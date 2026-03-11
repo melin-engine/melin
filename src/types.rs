@@ -10,10 +10,16 @@ pub struct OrderId(pub u64);
 
 /// Price in ticks (fixed-point). A tick is the smallest price increment
 /// for a given instrument.
+///
+/// Uses `NonZeroU64` rather than `u128` because: u64 supports prices up to
+/// 18.4 quintillion ticks (sufficient for any real-world instrument), fits in
+/// a single register, and keeps structs cache-line friendly.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Price(pub NonZeroU64);
 
 /// Quantity in lots.
+///
+/// Uses `NonZeroU64` because zero-quantity orders are invalid by definition.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Quantity(pub NonZeroU64);
 

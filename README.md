@@ -16,8 +16,9 @@ Early development. Core types are implemented:
 - [x] Order model (Market, Limit)
 - [x] Time-in-force (GTC, IOC, FOK)
 - [x] Execution reports (Fill, Placed, Cancelled, Rejected)
-- [ ] Order book
-- [ ] Matching engine
+- [x] Order book (price-time priority, BTreeMap + VecDeque)
+- [x] Matching engine (limit/market, GTC/IOC/FOK, cancel)
+- [ ] Fuzz & property-based testing (`cargo-fuzz`, `proptest`)
 - [ ] Event journal / recovery
 - [ ] Risk checks
 - [ ] Gateway / network layer
