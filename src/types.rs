@@ -68,6 +68,14 @@ pub enum OrderType {
     Market,
     /// Execute at the specified price or better.
     Limit { price: Price },
+    /// Becomes a market order when the last trade price reaches the trigger.
+    /// Stop buy triggers when price >= trigger; stop sell when price <= trigger.
+    Stop { trigger_price: Price },
+    /// Becomes a limit order when the last trade price reaches the trigger.
+    StopLimit {
+        trigger_price: Price,
+        limit_price: Price,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -111,6 +119,11 @@ pub enum ExecutionReport {
     Cancelled {
         order_id: OrderId,
         remaining_quantity: Quantity,
+    },
+    /// A stop order was triggered by a trade at the given price.
+    Triggered {
+        order_id: OrderId,
+        trigger_price: Price,
     },
     /// Order was rejected (e.g., market order on empty book, FOK can't fill).
     Rejected {

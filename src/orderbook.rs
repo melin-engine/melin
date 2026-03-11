@@ -16,6 +16,19 @@ struct RestingOrder {
     remaining: Quantity,
 }
 
+/// A pending stop order waiting to be triggered.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PendingStop {
+    id: OrderId,
+    side: Side,
+    trigger_price: Price,
+    quantity: Quantity,
+    time_in_force: TimeInForce,
+    /// If `Some`, becomes a limit order at this price when triggered.
+    /// If `None`, becomes a market order.
+    limit_price: Option<Price>,
+}
+
 /// One side of the order book (either all bids or all asks).
 #[derive(Debug, Default)]
 struct BookSide {
@@ -90,6 +103,16 @@ pub struct OrderBook {
     /// HashMap: O(1) amortized lookup for cancel operations. Maps order_id to
     /// its location (side, price) so we don't need to scan the book.
     order_index: HashMap<OrderId, (Side, Price)>,
+    /// BTreeMap keyed by trigger price so we can efficiently find all stops
+    /// that should fire at a given trade price. Stop buys trigger when price
+    /// rises (iterate from lowest trigger up), stop sells when price falls
+    /// (iterate from highest trigger down).
+    stop_buys: BTreeMap<Price, Vec<PendingStop>>,
+    stop_sells: BTreeMap<Price, Vec<PendingStop>>,
+    /// Tracks which order IDs are pending stops, for cancel support.
+    stop_index: HashMap<OrderId, (Side, Price)>,
+    /// Last trade price, used to determine which stops to trigger.
+    last_trade_price: Option<Price>,
 }
 
 impl Default for OrderBook {
@@ -104,6 +127,10 @@ impl OrderBook {
             bids: BookSide::default(),
             asks: BookSide::default(),
             order_index: HashMap::new(),
+            stop_buys: BTreeMap::new(),
+            stop_sells: BTreeMap::new(),
+            stop_index: HashMap::new(),
+            last_trade_price: None,
         }
     }
 
@@ -112,23 +139,54 @@ impl OrderBook {
         match order.order_type {
             OrderType::Limit { price } => self.execute_limit(order, price, reports),
             OrderType::Market => self.execute_market(order, reports),
+            OrderType::Stop { trigger_price } => {
+                self.add_stop(order, trigger_price, None);
+            }
+            OrderType::StopLimit {
+                trigger_price,
+                limit_price,
+            } => {
+                self.add_stop(order, trigger_price, Some(limit_price));
+            }
         }
+        self.check_triggers(reports);
     }
 
-    /// Cancel a resting order by ID.
+    /// Cancel a resting or pending stop order by ID.
     pub fn cancel(&mut self, order_id: OrderId, reports: &mut Vec<ExecutionReport>) {
-        let Some((side, price)) = self.order_index.remove(&order_id) else {
+        // Try resting orders first.
+        if let Some((side, price)) = self.order_index.remove(&order_id) {
+            let book_side = match side {
+                Side::Buy => &mut self.bids,
+                Side::Sell => &mut self.asks,
+            };
+            if let Some(remaining) = book_side.remove(price, order_id) {
+                reports.push(ExecutionReport::Cancelled {
+                    order_id,
+                    remaining_quantity: remaining,
+                });
+            }
             return;
-        };
-        let book_side = match side {
-            Side::Buy => &mut self.bids,
-            Side::Sell => &mut self.asks,
-        };
-        if let Some(remaining) = book_side.remove(price, order_id) {
-            reports.push(ExecutionReport::Cancelled {
-                order_id,
-                remaining_quantity: remaining,
-            });
+        }
+
+        // Try pending stops.
+        if let Some((side, trigger_price)) = self.stop_index.remove(&order_id) {
+            let stops = match side {
+                Side::Buy => &mut self.stop_buys,
+                Side::Sell => &mut self.stop_sells,
+            };
+            if let Some(level) = stops.get_mut(&trigger_price)
+                && let Some(pos) = level.iter().position(|s| s.id == order_id)
+            {
+                let stop = level.remove(pos);
+                if level.is_empty() {
+                    stops.remove(&trigger_price);
+                }
+                reports.push(ExecutionReport::Cancelled {
+                    order_id,
+                    remaining_quantity: stop.quantity,
+                });
+            }
         }
     }
 
@@ -259,6 +317,7 @@ impl OrderBook {
                     price,
                     quantity: fill_qty,
                 });
+                self.last_trade_price = Some(price);
 
                 match maker.remaining.checked_sub(fill_qty) {
                     Some(new_remaining) => {
@@ -292,6 +351,100 @@ impl OrderBook {
         Some(quantity)
     }
 
+    fn add_stop(&mut self, order: Order, trigger_price: Price, limit_price: Option<Price>) {
+        let stop = PendingStop {
+            id: order.id,
+            side: order.side,
+            trigger_price,
+            quantity: order.quantity,
+            time_in_force: order.time_in_force,
+            limit_price,
+        };
+        let stops = match order.side {
+            Side::Buy => &mut self.stop_buys,
+            Side::Sell => &mut self.stop_sells,
+        };
+        stops.entry(trigger_price).or_default().push(stop);
+        self.stop_index.insert(order.id, (order.side, trigger_price));
+    }
+
+    /// Check if the last trade price triggers any pending stop orders.
+    /// Triggered stops are converted to market/limit orders and executed.
+    fn check_triggers(&mut self, reports: &mut Vec<ExecutionReport>) {
+        let Some(trade_price) = self.last_trade_price else {
+            return;
+        };
+
+        // Stop buys: trigger when trade price >= trigger price.
+        // Collect all triggers at or below the trade price (ascending order).
+        let triggered_buy_prices: Vec<Price> = self
+            .stop_buys
+            .keys()
+            .take_while(|&&p| p <= trade_price)
+            .copied()
+            .collect();
+
+        let mut triggered: Vec<PendingStop> = Vec::new();
+        for price in triggered_buy_prices {
+            if let Some(stops) = self.stop_buys.remove(&price) {
+                for stop in &stops {
+                    self.stop_index.remove(&stop.id);
+                }
+                triggered.extend(stops);
+            }
+        }
+
+        // Stop sells: trigger when trade price <= trigger price.
+        // Collect all triggers at or above the trade price (descending order).
+        let triggered_sell_prices: Vec<Price> = self
+            .stop_sells
+            .keys()
+            .rev()
+            .take_while(|&&p| p >= trade_price)
+            .copied()
+            .collect();
+
+        for price in triggered_sell_prices {
+            if let Some(stops) = self.stop_sells.remove(&price) {
+                for stop in &stops {
+                    self.stop_index.remove(&stop.id);
+                }
+                triggered.extend(stops);
+            }
+        }
+
+        // Execute triggered stops as market/limit orders.
+        for stop in triggered {
+            reports.push(ExecutionReport::Triggered {
+                order_id: stop.id,
+                trigger_price: stop.trigger_price,
+            });
+
+            let order_type = match stop.limit_price {
+                Some(price) => OrderType::Limit { price },
+                None => OrderType::Market,
+            };
+
+            let order = Order {
+                id: stop.id,
+                side: stop.side,
+                order_type,
+                time_in_force: stop.time_in_force,
+                quantity: stop.quantity,
+            };
+
+            // Re-enter execute but skip check_triggers to avoid recursion —
+            // triggered orders are market/limit, so they won't re-add stops.
+            match order.order_type {
+                OrderType::Limit { price } => self.execute_limit(order, price, reports),
+                OrderType::Market => self.execute_market(order, reports),
+                OrderType::Stop { .. } | OrderType::StopLimit { .. } => {
+                    unreachable!("triggered stops become market or limit orders")
+                }
+            }
+        }
+    }
+
     fn place_on_book(
         &mut self,
         id: OrderId,
@@ -316,7 +469,10 @@ impl OrderBook {
 
     #[cfg(test)]
     fn is_empty(&self) -> bool {
-        self.bids.is_empty() && self.asks.is_empty()
+        self.bids.is_empty()
+            && self.asks.is_empty()
+            && self.stop_buys.is_empty()
+            && self.stop_sells.is_empty()
     }
 
     fn opposite_side(&self, side: Side) -> &BookSide {
@@ -841,6 +997,184 @@ mod tests {
         book.execute(market_order(4, Side::Sell, 7, TimeInForce::IOC), &mut reports);
         assert!(matches!(reports[0], ExecutionReport::Fill { quantity, .. } if quantity == qty(2)));
         assert!(matches!(reports[1], ExecutionReport::Fill { quantity, .. } if quantity == qty(5)));
+        assert!(book.is_empty());
+    }
+
+    // -- Stop orders --
+
+    fn stop_order(id: u64, side: Side, trigger: u64, q: u64, tif: TimeInForce) -> Order {
+        Order {
+            id: OrderId(id),
+            side,
+            order_type: OrderType::Stop {
+                trigger_price: price(trigger),
+            },
+            time_in_force: tif,
+            quantity: qty(q),
+        }
+    }
+
+    fn stop_limit_order(
+        id: u64,
+        side: Side,
+        trigger: u64,
+        limit: u64,
+        q: u64,
+        tif: TimeInForce,
+    ) -> Order {
+        Order {
+            id: OrderId(id),
+            side,
+            order_type: OrderType::StopLimit {
+                trigger_price: price(trigger),
+                limit_price: price(limit),
+            },
+            time_in_force: tif,
+            quantity: qty(q),
+        }
+    }
+
+    #[test]
+    fn stop_buy_triggers_on_trade_at_trigger_price() {
+        let mut book = OrderBook::new();
+        let mut reports = Vec::new();
+
+        // Place a resting ask at 100 and a stop buy that triggers at 100.
+        book.execute(limit_order(1, Side::Sell, 100, 10, TimeInForce::GTC), &mut reports);
+        book.execute(stop_order(2, Side::Buy, 100, 5, TimeInForce::IOC), &mut reports);
+        reports.clear();
+
+        // A trade at 100 should trigger the stop buy.
+        book.execute(limit_order(3, Side::Buy, 100, 5, TimeInForce::GTC), &mut reports);
+
+        // Order 3 fills against order 1 (5@100), then stop triggers and fills (5@100).
+        assert!(matches!(reports[0], ExecutionReport::Fill {
+            taker_order_id: OrderId(3), ..
+        }));
+        assert_eq!(reports[1], ExecutionReport::Triggered {
+            order_id: OrderId(2),
+            trigger_price: price(100),
+        });
+        assert!(matches!(reports[2], ExecutionReport::Fill {
+            taker_order_id: OrderId(2), ..
+        }));
+        assert!(book.is_empty());
+    }
+
+    #[test]
+    fn stop_sell_triggers_on_trade_at_trigger_price() {
+        let mut book = OrderBook::new();
+        let mut reports = Vec::new();
+
+        // Place a resting bid at 100 and a stop sell that triggers at 100.
+        book.execute(limit_order(1, Side::Buy, 100, 10, TimeInForce::GTC), &mut reports);
+        book.execute(stop_order(2, Side::Sell, 100, 5, TimeInForce::IOC), &mut reports);
+        reports.clear();
+
+        // A trade at 100 should trigger the stop sell.
+        book.execute(limit_order(3, Side::Sell, 100, 5, TimeInForce::GTC), &mut reports);
+
+        assert!(matches!(reports[0], ExecutionReport::Fill {
+            taker_order_id: OrderId(3), ..
+        }));
+        assert_eq!(reports[1], ExecutionReport::Triggered {
+            order_id: OrderId(2),
+            trigger_price: price(100),
+        });
+        assert!(matches!(reports[2], ExecutionReport::Fill {
+            taker_order_id: OrderId(2), ..
+        }));
+        assert!(book.is_empty());
+    }
+
+    #[test]
+    fn stop_buy_does_not_trigger_below_price() {
+        let mut book = OrderBook::new();
+        let mut reports = Vec::new();
+
+        // Stop buy at 110, but trade happens at 100.
+        book.execute(limit_order(1, Side::Sell, 100, 10, TimeInForce::GTC), &mut reports);
+        book.execute(stop_order(2, Side::Buy, 110, 5, TimeInForce::IOC), &mut reports);
+        reports.clear();
+
+        book.execute(limit_order(3, Side::Buy, 100, 5, TimeInForce::GTC), &mut reports);
+
+        // Only the limit order fills, stop is NOT triggered.
+        assert_eq!(reports.len(), 1);
+        assert!(matches!(reports[0], ExecutionReport::Fill {
+            taker_order_id: OrderId(3), ..
+        }));
+        // Stop and remaining ask still on book.
+        assert!(!book.is_empty());
+    }
+
+    #[test]
+    fn stop_limit_triggers_and_rests() {
+        let mut book = OrderBook::new();
+        let mut reports = Vec::new();
+
+        // Resting ask at 100, stop-limit buy: trigger at 100, limit at 95.
+        book.execute(limit_order(1, Side::Sell, 100, 10, TimeInForce::GTC), &mut reports);
+        book.execute(
+            stop_limit_order(2, Side::Buy, 100, 95, 5, TimeInForce::GTC),
+            &mut reports,
+        );
+        reports.clear();
+
+        // Trade at 100 triggers the stop, but limit price 95 < ask 100, so it rests.
+        book.execute(limit_order(3, Side::Buy, 100, 5, TimeInForce::GTC), &mut reports);
+
+        assert!(matches!(reports[0], ExecutionReport::Fill {
+            taker_order_id: OrderId(3), ..
+        }));
+        assert_eq!(reports[1], ExecutionReport::Triggered {
+            order_id: OrderId(2),
+            trigger_price: price(100),
+        });
+        // The stop-limit becomes a limit buy at 95, which rests (no asks at 95).
+        assert!(matches!(reports[2], ExecutionReport::Placed {
+            order_id: OrderId(2),
+            side: Side::Buy,
+            ..
+        }));
+    }
+
+    #[test]
+    fn cancel_pending_stop_order() {
+        let mut book = OrderBook::new();
+        let mut reports = Vec::new();
+
+        book.execute(stop_order(1, Side::Buy, 100, 10, TimeInForce::IOC), &mut reports);
+        reports.clear();
+
+        book.cancel(OrderId(1), &mut reports);
+
+        assert_eq!(reports.len(), 1);
+        assert_eq!(
+            reports[0],
+            ExecutionReport::Cancelled {
+                order_id: OrderId(1),
+                remaining_quantity: qty(10),
+            }
+        );
+        assert!(book.is_empty());
+    }
+
+    #[test]
+    fn cancelled_stop_does_not_trigger() {
+        let mut book = OrderBook::new();
+        let mut reports = Vec::new();
+
+        book.execute(limit_order(1, Side::Sell, 100, 10, TimeInForce::GTC), &mut reports);
+        book.execute(stop_order(2, Side::Buy, 100, 5, TimeInForce::IOC), &mut reports);
+        book.cancel(OrderId(2), &mut reports);
+        reports.clear();
+
+        // Trade at 100 — cancelled stop should not trigger.
+        book.execute(limit_order(3, Side::Buy, 100, 10, TimeInForce::GTC), &mut reports);
+
+        assert_eq!(reports.len(), 1);
+        assert!(matches!(reports[0], ExecutionReport::Fill { .. }));
         assert!(book.is_empty());
     }
 }
