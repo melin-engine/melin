@@ -16,6 +16,31 @@ pub struct Symbol(pub u32);
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct OrderId(pub u64);
 
+/// Account/trader identifier.
+///
+/// Uses `u32` — same rationale as `Symbol`: no heap allocation, fast
+/// hashing. Supports ~4 billion accounts, sufficient for any single exchange.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct AccountId(pub u32);
+
+/// Currency identifier (e.g., USD, BTC, ETH).
+///
+/// Uses `u32` — same pattern as `Symbol` and `AccountId`. The mapping from
+/// human-readable currency codes to numeric IDs is managed outside the engine.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct CurrencyId(pub u32);
+
+/// Maps an instrument to its base and quote currencies.
+///
+/// Example: BTC/USD → base = BTC (what you buy/sell), quote = USD (what you pay with).
+/// The account manager uses this to determine which balances to reserve and credit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InstrumentSpec {
+    pub symbol: Symbol,
+    pub base: CurrencyId,
+    pub quote: CurrencyId,
+}
+
 /// Price in ticks (fixed-point). A tick is the smallest price increment
 /// for a given instrument.
 ///
@@ -92,6 +117,7 @@ pub enum TimeInForce {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Order {
     pub id: OrderId,
+    pub account: AccountId,
     pub side: Side,
     pub order_type: OrderType,
     pub time_in_force: TimeInForce,
@@ -112,6 +138,8 @@ pub enum ExecutionReport {
     Fill {
         maker_order_id: OrderId,
         taker_order_id: OrderId,
+        maker_account: AccountId,
+        taker_account: AccountId,
         price: Price,
         quantity: Quantity,
     },
@@ -138,6 +166,12 @@ pub enum RejectReason {
     NoLiquidity,
     /// FOK order cannot be fully filled.
     FOKCannotFill,
+    /// Account does not have sufficient available balance.
+    InsufficientBalance,
+    /// The account is not registered.
+    UnknownAccount,
+    /// The instrument is not registered.
+    UnknownSymbol,
 }
 
 #[cfg(test)]

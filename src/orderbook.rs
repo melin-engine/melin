@@ -6,13 +6,15 @@
 use std::collections::{BTreeMap, HashMap, VecDeque};
 
 use crate::types::{
-    ExecutionReport, Order, OrderId, OrderType, Price, Quantity, RejectReason, Side, TimeInForce,
+    AccountId, ExecutionReport, Order, OrderId, OrderType, Price, Quantity, RejectReason, Side,
+    TimeInForce,
 };
 
 /// A resting order on the book (the unfilled portion of a limit order).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct RestingOrder {
     id: OrderId,
+    account: AccountId,
     remaining: Quantity,
 }
 
@@ -20,6 +22,7 @@ struct RestingOrder {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct PendingStop {
     id: OrderId,
+    account: AccountId,
     side: Side,
     trigger_price: Price,
     quantity: Quantity,
@@ -205,13 +208,19 @@ impl OrderBook {
             }
         }
 
-        let remaining =
-            self.match_against(order.id, order.side, order.quantity, Some(price), reports);
+        let remaining = self.match_against(
+            order.id,
+            order.account,
+            order.side,
+            order.quantity,
+            Some(price),
+            reports,
+        );
 
         match remaining {
             Some(rem) => match order.time_in_force {
                 TimeInForce::GTC => {
-                    self.place_on_book(order.id, order.side, price, rem, reports);
+                    self.place_on_book(order.id, order.account, order.side, price, rem, reports);
                 }
                 TimeInForce::IOC | TimeInForce::FOK => {
                     reports.push(ExecutionReport::Cancelled {
@@ -250,7 +259,14 @@ impl OrderBook {
             return;
         }
 
-        let remaining = self.match_against(order.id, order.side, order.quantity, None, reports);
+        let remaining = self.match_against(
+            order.id,
+            order.account,
+            order.side,
+            order.quantity,
+            None,
+            reports,
+        );
 
         if let Some(rem) = remaining {
             // Market order couldn't fully fill — cancel remainder.
@@ -267,6 +283,7 @@ impl OrderBook {
     fn match_against(
         &mut self,
         taker_id: OrderId,
+        taker_account: AccountId,
         taker_side: Side,
         mut quantity: Quantity,
         price_limit: Option<Price>,
@@ -312,6 +329,8 @@ impl OrderBook {
                 reports.push(ExecutionReport::Fill {
                     maker_order_id: maker.id,
                     taker_order_id: taker_id,
+                    maker_account: maker.account,
+                    taker_account,
                     price,
                     quantity: fill_qty,
                 });
@@ -352,6 +371,7 @@ impl OrderBook {
     fn add_stop(&mut self, order: Order, trigger_price: Price, limit_price: Option<Price>) {
         let stop = PendingStop {
             id: order.id,
+            account: order.account,
             side: order.side,
             trigger_price,
             quantity: order.quantity,
@@ -426,6 +446,7 @@ impl OrderBook {
 
             let order = Order {
                 id: stop.id,
+                account: stop.account,
                 side: stop.side,
                 order_type,
                 time_in_force: stop.time_in_force,
@@ -447,6 +468,7 @@ impl OrderBook {
     fn place_on_book(
         &mut self,
         id: OrderId,
+        account: AccountId,
         side: Side,
         price: Price,
         quantity: Quantity,
@@ -460,6 +482,7 @@ impl OrderBook {
             price,
             RestingOrder {
                 id,
+                account,
                 remaining: quantity,
             },
         );
@@ -509,9 +532,13 @@ mod tests {
         Price(NonZeroU64::new(n).unwrap())
     }
 
+    /// Default test account — most orderbook tests don't care about account identity.
+    const TEST_ACCOUNT: AccountId = AccountId(1);
+
     fn limit_order(id: u64, side: Side, p: u64, q: u64, tif: TimeInForce) -> Order {
         Order {
             id: OrderId(id),
+            account: TEST_ACCOUNT,
             side,
             order_type: OrderType::Limit { price: price(p) },
             time_in_force: tif,
@@ -522,6 +549,7 @@ mod tests {
     fn market_order(id: u64, side: Side, q: u64, tif: TimeInForce) -> Order {
         Order {
             id: OrderId(id),
+            account: TEST_ACCOUNT,
             side,
             order_type: OrderType::Market,
             time_in_force: tif,
@@ -619,6 +647,8 @@ mod tests {
             ExecutionReport::Fill {
                 maker_order_id: OrderId(1),
                 taker_order_id: OrderId(2),
+                maker_account: TEST_ACCOUNT,
+                taker_account: TEST_ACCOUNT,
                 price: price(100),
                 quantity: qty(10),
             }
@@ -651,6 +681,8 @@ mod tests {
             ExecutionReport::Fill {
                 maker_order_id: OrderId(1),
                 taker_order_id: OrderId(2),
+                maker_account: TEST_ACCOUNT,
+                taker_account: TEST_ACCOUNT,
                 price: price(90),
                 quantity: qty(10),
             }
@@ -682,6 +714,8 @@ mod tests {
             ExecutionReport::Fill {
                 maker_order_id: OrderId(1),
                 taker_order_id: OrderId(2),
+                maker_account: TEST_ACCOUNT,
+                taker_account: TEST_ACCOUNT,
                 price: price(100),
                 quantity: qty(5),
             }
@@ -735,6 +769,8 @@ mod tests {
             ExecutionReport::Fill {
                 maker_order_id: OrderId(1),
                 taker_order_id: OrderId(3),
+                maker_account: TEST_ACCOUNT,
+                taker_account: TEST_ACCOUNT,
                 price: price(100),
                 quantity: qty(5),
             }
@@ -744,6 +780,8 @@ mod tests {
             ExecutionReport::Fill {
                 maker_order_id: OrderId(2),
                 taker_order_id: OrderId(3),
+                maker_account: TEST_ACCOUNT,
+                taker_account: TEST_ACCOUNT,
                 price: price(100),
                 quantity: qty(2),
             }
@@ -786,6 +824,8 @@ mod tests {
             ExecutionReport::Fill {
                 maker_order_id: OrderId(2),
                 taker_order_id: OrderId(3),
+                maker_account: TEST_ACCOUNT,
+                taker_account: TEST_ACCOUNT,
                 price: price(100),
                 quantity: qty(3),
             }
@@ -1060,6 +1100,8 @@ mod tests {
             ExecutionReport::Fill {
                 maker_order_id: OrderId(1),
                 taker_order_id: OrderId(4),
+                maker_account: TEST_ACCOUNT,
+                taker_account: TEST_ACCOUNT,
                 price: price(100),
                 quantity: qty(5),
             }
@@ -1069,6 +1111,8 @@ mod tests {
             ExecutionReport::Fill {
                 maker_order_id: OrderId(2),
                 taker_order_id: OrderId(4),
+                maker_account: TEST_ACCOUNT,
+                taker_account: TEST_ACCOUNT,
                 price: price(101),
                 quantity: qty(5),
             }
@@ -1078,6 +1122,8 @@ mod tests {
             ExecutionReport::Fill {
                 maker_order_id: OrderId(3),
                 taker_order_id: OrderId(4),
+                maker_account: TEST_ACCOUNT,
+                taker_account: TEST_ACCOUNT,
                 price: price(102),
                 quantity: qty(2),
             }
@@ -1117,6 +1163,8 @@ mod tests {
             ExecutionReport::Fill {
                 maker_order_id: OrderId(1),
                 taker_order_id: OrderId(2),
+                maker_account: TEST_ACCOUNT,
+                taker_account: TEST_ACCOUNT,
                 price: price(100),
                 quantity: qty(10),
             }
@@ -1151,6 +1199,8 @@ mod tests {
             ExecutionReport::Fill {
                 maker_order_id: OrderId(2),
                 taker_order_id: OrderId(3),
+                maker_account: TEST_ACCOUNT,
+                taker_account: TEST_ACCOUNT,
                 price: price(100),
                 quantity: qty(3),
             }
@@ -1172,6 +1222,7 @@ mod tests {
     fn stop_order(id: u64, side: Side, trigger: u64, q: u64, tif: TimeInForce) -> Order {
         Order {
             id: OrderId(id),
+            account: TEST_ACCOUNT,
             side,
             order_type: OrderType::Stop {
                 trigger_price: price(trigger),
@@ -1191,6 +1242,7 @@ mod tests {
     ) -> Order {
         Order {
             id: OrderId(id),
+            account: TEST_ACCOUNT,
             side,
             order_type: OrderType::StopLimit {
                 trigger_price: price(trigger),
