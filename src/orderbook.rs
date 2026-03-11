@@ -314,6 +314,11 @@ impl OrderBook {
         });
     }
 
+    #[cfg(test)]
+    fn is_empty(&self) -> bool {
+        self.bids.is_empty() && self.asks.is_empty()
+    }
+
     fn opposite_side(&self, side: Side) -> &BookSide {
         match side {
             Side::Buy => &self.asks,
@@ -380,6 +385,11 @@ mod tests {
                 ..
             }
         ));
+        // Verify the order is resting: a matching sell should fill.
+        reports.clear();
+        book.execute(limit_order(2, Side::Sell, 100, 10, TimeInForce::GTC), &mut reports);
+        assert!(matches!(reports[0], ExecutionReport::Fill { .. }));
+        assert!(book.is_empty());
     }
 
     #[test]
@@ -394,6 +404,15 @@ mod tests {
         assert_eq!(reports.len(), 2);
         assert!(matches!(reports[0], ExecutionReport::Placed { .. }));
         assert!(matches!(reports[1], ExecutionReport::Placed { .. }));
+
+        // Verify both sides have liquidity.
+        reports.clear();
+        book.execute(market_order(3, Side::Sell, 10, TimeInForce::IOC), &mut reports);
+        assert!(matches!(reports[0], ExecutionReport::Fill { .. }));
+        reports.clear();
+        book.execute(market_order(4, Side::Buy, 10, TimeInForce::IOC), &mut reports);
+        assert!(matches!(reports[0], ExecutionReport::Fill { .. }));
+        assert!(book.is_empty());
     }
 
     // -- Limit order matching --
@@ -419,6 +438,8 @@ mod tests {
                 quantity: qty(10),
             }
         );
+
+        assert!(book.is_empty());
     }
 
     #[test]
@@ -443,6 +464,8 @@ mod tests {
                 quantity: qty(10),
             }
         );
+
+        assert!(book.is_empty());
     }
 
     #[test]
@@ -475,6 +498,13 @@ mod tests {
                 quantity: qty(5),
             }
         );
+
+        // Consume the resting remainder by selling 5 into it.
+        reports.clear();
+        book.execute(limit_order(3, Side::Sell, 100, 5, TimeInForce::GTC), &mut reports);
+        assert_eq!(reports.len(), 1);
+        assert!(matches!(reports[0], ExecutionReport::Fill { quantity, .. } if quantity == qty(5)));
+        assert!(book.is_empty());
     }
 
     #[test]
@@ -509,6 +539,12 @@ mod tests {
                 quantity: qty(2),
             }
         );
+
+        // Order 2 should still have 3 remaining on the book.
+        reports.clear();
+        book.execute(market_order(4, Side::Buy, 3, TimeInForce::IOC), &mut reports);
+        assert!(matches!(reports[0], ExecutionReport::Fill { quantity, .. } if quantity == qty(3)));
+        assert!(book.is_empty());
     }
 
     #[test]
@@ -530,6 +566,13 @@ mod tests {
             price: price(100),
             quantity: qty(3),
         });
+
+        // Ask at 110 (5 remaining) and bid at 100 (2 remaining from partial) should still be on book.
+        reports.clear();
+        book.execute(market_order(4, Side::Buy, 7, TimeInForce::IOC), &mut reports);
+        assert!(matches!(reports[0], ExecutionReport::Fill { quantity, .. } if quantity == qty(2)));
+        assert!(matches!(reports[1], ExecutionReport::Fill { quantity, .. } if quantity == qty(5)));
+        assert!(book.is_empty());
     }
 
     // -- Market orders --
@@ -546,6 +589,7 @@ mod tests {
 
         assert_eq!(reports.len(), 1);
         assert!(matches!(reports[0], ExecutionReport::Fill { .. }));
+        assert!(book.is_empty());
     }
 
     #[test]
@@ -585,6 +629,7 @@ mod tests {
                 remaining_quantity: qty(5),
             }
         );
+        assert!(book.is_empty());
     }
 
     // -- IOC --
@@ -608,6 +653,7 @@ mod tests {
                 remaining_quantity: qty(5),
             }
         );
+        assert!(book.is_empty());
     }
 
     // -- FOK --
@@ -631,6 +677,12 @@ mod tests {
                 reason: RejectReason::FOKCannotFill,
             }
         );
+
+        // The resting ask should be untouched.
+        reports.clear();
+        book.execute(market_order(3, Side::Buy, 5, TimeInForce::IOC), &mut reports);
+        assert!(matches!(reports[0], ExecutionReport::Fill { quantity, .. } if quantity == qty(5)));
+        assert!(book.is_empty());
     }
 
     #[test]
@@ -645,6 +697,7 @@ mod tests {
 
         assert_eq!(reports.len(), 1);
         assert!(matches!(reports[0], ExecutionReport::Fill { .. }));
+        assert!(book.is_empty());
     }
 
     // -- Cancel --
@@ -667,6 +720,7 @@ mod tests {
                 remaining_quantity: qty(10),
             }
         );
+        assert!(book.is_empty());
     }
 
     #[test]
@@ -729,6 +783,12 @@ mod tests {
             price: price(102),
             quantity: qty(2),
         });
+
+        // Order 3 still has 3 remaining on the book.
+        reports.clear();
+        book.execute(market_order(5, Side::Buy, 3, TimeInForce::IOC), &mut reports);
+        assert!(matches!(reports[0], ExecutionReport::Fill { quantity, .. } if quantity == qty(3)));
+        assert!(book.is_empty());
     }
 
     // -- Sell-side matching --
@@ -753,6 +813,7 @@ mod tests {
                 quantity: qty(10),
             }
         );
+        assert!(book.is_empty());
     }
 
     #[test]
@@ -774,5 +835,12 @@ mod tests {
             price: price(100),
             quantity: qty(3),
         });
+
+        // Bid at 90 (5) and bid at 100 (2 remaining) should still be on book.
+        reports.clear();
+        book.execute(market_order(4, Side::Sell, 7, TimeInForce::IOC), &mut reports);
+        assert!(matches!(reports[0], ExecutionReport::Fill { quantity, .. } if quantity == qty(2)));
+        assert!(matches!(reports[1], ExecutionReport::Fill { quantity, .. } if quantity == qty(5)));
+        assert!(book.is_empty());
     }
 }
