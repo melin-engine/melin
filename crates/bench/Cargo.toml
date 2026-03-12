@@ -1,0 +1,15 @@
+[package]
+name = "trading-bench"
+version = "0.1.0"
+edition = "2024"
+
+[[bin]]
+name = "trading-bench"
+path = "src/main.rs"
+
+[dependencies]
+trading-engine = { path = "../engine" }
+trading-protocol = { path = "../protocol" }
+trading-server = { path = "../server" }
+hdrhistogram = "7"
+tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "sync", "macros", "time"] }

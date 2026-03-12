@@ -1,11 +1,5 @@
-mod engine;
-mod response;
-mod server;
-mod session;
-
 use trading_protocol::tcp::TcpTransportListener;
-
-use server::ServerConfig;
+use trading_server::server::ServerConfig;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -17,5 +11,5 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let config = ServerConfig::default();
     let listener = TcpTransportListener::bind(config.bind_addr).await?;
-    server::run(listener, config).await
+    trading_server::server::run(listener, config).await
 }

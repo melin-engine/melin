@@ -3,6 +3,14 @@ name = "trading-server"
 version = "0.1.0"
 edition = "2024"
 
+[lib]
+name = "trading_server"
+path = "src/lib.rs"
+
+[[bin]]
+name = "trading-server"
+path = "src/main.rs"
+
 [dependencies]
 trading-engine = { path = "../engine" }
 trading-disruptor = { path = "../disruptor" }
