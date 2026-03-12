@@ -7,8 +7,9 @@
 //! 4. Spawns 3 OS threads: journal, matching, response.
 //! 5. Runs the accept loop, spawning a reader OS thread per connection.
 //!
-//! No tokio on the hot path — reader threads do blocking I/O and publish
-//! directly to the disruptor. The response thread writes directly to sockets.
+//! Fully synchronous — no async runtime needed. Reader threads do blocking
+//! I/O and publish directly to the disruptor. The response thread writes
+//! directly to sockets.
 
 use std::io::Write;
 use std::net::SocketAddr;
@@ -24,7 +25,7 @@ use trading_engine::journal::pipeline::build_pipeline;
 
 use trading_protocol::blocking::BlockingFrameWriter;
 use trading_protocol::message::ConnectionId;
-use trading_protocol::transport::{TransportListener, TransportStream};
+use trading_protocol::transport::BlockingTransportListener;
 
 use crate::response::ControlEvent;
 use crate::session;
@@ -67,11 +68,11 @@ impl Default for ServerConfig {
 /// 4. Runs the accept loop, spawning a reader OS thread per connection.
 ///
 /// Returns when the listener encounters a fatal error.
-pub async fn run<L: TransportListener>(
+pub fn run<L: BlockingTransportListener>(
     listener: L,
     config: ServerConfig,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    run_with_shutdown(listener, config, Arc::new(AtomicBool::new(false))).await
+    run_with_shutdown(listener, config, Arc::new(AtomicBool::new(false)))
 }
 
 /// Run the trading server with an externally controlled shutdown flag.
@@ -79,7 +80,7 @@ pub async fn run<L: TransportListener>(
 /// Same as [`run`], but the caller can set `shutdown` to `true` to trigger
 /// a clean shutdown of all pipeline threads (useful for benchmarks that need
 /// to collect latency trace reports).
-pub async fn run_with_shutdown<L: TransportListener>(
+pub fn run_with_shutdown<L: BlockingTransportListener>(
     mut listener: L,
     config: ServerConfig,
     shutdown: Arc<AtomicBool>,
@@ -140,9 +141,10 @@ pub async fn run_with_shutdown<L: TransportListener>(
     // flexibility (e.g., multiple listeners).
     let next_connection_id = AtomicU64::new(1);
 
-    // Accept loop.
+    // Accept loop — blocking. Each accepted connection yields blocking
+    // read/write halves directly (no async-to-blocking conversion).
     loop {
-        let (stream, addr) = match listener.accept().await {
+        let (std_read, std_write, addr) = match listener.accept() {
             Ok(conn) => conn,
             Err(e) => {
                 error!(error = %e, "accept error");
@@ -153,15 +155,6 @@ pub async fn run_with_shutdown<L: TransportListener>(
         let connection_id = ConnectionId(next_connection_id.fetch_add(1, Ordering::Relaxed));
 
         debug!(connection_id = connection_id.0, addr = %addr, "new connection");
-
-        // Convert the async stream to blocking read/write halves.
-        let (std_read, std_write) = match stream.into_blocking_split() {
-            Ok(parts) => parts,
-            Err(e) => {
-                error!(connection_id = connection_id.0, error = %e, "failed to convert to blocking");
-                continue;
-            }
-        };
 
         // Register the writer with the response thread before spawning
         // the reader. This ensures the response stage has the writer

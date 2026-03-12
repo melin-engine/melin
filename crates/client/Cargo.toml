@@ -5,4 +5,3 @@ edition = "2024"
 
 [dependencies]
 trading-protocol = { path = "../protocol" }
-tokio = { version = "1", features = ["net", "io-util", "sync"] }

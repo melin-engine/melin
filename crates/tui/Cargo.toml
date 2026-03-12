@@ -6,6 +6,5 @@ edition = "2024"
 [dependencies]
 trading-client = { path = "../client" }
 trading-protocol = { path = "../protocol" }
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync"] }
 ratatui = "0.29"
 crossterm = "0.28"

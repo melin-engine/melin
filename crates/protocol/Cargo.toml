@@ -8,8 +8,6 @@ latency-trace = ["trading-engine/latency-trace"]
 
 [dependencies]
 trading-engine = { path = "../engine" }
-tokio = { version = "1", features = ["net", "io-util", "sync"] }
 
 [dev-dependencies]
 tempfile = "3"
-tokio = { version = "1", features = ["net", "io-util", "sync", "macros", "rt"] }

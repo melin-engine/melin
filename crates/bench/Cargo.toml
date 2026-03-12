@@ -16,6 +16,3 @@ trading-engine = { path = "../engine" }
 trading-protocol = { path = "../protocol" }
 trading-server = { path = "../server" }
 hdrhistogram = "7"
-# Minimal tokio — only needed for the server accept loop running in a
-# background thread. The benchmark client uses pure blocking I/O.
-tokio = { version = "1", features = ["rt", "net", "io-util"] }

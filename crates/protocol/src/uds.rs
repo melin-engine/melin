@@ -1,30 +1,26 @@
 //! Unix domain socket transport implementation.
 //!
-//! Same length-prefixed framing as TCP, but avoids the TCP/IP stack
-//! entirely — no checksums, congestion control, or connection tracking.
-//! Useful for same-machine benchmarks to isolate network stack overhead
-//! from application-level latency.
+//! Avoids the TCP/IP stack entirely — no checksums, congestion control,
+//! or connection tracking. Useful for same-machine deployment to isolate
+//! network stack overhead from application-level latency.
 
 use std::io;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 
-use tokio::io::{AsyncReadExt, AsyncWriteExt, BufWriter};
-use tokio::net::{UnixListener, UnixStream};
+use crate::transport::BlockingTransportListener;
 
-use crate::transport::{TransportListener, TransportRead, TransportStream, TransportWrite};
-
-/// Maximum frame payload size (1 KiB). Same limit as TCP transport.
-const MAX_FRAME_SIZE: usize = 1024;
-
-/// Unix domain socket listener.
-pub struct UdsTransportListener {
-    listener: UnixListener,
-    /// Store the path so we can report a synthetic `SocketAddr` from `local_addr`.
+/// Blocking Unix domain socket listener.
+///
+/// Used by the server accept loop. Accepted connections are in blocking
+/// mode — no async runtime needed.
+pub struct BlockingUdsListener {
+    listener: std::os::unix::net::UnixListener,
+    /// Store the path so we can report it and for cleanup.
     path: PathBuf,
 }
 
-impl UdsTransportListener {
+impl BlockingUdsListener {
     /// Bind to the given filesystem path.
     ///
     /// Removes any stale socket file at `path` before binding.
@@ -33,7 +29,7 @@ impl UdsTransportListener {
         if path.exists() {
             std::fs::remove_file(path)?;
         }
-        let listener = UnixListener::bind(path)?;
+        let listener = std::os::unix::net::UnixListener::bind(path)?;
         Ok(Self {
             listener,
             path: path.to_owned(),
@@ -52,202 +48,60 @@ impl UdsTransportListener {
     }
 }
 
-impl TransportListener for UdsTransportListener {
-    type Stream = UdsTransportStream;
+impl BlockingTransportListener for BlockingUdsListener {
+    type Read = std::os::unix::net::UnixStream;
+    type Write = std::os::unix::net::UnixStream;
 
-    async fn accept(&mut self) -> io::Result<(UdsTransportStream, SocketAddr)> {
-        let (stream, _unix_addr) = self.listener.accept().await?;
+    fn accept(
+        &mut self,
+    ) -> io::Result<(
+        std::os::unix::net::UnixStream,
+        std::os::unix::net::UnixStream,
+        SocketAddr,
+    )> {
+        let (stream, _unix_addr) = self.listener.accept()?;
         // UDS doesn't have IP addresses — return a synthetic loopback address.
         let addr: SocketAddr = "127.0.0.1:0".parse().expect("valid addr");
-        Ok((UdsTransportStream { stream }, addr))
-    }
-}
-
-/// A Unix domain socket stream that can be split into read/write halves.
-pub struct UdsTransportStream {
-    stream: UnixStream,
-}
-
-impl UdsTransportStream {
-    /// Wrap an existing `UnixStream`.
-    pub fn new(stream: UnixStream) -> Self {
-        Self { stream }
-    }
-
-    /// Consume the transport and return the inner tokio `UnixStream`.
-    ///
-    /// Used by the server to convert to a blocking `std::os::unix::net::UnixStream`
-    /// via `into_std()` for dedicated I/O threads.
-    pub fn into_inner(self) -> UnixStream {
-        self.stream
-    }
-}
-
-impl TransportStream for UdsTransportStream {
-    type Read = UdsTransportRead;
-    type Write = UdsTransportWrite;
-    type BlockingRead = std::os::unix::net::UnixStream;
-    type BlockingWrite = std::os::unix::net::UnixStream;
-
-    fn into_split(self) -> (UdsTransportRead, UdsTransportWrite) {
-        let (read, write) = self.stream.into_split();
-        (
-            UdsTransportRead { reader: read },
-            UdsTransportWrite {
-                writer: BufWriter::new(write),
-            },
-        )
-    }
-
-    fn into_blocking_split(
-        self,
-    ) -> std::io::Result<(
-        std::os::unix::net::UnixStream,
-        std::os::unix::net::UnixStream,
-    )> {
-        let std_stream = self.stream.into_std()?;
-        // tokio leaves the socket in non-blocking mode after into_std().
-        // Switch to blocking mode for dedicated I/O threads.
-        std_stream.set_nonblocking(false)?;
-        let read_half = std_stream.try_clone()?;
-        Ok((read_half, std_stream))
-    }
-}
-
-/// Read half of a UDS transport. Reads length-prefixed frames.
-pub struct UdsTransportRead {
-    reader: tokio::net::unix::OwnedReadHalf,
-}
-
-impl TransportRead for UdsTransportRead {
-    async fn read_frame(&mut self) -> io::Result<Option<Vec<u8>>> {
-        // Read the 4-byte length prefix.
-        let mut len_buf = [0u8; 4];
-        match self.reader.read_exact(&mut len_buf).await {
-            Ok(_) => {}
-            Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => return Ok(None),
-            Err(e) => return Err(e),
-        }
-
-        let len = u32::from_le_bytes(len_buf) as usize;
-        if len > MAX_FRAME_SIZE {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("frame too large: {len} bytes (max {MAX_FRAME_SIZE})"),
-            ));
-        }
-
-        let mut frame = vec![0u8; len];
-        self.reader.read_exact(&mut frame).await?;
-
-        Ok(Some(frame))
-    }
-}
-
-/// Write half of a UDS transport. Writes length-prefixed frames.
-///
-/// Uses `BufWriter` to batch small writes into fewer syscalls.
-pub struct UdsTransportWrite {
-    writer: BufWriter<tokio::net::unix::OwnedWriteHalf>,
-}
-
-impl TransportWrite for UdsTransportWrite {
-    async fn write_frame(&mut self, data: &[u8]) -> io::Result<()> {
-        let len = data.len() as u32;
-        self.writer.write_all(&len.to_le_bytes()).await?;
-        self.writer.write_all(data).await?;
-        Ok(())
-    }
-
-    async fn flush(&mut self) -> io::Result<()> {
-        self.writer.flush().await
+        let read_half = stream.try_clone()?;
+        Ok((read_half, stream, addr))
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::transport::{TransportRead, TransportStream, TransportWrite};
+    use crate::blocking::{BlockingFrameReader, BlockingFrameWriter};
 
-    #[tokio::test]
-    async fn frame_round_trip_over_uds() {
+    #[test]
+    fn accept_and_exchange_frame() {
         let dir = tempfile::tempdir().unwrap();
         let sock_path = dir.path().join("test.sock");
 
-        let listener = UdsTransportListener::bind(&sock_path).unwrap();
+        let listener = BlockingUdsListener::bind(&sock_path).unwrap();
 
-        // Client connects.
-        let client_stream = UnixStream::connect(&sock_path).await.unwrap();
-        let client = UdsTransportStream::new(client_stream);
-        let (mut client_read, mut client_write) = client.into_split();
+        let sock = sock_path.clone();
+        let handle = std::thread::spawn(move || {
+            let mut listener = listener;
+            let (read, write, _addr) = listener.accept().unwrap();
+            let mut reader = BlockingFrameReader::new(read);
+            let mut writer = BlockingFrameWriter::new(write);
 
-        // Server accepts.
-        let mut listener = listener;
-        let (server_stream, _) = listener.accept().await.unwrap();
-        let (mut server_read, mut server_write) = server_stream.into_split();
+            let frame = reader.read_frame().unwrap().unwrap();
+            writer.write_frame(&frame).unwrap();
+            writer.flush().unwrap();
+        });
 
-        // Client sends, server receives.
+        let stream = std::os::unix::net::UnixStream::connect(&sock).unwrap();
+        let mut writer = BlockingFrameWriter::new(stream.try_clone().unwrap());
+        let mut reader = BlockingFrameReader::new(stream);
+
         let data = b"hello trading";
-        client_write.write_frame(data).await.unwrap();
-        client_write.flush().await.unwrap();
+        writer.write_frame(data).unwrap();
+        writer.flush().unwrap();
 
-        let received = server_read.read_frame().await.unwrap().unwrap();
+        let received = reader.read_frame().unwrap().unwrap();
         assert_eq!(received, data);
 
-        // Server sends back, client receives.
-        let reply = b"ack";
-        server_write.write_frame(reply).await.unwrap();
-        server_write.flush().await.unwrap();
-
-        let received = client_read.read_frame().await.unwrap().unwrap();
-        assert_eq!(received, reply);
-    }
-
-    #[tokio::test]
-    async fn clean_disconnect_returns_none() {
-        let dir = tempfile::tempdir().unwrap();
-        let sock_path = dir.path().join("test.sock");
-
-        let listener = UdsTransportListener::bind(&sock_path).unwrap();
-
-        let client_stream = UnixStream::connect(&sock_path).await.unwrap();
-        let mut listener = listener;
-        let (server_stream, _) = listener.accept().await.unwrap();
-        let (mut server_read, _server_write) = server_stream.into_split();
-
-        // Drop client → server sees clean disconnect.
-        drop(client_stream);
-
-        let result = server_read.read_frame().await.unwrap();
-        assert!(result.is_none());
-    }
-
-    #[tokio::test]
-    async fn multiple_frames_in_sequence() {
-        let dir = tempfile::tempdir().unwrap();
-        let sock_path = dir.path().join("test.sock");
-
-        let listener = UdsTransportListener::bind(&sock_path).unwrap();
-
-        let client_stream = UnixStream::connect(&sock_path).await.unwrap();
-        let client = UdsTransportStream::new(client_stream);
-        let (_client_read, mut client_write) = client.into_split();
-
-        let mut listener = listener;
-        let (server_stream, _) = listener.accept().await.unwrap();
-        let (mut server_read, _server_write) = server_stream.into_split();
-
-        // Send 100 frames.
-        for i in 0u32..100 {
-            let data = i.to_le_bytes();
-            client_write.write_frame(&data).await.unwrap();
-        }
-        client_write.flush().await.unwrap();
-
-        // Read them all back.
-        for i in 0u32..100 {
-            let frame = server_read.read_frame().await.unwrap().unwrap();
-            assert_eq!(frame, i.to_le_bytes());
-        }
+        handle.join().unwrap();
     }
 }

@@ -1,5 +1,6 @@
 use std::net::SocketAddr;
 use std::num::NonZeroU64;
+use std::sync::mpsc;
 
 use crossterm::event::{self, Event, KeyCode, KeyEventKind};
 use ratatui::Frame;
@@ -7,7 +8,6 @@ use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, Paragraph};
-use tokio::sync::mpsc;
 
 use trading_client::Client;
 use trading_protocol::message::{Request, ResponseKind};
@@ -302,7 +302,7 @@ impl App {
                     "Cancelling order #{order_id} on {}",
                     SYMBOLS[*symbol].0
                 ));
-                if self.request_tx.try_send(request).is_err() {
+                if self.request_tx.send(request).is_err() {
                     self.log.push("Disconnected.".into());
                 }
                 self.screen = Screen::ActionMenu;
@@ -366,7 +366,7 @@ impl App {
         ));
 
         let request = Request::SubmitOrder { symbol: sym, order };
-        if self.request_tx.try_send(request).is_err() {
+        if self.request_tx.send(request).is_err() {
             self.log.push("Disconnected.".into());
         }
     }
@@ -443,27 +443,27 @@ fn format_report(report: &ExecutionReport) -> String {
     }
 }
 
-// ── Client task ─────────────────────────────────────────────────────
+// ── Client thread ───────────────────────────────────────────────────
 
-async fn client_task(
+fn client_thread(
     addr: SocketAddr,
-    mut request_rx: mpsc::Receiver<Request>,
+    request_rx: mpsc::Receiver<Request>,
     response_tx: mpsc::Sender<String>,
 ) {
-    let mut client = match Client::connect(addr).await {
+    let mut client = match Client::connect(addr) {
         Ok(c) => {
-            let _ = response_tx.send(format!("Connected to {addr}")).await;
+            let _ = response_tx.send(format!("Connected to {addr}"));
             c
         }
         Err(e) => {
-            let _ = response_tx.send(format!("Connection failed: {e}")).await;
+            let _ = response_tx.send(format!("Connection failed: {e}"));
             return;
         }
     };
 
-    while let Some(request) = request_rx.recv().await {
+    while let Ok(request) = request_rx.recv() {
         let start = std::time::Instant::now();
-        match client.send_request(&request).await {
+        match client.send_request(&request) {
             Ok(responses) => {
                 let latency = start.elapsed();
                 for resp in &responses {
@@ -472,15 +472,15 @@ async fn client_task(
                         ResponseKind::EngineError => "ENGINE ERROR".into(),
                         ResponseKind::BatchEnd => continue,
                     };
-                    let _ = response_tx.send(msg).await;
+                    let _ = response_tx.send(msg);
                 }
                 if responses.is_empty() {
-                    let _ = response_tx.send("(no reports)".into()).await;
+                    let _ = response_tx.send("(no reports)".into());
                 }
-                let _ = response_tx.send(format!("  ⏱ {latency:.3?}")).await;
+                let _ = response_tx.send(format!("  ⏱ {latency:.3?}"));
             }
             Err(e) => {
-                let _ = response_tx.send(format!("Request failed: {e}")).await;
+                let _ = response_tx.send(format!("Request failed: {e}"));
                 break;
             }
         }
@@ -698,17 +698,19 @@ fn centered_rect(width: u16, height: u16, area: Rect) -> Rect {
 
 // ── Main ────────────────────────────────────────────────────────────
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+fn main() -> Result<(), Box<dyn std::error::Error>> {
     let addr: SocketAddr = std::env::args()
         .nth(1)
         .unwrap_or_else(|| "127.0.0.1:9876".into())
         .parse()?;
 
-    let (request_tx, request_rx) = mpsc::channel::<Request>(16);
-    let (response_tx, response_rx) = mpsc::channel::<String>(64);
+    let (request_tx, request_rx) = mpsc::channel::<Request>();
+    let (response_tx, response_rx) = mpsc::channel::<String>();
 
-    tokio::spawn(client_task(addr, request_rx, response_tx));
+    std::thread::Builder::new()
+        .name("client".into())
+        .spawn(move || client_thread(addr, request_rx, response_tx))
+        .expect("spawn client thread");
 
     let mut terminal = ratatui::init();
     let mut app = App::new(request_tx, response_rx);

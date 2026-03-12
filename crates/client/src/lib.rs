@@ -1,18 +1,15 @@
 //! Client library for connecting to the trading server.
 //!
 //! Provides a typed API over the binary wire protocol. Connects via TCP,
-//! sends requests, and collects response batches.
+//! sends requests, and collects response batches using blocking I/O.
 
 use std::io;
 use std::net::SocketAddr;
 
-use tokio::net::TcpStream;
-
+use trading_protocol::blocking::{BlockingFrameReader, BlockingFrameWriter};
 use trading_protocol::codec;
 use trading_protocol::error::ProtocolError;
 use trading_protocol::message::{Request, ResponseKind};
-use trading_protocol::tcp::{TcpTransportRead, TcpTransportStream, TcpTransportWrite};
-use trading_protocol::transport::{TransportRead, TransportStream, TransportWrite};
 
 /// Error returned by client operations.
 #[derive(Debug)]
@@ -52,11 +49,11 @@ impl From<ProtocolError> for ClientError {
 /// Client connection to the trading server.
 ///
 /// Sends requests and receives response batches synchronously (one
-/// request at a time). For pipelining, a more sophisticated approach
-/// with request IDs and multiplexing would be needed.
+/// request at a time, blocking I/O). For pipelining, use
+/// `BlockingFrameReader`/`BlockingFrameWriter` directly.
 pub struct Client {
-    reader: TcpTransportRead,
-    writer: TcpTransportWrite,
+    reader: BlockingFrameReader<std::net::TcpStream>,
+    writer: BlockingFrameWriter<std::net::TcpStream>,
     /// Pre-allocated encode buffer. 128 bytes is sufficient for all
     /// request types (the largest is SubmitOrder with a StopLimit at ~60 bytes).
     encode_buf: [u8; 128],
@@ -64,11 +61,11 @@ pub struct Client {
 
 impl Client {
     /// Connect to a trading server at the given address.
-    pub async fn connect(addr: SocketAddr) -> Result<Self, ClientError> {
-        let stream = TcpStream::connect(addr).await?;
+    pub fn connect(addr: SocketAddr) -> Result<Self, ClientError> {
+        let stream = std::net::TcpStream::connect(addr)?;
         stream.set_nodelay(true)?;
-        let transport = TcpTransportStream::new(stream);
-        let (reader, writer) = transport.into_split();
+        let reader = BlockingFrameReader::new(stream.try_clone()?);
+        let writer = BlockingFrameWriter::new(stream);
         Ok(Self {
             reader,
             writer,
@@ -79,27 +76,18 @@ impl Client {
     /// Send a request and collect all responses until BatchEnd.
     ///
     /// Returns the list of responses (excluding the BatchEnd marker itself).
-    pub async fn send_request(
-        &mut self,
-        request: &Request,
-    ) -> Result<Vec<ResponseKind>, ClientError> {
+    pub fn send_request(&mut self, request: &Request) -> Result<Vec<ResponseKind>, ClientError> {
         // Encode and send.
         let written = codec::encode_request(request, &mut self.encode_buf)?;
         // write_frame expects payload without length prefix; encode_request
         // writes [length(4) | tag+payload], so skip the prefix.
-        self.writer
-            .write_frame(&self.encode_buf[4..written])
-            .await?;
-        self.writer.flush().await?;
+        self.writer.write_frame(&self.encode_buf[4..written])?;
+        self.writer.flush()?;
 
         // Collect responses until BatchEnd.
         let mut responses = Vec::new();
         loop {
-            let frame = self
-                .reader
-                .read_frame()
-                .await?
-                .ok_or(ClientError::Disconnected)?;
+            let frame = self.reader.read_frame()?.ok_or(ClientError::Disconnected)?;
 
             let response = codec::decode_response(&frame)?;
             match response {
@@ -115,70 +103,61 @@ impl Client {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use trading_protocol::tcp::TcpTransportListener;
-    use trading_protocol::transport::TransportListener;
     use trading_protocol::types::{OrderId, Symbol};
 
     /// Mock server that reads one request and responds with BatchEnd.
-    async fn mock_batch_end_server(mut listener: TcpTransportListener) {
-        let (stream, _) = listener.accept().await.unwrap();
-        let (mut reader, mut writer) = stream.into_split();
+    fn mock_batch_end_server(listener: std::net::TcpListener) {
+        let (stream, _) = listener.accept().unwrap();
+        let mut reader = BlockingFrameReader::new(stream.try_clone().unwrap());
+        let mut writer = BlockingFrameWriter::new(stream);
 
         // Read one request frame (discard it).
-        let _frame = reader.read_frame().await.unwrap().unwrap();
+        let _frame = reader.read_frame().unwrap().unwrap();
 
         // Respond with BatchEnd.
         let mut buf = [0u8; 128];
         let written = codec::encode_response(&ResponseKind::BatchEnd, &mut buf).unwrap();
-        writer.write_frame(&buf[4..written]).await.unwrap();
-        writer.flush().await.unwrap();
+        writer.write_frame(&buf[4..written]).unwrap();
+        writer.flush().unwrap();
     }
 
-    #[tokio::test]
-    async fn connect_send_receive_batch_end() {
-        let listener = TcpTransportListener::bind("127.0.0.1:0".parse().unwrap())
-            .await
-            .unwrap();
+    #[test]
+    fn connect_send_receive_batch_end() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
 
-        tokio::spawn(mock_batch_end_server(listener));
+        std::thread::spawn(move || mock_batch_end_server(listener));
 
-        let mut client = Client::connect(addr).await.unwrap();
+        let mut client = Client::connect(addr).unwrap();
         let responses = client
             .send_request(&Request::CancelOrder {
                 symbol: Symbol(1),
                 order_id: OrderId(42),
             })
-            .await
             .unwrap();
 
         // No reports before BatchEnd — just an empty batch.
         assert!(responses.is_empty());
     }
 
-    #[tokio::test]
-    async fn disconnect_before_batch_end_is_error() {
-        let listener = TcpTransportListener::bind("127.0.0.1:0".parse().unwrap())
-            .await
-            .unwrap();
+    #[test]
+    fn disconnect_before_batch_end_is_error() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
 
         // Server accepts and immediately drops the connection.
-        tokio::spawn(async move {
-            let mut listener = listener;
-            let (stream, _) = listener.accept().await.unwrap();
-            let (mut reader, _writer) = stream.into_split();
-            let _frame = reader.read_frame().await.unwrap();
+        std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let mut reader = BlockingFrameReader::new(stream);
+            let _frame = reader.read_frame().unwrap();
             // Drop without sending BatchEnd.
         });
 
-        let mut client = Client::connect(addr).await.unwrap();
-        let result = client
-            .send_request(&Request::CancelOrder {
-                symbol: Symbol(1),
-                order_id: OrderId(42),
-            })
-            .await;
+        let mut client = Client::connect(addr).unwrap();
+        let result = client.send_request(&Request::CancelOrder {
+            symbol: Symbol(1),
+            order_id: OrderId(42),
+        });
 
         assert!(result.is_err());
     }

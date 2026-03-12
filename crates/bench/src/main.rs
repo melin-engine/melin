@@ -9,9 +9,8 @@
 //! in-flight orders to keep the pipeline saturated without unbounded
 //! queue buildup. Measures per-order round-trip latency under load.
 //!
-//! The client uses blocking I/O (no tokio) to eliminate async scheduling
-//! noise from latency measurements. Only the server accept loop runs
-//! on a minimal tokio runtime in a background thread.
+//! Zero async — the server accept loop, pipeline threads, and client all
+//! use blocking I/O. No tokio dependency.
 //!
 //! Usage:
 //!     cargo run --release -p trading-bench [-- [--uds] <order_pairs>]
@@ -19,7 +18,6 @@
 //! Default: TCP transport, 1,000,000 order pairs (2,000,000 total orders).
 
 use std::io::{Read, Write};
-use std::net::SocketAddr;
 use std::num::NonZeroU64;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -33,6 +31,7 @@ use trading_engine::types::*;
 use trading_protocol::blocking::{BlockingFrameReader, BlockingFrameWriter};
 use trading_protocol::codec;
 use trading_protocol::message::{Request, ResponseKind};
+use trading_protocol::transport::BlockingTransportListener;
 use trading_server::server::ServerConfig;
 
 /// Number of order pairs (buy + sell) per benchmark run.
@@ -68,14 +67,24 @@ fn main() {
     let shutdown = Arc::new(AtomicBool::new(false));
 
     if use_uds {
+        use trading_protocol::uds::BlockingUdsListener;
+
         let sock_path = tmp_dir.join("bench.sock");
-        start_uds_server(sock_path.clone(), config, Arc::clone(&shutdown));
+        let listener = BlockingUdsListener::bind(&sock_path).expect("bind UDS");
+        start_server(listener, config, Arc::clone(&shutdown));
+
         let stream = connect_uds(&sock_path);
         let reader = BlockingFrameReader::new(stream.try_clone().expect("clone UDS stream"));
         let writer = BlockingFrameWriter::new(stream);
         run_bench_loop(reader, writer, "Unix domain socket", pairs, shutdown);
     } else {
-        let addr = start_tcp_server(config, Arc::clone(&shutdown));
+        use trading_protocol::tcp::BlockingTcpListener;
+
+        let listener = BlockingTcpListener::bind("127.0.0.1:0".parse().expect("valid addr"))
+            .expect("bind TCP");
+        let addr = listener.local_addr().expect("local addr");
+        start_server(listener, config, Arc::clone(&shutdown));
+
         let stream = connect_tcp(addr);
         stream.set_nodelay(true).expect("set TCP_NODELAY");
         let reader = BlockingFrameReader::new(stream.try_clone().expect("clone TCP stream"));
@@ -86,74 +95,26 @@ fn main() {
     let _ = std::fs::remove_dir_all(&tmp_dir);
 }
 
-/// Start TCP server in a background thread with its own tokio runtime.
-/// Returns the bound address once the listener is ready.
-fn start_tcp_server(config: ServerConfig, shutdown: Arc<AtomicBool>) -> SocketAddr {
-    use trading_protocol::tcp::TcpTransportListener;
-
-    let (addr_tx, addr_rx) = std_mpsc::channel();
-
+/// Start the server on a background thread. The listener is already bound,
+/// so the client can connect immediately (connections queue in the kernel
+/// backlog until the server calls `accept()`).
+fn start_server<L: BlockingTransportListener>(
+    listener: L,
+    config: ServerConfig,
+    shutdown: Arc<AtomicBool>,
+) {
     std::thread::Builder::new()
-        .name("server-runtime".into())
+        .name("server".into())
         .spawn(move || {
-            let rt = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .expect("server tokio runtime");
-
-            rt.block_on(async move {
-                let bind_addr: SocketAddr = "127.0.0.1:0".parse().expect("valid addr");
-                let listener = TcpTransportListener::bind(bind_addr)
-                    .await
-                    .expect("bind TCP");
-                let actual_addr = listener.local_addr().expect("local addr");
-                addr_tx.send(actual_addr).expect("send addr");
-
-                if let Err(e) =
-                    trading_server::server::run_with_shutdown(listener, config, shutdown).await
-                {
-                    eprintln!("server error: {e}");
-                }
-            });
+            if let Err(e) = trading_server::server::run_with_shutdown(listener, config, shutdown) {
+                eprintln!("server error: {e}");
+            }
         })
         .expect("spawn server thread");
-
-    addr_rx.recv().expect("receive server addr")
-}
-
-/// Start UDS server in a background thread with its own tokio runtime.
-/// Blocks until the listener is bound and ready for connections.
-fn start_uds_server(sock_path: PathBuf, config: ServerConfig, shutdown: Arc<AtomicBool>) {
-    use trading_protocol::uds::UdsTransportListener;
-
-    let (ready_tx, ready_rx) = std_mpsc::channel();
-
-    std::thread::Builder::new()
-        .name("server-runtime".into())
-        .spawn(move || {
-            let rt = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .expect("server tokio runtime");
-
-            rt.block_on(async move {
-                let listener = UdsTransportListener::bind(&sock_path).expect("bind UDS");
-                ready_tx.send(()).expect("send ready");
-
-                if let Err(e) =
-                    trading_server::server::run_with_shutdown(listener, config, shutdown).await
-                {
-                    eprintln!("server error: {e}");
-                }
-            });
-        })
-        .expect("spawn server thread");
-
-    ready_rx.recv().expect("wait for server ready");
 }
 
 /// Connect to TCP server with retry.
-fn connect_tcp(addr: SocketAddr) -> std::net::TcpStream {
+fn connect_tcp(addr: std::net::SocketAddr) -> std::net::TcpStream {
     for attempt in 1..=50 {
         match std::net::TcpStream::connect(addr) {
             Ok(s) => return s,
@@ -178,7 +139,7 @@ fn connect_uds(path: &std::path::Path) -> std::os::unix::net::UnixStream {
 
 /// Run the core benchmark loop: encode, send, receive, report.
 ///
-/// Pure blocking I/O — no async runtime on the client side.
+/// Pure blocking I/O — no async runtime anywhere.
 fn run_bench_loop<R: Read + Send + 'static, W: Write + Send>(
     reader: BlockingFrameReader<R>,
     mut writer: BlockingFrameWriter<W>,
