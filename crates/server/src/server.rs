@@ -40,6 +40,14 @@ pub struct ServerConfig {
     pub journal_path: PathBuf,
     /// Optional path to a snapshot file for faster recovery.
     pub snapshot_path: Option<PathBuf>,
+    /// CPU core IDs for pinning the 4 pipeline threads.
+    /// Order: [journal, matching, response, publisher].
+    /// Default: cores 1–4 (skips core 0 which handles kernel interrupts).
+    ///
+    /// Production recommendation: use `isolcpus` to reserve cores,
+    /// keep all cores on the same NUMA node, avoid hyperthreading
+    /// siblings for latency-sensitive threads.
+    pub core_affinity: [usize; 4],
 }
 
 impl Default for ServerConfig {
@@ -50,6 +58,7 @@ impl Default for ServerConfig {
             response_channel_capacity: 65_536,
             journal_path: PathBuf::from("trading.journal"),
             snapshot_path: None,
+            core_affinity: [1, 2, 3, 4],
         }
     }
 }
@@ -84,22 +93,34 @@ pub async fn run<L: TransportListener>(
     let shutdown = Arc::new(AtomicBool::new(false));
 
     // Spawn pipeline OS threads.
+    // Copy core_affinity once — [usize; 4] is Copy, moved into each closure.
+    let cores = config.core_affinity;
+
     let s1 = Arc::clone(&shutdown);
     let journal_handle = std::thread::Builder::new()
         .name("journal".into())
-        .spawn(move || journal_stage.run(&s1))
+        .spawn(move || {
+            apply_affinity("journal", cores[0]);
+            journal_stage.run(&s1)
+        })
         .expect("failed to spawn journal thread");
 
     let s2 = Arc::clone(&shutdown);
     let matching_handle = std::thread::Builder::new()
         .name("matching".into())
-        .spawn(move || matching_stage.run(&s2))
+        .spawn(move || {
+            apply_affinity("matching", cores[1]);
+            matching_stage.run(&s2)
+        })
         .expect("failed to spawn matching thread");
 
     let s3 = Arc::clone(&shutdown);
     let response_handle = std::thread::Builder::new()
         .name("response".into())
-        .spawn(move || crate::response::run(output_consumer, control_rx, journal_cursor, &s3))
+        .spawn(move || {
+            apply_affinity("response", cores[2]);
+            crate::response::run(output_consumer, control_rx, journal_cursor, &s3)
+        })
         .expect("failed to spawn response thread");
 
     // Command channel: all client reader tasks → publisher thread.
@@ -109,6 +130,7 @@ pub async fn run<L: TransportListener>(
     let publisher_handle = std::thread::Builder::new()
         .name("publisher".into())
         .spawn(move || {
+            apply_affinity("publisher", cores[3]);
             crate::engine::run(engine_rx, input_producer, control_tx);
         })
         .expect("failed to spawn publisher thread");
@@ -197,6 +219,14 @@ fn init_engine(config: &ServerConfig) -> Result<JournaledExchange, Box<dyn std::
         let mut engine = JournaledExchange::create(&config.journal_path)?;
         seed_test_data(&mut engine)?;
         Ok(engine)
+    }
+}
+
+/// Apply CPU core affinity for a pipeline thread, logging the result.
+fn apply_affinity(thread_name: &str, core_id: usize) {
+    match crate::affinity::pin_to_core(core_id) {
+        Ok(c) => info!(core = c, thread = thread_name, "pinned to core"),
+        Err(e) => tracing::warn!(thread = thread_name, error = e, "core pinning failed"),
     }
 }
 

@@ -950,6 +950,7 @@ dependencies = [
 name = "trading-server"
 version = "0.1.0"
 dependencies = [
+ "libc",
  "tempfile",
  "tokio",
  "tracing",

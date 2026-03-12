@@ -3,5 +3,6 @@ members = ["crates/*"]
 resolver = "3"
 
 [workspace.dependencies]
+libc = "0.2"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }

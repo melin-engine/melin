@@ -1,5 +1,6 @@
 //! Trading server library — exposes server startup for embedding (benchmarks, tests).
 
+mod affinity;
 mod engine;
 mod response;
 pub mod server;
