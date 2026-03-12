@@ -86,8 +86,20 @@ pub fn run(
     let mut server_e2e_hist =
         trace::StageHistogram::new("server e2e (reader recv → response flush)");
 
+    // Track connections with buffered (unflushed) writes across batches.
+    // Under high load, we process many SPSC batches before flushing,
+    // amortizing the cost of N flush syscalls (one per connection) across
+    // many batches instead of paying it every batch.
+    let mut dirty_connections: HashSet<u64> = HashSet::new();
+
     loop {
         if shutdown.load(Ordering::Relaxed) {
+            // Flush any remaining buffered writes before shutdown.
+            for conn_id in &dirty_connections {
+                if let Some(writer) = connections.get_mut(conn_id) {
+                    let _ = writer.flush();
+                }
+            }
             #[cfg(feature = "latency-trace")]
             {
                 spsc_hist.print_report();
@@ -115,6 +127,25 @@ pub fn run(
         // Consume output slots from matching stage.
         let count = consumer.consume_batch(&mut batch, MAX_BATCH);
         if count == 0 {
+            // SPSC is empty — flush all dirty connections before spinning.
+            // This is the adaptive flushing strategy: under high load, we
+            // process many batches before reaching this point, amortizing
+            // flush syscall overhead across thousands of entries. Under low
+            // load, we reach this quickly and flush promptly.
+            if !dirty_connections.is_empty() {
+                for conn_id in dirty_connections.drain() {
+                    if let Some(writer) = connections.get_mut(&conn_id)
+                        && let Err(e) = writer.flush()
+                    {
+                        tracing::debug!(
+                            connection_id = conn_id,
+                            error = %e,
+                            "flush error, dropping connection"
+                        );
+                        connections.remove(&conn_id);
+                    }
+                }
+            }
             std::hint::spin_loop();
             continue;
         }
@@ -144,12 +175,6 @@ pub fn run(
                 }
             }
         }
-
-        // Track connections that received writes during this batch so we
-        // can flush them once at the end, instead of per-BatchEnd event.
-        // With N clients interleaved, this reduces flush syscalls from
-        // ~N/batch to exactly N/batch (one per dirty connection).
-        let mut dirty_connections: HashSet<u64> = HashSet::new();
 
         for slot in &batch[..count] {
             #[cfg(feature = "latency-trace")]
@@ -195,22 +220,6 @@ pub fn run(
                     server_e2e_hist
                         .record_ns(trace::trace_elapsed_ns(slot.recv_ts, trace::trace_ts()));
                 }
-            }
-        }
-
-        // Flush all connections that received writes during this batch.
-        // Deferred flushing amortizes syscall overhead: one flush per
-        // dirty connection per batch instead of one per BatchEnd event.
-        for conn_id in &dirty_connections {
-            if let Some(writer) = connections.get_mut(conn_id)
-                && let Err(e) = writer.flush()
-            {
-                tracing::debug!(
-                    connection_id = conn_id,
-                    error = %e,
-                    "flush error, dropping connection"
-                );
-                connections.remove(conn_id);
             }
         }
 
