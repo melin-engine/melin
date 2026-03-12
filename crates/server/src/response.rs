@@ -122,6 +122,29 @@ pub fn run(
         #[cfg(feature = "latency-trace")]
         let consume_ts = trace::trace_ts();
 
+        // Wait for the journal to confirm the entire batch is durable.
+        // Find the highest input_seq in the batch and wait once, rather
+        // than spin-waiting per event. This eliminates redundant atomic
+        // loads when the batch contains many events from different clients.
+        #[cfg(not(feature = "no-fsync"))]
+        {
+            let max_seq = batch[..count]
+                .iter()
+                .map(|s| s.input_seq)
+                .max()
+                .expect("non-empty batch");
+            let needed = max_seq + 1;
+            if cached_journal_pos < needed {
+                loop {
+                    cached_journal_pos = journal_cursor.get().load(Ordering::Acquire);
+                    if cached_journal_pos >= needed {
+                        break;
+                    }
+                    std::hint::spin_loop();
+                }
+            }
+        }
+
         // Track connections that received writes during this batch so we
         // can flush them once at the end, instead of per-BatchEnd event.
         // With N clients interleaved, this reduces flush syscalls from
@@ -131,21 +154,6 @@ pub fn run(
         for slot in &batch[..count] {
             #[cfg(feature = "latency-trace")]
             spsc_hist.record_ns(trace::trace_elapsed_ns(slot.match_complete_ts, consume_ts));
-
-            // Wait for the journal to confirm this event is durable.
-            #[cfg(not(feature = "no-fsync"))]
-            {
-                let needed = slot.input_seq + 1;
-                if cached_journal_pos < needed {
-                    loop {
-                        cached_journal_pos = journal_cursor.get().load(Ordering::Acquire);
-                        if cached_journal_pos >= needed {
-                            break;
-                        }
-                        std::hint::spin_loop();
-                    }
-                }
-            }
 
             let kind = match slot.payload {
                 OutputPayload::Report(report) => ResponseKind::Report(report),
