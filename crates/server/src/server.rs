@@ -5,6 +5,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use tokio::sync::mpsc;
+use tracing::{debug, error, info};
 
 use trading_engine::journal::JournaledExchange;
 
@@ -67,7 +68,7 @@ pub async fn run<L: TransportListener>(
         })
         .expect("failed to spawn engine thread");
 
-    eprintln!("[server] listening on {}", config.bind_addr);
+    info!(addr = %config.bind_addr, "listening");
 
     // Monotonically increasing connection ID counter. AtomicU64 because
     // the accept loop is the only writer, but using atomic for future
@@ -79,14 +80,14 @@ pub async fn run<L: TransportListener>(
         let (stream, addr) = match listener.accept().await {
             Ok(conn) => conn,
             Err(e) => {
-                eprintln!("[server] accept error: {e}");
+                error!(error = %e, "accept error");
                 continue;
             }
         };
 
         let connection_id = ConnectionId(next_connection_id.fetch_add(1, Ordering::Relaxed));
 
-        eprintln!("[server] new connection {} from {addr}", connection_id.0);
+        debug!(connection_id = connection_id.0, addr = %addr, "new connection");
 
         // Per-connection response channel.
         let (response_tx, response_rx) =
@@ -103,7 +104,7 @@ pub async fn run<L: TransportListener>(
             .await
             .is_err()
         {
-            eprintln!("[server] engine channel closed, shutting down");
+            info!("engine channel closed, shutting down");
             break;
         }
 
@@ -131,17 +132,17 @@ fn init_engine(config: &ServerConfig) -> Result<JournaledExchange, Box<dyn std::
         && snap_path.exists()
         && config.journal_path.exists()
     {
-        eprintln!("[server] recovering from snapshot + journal");
+        info!("recovering from snapshot + journal");
         let engine = JournaledExchange::recover_from_snapshot(snap_path, &config.journal_path)?;
         return Ok(engine);
     }
 
     if config.journal_path.exists() {
-        eprintln!("[server] recovering from journal");
+        info!("recovering from journal");
         let engine = JournaledExchange::recover(&config.journal_path)?;
         Ok(engine)
     } else {
-        eprintln!("[server] creating new journal");
+        info!("creating new journal");
         let engine = JournaledExchange::create(&config.journal_path)?;
         Ok(engine)
     }

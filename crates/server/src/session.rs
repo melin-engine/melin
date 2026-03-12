@@ -11,6 +11,8 @@ use std::net::SocketAddr;
 
 use tokio::sync::mpsc;
 
+use tracing::{debug, error};
+
 use trading_protocol::codec;
 use trading_protocol::message::{ConnectionId, EngineCommand, Response};
 use trading_protocol::transport::{TransportRead, TransportWrite};
@@ -50,11 +52,11 @@ async fn reader_task<R: TransportRead>(
             Ok(Some(frame)) => frame,
             Ok(None) => {
                 // Clean disconnect.
-                eprintln!("[session] client {addr} disconnected");
+                debug!(addr = %addr, "client disconnected");
                 break;
             }
             Err(e) => {
-                eprintln!("[session] read error from {addr}: {e}");
+                debug!(addr = %addr, error = %e, "read error");
                 break;
             }
         };
@@ -62,7 +64,7 @@ async fn reader_task<R: TransportRead>(
         let request = match codec::decode_request(&frame) {
             Ok(req) => req,
             Err(e) => {
-                eprintln!("[session] decode error from {addr}: {e}");
+                debug!(addr = %addr, error = %e, "decode error");
                 // Skip malformed messages rather than disconnecting — the
                 // client may have a codec bug but other messages may be valid.
                 continue;
@@ -75,7 +77,7 @@ async fn reader_task<R: TransportRead>(
         };
         if engine_tx.send(cmd).await.is_err() {
             // Engine shut down.
-            eprintln!("[session] engine channel closed, dropping {addr}");
+            debug!(addr = %addr, "engine channel closed, dropping connection");
             break;
         }
     }
@@ -102,10 +104,7 @@ async fn writer_task<W: TransportWrite>(
         let written = match codec::encode_response(&response, &mut buf) {
             Ok(n) => n,
             Err(e) => {
-                eprintln!(
-                    "[session] encode error for connection {}: {e}",
-                    connection_id.0
-                );
+                error!(connection_id = connection_id.0, error = %e, "encode error");
                 continue;
             }
         };
@@ -113,14 +112,14 @@ async fn writer_task<W: TransportWrite>(
         // write_frame expects the payload (tag + fields), not the length prefix.
         // Our encode_response writes [length(4) | tag+payload], so skip the prefix.
         if let Err(e) = writer.write_frame(&buf[4..written]).await {
-            eprintln!("[session] write error to {addr}: {e}");
+            debug!(addr = %addr, error = %e, "write error");
             break;
         }
 
         // Flush after each batch to minimize latency — the client is waiting
         // for all reports from its request before proceeding.
         if is_batch_end && let Err(e) = writer.flush().await {
-            eprintln!("[session] flush error to {addr}: {e}");
+            debug!(addr = %addr, error = %e, "flush error");
             break;
         }
     }

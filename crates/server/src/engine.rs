@@ -7,6 +7,7 @@
 use std::collections::HashMap;
 
 use tokio::sync::mpsc;
+use tracing::{error, info};
 
 use trading_engine::journal::JournaledExchange;
 use trading_engine::types::ExecutionReport;
@@ -33,7 +34,7 @@ pub fn run(mut engine: JournaledExchange, mut rx: mpsc::Receiver<EngineCommand>)
             Some(cmd) => cmd,
             None => {
                 // All senders dropped — server is shutting down.
-                eprintln!("[engine] command channel closed, shutting down");
+                info!("command channel closed, shutting down");
                 break;
             }
         };
@@ -79,14 +80,14 @@ fn process_request(
     match *request {
         Request::SubmitOrder { symbol, order } => {
             if let Err(e) = engine.execute(symbol, order, reports) {
-                eprintln!("[engine] journal error on submit: {e}");
+                error!(error = %e, "journal error on submit");
                 // Reports may be empty — the caller will send BatchEnd anyway,
                 // which tells the client the request was processed (with no fills).
             }
         }
         Request::CancelOrder { symbol, order_id } => {
             if let Err(e) = engine.cancel(symbol, order_id, reports) {
-                eprintln!("[engine] journal error on cancel: {e}");
+                error!(error = %e, "journal error on cancel");
             }
         }
     }

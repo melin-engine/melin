@@ -26,6 +26,7 @@ cargo fmt            # format
 - **Reasonably optimized from the start** — don't prematurely optimize, but make performance-conscious choices by default: minimize allocations, avoid locks on the hot path, favor cache-friendly data structures. Profile before micro-optimizing.
 - **No `.unwrap()` in production code** — use proper error handling. `.unwrap()` is fine in tests.
 - **Comment data structure and type choices** — always add a comment justifying why a specific collection, data structure, or numeric type was chosen (e.g., why `BTreeMap` over `HashMap`, why `u64` over `u128`).
+- **Log levels** — `error!`: server malfunctions only (bugs, journal I/O failures) — must never fire due to bad client input or client network issues. `info!`: server lifecycle events (start, stop, recovery). `debug!`: client-caused events (connections, disconnects, malformed messages, write failures).
 
 ### Git
 - **No co-authored commits** — do not add `Co-Authored-By` trailers.
@@ -93,15 +94,15 @@ cargo fmt            # format
 - [x] Binary wire protocol (custom codec, length-prefixed framing)
 - [x] Transport abstraction (TCP now, QUIC/kernel bypass later)
 - [x] TCP transport with `TCP_NODELAY`
-- [ ] Server (engine thread, session management, accept loop)
-- [ ] Client library
+- [x] Server (engine thread, session management, accept loop)
+- [x] Client library
 - [ ] Admin API (instrument registration, deposits, withdrawals)
 - [ ] TLS (rustls or native-tls for encrypted client connections)
 - [ ] QUIC transport (investigate `quinn`)
 - [ ] Kernel bypass (DPDK/ef_vi) for single-digit µs latency
 
 ### Logging & Observability
-- [ ] Structured logging (connection events, order flow, errors)
+- [x] Structured logging (`tracing` crate, error-level for malfunctions)
 - [ ] Output event log (ExecutionReports for audit trail)
 - [ ] Metrics (latency histograms, throughput counters, connection counts)
 

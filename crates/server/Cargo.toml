@@ -7,6 +7,8 @@ edition = "2024"
 trading-engine = { path = "../engine" }
 trading-protocol = { path = "../protocol" }
 tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "sync", "macros"] }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
 
 [dev-dependencies]
 tempfile = "3"
