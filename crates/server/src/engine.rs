@@ -1,40 +1,41 @@
-//! Engine loop — runs on a dedicated OS thread.
+//! Publisher thread — bridges tokio async world to the disruptor pipeline.
 //!
-//! Owns the `JournaledExchange` and the connection table. All commands
-//! (orders, connects, disconnects) flow through a single mpsc channel,
-//! so no mutex is needed. This is the LMAX single-writer pattern.
+//! Receives `EngineCommand` messages from session reader tasks via a tokio
+//! mpsc channel, then either:
+//! - **Request**: publishes to the input disruptor ring buffer (hot path).
+//! - **Connected/Disconnected**: forwards to the response stage's control
+//!   channel (rare, not hot path).
 
-use std::collections::HashMap;
+use std::sync::mpsc;
 
-use tokio::sync::mpsc;
-use tracing::{error, info};
+use tokio::sync::mpsc as tokio_mpsc;
+use tracing::info;
 
-use trading_engine::journal::JournaledExchange;
-use trading_engine::types::ExecutionReport;
+use trading_engine::journal::event::JournalEvent;
+use trading_engine::journal::pipeline::InputSlot;
 
-use trading_protocol::message::{ConnectionId, EngineCommand, Request, Response};
+use trading_disruptor::ring;
 
-/// Run the engine loop. Blocks the calling thread until the command
+use trading_protocol::message::{EngineCommand, Request};
+
+use crate::response::ControlEvent;
+
+/// Run the publisher loop. Blocks the calling thread until the command
 /// channel is closed (server shutdown).
 ///
-/// `rx` receives commands from all client reader tasks plus connect/disconnect
-/// events from the accept loop.
-pub fn run(mut engine: JournaledExchange, mut rx: mpsc::Receiver<EngineCommand>) {
-    // Connection table: maps connection IDs to their response senders.
-    // HashMap for O(1) lookup/insert/remove. The connection count is
-    // bounded by the OS file descriptor limit, so this stays small.
-    let mut connections: HashMap<ConnectionId, mpsc::Sender<Response>> = HashMap::new();
-
-    // Pre-allocated report buffer, reused across commands to avoid
-    // per-request allocation on the hot path.
-    let mut reports: Vec<ExecutionReport> = Vec::with_capacity(64);
-
+/// This thread is the single writer to the input disruptor — consistent
+/// with the LMAX single-writer principle.
+pub fn run(
+    mut rx: tokio_mpsc::Receiver<EngineCommand>,
+    mut input_producer: ring::Producer<InputSlot>,
+    control_tx: mpsc::Sender<ControlEvent>,
+) {
     loop {
         let cmd = match rx.blocking_recv() {
             Some(cmd) => cmd,
             None => {
                 // All senders dropped — server is shutting down.
-                info!("command channel closed, shutting down");
+                info!("command channel closed, shutting down publisher");
                 break;
             }
         };
@@ -44,51 +45,35 @@ pub fn run(mut engine: JournaledExchange, mut rx: mpsc::Receiver<EngineCommand>)
                 connection_id,
                 sender,
             } => {
-                connections.insert(connection_id, sender);
+                // Route to the response stage via the control channel.
+                let _ = control_tx.send(ControlEvent::Connected {
+                    connection_id: connection_id.0,
+                    sender,
+                });
             }
             EngineCommand::Disconnected { connection_id } => {
-                connections.remove(&connection_id);
+                let _ = control_tx.send(ControlEvent::Disconnected {
+                    connection_id: connection_id.0,
+                });
             }
             EngineCommand::Request {
                 connection_id,
                 request,
             } => {
-                reports.clear();
-                process_request(&mut engine, &request, &mut reports);
-
-                if let Some(tx) = connections.get(&connection_id) {
-                    for report in &reports {
-                        // try_send to avoid blocking the engine thread if the
-                        // writer task's channel is full (backpressure). If the
-                        // channel is full, the response is dropped — the client
-                        // will see a gap and can reconnect.
-                        let _ = tx.try_send(Response::Report(*report));
-                    }
-                    let _ = tx.try_send(Response::BatchEnd);
-                }
+                let event = request_to_event(&request);
+                input_producer.publish(InputSlot {
+                    connection_id: connection_id.0,
+                    event,
+                });
             }
         }
     }
 }
 
-/// Execute a single request against the engine.
-fn process_request(
-    engine: &mut JournaledExchange,
-    request: &Request,
-    reports: &mut Vec<ExecutionReport>,
-) {
+/// Convert a wire `Request` to a `JournalEvent` for the pipeline.
+fn request_to_event(request: &Request) -> JournalEvent {
     match *request {
-        Request::SubmitOrder { symbol, order } => {
-            if let Err(e) = engine.execute(symbol, order, reports) {
-                error!(error = %e, "journal error on submit");
-                // Reports may be empty — the caller will send BatchEnd anyway,
-                // which tells the client the request was processed (with no fills).
-            }
-        }
-        Request::CancelOrder { symbol, order_id } => {
-            if let Err(e) = engine.cancel(symbol, order_id, reports) {
-                error!(error = %e, "journal error on cancel");
-            }
-        }
+        Request::SubmitOrder { symbol, order } => JournalEvent::SubmitOrder { symbol, order },
+        Request::CancelOrder { symbol, order_id } => JournalEvent::CancelOrder { symbol, order_id },
     }
 }

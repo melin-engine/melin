@@ -1,13 +1,22 @@
-//! Server orchestrator — binds the accept loop, engine thread, and sessions.
+//! Server orchestrator — binds the accept loop, pipeline threads, and sessions.
+//!
+//! On startup:
+//! 1. Recovers or creates the `JournaledExchange`.
+//! 2. Decomposes it into `(Exchange, JournalWriter)` via `into_parts()`.
+//! 3. Builds the disruptor pipeline (input ring buffer + output SPSC).
+//! 4. Spawns 4 OS threads: publisher, journal, matching, response.
+//! 5. Runs the accept loop, spawning sessions for each connection.
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use tokio::sync::mpsc;
 use tracing::{debug, error, info};
 
 use trading_engine::journal::JournaledExchange;
+use trading_engine::journal::pipeline::build_pipeline;
 
 use trading_protocol::message::{ConnectionId, EngineCommand, Response};
 use trading_protocol::transport::{TransportListener, TransportStream};
@@ -45,9 +54,11 @@ impl Default for ServerConfig {
 
 /// Run the trading server.
 ///
-/// 1. Initializes (or recovers) the `JournaledExchange`.
-/// 2. Spawns the engine on a dedicated OS thread.
-/// 3. Runs the accept loop, spawning sessions for each connection.
+/// 1. Initializes (or recovers) the `JournaledExchange`, then decomposes
+///    it into `Exchange` and `JournalWriter` for the pipeline.
+/// 2. Builds the disruptor pipeline (input ring + output SPSC + stages).
+/// 3. Spawns 4 OS threads: publisher, journal, matching, response.
+/// 4. Runs the accept loop, spawning sessions for each connection.
 ///
 /// Returns when the listener encounters a fatal error.
 pub async fn run<L: TransportListener>(
@@ -57,16 +68,48 @@ pub async fn run<L: TransportListener>(
     // Initialize or recover the exchange.
     let engine = init_engine(&config)?;
 
-    // Command channel: all client reader tasks → engine thread.
+    // Decompose into parts for the pipeline.
+    let (exchange, writer) = engine.into_parts();
+
+    // Build the disruptor pipeline.
+    let (input_producer, journal_stage, matching_stage, output_consumer) =
+        build_pipeline(exchange, writer);
+
+    // Control channel for connect/disconnect events → response stage.
+    let (control_tx, control_rx) = std::sync::mpsc::channel();
+
+    // Shared shutdown flag for pipeline threads.
+    let shutdown = Arc::new(AtomicBool::new(false));
+
+    // Spawn pipeline OS threads.
+    let s1 = Arc::clone(&shutdown);
+    let journal_handle = std::thread::Builder::new()
+        .name("journal".into())
+        .spawn(move || journal_stage.run(&s1))
+        .expect("failed to spawn journal thread");
+
+    let s2 = Arc::clone(&shutdown);
+    let matching_handle = std::thread::Builder::new()
+        .name("matching".into())
+        .spawn(move || matching_stage.run(&s2))
+        .expect("failed to spawn matching thread");
+
+    let s3 = Arc::clone(&shutdown);
+    let response_handle = std::thread::Builder::new()
+        .name("response".into())
+        .spawn(move || crate::response::run(output_consumer, control_rx, &s3))
+        .expect("failed to spawn response thread");
+
+    // Command channel: all client reader tasks → publisher thread.
     let (engine_tx, engine_rx) = mpsc::channel::<EngineCommand>(config.command_channel_capacity);
 
-    // Spawn the engine on a dedicated OS thread to avoid tokio scheduler jitter.
-    let engine_handle = std::thread::Builder::new()
-        .name("engine".into())
+    // Spawn the publisher on a dedicated OS thread.
+    let publisher_handle = std::thread::Builder::new()
+        .name("publisher".into())
         .spawn(move || {
-            crate::engine::run(engine, engine_rx);
+            crate::engine::run(engine_rx, input_producer, control_tx);
         })
-        .expect("failed to spawn engine thread");
+        .expect("failed to spawn publisher thread");
 
     info!(addr = %config.bind_addr, "listening");
 
@@ -94,7 +137,7 @@ pub async fn run<L: TransportListener>(
             mpsc::channel::<Response>(config.response_channel_capacity);
 
         // Register the connection with the engine before spawning tasks.
-        // This ensures the engine has the response sender before any
+        // This ensures the response stage has the sender before any
         // requests arrive.
         if engine_tx
             .send(EngineCommand::Connected {
@@ -119,9 +162,15 @@ pub async fn run<L: TransportListener>(
         );
     }
 
-    // Drop the sender to signal the engine thread to shut down.
+    // Signal pipeline threads to shut down.
+    shutdown.store(true, Ordering::Relaxed);
+
+    // Drop the sender to close the publisher thread's channel.
     drop(engine_tx);
-    let _ = engine_handle.join();
+    let _ = publisher_handle.join();
+    let _ = journal_handle.join();
+    let _ = matching_handle.join();
+    let _ = response_handle.join();
 
     Ok(())
 }

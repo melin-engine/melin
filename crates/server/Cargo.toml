@@ -5,6 +5,7 @@ edition = "2024"
 
 [dependencies]
 trading-engine = { path = "../engine" }
+trading-disruptor = { path = "../disruptor" }
 trading-protocol = { path = "../protocol" }
 tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "sync", "macros"] }
 tracing = { workspace = true }
