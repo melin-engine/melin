@@ -9,6 +9,7 @@ pub mod codec;
 pub mod engine;
 pub mod error;
 pub mod event;
+pub mod pipeline;
 pub mod reader;
 pub mod snapshot;
 pub mod writer;

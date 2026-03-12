@@ -90,6 +90,31 @@ impl JournalWriter {
         Ok(seq)
     }
 
+    /// Append an event to the journal **without** flushing to disk.
+    ///
+    /// Used by the pipeline journal stage to batch multiple events into
+    /// a single `write_all` before calling `sync()` once for the batch.
+    /// This amortizes the fsync cost across many events under load.
+    pub fn append_no_sync(&mut self, event: &JournalEvent) -> Result<u64, JournalError> {
+        let seq = self.next_sequence;
+        let timestamp_ns = wall_clock_nanos();
+
+        let written = codec::encode(seq, timestamp_ns, event, &mut self.buffer)?;
+        self.file.write_all(&self.buffer[..written])?;
+
+        self.next_sequence += 1;
+        Ok(seq)
+    }
+
+    /// Flush the journal to disk (fsync).
+    ///
+    /// Called after one or more `append_no_sync` calls to make the batch
+    /// durable in a single I/O operation.
+    pub fn sync(&mut self) -> Result<(), JournalError> {
+        self.file.sync_data()?;
+        Ok(())
+    }
+
     /// Current next sequence number (useful for snapshot coordination).
     pub fn next_sequence(&self) -> u64 {
         self.next_sequence

@@ -155,6 +155,15 @@ impl JournaledExchange {
     pub fn journal_path(&self) -> &Path {
         self.writer.path()
     }
+
+    /// Decompose into parts for the pipeline architecture.
+    ///
+    /// After recovery, the exchange and journal writer are handed to separate
+    /// pipeline stages: the matching thread owns the `Exchange`, and the
+    /// journal thread owns the `JournalWriter`.
+    pub fn into_parts(self) -> (Exchange, JournalWriter) {
+        (self.exchange, self.writer)
+    }
 }
 
 /// Replay a single journal event into an exchange. Used during recovery.
