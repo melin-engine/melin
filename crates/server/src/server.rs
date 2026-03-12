@@ -28,11 +28,13 @@ pub struct ServerConfig {
     /// Address to bind the TCP listener.
     pub bind_addr: SocketAddr,
     /// Capacity of the engine command channel (inbound from all clients).
-    /// Sized for burst absorption — 64K commands can queue without backpressure.
+    /// 256K commands — at 10M orders/sec with 100 clients, gives ~2.5 ms
+    /// of burst buffering per client before backpressure.
     pub command_channel_capacity: usize,
     /// Capacity of per-connection response channels.
-    /// Smaller than the command channel since each connection handles fewer
-    /// concurrent responses.
+    /// 64K slots × ~40 bytes = ~2.5 MiB per connection. Must be large
+    /// enough that the TCP writer task can keep up under sustained load
+    /// without dropping responses via try_send.
     pub response_channel_capacity: usize,
     /// Path to the journal file for durable event sourcing.
     pub journal_path: PathBuf,
@@ -44,8 +46,8 @@ impl Default for ServerConfig {
     fn default() -> Self {
         Self {
             bind_addr: "127.0.0.1:9876".parse().expect("valid default addr"),
-            command_channel_capacity: 65_536,
-            response_channel_capacity: 4_096,
+            command_channel_capacity: 262_144,
+            response_channel_capacity: 65_536,
             journal_path: PathBuf::from("trading.journal"),
             snapshot_path: None,
         }

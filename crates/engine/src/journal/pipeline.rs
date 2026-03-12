@@ -25,11 +25,15 @@ use trading_disruptor::ring;
 use trading_disruptor::spsc;
 
 /// Ring buffer capacity for the input disruptor (journal + matching consumers).
-/// 2^16 = 65,536 slots — matches the server's command channel capacity.
-pub const INPUT_RING_CAPACITY: usize = 1 << 16;
+/// 2^20 = 1,048,576 slots. At ~72 bytes per slot, this is ~72 MiB — fits in
+/// L3 cache on modern server CPUs. Provides ~100 ms of buffering at 10M
+/// orders/sec, enough headroom for fsync stalls without backpressure.
+pub const INPUT_RING_CAPACITY: usize = 1 << 20;
 
 /// SPSC queue capacity for the output path (matching → response).
-pub const OUTPUT_RING_CAPACITY: usize = 1 << 16;
+/// Matches the input ring size since one input event can produce multiple
+/// output messages (e.g., Fill + BatchEnd).
+pub const OUTPUT_RING_CAPACITY: usize = 1 << 20;
 
 /// Maximum number of events processed in one journal batch.
 /// Limits the time spent encoding before fsync, keeping tail latency bounded.
