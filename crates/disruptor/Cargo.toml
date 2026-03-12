@@ -1,0 +1,7 @@
+[package]
+name = "trading-disruptor"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+# No external dependencies — this is a generic, reusable ring buffer library.
