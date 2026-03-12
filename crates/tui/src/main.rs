@@ -462,8 +462,10 @@ async fn client_task(
     };
 
     while let Some(request) = request_rx.recv().await {
+        let start = std::time::Instant::now();
         match client.send_request(&request).await {
             Ok(responses) => {
+                let latency = start.elapsed();
                 for resp in &responses {
                     let msg = match resp {
                         Response::Report(report) => format_report(report),
@@ -475,6 +477,7 @@ async fn client_task(
                 if responses.is_empty() {
                     let _ = response_tx.send("(no reports)".into()).await;
                 }
+                let _ = response_tx.send(format!("  ⏱ {latency:.3?}")).await;
             }
             Err(e) => {
                 let _ = response_tx.send(format!("Request failed: {e}")).await;
