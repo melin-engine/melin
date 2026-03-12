@@ -9,18 +9,23 @@
 //! in-flight orders to keep the pipeline saturated without unbounded
 //! queue buildup. Measures per-order round-trip latency under load.
 //!
-//! Zero async — the server accept loop, pipeline threads, and client all
+//! Multi-client mode (`--clients=N`) spawns N independent client
+//! connections, each with its own pipelining loop. This pushes aggregate
+//! event rates beyond the single-client transport bottleneck (~200K/s).
+//!
+//! Zero async — the server accept loop, pipeline threads, and clients all
 //! use blocking I/O. No tokio dependency.
 //!
 //! Usage:
-//!     cargo run --release -p trading-bench [-- [--uds] <order_pairs>]
+//!     cargo run --release -p trading-bench [-- [--uds] [--clients=N] [--window=N] [--group-commit-us=N] <order_pairs>]
 //!
-//! Default: TCP transport, 1,000,000 order pairs (2,000,000 total orders).
+//! Default: TCP transport, 1 client, 1,000,000 order pairs (2,000,000 total orders).
 
 use std::io::{Read, Write};
 use std::num::NonZeroU64;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::Barrier;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc as std_mpsc;
 use std::time::{Duration, Instant};
@@ -37,32 +42,25 @@ use trading_server::server::ServerConfig;
 /// Number of order pairs (buy + sell) per benchmark run.
 const DEFAULT_PAIRS: usize = 1_000_000;
 
-/// Warmup orders (not measured) to prime the pipeline and caches.
+/// Warmup orders (not measured) per client to prime the pipeline and caches.
 const WARMUP_ORDERS: usize = 1_000;
 
-/// Default number of orders in flight simultaneously. Controls the level
-/// of pipelining — enough to keep the server pipeline saturated (journal +
+/// Default number of orders in flight simultaneously per client. Controls the
+/// level of pipelining — enough to keep the server pipeline saturated (journal +
 /// matching stages overlap), small enough that per-order latency reflects
 /// actual processing time rather than unbounded queueing.
 const DEFAULT_WINDOW: usize = 64;
+
+/// Default number of concurrent client connections.
+const DEFAULT_CLIENTS: usize = 1;
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let use_uds = args.iter().any(|a| a == "--uds");
 
-    // Parse --window=N
-    let window: usize = args
-        .iter()
-        .find_map(|a| a.strip_prefix("--window="))
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(DEFAULT_WINDOW);
-
-    // Parse --group-commit-us=N (group commit delay in microseconds)
-    let group_commit_us: u64 = args
-        .iter()
-        .find_map(|a| a.strip_prefix("--group-commit-us="))
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(0);
+    let window: usize = parse_flag(&args, "--window=").unwrap_or(DEFAULT_WINDOW);
+    let group_commit_us: u64 = parse_flag(&args, "--group-commit-us=").unwrap_or(0);
+    let num_clients: usize = parse_flag(&args, "--clients=").unwrap_or(DEFAULT_CLIENTS);
 
     let pairs: usize = args
         .iter()
@@ -89,15 +87,21 @@ fn main() {
         let listener = BlockingUdsListener::bind(&sock_path).expect("bind UDS");
         start_server(listener, config, Arc::clone(&shutdown));
 
-        let stream = connect_uds(&sock_path);
-        let reader = BlockingFrameReader::new(stream.try_clone().expect("clone UDS stream"));
-        let writer = BlockingFrameWriter::new(stream);
-        run_bench_loop(
-            reader,
-            writer,
+        // Factory that creates a new UDS connection.
+        let sock_path_ref = &sock_path;
+        let connect = || {
+            let stream = connect_uds(sock_path_ref);
+            let reader = BlockingFrameReader::new(stream.try_clone().expect("clone UDS stream"));
+            let writer = BlockingFrameWriter::new(stream);
+            (reader, writer)
+        };
+
+        run_multi_client(
+            connect,
             "Unix domain socket",
             pairs,
             window,
+            num_clients,
             group_commit_us,
             shutdown,
         );
@@ -109,22 +113,33 @@ fn main() {
         let addr = listener.local_addr().expect("local addr");
         start_server(listener, config, Arc::clone(&shutdown));
 
-        let stream = connect_tcp(addr);
-        stream.set_nodelay(true).expect("set TCP_NODELAY");
-        let reader = BlockingFrameReader::new(stream.try_clone().expect("clone TCP stream"));
-        let writer = BlockingFrameWriter::new(stream);
-        run_bench_loop(
-            reader,
-            writer,
+        let connect = || {
+            let stream = connect_tcp(addr);
+            stream.set_nodelay(true).expect("set TCP_NODELAY");
+            let reader = BlockingFrameReader::new(stream.try_clone().expect("clone TCP stream"));
+            let writer = BlockingFrameWriter::new(stream);
+            (reader, writer)
+        };
+
+        run_multi_client(
+            connect,
             "TCP loopback",
             pairs,
             window,
+            num_clients,
             group_commit_us,
             shutdown,
         );
     }
 
     let _ = std::fs::remove_dir_all(&tmp_dir);
+}
+
+/// Parse a `--key=value` flag from the argument list.
+fn parse_flag<T: std::str::FromStr>(args: &[String], prefix: &str) -> Option<T> {
+    args.iter()
+        .find_map(|a| a.strip_prefix(prefix))
+        .and_then(|s| s.parse().ok())
 }
 
 /// Start the server on a background thread. The listener is already bound,
@@ -169,18 +184,163 @@ fn connect_uds(path: &std::path::Path) -> std::os::unix::net::UnixStream {
     unreachable!()
 }
 
-/// Run the core benchmark loop: encode, send, receive, report.
+/// Spawn N client connections, each running its own pipelining loop, and
+/// report aggregate throughput and merged latency histograms.
 ///
-/// Pure blocking I/O — no async runtime anywhere.
-fn run_bench_loop<R: Read + Send + 'static, W: Write + Send>(
-    reader: BlockingFrameReader<R>,
-    mut writer: BlockingFrameWriter<W>,
+/// The `connect` closure creates a new (reader, writer) pair for each client.
+/// All clients synchronize via a barrier before starting their blast loops
+/// to ensure they measure concurrent load, not staggered connection setup.
+fn run_multi_client<R, W, F>(
+    connect: F,
     transport_name: &str,
-    pairs: usize,
+    total_pairs: usize,
     window: usize,
+    num_clients: usize,
     group_commit_us: u64,
     shutdown: Arc<AtomicBool>,
-) {
+) where
+    R: Read + Send + 'static,
+    W: Write + Send + 'static,
+    F: Fn() -> (BlockingFrameReader<R>, BlockingFrameWriter<W>),
+{
+    // Divide work evenly across clients. Remaining pairs go to the last client.
+    let pairs_per_client = total_pairs / num_clients;
+    let remainder = total_pairs % num_clients;
+
+    // Barrier: all clients + main thread wait until everyone is connected and
+    // ready, so we measure concurrent load, not staggered setup.
+    let barrier = Arc::new(Barrier::new(num_clients + 1));
+
+    // Collect client thread handles. Each returns (histogram, duration).
+    let mut handles = Vec::with_capacity(num_clients);
+
+    for client_id in 0..num_clients {
+        let (reader, writer) = connect();
+        let barrier = Arc::clone(&barrier);
+
+        // Last client picks up remainder pairs.
+        let client_pairs = if client_id == num_clients - 1 {
+            pairs_per_client + remainder
+        } else {
+            pairs_per_client
+        };
+
+        // Order ID offset: each client gets a unique range to avoid collisions.
+        // Client 0: [1, 2*pairs_0 + warmup], Client 1: [offset_1, ...], etc.
+        let order_id_offset: u64 = (0..client_id)
+            .map(|c| {
+                let p = if c == num_clients - 1 {
+                    pairs_per_client + remainder
+                } else {
+                    pairs_per_client
+                };
+                (WARMUP_ORDERS + p * 2) as u64
+            })
+            .sum();
+
+        let handle = std::thread::Builder::new()
+            .name(format!("client-{client_id}"))
+            .spawn(move || {
+                run_client_loop(
+                    reader,
+                    writer,
+                    client_pairs,
+                    window,
+                    order_id_offset,
+                    barrier,
+                )
+            })
+            .expect("spawn client thread");
+
+        handles.push(handle);
+    }
+
+    // Wait for all clients to be ready, then release them simultaneously.
+    barrier.wait();
+    let blast_start = Instant::now();
+
+    // Collect results from all clients.
+    // Histogram range: 1 ns to 10 s, 3 significant digits.
+    let mut merged_histogram =
+        Histogram::<u64>::new_with_bounds(1, 10_000_000_000, 3).expect("histogram bounds");
+    for handle in handles {
+        let (histogram, _duration) = handle.join().expect("client thread panicked");
+        merged_histogram.add(&histogram).expect("merge histograms");
+    }
+
+    let blast_duration = blast_start.elapsed();
+
+    // --- Report ---
+    let total_measured = total_pairs * 2;
+    let total_orders = total_measured + (WARMUP_ORDERS * num_clients);
+    let throughput = (total_orders as f64) / blast_duration.as_secs_f64();
+    let wall_ms = blast_duration.as_micros() as f64 / 1000.0;
+
+    println!(
+        "=== Pipelined Benchmark ({total_measured} orders, {} warmup, window={window}, clients={num_clients}) ===",
+        WARMUP_ORDERS * num_clients
+    );
+    if group_commit_us > 0 {
+        println!("  Group commit delay: {group_commit_us} µs");
+    }
+    println!();
+    println!("  Transport: {transport_name}");
+    println!();
+    println!("  Throughput");
+    println!("    wall time:  {wall_ms:.2} ms");
+    println!(
+        "    throughput: {throughput:.0} orders/sec ({:.2} µs/order)",
+        1_000_000.0 / throughput
+    );
+    println!();
+    println!("  Per-Order Round-Trip Latency (all clients merged)");
+    println!(
+        "    min:    {:>8.2} µs",
+        merged_histogram.min() as f64 / 1000.0
+    );
+    println!(
+        "    p50:    {:>8.2} µs",
+        merged_histogram.value_at_quantile(0.50) as f64 / 1000.0
+    );
+    println!(
+        "    p90:    {:>8.2} µs",
+        merged_histogram.value_at_quantile(0.90) as f64 / 1000.0
+    );
+    println!(
+        "    p99:    {:>8.2} µs",
+        merged_histogram.value_at_quantile(0.99) as f64 / 1000.0
+    );
+    println!(
+        "    p99.9:  {:>8.2} µs",
+        merged_histogram.value_at_quantile(0.999) as f64 / 1000.0
+    );
+    println!(
+        "    max:    {:>8.2} µs",
+        merged_histogram.max() as f64 / 1000.0
+    );
+
+    // Signal server shutdown so pipeline threads can clean up and print
+    // latency-trace reports (if the feature is enabled).
+    println!();
+    println!("=== Pipeline Latency Trace ===");
+    println!();
+    shutdown.store(true, Ordering::Relaxed);
+    // Give pipeline threads time to drain and print reports.
+    std::thread::sleep(Duration::from_millis(200));
+}
+
+/// Run a single client's pipelining loop. Called from a dedicated thread.
+///
+/// Returns `(histogram, duration)` — the latency histogram (excluding warmup)
+/// and the wall-clock duration of the measured blast.
+fn run_client_loop<R: Read + Send + 'static, W: Write + Send>(
+    reader: BlockingFrameReader<R>,
+    mut writer: BlockingFrameWriter<W>,
+    pairs: usize,
+    window: usize,
+    order_id_offset: u64,
+    barrier: Arc<Barrier>,
+) -> (Histogram<u64>, Duration) {
     let total_orders = WARMUP_ORDERS + (pairs * 2);
     let nz = |v: u64| NonZeroU64::new(v).expect("non-zero");
 
@@ -191,7 +351,7 @@ fn run_bench_loop<R: Read + Send + 'static, W: Write + Send>(
     let mut encode_buf = [0u8; 128];
 
     for i in 0..total_orders {
-        let order_id = OrderId((i as u64) + 1);
+        let order_id = OrderId(order_id_offset + (i as u64) + 1);
         let side = if i % 2 == 0 { Side::Buy } else { Side::Sell };
 
         let request = Request::SubmitOrder {
@@ -256,6 +416,9 @@ fn run_bench_loop<R: Read + Send + 'static, W: Write + Send>(
         })
         .expect("spawn reader thread");
 
+    // Wait for all clients to be connected and encoded before starting.
+    barrier.wait();
+
     // Sender: pushes timestamp then frame. Blocks when WINDOW orders are
     // in-flight (bounded sync channel). Flushes periodically and always
     // before the channel would block (to prevent deadlock — the receiver
@@ -299,58 +462,7 @@ fn run_bench_loop<R: Read + Send + 'static, W: Write + Send>(
     let histogram = recv_handle.join().expect("receiver thread panicked");
     let blast_duration = blast_start.elapsed();
 
-    // --- Report ---
-    let measured_orders = pairs * 2;
-    // Throughput uses total_orders (including warmup) since blast_duration
-    // covers the entire run. The pipeline is warm for all but the first
-    // few hundred orders, so this is representative of steady state.
-    let throughput = (total_orders as f64) / blast_duration.as_secs_f64();
-    let wall_ms = blast_duration.as_micros() as f64 / 1000.0;
-
-    println!(
-        "=== Pipelined Benchmark ({measured_orders} orders, {WARMUP_ORDERS} warmup, window={window}) ==="
-    );
-    if group_commit_us > 0 {
-        println!("  Group commit delay: {group_commit_us} µs");
-    }
-    println!();
-    println!("  Transport: {transport_name}");
-    println!();
-    println!("  Throughput");
-    println!("    wall time:  {wall_ms:.2} ms");
-    println!(
-        "    throughput: {throughput:.0} orders/sec ({:.2} µs/order)",
-        1_000_000.0 / throughput
-    );
-    println!();
-    println!("  Per-Order Round-Trip Latency");
-    println!("    min:    {:>8.2} µs", histogram.min() as f64 / 1000.0);
-    println!(
-        "    p50:    {:>8.2} µs",
-        histogram.value_at_quantile(0.50) as f64 / 1000.0
-    );
-    println!(
-        "    p90:    {:>8.2} µs",
-        histogram.value_at_quantile(0.90) as f64 / 1000.0
-    );
-    println!(
-        "    p99:    {:>8.2} µs",
-        histogram.value_at_quantile(0.99) as f64 / 1000.0
-    );
-    println!(
-        "    p99.9:  {:>8.2} µs",
-        histogram.value_at_quantile(0.999) as f64 / 1000.0
-    );
-    println!("    max:    {:>8.2} µs", histogram.max() as f64 / 1000.0);
-
-    // Signal server shutdown so pipeline threads can clean up and print
-    // latency-trace reports (if the feature is enabled).
-    println!();
-    println!("=== Pipeline Latency Trace ===");
-    println!();
-    shutdown.store(true, Ordering::Relaxed);
-    // Give pipeline threads time to drain and print reports.
-    std::thread::sleep(Duration::from_millis(200));
+    (histogram, blast_duration)
 }
 
 /// Create a temporary directory that persists for the process lifetime.
