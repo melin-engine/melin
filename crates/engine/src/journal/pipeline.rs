@@ -1,17 +1,26 @@
 //! Pipeline stages for the LMAX disruptor architecture.
 //!
-//! Two hot-path stages consume from an input disruptor (multi-consumer ring buffer):
+//! Two hot-path stages consume from an input disruptor in **parallel**:
 //! 1. **Journal stage**: batch-writes events to the WAL, fsyncs once per batch.
-//! 2. **Matching stage**: executes commands on the `Exchange`, publishes responses.
+//!    Advances its cursor only after fsync.
+//! 2. **Matching stage**: executes commands on the `Exchange`, publishes responses
+//!    to the output SPSC. Runs concurrently with the journal — no waiting for fsync.
 //!
-//! The response stage (routing responses to per-connection channels) lives in the
-//! server crate since it depends on tokio channels.
+//! The **response stage** (in the server crate) consumes the output SPSC but
+//! gates on the journal cursor before sending: a response is only sent to
+//! the client after the corresponding event is durable on disk.
+//!
+//! This gives maximum pipeline parallelism (matching overlaps journal I/O)
+//! while preserving persist-before-ack at the response boundary.
+
+use std::sync::Arc;
 
 use crate::exchange::Exchange;
 use crate::journal::event::JournalEvent;
 use crate::journal::writer::JournalWriter;
 use crate::types::ExecutionReport;
 
+use trading_disruptor::padding::Sequence;
 use trading_disruptor::ring;
 use trading_disruptor::spsc;
 
@@ -58,11 +67,16 @@ impl Default for InputSlot {
 /// Slot in the output SPSC queue (matching → response).
 ///
 /// Each slot carries either an execution report or a batch-end marker
-/// for a specific connection. `Copy` for zero-cost ring buffer ops.
+/// for a specific connection, plus the input sequence it originated from
+/// so the response stage can gate on journal completion.
 #[derive(Debug, Clone, Copy)]
 pub struct OutputSlot {
     /// Which client connection receives this response.
     pub connection_id: u64,
+    /// Input disruptor sequence this output originated from.
+    /// The response stage must not send this until the journal cursor
+    /// has advanced past this value (i.e., the event is durable).
+    pub input_seq: u64,
     /// The response payload.
     pub payload: OutputPayload,
 }
@@ -82,6 +96,7 @@ impl Default for OutputSlot {
     fn default() -> Self {
         Self {
             connection_id: 0,
+            input_seq: 0,
             payload: OutputPayload::BatchEnd,
         }
     }
@@ -90,8 +105,9 @@ impl Default for OutputSlot {
 /// Journal stage: consumes from the input disruptor, batch-writes events
 /// to the WAL, and fsyncs once per batch.
 ///
-/// Runs on a dedicated OS thread. Advancing the journal consumer's sequence
-/// signals to the matching stage that events are durable.
+/// Runs on a dedicated OS thread. Uses `read_batch` + `commit` so its
+/// cursor only advances **after** fsync. The response stage reads this
+/// cursor to know when events are durable.
 pub struct JournalStage {
     writer: JournalWriter,
     consumer: ring::Consumer<InputSlot>,
@@ -105,6 +121,11 @@ impl JournalStage {
 
     /// Run the journal stage loop. Blocks until shutdown is signaled.
     ///
+    /// Uses `read_batch` + `commit` (not `consume_batch`) to ensure the
+    /// journal cursor is only advanced **after** fsync. The response stage
+    /// checks this cursor before sending — this is the persist-before-ack
+    /// boundary.
+    ///
     /// Returns the `JournalWriter` on shutdown for clean resource release.
     pub fn run(mut self, shutdown: &std::sync::atomic::AtomicBool) -> JournalWriter {
         let mut batch = [InputSlot::default(); MAX_JOURNAL_BATCH];
@@ -115,32 +136,35 @@ impl JournalStage {
                 return self.writer;
             }
 
-            let count = self.consumer.consume_batch(&mut batch, MAX_JOURNAL_BATCH);
+            // Read entries WITHOUT advancing the cursor.
+            let count = self.consumer.read_batch(&mut batch, MAX_JOURNAL_BATCH);
             if count == 0 {
                 std::hint::spin_loop();
                 continue;
             }
 
-            // Batch encode all events, then single fsync.
+            // Batch encode all events.
             for slot in &batch[..count] {
                 if let Err(e) = self.writer.append_no_sync(&slot.event) {
                     eprintln!("journal encode error: {e}");
                 }
             }
 
-            // Single fsync for the entire batch — this is where the latency
-            // amortization happens. Under load, one ~700µs fsync covers
-            // potentially hundreds of events.
+            // Single fsync for the entire batch.
             if let Err(e) = self.writer.sync() {
                 eprintln!("journal sync error: {e}");
             }
+
+            // NOW advance the cursor — the response stage uses this to know
+            // events are safely on disk.
+            self.consumer.commit(count);
         }
     }
 
     /// Drain any remaining entries from the ring buffer on shutdown.
     fn drain_remaining(&mut self, batch: &mut [InputSlot]) {
         loop {
-            let count = self.consumer.consume_batch(batch, MAX_JOURNAL_BATCH);
+            let count = self.consumer.read_batch(batch, MAX_JOURNAL_BATCH);
             if count == 0 {
                 break;
             }
@@ -148,15 +172,17 @@ impl JournalStage {
                 let _ = self.writer.append_no_sync(&slot.event);
             }
             let _ = self.writer.sync();
+            self.consumer.commit(count);
         }
     }
 }
 
-/// Matching stage: consumes from the input disruptor (gated on journal),
-/// executes commands on the Exchange, and publishes responses to the output SPSC.
+/// Matching stage: consumes from the input disruptor (in parallel with
+/// the journal stage), executes commands on the Exchange, and publishes
+/// responses to the output SPSC.
 ///
-/// Runs on a dedicated OS thread. Only processes events after the journal
-/// stage has made them durable.
+/// Runs on a dedicated OS thread. Does NOT wait for journal fsync —
+/// the persist-before-ack check happens in the response stage.
 pub struct MatchingStage {
     exchange: Exchange,
     consumer: ring::Consumer<InputSlot>,
@@ -190,7 +216,7 @@ impl MatchingStage {
             }
 
             let entry = self.consumer.try_consume();
-            let Some((_, slot)) = entry else {
+            let Some((input_seq, slot)) = entry else {
                 std::hint::spin_loop();
                 continue;
             };
@@ -199,9 +225,12 @@ impl MatchingStage {
             self.process_event(&slot, &mut reports);
 
             // Publish execution reports to the output SPSC.
+            // All output slots for this request carry the same input_seq
+            // so the response stage can gate on journal completion.
             for report in &reports {
                 self.output.publish(OutputSlot {
                     connection_id: slot.connection_id,
+                    input_seq,
                     payload: OutputPayload::Report(*report),
                 });
             }
@@ -209,6 +238,7 @@ impl MatchingStage {
             // Signal end of batch for this request.
             self.output.publish(OutputSlot {
                 connection_id: slot.connection_id,
+                input_seq,
                 payload: OutputPayload::BatchEnd,
             });
         }
@@ -237,10 +267,15 @@ impl MatchingStage {
     }
 }
 
-/// Build the input disruptor and output SPSC, returning the stages and producers.
+/// Build the input disruptor and output SPSC, returning the stages and
+/// the journal progress cursor for the response stage.
 ///
-/// The caller (server) is responsible for building the response stage and
-/// spawning all threads.
+/// **Topology**: both journal and matching consumers are gated on the
+/// producer (parallel). The matching stage does NOT wait for journal
+/// fsync — the response stage gates on the journal cursor instead.
+///
+/// The caller (server) is responsible for building the response stage
+/// and spawning all threads.
 pub fn build_pipeline(
     exchange: Exchange,
     writer: JournalWriter,
@@ -249,16 +284,21 @@ pub fn build_pipeline(
     JournalStage,
     MatchingStage,
     spsc::Consumer<OutputSlot>,
+    Arc<Sequence>,
 ) {
-    // Input disruptor: 1 producer, 2 consumers (journal → matching).
+    // Input disruptor: 1 producer, 2 parallel consumers.
     let (input_producer, mut consumers) =
         ring::DisruptorBuilder::<InputSlot>::new(INPUT_RING_CAPACITY)
             .add_consumer() // consumer 0: journal, gated on producer
-            .add_consumer_after(0) // consumer 1: matching, gated on journal
+            .add_consumer() // consumer 1: matching, gated on producer (parallel)
             .build();
 
     let matching_consumer = consumers.pop().expect("matching consumer");
     let journal_consumer = consumers.pop().expect("journal consumer");
+
+    // Grab the journal's progress cursor before moving it into the stage.
+    // The response stage will read this to gate on fsync completion.
+    let journal_cursor = journal_consumer.progress_counter();
 
     // Output SPSC: matching → response.
     let (output_producer, output_consumer) = spsc::channel::<OutputSlot>(OUTPUT_RING_CAPACITY);
@@ -271,6 +311,7 @@ pub fn build_pipeline(
         journal_stage,
         matching_stage,
         output_consumer,
+        journal_cursor,
     )
 }
 
@@ -279,8 +320,7 @@ mod tests {
     use super::*;
     use crate::types::*;
     use std::num::NonZeroU64;
-    use std::sync::Arc;
-    use std::sync::atomic::AtomicBool;
+    use std::sync::atomic::{AtomicBool, Ordering};
 
     fn limit_order(id: u64, account: AccountId, side: Side, price: u64, qty: u64) -> Order {
         Order {
@@ -302,7 +342,6 @@ mod tests {
 
         let writer = JournalWriter::create(&path).unwrap();
 
-        // Create a minimal disruptor with one consumer (the journal stage).
         let (mut producer, mut consumers) = ring::DisruptorBuilder::<InputSlot>::new(64)
             .add_consumer()
             .build();
@@ -313,7 +352,6 @@ mod tests {
         let shutdown = Arc::new(AtomicBool::new(false));
         let shutdown2 = Arc::clone(&shutdown);
 
-        // Publish some events.
         producer.publish(InputSlot {
             connection_id: 1,
             event: JournalEvent::AddInstrument {
@@ -333,14 +371,12 @@ mod tests {
             },
         });
 
-        // Run journal stage briefly.
         let handle = std::thread::spawn(move || stage.run(&shutdown2));
 
         std::thread::sleep(std::time::Duration::from_millis(50));
-        shutdown.store(true, std::sync::atomic::Ordering::Relaxed);
+        shutdown.store(true, Ordering::Relaxed);
         let _writer = handle.join().unwrap();
 
-        // Verify events were journaled by reading them back.
         let mut reader = crate::journal::JournalReader::open(&path).unwrap();
         let entry1 = reader.next_entry().unwrap().unwrap();
         assert!(matches!(entry1.event, JournalEvent::AddInstrument { .. }));
@@ -360,13 +396,11 @@ mod tests {
         exchange.deposit(AccountId(1), CurrencyId(1), 1_000_000);
         exchange.deposit(AccountId(2), CurrencyId(0), 1_000);
 
-        // Create input disruptor (single consumer for matching).
         let (mut input_producer, mut consumers) = ring::DisruptorBuilder::<InputSlot>::new(64)
             .add_consumer()
             .build();
         let consumer = consumers.pop().unwrap();
 
-        // Create output SPSC.
         let (output_producer, mut output_consumer) = spsc::channel::<OutputSlot>(64);
 
         let stage = MatchingStage::new(exchange, consumer, output_producer);
@@ -374,7 +408,6 @@ mod tests {
         let shutdown = Arc::new(AtomicBool::new(false));
         let shutdown2 = Arc::clone(&shutdown);
 
-        // Submit a sell order.
         input_producer.publish(InputSlot {
             connection_id: 42,
             event: JournalEvent::SubmitOrder {
@@ -385,7 +418,6 @@ mod tests {
 
         let handle = std::thread::spawn(move || stage.run(&shutdown2));
 
-        // Wait for output.
         let mut attempts = 0;
         let output = loop {
             if let Some((_, slot)) = output_consumer.try_consume() {
@@ -399,12 +431,12 @@ mod tests {
         };
 
         assert_eq!(output.connection_id, 42);
+        assert_eq!(output.input_seq, 0);
         assert!(matches!(
             output.payload,
             OutputPayload::Report(ExecutionReport::Placed { .. })
         ));
 
-        // Consume the BatchEnd.
         let batch_end = loop {
             if let Some((_, slot)) = output_consumer.try_consume() {
                 break slot;
@@ -413,12 +445,12 @@ mod tests {
         };
         assert!(matches!(batch_end.payload, OutputPayload::BatchEnd));
 
-        shutdown.store(true, std::sync::atomic::Ordering::Relaxed);
+        shutdown.store(true, Ordering::Relaxed);
         let _exchange = handle.join().unwrap();
     }
 
     #[test]
-    fn full_pipeline_journal_and_matching() {
+    fn full_pipeline_journal_and_matching_parallel() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("full_pipeline.journal");
 
@@ -433,8 +465,13 @@ mod tests {
 
         let writer = JournalWriter::create(&path).unwrap();
 
-        let (mut input_producer, journal_stage, matching_stage, mut output_consumer) =
-            build_pipeline(exchange, writer);
+        let (
+            mut input_producer,
+            journal_stage,
+            matching_stage,
+            mut output_consumer,
+            journal_cursor,
+        ) = build_pipeline(exchange, writer);
 
         let shutdown = Arc::new(AtomicBool::new(false));
         let s1 = Arc::clone(&shutdown);
@@ -464,8 +501,20 @@ mod tests {
             output.payload,
             OutputPayload::Report(ExecutionReport::Placed { .. })
         ));
+        assert_eq!(output.input_seq, 0);
 
-        shutdown.store(true, std::sync::atomic::Ordering::Relaxed);
+        // Wait for journal to confirm durability (cursor > input_seq).
+        loop {
+            let cursor = journal_cursor.get().load(Ordering::Acquire);
+            if cursor > output.input_seq {
+                break;
+            }
+            std::hint::spin_loop();
+        }
+
+        // Now it's safe to send the response — event is durable.
+
+        shutdown.store(true, Ordering::Relaxed);
         let _writer = t_journal.join().unwrap();
         let _exchange = t_matching.join().unwrap();
 

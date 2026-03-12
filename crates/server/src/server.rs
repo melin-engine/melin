@@ -72,7 +72,7 @@ pub async fn run<L: TransportListener>(
     let (exchange, writer) = engine.into_parts();
 
     // Build the disruptor pipeline.
-    let (input_producer, journal_stage, matching_stage, output_consumer) =
+    let (input_producer, journal_stage, matching_stage, output_consumer, journal_cursor) =
         build_pipeline(exchange, writer);
 
     // Control channel for connect/disconnect events → response stage.
@@ -97,7 +97,7 @@ pub async fn run<L: TransportListener>(
     let s3 = Arc::clone(&shutdown);
     let response_handle = std::thread::Builder::new()
         .name("response".into())
-        .spawn(move || crate::response::run(output_consumer, control_rx, &s3))
+        .spawn(move || crate::response::run(output_consumer, control_rx, journal_cursor, &s3))
         .expect("failed to spawn response thread");
 
     // Command channel: all client reader tasks → publisher thread.

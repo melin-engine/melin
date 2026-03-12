@@ -196,9 +196,26 @@ impl<T: Copy + Default> Consumer<T> {
     /// Read a batch of entries. Returns the number of entries read (up to `max`
     /// and `buf.len()`). Advances the consumer's progress counter once for the batch.
     ///
-    /// Batch consumption is critical for the journal stage: one `sync_data()`
-    /// call covers all entries in the batch.
+    /// For consumers that need to defer cursor advancement (e.g., the journal
+    /// stage must fsync before signaling downstream), use [`read_batch`] +
+    /// [`commit`] instead.
     pub fn consume_batch(&mut self, buf: &mut [T], max: usize) -> usize {
+        let count = self.read_batch(buf, max);
+        if count > 0 {
+            self.commit(count);
+        }
+        count
+    }
+
+    /// Read a batch of entries **without** advancing the progress counter.
+    ///
+    /// The entries are copied into `buf` and `next_read` advances internally,
+    /// but downstream consumers won't see the progress until [`commit`] is
+    /// called. This is critical for the journal stage: it must fsync before
+    /// signaling the matching stage that entries are durable.
+    ///
+    /// Returns the number of entries read (up to `max` and `buf.len()`).
+    pub fn read_batch(&mut self, buf: &mut [T], max: usize) -> usize {
         // Always re-read dependency for batch operations.
         self.cached_dep = self.dependency.load();
         let available = self.cached_dep.saturating_sub(self.next_read);
@@ -214,11 +231,28 @@ impl<T: Copy + Default> Consumer<T> {
         }
 
         self.next_read += count as u64;
-        // Single release store for the whole batch.
+        count
+    }
+
+    /// Advance the progress counter by `count` entries, making them visible
+    /// to downstream consumers and the producer (for backpressure).
+    ///
+    /// Must be called after [`read_batch`] once the entries have been
+    /// durably processed (e.g., after fsync).
+    pub fn commit(&mut self, _count: usize) {
+        // Release store so downstream consumers see our progress.
         self.processed
             .get()
             .store(self.next_read, Ordering::Release);
-        count
+    }
+
+    /// Returns a shared reference to this consumer's progress counter.
+    ///
+    /// External code (e.g., the response stage) can read this to determine
+    /// how far this consumer has progressed, enabling out-of-band gating
+    /// without a direct disruptor dependency.
+    pub fn progress_counter(&self) -> Arc<Sequence> {
+        Arc::clone(&self.processed)
     }
 
     /// Number of entries available to read.
