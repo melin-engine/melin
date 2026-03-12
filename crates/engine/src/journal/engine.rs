@@ -413,22 +413,23 @@ mod tests {
             je.deposit(ACCT_A, USD, 100_000).unwrap();
         }
 
-        let original_len = std::fs::metadata(&path).unwrap().len();
+        // Find valid data end (file is larger due to pre-allocation).
+        let valid_data_end = {
+            let mut reader = crate::journal::reader::JournalReader::open(&path).unwrap();
+            while reader.next_entry().unwrap().is_some() {}
+            reader.valid_file_end()
+        };
 
-        // Simulate crash by truncating last entry.
+        // Simulate crash by truncating 3 bytes from the last valid entry.
         {
             let file = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
-            file.set_len(original_len - 3).unwrap();
+            file.set_len(valid_data_end - 3).unwrap();
         }
 
         // Recovery should replay the first event (AddInstrument) but not the truncated Deposit.
         let je = JournaledExchange::recover(&path).unwrap();
         assert_eq!(je.next_sequence(), 2); // Only 1 event replayed.
         assert_eq!(je.exchange().accounts().balance(ACCT_A, USD).available, 0);
-
-        // File should be truncated to remove the garbage trailing bytes.
-        let recovered_len = std::fs::metadata(&path).unwrap().len();
-        assert!(recovered_len < original_len - 3);
     }
 
     #[test]
@@ -442,11 +443,15 @@ mod tests {
             je.deposit(ACCT_A, USD, 100_000).unwrap();
         }
 
-        // Simulate crash.
+        // Find valid data end, then simulate crash by truncating within valid data.
         {
+            let valid_data_end = {
+                let mut reader = crate::journal::reader::JournalReader::open(&path).unwrap();
+                while reader.next_entry().unwrap().is_some() {}
+                reader.valid_file_end()
+            };
             let file = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
-            let len = std::fs::metadata(&path).unwrap().len();
-            file.set_len(len - 3).unwrap();
+            file.set_len(valid_data_end - 3).unwrap();
         }
 
         // Recover and append a new event.

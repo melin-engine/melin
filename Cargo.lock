@@ -809,6 +809,7 @@ name = "trading-engine"
 version = "0.1.0"
 dependencies = [
  "crc32c",
+ "libc",
  "tempfile",
  "trading-disruptor",
 ]

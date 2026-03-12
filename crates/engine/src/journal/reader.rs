@@ -67,7 +67,8 @@ impl JournalReader {
     /// Read the next journal entry.
     ///
     /// Returns `Ok(Some(entry))` for each valid entry.
-    /// Returns `Ok(None)` at EOF or on a truncated final entry (crash recovery).
+    /// Returns `Ok(None)` at EOF, on a truncated final entry (crash recovery),
+    /// or when reaching zero-filled pre-allocated (fallocated) space.
     /// Returns `Err` on corruption (CRC mismatch, sequence gap, etc.).
     pub fn next_entry(&mut self) -> Result<Option<JournalEntry>, JournalError> {
         // Ensure we have data to work with.
@@ -75,6 +76,13 @@ impl JournalReader {
 
         let available = self.valid - self.pos;
         if available == 0 {
+            return Ok(None);
+        }
+
+        // Zero magic bytes indicate pre-allocated (fallocated) space.
+        // Entry magic is always 0x4A45, so zero bytes can never start a
+        // valid entry — treat as end-of-data.
+        if available >= 2 && self.buffer[self.pos] == 0 && self.buffer[self.pos + 1] == 0 {
             return Ok(None);
         }
 
@@ -89,6 +97,13 @@ impl JournalReader {
                 if self.try_extend_buffer()? {
                     // Got more data, try again.
                     let data = &self.buffer[self.pos..self.valid];
+
+                    // Re-check for zero magic after extending — the buffer
+                    // may now contain pre-allocated zeros.
+                    if data.len() >= 2 && data[0] == 0 && data[1] == 0 {
+                        return Ok(None);
+                    }
+
                     match codec::decode(data) {
                         Ok((consumed, sequence, timestamp_ns, event)) => {
                             self.validate_and_advance(consumed, sequence, timestamp_ns, event)
@@ -274,12 +289,17 @@ mod tests {
             }
         }
 
-        let file_len_before = std::fs::metadata(&path).unwrap().len();
+        // Find the valid data end (file is larger due to pre-allocation).
+        let valid_data_end = {
+            let mut reader = JournalReader::open(&path).unwrap();
+            while reader.next_entry().unwrap().is_some() {}
+            reader.valid_file_end()
+        };
 
-        // Truncate the file mid-entry (remove last 5 bytes).
+        // Truncate mid-entry: cut 5 bytes from the valid data region.
         {
             let file = OpenOptions::new().write(true).open(&path).unwrap();
-            file.set_len(file_len_before - 5).unwrap();
+            file.set_len(valid_data_end - 5).unwrap();
         }
 
         let mut reader = JournalReader::open(&path).unwrap();
@@ -292,8 +312,8 @@ mod tests {
         // Truncated last entry returns None.
         assert!(reader.next_entry().unwrap().is_none());
 
-        // valid_file_end should point to end of last good entry, NOT end of file.
-        assert!(reader.valid_file_end() < file_len_before - 5);
+        // valid_file_end should point to end of last good entry, NOT truncation point.
+        assert!(reader.valid_file_end() < valid_data_end - 5);
     }
 
     #[test]
@@ -328,6 +348,85 @@ mod tests {
         // Second entry should fail with CRC or corrupt error.
         let result = reader.next_entry();
         assert!(result.is_err() || result.unwrap().is_none());
+    }
+
+    #[test]
+    fn preallocated_zeros_treated_as_end_of_data() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("prealloc.journal");
+
+        let events = sample_events();
+        {
+            let mut writer = JournalWriter::create(&path).unwrap();
+            for event in &events {
+                writer.append(event).unwrap();
+            }
+        }
+
+        // The file should be larger than valid data due to pre-allocation.
+        let file_len = std::fs::metadata(&path).unwrap().len();
+        let valid_data_upper_bound = (FILE_HEADER_SIZE + events.len() * 128) as u64;
+        assert!(
+            file_len > valid_data_upper_bound,
+            "file should be pre-allocated: len={file_len}, data<={valid_data_upper_bound}"
+        );
+
+        // Reader should stop at the end of valid entries, ignoring zeros.
+        let mut reader = JournalReader::open(&path).unwrap();
+        for (i, expected) in events.iter().enumerate() {
+            let entry = reader.next_entry().unwrap().unwrap();
+            assert_eq!(entry.sequence, (i as u64) + 1);
+            assert_eq!(&entry.event, expected);
+        }
+        assert!(reader.next_entry().unwrap().is_none());
+    }
+
+    #[test]
+    fn recovery_after_crash_with_preallocation() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("crash_prealloc.journal");
+
+        let events = sample_events();
+        {
+            let mut writer = JournalWriter::create(&path).unwrap();
+            for event in &events {
+                writer.append(event).unwrap();
+            }
+        }
+
+        // Simulate crash: file still has pre-allocated zeros after valid data.
+        // Reader should recover all entries.
+        let mut reader = JournalReader::open(&path).unwrap();
+        let mut count = 0;
+        while reader.next_entry().unwrap().is_some() {
+            count += 1;
+        }
+        assert_eq!(count, events.len());
+
+        // open_append should truncate pre-allocated space and re-allocate.
+        let valid_end = reader.valid_file_end();
+        let last_seq = reader.last_sequence().unwrap();
+        let mut writer = JournalWriter::open_append(&path, last_seq, valid_end).unwrap();
+
+        // Write one more event after recovery.
+        let extra = JournalEvent::Deposit {
+            account: AccountId(99),
+            currency: CurrencyId(0),
+            amount: 42,
+        };
+        writer.append(&extra).unwrap();
+
+        // Re-read everything.
+        let mut reader = JournalReader::open(&path).unwrap();
+        for (i, expected) in events.iter().enumerate() {
+            let entry = reader.next_entry().unwrap().unwrap();
+            assert_eq!(entry.sequence, (i as u64) + 1);
+            assert_eq!(&entry.event, expected);
+        }
+        let entry = reader.next_entry().unwrap().unwrap();
+        assert_eq!(entry.sequence, (events.len() as u64) + 1);
+        assert_eq!(entry.event, extra);
+        assert!(reader.next_entry().unwrap().is_none());
     }
 
     #[test]
