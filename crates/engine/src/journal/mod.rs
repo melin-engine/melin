@@ -12,6 +12,7 @@ pub mod event;
 pub mod pipeline;
 pub mod reader;
 pub mod snapshot;
+pub mod trace;
 pub mod writer;
 
 pub use engine::JournaledExchange;

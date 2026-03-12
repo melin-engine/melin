@@ -7,9 +7,13 @@ edition = "2024"
 ## Skip all fsync calls in the journal writer. Unsafe for production — data
 ## will not survive crashes — but useful for benchmarking to isolate I/O cost.
 no-fsync = []
+## Record per-stage latency histograms and print a summary on shutdown.
+## Adds ~20ns of clock overhead per event. Not for production.
+latency-trace = ["dep:hdrhistogram"]
 
 [dependencies]
 crc32c = "0.6"
+hdrhistogram = { version = "7", optional = true }
 libc = { workspace = true }
 trading-disruptor = { path = "../disruptor" }
 

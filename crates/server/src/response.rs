@@ -18,6 +18,8 @@ use trading_disruptor::padding::Sequence;
 use trading_disruptor::spsc;
 
 use trading_engine::journal::pipeline::{OutputPayload, OutputSlot};
+#[cfg(feature = "latency-trace")]
+use trading_engine::journal::trace;
 
 use trading_protocol::message::Response;
 
@@ -63,8 +65,19 @@ pub fn run(
     #[cfg(feature = "no-fsync")]
     let _ = &journal_cursor;
 
+    #[cfg(feature = "latency-trace")]
+    let mut spsc_hist =
+        trace::StageHistogram::new("response: SPSC wakeup (matching publish → response consume)");
+    #[cfg(feature = "latency-trace")]
+    let mut dispatch_hist = trace::StageHistogram::new("response: dispatch (consume → try_send)");
+
     loop {
         if shutdown.load(Ordering::Relaxed) {
+            #[cfg(feature = "latency-trace")]
+            {
+                spsc_hist.print_report();
+                dispatch_hist.print_report();
+            }
             return;
         }
 
@@ -90,7 +103,13 @@ pub fn run(
             continue;
         }
 
+        #[cfg(feature = "latency-trace")]
+        let consume_ts = trace::trace_ts();
+
         for slot in &batch[..count] {
+            #[cfg(feature = "latency-trace")]
+            spsc_hist.record_ns(trace::trace_elapsed_ns(slot.match_complete_ts, consume_ts));
+
             // Wait for the journal to confirm this event is durable.
             // The journal cursor represents total entries processed
             // (fsync'd). We need cursor > input_seq.
@@ -129,5 +148,8 @@ pub fn run(
             // Connection not found → response silently dropped.
             // Happens if client disconnected between submit and response.
         }
+
+        #[cfg(feature = "latency-trace")]
+        dispatch_hist.record_ns(trace::trace_elapsed_ns(consume_ts, trace::trace_ts()));
     }
 }

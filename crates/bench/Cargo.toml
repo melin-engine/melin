@@ -5,6 +5,7 @@ edition = "2024"
 
 [features]
 no-fsync = ["trading-engine/no-fsync"]
+latency-trace = ["trading-server/latency-trace"]
 
 [[bin]]
 name = "trading-bench"

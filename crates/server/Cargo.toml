@@ -8,6 +8,7 @@ edition = "2024"
 ## Unsafe for production — data may not survive crashes — but useful for
 ## benchmarking to isolate I/O cost from pipeline latency.
 no-fsync = ["trading-engine/no-fsync"]
+latency-trace = ["trading-engine/latency-trace"]
 
 [lib]
 name = "trading_server"

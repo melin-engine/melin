@@ -16,6 +16,8 @@
 use std::net::SocketAddr;
 use std::num::NonZeroU64;
 use std::path::PathBuf;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
 use hdrhistogram::Histogram;
@@ -73,9 +75,16 @@ async fn run_benchmark(pairs: usize) {
         ..ServerConfig::default()
     };
 
+    // Shared shutdown flag — set after benchmark completes so pipeline
+    // threads can clean up and print latency-trace reports.
+    let shutdown = Arc::new(AtomicBool::new(false));
+    let shutdown_for_server = Arc::clone(&shutdown);
+
     // Spawn server on a background task.
-    tokio::spawn(async move {
-        if let Err(e) = trading_server::server::run(listener, config).await {
+    let _server_handle = tokio::spawn(async move {
+        if let Err(e) =
+            trading_server::server::run_with_shutdown(listener, config, shutdown_for_server).await
+        {
             eprintln!("server error: {e}");
         }
     });
@@ -224,6 +233,15 @@ async fn run_benchmark(pairs: usize) {
         histogram.value_at_quantile(0.999) as f64 / 1000.0
     );
     println!("    max:    {:>8.2} µs", histogram.max() as f64 / 1000.0);
+
+    // Signal server shutdown so pipeline threads can clean up and print
+    // latency-trace reports (if the feature is enabled).
+    println!();
+    println!("=== Pipeline Latency Trace ===");
+    println!();
+    shutdown.store(true, Ordering::Relaxed);
+    // Give pipeline threads time to drain and print reports.
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
 
     // Cleanup temp directory.
     let _ = std::fs::remove_dir_all(&tmp_dir);

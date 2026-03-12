@@ -933,6 +933,7 @@ name = "trading-engine"
 version = "0.1.0"
 dependencies = [
  "crc32c",
+ "hdrhistogram",
  "libc",
  "tempfile",
  "trading-disruptor",

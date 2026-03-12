@@ -17,6 +17,7 @@ use std::sync::Arc;
 
 use crate::exchange::Exchange;
 use crate::journal::event::JournalEvent;
+use crate::journal::trace::{TraceTimestamp, trace_ts};
 use crate::journal::writer::JournalWriter;
 use crate::types::ExecutionReport;
 
@@ -50,6 +51,9 @@ pub struct InputSlot {
     pub connection_id: u64,
     /// The journaled event (order submit, cancel, etc.).
     pub event: JournalEvent,
+    /// Timestamp when the publisher wrote this slot to the disruptor.
+    /// `()` (zero-sized) when `latency-trace` is disabled.
+    pub publish_ts: TraceTimestamp,
 }
 
 impl Default for InputSlot {
@@ -64,6 +68,7 @@ impl Default for InputSlot {
                 currency: crate::types::CurrencyId(0),
                 amount: 0,
             },
+            publish_ts: trace_ts(),
         }
     }
 }
@@ -83,6 +88,9 @@ pub struct OutputSlot {
     pub input_seq: u64,
     /// The response payload.
     pub payload: OutputPayload,
+    /// Timestamp when the matching stage finished processing this event.
+    /// `()` (zero-sized) when `latency-trace` is disabled.
+    pub match_complete_ts: TraceTimestamp,
 }
 
 /// Payload within an output slot.
@@ -102,6 +110,7 @@ impl Default for OutputSlot {
             connection_id: 0,
             input_seq: 0,
             payload: OutputPayload::BatchEnd,
+            match_complete_ts: trace_ts(),
         }
     }
 }
@@ -134,9 +143,22 @@ impl JournalStage {
     pub fn run(mut self, shutdown: &std::sync::atomic::AtomicBool) -> JournalWriter {
         let mut batch = [InputSlot::default(); MAX_JOURNAL_BATCH];
 
+        #[cfg(feature = "latency-trace")]
+        let mut wakeup_hist = crate::journal::trace::StageHistogram::new(
+            "journal: disruptor wakeup (publish → journal consume)",
+        );
+        #[cfg(feature = "latency-trace")]
+        let mut batch_hist =
+            crate::journal::trace::StageHistogram::new("journal: batch processing (write + sync)");
+
         loop {
             if shutdown.load(std::sync::atomic::Ordering::Relaxed) {
                 self.drain_remaining(&mut batch);
+                #[cfg(feature = "latency-trace")]
+                {
+                    wakeup_hist.print_report();
+                    batch_hist.print_report();
+                }
                 return self.writer;
             }
 
@@ -145,6 +167,17 @@ impl JournalStage {
             if count == 0 {
                 std::hint::spin_loop();
                 continue;
+            }
+
+            #[cfg(feature = "latency-trace")]
+            let batch_start = trace_ts();
+
+            #[cfg(feature = "latency-trace")]
+            for slot in &batch[..count] {
+                wakeup_hist.record_ns(crate::journal::trace::trace_elapsed_ns(
+                    slot.publish_ts,
+                    batch_start,
+                ));
             }
 
             // Batch encode all events.
@@ -162,6 +195,12 @@ impl JournalStage {
             // NOW advance the cursor — the response stage uses this to know
             // events are safely on disk.
             self.consumer.commit(count);
+
+            #[cfg(feature = "latency-trace")]
+            batch_hist.record_ns(crate::journal::trace::trace_elapsed_ns(
+                batch_start,
+                trace_ts(),
+            ));
         }
     }
 
@@ -214,8 +253,21 @@ impl MatchingStage {
         // Pre-allocated report buffer, reused across commands.
         let mut reports: Vec<ExecutionReport> = Vec::with_capacity(64);
 
+        #[cfg(feature = "latency-trace")]
+        let mut wakeup_hist = crate::journal::trace::StageHistogram::new(
+            "matching: disruptor wakeup (publish → matching consume)",
+        );
+        #[cfg(feature = "latency-trace")]
+        let mut execute_hist =
+            crate::journal::trace::StageHistogram::new("matching: execute (process_event)");
+
         loop {
             if shutdown.load(std::sync::atomic::Ordering::Relaxed) {
+                #[cfg(feature = "latency-trace")]
+                {
+                    wakeup_hist.print_report();
+                    execute_hist.print_report();
+                }
                 return self.exchange;
             }
 
@@ -225,8 +277,32 @@ impl MatchingStage {
                 continue;
             };
 
+            #[cfg(feature = "latency-trace")]
+            {
+                let now = trace_ts();
+                wakeup_hist.record_ns(crate::journal::trace::trace_elapsed_ns(
+                    slot.publish_ts,
+                    now,
+                ));
+            }
+
             reports.clear();
+
+            #[cfg(feature = "latency-trace")]
+            let exec_start = trace_ts();
+
             self.process_event(&slot, &mut reports);
+
+            #[cfg(feature = "latency-trace")]
+            let exec_end = trace_ts();
+
+            #[cfg(feature = "latency-trace")]
+            execute_hist.record_ns(crate::journal::trace::trace_elapsed_ns(
+                exec_start, exec_end,
+            ));
+
+            #[allow(clippy::let_unit_value)] // ZST when latency-trace is disabled
+            let match_complete_ts = trace_ts();
 
             // Publish execution reports to the output SPSC.
             // All output slots for this request carry the same input_seq
@@ -236,6 +312,7 @@ impl MatchingStage {
                     connection_id: slot.connection_id,
                     input_seq,
                     payload: OutputPayload::Report(*report),
+                    match_complete_ts,
                 });
             }
 
@@ -244,6 +321,7 @@ impl MatchingStage {
                 connection_id: slot.connection_id,
                 input_seq,
                 payload: OutputPayload::BatchEnd,
+                match_complete_ts,
             });
         }
     }
@@ -365,6 +443,7 @@ mod tests {
                     quote: CurrencyId(1),
                 },
             },
+            publish_ts: trace_ts(),
         });
         producer.publish(InputSlot {
             connection_id: 1,
@@ -373,6 +452,7 @@ mod tests {
                 currency: CurrencyId(1),
                 amount: 100_000,
             },
+            publish_ts: trace_ts(),
         });
 
         let handle = std::thread::spawn(move || stage.run(&shutdown2));
@@ -418,6 +498,7 @@ mod tests {
                 symbol: Symbol(1),
                 order: limit_order(1, AccountId(2), Side::Sell, 100, 50),
             },
+            publish_ts: trace_ts(),
         });
 
         let handle = std::thread::spawn(move || stage.run(&shutdown2));
@@ -491,6 +572,7 @@ mod tests {
                 symbol: Symbol(1),
                 order: limit_order(1, AccountId(2), Side::Sell, 100, 50),
             },
+            publish_ts: trace_ts(),
         });
 
         // Wait for the Placed report in the output SPSC.

@@ -13,6 +13,7 @@ use tracing::info;
 
 use trading_engine::journal::event::JournalEvent;
 use trading_engine::journal::pipeline::InputSlot;
+use trading_engine::journal::trace::trace_ts;
 
 use trading_disruptor::ring;
 
@@ -64,6 +65,7 @@ pub fn run(
                 input_producer.publish(InputSlot {
                     connection_id: connection_id.0,
                     event,
+                    publish_ts: trace_ts(),
                 });
             }
         }

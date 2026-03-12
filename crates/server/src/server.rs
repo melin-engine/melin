@@ -73,8 +73,21 @@ impl Default for ServerConfig {
 ///
 /// Returns when the listener encounters a fatal error.
 pub async fn run<L: TransportListener>(
+    listener: L,
+    config: ServerConfig,
+) -> Result<(), Box<dyn std::error::Error>> {
+    run_with_shutdown(listener, config, Arc::new(AtomicBool::new(false))).await
+}
+
+/// Run the trading server with an externally controlled shutdown flag.
+///
+/// Same as [`run`], but the caller can set `shutdown` to `true` to trigger
+/// a clean shutdown of all pipeline threads (useful for benchmarks that need
+/// to collect latency trace reports).
+pub async fn run_with_shutdown<L: TransportListener>(
     mut listener: L,
     config: ServerConfig,
+    shutdown: Arc<AtomicBool>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // Initialize or recover the exchange.
     let engine = init_engine(&config)?;
@@ -88,9 +101,6 @@ pub async fn run<L: TransportListener>(
 
     // Control channel for connect/disconnect events → response stage.
     let (control_tx, control_rx) = std::sync::mpsc::channel();
-
-    // Shared shutdown flag for pipeline threads.
-    let shutdown = Arc::new(AtomicBool::new(false));
 
     // Spawn pipeline OS threads.
     // Copy core_affinity once — [usize; 4] is Copy, moved into each closure.
