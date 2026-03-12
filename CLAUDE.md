@@ -96,6 +96,7 @@ cargo fmt            # format
 - [ ] Server (engine thread, session management, accept loop)
 - [ ] Client library
 - [ ] Admin API (instrument registration, deposits, withdrawals)
+- [ ] TLS (rustls or native-tls for encrypted client connections)
 - [ ] QUIC transport (investigate `quinn`)
 - [ ] Kernel bypass (DPDK/ef_vi) for single-digit µs latency
 
