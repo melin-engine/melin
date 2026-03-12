@@ -92,6 +92,10 @@ pub fn run(
     // many batches instead of paying it every batch.
     let mut dirty_connections: HashSet<u64> = HashSet::new();
 
+    // Adaptive spin: spin first (fast wakeup), yield after threshold
+    // to avoid aggressive OS preemption of this pipeline thread.
+    let mut idle_spins: u32 = 0;
+
     loop {
         if shutdown.load(Ordering::Relaxed) {
             // Flush any remaining buffered writes before shutdown.
@@ -146,9 +150,15 @@ pub fn run(
                     }
                 }
             }
-            std::hint::spin_loop();
+            if idle_spins < 1000 {
+                idle_spins += 1;
+                std::hint::spin_loop();
+            } else {
+                std::thread::yield_now();
+            }
             continue;
         }
+        idle_spins = 0;
 
         #[cfg(feature = "latency-trace")]
         let consume_ts = trace::trace_ts();

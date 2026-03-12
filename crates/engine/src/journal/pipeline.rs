@@ -181,6 +181,7 @@ impl JournalStage {
 
         let mut batch = [InputSlot::default(); MAX_JOURNAL_BATCH];
         let delay = self.group_commit_delay;
+        let mut idle_spins: u32 = 0;
 
         // Total events encoded since last fsync/commit.
         let mut pending: usize = 0;
@@ -220,6 +221,8 @@ impl JournalStage {
             };
 
             if count > 0 {
+                idle_spins = 0;
+
                 #[cfg(feature = "latency-trace")]
                 let batch_start = trace_ts();
 
@@ -262,8 +265,11 @@ impl JournalStage {
                     pending = 0;
                     first_write_ts = None;
                 }
-            } else {
+            } else if idle_spins < 1000 {
+                idle_spins += 1;
                 std::hint::spin_loop();
+            } else {
+                std::thread::yield_now();
             }
         }
     }
@@ -293,6 +299,7 @@ impl JournalStage {
 
         let mut batch = [InputSlot::default(); MAX_JOURNAL_BATCH];
         let delay = self.group_commit_delay;
+        let mut idle_spins: u32 = 0;
 
         // Ring size 2: only 1 fsync in flight, but 2 entries avoids edge
         // cases with submission/completion overlap.
@@ -369,6 +376,8 @@ impl JournalStage {
             // --- Step 1: Read and encode a batch ---
             let count = self.consumer.read_batch(&mut batch, MAX_JOURNAL_BATCH);
             if count > 0 {
+                idle_spins = 0;
+
                 #[cfg(feature = "latency-trace")]
                 let batch_start = trace_ts();
 
@@ -461,7 +470,12 @@ impl JournalStage {
             }
 
             if count == 0 && !fsync_in_flight {
-                std::hint::spin_loop();
+                if idle_spins < 1000 {
+                    idle_spins += 1;
+                    std::hint::spin_loop();
+                } else {
+                    std::thread::yield_now();
+                }
             }
         }
     }
@@ -514,6 +528,11 @@ impl MatchingStage {
     pub fn run(mut self, shutdown: &std::sync::atomic::AtomicBool) -> Exchange {
         // Pre-allocated report buffer, reused across commands.
         let mut reports: Vec<ExecutionReport> = Vec::with_capacity(64);
+        // Spin count for adaptive wait: spin first (fast wakeup), then yield
+        // to the OS scheduler (prevents the kernel from aggressively preempting
+        // this thread during busy periods). 1000 spins ≈ 1µs at ~1ns/spin,
+        // which is well under the inter-event arrival time at peak throughput.
+        let mut idle_spins: u32 = 0;
 
         #[cfg(feature = "latency-trace")]
         let mut wakeup_hist = crate::journal::trace::StageHistogram::new(
@@ -535,9 +554,15 @@ impl MatchingStage {
 
             let entry = self.consumer.try_consume();
             let Some((input_seq, slot)) = entry else {
-                std::hint::spin_loop();
+                if idle_spins < 1000 {
+                    idle_spins += 1;
+                    std::hint::spin_loop();
+                } else {
+                    std::thread::yield_now();
+                }
                 continue;
             };
+            idle_spins = 0;
 
             #[cfg(feature = "latency-trace")]
             {
