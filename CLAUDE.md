@@ -80,7 +80,7 @@ cargo fmt            # format
 - [x] Write-ahead journal (input commands, CRC32C checksums, crash recovery)
 - [x] Snapshot save/load (version-boundary recovery, CRC32C integrity)
 - [x] `JournaledExchange` wrapper (persist-before-ack, deterministic replay)
-- [ ] Async journal I/O via ring buffer
+- [x] Async journal I/O via LMAX disruptor ring buffer pipeline
 - [ ] Journal rotation
 - [ ] Output event log (ExecutionReports for audit)
 
@@ -112,23 +112,40 @@ cargo fmt            # format
 2. **Remaining risk checks** — self-trade prevention, order throttling, position/exposure limits
 3. **GTD / Day time-in-force** — requires a time source and expiry mechanism
 4. **Benchmarks** — latency and throughput measurement (p99/p99.9) to validate the ~100ns budget
-5. **Async journal I/O** — move journaling to a separate thread via ring buffer for ~100ns writes
+5. ~~**Async journal I/O**~~ — done: LMAX disruptor pipeline (journal/matching/response threads on ring buffers)
 
 ## Structure
 
-- `src/main.rs` — entry point
-- `src/lib.rs` — crate root, module declarations
+### `crates/disruptor/` — generic lock-free ring buffers (no trading-domain knowledge)
+- `src/padding.rs` — cache-line alignment (`CachePadded<T>`)
+- `src/ring.rs` — multi-consumer disruptor (1 producer, N gated consumers)
+- `src/spsc.rs` — single-producer, single-consumer queue
+
+### `crates/engine/` — matching engine and event sourcing
 - `src/types.rs` — core types (OrderId, AccountId, CurrencyId, Price, Quantity, Order, ExecutionReport, InstrumentSpec, etc.)
 - `src/account.rs` — account balance management (deposit, withdraw, reserve, fill, release)
 - `src/orderbook.rs` — order book with price-time priority matching and stop trigger logic
 - `src/exchange.rs` — multi-instrument dispatcher with integrated balance validation
 - `src/journal/` — durable write-ahead log for event sourcing and crash recovery
-  - `mod.rs` — module declarations, re-exports
   - `event.rs` — `JournalEvent` enum (input commands only)
   - `codec.rs` — binary encode/decode with CRC32C checksums
-  - `writer.rs` — `JournalWriter` (append + fsync to disk)
+  - `writer.rs` — `JournalWriter` (append + fsync to disk, batch append API)
   - `reader.rs` — `JournalReader` (sequential read + validate)
   - `engine.rs` — `JournaledExchange` wrapper (journal-before-execute + replay recovery)
+  - `pipeline.rs` — disruptor pipeline stages (`JournalStage`, `MatchingStage`, slot types)
   - `snapshot.rs` — snapshot save/load for Exchange state (version-boundary recovery)
   - `error.rs` — `JournalError` enum
-- `Cargo.toml` — dependencies and project config
+
+### `crates/server/` — TCP server and pipeline orchestration
+- `src/server.rs` — builds disruptor pipeline, spawns 4 OS threads, accept loop
+- `src/engine.rs` — publisher thread (tokio mpsc → input disruptor)
+- `src/response.rs` — response stage thread (output SPSC → per-connection channels)
+- `src/session.rs` — per-connection reader/writer tasks
+
+### `crates/protocol/` — wire protocol
+- `src/message.rs` — `Request`, `Response`, `EngineCommand`, `ConnectionId`
+- `src/codec.rs` — binary encode/decode for wire messages
+- `src/transport.rs` — transport traits (`TransportListener`, `TransportStream`, `TransportRead`, `TransportWrite`)
+
+### `crates/client/` — typed client library
+### `crates/tui/` — terminal UI for interactive testing
