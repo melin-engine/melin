@@ -27,6 +27,11 @@ impl TcpTransportListener {
         let listener = TcpListener::bind(addr).await?;
         Ok(Self { listener })
     }
+
+    /// Returns the local address this listener is bound to.
+    pub fn local_addr(&self) -> io::Result<SocketAddr> {
+        self.listener.local_addr()
+    }
 }
 
 impl TransportListener for TcpTransportListener {
@@ -127,7 +132,7 @@ mod tests {
         let listener = TcpTransportListener::bind("127.0.0.1:0".parse().unwrap())
             .await
             .unwrap();
-        let addr = listener.listener.local_addr().unwrap();
+        let addr = listener.local_addr().unwrap();
 
         // Client connects.
         let client_stream = TcpStream::connect(addr).await.unwrap();
@@ -162,7 +167,7 @@ mod tests {
         let listener = TcpTransportListener::bind("127.0.0.1:0".parse().unwrap())
             .await
             .unwrap();
-        let addr = listener.listener.local_addr().unwrap();
+        let addr = listener.local_addr().unwrap();
 
         let client_stream = TcpStream::connect(addr).await.unwrap();
         let mut listener = listener;
@@ -181,7 +186,7 @@ mod tests {
         let listener = TcpTransportListener::bind("127.0.0.1:0".parse().unwrap())
             .await
             .unwrap();
-        let addr = listener.listener.local_addr().unwrap();
+        let addr = listener.local_addr().unwrap();
 
         let mut client_stream = TcpStream::connect(addr).await.unwrap();
         let mut listener = listener;
@@ -204,7 +209,7 @@ mod tests {
         let listener = TcpTransportListener::bind("127.0.0.1:0".parse().unwrap())
             .await
             .unwrap();
-        let addr = listener.listener.local_addr().unwrap();
+        let addr = listener.local_addr().unwrap();
 
         let client_stream = TcpStream::connect(addr).await.unwrap();
         client_stream.set_nodelay(true).unwrap();
