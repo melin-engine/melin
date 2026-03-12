@@ -1,0 +1,4 @@
+# The default (7) is one too few for OrderBook::from_parts and PendingStop::new,
+# which each take 7 non-self arguments. 8 keeps the lint useful while avoiding
+# noise on reasonable constructors.
+too-many-arguments-threshold = 8

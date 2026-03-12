@@ -35,13 +35,35 @@ impl Balance {
 /// Tracks what was reserved for a specific order so we can release on
 /// cancel/fill without recomputing.
 #[derive(Debug, Clone, Copy)]
-struct Reservation {
+pub(crate) struct Reservation {
     account: AccountId,
     /// The currency that was reserved (quote for buys, base for sells).
     currency: CurrencyId,
     /// Remaining reserved amount. Decremented on each partial fill,
     /// fully released on cancel.
     remaining: u64,
+}
+
+impl Reservation {
+    pub(crate) fn new(account: AccountId, currency: CurrencyId, remaining: u64) -> Self {
+        Self {
+            account,
+            currency,
+            remaining,
+        }
+    }
+
+    pub(crate) fn account(&self) -> AccountId {
+        self.account
+    }
+
+    pub(crate) fn currency(&self) -> CurrencyId {
+        self.currency
+    }
+
+    pub(crate) fn remaining(&self) -> u64 {
+        self.remaining
+    }
 }
 
 /// Manages account balances across all currencies.
@@ -62,6 +84,29 @@ impl AccountManager {
             balances: HashMap::new(),
             reservations: HashMap::new(),
         }
+    }
+
+    /// Reconstruct from pre-built parts (used by snapshot restore).
+    pub(crate) fn from_parts(
+        balances: HashMap<(AccountId, CurrencyId), Balance>,
+        reservations: HashMap<OrderId, Reservation>,
+    ) -> Self {
+        Self {
+            balances,
+            reservations,
+        }
+    }
+
+    /// Iterate over all balances (for snapshot serialization).
+    pub(crate) fn balances_iter(
+        &self,
+    ) -> impl Iterator<Item = (&(AccountId, CurrencyId), &Balance)> {
+        self.balances.iter()
+    }
+
+    /// Iterate over all reservations (for snapshot serialization).
+    pub(crate) fn reservations_iter(&self) -> impl Iterator<Item = (&OrderId, &Reservation)> {
+        self.reservations.iter()
     }
 
     /// Credit funds to an account. Creates the account/currency entry if needed.

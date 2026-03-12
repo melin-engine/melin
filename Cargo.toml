@@ -4,3 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+crc32c = "0.6"
+
+[dev-dependencies]
+tempfile = "3"

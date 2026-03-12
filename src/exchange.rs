@@ -43,6 +43,39 @@ impl Exchange {
         }
     }
 
+    /// Reconstruct from pre-built parts (used by snapshot restore).
+    pub(crate) fn from_parts(
+        books: HashMap<Symbol, OrderBook>,
+        instruments: HashMap<Symbol, InstrumentSpec>,
+        accounts: AccountManager,
+        order_sides: HashMap<OrderId, Side>,
+    ) -> Self {
+        Self {
+            books,
+            instruments,
+            accounts,
+            order_sides,
+        }
+    }
+
+    /// Access instrument specifications (for snapshot serialization).
+    pub(crate) fn instruments(&self) -> &HashMap<Symbol, InstrumentSpec> {
+        &self.instruments
+    }
+
+    /// Access order books (for snapshot serialization).
+    pub(crate) fn books(&self) -> &HashMap<Symbol, OrderBook> {
+        &self.books
+    }
+
+    /// Snapshot the order-side map as a Vec for serialization.
+    pub(crate) fn snapshot_order_sides(&self) -> Vec<(OrderId, Side)> {
+        self.order_sides
+            .iter()
+            .map(|(&id, &side)| (id, side))
+            .collect()
+    }
+
     /// Register a new instrument with its currency pair specification.
     pub fn add_instrument(&mut self, spec: InstrumentSpec) {
         self.books.entry(spec.symbol).or_default();

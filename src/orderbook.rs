@@ -12,7 +12,7 @@ use crate::types::{
 
 /// A resting order on the book (the unfilled portion of a limit order).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct RestingOrder {
+pub(crate) struct RestingOrder {
     id: OrderId,
     account: AccountId,
     remaining: Quantity,
@@ -20,7 +20,7 @@ struct RestingOrder {
 
 /// A pending stop order waiting to be triggered.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct PendingStop {
+pub(crate) struct PendingStop {
     id: OrderId,
     account: AccountId,
     side: Side,
@@ -34,7 +34,7 @@ struct PendingStop {
 
 /// One side of the order book (either all bids or all asks).
 #[derive(Debug, Default)]
-struct BookSide {
+pub(crate) struct BookSide {
     /// BTreeMap: keeps price levels sorted so we can efficiently iterate from
     /// best price (lowest ask / highest bid) without re-sorting. O(log n)
     /// insert/remove per level.
@@ -44,7 +44,91 @@ struct BookSide {
     levels: BTreeMap<Price, VecDeque<RestingOrder>>,
 }
 
+impl RestingOrder {
+    /// Create a new resting order (used by snapshot restore).
+    pub(crate) fn new(id: OrderId, account: AccountId, remaining: Quantity) -> Self {
+        Self {
+            id,
+            account,
+            remaining,
+        }
+    }
+
+    pub(crate) fn id(&self) -> OrderId {
+        self.id
+    }
+
+    pub(crate) fn account(&self) -> AccountId {
+        self.account
+    }
+
+    pub(crate) fn remaining(&self) -> Quantity {
+        self.remaining
+    }
+}
+
+impl PendingStop {
+    /// Create a new pending stop order (used by snapshot restore).
+    pub(crate) fn new(
+        id: OrderId,
+        account: AccountId,
+        side: Side,
+        trigger_price: Price,
+        quantity: Quantity,
+        time_in_force: TimeInForce,
+        limit_price: Option<Price>,
+    ) -> Self {
+        Self {
+            id,
+            account,
+            side,
+            trigger_price,
+            quantity,
+            time_in_force,
+            limit_price,
+        }
+    }
+
+    pub(crate) fn id(&self) -> OrderId {
+        self.id
+    }
+
+    pub(crate) fn account(&self) -> AccountId {
+        self.account
+    }
+
+    pub(crate) fn side(&self) -> Side {
+        self.side
+    }
+
+    pub(crate) fn trigger_price(&self) -> Price {
+        self.trigger_price
+    }
+
+    pub(crate) fn quantity(&self) -> Quantity {
+        self.quantity
+    }
+
+    pub(crate) fn time_in_force(&self) -> TimeInForce {
+        self.time_in_force
+    }
+
+    pub(crate) fn limit_price(&self) -> Option<Price> {
+        self.limit_price
+    }
+}
+
 impl BookSide {
+    /// Iterate over price levels in sorted order.
+    pub(crate) fn levels_iter(&self) -> impl Iterator<Item = (&Price, &VecDeque<RestingOrder>)> {
+        self.levels.iter()
+    }
+
+    /// Reconstruct a BookSide from pre-built levels (used by snapshot restore).
+    pub(crate) fn from_levels(levels: BTreeMap<Price, VecDeque<RestingOrder>>) -> Self {
+        Self { levels }
+    }
+
     fn add(&mut self, price: Price, order: RestingOrder) {
         self.levels.entry(price).or_default().push_back(order);
     }
@@ -135,6 +219,65 @@ impl OrderBook {
             stop_index: HashMap::new(),
             last_trade_price: None,
         }
+    }
+
+    /// Reconstruct an OrderBook from pre-built parts (used by snapshot restore).
+    pub(crate) fn from_parts(
+        bids: BookSide,
+        asks: BookSide,
+        order_index: HashMap<OrderId, (Side, Price)>,
+        stop_buys: BTreeMap<Price, Vec<PendingStop>>,
+        stop_sells: BTreeMap<Price, Vec<PendingStop>>,
+        stop_index: HashMap<OrderId, (Side, Price)>,
+        last_trade_price: Option<Price>,
+    ) -> Self {
+        Self {
+            bids,
+            asks,
+            order_index,
+            stop_buys,
+            stop_sells,
+            stop_index,
+            last_trade_price,
+        }
+    }
+
+    // --- Snapshot accessors ---
+
+    pub(crate) fn bids(&self) -> &BookSide {
+        &self.bids
+    }
+
+    pub(crate) fn asks(&self) -> &BookSide {
+        &self.asks
+    }
+
+    pub(crate) fn stop_buys(&self) -> &BTreeMap<Price, Vec<PendingStop>> {
+        &self.stop_buys
+    }
+
+    pub(crate) fn stop_sells(&self) -> &BTreeMap<Price, Vec<PendingStop>> {
+        &self.stop_sells
+    }
+
+    pub(crate) fn last_trade_price(&self) -> Option<Price> {
+        self.last_trade_price
+    }
+
+    /// Snapshot the order index as a Vec for serialization.
+    pub(crate) fn snapshot_order_index(&self) -> Vec<(OrderId, Side, Price)> {
+        self.order_index
+            .iter()
+            .map(|(&id, &(side, price))| (id, side, price))
+            .collect()
+    }
+
+    /// Snapshot the stop index as a Vec for serialization.
+    pub(crate) fn snapshot_stop_index(&self) -> Vec<(OrderId, Side, Price)> {
+        self.stop_index
+            .iter()
+            .map(|(&id, &(side, price))| (id, side, price))
+            .collect()
     }
 
     /// Process an incoming order, appending execution reports to `reports`.
