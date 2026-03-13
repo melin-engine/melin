@@ -195,6 +195,8 @@ pub fn run_with_shutdown<L: BlockingTransportListener>(
     // Signal pipeline threads to shut down.
     shutdown.store(true, Ordering::Relaxed);
 
+    // Thread join can only fail if the thread panicked; nothing useful to
+    // do except let the panic propagate on drop, which is the default.
     let _ = journal_handle.join();
     let _ = matching_handle.join();
     let _ = response_handle.join();

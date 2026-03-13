@@ -71,6 +71,8 @@ impl StageHistogram {
     /// Record a latency sample in nanoseconds.
     #[inline]
     pub fn record_ns(&mut self, ns: u64) {
+        // Best-effort: record() only fails if ns exceeds the histogram's
+        // configured max, which is non-critical for diagnostics.
         let _ = self.hist.record(ns);
     }
 }
@@ -121,6 +123,7 @@ impl StageHistogram {
             max = us(self.hist.max()),
         );
 
+        // Best-effort diagnostic output on shutdown.
         let _ = std::io::stderr().lock().write_all(buf.as_bytes());
     }
 }

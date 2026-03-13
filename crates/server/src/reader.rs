@@ -286,6 +286,7 @@ fn remove_connection<R>(
         unsafe {
             libc::epoll_ctl(epoll_fd, libc::EPOLL_CTL_DEL, fd, std::ptr::null_mut());
         }
+        // Best-effort: receiver may have shut down during server teardown.
         let _ = control_tx.send(ControlEvent::Disconnected {
             connection_id: conn.connection_id,
         });
