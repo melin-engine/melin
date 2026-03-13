@@ -114,6 +114,32 @@ for affinity_file in /proc/irq/*/smp_affinity; do
 done
 echo "  IRQ affinity → pinned ${irq_pinned} IRQs to core 0 (${irq_failed} unchanged)"
 
+# --- Report kernel boot tuning (read-only, set via GRUB) ---
+
+echo ""
+echo "=== Kernel boot tuning (see scripts/grub-bench.conf) ==="
+
+isolated=$(cat /sys/devices/system/cpu/isolated 2>/dev/null || true)
+if [[ -n "$isolated" ]]; then
+    echo "  isolcpus: ${isolated}"
+else
+    echo "  isolcpus: (not set)"
+fi
+
+nohz=$(cat /sys/devices/system/cpu/nohz_full 2>/dev/null || true)
+if [[ -n "$nohz" ]]; then
+    echo "  nohz_full: ${nohz}"
+else
+    echo "  nohz_full: (not set)"
+fi
+
+if grep -q 'rcu_nocbs=' /proc/cmdline 2>/dev/null; then
+    rcu_nocbs=$(grep -o 'rcu_nocbs=[^ ]*' /proc/cmdline)
+    echo "  ${rcu_nocbs}"
+else
+    echo "  rcu_nocbs: (not set)"
+fi
+
 # --- Capture dmesg before benchmark ---
 
 DMESG_BEFORE=$(mktemp /tmp/bench-dmesg-before.XXXXXX)
