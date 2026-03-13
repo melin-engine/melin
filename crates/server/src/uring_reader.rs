@@ -104,6 +104,7 @@ pub fn spawn_reader_pool<R: AsRawFd + Send + 'static>(
     _num_threads: usize,
     producer: ring::MultiProducer<InputSlot>,
     control_tx: mpsc::Sender<ControlEvent>,
+    core_start: usize,
 ) -> UringReaderHandle<R> {
     let (tx, rx) = mpsc::channel();
 
@@ -115,6 +116,10 @@ pub fn spawn_reader_pool<R: AsRawFd + Send + 'static>(
     std::thread::Builder::new()
         .name("uring-reader".into())
         .spawn(move || {
+            match crate::affinity::pin_to_core(core_start) {
+                Ok(c) => tracing::info!(thread = "uring-reader", core = c, "pinned to core"),
+                Err(e) => tracing::warn!(thread = "uring-reader", core = core_start, error = %e, "failed to pin"),
+            }
             uring_reader_loop(rx, wakeup_fd, producer, &control_tx);
         })
         .expect("failed to spawn uring reader thread");

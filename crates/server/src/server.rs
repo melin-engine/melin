@@ -70,6 +70,11 @@ pub struct ServerConfig {
     /// of connections via epoll. Connections are assigned round-robin.
     /// Default: 2 (enough for ~100 connections without oversubscription).
     pub reader_threads: usize,
+    /// First CPU core for reader thread pinning. Reader thread `i` is
+    /// pinned to core `reader_core_start + i`. Placed after the pipeline
+    /// cores (1-3) to avoid cache contention.
+    /// Default: 4 (reader-0 → core 4, reader-1 → core 5).
+    pub reader_core_start: usize,
 }
 
 impl Default for ServerConfig {
@@ -81,6 +86,7 @@ impl Default for ServerConfig {
             core_affinity: [1, 2, 3],
             group_commit_delay: std::time::Duration::ZERO,
             reader_threads: 2,
+            reader_core_start: 4,
         }
     }
 }
@@ -130,10 +136,14 @@ pub fn run_with_shutdown<L: BlockingTransportListener>(
     // Spawn the epoll reader thread pool. Connections are distributed
     // round-robin across reader threads. Each thread uses epoll to
     // multiplex its connections and MultiProducer to publish to the
-    // disruptor. With 2 readers + 3 pipeline = 5 OS threads total,
-    // no oversubscription even with hundreds of connections.
-    let mut reader_handle =
-        reader::spawn_reader_pool(config.reader_threads, input_producer, control_tx.clone());
+    // disruptor. With 2 readers (cores 4-5) + 3 pipeline (cores 1-3) =
+    // 5 pinned OS threads, no oversubscription even with hundreds of connections.
+    let mut reader_handle = reader::spawn_reader_pool(
+        config.reader_threads,
+        input_producer,
+        control_tx.clone(),
+        config.reader_core_start,
+    );
 
     // Spawn pipeline OS threads.
     let cores = config.core_affinity;

@@ -3,8 +3,9 @@
 //! Replaces the per-connection reader thread model (N threads for N connections)
 //! with a small pool of reader threads (default 2), each using `epoll` to
 //! multiplex a subset of connections. This eliminates thread oversubscription
-//! (32 clients → 2 reader threads + 3 pipeline = 5 total) while maintaining
-//! parallel I/O throughput.
+//! (32 clients → 2 reader threads + 3 pipeline = 5 pinned threads) while
+//! maintaining parallel I/O throughput. Reader threads are pinned to
+//! dedicated cores (default 4-5) to avoid cache contention with the pipeline.
 //!
 //! Each connection's fd is set to `O_NONBLOCK` and registered with epoll in
 //! edge-triggered mode. When data arrives, the reader performs incremental
@@ -91,6 +92,7 @@ pub fn spawn_reader_pool<R: AsRawFd + Send + 'static>(
     num_threads: usize,
     producer: ring::MultiProducer<InputSlot>,
     control_tx: mpsc::Sender<ControlEvent>,
+    core_start: usize,
 ) -> EpollReaderHandle<R> {
     assert!(num_threads > 0, "need at least 1 reader thread");
 
@@ -106,10 +108,15 @@ pub fn spawn_reader_pool<R: AsRawFd + Send + 'static>(
         let producer_clone = producer.clone();
         let control_tx_clone = control_tx.clone();
         let wakeup_fd = event_fd;
+        let core_id = core_start + i;
 
         std::thread::Builder::new()
             .name(format!("reader-{i}"))
             .spawn(move || {
+                match crate::affinity::pin_to_core(core_id) {
+                    Ok(c) => tracing::info!(thread = "reader-{i}", core = c, "pinned to core"),
+                    Err(e) => tracing::warn!(thread = "reader-{i}", core = core_id, error = %e, "failed to pin"),
+                }
                 epoll_reader_loop(rx, wakeup_fd, producer_clone, &control_tx_clone);
             })
             .expect("failed to spawn reader thread");

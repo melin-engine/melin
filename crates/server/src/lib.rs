@@ -1,6 +1,6 @@
 //! Trading server library — exposes server startup for embedding (benchmarks, tests).
 
-mod affinity;
+pub mod affinity;
 #[cfg(not(feature = "io-uring"))]
 mod reader;
 #[cfg(not(feature = "io-uring"))]

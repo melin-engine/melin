@@ -70,9 +70,16 @@ const DEFAULT_WINDOW: usize = 64;
 const DEFAULT_CLIENTS: usize = 1;
 
 /// Default number of bench client threads. Each thread manages a subset of
-/// connections via epoll. 4 threads is enough to saturate the server pipeline
-/// without oversubscribing cores (4 bench + 5 server = 9 threads on 16 cores).
+/// connections via epoll. Pinned to cores 6-9 (2 physical + 2 HT siblings
+/// on 8C/16T). With 4 bench + 5 server (3 pipeline + 2 reader) = 9 pinned
+/// threads total, leaving core 0 for OS/IRQ and 6 cores free.
 const DEFAULT_BENCH_THREADS: usize = 4;
+
+/// First CPU core for bench thread pinning. Server uses cores 1-3 (pipeline)
+/// and 4-5 (readers), so bench threads start at core 6 to avoid contention
+/// for L1/L2 cache and reduce involuntary context switches. Thread i is
+/// pinned to core `BENCH_CORE_START + i`.
+const BENCH_CORE_START: usize = 6;
 
 /// Maximum frame payload size (matches protocol).
 const MAX_FRAME_SIZE: usize = 1024;
@@ -167,6 +174,12 @@ fn main() {
             let num_clients: usize = parse_flag(&args, "--clients=").unwrap_or(DEFAULT_CLIENTS);
             let bench_threads: usize =
                 parse_flag(&args, "--bench-threads=").unwrap_or(DEFAULT_BENCH_THREADS);
+            #[cfg(feature = "io-uring")]
+            if args.iter().any(|a| a.starts_with("--bench-threads=")) {
+                eprintln!(
+                    "warning: --bench-threads is ignored with io-uring (single-threaded event loop)"
+                );
+            }
             run_roundtrip_bench(
                 use_uds,
                 pairs,
@@ -986,9 +999,13 @@ fn run_epoll_roundtrip<R, W, F>(
 
     for (i, conns) in thread_conns.into_iter().enumerate() {
         let barrier = Arc::clone(&barrier);
+        let core_id = BENCH_CORE_START + i;
         let handle = std::thread::Builder::new()
             .name(format!("bench-{i}"))
             .spawn(move || {
+                if let Err(e) = trading_server::affinity::pin_to_core(core_id) {
+                    eprintln!("warning: bench-{i} could not pin to core {core_id}: {e}");
+                }
                 barrier.wait();
                 run_epoll_loop(conns, window)
             })
@@ -1107,6 +1124,12 @@ fn run_uring_roundtrip<R, W, F>(
         });
     }
 
+    // Pin the io_uring bench thread (runs on main thread) to avoid
+    // cache contention with server threads (cores 1-5).
+    if let Err(e) = trading_server::affinity::pin_to_core(BENCH_CORE_START) {
+        eprintln!("warning: could not pin io_uring bench to core {BENCH_CORE_START}: {e}");
+    }
+
     let start = Instant::now();
     let (histogram, _series) = run_uring_loop(connections, window, start);
     let wall = start.elapsed();
@@ -1116,7 +1139,9 @@ fn run_uring_roundtrip<R, W, F>(
         extra_lines.push(format!("  Group commit delay: {group_commit_us} µs"));
     }
     extra_lines.push(format!("  Transport: {transport_name}"));
-    extra_lines.push("  Bench threads: 1 (io_uring)".to_string());
+    extra_lines.push(format!(
+        "  Bench threads: 1 (io_uring, core {BENCH_CORE_START})"
+    ));
     extra_lines.push(format!("  Window: {window}, Clients: {num_clients}"));
 
     print_results(
