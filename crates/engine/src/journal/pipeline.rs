@@ -207,6 +207,7 @@ impl JournalStage {
             if shutdown.load(std::sync::atomic::Ordering::Relaxed) {
                 // Flush any pending data before shutdown.
                 if pending > 0 {
+                    #[cfg(not(feature = "no-persist"))]
                     if let Err(e) = self.writer.sync() {
                         tracing::error!(error = %e, "journal sync error on shutdown");
                     }
@@ -249,12 +250,14 @@ impl JournalStage {
                     ));
                 }
 
+                #[cfg(not(feature = "no-persist"))]
                 for slot in &batch[..count] {
                     if let Err(e) = self.writer.append_no_sync(&slot.event) {
                         tracing::error!(error = %e, "journal encode error");
                     }
                 }
                 pending += count;
+                #[cfg(not(feature = "no-persist"))]
                 if first_write_ts.is_none() {
                     first_write_ts = Some(Instant::now());
                 }
@@ -438,6 +441,7 @@ impl JournalStage {
                     ));
                 }
 
+                #[cfg(not(feature = "no-persist"))]
                 for slot in &batch[..count] {
                     if let Err(e) = self.writer.append_no_sync(&slot.event) {
                         tracing::error!(error = %e, "journal encode error");
@@ -546,13 +550,16 @@ impl JournalStage {
             if count == 0 {
                 break;
             }
-            for slot in &batch[..count] {
-                if let Err(e) = self.writer.append_no_sync(&slot.event) {
-                    tracing::error!(error = %e, "journal encode error on drain");
+            #[cfg(not(feature = "no-persist"))]
+            {
+                for slot in &batch[..count] {
+                    if let Err(e) = self.writer.append_no_sync(&slot.event) {
+                        tracing::error!(error = %e, "journal encode error on drain");
+                    }
                 }
-            }
-            if let Err(e) = self.writer.sync() {
-                tracing::error!(error = %e, "journal sync error on drain");
+                if let Err(e) = self.writer.sync() {
+                    tracing::error!(error = %e, "journal sync error on drain");
+                }
             }
             self.consumer.commit(count);
         }

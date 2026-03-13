@@ -5,6 +5,7 @@ edition = "2024"
 
 [features]
 no-fsync = ["trading-engine/no-fsync"]
+no-persist = ["trading-server/no-persist"]
 latency-trace = ["trading-server/latency-trace"]
 io-uring = ["trading-server/io-uring"]
 pipeline-stats = ["trading-server/pipeline-stats"]
