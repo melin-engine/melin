@@ -140,7 +140,7 @@ fn main() {
 fn run_engine_bench(total_pairs: usize) {
     let nz = |v: u64| NonZeroU64::new(v).expect("non-zero");
 
-    let mut exchange = trading_engine::exchange::Exchange::new();
+    let mut exchange = trading_engine::exchange::Exchange::with_capacity();
     exchange.add_instrument(InstrumentSpec {
         symbol: Symbol(1),
         base: CurrencyId(1),
@@ -151,6 +151,8 @@ fn run_engine_bench(total_pairs: usize) {
     // immediately, so a generous initial deposit avoids balance exhaustion.
     exchange.deposit(AccountId(1), CurrencyId(1), u64::MAX / 2);
     exchange.deposit(AccountId(1), CurrencyId(2), u64::MAX / 2);
+
+    exchange.prefault();
 
     let total_orders = WARMUP_ORDERS + total_pairs * 2;
     let mut reports = Vec::with_capacity(256);
@@ -232,7 +234,7 @@ fn run_pipeline_bench(total_pairs: usize, window: usize, group_commit_us: u64) {
     let nz = |v: u64| NonZeroU64::new(v).expect("non-zero");
 
     // Set up exchange with one instrument and funded account.
-    let mut exchange = trading_engine::exchange::Exchange::new();
+    let mut exchange = trading_engine::exchange::Exchange::with_capacity();
     exchange.add_instrument(InstrumentSpec {
         symbol: Symbol(1),
         base: CurrencyId(1),
@@ -240,6 +242,7 @@ fn run_pipeline_bench(total_pairs: usize, window: usize, group_commit_us: u64) {
     });
     exchange.deposit(AccountId(1), CurrencyId(1), u64::MAX / 2);
     exchange.deposit(AccountId(1), CurrencyId(2), u64::MAX / 2);
+    exchange.prefault();
 
     let tmp_dir = tempdir();
     let journal_path = tmp_dir.join("pipeline-bench.journal");

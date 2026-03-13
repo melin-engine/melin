@@ -86,6 +86,37 @@ impl AccountManager {
         }
     }
 
+    /// Create an AccountManager pre-sized for production workloads.
+    /// Avoids HashMap resize spikes on the hot path.
+    pub fn with_capacity() -> Self {
+        Self {
+            // Many accounts × few currencies per account.
+            balances: HashMap::with_capacity(10_000),
+            // One reservation per resting order across all instruments.
+            reservations: HashMap::with_capacity(2_000_000),
+        }
+    }
+
+    /// Touch all pre-allocated HashMap pages so page faults happen at startup,
+    /// not on the hot path.
+    pub fn prefault(&mut self) {
+        let cap = self.balances.capacity();
+        for i in 0..cap as u32 {
+            self.balances
+                .insert((AccountId(i), CurrencyId(0)), Balance::default());
+        }
+        self.balances.clear();
+
+        let cap = self.reservations.capacity();
+        for i in 0..cap {
+            self.reservations.insert(
+                OrderId(i as u64),
+                Reservation::new(AccountId(0), CurrencyId(0), 0),
+            );
+        }
+        self.reservations.clear();
+    }
+
     /// Reconstruct from pre-built parts (used by snapshot restore).
     pub(crate) fn from_parts(
         balances: HashMap<(AccountId, CurrencyId), Balance>,

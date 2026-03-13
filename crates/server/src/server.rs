@@ -100,7 +100,10 @@ pub fn run_with_shutdown<L: BlockingTransportListener>(
     let engine = init_engine(&config)?;
 
     // Decompose into parts for the pipeline.
-    let (exchange, writer) = engine.into_parts();
+    let (mut exchange, writer) = engine.into_parts();
+
+    // Pre-fault all HashMap pages so page faults happen now, not on the hot path.
+    exchange.prefault();
 
     // Build the disruptor pipeline.
     let (input_producer, journal_stage, matching_stage, output_consumer, journal_cursor) =

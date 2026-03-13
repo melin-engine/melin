@@ -34,6 +34,9 @@ pub struct Exchange {
     /// Reusable buffer for consumed order IDs from `process_reports()`.
     /// Avoids per-order Vec allocation on the hot path.
     consumed_buf: Vec<OrderId>,
+    /// When true, new order books are created with generous pre-allocation
+    /// to avoid HashMap resize spikes on the hot path.
+    presized: bool,
 }
 
 impl Exchange {
@@ -44,6 +47,21 @@ impl Exchange {
             accounts: AccountManager::new(),
             order_sides: HashMap::new(),
             consumed_buf: Vec::new(),
+            presized: false,
+        }
+    }
+
+    /// Create an Exchange pre-sized for production workloads. Avoids
+    /// HashMap resize spikes on the hot path by allocating upfront.
+    /// RAM is cheap; tail latency is not.
+    pub fn with_capacity() -> Self {
+        Self {
+            books: HashMap::with_capacity(64),
+            instruments: HashMap::with_capacity(64),
+            accounts: AccountManager::with_capacity(),
+            order_sides: HashMap::with_capacity(2_000_000),
+            consumed_buf: Vec::with_capacity(256),
+            presized: true,
         }
     }
 
@@ -60,6 +78,7 @@ impl Exchange {
             accounts,
             order_sides,
             consumed_buf: Vec::new(),
+            presized: false,
         }
     }
 
@@ -81,9 +100,33 @@ impl Exchange {
             .collect()
     }
 
+    /// Touch all pre-allocated HashMap pages so page faults happen at startup,
+    /// not on the hot path. Call once after adding instruments, before accepting
+    /// orders.
+    pub fn prefault(&mut self) {
+        let cap = self.order_sides.capacity();
+        for i in 0..cap {
+            self.order_sides.insert(OrderId(i as u64), Side::Buy);
+        }
+        self.order_sides.clear();
+
+        self.accounts.prefault();
+
+        for book in self.books.values_mut() {
+            book.prefault();
+        }
+    }
+
     /// Register a new instrument with its currency pair specification.
     pub fn add_instrument(&mut self, spec: InstrumentSpec) {
-        self.books.entry(spec.symbol).or_default();
+        let presized = self.presized;
+        self.books.entry(spec.symbol).or_insert_with(|| {
+            if presized {
+                OrderBook::with_capacity()
+            } else {
+                OrderBook::new()
+            }
+        });
         self.instruments.insert(spec.symbol, spec);
     }
 

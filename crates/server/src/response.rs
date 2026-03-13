@@ -63,8 +63,9 @@ pub fn run(
     shutdown: &AtomicBool,
 ) {
     // Connection table: maps connection IDs to their blocking writers.
-    // HashMap for O(1) lookup. Connection count bounded by OS fd limits.
-    let mut connections: HashMap<u64, BlockingFrameWriter<Box<dyn Write + Send>>> = HashMap::new();
+    // HashMap for O(1) lookup. Pre-sized for a reasonable number of concurrent clients.
+    let mut connections: HashMap<u64, BlockingFrameWriter<Box<dyn Write + Send>>> =
+        HashMap::with_capacity(256);
 
     let mut batch = [OutputSlot::default(); MAX_BATCH];
     let mut encode_buf = [0u8; MAX_RESPONSE_BUF];

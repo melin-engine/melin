@@ -159,7 +159,8 @@ fn epoll_reader_loop<R: AsRawFd>(
     let ret = unsafe { libc::epoll_ctl(epoll_fd, libc::EPOLL_CTL_ADD, wakeup_fd, &mut ev) };
     assert!(ret == 0, "epoll_ctl add eventfd failed");
 
-    let mut connections: HashMap<RawFd, ConnectionState<R>> = HashMap::new();
+    // Pre-size for a reasonable number of concurrent connections per reader thread.
+    let mut connections: HashMap<RawFd, ConnectionState<R>> = HashMap::with_capacity(256);
     let mut events = vec![libc::epoll_event { events: 0, u64: 0 }; MAX_EPOLL_EVENTS];
 
     #[cfg(feature = "latency-trace")]

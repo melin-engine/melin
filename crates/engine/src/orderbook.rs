@@ -238,6 +238,52 @@ impl OrderBook {
         }
     }
 
+    /// Create an OrderBook pre-sized for production workloads. Avoids
+    /// HashMap resize spikes under heavy quoting by allocating upfront.
+    pub fn with_capacity() -> Self {
+        Self {
+            bids: BookSide::default(),
+            asks: BookSide::default(),
+            // One entry per resting order for O(1) cancel lookups.
+            order_index: HashMap::with_capacity(1_000_000),
+            // BTreeMap is node-allocated — no resize spikes.
+            stop_buys: BTreeMap::new(),
+            stop_sells: BTreeMap::new(),
+            stop_index: HashMap::with_capacity(100_000),
+            last_trade_price: None,
+            trigger_price_buf: Vec::with_capacity(64),
+            triggered_buf: Vec::with_capacity(64),
+        }
+    }
+
+    /// Touch all pre-allocated HashMap pages so page faults happen at startup,
+    /// not on the hot path. Insert dummy entries up to capacity, then clear.
+    pub fn prefault(&mut self) {
+        let cap = self.order_index.capacity();
+        for i in 0..cap {
+            self.order_index.insert(
+                OrderId(i as u64),
+                (
+                    Side::Buy,
+                    Price(std::num::NonZeroU64::new(1).expect("non-zero literal")),
+                ),
+            );
+        }
+        self.order_index.clear();
+
+        let cap = self.stop_index.capacity();
+        for i in 0..cap {
+            self.stop_index.insert(
+                OrderId(i as u64),
+                (
+                    Side::Buy,
+                    Price(std::num::NonZeroU64::new(1).expect("non-zero literal")),
+                ),
+            );
+        }
+        self.stop_index.clear();
+    }
+
     /// Reconstruct an OrderBook from pre-built parts (used by snapshot restore).
     pub(crate) fn from_parts(
         bids: BookSide,
