@@ -418,7 +418,7 @@ mod tests {
     use std::num::NonZeroU64;
 
     use super::*;
-    use crate::types::{OrderType, Symbol, TimeInForce};
+    use crate::types::{OrderType, SelfTradeProtection, Symbol, TimeInForce};
 
     const ACCT_A: AccountId = AccountId(1);
     const ACCT_B: AccountId = AccountId(2);
@@ -449,6 +449,7 @@ mod tests {
             order_type: OrderType::Limit { price: price(p) },
             time_in_force: TimeInForce::GTC,
             quantity: qty(q),
+            stp: SelfTradeProtection::Allow,
         }
     }
 
@@ -460,6 +461,7 @@ mod tests {
             order_type: OrderType::Limit { price: price(p) },
             time_in_force: TimeInForce::GTC,
             quantity: qty(q),
+            stp: SelfTradeProtection::Allow,
         }
     }
 
@@ -471,6 +473,7 @@ mod tests {
             order_type: OrderType::Market,
             time_in_force: TimeInForce::IOC,
             quantity: qty(q),
+            stp: SelfTradeProtection::Allow,
         }
     }
 
@@ -482,6 +485,7 @@ mod tests {
             order_type: OrderType::Market,
             time_in_force: TimeInForce::IOC,
             quantity: qty(q),
+            stp: SelfTradeProtection::Allow,
         }
     }
 

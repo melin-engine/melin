@@ -16,7 +16,7 @@ pub mod uds;
 /// engine crate.
 pub mod types {
     pub use trading_engine::types::{
-        AccountId, ExecutionReport, Order, OrderId, OrderType, Price, Quantity, RejectReason, Side,
-        Symbol, TimeInForce,
+        AccountId, ExecutionReport, Order, OrderId, OrderType, Price, Quantity, RejectReason,
+        SelfTradeProtection, Side, Symbol, TimeInForce,
     };
 }

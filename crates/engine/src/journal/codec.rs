@@ -40,7 +40,8 @@ use crate::le;
 pub const FILE_MAGIC: u32 = 0x4A4F_5552;
 
 /// Current format version. Bumped on any layout change.
-pub const FORMAT_VERSION: u16 = 1;
+/// v1 → v2: added SelfTradeProtection byte to Order encoding.
+pub const FORMAT_VERSION: u16 = 2;
 
 /// File header size in bytes.
 pub const FILE_HEADER_SIZE: usize = 8;
@@ -330,6 +331,8 @@ fn encode_order(order: &Order, buf: &mut [u8]) -> usize {
     pos += 1;
     le::put_u64(&mut buf[pos..], order.quantity.get());
     pos += 8;
+    buf[pos] = le::encode_stp(order.stp);
+    pos += 1;
 
     pos
 }
@@ -395,8 +398,8 @@ fn decode_order(buf: &[u8], sequence: u64) -> Result<(usize, Order), JournalErro
         _ => return Err(corrupt("invalid order type tag")),
     };
 
-    if buf.len() < pos + 9 {
-        return Err(corrupt("order missing tif/quantity"));
+    if buf.len() < pos + 10 {
+        return Err(corrupt("order missing tif/quantity/stp"));
     }
 
     let time_in_force = le::decode_tif(buf[pos]).ok_or(corrupt("invalid time-in-force"))?;
@@ -404,6 +407,9 @@ fn decode_order(buf: &[u8], sequence: u64) -> Result<(usize, Order), JournalErro
 
     let quantity = NonZeroU64::new(le::get_u64(&buf[pos..])).ok_or(corrupt("quantity is zero"))?;
     pos += 8;
+
+    let stp = le::decode_stp(buf[pos]).ok_or(corrupt("invalid self-trade protection"))?;
+    pos += 1;
 
     Ok((
         pos,
@@ -414,6 +420,7 @@ fn decode_order(buf: &[u8], sequence: u64) -> Result<(usize, Order), JournalErro
             order_type,
             time_in_force,
             quantity: Quantity(quantity),
+            stp,
         },
     ))
 }
@@ -421,7 +428,7 @@ fn decode_order(buf: &[u8], sequence: u64) -> Result<(usize, Order), JournalErro
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::{Side, TimeInForce};
+    use crate::types::{SelfTradeProtection, Side, TimeInForce};
     use std::num::NonZeroU64;
 
     fn nz(v: u64) -> NonZeroU64 {
@@ -453,6 +460,7 @@ mod tests {
                     },
                     time_in_force: TimeInForce::GTC,
                     quantity: Quantity(nz(10)),
+                    stp: SelfTradeProtection::CancelNewest,
                 },
             },
             JournalEvent::SubmitOrder {
@@ -464,6 +472,7 @@ mod tests {
                     order_type: OrderType::Market,
                     time_in_force: TimeInForce::IOC,
                     quantity: Quantity(nz(5)),
+                    stp: SelfTradeProtection::Allow,
                 },
             },
             JournalEvent::SubmitOrder {
@@ -477,6 +486,7 @@ mod tests {
                     },
                     time_in_force: TimeInForce::GTC,
                     quantity: Quantity(nz(20)),
+                    stp: SelfTradeProtection::CancelOldest,
                 },
             },
             JournalEvent::SubmitOrder {
@@ -491,6 +501,7 @@ mod tests {
                     },
                     time_in_force: TimeInForce::FOK,
                     quantity: Quantity(nz(15)),
+                    stp: SelfTradeProtection::CancelBoth,
                 },
             },
             JournalEvent::CancelOrder {

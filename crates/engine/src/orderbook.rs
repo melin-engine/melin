@@ -7,8 +7,8 @@ use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::num::NonZeroU64;
 
 use crate::types::{
-    AccountId, ExecutionReport, Order, OrderId, OrderType, Price, Quantity, RejectReason, Side,
-    TimeInForce,
+    AccountId, ExecutionReport, Order, OrderId, OrderType, Price, Quantity, RejectReason,
+    SelfTradeProtection, Side, TimeInForce,
 };
 
 /// A resting order on the book (the unfilled portion of a limit order).
@@ -35,6 +35,8 @@ pub(crate) struct PendingStop {
     /// Prevents fills from exceeding the reserved amount. `None` for sell-side
     /// orders and limit/stop-limit buys (where cost is bounded by price × qty).
     quote_budget: Option<u64>,
+    /// Self-trade prevention mode, preserved from the original order.
+    stp: SelfTradeProtection,
 }
 
 /// One side of the order book (either all bids or all asks).
@@ -74,6 +76,7 @@ impl RestingOrder {
 
 impl PendingStop {
     /// Create a new pending stop order (used by snapshot restore).
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         id: OrderId,
         account: AccountId,
@@ -83,6 +86,7 @@ impl PendingStop {
         time_in_force: TimeInForce,
         limit_price: Option<Price>,
         quote_budget: Option<u64>,
+        stp: SelfTradeProtection,
     ) -> Self {
         Self {
             id,
@@ -93,6 +97,7 @@ impl PendingStop {
             time_in_force,
             limit_price,
             quote_budget,
+            stp,
         }
     }
 
@@ -127,6 +132,10 @@ impl PendingStop {
     pub(crate) fn quote_budget(&self) -> Option<u64> {
         self.quote_budget
     }
+
+    pub(crate) fn stp(&self) -> SelfTradeProtection {
+        self.stp
+    }
 }
 
 impl BookSide {
@@ -159,7 +168,14 @@ impl BookSide {
     }
 
     /// Total available quantity at prices that would match the given limit price.
-    fn available_quantity(&self, side: Side, limit: Option<Price>) -> u64 {
+    /// If `exclude_account` is `Some`, orders from that account are skipped
+    /// (used for FOK pre-check with STP CancelNewest/CancelBoth).
+    fn available_quantity(
+        &self,
+        side: Side,
+        limit: Option<Price>,
+        exclude_account: Option<AccountId>,
+    ) -> u64 {
         let mut total: u64 = 0;
         match side {
             Side::Buy => {
@@ -171,6 +187,9 @@ impl BookSide {
                         break;
                     }
                     for order in level {
+                        if exclude_account.is_some_and(|acct| acct == order.account) {
+                            continue;
+                        }
                         total = total.saturating_add(order.remaining.get());
                     }
                 }
@@ -184,6 +203,9 @@ impl BookSide {
                         break;
                     }
                     for order in level {
+                        if exclude_account.is_some_and(|acct| acct == order.account) {
+                            continue;
+                        }
                         total = total.saturating_add(order.remaining.get());
                     }
                 }
@@ -415,8 +437,15 @@ impl OrderBook {
         let opposite = self.opposite_side(order.side);
 
         // FOK: check if we can fill entirely before doing anything.
+        // With STP enabled, same-account orders won't fill (they get cancelled
+        // or block matching), so exclude them from the available quantity check.
         if order.time_in_force == TimeInForce::FOK {
-            let available = opposite.available_quantity(Self::opposite(order.side), Some(price));
+            let exclude = match order.stp {
+                SelfTradeProtection::Allow => None,
+                _ => Some(order.account),
+            };
+            let available =
+                opposite.available_quantity(Self::opposite(order.side), Some(price), exclude);
             if available < order.quantity.get() {
                 reports.push(ExecutionReport::Rejected {
                     order_id: order.id,
@@ -426,28 +455,46 @@ impl OrderBook {
             }
         }
 
-        let remaining = self.match_against(
+        let (remaining, stp_cancelled) = self.match_against(
             order.id,
             order.account,
             order.side,
             order.quantity,
             Some(price),
             None,
+            order.stp,
             reports,
         );
 
         match remaining {
-            Some(rem) => match order.time_in_force {
-                TimeInForce::GTC => {
-                    self.place_on_book(order.id, order.account, order.side, price, rem, reports);
-                }
-                TimeInForce::IOC | TimeInForce::FOK => {
+            Some(rem) => {
+                if stp_cancelled {
+                    // STP terminated matching — cancel the taker regardless of TIF.
                     reports.push(ExecutionReport::Cancelled {
                         order_id: order.id,
                         remaining_quantity: rem,
                     });
+                } else {
+                    match order.time_in_force {
+                        TimeInForce::GTC => {
+                            self.place_on_book(
+                                order.id,
+                                order.account,
+                                order.side,
+                                price,
+                                rem,
+                                reports,
+                            );
+                        }
+                        TimeInForce::IOC | TimeInForce::FOK => {
+                            reports.push(ExecutionReport::Cancelled {
+                                order_id: order.id,
+                                remaining_quantity: rem,
+                            });
+                        }
+                    }
                 }
-            },
+            }
             None => {
                 // Fully filled, nothing to do.
             }
@@ -464,7 +511,11 @@ impl OrderBook {
 
         // FOK: check if we can fill entirely.
         if order.time_in_force == TimeInForce::FOK {
-            let available = opposite.available_quantity(Self::opposite(order.side), None);
+            let exclude = match order.stp {
+                SelfTradeProtection::Allow => None,
+                _ => Some(order.account),
+            };
+            let available = opposite.available_quantity(Self::opposite(order.side), None, exclude);
             if available < order.quantity.get() {
                 reports.push(ExecutionReport::Rejected {
                     order_id: order.id,
@@ -483,18 +534,20 @@ impl OrderBook {
             return;
         }
 
-        let remaining = self.match_against(
+        let (remaining, _stp_cancelled) = self.match_against(
             order.id,
             order.account,
             order.side,
             order.quantity,
             None,
             quote_budget,
+            order.stp,
             reports,
         );
 
         if let Some(rem) = remaining {
             // Market order couldn't fully fill — cancel remainder.
+            // (STP cancellation also results in cancelling the remainder.)
             reports.push(ExecutionReport::Cancelled {
                 order_id: order.id,
                 remaining_quantity: rem,
@@ -503,12 +556,16 @@ impl OrderBook {
     }
 
     /// Match an incoming order against the opposite side of the book.
+    #[allow(clippy::too_many_arguments)]
     ///
     /// `quote_budget` caps the total quote cost for buy-side market orders,
     /// preventing fills from exceeding the reserved amount. Ignored for sells
     /// and limit buys.
     ///
-    /// Returns the remaining quantity if not fully filled, or `None` if fully filled.
+    /// Returns `(remaining_qty, stp_cancelled)`:
+    /// - `remaining_qty`: `None` if fully filled, `Some(qty)` if unfilled remainder.
+    /// - `stp_cancelled`: `true` if STP terminated matching (taker should be cancelled,
+    ///   not placed on book).
     fn match_against(
         &mut self,
         taker_id: OrderId,
@@ -517,8 +574,9 @@ impl OrderBook {
         mut quantity: Quantity,
         price_limit: Option<Price>,
         mut quote_budget: Option<u64>,
+        stp: SelfTradeProtection,
         reports: &mut Vec<ExecutionReport>,
-    ) -> Option<Quantity> {
+    ) -> (Option<Quantity>, bool) {
         let opposite = match taker_side {
             Side::Buy => &mut self.asks,
             Side::Sell => &mut self.bids,
@@ -548,12 +606,50 @@ impl OrderBook {
             }
         };
 
+        let mut stp_cancelled = false;
+
         'outer: for price in prices {
             let Some(level) = opposite.levels.get_mut(&price) else {
                 continue;
             };
 
             while let Some(maker) = level.front_mut() {
+                // Self-trade prevention: check if taker and maker belong to
+                // the same account before generating a fill.
+                if stp != SelfTradeProtection::Allow && maker.account == taker_account {
+                    match stp {
+                        SelfTradeProtection::Allow => unreachable!(),
+                        SelfTradeProtection::CancelNewest => {
+                            // Cancel the taker, leave the maker on the book.
+                            stp_cancelled = true;
+                            break 'outer;
+                        }
+                        SelfTradeProtection::CancelOldest => {
+                            // Cancel the maker, continue matching the taker.
+                            let cancelled_maker = level.pop_front().expect("front existed");
+                            self.order_index.remove(&cancelled_maker.id);
+                            reports.push(ExecutionReport::Cancelled {
+                                order_id: cancelled_maker.id,
+                                remaining_quantity: cancelled_maker.remaining,
+                            });
+                            continue;
+                        }
+                        SelfTradeProtection::CancelBoth => {
+                            // Cancel the maker and the taker.
+                            let cancelled_maker = level.pop_front().expect("front existed");
+                            self.order_index.remove(&cancelled_maker.id);
+                            reports.push(ExecutionReport::Cancelled {
+                                order_id: cancelled_maker.id,
+                                remaining_quantity: cancelled_maker.remaining,
+                            });
+                            if level.is_empty() {
+                                opposite.levels.remove(&price);
+                            }
+                            return (Some(quantity), true);
+                        }
+                    }
+                }
+
                 let mut fill_qty = quantity.min(maker.remaining);
 
                 // Enforce quote budget: limit fill to what the taker can afford.
@@ -612,7 +708,7 @@ impl OrderBook {
                         if level.is_empty() {
                             opposite.levels.remove(&price);
                         }
-                        return None;
+                        return (None, false);
                     }
                 }
             }
@@ -621,7 +717,7 @@ impl OrderBook {
             opposite.levels.remove(&price);
         }
 
-        Some(quantity)
+        (Some(quantity), stp_cancelled)
     }
 
     fn add_stop(
@@ -640,6 +736,7 @@ impl OrderBook {
             time_in_force: order.time_in_force,
             limit_price,
             quote_budget,
+            stp: order.stp,
         };
         let stops = match order.side {
             Side::Buy => &mut self.stop_buys,
@@ -724,6 +821,7 @@ impl OrderBook {
                 order_type,
                 time_in_force: stop.time_in_force,
                 quantity: stop.quantity,
+                stp: stop.stp,
             };
 
             // Re-enter execute but skip check_triggers to avoid recursion —
@@ -819,6 +917,7 @@ mod tests {
             order_type: OrderType::Limit { price: price(p) },
             time_in_force: tif,
             quantity: qty(q),
+            stp: SelfTradeProtection::Allow,
         }
     }
 
@@ -830,6 +929,7 @@ mod tests {
             order_type: OrderType::Market,
             time_in_force: tif,
             quantity: qty(q),
+            stp: SelfTradeProtection::Allow,
         }
     }
 
@@ -1552,6 +1652,7 @@ mod tests {
             },
             time_in_force: tif,
             quantity: qty(q),
+            stp: SelfTradeProtection::Allow,
         }
     }
 
@@ -1573,6 +1674,7 @@ mod tests {
             },
             time_in_force: tif,
             quantity: qty(q),
+            stp: SelfTradeProtection::Allow,
         }
     }
 

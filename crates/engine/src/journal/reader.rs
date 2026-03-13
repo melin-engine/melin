@@ -232,6 +232,7 @@ mod tests {
                     },
                     time_in_force: TimeInForce::GTC,
                     quantity: Quantity(nz(10)),
+                    stp: SelfTradeProtection::CancelNewest,
                 },
             },
             JournalEvent::CancelOrder {

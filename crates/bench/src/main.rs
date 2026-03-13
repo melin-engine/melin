@@ -241,6 +241,7 @@ fn run_engine_bench(total_pairs: usize) {
                 },
                 time_in_force: TimeInForce::GTC,
                 quantity: Quantity(nz(1)),
+                stp: SelfTradeProtection::Allow,
             },
             &mut reports,
         );
@@ -273,6 +274,7 @@ fn run_engine_bench(total_pairs: usize) {
                 },
                 time_in_force: TimeInForce::GTC,
                 quantity: Quantity(nz(1)),
+                stp: SelfTradeProtection::Allow,
             },
             &mut reports,
         );
@@ -389,6 +391,7 @@ fn run_pipeline_bench(total_pairs: usize, window: usize, group_commit_us: u64) {
                     },
                     time_in_force: TimeInForce::GTC,
                     quantity: Quantity(nz(1)),
+                    stp: SelfTradeProtection::Allow,
                 },
             },
             publish_ts: trace_ts(),
@@ -1461,6 +1464,7 @@ fn encode_frames(total_orders: usize, order_id_offset: u64) -> Vec<Vec<u8>> {
                 },
                 time_in_force: TimeInForce::GTC,
                 quantity: Quantity(nz(1)),
+                stp: SelfTradeProtection::Allow,
             },
         };
 

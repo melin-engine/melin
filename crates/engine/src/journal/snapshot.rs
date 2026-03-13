@@ -43,7 +43,8 @@ type StopLevels = Vec<(Price, Vec<PendingStopSnapshot>)>;
 const SNAP_MAGIC: u32 = 0x534E_4150;
 
 /// Current snapshot format version.
-const SNAP_VERSION: u16 = 1;
+/// v1 → v2: added SelfTradeProtection byte to PendingStopSnapshot.
+const SNAP_VERSION: u16 = 2;
 
 /// Snapshot header size: magic(4) + version(2) + reserved(2) + sequence(8) = 16.
 const SNAP_HEADER_SIZE: usize = 16;
@@ -191,6 +192,8 @@ pub(crate) struct PendingStopSnapshot {
     pub(crate) limit_price: Option<Price>,
     /// Quote budget for buy-side market/stop-market orders.
     pub(crate) quote_budget: Option<u64>,
+    /// Self-trade prevention mode.
+    pub(crate) stp: crate::types::SelfTradeProtection,
 }
 
 // --- Encoding helpers ---
@@ -313,6 +316,7 @@ fn encode_stop_side(levels: &[(Price, Vec<PendingStopSnapshot>)], buf: &mut Vec<
                 }
                 None => buf.push(0),
             }
+            buf.push(le::encode_stp(stop.stp));
         }
     }
 }
@@ -678,6 +682,12 @@ fn decode_stop_side_levels(buf: &[u8]) -> Result<(usize, StopLevels), JournalErr
                 _ => return Err(corrupt("invalid quote_budget tag in stop")),
             };
 
+            if pos >= buf.len() {
+                return Err(JournalError::TruncatedEntry);
+            }
+            let stp = le::decode_stp(buf[pos]).ok_or(corrupt("invalid stp in stop"))?;
+            pos += 1;
+
             stops.push(PendingStopSnapshot {
                 id,
                 account,
@@ -687,6 +697,7 @@ fn decode_stop_side_levels(buf: &[u8]) -> Result<(usize, StopLevels), JournalErr
                 time_in_force: tif,
                 limit_price,
                 quote_budget,
+                stp,
             });
         }
         levels.push((Price(trigger_val), stops));
@@ -809,6 +820,7 @@ impl OrderBook {
                             time_in_force: s.time_in_force(),
                             limit_price: s.limit_price(),
                             quote_budget: s.quote_budget(),
+                            stp: s.stp(),
                         })
                         .collect();
                     (trigger_price, snaps)
@@ -856,6 +868,7 @@ impl OrderBook {
                             s.time_in_force,
                             s.limit_price,
                             s.quote_budget,
+                            s.stp,
                         )
                     })
                     .collect();
@@ -927,6 +940,7 @@ mod tests {
             },
             time_in_force: TimeInForce::GTC,
             quantity: qty(q),
+            stp: SelfTradeProtection::Allow,
         }
     }
 

@@ -60,13 +60,14 @@ Clients ──TCP/UDS──> Accept Loop
 ### Risk & Accounting
 - Per-account, per-currency balance management
 - Reserve on order, update on fill, release on cancel
+- Self-trade prevention (per-order modes: CancelNewest, CancelOldest, CancelBoth)
 
 ## Build
 
 ```sh
 cargo build          # compile
 cargo run            # run server
-cargo test           # run tests (148 tests across workspace)
+cargo test           # run tests
 cargo clippy         # lint
 cargo fmt            # format
 ```
@@ -95,8 +96,8 @@ All benchmarks: 10M order pairs, 16 clients, 64 pipelined orders per client.
 ```
 sudo ./scripts/bench-isolate.sh --features io-uring,no-persist -- 10000000 --clients=16 --window=64
 
-Throughput:  3.69M orders/sec (0.27 µs/order)
-Latency:     p99 = 348 µs, p99.9 = 497 µs, max = 2.26 ms
+Throughput:  3.61M orders/sec (0.28 µs/order)
+Latency:     p99 = 355 µs, p99.9 = 605 µs, max = 2.55 ms
 ```
 
 **With fsync/FUA** (full durability, pwritev2 + RWF_DSYNC):
@@ -104,8 +105,8 @@ Latency:     p99 = 348 µs, p99.9 = 497 µs, max = 2.26 ms
 ```
 sudo ./scripts/bench-isolate.sh --features io-uring -- 10000000 --clients=16 --window=64
 
-Throughput:  779K orders/sec (1.28 µs/order)
-Latency:     p99 = 1.95 ms, p99.9 = 4.91 ms, max = 10.7 ms
+Throughput:  830K orders/sec (1.20 µs/order)
+Latency:     p99 = 1.84 ms, p99.9 = 4.55 ms, max = 7.55 ms
 ```
 
 ## License

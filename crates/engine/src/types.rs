@@ -113,6 +113,25 @@ pub enum TimeInForce {
     FOK,
 }
 
+/// Self-trade prevention mode, set per order.
+///
+/// Determines behavior when an incoming (taker) order would match against
+/// a resting (maker) order from the same account.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SelfTradeProtection {
+    /// Self-trades are allowed — no prevention.
+    Allow,
+    /// Cancel the incoming taker order's remaining quantity.
+    /// The resting maker order stays on the book.
+    #[default]
+    CancelNewest,
+    /// Cancel the resting maker order and continue matching the taker
+    /// against remaining orders.
+    CancelOldest,
+    /// Cancel both the resting maker and the incoming taker's remaining quantity.
+    CancelBoth,
+}
+
 /// An incoming order request.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Order {
@@ -122,6 +141,8 @@ pub struct Order {
     pub order_type: OrderType,
     pub time_in_force: TimeInForce,
     pub quantity: Quantity,
+    /// Self-trade prevention mode.
+    pub stp: SelfTradeProtection,
 }
 
 /// Events emitted by the matching engine.
@@ -172,6 +193,9 @@ pub enum RejectReason {
     UnknownAccount,
     /// The instrument is not registered.
     UnknownSymbol,
+    /// Self-trade prevention triggered — order would match against
+    /// the same account.
+    SelfTradePrevented,
 }
 
 #[cfg(test)]

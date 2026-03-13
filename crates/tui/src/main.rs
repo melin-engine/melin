@@ -17,8 +17,8 @@ use ratatui::widgets::{Block, Borders, Clear, List, ListItem, Paragraph};
 use trading_client::Client;
 use trading_protocol::message::{Request, ResponseKind};
 use trading_protocol::types::{
-    AccountId, ExecutionReport, Order, OrderId, OrderType, Price, Quantity, RejectReason, Side,
-    Symbol, TimeInForce,
+    AccountId, ExecutionReport, Order, OrderId, OrderType, Price, Quantity, RejectReason,
+    SelfTradeProtection, Side, Symbol, TimeInForce,
 };
 
 // ── Menu definitions ────────────────────────────────────────────────
@@ -358,6 +358,7 @@ impl App {
             order_type,
             time_in_force: tif,
             quantity: qty,
+            stp: SelfTradeProtection::default(),
         };
 
         let side_str = if side == Side::Buy { "BUY" } else { "SELL" };
@@ -442,6 +443,7 @@ fn format_report(report: &ExecutionReport) -> String {
                 RejectReason::InsufficientBalance => "insufficient balance",
                 RejectReason::UnknownAccount => "unknown account",
                 RejectReason::UnknownSymbol => "unknown symbol",
+                RejectReason::SelfTradePrevented => "self-trade prevented",
             };
             format!("REJECT  #{} ({reason_str})", order_id.0)
         }

@@ -180,6 +180,7 @@ fn run_book_actions(
                     order_type: OrderType::Limit { price: *price },
                     time_in_force: *tif,
                     quantity: *quantity,
+                    stp: SelfTradeProtection::Allow,
                 };
                 book.execute(order, None, &mut reports);
             }
@@ -194,6 +195,7 @@ fn run_book_actions(
                     order_type: OrderType::Market,
                     time_in_force: TimeInForce::IOC,
                     quantity: *quantity,
+                    stp: SelfTradeProtection::Allow,
                 };
                 book.execute(order, None, &mut reports);
             }
@@ -296,6 +298,7 @@ fn run_exchange_actions(actions: &[ExchangeAction]) -> (Exchange, Vec<Option<Ord
                     order_type: OrderType::Limit { price: *price },
                     time_in_force: *tif,
                     quantity: *quantity,
+                    stp: SelfTradeProtection::Allow,
                 };
                 exchange.execute(sym, order, &mut reports);
                 reports.clear();
@@ -315,6 +318,7 @@ fn run_exchange_actions(actions: &[ExchangeAction]) -> (Exchange, Vec<Option<Ord
                     order_type: OrderType::Market,
                     time_in_force: TimeInForce::IOC,
                     quantity: *quantity,
+                    stp: SelfTradeProtection::Allow,
                 };
                 exchange.execute(sym, order, &mut reports);
                 reports.clear();
@@ -560,6 +564,7 @@ proptest! {
                 order_type: OrderType::Limit { price: *p },
                 time_in_force: TimeInForce::GTC,
                 quantity: *q,
+                stp: SelfTradeProtection::Allow,
             };
             book.execute(order, None, &mut reports);
         }
@@ -572,6 +577,7 @@ proptest! {
             order_type: OrderType::Market,
             time_in_force: TimeInForce::IOC,
             quantity: Quantity(NonZeroU64::new(market_qty).unwrap()),
+            stp: SelfTradeProtection::Allow,
         };
         book.execute(market, None, &mut reports);
 
@@ -623,6 +629,7 @@ proptest! {
                 order_type: OrderType::Limit { price: *p },
                 time_in_force: TimeInForce::GTC,
                 quantity: *q,
+                stp: SelfTradeProtection::Allow,
             };
             book.execute(order, None, &mut reports);
         }
@@ -635,6 +642,7 @@ proptest! {
             order_type: OrderType::Market,
             time_in_force: TimeInForce::IOC,
             quantity: Quantity(NonZeroU64::new(market_qty).unwrap()),
+            stp: SelfTradeProtection::Allow,
         };
         book.execute(market, None, &mut reports);
 
@@ -734,6 +742,7 @@ proptest! {
             order_type: OrderType::Limit { price: p },
             time_in_force: TimeInForce::GTC,
             quantity: q,
+            stp: SelfTradeProtection::Allow,
         };
         let _ = mgr.try_reserve(&buy, &spec);
 
@@ -745,6 +754,7 @@ proptest! {
             order_type: OrderType::Limit { price: p },
             time_in_force: TimeInForce::GTC,
             quantity: q,
+            stp: SelfTradeProtection::Allow,
         };
         let _ = mgr.try_reserve(&sell, &spec);
     }
@@ -771,6 +781,7 @@ proptest! {
             order_type: OrderType::Limit { price: p },
             time_in_force: TimeInForce::GTC,
             quantity: q,
+            stp: SelfTradeProtection::Allow,
         };
         let sell = Order {
             id: OrderId(2),
@@ -779,6 +790,7 @@ proptest! {
             order_type: OrderType::Limit { price: p },
             time_in_force: TimeInForce::GTC,
             quantity: q,
+            stp: SelfTradeProtection::Allow,
         };
 
         let buy_ok = mgr.try_reserve(&buy, &spec).is_ok();

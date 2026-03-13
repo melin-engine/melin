@@ -52,6 +52,7 @@ const REJECT_FOK_CANNOT_FILL: u8 = 1;
 const REJECT_INSUFFICIENT_BALANCE: u8 = 2;
 const REJECT_UNKNOWN_ACCOUNT: u8 = 3;
 const REJECT_UNKNOWN_SYMBOL: u8 = 4;
+const REJECT_SELF_TRADE_PREVENTED: u8 = 5;
 
 /// Encode a request into `buf`. Returns total bytes written (length prefix + tag + payload).
 ///
@@ -213,6 +214,8 @@ fn encode_order(order: &Order, buf: &mut [u8]) -> usize {
     pos += 1;
     le::put_u64(&mut buf[pos..], order.quantity.get());
     pos += 8;
+    buf[pos] = le::encode_stp(order.stp);
+    pos += 1;
 
     pos
 }
@@ -278,7 +281,7 @@ fn decode_order(buf: &[u8]) -> Result<(usize, Order), ProtocolError> {
         _ => return Err(ProtocolError::InvalidField("order type tag")),
     };
 
-    if buf.len() < pos + 9 {
+    if buf.len() < pos + 10 {
         return Err(ProtocolError::Truncated);
     }
 
@@ -290,6 +293,10 @@ fn decode_order(buf: &[u8]) -> Result<(usize, Order), ProtocolError> {
         .ok_or(ProtocolError::InvalidField("quantity is zero"))?;
     pos += 8;
 
+    let stp =
+        le::decode_stp(buf[pos]).ok_or(ProtocolError::InvalidField("self-trade protection"))?;
+    pos += 1;
+
     Ok((
         pos,
         Order {
@@ -299,6 +306,7 @@ fn decode_order(buf: &[u8]) -> Result<(usize, Order), ProtocolError> {
             order_type,
             time_in_force,
             quantity: Quantity(quantity),
+            stp,
         },
     ))
 }
@@ -469,6 +477,7 @@ fn encode_reject_reason(reason: RejectReason) -> u8 {
         RejectReason::InsufficientBalance => REJECT_INSUFFICIENT_BALANCE,
         RejectReason::UnknownAccount => REJECT_UNKNOWN_ACCOUNT,
         RejectReason::UnknownSymbol => REJECT_UNKNOWN_SYMBOL,
+        RejectReason::SelfTradePrevented => REJECT_SELF_TRADE_PREVENTED,
     }
 }
 
@@ -479,6 +488,7 @@ fn decode_reject_reason(b: u8) -> Result<RejectReason, ProtocolError> {
         REJECT_INSUFFICIENT_BALANCE => Ok(RejectReason::InsufficientBalance),
         REJECT_UNKNOWN_ACCOUNT => Ok(RejectReason::UnknownAccount),
         REJECT_UNKNOWN_SYMBOL => Ok(RejectReason::UnknownSymbol),
+        REJECT_SELF_TRADE_PREVENTED => Ok(RejectReason::SelfTradePrevented),
         _ => Err(ProtocolError::InvalidField("reject reason")),
     }
 }
@@ -486,7 +496,7 @@ fn decode_reject_reason(b: u8) -> Result<RejectReason, ProtocolError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use trading_engine::types::{Side, TimeInForce};
+    use trading_engine::types::{SelfTradeProtection, Side, TimeInForce};
 
     fn nz(v: u64) -> NonZeroU64 {
         NonZeroU64::new(v).unwrap()
@@ -505,6 +515,7 @@ mod tests {
                     },
                     time_in_force: TimeInForce::GTC,
                     quantity: Quantity(nz(10)),
+                    stp: SelfTradeProtection::CancelNewest,
                 },
             },
             Request::SubmitOrder {
@@ -516,6 +527,7 @@ mod tests {
                     order_type: OrderType::Market,
                     time_in_force: TimeInForce::IOC,
                     quantity: Quantity(nz(5)),
+                    stp: SelfTradeProtection::Allow,
                 },
             },
             Request::SubmitOrder {
@@ -529,6 +541,7 @@ mod tests {
                     },
                     time_in_force: TimeInForce::GTC,
                     quantity: Quantity(nz(20)),
+                    stp: SelfTradeProtection::CancelOldest,
                 },
             },
             Request::SubmitOrder {
@@ -543,6 +556,7 @@ mod tests {
                     },
                     time_in_force: TimeInForce::FOK,
                     quantity: Quantity(nz(15)),
+                    stp: SelfTradeProtection::CancelBoth,
                 },
             },
             Request::CancelOrder {
@@ -595,6 +609,10 @@ mod tests {
             ResponseKind::Report(ExecutionReport::Rejected {
                 order_id: OrderId(9),
                 reason: RejectReason::UnknownSymbol,
+            }),
+            ResponseKind::Report(ExecutionReport::Rejected {
+                order_id: OrderId(10),
+                reason: RejectReason::SelfTradePrevented,
             }),
             ResponseKind::EngineError,
             ResponseKind::BatchEnd,

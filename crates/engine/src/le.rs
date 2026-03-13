@@ -3,7 +3,7 @@
 //! Used by both the journal codec and snapshot serialization to avoid
 //! duplicating these primitives.
 
-use crate::types::{Side, TimeInForce};
+use crate::types::{SelfTradeProtection, Side, TimeInForce};
 
 // --- Fixed-buffer writers (for journal codec's pre-allocated buffer) ---
 
@@ -78,6 +78,26 @@ pub fn decode_tif(b: u8) -> Option<TimeInForce> {
         0 => Some(TimeInForce::GTC),
         1 => Some(TimeInForce::IOC),
         2 => Some(TimeInForce::FOK),
+        _ => None,
+    }
+}
+
+/// SelfTradeProtection encoding: Allow=0, CancelNewest=1, CancelOldest=2, CancelBoth=3.
+pub fn encode_stp(stp: SelfTradeProtection) -> u8 {
+    match stp {
+        SelfTradeProtection::Allow => 0,
+        SelfTradeProtection::CancelNewest => 1,
+        SelfTradeProtection::CancelOldest => 2,
+        SelfTradeProtection::CancelBoth => 3,
+    }
+}
+
+pub fn decode_stp(b: u8) -> Option<SelfTradeProtection> {
+    match b {
+        0 => Some(SelfTradeProtection::Allow),
+        1 => Some(SelfTradeProtection::CancelNewest),
+        2 => Some(SelfTradeProtection::CancelOldest),
+        3 => Some(SelfTradeProtection::CancelBoth),
         _ => None,
     }
 }

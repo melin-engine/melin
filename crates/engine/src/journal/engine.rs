@@ -224,6 +224,7 @@ mod tests {
             order_type: OrderType::Limit { price: price(p) },
             time_in_force: TimeInForce::GTC,
             quantity: qty(q),
+            stp: SelfTradeProtection::Allow,
         }
     }
 
