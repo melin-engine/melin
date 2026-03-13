@@ -18,3 +18,4 @@ trading-engine = { path = "../engine" }
 trading-protocol = { path = "../protocol" }
 trading-server = { path = "../server" }
 hdrhistogram = "7"
+libc = { workspace = true }
