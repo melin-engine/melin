@@ -1,8 +1,9 @@
 //! Unix domain socket transport implementation.
 //!
 //! Avoids the TCP/IP stack entirely — no checksums, congestion control,
-//! or connection tracking. Useful for same-machine deployment to isolate
-//! network stack overhead from application-level latency.
+//! or connection tracking. Used as a benchmarking comparison point to
+//! isolate TCP stack overhead from application-level latency.
+//! Production deployments use TCP (required for remote clients).
 
 use std::io;
 use std::net::SocketAddr;

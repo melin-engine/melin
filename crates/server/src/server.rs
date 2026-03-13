@@ -60,6 +60,11 @@ pub struct ServerConfig {
     /// issuing fsync, allowing more events to accumulate in the batch.
     /// Under high load the batch fills naturally and the delay rarely
     /// fires. Zero means sync immediately after each batch read.
+    ///
+    /// **TCP**: keep at zero. Any delay holds the journal cursor longer,
+    /// making the response stage block and accumulate larger TCP sends.
+    /// The io_uring overlapped fsync already provides natural batching.
+    /// **UDS**: 100µs improves throughput ~25% since transport is near-free.
     pub group_commit_delay: std::time::Duration,
     /// Number of epoll reader threads. Each thread multiplexes a subset
     /// of connections via epoll. Connections are assigned round-robin.
