@@ -1,0 +1,5 @@
+[build]
+# Emit instructions tuned for the build machine's CPU (AVX2, BMI2, etc.).
+# Produces faster code but binaries are not portable across CPU generations.
+# Remove or change to a specific target (e.g., "x86-64-v3") for distributed builds.
+rustflags = ["-C", "target-cpu=native"]

@@ -6,3 +6,23 @@ resolver = "3"
 libc = "0.2"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
+
+[profile.release]
+# Full cross-crate LTO: allows LLVM to inline across crate boundaries
+# (e.g., disruptor ring ops into engine hot path). Major win for multi-crate
+# workspaces. Cost: slower release builds.
+lto = "fat"
+# Single codegen unit: LLVM optimizes the entire crate as one compilation
+# unit instead of splitting into parallel chunks. Pairs with LTO for
+# maximum cross-function optimization.
+codegen-units = 1
+# Abort on panic: eliminates unwind tables and landing pads. Smaller
+# binaries, no unwind overhead at call boundaries. Safe here because
+# pipeline threads don't use catch_unwind.
+panic = "abort"
+
+# Compile dependencies with optimizations even in debug mode. Makes
+# `cargo test` (especially proptests) run much faster without slowing
+# down the edit-compile-debug cycle for our own code.
+[profile.dev.package."*"]
+opt-level = 2
