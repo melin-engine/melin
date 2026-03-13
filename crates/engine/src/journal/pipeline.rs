@@ -639,12 +639,16 @@ mod tests {
         shutdown.store(true, Ordering::Relaxed);
         let _writer = handle.join().unwrap();
 
-        let mut reader = crate::journal::JournalReader::open(&path).unwrap();
-        let entry1 = reader.next_entry().unwrap().unwrap();
-        assert!(matches!(entry1.event, JournalEvent::AddInstrument { .. }));
-        let entry2 = reader.next_entry().unwrap().unwrap();
-        assert!(matches!(entry2.event, JournalEvent::Deposit { .. }));
-        assert!(reader.next_entry().unwrap().is_none());
+        // Verify events were journaled (only when persistence is enabled).
+        #[cfg(not(feature = "no-persist"))]
+        {
+            let mut reader = crate::journal::JournalReader::open(&path).unwrap();
+            let entry1 = reader.next_entry().unwrap().unwrap();
+            assert!(matches!(entry1.event, JournalEvent::AddInstrument { .. }));
+            let entry2 = reader.next_entry().unwrap().unwrap();
+            assert!(matches!(entry2.event, JournalEvent::Deposit { .. }));
+            assert!(reader.next_entry().unwrap().is_none());
+        }
     }
 
     #[test]
@@ -779,9 +783,12 @@ mod tests {
         let _writer = t_journal.join().unwrap();
         let _exchange = t_matching.join().unwrap();
 
-        // Verify the event was journaled.
-        let mut reader = crate::journal::JournalReader::open(&path).unwrap();
-        let entry = reader.next_entry().unwrap().unwrap();
-        assert!(matches!(entry.event, JournalEvent::SubmitOrder { .. }));
+        // Verify the event was journaled (only when persistence is enabled).
+        #[cfg(not(feature = "no-persist"))]
+        {
+            let mut reader = crate::journal::JournalReader::open(&path).unwrap();
+            let entry = reader.next_entry().unwrap().unwrap();
+            assert!(matches!(entry.event, JournalEvent::SubmitOrder { .. }));
+        }
     }
 }
