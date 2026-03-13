@@ -207,7 +207,9 @@ impl JournalStage {
             if shutdown.load(std::sync::atomic::Ordering::Relaxed) {
                 // Flush any pending data before shutdown.
                 if pending > 0 {
-                    let _ = self.writer.sync();
+                    if let Err(e) = self.writer.sync() {
+                        eprintln!("journal sync error on shutdown: {e}");
+                    }
                     self.consumer.commit(pending);
                 }
                 self.drain_remaining(&mut batch);
@@ -542,9 +544,13 @@ impl JournalStage {
                 break;
             }
             for slot in &batch[..count] {
-                let _ = self.writer.append_no_sync(&slot.event);
+                if let Err(e) = self.writer.append_no_sync(&slot.event) {
+                    eprintln!("journal encode error on drain: {e}");
+                }
             }
-            let _ = self.writer.sync();
+            if let Err(e) = self.writer.sync() {
+                eprintln!("journal sync error on drain: {e}");
+            }
             self.consumer.commit(count);
         }
     }
