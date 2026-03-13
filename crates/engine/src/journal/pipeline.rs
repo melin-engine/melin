@@ -140,6 +140,8 @@ pub struct JournalStage {
     /// allowing more events to accumulate in the batch. At high event
     /// rates, the batch fills naturally and the delay rarely fires.
     /// Zero means sync immediately (no delay).
+    /// Only read when fsync is enabled (not `no-fsync` feature).
+    #[cfg_attr(feature = "no-fsync", allow(dead_code))]
     group_commit_delay: Duration,
 }
 
@@ -293,28 +295,38 @@ impl JournalStage {
     /// Returns the `JournalWriter` on shutdown for clean resource release.
     #[cfg(feature = "io-uring")]
     pub fn run(mut self, shutdown: &std::sync::atomic::AtomicBool) -> JournalWriter {
+        #[cfg(not(feature = "no-fsync"))]
         use std::time::Instant;
 
+        #[cfg(not(feature = "no-fsync"))]
         use io_uring::{IoUring, opcode, types};
 
         let mut batch = [InputSlot::default(); MAX_JOURNAL_BATCH];
-        let delay = self.group_commit_delay;
         let mut idle_spins: u32 = 0;
-
-        // Ring size 2: only 1 fsync in flight, but 2 entries avoids edge
-        // cases with submission/completion overlap.
-        let mut ring = IoUring::new(2).expect("failed to create io_uring instance");
 
         // Sequence tracking for the overlapped state machine.
         // `synced_seq`: last position committed (durable on disk).
         // `written_seq`: last position encoded (may not be synced yet).
-        // `fsync_covers_seq`: the `written_seq` at the time the in-flight
-        //   fsync was submitted — these events become durable on CQE.
         let mut synced_seq: u64 = 0;
         let mut written_seq: u64 = 0;
+
+        // fsync-related state: io_uring ring, group commit delay, and
+        // the overlapped fsync tracking variables. Only needed when
+        // fsync is enabled (production mode).
+        #[cfg(not(feature = "no-fsync"))]
+        let delay = self.group_commit_delay;
+        // Ring size 2: only 1 fsync in flight, but 2 entries avoids edge
+        // cases with submission/completion overlap.
+        #[cfg(not(feature = "no-fsync"))]
+        let mut ring = IoUring::new(2).expect("failed to create io_uring instance");
+        // `fsync_covers_seq`: the `written_seq` at the time the in-flight
+        //   fsync was submitted — these events become durable on CQE.
+        #[cfg(not(feature = "no-fsync"))]
         let mut fsync_covers_seq: u64 = 0;
+        #[cfg(not(feature = "no-fsync"))]
         let mut fsync_in_flight = false;
         // Timestamp of first unsynced write (for group commit delay).
+        #[cfg(not(feature = "no-fsync"))]
         let mut first_write_ts: Option<Instant> = None;
 
         #[cfg(feature = "latency-trace")]
@@ -325,10 +337,12 @@ impl JournalStage {
         let mut batch_hist =
             crate::journal::trace::StageHistogram::new("journal: batch processing (write + sync)");
 
+        #[cfg(not(feature = "no-fsync"))]
         let fd = types::Fd(self.writer.fd());
 
         /// Submit an `IORING_OP_FSYNC` (fdatasync) to the io_uring ring.
         /// Uses user_data=1 as a tag to identify completions.
+        #[cfg(not(feature = "no-fsync"))]
         #[inline]
         fn submit_fsync(ring: &mut IoUring, fd: types::Fd) {
             let entry = opcode::Fsync::new(fd)
@@ -347,6 +361,7 @@ impl JournalStage {
         loop {
             if shutdown.load(std::sync::atomic::Ordering::Relaxed) {
                 // Wait for any in-flight fsync to complete before shutdown.
+                #[cfg(not(feature = "no-fsync"))]
                 if fsync_in_flight {
                     ring.submit_and_wait(1)
                         .expect("io_uring wait failed on shutdown");
@@ -358,6 +373,7 @@ impl JournalStage {
                     synced_seq = fsync_covers_seq;
                 }
                 // If there's data written after the last fsync, do a final sync.
+                #[cfg(not(feature = "no-fsync"))]
                 if written_seq > synced_seq {
                     if let Err(e) = self.writer.sync() {
                         eprintln!("journal sync error on shutdown: {e}");
@@ -396,6 +412,7 @@ impl JournalStage {
                 }
                 // `next_read` has advanced by `count` — snapshot as written_seq.
                 written_seq = self.consumer.next_read();
+                #[cfg(not(feature = "no-fsync"))]
                 if first_write_ts.is_none() {
                     first_write_ts = Some(Instant::now());
                 }
@@ -469,7 +486,12 @@ impl JournalStage {
                 }
             }
 
-            if count == 0 && !fsync_in_flight {
+            #[cfg(not(feature = "no-fsync"))]
+            let idle = count == 0 && !fsync_in_flight;
+            #[cfg(feature = "no-fsync")]
+            let idle = count == 0;
+
+            if idle {
                 if idle_spins < 1000 {
                     idle_spins += 1;
                     std::hint::spin_loop();
