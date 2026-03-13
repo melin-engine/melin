@@ -91,19 +91,19 @@ The [benchmark suite](crates/bench/) supports three modes: bare matching engine,
 **Without fsync** (isolates pipeline latency from disk I/O):
 
 ```
-cargo run --release -p trading-bench --features io-uring,no-fsync -- 3000000 --clients=32 --window=8
+cargo run --release -p trading-bench --features no-persist -- 3000000 --clients=16 --window=8
 
-Throughput:  620K orders/sec (1.61 µs/order)
-Latency:     p99 = 650 µs, p99.9 = 813 µs, max = 1.96 ms
+Throughput:  650K orders/sec (1.54 µs/order)
+Latency:     p99 = 268 µs, p99.9 = 306 µs, max = 623 µs
 ```
 
 **With fsync** (full durability, io_uring async fdatasync):
 
 ```
-cargo run --release -p trading-bench --features io-uring -- 3000000 --clients=32 --window=8
+cargo run --release -p trading-bench --features io-uring -- 3000000 --clients=16 --window=8
 
-Throughput:  182K orders/sec (5.50 µs/order)
-Latency:     p99 = 1.83 ms, p99.9 = 3.22 ms, max = 7.44 ms
+Throughput:  106K orders/sec (9.41 µs/order)
+Latency:     p99 = 1.70 ms, p99.9 = 3.09 ms, max = 7.47 ms
 ```
 
 ## License
