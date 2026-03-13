@@ -1119,6 +1119,11 @@ fn run_uring_loop(mut connections: Vec<UringBenchConn>, window: usize) -> Histog
         Histogram::<u64>::new_with_bounds(1, 10_000_000_000, 3).expect("histogram bounds");
     let mut done_count: usize = 0;
 
+    // Pre-allocated CQE collection buffer. Must collect CQEs before
+    // processing because the CQ borrow must end before mutating connections.
+    // Avoids per-iteration heap allocation from `.collect()`.
+    let mut cqes: Vec<(u64, i32)> = Vec::with_capacity(1024);
+
     // Submit initial RECVs for all connections.
     for (i, conn) in connections.iter_mut().enumerate() {
         let sqe = opcode::Recv::new(
@@ -1144,12 +1149,10 @@ fn run_uring_loop(mut connections: Vec<UringBenchConn>, window: usize) -> Histog
             Err(e) => panic!("io_uring submit_and_wait: {e}"),
         }
 
-        let cqes: Vec<(u64, i32)> = ring
-            .completion()
-            .map(|cqe| (cqe.user_data(), cqe.result()))
-            .collect();
+        cqes.clear();
+        cqes.extend(ring.completion().map(|cqe| (cqe.user_data(), cqe.result())));
 
-        for (token, result) in cqes {
+        for &(token, result) in cqes.iter() {
             if token & SEND_FLAG != 0 {
                 // ── SEND completion ──
                 let idx = (token & !SEND_FLAG) as usize;
@@ -1214,7 +1217,12 @@ fn run_uring_loop(mut connections: Vec<UringBenchConn>, window: usize) -> Histog
                     }
                 }
                 if cursor > 0 {
-                    conn.parse_buf.drain(..cursor);
+                    // Shift remaining bytes to front without allocating.
+                    // `copy_within` + `truncate` avoids the O(n) memmove
+                    // overhead of `Vec::drain` which must drop + shift.
+                    let remaining = conn.parse_buf.len() - cursor;
+                    conn.parse_buf.copy_within(cursor.., 0);
+                    conn.parse_buf.truncate(remaining);
                 }
 
                 // Resubmit RECV if connection is still active.
