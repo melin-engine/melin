@@ -66,7 +66,7 @@ Clients ──TCP/UDS──> Accept Loop
 ```sh
 cargo build          # compile
 cargo run            # run server
-cargo test           # run tests (126 tests across workspace)
+cargo test           # run tests (134 tests across workspace)
 cargo clippy         # lint
 cargo fmt            # format
 ```
@@ -88,21 +88,30 @@ crates/
 
 The [benchmark suite](crates/bench/) supports three modes: bare matching engine, disruptor pipeline without network, and full TCP/UDS round-trip. Results below are from the round-trip mode measuring full TCP loopback latency. AMD Ryzen 7 5800X3D (8C/16T), 64 GB DDR5, NVMe SSD, Linux 6.8.
 
-All benchmarks: 16 clients, 64 pipelined orders per client, 1M order pairs.
+All benchmarks: 16 clients, 64 pipelined orders per client.
 
-**Without fsync** (isolates pipeline latency from disk I/O):
+**Without persistence** (10M pairs, pipeline + network ceiling):
 
 ```
-cargo run --release -p trading-bench --features io-uring,no-fsync -- 1000000 --clients=16 --window=64 --mode=roundtrip
+cargo run --release -p trading-bench --features io-uring,no-persist -- 10000000 --clients=16 --window=64
+
+Throughput:  2.57M orders/sec (0.39 µs/order)
+Latency:     p99 = 520 µs, p99.9 = 593 µs, max = 780 µs
+```
+
+**Without fsync** (1M pairs, isolates pipeline latency from disk I/O):
+
+```
+cargo run --release -p trading-bench --features io-uring,no-fsync -- 1000000 --clients=16 --window=64
 
 Throughput:  1.62M orders/sec (0.62 µs/order)
 Latency:     p99 = 378 µs, p99.9 = 506 µs, max = 1.07 ms
 ```
 
-**With fsync** (full durability, io_uring async fdatasync):
+**With fsync** (1M pairs, full durability, io_uring async fdatasync):
 
 ```
-cargo run --release -p trading-bench --features io-uring -- 1000000 --clients=16 --window=64 --mode=roundtrip
+cargo run --release -p trading-bench --features io-uring -- 1000000 --clients=16 --window=64
 
 Throughput:  605K orders/sec (1.65 µs/order)
 Latency:     p99 = 1.80 ms, p99.9 = 6.75 ms, max = 7.08 ms
