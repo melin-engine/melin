@@ -29,7 +29,7 @@ use trading_engine::journal::trace::trace_ts;
 use trading_protocol::codec;
 use trading_protocol::message::{ConnectionId, Request};
 
-use crate::response::ControlEvent;
+use crate::uring_response::ControlEvent;
 
 /// Size of the per-connection recv buffer. 4 KiB accommodates multiple
 /// frames per recv (frames are typically <100 bytes), reducing the

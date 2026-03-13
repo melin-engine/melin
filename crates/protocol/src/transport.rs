@@ -17,11 +17,12 @@ use std::os::unix::io::AsRawFd;
 /// can be handed directly to the reader thread and the response thread.
 /// No async-to-blocking conversion needed.
 ///
-/// `Read` requires `AsRawFd` so the epoll-based multiplexed reader can
-/// register connection fds with epoll and perform non-blocking I/O.
+/// `Read` requires `AsRawFd` so the epoll/io_uring reader can register
+/// connection fds for multiplexed I/O. `Write` requires `AsRawFd` so
+/// the io_uring response stage can submit SEND SQEs with the raw fd.
 pub trait BlockingTransportListener: Send + 'static {
     type Read: io::Read + AsRawFd + Send + 'static;
-    type Write: io::Write + Send + 'static;
+    type Write: io::Write + AsRawFd + Send + 'static;
 
     /// Accept a new connection, returning blocking read/write halves
     /// and the peer address.

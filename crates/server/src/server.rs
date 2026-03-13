@@ -11,8 +11,9 @@
 //! uses epoll to multiplex all connections, eliminating thread oversubscription.
 //! The response thread writes directly to sockets.
 
-use std::io::Write;
 use std::net::SocketAddr;
+#[cfg(feature = "io-uring")]
+use std::os::unix::io::AsRawFd;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -22,15 +23,21 @@ use tracing::{debug, error, info};
 use trading_engine::journal::JournaledExchange;
 use trading_engine::journal::pipeline::build_pipeline;
 
-use trading_protocol::blocking::BlockingFrameWriter;
 use trading_protocol::message::ConnectionId;
 use trading_protocol::transport::BlockingTransportListener;
 
 #[cfg(not(feature = "io-uring"))]
+use trading_protocol::blocking::BlockingFrameWriter;
+
+#[cfg(not(feature = "io-uring"))]
 use crate::reader::{self, ReaderRegistration};
+#[cfg(not(feature = "io-uring"))]
 use crate::response::ControlEvent;
+
 #[cfg(feature = "io-uring")]
 use crate::uring_reader::{self as reader, ReaderRegistration};
+#[cfg(feature = "io-uring")]
+use crate::uring_response::ControlEvent;
 
 /// Server configuration.
 pub struct ServerConfig {
@@ -149,7 +156,10 @@ pub fn run_with_shutdown<L: BlockingTransportListener>(
         .name("response".into())
         .spawn(move || {
             apply_affinity("response", cores[2]);
-            crate::response::run(output_consumer, control_rx, journal_cursor, &s3)
+            #[cfg(not(feature = "io-uring"))]
+            crate::response::run(output_consumer, control_rx, journal_cursor, &s3);
+            #[cfg(feature = "io-uring")]
+            crate::uring_response::run(output_consumer, control_rx, journal_cursor, &s3);
         })
         .expect("failed to spawn response thread");
 
@@ -178,14 +188,25 @@ pub fn run_with_shutdown<L: BlockingTransportListener>(
         // Register the writer with the response thread before the reader.
         // This ensures the response stage has the writer before any
         // requests arrive from this connection.
-        let boxed_writer: Box<dyn Write + Send> = Box::new(std_write);
-        if control_tx
-            .send(ControlEvent::Connected {
+        #[cfg(not(feature = "io-uring"))]
+        let control_event = {
+            let boxed_writer: Box<dyn std::io::Write + Send> = Box::new(std_write);
+            ControlEvent::Connected {
                 connection_id: connection_id.0,
                 writer: BlockingFrameWriter::new(boxed_writer),
-            })
-            .is_err()
-        {
+            }
+        };
+        #[cfg(feature = "io-uring")]
+        let control_event = {
+            let fd = std_write.as_raw_fd();
+            let owner: Box<dyn Send> = Box::new(std_write);
+            ControlEvent::Connected {
+                connection_id: connection_id.0,
+                fd,
+                _owner: owner,
+            }
+        };
+        if control_tx.send(control_event).is_err() {
             info!("response thread gone, shutting down");
             break;
         }

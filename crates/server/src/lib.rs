@@ -3,8 +3,11 @@
 mod affinity;
 #[cfg(not(feature = "io-uring"))]
 mod reader;
+#[cfg(not(feature = "io-uring"))]
 mod response;
 pub mod server;
 
 #[cfg(feature = "io-uring")]
 mod uring_reader;
+#[cfg(feature = "io-uring")]
+mod uring_response;
