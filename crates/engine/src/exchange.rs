@@ -127,18 +127,15 @@ impl Exchange {
 
         // Process reports to update balances.
         let new_reports = &reports[report_start..];
-        self.accounts
+        let consumed = self
+            .accounts
             .process_reports(new_reports, &self.order_sides, &spec);
 
-        // Clean up order_sides for fully consumed orders.
-        for report in &reports[report_start..] {
-            match report {
-                ExecutionReport::Cancelled { order_id, .. }
-                | ExecutionReport::Rejected { order_id, .. } => {
-                    self.order_sides.remove(order_id);
-                }
-                _ => {}
-            }
+        // Clean up order_sides for fully consumed orders (filled, cancelled,
+        // or rejected). Without this, order_sides leaks entries and triggers
+        // increasingly expensive HashMap resizes on the hot path.
+        for order_id in consumed {
+            self.order_sides.remove(&order_id);
         }
     }
 
@@ -162,14 +159,13 @@ impl Exchange {
 
         // Release reserved funds if cancellation succeeded.
         let new_reports = &reports[report_start..];
-        self.accounts
+        let consumed = self
+            .accounts
             .process_reports(new_reports, &self.order_sides, &spec);
 
-        // Clean up order_sides.
-        for report in &reports[report_start..] {
-            if let ExecutionReport::Cancelled { order_id, .. } = report {
-                self.order_sides.remove(order_id);
-            }
+        // Clean up order_sides for cancelled orders.
+        for order_id in consumed {
+            self.order_sides.remove(&order_id);
         }
     }
 }

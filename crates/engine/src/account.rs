@@ -247,9 +247,10 @@ impl AccountManager {
             }
         }
 
-        // Clean up fully consumed reservations.
-        self.cleanup_reservation(buyer_order);
-        self.cleanup_reservation(seller_order);
+        // Note: reservation cleanup is handled by process_reports(), which
+        // checks remaining == 0 after each fill and returns the consumed IDs.
+        // Do NOT clean up here — process_reports needs the entry to exist
+        // so it can report consumed IDs back to Exchange for order_sides cleanup.
     }
 
     /// Release all remaining reserved funds for an order (on cancel or reject).
@@ -264,12 +265,18 @@ impl AccountManager {
 
     /// Process execution reports to update balances.
     /// Call this after the order book processes an order.
+    ///
+    /// Returns order IDs whose reservations are fully consumed (remaining
+    /// reached zero on fill, or released on cancel/reject). The caller
+    /// should use this to clean up any per-order tracking maps (e.g.
+    /// `order_sides` in Exchange).
     pub fn process_reports(
         &mut self,
         reports: &[ExecutionReport],
         maker_sides: &HashMap<OrderId, Side>,
         spec: &InstrumentSpec,
-    ) {
+    ) -> Vec<OrderId> {
+        let mut consumed = Vec::new();
         for report in reports {
             match *report {
                 ExecutionReport::Fill {
@@ -290,16 +297,36 @@ impl AccountManager {
                             spec,
                         );
                     }
+                    // Remove fully consumed reservations (remaining == 0).
+                    if self
+                        .reservations
+                        .get(&maker_order_id)
+                        .is_some_and(|r| r.remaining == 0)
+                    {
+                        self.reservations.remove(&maker_order_id);
+                        consumed.push(maker_order_id);
+                    }
+                    if self
+                        .reservations
+                        .get(&taker_order_id)
+                        .is_some_and(|r| r.remaining == 0)
+                    {
+                        self.reservations.remove(&taker_order_id);
+                        consumed.push(taker_order_id);
+                    }
                 }
                 ExecutionReport::Cancelled { order_id, .. } => {
                     self.release(order_id);
+                    consumed.push(order_id);
                 }
                 ExecutionReport::Rejected { order_id, .. } => {
                     self.release(order_id);
+                    consumed.push(order_id);
                 }
                 ExecutionReport::Placed { .. } | ExecutionReport::Triggered { .. } => {}
             }
         }
+        consumed
     }
 
     /// Compute the required reserve currency and amount for an order.
@@ -338,15 +365,6 @@ impl AccountManager {
                 // Reserve quantity in base currency.
                 Ok((spec.base, order.quantity.get()))
             }
-        }
-    }
-
-    /// Remove reservation entry if fully consumed.
-    fn cleanup_reservation(&mut self, order_id: OrderId) {
-        if let Some(res) = self.reservations.get(&order_id)
-            && res.remaining == 0
-        {
-            self.reservations.remove(&order_id);
         }
     }
 }
