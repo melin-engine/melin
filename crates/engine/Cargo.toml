@@ -14,9 +14,10 @@ no-persist = ["no-fsync"]
 ## Record per-stage latency histograms and print a summary on shutdown.
 ## Adds ~20ns of clock overhead per event. Not for production.
 latency-trace = ["dep:hdrhistogram"]
-## Use io_uring for async fsync in the journal stage. Linux-only.
-## Overlaps fsync I/O wait with encoding the next batch for higher throughput.
-io-uring = ["dep:io-uring"]
+## Forwarded from server crate — the engine no longer uses io_uring directly
+## (journal sync uses pwritev2+RWF_DSYNC instead), but the feature flag is
+## kept for cfg compatibility with other crates that gate on it.
+io-uring = []
 ## Print per-stage busy/idle utilization on shutdown. Identifies the pipeline
 ## bottleneck: the stage closest to 100% busy is the constraint.
 pipeline-stats = []
@@ -24,7 +25,6 @@ pipeline-stats = []
 [dependencies]
 crc32c = "0.6"
 hdrhistogram = { version = "7", optional = true }
-io-uring = { version = "0.7", optional = true }
 libc = { workspace = true }
 tracing = { workspace = true }
 trading-disruptor = { path = "../disruptor" }

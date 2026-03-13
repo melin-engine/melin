@@ -2,13 +2,18 @@
 //!
 //! Uses `posix_fallocate` to pre-extend the journal file in 64 MiB chunks.
 //! This allocates disk blocks (extents) ahead of time so that subsequent
-//! `sync_data()` calls only flush dirty data pages — not filesystem metadata
-//! updates for newly allocated extents. This significantly reduces fsync
-//! latency under sustained write load.
+//! sync calls only flush data pages — not filesystem metadata updates for
+//! newly allocated extents. This significantly reduces sync latency under
+//! sustained write load.
 //!
-//! Writes use `write_all_at` (pwrite) with an explicit write position rather
-//! than kernel-managed append mode, because the file size includes
-//! pre-allocated (zero-filled) space beyond the valid data boundary.
+//! Durability uses `pwritev2` with `RWF_DSYNC` (Force Unit Access) instead
+//! of `pwrite` + `fdatasync`. On NVMe drives with FUA support, the kernel
+//! issues a single FUA write instead of write + full cache flush, reducing
+//! sync latency from ~1-7 ms to ~10-100 µs for small writes.
+//!
+//! Writes use positioned I/O with an explicit write position rather than
+//! kernel-managed append mode, because the file size includes pre-allocated
+//! (zero-filled) space beyond the valid data boundary.
 
 use std::fs::{File, OpenOptions};
 use std::os::unix::fs::FileExt;
@@ -132,39 +137,21 @@ impl JournalWriter {
     /// Append an event to the journal and flush to disk.
     ///
     /// Returns the assigned sequence number. The event is durable after this
-    /// returns (fsync'd).
+    /// returns (written with `RWF_DSYNC` / FUA).
     pub fn append(&mut self, event: &JournalEvent) -> Result<u64, JournalError> {
-        let seq = self.next_sequence;
-        let timestamp_ns = wall_clock_nanos();
-
-        let written = codec::encode(seq, timestamp_ns, event, &mut self.buffer)?;
-        self.ensure_allocated(written as u64)?;
-        self.file
-            .write_all_at(&self.buffer[..written], self.write_pos)?;
-        self.write_pos += written as u64;
-        #[cfg(not(feature = "no-fsync"))]
-        self.file.sync_data()?;
-
-        self.next_sequence += 1;
+        let seq = self.batch_append(event)?;
+        self.flush_batch_sync()?;
         Ok(seq)
     }
 
-    /// Append an event to the journal **without** flushing to disk.
+    /// Append an event to the journal **without** syncing to disk.
     ///
     /// Used by the pipeline journal stage to batch multiple events into
-    /// a single write before calling `sync()` once for the batch.
-    /// This amortizes the fsync cost across many events under load.
+    /// a single write before calling `flush_batch_sync()` once for the batch.
+    /// This amortizes the sync cost across many events under load.
     pub fn append_no_sync(&mut self, event: &JournalEvent) -> Result<u64, JournalError> {
-        let seq = self.next_sequence;
-        let timestamp_ns = wall_clock_nanos();
-
-        let written = codec::encode(seq, timestamp_ns, event, &mut self.buffer)?;
-        self.ensure_allocated(written as u64)?;
-        self.file
-            .write_all_at(&self.buffer[..written], self.write_pos)?;
-        self.write_pos += written as u64;
-
-        self.next_sequence += 1;
+        let seq = self.batch_append(event)?;
+        self.flush_batch()?;
         Ok(seq)
     }
 
@@ -218,11 +205,39 @@ impl JournalWriter {
         Ok(())
     }
 
-    /// Flush the journal to disk (fsync).
+    /// Write the batch buffer to disk with guaranteed durability (FUA).
     ///
-    /// Called after one or more `append_no_sync` calls to make the batch
-    /// durable in a single I/O operation. Because storage is pre-allocated,
-    /// this only flushes data pages — no extent metadata updates needed.
+    /// Uses `pwritev2` with `RWF_DSYNC` to combine the data write and
+    /// durability guarantee into a single syscall. On NVMe drives with
+    /// FUA (Force Unit Access) support, the kernel issues a single FUA
+    /// write instead of write + full cache flush (`fdatasync`). This
+    /// reduces sync latency from ~1-7 ms to ~10-100 µs for small writes.
+    ///
+    /// Falls back to plain `pwrite` when the `no-fsync` feature is enabled.
+    pub fn flush_batch_sync(&mut self) -> Result<(), JournalError> {
+        if self.batch_buf.is_empty() {
+            return Ok(());
+        }
+        self.ensure_allocated(self.batch_buf.len() as u64)?;
+
+        #[cfg(not(feature = "no-fsync"))]
+        {
+            pwritev2_dsync(self.file.as_raw_fd(), &self.batch_buf, self.write_pos)?;
+        }
+        #[cfg(feature = "no-fsync")]
+        {
+            self.file.write_all_at(&self.batch_buf, self.write_pos)?;
+        }
+
+        self.write_pos += self.batch_buf.len() as u64;
+        self.batch_buf.clear();
+        Ok(())
+    }
+
+    /// Flush the journal to disk (fdatasync).
+    ///
+    /// Legacy sync path — only used during shutdown drain. Production
+    /// hot path uses `flush_batch_sync()` (pwritev2 + RWF_DSYNC) instead.
     pub fn sync(&mut self) -> Result<(), JournalError> {
         #[cfg(not(feature = "no-fsync"))]
         self.file.sync_data()?;
@@ -240,9 +255,6 @@ impl JournalWriter {
     }
 
     /// Raw file descriptor for the journal file.
-    ///
-    /// Used by the io_uring journal stage to construct `IORING_OP_FSYNC`
-    /// opcodes without owning the file.
     pub fn fd(&self) -> std::os::unix::io::RawFd {
         self.file.as_raw_fd()
     }
@@ -261,6 +273,40 @@ impl JournalWriter {
         self.file.sync_all()?;
         Ok(())
     }
+}
+
+/// Write data with `RWF_DSYNC` via `pwritev2` — combines write + durability
+/// in a single syscall.
+///
+/// `RWF_DSYNC` provides per-write data integrity: the kernel ensures the data
+/// is on persistent storage before returning. On NVMe drives with FUA (Force
+/// Unit Access) support, this translates to a single FUA write command instead
+/// of write + full cache flush. Much faster than write + fdatasync for small
+/// writes because FUA only persists the written sectors, while fdatasync
+/// drains the entire NVMe write queue.
+#[cfg(not(feature = "no-fsync"))]
+fn pwritev2_dsync(
+    fd: std::os::unix::io::RawFd,
+    buf: &[u8],
+    offset: u64,
+) -> Result<(), JournalError> {
+    let iov = libc::iovec {
+        iov_base: buf.as_ptr() as *mut libc::c_void,
+        iov_len: buf.len(),
+    };
+    // Safety: fd is a valid file descriptor, iov points to valid memory
+    // that outlives the syscall.
+    let ret = unsafe { libc::pwritev2(fd, &iov, 1, offset as libc::off_t, libc::RWF_DSYNC) };
+    if ret < 0 {
+        return Err(JournalError::Io(std::io::Error::last_os_error()));
+    }
+    if (ret as usize) != buf.len() {
+        return Err(JournalError::Io(std::io::Error::new(
+            std::io::ErrorKind::WriteZero,
+            "short pwritev2 write",
+        )));
+    }
+    Ok(())
 }
 
 /// Pre-allocate disk blocks from the current position forward by one chunk.

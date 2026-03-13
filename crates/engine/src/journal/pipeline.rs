@@ -1,10 +1,11 @@
 //! Pipeline stages for the LMAX disruptor architecture.
 //!
 //! Two hot-path stages consume from an input disruptor in **parallel**:
-//! 1. **Journal stage**: batch-writes events to the WAL, fsyncs once per batch.
-//!    Advances its cursor only after fsync.
+//! 1. **Journal stage**: batch-encodes events, then writes + syncs in a single
+//!    `pwritev2` with `RWF_DSYNC` (FUA). Advances its cursor only after the
+//!    durable write completes.
 //! 2. **Matching stage**: executes commands on the `Exchange`, publishes responses
-//!    to the output SPSC. Runs concurrently with the journal — no waiting for fsync.
+//!    to the output SPSC. Runs concurrently with the journal — no waiting for sync.
 //!
 //! The **response stage** (in the server crate) consumes the output SPSC but
 //! gates on the journal cursor before sending: a response is only sent to
@@ -38,7 +39,7 @@ pub const INPUT_RING_CAPACITY: usize = 1 << 20;
 pub const OUTPUT_RING_CAPACITY: usize = 1 << 20;
 
 /// Maximum number of events processed in one journal batch.
-/// Limits the time spent encoding before fsync, keeping tail latency bounded.
+/// Limits the time spent encoding before sync, keeping tail latency bounded.
 const MAX_JOURNAL_BATCH: usize = 1024;
 
 /// Slot in the input disruptor ring buffer.
@@ -126,19 +127,19 @@ impl Default for OutputSlot {
     }
 }
 
-/// Journal stage: consumes from the input disruptor, batch-writes events
-/// to the WAL, and fsyncs once per batch.
+/// Journal stage: consumes from the input disruptor, batch-encodes events,
+/// and writes + syncs in a single `pwritev2` with `RWF_DSYNC` (FUA).
 ///
 /// Runs on a dedicated OS thread. Uses `read_batch` + `commit` so its
-/// cursor only advances **after** fsync. The response stage reads this
-/// cursor to know when events are durable.
+/// cursor only advances **after** the durable write. The response stage
+/// reads this cursor to know when events are durable.
 pub struct JournalStage {
     writer: JournalWriter,
     consumer: ring::Consumer<InputSlot>,
     /// Group commit coalescing window. The journal stage waits up to this
-    /// duration after the first unsynced write before issuing fsync,
-    /// allowing more events to accumulate in the batch. At high event
-    /// rates, the batch fills naturally and the delay rarely fires.
+    /// duration after the first unsynced write before issuing the durable
+    /// write, allowing more events to accumulate in the batch. At high
+    /// event rates, the batch fills naturally and the delay rarely fires.
     /// Zero means sync immediately (no delay).
     /// Only read when fsync is enabled (not `no-fsync` feature).
     #[cfg_attr(feature = "no-fsync", allow(dead_code))]
@@ -148,9 +149,10 @@ pub struct JournalStage {
 impl JournalStage {
     /// Create a new journal stage.
     ///
-    /// `group_commit_delay`: coalescing window for fsync batching. The
+    /// `group_commit_delay`: coalescing window for sync batching. The
     /// journal waits up to this duration for more events to arrive before
-    /// issuing fsync. Zero means sync immediately after each batch read.
+    /// issuing the durable write. Zero means sync immediately after each
+    /// batch read.
     pub fn new(
         writer: JournalWriter,
         consumer: ring::Consumer<InputSlot>,
@@ -163,31 +165,38 @@ impl JournalStage {
         }
     }
 
-    /// Run the journal stage loop (blocking fsync variant).
+    /// Run the journal stage loop.
     ///
     /// Uses `read_batch` + `commit` (not `consume_batch`) to ensure the
-    /// journal cursor is only advanced **after** fsync. The response stage
-    /// checks this cursor before sending — this is the persist-before-ack
-    /// boundary.
+    /// journal cursor is only advanced **after** the write is durable.
+    /// The response stage checks this cursor before sending — this is
+    /// the persist-before-ack boundary.
+    ///
+    /// Durability uses `pwritev2` with `RWF_DSYNC` (FUA) instead of
+    /// separate pwrite + fdatasync. This combines write + sync into a
+    /// single syscall and leverages NVMe Force Unit Access for ~10-100 µs
+    /// sync latency instead of ~1-7 ms full cache flushes.
     ///
     /// With group commit delay > 0, the journal coalesces multiple reads
-    /// into a single fsync: it keeps reading events until either the
+    /// into a single sync: it keeps reading events until either the
     /// batch is full (MAX_JOURNAL_BATCH) or the delay has elapsed since
     /// the first unsynced write. Under high load the batch fills
     /// naturally and the delay never fires.
     ///
     /// Returns the `JournalWriter` on shutdown for clean resource release.
-    #[cfg(not(feature = "io-uring"))]
     pub fn run(mut self, shutdown: &std::sync::atomic::AtomicBool) -> JournalWriter {
+        #[cfg(not(feature = "no-fsync"))]
         use std::time::Instant;
 
         let mut batch = [InputSlot::default(); MAX_JOURNAL_BATCH];
+        #[cfg(not(feature = "no-fsync"))]
         let delay = self.group_commit_delay;
         let mut idle_spins: u32 = 0;
 
-        // Total events encoded since last fsync/commit.
+        // Total events encoded since last sync/commit.
         let mut pending: usize = 0;
         // Timestamp of first unsynced write (for group commit delay).
+        #[cfg(not(feature = "no-fsync"))]
         let mut first_write_ts: Option<Instant> = None;
 
         #[cfg(feature = "pipeline-stats")]
@@ -208,7 +217,7 @@ impl JournalStage {
                 // Flush any pending data before shutdown.
                 if pending > 0 {
                     #[cfg(not(feature = "no-persist"))]
-                    if let Err(e) = self.writer.sync() {
+                    if let Err(e) = self.writer.flush_batch_sync() {
                         tracing::error!(error = %e, "journal sync error on shutdown");
                     }
                     self.consumer.commit(pending);
@@ -251,21 +260,18 @@ impl JournalStage {
                 }
 
                 // Batch-encode all events into the writer's internal buffer.
-                // One timestamp per batch avoids per-event clock_gettime syscalls.
-                // flush_batch issues a single pwrite for the entire batch.
+                // Data stays in the buffer until the sync point — one
+                // pwritev2+RWF_DSYNC replaces multiple pwrites + fdatasync.
                 #[cfg(not(feature = "no-persist"))]
                 {
                     for slot in &batch[..count] {
                         if let Err(e) = self.writer.batch_append(&slot.event) {
                             tracing::error!(error = %e, "journal encode error");
                         }
-                    }
-                    if let Err(e) = self.writer.flush_batch() {
-                        tracing::error!(error = %e, "journal flush_batch error");
                     }
                 }
                 pending += count;
-                #[cfg(not(feature = "no-persist"))]
+                #[cfg(not(feature = "no-fsync"))]
                 if first_write_ts.is_none() {
                     first_write_ts = Some(Instant::now());
                 }
@@ -277,274 +283,28 @@ impl JournalStage {
                 ));
             }
 
-            // Sync when: we have data AND (batch full OR delay expired OR no delay configured).
+            // Sync when: we have data AND (batch full OR delay expired OR no delay).
             if pending > 0 {
+                #[cfg(not(feature = "no-fsync"))]
                 let should_sync = pending >= MAX_JOURNAL_BATCH
                     || delay.is_zero()
                     || first_write_ts.is_some_and(|ts| ts.elapsed() >= delay);
+                #[cfg(feature = "no-fsync")]
+                let should_sync = true;
 
                 if should_sync {
-                    if let Err(e) = self.writer.sync() {
-                        tracing::error!(error = %e, "journal sync error");
+                    #[cfg(not(feature = "no-persist"))]
+                    if let Err(e) = self.writer.flush_batch_sync() {
+                        tracing::error!(error = %e, "journal flush_batch_sync error");
                     }
                     self.consumer.commit(pending);
                     pending = 0;
-                    first_write_ts = None;
+                    #[cfg(not(feature = "no-fsync"))]
+                    {
+                        first_write_ts = None;
+                    }
                 }
             } else {
-                #[cfg(feature = "pipeline-stats")]
-                {
-                    idle_count += 1;
-                }
-                if idle_spins < 1000 {
-                    idle_spins += 1;
-                    std::hint::spin_loop();
-                } else {
-                    std::thread::yield_now();
-                }
-            }
-        }
-    }
-
-    /// Run the journal stage loop (io_uring overlapped fsync variant).
-    ///
-    /// Overlaps fsync I/O wait with encoding the next batch from the
-    /// disruptor. While the kernel is fsyncing batch A, we read and encode
-    /// batch B. When the CQE arrives, we commit batch A and continue.
-    ///
-    /// With group commit delay > 0, after a CQE arrives the journal waits
-    /// up to `group_commit_delay` for more events before submitting the
-    /// next fsync. This coalesces small batches under medium load. Under
-    /// high load, events accumulate during the fsync wait and the delay
-    /// is skipped (batch already full).
-    ///
-    /// **Correctness**: `fdatasync` syncs all dirty pages at submission time.
-    /// We only commit events written *before* the fsync was submitted.
-    /// Events encoded during the fsync wait get their own subsequent fsync.
-    ///
-    /// Returns the `JournalWriter` on shutdown for clean resource release.
-    #[cfg(feature = "io-uring")]
-    pub fn run(mut self, shutdown: &std::sync::atomic::AtomicBool) -> JournalWriter {
-        #[cfg(not(feature = "no-fsync"))]
-        use std::time::Instant;
-
-        #[cfg(not(feature = "no-fsync"))]
-        use io_uring::{IoUring, opcode, types};
-
-        let mut batch = [InputSlot::default(); MAX_JOURNAL_BATCH];
-        let mut idle_spins: u32 = 0;
-
-        #[cfg(feature = "pipeline-stats")]
-        let mut busy_count: u64 = 0;
-        #[cfg(feature = "pipeline-stats")]
-        let mut idle_count: u64 = 0;
-
-        // Sequence tracking for the overlapped state machine.
-        // `synced_seq`: last position committed (durable on disk).
-        // `written_seq`: last position encoded (may not be synced yet).
-        let mut synced_seq: u64 = 0;
-        let mut written_seq: u64 = 0;
-
-        // fsync-related state: io_uring ring, group commit delay, and
-        // the overlapped fsync tracking variables. Only needed when
-        // fsync is enabled (production mode).
-        #[cfg(not(feature = "no-fsync"))]
-        let delay = self.group_commit_delay;
-        // Ring size 2: only 1 fsync in flight, but 2 entries avoids edge
-        // cases with submission/completion overlap.
-        #[cfg(not(feature = "no-fsync"))]
-        let mut ring = IoUring::new(2).expect("failed to create io_uring instance");
-        // `fsync_covers_seq`: the `written_seq` at the time the in-flight
-        //   fsync was submitted — these events become durable on CQE.
-        #[cfg(not(feature = "no-fsync"))]
-        let mut fsync_covers_seq: u64 = 0;
-        #[cfg(not(feature = "no-fsync"))]
-        let mut fsync_in_flight = false;
-        // Timestamp of first unsynced write (for group commit delay).
-        #[cfg(not(feature = "no-fsync"))]
-        let mut first_write_ts: Option<Instant> = None;
-
-        #[cfg(feature = "latency-trace")]
-        let mut wakeup_hist = crate::journal::trace::StageHistogram::new(
-            "journal: disruptor wakeup (publish → journal consume)",
-        );
-        #[cfg(feature = "latency-trace")]
-        let mut batch_hist =
-            crate::journal::trace::StageHistogram::new("journal: batch processing (write + sync)");
-
-        #[cfg(not(feature = "no-fsync"))]
-        let fd = types::Fd(self.writer.fd());
-
-        /// Submit an `IORING_OP_FSYNC` (fdatasync) to the io_uring ring.
-        /// Uses user_data=1 as a tag to identify completions.
-        #[cfg(not(feature = "no-fsync"))]
-        #[inline]
-        fn submit_fsync(ring: &mut IoUring, fd: types::Fd) {
-            let entry = opcode::Fsync::new(fd)
-                .flags(io_uring::types::FsyncFlags::DATASYNC)
-                .build()
-                .user_data(1);
-            // Safety: the fd is valid for the lifetime of the journal stage.
-            unsafe {
-                ring.submission()
-                    .push(&entry)
-                    .expect("io_uring SQ full (should never happen with ring size 2)");
-            }
-            ring.submit().expect("io_uring submit failed");
-        }
-
-        loop {
-            if shutdown.load(std::sync::atomic::Ordering::Relaxed) {
-                // Wait for any in-flight fsync to complete before shutdown.
-                #[cfg(not(feature = "no-fsync"))]
-                if fsync_in_flight {
-                    ring.submit_and_wait(1)
-                        .expect("io_uring wait failed on shutdown");
-                    let cqe = ring.completion().next().expect("missing CQE on shutdown");
-                    if cqe.result() < 0 {
-                        tracing::error!(
-                            result = cqe.result(),
-                            "journal io_uring fsync error on shutdown"
-                        );
-                    }
-                    self.consumer.set_progress(fsync_covers_seq);
-                    synced_seq = fsync_covers_seq;
-                }
-                // If there's data written after the last fsync, do a final sync.
-                #[cfg(not(feature = "no-fsync"))]
-                if written_seq > synced_seq {
-                    if let Err(e) = self.writer.sync() {
-                        tracing::error!(error = %e, "journal sync error on shutdown");
-                    }
-                    self.consumer.set_progress(written_seq);
-                }
-                self.drain_remaining(&mut batch);
-                #[cfg(feature = "latency-trace")]
-                {
-                    wakeup_hist.print_report();
-                    batch_hist.print_report();
-                }
-                #[cfg(feature = "pipeline-stats")]
-                print_utilization("journal", busy_count, idle_count);
-                return self.writer;
-            }
-
-            // --- Step 1: Read and encode a batch ---
-            let count = self.consumer.read_batch(&mut batch, MAX_JOURNAL_BATCH);
-            if count > 0 {
-                idle_spins = 0;
-                #[cfg(feature = "pipeline-stats")]
-                {
-                    busy_count += 1;
-                }
-
-                #[cfg(feature = "latency-trace")]
-                let batch_start = trace_ts();
-
-                #[cfg(feature = "latency-trace")]
-                for slot in &batch[..count] {
-                    wakeup_hist.record_ns(crate::journal::trace::trace_elapsed_ns(
-                        slot.publish_ts,
-                        batch_start,
-                    ));
-                }
-
-                // Batch-encode all events into the writer's internal buffer.
-                // One timestamp per batch avoids per-event clock_gettime syscalls.
-                // flush_batch issues a single pwrite for the entire batch.
-                #[cfg(not(feature = "no-persist"))]
-                {
-                    for slot in &batch[..count] {
-                        if let Err(e) = self.writer.batch_append(&slot.event) {
-                            tracing::error!(error = %e, "journal encode error");
-                        }
-                    }
-                    if let Err(e) = self.writer.flush_batch() {
-                        tracing::error!(error = %e, "journal flush_batch error");
-                    }
-                }
-                // `next_read` has advanced by `count` — snapshot as written_seq.
-                written_seq = self.consumer.next_read();
-                #[cfg(not(feature = "no-fsync"))]
-                if first_write_ts.is_none() {
-                    first_write_ts = Some(Instant::now());
-                }
-
-                #[cfg(feature = "latency-trace")]
-                batch_hist.record_ns(crate::journal::trace::trace_elapsed_ns(
-                    batch_start,
-                    trace_ts(),
-                ));
-            }
-
-            // --- Step 2: Submit fsync if none in flight and we have unsynced data ---
-            #[cfg(not(feature = "no-fsync"))]
-            if !fsync_in_flight && written_seq > synced_seq {
-                // With group commit delay: wait for more events to accumulate
-                // before submitting fsync. Skip the delay if the batch is full.
-                let should_submit = delay.is_zero()
-                    || (written_seq - synced_seq) as usize >= MAX_JOURNAL_BATCH
-                    || first_write_ts.is_some_and(|ts| ts.elapsed() >= delay);
-
-                if should_submit {
-                    fsync_covers_seq = written_seq;
-                    submit_fsync(&mut ring, fd);
-                    fsync_in_flight = true;
-                    first_write_ts = None;
-                }
-            }
-            // When no-fsync is enabled, just commit immediately (no fsync).
-            #[cfg(feature = "no-fsync")]
-            if written_seq > synced_seq {
-                self.consumer.set_progress(written_seq);
-                synced_seq = written_seq;
-            }
-
-            // --- Step 3: Check for fsync completion ---
-            #[cfg(not(feature = "no-fsync"))]
-            if fsync_in_flight {
-                // If no new data was read (count == 0), block-wait — nothing
-                // else to do. Otherwise, non-blocking peek so we can keep
-                // encoding while fsync completes.
-                if count == 0 {
-                    ring.submit_and_wait(1).expect("io_uring wait failed");
-                }
-
-                // Extract completion result and drop the CompletionQueue
-                // borrow before we potentially call submit_fsync.
-                let cqe_result = ring.completion().next().map(|cqe| cqe.result());
-
-                if let Some(result) = cqe_result {
-                    if result < 0 {
-                        tracing::error!(result, "journal io_uring fsync error");
-                    }
-                    // These events are now durable — publish the progress.
-                    self.consumer.set_progress(fsync_covers_seq);
-                    synced_seq = fsync_covers_seq;
-                    fsync_in_flight = false;
-
-                    // If more data was written during the fsync and we should
-                    // submit immediately (no delay or batch full), do so.
-                    if written_seq > synced_seq {
-                        let pending = (written_seq - synced_seq) as usize;
-                        if delay.is_zero() || pending >= MAX_JOURNAL_BATCH {
-                            fsync_covers_seq = written_seq;
-                            submit_fsync(&mut ring, fd);
-                            fsync_in_flight = true;
-                            first_write_ts = None;
-                        }
-                        // Otherwise, let the delay timer in step 2 handle it
-                        // on the next iteration (accumulate more events).
-                    }
-                }
-            }
-
-            #[cfg(not(feature = "no-fsync"))]
-            let idle = count == 0 && !fsync_in_flight;
-            #[cfg(feature = "no-fsync")]
-            let idle = count == 0;
-
-            if idle {
                 #[cfg(feature = "pipeline-stats")]
                 {
                     idle_count += 1;
@@ -573,10 +333,7 @@ impl JournalStage {
                         tracing::error!(error = %e, "journal encode error on drain");
                     }
                 }
-                if let Err(e) = self.writer.flush_batch() {
-                    tracing::error!(error = %e, "journal flush_batch error on drain");
-                }
-                if let Err(e) = self.writer.sync() {
+                if let Err(e) = self.writer.flush_batch_sync() {
                     tracing::error!(error = %e, "journal sync error on drain");
                 }
             }
@@ -589,7 +346,7 @@ impl JournalStage {
 /// the journal stage), executes commands on the Exchange, and publishes
 /// responses to the output SPSC.
 ///
-/// Runs on a dedicated OS thread. Does NOT wait for journal fsync —
+/// Runs on a dedicated OS thread. Does NOT wait for journal sync —
 /// the persist-before-ack check happens in the response stage.
 pub struct MatchingStage {
     exchange: Exchange,
@@ -769,7 +526,7 @@ fn print_utilization(stage: &str, busy: u64, idle: u64) {
 ///
 /// **Topology**: both journal and matching consumers are gated on the
 /// producer (parallel). The matching stage does NOT wait for journal
-/// fsync — the response stage gates on the journal cursor instead.
+/// sync — the response stage gates on the journal cursor instead.
 ///
 /// The caller (server) is responsible for building the response stage
 /// and spawning all threads.
@@ -797,7 +554,7 @@ pub fn build_pipeline(
     let journal_consumer = consumers.pop().expect("journal consumer");
 
     // Grab the journal's progress cursor before moving it into the stage.
-    // The response stage will read this to gate on fsync completion.
+    // The response stage will read this to gate on sync completion.
     let journal_cursor = journal_consumer.progress_counter();
 
     // Output SPSC: matching → response.

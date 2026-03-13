@@ -1073,7 +1073,6 @@ version = "0.1.0"
 dependencies = [
  "crc32c",
  "hdrhistogram",
- "io-uring",
  "libc",
  "proptest",
  "tempfile",
