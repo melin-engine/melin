@@ -1043,9 +1043,11 @@ dependencies = [
 name = "trading-bench"
 version = "0.1.0"
 dependencies = [
+ "crossterm",
  "hdrhistogram",
  "io-uring",
  "libc",
+ "ratatui",
  "tikv-jemallocator",
  "tracing-subscriber",
  "trading-disruptor",

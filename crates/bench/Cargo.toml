@@ -9,6 +9,7 @@ no-persist = ["trading-server/no-persist"]
 latency-trace = ["trading-server/latency-trace"]
 io-uring = ["trading-server/io-uring", "dep:io-uring"]
 pipeline-stats = ["trading-server/pipeline-stats"]
+chart = ["dep:ratatui", "dep:crossterm"]
 
 [[bin]]
 name = "trading-bench"
@@ -24,3 +25,5 @@ libc = { workspace = true }
 tikv-jemallocator = { workspace = true }
 tracing-subscriber = { workspace = true }
 io-uring = { version = "0.7", optional = true }
+ratatui = { version = "0.29", optional = true }
+crossterm = { version = "0.28", optional = true }

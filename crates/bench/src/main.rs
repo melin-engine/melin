@@ -48,6 +48,12 @@ use trading_protocol::message::{Request, ResponseKind};
 use trading_protocol::transport::BlockingTransportListener;
 use trading_server::server::ServerConfig;
 
+/// Number of completed orders between latency time-series samples.
+/// Each sample captures interval p99/p99.9 (reset after each sample),
+/// giving temporal variation rather than cumulative smoothing.
+#[cfg(feature = "chart")]
+const SAMPLE_INTERVAL: usize = 1_000;
+
 /// Number of order pairs (buy + sell) per benchmark run.
 const DEFAULT_PAIRS: usize = 1_000_000;
 
@@ -74,6 +80,49 @@ const MAX_FRAME_SIZE: usize = 1024;
 /// Maximum epoll events per wait call.
 #[cfg(not(feature = "io-uring"))]
 const MAX_EPOLL_EVENTS: usize = 64;
+
+/// One latency time-series sample: interval percentiles at a point in time.
+/// Captured every `SAMPLE_INTERVAL` completed orders using an interval
+/// histogram (snapshot + reset), so each sample reflects recent behavior
+/// rather than cumulative averages.
+#[cfg(feature = "chart")]
+struct LatencySample {
+    /// Seconds elapsed since measurement start.
+    elapsed_secs: f64,
+    /// Interval p99 latency in microseconds.
+    p99_us: f64,
+    /// Interval p99.9 latency in microseconds.
+    p999_us: f64,
+}
+
+/// Time-series of latency samples for chart display.
+/// Empty Vec when chart feature is disabled (no heap allocation).
+#[cfg(feature = "chart")]
+type TimeSeries = Vec<LatencySample>;
+#[cfg(all(not(feature = "chart"), feature = "io-uring"))]
+type TimeSeries = Vec<()>;
+
+/// Record a latency sample if `SAMPLE_INTERVAL` orders have accumulated
+/// in the interval histogram. Resets the interval histogram after sampling.
+#[cfg(feature = "chart")]
+fn maybe_sample(
+    interval_hist: &mut Histogram<u64>,
+    interval_count: &mut usize,
+    series: &mut TimeSeries,
+    start: Instant,
+) {
+    if *interval_count >= SAMPLE_INTERVAL {
+        if !interval_hist.is_empty() {
+            series.push(LatencySample {
+                elapsed_secs: start.elapsed().as_secs_f64(),
+                p99_us: interval_hist.value_at_quantile(0.99) as f64 / 1000.0,
+                p999_us: interval_hist.value_at_quantile(0.999) as f64 / 1000.0,
+            });
+        }
+        interval_hist.reset();
+        *interval_count = 0;
+    }
+}
 
 fn main() {
     // Initialize tracing so pipeline-stats and latency-trace output is visible.
@@ -185,6 +234,14 @@ fn run_engine_bench(total_pairs: usize) {
     }
 
     // Measured run.
+    #[cfg(feature = "chart")]
+    let mut interval_hist =
+        Histogram::<u64>::new_with_bounds(1, 10_000_000_000, 3).expect("interval histogram");
+    #[cfg(feature = "chart")]
+    let mut interval_count: usize = 0;
+    #[cfg(feature = "chart")]
+    let mut series: TimeSeries = Vec::new();
+
     let start = Instant::now();
     for i in WARMUP_ORDERS..total_orders {
         let order_id = OrderId((i as u64) + 1);
@@ -208,6 +265,12 @@ fn run_engine_bench(total_pairs: usize) {
         );
         let elapsed_ns = t0.elapsed().as_nanos() as u64;
         histogram.record(elapsed_ns).expect("record");
+        #[cfg(feature = "chart")]
+        {
+            interval_hist.record(elapsed_ns).expect("record interval");
+            interval_count += 1;
+            maybe_sample(&mut interval_hist, &mut interval_count, &mut series, start);
+        }
     }
     let wall = start.elapsed();
 
@@ -219,6 +282,8 @@ fn run_engine_bench(total_pairs: usize) {
         wall,
         &[],
     );
+    #[cfg(feature = "chart")]
+    show_chart(&series);
 }
 
 // ===========================================================================
@@ -1043,7 +1108,7 @@ fn run_uring_roundtrip<R, W, F>(
     }
 
     let start = Instant::now();
-    let histogram = run_uring_loop(connections, window);
+    let (histogram, _series) = run_uring_loop(connections, window, start);
     let wall = start.elapsed();
 
     let mut extra_lines = Vec::new();
@@ -1068,6 +1133,9 @@ fn run_uring_roundtrip<R, W, F>(
     println!();
     shutdown.store(true, Ordering::Relaxed);
     std::thread::sleep(Duration::from_millis(200));
+
+    #[cfg(feature = "chart")]
+    show_chart(&_series);
 }
 
 /// Size of per-connection recv buffer for io_uring RECV.
@@ -1109,8 +1177,14 @@ struct UringBenchConn {
 
 /// io_uring event loop for all benchmark connections. Single-threaded:
 /// uses RECV for reads and SEND for writes through one io_uring ring.
+/// Returns the cumulative histogram and (when `chart` feature is enabled)
+/// a time-series of interval latency percentiles for visualization.
 #[cfg(feature = "io-uring")]
-fn run_uring_loop(mut connections: Vec<UringBenchConn>, window: usize) -> Histogram<u64> {
+fn run_uring_loop(
+    mut connections: Vec<UringBenchConn>,
+    window: usize,
+    bench_start: Instant,
+) -> (Histogram<u64>, TimeSeries) {
     use io_uring::{IoUring, opcode, types};
 
     let n = connections.len();
@@ -1118,6 +1192,17 @@ fn run_uring_loop(mut connections: Vec<UringBenchConn>, window: usize) -> Histog
     let mut histogram =
         Histogram::<u64>::new_with_bounds(1, 10_000_000_000, 3).expect("histogram bounds");
     let mut done_count: usize = 0;
+
+    #[cfg(feature = "chart")]
+    let mut interval_hist =
+        Histogram::<u64>::new_with_bounds(1, 10_000_000_000, 3).expect("interval histogram");
+    #[cfg(feature = "chart")]
+    let mut interval_count: usize = 0;
+    #[cfg(feature = "chart")]
+    let mut series: TimeSeries = Vec::new();
+    #[cfg(not(feature = "chart"))]
+    let series = TimeSeries::new();
+    let _ = &bench_start; // used only with chart feature
 
     // Pre-allocated CQE collection buffer. Must collect CQEs before
     // processing because the CQ borrow must end before mutating connections.
@@ -1208,6 +1293,17 @@ fn run_uring_loop(mut connections: Vec<UringBenchConn>, window: usize) -> Histog
                         let latency_ns = sent_at.elapsed().as_nanos() as u64;
                         if conn.batch_count >= WARMUP_ORDERS {
                             histogram.record(latency_ns).expect("record");
+                            #[cfg(feature = "chart")]
+                            {
+                                interval_hist.record(latency_ns).expect("record interval");
+                                interval_count += 1;
+                                maybe_sample(
+                                    &mut interval_hist,
+                                    &mut interval_count,
+                                    &mut series,
+                                    bench_start,
+                                );
+                            }
                         }
                         conn.batch_count += 1;
                         if conn.batch_count >= conn.total_orders {
@@ -1246,7 +1342,7 @@ fn run_uring_loop(mut connections: Vec<UringBenchConn>, window: usize) -> Histog
         uring_fill_windows(&mut ring, &mut connections, window);
     }
 
-    histogram
+    (histogram, series)
 }
 
 /// Fill send windows for all connections that have capacity and no pending send.
@@ -1398,6 +1494,114 @@ fn print_results(
         histogram.value_at_quantile(0.999) as f64 / 1000.0
     );
     println!("    max:    {:>8.2} µs", histogram.max() as f64 / 1000.0);
+}
+
+/// Display a latency percentile chart using ratatui, then wait for a keypress.
+#[cfg(feature = "chart")]
+fn show_chart(series: &TimeSeries) {
+    use std::io::stdout;
+
+    use crossterm::event::{self, Event, KeyCode};
+    use crossterm::execute;
+    use crossterm::terminal::{EnterAlternateScreen, LeaveAlternateScreen};
+    use ratatui::Terminal;
+    use ratatui::backend::CrosstermBackend;
+    use ratatui::layout::{Constraint, Layout};
+    use ratatui::style::{Color, Style};
+    use ratatui::symbols::Marker;
+    use ratatui::text::Span;
+    use ratatui::widgets::{Axis, Block, Borders, Chart, Dataset, GraphType};
+
+    if series.is_empty() {
+        return;
+    }
+
+    // Prepare data points: (elapsed_secs, latency_us).
+    let p99_data: Vec<(f64, f64)> = series.iter().map(|s| (s.elapsed_secs, s.p99_us)).collect();
+    let p999_data: Vec<(f64, f64)> = series.iter().map(|s| (s.elapsed_secs, s.p999_us)).collect();
+
+    let x_max = series.last().map(|s| s.elapsed_secs).unwrap_or(1.0);
+    let y_max = series
+        .iter()
+        .map(|s| s.p999_us)
+        .fold(0.0f64, f64::max)
+        .max(1.0)
+        * 1.1; // 10% headroom
+
+    // Enter TUI.
+    crossterm::terminal::enable_raw_mode().expect("enable raw mode");
+    let mut stdout = stdout();
+    execute!(stdout, EnterAlternateScreen).expect("enter alternate screen");
+    let backend = CrosstermBackend::new(stdout);
+    let mut terminal = Terminal::new(backend).expect("create terminal");
+
+    terminal
+        .draw(|frame| {
+            let area = Layout::default()
+                .constraints([Constraint::Percentage(100)])
+                .split(frame.area())[0];
+
+            let datasets = vec![
+                Dataset::default()
+                    .name("p99")
+                    .marker(Marker::Braille)
+                    .graph_type(GraphType::Line)
+                    .style(Style::default().fg(Color::Cyan))
+                    .data(&p99_data),
+                Dataset::default()
+                    .name("p99.9")
+                    .marker(Marker::Braille)
+                    .graph_type(GraphType::Line)
+                    .style(Style::default().fg(Color::Yellow))
+                    .data(&p999_data),
+            ];
+
+            let x_labels = vec![
+                Span::raw("0s"),
+                Span::raw(format!("{:.1}s", x_max / 2.0)),
+                Span::raw(format!("{:.1}s", x_max)),
+            ];
+            let y_labels = vec![
+                Span::raw("0"),
+                Span::raw(format!("{:.0} µs", y_max / 2.0)),
+                Span::raw(format!("{:.0} µs", y_max)),
+            ];
+
+            let chart = Chart::new(datasets)
+                .block(
+                    Block::default()
+                        .title(" Latency Percentiles Over Time (press any key to exit) ")
+                        .borders(Borders::ALL),
+                )
+                .x_axis(
+                    Axis::default()
+                        .title("Time")
+                        .bounds([0.0, x_max])
+                        .labels(x_labels),
+                )
+                .y_axis(
+                    Axis::default()
+                        .title("Latency")
+                        .bounds([0.0, y_max])
+                        .labels(y_labels),
+                );
+
+            frame.render_widget(chart, area);
+        })
+        .expect("draw chart");
+
+    // Wait for any key.
+    loop {
+        if let Ok(Event::Key(key)) = event::read()
+            && key.code != KeyCode::Null
+        {
+            break;
+        }
+    }
+
+    // Restore terminal.
+    crossterm::terminal::disable_raw_mode().expect("disable raw mode");
+    execute!(terminal.backend_mut(), LeaveAlternateScreen).expect("leave alternate screen");
 }
 
 /// Create a temporary directory that persists for the process lifetime.
