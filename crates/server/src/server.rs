@@ -1,15 +1,15 @@
-//! Server orchestrator — binds the accept loop, pipeline threads, and sessions.
+//! Server orchestrator — binds the accept loop, pipeline threads, and reader.
 //!
 //! On startup:
 //! 1. Recovers or creates the `JournaledExchange`.
 //! 2. Decomposes it into `(Exchange, JournalWriter)` via `into_parts()`.
 //! 3. Builds the disruptor pipeline (input ring buffer + output SPSC).
-//! 4. Spawns 3 OS threads: journal, matching, response.
-//! 5. Runs the accept loop, spawning a reader OS thread per connection.
+//! 4. Spawns 4 OS threads: reader (epoll), journal, matching, response.
+//! 5. Runs the accept loop, registering connections with the epoll reader.
 //!
-//! Fully synchronous — no async runtime needed. Reader threads do blocking
-//! I/O and publish directly to the disruptor. The response thread writes
-//! directly to sockets.
+//! Fully synchronous — no async runtime needed. The single reader thread
+//! uses epoll to multiplex all connections, eliminating thread oversubscription.
+//! The response thread writes directly to sockets.
 
 use std::io::Write;
 use std::net::SocketAddr;
@@ -26,8 +26,8 @@ use trading_protocol::blocking::BlockingFrameWriter;
 use trading_protocol::message::ConnectionId;
 use trading_protocol::transport::BlockingTransportListener;
 
+use crate::reader::{self, ReaderRegistration};
 use crate::response::ControlEvent;
-use crate::session;
 
 /// Server configuration.
 pub struct ServerConfig {
@@ -51,6 +51,10 @@ pub struct ServerConfig {
     /// Under high load the batch fills naturally and the delay rarely
     /// fires. Zero means sync immediately after each batch read.
     pub group_commit_delay: std::time::Duration,
+    /// Number of epoll reader threads. Each thread multiplexes a subset
+    /// of connections via epoll. Connections are assigned round-robin.
+    /// Default: 2 (enough for ~100 connections without oversubscription).
+    pub reader_threads: usize,
 }
 
 impl Default for ServerConfig {
@@ -61,6 +65,7 @@ impl Default for ServerConfig {
             snapshot_path: None,
             core_affinity: [1, 2, 3],
             group_commit_delay: std::time::Duration::ZERO,
+            reader_threads: 2,
         }
     }
 }
@@ -101,13 +106,16 @@ pub fn run_with_shutdown<L: BlockingTransportListener>(
     let (input_producer, journal_stage, matching_stage, output_consumer, journal_cursor) =
         build_pipeline(exchange, writer, config.group_commit_delay);
 
-    // Multi-producer: each reader thread gets a clone. Lock-free CAS-based
-    // slot claiming eliminates mutex contention entirely. Scales to any
-    // connection count without serialization overhead.
-    let shared_producer = input_producer;
-
     // Control channel for connect/disconnect events → response stage.
     let (control_tx, control_rx) = std::sync::mpsc::channel();
+
+    // Spawn the epoll reader thread pool. Connections are distributed
+    // round-robin across reader threads. Each thread uses epoll to
+    // multiplex its connections and MultiProducer to publish to the
+    // disruptor. With 2 readers + 3 pipeline = 5 OS threads total,
+    // no oversubscription even with hundreds of connections.
+    let mut reader_handle =
+        reader::spawn_reader_pool(config.reader_threads, input_producer, control_tx.clone());
 
     // Spawn pipeline OS threads.
     let cores = config.core_affinity;
@@ -146,8 +154,8 @@ pub fn run_with_shutdown<L: BlockingTransportListener>(
     // flexibility (e.g., multiple listeners).
     let next_connection_id = AtomicU64::new(1);
 
-    // Accept loop — blocking. Each accepted connection yields blocking
-    // read/write halves directly (no async-to-blocking conversion).
+    // Accept loop — blocking. Each accepted connection is registered with
+    // the epoll reader thread (no per-connection threads).
     loop {
         let (std_read, std_write, addr) = match listener.accept() {
             Ok(conn) => conn,
@@ -161,9 +169,9 @@ pub fn run_with_shutdown<L: BlockingTransportListener>(
 
         debug!(connection_id = connection_id.0, addr = %addr, "new connection");
 
-        // Register the writer with the response thread before spawning
-        // the reader. This ensures the response stage has the writer
-        // before any requests arrive.
+        // Register the writer with the response thread before the reader.
+        // This ensures the response stage has the writer before any
+        // requests arrive from this connection.
         let boxed_writer: Box<dyn Write + Send> = Box::new(std_write);
         if control_tx
             .send(ControlEvent::Connected {
@@ -176,14 +184,12 @@ pub fn run_with_shutdown<L: BlockingTransportListener>(
             break;
         }
 
-        // Spawn a dedicated reader thread for this connection.
-        session::spawn_reader_thread(
+        // Register the reader fd with the epoll reader thread.
+        reader_handle.register(ReaderRegistration {
             connection_id,
-            std_read,
-            shared_producer.clone(),
-            control_tx.clone(),
+            reader: std_read,
             addr,
-        );
+        });
     }
 
     // Signal pipeline threads to shut down.
