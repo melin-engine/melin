@@ -84,6 +84,28 @@ crates/
 └── tui/           Terminal UI for interactive testing
 ```
 
+## Performance
+
+End-to-end benchmark (`crates/bench/`) measures full TCP round-trip latency on loopback: client sends order, server processes through the entire pipeline (read → journal → match → response), client receives execution report. AMD Ryzen 7 5800X3D (8C/16T), 64 GB DDR5, NVMe SSD, Linux 6.8.
+
+**Without fsync** (isolates pipeline latency from disk I/O):
+
+```
+cargo run --release -p trading-bench --features io-uring,no-fsync -- 3000000 --clients=32 --window=8
+
+Throughput:  620K orders/sec (1.61 µs/order)
+Latency:     p99 = 650 µs, p99.9 = 813 µs, max = 1.96 ms
+```
+
+**With fsync** (full durability, io_uring async fdatasync):
+
+```
+cargo run --release -p trading-bench --features io-uring -- 3000000 --clients=32 --window=8
+
+Throughput:  182K orders/sec (5.50 µs/order)
+Latency:     p99 = 1.83 ms, p99.9 = 3.22 ms, max = 7.44 ms
+```
+
 ## License
 
 Copyright (c) 2026 Pierre Larger. All Rights Reserved.
