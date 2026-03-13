@@ -197,9 +197,17 @@ impl AccountManager {
         spec: &InstrumentSpec,
     ) {
         // cost = price × quantity, using u128 to avoid overflow.
-        // This cannot overflow u64 here because we already validated at
-        // reservation time. If it somehow does, saturate rather than panic.
+        // This fits in u64 because reservation validated price × quantity
+        // at order placement (limit buys) or the quote budget caps total
+        // cost (market buys). Assert in debug builds; saturate in release
+        // as a defensive fallback.
         let cost = (price.get() as u128) * (quantity.get() as u128);
+        debug_assert!(
+            cost <= u64::MAX as u128,
+            "fill cost overflows u64: {cost} = {} × {}",
+            price.get(),
+            quantity.get()
+        );
         let cost_u64 = u64::try_from(cost).unwrap_or(u64::MAX);
         let qty = quantity.get();
 
