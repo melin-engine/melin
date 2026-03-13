@@ -26,8 +26,11 @@ use trading_protocol::blocking::BlockingFrameWriter;
 use trading_protocol::message::ConnectionId;
 use trading_protocol::transport::BlockingTransportListener;
 
+#[cfg(not(feature = "io-uring"))]
 use crate::reader::{self, ReaderRegistration};
 use crate::response::ControlEvent;
+#[cfg(feature = "io-uring")]
+use crate::uring_reader::{self as reader, ReaderRegistration};
 
 /// Server configuration.
 pub struct ServerConfig {

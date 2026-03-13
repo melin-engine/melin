@@ -10,7 +10,7 @@ edition = "2024"
 no-fsync = ["trading-engine/no-fsync"]
 no-persist = ["trading-engine/no-persist"]
 latency-trace = ["trading-engine/latency-trace", "trading-protocol/latency-trace"]
-io-uring = ["trading-engine/io-uring"]
+io-uring = ["trading-engine/io-uring", "dep:io-uring"]
 pipeline-stats = ["trading-engine/pipeline-stats"]
 
 [lib]
@@ -29,6 +29,7 @@ libc = { workspace = true }
 tracing = { workspace = true }
 tikv-jemallocator = { workspace = true }
 tracing-subscriber = { workspace = true }
+io-uring = { version = "0.7", optional = true }
 
 [dev-dependencies]
 tempfile = "3"
