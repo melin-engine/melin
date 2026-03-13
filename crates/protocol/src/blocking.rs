@@ -4,22 +4,30 @@
 //! `std::io::Read`/`Write` directly. Used by the server's reader and
 //! response threads to avoid tokio task scheduling overhead on the hot path.
 
-use std::io::{self, BufWriter, Read, Write};
+use std::io::{self, BufReader, BufWriter, Read, Write};
 
 /// Maximum frame payload size (1 KiB). Same limit as the async transports.
 const MAX_FRAME_SIZE: usize = 1024;
 
 /// Blocking frame reader. Reads length-prefixed frames from any `Read` source.
 ///
+/// Uses `BufReader` to amortize read syscalls — a single recv fills the
+/// buffer with many frames, so subsequent `read_exact` calls hit the
+/// buffer instead of making kernel transitions. This is critical for
+/// round-trip latency: without buffering, each frame requires 2 read
+/// syscalls (4-byte length prefix + payload).
+///
 /// Generic over the reader type so it works with both `std::net::TcpStream`
 /// and `std::os::unix::net::UnixStream`.
 pub struct BlockingFrameReader<R> {
-    reader: R,
+    reader: BufReader<R>,
 }
 
 impl<R: Read> BlockingFrameReader<R> {
     pub fn new(reader: R) -> Self {
-        Self { reader }
+        Self {
+            reader: BufReader::new(reader),
+        }
     }
 
     /// Read the next complete frame. Returns `None` on clean disconnect.
