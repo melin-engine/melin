@@ -175,28 +175,34 @@ fn start_server<L: BlockingTransportListener>(
         .expect("spawn server thread");
 }
 
-/// Connect to TCP server with retry.
+/// Connect to TCP server with retry (up to 50 attempts, 10ms apart).
 fn connect_tcp(addr: std::net::SocketAddr) -> std::net::TcpStream {
-    for attempt in 1..=50 {
+    let mut last_err = None;
+    for _ in 0..50 {
         match std::net::TcpStream::connect(addr) {
             Ok(s) => return s,
-            Err(_) if attempt < 50 => std::thread::sleep(Duration::from_millis(10)),
-            Err(e) => panic!("failed to connect after 50 attempts: {e}"),
+            Err(e) => {
+                last_err = Some(e);
+                std::thread::sleep(Duration::from_millis(10));
+            }
         }
     }
-    unreachable!()
+    panic!("failed to connect after 50 attempts: {}", last_err.unwrap());
 }
 
-/// Connect to UDS server with retry.
+/// Connect to UDS server with retry (up to 50 attempts, 10ms apart).
 fn connect_uds(path: &std::path::Path) -> std::os::unix::net::UnixStream {
-    for attempt in 1..=50 {
+    let mut last_err = None;
+    for _ in 0..50 {
         match std::os::unix::net::UnixStream::connect(path) {
             Ok(s) => return s,
-            Err(_) if attempt < 50 => std::thread::sleep(Duration::from_millis(10)),
-            Err(e) => panic!("failed to connect after 50 attempts: {e}"),
+            Err(e) => {
+                last_err = Some(e);
+                std::thread::sleep(Duration::from_millis(10));
+            }
         }
     }
-    unreachable!()
+    panic!("failed to connect after 50 attempts: {}", last_err.unwrap());
 }
 
 // ---------------------------------------------------------------------------
