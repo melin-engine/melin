@@ -1,0 +1,18 @@
+[package]
+name = "trading-gateway"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+name = "trading_gateway"
+path = "src/lib.rs"
+
+[[bin]]
+name = "trading-gateway"
+path = "src/main.rs"
+
+[dependencies]
+trading-protocol = { path = "../protocol" }
+tracing = { workspace = true }
+tikv-jemallocator = { workspace = true }
+tracing-subscriber = { workspace = true }

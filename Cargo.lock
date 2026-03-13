@@ -1081,6 +1081,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "trading-gateway"
+version = "0.1.0"
+dependencies = [
+ "tikv-jemallocator",
+ "tracing",
+ "tracing-subscriber",
+ "trading-protocol",
+]
+
+[[package]]
 name = "trading-protocol"
 version = "0.1.0"
 dependencies = [
