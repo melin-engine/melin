@@ -34,8 +34,15 @@ const MAX_BATCH: usize = 1024;
 /// so 128 bytes is generous.
 const MAX_RESPONSE_BUF: usize = 128;
 
-/// io_uring submission queue depth for sends.
-const RING_SIZE: u32 = 256;
+/// io_uring submission queue depth for sends. Must be ≥ max concurrent
+/// connections to avoid SQ overflow when all connections are dirty.
+/// Power of 2 for io_uring alignment.
+const RING_SIZE: u32 = 1024;
+
+/// Maximum accumulated send buffer per connection (64 KiB). If a client
+/// falls behind and the buffer exceeds this, the connection is dropped.
+/// 64 KiB holds ~500 response frames — well beyond any reasonable lag.
+const MAX_SEND_BUF: usize = 64 * 1024;
 
 /// Control plane events for connection registration.
 ///
@@ -247,6 +254,19 @@ pub fn run(
                     }
                 };
 
+                // Drop slow clients whose send buffer has grown too large.
+                // This prevents unbounded memory growth from a single laggy
+                // connection causing allocator pressure and tail latency spikes.
+                if entry.send_buf.len() + written > MAX_SEND_BUF {
+                    debug!(
+                        connection_id = slot.connection_id,
+                        send_buf_len = entry.send_buf.len(),
+                        "send buffer exceeded limit, dropping connection"
+                    );
+                    to_remove.push(slot.connection_id);
+                    continue;
+                }
+
                 // Append the full wire frame to the connection's send buffer.
                 // encode_response writes [length(4) | payload], which is the
                 // complete wire format — no extra framing needed.
@@ -260,6 +280,12 @@ pub fn run(
                         .record_ns(trace::trace_elapsed_ns(slot.recv_ts, trace::trace_ts()));
                 }
             }
+        }
+
+        // Remove connections that exceeded the send buffer limit.
+        for conn_id in to_remove.drain(..) {
+            connections.remove(&conn_id);
+            dirty_connections.remove(&conn_id);
         }
 
         #[cfg(feature = "latency-trace")]
