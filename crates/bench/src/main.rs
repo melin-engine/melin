@@ -28,7 +28,9 @@
 static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
 use std::collections::VecDeque;
-use std::io::{self, Write};
+#[cfg(not(feature = "io-uring"))]
+use std::io;
+use std::io::Write;
 use std::num::NonZeroU64;
 use std::os::unix::io::{AsRawFd, RawFd};
 use std::path::PathBuf;
@@ -39,6 +41,7 @@ use std::time::{Duration, Instant};
 use hdrhistogram::Histogram;
 
 use trading_engine::types::*;
+#[cfg(not(feature = "io-uring"))]
 use trading_protocol::blocking::BlockingFrameWriter;
 use trading_protocol::codec;
 use trading_protocol::message::{Request, ResponseKind};
@@ -69,6 +72,7 @@ const DEFAULT_BENCH_THREADS: usize = 4;
 const MAX_FRAME_SIZE: usize = 1024;
 
 /// Maximum epoll events per wait call.
+#[cfg(not(feature = "io-uring"))]
 const MAX_EPOLL_EVENTS: usize = 64;
 
 fn main() {
@@ -420,8 +424,7 @@ fn run_roundtrip_bench(
         let connect = || {
             let stream = connect_uds(sock_path_ref);
             let read_stream = stream.try_clone().expect("clone UDS stream");
-            let writer = BlockingFrameWriter::new(stream);
-            (read_stream, writer)
+            (read_stream, stream)
         };
 
         run_roundtrip_inner(
@@ -446,8 +449,7 @@ fn run_roundtrip_bench(
             let stream = connect_tcp(addr);
             stream.set_nodelay(true).expect("set TCP_NODELAY");
             let read_stream = stream.try_clone().expect("clone TCP stream");
-            let writer = BlockingFrameWriter::new(stream);
-            (read_stream, writer)
+            (read_stream, stream)
         };
 
         run_roundtrip_inner(
@@ -535,6 +537,7 @@ fn connect_uds(path: &std::path::Path) -> std::os::unix::net::UnixStream {
 // ---------------------------------------------------------------------------
 
 /// State for one benchmark connection in the epoll event loop.
+#[cfg(not(feature = "io-uring"))]
 struct BenchConnection<W: Write> {
     // --- Write side (blocking, buffered) ---
     writer: BlockingFrameWriter<W>,
@@ -570,7 +573,9 @@ struct BenchConnection<W: Write> {
 
 /// Trait alias for types that are both `AsRawFd` and `Send`.
 /// Used to erase the concrete stream type (TCP or UDS) behind a trait object.
+#[cfg(not(feature = "io-uring"))]
 trait AsRawFdSend: AsRawFd + Send {}
+#[cfg(not(feature = "io-uring"))]
 impl<T: AsRawFd + Send> AsRawFdSend for T {}
 
 // ---------------------------------------------------------------------------
@@ -578,6 +583,7 @@ impl<T: AsRawFd + Send> AsRawFdSend for T {}
 // ---------------------------------------------------------------------------
 
 /// Result of attempting to read a complete frame.
+#[cfg(not(feature = "io-uring"))]
 enum FrameResult {
     /// A complete frame was read; valid bytes are in the connection's payload_buf.
     Complete,
@@ -592,6 +598,7 @@ enum FrameResult {
 /// Try to read one complete frame from a non-blocking fd.
 /// On `FrameResult::Complete`, the frame payload is in
 /// `conn.payload_buf[..conn.payload_len]`.
+#[cfg(not(feature = "io-uring"))]
 fn try_read_frame<W: Write>(conn: &mut BenchConnection<W>) -> FrameResult {
     // Step 1: Read 4-byte length prefix.
     if !conn.reading_payload {
@@ -640,6 +647,7 @@ fn try_read_frame<W: Write>(conn: &mut BenchConnection<W>) -> FrameResult {
     }
 }
 
+#[cfg(not(feature = "io-uring"))]
 enum FillResult {
     /// Progressed to `filled` bytes. If `filled < target`, EAGAIN.
     Complete(usize),
@@ -648,6 +656,7 @@ enum FillResult {
 }
 
 /// Non-blocking read into `buf[filled..target]`.
+#[cfg(not(feature = "io-uring"))]
 fn nonblocking_fill(fd: RawFd, buf: &mut [u8], mut filled: usize, target: usize) -> FillResult {
     while filled < target {
         let n = unsafe {
@@ -678,6 +687,7 @@ fn nonblocking_fill(fd: RawFd, buf: &mut [u8], mut filled: usize, target: usize)
 
 /// Run the epoll event loop for a subset of connections. Returns the
 /// latency histogram for this thread's connections.
+#[cfg(not(feature = "io-uring"))]
 fn run_epoll_loop<W: Write>(
     mut connections: Vec<BenchConnection<W>>,
     window: usize,
@@ -789,13 +799,60 @@ fn run_roundtrip_inner<R, W, F>(
     total_pairs: usize,
     window: usize,
     num_clients: usize,
+    #[cfg_attr(feature = "io-uring", allow(unused_variables))] bench_threads: usize,
+    group_commit_us: u64,
+    shutdown: Arc<AtomicBool>,
+) where
+    R: AsRawFd + Send + 'static,
+    W: Write + AsRawFd + Send + 'static,
+    F: Fn() -> (R, W),
+{
+    // io_uring path: single-threaded event loop using io_uring RECV/SEND.
+    #[cfg(feature = "io-uring")]
+    {
+        run_uring_roundtrip(
+            connect,
+            transport_name,
+            total_pairs,
+            window,
+            num_clients,
+            group_commit_us,
+            shutdown,
+        );
+    }
+
+    // Epoll path: multi-threaded event loop using epoll reads + blocking writes.
+    #[cfg(not(feature = "io-uring"))]
+    {
+        run_epoll_roundtrip(
+            connect,
+            transport_name,
+            total_pairs,
+            window,
+            num_clients,
+            bench_threads,
+            group_commit_us,
+            shutdown,
+        );
+    }
+}
+
+/// Epoll-based roundtrip benchmark. Uses epoll for reads and blocking
+/// writes via BlockingFrameWriter.
+#[cfg(not(feature = "io-uring"))]
+fn run_epoll_roundtrip<R, W, F>(
+    connect: F,
+    transport_name: &str,
+    total_pairs: usize,
+    window: usize,
+    num_clients: usize,
     bench_threads: usize,
     group_commit_us: u64,
     shutdown: Arc<AtomicBool>,
 ) where
     R: AsRawFd + Send + 'static,
-    W: Write + Send + 'static,
-    F: Fn() -> (R, BlockingFrameWriter<W>),
+    W: Write + AsRawFd + Send + 'static,
+    F: Fn() -> (R, W),
 {
     let pairs_per_client = total_pairs / num_clients;
     let remainder = total_pairs % num_clients;
@@ -806,8 +863,9 @@ fn run_roundtrip_inner<R, W, F>(
         (0..num_threads).map(|_| Vec::new()).collect();
 
     for client_id in 0..num_clients {
-        let (read_stream, writer) = connect();
+        let (read_stream, write_stream) = connect();
         let fd = read_stream.as_raw_fd();
+        let writer = BlockingFrameWriter::new(write_stream);
 
         // Set non-blocking on the read fd.
         unsafe {
@@ -914,9 +972,322 @@ fn run_roundtrip_inner<R, W, F>(
     std::thread::sleep(Duration::from_millis(200));
 }
 
+// ===========================================================================
+// io_uring roundtrip benchmark
+// ===========================================================================
+
+/// io_uring-based roundtrip benchmark. Uses a single thread with io_uring
+/// RECV for reads and io_uring SEND for writes, replacing the multi-threaded
+/// epoll + blocking-write approach.
+#[cfg(feature = "io-uring")]
+fn run_uring_roundtrip<R, W, F>(
+    connect: F,
+    transport_name: &str,
+    total_pairs: usize,
+    window: usize,
+    num_clients: usize,
+    group_commit_us: u64,
+    shutdown: Arc<AtomicBool>,
+) where
+    R: AsRawFd + Send + 'static,
+    W: Write + AsRawFd + Send + 'static,
+    F: Fn() -> (R, W),
+{
+    let pairs_per_client = total_pairs / num_clients;
+    let remainder = total_pairs % num_clients;
+
+    let mut connections: Vec<UringBenchConn> = Vec::with_capacity(num_clients);
+
+    for client_id in 0..num_clients {
+        let (read_stream, write_stream) = connect();
+        let read_fd = read_stream.as_raw_fd();
+        let write_fd = write_stream.as_raw_fd();
+
+        let client_pairs = if client_id == num_clients - 1 {
+            pairs_per_client + remainder
+        } else {
+            pairs_per_client
+        };
+        let total_orders = WARMUP_ORDERS + client_pairs * 2;
+
+        let order_id_offset: u64 = (0..client_id)
+            .map(|c| {
+                let p = if c == num_clients - 1 {
+                    pairs_per_client + remainder
+                } else {
+                    pairs_per_client
+                };
+                (WARMUP_ORDERS + p * 2) as u64
+            })
+            .sum();
+
+        let frames = encode_frames(total_orders, order_id_offset);
+
+        connections.push(UringBenchConn {
+            read_fd,
+            write_fd,
+            _read_owner: Box::new(read_stream),
+            _write_owner: Box::new(write_stream),
+            recv_buf: Box::new([0u8; URING_RECV_BUF_SIZE]),
+            parse_buf: Vec::with_capacity(MAX_FRAME_SIZE + 4),
+            recv_pending: false,
+            send_buf: Vec::with_capacity(4096),
+            send_pending: false,
+            frames,
+            send_cursor: 0,
+            inflight_ts: VecDeque::with_capacity(window),
+            batch_count: 0,
+            total_orders,
+            done: false,
+        });
+    }
+
+    let start = Instant::now();
+    let histogram = run_uring_loop(connections, window);
+    let wall = start.elapsed();
+
+    let mut extra_lines = Vec::new();
+    if group_commit_us > 0 {
+        extra_lines.push(format!("  Group commit delay: {group_commit_us} µs"));
+    }
+    extra_lines.push(format!("  Transport: {transport_name}"));
+    extra_lines.push("  Bench threads: 1 (io_uring)".to_string());
+    extra_lines.push(format!("  Window: {window}, Clients: {num_clients}"));
+
+    print_results(
+        "Roundtrip",
+        total_pairs * 2,
+        WARMUP_ORDERS * num_clients,
+        &histogram,
+        wall,
+        &extra_lines,
+    );
+
+    println!();
+    println!("=== Pipeline Latency Trace ===");
+    println!();
+    shutdown.store(true, Ordering::Relaxed);
+    std::thread::sleep(Duration::from_millis(200));
+}
+
+/// Size of per-connection recv buffer for io_uring RECV.
+#[cfg(feature = "io-uring")]
+const URING_RECV_BUF_SIZE: usize = 4096;
+
+/// Flag bit in io_uring user_data to distinguish SEND from RECV CQEs.
+/// Bit 63 set = SEND completion, clear = RECV completion.
+#[cfg(feature = "io-uring")]
+const SEND_FLAG: u64 = 1 << 63;
+
+/// Per-connection state for the io_uring benchmark event loop.
+#[cfg(feature = "io-uring")]
+struct UringBenchConn {
+    read_fd: RawFd,
+    write_fd: RawFd,
+    /// Owns the read half — keeps the fd alive.
+    _read_owner: Box<dyn Send>,
+    /// Owns the write half — keeps the fd alive.
+    _write_owner: Box<dyn Send>,
+
+    // Recv state
+    recv_buf: Box<[u8; URING_RECV_BUF_SIZE]>,
+    parse_buf: Vec<u8>,
+    recv_pending: bool,
+
+    // Send state
+    send_buf: Vec<u8>,
+    send_pending: bool,
+
+    // Pipelining state
+    frames: Vec<Vec<u8>>,
+    send_cursor: usize,
+    inflight_ts: VecDeque<Instant>,
+    batch_count: usize,
+    total_orders: usize,
+    done: bool,
+}
+
+/// io_uring event loop for all benchmark connections. Single-threaded:
+/// uses RECV for reads and SEND for writes through one io_uring ring.
+#[cfg(feature = "io-uring")]
+fn run_uring_loop(mut connections: Vec<UringBenchConn>, window: usize) -> Histogram<u64> {
+    use io_uring::{IoUring, opcode, types};
+
+    let n = connections.len();
+    let mut ring = IoUring::new(1024).expect("create io_uring for bench");
+    let mut histogram =
+        Histogram::<u64>::new_with_bounds(1, 10_000_000_000, 3).expect("histogram bounds");
+    let mut done_count: usize = 0;
+
+    // Submit initial RECVs for all connections.
+    for (i, conn) in connections.iter_mut().enumerate() {
+        let sqe = opcode::Recv::new(
+            types::Fd(conn.read_fd),
+            conn.recv_buf.as_mut_ptr(),
+            URING_RECV_BUF_SIZE as u32,
+        )
+        .build()
+        .user_data(i as u64);
+        unsafe {
+            ring.submission().push(&sqe).expect("SQ full");
+        }
+        conn.recv_pending = true;
+    }
+
+    // Fill initial send windows.
+    uring_fill_windows(&mut ring, &mut connections, window);
+
+    while done_count < n {
+        match ring.submit_and_wait(1) {
+            Ok(_) => {}
+            Err(ref e) if e.raw_os_error() == Some(libc::EINTR) => continue,
+            Err(e) => panic!("io_uring submit_and_wait: {e}"),
+        }
+
+        let cqes: Vec<(u64, i32)> = ring
+            .completion()
+            .map(|cqe| (cqe.user_data(), cqe.result()))
+            .collect();
+
+        for (token, result) in cqes {
+            if token & SEND_FLAG != 0 {
+                // ── SEND completion ──
+                let idx = (token & !SEND_FLAG) as usize;
+                let conn = &mut connections[idx];
+                conn.send_pending = false;
+
+                assert!(result >= 0, "send error: {result}");
+                let sent = result as usize;
+                if sent >= conn.send_buf.len() {
+                    conn.send_buf.clear();
+                } else {
+                    // Partial send — drain and resubmit.
+                    conn.send_buf.drain(..sent);
+                    let sqe = opcode::Send::new(
+                        types::Fd(conn.write_fd),
+                        conn.send_buf.as_ptr(),
+                        conn.send_buf.len() as u32,
+                    )
+                    .build()
+                    .user_data(idx as u64 | SEND_FLAG);
+                    unsafe {
+                        ring.submission().push(&sqe).expect("SQ full");
+                    }
+                    conn.send_pending = true;
+                }
+            } else {
+                // ── RECV completion ──
+                let idx = token as usize;
+                assert!(result > 0, "recv error or disconnect: {result}");
+
+                let n_bytes = result as usize;
+                let conn = &mut connections[idx];
+                conn.recv_pending = false;
+                conn.parse_buf.extend_from_slice(&conn.recv_buf[..n_bytes]);
+
+                // Parse complete frames.
+                let mut cursor = 0;
+                while cursor + 4 <= conn.parse_buf.len() {
+                    let len_bytes: [u8; 4] = conn.parse_buf[cursor..cursor + 4]
+                        .try_into()
+                        .expect("4 bytes");
+                    let frame_len = u32::from_le_bytes(len_bytes) as usize;
+                    if cursor + 4 + frame_len > conn.parse_buf.len() {
+                        break;
+                    }
+
+                    let frame = &conn.parse_buf[cursor + 4..cursor + 4 + frame_len];
+                    let response = codec::decode_response(frame).expect("decode response");
+                    cursor += 4 + frame_len;
+
+                    if matches!(response, ResponseKind::BatchEnd) {
+                        let sent_at = conn.inflight_ts.pop_front().expect("inflight timestamp");
+                        let latency_ns = sent_at.elapsed().as_nanos() as u64;
+                        if conn.batch_count >= WARMUP_ORDERS {
+                            histogram.record(latency_ns).expect("record");
+                        }
+                        conn.batch_count += 1;
+                        if conn.batch_count >= conn.total_orders {
+                            conn.done = true;
+                            done_count += 1;
+                        }
+                    }
+                }
+                if cursor > 0 {
+                    conn.parse_buf.drain(..cursor);
+                }
+
+                // Resubmit RECV if connection is still active.
+                if !conn.done {
+                    let sqe = opcode::Recv::new(
+                        types::Fd(conn.read_fd),
+                        conn.recv_buf.as_mut_ptr(),
+                        URING_RECV_BUF_SIZE as u32,
+                    )
+                    .build()
+                    .user_data(idx as u64);
+                    unsafe {
+                        ring.submission().push(&sqe).expect("SQ full");
+                    }
+                    conn.recv_pending = true;
+                }
+            }
+        }
+
+        // Refill send windows for connections with capacity.
+        uring_fill_windows(&mut ring, &mut connections, window);
+    }
+
+    histogram
+}
+
+/// Fill send windows for all connections that have capacity and no pending send.
+/// Builds a length-prefixed send buffer and submits SEND SQEs.
+#[cfg(feature = "io-uring")]
+fn uring_fill_windows(
+    ring: &mut io_uring::IoUring,
+    connections: &mut [UringBenchConn],
+    window: usize,
+) {
+    use io_uring::{opcode, types};
+
+    for (i, conn) in connections.iter_mut().enumerate() {
+        if conn.done || conn.send_pending {
+            continue;
+        }
+
+        // Fill the send buffer with as many frames as the window allows.
+        while conn.inflight_ts.len() < window && conn.send_cursor < conn.total_orders {
+            let ts = Instant::now();
+            let frame = &conn.frames[conn.send_cursor];
+            // Write the length-prefixed wire frame into the send buffer.
+            let len = frame.len() as u32;
+            conn.send_buf.extend_from_slice(&len.to_le_bytes());
+            conn.send_buf.extend_from_slice(frame);
+            conn.inflight_ts.push_back(ts);
+            conn.send_cursor += 1;
+        }
+
+        if !conn.send_buf.is_empty() {
+            let sqe = opcode::Send::new(
+                types::Fd(conn.write_fd),
+                conn.send_buf.as_ptr(),
+                conn.send_buf.len() as u32,
+            )
+            .build()
+            .user_data(i as u64 | SEND_FLAG);
+            unsafe {
+                ring.submission().push(&sqe).expect("SQ full");
+            }
+            conn.send_pending = true;
+        }
+    }
+}
+
 /// Send frames on all connections that have window capacity.
 /// Each connection is flushed independently after its batch, simulating
 /// real clients that send and flush without coordinating with each other.
+#[cfg(not(feature = "io-uring"))]
 fn send_pending<W: Write>(connections: &mut [BenchConnection<W>], window: usize) {
     for conn in connections.iter_mut() {
         if conn.done {
