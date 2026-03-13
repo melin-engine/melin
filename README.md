@@ -88,22 +88,24 @@ crates/
 
 The [benchmark suite](crates/bench/) supports three modes: bare matching engine, disruptor pipeline without network, and full TCP/UDS round-trip. Results below are from the round-trip mode measuring full TCP loopback latency. AMD Ryzen 7 5800X3D (8C/16T), 64 GB DDR5, NVMe SSD, Linux 6.8.
 
+All benchmarks: 16 clients, 64 pipelined orders per client, 1M order pairs.
+
 **Without fsync** (isolates pipeline latency from disk I/O):
 
 ```
-cargo run --release -p trading-bench --features no-persist -- 3000000 --clients=16 --window=8
+cargo run --release -p trading-bench --features io-uring,no-fsync -- 1000000 --clients=16 --window=64 --mode=roundtrip
 
-Throughput:  650K orders/sec (1.54 µs/order)
-Latency:     p99 = 268 µs, p99.9 = 306 µs, max = 623 µs
+Throughput:  1.62M orders/sec (0.62 µs/order)
+Latency:     p99 = 378 µs, p99.9 = 506 µs, max = 1.07 ms
 ```
 
 **With fsync** (full durability, io_uring async fdatasync):
 
 ```
-cargo run --release -p trading-bench --features io-uring -- 3000000 --clients=16 --window=8
+cargo run --release -p trading-bench --features io-uring -- 1000000 --clients=16 --window=64 --mode=roundtrip
 
-Throughput:  106K orders/sec (9.41 µs/order)
-Latency:     p99 = 1.70 ms, p99.9 = 3.09 ms, max = 7.47 ms
+Throughput:  605K orders/sec (1.65 µs/order)
+Latency:     p99 = 1.80 ms, p99.9 = 6.75 ms, max = 7.08 ms
 ```
 
 ## License
