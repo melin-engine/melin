@@ -29,7 +29,7 @@ A matching engine built on the [LMAX architecture](https://martinfowler.com/arti
                       │   │ + RWF_DSYNC  │  │ .execute()   │                        │
                       │   └──────┬───────┘  └──────┬───────┘                        │
                       │          │                 │                                │
-                      │          │ cursor           │ output SPSC                   │
+                      │          │ cursor          │ output SPSC                    │
                       │          ▼                 ▼                                │
                       │   ┌──────────────────────────────┐                          │
                       │   │       Response Thread        │                          │
