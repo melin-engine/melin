@@ -1628,6 +1628,10 @@ fn print_results(
         "    p99.9:  {:>8.2} µs",
         histogram.value_at_quantile(0.999) as f64 / 1000.0
     );
+    println!(
+        "    p99.99: {:>8.2} µs",
+        histogram.value_at_quantile(0.9999) as f64 / 1000.0
+    );
     println!("    max:    {:>8.2} µs", histogram.max() as f64 / 1000.0);
 }
 
