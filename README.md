@@ -35,50 +35,50 @@ Clients ──TCP/UDS──> Accept Loop
 
 ## Features
 
-Checklist of features expected of a production trade execution engine. Items marked with **[x]** are implemented; **[ ]** are planned.
+Checklist of features expected of a production trade execution engine. Items marked with **[x]** are implemented; **[ ]** are planned; *deferred* items are not needed for the LAN benchmark demo.
 
 ### Order Types
 - [x] Market
 - [x] Limit
 - [x] Stop (stop-loss)
 - [x] Stop-Limit
-- [ ] ~~Iceberg (hidden quantity)~~
-- [ ] Trailing Stop
-- [ ] OCO (One-Cancels-Other)
-- [ ] Bracket (entry + take-profit + stop-loss)
+- [ ] Iceberg (hidden quantity) — *deferred*
+- [ ] Trailing Stop — *deferred*
+- [ ] OCO (One-Cancels-Other) — *deferred*
+- [ ] Bracket (entry + take-profit + stop-loss) — *deferred*
 
 ### Time-in-Force
 - [x] GTC (Good-Til-Cancelled)
 - [x] IOC (Immediate-Or-Cancel)
 - [x] FOK (Fill-Or-Kill)
-- [ ] GTD (Good-Til-Date)
-- [ ] Day
+- [ ] GTD (Good-Til-Date) — *deferred*
+- [ ] Day — *deferred*
 
 ### Execution Qualifiers
-- [ ] Post-Only (maker-only, reject if would take)
-- [ ] Reduce-Only (only decrease position size)
+- [ ] Post-Only (maker-only, reject if would take) — *deferred*
+- [ ] Reduce-Only (only decrease position size) — *deferred*
 
 ### Matching Engine
 - [x] Strict price-time priority (BTreeMap + VecDeque order book)
 - [x] Execution reports: Fill, Placed, Triggered, Cancelled, Rejected
 - [x] Multi-instrument exchange with shared account balances
-- [ ] Cancel-replace / order amendment (atomic modify without losing queue priority for unchanged price)
-- [ ] Circuit breakers (price bands, trading halts)
-- [ ] Auction mechanisms (opening/closing/volatility auctions)
+- [ ] Cancel-replace / order amendment — *deferred*
+- [ ] Circuit breakers (price bands, trading halts) — *deferred*
+- [ ] Auction mechanisms (opening/closing/volatility auctions) — *deferred*
 
 ### Fees
-- [ ] Maker/taker fee model (configurable per instrument or tier)
-- [ ] Fee deduction on fill (deduct from proceeds, include in ExecutionReport)
-- [ ] Fee schedules (volume-based tiers, account-level overrides)
+- [ ] Maker/taker fee model — *deferred*
+- [ ] Fee deduction on fill — *deferred*
+- [ ] Fee schedules (volume-based tiers) — *deferred*
 
 ### Risk & Accounting
 - [x] Per-account, per-currency balance management (reserve on order, update on fill, release on cancel)
 - [x] Self-trade prevention (per-order modes: CancelNewest, CancelOldest, CancelBoth)
-- [ ] Kill switch (cancel all orders for an account/firm)
-- [ ] Fat finger checks (max order size, max notional value)
-- [ ] Price band checks (reject orders too far from reference price)
-- [ ] Order throttling (per-account rate limiting)
-- [ ] Position/exposure limits
+- [ ] Kill switch (cancel all orders for an account/firm) — *deferred*
+- [ ] Fat finger checks (max order size, max notional value) — *deferred*
+- [ ] Price band checks (reject orders too far from reference price) — *deferred*
+- [ ] Order throttling (per-account rate limiting) — *deferred*
+- [ ] Position/exposure limits — *deferred*
 
 ### Event Sourcing & Durability ([docs/journal.md](docs/journal.md))
 - [x] Write-ahead journal with CRC32C checksums
@@ -87,10 +87,10 @@ Checklist of features expected of a production trade execution engine. Items mar
 - [x] Snapshot save/load for fast recovery
 - [x] Deterministic replay from journal
 - [x] Pipelined io_uring async fsync with group commit
-- [ ] Client deduplication (idempotency keys / sequence numbers for crash-recovery safety)
-- [ ] Journal rotation
-- [ ] Journal compaction (automatic snapshot trigger)
-- [ ] Output event log (durable ExecutionReport stream for audit trail)
+- [ ] Client deduplication (idempotency keys / sequence numbers) — *deferred*
+- [ ] Journal rotation — *deferred*
+- [ ] Journal compaction (automatic snapshot trigger) — *deferred*
+- [ ] Output event log (durable ExecutionReport stream for audit trail) — *deferred*
 
 ### Networking
 - [x] Custom binary wire protocol (length-prefixed framing)
@@ -102,23 +102,23 @@ Checklist of features expected of a production trade execution engine. Items mar
 - [x] Typed client library
 - [x] Terminal UI for interactive testing
 - [ ] Heartbeats and connection timeouts
-- [ ] Backpressure handling (defined policy when disruptor is full)
-- [ ] TLS (encrypted client connections)
-- [ ] DDoS protection (connection rate limiting, per-IP limits, max connections cap)
-- [ ] QUIC transport
-- [ ] Kernel bypass (DPDK/ef_vi)
+- [ ] Backpressure handling (defined policy when disruptor is full) — *deferred*
+- [ ] TLS (encrypted client connections) — *deferred*
+- [ ] DDoS protection (connection rate limiting, per-IP limits, max connections cap) — *deferred*
+- [ ] QUIC transport — *deferred*
+- [ ] Kernel bypass (DPDK/ef_vi) — *deferred*
 
 ### Gateway
 - [x] TCP proxy between clients and engine (binary protocol)
-- [ ] Scalable I/O model (epoll/io_uring multiplexing — current 2-threads-per-client caps at ~500 connections)
-- [ ] Market data dissemination (L2 snapshots, trade feed, BBO push updates)
-- [ ] Subscription management (subscribe/unsubscribe per instrument)
-- [ ] Reference data management (instrument lifecycle)
+- [ ] Scalable I/O model (epoll/io_uring multiplexing) — *deferred*
+- [ ] Market data dissemination (L2 snapshots, trade feed, BBO push updates) — *deferred*
+- [ ] Subscription management (subscribe/unsubscribe per instrument) — *deferred*
+- [ ] Reference data management (instrument lifecycle) — *deferred*
 
 ### Authentication & Authorization
-- [ ] Client authentication
-- [ ] Per-account trading permissions
-- [ ] Admin API (instrument management, circuit breaker controls, kill switch)
+- [ ] Client authentication — *deferred*
+- [ ] Per-account trading permissions — *deferred*
+- [ ] Admin API (instrument management, circuit breaker controls, kill switch) — *deferred*
 
 ### Operations & Reliability
 - [x] Structured logging (`tracing` crate)
@@ -129,10 +129,10 @@ Checklist of features expected of a production trade execution engine. Items mar
 - [ ] Metrics (latency histograms, throughput counters, connection counts)
 
 ### Redundancy & High Availability
-- [ ] Journal replication (WAL streaming to replica)
-- [ ] State machine replication (deterministic replay on replica)
-- [ ] Failover detection and promotion (leader election, split-brain prevention)
-- [ ] Client failover (reconnect to new primary, resume with sequence numbers)
+- [ ] Journal replication (WAL streaming to replica) — *deferred*
+- [ ] State machine replication (deterministic replay on replica) — *deferred*
+- [ ] Failover detection and promotion (leader election, split-brain prevention) — *deferred*
+- [ ] Client failover (reconnect to new primary, resume with sequence numbers) — *deferred*
 
 ### Performance Tuning
 - [x] Release profile: `lto = "fat"`, `codegen-units = 1`, `panic = "abort"`, `target-cpu=native`
