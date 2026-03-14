@@ -1,6 +1,6 @@
-# Trading Engine
+# Matching Engine
 
-A sub-millisecond, trading engine targeting **10M orders/sec**, built on the [LMAX architecture](https://martinfowler.com/articles/lmax.html) in Rust.
+A matching engine built on the [LMAX architecture](https://martinfowler.com/articles/lmax.html) in Rust.
 
 ## Architecture
 
@@ -35,42 +35,111 @@ Clients ──TCP/UDS──> Accept Loop
 
 ## Features
 
+Checklist of features expected of a production trade execution engine. Items marked with **[x]** are implemented; **[ ]** are planned.
+
+### Order Types
+- [x] Market
+- [x] Limit
+- [x] Stop (stop-loss)
+- [x] Stop-Limit
+- [ ] ~~Iceberg (hidden quantity)~~
+- [ ] Trailing Stop
+- [ ] OCO (One-Cancels-Other)
+- [ ] Bracket (entry + take-profit + stop-loss)
+
+### Time-in-Force
+- [x] GTC (Good-Til-Cancelled)
+- [x] IOC (Immediate-Or-Cancel)
+- [x] FOK (Fill-Or-Kill)
+- [ ] GTD (Good-Til-Date)
+- [ ] Day
+
+### Execution Qualifiers
+- [ ] Post-Only (maker-only, reject if would take)
+- [ ] Reduce-Only (only decrease position size)
+
 ### Matching Engine
-- Order types: Market, Limit, Stop, Stop-Limit
-- Time-in-force: GTC, IOC, FOK
-- Strict price-time priority (BTreeMap + VecDeque order book)
-- Execution reports: Fill, Placed, Triggered, Cancelled, Rejected
-- Multi-instrument exchange with shared account balances
+- [x] Strict price-time priority (BTreeMap + VecDeque order book)
+- [x] Execution reports: Fill, Placed, Triggered, Cancelled, Rejected
+- [x] Multi-instrument exchange with shared account balances
+- [ ] Cancel-replace / order amendment (atomic modify without losing queue priority for unchanged price)
+- [ ] Circuit breakers (price bands, trading halts)
+- [ ] Auction mechanisms (opening/closing/volatility auctions)
 
-### Event Sourcing
-- Write-ahead journal with CRC32C checksums
-- Batch journal I/O via disruptor ring buffer pipeline
-- Pre-allocated storage (`posix_fallocate`) for reduced fsync latency
-- Snapshot save/load for fast recovery
-- Deterministic replay from journal
-
-### Networking
-- Custom binary wire protocol (length-prefixed framing)
-- TCP transport with `TCP_NODELAY` and Unix domain socket transport
-- Epoll reader pool (edge-triggered, non-blocking) with dedicated I/O threads (zero tokio)
-- Transport abstraction (TCP/UDS now, io_uring/kernel bypass later)
-- Typed client library
-- Terminal UI for interactive testing
+### Fees
+- [ ] Maker/taker fee model (configurable per instrument or tier)
+- [ ] Fee deduction on fill (deduct from proceeds, include in ExecutionReport)
+- [ ] Fee schedules (volume-based tiers, account-level overrides)
 
 ### Risk & Accounting
-- Per-account, per-currency balance management
-- Reserve on order, update on fill, release on cancel
-- Self-trade prevention (per-order modes: CancelNewest, CancelOldest, CancelBoth)
+- [x] Per-account, per-currency balance management (reserve on order, update on fill, release on cancel)
+- [x] Self-trade prevention (per-order modes: CancelNewest, CancelOldest, CancelBoth)
+- [ ] Kill switch (cancel all orders for an account/firm)
+- [ ] Fat finger checks (max order size, max notional value)
+- [ ] Price band checks (reject orders too far from reference price)
+- [ ] Order throttling (per-account rate limiting)
+- [ ] Position/exposure limits
 
-## Build
+### Event Sourcing & Durability ([docs/journal.md](docs/journal.md))
+- [x] Write-ahead journal with CRC32C checksums
+- [x] Batch journal I/O via LMAX disruptor ring buffer pipeline
+- [x] Pre-allocated storage (`posix_fallocate`) for reduced fsync latency
+- [x] Snapshot save/load for fast recovery
+- [x] Deterministic replay from journal
+- [x] Pipelined io_uring async fsync with group commit
+- [ ] Client deduplication (idempotency keys / sequence numbers for crash-recovery safety)
+- [ ] Journal rotation
+- [ ] Journal compaction (automatic snapshot trigger)
+- [ ] Output event log (durable ExecutionReport stream for audit trail)
 
-```sh
-cargo build          # compile
-cargo run            # run server
-cargo test           # run tests
-cargo clippy         # lint
-cargo fmt            # format
-```
+### Networking
+- [x] Custom binary wire protocol (length-prefixed framing)
+- [x] TCP transport with `TCP_NODELAY`
+- [x] Unix domain socket transport
+- [x] Epoll reader pool (edge-triggered, non-blocking) with dedicated I/O threads (zero tokio)
+- [x] Lock-free CAS-based multi-producer disruptor (no mutex on input path)
+- [x] io_uring transport (separate read/write rings)
+- [x] Typed client library
+- [x] Terminal UI for interactive testing
+- [ ] Heartbeats and connection timeouts
+- [ ] Backpressure handling (defined policy when disruptor is full)
+- [ ] TLS (encrypted client connections)
+- [ ] DDoS protection (connection rate limiting, per-IP limits, max connections cap)
+- [ ] QUIC transport
+- [ ] Kernel bypass (DPDK/ef_vi)
+
+### Gateway
+- [x] TCP proxy between clients and engine (binary protocol)
+- [ ] Scalable I/O model (epoll/io_uring multiplexing — current 2-threads-per-client caps at ~500 connections)
+- [ ] Market data dissemination (L2 snapshots, trade feed, BBO push updates)
+- [ ] Subscription management (subscribe/unsubscribe per instrument)
+- [ ] Reference data management (instrument lifecycle)
+
+### Authentication & Authorization
+- [ ] Client authentication
+- [ ] Per-account trading permissions
+- [ ] Admin API (instrument management, circuit breaker controls, kill switch)
+
+### Operations & Reliability
+- [x] Structured logging (`tracing` crate)
+- [x] Per-stage pipeline latency tracing (`latency-trace` feature gate)
+- [ ] Configuration management (config file / CLI args — currently hardcoded)
+- [ ] Graceful shutdown (drain in-flight orders, flush journal)
+- [ ] Health checks / readiness probes
+- [ ] Metrics (latency histograms, throughput counters, connection counts)
+
+### Redundancy & High Availability
+- [ ] Journal replication (WAL streaming to replica)
+- [ ] State machine replication (deterministic replay on replica)
+- [ ] Failover detection and promotion (leader election, split-brain prevention)
+- [ ] Client failover (reconnect to new primary, resume with sequence numbers)
+
+### Performance Tuning
+- [x] Release profile: `lto = "fat"`, `codegen-units = 1`, `panic = "abort"`, `target-cpu=native`
+- [x] jemalloc (`tikv-jemallocator`)
+- [x] CPU core pinning for all pipeline, reader, and bench threads
+- [x] IRQ affinity pinning (`bench-isolate.sh`)
+- [x] Kernel boot isolation (`isolcpus`, `nohz_full`, `rcu_nocbs`)
 
 ## Project Structure
 
