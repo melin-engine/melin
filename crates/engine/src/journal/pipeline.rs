@@ -534,6 +534,9 @@ impl MatchingStage {
             JournalEvent::CancelOrder { symbol, order_id } => {
                 self.exchange.cancel(symbol, order_id, reports);
             }
+            JournalEvent::SetRiskLimits { symbol, limits } => {
+                self.exchange.set_risk_limits(symbol, limits);
+            }
         }
     }
 }

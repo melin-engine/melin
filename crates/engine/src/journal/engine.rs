@@ -7,7 +7,7 @@ use std::path::Path;
 
 use crate::exchange::Exchange;
 use crate::types::{
-    AccountId, CurrencyId, ExecutionReport, InstrumentSpec, Order, OrderId, Symbol,
+    AccountId, CurrencyId, ExecutionReport, InstrumentSpec, Order, OrderId, RiskLimits, Symbol,
 };
 
 use super::error::JournalError;
@@ -53,6 +53,18 @@ impl JournaledExchange {
             amount,
         })?;
         self.exchange.deposit(account, currency, amount);
+        Ok(())
+    }
+
+    /// Set risk limits for an instrument. Journals before executing.
+    pub fn set_risk_limits(
+        &mut self,
+        symbol: Symbol,
+        limits: RiskLimits,
+    ) -> Result<(), JournalError> {
+        self.writer
+            .append(&JournalEvent::SetRiskLimits { symbol, limits })?;
+        self.exchange.set_risk_limits(symbol, limits);
         Ok(())
     }
 
@@ -184,6 +196,9 @@ fn replay_event(exchange: &mut Exchange, event: &JournalEvent, reports: &mut Vec
         }
         JournalEvent::CancelOrder { symbol, order_id } => {
             exchange.cancel(symbol, order_id, reports);
+        }
+        JournalEvent::SetRiskLimits { symbol, limits } => {
+            exchange.set_risk_limits(symbol, limits);
         }
     }
 }

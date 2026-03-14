@@ -28,7 +28,9 @@ use std::path::Path;
 use crate::account::{AccountManager, Balance, Reservation};
 use crate::exchange::Exchange;
 use crate::orderbook::OrderBook;
-use crate::types::{AccountId, CurrencyId, InstrumentSpec, OrderId, Price, Quantity, Side, Symbol};
+use crate::types::{
+    AccountId, CurrencyId, InstrumentSpec, OrderId, Price, Quantity, RiskLimits, Side, Symbol,
+};
 
 use super::error::JournalError;
 use crate::le;
@@ -45,7 +47,8 @@ const SNAP_MAGIC: u32 = 0x534E_4150;
 /// Current snapshot format version.
 /// v1 → v2: added SelfTradeProtection byte to PendingStopSnapshot.
 /// v2 → v3: added per-account OrderId high-water marks for client dedup.
-const SNAP_VERSION: u16 = 3;
+/// v3 → v4: added per-instrument RiskLimits for fat finger checks.
+const SNAP_VERSION: u16 = 4;
 
 /// Snapshot header size: magic(4) + version(2) + reserved(2) + sequence(8) = 16.
 const SNAP_HEADER_SIZE: usize = 16;
@@ -160,6 +163,8 @@ pub(crate) struct ExchangeSnapshot {
     pub(crate) books: Vec<(Symbol, BookSnapshot)>,
     /// Per-account OrderId high-water marks for client deduplication.
     pub(crate) max_order_id: Vec<(AccountId, u64)>,
+    /// Per-instrument fat finger risk limits.
+    pub(crate) risk_limits: Vec<(Symbol, RiskLimits)>,
 }
 
 /// Serialized order book state for a single instrument.
@@ -247,6 +252,26 @@ fn encode_exchange_state(state: &ExchangeSnapshot, buf: &mut Vec<u8>) {
     for (account, hwm) in &state.max_order_id {
         le::push_u32(buf, account.0);
         le::push_u64(buf, *hwm);
+    }
+
+    // Per-instrument risk limits (v4+).
+    le::push_u32(buf, state.risk_limits.len() as u32);
+    for (symbol, limits) in &state.risk_limits {
+        le::push_u32(buf, symbol.0);
+        match limits.max_order_qty {
+            Some(qty) => {
+                buf.push(1);
+                le::push_u64(buf, qty.get());
+            }
+            None => buf.push(0),
+        }
+        match limits.max_order_notional {
+            Some(notional) => {
+                buf.push(1);
+                le::push_u64(buf, notional);
+            }
+            None => buf.push(0),
+        }
     }
 }
 
@@ -462,6 +487,56 @@ fn decode_exchange_state(buf: &[u8]) -> Result<(usize, ExchangeSnapshot), Journa
         pos += 12;
     }
 
+    // Per-instrument risk limits (v4+).
+    check(pos, 4)?;
+    let n_risk_limits = le::get_u32(&buf[pos..]) as usize;
+    pos += 4;
+    // Each entry is at least 6 bytes: symbol(4) + two option tags(1+1).
+    validate_count(buf.len() - pos, n_risk_limits, 6)?;
+    let mut risk_limits = Vec::with_capacity(n_risk_limits);
+    for _ in 0..n_risk_limits {
+        check(pos, 6)?;
+        let symbol = Symbol(le::get_u32(&buf[pos..]));
+        pos += 4;
+        let max_order_qty = match buf[pos] {
+            1 => {
+                pos += 1;
+                check(pos, 8)?;
+                let v = NonZeroU64::new(le::get_u64(&buf[pos..]))
+                    .ok_or(corrupt("zero max_order_qty in risk limits"))?;
+                pos += 8;
+                Some(Quantity(v))
+            }
+            0 => {
+                pos += 1;
+                None
+            }
+            _ => return Err(corrupt("invalid max_order_qty tag in risk limits")),
+        };
+        check(pos, 1)?;
+        let max_order_notional = match buf[pos] {
+            1 => {
+                pos += 1;
+                check(pos, 8)?;
+                let v = le::get_u64(&buf[pos..]);
+                pos += 8;
+                Some(v)
+            }
+            0 => {
+                pos += 1;
+                None
+            }
+            _ => return Err(corrupt("invalid max_order_notional tag in risk limits")),
+        };
+        risk_limits.push((
+            symbol,
+            RiskLimits {
+                max_order_qty,
+                max_order_notional,
+            },
+        ));
+    }
+
     Ok((
         pos,
         ExchangeSnapshot {
@@ -471,6 +546,7 @@ fn decode_exchange_state(buf: &[u8]) -> Result<(usize, ExchangeSnapshot), Journa
             order_sides,
             books,
             max_order_id,
+            risk_limits,
         },
     ))
 }
@@ -749,6 +825,7 @@ impl Exchange {
             .collect();
 
         let max_order_id = self.snapshot_max_order_id();
+        let risk_limits = self.snapshot_risk_limits();
 
         ExchangeSnapshot {
             instruments,
@@ -757,6 +834,7 @@ impl Exchange {
             order_sides,
             books,
             max_order_id,
+            risk_limits,
         }
     }
 
@@ -780,6 +858,7 @@ impl Exchange {
 
         let accounts = AccountManager::restore(state.balances, state.reservations);
         let order_sides: HashMap<OrderId, Side> = state.order_sides.into_iter().collect();
+        let risk_limits: HashMap<Symbol, RiskLimits> = state.risk_limits.into_iter().collect();
         let max_order_id: HashMap<AccountId, u64> = state.max_order_id.into_iter().collect();
 
         Self::from_parts(
@@ -787,6 +866,7 @@ impl Exchange {
             instruments_map,
             accounts,
             order_sides,
+            risk_limits,
             max_order_id,
         )
     }

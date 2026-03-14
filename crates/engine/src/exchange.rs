@@ -14,7 +14,7 @@ use crate::account::AccountManager;
 use crate::orderbook::OrderBook;
 use crate::types::{
     AccountId, CurrencyId, ExecutionReport, InstrumentSpec, Order, OrderId, OrderType,
-    RejectReason, Side, Symbol,
+    RejectReason, RiskLimits, Side, Symbol,
 };
 
 /// Top-level exchange managing multiple instruments.
@@ -31,6 +31,9 @@ pub struct Exchange {
     /// Tracks order side by ID so fills can determine buyer/seller.
     /// Populated on order submission, cleaned up on full fill or cancel.
     order_sides: HashMap<OrderId, Side>,
+    /// Per-instrument fat finger limits. Checked in `execute()` before
+    /// balance reservation. HashMap for O(1) lookup by Symbol(u32).
+    risk_limits: HashMap<Symbol, RiskLimits>,
     /// Per-account high-water mark for order IDs. Rejects submissions
     /// with `order_id <= max_seen[account]` to prevent duplicate execution
     /// on crash-recovery retry. HashMap for O(1) lookup keyed on
@@ -51,6 +54,7 @@ impl Exchange {
             instruments: HashMap::new(),
             accounts: AccountManager::new(),
             order_sides: HashMap::new(),
+            risk_limits: HashMap::new(),
             max_order_id: HashMap::new(),
             consumed_buf: Vec::new(),
             presized: false,
@@ -66,6 +70,7 @@ impl Exchange {
             instruments: HashMap::with_capacity(64),
             accounts: AccountManager::with_capacity(),
             order_sides: HashMap::with_capacity(2_000_000),
+            risk_limits: HashMap::with_capacity(64),
             max_order_id: HashMap::with_capacity(10_000),
             consumed_buf: Vec::with_capacity(256),
             presized: true,
@@ -78,6 +83,7 @@ impl Exchange {
         instruments: HashMap<Symbol, InstrumentSpec>,
         accounts: AccountManager,
         order_sides: HashMap<OrderId, Side>,
+        risk_limits: HashMap<Symbol, RiskLimits>,
         max_order_id: HashMap<AccountId, u64>,
     ) -> Self {
         Self {
@@ -85,6 +91,7 @@ impl Exchange {
             instruments,
             accounts,
             order_sides,
+            risk_limits,
             max_order_id,
             consumed_buf: Vec::new(),
             presized: false,
@@ -114,6 +121,19 @@ impl Exchange {
         self.max_order_id
             .iter()
             .map(|(&account, &hwm)| (account, hwm))
+            .collect()
+    }
+
+    /// Set fat finger risk limits for an instrument.
+    pub fn set_risk_limits(&mut self, symbol: Symbol, limits: RiskLimits) {
+        self.risk_limits.insert(symbol, limits);
+    }
+
+    /// Snapshot the per-instrument risk limits for serialization.
+    pub(crate) fn snapshot_risk_limits(&self) -> Vec<(Symbol, RiskLimits)> {
+        self.risk_limits
+            .iter()
+            .map(|(&symbol, &limits)| (symbol, limits))
             .collect()
     }
 
@@ -192,6 +212,39 @@ impl Exchange {
             return;
         }
         *hwm = order.id.0;
+
+        // Fat finger checks: reject orders exceeding per-instrument limits.
+        if let Some(limits) = self.risk_limits.get(&symbol) {
+            if let Some(max_qty) = limits.max_order_qty
+                && order.quantity.get() > max_qty.get()
+            {
+                reports.push(ExecutionReport::Rejected {
+                    order_id: order.id,
+                    reason: RejectReason::ExceedsMaxOrderQty,
+                });
+                return;
+            }
+            if let Some(max_notional) = limits.max_order_notional {
+                // Notional check applies only to orders with a known price.
+                // Market and Stop orders have no submission-time price.
+                // StopLimit uses limit_price (worst-case resting price).
+                let limit_price = match order.order_type {
+                    OrderType::Limit { price } => Some(price),
+                    OrderType::StopLimit { limit_price, .. } => Some(limit_price),
+                    OrderType::Market | OrderType::Stop { .. } => None,
+                };
+                if let Some(price) = limit_price {
+                    let notional = price.get() as u128 * order.quantity.get() as u128;
+                    if notional > max_notional as u128 {
+                        reports.push(ExecutionReport::Rejected {
+                            order_id: order.id,
+                            reason: RejectReason::ExceedsMaxNotional,
+                        });
+                        return;
+                    }
+                }
+            }
+        }
 
         // Reserve funds before submitting to the matching engine.
         let reserved = match self.accounts.try_reserve(&order, &spec) {
@@ -2231,6 +2284,166 @@ mod tests {
         );
         assert!(matches!(reports[0], ExecutionReport::Placed { .. }));
     }
+
+    // --- Fat finger checks ---
+
+    #[test]
+    fn qty_exceeds_max_rejected() {
+        let mut exchange = Exchange::new();
+        exchange.add_instrument(btc_usd_spec());
+        exchange.deposit(ACCT_A, USD, 1_000_000);
+        exchange.set_risk_limits(
+            Symbol(1),
+            RiskLimits {
+                max_order_qty: Some(qty(100)),
+                max_order_notional: None,
+            },
+        );
+
+        let mut reports = Vec::new();
+        exchange.execute(
+            Symbol(1),
+            limit_order(1, ACCT_A, Side::Buy, 100, 101, TimeInForce::GTC),
+            &mut reports,
+        );
+        assert!(matches!(
+            reports[0],
+            ExecutionReport::Rejected {
+                reason: RejectReason::ExceedsMaxOrderQty,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn qty_at_boundary_accepted() {
+        let mut exchange = Exchange::new();
+        exchange.add_instrument(btc_usd_spec());
+        exchange.deposit(ACCT_A, USD, 1_000_000);
+        exchange.set_risk_limits(
+            Symbol(1),
+            RiskLimits {
+                max_order_qty: Some(qty(100)),
+                max_order_notional: None,
+            },
+        );
+
+        let mut reports = Vec::new();
+        exchange.execute(
+            Symbol(1),
+            limit_order(1, ACCT_A, Side::Buy, 100, 100, TimeInForce::GTC),
+            &mut reports,
+        );
+        assert!(matches!(reports[0], ExecutionReport::Placed { .. }));
+    }
+
+    #[test]
+    fn notional_exceeds_max_rejected() {
+        let mut exchange = Exchange::new();
+        exchange.add_instrument(btc_usd_spec());
+        exchange.deposit(ACCT_A, USD, 1_000_000);
+        exchange.set_risk_limits(
+            Symbol(1),
+            RiskLimits {
+                max_order_qty: None,
+                max_order_notional: Some(10_000),
+            },
+        );
+
+        let mut reports = Vec::new();
+        // price 101 * qty 100 = 10100 > 10000
+        exchange.execute(
+            Symbol(1),
+            limit_order(1, ACCT_A, Side::Buy, 101, 100, TimeInForce::GTC),
+            &mut reports,
+        );
+        assert!(matches!(
+            reports[0],
+            ExecutionReport::Rejected {
+                reason: RejectReason::ExceedsMaxNotional,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn notional_at_boundary_accepted() {
+        let mut exchange = Exchange::new();
+        exchange.add_instrument(btc_usd_spec());
+        exchange.deposit(ACCT_A, USD, 1_000_000);
+        exchange.set_risk_limits(
+            Symbol(1),
+            RiskLimits {
+                max_order_qty: None,
+                max_order_notional: Some(10_000),
+            },
+        );
+
+        let mut reports = Vec::new();
+        // price 100 * qty 100 = 10000 == max
+        exchange.execute(
+            Symbol(1),
+            limit_order(1, ACCT_A, Side::Buy, 100, 100, TimeInForce::GTC),
+            &mut reports,
+        );
+        assert!(matches!(reports[0], ExecutionReport::Placed { .. }));
+    }
+
+    #[test]
+    fn market_order_skips_notional_check() {
+        let mut exchange = Exchange::new();
+        exchange.add_instrument(btc_usd_spec());
+        exchange.deposit(ACCT_A, USD, 1_000_000);
+        exchange.set_risk_limits(
+            Symbol(1),
+            RiskLimits {
+                max_order_qty: None,
+                max_order_notional: Some(1), // very low notional limit
+            },
+        );
+
+        let mut reports = Vec::new();
+        exchange.execute(
+            Symbol(1),
+            Order {
+                id: OrderId(1),
+                account: ACCT_A,
+                side: Side::Buy,
+                order_type: OrderType::Market,
+                time_in_force: TimeInForce::IOC,
+                quantity: qty(1000),
+                stp: SelfTradeProtection::Allow,
+            },
+            &mut reports,
+        );
+        // Should NOT be rejected for notional — market orders have no price.
+        // Will be rejected for NoLiquidity (empty book), which is fine.
+        assert!(!reports.iter().any(|r| matches!(
+            r,
+            ExecutionReport::Rejected {
+                reason: RejectReason::ExceedsMaxNotional,
+                ..
+            }
+        )));
+    }
+
+    #[test]
+    fn no_limits_configured_passes() {
+        let mut exchange = Exchange::new();
+        exchange.add_instrument(btc_usd_spec());
+        exchange.deposit(ACCT_A, USD, 1_000_000_000);
+        // No set_risk_limits call — all orders should pass fat finger checks.
+
+        let mut reports = Vec::new();
+        exchange.execute(
+            Symbol(1),
+            limit_order(1, ACCT_A, Side::Buy, 1_000_000, 1000, TimeInForce::GTC),
+            &mut reports,
+        );
+        assert!(matches!(reports[0], ExecutionReport::Placed { .. }));
+    }
+
+    // --- Client dedup tests (continued) ---
 
     #[test]
     fn same_order_id_different_accounts_allowed() {

@@ -41,6 +41,25 @@ pub struct InstrumentSpec {
     pub quote: CurrencyId,
 }
 
+/// Per-instrument risk limits for fat finger checks. Checked in
+/// `Exchange::execute()` before balance reservation and matching.
+///
+/// `Option` fields: `None` means "no limit" (unconfigured instruments
+/// pass all checks). Both fields use `Copy`-friendly types for zero-cost
+/// hot-path access.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RiskLimits {
+    /// Maximum order quantity (in lots). Rejects orders where
+    /// `quantity > max_order_qty`.
+    pub max_order_qty: Option<Quantity>,
+    /// Maximum order notional value (price × quantity, in ticks).
+    /// Uses `u64` for the configured ceiling — the actual comparison
+    /// uses `u128` to avoid overflow on `price.get() * quantity.get()`.
+    /// Applies only to orders with a known price (Limit, StopLimit);
+    /// Market and Stop orders skip this check.
+    pub max_order_notional: Option<u64>,
+}
+
 /// Price in ticks (fixed-point). A tick is the smallest price increment
 /// for a given instrument.
 ///
@@ -200,6 +219,11 @@ pub enum RejectReason {
     /// already submitted by this account. Prevents double-execution on
     /// crash-recovery retry.
     DuplicateOrderId,
+    /// Order quantity exceeds the instrument's configured maximum.
+    ExceedsMaxOrderQty,
+    /// Order notional (price × quantity) exceeds the instrument's
+    /// configured maximum.
+    ExceedsMaxNotional,
 }
 
 #[cfg(test)]

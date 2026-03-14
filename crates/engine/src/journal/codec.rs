@@ -29,7 +29,8 @@
 use std::num::NonZeroU64;
 
 use crate::types::{
-    AccountId, CurrencyId, InstrumentSpec, Order, OrderId, OrderType, Price, Quantity, Symbol,
+    AccountId, CurrencyId, InstrumentSpec, Order, OrderId, OrderType, Price, Quantity, RiskLimits,
+    Symbol,
 };
 
 use super::error::JournalError;
@@ -41,7 +42,8 @@ pub const FILE_MAGIC: u32 = 0x4A4F_5552;
 
 /// Current format version. Bumped on any layout change.
 /// v1 → v2: added SelfTradeProtection byte to Order encoding.
-pub const FORMAT_VERSION: u16 = 2;
+/// v2 → v3: added SetRiskLimits event for fat finger checks.
+pub const FORMAT_VERSION: u16 = 3;
 
 /// File header size in bytes.
 pub const FILE_HEADER_SIZE: usize = 8;
@@ -60,6 +62,7 @@ const TAG_ADD_INSTRUMENT: u8 = 1;
 const TAG_DEPOSIT: u8 = 2;
 const TAG_SUBMIT_ORDER: u8 = 3;
 const TAG_CANCEL_ORDER: u8 = 4;
+const TAG_SET_RISK_LIMITS: u8 = 5;
 
 /// OrderType tag encoding (codec-specific, not shared — order types are only
 /// in the journal format, not in snapshots).
@@ -140,6 +143,37 @@ pub fn encode(
             le::put_u64(&mut buf[pos..], order_id.0);
             pos += 8;
             TAG_CANCEL_ORDER
+        }
+        JournalEvent::SetRiskLimits { symbol, limits } => {
+            le::put_u32(&mut buf[pos..], symbol.0);
+            pos += 4;
+            // max_order_qty: option tag (1) + value if Some (8).
+            match limits.max_order_qty {
+                Some(qty) => {
+                    buf[pos] = 1;
+                    pos += 1;
+                    le::put_u64(&mut buf[pos..], qty.get());
+                    pos += 8;
+                }
+                None => {
+                    buf[pos] = 0;
+                    pos += 1;
+                }
+            }
+            // max_order_notional: option tag (1) + value if Some (8).
+            match limits.max_order_notional {
+                Some(notional) => {
+                    buf[pos] = 1;
+                    pos += 1;
+                    le::put_u64(&mut buf[pos..], notional);
+                    pos += 8;
+                }
+                None => {
+                    buf[pos] = 0;
+                    pos += 1;
+                }
+            }
+            TAG_SET_RISK_LIMITS
         }
     };
 
@@ -271,6 +305,79 @@ pub fn decode(buf: &[u8]) -> Result<(usize, u64, u64, JournalEvent), JournalErro
             JournalEvent::CancelOrder {
                 symbol: Symbol(le::get_u32(&payload[0..])),
                 order_id: OrderId(le::get_u64(&payload[4..])),
+            }
+        }
+        TAG_SET_RISK_LIMITS => {
+            // symbol(4) + option_tag(1) [+ qty(8)] + option_tag(1) [+ notional(8)]
+            if payload.len() < 6 {
+                return Err(JournalError::CorruptEntry {
+                    sequence,
+                    reason: "SetRiskLimits payload too short",
+                });
+            }
+            let symbol = Symbol(le::get_u32(&payload[0..]));
+            let mut p = 4;
+            let max_order_qty = match payload[p] {
+                1 => {
+                    p += 1;
+                    if p + 8 > payload.len() {
+                        return Err(JournalError::CorruptEntry {
+                            sequence,
+                            reason: "SetRiskLimits max_order_qty truncated",
+                        });
+                    }
+                    let v = NonZeroU64::new(le::get_u64(&payload[p..])).ok_or(
+                        JournalError::CorruptEntry {
+                            sequence,
+                            reason: "SetRiskLimits max_order_qty is zero",
+                        },
+                    )?;
+                    p += 8;
+                    Some(Quantity(v))
+                }
+                0 => {
+                    p += 1;
+                    None
+                }
+                _ => {
+                    return Err(JournalError::CorruptEntry {
+                        sequence,
+                        reason: "SetRiskLimits invalid max_order_qty tag",
+                    });
+                }
+            };
+            if p >= payload.len() {
+                return Err(JournalError::CorruptEntry {
+                    sequence,
+                    reason: "SetRiskLimits max_order_notional tag missing",
+                });
+            }
+            let max_order_notional = match payload[p] {
+                1 => {
+                    p += 1;
+                    if p + 8 > payload.len() {
+                        return Err(JournalError::CorruptEntry {
+                            sequence,
+                            reason: "SetRiskLimits max_order_notional truncated",
+                        });
+                    }
+                    let v = le::get_u64(&payload[p..]);
+                    Some(v)
+                }
+                0 => None,
+                _ => {
+                    return Err(JournalError::CorruptEntry {
+                        sequence,
+                        reason: "SetRiskLimits invalid max_order_notional tag",
+                    });
+                }
+            };
+            JournalEvent::SetRiskLimits {
+                symbol,
+                limits: RiskLimits {
+                    max_order_qty,
+                    max_order_notional,
+                },
             }
         }
         _ => {
@@ -507,6 +614,20 @@ mod tests {
             JournalEvent::CancelOrder {
                 symbol: Symbol(1),
                 order_id: OrderId(100),
+            },
+            JournalEvent::SetRiskLimits {
+                symbol: Symbol(1),
+                limits: RiskLimits {
+                    max_order_qty: Some(Quantity(nz(1000))),
+                    max_order_notional: Some(500_000),
+                },
+            },
+            JournalEvent::SetRiskLimits {
+                symbol: Symbol(2),
+                limits: RiskLimits {
+                    max_order_qty: None,
+                    max_order_notional: None,
+                },
             },
         ]
     }

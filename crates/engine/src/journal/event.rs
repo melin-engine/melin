@@ -4,7 +4,7 @@
 //! engine is deterministic, so replaying inputs reproduces outputs identically.
 //! This halves journal size and simplifies the format.
 
-use crate::types::{AccountId, CurrencyId, InstrumentSpec, Order, OrderId, Symbol};
+use crate::types::{AccountId, CurrencyId, InstrumentSpec, Order, OrderId, RiskLimits, Symbol};
 
 /// An input event to be journaled for replay and crash recovery.
 ///
@@ -24,4 +24,6 @@ pub enum JournalEvent {
     SubmitOrder { symbol: Symbol, order: Order },
     /// Cancel a resting or pending stop order.
     CancelOrder { symbol: Symbol, order_id: OrderId },
+    /// Set fat finger risk limits for an instrument.
+    SetRiskLimits { symbol: Symbol, limits: RiskLimits },
 }

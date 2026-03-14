@@ -57,6 +57,8 @@ const REJECT_UNKNOWN_ACCOUNT: u8 = 3;
 const REJECT_UNKNOWN_SYMBOL: u8 = 4;
 const REJECT_SELF_TRADE_PREVENTED: u8 = 5;
 const REJECT_DUPLICATE_ORDER_ID: u8 = 6;
+const REJECT_EXCEEDS_MAX_ORDER_QTY: u8 = 7;
+const REJECT_EXCEEDS_MAX_NOTIONAL: u8 = 8;
 
 /// Encode a request into `buf`. Returns total bytes written (length prefix + tag + payload).
 ///
@@ -498,6 +500,8 @@ fn encode_reject_reason(reason: RejectReason) -> u8 {
         RejectReason::UnknownSymbol => REJECT_UNKNOWN_SYMBOL,
         RejectReason::SelfTradePrevented => REJECT_SELF_TRADE_PREVENTED,
         RejectReason::DuplicateOrderId => REJECT_DUPLICATE_ORDER_ID,
+        RejectReason::ExceedsMaxOrderQty => REJECT_EXCEEDS_MAX_ORDER_QTY,
+        RejectReason::ExceedsMaxNotional => REJECT_EXCEEDS_MAX_NOTIONAL,
     }
 }
 
@@ -510,6 +514,8 @@ fn decode_reject_reason(b: u8) -> Result<RejectReason, ProtocolError> {
         REJECT_UNKNOWN_SYMBOL => Ok(RejectReason::UnknownSymbol),
         REJECT_SELF_TRADE_PREVENTED => Ok(RejectReason::SelfTradePrevented),
         REJECT_DUPLICATE_ORDER_ID => Ok(RejectReason::DuplicateOrderId),
+        REJECT_EXCEEDS_MAX_ORDER_QTY => Ok(RejectReason::ExceedsMaxOrderQty),
+        REJECT_EXCEEDS_MAX_NOTIONAL => Ok(RejectReason::ExceedsMaxNotional),
         _ => Err(ProtocolError::InvalidField("reject reason")),
     }
 }
@@ -639,6 +645,14 @@ mod tests {
             ResponseKind::Report(ExecutionReport::Rejected {
                 order_id: OrderId(11),
                 reason: RejectReason::DuplicateOrderId,
+            }),
+            ResponseKind::Report(ExecutionReport::Rejected {
+                order_id: OrderId(12),
+                reason: RejectReason::ExceedsMaxOrderQty,
+            }),
+            ResponseKind::Report(ExecutionReport::Rejected {
+                order_id: OrderId(13),
+                reason: RejectReason::ExceedsMaxNotional,
             }),
             ResponseKind::EngineError,
             ResponseKind::BatchEnd,
