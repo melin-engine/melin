@@ -39,114 +39,70 @@ use crate::uring_reader::{self as reader, ReaderRegistration};
 #[cfg(feature = "io-uring")]
 use crate::uring_response::ControlEvent;
 
-/// Server configuration.
+/// Server configuration, parsed from CLI arguments via clap.
+#[derive(clap::Parser)]
+#[command(name = "trading-server", about = "Low-latency matching engine server")]
 pub struct ServerConfig {
     /// Address to bind the TCP listener.
-    pub bind_addr: SocketAddr,
+    #[arg(long, default_value = "127.0.0.1:9876")]
+    pub bind: SocketAddr,
     /// Path to the journal file for durable event sourcing.
-    pub journal_path: PathBuf,
-    /// Optional path to a snapshot file for faster recovery.
-    pub snapshot_path: Option<PathBuf>,
-    /// CPU core IDs for pinning the 3 pipeline threads.
-    /// Order: [journal, matching, response].
-    /// Default: cores 1–3 (skips core 0 which handles kernel interrupts).
-    ///
-    /// Production recommendation: use `isolcpus` to reserve cores,
-    /// keep all cores on the same NUMA node, avoid hyperthreading
-    /// siblings for latency-sensitive threads.
-    pub core_affinity: [usize; 3],
-    /// Group commit coalescing window for the journal stage. The journal
-    /// waits up to this duration after the first unsynced write before
-    /// issuing fsync, allowing more events to accumulate in the batch.
-    /// Under high load the batch fills naturally and the delay rarely
-    /// fires. Zero means sync immediately after each batch read.
-    ///
-    /// **TCP**: keep at zero. Any delay holds the journal cursor longer,
-    /// making the response stage block and accumulate larger TCP sends.
-    /// The io_uring overlapped fsync already provides natural batching.
-    /// **UDS**: 100µs improves throughput ~25% since transport is near-free.
-    pub group_commit_delay: std::time::Duration,
-    /// Number of epoll reader threads. Each thread multiplexes a subset
-    /// of connections via epoll. Connections are assigned round-robin.
-    /// Default: 2 (enough for ~100 connections without oversubscription).
-    pub reader_threads: usize,
-    /// First CPU core for reader thread pinning. Reader thread `i` is
-    /// pinned to core `reader_core_start + i`. Placed after the pipeline
-    /// cores (1-3) to avoid cache contention.
-    /// Default: 4 (reader-0 → core 4, reader-1 → core 5).
-    pub reader_core_start: usize,
+    #[arg(long, default_value = "trading.journal")]
+    pub journal: PathBuf,
+    /// Path to a snapshot file for faster recovery.
+    #[arg(long)]
+    pub snapshot: Option<PathBuf>,
+    /// Pipeline core IDs: journal,matching,response (comma-separated).
+    /// Core 0 is reserved for OS/IRQ handling.
+    #[arg(long, default_value = "1,2,3", value_parser = parse_cores)]
+    pub cores: [usize; 3],
+    /// Number of epoll reader threads.
+    #[arg(long, default_value_t = 2)]
+    pub readers: usize,
+    /// First CPU core for reader thread pinning. Reader thread i is
+    /// pinned to reader_cores + i.
+    #[arg(long, default_value_t = 4)]
+    pub reader_cores: usize,
+    /// Group commit coalescing delay in microseconds. Keep at 0 for TCP.
+    #[arg(long, default_value_t = 0)]
+    pub group_commit_us: u64,
 }
 
 impl Default for ServerConfig {
     fn default() -> Self {
         Self {
-            bind_addr: "127.0.0.1:9876".parse().expect("valid default addr"),
-            journal_path: PathBuf::from("trading.journal"),
-            snapshot_path: None,
-            core_affinity: [1, 2, 3],
-            group_commit_delay: std::time::Duration::ZERO,
-            reader_threads: 2,
-            reader_core_start: 4,
+            bind: "127.0.0.1:9876".parse().expect("valid default addr"),
+            journal: PathBuf::from("trading.journal"),
+            snapshot: None,
+            cores: [1, 2, 3],
+            readers: 2,
+            reader_cores: 4,
+            group_commit_us: 0,
         }
     }
 }
 
 impl ServerConfig {
-    /// Build a `ServerConfig` from CLI arguments, falling back to defaults.
-    ///
-    /// Supported flags:
-    /// - `--bind=<addr>` — listen address (default: 127.0.0.1:9876)
-    /// - `--journal=<path>` — journal file path (default: trading.journal)
-    /// - `--snapshot=<path>` — snapshot file path (default: none)
-    /// - `--cores=<j,m,r>` — pipeline core IDs (default: 1,2,3)
-    /// - `--readers=<n>` — reader thread count (default: 2)
-    /// - `--reader-cores=<start>` — first reader core ID (default: 4)
-    /// - `--group-commit-us=<n>` — group commit delay in microseconds (default: 0)
-    pub fn from_args(args: &[String]) -> Result<Self, String> {
-        let mut config = Self::default();
-
-        if let Some(v) = parse_flag::<SocketAddr>(args, "--bind=") {
-            config.bind_addr = v;
-        }
-        if let Some(v) = parse_flag::<String>(args, "--journal=") {
-            config.journal_path = PathBuf::from(v);
-        }
-        if let Some(v) = parse_flag::<String>(args, "--snapshot=") {
-            config.snapshot_path = Some(PathBuf::from(v));
-        }
-        if let Some(v) = parse_flag::<String>(args, "--cores=") {
-            let cores: Vec<&str> = v.split(',').collect();
-            if cores.len() != 3 {
-                return Err(format!(
-                    "--cores expects 3 comma-separated core IDs (got {})",
-                    cores.len()
-                ));
-            }
-            let mut affinity = [0usize; 3];
-            for (i, c) in cores.iter().enumerate() {
-                affinity[i] = c.parse().map_err(|_| format!("invalid core ID: {c}"))?;
-            }
-            config.core_affinity = affinity;
-        }
-        if let Some(v) = parse_flag::<usize>(args, "--readers=") {
-            config.reader_threads = v;
-        }
-        if let Some(v) = parse_flag::<usize>(args, "--reader-cores=") {
-            config.reader_core_start = v;
-        }
-        if let Some(v) = parse_flag::<u64>(args, "--group-commit-us=") {
-            config.group_commit_delay = std::time::Duration::from_micros(v);
-        }
-
-        Ok(config)
+    /// Group commit delay as a Duration.
+    pub fn group_commit_delay(&self) -> std::time::Duration {
+        std::time::Duration::from_micros(self.group_commit_us)
     }
 }
 
-/// Parse a `--key=value` flag from an argument list.
-fn parse_flag<T: std::str::FromStr>(args: &[String], prefix: &str) -> Option<T> {
-    args.iter()
-        .find_map(|a| a.strip_prefix(prefix))
-        .and_then(|s| s.parse().ok())
+/// Parse "j,m,r" into [usize; 3] for pipeline core affinity.
+fn parse_cores(s: &str) -> Result<[usize; 3], String> {
+    let parts: Vec<&str> = s.split(',').collect();
+    if parts.len() != 3 {
+        return Err(format!(
+            "expected 3 comma-separated core IDs, got {}",
+            parts.len()
+        ));
+    }
+    let mut cores = [0usize; 3];
+    for (i, p) in parts.iter().enumerate() {
+        cores[i] = p.parse().map_err(|_| format!("invalid core ID: {p}"))?;
+    }
+    Ok(cores)
 }
 
 /// Run the trading server.
@@ -186,7 +142,7 @@ pub fn run_with_shutdown<L: BlockingTransportListener>(
 
     // Build the disruptor pipeline.
     let (input_producer, journal_stage, matching_stage, output_consumer, journal_cursor) =
-        build_pipeline(exchange, writer, config.group_commit_delay);
+        build_pipeline(exchange, writer, config.group_commit_delay());
 
     // Control channel for connect/disconnect events → response stage.
     let (control_tx, control_rx) = std::sync::mpsc::channel();
@@ -197,14 +153,14 @@ pub fn run_with_shutdown<L: BlockingTransportListener>(
     // disruptor. With 2 readers (cores 4-5) + 3 pipeline (cores 1-3) =
     // 5 pinned OS threads, no oversubscription even with hundreds of connections.
     let mut reader_handle = reader::spawn_reader_pool(
-        config.reader_threads,
+        config.readers,
         input_producer,
         control_tx.clone(),
-        config.reader_core_start,
+        config.reader_cores,
     );
 
     // Spawn pipeline OS threads.
-    let cores = config.core_affinity;
+    let cores = config.cores;
 
     let s1 = Arc::clone(&shutdown);
     let journal_handle = std::thread::Builder::new()
@@ -236,7 +192,7 @@ pub fn run_with_shutdown<L: BlockingTransportListener>(
         })
         .expect("failed to spawn response thread");
 
-    info!(addr = %config.bind_addr, "listening");
+    info!(addr = %config.bind, "listening");
 
     // Monotonically increasing connection ID counter. AtomicU64 because
     // the accept loop is the only writer, but using atomic for future
@@ -306,22 +262,22 @@ pub fn run_with_shutdown<L: BlockingTransportListener>(
 
 /// Initialize or recover the JournaledExchange from disk.
 fn init_engine(config: &ServerConfig) -> Result<JournaledExchange, Box<dyn std::error::Error>> {
-    if let Some(ref snap_path) = config.snapshot_path
+    if let Some(ref snap_path) = config.snapshot
         && snap_path.exists()
-        && config.journal_path.exists()
+        && config.journal.exists()
     {
         info!("recovering from snapshot + journal");
-        let engine = JournaledExchange::recover_from_snapshot(snap_path, &config.journal_path)?;
+        let engine = JournaledExchange::recover_from_snapshot(snap_path, &config.journal)?;
         return Ok(engine);
     }
 
-    if config.journal_path.exists() {
+    if config.journal.exists() {
         info!("recovering from journal");
-        let engine = JournaledExchange::recover(&config.journal_path)?;
+        let engine = JournaledExchange::recover(&config.journal)?;
         Ok(engine)
     } else {
         info!("creating new journal");
-        let mut engine = JournaledExchange::create(&config.journal_path)?;
+        let mut engine = JournaledExchange::create(&config.journal)?;
         seed_test_data(&mut engine)?;
         Ok(engine)
     }

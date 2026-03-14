@@ -26,6 +26,7 @@ path = "src/main.rs"
 trading-engine = { path = "../engine" }
 trading-disruptor = { path = "../disruptor" }
 trading-protocol = { path = "../protocol" }
+clap = { workspace = true }
 libc = { workspace = true }
 tracing = { workspace = true }
 tikv-jemallocator = { workspace = true }

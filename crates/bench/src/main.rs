@@ -132,6 +132,36 @@ fn maybe_sample(
     }
 }
 
+/// Benchmark CLI arguments.
+#[derive(clap::Parser)]
+#[command(name = "trading-bench", about = "Matching engine benchmark suite")]
+struct BenchArgs {
+    /// Benchmark mode: roundtrip (full server), pipeline (no network), engine (matching only).
+    #[arg(long, default_value = "roundtrip")]
+    mode: String,
+    /// Use Unix domain sockets instead of TCP (roundtrip mode only).
+    #[arg(long)]
+    uds: bool,
+    /// Connect to a remote engine instead of spawning an embedded server (roundtrip mode only).
+    #[arg(long)]
+    addr: Option<std::net::SocketAddr>,
+    /// Number of order pairs (buy + sell) to benchmark.
+    #[arg(default_value_t = DEFAULT_PAIRS)]
+    pairs: usize,
+    /// Orders in flight per client (pipelining depth).
+    #[arg(long, default_value_t = DEFAULT_WINDOW)]
+    window: usize,
+    /// Number of concurrent client connections.
+    #[arg(long, default_value_t = DEFAULT_CLIENTS)]
+    clients: usize,
+    /// Number of bench client threads (ignored with io-uring).
+    #[arg(long, default_value_t = DEFAULT_BENCH_THREADS)]
+    bench_threads: usize,
+    /// Group commit coalescing delay in microseconds.
+    #[arg(long, default_value_t = 0)]
+    group_commit_us: u64,
+}
+
 fn main() {
     // Initialize tracing so pipeline-stats and latency-trace output is visible.
     tracing_subscriber::fmt()
@@ -139,57 +169,30 @@ fn main() {
         .with_thread_names(true)
         .init();
 
-    let args: Vec<String> = std::env::args().skip(1).collect();
-    let mode: String = parse_flag(&args, "--mode=").unwrap_or_else(|| "roundtrip".into());
-    let use_uds = args.iter().any(|a| a == "--uds");
+    let args = <BenchArgs as clap::Parser>::parse();
 
-    let pairs: usize = args
-        .iter()
-        .filter(|a| !a.starts_with("--"))
-        .find_map(|s| s.parse().ok())
-        .unwrap_or(DEFAULT_PAIRS);
-
-    match mode.as_str() {
+    match args.mode.as_str() {
         "engine" => {
-            warn_ignored_flags(
-                &args,
-                &[
-                    "--clients=",
-                    "--bench-threads=",
-                    "--window=",
-                    "--group-commit-us=",
-                    "--uds",
-                ],
-            );
-            run_engine_bench(pairs);
+            run_engine_bench(args.pairs);
         }
         "pipeline" => {
-            warn_ignored_flags(&args, &["--clients=", "--bench-threads=", "--uds"]);
-            let window: usize = parse_flag(&args, "--window=").unwrap_or(DEFAULT_WINDOW);
-            let group_commit_us: u64 = parse_flag(&args, "--group-commit-us=").unwrap_or(0);
-            run_pipeline_bench(pairs, window, group_commit_us);
+            run_pipeline_bench(args.pairs, args.window, args.group_commit_us);
         }
         "roundtrip" => {
-            let window: usize = parse_flag(&args, "--window=").unwrap_or(DEFAULT_WINDOW);
-            let group_commit_us: u64 = parse_flag(&args, "--group-commit-us=").unwrap_or(0);
-            let num_clients: usize = parse_flag(&args, "--clients=").unwrap_or(DEFAULT_CLIENTS);
-            let bench_threads: usize =
-                parse_flag(&args, "--bench-threads=").unwrap_or(DEFAULT_BENCH_THREADS);
             #[cfg(feature = "io-uring")]
-            if args.iter().any(|a| a.starts_with("--bench-threads=")) {
+            if args.bench_threads != DEFAULT_BENCH_THREADS {
                 eprintln!(
                     "warning: --bench-threads is ignored with io-uring (single-threaded event loop)"
                 );
             }
-            let remote_addr: Option<std::net::SocketAddr> = parse_flag(&args, "--addr=");
             run_roundtrip_bench(
-                use_uds,
-                pairs,
-                window,
-                num_clients,
-                bench_threads,
-                group_commit_us,
-                remote_addr,
+                args.uds,
+                args.pairs,
+                args.window,
+                args.clients,
+                args.bench_threads,
+                args.group_commit_us,
+                args.addr,
             );
         }
         other => {
@@ -524,9 +527,9 @@ fn run_roundtrip_bench(
     let journal_path = tmp_dir.join("bench.journal");
 
     let config = ServerConfig {
-        journal_path,
-        snapshot_path: None,
-        group_commit_delay: Duration::from_micros(group_commit_us),
+        journal: journal_path,
+        snapshot: None,
+        group_commit_us,
         ..ServerConfig::default()
     };
 
@@ -584,23 +587,6 @@ fn run_roundtrip_bench(
     }
 
     let _ = std::fs::remove_dir_all(&tmp_dir);
-}
-
-/// Parse a `--key=value` flag from the argument list.
-fn parse_flag<T: std::str::FromStr>(args: &[String], prefix: &str) -> Option<T> {
-    args.iter()
-        .find_map(|a| a.strip_prefix(prefix))
-        .and_then(|s| s.parse().ok())
-}
-
-/// Warn if the user passed flags that are ignored in the current mode.
-fn warn_ignored_flags(args: &[String], ignored: &[&str]) {
-    for &prefix in ignored {
-        if args.iter().any(|a| a.starts_with(prefix) || a == prefix) {
-            let name = prefix.trim_end_matches('=');
-            eprintln!("warning: {name} is ignored in this mode");
-        }
-    }
 }
 
 /// Start the server on a background thread. The listener is already bound,

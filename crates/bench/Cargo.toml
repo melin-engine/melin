@@ -21,6 +21,7 @@ trading-engine = { path = "../engine" }
 trading-disruptor = { path = "../disruptor" }
 trading-protocol = { path = "../protocol" }
 trading-server = { path = "../server" }
+clap = { workspace = true }
 hdrhistogram = "7"
 libc = { workspace = true }
 tikv-jemallocator = { workspace = true }
