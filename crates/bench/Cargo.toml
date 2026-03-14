@@ -23,6 +23,7 @@ trading-protocol = { path = "../protocol" }
 trading-server = { path = "../server" }
 clap = { workspace = true }
 hdrhistogram = "7"
+rand = "0.9"
 libc = { workspace = true }
 tikv-jemallocator = { workspace = true }
 tracing-subscriber = { workspace = true }

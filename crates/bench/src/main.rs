@@ -15,13 +15,16 @@
 //! in a tight loop — no disruptor, no journal, no I/O. Measures pure matching
 //! engine throughput and latency.
 //!
-//! All modes use self-trade pairs (buy then sell at the same price from the same
-//! account — net zero balance change, unlimited cycles).
+//! All modes use the realistic order flow generator: a mix of limit orders and
+//! cancels with power-law price/size distributions, multiple accounts, and
+//! resting book depth. Events are pre-generated before the measured run.
 //!
 //! Usage:
 //!     cargo run --release -p trading-bench [-- [--mode=roundtrip|pipeline|engine] [--uds] [--addr=<ip:port>] [--clients=N] [--window=N] [--group-commit-us=N] [--bench-threads=N] <order_pairs>]
 //!
 //! Default: roundtrip mode, TCP transport, 1 client, 1,000,000 order pairs.
+
+mod generator;
 
 /// jemalloc: thread-local caches eliminate allocator lock contention,
 /// giving more predictable latency than glibc malloc under high throughput.
@@ -45,7 +48,7 @@ use trading_engine::types::*;
 #[cfg(not(feature = "io-uring"))]
 use trading_protocol::blocking::BlockingFrameWriter;
 use trading_protocol::codec;
-use trading_protocol::message::{Request, ResponseKind};
+use trading_protocol::message::ResponseKind;
 use trading_protocol::transport::BlockingTransportListener;
 use trading_server::server::ServerConfig;
 
@@ -255,15 +258,15 @@ fn main() {
 // Engine-only benchmark
 // ===========================================================================
 
-/// Pure matching engine benchmark. Calls `Exchange::execute()` directly in a
-/// tight loop with no disruptor, journal, or I/O. Measures the raw cost of
-/// order matching and balance management.
+/// Engine-only benchmark with realistic order flow. Calls `Exchange::execute()`
+/// and `Exchange::cancel()` directly in a tight loop — no disruptor, no journal,
+/// no I/O. Uses the generator to produce a mix of limit orders and cancels with
+/// power-law price/size distributions, multiple accounts, and resting book depth.
+/// All events are pre-generated before the measured run so RNG overhead doesn't
+/// pollute per-order timing.
 fn run_engine_bench(total_pairs: usize, warmup: usize) {
-    let nz = |v: u64| NonZeroU64::new(v).expect("non-zero");
+    use generator::{GeneratedEvent, GeneratorConfig, OrderFlowGenerator};
 
-    // Calibrate TSC for low-overhead per-order timing (~4ns vs ~20ns for
-    // Instant::now). The engine-only loop is tight enough that clock_gettime
-    // overhead is visible in the histogram.
     #[cfg(target_arch = "x86_64")]
     let ticks_per_ns = calibrate_tsc();
     #[cfg(target_arch = "x86_64")]
@@ -272,45 +275,54 @@ fn run_engine_bench(total_pairs: usize, warmup: usize) {
         ticks_per_ns, ticks_per_ns
     );
 
+    let config = GeneratorConfig::default();
+    let num_accounts = config.num_accounts;
+    let num_instruments = config.num_instruments;
+
     let mut exchange = trading_engine::exchange::Exchange::with_capacity();
-    exchange.add_instrument(InstrumentSpec {
-        symbol: Symbol(1),
-        base: CurrencyId(1),
-        quote: CurrencyId(2),
-    });
-    // Deposit enough for all orders. Each buy reserves price(100) * qty(1) = 100
-    // quote currency, each sell reserves 1 base currency. Self-trades release
-    // immediately, so a generous initial deposit avoids balance exhaustion.
-    exchange.deposit(AccountId(1), CurrencyId(1), u64::MAX / 2);
-    exchange.deposit(AccountId(1), CurrencyId(2), u64::MAX / 2);
+
+    // Register instruments.
+    for i in 1..=num_instruments {
+        exchange.add_instrument(InstrumentSpec {
+            symbol: Symbol(i),
+            base: CurrencyId(i * 2 - 1),
+            quote: CurrencyId(i * 2),
+        });
+    }
+
+    // Deposit generous balances for all accounts across all currencies.
+    for acct in 1..=num_accounts {
+        for i in 1..=num_instruments {
+            exchange.deposit(AccountId(acct), CurrencyId(i * 2 - 1), u64::MAX / 4);
+            exchange.deposit(AccountId(acct), CurrencyId(i * 2), u64::MAX / 4);
+        }
+    }
 
     exchange.prefault();
 
-    let total_orders = warmup + total_pairs * 2;
+    let total_events = warmup + total_pairs * 2;
+
+    // Pre-generate all events so RNG overhead doesn't pollute timing.
+    eprintln!("Pre-generating {total_events} events...");
+    let mut flow = OrderFlowGenerator::new(config);
+    let events = flow.generate_events(total_events);
+    eprintln!("Pre-generation complete.");
+
     let mut reports = Vec::with_capacity(256);
     let mut histogram =
         Histogram::<u64>::new_with_bounds(1, 10_000_000_000, 3).expect("histogram bounds");
 
-    // Warmup: prime caches and allocator.
-    for i in 0..warmup {
-        let order_id = OrderId((i as u64) + 1);
-        let side = if i % 2 == 0 { Side::Buy } else { Side::Sell };
+    // Warmup.
+    for event in &events[..warmup] {
         reports.clear();
-        exchange.execute(
-            Symbol(1),
-            Order {
-                id: order_id,
-                account: AccountId(1),
-                side,
-                order_type: OrderType::Limit {
-                    price: Price(nz(100)),
-                },
-                time_in_force: TimeInForce::GTC,
-                quantity: Quantity(nz(1)),
-                stp: SelfTradeProtection::Allow,
-            },
-            &mut reports,
-        );
+        match *event {
+            GeneratedEvent::Submit { symbol, order } => {
+                exchange.execute(symbol, order, &mut reports);
+            }
+            GeneratedEvent::Cancel { symbol, order_id } => {
+                exchange.cancel(symbol, order_id, &mut reports);
+            }
+        }
     }
 
     // Measured run.
@@ -322,34 +334,28 @@ fn run_engine_bench(total_pairs: usize, warmup: usize) {
     #[cfg(feature = "chart")]
     let mut series: TimeSeries = Vec::new();
 
+    let mut submits: u64 = 0;
+    let mut cancels: u64 = 0;
+
     let start = Instant::now();
-    for i in warmup..total_orders {
-        let order_id = OrderId((i as u64) + 1);
-        let side = if i % 2 == 0 { Side::Buy } else { Side::Sell };
+    for event in &events[warmup..] {
         reports.clear();
 
-        // Use rdtscp for per-order timing on x86_64 (~4ns overhead).
-        // Fall back to Instant::now() on other architectures.
         #[cfg(target_arch = "x86_64")]
         let t0 = rdtscp();
         #[cfg(not(target_arch = "x86_64"))]
         let t0 = Instant::now();
 
-        exchange.execute(
-            Symbol(1),
-            Order {
-                id: order_id,
-                account: AccountId(1),
-                side,
-                order_type: OrderType::Limit {
-                    price: Price(nz(100)),
-                },
-                time_in_force: TimeInForce::GTC,
-                quantity: Quantity(nz(1)),
-                stp: SelfTradeProtection::Allow,
-            },
-            &mut reports,
-        );
+        match *event {
+            GeneratedEvent::Submit { symbol, order } => {
+                exchange.execute(symbol, order, &mut reports);
+                submits += 1;
+            }
+            GeneratedEvent::Cancel { symbol, order_id } => {
+                exchange.cancel(symbol, order_id, &mut reports);
+                cancels += 1;
+            }
+        }
 
         #[cfg(target_arch = "x86_64")]
         let elapsed_ns = tsc_to_ns(rdtscp() - t0, ticks_per_ns);
@@ -366,13 +372,23 @@ fn run_engine_bench(total_pairs: usize, warmup: usize) {
     }
     let wall = start.elapsed();
 
+    let measured = events.len() - warmup;
+    let cancel_pct = if submits + cancels > 0 {
+        cancels as f64 / (submits + cancels) as f64 * 100.0
+    } else {
+        0.0
+    };
+
     print_results(
-        "Engine-Only",
-        total_pairs * 2,
+        "Realistic Order Flow",
+        measured,
         warmup,
         &histogram,
         wall,
-        &[],
+        &[
+            format!("  Accounts: {num_accounts}, Instruments: {num_instruments}"),
+            format!("  Submits: {submits}, Cancels: {cancels} ({cancel_pct:.1}% cancel)"),
+        ],
     );
     #[cfg(feature = "chart")]
     show_chart(&series);
@@ -555,6 +571,7 @@ fn drain_output(
 /// When `remote_addr` is `Some`, connects to a remote engine instead of
 /// spawning an embedded server. This is the mode used for LAN benchmarks
 /// where the engine runs on a separate machine.
+#[allow(clippy::too_many_arguments)]
 fn run_roundtrip_bench(
     use_uds: bool,
     pairs: usize,
@@ -1097,7 +1114,15 @@ fn run_epoll_roundtrip<R, W, F>(
             })
             .sum();
 
-        let frames = encode_frames(total_orders, order_id_offset);
+        let frames = {
+            let mut flow = generator::OrderFlowGenerator::new(generator::GeneratorConfig {
+                // Use 2 accounts to match server seed data.
+                num_accounts: 2,
+                start_order_id: order_id_offset + 1,
+                ..Default::default()
+            });
+            flow.generate_frames(total_orders)
+        };
 
         let conn = BenchConnection {
             writer,
@@ -1190,6 +1215,7 @@ fn run_epoll_roundtrip<R, W, F>(
 /// RECV for reads and io_uring SEND for writes, replacing the multi-threaded
 /// epoll + blocking-write approach.
 #[cfg(feature = "io-uring")]
+#[allow(clippy::too_many_arguments)]
 fn run_uring_roundtrip<R, W, F>(
     connect: F,
     transport_name: &str,
@@ -1236,7 +1262,14 @@ fn run_uring_roundtrip<R, W, F>(
             })
             .sum();
 
-        let frames = encode_frames(total_orders, order_id_offset);
+        let frames = {
+            let mut flow = generator::OrderFlowGenerator::new(generator::GeneratorConfig {
+                num_accounts: 2,
+                start_order_id: order_id_offset + 1,
+                ..Default::default()
+            });
+            flow.generate_frames(total_orders)
+        };
 
         connections.push(UringBenchConn {
             read_fd,
@@ -1572,38 +1605,6 @@ fn send_pending<W: Write>(connections: &mut [BenchConnection<W>], window: usize)
             conn.writer.flush().expect("flush");
         }
     }
-}
-
-/// Pre-encode all request frames for one connection.
-fn encode_frames(total_orders: usize, order_id_offset: u64) -> Vec<Vec<u8>> {
-    let nz = |v: u64| NonZeroU64::new(v).expect("non-zero");
-    let mut frames = Vec::with_capacity(total_orders);
-    let mut encode_buf = [0u8; 128];
-
-    for i in 0..total_orders {
-        let order_id = OrderId(order_id_offset + (i as u64) + 1);
-        let side = if i % 2 == 0 { Side::Buy } else { Side::Sell };
-
-        let request = Request::SubmitOrder {
-            symbol: Symbol(1),
-            order: Order {
-                id: order_id,
-                account: AccountId(1),
-                side,
-                order_type: OrderType::Limit {
-                    price: Price(nz(100)),
-                },
-                time_in_force: TimeInForce::GTC,
-                quantity: Quantity(nz(1)),
-                stp: SelfTradeProtection::Allow,
-            },
-        };
-
-        let written = codec::encode_request(&request, &mut encode_buf).expect("encode");
-        frames.push(encode_buf[4..written].to_vec());
-    }
-
-    frames
 }
 
 // ===========================================================================

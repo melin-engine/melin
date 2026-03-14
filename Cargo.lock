@@ -1156,6 +1156,7 @@ dependencies = [
  "hdrhistogram",
  "io-uring",
  "libc",
+ "rand",
  "ratatui",
  "tikv-jemallocator",
  "tracing-subscriber",
