@@ -246,17 +246,23 @@ impl OrderFlowGenerator {
                 order_type,
                 time_in_force,
                 quantity,
-                stp: SelfTradeProtection::Allow,
+                stp: self.pick_stp(),
             },
         }
     }
 
     fn generate_cancel(&mut self) -> GeneratedEvent {
-        let idx = Uniform::new(0, self.live_count)
-            .expect("valid range")
-            .sample(&mut self.rng);
+        // Bias toward recent orders (high index = newest). In real markets,
+        // cancels are dominated by rapid quote updates (cancel-replace) on
+        // recent orders. Use U^2 to skew the distribution toward the
+        // newest entries: squaring a uniform [0,1) concentrates mass near 1.
+        let u: f64 = self.unit_dist.sample(&mut self.rng);
+        let biased = u * u; // skew toward 1.0 (newest)
+        let idx = (biased * self.live_count as f64) as usize;
+        let idx = idx.min(self.live_count - 1);
 
         let cap = self.live_orders.len();
+        // Ring entries are oldest-first: index 0 = oldest, live_count-1 = newest.
         let ring_idx = (self.live_cursor + cap - self.live_count + idx) % cap;
         let (order_id, symbol) = self.live_orders[ring_idx];
 
@@ -325,6 +331,21 @@ impl OrderFlowGenerator {
         let raw = self.config.min_size as f64 * (1.0 - u).powf(-1.0 / (alpha - 1.0));
         let size = (raw as u64).clamp(self.config.min_size, self.config.max_size);
         Quantity(NonZeroU64::new(size).expect("size > 0"))
+    }
+
+    /// Pick a self-trade prevention mode. Most orders use Allow (70%),
+    /// with the three active modes sharing the remainder.
+    fn pick_stp(&mut self) -> SelfTradeProtection {
+        let u: f64 = self.unit_dist.sample(&mut self.rng);
+        if u < 0.70 {
+            SelfTradeProtection::Allow
+        } else if u < 0.80 {
+            SelfTradeProtection::CancelNewest
+        } else if u < 0.90 {
+            SelfTradeProtection::CancelOldest
+        } else {
+            SelfTradeProtection::CancelBoth
+        }
     }
 }
 
