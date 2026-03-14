@@ -3,6 +3,7 @@
 #
 # Usage:
 #   sudo ./scripts/bench-isolate.sh [bench args]
+#   BENCH_PERF=1 sudo ./scripts/bench-isolate.sh [bench args]   # with perf profiling
 #
 # Optimizations applied:
 #   1. CPU governor → performance (lock max frequency, no scaling transitions)
@@ -140,11 +141,55 @@ else
     echo "  rcu_nocbs: (not set)"
 fi
 
+# --- Capture SMI count before benchmark ---
+# SMIs (System Management Interrupts) are firmware-level interrupts that
+# cannot be disabled from userspace. They pause the CPU for 50-200 µs,
+# showing up as unexplained max latency spikes. The IA32_SMI_COUNT MSR
+# (0x34) counts total SMIs since boot — we diff before/after to detect
+# SMIs during the benchmark.
+SMI_BEFORE=""
+SMI_AFTER=""
+echo ""
+echo "=== SMI tracking ==="
+if command -v rdmsr &>/dev/null; then
+    modprobe msr 2>/dev/null || true
+    # Read from CPU 0 explicitly — rdmsr defaults to all CPUs which can fail.
+    SMI_BEFORE=$(rdmsr -p 0 0x34 2>/dev/null || true)
+    if [[ -n "$SMI_BEFORE" ]]; then
+        echo "  SMI count before: ${SMI_BEFORE} (IA32_SMI_COUNT MSR 0x34, CPU 0)"
+    else
+        echo "  (failed to read MSR 0x34 — check: ls /dev/cpu/0/msr)"
+    fi
+else
+    echo "  (skipped — install msr-tools: sudo apt install msr-tools)"
+fi
+
 # --- Capture dmesg before benchmark ---
 
 DMESG_BEFORE=$(mktemp /tmp/bench-dmesg-before.XXXXXX)
 DMESG_AFTER=$(mktemp /tmp/bench-dmesg-after.XXXXXX)
 dmesg --time-format iso > "$DMESG_BEFORE"
+
+# --- Start perf profiling if requested ---
+# Captures kernel-level activity on pipeline/reader/bench cores (1+) during
+# the benchmark. Helps identify periodic kernel interrupts (khugepaged,
+# vmstat, kworker) that cause tail latency spikes.
+# WARNING: perf sampling itself introduces NMI-like interrupts that degrade
+# latency (~20% throughput drop). Only enable for diagnosis, not for
+# publishable benchmark numbers.
+PERF_DATA=""
+PERF_PID=""
+if [[ "${BENCH_PERF:-0}" == "1" ]] && command -v perf &>/dev/null; then
+    PERF_DATA=$(mktemp /tmp/bench-perf.XXXXXX.data)
+    # Sample kernel stacks on cores 1+ at 997 Hz (prime to avoid aliasing).
+    # --call-graph=fp for frame pointer-based stack traces.
+    perf record -a -g --call-graph=fp -F 997 -C 1-15 -o "$PERF_DATA" &
+    PERF_PID=$!
+    echo "=== Perf profiling ==="
+    echo "  Recording kernel activity on cores 1-15 (PID ${PERF_PID})"
+    echo "  WARNING: perf sampling degrades latency — results are diagnostic only"
+    echo ""
+fi
 
 echo "=== Running benchmark ==="
 echo ""
@@ -155,6 +200,42 @@ echo ""
 CARGO_BIN="$(sudo -u "${SUDO_USER}" bash -lc 'which cargo')"
 sudo -u "${SUDO_USER}" \
     "$CARGO_BIN" run --release -p trading-bench "$@"
+
+# --- Stop perf and show summary ---
+if [[ -n "$PERF_PID" ]]; then
+    kill -INT "$PERF_PID" 2>/dev/null || true
+    wait "$PERF_PID" 2>/dev/null || true
+    echo ""
+    echo "=== Perf summary (kernel activity on cores 1-15) ==="
+    # Show top functions by overhead — kernel functions causing interruptions.
+    perf report -i "$PERF_DATA" --stdio --no-children --percent-limit=0.5 2>/dev/null \
+        | head -40 || echo "  (perf report failed)"
+    echo ""
+    echo "  Full report: perf report -i ${PERF_DATA}"
+    echo "  (file preserved for manual inspection)"
+fi
+
+# --- Check SMI count after benchmark ---
+
+if [[ -n "$SMI_BEFORE" ]]; then
+    SMI_AFTER=$(rdmsr -p 0 0x34 2>/dev/null || true)
+    if [[ -n "$SMI_AFTER" ]]; then
+        # MSR values are hex — convert to decimal for diff.
+        smi_before_dec=$((16#${SMI_BEFORE}))
+        smi_after_dec=$((16#${SMI_AFTER}))
+        smi_delta=$((smi_after_dec - smi_before_dec))
+        echo ""
+        echo "=== SMI report ==="
+        echo "  SMI count after:  ${SMI_AFTER}"
+        if [[ $smi_delta -gt 0 ]]; then
+            echo "  *** ${smi_delta} SMI(s) fired during benchmark ***"
+            echo "  Each SMI pauses the CPU for ~50-200 µs (firmware-level, cannot be disabled)."
+            echo "  This likely explains max latency spikes."
+        else
+            echo "  No SMIs detected during benchmark."
+        fi
+    fi
+fi
 
 # --- Capture dmesg after benchmark and show diff ---
 

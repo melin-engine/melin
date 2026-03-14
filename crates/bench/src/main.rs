@@ -58,8 +58,8 @@ const SAMPLE_INTERVAL: usize = 1_000;
 /// Number of order pairs (buy + sell) per benchmark run.
 const DEFAULT_PAIRS: usize = 1_000_000;
 
-/// Warmup orders (not measured) per client to prime the pipeline and caches.
-const WARMUP_ORDERS: usize = 1_000;
+/// Default warmup orders (not measured) per client to prime the pipeline and caches.
+const WARMUP_ORDERS: usize = 100_000;
 
 /// Default number of orders in flight simultaneously per client. Controls the
 /// level of pipelining — enough to keep the server pipeline saturated (journal +
@@ -160,6 +160,10 @@ struct BenchArgs {
     /// Group commit coalescing delay in microseconds.
     #[arg(long, default_value_t = 0)]
     group_commit_us: u64,
+    /// Warmup orders per client (not measured). Higher values let caches,
+    /// branch predictors, and allocator settle before measurement starts.
+    #[arg(long, default_value_t = WARMUP_ORDERS)]
+    warmup: usize,
 }
 
 fn main() {
@@ -173,10 +177,10 @@ fn main() {
 
     match args.mode.as_str() {
         "engine" => {
-            run_engine_bench(args.pairs);
+            run_engine_bench(args.pairs, args.warmup);
         }
         "pipeline" => {
-            run_pipeline_bench(args.pairs, args.window, args.group_commit_us);
+            run_pipeline_bench(args.pairs, args.window, args.group_commit_us, args.warmup);
         }
         "roundtrip" => {
             #[cfg(feature = "io-uring")]
@@ -193,6 +197,7 @@ fn main() {
                 args.bench_threads,
                 args.group_commit_us,
                 args.addr,
+                args.warmup,
             );
         }
         other => {
@@ -209,7 +214,7 @@ fn main() {
 /// Pure matching engine benchmark. Calls `Exchange::execute()` directly in a
 /// tight loop with no disruptor, journal, or I/O. Measures the raw cost of
 /// order matching and balance management.
-fn run_engine_bench(total_pairs: usize) {
+fn run_engine_bench(total_pairs: usize, warmup: usize) {
     let nz = |v: u64| NonZeroU64::new(v).expect("non-zero");
 
     let mut exchange = trading_engine::exchange::Exchange::with_capacity();
@@ -226,13 +231,13 @@ fn run_engine_bench(total_pairs: usize) {
 
     exchange.prefault();
 
-    let total_orders = WARMUP_ORDERS + total_pairs * 2;
+    let total_orders = warmup + total_pairs * 2;
     let mut reports = Vec::with_capacity(256);
     let mut histogram =
         Histogram::<u64>::new_with_bounds(1, 10_000_000_000, 3).expect("histogram bounds");
 
     // Warmup: prime caches and allocator.
-    for i in 0..WARMUP_ORDERS {
+    for i in 0..warmup {
         let order_id = OrderId((i as u64) + 1);
         let side = if i % 2 == 0 { Side::Buy } else { Side::Sell };
         reports.clear();
@@ -263,7 +268,7 @@ fn run_engine_bench(total_pairs: usize) {
     let mut series: TimeSeries = Vec::new();
 
     let start = Instant::now();
-    for i in WARMUP_ORDERS..total_orders {
+    for i in warmup..total_orders {
         let order_id = OrderId((i as u64) + 1);
         let side = if i % 2 == 0 { Side::Buy } else { Side::Sell };
         reports.clear();
@@ -298,7 +303,7 @@ fn run_engine_bench(total_pairs: usize) {
     print_results(
         "Engine-Only",
         total_pairs * 2,
-        WARMUP_ORDERS,
+        warmup,
         &histogram,
         wall,
         &[],
@@ -315,7 +320,7 @@ fn run_engine_bench(total_pairs: usize) {
 /// matching stage) but bypasses TCP/UDS transport. The bench thread publishes
 /// InputSlots directly to the MultiProducer and drains OutputSlots from the
 /// SPSC consumer. Measures pipeline latency without network overhead.
-fn run_pipeline_bench(total_pairs: usize, window: usize, group_commit_us: u64) {
+fn run_pipeline_bench(total_pairs: usize, window: usize, group_commit_us: u64, warmup: usize) {
     use trading_engine::journal::JournalWriter;
     use trading_engine::journal::event::JournalEvent;
     use trading_engine::journal::pipeline::{InputSlot, build_pipeline};
@@ -357,7 +362,7 @@ fn run_pipeline_bench(total_pairs: usize, window: usize, group_commit_us: u64) {
         .spawn(move || matching_stage.run(&shutdown_m))
         .expect("spawn matching thread");
 
-    let total_orders = WARMUP_ORDERS + total_pairs * 2;
+    let total_orders = warmup + total_pairs * 2;
     let mut histogram =
         Histogram::<u64>::new_with_bounds(1, 10_000_000_000, 3).expect("histogram bounds");
 
@@ -379,7 +384,7 @@ fn run_pipeline_bench(total_pairs: usize, window: usize, group_commit_us: u64) {
                 &mut inflight_ts,
                 &mut histogram,
                 &mut completed,
-                WARMUP_ORDERS,
+                warmup,
             );
         }
 
@@ -413,7 +418,7 @@ fn run_pipeline_bench(total_pairs: usize, window: usize, group_commit_us: u64) {
             &mut inflight_ts,
             &mut histogram,
             &mut completed,
-            WARMUP_ORDERS,
+            warmup,
         );
     }
 
@@ -431,7 +436,7 @@ fn run_pipeline_bench(total_pairs: usize, window: usize, group_commit_us: u64) {
     print_results(
         "Pipeline (no network)",
         total_pairs * 2,
-        WARMUP_ORDERS,
+        warmup,
         &histogram,
         wall,
         &extra_lines,
@@ -492,6 +497,7 @@ fn run_roundtrip_bench(
     bench_threads: usize,
     group_commit_us: u64,
     remote_addr: Option<std::net::SocketAddr>,
+    warmup: usize,
 ) {
     // Remote mode: connect to an external engine, no embedded server.
     if let Some(addr) = remote_addr {
@@ -518,6 +524,7 @@ fn run_roundtrip_bench(
             bench_threads,
             group_commit_us,
             shutdown,
+            warmup,
         );
         return;
     }
@@ -558,6 +565,7 @@ fn run_roundtrip_bench(
             bench_threads,
             group_commit_us,
             shutdown,
+            warmup,
         );
     } else {
         use trading_protocol::tcp::BlockingTcpListener;
@@ -583,6 +591,7 @@ fn run_roundtrip_bench(
             bench_threads,
             group_commit_us,
             shutdown,
+            warmup,
         );
     }
 
@@ -863,7 +872,7 @@ fn run_epoll_loop<W: Write>(
                             let sent_at = conn.inflight_ts.pop_front().expect("inflight timestamp");
                             let latency_ns = sent_at.elapsed().as_nanos() as u64;
 
-                            if conn.batch_count >= WARMUP_ORDERS {
+                            if conn.batch_count >= warmup {
                                 histogram.record(latency_ns).expect("record");
                             }
 
@@ -898,6 +907,7 @@ fn run_epoll_loop<W: Write>(
 // ---------------------------------------------------------------------------
 
 /// Create connections, distribute across bench threads, run, report results.
+#[allow(clippy::too_many_arguments)]
 fn run_roundtrip_inner<R, W, F>(
     connect: F,
     transport_name: &str,
@@ -907,6 +917,7 @@ fn run_roundtrip_inner<R, W, F>(
     #[cfg_attr(feature = "io-uring", allow(unused_variables))] bench_threads: usize,
     group_commit_us: u64,
     shutdown: Arc<AtomicBool>,
+    warmup: usize,
 ) where
     R: AsRawFd + Send + 'static,
     W: Write + AsRawFd + Send + 'static,
@@ -923,6 +934,7 @@ fn run_roundtrip_inner<R, W, F>(
             num_clients,
             group_commit_us,
             shutdown,
+            warmup,
         );
     }
 
@@ -938,6 +950,7 @@ fn run_roundtrip_inner<R, W, F>(
             bench_threads,
             group_commit_us,
             shutdown,
+            warmup,
         );
     }
 }
@@ -954,6 +967,7 @@ fn run_epoll_roundtrip<R, W, F>(
     bench_threads: usize,
     group_commit_us: u64,
     shutdown: Arc<AtomicBool>,
+    warmup: usize,
 ) where
     R: AsRawFd + Send + 'static,
     W: Write + AsRawFd + Send + 'static,
@@ -983,7 +997,7 @@ fn run_epoll_roundtrip<R, W, F>(
         } else {
             pairs_per_client
         };
-        let total_orders = WARMUP_ORDERS + client_pairs * 2;
+        let total_orders = warmup + client_pairs * 2;
 
         let order_id_offset: u64 = (0..client_id)
             .map(|c| {
@@ -992,7 +1006,7 @@ fn run_epoll_roundtrip<R, W, F>(
                 } else {
                     pairs_per_client
                 };
-                (WARMUP_ORDERS + p * 2) as u64
+                (warmup + p * 2) as u64
             })
             .sum();
 
@@ -1065,7 +1079,7 @@ fn run_epoll_roundtrip<R, W, F>(
     print_results(
         "Roundtrip",
         total_pairs * 2,
-        WARMUP_ORDERS * num_clients,
+        warmup * num_clients,
         &merged_histogram,
         blast_duration,
         &extra_lines,
@@ -1097,6 +1111,7 @@ fn run_uring_roundtrip<R, W, F>(
     num_clients: usize,
     group_commit_us: u64,
     shutdown: Arc<AtomicBool>,
+    warmup: usize,
 ) where
     R: AsRawFd + Send + 'static,
     W: Write + AsRawFd + Send + 'static,
@@ -1117,7 +1132,7 @@ fn run_uring_roundtrip<R, W, F>(
         } else {
             pairs_per_client
         };
-        let total_orders = WARMUP_ORDERS + client_pairs * 2;
+        let total_orders = warmup + client_pairs * 2;
 
         let order_id_offset: u64 = (0..client_id)
             .map(|c| {
@@ -1126,7 +1141,7 @@ fn run_uring_roundtrip<R, W, F>(
                 } else {
                     pairs_per_client
                 };
-                (WARMUP_ORDERS + p * 2) as u64
+                (warmup + p * 2) as u64
             })
             .sum();
 
@@ -1158,7 +1173,7 @@ fn run_uring_roundtrip<R, W, F>(
     }
 
     let start = Instant::now();
-    let (histogram, _series) = run_uring_loop(connections, window, start);
+    let (histogram, _series) = run_uring_loop(connections, window, start, warmup);
     let wall = start.elapsed();
 
     let mut extra_lines = Vec::new();
@@ -1174,7 +1189,7 @@ fn run_uring_roundtrip<R, W, F>(
     print_results(
         "Roundtrip",
         total_pairs * 2,
-        WARMUP_ORDERS * num_clients,
+        warmup * num_clients,
         &histogram,
         wall,
         &extra_lines,
@@ -1236,6 +1251,7 @@ fn run_uring_loop(
     mut connections: Vec<UringBenchConn>,
     window: usize,
     bench_start: Instant,
+    warmup: usize,
 ) -> (Histogram<u64>, TimeSeries) {
     use io_uring::{IoUring, opcode, types};
 
@@ -1343,7 +1359,7 @@ fn run_uring_loop(
                     if matches!(response, ResponseKind::BatchEnd) {
                         let sent_at = conn.inflight_ts.pop_front().expect("inflight timestamp");
                         let latency_ns = sent_at.elapsed().as_nanos() as u64;
-                        if conn.batch_count >= WARMUP_ORDERS {
+                        if conn.batch_count >= warmup {
                             histogram.record(latency_ns).expect("record");
                             #[cfg(feature = "chart")]
                             {
