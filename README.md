@@ -74,8 +74,9 @@ Checklist of features expected of a production trade execution engine. Items mar
 ### Risk & Accounting
 - [x] Per-account, per-currency balance management (reserve on order, update on fill, release on cancel)
 - [x] Self-trade prevention (per-order modes: CancelNewest, CancelOldest, CancelBoth)
-- [ ] Kill switch (cancel all orders for an account/firm) — *deferred*
-- [ ] Fat finger checks (max order size, max notional value) — *deferred*
+- [x] Fat finger checks (max order size, max notional value — per-instrument configurable `RiskLimits`)
+- [x] Kill switch (cancel all resting orders and pending stops for an account across all instruments)
+- [x] Client deduplication (per-account OrderId high-water mark — prevents double-execution on crash-recovery retry)
 - [ ] Price band checks (reject orders too far from reference price) — *deferred*
 - [ ] Order throttling (per-account rate limiting) — *deferred*
 - [ ] Position/exposure limits — *deferred*
@@ -87,7 +88,6 @@ Checklist of features expected of a production trade execution engine. Items mar
 - [x] Snapshot save/load for fast recovery
 - [x] Deterministic replay from journal
 - [x] Pipelined io_uring async fsync with group commit
-- [ ] Client deduplication (idempotency keys / sequence numbers) — *deferred*
 - [ ] Journal rotation — *deferred*
 - [ ] Journal compaction (automatic snapshot trigger) — *deferred*
 - [ ] Output event log (durable ExecutionReport stream for audit trail) — *deferred*
@@ -98,10 +98,10 @@ Checklist of features expected of a production trade execution engine. Items mar
 - [x] Unix domain socket transport
 - [x] Epoll reader pool (edge-triggered, non-blocking) with dedicated I/O threads (zero tokio)
 - [x] Lock-free CAS-based multi-producer disruptor (no mutex on input path)
-- [x] io_uring transport (separate read/write rings)
+- [x] io_uring transport (separate read/write rings, multishot RECV with provided buffer groups)
 - [x] Typed client library
 - [x] Terminal UI for interactive testing
-- [ ] Heartbeats and connection timeouts
+- [x] Heartbeats and connection timeouts (bidirectional keepalive, configurable idle timeout detection)
 - [ ] Backpressure handling (defined policy when disruptor is full) — *deferred*
 - [ ] TLS (encrypted client connections) — *deferred*
 - [ ] DDoS protection (connection rate limiting, per-IP limits, max connections cap) — *deferred*
@@ -124,9 +124,14 @@ Checklist of features expected of a production trade execution engine. Items mar
 - [x] Structured logging (`tracing` crate)
 - [x] Per-stage pipeline latency tracing (`latency-trace` feature gate)
 - [x] Configuration management (CLI args for bind address, journal path, core affinity, reader threads)
-- [ ] Graceful shutdown (drain in-flight orders, flush journal)
-- [ ] Health checks / readiness probes
-- [ ] Metrics (latency histograms, throughput counters, connection counts)
+- [x] Graceful shutdown (SIGINT/SIGTERM handler, ordered drain: readers → journal → matching → response)
+- [x] Health checks / readiness probes (`ServerReady` wire handshake on connect)
+
+### Metrics & Observability
+- [x] Pipeline stage utilization (`pipeline-stats` feature gate — busy/idle ratio per stage)
+- [ ] Metrics transport (decide where/how to expose: stats file, output event channel, admin socket)
+- [ ] Connection counts, disruptor queue depth — *primary node only*
+- [ ] Order/fill/cancel throughput, latency histograms, volume analytics — *deffered: replica or offline (journal-derived, zero primary impact)*
 
 ### Redundancy & High Availability
 - [ ] Journal replication (WAL streaming to replica) — *deferred*
