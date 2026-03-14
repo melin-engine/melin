@@ -1,29 +1,47 @@
 # Matching Engine
 
-A matching engine built on the [LMAX architecture](https://martinfowler.com/articles/lmax.html) in Rust.
+A matching engine built on the [LMAX architecture](https://martinfowler.com/articles/lmax.html), written in Rust.
 
 ## Architecture
 
 ```
-Clients ──TCP/UDS──> Accept Loop
-                         │
-                    Epoll Reader Pool (edge-triggered, non-blocking I/O)
-                         │
-                    lock-free MultiProducer ──> Input Disruptor (ring buffer)
-                                                         │
-                                          ┌──────────────┼──────────────────┐
-                                          │                                 │
-                                     Journal Thread                Matching Thread
-                                     batch write + sync            execute on Exchange
-                                     (pwritev2 + RWF_DSYNC/FUA)   publish to output SPSC
-                                          │                                 │
-                                     advances cursor ────────┐              │
-                                                             ▼              │
-                                                      Response Thread  ◄───┘
-                                                      gates on journal cursor
-                                                      writes directly to sockets
-                                                             │
-                                                      ──TCP/UDS──> Clients
+                      ┌─────────────────────────────────────────────────────────────┐
+                      │                         SERVER                              │
+                      │                                                             │
+  Clients ─TCP───────────────────► Accept Loop                                      │
+                      │                │                                            │
+                      │                ▼                                            │
+                      │            Epoll/io_uring Reader Pool                       │
+                      │            (edge-triggered, non-blocking)                   │
+                      │                │                                            │
+                      │                │  lock-free CAS                             │
+                      │                ▼                                            │
+                      │   ┌─────────────────────────────────┐                       │
+                      │   │     Input Disruptor (ring buf)  │                       │
+                      │   └──────────┬──────────────┬───────┘                       │
+                      │              │              │                               │
+                      │              ▼              ▼                               │
+                      │   ┌──────────────┐  ┌──────────────┐                        │
+                      │   │   Journal    │  │   Matching   │   parallel consumers   │
+                      │   │   Thread     │  │   Thread     │                        │
+                      │   │              │  │              │                        │
+                      │   │ pwritev2     │  │ Exchange     │                        │
+                      │   │ + RWF_DSYNC  │  │ .execute()   │                        │
+                      │   └──────┬───────┘  └──────┬───────┘                        │
+                      │          │                 │                                │
+                      │          │ cursor           │ output SPSC                   │
+                      │          ▼                 ▼                                │
+                      │   ┌──────────────────────────────┐                          │
+                      │   │       Response Thread        │                          │
+                      │   │                              │                          │
+                      │   │  gates on journal cursor     │                          │
+                      │   │  (persist-before-ack)        │                          │
+                      │   └──────────────┬───────────────┘                          │
+                      │                  │                                          │
+                      └──────────────────┼──────────────────────────────────────────┘
+                                         │
+                                         │
+  Clients ◄─TCP──────────────────────────┘
 ```
 
 - **Single-threaded matching engine** — no locks on the hot path; one thread executes all matching logic
@@ -165,50 +183,20 @@ The [benchmark suite](crates/bench/) supports three modes: bare matching engine,
 
 All benchmarks: 10M order pairs (20M measured), 16 clients, 64 pipelined orders per client.
 
-**Engine-only** (matching engine, no pipeline/network):
+| Metric | Engine-only | TCP (no persistence) | TCP (fsync/FUA) |
+|--------|-------------|----------------------|-----------------|
+| **Throughput** | 11.2M orders/sec | 3.01M orders/sec | 779K orders/sec |
+| **p90** | 0.05 µs | 350 µs | 1.53 ms |
+| **p99** | 0.05 µs | 495 µs | 1.85 ms |
+| **p99.9** | 0.09 µs | 546 µs | 4.50 ms |
+| **p99.99** | 0.12 µs | 588 µs | 7.32 ms |
+| **max** | 95.23 µs | 722 µs | 7.58 ms |
 
+```sh
+sudo ./scripts/bench-isolate.sh -- 10000000 --clients=16 --window=64 --mode engine    # engine-only
+sudo ./scripts/bench-isolate.sh --features no-persist -- 10000000 --clients=16 --window=64  # no persistence
+sudo ./scripts/bench-isolate.sh -- 10000000 --clients=16 --window=64                   # with fsync/FUA
 ```
-sudo ./scripts/bench-isolate.sh -- 10000000 --clients=16 --window=64 --mode engine
-```
-
-| Metric | Value |
-|--------|-------|
-| **Throughput** | 11.2M orders/sec (0.09 µs/order) |
-| **p90** | 0.05 µs |
-| **p99** | 0.05 µs |
-| **p99.9** | 0.09 µs |
-| **p99.99** | 0.12 µs |
-| **max** | 95.23 µs |
-
-**Full TCP round-trip without persistence**
-
-```
-sudo ./scripts/bench-isolate.sh --features no-persist -- 10000000 --clients=16 --window=64
-```
-
-| Metric | Value |
-|--------|-------|
-| **Throughput** | 3.01M orders/sec (0.33 µs/order) |
-| **p90** | 350 µs |
-| **p99** | 495 µs |
-| **p99.9** | 546 µs |
-| **p99.99** | 588 µs |
-| **max** | 722 µs |
-
-**Full TCP round-trip with persistence (fsync/FUA included)**
-
-```
-sudo ./scripts/bench-isolate.sh -- 10000000 --clients=16 --window=64
-```
-
-| Metric | Value |
-|--------|-------|
-| **Throughput** | 779K orders/sec (1.28 µs/order) |
-| **p90** | 1.53 ms |
-| **p99** | 1.85 ms |
-| **p99.9** | 4.50 ms |
-| **p99.99** | 7.32 ms |
-| **max** | 7.58 ms |
 
 ## License
 
