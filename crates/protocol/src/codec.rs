@@ -56,6 +56,7 @@ const REJECT_INSUFFICIENT_BALANCE: u8 = 2;
 const REJECT_UNKNOWN_ACCOUNT: u8 = 3;
 const REJECT_UNKNOWN_SYMBOL: u8 = 4;
 const REJECT_SELF_TRADE_PREVENTED: u8 = 5;
+const REJECT_DUPLICATE_ORDER_ID: u8 = 6;
 
 /// Encode a request into `buf`. Returns total bytes written (length prefix + tag + payload).
 ///
@@ -496,6 +497,7 @@ fn encode_reject_reason(reason: RejectReason) -> u8 {
         RejectReason::UnknownAccount => REJECT_UNKNOWN_ACCOUNT,
         RejectReason::UnknownSymbol => REJECT_UNKNOWN_SYMBOL,
         RejectReason::SelfTradePrevented => REJECT_SELF_TRADE_PREVENTED,
+        RejectReason::DuplicateOrderId => REJECT_DUPLICATE_ORDER_ID,
     }
 }
 
@@ -507,6 +509,7 @@ fn decode_reject_reason(b: u8) -> Result<RejectReason, ProtocolError> {
         REJECT_UNKNOWN_ACCOUNT => Ok(RejectReason::UnknownAccount),
         REJECT_UNKNOWN_SYMBOL => Ok(RejectReason::UnknownSymbol),
         REJECT_SELF_TRADE_PREVENTED => Ok(RejectReason::SelfTradePrevented),
+        REJECT_DUPLICATE_ORDER_ID => Ok(RejectReason::DuplicateOrderId),
         _ => Err(ProtocolError::InvalidField("reject reason")),
     }
 }
@@ -632,6 +635,10 @@ mod tests {
             ResponseKind::Report(ExecutionReport::Rejected {
                 order_id: OrderId(10),
                 reason: RejectReason::SelfTradePrevented,
+            }),
+            ResponseKind::Report(ExecutionReport::Rejected {
+                order_id: OrderId(11),
+                reason: RejectReason::DuplicateOrderId,
             }),
             ResponseKind::EngineError,
             ResponseKind::BatchEnd,

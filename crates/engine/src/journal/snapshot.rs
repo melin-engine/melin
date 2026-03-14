@@ -44,7 +44,8 @@ const SNAP_MAGIC: u32 = 0x534E_4150;
 
 /// Current snapshot format version.
 /// v1 → v2: added SelfTradeProtection byte to PendingStopSnapshot.
-const SNAP_VERSION: u16 = 2;
+/// v2 → v3: added per-account OrderId high-water marks for client dedup.
+const SNAP_VERSION: u16 = 3;
 
 /// Snapshot header size: magic(4) + version(2) + reserved(2) + sequence(8) = 16.
 const SNAP_HEADER_SIZE: usize = 16;
@@ -157,6 +158,8 @@ pub(crate) struct ExchangeSnapshot {
     pub(crate) reservations: Vec<(OrderId, AccountId, CurrencyId, u64)>,
     pub(crate) order_sides: Vec<(OrderId, Side)>,
     pub(crate) books: Vec<(Symbol, BookSnapshot)>,
+    /// Per-account OrderId high-water marks for client deduplication.
+    pub(crate) max_order_id: Vec<(AccountId, u64)>,
 }
 
 /// Serialized order book state for a single instrument.
@@ -237,6 +240,13 @@ fn encode_exchange_state(state: &ExchangeSnapshot, buf: &mut Vec<u8>) {
     for (symbol, book) in &state.books {
         le::push_u32(buf, symbol.0);
         encode_book_snapshot(book, buf);
+    }
+
+    // Per-account OrderId high-water marks (v3+).
+    le::push_u32(buf, state.max_order_id.len() as u32);
+    for (account, hwm) in &state.max_order_id {
+        le::push_u32(buf, account.0);
+        le::push_u64(buf, *hwm);
     }
 }
 
@@ -437,6 +447,21 @@ fn decode_exchange_state(buf: &[u8]) -> Result<(usize, ExchangeSnapshot), Journa
         books.push((symbol, book));
     }
 
+    // Per-account OrderId high-water marks (v3+).
+    check(pos, 4)?;
+    let n_max_order_id = le::get_u32(&buf[pos..]) as usize;
+    pos += 4;
+    // Each entry is 12 bytes: account_id(4) + hwm(8).
+    validate_count(buf.len() - pos, n_max_order_id, 12)?;
+    let mut max_order_id = Vec::with_capacity(n_max_order_id);
+    for _ in 0..n_max_order_id {
+        check(pos, 12)?;
+        let account = AccountId(le::get_u32(&buf[pos..]));
+        let hwm = le::get_u64(&buf[pos + 4..]);
+        max_order_id.push((account, hwm));
+        pos += 12;
+    }
+
     Ok((
         pos,
         ExchangeSnapshot {
@@ -445,6 +470,7 @@ fn decode_exchange_state(buf: &[u8]) -> Result<(usize, ExchangeSnapshot), Journa
             reservations,
             order_sides,
             books,
+            max_order_id,
         },
     ))
 }
@@ -722,12 +748,15 @@ impl Exchange {
             .map(|(&symbol, book)| (symbol, book.snapshot()))
             .collect();
 
+        let max_order_id = self.snapshot_max_order_id();
+
         ExchangeSnapshot {
             instruments,
             balances,
             reservations,
             order_sides,
             books,
+            max_order_id,
         }
     }
 
@@ -751,8 +780,15 @@ impl Exchange {
 
         let accounts = AccountManager::restore(state.balances, state.reservations);
         let order_sides: HashMap<OrderId, Side> = state.order_sides.into_iter().collect();
+        let max_order_id: HashMap<AccountId, u64> = state.max_order_id.into_iter().collect();
 
-        Self::from_parts(books_map, instruments_map, accounts, order_sides)
+        Self::from_parts(
+            books_map,
+            instruments_map,
+            accounts,
+            order_sides,
+            max_order_id,
+        )
     }
 }
 

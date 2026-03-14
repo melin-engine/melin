@@ -196,6 +196,10 @@ pub enum RejectReason {
     /// Self-trade prevention triggered — order would match against
     /// the same account.
     SelfTradePrevented,
+    /// Duplicate order ID — an order with this ID (or a higher one) was
+    /// already submitted by this account. Prevents double-execution on
+    /// crash-recovery retry.
+    DuplicateOrderId,
 }
 
 #[cfg(test)]

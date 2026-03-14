@@ -31,6 +31,11 @@ pub struct Exchange {
     /// Tracks order side by ID so fills can determine buyer/seller.
     /// Populated on order submission, cleaned up on full fill or cancel.
     order_sides: HashMap<OrderId, Side>,
+    /// Per-account high-water mark for order IDs. Rejects submissions
+    /// with `order_id <= max_seen[account]` to prevent duplicate execution
+    /// on crash-recovery retry. HashMap for O(1) lookup keyed on
+    /// AccountId(u32) — cheap single-word hash.
+    max_order_id: HashMap<AccountId, u64>,
     /// Reusable buffer for consumed order IDs from `process_reports()`.
     /// Avoids per-order Vec allocation on the hot path.
     consumed_buf: Vec<OrderId>,
@@ -46,6 +51,7 @@ impl Exchange {
             instruments: HashMap::new(),
             accounts: AccountManager::new(),
             order_sides: HashMap::new(),
+            max_order_id: HashMap::new(),
             consumed_buf: Vec::new(),
             presized: false,
         }
@@ -60,6 +66,7 @@ impl Exchange {
             instruments: HashMap::with_capacity(64),
             accounts: AccountManager::with_capacity(),
             order_sides: HashMap::with_capacity(2_000_000),
+            max_order_id: HashMap::with_capacity(10_000),
             consumed_buf: Vec::with_capacity(256),
             presized: true,
         }
@@ -71,12 +78,14 @@ impl Exchange {
         instruments: HashMap<Symbol, InstrumentSpec>,
         accounts: AccountManager,
         order_sides: HashMap<OrderId, Side>,
+        max_order_id: HashMap<AccountId, u64>,
     ) -> Self {
         Self {
             books,
             instruments,
             accounts,
             order_sides,
+            max_order_id,
             consumed_buf: Vec::new(),
             presized: false,
         }
@@ -100,6 +109,14 @@ impl Exchange {
             .collect()
     }
 
+    /// Snapshot the per-account order ID high-water marks for serialization.
+    pub(crate) fn snapshot_max_order_id(&self) -> Vec<(AccountId, u64)> {
+        self.max_order_id
+            .iter()
+            .map(|(&account, &hwm)| (account, hwm))
+            .collect()
+    }
+
     /// Touch all pre-allocated HashMap pages so page faults happen at startup,
     /// not on the hot path. Call once after adding instruments, before accepting
     /// orders.
@@ -109,6 +126,12 @@ impl Exchange {
             self.order_sides.insert(OrderId(i as u64), Side::Buy);
         }
         self.order_sides.clear();
+
+        let max_oid_cap = self.max_order_id.capacity();
+        for i in 0..max_oid_cap {
+            self.max_order_id.insert(AccountId(i as u32), 0);
+        }
+        self.max_order_id.clear();
 
         self.accounts.prefault();
 
@@ -152,6 +175,23 @@ impl Exchange {
             });
             return;
         };
+
+        // Dedup: reject if this account already submitted an order with
+        // the same or higher ID. Prevents duplicate execution on
+        // crash-recovery replay. The HWM advances unconditionally because
+        // the journal records every SubmitOrder regardless of matching
+        // outcome — a replayed InsufficientBalance rejection is harmless,
+        // but a replayed fill is not. Clients must use a new OrderId for
+        // genuinely new orders, even if the previous one was rejected.
+        let hwm = self.max_order_id.entry(order.account).or_insert(0);
+        if order.id.0 <= *hwm {
+            reports.push(ExecutionReport::Rejected {
+                order_id: order.id,
+                reason: RejectReason::DuplicateOrderId,
+            });
+            return;
+        }
+        *hwm = order.id.0;
 
         // Reserve funds before submitting to the matching engine.
         let reserved = match self.accounts.try_reserve(&order, &spec) {
@@ -2081,5 +2121,139 @@ mod tests {
                 ..
             }
         )));
+    }
+
+    // --- Client dedup tests ---
+
+    #[test]
+    fn duplicate_order_id_rejected() {
+        let mut exchange = Exchange::new();
+        exchange.add_instrument(btc_usd_spec());
+        exchange.deposit(ACCT_A, USD, 100_000);
+
+        let mut reports = Vec::new();
+        exchange.execute(
+            Symbol(1),
+            limit_order(1, ACCT_A, Side::Buy, 100, 10, TimeInForce::GTC),
+            &mut reports,
+        );
+        assert!(matches!(reports[0], ExecutionReport::Placed { .. }));
+
+        reports.clear();
+        exchange.execute(
+            Symbol(1),
+            limit_order(1, ACCT_A, Side::Buy, 100, 10, TimeInForce::GTC),
+            &mut reports,
+        );
+        assert!(matches!(
+            reports[0],
+            ExecutionReport::Rejected {
+                reason: RejectReason::DuplicateOrderId,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn lower_order_id_rejected() {
+        let mut exchange = Exchange::new();
+        exchange.add_instrument(btc_usd_spec());
+        exchange.deposit(ACCT_A, USD, 100_000);
+
+        let mut reports = Vec::new();
+        exchange.execute(
+            Symbol(1),
+            limit_order(5, ACCT_A, Side::Buy, 100, 10, TimeInForce::GTC),
+            &mut reports,
+        );
+        assert!(matches!(reports[0], ExecutionReport::Placed { .. }));
+
+        reports.clear();
+        exchange.execute(
+            Symbol(1),
+            limit_order(3, ACCT_A, Side::Buy, 100, 10, TimeInForce::GTC),
+            &mut reports,
+        );
+        assert!(matches!(
+            reports[0],
+            ExecutionReport::Rejected {
+                reason: RejectReason::DuplicateOrderId,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn rejected_order_consumes_id() {
+        // Even if an order is rejected (e.g., InsufficientBalance), the
+        // HWM advances because the journal already recorded the event.
+        // A retry with the same ID is a duplicate. The client must use
+        // a new OrderId for genuinely new orders.
+        let mut exchange = Exchange::new();
+        exchange.add_instrument(btc_usd_spec());
+
+        let mut reports = Vec::new();
+        exchange.execute(
+            Symbol(1),
+            limit_order(1, ACCT_A, Side::Buy, 100, 10, TimeInForce::GTC),
+            &mut reports,
+        );
+        assert!(matches!(
+            reports[0],
+            ExecutionReport::Rejected {
+                reason: RejectReason::InsufficientBalance,
+                ..
+            }
+        ));
+
+        // Retry with the same ID — blocked by dedup even after depositing.
+        exchange.deposit(ACCT_A, USD, 100_000);
+        reports.clear();
+        exchange.execute(
+            Symbol(1),
+            limit_order(1, ACCT_A, Side::Buy, 100, 10, TimeInForce::GTC),
+            &mut reports,
+        );
+        assert!(matches!(
+            reports[0],
+            ExecutionReport::Rejected {
+                reason: RejectReason::DuplicateOrderId,
+                ..
+            }
+        ));
+
+        // A new, higher ID succeeds.
+        reports.clear();
+        exchange.execute(
+            Symbol(1),
+            limit_order(2, ACCT_A, Side::Buy, 100, 10, TimeInForce::GTC),
+            &mut reports,
+        );
+        assert!(matches!(reports[0], ExecutionReport::Placed { .. }));
+    }
+
+    #[test]
+    fn same_order_id_different_accounts_allowed() {
+        let mut exchange = Exchange::new();
+        exchange.add_instrument(btc_usd_spec());
+        exchange.deposit(ACCT_A, USD, 100_000);
+        exchange.deposit(ACCT_B, BTC, 100);
+
+        let mut reports = Vec::new();
+        exchange.execute(
+            Symbol(1),
+            limit_order(1, ACCT_A, Side::Buy, 100, 10, TimeInForce::GTC),
+            &mut reports,
+        );
+        assert!(matches!(reports[0], ExecutionReport::Placed { .. }));
+
+        reports.clear();
+        exchange.execute(
+            Symbol(1),
+            limit_order(1, ACCT_B, Side::Sell, 100, 10, TimeInForce::GTC),
+            &mut reports,
+        );
+        // Should succeed — dedup is per-account, not global.
+        assert!(matches!(reports[0], ExecutionReport::Fill { .. }));
     }
 }
