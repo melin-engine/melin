@@ -148,6 +148,8 @@ struct LatencySample {
     p99_us: f64,
     /// Interval p99.9 latency in microseconds.
     p999_us: f64,
+    /// Interval p99.99 latency in microseconds.
+    p9999_us: f64,
 }
 
 /// Time-series of latency samples for chart display.
@@ -172,6 +174,7 @@ fn maybe_sample(
                 elapsed_secs: start.elapsed().as_secs_f64(),
                 p99_us: interval_hist.value_at_quantile(0.99) as f64 / 1000.0,
                 p999_us: interval_hist.value_at_quantile(0.999) as f64 / 1000.0,
+                p9999_us: interval_hist.value_at_quantile(0.9999) as f64 / 1000.0,
             });
         }
         interval_hist.reset();
@@ -402,7 +405,7 @@ fn run_engine_bench(total_pairs: usize, warmup: usize) {
         ],
     );
     #[cfg(feature = "chart")]
-    show_chart(&series);
+    show_chart(&series, &histogram);
 }
 
 // ===========================================================================
@@ -1346,7 +1349,7 @@ fn run_uring_roundtrip<R, W, F>(
     std::thread::sleep(Duration::from_millis(200));
 
     #[cfg(feature = "chart")]
-    show_chart(&_series);
+    show_chart(&_series, &histogram);
 }
 
 /// Size of per-connection recv buffer for io_uring RECV.
@@ -1692,7 +1695,7 @@ fn print_results(
 
 /// Display a latency percentile chart using ratatui, then wait for a keypress.
 #[cfg(feature = "chart")]
-fn show_chart(series: &TimeSeries) {
+fn show_chart(series: &TimeSeries, histogram: &Histogram<u64>) {
     use std::io::stdout;
 
     use crossterm::event::{self, Event, KeyCode};
@@ -1701,26 +1704,49 @@ fn show_chart(series: &TimeSeries) {
     use ratatui::Terminal;
     use ratatui::backend::CrosstermBackend;
     use ratatui::layout::{Constraint, Layout};
-    use ratatui::style::{Color, Style};
+    use ratatui::style::{Color, Modifier, Style};
     use ratatui::symbols::Marker;
     use ratatui::text::Span;
-    use ratatui::widgets::{Axis, Block, Borders, Chart, Dataset, GraphType};
+    use ratatui::widgets::{
+        Axis, Bar, BarChart, BarGroup, Block, Borders, Chart, Dataset, GraphType,
+    };
 
-    if series.is_empty() {
+    if series.is_empty() && histogram.is_empty() {
         return;
     }
 
-    // Prepare data points: (elapsed_secs, latency_us).
+    // --- Prepare tail stability data ---
     let p99_data: Vec<(f64, f64)> = series.iter().map(|s| (s.elapsed_secs, s.p99_us)).collect();
     let p999_data: Vec<(f64, f64)> = series.iter().map(|s| (s.elapsed_secs, s.p999_us)).collect();
+    let p9999_data: Vec<(f64, f64)> = series
+        .iter()
+        .map(|s| (s.elapsed_secs, s.p9999_us))
+        .collect();
 
     let x_max = series.last().map(|s| s.elapsed_secs).unwrap_or(1.0);
     let y_max = series
         .iter()
-        .map(|s| s.p999_us)
+        .map(|s| s.p9999_us)
         .fold(0.0f64, f64::max)
         .max(1.0)
-        * 1.1; // 10% headroom
+        * 1.1;
+
+    // --- Prepare histogram data ---
+    // Build log-scale buckets from the HDR histogram for display.
+    let hist_buckets: Vec<(String, u64)> = {
+        let quantiles = [
+            0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 0.95, 0.99, 0.999, 0.9999,
+        ];
+        let mut buckets = Vec::new();
+        for window in quantiles.windows(2) {
+            let lo = histogram.value_at_quantile(window[0]) as f64 / 1000.0;
+            let hi = histogram.value_at_quantile(window[1]) as f64 / 1000.0;
+            let pct = ((window[1] - window[0]) * 100.0) as u64;
+            let label = format!("{:.0}-{:.0}µs", lo, hi);
+            buckets.push((label, pct));
+        }
+        buckets
+    };
 
     // Enter TUI.
     crossterm::terminal::enable_raw_mode().expect("enable raw mode");
@@ -1729,67 +1755,124 @@ fn show_chart(series: &TimeSeries) {
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend).expect("create terminal");
 
-    terminal
-        .draw(|frame| {
-            let area = Layout::default()
-                .constraints([Constraint::Percentage(100)])
-                .split(frame.area())[0];
+    let mut tab: usize = 0; // 0 = tail stability, 1 = histogram
 
-            let datasets = vec![
-                Dataset::default()
-                    .name("p99")
-                    .marker(Marker::Braille)
-                    .graph_type(GraphType::Line)
-                    .style(Style::default().fg(Color::Cyan))
-                    .data(&p99_data),
-                Dataset::default()
-                    .name("p99.9")
-                    .marker(Marker::Braille)
-                    .graph_type(GraphType::Line)
-                    .style(Style::default().fg(Color::Yellow))
-                    .data(&p999_data),
-            ];
-
-            let x_labels = vec![
-                Span::raw("0s"),
-                Span::raw(format!("{:.1}s", x_max / 2.0)),
-                Span::raw(format!("{:.1}s", x_max)),
-            ];
-            let y_labels = vec![
-                Span::raw("0"),
-                Span::raw(format!("{:.0} µs", y_max / 2.0)),
-                Span::raw(format!("{:.0} µs", y_max)),
-            ];
-
-            let chart = Chart::new(datasets)
-                .block(
-                    Block::default()
-                        .title(" Latency Percentiles Over Time (press any key to exit) ")
-                        .borders(Borders::ALL),
-                )
-                .x_axis(
-                    Axis::default()
-                        .title("Time")
-                        .bounds([0.0, x_max])
-                        .labels(x_labels),
-                )
-                .y_axis(
-                    Axis::default()
-                        .title("Latency")
-                        .bounds([0.0, y_max])
-                        .labels(y_labels),
-                );
-
-            frame.render_widget(chart, area);
-        })
-        .expect("draw chart");
-
-    // Wait for any key.
     loop {
-        if let Ok(Event::Key(key)) = event::read()
-            && key.code != KeyCode::Null
-        {
-            break;
+        terminal
+            .draw(|frame| {
+                let area = Layout::default()
+                    .constraints([Constraint::Percentage(100)])
+                    .split(frame.area())[0];
+
+                match tab {
+                    0 => {
+                        // Tail latency stability over time.
+                        let datasets = vec![
+                            Dataset::default()
+                                .name("p99")
+                                .marker(Marker::Braille)
+                                .graph_type(GraphType::Line)
+                                .style(Style::default().fg(Color::Cyan))
+                                .data(&p99_data),
+                            Dataset::default()
+                                .name("p99.9")
+                                .marker(Marker::Braille)
+                                .graph_type(GraphType::Line)
+                                .style(Style::default().fg(Color::Yellow))
+                                .data(&p999_data),
+                            Dataset::default()
+                                .name("p99.99")
+                                .marker(Marker::Braille)
+                                .graph_type(GraphType::Line)
+                                .style(Style::default().fg(Color::Red))
+                                .data(&p9999_data),
+                        ];
+
+                        let x_labels = vec![
+                            Span::raw("0s"),
+                            Span::raw(format!("{:.1}s", x_max / 2.0)),
+                            Span::raw(format!("{:.1}s", x_max)),
+                        ];
+                        let y_labels = vec![
+                            Span::raw("0"),
+                            Span::raw(format!("{:.0} µs", y_max / 2.0)),
+                            Span::raw(format!("{:.0} µs", y_max)),
+                        ];
+
+                        let chart = Chart::new(datasets)
+                            .block(
+                                Block::default()
+                                    .title(
+                                        " Tail Latency Stability [Tab: switch view | q: exit] ",
+                                    )
+                                    .title_style(
+                                        Style::default()
+                                            .fg(Color::White)
+                                            .add_modifier(Modifier::BOLD),
+                                    )
+                                    .borders(Borders::ALL),
+                            )
+                            .x_axis(
+                                Axis::default()
+                                    .title("Time")
+                                    .bounds([0.0, x_max])
+                                    .labels(x_labels),
+                            )
+                            .y_axis(
+                                Axis::default()
+                                    .title("Latency")
+                                    .bounds([0.0, y_max])
+                                    .labels(y_labels),
+                            );
+
+                        frame.render_widget(chart, area);
+                    }
+                    1 => {
+                        // Latency distribution histogram.
+                        let bars: Vec<Bar> = hist_buckets
+                            .iter()
+                            .map(|(label, pct)| {
+                                Bar::default()
+                                    .label(label.as_str().into())
+                                    .value(*pct)
+                                    .style(Style::default().fg(Color::Cyan))
+                            })
+                            .collect();
+
+                        let bar_chart = BarChart::default()
+                            .block(
+                                Block::default()
+                                    .title(
+                                        " Latency Distribution (% of orders) [Tab: switch | q: exit] ",
+                                    )
+                                    .title_style(
+                                        Style::default()
+                                            .fg(Color::White)
+                                            .add_modifier(Modifier::BOLD),
+                                    )
+                                    .borders(Borders::ALL),
+                            )
+                            .data(BarGroup::default().bars(&bars))
+                            .bar_width(
+                                ((area.width as usize).saturating_sub(4) / bars.len().max(1))
+                                    .max(3) as u16,
+                            )
+                            .bar_gap(1);
+
+                        frame.render_widget(bar_chart, area);
+                    }
+                    _ => {}
+                }
+            })
+            .expect("draw chart");
+
+        // Handle input.
+        if let Ok(Event::Key(key)) = event::read() {
+            match key.code {
+                KeyCode::Tab => tab = (tab + 1) % 2,
+                KeyCode::Char('q') | KeyCode::Esc => break,
+                _ => break,
+            }
         }
     }
 
