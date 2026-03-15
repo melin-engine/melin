@@ -157,6 +157,11 @@ Checklist of features expected of a production trade execution engine. Items mar
 - [ ] Failover detection and promotion (leader election, split-brain prevention) — *deferred*
 - [ ] Client failover (reconnect to new primary, resume with sequence numbers) — *deferred*
 
+### Horizontal Scaling
+- [ ] Instrument sharding (partition instruments across engine instances, each single-threaded) — *deferred*
+- [ ] Cross-shard routing (gateway routes orders to the correct shard by symbol) — *deferred*
+- [ ] Cross-shard risk checks (portfolio-level margin requires message passing between shards) — *deferred*
+
 ### Performance Tuning
 - [x] Release profile: `lto = "fat"`, `codegen-units = 1`, `panic = "abort"`, `target-cpu=native`
 - [x] jemalloc (`tikv-jemallocator`)
@@ -179,23 +184,74 @@ crates/
 
 ## Performance
 
-The [benchmark suite](crates/bench/) supports three modes: bare matching engine, disruptor pipeline without network, and full TCP or UDS round-trip. AMD Ryzen 7 5800X3D (8C/16T), 64 GB DDR5, NVMe SSD, Linux 6.8. All threads pinned to dedicated cores, IRQs pinned to core 0, CPU governor locked to performance, kernel boot isolation (`isolcpus`, `nohz_full`, `rcu_nocbs`).
+LAN round-trip benchmarks. Two Cherry AMD Ryzen 9950X servers (16C/32T, 192 GB RAM, 2x 1TB NVMe, 10 Gbps). Engine on one server with journal on a dedicated NVMe disk, benchmark client on the other, TCP over private network. [Realistic order flow](crates/bench/).
 
-All benchmarks: 10M order pairs (20M measured), 16 clients, 64 pipelined orders per client.
+**Peak-load throughput** — full durability, 100M order pairs, 16 clients, 256 pipelined:
 
-| Metric | Engine-only | TCP (no persistence) | TCP (fsync/FUA) |
-|--------|-------------|----------------------|-----------------|
-| **Throughput** | 11.2M orders/sec | 3.01M orders/sec | 779K orders/sec |
-| **p90** | 0.05 µs | 350 µs | 1.53 ms |
-| **p99** | 0.05 µs | 495 µs | 1.85 ms |
-| **p99.9** | 0.09 µs | 546 µs | 4.50 ms |
-| **p99.99** | 0.12 µs | 588 µs | 7.32 ms |
-| **max** | 95.23 µs | 722 µs | 7.58 ms |
+| Metric | Value |
+|--------|-------|
+| **Throughput** | 5.2M orders/sec |
+| **p90** | 788 µs |
+| **p99** | 870 µs |
+| **p99.9** | 939 µs |
+| **p99.99** | 1.25 ms |
+| **p99.999** | 1.42 ms |
+| **p99.9999** | 1.46 ms |
+| **max** | 1.47 ms |
 
 ```sh
-sudo ./scripts/bench-isolate.sh -- 10000000 --clients=16 --window=64 --mode engine    # engine-only
-sudo ./scripts/bench-isolate.sh --features no-persist -- 10000000 --clients=16 --window=64  # no persistence
-sudo ./scripts/bench-isolate.sh -- 10000000 --clients=16 --window=64                   # with fsync/FUA
+./trading-server --bind 0.0.0.0:9876 --journal /mnt/journal/trading.journal  # engine server
+./trading-bench 100000000 --addr <engine-ip>:9876 --window=256               # bench client
+```
+
+**Peak-load throughput** — no persistence, 100M order pairs, 32 clients, 192 pipelined:
+
+| Metric | Value |
+|--------|-------|
+| **Throughput** | 11.2M orders/sec |
+| **p90** | 593 µs |
+| **p99** | 645 µs |
+| **p99.9** | 747 µs |
+| **p99.99** | 790 µs |
+| **p99.999** | 821 µs |
+| **p99.9999** | 877 µs |
+| **p99.99999** | 913 µs |
+| **max** | 915 µs |
+
+```sh
+./trading-bench 100000000 --addr <engine-ip>:9876 --window=192 --clients=32  # no-persist server
+```
+
+**Single-order latency** — full durability, 1 client, no pipelining, 1M order pairs:
+
+| Metric | Value |
+|--------|-------|
+| **Throughput** | 14.1K orders/sec |
+| **p50** | 70 µs |
+| **p99** | 126 µs |
+| **p99.99** | 134 µs |
+| **max** | 689 µs |
+
+```sh
+./trading-bench 1000000 --addr <engine-ip>:9876 --window=1 --clients=1
+```
+
+**Engine-only** — no pipeline, no network, 100M order pairs on the Ryzen 9950X:
+
+| Metric | Value |
+|--------|-------|
+| **Throughput** | 17.3M orders/sec |
+| **p90** | 0.05 µs |
+| **p99** | 0.06 µs |
+| **p99.9** | 0.06 µs |
+| **p99.99** | 0.12 µs |
+| **p99.999** | 0.61 µs |
+| **p99.9999** | 3.31 µs |
+| **p99.99999** | 18.93 µs |
+| **max** | 121.92 µs |
+
+```sh
+./trading-bench 100000000 --mode=engine
 ```
 
 ## License

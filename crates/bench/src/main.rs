@@ -987,7 +987,9 @@ fn run_epoll_loop<W: Write>(
                         let response = codec::decode_response(frame).expect("decode response");
 
                         if matches!(response, ResponseKind::BatchEnd) {
-                            let sent_at = conn.inflight_ts.pop_front().expect("inflight timestamp");
+                            let sent_at = conn.inflight_ts.pop_front().expect(
+                                "inflight timestamp desync: got BatchEnd without matching send",
+                            );
                             let latency_ns = sent_at.elapsed().as_nanos() as u64;
 
                             if conn.batch_count >= warmup {
@@ -1499,7 +1501,9 @@ fn run_uring_loop(
                     cursor += 4 + frame_len;
 
                     if matches!(response, ResponseKind::BatchEnd) {
-                        let sent_at = conn.inflight_ts.pop_front().expect("inflight timestamp");
+                        let sent_at = conn.inflight_ts.pop_front().expect(
+                            "inflight timestamp desync: got BatchEnd without matching send",
+                        );
                         let latency_ns = sent_at.elapsed().as_nanos() as u64;
                         if conn.batch_count >= warmup {
                             histogram.record(latency_ns).expect("record");
