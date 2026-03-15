@@ -218,6 +218,10 @@ struct BenchArgs {
     /// Use this to place the journal on a dedicated disk for benchmarking.
     #[arg(long)]
     journal: Option<std::path::PathBuf>,
+    /// Write results to a JSON file. Useful for building saturation curves
+    /// from multiple runs with different load levels.
+    #[arg(long)]
+    json: Option<std::path::PathBuf>,
 }
 
 fn main() {
@@ -228,10 +232,11 @@ fn main() {
         .init();
 
     let args = <BenchArgs as clap::Parser>::parse();
+    let json_path = args.json.as_deref();
 
     match args.mode.as_str() {
         "engine" => {
-            run_engine_bench(args.pairs, args.warmup);
+            run_engine_bench(args.pairs, args.warmup, json_path);
         }
         "pipeline" => {
             run_pipeline_bench(
@@ -240,6 +245,7 @@ fn main() {
                 args.group_commit_us,
                 args.warmup,
                 args.journal,
+                json_path,
             );
         }
         "roundtrip" => {
@@ -259,6 +265,7 @@ fn main() {
                 args.addr,
                 args.warmup,
                 args.journal,
+                json_path,
             );
         }
         other => {
@@ -278,7 +285,7 @@ fn main() {
 /// power-law price/size distributions, multiple accounts, and resting book depth.
 /// All events are pre-generated before the measured run so RNG overhead doesn't
 /// pollute per-order timing.
-fn run_engine_bench(total_pairs: usize, warmup: usize) {
+fn run_engine_bench(total_pairs: usize, warmup: usize, json_path: Option<&std::path::Path>) {
     use generator::{GeneratedEvent, GeneratorConfig, OrderFlowGenerator};
 
     #[cfg(target_arch = "x86_64")]
@@ -403,6 +410,7 @@ fn run_engine_bench(total_pairs: usize, warmup: usize) {
             format!("  Accounts: {num_accounts}, Instruments: {num_instruments}"),
             format!("  Submits: {submits}, Cancels: {cancels} ({cancel_pct:.1}% cancel)"),
         ],
+        json_path,
     );
     #[cfg(feature = "chart")]
     show_chart(&series, &histogram);
@@ -422,6 +430,7 @@ fn run_pipeline_bench(
     group_commit_us: u64,
     warmup: usize,
     journal_path: Option<std::path::PathBuf>,
+    json_path: Option<&std::path::Path>,
 ) {
     use trading_engine::journal::JournalWriter;
     use trading_engine::journal::event::JournalEvent;
@@ -542,6 +551,7 @@ fn run_pipeline_bench(
         &histogram,
         wall,
         &extra_lines,
+        json_path,
     );
 
     println!();
@@ -602,6 +612,7 @@ fn run_roundtrip_bench(
     remote_addr: Option<std::net::SocketAddr>,
     warmup: usize,
     journal_path: Option<std::path::PathBuf>,
+    json_path: Option<&std::path::Path>,
 ) {
     // Remote mode: connect to an external engine, no embedded server.
     if let Some(addr) = remote_addr {
@@ -629,6 +640,7 @@ fn run_roundtrip_bench(
             group_commit_us,
             shutdown,
             warmup,
+            json_path,
         );
         return;
     }
@@ -670,6 +682,7 @@ fn run_roundtrip_bench(
             group_commit_us,
             shutdown,
             warmup,
+            json_path,
         );
     } else {
         use trading_protocol::tcp::BlockingTcpListener;
@@ -696,6 +709,7 @@ fn run_roundtrip_bench(
             group_commit_us,
             shutdown,
             warmup,
+            json_path,
         );
     }
 
@@ -1041,6 +1055,7 @@ fn run_roundtrip_inner<R, W, F>(
     group_commit_us: u64,
     shutdown: Arc<AtomicBool>,
     warmup: usize,
+    json_path: Option<&std::path::Path>,
 ) where
     R: std::io::Read + AsRawFd + Send + 'static,
     W: Write + AsRawFd + Send + 'static,
@@ -1058,6 +1073,7 @@ fn run_roundtrip_inner<R, W, F>(
             group_commit_us,
             shutdown,
             warmup,
+            json_path,
         );
     }
 
@@ -1074,6 +1090,7 @@ fn run_roundtrip_inner<R, W, F>(
             group_commit_us,
             shutdown,
             warmup,
+            json_path,
         );
     }
 }
@@ -1091,6 +1108,7 @@ fn run_epoll_roundtrip<R, W, F>(
     group_commit_us: u64,
     shutdown: Arc<AtomicBool>,
     warmup: usize,
+    json_path: Option<&std::path::Path>,
 ) where
     R: AsRawFd + Send + 'static,
     W: Write + AsRawFd + Send + 'static,
@@ -1218,6 +1236,7 @@ fn run_epoll_roundtrip<R, W, F>(
         &merged_histogram,
         blast_duration,
         &extra_lines,
+        json_path,
     );
 
     // Signal server shutdown so pipeline threads can clean up and print
@@ -1248,6 +1267,7 @@ fn run_uring_roundtrip<R, W, F>(
     group_commit_us: u64,
     shutdown: Arc<AtomicBool>,
     warmup: usize,
+    json_path: Option<&std::path::Path>,
 ) where
     R: std::io::Read + AsRawFd + Send + 'static,
     W: Write + AsRawFd + Send + 'static,
@@ -1340,6 +1360,7 @@ fn run_uring_roundtrip<R, W, F>(
         &histogram,
         wall,
         &extra_lines,
+        json_path,
     );
 
     println!();
@@ -1637,6 +1658,7 @@ fn send_pending<W: Write>(connections: &mut [BenchConnection<W>], window: usize)
 // ===========================================================================
 
 /// Print benchmark results: header, throughput, latency histogram.
+/// Optionally writes results to a JSON file for post-processing.
 fn print_results(
     label: &str,
     measured_orders: usize,
@@ -1644,6 +1666,7 @@ fn print_results(
     histogram: &Histogram<u64>,
     wall: Duration,
     extra_lines: &[String],
+    json_path: Option<&std::path::Path>,
 ) {
     let total_orders = measured_orders + warmup_orders;
     let throughput = (total_orders as f64) / wall.as_secs_f64();
@@ -1691,6 +1714,52 @@ fn print_results(
         threshold *= 10;
     }
     println!("    max:     {:>8.2} µs", histogram.max() as f64 / 1000.0);
+
+    // Write JSON results if requested.
+    if let Some(path) = json_path {
+        use std::io::Write;
+
+        let throughput = (total_orders as f64) / wall.as_secs_f64();
+        let mut percentiles = String::from("{");
+        percentiles.push_str(&format!(
+            "\"min_us\":{:.2},\"p50_us\":{:.2},\"p90_us\":{:.2}",
+            histogram.min() as f64 / 1000.0,
+            histogram.value_at_quantile(0.50) as f64 / 1000.0,
+            histogram.value_at_quantile(0.90) as f64 / 1000.0,
+        ));
+        let mut n = 2;
+        let mut t = 1_000usize;
+        while t <= measured_orders {
+            let q = 1.0 - 10.0f64.powi(-(n as i32));
+            let label = if n <= 2 {
+                "p99_us".to_string()
+            } else {
+                format!("p99{}_us", ".9".repeat(n - 2))
+            };
+            percentiles.push_str(&format!(
+                ",\"{}\":{:.2}",
+                label,
+                histogram.value_at_quantile(q) as f64 / 1000.0
+            ));
+            n += 1;
+            t *= 10;
+        }
+        percentiles.push_str(&format!(
+            ",\"max_us\":{:.2}}}",
+            histogram.max() as f64 / 1000.0
+        ));
+
+        let json = format!(
+            "{{\"label\":\"{label}\",\"measured_orders\":{measured_orders},\"warmup_orders\":{warmup_orders},\"wall_ms\":{:.2},\"throughput_ops\":{:.0},\"latency\":{percentiles}}}",
+            wall.as_secs_f64() * 1000.0,
+            throughput,
+        );
+
+        let mut file = std::fs::File::create(path).expect("create json file");
+        file.write_all(json.as_bytes()).expect("write json");
+        file.write_all(b"\n").expect("write newline");
+        eprintln!("Results written to {}", path.display());
+    }
 }
 
 /// Display a latency percentile chart using ratatui, then wait for a keypress.
