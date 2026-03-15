@@ -53,52 +53,35 @@ A matching engine built on the [LMAX architecture](https://martinfowler.com/arti
 
 ## Features
 
-Checklist of features expected of a production trade execution engine. Items marked with **[x]** are implemented; **[ ]** are planned; *deferred* items are not needed for the LAN benchmark demo.
+Checklist of features expected of a production trade execution engine. Items marked with **[x]** are implemented; **[ ]** are planned.
 
 ### Order Types
 - [x] Market
 - [x] Limit
 - [x] Stop (stop-loss)
 - [x] Stop-Limit
-- [ ] Iceberg (hidden quantity) — *deferred*
-- [ ] Trailing Stop — *deferred*
-- [ ] OCO (One-Cancels-Other) — *deferred*
-- [ ] Bracket (entry + take-profit + stop-loss) — *deferred*
-
+- [ ] Iceberg (hidden quantity)- [ ] Trailing Stop- [ ] OCO (One-Cancels-Other)- [ ] Bracket (entry + take-profit + stop-loss)
 ### Time-in-Force
 - [x] GTC (Good-Til-Cancelled)
 - [x] IOC (Immediate-Or-Cancel)
 - [x] FOK (Fill-Or-Kill)
-- [ ] GTD (Good-Til-Date) — *deferred*
-- [ ] Day — *deferred*
-
+- [ ] GTD (Good-Til-Date)- [ ] Day
 ### Execution Qualifiers
-- [ ] Post-Only (maker-only, reject if would take) — *deferred*
-- [ ] Reduce-Only (only decrease position size) — *deferred*
-
+- [ ] Post-Only (maker-only, reject if would take)- [ ] Reduce-Only (only decrease position size)
 ### Matching Engine
 - [x] Strict price-time priority (BTreeMap + VecDeque order book)
 - [x] Execution reports: Fill, Placed, Triggered, Cancelled, Rejected
 - [x] Multi-instrument exchange with shared account balances
-- [ ] Cancel-replace / order amendment — *deferred*
-- [ ] Circuit breakers (price bands, trading halts) — *deferred*
-- [ ] Auction mechanisms (opening/closing/volatility auctions) — *deferred*
-
+- [ ] Cancel-replace / order amendment- [ ] Circuit breakers (price bands, trading halts)- [ ] Auction mechanisms (opening/closing/volatility auctions)
 ### Fees
-- [ ] Maker/taker fee model — *deferred*
-- [ ] Fee deduction on fill — *deferred*
-- [ ] Fee schedules (volume-based tiers) — *deferred*
-
+- [ ] Maker/taker fee model- [ ] Fee deduction on fill- [ ] Fee schedules (volume-based tiers)
 ### Risk & Accounting
 - [x] Per-account, per-currency balance management (reserve on order, update on fill, release on cancel)
 - [x] Self-trade prevention (per-order modes: CancelNewest, CancelOldest, CancelBoth)
 - [x] Fat finger checks (max order size, max notional value — per-instrument configurable `RiskLimits`)
 - [x] Kill switch (cancel all resting orders and pending stops for an account across all instruments)
 - [x] Client deduplication (per-account OrderId high-water mark — prevents double-execution on crash-recovery retry)
-- [ ] Price band checks (reject orders too far from reference price) — *deferred*
-- [ ] Order throttling (per-account rate limiting) — *deferred*
-- [ ] Position/exposure limits — *deferred*
-
+- [ ] Price band checks (reject orders too far from reference price)- [ ] Order throttling (per-account rate limiting)- [ ] Position/exposure limits
 ### Event Sourcing & Durability ([docs/journal.md](docs/journal.md))
 - [x] Write-ahead journal with CRC32C checksums
 - [x] Batch journal I/O via LMAX disruptor ring buffer pipeline
@@ -106,10 +89,7 @@ Checklist of features expected of a production trade execution engine. Items mar
 - [x] Snapshot save/load for fast recovery
 - [x] Deterministic replay from journal
 - [x] Pipelined io_uring async fsync with group commit
-- [ ] Journal rotation — *deferred*
-- [ ] Journal compaction (automatic snapshot trigger) — *deferred*
-- [ ] Output event log (durable ExecutionReport stream for audit trail) — *deferred*
-
+- [ ] Journal rotation- [ ] Journal compaction (automatic snapshot trigger)- [ ] Output event log (durable ExecutionReport stream for audit trail)
 ### Networking
 - [x] Custom binary wire protocol (length-prefixed framing)
 - [x] TCP transport with `TCP_NODELAY`
@@ -120,24 +100,12 @@ Checklist of features expected of a production trade execution engine. Items mar
 - [x] Typed client library
 - [x] Terminal UI for interactive testing
 - [x] Heartbeats and connection timeouts (bidirectional keepalive, configurable idle timeout detection)
-- [ ] Backpressure handling (defined policy when disruptor is full) — *deferred*
-- [ ] TLS (encrypted client connections) — *deferred*
-- [ ] DDoS protection (connection rate limiting, per-IP limits, max connections cap) — *deferred*
-- [ ] QUIC transport — *deferred*
-- [ ] Kernel bypass (DPDK/ef_vi) — *deferred*
-
+- [ ] Backpressure handling (defined policy when disruptor is full)- [ ] TLS (encrypted client connections)- [ ] DDoS protection (connection rate limiting, per-IP limits, max connections cap)- [ ] QUIC transport- [ ] Kernel bypass (DPDK/ef_vi)
 ### Gateway
 - [x] TCP proxy between clients and engine (binary protocol)
-- [ ] Scalable I/O model (epoll/io_uring multiplexing) — *deferred*
-- [ ] Market data dissemination (L2 snapshots, trade feed, BBO push updates) — *deferred*
-- [ ] Subscription management (subscribe/unsubscribe per instrument) — *deferred*
-- [ ] Reference data management (instrument lifecycle) — *deferred*
-
+- [ ] Scalable I/O model (epoll/io_uring multiplexing)- [ ] Market data dissemination (L2 snapshots, trade feed, BBO push updates)- [ ] Subscription management (subscribe/unsubscribe per instrument)- [ ] Reference data management (instrument lifecycle)
 ### Authentication & Authorization
-- [ ] Client authentication — *deferred*
-- [ ] Per-account trading permissions — *deferred*
-- [ ] Admin API (instrument management, circuit breaker controls, kill switch) — *deferred*
-
+- [ ] Client authentication- [ ] Per-account trading permissions- [ ] Admin API (instrument management, circuit breaker controls, kill switch)
 ### Operations & Reliability
 - [x] Structured logging (`tracing` crate)
 - [x] Per-stage pipeline latency tracing (`latency-trace` feature gate)
@@ -149,19 +117,12 @@ Checklist of features expected of a production trade execution engine. Items mar
 - [x] Pipeline stage utilization (`pipeline-stats` feature gate — busy/idle ratio per stage)
 - [ ] Metrics transport (decide where/how to expose: stats file, output event channel, admin socket)
 - [ ] Connection counts, disruptor queue depth — *primary node only*
-- [ ] Order/fill/cancel throughput, latency histograms, volume analytics — *deffered: replica or offline (journal-derived, zero primary impact)*
+- [ ] Order/fill/cancel throughput, latency histograms, volume analytics — *replica or offline (journal-derived, zero primary impact)*
 
 ### Redundancy & High Availability
-- [ ] Journal replication (WAL streaming to replica) — *deferred*
-- [ ] State machine replication (deterministic replay on replica) — *deferred*
-- [ ] Failover detection and promotion (leader election, split-brain prevention) — *deferred*
-- [ ] Client failover (reconnect to new primary, resume with sequence numbers) — *deferred*
-
+- [ ] Journal replication (WAL streaming to replica)- [ ] State machine replication (deterministic replay on replica)- [ ] Failover detection and promotion (leader election, split-brain prevention)- [ ] Client failover (reconnect to new primary, resume with sequence numbers)
 ### Horizontal Scaling
-- [ ] Instrument sharding (partition instruments across engine instances, each single-threaded) — *deferred*
-- [ ] Cross-shard routing (gateway routes orders to the correct shard by symbol) — *deferred*
-- [ ] Cross-shard risk checks (portfolio-level margin requires message passing between shards) — *deferred*
-
+- [ ] Instrument sharding (partition instruments across engine instances, each single-threaded)- [ ] Cross-shard routing (gateway routes orders to the correct shard by symbol)- [ ] Cross-shard risk checks (portfolio-level margin requires message passing between shards)
 ### Performance Tuning
 - [x] Release profile: `lto = "fat"`, `codegen-units = 1`, `panic = "abort"`, `target-cpu=native`
 - [x] jemalloc (`tikv-jemallocator`)
