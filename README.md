@@ -162,6 +162,19 @@ Checklist of features expected of a production trade execution engine. Items mar
 - [ ] Cross-shard routing (gateway routes orders to the correct shard by symbol)
 - [ ] Cross-shard risk checks (portfolio-level margin requires message passing between shards)
 
+### Benchmarking & Measurements
+- [x] Realistic order flow generator (power-law prices/sizes, cancels, fills, multiple accounts, STP diversity)
+- [x] Multi-threaded io_uring benchmark client (`--bench-threads`)
+- [x] JSON output for machine-readable results (`--json`)
+- [x] TUI charts: tail latency stability and latency histogram (`--features chart`)
+- [x] Dynamic percentile depth based on sample size
+- [ ] Multi-threaded LAN benchmark — test scaling across bench threads on the Cherry servers
+- [ ] Saturation curve — sweep `--clients` and `--window`, plot latency vs throughput from JSON output
+- [ ] Multi-machine benchmark — run bench from multiple machines simultaneously (`--account-id`, `--order-id-offset`)
+- [ ] Real-world data replay (NASDAQ ITCH 5.0, Databento, Lobster — legal review needed)
+- [ ] Flame graph integration — automated `perf record` + folding for hot-path analysis
+- [ ] Benchmark reproducibility — seeded RNG option for deterministic order flow across runs
+
 ### Performance Tuning
 - [x] Release profile: `lto = "fat"`, `codegen-units = 1`, `panic = "abort"`, `target-cpu=native`
 - [x] jemalloc (`tikv-jemallocator`)
