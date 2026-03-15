@@ -25,7 +25,7 @@ use std::io::{Read, Write};
 use std::num::NonZeroU64;
 use std::path::Path;
 
-use crate::account::{AccountManager, Balance, Reservation};
+use crate::account::{AccountManager, Balance};
 use crate::exchange::Exchange;
 use crate::orderbook::OrderBook;
 use crate::types::{
@@ -856,7 +856,7 @@ impl Exchange {
             books_map.entry(spec.symbol).or_default();
         }
 
-        let accounts = AccountManager::restore(state.balances, state.reservations);
+        let accounts = AccountManager::from_parts(state.balances, state.reservations);
         let order_sides: HashMap<OrderId, Side> = state.order_sides.into_iter().collect();
         let risk_limits: HashMap<Symbol, RiskLimits> = state.risk_limits.into_iter().collect();
         let max_order_id: HashMap<AccountId, u64> = state.max_order_id.into_iter().collect();
@@ -869,35 +869,6 @@ impl Exchange {
             risk_limits,
             max_order_id,
         )
-    }
-}
-
-impl AccountManager {
-    /// Snapshot all balances for serialization.
-    pub(crate) fn snapshot_balances(&self) -> Vec<((AccountId, CurrencyId), Balance)> {
-        self.balances_iter().map(|(&k, &v)| (k, v)).collect()
-    }
-
-    /// Snapshot all reservations for serialization.
-    pub(crate) fn snapshot_reservations(&self) -> Vec<(OrderId, AccountId, CurrencyId, u64)> {
-        self.reservations_iter()
-            .map(|(&order_id, res)| (order_id, res.account(), res.currency(), res.remaining()))
-            .collect()
-    }
-
-    /// Restore from snapshot data.
-    pub(crate) fn restore(
-        balances: Vec<((AccountId, CurrencyId), Balance)>,
-        reservations: Vec<(OrderId, AccountId, CurrencyId, u64)>,
-    ) -> Self {
-        let balance_map: HashMap<(AccountId, CurrencyId), Balance> = balances.into_iter().collect();
-        let reservation_map: HashMap<OrderId, Reservation> = reservations
-            .into_iter()
-            .map(|(order_id, account, currency, remaining)| {
-                (order_id, Reservation::new(account, currency, remaining))
-            })
-            .collect();
-        Self::from_parts(balance_map, reservation_map)
     }
 }
 

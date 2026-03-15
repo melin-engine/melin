@@ -4,6 +4,17 @@
 //! placement, updates balances on fills, and releases reserves on
 //! cancellation. Runs on the same single thread as the matching engine
 //! (no locks needed).
+//!
+//! Balances are stored in a flat `Vec<Balance>` indexed by
+//! `account_id * currency_stride + currency_id`. This gives O(1) lookups
+//! with no hashing, no prefault needed (sequential allocation), and
+//! near-instant bulk provisioning (single allocation + sequential writes).
+//!
+//! The Vec is sized at startup to cover all seeded accounts/currencies.
+//! Hot-path operations (`try_reserve`, `fill`, `release`, `balance`) use
+//! direct indexing with no allocation. Only `deposit` can grow the Vec
+//! when a new account or currency appears — this is an admin operation
+//! that happens outside the order-matching critical path.
 
 use std::collections::HashMap;
 
@@ -17,7 +28,7 @@ use crate::types::{
 /// Split into `available` (free to use) and `reserved` (locked by open orders).
 /// Uses `u64` to match the scale of `Price`/`Quantity`. Overflow-prone
 /// calculations (price × quantity) use `u128` intermediates.
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Balance {
     /// Funds available for new orders.
     pub available: u64,
@@ -29,6 +40,10 @@ impl Balance {
     /// Total balance (available + reserved).
     pub fn total(&self) -> u64 {
         self.available.saturating_add(self.reserved)
+    }
+
+    fn is_zero(&self) -> bool {
+        self.available == 0 && self.reserved == 0
     }
 }
 
@@ -68,82 +83,124 @@ impl Reservation {
 
 /// Manages account balances across all currencies.
 ///
-/// Uses `HashMap<(AccountId, CurrencyId), Balance>` — a flat composite key
-/// avoids nested map lookups, keeping balance checks to a single hash
-/// lookup on the hot path.
+/// Balances are stored in a flat `Vec<Balance>` indexed by
+/// `account_id * currency_stride + currency_id` for O(1) direct lookups.
+/// No hashing, no prefault, and bulk provisioning is a single allocation.
+///
+/// The Vec is pre-sized at startup to cover all seeded accounts. Runtime
+/// deposits for new accounts may grow the Vec, but deposits are admin
+/// operations — not on the order-matching hot path.
 pub struct AccountManager {
-    balances: HashMap<(AccountId, CurrencyId), Balance>,
-    /// Maps each open order to its reservation details. O(1) lookup on
-    /// fill/cancel so we don't need to recompute costs.
+    /// Flat balance array. Index = account.0 * currency_stride + currency.0.
+    balances: Vec<Balance>,
+    /// Number of currency slots per account row (max_currency_id + 1).
+    currency_stride: usize,
+    /// Maps each open order to its reservation details. HashMap because
+    /// OrderIds are sparse u64 values that come and go with order lifecycle.
     reservations: HashMap<OrderId, Reservation>,
 }
 
 impl AccountManager {
     pub fn new() -> Self {
         Self {
-            balances: HashMap::new(),
+            balances: Vec::new(),
+            currency_stride: 0,
             reservations: HashMap::new(),
         }
     }
 
     /// Create an AccountManager pre-sized for production workloads.
-    /// Avoids HashMap resize spikes on the hot path.
     pub fn with_capacity() -> Self {
         Self {
-            // Many accounts × few currencies per account.
-            balances: HashMap::with_capacity(10_000),
+            balances: Vec::new(),
+            currency_stride: 0,
             // One reservation per resting order across all instruments.
             reservations: HashMap::with_capacity(2_000_000),
         }
     }
 
-    /// Touch all pre-allocated HashMap pages so page faults happen at startup,
-    /// not on the hot path.
+    /// Touch all pre-allocated pages so page faults happen at startup,
+    /// not on the hot path. Only needed for the reservations HashMap;
+    /// the flat balance Vec is already contiguous and sequentially faulted.
     pub fn prefault(&mut self) {
-        let cap = self.balances.capacity();
-        for i in 0..cap as u32 {
-            self.balances
-                .insert((AccountId(i), CurrencyId(0)), Balance::default());
+        if self.reservations.is_empty() {
+            let cap = self.reservations.capacity();
+            for i in 0..cap {
+                self.reservations.insert(
+                    OrderId(i as u64),
+                    Reservation::new(AccountId(0), CurrencyId(0), 0),
+                );
+            }
+            self.reservations.clear();
         }
-        self.balances.clear();
-
-        let cap = self.reservations.capacity();
-        for i in 0..cap {
-            self.reservations.insert(
-                OrderId(i as u64),
-                Reservation::new(AccountId(0), CurrencyId(0), 0),
-            );
-        }
-        self.reservations.clear();
     }
 
-    /// Reconstruct from pre-built parts (used by snapshot restore).
+    /// Reconstruct from snapshot data.
     pub(crate) fn from_parts(
-        balances: HashMap<(AccountId, CurrencyId), Balance>,
-        reservations: HashMap<OrderId, Reservation>,
+        balance_entries: Vec<((AccountId, CurrencyId), Balance)>,
+        reservations: Vec<(OrderId, AccountId, CurrencyId, u64)>,
     ) -> Self {
+        // Find dimensions from the balance entries.
+        let mut max_account: u32 = 0;
+        let mut max_currency: u32 = 0;
+        for &((account, currency), _) in &balance_entries {
+            max_account = max_account.max(account.0);
+            max_currency = max_currency.max(currency.0);
+        }
+        let currency_stride = max_currency as usize + 1;
+        let num_accounts = max_account as usize + 1;
+        let mut balances = vec![Balance::default(); num_accounts * currency_stride];
+        for ((account, currency), balance) in balance_entries {
+            let idx = account.0 as usize * currency_stride + currency.0 as usize;
+            balances[idx] = balance;
+        }
+
+        let reservation_map: HashMap<OrderId, Reservation> = reservations
+            .into_iter()
+            .map(|(order_id, account, currency, remaining)| {
+                (order_id, Reservation::new(account, currency, remaining))
+            })
+            .collect();
+
         Self {
             balances,
-            reservations,
+            currency_stride,
+            reservations: reservation_map,
         }
     }
 
-    /// Iterate over all balances (for snapshot serialization).
-    pub(crate) fn balances_iter(
-        &self,
-    ) -> impl Iterator<Item = (&(AccountId, CurrencyId), &Balance)> {
-        self.balances.iter()
+    /// Snapshot all non-zero balances for serialization.
+    pub(crate) fn snapshot_balances(&self) -> Vec<((AccountId, CurrencyId), Balance)> {
+        if self.currency_stride == 0 {
+            return Vec::new();
+        }
+        let mut out = Vec::new();
+        for (i, bal) in self.balances.iter().enumerate() {
+            if !bal.is_zero() {
+                let account = AccountId((i / self.currency_stride) as u32);
+                let currency = CurrencyId((i % self.currency_stride) as u32);
+                out.push(((account, currency), *bal));
+            }
+        }
+        out
     }
 
-    /// Iterate over all reservations (for snapshot serialization).
-    pub(crate) fn reservations_iter(&self) -> impl Iterator<Item = (&OrderId, &Reservation)> {
-        self.reservations.iter()
+    /// Snapshot all reservations for serialization.
+    pub(crate) fn snapshot_reservations(&self) -> Vec<(OrderId, AccountId, CurrencyId, u64)> {
+        self.reservations
+            .iter()
+            .map(|(&order_id, res)| (order_id, res.account(), res.currency(), res.remaining()))
+            .collect()
     }
 
-    /// Credit funds to an account. Creates the account/currency entry if needed.
+    /// Credit funds to an account. Grows the balance array if needed.
+    /// This is an admin operation — not on the order-matching hot path.
+    /// After startup seeding, the Vec already covers all known accounts
+    /// so runtime deposits for existing accounts never allocate.
     pub fn deposit(&mut self, account: AccountId, currency: CurrencyId, amount: u64) {
-        let balance = self.balances.entry((account, currency)).or_default();
-        balance.available = balance.available.saturating_add(amount);
+        self.ensure_capacity(account, currency);
+        let idx = account.0 as usize * self.currency_stride + currency.0 as usize;
+        self.balances[idx].available = self.balances[idx].available.saturating_add(amount);
     }
 
     /// Debit available funds from an account.
@@ -154,23 +211,19 @@ impl AccountManager {
         currency: CurrencyId,
         amount: u64,
     ) -> Result<(), RejectReason> {
-        let balance = self
-            .balances
-            .get_mut(&(account, currency))
+        let bal = self
+            .get_mut(account, currency)
             .ok_or(RejectReason::UnknownAccount)?;
-        if balance.available < amount {
+        if bal.available < amount {
             return Err(RejectReason::InsufficientBalance);
         }
-        balance.available -= amount;
+        bal.available -= amount;
         Ok(())
     }
 
     /// Get the balance for an account/currency pair.
     pub fn balance(&self, account: AccountId, currency: CurrencyId) -> Balance {
-        self.balances
-            .get(&(account, currency))
-            .copied()
-            .unwrap_or_default()
+        self.get(account, currency).copied().unwrap_or_default()
     }
 
     /// Attempt to reserve funds for an incoming order.
@@ -189,17 +242,16 @@ impl AccountManager {
     ) -> Result<u64, RejectReason> {
         let (currency, amount) = self.required_reserve(order, spec)?;
 
-        let balance = self
-            .balances
-            .get_mut(&(order.account, currency))
+        let bal = self
+            .get_mut(order.account, currency)
             .ok_or(RejectReason::InsufficientBalance)?;
 
-        if balance.available < amount {
+        if bal.available < amount {
             return Err(RejectReason::InsufficientBalance);
         }
 
-        balance.available -= amount;
-        balance.reserved += amount;
+        bal.available -= amount;
+        bal.reserved += amount;
 
         self.reservations.insert(
             order.id,
@@ -248,42 +300,32 @@ impl AccountManager {
         };
 
         // Buyer: reserved quote decreases, available base increases.
+        // ensure_capacity is a no-op after startup seeding (all currencies
+        // already in range) — just two comparisons, no allocation.
         if let Some(res) = self.reservations.get_mut(&buyer_order) {
             res.remaining = res.remaining.saturating_sub(cost_u64);
-            if let Some(bal) = self.balances.get_mut(&(res.account, spec.quote)) {
-                bal.reserved = bal.reserved.saturating_sub(cost_u64);
-            }
-            if let Some(bal) = self.balances.get_mut(&(res.account, spec.base)) {
-                bal.available = bal.available.saturating_add(qty);
-            } else {
-                // Account may not have a base currency entry yet.
-                self.balances.insert(
-                    (res.account, spec.base),
-                    Balance {
-                        available: qty,
-                        reserved: 0,
-                    },
-                );
-            }
+            let buyer_account = res.account;
+            self.ensure_capacity(buyer_account, spec.base);
+            let stride = self.currency_stride;
+            let quote_idx = buyer_account.0 as usize * stride + spec.quote.0 as usize;
+            self.balances[quote_idx].reserved =
+                self.balances[quote_idx].reserved.saturating_sub(cost_u64);
+            let base_idx = buyer_account.0 as usize * stride + spec.base.0 as usize;
+            self.balances[base_idx].available =
+                self.balances[base_idx].available.saturating_add(qty);
         }
 
         // Seller: reserved base decreases, available quote increases.
         if let Some(res) = self.reservations.get_mut(&seller_order) {
             res.remaining = res.remaining.saturating_sub(qty);
-            if let Some(bal) = self.balances.get_mut(&(res.account, spec.base)) {
-                bal.reserved = bal.reserved.saturating_sub(qty);
-            }
-            if let Some(bal) = self.balances.get_mut(&(res.account, spec.quote)) {
-                bal.available = bal.available.saturating_add(cost_u64);
-            } else {
-                self.balances.insert(
-                    (res.account, spec.quote),
-                    Balance {
-                        available: cost_u64,
-                        reserved: 0,
-                    },
-                );
-            }
+            let seller_account = res.account;
+            self.ensure_capacity(seller_account, spec.quote);
+            let stride = self.currency_stride;
+            let base_idx = seller_account.0 as usize * stride + spec.base.0 as usize;
+            self.balances[base_idx].reserved = self.balances[base_idx].reserved.saturating_sub(qty);
+            let quote_idx = seller_account.0 as usize * stride + spec.quote.0 as usize;
+            self.balances[quote_idx].available =
+                self.balances[quote_idx].available.saturating_add(cost_u64);
         }
 
         // Note: reservation cleanup is handled by process_reports(), which
@@ -295,7 +337,7 @@ impl AccountManager {
     /// Release all remaining reserved funds for an order (on cancel or reject).
     pub fn release(&mut self, order_id: OrderId) {
         if let Some(res) = self.reservations.remove(&order_id)
-            && let Some(bal) = self.balances.get_mut(&(res.account, res.currency))
+            && let Some(bal) = self.get_mut(res.account, res.currency)
         {
             bal.reserved = bal.reserved.saturating_sub(res.remaining);
             bal.available = bal.available.saturating_add(res.remaining);
@@ -388,8 +430,7 @@ impl AccountManager {
                     OrderType::Market | OrderType::Stop { .. } => {
                         // Reserve entire available quote balance since final
                         // price is unknown. Refunded after execution.
-                        self.balances
-                            .get(&(order.account, currency))
+                        self.get(order.account, currency)
                             .map(|b| b.available)
                             .unwrap_or(0)
                     }
@@ -403,6 +444,66 @@ impl AccountManager {
                 // Reserve quantity in base currency.
                 Ok((spec.base, order.quantity.get()))
             }
+        }
+    }
+
+    /// Get a reference to a balance slot, or None if out of bounds.
+    /// Used on the hot path — two comparisons + one array index, no allocation.
+    #[inline]
+    fn get(&self, account: AccountId, currency: CurrencyId) -> Option<&Balance> {
+        let c = currency.0 as usize;
+        if c >= self.currency_stride {
+            return None;
+        }
+        let idx = account.0 as usize * self.currency_stride + c;
+        self.balances.get(idx)
+    }
+
+    /// Get a mutable reference to a balance slot, or None if out of bounds.
+    #[inline]
+    fn get_mut(&mut self, account: AccountId, currency: CurrencyId) -> Option<&mut Balance> {
+        let c = currency.0 as usize;
+        if c >= self.currency_stride {
+            return None;
+        }
+        let idx = account.0 as usize * self.currency_stride + c;
+        self.balances.get_mut(idx)
+    }
+
+    /// Grow the balance array if `(account, currency)` is out of bounds.
+    /// After startup seeding this is a no-op (early return on two comparisons).
+    /// Only allocates when a runtime deposit introduces a previously unseen
+    /// account or currency — an admin operation, not on the matching hot path.
+    ///
+    /// Two growth cases: (1) currency_stride needs to increase — requires
+    /// reshuffling all rows; (2) just need more account rows — simple extend.
+    fn ensure_capacity(&mut self, account: AccountId, currency: CurrencyId) {
+        let needed_stride = currency.0 as usize + 1;
+        let needed_rows = account.0 as usize + 1;
+
+        if needed_stride > self.currency_stride {
+            // Stride increase: reshuffle existing rows to widen each row.
+            let old_stride = self.currency_stride;
+            let old_rows = if old_stride > 0 {
+                self.balances.len() / old_stride
+            } else {
+                0
+            };
+            let new_rows = old_rows.max(needed_rows);
+            let mut new_balances = vec![Balance::default(); new_rows * needed_stride];
+            // Copy each old row into the wider layout.
+            for row in 0..old_rows {
+                let old_start = row * old_stride;
+                let new_start = row * needed_stride;
+                new_balances[new_start..new_start + old_stride]
+                    .copy_from_slice(&self.balances[old_start..old_start + old_stride]);
+            }
+            self.balances = new_balances;
+            self.currency_stride = needed_stride;
+        } else if needed_rows * self.currency_stride > self.balances.len() {
+            // Just need more rows — extend with zeros.
+            self.balances
+                .resize(needed_rows * self.currency_stride, Balance::default());
         }
     }
 }
