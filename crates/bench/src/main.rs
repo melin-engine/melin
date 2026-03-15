@@ -249,12 +249,6 @@ fn main() {
             );
         }
         "roundtrip" => {
-            #[cfg(feature = "io-uring")]
-            if args.bench_threads != DEFAULT_BENCH_THREADS {
-                eprintln!(
-                    "warning: --bench-threads is ignored with io-uring (single-threaded event loop)"
-                );
-            }
             run_roundtrip_bench(
                 args.uds,
                 args.pairs,
@@ -1070,6 +1064,7 @@ fn run_roundtrip_inner<R, W, F>(
             total_pairs,
             window,
             num_clients,
+            bench_threads,
             group_commit_us,
             shutdown,
             warmup,
@@ -1264,6 +1259,7 @@ fn run_uring_roundtrip<R, W, F>(
     total_pairs: usize,
     window: usize,
     num_clients: usize,
+    bench_threads: usize,
     group_commit_us: u64,
     shutdown: Arc<AtomicBool>,
     warmup: usize,
@@ -1333,14 +1329,52 @@ fn run_uring_roundtrip<R, W, F>(
         });
     }
 
-    // Pin the io_uring bench thread (runs on main thread) to avoid
-    // cache contention with server threads (cores 1-5).
-    if let Err(e) = trading_server::affinity::pin_to_core(BENCH_CORE_START) {
-        eprintln!("warning: could not pin io_uring bench to core {BENCH_CORE_START}: {e}");
+    let num_threads = bench_threads.min(num_clients);
+
+    // Distribute connections round-robin across bench threads.
+    let mut thread_conns: Vec<Vec<UringBenchConn>> = (0..num_threads).map(|_| Vec::new()).collect();
+    for (i, conn) in connections.into_iter().enumerate() {
+        thread_conns[i % num_threads].push(conn);
     }
 
     let start = Instant::now();
-    let (histogram, _series) = run_uring_loop(connections, window, start, warmup);
+
+    // Spawn io_uring bench threads, each with its own ring and connection subset.
+    let handles: Vec<_> = thread_conns
+        .into_iter()
+        .enumerate()
+        .map(|(i, conns)| {
+            let core_id = BENCH_CORE_START + i;
+            let bench_start = start;
+            std::thread::Builder::new()
+                .name(format!("bench-{i}"))
+                .spawn(move || {
+                    if let Err(e) = trading_server::affinity::pin_to_core(core_id) {
+                        eprintln!("warning: could not pin bench-{i} to core {core_id}: {e}");
+                    }
+                    run_uring_loop(conns, window, bench_start, warmup)
+                })
+                .expect("spawn bench thread")
+        })
+        .collect();
+
+    // Collect and merge histograms from all threads.
+    let mut histogram =
+        Histogram::<u64>::new_with_bounds(1, 10_000_000_000, 3).expect("histogram bounds");
+    #[cfg(feature = "chart")]
+    let mut _series: TimeSeries = Vec::new();
+    #[cfg(not(feature = "chart"))]
+    let _series: TimeSeries = Vec::new();
+
+    for handle in handles {
+        let (h, s) = handle.join().expect("bench thread panicked");
+        histogram.add(&h).expect("merge histograms");
+        #[cfg(feature = "chart")]
+        _series.extend(s);
+        #[cfg(not(feature = "chart"))]
+        let _ = s;
+    }
+
     let wall = start.elapsed();
 
     let mut extra_lines = Vec::new();
@@ -1349,7 +1383,8 @@ fn run_uring_roundtrip<R, W, F>(
     }
     extra_lines.push(format!("  Transport: {transport_name}"));
     extra_lines.push(format!(
-        "  Bench threads: 1 (io_uring, core {BENCH_CORE_START})"
+        "  Bench threads: {num_threads} (io_uring, cores {BENCH_CORE_START}-{})",
+        BENCH_CORE_START + num_threads - 1
     ));
     extra_lines.push(format!("  Window: {window}, Clients: {num_clients}"));
 
