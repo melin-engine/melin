@@ -171,6 +171,23 @@ Most analytics can run on a **replica** replaying the journal, keeping the prima
 - [ ] Client failover (reconnect to new primary, resume with sequence numbers)
 - [ ] Network partition handling (fencing, quorum-based decisions)
 
+## Priority Roadmap
+
+Ordered by importance for commercial readiness (exchange operators and investors).
+
+1. **Circuit breakers** — price bands, trading halts. Table stakes for any production exchange.
+2. **Cancel-replace / order amendment** — market makers won't evaluate without it. Most active order flow on any venue.
+3. **Replication & HA** — journal streaming to a replica, deterministic replay, failover. No exchange runs a single node.
+4. **Fuzz testing** — `cargo-fuzz` crash discovery. Correctness credibility for technical due diligence.
+5. **Journal rotation + compaction** — unbounded disk growth is a non-starter operationally.
+6. **TLS + authentication** — mTLS with certificate-based authorization (admin/trader/read-only permissions). Required for non-VLAN deployments.
+7. **Metrics & observability** — connection counts, queue depth, health endpoints. Operators need visibility.
+8. **Auction mechanisms** — opening/closing/volatility auctions. Differentiator for regulated venues.
+9. **Fee model** — maker/taker fees on fills. Shows the engine can generate revenue.
+10. **Documentation** — architecture guide, API reference, operational runbook.
+
+Also needed: backpressure policy, gateway scalability (epoll/io_uring multiplexing), admin API.
+
 ### Benchmarking & Measurements
 - [x] Realistic order flow generator (power-law prices/sizes, cancels, fills, multiple accounts, STP diversity)
 - [x] Multi-threaded io_uring benchmark client (`--bench-threads`)
