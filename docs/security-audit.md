@@ -138,8 +138,7 @@ A corrupted or malicious snapshot file can:
 
 Auth nonce uses `rand::fill(&mut nonce)` which defaults to the thread-local CSPRNG. This is secure in practice, but doesn't explicitly specify `OsRng` for cryptographic material.
 
-**Impact**: None currently — `rand` 0.9 defaults are secure.
-**Mitigation**: Use `rand::rngs::OsRng` explicitly to make the security guarantee visible in code.
+**Status**: **FIXED** — replaced `rand::fill()` with `getrandom::fill()` which calls the OS CSPRNG directly.
 
 ---
 
@@ -149,8 +148,7 @@ Auth nonce uses `rand::fill(&mut nonce)` which defaults to the thread-local CSPR
 
 Connection state has no `is_authenticated` field. Authentication is enforced structurally (only authenticated connections reach the reader), but a future refactor could accidentally allow unauthenticated traffic.
 
-**Impact**: None currently — defense-in-depth improvement.
-**Mitigation**: Add explicit `authenticated: bool` field, assert on entry to `process_connection`.
+**Status**: **N/A** — on closer inspection, `ConnectionState` already carries a typed `permission: Permission` field set only from the auth handshake. This is stronger than a boolean — unauthenticated connections never reach the reader.
 
 ---
 
@@ -178,8 +176,8 @@ Market and stop orders skip price band checks because they have no submission-ti
 | SEC-07 | Saturating arithmetic masks errors | MEDIUM | No |
 | SEC-08 | No TLS | MEDIUM | MITM |
 | SEC-09 | Snapshot file tampering | MEDIUM | No |
-| SEC-10 | Nonce RNG not explicit | LOW | No |
-| SEC-11 | No explicit auth state field | LOW | No |
+| SEC-10 | ~~Nonce RNG not explicit~~ | ~~LOW~~ FIXED | No |
+| SEC-11 | ~~No explicit auth state field~~ | ~~LOW~~ N/A | No |
 | SEC-12 | Market orders bypass price bands | LOW | N/A |
 
 ## Recommended Priority

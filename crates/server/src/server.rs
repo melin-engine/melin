@@ -486,8 +486,10 @@ fn authenticate_connection<R: std::io::Read, W: std::io::Write>(
     use trading_protocol::message::{Request, ResponseKind};
 
     // Generate a 32-byte random nonce for this connection.
+    // Explicit OsRng for cryptographic material (SEC-10).
     let mut nonce = [0u8; 32];
-    rand::fill(&mut nonce);
+    getrandom::fill(&mut nonce)
+        .map_err(|e| io::Error::other(format!("getrandom failed: {e}")))?;
 
     // Send Challenge.
     let mut buf = [0u8; 64];
