@@ -250,7 +250,11 @@ impl Exchange {
                 return;
             }
             // Price band check applies only to orders with a known price.
-            // Market and Stop orders have no submission-time price.
+            // Market and Stop orders have no submission-time price and
+            // bypass bands by design (SEC-12). A large market order can
+            // fill far outside the intended bands. Mitigation: use the
+            // trading halt flag, or implement automatic volatility halts
+            // (Phase 3 of the circuit breaker plan).
             let limit_price = match order.order_type {
                 OrderType::Limit { price } => Some(price),
                 OrderType::StopLimit { limit_price, .. } => Some(limit_price),

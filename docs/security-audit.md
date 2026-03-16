@@ -36,7 +36,7 @@ The accept loop has no limit on concurrent connections, no per-IP rate limiting,
 
 **Impact**: An attacker can exhaust file descriptors (EMFILE), saturate the accept thread with slow auth handshakes, or overwhelm the reader pool with thousands of idle connections.
 **Exploitable remotely**: Yes — open many connections slowly.
-**Mitigation**: Add `max_connections` limit, per-IP connection cap, and exponential backoff on auth failures.
+**Status**: **PARTIALLY FIXED** — added `--max-connections` flag (default 1024). Connections beyond the limit are rejected before auth. Remaining: per-IP connection cap and exponential backoff on auth failures.
 
 ---
 
@@ -158,8 +158,7 @@ Connection state has no `is_authenticated` field. Authentication is enforced str
 
 Market and stop orders skip price band checks because they have no submission-time price. A large market order can fill far outside the intended price bands.
 
-**Impact**: Price moves beyond intended bands — operational, not a security bug.
-**Mitigation**: Document this behavior. Consider auto-halting after a trade outside bands (Phase 3 of circuit breaker plan).
+**Status**: **DOCUMENTED** — added comment in `exchange.rs` explaining the design choice and pointing to Phase 3 (automatic volatility halts) as the proper mitigation.
 
 ---
 
@@ -168,7 +167,7 @@ Market and stop orders skip price band checks because they have no submission-ti
 | ID | Issue | Severity | Remote |
 |----|-------|----------|--------|
 | SEC-01 | ~~Response stage blocks on slow client~~ | ~~HIGH~~ FIXED | Yes |
-| SEC-02 | No connection limits / rate limiting | HIGH | Yes |
+| SEC-02 | ~~No connection limits~~ / rate limiting | ~~HIGH~~ PARTIAL | Yes |
 | SEC-03 | Unbounded order book growth | HIGH | Yes |
 | SEC-04 | No order throttling | MEDIUM | Yes |
 | SEC-05 | Journal disk exhaustion hangs server | MEDIUM | Indirect |
@@ -178,7 +177,7 @@ Market and stop orders skip price band checks because they have no submission-ti
 | SEC-09 | Snapshot file tampering | MEDIUM | No |
 | SEC-10 | ~~Nonce RNG not explicit~~ | ~~LOW~~ FIXED | No |
 | SEC-11 | ~~No explicit auth state field~~ | ~~LOW~~ N/A | No |
-| SEC-12 | Market orders bypass price bands | LOW | N/A |
+| SEC-12 | ~~Market orders bypass price bands~~ | ~~LOW~~ DOCUMENTED | N/A |
 
 ## Recommended Priority
 
