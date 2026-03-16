@@ -667,7 +667,7 @@ impl Exchange {
         let new_required = match side {
             Side::Buy => {
                 let cost = new_price.get() as u128 * new_quantity.get() as u128;
-                let fee_cushion = cost / 10_000 * max_fee_bps as u128;
+                let fee_cushion = cost * max_fee_bps as u128 / 10_000;
                 let with_fee = cost.saturating_add(fee_cushion);
                 match u64::try_from(with_fee) {
                     Ok(c) => c,
@@ -4720,5 +4720,67 @@ mod tests {
             assert_eq!(*maker_fee, 50);
             assert_eq!(*taker_fee, 100);
         }
+    }
+
+    #[test]
+    fn fee_cushion_covers_actual_fee_at_rounding_boundary() {
+        // Regression test: cost=15_000, bps=3 → actual fee = 15_000*3/10_000 = 4.
+        // Old formula (cost/10_000*bps) = 1*3 = 3, which was insufficient.
+        let mut exchange = Exchange::new();
+        let btc = Symbol(1);
+        exchange.add_instrument(btc_usd_spec());
+        // Deposit just enough for cost (15_000) + correct fee cushion (4) = 15_004.
+        exchange.deposit(ACCT_A, USD, 15_004);
+        exchange.deposit(ACCT_B, BTC, 100);
+
+        exchange.set_fee_schedule(
+            btc,
+            FeeSchedule {
+                maker_fee_bps: 3,
+                taker_fee_bps: 3,
+            },
+        );
+
+        let mut reports = Vec::new();
+        // price=150, qty=100 → cost=15_000. fee=15_000*3/10_000=4.
+        // Reservation must be 15_004 to cover cost+fee.
+        exchange.execute(
+            btc,
+            limit_order(1, ACCT_A, Side::Buy, 150, 100, TimeInForce::GTC),
+            &mut reports,
+        );
+        // Should be placed, not rejected for insufficient balance.
+        assert!(
+            matches!(reports[0], ExecutionReport::Placed { .. }),
+            "expected Placed, got {:?}",
+            reports[0]
+        );
+        reports.clear();
+
+        // Fill it.
+        exchange.execute(
+            btc,
+            limit_order(2, ACCT_B, Side::Sell, 150, 100, TimeInForce::GTC),
+            &mut reports,
+        );
+
+        let fill = reports
+            .iter()
+            .find(|r| matches!(r, ExecutionReport::Fill { .. }))
+            .unwrap();
+        if let ExecutionReport::Fill {
+            maker_fee,
+            taker_fee,
+            ..
+        } = fill
+        {
+            assert_eq!(*maker_fee, 4);
+            assert_eq!(*taker_fee, 4);
+        }
+
+        // Buyer: deposited 15_004, reserved 15_004, cost=15_000 + fee=4 = 15_004.
+        // No leftover — balance should be 0 available, 0 reserved.
+        assert_eq!(exchange.accounts().balance(ACCT_A, USD).available, 0);
+        assert_eq!(exchange.accounts().balance(ACCT_A, BTC).available, 100);
     }
 }

@@ -537,9 +537,11 @@ impl AccountManager {
                         // The fee cushion ensures fees can be charged from the
                         // reservation even when filling at the exact limit price.
                         let cost = (price.get() as u128) * (order.quantity.get() as u128);
-                        // Compute fee cushion separately to avoid u128 overflow
-                        // (cost * 10_020 could exceed u128 for extreme values).
-                        let fee_cushion = cost / 10_000 * max_fee_bps as u128;
+                        // Fee cushion must use the same rounding direction as
+                        // apply_fees (cost * bps / 10_000) to guarantee the
+                        // reservation always covers the actual fee. No overflow
+                        // risk: u128 handles cost * 10_000 for any u64 inputs.
+                        let fee_cushion = cost * max_fee_bps as u128 / 10_000;
                         let with_fee = cost.saturating_add(fee_cushion);
                         u64::try_from(with_fee).map_err(|_| RejectReason::InsufficientBalance)?
                     }
