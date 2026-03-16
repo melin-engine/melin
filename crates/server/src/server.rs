@@ -333,6 +333,14 @@ pub fn run_with_shutdown<L: BlockingTransportListener>(
             debug!(connection_id = connection_id.0, error = %e, "failed to clear auth timeout");
         }
 
+        // Set a write timeout on the response socket so a slow/stalled
+        // client cannot block the response thread (SEC-01). If a write
+        // takes longer than this, it returns EAGAIN and the response
+        // stage drops the connection.
+        if let Err(e) = set_write_timeout(&std_write, Some(std::time::Duration::from_secs(5))) {
+            debug!(connection_id = connection_id.0, error = %e, "failed to set write timeout");
+        }
+
         // Register the writer with the response thread before the reader.
         // This ensures the response stage has the writer before any
         // requests arrive from this connection.
@@ -589,6 +597,37 @@ fn set_read_timeout<F: std::os::unix::io::AsRawFd>(
             fd.as_raw_fd(),
             libc::SOL_SOCKET,
             libc::SO_RCVTIMEO,
+            &tv as *const libc::timeval as *const libc::c_void,
+            std::mem::size_of::<libc::timeval>() as libc::socklen_t,
+        )
+    };
+    if ret < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+/// Set `SO_SNDTIMEO` on a socket. Prevents blocking writes from stalling
+/// the response thread when a client stops reading (SEC-01).
+fn set_write_timeout<F: std::os::unix::io::AsRawFd>(
+    fd: &F,
+    timeout: Option<std::time::Duration>,
+) -> std::io::Result<()> {
+    let tv = match timeout {
+        Some(d) => libc::timeval {
+            tv_sec: d.as_secs() as libc::time_t,
+            tv_usec: d.subsec_micros() as libc::suseconds_t,
+        },
+        None => libc::timeval {
+            tv_sec: 0,
+            tv_usec: 0,
+        },
+    };
+    let ret = unsafe {
+        libc::setsockopt(
+            fd.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_SNDTIMEO,
             &tv as *const libc::timeval as *const libc::c_void,
             std::mem::size_of::<libc::timeval>() as libc::socklen_t,
         )

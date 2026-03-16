@@ -24,7 +24,7 @@ The response stage calls `BlockingFrameWriter::write_frame()` without a write ti
 
 **Impact**: Latency spike or complete stall for all clients.
 **Exploitable remotely**: Yes — connect, authenticate, stop reading.
-**Mitigation**: Set `SO_SNDTIMEO` / `set_write_timeout()` on response sockets. Drop connections that fail to drain within the timeout.
+**Status**: **FIXED** — 5-second `SO_SNDTIMEO` set on response sockets before handoff to response stage. Timed-out writes return an error, and the response stage already drops connections on write error.
 
 ---
 
@@ -169,7 +169,7 @@ Market and stop orders skip price band checks because they have no submission-ti
 
 | ID | Issue | Severity | Remote |
 |----|-------|----------|--------|
-| SEC-01 | Response stage blocks on slow client | HIGH | Yes |
+| SEC-01 | ~~Response stage blocks on slow client~~ | ~~HIGH~~ FIXED | Yes |
 | SEC-02 | No connection limits / rate limiting | HIGH | Yes |
 | SEC-03 | Unbounded order book growth | HIGH | Yes |
 | SEC-04 | No order throttling | MEDIUM | Yes |
