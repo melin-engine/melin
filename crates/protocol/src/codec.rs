@@ -21,7 +21,8 @@ use std::num::NonZeroU64;
 
 use trading_engine::le;
 use trading_engine::types::{
-    AccountId, ExecutionReport, Order, OrderId, OrderType, Price, Quantity, RejectReason, Symbol,
+    AccountId, CircuitBreakerConfig, CurrencyId, ExecutionReport, InstrumentSpec, Order, OrderId,
+    OrderType, Price, Quantity, RejectReason, RiskLimits, Symbol,
 };
 
 use crate::error::ProtocolError;
@@ -33,6 +34,10 @@ const TAG_CANCEL_ORDER: u8 = 2;
 const TAG_REQUEST_HEARTBEAT: u8 = 3;
 const TAG_CANCEL_ALL: u8 = 4;
 const TAG_CHALLENGE_RESPONSE: u8 = 5;
+const TAG_ADD_INSTRUMENT: u8 = 6;
+const TAG_DEPOSIT: u8 = 7;
+const TAG_SET_RISK_LIMITS: u8 = 8;
+const TAG_SET_CIRCUIT_BREAKER: u8 = 9;
 
 // --- Response tags ---
 const TAG_PLACED: u8 = 11;
@@ -110,6 +115,69 @@ pub fn encode_request(request: &Request, buf: &mut [u8]) -> Result<usize, Protoc
             buf[pos..pos + 32].copy_from_slice(public_key);
             pos += 32;
         }
+        Request::AddInstrument { spec } => {
+            buf[pos] = TAG_ADD_INSTRUMENT;
+            pos += 1;
+            le::put_u32(&mut buf[pos..], spec.symbol.0);
+            pos += 4;
+            le::put_u32(&mut buf[pos..], spec.base.0);
+            pos += 4;
+            le::put_u32(&mut buf[pos..], spec.quote.0);
+            pos += 4;
+        }
+        Request::Deposit {
+            account,
+            currency,
+            amount,
+        } => {
+            buf[pos] = TAG_DEPOSIT;
+            pos += 1;
+            le::put_u32(&mut buf[pos..], account.0);
+            pos += 4;
+            le::put_u32(&mut buf[pos..], currency.0);
+            pos += 4;
+            le::put_u64(&mut buf[pos..], *amount);
+            pos += 8;
+        }
+        Request::SetRiskLimits { symbol, limits } => {
+            buf[pos] = TAG_SET_RISK_LIMITS;
+            pos += 1;
+            le::put_u32(&mut buf[pos..], symbol.0);
+            pos += 4;
+            // Flags byte: bit 0 = has max_order_qty, bit 1 = has max_order_notional.
+            let flags = (limits.max_order_qty.is_some() as u8)
+                | ((limits.max_order_notional.is_some() as u8) << 1);
+            buf[pos] = flags;
+            pos += 1;
+            if let Some(qty) = limits.max_order_qty {
+                le::put_u64(&mut buf[pos..], qty.get());
+                pos += 8;
+            }
+            if let Some(notional) = limits.max_order_notional {
+                le::put_u64(&mut buf[pos..], notional);
+                pos += 8;
+            }
+        }
+        Request::SetCircuitBreaker { symbol, config } => {
+            buf[pos] = TAG_SET_CIRCUIT_BREAKER;
+            pos += 1;
+            le::put_u32(&mut buf[pos..], symbol.0);
+            pos += 4;
+            // Flags: bit 0 = has lower band, bit 1 = has upper band, bit 2 = halted.
+            let flags = (config.price_band_lower.is_some() as u8)
+                | ((config.price_band_upper.is_some() as u8) << 1)
+                | ((config.halted as u8) << 2);
+            buf[pos] = flags;
+            pos += 1;
+            if let Some(lower) = config.price_band_lower {
+                le::put_u64(&mut buf[pos..], lower.get());
+                pos += 8;
+            }
+            if let Some(upper) = config.price_band_upper {
+                le::put_u64(&mut buf[pos..], upper.get());
+                pos += 8;
+            }
+        }
     }
 
     // Write the length prefix (excludes the 4-byte length field itself).
@@ -168,6 +236,108 @@ pub fn decode_request(buf: &[u8]) -> Result<Request, ProtocolError> {
             Ok(Request::ChallengeResponse {
                 signature,
                 public_key,
+            })
+        }
+        TAG_ADD_INSTRUMENT => {
+            if payload.len() < 12 {
+                return Err(ProtocolError::Truncated);
+            }
+            Ok(Request::AddInstrument {
+                spec: InstrumentSpec {
+                    symbol: Symbol(le::get_u32(&payload[0..])),
+                    base: CurrencyId(le::get_u32(&payload[4..])),
+                    quote: CurrencyId(le::get_u32(&payload[8..])),
+                },
+            })
+        }
+        TAG_DEPOSIT => {
+            if payload.len() < 16 {
+                return Err(ProtocolError::Truncated);
+            }
+            Ok(Request::Deposit {
+                account: AccountId(le::get_u32(&payload[0..])),
+                currency: CurrencyId(le::get_u32(&payload[4..])),
+                amount: le::get_u64(&payload[8..]),
+            })
+        }
+        TAG_SET_RISK_LIMITS => {
+            if payload.len() < 5 {
+                return Err(ProtocolError::Truncated);
+            }
+            let symbol = Symbol(le::get_u32(&payload[0..]));
+            let flags = payload[4];
+            let mut off = 5;
+
+            let max_order_qty = if flags & 1 != 0 {
+                if payload.len() < off + 8 {
+                    return Err(ProtocolError::Truncated);
+                }
+                let v = NonZeroU64::new(le::get_u64(&payload[off..]))
+                    .ok_or(ProtocolError::InvalidField("max_order_qty is zero"))?;
+                off += 8;
+                Some(Quantity(v))
+            } else {
+                None
+            };
+
+            let max_order_notional = if flags & 2 != 0 {
+                if payload.len() < off + 8 {
+                    return Err(ProtocolError::Truncated);
+                }
+                let v = le::get_u64(&payload[off..]);
+                Some(v)
+            } else {
+                None
+            };
+
+            Ok(Request::SetRiskLimits {
+                symbol,
+                limits: RiskLimits {
+                    max_order_qty,
+                    max_order_notional,
+                },
+            })
+        }
+        TAG_SET_CIRCUIT_BREAKER => {
+            if payload.len() < 5 {
+                return Err(ProtocolError::Truncated);
+            }
+            let symbol = Symbol(le::get_u32(&payload[0..]));
+            let flags = payload[4];
+            let mut off = 5;
+
+            let price_band_lower = if flags & 1 != 0 {
+                if payload.len() < off + 8 {
+                    return Err(ProtocolError::Truncated);
+                }
+                let v = NonZeroU64::new(le::get_u64(&payload[off..]))
+                    .ok_or(ProtocolError::InvalidField("price_band_lower is zero"))?;
+                off += 8;
+                Some(Price(v))
+            } else {
+                None
+            };
+
+            let price_band_upper = if flags & 2 != 0 {
+                if payload.len() < off + 8 {
+                    return Err(ProtocolError::Truncated);
+                }
+                let v = NonZeroU64::new(le::get_u64(&payload[off..]))
+                    .ok_or(ProtocolError::InvalidField("price_band_upper is zero"))?;
+                Some(Price(v))
+            } else {
+                None
+            };
+
+            let halted = flags & 4 != 0;
+
+            Ok(Request::SetCircuitBreaker {
+                symbol,
+                config: CircuitBreakerConfig {
+                    price_band_lower,
+                    price_band_upper,
+                    halted,
+                },
             })
         }
         _ => Err(ProtocolError::UnknownTag(tag)),
@@ -664,6 +834,62 @@ mod tests {
             Request::ChallengeResponse {
                 signature: [0xAA; 64],
                 public_key: [0xBB; 32],
+            },
+            Request::AddInstrument {
+                spec: InstrumentSpec {
+                    symbol: Symbol(3),
+                    base: CurrencyId(5),
+                    quote: CurrencyId(6),
+                },
+            },
+            Request::Deposit {
+                account: AccountId(1),
+                currency: CurrencyId(2),
+                amount: 1_000_000,
+            },
+            Request::SetRiskLimits {
+                symbol: Symbol(1),
+                limits: RiskLimits {
+                    max_order_qty: Some(Quantity(nz(1000))),
+                    max_order_notional: Some(500_000),
+                },
+            },
+            Request::SetRiskLimits {
+                symbol: Symbol(2),
+                limits: RiskLimits {
+                    max_order_qty: None,
+                    max_order_notional: None,
+                },
+            },
+            Request::SetRiskLimits {
+                symbol: Symbol(3),
+                limits: RiskLimits {
+                    max_order_qty: Some(Quantity(nz(100))),
+                    max_order_notional: None,
+                },
+            },
+            Request::SetRiskLimits {
+                symbol: Symbol(4),
+                limits: RiskLimits {
+                    max_order_qty: None,
+                    max_order_notional: Some(999_999),
+                },
+            },
+            Request::SetCircuitBreaker {
+                symbol: Symbol(1),
+                config: CircuitBreakerConfig {
+                    price_band_lower: Some(Price(nz(900))),
+                    price_band_upper: Some(Price(nz(1100))),
+                    halted: false,
+                },
+            },
+            Request::SetCircuitBreaker {
+                symbol: Symbol(2),
+                config: CircuitBreakerConfig {
+                    price_band_lower: None,
+                    price_band_upper: None,
+                    halted: true,
+                },
             },
         ]
     }

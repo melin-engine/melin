@@ -644,8 +644,15 @@ fn process_frames<R>(
             continue;
         }
 
-        // Enforce permission: ReadOnly connections cannot trade.
-        if !conn.permission.can_trade() {
+        // Enforce permissions.
+        if request.requires_admin() && !conn.permission.is_admin() {
+            debug!(
+                connection_id = conn.connection_id,
+                "non-admin attempted admin command, dropping request"
+            );
+            continue;
+        }
+        if !request.requires_admin() && !conn.permission.can_trade() {
             debug!(
                 connection_id = conn.connection_id,
                 "read-only connection attempted trade, dropping request"
@@ -695,6 +702,22 @@ fn request_to_event(request: &Request) -> JournalEvent {
         Request::SubmitOrder { symbol, order } => JournalEvent::SubmitOrder { symbol, order },
         Request::CancelOrder { symbol, order_id } => JournalEvent::CancelOrder { symbol, order_id },
         Request::CancelAll { account } => JournalEvent::CancelAll { account },
+        Request::AddInstrument { spec } => JournalEvent::AddInstrument { spec },
+        Request::Deposit {
+            account,
+            currency,
+            amount,
+        } => JournalEvent::Deposit {
+            account,
+            currency,
+            amount,
+        },
+        Request::SetRiskLimits { symbol, limits } => {
+            JournalEvent::SetRiskLimits { symbol, limits }
+        }
+        Request::SetCircuitBreaker { symbol, config } => {
+            JournalEvent::SetCircuitBreaker { symbol, config }
+        }
         Request::Heartbeat | Request::ChallengeResponse { .. } => {
             unreachable!("heartbeats and auth messages filtered before request_to_event")
         }

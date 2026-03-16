@@ -33,6 +33,12 @@ impl Permission {
     pub fn can_trade(self) -> bool {
         matches!(self, Permission::Admin | Permission::Trader)
     }
+
+    /// Whether this permission level allows administrative operations
+    /// (add instrument, deposit, set risk limits).
+    pub fn is_admin(self) -> bool {
+        matches!(self, Permission::Admin)
+    }
 }
 
 /// Maps Ed25519 public keys to permission levels.
@@ -190,6 +196,13 @@ admin AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA= test
         assert!(Permission::Admin.can_trade());
         assert!(Permission::Trader.can_trade());
         assert!(!Permission::ReadOnly.can_trade());
+    }
+
+    #[test]
+    fn permission_is_admin() {
+        assert!(Permission::Admin.is_admin());
+        assert!(!Permission::Trader.is_admin());
+        assert!(!Permission::ReadOnly.is_admin());
     }
 
     #[test]

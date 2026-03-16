@@ -1348,6 +1348,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "trading-admin"
+version = "0.1.0"
+dependencies = [
+ "base64 0.22.1",
+ "crossterm",
+ "ed25519-dalek",
+ "rand",
+ "ratatui",
+ "trading-client",
+ "trading-protocol",
+]
+
+[[package]]
 name = "trading-bench"
 version = "0.1.0"
 dependencies = [

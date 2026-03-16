@@ -1,10 +1,13 @@
 //! Wire message types for the trading protocol.
 //!
-//! Only trading operations (submit/cancel) are exposed to clients.
-//! Administrative operations (add instrument, deposit) are server-side
-//! only — they'll be configured at startup or via a separate admin API.
+//! Includes both trading operations (submit/cancel) and administrative
+//! commands (add instrument, deposit, set risk limits). Administrative
+//! commands require `Permission::Admin` and are gated on the reader thread.
 
-use trading_engine::types::{AccountId, ExecutionReport, Order, OrderId, Symbol};
+use trading_engine::types::{
+    AccountId, CircuitBreakerConfig, CurrencyId, ExecutionReport, InstrumentSpec, Order, OrderId,
+    RiskLimits, Symbol,
+};
 
 /// Connection identifier assigned by the server.
 ///
@@ -15,11 +18,9 @@ use trading_engine::types::{AccountId, ExecutionReport, Order, OrderId, Symbol};
 pub struct ConnectionId(pub u64);
 
 /// Client → server request.
-///
-/// Limited to trading operations. Administrative actions (instrument
-/// registration, deposits) are not client-facing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Request {
+    // --- Trading operations (Admin + Trader) ---
     /// Submit an order for matching.
     SubmitOrder { symbol: Symbol, order: Order },
     /// Cancel a resting or pending stop order.
@@ -27,6 +28,28 @@ pub enum Request {
     /// Cancel all resting orders and pending stops for an account
     /// across all instruments (kill switch).
     CancelAll { account: AccountId },
+
+    // --- Administrative operations (Admin only) ---
+    /// Register a new instrument with its base/quote currency pair.
+    AddInstrument { spec: InstrumentSpec },
+    /// Credit funds to an account. Used for initial seeding and
+    /// operational adjustments.
+    Deposit {
+        account: AccountId,
+        currency: CurrencyId,
+        amount: u64,
+    },
+    /// Set or update fat-finger risk limits for an instrument.
+    /// `None` fields clear the corresponding limit.
+    SetRiskLimits { symbol: Symbol, limits: RiskLimits },
+    /// Configure circuit breakers for an instrument: price bands
+    /// and/or trading halt. Replaces the current configuration.
+    SetCircuitBreaker {
+        symbol: Symbol,
+        config: CircuitBreakerConfig,
+    },
+
+    // --- Control messages (all permission levels) ---
     /// Keepalive heartbeat. Resets the server's idle timeout for this
     /// connection. Tag-only, no payload.
     Heartbeat,
@@ -39,6 +62,19 @@ pub enum Request {
         /// Client's Ed25519 public key (32 bytes).
         public_key: [u8; 32],
     },
+}
+
+impl Request {
+    /// Whether this request requires `Permission::Admin`.
+    pub fn requires_admin(&self) -> bool {
+        matches!(
+            self,
+            Request::AddInstrument { .. }
+                | Request::Deposit { .. }
+                | Request::SetRiskLimits { .. }
+                | Request::SetCircuitBreaker { .. }
+        )
+    }
 }
 
 /// Server → client response payload.
