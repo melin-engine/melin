@@ -162,7 +162,8 @@ Most analytics can run on a **replica** replaying the journal, keeping the prima
 ### Testing
 - [x] `proptest` invariant tests (price-time priority, volume conservation, balance conservation, book/reservation/order-sides consistency, overflow safety, STP enforcement — all order types including stops, all STP modes, circuit breaker toggling, cancel-all)
 - [x] Verified `price × quantity` intermediate calculations don't overflow `u64` (use `u128` for computed values)
-- [ ] `cargo-fuzz` crash discovery (codec fuzzing for binary parsers)
+- [x] Bolero fuzz tests for journal and wire protocol codecs (decode crash discovery + encode/decode round-trip)
+- [x] Security audit ([docs/security-audit.md](docs/security-audit.md))
 
 ### Redundancy & High Availability
 - [ ] Journal replication (WAL streaming to replica; sync for zero data loss, async for lower latency)
@@ -186,6 +187,7 @@ Ordered by importance for commercial readiness (exchange operators and investors
 9. **Auction mechanisms** — opening/closing/volatility auctions. Differentiator for regulated venues.
 10. **Fee model** — maker/taker fees on fills. Shows the engine can generate revenue.
 11. **Documentation** — architecture guide, API reference, operational runbook.
+12. **Security hardening** — remaining [audit findings](docs/security-audit.md): per-account order limits (SEC-03), order throttling (SEC-04), disk exhaustion handling (SEC-05), snapshot validation (SEC-09).
 
 Also needed: backpressure policy, gateway scalability (epoll/io_uring multiplexing), per-account permissions.
 

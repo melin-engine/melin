@@ -74,6 +74,11 @@ pub struct ServerConfig {
     /// have not sent any data within this window. Set to 0 to disable.
     #[arg(long, default_value_t = 30)]
     pub connection_timeout_secs: u64,
+    /// Maximum number of concurrent authenticated connections. New
+    /// connections are rejected (closed immediately) when this limit is
+    /// reached. 0 means unlimited. Prevents fd/memory exhaustion (SEC-02).
+    #[arg(long, default_value_t = 1024)]
+    pub max_connections: u64,
     /// Number of test accounts to seed on first startup.
     #[arg(long, default_value_t = 2)]
     pub accounts: u32,
@@ -99,6 +104,7 @@ impl Default for ServerConfig {
             group_commit_us: 0,
             heartbeat_interval_secs: 10,
             connection_timeout_secs: 30,
+            max_connections: 1024,
             accounts: 2,
             instruments: 2,
             authorized_keys: PathBuf::from("authorized_keys"),
@@ -236,6 +242,13 @@ pub fn run_with_shutdown<L: BlockingTransportListener>(
         })
         .expect("failed to spawn matching thread");
 
+    // Active connection counter shared between accept loop and response
+    // stage. Incremented on successful auth, decremented on disconnect.
+    // Used to enforce max_connections (SEC-02).
+    let active_connections = Arc::new(AtomicU64::new(0));
+    #[cfg_attr(feature = "io-uring", allow(unused_variables))]
+    let active_connections_response = Arc::clone(&active_connections);
+
     let s3 = Arc::clone(&shutdown);
     let response_handle = std::thread::Builder::new()
         .name("response".into())
@@ -248,6 +261,7 @@ pub fn run_with_shutdown<L: BlockingTransportListener>(
                 journal_cursor,
                 &s3,
                 heartbeat_interval,
+                active_connections_response,
             );
             #[cfg(feature = "io-uring")]
             crate::uring_response::run(
@@ -296,6 +310,18 @@ pub fn run_with_shutdown<L: BlockingTransportListener>(
             }
         };
 
+        // Enforce max_connections limit (SEC-02). Reject early before
+        // spending time on auth. The counter is decremented by the response
+        // stage on disconnect or write error.
+        if config.max_connections > 0
+            && active_connections.load(Ordering::Relaxed) >= config.max_connections
+        {
+            debug!(addr = %addr, "connection rejected: max_connections reached");
+            drop(std_read);
+            drop(std_write);
+            continue;
+        }
+
         let connection_id = ConnectionId(next_connection_id.fetch_add(1, Ordering::Relaxed));
 
         debug!(connection_id = connection_id.0, addr = %addr, "new connection");
@@ -325,12 +351,22 @@ pub fn run_with_shutdown<L: BlockingTransportListener>(
             }
         };
 
+        active_connections.fetch_add(1, Ordering::Relaxed);
+
         // Clear the read timeout before handing to the epoll reader.
         // Epoll uses non-blocking I/O, so the timeout is irrelevant, but
         // clearing it avoids surprising behavior if the fd is ever used
         // in blocking mode again.
         if let Err(e) = set_read_timeout(&std_read, None) {
             debug!(connection_id = connection_id.0, error = %e, "failed to clear auth timeout");
+        }
+
+        // Set a write timeout on the response socket so a slow/stalled
+        // client cannot block the response thread (SEC-01). If a write
+        // takes longer than this, it returns EAGAIN and the response
+        // stage drops the connection.
+        if let Err(e) = set_write_timeout(&std_write, Some(std::time::Duration::from_secs(5))) {
+            debug!(connection_id = connection_id.0, error = %e, "failed to set write timeout");
         }
 
         // Register the writer with the response thread before the reader.
@@ -478,8 +514,10 @@ fn authenticate_connection<R: std::io::Read, W: std::io::Write>(
     use trading_protocol::message::{Request, ResponseKind};
 
     // Generate a 32-byte random nonce for this connection.
+    // Explicit OsRng for cryptographic material (SEC-10).
     let mut nonce = [0u8; 32];
-    rand::fill(&mut nonce);
+    getrandom::fill(&mut nonce)
+        .map_err(|e| io::Error::other(format!("getrandom failed: {e}")))?;
 
     // Send Challenge.
     let mut buf = [0u8; 64];
@@ -589,6 +627,37 @@ fn set_read_timeout<F: std::os::unix::io::AsRawFd>(
             fd.as_raw_fd(),
             libc::SOL_SOCKET,
             libc::SO_RCVTIMEO,
+            &tv as *const libc::timeval as *const libc::c_void,
+            std::mem::size_of::<libc::timeval>() as libc::socklen_t,
+        )
+    };
+    if ret < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+/// Set `SO_SNDTIMEO` on a socket. Prevents blocking writes from stalling
+/// the response thread when a client stops reading (SEC-01).
+fn set_write_timeout<F: std::os::unix::io::AsRawFd>(
+    fd: &F,
+    timeout: Option<std::time::Duration>,
+) -> std::io::Result<()> {
+    let tv = match timeout {
+        Some(d) => libc::timeval {
+            tv_sec: d.as_secs() as libc::time_t,
+            tv_usec: d.subsec_micros() as libc::suseconds_t,
+        },
+        None => libc::timeval {
+            tv_sec: 0,
+            tv_usec: 0,
+        },
+    };
+    let ret = unsafe {
+        libc::setsockopt(
+            fd.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_SNDTIMEO,
             &tv as *const libc::timeval as *const libc::c_void,
             std::mem::size_of::<libc::timeval>() as libc::socklen_t,
         )

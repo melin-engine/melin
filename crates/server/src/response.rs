@@ -11,7 +11,7 @@
 use std::collections::{HashMap, HashSet};
 use std::io::Write;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
@@ -70,6 +70,7 @@ pub fn run(
     journal_cursor: Arc<Sequence>,
     shutdown: &AtomicBool,
     heartbeat_interval: Option<Duration>,
+    active_connections: Arc<AtomicU64>,
 ) {
     // Connection table: maps connection IDs to their state (writer + last_send).
     // HashMap for O(1) lookup. Pre-sized for a reasonable number of concurrent clients.
@@ -161,7 +162,9 @@ pub fn run(
                     );
                 }
                 ControlEvent::Disconnected { connection_id } => {
-                    connections.remove(&connection_id);
+                    if connections.remove(&connection_id).is_some() {
+                        active_connections.fetch_sub(1, Ordering::Relaxed);
+                    }
                 }
             }
         }
@@ -185,6 +188,7 @@ pub fn run(
                             "flush error, dropping connection"
                         );
                         connections.remove(&conn_id);
+                        active_connections.fetch_sub(1, Ordering::Relaxed);
                     }
                 }
             }
@@ -222,6 +226,7 @@ pub fn run(
                     }
                     for conn_id in failed {
                         connections.remove(&conn_id);
+                        active_connections.fetch_sub(1, Ordering::Relaxed);
                     }
                 }
             }
@@ -302,6 +307,7 @@ pub fn run(
                         "write error, dropping connection"
                     );
                     connections.remove(&slot.connection_id);
+                    active_connections.fetch_sub(1, Ordering::Relaxed);
                     continue;
                 }
 
