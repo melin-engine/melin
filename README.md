@@ -177,7 +177,7 @@ Most analytics can run on a **replica** replaying the journal, keeping the prima
 Ordered by importance for commercial readiness (exchange operators and investors).
 
 1. ~~**Circuit breakers**~~ ✅ — price bands, trading halts. Fully integrated with event sourcing.
-2. **Cancel-replace / order amendment** — market makers won't evaluate without it. Most active order flow on any venue.
+2. ~~**Cancel-replace / order amendment**~~ ✅ — atomic price/qty amendment with reservation delta, time priority rules, price-would-cross rejection.
 3. **Replication & HA** — journal streaming to a replica, deterministic replay, failover. No exchange runs a single node.
 4. ~~**Fuzz testing**~~ ✅ — proptest coverage extended to all order types, STP modes, circuit breakers, stops. Found and fixed a reservation leak on price-improved fills.
 5. **Journal rotation + compaction** — unbounded disk growth is a non-starter operationally.

@@ -67,10 +67,21 @@ pub struct JournalWriter {
 
 impl JournalWriter {
     /// Create a new journal file. Writes the file header, pre-allocates
-    /// storage, and returns a writer.
+    /// storage, and returns a writer starting at sequence 1.
     ///
     /// Fails if the file already exists (use `open_append` for existing journals).
     pub fn create(path: &Path) -> Result<Self, JournalError> {
+        Self::create_continuing(path, 1)
+    }
+
+    /// Create a new journal file that continues from a given sequence number.
+    ///
+    /// Used by journal rotation: after snapshotting, the old journal is archived
+    /// and a new one is created. Sequence numbers must be continuous across
+    /// rotation boundaries so that snapshot + journal recovery works correctly.
+    ///
+    /// Fails if the file already exists.
+    pub fn create_continuing(path: &Path, starting_sequence: u64) -> Result<Self, JournalError> {
         let file = OpenOptions::new()
             .read(true)
             .write(true)
@@ -96,7 +107,7 @@ impl JournalWriter {
             file,
             buffer: [0u8; MAX_ENTRY_SIZE],
             batch_buf: Vec::with_capacity(BATCH_BUF_CAPACITY),
-            next_sequence: 1,
+            next_sequence: starting_sequence,
             path: path.to_path_buf(),
             write_pos,
             allocated_end,
@@ -247,6 +258,11 @@ impl JournalWriter {
     /// Current next sequence number (useful for snapshot coordination).
     pub fn next_sequence(&self) -> u64 {
         self.next_sequence
+    }
+
+    /// Current byte offset in the journal file (size of valid data).
+    pub fn write_pos(&self) -> u64 {
+        self.write_pos
     }
 
     /// Path to the journal file.

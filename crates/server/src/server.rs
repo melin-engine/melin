@@ -21,6 +21,7 @@ use tracing::{debug, error, info};
 
 use trading_engine::journal::JournaledExchange;
 use trading_engine::journal::pipeline::build_pipeline;
+use trading_engine::journal::writer::JournalWriter;
 
 use trading_protocol::auth::{AuthorizedKeys, Permission};
 use trading_protocol::message::ConnectionId;
@@ -90,6 +91,11 @@ pub struct ServerConfig {
     /// See `AuthorizedKeys` for file format.
     #[arg(long)]
     pub authorized_keys: PathBuf,
+    /// Maximum journal size in MiB before automatic rotation at startup.
+    /// When the journal exceeds this threshold, the server saves a snapshot
+    /// and starts a fresh journal. Set to 0 to disable. Default: 256 MiB.
+    #[arg(long, default_value_t = 256)]
+    pub max_journal_mib: u64,
 }
 
 impl Default for ServerConfig {
@@ -108,6 +114,7 @@ impl Default for ServerConfig {
             accounts: 2,
             instruments: 2,
             authorized_keys: PathBuf::from("authorized_keys"),
+            max_journal_mib: 256,
         }
     }
 }
@@ -425,25 +432,71 @@ pub fn run_with_shutdown<L: BlockingTransportListener>(
 
 /// Initialize or recover the JournaledExchange from disk.
 fn init_engine(config: &ServerConfig) -> Result<JournaledExchange, Box<dyn std::error::Error>> {
-    if let Some(ref snap_path) = config.snapshot
-        && snap_path.exists()
-        && config.journal.exists()
-    {
-        info!("recovering from snapshot + journal");
-        let engine = JournaledExchange::recover_from_snapshot(snap_path, &config.journal)?;
-        return Ok(engine);
-    }
+    // Check for a snapshot: either the explicit --snapshot path, or the
+    // default derived path (used by auto-rotation when --snapshot is not set).
+    let derived_snap = config.journal.with_extension("snapshot");
+    let snap_path = config.snapshot.as_deref().or_else(|| {
+        if derived_snap.exists() {
+            Some(derived_snap.as_path())
+        } else {
+            None
+        }
+    });
 
-    if config.journal.exists() {
+    let journal_exists = config.journal.exists();
+    let mut engine = if let Some(snap_path) = snap_path
+        && snap_path.exists()
+        && journal_exists
+    {
+        info!(snapshot = %snap_path.display(), "recovering from snapshot + journal");
+        JournaledExchange::recover_from_snapshot(snap_path, &config.journal)?
+    } else if let Some(snap_path) = snap_path
+        && snap_path.exists()
+        && !journal_exists
+    {
+        // Snapshot exists but journal doesn't — likely a crash between
+        // rotate_file() and create_continuing(). Recover from snapshot
+        // alone and create a fresh journal.
+        info!(
+            snapshot = %snap_path.display(),
+            "recovering from snapshot only (journal missing, post-rotation crash?)"
+        );
+        let (exchange, snap_sequence) = trading_engine::journal::snapshot::load(snap_path)?;
+        let writer = JournalWriter::create_continuing(&config.journal, snap_sequence + 1)?;
+        JournaledExchange::from_parts(exchange, writer)
+    } else if journal_exists {
         info!("recovering from journal");
-        let engine = JournaledExchange::recover(&config.journal)?;
-        Ok(engine)
+        JournaledExchange::recover(&config.journal)?
     } else {
         info!("creating new journal");
         let mut engine = JournaledExchange::create(&config.journal)?;
         seed_test_data(&mut engine, config.accounts, config.instruments)?;
-        Ok(engine)
+        engine
+    };
+
+    // Rotate journal if it exceeds the configured size threshold.
+    // This saves a snapshot, archives the old journal, and starts
+    // a fresh one — preventing unbounded disk growth across restarts.
+    if config.max_journal_mib > 0 {
+        let threshold = config.max_journal_mib * 1024 * 1024;
+        let current_size = engine.journal_size();
+        if current_size > threshold {
+            let snap_path = config
+                .snapshot
+                .clone()
+                .unwrap_or_else(|| config.journal.with_extension("snapshot"));
+            info!(
+                current_mib = current_size / (1024 * 1024),
+                threshold_mib = config.max_journal_mib,
+                snapshot = %snap_path.display(),
+                "journal exceeds threshold, rotating"
+            );
+            engine.rotate(&snap_path)?;
+            info!("journal rotated successfully");
+        }
     }
+
+    Ok(engine)
 }
 
 /// Apply CPU core affinity for a pipeline thread, logging the result.
@@ -516,8 +569,7 @@ fn authenticate_connection<R: std::io::Read, W: std::io::Write>(
     // Generate a 32-byte random nonce for this connection.
     // Explicit OsRng for cryptographic material (SEC-10).
     let mut nonce = [0u8; 32];
-    getrandom::fill(&mut nonce)
-        .map_err(|e| io::Error::other(format!("getrandom failed: {e}")))?;
+    getrandom::fill(&mut nonce).map_err(|e| io::Error::other(format!("getrandom failed: {e}")))?;
 
     // Send Challenge.
     let mut buf = [0u8; 64];

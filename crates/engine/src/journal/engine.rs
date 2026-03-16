@@ -192,6 +192,44 @@ impl JournaledExchange {
         self.writer.path()
     }
 
+    /// Rotate the journal: save a snapshot, archive the old journal, and
+    /// start writing to a new empty journal file.
+    ///
+    /// The new journal continues the sequence numbering from the old one,
+    /// so recovery from the snapshot + new journal produces the same state.
+    ///
+    /// The old journal is renamed to `<path>.1` (bumping any existing
+    /// archives: `.1` → `.2`, `.2` → `.3`, etc.). The snapshot is written
+    /// to `snapshot_path` atomically (via `.tmp` + rename).
+    ///
+    /// Call this before `into_parts()` — rotation requires both the
+    /// exchange (for snapshot) and the writer (for sequence continuity).
+    pub fn rotate(&mut self, snapshot_path: &Path) -> Result<(), JournalError> {
+        // 1. Save snapshot at the current sequence boundary.
+        self.save_snapshot(snapshot_path)?;
+
+        // 2. Archive the old journal by rotating file names.
+        let journal_path = self.writer.path().to_path_buf();
+        rotate_file(&journal_path)?;
+
+        // 3. Create a new journal continuing from the same sequence.
+        let next_seq = self.writer.next_sequence();
+        self.writer = JournalWriter::create_continuing(&journal_path, next_seq)?;
+
+        Ok(())
+    }
+
+    /// Size of the current journal file in bytes.
+    pub fn journal_size(&self) -> u64 {
+        self.writer.write_pos()
+    }
+
+    /// Construct from pre-built parts. Used by the server for snapshot-only
+    /// recovery (when the journal is missing after a rotation crash).
+    pub fn from_parts(exchange: Exchange, writer: JournalWriter) -> Self {
+        Self { exchange, writer }
+    }
+
     /// Decompose into parts for the pipeline architecture.
     ///
     /// After recovery, the exchange and journal writer are handed to separate
@@ -200,6 +238,32 @@ impl JournaledExchange {
     pub fn into_parts(self) -> (Exchange, JournalWriter) {
         (self.exchange, self.writer)
     }
+}
+
+/// Rotate a file by renaming it to `<path>.1`, bumping existing archives.
+///
+/// `foo.journal` → `foo.journal.1` (and `.1` → `.2`, `.2` → `.3`, etc.)
+fn rotate_file(path: &Path) -> Result<(), JournalError> {
+    // Find the highest existing archive number.
+    let mut max_n = 0u32;
+    loop {
+        let archive = format!("{}.{}", path.display(), max_n + 1);
+        if !std::path::Path::new(&archive).exists() {
+            break;
+        }
+        max_n += 1;
+    }
+
+    // Rename in reverse order to avoid overwriting: .2→.3, .1→.2, base→.1
+    for n in (1..=max_n).rev() {
+        let from = format!("{}.{n}", path.display());
+        let to = format!("{}.{}", path.display(), n + 1);
+        std::fs::rename(&from, &to)?;
+    }
+    let archive_1 = format!("{}.1", path.display());
+    std::fs::rename(path, &archive_1)?;
+
+    Ok(())
 }
 
 /// Replay a single journal event into an exchange. Used during recovery.
@@ -602,5 +666,150 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn rotate_produces_valid_snapshot_and_new_journal() {
+        let dir = tempfile::tempdir().unwrap();
+        let journal_path = dir.path().join("test.journal");
+        let snap_path = dir.path().join("test.snapshot");
+
+        // Create engine, seed data, submit some orders.
+        let mut engine = JournaledExchange::create(&journal_path).unwrap();
+        engine.add_instrument(btc_usd_spec()).unwrap();
+        engine.deposit(ACCT_A, USD, 1_000_000).unwrap();
+        engine.deposit(ACCT_A, BTC, 1_000).unwrap();
+
+        let mut reports = Vec::new();
+        engine
+            .execute(
+                Symbol(1),
+                limit_order(1, ACCT_A, Side::Buy, 100, 50),
+                &mut reports,
+            )
+            .unwrap();
+
+        let seq_before = engine.next_sequence();
+        let size_before = engine.journal_size();
+        assert!(size_before > 0);
+
+        // Rotate.
+        engine.rotate(&snap_path).unwrap();
+
+        // Snapshot exists.
+        assert!(snap_path.exists());
+        // Old journal archived.
+        let archived = format!("{}.1", journal_path.display());
+        assert!(std::path::Path::new(&archived).exists());
+        // New journal exists and is smaller.
+        assert!(journal_path.exists());
+        assert!(engine.journal_size() < size_before);
+        // Sequence continues.
+        assert_eq!(engine.next_sequence(), seq_before);
+
+        // Can still append to the new journal.
+        engine
+            .execute(
+                Symbol(1),
+                limit_order(2, ACCT_A, Side::Sell, 200, 30),
+                &mut reports,
+            )
+            .unwrap();
+        assert_eq!(engine.next_sequence(), seq_before + 1);
+    }
+
+    #[test]
+    fn recovery_after_rotation_produces_identical_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let journal_path = dir.path().join("test.journal");
+        let snap_path = dir.path().join("test.snapshot");
+
+        // Build state, rotate, add more events.
+        let mut engine = JournaledExchange::create(&journal_path).unwrap();
+        engine.add_instrument(btc_usd_spec()).unwrap();
+        engine.deposit(ACCT_A, USD, 1_000_000).unwrap();
+        engine.deposit(ACCT_B, BTC, 1_000).unwrap();
+
+        let mut reports = Vec::new();
+        engine
+            .execute(
+                Symbol(1),
+                limit_order(1, ACCT_A, Side::Buy, 100, 50),
+                &mut reports,
+            )
+            .unwrap();
+
+        // Rotate — snapshot captures the buy order.
+        engine.rotate(&snap_path).unwrap();
+
+        // Submit a sell AFTER rotation — only in the new journal.
+        engine
+            .execute(
+                Symbol(1),
+                limit_order(1, ACCT_B, Side::Sell, 100, 20),
+                &mut reports,
+            )
+            .unwrap();
+
+        // Capture balances for comparison.
+        let bal_a_usd = engine.exchange().accounts().balance(ACCT_A, USD);
+        let bal_b_btc = engine.exchange().accounts().balance(ACCT_B, BTC);
+        drop(engine);
+
+        // Recover from snapshot + new journal.
+        let recovered =
+            JournaledExchange::recover_from_snapshot(&snap_path, &journal_path).unwrap();
+        assert_eq!(
+            recovered.exchange().accounts().balance(ACCT_A, USD),
+            bal_a_usd
+        );
+        assert_eq!(
+            recovered.exchange().accounts().balance(ACCT_B, BTC),
+            bal_b_btc
+        );
+    }
+
+    #[test]
+    fn multiple_rotations_archive_correctly() {
+        let dir = tempfile::tempdir().unwrap();
+        let journal_path = dir.path().join("test.journal");
+        let snap_path = dir.path().join("test.snapshot");
+
+        let mut engine = JournaledExchange::create(&journal_path).unwrap();
+        engine.add_instrument(btc_usd_spec()).unwrap();
+        engine.deposit(ACCT_A, USD, 1_000_000).unwrap();
+
+        // Rotate twice.
+        engine.rotate(&snap_path).unwrap();
+        assert!(std::path::Path::new(&format!("{}.1", journal_path.display())).exists());
+
+        engine.deposit(ACCT_A, BTC, 500).unwrap();
+        engine.rotate(&snap_path).unwrap();
+        assert!(std::path::Path::new(&format!("{}.2", journal_path.display())).exists());
+        assert!(std::path::Path::new(&format!("{}.1", journal_path.display())).exists());
+        assert!(journal_path.exists());
+    }
+
+    #[test]
+    fn create_continuing_starts_at_correct_sequence() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cont.journal");
+
+        let mut writer = JournalWriter::create_continuing(&path, 42).unwrap();
+        assert_eq!(writer.next_sequence(), 42);
+
+        let event = JournalEvent::Deposit {
+            account: ACCT_A,
+            currency: USD,
+            amount: 100,
+        };
+        let seq = writer.append(&event).unwrap();
+        assert_eq!(seq, 42);
+        assert_eq!(writer.next_sequence(), 43);
+
+        // Read it back.
+        let mut reader = crate::journal::reader::JournalReader::open(&path).unwrap();
+        let entry = reader.next_entry().unwrap().unwrap();
+        assert_eq!(entry.sequence, 42);
     }
 }

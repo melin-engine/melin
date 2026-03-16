@@ -129,12 +129,17 @@ impl JournalReader {
         timestamp_ns: u64,
         event: JournalEvent,
     ) -> Result<Option<JournalEntry>, JournalError> {
-        let expected = self.last_sequence.map_or(1, |s| s + 1);
-        if sequence != expected {
-            return Err(JournalError::SequenceGap {
-                expected,
-                actual: sequence,
-            });
+        // For the first entry, accept whatever sequence we find (supports
+        // rotated journals that continue from a prior sequence). For
+        // subsequent entries, enforce strict continuity.
+        if let Some(last) = self.last_sequence {
+            let expected = last + 1;
+            if sequence != expected {
+                return Err(JournalError::SequenceGap {
+                    expected,
+                    actual: sequence,
+                });
+            }
         }
         self.last_sequence = Some(sequence);
         self.pos += consumed;
