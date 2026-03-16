@@ -449,8 +449,24 @@ fn format_report(report: &ExecutionReport) -> String {
                 RejectReason::ExceedsMaxNotional => "exceeds max notional",
                 RejectReason::TradingHalted => "trading halted",
                 RejectReason::OutsidePriceBand => "outside price band",
+                RejectReason::UnknownOrder => "unknown order",
+                RejectReason::PriceWouldCross => "price would cross spread",
             };
             format!("REJECT  #{} ({reason_str})", order_id.0)
+        }
+        ExecutionReport::Replaced {
+            order_id,
+            side,
+            old_price,
+            new_price,
+            old_remaining,
+            new_remaining,
+        } => {
+            let side_str = if *side == Side::Buy { "BUY" } else { "SELL" };
+            format!(
+                "REPLACE #{} {} @{}→{} x{}→{}",
+                order_id.0, side_str, old_price.0, new_price.0, old_remaining.0, new_remaining.0,
+            )
         }
     }
 }

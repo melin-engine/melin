@@ -6,7 +6,7 @@
 
 use trading_engine::types::{
     AccountId, CircuitBreakerConfig, CurrencyId, ExecutionReport, InstrumentSpec, Order, OrderId,
-    RiskLimits, Symbol,
+    Price, Quantity, RiskLimits, Symbol,
 };
 
 /// Connection identifier assigned by the server.
@@ -28,6 +28,15 @@ pub enum Request {
     /// Cancel all resting orders and pending stops for an account
     /// across all instruments (kill switch).
     CancelAll { account: AccountId },
+    /// Atomically amend a resting limit order's price and/or quantity.
+    /// If the amendment fails (e.g. insufficient balance), the original
+    /// order remains intact. `new_quantity` is the desired new remaining.
+    CancelReplace {
+        symbol: Symbol,
+        order_id: OrderId,
+        new_price: Price,
+        new_quantity: Quantity,
+    },
 
     // --- Administrative operations (Admin only) ---
     /// Register a new instrument with its base/quote currency pair.

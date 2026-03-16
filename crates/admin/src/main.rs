@@ -38,10 +38,11 @@ const ACTIONS: &[&str] = &[
     "Stop Sell",
     "Stop-Limit Buy",
     "Stop-Limit Sell",
-    // Cancel (8-9)
+    // Cancel / Amend (8-10)
     "Cancel Order",
     "Cancel All",
-    // Admin (10-13)
+    "Cancel-Replace",
+    // Admin (11-14)
     "Add Instrument",
     "Deposit",
     "Set Risk Limits",
@@ -171,6 +172,18 @@ enum NextStep {
         symbol: u32,
         max_order_qty: Option<u64>,
     },
+    /// Cancel-replace: enter symbol.
+    CancelReplaceSymbol,
+    /// Cancel-replace: entered symbol, enter order ID.
+    CancelReplaceOrderId { symbol: u32 },
+    /// Cancel-replace: entered order ID, enter new price.
+    CancelReplacePrice { symbol: u32, order_id: u64 },
+    /// Cancel-replace: entered price, enter new quantity.
+    CancelReplaceQty {
+        symbol: u32,
+        order_id: u64,
+        new_price: u64,
+    },
     /// Circuit breaker: enter symbol.
     CircuitBreakerSymbol,
     /// Circuit breaker: entered symbol, enter lower price band (0 = none).
@@ -273,6 +286,7 @@ impl App {
                     | NextStep::AddInstrumentBase { symbol: 0 }
                     | NextStep::DepositAccount
                     | NextStep::RiskLimitsSymbol
+                    | NextStep::CancelReplaceSymbol
                     | NextStep::CircuitBreakerSymbol => Screen::ActionMenu,
                     // Deeper steps → back to previous input.
                     NextStep::AfterAccount { collected } => Screen::NumberInput {
@@ -370,6 +384,26 @@ impl App {
                         buf: String::new(),
                         next: NextStep::RiskLimitsMaxQty { symbol: *symbol },
                     },
+                    NextStep::CancelReplaceOrderId { .. } => Screen::NumberInput {
+                        label: "Symbol ID",
+                        buf: String::new(),
+                        next: NextStep::CancelReplaceSymbol,
+                    },
+                    NextStep::CancelReplacePrice { symbol, .. } => Screen::NumberInput {
+                        label: "Order ID",
+                        buf: String::new(),
+                        next: NextStep::CancelReplaceOrderId { symbol: *symbol },
+                    },
+                    NextStep::CancelReplaceQty {
+                        symbol, order_id, ..
+                    } => Screen::NumberInput {
+                        label: "New Price",
+                        buf: String::new(),
+                        next: NextStep::CancelReplacePrice {
+                            symbol: *symbol,
+                            order_id: *order_id,
+                        },
+                    },
                     NextStep::CircuitBreakerLower { .. } => Screen::NumberInput {
                         label: "Symbol ID",
                         buf: String::new(),
@@ -425,6 +459,14 @@ impl App {
                         };
                     }
                     10 => {
+                        // Cancel-Replace — ask for symbol.
+                        self.screen = Screen::NumberInput {
+                            label: "Symbol ID",
+                            buf: String::new(),
+                            next: NextStep::CancelReplaceSymbol,
+                        };
+                    }
+                    11 => {
                         // Add Instrument — ask for symbol ID.
                         self.screen = Screen::NumberInput {
                             label: "Symbol ID",
@@ -432,7 +474,7 @@ impl App {
                             next: NextStep::AddInstrumentBase { symbol: 0 },
                         };
                     }
-                    11 => {
+                    12 => {
                         // Deposit — ask for account ID.
                         self.screen = Screen::NumberInput {
                             label: "Account ID",
@@ -440,7 +482,7 @@ impl App {
                             next: NextStep::DepositAccount,
                         };
                     }
-                    12 => {
+                    13 => {
                         // Set Risk Limits — ask for symbol.
                         self.screen = Screen::NumberInput {
                             label: "Symbol ID",
@@ -448,7 +490,7 @@ impl App {
                             next: NextStep::RiskLimitsSymbol,
                         };
                     }
-                    13 => {
+                    14 => {
                         // Set Circuit Breaker — ask for symbol.
                         self.screen = Screen::NumberInput {
                             label: "Symbol ID",
@@ -694,6 +736,57 @@ impl App {
                             max_notional
                                 .map(|v| v.to_string())
                                 .unwrap_or_else(|| "none".into()),
+                        ));
+                        let _ = self.request_tx.send(request);
+                        self.screen = Screen::ActionMenu;
+                        self.cursor = 0;
+                    }
+
+                    // --- Cancel-replace flow ---
+                    NextStep::CancelReplaceSymbol => {
+                        self.screen = Screen::NumberInput {
+                            label: "Order ID",
+                            buf: String::new(),
+                            next: NextStep::CancelReplaceOrderId { symbol: val as u32 },
+                        };
+                    }
+                    NextStep::CancelReplaceOrderId { symbol } => {
+                        self.screen = Screen::NumberInput {
+                            label: "New Price",
+                            buf: String::new(),
+                            next: NextStep::CancelReplacePrice {
+                                symbol,
+                                order_id: val,
+                            },
+                        };
+                    }
+                    NextStep::CancelReplacePrice { symbol, order_id } => {
+                        self.screen = Screen::NumberInput {
+                            label: "New Quantity (remaining)",
+                            buf: String::new(),
+                            next: NextStep::CancelReplaceQty {
+                                symbol,
+                                order_id,
+                                new_price: val,
+                            },
+                        };
+                    }
+                    NextStep::CancelReplaceQty {
+                        symbol,
+                        order_id,
+                        new_price,
+                    } => {
+                        let request = Request::CancelReplace {
+                            symbol: Symbol(symbol),
+                            order_id: OrderId(order_id),
+                            new_price: Price(NonZeroU64::new(new_price).expect("validated > 0")),
+                            new_quantity: Quantity(
+                                NonZeroU64::new(val).expect("validated > 0"),
+                            ),
+                        };
+                        self.log.push(format!(
+                            "→ CANCEL-REPLACE #{} sym:{} price:{} qty:{}",
+                            order_id, symbol, new_price, val
                         ));
                         let _ = self.request_tx.send(request);
                         self.screen = Screen::ActionMenu;
@@ -949,8 +1042,24 @@ fn format_report(report: &ExecutionReport) -> String {
                 RejectReason::ExceedsMaxNotional => "exceeds max notional",
                 RejectReason::TradingHalted => "trading halted",
                 RejectReason::OutsidePriceBand => "outside price band",
+                RejectReason::UnknownOrder => "unknown order",
+                RejectReason::PriceWouldCross => "price would cross spread",
             };
             format!("REJECT  #{} ({reason_str})", order_id.0)
+        }
+        ExecutionReport::Replaced {
+            order_id,
+            side,
+            old_price,
+            new_price,
+            old_remaining,
+            new_remaining,
+        } => {
+            let side_str = if side == Side::Buy { "BUY" } else { "SELL" };
+            format!(
+                "REPLACE #{} {} @{}→{} x{}→{}",
+                order_id.0, side_str, old_price.0, new_price.0, old_remaining.0, new_remaining.0,
+            )
         }
     }
 }

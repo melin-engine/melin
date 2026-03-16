@@ -590,6 +590,17 @@ fn request_to_event(request: &Request) -> JournalEvent {
         Request::SetCircuitBreaker { symbol, config } => {
             JournalEvent::SetCircuitBreaker { symbol, config }
         }
+        Request::CancelReplace {
+            symbol,
+            order_id,
+            new_price,
+            new_quantity,
+        } => JournalEvent::CancelReplace {
+            symbol,
+            order_id,
+            new_price,
+            new_quantity,
+        },
         Request::Heartbeat | Request::ChallengeResponse { .. } => {
             unreachable!("heartbeats and auth messages filtered before request_to_event")
         }

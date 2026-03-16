@@ -38,6 +38,7 @@ const TAG_ADD_INSTRUMENT: u8 = 6;
 const TAG_DEPOSIT: u8 = 7;
 const TAG_SET_RISK_LIMITS: u8 = 8;
 const TAG_SET_CIRCUIT_BREAKER: u8 = 9;
+const TAG_CANCEL_REPLACE: u8 = 10;
 
 // --- Response tags ---
 const TAG_PLACED: u8 = 11;
@@ -51,6 +52,7 @@ const TAG_SERVER_READY: u8 = 18;
 const TAG_RESPONSE_HEARTBEAT: u8 = 19;
 const TAG_CHALLENGE: u8 = 20;
 const TAG_AUTH_FAILED: u8 = 21;
+const TAG_REPLACED: u8 = 22;
 
 // --- OrderType tags (wire-specific, not shared with journal) ---
 const ORDER_TYPE_MARKET: u8 = 0;
@@ -70,6 +72,8 @@ const REJECT_EXCEEDS_MAX_ORDER_QTY: u8 = 7;
 const REJECT_EXCEEDS_MAX_NOTIONAL: u8 = 8;
 const REJECT_TRADING_HALTED: u8 = 9;
 const REJECT_OUTSIDE_PRICE_BAND: u8 = 10;
+const REJECT_UNKNOWN_ORDER: u8 = 11;
+const REJECT_PRICE_WOULD_CROSS: u8 = 12;
 
 /// Encode a request into `buf`. Returns total bytes written (length prefix + tag + payload).
 ///
@@ -177,6 +181,23 @@ pub fn encode_request(request: &Request, buf: &mut [u8]) -> Result<usize, Protoc
                 le::put_u64(&mut buf[pos..], upper.get());
                 pos += 8;
             }
+        }
+        Request::CancelReplace {
+            symbol,
+            order_id,
+            new_price,
+            new_quantity,
+        } => {
+            buf[pos] = TAG_CANCEL_REPLACE;
+            pos += 1;
+            le::put_u32(&mut buf[pos..], symbol.0);
+            pos += 4;
+            le::put_u64(&mut buf[pos..], order_id.0);
+            pos += 8;
+            le::put_u64(&mut buf[pos..], new_price.get());
+            pos += 8;
+            le::put_u64(&mut buf[pos..], new_quantity.get());
+            pos += 8;
         }
     }
 
@@ -340,6 +361,24 @@ pub fn decode_request(buf: &[u8]) -> Result<Request, ProtocolError> {
                 },
             })
         }
+        TAG_CANCEL_REPLACE => {
+            // symbol(4) + order_id(8) + new_price(8) + new_quantity(8) = 28
+            if payload.len() < 28 {
+                return Err(ProtocolError::Truncated);
+            }
+            let symbol = Symbol(le::get_u32(&payload[0..]));
+            let order_id = OrderId(le::get_u64(&payload[4..]));
+            let new_price = NonZeroU64::new(le::get_u64(&payload[12..]))
+                .ok_or(ProtocolError::InvalidField("cancel-replace new_price is zero"))?;
+            let new_quantity = NonZeroU64::new(le::get_u64(&payload[20..]))
+                .ok_or(ProtocolError::InvalidField("cancel-replace new_quantity is zero"))?;
+            Ok(Request::CancelReplace {
+                symbol,
+                order_id,
+                new_price: Price(new_price),
+                new_quantity: Quantity(new_quantity),
+            })
+        }
         _ => Err(ProtocolError::UnknownTag(tag)),
     }
 }
@@ -411,7 +450,7 @@ pub fn decode_response(buf: &[u8]) -> Result<ResponseKind, ProtocolError> {
             Ok(ResponseKind::Challenge { nonce })
         }
         TAG_AUTH_FAILED => Ok(ResponseKind::AuthFailed),
-        TAG_PLACED | TAG_FILL | TAG_CANCELLED | TAG_TRIGGERED | TAG_REJECTED => {
+        TAG_PLACED | TAG_FILL | TAG_CANCELLED | TAG_TRIGGERED | TAG_REJECTED | TAG_REPLACED => {
             let report = decode_execution_report(tag, payload)?;
             Ok(ResponseKind::Report(report))
         }
@@ -642,6 +681,29 @@ fn encode_execution_report(report: &ExecutionReport, buf: &mut [u8]) -> usize {
             buf[pos] = encode_reject_reason(*reason);
             pos += 1;
         }
+        ExecutionReport::Replaced {
+            order_id,
+            side,
+            old_price,
+            new_price,
+            old_remaining,
+            new_remaining,
+        } => {
+            buf[pos] = TAG_REPLACED;
+            pos += 1;
+            le::put_u64(&mut buf[pos..], order_id.0);
+            pos += 8;
+            buf[pos] = le::encode_side(*side);
+            pos += 1;
+            le::put_u64(&mut buf[pos..], old_price.get());
+            pos += 8;
+            le::put_u64(&mut buf[pos..], new_price.get());
+            pos += 8;
+            le::put_u64(&mut buf[pos..], old_remaining.get());
+            pos += 8;
+            le::put_u64(&mut buf[pos..], new_remaining.get());
+            pos += 8;
+        }
     }
 
     pos
@@ -720,6 +782,31 @@ fn decode_execution_report(tag: u8, payload: &[u8]) -> Result<ExecutionReport, P
             let reason = decode_reject_reason(payload[8])?;
             Ok(ExecutionReport::Rejected { order_id, reason })
         }
+        TAG_REPLACED => {
+            // order_id(8) + side(1) + old_price(8) + new_price(8) + old_remaining(8) + new_remaining(8) = 41
+            if payload.len() < 41 {
+                return Err(ProtocolError::Truncated);
+            }
+            let order_id = OrderId(le::get_u64(&payload[0..]));
+            let side =
+                le::decode_side(payload[8]).ok_or(ProtocolError::InvalidField("side"))?;
+            let old_price = NonZeroU64::new(le::get_u64(&payload[9..]))
+                .ok_or(ProtocolError::InvalidField("replaced old_price is zero"))?;
+            let new_price = NonZeroU64::new(le::get_u64(&payload[17..]))
+                .ok_or(ProtocolError::InvalidField("replaced new_price is zero"))?;
+            let old_remaining = NonZeroU64::new(le::get_u64(&payload[25..]))
+                .ok_or(ProtocolError::InvalidField("replaced old_remaining is zero"))?;
+            let new_remaining = NonZeroU64::new(le::get_u64(&payload[33..]))
+                .ok_or(ProtocolError::InvalidField("replaced new_remaining is zero"))?;
+            Ok(ExecutionReport::Replaced {
+                order_id,
+                side,
+                old_price: Price(old_price),
+                new_price: Price(new_price),
+                old_remaining: Quantity(old_remaining),
+                new_remaining: Quantity(new_remaining),
+            })
+        }
         _ => Err(ProtocolError::UnknownTag(tag)),
     }
 }
@@ -737,6 +824,8 @@ fn encode_reject_reason(reason: RejectReason) -> u8 {
         RejectReason::ExceedsMaxNotional => REJECT_EXCEEDS_MAX_NOTIONAL,
         RejectReason::TradingHalted => REJECT_TRADING_HALTED,
         RejectReason::OutsidePriceBand => REJECT_OUTSIDE_PRICE_BAND,
+        RejectReason::UnknownOrder => REJECT_UNKNOWN_ORDER,
+        RejectReason::PriceWouldCross => REJECT_PRICE_WOULD_CROSS,
     }
 }
 
@@ -753,6 +842,8 @@ fn decode_reject_reason(b: u8) -> Result<RejectReason, ProtocolError> {
         REJECT_EXCEEDS_MAX_NOTIONAL => Ok(RejectReason::ExceedsMaxNotional),
         REJECT_TRADING_HALTED => Ok(RejectReason::TradingHalted),
         REJECT_OUTSIDE_PRICE_BAND => Ok(RejectReason::OutsidePriceBand),
+        REJECT_UNKNOWN_ORDER => Ok(RejectReason::UnknownOrder),
+        REJECT_PRICE_WOULD_CROSS => Ok(RejectReason::PriceWouldCross),
         _ => Err(ProtocolError::InvalidField("reject reason")),
     }
 }
@@ -891,6 +982,12 @@ mod tests {
                     halted: true,
                 },
             },
+            Request::CancelReplace {
+                symbol: Symbol(1),
+                order_id: OrderId(42),
+                new_price: Price(nz(5500)),
+                new_quantity: Quantity(nz(30)),
+            },
         ]
     }
 
@@ -961,6 +1058,22 @@ mod tests {
             ResponseKind::Report(ExecutionReport::Rejected {
                 order_id: OrderId(15),
                 reason: RejectReason::OutsidePriceBand,
+            }),
+            ResponseKind::Report(ExecutionReport::Rejected {
+                order_id: OrderId(16),
+                reason: RejectReason::UnknownOrder,
+            }),
+            ResponseKind::Report(ExecutionReport::Rejected {
+                order_id: OrderId(17),
+                reason: RejectReason::PriceWouldCross,
+            }),
+            ResponseKind::Report(ExecutionReport::Replaced {
+                order_id: OrderId(42),
+                side: Side::Buy,
+                old_price: Price(nz(5000)),
+                new_price: Price(nz(5500)),
+                old_remaining: Quantity(nz(50)),
+                new_remaining: Quantity(nz(30)),
             }),
             ResponseKind::EngineError,
             ResponseKind::BatchEnd,
