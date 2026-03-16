@@ -180,12 +180,12 @@ Ordered by importance for commercial readiness (exchange operators and investors
 2. ~~**Cancel-replace / order amendment**~~ ✅ — atomic price/qty amendment with reservation delta, time priority rules, price-would-cross rejection.
 3. **Replication & HA** — journal streaming to a replica, deterministic replay, failover. No exchange runs a single node.
 4. ~~**Fuzz testing**~~ ✅ — proptest coverage extended to all order types, STP modes, circuit breakers, stops. Found and fixed a reservation leak on price-improved fills.
-5. **Journal rotation + compaction** — unbounded disk growth is a non-starter operationally.
+5. ~~**Journal rotation + compaction**~~ ✅ — automatic snapshot + journal archiving at startup when size threshold exceeded. Documented recovery scenarios for every crash timing.
 6. ~~**Authentication**~~ ✅ — Ed25519 challenge-response. Admin API for instrument/deposit/risk/circuit-breaker management.
-7. **TLS** — encrypted client connections. Required for non-VLAN deployments.
+7. ~~**TLS**~~ (deferred) — not needed for VLAN deployments. Ed25519 challenge-response provides identity without encryption overhead on the hot path.
 8. **Metrics & observability** — connection counts, queue depth, health endpoints. Operators need visibility.
 9. **Auction mechanisms** — opening/closing/volatility auctions. Differentiator for regulated venues.
-10. **Fee model** — maker/taker fees on fills. Shows the engine can generate revenue.
+10. ~~**Fee model**~~ ✅ — per-instrument maker/taker fees in basis points. Deducted from fill proceeds in quote currency. Configurable via admin API, journaled for deterministic replay. (`feat/fee-model` branch, pending merge)
 11. **Documentation** — architecture guide, API reference, operational runbook.
 12. **Security hardening** — remaining [audit findings](docs/security-audit.md): per-account order limits (SEC-03), order throttling (SEC-04), disk exhaustion handling (SEC-05), snapshot validation (SEC-09).
 
