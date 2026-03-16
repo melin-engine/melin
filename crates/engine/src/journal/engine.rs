@@ -238,6 +238,10 @@ fn replay_event(exchange: &mut Exchange, event: &JournalEvent, reports: &mut Vec
         } => {
             exchange.cancel_replace(symbol, order_id, new_price, new_quantity, reports);
         }
+        JournalEvent::QueryStats => {
+            // QueryStats is never journaled, so it should never appear
+            // during replay. No-op if it somehow does.
+        }
     }
 }
 

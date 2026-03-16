@@ -15,6 +15,7 @@
 //! while preserving persist-before-ack at the response boundary.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use crate::exchange::Exchange;
@@ -113,6 +114,12 @@ pub enum OutputPayload {
     BatchEnd,
     /// Internal error during matching.
     EngineError,
+    /// Server stats snapshot in response to `QueryStats`.
+    StatsHeader {
+        active_connections: u64,
+        events_processed: u64,
+        journal_sequence: u64,
+    },
 }
 
 impl Default for OutputSlot {
@@ -262,9 +269,13 @@ impl JournalStage {
                 // Batch-encode all events into the writer's internal buffer.
                 // Data stays in the buffer until the sync point — one
                 // pwritev2+RWF_DSYNC replaces multiple pwrites + fdatasync.
+                // QueryStats is not journaled (no state change).
                 #[cfg(not(feature = "no-persist"))]
                 {
                     for slot in &batch[..count] {
+                        if matches!(slot.event, JournalEvent::QueryStats) {
+                            continue;
+                        }
                         if let Err(e) = self.writer.batch_append(&slot.event) {
                             tracing::error!(error = %e, "journal encode error");
                         }
@@ -329,6 +340,9 @@ impl JournalStage {
             #[cfg(not(feature = "no-persist"))]
             {
                 for slot in &batch[..count] {
+                    if matches!(slot.event, JournalEvent::QueryStats) {
+                        continue;
+                    }
                     if let Err(e) = self.writer.batch_append(&slot.event) {
                         tracing::error!(error = %e, "journal encode error on drain");
                     }
@@ -352,6 +366,17 @@ pub struct MatchingStage {
     exchange: Exchange,
     consumer: ring::Consumer<InputSlot>,
     output: spsc::Producer<OutputSlot>,
+    /// Monotonically increasing count of events processed. Relaxed ordering
+    /// is sufficient — this is a diagnostic counter, not a synchronization
+    /// primitive. One `fetch_add(1, Relaxed)` per event (~1ns).
+    events_processed: Arc<AtomicU64>,
+    /// Journal cursor for reading the current durable sequence. Used by
+    /// `QueryStats` to report the journal position without adding any
+    /// cross-thread synchronization on the hot path.
+    journal_cursor: Arc<Sequence>,
+    /// Active connection count, shared with the server accept loop.
+    /// Read only when processing `QueryStats` (once per second at most).
+    active_connections: Arc<AtomicU64>,
 }
 
 impl MatchingStage {
@@ -360,11 +385,17 @@ impl MatchingStage {
         exchange: Exchange,
         consumer: ring::Consumer<InputSlot>,
         output: spsc::Producer<OutputSlot>,
+        events_processed: Arc<AtomicU64>,
+        journal_cursor: Arc<Sequence>,
+        active_connections: Arc<AtomicU64>,
     ) -> Self {
         Self {
             exchange,
             consumer,
             output,
+            events_processed,
+            journal_cursor,
+            active_connections,
         }
     }
 
@@ -382,6 +413,10 @@ impl MatchingStage {
         // this thread during busy periods). 1000 spins ≈ 1µs at ~1ns/spin,
         // which is well under the inter-event arrival time at peak throughput.
         let mut idle_spins: u32 = 0;
+        // Thread-local events counter — plain u64 increment (~0.3ns) instead
+        // of atomic fetch_add (~5-8ns). Flushed to the shared Arc<AtomicU64>
+        // only when QueryStats fires (~1/sec) or on shutdown.
+        let mut local_events: u64 = 0;
 
         #[cfg(feature = "pipeline-stats")]
         let mut busy_count: u64 = 0;
@@ -400,6 +435,8 @@ impl MatchingStage {
             if shutdown.load(std::sync::atomic::Ordering::Relaxed) {
                 // Drain remaining entries so every journaled event gets a response.
                 self.drain_remaining(&mut reports);
+                // Flush the thread-local counter to the shared atomic.
+                self.events_processed.store(local_events, Ordering::Relaxed);
                 #[cfg(feature = "latency-trace")]
                 {
                     wakeup_hist.print_report();
@@ -444,6 +481,47 @@ impl MatchingStage {
             #[cfg(feature = "latency-trace")]
             let exec_start = trace_ts();
 
+            // QueryStats is handled inline — it reads matching-stage-owned
+            // state and publishes directly without touching the Exchange.
+            // Not counted in events_processed (it's not a trading event).
+            if matches!(slot.event, JournalEvent::QueryStats) {
+                #[cfg(feature = "latency-trace")]
+                let exec_end = trace_ts();
+                #[cfg(feature = "latency-trace")]
+                execute_hist.record_ns(crate::journal::trace::trace_elapsed_ns(
+                    exec_start, exec_end,
+                ));
+
+                #[allow(clippy::let_unit_value)]
+                let match_complete_ts = trace_ts();
+
+                // Flush the thread-local counter so the snapshot is current.
+                self.events_processed.store(local_events, Ordering::Relaxed);
+
+                let journal_sequence = self.journal_cursor.get().load(Ordering::Relaxed);
+                let active_connections = self.active_connections.load(Ordering::Relaxed);
+                self.output.publish(OutputSlot {
+                    connection_id: slot.connection_id,
+                    input_seq,
+                    payload: OutputPayload::StatsHeader {
+                        active_connections,
+                        events_processed: local_events,
+                        journal_sequence,
+                    },
+                    match_complete_ts,
+                    recv_ts: slot.recv_ts,
+                });
+                self.output.publish(OutputSlot {
+                    connection_id: slot.connection_id,
+                    input_seq,
+                    payload: OutputPayload::BatchEnd,
+                    match_complete_ts,
+                    recv_ts: slot.recv_ts,
+                });
+                continue;
+            }
+
+            local_events += 1;
             self.process_event(&slot, &mut reports);
 
             #[cfg(feature = "latency-trace")]
@@ -490,6 +568,11 @@ impl MatchingStage {
             let Some((input_seq, slot)) = entry else {
                 break;
             };
+            // Stats queries are meaningless during shutdown — skip to avoid
+            // emitting a bare BatchEnd without a preceding StatsHeader.
+            if matches!(slot.event, JournalEvent::QueryStats) {
+                continue;
+            }
             reports.clear();
             self.process_event(&slot, reports);
 
@@ -552,6 +635,10 @@ impl MatchingStage {
                 self.exchange
                     .cancel_replace(symbol, order_id, new_price, new_quantity, reports);
             }
+            JournalEvent::QueryStats => {
+                // Handled inline in the run loop before process_event is called.
+                // This arm exists only for exhaustiveness.
+            }
         }
     }
 }
@@ -588,12 +675,14 @@ pub fn build_pipeline(
     exchange: Exchange,
     writer: JournalWriter,
     group_commit_delay: Duration,
+    active_connections: Arc<AtomicU64>,
 ) -> (
     ring::MultiProducer<InputSlot>,
     JournalStage,
     MatchingStage,
     spsc::Consumer<OutputSlot>,
     Arc<Sequence>,
+    Arc<AtomicU64>,
 ) {
     // Input disruptor: N producers (reader threads), 2 parallel consumers.
     // MultiProducer allows lock-free concurrent publishing from all reader
@@ -614,8 +703,17 @@ pub fn build_pipeline(
     // Output SPSC: matching → response.
     let (output_producer, output_consumer) = spsc::channel::<OutputSlot>(OUTPUT_RING_CAPACITY);
 
+    let events_processed = Arc::new(AtomicU64::new(0));
+
     let journal_stage = JournalStage::new(writer, journal_consumer, group_commit_delay);
-    let matching_stage = MatchingStage::new(exchange, matching_consumer, output_producer);
+    let matching_stage = MatchingStage::new(
+        exchange,
+        matching_consumer,
+        output_producer,
+        Arc::clone(&events_processed),
+        Arc::clone(&journal_cursor),
+        active_connections,
+    );
 
     (
         input_producer,
@@ -623,6 +721,7 @@ pub fn build_pipeline(
         matching_stage,
         output_consumer,
         journal_cursor,
+        events_processed,
     )
 }
 
@@ -631,7 +730,7 @@ mod tests {
     use super::*;
     use crate::types::*;
     use std::num::NonZeroU64;
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
     use std::time::Duration;
 
     fn limit_order(id: u64, account: AccountId, side: Side, price: u64, qty: u64) -> Order {
@@ -724,7 +823,18 @@ mod tests {
 
         let (output_producer, mut output_consumer) = spsc::channel::<OutputSlot>(64);
 
-        let stage = MatchingStage::new(exchange, consumer, output_producer);
+        // Journal cursor and counters not used in this test — create dummies.
+        let dummy_cursor = Arc::new(Sequence::new(AtomicU64::new(0)));
+        let events_counter = Arc::new(AtomicU64::new(0));
+        let active_conns = Arc::new(AtomicU64::new(0));
+        let stage = MatchingStage::new(
+            exchange,
+            consumer,
+            output_producer,
+            events_counter,
+            dummy_cursor,
+            active_conns,
+        );
 
         let shutdown = Arc::new(AtomicBool::new(false));
         let shutdown2 = Arc::clone(&shutdown);
@@ -788,8 +898,15 @@ mod tests {
 
         let writer = JournalWriter::create(&path).unwrap();
 
-        let (input_producer, journal_stage, matching_stage, mut output_consumer, journal_cursor) =
-            build_pipeline(exchange, writer, Duration::ZERO);
+        let active_conns = Arc::new(AtomicU64::new(0));
+        let (
+            input_producer,
+            journal_stage,
+            matching_stage,
+            mut output_consumer,
+            journal_cursor,
+            _events_processed,
+        ) = build_pipeline(exchange, writer, Duration::ZERO, active_conns);
 
         let shutdown = Arc::new(AtomicBool::new(false));
         let s1 = Arc::clone(&shutdown);

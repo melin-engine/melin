@@ -39,6 +39,7 @@ const TAG_DEPOSIT: u8 = 7;
 const TAG_SET_RISK_LIMITS: u8 = 8;
 const TAG_SET_CIRCUIT_BREAKER: u8 = 9;
 const TAG_CANCEL_REPLACE: u8 = 10;
+const TAG_QUERY_STATS: u8 = 30;
 
 // --- Response tags ---
 const TAG_PLACED: u8 = 11;
@@ -53,6 +54,7 @@ const TAG_RESPONSE_HEARTBEAT: u8 = 19;
 const TAG_CHALLENGE: u8 = 20;
 const TAG_AUTH_FAILED: u8 = 21;
 const TAG_REPLACED: u8 = 22;
+const TAG_STATS_HEADER: u8 = 23;
 
 // --- OrderType tags (wire-specific, not shared with journal) ---
 const ORDER_TYPE_MARKET: u8 = 0;
@@ -198,6 +200,10 @@ pub fn encode_request(request: &Request, buf: &mut [u8]) -> Result<usize, Protoc
             pos += 8;
             le::put_u64(&mut buf[pos..], new_quantity.get());
             pos += 8;
+        }
+        Request::QueryStats => {
+            buf[pos] = TAG_QUERY_STATS;
+            pos += 1;
         }
     }
 
@@ -381,6 +387,7 @@ pub fn decode_request(buf: &[u8]) -> Result<Request, ProtocolError> {
                 new_quantity: Quantity(new_quantity),
             })
         }
+        TAG_QUERY_STATS => Ok(Request::QueryStats),
         _ => Err(ProtocolError::UnknownTag(tag)),
     }
 }
@@ -421,6 +428,20 @@ pub fn encode_response(response: &ResponseKind, buf: &mut [u8]) -> Result<usize,
             buf[pos] = TAG_AUTH_FAILED;
             pos += 1;
         }
+        ResponseKind::StatsHeader {
+            active_connections,
+            events_processed,
+            journal_sequence,
+        } => {
+            buf[pos] = TAG_STATS_HEADER;
+            pos += 1;
+            le::put_u64(&mut buf[pos..], *active_connections);
+            pos += 8;
+            le::put_u64(&mut buf[pos..], *events_processed);
+            pos += 8;
+            le::put_u64(&mut buf[pos..], *journal_sequence);
+            pos += 8;
+        }
     }
 
     let payload_len = pos - 4;
@@ -455,6 +476,17 @@ pub fn decode_response(buf: &[u8]) -> Result<ResponseKind, ProtocolError> {
         TAG_PLACED | TAG_FILL | TAG_CANCELLED | TAG_TRIGGERED | TAG_REJECTED | TAG_REPLACED => {
             let report = decode_execution_report(tag, payload)?;
             Ok(ResponseKind::Report(report))
+        }
+        TAG_STATS_HEADER => {
+            // active_connections(8) + events_processed(8) + journal_sequence(8) = 24
+            if payload.len() < 24 {
+                return Err(ProtocolError::Truncated);
+            }
+            Ok(ResponseKind::StatsHeader {
+                active_connections: le::get_u64(&payload[0..]),
+                events_processed: le::get_u64(&payload[8..]),
+                journal_sequence: le::get_u64(&payload[16..]),
+            })
         }
         _ => Err(ProtocolError::UnknownTag(tag)),
     }
@@ -991,6 +1023,7 @@ mod tests {
                 new_price: Price(nz(5500)),
                 new_quantity: Quantity(nz(30)),
             },
+            Request::QueryStats,
         ]
     }
 
@@ -1084,6 +1117,11 @@ mod tests {
             ResponseKind::Heartbeat,
             ResponseKind::Challenge { nonce: [0xCC; 32] },
             ResponseKind::AuthFailed,
+            ResponseKind::StatsHeader {
+                active_connections: 5,
+                events_processed: 1_234_567,
+                journal_sequence: 1_234_567,
+            },
         ]
     }
 

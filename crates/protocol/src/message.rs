@@ -58,6 +58,13 @@ pub enum Request {
         config: CircuitBreakerConfig,
     },
 
+    // --- Query operations (Admin only) ---
+    /// Request a snapshot of server stats (connections, throughput, book
+    /// depth, balances). Tag-only, no payload. Flows through the pipeline
+    /// like any other request so the matching stage can read Exchange state
+    /// without concurrency issues.
+    QueryStats,
+
     // --- Control messages (all permission levels) ---
     /// Keepalive heartbeat. Resets the server's idle timeout for this
     /// connection. Tag-only, no payload.
@@ -82,6 +89,7 @@ impl Request {
                 | Request::Deposit { .. }
                 | Request::SetRiskLimits { .. }
                 | Request::SetCircuitBreaker { .. }
+                | Request::QueryStats
         )
     }
 }
@@ -115,4 +123,15 @@ pub enum ResponseKind {
     /// Authentication failed — invalid signature, unknown key, or
     /// other auth error. Server drops the connection after sending this.
     AuthFailed,
+
+    // --- Stats response ---
+    /// Server stats snapshot. Sent in response to `QueryStats`.
+    StatsHeader {
+        /// Number of currently authenticated connections.
+        active_connections: u64,
+        /// Total events processed by the matching engine since startup.
+        events_processed: u64,
+        /// Current journal sequence number (last durable event).
+        journal_sequence: u64,
+    },
 }

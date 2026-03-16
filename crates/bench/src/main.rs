@@ -39,7 +39,7 @@ use std::num::NonZeroU64;
 use std::os::unix::io::{AsRawFd, RawFd};
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use hdrhistogram::Histogram;
@@ -476,8 +476,15 @@ fn run_pipeline_bench(
     let writer = JournalWriter::create(&effective_journal).expect("create journal");
 
     let group_commit_delay = Duration::from_micros(group_commit_us);
-    let (producer, journal_stage, matching_stage, mut output_consumer, _journal_cursor) =
-        build_pipeline(exchange, writer, group_commit_delay);
+    let active_conns = Arc::new(AtomicU64::new(0));
+    let (
+        producer,
+        journal_stage,
+        matching_stage,
+        mut output_consumer,
+        _journal_cursor,
+        _events_processed,
+    ) = build_pipeline(exchange, writer, group_commit_delay, active_conns);
 
     let shutdown = Arc::new(AtomicBool::new(false));
 

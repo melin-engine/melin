@@ -151,6 +151,38 @@ impl Client {
 
         Ok(responses)
     }
+
+    /// Query server stats. Returns `(active_connections, events_processed, journal_sequence)`.
+    ///
+    /// Sends `QueryStats` and extracts the `StatsHeader` from the response batch.
+    pub fn query_stats(&mut self) -> Result<StatsSnapshot, ClientError> {
+        let responses = self.send_request(&Request::QueryStats)?;
+        for resp in &responses {
+            if let ResponseKind::StatsHeader {
+                active_connections,
+                events_processed,
+                journal_sequence,
+            } = resp
+            {
+                return Ok(StatsSnapshot {
+                    active_connections: *active_connections,
+                    events_processed: *events_processed,
+                    journal_sequence: *journal_sequence,
+                });
+            }
+        }
+        Err(ClientError::Protocol(ProtocolError::InvalidField(
+            "no StatsHeader in response",
+        )))
+    }
+}
+
+/// Snapshot of server stats returned by [`Client::query_stats`].
+#[derive(Debug, Clone, Copy)]
+pub struct StatsSnapshot {
+    pub active_connections: u64,
+    pub events_processed: u64,
+    pub journal_sequence: u64,
 }
 
 #[cfg(test)]

@@ -10,6 +10,7 @@
 use std::net::SocketAddr;
 use std::num::NonZeroU64;
 use std::sync::mpsc;
+use std::time::Instant;
 
 use crossterm::event::{self, Event, KeyCode, KeyEventKind};
 use ratatui::Frame;
@@ -18,7 +19,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, Paragraph};
 
-use trading_client::Client;
+use trading_client::{Client, StatsSnapshot};
 use trading_protocol::message::{Request, ResponseKind};
 use trading_protocol::types::{
     AccountId, CircuitBreakerConfig, CurrencyId, ExecutionReport, InstrumentSpec, Order, OrderId,
@@ -210,6 +211,19 @@ struct App {
     response_rx: mpsc::Receiver<String>,
     quit: bool,
     next_order_id: u64,
+    /// Last stats snapshot received from the server.
+    stats: Option<DashboardStats>,
+    /// When the last stats poll was sent. Used to send QueryStats every second.
+    last_stats_poll: Instant,
+}
+
+/// Dashboard stats computed from `StatsHeader` responses.
+struct DashboardStats {
+    active_connections: u64,
+    events_processed: u64,
+    journal_sequence: u64,
+    /// Computed throughput: events/sec since last snapshot.
+    throughput: u64,
 }
 
 impl App {
@@ -222,6 +236,8 @@ impl App {
             response_rx,
             quit: false,
             next_order_id: 1,
+            stats: None,
+            last_stats_poll: Instant::now(),
         }
     }
 
@@ -1086,6 +1102,7 @@ fn client_thread(
     key: &ed25519_dalek::SigningKey,
     request_rx: mpsc::Receiver<Request>,
     response_tx: mpsc::Sender<String>,
+    stats_tx: mpsc::Sender<StatsSnapshot>,
 ) {
     let mut client = match Client::connect(addr, key) {
         Ok(c) => {
@@ -1115,6 +1132,19 @@ fn client_thread(
                         | ResponseKind::Heartbeat
                         | ResponseKind::Challenge { .. }
                         | ResponseKind::AuthFailed => continue,
+                        ResponseKind::StatsHeader {
+                            active_connections,
+                            events_processed,
+                            journal_sequence,
+                        } => {
+                            // Best-effort: receiver may be gone if UI quit.
+                            let _ = stats_tx.send(StatsSnapshot {
+                                active_connections: *active_connections,
+                                events_processed: *events_processed,
+                                journal_sequence: *journal_sequence,
+                            });
+                            continue;
+                        }
                     };
                     let _ = response_tx.send(format!("{msg}  [{latency:.3?}]"));
                 }
@@ -1132,11 +1162,16 @@ fn client_thread(
 fn draw(frame: &mut Frame, app: &App) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Min(5), Constraint::Length(3)])
+        .constraints([
+            Constraint::Length(3), // dashboard
+            Constraint::Min(5),    // log
+            Constraint::Length(3), // status bar
+        ])
         .split(frame.area());
 
-    draw_log(frame, app, chunks[0]);
-    draw_status_bar(frame, app, chunks[1]);
+    draw_dashboard(frame, app, chunks[0]);
+    draw_log(frame, app, chunks[1]);
+    draw_status_bar(frame, app, chunks[2]);
 
     match &app.screen {
         Screen::ActionMenu => {
@@ -1162,6 +1197,31 @@ fn draw(frame: &mut Frame, app: &App) {
             draw_command_input(frame, buf);
         }
     }
+}
+
+fn draw_dashboard(frame: &mut Frame, app: &App, area: Rect) {
+    let text = if let Some(stats) = &app.stats {
+        let tput = if stats.throughput >= 1_000_000 {
+            format!("{:.1}M/s", stats.throughput as f64 / 1_000_000.0)
+        } else if stats.throughput >= 1_000 {
+            format!("{}K/s", stats.throughput / 1_000)
+        } else {
+            format!("{}/s", stats.throughput)
+        };
+        format!(
+            " Connections: {}    Events: {}    Throughput: {}    Journal: #{}",
+            stats.active_connections, stats.events_processed, tput, stats.journal_sequence,
+        )
+    } else {
+        " Waiting for stats...".into()
+    };
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(" Dashboard ")
+        .border_style(Style::default().fg(Color::DarkGray));
+    let paragraph = Paragraph::new(text).block(block);
+    frame.render_widget(paragraph, area);
 }
 
 fn draw_log(frame: &mut Frame, app: &App, area: Rect) {
@@ -1346,17 +1406,52 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let (request_tx, request_rx) = mpsc::channel::<Request>();
     let (response_tx, response_rx) = mpsc::channel::<String>();
+    let (stats_tx, stats_rx) = mpsc::channel::<StatsSnapshot>();
 
     std::thread::Builder::new()
         .name("client".into())
-        .spawn(move || client_thread(addr, &key, request_rx, response_tx))
+        .spawn(move || client_thread(addr, &key, request_rx, response_tx, stats_tx))
         .expect("spawn client thread");
 
     let mut terminal = ratatui::init();
-    let mut app = App::new(request_tx, response_rx);
+    let mut app = App::new(request_tx.clone(), response_rx);
+    let stats_request_tx = request_tx;
 
     loop {
         app.poll_responses();
+
+        // Poll stats from client thread. Only use the latest snapshot
+        // if multiple arrived (avoids near-zero elapsed denominator).
+        let mut latest_stats: Option<StatsSnapshot> = None;
+        while let Ok(raw) = stats_rx.try_recv() {
+            latest_stats = Some(raw);
+        }
+        if let Some(raw) = latest_stats {
+            let elapsed = app.last_stats_poll.elapsed().as_secs_f64();
+            let throughput = if let Some(prev) = &app.stats {
+                if elapsed > 0.01 {
+                    ((raw.events_processed.saturating_sub(prev.events_processed)) as f64 / elapsed)
+                        as u64
+                } else {
+                    prev.throughput
+                }
+            } else {
+                0
+            };
+            app.stats = Some(DashboardStats {
+                active_connections: raw.active_connections,
+                events_processed: raw.events_processed,
+                journal_sequence: raw.journal_sequence,
+                throughput,
+            });
+            app.last_stats_poll = Instant::now();
+        }
+
+        // Send a QueryStats request every second.
+        if app.last_stats_poll.elapsed() >= std::time::Duration::from_secs(1) {
+            let _ = stats_request_tx.send(Request::QueryStats);
+        }
+
         terminal.draw(|f| draw(f, &app))?;
 
         if app.quit {

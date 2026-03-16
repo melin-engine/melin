@@ -503,7 +503,8 @@ fn client_thread(
                         | ResponseKind::ServerReady
                         | ResponseKind::Heartbeat
                         | ResponseKind::Challenge { .. }
-                        | ResponseKind::AuthFailed => continue,
+                        | ResponseKind::AuthFailed
+                        | ResponseKind::StatsHeader { .. } => continue,
                     };
                     let _ = response_tx.send(msg);
                 }

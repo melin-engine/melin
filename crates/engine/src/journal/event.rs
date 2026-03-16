@@ -44,4 +44,8 @@ pub enum JournalEvent {
         new_price: Price,
         new_quantity: Quantity,
     },
+    /// Query server stats. Not journaled (no state change) — the journal
+    /// stage skips this variant. Flows through the pipeline so the matching
+    /// stage can read Exchange state without concurrency issues.
+    QueryStats,
 }

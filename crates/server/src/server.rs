@@ -196,9 +196,26 @@ pub fn run_with_shutdown<L: BlockingTransportListener>(
     // Pre-fault all HashMap pages so page faults happen now, not on the hot path.
     exchange.prefault();
 
+    // Active connection counter shared between accept loop, response
+    // stage, and matching stage (for stats queries).
+    // Incremented on successful auth, decremented on disconnect.
+    // Used to enforce max_connections (SEC-02).
+    let active_connections = Arc::new(AtomicU64::new(0));
+
     // Build the disruptor pipeline.
-    let (input_producer, journal_stage, matching_stage, output_consumer, journal_cursor) =
-        build_pipeline(exchange, writer, config.group_commit_delay());
+    let (
+        input_producer,
+        journal_stage,
+        matching_stage,
+        output_consumer,
+        journal_cursor,
+        _events_processed,
+    ) = build_pipeline(
+        exchange,
+        writer,
+        config.group_commit_delay(),
+        Arc::clone(&active_connections),
+    );
 
     // Control channel for connect/disconnect events → response stage.
     let (control_tx, control_rx) = std::sync::mpsc::channel();
@@ -242,10 +259,6 @@ pub fn run_with_shutdown<L: BlockingTransportListener>(
         })
         .expect("failed to spawn matching thread");
 
-    // Active connection counter shared between accept loop and response
-    // stage. Incremented on successful auth, decremented on disconnect.
-    // Used to enforce max_connections (SEC-02).
-    let active_connections = Arc::new(AtomicU64::new(0));
     #[cfg_attr(feature = "io-uring", allow(unused_variables))]
     let active_connections_response = Arc::clone(&active_connections);
 

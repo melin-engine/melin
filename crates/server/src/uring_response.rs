@@ -294,6 +294,15 @@ pub fn run(
                 OutputPayload::Report(report) => ResponseKind::Report(report),
                 OutputPayload::BatchEnd => ResponseKind::BatchEnd,
                 OutputPayload::EngineError => ResponseKind::EngineError,
+                OutputPayload::StatsHeader {
+                    active_connections,
+                    events_processed,
+                    journal_sequence,
+                } => ResponseKind::StatsHeader {
+                    active_connections,
+                    events_processed,
+                    journal_sequence,
+                },
             };
 
             if let Some(entry) = connections.get_mut(&slot.connection_id) {

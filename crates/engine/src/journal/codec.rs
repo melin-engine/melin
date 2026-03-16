@@ -235,6 +235,14 @@ pub fn encode(
             pos += 8;
             TAG_CANCEL_REPLACE
         }
+        JournalEvent::QueryStats => {
+            // QueryStats is never journaled — the journal stage filters it
+            // out before calling batch_append. This arm should never execute.
+            return Err(JournalError::CorruptEntry {
+                sequence,
+                reason: "QueryStats must not be journaled",
+            });
+        }
     };
 
     // `length` covers event_tag(1) + payload bytes.
