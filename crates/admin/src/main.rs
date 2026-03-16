@@ -130,7 +130,11 @@ impl OrderFields {
     }
 
     fn side(&self) -> Side {
-        if self.action.is_multiple_of(2) { Side::Buy } else { Side::Sell }
+        if self.action.is_multiple_of(2) {
+            Side::Buy
+        } else {
+            Side::Sell
+        }
     }
 }
 
@@ -610,10 +614,8 @@ impl App {
                                 symbol: Symbol(symbol),
                                 order_id: OrderId(val),
                             };
-                            self.log.push(format!(
-                                "→ CANCEL #{val} on symbol {}",
-                                symbol,
-                            ));
+                            self.log
+                                .push(format!("→ CANCEL #{val} on symbol {}", symbol,));
                             let _ = self.request_tx.send(request);
                             self.screen = Screen::ActionMenu;
                             self.cursor = 0;
@@ -668,7 +670,9 @@ impl App {
                         self.screen = Screen::NumberInput {
                             label: "Currency ID",
                             buf: String::new(),
-                            next: NextStep::DepositCurrency { account: val as u32 },
+                            next: NextStep::DepositCurrency {
+                                account: val as u32,
+                            },
                         };
                     }
                     NextStep::DepositCurrency { account } => {
@@ -780,9 +784,7 @@ impl App {
                             symbol: Symbol(symbol),
                             order_id: OrderId(order_id),
                             new_price: Price(NonZeroU64::new(new_price).expect("validated > 0")),
-                            new_quantity: Quantity(
-                                NonZeroU64::new(val).expect("validated > 0"),
-                            ),
+                            new_quantity: Quantity(NonZeroU64::new(val).expect("validated > 0")),
                         };
                         self.log.push(format!(
                             "→ CANCEL-REPLACE #{} sym:{} price:{} qty:{}",
@@ -840,8 +842,12 @@ impl App {
                         self.log.push(format!(
                             "→ CIRCUIT BREAKER sym:{} lower:{} upper:{} halted:{}",
                             symbol,
-                            lower.map(|v| v.to_string()).unwrap_or_else(|| "none".into()),
-                            upper.map(|v| v.to_string()).unwrap_or_else(|| "none".into()),
+                            lower
+                                .map(|v| v.to_string())
+                                .unwrap_or_else(|| "none".into()),
+                            upper
+                                .map(|v| v.to_string())
+                                .unwrap_or_else(|| "none".into()),
                             config.halted,
                         ));
                         let _ = self.request_tx.send(request);
@@ -927,8 +933,14 @@ impl App {
             OrderType::Market => "MARKET".into(),
             OrderType::Limit { price } => format!("LIMIT @{}", price.0),
             OrderType::Stop { trigger_price } => format!("STOP trigger @{}", trigger_price.0),
-            OrderType::StopLimit { trigger_price, limit_price } => {
-                format!("STOP-LIMIT trigger @{} limit @{}", trigger_price.0, limit_price.0)
+            OrderType::StopLimit {
+                trigger_price,
+                limit_price,
+            } => {
+                format!(
+                    "STOP-LIMIT trigger @{} limit @{}",
+                    trigger_price.0, limit_price.0
+                )
             }
         };
         self.log.push(format!(
@@ -988,7 +1000,10 @@ fn parse_text_command(input: &str) -> Result<Request, String> {
                 account: AccountId(acct),
             })
         }
-        _ => Err(format!("unknown command: {} (try: cancel <sym> <id>, cancel-all <acct>)", parts[0])),
+        _ => Err(format!(
+            "unknown command: {} (try: cancel <sym> <id>, cancel-all <acct>)",
+            parts[0]
+        )),
     }
 }
 
@@ -1133,7 +1148,12 @@ fn draw(frame: &mut Frame, app: &App) {
         }
         Screen::StpMenu { .. } => {
             let items: Vec<&str> = STP_OPTIONS.iter().map(|(name, _)| *name).collect();
-            draw_menu(frame, "Self-Trade Prevention", items.into_iter(), app.cursor);
+            draw_menu(
+                frame,
+                "Self-Trade Prevention",
+                items.into_iter(),
+                app.cursor,
+            );
         }
         Screen::NumberInput { label, buf, .. } => {
             draw_input(frame, label, buf);

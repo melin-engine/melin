@@ -257,23 +257,23 @@ impl Exchange {
                 OrderType::Market | OrderType::Stop { .. } => None,
             };
             if let Some(price) = limit_price {
-                if let Some(lower) = cb.price_band_lower {
-                    if price < lower {
-                        reports.push(ExecutionReport::Rejected {
-                            order_id: order.id,
-                            reason: RejectReason::OutsidePriceBand,
-                        });
-                        return;
-                    }
+                if let Some(lower) = cb.price_band_lower
+                    && price < lower
+                {
+                    reports.push(ExecutionReport::Rejected {
+                        order_id: order.id,
+                        reason: RejectReason::OutsidePriceBand,
+                    });
+                    return;
                 }
-                if let Some(upper) = cb.price_band_upper {
-                    if price > upper {
-                        reports.push(ExecutionReport::Rejected {
-                            order_id: order.id,
-                            reason: RejectReason::OutsidePriceBand,
-                        });
-                        return;
-                    }
+                if let Some(upper) = cb.price_band_upper
+                    && price > upper
+                {
+                    reports.push(ExecutionReport::Rejected {
+                        order_id: order.id,
+                        reason: RejectReason::OutsidePriceBand,
+                    });
+                    return;
                 }
             }
         }
@@ -610,10 +610,7 @@ impl Exchange {
         };
 
         if let Err(reason) = self.accounts.try_adjust_reservation(order_id, new_required) {
-            reports.push(ExecutionReport::Rejected {
-                order_id,
-                reason,
-            });
+            reports.push(ExecutionReport::Rejected { order_id, reason });
             return;
         }
 
@@ -3836,7 +3833,9 @@ mod tests {
         );
 
         // Expect a fill against order 1 (maker), not order 2.
-        let fill = reports.iter().find(|r| matches!(r, ExecutionReport::Fill { .. }));
+        let fill = reports
+            .iter()
+            .find(|r| matches!(r, ExecutionReport::Fill { .. }));
         assert!(fill.is_some());
         assert!(matches!(
             fill.unwrap(),
@@ -3883,7 +3882,9 @@ mod tests {
             &mut reports,
         );
 
-        let fill = reports.iter().find(|r| matches!(r, ExecutionReport::Fill { .. }));
+        let fill = reports
+            .iter()
+            .find(|r| matches!(r, ExecutionReport::Fill { .. }));
         assert!(fill.is_some());
         assert!(matches!(
             fill.unwrap(),
