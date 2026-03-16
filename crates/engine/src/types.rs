@@ -89,9 +89,10 @@ pub struct CircuitBreakerConfig {
 
 /// Per-instrument maker/taker fee schedule.
 ///
-/// Fees are in basis points (1 bp = 0.01%). Deducted from the received
-/// currency: buyers pay fees in base, sellers in quote. This avoids
-/// changing the reservation model — fees reduce proceeds, not cost.
+/// Fees are in basis points (1 bp = 0.01%), charged in quote currency
+/// (cost-based): `fee = price * quantity * bps / 10_000`. The buyer's
+/// fee is deducted from their reservation; the seller's fee is deducted
+/// from their proceeds.
 ///
 /// Example: `maker_fee_bps = 5, taker_fee_bps = 10` means 0.05% maker
 /// and 0.10% taker fees.
@@ -225,11 +226,9 @@ pub enum ExecutionReport {
         taker_account: AccountId,
         price: Price,
         quantity: Quantity,
-        /// Fee charged to the maker, in the currency they receive
-        /// (base if buying, quote if selling). 0 if no fee.
+        /// Fee charged to the maker in quote currency. 0 if no fee.
         maker_fee: u64,
-        /// Fee charged to the taker, in the currency they receive
-        /// (base if buying, quote if selling). 0 if no fee.
+        /// Fee charged to the taker in quote currency. 0 if no fee.
         taker_fee: u64,
     },
     /// Order was cancelled (or remainder cancelled for IOC).
