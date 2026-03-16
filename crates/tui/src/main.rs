@@ -718,7 +718,10 @@ fn centered_rect(width: u16, height: u16, area: Rect) -> Rect {
 fn load_signing_key(path: &str) -> ed25519_dalek::SigningKey {
     let bytes = std::fs::read(path).unwrap_or_else(|e| panic!("cannot read key file {path}: {e}"));
     if bytes.len() != 32 {
-        panic!("key file must be exactly 32 bytes (raw Ed25519 seed), got {}", bytes.len());
+        panic!(
+            "key file must be exactly 32 bytes (raw Ed25519 seed), got {}",
+            bytes.len()
+        );
     }
     let mut seed = [0u8; 32];
     seed.copy_from_slice(&bytes);

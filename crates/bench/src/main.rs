@@ -814,7 +814,10 @@ fn connect_tcp(addr: std::net::SocketAddr) -> std::net::TcpStream {
 
 /// Perform challenge-response auth handshake on a new connection.
 /// Must be called before the stream is set to non-blocking mode.
-fn auth_handshake(stream: &mut (impl std::io::Read + std::io::Write), key: &ed25519_dalek::SigningKey) {
+fn auth_handshake(
+    stream: &mut (impl std::io::Read + std::io::Write),
+    key: &ed25519_dalek::SigningKey,
+) {
     use ed25519_dalek::Signer;
     use trading_protocol::message::Request;
 

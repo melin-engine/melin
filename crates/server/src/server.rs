@@ -540,11 +540,10 @@ fn authenticate_connection<R: std::io::Read, W: std::io::Write>(
     };
 
     // Verify the Ed25519 signature over the nonce.
-    let verifying_key = VerifyingKey::from_bytes(&public_key_bytes)
-        .map_err(|e| {
-            send_auth_failed(writer);
-            io::Error::other(format!("invalid public key: {e}"))
-        })?;
+    let verifying_key = VerifyingKey::from_bytes(&public_key_bytes).map_err(|e| {
+        send_auth_failed(writer);
+        io::Error::other(format!("invalid public key: {e}"))
+    })?;
     let signature = ed25519_dalek::Signature::from_bytes(&signature_bytes);
     verifying_key.verify(&nonce, &signature).map_err(|e| {
         send_auth_failed(writer);

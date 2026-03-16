@@ -367,6 +367,16 @@ impl OrderBook {
             .collect()
     }
 
+    /// Check if a resting order with the given ID exists on the book.
+    pub(crate) fn has_order(&self, id: OrderId) -> bool {
+        self.order_index.contains_key(&id)
+    }
+
+    /// Check if a pending stop with the given ID exists on the book.
+    pub(crate) fn has_stop(&self, id: OrderId) -> bool {
+        self.stop_index.contains_key(&id)
+    }
+
     /// Process an incoming order, appending execution reports to `reports`.
     ///
     /// `quote_budget` limits the total quote currency cost for buy-side market

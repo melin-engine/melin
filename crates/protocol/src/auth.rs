@@ -95,7 +95,7 @@ impl AuthorizedKeys {
                         "line {}: unknown permission '{}' (expected admin/trader/readonly)",
                         line_num + 1,
                         other
-                    ))
+                    ));
                 }
             };
 
@@ -151,7 +151,9 @@ readonly AgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgI= monitoring
         let keys = AuthorizedKeys::parse(content).unwrap();
         assert_eq!(keys.len(), 3);
 
-        let admin_key = BASE64.decode("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=").unwrap();
+        let admin_key = BASE64
+            .decode("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=")
+            .unwrap();
         let mut k = [0u8; 32];
         k.copy_from_slice(&admin_key);
         assert_eq!(keys.lookup(&k), Some(Permission::Admin));

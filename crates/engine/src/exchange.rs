@@ -353,6 +353,42 @@ impl Exchange {
             &mut self.consumed_buf,
         );
 
+        // Buy-side orders may have leftover reservation after fills due to
+        // price improvement: a limit buy at price 100 filling at price 80
+        // reserved 100×qty but only spent 80×qty, leaving 20×qty in the
+        // reservation. Market/stop buys reserve the entire available quote
+        // balance, making this even more likely. The Fill handler in
+        // process_reports only cleans up reservations when remaining == 0,
+        // which won't happen with price improvement.
+        //
+        // Scan all order IDs from fill reports. If any has a leftover
+        // reservation but is no longer on the book (fully filled), release
+        // the unused portion. This also handles triggered stops whose fill
+        // didn't exhaust their budget-based reservation.
+        let book = self
+            .books
+            .get(&symbol)
+            .expect("book exists because instrument was added");
+        for report in &reports[report_start..] {
+            if let ExecutionReport::Fill {
+                maker_order_id,
+                taker_order_id,
+                ..
+            } = report
+            {
+                for &id in &[*maker_order_id, *taker_order_id] {
+                    if !self.consumed_buf.contains(&id)
+                        && self.accounts.has_reservation(id)
+                        && !book.has_order(id)
+                        && !book.has_stop(id)
+                    {
+                        self.accounts.release(id);
+                        self.consumed_buf.push(id);
+                    }
+                }
+            }
+        }
+
         // Clean up order_sides for fully consumed orders (filled, cancelled,
         // or rejected). Without this, order_sides leaks entries and triggers
         // increasingly expensive HashMap resizes on the hot path.
@@ -2992,10 +3028,17 @@ mod tests {
         let mut reports = Vec::new();
 
         // Market.
-        exchange.execute(Symbol(1), market_order(1, ACCT_A, Side::Buy, 10), &mut reports);
+        exchange.execute(
+            Symbol(1),
+            market_order(1, ACCT_A, Side::Buy, 10),
+            &mut reports,
+        );
         assert!(matches!(
             reports[0],
-            ExecutionReport::Rejected { reason: RejectReason::TradingHalted, .. }
+            ExecutionReport::Rejected {
+                reason: RejectReason::TradingHalted,
+                ..
+            }
         ));
 
         // Stop.
@@ -3006,7 +3049,9 @@ mod tests {
                 id: OrderId(2),
                 account: ACCT_A,
                 side: Side::Buy,
-                order_type: OrderType::Stop { trigger_price: price(100) },
+                order_type: OrderType::Stop {
+                    trigger_price: price(100),
+                },
                 time_in_force: TimeInForce::GTC,
                 quantity: qty(10),
                 stp: SelfTradeProtection::Allow,
@@ -3015,7 +3060,10 @@ mod tests {
         );
         assert!(matches!(
             reports[0],
-            ExecutionReport::Rejected { reason: RejectReason::TradingHalted, .. }
+            ExecutionReport::Rejected {
+                reason: RejectReason::TradingHalted,
+                ..
+            }
         ));
 
         // StopLimit.
@@ -3038,7 +3086,10 @@ mod tests {
         );
         assert!(matches!(
             reports[0],
-            ExecutionReport::Rejected { reason: RejectReason::TradingHalted, .. }
+            ExecutionReport::Rejected {
+                reason: RejectReason::TradingHalted,
+                ..
+            }
         ));
     }
 
@@ -3079,7 +3130,10 @@ mod tests {
         );
         assert!(matches!(
             reports[0],
-            ExecutionReport::Rejected { reason: RejectReason::OutsidePriceBand, .. }
+            ExecutionReport::Rejected {
+                reason: RejectReason::OutsidePriceBand,
+                ..
+            }
         ));
 
         // StopLimit with limit_price within bands — accepted.
@@ -3103,7 +3157,9 @@ mod tests {
         // Stop orders rest in the stop queue — they produce no immediate report
         // unless triggered, so we just verify no rejection.
         assert!(
-            !reports.iter().any(|r| matches!(r, ExecutionReport::Rejected { .. })),
+            !reports
+                .iter()
+                .any(|r| matches!(r, ExecutionReport::Rejected { .. })),
             "in-range stop-limit should not be rejected"
         );
     }
@@ -3133,7 +3189,9 @@ mod tests {
                 id: OrderId(1),
                 account: ACCT_A,
                 side: Side::Buy,
-                order_type: OrderType::Stop { trigger_price: price(200) },
+                order_type: OrderType::Stop {
+                    trigger_price: price(200),
+                },
                 time_in_force: TimeInForce::GTC,
                 quantity: qty(10),
                 stp: SelfTradeProtection::Allow,
@@ -3141,7 +3199,9 @@ mod tests {
             &mut reports,
         );
         assert!(
-            !reports.iter().any(|r| matches!(r, ExecutionReport::Rejected { .. })),
+            !reports
+                .iter()
+                .any(|r| matches!(r, ExecutionReport::Rejected { .. })),
             "stop order should bypass price bands"
         );
     }
@@ -3172,7 +3232,10 @@ mod tests {
         );
         assert!(matches!(
             reports[0],
-            ExecutionReport::Rejected { reason: RejectReason::OutsidePriceBand, .. }
+            ExecutionReport::Rejected {
+                reason: RejectReason::OutsidePriceBand,
+                ..
+            }
         ));
 
         // High price — no upper bound, should pass.
@@ -3203,7 +3266,10 @@ mod tests {
         );
         assert!(matches!(
             reports[0],
-            ExecutionReport::Rejected { reason: RejectReason::OutsidePriceBand, .. }
+            ExecutionReport::Rejected {
+                reason: RejectReason::OutsidePriceBand,
+                ..
+            }
         ));
 
         // Low price — no lower bound, should pass.
@@ -3271,7 +3337,10 @@ mod tests {
         );
         assert!(matches!(
             reports[0],
-            ExecutionReport::Rejected { reason: RejectReason::OutsidePriceBand, .. }
+            ExecutionReport::Rejected {
+                reason: RejectReason::OutsidePriceBand,
+                ..
+            }
         ));
 
         // Sell above upper band — rejected.
@@ -3283,7 +3352,10 @@ mod tests {
         );
         assert!(matches!(
             reports[0],
-            ExecutionReport::Rejected { reason: RejectReason::OutsidePriceBand, .. }
+            ExecutionReport::Rejected {
+                reason: RejectReason::OutsidePriceBand,
+                ..
+            }
         ));
 
         // Sell within bands — accepted.
@@ -3322,7 +3394,10 @@ mod tests {
         );
         assert!(matches!(
             reports[0],
-            ExecutionReport::Rejected { reason: RejectReason::TradingHalted, .. }
+            ExecutionReport::Rejected {
+                reason: RejectReason::TradingHalted,
+                ..
+            }
         ));
 
         // ETH/USD — should still work.
@@ -3415,7 +3490,10 @@ mod tests {
         );
         assert!(matches!(
             reports[0],
-            ExecutionReport::Rejected { reason: RejectReason::TradingHalted, .. }
+            ExecutionReport::Rejected {
+                reason: RejectReason::TradingHalted,
+                ..
+            }
         ));
 
         // Unhalt and retry with the same OrderId — should be rejected as duplicate.
@@ -3428,7 +3506,10 @@ mod tests {
         );
         assert!(matches!(
             reports[0],
-            ExecutionReport::Rejected { reason: RejectReason::DuplicateOrderId, .. }
+            ExecutionReport::Rejected {
+                reason: RejectReason::DuplicateOrderId,
+                ..
+            }
         ));
     }
 
@@ -3455,7 +3536,10 @@ mod tests {
         );
         assert!(matches!(
             reports[0],
-            ExecutionReport::Rejected { reason: RejectReason::OutsidePriceBand, .. }
+            ExecutionReport::Rejected {
+                reason: RejectReason::OutsidePriceBand,
+                ..
+            }
         ));
 
         // Widen bands and retry same OrderId — should be duplicate.
@@ -3468,7 +3552,10 @@ mod tests {
         );
         assert!(matches!(
             reports[0],
-            ExecutionReport::Rejected { reason: RejectReason::DuplicateOrderId, .. }
+            ExecutionReport::Rejected {
+                reason: RejectReason::DuplicateOrderId,
+                ..
+            }
         ));
     }
 
@@ -3497,7 +3584,10 @@ mod tests {
         );
         assert!(matches!(
             reports[0],
-            ExecutionReport::Rejected { reason: RejectReason::TradingHalted, .. }
+            ExecutionReport::Rejected {
+                reason: RejectReason::TradingHalted,
+                ..
+            }
         ));
     }
 }

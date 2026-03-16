@@ -966,9 +966,7 @@ mod tests {
             ResponseKind::BatchEnd,
             ResponseKind::ServerReady,
             ResponseKind::Heartbeat,
-            ResponseKind::Challenge {
-                nonce: [0xCC; 32],
-            },
+            ResponseKind::Challenge { nonce: [0xCC; 32] },
             ResponseKind::AuthFailed,
         ]
     }

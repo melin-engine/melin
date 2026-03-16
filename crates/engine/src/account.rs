@@ -334,6 +334,11 @@ impl AccountManager {
         // so it can report consumed IDs back to Exchange for order_sides cleanup.
     }
 
+    /// Check if a reservation exists for the given order.
+    pub fn has_reservation(&self, order_id: OrderId) -> bool {
+        self.reservations.contains_key(&order_id)
+    }
+
     /// Release all remaining reserved funds for an order (on cancel or reject).
     pub fn release(&mut self, order_id: OrderId) {
         if let Some(res) = self.reservations.remove(&order_id)
