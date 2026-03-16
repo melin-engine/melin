@@ -5,8 +5,8 @@
 //! This halves journal size and simplifies the format.
 
 use crate::types::{
-    AccountId, CircuitBreakerConfig, CurrencyId, InstrumentSpec, Order, OrderId, Price, Quantity,
-    RiskLimits, Symbol,
+    AccountId, CircuitBreakerConfig, CurrencyId, FeeSchedule, InstrumentSpec, Order, OrderId,
+    Price, Quantity, RiskLimits, Symbol,
 };
 
 /// An input event to be journaled for replay and crash recovery.
@@ -43,6 +43,11 @@ pub enum JournalEvent {
         order_id: OrderId,
         new_price: Price,
         new_quantity: Quantity,
+    },
+    /// Set the fee schedule (maker/taker fees) for an instrument.
+    SetFeeSchedule {
+        symbol: Symbol,
+        schedule: FeeSchedule,
     },
     /// Query server stats. Not journaled (no state change) — the journal
     /// stage skips this variant. Flows through the pipeline so the matching

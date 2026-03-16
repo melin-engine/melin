@@ -87,6 +87,22 @@ pub struct CircuitBreakerConfig {
     pub halted: bool,
 }
 
+/// Per-instrument maker/taker fee schedule.
+///
+/// Fees are in basis points (1 bp = 0.01%). Deducted from the received
+/// currency: buyers pay fees in base, sellers in quote. This avoids
+/// changing the reservation model — fees reduce proceeds, not cost.
+///
+/// Example: `maker_fee_bps = 5, taker_fee_bps = 10` means 0.05% maker
+/// and 0.10% taker fees.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct FeeSchedule {
+    /// Maker fee in basis points (0-10000). 0 = no fee.
+    pub maker_fee_bps: u16,
+    /// Taker fee in basis points (0-10000). 0 = no fee.
+    pub taker_fee_bps: u16,
+}
+
 /// Price in ticks (fixed-point). A tick is the smallest price increment
 /// for a given instrument.
 ///
@@ -209,10 +225,17 @@ pub enum ExecutionReport {
         taker_account: AccountId,
         price: Price,
         quantity: Quantity,
+        /// Fee charged to the maker, in the currency they receive
+        /// (base if buying, quote if selling). 0 if no fee.
+        maker_fee: u64,
+        /// Fee charged to the taker, in the currency they receive
+        /// (base if buying, quote if selling). 0 if no fee.
+        taker_fee: u64,
     },
     /// Order was cancelled (or remainder cancelled for IOC).
     Cancelled {
         order_id: OrderId,
+        account: AccountId,
         remaining_quantity: Quantity,
     },
     /// A stop order was triggered by a trade at the given price.
@@ -223,6 +246,7 @@ pub enum ExecutionReport {
     /// Order was rejected (e.g., market order on empty book, FOK can't fill).
     Rejected {
         order_id: OrderId,
+        account: AccountId,
         reason: RejectReason,
     },
     /// Order was amended via cancel-replace. Emitted on success.

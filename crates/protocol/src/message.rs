@@ -5,8 +5,8 @@
 //! commands require `Permission::Admin` and are gated on the reader thread.
 
 use trading_engine::types::{
-    AccountId, CircuitBreakerConfig, CurrencyId, ExecutionReport, InstrumentSpec, Order, OrderId,
-    Price, Quantity, RiskLimits, Symbol,
+    AccountId, CircuitBreakerConfig, CurrencyId, ExecutionReport, FeeSchedule, InstrumentSpec,
+    Order, OrderId, Price, Quantity, RiskLimits, Symbol,
 };
 
 /// Connection identifier assigned by the server.
@@ -57,6 +57,11 @@ pub enum Request {
         symbol: Symbol,
         config: CircuitBreakerConfig,
     },
+    /// Set maker/taker fee schedule for an instrument.
+    SetFeeSchedule {
+        symbol: Symbol,
+        schedule: FeeSchedule,
+    },
 
     // --- Query operations (Admin only) ---
     /// Request a snapshot of server stats (connections, throughput, book
@@ -89,6 +94,7 @@ impl Request {
                 | Request::Deposit { .. }
                 | Request::SetRiskLimits { .. }
                 | Request::SetCircuitBreaker { .. }
+                | Request::SetFeeSchedule { .. }
                 | Request::QueryStats
         )
     }

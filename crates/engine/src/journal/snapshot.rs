@@ -30,8 +30,8 @@ use crate::account::{AccountManager, Balance};
 use crate::exchange::Exchange;
 use crate::orderbook::OrderBook;
 use crate::types::{
-    AccountId, CircuitBreakerConfig, CurrencyId, InstrumentSpec, OrderId, Price, Quantity,
-    RiskLimits, Side, Symbol,
+    AccountId, CircuitBreakerConfig, CurrencyId, FeeSchedule, InstrumentSpec, OrderId, Price,
+    Quantity, RiskLimits, Side, Symbol,
 };
 
 use super::error::JournalError;
@@ -189,7 +189,7 @@ pub(crate) struct ExchangeSnapshot {
     pub(crate) instruments: Vec<InstrumentSpec>,
     pub(crate) balances: Vec<((AccountId, CurrencyId), Balance)>,
     pub(crate) reservations: Vec<(OrderId, AccountId, CurrencyId, u64)>,
-    pub(crate) order_sides: Vec<(OrderId, Side)>,
+    pub(crate) order_sides: Vec<((AccountId, OrderId), Side)>,
     pub(crate) books: Vec<(Symbol, BookSnapshot)>,
     /// Per-account OrderId high-water marks for client deduplication.
     pub(crate) max_order_id: Vec<(AccountId, u64)>,
@@ -197,6 +197,8 @@ pub(crate) struct ExchangeSnapshot {
     pub(crate) risk_limits: Vec<(Symbol, RiskLimits)>,
     /// Per-instrument circuit breaker configurations.
     pub(crate) circuit_breakers: Vec<(Symbol, CircuitBreakerConfig)>,
+    /// Per-instrument maker/taker fee schedules.
+    pub(crate) fee_schedules: Vec<(Symbol, FeeSchedule)>,
 }
 
 /// Serialized order book state for a single instrument.
@@ -265,9 +267,10 @@ fn encode_exchange_state(state: &ExchangeSnapshot, buf: &mut Vec<u8>) {
         le::push_u64(buf, *remaining);
     }
 
-    // Order sides.
+    // Order sides: (account_id, order_id, side) per entry.
     le::push_u32(buf, state.order_sides.len() as u32);
-    for (order_id, side) in &state.order_sides {
+    for ((account, order_id), side) in &state.order_sides {
+        le::push_u32(buf, account.0);
         le::push_u64(buf, order_id.0);
         buf.push(le::encode_side(*side));
     }
@@ -325,6 +328,14 @@ fn encode_exchange_state(state: &ExchangeSnapshot, buf: &mut Vec<u8>) {
             None => buf.push(0),
         }
         buf.push(u8::from(config.halted));
+    }
+
+    // Fee schedules.
+    le::push_u32(buf, state.fee_schedules.len() as u32);
+    for (symbol, schedule) in &state.fee_schedules {
+        le::push_u32(buf, symbol.0);
+        le::push_u16(buf, schedule.maker_fee_bps);
+        le::push_u16(buf, schedule.taker_fee_bps);
     }
 }
 
@@ -495,18 +506,19 @@ fn decode_exchange_state(buf: &[u8]) -> Result<(usize, ExchangeSnapshot), Journa
         pos += 24;
     }
 
-    // Order sides.
+    // Order sides: (account_id, order_id, side) per entry — 13 bytes each.
     check(pos, 4)?;
     let n_order_sides = le::get_u32(&buf[pos..]) as usize;
     pos += 4;
-    validate_count(buf.len() - pos, n_order_sides, 9)?;
+    validate_count(buf.len() - pos, n_order_sides, 13)?;
     let mut order_sides = Vec::with_capacity(n_order_sides);
     for _ in 0..n_order_sides {
-        check(pos, 9)?;
-        let order_id = OrderId(le::get_u64(&buf[pos..]));
-        let side = le::decode_side(buf[pos + 8]).ok_or(corrupt("invalid side in snapshot"))?;
-        order_sides.push((order_id, side));
-        pos += 9;
+        check(pos, 13)?;
+        let account = AccountId(le::get_u32(&buf[pos..]));
+        let order_id = OrderId(le::get_u64(&buf[pos + 4..]));
+        let side = le::decode_side(buf[pos + 12]).ok_or(corrupt("invalid side in snapshot"))?;
+        order_sides.push(((account, order_id), side));
+        pos += 13;
     }
 
     // Books.
@@ -645,6 +657,35 @@ fn decode_exchange_state(buf: &[u8]) -> Result<(usize, ExchangeSnapshot), Journa
         ));
     }
 
+    // Fee schedules (optional — older snapshots won't have this).
+    let fee_schedules = if pos < buf.len() {
+        check(pos, 4)?;
+        let n_fee_schedules = le::get_u32(&buf[pos..]) as usize;
+        pos += 4;
+        // Each fee schedule: symbol(4) + maker_bps(2) + taker_bps(2) = 8 bytes.
+        validate_count(buf.len() - pos, n_fee_schedules, 8)?;
+        let mut schedules = Vec::with_capacity(n_fee_schedules);
+        for _ in 0..n_fee_schedules {
+            check(pos, 8)?;
+            let symbol = Symbol(le::get_u32(&buf[pos..]));
+            pos += 4;
+            let maker_fee_bps = le::get_u16(&buf[pos..]);
+            pos += 2;
+            let taker_fee_bps = le::get_u16(&buf[pos..]);
+            pos += 2;
+            schedules.push((
+                symbol,
+                FeeSchedule {
+                    maker_fee_bps,
+                    taker_fee_bps,
+                },
+            ));
+        }
+        schedules
+    } else {
+        Vec::new()
+    };
+
     Ok((
         pos,
         ExchangeSnapshot {
@@ -656,6 +697,7 @@ fn decode_exchange_state(buf: &[u8]) -> Result<(usize, ExchangeSnapshot), Journa
             max_order_id,
             risk_limits,
             circuit_breakers,
+            fee_schedules,
         },
     ))
 }
@@ -925,7 +967,7 @@ impl Exchange {
         let instruments: Vec<InstrumentSpec> = self.instruments().values().copied().collect();
         let balances = self.accounts().snapshot_balances();
         let reservations = self.accounts().snapshot_reservations();
-        let order_sides: Vec<(OrderId, Side)> = self.snapshot_order_sides();
+        let order_sides: Vec<((AccountId, OrderId), Side)> = self.snapshot_order_sides();
 
         let books: Vec<(Symbol, BookSnapshot)> = self
             .books()
@@ -936,6 +978,7 @@ impl Exchange {
         let max_order_id = self.snapshot_max_order_id();
         let risk_limits = self.snapshot_risk_limits();
         let circuit_breakers = self.snapshot_circuit_breakers();
+        let fee_schedules = self.snapshot_fee_schedules();
 
         ExchangeSnapshot {
             instruments,
@@ -946,6 +989,7 @@ impl Exchange {
             max_order_id,
             risk_limits,
             circuit_breakers,
+            fee_schedules,
         }
     }
 
@@ -968,10 +1012,12 @@ impl Exchange {
         }
 
         let accounts = AccountManager::from_parts(state.balances, state.reservations);
-        let order_sides: HashMap<OrderId, Side> = state.order_sides.into_iter().collect();
+        let order_sides: HashMap<(AccountId, OrderId), Side> =
+            state.order_sides.into_iter().collect();
         let risk_limits: HashMap<Symbol, RiskLimits> = state.risk_limits.into_iter().collect();
         let circuit_breakers: HashMap<Symbol, CircuitBreakerConfig> =
             state.circuit_breakers.into_iter().collect();
+        let fee_schedules: HashMap<Symbol, FeeSchedule> = state.fee_schedules.into_iter().collect();
         let max_order_id: HashMap<AccountId, u64> = state.max_order_id.into_iter().collect();
 
         Self::from_parts(
@@ -981,6 +1027,7 @@ impl Exchange {
             order_sides,
             risk_limits,
             circuit_breakers,
+            fee_schedules,
             max_order_id,
         )
     }

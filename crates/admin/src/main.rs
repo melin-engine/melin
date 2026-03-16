@@ -22,9 +22,9 @@ use ratatui::widgets::{Block, Borders, Clear, List, ListItem, Paragraph};
 use trading_client::{Client, StatsSnapshot};
 use trading_protocol::message::{Request, ResponseKind};
 use trading_protocol::types::{
-    AccountId, CircuitBreakerConfig, CurrencyId, ExecutionReport, InstrumentSpec, Order, OrderId,
-    OrderType, Price, Quantity, RejectReason, RiskLimits, SelfTradeProtection, Side, Symbol,
-    TimeInForce,
+    AccountId, CircuitBreakerConfig, CurrencyId, ExecutionReport, FeeSchedule, InstrumentSpec,
+    Order, OrderId, OrderType, Price, Quantity, RejectReason, RiskLimits, SelfTradeProtection,
+    Side, Symbol, TimeInForce,
 };
 
 // ── Menu definitions ────────────────────────────────────────────────
@@ -43,11 +43,12 @@ const ACTIONS: &[&str] = &[
     "Cancel Order",
     "Cancel All",
     "Cancel-Replace",
-    // Admin (11-14)
+    // Admin (11-15)
     "Add Instrument",
     "Deposit",
     "Set Risk Limits",
     "Set Circuit Breaker",
+    "Set Fee Schedule",
 ];
 
 const TIF_OPTIONS: &[(&str, TimeInForce)] = &[
@@ -201,6 +202,12 @@ enum NextStep {
         lower: Option<u64>,
         upper: Option<u64>,
     },
+    /// Fee schedule: enter symbol.
+    FeeScheduleSymbol,
+    /// Fee schedule: entered symbol, enter maker fee bps.
+    FeeScheduleMakerBps { symbol: u32 },
+    /// Fee schedule: entered maker bps, enter taker fee bps.
+    FeeScheduleTakerBps { symbol: u32, maker_bps: u16 },
 }
 
 struct App {
@@ -307,7 +314,8 @@ impl App {
                     | NextStep::DepositAccount
                     | NextStep::RiskLimitsSymbol
                     | NextStep::CancelReplaceSymbol
-                    | NextStep::CircuitBreakerSymbol => Screen::ActionMenu,
+                    | NextStep::CircuitBreakerSymbol
+                    | NextStep::FeeScheduleSymbol => Screen::ActionMenu,
                     // Deeper steps → back to previous input.
                     NextStep::AfterAccount { collected } => Screen::NumberInput {
                         label: "Symbol ID",
@@ -442,6 +450,16 @@ impl App {
                             lower: *lower,
                         },
                     },
+                    NextStep::FeeScheduleMakerBps { .. } => Screen::NumberInput {
+                        label: "Symbol ID",
+                        buf: String::new(),
+                        next: NextStep::FeeScheduleSymbol,
+                    },
+                    NextStep::FeeScheduleTakerBps { symbol, .. } => Screen::NumberInput {
+                        label: "Maker Fee (basis points, 0-10000)",
+                        buf: String::new(),
+                        next: NextStep::FeeScheduleMakerBps { symbol: *symbol },
+                    },
                 }
             }
         };
@@ -518,6 +536,14 @@ impl App {
                             next: NextStep::CircuitBreakerSymbol,
                         };
                     }
+                    15 => {
+                        // Set Fee Schedule — ask for symbol.
+                        self.screen = Screen::NumberInput {
+                            label: "Symbol ID",
+                            buf: String::new(),
+                            next: NextStep::FeeScheduleSymbol,
+                        };
+                    }
                     _ => {}
                 }
             }
@@ -539,6 +565,8 @@ impl App {
                         | NextStep::CircuitBreakerLower { .. }
                         | NextStep::CircuitBreakerUpper { .. }
                         | NextStep::CircuitBreakerHalted { .. }
+                        | NextStep::FeeScheduleMakerBps { .. }
+                        | NextStep::FeeScheduleTakerBps { .. }
                 );
                 if val == 0 && !allows_zero {
                     self.log.push("Value must be > 0.".into());
@@ -870,6 +898,41 @@ impl App {
                         self.screen = Screen::ActionMenu;
                         self.cursor = 0;
                     }
+
+                    // --- Fee schedule flow ---
+                    NextStep::FeeScheduleSymbol => {
+                        self.screen = Screen::NumberInput {
+                            label: "Maker Fee (basis points, 0-10000)",
+                            buf: String::new(),
+                            next: NextStep::FeeScheduleMakerBps { symbol: val as u32 },
+                        };
+                    }
+                    NextStep::FeeScheduleMakerBps { symbol } => {
+                        self.screen = Screen::NumberInput {
+                            label: "Taker Fee (basis points, 0-10000)",
+                            buf: String::new(),
+                            next: NextStep::FeeScheduleTakerBps {
+                                symbol,
+                                maker_bps: val as u16,
+                            },
+                        };
+                    }
+                    NextStep::FeeScheduleTakerBps { symbol, maker_bps } => {
+                        let request = Request::SetFeeSchedule {
+                            symbol: Symbol(symbol),
+                            schedule: FeeSchedule {
+                                maker_fee_bps: maker_bps,
+                                taker_fee_bps: val as u16,
+                            },
+                        };
+                        self.log.push(format!(
+                            "→ FEE SCHEDULE sym:{} maker:{}bps taker:{}bps",
+                            symbol, maker_bps, val
+                        ));
+                        let _ = self.request_tx.send(request);
+                        self.screen = Screen::ActionMenu;
+                        self.cursor = 0;
+                    }
                 }
             }
 
@@ -1044,14 +1107,24 @@ fn format_report(report: &ExecutionReport) -> String {
             taker_order_id,
             price,
             quantity,
+            maker_fee,
+            taker_fee,
             ..
-        } => format!(
-            "FILL    maker #{} / taker #{} @{} x{}",
-            maker_order_id.0, taker_order_id.0, price.0, quantity.0,
-        ),
+        } => {
+            let fee_str = if maker_fee > 0 || taker_fee > 0 {
+                format!(" fees:m={maker_fee}/t={taker_fee}")
+            } else {
+                String::new()
+            };
+            format!(
+                "FILL    maker #{} / taker #{} @{} x{}{}",
+                maker_order_id.0, taker_order_id.0, price.0, quantity.0, fee_str,
+            )
+        }
         ExecutionReport::Cancelled {
             order_id,
             remaining_quantity,
+            ..
         } => format!(
             "CANCEL  #{} (remaining: {})",
             order_id.0, remaining_quantity.0,
@@ -1060,7 +1133,9 @@ fn format_report(report: &ExecutionReport) -> String {
             order_id,
             trigger_price,
         } => format!("TRIGGER #{} @{}", order_id.0, trigger_price.0),
-        ExecutionReport::Rejected { order_id, reason } => {
+        ExecutionReport::Rejected {
+            order_id, reason, ..
+        } => {
             let reason_str = match reason {
                 RejectReason::NoLiquidity => "no liquidity",
                 RejectReason::FOKCannotFill => "FOK cannot fill",

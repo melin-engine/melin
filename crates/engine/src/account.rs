@@ -95,9 +95,10 @@ pub struct AccountManager {
     balances: Vec<Balance>,
     /// Number of currency slots per account row (max_currency_id + 1).
     currency_stride: usize,
-    /// Maps each open order to its reservation details. HashMap because
-    /// OrderIds are sparse u64 values that come and go with order lifecycle.
-    reservations: HashMap<OrderId, Reservation>,
+    /// Maps each open order to its reservation details. Keyed by
+    /// (AccountId, OrderId) because different accounts can independently
+    /// use the same OrderId. HashMap because keys are sparse.
+    reservations: HashMap<(AccountId, OrderId), Reservation>,
 }
 
 impl AccountManager {
@@ -127,7 +128,7 @@ impl AccountManager {
             let cap = self.reservations.capacity();
             for i in 0..cap {
                 self.reservations.insert(
-                    OrderId(i as u64),
+                    (AccountId(0), OrderId(i as u64)),
                     Reservation::new(AccountId(0), CurrencyId(0), 0),
                 );
             }
@@ -155,10 +156,13 @@ impl AccountManager {
             balances[idx] = balance;
         }
 
-        let reservation_map: HashMap<OrderId, Reservation> = reservations
+        let reservation_map: HashMap<(AccountId, OrderId), Reservation> = reservations
             .into_iter()
             .map(|(order_id, account, currency, remaining)| {
-                (order_id, Reservation::new(account, currency, remaining))
+                (
+                    (account, order_id),
+                    Reservation::new(account, currency, remaining),
+                )
             })
             .collect();
 
@@ -189,7 +193,9 @@ impl AccountManager {
     pub(crate) fn snapshot_reservations(&self) -> Vec<(OrderId, AccountId, CurrencyId, u64)> {
         self.reservations
             .iter()
-            .map(|(&order_id, res)| (order_id, res.account(), res.currency(), res.remaining()))
+            .map(|(&(_account, order_id), res)| {
+                (order_id, res.account(), res.currency(), res.remaining())
+            })
             .collect()
     }
 
@@ -235,12 +241,16 @@ impl AccountManager {
     /// - **Sell market/stop-market**: reserves `quantity` in base currency.
     ///
     /// Returns the reserved amount on success, or a `RejectReason` on failure.
+    /// `max_fee_bps` is the highest applicable fee rate (max of maker, taker).
+    /// For buy limit orders, the reservation includes a fee cushion so that
+    /// fees can always be charged from the reservation, even at the limit price.
     pub fn try_reserve(
         &mut self,
         order: &Order,
         spec: &InstrumentSpec,
+        max_fee_bps: u16,
     ) -> Result<u64, RejectReason> {
-        let (currency, amount) = self.required_reserve(order, spec)?;
+        let (currency, amount) = self.required_reserve(order, spec, max_fee_bps)?;
 
         let bal = self
             .get_mut(order.account, currency)
@@ -254,7 +264,7 @@ impl AccountManager {
         bal.reserved += amount;
 
         self.reservations.insert(
-            order.id,
+            (order.account, order.id),
             Reservation {
                 account: order.account,
                 currency,
@@ -270,13 +280,18 @@ impl AccountManager {
     /// The buyer's reserved quote decreases by `cost`, available base increases
     /// by `quantity`. The seller's reserved base decreases by `quantity`,
     /// available quote increases by `cost`.
+    #[allow(clippy::too_many_arguments)]
     pub fn fill(
         &mut self,
+        maker_account: AccountId,
         maker_order_id: OrderId,
+        taker_account: AccountId,
         taker_order_id: OrderId,
         price: Price,
         quantity: Quantity,
         maker_side: Side,
+        maker_fee: u64,
+        taker_fee: u64,
         spec: &InstrumentSpec,
     ) {
         // cost = price × quantity, using u128 to avoid overflow.
@@ -294,29 +309,50 @@ impl AccountManager {
         let cost_u64 = u64::try_from(cost).unwrap_or(u64::MAX);
         let qty = quantity.get();
 
-        let (buyer_order, seller_order) = match maker_side {
-            Side::Buy => (maker_order_id, taker_order_id),
-            Side::Sell => (taker_order_id, maker_order_id),
-        };
+        // Determine which fee applies to the buyer and seller.
+        // Fees are in quote currency for both sides.
+        let (buyer_account, buyer_order, seller_account, seller_order, buyer_fee, seller_fee) =
+            match maker_side {
+                Side::Buy => (
+                    maker_account,
+                    maker_order_id,
+                    taker_account,
+                    taker_order_id,
+                    maker_fee,
+                    taker_fee,
+                ),
+                Side::Sell => (
+                    taker_account,
+                    taker_order_id,
+                    maker_account,
+                    maker_order_id,
+                    taker_fee,
+                    maker_fee,
+                ),
+            };
 
-        // Buyer: reserved quote decreases, available base increases.
+        // Buyer: reserved quote decreases by cost + fee, available base increases.
+        // The reservation includes a fee cushion (reserved at placement time
+        // with max_fee_bps), so cost + fee fits within the reservation.
         // ensure_capacity is a no-op after startup seeding (all currencies
         // already in range) — just two comparisons, no allocation.
-        if let Some(res) = self.reservations.get_mut(&buyer_order) {
-            res.remaining = res.remaining.saturating_sub(cost_u64);
+        if let Some(res) = self.reservations.get_mut(&(buyer_account, buyer_order)) {
+            let total_deduct = cost_u64.saturating_add(buyer_fee);
+            res.remaining = res.remaining.saturating_sub(total_deduct);
             let buyer_account = res.account;
             self.ensure_capacity(buyer_account, spec.base);
             let stride = self.currency_stride;
             let quote_idx = buyer_account.0 as usize * stride + spec.quote.0 as usize;
-            self.balances[quote_idx].reserved =
-                self.balances[quote_idx].reserved.saturating_sub(cost_u64);
+            self.balances[quote_idx].reserved = self.balances[quote_idx]
+                .reserved
+                .saturating_sub(total_deduct);
             let base_idx = buyer_account.0 as usize * stride + spec.base.0 as usize;
             self.balances[base_idx].available =
                 self.balances[base_idx].available.saturating_add(qty);
         }
 
-        // Seller: reserved base decreases, available quote increases.
-        if let Some(res) = self.reservations.get_mut(&seller_order) {
+        // Seller: reserved base decreases, available quote increases by cost - fee.
+        if let Some(res) = self.reservations.get_mut(&(seller_account, seller_order)) {
             res.remaining = res.remaining.saturating_sub(qty);
             let seller_account = res.account;
             self.ensure_capacity(seller_account, spec.quote);
@@ -324,8 +360,9 @@ impl AccountManager {
             let base_idx = seller_account.0 as usize * stride + spec.base.0 as usize;
             self.balances[base_idx].reserved = self.balances[base_idx].reserved.saturating_sub(qty);
             let quote_idx = seller_account.0 as usize * stride + spec.quote.0 as usize;
-            self.balances[quote_idx].available =
-                self.balances[quote_idx].available.saturating_add(cost_u64);
+            self.balances[quote_idx].available = self.balances[quote_idx]
+                .available
+                .saturating_add(cost_u64.saturating_sub(seller_fee));
         }
 
         // Note: reservation cleanup is handled by process_reports(), which
@@ -334,9 +371,9 @@ impl AccountManager {
         // so it can report consumed IDs back to Exchange for order_sides cleanup.
     }
 
-    /// Check if a reservation exists for the given order.
-    pub fn has_reservation(&self, order_id: OrderId) -> bool {
-        self.reservations.contains_key(&order_id)
+    /// Check if a reservation exists for the given (account, order) pair.
+    pub fn has_reservation(&self, account: AccountId, order_id: OrderId) -> bool {
+        self.reservations.contains_key(&(account, order_id))
     }
 
     /// Adjust an existing reservation in-place for cancel-replace.
@@ -348,12 +385,13 @@ impl AccountManager {
     /// If the new amount is lower or equal, always succeeds.
     pub fn try_adjust_reservation(
         &mut self,
+        account: AccountId,
         order_id: OrderId,
         new_amount: u64,
     ) -> Result<(), RejectReason> {
         let res = self
             .reservations
-            .get(&order_id)
+            .get(&(account, order_id))
             .ok_or(RejectReason::UnknownOrder)?;
         let old_amount = res.remaining;
         let account = res.account;
@@ -381,15 +419,18 @@ impl AccountManager {
         }
 
         // Update the reservation.
-        let res = self.reservations.get_mut(&order_id).expect("checked above");
+        let res = self
+            .reservations
+            .get_mut(&(account, order_id))
+            .expect("checked above");
         res.remaining = new_amount;
 
         Ok(())
     }
 
     /// Release all remaining reserved funds for an order (on cancel or reject).
-    pub fn release(&mut self, order_id: OrderId) {
-        if let Some(res) = self.reservations.remove(&order_id)
+    pub fn release(&mut self, account: AccountId, order_id: OrderId) {
+        if let Some(res) = self.reservations.remove(&(account, order_id))
             && let Some(bal) = self.get_mut(res.account, res.currency)
         {
             bal.reserved = bal.reserved.saturating_sub(res.remaining);
@@ -407,55 +448,68 @@ impl AccountManager {
     pub fn process_reports(
         &mut self,
         reports: &[ExecutionReport],
-        maker_sides: &HashMap<OrderId, Side>,
+        maker_sides: &HashMap<(AccountId, OrderId), Side>,
         spec: &InstrumentSpec,
-        consumed: &mut Vec<OrderId>,
+        consumed: &mut Vec<(AccountId, OrderId)>,
     ) {
         for report in reports {
             match *report {
                 ExecutionReport::Fill {
                     maker_order_id,
                     taker_order_id,
+                    maker_account,
+                    taker_account,
                     price,
                     quantity,
-                    ..
+                    maker_fee,
+                    taker_fee,
                 } => {
                     // Look up the maker's side to determine buyer/seller.
-                    if let Some(&maker_side) = maker_sides.get(&maker_order_id) {
+                    let maker_key = (maker_account, maker_order_id);
+                    if let Some(&maker_side) = maker_sides.get(&maker_key) {
                         self.fill(
+                            maker_account,
                             maker_order_id,
+                            taker_account,
                             taker_order_id,
                             price,
                             quantity,
                             maker_side,
+                            maker_fee,
+                            taker_fee,
                             spec,
                         );
                     }
                     // Remove fully consumed reservations (remaining == 0).
+                    let taker_key = (taker_account, taker_order_id);
                     if self
                         .reservations
-                        .get(&maker_order_id)
+                        .get(&maker_key)
                         .is_some_and(|r| r.remaining == 0)
                     {
-                        self.reservations.remove(&maker_order_id);
-                        consumed.push(maker_order_id);
+                        self.reservations.remove(&maker_key);
+                        consumed.push(maker_key);
                     }
                     if self
                         .reservations
-                        .get(&taker_order_id)
+                        .get(&taker_key)
                         .is_some_and(|r| r.remaining == 0)
                     {
-                        self.reservations.remove(&taker_order_id);
-                        consumed.push(taker_order_id);
+                        self.reservations.remove(&taker_key);
+                        consumed.push(taker_key);
                     }
                 }
-                ExecutionReport::Cancelled { order_id, .. } => {
-                    self.release(order_id);
-                    consumed.push(order_id);
+                ExecutionReport::Cancelled {
+                    order_id, account, ..
+                } => {
+                    self.release(account, order_id);
+                    consumed.push((account, order_id));
                 }
-                ExecutionReport::Rejected { order_id, .. } => {
-                    self.release(order_id);
-                    consumed.push(order_id);
+                ExecutionReport::Rejected {
+                    order_id, account, ..
+                } => {
+                    self.release(account, order_id);
+                    consumed.push((account, order_id));
                 }
                 ExecutionReport::Placed { .. }
                 | ExecutionReport::Triggered { .. }
@@ -469,6 +523,7 @@ impl AccountManager {
         &self,
         order: &Order,
         spec: &InstrumentSpec,
+        max_fee_bps: u16,
     ) -> Result<(CurrencyId, u64), RejectReason> {
         match order.side {
             Side::Buy => {
@@ -478,9 +533,15 @@ impl AccountManager {
                     | OrderType::StopLimit {
                         limit_price: price, ..
                     } => {
-                        // price × quantity in quote currency. Use u128 intermediate.
+                        // price × quantity in quote currency, plus fee cushion.
+                        // The fee cushion ensures fees can be charged from the
+                        // reservation even when filling at the exact limit price.
                         let cost = (price.get() as u128) * (order.quantity.get() as u128);
-                        u64::try_from(cost).map_err(|_| RejectReason::InsufficientBalance)?
+                        // Compute fee cushion separately to avoid u128 overflow
+                        // (cost * 10_020 could exceed u128 for extreme values).
+                        let fee_cushion = cost / 10_000 * max_fee_bps as u128;
+                        let with_fee = cost.saturating_add(fee_cushion);
+                        u64::try_from(with_fee).map_err(|_| RejectReason::InsufficientBalance)?
                     }
                     OrderType::Market | OrderType::Stop { .. } => {
                         // Reserve entire available quote balance since final
@@ -693,7 +754,7 @@ mod tests {
         mgr.deposit(ACCT_A, USD, 10_000);
 
         let order = limit_buy(1, ACCT_A, 100, 50); // cost = 100 * 50 = 5000
-        let reserved = mgr.try_reserve(&order, &spec()).unwrap();
+        let reserved = mgr.try_reserve(&order, &spec(), 0).unwrap();
 
         assert_eq!(reserved, 5_000);
         let bal = mgr.balance(ACCT_A, USD);
@@ -707,7 +768,7 @@ mod tests {
         mgr.deposit(ACCT_A, BTC, 100);
 
         let order = limit_sell(1, ACCT_A, 50_000, 30);
-        let reserved = mgr.try_reserve(&order, &spec()).unwrap();
+        let reserved = mgr.try_reserve(&order, &spec(), 0).unwrap();
 
         assert_eq!(reserved, 30);
         let bal = mgr.balance(ACCT_A, BTC);
@@ -721,7 +782,7 @@ mod tests {
         mgr.deposit(ACCT_A, USD, 1_000);
 
         let order = limit_buy(1, ACCT_A, 100, 50); // cost = 5000 > 1000
-        let err = mgr.try_reserve(&order, &spec()).unwrap_err();
+        let err = mgr.try_reserve(&order, &spec(), 0).unwrap_err();
         assert_eq!(err, RejectReason::InsufficientBalance);
 
         // Balance unchanged.
@@ -735,7 +796,7 @@ mod tests {
         mgr.deposit(ACCT_A, USD, 10_000);
 
         let order = market_buy(1, ACCT_A, 50);
-        let reserved = mgr.try_reserve(&order, &spec()).unwrap();
+        let reserved = mgr.try_reserve(&order, &spec(), 0).unwrap();
 
         assert_eq!(reserved, 10_000);
         assert_eq!(mgr.balance(ACCT_A, USD).available, 0);
@@ -748,7 +809,7 @@ mod tests {
         mgr.deposit(ACCT_A, BTC, 100);
 
         let order = market_sell(1, ACCT_A, 30);
-        let reserved = mgr.try_reserve(&order, &spec()).unwrap();
+        let reserved = mgr.try_reserve(&order, &spec(), 0).unwrap();
 
         assert_eq!(reserved, 30);
         assert_eq!(mgr.balance(ACCT_A, BTC).available, 70);
@@ -763,8 +824,8 @@ mod tests {
         mgr.deposit(ACCT_A, USD, 10_000);
 
         let order = limit_buy(1, ACCT_A, 100, 50);
-        mgr.try_reserve(&order, &spec()).unwrap();
-        mgr.release(OrderId(1));
+        mgr.try_reserve(&order, &spec(), 0).unwrap();
+        mgr.release(ACCT_A, OrderId(1));
 
         assert_eq!(mgr.balance(ACCT_A, USD).available, 10_000);
         assert_eq!(mgr.balance(ACCT_A, USD).reserved, 0);
@@ -774,7 +835,7 @@ mod tests {
     fn release_unknown_order_is_noop() {
         let mut mgr = AccountManager::new();
         mgr.deposit(ACCT_A, USD, 10_000);
-        mgr.release(OrderId(999));
+        mgr.release(ACCT_A, OrderId(999));
         assert_eq!(mgr.balance(ACCT_A, USD).available, 10_000);
     }
 
@@ -788,16 +849,20 @@ mod tests {
 
         let buy = limit_buy(1, ACCT_A, 100, 10); // cost = 1000
         let sell = limit_sell(2, ACCT_B, 100, 10);
-        mgr.try_reserve(&buy, &spec()).unwrap();
-        mgr.try_reserve(&sell, &spec()).unwrap();
+        mgr.try_reserve(&buy, &spec(), 0).unwrap();
+        mgr.try_reserve(&sell, &spec(), 0).unwrap();
 
-        // Maker is seller (order 2), taker is buyer (order 1).
+        // Maker is seller (order 2, ACCT_B), taker is buyer (order 1, ACCT_A).
         mgr.fill(
+            ACCT_B,
             OrderId(2),
+            ACCT_A,
             OrderId(1),
             price(100),
             qty(10),
             Side::Sell,
+            0,
+            0,
             &spec(),
         );
 
@@ -820,16 +885,20 @@ mod tests {
 
         let buy = limit_buy(1, ACCT_A, 100, 20); // reserve 2000
         let sell = limit_sell(2, ACCT_B, 100, 10);
-        mgr.try_reserve(&buy, &spec()).unwrap();
-        mgr.try_reserve(&sell, &spec()).unwrap();
+        mgr.try_reserve(&buy, &spec(), 0).unwrap();
+        mgr.try_reserve(&sell, &spec(), 0).unwrap();
 
         // Partial fill: only 10 of 20 filled.
         mgr.fill(
+            ACCT_B,
             OrderId(2),
+            ACCT_A,
             OrderId(1),
             price(100),
             qty(10),
             Side::Sell,
+            0,
+            0,
             &spec(),
         );
 
@@ -847,20 +916,24 @@ mod tests {
 
         let buy = limit_buy(1, ACCT_A, 100, 20); // reserve 2000
         let sell = limit_sell(2, ACCT_B, 100, 10);
-        mgr.try_reserve(&buy, &spec()).unwrap();
-        mgr.try_reserve(&sell, &spec()).unwrap();
+        mgr.try_reserve(&buy, &spec(), 0).unwrap();
+        mgr.try_reserve(&sell, &spec(), 0).unwrap();
 
         // Fill 10 of 20.
         mgr.fill(
+            ACCT_B,
             OrderId(2),
+            ACCT_A,
             OrderId(1),
             price(100),
             qty(10),
             Side::Sell,
+            0,
+            0,
             &spec(),
         );
         // Cancel remaining 10.
-        mgr.release(OrderId(1));
+        mgr.release(ACCT_A, OrderId(1));
 
         // Buyer: 1000 spent on fills, 1000 returned from cancel.
         assert_eq!(mgr.balance(ACCT_A, USD).available, 9_000);
@@ -875,7 +948,7 @@ mod tests {
 
         // price * quantity overflows u64.
         let order = limit_buy(1, ACCT_A, u64::MAX, 2);
-        let err = mgr.try_reserve(&order, &spec()).unwrap_err();
+        let err = mgr.try_reserve(&order, &spec(), 0).unwrap_err();
         assert_eq!(err, RejectReason::InsufficientBalance);
     }
 
@@ -887,15 +960,19 @@ mod tests {
 
         let buy = limit_buy(1, ACCT_A, 100, 10); // reserve 1000 USD
         let sell = limit_sell(2, ACCT_A, 100, 10); // reserve 10 BTC
-        mgr.try_reserve(&buy, &spec()).unwrap();
-        mgr.try_reserve(&sell, &spec()).unwrap();
+        mgr.try_reserve(&buy, &spec(), 0).unwrap();
+        mgr.try_reserve(&sell, &spec(), 0).unwrap();
 
         mgr.fill(
+            ACCT_A,
             OrderId(1),
+            ACCT_A,
             OrderId(2),
             price(100),
             qty(10),
             Side::Buy,
+            0,
+            0,
             &spec(),
         );
 
@@ -915,21 +992,25 @@ mod tests {
 
         let buy = market_buy(1, ACCT_A, 10);
         let sell = limit_sell(2, ACCT_B, 100, 10);
-        mgr.try_reserve(&buy, &spec()).unwrap(); // reserves all 10_000
-        mgr.try_reserve(&sell, &spec()).unwrap();
+        mgr.try_reserve(&buy, &spec(), 0).unwrap(); // reserves all 10_000
+        mgr.try_reserve(&sell, &spec(), 0).unwrap();
 
         // Fill at price 100, qty 10 → cost = 1000.
         mgr.fill(
+            ACCT_B,
             OrderId(2),
+            ACCT_A,
             OrderId(1),
             price(100),
             qty(10),
             Side::Sell,
+            0,
+            0,
             &spec(),
         );
 
         // Market order is fully filled, release unused reservation.
-        mgr.release(OrderId(1));
+        mgr.release(ACCT_A, OrderId(1));
 
         // Buyer: spent 1000, got back 9000 from unused reserve.
         assert_eq!(mgr.balance(ACCT_A, USD).available, 9_000);
@@ -944,29 +1025,37 @@ mod tests {
         mgr.deposit(ACCT_B, BTC, 100);
 
         let buy = limit_buy(1, ACCT_A, 200, 20); // reserve 200*20 = 4000
-        mgr.try_reserve(&buy, &spec()).unwrap();
+        mgr.try_reserve(&buy, &spec(), 0).unwrap();
 
         // Sell 1: 10 @ 100.
         let sell1 = limit_sell(2, ACCT_B, 100, 10);
-        mgr.try_reserve(&sell1, &spec()).unwrap();
+        mgr.try_reserve(&sell1, &spec(), 0).unwrap();
         mgr.fill(
+            ACCT_B,
             OrderId(2),
+            ACCT_A,
             OrderId(1),
             price(100),
             qty(10),
             Side::Sell,
+            0,
+            0,
             &spec(),
         );
 
         // Sell 2: 5 @ 150.
         let sell2 = limit_sell(3, ACCT_B, 150, 5);
-        mgr.try_reserve(&sell2, &spec()).unwrap();
+        mgr.try_reserve(&sell2, &spec(), 0).unwrap();
         mgr.fill(
+            ACCT_B,
             OrderId(3),
+            ACCT_A,
             OrderId(1),
             price(150),
             qty(5),
             Side::Sell,
+            0,
+            0,
             &spec(),
         );
 

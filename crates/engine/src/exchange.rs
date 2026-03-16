@@ -13,8 +13,8 @@ use std::collections::HashMap;
 use crate::account::AccountManager;
 use crate::orderbook::OrderBook;
 use crate::types::{
-    AccountId, CircuitBreakerConfig, CurrencyId, ExecutionReport, InstrumentSpec, Order, OrderId,
-    OrderType, Price, Quantity, RejectReason, RiskLimits, Side, Symbol,
+    AccountId, CircuitBreakerConfig, CurrencyId, ExecutionReport, FeeSchedule, InstrumentSpec,
+    Order, OrderId, OrderType, Price, Quantity, RejectReason, RiskLimits, Side, Symbol,
 };
 
 /// Top-level exchange managing multiple instruments.
@@ -28,23 +28,27 @@ pub struct Exchange {
     instruments: HashMap<Symbol, InstrumentSpec>,
     /// Shared account balance manager across all instruments.
     accounts: AccountManager,
-    /// Tracks order side by ID so fills can determine buyer/seller.
-    /// Populated on order submission, cleaned up on full fill or cancel.
-    order_sides: HashMap<OrderId, Side>,
+    /// Tracks order side by (account, order_id) so fills can determine
+    /// buyer/seller. Keyed by the pair because different accounts can
+    /// independently use the same OrderId.
+    order_sides: HashMap<(AccountId, OrderId), Side>,
     /// Per-instrument fat finger limits. Checked in `execute()` before
     /// balance reservation. HashMap for O(1) lookup by Symbol(u32).
     risk_limits: HashMap<Symbol, RiskLimits>,
     /// Per-instrument circuit breaker configuration. Checked in `execute()`
     /// after dedup and before fat finger checks. HashMap for O(1) lookup.
     circuit_breakers: HashMap<Symbol, CircuitBreakerConfig>,
+    /// Per-instrument maker/taker fee schedule. Applied to fill proceeds
+    /// after matching, before balance updates. HashMap for O(1) lookup.
+    fee_schedules: HashMap<Symbol, FeeSchedule>,
     /// Per-account high-water mark for order IDs. Rejects submissions
     /// with `order_id <= max_seen[account]` to prevent duplicate execution
     /// on crash-recovery retry. HashMap for O(1) lookup keyed on
     /// AccountId(u32) — cheap single-word hash.
     max_order_id: HashMap<AccountId, u64>,
-    /// Reusable buffer for consumed order IDs from `process_reports()`.
-    /// Avoids per-order Vec allocation on the hot path.
-    consumed_buf: Vec<OrderId>,
+    /// Reusable buffer for consumed (account, order) keys from
+    /// `process_reports()`. Avoids per-order Vec allocation on the hot path.
+    consumed_buf: Vec<(AccountId, OrderId)>,
     /// When true, new order books are created with generous pre-allocation
     /// to avoid HashMap resize spikes on the hot path.
     presized: bool,
@@ -59,6 +63,7 @@ impl Exchange {
             order_sides: HashMap::new(),
             risk_limits: HashMap::new(),
             circuit_breakers: HashMap::new(),
+            fee_schedules: HashMap::new(),
             max_order_id: HashMap::new(),
             consumed_buf: Vec::new(),
             presized: false,
@@ -76,6 +81,7 @@ impl Exchange {
             order_sides: HashMap::with_capacity(2_000_000),
             risk_limits: HashMap::with_capacity(64),
             circuit_breakers: HashMap::with_capacity(64),
+            fee_schedules: HashMap::with_capacity(64),
             max_order_id: HashMap::with_capacity(10_000),
             consumed_buf: Vec::with_capacity(256),
             presized: true,
@@ -87,9 +93,10 @@ impl Exchange {
         books: HashMap<Symbol, OrderBook>,
         instruments: HashMap<Symbol, InstrumentSpec>,
         accounts: AccountManager,
-        order_sides: HashMap<OrderId, Side>,
+        order_sides: HashMap<(AccountId, OrderId), Side>,
         risk_limits: HashMap<Symbol, RiskLimits>,
         circuit_breakers: HashMap<Symbol, CircuitBreakerConfig>,
+        fee_schedules: HashMap<Symbol, FeeSchedule>,
         max_order_id: HashMap<AccountId, u64>,
     ) -> Self {
         Self {
@@ -99,6 +106,7 @@ impl Exchange {
             order_sides,
             risk_limits,
             circuit_breakers,
+            fee_schedules,
             max_order_id,
             consumed_buf: Vec::new(),
             presized: false,
@@ -116,10 +124,10 @@ impl Exchange {
     }
 
     /// Snapshot the order-side map as a Vec for serialization.
-    pub(crate) fn snapshot_order_sides(&self) -> Vec<(OrderId, Side)> {
+    pub(crate) fn snapshot_order_sides(&self) -> Vec<((AccountId, OrderId), Side)> {
         self.order_sides
             .iter()
-            .map(|(&id, &side)| (id, side))
+            .map(|(&key, &side)| (key, side))
             .collect()
     }
 
@@ -149,6 +157,19 @@ impl Exchange {
         self.circuit_breakers.insert(symbol, config);
     }
 
+    /// Set the maker/taker fee schedule for an instrument.
+    pub fn set_fee_schedule(&mut self, symbol: Symbol, schedule: FeeSchedule) {
+        self.fee_schedules.insert(symbol, schedule);
+    }
+
+    /// Snapshot the fee schedules for serialization.
+    pub(crate) fn snapshot_fee_schedules(&self) -> Vec<(Symbol, FeeSchedule)> {
+        self.fee_schedules
+            .iter()
+            .map(|(&symbol, &schedule)| (symbol, schedule))
+            .collect()
+    }
+
     /// Snapshot the per-instrument circuit breaker configs for serialization.
     pub(crate) fn snapshot_circuit_breakers(&self) -> Vec<(Symbol, CircuitBreakerConfig)> {
         self.circuit_breakers
@@ -165,7 +186,8 @@ impl Exchange {
         if self.order_sides.is_empty() {
             let cap = self.order_sides.capacity();
             for i in 0..cap {
-                self.order_sides.insert(OrderId(i as u64), Side::Buy);
+                self.order_sides
+                    .insert((AccountId(0), OrderId(i as u64)), Side::Buy);
             }
             self.order_sides.clear();
         }
@@ -216,6 +238,7 @@ impl Exchange {
         let Some(spec) = self.instruments.get(&symbol).copied() else {
             reports.push(ExecutionReport::Rejected {
                 order_id: order.id,
+                account: order.account,
                 reason: RejectReason::UnknownSymbol,
             });
             return;
@@ -232,6 +255,7 @@ impl Exchange {
         if order.id.0 <= *hwm {
             reports.push(ExecutionReport::Rejected {
                 order_id: order.id,
+                account: order.account,
                 reason: RejectReason::DuplicateOrderId,
             });
             return;
@@ -245,6 +269,7 @@ impl Exchange {
             if cb.halted {
                 reports.push(ExecutionReport::Rejected {
                     order_id: order.id,
+                    account: order.account,
                     reason: RejectReason::TradingHalted,
                 });
                 return;
@@ -266,6 +291,7 @@ impl Exchange {
                 {
                     reports.push(ExecutionReport::Rejected {
                         order_id: order.id,
+                        account: order.account,
                         reason: RejectReason::OutsidePriceBand,
                     });
                     return;
@@ -275,6 +301,7 @@ impl Exchange {
                 {
                     reports.push(ExecutionReport::Rejected {
                         order_id: order.id,
+                        account: order.account,
                         reason: RejectReason::OutsidePriceBand,
                     });
                     return;
@@ -289,6 +316,7 @@ impl Exchange {
             {
                 reports.push(ExecutionReport::Rejected {
                     order_id: order.id,
+                    account: order.account,
                     reason: RejectReason::ExceedsMaxOrderQty,
                 });
                 return;
@@ -307,6 +335,7 @@ impl Exchange {
                     if notional > max_notional as u128 {
                         reports.push(ExecutionReport::Rejected {
                             order_id: order.id,
+                            account: order.account,
                             reason: RejectReason::ExceedsMaxNotional,
                         });
                         return;
@@ -316,11 +345,19 @@ impl Exchange {
         }
 
         // Reserve funds before submitting to the matching engine.
-        let reserved = match self.accounts.try_reserve(&order, &spec) {
+        // Include a fee cushion for buy-side limit orders so fees can be
+        // charged from the reservation even at the exact limit price.
+        let max_fee_bps = self
+            .fee_schedules
+            .get(&symbol)
+            .map(|f| f.maker_fee_bps.max(f.taker_fee_bps))
+            .unwrap_or(0);
+        let reserved = match self.accounts.try_reserve(&order, &spec, max_fee_bps) {
             Ok(amount) => amount,
             Err(reason) => {
                 reports.push(ExecutionReport::Rejected {
                     order_id: order.id,
+                    account: order.account,
                     reason,
                 });
                 return;
@@ -337,7 +374,8 @@ impl Exchange {
         };
 
         // Track the order's side for fill processing.
-        self.order_sides.insert(order.id, order.side);
+        self.order_sides
+            .insert((order.account, order.id), order.side);
 
         let report_start = reports.len();
 
@@ -346,6 +384,11 @@ impl Exchange {
             .get_mut(&symbol)
             .expect("book exists because instrument was added");
         book.execute(order, quote_budget, reports);
+
+        // Compute fees on fills before balance updates.
+        if let Some(fees) = self.fee_schedules.get(&symbol) {
+            apply_fees(&mut reports[report_start..], fees);
+        }
 
         // Process reports to update balances.
         let new_reports = &reports[report_start..];
@@ -377,17 +420,22 @@ impl Exchange {
             if let ExecutionReport::Fill {
                 maker_order_id,
                 taker_order_id,
+                maker_account,
+                taker_account,
                 ..
             } = report
             {
-                for &id in &[*maker_order_id, *taker_order_id] {
-                    if !self.consumed_buf.contains(&id)
-                        && self.accounts.has_reservation(id)
+                for &(account, id) in &[
+                    (*maker_account, *maker_order_id),
+                    (*taker_account, *taker_order_id),
+                ] {
+                    if !self.consumed_buf.contains(&(account, id))
+                        && self.accounts.has_reservation(account, id)
                         && !book.has_order(id)
                         && !book.has_stop(id)
                     {
-                        self.accounts.release(id);
-                        self.consumed_buf.push(id);
+                        self.accounts.release(account, id);
+                        self.consumed_buf.push((account, id));
                     }
                 }
             }
@@ -396,8 +444,8 @@ impl Exchange {
         // Clean up order_sides for fully consumed orders (filled, cancelled,
         // or rejected). Without this, order_sides leaks entries and triggers
         // increasingly expensive HashMap resizes on the hot path.
-        for &order_id in &self.consumed_buf {
-            self.order_sides.remove(&order_id);
+        for &key in &self.consumed_buf {
+            self.order_sides.remove(&key);
         }
     }
 
@@ -429,8 +477,8 @@ impl Exchange {
                 &mut self.consumed_buf,
             );
 
-            for &order_id in &self.consumed_buf {
-                self.order_sides.remove(&order_id);
+            for &key in &self.consumed_buf {
+                self.order_sides.remove(&key);
             }
         }
     }
@@ -464,8 +512,8 @@ impl Exchange {
         );
 
         // Clean up order_sides for cancelled orders.
-        for &order_id in &self.consumed_buf {
-            self.order_sides.remove(&order_id);
+        for &key in &self.consumed_buf {
+            self.order_sides.remove(&key);
         }
     }
 
@@ -497,25 +545,34 @@ impl Exchange {
         // cancel-replace only modifies an existing order (reservation
         // currency is already known from the original order).
         if !self.instruments.contains_key(&symbol) {
+            // Account unknown — order not on any book for this symbol.
+            // Scan order_sides for the account (rare path, O(n) acceptable).
+            let account = self.find_account_for_order(order_id);
             reports.push(ExecutionReport::Rejected {
                 order_id,
+                account,
                 reason: RejectReason::UnknownSymbol,
             });
             return;
         }
 
         let Some(book) = self.books.get_mut(&symbol) else {
+            let account = self.find_account_for_order(order_id);
             reports.push(ExecutionReport::Rejected {
                 order_id,
+                account,
                 reason: RejectReason::UnknownSymbol,
             });
             return;
         };
 
         // 1. Order must exist as a resting limit order.
-        let Some((side, old_price, old_remaining)) = book.get_resting_order(order_id) else {
+        let Some((account, side, old_price, old_remaining)) = book.get_resting_order(order_id)
+        else {
+            let account = self.find_account_for_order(order_id);
             reports.push(ExecutionReport::Rejected {
                 order_id,
+                account,
                 reason: RejectReason::UnknownOrder,
             });
             return;
@@ -526,6 +583,7 @@ impl Exchange {
             if cb.halted {
                 reports.push(ExecutionReport::Rejected {
                     order_id,
+                    account,
                     reason: RejectReason::TradingHalted,
                 });
                 return;
@@ -535,6 +593,7 @@ impl Exchange {
             {
                 reports.push(ExecutionReport::Rejected {
                     order_id,
+                    account,
                     reason: RejectReason::OutsidePriceBand,
                 });
                 return;
@@ -544,6 +603,7 @@ impl Exchange {
             {
                 reports.push(ExecutionReport::Rejected {
                     order_id,
+                    account,
                     reason: RejectReason::OutsidePriceBand,
                 });
                 return;
@@ -557,6 +617,7 @@ impl Exchange {
             {
                 reports.push(ExecutionReport::Rejected {
                     order_id,
+                    account,
                     reason: RejectReason::ExceedsMaxOrderQty,
                 });
                 return;
@@ -566,6 +627,7 @@ impl Exchange {
                 if notional > max_notional as u128 {
                     reports.push(ExecutionReport::Rejected {
                         order_id,
+                        account,
                         reason: RejectReason::ExceedsMaxNotional,
                     });
                     return;
@@ -588,22 +650,31 @@ impl Exchange {
         if would_cross {
             reports.push(ExecutionReport::Rejected {
                 order_id,
+                account,
                 reason: RejectReason::PriceWouldCross,
             });
             return;
         }
 
         // 5. Adjust reservation atomically. Compute the new required amount
-        // based on the new price/quantity. If insufficient balance, the
-        // original reservation (and order) stays intact.
+        // based on the new price/quantity, including fee cushion for buys.
+        // If insufficient balance, the original reservation stays intact.
+        let max_fee_bps = self
+            .fee_schedules
+            .get(&symbol)
+            .map(|f| f.maker_fee_bps.max(f.taker_fee_bps))
+            .unwrap_or(0);
         let new_required = match side {
             Side::Buy => {
                 let cost = new_price.get() as u128 * new_quantity.get() as u128;
-                match u64::try_from(cost) {
+                let fee_cushion = cost / 10_000 * max_fee_bps as u128;
+                let with_fee = cost.saturating_add(fee_cushion);
+                match u64::try_from(with_fee) {
                     Ok(c) => c,
                     Err(_) => {
                         reports.push(ExecutionReport::Rejected {
                             order_id,
+                            account,
                             reason: RejectReason::InsufficientBalance,
                         });
                         return;
@@ -613,8 +684,15 @@ impl Exchange {
             Side::Sell => new_quantity.get(),
         };
 
-        if let Err(reason) = self.accounts.try_adjust_reservation(order_id, new_required) {
-            reports.push(ExecutionReport::Rejected { order_id, reason });
+        if let Err(reason) = self
+            .accounts
+            .try_adjust_reservation(account, order_id, new_required)
+        {
+            reports.push(ExecutionReport::Rejected {
+                order_id,
+                account,
+                reason,
+            });
             return;
         }
 
@@ -632,6 +710,50 @@ impl Exchange {
             old_remaining,
             new_remaining: new_quantity,
         });
+    }
+
+    /// Find the account that owns the given order by scanning `order_sides`.
+    /// Returns `AccountId(0)` if the order is not found (best-effort for
+    /// reject reports where the order doesn't exist on any book).
+    /// Linear scan — only used by cancel_replace reject paths which are rare.
+    fn find_account_for_order(&self, order_id: OrderId) -> AccountId {
+        self.order_sides
+            .keys()
+            .find(|&&(_, oid)| oid == order_id)
+            .map(|&(account, _)| account)
+            .unwrap_or(AccountId(0))
+    }
+}
+
+/// Compute and set maker/taker fees on Fill reports.
+///
+/// Both maker and taker fees are in quote currency (cost-based):
+///   `fee = cost * fee_bps / 10_000` where `cost = price * quantity`.
+///
+/// The buyer's fee is deducted from their reservation (which includes
+/// a fee cushion). The seller's fee is deducted from their proceeds.
+///
+/// Uses u128 intermediate to avoid overflow on `value * bps`.
+fn apply_fees(reports: &mut [ExecutionReport], fees: &FeeSchedule) {
+    if fees.maker_fee_bps == 0 && fees.taker_fee_bps == 0 {
+        return;
+    }
+
+    for report in reports.iter_mut() {
+        if let ExecutionReport::Fill {
+            price,
+            quantity,
+            maker_fee,
+            taker_fee,
+            ..
+        } = report
+        {
+            // Both fees are in quote currency (cost-based). This is the
+            // standard model used by most centralized exchanges.
+            let cost = price.get() as u128 * quantity.get() as u128;
+            *maker_fee = (cost * fees.maker_fee_bps as u128 / 10_000) as u64;
+            *taker_fee = (cost * fees.taker_fee_bps as u128 / 10_000) as u64;
+        }
     }
 }
 
@@ -725,6 +847,7 @@ mod tests {
             reports[0],
             ExecutionReport::Rejected {
                 order_id: OrderId(1),
+                account: ACCT_A,
                 reason: RejectReason::UnknownSymbol,
             }
         );
@@ -749,6 +872,7 @@ mod tests {
             reports[0],
             ExecutionReport::Rejected {
                 order_id: OrderId(1),
+                account: ACCT_A,
                 reason: RejectReason::InsufficientBalance,
             }
         );
@@ -905,6 +1029,7 @@ mod tests {
             reports[0],
             ExecutionReport::Rejected {
                 order_id: OrderId(2),
+                account: ACCT_A,
                 reason: RejectReason::InsufficientBalance,
             }
         );
@@ -1361,7 +1486,7 @@ mod tests {
         // Taker remainder cancelled.
         assert!(reports.iter().any(|r| matches!(
             r,
-            ExecutionReport::Cancelled { order_id: OrderId(3), remaining_quantity }
+            ExecutionReport::Cancelled { order_id: OrderId(3), remaining_quantity, .. }
             if *remaining_quantity == qty(5)
         )));
         // ACCT_A's resting sell (order 2) is untouched.
@@ -1956,7 +2081,7 @@ mod tests {
         // Taker remainder cancelled.
         assert!(reports.iter().any(|r| matches!(
             r,
-            ExecutionReport::Cancelled { order_id: OrderId(3), remaining_quantity }
+            ExecutionReport::Cancelled { order_id: OrderId(3), remaining_quantity, .. }
             if *remaining_quantity == qty(5)
         )));
         // No second fill.
@@ -2165,7 +2290,7 @@ mod tests {
         // Taker cancelled with remaining 7.
         assert!(reports.iter().any(|r| matches!(
             r,
-            ExecutionReport::Cancelled { order_id: OrderId(3), remaining_quantity }
+            ExecutionReport::Cancelled { order_id: OrderId(3), remaining_quantity, .. }
             if *remaining_quantity == qty(7)
         )));
         // ACCT_A's resting sell (order 2) untouched.
@@ -3927,6 +4052,7 @@ mod tests {
             reports[0],
             ExecutionReport::Rejected {
                 order_id: OrderId(1),
+                account: ACCT_A,
                 reason: RejectReason::InsufficientBalance,
             }
         );
@@ -3952,6 +4078,7 @@ mod tests {
             reports[0],
             ExecutionReport::Rejected {
                 order_id: OrderId(999),
+                account: AccountId(0),
                 reason: RejectReason::UnknownOrder,
             }
         );
@@ -3971,6 +4098,7 @@ mod tests {
             reports[0],
             ExecutionReport::Rejected {
                 order_id: OrderId(1),
+                account: AccountId(0),
                 reason: RejectReason::UnknownSymbol,
             }
         );
@@ -4010,6 +4138,7 @@ mod tests {
             reports[0],
             ExecutionReport::Rejected {
                 order_id: OrderId(1),
+                account: ACCT_A,
                 reason: RejectReason::PriceWouldCross,
             }
         );
@@ -4053,6 +4182,7 @@ mod tests {
             reports[0],
             ExecutionReport::Rejected {
                 order_id: OrderId(1),
+                account: ACCT_A,
                 reason: RejectReason::TradingHalted,
             }
         );
@@ -4097,6 +4227,7 @@ mod tests {
             reports[0],
             ExecutionReport::Rejected {
                 order_id: OrderId(1),
+                account: ACCT_A,
                 reason: RejectReason::OutsidePriceBand,
             }
         );
@@ -4140,6 +4271,7 @@ mod tests {
             reports[0],
             ExecutionReport::Rejected {
                 order_id: OrderId(1),
+                account: ACCT_A,
                 reason: RejectReason::ExceedsMaxOrderQty,
             }
         );
@@ -4418,5 +4550,175 @@ mod tests {
         ));
         // Original order intact.
         assert_eq!(exchange.accounts().balance(ACCT_A, USD).reserved, 1_000);
+    }
+
+    // -- Fee model tests --
+
+    #[test]
+    fn fee_deducted_from_fill_proceeds() {
+        let mut exchange = Exchange::new();
+        let btc = Symbol(1);
+        exchange.add_instrument(btc_usd_spec());
+        exchange.deposit(ACCT_A, USD, 50_000);
+        exchange.deposit(ACCT_B, BTC, 100);
+
+        // 10 bps maker, 20 bps taker.
+        exchange.set_fee_schedule(
+            btc,
+            FeeSchedule {
+                maker_fee_bps: 10,
+                taker_fee_bps: 20,
+            },
+        );
+
+        let mut reports = Vec::new();
+
+        // Resting buy (maker) at 1000 for 10.
+        exchange.execute(
+            btc,
+            limit_order(1, ACCT_A, Side::Buy, 1000, 10, TimeInForce::GTC),
+            &mut reports,
+        );
+        reports.clear();
+
+        // Incoming sell (taker) hits the resting buy.
+        exchange.execute(
+            btc,
+            limit_order(2, ACCT_B, Side::Sell, 1000, 10, TimeInForce::GTC),
+            &mut reports,
+        );
+
+        // Find the fill report.
+        let fill = reports
+            .iter()
+            .find(|r| matches!(r, ExecutionReport::Fill { .. }))
+            .unwrap();
+        if let ExecutionReport::Fill {
+            maker_fee,
+            taker_fee,
+            ..
+        } = fill
+        {
+            // cost = 1000 * 10 = 10_000
+            // maker_fee = 10_000 * 10 / 10_000 = 10
+            // taker_fee = 10_000 * 20 / 10_000 = 20
+            assert_eq!(*maker_fee, 10);
+            assert_eq!(*taker_fee, 20);
+        } else {
+            panic!("expected Fill");
+        }
+
+        // Buyer (maker): reserved 10_020 (cost 10_000 + max fee cushion 20).
+        // Fill deducts cost (10_000) + maker_fee (10) = 10_010 from reservation.
+        // Leftover cushion (10) released: available = 50_000 - 10_020 + 10 = 39_990.
+        assert_eq!(exchange.accounts().balance(ACCT_A, USD).available, 39_990);
+        assert_eq!(exchange.accounts().balance(ACCT_A, BTC).available, 10);
+
+        // Seller (taker): received cost (10_000) - taker_fee (20) = 9_980 in quote.
+        assert_eq!(exchange.accounts().balance(ACCT_B, USD).available, 9_980);
+        assert_eq!(exchange.accounts().balance(ACCT_B, BTC).available, 90);
+    }
+
+    #[test]
+    fn zero_fees_produce_no_deduction() {
+        let mut exchange = Exchange::new();
+        let btc = Symbol(1);
+        exchange.add_instrument(btc_usd_spec());
+        exchange.deposit(ACCT_A, USD, 50_000);
+        exchange.deposit(ACCT_B, BTC, 100);
+
+        // No fee schedule set — defaults to 0/0.
+
+        let mut reports = Vec::new();
+        exchange.execute(
+            btc,
+            limit_order(1, ACCT_A, Side::Buy, 1000, 10, TimeInForce::GTC),
+            &mut reports,
+        );
+        reports.clear();
+
+        exchange.execute(
+            btc,
+            limit_order(2, ACCT_B, Side::Sell, 1000, 10, TimeInForce::GTC),
+            &mut reports,
+        );
+
+        let fill = reports
+            .iter()
+            .find(|r| matches!(r, ExecutionReport::Fill { .. }))
+            .unwrap();
+        if let ExecutionReport::Fill {
+            maker_fee,
+            taker_fee,
+            ..
+        } = fill
+        {
+            assert_eq!(*maker_fee, 0);
+            assert_eq!(*taker_fee, 0);
+        }
+
+        // No fees: buyer pays exactly 10_000, seller receives exactly 10_000.
+        assert_eq!(exchange.accounts().balance(ACCT_A, USD).available, 40_000);
+        assert_eq!(exchange.accounts().balance(ACCT_B, USD).available, 10_000);
+    }
+
+    #[test]
+    fn fee_schedule_change_applies_to_subsequent_fills() {
+        let mut exchange = Exchange::new();
+        let btc = Symbol(1);
+        exchange.add_instrument(btc_usd_spec());
+        exchange.deposit(ACCT_A, USD, 100_000);
+        exchange.deposit(ACCT_B, BTC, 200);
+
+        let mut reports = Vec::new();
+
+        // First trade with no fees.
+        exchange.execute(
+            btc,
+            limit_order(1, ACCT_A, Side::Buy, 1000, 10, TimeInForce::GTC),
+            &mut reports,
+        );
+        exchange.execute(
+            btc,
+            limit_order(2, ACCT_B, Side::Sell, 1000, 10, TimeInForce::GTC),
+            &mut reports,
+        );
+        reports.clear();
+
+        // Set fees.
+        exchange.set_fee_schedule(
+            btc,
+            FeeSchedule {
+                maker_fee_bps: 50,
+                taker_fee_bps: 100,
+            },
+        );
+
+        // Second trade with fees.
+        exchange.execute(
+            btc,
+            limit_order(3, ACCT_A, Side::Buy, 1000, 10, TimeInForce::GTC),
+            &mut reports,
+        );
+        exchange.execute(
+            btc,
+            limit_order(4, ACCT_B, Side::Sell, 1000, 10, TimeInForce::GTC),
+            &mut reports,
+        );
+
+        let fill = reports
+            .iter()
+            .find(|r| matches!(r, ExecutionReport::Fill { .. }))
+            .unwrap();
+        if let ExecutionReport::Fill {
+            maker_fee,
+            taker_fee,
+            ..
+        } = fill
+        {
+            // cost = 10_000. maker = 10_000 * 50 / 10_000 = 50. taker = 100.
+            assert_eq!(*maker_fee, 50);
+            assert_eq!(*taker_fee, 100);
+        }
     }
 }

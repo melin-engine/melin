@@ -29,8 +29,8 @@
 use std::num::NonZeroU64;
 
 use crate::types::{
-    AccountId, CircuitBreakerConfig, CurrencyId, InstrumentSpec, Order, OrderId, OrderType, Price,
-    Quantity, RiskLimits, Symbol,
+    AccountId, CircuitBreakerConfig, CurrencyId, FeeSchedule, InstrumentSpec, Order, OrderId,
+    OrderType, Price, Quantity, RiskLimits, Symbol,
 };
 
 use super::error::JournalError;
@@ -71,6 +71,7 @@ const TAG_SET_CIRCUIT_BREAKER: u8 = 7;
 const TAG_CANCEL_REPLACE: u8 = 8;
 const TAG_GENESIS_HASH: u8 = 9;
 const TAG_CHECKPOINT: u8 = 10;
+const TAG_SET_FEE_SCHEDULE: u8 = 11;
 
 /// OrderType tag encoding (codec-specific, not shared — order types are only
 /// in the journal format, not in snapshots).
@@ -262,6 +263,15 @@ pub fn encode(
             le::put_u64(&mut buf[pos..], *events_since_checkpoint);
             pos += 8;
             TAG_CHECKPOINT
+        }
+        JournalEvent::SetFeeSchedule { symbol, schedule } => {
+            le::put_u32(&mut buf[pos..], symbol.0);
+            pos += 4;
+            le::put_u16(&mut buf[pos..], schedule.maker_fee_bps);
+            pos += 2;
+            le::put_u16(&mut buf[pos..], schedule.taker_fee_bps);
+            pos += 2;
+            TAG_SET_FEE_SCHEDULE
         }
     };
 
@@ -623,6 +633,25 @@ pub fn decode(buf: &[u8]) -> Result<(usize, u64, u64, JournalEvent), JournalErro
                 events_since_checkpoint,
             }
         }
+        TAG_SET_FEE_SCHEDULE => {
+            // symbol(4) + maker_fee_bps(2) + taker_fee_bps(2) = 8
+            if payload.len() < 8 {
+                return Err(JournalError::CorruptEntry {
+                    sequence,
+                    reason: "SetFeeSchedule payload too short",
+                });
+            }
+            let symbol = Symbol(le::get_u32(&payload[0..]));
+            let maker_fee_bps = le::get_u16(&payload[4..]);
+            let taker_fee_bps = le::get_u16(&payload[6..]);
+            JournalEvent::SetFeeSchedule {
+                symbol,
+                schedule: FeeSchedule {
+                    maker_fee_bps,
+                    taker_fee_bps,
+                },
+            }
+        }
         _ => {
             return Err(JournalError::CorruptEntry {
                 sequence,
@@ -778,7 +807,7 @@ fn decode_order(buf: &[u8], sequence: u64) -> Result<(usize, Order), JournalErro
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::{CircuitBreakerConfig, SelfTradeProtection, Side, TimeInForce};
+    use crate::types::{CircuitBreakerConfig, FeeSchedule, SelfTradeProtection, Side, TimeInForce};
     use std::num::NonZeroU64;
 
     fn nz(v: u64) -> NonZeroU64 {
@@ -901,6 +930,13 @@ mod tests {
             JournalEvent::Checkpoint {
                 chain_hash: [0xCD; 32],
                 events_since_checkpoint: 100_000,
+            },
+            JournalEvent::SetFeeSchedule {
+                symbol: Symbol(1),
+                schedule: FeeSchedule {
+                    maker_fee_bps: 5,
+                    taker_fee_bps: 10,
+                },
             },
         ]
     }
