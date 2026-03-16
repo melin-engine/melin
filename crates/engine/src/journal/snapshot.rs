@@ -52,7 +52,8 @@ const SNAP_MAGIC: u32 = 0x534E_4150;
 /// v3 → v4: added per-instrument RiskLimits for fat finger checks.
 /// v4 → v5: added per-instrument CircuitBreakerConfig for price bands + halts.
 /// v5 → v6: added chain_hash for BLAKE3 hash chain continuity across snapshots.
-const SNAP_VERSION: u16 = 6;
+/// v6 → v7: order_sides keyed by (AccountId, OrderId), added fee schedules.
+const SNAP_VERSION: u16 = 7;
 
 /// Snapshot header size: magic(4) + version(2) + reserved(2) + sequence(8) + chain_hash(32) = 48.
 const SNAP_HEADER_SIZE: usize = 48;
@@ -132,10 +133,10 @@ pub fn load(path: &Path) -> Result<(Exchange, u64, [u8; 32]), JournalError> {
     }
     let version = u16::from_le_bytes([buf[4], buf[5]]);
 
-    // v5 header is 16 bytes, v6 header is 48 bytes (adds 32-byte chain_hash).
-    let (header_size, is_v6) = match version {
+    // v5 header is 16 bytes, v6+ header is 48 bytes (adds 32-byte chain_hash).
+    let (header_size, has_chain_hash) = match version {
         5 => (16usize, false),
-        6 => (SNAP_HEADER_SIZE, true),
+        6 | 7 => (SNAP_HEADER_SIZE, true),
         _ => return Err(JournalError::UnsupportedVersion { version }),
     };
 
@@ -164,8 +165,8 @@ pub fn load(path: &Path) -> Result<(Exchange, u64, [u8; 32]), JournalError> {
         buf[8], buf[9], buf[10], buf[11], buf[12], buf[13], buf[14], buf[15],
     ]);
 
-    // Read chain_hash (v6) or default to zeros (v5).
-    let chain_hash = if is_v6 {
+    // Read chain_hash (v6+) or default to zeros (v5).
+    let chain_hash = if has_chain_hash {
         let mut h = [0u8; 32];
         h.copy_from_slice(&buf[16..48]);
         h
@@ -174,7 +175,7 @@ pub fn load(path: &Path) -> Result<(Exchange, u64, [u8; 32]), JournalError> {
     };
 
     // Decode exchange state.
-    let (_, state) = decode_exchange_state(&buf[header_size..data_len])?;
+    let (_, state) = decode_exchange_state(&buf[header_size..data_len], version)?;
     let exchange = Exchange::restore_state(state);
 
     Ok((exchange, sequence, chain_hash))
@@ -437,7 +438,10 @@ fn validate_count(remaining: usize, n: usize, item_size: usize) -> Result<(), Jo
     }
 }
 
-fn decode_exchange_state(buf: &[u8]) -> Result<(usize, ExchangeSnapshot), JournalError> {
+fn decode_exchange_state(
+    buf: &[u8],
+    version: u16,
+) -> Result<(usize, ExchangeSnapshot), JournalError> {
     let corrupt = |reason: &'static str| JournalError::CorruptEntry {
         sequence: 0,
         reason,
@@ -506,19 +510,35 @@ fn decode_exchange_state(buf: &[u8]) -> Result<(usize, ExchangeSnapshot), Journa
         pos += 24;
     }
 
-    // Order sides: (account_id, order_id, side) per entry — 13 bytes each.
+    // Order sides: v7+ stores (account_id(4) + order_id(8) + side(1)) = 13 bytes.
+    // v5/v6 stores (order_id(8) + side(1)) = 9 bytes (no account in key).
     check(pos, 4)?;
     let n_order_sides = le::get_u32(&buf[pos..]) as usize;
     pos += 4;
-    validate_count(buf.len() - pos, n_order_sides, 13)?;
     let mut order_sides = Vec::with_capacity(n_order_sides);
-    for _ in 0..n_order_sides {
-        check(pos, 13)?;
-        let account = AccountId(le::get_u32(&buf[pos..]));
-        let order_id = OrderId(le::get_u64(&buf[pos + 4..]));
-        let side = le::decode_side(buf[pos + 12]).ok_or(corrupt("invalid side in snapshot"))?;
-        order_sides.push(((account, order_id), side));
-        pos += 13;
+    if version >= 7 {
+        validate_count(buf.len() - pos, n_order_sides, 13)?;
+        for _ in 0..n_order_sides {
+            check(pos, 13)?;
+            let account = AccountId(le::get_u32(&buf[pos..]));
+            let order_id = OrderId(le::get_u64(&buf[pos + 4..]));
+            let side = le::decode_side(buf[pos + 12]).ok_or(corrupt("invalid side in snapshot"))?;
+            order_sides.push(((account, order_id), side));
+            pos += 13;
+        }
+    } else {
+        // v5/v6: order_id(8) + side(1) = 9 bytes. Account is unknown —
+        // use AccountId(0) as placeholder. This is lossy but allows loading
+        // old snapshots for migration. In practice, v6 snapshots will be
+        // re-saved as v7 on the next rotation.
+        validate_count(buf.len() - pos, n_order_sides, 9)?;
+        for _ in 0..n_order_sides {
+            check(pos, 9)?;
+            let order_id = OrderId(le::get_u64(&buf[pos..]));
+            let side = le::decode_side(buf[pos + 8]).ok_or(corrupt("invalid side in snapshot"))?;
+            order_sides.push(((AccountId(0), order_id), side));
+            pos += 9;
+        }
     }
 
     // Books.
@@ -657,8 +677,8 @@ fn decode_exchange_state(buf: &[u8]) -> Result<(usize, ExchangeSnapshot), Journa
         ));
     }
 
-    // Fee schedules (optional — older snapshots won't have this).
-    let fee_schedules = if pos < buf.len() {
+    // Fee schedules: only in v7+ snapshots.
+    let fee_schedules = if version >= 7 && pos < buf.len() {
         check(pos, 4)?;
         let n_fee_schedules = le::get_u32(&buf[pos..]) as usize;
         pos += 4;
