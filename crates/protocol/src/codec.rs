@@ -32,6 +32,7 @@ const TAG_SUBMIT_ORDER: u8 = 1;
 const TAG_CANCEL_ORDER: u8 = 2;
 const TAG_REQUEST_HEARTBEAT: u8 = 3;
 const TAG_CANCEL_ALL: u8 = 4;
+const TAG_CHALLENGE_RESPONSE: u8 = 5;
 
 // --- Response tags ---
 const TAG_PLACED: u8 = 11;
@@ -43,6 +44,8 @@ const TAG_ENGINE_ERROR: u8 = 16;
 const TAG_BATCH_END: u8 = 17;
 const TAG_SERVER_READY: u8 = 18;
 const TAG_RESPONSE_HEARTBEAT: u8 = 19;
+const TAG_CHALLENGE: u8 = 20;
+const TAG_AUTH_FAILED: u8 = 21;
 
 // --- OrderType tags (wire-specific, not shared with journal) ---
 const ORDER_TYPE_MARKET: u8 = 0;
@@ -94,6 +97,17 @@ pub fn encode_request(request: &Request, buf: &mut [u8]) -> Result<usize, Protoc
             buf[pos] = TAG_REQUEST_HEARTBEAT;
             pos += 1;
         }
+        Request::ChallengeResponse {
+            signature,
+            public_key,
+        } => {
+            buf[pos] = TAG_CHALLENGE_RESPONSE;
+            pos += 1;
+            buf[pos..pos + 64].copy_from_slice(signature);
+            pos += 64;
+            buf[pos..pos + 32].copy_from_slice(public_key);
+            pos += 32;
+        }
     }
 
     // Write the length prefix (excludes the 4-byte length field itself).
@@ -141,6 +155,19 @@ pub fn decode_request(buf: &[u8]) -> Result<Request, ProtocolError> {
             })
         }
         TAG_REQUEST_HEARTBEAT => Ok(Request::Heartbeat),
+        TAG_CHALLENGE_RESPONSE => {
+            if payload.len() < 96 {
+                return Err(ProtocolError::Truncated);
+            }
+            let mut signature = [0u8; 64];
+            signature.copy_from_slice(&payload[..64]);
+            let mut public_key = [0u8; 32];
+            public_key.copy_from_slice(&payload[64..96]);
+            Ok(Request::ChallengeResponse {
+                signature,
+                public_key,
+            })
+        }
         _ => Err(ProtocolError::UnknownTag(tag)),
     }
 }
@@ -171,6 +198,16 @@ pub fn encode_response(response: &ResponseKind, buf: &mut [u8]) -> Result<usize,
             buf[pos] = TAG_RESPONSE_HEARTBEAT;
             pos += 1;
         }
+        ResponseKind::Challenge { nonce } => {
+            buf[pos] = TAG_CHALLENGE;
+            pos += 1;
+            buf[pos..pos + 32].copy_from_slice(nonce);
+            pos += 32;
+        }
+        ResponseKind::AuthFailed => {
+            buf[pos] = TAG_AUTH_FAILED;
+            pos += 1;
+        }
     }
 
     let payload_len = pos - 4;
@@ -193,6 +230,15 @@ pub fn decode_response(buf: &[u8]) -> Result<ResponseKind, ProtocolError> {
         TAG_BATCH_END => Ok(ResponseKind::BatchEnd),
         TAG_SERVER_READY => Ok(ResponseKind::ServerReady),
         TAG_RESPONSE_HEARTBEAT => Ok(ResponseKind::Heartbeat),
+        TAG_CHALLENGE => {
+            if payload.len() < 32 {
+                return Err(ProtocolError::Truncated);
+            }
+            let mut nonce = [0u8; 32];
+            nonce.copy_from_slice(&payload[..32]);
+            Ok(ResponseKind::Challenge { nonce })
+        }
+        TAG_AUTH_FAILED => Ok(ResponseKind::AuthFailed),
         TAG_PLACED | TAG_FILL | TAG_CANCELLED | TAG_TRIGGERED | TAG_REJECTED => {
             let report = decode_execution_report(tag, payload)?;
             Ok(ResponseKind::Report(report))
@@ -609,6 +655,10 @@ mod tests {
                 account: AccountId(42),
             },
             Request::Heartbeat,
+            Request::ChallengeResponse {
+                signature: [0xAA; 64],
+                public_key: [0xBB; 32],
+            },
         ]
     }
 
@@ -676,13 +726,17 @@ mod tests {
             ResponseKind::BatchEnd,
             ResponseKind::ServerReady,
             ResponseKind::Heartbeat,
+            ResponseKind::Challenge {
+                nonce: [0xCC; 32],
+            },
+            ResponseKind::AuthFailed,
         ]
     }
 
     #[test]
     fn request_round_trip_all_variants() {
         let requests = make_requests();
-        let mut buf = [0u8; 128];
+        let mut buf = [0u8; 256];
 
         for (i, request) in requests.iter().enumerate() {
             let written = encode_request(request, &mut buf).unwrap();

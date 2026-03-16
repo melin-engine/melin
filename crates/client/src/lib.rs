@@ -6,6 +6,8 @@
 use std::io;
 use std::net::SocketAddr;
 
+use ed25519_dalek::{Signer, SigningKey};
+
 use trading_protocol::blocking::{BlockingFrameReader, BlockingFrameWriter};
 use trading_protocol::codec;
 use trading_protocol::error::ProtocolError;
@@ -20,6 +22,9 @@ pub enum ClientError {
     Protocol(ProtocolError),
     /// Server closed the connection before sending BatchEnd.
     Disconnected,
+    /// Server rejected the Ed25519 challenge-response authentication
+    /// (unknown key, invalid signature, or wrong key permissions).
+    AuthFailed,
 }
 
 impl std::fmt::Display for ClientError {
@@ -28,6 +33,7 @@ impl std::fmt::Display for ClientError {
             Self::Io(e) => write!(f, "I/O error: {e}"),
             Self::Protocol(e) => write!(f, "protocol error: {e}"),
             Self::Disconnected => write!(f, "disconnected from server"),
+            Self::AuthFailed => write!(f, "authentication failed"),
         }
     }
 }
@@ -60,23 +66,55 @@ pub struct Client {
 }
 
 impl Client {
-    /// Connect to a trading server at the given address.
+    /// Connect to a trading server with Ed25519 challenge-response auth.
     ///
-    /// Blocks until the server sends a `ServerReady` frame, confirming that
-    /// the pipeline is initialized and the connection is ready for trading.
-    pub fn connect(addr: SocketAddr) -> Result<Self, ClientError> {
+    /// 1. Receives a `Challenge` (32-byte nonce) from the server.
+    /// 2. Signs the nonce with the provided `SigningKey`.
+    /// 3. Sends a `ChallengeResponse` (signature + public key).
+    /// 4. Waits for `ServerReady` (success) or `AuthFailed`.
+    pub fn connect(addr: SocketAddr, key: &SigningKey) -> Result<Self, ClientError> {
         let stream = std::net::TcpStream::connect(addr)?;
         stream.set_nodelay(true)?;
         let mut reader = BlockingFrameReader::new(stream.try_clone()?);
-        let writer = BlockingFrameWriter::new(stream);
+        let mut writer = BlockingFrameWriter::new(stream);
 
-        // Wait for the ServerReady handshake before returning.
+        // Step 1: Receive Challenge from server.
         let frame = reader.read_frame()?.ok_or(ClientError::Disconnected)?;
         let response = codec::decode_response(frame)?;
-        if !matches!(response, ResponseKind::ServerReady) {
-            return Err(ClientError::Protocol(
-                trading_protocol::error::ProtocolError::InvalidField("expected ServerReady"),
-            ));
+        let nonce = match response {
+            ResponseKind::Challenge { nonce } => nonce,
+            _ => {
+                return Err(ClientError::Protocol(
+                    ProtocolError::InvalidField("expected Challenge"),
+                ));
+            }
+        };
+
+        // Step 2: Sign the nonce and send ChallengeResponse.
+        let signature = key.sign(&nonce);
+        let public_key = key.verifying_key().to_bytes();
+        let request = Request::ChallengeResponse {
+            signature: signature.to_bytes(),
+            public_key,
+        };
+        let mut encode_buf = [0u8; 256];
+        let written = codec::encode_request(&request, &mut encode_buf)?;
+        writer.write_frame(&encode_buf[4..written])?;
+        writer.flush()?;
+
+        // Step 3: Wait for ServerReady or AuthFailed.
+        let frame = reader.read_frame()?.ok_or(ClientError::Disconnected)?;
+        let response = codec::decode_response(frame)?;
+        match response {
+            ResponseKind::ServerReady => {}
+            ResponseKind::AuthFailed => {
+                return Err(ClientError::AuthFailed);
+            }
+            _ => {
+                return Err(ClientError::Protocol(ProtocolError::InvalidField(
+                    "expected ServerReady or AuthFailed",
+                )));
+            }
         }
 
         Ok(Self {
@@ -120,22 +158,57 @@ mod tests {
     use super::*;
     use trading_protocol::types::{OrderId, Symbol};
 
-    /// Send a ServerReady frame to the given writer.
-    fn send_ready(writer: &mut BlockingFrameWriter<std::net::TcpStream>) {
-        let mut buf = [0u8; 8];
-        let written = codec::encode_response(&ResponseKind::ServerReady, &mut buf).unwrap();
+    /// Generate a test signing key from a fixed seed for deterministic tests.
+    fn test_key() -> SigningKey {
+        SigningKey::from_bytes(&[0xAA; 32])
+    }
+
+    /// Run the server side of the challenge-response handshake, accepting
+    /// any valid signature from the test key.
+    fn mock_auth_handshake(
+        reader: &mut BlockingFrameReader<std::net::TcpStream>,
+        writer: &mut BlockingFrameWriter<std::net::TcpStream>,
+    ) {
+        use ed25519_dalek::{Verifier, VerifyingKey};
+
+        // Send Challenge.
+        let nonce = [0xBB; 32];
+        let mut buf = [0u8; 64];
+        let written =
+            codec::encode_response(&ResponseKind::Challenge { nonce }, &mut buf).unwrap();
+        writer.write_frame(&buf[4..written]).unwrap();
+        writer.flush().unwrap();
+
+        // Read ChallengeResponse.
+        let frame = reader.read_frame().unwrap().unwrap();
+        let request = codec::decode_request(frame).unwrap();
+        let (sig_bytes, pk_bytes) = match request {
+            Request::ChallengeResponse {
+                signature,
+                public_key,
+            } => (signature, public_key),
+            _ => panic!("expected ChallengeResponse"),
+        };
+
+        // Verify signature.
+        let vk = VerifyingKey::from_bytes(&pk_bytes).unwrap();
+        let sig = ed25519_dalek::Signature::from_bytes(&sig_bytes);
+        vk.verify(&nonce, &sig).unwrap();
+
+        // Send ServerReady.
+        let written =
+            codec::encode_response(&ResponseKind::ServerReady, &mut buf).unwrap();
         writer.write_frame(&buf[4..written]).unwrap();
         writer.flush().unwrap();
     }
 
-    /// Mock server that reads one request and responds with BatchEnd.
+    /// Mock server that authenticates, reads one request, responds with BatchEnd.
     fn mock_batch_end_server(listener: std::net::TcpListener) {
         let (stream, _) = listener.accept().unwrap();
         let mut reader = BlockingFrameReader::new(stream.try_clone().unwrap());
         let mut writer = BlockingFrameWriter::new(stream);
 
-        // Send ServerReady handshake.
-        send_ready(&mut writer);
+        mock_auth_handshake(&mut reader, &mut writer);
 
         // Read one request frame (discard it).
         let _frame = reader.read_frame().unwrap().unwrap();
@@ -154,7 +227,8 @@ mod tests {
 
         std::thread::spawn(move || mock_batch_end_server(listener));
 
-        let mut client = Client::connect(addr).unwrap();
+        let key = test_key();
+        let mut client = Client::connect(addr, &key).unwrap();
         let responses = client
             .send_request(&Request::CancelOrder {
                 symbol: Symbol(1),
@@ -167,21 +241,141 @@ mod tests {
     }
 
     #[test]
+    fn auth_failed_returns_auth_error() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        // Server sends Challenge then AuthFailed (simulating unknown key).
+        std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let mut reader = BlockingFrameReader::new(stream.try_clone().unwrap());
+            let mut writer = BlockingFrameWriter::new(stream);
+
+            // Send Challenge.
+            let nonce = [0xBB; 32];
+            let mut buf = [0u8; 64];
+            let written =
+                codec::encode_response(&ResponseKind::Challenge { nonce }, &mut buf).unwrap();
+            writer.write_frame(&buf[4..written]).unwrap();
+            writer.flush().unwrap();
+
+            // Read ChallengeResponse (discard it).
+            let _frame = reader.read_frame().unwrap().unwrap();
+
+            // Send AuthFailed.
+            let written =
+                codec::encode_response(&ResponseKind::AuthFailed, &mut buf).unwrap();
+            writer.write_frame(&buf[4..written]).unwrap();
+            writer.flush().unwrap();
+        });
+
+        let key = test_key();
+        let result = Client::connect(addr, &key);
+        assert!(matches!(result, Err(ClientError::AuthFailed)));
+    }
+
+    #[test]
+    fn server_disconnects_during_auth_is_error() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        // Server sends Challenge, reads ChallengeResponse, then drops
+        // without sending ServerReady.
+        std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let mut reader = BlockingFrameReader::new(stream.try_clone().unwrap());
+            let mut writer = BlockingFrameWriter::new(stream);
+
+            let nonce = [0xBB; 32];
+            let mut buf = [0u8; 64];
+            let written =
+                codec::encode_response(&ResponseKind::Challenge { nonce }, &mut buf).unwrap();
+            writer.write_frame(&buf[4..written]).unwrap();
+            writer.flush().unwrap();
+
+            // Consume the ChallengeResponse, then drop.
+            let _ = reader.read_frame();
+        });
+
+        let key = test_key();
+        let result = Client::connect(addr, &key);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn server_sends_non_challenge_first_is_error() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        // Server sends ServerReady instead of Challenge as first message.
+        std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let mut writer = BlockingFrameWriter::new(stream);
+
+            let mut buf = [0u8; 8];
+            let written =
+                codec::encode_response(&ResponseKind::ServerReady, &mut buf).unwrap();
+            writer.write_frame(&buf[4..written]).unwrap();
+            writer.flush().unwrap();
+        });
+
+        let key = test_key();
+        let result = Client::connect(addr, &key);
+        assert!(matches!(result, Err(ClientError::Protocol(_))));
+    }
+
+    #[test]
+    fn server_sends_unexpected_response_after_auth() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        // Server sends Challenge, reads ChallengeResponse, then sends
+        // a Heartbeat instead of ServerReady/AuthFailed.
+        std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let mut reader = BlockingFrameReader::new(stream.try_clone().unwrap());
+            let mut writer = BlockingFrameWriter::new(stream);
+
+            // Send Challenge.
+            let nonce = [0xBB; 32];
+            let mut buf = [0u8; 64];
+            let written =
+                codec::encode_response(&ResponseKind::Challenge { nonce }, &mut buf).unwrap();
+            writer.write_frame(&buf[4..written]).unwrap();
+            writer.flush().unwrap();
+
+            // Read ChallengeResponse.
+            let _frame = reader.read_frame().unwrap().unwrap();
+
+            // Send Heartbeat instead of ServerReady/AuthFailed.
+            let written =
+                codec::encode_response(&ResponseKind::Heartbeat, &mut buf).unwrap();
+            writer.write_frame(&buf[4..written]).unwrap();
+            writer.flush().unwrap();
+        });
+
+        let key = test_key();
+        let result = Client::connect(addr, &key);
+        assert!(matches!(result, Err(ClientError::Protocol(_))));
+    }
+
+    #[test]
     fn disconnect_before_batch_end_is_error() {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
 
-        // Server accepts, sends ServerReady, reads one request, then drops.
+        // Server authenticates, reads one request, then drops.
         std::thread::spawn(move || {
             let (stream, _) = listener.accept().unwrap();
-            let mut writer = BlockingFrameWriter::new(stream.try_clone().unwrap());
-            send_ready(&mut writer);
-            let mut reader = BlockingFrameReader::new(stream);
+            let mut reader = BlockingFrameReader::new(stream.try_clone().unwrap());
+            let mut writer = BlockingFrameWriter::new(stream);
+            mock_auth_handshake(&mut reader, &mut writer);
             let _frame = reader.read_frame().unwrap();
             // Drop without sending BatchEnd.
         });
 
-        let mut client = Client::connect(addr).unwrap();
+        let key = test_key();
+        let mut client = Client::connect(addr, &key).unwrap();
         let result = client.send_request(&Request::CancelOrder {
             symbol: Symbol(1),
             order_id: OrderId(42),

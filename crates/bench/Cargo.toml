@@ -21,7 +21,9 @@ trading-engine = { path = "../engine" }
 trading-disruptor = { path = "../disruptor" }
 trading-protocol = { path = "../protocol" }
 trading-server = { path = "../server" }
+base64 = { workspace = true }
 clap = { workspace = true }
+ed25519-dalek = { workspace = true }
 hdrhistogram = "7"
 rand = "0.9"
 libc = { workspace = true }

@@ -3,6 +3,7 @@
 //! Defines message types, binary codec, and transport abstraction.
 //! Shared by the server and client crates.
 
+pub mod auth;
 pub mod blocking;
 pub mod codec;
 pub mod error;

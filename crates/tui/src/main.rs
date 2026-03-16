@@ -457,10 +457,11 @@ fn format_report(report: &ExecutionReport) -> String {
 
 fn client_thread(
     addr: SocketAddr,
+    key: &ed25519_dalek::SigningKey,
     request_rx: mpsc::Receiver<Request>,
     response_tx: mpsc::Sender<String>,
 ) {
-    let mut client = match Client::connect(addr) {
+    let mut client = match Client::connect(addr, key) {
         Ok(c) => {
             let _ = response_tx.send(format!("Connected to {addr}"));
             c
@@ -482,7 +483,9 @@ fn client_thread(
                         ResponseKind::EngineError => "ENGINE ERROR".into(),
                         ResponseKind::BatchEnd
                         | ResponseKind::ServerReady
-                        | ResponseKind::Heartbeat => continue,
+                        | ResponseKind::Heartbeat
+                        | ResponseKind::Challenge { .. }
+                        | ResponseKind::AuthFailed => continue,
                     };
                     let _ = response_tx.send(msg);
                 }
@@ -710,18 +713,33 @@ fn centered_rect(width: u16, height: u16, area: Rect) -> Rect {
 
 // ── Main ────────────────────────────────────────────────────────────
 
+fn load_signing_key(path: &str) -> ed25519_dalek::SigningKey {
+    let bytes = std::fs::read(path).unwrap_or_else(|e| panic!("cannot read key file {path}: {e}"));
+    if bytes.len() != 32 {
+        panic!("key file must be exactly 32 bytes (raw Ed25519 seed), got {}", bytes.len());
+    }
+    let mut seed = [0u8; 32];
+    seed.copy_from_slice(&bytes);
+    ed25519_dalek::SigningKey::from_bytes(&seed)
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let addr: SocketAddr = std::env::args()
         .nth(1)
         .unwrap_or_else(|| "127.0.0.1:9876".into())
         .parse()?;
 
+    let key_path = std::env::args()
+        .nth(2)
+        .unwrap_or_else(|| panic!("usage: trading-tui <addr> <key-file>"));
+    let key = load_signing_key(&key_path);
+
     let (request_tx, request_rx) = mpsc::channel::<Request>();
     let (response_tx, response_rx) = mpsc::channel::<String>();
 
     std::thread::Builder::new()
         .name("client".into())
-        .spawn(move || client_thread(addr, request_rx, response_tx))
+        .spawn(move || client_thread(addr, &key, request_rx, response_tx))
         .expect("spawn client thread");
 
     let mut terminal = ratatui::init();

@@ -228,6 +228,10 @@ struct BenchArgs {
     /// from multiple runs with different load levels.
     #[arg(long)]
     json: Option<std::path::PathBuf>,
+    /// Path to a 32-byte raw Ed25519 private key file for authentication
+    /// (required for remote mode with --addr, auto-generated for embedded).
+    #[arg(long)]
+    key: Option<std::path::PathBuf>,
 }
 
 fn main() {
@@ -274,6 +278,7 @@ fn main() {
                 args.accounts,
                 args.instruments,
                 json_path,
+                args.key.as_deref(),
             );
         }
         other => {
@@ -631,6 +636,7 @@ fn run_roundtrip_bench(
     num_accounts: u32,
     num_instruments: u32,
     json_path: Option<&std::path::Path>,
+    key_path: Option<&std::path::Path>,
 ) {
     // Remote mode: connect to an external engine, no embedded server.
     if let Some(addr) = remote_addr {
@@ -639,6 +645,11 @@ fn run_roundtrip_bench(
             std::process::exit(1);
         }
 
+        let key_path = key_path.unwrap_or_else(|| {
+            eprintln!("error: --key is required for remote mode (--addr)");
+            std::process::exit(1);
+        });
+        let key = load_signing_key(key_path);
         let shutdown = Arc::new(AtomicBool::new(false));
 
         let connect = || {
@@ -659,12 +670,23 @@ fn run_roundtrip_bench(
             shutdown,
             warmup,
             json_path,
+            &key,
         );
         return;
     }
 
     // Local mode: spawn an embedded server.
+    // Generate a deterministic bench key and matching authorized_keys file.
+    let bench_key = ed25519_dalek::SigningKey::from_bytes(&[0xBE; 32]);
     let tmp_dir = tempdir();
+    let keys_path = tmp_dir.join("authorized_keys");
+    let pub_key_b64 = base64::Engine::encode(
+        &base64::engine::general_purpose::STANDARD,
+        bench_key.verifying_key().to_bytes(),
+    );
+    std::fs::write(&keys_path, format!("trader {pub_key_b64} bench\n"))
+        .expect("write authorized_keys");
+
     let effective_journal = journal_path.unwrap_or_else(|| tmp_dir.join("bench.journal"));
 
     let config = ServerConfig {
@@ -676,6 +698,7 @@ fn run_roundtrip_bench(
         // Disable connection timeout for benchmarks — pre-generation
         // can take longer than the default 30s for large runs.
         connection_timeout_secs: 0,
+        authorized_keys: keys_path,
         ..ServerConfig::default()
     };
 
@@ -706,6 +729,7 @@ fn run_roundtrip_bench(
             shutdown,
             warmup,
             json_path,
+            &bench_key,
         );
     } else {
         use trading_protocol::tcp::BlockingTcpListener;
@@ -733,10 +757,26 @@ fn run_roundtrip_bench(
             shutdown,
             warmup,
             json_path,
+            &bench_key,
         );
     }
 
     let _ = std::fs::remove_dir_all(&tmp_dir);
+}
+
+/// Load a 32-byte raw Ed25519 private key from a file.
+fn load_signing_key(path: &std::path::Path) -> ed25519_dalek::SigningKey {
+    let bytes = std::fs::read(path)
+        .unwrap_or_else(|e| panic!("cannot read key file {}: {e}", path.display()));
+    if bytes.len() != 32 {
+        panic!(
+            "key file must be exactly 32 bytes (raw Ed25519 seed), got {}",
+            bytes.len()
+        );
+    }
+    let mut seed = [0u8; 32];
+    seed.copy_from_slice(&bytes);
+    ed25519_dalek::SigningKey::from_bytes(&seed)
 }
 
 /// Start the server on a background thread. The listener is already bound,
@@ -772,15 +812,40 @@ fn connect_tcp(addr: std::net::SocketAddr) -> std::net::TcpStream {
     panic!("failed to connect after 50 attempts: {}", last_err.unwrap());
 }
 
-/// Read and verify a `ServerReady` frame from a blocking stream.
+/// Perform challenge-response auth handshake on a new connection.
 /// Must be called before the stream is set to non-blocking mode.
-fn await_server_ready(stream: &mut impl std::io::Read) {
-    // Frame: 4-byte LE length prefix + payload.
+fn auth_handshake(stream: &mut (impl std::io::Read + std::io::Write), key: &ed25519_dalek::SigningKey) {
+    use ed25519_dalek::Signer;
+    use trading_protocol::message::Request;
+
+    // Read Challenge frame.
     let mut len_buf = [0u8; 4];
+    std::io::Read::read_exact(stream, &mut len_buf).expect("read Challenge length");
+    let len = u32::from_le_bytes(len_buf) as usize;
+    assert!(len <= MAX_FRAME_SIZE, "Challenge frame too large: {len}");
+    let mut payload = [0u8; 64];
+    std::io::Read::read_exact(stream, &mut payload[..len]).expect("read Challenge payload");
+    let response = codec::decode_response(&payload[..len]).expect("decode Challenge");
+    let nonce = match response {
+        ResponseKind::Challenge { nonce } => nonce,
+        other => panic!("expected Challenge, got {other:?}"),
+    };
+
+    // Sign and send ChallengeResponse.
+    let signature = key.sign(&nonce);
+    let request = Request::ChallengeResponse {
+        signature: signature.to_bytes(),
+        public_key: key.verifying_key().to_bytes(),
+    };
+    let mut buf = [0u8; 256];
+    let written = codec::encode_request(&request, &mut buf).expect("encode ChallengeResponse");
+    std::io::Write::write_all(stream, &buf[..written]).expect("send ChallengeResponse");
+    std::io::Write::flush(stream).expect("flush ChallengeResponse");
+
+    // Read ServerReady.
     std::io::Read::read_exact(stream, &mut len_buf).expect("read ServerReady length");
     let len = u32::from_le_bytes(len_buf) as usize;
     assert!(len <= MAX_FRAME_SIZE, "ServerReady frame too large: {len}");
-    let mut payload = [0u8; 8];
     std::io::Read::read_exact(stream, &mut payload[..len]).expect("read ServerReady payload");
     let response = codec::decode_response(&payload[..len]).expect("decode ServerReady");
     assert!(
@@ -1079,8 +1144,9 @@ fn run_roundtrip_inner<R, W, F>(
     shutdown: Arc<AtomicBool>,
     warmup: usize,
     json_path: Option<&std::path::Path>,
+    key: &ed25519_dalek::SigningKey,
 ) where
-    R: std::io::Read + AsRawFd + Send + 'static,
+    R: std::io::Read + std::io::Write + AsRawFd + Send + 'static,
     W: Write + AsRawFd + Send + 'static,
     F: Fn() -> (R, W),
 {
@@ -1098,6 +1164,7 @@ fn run_roundtrip_inner<R, W, F>(
             shutdown,
             warmup,
             json_path,
+            key,
         );
     }
 
@@ -1115,6 +1182,7 @@ fn run_roundtrip_inner<R, W, F>(
             shutdown,
             warmup,
             json_path,
+            key,
         );
     }
 }
@@ -1133,8 +1201,9 @@ fn run_epoll_roundtrip<R, W, F>(
     shutdown: Arc<AtomicBool>,
     warmup: usize,
     json_path: Option<&std::path::Path>,
+    key: &ed25519_dalek::SigningKey,
 ) where
-    R: AsRawFd + Send + 'static,
+    R: std::io::Read + std::io::Write + AsRawFd + Send + 'static,
     W: Write + AsRawFd + Send + 'static,
     F: Fn() -> (R, W),
 {
@@ -1149,8 +1218,8 @@ fn run_epoll_roundtrip<R, W, F>(
     for client_id in 0..num_clients {
         let (mut read_stream, write_stream) = connect();
 
-        // Wait for ServerReady handshake while the socket is still blocking.
-        await_server_ready(&mut read_stream);
+        // Challenge-response auth while the socket is still blocking.
+        auth_handshake(&mut read_stream, key);
 
         let fd = read_stream.as_raw_fd();
         let writer = BlockingFrameWriter::new(write_stream);
@@ -1293,8 +1362,9 @@ fn run_uring_roundtrip<R, W, F>(
     shutdown: Arc<AtomicBool>,
     warmup: usize,
     json_path: Option<&std::path::Path>,
+    key: &ed25519_dalek::SigningKey,
 ) where
-    R: std::io::Read + AsRawFd + Send + 'static,
+    R: std::io::Read + std::io::Write + AsRawFd + Send + 'static,
     W: Write + AsRawFd + Send + 'static,
     F: Fn() -> (R, W),
 {
@@ -1306,8 +1376,8 @@ fn run_uring_roundtrip<R, W, F>(
     for client_id in 0..num_clients {
         let (mut read_stream, write_stream) = connect();
 
-        // Wait for ServerReady handshake while the socket is still blocking.
-        await_server_ready(&mut read_stream);
+        // Challenge-response auth while the socket is still blocking.
+        auth_handshake(&mut read_stream, key);
 
         let read_fd = read_stream.as_raw_fd();
         let write_fd = write_stream.as_raw_fd();

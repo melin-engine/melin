@@ -6,6 +6,7 @@ edition = "2024"
 [dependencies]
 trading-client = { path = "../client" }
 trading-protocol = { path = "../protocol" }
+ed25519-dalek = { workspace = true }
 ratatui = "0.29"
 crossterm = "0.28"
 tikv-jemallocator = { workspace = true }

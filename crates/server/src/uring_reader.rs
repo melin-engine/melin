@@ -30,6 +30,7 @@ use trading_disruptor::ring;
 use trading_engine::journal::event::JournalEvent;
 use trading_engine::journal::pipeline::InputSlot;
 use trading_engine::journal::trace::trace_ts;
+use trading_protocol::auth::Permission;
 use trading_protocol::codec;
 use trading_protocol::message::{ConnectionId, Request};
 
@@ -76,6 +77,8 @@ pub struct ReaderRegistration<R> {
     pub connection_id: ConnectionId,
     pub reader: R,
     pub addr: SocketAddr,
+    /// Permission level established during the auth handshake.
+    pub permission: Permission,
 }
 
 /// Handle for the accept loop to register connections with the io_uring reader.
@@ -165,6 +168,9 @@ pub fn spawn_reader_pool<R: AsRawFd + Send + 'static>(
 struct ConnectionEntry<R> {
     connection_id: u64,
     addr: SocketAddr,
+    /// Permission level from auth handshake. Checked per-request on
+    /// the reader thread (cold path), zero cost on the matching engine.
+    permission: Permission,
     /// Owned reader — keeps the fd alive. Dropping closes the fd.
     _reader: R,
     fd: RawFd,
@@ -319,6 +325,7 @@ fn uring_reader_loop<R: AsRawFd>(
                         let entry = ConnectionEntry {
                             connection_id: reg.connection_id.0,
                             addr: reg.addr,
+                            permission: reg.permission,
                             fd,
                             _reader: reg.reader,
                             parse_buf: Vec::with_capacity(MAX_FRAME_SIZE + 4),
@@ -628,6 +635,24 @@ fn process_frames<R>(
             continue;
         }
 
+        // ChallengeResponse after auth is invalid — ignore.
+        if matches!(request, Request::ChallengeResponse { .. }) {
+            debug!(
+                connection_id = conn.connection_id,
+                "ChallengeResponse after auth, ignoring"
+            );
+            continue;
+        }
+
+        // Enforce permission: ReadOnly connections cannot trade.
+        if !conn.permission.can_trade() {
+            debug!(
+                connection_id = conn.connection_id,
+                "read-only connection attempted trade, dropping request"
+            );
+            continue;
+        }
+
         #[allow(clippy::let_unit_value)]
         let recv_ts = trace_ts();
 
@@ -670,6 +695,8 @@ fn request_to_event(request: &Request) -> JournalEvent {
         Request::SubmitOrder { symbol, order } => JournalEvent::SubmitOrder { symbol, order },
         Request::CancelOrder { symbol, order_id } => JournalEvent::CancelOrder { symbol, order_id },
         Request::CancelAll { account } => JournalEvent::CancelAll { account },
-        Request::Heartbeat => unreachable!("heartbeats filtered before request_to_event"),
+        Request::Heartbeat | Request::ChallengeResponse { .. } => {
+            unreachable!("heartbeats and auth messages filtered before request_to_event")
+        }
     }
 }

@@ -30,6 +30,15 @@ pub enum Request {
     /// Keepalive heartbeat. Resets the server's idle timeout for this
     /// connection. Tag-only, no payload.
     Heartbeat,
+    /// Challenge-response authentication. Sent after receiving a
+    /// `Challenge` from the server. Contains the Ed25519 signature
+    /// over the nonce and the client's public key.
+    ChallengeResponse {
+        /// Ed25519 signature of the server-provided nonce (64 bytes).
+        signature: [u8; 64],
+        /// Client's Ed25519 public key (32 bytes).
+        public_key: [u8; 32],
+    },
 }
 
 /// Server → client response payload.
@@ -51,4 +60,14 @@ pub enum ResponseKind {
     ServerReady,
     /// Keepalive heartbeat sent during idle periods. Tag-only, no payload.
     Heartbeat,
+    /// Challenge sent by the server after accepting a connection.
+    /// Contains a 32-byte random nonce for the client to sign.
+    Challenge {
+        /// Random nonce (32 bytes) that the client must sign with its
+        /// Ed25519 private key.
+        nonce: [u8; 32],
+    },
+    /// Authentication failed — invalid signature, unknown key, or
+    /// other auth error. Server drops the connection after sending this.
+    AuthFailed,
 }

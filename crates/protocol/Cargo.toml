@@ -7,6 +7,8 @@ edition = "2024"
 latency-trace = ["trading-engine/latency-trace"]
 
 [dependencies]
+base64 = { workspace = true }
+ed25519-dalek = { workspace = true }
 trading-engine = { path = "../engine" }
 
 [dev-dependencies]
