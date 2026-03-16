@@ -84,9 +84,9 @@ impl Client {
         let nonce = match response {
             ResponseKind::Challenge { nonce } => nonce,
             _ => {
-                return Err(ClientError::Protocol(
-                    ProtocolError::InvalidField("expected Challenge"),
-                ));
+                return Err(ClientError::Protocol(ProtocolError::InvalidField(
+                    "expected Challenge",
+                )));
             }
         };
 
@@ -174,8 +174,7 @@ mod tests {
         // Send Challenge.
         let nonce = [0xBB; 32];
         let mut buf = [0u8; 64];
-        let written =
-            codec::encode_response(&ResponseKind::Challenge { nonce }, &mut buf).unwrap();
+        let written = codec::encode_response(&ResponseKind::Challenge { nonce }, &mut buf).unwrap();
         writer.write_frame(&buf[4..written]).unwrap();
         writer.flush().unwrap();
 
@@ -196,8 +195,7 @@ mod tests {
         vk.verify(&nonce, &sig).unwrap();
 
         // Send ServerReady.
-        let written =
-            codec::encode_response(&ResponseKind::ServerReady, &mut buf).unwrap();
+        let written = codec::encode_response(&ResponseKind::ServerReady, &mut buf).unwrap();
         writer.write_frame(&buf[4..written]).unwrap();
         writer.flush().unwrap();
     }
@@ -263,8 +261,7 @@ mod tests {
             let _frame = reader.read_frame().unwrap().unwrap();
 
             // Send AuthFailed.
-            let written =
-                codec::encode_response(&ResponseKind::AuthFailed, &mut buf).unwrap();
+            let written = codec::encode_response(&ResponseKind::AuthFailed, &mut buf).unwrap();
             writer.write_frame(&buf[4..written]).unwrap();
             writer.flush().unwrap();
         });
@@ -313,8 +310,7 @@ mod tests {
             let mut writer = BlockingFrameWriter::new(stream);
 
             let mut buf = [0u8; 8];
-            let written =
-                codec::encode_response(&ResponseKind::ServerReady, &mut buf).unwrap();
+            let written = codec::encode_response(&ResponseKind::ServerReady, &mut buf).unwrap();
             writer.write_frame(&buf[4..written]).unwrap();
             writer.flush().unwrap();
         });
@@ -348,8 +344,7 @@ mod tests {
             let _frame = reader.read_frame().unwrap().unwrap();
 
             // Send Heartbeat instead of ServerReady/AuthFailed.
-            let written =
-                codec::encode_response(&ResponseKind::Heartbeat, &mut buf).unwrap();
+            let written = codec::encode_response(&ResponseKind::Heartbeat, &mut buf).unwrap();
             writer.write_frame(&buf[4..written]).unwrap();
             writer.flush().unwrap();
         });
