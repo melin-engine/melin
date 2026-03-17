@@ -45,7 +45,7 @@ A matching engine built on the [LMAX architecture](https://martinfowler.com/arti
 ```
 
 - **Single-threaded matching engine** — no locks on the hot path; one thread executes all matching logic
-- **LMAX-style disruptor pipeline** — 3 OS threads (journal, matching, response) on lock-free ring buffers; lock-free CAS-based multi-producer from reader pool; journal and matching run in parallel on the same events
+- **LMAX-style disruptor pipeline** ([docs/pipeline-architecture.md](docs/pipeline-architecture.md)) — 3 OS threads (journal, matching, response) on lock-free ring buffers; lock-free CAS-based multi-producer from reader pool; journal and matching run in parallel on the same events
 - **Persist-before-ack** — pipelined journal I/O with full durability guarantee; matching latency overlapped against journal writes, acknowledgement gated on confirmed durability, not optimistically sent
 - **Batch sync amortization** — under load, one sync covers many events; `pwritev2` with `RWF_DSYNC` (Force Unit Access) combines write + durability in a single syscall; `posix_fallocate` pre-allocates 64 MiB chunks so sync only flushes data pages, not extent metadata
 - **Event sourcing** — deterministic replay for crash recovery and audit; snapshots for fast restart; BLAKE3 hash chain for tamper evidence
@@ -72,7 +72,7 @@ Checklist of features expected of a production trade execution engine. Items mar
 ### Execution Qualifiers
 - [ ] Post-Only (maker-only, reject if would take)
 
-### Matching Engine
+### Matching Engine ([docs/matching-engine.md](docs/matching-engine.md))
 - [x] Strict price-time priority (BTreeMap + VecDeque order book)
 - [x] Execution reports: Fill (with fees), Placed, Triggered, Cancelled, Rejected, Replaced
 - [x] Multi-instrument exchange with shared account balances
@@ -80,12 +80,12 @@ Checklist of features expected of a production trade execution engine. Items mar
 - [x] Circuit breakers (price bands, trading halts — per-instrument `CircuitBreakerConfig`)
 - [ ] Auction mechanisms (opening/closing/volatility auctions)
 
-### Fees
+### Fees ([docs/fee-model.md](docs/fee-model.md))
 - [x] Maker/taker fee model (per-instrument `FeeSchedule` in basis points, configurable via admin API)
 - [x] Fee deduction on fill (fees in quote currency, deducted from buyer reservation and seller proceeds, reported in `ExecutionReport::Fill`)
 - [ ] Tiered fee schedules (volume-based tiers, account-level overrides)
 
-### Risk & Accounting
+### Risk & Accounting ([docs/risk-checks.md](docs/risk-checks.md), [docs/balance-management.md](docs/balance-management.md))
 - [x] Per-account, per-currency balance management (reserve on order, update on fill, release on cancel)
 - [x] Self-trade prevention (per-order modes: CancelNewest, CancelOldest, CancelBoth)
 - [x] Fat finger checks (max order size, max notional value — per-instrument configurable `RiskLimits`)
@@ -191,7 +191,7 @@ Ordered by importance for commercial readiness (exchange operators and investors
 
 Also needed: backpressure policy, gateway scalability (epoll/io_uring multiplexing), per-account permissions, crash injection tests (kill server at random points during load, verify recovery produces identical state — validates journal/snapshot/rotation crash safety end-to-end).
 
-### Benchmarking & Measurements
+### Benchmarking & Measurements ([docs/benchmarking.md](docs/benchmarking.md))
 - [x] Realistic order flow generator (power-law prices/sizes, cancels, fills, multiple accounts, STP diversity)
 - [x] Multi-threaded io_uring benchmark client (`--bench-threads`)
 - [x] JSON output for machine-readable results (`--json`)
