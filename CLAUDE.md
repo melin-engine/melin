@@ -128,10 +128,10 @@ Core layout: 0=OS/IRQ, 1-3=pipeline (journal/matching/response), 4-5=readers, 6+
 - `src/spsc.rs` — single-producer, single-consumer queue
 
 ### `crates/engine/` — matching engine and event sourcing
-- `src/types.rs` — core types (OrderId, AccountId, CurrencyId, Price, Quantity, Order, ExecutionReport, InstrumentSpec, CircuitBreakerConfig, etc.)
+- `src/types.rs` — core types (OrderId, AccountId, CurrencyId, Price, Quantity, Order, ExecutionReport, InstrumentSpec, CircuitBreakerConfig, FeeSchedule, etc.)
 - `src/account.rs` — account balance management (flat `Vec<Balance>` indexed by `account_id * stride + currency_id` for O(1) lookups; deposit, withdraw, reserve, fill, release)
 - `src/orderbook.rs` — order book with price-time priority matching and stop trigger logic
-- `src/exchange.rs` — multi-instrument dispatcher with integrated balance validation
+- `src/exchange.rs` — multi-instrument dispatcher with integrated balance validation, fee computation, cancel-replace
 - `src/journal/` — durable write-ahead log for event sourcing and crash recovery
   - `event.rs` — `JournalEvent` enum (input commands only)
   - `codec.rs` — binary encode/decode with CRC32C checksums
@@ -156,8 +156,8 @@ Core layout: 0=OS/IRQ, 1-3=pipeline (journal/matching/response), 4-5=readers, 6+
 - `src/tcp.rs` — `BlockingTcpListener` (std `TcpListener`, `TCP_NODELAY`)
 - `src/uds.rs` — `BlockingUdsListener` (std `UnixListener`)
 
-### `crates/gateway/` — client-facing proxy (planned)
-### `crates/admin/` — CLI admin tool (instrument management, deposits, circuit breakers, risk limits, key generation)
+### `crates/gateway/` — TCP proxy between clients and engine
+### `crates/admin/` — CLI admin tool (instrument management, deposits, circuit breakers, risk limits, fee schedules, cancel-replace, live stats dashboard, key generation)
 ### `crates/client/` — typed blocking client library (Ed25519 auth, std `TcpStream`)
 ### `crates/bench/` — pipelined end-to-end benchmark with latency histograms (TCP default, `--uds` flag)
 ### `crates/tui/` — terminal UI for interactive testing

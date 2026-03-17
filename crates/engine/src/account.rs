@@ -277,9 +277,9 @@ impl AccountManager {
 
     /// Update balances after a fill. Called once per `ExecutionReport::Fill`.
     ///
-    /// The buyer's reserved quote decreases by `cost`, available base increases
-    /// by `quantity`. The seller's reserved base decreases by `quantity`,
-    /// available quote increases by `cost`.
+    /// The buyer's reserved quote decreases by `cost + buyer_fee`, available
+    /// base increases by `quantity`. The seller's reserved base decreases by
+    /// `quantity`, available quote increases by `cost - seller_fee`.
     #[allow(clippy::too_many_arguments)]
     pub fn fill(
         &mut self,

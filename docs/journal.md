@@ -12,6 +12,8 @@ This document describes the write-ahead journal, snapshot system, crash recovery
 
 4. **CRC32C integrity** — every journal entry and every snapshot file is checksummed with CRC32C (hardware-accelerated on x86). Corruption is detected on read, never silently replayed.
 
+5. **BLAKE3 hash chain** — each entry is hashed into a running BLAKE3 chain (`hash_n = BLAKE3(entry_bytes || hash_{n-1})`). Periodic checkpoint entries record the chain hash, enabling tamper detection and replica consistency verification without per-entry disk overhead.
+
 ## Journal File Format
 
 ### File Header (8 bytes, written once)
@@ -19,11 +21,11 @@ This document describes the write-ahead journal, snapshot system, crash recovery
 ```
 Offset  Size  Field           Value
 0       4     file_magic      0x4A4F5552 ("JOUR")
-4       2     format_version  2
+4       2     format_version  6
 6       2     reserved        0
 ```
 
-The header is written when the journal is created and never modified. `format_version` is checked on open; mismatches are rejected with `UnsupportedVersion`.
+The header is written when the journal is created and never modified. `format_version` is checked on open; v5 and v6 are accepted (v5 journals are readable but lack hash chain verification).
 
 ### Entry Layout (repeats after header)
 
@@ -33,7 +35,7 @@ Offset  Size  Field           Description
 2       2     length          byte count of (event_tag + payload), excludes header and CRC
 4       8     sequence        monotonically increasing, starts at 1, no gaps
 12      8     timestamp_ns    wall-clock nanoseconds since Unix epoch (informational only)
-20      1     event_tag       discriminant (1=AddInstrument, 2=Deposit, 3=SubmitOrder, 4=CancelOrder)
+20      1     event_tag       discriminant (see Event Payloads below)
 21      var   payload         event-specific fields (see below)
 21+len  4     crc32c          CRC32C of all preceding bytes in this entry (offset 0 through 20+len)
 ```
@@ -85,6 +87,67 @@ Total entry size: `20 + length + 4` bytes. Typical entries are 40-85 bytes.
 | 15+N | 8 | quantity (u64) |
 | 23+N | 1 | self_trade_prevention (0=Allow, 1=CancelNewest, 2=CancelOldest, 3=CancelBoth) |
 
+**SetRiskLimits (tag=5)** — 6-22 bytes
+
+| Offset | Size | Field |
+|--------|------|-------|
+| 0 | 4 | symbol (u32) |
+| 4 | 1 | max_order_qty option tag (0=None, 1=Some) |
+| 5 | 0 or 8 | max_order_qty value (u64, if Some) |
+| 5+N | 1 | max_order_notional option tag |
+| 6+N | 0 or 8 | max_order_notional value (u64, if Some) |
+
+**CancelAll (tag=6)** — 4 bytes
+
+| Offset | Size | Field |
+|--------|------|-------|
+| 0 | 4 | account_id (u32) |
+
+**SetCircuitBreaker (tag=7)** — 7-23 bytes
+
+| Offset | Size | Field |
+|--------|------|-------|
+| 0 | 4 | symbol (u32) |
+| 4 | 1 | price_band_lower option tag (0=None, 1=Some) |
+| 5 | 0 or 8 | price_band_lower value (u64, if Some) |
+| 5+N | 1 | price_band_upper option tag |
+| 6+N | 0 or 8 | price_band_upper value (u64, if Some) |
+| 6+N+M | 1 | halted (0=false, 1=true) |
+
+**CancelReplace (tag=8)** — 28 bytes
+
+| Offset | Size | Field |
+|--------|------|-------|
+| 0 | 4 | symbol (u32) |
+| 4 | 8 | order_id (u64) |
+| 12 | 8 | new_price (u64, NonZero) |
+| 20 | 8 | new_quantity (u64, NonZero) |
+
+**GenesisHash (tag=9)** — 32 bytes
+
+| Offset | Size | Field |
+|--------|------|-------|
+| 0 | 32 | hash ([u8; 32]) — random bytes (fresh journal) or previous chain hash (rotation) |
+
+First entry in every v6 journal. Seeds the BLAKE3 hash chain. Transparent to callers (reader skips it and only returns user events).
+
+**Checkpoint (tag=10)** — 40 bytes
+
+| Offset | Size | Field |
+|--------|------|-------|
+| 0 | 32 | chain_hash ([u8; 32]) — running BLAKE3 hash at this point |
+| 32 | 8 | events_since_checkpoint (u64) |
+
+Auto-emitted every 100K events. The reader verifies the chain hash and event count; mismatches produce `HashChainMismatch`. Transparent to callers.
+
+**SetFeeSchedule (tag=11)** — 8 bytes
+
+| Offset | Size | Field |
+|--------|------|-------|
+| 0 | 4 | symbol (u32) |
+| 4 | 2 | maker_fee_bps (u16) |
+| 6 | 2 | taker_fee_bps (u16) |
+
 ## Durability
 
 ### Write Path
@@ -119,13 +182,15 @@ JournaledExchange::recover(journal_path):
      - Validate entry_magic (0x4A45).
      - Validate CRC32C.
      - Validate sequence continuity (expected = last + 1).
+     - On GenesisHash: initialize BLAKE3 hash chain, skip (transparent).
+     - On Checkpoint: verify chain hash + event count, skip (transparent).
+     - On normal entries: update hash chain, replay on Exchange.
      - If entry_magic is 0x0000 → end of data (pre-allocated space). Stop.
      - If entry is truncated at EOF → partial write from crash. Stop.
-     - If CRC mismatch or sequence gap → return error (real corruption).
-  3. For each valid entry, replay the event on a fresh Exchange instance.
-  4. Truncate the file to valid_file_end (remove trailing garbage).
-  5. Re-allocate space from valid_file_end forward.
-  6. Reopen writer for appending at next_sequence = last_sequence + 1.
+     - If CRC mismatch, sequence gap, or hash chain mismatch → return error.
+  3. Truncate the file to valid_file_end (remove trailing garbage).
+  4. Re-allocate space from valid_file_end forward.
+  5. Reopen writer for appending, resuming the hash chain from reader's final state.
 ```
 
 **Key behaviors:**
@@ -154,10 +219,11 @@ This avoids replaying the entire journal from genesis. Recovery time is proporti
 ```
 Offset  Size  Field           Value
 0       4     file_magic      0x534E4150 ("SNAP")
-4       2     format_version  2
+4       2     format_version  7
 6       2     reserved        0
 8       8     sequence        journal sequence number at snapshot time
-16      var   data            serialized Exchange state (manual binary encoding)
+16      32    chain_hash      BLAKE3 hash chain state (v6+; zeros for v5)
+48      var   data            serialized Exchange state (manual binary encoding)
 EOF-4   4     crc32c          CRC32C of everything from offset 0 through EOF-4
 ```
 
@@ -170,7 +236,8 @@ The snapshot captures the full Exchange state:
 - **Instruments** — all registered trading pairs (symbol, base currency, quote currency)
 - **Account balances** — per-account, per-currency available and reserved amounts
 - **Balance reservations** — per-order reserved funds (order_id → account, currency, amount)
-- **Order sides** — per-order buy/sell tracking (for fill processing)
+- **Order sides** — per-order buy/sell tracking, keyed by (account_id, order_id)
+- **Fee schedules** — per-instrument maker/taker fee rates in basis points
 - **Order books** — per-instrument:
   - Resting bids and asks at each price level (order_id, account, remaining quantity)
   - Order index (order_id → side, price) for O(1) cancel
@@ -191,13 +258,48 @@ A crash during snapshot creation leaves only a temporary file, which is harmless
 
 ### When to Snapshot
 
-Snapshots are currently taken manually (via `save_snapshot()`). In production, they should be triggered:
+Snapshots are taken automatically during journal rotation, which triggers at startup when the journal exceeds a configurable size threshold (`--max-journal-mib`, default 256 MiB). Snapshots can also be triggered manually via `save_snapshot()`.
 
-- Before deploying a new engine version (version boundary — see Migration below).
-- Periodically, to bound recovery time (e.g., every N million events or every M minutes).
-- Before journal rotation (the snapshot makes the old journal dispensable for recovery).
+- **At rotation** — automatic snapshot + journal archiving when size threshold exceeded.
+- **Before deploying a new engine version** — version boundary (see Migration below).
+- **Periodically** — to bound recovery time if rotation threshold is set high.
 
-Automatic snapshot triggering (journal compaction) is not yet implemented.
+## BLAKE3 Hash Chain
+
+Every v6 journal maintains a running BLAKE3 hash chain for tamper evidence and replica consistency verification.
+
+### How It Works
+
+1. **Genesis entry** — the first entry in every v6 journal. Contains 32 random bytes (fresh journal) or the previous chain hash (rotated journal). Initializes the chain: `hash_0 = BLAKE3(genesis_entry_bytes)`.
+
+2. **Normal entries** — each entry updates the chain: `hash_n = BLAKE3(entry_bytes_excl_CRC || hash_{n-1})`. The hash is computed over the raw encoded bytes (header + tag + payload) so it covers sequence, timestamp, and payload. Computed in-memory only — no extra disk I/O per entry (~15-30ns).
+
+3. **Checkpoint entries** — auto-emitted every 100K events. Contains the current chain hash and event count. The reader verifies both at each checkpoint; mismatches produce `HashChainMismatch`. The checkpoint itself is hashed into the chain for continuity.
+
+4. **Rotation continuity** — on journal rotation, the new journal's genesis hash is the old journal's final chain hash. This provides cryptographic linkage across rotation boundaries.
+
+5. **Snapshot integration** — snapshots store the chain hash (v6+ header). Recovery from snapshot seeds the chain so verification continues without replaying from genesis.
+
+### What It Detects
+
+- **Tampered entries** — modifying any byte in any entry breaks the chain at the next checkpoint.
+- **Reordered entries** — entries hashed in a different order produce a different chain hash.
+- **Replica divergence** — a replica replaying events can compare checkpoint hashes to prove it processed the same events in the same order.
+
+### What It Does NOT Detect
+
+- **Tamper between the last checkpoint and EOF** — the chain diverges but there's no subsequent checkpoint to catch it. A final checkpoint on shutdown would close this gap.
+- **Truncation attacks** — removing entries from the end produces a valid (shorter) chain. Sequence numbers detect this if the expected sequence is known.
+
+## Journal Rotation
+
+When the journal file exceeds the configured size threshold (`--max-journal-mib`, default 256 MiB), rotation triggers at startup:
+
+1. **Save snapshot** at the current sequence boundary (includes chain hash).
+2. **Archive old journal** by renaming: `trading.journal` → `trading.journal.1` (bumping existing archives: `.1` → `.2`, etc.).
+3. **Create new journal** continuing from the same sequence with a genesis hash = old chain hash.
+
+Recovery from snapshot + new journal produces identical state. Old journals are kept for audit.
 
 ## Pipeline Architecture
 
@@ -234,19 +336,36 @@ The journal participates in a 3-stage LMAX disruptor pipeline:
 
 ## Format Versioning
 
-Both the journal and snapshot have independent `format_version` fields. The current version for both is **2**.
+Both the journal and snapshot have independent `format_version` fields. Current journal version: **6**. Current snapshot version: **7**.
 
-### Version History
+### Journal Version History
 
 | Version | Change |
 |---------|--------|
 | 1 | Initial format |
-| 2 | Added `SelfTradeProtection` byte to Order encoding (journal) and `PendingStopSnapshot` (snapshot) |
+| 2 | Added `SelfTradeProtection` byte to Order encoding |
+| 3 | Added `SetRiskLimits` event (tag=5) for fat finger checks |
+| 4 | Added `CancelAll` event (tag=6) for kill switch |
+| 5 | Added `SetCircuitBreaker` event (tag=7) for price bands + trading halts |
+| 6 | Added `GenesisHash` (tag=9), `Checkpoint` (tag=10) for BLAKE3 hash chain; `CancelReplace` (tag=8); `SetFeeSchedule` (tag=11) |
+
+### Snapshot Version History
+
+| Version | Change |
+|---------|--------|
+| 1 | Initial format |
+| 2 | Added `SelfTradeProtection` byte to `PendingStopSnapshot` |
+| 3 | Added per-account OrderId high-water marks for client dedup |
+| 4 | Added per-instrument `RiskLimits` for fat finger checks |
+| 5 | Added per-instrument `CircuitBreakerConfig` for price bands + halts |
+| 6 | Added `chain_hash` (32 bytes) in header for BLAKE3 hash chain continuity |
+| 7 | Order sides keyed by `(AccountId, OrderId)` instead of `OrderId`; added per-instrument fee schedules |
 
 ### Compatibility Rules
 
-- The reader rejects any file whose `format_version` does not match the compiled-in constant. There is no backwards-compatible reading of old versions.
-- This is intentional: the journal is an internal persistence format, not an interchange format. Forward/backward compatibility adds complexity and is unnecessary when the operator controls both the writer and reader.
+- The journal reader accepts v5 and v6 files. V5 journals are readable but lack hash chain verification.
+- The snapshot reader accepts v5, v6, and v7 files. V5 snapshots use a 16-byte header (no chain hash). V6 snapshots use the old `OrderId`-only key format for order sides and lack fee schedules.
+- Older versions are rejected with `UnsupportedVersion`.
 
 ## Migration Procedure
 
@@ -275,7 +394,7 @@ When changing the journal or snapshot format (adding fields, changing encoding, 
 
 Adding a new `JournalEvent` variant (e.g., `SetPriceBands`, `HaltInstrument`) requires:
 
-1. Assign a new event tag (e.g., `TAG_SET_PRICE_BANDS = 5`).
+1. Assign a new event tag (next available: 12).
 2. Add encode/decode logic to the codec.
 3. Bump `FORMAT_VERSION` (old readers will reject the new file, which is correct).
 4. Follow the standard upgrade procedure above.
@@ -284,7 +403,7 @@ If the new event type is purely additive (old events unchanged, new tag added), 
 
 ### Adding Fields to Existing Events
 
-Adding a field to an existing event (as was done in v1→v2 with `SelfTradeProtection`):
+Adding a field to an existing event (as done in v1→v2 with `SelfTradeProtection`):
 
 1. Append the field to the end of the event's binary layout.
 2. Bump `FORMAT_VERSION`.
@@ -298,7 +417,7 @@ Inserting a field in the middle or changing field sizes breaks all entries in th
 
 The journal grows monotonically. Pre-allocation extends it in 64 MiB chunks. A single entry is ~40-85 bytes, so 64 MiB covers roughly 800K-1.6M entries before the next allocation.
 
-At sustained 830K orders/sec (with fsync), the journal grows at ~50-70 MB/sec. Without rotation or compaction, it will consume ~4 GB/min. **Journal rotation and compaction are not yet implemented** — monitor disk usage.
+At sustained 830K orders/sec (with fsync), the journal grows at ~50-70 MB/sec. Journal rotation triggers at startup when the file exceeds `--max-journal-mib` (default 256 MiB), creating a snapshot and archiving the old journal.
 
 ### Sequence Numbers
 
@@ -318,13 +437,12 @@ The `timestamp_ns` field is wall-clock time from `clock_gettime(CLOCK_REALTIME)`
 | `ChecksumMismatch` | CRC32C validation failed | Bit rot or partial write — investigate storage |
 | `SequenceGap` | Non-contiguous sequence numbers | Corruption or file truncation — investigate |
 | `TruncatedEntry` | Incomplete entry at EOF | Normal crash recovery — entry is discarded |
+| `HashChainMismatch` | BLAKE3 chain hash verification failed at checkpoint | Tampered or corrupt entry between checkpoints — investigate |
 | `Io` | Underlying I/O error | Disk failure, permissions, full disk |
 
 ### Limitations
 
-- **No journal rotation** — single file grows unbounded. Requires manual management.
-- **No compaction** — old entries are never removed. Snapshot + rotate is the planned approach.
-- **No client deduplication** — after crash recovery, clients that retry may cause duplicate executions. Sequence numbers / idempotency keys are planned.
+- **Startup-only rotation** — journal rotation triggers at startup when the file exceeds the size threshold. Runtime rotation (during sustained load) is not yet implemented.
 - **No output event log** — execution reports are not persisted. Audit trail requires replaying the journal.
 - **Single journal file** — no striping or parallel writes. The journal is single-threaded by design (LMAX architecture).
 - **No encryption** — journal and snapshot files are plaintext binary. Sensitive data (account IDs, order details) is visible to anyone with file access.
