@@ -37,6 +37,10 @@ pub fn get_u64(buf: &[u8]) -> u64 {
 
 // --- Vec-appending writers (for snapshot's growable buffer) ---
 
+pub fn push_u16(buf: &mut Vec<u8>, v: u16) {
+    buf.extend_from_slice(&v.to_le_bytes());
+}
+
 pub fn push_u32(buf: &mut Vec<u8>, v: u32) {
     buf.extend_from_slice(&v.to_le_bytes());
 }

@@ -394,7 +394,7 @@ fn book_total_quantity(book: &OrderBook) -> u64 {
 fn assert_exchange_consistent(exchange: &Exchange, action_idx: usize, action_desc: &str) {
     let order_sides = exchange.snapshot_order_sides();
     let sides_ids: std::collections::HashSet<OrderId> =
-        order_sides.iter().map(|(id, _)| *id).collect();
+        order_sides.iter().map(|((_acct, id), _)| *id).collect();
 
     let reservations = exchange.accounts().snapshot_reservations();
     let reserved_ids: std::collections::HashSet<OrderId> =
@@ -1015,7 +1015,7 @@ proptest! {
             quantity: q,
             stp: SelfTradeProtection::Allow,
         };
-        let _ = mgr.try_reserve(&buy, &spec);
+        let _ = mgr.try_reserve(&buy, &spec, 0);
 
         // Sell limit: reserves quantity in base, no multiplication.
         let sell = Order {
@@ -1027,7 +1027,7 @@ proptest! {
             quantity: q,
             stp: SelfTradeProtection::Allow,
         };
-        let _ = mgr.try_reserve(&sell, &spec);
+        let _ = mgr.try_reserve(&sell, &spec, 0);
     }
 
     /// Fill operations with large values must not panic.
@@ -1064,12 +1064,12 @@ proptest! {
             stp: SelfTradeProtection::Allow,
         };
 
-        let buy_ok = mgr.try_reserve(&buy, &spec).is_ok();
-        let sell_ok = mgr.try_reserve(&sell, &spec).is_ok();
+        let buy_ok = mgr.try_reserve(&buy, &spec, 0).is_ok();
+        let sell_ok = mgr.try_reserve(&sell, &spec, 0).is_ok();
 
         if buy_ok && sell_ok {
             // Fill must not panic regardless of price × quantity magnitude.
-            mgr.fill(OrderId(2), OrderId(1), p, q, Side::Sell, &spec);
+            mgr.fill(ACCT_B, OrderId(2), ACCT_A, OrderId(1), p, q, Side::Sell, 0, 0, &spec);
         }
     }
 }
@@ -1156,7 +1156,7 @@ proptest! {
 
         let order_sides = exchange.snapshot_order_sides();
         let sides_ids: std::collections::HashSet<OrderId> =
-            order_sides.iter().map(|(id, _)| *id).collect();
+            order_sides.iter().map(|((_acct, id), _)| *id).collect();
 
         let mut book_order_ids = std::collections::HashSet::new();
         for (_sym, book) in exchange.books() {

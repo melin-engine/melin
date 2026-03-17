@@ -185,7 +185,7 @@ Ordered by importance for commercial readiness (exchange operators and investors
 7. ~~**TLS**~~ (deferred) — not needed for VLAN deployments. Ed25519 challenge-response provides identity without encryption overhead on the hot path.
 8. **Metrics & observability** — connection counts, queue depth, health endpoints. Operators need visibility.
 9. **Auction mechanisms** — opening/closing/volatility auctions. Differentiator for regulated venues.
-10. ~~**Fee model**~~ ✅ — per-instrument maker/taker fees in basis points. Deducted from fill proceeds in quote currency. Configurable via admin API, journaled for deterministic replay. (`feat/fee-model` branch, pending merge)
+10. ~~**Fee model**~~ ✅ — per-instrument maker/taker fees in basis points. Deducted from fill proceeds in quote currency. Configurable via admin API, journaled for deterministic replay.
 11. **Documentation** — architecture guide, API reference, operational runbook.
 12. **Security hardening** — remaining [audit findings](docs/security-audit.md): per-account order limits (SEC-03), order throttling (SEC-04), disk exhaustion handling (SEC-05), snapshot validation (SEC-09).
 

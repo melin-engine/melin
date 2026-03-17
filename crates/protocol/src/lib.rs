@@ -20,8 +20,8 @@ mod fuzz_tests;
 /// engine crate.
 pub mod types {
     pub use trading_engine::types::{
-        AccountId, CircuitBreakerConfig, CurrencyId, ExecutionReport, InstrumentSpec, Order,
-        OrderId, OrderType, Price, Quantity, RejectReason, RiskLimits, SelfTradeProtection, Side,
-        Symbol, TimeInForce,
+        AccountId, CircuitBreakerConfig, CurrencyId, ExecutionReport, FeeSchedule, InstrumentSpec,
+        Order, OrderId, OrderType, Price, Quantity, RejectReason, RiskLimits, SelfTradeProtection,
+        Side, Symbol, TimeInForce,
     };
 }

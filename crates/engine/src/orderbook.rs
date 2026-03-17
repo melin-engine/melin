@@ -153,14 +153,20 @@ impl BookSide {
         self.levels.entry(price).or_default().push_back(order);
     }
 
-    fn remove(&mut self, price: Price, order_id: OrderId) -> Option<Quantity> {
+    /// Remove a resting order and return both its account and remaining quantity.
+    /// Used by cancel paths that need the account for `ExecutionReport::Cancelled`.
+    fn remove_with_account(
+        &mut self,
+        price: Price,
+        order_id: OrderId,
+    ) -> Option<(AccountId, Quantity)> {
         let level = self.levels.get_mut(&price)?;
         let pos = level.iter().position(|o| o.id == order_id)?;
         let order = level.remove(pos).expect("position was valid");
         if level.is_empty() {
             self.levels.remove(&price);
         }
-        Some(order.remaining)
+        Some((order.account, order.remaining))
     }
 
     fn is_empty(&self) -> bool {
@@ -379,7 +385,10 @@ impl OrderBook {
 
     /// Look up a resting order's current state: (side, price, remaining).
     /// Returns `None` if the order is not on the book.
-    pub(crate) fn get_resting_order(&self, order_id: OrderId) -> Option<(Side, Price, Quantity)> {
+    pub(crate) fn get_resting_order(
+        &self,
+        order_id: OrderId,
+    ) -> Option<(AccountId, Side, Price, Quantity)> {
         let &(side, price) = self.order_index.get(&order_id)?;
         let book_side = match side {
             Side::Buy => &self.bids,
@@ -387,7 +396,7 @@ impl OrderBook {
         };
         let level = book_side.levels.get(&price)?;
         let order = level.iter().find(|o| o.id == order_id)?;
-        Some((side, price, order.remaining))
+        Some((order.account, side, price, order.remaining))
     }
 
     /// Best bid price (highest), or `None` if the bid side is empty.
@@ -497,9 +506,10 @@ impl OrderBook {
                 Side::Buy => &mut self.bids,
                 Side::Sell => &mut self.asks,
             };
-            if let Some(remaining) = book_side.remove(price, order_id) {
+            if let Some((account, remaining)) = book_side.remove_with_account(price, order_id) {
                 reports.push(ExecutionReport::Cancelled {
                     order_id,
+                    account,
                     remaining_quantity: remaining,
                 });
             }
@@ -521,6 +531,7 @@ impl OrderBook {
                 }
                 reports.push(ExecutionReport::Cancelled {
                     order_id,
+                    account: stop.account,
                     remaining_quantity: stop.quantity,
                 });
             }
@@ -597,6 +608,7 @@ impl OrderBook {
             if available < order.quantity.get() {
                 reports.push(ExecutionReport::Rejected {
                     order_id: order.id,
+                    account: order.account,
                     reason: RejectReason::FOKCannotFill,
                 });
                 return;
@@ -620,6 +632,7 @@ impl OrderBook {
                     // STP terminated matching — cancel the taker regardless of TIF.
                     reports.push(ExecutionReport::Cancelled {
                         order_id: order.id,
+                        account: order.account,
                         remaining_quantity: rem,
                     });
                 } else {
@@ -637,6 +650,7 @@ impl OrderBook {
                         TimeInForce::IOC | TimeInForce::FOK => {
                             reports.push(ExecutionReport::Cancelled {
                                 order_id: order.id,
+                                account: order.account,
                                 remaining_quantity: rem,
                             });
                         }
@@ -667,6 +681,7 @@ impl OrderBook {
             if available < order.quantity.get() {
                 reports.push(ExecutionReport::Rejected {
                     order_id: order.id,
+                    account: order.account,
                     reason: RejectReason::FOKCannotFill,
                 });
                 return;
@@ -677,6 +692,7 @@ impl OrderBook {
         if opposite.is_empty() {
             reports.push(ExecutionReport::Rejected {
                 order_id: order.id,
+                account: order.account,
                 reason: RejectReason::NoLiquidity,
             });
             return;
@@ -698,6 +714,7 @@ impl OrderBook {
             // (STP cancellation also results in cancelling the remainder.)
             reports.push(ExecutionReport::Cancelled {
                 order_id: order.id,
+                account: order.account,
                 remaining_quantity: rem,
             });
         }
@@ -778,6 +795,7 @@ impl OrderBook {
                             self.order_index.remove(&cancelled_maker.id);
                             reports.push(ExecutionReport::Cancelled {
                                 order_id: cancelled_maker.id,
+                                account: cancelled_maker.account,
                                 remaining_quantity: cancelled_maker.remaining,
                             });
                             continue;
@@ -788,6 +806,7 @@ impl OrderBook {
                             self.order_index.remove(&cancelled_maker.id);
                             reports.push(ExecutionReport::Cancelled {
                                 order_id: cancelled_maker.id,
+                                account: cancelled_maker.account,
                                 remaining_quantity: cancelled_maker.remaining,
                             });
                             if level.is_empty() {
@@ -816,6 +835,8 @@ impl OrderBook {
                     }
                 }
 
+                // Fees are zero here — the Exchange computes and sets
+                // them after matching, before balance updates.
                 reports.push(ExecutionReport::Fill {
                     maker_order_id: maker.id,
                     taker_order_id: taker_id,
@@ -823,6 +844,8 @@ impl OrderBook {
                     taker_account,
                     price,
                     quantity: fill_qty,
+                    maker_fee: 0,
+                    taker_fee: 0,
                 });
                 self.last_trade_price = Some(price);
 
@@ -1183,6 +1206,8 @@ mod tests {
                 taker_account: TEST_ACCOUNT,
                 price: price(100),
                 quantity: qty(10),
+                maker_fee: 0,
+                taker_fee: 0,
             }
         );
 
@@ -1219,6 +1244,8 @@ mod tests {
                 taker_account: TEST_ACCOUNT,
                 price: price(90),
                 quantity: qty(10),
+                maker_fee: 0,
+                taker_fee: 0,
             }
         );
 
@@ -1254,6 +1281,8 @@ mod tests {
                 taker_account: TEST_ACCOUNT,
                 price: price(100),
                 quantity: qty(5),
+                maker_fee: 0,
+                taker_fee: 0,
             }
         );
         assert_eq!(
@@ -1313,6 +1342,8 @@ mod tests {
                 taker_account: TEST_ACCOUNT,
                 price: price(100),
                 quantity: qty(5),
+                maker_fee: 0,
+                taker_fee: 0,
             }
         );
         assert_eq!(
@@ -1324,6 +1355,8 @@ mod tests {
                 taker_account: TEST_ACCOUNT,
                 price: price(100),
                 quantity: qty(2),
+                maker_fee: 0,
+                taker_fee: 0,
             }
         );
 
@@ -1372,6 +1405,8 @@ mod tests {
                 taker_account: TEST_ACCOUNT,
                 price: price(100),
                 quantity: qty(3),
+                maker_fee: 0,
+                taker_fee: 0,
             }
         );
 
@@ -1428,6 +1463,7 @@ mod tests {
             reports[0],
             ExecutionReport::Rejected {
                 order_id: OrderId(1),
+                account: TEST_ACCOUNT,
                 reason: RejectReason::NoLiquidity,
             }
         );
@@ -1458,6 +1494,7 @@ mod tests {
             reports[1],
             ExecutionReport::Cancelled {
                 order_id: OrderId(2),
+                account: TEST_ACCOUNT,
                 remaining_quantity: qty(5),
             }
         );
@@ -1490,6 +1527,7 @@ mod tests {
             reports[1],
             ExecutionReport::Cancelled {
                 order_id: OrderId(2),
+                account: TEST_ACCOUNT,
                 remaining_quantity: qty(5),
             }
         );
@@ -1522,6 +1560,7 @@ mod tests {
             reports[0],
             ExecutionReport::Rejected {
                 order_id: OrderId(2),
+                account: TEST_ACCOUNT,
                 reason: RejectReason::FOKCannotFill,
             }
         );
@@ -1581,6 +1620,7 @@ mod tests {
             reports[0],
             ExecutionReport::Cancelled {
                 order_id: OrderId(1),
+                account: TEST_ACCOUNT,
                 remaining_quantity: qty(10),
             }
         );
@@ -1668,6 +1708,8 @@ mod tests {
                 taker_account: TEST_ACCOUNT,
                 price: price(100),
                 quantity: qty(5),
+                maker_fee: 0,
+                taker_fee: 0,
             }
         );
         assert_eq!(
@@ -1679,6 +1721,8 @@ mod tests {
                 taker_account: TEST_ACCOUNT,
                 price: price(101),
                 quantity: qty(5),
+                maker_fee: 0,
+                taker_fee: 0,
             }
         );
         assert_eq!(
@@ -1690,6 +1734,8 @@ mod tests {
                 taker_account: TEST_ACCOUNT,
                 price: price(102),
                 quantity: qty(2),
+                maker_fee: 0,
+                taker_fee: 0,
             }
         );
 
@@ -1734,6 +1780,8 @@ mod tests {
                 taker_account: TEST_ACCOUNT,
                 price: price(100),
                 quantity: qty(10),
+                maker_fee: 0,
+                taker_fee: 0,
             }
         );
         assert!(book.is_empty());
@@ -1773,6 +1821,8 @@ mod tests {
                 taker_account: TEST_ACCOUNT,
                 price: price(100),
                 quantity: qty(3),
+                maker_fee: 0,
+                taker_fee: 0,
             }
         );
 
@@ -2031,6 +2081,7 @@ mod tests {
             reports[0],
             ExecutionReport::Cancelled {
                 order_id: OrderId(1),
+                account: TEST_ACCOUNT,
                 remaining_quantity: qty(10),
             }
         );

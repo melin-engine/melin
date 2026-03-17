@@ -635,6 +635,9 @@ impl MatchingStage {
                 self.exchange
                     .cancel_replace(symbol, order_id, new_price, new_quantity, reports);
             }
+            JournalEvent::SetFeeSchedule { symbol, schedule } => {
+                self.exchange.set_fee_schedule(symbol, schedule);
+            }
             JournalEvent::QueryStats => {
                 // Handled inline in the run loop before process_event is called.
                 // This arm exists only for exhaustiveness.

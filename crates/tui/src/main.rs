@@ -420,14 +420,24 @@ fn format_report(report: &ExecutionReport) -> String {
             taker_order_id,
             price,
             quantity,
+            maker_fee,
+            taker_fee,
             ..
-        } => format!(
-            "FILL    maker #{} / taker #{} @ {} x{}",
-            maker_order_id.0, taker_order_id.0, price.0, quantity.0,
-        ),
+        } => {
+            let fee_str = if *maker_fee > 0 || *taker_fee > 0 {
+                format!(" fees:m={maker_fee}/t={taker_fee}")
+            } else {
+                String::new()
+            };
+            format!(
+                "FILL    maker #{} / taker #{} @ {} x{}{}",
+                maker_order_id.0, taker_order_id.0, price.0, quantity.0, fee_str,
+            )
+        }
         ExecutionReport::Cancelled {
             order_id,
             remaining_quantity,
+            ..
         } => format!(
             "CANCEL  #{} (remaining: {})",
             order_id.0, remaining_quantity.0,
@@ -436,7 +446,9 @@ fn format_report(report: &ExecutionReport) -> String {
             order_id,
             trigger_price,
         } => format!("TRIGGER #{} @ {}", order_id.0, trigger_price.0),
-        ExecutionReport::Rejected { order_id, reason } => {
+        ExecutionReport::Rejected {
+            order_id, reason, ..
+        } => {
             let reason_str = match reason {
                 RejectReason::NoLiquidity => "no liquidity",
                 RejectReason::FOKCannotFill => "FOK cannot fill",

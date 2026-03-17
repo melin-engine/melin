@@ -218,14 +218,18 @@ fn response_from_bytes(data: &[u8]) -> Option<ResponseKind> {
                 taker_account,
                 price,
                 quantity,
+                maker_fee: 0,
+                taker_fee: 0,
             }))
         }
         2 => {
             // Cancelled.
             let order_id = OrderId(u64_at(data, 1)?);
-            let remaining = Quantity(nz64(data, 9)?);
+            let account = AccountId(u32_at(data, 9)?);
+            let remaining = Quantity(nz64(data, 13)?);
             Some(ResponseKind::Report(ExecutionReport::Cancelled {
                 order_id,
+                account,
                 remaining_quantity: remaining,
             }))
         }
@@ -240,11 +244,12 @@ fn response_from_bytes(data: &[u8]) -> Option<ResponseKind> {
         }
         4 => {
             // Rejected.
-            if data.len() < 10 {
+            if data.len() < 14 {
                 return None;
             }
             let order_id = OrderId(u64_at(data, 1)?);
-            let reason = match data[9] % 11 {
+            let account = AccountId(u32_at(data, 9)?);
+            let reason = match data[13] % 11 {
                 0 => RejectReason::NoLiquidity,
                 1 => RejectReason::FOKCannotFill,
                 2 => RejectReason::InsufficientBalance,
@@ -259,6 +264,7 @@ fn response_from_bytes(data: &[u8]) -> Option<ResponseKind> {
             };
             Some(ResponseKind::Report(ExecutionReport::Rejected {
                 order_id,
+                account,
                 reason,
             }))
         }

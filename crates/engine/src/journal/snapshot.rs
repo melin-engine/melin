@@ -30,8 +30,8 @@ use crate::account::{AccountManager, Balance};
 use crate::exchange::Exchange;
 use crate::orderbook::OrderBook;
 use crate::types::{
-    AccountId, CircuitBreakerConfig, CurrencyId, InstrumentSpec, OrderId, Price, Quantity,
-    RiskLimits, Side, Symbol,
+    AccountId, CircuitBreakerConfig, CurrencyId, FeeSchedule, InstrumentSpec, OrderId, Price,
+    Quantity, RiskLimits, Side, Symbol,
 };
 
 use super::error::JournalError;
@@ -52,7 +52,8 @@ const SNAP_MAGIC: u32 = 0x534E_4150;
 /// v3 → v4: added per-instrument RiskLimits for fat finger checks.
 /// v4 → v5: added per-instrument CircuitBreakerConfig for price bands + halts.
 /// v5 → v6: added chain_hash for BLAKE3 hash chain continuity across snapshots.
-const SNAP_VERSION: u16 = 6;
+/// v6 → v7: order_sides keyed by (AccountId, OrderId), added fee schedules.
+const SNAP_VERSION: u16 = 7;
 
 /// Snapshot header size: magic(4) + version(2) + reserved(2) + sequence(8) + chain_hash(32) = 48.
 const SNAP_HEADER_SIZE: usize = 48;
@@ -132,10 +133,10 @@ pub fn load(path: &Path) -> Result<(Exchange, u64, [u8; 32]), JournalError> {
     }
     let version = u16::from_le_bytes([buf[4], buf[5]]);
 
-    // v5 header is 16 bytes, v6 header is 48 bytes (adds 32-byte chain_hash).
-    let (header_size, is_v6) = match version {
+    // v5 header is 16 bytes, v6+ header is 48 bytes (adds 32-byte chain_hash).
+    let (header_size, has_chain_hash) = match version {
         5 => (16usize, false),
-        6 => (SNAP_HEADER_SIZE, true),
+        6 | 7 => (SNAP_HEADER_SIZE, true),
         _ => return Err(JournalError::UnsupportedVersion { version }),
     };
 
@@ -164,8 +165,8 @@ pub fn load(path: &Path) -> Result<(Exchange, u64, [u8; 32]), JournalError> {
         buf[8], buf[9], buf[10], buf[11], buf[12], buf[13], buf[14], buf[15],
     ]);
 
-    // Read chain_hash (v6) or default to zeros (v5).
-    let chain_hash = if is_v6 {
+    // Read chain_hash (v6+) or default to zeros (v5).
+    let chain_hash = if has_chain_hash {
         let mut h = [0u8; 32];
         h.copy_from_slice(&buf[16..48]);
         h
@@ -174,7 +175,7 @@ pub fn load(path: &Path) -> Result<(Exchange, u64, [u8; 32]), JournalError> {
     };
 
     // Decode exchange state.
-    let (_, state) = decode_exchange_state(&buf[header_size..data_len])?;
+    let (_, state) = decode_exchange_state(&buf[header_size..data_len], version)?;
     let exchange = Exchange::restore_state(state);
 
     Ok((exchange, sequence, chain_hash))
@@ -189,7 +190,7 @@ pub(crate) struct ExchangeSnapshot {
     pub(crate) instruments: Vec<InstrumentSpec>,
     pub(crate) balances: Vec<((AccountId, CurrencyId), Balance)>,
     pub(crate) reservations: Vec<(OrderId, AccountId, CurrencyId, u64)>,
-    pub(crate) order_sides: Vec<(OrderId, Side)>,
+    pub(crate) order_sides: Vec<((AccountId, OrderId), Side)>,
     pub(crate) books: Vec<(Symbol, BookSnapshot)>,
     /// Per-account OrderId high-water marks for client deduplication.
     pub(crate) max_order_id: Vec<(AccountId, u64)>,
@@ -197,6 +198,8 @@ pub(crate) struct ExchangeSnapshot {
     pub(crate) risk_limits: Vec<(Symbol, RiskLimits)>,
     /// Per-instrument circuit breaker configurations.
     pub(crate) circuit_breakers: Vec<(Symbol, CircuitBreakerConfig)>,
+    /// Per-instrument maker/taker fee schedules.
+    pub(crate) fee_schedules: Vec<(Symbol, FeeSchedule)>,
 }
 
 /// Serialized order book state for a single instrument.
@@ -265,9 +268,10 @@ fn encode_exchange_state(state: &ExchangeSnapshot, buf: &mut Vec<u8>) {
         le::push_u64(buf, *remaining);
     }
 
-    // Order sides.
+    // Order sides: (account_id, order_id, side) per entry.
     le::push_u32(buf, state.order_sides.len() as u32);
-    for (order_id, side) in &state.order_sides {
+    for ((account, order_id), side) in &state.order_sides {
+        le::push_u32(buf, account.0);
         le::push_u64(buf, order_id.0);
         buf.push(le::encode_side(*side));
     }
@@ -325,6 +329,14 @@ fn encode_exchange_state(state: &ExchangeSnapshot, buf: &mut Vec<u8>) {
             None => buf.push(0),
         }
         buf.push(u8::from(config.halted));
+    }
+
+    // Fee schedules.
+    le::push_u32(buf, state.fee_schedules.len() as u32);
+    for (symbol, schedule) in &state.fee_schedules {
+        le::push_u32(buf, symbol.0);
+        le::push_u16(buf, schedule.maker_fee_bps);
+        le::push_u16(buf, schedule.taker_fee_bps);
     }
 }
 
@@ -426,7 +438,10 @@ fn validate_count(remaining: usize, n: usize, item_size: usize) -> Result<(), Jo
     }
 }
 
-fn decode_exchange_state(buf: &[u8]) -> Result<(usize, ExchangeSnapshot), JournalError> {
+fn decode_exchange_state(
+    buf: &[u8],
+    version: u16,
+) -> Result<(usize, ExchangeSnapshot), JournalError> {
     let corrupt = |reason: &'static str| JournalError::CorruptEntry {
         sequence: 0,
         reason,
@@ -495,18 +510,35 @@ fn decode_exchange_state(buf: &[u8]) -> Result<(usize, ExchangeSnapshot), Journa
         pos += 24;
     }
 
-    // Order sides.
+    // Order sides: v7+ stores (account_id(4) + order_id(8) + side(1)) = 13 bytes.
+    // v5/v6 stores (order_id(8) + side(1)) = 9 bytes (no account in key).
     check(pos, 4)?;
     let n_order_sides = le::get_u32(&buf[pos..]) as usize;
     pos += 4;
-    validate_count(buf.len() - pos, n_order_sides, 9)?;
     let mut order_sides = Vec::with_capacity(n_order_sides);
-    for _ in 0..n_order_sides {
-        check(pos, 9)?;
-        let order_id = OrderId(le::get_u64(&buf[pos..]));
-        let side = le::decode_side(buf[pos + 8]).ok_or(corrupt("invalid side in snapshot"))?;
-        order_sides.push((order_id, side));
-        pos += 9;
+    if version >= 7 {
+        validate_count(buf.len() - pos, n_order_sides, 13)?;
+        for _ in 0..n_order_sides {
+            check(pos, 13)?;
+            let account = AccountId(le::get_u32(&buf[pos..]));
+            let order_id = OrderId(le::get_u64(&buf[pos + 4..]));
+            let side = le::decode_side(buf[pos + 12]).ok_or(corrupt("invalid side in snapshot"))?;
+            order_sides.push(((account, order_id), side));
+            pos += 13;
+        }
+    } else {
+        // v5/v6: order_id(8) + side(1) = 9 bytes. Account is unknown —
+        // use AccountId(0) as placeholder. This is lossy but allows loading
+        // old snapshots for migration. In practice, v6 snapshots will be
+        // re-saved as v7 on the next rotation.
+        validate_count(buf.len() - pos, n_order_sides, 9)?;
+        for _ in 0..n_order_sides {
+            check(pos, 9)?;
+            let order_id = OrderId(le::get_u64(&buf[pos..]));
+            let side = le::decode_side(buf[pos + 8]).ok_or(corrupt("invalid side in snapshot"))?;
+            order_sides.push(((AccountId(0), order_id), side));
+            pos += 9;
+        }
     }
 
     // Books.
@@ -645,6 +677,35 @@ fn decode_exchange_state(buf: &[u8]) -> Result<(usize, ExchangeSnapshot), Journa
         ));
     }
 
+    // Fee schedules: only in v7+ snapshots.
+    let fee_schedules = if version >= 7 && pos < buf.len() {
+        check(pos, 4)?;
+        let n_fee_schedules = le::get_u32(&buf[pos..]) as usize;
+        pos += 4;
+        // Each fee schedule: symbol(4) + maker_bps(2) + taker_bps(2) = 8 bytes.
+        validate_count(buf.len() - pos, n_fee_schedules, 8)?;
+        let mut schedules = Vec::with_capacity(n_fee_schedules);
+        for _ in 0..n_fee_schedules {
+            check(pos, 8)?;
+            let symbol = Symbol(le::get_u32(&buf[pos..]));
+            pos += 4;
+            let maker_fee_bps = le::get_u16(&buf[pos..]);
+            pos += 2;
+            let taker_fee_bps = le::get_u16(&buf[pos..]);
+            pos += 2;
+            schedules.push((
+                symbol,
+                FeeSchedule {
+                    maker_fee_bps,
+                    taker_fee_bps,
+                },
+            ));
+        }
+        schedules
+    } else {
+        Vec::new()
+    };
+
     Ok((
         pos,
         ExchangeSnapshot {
@@ -656,6 +717,7 @@ fn decode_exchange_state(buf: &[u8]) -> Result<(usize, ExchangeSnapshot), Journa
             max_order_id,
             risk_limits,
             circuit_breakers,
+            fee_schedules,
         },
     ))
 }
@@ -925,7 +987,7 @@ impl Exchange {
         let instruments: Vec<InstrumentSpec> = self.instruments().values().copied().collect();
         let balances = self.accounts().snapshot_balances();
         let reservations = self.accounts().snapshot_reservations();
-        let order_sides: Vec<(OrderId, Side)> = self.snapshot_order_sides();
+        let order_sides: Vec<((AccountId, OrderId), Side)> = self.snapshot_order_sides();
 
         let books: Vec<(Symbol, BookSnapshot)> = self
             .books()
@@ -936,6 +998,7 @@ impl Exchange {
         let max_order_id = self.snapshot_max_order_id();
         let risk_limits = self.snapshot_risk_limits();
         let circuit_breakers = self.snapshot_circuit_breakers();
+        let fee_schedules = self.snapshot_fee_schedules();
 
         ExchangeSnapshot {
             instruments,
@@ -946,6 +1009,7 @@ impl Exchange {
             max_order_id,
             risk_limits,
             circuit_breakers,
+            fee_schedules,
         }
     }
 
@@ -968,10 +1032,12 @@ impl Exchange {
         }
 
         let accounts = AccountManager::from_parts(state.balances, state.reservations);
-        let order_sides: HashMap<OrderId, Side> = state.order_sides.into_iter().collect();
+        let order_sides: HashMap<(AccountId, OrderId), Side> =
+            state.order_sides.into_iter().collect();
         let risk_limits: HashMap<Symbol, RiskLimits> = state.risk_limits.into_iter().collect();
         let circuit_breakers: HashMap<Symbol, CircuitBreakerConfig> =
             state.circuit_breakers.into_iter().collect();
+        let fee_schedules: HashMap<Symbol, FeeSchedule> = state.fee_schedules.into_iter().collect();
         let max_order_id: HashMap<AccountId, u64> = state.max_order_id.into_iter().collect();
 
         Self::from_parts(
@@ -981,6 +1047,7 @@ impl Exchange {
             order_sides,
             risk_limits,
             circuit_breakers,
+            fee_schedules,
             max_order_id,
         )
     }

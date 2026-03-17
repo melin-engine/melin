@@ -21,8 +21,8 @@ use std::num::NonZeroU64;
 
 use trading_engine::le;
 use trading_engine::types::{
-    AccountId, CircuitBreakerConfig, CurrencyId, ExecutionReport, InstrumentSpec, Order, OrderId,
-    OrderType, Price, Quantity, RejectReason, RiskLimits, Symbol,
+    AccountId, CircuitBreakerConfig, CurrencyId, ExecutionReport, FeeSchedule, InstrumentSpec,
+    Order, OrderId, OrderType, Price, Quantity, RejectReason, RiskLimits, Symbol,
 };
 
 use crate::error::ProtocolError;
@@ -39,6 +39,7 @@ const TAG_DEPOSIT: u8 = 7;
 const TAG_SET_RISK_LIMITS: u8 = 8;
 const TAG_SET_CIRCUIT_BREAKER: u8 = 9;
 const TAG_CANCEL_REPLACE: u8 = 10;
+const TAG_SET_FEE_SCHEDULE: u8 = 31;
 const TAG_QUERY_STATS: u8 = 30;
 
 // --- Response tags ---
@@ -200,6 +201,16 @@ pub fn encode_request(request: &Request, buf: &mut [u8]) -> Result<usize, Protoc
             pos += 8;
             le::put_u64(&mut buf[pos..], new_quantity.get());
             pos += 8;
+        }
+        Request::SetFeeSchedule { symbol, schedule } => {
+            buf[pos] = TAG_SET_FEE_SCHEDULE;
+            pos += 1;
+            le::put_u32(&mut buf[pos..], symbol.0);
+            pos += 4;
+            le::put_u16(&mut buf[pos..], schedule.maker_fee_bps);
+            pos += 2;
+            le::put_u16(&mut buf[pos..], schedule.taker_fee_bps);
+            pos += 2;
         }
         Request::QueryStats => {
             buf[pos] = TAG_QUERY_STATS;
@@ -388,6 +399,22 @@ pub fn decode_request(buf: &[u8]) -> Result<Request, ProtocolError> {
             })
         }
         TAG_QUERY_STATS => Ok(Request::QueryStats),
+        TAG_SET_FEE_SCHEDULE => {
+            // symbol(4) + maker_fee_bps(2) + taker_fee_bps(2) = 8
+            if payload.len() < 8 {
+                return Err(ProtocolError::Truncated);
+            }
+            let symbol = Symbol(le::get_u32(&payload[0..]));
+            let maker_fee_bps = le::get_u16(&payload[4..]);
+            let taker_fee_bps = le::get_u16(&payload[6..]);
+            Ok(Request::SetFeeSchedule {
+                symbol,
+                schedule: FeeSchedule {
+                    maker_fee_bps,
+                    taker_fee_bps,
+                },
+            })
+        }
         _ => Err(ProtocolError::UnknownTag(tag)),
     }
 }
@@ -669,6 +696,8 @@ fn encode_execution_report(report: &ExecutionReport, buf: &mut [u8]) -> usize {
             taker_account,
             price,
             quantity,
+            maker_fee,
+            taker_fee,
         } => {
             buf[pos] = TAG_FILL;
             pos += 1;
@@ -684,15 +713,22 @@ fn encode_execution_report(report: &ExecutionReport, buf: &mut [u8]) -> usize {
             pos += 8;
             le::put_u64(&mut buf[pos..], quantity.get());
             pos += 8;
+            le::put_u64(&mut buf[pos..], *maker_fee);
+            pos += 8;
+            le::put_u64(&mut buf[pos..], *taker_fee);
+            pos += 8;
         }
         ExecutionReport::Cancelled {
             order_id,
+            account,
             remaining_quantity,
         } => {
             buf[pos] = TAG_CANCELLED;
             pos += 1;
             le::put_u64(&mut buf[pos..], order_id.0);
             pos += 8;
+            le::put_u32(&mut buf[pos..], account.0);
+            pos += 4;
             le::put_u64(&mut buf[pos..], remaining_quantity.get());
             pos += 8;
         }
@@ -707,11 +743,17 @@ fn encode_execution_report(report: &ExecutionReport, buf: &mut [u8]) -> usize {
             le::put_u64(&mut buf[pos..], trigger_price.get());
             pos += 8;
         }
-        ExecutionReport::Rejected { order_id, reason } => {
+        ExecutionReport::Rejected {
+            order_id,
+            account,
+            reason,
+        } => {
             buf[pos] = TAG_REJECTED;
             pos += 1;
             le::put_u64(&mut buf[pos..], order_id.0);
             pos += 8;
+            le::put_u32(&mut buf[pos..], account.0);
+            pos += 4;
             buf[pos] = encode_reject_reason(*reason);
             pos += 1;
         }
@@ -764,7 +806,7 @@ fn decode_execution_report(tag: u8, payload: &[u8]) -> Result<ExecutionReport, P
             })
         }
         TAG_FILL => {
-            if payload.len() < 40 {
+            if payload.len() < 56 {
                 return Err(ProtocolError::Truncated);
             }
             let maker_order_id = OrderId(le::get_u64(&payload[0..]));
@@ -775,6 +817,8 @@ fn decode_execution_report(tag: u8, payload: &[u8]) -> Result<ExecutionReport, P
                 .ok_or(ProtocolError::InvalidField("fill price is zero"))?;
             let quantity = NonZeroU64::new(le::get_u64(&payload[32..]))
                 .ok_or(ProtocolError::InvalidField("fill quantity is zero"))?;
+            let maker_fee = le::get_u64(&payload[40..]);
+            let taker_fee = le::get_u64(&payload[48..]);
             Ok(ExecutionReport::Fill {
                 maker_order_id,
                 taker_order_id,
@@ -782,17 +826,22 @@ fn decode_execution_report(tag: u8, payload: &[u8]) -> Result<ExecutionReport, P
                 taker_account,
                 price: Price(price),
                 quantity: Quantity(quantity),
+                maker_fee,
+                taker_fee,
             })
         }
         TAG_CANCELLED => {
-            if payload.len() < 16 {
+            // order_id(8) + account(4) + remaining(8) = 20
+            if payload.len() < 20 {
                 return Err(ProtocolError::Truncated);
             }
             let order_id = OrderId(le::get_u64(&payload[0..]));
-            let remaining = NonZeroU64::new(le::get_u64(&payload[8..]))
+            let account = AccountId(le::get_u32(&payload[8..]));
+            let remaining = NonZeroU64::new(le::get_u64(&payload[12..]))
                 .ok_or(ProtocolError::InvalidField("cancelled remaining is zero"))?;
             Ok(ExecutionReport::Cancelled {
                 order_id,
+                account,
                 remaining_quantity: Quantity(remaining),
             })
         }
@@ -809,12 +858,18 @@ fn decode_execution_report(tag: u8, payload: &[u8]) -> Result<ExecutionReport, P
             })
         }
         TAG_REJECTED => {
-            if payload.len() < 9 {
+            // order_id(8) + account(4) + reason(1) = 13
+            if payload.len() < 13 {
                 return Err(ProtocolError::Truncated);
             }
             let order_id = OrderId(le::get_u64(&payload[0..]));
-            let reason = decode_reject_reason(payload[8])?;
-            Ok(ExecutionReport::Rejected { order_id, reason })
+            let account = AccountId(le::get_u32(&payload[8..]));
+            let reason = decode_reject_reason(payload[12])?;
+            Ok(ExecutionReport::Rejected {
+                order_id,
+                account,
+                reason,
+            })
         }
         TAG_REPLACED => {
             // order_id(8) + side(1) + old_price(8) + new_price(8) + old_remaining(8) + new_remaining(8) = 41
@@ -1023,6 +1078,13 @@ mod tests {
                 new_price: Price(nz(5500)),
                 new_quantity: Quantity(nz(30)),
             },
+            Request::SetFeeSchedule {
+                symbol: Symbol(1),
+                schedule: FeeSchedule {
+                    maker_fee_bps: 5,
+                    taker_fee_bps: 10,
+                },
+            },
             Request::QueryStats,
         ]
     }
@@ -1042,9 +1104,12 @@ mod tests {
                 taker_account: AccountId(20),
                 price: Price(nz(100)),
                 quantity: Quantity(nz(10)),
+                maker_fee: 5,
+                taker_fee: 10,
             }),
             ResponseKind::Report(ExecutionReport::Cancelled {
                 order_id: OrderId(3),
+                account: AccountId(10),
                 remaining_quantity: Quantity(nz(5)),
             }),
             ResponseKind::Report(ExecutionReport::Triggered {
@@ -1053,54 +1118,67 @@ mod tests {
             }),
             ResponseKind::Report(ExecutionReport::Rejected {
                 order_id: OrderId(5),
+                account: AccountId(10),
                 reason: RejectReason::NoLiquidity,
             }),
             ResponseKind::Report(ExecutionReport::Rejected {
                 order_id: OrderId(6),
+                account: AccountId(10),
                 reason: RejectReason::FOKCannotFill,
             }),
             ResponseKind::Report(ExecutionReport::Rejected {
                 order_id: OrderId(7),
+                account: AccountId(10),
                 reason: RejectReason::InsufficientBalance,
             }),
             ResponseKind::Report(ExecutionReport::Rejected {
                 order_id: OrderId(8),
+                account: AccountId(10),
                 reason: RejectReason::UnknownAccount,
             }),
             ResponseKind::Report(ExecutionReport::Rejected {
                 order_id: OrderId(9),
+                account: AccountId(10),
                 reason: RejectReason::UnknownSymbol,
             }),
             ResponseKind::Report(ExecutionReport::Rejected {
                 order_id: OrderId(10),
+                account: AccountId(10),
                 reason: RejectReason::SelfTradePrevented,
             }),
             ResponseKind::Report(ExecutionReport::Rejected {
                 order_id: OrderId(11),
+                account: AccountId(10),
                 reason: RejectReason::DuplicateOrderId,
             }),
             ResponseKind::Report(ExecutionReport::Rejected {
                 order_id: OrderId(12),
+                account: AccountId(10),
                 reason: RejectReason::ExceedsMaxOrderQty,
             }),
             ResponseKind::Report(ExecutionReport::Rejected {
                 order_id: OrderId(13),
+                account: AccountId(10),
                 reason: RejectReason::ExceedsMaxNotional,
             }),
             ResponseKind::Report(ExecutionReport::Rejected {
                 order_id: OrderId(14),
+                account: AccountId(10),
                 reason: RejectReason::TradingHalted,
             }),
             ResponseKind::Report(ExecutionReport::Rejected {
                 order_id: OrderId(15),
+                account: AccountId(10),
                 reason: RejectReason::OutsidePriceBand,
             }),
             ResponseKind::Report(ExecutionReport::Rejected {
                 order_id: OrderId(16),
+                account: AccountId(10),
                 reason: RejectReason::UnknownOrder,
             }),
             ResponseKind::Report(ExecutionReport::Rejected {
                 order_id: OrderId(17),
+                account: AccountId(10),
                 reason: RejectReason::PriceWouldCross,
             }),
             ResponseKind::Report(ExecutionReport::Replaced {
