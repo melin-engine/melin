@@ -106,7 +106,7 @@ Checklist of features expected of a production trade execution engine. Items mar
 - [x] BLAKE3 hash chain with periodic checkpoints (tamper evidence, replica consistency verification)
 - [ ] Output event log (durable ExecutionReport stream for audit trail)
 
-### Networking
+### Networking ([docs/wire-protocol.md](docs/wire-protocol.md))
 - [x] Custom binary wire protocol (length-prefixed framing)
 - [x] TCP transport with `TCP_NODELAY`
 - [x] Unix domain socket transport
@@ -128,12 +128,12 @@ Checklist of features expected of a production trade execution engine. Items mar
 - [ ] Reference data management (instrument lifecycle)
 - [ ] Rate limiting and connection management (per-client throttling)
 
-### Authentication & Authorization
+### Authentication & Authorization ([docs/admin-guide.md](docs/admin-guide.md))
 - [x] Client authentication (Ed25519 challenge-response handshake)
 - [ ] Per-account trading permissions
 - [x] Admin API (instrument management, deposits, circuit breaker controls, kill switch, risk limits, fee schedules, cancel-replace, live stats dashboard)
 
-### Operations & Reliability
+### Operations & Reliability ([docs/operations.md](docs/operations.md))
 - [x] Structured logging (`tracing` crate, error-level for server malfunctions only)
 - [x] Per-stage pipeline latency tracing (`latency-trace` feature gate)
 - [x] Configuration management (CLI args for bind address, journal path, core affinity, reader threads)
