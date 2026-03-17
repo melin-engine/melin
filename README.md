@@ -48,7 +48,7 @@ A matching engine built on the [LMAX architecture](https://martinfowler.com/arti
 - **LMAX-style disruptor pipeline** — 3 OS threads (journal, matching, response) on lock-free ring buffers; lock-free CAS-based multi-producer from reader pool; journal and matching run in parallel on the same events
 - **Persist-before-ack** — pipelined journal I/O with full durability guarantee; matching latency overlapped against journal writes, acknowledgement gated on confirmed durability, not optimistically sent
 - **Batch sync amortization** — under load, one sync covers many events; `pwritev2` with `RWF_DSYNC` (Force Unit Access) combines write + durability in a single syscall; `posix_fallocate` pre-allocates 64 MiB chunks so sync only flushes data pages, not extent metadata
-- **Event sourcing** — deterministic replay for crash recovery and audit; snapshots for fast restart
+- **Event sourcing** — deterministic replay for crash recovery and audit; snapshots for fast restart; BLAKE3 hash chain for tamper evidence
 - **Mechanical sympathy** — cache-line-padded sequences, fixed-point pricing (no floats), pre-allocated buffers with no per-order allocations on the hot path
 
 ## Features
@@ -74,16 +74,16 @@ Checklist of features expected of a production trade execution engine. Items mar
 
 ### Matching Engine
 - [x] Strict price-time priority (BTreeMap + VecDeque order book)
-- [x] Execution reports: Fill, Placed, Triggered, Cancelled, Rejected
+- [x] Execution reports: Fill (with fees), Placed, Triggered, Cancelled, Rejected, Replaced
 - [x] Multi-instrument exchange with shared account balances
-- [ ] Cancel-replace / order amendment (atomic modify without losing queue priority for unchanged price)
+- [x] Cancel-replace / order amendment (atomic price/qty modify; preserves queue priority when price unchanged, loses priority on price change)
 - [x] Circuit breakers (price bands, trading halts — per-instrument `CircuitBreakerConfig`)
 - [ ] Auction mechanisms (opening/closing/volatility auctions)
 
 ### Fees
-- [ ] Maker/taker fee model (configurable per instrument or tier)
-- [ ] Fee deduction on fill (deduct from proceeds, include in ExecutionReport)
-- [ ] Fee schedules (volume-based tiers, account-level overrides)
+- [x] Maker/taker fee model (per-instrument `FeeSchedule` in basis points, configurable via admin API)
+- [x] Fee deduction on fill (fees in quote currency, deducted from buyer reservation and seller proceeds, reported in `ExecutionReport::Fill`)
+- [ ] Tiered fee schedules (volume-based tiers, account-level overrides)
 
 ### Risk & Accounting
 - [x] Per-account, per-currency balance management (reserve on order, update on fill, release on cancel)
@@ -102,8 +102,8 @@ Checklist of features expected of a production trade execution engine. Items mar
 - [x] Snapshot save/load for fast recovery
 - [x] Deterministic replay from journal
 - [x] Pipelined io_uring async fsync with group commit
-- [ ] Journal rotation
-- [ ] Journal compaction (automatic snapshot trigger)
+- [x] Journal rotation (automatic snapshot + archive when size threshold exceeded at startup)
+- [x] BLAKE3 hash chain with periodic checkpoints (tamper evidence, replica consistency verification)
 - [ ] Output event log (durable ExecutionReport stream for audit trail)
 
 ### Networking
@@ -131,7 +131,7 @@ Checklist of features expected of a production trade execution engine. Items mar
 ### Authentication & Authorization
 - [x] Client authentication (Ed25519 challenge-response handshake)
 - [ ] Per-account trading permissions
-- [x] Admin API (instrument management, deposits, circuit breaker controls, kill switch, risk limits)
+- [x] Admin API (instrument management, deposits, circuit breaker controls, kill switch, risk limits, fee schedules, cancel-replace, live stats dashboard)
 
 ### Operations & Reliability
 - [x] Structured logging (`tracing` crate, error-level for server malfunctions only)
@@ -146,8 +146,8 @@ Most analytics can run on a **replica** replaying the journal, keeping the prima
 
 #### Primary node (lightweight, operational health)
 - [x] Pipeline stage utilization (`pipeline-stats` feature gate — busy/idle ratio per stage)
-- [ ] Metrics transport (decide where/how to expose: stats file, output event channel, Prometheus endpoint, or admin socket — must not touch the hot path)
-- [ ] Connection counts (active clients, connects/disconnects per second)
+- [x] Admin TUI observability dashboard (live connection count, events processed, throughput, journal sequence — polled via `QueryStats` through the pipeline)
+- [ ] Metrics transport (Prometheus endpoint or stats file — must not touch the hot path)
 - [ ] Disruptor queue depth / backpressure monitoring (input ring fill level)
 - [ ] Health/liveness endpoint (beyond current `ServerReady` handshake)
 
@@ -180,7 +180,7 @@ Ordered by importance for commercial readiness (exchange operators and investors
 2. ~~**Cancel-replace / order amendment**~~ ✅ — atomic price/qty amendment with reservation delta, time priority rules, price-would-cross rejection.
 3. **Replication & HA** — journal streaming to a replica, deterministic replay, failover. No exchange runs a single node.
 4. ~~**Fuzz testing**~~ ✅ — proptest coverage extended to all order types, STP modes, circuit breakers, stops. Found and fixed a reservation leak on price-improved fills.
-5. ~~**Journal rotation + compaction**~~ ✅ — automatic snapshot + journal archiving at startup when size threshold exceeded. Documented recovery scenarios for every crash timing.
+5. ~~**Journal rotation + integrity**~~ ✅ — automatic snapshot + journal archiving at startup when size threshold exceeded. BLAKE3 hash chain with periodic checkpoints for tamper evidence and replica consistency. Documented recovery scenarios for every crash timing.
 6. ~~**Authentication**~~ ✅ — Ed25519 challenge-response. Admin API for instrument/deposit/risk/circuit-breaker management.
 7. ~~**TLS**~~ (deferred) — not needed for VLAN deployments. Ed25519 challenge-response provides identity without encryption overhead on the hot path.
 8. **Metrics & observability** — connection counts, queue depth, health endpoints. Operators need visibility.
@@ -216,7 +216,7 @@ crates/
 ├── engine/        Matching engine, order books, event sourcing, journal pipeline
 ├── protocol/      Binary wire protocol, transport abstractions, blocking I/O
 ├── server/        Server, pipeline orchestration, dedicated I/O threads
-├── admin/         CLI admin tool (instrument management, deposits, circuit breakers)
+├── admin/         CLI admin tool (instruments, deposits, fees, risk, circuit breakers, live dashboard)
 ├── bench/         Benchmark suite (engine, pipeline, and full round-trip modes)
 ├── client/        Typed client library
 └── tui/           Terminal UI for interactive testing
