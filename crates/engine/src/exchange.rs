@@ -17,30 +17,33 @@ use crate::types::{
     Order, OrderId, OrderType, Price, Quantity, RejectReason, RiskLimits, Side, Symbol,
 };
 
+/// All per-instrument state in one struct for cache-friendly single-lookup
+/// access. On every order the engine does one HashMap lookup instead of 5,
+/// turning 5 potential cache misses into 1.
+pub(crate) struct InstrumentState {
+    pub(crate) spec: InstrumentSpec,
+    pub(crate) book: OrderBook,
+    pub(crate) risk_limits: RiskLimits,
+    pub(crate) circuit_breaker: CircuitBreakerConfig,
+    pub(crate) fee_schedule: FeeSchedule,
+}
+
 /// Top-level exchange managing multiple instruments.
 pub struct Exchange {
-    /// HashMap for symbol → order book dispatch. O(1) amortized lookup.
+    /// HashMap for symbol → consolidated instrument state. O(1) amortized
+    /// lookup. One lookup gives access to the book, spec, risk limits,
+    /// circuit breaker config, and fee schedule — all in one cache-friendly
+    /// struct.
     // TODO: If profiling shows hashing overhead on the hot path, consider
-    // replacing with a pre-allocated `OrderBook` array indexed by
-    // Symbol(u32), giving true O(1) dispatch with no hashing.
-    books: HashMap<Symbol, OrderBook>,
-    /// Instrument specifications mapping symbols to their currency pairs.
-    instruments: HashMap<Symbol, InstrumentSpec>,
+    // replacing with a pre-allocated array indexed by Symbol(u32), giving
+    // true O(1) dispatch with no hashing.
+    instruments: HashMap<Symbol, InstrumentState>,
     /// Shared account balance manager across all instruments.
     accounts: AccountManager,
     /// Tracks order side by (account, order_id) so fills can determine
     /// buyer/seller. Keyed by the pair because different accounts can
     /// independently use the same OrderId.
     order_sides: HashMap<(AccountId, OrderId), Side>,
-    /// Per-instrument fat finger limits. Checked in `execute()` before
-    /// balance reservation. HashMap for O(1) lookup by Symbol(u32).
-    risk_limits: HashMap<Symbol, RiskLimits>,
-    /// Per-instrument circuit breaker configuration. Checked in `execute()`
-    /// after dedup and before fat finger checks. HashMap for O(1) lookup.
-    circuit_breakers: HashMap<Symbol, CircuitBreakerConfig>,
-    /// Per-instrument maker/taker fee schedule. Applied to fill proceeds
-    /// after matching, before balance updates. HashMap for O(1) lookup.
-    fee_schedules: HashMap<Symbol, FeeSchedule>,
     /// Per-account high-water mark for order IDs. Rejects submissions
     /// with `order_id <= max_seen[account]` to prevent duplicate execution
     /// on crash-recovery retry. HashMap for O(1) lookup keyed on
@@ -57,13 +60,9 @@ pub struct Exchange {
 impl Exchange {
     pub fn new() -> Self {
         Self {
-            books: HashMap::new(),
             instruments: HashMap::new(),
             accounts: AccountManager::new(),
             order_sides: HashMap::new(),
-            risk_limits: HashMap::new(),
-            circuit_breakers: HashMap::new(),
-            fee_schedules: HashMap::new(),
             max_order_id: HashMap::new(),
             consumed_buf: Vec::new(),
             presized: false,
@@ -75,13 +74,9 @@ impl Exchange {
     /// RAM is cheap; tail latency is not.
     pub fn with_capacity() -> Self {
         Self {
-            books: HashMap::with_capacity(64),
             instruments: HashMap::with_capacity(64),
             accounts: AccountManager::with_capacity(),
             order_sides: HashMap::with_capacity(2_000_000),
-            risk_limits: HashMap::with_capacity(64),
-            circuit_breakers: HashMap::with_capacity(64),
-            fee_schedules: HashMap::with_capacity(64),
             max_order_id: HashMap::with_capacity(10_000),
             consumed_buf: Vec::with_capacity(256),
             presized: true,
@@ -90,37 +85,31 @@ impl Exchange {
 
     /// Reconstruct from pre-built parts (used by snapshot restore).
     pub(crate) fn from_parts(
-        books: HashMap<Symbol, OrderBook>,
-        instruments: HashMap<Symbol, InstrumentSpec>,
+        instruments: HashMap<Symbol, InstrumentState>,
         accounts: AccountManager,
         order_sides: HashMap<(AccountId, OrderId), Side>,
-        risk_limits: HashMap<Symbol, RiskLimits>,
-        circuit_breakers: HashMap<Symbol, CircuitBreakerConfig>,
-        fee_schedules: HashMap<Symbol, FeeSchedule>,
         max_order_id: HashMap<AccountId, u64>,
     ) -> Self {
         Self {
-            books,
             instruments,
             accounts,
             order_sides,
-            risk_limits,
-            circuit_breakers,
-            fee_schedules,
             max_order_id,
             consumed_buf: Vec::new(),
             presized: false,
         }
     }
 
-    /// Access instrument specifications (for snapshot serialization).
-    pub(crate) fn instruments(&self) -> &HashMap<Symbol, InstrumentSpec> {
-        &self.instruments
+    /// Iterate over instrument specs (for snapshot serialization).
+    pub(crate) fn instrument_specs(&self) -> impl Iterator<Item = &InstrumentSpec> {
+        self.instruments.values().map(|inst| &inst.spec)
     }
 
-    /// Access order books (for snapshot serialization).
-    pub(crate) fn books(&self) -> &HashMap<Symbol, OrderBook> {
-        &self.books
+    /// Iterate over (symbol, book) pairs (for snapshot serialization and proptests).
+    pub(crate) fn books(&self) -> impl Iterator<Item = (Symbol, &OrderBook)> {
+        self.instruments
+            .iter()
+            .map(|(&sym, inst)| (sym, &inst.book))
     }
 
     /// Snapshot the order-side map as a Vec for serialization.
@@ -139,42 +128,51 @@ impl Exchange {
             .collect()
     }
 
-    /// Set fat finger risk limits for an instrument.
+    /// Set fat finger risk limits for an instrument. No-op if the
+    /// instrument doesn't exist (matches previous behavior).
     pub fn set_risk_limits(&mut self, symbol: Symbol, limits: RiskLimits) {
-        self.risk_limits.insert(symbol, limits);
+        if let Some(inst) = self.instruments.get_mut(&symbol) {
+            inst.risk_limits = limits;
+        }
     }
 
     /// Snapshot the per-instrument risk limits for serialization.
     pub(crate) fn snapshot_risk_limits(&self) -> Vec<(Symbol, RiskLimits)> {
-        self.risk_limits
+        self.instruments
             .iter()
-            .map(|(&symbol, &limits)| (symbol, limits))
+            .map(|(&symbol, inst)| (symbol, inst.risk_limits))
             .collect()
     }
 
-    /// Set circuit breaker configuration for an instrument.
+    /// Set circuit breaker configuration for an instrument. No-op if the
+    /// instrument doesn't exist (matches previous behavior).
     pub fn set_circuit_breaker(&mut self, symbol: Symbol, config: CircuitBreakerConfig) {
-        self.circuit_breakers.insert(symbol, config);
+        if let Some(inst) = self.instruments.get_mut(&symbol) {
+            inst.circuit_breaker = config;
+        }
     }
 
-    /// Set the maker/taker fee schedule for an instrument.
+    /// Set the maker/taker fee schedule for an instrument. No-op if the
+    /// instrument doesn't exist (matches previous behavior).
     pub fn set_fee_schedule(&mut self, symbol: Symbol, schedule: FeeSchedule) {
-        self.fee_schedules.insert(symbol, schedule);
+        if let Some(inst) = self.instruments.get_mut(&symbol) {
+            inst.fee_schedule = schedule;
+        }
     }
 
     /// Snapshot the fee schedules for serialization.
     pub(crate) fn snapshot_fee_schedules(&self) -> Vec<(Symbol, FeeSchedule)> {
-        self.fee_schedules
+        self.instruments
             .iter()
-            .map(|(&symbol, &schedule)| (symbol, schedule))
+            .map(|(&symbol, inst)| (symbol, inst.fee_schedule))
             .collect()
     }
 
     /// Snapshot the per-instrument circuit breaker configs for serialization.
     pub(crate) fn snapshot_circuit_breakers(&self) -> Vec<(Symbol, CircuitBreakerConfig)> {
-        self.circuit_breakers
+        self.instruments
             .iter()
-            .map(|(&symbol, &config)| (symbol, config))
+            .map(|(&symbol, inst)| (symbol, inst.circuit_breaker))
             .collect()
     }
 
@@ -202,22 +200,28 @@ impl Exchange {
 
         self.accounts.prefault();
 
-        for book in self.books.values_mut() {
-            book.prefault();
+        for inst in self.instruments.values_mut() {
+            inst.book.prefault();
         }
     }
 
     /// Register a new instrument with its currency pair specification.
     pub fn add_instrument(&mut self, spec: InstrumentSpec) {
         let presized = self.presized;
-        self.books.entry(spec.symbol).or_insert_with(|| {
-            if presized {
+        self.instruments.entry(spec.symbol).or_insert_with(|| {
+            let book = if presized {
                 OrderBook::with_capacity()
             } else {
                 OrderBook::new()
+            };
+            InstrumentState {
+                spec,
+                book,
+                risk_limits: RiskLimits::default(),
+                circuit_breaker: CircuitBreakerConfig::default(),
+                fee_schedule: FeeSchedule::default(),
             }
         });
-        self.instruments.insert(spec.symbol, spec);
     }
 
     /// Deposit funds into an account.
@@ -235,7 +239,7 @@ impl Exchange {
     /// Validates the instrument exists, reserves funds, then executes.
     /// On fill, balances are updated. On reject/cancel, reserves are released.
     pub fn execute(&mut self, symbol: Symbol, order: Order, reports: &mut Vec<ExecutionReport>) {
-        let Some(spec) = self.instruments.get(&symbol).copied() else {
+        let Some(inst) = self.instruments.get(&symbol) else {
             reports.push(ExecutionReport::Rejected {
                 order_id: order.id,
                 account: order.account,
@@ -243,6 +247,9 @@ impl Exchange {
             });
             return;
         };
+        // Copy spec before taking mutable borrow on instruments below.
+        // InstrumentSpec is Copy (3 × u32 = 12 bytes).
+        let spec = inst.spec;
 
         // Dedup: reject if this account already submitted an order with
         // the same or higher ID. Prevents duplicate execution on
@@ -262,84 +269,89 @@ impl Exchange {
         }
         *hwm = order.id.0;
 
+        // Re-lookup for the remaining checks (immutable borrows above
+        // ended; we need a fresh reference after max_order_id borrow).
+        let inst = self
+            .instruments
+            .get(&symbol)
+            .expect("instrument verified to exist above");
+
         // Circuit breaker checks: trading halt rejects all orders; price
         // bands reject limit/stop-limit orders outside [lower, upper].
-        // Single bool check (~1ns) + HashMap lookup + 2 comparisons (~3-5ns).
-        if let Some(cb) = self.circuit_breakers.get(&symbol) {
-            if cb.halted {
+        // No HashMap lookup — circuit breaker is in the same struct.
+        let cb = &inst.circuit_breaker;
+        if cb.halted {
+            reports.push(ExecutionReport::Rejected {
+                order_id: order.id,
+                account: order.account,
+                reason: RejectReason::TradingHalted,
+            });
+            return;
+        }
+        // Price band check applies only to orders with a known price.
+        // Market and Stop orders have no submission-time price and
+        // bypass bands by design (SEC-12). A large market order can
+        // fill far outside the intended bands. Mitigation: use the
+        // trading halt flag, or implement automatic volatility halts
+        // (Phase 3 of the circuit breaker plan).
+        let limit_price = match order.order_type {
+            OrderType::Limit { price } => Some(price),
+            OrderType::StopLimit { limit_price, .. } => Some(limit_price),
+            OrderType::Market | OrderType::Stop { .. } => None,
+        };
+        if let Some(price) = limit_price {
+            if let Some(lower) = cb.price_band_lower
+                && price < lower
+            {
                 reports.push(ExecutionReport::Rejected {
                     order_id: order.id,
                     account: order.account,
-                    reason: RejectReason::TradingHalted,
+                    reason: RejectReason::OutsidePriceBand,
                 });
                 return;
             }
-            // Price band check applies only to orders with a known price.
-            // Market and Stop orders have no submission-time price and
-            // bypass bands by design (SEC-12). A large market order can
-            // fill far outside the intended bands. Mitigation: use the
-            // trading halt flag, or implement automatic volatility halts
-            // (Phase 3 of the circuit breaker plan).
+            if let Some(upper) = cb.price_band_upper
+                && price > upper
+            {
+                reports.push(ExecutionReport::Rejected {
+                    order_id: order.id,
+                    account: order.account,
+                    reason: RejectReason::OutsidePriceBand,
+                });
+                return;
+            }
+        }
+
+        // Fat finger checks: reject orders exceeding per-instrument limits.
+        let limits = &inst.risk_limits;
+        if let Some(max_qty) = limits.max_order_qty
+            && order.quantity.get() > max_qty.get()
+        {
+            reports.push(ExecutionReport::Rejected {
+                order_id: order.id,
+                account: order.account,
+                reason: RejectReason::ExceedsMaxOrderQty,
+            });
+            return;
+        }
+        if let Some(max_notional) = limits.max_order_notional {
+            // Notional check applies only to orders with a known price.
+            // Market and Stop orders have no submission-time price.
+            // StopLimit uses limit_price (worst-case resting price).
             let limit_price = match order.order_type {
                 OrderType::Limit { price } => Some(price),
                 OrderType::StopLimit { limit_price, .. } => Some(limit_price),
                 OrderType::Market | OrderType::Stop { .. } => None,
             };
             if let Some(price) = limit_price {
-                if let Some(lower) = cb.price_band_lower
-                    && price < lower
-                {
+                let notional = price.get() as u128 * order.quantity.get() as u128;
+                if notional > max_notional as u128 {
                     reports.push(ExecutionReport::Rejected {
                         order_id: order.id,
                         account: order.account,
-                        reason: RejectReason::OutsidePriceBand,
+                        reason: RejectReason::ExceedsMaxNotional,
                     });
                     return;
-                }
-                if let Some(upper) = cb.price_band_upper
-                    && price > upper
-                {
-                    reports.push(ExecutionReport::Rejected {
-                        order_id: order.id,
-                        account: order.account,
-                        reason: RejectReason::OutsidePriceBand,
-                    });
-                    return;
-                }
-            }
-        }
-
-        // Fat finger checks: reject orders exceeding per-instrument limits.
-        if let Some(limits) = self.risk_limits.get(&symbol) {
-            if let Some(max_qty) = limits.max_order_qty
-                && order.quantity.get() > max_qty.get()
-            {
-                reports.push(ExecutionReport::Rejected {
-                    order_id: order.id,
-                    account: order.account,
-                    reason: RejectReason::ExceedsMaxOrderQty,
-                });
-                return;
-            }
-            if let Some(max_notional) = limits.max_order_notional {
-                // Notional check applies only to orders with a known price.
-                // Market and Stop orders have no submission-time price.
-                // StopLimit uses limit_price (worst-case resting price).
-                let limit_price = match order.order_type {
-                    OrderType::Limit { price } => Some(price),
-                    OrderType::StopLimit { limit_price, .. } => Some(limit_price),
-                    OrderType::Market | OrderType::Stop { .. } => None,
-                };
-                if let Some(price) = limit_price {
-                    let notional = price.get() as u128 * order.quantity.get() as u128;
-                    if notional > max_notional as u128 {
-                        reports.push(ExecutionReport::Rejected {
-                            order_id: order.id,
-                            account: order.account,
-                            reason: RejectReason::ExceedsMaxNotional,
-                        });
-                        return;
-                    }
                 }
             }
         }
@@ -349,11 +361,10 @@ impl Exchange {
         // charged from the reservation even at the exact limit price.
         // Only positive fees need a reservation cushion — rebates (negative)
         // don't require upfront funds.
-        let max_fee_bps = self
-            .fee_schedules
-            .get(&symbol)
-            .map(|f| 0i16.max(f.maker_fee_bps).max(0i16.max(f.taker_fee_bps)) as u16)
-            .unwrap_or(0);
+        let fees = &inst.fee_schedule;
+        let max_fee_bps = 0i16
+            .max(fees.maker_fee_bps)
+            .max(0i16.max(fees.taker_fee_bps)) as u16;
         let reserved = match self.accounts.try_reserve(&order, &spec, max_fee_bps) {
             Ok(amount) => amount,
             Err(reason) => {
@@ -381,16 +392,15 @@ impl Exchange {
 
         let report_start = reports.len();
 
-        let book = self
-            .books
+        // Single mutable lookup: book, fees all from the same struct.
+        let inst = self
+            .instruments
             .get_mut(&symbol)
-            .expect("book exists because instrument was added");
-        book.execute(order, quote_budget, reports);
+            .expect("instrument verified to exist above");
+        inst.book.execute(order, quote_budget, reports);
 
         // Compute fees on fills before balance updates.
-        if let Some(fees) = self.fee_schedules.get(&symbol) {
-            apply_fees(&mut reports[report_start..], fees);
-        }
+        apply_fees(&mut reports[report_start..], &inst.fee_schedule);
 
         // Process reports to update balances.
         let new_reports = &reports[report_start..];
@@ -414,10 +424,10 @@ impl Exchange {
         // reservation but is no longer on the book (fully filled), release
         // the unused portion. This also handles triggered stops whose fill
         // didn't exhaust their budget-based reservation.
-        let book = self
-            .books
+        let inst = self
+            .instruments
             .get(&symbol)
-            .expect("book exists because instrument was added");
+            .expect("instrument verified to exist above");
         for report in &reports[report_start..] {
             if let ExecutionReport::Fill {
                 maker_order_id,
@@ -433,8 +443,8 @@ impl Exchange {
                 ] {
                     if !self.consumed_buf.contains(&(account, id))
                         && self.accounts.has_reservation(account, id)
-                        && !book.has_order(account, id)
-                        && !book.has_stop(account, id)
+                        && !inst.book.has_order(account, id)
+                        && !inst.book.has_stop(account, id)
                     {
                         self.accounts.release(account, id);
                         self.consumed_buf.push((account, id));
@@ -454,21 +464,20 @@ impl Exchange {
     /// Cancel all resting orders and pending stops for an account across
     /// all instruments (kill switch). Releases all associated reservations.
     pub fn cancel_all(&mut self, account: AccountId, reports: &mut Vec<ExecutionReport>) {
-        // Collect symbols first to avoid borrowing self.books while also
-        // needing self.accounts and self.order_sides.
-        let symbols: Vec<Symbol> = self.books.keys().copied().collect();
+        // Collect symbols first to avoid borrowing self.instruments while
+        // also needing self.accounts and self.order_sides.
+        let symbols: Vec<Symbol> = self.instruments.keys().copied().collect();
 
         for symbol in symbols {
-            let Some(spec) = self.instruments.get(&symbol).copied() else {
-                continue;
-            };
+            let inst = self
+                .instruments
+                .get_mut(&symbol)
+                .expect("symbol came from instruments keys");
+            let spec = inst.spec;
 
             let report_start = reports.len();
 
-            let Some(book) = self.books.get_mut(&symbol) else {
-                continue;
-            };
-            book.cancel_all_for_account(account, reports);
+            inst.book.cancel_all_for_account(account, reports);
 
             let new_reports = &reports[report_start..];
             self.consumed_buf.clear();
@@ -493,16 +502,14 @@ impl Exchange {
         order_id: OrderId,
         reports: &mut Vec<ExecutionReport>,
     ) {
-        let Some(spec) = self.instruments.get(&symbol).copied() else {
+        let Some(inst) = self.instruments.get_mut(&symbol) else {
             return;
         };
+        let spec = inst.spec;
 
         let report_start = reports.len();
 
-        let Some(book) = self.books.get_mut(&symbol) else {
-            return;
-        };
-        book.cancel(account, order_id, reports);
+        inst.book.cancel(account, order_id, reports);
 
         // Release reserved funds if cancellation succeeded.
         let new_reports = &reports[report_start..];
@@ -545,19 +552,8 @@ impl Exchange {
         new_quantity: Quantity,
         reports: &mut Vec<ExecutionReport>,
     ) {
-        // Verify instrument exists. The spec itself isn't needed since
-        // cancel-replace only modifies an existing order (reservation
-        // currency is already known from the original order).
-        if !self.instruments.contains_key(&symbol) {
-            reports.push(ExecutionReport::Rejected {
-                order_id,
-                account,
-                reason: RejectReason::UnknownSymbol,
-            });
-            return;
-        }
-
-        let Some(book) = self.books.get_mut(&symbol) else {
+        // Single lookup for all instrument state.
+        let Some(inst) = self.instruments.get(&symbol) else {
             reports.push(ExecutionReport::Rejected {
                 order_id,
                 account,
@@ -569,7 +565,7 @@ impl Exchange {
         // 1. Order must exist as a resting limit order.
         // Use peek_order_location (O(1) index lookup) for validation —
         // the VecDeque scan for old_remaining is deferred to replace_order.
-        let Some((side, _old_price)) = book.peek_order_location(account, order_id) else {
+        let Some((side, _old_price)) = inst.book.peek_order_location(account, order_id) else {
             reports.push(ExecutionReport::Rejected {
                 order_id,
                 account,
@@ -579,59 +575,57 @@ impl Exchange {
         };
 
         // 2. Circuit breaker checks on the new price.
-        if let Some(cb) = self.circuit_breakers.get(&symbol) {
-            if cb.halted {
-                reports.push(ExecutionReport::Rejected {
-                    order_id,
-                    account,
-                    reason: RejectReason::TradingHalted,
-                });
-                return;
-            }
-            if let Some(lower) = cb.price_band_lower
-                && new_price < lower
-            {
-                reports.push(ExecutionReport::Rejected {
-                    order_id,
-                    account,
-                    reason: RejectReason::OutsidePriceBand,
-                });
-                return;
-            }
-            if let Some(upper) = cb.price_band_upper
-                && new_price > upper
-            {
-                reports.push(ExecutionReport::Rejected {
-                    order_id,
-                    account,
-                    reason: RejectReason::OutsidePriceBand,
-                });
-                return;
-            }
+        let cb = &inst.circuit_breaker;
+        if cb.halted {
+            reports.push(ExecutionReport::Rejected {
+                order_id,
+                account,
+                reason: RejectReason::TradingHalted,
+            });
+            return;
+        }
+        if let Some(lower) = cb.price_band_lower
+            && new_price < lower
+        {
+            reports.push(ExecutionReport::Rejected {
+                order_id,
+                account,
+                reason: RejectReason::OutsidePriceBand,
+            });
+            return;
+        }
+        if let Some(upper) = cb.price_band_upper
+            && new_price > upper
+        {
+            reports.push(ExecutionReport::Rejected {
+                order_id,
+                account,
+                reason: RejectReason::OutsidePriceBand,
+            });
+            return;
         }
 
         // 3. Risk limit checks on the new quantity/notional.
-        if let Some(limits) = self.risk_limits.get(&symbol) {
-            if let Some(max_qty) = limits.max_order_qty
-                && new_quantity.get() > max_qty.get()
-            {
+        let limits = &inst.risk_limits;
+        if let Some(max_qty) = limits.max_order_qty
+            && new_quantity.get() > max_qty.get()
+        {
+            reports.push(ExecutionReport::Rejected {
+                order_id,
+                account,
+                reason: RejectReason::ExceedsMaxOrderQty,
+            });
+            return;
+        }
+        if let Some(max_notional) = limits.max_order_notional {
+            let notional = new_price.get() as u128 * new_quantity.get() as u128;
+            if notional > max_notional as u128 {
                 reports.push(ExecutionReport::Rejected {
                     order_id,
                     account,
-                    reason: RejectReason::ExceedsMaxOrderQty,
+                    reason: RejectReason::ExceedsMaxNotional,
                 });
                 return;
-            }
-            if let Some(max_notional) = limits.max_order_notional {
-                let notional = new_price.get() as u128 * new_quantity.get() as u128;
-                if notional > max_notional as u128 {
-                    reports.push(ExecutionReport::Rejected {
-                        order_id,
-                        account,
-                        reason: RejectReason::ExceedsMaxNotional,
-                    });
-                    return;
-                }
             }
         }
 
@@ -640,10 +634,12 @@ impl Exchange {
         // user wants to cross the spread, they should cancel and submit a
         // new order.
         let would_cross = match side {
-            Side::Buy => book
+            Side::Buy => inst
+                .book
                 .best_ask()
                 .is_some_and(|best_ask| new_price >= best_ask),
-            Side::Sell => book
+            Side::Sell => inst
+                .book
                 .best_bid()
                 .is_some_and(|best_bid| new_price <= best_bid),
         };
@@ -661,11 +657,10 @@ impl Exchange {
         // If insufficient balance, the original reservation stays intact.
         // Only positive fees need a reservation cushion — rebates (negative)
         // don't require upfront funds.
-        let max_fee_bps = self
-            .fee_schedules
-            .get(&symbol)
-            .map(|f| 0i16.max(f.maker_fee_bps).max(0i16.max(f.taker_fee_bps)) as u16)
-            .unwrap_or(0);
+        let fees = &inst.fee_schedule;
+        let max_fee_bps = 0i16
+            .max(fees.maker_fee_bps)
+            .max(0i16.max(fees.taker_fee_bps)) as u16;
         let new_required = match side {
             Side::Buy => {
                 let cost = new_price.get() as u128 * new_quantity.get() as u128;
@@ -702,7 +697,12 @@ impl Exchange {
         // scan). This returns (account, old_price, old_remaining).
         // Cannot fail since we verified the order exists above and matching is
         // single-threaded (no concurrent removal possible).
-        let (old_price, old_remaining) = book
+        let inst = self
+            .instruments
+            .get_mut(&symbol)
+            .expect("instrument verified to exist above");
+        let (old_price, old_remaining) = inst
+            .book
             .replace_order(account, order_id, new_price, new_quantity)
             .expect("order verified to exist");
 

@@ -1020,15 +1020,14 @@ fn decode_stop_side_levels(buf: &[u8]) -> Result<(usize, StopLevels), JournalErr
 impl Exchange {
     /// Create a snapshot of all internal state for serialization.
     pub(crate) fn snapshot_state(&self) -> ExchangeSnapshot {
-        let instruments: Vec<InstrumentSpec> = self.instruments().values().copied().collect();
+        let instruments: Vec<InstrumentSpec> = self.instrument_specs().copied().collect();
         let balances = self.accounts().snapshot_balances();
         let reservations = self.accounts().snapshot_reservations();
         let order_sides: Vec<((AccountId, OrderId), Side)> = self.snapshot_order_sides();
 
         let books: Vec<(Symbol, BookSnapshot)> = self
             .books()
-            .iter()
-            .map(|(&symbol, book)| (symbol, book.snapshot()))
+            .map(|(symbol, book)| (symbol, book.snapshot()))
             .collect();
 
         let max_order_id = self.snapshot_max_order_id();
@@ -1051,41 +1050,40 @@ impl Exchange {
 
     /// Reconstruct an Exchange from a snapshot.
     pub(crate) fn restore_state(state: ExchangeSnapshot) -> Self {
-        let mut instruments_map = HashMap::new();
-        let mut books_map = HashMap::new();
+        use crate::exchange::InstrumentState;
 
-        for spec in &state.instruments {
-            instruments_map.insert(spec.symbol, *spec);
-        }
-
+        // Build per-symbol lookup tables from the flat snapshot Vecs.
+        let mut books_map: HashMap<Symbol, OrderBook> = HashMap::new();
         for (symbol, book_snap) in state.books {
             books_map.insert(symbol, OrderBook::restore(book_snap));
         }
+        let risk_map: HashMap<Symbol, RiskLimits> = state.risk_limits.into_iter().collect();
+        let cb_map: HashMap<Symbol, CircuitBreakerConfig> =
+            state.circuit_breakers.into_iter().collect();
+        let fee_map: HashMap<Symbol, FeeSchedule> = state.fee_schedules.into_iter().collect();
 
-        // Ensure all instruments have books (some may have been empty).
+        // Assemble consolidated InstrumentState per symbol.
+        let mut instruments: HashMap<Symbol, InstrumentState> = HashMap::new();
         for spec in &state.instruments {
-            books_map.entry(spec.symbol).or_default();
+            let book = books_map.remove(&spec.symbol).unwrap_or_default();
+            instruments.insert(
+                spec.symbol,
+                InstrumentState {
+                    spec: *spec,
+                    book,
+                    risk_limits: risk_map.get(&spec.symbol).copied().unwrap_or_default(),
+                    circuit_breaker: cb_map.get(&spec.symbol).copied().unwrap_or_default(),
+                    fee_schedule: fee_map.get(&spec.symbol).copied().unwrap_or_default(),
+                },
+            );
         }
 
         let accounts = AccountManager::from_parts(state.balances, state.reservations);
         let order_sides: HashMap<(AccountId, OrderId), Side> =
             state.order_sides.into_iter().collect();
-        let risk_limits: HashMap<Symbol, RiskLimits> = state.risk_limits.into_iter().collect();
-        let circuit_breakers: HashMap<Symbol, CircuitBreakerConfig> =
-            state.circuit_breakers.into_iter().collect();
-        let fee_schedules: HashMap<Symbol, FeeSchedule> = state.fee_schedules.into_iter().collect();
         let max_order_id: HashMap<AccountId, u64> = state.max_order_id.into_iter().collect();
 
-        Self::from_parts(
-            books_map,
-            instruments_map,
-            accounts,
-            order_sides,
-            risk_limits,
-            circuit_breakers,
-            fee_schedules,
-            max_order_id,
-        )
+        Self::from_parts(instruments, accounts, order_sides, max_order_id)
     }
 }
 
