@@ -209,7 +209,13 @@ Also needed: backpressure policy, gateway scalability (epoll/io_uring multiplexi
 - [x] CPU core pinning for all pipeline, reader, and bench threads
 - [x] IRQ affinity pinning (`bench-isolate.sh`)
 - [x] Kernel boot isolation (`isolcpus`, `nohz_full`, `rcu_nocbs`)
-- [ ] Profile-Guided Optimization (PGO) — two-pass build with `rustc -Cprofile-generate` / `-Cprofile-use`. Typical gains 10-30% on branch-heavy matching loops. Payload-dependent: profiling against the synthetic generator will optimize for its branch patterns, not necessarily production traffic. Ideally profile against real market data replay (ITCH, Databento) or recorded production journals once available.
+- [x] Reservation slab — `Vec<Reservation>` + free list replaces `HashMap<(AccountId, OrderId), Reservation>` for O(1) indexed access on every fill/cancel
+- [x] Reusable match price buffer — `match_price_buf` on OrderBook avoids heap allocation per aggressive order
+- [ ] **Flat Vec instrument dispatch** — replace `instruments: HashMap<Symbol, InstrumentState>` with `Vec<InstrumentState>` indexed by `Symbol.0`. Eliminates 2-3 hash lookups per operation (the single hottest HashMap on every execute/cancel/amend)
+- [ ] **Flat Vec max_order_id** — replace `max_order_id: HashMap<AccountId, u64>` with `Vec<u64>` indexed by `AccountId.0`. Eliminates a hash+entry call on every submit
+- [ ] **Monotonic sequence ID for order tracking** — assign a global `u32` sequence number at submission. Use it to index `order_info` (Exchange) and `order_index` (OrderBook) as flat `Vec` instead of `HashMap<(AccountId, OrderId), ...>`. Eliminates 4-6 hash lookups per execute and 1-2 per cancel. Requires threading the sequence ID through the wire protocol and orderbook
+- [ ] **Cache-friendly price levels** — replace `BTreeMap<Price, VecDeque<RestingOrder>>` with a sorted `Vec` or custom array-based B+tree with 64-byte nodes. BTreeMap allocates each node separately with poor cache locality. Typical books have 5-20 active levels — a compact sorted array with binary search would fit in 1-2 cache lines
+- [ ] **Profile-Guided Optimization (PGO)** — two-pass build with `rustc -Cprofile-generate` / `-Cprofile-use`. Typical gains 10-30% on branch-heavy matching loops. Payload-dependent: profiling against the synthetic generator will optimize for its branch patterns, not necessarily production traffic. Ideally profile against real market data replay (ITCH, Databento) or recorded production journals once available
 
 ## Project Structure
 
