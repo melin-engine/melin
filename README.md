@@ -116,6 +116,8 @@ Checklist of features expected of a production trade execution engine. Items mar
 - [x] Typed client library
 - [x] Terminal UI for interactive testing
 - [x] Heartbeats and connection timeouts (bidirectional keepalive, configurable idle timeout detection)
+- [ ] Batched io_uring SEND in response stage (reduce per-response syscall overhead)
+- [ ] TCP_CORK / MSG_MORE response batching (coalesce small frames into single TCP segments)
 - [ ] Backpressure handling (defined policy when disruptor is full)
 - [ ] TLS (encrypted client connections)
 
