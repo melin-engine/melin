@@ -244,10 +244,15 @@ pub struct OrderBook {
     stop_index: HashMap<(AccountId, OrderId), (Side, Price)>,
     /// Last trade price, used to determine which stops to trigger.
     last_trade_price: Option<Price>,
-    /// Reusable buffers for `check_triggers()` to avoid per-order allocations.
+    /// Reusable buffers to avoid per-order allocations on the hot path.
     /// Cleared and reused each call. Capacity grows to high-water mark and stays.
     trigger_price_buf: Vec<Price>,
     triggered_buf: Vec<PendingStop>,
+    /// Reusable buffer for `match_against()` to collect matchable price levels.
+    /// We can't iterate the BTreeMap and mutate it simultaneously (filled makers
+    /// are removed during matching), so prices are collected first. This buffer
+    /// avoids a heap allocation on every aggressive order.
+    match_price_buf: Vec<Price>,
 }
 
 impl Default for OrderBook {
@@ -268,6 +273,7 @@ impl OrderBook {
             last_trade_price: None,
             trigger_price_buf: Vec::new(),
             triggered_buf: Vec::new(),
+            match_price_buf: Vec::new(),
         }
     }
 
@@ -286,6 +292,8 @@ impl OrderBook {
             last_trade_price: None,
             trigger_price_buf: Vec::with_capacity(64),
             triggered_buf: Vec::with_capacity(64),
+            // Typical aggressive order sweeps a handful of price levels.
+            match_price_buf: Vec::with_capacity(64),
         }
     }
 
@@ -337,6 +345,7 @@ impl OrderBook {
             last_trade_price,
             trigger_price_buf: Vec::new(),
             triggered_buf: Vec::new(),
+            match_price_buf: Vec::new(),
         }
     }
 
@@ -777,33 +786,44 @@ impl OrderBook {
             Side::Sell => &mut self.bids,
         };
 
-        // Collect the prices we need to visit. We can't iterate and mutate simultaneously,
-        // so we gather matching price levels first.
-        let prices: Vec<Price> = match taker_side {
+        // Collect the prices we need to visit into a reusable buffer. We can't
+        // iterate the BTreeMap and mutate it simultaneously (filled makers are
+        // removed), so prices are collected first. The buffer lives on OrderBook
+        // to avoid a heap allocation on every aggressive order.
+        self.match_price_buf.clear();
+        match taker_side {
             Side::Buy => {
                 // Buy matches against asks (lowest first)
-                opposite
-                    .levels
-                    .keys()
-                    .take_while(|&&p| price_limit.is_none_or(|limit| p <= limit))
-                    .copied()
-                    .collect()
+                self.match_price_buf.extend(
+                    opposite
+                        .levels
+                        .keys()
+                        .take_while(|&&p| price_limit.is_none_or(|limit| p <= limit))
+                        .copied(),
+                );
             }
             Side::Sell => {
                 // Sell matches against bids (highest first)
-                opposite
-                    .levels
-                    .keys()
-                    .rev()
-                    .take_while(|&&p| price_limit.is_none_or(|limit| p >= limit))
-                    .copied()
-                    .collect()
+                self.match_price_buf.extend(
+                    opposite
+                        .levels
+                        .keys()
+                        .rev()
+                        .take_while(|&&p| price_limit.is_none_or(|limit| p >= limit))
+                        .copied(),
+                );
             }
         };
 
         let mut stp_cancelled = false;
 
-        'outer: for price in prices {
+        // Iterate from a index to avoid borrowing self.match_price_buf while
+        // mutating self through opposite. The buffer won't be modified during
+        // the loop, so index-based access is safe and equivalent to iter().
+        let mut price_idx = 0;
+        'outer: while price_idx < self.match_price_buf.len() {
+            let price = self.match_price_buf[price_idx];
+            price_idx += 1;
             let Some(level) = opposite.levels.get_mut(&price) else {
                 continue;
             };
