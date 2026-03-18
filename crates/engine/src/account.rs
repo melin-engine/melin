@@ -464,7 +464,7 @@ impl AccountManager {
     pub fn process_reports(
         &mut self,
         reports: &[ExecutionReport],
-        order_info: &std::collections::HashMap<(AccountId, OrderId), OrderInfo>,
+        order_info: &rustc_hash::FxHashMap<(AccountId, OrderId), OrderInfo>,
         spec: &InstrumentSpec,
         consumed: &mut Vec<(AccountId, OrderId)>,
     ) {

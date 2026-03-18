@@ -21,6 +21,8 @@
 //! | crc32c         | u32     | 4     | CRC32C of everything above         |
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
+
+use rustc_hash::FxHashMap;
 use std::fs::{self, File};
 use std::io::{Read, Write};
 use std::num::NonZeroU64;
@@ -1089,8 +1091,8 @@ impl Exchange {
         // Build order_info by combining saved sides with restored reservation slots.
         // Build a side lookup first, then merge with slot assignments.
         let side_map: HashMap<(AccountId, OrderId), Side> = state.order_sides.into_iter().collect();
-        let mut order_info: HashMap<(AccountId, OrderId), OrderInfo> =
-            HashMap::with_capacity(side_map.len());
+        let mut order_info: FxHashMap<(AccountId, OrderId), OrderInfo> =
+            FxHashMap::with_capacity_and_hasher(side_map.len(), Default::default());
         for (key, slot) in slot_assignments {
             if let Some(&side) = side_map.get(&key) {
                 order_info.insert(
@@ -1211,13 +1213,13 @@ impl OrderBook {
             btree
         };
 
-        let order_index: HashMap<(AccountId, OrderId), (Side, Price)> = snap
+        let order_index: FxHashMap<(AccountId, OrderId), (Side, Price)> = snap
             .order_index
             .into_iter()
             .map(|(id, account, side, price)| ((account, id), (side, price)))
             .collect();
 
-        let stop_index: HashMap<(AccountId, OrderId), (Side, Price)> = snap
+        let stop_index: FxHashMap<(AccountId, OrderId), (Side, Price)> = snap
             .stop_index
             .into_iter()
             .map(|(id, account, side, price)| ((account, id), (side, price)))

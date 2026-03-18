@@ -24,6 +24,7 @@ pipeline-stats = []
 
 [dependencies]
 blake3 = "1"
+rustc-hash = "2"
 crc32c = "0.6"
 getrandom = "0.3"
 hdrhistogram = { version = "7", optional = true }

@@ -8,7 +8,7 @@
 //! stays single-threaded. Note: portfolio risk checks then require
 //! cross-shard message passing, adding latency and complexity.
 
-use std::collections::HashMap;
+use rustc_hash::FxHashMap;
 
 use crate::account::{AccountManager, OrderInfo, ReservationSlot};
 use crate::orderbook::OrderBook;
@@ -63,7 +63,7 @@ pub struct Exchange {
     /// Keyed by the pair because different accounts can independently
     /// use the same OrderId. The `ReservationSlot` enables O(1) Vec-indexed
     /// access to the reservation slab (eliminating a second HashMap lookup).
-    order_info: HashMap<(AccountId, OrderId), OrderInfo>,
+    order_info: FxHashMap<(AccountId, OrderId), OrderInfo>,
     /// Per-account high-water mark for order IDs. Rejects submissions
     /// with `order_id <= max_seen[account]` to prevent duplicate execution
     /// on crash-recovery retry. Flat Vec indexed by AccountId.0 for true
@@ -82,7 +82,7 @@ impl Exchange {
         Self {
             instruments: Vec::new(),
             accounts: AccountManager::new(),
-            order_info: HashMap::new(),
+            order_info: FxHashMap::default(),
             max_order_id: Vec::new(),
             consumed_buf: Vec::new(),
             presized: false,
@@ -97,7 +97,7 @@ impl Exchange {
             // 64 instrument slots — each empty slot is 8 bytes (null Box ptr).
             instruments: Vec::with_capacity(64),
             accounts: AccountManager::with_capacity(),
-            order_info: HashMap::with_capacity(2_000_000),
+            order_info: FxHashMap::with_capacity_and_hasher(2_000_000, Default::default()),
             // 10K accounts × 8 bytes = 80 KB — negligible.
             max_order_id: vec![0; 10_000],
             consumed_buf: Vec::with_capacity(256),
@@ -109,7 +109,7 @@ impl Exchange {
     pub(crate) fn from_parts(
         instruments: Vec<Option<Box<InstrumentState>>>,
         accounts: AccountManager,
-        order_info: HashMap<(AccountId, OrderId), OrderInfo>,
+        order_info: FxHashMap<(AccountId, OrderId), OrderInfo>,
         max_order_id: Vec<u64>,
     ) -> Self {
         Self {
