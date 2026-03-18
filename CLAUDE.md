@@ -104,17 +104,16 @@ Without the mid-batch flush (per-slot check only), results were identical to bas
 
 Performance figures are in the [README](README.md#performance). Keep them up to date when making performance-related changes.
 
-LAN benchmark (two Cherry AMD Ryzen 9950X servers, dedicated NVMe journal disk):
-- **With fsync/FUA**: 5.2M orders/sec, p99.9 = 939 µs, max = 1.47 ms
-- **Without persistence**: 11.2M orders/sec, p99.9 = 747 µs, max = 915 µs
-- **Single-order latency**: 70 µs p50 (1 client, no pipelining, full durability)
-- **Engine-only**: 17.3M orders/sec, p99 = 0.06 µs
+LAN benchmark at `5330d6f` (two Cherry AMD Ryzen 9950X servers, dedicated NVMe journal disk):
+- **With fsync/FUA**: 2.9M orders/sec, p99.9 = 1583 µs, max = 1725 µs
+- **Without persistence**: 9.0M orders/sec, p99.9 = 894 µs, max = 1157 µs
+- **Single-order latency**: 127 µs p50 (1 client, no pipelining, full durability)
 
 ### Current bottleneck: TCP network stack
 
-The 2x gap between fsync (5.2M) and no-persist (11.2M) shows that journal I/O is no longer the dominant bottleneck on PLP NVMe hardware. The TCP stack (syscalls, kernel buffers, io_uring send/recv overhead) is now the primary throughput limiter. The engine itself runs at 17.3M/s — the pipeline and network consume the remaining headroom.
+The 3x gap between fsync (2.9M) and no-persist (9.0M) shows that journal I/O is a significant bottleneck. The TCP stack (syscalls, kernel buffers, io_uring send/recv overhead) is the primary throughput limiter for no-persist mode.
 
-**How to apply:** Further throughput gains require reducing TCP overhead (e.g., batched io_uring multishot send). Journal optimization is no longer the priority.
+**How to apply:** Further throughput gains require reducing TCP overhead (e.g., batched io_uring multishot send) and journal I/O optimization.
 
 Core layout: 0=OS/IRQ, 1-3=pipeline (journal/matching/response), 4-5=readers, 6+=bench.
 

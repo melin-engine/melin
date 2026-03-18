@@ -233,20 +233,21 @@ crates/
 
 ## Performance
 
-LAN round-trip benchmarks. Two Cherry AMD Ryzen 9950X servers (16C/32T, 192 GB RAM, 2x 1TB NVMe, 10 Gbps). Engine on one server with journal on a dedicated NVMe disk, benchmark client on the other, TCP over private network. [Realistic order flow](crates/bench/).
+LAN round-trip benchmarks at [`5330d6f`](../../commit/5330d6f). Two Cherry AMD Ryzen 9950X servers (16C/32T, 192 GB RAM, 2x 1TB NVMe, 10 Gbps). Engine on one server with journal on a dedicated NVMe disk, benchmark client on the other, TCP over private network. [Realistic order flow](crates/bench/). Reproducible via `scripts/lan-bench-suite.sh`.
 
 **Peak-load throughput** — full durability, 100M order pairs, 16 clients, 256 pipelined:
 
 | Metric | Value |
 |--------|-------|
-| **Throughput** | 5.2M orders/sec |
-| **p90** | 788 µs |
-| **p99** | 870 µs |
-| **p99.9** | 939 µs |
-| **p99.99** | 1.25 ms |
-| **p99.999** | 1.42 ms |
-| **p99.9999** | 1.46 ms |
-| **max** | 1.47 ms |
+| **Throughput** | 2.9M orders/sec |
+| **p50** | 1403 µs |
+| **p90** | 1447 µs |
+| **p99** | 1523 µs |
+| **p99.9** | 1583 µs |
+| **p99.99** | 1612 µs |
+| **p99.999** | 1657 µs |
+| **p99.9999** | 1712 µs |
+| **max** | 1725 µs |
 
 ```sh
 ./trading-server --bind 0.0.0.0:9876 --journal /mnt/journal/trading.journal  # engine server
@@ -257,15 +258,15 @@ LAN round-trip benchmarks. Two Cherry AMD Ryzen 9950X servers (16C/32T, 192 GB R
 
 | Metric | Value |
 |--------|-------|
-| **Throughput** | 11.2M orders/sec |
-| **p90** | 593 µs |
-| **p99** | 645 µs |
-| **p99.9** | 747 µs |
-| **p99.99** | 790 µs |
-| **p99.999** | 821 µs |
-| **p99.9999** | 877 µs |
-| **p99.99999** | 913 µs |
-| **max** | 915 µs |
+| **Throughput** | 9.0M orders/sec |
+| **p50** | 645 µs |
+| **p90** | 758 µs |
+| **p99** | 814 µs |
+| **p99.9** | 894 µs |
+| **p99.99** | 945 µs |
+| **p99.999** | 1021 µs |
+| **p99.9999** | 1063 µs |
+| **max** | 1157 µs |
 
 ```sh
 ./trading-bench 100000000 --addr <engine-ip>:9876 --window=192 --clients=32  # no-persist server
@@ -275,32 +276,17 @@ LAN round-trip benchmarks. Two Cherry AMD Ryzen 9950X servers (16C/32T, 192 GB R
 
 | Metric | Value |
 |--------|-------|
-| **Throughput** | 14.1K orders/sec |
-| **p50** | 70 µs |
-| **p99** | 126 µs |
-| **p99.99** | 134 µs |
-| **max** | 689 µs |
+| **Throughput** | 7.9K orders/sec |
+| **p50** | 127 µs |
+| **p90** | 128 µs |
+| **p99** | 133 µs |
+| **p99.9** | 147 µs |
+| **p99.99** | 151 µs |
+| **p99.999** | 164 µs |
+| **max** | 250 µs |
 
 ```sh
 ./trading-bench 1000000 --addr <engine-ip>:9876 --window=1 --clients=1
-```
-
-**Engine-only** — no pipeline, no network, 100M order pairs on the Ryzen 9950X:
-
-| Metric | Value |
-|--------|-------|
-| **Throughput** | 17.3M orders/sec |
-| **p90** | 0.05 µs |
-| **p99** | 0.06 µs |
-| **p99.9** | 0.06 µs |
-| **p99.99** | 0.12 µs |
-| **p99.999** | 0.61 µs |
-| **p99.9999** | 3.31 µs |
-| **p99.99999** | 18.93 µs |
-| **max** | 121.92 µs |
-
-```sh
-./trading-bench 100000000 --mode=engine
 ```
 
 ## License

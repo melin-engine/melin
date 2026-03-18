@@ -5,45 +5,85 @@
 # from the bench machine, collects results.
 #
 # Usage:
-#   ./scripts/lan-bench.sh <server-public-ip> <bench-public-ip> <server-vlan-ip> [user]
+#   ./scripts/lan-bench.sh <server-public-ip> <bench-public-ip> <server-vlan-ip> [user] [-- server-args... -- bench-args...]
 #
-# Example:
+# Examples:
+#   # Defaults (100M pairs, 16 clients, window 256):
 #   ./scripts/lan-bench.sh 84.32.176.142 84.32.176.143 10.0.0.1
-#   ./scripts/lan-bench.sh 84.32.176.142 84.32.176.143 10.0.0.1 pierre
+#
+#   # Custom server and bench args:
+#   ./scripts/lan-bench.sh 84.32.176.142 84.32.176.143 10.0.0.1 pierre \
+#       -- --accounts 2000 --instruments 50 \
+#       -- 50000000 --clients 32 --window 128
+#
+#   # Only custom bench args (empty server args):
+#   ./scripts/lan-bench.sh 84.32.176.142 84.32.176.143 10.0.0.1 pierre \
+#       -- -- 200000000 --clients 8 --window 64
+#
+# The first "--" separates positional args from extra server args.
+# The second "--" separates server args from extra bench args.
+# Server always gets: --bind, --journal, --authorized-keys.
+# Bench always gets: --addr, --key, --json.
 #
 # Prerequisites:
 #   - SSH access to both machines (as root by default, or as [user])
 #   - Both machines have been set up via cherry-deploy.sh (or cherry-setup.sh)
 #   - A VLAN/private network between the two machines
 #   - The bench machine can reach <server-vlan-ip> over the private network
-#
-# What it does:
-#   1. Builds the latest code on both machines (git pull + cargo build)
-#   2. Generates auth keys on the bench machine
-#   3. Starts the engine on the server (with bench-isolate.sh)
-#   4. Runs the benchmark from the bench machine
-#   5. Prints results and copies the JSON output locally
 
 set -euo pipefail
 
-if [[ $# -lt 3 ]]; then
-    echo "usage: $0 <server-public-ip> <bench-public-ip> <server-vlan-ip> [user]"
+# ---------------------------------------------------------------------------
+# Parse arguments: positional args, then "-- server-args -- bench-args"
+# ---------------------------------------------------------------------------
+POSITIONAL=()
+SERVER_EXTRA_ARGS=""
+BENCH_EXTRA_ARGS=""
+
+# Collect positional args until first "--"
+while [[ $# -gt 0 ]]; do
+    if [[ "$1" == "--" ]]; then
+        shift
+        break
+    fi
+    POSITIONAL+=("$1")
+    shift
+done
+
+# Collect server args until second "--"
+while [[ $# -gt 0 ]]; do
+    if [[ "$1" == "--" ]]; then
+        shift
+        break
+    fi
+    SERVER_EXTRA_ARGS="${SERVER_EXTRA_ARGS} $1"
+    shift
+done
+
+# Remaining args are bench args
+BENCH_EXTRA_ARGS="$*"
+
+if [[ ${#POSITIONAL[@]} -lt 3 ]]; then
+    echo "usage: $0 <server-public-ip> <bench-public-ip> <server-vlan-ip> [user] [-- server-args... -- bench-args...]"
     echo ""
     echo "  server-public-ip  SSH-reachable IP of the engine server"
     echo "  bench-public-ip   SSH-reachable IP of the benchmark client machine"
     echo "  server-vlan-ip    VLAN/private IP of the engine server (used for trading traffic)"
     echo "  user              SSH username (default: root)"
     echo ""
-    echo "example:"
+    echo "  After '--', extra args are passed to trading-server."
+    echo "  After a second '--', extra args are passed to trading-bench."
+    echo ""
+    echo "examples:"
     echo "  $0 84.32.176.142 84.32.176.143 10.0.0.1"
-    echo "  $0 84.32.176.142 84.32.176.143 10.0.0.1 pierre"
+    echo "  $0 84.32.176.142 84.32.176.143 10.0.0.1 pierre -- --accounts 2000 -- 50000000 --clients 32"
     exit 1
 fi
 
-SERVER_PUB="$1"
-BENCH_PUB="$2"
-SERVER_VLAN="$3"
-SSH_USER="${4:-root}"
+SERVER_PUB="${POSITIONAL[0]}"
+BENCH_PUB="${POSITIONAL[1]}"
+SERVER_VLAN="${POSITIONAL[2]}"
+SSH_USER="${POSITIONAL[3]:-root}"
 
 SSH_OPTS="-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR"
 SERVER="${SSH_USER}@${SERVER_PUB}"
@@ -53,17 +93,13 @@ REPO_DIR="~/workspace/trading"
 JOURNAL_PATH="${JOURNAL_PATH:-/mnt/journal/bench.journal}"
 SNAPSHOT_PATH="${SNAPSHOT_PATH:-/mnt/journal/bench.snapshot}"
 BIND_ADDR="${SERVER_VLAN}:9876"
-PAIRS="${PAIRS:-100000000}"
-WINDOW="${WINDOW:-256}"
-CLIENTS="${CLIENTS:-16}"
 CARGO_BUILD_FLAGS="${CARGO_BUILD_FLAGS:---release}"
 
 echo "=== LAN Benchmark ==="
-echo "  Server:     ${SERVER} (VLAN: ${SERVER_VLAN})"
-echo "  Bench:      ${BENCH}"
-echo "  Pairs:      ${PAIRS} ($(( PAIRS * 2 )) orders)"
-echo "  Clients:    ${CLIENTS}"
-echo "  Window:     ${WINDOW}"
+echo "  Server:      ${SERVER} (VLAN: ${SERVER_VLAN})"
+echo "  Bench:       ${BENCH}"
+echo "  Server args: --bind ${BIND_ADDR} --journal ${JOURNAL_PATH} --authorized-keys ...${SERVER_EXTRA_ARGS}"
+echo "  Bench args:  --addr ${BIND_ADDR} --key bench.key --json ...${BENCH_EXTRA_ARGS}"
 echo ""
 
 # ---------------------------------------------------------------------------
@@ -121,8 +157,7 @@ ssh $SSH_OPTS "$SERVER" "RUST_LOG=info nohup ${REPO_DIR}/target/release/trading-
         --bind ${BIND_ADDR} \
         --journal ${JOURNAL_PATH} \
         --authorized-keys ${REPO_DIR}/authorized_keys \
-        --accounts ${ACCOUNTS:-1000} \
-        --instruments ${INSTRUMENTS:-100} \
+        ${SERVER_EXTRA_ARGS} \
     >/tmp/trading-server.log 2>&1 </dev/null &" </dev/null
 
 # Wait for the server to be ready.
@@ -142,19 +177,17 @@ done
 echo ""
 
 # ---------------------------------------------------------------------------
-# 5. Copy the bench key to the bench machine and run the benchmark
+# 5. Run the benchmark
 # ---------------------------------------------------------------------------
 echo "=== Running benchmark ==="
-echo "  ${PAIRS} order pairs, ${CLIENTS} clients, window ${WINDOW}"
 echo ""
 
 ssh $SSH_OPTS "$BENCH" "cd ${REPO_DIR} && source ~/.cargo/env && \
-    ./target/release/trading-bench ${PAIRS} \
+    ./target/release/trading-bench \
         --addr ${BIND_ADDR} \
-        --window ${WINDOW} \
-        --clients ${CLIENTS} \
         --key bench.key \
-        --json /tmp/bench-results.json"
+        --json /tmp/bench-results.json \
+        ${BENCH_EXTRA_ARGS}"
 
 echo ""
 
