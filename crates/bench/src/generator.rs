@@ -21,7 +21,9 @@
 
 use std::num::NonZeroU64;
 
+use rand::SeedableRng;
 use rand::distr::{Distribution, Uniform};
+use rand::rngs::SmallRng;
 
 use trading_engine::types::{
     AccountId, Order, OrderId, OrderType, Price, Quantity, SelfTradeProtection, Side, Symbol,
@@ -85,6 +87,10 @@ pub struct GeneratorConfig {
     /// Starting order ID. Used to partition ID ranges across multiple
     /// bench clients to avoid collisions.
     pub start_order_id: u64,
+    /// PRNG seed for deterministic order flow. Same seed produces the
+    /// exact same event sequence, making benchmarks reproducible.
+    /// Default: 42.
+    pub seed: u64,
 }
 
 impl Default for GeneratorConfig {
@@ -106,6 +112,7 @@ impl Default for GeneratorConfig {
             stop_order_ratio: 0.03,
             cancel_replace_ratio: 0.30,
             start_order_id: 1,
+            seed: 42,
         }
     }
 }
@@ -133,7 +140,8 @@ pub enum GeneratedEvent {
 /// Generates a realistic stream of order events.
 pub struct OrderFlowGenerator {
     config: GeneratorConfig,
-    rng: rand::rngs::ThreadRng,
+    /// Deterministic PRNG (xoshiro256++). Fast, no syscalls, seedable.
+    rng: SmallRng,
     next_order_id: u64,
     /// Ring buffer of recently submitted order IDs available for cancellation.
     /// Fixed-size circular buffer to bound memory. OrderId(0) = empty slot.
@@ -156,9 +164,10 @@ impl OrderFlowGenerator {
     pub fn new(config: GeneratorConfig) -> Self {
         let capacity = 100_000; // track up to 100K live orders for cancellation
         let start_id = config.start_order_id;
+        let seed = config.seed;
         Self {
             config,
-            rng: rand::rng(),
+            rng: SmallRng::seed_from_u64(seed),
             next_order_id: start_id,
             live_orders: vec![(OrderId(0), Symbol(0)); capacity],
             live_cursor: 0,
@@ -688,5 +697,46 @@ mod tests {
         let mut ofg = OrderFlowGenerator::new(GeneratorConfig::default());
         let events = ofg.generate_events(500);
         assert_eq!(events.len(), 500);
+    }
+
+    #[test]
+    fn same_seed_produces_identical_sequence() {
+        let config = GeneratorConfig::default();
+        let mut gen1 = OrderFlowGenerator::new(config.clone());
+        let mut gen2 = OrderFlowGenerator::new(config);
+
+        let events1 = gen1.generate_frames(1000);
+        let events2 = gen2.generate_frames(1000);
+
+        assert_eq!(events1.len(), events2.len());
+        for (i, (a, b)) in events1.iter().zip(events2.iter()).enumerate() {
+            assert_eq!(a, b, "divergence at event {i}");
+        }
+    }
+
+    #[test]
+    fn different_seed_produces_different_sequence() {
+        let mut gen1 = OrderFlowGenerator::new(GeneratorConfig {
+            seed: 1,
+            ..Default::default()
+        });
+        let mut gen2 = OrderFlowGenerator::new(GeneratorConfig {
+            seed: 2,
+            ..Default::default()
+        });
+
+        let events1 = gen1.generate_frames(100);
+        let events2 = gen2.generate_frames(100);
+
+        // At least some frames should differ.
+        let differ = events1
+            .iter()
+            .zip(events2.iter())
+            .filter(|(a, b)| a != b)
+            .count();
+        assert!(
+            differ > 0,
+            "different seeds should produce different output"
+        );
     }
 }
