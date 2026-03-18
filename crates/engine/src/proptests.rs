@@ -695,7 +695,7 @@ proptest! {
         }
 
         let ids_from_index: std::collections::HashSet<OrderId> =
-            index.iter().map(|&(id, _, _)| id).collect();
+            index.iter().map(|&(id, _, _, _)| id).collect();
 
         prop_assert_eq!(
             ids_from_book.len(),
@@ -734,7 +734,7 @@ proptest! {
         }
 
         let stop_ids_from_index: std::collections::HashSet<OrderId> =
-            stop_idx.iter().map(|&(id, _, _)| id).collect();
+            stop_idx.iter().map(|&(id, _, _, _)| id).collect();
 
         prop_assert_eq!(
             stop_ids_from_book,

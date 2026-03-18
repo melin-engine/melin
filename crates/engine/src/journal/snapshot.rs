@@ -8,12 +8,12 @@
 //! Uses manual binary serialization (same approach as the journal codec)
 //! to avoid serde dependency.
 //!
-//! ## File format (v6)
+//! ## File format (v8)
 //!
 //! | Field          | Type    | Bytes | Purpose                            |
 //! |----------------|---------|-------|------------------------------------|
 //! | file_magic     | u32     | 4     | `0x534E4150` ("SNAP")              |
-//! | format_version | u16     | 2     | Current version = 6                |
+//! | format_version | u16     | 2     | Current version = 8                |
 //! | reserved       | u16     | 2     | Padding, zeroed                    |
 //! | sequence       | u64     | 8     | Journal sequence at snapshot       |
 //! | chain_hash     | [u8;32] | 32    | BLAKE3 hash chain state (v6+)      |
@@ -53,7 +53,8 @@ const SNAP_MAGIC: u32 = 0x534E_4150;
 /// v4 → v5: added per-instrument CircuitBreakerConfig for price bands + halts.
 /// v5 → v6: added chain_hash for BLAKE3 hash chain continuity across snapshots.
 /// v6 → v7: order_sides keyed by (AccountId, OrderId), added fee schedules.
-const SNAP_VERSION: u16 = 7;
+/// v7 → v8: order_index and stop_index now store AccountId (21 bytes/entry vs 17).
+const SNAP_VERSION: u16 = 8;
 
 /// Snapshot header size: magic(4) + version(2) + reserved(2) + sequence(8) + chain_hash(32) = 48.
 const SNAP_HEADER_SIZE: usize = 48;
@@ -136,7 +137,7 @@ pub fn load(path: &Path) -> Result<(Exchange, u64, [u8; 32]), JournalError> {
     // v5 header is 16 bytes, v6+ header is 48 bytes (adds 32-byte chain_hash).
     let (header_size, has_chain_hash) = match version {
         5 => (16usize, false),
-        6 | 7 => (SNAP_HEADER_SIZE, true),
+        6..=8 => (SNAP_HEADER_SIZE, true),
         _ => return Err(JournalError::UnsupportedVersion { version }),
     };
 
@@ -208,10 +209,10 @@ pub(crate) struct ExchangeSnapshot {
 pub(crate) struct BookSnapshot {
     pub(crate) bids: Vec<(Price, Vec<RestingOrderSnapshot>)>,
     pub(crate) asks: Vec<(Price, Vec<RestingOrderSnapshot>)>,
-    pub(crate) order_index: Vec<(OrderId, Side, Price)>,
+    pub(crate) order_index: Vec<(OrderId, AccountId, Side, Price)>,
     pub(crate) stop_buys: Vec<(Price, Vec<PendingStopSnapshot>)>,
     pub(crate) stop_sells: Vec<(Price, Vec<PendingStopSnapshot>)>,
-    pub(crate) stop_index: Vec<(OrderId, Side, Price)>,
+    pub(crate) stop_index: Vec<(OrderId, AccountId, Side, Price)>,
     pub(crate) last_trade_price: Option<Price>,
 }
 
@@ -346,10 +347,11 @@ fn encode_book_snapshot(book: &BookSnapshot, buf: &mut Vec<u8>) {
     // Asks.
     encode_book_side(&book.asks, buf);
 
-    // Order index.
+    // Order index: (order_id, account_id, side, price) — 21 bytes each.
     le::push_u32(buf, book.order_index.len() as u32);
-    for (order_id, side, price) in &book.order_index {
+    for (order_id, account, side, price) in &book.order_index {
         le::push_u64(buf, order_id.0);
+        le::push_u32(buf, account.0);
         buf.push(le::encode_side(*side));
         le::push_u64(buf, price.get());
     }
@@ -359,10 +361,11 @@ fn encode_book_snapshot(book: &BookSnapshot, buf: &mut Vec<u8>) {
     // Stop sells.
     encode_stop_side(&book.stop_sells, buf);
 
-    // Stop index.
+    // Stop index: (order_id, account_id, side, price) — 21 bytes each.
     le::push_u32(buf, book.stop_index.len() as u32);
-    for (order_id, side, price) in &book.stop_index {
+    for (order_id, account, side, price) in &book.stop_index {
         le::push_u64(buf, order_id.0);
+        le::push_u32(buf, account.0);
         buf.push(le::encode_side(*side));
         le::push_u64(buf, price.get());
     }
@@ -552,7 +555,7 @@ fn decode_exchange_state(
         check(pos, 4)?;
         let symbol = Symbol(le::get_u32(&buf[pos..]));
         pos += 4;
-        let (consumed, book) = decode_book_snapshot(&buf[pos..])?;
+        let (consumed, book) = decode_book_snapshot(&buf[pos..], version)?;
         pos += consumed;
         books.push((symbol, book));
     }
@@ -722,7 +725,7 @@ fn decode_exchange_state(
     ))
 }
 
-fn decode_book_snapshot(buf: &[u8]) -> Result<(usize, BookSnapshot), JournalError> {
+fn decode_book_snapshot(buf: &[u8], version: u16) -> Result<(usize, BookSnapshot), JournalError> {
     let corrupt = |reason: &'static str| JournalError::CorruptEntry {
         sequence: 0,
         reason,
@@ -745,20 +748,37 @@ fn decode_book_snapshot(buf: &[u8]) -> Result<(usize, BookSnapshot), JournalErro
     let (consumed, asks) = decode_book_side_levels(&buf[pos..])?;
     pos += consumed;
 
-    // Order index.
+    // Order index: v8+ stores (order_id, account_id, side, price) — 21 bytes each.
+    // v5-v7 stores (order_id, side, price) — 17 bytes each (no account; uses AccountId(0) placeholder).
     check(pos, 4)?;
     let n_order_index = le::get_u32(&buf[pos..]) as usize;
     pos += 4;
-    validate_count(buf.len() - pos, n_order_index, 17)?;
     let mut order_index = Vec::with_capacity(n_order_index);
-    for _ in 0..n_order_index {
-        check(pos, 17)?;
-        let order_id = OrderId(le::get_u64(&buf[pos..]));
-        let side = le::decode_side(buf[pos + 8]).ok_or(corrupt("invalid side"))?;
-        let price_val =
-            NonZeroU64::new(le::get_u64(&buf[pos + 9..])).ok_or(corrupt("zero price in index"))?;
-        order_index.push((order_id, side, Price(price_val)));
-        pos += 17;
+    if version >= 8 {
+        validate_count(buf.len() - pos, n_order_index, 21)?;
+        for _ in 0..n_order_index {
+            check(pos, 21)?;
+            let order_id = OrderId(le::get_u64(&buf[pos..]));
+            let account = AccountId(le::get_u32(&buf[pos + 8..]));
+            let side = le::decode_side(buf[pos + 12]).ok_or(corrupt("invalid side"))?;
+            let price_val = NonZeroU64::new(le::get_u64(&buf[pos + 13..]))
+                .ok_or(corrupt("zero price in index"))?;
+            order_index.push((order_id, account, side, Price(price_val)));
+            pos += 21;
+        }
+    } else {
+        validate_count(buf.len() - pos, n_order_index, 17)?;
+        for _ in 0..n_order_index {
+            check(pos, 17)?;
+            let order_id = OrderId(le::get_u64(&buf[pos..]));
+            let side = le::decode_side(buf[pos + 8]).ok_or(corrupt("invalid side"))?;
+            let price_val = NonZeroU64::new(le::get_u64(&buf[pos + 9..]))
+                .ok_or(corrupt("zero price in index"))?;
+            // Pre-v8 snapshots lack AccountId in the index; use placeholder.
+            // The account can be recovered from the BookSide resting orders.
+            order_index.push((order_id, AccountId(0), side, Price(price_val)));
+            pos += 17;
+        }
     }
 
     // Stop buys.
@@ -769,20 +789,36 @@ fn decode_book_snapshot(buf: &[u8]) -> Result<(usize, BookSnapshot), JournalErro
     let (consumed, stop_sells) = decode_stop_side_levels(&buf[pos..])?;
     pos += consumed;
 
-    // Stop index.
+    // Stop index: v8+ stores (order_id, account_id, side, price) — 21 bytes each.
+    // v5-v7 stores (order_id, side, price) — 17 bytes each.
     check(pos, 4)?;
     let n_stop_index = le::get_u32(&buf[pos..]) as usize;
     pos += 4;
-    validate_count(buf.len() - pos, n_stop_index, 17)?;
     let mut stop_index = Vec::with_capacity(n_stop_index);
-    for _ in 0..n_stop_index {
-        check(pos, 17)?;
-        let order_id = OrderId(le::get_u64(&buf[pos..]));
-        let side = le::decode_side(buf[pos + 8]).ok_or(corrupt("invalid side"))?;
-        let price_val = NonZeroU64::new(le::get_u64(&buf[pos + 9..]))
-            .ok_or(corrupt("zero price in stop index"))?;
-        stop_index.push((order_id, side, Price(price_val)));
-        pos += 17;
+    if version >= 8 {
+        validate_count(buf.len() - pos, n_stop_index, 21)?;
+        for _ in 0..n_stop_index {
+            check(pos, 21)?;
+            let order_id = OrderId(le::get_u64(&buf[pos..]));
+            let account = AccountId(le::get_u32(&buf[pos + 8..]));
+            let side = le::decode_side(buf[pos + 12]).ok_or(corrupt("invalid side"))?;
+            let price_val = NonZeroU64::new(le::get_u64(&buf[pos + 13..]))
+                .ok_or(corrupt("zero price in stop index"))?;
+            stop_index.push((order_id, account, side, Price(price_val)));
+            pos += 21;
+        }
+    } else {
+        validate_count(buf.len() - pos, n_stop_index, 17)?;
+        for _ in 0..n_stop_index {
+            check(pos, 17)?;
+            let order_id = OrderId(le::get_u64(&buf[pos..]));
+            let side = le::decode_side(buf[pos + 8]).ok_or(corrupt("invalid side"))?;
+            let price_val = NonZeroU64::new(le::get_u64(&buf[pos + 9..]))
+                .ok_or(corrupt("zero price in stop index"))?;
+            // Pre-v8 snapshots lack AccountId in the stop index; use placeholder.
+            stop_index.push((order_id, AccountId(0), side, Price(price_val)));
+            pos += 17;
+        }
     }
 
     // Last trade price.
@@ -1145,16 +1181,16 @@ impl OrderBook {
             btree
         };
 
-        let order_index: HashMap<OrderId, (Side, Price)> = snap
+        let order_index: HashMap<OrderId, (AccountId, Side, Price)> = snap
             .order_index
             .into_iter()
-            .map(|(id, side, price)| (id, (side, price)))
+            .map(|(id, account, side, price)| (id, (account, side, price)))
             .collect();
 
-        let stop_index: HashMap<OrderId, (Side, Price)> = snap
+        let stop_index: HashMap<OrderId, (AccountId, Side, Price)> = snap
             .stop_index
             .into_iter()
-            .map(|(id, side, price)| (id, (side, price)))
+            .map(|(id, account, side, price)| (id, (account, side, price)))
             .collect();
 
         Self::from_parts(

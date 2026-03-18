@@ -547,9 +547,7 @@ impl Exchange {
         // cancel-replace only modifies an existing order (reservation
         // currency is already known from the original order).
         if !self.instruments.contains_key(&symbol) {
-            // Account unknown — order not on any book for this symbol.
-            // Scan order_sides for the account (rare path, O(n) acceptable).
-            let account = self.find_account_for_order(order_id);
+            let account = self.find_account_for_order(symbol, order_id);
             reports.push(ExecutionReport::Rejected {
                 order_id,
                 account,
@@ -559,7 +557,7 @@ impl Exchange {
         }
 
         let Some(book) = self.books.get_mut(&symbol) else {
-            let account = self.find_account_for_order(order_id);
+            let account = self.find_account_for_order(symbol, order_id);
             reports.push(ExecutionReport::Rejected {
                 order_id,
                 account,
@@ -569,9 +567,10 @@ impl Exchange {
         };
 
         // 1. Order must exist as a resting limit order.
-        let Some((account, side, old_price, old_remaining)) = book.get_resting_order(order_id)
-        else {
-            let account = self.find_account_for_order(order_id);
+        // Use peek_order_location (O(1) index lookup) for validation —
+        // the VecDeque scan for old_remaining is deferred to replace_order.
+        let Some((account, side, _old_price)) = book.peek_order_location(order_id) else {
+            let account = self.find_account_for_order(symbol, order_id);
             reports.push(ExecutionReport::Rejected {
                 order_id,
                 account,
@@ -700,10 +699,12 @@ impl Exchange {
             return;
         }
 
-        // 6. All checks passed — perform the book replacement.
-        // This cannot fail since we verified the order exists above and
-        // matching is single-threaded (no concurrent removal possible).
-        book.replace_order(order_id, new_price, new_quantity)
+        // 6. All checks passed — perform the book replacement (single VecDeque
+        // scan). This returns (account, old_price, old_remaining).
+        // Cannot fail since we verified the order exists above and matching is
+        // single-threaded (no concurrent removal possible).
+        let (_account, old_price, old_remaining) = book
+            .replace_order(order_id, new_price, new_quantity)
             .expect("order verified to exist");
 
         reports.push(ExecutionReport::Replaced {
@@ -716,16 +717,22 @@ impl Exchange {
         });
     }
 
-    /// Find the account that owns the given order by scanning `order_sides`.
+    /// Find the account that owns the given order.
     ///
-    /// Returns `AccountId(u32::MAX)` if the order is not found. This sentinel
-    /// value is used in reject reports for cancel-replace on nonexistent orders;
-    /// the response stage routes by connection_id (not account), so the account
-    /// field is informational only. `u32::MAX` is preferred over `0` because
-    /// account 0 is a valid account in production.
-    ///
-    /// Linear scan — only used by cancel_replace reject paths which are rare.
-    fn find_account_for_order(&self, order_id: OrderId) -> AccountId {
+    /// First checks the order book's index (O(1)), then falls back to scanning
+    /// `order_sides` (O(n)). Returns `AccountId(u32::MAX)` if the order is not
+    /// found. This sentinel value is used in reject reports for cancel-replace
+    /// on nonexistent orders; the response stage routes by connection_id (not
+    /// account), so the account field is informational only. `u32::MAX` is
+    /// preferred over `0` because account 0 is a valid account in production.
+    fn find_account_for_order(&self, symbol: Symbol, order_id: OrderId) -> AccountId {
+        // Try the book's O(1) order index first.
+        if let Some(book) = self.books.get(&symbol)
+            && let Some((account, _, _)) = book.peek_order_location(order_id)
+        {
+            return account;
+        }
+        // Fallback: linear scan of order_sides (rare path).
         self.order_sides
             .keys()
             .find(|&&(_, oid)| oid == order_id)
