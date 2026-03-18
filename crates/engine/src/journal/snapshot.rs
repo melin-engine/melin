@@ -1178,15 +1178,19 @@ impl OrderBook {
     /// Restore an order book from a snapshot.
     pub(crate) fn restore(snap: BookSnapshot) -> Self {
         let restore_side = |levels: Vec<(Price, Vec<RestingOrderSnapshot>)>| {
-            let mut btree = BTreeMap::new();
-            for (price, orders) in levels {
-                let queue: VecDeque<crate::orderbook::RestingOrder> = orders
-                    .into_iter()
-                    .map(|o| crate::orderbook::RestingOrder::new(o.id, o.account, o.remaining))
-                    .collect();
-                btree.insert(price, queue);
-            }
-            crate::orderbook::BookSide::from_levels(btree)
+            // Build sorted Vec of (Price, VecDeque) — input is already sorted
+            // by price from the snapshot codec.
+            let sorted: Vec<(Price, VecDeque<crate::orderbook::RestingOrder>)> = levels
+                .into_iter()
+                .map(|(price, orders)| {
+                    let queue = orders
+                        .into_iter()
+                        .map(|o| crate::orderbook::RestingOrder::new(o.id, o.account, o.remaining))
+                        .collect();
+                    (price, queue)
+                })
+                .collect();
+            crate::orderbook::BookSide::from_levels(sorted)
         };
 
         let restore_stops = |levels: Vec<(Price, Vec<PendingStopSnapshot>)>| {

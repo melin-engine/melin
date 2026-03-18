@@ -42,15 +42,18 @@ pub(crate) struct PendingStop {
 }
 
 /// One side of the order book (either all bids or all asks).
+///
+/// Uses a sorted `Vec` instead of `BTreeMap` for price levels. Typical books
+/// have 5-20 active levels per side — at ~32 bytes per entry (Price + VecDeque
+/// header), the entire side fits in 1-3 L1 cache lines. Binary search gives
+/// O(log n) lookup with zero pointer chasing; insert/remove shift ~160-640
+/// bytes, which is a single memcpy in L1. BTreeMap's node-per-entry layout
+/// causes cache misses on every traversal.
 #[derive(Debug, Default)]
 pub(crate) struct BookSide {
-    /// BTreeMap: keeps price levels sorted so we can efficiently iterate from
-    /// best price (lowest ask / highest bid) without re-sorting. O(log n)
-    /// insert/remove per level.
-    ///
-    /// VecDeque: FIFO queue within each price level for time priority. O(1)
-    /// push_back (new orders) and pop_front (fills).
-    levels: BTreeMap<Price, VecDeque<RestingOrder>>,
+    /// Sorted ascending by Price. Binary search for all lookups.
+    /// VecDeque at each level: FIFO queue for time priority.
+    levels: Vec<(Price, VecDeque<RestingOrder>)>,
 }
 
 impl RestingOrder {
@@ -141,18 +144,56 @@ impl PendingStop {
 }
 
 impl BookSide {
-    /// Iterate over price levels in sorted order.
-    pub(crate) fn levels_iter(&self) -> impl Iterator<Item = (&Price, &VecDeque<RestingOrder>)> {
-        self.levels.iter()
+    /// Binary search for a price level. Returns `Ok(index)` if found,
+    /// `Err(index)` for the insertion point.
+    #[inline]
+    fn search(&self, price: Price) -> Result<usize, usize> {
+        self.levels.binary_search_by_key(&price, |(p, _)| *p)
     }
 
-    /// Reconstruct a BookSide from pre-built levels (used by snapshot restore).
-    pub(crate) fn from_levels(levels: BTreeMap<Price, VecDeque<RestingOrder>>) -> Self {
+    /// Iterate over price levels in ascending order.
+    pub(crate) fn levels_iter(&self) -> impl Iterator<Item = (&Price, &VecDeque<RestingOrder>)> {
+        self.levels.iter().map(|(p, q)| (p, q))
+    }
+
+    /// Reconstruct a BookSide from pre-sorted levels (used by snapshot restore).
+    /// Input must be sorted ascending by Price.
+    pub(crate) fn from_levels(levels: Vec<(Price, VecDeque<RestingOrder>)>) -> Self {
         Self { levels }
     }
 
     fn add(&mut self, price: Price, order: RestingOrder) {
-        self.levels.entry(price).or_default().push_back(order);
+        match self.search(price) {
+            Ok(idx) => self.levels[idx].1.push_back(order),
+            Err(idx) => {
+                let mut queue = VecDeque::new();
+                queue.push_back(order);
+                self.levels.insert(idx, (price, queue));
+            }
+        }
+    }
+
+    /// Get a mutable reference to the queue at a price level.
+    fn get_mut(&mut self, price: Price) -> Option<&mut VecDeque<RestingOrder>> {
+        match self.search(price) {
+            Ok(idx) => Some(&mut self.levels[idx].1),
+            Err(_) => None,
+        }
+    }
+
+    /// Get an immutable reference to the queue at a price level.
+    fn get(&self, price: Price) -> Option<&VecDeque<RestingOrder>> {
+        match self.search(price) {
+            Ok(idx) => Some(&self.levels[idx].1),
+            Err(_) => None,
+        }
+    }
+
+    /// Remove the price level entirely.
+    fn remove_level(&mut self, price: Price) {
+        if let Ok(idx) = self.search(price) {
+            self.levels.remove(idx);
+        }
     }
 
     /// Remove a resting order and return both its account and remaining quantity.
@@ -162,11 +203,12 @@ impl BookSide {
         price: Price,
         order_id: OrderId,
     ) -> Option<(AccountId, Quantity)> {
-        let level = self.levels.get_mut(&price)?;
+        let idx = self.search(price).ok()?;
+        let level = &mut self.levels[idx].1;
         let pos = level.iter().position(|o| o.id == order_id)?;
         let order = level.remove(pos).expect("position was valid");
         if level.is_empty() {
-            self.levels.remove(&price);
+            self.levels.remove(idx);
         }
         Some((order.account, order.remaining))
     }
@@ -188,9 +230,9 @@ impl BookSide {
         match side {
             Side::Buy => {
                 // Bids: iterate from highest price downward
-                for (&price, level) in self.levels.iter().rev() {
+                for (price, level) in self.levels.iter().rev() {
                     if let Some(limit) = limit
-                        && price < limit
+                        && *price < limit
                     {
                         break;
                     }
@@ -204,9 +246,9 @@ impl BookSide {
             }
             Side::Sell => {
                 // Asks: iterate from lowest price upward
-                for (&price, level) in &self.levels {
+                for (price, level) in &self.levels {
                     if let Some(limit) = limit
-                        && price > limit
+                        && *price > limit
                     {
                         break;
                     }
@@ -427,19 +469,19 @@ impl OrderBook {
             Side::Buy => &self.bids,
             Side::Sell => &self.asks,
         };
-        let level = book_side.levels.get(&price)?;
+        let level = book_side.get(price)?;
         let order = level.iter().find(|o| o.id == order_id)?;
         Some((side, price, order.remaining))
     }
 
     /// Best bid price (highest), or `None` if the bid side is empty.
     pub(crate) fn best_bid(&self) -> Option<Price> {
-        self.bids.levels.last_key_value().map(|(&p, _)| p)
+        self.bids.levels.last().map(|(p, _)| *p)
     }
 
     /// Best ask price (lowest), or `None` if the ask side is empty.
     pub(crate) fn best_ask(&self) -> Option<Price> {
-        self.asks.levels.first_key_value().map(|(&p, _)| p)
+        self.asks.levels.first().map(|(p, _)| *p)
     }
 
     /// Replace a resting order's price and/or quantity in-place.
@@ -467,7 +509,7 @@ impl OrderBook {
 
         if old_price == new_price {
             // Same price level — check if we can keep time priority.
-            let level = book_side.levels.get_mut(&old_price)?;
+            let level = book_side.get_mut(old_price)?;
             let pos = level.iter().position(|o| o.id == order_id)?;
             let old_remaining = level[pos].remaining;
 
@@ -485,14 +527,14 @@ impl OrderBook {
             // Price change → remove from old level, add to new level.
             // Manipulate the VecDeque directly to preserve the RestingOrder
             // (including account), since BookSide::remove only returns Quantity.
-            let old_level = book_side.levels.get_mut(&old_price)?;
+            let old_level = book_side.get_mut(old_price)?;
             let pos = old_level.iter().position(|o| o.id == order_id)?;
             let mut order = old_level.remove(pos).expect("position was valid");
             let old_remaining = order.remaining;
             order.remaining = new_quantity;
 
             if old_level.is_empty() {
-                book_side.levels.remove(&old_price);
+                book_side.remove_level(old_price);
             }
 
             // Add at back of new price level (loses time priority).
@@ -591,18 +633,18 @@ impl OrderBook {
         reports: &mut Vec<ExecutionReport>,
     ) {
         // Collect matching order IDs by scanning the book sides directly.
-        // We scan the BTreeMap levels (not order_index) because RestingOrder
+        // We scan the price levels (not order_index) because RestingOrder
         // carries the account field we need to filter on.
         let mut to_cancel: Vec<OrderId> = Vec::new();
 
-        for queue in self.bids.levels.values() {
+        for (_, queue) in &self.bids.levels {
             for order in queue {
                 if order.account == account {
                     to_cancel.push(order.id);
                 }
             }
         }
-        for queue in self.asks.levels.values() {
+        for (_, queue) in &self.asks.levels {
             for order in queue {
                 if order.account == account {
                     to_cancel.push(order.id);
@@ -799,7 +841,8 @@ impl OrderBook {
                 self.match_price_buf.extend(
                     opposite
                         .levels
-                        .keys()
+                        .iter()
+                        .map(|(p, _)| p)
                         .take_while(|&&p| price_limit.is_none_or(|limit| p <= limit))
                         .copied(),
                 );
@@ -809,8 +852,9 @@ impl OrderBook {
                 self.match_price_buf.extend(
                     opposite
                         .levels
-                        .keys()
+                        .iter()
                         .rev()
+                        .map(|(p, _)| p)
                         .take_while(|&&p| price_limit.is_none_or(|limit| p >= limit))
                         .copied(),
                 );
@@ -826,7 +870,7 @@ impl OrderBook {
         'outer: while price_idx < self.match_price_buf.len() {
             let price = self.match_price_buf[price_idx];
             price_idx += 1;
-            let Some(level) = opposite.levels.get_mut(&price) else {
+            let Some(level) = opposite.get_mut(price) else {
                 continue;
             };
 
@@ -864,7 +908,7 @@ impl OrderBook {
                                 remaining_quantity: cancelled_maker.remaining,
                             });
                             if level.is_empty() {
-                                opposite.levels.remove(&price);
+                                opposite.remove_level(price);
                             }
                             return (Some(quantity), true);
                         }
@@ -932,7 +976,7 @@ impl OrderBook {
                     None => {
                         // Taker fully filled.
                         if level.is_empty() {
-                            opposite.levels.remove(&price);
+                            opposite.remove_level(price);
                         }
                         return (None, false);
                     }
@@ -940,7 +984,7 @@ impl OrderBook {
             }
 
             // Level fully consumed.
-            opposite.levels.remove(&price);
+            opposite.remove_level(price);
         }
 
         (Some(quantity), stp_cancelled)
