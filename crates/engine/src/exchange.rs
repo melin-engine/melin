@@ -66,9 +66,9 @@ pub struct Exchange {
     order_info: HashMap<(AccountId, OrderId), OrderInfo>,
     /// Per-account high-water mark for order IDs. Rejects submissions
     /// with `order_id <= max_seen[account]` to prevent duplicate execution
-    /// on crash-recovery retry. HashMap for O(1) lookup keyed on
-    /// AccountId(u32) — cheap single-word hash.
-    max_order_id: HashMap<AccountId, u64>,
+    /// on crash-recovery retry. Flat Vec indexed by AccountId.0 for true
+    /// O(1) with zero hashing — one access per submit.
+    max_order_id: Vec<u64>,
     /// Reusable buffer for consumed (account, order) keys from
     /// `process_reports()`. Avoids per-order Vec allocation on the hot path.
     consumed_buf: Vec<(AccountId, OrderId)>,
@@ -83,7 +83,7 @@ impl Exchange {
             instruments: Vec::new(),
             accounts: AccountManager::new(),
             order_info: HashMap::new(),
-            max_order_id: HashMap::new(),
+            max_order_id: Vec::new(),
             consumed_buf: Vec::new(),
             presized: false,
         }
@@ -98,7 +98,8 @@ impl Exchange {
             instruments: Vec::with_capacity(64),
             accounts: AccountManager::with_capacity(),
             order_info: HashMap::with_capacity(2_000_000),
-            max_order_id: HashMap::with_capacity(10_000),
+            // 10K accounts × 8 bytes = 80 KB — negligible.
+            max_order_id: vec![0; 10_000],
             consumed_buf: Vec::with_capacity(256),
             presized: true,
         }
@@ -109,7 +110,7 @@ impl Exchange {
         instruments: Vec<Option<Box<InstrumentState>>>,
         accounts: AccountManager,
         order_info: HashMap<(AccountId, OrderId), OrderInfo>,
-        max_order_id: HashMap<AccountId, u64>,
+        max_order_id: Vec<u64>,
     ) -> Self {
         Self {
             instruments,
@@ -163,10 +164,13 @@ impl Exchange {
     }
 
     /// Snapshot the per-account order ID high-water marks for serialization.
+    /// Only includes non-zero entries (accounts that have submitted orders).
     pub(crate) fn snapshot_max_order_id(&self) -> Vec<(AccountId, u64)> {
         self.max_order_id
             .iter()
-            .map(|(&account, &hwm)| (account, hwm))
+            .enumerate()
+            .filter(|(_, hwm)| **hwm > 0)
+            .map(|(i, hwm)| (AccountId(i as u32), *hwm))
             .collect()
     }
 
@@ -239,13 +243,8 @@ impl Exchange {
             self.order_info.clear();
         }
 
-        if self.max_order_id.is_empty() {
-            let max_oid_cap = self.max_order_id.capacity();
-            for i in 0..max_oid_cap {
-                self.max_order_id.insert(AccountId(i as u32), 0);
-            }
-            self.max_order_id.clear();
-        }
+        // max_order_id is a flat Vec — pages already faulted by vec![0; N]
+        // in with_capacity(). No prefault needed.
 
         self.accounts.prefault();
 
@@ -315,7 +314,13 @@ impl Exchange {
         // outcome — a replayed InsufficientBalance rejection is harmless,
         // but a replayed fill is not. Clients must use a new OrderId for
         // genuinely new orders, even if the previous one was rejected.
-        let hwm = self.max_order_id.entry(order.account).or_insert(0);
+        // Grow the HWM Vec if this is a new account (admin-seeded accounts
+        // are covered by with_capacity; runtime growth is rare).
+        let acct_idx = order.account.0 as usize;
+        if acct_idx >= self.max_order_id.len() {
+            self.max_order_id.resize(acct_idx + 1, 0);
+        }
+        let hwm = &mut self.max_order_id[acct_idx];
         if order.id.0 <= *hwm {
             reports.push(ExecutionReport::Rejected {
                 order_id: order.id,
@@ -326,8 +331,8 @@ impl Exchange {
         }
         *hwm = order.id.0;
 
-        // Re-lookup for the remaining checks (immutable borrows above
-        // ended; we need a fresh reference after max_order_id borrow).
+        // Re-lookup: the mutable borrow on max_order_id ended; we need
+        // a fresh immutable reference to instruments for validation.
         let inst = inst_ref(&self.instruments, symbol).expect("instrument verified to exist above");
 
         // Circuit breaker checks: trading halt rejects all orders; price

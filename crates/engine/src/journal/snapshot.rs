@@ -1103,7 +1103,17 @@ impl Exchange {
             }
         }
 
-        let max_order_id: HashMap<AccountId, u64> = state.max_order_id.into_iter().collect();
+        // Build flat Vec indexed by AccountId.0.
+        let max_acct = state
+            .max_order_id
+            .iter()
+            .map(|(a, _)| a.0 as usize)
+            .max()
+            .unwrap_or(0);
+        let mut max_order_id = vec![0u64; max_acct + 1];
+        for (account, hwm) in state.max_order_id {
+            max_order_id[account.0 as usize] = hwm;
+        }
 
         Self::from_parts(instruments, accounts, order_info, max_order_id)
     }
