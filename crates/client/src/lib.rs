@@ -262,6 +262,7 @@ mod tests {
         let responses = client
             .send_request(&Request::CancelOrder {
                 symbol: Symbol(1),
+                account: trading_protocol::types::AccountId(1),
                 order_id: OrderId(42),
             })
             .unwrap();
@@ -405,6 +406,7 @@ mod tests {
         let mut client = Client::connect(addr, &key).unwrap();
         let result = client.send_request(&Request::CancelOrder {
             symbol: Symbol(1),
+            account: trading_protocol::types::AccountId(1),
             order_id: OrderId(42),
         });
 

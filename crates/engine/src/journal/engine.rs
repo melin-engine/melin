@@ -109,12 +109,16 @@ impl JournaledExchange {
     pub fn cancel(
         &mut self,
         symbol: Symbol,
+        account: AccountId,
         order_id: OrderId,
         reports: &mut Vec<ExecutionReport>,
     ) -> Result<(), JournalError> {
-        self.writer
-            .append(&JournalEvent::CancelOrder { symbol, order_id })?;
-        self.exchange.cancel(symbol, order_id, reports);
+        self.writer.append(&JournalEvent::CancelOrder {
+            symbol,
+            account,
+            order_id,
+        })?;
+        self.exchange.cancel(symbol, account, order_id, reports);
         Ok(())
     }
 
@@ -314,8 +318,12 @@ fn replay_event(exchange: &mut Exchange, event: &JournalEvent, reports: &mut Vec
         JournalEvent::SubmitOrder { symbol, order } => {
             exchange.execute(symbol, order, reports);
         }
-        JournalEvent::CancelOrder { symbol, order_id } => {
-            exchange.cancel(symbol, order_id, reports);
+        JournalEvent::CancelOrder {
+            symbol,
+            account,
+            order_id,
+        } => {
+            exchange.cancel(symbol, account, order_id, reports);
         }
         JournalEvent::SetRiskLimits { symbol, limits } => {
             exchange.set_risk_limits(symbol, limits);
@@ -328,11 +336,12 @@ fn replay_event(exchange: &mut Exchange, event: &JournalEvent, reports: &mut Vec
         }
         JournalEvent::CancelReplace {
             symbol,
+            account,
             order_id,
             new_price,
             new_quantity,
         } => {
-            exchange.cancel_replace(symbol, order_id, new_price, new_quantity, reports);
+            exchange.cancel_replace(symbol, account, order_id, new_price, new_quantity, reports);
         }
         JournalEvent::SetFeeSchedule { symbol, schedule } => {
             exchange.set_fee_schedule(symbol, schedule);
@@ -428,7 +437,8 @@ mod tests {
             reports.clear();
 
             // Cancel the resting buy.
-            je.cancel(Symbol(1), OrderId(3), &mut reports).unwrap();
+            je.cancel(Symbol(1), ACCT_A, OrderId(3), &mut reports)
+                .unwrap();
             reports.clear();
 
             // Verify state.

@@ -161,6 +161,7 @@ mod tests {
         let mut encode_buf = [0u8; 128];
         let request = Request::CancelOrder {
             symbol: Symbol(1),
+            account: AccountId(1),
             order_id: OrderId(42),
         };
         let written = codec::encode_request(&request, &mut encode_buf).unwrap();
@@ -196,6 +197,7 @@ mod tests {
         for i in 0..10 {
             let request = Request::CancelOrder {
                 symbol: Symbol(1),
+                account: AccountId(1),
                 order_id: OrderId(i),
             };
             let written = codec::encode_request(&request, &mut encode_buf).unwrap();

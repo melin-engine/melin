@@ -614,8 +614,12 @@ impl MatchingStage {
             JournalEvent::SubmitOrder { symbol, order } => {
                 self.exchange.execute(symbol, order, reports);
             }
-            JournalEvent::CancelOrder { symbol, order_id } => {
-                self.exchange.cancel(symbol, order_id, reports);
+            JournalEvent::CancelOrder {
+                symbol,
+                account,
+                order_id,
+            } => {
+                self.exchange.cancel(symbol, account, order_id, reports);
             }
             JournalEvent::SetRiskLimits { symbol, limits } => {
                 self.exchange.set_risk_limits(symbol, limits);
@@ -628,12 +632,19 @@ impl MatchingStage {
             }
             JournalEvent::CancelReplace {
                 symbol,
+                account,
                 order_id,
                 new_price,
                 new_quantity,
             } => {
-                self.exchange
-                    .cancel_replace(symbol, order_id, new_price, new_quantity, reports);
+                self.exchange.cancel_replace(
+                    symbol,
+                    account,
+                    order_id,
+                    new_price,
+                    new_quantity,
+                    reports,
+                );
             }
             JournalEvent::SetFeeSchedule { symbol, schedule } => {
                 self.exchange.set_fee_schedule(symbol, schedule);

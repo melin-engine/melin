@@ -433,8 +433,8 @@ impl Exchange {
                 ] {
                     if !self.consumed_buf.contains(&(account, id))
                         && self.accounts.has_reservation(account, id)
-                        && !book.has_order(id)
-                        && !book.has_stop(id)
+                        && !book.has_order(account, id)
+                        && !book.has_stop(account, id)
                     {
                         self.accounts.release(account, id);
                         self.consumed_buf.push((account, id));
@@ -489,6 +489,7 @@ impl Exchange {
     pub fn cancel(
         &mut self,
         symbol: Symbol,
+        account: AccountId,
         order_id: OrderId,
         reports: &mut Vec<ExecutionReport>,
     ) {
@@ -501,7 +502,7 @@ impl Exchange {
         let Some(book) = self.books.get_mut(&symbol) else {
             return;
         };
-        book.cancel(order_id, reports);
+        book.cancel(account, order_id, reports);
 
         // Release reserved funds if cancellation succeeded.
         let new_reports = &reports[report_start..];
@@ -538,6 +539,7 @@ impl Exchange {
     pub fn cancel_replace(
         &mut self,
         symbol: Symbol,
+        account: AccountId,
         order_id: OrderId,
         new_price: Price,
         new_quantity: Quantity,
@@ -547,7 +549,6 @@ impl Exchange {
         // cancel-replace only modifies an existing order (reservation
         // currency is already known from the original order).
         if !self.instruments.contains_key(&symbol) {
-            let account = self.find_account_for_order(symbol, order_id);
             reports.push(ExecutionReport::Rejected {
                 order_id,
                 account,
@@ -557,7 +558,6 @@ impl Exchange {
         }
 
         let Some(book) = self.books.get_mut(&symbol) else {
-            let account = self.find_account_for_order(symbol, order_id);
             reports.push(ExecutionReport::Rejected {
                 order_id,
                 account,
@@ -569,8 +569,7 @@ impl Exchange {
         // 1. Order must exist as a resting limit order.
         // Use peek_order_location (O(1) index lookup) for validation —
         // the VecDeque scan for old_remaining is deferred to replace_order.
-        let Some((account, side, _old_price)) = book.peek_order_location(order_id) else {
-            let account = self.find_account_for_order(symbol, order_id);
+        let Some((side, _old_price)) = book.peek_order_location(account, order_id) else {
             reports.push(ExecutionReport::Rejected {
                 order_id,
                 account,
@@ -703,8 +702,8 @@ impl Exchange {
         // scan). This returns (account, old_price, old_remaining).
         // Cannot fail since we verified the order exists above and matching is
         // single-threaded (no concurrent removal possible).
-        let (_account, old_price, old_remaining) = book
-            .replace_order(order_id, new_price, new_quantity)
+        let (old_price, old_remaining) = book
+            .replace_order(account, order_id, new_price, new_quantity)
             .expect("order verified to exist");
 
         reports.push(ExecutionReport::Replaced {
@@ -715,29 +714,6 @@ impl Exchange {
             old_remaining,
             new_remaining: new_quantity,
         });
-    }
-
-    /// Find the account that owns the given order.
-    ///
-    /// First checks the order book's index (O(1)), then falls back to scanning
-    /// `order_sides` (O(n)). Returns `AccountId(u32::MAX)` if the order is not
-    /// found. This sentinel value is used in reject reports for cancel-replace
-    /// on nonexistent orders; the response stage routes by connection_id (not
-    /// account), so the account field is informational only. `u32::MAX` is
-    /// preferred over `0` because account 0 is a valid account in production.
-    fn find_account_for_order(&self, symbol: Symbol, order_id: OrderId) -> AccountId {
-        // Try the book's O(1) order index first.
-        if let Some(book) = self.books.get(&symbol)
-            && let Some((account, _, _)) = book.peek_order_location(order_id)
-        {
-            return account;
-        }
-        // Fallback: linear scan of order_sides (rare path).
-        self.order_sides
-            .keys()
-            .find(|&&(_, oid)| oid == order_id)
-            .map(|&(account, _)| account)
-            .unwrap_or(AccountId(u32::MAX))
     }
 }
 
@@ -970,7 +946,7 @@ mod tests {
         );
         reports.clear();
 
-        exchange.cancel(btc, OrderId(1), &mut reports);
+        exchange.cancel(btc, ACCT_A, OrderId(1), &mut reports);
         assert!(matches!(reports[0], ExecutionReport::Cancelled { .. }));
 
         assert_eq!(exchange.accounts().balance(ACCT_A, USD).available, 10_000);
@@ -1079,7 +1055,7 @@ mod tests {
         reports.clear();
 
         // Cancel the remaining 5.
-        exchange.cancel(btc, OrderId(2), &mut reports);
+        exchange.cancel(btc, ACCT_A, OrderId(2), &mut reports);
 
         // Buyer: spent 500 on 5 fills, 500 returned from cancel.
         assert_eq!(exchange.accounts().balance(ACCT_A, USD).available, 9_500);
@@ -2931,7 +2907,7 @@ mod tests {
 
         // ACCT_B's order should still be resting.
         reports.clear();
-        exchange.cancel(Symbol(1), OrderId(100), &mut reports);
+        exchange.cancel(Symbol(1), ACCT_B, OrderId(100), &mut reports);
         assert_eq!(reports.len(), 1);
         assert!(matches!(reports[0], ExecutionReport::Cancelled { .. }));
     }
@@ -3070,6 +3046,182 @@ mod tests {
         );
         // Should succeed — dedup is per-account, not global.
         assert!(matches!(reports[0], ExecutionReport::Fill { .. }));
+    }
+
+    #[test]
+    fn same_order_id_different_accounts_cancel_targets_correct_order() {
+        // Two accounts place resting orders with the same OrderId on the
+        // same side. Cancelling one must not affect the other.
+        let mut exchange = Exchange::new();
+        let btc = Symbol(1);
+        exchange.add_instrument(btc_usd_spec());
+        exchange.deposit(ACCT_A, USD, 100_000);
+        exchange.deposit(ACCT_B, USD, 100_000);
+
+        let mut reports = Vec::new();
+
+        // Both place buy OrderId(1) at different prices (so they don't fill).
+        exchange.execute(
+            btc,
+            limit_order(1, ACCT_A, Side::Buy, 90, 10, TimeInForce::GTC),
+            &mut reports,
+        );
+        assert!(matches!(reports[0], ExecutionReport::Placed { .. }));
+        reports.clear();
+
+        exchange.execute(
+            btc,
+            limit_order(1, ACCT_B, Side::Buy, 80, 5, TimeInForce::GTC),
+            &mut reports,
+        );
+        assert!(matches!(reports[0], ExecutionReport::Placed { .. }));
+        reports.clear();
+
+        // Cancel ACCT_A's order — ACCT_B's should survive.
+        exchange.cancel(btc, ACCT_A, OrderId(1), &mut reports);
+        assert_eq!(reports.len(), 1);
+        assert!(matches!(
+            reports[0],
+            ExecutionReport::Cancelled {
+                order_id: OrderId(1),
+                account: ACCT_A,
+                ..
+            }
+        ));
+        reports.clear();
+
+        // ACCT_A's reservation released.
+        assert_eq!(exchange.accounts().balance(ACCT_A, USD).reserved, 0);
+        // ACCT_B's reservation still held.
+        assert!(exchange.accounts().balance(ACCT_B, USD).reserved > 0);
+
+        // Cancel ACCT_B's order — should also work.
+        exchange.cancel(btc, ACCT_B, OrderId(1), &mut reports);
+        assert_eq!(reports.len(), 1);
+        assert!(matches!(
+            reports[0],
+            ExecutionReport::Cancelled {
+                order_id: OrderId(1),
+                account: ACCT_B,
+                ..
+            }
+        ));
+        assert_eq!(exchange.accounts().balance(ACCT_B, USD).reserved, 0);
+    }
+
+    #[test]
+    fn same_order_id_different_accounts_amend_targets_correct_order() {
+        // Two accounts with the same OrderId resting. Amending one must
+        // not affect the other.
+        let mut exchange = Exchange::new();
+        let btc = Symbol(1);
+        exchange.add_instrument(btc_usd_spec());
+        exchange.deposit(ACCT_A, USD, 100_000);
+        exchange.deposit(ACCT_B, USD, 100_000);
+
+        let mut reports = Vec::new();
+
+        exchange.execute(
+            btc,
+            limit_order(1, ACCT_A, Side::Buy, 90, 10, TimeInForce::GTC),
+            &mut reports,
+        );
+        reports.clear();
+        exchange.execute(
+            btc,
+            limit_order(1, ACCT_B, Side::Buy, 80, 5, TimeInForce::GTC),
+            &mut reports,
+        );
+        reports.clear();
+
+        // Amend ACCT_A's order to new price/qty.
+        exchange.cancel_replace(btc, ACCT_A, OrderId(1), price(85), qty(8), &mut reports);
+        assert_eq!(reports.len(), 1);
+        if let ExecutionReport::Replaced {
+            order_id,
+            old_price,
+            new_price,
+            old_remaining,
+            new_remaining,
+            ..
+        } = &reports[0]
+        {
+            assert_eq!(*order_id, OrderId(1));
+            assert_eq!(*old_price, price(90));
+            assert_eq!(*new_price, price(85));
+            assert_eq!(*old_remaining, qty(10));
+            assert_eq!(*new_remaining, qty(8));
+        } else {
+            panic!("expected Replaced, got {:?}", reports[0]);
+        }
+        reports.clear();
+
+        // ACCT_B's order should be unchanged — verify by cancelling it
+        // and checking the remaining quantity is still 5 at price 80.
+        exchange.cancel(btc, ACCT_B, OrderId(1), &mut reports);
+        if let ExecutionReport::Cancelled {
+            remaining_quantity, ..
+        } = &reports[0]
+        {
+            assert_eq!(*remaining_quantity, qty(5));
+        } else {
+            panic!("expected Cancelled, got {:?}", reports[0]);
+        }
+    }
+
+    #[test]
+    fn same_order_id_different_accounts_cancel_all_targets_correct_account() {
+        // Two accounts with the same OrderId resting. CancelAll for one
+        // account must not touch the other's orders.
+        let mut exchange = Exchange::new();
+        let btc = Symbol(1);
+        exchange.add_instrument(btc_usd_spec());
+        exchange.deposit(ACCT_A, USD, 100_000);
+        exchange.deposit(ACCT_B, USD, 100_000);
+
+        let mut reports = Vec::new();
+
+        exchange.execute(
+            btc,
+            limit_order(1, ACCT_A, Side::Buy, 90, 10, TimeInForce::GTC),
+            &mut reports,
+        );
+        reports.clear();
+        exchange.execute(
+            btc,
+            limit_order(1, ACCT_B, Side::Buy, 80, 5, TimeInForce::GTC),
+            &mut reports,
+        );
+        reports.clear();
+
+        // CancelAll for ACCT_A.
+        exchange.cancel_all(ACCT_A, &mut reports);
+        assert_eq!(reports.len(), 1);
+        assert!(matches!(
+            reports[0],
+            ExecutionReport::Cancelled {
+                order_id: OrderId(1),
+                account: ACCT_A,
+                ..
+            }
+        ));
+        reports.clear();
+
+        // ACCT_A fully released, ACCT_B still has reservation.
+        assert_eq!(exchange.accounts().balance(ACCT_A, USD).reserved, 0);
+        assert!(exchange.accounts().balance(ACCT_B, USD).reserved > 0);
+
+        // ACCT_B's order is still live — it can be cancelled independently.
+        exchange.cancel(btc, ACCT_B, OrderId(1), &mut reports);
+        assert_eq!(reports.len(), 1);
+        assert!(matches!(
+            reports[0],
+            ExecutionReport::Cancelled {
+                order_id: OrderId(1),
+                account: ACCT_B,
+                ..
+            }
+        ));
     }
 
     // --- Circuit breaker tests ---
@@ -3619,7 +3771,7 @@ mod tests {
 
         // Cancel should still work — cancels bypass circuit breaker checks.
         reports.clear();
-        exchange.cancel(Symbol(1), OrderId(1), &mut reports);
+        exchange.cancel(Symbol(1), ACCT_A, OrderId(1), &mut reports);
         assert!(matches!(reports[0], ExecutionReport::Cancelled { .. }));
     }
 
@@ -3923,7 +4075,7 @@ mod tests {
         reports.clear();
 
         // Cancel-replace to price 120 (same qty).
-        exchange.cancel_replace(btc, OrderId(1), price(120), qty(10), &mut reports);
+        exchange.cancel_replace(btc, ACCT_A, OrderId(1), price(120), qty(10), &mut reports);
 
         assert_eq!(reports.len(), 1);
         assert_eq!(
@@ -3967,7 +4119,7 @@ mod tests {
         reports.clear();
 
         // Cancel-replace order 1 to lower qty (5). Should keep priority.
-        exchange.cancel_replace(btc, OrderId(1), price(100), qty(5), &mut reports);
+        exchange.cancel_replace(btc, ACCT_A, OrderId(1), price(100), qty(5), &mut reports);
         assert!(matches!(reports[0], ExecutionReport::Replaced { .. }));
         reports.clear();
 
@@ -4017,7 +4169,7 @@ mod tests {
         reports.clear();
 
         // Cancel-replace order 1 to higher qty (15). Should lose priority.
-        exchange.cancel_replace(btc, OrderId(1), price(100), qty(15), &mut reports);
+        exchange.cancel_replace(btc, ACCT_A, OrderId(1), price(100), qty(15), &mut reports);
         assert!(matches!(reports[0], ExecutionReport::Replaced { .. }));
         reports.clear();
 
@@ -4062,7 +4214,7 @@ mod tests {
         reports.clear();
 
         // Cancel-replace to price 500 for 10 (would need 5000, only have 1100 total).
-        exchange.cancel_replace(btc, OrderId(1), price(500), qty(10), &mut reports);
+        exchange.cancel_replace(btc, ACCT_A, OrderId(1), price(500), qty(10), &mut reports);
 
         assert_eq!(reports.len(), 1);
         assert_eq!(
@@ -4088,14 +4240,14 @@ mod tests {
         let mut reports = Vec::new();
 
         // Cancel-replace on an order ID that was never placed.
-        exchange.cancel_replace(btc, OrderId(999), price(100), qty(10), &mut reports);
+        exchange.cancel_replace(btc, ACCT_A, OrderId(999), price(100), qty(10), &mut reports);
 
         assert_eq!(reports.len(), 1);
         assert_eq!(
             reports[0],
             ExecutionReport::Rejected {
                 order_id: OrderId(999),
-                account: AccountId(u32::MAX),
+                account: ACCT_A,
                 reason: RejectReason::UnknownOrder,
             }
         );
@@ -4108,14 +4260,21 @@ mod tests {
 
         let mut reports = Vec::new();
 
-        exchange.cancel_replace(Symbol(42), OrderId(1), price(100), qty(10), &mut reports);
+        exchange.cancel_replace(
+            Symbol(42),
+            ACCT_A,
+            OrderId(1),
+            price(100),
+            qty(10),
+            &mut reports,
+        );
 
         assert_eq!(reports.len(), 1);
         assert_eq!(
             reports[0],
             ExecutionReport::Rejected {
                 order_id: OrderId(1),
-                account: AccountId(u32::MAX),
+                account: ACCT_A,
                 reason: RejectReason::UnknownSymbol,
             }
         );
@@ -4148,7 +4307,7 @@ mod tests {
         reports.clear();
 
         // Cancel-replace the buy to price 110 — would cross the ask.
-        exchange.cancel_replace(btc, OrderId(1), price(110), qty(10), &mut reports);
+        exchange.cancel_replace(btc, ACCT_A, OrderId(1), price(110), qty(10), &mut reports);
 
         assert_eq!(reports.len(), 1);
         assert_eq!(
@@ -4192,7 +4351,7 @@ mod tests {
         );
 
         // Cancel-replace should be rejected.
-        exchange.cancel_replace(btc, OrderId(1), price(120), qty(10), &mut reports);
+        exchange.cancel_replace(btc, ACCT_A, OrderId(1), price(120), qty(10), &mut reports);
 
         assert_eq!(reports.len(), 1);
         assert_eq!(
@@ -4237,7 +4396,7 @@ mod tests {
         );
 
         // Cancel-replace to price 120 — outside upper band.
-        exchange.cancel_replace(btc, OrderId(1), price(120), qty(10), &mut reports);
+        exchange.cancel_replace(btc, ACCT_A, OrderId(1), price(120), qty(10), &mut reports);
 
         assert_eq!(reports.len(), 1);
         assert_eq!(
@@ -4281,7 +4440,7 @@ mod tests {
         );
 
         // Cancel-replace to qty 25 — exceeds limit.
-        exchange.cancel_replace(btc, OrderId(1), price(100), qty(25), &mut reports);
+        exchange.cancel_replace(btc, ACCT_A, OrderId(1), price(100), qty(25), &mut reports);
 
         assert_eq!(reports.len(), 1);
         assert_eq!(
@@ -4326,7 +4485,7 @@ mod tests {
         reports.clear();
 
         // Cancel-replace remaining to qty 50 at price 90.
-        exchange.cancel_replace(btc, OrderId(1), price(90), qty(50), &mut reports);
+        exchange.cancel_replace(btc, ACCT_A, OrderId(1), price(90), qty(50), &mut reports);
 
         assert_eq!(reports.len(), 1);
         assert_eq!(
@@ -4370,7 +4529,7 @@ mod tests {
         reports.clear();
 
         // Cancel-replace to price 180, qty 8.
-        exchange.cancel_replace(btc, OrderId(1), price(180), qty(8), &mut reports);
+        exchange.cancel_replace(btc, ACCT_A, OrderId(1), price(180), qty(8), &mut reports);
 
         assert_eq!(reports.len(), 1);
         assert_eq!(
@@ -4408,7 +4567,7 @@ mod tests {
         reports.clear();
 
         // Cancel-replace with same price and qty — should succeed as a no-op.
-        exchange.cancel_replace(btc, OrderId(1), price(100), qty(10), &mut reports);
+        exchange.cancel_replace(btc, ACCT_A, OrderId(1), price(100), qty(10), &mut reports);
 
         assert_eq!(reports.len(), 1);
         assert_eq!(
@@ -4453,7 +4612,7 @@ mod tests {
         reports.clear();
 
         // Replace to price 130 — above upper band.
-        exchange.cancel_replace(btc, OrderId(1), price(130), qty(10), &mut reports);
+        exchange.cancel_replace(btc, ACCT_A, OrderId(1), price(130), qty(10), &mut reports);
         assert!(matches!(
             reports[0],
             ExecutionReport::Rejected {
@@ -4489,7 +4648,7 @@ mod tests {
         reports.clear();
 
         // Replace to 200*100 = 20_000 notional — exceeds 10_000 limit.
-        exchange.cancel_replace(btc, OrderId(1), price(200), qty(100), &mut reports);
+        exchange.cancel_replace(btc, ACCT_A, OrderId(1), price(200), qty(100), &mut reports);
         assert!(matches!(
             reports[0],
             ExecutionReport::Rejected {
@@ -4526,7 +4685,7 @@ mod tests {
         reports.clear();
 
         // Replace ask to price 100 — would cross the bid. Rejected.
-        exchange.cancel_replace(btc, OrderId(2), price(100), qty(10), &mut reports);
+        exchange.cancel_replace(btc, ACCT_A, OrderId(2), price(100), qty(10), &mut reports);
         assert!(matches!(
             reports[0],
             ExecutionReport::Rejected {
@@ -4557,7 +4716,7 @@ mod tests {
         // Replace to a price/qty combination that overflows u64.
         // Price close to u64::MAX, qty > 1 → overflow.
         let huge_price = Price(NonZeroU64::new(u64::MAX / 2).unwrap());
-        exchange.cancel_replace(btc, OrderId(1), huge_price, qty(3), &mut reports);
+        exchange.cancel_replace(btc, ACCT_A, OrderId(1), huge_price, qty(3), &mut reports);
         assert!(matches!(
             reports[0],
             ExecutionReport::Rejected {

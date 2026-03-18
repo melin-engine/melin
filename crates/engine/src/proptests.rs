@@ -13,6 +13,9 @@ use crate::exchange::Exchange;
 use crate::orderbook::OrderBook;
 use crate::types::*;
 
+/// Default test account for orderbook proptests (same as orderbook::tests::TEST_ACCOUNT).
+const TEST_ACCOUNT: AccountId = AccountId(1);
+
 // ---------------------------------------------------------------------------
 // Constants and helpers
 // ---------------------------------------------------------------------------
@@ -327,7 +330,7 @@ fn run_book_actions(
                 action_order_ids.push(None);
                 if *target_idx < action_idx {
                     if let Some(id) = action_order_ids[*target_idx] {
-                        book.cancel(id, &mut reports);
+                        book.cancel(TEST_ACCOUNT, id, &mut reports);
                     }
                 }
             }
@@ -449,13 +452,17 @@ fn assert_exchange_consistent(exchange: &Exchange, action_idx: usize, action_des
 /// Run a sequence of ExchangeActions and return final exchange state plus all reports.
 fn run_exchange_actions(
     actions: &[ExchangeAction],
-) -> (Exchange, Vec<Option<OrderId>>, Vec<ExecutionReport>) {
+) -> (
+    Exchange,
+    Vec<Option<(OrderId, AccountId)>>,
+    Vec<ExecutionReport>,
+) {
     let mut exchange = Exchange::new();
     exchange.add_instrument(btc_usd_spec());
     let mut reports = Vec::new();
     let mut all_reports = Vec::new();
     let mut next_id = 1u64;
-    let mut action_order_ids: Vec<Option<OrderId>> = Vec::new();
+    let mut action_order_ids: Vec<Option<(OrderId, AccountId)>> = Vec::new();
     let sym = Symbol(1);
 
     for action in actions {
@@ -479,7 +486,7 @@ fn run_exchange_actions(
             } => {
                 let id = OrderId(next_id);
                 next_id += 1;
-                action_order_ids.push(Some(id));
+                action_order_ids.push(Some((id, *account)));
                 let order = Order {
                     id,
                     account: *account,
@@ -501,7 +508,7 @@ fn run_exchange_actions(
             } => {
                 let id = OrderId(next_id);
                 next_id += 1;
-                action_order_ids.push(Some(id));
+                action_order_ids.push(Some((id, *account)));
                 let order = Order {
                     id,
                     account: *account,
@@ -524,7 +531,7 @@ fn run_exchange_actions(
             } => {
                 let id = OrderId(next_id);
                 next_id += 1;
-                action_order_ids.push(Some(id));
+                action_order_ids.push(Some((id, *account)));
                 let order = Order {
                     id,
                     account: *account,
@@ -551,7 +558,7 @@ fn run_exchange_actions(
             } => {
                 let id = OrderId(next_id);
                 next_id += 1;
-                action_order_ids.push(Some(id));
+                action_order_ids.push(Some((id, *account)));
                 let order = Order {
                     id,
                     account: *account,
@@ -571,8 +578,8 @@ fn run_exchange_actions(
             ExchangeAction::Cancel { target_idx } => {
                 action_order_ids.push(None);
                 if *target_idx < action_idx {
-                    if let Some(id) = action_order_ids[*target_idx] {
-                        exchange.cancel(sym, id, &mut reports);
+                    if let Some((id, account)) = action_order_ids[*target_idx] {
+                        exchange.cancel(sym, account, id, &mut reports);
                         all_reports.extend_from_slice(&reports);
                         reports.clear();
                     }
@@ -1214,7 +1221,7 @@ proptest! {
                 | ExchangeAction::Market { stp, .. }
                 | ExchangeAction::Stop { stp, .. }
                 | ExchangeAction::StopLimit { stp, .. } => {
-                    if let Some(id) = order_ids[id_idx] {
+                    if let Some((id, _account)) = order_ids[id_idx] {
                         stp_map.insert(id, *stp);
                     }
                     id_idx += 1;

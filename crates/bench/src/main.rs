@@ -361,16 +361,28 @@ fn run_engine_bench(
             GeneratedEvent::Submit { symbol, order } => {
                 exchange.execute(symbol, order, &mut reports);
             }
-            GeneratedEvent::Cancel { symbol, order_id } => {
-                exchange.cancel(symbol, order_id, &mut reports);
+            GeneratedEvent::Cancel {
+                symbol,
+                account,
+                order_id,
+            } => {
+                exchange.cancel(symbol, account, order_id, &mut reports);
             }
             GeneratedEvent::CancelReplace {
                 symbol,
+                account,
                 order_id,
                 new_price,
                 new_quantity,
             } => {
-                exchange.cancel_replace(symbol, order_id, new_price, new_quantity, &mut reports);
+                exchange.cancel_replace(
+                    symbol,
+                    account,
+                    order_id,
+                    new_price,
+                    new_quantity,
+                    &mut reports,
+                );
             }
         }
     }
@@ -402,17 +414,29 @@ fn run_engine_bench(
                 exchange.execute(symbol, order, &mut reports);
                 submits += 1;
             }
-            GeneratedEvent::Cancel { symbol, order_id } => {
-                exchange.cancel(symbol, order_id, &mut reports);
+            GeneratedEvent::Cancel {
+                symbol,
+                account,
+                order_id,
+            } => {
+                exchange.cancel(symbol, account, order_id, &mut reports);
                 cancels += 1;
             }
             GeneratedEvent::CancelReplace {
                 symbol,
+                account,
                 order_id,
                 new_price,
                 new_quantity,
             } => {
-                exchange.cancel_replace(symbol, order_id, new_price, new_quantity, &mut reports);
+                exchange.cancel_replace(
+                    symbol,
+                    account,
+                    order_id,
+                    new_price,
+                    new_quantity,
+                    &mut reports,
+                );
                 amends += 1;
             }
         }

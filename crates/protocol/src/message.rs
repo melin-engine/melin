@@ -24,7 +24,11 @@ pub enum Request {
     /// Submit an order for matching.
     SubmitOrder { symbol: Symbol, order: Order },
     /// Cancel a resting or pending stop order.
-    CancelOrder { symbol: Symbol, order_id: OrderId },
+    CancelOrder {
+        symbol: Symbol,
+        account: AccountId,
+        order_id: OrderId,
+    },
     /// Cancel all resting orders and pending stops for an account
     /// across all instruments (kill switch).
     CancelAll { account: AccountId },
@@ -33,6 +37,7 @@ pub enum Request {
     /// order remains intact. `new_quantity` is the desired new remaining.
     CancelReplace {
         symbol: Symbol,
+        account: AccountId,
         order_id: OrderId,
         new_price: Price,
         new_quantity: Quantity,

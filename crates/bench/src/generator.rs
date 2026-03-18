@@ -126,11 +126,13 @@ pub enum GeneratedEvent {
     },
     Cancel {
         symbol: Symbol,
+        account: AccountId,
         order_id: OrderId,
     },
     /// Atomic price/quantity amendment of a resting order.
     CancelReplace {
         symbol: Symbol,
+        account: AccountId,
         order_id: OrderId,
         new_price: Price,
         new_quantity: Quantity,
@@ -145,7 +147,8 @@ pub struct OrderFlowGenerator {
     next_order_id: u64,
     /// Ring buffer of recently submitted order IDs available for cancellation.
     /// Fixed-size circular buffer to bound memory. OrderId(0) = empty slot.
-    live_orders: Vec<(OrderId, Symbol)>,
+    /// Stores (OrderId, AccountId, Symbol) so cancel/amend can include account.
+    live_orders: Vec<(OrderId, AccountId, Symbol)>,
     /// Write position in the live_orders ring buffer.
     live_cursor: usize,
     /// Number of valid entries in live_orders (up to capacity).
@@ -169,7 +172,7 @@ impl OrderFlowGenerator {
             config,
             rng: SmallRng::seed_from_u64(seed),
             next_order_id: start_id,
-            live_orders: vec![(OrderId(0), Symbol(0)); capacity],
+            live_orders: vec![(OrderId(0), AccountId(0), Symbol(0)); capacity],
             live_cursor: 0,
             live_count: 0,
             pending_cancels: Vec::new(),
@@ -216,16 +219,24 @@ impl OrderFlowGenerator {
             let event = self.next_event();
             let request = match event {
                 GeneratedEvent::Submit { symbol, order } => Request::SubmitOrder { symbol, order },
-                GeneratedEvent::Cancel { symbol, order_id } => {
-                    Request::CancelOrder { symbol, order_id }
-                }
+                GeneratedEvent::Cancel {
+                    symbol,
+                    account,
+                    order_id,
+                } => Request::CancelOrder {
+                    symbol,
+                    account,
+                    order_id,
+                },
                 GeneratedEvent::CancelReplace {
                     symbol,
+                    account,
                     order_id,
                     new_price,
                     new_quantity,
                 } => Request::CancelReplace {
                     symbol,
+                    account,
                     order_id,
                     new_price,
                     new_quantity,
@@ -314,15 +325,16 @@ impl OrderFlowGenerator {
             let cap = self.live_orders.len();
             let write_idx = self.live_cursor % cap;
             if self.live_count == cap {
-                let (evicted_id, evicted_sym) = self.live_orders[write_idx];
+                let (evicted_id, evicted_acct, evicted_sym) = self.live_orders[write_idx];
                 if evicted_id.0 != 0 {
                     self.pending_cancels.push(GeneratedEvent::Cancel {
                         symbol: evicted_sym,
+                        account: evicted_acct,
                         order_id: evicted_id,
                     });
                 }
             }
-            self.live_orders[write_idx] = (order_id, symbol);
+            self.live_orders[write_idx] = (order_id, account, symbol);
             self.live_cursor += 1;
             if self.live_count < cap {
                 self.live_count += 1;
@@ -353,7 +365,7 @@ impl OrderFlowGenerator {
 
         let cap = self.live_orders.len();
         let ring_idx = (self.live_cursor + cap - self.live_count + idx) % cap;
-        let (order_id, symbol) = self.live_orders[ring_idx];
+        let (order_id, account, symbol) = self.live_orders[ring_idx];
 
         // New price: small random offset from mid (tighter than initial placement).
         let side = if self.side_dist.sample(&mut self.rng) == 0 {
@@ -366,6 +378,7 @@ impl OrderFlowGenerator {
 
         GeneratedEvent::CancelReplace {
             symbol,
+            account,
             order_id,
             new_price,
             new_quantity,
@@ -385,14 +398,18 @@ impl OrderFlowGenerator {
         let cap = self.live_orders.len();
         // Ring entries are oldest-first: index 0 = oldest, live_count-1 = newest.
         let ring_idx = (self.live_cursor + cap - self.live_count + idx) % cap;
-        let (order_id, symbol) = self.live_orders[ring_idx];
+        let (order_id, account, symbol) = self.live_orders[ring_idx];
 
         // Swap-remove: replace with the oldest entry to keep the ring valid.
         let oldest_idx = (self.live_cursor + cap - self.live_count) % cap;
         self.live_orders[ring_idx] = self.live_orders[oldest_idx];
         self.live_count -= 1;
 
-        GeneratedEvent::Cancel { symbol, order_id }
+        GeneratedEvent::Cancel {
+            symbol,
+            account,
+            order_id,
+        }
     }
 
     /// Pick an account with Zipf-like distribution.
@@ -665,17 +682,23 @@ mod tests {
                 GeneratedEvent::Submit { symbol, order } => {
                     exchange.execute(symbol, order, &mut reports);
                 }
-                GeneratedEvent::Cancel { symbol, order_id } => {
-                    exchange.cancel(symbol, order_id, &mut reports);
+                GeneratedEvent::Cancel {
+                    symbol,
+                    account,
+                    order_id,
+                } => {
+                    exchange.cancel(symbol, account, order_id, &mut reports);
                 }
                 GeneratedEvent::CancelReplace {
                     symbol,
+                    account,
                     order_id,
                     new_price,
                     new_quantity,
                 } => {
                     exchange.cancel_replace(
                         symbol,
+                        account,
                         order_id,
                         new_price,
                         new_quantity,

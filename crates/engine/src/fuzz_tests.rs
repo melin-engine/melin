@@ -189,7 +189,8 @@ fn journal_event_from_bytes(data: &[u8]) -> Option<JournalEvent> {
             // CancelOrder.
             Some(JournalEvent::CancelOrder {
                 symbol: Symbol(u32_at(data, 1)?),
-                order_id: OrderId(u64_at(data, 5)?),
+                account: AccountId(u32_at(data, 5)?),
+                order_id: OrderId(u64_at(data, 9)?),
             })
         }
         4 => {

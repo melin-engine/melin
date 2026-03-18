@@ -93,10 +93,16 @@ pub fn encode_request(request: &Request, buf: &mut [u8]) -> Result<usize, Protoc
             pos += 4;
             pos += encode_order(order, &mut buf[pos..]);
         }
-        Request::CancelOrder { symbol, order_id } => {
+        Request::CancelOrder {
+            symbol,
+            account,
+            order_id,
+        } => {
             buf[pos] = TAG_CANCEL_ORDER;
             pos += 1;
             le::put_u32(&mut buf[pos..], symbol.0);
+            pos += 4;
+            le::put_u32(&mut buf[pos..], account.0);
             pos += 4;
             le::put_u64(&mut buf[pos..], order_id.0);
             pos += 8;
@@ -187,6 +193,7 @@ pub fn encode_request(request: &Request, buf: &mut [u8]) -> Result<usize, Protoc
         }
         Request::CancelReplace {
             symbol,
+            account,
             order_id,
             new_price,
             new_quantity,
@@ -194,6 +201,8 @@ pub fn encode_request(request: &Request, buf: &mut [u8]) -> Result<usize, Protoc
             buf[pos] = TAG_CANCEL_REPLACE;
             pos += 1;
             le::put_u32(&mut buf[pos..], symbol.0);
+            pos += 4;
+            le::put_u32(&mut buf[pos..], account.0);
             pos += 4;
             le::put_u64(&mut buf[pos..], order_id.0);
             pos += 8;
@@ -246,12 +255,14 @@ pub fn decode_request(buf: &[u8]) -> Result<Request, ProtocolError> {
             Ok(Request::SubmitOrder { symbol, order })
         }
         TAG_CANCEL_ORDER => {
-            if payload.len() < 12 {
+            // symbol(4) + account(4) + order_id(8) = 16
+            if payload.len() < 16 {
                 return Err(ProtocolError::Truncated);
             }
             Ok(Request::CancelOrder {
                 symbol: Symbol(le::get_u32(&payload[0..])),
-                order_id: OrderId(le::get_u64(&payload[4..])),
+                account: AccountId(le::get_u32(&payload[4..])),
+                order_id: OrderId(le::get_u64(&payload[8..])),
             })
         }
         TAG_CANCEL_ALL => {
@@ -379,20 +390,22 @@ pub fn decode_request(buf: &[u8]) -> Result<Request, ProtocolError> {
             })
         }
         TAG_CANCEL_REPLACE => {
-            // symbol(4) + order_id(8) + new_price(8) + new_quantity(8) = 28
-            if payload.len() < 28 {
+            // symbol(4) + account(4) + order_id(8) + new_price(8) + new_quantity(8) = 32
+            if payload.len() < 32 {
                 return Err(ProtocolError::Truncated);
             }
             let symbol = Symbol(le::get_u32(&payload[0..]));
-            let order_id = OrderId(le::get_u64(&payload[4..]));
-            let new_price = NonZeroU64::new(le::get_u64(&payload[12..])).ok_or(
+            let account = AccountId(le::get_u32(&payload[4..]));
+            let order_id = OrderId(le::get_u64(&payload[8..]));
+            let new_price = NonZeroU64::new(le::get_u64(&payload[16..])).ok_or(
                 ProtocolError::InvalidField("cancel-replace new_price is zero"),
             )?;
-            let new_quantity = NonZeroU64::new(le::get_u64(&payload[20..])).ok_or(
+            let new_quantity = NonZeroU64::new(le::get_u64(&payload[24..])).ok_or(
                 ProtocolError::InvalidField("cancel-replace new_quantity is zero"),
             )?;
             Ok(Request::CancelReplace {
                 symbol,
+                account,
                 order_id,
                 new_price: Price(new_price),
                 new_quantity: Quantity(new_quantity),
@@ -1006,6 +1019,7 @@ mod tests {
             },
             Request::CancelOrder {
                 symbol: Symbol(1),
+                account: AccountId(42),
                 order_id: OrderId(100),
             },
             Request::CancelAll {
@@ -1074,6 +1088,7 @@ mod tests {
             },
             Request::CancelReplace {
                 symbol: Symbol(1),
+                account: AccountId(42),
                 order_id: OrderId(42),
                 new_price: Price(nz(5500)),
                 new_quantity: Quantity(nz(30)),
@@ -1260,6 +1275,7 @@ mod tests {
     fn length_prefix_is_correct() {
         let request = Request::CancelOrder {
             symbol: Symbol(1),
+            account: AccountId(1),
             order_id: OrderId(42),
         };
         let mut buf = [0u8; 128];

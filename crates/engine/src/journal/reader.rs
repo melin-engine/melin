@@ -357,6 +357,7 @@ mod tests {
             },
             JournalEvent::CancelOrder {
                 symbol: Symbol(1),
+                account: AccountId(42),
                 order_id: OrderId(1),
             },
         ]

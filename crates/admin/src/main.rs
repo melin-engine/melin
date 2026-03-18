@@ -154,8 +154,10 @@ enum NextStep {
     AfterPrice { collected: OrderFields },
     /// We just entered the quantity — go to TIF (limit) or submit (market/stop).
     AfterQuantity { collected: OrderFields },
-    /// Cancel order: entered symbol, now enter order ID.
-    CancelOrderId { symbol: u32 },
+    /// Cancel order: entered symbol, now enter account ID.
+    CancelOrderAccount { symbol: u32 },
+    /// Cancel order: entered account, now enter order ID.
+    CancelOrderId { symbol: u32, account: u32 },
     /// Cancel all: enter account ID.
     CancelAllAccount,
     // --- Admin flows ---
@@ -180,13 +182,20 @@ enum NextStep {
     },
     /// Cancel-replace: enter symbol.
     CancelReplaceSymbol,
-    /// Cancel-replace: entered symbol, enter order ID.
-    CancelReplaceOrderId { symbol: u32 },
+    /// Cancel-replace: entered symbol, enter account ID.
+    CancelReplaceAccount { symbol: u32 },
+    /// Cancel-replace: entered account, enter order ID.
+    CancelReplaceOrderId { symbol: u32, account: u32 },
     /// Cancel-replace: entered order ID, enter new price.
-    CancelReplacePrice { symbol: u32, order_id: u64 },
+    CancelReplacePrice {
+        symbol: u32,
+        account: u32,
+        order_id: u64,
+    },
     /// Cancel-replace: entered price, enter new quantity.
     CancelReplaceQty {
         symbol: u32,
+        account: u32,
         order_id: u64,
         new_price: u64,
     },
@@ -309,7 +318,7 @@ impl App {
                 match next {
                     // First step of any flow → back to action menu.
                     NextStep::Account { .. }
-                    | NextStep::CancelOrderId { symbol: 0 }
+                    | NextStep::CancelOrderAccount { symbol: 0 }
                     | NextStep::CancelAllAccount
                     | NextStep::AddInstrumentBase { symbol: 0 }
                     | NextStep::DepositAccount
@@ -378,10 +387,15 @@ impl App {
                             }
                         }
                     }
-                    NextStep::CancelOrderId { .. } => Screen::NumberInput {
+                    NextStep::CancelOrderAccount { .. } => Screen::NumberInput {
                         label: "Symbol ID",
                         buf: String::new(),
-                        next: NextStep::CancelOrderId { symbol: 0 },
+                        next: NextStep::CancelOrderAccount { symbol: 0 },
+                    },
+                    NextStep::CancelOrderId { symbol, .. } => Screen::NumberInput {
+                        label: "Account ID",
+                        buf: String::new(),
+                        next: NextStep::CancelOrderAccount { symbol: *symbol },
                     },
                     NextStep::AddInstrumentBase { .. } => Screen::NumberInput {
                         label: "Symbol ID",
@@ -413,23 +427,37 @@ impl App {
                         buf: String::new(),
                         next: NextStep::RiskLimitsMaxQty { symbol: *symbol },
                     },
-                    NextStep::CancelReplaceOrderId { .. } => Screen::NumberInput {
+                    NextStep::CancelReplaceAccount { .. } => Screen::NumberInput {
                         label: "Symbol ID",
                         buf: String::new(),
                         next: NextStep::CancelReplaceSymbol,
                     },
-                    NextStep::CancelReplacePrice { symbol, .. } => Screen::NumberInput {
+                    NextStep::CancelReplaceOrderId { symbol, .. } => Screen::NumberInput {
+                        label: "Account ID",
+                        buf: String::new(),
+                        next: NextStep::CancelReplaceAccount { symbol: *symbol },
+                    },
+                    NextStep::CancelReplacePrice {
+                        symbol, account, ..
+                    } => Screen::NumberInput {
                         label: "Order ID",
                         buf: String::new(),
-                        next: NextStep::CancelReplaceOrderId { symbol: *symbol },
+                        next: NextStep::CancelReplaceOrderId {
+                            symbol: *symbol,
+                            account: *account,
+                        },
                     },
                     NextStep::CancelReplaceQty {
-                        symbol, order_id, ..
+                        symbol,
+                        account,
+                        order_id,
+                        ..
                     } => Screen::NumberInput {
                         label: "New Price",
                         buf: String::new(),
                         next: NextStep::CancelReplacePrice {
                             symbol: *symbol,
+                            account: *account,
                             order_id: *order_id,
                         },
                     },
@@ -486,7 +514,7 @@ impl App {
                         self.screen = Screen::NumberInput {
                             label: "Symbol ID",
                             buf: String::new(),
-                            next: NextStep::CancelOrderId { symbol: 0 },
+                            next: NextStep::CancelOrderAccount { symbol: 0 },
                         };
                     }
                     9 => {
@@ -665,27 +693,38 @@ impl App {
                             self.cursor = 0;
                         }
                     }
-                    NextStep::CancelOrderId { symbol: _ } => {
-                        // `val` was the symbol on first pass. We stashed 0,
-                        // meaning we need the symbol first, then order ID.
-                        // Check if symbol is already set.
-                        if let NextStep::CancelOrderId { symbol: 0 } = next {
-                            self.screen = Screen::NumberInput {
-                                label: "Order ID",
-                                buf: String::new(),
-                                next: NextStep::CancelOrderId { symbol: val as u32 },
-                            };
-                        } else if let NextStep::CancelOrderId { symbol } = *next {
-                            let request = Request::CancelOrder {
-                                symbol: Symbol(symbol),
-                                order_id: OrderId(val),
-                            };
-                            self.log
-                                .push(format!("→ CANCEL #{val} on symbol {}", symbol,));
-                            let _ = self.request_tx.send(request);
-                            self.screen = Screen::ActionMenu;
-                            self.cursor = 0;
-                        }
+                    NextStep::CancelOrderAccount { symbol: 0 } => {
+                        // First pass: `val` is the symbol.
+                        self.screen = Screen::NumberInput {
+                            label: "Account ID",
+                            buf: String::new(),
+                            next: NextStep::CancelOrderAccount { symbol: val as u32 },
+                        };
+                    }
+                    NextStep::CancelOrderAccount { symbol } => {
+                        // Second pass: `val` is the account.
+                        self.screen = Screen::NumberInput {
+                            label: "Order ID",
+                            buf: String::new(),
+                            next: NextStep::CancelOrderId {
+                                symbol,
+                                account: val as u32,
+                            },
+                        };
+                    }
+                    NextStep::CancelOrderId { symbol, account } => {
+                        let request = Request::CancelOrder {
+                            symbol: Symbol(symbol),
+                            account: AccountId(account),
+                            order_id: OrderId(val),
+                        };
+                        self.log.push(format!(
+                            "→ CANCEL #{val} on symbol {} account {}",
+                            symbol, account
+                        ));
+                        let _ = self.request_tx.send(request);
+                        self.screen = Screen::ActionMenu;
+                        self.cursor = 0;
                     }
                     NextStep::CancelAllAccount => {
                         let request = Request::CancelAll {
@@ -815,27 +854,43 @@ impl App {
                     // --- Cancel-replace flow ---
                     NextStep::CancelReplaceSymbol => {
                         self.screen = Screen::NumberInput {
-                            label: "Order ID",
+                            label: "Account ID",
                             buf: String::new(),
-                            next: NextStep::CancelReplaceOrderId { symbol: val as u32 },
+                            next: NextStep::CancelReplaceAccount { symbol: val as u32 },
                         };
                     }
-                    NextStep::CancelReplaceOrderId { symbol } => {
+                    NextStep::CancelReplaceAccount { symbol } => {
+                        self.screen = Screen::NumberInput {
+                            label: "Order ID",
+                            buf: String::new(),
+                            next: NextStep::CancelReplaceOrderId {
+                                symbol,
+                                account: val as u32,
+                            },
+                        };
+                    }
+                    NextStep::CancelReplaceOrderId { symbol, account } => {
                         self.screen = Screen::NumberInput {
                             label: "New Price",
                             buf: String::new(),
                             next: NextStep::CancelReplacePrice {
                                 symbol,
+                                account,
                                 order_id: val,
                             },
                         };
                     }
-                    NextStep::CancelReplacePrice { symbol, order_id } => {
+                    NextStep::CancelReplacePrice {
+                        symbol,
+                        account,
+                        order_id,
+                    } => {
                         self.screen = Screen::NumberInput {
                             label: "New Quantity (remaining)",
                             buf: String::new(),
                             next: NextStep::CancelReplaceQty {
                                 symbol,
+                                account,
                                 order_id,
                                 new_price: val,
                             },
@@ -843,18 +898,20 @@ impl App {
                     }
                     NextStep::CancelReplaceQty {
                         symbol,
+                        account,
                         order_id,
                         new_price,
                     } => {
                         let request = Request::CancelReplace {
                             symbol: Symbol(symbol),
+                            account: AccountId(account),
                             order_id: OrderId(order_id),
                             new_price: Price(NonZeroU64::new(new_price).expect("validated > 0")),
                             new_quantity: Quantity(NonZeroU64::new(val).expect("validated > 0")),
                         };
                         self.log.push(format!(
-                            "→ CANCEL-REPLACE #{} sym:{} price:{} qty:{}",
-                            order_id, symbol, new_price, val
+                            "→ CANCEL-REPLACE #{} sym:{} acct:{} price:{} qty:{}",
+                            order_id, symbol, account, new_price, val
                         ));
                         let _ = self.request_tx.send(request);
                         self.screen = Screen::ActionMenu;
@@ -1093,11 +1150,13 @@ fn parse_text_command(input: &str) -> Result<Request, String> {
         return Err("empty command".into());
     }
     match parts[0] {
-        "cancel" if parts.len() >= 3 => {
+        "cancel" if parts.len() >= 4 => {
             let sym: u32 = parts[1].parse().map_err(|_| "invalid symbol")?;
-            let oid: u64 = parts[2].parse().map_err(|_| "invalid order_id")?;
+            let acct: u32 = parts[2].parse().map_err(|_| "invalid account")?;
+            let oid: u64 = parts[3].parse().map_err(|_| "invalid order_id")?;
             Ok(Request::CancelOrder {
                 symbol: Symbol(sym),
+                account: AccountId(acct),
                 order_id: OrderId(oid),
             })
         }

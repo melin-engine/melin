@@ -70,8 +70,14 @@ enum Screen {
         /// For limit orders: the price, once entered.
         price: Option<u64>,
     },
+    /// Picking an account for cancel.
+    CancelAccountMenu { symbol: usize },
     /// Typing the order ID to cancel.
-    CancelInput { symbol: usize, buf: String },
+    CancelInput {
+        symbol: usize,
+        account: usize,
+        buf: String,
+    },
 }
 
 #[derive(Clone, Copy)]
@@ -118,6 +124,7 @@ impl App {
             Screen::SymbolMenu { .. } => SYMBOLS.len(),
             Screen::AccountMenu { .. } => ACCOUNTS.len(),
             Screen::TifMenu { .. } => TIF_OPTIONS.len(),
+            Screen::CancelAccountMenu { .. } => ACCOUNTS.len(),
             Screen::NumberInput { .. } | Screen::CancelInput { .. } => 0,
         }
     }
@@ -176,7 +183,8 @@ impl App {
                     },
                 }
             }
-            Screen::CancelInput { .. } => Screen::SymbolMenu { action: 4 },
+            Screen::CancelAccountMenu { .. } => Screen::SymbolMenu { action: 4 },
+            Screen::CancelInput { symbol, .. } => Screen::CancelAccountMenu { symbol: *symbol },
         };
         self.cursor = 0;
     }
@@ -193,11 +201,9 @@ impl App {
                 let action = *action;
                 let symbol = self.cursor;
                 if action == 4 {
-                    // Cancel → go to order ID input.
-                    self.screen = Screen::CancelInput {
-                        symbol,
-                        buf: String::new(),
-                    };
+                    // Cancel → go to account selection.
+                    self.screen = Screen::CancelAccountMenu { symbol };
+                    self.cursor = 0;
                 } else {
                     self.screen = Screen::AccountMenu { action, symbol };
                     self.cursor = 0;
@@ -290,7 +296,20 @@ impl App {
                     }
                 }
             }
-            Screen::CancelInput { symbol, buf } => {
+            Screen::CancelAccountMenu { symbol } => {
+                let symbol = *symbol;
+                let account = self.cursor;
+                self.screen = Screen::CancelInput {
+                    symbol,
+                    account,
+                    buf: String::new(),
+                };
+            }
+            Screen::CancelInput {
+                symbol,
+                account,
+                buf,
+            } => {
                 let order_id: u64 = match buf.parse() {
                     Ok(v) => v,
                     _ => {
@@ -299,13 +318,15 @@ impl App {
                     }
                 };
                 let sym = Symbol(SYMBOLS[*symbol].1);
+                let acc = AccountId(ACCOUNTS[*account].1);
                 let request = Request::CancelOrder {
                     symbol: sym,
+                    account: acc,
                     order_id: OrderId(order_id),
                 };
                 self.log.push(format!(
-                    "Cancelling order #{order_id} on {}",
-                    SYMBOLS[*symbol].0
+                    "Cancelling order #{order_id} on {} for {}",
+                    SYMBOLS[*symbol].0, ACCOUNTS[*account].0
                 ));
                 if self.request_tx.send(request).is_err() {
                     self.log.push("Disconnected.".into());
@@ -571,6 +592,10 @@ fn draw(frame: &mut Frame, app: &App) {
             };
             draw_input(frame, label, buf);
         }
+        Screen::CancelAccountMenu { .. } => {
+            let items: Vec<&str> = ACCOUNTS.iter().map(|(name, _)| *name).collect();
+            draw_menu(frame, "Account", items.into_iter(), app.cursor);
+        }
         Screen::CancelInput { buf, .. } => {
             draw_input(frame, "Order ID", buf);
         }
@@ -646,6 +671,9 @@ fn draw_status_bar(frame: &mut Frame, app: &App, area: Rect) {
                 "{} → {} → {field_str}",
                 ACTIONS[*action], SYMBOLS[*symbol].0
             )
+        }
+        Screen::CancelAccountMenu { symbol } => {
+            format!("Cancel → {} → Select account", SYMBOLS[*symbol].0)
         }
         Screen::CancelInput { symbol, .. } => {
             format!("Cancel → {} → Enter order ID", SYMBOLS[*symbol].0)

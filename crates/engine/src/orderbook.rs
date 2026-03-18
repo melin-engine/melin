@@ -226,14 +226,12 @@ impl BookSide {
 pub struct OrderBook {
     bids: BookSide,
     asks: BookSide,
-    /// HashMap: O(1) amortized lookup for cancel operations. Maps order_id to
-    /// its location (account, side, price) so we don't need to scan the book.
-    /// NOTE: keyed by OrderId alone. If different accounts use the same OrderId
-    /// on the same instrument, the second insert silently overwrites the first,
-    /// making the first order unreachable by cancel/amend. In practice this is
-    /// rare because the Exchange enforces per-account monotonic OrderIds, but
-    /// cross-account collisions are theoretically possible.
-    order_index: HashMap<OrderId, (AccountId, Side, Price)>,
+    /// HashMap: O(1) amortized lookup for cancel operations. Maps
+    /// (account, order_id) to its location (side, price) so we don't
+    /// need to scan the book. Keyed by (AccountId, OrderId) to eliminate
+    /// cross-account collisions — different accounts can independently
+    /// use the same OrderId without index conflicts.
+    order_index: HashMap<(AccountId, OrderId), (Side, Price)>,
     /// BTreeMap keyed by trigger price so we can efficiently find all stops
     /// that should fire at a given trade price. Stop buys trigger when price
     /// rises (iterate from lowest trigger up), stop sells when price falls
@@ -241,8 +239,9 @@ pub struct OrderBook {
     stop_buys: BTreeMap<Price, Vec<PendingStop>>,
     stop_sells: BTreeMap<Price, Vec<PendingStop>>,
     /// Tracks which order IDs are pending stops, for cancel support.
-    /// Same OrderId-collision caveat as `order_index` above.
-    stop_index: HashMap<OrderId, (AccountId, Side, Price)>,
+    /// Keyed by (AccountId, OrderId) to match order_index and eliminate
+    /// cross-account collisions.
+    stop_index: HashMap<(AccountId, OrderId), (Side, Price)>,
     /// Last trade price, used to determine which stops to trigger.
     last_trade_price: Option<Price>,
     /// Reusable buffers for `check_triggers()` to avoid per-order allocations.
@@ -296,9 +295,8 @@ impl OrderBook {
         let cap = self.order_index.capacity();
         for i in 0..cap {
             self.order_index.insert(
-                OrderId(i as u64),
+                (AccountId(0), OrderId(i as u64)),
                 (
-                    AccountId(0),
                     Side::Buy,
                     Price(std::num::NonZeroU64::new(1).expect("non-zero literal")),
                 ),
@@ -309,9 +307,8 @@ impl OrderBook {
         let cap = self.stop_index.capacity();
         for i in 0..cap {
             self.stop_index.insert(
-                OrderId(i as u64),
+                (AccountId(0), OrderId(i as u64)),
                 (
-                    AccountId(0),
                     Side::Buy,
                     Price(std::num::NonZeroU64::new(1).expect("non-zero literal")),
                 ),
@@ -324,10 +321,10 @@ impl OrderBook {
     pub(crate) fn from_parts(
         bids: BookSide,
         asks: BookSide,
-        order_index: HashMap<OrderId, (AccountId, Side, Price)>,
+        order_index: HashMap<(AccountId, OrderId), (Side, Price)>,
         stop_buys: BTreeMap<Price, Vec<PendingStop>>,
         stop_sells: BTreeMap<Price, Vec<PendingStop>>,
-        stop_index: HashMap<OrderId, (AccountId, Side, Price)>,
+        stop_index: HashMap<(AccountId, OrderId), (Side, Price)>,
         last_trade_price: Option<Price>,
     ) -> Self {
         Self {
@@ -366,60 +363,62 @@ impl OrderBook {
     }
 
     /// Snapshot the order index as a Vec for serialization.
+    /// Serialized as (order_id, account, side, price) for wire compatibility.
     pub(crate) fn snapshot_order_index(&self) -> Vec<(OrderId, AccountId, Side, Price)> {
         self.order_index
             .iter()
-            .map(|(&id, &(account, side, price))| (id, account, side, price))
+            .map(|(&(account, id), &(side, price))| (id, account, side, price))
             .collect()
     }
 
     /// Snapshot the stop index as a Vec for serialization.
+    /// Serialized as (order_id, account, side, price) for wire compatibility.
     pub(crate) fn snapshot_stop_index(&self) -> Vec<(OrderId, AccountId, Side, Price)> {
         self.stop_index
             .iter()
-            .map(|(&id, &(account, side, price))| (id, account, side, price))
+            .map(|(&(account, id), &(side, price))| (id, account, side, price))
             .collect()
     }
 
-    /// Check if a resting order with the given ID exists on the book.
-    pub(crate) fn has_order(&self, id: OrderId) -> bool {
-        self.order_index.contains_key(&id)
+    /// Check if a resting order with the given (account, order_id) exists on the book.
+    pub(crate) fn has_order(&self, account: AccountId, id: OrderId) -> bool {
+        self.order_index.contains_key(&(account, id))
     }
 
-    /// Check if a pending stop with the given ID exists on the book.
-    pub(crate) fn has_stop(&self, id: OrderId) -> bool {
-        self.stop_index.contains_key(&id)
+    /// Check if a pending stop with the given (account, order_id) exists on the book.
+    pub(crate) fn has_stop(&self, account: AccountId, id: OrderId) -> bool {
+        self.stop_index.contains_key(&(account, id))
     }
 
-    /// Look up a resting order's location from the index: (account, side, price).
+    /// Look up a resting order's location from the index: (side, price).
     /// O(1) HashMap lookup — no VecDeque scan. Returns `None` if the order is
     /// not on the book.
     pub(crate) fn peek_order_location(
         &self,
+        account: AccountId,
         order_id: OrderId,
-    ) -> Option<(AccountId, Side, Price)> {
-        self.order_index
-            .get(&order_id)
-            .map(|&(account, side, price)| (account, side, price))
+    ) -> Option<(Side, Price)> {
+        self.order_index.get(&(account, order_id)).copied()
     }
 
-    /// Look up a resting order's current state: (account, side, price, remaining).
+    /// Look up a resting order's current state: (side, price, remaining).
     /// Returns `None` if the order is not on the book.
     /// NOTE: This performs an O(n) VecDeque scan to find `remaining`. If you
-    /// only need account/side/price, use `peek_order_location` instead.
+    /// only need side/price, use `peek_order_location` instead.
     #[allow(dead_code)]
     pub(crate) fn get_resting_order(
         &self,
+        account: AccountId,
         order_id: OrderId,
-    ) -> Option<(AccountId, Side, Price, Quantity)> {
-        let &(account, side, price) = self.order_index.get(&order_id)?;
+    ) -> Option<(Side, Price, Quantity)> {
+        let &(side, price) = self.order_index.get(&(account, order_id))?;
         let book_side = match side {
             Side::Buy => &self.bids,
             Side::Sell => &self.asks,
         };
         let level = book_side.levels.get(&price)?;
         let order = level.iter().find(|o| o.id == order_id)?;
-        Some((account, side, price, order.remaining))
+        Some((side, price, order.remaining))
     }
 
     /// Best bid price (highest), or `None` if the bid side is empty.
@@ -444,11 +443,12 @@ impl OrderBook {
     /// a separate index lookup.
     pub(crate) fn replace_order(
         &mut self,
+        account: AccountId,
         order_id: OrderId,
         new_price: Price,
         new_quantity: Quantity,
-    ) -> Option<(AccountId, Price, Quantity)> {
-        let &(account, side, old_price) = self.order_index.get(&order_id)?;
+    ) -> Option<(Price, Quantity)> {
+        let &(side, old_price) = self.order_index.get(&(account, order_id))?;
         let book_side = match side {
             Side::Buy => &mut self.bids,
             Side::Sell => &mut self.asks,
@@ -469,7 +469,7 @@ impl OrderBook {
                 order.remaining = new_quantity;
                 level.push_back(order);
             }
-            Some((account, old_price, old_remaining))
+            Some((old_price, old_remaining))
         } else {
             // Price change → remove from old level, add to new level.
             // Manipulate the VecDeque directly to preserve the RestingOrder
@@ -489,9 +489,9 @@ impl OrderBook {
 
             // Update the order index to reflect the new price.
             self.order_index
-                .insert(order_id, (account, side, new_price));
+                .insert((account, order_id), (side, new_price));
 
-            Some((account, old_price, old_remaining))
+            Some((old_price, old_remaining))
         }
     }
 
@@ -523,15 +523,20 @@ impl OrderBook {
         self.check_triggers(reports);
     }
 
-    /// Cancel a resting or pending stop order by ID.
-    pub fn cancel(&mut self, order_id: OrderId, reports: &mut Vec<ExecutionReport>) {
+    /// Cancel a resting or pending stop order by (account, order_id).
+    pub fn cancel(
+        &mut self,
+        account: AccountId,
+        order_id: OrderId,
+        reports: &mut Vec<ExecutionReport>,
+    ) {
         // Try resting orders first.
-        if let Some((_account, side, price)) = self.order_index.remove(&order_id) {
+        if let Some((side, price)) = self.order_index.remove(&(account, order_id)) {
             let book_side = match side {
                 Side::Buy => &mut self.bids,
                 Side::Sell => &mut self.asks,
             };
-            if let Some((account, remaining)) = book_side.remove_with_account(price, order_id) {
+            if let Some((_acct, remaining)) = book_side.remove_with_account(price, order_id) {
                 reports.push(ExecutionReport::Cancelled {
                     order_id,
                     account,
@@ -542,7 +547,7 @@ impl OrderBook {
         }
 
         // Try pending stops.
-        if let Some((_account, side, trigger_price)) = self.stop_index.remove(&order_id) {
+        if let Some((side, trigger_price)) = self.stop_index.remove(&(account, order_id)) {
             let stops = match side {
                 Side::Buy => &mut self.stop_buys,
                 Side::Sell => &mut self.stop_sells,
@@ -613,7 +618,7 @@ impl OrderBook {
         // Cancel each collected order. cancel() handles removal from
         // order_index/stop_index, BookSide levels, and report generation.
         for id in to_cancel {
-            self.cancel(id, reports);
+            self.cancel(account, id, reports);
         }
     }
 
@@ -817,7 +822,8 @@ impl OrderBook {
                         SelfTradeProtection::CancelOldest => {
                             // Cancel the maker, continue matching the taker.
                             let cancelled_maker = level.pop_front().expect("front existed");
-                            self.order_index.remove(&cancelled_maker.id);
+                            self.order_index
+                                .remove(&(cancelled_maker.account, cancelled_maker.id));
                             reports.push(ExecutionReport::Cancelled {
                                 order_id: cancelled_maker.id,
                                 account: cancelled_maker.account,
@@ -828,7 +834,8 @@ impl OrderBook {
                         SelfTradeProtection::CancelBoth => {
                             // Cancel the maker and the taker.
                             let cancelled_maker = level.pop_front().expect("front existed");
-                            self.order_index.remove(&cancelled_maker.id);
+                            self.order_index
+                                .remove(&(cancelled_maker.account, cancelled_maker.id));
                             reports.push(ExecutionReport::Cancelled {
                                 order_id: cancelled_maker.id,
                                 account: cancelled_maker.account,
@@ -887,7 +894,8 @@ impl OrderBook {
                     None => {
                         // Maker fully filled — remove from book.
                         let filled_maker = level.pop_front().expect("front existed");
-                        self.order_index.remove(&filled_maker.id);
+                        self.order_index
+                            .remove(&(filled_maker.account, filled_maker.id));
                     }
                 }
 
@@ -940,7 +948,7 @@ impl OrderBook {
         };
         stops.entry(trigger_price).or_default().push(stop);
         self.stop_index
-            .insert(order.id, (order.account, order.side, trigger_price));
+            .insert((order.account, order.id), (order.side, trigger_price));
     }
 
     /// Check if the last trade price triggers any pending stop orders.
@@ -968,7 +976,7 @@ impl OrderBook {
         for &price in &self.trigger_price_buf {
             if let Some(stops) = self.stop_buys.remove(&price) {
                 for stop in &stops {
-                    self.stop_index.remove(&stop.id);
+                    self.stop_index.remove(&(stop.account, stop.id));
                 }
                 self.triggered_buf.extend(stops);
             }
@@ -988,7 +996,7 @@ impl OrderBook {
         for &price in &self.trigger_price_buf {
             if let Some(stops) = self.stop_sells.remove(&price) {
                 for stop in &stops {
-                    self.stop_index.remove(&stop.id);
+                    self.stop_index.remove(&(stop.account, stop.id));
                 }
                 self.triggered_buf.extend(stops);
             }
@@ -1056,7 +1064,7 @@ impl OrderBook {
                 remaining: quantity,
             },
         );
-        self.order_index.insert(id, (account, side, price));
+        self.order_index.insert((account, id), (side, price));
         reports.push(ExecutionReport::Placed {
             order_id: id,
             side,
@@ -1638,7 +1646,7 @@ mod tests {
         );
         reports.clear();
 
-        book.cancel(OrderId(1), &mut reports);
+        book.cancel(TEST_ACCOUNT, OrderId(1), &mut reports);
 
         assert_eq!(reports.len(), 1);
         assert_eq!(
@@ -1657,7 +1665,7 @@ mod tests {
         let mut book = OrderBook::new();
         let mut reports = Vec::new();
 
-        book.cancel(OrderId(999), &mut reports);
+        book.cancel(TEST_ACCOUNT, OrderId(999), &mut reports);
 
         assert!(reports.is_empty());
     }
@@ -1672,7 +1680,7 @@ mod tests {
             None,
             &mut reports,
         );
-        book.cancel(OrderId(1), &mut reports);
+        book.cancel(TEST_ACCOUNT, OrderId(1), &mut reports);
         reports.clear();
 
         // Market buy should find no liquidity.
@@ -2099,7 +2107,7 @@ mod tests {
         );
         reports.clear();
 
-        book.cancel(OrderId(1), &mut reports);
+        book.cancel(TEST_ACCOUNT, OrderId(1), &mut reports);
 
         assert_eq!(reports.len(), 1);
         assert_eq!(
@@ -2128,7 +2136,7 @@ mod tests {
             None,
             &mut reports,
         );
-        book.cancel(OrderId(2), &mut reports);
+        book.cancel(TEST_ACCOUNT, OrderId(2), &mut reports);
         reports.clear();
 
         // Trade at 100 — cancelled stop should not trigger.

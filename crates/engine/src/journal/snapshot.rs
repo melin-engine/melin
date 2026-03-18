@@ -1181,16 +1181,16 @@ impl OrderBook {
             btree
         };
 
-        let order_index: HashMap<OrderId, (AccountId, Side, Price)> = snap
+        let order_index: HashMap<(AccountId, OrderId), (Side, Price)> = snap
             .order_index
             .into_iter()
-            .map(|(id, account, side, price)| (id, (account, side, price)))
+            .map(|(id, account, side, price)| ((account, id), (side, price)))
             .collect();
 
-        let stop_index: HashMap<OrderId, (AccountId, Side, Price)> = snap
+        let stop_index: HashMap<(AccountId, OrderId), (Side, Price)> = snap
             .stop_index
             .into_iter()
-            .map(|(id, account, side, price)| (id, (account, side, price)))
+            .map(|(id, account, side, price)| ((account, id), (side, price)))
             .collect();
 
         Self::from_parts(

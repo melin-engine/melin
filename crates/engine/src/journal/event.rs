@@ -26,7 +26,11 @@ pub enum JournalEvent {
     /// Submit an order for matching.
     SubmitOrder { symbol: Symbol, order: Order },
     /// Cancel a resting or pending stop order.
-    CancelOrder { symbol: Symbol, order_id: OrderId },
+    CancelOrder {
+        symbol: Symbol,
+        account: AccountId,
+        order_id: OrderId,
+    },
     /// Set fat finger risk limits for an instrument.
     SetRiskLimits { symbol: Symbol, limits: RiskLimits },
     /// Cancel all resting orders and pending stops for an account
@@ -40,6 +44,7 @@ pub enum JournalEvent {
     /// Atomically amend a resting limit order's price and/or quantity.
     CancelReplace {
         symbol: Symbol,
+        account: AccountId,
         order_id: OrderId,
         new_price: Price,
         new_quantity: Quantity,

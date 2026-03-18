@@ -157,7 +157,8 @@ fn request_from_bytes(data: &[u8]) -> Option<Request> {
         }
         1 => Some(Request::CancelOrder {
             symbol: Symbol(u32_at(data, 1)?),
-            order_id: OrderId(u64_at(data, 5)?),
+            account: AccountId(u32_at(data, 5)?),
+            order_id: OrderId(u64_at(data, 9)?),
         }),
         2 => Some(Request::CancelAll {
             account: AccountId(u32_at(data, 1)?),

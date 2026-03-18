@@ -700,7 +700,15 @@ fn process_frames<R>(
 fn request_to_event(request: &Request) -> JournalEvent {
     match *request {
         Request::SubmitOrder { symbol, order } => JournalEvent::SubmitOrder { symbol, order },
-        Request::CancelOrder { symbol, order_id } => JournalEvent::CancelOrder { symbol, order_id },
+        Request::CancelOrder {
+            symbol,
+            account,
+            order_id,
+        } => JournalEvent::CancelOrder {
+            symbol,
+            account,
+            order_id,
+        },
         Request::CancelAll { account } => JournalEvent::CancelAll { account },
         Request::AddInstrument { spec } => JournalEvent::AddInstrument { spec },
         Request::Deposit {
@@ -718,11 +726,13 @@ fn request_to_event(request: &Request) -> JournalEvent {
         }
         Request::CancelReplace {
             symbol,
+            account,
             order_id,
             new_price,
             new_quantity,
         } => JournalEvent::CancelReplace {
             symbol,
+            account,
             order_id,
             new_price,
             new_quantity,

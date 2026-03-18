@@ -758,6 +758,7 @@ mod tests {
         // Reopen and append more.
         let extra = JournalEvent::CancelOrder {
             symbol: Symbol(1),
+            account: AccountId(1),
             order_id: OrderId(42),
         };
         {
@@ -825,6 +826,7 @@ mod tests {
 
         let cancel = JournalEvent::CancelOrder {
             symbol: Symbol(1),
+            account: AccountId(1),
             order_id: OrderId(99),
         };
 

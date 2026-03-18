@@ -148,8 +148,14 @@ pub fn encode(
             pos += encode_order(order, &mut buf[pos..]);
             TAG_SUBMIT_ORDER
         }
-        JournalEvent::CancelOrder { symbol, order_id } => {
+        JournalEvent::CancelOrder {
+            symbol,
+            account,
+            order_id,
+        } => {
             le::put_u32(&mut buf[pos..], symbol.0);
+            pos += 4;
+            le::put_u32(&mut buf[pos..], account.0);
             pos += 4;
             le::put_u64(&mut buf[pos..], order_id.0);
             pos += 8;
@@ -227,11 +233,14 @@ pub fn encode(
         }
         JournalEvent::CancelReplace {
             symbol,
+            account,
             order_id,
             new_price,
             new_quantity,
         } => {
             le::put_u32(&mut buf[pos..], symbol.0);
+            pos += 4;
+            le::put_u32(&mut buf[pos..], account.0);
             pos += 4;
             le::put_u64(&mut buf[pos..], order_id.0);
             pos += 8;
@@ -394,7 +403,8 @@ pub fn decode(buf: &[u8]) -> Result<(usize, u64, u64, JournalEvent), JournalErro
             JournalEvent::SubmitOrder { symbol, order }
         }
         TAG_CANCEL_ORDER => {
-            if payload.len() < 12 {
+            // symbol(4) + account(4) + order_id(8) = 16
+            if payload.len() < 16 {
                 return Err(JournalError::CorruptEntry {
                     sequence,
                     reason: "CancelOrder payload too short",
@@ -402,7 +412,8 @@ pub fn decode(buf: &[u8]) -> Result<(usize, u64, u64, JournalEvent), JournalErro
             }
             JournalEvent::CancelOrder {
                 symbol: Symbol(le::get_u32(&payload[0..])),
-                order_id: OrderId(le::get_u64(&payload[4..])),
+                account: AccountId(le::get_u32(&payload[4..])),
+                order_id: OrderId(le::get_u64(&payload[8..])),
             }
         }
         TAG_SET_RISK_LIMITS => {
@@ -580,27 +591,29 @@ pub fn decode(buf: &[u8]) -> Result<(usize, u64, u64, JournalEvent), JournalErro
             }
         }
         TAG_CANCEL_REPLACE => {
-            // symbol(4) + order_id(8) + new_price(8) + new_quantity(8) = 28
-            if payload.len() < 28 {
+            // symbol(4) + account(4) + order_id(8) + new_price(8) + new_quantity(8) = 32
+            if payload.len() < 32 {
                 return Err(JournalError::CorruptEntry {
                     sequence,
                     reason: "CancelReplace payload too short",
                 });
             }
             let symbol = Symbol(le::get_u32(&payload[0..]));
-            let order_id = OrderId(le::get_u64(&payload[4..]));
+            let account = AccountId(le::get_u32(&payload[4..]));
+            let order_id = OrderId(le::get_u64(&payload[8..]));
             let new_price =
-                NonZeroU64::new(le::get_u64(&payload[12..])).ok_or(JournalError::CorruptEntry {
+                NonZeroU64::new(le::get_u64(&payload[16..])).ok_or(JournalError::CorruptEntry {
                     sequence,
                     reason: "CancelReplace new_price is zero",
                 })?;
             let new_quantity =
-                NonZeroU64::new(le::get_u64(&payload[20..])).ok_or(JournalError::CorruptEntry {
+                NonZeroU64::new(le::get_u64(&payload[24..])).ok_or(JournalError::CorruptEntry {
                     sequence,
                     reason: "CancelReplace new_quantity is zero",
                 })?;
             JournalEvent::CancelReplace {
                 symbol,
+                account,
                 order_id,
                 new_price: Price(new_price),
                 new_quantity: Quantity(new_quantity),
@@ -885,6 +898,7 @@ mod tests {
             },
             JournalEvent::CancelOrder {
                 symbol: Symbol(1),
+                account: AccountId(42),
                 order_id: OrderId(100),
             },
             JournalEvent::SetRiskLimits {
@@ -922,6 +936,7 @@ mod tests {
             },
             JournalEvent::CancelReplace {
                 symbol: Symbol(1),
+                account: AccountId(42),
                 order_id: OrderId(100),
                 new_price: Price(nz(5500)),
                 new_quantity: Quantity(nz(8)),
