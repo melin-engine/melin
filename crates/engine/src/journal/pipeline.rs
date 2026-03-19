@@ -43,6 +43,14 @@ pub const OUTPUT_RING_CAPACITY: usize = 1 << 20;
 /// Limits the time spent encoding before sync, keeping tail latency bounded.
 const MAX_JOURNAL_BATCH: usize = 1024;
 
+/// Maximum events consumed per disruptor batch in the matching stage.
+/// Amortizes one atomic Release store over N events. Keep small to avoid
+/// burstiness that causes the response stage to wait on the journal cursor.
+/// Benchmarked: 32 is the sweet spot — lower values underperform due to
+/// consume_batch overhead, higher values (64+) add burstiness with no
+/// throughput gain. At ~100 ns/event, 32 events = ~3.2 µs burst.
+const MAX_MATCHING_BATCH: usize = 32;
+
 /// Slot in the input disruptor ring buffer.
 ///
 /// Carries a connection ID alongside the event so the response stage knows
@@ -401,6 +409,11 @@ impl MatchingStage {
 
     /// Run the matching stage loop. Blocks until shutdown.
     ///
+    /// Uses small-batch consumption from the disruptor to amortize the
+    /// atomic progress-store: one `Release` store per batch instead of
+    /// per event. Events are still processed sequentially — only the
+    /// disruptor I/O is batched.
+    ///
     /// Returns the `Exchange` on shutdown for potential snapshot saving.
     pub fn run(mut self, shutdown: &std::sync::atomic::AtomicBool) -> Exchange {
         // Pre-allocated report buffer, reused across commands.
@@ -417,6 +430,8 @@ impl MatchingStage {
         // of atomic fetch_add (~5-8ns). Flushed to the shared Arc<AtomicU64>
         // only when QueryStats fires (~1/sec) or on shutdown.
         let mut local_events: u64 = 0;
+
+        let mut batch = [InputSlot::default(); MAX_MATCHING_BATCH];
 
         #[cfg(feature = "pipeline-stats")]
         let mut busy_count: u64 = 0;
@@ -447,8 +462,9 @@ impl MatchingStage {
                 return self.exchange;
             }
 
-            let entry = self.consumer.try_consume();
-            let Some((input_seq, slot)) = entry else {
+            let batch_start = self.consumer.next_read();
+            let count = self.consumer.consume_batch(&mut batch, MAX_MATCHING_BATCH);
+            if count == 0 {
                 #[cfg(feature = "pipeline-stats")]
                 {
                     idle_count += 1;
@@ -460,57 +476,99 @@ impl MatchingStage {
                     std::thread::yield_now();
                 }
                 continue;
-            };
+            }
             idle_spins = 0;
-            #[cfg(feature = "pipeline-stats")]
-            {
-                busy_count += 1;
-            }
 
-            #[cfg(feature = "latency-trace")]
-            {
-                let now = trace_ts();
-                wakeup_hist.record_ns(crate::journal::trace::trace_elapsed_ns(
-                    slot.publish_ts,
-                    now,
-                ));
-            }
+            for (i, slot) in batch[..count].iter().enumerate() {
+                let input_seq = batch_start + i as u64;
 
-            reports.clear();
+                #[cfg(feature = "pipeline-stats")]
+                {
+                    busy_count += 1;
+                }
 
-            #[cfg(feature = "latency-trace")]
-            let exec_start = trace_ts();
+                #[cfg(feature = "latency-trace")]
+                {
+                    let now = trace_ts();
+                    wakeup_hist.record_ns(crate::journal::trace::trace_elapsed_ns(
+                        slot.publish_ts,
+                        now,
+                    ));
+                }
 
-            // QueryStats is handled inline — it reads matching-stage-owned
-            // state and publishes directly without touching the Exchange.
-            // Not counted in events_processed (it's not a trading event).
-            if matches!(slot.event, JournalEvent::QueryStats) {
+                reports.clear();
+
+                #[cfg(feature = "latency-trace")]
+                let exec_start = trace_ts();
+
+                // QueryStats is handled inline — it reads matching-stage-owned
+                // state and publishes directly without touching the Exchange.
+                // Not counted in events_processed (it's not a trading event).
+                if matches!(slot.event, JournalEvent::QueryStats) {
+                    #[cfg(feature = "latency-trace")]
+                    let exec_end = trace_ts();
+                    #[cfg(feature = "latency-trace")]
+                    execute_hist.record_ns(crate::journal::trace::trace_elapsed_ns(
+                        exec_start, exec_end,
+                    ));
+
+                    #[allow(clippy::let_unit_value)]
+                    let match_complete_ts = trace_ts();
+
+                    // Flush the thread-local counter so the snapshot is current.
+                    self.events_processed.store(local_events, Ordering::Relaxed);
+
+                    let journal_sequence = self.journal_cursor.get().load(Ordering::Relaxed);
+                    let active_connections = self.active_connections.load(Ordering::Relaxed);
+                    self.output.publish(OutputSlot {
+                        connection_id: slot.connection_id,
+                        input_seq,
+                        payload: OutputPayload::StatsHeader {
+                            active_connections,
+                            events_processed: local_events,
+                            journal_sequence,
+                        },
+                        match_complete_ts,
+                        recv_ts: slot.recv_ts,
+                    });
+                    self.output.publish(OutputSlot {
+                        connection_id: slot.connection_id,
+                        input_seq,
+                        payload: OutputPayload::BatchEnd,
+                        match_complete_ts,
+                        recv_ts: slot.recv_ts,
+                    });
+                    continue;
+                }
+
+                local_events += 1;
+                self.process_event(slot, &mut reports);
+
                 #[cfg(feature = "latency-trace")]
                 let exec_end = trace_ts();
+
                 #[cfg(feature = "latency-trace")]
                 execute_hist.record_ns(crate::journal::trace::trace_elapsed_ns(
                     exec_start, exec_end,
                 ));
 
-                #[allow(clippy::let_unit_value)]
+                #[allow(clippy::let_unit_value)] // ZST when latency-trace is disabled
                 let match_complete_ts = trace_ts();
 
-                // Flush the thread-local counter so the snapshot is current.
-                self.events_processed.store(local_events, Ordering::Relaxed);
+                // Publish execution reports to the output SPSC.
+                // All output slots for this request carry the same input_seq
+                // so the response stage can gate on journal completion.
+                for report in &reports {
+                    self.output.publish(OutputSlot {
+                        connection_id: slot.connection_id,
+                        input_seq,
+                        payload: OutputPayload::Report(*report),
+                        match_complete_ts,
+                        recv_ts: slot.recv_ts,
+                    });
+                }
 
-                let journal_sequence = self.journal_cursor.get().load(Ordering::Relaxed);
-                let active_connections = self.active_connections.load(Ordering::Relaxed);
-                self.output.publish(OutputSlot {
-                    connection_id: slot.connection_id,
-                    input_seq,
-                    payload: OutputPayload::StatsHeader {
-                        active_connections,
-                        events_processed: local_events,
-                        journal_sequence,
-                    },
-                    match_complete_ts,
-                    recv_ts: slot.recv_ts,
-                });
+                // Signal end of batch for this request.
                 self.output.publish(OutputSlot {
                     connection_id: slot.connection_id,
                     input_seq,
@@ -518,44 +576,7 @@ impl MatchingStage {
                     match_complete_ts,
                     recv_ts: slot.recv_ts,
                 });
-                continue;
             }
-
-            local_events += 1;
-            self.process_event(&slot, &mut reports);
-
-            #[cfg(feature = "latency-trace")]
-            let exec_end = trace_ts();
-
-            #[cfg(feature = "latency-trace")]
-            execute_hist.record_ns(crate::journal::trace::trace_elapsed_ns(
-                exec_start, exec_end,
-            ));
-
-            #[allow(clippy::let_unit_value)] // ZST when latency-trace is disabled
-            let match_complete_ts = trace_ts();
-
-            // Publish execution reports to the output SPSC.
-            // All output slots for this request carry the same input_seq
-            // so the response stage can gate on journal completion.
-            for report in &reports {
-                self.output.publish(OutputSlot {
-                    connection_id: slot.connection_id,
-                    input_seq,
-                    payload: OutputPayload::Report(*report),
-                    match_complete_ts,
-                    recv_ts: slot.recv_ts,
-                });
-            }
-
-            // Signal end of batch for this request.
-            self.output.publish(OutputSlot {
-                connection_id: slot.connection_id,
-                input_seq,
-                payload: OutputPayload::BatchEnd,
-                match_complete_ts,
-                recv_ts: slot.recv_ts,
-            });
         }
     }
 
