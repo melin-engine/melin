@@ -404,17 +404,29 @@ impl JournalStage {
         // internal locking on the SQ. COOP_TASKRUN: CQE delivery happens
         // cooperatively during io_uring_enter() instead of via async interrupt,
         // eliminating IRQ-driven jitter on the journal thread's core.
+        // NB: with COOP_TASKRUN, CQEs are only posted to the shared CQ ring
+        // during io_uring_enter() calls — pure userspace reads of the CQ will
+        // miss completions. All reap points must call ring.submit() first to
+        // flush kernel task_work.
         let mut ring: IoUring = IoUring::builder()
             .setup_single_issuer()
             .setup_coop_taskrun()
             .build(4)
             .expect("io_uring init failed");
+
+        // Register the journal fd so the kernel skips fget/fput (fd table
+        // lookup + atomic refcount) on every SQE. Use types::Fixed(0) in
+        // SQEs instead of types::Fd(raw_fd).
+        let raw_fd = self.writer.fd();
+        ring.submitter()
+            .register_files(&[raw_fd])
+            .expect("io_uring register_files failed");
+
         let mut batch = [InputSlot::default(); MAX_JOURNAL_BATCH];
         let delay = self.group_commit_delay;
         let mut idle_spins: u32 = 0;
         let mut pending: usize = 0;
         let mut first_write_ts: Option<Instant> = None;
-        let fd = self.writer.fd();
 
         // In-flight state: the batch being written and the sequence to commit
         // when the CQE arrives. `inflight_seq` is the consumer's `next_read`
@@ -450,6 +462,12 @@ impl JournalStage {
             }
 
             // --- Reap CQE from previous in-flight write (non-blocking) ---
+            // With COOP_TASKRUN, CQEs sit in kernel task_work until flushed
+            // by io_uring_enter(). submit() with 0 pending SQEs still enters
+            // the kernel and processes task_work (fast no-op path).
+            if inflight.is_some() {
+                ring.submit().expect("io_uring flush failed");
+            }
             if let Some((ref batch_data, seq)) = inflight
                 && let Some(cqe) = ring.completion().next()
             {
@@ -500,10 +518,12 @@ impl JournalStage {
 
             // --- Eagerly reap CQE after encoding ---
             // The non-blocking check at the top of the loop may have missed
-            // a CQE that arrived while we were encoding events. Reap it now
-            // so the cursor advances sooner and the slot frees up for
-            // immediate submission — saves one full loop iteration of delay
-            // on the response stage.
+            // a CQE that arrived while we were encoding events. Flush
+            // task_work and reap it now so the cursor advances sooner and
+            // the slot frees up for immediate submission.
+            if inflight.is_some() {
+                ring.submit().expect("io_uring flush failed");
+            }
             if inflight.is_some()
                 && let Some((ref batch_data, seq)) = inflight
                 && let Some(cqe) = ring.completion().next()
@@ -552,7 +572,7 @@ impl JournalStage {
                         Ok(Some(async_batch)) => {
                             let seq = self.consumer.next_read();
                             let sqe = opcode::Write::new(
-                                types::Fd(fd),
+                                types::Fixed(0),
                                 async_batch.buf.as_ptr(),
                                 async_batch.buf.len() as u32,
                             )
@@ -596,10 +616,11 @@ impl JournalStage {
 
     /// Busy-poll until the in-flight io_uring CQE arrives.
     ///
-    /// Uses userspace spin instead of the blocking `submit_and_wait(1)`
-    /// syscall. The journal thread is pinned to a dedicated core, so
-    /// busy-polling avoids kernel sleep/wake jitter that would otherwise
-    /// add variable microseconds to cursor advancement (tail latency).
+    /// Each iteration calls `ring.submit()` (no pending SQEs) to enter the
+    /// kernel and flush COOP_TASKRUN task_work — without this, the CQE would
+    /// never appear in the shared CQ ring. This is a fast no-op syscall
+    /// (~200ns) that avoids the sleep/wake scheduler jitter of
+    /// `submit_and_wait(1)`.
     #[cfg(all(
         feature = "io-uring",
         not(feature = "no-fsync"),
@@ -611,6 +632,8 @@ impl JournalStage {
         batch_data: &super::writer::AsyncWriteBatch,
     ) {
         loop {
+            // Flush kernel task_work so any completed CQEs become visible.
+            ring.submit().expect("io_uring flush failed");
             if let Some(cqe) = ring.completion().next() {
                 let result = cqe.result();
                 if result < 0 {
