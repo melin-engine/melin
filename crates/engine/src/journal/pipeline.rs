@@ -400,7 +400,15 @@ impl JournalStage {
         use io_uring::{IoUring, opcode, types};
         use std::time::Instant;
 
-        let mut ring: IoUring = IoUring::new(4).expect("io_uring init failed");
+        // SINGLE_ISSUER: only one thread submits SQEs — lets the kernel skip
+        // internal locking on the SQ. COOP_TASKRUN: CQE delivery happens
+        // cooperatively during io_uring_enter() instead of via async interrupt,
+        // eliminating IRQ-driven jitter on the journal thread's core.
+        let mut ring: IoUring = IoUring::builder()
+            .setup_single_issuer()
+            .setup_coop_taskrun()
+            .build(4)
+            .expect("io_uring init failed");
         let mut batch = [InputSlot::default(); MAX_JOURNAL_BATCH];
         let delay = self.group_commit_delay;
         let mut idle_spins: u32 = 0;
@@ -490,6 +498,31 @@ impl JournalStage {
                 }
             }
 
+            // --- Eagerly reap CQE after encoding ---
+            // The non-blocking check at the top of the loop may have missed
+            // a CQE that arrived while we were encoding events. Reap it now
+            // so the cursor advances sooner and the slot frees up for
+            // immediate submission — saves one full loop iteration of delay
+            // on the response stage.
+            if inflight.is_some()
+                && let Some((ref batch_data, seq)) = inflight
+                && let Some(cqe) = ring.completion().next()
+            {
+                let result = cqe.result();
+                if result < 0 {
+                    tracing::error!(errno = -result, "io_uring journal write failed");
+                } else if (result as usize) != batch_data.buf.len() {
+                    tracing::error!(
+                        written = result,
+                        expected = batch_data.buf.len(),
+                        "io_uring journal short write"
+                    );
+                }
+                self.consumer.set_progress(seq);
+                let completed = inflight.take().expect("checked above");
+                self.writer.confirm_async_write(completed.0);
+            }
+
             // --- Decide whether to submit ---
             if pending > 0 {
                 // With overlapping: only submit when either (a) there's no
@@ -561,7 +594,12 @@ impl JournalStage {
         }
     }
 
-    /// Block until the in-flight io_uring CQE arrives.
+    /// Busy-poll until the in-flight io_uring CQE arrives.
+    ///
+    /// Uses userspace spin instead of the blocking `submit_and_wait(1)`
+    /// syscall. The journal thread is pinned to a dedicated core, so
+    /// busy-polling avoids kernel sleep/wake jitter that would otherwise
+    /// add variable microseconds to cursor advancement (tail latency).
     #[cfg(all(
         feature = "io-uring",
         not(feature = "no-fsync"),
@@ -572,18 +610,21 @@ impl JournalStage {
         ring: &mut io_uring::IoUring,
         batch_data: &super::writer::AsyncWriteBatch,
     ) {
-        ring.submit_and_wait(1).expect("io_uring submit_and_wait");
-        if let Some(cqe) = ring.completion().next() {
-            let result = cqe.result();
-            if result < 0 {
-                tracing::error!(errno = -result, "io_uring journal write failed (drain)");
-            } else if (result as usize) != batch_data.buf.len() {
-                tracing::error!(
-                    written = result,
-                    expected = batch_data.buf.len(),
-                    "io_uring journal short write (drain)"
-                );
+        loop {
+            if let Some(cqe) = ring.completion().next() {
+                let result = cqe.result();
+                if result < 0 {
+                    tracing::error!(errno = -result, "io_uring journal write failed (drain)");
+                } else if (result as usize) != batch_data.buf.len() {
+                    tracing::error!(
+                        written = result,
+                        expected = batch_data.buf.len(),
+                        "io_uring journal short write (drain)"
+                    );
+                }
+                return;
             }
+            std::hint::spin_loop();
         }
     }
 }
