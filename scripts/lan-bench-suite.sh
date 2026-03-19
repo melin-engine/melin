@@ -133,6 +133,79 @@ echo ""
 cp /tmp/lan-bench-results.json "${RESULTS_DIR}/3-single-order.json" 2>/dev/null || true
 
 # ---------------------------------------------------------------------------
+# 4. Saturation sweep — full durability, varying load
+# ---------------------------------------------------------------------------
+echo ""
+echo "============================================================"
+echo "  [4/4] Saturation sweep — full durability"
+echo "  10M pairs each, varying clients × window"
+echo "============================================================"
+echo ""
+
+SWEEP_DIR="${RESULTS_DIR}/sweep"
+mkdir -p "${SWEEP_DIR}"
+
+SWEEP_CONFIGS=(
+    "1:1"
+    "4:16"
+    "8:64"
+    "16:128"
+    "16:256"
+    "32:256"
+)
+
+for config in "${SWEEP_CONFIGS[@]}"; do
+    clients="${config%%:*}"
+    window="${config##*:}"
+    echo "--- clients=${clients}, window=${window} ---"
+
+    "${LAN_BENCH}" "$SERVER_PUB" "$BENCH_PUB" "$SERVER_VLAN" "$SSH_USER" \
+        -- --accounts 1000 --instruments 100 \
+        -- 10000000 --clients "${clients}" --window "${window}"
+
+    cp /tmp/lan-bench-results.json "${SWEEP_DIR}/c${clients}-w${window}.json" 2>/dev/null || true
+    echo ""
+done
+
+# ---------------------------------------------------------------------------
+# 5. Generate plots
+# ---------------------------------------------------------------------------
+echo ""
+echo "============================================================"
+echo "  Generating plots"
+echo "============================================================"
+echo ""
+
+# Build the plot tool if not already built.
+PLOT_BIN=""
+for HOST in "${SERVER}" "${BENCH}"; do
+    if ssh $SSH_OPTS "$HOST" "test -x ${REPO_DIR}/target/release/trading-plot" 2>/dev/null; then
+        PLOT_BIN="${HOST}"
+        break
+    fi
+done
+
+# Build locally if available, otherwise build on bench machine.
+if command -v cargo &>/dev/null && [[ -f "$(dirname "$0")/../crates/bench/src/plot.rs" ]]; then
+    LOCAL_REPO="$(cd "$(dirname "$0")/.." && pwd)"
+    echo "  Building plot tool locally..."
+    (cd "$LOCAL_REPO" && cargo build --release -p trading-bench --features plot --bin trading-plot 2>&1 | tail -1)
+    PLOT_TOOL="${LOCAL_REPO}/target/release/trading-plot"
+
+    echo "  Generating latency CDF..."
+    "${PLOT_TOOL}" latency-cdf -o "${RESULTS_DIR}/latency-cdf.svg" \
+        "${RESULTS_DIR}/1-fsync.json" \
+        "${RESULTS_DIR}/2-no-persist.json" \
+        "${RESULTS_DIR}/3-single-order.json" 2>&1
+
+    echo "  Generating saturation curve..."
+    "${PLOT_TOOL}" saturation -o "${RESULTS_DIR}/saturation.svg" \
+        "${SWEEP_DIR}"/*.json 2>&1
+
+    echo ""
+fi
+
+# ---------------------------------------------------------------------------
 # Summary
 # ---------------------------------------------------------------------------
 echo ""
@@ -141,3 +214,4 @@ echo "  Suite complete. Results in ${RESULTS_DIR}/"
 echo "============================================================"
 echo ""
 ls -la "${RESULTS_DIR}/"
+ls -la "${SWEEP_DIR}/" 2>/dev/null || true

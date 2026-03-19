@@ -11,10 +11,16 @@ latency-trace = ["trading-server/latency-trace"]
 io-uring = ["trading-server/io-uring", "dep:io-uring"]
 pipeline-stats = ["trading-server/pipeline-stats"]
 chart = ["dep:ratatui", "dep:crossterm"]
+plot = ["dep:plotters"]
 
 [[bin]]
 name = "trading-bench"
 path = "src/main.rs"
+
+[[bin]]
+name = "trading-plot"
+path = "src/plot.rs"
+required-features = ["plot"]
 
 [dependencies]
 trading-engine = { path = "../engine" }
@@ -32,3 +38,6 @@ tracing-subscriber = { workspace = true }
 io-uring = { version = "0.7", optional = true }
 ratatui = { version = "0.29", optional = true }
 crossterm = { version = "0.28", optional = true }
+plotters = { version = "0.3", optional = true, default-features = false, features = ["svg_backend", "line_series"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
