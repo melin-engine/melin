@@ -28,6 +28,8 @@ fi
 
 ORIG_GOVERNOR=$(cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor 2>/dev/null || echo "schedutil")
 ORIG_NMI=$(cat /proc/sys/kernel/nmi_watchdog 2>/dev/null || echo "1")
+ORIG_THP=$(cat /sys/kernel/mm/transparent_hugepage/enabled 2>/dev/null | grep -o '\[.*\]' | tr -d '[]' || echo "always")
+ORIG_WB_CPUMASK=$(cat /sys/bus/workqueue/devices/writeback/cpumask 2>/dev/null || true)
 IRQBALANCE_WAS_RUNNING=false
 if systemctl is-active --quiet irqbalance 2>/dev/null; then
     IRQBALANCE_WAS_RUNNING=true
@@ -66,6 +68,15 @@ restore() {
     done < "$ORIG_IRQ_AFFINITIES"
     echo "  IRQ affinities → restored ${restored} IRQs"
     rm -f "$ORIG_IRQ_AFFINITIES"
+
+    # Restore transparent huge pages.
+    echo "$ORIG_THP" > /sys/kernel/mm/transparent_hugepage/enabled 2>/dev/null || true
+    echo "  THP → ${ORIG_THP}"
+
+    # Restore writeback workqueue cpumask.
+    if [[ -n "$ORIG_WB_CPUMASK" ]]; then
+        echo "$ORIG_WB_CPUMASK" > /sys/bus/workqueue/devices/writeback/cpumask 2>/dev/null || true
+    fi
 
     # Restart irqbalance if it was running.
     if $IRQBALANCE_WAS_RUNNING; then
@@ -114,6 +125,26 @@ for affinity_file in /proc/irq/*/smp_affinity; do
     fi
 done
 echo "  IRQ affinity → pinned ${irq_pinned} IRQs to core 0 (${irq_failed} unchanged)"
+
+# 5. Disable transparent huge pages. khugepaged compaction runs in the
+#    background and can stall any core for 1-4ms while collapsing pages
+#    into 2 MiB huge pages. Disabling THP eliminates this jitter source.
+echo "$ORIG_THP" > /dev/null  # save was done above
+echo "never" > /sys/kernel/mm/transparent_hugepage/enabled 2>/dev/null || true
+echo "  THP → never (was: ${ORIG_THP})"
+
+# 6. Pin kernel workqueues to core 0. By default, workqueues (writeback,
+#    mm_percpu_wq, nvme-wq) have cpumask=ffffffff and can schedule kworker
+#    threads on isolated cores. Pin them to core 0 to keep kernel background
+#    work off pipeline cores. Only pin unbound workqueues (bound per-CPU
+#    workqueues like events_highpri cannot be reaffined).
+wq_pinned=0
+for cpumask_file in /sys/bus/workqueue/devices/*/cpumask; do
+    if echo 1 > "$cpumask_file" 2>/dev/null; then
+        wq_pinned=$((wq_pinned + 1))
+    fi
+done
+echo "  workqueue affinity → pinned ${wq_pinned} workqueues to core 0"
 
 # --- Report kernel boot tuning (read-only, set via GRUB) ---
 

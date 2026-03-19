@@ -156,18 +156,38 @@ if [[ -n "$JOURNAL_DISK" ]]; then
 
     mkdir -p "$JOURNAL_MOUNT"
 
+    # Mount options optimized for journal I/O on dedicated NVMe:
+    #   noatime:    skip access-time metadata updates
+    #   nobarrier:  skip disk cache flush barriers — redundant with
+    #               NVMe FUA + RWF_DSYNC (per-write durability)
+    #   data=writeback: don't order data writes before metadata journal
+    #               commits — safe because RWF_DSYNC ensures data is on
+    #               persistent storage before the syscall returns
+    #   journal_async_commit: don't wait for ext4 journal commit completion
+    #               before returning from metadata operations — reduces
+    #               latency for extent conversions (unwritten → written)
+    #   commit=300: delay ext4 journal commits to every 300s instead of 5s
+    #               — our data path (RWF_DSYNC/FUA) doesn't rely on ext4
+    #               journal commits for durability, so minimize their
+    #               frequency to reduce jbd2 lock contention
+    JOURNAL_MOUNT_OPTS="noatime,nobarrier,data=writeback,journal_async_commit,commit=300"
+
     # Mount if not already mounted.
     if ! mountpoint -q "$JOURNAL_MOUNT"; then
-        mount "$JOURNAL_DISK" "$JOURNAL_MOUNT"
-        echo "  Mounted $JOURNAL_DISK at $JOURNAL_MOUNT"
+        mount -o "$JOURNAL_MOUNT_OPTS" "$JOURNAL_DISK" "$JOURNAL_MOUNT"
+        echo "  Mounted $JOURNAL_DISK at $JOURNAL_MOUNT ($JOURNAL_MOUNT_OPTS)"
     else
         echo "  Already mounted at $JOURNAL_MOUNT"
+        echo "  Remounting with optimized options..."
+        mount -o "remount,$JOURNAL_MOUNT_OPTS" "$JOURNAL_MOUNT" 2>/dev/null \
+            && echo "  Remounted with $JOURNAL_MOUNT_OPTS" \
+            || echo "  WARNING: remount failed (data= mode cannot change at runtime, re-run after umount or reboot)"
     fi
 
     # Add to fstab if not present.
     if ! grep -q "$JOURNAL_MOUNT" /etc/fstab; then
         UUID=$(blkid -s UUID -o value "$JOURNAL_DISK")
-        echo "UUID=$UUID $JOURNAL_MOUNT ext4 defaults,noatime 0 2" >> /etc/fstab
+        echo "UUID=$UUID $JOURNAL_MOUNT ext4 $JOURNAL_MOUNT_OPTS 0 2" >> /etc/fstab
         echo "  Added to /etc/fstab (UUID=$UUID)"
     fi
 else
