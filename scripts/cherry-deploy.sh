@@ -62,6 +62,45 @@ echo ""
 # Use bash explicitly to avoid TTY issues with ssh -t.
 ssh "$REMOTE" "bash /tmp/cherry-setup.sh"
 
+# 3. Reboot if kernel boot params were just configured.
+NEEDS_REBOOT=$(ssh "$REMOTE" "test -f /tmp/.cherry-needs-reboot && echo yes || echo no")
+if [[ "$NEEDS_REBOOT" == "yes" ]]; then
+    echo "=== Rebooting for kernel boot params (isolcpus, nohz_full, rcu_nocbs) ==="
+    ssh "$REMOTE" "rm -f /tmp/.cherry-needs-reboot && shutdown -r now" 2>/dev/null || true
+
+    # Wait for SSH to go down.
+    echo -n "  Waiting for shutdown..."
+    sleep 5
+    for _ in $(seq 1 30); do
+        if ! ssh -o ConnectTimeout=2 -o BatchMode=yes "$REMOTE" true 2>/dev/null; then
+            break
+        fi
+        sleep 1
+    done
+    echo " down."
+
+    # Wait for SSH to come back up.
+    echo -n "  Waiting for reboot..."
+    for _ in $(seq 1 120); do
+        if ssh -o ConnectTimeout=2 -o BatchMode=yes "$REMOTE" true 2>/dev/null; then
+            echo " up."
+            break
+        fi
+        sleep 2
+    done
+
+    # Verify boot params are active.
+    echo ""
+    echo "=== Verifying kernel boot params ==="
+    ISOLATED=$(ssh "$REMOTE" "cat /sys/devices/system/cpu/isolated 2>/dev/null")
+    NOHZ=$(ssh "$REMOTE" "cat /sys/devices/system/cpu/nohz_full 2>/dev/null")
+    echo "  isolated cores: ${ISOLATED:-none}"
+    echo "  nohz_full:      ${NOHZ:-none}"
+    if [[ -z "$ISOLATED" ]]; then
+        echo "  WARNING: isolcpus not active — check GRUB config"
+    fi
+fi
+
 echo ""
 echo "=== Deployment complete. Connecting... ==="
 exec ssh -t "$REMOTE" "cd ~/workspace/trading && exec bash --login"
