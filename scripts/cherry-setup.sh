@@ -121,6 +121,8 @@ if [[ -f "$GRUB_FILE" ]]; then
         cp "$GRUB_FILE" "${GRUB_FILE}.bak"
         sed -i "s/^GRUB_CMDLINE_LINUX_DEFAULT=\"\(.*\)\"/GRUB_CMDLINE_LINUX_DEFAULT=\"\1 $BENCH_PARAMS\"/" "$GRUB_FILE"
         update-grub
+        # Signal to cherry-deploy.sh that a reboot is needed.
+        touch /tmp/.cherry-needs-reboot
         echo "  *** REBOOT REQUIRED for isolcpus to take effect ***"
     fi
 else
