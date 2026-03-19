@@ -517,8 +517,7 @@ impl JournalStage {
             // a CQE that arrived while we were encoding events. Reap it now
             // so the cursor advances sooner and the slot frees up for
             // immediate submission.
-            if inflight.is_some()
-                && let Some((ref batch_data, seq)) = inflight
+            if let Some((ref batch_data, seq)) = inflight
                 && let Some(cqe) = ring.completion().next()
             {
                 let result = cqe.result();
