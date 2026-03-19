@@ -244,21 +244,21 @@ crates/
 
 ## Performance
 
-LAN round-trip benchmarks at [`5330d6f`](../../commit/5330d6f). Two Cherry AMD Ryzen 9950X servers (16C/32T, 192 GB RAM, 2x 1TB NVMe, 10 Gbps). Engine on one server with journal on a dedicated NVMe disk, benchmark client on the other, TCP over private network. [Realistic order flow](crates/bench/). Reproducible via `scripts/lan-bench-suite.sh`.
+LAN round-trip benchmarks at [`126d118`](../../commit/126d118). Two Cherry AMD Ryzen 9950X servers (16C/32T, 192 GB RAM, 2x 1TB NVMe, 10 Gbps). Engine on one server with journal on a dedicated NVMe disk, benchmark client on the other, TCP over private network. [Realistic order flow](crates/bench/). Reproducible via `scripts/lan-bench-suite.sh`.
 
 **Peak-load throughput** — full durability, 100M order pairs, 16 clients, 256 pipelined:
 
 | Metric | Value |
 |--------|-------|
-| **Throughput** | 2.9M orders/sec |
-| **p50** | 1403 µs |
-| **p90** | 1447 µs |
-| **p99** | 1523 µs |
-| **p99.9** | 1583 µs |
-| **p99.99** | 1612 µs |
-| **p99.999** | 1657 µs |
-| **p99.9999** | 1712 µs |
-| **max** | 1725 µs |
+| **Throughput** | 4.3M orders/sec |
+| **p50** | 926 µs |
+| **p90** | 952 µs |
+| **p99** | 1031 µs |
+| **p99.9** | 1080 µs |
+| **p99.99** | 1102 µs |
+| **p99.999** | 1128 µs |
+| **p99.9999** | 1200 µs |
+| **max** | 1232 µs |
 
 ```sh
 ./trading-server --bind 0.0.0.0:9876 --journal /mnt/journal/trading.journal  # engine server
@@ -269,15 +269,15 @@ LAN round-trip benchmarks at [`5330d6f`](../../commit/5330d6f). Two Cherry AMD R
 
 | Metric | Value |
 |--------|-------|
-| **Throughput** | 9.0M orders/sec |
-| **p50** | 645 µs |
-| **p90** | 758 µs |
-| **p99** | 814 µs |
-| **p99.9** | 894 µs |
-| **p99.99** | 945 µs |
+| **Throughput** | 8.8M orders/sec |
+| **p50** | 651 µs |
+| **p90** | 760 µs |
+| **p99** | 826 µs |
+| **p99.9** | 895 µs |
+| **p99.99** | 950 µs |
 | **p99.999** | 1021 µs |
-| **p99.9999** | 1063 µs |
-| **max** | 1157 µs |
+| **p99.9999** | 1044 µs |
+| **max** | 1148 µs |
 
 ```sh
 ./trading-bench 100000000 --addr <engine-ip>:9876 --window=192 --clients=32  # no-persist server
@@ -287,14 +287,14 @@ LAN round-trip benchmarks at [`5330d6f`](../../commit/5330d6f). Two Cherry AMD R
 
 | Metric | Value |
 |--------|-------|
-| **Throughput** | 7.9K orders/sec |
-| **p50** | 127 µs |
-| **p90** | 128 µs |
-| **p99** | 133 µs |
-| **p99.9** | 147 µs |
-| **p99.99** | 151 µs |
-| **p99.999** | 164 µs |
-| **max** | 250 µs |
+| **Throughput** | 13.1K orders/sec |
+| **p50** | 76 µs |
+| **p90** | 77 µs |
+| **p99** | 113 µs |
+| **p99.9** | 116 µs |
+| **p99.99** | 118 µs |
+| **p99.999** | 238 µs |
+| **max** | 338 µs |
 
 ```sh
 ./trading-bench 1000000 --addr <engine-ip>:9876 --window=1 --clients=1
