@@ -80,11 +80,11 @@ pub struct ServerConfig {
     /// reached. 0 means unlimited. Prevents fd/memory exhaustion (SEC-02).
     #[arg(long, default_value_t = 1024)]
     pub max_connections: u64,
-    /// Number of test accounts to seed on first startup.
-    #[arg(long, default_value_t = 2)]
+    /// Number of accounts to seed on first startup.
+    #[arg(long, default_value_t = 1_000_000)]
     pub accounts: u32,
-    /// Number of test instruments to seed on first startup.
-    #[arg(long, default_value_t = 2)]
+    /// Number of instruments to seed on first startup.
+    #[arg(long, default_value_t = 100)]
     pub instruments: u32,
     /// Path to the authorized keys file for Ed25519 challenge-response
     /// authentication. Every connection must authenticate before trading.

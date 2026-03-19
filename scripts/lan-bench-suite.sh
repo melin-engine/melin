@@ -74,8 +74,7 @@ echo "============================================================"
 echo ""
 
 "${LAN_BENCH}" "$SERVER_PUB" "$BENCH_PUB" "$SERVER_VLAN" "$SSH_USER" \
-    -- --accounts 1000 --instruments 100 \
-    -- 100000000 --clients 16 --window 256
+    -- -- 100000000 --clients 16 --window 256
 
 cp /tmp/lan-bench-results.json "${RESULTS_DIR}/1-fsync.json" 2>/dev/null || true
 
@@ -105,8 +104,7 @@ ssh $SSH_OPTS "$SERVER" "cd ${REPO_DIR} && source ~/.cargo/env && \
     cp target/release/trading-server.nopersist target/release/trading-server"
 
 "${LAN_BENCH}" "$SERVER_PUB" "$BENCH_PUB" "$SERVER_VLAN" "$SSH_USER" \
-    -- --accounts 1000 --instruments 100 \
-    -- 100000000 --clients 32 --window 192
+    -- -- 100000000 --clients 32 --window 192
 
 cp /tmp/lan-bench-results.json "${RESULTS_DIR}/2-no-persist.json" 2>/dev/null || true
 
@@ -127,8 +125,7 @@ echo "============================================================"
 echo ""
 
 "${LAN_BENCH}" "$SERVER_PUB" "$BENCH_PUB" "$SERVER_VLAN" "$SSH_USER" \
-    -- --accounts 1000 --instruments 100 \
-    -- 1000000 --clients 1 --window 1
+    -- -- 1000000 --clients 1 --window 1
 
 cp /tmp/lan-bench-results.json "${RESULTS_DIR}/3-single-order.json" 2>/dev/null || true
 
@@ -159,8 +156,7 @@ run_sweep() {
         echo "--- ${label} ---"
 
         "${LAN_BENCH}" "$SERVER_PUB" "$BENCH_PUB" "$SERVER_VLAN" "$SSH_USER" \
-            -- --accounts 1000 --instruments 100 \
-            -- ${ORDERS_PER_SWEEP} ${bench_args}
+            -- -- ${ORDERS_PER_SWEEP} ${bench_args}
 
         cp /tmp/lan-bench-results.json "${sweep_dir}/${label}.json" 2>/dev/null || true
         echo ""
@@ -171,7 +167,7 @@ run_sweep() {
 # 4. Sweeps — one parameter at a time, others held fixed
 # ---------------------------------------------------------------------------
 
-# 4a. Window sweep (fixed clients=16, accounts=1000, instruments=100)
+# 4a. Window sweep (fixed clients=16, accounts/instruments=server defaults)
 run_sweep "window" \
     "w32:--clients 16 --window 32" \
     "w64:--clients 16 --window 64" \
@@ -179,7 +175,7 @@ run_sweep "window" \
     "w256:--clients 16 --window 256" \
     "w512:--clients 16 --window 512"
 
-# 4c. Accounts sweep (fixed clients=16, window=128, instruments=100)
+# 4c. Accounts sweep (fixed clients=16, window=128)
 #     Server args vary — need to pass accounts to the server, not bench.
 #     Use a direct loop since server args differ per point.
 ACCT_SWEEP_DIR="${RESULTS_DIR}/sweep-accounts"
@@ -194,13 +190,13 @@ for acct in 1000000 10000000 100000000; do
     label="a${acct}"
     echo "--- accounts=${acct} ---"
     "${LAN_BENCH}" "$SERVER_PUB" "$BENCH_PUB" "$SERVER_VLAN" "$SSH_USER" \
-        -- --accounts "${acct}" --instruments 100 \
+        -- --accounts "${acct}" \
         -- ${ORDERS_PER_SWEEP} --clients 16 --window 128
     cp /tmp/lan-bench-results.json "${ACCT_SWEEP_DIR}/${label}.json" 2>/dev/null || true
     echo ""
 done
 
-# 4d. Instruments sweep (fixed clients=16, window=128, accounts=1000)
+# 4d. Instruments sweep (fixed clients=16, window=128)
 INST_SWEEP_DIR="${RESULTS_DIR}/sweep-instruments"
 mkdir -p "${INST_SWEEP_DIR}"
 echo ""
@@ -213,7 +209,7 @@ for inst in 10 100 1000; do
     label="i${inst}"
     echo "--- instruments=${inst} ---"
     "${LAN_BENCH}" "$SERVER_PUB" "$BENCH_PUB" "$SERVER_VLAN" "$SSH_USER" \
-        -- --accounts 1000 --instruments "${inst}" \
+        -- --instruments "${inst}" \
         -- ${ORDERS_PER_SWEEP} --clients 16 --window 128
     cp /tmp/lan-bench-results.json "${INST_SWEEP_DIR}/${label}.json" 2>/dev/null || true
     echo ""
