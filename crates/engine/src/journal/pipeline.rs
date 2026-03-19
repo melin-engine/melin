@@ -422,6 +422,20 @@ impl JournalStage {
             .register_files(&[raw_fd])
             .expect("io_uring register_files failed");
 
+        // Pin io-wq worker threads to core 0 (OS/IRQ core). Without this,
+        // io-wq workers inherit the journal thread's CPU affinity (core 1)
+        // and contend with the busy-spinning journal thread. With nohz_full,
+        // timer ticks are suppressed on core 1, so the worker can be starved
+        // for up to 4ms (HZ=250) waiting for preemption — causing ~6ms p99.9
+        // tail latency spikes. Core 0 is non-isolated and always has ticks.
+        {
+            let mut cpuset: libc::cpu_set_t = unsafe { std::mem::zeroed() };
+            unsafe { libc::CPU_SET(0, &mut cpuset) };
+            ring.submitter()
+                .register_iowq_aff(&cpuset)
+                .expect("io_uring register_iowq_aff failed");
+        }
+
         let mut batch = [InputSlot::default(); MAX_JOURNAL_BATCH];
         let delay = self.group_commit_delay;
         let mut idle_spins: u32 = 0;
