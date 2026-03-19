@@ -935,11 +935,13 @@ mod tests {
             let mut writer =
                 JournalWriter::open_append(&path, last_seq, valid_end, None, 0).unwrap();
             // Write only one small entry (doesn't cover all the garbage bytes).
-            writer.append(&JournalEvent::Deposit {
-                account: crate::types::AccountId(1),
-                currency: crate::types::CurrencyId(0),
-                amount: 1,
-            }).unwrap();
+            writer
+                .append(&JournalEvent::Deposit {
+                    account: crate::types::AccountId(1),
+                    currency: crate::types::CurrencyId(0),
+                    amount: 1,
+                })
+                .unwrap();
         }
 
         // Second recovery: should succeed cleanly (no CorruptEntry from

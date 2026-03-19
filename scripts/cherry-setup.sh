@@ -180,10 +180,12 @@ if [[ -n "$JOURNAL_DISK" ]]; then
         echo "  Mounted $JOURNAL_DISK at $JOURNAL_MOUNT ($JOURNAL_MOUNT_OPTS)"
     else
         echo "  Already mounted at $JOURNAL_MOUNT"
-        echo "  Remounting with optimized options..."
-        mount -o "remount,$JOURNAL_MOUNT_OPTS" "$JOURNAL_MOUNT" 2>/dev/null \
-            && echo "  Remounted with $JOURNAL_MOUNT_OPTS" \
-            || echo "  WARNING: remount failed (data= mode cannot change at runtime, re-run after umount or reboot)"
+        # data=writeback cannot be changed via remount — must unmount first.
+        # Safe during setup: nothing is using the journal disk yet.
+        echo "  Unmounting and remounting with optimized options..."
+        umount "$JOURNAL_MOUNT"
+        mount -o "$JOURNAL_MOUNT_OPTS" "$JOURNAL_DISK" "$JOURNAL_MOUNT"
+        echo "  Remounted with $JOURNAL_MOUNT_OPTS"
     fi
 
     # Add to fstab if not present.
