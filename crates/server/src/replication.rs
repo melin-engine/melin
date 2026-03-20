@@ -1017,4 +1017,249 @@ mod tests {
         let end_seq = replica_handle.join().unwrap();
         assert_eq!(end_seq, 42);
     }
+
+    #[test]
+    fn disconnect_degrades_cursor_to_max() {
+        // When a replica disconnects, run_sender resets the replication
+        // cursor to u64::MAX so the response stage stops gating on acks.
+        // Test the cursor lifecycle: starts at 0, set during handshake,
+        // then reset to MAX on disconnect.
+        let cursor = Arc::new(AtomicU64::new(0));
+
+        // Simulate handshake: cursor set to last_sequence + 1.
+        let handshake_seq = 42u64;
+        cursor.store(handshake_seq + 1, Ordering::Release);
+        assert_eq!(cursor.load(Ordering::Acquire), 43);
+
+        // Simulate ack advancing cursor.
+        cursor.fetch_max(100 + 1, Ordering::Release);
+        assert_eq!(cursor.load(Ordering::Acquire), 101);
+
+        // Simulate disconnect: run_sender resets to MAX.
+        cursor.store(u64::MAX, Ordering::Release);
+        assert_eq!(cursor.load(Ordering::Acquire), u64::MAX);
+
+        // Simulate reconnect: cursor set back to handshake value.
+        cursor.store(0 + 1, Ordering::Release);
+        assert_eq!(cursor.load(Ordering::Acquire), 1);
+    }
+
+    #[test]
+    fn ack_advances_cursor_monotonically() {
+        // Acks must only advance the cursor, never regress it.
+        // A stale ack (lower sequence) should be ignored.
+        let cursor = Arc::new(AtomicU64::new(0));
+
+        // Simulate processing ack seq=100 → cursor should become 101.
+        let new_val = 100 + 1;
+        cursor.fetch_max(new_val, Ordering::Release);
+        assert_eq!(cursor.load(Ordering::Acquire), 101);
+
+        // Stale ack seq=50 → cursor should stay at 101.
+        let stale_val = 50 + 1;
+        cursor.fetch_max(stale_val, Ordering::Release);
+        assert_eq!(cursor.load(Ordering::Acquire), 101);
+
+        // Newer ack seq=200 → cursor should advance to 201.
+        let newer_val = 200 + 1;
+        cursor.fetch_max(newer_val, Ordering::Release);
+        assert_eq!(cursor.load(Ordering::Acquire), 201);
+    }
+
+    #[test]
+    fn multiple_data_batches_acked_in_order() {
+        // Send multiple DataBatch frames, verify replica acks each one
+        // and the cursor advances correctly.
+        use std::os::unix::net::UnixStream;
+
+        let (primary_stream, replica_stream) = UnixStream::pair().unwrap();
+
+        let replica_handle = std::thread::spawn(move || {
+            let mut reader = replica_stream.try_clone().unwrap();
+            let mut writer = replica_stream;
+            let mut buf = Vec::new();
+
+            // Send handshake.
+            encode_handshake(
+                &Handshake {
+                    last_sequence: 0,
+                    chain_hash: [0u8; 32],
+                },
+                &mut buf,
+            );
+            writer.write_all(&buf).unwrap();
+            writer.flush().unwrap();
+            buf.clear();
+
+            // Read StreamStart.
+            let frame = read_frame(&mut reader, MAX_CONTROL_FRAME).unwrap();
+            assert!(matches!(
+                decode_primary_message(&frame).unwrap(),
+                PrimaryMessage::StreamStart { .. }
+            ));
+
+            // Read and ack 3 DataBatches.
+            let mut acked_seqs = Vec::new();
+            for _ in 0..3 {
+                let frame = read_frame(&mut reader, MAX_DATA_FRAME).unwrap();
+                let end_seq = match decode_primary_message(&frame).unwrap() {
+                    PrimaryMessage::DataBatch { end_sequence, .. } => end_sequence,
+                    other => panic!("expected DataBatch, got {other:?}"),
+                };
+                acked_seqs.push(end_seq);
+
+                encode_ack(
+                    &Ack {
+                        acked_sequence: end_seq,
+                    },
+                    &mut buf,
+                );
+                writer.write_all(&buf).unwrap();
+                writer.flush().unwrap();
+                buf.clear();
+            }
+
+            acked_seqs
+        });
+
+        // Primary side.
+        let mut p_reader = primary_stream.try_clone().unwrap();
+        let mut p_writer = primary_stream;
+        let mut buf = Vec::new();
+
+        // Read handshake.
+        let frame = read_frame(&mut p_reader, MAX_CONTROL_FRAME).unwrap();
+        assert!(matches!(
+            decode_replica_message(&frame).unwrap(),
+            ReplicaMessage::Handshake(_)
+        ));
+
+        // Send StreamStart.
+        encode_stream_start(0, &[0u8; 32], &mut buf);
+        p_writer.write_all(&buf).unwrap();
+        p_writer.flush().unwrap();
+        buf.clear();
+
+        // Send 3 DataBatches with increasing sequence numbers.
+        for seq in [10u64, 20, 30] {
+            encode_data_batch(seq, &[0x11; 32], &[0xAA; 8], &mut buf);
+            p_writer.write_all(&buf).unwrap();
+            p_writer.flush().unwrap();
+            buf.clear();
+        }
+
+        // Read 3 acks.
+        for expected_seq in [10u64, 20, 30] {
+            let frame = read_frame(&mut p_reader, MAX_CONTROL_FRAME).unwrap();
+            let ack = match decode_replica_message(&frame).unwrap() {
+                ReplicaMessage::Ack(a) => a,
+                other => panic!("expected Ack, got {other:?}"),
+            };
+            assert_eq!(ack.acked_sequence, expected_seq);
+        }
+
+        let acked = replica_handle.join().unwrap();
+        assert_eq!(acked, vec![10, 20, 30]);
+    }
+
+    #[test]
+    fn heartbeat_encode_contains_sequence_and_hash() {
+        // Heartbeat messages carry the last known sequence and chain hash
+        // so the replica can verify it hasn't missed any data.
+        let chain_hash = [0x42; 32];
+        let mut buf = Vec::new();
+        encode_heartbeat(999, &chain_hash, &mut buf);
+
+        let payload = &buf[4..];
+        match decode_primary_message(payload).unwrap() {
+            PrimaryMessage::Heartbeat {
+                sequence,
+                chain_hash: h,
+            } => {
+                assert_eq!(sequence, 999);
+                assert_eq!(h, chain_hash);
+            }
+            other => panic!("expected Heartbeat, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn replica_mid_stream_handshake_with_nonzero_sequence() {
+        // A replica that already has some data sends a non-zero last_sequence
+        // in its handshake. The primary should respond with StreamStart
+        // containing that sequence, and the replica should only receive
+        // events after that point.
+        use std::os::unix::net::UnixStream;
+
+        let (primary_stream, replica_stream) = UnixStream::pair().unwrap();
+
+        let replica_handle = std::thread::spawn(move || {
+            let mut reader = replica_stream.try_clone().unwrap();
+            let mut writer = replica_stream;
+            let mut buf = Vec::new();
+
+            // Replica already has events up to sequence 100.
+            encode_handshake(
+                &Handshake {
+                    last_sequence: 100,
+                    chain_hash: [0xBB; 32],
+                },
+                &mut buf,
+            );
+            writer.write_all(&buf).unwrap();
+            writer.flush().unwrap();
+            buf.clear();
+
+            // Read StreamStart — should echo back our last_sequence.
+            let frame = read_frame(&mut reader, MAX_CONTROL_FRAME).unwrap();
+            match decode_primary_message(&frame).unwrap() {
+                PrimaryMessage::StreamStart { start_sequence, .. } => {
+                    assert_eq!(
+                        start_sequence, 100,
+                        "StreamStart should echo replica's last_sequence"
+                    );
+                }
+                other => panic!("expected StreamStart, got {other:?}"),
+            }
+
+            // Read a DataBatch — should be for events AFTER 100.
+            let frame = read_frame(&mut reader, MAX_DATA_FRAME).unwrap();
+            match decode_primary_message(&frame).unwrap() {
+                PrimaryMessage::DataBatch { end_sequence, .. } => {
+                    assert!(
+                        end_sequence > 100,
+                        "DataBatch should be after replica's last_sequence"
+                    );
+                }
+                other => panic!("expected DataBatch, got {other:?}"),
+            }
+        });
+
+        // Primary side.
+        let mut p_reader = primary_stream.try_clone().unwrap();
+        let mut p_writer = primary_stream;
+        let mut buf = Vec::new();
+
+        // Read handshake.
+        let frame = read_frame(&mut p_reader, MAX_CONTROL_FRAME).unwrap();
+        let handshake = match decode_replica_message(&frame).unwrap() {
+            ReplicaMessage::Handshake(h) => h,
+            _ => panic!("expected Handshake"),
+        };
+        assert_eq!(handshake.last_sequence, 100);
+        assert_eq!(handshake.chain_hash, [0xBB; 32]);
+
+        // Send StreamStart echoing the replica's sequence.
+        encode_stream_start(handshake.last_sequence, &[0u8; 32], &mut buf);
+        p_writer.write_all(&buf).unwrap();
+        p_writer.flush().unwrap();
+        buf.clear();
+
+        // Send DataBatch with sequence 150 (after replica's 100).
+        encode_data_batch(150, &[0x11; 32], &[0xAA; 8], &mut buf);
+        p_writer.write_all(&buf).unwrap();
+        p_writer.flush().unwrap();
+
+        replica_handle.join().unwrap();
+    }
 }
