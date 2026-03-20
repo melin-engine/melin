@@ -5,48 +5,48 @@ A matching engine built on the [LMAX architecture](https://martinfowler.com/arti
 ## Architecture
 
 ```
-                      ┌─────────────────────────────────────────────────────────────┐
-                      │                         SERVER                              │
-                      │                                                             │
-  Clients ─TCP───────────────────► Accept Loop                                      │
-                      │                │                                            │
-                      │                ▼                                            │
-                      │            Epoll/io_uring Reader Pool                       │
-                      │            (edge-triggered, non-blocking)                   │
-                      │                │                                            │
-                      │                │  lock-free CAS                             │
-                      │                ▼                                            │
-                      │   ┌─────────────────────────────────┐                       │
-                      │   │     Input Disruptor (ring buf)  │                       │
-                      │   └──────────┬──────────────┬───────┘                       │
-                      │              │              │                               │
-                      │              ▼              ▼                               │
-                      │   ┌──────────────┐  ┌──────────────┐                        │
-                      │   │   Journal    │  │   Matching   │   parallel consumers   │
-                      │   │   Thread     │  │   Thread     │                        │
-                      │   │              │  │              │                        │
-                      │   │ pwritev2     │  │ Exchange     │                        │
-                      │   │ + RWF_DSYNC  │  │ .execute()   │                        │
-                      │   └──────┬───────┘  └──────┬───────┘                        │
-                      │          │                 │                                │
-                      │          │ cursor          │ output SPSC                    │
-                      │          ▼                 ▼                                │
-                      │   ┌──────────────────────────────┐                          │
-                      │   │       Response Thread        │                          │
-                      │   │                              │                          │
-                      │   │  gates on journal cursor     │                          │
-                      │   │  (persist-before-ack)        │                          │
-                      │   └──────────────┬───────────────┘                          │
-                      │                  │                                          │
-                      └──────────────────┼──────────────────────────────────────────┘
-                                         │
-                                         │
-  Clients ◄─TCP──────────────────────────┘
+                           ┌────────────────────────────────────────────────────────────┐
+                           │                          PRIMARY                           │
+                           │                                                            │
+  Clients ─TCP────────────────────────► Accept Loop                                     │
+                           │                │                                           │
+                           │                ▼                                           │
+                           │            Epoll/io_uring Reader Pool                      │
+                           │            (edge-triggered, non-blocking)                  │
+                           │                │                                           │
+                           │                │  lock-free CAS                            │
+                           │                ▼                                           │
+                           │   ┌─────────────────────────────────┐                      │
+                           │   │     Input Disruptor (ring buf)  │                      │
+                           │   └──────────┬──────────────┬───────┘                      │
+                           │              │              │                              │
+                           │              ▼              ▼                              │
+  ┌──────────────────┐     │   ┌──────────────┐  ┌──────────────┐                       │
+  │     REPLICA      │     │   │   Journal    │  │   Matching   │  parallel consumers   │
+  │                  │     │   │   Thread     │  │   Thread     │                       │
+  │  replay + fsync  │◄────┼───│              │  │              │                       │
+  │                  │repl │   │ pwritev2     │  │ Exchange     │                       │
+  │  ack ─┐          │ring │   │ + RWF_DSYNC  │  │ .execute()   │                       │
+  └───────┼──────────┘     │   └──────┬───────┘  └──────┬───────┘                       │
+          │                │          │                 │                               │
+          │ repl cursor    │          │ journal cursor  │ output SPSC                   │
+          │                │          ▼                 ▼                               │
+          │                │   ┌──────────────────────────────┐                         │
+          └──────────────► │   │       Response Thread        │                         │
+                           │   │                              │                         │
+                           │   │  gates on min(journal cursor,│                         │
+                           │   │      repl cursor)            │                         │
+                           │   └──────────────┬───────────────┘                         │
+                           │                  │                                         │
+                           └──────────────────┼─────────────────────────────────────────┘
+                                              │
+  Clients ◄─TCP───────────────────────────────┘
 ```
 
 - **Single-threaded matching engine** — no locks on the hot path; one thread executes all matching logic
 - **LMAX-style disruptor pipeline** ([docs/pipeline-architecture.md](docs/pipeline-architecture.md)) — 3 OS threads (journal, matching, response) on lock-free ring buffers; lock-free CAS-based multi-producer from reader pool; journal and matching run in parallel on the same events
 - **Persist-before-ack** — pipelined journal I/O with full durability guarantee; matching latency overlapped against journal writes, acknowledgement gated on confirmed durability, not optimistically sent
+- **Synchronous replication** — journal batches streamed to a replica via a lock-free ring buffer; replica fsyncs and acks before the primary sends responses to clients (zero data loss)
 - **Batch sync amortization** — under load, one sync covers many events; `pwritev2` with `RWF_DSYNC` (Force Unit Access) combines write + durability in a single syscall; `posix_fallocate` pre-allocates 64 MiB chunks so sync only flushes data pages, not extent metadata
 - **Event sourcing** — deterministic replay for crash recovery and audit; snapshots for fast restart; BLAKE3 hash chain for tamper evidence
 - **Mechanical sympathy** — cache-line-padded sequences, fixed-point pricing (no floats), pre-allocated buffers with no per-order allocations on the hot path
@@ -248,61 +248,92 @@ crates/
 
 ## Performance
 
-LAN round-trip benchmarks at [`126d118`](../../commit/126d118). Two Cherry AMD Ryzen 9950X servers (16C/32T, 192 GB RAM, 2x 1TB NVMe, 10 Gbps). Engine on one server with journal on a dedicated NVMe disk, benchmark client on the other, TCP over private network. [Realistic order flow](crates/bench/). Reproducible via `scripts/lan-bench-suite.sh`.
+LAN round-trip benchmarks at [`331c089`](../../commit/331c089). Two or three Cherry AMD Ryzen 9950X servers (16C/32T, 192 GB RAM, 2x 1TB NVMe, 10 Gbps). Engine on one server with journal on a dedicated NVMe disk, benchmark client on the second, replica on the third (replication only). TCP over private VLAN. [Realistic order flow](crates/bench/). Reproducible via `scripts/lan-bench-suite.sh`.
 
-**Peak-load throughput** — full durability, 100M order pairs, 16 clients, 256 pipelined:
+### Headline numbers
 
-| Metric | Value |
-|--------|-------|
-| **Throughput** | 4.3M orders/sec |
-| **p50** | 926 µs |
-| **p90** | 952 µs |
-| **p99** | 1031 µs |
-| **p99.9** | 1080 µs |
-| **p99.99** | 1102 µs |
-| **p99.999** | 1128 µs |
-| **p99.9999** | 1200 µs |
-| **max** | 1232 µs |
+| Mode | Throughput | p50 | p99 | p99.9 | max |
+|------|-----------|-----|-----|-------|-----|
+| **Full durability** (fsync) | **4.0M orders/sec** | 916 µs | 1,026 µs | 1,072 µs | 1,595 µs |
+| **No persistence** | **8.0M orders/sec** | 636 µs | 827 µs | 897 µs | 1,396 µs |
+| **Single-order latency** | 13.1K orders/sec | **74 µs** | 110 µs | 114 µs | 329 µs |
+| **Synchronous replication** | **1.1M orders/sec** | 1,040 µs | 1,297 µs | 1,342 µs | 1,442 µs |
 
-```sh
-./trading-server --bind 0.0.0.0:9876 --journal /mnt/journal/trading.journal  # engine server
-./trading-bench 100000000 --addr <engine-ip>:9876 --window=256               # bench client
-```
+### Peak-load throughput — full durability
 
-**Peak-load throughput** — no persistence, 100M order pairs, 32 clients, 192 pipelined:
+100M order pairs, 16 clients, 256 pipelined, `pwritev2` + `RWF_DSYNC` (FUA) journaling:
 
 | Metric | Value |
 |--------|-------|
-| **Throughput** | 8.8M orders/sec |
-| **p50** | 651 µs |
-| **p90** | 760 µs |
-| **p99** | 826 µs |
-| **p99.9** | 895 µs |
-| **p99.99** | 950 µs |
-| **p99.999** | 1021 µs |
-| **p99.9999** | 1044 µs |
-| **max** | 1148 µs |
+| **Throughput** | 4.0M orders/sec |
+| **p50** | 916 µs |
+| **p90** | 947 µs |
+| **p99** | 1,026 µs |
+| **p99.9** | 1,072 µs |
+| **p99.99** | 1,104 µs |
+| **p99.999** | 1,477 µs |
+| **max** | 1,595 µs |
 
-```sh
-./trading-bench 100000000 --addr <engine-ip>:9876 --window=192 --clients=32  # no-persist server
-```
+### Peak-load throughput — no persistence
 
-**Single-order latency** — full durability, 1 client, no pipelining, 1M order pairs:
+100M order pairs, 16 clients, 384 pipelined:
+
+| Metric | Value |
+|--------|-------|
+| **Throughput** | 8.0M orders/sec |
+| **p50** | 636 µs |
+| **p90** | 757 µs |
+| **p99** | 827 µs |
+| **p99.9** | 897 µs |
+| **p99.99** | 998 µs |
+| **p99.999** | 1,029 µs |
+| **max** | 1,396 µs |
+
+### Single-order latency — full durability
+
+1M order pairs, 1 client, no pipelining (window=1):
 
 | Metric | Value |
 |--------|-------|
 | **Throughput** | 13.1K orders/sec |
-| **p50** | 76 µs |
-| **p90** | 77 µs |
-| **p99** | 113 µs |
-| **p99.9** | 116 µs |
-| **p99.99** | 118 µs |
-| **p99.999** | 238 µs |
-| **max** | 338 µs |
+| **p50** | 74 µs |
+| **p90** | 75 µs |
+| **p99** | 110 µs |
+| **p99.9** | 114 µs |
+| **p99.99** | 119 µs |
+| **p99.999** | 186 µs |
+| **max** | 329 µs |
 
-```sh
-./trading-bench 1000000 --addr <engine-ip>:9876 --window=1 --clients=1
-```
+### Synchronous replication — full durability
+
+2M order pairs, 16 clients, 256 pipelined. Primary + replica, both with dedicated NVMe journals, ack-gated responses (zero data loss):
+
+| Metric | Value |
+|--------|-------|
+| **Throughput** | 1.1M orders/sec |
+| **p50** | 1,040 µs |
+| **p90** | 1,236 µs |
+| **p99** | 1,297 µs |
+| **p99.9** | 1,342 µs |
+| **p99.99** | 1,401 µs |
+| **p99.999** | 1,428 µs |
+| **max** | 1,442 µs |
+
+Journals verified byte-identical (BLAKE3 chain hash match, 5.8M entries).
+
+### Plots
+
+**Latency CDF** — all four modes on the same axes:
+
+![Latency CDF](docs/plots/latency-cdf.svg)
+
+**Throughput vs. window depth** (fsync mode, 16 clients, 10M orders per point):
+
+![Saturation — window](docs/plots/saturation-window.svg)
+
+**Throughput vs. instrument count** (fsync mode, 16 clients, window 128):
+
+![Saturation — instruments](docs/plots/saturation-instruments.svg)
 
 ## License
 

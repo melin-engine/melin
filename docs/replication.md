@@ -8,16 +8,22 @@ Synchronous journal replication from a primary server to a replica, providing ze
 
 ```
 Primary:
-  Readers → Disruptor → JournalStage       (consumer 0, parallel) → disk
-                       → MatchingStage      (consumer 1, parallel) → OutputSPSC
-                       → ReplicationStage   (consumer 2, parallel) → TCP → Replica
+  Readers → Disruptor → JournalStage  (consumer 0) → disk + replication channel
+                       → MatchingStage (consumer 1) → OutputSPSC
+
+  JournalStage: after flush_batch_sync(), sends a copy of the
+  exact bytes written to disk to the replication sender thread.
+
+  ReplicationSender thread: streams DataBatch frames to replica,
+  processes acks, updates replication_cursor.
 
   ResponseStage gates on min(journal_cursor, replication_cursor)
 
 Replica:
-  TCP → ReplicationReceiver → decode + verify CRC + chain hash
-      → local JournalWriter (durability) → ack sequence back to primary
+  TCP → ReplicationReceiver → decode entries, verify CRC
+      → write_raw_sync() (byte-for-byte copy to local journal)
       → replay into Exchange (state)
+      → ack sequence back to primary
 ```
 
 ### Pipeline integration
@@ -41,11 +47,14 @@ The response stage gates on `min(journal_cursor, replication_cursor)` instead of
 | Scenario | `replication_cursor` | Response gate effect |
 |---|---|---|
 | `--standalone` (dev/test) | `u64::MAX` | `min(journal, MAX) = journal` — no replication |
+| `--replication-bind`, no replica connected | `u64::MAX` | Same as standalone — server works normally |
 | Replica connected, acking | Latest acked seq | Waits for both journal + replica |
 | Replica disconnects | `u64::MAX` | Degrades to local-only, operator alerted |
 | Replica reconnects | Resumes from ack | Gate re-engages |
 
-When the replica disconnects, the cursor is set to `u64::MAX` so the primary degrades gracefully to local-only durability. This is a deliberate design choice: a disconnected replica should not halt the exchange. The operator is alerted via `error!` log and must reconnect the replica.
+The cursor is **always initialized to `u64::MAX`**, even when replication is enabled. This ensures the server starts immediately and serves clients without waiting for a replica. The cursor only engages when a replica connects and starts sending acks. On disconnect, it resets to `u64::MAX`.
+
+The cursor update is **monotonic** (`fetch_max`) — a stale ack (e.g., from a previous connection) cannot regress the cursor to a lower value.
 
 ## Wire Protocol
 
@@ -66,27 +75,20 @@ Length-prefixed frames, little-endian. Runs over a dedicated TCP connection sepa
 | NeedSnapshot | `[len:u32][type=0x11]` | Replica is too far behind; needs a snapshot transfer (future, not implemented) |
 | HashMismatch | `[len:u32][type=0x12]` | Chain hash doesn't match at the replica's reported sequence (not yet validated) |
 | DataBatch | `[len:u32][type=0x20][end_sequence:u64][chain_hash:[u8;32]][journal_bytes...]` | Batch of encoded journal entries with trailing chain hash |
-| Heartbeat | `[len:u32][type=0x30][sequence:u64][chain_hash:[u8;32]]` | Periodic idle keepalive with current state |
+| Heartbeat | `[len:u32][type=0x30][sequence:u64][chain_hash:[u8;32]]` | Periodic idle keepalive (5-second interval) with current state |
 
 ### Design rationale
 
-- **Journal wire format reuse**: DataBatch payloads contain raw journal-encoded bytes (same as on-disk format). This avoids a second serialization format, ensures the replica can write directly to its journal, and inherits CRC32C integrity checks.
-- **Chain hash in DataBatch**: The replica verifies the chain hash after processing each batch, catching any corruption in transit that CRC alone might miss (CRC protects individual entries; the chain hash protects ordering and completeness).
-- **Single replica (v1)**: The primary accepts one replica connection. Multi-replica support is a future extension.
-
-## Catch-up
-
-When a replica connects with `last_sequence < primary.current_sequence`, the primary reads historical entries from the journal file(s) using `JournalReader` and streams them as `DataBatch` frames before switching to the live feed from the disruptor.
-
-The chain hash in the handshake is validated against the journal at the replica's reported sequence. A mismatch indicates divergent history (e.g., the replica was connected to a different primary) and is rejected with `HashMismatch`.
+- **Journal byte reuse**: DataBatch payloads contain the exact bytes from the primary's journal file. The replica writes them directly via `write_raw_sync()`, producing a byte-for-byte copy. No re-encoding, no second serialization format.
+- **Single replica (v1)**: The primary accepts one replica connection at a time. If a second replica connects, it replaces the first.
 
 ## Replica Mode
 
 A server started with `--replica-of <primary_addr>` runs in replica mode:
 
 - Connects to the primary and sends a `Handshake`.
-- Receives `DataBatch` frames, decodes entries, verifies CRC and chain hash.
-- Writes entries to a local `JournalWriter` for durability.
+- Receives `DataBatch` frames, decodes entries, verifies CRC per entry.
+- Writes raw bytes to a local journal via `write_raw_sync()` for durability.
 - Replays entries into a local `Exchange` for state.
 - Sends `Ack` frames after each durable write.
 - Does **not** accept client connections (read-only state).
@@ -95,13 +97,13 @@ A server started with `--replica-of <primary_addr>` runs in replica mode:
 
 | Flag | Required | Default | Purpose |
 |---|---|---|---|
-| `--replication-bind <addr>` | Yes (primary mode) | — | Address to listen for replica connections |
-| `--standalone` | No | — | Disable replication (dev/test); sets cursor to `u64::MAX` |
+| `--replication-bind <addr>` | No | — | Address to listen for replica connections |
+| `--standalone` | No | `false` | Explicitly disable replication (dev/test) |
 | `--replica-of <addr>` | No | — | Run as a replica connected to the given primary |
 
-`--replication-bind` and `--standalone` are mutually exclusive. `--replica-of` is mutually exclusive with both.
+`--replication-bind` and `--standalone` are mutually exclusive. `--replica-of` is mutually exclusive with both. If none are specified, the server runs in standalone mode.
 
-## Future Work (not in this branch)
+## Current Limitations (v1)
 
 These are known limitations of the current implementation. Each is documented here with the reason it was deferred and the plan for resolution.
 
