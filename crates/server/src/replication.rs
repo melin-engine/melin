@@ -1,5 +1,10 @@
 //! Replication — synchronous journal streaming from primary to replica.
 //!
+//! The JournalStage sends byte-for-byte copies of encoded journal batches
+//! through a bounded channel. The `ReplicationSender` streams them to the
+//! replica as `DataBatch` frames. The replica writes them directly to its
+//! local journal via `write_raw_sync()` and replays into its Exchange.
+//!
 //! ## Wire Protocol
 //!
 //! Length-prefixed frames, little-endian, over a dedicated TCP connection.
@@ -26,6 +31,7 @@
 
 use std::io::{self, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::os::unix::io::AsRawFd;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
@@ -417,8 +423,20 @@ fn handle_replica_connection(
     writer.flush()?;
     send_buf.clear();
 
-    // Set non-blocking read for ack processing during streaming.
-    reader.set_read_timeout(Some(std::time::Duration::from_millis(1)))?;
+    // Short read timeout for process_acks. The actual availability check
+    // uses poll(0) — this timeout only applies after poll confirms data
+    // is ready, as a safety net for partial frames.
+    reader.set_read_timeout(Some(std::time::Duration::from_millis(5)))?;
+
+    // pollfd for non-blocking ack availability check. poll(fd, POLLIN, 0)
+    // returns immediately — avoids the 2ms+ SO_RCVTIMEO floor that Linux
+    // imposes even for 1µs timeouts (kernel jiffy rounding).
+    let reader_fd = reader.as_raw_fd();
+    let mut pollfd = libc::pollfd {
+        fd: reader_fd,
+        events: libc::POLLIN,
+        revents: 0,
+    };
 
     // Reset the replication cursor from u64::MAX (disconnect state) so
     // that subsequent fetch_max calls from ack processing can advance it.
@@ -439,11 +457,34 @@ fn handle_replica_connection(
             return Ok(());
         }
 
+        // Process any pending acks (non-blocking via internal poll(0)).
+        if let Err(e) = process_acks(&mut reader, replication_cursor, &mut pollfd) {
+            return Err(io::Error::other(format!("replica ack read error: {e}")));
+        }
+
         // Try to read a batch from the replication ring (non-blocking).
         if let Some((meta, data)) = repl_consumer.try_read() {
-            // Send DataBatch frame. Must send before commit() releases the slot.
+            // Coalesce multiple batches into one TCP write+flush to
+            // amortize syscall overhead. Drain up to 16 batches from
+            // the ring before flushing. Each batch is encoded into the
+            // send buffer; a single write_all+flush sends them all.
             encode_data_batch(meta.end_sequence, &meta.chain_hash, data, &mut send_buf);
             repl_consumer.commit();
+            last_sequence = meta.end_sequence;
+            last_chain_hash = meta.chain_hash;
+
+            // Drain more batches if available (up to 15 more).
+            for _ in 0..15 {
+                if let Some((meta, data)) = repl_consumer.try_read() {
+                    encode_data_batch(meta.end_sequence, &meta.chain_hash, data, &mut send_buf);
+                    repl_consumer.commit();
+                    last_sequence = meta.end_sequence;
+                    last_chain_hash = meta.chain_hash;
+                } else {
+                    break;
+                }
+            }
+
             if let Err(e) = writer.write_all(&send_buf) {
                 return Err(io::Error::other(format!("write DataBatch: {e}")));
             }
@@ -452,8 +493,6 @@ fn handle_replica_connection(
             }
             send_buf.clear();
             last_send = std::time::Instant::now();
-            last_sequence = meta.end_sequence;
-            last_chain_hash = meta.chain_hash;
         } else {
             // No batch available — send heartbeat if idle.
             if last_send.elapsed() >= HEARTBEAT_INTERVAL {
@@ -467,28 +506,39 @@ fn handle_replica_connection(
                 send_buf.clear();
                 last_send = std::time::Instant::now();
             }
-            // Brief yield before retrying to avoid busy-spinning.
-            std::hint::spin_loop();
-        }
-
-        // Process acks (non-blocking). If the connection is dead, exit.
-        if let Err(e) = process_acks(&mut reader, replication_cursor) {
-            return Err(io::Error::other(format!("replica ack read error: {e}")));
+            // Ring empty — process any pending acks, then yield.
+            // Using poll(0) instead of poll(1ms) to avoid adding 1ms
+            // to the ack→response latency path when the ring empties
+            // between journal stage batches.
+            if let Err(e) = process_acks(&mut reader, replication_cursor, &mut pollfd) {
+                return Err(io::Error::other(format!("replica ack read error: {e}")));
+            }
+            std::thread::yield_now();
         }
     }
 }
 
-/// Read and process ack frames from the replica (non-blocking).
-/// Updates the replication cursor on each ack.
-/// Returns `Err` if the connection is dead (non-timeout read error).
-fn process_acks(reader: &mut TcpStream, replication_cursor: &Arc<AtomicU64>) -> io::Result<()> {
+/// Read and process ack frames from the replica using poll(0) for
+/// each frame. Never blocks — returns as soon as no more data is
+/// available. This avoids the ~2ms Linux SO_RCVTIMEO floor that
+/// makes sub-ms read timeouts unreliable.
+fn process_acks(
+    reader: &mut TcpStream,
+    replication_cursor: &Arc<AtomicU64>,
+    pollfd: &mut libc::pollfd,
+) -> io::Result<()> {
     loop {
+        // Check if more ack data is available before calling read_frame.
+        // poll(0) is truly non-blocking — no kernel jiffy rounding.
+        pollfd.revents = 0;
+        let ready = unsafe { libc::poll(pollfd, 1, 0) };
+        if ready <= 0 || (pollfd.revents & libc::POLLIN) == 0 {
+            return Ok(()); // No data available.
+        }
+
         match read_frame(reader, MAX_CONTROL_FRAME) {
             Ok(payload) => match decode_replica_message(&payload) {
                 Ok(ReplicaMessage::Ack(ack)) => {
-                    // Update cursor monotonically: only advance, never go backward.
-                    // This prevents a stale ack (e.g., after reconnect) from
-                    // regressing the cursor.
                     let new_val = ack.acked_sequence + 1;
                     let _ = replication_cursor.fetch_max(new_val, Ordering::Release);
                 }
@@ -523,7 +573,6 @@ pub fn run_receiver(
     shutdown: &AtomicBool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use trading_engine::exchange::Exchange;
-    use trading_engine::journal::codec;
     use trading_engine::journal::writer::JournalWriter;
 
     info!(primary = %primary_addr, "connecting to primary as replica");
@@ -633,6 +682,15 @@ pub fn run_receiver(
     // heap allocation. Same pattern as MatchingStage.
     let mut reports: Vec<trading_engine::types::ExecutionReport> = Vec::with_capacity(256);
 
+    // Accumulation buffer for coalescing multiple DataBatch frames into
+    // one fsync. The replica reads all available frames from the TCP
+    // buffer, accumulates journal bytes, then does ONE pwritev2+RWF_DSYNC
+    // and ONE ack for the highest sequence. This reduces NVMe fsync
+    // overhead from one-per-batch to one-per-TCP-read-burst.
+    let mut journal_accum: Vec<u8> = Vec::with_capacity(128 * 1024);
+    let mut accum_entry_count: u64 = 0;
+    let mut accum_end_sequence: u64;
+
     // Main receive loop.
     loop {
         if shutdown.load(Ordering::Relaxed) {
@@ -640,7 +698,8 @@ pub fn run_receiver(
             return Ok(());
         }
 
-        // Read the next frame from the primary.
+        // Read the first frame (blocking, with the 5s timeout for
+        // shutdown checking).
         let frame = match read_frame(&mut reader, MAX_DATA_FRAME) {
             Ok(f) => f,
             Err(e)
@@ -660,40 +719,66 @@ pub fn run_receiver(
                 chain_hash: _batch_chain_hash,
                 journal_bytes,
             } => {
-                // Decode each entry to replay into the exchange and count entries.
-                let mut offset = 0;
-                let mut entry_count = 0u64;
-                while offset < journal_bytes.len() {
-                    let remaining = &journal_bytes[offset..];
-                    match codec::decode(remaining) {
-                        Ok((consumed, _sequence, _timestamp_ns, event)) => {
-                            replay_event(&mut exchange, &event, &mut reports);
-                            offset += consumed;
-                            entry_count += 1;
+                // Decode + replay + accumulate for coalesced fsync.
+                decode_replay_accum(
+                    &journal_bytes,
+                    &mut exchange,
+                    &mut reports,
+                    &mut journal_accum,
+                    &mut accum_entry_count,
+                )?;
+                accum_end_sequence = end_sequence;
+
+                // Drain additional frames already in the TCP buffer.
+                // Use poll(0) to check availability — avoids the ~2ms
+                // SO_RCVTIMEO jiffy floor on Linux.
+                let mut rpollfd = libc::pollfd {
+                    fd: reader.as_raw_fd(),
+                    events: libc::POLLIN,
+                    revents: 0,
+                };
+                loop {
+                    rpollfd.revents = 0;
+                    let ready = (unsafe { libc::poll(&mut rpollfd, 1, 0) }) > 0
+                        && (rpollfd.revents & libc::POLLIN) != 0;
+                    if !ready {
+                        break;
+                    }
+                    let frame = match read_frame(&mut reader, MAX_DATA_FRAME) {
+                        Ok(f) => f,
+                        Err(_) => break,
+                    };
+                    match decode_primary_message(&frame)? {
+                        PrimaryMessage::DataBatch {
+                            end_sequence,
+                            journal_bytes,
+                            ..
+                        } => {
+                            decode_replay_accum(
+                                &journal_bytes,
+                                &mut exchange,
+                                &mut reports,
+                                &mut journal_accum,
+                                &mut accum_entry_count,
+                            )?;
+                            accum_end_sequence = end_sequence;
                         }
-                        Err(e) => {
-                            return Err(format!(
-                                "failed to decode journal entry at offset {offset}: {e}"
-                            )
-                            .into());
-                        }
+                        _ => break,
                     }
                 }
+                // One fsync for all accumulated batches.
+                journal_writer.write_raw_sync(&journal_accum, accum_entry_count)?;
 
-                // Write raw journal bytes to the local journal with durability.
-                // This preserves the primary's exact sequence numbers, timestamps,
-                // and CRC checksums — the replica's journal is a byte-for-byte
-                // copy of the primary's (after the genesis entry).
-                journal_writer.write_raw_sync(&journal_bytes, entry_count)?;
-
-                // Ack the batch.
+                // One ack for the highest sequence.
                 let ack = Ack {
-                    acked_sequence: end_sequence,
+                    acked_sequence: accum_end_sequence,
                 };
                 encode_ack(&ack, &mut send_buf);
                 tcp_writer.write_all(&send_buf)?;
                 tcp_writer.flush()?;
                 send_buf.clear();
+                journal_accum.clear();
+                accum_entry_count = 0;
             }
             PrimaryMessage::Heartbeat {
                 sequence,
@@ -719,6 +804,36 @@ pub fn run_receiver(
 ///
 /// The reports Vec is caller-owned and reused across calls to avoid
 /// per-event heap allocation.
+/// Decode journal entries, replay into exchange, accumulate raw bytes for
+/// coalesced fsync. Used by the replica to batch multiple DataBatch frames
+/// into one pwritev2+RWF_DSYNC call.
+fn decode_replay_accum(
+    journal_bytes: &[u8],
+    exchange: &mut trading_engine::exchange::Exchange,
+    reports: &mut Vec<trading_engine::types::ExecutionReport>,
+    accum: &mut Vec<u8>,
+    entry_count: &mut u64,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut offset = 0;
+    while offset < journal_bytes.len() {
+        let remaining = &journal_bytes[offset..];
+        match trading_engine::journal::codec::decode(remaining) {
+            Ok((consumed, _sequence, _timestamp_ns, event)) => {
+                replay_event(exchange, &event, reports);
+                offset += consumed;
+                *entry_count += 1;
+            }
+            Err(e) => {
+                return Err(
+                    format!("failed to decode journal entry at offset {offset}: {e}").into(),
+                );
+            }
+        }
+    }
+    accum.extend_from_slice(journal_bytes);
+    Ok(())
+}
+
 fn replay_event(
     exchange: &mut trading_engine::exchange::Exchange,
     event: &trading_engine::journal::event::JournalEvent,
