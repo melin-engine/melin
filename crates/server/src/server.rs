@@ -208,6 +208,21 @@ pub fn run_with_shutdown<L: BlockingTransportListener>(
     config: ServerConfig,
     shutdown: Arc<AtomicBool>,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    // Replica mode: connect to primary, receive journal stream, replay.
+    // Must run before init_engine — the replica's journal is created from
+    // the primary's genesis during the replication handshake.
+    //
+    // TODO: this is a minimal receiver that writes to journal only. For
+    // production, the replica should build the full pipeline (Exchange,
+    // matching stage, accept loop in dormant state) so it can:
+    //   - Be promoted to primary (switch input from replication to clients)
+    //   - Serve read-only queries (L2 book snapshots, trade feed)
+    //   - Verify state via BLAKE3 hash chain
+    if let Some(primary_addr) = config.replica_of {
+        info!(primary = %primary_addr, "starting in replica mode");
+        return crate::replication::run_receiver(primary_addr, &config.journal, &shutdown);
+    }
+
     // Load authorized keys for challenge-response authentication.
     let authorized_keys = Arc::new(AuthorizedKeys::load(&config.authorized_keys)?);
     info!(
@@ -235,11 +250,6 @@ pub fn run_with_shutdown<L: BlockingTransportListener>(
     let enable_replication = config.replication_bind.is_some();
     if enable_replication && config.standalone {
         return Err("--replication-bind and --standalone are mutually exclusive".into());
-    }
-    if config.replica_of.is_some() && (enable_replication || config.standalone) {
-        return Err(
-            "--replica-of is mutually exclusive with --replication-bind and --standalone".into(),
-        );
     }
 
     // Read the raw genesis entry bytes from the journal file before
