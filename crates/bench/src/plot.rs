@@ -602,6 +602,8 @@ fn sweep_x_label(filename: &str) -> &'static str {
         "Instruments"
     } else if stem.starts_with('c') {
         "Clients"
+    } else if stem.starts_with('a') {
+        "Accounts"
     } else {
         "Parameter"
     }

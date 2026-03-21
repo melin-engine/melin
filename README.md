@@ -360,6 +360,10 @@ Journals verified byte-identical (BLAKE3 chain hash match, 42.6M entries).
 
 ![Saturation — instruments](docs/plots/saturation-instruments.svg)
 
+**Throughput vs. account count** (fsync mode, 16 clients, window 128):
+
+![Saturation — accounts](docs/plots/saturation-accounts.svg)
+
 ## License
 
 Copyright (c) 2026 Pierre Larger. All Rights Reserved.

@@ -277,6 +277,27 @@ for inst in 10 100 1000; do
     echo ""
 done
 
+# 4d. Account sweep (fixed clients=16, window=128)
+# Tests whether account count affects hot-path latency via cache pressure
+# on the flat balance array (account_id × stride × 16 bytes).
+ACCT_SWEEP_DIR="${RESULTS_DIR}/sweep-accounts"
+mkdir -p "${ACCT_SWEEP_DIR}"
+echo ""
+echo "============================================================"
+echo "  Sweep: accounts"
+echo "  ${ORDERS_PER_SWEEP} orders per point"
+echo "============================================================"
+echo ""
+for accts in 100000 1000000 10000000; do
+    label="a${accts}"
+    echo "--- accounts=${accts} ---"
+    "${LAN_BENCH}" "$SERVER_PUB" "$BENCH_PUB" "$SERVER_VLAN" "$SSH_USER" \
+        -- --accounts "${accts}" \
+        -- ${ORDERS_PER_SWEEP} --clients 16 --window 128 --accounts "${accts}"
+    cp /tmp/lan-bench-results.json "${ACCT_SWEEP_DIR}/${label}.json" 2>/dev/null || true
+    echo ""
+done
+
 fi
 
 # ---------------------------------------------------------------------------
@@ -411,7 +432,7 @@ if command -v cargo &>/dev/null && [[ -f "$(dirname "$0")/../crates/bench/src/pl
     "${PLOT_TOOL}" latency-cdf -o "${PLOT_DIR}/latency-cdf.svg" \
         "${CDF_FILES[@]}" 2>&1
 
-    for sweep in window clients instruments; do
+    for sweep in window clients instruments accounts; do
         dir="${RESULTS_DIR}/sweep-${sweep}"
         if [[ -d "$dir" ]] && ls "${dir}"/*.json &>/dev/null; then
             echo "  Generating sweep plot: ${sweep}..."
