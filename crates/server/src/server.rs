@@ -453,28 +453,15 @@ pub fn run_with_shutdown<L: BlockingTransportListener>(
         }
 
         for acct in 1..=config.accounts {
-            for i in 1..=config.instruments {
-                producer.publish(InputSlot {
-                    connection_id: 0,
-                    event: JournalEvent::Deposit {
-                        account: AccountId(acct),
-                        currency: CurrencyId(i * 2 - 1),
-                        amount: u64::MAX / 4,
-                    },
-                    publish_ts: trace_ts(),
-                    recv_ts: trace_ts(),
-                });
-                producer.publish(InputSlot {
-                    connection_id: 0,
-                    event: JournalEvent::Deposit {
-                        account: AccountId(acct),
-                        currency: CurrencyId(i * 2),
-                        amount: u64::MAX / 4,
-                    },
-                    publish_ts: trace_ts(),
-                    recv_ts: trace_ts(),
-                });
-            }
+            producer.publish(InputSlot {
+                connection_id: 0,
+                event: JournalEvent::ProvisionAccount {
+                    account: AccountId(acct),
+                    amount: u64::MAX / 4,
+                },
+                publish_ts: trace_ts(),
+                recv_ts: trace_ts(),
+            });
         }
 
         info!(

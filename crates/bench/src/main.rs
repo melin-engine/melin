@@ -351,12 +351,9 @@ fn run_engine_bench(
         });
     }
 
-    // Deposit generous balances for all accounts across all currencies.
+    // Provision all accounts with generous balances in all currencies.
     for acct in 1..=num_accounts {
-        for i in 1..=num_instruments {
-            exchange.deposit(AccountId(acct), CurrencyId(i * 2 - 1), u64::MAX / 4);
-            exchange.deposit(AccountId(acct), CurrencyId(i * 2), u64::MAX / 4);
-        }
+        exchange.provision_account(AccountId(acct), u64::MAX / 4);
     }
 
     exchange.prefault();

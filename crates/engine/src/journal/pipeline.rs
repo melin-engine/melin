@@ -1028,6 +1028,9 @@ impl MatchingStage {
             JournalEvent::SetFeeSchedule { symbol, schedule } => {
                 self.exchange.set_fee_schedule(symbol, schedule);
             }
+            JournalEvent::ProvisionAccount { account, amount } => {
+                self.exchange.provision_account(account, amount);
+            }
             JournalEvent::QueryStats => {
                 // Handled inline in the run loop before process_event is called.
                 // This arm exists only for exhaustiveness.

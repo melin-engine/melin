@@ -346,6 +346,9 @@ fn replay_event(exchange: &mut Exchange, event: &JournalEvent, reports: &mut Vec
         JournalEvent::SetFeeSchedule { symbol, schedule } => {
             exchange.set_fee_schedule(symbol, schedule);
         }
+        JournalEvent::ProvisionAccount { account, amount } => {
+            exchange.provision_account(account, amount);
+        }
         JournalEvent::QueryStats => {
             // QueryStats is never journaled, so it should never appear
             // during replay. No-op if it somehow does.

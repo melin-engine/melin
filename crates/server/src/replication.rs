@@ -891,6 +891,9 @@ fn replay_event(
         JournalEvent::SetFeeSchedule { symbol, schedule } => {
             exchange.set_fee_schedule(*symbol, *schedule);
         }
+        JournalEvent::ProvisionAccount { account, amount } => {
+            exchange.provision_account(*account, *amount);
+        }
         JournalEvent::QueryStats
         | JournalEvent::GenesisHash { .. }
         | JournalEvent::Checkpoint { .. } => {

@@ -292,6 +292,16 @@ impl Exchange {
         self.accounts.deposit(account, currency, amount);
     }
 
+    /// Provision an account with `amount` deposited in every currency of
+    /// every registered instrument. Replaces O(instruments) individual
+    /// Deposit calls with a single operation for bulk seeding.
+    pub fn provision_account(&mut self, account: AccountId, amount: u64) {
+        for state in self.instruments.iter().flatten() {
+            self.accounts.deposit(account, state.spec.base, amount);
+            self.accounts.deposit(account, state.spec.quote, amount);
+        }
+    }
+
     /// Get the account manager (for balance queries).
     pub fn accounts(&self) -> &AccountManager {
         &self.accounts

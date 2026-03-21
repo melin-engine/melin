@@ -54,6 +54,13 @@ pub enum JournalEvent {
         symbol: Symbol,
         schedule: FeeSchedule,
     },
+    /// Provision an account with a deposit of `amount` in every currency
+    /// of every registered instrument. Used for bulk seeding — one event
+    /// replaces O(instruments) individual Deposit events.
+    ///
+    /// Internal only: not exposed via the wire protocol. Only the server's
+    /// startup seeding path emits this event.
+    ProvisionAccount { account: AccountId, amount: u64 },
     /// Query server stats. Not journaled (no state change) — the journal
     /// stage skips this variant. Flows through the pipeline so the matching
     /// stage can read Exchange state without concurrency issues.

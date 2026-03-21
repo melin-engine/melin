@@ -72,6 +72,7 @@ const TAG_CANCEL_REPLACE: u8 = 8;
 const TAG_GENESIS_HASH: u8 = 9;
 const TAG_CHECKPOINT: u8 = 10;
 const TAG_SET_FEE_SCHEDULE: u8 = 11;
+const TAG_PROVISION_ACCOUNT: u8 = 12;
 
 /// OrderType tag encoding (codec-specific, not shared — order types are only
 /// in the journal format, not in snapshots).
@@ -281,6 +282,13 @@ pub fn encode(
             le::put_i16(&mut buf[pos..], schedule.taker_fee_bps);
             pos += 2;
             TAG_SET_FEE_SCHEDULE
+        }
+        JournalEvent::ProvisionAccount { account, amount } => {
+            le::put_u32(&mut buf[pos..], account.0);
+            pos += 4;
+            le::put_u64(&mut buf[pos..], *amount);
+            pos += 8;
+            TAG_PROVISION_ACCOUNT
         }
     };
 
@@ -665,6 +673,18 @@ pub fn decode(buf: &[u8]) -> Result<(usize, u64, u64, JournalEvent), JournalErro
                 },
             }
         }
+        TAG_PROVISION_ACCOUNT => {
+            // account(4) + amount(8) = 12
+            if payload.len() < 12 {
+                return Err(JournalError::CorruptEntry {
+                    sequence,
+                    reason: "ProvisionAccount payload too short",
+                });
+            }
+            let account = AccountId(le::get_u32(&payload[0..]));
+            let amount = le::get_u64(&payload[4..]);
+            JournalEvent::ProvisionAccount { account, amount }
+        }
         _ => {
             return Err(JournalError::CorruptEntry {
                 sequence,
@@ -952,6 +972,10 @@ mod tests {
                     maker_fee_bps: 5,
                     taker_fee_bps: 10,
                 },
+            },
+            JournalEvent::ProvisionAccount {
+                account: AccountId(42),
+                amount: u64::MAX / 4,
             },
         ]
     }
