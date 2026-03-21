@@ -116,7 +116,7 @@ pub struct GeneratorConfig {
 impl Default for GeneratorConfig {
     fn default() -> Self {
         Self {
-            num_accounts: 100,
+            num_accounts: 1_000_000,
             num_instruments: 1,
             cancel_ratio: 0.60,
             mid_price: 10_000,

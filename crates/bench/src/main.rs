@@ -238,7 +238,7 @@ struct BenchArgs {
     #[arg(long)]
     journal: Option<std::path::PathBuf>,
     /// Number of trading accounts.
-    #[arg(long, default_value_t = 1000)]
+    #[arg(long, default_value_t = 1_000_000)]
     accounts: u32,
     /// Number of instruments.
     #[arg(long, default_value_t = 100)]
