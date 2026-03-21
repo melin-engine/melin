@@ -135,7 +135,7 @@ Pipeline layer breakdown (loopback, Fedora dev machine, `fb3e959`):
 
 **How to apply:** The matching engine is not the bottleneck. Further throughput gains require reducing transport overhead (UDS, kernel bypass) or journal I/O optimization (overlapped io_uring writes). See Performance Tuning leads in the README.
 
-Core layout: 0=OS/IRQ, 1-3=pipeline (journal/matching/response), 4-5=readers, 6+=bench.
+Core layout: 0=OS/IRQ, 1-3=pipeline (journal/matching/response), 4-5=readers, 6=repl-sender, 7+=bench.
 
 ### Prioritized performance leads
 
@@ -143,9 +143,8 @@ Core layout: 0=OS/IRQ, 1-3=pipeline (journal/matching/response), 4-5=readers, 6+
 |----------|-------------|-----------|------------|
 | 1 | Higher window depth on Cherry (512, 1024) | Up to 2x repl throughput | Config only |
 | 2 | Embed ReservationSlot in RestingOrder | 5-10% matching | Moderate |
-| 3 | Pin sender thread to dedicated core | Latency improvement | Low |
-| 4 | io_uring for replication TCP (SEND/RECV) | Reduce syscall overhead | High |
-| 5 | Kernel bypass (AF_XDP) | Up to 2x over TCP | Very high |
+| 3 | io_uring for replication TCP (SEND/RECV) | Reduce syscall overhead | High |
+| 4 | Kernel bypass (AF_XDP) | Up to 2x over TCP | Very high |
 
 **Benchmarking constraint**: do NOT optimize by batching multiple client requests into a single write — real clients send one order at a time. Batch submission is unrealistic and inflates throughput numbers artificially.
 

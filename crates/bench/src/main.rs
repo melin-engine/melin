@@ -74,16 +74,16 @@ const DEFAULT_WINDOW: usize = 64;
 const DEFAULT_CLIENTS: usize = 16;
 
 /// Default number of bench client threads. Each thread manages a subset of
-/// connections via epoll. Pinned to cores 6-9 (2 physical + 2 HT siblings
-/// on 8C/16T). With 4 bench + 5 server (3 pipeline + 2 reader) = 9 pinned
-/// threads total, leaving core 0 for OS/IRQ and 6 cores free.
+/// connections via epoll. Pinned to cores 7-10 (2 physical + 2 HT siblings
+/// on 8C/16T). With 4 bench + 6 server (3 pipeline + 2 reader + 1 repl-sender)
+/// = 10 pinned threads total, leaving core 0 for OS/IRQ.
 const DEFAULT_BENCH_THREADS: usize = 4;
 
-/// First CPU core for bench thread pinning. Server uses cores 1-3 (pipeline)
-/// and 4-5 (readers), so bench threads start at core 6 to avoid contention
-/// for L1/L2 cache and reduce involuntary context switches. Thread i is
-/// pinned to core `BENCH_CORE_START + i`.
-const BENCH_CORE_START: usize = 6;
+/// First CPU core for bench thread pinning. Server uses cores 1-3 (pipeline),
+/// 4-5 (readers), and 6 (repl-sender), so bench threads start at core 7 to
+/// avoid contention for L1/L2 cache and reduce involuntary context switches.
+/// Thread i is pinned to core `BENCH_CORE_START + i`.
+const BENCH_CORE_START: usize = 7;
 
 /// Maximum frame payload size (matches protocol).
 const MAX_FRAME_SIZE: usize = 1024;

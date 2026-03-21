@@ -38,7 +38,7 @@ The server uses jemalloc by default (thread-local caches eliminate allocator loc
 | `--journal` | `melin.journal` | Path to the journal file. Use a dedicated NVMe for best latency. |
 | `--snapshot` | (derived) | Path to the snapshot file. If omitted, defaults to `<journal>.snapshot` (e.g., `trading.snapshot`). |
 | `--authorized-keys` | `authorized_keys` | Path to the Ed25519 authorized keys file. Every connection must authenticate before trading. |
-| `--cores` | `1,2,3` | Pipeline core IDs: `journal,matching,response` (comma-separated). Core 0 should be reserved for OS/IRQ. |
+| `--cores` | `1,2,3,6` | Pipeline core IDs: `journal,matching,response,repl-sender` (comma-separated). Core 0 should be reserved for OS/IRQ. |
 | `--readers` | `2` | Number of epoll reader threads. Each multiplexes connections via epoll. |
 | `--reader-cores` | `4` | First CPU core for reader threads. Reader thread `i` is pinned to core `reader_cores + i`. |
 | `--max-journal-mib` | `256` | Maximum journal size in MiB before automatic rotation at startup. Set to `0` to disable. |
@@ -56,7 +56,7 @@ The server uses jemalloc by default (thread-local caches eliminate allocator loc
 3. Pre-fault all exchange hash map pages (avoids page faults on the hot path).
 4. Build the disruptor pipeline (input ring buffer + output SPSC queue).
 5. Spawn reader thread pool (epoll-based, one thread per `--readers`).
-6. Spawn 3 pipeline OS threads: journal, matching, response -- each pinned to its `--cores` value.
+6. Spawn 3-4 pipeline OS threads: journal, matching, response, and optionally repl-sender -- each pinned to its `--cores` value.
 7. Set listener to non-blocking mode.
 8. Enter accept loop, authenticating connections via Ed25519 challenge-response.
 
@@ -67,7 +67,7 @@ The server uses jemalloc by default (thread-local caches eliminate allocator loc
     --bind 0.0.0.0:9876 \
     --journal /mnt/nvme/melin.journal \
     --authorized-keys /etc/trading/authorized_keys \
-    --cores 1,2,3 \
+    --cores 1,2,3,6 \
     --readers 2 \
     --reader-cores 4 \
     --max-journal-mib 512
@@ -220,15 +220,16 @@ The recommended core assignment for a production server:
 | 0 | OS, IRQs, RCU callbacks | (reserved, never assign pipeline work) |
 | 1 | Journal stage | `--cores 1,...` |
 | 2 | Matching stage | `--cores ...,2,...` |
-| 3 | Response stage | `--cores ...,...,3` |
+| 3 | Response stage | `--cores ...,...,3,...` |
 | 4-5 | Reader threads | `--readers 2 --reader-cores 4` |
-| 6+ | Available for other work (benchmarks, monitoring) | -- |
+| 6 | Replication sender | `--cores ...,...,...,6` |
+| 7+ | Available for other work (benchmarks, monitoring) | -- |
 
 ### Core Pinning (`--cores`, `--readers`, `--reader-cores`)
 
 Each pipeline thread calls `sched_setaffinity` to pin itself to the specified core. If pinning fails, a warning is logged but the server continues.
 
-- `--cores 1,2,3` pins journal to core 1, matching to core 2, response to core 3.
+- `--cores 1,2,3,6` pins journal to core 1, matching to core 2, response to core 3, repl-sender to core 6.
 - `--readers 2 --reader-cores 4` pins reader 0 to core 4, reader 1 to core 5.
 
 ### Kernel Boot Parameters (GRUB)

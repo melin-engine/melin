@@ -53,10 +53,11 @@ pub struct ServerConfig {
     /// Path to a snapshot file for faster recovery.
     #[arg(long)]
     pub snapshot: Option<PathBuf>,
-    /// Pipeline core IDs: journal,matching,response (comma-separated).
-    /// Core 0 is reserved for OS/IRQ handling.
-    #[arg(long, default_value = "1,2,3", value_parser = parse_cores)]
-    pub cores: [usize; 3],
+    /// Pipeline core IDs: journal,matching,response[,repl-sender]
+    /// (comma-separated). Core 0 is reserved for OS/IRQ handling.
+    /// The 4th core (repl-sender) is used when replication is enabled.
+    #[arg(long, default_value = "1,2,3,6", value_parser = parse_cores)]
+    pub cores: PipelineCores,
     /// Number of epoll reader threads.
     #[arg(long, default_value_t = 2)]
     pub readers: usize,
@@ -147,7 +148,12 @@ impl Default for ServerConfig {
             bind: "127.0.0.1:9876".parse().expect("valid default addr"),
             journal: PathBuf::from("trading.journal"),
             snapshot: None,
-            cores: [1, 2, 3],
+            cores: PipelineCores {
+                journal: 1,
+                matching: 2,
+                response: 3,
+                repl_sender: 6,
+            },
             readers: 2,
             reader_cores: 4,
             group_commit_us: 0,
@@ -194,20 +200,38 @@ impl ServerConfig {
     }
 }
 
-/// Parse "j,m,r" into [usize; 3] for pipeline core affinity.
-fn parse_cores(s: &str) -> Result<[usize; 3], String> {
+/// Core assignments for pipeline threads.
+///
+/// Four fields: journal, matching, response, and repl-sender.
+/// All four are always stored; the repl-sender core is only used
+/// when replication is enabled.
+#[derive(Debug, Clone, Copy)]
+pub struct PipelineCores {
+    pub journal: usize,
+    pub matching: usize,
+    pub response: usize,
+    pub repl_sender: usize,
+}
+
+/// Parse "j,m,r,s" into `PipelineCores` for pipeline core affinity.
+fn parse_cores(s: &str) -> Result<PipelineCores, String> {
     let parts: Vec<&str> = s.split(',').collect();
-    if parts.len() != 3 {
+    if parts.len() != 4 {
         return Err(format!(
-            "expected 3 comma-separated core IDs, got {}",
+            "expected 4 comma-separated core IDs (journal,matching,response,repl-sender), got {}",
             parts.len()
         ));
     }
-    let mut cores = [0usize; 3];
-    for (i, p) in parts.iter().enumerate() {
-        cores[i] = p.parse().map_err(|_| format!("invalid core ID: {p}"))?;
-    }
-    Ok(cores)
+    let parse = |p: &str| {
+        p.parse::<usize>()
+            .map_err(|_| format!("invalid core ID: {p}"))
+    };
+    Ok(PipelineCores {
+        journal: parse(parts[0])?,
+        matching: parse(parts[1])?,
+        response: parse(parts[2])?,
+        repl_sender: parse(parts[3])?,
+    })
 }
 
 /// Run the trading server.
@@ -363,7 +387,7 @@ pub fn run_with_shutdown<L: BlockingTransportListener>(
     let journal_handle = std::thread::Builder::new()
         .name("journal".into())
         .spawn(move || {
-            apply_affinity("journal", cores[0]);
+            apply_affinity("journal", cores.journal);
             journal_stage.run(&s1)
         })
         .expect("failed to spawn journal thread");
@@ -372,7 +396,7 @@ pub fn run_with_shutdown<L: BlockingTransportListener>(
     let matching_handle = std::thread::Builder::new()
         .name("matching".into())
         .spawn(move || {
-            apply_affinity("matching", cores[1]);
+            apply_affinity("matching", cores.matching);
             matching_stage.run(&s2)
         })
         .expect("failed to spawn matching thread");
@@ -388,7 +412,7 @@ pub fn run_with_shutdown<L: BlockingTransportListener>(
     let response_handle = std::thread::Builder::new()
         .name("response".into())
         .spawn(move || {
-            apply_affinity("response", cores[2]);
+            apply_affinity("response", cores.response);
             #[cfg(not(feature = "io-uring"))]
             crate::response::run(
                 output_consumer,
@@ -429,6 +453,7 @@ pub fn run_with_shutdown<L: BlockingTransportListener>(
         let repl_sender_handle = std::thread::Builder::new()
             .name("repl-sender".into())
             .spawn(move || {
+                apply_affinity("repl-sender", cores.repl_sender);
                 crate::replication::run_sender(
                     repl_bind,
                     repl_consumer,

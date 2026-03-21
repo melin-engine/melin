@@ -170,9 +170,10 @@ All threads are pinned to specific CPU cores via `sched_setaffinity`. The layout
 | 0 | OS, IRQ handling, RCU callbacks |
 | 1-3 | Pipeline (journal, matching, response) — set by server's `--cores` flag |
 | 4-5 | Reader pool threads |
-| 6+ | Bench client threads (`BENCH_CORE_START = 6`, hardcoded) |
+| 6 | Replication sender — set by server's `--cores` flag (4th value) |
+| 7+ | Bench client threads (`BENCH_CORE_START = 7`, hardcoded) |
 
-Bench thread `i` is pinned to core `6 + i`. With 4 bench threads (default), cores 6-9 are used. The server's pipeline cores are configurable via `--cores`; the bench client's core start offset is not.
+Bench thread `i` is pinned to core `7 + i`. With 4 bench threads (default), cores 7-10 are used. The server's pipeline cores are configurable via `--cores`; the bench client's core start offset is not.
 
 ### IRQ affinity (`bench-isolate.sh`)
 

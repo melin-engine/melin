@@ -240,7 +240,7 @@ The matching engine is not the bottleneck. Further throughput gains require redu
 **Replication throughput** (current: 1.1M/s with sync replication):
 
 - [ ] **Higher window depth** (512, 1024) — throughput under replication is bounded by Little's Law: `throughput = inflight / RTT`. With replica fsync ~80µs over VLAN, more in-flight orders directly translates to higher throughput. Config-only change. Est. up to 2x replication throughput.
-- [ ] **Pin sender thread to dedicated core** — replication sender currently shares cores. Dedicated core eliminates scheduling jitter. Low complexity.
+- [x] **Pin sender thread to dedicated core** — replication sender pinned via `--cores` 4th value (default core 6). Eliminates scheduling jitter.
 - [ ] **io_uring for replication TCP** (`SEND`/`RECV` SQEs) — replace syscall-based send/recv with io_uring on the sender thread. Reduces per-batch syscall overhead (~400ns/batch). High complexity.
 
 **Engine/pipeline throughput** (current: 4.0M/s with fsync, 8.0M/s no-persist):

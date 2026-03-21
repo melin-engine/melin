@@ -109,7 +109,7 @@ echo ""
 # 3. Kernel boot parameters (isolcpus + nohz_full + rcu_nocbs)
 # ---------------------------------------------------------------------------
 GRUB_FILE="/etc/default/grub"
-BENCH_PARAMS="isolcpus=nohz,domain,1-5 nohz_full=1-5 rcu_nocbs=1-5"
+BENCH_PARAMS="isolcpus=nohz,domain,1-6 nohz_full=1-6 rcu_nocbs=1-6"
 
 if [[ -f "$GRUB_FILE" ]]; then
     if grep -q "isolcpus" "$GRUB_FILE" 2>/dev/null; then
@@ -282,8 +282,8 @@ echo ""
 echo "Next steps:"
 echo "  1. Reboot if kernel boot params were added (isolcpus)"
 echo "  2. Verify after reboot:"
-echo "     cat /sys/devices/system/cpu/isolated   # should show: 1-5"
-echo "     cat /sys/devices/system/cpu/nohz_full  # should show: 1-5"
+echo "     cat /sys/devices/system/cpu/isolated   # should show: 1-6"
+echo "     cat /sys/devices/system/cpu/nohz_full  # should show: 1-6"
 echo ""
 echo "  3. Run the LAN benchmark from your local machine:"
 echo "     ./scripts/lan-bench.sh <server-pub-ip> <bench-pub-ip> <server-vlan-ip>"

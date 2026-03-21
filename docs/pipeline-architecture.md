@@ -226,7 +226,7 @@ Because the journal and matching consumers run in parallel (not chained), the ma
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--cores` | `1,2,3` | Pipeline core IDs: journal, matching, response (comma-separated) |
+| `--cores` | `1,2,3,6` | Pipeline core IDs: journal, matching, response, repl-sender (comma-separated) |
 | `--readers` | `2` | Number of epoll reader threads |
 | `--reader-cores` | `4` | First CPU core for reader thread pinning (reader i -> core reader_cores + i) |
 | `--group-commit-us` | `0` | Group commit coalescing delay in microseconds. Keep at 0 for TCP. |

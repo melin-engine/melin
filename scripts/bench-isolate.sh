@@ -13,7 +13,8 @@
 #   4. irqbalance → stopped (prevents daemon from redistributing IRQs)
 #
 # Core layout: 0=OS/IRQ, 1-3=pipeline (journal/matching/response),
-# 4-5=reader threads, 6+=bench threads. All pinned via sched_setaffinity.
+# 4-5=reader threads, 6=repl-sender, 7+=bench threads. All pinned via
+# sched_setaffinity.
 # All settings are saved and restored on exit (including Ctrl-C / errors).
 # Kernel dmesg is captured before/after to correlate spikes with kernel events.
 
