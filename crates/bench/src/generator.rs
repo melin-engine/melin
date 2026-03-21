@@ -167,8 +167,9 @@ pub struct OrderFlowGenerator {
     next_order_id: u64,
     /// Ring buffer of recently submitted order IDs available for cancellation.
     /// Fixed-size circular buffer to bound memory. OrderId(0) = empty slot.
-    /// Stores (OrderId, AccountId, Symbol) so cancel/amend can include account.
-    live_orders: Vec<(OrderId, AccountId, Symbol)>,
+    /// Stores (OrderId, AccountId, Symbol, Side) so cancel/amend can use
+    /// the original order's side for price generation.
+    live_orders: Vec<(OrderId, AccountId, Symbol, Side)>,
     /// Write position in the live_orders ring buffer.
     live_cursor: usize,
     /// Number of valid entries in live_orders (up to capacity).
@@ -203,7 +204,7 @@ impl OrderFlowGenerator {
             config,
             rng: SmallRng::seed_from_u64(seed),
             next_order_id: start_id,
-            live_orders: vec![(OrderId(0), AccountId(0), Symbol(0)); capacity],
+            live_orders: vec![(OrderId(0), AccountId(0), Symbol(0), Side::Buy); capacity],
             live_cursor: 0,
             live_count: 0,
             pending_cancels: Vec::new(),
@@ -359,7 +360,7 @@ impl OrderFlowGenerator {
             let cap = self.live_orders.len();
             let write_idx = self.live_cursor % cap;
             if self.live_count == cap {
-                let (evicted_id, evicted_acct, evicted_sym) = self.live_orders[write_idx];
+                let (evicted_id, evicted_acct, evicted_sym, _) = self.live_orders[write_idx];
                 if evicted_id.0 != 0 {
                     self.pending_cancels.push(GeneratedEvent::Cancel {
                         symbol: evicted_sym,
@@ -368,7 +369,7 @@ impl OrderFlowGenerator {
                     });
                 }
             }
-            self.live_orders[write_idx] = (order_id, account, symbol);
+            self.live_orders[write_idx] = (order_id, account, symbol, side);
             self.live_cursor += 1;
             if self.live_count < cap {
                 self.live_count += 1;
@@ -399,14 +400,10 @@ impl OrderFlowGenerator {
 
         let cap = self.live_orders.len();
         let ring_idx = (self.live_cursor + cap - self.live_count + idx) % cap;
-        let (order_id, account, symbol) = self.live_orders[ring_idx];
+        let (order_id, account, symbol, side) = self.live_orders[ring_idx];
 
-        // New price: small random offset from mid (tighter than initial placement).
-        let side = if self.side_dist.sample(&mut self.rng) == 0 {
-            Side::Buy
-        } else {
-            Side::Sell
-        };
+        // New price uses the original order's side to avoid price-cross
+        // rejections (a buy amended to a sell-side price would cross).
         let new_price = self.pick_price(side);
         let new_quantity = self.pick_size();
 
@@ -432,7 +429,7 @@ impl OrderFlowGenerator {
         let cap = self.live_orders.len();
         // Ring entries are oldest-first: index 0 = oldest, live_count-1 = newest.
         let ring_idx = (self.live_cursor + cap - self.live_count + idx) % cap;
-        let (order_id, account, symbol) = self.live_orders[ring_idx];
+        let (order_id, account, symbol, _) = self.live_orders[ring_idx];
 
         // Swap-remove: replace with the oldest entry to keep the ring valid.
         let oldest_idx = (self.live_cursor + cap - self.live_count) % cap;

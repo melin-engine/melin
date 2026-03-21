@@ -744,6 +744,8 @@ fn run_roundtrip_bench(
             warmup,
             json_path,
             &key,
+            num_accounts,
+            num_instruments,
         );
         return;
     }
@@ -803,6 +805,8 @@ fn run_roundtrip_bench(
             warmup,
             json_path,
             &bench_key,
+            num_accounts,
+            num_instruments,
         );
     } else {
         use melin_protocol::tcp::BlockingTcpListener;
@@ -831,6 +835,8 @@ fn run_roundtrip_bench(
             warmup,
             json_path,
             &bench_key,
+            num_accounts,
+            num_instruments,
         );
     }
 
@@ -1223,6 +1229,8 @@ fn run_roundtrip_inner<R, W, F>(
     warmup: usize,
     json_path: Option<&std::path::Path>,
     key: &ed25519_dalek::SigningKey,
+    num_accounts: u32,
+    num_instruments: u32,
 ) where
     R: std::io::Read + std::io::Write + AsRawFd + Send + 'static,
     W: Write + AsRawFd + Send + 'static,
@@ -1243,6 +1251,8 @@ fn run_roundtrip_inner<R, W, F>(
             warmup,
             json_path,
             key,
+            num_accounts,
+            num_instruments,
         );
     }
 
@@ -1256,6 +1266,8 @@ fn run_roundtrip_inner<R, W, F>(
             window,
             num_clients,
             bench_threads,
+            num_accounts,
+            num_instruments,
             group_commit_us,
             shutdown,
             warmup,
@@ -1275,6 +1287,8 @@ fn run_epoll_roundtrip<R, W, F>(
     window: usize,
     num_clients: usize,
     bench_threads: usize,
+    num_accounts: u32,
+    num_instruments: u32,
     group_commit_us: u64,
     shutdown: Arc<AtomicBool>,
     warmup: usize,
@@ -1500,6 +1514,8 @@ fn run_uring_roundtrip<R, W, F>(
     warmup: usize,
     json_path: Option<&std::path::Path>,
     key: &ed25519_dalek::SigningKey,
+    num_accounts: u32,
+    num_instruments: u32,
 ) where
     R: std::io::Read + std::io::Write + AsRawFd + Send + 'static,
     W: Write + AsRawFd + Send + 'static,
@@ -1540,7 +1556,8 @@ fn run_uring_roundtrip<R, W, F>(
 
         let frames = {
             let mut flow = generator::OrderFlowGenerator::new(generator::GeneratorConfig {
-                num_accounts: 2,
+                num_accounts,
+                num_instruments,
                 start_order_id: order_id_offset + 1,
                 ..Default::default()
             });
