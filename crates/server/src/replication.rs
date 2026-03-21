@@ -197,6 +197,26 @@ fn read_frame(reader: &mut impl Read, max_size: usize) -> io::Result<Vec<u8>> {
     Ok(buf)
 }
 
+/// Read a length-prefixed frame into a reusable buffer. Avoids per-frame
+/// heap allocation — the caller owns the Vec and it grows to high-water
+/// mark then stays there.
+fn read_frame_into(reader: &mut impl Read, buf: &mut Vec<u8>, max_size: usize) -> io::Result<()> {
+    let mut len_buf = [0u8; 4];
+    reader.read_exact(&mut len_buf)?;
+    let len = u32::from_le_bytes(len_buf) as usize;
+    if len > max_size {
+        return Err(io::Error::other(format!(
+            "frame too large: {len} > {max_size}"
+        )));
+    }
+    if len == 0 {
+        return Err(io::Error::other("empty frame"));
+    }
+    buf.resize(len, 0);
+    reader.read_exact(buf)?;
+    Ok(())
+}
+
 /// Decode a replica message from a frame payload.
 fn decode_replica_message(payload: &[u8]) -> io::Result<ReplicaMessage> {
     if payload.is_empty() {
@@ -690,6 +710,9 @@ pub fn run_receiver(
     let mut journal_accum: Vec<u8> = Vec::with_capacity(128 * 1024);
     let mut accum_entry_count: u64 = 0;
     let mut accum_end_sequence: u64;
+    // Reusable frame buffer — grows to high-water mark, avoids per-frame
+    // heap allocation in the hot receive loop.
+    let mut frame_buf: Vec<u8> = Vec::with_capacity(64 * 1024);
 
     // Main receive loop.
     loop {
@@ -700,8 +723,8 @@ pub fn run_receiver(
 
         // Read the first frame (blocking, with the 5s timeout for
         // shutdown checking).
-        let frame = match read_frame(&mut reader, MAX_DATA_FRAME) {
-            Ok(f) => f,
+        match read_frame_into(&mut reader, &mut frame_buf, MAX_DATA_FRAME) {
+            Ok(()) => {}
             Err(e)
                 if e.kind() == io::ErrorKind::WouldBlock || e.kind() == io::ErrorKind::TimedOut =>
             {
@@ -710,9 +733,9 @@ pub fn run_receiver(
             Err(e) => {
                 return Err(format!("read error from primary: {e}").into());
             }
-        };
+        }
 
-        let message = decode_primary_message(&frame)?;
+        let message = decode_primary_message(&frame_buf)?;
         match message {
             PrimaryMessage::DataBatch {
                 end_sequence,
@@ -741,11 +764,10 @@ pub fn run_receiver(
                     if !ready {
                         break;
                     }
-                    let frame = match read_frame(&mut reader, MAX_DATA_FRAME) {
-                        Ok(f) => f,
-                        Err(_) => break,
-                    };
-                    match decode_primary_message(&frame)? {
+                    if read_frame_into(&mut reader, &mut frame_buf, MAX_DATA_FRAME).is_err() {
+                        break;
+                    }
+                    match decode_primary_message(&frame_buf)? {
                         PrimaryMessage::DataBatch {
                             end_sequence,
                             journal_bytes,

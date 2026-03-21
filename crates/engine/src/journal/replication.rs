@@ -20,10 +20,12 @@ use melin_disruptor::padding::Sequence;
 const CHUNK_SIZE: usize = 128 * 1024;
 
 /// Capacity of the replication ring (number of batch slots).
-/// 2^6 = 64 slots. At 128 KiB per slot, total buffer = 8 MiB.
-/// Provides buffering for ~64K events (64 batches * 1024 events/batch)
-/// before backpressure reaches the journal stage.
-pub const REPLICATION_RING_CAPACITY: usize = 1 << 6;
+/// 2^8 = 256 slots. At 128 KiB per slot, total buffer = 32 MiB.
+/// Provides buffering for ~256K events (256 batches * 1024 events/batch)
+/// before backpressure reaches the journal stage. Larger than the
+/// minimum (64 slots) to absorb sender/replica latency spikes without
+/// stalling the journal stage.
+pub const REPLICATION_RING_CAPACITY: usize = 1 << 8;
 
 /// Metadata for one replication batch. Small and `Copy` — carried in the
 /// disruptor ring slot. The actual byte data lives in the shared buffer
