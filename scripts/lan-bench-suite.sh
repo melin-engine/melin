@@ -409,8 +409,8 @@ if command -v cargo &>/dev/null && [[ -f "$(dirname "$0")/../crates/bench/src/pl
     for sweep in window instruments; do
         dir="${RESULTS_DIR}/sweep-${sweep}"
         if [[ -d "$dir" ]] && ls "${dir}"/*.json &>/dev/null; then
-            echo "  Generating saturation curve: ${sweep}..."
-            "${PLOT_TOOL}" saturation -o "${PLOT_DIR}/saturation-${sweep}.svg" \
+            echo "  Generating sweep plot: ${sweep}..."
+            "${PLOT_TOOL}" sweep -o "${PLOT_DIR}/saturation-${sweep}.svg" \
                 "${dir}"/*.json 2>&1
         fi
     done

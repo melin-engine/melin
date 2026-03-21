@@ -65,6 +65,7 @@ fn main() {
     match args[1].as_str() {
         "latency-cdf" => cmd_latency_cdf(&args[2..]),
         "saturation" => cmd_saturation(&args[2..]),
+        "sweep" => cmd_sweep(&args[2..]),
         "pipeline" => cmd_pipeline(&args[2..]),
         "all" => cmd_all(&args[2..]),
         _ => {
@@ -81,6 +82,7 @@ fn print_usage() {
     eprintln!("Commands:");
     eprintln!("  latency-cdf  Percentile plot comparing benchmark configs");
     eprintln!("  saturation   Throughput vs latency at multiple load levels");
+    eprintln!("  sweep        Parameter vs throughput (e.g. window depth sweep)");
     eprintln!("  pipeline     Pipeline stage utilization bar chart");
     eprintln!("  all          Generate all plots from a results directory");
     eprintln!();
@@ -560,6 +562,174 @@ fn plot_saturation(results: &[LoadedResult], output: &PathBuf) {
         .border_style(BLACK.mix(0.3))
         .draw()
         .unwrap();
+
+    root.present().unwrap();
+    eprintln!("wrote {}", output.display());
+}
+
+// =====================================================================
+// Command: sweep — parameter vs throughput
+// =====================================================================
+
+fn cmd_sweep(args: &[String]) {
+    let opts = parse_args(args, "sweep.svg");
+    let results = load_results(&opts.files);
+    if results.len() < 2 {
+        eprintln!("error: need at least 2 result files for sweep plot");
+        std::process::exit(1);
+    }
+    plot_sweep(&results, &opts.output);
+}
+
+/// Extract the numeric value from a filename stem.
+/// "w256.json" → 256, "i100.json" → 100, "w32.json" → 32.
+fn extract_sweep_value(filename: &str) -> Option<f64> {
+    let stem = filename.strip_suffix(".json").unwrap_or(filename);
+    // Strip leading non-digit prefix (e.g. "w" from "w256").
+    let digits: String = stem.chars().skip_while(|c| !c.is_ascii_digit()).collect();
+    digits.parse::<f64>().ok()
+}
+
+/// Extract the parameter name prefix from a filename stem.
+/// "w256.json" → "Window depth", "i100.json" → "Instruments".
+fn sweep_x_label(filename: &str) -> &'static str {
+    let stem = filename.strip_suffix(".json").unwrap_or(filename);
+    if stem.starts_with('w') {
+        "Window depth"
+    } else if stem.starts_with('i') {
+        "Instruments"
+    } else {
+        "Parameter"
+    }
+}
+
+fn plot_sweep(results: &[LoadedResult], output: &PathBuf) {
+    let root = SVGBackend::new(output, (900, 500)).into_drawing_area();
+    root.fill(&WHITE).unwrap();
+
+    // Build (parameter_value, throughput, p99_latency) points.
+    let mut points: Vec<(f64, f64, f64)> = results
+        .iter()
+        .filter_map(|r| {
+            let val = extract_sweep_value(&r.filename)?;
+            let p99 = r.result.latency.get("p99_us").copied().unwrap_or(0.0);
+            Some((val, r.result.throughput_ops, p99))
+        })
+        .collect();
+    points.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+
+    if points.is_empty() {
+        eprintln!("error: no valid sweep data (could not extract numeric values from filenames)");
+        std::process::exit(1);
+    }
+
+    let x_label = sweep_x_label(&results[0].filename);
+    let max_x = points.last().map(|p| p.0).unwrap_or(1.0) * 1.15;
+    let max_throughput = points.iter().map(|p| p.1).fold(0.0f64, f64::max) * 1.15;
+    let max_latency = points.iter().map(|p| p.2).fold(0.0f64, f64::max) * 1.3;
+
+    // Split into left (throughput) and right (latency) areas.
+    let (left, right) = root.split_horizontally(800);
+
+    let mut chart = ChartBuilder::on(&left)
+        .caption(
+            format!("Throughput & Latency vs {x_label}"),
+            ("sans-serif", 22).into_font(),
+        )
+        .margin(15)
+        .x_label_area_size(50)
+        .y_label_area_size(70)
+        .right_y_label_area_size(70)
+        .build_cartesian_2d(0.0..max_x, 0.0..max_throughput)
+        .unwrap()
+        .set_secondary_coord(0.0..max_x, 0.0..max_latency);
+
+    chart
+        .configure_mesh()
+        .x_desc(x_label)
+        .y_desc("Throughput (orders/sec)")
+        .x_label_formatter(&|v| {
+            if *v >= 1000.0 {
+                format!("{:.0}K", v / 1000.0)
+            } else {
+                format!("{:.0}", v)
+            }
+        })
+        .y_label_formatter(&|v| {
+            if *v >= 1_000_000.0 {
+                format!("{:.1}M", v / 1_000_000.0)
+            } else if *v >= 1_000.0 {
+                format!("{:.0}K", v / 1_000.0)
+            } else {
+                format!("{:.0}", v)
+            }
+        })
+        .draw()
+        .unwrap();
+
+    chart
+        .configure_secondary_axes()
+        .y_desc("p99 Latency (µs)")
+        .y_label_formatter(&|v| {
+            if *v >= 1000.0 {
+                format!("{:.1}ms", v / 1000.0)
+            } else {
+                format!("{:.0}µs", v)
+            }
+        })
+        .draw()
+        .unwrap();
+
+    // Throughput line (primary Y-axis).
+    let tp_points: Vec<(f64, f64)> = points.iter().map(|p| (p.0, p.1)).collect();
+    chart
+        .draw_series(LineSeries::new(
+            tp_points.clone(),
+            COLOR_FSYNC.stroke_width(2),
+        ))
+        .unwrap()
+        .label("Throughput")
+        .legend(move |(x, y)| {
+            PathElement::new(vec![(x, y), (x + 20, y)], COLOR_FSYNC.stroke_width(2))
+        });
+    chart
+        .draw_series(
+            tp_points
+                .iter()
+                .map(|&(x, y)| Circle::new((x, y), 4, COLOR_FSYNC.filled())),
+        )
+        .unwrap();
+
+    // p99 latency line (secondary Y-axis).
+    let lat_points: Vec<(f64, f64)> = points.iter().map(|p| (p.0, p.2)).collect();
+    chart
+        .draw_secondary_series(LineSeries::new(
+            lat_points.clone(),
+            COLOR_SINGLE.stroke_width(2),
+        ))
+        .unwrap()
+        .label("p99 Latency")
+        .legend(move |(x, y)| {
+            PathElement::new(vec![(x, y), (x + 20, y)], COLOR_SINGLE.stroke_width(2))
+        });
+    chart
+        .draw_secondary_series(
+            lat_points
+                .iter()
+                .map(|&(x, y)| Circle::new((x, y), 4, COLOR_SINGLE.filled())),
+        )
+        .unwrap();
+
+    chart
+        .configure_series_labels()
+        .position(SeriesLabelPosition::UpperLeft)
+        .background_style(WHITE.mix(0.8))
+        .border_style(BLACK.mix(0.3))
+        .draw()
+        .unwrap();
+
+    // We don't draw on the right area — it's just padding for the secondary axis.
+    let _ = right;
 
     root.present().unwrap();
     eprintln!("wrote {}", output.display());
