@@ -26,6 +26,7 @@ path = "src/main.rs"
 trading-engine = { path = "../engine" }
 trading-disruptor = { path = "../disruptor" }
 trading-protocol = { path = "../protocol" }
+blake3 = "1"
 clap = { workspace = true }
 ed25519-dalek = { workspace = true }
 getrandom = "0.3"

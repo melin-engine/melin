@@ -3,6 +3,7 @@
 pub mod affinity;
 #[cfg(not(feature = "io-uring"))]
 mod reader;
+pub mod replication;
 #[cfg(not(feature = "io-uring"))]
 mod response;
 pub mod server;

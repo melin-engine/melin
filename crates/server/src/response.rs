@@ -61,13 +61,18 @@ struct ConnectionState {
 /// Run the response stage loop. Blocks the calling thread until shutdown.
 ///
 /// Consumes from the output SPSC and writes encoded responses directly
-/// to each connection's socket. For each output slot, waits until the
-/// journal cursor has advanced past `input_seq` before writing — ensuring
-/// the client never receives a response for an event that isn't yet durable.
+/// to each connection's socket. For each output slot, waits until both
+/// the journal cursor and replication cursor have advanced past `input_seq`
+/// before writing — ensuring the client never receives a response for an
+/// event that isn't yet durable locally AND replicated.
+///
+/// When replication is disabled (standalone mode), `replication_cursor` is
+/// initialized to `u64::MAX` so `min(journal, MAX) = journal`.
 pub fn run(
     mut consumer: spsc::Consumer<OutputSlot>,
     control_rx: mpsc::Receiver<ControlEvent>,
     journal_cursor: Arc<Sequence>,
+    replication_cursor: Arc<AtomicU64>,
     shutdown: &AtomicBool,
     heartbeat_interval: Option<Duration>,
     active_connections: Arc<AtomicU64>,
@@ -251,10 +256,14 @@ pub fn run(
         #[cfg(feature = "latency-trace")]
         let consume_ts = trace::trace_ts();
 
-        // Wait for the journal to confirm the entire batch is durable.
+        // Wait for both journal AND replication to confirm the entire batch.
         // Find the highest input_seq in the batch and wait once, rather
         // than spin-waiting per event. This eliminates redundant atomic
         // loads when the batch contains many events from different clients.
+        //
+        // The effective cursor is min(journal_cursor, replication_cursor).
+        // When replication is disabled, replication_cursor = u64::MAX so
+        // min(journal, MAX) = journal — no change in behavior.
         #[cfg(not(feature = "no-fsync"))]
         {
             let max_seq = batch[..count]
@@ -265,7 +274,9 @@ pub fn run(
             let needed = max_seq + 1;
             if cached_journal_pos < needed {
                 loop {
-                    cached_journal_pos = journal_cursor.get().load(Ordering::Acquire);
+                    let journal_pos = journal_cursor.get().load(Ordering::Acquire);
+                    let repl_pos = replication_cursor.load(Ordering::Acquire);
+                    cached_journal_pos = journal_pos.min(repl_pos);
                     if cached_journal_pos >= needed {
                         break;
                     }

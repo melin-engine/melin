@@ -106,7 +106,8 @@ impl JournalWriter {
     /// Fails if the file already exists (use `open_append` for existing journals).
     pub fn create(path: &Path) -> Result<Self, JournalError> {
         let mut genesis = [0u8; 32];
-        getrandom::fill(&mut genesis).map_err(|e| JournalError::Io(std::io::Error::other(e)))?;
+        getrandom::fill(&mut genesis)
+            .map_err(|e| JournalError::Io(std::io::Error::other(e.to_string())))?;
         Self::create_with_genesis(path, 1, genesis)
     }
 
@@ -481,6 +482,46 @@ impl JournalWriter {
         self.hash_chain
             .as_ref()
             .map_or(0, |c| c.events_since_checkpoint)
+    }
+
+    /// Read-only access to the pending batch buffer (encoded but not yet flushed).
+    ///
+    /// Used by the journal stage to snapshot encoded bytes for replication
+    /// after `flush_batch_sync()` — the bytes are identical to what was
+    /// just written to disk.
+    ///
+    /// Returns an empty slice if no data is pending.
+    pub fn pending_batch_bytes(&self) -> &[u8] {
+        &self.batch_buf
+    }
+
+    /// Write pre-encoded journal bytes directly to the file with durability.
+    ///
+    /// Used by the replication receiver to write bytes received from the
+    /// primary without re-encoding. The bytes must be valid journal entries
+    /// (the caller is responsible for CRC and sequence validation).
+    ///
+    /// Advances `write_pos` and `next_sequence` to account for the written
+    /// data. Does NOT update the hash chain — the receiver tracks chain
+    /// state separately if needed.
+    pub fn write_raw_sync(&mut self, data: &[u8], entry_count: u64) -> Result<(), JournalError> {
+        if data.is_empty() {
+            return Ok(());
+        }
+        self.ensure_allocated(data.len() as u64)?;
+
+        #[cfg(not(feature = "no-fsync"))]
+        {
+            pwritev2_dsync(self.file.as_raw_fd(), data, self.write_pos)?;
+        }
+        #[cfg(feature = "no-fsync")]
+        {
+            self.file.write_all_at(data, self.write_pos)?;
+        }
+
+        self.write_pos += data.len() as u64;
+        self.next_sequence += entry_count;
+        Ok(())
     }
 
     /// Ensure enough pre-allocated space exists for the next write.
@@ -1222,5 +1263,91 @@ mod tests {
         }
         assert_eq!(count, CHECKPOINT_INTERVAL + 5);
         assert_eq!(reader.chain_hash().unwrap(), writer_hash);
+    }
+
+    #[test]
+    fn write_raw_sync_produces_readable_journal() {
+        let dir = tempfile::tempdir().unwrap();
+        let primary_path = dir.path().join("primary.journal");
+        let replica_path = dir.path().join("replica.journal");
+
+        // Write events to the primary journal normally.
+        let events = vec![
+            JournalEvent::Deposit {
+                account: AccountId(1),
+                currency: CurrencyId(0),
+                amount: 100,
+            },
+            JournalEvent::Deposit {
+                account: AccountId(2),
+                currency: CurrencyId(0),
+                amount: 200,
+            },
+            sample_event(),
+        ];
+
+        let primary_genesis;
+        let raw_bytes;
+        let entry_count;
+        {
+            let mut writer = JournalWriter::create(&primary_path).unwrap();
+            primary_genesis = writer.chain_hash().unwrap();
+
+            // Encode events into batch buffer, then snapshot the bytes.
+            for event in &events {
+                writer.batch_append(event).unwrap();
+            }
+            raw_bytes = writer.pending_batch_bytes().to_vec();
+            entry_count = events.len() as u64;
+            writer.flush_batch_sync().unwrap();
+        }
+
+        // Create the replica journal with the same genesis hash.
+        {
+            let mut replica =
+                JournalWriter::create_continuing(&replica_path, 1, primary_genesis).unwrap();
+            // Write the raw bytes captured from the primary.
+            replica.write_raw_sync(&raw_bytes, entry_count).unwrap();
+            assert_eq!(replica.next_sequence(), 2 + entry_count);
+        }
+
+        // Read back from the replica journal — should see the same events.
+        let mut reader = JournalReader::open(&replica_path).unwrap();
+        for (i, expected) in events.iter().enumerate() {
+            let entry = reader.next_entry().unwrap().unwrap();
+            assert_eq!(entry.sequence, (i as u64) + 2); // genesis consumed seq 1
+            assert_eq!(&entry.event, expected);
+        }
+        assert!(reader.next_entry().unwrap().is_none());
+    }
+
+    #[test]
+    fn write_raw_sync_advances_write_pos() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("raw_pos.journal");
+
+        let mut writer = JournalWriter::create(&path).unwrap();
+        let pos_before = writer.write_pos();
+
+        let data = [0x4A, 0x45, 0x00, 0x01, 0x02, 0x00, 0x00, 0x00]; // fake entry bytes
+        writer.write_raw_sync(&data, 1).unwrap();
+
+        assert_eq!(writer.write_pos(), pos_before + data.len() as u64);
+        assert_eq!(writer.next_sequence(), 3); // genesis(1) + genesis_created_next(2) + raw(1)
+    }
+
+    #[test]
+    fn write_raw_sync_empty_is_noop() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("raw_empty.journal");
+
+        let mut writer = JournalWriter::create(&path).unwrap();
+        let pos = writer.write_pos();
+        let seq = writer.next_sequence();
+
+        writer.write_raw_sync(&[], 0).unwrap();
+
+        assert_eq!(writer.write_pos(), pos);
+        assert_eq!(writer.next_sequence(), seq);
     }
 }

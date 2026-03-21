@@ -3,13 +3,17 @@
 //! Two hot-path stages consume from an input disruptor in **parallel**:
 //! 1. **Journal stage**: batch-encodes events, then writes + syncs in a single
 //!    `pwritev2` with `RWF_DSYNC` (FUA). Advances its cursor only after the
-//!    durable write completes.
+//!    durable write completes. When replication is enabled, sends a copy of
+//!    each encoded batch to the replication sender thread via a bounded channel.
+//!    The bytes are identical to what was written to disk — same sequences,
+//!    timestamps, CRC checksums, and checkpoint entries.
 //! 2. **Matching stage**: executes commands on the `Exchange`, publishes responses
 //!    to the output SPSC. Runs concurrently with the journal — no waiting for sync.
 //!
 //! The **response stage** (in the server crate) consumes the output SPSC but
-//! gates on the journal cursor before sending: a response is only sent to
-//! the client after the corresponding event is durable on disk.
+//! gates on `min(journal_cursor, replication_cursor)` before sending: a response
+//! is only sent after the event is durable on disk **and** acknowledged by the
+//! replica (when replication is active).
 //!
 //! This gives maximum pipeline parallelism (matching overlaps journal I/O)
 //! while preserving persist-before-ack at the response boundary.
@@ -20,6 +24,7 @@ use std::time::Duration;
 
 use crate::exchange::Exchange;
 use crate::journal::event::JournalEvent;
+use crate::journal::replication::{ReplicationConsumer, ReplicationProducer};
 use crate::journal::trace::{TraceTimestamp, trace_ts};
 use crate::journal::writer::JournalWriter;
 use crate::types::ExecutionReport;
@@ -148,6 +153,11 @@ impl Default for OutputSlot {
 /// Runs on a dedicated OS thread. Uses `read_batch` + `commit` so its
 /// cursor only advances **after** the durable write. The response stage
 /// reads this cursor to know when events are durable.
+///
+/// When replication is enabled, the journal stage also sends a copy of
+/// each encoded batch to the replication sender thread via a bounded
+/// channel. The bytes are identical to what was written to disk — same
+/// sequences, timestamps, CRC checksums, and checkpoint entries.
 pub struct JournalStage {
     writer: JournalWriter,
     consumer: ring::Consumer<InputSlot>,
@@ -159,6 +169,11 @@ pub struct JournalStage {
     /// Only read when fsync is enabled (not `no-fsync` feature).
     #[cfg_attr(feature = "no-fsync", allow(dead_code))]
     group_commit_delay: Duration,
+    /// Optional replication ring producer. When `Some`, the journal stage
+    /// copies encoded batch bytes into a pre-allocated ring slot after each
+    /// `flush_batch_sync()`. No heap allocation — just a memcpy into the
+    /// ring's pre-allocated buffer. When `None`, replication is disabled.
+    replication_producer: Option<ReplicationProducer>,
 }
 
 impl JournalStage {
@@ -177,7 +192,15 @@ impl JournalStage {
             writer,
             consumer,
             group_commit_delay,
+            replication_producer: None,
         }
+    }
+
+    /// Set the replication ring producer. When set, the journal stage
+    /// copies encoded batch bytes into the ring after `flush_batch_sync()`.
+    /// No heap allocation — just a memcpy into a pre-allocated buffer.
+    pub fn set_replication_producer(&mut self, producer: ReplicationProducer) {
+        self.replication_producer = Some(producer);
     }
 
     /// Run the journal stage loop.
@@ -306,7 +329,7 @@ impl JournalStage {
                             continue;
                         }
                         if let Err(e) = self.writer.batch_append(&slot.event) {
-                            tracing::error!(error = %e, "journal encode error");
+                            panic!("fatal journal encode error: {e}");
                         }
                     }
                 }
@@ -334,9 +357,30 @@ impl JournalStage {
 
                 if should_sync {
                     #[cfg(not(feature = "no-persist"))]
-                    if let Err(e) = self.writer.flush_batch_sync() {
-                        tracing::error!(error = %e, "journal flush_batch_sync error");
+                    {
+                        // Snapshot batch bytes for replication BEFORE flush
+                        // (flush clears the buffer). Copies into a pre-allocated
+                        // ring slot — no heap allocation.
+                        // Only when persistence is enabled — with no-persist,
+                        // batch_buf is never cleared and would grow unbounded.
+                        if let Some(producer) = &mut self.replication_producer {
+                            let bytes = self.writer.pending_batch_bytes();
+                            if !bytes.is_empty() {
+                                let end_seq = self.writer.next_sequence() - 1;
+                                let chain = self.writer.chain_hash().unwrap_or([0u8; 32]);
+                                producer.publish(bytes, end_seq, chain);
+                            }
+                        }
+
+                        if let Err(e) = self.writer.flush_batch_sync() {
+                            // Fatal: journal I/O failure means we can't
+                            // guarantee durability. Panic to prevent the
+                            // pipeline from spinning forever on a broken
+                            // disk (e.g., ENOSPC).
+                            panic!("fatal journal I/O error: {e}");
+                        }
                     }
+
                     self.consumer.commit(pending);
                     pending = 0;
                     #[cfg(not(feature = "no-fsync"))]
@@ -376,6 +420,17 @@ impl JournalStage {
                         tracing::error!(error = %e, "journal encode error on drain");
                     }
                 }
+
+                // Snapshot for replication before flush.
+                if let Some(producer) = &mut self.replication_producer {
+                    let bytes = self.writer.pending_batch_bytes();
+                    if !bytes.is_empty() {
+                        let end_seq = self.writer.next_sequence() - 1;
+                        let chain = self.writer.chain_hash().unwrap_or([0u8; 32]);
+                        producer.publish(bytes, end_seq, chain);
+                    }
+                }
+
                 if let Err(e) = self.writer.flush_batch_sync() {
                     tracing::error!(error = %e, "journal sync error on drain");
                 }
@@ -517,7 +572,7 @@ impl JournalStage {
                         continue;
                     }
                     if let Err(e) = self.writer.batch_append(&slot.event) {
-                        tracing::error!(error = %e, "journal encode error");
+                        panic!("fatal journal encode error: {e}");
                     }
                 }
                 pending += count;
@@ -573,6 +628,17 @@ impl JournalStage {
                         self.writer.confirm_async_write(batch_data);
                     }
 
+                    // Snapshot batch bytes for replication BEFORE
+                    // take_batch_for_async_write (which swaps the buffer).
+                    if let Some(producer) = &mut self.replication_producer {
+                        let bytes = self.writer.pending_batch_bytes();
+                        if !bytes.is_empty() {
+                            let end_seq = self.writer.next_sequence() - 1;
+                            let chain = self.writer.chain_hash().unwrap_or([0u8; 32]);
+                            producer.publish(bytes, end_seq, chain);
+                        }
+                    }
+
                     // Take the batch buffer and submit async write.
                     match self.writer.take_batch_for_async_write() {
                         Ok(Some(async_batch)) => {
@@ -599,7 +665,7 @@ impl JournalStage {
                             self.consumer.commit(pending);
                         }
                         Err(e) => {
-                            tracing::error!(error = %e, "journal take_batch error");
+                            panic!("fatal journal I/O error: {e}");
                         }
                     }
                     pending = 0;
@@ -995,12 +1061,18 @@ fn print_utilization(stage: &str, busy: u64, idle: u64) {
 /// Build the input disruptor and output SPSC, returning the stages and
 /// the journal progress cursor for the response stage.
 ///
-/// **Topology**: both journal and matching consumers are gated on the
-/// producer (parallel). The matching stage does NOT wait for journal
-/// sync — the response stage gates on the journal cursor instead.
+/// **Topology**: journal, matching, and (optionally) replication consumers
+/// are all gated on the producer (parallel). The matching stage does NOT
+/// wait for journal sync — the response stage gates on the journal cursor
+/// (and replication cursor when active) instead.
 ///
 /// The caller (server) is responsible for building the response stage
 /// and spawning all threads.
+///
+/// When `enable_replication` is true, a 3rd consumer is added for the
+/// replication stage. The returned `Option<ReplicationStage>` and
+/// `Arc<AtomicU64>` (replication cursor) are used by the server to spawn
+/// the replication thread and gate the response stage.
 pub fn build_pipeline(
     exchange: Exchange,
     writer: JournalWriter,
@@ -1012,6 +1084,60 @@ pub fn build_pipeline(
     MatchingStage,
     spsc::Consumer<OutputSlot>,
     Arc<Sequence>,
+    Arc<AtomicU64>,
+) {
+    let (
+        producer,
+        journal_stage,
+        matching_stage,
+        output_consumer,
+        journal_cursor,
+        events_processed,
+        _,
+        _,
+    ) = build_pipeline_with_replication(
+        exchange,
+        writer,
+        group_commit_delay,
+        active_connections,
+        false,
+    );
+    (
+        producer,
+        journal_stage,
+        matching_stage,
+        output_consumer,
+        journal_cursor,
+        events_processed,
+    )
+}
+
+/// Build the pipeline with optional replication support.
+///
+/// When `enable_replication` is true, builds a replication ring (pre-allocated,
+/// lock-free) and wires the producer into the `JournalStage`. After each
+/// `flush_batch_sync()`, the journal stage copies the encoded bytes into a
+/// pre-allocated ring slot (no heap allocation). The returned consumer(s)
+/// are for replica sender threads.
+///
+/// Returns one `ReplicationConsumer` for the sender thread, and a
+/// `replication_cursor` `Arc<AtomicU64>` for the response stage.
+/// When replication is disabled, the cursor is `u64::MAX` (standalone mode).
+#[allow(clippy::type_complexity)]
+pub fn build_pipeline_with_replication(
+    exchange: Exchange,
+    writer: JournalWriter,
+    group_commit_delay: Duration,
+    active_connections: Arc<AtomicU64>,
+    enable_replication: bool,
+) -> (
+    ring::MultiProducer<InputSlot>,
+    JournalStage,
+    MatchingStage,
+    spsc::Consumer<OutputSlot>,
+    Arc<Sequence>,
+    Arc<AtomicU64>,
+    Option<ReplicationConsumer>,
     Arc<AtomicU64>,
 ) {
     // Input disruptor: N producers (reader threads), 2 parallel consumers.
@@ -1035,7 +1161,18 @@ pub fn build_pipeline(
 
     let events_processed = Arc::new(AtomicU64::new(0));
 
-    let journal_stage = JournalStage::new(writer, journal_consumer, group_commit_delay);
+    let mut journal_stage = JournalStage::new(writer, journal_consumer, group_commit_delay);
+
+    // Build the replication ring if enabled. 64 slots × 128 KiB = 8 MiB
+    // of pre-allocated buffers. Single consumer for v1 (one replica).
+    let replication_consumer = if enable_replication {
+        let (producer, mut ring_consumers) = crate::journal::replication::build_replication_ring(1);
+        journal_stage.set_replication_producer(producer);
+        Some(ring_consumers.pop().expect("replication consumer"))
+    } else {
+        None
+    };
+
     let matching_stage = MatchingStage::new(
         exchange,
         matching_consumer,
@@ -1045,6 +1182,14 @@ pub fn build_pipeline(
         active_connections,
     );
 
+    // Replication cursor: shared atomic read by the response stage.
+    // Always initialized to u64::MAX so the server works immediately
+    // even before a replica connects. When a replica connects and starts
+    // acking, the sender thread sets this to the acked sequence.
+    // On disconnect, it's reset to u64::MAX (degrade to local-only).
+    // This means: `min(journal_cursor, u64::MAX) = journal_cursor`.
+    let replication_cursor = Arc::new(AtomicU64::new(u64::MAX));
+
     (
         input_producer,
         journal_stage,
@@ -1052,6 +1197,8 @@ pub fn build_pipeline(
         output_consumer,
         journal_cursor,
         events_processed,
+        replication_consumer,
+        replication_cursor,
     )
 }
 
@@ -1291,6 +1438,198 @@ mod tests {
             let mut reader = crate::journal::JournalReader::open(&path).unwrap();
             let entry = reader.next_entry().unwrap().unwrap();
             assert!(matches!(entry.event, JournalEvent::SubmitOrder { .. }));
+        }
+    }
+
+    #[test]
+    fn journal_stage_sends_replication_batches() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("repl_pipeline.journal");
+
+        let mut exchange = Exchange::new();
+        exchange.add_instrument(InstrumentSpec {
+            symbol: Symbol(1),
+            base: CurrencyId(0),
+            quote: CurrencyId(1),
+        });
+        exchange.deposit(AccountId(1), CurrencyId(1), 1_000_000);
+        exchange.deposit(AccountId(2), CurrencyId(0), 1_000);
+
+        let writer = JournalWriter::create(&path).unwrap();
+
+        let active_conns = Arc::new(AtomicU64::new(0));
+        let (
+            input_producer,
+            journal_stage,
+            matching_stage,
+            mut output_consumer,
+            journal_cursor,
+            _events_processed,
+            replication_rx,
+            replication_cursor,
+        ) = build_pipeline_with_replication(exchange, writer, Duration::ZERO, active_conns, true);
+
+        let mut repl_consumer = replication_rx.expect("replication should be enabled");
+
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let s1 = Arc::clone(&shutdown);
+        let s2 = Arc::clone(&shutdown);
+
+        let t_journal = std::thread::spawn(move || journal_stage.run(&s1));
+        let t_matching = std::thread::spawn(move || matching_stage.run(&s2));
+
+        // Submit an order through the pipeline.
+        input_producer.publish(InputSlot {
+            connection_id: 1,
+            event: JournalEvent::SubmitOrder {
+                symbol: Symbol(1),
+                order: limit_order(1, AccountId(2), Side::Sell, 100, 50),
+            },
+            publish_ts: trace_ts(),
+            recv_ts: trace_ts(),
+        });
+
+        // Wait for the Placed report in the output SPSC (matching stage).
+        let output = loop {
+            if let Some((_, slot)) = output_consumer.try_consume() {
+                break slot;
+            }
+            std::hint::spin_loop();
+        };
+        assert!(matches!(
+            output.payload,
+            OutputPayload::Report(ExecutionReport::Placed { .. })
+        ));
+
+        // Wait for journal to confirm durability.
+        loop {
+            let cursor = journal_cursor.get().load(Ordering::Acquire);
+            if cursor > output.input_seq {
+                break;
+            }
+            std::hint::spin_loop();
+        }
+
+        // The journal stage should have published a replication batch with the
+        // exact same bytes it wrote to disk. Spin-wait for it.
+        let (repl_meta, repl_data) = loop {
+            if let Some((meta, data)) = repl_consumer.try_read() {
+                // Copy data out before commit releases the slot.
+                let data_copy = data.to_vec();
+                repl_consumer.commit();
+                break (meta, data_copy);
+            }
+            std::hint::spin_loop();
+        };
+        assert!(
+            repl_meta.end_sequence > 0,
+            "replication batch should have events"
+        );
+        assert!(!repl_data.is_empty(), "replication batch should have data");
+        assert_ne!(
+            repl_meta.chain_hash, [0u8; 32],
+            "chain hash should be initialized"
+        );
+
+        // Verify the replication batch contains valid journal entries with
+        // the same sequence numbers as the on-disk journal.
+        let (consumed, seq, _ts, event) = crate::journal::codec::decode(&repl_data).unwrap();
+        assert!(consumed > 0);
+        assert_eq!(
+            seq, 2,
+            "replication sequence should match journal (genesis=1, first user=2)"
+        );
+        assert!(matches!(event, JournalEvent::SubmitOrder { .. }));
+
+        // Verify the replicated bytes are byte-identical to what's on disk.
+        #[cfg(not(feature = "no-persist"))]
+        {
+            use crate::journal::codec::FILE_HEADER_SIZE;
+            let file_bytes = std::fs::read(&path).unwrap();
+
+            // Find the end of the genesis entry (first entry after file header).
+            let mut offset = FILE_HEADER_SIZE;
+            let genesis_len =
+                u16::from_le_bytes([file_bytes[offset + 2], file_bytes[offset + 3]]) as usize;
+            offset += 20 + genesis_len + 4;
+
+            // Find end of valid data via reader.
+            let mut reader = crate::journal::JournalReader::open(&path).unwrap();
+            while reader.next_entry().unwrap().is_some() {}
+            let data_end = reader.valid_file_end() as usize;
+
+            let disk_bytes = &file_bytes[offset..data_end];
+            assert_eq!(
+                repl_data, disk_bytes,
+                "replicated bytes must be byte-identical to journal file"
+            );
+        }
+
+        // Simulate replica acking — update the replication cursor.
+        replication_cursor.store(repl_meta.end_sequence + 1, Ordering::Release);
+
+        // Verify dual-cursor gating: both cursors advanced.
+        let journal_pos = journal_cursor.get().load(Ordering::Acquire);
+        let repl_pos = replication_cursor.load(Ordering::Acquire);
+        let effective = journal_pos.min(repl_pos);
+        assert!(
+            effective > output.input_seq,
+            "both cursors should have advanced"
+        );
+
+        shutdown.store(true, Ordering::Relaxed);
+        let _writer = t_journal.join().unwrap();
+        let _exchange = t_matching.join().unwrap();
+    }
+
+    #[test]
+    fn replication_cursor_always_starts_at_max() {
+        // Cursor should be u64::MAX regardless of replication mode.
+        // When disabled: no replica, no gating.
+        // When enabled: server works before a replica connects; cursor
+        // only engages when the replica sends its first ack.
+        let dir = tempfile::tempdir().unwrap();
+
+        // Standalone mode.
+        {
+            let path = dir.path().join("standalone.journal");
+            let exchange = Exchange::new();
+            let writer = JournalWriter::create(&path).unwrap();
+            let active_conns = Arc::new(AtomicU64::new(0));
+
+            let (_, _, _, _, _, _, replication, replication_cursor) =
+                build_pipeline_with_replication(
+                    exchange,
+                    writer,
+                    Duration::ZERO,
+                    active_conns,
+                    false,
+                );
+            assert!(replication.is_none());
+            assert_eq!(replication_cursor.load(Ordering::Relaxed), u64::MAX);
+        }
+
+        // Replication enabled — cursor still starts at u64::MAX.
+        {
+            let path = dir.path().join("repl_enabled.journal");
+            let exchange = Exchange::new();
+            let writer = JournalWriter::create(&path).unwrap();
+            let active_conns = Arc::new(AtomicU64::new(0));
+
+            let (_, _, _, _, _, _, replication, replication_cursor) =
+                build_pipeline_with_replication(
+                    exchange,
+                    writer,
+                    Duration::ZERO,
+                    active_conns,
+                    true,
+                );
+            assert!(replication.is_some());
+            assert_eq!(
+                replication_cursor.load(Ordering::Relaxed),
+                u64::MAX,
+                "replication cursor should start at MAX even when enabled"
+            );
         }
     }
 }

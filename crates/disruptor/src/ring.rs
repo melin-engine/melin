@@ -221,6 +221,65 @@ impl<T: Copy + Default> Producer<T> {
             }
         }
     }
+
+    /// Check if the ring has space for one more entry without publishing.
+    ///
+    /// Returns `Ok(seq)` with the sequence that the next `publish_claimed`
+    /// will use. Returns `Err(Full)` if backpressured.
+    ///
+    /// Single-producer only. The caller can use `seq` to pre-write data
+    /// into a side buffer, then call `publish_claimed` to make it visible.
+    pub fn try_claim(&mut self) -> Result<u64, Full> {
+        let seq = self.shared.cursor.get().load(Ordering::Relaxed);
+        let capacity = self.shared.buffer.mask + 1;
+
+        if seq - self.cached_gate_min >= capacity {
+            let mut min = u64::MAX;
+            for gate in &self.gates {
+                let g = gate.get().load(Ordering::Acquire);
+                if g < min {
+                    min = g;
+                }
+            }
+            self.cached_gate_min = min;
+            if seq - min >= capacity {
+                return Err(Full);
+            }
+        }
+        Ok(seq)
+    }
+
+    /// Publish a value at a previously claimed sequence.
+    ///
+    /// Must be called after a successful `try_claim()`. The caller should
+    /// have written any side-buffer data between `try_claim` and this call.
+    /// The Release store on the cursor ensures all prior writes (including
+    /// side-buffer writes) are visible to consumers.
+    ///
+    /// # Safety contract
+    /// The `seq` must be the value returned by the most recent `try_claim`.
+    /// No other `try_publish` or `publish_claimed` may have been called
+    /// between `try_claim` and this call.
+    pub fn publish_claimed(&mut self, seq: u64, value: T) {
+        // Safety: try_claim verified the slot is free.
+        unsafe { self.shared.buffer.write(seq, value) };
+        // Release: consumers see both the slot data AND any prior writes
+        // (e.g., side-buffer data written between try_claim and this call).
+        self.shared.cursor.get().store(seq + 1, Ordering::Release);
+    }
+
+    /// Peek at the current cursor value (next sequence to be published).
+    ///
+    /// Only meaningful for single-producer use. The returned sequence is
+    /// the slot that will be written by the next successful `try_publish`.
+    pub fn peek_cursor(&self) -> u64 {
+        self.shared.cursor.get().load(Ordering::Relaxed)
+    }
+
+    /// Capacity of the ring buffer.
+    pub fn capacity(&self) -> u64 {
+        self.shared.buffer.mask + 1
+    }
 }
 
 /// Multi-producer end of the disruptor. Multiple threads can publish

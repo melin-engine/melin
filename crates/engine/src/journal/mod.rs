@@ -11,6 +11,7 @@ pub mod error;
 pub mod event;
 pub mod pipeline;
 pub mod reader;
+pub mod replication;
 pub mod snapshot;
 pub mod trace;
 pub mod writer;

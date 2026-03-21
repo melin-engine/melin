@@ -1107,6 +1107,7 @@ fn nonblocking_fill(fd: RawFd, buf: &mut [u8], mut filled: usize, target: usize)
 fn run_epoll_loop<W: Write>(
     mut connections: Vec<BenchConnection<W>>,
     window: usize,
+    progress: Arc<AtomicU64>,
 ) -> Histogram<u64> {
     let num_conns = connections.len();
 
@@ -1181,6 +1182,7 @@ fn run_epoll_loop<W: Write>(
                             }
 
                             conn.batch_count += 1;
+                            progress.fetch_add(1, Ordering::Relaxed);
                             if conn.batch_count >= conn.total_orders {
                                 conn.done = true;
                                 done_count += 1;
@@ -1359,6 +1361,16 @@ fn run_epoll_roundtrip<R, W, F>(
         thread_conns[client_id % num_threads].push(conn);
     }
 
+    // Total orders across all clients (including warmup) for progress reporting.
+    let total_all_orders: u64 = (warmup * num_clients + total_pairs * 2) as u64;
+    let progress = Arc::new(AtomicU64::new(0));
+    let progress_shutdown = Arc::new(AtomicBool::new(false));
+    let progress_handle = spawn_progress_reporter(
+        Arc::clone(&progress),
+        total_all_orders,
+        Arc::clone(&progress_shutdown),
+    );
+
     // Spawn bench threads.
     let barrier = Arc::new(std::sync::Barrier::new(num_threads + 1));
     let mut handles = Vec::with_capacity(num_threads);
@@ -1366,6 +1378,7 @@ fn run_epoll_roundtrip<R, W, F>(
     for (i, conns) in thread_conns.into_iter().enumerate() {
         let barrier = Arc::clone(&barrier);
         let core_id = BENCH_CORE_START + i;
+        let thread_progress = Arc::clone(&progress);
         let handle = std::thread::Builder::new()
             .name(format!("bench-{i}"))
             .spawn(move || {
@@ -1373,7 +1386,7 @@ fn run_epoll_roundtrip<R, W, F>(
                     eprintln!("warning: bench-{i} could not pin to core {core_id}: {e}");
                 }
                 barrier.wait();
-                run_epoll_loop(conns, window)
+                run_epoll_loop(conns, window, thread_progress)
             })
             .expect("spawn bench thread");
         handles.push(handle);
@@ -1390,6 +1403,10 @@ fn run_epoll_roundtrip<R, W, F>(
         let histogram = handle.join().expect("bench thread panicked");
         merged_histogram.add(&histogram).expect("merge histograms");
     }
+
+    // Stop progress reporter.
+    progress_shutdown.store(true, Ordering::Relaxed);
+    let _ = progress_handle.join();
 
     let blast_duration = blast_start.elapsed();
 
@@ -1422,6 +1439,50 @@ fn run_epoll_roundtrip<R, W, F>(
 }
 
 // ===========================================================================
+// Progress reporting
+// ===========================================================================
+
+/// Spawn a background thread that prints periodic progress to stderr.
+/// Returns a handle; the thread exits when `shutdown` is set to true.
+fn spawn_progress_reporter(
+    completed: Arc<AtomicU64>,
+    total_orders: u64,
+    shutdown: Arc<AtomicBool>,
+) -> std::thread::JoinHandle<()> {
+    std::thread::Builder::new()
+        .name("progress".into())
+        .spawn(move || {
+            let start = Instant::now();
+            let mut last_completed: u64 = 0;
+            let mut last_time = start;
+
+            loop {
+                std::thread::sleep(Duration::from_secs(5));
+                if shutdown.load(Ordering::Relaxed) {
+                    break;
+                }
+
+                let now = Instant::now();
+                let current = completed.load(Ordering::Relaxed);
+                let dt = now.duration_since(last_time).as_secs_f64();
+                let delta = current.saturating_sub(last_completed);
+                let rate = delta as f64 / dt;
+                let elapsed = now.duration_since(start).as_secs_f64();
+                let pct = current as f64 / total_orders as f64 * 100.0;
+
+                eprintln!(
+                    "  [{elapsed:.1}s] {current} / {total_orders} orders ({pct:.1}%)  {:.0}K/s",
+                    rate / 1000.0,
+                );
+
+                last_completed = current;
+                last_time = now;
+            }
+        })
+        .expect("spawn progress thread")
+}
+
+// ===========================================================================
 // io_uring roundtrip benchmark
 // ===========================================================================
 
@@ -1451,6 +1512,7 @@ fn run_uring_roundtrip<R, W, F>(
     let remainder = total_pairs % num_clients;
 
     let mut connections: Vec<UringBenchConn> = Vec::with_capacity(num_clients);
+    let setup_start = Instant::now();
 
     for client_id in 0..num_clients {
         let (mut read_stream, write_stream) = connect();
@@ -1488,6 +1550,11 @@ fn run_uring_roundtrip<R, W, F>(
             flow.generate_frames(total_orders)
         };
 
+        eprintln!(
+            "  client {}/{num_clients}: connected, {total_orders} frames generated",
+            client_id + 1,
+        );
+
         connections.push(UringBenchConn {
             read_fd,
             write_fd,
@@ -1507,6 +1574,11 @@ fn run_uring_roundtrip<R, W, F>(
         });
     }
 
+    eprintln!(
+        "  all {num_clients} clients ready ({:.1}s setup)",
+        setup_start.elapsed().as_secs_f64(),
+    );
+
     let num_threads = bench_threads.min(num_clients);
 
     // Distribute connections round-robin across bench threads.
@@ -1514,6 +1586,16 @@ fn run_uring_roundtrip<R, W, F>(
     for (i, conn) in connections.into_iter().enumerate() {
         thread_conns[i % num_threads].push(conn);
     }
+
+    // Total orders across all clients (including warmup) for progress reporting.
+    let total_all_orders: u64 = (warmup * num_clients + total_pairs * 2) as u64;
+    let progress = Arc::new(AtomicU64::new(0));
+    let progress_shutdown = Arc::new(AtomicBool::new(false));
+    let progress_handle = spawn_progress_reporter(
+        Arc::clone(&progress),
+        total_all_orders,
+        Arc::clone(&progress_shutdown),
+    );
 
     let start = Instant::now();
 
@@ -1524,13 +1606,14 @@ fn run_uring_roundtrip<R, W, F>(
         .map(|(i, conns)| {
             let core_id = BENCH_CORE_START + i;
             let bench_start = start;
+            let thread_progress = Arc::clone(&progress);
             std::thread::Builder::new()
                 .name(format!("bench-{i}"))
                 .spawn(move || {
                     if let Err(e) = trading_server::affinity::pin_to_core(core_id) {
                         eprintln!("warning: could not pin bench-{i} to core {core_id}: {e}");
                     }
-                    run_uring_loop(conns, window, bench_start, warmup)
+                    run_uring_loop(conns, window, bench_start, warmup, thread_progress)
                 })
                 .expect("spawn bench thread")
         })
@@ -1552,6 +1635,10 @@ fn run_uring_roundtrip<R, W, F>(
         #[cfg(not(feature = "chart"))]
         let _ = s;
     }
+
+    // Stop progress reporter.
+    progress_shutdown.store(true, Ordering::Relaxed);
+    let _ = progress_handle.join();
 
     let wall = start.elapsed();
 
@@ -1633,6 +1720,7 @@ fn run_uring_loop(
     window: usize,
     bench_start: Instant,
     warmup: usize,
+    progress: Arc<AtomicU64>,
 ) -> (Histogram<u64>, TimeSeries) {
     use io_uring::{IoUring, opcode, types};
 
@@ -1757,6 +1845,7 @@ fn run_uring_loop(
                             }
                         }
                         conn.batch_count += 1;
+                        progress.fetch_add(1, Ordering::Relaxed);
                         if conn.batch_count >= conn.total_orders {
                             conn.done = true;
                             done_count += 1;

@@ -6,7 +6,7 @@
 
 set -euo pipefail
 
-for name in bench-server bench-client; do
+for name in bench-server bench-client bench-replica; do
     if docker rm -f "$name" 2>/dev/null; then
         echo "Removed $name"
     fi

@@ -116,10 +116,11 @@ Without the mid-batch flush (per-slot check only), results were identical to bas
 
 Performance figures are in the [README](README.md#performance). Keep them up to date when making performance-related changes.
 
-LAN benchmark at `126d118` (two Cherry AMD Ryzen 9950X servers, dedicated NVMe journal disk):
-- **With fsync/FUA**: 4.3M orders/sec, p50 = 926 µs, p99.9 = 1080 µs, max = 1232 µs
-- **Without persistence**: 8.8M orders/sec, p50 = 651 µs, p99.9 = 895 µs, max = 1148 µs
-- **Single-order latency**: 76 µs p50 (1 client, no pipelining, full durability)
+LAN benchmark at `331c089` (two or three Cherry AMD Ryzen 9950X servers, dedicated NVMe journal disk):
+- **With fsync/FUA**: 4.0M orders/sec, p50 = 916 µs, p99.9 = 1072 µs, max = 1595 µs
+- **Without persistence**: 8.0M orders/sec, p50 = 636 µs, p99.9 = 897 µs, max = 1396 µs
+- **Single-order latency**: 74 µs p50 (1 client, no pipelining, full durability)
+- **With fsync + sync replication**: 1.1M orders/sec, p50 = 1040 µs, p99.9 = 1342 µs, max = 1442 µs
 
 ### Current bottleneck: TCP network stack
 
@@ -156,14 +157,16 @@ Core layout: 0=OS/IRQ, 1-3=pipeline (journal/matching/response), 4-5=readers, 6+
   - `writer.rs` — `JournalWriter` (append + fsync to disk, batch append API)
   - `reader.rs` — `JournalReader` (sequential read + validate)
   - `engine.rs` — `JournaledExchange` wrapper (journal-before-execute + replay recovery)
-  - `pipeline.rs` — disruptor pipeline stages (`JournalStage`, `MatchingStage`, slot types)
+  - `pipeline.rs` — disruptor pipeline stages (`JournalStage` with optional replication ring, `MatchingStage`, slot types)
+  - `replication.rs` — lock-free replication ring buffer (pre-allocated 128 KiB slots, single-producer multi-consumer)
   - `snapshot.rs` — snapshot save/load for Exchange state (version-boundary recovery)
   - `error.rs` — `JournalError` enum
 
 ### `crates/server/` — server and pipeline orchestration
-- `src/server.rs` — builds disruptor pipeline, spawns 3 OS threads, accept loop
-- `src/response.rs` — response stage thread (output SPSC → direct socket writes via `BlockingFrameWriter`)
+- `src/server.rs` — builds disruptor pipeline, spawns 3+ OS threads, accept loop
+- `src/response.rs` — response stage thread (output SPSC → direct socket writes, gates on `min(journal_cursor, replication_cursor)`)
 - `src/reader.rs` — epoll-based multiplexed reader pool (edge-triggered, non-blocking I/O → lock-free `MultiProducer`)
+- `src/replication.rs` — replication wire protocol, sender (primary), receiver (replica)
 - `src/affinity.rs` — CPU core pinning for pipeline and reader threads
 
 ### `crates/protocol/` — wire protocol (zero async, no tokio)

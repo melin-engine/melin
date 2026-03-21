@@ -1,23 +1,38 @@
 #!/usr/bin/env bash
-# Start two Docker containers for testing lan-bench.sh locally.
+# Start Docker containers for testing lan-bench.sh and replication locally.
 #
-# Creates a "bench-net" network and two privileged Ubuntu containers
-# with SSH access via your default SSH key.
+# Creates a "bench-net" network and two (or three) privileged Ubuntu
+# containers with SSH access via your default SSH key.
 #
 # Usage:
-#   ./scripts/test-containers-start.sh
+#   ./scripts/test-containers-start.sh            # server + client
+#   ./scripts/test-containers-start.sh --replica   # server + client + replica
 #
 # After starting:
 #   SERVER_IP=$(docker inspect -f '{{range.NetworkSettings.Networks}}{{.IPAddress}}{{end}}' bench-server)
 #   BENCH_IP=$(docker inspect -f '{{range.NetworkSettings.Networks}}{{.IPAddress}}{{end}}' bench-client)
 #   ./scripts/lan-bench.sh "$SERVER_IP" "$BENCH_IP" "$SERVER_IP" root
+#
+#   # With replica:
+#   REPLICA_IP=$(docker inspect -f '{{range.NetworkSettings.Networks}}{{.IPAddress}}{{end}}' bench-replica)
+#   ./scripts/lan-bench-suite.sh "$SERVER_IP" "$BENCH_IP" "$SERVER_IP" root "$REPLICA_IP" "$REPLICA_IP"
 
 set -euo pipefail
 
 NETWORK="bench-net"
 SERVER="bench-server"
 CLIENT="bench-client"
+REPLICA="bench-replica"
 IMAGE="ubuntu:24.04"
+
+# Parse flags.
+WITH_REPLICA=false
+for arg in "$@"; do
+    case "$arg" in
+        --replica) WITH_REPLICA=true ;;
+        *) echo "unknown flag: $arg" >&2; exit 1 ;;
+    esac
+done
 
 # SSH key for logging into the containers.
 SSH_PUB=""
@@ -44,8 +59,14 @@ echo "Using GitHub deploy key: $GITHUB_KEY"
 # Create network (ignore if exists).
 docker network create "$NETWORK" 2>/dev/null || true
 
+# Build container list.
+CONTAINERS=("$SERVER" "$CLIENT")
+if [[ "$WITH_REPLICA" == "true" ]]; then
+    CONTAINERS+=("$REPLICA")
+fi
+
 # Start containers.
-for name in "$SERVER" "$CLIENT"; do
+for name in "${CONTAINERS[@]}"; do
     # Remove old container if it exists.
     docker rm -f "$name" 2>/dev/null || true
 
@@ -107,3 +128,11 @@ CLIENT_IP=$(docker inspect -f '{{range.NetworkSettings.Networks}}{{.IPAddress}}{
 echo ""
 echo "Containers ready. Run the benchmark with:"
 echo "  ./scripts/lan-bench.sh $SERVER_IP $CLIENT_IP $SERVER_IP"
+
+if [[ "$WITH_REPLICA" == "true" ]]; then
+    REPLICA_IP=$(docker inspect -f '{{range.NetworkSettings.Networks}}{{.IPAddress}}{{end}}' "$REPLICA")
+    echo ""
+    echo "Replication benchmark:"
+    echo "  RUN_FSYNC=0 RUN_NOPERSIST=0 RUN_SINGLE=0 RUN_SWEEPS=0 RUN_PLOTS=0 \\"
+    echo "    ./scripts/lan-bench-suite.sh $SERVER_IP $CLIENT_IP $SERVER_IP root $REPLICA_IP $REPLICA_IP"
+fi

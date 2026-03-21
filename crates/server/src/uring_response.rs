@@ -80,12 +80,13 @@ struct ConnectionEntry {
 /// Run the io_uring response stage loop. Blocks the calling thread until shutdown.
 ///
 /// Same semantics as `response::run` — consumes from the output SPSC, waits
-/// for journal durability, and sends responses — but uses io_uring SEND
-/// instead of blocking `write(2)` syscalls.
+/// for journal + replication durability, and sends responses — but uses
+/// io_uring SEND instead of blocking `write(2)` syscalls.
 pub fn run(
     mut consumer: spsc::Consumer<OutputSlot>,
     control_rx: mpsc::Receiver<ControlEvent>,
     journal_cursor: Arc<Sequence>,
+    replication_cursor: Arc<std::sync::atomic::AtomicU64>,
     shutdown: &AtomicBool,
     heartbeat_interval: Option<Duration>,
 ) {
@@ -266,7 +267,7 @@ pub fn run(
         #[cfg(feature = "latency-trace")]
         let consume_ts = trace::trace_ts();
 
-        // Wait for the journal to confirm the entire batch is durable.
+        // Wait for both journal AND replication to confirm the batch.
         #[cfg(not(feature = "no-fsync"))]
         {
             let max_seq = batch[..count]
@@ -277,7 +278,9 @@ pub fn run(
             let needed = max_seq + 1;
             if cached_journal_pos < needed {
                 loop {
-                    cached_journal_pos = journal_cursor.get().load(Ordering::Acquire);
+                    let journal_pos = journal_cursor.get().load(Ordering::Acquire);
+                    let repl_pos = replication_cursor.load(Ordering::Acquire);
+                    cached_journal_pos = journal_pos.min(repl_pos);
                     if cached_journal_pos >= needed {
                         break;
                     }
