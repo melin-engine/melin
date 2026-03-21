@@ -415,6 +415,17 @@ if command -v cargo &>/dev/null && [[ -f "$(dirname "$0")/../crates/bench/src/pl
         fi
     done
 
+    # Latency stability over time (from time-series data in JSON).
+    STABILITY_FILES=()
+    for f in "${RESULTS_DIR}/1-fsync.json" "${RESULTS_DIR}/4-replication.json"; do
+        [[ -f "$f" ]] && STABILITY_FILES+=("$f")
+    done
+    if [[ ${#STABILITY_FILES[@]} -gt 0 ]]; then
+        echo "  Generating latency stability..."
+        "${PLOT_TOOL}" stability -o "${PLOT_DIR}/latency-stability.svg" \
+            "${STABILITY_FILES[@]}" 2>&1
+    fi
+
     echo ""
     echo "  Plots written to docs/plots/"
 fi

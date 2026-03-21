@@ -55,7 +55,6 @@ use melin_server::server::ServerConfig;
 /// Number of completed orders between latency time-series samples.
 /// Each sample captures interval p99/p99.9 (reset after each sample),
 /// giving temporal variation rather than cumulative smoothing.
-#[cfg(feature = "chart")]
 const SAMPLE_INTERVAL: usize = 1_000;
 
 /// Number of order pairs (buy + sell) per benchmark run.
@@ -159,7 +158,6 @@ fn tsc_to_ns(ticks: u64, ticks_per_ns: f64) -> u64 {
 /// Captured every `SAMPLE_INTERVAL` completed orders using an interval
 /// histogram (snapshot + reset), so each sample reflects recent behavior
 /// rather than cumulative averages.
-#[cfg(feature = "chart")]
 struct LatencySample {
     /// Seconds elapsed since measurement start.
     elapsed_secs: f64,
@@ -171,16 +169,11 @@ struct LatencySample {
     p9999_us: f64,
 }
 
-/// Time-series of latency samples for chart display.
-/// Empty Vec when chart feature is disabled (no heap allocation).
-#[cfg(feature = "chart")]
+/// Time-series of latency samples for chart display and stability plots.
 type TimeSeries = Vec<LatencySample>;
-#[cfg(all(not(feature = "chart"), feature = "io-uring"))]
-type TimeSeries = Vec<()>;
 
 /// Record a latency sample if `SAMPLE_INTERVAL` orders have accumulated
 /// in the interval histogram. Resets the interval histogram after sampling.
-#[cfg(feature = "chart")]
 fn maybe_sample(
     interval_hist: &mut Histogram<u64>,
     interval_count: &mut usize,
@@ -404,12 +397,9 @@ fn run_engine_bench(
     }
 
     // Measured run.
-    #[cfg(feature = "chart")]
     let mut interval_hist =
         Histogram::<u64>::new_with_bounds(1, 10_000_000_000, 3).expect("interval histogram");
-    #[cfg(feature = "chart")]
     let mut interval_count: usize = 0;
-    #[cfg(feature = "chart")]
     let mut series: TimeSeries = Vec::new();
 
     let mut submits: u64 = 0;
@@ -463,12 +453,9 @@ fn run_engine_bench(
         let elapsed_ns = t0.elapsed().as_nanos() as u64;
 
         histogram.record(elapsed_ns).expect("record");
-        #[cfg(feature = "chart")]
-        {
-            interval_hist.record(elapsed_ns).expect("record interval");
-            interval_count += 1;
-            maybe_sample(&mut interval_hist, &mut interval_count, &mut series, start);
-        }
+        interval_hist.record(elapsed_ns).expect("record interval");
+        interval_count += 1;
+        maybe_sample(&mut interval_hist, &mut interval_count, &mut series, start);
     }
     let wall = start.elapsed();
 
@@ -498,6 +485,7 @@ fn run_engine_bench(
             ),
         ],
         json_path,
+        &series,
     );
     #[cfg(feature = "chart")]
     show_chart(&series, &histogram);
@@ -652,6 +640,7 @@ fn run_pipeline_bench(
         measured_wall,
         &extra_lines,
         json_path,
+        &Vec::new(),
     );
 
     println!();
@@ -1460,6 +1449,7 @@ fn run_epoll_roundtrip<R, W, F>(
         measured_wall,
         &extra_lines,
         json_path,
+        &[],
     );
 
     // Signal server shutdown so pipeline threads can clean up and print
@@ -1662,10 +1652,7 @@ fn run_uring_roundtrip<R, W, F>(
     let mut histogram =
         Histogram::<u64>::new_with_bounds(1, 10_000_000_000, 3).expect("histogram bounds");
     let mut latest_measured_start: Option<Instant> = None;
-    #[cfg(feature = "chart")]
-    let mut _series: TimeSeries = Vec::new();
-    #[cfg(not(feature = "chart"))]
-    let _series: TimeSeries = Vec::new();
+    let mut all_series: TimeSeries = Vec::new();
 
     for handle in handles {
         let (h, s, ms) = handle.join().expect("bench thread panicked");
@@ -1674,10 +1661,7 @@ fn run_uring_roundtrip<R, W, F>(
             latest_measured_start =
                 Some(latest_measured_start.map_or(t, |prev: Instant| prev.max(t)));
         }
-        #[cfg(feature = "chart")]
-        _series.extend(s);
-        #[cfg(not(feature = "chart"))]
-        let _ = s;
+        all_series.extend(s);
     }
 
     // Stop progress reporter.
@@ -1703,6 +1687,9 @@ fn run_uring_roundtrip<R, W, F>(
     ));
     extra_lines.push(format!("  Window: {window}, Clients: {num_clients}"));
 
+    // Sort time-series by elapsed time for stable plot output.
+    all_series.sort_by(|a, b| a.elapsed_secs.partial_cmp(&b.elapsed_secs).unwrap());
+
     print_results(
         "Roundtrip",
         total_pairs * 2,
@@ -1711,6 +1698,7 @@ fn run_uring_roundtrip<R, W, F>(
         measured_wall,
         &extra_lines,
         json_path,
+        &all_series,
     );
 
     println!();
@@ -1783,16 +1771,10 @@ fn run_uring_loop(
     // Used to compute throughput over the measured phase only.
     let mut measured_start: Option<Instant> = None;
 
-    #[cfg(feature = "chart")]
     let mut interval_hist =
         Histogram::<u64>::new_with_bounds(1, 10_000_000_000, 3).expect("interval histogram");
-    #[cfg(feature = "chart")]
     let mut interval_count: usize = 0;
-    #[cfg(feature = "chart")]
     let mut series: TimeSeries = Vec::new();
-    #[cfg(not(feature = "chart"))]
-    let series = TimeSeries::new();
-    let _ = &bench_start; // used only with chart feature
 
     // Pre-allocated CQE collection buffer. Must collect CQEs before
     // processing because the CQ borrow must end before mutating connections.
@@ -1888,17 +1870,14 @@ fn run_uring_loop(
                                 measured_start = Some(Instant::now());
                             }
                             histogram.record(latency_ns).expect("record");
-                            #[cfg(feature = "chart")]
-                            {
-                                interval_hist.record(latency_ns).expect("record interval");
-                                interval_count += 1;
-                                maybe_sample(
-                                    &mut interval_hist,
-                                    &mut interval_count,
-                                    &mut series,
-                                    bench_start,
-                                );
-                            }
+                            interval_hist.record(latency_ns).expect("record interval");
+                            interval_count += 1;
+                            maybe_sample(
+                                &mut interval_hist,
+                                &mut interval_count,
+                                &mut series,
+                                bench_start,
+                            );
                         }
                         conn.batch_count += 1;
                         progress.fetch_add(1, Ordering::Relaxed);
@@ -2025,6 +2004,7 @@ fn print_results(
     wall: Duration,
     extra_lines: &[String],
     json_path: Option<&std::path::Path>,
+    series: &TimeSeries,
 ) {
     let throughput = (measured_orders as f64) / wall.as_secs_f64();
     let wall_ms = wall.as_micros() as f64 / 1000.0;
@@ -2106,8 +2086,24 @@ fn print_results(
             histogram.max() as f64 / 1000.0
         ));
 
+        // Serialize time-series data for stability plots.
+        let ts_json = if series.is_empty() {
+            String::from("[]")
+        } else {
+            let entries: Vec<String> = series
+                .iter()
+                .map(|s| {
+                    format!(
+                        "{{\"elapsed_secs\":{:.3},\"p99_us\":{:.2},\"p999_us\":{:.2},\"p9999_us\":{:.2}}}",
+                        s.elapsed_secs, s.p99_us, s.p999_us, s.p9999_us,
+                    )
+                })
+                .collect();
+            format!("[{}]", entries.join(","))
+        };
+
         let json = format!(
-            "{{\"label\":\"{label}\",\"measured_orders\":{measured_orders},\"warmup_orders\":{warmup_orders},\"wall_ms\":{:.2},\"throughput_ops\":{:.0},\"latency\":{percentiles}}}",
+            "{{\"label\":\"{label}\",\"measured_orders\":{measured_orders},\"warmup_orders\":{warmup_orders},\"wall_ms\":{:.2},\"throughput_ops\":{:.0},\"latency\":{percentiles},\"time_series\":{ts_json}}}",
             wall.as_secs_f64() * 1000.0,
             throughput,
         );

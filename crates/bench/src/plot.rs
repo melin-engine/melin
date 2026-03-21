@@ -66,6 +66,7 @@ fn main() {
         "latency-cdf" => cmd_latency_cdf(&args[2..]),
         "saturation" => cmd_saturation(&args[2..]),
         "sweep" => cmd_sweep(&args[2..]),
+        "stability" => cmd_stability(&args[2..]),
         "pipeline" => cmd_pipeline(&args[2..]),
         "all" => cmd_all(&args[2..]),
         _ => {
@@ -83,6 +84,7 @@ fn print_usage() {
     eprintln!("  latency-cdf  Percentile plot comparing benchmark configs");
     eprintln!("  saturation   Throughput vs latency at multiple load levels");
     eprintln!("  sweep        Parameter vs throughput (e.g. window depth sweep)");
+    eprintln!("  stability    Latency stability over time (from time-series JSON)");
     eprintln!("  pipeline     Pipeline stage utilization bar chart");
     eprintln!("  all          Generate all plots from a results directory");
     eprintln!();
@@ -730,6 +732,157 @@ fn plot_sweep(results: &[LoadedResult], output: &PathBuf) {
 
     // We don't draw on the right area — it's just padding for the secondary axis.
     let _ = right;
+
+    root.present().unwrap();
+    eprintln!("wrote {}", output.display());
+}
+
+// =====================================================================
+// Command: stability — latency stability over time
+// =====================================================================
+
+/// Time-series data embedded in the JSON output.
+#[derive(Debug, Deserialize)]
+struct TimeSeriesResult {
+    #[allow(dead_code)]
+    label: String,
+    throughput_ops: f64,
+    #[serde(default)]
+    time_series: Vec<TimeSeriesPoint>,
+}
+
+#[derive(Debug, Deserialize)]
+struct TimeSeriesPoint {
+    elapsed_secs: f64,
+    p99_us: f64,
+    p999_us: f64,
+    #[allow(dead_code)]
+    p9999_us: f64,
+}
+
+fn cmd_stability(args: &[String]) {
+    let opts = parse_args(args, "stability.svg");
+    if opts.files.is_empty() {
+        eprintln!("error: need at least 1 result file with time_series data");
+        std::process::exit(1);
+    }
+
+    let mut all_results = Vec::new();
+    for path in &opts.files {
+        let data = fs::read_to_string(path).unwrap_or_else(|e| {
+            eprintln!("warning: cannot read {}: {}", path.display(), e);
+            String::new()
+        });
+        if data.is_empty() {
+            continue;
+        }
+        match serde_json::from_str::<TimeSeriesResult>(&data) {
+            Ok(r) if !r.time_series.is_empty() => {
+                let filename = path
+                    .file_name()
+                    .map(|f| f.to_string_lossy().into_owned())
+                    .unwrap_or_default();
+                all_results.push((r, filename));
+            }
+            Ok(_) => eprintln!(
+                "warning: {} has no time_series data, skipping",
+                path.display()
+            ),
+            Err(e) => eprintln!("warning: cannot parse {}: {}", path.display(), e),
+        }
+    }
+
+    if all_results.is_empty() {
+        eprintln!("error: no files with time_series data found");
+        std::process::exit(1);
+    }
+
+    plot_stability(&all_results, &opts.output);
+}
+
+fn plot_stability(results: &[(TimeSeriesResult, String)], output: &PathBuf) {
+    let root = SVGBackend::new(output, (900, 500)).into_drawing_area();
+    root.fill(&WHITE).unwrap();
+
+    let max_time = results
+        .iter()
+        .flat_map(|(r, _)| r.time_series.iter().map(|p| p.elapsed_secs))
+        .fold(0.0f64, f64::max)
+        * 1.05;
+
+    let max_lat = results
+        .iter()
+        .flat_map(|(r, _)| r.time_series.iter().map(|p| p.p999_us))
+        .fold(0.0f64, f64::max)
+        * 1.2;
+
+    let mut chart = ChartBuilder::on(&root)
+        .caption(
+            "Latency Stability Over Time",
+            ("sans-serif", 22).into_font(),
+        )
+        .margin(15)
+        .x_label_area_size(50)
+        .y_label_area_size(70)
+        .build_cartesian_2d(0.0..max_time, 0.0..max_lat)
+        .unwrap();
+
+    chart
+        .configure_mesh()
+        .x_desc("Time (seconds)")
+        .y_desc("Latency (µs)")
+        .x_label_formatter(&|v| format!("{:.0}s", v))
+        .y_label_formatter(&|v| {
+            if *v >= 1000.0 {
+                format!("{:.1}ms", v / 1000.0)
+            } else {
+                format!("{:.0}µs", v)
+            }
+        })
+        .draw()
+        .unwrap();
+
+    for (i, (result, filename)) in results.iter().enumerate() {
+        let color = COLORS[i % COLORS.len()];
+        let mode = mode_from_filename(filename);
+        let tp = format_throughput(result.throughput_ops);
+
+        // p99 line.
+        let p99_points: Vec<(f64, f64)> = result
+            .time_series
+            .iter()
+            .map(|p| (p.elapsed_secs, p.p99_us))
+            .collect();
+        chart
+            .draw_series(LineSeries::new(p99_points, color.stroke_width(2)))
+            .unwrap()
+            .label(format!("{mode} p99 ({tp})"))
+            .legend(move |(x, y)| {
+                PathElement::new(vec![(x, y), (x + 20, y)], color.stroke_width(2))
+            });
+
+        // p99.9 line (dashed via thinner stroke).
+        let p999_points: Vec<(f64, f64)> = result
+            .time_series
+            .iter()
+            .map(|p| (p.elapsed_secs, p.p999_us))
+            .collect();
+        chart
+            .draw_series(LineSeries::new(p999_points, color.stroke_width(1)))
+            .unwrap()
+            .label(format!("{mode} p99.9"))
+            .legend(move |(x, y)| {
+                PathElement::new(vec![(x, y), (x + 20, y)], color.stroke_width(1))
+            });
+    }
+
+    chart
+        .configure_series_labels()
+        .position(SeriesLabelPosition::UpperRight)
+        .background_style(WHITE.mix(0.8))
+        .border_style(BLACK.mix(0.3))
+        .draw()
+        .unwrap();
 
     root.present().unwrap();
     eprintln!("wrote {}", output.display());
