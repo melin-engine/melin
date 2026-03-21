@@ -118,7 +118,7 @@ Performance figures are in the [README](README.md#performance). Keep them up to 
 
 LAN benchmark at `093d59e` (two or three Cherry AMD Ryzen 9950X servers, SMT disabled, dedicated NVMe journal disk):
 - **With fsync/FUA**: 4.0M orders/sec, p50 = 920 µs, p99.9 = 1082 µs, max = 1560 µs
-- **Without persistence**: 4.5M orders/sec, p50 = 1297 µs, p99.9 = 1448 µs, max = 3557 µs
+- **Without persistence**: 8.0M orders/sec, p50 = 441 µs, p99.9 = 661 µs, max = 1969 µs
 - **Single-order latency**: 73 µs p50 (1 client, no pipelining, full durability)
 - **With fsync + sync replication**: 2.7M orders/sec, p50 = 1059 µs, p99.9 = 1393 µs, max = 1794 µs
 

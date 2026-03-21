@@ -276,7 +276,7 @@ LAN round-trip benchmarks at [`093d59e`](../../commit/093d59e). Two or three Che
 | Mode | Throughput | p50 | p99 | p99.9 | max |
 |------|-----------|-----|-----|-------|-----|
 | **Full durability** (fsync) | **4.0M orders/sec** | 920 µs | 1,035 µs | 1,082 µs | 1,560 µs |
-| **No persistence** | **4.5M orders/sec** | 1,297 µs | 1,372 µs | 1,448 µs | 3,557 µs |
+| **No persistence** | **8.0M orders/sec** | 441 µs | 629 µs | 661 µs | 1,969 µs |
 | **Single-order latency** | 13.5K orders/sec | **73 µs** | 105 µs | 108 µs | 6,472 µs |
 | **Synchronous replication** | **2.7M orders/sec** | 1,059 µs | 1,311 µs | 1,393 µs | 1,794 µs |
 
@@ -297,18 +297,18 @@ LAN round-trip benchmarks at [`093d59e`](../../commit/093d59e). Two or three Che
 
 ### Peak-load throughput — no persistence
 
-100M order pairs, 16 clients, 384 pipelined:
+100M order pairs, 16 clients, 256 pipelined:
 
 | Metric | Value |
 |--------|-------|
-| **Throughput** | 4.5M orders/sec |
-| **p50** | 1,297 µs |
-| **p90** | 1,327 µs |
-| **p99** | 1,372 µs |
-| **p99.9** | 1,448 µs |
-| **p99.99** | 1,483 µs |
-| **p99.999** | 1,930 µs |
-| **max** | 3,557 µs |
+| **Throughput** | 8.0M orders/sec |
+| **p50** | 441 µs |
+| **p90** | 514 µs |
+| **p99** | 629 µs |
+| **p99.9** | 661 µs |
+| **p99.99** | 760 µs |
+| **p99.999** | 1,748 µs |
+| **max** | 1,969 µs |
 
 ### Single-order latency — full durability
 
