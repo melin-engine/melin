@@ -249,9 +249,14 @@ run_sweep "window" \
     "w256:--clients 16 --window 256" \
     "w512:--clients 16 --window 512"
 
-# Accounts sweep removed: seeding cost is O(accounts × instruments),
-# so 10M+ accounts take hours to seed. Needs lazy account creation
-# or fast-path seeding before this is viable.
+# 4b. Client sweep (constant total in-flight = 4096, fixed 10M orders per point)
+# Window adjusted so clients × window = 4096, isolating client count effects.
+run_sweep "clients" \
+    "c64:--clients 64 --window 64" \
+    "c128:--clients 128 --window 32" \
+    "c256:--clients 256 --window 16" \
+    "c512:--clients 512 --window 8" \
+    "c1024:--clients 1024 --window 4"
 
 # 4c. Instruments sweep (fixed clients=16, window=128)
 INST_SWEEP_DIR="${RESULTS_DIR}/sweep-instruments"
@@ -406,7 +411,7 @@ if command -v cargo &>/dev/null && [[ -f "$(dirname "$0")/../crates/bench/src/pl
     "${PLOT_TOOL}" latency-cdf -o "${PLOT_DIR}/latency-cdf.svg" \
         "${CDF_FILES[@]}" 2>&1
 
-    for sweep in window instruments; do
+    for sweep in window clients instruments; do
         dir="${RESULTS_DIR}/sweep-${sweep}"
         if [[ -d "$dir" ]] && ls "${dir}"/*.json &>/dev/null; then
             echo "  Generating sweep plot: ${sweep}..."

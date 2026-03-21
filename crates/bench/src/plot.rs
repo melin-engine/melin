@@ -593,13 +593,15 @@ fn extract_sweep_value(filename: &str) -> Option<f64> {
 }
 
 /// Extract the parameter name prefix from a filename stem.
-/// "w256.json" → "Window depth", "i100.json" → "Instruments".
+/// "w256.json" → "Window depth", "i100.json" → "Instruments", "c64.json" → "Clients".
 fn sweep_x_label(filename: &str) -> &'static str {
     let stem = filename.strip_suffix(".json").unwrap_or(filename);
     if stem.starts_with('w') {
         "Window depth"
     } else if stem.starts_with('i') {
         "Instruments"
+    } else if stem.starts_with('c') {
+        "Clients"
     } else {
         "Parameter"
     }

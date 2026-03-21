@@ -352,6 +352,10 @@ Journals verified byte-identical (BLAKE3 chain hash match, 42.6M entries).
 
 ![Saturation — window](docs/plots/saturation-window.svg)
 
+**Latency vs. client count** (fsync mode, constant 4096 total in-flight, 10M orders per point):
+
+![Saturation — clients](docs/plots/saturation-clients.svg)
+
 **Throughput vs. instrument count** (fsync mode, 16 clients, window 128):
 
 ![Saturation — instruments](docs/plots/saturation-instruments.svg)
