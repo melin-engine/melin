@@ -281,7 +281,7 @@ if [[ "$RUN_REPLICATION" == "1" && -n "$REPLICA_PUB" && -n "$REPLICA_VLAN" ]]; t
     echo ""
     echo "============================================================"
     echo "  [5] Peak throughput — full durability + sync replication"
-    echo "  100M pairs, 16 clients, window 256"
+    echo "  20M pairs, 16 clients, window 256"
     echo "============================================================"
     echo ""
 
@@ -355,7 +355,7 @@ if [[ "$RUN_REPLICATION" == "1" && -n "$REPLICA_PUB" && -n "$REPLICA_VLAN" ]]; t
             --addr ${SERVER_VLAN}:9876 \
             --key bench.key \
             --json /tmp/bench-results.json \
-            2000000 --clients 16 --window 256"
+            20000000 --clients 16 --window 256"
 
     scp $SSH_OPTS -q "${SSH_USER}@${BENCH_PUB}:/tmp/bench-results.json" "${RESULTS_DIR}/4-replication.json" 2>/dev/null || true
 
