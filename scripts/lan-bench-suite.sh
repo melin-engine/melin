@@ -55,6 +55,7 @@ REPL_PORT=9877
 RUN_FSYNC="${RUN_FSYNC:-1}"
 RUN_NOPERSIST="${RUN_NOPERSIST:-1}"
 RUN_SINGLE="${RUN_SINGLE:-1}"
+RUN_PIPELINE="${RUN_PIPELINE:-1}"
 RUN_SWEEPS="${RUN_SWEEPS:-1}"
 RUN_REPLICATION="${RUN_REPLICATION:-1}"
 RUN_PLOTS="${RUN_PLOTS:-1}"
@@ -200,6 +201,55 @@ echo ""
     -- -- 500000 --clients 1 --window 1
 
 cp /tmp/lan-bench-results.json "${RESULTS_DIR}/3-single-order.json" 2>/dev/null || true
+fi
+
+# ---------------------------------------------------------------------------
+# 4. Pipeline breakdown — engine-only and pipeline (no network)
+# ---------------------------------------------------------------------------
+if [[ "$RUN_PIPELINE" == "1" ]]; then
+
+PIPELINE_PAIRS=100000000
+PIPELINE_WINDOW=256
+
+# 4a. Engine only — matching engine without journal or network.
+# Runs on the server machine (same CPU as production benchmarks).
+echo ""
+echo "============================================================"
+echo "  Engine only — matching engine, no journal, no network"
+echo "  ${PIPELINE_PAIRS} pairs, window ${PIPELINE_WINDOW}"
+echo "============================================================"
+echo ""
+
+ssh $SSH_OPTS "$SERVER" "cd ${REPO_DIR} && source ~/.cargo/env && \
+    ./target/release/melin-bench \
+        --mode engine \
+        --json /tmp/bench-results.json \
+        ${PIPELINE_PAIRS}"
+
+scp $SSH_OPTS -q "${SSH_USER}@${SERVER_PUB}:/tmp/bench-results.json" "${RESULTS_DIR}/5-engine-only.json" 2>/dev/null || true
+
+# 4b. Pipeline (no network) — journal + matching, no TCP.
+# Uses the dedicated NVMe journal disk for realistic fsync costs.
+echo ""
+echo "============================================================"
+echo "  Pipeline — journal + matching, no network"
+echo "  ${PIPELINE_PAIRS} pairs, window ${PIPELINE_WINDOW}"
+echo "============================================================"
+echo ""
+
+JOURNAL_PATH="/mnt/journal/bench.journal"
+ssh $SSH_OPTS "$SERVER" "rm -f ${JOURNAL_PATH} ${JOURNAL_PATH}.* 2>/dev/null; true"
+
+ssh $SSH_OPTS "$SERVER" "cd ${REPO_DIR} && source ~/.cargo/env && \
+    ./target/release/melin-bench \
+        --mode pipeline \
+        --window ${PIPELINE_WINDOW} \
+        --journal ${JOURNAL_PATH} \
+        --json /tmp/bench-results.json \
+        ${PIPELINE_PAIRS}"
+
+scp $SSH_OPTS -q "${SSH_USER}@${SERVER_PUB}:/tmp/bench-results.json" "${RESULTS_DIR}/6-pipeline.json" 2>/dev/null || true
+
 fi
 
 # ---------------------------------------------------------------------------

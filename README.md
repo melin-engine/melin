@@ -279,6 +279,8 @@ LAN round-trip benchmarks at [`093d59e`](../../commit/093d59e). Two or three Che
 | **Synchronous replication** | **2.7M orders/sec** | 1,059 µs | 1,311 µs | 1,393 µs | 1,794 µs |
 | **Single-order latency** | 13.5K orders/sec | **73 µs** | 105 µs | 108 µs | 6,472 µs |
 | **No persistence** | **8.0M orders/sec** | 441 µs | 629 µs | 661 µs | 1,969 µs |
+| **Pipeline** (no network) | *TBD* | | | | |
+| **Engine only** | *TBD* | | | | |
 
 ### Peak-load throughput — full durability
 
