@@ -215,24 +215,27 @@ impl ReplicationConsumer {
 /// (one per replica sender thread).
 pub fn build_replication_ring(
     num_consumers: usize,
+    capacity: usize,
 ) -> (ReplicationProducer, Vec<ReplicationConsumer>) {
     assert!(num_consumers > 0, "need at least one consumer");
+    assert!(
+        capacity.is_power_of_two(),
+        "replication ring capacity must be a power of two, got {capacity}"
+    );
 
-    let mut builder =
-        melin_disruptor::ring::DisruptorBuilder::<ReplicationMeta>::new(REPLICATION_RING_CAPACITY);
+    let mut builder = melin_disruptor::ring::DisruptorBuilder::<ReplicationMeta>::new(capacity);
     for _ in 0..num_consumers {
         builder = builder.add_consumer();
     }
     let (inner_producer, inner_consumers) = builder.build();
 
     // Pre-allocate byte buffers — one 128 KiB chunk per ring slot.
-    // Total: 64 * 128 KiB = 8 MiB.
-    let chunks: Vec<UnsafeCell<[u8; CHUNK_SIZE]>> = (0..REPLICATION_RING_CAPACITY)
+    let chunks: Vec<UnsafeCell<[u8; CHUNK_SIZE]>> = (0..capacity)
         .map(|_| UnsafeCell::new([0u8; CHUNK_SIZE]))
         .collect();
     let buffers = Arc::new(SharedBuffers {
         chunks: chunks.into_boxed_slice(),
-        mask: (REPLICATION_RING_CAPACITY - 1) as u64,
+        mask: (capacity - 1) as u64,
     });
 
     let producer = ReplicationProducer {
@@ -259,7 +262,7 @@ mod tests {
 
     #[test]
     fn single_batch_round_trip() {
-        let (mut producer, mut consumers) = build_replication_ring(1);
+        let (mut producer, mut consumers) = build_replication_ring(1, REPLICATION_RING_CAPACITY);
         let consumer = &mut consumers[0];
 
         let data = b"hello replication ring";
@@ -275,7 +278,7 @@ mod tests {
 
     #[test]
     fn multiple_batches() {
-        let (mut producer, mut consumers) = build_replication_ring(1);
+        let (mut producer, mut consumers) = build_replication_ring(1, REPLICATION_RING_CAPACITY);
         let consumer = &mut consumers[0];
 
         for i in 0..10u64 {
@@ -296,7 +299,7 @@ mod tests {
 
     #[test]
     fn two_consumers_independent_progress() {
-        let (mut producer, mut consumers) = build_replication_ring(2);
+        let (mut producer, mut consumers) = build_replication_ring(2, REPLICATION_RING_CAPACITY);
         let mut c1 = consumers.pop().unwrap();
         let mut c0 = consumers.pop().unwrap();
 
@@ -327,7 +330,7 @@ mod tests {
 
     #[test]
     fn large_batch_fills_chunk() {
-        let (mut producer, mut consumers) = build_replication_ring(1);
+        let (mut producer, mut consumers) = build_replication_ring(1, REPLICATION_RING_CAPACITY);
         let consumer = &mut consumers[0];
 
         let data = vec![0xFFu8; CHUNK_SIZE];
@@ -343,7 +346,7 @@ mod tests {
 
     #[test]
     fn wrap_around() {
-        let (mut producer, mut consumers) = build_replication_ring(1);
+        let (mut producer, mut consumers) = build_replication_ring(1, REPLICATION_RING_CAPACITY);
         let consumer = &mut consumers[0];
 
         for i in 0..REPLICATION_RING_CAPACITY as u64 * 3 {
@@ -358,7 +361,7 @@ mod tests {
 
     #[test]
     fn concurrent_producer_consumer() {
-        let (mut producer, mut consumers) = build_replication_ring(1);
+        let (mut producer, mut consumers) = build_replication_ring(1, REPLICATION_RING_CAPACITY);
         let mut consumer = consumers.pop().unwrap();
 
         let count = 10_000u64;

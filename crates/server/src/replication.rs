@@ -58,9 +58,6 @@ const MAX_CONTROL_FRAME: usize = 256;
 /// at ~80 bytes each = ~80 KiB, plus header overhead.
 const MAX_DATA_FRAME: usize = 256 * 1024;
 
-/// Heartbeat interval for the replication connection (5 seconds).
-const HEARTBEAT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
-
 // --- Wire protocol encode/decode ---
 
 /// Handshake message sent by the replica on connection.
@@ -328,6 +325,7 @@ pub fn run_sender(
     shutdown: &AtomicBool,
     replica_ready: &AtomicBool,
     batch_size: usize,
+    heartbeat_secs: u64,
 ) {
     let listener = match TcpListener::bind(bind_addr) {
         Ok(l) => l,
@@ -389,6 +387,7 @@ pub fn run_sender(
             &genesis_entry,
             shutdown,
             batch_size,
+            heartbeat_secs,
         ) {
             Ok(()) => warn!("replica disconnected cleanly"),
             Err(e) => warn!(error = %e, "replica connection error"),
@@ -417,6 +416,7 @@ fn handle_replica_connection(
     genesis_entry: &[u8],
     shutdown: &AtomicBool,
     batch_size: usize,
+    heartbeat_secs: u64,
 ) -> io::Result<()> {
     let mut reader = stream.try_clone()?;
     let mut writer = stream;
@@ -476,6 +476,7 @@ fn handle_replica_connection(
     // Events after that will gate until the replica acks them.
     replication_cursor.store(handshake.last_sequence + 1, Ordering::Release);
 
+    let heartbeat_interval = std::time::Duration::from_secs(heartbeat_secs);
     let mut last_send = std::time::Instant::now();
     let mut last_sequence = handshake.last_sequence;
     let mut last_chain_hash = handshake.chain_hash;
@@ -535,7 +536,7 @@ fn handle_replica_connection(
             last_send = std::time::Instant::now();
         } else {
             // No batch available — send heartbeat if idle.
-            if last_send.elapsed() >= HEARTBEAT_INTERVAL {
+            if last_send.elapsed() >= heartbeat_interval {
                 encode_heartbeat(last_sequence, &last_chain_hash, &mut send_buf);
                 if let Err(e) = writer.write_all(&send_buf) {
                     return Err(io::Error::other(format!("write Heartbeat: {e}")));

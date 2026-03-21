@@ -121,6 +121,24 @@ pub struct ServerConfig {
     /// but increase per-write latency. Default: 32.
     #[arg(long, default_value_t = 32)]
     pub replication_batch_size: usize,
+
+    /// Maximum events per journal fsync batch. Smaller values reduce
+    /// tail latency (less work per sync), larger values improve throughput
+    /// (fewer fsyncs). Default: 1024.
+    #[arg(long, default_value_t = 1024)]
+    pub max_journal_batch: usize,
+
+    /// Replication heartbeat interval in seconds. The primary sends a
+    /// heartbeat to the replica after this many seconds of idle. Used
+    /// for disconnect detection. Default: 5.
+    #[arg(long, default_value_t = 5)]
+    pub replication_heartbeat_secs: u64,
+
+    /// Number of slots in the replication ring buffer. Must be a power
+    /// of two. Each slot holds up to 128 KiB. More slots = more buffering
+    /// before the journal stage backpressures. Default: 256 (32 MiB).
+    #[arg(long, default_value_t = 256)]
+    pub replication_ring_size: usize,
 }
 
 impl Default for ServerConfig {
@@ -144,6 +162,9 @@ impl Default for ServerConfig {
             standalone: false,
             replica_of: None,
             replication_batch_size: 32,
+            max_journal_batch: 1024,
+            replication_heartbeat_secs: 5,
+            replication_ring_size: 256,
         }
     }
 }
@@ -301,6 +322,8 @@ pub fn run_with_shutdown<L: BlockingTransportListener>(
         config.group_commit_delay(),
         Arc::clone(&active_connections),
         enable_replication,
+        config.max_journal_batch,
+        config.replication_ring_size,
     );
 
     // Control channel for connect/disconnect events → response stage.
@@ -402,6 +425,7 @@ pub fn run_with_shutdown<L: BlockingTransportListener>(
         let ready_flag = Arc::clone(&replica_ready);
 
         let batch_size = config.replication_batch_size;
+        let heartbeat_secs = config.replication_heartbeat_secs;
         let repl_sender_handle = std::thread::Builder::new()
             .name("repl-sender".into())
             .spawn(move || {
@@ -413,6 +437,7 @@ pub fn run_with_shutdown<L: BlockingTransportListener>(
                     &s_repl,
                     &ready_flag,
                     batch_size,
+                    heartbeat_secs,
                 );
             })
             .expect("failed to spawn replication sender thread");

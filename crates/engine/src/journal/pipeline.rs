@@ -169,6 +169,9 @@ pub struct JournalStage {
     /// Only read when fsync is enabled (not `no-fsync` feature).
     #[cfg_attr(feature = "no-fsync", allow(dead_code))]
     group_commit_delay: Duration,
+    /// Maximum events per journal fsync batch. Capped at MAX_JOURNAL_BATCH
+    /// (the stack array size). Smaller values reduce tail latency.
+    max_batch: usize,
     /// Optional replication ring producer. When `Some`, the journal stage
     /// copies encoded batch bytes into a pre-allocated ring slot after each
     /// `flush_batch_sync()`. No heap allocation — just a memcpy into the
@@ -187,11 +190,13 @@ impl JournalStage {
         writer: JournalWriter,
         consumer: ring::Consumer<InputSlot>,
         group_commit_delay: Duration,
+        max_batch: usize,
     ) -> Self {
         Self {
             writer,
             consumer,
             group_commit_delay,
+            max_batch: max_batch.min(MAX_JOURNAL_BATCH),
             replication_producer: None,
         }
     }
@@ -349,7 +354,7 @@ impl JournalStage {
             // Sync when: we have data AND (batch full OR delay expired OR no delay).
             if pending > 0 {
                 #[cfg(not(feature = "no-fsync"))]
-                let should_sync = pending >= MAX_JOURNAL_BATCH
+                let should_sync = pending >= self.max_batch
                     || delay.is_zero()
                     || first_write_ts.is_some_and(|ts| ts.elapsed() >= delay);
                 #[cfg(feature = "no-fsync")]
@@ -613,7 +618,7 @@ impl JournalStage {
                 // continue accumulating — the CQE reap at the top of the
                 // loop will free the slot, and the NEXT iteration submits.
                 let slot_free = inflight.is_none();
-                let batch_full = pending >= MAX_JOURNAL_BATCH;
+                let batch_full = pending >= self.max_batch;
                 let delay_expired =
                     delay.is_zero() || first_write_ts.is_some_and(|ts| ts.elapsed() >= delay);
 
@@ -1105,6 +1110,8 @@ pub fn build_pipeline(
         group_commit_delay,
         active_connections,
         false,
+        MAX_JOURNAL_BATCH,
+        crate::journal::replication::REPLICATION_RING_CAPACITY,
     );
     (
         producer,
@@ -1134,6 +1141,8 @@ pub fn build_pipeline_with_replication(
     group_commit_delay: Duration,
     active_connections: Arc<AtomicU64>,
     enable_replication: bool,
+    max_journal_batch: usize,
+    replication_ring_size: usize,
 ) -> (
     ring::MultiProducer<InputSlot>,
     JournalStage,
@@ -1170,12 +1179,18 @@ pub fn build_pipeline_with_replication(
 
     let events_processed = Arc::new(AtomicU64::new(0));
 
-    let mut journal_stage = JournalStage::new(writer, journal_consumer, group_commit_delay);
+    let mut journal_stage = JournalStage::new(
+        writer,
+        journal_consumer,
+        group_commit_delay,
+        max_journal_batch,
+    );
 
-    // Build the replication ring if enabled. 64 slots × 128 KiB = 8 MiB
-    // of pre-allocated buffers. Single consumer for v1 (one replica).
+    // Build the replication ring if enabled. Each slot holds up to 128 KiB.
+    // Single consumer for v1 (one replica).
     let replication_consumer = if enable_replication {
-        let (producer, mut ring_consumers) = crate::journal::replication::build_replication_ring(1);
+        let (producer, mut ring_consumers) =
+            crate::journal::replication::build_replication_ring(1, replication_ring_size);
         journal_stage.set_replication_producer(producer);
         Some(ring_consumers.pop().expect("replication consumer"))
     } else {
@@ -1215,6 +1230,7 @@ pub fn build_pipeline_with_replication(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::journal::replication::REPLICATION_RING_CAPACITY;
     use crate::types::*;
     use std::num::NonZeroU64;
     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -1246,7 +1262,7 @@ mod tests {
             .build();
 
         let consumer = consumers.pop().unwrap();
-        let stage = JournalStage::new(writer, consumer, Duration::ZERO);
+        let stage = JournalStage::new(writer, consumer, Duration::ZERO, MAX_JOURNAL_BATCH);
 
         let shutdown = Arc::new(AtomicBool::new(false));
         let shutdown2 = Arc::clone(&shutdown);
@@ -1478,7 +1494,15 @@ mod tests {
             _events_processed,
             replication_rx,
             replication_cursor,
-        ) = build_pipeline_with_replication(exchange, writer, Duration::ZERO, active_conns, true);
+        ) = build_pipeline_with_replication(
+            exchange,
+            writer,
+            Duration::ZERO,
+            active_conns,
+            true,
+            MAX_JOURNAL_BATCH,
+            REPLICATION_RING_CAPACITY,
+        );
 
         let mut repl_consumer = replication_rx.expect("replication should be enabled");
 
@@ -1615,6 +1639,8 @@ mod tests {
                     Duration::ZERO,
                     active_conns,
                     false,
+                    MAX_JOURNAL_BATCH,
+                    REPLICATION_RING_CAPACITY,
                 );
             assert!(replication.is_none());
             assert_eq!(replication_cursor.load(Ordering::Relaxed), u64::MAX);
@@ -1634,6 +1660,8 @@ mod tests {
                     Duration::ZERO,
                     active_conns,
                     true,
+                    MAX_JOURNAL_BATCH,
+                    REPLICATION_RING_CAPACITY,
                 );
             assert!(replication.is_some());
             assert_eq!(
