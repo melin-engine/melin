@@ -106,10 +106,19 @@ fi
 echo ""
 
 # ---------------------------------------------------------------------------
-# 3. Kernel boot parameters (isolcpus + nohz_full + rcu_nocbs)
+# 3. Kernel boot parameters
 # ---------------------------------------------------------------------------
+# Core isolation, tick suppression, and latency tuning — all persistent
+# across reboots via GRUB.
+#   isolcpus/nohz_full/rcu_nocbs: isolate cores 1-6 from scheduler/timers/RCU
+#   nmi_watchdog=0: disable NMI watchdog (eliminates periodic NMI interrupts)
+#   transparent_hugepage=never: disable THP (khugepaged compaction causes 1-4ms stalls)
+#   cpufreq.default_governor=performance: lock max CPU frequency (no scaling transitions)
+#   processor.max_cstate=1: prevent deep C-states (C2+ wakeup costs 10-100µs)
+#   skew_tick=1: offset timer ticks across cores to reduce kernel lock contention
+#   nosmt: disable hyperthreading — prevents HT siblings from polluting L1/L2 on pipeline cores
 GRUB_FILE="/etc/default/grub"
-BENCH_PARAMS="isolcpus=nohz,domain,1-6 nohz_full=1-6 rcu_nocbs=1-6"
+BENCH_PARAMS="isolcpus=nohz,domain,1-6 nohz_full=1-6 rcu_nocbs=1-6 nmi_watchdog=0 transparent_hugepage=never cpufreq.default_governor=performance processor.max_cstate=1 skew_tick=1 nosmt"
 
 if [[ -f "$GRUB_FILE" ]]; then
     if grep -q "isolcpus" "$GRUB_FILE" 2>/dev/null; then
@@ -128,6 +137,46 @@ if [[ -f "$GRUB_FILE" ]]; then
 else
     echo "=== No GRUB config found, skipping kernel boot params ==="
 fi
+
+echo ""
+
+# ---------------------------------------------------------------------------
+# 3b. Disable noisy background services
+# ---------------------------------------------------------------------------
+# These services wake up periodically on random cores, causing latency
+# spikes via context switches, IPI interrupts, or disk I/O on pipeline
+# cores. Disabling them is safe on single-purpose benchmark servers.
+echo "=== Disabling background services ==="
+for svc in irqbalance unattended-upgrades multipathd smartd cron; do
+    if systemctl is-active --quiet "$svc" 2>/dev/null; then
+        systemctl stop "$svc"
+        systemctl disable "$svc"
+        echo "  $svc → stopped and disabled"
+    elif systemctl is-enabled --quiet "$svc" 2>/dev/null; then
+        systemctl disable "$svc"
+        echo "  $svc → disabled (was not running)"
+    else
+        echo "  $svc → not present"
+    fi
+done
+
+echo ""
+
+# ---------------------------------------------------------------------------
+# 3c. Sysctl tuning (persistent via /etc/sysctl.d/)
+# ---------------------------------------------------------------------------
+echo "=== Configuring sysctl ==="
+SYSCTL_FILE="/etc/sysctl.d/99-melin-bench.conf"
+cat > "$SYSCTL_FILE" << 'EOF'
+# Melin exchange engine — latency tuning.
+# Never swap — a single page-in is ~1ms.
+vm.swappiness = 0
+# Disable automatic NUMA page migration. The balancing scanner wakes up
+# periodically and can stall cores. Single-socket servers don't benefit.
+kernel.numa_balancing = 0
+EOF
+sysctl --system --quiet
+echo "  Written $SYSCTL_FILE (vm.swappiness=0, kernel.numa_balancing=0)"
 
 echo ""
 
