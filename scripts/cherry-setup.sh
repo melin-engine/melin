@@ -126,20 +126,42 @@ echo ""
 #   nosmt: disable hyperthreading — prevents HT siblings from polluting L1/L2 on pipeline cores
 GRUB_FILE="/etc/default/grub"
 BENCH_PARAMS="isolcpus=nohz,domain,1-6 nohz_full=1-6 rcu_nocbs=1-6 nmi_watchdog=0 transparent_hugepage=never cpufreq.default_governor=performance processor.max_cstate=1 skew_tick=1 nosmt"
+# IOMMU passthrough for DPDK SR-IOV (vfio-pci). Works on both AMD and Intel.
+# amd_iommu/intel_iommu enables the IOMMU; iommu=pt sets passthrough mode
+# so DMA bypasses the IOMMU translation for performance.
+IOMMU_PARAMS="iommu=pt"
 
 if [[ -f "$GRUB_FILE" ]]; then
-    if grep -q "isolcpus" "$GRUB_FILE" 2>/dev/null; then
+    NEEDS_UPDATE=0
+
+    if ! grep -q "isolcpus" "$GRUB_FILE" 2>/dev/null; then
+        echo "=== Adding kernel boot parameters ==="
+        echo "  Adding: $BENCH_PARAMS"
+        NEEDS_UPDATE=1
+    fi
+
+    if ! grep -q "iommu=pt" "$GRUB_FILE" 2>/dev/null; then
+        echo "  Adding IOMMU passthrough for DPDK: $IOMMU_PARAMS"
+        NEEDS_UPDATE=1
+    fi
+
+    if [[ "$NEEDS_UPDATE" -eq 1 ]]; then
+        cp "$GRUB_FILE" "${GRUB_FILE}.bak"
+        # Build the full param string from what's missing.
+        ADD_PARAMS=""
+        if ! grep -q "isolcpus" "$GRUB_FILE" 2>/dev/null; then
+            ADD_PARAMS="$BENCH_PARAMS"
+        fi
+        if ! grep -q "iommu=pt" "$GRUB_FILE" 2>/dev/null; then
+            ADD_PARAMS="$ADD_PARAMS $IOMMU_PARAMS"
+        fi
+        sed -i "s/^GRUB_CMDLINE_LINUX_DEFAULT=\"\(.*\)\"/GRUB_CMDLINE_LINUX_DEFAULT=\"\1 $ADD_PARAMS\"/" "$GRUB_FILE"
+        update-grub
+        touch /tmp/.cherry-needs-reboot
+        echo "  *** REBOOT REQUIRED for new kernel params to take effect ***"
+    else
         echo "=== Kernel boot params already configured ==="
         grep "GRUB_CMDLINE_LINUX_DEFAULT" "$GRUB_FILE"
-    else
-        echo "=== Configuring kernel boot parameters ==="
-        echo "  Adding: $BENCH_PARAMS"
-        cp "$GRUB_FILE" "${GRUB_FILE}.bak"
-        sed -i "s/^GRUB_CMDLINE_LINUX_DEFAULT=\"\(.*\)\"/GRUB_CMDLINE_LINUX_DEFAULT=\"\1 $BENCH_PARAMS\"/" "$GRUB_FILE"
-        update-grub
-        # Signal to cherry-deploy.sh that a reboot is needed.
-        touch /tmp/.cherry-needs-reboot
-        echo "  *** REBOOT REQUIRED for isolcpus to take effect ***"
     fi
 else
     echo "=== No GRUB config found, skipping kernel boot params ==="
