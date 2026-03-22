@@ -122,7 +122,6 @@ LAN benchmark at `66fed71` (two or three Cherry AMD Ryzen 9950X servers, SMT dis
 - **Single-order latency**: 78 µs p50 (1 client, no pipelining, full durability)
 - **With fsync + sync replication**: 3.7M orders/sec, p50 = 984 µs, p99.9 = 1332 µs, max = 2482 µs
 - **Engine only**: 12.9M orders/sec, p50 = 50 ns
-- **Pipeline (no network)**: 1.9M orders/sec, p50 = 16 µs
 
 ### Current bottleneck: TCP network stack
 
@@ -130,7 +129,6 @@ The TCP stack (syscalls, kernel buffers, io_uring send/recv overhead) is the pri
 
 Pipeline layer breakdown (Cherry LAN, `66fed71`):
 - **Engine only**: 12.9M/s, p50=50ns — matching engine has ~3x headroom
-- **Pipeline (no network)**: 1.9M/s, p50=16µs — journal fsync is the primary gate
 - **TCP + fsync**: 4.0M/s, p50=971µs — pipelining hides fsync latency at high window depths
 - **TCP no-persist**: 10.0M/s, p50=762µs (window 512) — removing fsync unlocks 2.5x throughput
 

@@ -276,7 +276,6 @@ LAN round-trip benchmarks at [`66fed71`](../../commit/66fed71). Two or three Che
 | **Synchronous replication** | **3.7M orders/sec** | 984 µs | 1,265 µs | 1,332 µs | 2,482 µs |
 | **Single-order latency** | 12.2K orders/sec | **78 µs** | 110 µs | 112 µs | 1,215 µs |
 | **No persistence** | **10.0M orders/sec** | 762 µs | 909 µs | 1,015 µs | 2,767 µs |
-| **Pipeline** (no network) | **1.9M orders/sec** | 16 µs | 523 µs | 532 µs | 6,767 µs |
 | **Engine only** | **12.9M orders/sec** | 0.05 µs | 0.20 µs | 0.47 µs | 400 µs |
 
 ### Peak-load throughput — full durability
@@ -340,18 +339,6 @@ Journals verified byte-identical (BLAKE3 chain hash match, 202.6M entries).
 | **p99.99** | 1,050 µs |
 | **p99.999** | 2,208 µs |
 | **max** | 2,767 µs |
-
-### Pipeline layer breakdown
-
-Engine-only and pipeline benchmarks run on the server machine (same CPU as production benchmarks). Pipeline uses the dedicated NVMe journal disk.
-
-| Layer | Throughput | p50 | p99.9 | Notes |
-|-------|-----------|-----|-------|-------|
-| **Engine only** | 12.9M/s | 0.05 µs | 0.47 µs | Matching engine, no journal or network |
-| **Pipeline** (no network) | 1.9M/s | 16 µs | 532 µs | Journal + matching, no TCP |
-| **Full durability** (TCP) | 4.0M/s | 971 µs | 1,083 µs | End-to-end with fsync |
-
-The matching engine has ~3x headroom over the end-to-end pipeline. The journal fsync stage is the primary throughput gate; TCP network overhead adds latency but not throughput cost at this load.
 
 ### Plots
 
