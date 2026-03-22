@@ -175,6 +175,18 @@ vm.swappiness = 0
 # periodically and can stall cores. Single-socket servers don't benefit.
 kernel.numa_balancing = 0
 EOF
+# Raise the system-wide max file descriptor limit. The default (1024) is
+# too low for client-sweep benchmarks: 512 clients × 2 fds (stream +
+# clone) + server-side accept fds + journal/io_uring fds ≈ 1500+.
+LIMITS_FILE="/etc/security/limits.d/99-melin-bench.conf"
+cat > "$LIMITS_FILE" << 'EOF'
+# Melin benchmark — raise fd limits for high client counts.
+*    soft nofile 65536
+*    hard nofile 65536
+root soft nofile 65536
+root hard nofile 65536
+EOF
+echo "  Written $LIMITS_FILE (nofile=65536)"
 sysctl --system --quiet
 echo "  Written $SYSCTL_FILE (vm.swappiness=0, kernel.numa_balancing=0)"
 

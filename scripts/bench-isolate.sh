@@ -92,6 +92,9 @@ trap restore EXIT
 
 # --- Apply optimizations ---
 
+# Raise fd limit for high client-count benchmarks (512 clients × 2 fds each).
+ulimit -n 65536
+
 echo "=== Applying latency optimizations ==="
 
 # 1. CPU governor → performance (eliminates frequency scaling stalls).
