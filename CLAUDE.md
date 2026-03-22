@@ -72,19 +72,26 @@ DPDK kernel-bypass networking at the transport edge — bypasses the Linux kerne
 - Core pinning for DPDK poll thread (`--dpdk-core`, default 7)
 - CLI args: `--dpdk-eal-args`, `--dpdk-port`, `--dpdk-ip`, `--dpdk-prefix-len`, `--dpdk-gateway`, `--dpdk-core`
 - Smoke test passes end-to-end via TAP virtual device (p50=17µs)
+- DPDK bench client (`crates/bench/src/dpdk.rs`): smoltcp outbound connections, non-blocking auth, pipelined send/recv
 - 35 unit tests (frame parsing, request mapping, shared request module)
-- SR-IOV setup script for Intel E810 (`scripts/dpdk-setup.sh`)
+- SR-IOV setup script auto-detects bond slaves, PCI addresses, VLAN ID (`scripts/dpdk-setup.sh`)
 - Shared `request.rs` module eliminates request processing duplication across all 3 transport backends
+- **Validated on real hardware**: Intel X710 SR-IOV VF on Cherry Servers (Ubuntu 24.04, AMD EPYC). DPDK `net_iavf` driver probes the VF, smoltcp listens on the VLAN IP. Server starts and accepts connections.
+
+**Server requirements for DPDK SR-IOV:**
+- NIC must expose SR-IOV PCI capability. Check before renting:
+  `lspci | grep -i ethernet; find /sys/bus/pci/devices/ -name sriov_totalvfs -exec sh -c 'echo "$(basename $(dirname {})): $(cat {})"' \;`
+- If `sriov_totalvfs` shows a number > 0, the NIC works. The model matters less than whether SR-IOV is exposed.
+- Ubuntu 24.04's HWE kernel (6.14) and GA kernel (6.8) both work with Intel X710 SR-IOV.
+- Ubuntu 24.04's kernels do NOT have SR-IOV for Intel E810-XXV SFP (tested, confirmed missing).
+- Debian Trixie's ice module lacks SR-IOV entirely. Don't use Debian for DPDK.
+- Two servers on the same VLAN required for benchmarking — switches don't hairpin traffic to the same server.
 
 **Known gaps (not yet implemented):**
-- **Cargo.lock for dpdk crate**: excluded from workspace, dependencies unpinned. First build on a new machine may pull different versions.
-- **Unused reader config in DPDK mode**: `--readers` and `--reader-cores` CLI args are accepted but ignored when DPDK is enabled.
 - **No idle connection timeout**: authenticated connections have no timeout (epoll/uring path uses `--connection-timeout-secs`). Dead connections rely on smoltcp TCP keepalive.
 - **No `max_connections` enforcement**: the DPDK poll loop accepts all connections without checking the limit.
 - **`active_connections` counter not wired**: counter exists but is never incremented/decremented, breaking stats queries and `--max-connections`.
-- **Bindgen warnings in release builds**: `unsafe_op_in_unsafe_fn` warnings from generated code in `OUT_DIR` leak through despite suppression in `ffi.rs`.
-- **Not tested on x86_64**: built and tested on aarch64 only. Cherry servers (AMD x86_64) may produce different bindgen output.
-- **ARP untested on real hardware**: smoltcp handles ARP but only validated over TAP (point-to-point, no real ARP needed).
+- **Hugepage mount not automated in dpdk-setup.sh**: must manually `mount -t hugetlbfs -o pagesize=2M nodev /mnt/huge_2m` before starting.
 
 ## Dead Ends / Investigated & Rejected
 
