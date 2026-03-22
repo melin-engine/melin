@@ -33,9 +33,6 @@ use crate::{TimeSeries, maybe_sample, print_results, spawn_progress_reporter};
 /// frames in flight.
 const SOCKET_BUF_SIZE: usize = 65536;
 
-/// Maximum frame payload size (matches protocol).
-const MAX_FRAME_SIZE: usize = 1024;
-
 /// How often to refresh the smoltcp timestamp (poll iterations).
 const TIMESTAMP_REFRESH_INTERVAL: u32 = 100;
 
@@ -71,6 +68,7 @@ pub struct DpdkBenchConfig {
 }
 
 /// Run the DPDK roundtrip benchmark.
+#[allow(clippy::too_many_arguments)]
 pub fn run_dpdk_roundtrip(
     config: DpdkBenchConfig,
     total_pairs: usize,
@@ -230,7 +228,7 @@ pub fn run_dpdk_roundtrip(
 
         connections.push(DpdkBenchConn {
             handle,
-            parse_buf: Vec::with_capacity(MAX_FRAME_SIZE + 4),
+            parse_buf: Vec::with_capacity(1028), // MAX_FRAME_SIZE (1024) + 4-byte length prefix
             frames,
             send_cursor: 0,
             send_pending: Vec::new(),
@@ -326,8 +324,10 @@ pub fn run_dpdk_roundtrip(
 
             // --- Send: fill the window ---
             // First, drain any pending partial send.
-            if !conn.send_pending.is_empty() && socket.can_send() {
-                let sent = socket.send_slice(&conn.send_pending).unwrap_or(0);
+            if !conn.send_pending.is_empty()
+                && socket.can_send()
+                && let Ok(sent) = socket.send_slice(&conn.send_pending)
+            {
                 if sent >= conn.send_pending.len() {
                     conn.send_pending.clear();
                 } else if sent > 0 {
@@ -344,7 +344,13 @@ pub fn run_dpdk_roundtrip(
                 && socket.can_send()
             {
                 let frame = &conn.frames[conn.send_cursor];
-                let sent = socket.send_slice(frame).unwrap_or(0);
+                let sent = match socket.send_slice(frame) {
+                    Ok(n) => n,
+                    Err(_) => break, // Socket error — stop sending.
+                };
+                if sent == 0 {
+                    break; // TX buffer full despite can_send() — retry next poll.
+                }
                 if sent < frame.len() {
                     // Partial send — buffer the remainder.
                     conn.send_pending.extend_from_slice(&frame[sent..]);
@@ -355,11 +361,10 @@ pub fn run_dpdk_roundtrip(
 
             // --- Recv: drain all available data from smoltcp socket ---
             while socket.can_recv() {
-                let n = socket.recv_slice(&mut recv_buf).unwrap_or(0);
-                if n == 0 {
-                    break;
+                match socket.recv_slice(&mut recv_buf) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => conn.parse_buf.extend_from_slice(&recv_buf[..n]),
                 }
-                conn.parse_buf.extend_from_slice(&recv_buf[..n]);
             }
 
             // Parse frames from parse_buf.
@@ -377,34 +382,34 @@ pub fn run_dpdk_roundtrip(
                 }
 
                 let payload = &conn.parse_buf[cursor + 4..cursor + 4 + frame_len];
-                if let Ok(response) = codec::decode_response(payload) {
-                    if matches!(response, ResponseKind::BatchEnd) {
-                        conn.batch_count += 1;
-                        progress.fetch_add(1, Ordering::Relaxed);
+                if let Ok(response) = codec::decode_response(payload)
+                    && matches!(response, ResponseKind::BatchEnd)
+                {
+                    conn.batch_count += 1;
+                    progress.fetch_add(1, Ordering::Relaxed);
 
-                        if conn.batch_count > warmup {
-                            if measured_start.is_none() {
-                                measured_start = Some(Instant::now());
-                            }
-                            if let Some(send_ts) = conn.inflight_ts.pop_front() {
-                                let latency_ns = send_ts.elapsed().as_nanos() as u64;
-                                histogram.record(latency_ns).ok();
-                                interval_hist.record(latency_ns).ok();
-                                interval_count += 1;
-                                maybe_sample(
-                                    &mut interval_hist,
-                                    &mut interval_count,
-                                    &mut series,
-                                    start,
-                                );
-                            }
-                        } else {
-                            conn.inflight_ts.pop_front();
+                    if conn.batch_count > warmup {
+                        if measured_start.is_none() {
+                            measured_start = Some(Instant::now());
                         }
+                        if let Some(send_ts) = conn.inflight_ts.pop_front() {
+                            let latency_ns = send_ts.elapsed().as_nanos() as u64;
+                            histogram.record(latency_ns).ok();
+                            interval_hist.record(latency_ns).ok();
+                            interval_count += 1;
+                            maybe_sample(
+                                &mut interval_hist,
+                                &mut interval_count,
+                                &mut series,
+                                start,
+                            );
+                        }
+                    } else {
+                        conn.inflight_ts.pop_front();
+                    }
 
-                        if conn.batch_count >= conn.total_orders {
-                            conn.done = true;
-                        }
+                    if conn.batch_count >= conn.total_orders {
+                        conn.done = true;
                     }
                 }
 
