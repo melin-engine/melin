@@ -950,6 +950,31 @@ fn connect_uds(path: &std::path::Path) -> std::os::unix::net::UnixStream {
     panic!("failed to connect after 50 attempts: {}", last_err.unwrap());
 }
 
+/// Pre-encoded heartbeat wire frame (length prefix + tag). Used during setup
+/// to keep already-connected clients alive while remaining clients connect.
+/// The server's idle timeout (default 30s) would otherwise drop early
+/// connections during slow setup phases (e.g., 512 clients × ~100ms each).
+fn heartbeat_frame() -> [u8; 5] {
+    let mut buf = [0u8; 128];
+    let n = codec::encode_request(&melin_protocol::message::Request::Heartbeat, &mut buf)
+        .expect("encode heartbeat");
+    let mut frame = [0u8; 5];
+    frame.copy_from_slice(&buf[..n]);
+    frame
+}
+
+/// Send a heartbeat on every established connection to reset the server's
+/// idle timer. Uses raw `write(2)` on the write fd — sockets are still in
+/// blocking mode during setup, so the small 5-byte write completes
+/// immediately.
+fn keepalive_established(write_fds: &[RawFd], heartbeat: &[u8; 5]) {
+    for &fd in write_fds {
+        unsafe {
+            libc::write(fd, heartbeat.as_ptr().cast(), heartbeat.len());
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Per-connection state
 // ---------------------------------------------------------------------------
@@ -1309,14 +1334,27 @@ fn run_epoll_roundtrip<R, W, F>(
     let num_threads = bench_threads.min(num_clients);
     let mut thread_conns: Vec<Vec<BenchConnection<W>>> =
         (0..num_threads).map(|_| Vec::new()).collect();
+    let heartbeat = heartbeat_frame();
+    // Track write fds for keepalive heartbeats during setup.
+    let mut write_fds: Vec<RawFd> = Vec::with_capacity(num_clients);
+    let mut last_keepalive = Instant::now();
 
     for client_id in 0..num_clients {
+        // Send heartbeats on all established connections every 10s to
+        // prevent the server's 30s idle timeout from dropping them.
+        if last_keepalive.elapsed() >= Duration::from_secs(10) {
+            keepalive_established(&write_fds, &heartbeat);
+            last_keepalive = Instant::now();
+        }
+
         let (mut read_stream, write_stream) = connect();
 
         // Challenge-response auth while the socket is still blocking.
         auth_handshake(&mut read_stream, key);
 
         let fd = read_stream.as_raw_fd();
+        let write_fd = write_stream.as_raw_fd();
+        write_fds.push(write_fd);
         let writer = BlockingFrameWriter::new(write_stream);
 
         // Set non-blocking on the read fd.
@@ -1539,8 +1577,19 @@ fn run_uring_roundtrip<R, W, F>(
 
     let mut connections: Vec<UringBenchConn> = Vec::with_capacity(num_clients);
     let setup_start = Instant::now();
+    let heartbeat = heartbeat_frame();
+    // Track write fds for keepalive heartbeats during setup.
+    let mut write_fds: Vec<RawFd> = Vec::with_capacity(num_clients);
+    let mut last_keepalive = Instant::now();
 
     for client_id in 0..num_clients {
+        // Send heartbeats on all established connections every 10s to
+        // prevent the server's 30s idle timeout from dropping them.
+        if last_keepalive.elapsed() >= Duration::from_secs(10) {
+            keepalive_established(&write_fds, &heartbeat);
+            last_keepalive = Instant::now();
+        }
+
         let (mut read_stream, write_stream) = connect();
 
         // Challenge-response auth while the socket is still blocking.
@@ -1548,6 +1597,7 @@ fn run_uring_roundtrip<R, W, F>(
 
         let read_fd = read_stream.as_raw_fd();
         let write_fd = write_stream.as_raw_fd();
+        write_fds.push(write_fd);
 
         let client_pairs = if client_id == num_clients - 1 {
             pairs_per_client + remainder
