@@ -5,17 +5,21 @@
 //! and `bindgen` to produce this file. Only the subset of DPDK we need is
 //! exposed (EAL, mempool, ethdev, mbuf).
 
-#![allow(
+// Suppress warnings from bindgen-generated code. These are applied at
+// the module level so they cover everything in the included file.
+#[allow(
     non_upper_case_globals,
     non_camel_case_types,
     non_snake_case,
     dead_code,
     unsafe_op_in_unsafe_fn,
-    // bindgen sometimes generates types that trigger these.
     clippy::useless_transmute,
     clippy::unnecessary_cast,
     clippy::too_many_arguments,
-    clippy::ptr_offset_with_cast,
+    clippy::ptr_offset_with_cast
 )]
+mod bindings {
+    include!(concat!(env!("OUT_DIR"), "/dpdk_bindings.rs"));
+}
 
-include!(concat!(env!("OUT_DIR"), "/dpdk_bindings.rs"));
+pub use bindings::*;

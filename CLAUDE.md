@@ -56,6 +56,36 @@ cargo fmt            # format
 
 See [README.md](README.md#features) for the full feature checklist and roadmap.
 
+## In Progress
+
+### DPDK kernel-bypass transport (`feat/dpdk-transport` branch)
+
+**Date**: 2026-03-22 | **Feature flag**: `--features dpdk` (compile-time, replaces io-uring/epoll transport)
+
+DPDK kernel-bypass networking at the transport edge — bypasses the Linux kernel TCP stack entirely. Uses DPDK for NIC I/O (`rx_burst`/`tx_burst`) and smoltcp for userspace TCP processing. The engine pipeline is completely unaware of DPDK.
+
+**What works:**
+- Full transport layer: `crates/dpdk/` (EAL, mempool, port, smoltcp Device, C wrappers for inline DPDK functions)
+- DPDK poll thread replaces epoll reader pool: NIC polling, smoltcp TCP, frame decode, disruptor publish
+- Separate DPDK response stage: encodes to mpsc TX channel, DPDK poll thread drains into smoltcp sockets
+- Non-blocking Ed25519 auth handshake state machine (Challenge → ChallengeResponse → ServerReady)
+- Core pinning for DPDK poll thread (`--dpdk-core`, default 7)
+- CLI args: `--dpdk-eal-args`, `--dpdk-port`, `--dpdk-ip`, `--dpdk-prefix-len`, `--dpdk-gateway`, `--dpdk-core`
+- Smoke test passes end-to-end via TAP virtual device (p50=17µs)
+- 35 unit tests (frame parsing, request mapping, shared request module)
+- SR-IOV setup script for Intel E810 (`scripts/dpdk-setup.sh`)
+- Shared `request.rs` module eliminates request processing duplication across all 3 transport backends
+
+**Known gaps (not yet implemented):**
+- **Cargo.lock for dpdk crate**: excluded from workspace, dependencies unpinned. First build on a new machine may pull different versions.
+- **Unused reader config in DPDK mode**: `--readers` and `--reader-cores` CLI args are accepted but ignored when DPDK is enabled.
+- **No idle connection timeout**: authenticated connections have no timeout (epoll/uring path uses `--connection-timeout-secs`). Dead connections rely on smoltcp TCP keepalive.
+- **No `max_connections` enforcement**: the DPDK poll loop accepts all connections without checking the limit.
+- **`active_connections` counter not wired**: counter exists but is never incremented/decremented, breaking stats queries and `--max-connections`.
+- **Bindgen warnings in release builds**: `unsafe_op_in_unsafe_fn` warnings from generated code in `OUT_DIR` leak through despite suppression in `ffi.rs`.
+- **Not tested on x86_64**: built and tested on aarch64 only. Cherry servers (AMD x86_64) may produce different bindgen output.
+- **ARP untested on real hardware**: smoltcp handles ARP but only validated over TAP (point-to-point, no real ARP needed).
+
 ## Dead Ends / Investigated & Rejected
 
 ### SMI count tracking via MSR 0x34 (AMD Ryzen)
