@@ -38,8 +38,10 @@ PF1_IFACE="${PF1_IFACE:-enp1s0f1np1}"
 # VLAN ID for trading traffic.
 VLAN_ID="${VLAN_ID:-1461}"
 
-# Dedicated IP for the DPDK interface.
-DPDK_IP="${DPDK_IP:-10.189.210.100/24}"
+# Dedicated IP for the DPDK interface. If not set, auto-derive from the
+# bond VLAN IP by incrementing the last octet by 100. This avoids ARP
+# conflicts between the kernel bond IP and the DPDK smoltcp IP.
+DPDK_IP="${DPDK_IP:-auto}"
 
 # Number of hugepages (2MB each). 1024 = 2GB, enough for DPDK mempool.
 HUGEPAGES="${HUGEPAGES:-1024}"
@@ -52,6 +54,31 @@ while [[ $# -gt 0 ]]; do
         *) echo "unknown option: $1" >&2; exit 1 ;;
     esac
 done
+
+# ---------------------------------------------------------------------------
+# Auto-detect DPDK IP from bond VLAN interface
+# ---------------------------------------------------------------------------
+if [[ "$DPDK_IP" == "auto" ]]; then
+    VLAN_IFACE="bond0.${VLAN_ID}"
+    BOND_IP=$(ip -4 addr show "$VLAN_IFACE" 2>/dev/null | grep -oP 'inet \K[\d.]+')
+    BOND_PREFIX=$(ip -4 addr show "$VLAN_IFACE" 2>/dev/null | grep -oP 'inet [\d.]+/\K\d+')
+
+    if [[ -z "$BOND_IP" ]]; then
+        echo "error: could not detect IP on $VLAN_IFACE — set DPDK_IP manually" >&2
+        exit 1
+    fi
+
+    # Increment the last octet by 100 (wrap at 255).
+    IFS='.' read -r a b c d <<< "$BOND_IP"
+    DPDK_LAST=$(( (d + 100) % 256 ))
+    if [[ "$DPDK_LAST" -eq "$d" ]]; then
+        DPDK_LAST=$(( (d + 101) % 256 ))
+    fi
+    DPDK_IP="${a}.${b}.${c}.${DPDK_LAST}/${BOND_PREFIX}"
+
+    echo "  Bond VLAN IP: ${BOND_IP}/${BOND_PREFIX} (${VLAN_IFACE})"
+    echo "  DPDK IP:      ${DPDK_IP} (auto-derived)"
+fi
 
 # ---------------------------------------------------------------------------
 # Preflight checks
@@ -211,6 +238,16 @@ ls -la /sys/bus/pci/drivers/vfio-pci/ 2>/dev/null | grep "0000:" || echo "  (non
 
 VF0_PCI=$(readlink -f "/sys/bus/pci/devices/${PF0_PCI}/virtfn0" 2>/dev/null | xargs basename 2>/dev/null || echo "?")
 VF1_PCI=$(readlink -f "/sys/bus/pci/devices/${PF1_PCI}/virtfn0" 2>/dev/null | xargs basename 2>/dev/null || echo "?")
+
+# Save DPDK config for use by dpdk-lan-bench.sh.
+DPDK_CONF="/etc/melin-dpdk.conf"
+cat > "$DPDK_CONF" <<EOF
+DPDK_IP=${DPDK_IP%%/*}
+DPDK_PREFIX=${DPDK_IP##*/}
+DPDK_PORT=0
+HUGE_DIR=/mnt/huge_2m
+EOF
+echo "  Config written to ${DPDK_CONF}"
 
 echo ""
 echo "=== Setup complete ==="
