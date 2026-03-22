@@ -27,16 +27,34 @@ set -euo pipefail
 # Configuration
 # ---------------------------------------------------------------------------
 
-# Bond member PCI addresses (from lspci). Update for your hardware.
-PF0_PCI="${PF0_PCI:-0000:01:00.0}"
-PF1_PCI="${PF1_PCI:-0000:01:00.1}"
+# Auto-detect bond member PCI addresses and interface names if not set.
+# Finds the first two Intel Ethernet PCI devices that are bond slaves.
+if [[ -z "${PF0_PCI:-}" ]]; then
+    BOND_SLAVES=$(cat /sys/class/net/bond0/bonding/slaves 2>/dev/null || true)
+    if [[ -n "$BOND_SLAVES" ]]; then
+        PF0_IFACE=$(echo "$BOND_SLAVES" | awk '{print $1}')
+        PF1_IFACE=$(echo "$BOND_SLAVES" | awk '{print $2}')
+        PF0_PCI=$(ethtool -i "$PF0_IFACE" 2>/dev/null | grep bus-info | awk '{print $2}')
+        PF1_PCI=$(ethtool -i "$PF1_IFACE" 2>/dev/null | grep bus-info | awk '{print $2}')
+    else
+        echo "error: no bond0 found and PF0_PCI not set" >&2
+        exit 1
+    fi
+fi
+PF0_PCI="${PF0_PCI}"
+PF1_PCI="${PF1_PCI}"
+PF0_IFACE="${PF0_IFACE}"
+PF1_IFACE="${PF1_IFACE}"
 
-# Bond member interface names. Update for your hardware.
-PF0_IFACE="${PF0_IFACE:-enp1s0f0np0}"
-PF1_IFACE="${PF1_IFACE:-enp1s0f1np1}"
-
-# VLAN ID for trading traffic.
-VLAN_ID="${VLAN_ID:-1461}"
+# VLAN ID for trading traffic. Auto-detect from bond VLAN interface if not set.
+if [[ -z "${VLAN_ID:-}" ]]; then
+    VLAN_IFACE=$(ip -o link show | grep "bond0\." | head -1 | awk -F'[ :@]+' '{print $2}')
+    if [[ -n "$VLAN_IFACE" ]]; then
+        VLAN_ID="${VLAN_IFACE##*.}"
+    else
+        VLAN_ID="1461"  # fallback
+    fi
+fi
 
 # Dedicated IP for the DPDK interface. If not set, auto-derive from the
 # bond VLAN IP by incrementing the last octet by 100. This avoids ARP
@@ -94,17 +112,10 @@ if ! dmesg | grep -qi "DMAR\|IOMMU"; then
     echo "warning: IOMMU may not be enabled. Add 'intel_iommu=on iommu=pt' to kernel cmdline."
 fi
 
-# Check ice driver is loaded.
-if ! lsmod | grep -q "^ice "; then
-    echo "error: ice driver not loaded (Intel E810 required)" >&2
-    exit 1
-fi
-
-# Check SR-IOV support.
+# Check SR-IOV support on the first PF.
 if [[ ! -f "/sys/bus/pci/devices/${PF0_PCI}/sriov_totalvfs" ]]; then
-    echo "error: SR-IOV not available on ${PF0_PCI}." >&2
-    echo "  The ice driver may lack CONFIG_PCI_IOV support." >&2
-    echo "  Run cherry-setup.sh first — it installs Intel's out-of-tree ice driver." >&2
+    echo "error: SR-IOV not available on ${PF0_PCI} ($(lspci -s ${PF0_PCI#*:} 2>/dev/null))" >&2
+    echo "  Check kernel driver and IOMMU configuration." >&2
     exit 1
 fi
 
