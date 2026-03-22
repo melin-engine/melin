@@ -93,15 +93,15 @@ impl Device for DpdkDevice {
             (ptr, len)
         };
 
-        // Copy packet data. smoltcp's RxToken takes ownership via closure,
-        // but the mbuf must be freed back to the pool after consumption.
-        let mut buf = vec![0u8; data_len];
-        unsafe {
-            std::ptr::copy_nonoverlapping(data_ptr as *const u8, buf.as_mut_ptr(), data_len);
-            ffi::dpdk_pktmbuf_free(mbuf);
-        }
-
-        let rx_token = DpdkRxToken { buf };
+        // Pass the mbuf directly to the RxToken. The token holds the raw
+        // pointer and frees it after smoltcp consumes the packet data.
+        // This avoids any copy or allocation — smoltcp reads directly
+        // from DPDK hugepage memory.
+        let rx_token = DpdkRxToken {
+            mbuf,
+            data_ptr: data_ptr as *const u8,
+            data_len,
+        };
         let tx_token = DpdkTxToken {
             port_id: self.port_id,
             mempool: self.mempool,
@@ -122,9 +122,13 @@ impl Device for DpdkDevice {
     }
 }
 
-/// RX token: holds one received Ethernet frame.
+/// RX token: holds one received Ethernet frame via a DPDK mbuf.
+/// Zero-copy: smoltcp reads directly from hugepage-backed mbuf memory.
+/// The mbuf is freed back to the pool when the token is consumed.
 pub struct DpdkRxToken {
-    buf: Vec<u8>,
+    mbuf: *mut ffi::rte_mbuf,
+    data_ptr: *const u8,
+    data_len: usize,
 }
 
 impl phy::RxToken for DpdkRxToken {
@@ -132,7 +136,14 @@ impl phy::RxToken for DpdkRxToken {
     where
         F: FnOnce(&[u8]) -> R,
     {
-        f(&self.buf)
+        // SAFETY: data_ptr points into the mbuf's data area which remains
+        // valid until rte_pktmbuf_free is called. We call f() first, then free.
+        let data = unsafe { std::slice::from_raw_parts(self.data_ptr, self.data_len) };
+        let result = f(data);
+        unsafe {
+            ffi::dpdk_pktmbuf_free(self.mbuf);
+        }
+        result
     }
 }
 

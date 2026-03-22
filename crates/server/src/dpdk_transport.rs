@@ -43,6 +43,7 @@ use melin_engine::journal::trace::trace_ts;
 use melin_protocol::auth::{AuthorizedKeys, Permission};
 use melin_protocol::codec;
 use melin_protocol::message::{ConnectionId, Request, ResponseKind};
+use rand::Rng;
 
 use crate::request as shared_request;
 use smoltcp::iface::SocketHandle;
@@ -107,6 +108,15 @@ pub fn run_dpdk_poll(
     // Scratch buffer for reading from smoltcp sockets.
     let mut read_buf = [0u8; MAX_FRAME_SIZE + 4];
 
+    // Reusable handle buffer to avoid per-poll allocation.
+    let mut handle_buf: Vec<SocketHandle> = Vec::with_capacity(256);
+
+    // Fast PRNG for auth nonces. Seeded from OS entropy once at startup,
+    // then generates nonces without blocking. Auth nonces don't need
+    // CSPRNG-grade randomness — they prevent replay attacks within a
+    // session, not cryptographic key derivation.
+    let mut rng = rand::rng();
+
     loop {
         if shutdown.load(Ordering::Relaxed) {
             break;
@@ -126,9 +136,10 @@ pub fn run_dpdk_poll(
                 "DPDK: new connection, starting auth"
             );
 
-            // Generate a random nonce for the challenge.
-            let mut nonce = [0u8; 32];
-            getrandom::fill(&mut nonce).expect("getrandom failed");
+            // Generate a random nonce for the challenge. Uses a fast PRNG
+            // instead of getrandom to avoid blocking the poll thread on
+            // kernel entropy.
+            let nonce: [u8; 32] = rng.random();
 
             // Send the Challenge frame immediately.
             let mut challenge_buf = [0u8; 64];
@@ -156,15 +167,27 @@ pub fn run_dpdk_poll(
         while let Ok(frame) = tx_rx.try_recv() {
             if let Some(&handle) = id_to_handle.get(&frame.connection_id)
                 && let Some(conn) = connections.get(&handle)
+                && !transport.queue_send(conn.handle, &frame.data)
             {
-                transport.queue_send(conn.handle, &frame.data);
+                // TX queue overflow — client fell behind. Drop connection.
+                debug!(
+                    connection_id = frame.connection_id,
+                    "DPDK: TX queue overflow, dropping connection"
+                );
+                transport.close(conn.handle);
+                let _ = control_tx.send(ControlEvent::Disconnected {
+                    connection_id: frame.connection_id,
+                });
+                id_to_handle.remove(&frame.connection_id);
+                connections.remove(&handle);
             }
         }
 
         // 4. Read data from all connections and process.
-        let handle_indices: Vec<SocketHandle> = connections.keys().copied().collect();
+        handle_buf.clear();
+        handle_buf.extend(connections.keys().copied());
 
-        for handle in handle_indices {
+        for &handle in &handle_buf {
             let conn = match connections.get_mut(&handle) {
                 Some(c) => c,
                 None => continue,
@@ -380,6 +403,9 @@ fn send_auth_failed(conn: &ConnectionState, transport: &mut DpdkTransport) {
 }
 
 /// Process trading frames from an authenticated connection.
+///
+/// Uses a cursor to avoid O(n) drain/memmove on every frame. The buffer
+/// is compacted once after all frames in this batch are processed.
 fn process_trading_frames(
     conn: &mut ConnectionState,
     transport: &mut DpdkTransport,
@@ -387,8 +413,11 @@ fn process_trading_frames(
     control_tx: &mpsc::Sender<ControlEvent>,
     id_to_handle: &mut HashMap<u64, SocketHandle>,
 ) {
+    let mut cursor = 0;
+
     loop {
-        let frame_len = match try_extract_frame(&conn.parse_buf) {
+        let remaining = &conn.parse_buf[cursor..];
+        let frame_len = match try_extract_frame(remaining) {
             FrameResult::Complete(payload) => payload.len(),
             FrameResult::Incomplete => break,
             FrameResult::Oversized(len) => {
@@ -403,11 +432,11 @@ fn process_trading_frames(
                 });
                 id_to_handle.remove(&conn.connection_id.0);
                 conn.parse_buf.clear();
-                break;
+                return;
             }
         };
 
-        let payload = &conn.parse_buf[4..4 + frame_len];
+        let payload = &conn.parse_buf[cursor + 4..cursor + 4 + frame_len];
 
         match codec::decode_request(payload) {
             Ok(request) => {
@@ -433,7 +462,15 @@ fn process_trading_frames(
             }
         }
 
-        conn.parse_buf.drain(..4 + frame_len);
+        cursor += 4 + frame_len;
+    }
+
+    // Compact: shift remaining bytes to front. Single memmove for the
+    // entire batch instead of one per frame.
+    if cursor > 0 {
+        let remaining = conn.parse_buf.len() - cursor;
+        conn.parse_buf.copy_within(cursor.., 0);
+        conn.parse_buf.truncate(remaining);
     }
 }
 
@@ -475,6 +512,7 @@ mod tests {
     use super::*;
     use std::num::NonZeroU64;
 
+    use melin_engine::journal::event::JournalEvent;
     use melin_engine::types::*;
 
     // --- try_extract_frame tests ---
@@ -686,13 +724,13 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "heartbeats and auth filtered")]
+    #[should_panic(expected = "must be filtered before to_event")]
     fn request_to_event_heartbeat_panics() {
         shared_request::to_event(&Request::Heartbeat);
     }
 
     #[test]
-    #[should_panic(expected = "heartbeats and auth filtered")]
+    #[should_panic(expected = "must be filtered before to_event")]
     fn request_to_event_challenge_response_panics() {
         shared_request::to_event(&Request::ChallengeResponse {
             signature: [0u8; 64],

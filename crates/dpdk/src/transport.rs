@@ -23,6 +23,16 @@ const MAX_CONNECTIONS: usize = 1024;
 /// TCP listen port for trading connections.
 const LISTEN_PORT: u16 = 9876;
 
+/// Maximum TX queue size per connection (bytes). If a client falls behind
+/// and the queue exceeds this, the connection is dropped.
+const MAX_TX_QUEUE_SIZE: usize = 64 * 1024;
+
+/// How often to refresh the smoltcp timestamp (in poll iterations).
+/// smoltcp only needs millisecond-precision timestamps for TCP timers
+/// (retransmit, keepalive). Refreshing every 100 iterations at ~1MHz
+/// poll rate gives ~10ms resolution — plenty for TCP timers.
+const TIMESTAMP_REFRESH_INTERVAL: u32 = 100;
+
 /// Configuration for the DPDK transport.
 pub struct DpdkConfig {
     pub eal_args: Vec<String>,
@@ -65,8 +75,56 @@ pub struct DpdkTransport {
     listen_handle: SocketHandle,
     listen_port: u16,
     accepted: Vec<AcceptedConnection>,
-    /// Per-connection TX buffers keyed by SocketHandle.
-    tx_queues: HashMap<SocketHandle, Vec<u8>>,
+    /// Per-connection TX buffers keyed by SocketHandle. Uses a cursor
+    /// to avoid O(n) drain on partial sends.
+    tx_queues: HashMap<SocketHandle, TxQueue>,
+    /// Cached smoltcp timestamp. Refreshed periodically, not every poll.
+    cached_timestamp: Instant,
+    /// Poll iteration counter for timestamp refresh.
+    poll_count: u32,
+    /// Reusable handle buffer to avoid per-poll allocation.
+    handle_buf: Vec<SocketHandle>,
+}
+
+/// Per-connection TX queue with cursor to avoid drain() memmoves.
+struct TxQueue {
+    buf: Vec<u8>,
+    /// Read cursor — bytes before this have already been sent.
+    cursor: usize,
+}
+
+impl TxQueue {
+    fn new() -> Self {
+        TxQueue {
+            buf: Vec::new(),
+            cursor: 0,
+        }
+    }
+
+    /// Pending bytes to send.
+    fn pending(&self) -> &[u8] {
+        &self.buf[self.cursor..]
+    }
+
+    /// Total queued bytes (including already-sent prefix).
+    fn queued_bytes(&self) -> usize {
+        self.buf.len() - self.cursor
+    }
+
+    /// Advance the cursor after a successful send.
+    fn advance(&mut self, n: usize) {
+        self.cursor += n;
+        // Compact when the cursor passes halfway — amortized O(1).
+        if self.cursor > self.buf.len() / 2 && self.cursor > 4096 {
+            self.buf.drain(..self.cursor);
+            self.cursor = 0;
+        }
+    }
+
+    /// Append data to the queue.
+    fn push(&mut self, data: &[u8]) {
+        self.buf.extend_from_slice(data);
+    }
 }
 
 impl DpdkTransport {
@@ -157,25 +215,33 @@ impl DpdkTransport {
             listen_port: config.listen_port,
             accepted: Vec::new(),
             tx_queues: HashMap::new(),
+            cached_timestamp: now,
+            poll_count: 0,
+            handle_buf: Vec::with_capacity(MAX_CONNECTIONS),
         })
     }
 
     /// Run one poll iteration.
     pub fn poll(&mut self) -> Instant {
-        let timestamp = Instant::from_millis(
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_millis() as i64,
-        );
+        // Refresh the smoltcp timestamp periodically, not every poll.
+        // smoltcp only needs ms-precision for TCP retransmit/keepalive timers.
+        self.poll_count = self.poll_count.wrapping_add(1);
+        if self.poll_count.is_multiple_of(TIMESTAMP_REFRESH_INTERVAL) {
+            self.cached_timestamp = Instant::from_millis(
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_millis() as i64,
+            );
+        }
 
         self.device.poll_rx();
         self.iface
-            .poll(timestamp, &mut self.device, &mut self.sockets);
+            .poll(self.cached_timestamp, &mut self.device, &mut self.sockets);
         self.check_listener();
         self.flush_tx_queues();
 
-        timestamp
+        self.cached_timestamp
     }
 
     fn check_listener(&mut self) {
@@ -220,23 +286,24 @@ impl DpdkTransport {
     }
 
     fn flush_tx_queues(&mut self) {
-        let handles: Vec<SocketHandle> = self.tx_queues.keys().copied().collect();
+        self.handle_buf.clear();
+        self.handle_buf.extend(self.tx_queues.keys().copied());
 
-        for handle in handles {
-            let queue = match self.tx_queues.get_mut(&handle) {
-                Some(q) if !q.is_empty() => q,
+        for handle in 0..self.handle_buf.len() {
+            let h = self.handle_buf[handle];
+            let queue = match self.tx_queues.get_mut(&h) {
+                Some(q) if q.queued_bytes() > 0 => q,
                 _ => continue,
             };
 
-            let socket = self.sockets.get_mut::<tcp::Socket>(handle);
-
+            let socket = self.sockets.get_mut::<tcp::Socket>(h);
             if !socket.can_send() {
                 continue;
             }
 
-            let sent = socket.send_slice(queue).unwrap_or(0);
+            let sent = socket.send_slice(queue.pending()).unwrap_or(0);
             if sent > 0 {
-                queue.drain(..sent);
+                queue.advance(sent);
             }
         }
     }
@@ -255,12 +322,15 @@ impl DpdkTransport {
         socket.recv_slice(buf).unwrap_or(0)
     }
 
-    /// Queue data to be sent on a connection.
-    pub fn queue_send(&mut self, handle: SocketHandle, data: &[u8]) {
-        self.tx_queues
-            .entry(handle)
-            .or_default()
-            .extend_from_slice(data);
+    /// Queue data to be sent on a connection. Returns false if the
+    /// connection's TX queue exceeds the size limit (client fell behind).
+    pub fn queue_send(&mut self, handle: SocketHandle, data: &[u8]) -> bool {
+        let queue = self.tx_queues.entry(handle).or_insert_with(TxQueue::new);
+        if queue.queued_bytes() + data.len() > MAX_TX_QUEUE_SIZE {
+            return false;
+        }
+        queue.push(data);
+        true
     }
 
     /// Check if a connection is still open.
