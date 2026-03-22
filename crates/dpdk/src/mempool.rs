@@ -55,10 +55,10 @@ impl Mempool {
                 num_mbufs,
                 MBUF_CACHE_SIZE,
                 0, // priv_size: no per-mbuf private data
-                // Default mbuf data room size: RTE_MBUF_DEFAULT_BUF_SIZE
-                // (typically 2048 + 128 = 2176 bytes). Enough for standard
-                // Ethernet frames (1518 bytes max).
-                ffi::RTE_MBUF_DEFAULT_BUF_SIZE as u16,
+                // Default mbuf data room size (typically 2048 + 128 = 2176 bytes).
+                // Enough for standard Ethernet frames (1518 bytes max).
+                // Retrieved via C wrapper since it's a macro.
+                ffi::dpdk_mbuf_default_buf_size(),
                 socket_id,
             )
         };
@@ -81,9 +81,8 @@ impl Mempool {
 impl Drop for Mempool {
     fn drop(&mut self) {
         // SAFETY: we own the mempool and it was successfully created.
-        // rte_mempool_free is safe to call once.
         unsafe {
-            ffi::rte_mempool_free(self.raw);
+            ffi::dpdk_mempool_free(self.raw);
         }
     }
 }

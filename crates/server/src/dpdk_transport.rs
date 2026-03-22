@@ -97,10 +97,10 @@ pub fn run_dpdk_poll(
     shutdown: &AtomicBool,
     authorized_keys: Arc<AuthorizedKeys>,
 ) {
-    // Map from smoltcp SocketHandle index → connection state.
-    let mut connections: HashMap<usize, ConnectionState> = HashMap::with_capacity(256);
-    // Reverse map: connection_id → socket handle index (for TX routing).
-    let mut id_to_handle: HashMap<u64, usize> = HashMap::with_capacity(256);
+    // Map from smoltcp SocketHandle → connection state.
+    let mut connections: HashMap<SocketHandle, ConnectionState> = HashMap::with_capacity(256);
+    // Reverse map: connection_id → socket handle (for TX routing).
+    let mut id_to_handle: HashMap<u64, SocketHandle> = HashMap::with_capacity(256);
     let mut next_connection_id: u64 = 1;
 
     // Scratch buffer for reading from smoltcp sockets.
@@ -136,9 +136,8 @@ pub fn run_dpdk_poll(
                     .expect("challenge encodes");
             transport.queue_send(accepted.handle, &challenge_buf[..written]);
 
-            let handle_idx: usize = accepted.handle.into();
             connections.insert(
-                handle_idx,
+                accepted.handle,
                 ConnectionState {
                     connection_id: conn_id,
                     addr: accepted.peer,
@@ -154,18 +153,18 @@ pub fn run_dpdk_poll(
 
         // 3. Drain TX frames from the response stage into smoltcp sockets.
         while let Ok(frame) = tx_rx.try_recv() {
-            if let Some(&handle_idx) = id_to_handle.get(&frame.connection_id) {
-                if let Some(conn) = connections.get(&handle_idx) {
+            if let Some(&handle) = id_to_handle.get(&frame.connection_id) {
+                if let Some(conn) = connections.get(&handle) {
                     transport.queue_send(conn.handle, &frame.data);
                 }
             }
         }
 
         // 4. Read data from all connections and process.
-        let handle_indices: Vec<usize> = connections.keys().copied().collect();
+        let handle_indices: Vec<SocketHandle> = connections.keys().copied().collect();
 
-        for handle_idx in handle_indices {
-            let conn = match connections.get_mut(&handle_idx) {
+        for handle in handle_indices {
+            let conn = match connections.get_mut(&handle) {
                 Some(c) => c,
                 None => continue,
             };
@@ -179,7 +178,7 @@ pub fn run_dpdk_poll(
                         "DPDK: auth timeout, dropping connection"
                     );
                     transport.close(conn.handle);
-                    connections.remove(&handle_idx);
+                    connections.remove(&handle);
                     continue;
                 }
             }
@@ -200,7 +199,7 @@ pub fn run_dpdk_poll(
                         });
                     }
                     id_to_handle.remove(&conn.connection_id.0);
-                    connections.remove(&handle_idx);
+                    connections.remove(&handle);
                 }
                 continue;
             }
@@ -217,7 +216,7 @@ pub fn run_dpdk_poll(
                         &authorized_keys,
                         &control_tx,
                         &mut id_to_handle,
-                        handle_idx,
+                        handle,
                     );
                 }
                 AuthState::Authenticated { .. } => {
@@ -228,7 +227,7 @@ pub fn run_dpdk_poll(
                         &producer,
                         &control_tx,
                         &mut id_to_handle,
-                        handle_idx,
+                        handle,
                     );
                 }
             }
@@ -242,8 +241,8 @@ fn process_auth_frame(
     transport: &mut DpdkTransport,
     authorized_keys: &AuthorizedKeys,
     control_tx: &mpsc::Sender<ControlEvent>,
-    id_to_handle: &mut HashMap<u64, usize>,
-    handle_idx: usize,
+    id_to_handle: &mut HashMap<u64, SocketHandle>,
+    handle: SocketHandle,
 ) {
     // Need at least 4 bytes for the length prefix.
     if conn.parse_buf.len() < 4 {
@@ -361,7 +360,7 @@ fn process_auth_frame(
     conn.auth = AuthState::Authenticated { permission };
 
     // Register with the response stage and ID map.
-    id_to_handle.insert(conn.connection_id.0, handle_idx);
+    id_to_handle.insert(conn.connection_id.0, handle);
     let _ = control_tx.send(ControlEvent::Connected {
         connection_id: conn.connection_id.0,
     });
@@ -384,8 +383,8 @@ fn process_trading_frames(
     transport: &mut DpdkTransport,
     producer: &ring::MultiProducer<InputSlot>,
     control_tx: &mpsc::Sender<ControlEvent>,
-    id_to_handle: &mut HashMap<u64, usize>,
-    handle_idx: usize,
+    id_to_handle: &mut HashMap<u64, SocketHandle>,
+    handle: SocketHandle,
 ) {
     while conn.parse_buf.len() >= 4 {
         let frame_len = u32::from_le_bytes([

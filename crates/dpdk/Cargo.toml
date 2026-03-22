@@ -25,3 +25,5 @@ libc = "0.2"
 # Requires DPDK to be installed (pkg-config --cflags --libs libdpdk).
 bindgen = "0.71"
 pkg-config = "0.3"
+# cc compiles the C wrapper functions for DPDK inline functions.
+cc = "1"

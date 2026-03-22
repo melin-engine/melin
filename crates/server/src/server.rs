@@ -790,6 +790,14 @@ pub fn run_dpdk(
     // Initialize DPDK transport (EAL, mempool, port, smoltcp).
     let transport = melin_dpdk::DpdkTransport::init(&dpdk_config)?;
 
+    // Load authorized keys for challenge-response authentication.
+    let authorized_keys = Arc::new(AuthorizedKeys::load(&config.authorized_keys)?);
+    info!(
+        keys = authorized_keys.len(),
+        path = %config.authorized_keys.display(),
+        "loaded authorized keys"
+    );
+
     // Initialize or recover the exchange.
     let (engine, needs_seeding) = init_engine(&config)?;
     let (mut exchange, writer) = engine.into_parts();

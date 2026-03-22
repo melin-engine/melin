@@ -1057,6 +1057,7 @@ name = "melin-dpdk"
 version = "0.1.0"
 dependencies = [
  "bindgen",
+ "cc",
  "libc",
  "pkg-config",
  "smoltcp",

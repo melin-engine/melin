@@ -110,21 +110,7 @@ impl Port {
         }
         self.started = true;
 
-        // Log link status.
-        let mut link: ffi::rte_eth_link = unsafe { std::mem::zeroed() };
-        unsafe {
-            ffi::rte_eth_link_get_nowait(self.port_id, &mut link);
-        }
-        tracing::info!(
-            port_id = self.port_id,
-            link_speed = link.link_speed,
-            link_status = if link.link_status() != 0 {
-                "up"
-            } else {
-                "down"
-            },
-            "DPDK port started"
-        );
+        tracing::info!(port_id = self.port_id, "DPDK port started");
 
         Ok(())
     }

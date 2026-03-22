@@ -3,7 +3,7 @@
 //! This is the bridge between the userspace TCP stack (smoltcp) and the
 //! NIC driver (DPDK). smoltcp calls `receive()` to get inbound Ethernet
 //! frames and `transmit()` to send outbound frames. We translate these
-//! into DPDK mbuf operations.
+//! into DPDK mbuf operations via C wrapper functions (see inline_wrappers.c).
 //!
 //! The device is single-threaded — it's called from the DPDK poll thread
 //! only. No synchronization needed.
@@ -13,38 +13,29 @@ use smoltcp::time::Instant;
 
 use crate::ffi;
 
-/// Maximum burst size for `rte_eth_rx_burst` / `rte_eth_tx_burst`.
+/// Maximum burst size for rx_burst / tx_burst.
 /// 32 is the typical sweet spot: amortizes per-call overhead without
 /// adding excessive latency from batch processing.
 const BURST_SIZE: usize = 32;
 
-/// MTU for standard Ethernet (no jumbo frames). 1500 bytes payload +
-/// 14-byte Ethernet header + 4-byte FCS = 1518. smoltcp handles the
-/// Ethernet header, so we advertise the raw Ethernet frame capacity.
+/// MTU for standard Ethernet (no jumbo frames).
 const MTU: usize = 1500;
 
-/// smoltcp device backed by a DPDK port. Holds a reference to the port
-/// and mempool for mbuf allocation.
+/// smoltcp device backed by a DPDK port.
 pub struct DpdkDevice {
     port_id: u16,
     mempool: *mut ffi::rte_mempool,
-    /// Staging buffer for received mbufs. `rx_burst` fills this; we
-    /// hand them out one at a time via `receive()`.
+    /// Staging buffer for received mbufs.
     rx_buf: [*mut ffi::rte_mbuf; BURST_SIZE],
-    /// Number of valid mbufs in `rx_buf`.
     rx_count: usize,
-    /// Next mbuf to hand out from `rx_buf`.
     rx_cursor: usize,
 }
 
 // SAFETY: DpdkDevice is only used from the single DPDK poll thread.
-// The raw pointers are DPDK mbufs allocated from hugepage memory.
 unsafe impl Send for DpdkDevice {}
 
 impl DpdkDevice {
     /// Create a new device for the given DPDK port.
-    ///
-    /// `mempool` must outlive the device (it's used for TX mbuf allocation).
     pub fn new(port_id: u16, mempool: *mut ffi::rte_mempool) -> Self {
         DpdkDevice {
             port_id,
@@ -55,28 +46,28 @@ impl DpdkDevice {
         }
     }
 
-    /// Poll the NIC for received packets. Call this at the top of
-    /// each poll loop iteration before `iface.poll()`.
-    ///
-    /// Fills the internal RX buffer with up to BURST_SIZE mbufs.
+    /// Poll the NIC for received packets.
     pub fn poll_rx(&mut self) {
         if self.rx_cursor < self.rx_count {
-            // Still have unprocessed packets from the last burst.
             return;
         }
 
         // SAFETY: port is started, rx_buf is correctly sized.
         let count = unsafe {
-            ffi::rte_eth_rx_burst(
-                self.port_id,
-                0, // queue_id
-                self.rx_buf.as_mut_ptr(),
-                BURST_SIZE as u16,
-            )
+            ffi::dpdk_eth_rx_burst(self.port_id, 0, self.rx_buf.as_mut_ptr(), BURST_SIZE as u16)
         };
 
         self.rx_count = count as usize;
         self.rx_cursor = 0;
+    }
+
+    /// Capabilities accessor for use by DpdkDeviceRef.
+    pub fn capabilities(&self) -> DeviceCapabilities {
+        let mut caps = DeviceCapabilities::default();
+        caps.medium = Medium::Ethernet;
+        caps.max_transmission_unit = MTU;
+        caps.max_burst_size = Some(BURST_SIZE);
+        caps
     }
 }
 
@@ -92,21 +83,22 @@ impl Device for DpdkDevice {
         let mbuf = self.rx_buf[self.rx_cursor];
         self.rx_cursor += 1;
 
-        // Read packet data from the mbuf.
+        // Read packet data via C accessors (avoids direct struct field access
+        // on bindgen-generated types with complex unions/bitfields).
         let (data_ptr, data_len) = unsafe {
-            let ptr = (*mbuf).buf_addr.byte_add((*mbuf).data_off as usize);
-            let len = (*mbuf).data_len as usize;
+            let buf_addr = ffi::dpdk_mbuf_buf_addr(mbuf);
+            let data_off = ffi::dpdk_mbuf_data_off(mbuf) as usize;
+            let ptr = buf_addr.add(data_off);
+            let len = ffi::dpdk_mbuf_data_len(mbuf) as usize;
             (ptr, len)
         };
 
-        // Copy packet data to a stack buffer. This copy is unavoidable:
-        // smoltcp's RxToken::consume takes ownership via a closure, but
-        // the mbuf must be freed back to the pool after consumption.
-        // At ~1500 bytes max, this is a single memcpy well within L1.
+        // Copy packet data. smoltcp's RxToken takes ownership via closure,
+        // but the mbuf must be freed back to the pool after consumption.
         let mut buf = vec![0u8; data_len];
         unsafe {
             std::ptr::copy_nonoverlapping(data_ptr as *const u8, buf.as_mut_ptr(), data_len);
-            ffi::rte_pktmbuf_free(mbuf);
+            ffi::dpdk_pktmbuf_free(mbuf);
         }
 
         let rx_token = DpdkRxToken { buf };
@@ -126,13 +118,7 @@ impl Device for DpdkDevice {
     }
 
     fn capabilities(&self) -> DeviceCapabilities {
-        let mut caps = DeviceCapabilities::default();
-        caps.medium = Medium::Ethernet;
-        caps.max_transmission_unit = MTU;
-        // No checksum offload for now — smoltcp computes checksums in
-        // software. Can enable NIC offload later for marginal gains.
-        caps.max_burst_size = Some(BURST_SIZE);
-        caps
+        self.capabilities()
     }
 }
 
@@ -161,30 +147,30 @@ impl phy::TxToken for DpdkTxToken {
     where
         F: FnOnce(&mut [u8]) -> R,
     {
-        // Allocate an mbuf from the pool.
-        let mbuf = unsafe { ffi::rte_pktmbuf_alloc(self.mempool) };
+        let mbuf = unsafe { ffi::dpdk_pktmbuf_alloc(self.mempool) };
         assert!(!mbuf.is_null(), "mbuf alloc failed — mempool exhausted");
 
-        // Get a mutable slice to the mbuf data area and let the caller
-        // (smoltcp) write the Ethernet frame into it.
-        let data_ptr = unsafe { (*mbuf).buf_addr.byte_add((*mbuf).data_off as usize) as *mut u8 };
+        // Get mutable slice via C accessors.
+        let data_ptr = unsafe {
+            let buf_addr = ffi::dpdk_mbuf_buf_addr(mbuf);
+            let data_off = ffi::dpdk_mbuf_data_off(mbuf) as usize;
+            buf_addr.add(data_off) as *mut u8
+        };
         let buf = unsafe { std::slice::from_raw_parts_mut(data_ptr, len) };
 
         let result = f(buf);
 
-        // Set the packet length fields.
+        // Set packet length via C accessors.
         unsafe {
-            (*mbuf).data_len = len as u16;
-            (*mbuf).pkt_len = len as u32;
+            ffi::dpdk_mbuf_set_data_len(mbuf, len as u16);
+            ffi::dpdk_mbuf_set_pkt_len(mbuf, len as u32);
         }
 
-        // Send the packet. tx_burst returns the number of packets sent;
-        // if 0, the TX queue is full and we must free the mbuf.
         let mut tx_mbuf = mbuf;
-        let sent = unsafe { ffi::rte_eth_tx_burst(self.port_id, 0, &mut tx_mbuf, 1) };
+        let sent = unsafe { ffi::dpdk_eth_tx_burst(self.port_id, 0, &mut tx_mbuf, 1) };
         if sent == 0 {
             unsafe {
-                ffi::rte_pktmbuf_free(mbuf);
+                ffi::dpdk_pktmbuf_free(mbuf);
             }
             tracing::debug!("TX queue full, dropped packet");
         }
