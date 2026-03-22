@@ -386,32 +386,25 @@ fn process_trading_frames(
     control_tx: &mpsc::Sender<ControlEvent>,
     id_to_handle: &mut HashMap<u64, SocketHandle>,
 ) {
-    while conn.parse_buf.len() >= 4 {
-        let frame_len = u32::from_le_bytes([
-            conn.parse_buf[0],
-            conn.parse_buf[1],
-            conn.parse_buf[2],
-            conn.parse_buf[3],
-        ]) as usize;
-
-        if frame_len > MAX_FRAME_SIZE {
-            debug!(
-                connection_id = conn.connection_id.0,
-                frame_len, "DPDK: oversized frame, dropping connection"
-            );
-            transport.close(conn.handle);
-            let _ = control_tx.send(ControlEvent::Disconnected {
-                connection_id: conn.connection_id.0,
-            });
-            id_to_handle.remove(&conn.connection_id.0);
-            // Caller must remove from connections map after return.
-            conn.parse_buf.clear();
-            break;
-        }
-
-        if conn.parse_buf.len() < 4 + frame_len {
-            break; // Incomplete frame.
-        }
+    loop {
+        let frame_len = match try_extract_frame(&conn.parse_buf) {
+            FrameResult::Complete(payload) => payload.len(),
+            FrameResult::Incomplete => break,
+            FrameResult::Oversized(len) => {
+                debug!(
+                    connection_id = conn.connection_id.0,
+                    frame_len = len,
+                    "DPDK: oversized frame, dropping connection"
+                );
+                transport.close(conn.handle);
+                let _ = control_tx.send(ControlEvent::Disconnected {
+                    connection_id: conn.connection_id.0,
+                });
+                id_to_handle.remove(&conn.connection_id.0);
+                conn.parse_buf.clear();
+                break;
+            }
+        };
 
         let payload = &conn.parse_buf[4..4 + frame_len];
 
@@ -495,6 +488,383 @@ fn request_to_event(request: &Request) -> JournalEvent {
         Request::QueryStats => JournalEvent::QueryStats,
         Request::Heartbeat | Request::ChallengeResponse { .. } => {
             unreachable!("heartbeats and auth filtered before request_to_event")
+        }
+    }
+}
+
+/// Result of trying to extract a length-prefixed frame from a parse buffer.
+#[derive(Debug, PartialEq)]
+enum FrameResult<'a> {
+    /// Complete frame extracted. Payload is the frame data (without length prefix).
+    Complete(&'a [u8]),
+    /// Not enough data yet — need more bytes.
+    Incomplete,
+    /// Frame length exceeds MAX_FRAME_SIZE — connection should be dropped.
+    Oversized(usize),
+}
+
+/// Try to extract a length-prefixed frame from a parse buffer.
+///
+/// Wire format: `[u32 little-endian length][payload]`.
+/// Returns the payload slice on success, or Incomplete/Oversized.
+fn try_extract_frame(buf: &[u8]) -> FrameResult<'_> {
+    if buf.len() < 4 {
+        return FrameResult::Incomplete;
+    }
+
+    let frame_len = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]) as usize;
+
+    if frame_len > MAX_FRAME_SIZE {
+        return FrameResult::Oversized(frame_len);
+    }
+
+    if buf.len() < 4 + frame_len {
+        return FrameResult::Incomplete;
+    }
+
+    FrameResult::Complete(&buf[4..4 + frame_len])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::num::NonZeroU64;
+
+    use melin_engine::types::*;
+
+    // --- try_extract_frame tests ---
+
+    #[test]
+    fn extract_frame_empty_buffer() {
+        assert_eq!(try_extract_frame(&[]), FrameResult::Incomplete);
+    }
+
+    #[test]
+    fn extract_frame_partial_length() {
+        assert_eq!(try_extract_frame(&[0x05, 0x00]), FrameResult::Incomplete);
+    }
+
+    #[test]
+    fn extract_frame_length_only_no_payload() {
+        // Length says 5 bytes, but no payload present.
+        assert_eq!(
+            try_extract_frame(&[0x05, 0x00, 0x00, 0x00]),
+            FrameResult::Incomplete
+        );
+    }
+
+    #[test]
+    fn extract_frame_partial_payload() {
+        // Length says 5 bytes, only 3 payload bytes present.
+        assert_eq!(
+            try_extract_frame(&[0x05, 0x00, 0x00, 0x00, 0xAA, 0xBB, 0xCC]),
+            FrameResult::Incomplete
+        );
+    }
+
+    #[test]
+    fn extract_frame_complete() {
+        let buf = [0x03, 0x00, 0x00, 0x00, 0xAA, 0xBB, 0xCC];
+        assert_eq!(
+            try_extract_frame(&buf),
+            FrameResult::Complete(&[0xAA, 0xBB, 0xCC])
+        );
+    }
+
+    #[test]
+    fn extract_frame_complete_with_trailing_data() {
+        // 3-byte payload + extra bytes (next frame).
+        let buf = [0x03, 0x00, 0x00, 0x00, 0xAA, 0xBB, 0xCC, 0xFF, 0xFF];
+        assert_eq!(
+            try_extract_frame(&buf),
+            FrameResult::Complete(&[0xAA, 0xBB, 0xCC])
+        );
+    }
+
+    #[test]
+    fn extract_frame_zero_length() {
+        // Zero-length frame is valid (empty payload).
+        let buf = [0x00, 0x00, 0x00, 0x00];
+        assert_eq!(try_extract_frame(&buf), FrameResult::Complete(&[]));
+    }
+
+    #[test]
+    fn extract_frame_oversized() {
+        // Frame length exceeds MAX_FRAME_SIZE (1024).
+        let len = (MAX_FRAME_SIZE + 1) as u32;
+        let buf = len.to_le_bytes();
+        assert_eq!(
+            try_extract_frame(&buf),
+            FrameResult::Oversized(MAX_FRAME_SIZE + 1)
+        );
+    }
+
+    #[test]
+    fn extract_frame_exactly_max_size() {
+        // Frame length exactly at MAX_FRAME_SIZE should succeed (not oversized).
+        let len = MAX_FRAME_SIZE as u32;
+        let mut buf = Vec::from(len.to_le_bytes().as_slice());
+        buf.extend(vec![0u8; MAX_FRAME_SIZE]);
+        assert!(matches!(try_extract_frame(&buf), FrameResult::Complete(_)));
+    }
+
+    // --- request_to_event tests ---
+
+    fn make_order(id: u64, account: u32, side: Side) -> Order {
+        Order {
+            id: OrderId(id),
+            account: AccountId(account),
+            side,
+            order_type: OrderType::Limit {
+                price: Price(NonZeroU64::new(100).unwrap()),
+            },
+            quantity: Quantity(NonZeroU64::new(10).unwrap()),
+            time_in_force: TimeInForce::GTC,
+            stp: SelfTradeProtection::CancelNewest,
+        }
+    }
+
+    #[test]
+    fn request_to_event_submit_order() {
+        let order = make_order(1, 1, Side::Buy);
+        let req = Request::SubmitOrder {
+            symbol: Symbol(1),
+            order,
+        };
+        let event = request_to_event(&req);
+        assert!(matches!(event, JournalEvent::SubmitOrder { symbol, .. } if symbol == Symbol(1)));
+    }
+
+    #[test]
+    fn request_to_event_cancel_order() {
+        let req = Request::CancelOrder {
+            symbol: Symbol(2),
+            account: AccountId(5),
+            order_id: OrderId(42),
+        };
+        let event = request_to_event(&req);
+        assert!(
+            matches!(event, JournalEvent::CancelOrder { symbol, account, order_id }
+                if symbol == Symbol(2) && account == AccountId(5) && order_id == OrderId(42))
+        );
+    }
+
+    #[test]
+    fn request_to_event_cancel_all() {
+        let req = Request::CancelAll {
+            account: AccountId(7),
+        };
+        let event = request_to_event(&req);
+        assert!(matches!(event, JournalEvent::CancelAll { account } if account == AccountId(7)));
+    }
+
+    #[test]
+    fn request_to_event_deposit() {
+        let req = Request::Deposit {
+            account: AccountId(1),
+            currency: CurrencyId(2),
+            amount: 1000,
+        };
+        let event = request_to_event(&req);
+        assert!(
+            matches!(event, JournalEvent::Deposit { account, currency, amount }
+                if account == AccountId(1) && currency == CurrencyId(2) && amount == 1000)
+        );
+    }
+
+    #[test]
+    fn request_to_event_add_instrument() {
+        let spec = InstrumentSpec {
+            symbol: Symbol(10),
+            base: CurrencyId(1),
+            quote: CurrencyId(2),
+        };
+        let req = Request::AddInstrument { spec };
+        let event = request_to_event(&req);
+        assert!(matches!(event, JournalEvent::AddInstrument { spec: s } if s.symbol == Symbol(10)));
+    }
+
+    #[test]
+    fn request_to_event_cancel_replace() {
+        let req = Request::CancelReplace {
+            symbol: Symbol(1),
+            account: AccountId(1),
+            order_id: OrderId(5),
+            new_price: Price(NonZeroU64::new(200).unwrap()),
+            new_quantity: Quantity(NonZeroU64::new(50).unwrap()),
+        };
+        let event = request_to_event(&req);
+        assert!(
+            matches!(event, JournalEvent::CancelReplace { order_id, .. } if order_id == OrderId(5))
+        );
+    }
+
+    #[test]
+    fn request_to_event_set_risk_limits() {
+        let req = Request::SetRiskLimits {
+            symbol: Symbol(1),
+            limits: RiskLimits::default(),
+        };
+        let event = request_to_event(&req);
+        assert!(matches!(event, JournalEvent::SetRiskLimits { symbol, .. } if symbol == Symbol(1)));
+    }
+
+    #[test]
+    fn request_to_event_set_circuit_breaker() {
+        let req = Request::SetCircuitBreaker {
+            symbol: Symbol(1),
+            config: CircuitBreakerConfig::default(),
+        };
+        let event = request_to_event(&req);
+        assert!(
+            matches!(event, JournalEvent::SetCircuitBreaker { symbol, .. } if symbol == Symbol(1))
+        );
+    }
+
+    #[test]
+    fn request_to_event_set_fee_schedule() {
+        let req = Request::SetFeeSchedule {
+            symbol: Symbol(3),
+            schedule: FeeSchedule::default(),
+        };
+        let event = request_to_event(&req);
+        assert!(
+            matches!(event, JournalEvent::SetFeeSchedule { symbol, .. } if symbol == Symbol(3))
+        );
+    }
+
+    #[test]
+    fn request_to_event_query_stats() {
+        let req = Request::QueryStats;
+        let event = request_to_event(&req);
+        assert!(matches!(event, JournalEvent::QueryStats));
+    }
+
+    #[test]
+    #[should_panic(expected = "heartbeats and auth filtered")]
+    fn request_to_event_heartbeat_panics() {
+        request_to_event(&Request::Heartbeat);
+    }
+
+    #[test]
+    #[should_panic(expected = "heartbeats and auth filtered")]
+    fn request_to_event_challenge_response_panics() {
+        request_to_event(&Request::ChallengeResponse {
+            signature: [0u8; 64],
+            public_key: [0u8; 32],
+        });
+    }
+
+    // --- Wire-level round-trip: encode request → extract frame → decode ---
+
+    #[test]
+    fn wire_round_trip_submit_order() {
+        let order = make_order(99, 1, Side::Sell);
+        let req = Request::SubmitOrder {
+            symbol: Symbol(5),
+            order,
+        };
+        let mut buf = [0u8; 256];
+        let written = codec::encode_request(&req, &mut buf).unwrap();
+
+        // encode_request writes [u32 length][payload].
+        let frame = try_extract_frame(&buf[..written]);
+        match frame {
+            FrameResult::Complete(payload) => {
+                let decoded = codec::decode_request(payload).unwrap();
+                assert!(
+                    matches!(decoded, Request::SubmitOrder { symbol, .. } if symbol == Symbol(5))
+                );
+            }
+            other => panic!("expected Complete, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn wire_round_trip_cancel() {
+        let req = Request::CancelOrder {
+            symbol: Symbol(1),
+            account: AccountId(2),
+            order_id: OrderId(3),
+        };
+        let mut buf = [0u8; 256];
+        let written = codec::encode_request(&req, &mut buf).unwrap();
+
+        let frame = try_extract_frame(&buf[..written]);
+        match frame {
+            FrameResult::Complete(payload) => {
+                let decoded = codec::decode_request(payload).unwrap();
+                assert!(
+                    matches!(decoded, Request::CancelOrder { order_id, .. } if order_id == OrderId(3))
+                );
+            }
+            other => panic!("expected Complete, got {other:?}"),
+        }
+    }
+
+    // --- Incremental accumulation (simulates TCP byte-at-a-time arrival) ---
+
+    #[test]
+    fn incremental_frame_accumulation() {
+        let req = Request::Heartbeat;
+        let mut wire = [0u8; 64];
+        let written = codec::encode_request(&req, &mut wire).unwrap();
+        let wire = &wire[..written];
+
+        // Feed bytes one at a time into a parse buffer.
+        let mut parse_buf = Vec::new();
+        for (i, &byte) in wire.iter().enumerate() {
+            parse_buf.push(byte);
+            let result = try_extract_frame(&parse_buf);
+            if i < written - 1 {
+                assert_eq!(result, FrameResult::Incomplete, "byte {i}");
+            } else {
+                assert!(
+                    matches!(result, FrameResult::Complete(_)),
+                    "expected Complete at final byte"
+                );
+            }
+        }
+    }
+
+    // --- Multiple frames back-to-back ---
+
+    #[test]
+    fn multiple_frames_in_buffer() {
+        let req1 = Request::Heartbeat;
+        let req2 = Request::QueryStats;
+        let mut buf1 = [0u8; 64];
+        let mut buf2 = [0u8; 64];
+        let w1 = codec::encode_request(&req1, &mut buf1).unwrap();
+        let w2 = codec::encode_request(&req2, &mut buf2).unwrap();
+
+        // Concatenate two frames.
+        let mut combined = Vec::new();
+        combined.extend_from_slice(&buf1[..w1]);
+        combined.extend_from_slice(&buf2[..w2]);
+
+        // First extraction should get frame 1.
+        let result1 = try_extract_frame(&combined);
+        let payload1_len = match result1 {
+            FrameResult::Complete(p) => {
+                let decoded = codec::decode_request(p).unwrap();
+                assert!(matches!(decoded, Request::Heartbeat));
+                p.len()
+            }
+            other => panic!("expected Complete, got {other:?}"),
+        };
+
+        // Advance past first frame (4 bytes length + payload).
+        let remaining = &combined[4 + payload1_len..];
+
+        // Second extraction should get frame 2.
+        let result2 = try_extract_frame(remaining);
+        match result2 {
+            FrameResult::Complete(p) => {
+                let decoded = codec::decode_request(p).unwrap();
+                assert!(matches!(decoded, Request::QueryStats));
+            }
+            other => panic!("expected Complete, got {other:?}"),
         }
     }
 }
