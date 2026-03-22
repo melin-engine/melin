@@ -556,67 +556,87 @@ fn run_pipeline_bench(
         .expect("spawn matching thread");
 
     let total_orders = warmup + total_pairs * 2;
+
+    // Split publish and drain into separate threads so the publisher
+    // keeps the disruptor fed while the drainer processes BatchEnds.
+    // Without this, a single thread alternates publish→drain, starving
+    // the journal stage between drain phases and halving throughput.
+    //
+    // Coordination: inflight counter (AtomicU64) for window gating,
+    // SPSC channel for timestamps (publisher → drainer).
+    let inflight = Arc::new(AtomicU64::new(0));
+    let (ts_tx, ts_rx) = std::sync::mpsc::sync_channel::<Instant>(window);
+
+    // Publisher thread: continuously feeds events into the disruptor.
+    let inflight_pub = Arc::clone(&inflight);
+    let publish_handle = std::thread::Builder::new()
+        .name("pipeline-pub".into())
+        .spawn(move || {
+            for i in 0..total_orders {
+                let order_id = OrderId((i as u64) + 1);
+                let side = if i % 2 == 0 { Side::Buy } else { Side::Sell };
+
+                // Spin-wait for window capacity.
+                while inflight_pub.load(Ordering::Acquire) >= window as u64 {
+                    std::hint::spin_loop();
+                }
+
+                let ts = Instant::now();
+                producer.publish(InputSlot {
+                    connection_id: 0,
+                    event: JournalEvent::SubmitOrder {
+                        symbol: Symbol(1),
+                        order: Order {
+                            id: order_id,
+                            account: AccountId(1),
+                            side,
+                            order_type: OrderType::Limit {
+                                price: Price(nz(100)),
+                            },
+                            time_in_force: TimeInForce::GTC,
+                            quantity: Quantity(nz(1)),
+                            stp: SelfTradeProtection::Allow,
+                        },
+                    },
+                    publish_ts: trace_ts(),
+                    recv_ts: trace_ts(),
+                });
+                inflight_pub.fetch_add(1, Ordering::Release);
+                let _ = ts_tx.send(ts);
+            }
+        })
+        .expect("spawn pipeline publish thread");
+
+    // Drain thread (this thread): consume output SPSC and record latency.
     let mut histogram =
         Histogram::<u64>::new_with_bounds(1, 10_000_000_000, 3).expect("histogram bounds");
-
-    // Track in-flight timestamps for windowed pipelining.
-    // VecDeque for FIFO: push_back on publish, pop_front on BatchEnd.
-    let mut inflight_ts: VecDeque<Instant> = VecDeque::with_capacity(window);
     let mut completed = 0usize;
     let mut measured_start: Option<Instant> = None;
-
     let start = Instant::now();
 
-    for i in 0..total_orders {
-        let order_id = OrderId((i as u64) + 1);
-        let side = if i % 2 == 0 { Side::Buy } else { Side::Sell };
-
-        // Wait for window capacity before publishing.
-        while inflight_ts.len() >= window {
-            drain_output(
-                &mut output_consumer,
-                &mut inflight_ts,
-                &mut histogram,
-                &mut completed,
-                warmup,
-                &mut measured_start,
-            );
-        }
-
-        let ts = Instant::now();
-        producer.publish(InputSlot {
-            connection_id: 0,
-            event: JournalEvent::SubmitOrder {
-                symbol: Symbol(1),
-                order: Order {
-                    id: order_id,
-                    account: AccountId(1),
-                    side,
-                    order_type: OrderType::Limit {
-                        price: Price(nz(100)),
-                    },
-                    time_in_force: TimeInForce::GTC,
-                    quantity: Quantity(nz(1)),
-                    stp: SelfTradeProtection::Allow,
-                },
-            },
-            publish_ts: trace_ts(),
-            recv_ts: trace_ts(),
-        });
-        inflight_ts.push_back(ts);
-    }
-
-    // Drain remaining responses.
     while completed < total_orders {
-        drain_output(
-            &mut output_consumer,
-            &mut inflight_ts,
-            &mut histogram,
-            &mut completed,
-            warmup,
-            &mut measured_start,
-        );
+        let Some((_seq, slot)) = output_consumer.try_consume() else {
+            std::hint::spin_loop();
+            continue;
+        };
+        if matches!(
+            slot.payload,
+            melin_engine::journal::pipeline::OutputPayload::BatchEnd
+        ) {
+            let sent_at = ts_rx.recv().expect("timestamp channel");
+            inflight.fetch_sub(1, Ordering::Release);
+            let latency_ns = sent_at.elapsed().as_nanos() as u64;
+            if completed >= warmup {
+                if measured_start.is_none() {
+                    measured_start = Some(Instant::now());
+                }
+                histogram.record(latency_ns).expect("record");
+            }
+            completed += 1;
+        }
     }
+
+    publish_handle.join().expect("publisher thread");
 
     let end = Instant::now();
     let measured_wall = measured_start
@@ -652,37 +672,6 @@ fn run_pipeline_bench(
     let _ = matching_handle.join();
 
     let _ = std::fs::remove_dir_all(&tmp_dir);
-}
-
-/// Drain available OutputSlots from the SPSC consumer, recording latency
-/// for each BatchEnd response.
-fn drain_output(
-    consumer: &mut melin_disruptor::spsc::Consumer<melin_engine::journal::pipeline::OutputSlot>,
-    inflight_ts: &mut VecDeque<Instant>,
-    histogram: &mut Histogram<u64>,
-    completed: &mut usize,
-    warmup: usize,
-    measured_start: &mut Option<Instant>,
-) {
-    use melin_engine::journal::pipeline::OutputPayload;
-
-    loop {
-        let Some((_seq, slot)) = consumer.try_consume() else {
-            std::hint::spin_loop();
-            return;
-        };
-        if matches!(slot.payload, OutputPayload::BatchEnd) {
-            let sent_at = inflight_ts.pop_front().expect("inflight timestamp");
-            let latency_ns = sent_at.elapsed().as_nanos() as u64;
-            if *completed >= warmup {
-                if measured_start.is_none() {
-                    *measured_start = Some(Instant::now());
-                }
-                histogram.record(latency_ns).expect("record");
-            }
-            *completed += 1;
-        }
-    }
 }
 
 // ===========================================================================
