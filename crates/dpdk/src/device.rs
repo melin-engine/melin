@@ -34,6 +34,16 @@ pub struct DpdkDevice {
     offloads: ChecksumOffloads,
     /// Cached TX offload flags (computed once at init, reused per packet).
     tx_ol_flags: u64,
+    /// Injected frames to feed into smoltcp's RX path (e.g., crafted ARP
+    /// replies to seed the neighbor cache on SR-IOV VFs that drop broadcast).
+    inject_queue: Vec<Vec<u8>>,
+    /// (source_mac, source_ip) pairs learned from incoming IPv4 Ethernet
+    /// frames. Drained by the transport to seed smoltcp's neighbor cache
+    /// via crafted ARP replies (workaround for SR-IOV VFs that drop
+    /// broadcast ARP).
+    learned_neighbors: Vec<([u8; 6], [u8; 4])>,
+    /// Set of IPs we've already seeded to avoid repeated injections.
+    known_neighbors: std::collections::HashSet<[u8; 4]>,
 }
 
 // SAFETY: DpdkDevice is only used from the single DPDK poll thread.
@@ -63,6 +73,9 @@ impl DpdkDevice {
             rx_cursor: 0,
             offloads,
             tx_ol_flags,
+            inject_queue: Vec::new(),
+            learned_neighbors: Vec::new(),
+            known_neighbors: std::collections::HashSet::new(),
         }
     }
 
@@ -79,6 +92,19 @@ impl DpdkDevice {
 
         self.rx_count = count as usize;
         self.rx_cursor = 0;
+    }
+
+    /// Inject a raw Ethernet frame into smoltcp's RX path.
+    /// Used to seed the neighbor cache with crafted ARP replies on SR-IOV
+    /// VFs that can't receive broadcast ARP.
+    pub fn inject_rx(&mut self, frame: Vec<u8>) {
+        self.inject_queue.push(frame);
+    }
+
+    /// Learned (source_mac, source_ip) pairs from incoming IPv4 frames.
+    /// Drained by the transport to seed smoltcp's neighbor cache.
+    pub fn take_learned_neighbors(&mut self) -> Vec<([u8; 6], [u8; 4])> {
+        std::mem::take(&mut self.learned_neighbors)
     }
 
     /// Capabilities accessor for use by DpdkDeviceRef.
@@ -116,6 +142,18 @@ impl Device for DpdkDevice {
     type TxToken<'a> = DpdkTxToken;
 
     fn receive(&mut self, _timestamp: Instant) -> Option<(Self::RxToken<'_>, Self::TxToken<'_>)> {
+        // Drain injected frames first (crafted ARP replies for neighbor
+        // cache seeding). These are owned Vec<u8> buffers, not DPDK mbufs.
+        if let Some(frame) = self.inject_queue.pop() {
+            let rx_token = DpdkRxToken::Injected(frame);
+            let tx_token = DpdkTxToken {
+                port_id: self.port_id,
+                mempool: self.mempool,
+                tx_ol_flags: self.tx_ol_flags,
+            };
+            return Some((rx_token, tx_token));
+        }
+
         if self.rx_cursor >= self.rx_count {
             return None;
         }
@@ -133,11 +171,30 @@ impl Device for DpdkDevice {
             (ptr, len)
         };
 
+        // Learn source MAC+IP from incoming IPv4 frames to seed smoltcp's
+        // neighbor cache. On SR-IOV VFs that drop broadcast ARP, this is the
+        // only way smoltcp can learn peer MACs. Costs ~5ns per packet (two
+        // cache-hot byte reads from the mbuf we're already touching).
+        if data_len >= 34 {
+            let data = unsafe { std::slice::from_raw_parts(data_ptr as *const u8, data_len) };
+            // EtherType at offset 12: 0x0800 = IPv4
+            if data[12] == 0x08 && data[13] == 0x00 {
+                let mut src_mac = [0u8; 6];
+                src_mac.copy_from_slice(&data[6..12]);
+                let mut src_ip = [0u8; 4];
+                src_ip.copy_from_slice(&data[26..30]);
+                if !self.known_neighbors.contains(&src_ip) {
+                    self.known_neighbors.insert(src_ip);
+                    self.learned_neighbors.push((src_mac, src_ip));
+                }
+            }
+        }
+
         // Pass the mbuf directly to the RxToken. The token holds the raw
         // pointer and frees it after smoltcp consumes the packet data.
         // This avoids any copy or allocation — smoltcp reads directly
         // from DPDK hugepage memory.
-        let rx_token = DpdkRxToken {
+        let rx_token = DpdkRxToken::Mbuf {
             mbuf,
             data_ptr: data_ptr as *const u8,
             data_len,
@@ -164,13 +221,21 @@ impl Device for DpdkDevice {
     }
 }
 
-/// RX token: holds one received Ethernet frame via a DPDK mbuf.
-/// Zero-copy: smoltcp reads directly from hugepage-backed mbuf memory.
-/// The mbuf is freed back to the pool when the token is consumed.
-pub struct DpdkRxToken {
-    mbuf: *mut ffi::rte_mbuf,
-    data_ptr: *const u8,
-    data_len: usize,
+/// RX token: holds one received Ethernet frame.
+///
+/// Two variants:
+/// - `Mbuf`: zero-copy from DPDK hugepage memory. The mbuf is freed after consume.
+/// - `Injected`: owned buffer for crafted frames (e.g., ARP replies to seed
+///   the neighbor cache on SR-IOV VFs that can't receive broadcast ARP).
+pub enum DpdkRxToken {
+    /// Zero-copy: smoltcp reads directly from hugepage-backed mbuf memory.
+    Mbuf {
+        mbuf: *mut ffi::rte_mbuf,
+        data_ptr: *const u8,
+        data_len: usize,
+    },
+    /// Injected frame (owned buffer, no DPDK mbuf).
+    Injected(Vec<u8>),
 }
 
 impl phy::RxToken for DpdkRxToken {
@@ -178,14 +243,23 @@ impl phy::RxToken for DpdkRxToken {
     where
         F: FnOnce(&[u8]) -> R,
     {
-        // SAFETY: data_ptr points into the mbuf's data area which remains
-        // valid until rte_pktmbuf_free is called. We call f() first, then free.
-        let data = unsafe { std::slice::from_raw_parts(self.data_ptr, self.data_len) };
-        let result = f(data);
-        unsafe {
-            ffi::dpdk_pktmbuf_free(self.mbuf);
+        match self {
+            DpdkRxToken::Mbuf {
+                mbuf,
+                data_ptr,
+                data_len,
+            } => {
+                // SAFETY: data_ptr points into the mbuf's data area which remains
+                // valid until rte_pktmbuf_free is called. We call f() first, then free.
+                let data = unsafe { std::slice::from_raw_parts(data_ptr, data_len) };
+                let result = f(data);
+                unsafe {
+                    ffi::dpdk_pktmbuf_free(mbuf);
+                }
+                result
+            }
+            DpdkRxToken::Injected(ref frame) => f(frame),
         }
-        result
     }
 }
 

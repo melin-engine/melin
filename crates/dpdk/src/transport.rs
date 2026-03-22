@@ -236,6 +236,14 @@ impl DpdkTransport {
         }
 
         self.device.poll_rx();
+
+        // Auto-learn MAC→IP from incoming frames and seed smoltcp's neighbor
+        // cache. Workaround for SR-IOV VFs that drop broadcast ARP replies.
+        for (mac, ip_bytes) in self.device.take_learned_neighbors() {
+            let ip = Ipv4Addr::new(ip_bytes[0], ip_bytes[1], ip_bytes[2], ip_bytes[3]);
+            self.seed_neighbor(ip, mac);
+        }
+
         self.iface
             .poll(self.cached_timestamp, &mut self.device, &mut self.sockets);
         self.check_listener();
@@ -344,6 +352,50 @@ impl DpdkTransport {
         let socket = self.sockets.get_mut::<tcp::Socket>(handle);
         socket.close();
         self.tx_queues.remove(&handle);
+    }
+
+    /// Seed smoltcp's neighbor cache by injecting a crafted ARP reply.
+    ///
+    /// SR-IOV VFs on Intel X710 (and similar NICs) can't receive broadcast
+    /// frames, so ARP resolution fails. This method injects a fake ARP reply
+    /// into smoltcp's RX path so it learns the IP→MAC mapping without
+    /// needing a real ARP exchange.
+    ///
+    /// Call this for any peer IP that smoltcp needs to reach (e.g., bench
+    /// clients, gateways) when running on an SR-IOV VF.
+    pub fn seed_neighbor(&mut self, ip: Ipv4Addr, mac: [u8; 6]) {
+        let our_mac = self._port.mac_addr();
+        let our_ip = self.iface.ipv4_addr().expect("interface has IPv4 address");
+
+        // Craft an ARP reply Ethernet frame:
+        //   Ethernet: dst=our_mac, src=peer_mac, type=0x0806 (ARP)
+        //   ARP: reply, sender_hw=peer_mac, sender_ip=peer_ip,
+        //        target_hw=our_mac, target_ip=our_ip
+        let mut frame = [0u8; 42]; // 14 (eth) + 28 (ARP) = 42 bytes
+
+        // Ethernet header
+        frame[0..6].copy_from_slice(&our_mac); // dst MAC (us)
+        frame[6..12].copy_from_slice(&mac); // src MAC (peer)
+        frame[12..14].copy_from_slice(&[0x08, 0x06]); // EtherType: ARP
+
+        // ARP payload
+        frame[14..16].copy_from_slice(&[0x00, 0x01]); // hardware type: Ethernet
+        frame[16..18].copy_from_slice(&[0x08, 0x00]); // protocol type: IPv4
+        frame[18] = 6; // hardware addr len
+        frame[19] = 4; // protocol addr len
+        frame[20..22].copy_from_slice(&[0x00, 0x02]); // operation: reply
+        frame[22..28].copy_from_slice(&mac); // sender hardware addr
+        frame[28..32].copy_from_slice(&ip.octets()); // sender protocol addr
+        frame[32..38].copy_from_slice(&our_mac); // target hardware addr
+        frame[38..42].copy_from_slice(&our_ip.octets()); // target protocol addr
+
+        self.device.inject_rx(frame.to_vec());
+
+        tracing::info!(
+            peer_ip = %ip,
+            peer_mac = ?mac,
+            "seeded neighbor cache with ARP reply"
+        );
     }
 }
 
