@@ -73,7 +73,7 @@ fn main() {
             void dpdk_mbuf_set_data_len(struct rte_mbuf *m, uint16_t len);\n\
             uint32_t dpdk_mbuf_pkt_len(const struct rte_mbuf *m);\n\
             void dpdk_mbuf_set_pkt_len(struct rte_mbuf *m, uint32_t len);\n\
-            char *dpdk_mbuf_buf_addr(const struct rte_mbuf *m);\n\
+            void *dpdk_mbuf_buf_addr(const struct rte_mbuf *m);\n\
             ",
         )
         .clang_args(&include_args)

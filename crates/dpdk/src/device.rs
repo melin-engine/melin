@@ -86,7 +86,7 @@ impl Device for DpdkDevice {
         // Read packet data via C accessors (avoids direct struct field access
         // on bindgen-generated types with complex unions/bitfields).
         let (data_ptr, data_len) = unsafe {
-            let buf_addr = ffi::dpdk_mbuf_buf_addr(mbuf) as *const u8;
+            let buf_addr = ffi::dpdk_mbuf_buf_addr(mbuf).cast::<u8>();
             let data_off = ffi::dpdk_mbuf_data_off(mbuf) as usize;
             let ptr = buf_addr.add(data_off);
             let len = ffi::dpdk_mbuf_data_len(mbuf) as usize;
@@ -161,11 +161,10 @@ impl phy::TxToken for DpdkTxToken {
         let mbuf = unsafe { ffi::dpdk_pktmbuf_alloc(self.mempool) };
         assert!(!mbuf.is_null(), "mbuf alloc failed — mempool exhausted");
 
-        // Get mutable slice via C accessors. Cast to *mut u8 because
-        // dpdk_mbuf_buf_addr returns char* which is *mut i8 on x86_64
-        // but *mut u8 on aarch64.
+        // Get mutable slice via C accessors. Cast from *mut c_void to
+        // *mut u8 (dpdk_mbuf_buf_addr returns void*).
         let data_ptr = unsafe {
-            let buf_addr = ffi::dpdk_mbuf_buf_addr(mbuf) as *mut u8;
+            let buf_addr = ffi::dpdk_mbuf_buf_addr(mbuf).cast::<u8>();
             let data_off = ffi::dpdk_mbuf_data_off(mbuf) as usize;
             buf_addr.add(data_off)
         };

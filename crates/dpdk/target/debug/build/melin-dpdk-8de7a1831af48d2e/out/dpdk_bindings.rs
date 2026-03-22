@@ -3308,5 +3308,5 @@ unsafe extern "C" {
     pub fn dpdk_mbuf_set_pkt_len(m: *mut rte_mbuf, len: u32);
 }
 unsafe extern "C" {
-    pub fn dpdk_mbuf_buf_addr(m: *const rte_mbuf) -> *mut ::core::ffi::c_char;
+    pub fn dpdk_mbuf_buf_addr(m: *const rte_mbuf) -> *mut ::core::ffi::c_void;
 }

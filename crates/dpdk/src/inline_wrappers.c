@@ -58,6 +58,9 @@ void dpdk_mbuf_set_pkt_len(struct rte_mbuf *m, uint32_t len) {
     m->pkt_len = len;
 }
 
-char *dpdk_mbuf_buf_addr(const struct rte_mbuf *m) {
-    return (char *)m->buf_addr;
+/* Return buf_addr as void* to avoid platform-specific char signedness
+ * issues (char is signed on x86_64, unsigned on aarch64). Rust callers
+ * cast to *mut u8 / *const u8 as needed. */
+void *dpdk_mbuf_buf_addr(const struct rte_mbuf *m) {
+    return m->buf_addr;
 }

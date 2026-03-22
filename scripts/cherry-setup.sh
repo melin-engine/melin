@@ -68,9 +68,12 @@ apt-get install -y --no-install-recommends \
 # Intel ice driver with SR-IOV support. Debian's stock ice module is
 # built without CONFIG_PCI_IOV, so sriov_numvfs doesn't exist. The
 # Intel out-of-tree driver includes full SR-IOV + ADQ support.
+#
+# IMPORTANT: The driver is built and installed but NOT loaded here.
+# Loading requires rmmod ice, which kills the bonded network ports
+# and drops SSH. A REBOOT is needed to activate the new driver.
 install_ice_driver() {
     local ICE_VERSION="1.14.9"
-    local ICE_URL="https://downloadmirror.intel.com/830206/ice-${ICE_VERSION}.tar.gz"
     local ICE_DIR="/tmp/ice-${ICE_VERSION}"
 
     # Skip if SR-IOV already works.
@@ -91,14 +94,33 @@ install_ice_driver() {
 
     # Build dependencies.
     apt-get install -y --no-install-recommends \
-        linux-headers-$(uname -r) \
-        gcc make \
+        "linux-headers-$(uname -r)" \
+        gcc make curl \
         || { echo "  WARNING: could not install kernel headers"; return; }
 
-    # Download and build.
+    # Download from Intel's SourceForge mirror (the downloadmirror.intel.com
+    # URLs are unstable). Fall back to GitHub ice driver releases.
     cd /tmp
     if [[ ! -d "$ICE_DIR" ]]; then
-        curl -sL "$ICE_URL" | tar xz
+        echo "  Downloading ice driver v${ICE_VERSION}..."
+        local downloaded=0
+
+        # Try Intel's download mirror first.
+        for url in \
+            "https://downloadmirror.intel.com/830206/ice-${ICE_VERSION}.tar.gz" \
+            "https://sourceforge.net/projects/e1000/files/ice%20stable/${ICE_VERSION}/ice-${ICE_VERSION}.tar.gz/download"
+        do
+            if curl -fsSL "$url" -o "/tmp/ice-${ICE_VERSION}.tar.gz" 2>/dev/null; then
+                tar xzf "/tmp/ice-${ICE_VERSION}.tar.gz" -C /tmp
+                downloaded=1
+                break
+            fi
+        done
+
+        if [[ "$downloaded" -eq 0 ]]; then
+            echo "  WARNING: could not download ice driver from any mirror"
+            return
+        fi
     fi
 
     if [[ ! -d "${ICE_DIR}/src" ]]; then
@@ -106,22 +128,26 @@ install_ice_driver() {
         return
     fi
 
+    # Build and install the module.
     cd "${ICE_DIR}/src"
-    make -j$(nproc) install 2>&1 | tail -5
-
-    # Reload the driver.
-    rmmod ice 2>/dev/null || true
-    modprobe ice
-    sleep 2
-
-    # Verify SR-IOV is now available.
-    if [[ -f "/sys/bus/pci/devices/${pci}/sriov_totalvfs" ]]; then
-        local max_vfs
-        max_vfs=$(cat "/sys/bus/pci/devices/${pci}/sriov_totalvfs")
-        echo "  ice driver installed — SR-IOV available (max ${max_vfs} VFs)"
-    else
-        echo "  WARNING: ice driver installed but SR-IOV still not available"
+    if ! make -j"$(nproc)" install 2>&1 | tail -10; then
+        echo "  WARNING: ice driver build failed"
+        return
     fi
+
+    # Verify the module was installed.
+    if modinfo ice 2>/dev/null | grep -q "${ICE_DIR}"; then
+        echo "  ice driver v${ICE_VERSION} built and installed"
+    else
+        echo "  ice driver built (will activate after reboot)"
+    fi
+
+    # Do NOT rmmod/modprobe here — that would kill the bonded network
+    # ports and drop SSH. Signal that a reboot is needed instead.
+    # depmod ensures the new module is found on next boot.
+    depmod -a
+    touch /tmp/.cherry-needs-reboot
+    echo "  *** REBOOT REQUIRED to activate the new ice driver ***"
 }
 
 install_ice_driver
