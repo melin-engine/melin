@@ -7,6 +7,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use clap::Parser;
+#[cfg(not(feature = "dpdk"))]
 use melin_protocol::tcp::BlockingTcpListener;
 use melin_server::server::ServerConfig;
 
@@ -54,6 +55,30 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let config = ServerConfig::parse();
-    let listener = BlockingTcpListener::bind(config.bind)?;
-    melin_server::server::run_with_shutdown(listener, config, shutdown)
+
+    #[cfg(feature = "dpdk")]
+    {
+        let dpdk_config = melin_dpdk::DpdkConfig {
+            eal_args: config
+                .dpdk_eal_args
+                .split_whitespace()
+                .map(String::from)
+                .collect(),
+            port_id: config.dpdk_port,
+            ip_addr: config.dpdk_ip.parse().expect("invalid --dpdk-ip address"),
+            prefix_len: config.dpdk_prefix_len,
+            gateway: config
+                .dpdk_gateway
+                .as_deref()
+                .map(|s| s.parse().expect("invalid --dpdk-gateway address")),
+            listen_port: config.bind.port(),
+        };
+        return melin_server::server::run_dpdk(config, dpdk_config, shutdown);
+    }
+
+    #[cfg(not(feature = "dpdk"))]
+    {
+        let listener = BlockingTcpListener::bind(config.bind)?;
+        melin_server::server::run_with_shutdown(listener, config, shutdown)
+    }
 }

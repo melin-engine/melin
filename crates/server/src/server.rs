@@ -140,6 +140,28 @@ pub struct ServerConfig {
     /// before the journal stage backpressures. Default: 256 (32 MiB).
     #[arg(long, default_value_t = 256)]
     pub replication_ring_size: usize,
+
+    // --- DPDK configuration (only used with --features dpdk) ---
+    /// DPDK EAL arguments (space-separated). Example: "-l 0-7 --huge-dir /dev/hugepages".
+    /// Passed directly to rte_eal_init. Only used when compiled with --features dpdk.
+    #[arg(long, default_value = "")]
+    pub dpdk_eal_args: String,
+
+    /// DPDK port ID (the NIC bound to DPDK). Default: 0 (first available port).
+    #[arg(long, default_value_t = 0)]
+    pub dpdk_port: u16,
+
+    /// IPv4 address for the DPDK interface (e.g., "10.0.0.1").
+    #[arg(long, default_value = "10.0.0.1")]
+    pub dpdk_ip: String,
+
+    /// IPv4 prefix length for the DPDK interface. Default: 24.
+    #[arg(long, default_value_t = 24)]
+    pub dpdk_prefix_len: u8,
+
+    /// IPv4 gateway for the DPDK interface (optional, needed for cross-subnet traffic).
+    #[arg(long)]
+    pub dpdk_gateway: Option<String>,
 }
 
 impl Default for ServerConfig {
@@ -171,6 +193,11 @@ impl Default for ServerConfig {
             max_journal_batch: 1024,
             replication_heartbeat_secs: 5,
             replication_ring_size: 256,
+            dpdk_eal_args: String::new(),
+            dpdk_port: 0,
+            dpdk_ip: "10.0.0.1".into(),
+            dpdk_prefix_len: 24,
+            dpdk_gateway: None,
         }
     }
 }
@@ -735,6 +762,281 @@ pub fn run_with_shutdown<L: BlockingTransportListener>(
     }
 
     // Join replication thread.
+    if let Some(repl_sender_handle) = replication_handle {
+        let _ = repl_sender_handle.join();
+    }
+
+    info!("shutdown complete");
+    Ok(())
+}
+
+/// Run the trading server with DPDK kernel-bypass networking.
+///
+/// Replaces the kernel TCP stack entirely. The DPDK poll thread handles
+/// all NIC I/O and TCP processing via smoltcp. The response stage encodes
+/// frames and pushes them through an mpsc channel to the poll thread.
+///
+/// Thread layout:
+/// - Core N:   DPDK poll thread (rx_burst, smoltcp, frame decode, tx_burst)
+/// - Core 1:   Journal stage
+/// - Core 2:   Matching stage
+/// - Core 3:   Response stage (encodes to TX channel)
+#[cfg(feature = "dpdk")]
+pub fn run_dpdk(
+    config: ServerConfig,
+    dpdk_config: melin_dpdk::DpdkConfig,
+    shutdown: Arc<AtomicBool>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    // Initialize DPDK transport (EAL, mempool, port, smoltcp).
+    let transport = melin_dpdk::DpdkTransport::init(&dpdk_config)?;
+
+    // Initialize or recover the exchange.
+    let (engine, needs_seeding) = init_engine(&config)?;
+    let (mut exchange, writer) = engine.into_parts();
+    exchange.prefault();
+
+    let active_connections = Arc::new(AtomicU64::new(0));
+
+    // Replication setup (same as epoll path).
+    let enable_replication = config.replication_bind.is_some();
+    if enable_replication && config.standalone {
+        return Err("--replication-bind and --standalone are mutually exclusive".into());
+    }
+
+    let genesis_entry = if enable_replication {
+        use melin_engine::journal::codec::FILE_HEADER_SIZE;
+        let file_bytes = std::fs::read(writer.path())?;
+        let offset = FILE_HEADER_SIZE;
+        if file_bytes.len() < offset + 4 {
+            return Err("journal file too short to contain genesis entry".into());
+        }
+        let entry_len =
+            u16::from_le_bytes([file_bytes[offset + 2], file_bytes[offset + 3]]) as usize;
+        let total = 20 + entry_len + 4;
+        if file_bytes.len() < offset + total {
+            return Err("journal file truncated at genesis entry".into());
+        }
+        file_bytes[offset..offset + total].to_vec()
+    } else {
+        Vec::new()
+    };
+
+    // Build disruptor pipeline.
+    let (
+        input_producer,
+        journal_stage,
+        matching_stage,
+        output_consumer,
+        journal_cursor,
+        matching_cursor,
+        _events_processed,
+        replication,
+        replication_cursor,
+    ) = build_pipeline_with_replication(
+        exchange,
+        writer,
+        config.group_commit_delay(),
+        Arc::clone(&active_connections),
+        enable_replication,
+        config.max_journal_batch,
+        config.replication_ring_size,
+    );
+
+    let heartbeat_interval = config.heartbeat_interval();
+
+    // Clone producer for seeding before moving it to the DPDK thread.
+    let seed_producer = if needs_seeding {
+        Some(input_producer.clone())
+    } else {
+        None
+    };
+
+    // Control channel: DPDK poll thread → response stage (connect/disconnect).
+    let (control_tx, control_rx) = std::sync::mpsc::channel();
+
+    // TX channel: response stage → DPDK poll thread (encoded frames).
+    let (tx_out, tx_rx) = std::sync::mpsc::channel();
+
+    // Spawn pipeline threads (journal, matching — identical to epoll path).
+    let cores = config.cores;
+
+    let s1 = Arc::clone(&shutdown);
+    let journal_handle = std::thread::Builder::new()
+        .name("journal".into())
+        .spawn(move || {
+            apply_affinity("journal", cores.journal);
+            journal_stage.run(&s1)
+        })
+        .expect("failed to spawn journal thread");
+
+    let s2 = Arc::clone(&shutdown);
+    let matching_handle = std::thread::Builder::new()
+        .name("matching".into())
+        .spawn(move || {
+            apply_affinity("matching", cores.matching);
+            matching_stage.run(&s2)
+        })
+        .expect("failed to spawn matching thread");
+
+    // Spawn DPDK response stage (encodes to TX channel instead of kernel sockets).
+    let journal_cursor_response = Arc::clone(&journal_cursor);
+    let replication_cursor_response = Arc::clone(&replication_cursor);
+    let active_connections_response = Arc::clone(&active_connections);
+    let s3 = Arc::clone(&shutdown);
+    let response_handle = std::thread::Builder::new()
+        .name("response".into())
+        .spawn(move || {
+            apply_affinity("response", cores.response);
+            crate::dpdk_response::run(
+                output_consumer,
+                control_rx,
+                journal_cursor_response,
+                replication_cursor_response,
+                &s3,
+                heartbeat_interval,
+                active_connections_response,
+                tx_out,
+            );
+        })
+        .expect("failed to spawn response thread");
+
+    // Spawn replication sender if enabled (identical to epoll path).
+    let replica_ready = Arc::new(AtomicBool::new(false));
+    let replication_handle = if let Some(repl_consumer) = replication {
+        let repl_bind = config
+            .replication_bind
+            .expect("replication_bind must be set");
+        let s_repl = Arc::clone(&shutdown);
+        let repl_cursor = Arc::clone(&replication_cursor);
+        let ready_flag = Arc::clone(&replica_ready);
+        let batch_size = config.replication_batch_size;
+        let heartbeat_secs = config.replication_heartbeat_secs;
+        let repl_sender_handle = std::thread::Builder::new()
+            .name("repl-sender".into())
+            .spawn(move || {
+                apply_affinity("repl-sender", cores.repl_sender);
+                crate::replication::run_sender(
+                    repl_bind,
+                    repl_consumer,
+                    repl_cursor,
+                    genesis_entry,
+                    &s_repl,
+                    &ready_flag,
+                    batch_size,
+                    heartbeat_secs,
+                );
+            })
+            .expect("failed to spawn replication sender thread");
+        info!(addr = %repl_bind, "replication listener started");
+        Some(repl_sender_handle)
+    } else {
+        if !config.standalone && config.replica_of.is_none() {
+            info!("running in standalone mode (no replication)");
+        }
+        None
+    };
+
+    // Seed through the pipeline if needed.
+    if enable_replication && needs_seeding {
+        info!("waiting for replica to connect before seeding...");
+        while !replica_ready.load(Ordering::Acquire) {
+            if shutdown.load(Ordering::Relaxed) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+    }
+    if let Some(producer) = seed_producer {
+        use melin_engine::journal::event::JournalEvent;
+        use melin_engine::journal::pipeline::InputSlot;
+        use melin_engine::journal::trace::trace_ts;
+        use melin_engine::types::{AccountId, CurrencyId, InstrumentSpec, Symbol};
+
+        for i in 1..=config.instruments {
+            producer.publish(InputSlot {
+                connection_id: 0,
+                event: JournalEvent::AddInstrument {
+                    spec: InstrumentSpec {
+                        symbol: Symbol(i),
+                        base: CurrencyId(i * 2 - 1),
+                        quote: CurrencyId(i * 2),
+                    },
+                },
+                publish_ts: trace_ts(),
+                recv_ts: trace_ts(),
+            });
+        }
+
+        let mut last_published_seq = 0u64;
+        for acct in 1..=config.accounts {
+            last_published_seq = producer.publish(InputSlot {
+                connection_id: 0,
+                event: JournalEvent::ProvisionAccount {
+                    account: AccountId(acct),
+                    amount: u64::MAX / 4,
+                },
+                publish_ts: trace_ts(),
+                recv_ts: trace_ts(),
+            });
+        }
+
+        // Wait for seeding to complete through the entire pipeline.
+        let last_seed_seq = last_published_seq + 1;
+        while journal_cursor
+            .get()
+            .load(std::sync::atomic::Ordering::Acquire)
+            < last_seed_seq
+            || matching_cursor
+                .get()
+                .load(std::sync::atomic::Ordering::Acquire)
+                < last_seed_seq
+            || replication_cursor.load(std::sync::atomic::Ordering::Acquire) < last_seed_seq
+        {
+            std::hint::spin_loop();
+        }
+
+        info!(
+            accounts = config.accounts,
+            instruments = config.instruments,
+            "seeded test data through pipeline"
+        );
+    }
+
+    info!(
+        ip = %dpdk_config.ip_addr,
+        port = dpdk_config.listen_port,
+        "DPDK transport listening"
+    );
+
+    // Run the DPDK poll loop on this thread (the main thread).
+    // This blocks until shutdown.
+    crate::dpdk_transport::run_dpdk_poll(transport, input_producer, control_tx, tx_rx, &shutdown);
+
+    // Shutdown sequence.
+    info!("shutdown: draining pipeline");
+    shutdown.store(true, Ordering::Relaxed);
+
+    let mut thread_panicked = false;
+    let mut check_join = |name: &str, result: std::thread::Result<_>| {
+        if let Err(panic) = result {
+            let msg = panic
+                .downcast_ref::<&str>()
+                .copied()
+                .or_else(|| panic.downcast_ref::<String>().map(|s| s.as_str()))
+                .unwrap_or("<non-string panic>");
+            error!(thread = name, message = msg, "pipeline thread panicked");
+            thread_panicked = true;
+        }
+    };
+    check_join("journal", journal_handle.join().map(|_| ()));
+    check_join("matching", matching_handle.join().map(|_| ()));
+    check_join("response", response_handle.join().map(|_| ()));
+
+    if thread_panicked {
+        error!("shutdown complete (with thread panic)");
+        return Err("pipeline thread panicked".into());
+    }
+
     if let Some(repl_sender_handle) = replication_handle {
         let _ = repl_sender_handle.join();
     }
