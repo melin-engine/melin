@@ -295,12 +295,31 @@ impl phy::TxToken for DpdkTxToken {
             ffi::dpdk_mbuf_set_data_len(mbuf, len as u16);
             ffi::dpdk_mbuf_set_pkt_len(mbuf, len as u32);
 
-            // Set hardware checksum offload flags if the NIC supports it.
-            // The NIC needs ol_flags to know what to offload, and l2_len/l3_len
-            // to locate the IP and TCP headers within the frame.
-            if self.tx_ol_flags != 0 && len > 14 + 20 {
-                // Ethernet header = 14 bytes, IPv4 header = 20 bytes (no options).
-                // smoltcp doesn't use IP options or VLAN tags at L2.
+            // Hardware checksum offload: the NIC computes the final checksum,
+            // but DPDK requires a TCP pseudo-header checksum pre-filled in
+            // the TCP checksum field. smoltcp writes zero (Checksum::None),
+            // so we compute and fill the pseudo-header checksum here.
+            //
+            // Frame layout (smoltcp, no VLAN/IP options):
+            //   [0..14]  Ethernet header
+            //   [14..34] IPv4 header (IHL=5, no options)
+            //   [34..]   TCP header + payload
+            //
+            // IPv4 protocol field at offset 23. TCP = 6.
+            if self.tx_ol_flags != 0 && len >= 54 {
+                let proto = *data_ptr.add(23);
+                if proto == 6 {
+                    // TCP pseudo-header checksum:
+                    //   src_ip (4) + dst_ip (4) + [0, proto] (2) + tcp_len (2)
+                    let phdr_cksum =
+                        ipv4_pseudo_header_checksum(std::slice::from_raw_parts(data_ptr, len));
+                    // Write pseudo-header checksum into TCP checksum field
+                    // (offset 14 + 20 + 16 = 50).
+                    let cksum_bytes = phdr_cksum.to_be_bytes();
+                    *data_ptr.add(50) = cksum_bytes[0];
+                    *data_ptr.add(51) = cksum_bytes[1];
+                }
+
                 ffi::dpdk_mbuf_set_ol_flags(mbuf, self.tx_ol_flags);
                 ffi::dpdk_mbuf_set_tx_offload(mbuf, 14, 20, 0);
             }
@@ -317,4 +336,38 @@ impl phy::TxToken for DpdkTxToken {
 
         result
     }
+}
+
+/// Compute the IPv4 TCP pseudo-header checksum (RFC 793).
+///
+/// The pseudo-header consists of src_ip, dst_ip, zero, protocol (6),
+/// and TCP segment length. This is the seed value that the NIC combines
+/// with the TCP header+payload to produce the final checksum.
+///
+/// `frame` is a complete Ethernet frame (14-byte header + IPv4 + TCP).
+fn ipv4_pseudo_header_checksum(frame: &[u8]) -> u16 {
+    // Source IP at offset 26, Dest IP at offset 30.
+    let src_ip = &frame[26..30];
+    let dst_ip = &frame[30..34];
+    // TCP segment length = total frame length - Ethernet header - IPv4 header.
+    let tcp_len = (frame.len() - 34) as u16;
+
+    let mut sum: u32 = 0;
+    // Source IP (two 16-bit words).
+    sum += u16::from_be_bytes([src_ip[0], src_ip[1]]) as u32;
+    sum += u16::from_be_bytes([src_ip[2], src_ip[3]]) as u32;
+    // Dest IP (two 16-bit words).
+    sum += u16::from_be_bytes([dst_ip[0], dst_ip[1]]) as u32;
+    sum += u16::from_be_bytes([dst_ip[2], dst_ip[3]]) as u32;
+    // Zero + Protocol (TCP = 6).
+    sum += 6u32;
+    // TCP segment length.
+    sum += tcp_len as u32;
+
+    // Fold 32-bit sum to 16-bit with carry.
+    while sum >> 16 != 0 {
+        sum = (sum & 0xFFFF) + (sum >> 16);
+    }
+
+    sum as u16
 }
