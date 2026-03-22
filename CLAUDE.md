@@ -87,11 +87,27 @@ DPDK kernel-bypass networking at the transport edge — bypasses the Linux kerne
 - Debian Trixie's ice module lacks SR-IOV entirely. Don't use Debian for DPDK.
 - Two servers on the same VLAN required for benchmarking — switches don't hairpin traffic to the same server.
 
+**Benchmark results (Cherry Servers, AMD EPYC, Intel X710 10GbE, VLAN, Debian 6.12 kernel):**
+
+Compared DPDK+smoltcp server vs kernel TCP server, both with kernel TCP bench client, 1 client, window 256, 10M order pairs, full journal durability:
+
+| Transport | Throughput | p50 | p99 | p99.9 | max |
+|-----------|-----------|-----|-----|-------|-----|
+| Kernel TCP (io_uring) | 669K ord/s | 347 µs | 444 µs | 488 µs | 4.5 ms |
+| DPDK + smoltcp | 446K ord/s | 471 µs | 707 µs | 10.2 ms | 43.1 ms |
+
+**Result: kernel TCP is faster on this hardware.** smoltcp's software TCP processing (checksums, per-packet handling, no TSO/GRO) adds more overhead than the syscalls it eliminates. The DPDK path would benefit from:
+- Hardware checksum offload (smoltcp computes in software)
+- Direct PF binding instead of SR-IOV VF (eliminates PF switching fabric overhead)
+- A NIC with Mellanox-style bifurcated driver (avoids SR-IOV entirely)
+- Raw UDP transport (eliminates TCP overhead altogether)
+
 **Known gaps (not yet implemented):**
-- **No idle connection timeout**: authenticated connections have no timeout (epoll/uring path uses `--connection-timeout-secs`). Dead connections rely on smoltcp TCP keepalive.
+- **X710 VF drops broadcast ARP**: VFs only receive unicast frames. Bench must pre-populate ARP (`ip neigh add`) or use unicast ARP. This blocks DPDK-to-DPDK testing. Mellanox ConnectX NICs support broadcast on VFs natively.
+- **Server can't accept new connections after first client disconnects**: smoltcp listener doesn't recover — must restart server between runs.
+- **No idle connection timeout**: authenticated connections have no timeout (epoll/uring path uses `--connection-timeout-secs`).
 - **No `max_connections` enforcement**: the DPDK poll loop accepts all connections without checking the limit.
-- **`active_connections` counter not wired**: counter exists but is never incremented/decremented, breaking stats queries and `--max-connections`.
-- **Hugepage mount not automated in dpdk-setup.sh**: must manually `mount -t hugetlbfs -o pagesize=2M nodev /mnt/huge_2m` before starting.
+- **`active_connections` counter not wired**: counter exists but is never incremented/decremented.
 
 ## Dead Ends / Investigated & Rejected
 
