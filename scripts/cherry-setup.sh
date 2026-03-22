@@ -59,10 +59,72 @@ apt-get install -y --no-install-recommends \
 
 # DPDK kernel-bypass networking (optional — only needed with --features dpdk).
 # libdpdk-dev provides headers + pkg-config for bindgen FFI generation.
+# dpdk-dev provides dpdk-devbind.py for NIC binding.
 apt-get install -y --no-install-recommends \
     libdpdk-dev \
     dpdk-dev \
     || true  # may not be available on all distros/versions
+
+# Intel ice driver with SR-IOV support. Debian's stock ice module is
+# built without CONFIG_PCI_IOV, so sriov_numvfs doesn't exist. The
+# Intel out-of-tree driver includes full SR-IOV + ADQ support.
+install_ice_driver() {
+    local ICE_VERSION="1.14.9"
+    local ICE_URL="https://downloadmirror.intel.com/830206/ice-${ICE_VERSION}.tar.gz"
+    local ICE_DIR="/tmp/ice-${ICE_VERSION}"
+
+    # Skip if SR-IOV already works.
+    local pci
+    pci=$(lspci -D | grep -i "Ethernet.*E810" | head -1 | awk '{print $1}')
+    if [[ -n "$pci" && -f "/sys/bus/pci/devices/${pci}/sriov_totalvfs" ]]; then
+        echo "  ice driver already has SR-IOV support, skipping"
+        return
+    fi
+
+    # Skip if no E810 NIC.
+    if [[ -z "$pci" ]]; then
+        echo "  No Intel E810 NIC found, skipping ice driver install"
+        return
+    fi
+
+    echo "  Installing Intel ice driver v${ICE_VERSION} for SR-IOV support..."
+
+    # Build dependencies.
+    apt-get install -y --no-install-recommends \
+        linux-headers-$(uname -r) \
+        gcc make \
+        || { echo "  WARNING: could not install kernel headers"; return; }
+
+    # Download and build.
+    cd /tmp
+    if [[ ! -d "$ICE_DIR" ]]; then
+        curl -sL "$ICE_URL" | tar xz
+    fi
+
+    if [[ ! -d "${ICE_DIR}/src" ]]; then
+        echo "  WARNING: ice source not found at ${ICE_DIR}/src"
+        return
+    fi
+
+    cd "${ICE_DIR}/src"
+    make -j$(nproc) install 2>&1 | tail -5
+
+    # Reload the driver.
+    rmmod ice 2>/dev/null || true
+    modprobe ice
+    sleep 2
+
+    # Verify SR-IOV is now available.
+    if [[ -f "/sys/bus/pci/devices/${pci}/sriov_totalvfs" ]]; then
+        local max_vfs
+        max_vfs=$(cat "/sys/bus/pci/devices/${pci}/sriov_totalvfs")
+        echo "  ice driver installed — SR-IOV available (max ${max_vfs} VFs)"
+    else
+        echo "  WARNING: ice driver installed but SR-IOV still not available"
+    fi
+}
+
+install_ice_driver
 
 # Benchmarking / diagnostics
 apt-get install -y --no-install-recommends \

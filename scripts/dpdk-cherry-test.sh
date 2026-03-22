@@ -96,12 +96,13 @@ ssh $SSH_OPTS "$SERVER" "cd ${REPO} && \
 echo "  Waiting for TAP..."
 sleep 3
 
-# Configure kernel routing to the TAP
+# Configure kernel routing to the TAP. Use /32 to avoid adding a subnet
+# route that conflicts with the bond VLAN's 10.x.x.0/24 route.
 ssh $SSH_OPTS "$SERVER" "\
     if ip link show dtap0 >/dev/null 2>&1; then \
-        ip addr add ${TAP_IP}/24 dev dtap0 2>/dev/null || true; \
+        ip addr add ${TAP_IP}/32 dev dtap0 2>/dev/null || true; \
         ip link set dtap0 up; \
-        echo '  dtap0 up with ${TAP_IP}/24'; \
+        echo '  dtap0 up with ${TAP_IP}/32'; \
     else \
         echo '  ERROR: dtap0 not found'; \
         tail -20 /tmp/melin-server.log; \

@@ -100,6 +100,14 @@ if ! lsmod | grep -q "^ice "; then
     exit 1
 fi
 
+# Check SR-IOV support.
+if [[ ! -f "/sys/bus/pci/devices/${PF0_PCI}/sriov_totalvfs" ]]; then
+    echo "error: SR-IOV not available on ${PF0_PCI}." >&2
+    echo "  The ice driver may lack CONFIG_PCI_IOV support." >&2
+    echo "  Run cherry-setup.sh first — it installs Intel's out-of-tree ice driver." >&2
+    exit 1
+fi
+
 echo "=== DPDK SR-IOV Setup for Intel E810 ==="
 echo "  PF0: ${PF0_PCI} (${PF0_IFACE})"
 echo "  PF1: ${PF1_PCI} (${PF1_IFACE})"
