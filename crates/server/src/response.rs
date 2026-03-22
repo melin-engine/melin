@@ -113,8 +113,7 @@ pub fn run(
         let written =
             codec::encode_response(&ResponseKind::Heartbeat, &mut buf).expect("heartbeat encodes");
         // write_frame expects payload without length prefix.
-        let payload = buf[4..written].to_vec();
-        payload
+        buf[4..written].to_vec()
     };
 
     // Coarse timestamp for heartbeat scan — avoids Instant::now() on every spin.

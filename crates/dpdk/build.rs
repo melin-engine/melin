@@ -134,12 +134,11 @@ fn find_clang_resource_dir() -> Option<String> {
     if let Ok(output) = std::process::Command::new("clang")
         .arg("--print-resource-dir")
         .output()
+        && output.status.success()
     {
-        if output.status.success() {
-            let dir = String::from_utf8_lossy(&output.stdout).trim().to_string();
-            if std::path::Path::new(&format!("{dir}/include/stddef.h")).exists() {
-                return Some(dir);
-            }
+        let dir = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        if std::path::Path::new(&format!("{dir}/include/stddef.h")).exists() {
+            return Some(dir);
         }
     }
 

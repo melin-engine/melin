@@ -68,7 +68,7 @@ enum AuthState {
         accepted_at: Instant,
     },
     /// Auth completed successfully. Connection is ready for trading.
-    Authenticated { permission: Permission },
+    Authenticated { _permission: Permission },
 }
 
 /// Per-connection state in the DPDK poll thread.
@@ -153,10 +153,10 @@ pub fn run_dpdk_poll(
 
         // 3. Drain TX frames from the response stage into smoltcp sockets.
         while let Ok(frame) = tx_rx.try_recv() {
-            if let Some(&handle) = id_to_handle.get(&frame.connection_id) {
-                if let Some(conn) = connections.get(&handle) {
-                    transport.queue_send(conn.handle, &frame.data);
-                }
+            if let Some(&handle) = id_to_handle.get(&frame.connection_id)
+                && let Some(conn) = connections.get(&handle)
+            {
+                transport.queue_send(conn.handle, &frame.data);
             }
         }
 
@@ -170,17 +170,17 @@ pub fn run_dpdk_poll(
             };
 
             // Check auth timeout for pending connections.
-            if let AuthState::WaitingForResponse { accepted_at, .. } = &conn.auth {
-                if accepted_at.elapsed() > AUTH_TIMEOUT {
-                    debug!(
-                        connection_id = conn.connection_id.0,
-                        addr = %conn.addr,
-                        "DPDK: auth timeout, dropping connection"
-                    );
-                    transport.close(conn.handle);
-                    connections.remove(&handle);
-                    continue;
-                }
+            if let AuthState::WaitingForResponse { accepted_at, .. } = &conn.auth
+                && accepted_at.elapsed() > AUTH_TIMEOUT
+            {
+                debug!(
+                    connection_id = conn.connection_id.0,
+                    addr = %conn.addr,
+                    "DPDK: auth timeout, dropping connection"
+                );
+                transport.close(conn.handle);
+                connections.remove(&handle);
+                continue;
             }
 
             // Read available data from smoltcp socket.
@@ -227,7 +227,6 @@ pub fn run_dpdk_poll(
                         &producer,
                         &control_tx,
                         &mut id_to_handle,
-                        handle,
                     );
                 }
             }
@@ -357,7 +356,9 @@ fn process_auth_frame(
     );
 
     // Transition to authenticated state.
-    conn.auth = AuthState::Authenticated { permission };
+    conn.auth = AuthState::Authenticated {
+        _permission: permission,
+    };
 
     // Register with the response stage and ID map.
     id_to_handle.insert(conn.connection_id.0, handle);
@@ -384,7 +385,6 @@ fn process_trading_frames(
     producer: &ring::MultiProducer<InputSlot>,
     control_tx: &mpsc::Sender<ControlEvent>,
     id_to_handle: &mut HashMap<u64, SocketHandle>,
-    handle: SocketHandle,
 ) {
     while conn.parse_buf.len() >= 4 {
         let frame_len = u32::from_le_bytes([
@@ -417,17 +417,17 @@ fn process_trading_frames(
 
         match codec::decode_request(payload) {
             Ok(request) => {
-                if matches!(
+                if !matches!(
                     request,
                     Request::Heartbeat | Request::ChallengeResponse { .. }
                 ) {
-                    // Heartbeat: no-op.
-                } else {
+                    #[allow(clippy::let_unit_value)] // trace_ts() returns () without latency-trace
                     let recv_ts = trace_ts();
                     let event = request_to_event(&request);
                     producer.publish(InputSlot {
                         connection_id: conn.connection_id.0,
                         event,
+                        #[allow(clippy::let_unit_value)]
                         publish_ts: trace_ts(),
                         recv_ts,
                     });

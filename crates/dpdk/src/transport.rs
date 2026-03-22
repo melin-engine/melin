@@ -23,12 +23,6 @@ const MAX_CONNECTIONS: usize = 1024;
 /// TCP listen port for trading connections.
 const LISTEN_PORT: u16 = 9876;
 
-/// TCP receive buffer size per connection.
-const TCP_RX_BUF_SIZE: usize = 65536;
-
-/// TCP send buffer size per connection.
-const TCP_TX_BUF_SIZE: usize = 65536;
-
 /// Configuration for the DPDK transport.
 pub struct DpdkConfig {
     pub eal_args: Vec<String>,
@@ -198,7 +192,6 @@ impl DpdkTransport {
                             remote.port,
                         )
                     }
-                    _ => return,
                 }
             } else {
                 return;
@@ -266,7 +259,7 @@ impl DpdkTransport {
     pub fn queue_send(&mut self, handle: SocketHandle, data: &[u8]) {
         self.tx_queues
             .entry(handle)
-            .or_insert_with(Vec::new)
+            .or_default()
             .extend_from_slice(data);
     }
 

@@ -12,6 +12,7 @@
 //! The response thread writes directly to sockets.
 
 use std::net::SocketAddr;
+#[cfg(not(feature = "dpdk"))]
 use std::os::unix::io::AsRawFd;
 use std::path::PathBuf;
 use std::sync::Arc;

@@ -10,10 +10,12 @@
     non_camel_case_types,
     non_snake_case,
     dead_code,
+    unsafe_op_in_unsafe_fn,
     // bindgen sometimes generates types that trigger these.
     clippy::useless_transmute,
     clippy::unnecessary_cast,
     clippy::too_many_arguments,
+    clippy::ptr_offset_with_cast,
 )]
 
 include!(concat!(env!("OUT_DIR"), "/dpdk_bindings.rs"));

@@ -154,7 +154,7 @@ impl phy::TxToken for DpdkTxToken {
         let data_ptr = unsafe {
             let buf_addr = ffi::dpdk_mbuf_buf_addr(mbuf);
             let data_off = ffi::dpdk_mbuf_data_off(mbuf) as usize;
-            buf_addr.add(data_off) as *mut u8
+            buf_addr.add(data_off)
         };
         let buf = unsafe { std::slice::from_raw_parts_mut(data_ptr, len) };
 
