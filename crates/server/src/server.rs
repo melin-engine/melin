@@ -876,6 +876,7 @@ pub fn run_dpdk(
         enable_replication,
         config.max_journal_batch,
         config.replication_ring_size,
+        config.busy_spin,
     );
 
     let heartbeat_interval = config.heartbeat_interval();
@@ -947,6 +948,7 @@ pub fn run_dpdk(
         let ready_flag = Arc::clone(&replica_ready);
         let batch_size = config.replication_batch_size;
         let heartbeat_secs = config.replication_heartbeat_secs;
+        let busy_spin = config.busy_spin;
         let repl_sender_handle = std::thread::Builder::new()
             .name("repl-sender".into())
             .spawn(move || {
@@ -960,6 +962,7 @@ pub fn run_dpdk(
                     &ready_flag,
                     batch_size,
                     heartbeat_secs,
+                    busy_spin,
                 );
             })
             .expect("failed to spawn replication sender thread");
