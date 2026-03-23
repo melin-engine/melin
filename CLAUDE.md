@@ -116,21 +116,21 @@ Without the mid-batch flush (per-slot check only), results were identical to bas
 
 Performance figures are in the [README](README.md#performance). Keep them up to date when making performance-related changes.
 
-LAN benchmark at `66fed71` (two or three Cherry AMD Ryzen 9950X servers, SMT disabled, dedicated NVMe journal disk):
-- **With fsync/FUA**: 4.0M orders/sec, p50 = 971 µs, p99.9 = 1083 µs, max = 1759 µs
-- **Without persistence**: 10.0M orders/sec, p50 = 762 µs, p99.9 = 1015 µs, max = 2767 µs (window 512)
-- **Single-order latency**: 78 µs p50 (1 client, no pipelining, full durability)
-- **With fsync + sync replication**: 3.7M orders/sec, p50 = 984 µs, p99.9 = 1332 µs, max = 2482 µs
+LAN benchmark at `18456d8` (two or three Cherry AMD Ryzen 9 9900X servers, SMT disabled, dedicated NVMe journal disk):
+- **With fsync/FUA**: 8.1M orders/sec, p50 = 439 µs, p99.9 = 585 µs, max = 4338 µs
+- **Without persistence**: 11.1M orders/sec, p50 = 660 µs, p99.9 = 905 µs, max = 4837 µs (window 512)
+- **Single-order latency**: 70 µs p50 (1 client, no pipelining, full durability)
+- **With fsync + sync replication**: 6.7M orders/sec, p50 = 537 µs, p99.9 = 734 µs, max = 1883 µs
 - **Engine only**: 12.9M orders/sec, p50 = 50 ns
 
 ### Current bottleneck: TCP network stack
 
 The TCP stack (syscalls, kernel buffers, io_uring send/recv overhead) is the primary throughput limiter for no-persist mode. UDS is ~18% faster than TCP (4.6M vs 3.9M on loopback, no-persist) with dramatically tighter tail (p99.99 ~410µs vs ~1.9ms).
 
-Pipeline layer breakdown (Cherry LAN, `66fed71`):
-- **Engine only**: 12.9M/s, p50=50ns — matching engine has ~3x headroom
-- **TCP + fsync**: 4.0M/s, p50=971µs — pipelining hides fsync latency at high window depths
-- **TCP no-persist**: 10.0M/s, p50=762µs (window 512) — removing fsync unlocks 2.5x throughput
+Pipeline layer breakdown (Cherry LAN, `18456d8`):
+- **Engine only**: 12.9M/s, p50=50ns — matching engine has ~1.6x headroom
+- **TCP + fsync**: 8.1M/s, p50=439µs — pipelining hides fsync latency at high window depths
+- **TCP no-persist**: 11.1M/s, p50=660µs (window 512) — removing fsync unlocks 1.4x throughput
 
 **How to apply:** The matching engine is not the bottleneck. The journal fsync stage gates pipeline throughput; TCP pipelining (window=256) effectively hides fsync latency. Further throughput gains require reducing transport overhead (UDS, kernel bypass) or journal I/O optimization (overlapped io_uring writes). See Performance Tuning leads in the README.
 
