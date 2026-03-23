@@ -287,42 +287,46 @@ pub fn run_dpdk_roundtrip(
         });
     }
 
-    // Poll until all connections are established.
+    // Connect and authenticate one client at a time. With smoltcp's
+    // single-threaded poll loop, we can't wait for all connections to
+    // reach Established before starting auth — the server sends the
+    // Challenge immediately on accept, and its 5-second auth timeout
+    // fires if we don't respond while waiting for other connections.
     eprintln!("  connecting {num_clients} clients via DPDK...");
-    loop {
-        poll(
-            &mut device,
-            &mut iface,
-            &mut sockets,
-            &mut poll_count,
-            &mut cached_ts,
-        );
-        let all_established = connections.iter().all(|c| {
-            let s = sockets.get_mut::<tcp::Socket>(c.handle);
-            s.state() == State::Established
-        });
-        if all_established {
-            break;
+    for i in 0..num_clients {
+        // Wait for this connection to establish.
+        loop {
+            poll(
+                &mut device,
+                &mut iface,
+                &mut sockets,
+                &mut poll_count,
+                &mut cached_ts,
+            );
+            let s = sockets.get_mut::<tcp::Socket>(connections[i].handle);
+            if s.state() == State::Established {
+                break;
+            }
         }
-    }
 
-    // Auth handshake for all connections (polling-based).
-    eprintln!("  authenticating...");
-    dpdk_auth_all(
-        &mut connections,
-        &mut device,
-        &mut iface,
-        &mut sockets,
-        &mut poll_count,
-        &mut cached_ts,
-        key,
-    );
+        // Auth handshake for this connection.
+        {
+            let conn = std::slice::from_mut(&mut connections[i]);
+            dpdk_auth_all(
+                conn,
+                &mut device,
+                &mut iface,
+                &mut sockets,
+                &mut poll_count,
+                &mut cached_ts,
+                key,
+            );
+        }
 
-    for (i, conn) in connections.iter().enumerate() {
         eprintln!(
             "  client {}/{num_clients}: connected, {} frames generated",
             i + 1,
-            conn.total_orders,
+            connections[i].total_orders,
         );
     }
     eprintln!(
