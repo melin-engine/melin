@@ -60,8 +60,7 @@ The journal stage uses batch `pwritev2` + `RWF_DSYNC` (FUA) with 256 MiB pre-all
 | 2 | **Raise max batch size to 4096** | Up to 2-4x at sustained load | Low | Done |
 | 3 | **NVMe block device tuning** | Jitter reduction (p99.9/max) | Trivial | Done |
 | 4 | **WRITE_FIXED for journal** | ~200ns/batch | Low | Not started |
-| 5 | **Optane / persistent memory** | 3-10x journal latency | Hardware | Not started |
-| 6 | **Vectored writes (iovec per event)** | ~1-2µs/batch | Low | Not started |
+| 5 | **Vectored writes (iovec per event)** | ~1-2µs/batch | Low | Not started |
 
 **1. Adaptive overlapped io_uring writes.** Double-buffer design: submit `WRITE` + `RWF_DSYNC` asynchronously, accumulate next batch in spare buffer while NVMe write is inflight. Already built and reverted — the problem is events accumulated during an inflight write have their cursor delayed by one extra NVMe write latency, increasing tail. Fix: only overlap when the batch is large enough (e.g., >16 events) that NVMe write time exceeds accumulation time. For small batches, write synchronously — the FUA is ~10µs anyway. This eliminates the tail penalty at low load (where tail matters most) while getting the throughput win under high load.
 
@@ -71,9 +70,7 @@ The journal stage uses batch `pwritev2` + `RWF_DSYNC` (FUA) with 256 MiB pre-all
 
 **4. WRITE_FIXED for journal.** Register the two batch buffers via `IORING_REGISTER_BUFFERS` and use `IORING_OP_WRITE_FIXED` instead of plain `WRITE`. Skips `get_user_pages()` per SQE (~100-200ns). This failed for *socket* I/O on kernel 6.8 (routes through VFS), but works reliably for file writes.
 
-**5. Intel Optane / persistent memory.** Hardware change. Optane P5800X NVMe: ~5-7µs write latency with FUA vs ~10-20µs for typical TLC NVMe. Optane PMem (DCPMM) in App Direct mode: ~300ns write latency via DAX (`mount -o dax`) + `memcpy` + `clwb` + `sfence` — eliminates the syscall entirely.
-
-**6. Vectored writes.** Encode each event into its own small stack buffer and pass all as an iovec array to `pwritev2`. Eliminates the memcpy-per-event into the batch buffer (~100 KB/batch at 1024 events). Small gain but essentially free.
+**5. Vectored writes.** Encode each event into its own small stack buffer and pass all as an iovec array to `pwritev2`. Eliminates the memcpy-per-event into the batch buffer (~100 KB/batch at 1024 events). Small gain but essentially free.
 
 ### Engine / matching
 
