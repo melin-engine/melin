@@ -135,7 +135,8 @@ echo ""
 # ---------------------------------------------------------------------------
 # Core isolation, tick suppression, and latency tuning — all persistent
 # across reboots via GRUB.
-#   isolcpus/nohz_full/rcu_nocbs: isolate cores 1-6 from scheduler/timers/RCU
+#   isolcpus/nohz_full/rcu_nocbs: isolate cores 1-7 from scheduler/timers/RCU
+#   Core 7 is the DPDK poll thread (smoltcp + NIC I/O).
 #   nmi_watchdog=0: disable NMI watchdog (eliminates periodic NMI interrupts)
 #   transparent_hugepage=never: disable THP (khugepaged compaction causes 1-4ms stalls)
 #   cpufreq.default_governor=performance: lock max CPU frequency (no scaling transitions)
@@ -143,7 +144,7 @@ echo ""
 #   skew_tick=1: offset timer ticks across cores to reduce kernel lock contention
 #   nosmt: disable hyperthreading — prevents HT siblings from polluting L1/L2 on pipeline cores
 GRUB_FILE="/etc/default/grub"
-BENCH_PARAMS="isolcpus=nohz,domain,1-6 nohz_full=1-6 rcu_nocbs=1-6 nmi_watchdog=0 transparent_hugepage=never cpufreq.default_governor=performance processor.max_cstate=1 skew_tick=1 nosmt"
+BENCH_PARAMS="isolcpus=nohz,domain,1-7 nohz_full=1-7 rcu_nocbs=1-7 nmi_watchdog=0 transparent_hugepage=never cpufreq.default_governor=performance processor.max_cstate=1 skew_tick=1 nosmt"
 # IOMMU passthrough for DPDK SR-IOV (vfio-pci). Works on both AMD and Intel.
 # amd_iommu/intel_iommu enables the IOMMU; iommu=pt sets passthrough mode
 # so DMA bypasses the IOMMU translation for performance.
