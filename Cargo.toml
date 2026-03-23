@@ -34,3 +34,9 @@ panic = "abort"
 # down the edit-compile-debug cycle for our own code.
 [profile.dev.package."*"]
 opt-level = 2
+
+# Use local fastcp fork of smoltcp with dispatch_burst() (multi-segment
+# TCP egress) and cached hardware address lookup. These optimizations
+# reduce per-packet overhead in the DPDK transport.
+[patch.crates-io]
+smoltcp = { path = "../fastcp" }

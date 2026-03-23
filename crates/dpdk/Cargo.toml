@@ -10,7 +10,7 @@ default = []
 # Userspace TCP/IP stack — replaces the kernel TCP stack when using DPDK.
 # `std` feature needed for smoltcp to link against system time; `medium-ethernet`
 # for Ethernet frame processing; `proto-ipv4` + `socket-tcp` for TCP/IPv4.
-smoltcp = { version = "0.12", default-features = false, features = [
+smoltcp = { version = "0.13", default-features = false, features = [
     "std",
     "medium-ethernet",
     "proto-ipv4",
@@ -27,3 +27,8 @@ bindgen = "0.71"
 pkg-config = "0.3"
 # cc compiles the C wrapper functions for DPDK inline functions.
 cc = "1"
+
+# Use local fastcp fork of smoltcp with dispatch_burst() and cached
+# hardware address lookup.
+[patch.crates-io]
+smoltcp = { path = "../../../fastcp" }
