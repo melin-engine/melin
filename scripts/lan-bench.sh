@@ -150,15 +150,30 @@ ssh $SSH_OPTS "$SERVER" "rm -f ${JOURNAL_PATH} ${JOURNAL_PATH}.* ${SNAPSHOT_PATH
 echo ""
 
 # ---------------------------------------------------------------------------
-# 4. Start the engine on the server
+# 4. Pin all IRQs to core 0
+# ---------------------------------------------------------------------------
+# IRQ affinity doesn't persist across reboots and isolcpus doesn't prevent
+# hardware IRQs from being delivered to isolated cores. Pin everything to
+# core 0 so NIC/NVMe interrupts stay off pipeline cores 1-3.
+echo "=== Pinning IRQs to core 0 on server ==="
+ssh $SSH_OPTS "$SERVER" 'pinned=0; failed=0
+for f in /proc/irq/*/smp_affinity; do
+    if echo 1 > "$f" 2>/dev/null; then
+        pinned=$((pinned + 1))
+    else
+        failed=$((failed + 1))
+    fi
+done
+echo "  Pinned ${pinned} IRQs to core 0 (${failed} unchanged)"'
+echo ""
+
+# ---------------------------------------------------------------------------
+# 5. Start the engine on the server
 # ---------------------------------------------------------------------------
 echo "=== Starting engine on server ==="
 # Kill any existing melin-server process.
 ssh $SSH_OPTS "$SERVER" "pkill -x melin-server 2>/dev/null; true"
 sleep 1
-
-# Start the server in the background. For production-grade numbers, run
-# bench-isolate.sh separately before this script (CPU governor, IRQ pinning).
 ssh $SSH_OPTS "$SERVER" "RUST_LOG=info nohup ${REPO_DIR}/target/release/melin-server \
         --bind ${BIND_ADDR} \
         --journal ${JOURNAL_PATH} \
@@ -183,7 +198,7 @@ done
 echo ""
 
 # ---------------------------------------------------------------------------
-# 5. Run the benchmark
+# 6. Run the benchmark
 # ---------------------------------------------------------------------------
 echo "=== Running benchmark ==="
 echo ""
@@ -199,7 +214,7 @@ ssh $SSH_OPTS "$BENCH" "cd ${REPO_DIR} && source ~/.cargo/env && \
 echo ""
 
 # ---------------------------------------------------------------------------
-# 6. Collect results
+# 7. Collect results
 # ---------------------------------------------------------------------------
 echo "=== Collecting results ==="
 scp $SSH_OPTS -q "$BENCH":/tmp/bench-results.json /tmp/lan-bench-results.json 2>/dev/null || true
@@ -207,7 +222,7 @@ echo "  Results saved to /tmp/lan-bench-results.json"
 echo ""
 
 # ---------------------------------------------------------------------------
-# 7. Stop the server
+# 8. Stop the server
 # ---------------------------------------------------------------------------
 echo "=== Stopping server ==="
 ssh $SSH_OPTS "$SERVER" "pkill -INT -x melin-server 2>/dev/null; true"
