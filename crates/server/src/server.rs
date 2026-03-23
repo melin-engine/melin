@@ -891,8 +891,11 @@ pub fn run_dpdk(
     // Control channel: DPDK poll thread → response stage (connect/disconnect).
     let (control_tx, control_rx) = std::sync::mpsc::channel();
 
-    // TX channel: response stage → DPDK poll thread (encoded frames).
-    let (tx_out, tx_rx) = std::sync::mpsc::channel();
+    // TX SPSC: response stage → DPDK poll thread (encoded frames).
+    // Lock-free, fixed-size slots — no heap allocation per frame.
+    // 4096 slots × ~140 bytes = ~560 KiB. Enough to buffer a burst
+    // without backpressuring the response stage.
+    let (tx_out, tx_rx) = melin_disruptor::spsc::channel::<crate::dpdk_response::TxFrame>(4096);
 
     // Spawn pipeline threads (journal, matching — identical to epoll path).
     let cores = config.cores;

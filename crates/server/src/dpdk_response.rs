@@ -30,12 +30,39 @@ const MAX_BATCH: usize = 1024;
 /// Maximum encoded response size.
 const MAX_RESPONSE_BUF: usize = 128;
 
+/// Maximum wire frame size: 4-byte length prefix + MAX_RESPONSE_BUF payload.
+const MAX_TX_FRAME: usize = 4 + MAX_RESPONSE_BUF;
+
 /// An encoded frame destined for a specific connection.
-/// Sent from the response stage to the DPDK poll thread.
+/// Sent from the response stage to the DPDK poll thread via lock-free SPSC.
+///
+/// Fixed-size and `Copy` to fit the SPSC queue's requirements (no heap
+/// allocation per frame). Trading responses are small (~20-80 bytes),
+/// well within the 132-byte slot.
+#[derive(Clone, Copy)]
 pub struct TxFrame {
     pub connection_id: u64,
-    /// Complete wire frame: [u32 length prefix][payload].
-    pub data: Vec<u8>,
+    /// Number of valid bytes in `data`.
+    pub len: u16,
+    /// Wire frame: [u32 length prefix][payload]. Only `data[..len]` is valid.
+    pub data: [u8; MAX_TX_FRAME],
+}
+
+impl Default for TxFrame {
+    fn default() -> Self {
+        TxFrame {
+            connection_id: 0,
+            len: 0,
+            data: [0u8; MAX_TX_FRAME],
+        }
+    }
+}
+
+impl TxFrame {
+    /// The valid wire frame bytes.
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.data[..self.len as usize]
+    }
 }
 
 /// Control plane events for connection registration (DPDK variant).
@@ -63,7 +90,7 @@ pub fn run(
     shutdown: &AtomicBool,
     heartbeat_interval: Option<Duration>,
     active_connections: Arc<AtomicU64>,
-    tx_out: mpsc::Sender<TxFrame>,
+    mut tx_out: spsc::Producer<TxFrame>,
 ) {
     // Track known connections (for heartbeat scheduling).
     let mut connections: HashMap<u64, ConnectionHeartbeat> = HashMap::with_capacity(256);
@@ -77,13 +104,10 @@ pub fn run(
     #[cfg(feature = "no-fsync")]
     let _ = &journal_cursor;
 
-    // Pre-encode heartbeat frame.
-    let heartbeat_frame = {
-        let mut buf = [0u8; 8];
-        let written =
-            codec::encode_response(&ResponseKind::Heartbeat, &mut buf).expect("heartbeat encodes");
-        buf[..written].to_vec()
-    };
+    // Pre-encode heartbeat frame (fixed-size, no heap allocation).
+    let mut heartbeat_frame = [0u8; 8];
+    let heartbeat_len = codec::encode_response(&ResponseKind::Heartbeat, &mut heartbeat_frame)
+        .expect("heartbeat encodes");
 
     let mut last_heartbeat_scan = Instant::now();
     let mut idle_spins: u32 = 0;
@@ -123,14 +147,13 @@ pub fn run(
                     let mut failed: Vec<u64> = Vec::new();
                     for (&conn_id, state) in connections.iter_mut() {
                         if now.duration_since(state.last_send) >= interval {
-                            if tx_out
-                                .send(TxFrame {
-                                    connection_id: conn_id,
-                                    data: heartbeat_frame.clone(),
-                                })
-                                .is_err()
-                            {
-                                // DPDK poll thread is gone.
+                            let mut frame = TxFrame::default();
+                            frame.connection_id = conn_id;
+                            frame.len = heartbeat_len as u16;
+                            frame.data[..heartbeat_len]
+                                .copy_from_slice(&heartbeat_frame[..heartbeat_len]);
+                            if tx_out.try_publish(frame).is_err() {
+                                // SPSC full — DPDK poll thread fell behind.
                                 failed.push(conn_id);
                                 continue;
                             }
@@ -210,17 +233,12 @@ pub fn run(
             };
 
             // Send the complete wire frame (with length prefix) to the
-            // DPDK poll thread for transmission.
-            if tx_out
-                .send(TxFrame {
-                    connection_id: slot.connection_id,
-                    data: encode_buf[..written].to_vec(),
-                })
-                .is_err()
-            {
-                // DPDK poll thread is gone — shutdown imminent.
-                return;
-            }
+            // DPDK poll thread for transmission via lock-free SPSC.
+            let mut frame = TxFrame::default();
+            frame.connection_id = slot.connection_id;
+            frame.len = written as u16;
+            frame.data[..written].copy_from_slice(&encode_buf[..written]);
+            tx_out.publish(frame);
 
             if let Some(state) = connections.get_mut(&slot.connection_id) {
                 state.last_send = Instant::now();

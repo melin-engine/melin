@@ -95,7 +95,7 @@ pub fn run_dpdk_poll(
     mut transport: DpdkTransport,
     producer: ring::MultiProducer<InputSlot>,
     control_tx: mpsc::Sender<ControlEvent>,
-    tx_rx: mpsc::Receiver<TxFrame>,
+    mut tx_rx: melin_disruptor::spsc::Consumer<TxFrame>,
     shutdown: &AtomicBool,
     authorized_keys: Arc<AuthorizedKeys>,
 ) {
@@ -164,10 +164,11 @@ pub fn run_dpdk_poll(
         }
 
         // 3. Drain TX frames from the response stage into smoltcp sockets.
-        while let Ok(frame) = tx_rx.try_recv() {
+        // Lock-free SPSC — no mutex contention on the hot path.
+        while let Some((_seq, frame)) = tx_rx.try_consume() {
             if let Some(&handle) = id_to_handle.get(&frame.connection_id)
                 && let Some(conn) = connections.get(&handle)
-                && !transport.queue_send(conn.handle, &frame.data)
+                && !transport.queue_send(conn.handle, frame.as_bytes())
             {
                 // TX queue overflow — client fell behind. Drop connection.
                 debug!(
