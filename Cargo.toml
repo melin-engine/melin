@@ -35,8 +35,7 @@ panic = "abort"
 [profile.dev.package."*"]
 opt-level = 2
 
-# Use local fastcp fork of smoltcp with dispatch_burst() (multi-segment
-# TCP egress) and cached hardware address lookup. These optimizations
-# reduce per-packet overhead in the DPDK transport.
+# Use fastcp fork of smoltcp with dispatch_burst() (multi-segment TCP
+# egress), batch ingress, and cached hardware address lookup.
 [patch.crates-io]
-smoltcp = { path = "../fastcp" }
+smoltcp = { git = "ssh://git@github.com/pierre-l/fastcp.git", branch = "feat/tcp-batching" }

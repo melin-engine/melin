@@ -28,7 +28,7 @@ pkg-config = "0.3"
 # cc compiles the C wrapper functions for DPDK inline functions.
 cc = "1"
 
-# Use local fastcp fork of smoltcp with dispatch_burst() and cached
-# hardware address lookup.
+# Use fastcp fork of smoltcp with dispatch_burst(), batch ingress,
+# and cached hardware address lookup.
 [patch.crates-io]
-smoltcp = { path = "../../../fastcp" }
+smoltcp = { git = "ssh://git@github.com/pierre-l/fastcp.git", branch = "feat/tcp-batching" }
