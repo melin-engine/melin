@@ -1199,10 +1199,10 @@ fn run_epoll_loop<W: Write>(
                                     measured_start = Some(Instant::now());
                                 }
                                 histogram.record(latency_ns).expect("record");
+                                progress.fetch_add(1, Ordering::Relaxed);
                             }
 
                             conn.batch_count += 1;
-                            progress.fetch_add(1, Ordering::Relaxed);
                             if conn.batch_count >= conn.total_orders {
                                 conn.done = true;
                                 done_count += 1;
@@ -1402,8 +1402,8 @@ fn run_epoll_roundtrip<R, W, F>(
         thread_conns[client_id % num_threads].push(conn);
     }
 
-    // Total orders across all clients (including warmup) for progress reporting.
-    let total_all_orders: u64 = (warmup * num_clients + total_pairs * 2) as u64;
+    // Total measured orders (excluding warmup) for progress reporting.
+    let total_all_orders: u64 = (total_pairs * 2) as u64;
     let progress = Arc::new(AtomicU64::new(0));
     let progress_shutdown = Arc::new(AtomicBool::new(false));
     let progress_handle = spawn_progress_reporter(
@@ -1437,17 +1437,18 @@ fn run_epoll_roundtrip<R, W, F>(
     barrier.wait();
     let blast_start = Instant::now();
 
-    // Collect and merge histograms. Track the latest measured_start across
-    // threads — measurement begins when the last thread exits warmup.
+    // Collect and merge histograms. Track the earliest measured_start across
+    // threads — measurement begins when the first thread exits warmup, so
+    // the wall time covers all measured orders from all threads.
     let mut merged_histogram =
         Histogram::<u64>::new_with_bounds(1, 10_000_000_000, 3).expect("histogram bounds");
-    let mut latest_measured_start: Option<Instant> = None;
+    let mut earliest_measured_start: Option<Instant> = None;
     for handle in handles {
         let (histogram, ms) = handle.join().expect("bench thread panicked");
         merged_histogram.add(&histogram).expect("merge histograms");
         if let Some(t) = ms {
-            latest_measured_start =
-                Some(latest_measured_start.map_or(t, |prev: Instant| prev.max(t)));
+            earliest_measured_start =
+                Some(earliest_measured_start.map_or(t, |prev: Instant| prev.min(t)));
         }
     }
 
@@ -1456,7 +1457,7 @@ fn run_epoll_roundtrip<R, W, F>(
     let _ = progress_handle.join();
 
     let end = Instant::now();
-    let measured_wall = latest_measured_start
+    let measured_wall = earliest_measured_start
         .map(|s| end.duration_since(s))
         .unwrap_or_else(|| blast_start.elapsed());
 
@@ -1653,8 +1654,8 @@ fn run_uring_roundtrip<R, W, F>(
         thread_conns[i % num_threads].push(conn);
     }
 
-    // Total orders across all clients (including warmup) for progress reporting.
-    let total_all_orders: u64 = (warmup * num_clients + total_pairs * 2) as u64;
+    // Total measured orders (excluding warmup) for progress reporting.
+    let total_all_orders: u64 = (total_pairs * 2) as u64;
     let progress = Arc::new(AtomicU64::new(0));
     let progress_shutdown = Arc::new(AtomicBool::new(false));
     let progress_handle = spawn_progress_reporter(
@@ -1685,20 +1686,20 @@ fn run_uring_roundtrip<R, W, F>(
         })
         .collect();
 
-    // Collect and merge histograms from all threads. Track the latest
-    // measured_start across threads — measurement begins when the last
-    // thread exits warmup.
+    // Collect and merge histograms from all threads. Track the earliest
+    // measured_start — measurement begins when the first thread exits
+    // warmup, so the wall time covers all measured orders from all threads.
     let mut histogram =
         Histogram::<u64>::new_with_bounds(1, 10_000_000_000, 3).expect("histogram bounds");
-    let mut latest_measured_start: Option<Instant> = None;
+    let mut earliest_measured_start: Option<Instant> = None;
     let mut all_series: TimeSeries = Vec::new();
 
     for handle in handles {
         let (h, s, ms) = handle.join().expect("bench thread panicked");
         histogram.add(&h).expect("merge histograms");
         if let Some(t) = ms {
-            latest_measured_start =
-                Some(latest_measured_start.map_or(t, |prev: Instant| prev.max(t)));
+            earliest_measured_start =
+                Some(earliest_measured_start.map_or(t, |prev: Instant| prev.min(t)));
         }
         all_series.extend(s);
     }
@@ -1707,11 +1708,11 @@ fn run_uring_roundtrip<R, W, F>(
     progress_shutdown.store(true, Ordering::Relaxed);
     let _ = progress_handle.join();
 
-    // Measure throughput over the measured phase only — from when the last
-    // thread finished warmup until now. This excludes warmup orders and any
-    // seed event processing from the throughput calculation.
+    // Measure throughput over the measured phase only — from when the first
+    // thread finished warmup until now. This covers all measured orders
+    // from all threads without undercounting.
     let end = Instant::now();
-    let measured_wall = latest_measured_start
+    let measured_wall = earliest_measured_start
         .map(|s| end.duration_since(s))
         .unwrap_or_else(|| start.elapsed());
 
@@ -1919,9 +1920,9 @@ fn run_uring_loop(
                                 &mut series,
                                 bench_start,
                             );
+                            progress.fetch_add(1, Ordering::Relaxed);
                         }
                         conn.batch_count += 1;
-                        progress.fetch_add(1, Ordering::Relaxed);
                         if conn.batch_count >= conn.total_orders {
                             conn.done = true;
                             done_count += 1;
