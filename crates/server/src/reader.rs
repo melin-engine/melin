@@ -274,6 +274,10 @@ fn epoll_reader_loop<R: AsRawFd>(
             break;
         }
 
+        // One Instant::now() per epoll batch for connection timeout tracking
+        // instead of per frame — timeout is 30s, sub-ms precision is plenty.
+        let batch_now = Instant::now();
+
         for event in &events[..nfds as usize] {
             let token = event.u64;
 
@@ -296,6 +300,7 @@ fn epoll_reader_loop<R: AsRawFd>(
                 process_connection(
                     conn,
                     &producer,
+                    batch_now,
                     #[cfg(feature = "latency-trace")]
                     &mut publish_hist,
                 )
@@ -421,6 +426,7 @@ fn remove_connection<R>(
 fn process_connection<R>(
     conn: &mut ConnectionState<R>,
     producer: &ring::MultiProducer<InputSlot>,
+    now: Instant,
     #[cfg(feature = "latency-trace")]
     publish_hist: &mut melin_engine::journal::trace::StageHistogram,
 ) -> bool {
@@ -434,7 +440,7 @@ fn process_connection<R>(
                         return false; // EAGAIN
                     }
                     // Any successful read resets the idle timeout.
-                    conn.last_activity = Instant::now();
+                    conn.last_activity = now;
                     let len = u32::from_le_bytes(conn.len_buf) as usize;
                     if len > MAX_FRAME_SIZE {
                         debug!(

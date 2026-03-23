@@ -291,6 +291,8 @@ pub fn run(
             }
         }
 
+        let batch_now = Instant::now();
+
         for slot in &batch[..count] {
             #[cfg(feature = "latency-trace")]
             spsc_hist.record_ns(trace::trace_elapsed_ns(slot.match_complete_ts, consume_ts));
@@ -341,7 +343,7 @@ pub fn run(
                 // encode_response writes [length(4) | payload], which is the
                 // complete wire format — no extra framing needed.
                 entry.send_buf.extend_from_slice(&encode_buf[..written]);
-                entry.last_send = Instant::now();
+                entry.last_send = batch_now;
                 dirty_connections.insert(slot.connection_id);
 
                 // Record server-side end-to-end: reader recv → response flush.

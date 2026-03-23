@@ -346,13 +346,19 @@ impl JournalStage {
                 // Data stays in the buffer until the sync point — one
                 // pwritev2+RWF_DSYNC replaces multiple pwrites + fdatasync.
                 // QueryStats is not journaled (no state change).
+                // One clock_gettime per batch instead of per event. Events
+                // within a batch share a timestamp — ordering is preserved by
+                // sequence numbers. If per-event wall-clock timestamps become
+                // a regulatory requirement (MiFID II, SEC CAT), revert to
+                // batch_append() which calls clock_gettime per event.
                 #[cfg(not(feature = "no-persist"))]
                 {
+                    let ts = crate::journal::writer::wall_clock_nanos();
                     for slot in &batch[..count] {
                         if matches!(slot.event, JournalEvent::QueryStats) {
                             continue;
                         }
-                        if let Err(e) = self.writer.batch_append(&slot.event) {
+                        if let Err(e) = self.writer.batch_append_with_ts(&slot.event, ts) {
                             panic!("fatal journal encode error: {e}");
                         }
                     }
@@ -431,11 +437,12 @@ impl JournalStage {
             }
             #[cfg(not(feature = "no-persist"))]
             {
+                let ts = crate::journal::writer::wall_clock_nanos();
                 for slot in &batch[..count] {
                     if matches!(slot.event, JournalEvent::QueryStats) {
                         continue;
                     }
-                    if let Err(e) = self.writer.batch_append(&slot.event) {
+                    if let Err(e) = self.writer.batch_append_with_ts(&slot.event, ts) {
                         tracing::error!(error = %e, "journal encode error on drain");
                     }
                 }
@@ -586,11 +593,12 @@ impl JournalStage {
                     busy_count += 1;
                 }
 
+                let ts = crate::journal::writer::wall_clock_nanos();
                 for slot in &batch[..count] {
                     if matches!(slot.event, JournalEvent::QueryStats) {
                         continue;
                     }
-                    if let Err(e) = self.writer.batch_append(&slot.event) {
+                    if let Err(e) = self.writer.batch_append_with_ts(&slot.event, ts) {
                         panic!("fatal journal encode error: {e}");
                     }
                 }
