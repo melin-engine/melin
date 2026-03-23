@@ -62,7 +62,7 @@ Generate on the bench machine, copy to the server:
 ```sh
 # On bench:
 cd ~/workspace/trading
-cargo run --release --bin melin-admin -- keygen bench admin
+cargo run --release --bin melin-keygen -- bench admin
 # Creates bench.key (private) and bench.pub (public)
 
 # Copy public key to server's authorized_keys:
