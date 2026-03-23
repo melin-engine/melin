@@ -148,9 +148,10 @@ pub struct ServerConfig {
     #[arg(long, default_value = "", allow_hyphen_values = true)]
     pub dpdk_eal_args: String,
 
-    /// DPDK port ID (the NIC bound to DPDK). Default: 0 (first available port).
-    #[arg(long, default_value_t = 0)]
-    pub dpdk_port: u16,
+    /// DPDK port IDs (comma-separated). For LACP bonds, pass both VF ports
+    /// (e.g., "0,1") so traffic arriving on either bond member is received.
+    #[arg(long, default_value = "0", value_delimiter = ',')]
+    pub dpdk_ports: Vec<u16>,
 
     /// IPv4 address for the DPDK interface (e.g., "10.0.0.1").
     #[arg(long, default_value = "10.0.0.1")]
@@ -201,7 +202,7 @@ impl Default for ServerConfig {
             replication_heartbeat_secs: 5,
             replication_ring_size: 256,
             dpdk_eal_args: String::new(),
-            dpdk_port: 0,
+            dpdk_ports: vec![0],
             dpdk_ip: "10.0.0.1".into(),
             dpdk_prefix_len: 24,
             dpdk_gateway: None,

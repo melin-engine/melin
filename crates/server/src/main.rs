@@ -64,7 +64,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .split_whitespace()
                 .map(String::from)
                 .collect(),
-            port_id: config.dpdk_port,
+            port_ids: config.dpdk_ports.clone(),
             ip_addr: config.dpdk_ip.parse().expect("invalid --dpdk-ip address"),
             prefix_len: config.dpdk_prefix_len,
             gateway: config

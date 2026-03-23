@@ -64,7 +64,9 @@ struct DpdkBenchConn {
 /// DPDK benchmark configuration.
 pub struct DpdkBenchConfig {
     pub eal_args: Vec<String>,
-    pub port_id: u16,
+    /// DPDK port IDs to poll. First port is used for TX; all are polled
+    /// for RX. For LACP bonds, pass both VF port IDs.
+    pub port_ids: Vec<u16>,
     pub local_ip: Ipv4Addr,
     pub prefix_len: u8,
     pub gateway: Option<Ipv4Addr>,
@@ -94,19 +96,38 @@ pub fn run_dpdk_roundtrip(
     let eal_args: Vec<&str> = config.eal_args.iter().map(|s| s.as_str()).collect();
     let eal = Eal::init(&eal_args).expect("EAL init failed");
     let port_count = eal.port_count();
-    assert!(
-        config.port_id < port_count,
-        "DPDK port {} not found (available: {port_count})",
-        config.port_id
-    );
+    for &pid in &config.port_ids {
+        assert!(
+            pid < port_count,
+            "DPDK port {pid} not found (available: {port_count})",
+        );
+    }
 
     // Use more mbufs for the bench client — many connections with large windows.
-    let mempool = Mempool::create_with_size("bench_pool", 16384, 0).expect("mempool failed");
-    let mut port = Port::configure(config.port_id, &mempool).expect("port config failed");
-    port.start().expect("port start failed");
+    // Increase for extra ports.
+    let num_mbufs = if config.port_ids.len() > 1 {
+        24576
+    } else {
+        16384
+    };
+    let mempool = Mempool::create_with_size("bench_pool", num_mbufs, 0).expect("mempool failed");
 
-    let mac = port.mac_addr();
-    let mut device = DpdkDevice::new(config.port_id, mempool.as_raw(), port.offloads);
+    // Configure and start all ports. Use intersection of offload caps.
+    let mut ports = Vec::with_capacity(config.port_ids.len());
+    let mut combined_offloads: Option<melin_dpdk::port::ChecksumOffloads> = None;
+    for &pid in &config.port_ids {
+        let mut port = Port::configure(pid, &mempool).expect("port config failed");
+        port.start().expect("port start failed");
+        combined_offloads = Some(match combined_offloads {
+            None => port.offloads,
+            Some(prev) => prev.intersect(port.offloads),
+        });
+        ports.push(port);
+    }
+    let offloads = combined_offloads.unwrap_or_default();
+
+    let mac = ports[0].mac_addr();
+    let mut device = DpdkDevice::new(&config.port_ids, mempool.as_raw(), offloads);
 
     let hw_addr = HardwareAddress::Ethernet(EthernetAddress(mac));
     let iface_config = Config::new(hw_addr);

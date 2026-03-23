@@ -15,7 +15,7 @@ use smoltcp::wire::{EthernetAddress, HardwareAddress, IpAddress, IpCidr, Ipv4Add
 use crate::device::DpdkDevice;
 use crate::eal::Eal;
 use crate::mempool::Mempool;
-use crate::port::Port;
+use crate::port::{ChecksumOffloads, Port};
 
 /// Maximum concurrent TCP connections.
 const MAX_CONNECTIONS: usize = 1024;
@@ -43,7 +43,10 @@ const TIMESTAMP_REFRESH_INTERVAL: u32 = 100;
 /// Configuration for the DPDK transport.
 pub struct DpdkConfig {
     pub eal_args: Vec<String>,
-    pub port_id: u16,
+    /// DPDK port IDs to poll. The first port is used for TX; all ports
+    /// are polled for RX. For LACP bonds, pass both VF port IDs (e.g.,
+    /// `vec![0, 1]`) so traffic arriving on either bond member is received.
+    pub port_ids: Vec<u16>,
     pub ip_addr: Ipv4Addr,
     pub prefix_len: u8,
     pub gateway: Option<Ipv4Addr>,
@@ -54,7 +57,7 @@ impl Default for DpdkConfig {
     fn default() -> Self {
         DpdkConfig {
             eal_args: Vec::new(),
-            port_id: 0,
+            port_ids: vec![0],
             ip_addr: Ipv4Addr::new(10, 0, 0, 1),
             prefix_len: 24,
             gateway: None,
@@ -75,7 +78,7 @@ pub struct AcceptedConnection {
 pub struct DpdkTransport {
     _eal: Eal,
     _mempool: Mempool,
-    _port: Port,
+    _ports: Vec<Port>,
     device: DpdkDevice,
     iface: Interface,
     sockets: SocketSet<'static>,
@@ -141,20 +144,39 @@ impl DpdkTransport {
         let eal = Eal::init(&eal_args)?;
 
         let port_count = eal.port_count();
-        if config.port_id >= port_count {
-            return Err(format!(
-                "DPDK port {} not found (available: {})",
-                config.port_id, port_count
-            )
-            .into());
+        for &pid in &config.port_ids {
+            if pid >= port_count {
+                return Err(
+                    format!("DPDK port {} not found (available: {})", pid, port_count).into(),
+                );
+            }
         }
 
-        let mempool = Mempool::create("pktmbuf_pool", 0)?;
-        let mut port = Port::configure(config.port_id, &mempool)?;
-        port.start()?;
+        // Increase mempool for extra ports — each port needs RX descriptors.
+        let num_mbufs = if config.port_ids.len() > 1 {
+            12288
+        } else {
+            8192
+        };
+        let mempool = Mempool::create_with_size("pktmbuf_pool", num_mbufs as u32, 0)?;
 
-        let mac = port.mac_addr();
-        let device = DpdkDevice::new(config.port_id, mempool.as_raw(), port.offloads);
+        // Configure and start all ports. Use the intersection of offload
+        // capabilities (in practice, VFs on the same NIC have identical caps).
+        let mut ports = Vec::with_capacity(config.port_ids.len());
+        let mut combined_offloads: Option<ChecksumOffloads> = None;
+        for &pid in &config.port_ids {
+            let mut port = Port::configure(pid, &mempool)?;
+            port.start()?;
+            combined_offloads = Some(match combined_offloads {
+                None => port.offloads,
+                Some(prev) => prev.intersect(port.offloads),
+            });
+            ports.push(port);
+        }
+        let offloads = combined_offloads.unwrap_or_default();
+
+        let mac = ports[0].mac_addr();
+        let device = DpdkDevice::new(&config.port_ids, mempool.as_raw(), offloads);
 
         let hw_addr = HardwareAddress::Ethernet(EthernetAddress(mac));
         let iface_config = Config::new(hw_addr);
@@ -218,7 +240,7 @@ impl DpdkTransport {
         Ok(DpdkTransport {
             _eal: eal,
             _mempool: mempool,
-            _port: port,
+            _ports: ports,
             device,
             iface,
             sockets,
@@ -376,7 +398,7 @@ impl DpdkTransport {
     /// Call this for any peer IP that smoltcp needs to reach (e.g., bench
     /// clients, gateways) when running on an SR-IOV VF.
     pub fn seed_neighbor(&mut self, ip: Ipv4Addr, mac: [u8; 6]) {
-        let our_mac = self._port.mac_addr();
+        let our_mac = self._ports[0].mac_addr();
         let our_ip = self.iface.ipv4_addr().expect("interface has IPv4 address");
 
         // Craft an ARP reply Ethernet frame:

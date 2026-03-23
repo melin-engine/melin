@@ -22,15 +22,30 @@ const BURST_SIZE: usize = 32;
 /// MTU for standard Ethernet (no jumbo frames).
 const MTU: usize = 1500;
 
-/// smoltcp device backed by a DPDK port.
-pub struct DpdkDevice {
+/// Per-port RX state for multi-port polling.
+struct RxPort {
     port_id: u16,
-    mempool: *mut ffi::rte_mempool,
     /// Staging buffer for received mbufs.
     rx_buf: [*mut ffi::rte_mbuf; BURST_SIZE],
     rx_count: usize,
     rx_cursor: usize,
-    /// Hardware checksum offloads supported by the NIC.
+}
+
+/// smoltcp device backed by one or more DPDK ports.
+///
+/// RX polls all ports (for LACP bonds where the switch may hash traffic
+/// to either bond member's VF). TX always goes through the first port —
+/// the switch/bond handles egress distribution.
+pub struct DpdkDevice {
+    /// Per-port RX state. One entry per DPDK port.
+    rx_ports: Vec<RxPort>,
+    /// Index into `rx_ports` currently being drained.
+    active_rx: usize,
+    /// Port used for all TX (first port in the list).
+    tx_port_id: u16,
+    mempool: *mut ffi::rte_mempool,
+    /// Hardware checksum offloads supported by the NIC (intersection
+    /// of all ports' capabilities).
     offloads: ChecksumOffloads,
     /// Cached TX offload flags (computed once at init, reused per packet).
     tx_ol_flags: u64,
@@ -50,8 +65,18 @@ pub struct DpdkDevice {
 unsafe impl Send for DpdkDevice {}
 
 impl DpdkDevice {
-    /// Create a new device for the given DPDK port.
-    pub fn new(port_id: u16, mempool: *mut ffi::rte_mempool, offloads: ChecksumOffloads) -> Self {
+    /// Create a new device backed by one or more DPDK ports.
+    ///
+    /// `port_ids` lists all ports to poll for RX. The first port is also
+    /// used for TX. For LACP bonds, pass both VF port IDs so traffic
+    /// arriving on either bond member is received.
+    pub fn new(
+        port_ids: &[u16],
+        mempool: *mut ffi::rte_mempool,
+        offloads: ChecksumOffloads,
+    ) -> Self {
+        assert!(!port_ids.is_empty(), "at least one DPDK port required");
+
         // Pre-compute TX offload flags once — these are the same for every
         // outbound IPv4/TCP packet.
         let mut tx_ol_flags: u64 = 0;
@@ -65,12 +90,21 @@ impl DpdkDevice {
             tracing::info!("DPDK TX checksum offload enabled (flags=0x{tx_ol_flags:x})");
         }
 
+        let rx_ports = port_ids
+            .iter()
+            .map(|&port_id| RxPort {
+                port_id,
+                rx_buf: [std::ptr::null_mut(); BURST_SIZE],
+                rx_count: 0,
+                rx_cursor: 0,
+            })
+            .collect();
+
         DpdkDevice {
-            port_id,
+            rx_ports,
+            active_rx: 0,
+            tx_port_id: port_ids[0],
             mempool,
-            rx_buf: [std::ptr::null_mut(); BURST_SIZE],
-            rx_count: 0,
-            rx_cursor: 0,
             offloads,
             tx_ol_flags,
             inject_queue: Vec::new(),
@@ -79,19 +113,36 @@ impl DpdkDevice {
         }
     }
 
-    /// Poll the NIC for received packets.
+    /// Poll all ports for received packets.
+    ///
+    /// If the current port's buffer is exhausted, tries each port starting
+    /// from the current one. With LACP, this ensures traffic arriving on
+    /// either bond member's VF is received.
     pub fn poll_rx(&mut self) {
-        if self.rx_cursor < self.rx_count {
+        // Still draining current burst — nothing to do.
+        let active = &self.rx_ports[self.active_rx];
+        if active.rx_cursor < active.rx_count {
             return;
         }
 
-        // SAFETY: port is started, rx_buf is correctly sized.
-        let count = unsafe {
-            ffi::dpdk_eth_rx_burst(self.port_id, 0, self.rx_buf.as_mut_ptr(), BURST_SIZE as u16)
-        };
+        // Try each port, starting from the current one.
+        let n = self.rx_ports.len();
+        for i in 0..n {
+            let idx = (self.active_rx + i) % n;
+            let port = &mut self.rx_ports[idx];
 
-        self.rx_count = count as usize;
-        self.rx_cursor = 0;
+            // SAFETY: port is started, rx_buf is correctly sized.
+            let count = unsafe {
+                ffi::dpdk_eth_rx_burst(port.port_id, 0, port.rx_buf.as_mut_ptr(), BURST_SIZE as u16)
+            };
+
+            if count > 0 {
+                port.rx_count = count as usize;
+                port.rx_cursor = 0;
+                self.active_rx = idx;
+                return;
+            }
+        }
     }
 
     /// Inject a raw Ethernet frame into smoltcp's RX path.
@@ -147,19 +198,20 @@ impl Device for DpdkDevice {
         if let Some(frame) = self.inject_queue.pop() {
             let rx_token = DpdkRxToken::Injected(frame);
             let tx_token = DpdkTxToken {
-                port_id: self.port_id,
+                port_id: self.tx_port_id,
                 mempool: self.mempool,
                 tx_ol_flags: self.tx_ol_flags,
             };
             return Some((rx_token, tx_token));
         }
 
-        if self.rx_cursor >= self.rx_count {
+        let active = &mut self.rx_ports[self.active_rx];
+        if active.rx_cursor >= active.rx_count {
             return None;
         }
 
-        let mbuf = self.rx_buf[self.rx_cursor];
-        self.rx_cursor += 1;
+        let mbuf = active.rx_buf[active.rx_cursor];
+        active.rx_cursor += 1;
 
         // Read packet data via C accessors (avoids direct struct field access
         // on bindgen-generated types with complex unions/bitfields).
@@ -200,7 +252,7 @@ impl Device for DpdkDevice {
             data_len,
         };
         let tx_token = DpdkTxToken {
-            port_id: self.port_id,
+            port_id: self.tx_port_id,
             mempool: self.mempool,
             tx_ol_flags: self.tx_ol_flags,
         };
@@ -210,7 +262,7 @@ impl Device for DpdkDevice {
 
     fn transmit(&mut self, _timestamp: Instant) -> Option<Self::TxToken<'_>> {
         Some(DpdkTxToken {
-            port_id: self.port_id,
+            port_id: self.tx_port_id,
             mempool: self.mempool,
             tx_ol_flags: self.tx_ol_flags,
         })

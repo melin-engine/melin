@@ -260,9 +260,9 @@ struct BenchArgs {
     /// DPDK EAL arguments (space-separated).
     #[arg(long, default_value = "", allow_hyphen_values = true)]
     dpdk_eal_args: String,
-    /// DPDK port ID (default: 0).
-    #[arg(long, default_value_t = 0)]
-    dpdk_port: u16,
+    /// DPDK port IDs, comma-separated (default: "0"). For LACP bonds use "0,1".
+    #[arg(long, default_value = "0", value_delimiter = ',')]
+    dpdk_ports: Vec<u16>,
     /// Local IPv4 address for the DPDK bench interface.
     #[arg(long, default_value = "10.0.0.2")]
     dpdk_ip: String,
@@ -327,7 +327,7 @@ fn main() {
                             .split_whitespace()
                             .map(String::from)
                             .collect(),
-                        port_id: args.dpdk_port,
+                        port_ids: args.dpdk_ports.clone(),
                         local_ip: args.dpdk_ip.parse().expect("invalid --dpdk-ip"),
                         prefix_len: args.dpdk_prefix_len,
                         gateway: args

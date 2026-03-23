@@ -28,6 +28,20 @@ pub struct ChecksumOffloads {
     pub tx_tcp: bool,
 }
 
+impl ChecksumOffloads {
+    /// Intersection of two offload sets — only capabilities supported
+    /// by both are retained. Used for multi-port setups where all ports
+    /// must agree on offload capabilities.
+    pub fn intersect(self, other: Self) -> Self {
+        ChecksumOffloads {
+            rx_ip: self.rx_ip && other.rx_ip,
+            rx_tcp: self.rx_tcp && other.rx_tcp,
+            tx_ip: self.tx_ip && other.tx_ip,
+            tx_tcp: self.tx_tcp && other.tx_tcp,
+        }
+    }
+}
+
 /// Configured DPDK ethernet port, ready for `start()`.
 pub struct Port {
     port_id: u16,
