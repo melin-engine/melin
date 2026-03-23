@@ -1329,26 +1329,54 @@ fn run_epoll_roundtrip<R, W, F>(
     let pairs_per_client = total_pairs / num_clients;
     let remainder = total_pairs % num_clients;
 
-    // Create all connections upfront, then distribute round-robin to threads.
+    // Pre-generate frames for all clients in parallel. This is CPU-bound
+    // (RNG + encode) and dominates setup time.
+    use rayon::prelude::*;
+    let all_frames: Vec<_> = (0..num_clients)
+        .into_par_iter()
+        .map(|client_id| {
+            let client_pairs = if client_id == num_clients - 1 {
+                pairs_per_client + remainder
+            } else {
+                pairs_per_client
+            };
+            let total_orders = warmup + client_pairs * 2;
+            let order_id_offset: u64 = (0..client_id)
+                .map(|c| {
+                    let p = if c == num_clients - 1 {
+                        pairs_per_client + remainder
+                    } else {
+                        pairs_per_client
+                    };
+                    (warmup + p * 2) as u64
+                })
+                .sum();
+            let mut flow = generator::OrderFlowGenerator::new(generator::GeneratorConfig {
+                num_accounts,
+                num_instruments,
+                start_order_id: order_id_offset + 1,
+                ..Default::default()
+            });
+            (flow.generate_frames(total_orders), total_orders)
+        })
+        .collect();
+    eprintln!("  frames generated for all {num_clients} clients");
+
+    // Connect and auth sequentially, attach pre-generated frames.
     let num_threads = bench_threads.min(num_clients);
     let mut thread_conns: Vec<Vec<BenchConnection<W>>> =
         (0..num_threads).map(|_| Vec::new()).collect();
     let heartbeat = heartbeat_frame();
-    // Track write fds for keepalive heartbeats during setup.
     let mut write_fds: Vec<RawFd> = Vec::with_capacity(num_clients);
     let mut last_keepalive = Instant::now();
 
-    for client_id in 0..num_clients {
-        // Send heartbeats on all established connections every 10s to
-        // prevent the server's 30s idle timeout from dropping them.
+    for (client_id, (frames, total_orders)) in all_frames.into_iter().enumerate() {
         if last_keepalive.elapsed() >= Duration::from_secs(10) {
             keepalive_established(&write_fds, &heartbeat);
             last_keepalive = Instant::now();
         }
 
         let (mut read_stream, write_stream) = connect();
-
-        // Challenge-response auth while the socket is still blocking.
         auth_handshake(&mut read_stream, key);
 
         let fd = read_stream.as_raw_fd();
@@ -1356,7 +1384,6 @@ fn run_epoll_roundtrip<R, W, F>(
         write_fds.push(write_fd);
         let writer = BlockingFrameWriter::new(write_stream);
 
-        // Set non-blocking on the read fd.
         unsafe {
             let flags = libc::fcntl(fd, libc::F_GETFL);
             libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
@@ -1366,28 +1393,6 @@ fn run_epoll_roundtrip<R, W, F>(
             pairs_per_client + remainder
         } else {
             pairs_per_client
-        };
-        let total_orders = warmup + client_pairs * 2;
-
-        let order_id_offset: u64 = (0..client_id)
-            .map(|c| {
-                let p = if c == num_clients - 1 {
-                    pairs_per_client + remainder
-                } else {
-                    pairs_per_client
-                };
-                (warmup + p * 2) as u64
-            })
-            .sum();
-
-        let frames = {
-            let mut flow = generator::OrderFlowGenerator::new(generator::GeneratorConfig {
-                num_accounts,
-                num_instruments,
-                start_order_id: order_id_offset + 1,
-                ..Default::default()
-            });
-            flow.generate_frames(total_orders)
         };
 
         let conn = BenchConnection {
@@ -1408,7 +1413,6 @@ fn run_epoll_roundtrip<R, W, F>(
             done: false,
         };
 
-        // Round-robin distribution across threads.
         thread_conns[client_id % num_threads].push(conn);
     }
 
@@ -1578,62 +1582,57 @@ fn run_uring_roundtrip<R, W, F>(
     let pairs_per_client = total_pairs / num_clients;
     let remainder = total_pairs % num_clients;
 
-    let mut connections: Vec<UringBenchConn> = Vec::with_capacity(num_clients);
-    let setup_start = Instant::now();
-    let heartbeat = heartbeat_frame();
-    // Track write fds for keepalive heartbeats during setup.
-    let mut write_fds: Vec<RawFd> = Vec::with_capacity(num_clients);
-    let mut last_keepalive = Instant::now();
-
-    for client_id in 0..num_clients {
-        // Send heartbeats on all established connections every 10s to
-        // prevent the server's 30s idle timeout from dropping them.
-        if last_keepalive.elapsed() >= Duration::from_secs(10) {
-            keepalive_established(&write_fds, &heartbeat);
-            last_keepalive = Instant::now();
-        }
-
-        let (mut read_stream, write_stream) = connect();
-
-        // Challenge-response auth while the socket is still blocking.
-        auth_handshake(&mut read_stream, key);
-
-        let read_fd = read_stream.as_raw_fd();
-        let write_fd = write_stream.as_raw_fd();
-        write_fds.push(write_fd);
-
-        let client_pairs = if client_id == num_clients - 1 {
-            pairs_per_client + remainder
-        } else {
-            pairs_per_client
-        };
-        let total_orders = warmup + client_pairs * 2;
-
-        let order_id_offset: u64 = (0..client_id)
-            .map(|c| {
-                let p = if c == num_clients - 1 {
-                    pairs_per_client + remainder
-                } else {
-                    pairs_per_client
-                };
-                (warmup + p * 2) as u64
-            })
-            .sum();
-
-        let frames = {
+    // Pre-generate frames for all clients in parallel.
+    use rayon::prelude::*;
+    let all_frames: Vec<_> = (0..num_clients)
+        .into_par_iter()
+        .map(|client_id| {
+            let client_pairs = if client_id == num_clients - 1 {
+                pairs_per_client + remainder
+            } else {
+                pairs_per_client
+            };
+            let total_orders = warmup + client_pairs * 2;
+            let order_id_offset: u64 = (0..client_id)
+                .map(|c| {
+                    let p = if c == num_clients - 1 {
+                        pairs_per_client + remainder
+                    } else {
+                        pairs_per_client
+                    };
+                    (warmup + p * 2) as u64
+                })
+                .sum();
             let mut flow = generator::OrderFlowGenerator::new(generator::GeneratorConfig {
                 num_accounts,
                 num_instruments,
                 start_order_id: order_id_offset + 1,
                 ..Default::default()
             });
-            flow.generate_frames(total_orders)
-        };
+            (flow.generate_frames(total_orders), total_orders)
+        })
+        .collect();
+    eprintln!("  frames generated for all {num_clients} clients");
 
-        eprintln!(
-            "  client {}/{num_clients}: connected, {total_orders} frames generated",
-            client_id + 1,
-        );
+    // Connect and auth sequentially, attach pre-generated frames.
+    let mut connections: Vec<UringBenchConn> = Vec::with_capacity(num_clients);
+    let setup_start = Instant::now();
+    let heartbeat = heartbeat_frame();
+    let mut write_fds: Vec<RawFd> = Vec::with_capacity(num_clients);
+    let mut last_keepalive = Instant::now();
+
+    for (frames, total_orders) in all_frames {
+        if last_keepalive.elapsed() >= Duration::from_secs(10) {
+            keepalive_established(&write_fds, &heartbeat);
+            last_keepalive = Instant::now();
+        }
+
+        let (mut read_stream, write_stream) = connect();
+        auth_handshake(&mut read_stream, key);
+
+        let read_fd = read_stream.as_raw_fd();
+        let write_fd = write_stream.as_raw_fd();
+        write_fds.push(write_fd);
 
         connections.push(UringBenchConn {
             read_fd,
