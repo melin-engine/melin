@@ -361,6 +361,24 @@ if [[ "$RUN_REPLICATION" == "1" && -n "$REPLICA_PUB" && -n "$REPLICA_VLAN" ]]; t
     echo "============================================================"
     echo ""
 
+    # Pin IRQs to core 0 on the replica (server + bench are pinned by lan-bench.sh).
+    echo "  Pinning IRQs to core 0 on replica..."
+    ssh $SSH_OPTS "$REPLICA" 'pinned=0; failed=0
+for f in /proc/irq/*/smp_affinity; do
+    if echo 1 > "$f" 2>/dev/null; then
+        pinned=$((pinned + 1))
+    else
+        failed=$((failed + 1))
+    fi
+done
+echo "    Pinned ${pinned} IRQs to core 0 (${failed} unchanged)"'
+
+    # Reduce bond miimon on replica (server + bench done by lan-bench.sh).
+    ssh $SSH_OPTS "$REPLICA" 'if [ -d /sys/class/net/bond0 ]; then
+        echo 10000 > /sys/class/net/bond0/bonding/miimon 2>/dev/null || true
+        echo "  bond0 miimon → 10000 ms"
+    fi' 2>/dev/null || true
+
     # Clean journals on both primary and replica.
     JOURNAL_PATH="/mnt/journal/bench.journal"
     REPLICA_JOURNAL="/mnt/journal/replica.journal"

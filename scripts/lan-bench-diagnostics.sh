@@ -164,9 +164,9 @@ echo "  IRQ affinity → ${RESULTS_DIR}/irq-affinity.txt"
 ssh $SSH_OPTS "$SERVER" "cat /proc/interrupts" > "${RESULTS_DIR}/interrupts-before.txt"
 echo "  Interrupts snapshot → ${RESULTS_DIR}/interrupts-before.txt"
 
-# Capture dmesg.
-ssh $SSH_OPTS "$SERVER" "dmesg --time-format iso 2>/dev/null || dmesg" > "${RESULTS_DIR}/dmesg-before.txt"
-echo "  dmesg snapshot → ${RESULTS_DIR}/dmesg-before.txt"
+# Record dmesg line count so we can extract only new messages later.
+DMESG_BEFORE_LINES=$(ssh $SSH_OPTS "$SERVER" "dmesg | wc -l")
+echo "  dmesg baseline: ${DMESG_BEFORE_LINES} lines"
 
 # Check for processes on pipeline cores.
 ssh $SSH_OPTS "$SERVER" "bash -s ${PIPELINE_CORES}" <<'REMOTE_PS' > "${RESULTS_DIR}/processes-on-cores.txt"
@@ -280,13 +280,13 @@ echo "  Interrupt diff → ${RESULTS_DIR}/interrupts-diff.txt"
 cat "${RESULTS_DIR}/interrupts-diff.txt"
 echo ""
 
-# dmesg diff.
-ssh $SSH_OPTS "$SERVER" "dmesg --time-format iso 2>/dev/null || dmesg" > "${RESULTS_DIR}/dmesg-after.txt"
-dmesg_diff=$(diff "${RESULTS_DIR}/dmesg-before.txt" "${RESULTS_DIR}/dmesg-after.txt" | grep '^>' | sed 's/^> //' || true)
-if [[ -n "$dmesg_diff" ]]; then
-    echo "=== Kernel messages during benchmark ==="
-    echo "$dmesg_diff"
-    echo "$dmesg_diff" > "${RESULTS_DIR}/dmesg-diff.txt"
+# dmesg diff — extract only lines that appeared during the benchmark.
+DMESG_AFTER_LINES=$(ssh $SSH_OPTS "$SERVER" "dmesg | wc -l")
+dmesg_new=$((DMESG_AFTER_LINES - DMESG_BEFORE_LINES))
+if [[ $dmesg_new -gt 0 ]]; then
+    ssh $SSH_OPTS "$SERVER" "dmesg --time-format iso 2>/dev/null || dmesg" | tail -n "$dmesg_new" > "${RESULTS_DIR}/dmesg-diff.txt"
+    echo "=== Kernel messages during benchmark (${dmesg_new} new lines) ==="
+    cat "${RESULTS_DIR}/dmesg-diff.txt"
 else
     echo "=== Kernel messages during benchmark ==="
     echo "  (none)"

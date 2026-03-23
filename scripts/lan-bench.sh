@@ -155,8 +155,11 @@ echo ""
 # IRQ affinity doesn't persist across reboots and isolcpus doesn't prevent
 # hardware IRQs from being delivered to isolated cores. Pin everything to
 # core 0 so NIC/NVMe interrupts stay off pipeline cores 1-3.
-echo "=== Pinning IRQs to core 0 on server ==="
-ssh $SSH_OPTS "$SERVER" 'pinned=0; failed=0
+pin_irqs() {
+    local host="$1"
+    local label="$2"
+    echo "  ${label}..."
+    ssh $SSH_OPTS "$host" 'pinned=0; failed=0
 for f in /proc/irq/*/smp_affinity; do
     if echo 1 > "$f" 2>/dev/null; then
         pinned=$((pinned + 1))
@@ -164,7 +167,34 @@ for f in /proc/irq/*/smp_affinity; do
         failed=$((failed + 1))
     fi
 done
-echo "  Pinned ${pinned} IRQs to core 0 (${failed} unchanged)"'
+echo "    Pinned ${pinned} IRQs to core 0 (${failed} unchanged)"'
+}
+
+echo "=== Pinning IRQs to core 0 ==="
+pin_irqs "$SERVER" "server"
+pin_irqs "$BENCH" "bench"
+echo ""
+
+# ---------------------------------------------------------------------------
+# 4b. Reduce bonding driver jitter
+# ---------------------------------------------------------------------------
+# Cherry servers use 802.3ad bonding with miimon=100 (MII link check every
+# 100ms). Each check sends rescheduling IPIs to pipeline cores. The switch
+# doesn't support LACP anyway, so increase the interval to 10s during
+# benchmarks to reduce interrupt noise.
+reduce_bond_miimon() {
+    local host="$1"
+    local label="$2"
+    ssh $SSH_OPTS "$host" 'if [ -d /sys/class/net/bond0 ]; then
+        old=$(cat /sys/class/net/bond0/bonding/miimon 2>/dev/null)
+        echo 10000 > /sys/class/net/bond0/bonding/miimon 2>/dev/null || true
+        echo "  ${0##*/}: bond0 miimon: ${old} → 10000 ms"
+    fi' 2>/dev/null || true
+}
+
+echo "=== Reducing bond miimon interval ==="
+reduce_bond_miimon "$SERVER" "server"
+reduce_bond_miimon "$BENCH" "bench"
 echo ""
 
 # ---------------------------------------------------------------------------
