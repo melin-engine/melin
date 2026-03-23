@@ -44,6 +44,31 @@ impl Mempool {
         num_mbufs: u32,
         socket_id: i32,
     ) -> Result<Self, MempoolError> {
+        let buf_size = unsafe { ffi::dpdk_mbuf_default_buf_size() };
+        Self::create_full(name, num_mbufs, buf_size, socket_id)
+    }
+
+    /// Create a mempool for jumbo frames. `mtu` is the desired MTU (e.g.,
+    /// 9000). The mbuf data room is sized to hold one full frame plus
+    /// the RTE_PKTMBUF_HEADROOM (128 bytes).
+    pub fn create_for_mtu(
+        name: &str,
+        num_mbufs: u32,
+        mtu: u16,
+        socket_id: i32,
+    ) -> Result<Self, MempoolError> {
+        // Ethernet frame = 14 (header) + MTU + 4 (FCS, may be stripped).
+        // Add 128 bytes for RTE_PKTMBUF_HEADROOM.
+        let buf_size = mtu + 14 + 4 + 128;
+        Self::create_full(name, num_mbufs, buf_size, socket_id)
+    }
+
+    fn create_full(
+        name: &str,
+        num_mbufs: u32,
+        buf_size: u16,
+        socket_id: i32,
+    ) -> Result<Self, MempoolError> {
         let c_name = std::ffi::CString::new(name).map_err(|_| MempoolError::InvalidName)?;
 
         // SAFETY: EAL is initialized. We pass valid parameters and check
@@ -55,10 +80,7 @@ impl Mempool {
                 num_mbufs,
                 MBUF_CACHE_SIZE,
                 0, // priv_size: no per-mbuf private data
-                // Default mbuf data room size (typically 2048 + 128 = 2176 bytes).
-                // Enough for standard Ethernet frames (1518 bytes max).
-                // Retrieved via C wrapper since it's a macro.
-                ffi::dpdk_mbuf_default_buf_size(),
+                buf_size,
                 socket_id,
             )
         };

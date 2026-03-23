@@ -72,6 +72,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .as_deref()
                 .map(|s| s.parse().expect("invalid --dpdk-gateway address")),
             listen_port: config.bind.port(),
+            mtu: config.dpdk_mtu,
         };
         melin_server::server::run_dpdk(config, dpdk_config, shutdown)
     }

@@ -51,6 +51,9 @@ pub struct DpdkConfig {
     pub prefix_len: u8,
     pub gateway: Option<Ipv4Addr>,
     pub listen_port: u16,
+    /// MTU for the DPDK interface. 1500 for standard Ethernet, 9000 for
+    /// jumbo frames (6x fewer TCP segments, ~6x less per-segment overhead).
+    pub mtu: usize,
 }
 
 impl Default for DpdkConfig {
@@ -62,6 +65,7 @@ impl Default for DpdkConfig {
             prefix_len: 24,
             gateway: None,
             listen_port: LISTEN_PORT,
+            mtu: 1500,
         }
     }
 }
@@ -153,12 +157,16 @@ impl DpdkTransport {
         }
 
         // Increase mempool for extra ports — each port needs RX descriptors.
-        let num_mbufs = if config.port_ids.len() > 1 {
+        let num_mbufs: u32 = if config.port_ids.len() > 1 {
             12288
         } else {
             8192
         };
-        let mempool = Mempool::create_with_size("pktmbuf_pool", num_mbufs as u32, 0)?;
+        let mempool = if config.mtu > 1500 {
+            Mempool::create_for_mtu("pktmbuf_pool", num_mbufs, config.mtu as u16, 0)?
+        } else {
+            Mempool::create_with_size("pktmbuf_pool", num_mbufs, 0)?
+        };
 
         // Configure and start all ports. Use the intersection of offload
         // capabilities (in practice, VFs on the same NIC have identical caps).
@@ -176,7 +184,11 @@ impl DpdkTransport {
         let offloads = combined_offloads.unwrap_or_default();
 
         let mac = ports[0].mac_addr();
-        let device = DpdkDevice::new(&config.port_ids, mempool.as_raw(), offloads);
+        let mut device = DpdkDevice::new(&config.port_ids, mempool.as_raw(), offloads);
+        if config.mtu != 1500 {
+            device.set_mtu(config.mtu);
+            tracing::info!(mtu = config.mtu, "DPDK jumbo frames enabled");
+        }
 
         let hw_addr = HardwareAddress::Ethernet(EthernetAddress(mac));
         let iface_config = Config::new(hw_addr);

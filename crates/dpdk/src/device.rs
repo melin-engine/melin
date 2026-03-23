@@ -19,8 +19,9 @@ use crate::port::ChecksumOffloads;
 /// adding excessive latency from batch processing.
 const BURST_SIZE: usize = 32;
 
-/// MTU for standard Ethernet (no jumbo frames).
-const MTU: usize = 1500;
+/// Default MTU for standard Ethernet. Override with `DpdkDevice::set_mtu()`
+/// for jumbo frames (9000) which reduce TCP segment count ~6x.
+const DEFAULT_MTU: usize = 1500;
 
 /// Per-port RX state for multi-port polling.
 struct RxPort {
@@ -44,6 +45,9 @@ pub struct DpdkDevice {
     /// Port used for all TX (first port in the list).
     tx_port_id: u16,
     mempool: *mut ffi::rte_mempool,
+    /// MTU (Maximum Transmission Unit). 1500 for standard Ethernet,
+    /// 9000 for jumbo frames (6x fewer TCP segments).
+    mtu: usize,
     /// Hardware checksum offloads supported by the NIC (intersection
     /// of all ports' capabilities).
     offloads: ChecksumOffloads,
@@ -105,6 +109,7 @@ impl DpdkDevice {
             active_rx: 0,
             tx_port_id: port_ids[0],
             mempool,
+            mtu: DEFAULT_MTU,
             offloads,
             tx_ol_flags,
             inject_queue: Vec::new(),
@@ -145,6 +150,12 @@ impl DpdkDevice {
         }
     }
 
+    /// Set the MTU. Call before creating the smoltcp Interface so that
+    /// capabilities() reports the correct value. Use 9000 for jumbo frames.
+    pub fn set_mtu(&mut self, mtu: usize) {
+        self.mtu = mtu;
+    }
+
     /// Inject a raw Ethernet frame into smoltcp's RX path.
     /// Used to seed the neighbor cache with crafted ARP replies on SR-IOV
     /// VFs that can't receive broadcast ARP.
@@ -162,7 +173,7 @@ impl DpdkDevice {
     pub fn capabilities(&self) -> DeviceCapabilities {
         let mut caps = DeviceCapabilities::default();
         caps.medium = Medium::Ethernet;
-        caps.max_transmission_unit = MTU;
+        caps.max_transmission_unit = self.mtu;
         caps.max_burst_size = Some(BURST_SIZE);
 
         // Tell smoltcp which checksums the NIC handles in hardware.

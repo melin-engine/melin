@@ -272,6 +272,9 @@ struct BenchArgs {
     /// IPv4 gateway for the DPDK bench interface.
     #[arg(long)]
     dpdk_gateway: Option<String>,
+    /// MTU for the DPDK interface. Use 9000 for jumbo frames. Must match server.
+    #[arg(long, default_value_t = 1500)]
+    dpdk_mtu: usize,
     /// CPU core for the DPDK bench poll thread.
     #[arg(long, default_value_t = 7)]
     dpdk_core: usize,
@@ -335,6 +338,7 @@ fn main() {
                             .as_deref()
                             .map(|s| s.parse().expect("invalid --dpdk-gateway")),
                         server_addr: addr,
+                        mtu: args.dpdk_mtu,
                     },
                     args.pairs,
                     args.window,

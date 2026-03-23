@@ -71,6 +71,8 @@ pub struct DpdkBenchConfig {
     pub prefix_len: u8,
     pub gateway: Option<Ipv4Addr>,
     pub server_addr: std::net::SocketAddr,
+    /// MTU for the DPDK interface. Must match the server's MTU.
+    pub mtu: usize,
 }
 
 /// Run the DPDK roundtrip benchmark.
@@ -105,12 +107,17 @@ pub fn run_dpdk_roundtrip(
 
     // Use more mbufs for the bench client — many connections with large windows.
     // Increase for extra ports.
-    let num_mbufs = if config.port_ids.len() > 1 {
+    let num_mbufs: u32 = if config.port_ids.len() > 1 {
         24576
     } else {
         16384
     };
-    let mempool = Mempool::create_with_size("bench_pool", num_mbufs, 0).expect("mempool failed");
+    let mempool = if config.mtu > 1500 {
+        Mempool::create_for_mtu("bench_pool", num_mbufs, config.mtu as u16, 0)
+            .expect("mempool failed")
+    } else {
+        Mempool::create_with_size("bench_pool", num_mbufs, 0).expect("mempool failed")
+    };
 
     // Configure and start all ports. Use intersection of offload caps.
     let mut ports = Vec::with_capacity(config.port_ids.len());
@@ -128,6 +135,10 @@ pub fn run_dpdk_roundtrip(
 
     let mac = ports[0].mac_addr();
     let mut device = DpdkDevice::new(&config.port_ids, mempool.as_raw(), offloads);
+    if config.mtu != 1500 {
+        device.set_mtu(config.mtu);
+        eprintln!("  DPDK jumbo frames: MTU {}", config.mtu);
+    }
 
     let hw_addr = HardwareAddress::Ethernet(EthernetAddress(mac));
     let iface_config = Config::new(hw_addr);

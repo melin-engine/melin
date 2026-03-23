@@ -64,11 +64,16 @@ DPDK_IP="${DPDK_IP:-auto}"
 # Number of hugepages (2MB each). 1024 = 2GB, enough for DPDK mempool.
 HUGEPAGES="${HUGEPAGES:-1024}"
 
+# MTU for trading interfaces. 9000 = jumbo frames (6x fewer TCP segments
+# vs 1500). Requires switch support — most Cherry VLAN switches allow it.
+MTU="${MTU:-9000}"
+
 # Parse CLI overrides.
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --vlan) VLAN_ID="$2"; shift 2 ;;
         --ip) DPDK_IP="$2"; shift 2 ;;
+        --mtu) MTU="$2"; shift 2 ;;
         *) echo "unknown option: $1" >&2; exit 1 ;;
     esac
 done
@@ -124,6 +129,7 @@ echo "  PF0: ${PF0_PCI} (${PF0_IFACE})"
 echo "  PF1: ${PF1_PCI} (${PF1_IFACE})"
 echo "  VLAN: ${VLAN_ID}"
 echo "  DPDK IP: ${DPDK_IP}"
+echo "  MTU: ${MTU}"
 echo ""
 
 # ---------------------------------------------------------------------------
@@ -202,6 +208,11 @@ create_vf() {
     # Disable spoofcheck (needed for smoltcp to use its own MAC).
     ip link set "${iface}" vf 0 spoofchk off
     echo "  ${label}: VF 0 spoofcheck disabled"
+
+    # Set jumbo MTU on the PF so VFs can use large frames.
+    # Reduces TCP segment count ~6x (MSS 8960 vs 1460).
+    ip link set "${iface}" mtu "${MTU}"
+    echo "  ${label}: MTU set to ${MTU}"
 }
 
 create_vf "${PF0_PCI}" "${PF0_IFACE}" "PF0"
@@ -270,6 +281,7 @@ DPDK_IP=${DPDK_IP%%/*}
 DPDK_PREFIX=${DPDK_IP##*/}
 DPDK_PORT=0
 HUGE_DIR=/mnt/huge_2m
+MTU=${MTU}
 EOF
 echo "  Config written to ${DPDK_CONF}"
 

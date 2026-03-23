@@ -165,6 +165,11 @@ pub struct ServerConfig {
     #[arg(long)]
     pub dpdk_gateway: Option<String>,
 
+    /// MTU for the DPDK interface. Use 9000 for jumbo frames (6x fewer TCP
+    /// segments). Requires switch and PF MTU to be set accordingly.
+    #[arg(long, default_value_t = 1500)]
+    pub dpdk_mtu: usize,
+
     /// CPU core for the DPDK poll thread. This thread handles all NIC I/O
     /// and smoltcp TCP processing — it should be on an isolated core.
     /// Default: 7 (after the 3 pipeline cores + 2 reader cores).
@@ -206,6 +211,7 @@ impl Default for ServerConfig {
             dpdk_ip: "10.0.0.1".into(),
             dpdk_prefix_len: 24,
             dpdk_gateway: None,
+            dpdk_mtu: 1500,
             dpdk_core: 7,
         }
     }
