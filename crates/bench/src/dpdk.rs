@@ -391,17 +391,39 @@ pub fn run_dpdk_roundtrip(
                 && conn.send_cursor < conn.total_orders
                 && socket.can_send()
             {
-                let frame = &conn.frames[conn.send_cursor];
-                let sent = match socket.send_slice(frame) {
-                    Ok(n) => n,
-                    Err(_) => break, // Socket error — stop sending.
+                let payload = &conn.frames[conn.send_cursor];
+                // Build length-prefixed wire frame: [u32 LE length][payload].
+                let len_prefix = (payload.len() as u32).to_le_bytes();
+                let wire_len = 4 + payload.len();
+
+                // Try to send the length prefix first.
+                let sent = match socket.send_slice(&len_prefix) {
+                    Ok(n) if n == 4 => {
+                        // Prefix sent, now send payload.
+                        match socket.send_slice(payload) {
+                            Ok(n) if n == payload.len() => wire_len,
+                            Ok(n) => {
+                                // Partial payload — buffer remainder.
+                                conn.send_pending.extend_from_slice(&payload[n..]);
+                                wire_len
+                            }
+                            Err(_) => {
+                                // Payload failed — buffer entire payload.
+                                conn.send_pending.extend_from_slice(payload);
+                                wire_len
+                            }
+                        }
+                    }
+                    Ok(n) => {
+                        // Partial prefix — buffer remainder of prefix + payload.
+                        conn.send_pending.extend_from_slice(&len_prefix[n..]);
+                        conn.send_pending.extend_from_slice(payload);
+                        wire_len
+                    }
+                    Err(_) => break,
                 };
                 if sent == 0 {
-                    break; // TX buffer full despite can_send() — retry next poll.
-                }
-                if sent < frame.len() {
-                    // Partial send — buffer the remainder.
-                    conn.send_pending.extend_from_slice(&frame[sent..]);
+                    break;
                 }
                 conn.inflight_ts.push_back(Instant::now());
                 conn.send_cursor += 1;
