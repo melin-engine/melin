@@ -58,7 +58,7 @@ The journal stage uses batch `pwritev2` + `RWF_DSYNC` (FUA) with 256 MiB pre-all
 |---|-------------|-----------|--------|--------|
 | 1 | **Adaptive overlapped io_uring writes** | 30-50% throughput | Medium | Reverted — needs tail fix |
 | 2 | **Auto-tune max batch size** | Up to 2-4x at sustained load | Low | Not started |
-| 3 | **NVMe tuning (scheduler=none, queue depth=1)** | 10-30% latency | Trivial | Not started |
+| 3 | **NVMe block device tuning** | Jitter reduction (p99.9/max) | Trivial | Done |
 | 4 | **WRITE_FIXED for journal** | ~200ns/batch | Low | Not started |
 | 5 | **Optane / persistent memory** | 3-10x journal latency | Hardware | Not started |
 | 6 | **Vectored writes (iovec per event)** | ~1-2µs/batch | Low | Not started |
@@ -67,14 +67,7 @@ The journal stage uses batch `pwritev2` + `RWF_DSYNC` (FUA) with 256 MiB pre-all
 
 **2. Auto-tune max batch size.** Currently `MAX_JOURNAL_BATCH = 1024` is static. FUA cost is roughly constant regardless of payload size (up to ~128 KB = one NVMe command). Draining all available events from the ring (up to a higher cap, e.g., 4096) before writing means fewer FUA operations per second. At sustained high load, 4096 events in one FUA vs 4 × 1024-event FUA writes = 4x fewer syncs, directly increasing throughput. No latency penalty — events aren't delayed, they're already in the ring.
 
-**3. NVMe tuning.** If the journal NVMe hasn't been tuned:
-```sh
-# Bypass I/O scheduler (journal is single-writer sequential)
-echo none > /sys/block/nvme1n1/queue/scheduler
-# Queue depth 1 — no benefit from deeper queues with single-writer FUA
-echo 1 > /sys/block/nvme1n1/queue/nr_requests
-```
-Also check NVMe volatile write cache: `nvme get-feature -f 0x06 /dev/nvmeXn1`. If disabled, FUA is already a no-op (data always goes to non-volatile media), and `RWF_DSYNC` could theoretically be dropped.
+**3. NVMe block device tuning.** Implemented in `scripts/cherry-setup.sh` (sysfs writes + udev rule for persistence). Settings: `scheduler=none`, `nr_requests=2`, `nomerges=2`, `wbt_lat_usec=0`, `add_random=0`. Eliminates non-deterministic block layer overhead (scheduler sorting, merge scans, writeback throttling, entropy pool locks). Targets jitter (p99.9/max), not median throughput. Also worth checking NVMe volatile write cache: `nvme get-feature -f 0x06 /dev/nvmeXn1` — if disabled, FUA is already a no-op.
 
 **4. WRITE_FIXED for journal.** Register the two batch buffers via `IORING_REGISTER_BUFFERS` and use `IORING_OP_WRITE_FIXED` instead of plain `WRITE`. Skips `get_user_pages()` per SQE (~100-200ns). This failed for *socket* I/O on kernel 6.8 (routes through VFS), but works reliably for file writes.
 

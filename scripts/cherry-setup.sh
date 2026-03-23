@@ -255,6 +255,48 @@ if [[ -n "$JOURNAL_DISK" ]]; then
         echo "UUID=$UUID $JOURNAL_MOUNT ext4 $JOURNAL_MOUNT_OPTS 0 2" >> /etc/fstab
         echo "  Added to /etc/fstab (UUID=$UUID)"
     fi
+
+    # NVMe block device tuning — reduces jitter (p99.9/max) by eliminating
+    # non-deterministic software overhead on the I/O path. These are sysfs
+    # settings that don't survive reboots, so we also install a udev rule.
+    #
+    #   scheduler=none:   bypass mq-deadline's per-I/O sorting, timer-based
+    #                     batching, and lock acquisition
+    #   nr_requests=2:    minimal software queue depth — one inflight + one
+    #                     queued (for future overlapped io_uring writes)
+    #   nomerges=2:       skip merge scan entirely — FUA writes are issued
+    #                     individually with nothing to merge; scan time varies
+    #                     with queue depth (non-deterministic)
+    #   wbt_lat_usec=0:   disable writeback throttling — can inject artificial
+    #                     delays based on a moving average; not needed on a
+    #                     dedicated single-writer device
+    #   add_random=0:     don't feed I/O completion timing into the entropy
+    #                     pool — avoids a spinlock per I/O completion
+    JOURNAL_DEV=$(basename "$JOURNAL_DISK")
+    BLOCK_SYSFS="/sys/block/$JOURNAL_DEV/queue"
+
+    echo "  NVMe block tuning ($JOURNAL_DEV):"
+    for param in "scheduler none" "nr_requests 2" "nomerges 2" "wbt_lat_usec 0" "add_random 0"; do
+        key="${param% *}"
+        val="${param#* }"
+        target="$BLOCK_SYSFS/$key"
+        if [[ -f "$target" ]]; then
+            old=$(cat "$target" 2>/dev/null | sed 's/.*\[\(.*\)\].*/\1/' || true)
+            echo "$val" > "$target" 2>/dev/null || true
+            echo "    $key: $old → $val"
+        else
+            echo "    $key: (not available)"
+        fi
+    done
+
+    # Persist via udev rule so settings survive reboots.
+    UDEV_RULE="/etc/udev/rules.d/99-melin-journal-nvme.rules"
+    cat > "$UDEV_RULE" << EOF
+# Melin journal NVMe tuning — reduce block layer jitter.
+# Applied to the journal disk identified during cherry-setup.sh.
+ACTION=="add|change", KERNEL=="$JOURNAL_DEV", ATTR{queue/scheduler}="none", ATTR{queue/nr_requests}="2", ATTR{queue/nomerges}="2", ATTR{queue/wbt_lat_usec}="0", ATTR{queue/add_random}="0"
+EOF
+    echo "  Installed udev rule: $UDEV_RULE"
 else
     echo "=== No dedicated journal disk found, skipping ==="
 fi
