@@ -366,6 +366,12 @@ mod tests {
     use super::*;
     use crate::types::*;
 
+    /// First user-event sequence: 2 with hash-chain (genesis takes 1), 1 without.
+    #[cfg(feature = "hash-chain")]
+    const FIRST_SEQ: u64 = 2;
+    #[cfg(not(feature = "hash-chain"))]
+    const FIRST_SEQ: u64 = 1;
+
     const ACCT_A: AccountId = AccountId(1);
     const ACCT_B: AccountId = AccountId(2);
     const BTC: CurrencyId = CurrencyId(0);
@@ -540,22 +546,23 @@ mod tests {
             let mut je = JournaledExchange::create(&path).unwrap();
             je.add_instrument(btc_usd_spec()).unwrap();
             je.deposit(ACCT_A, USD, 100_000).unwrap();
-            // Genesis(1) + AddInstrument(2) + Deposit(3) = next is 4.
-            assert_eq!(je.next_sequence(), 4);
+            // With hash-chain: Genesis(1) + AddInstrument(2) + Deposit(3) = next is 4.
+            // Without: AddInstrument(1) + Deposit(2) = next is 3.
+            assert_eq!(je.next_sequence(), FIRST_SEQ + 2);
         }
 
         // Recover and append more.
         {
             let mut je = JournaledExchange::recover(&path).unwrap();
-            assert_eq!(je.next_sequence(), 4);
+            assert_eq!(je.next_sequence(), FIRST_SEQ + 2);
 
             je.deposit(ACCT_B, BTC, 500).unwrap();
-            assert_eq!(je.next_sequence(), 5);
+            assert_eq!(je.next_sequence(), FIRST_SEQ + 3);
         }
 
-        // Recover again — should see all 3 user events + genesis.
+        // Recover again — should see all 3 user events.
         let je = JournaledExchange::recover(&path).unwrap();
-        assert_eq!(je.next_sequence(), 5);
+        assert_eq!(je.next_sequence(), FIRST_SEQ + 3);
         assert_eq!(
             je.exchange().accounts().balance(ACCT_A, USD).available,
             100_000
@@ -573,8 +580,8 @@ mod tests {
         }
 
         let je = JournaledExchange::recover(&path).unwrap();
-        // Genesis consumed seq 1, so next is 2.
-        assert_eq!(je.next_sequence(), 2);
+        // With hash-chain, genesis consumed seq 1, so next is 2; without, next is 1.
+        assert_eq!(je.next_sequence(), FIRST_SEQ);
     }
 
     #[test]
@@ -603,8 +610,9 @@ mod tests {
 
         // Recovery should replay the first event (AddInstrument) but not the truncated Deposit.
         let je = JournaledExchange::recover(&path).unwrap();
-        // Genesis(1) + AddInstrument(2) survived, Deposit(3) truncated → next=3.
-        assert_eq!(je.next_sequence(), 3);
+        // With hash-chain: Genesis(1) + AddInstrument(2) survived, Deposit(3) truncated → next=3.
+        // Without: AddInstrument(1) survived, Deposit(2) truncated → next=2.
+        assert_eq!(je.next_sequence(), FIRST_SEQ + 1);
         assert_eq!(je.exchange().accounts().balance(ACCT_A, USD).available, 0);
     }
 
@@ -638,9 +646,9 @@ mod tests {
 
         // Full re-recovery should see both events cleanly (no garbage between).
         let je = JournaledExchange::recover(&path).unwrap();
-        // Genesis(1) + AddInstrument(2) + Deposit(3) → next=4
-        // (original Deposit was truncated, re-appended Deposit takes seq 3).
-        assert_eq!(je.next_sequence(), 4);
+        // With hash-chain: Genesis(1) + AddInstrument(2) + Deposit(3) → next=4
+        // Without: AddInstrument(1) + Deposit(2) → next=3
+        assert_eq!(je.next_sequence(), FIRST_SEQ + 2);
         assert_eq!(
             je.exchange().accounts().balance(ACCT_A, USD).available,
             50_000
@@ -681,8 +689,9 @@ mod tests {
 
         // Recover from snapshot + journal.
         let je = JournaledExchange::recover_from_snapshot(&snap_path, &journal_path).unwrap();
-        // Genesis(1) + 4 user events(2,3,4,5) + 1 post-snap(6) → next=7
-        assert_eq!(je.next_sequence(), 7);
+        // With hash-chain: Genesis(1) + 4 user events(2,3,4,5) + 1 post-snap(6) → next=7
+        // Without: 4 user events(1,2,3,4) + 1 post-snap(5) → next=6
+        assert_eq!(je.next_sequence(), FIRST_SEQ + 5);
         // Buyer got 20 BTC from fill.
         assert_eq!(je.exchange().accounts().balance(ACCT_A, BTC).available, 20);
         // Seller still has 30 resting (50 - 20 filled).
@@ -765,9 +774,13 @@ mod tests {
         // New journal exists and is smaller.
         assert!(journal_path.exists());
         assert!(engine.journal_size() < size_before);
-        // Sequence continues. The new journal writes a genesis entry,
-        // consuming one sequence number.
-        assert_eq!(engine.next_sequence(), seq_before + 1);
+        // Sequence continues. With hash-chain, the new journal writes a
+        // genesis entry consuming one sequence number.
+        #[cfg(feature = "hash-chain")]
+        let rotation_cost = 1u64;
+        #[cfg(not(feature = "hash-chain"))]
+        let rotation_cost = 0u64;
+        assert_eq!(engine.next_sequence(), seq_before + rotation_cost);
 
         // Can still append to the new journal.
         engine
@@ -777,7 +790,7 @@ mod tests {
                 &mut reports,
             )
             .unwrap();
-        assert_eq!(engine.next_sequence(), seq_before + 2);
+        assert_eq!(engine.next_sequence(), seq_before + rotation_cost + 1);
     }
 
     #[test]
@@ -858,8 +871,13 @@ mod tests {
         let path = dir.path().join("cont.journal");
 
         let mut writer = JournalWriter::create_continuing(&path, 42, [0xAA; 32]).unwrap();
-        // Genesis consumes seq 42, next is 43.
-        assert_eq!(writer.next_sequence(), 43);
+        // With hash-chain, genesis consumes seq 42, next is 43.
+        // Without hash-chain, no genesis, next is 42.
+        #[cfg(feature = "hash-chain")]
+        let expected_first = 43u64;
+        #[cfg(not(feature = "hash-chain"))]
+        let expected_first = 42u64;
+        assert_eq!(writer.next_sequence(), expected_first);
 
         let event = JournalEvent::Deposit {
             account: ACCT_A,
@@ -867,15 +885,16 @@ mod tests {
             amount: 100,
         };
         let seq = writer.append(&event).unwrap();
-        assert_eq!(seq, 43);
-        assert_eq!(writer.next_sequence(), 44);
+        assert_eq!(seq, expected_first);
+        assert_eq!(writer.next_sequence(), expected_first + 1);
 
-        // Read it back. Genesis is transparent, first user entry is seq 43.
+        // Read it back. Genesis is transparent, first user entry starts at expected_first.
         let mut reader = crate::journal::reader::JournalReader::open(&path).unwrap();
         let entry = reader.next_entry().unwrap().unwrap();
-        assert_eq!(entry.sequence, 43);
+        assert_eq!(entry.sequence, expected_first);
     }
 
+    #[cfg(feature = "hash-chain")]
     #[test]
     fn recovery_preserves_chain_hash() {
         let dir = tempfile::tempdir().unwrap();
@@ -894,6 +913,7 @@ mod tests {
         assert_eq!(recovered.writer_chain_hash(), original_hash);
     }
 
+    #[cfg(feature = "hash-chain")]
     #[test]
     fn rotation_preserves_chain_continuity() {
         let dir = tempfile::tempdir().unwrap();
@@ -919,6 +939,7 @@ mod tests {
         assert_ne!(hash_before_rotate, hash_after_rotate);
     }
 
+    #[cfg(feature = "hash-chain")]
     #[test]
     fn snapshot_stores_chain_hash() {
         let dir = tempfile::tempdir().unwrap();
@@ -983,6 +1004,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "hash-chain")]
     #[test]
     fn crash_recovery_chain_hash_continuity() {
         let dir = tempfile::tempdir().unwrap();
@@ -1020,6 +1042,7 @@ mod tests {
         assert_eq!(je2.writer_chain_hash(), hash_after_append);
     }
 
+    #[cfg(feature = "hash-chain")]
     #[test]
     fn multiple_rotations_preserve_chain_state() {
         let dir = tempfile::tempdir().unwrap();

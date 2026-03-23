@@ -83,13 +83,16 @@ pub struct JournalWriter {
     /// Byte offset of the end of pre-allocated space. When `write_pos`
     /// approaches this, another `PREALLOC_CHUNK` is allocated.
     allocated_end: u64,
-    /// BLAKE3 hash chain state. `None` for v5 journals (no hash chain).
-    /// When active, each encoded entry's bytes (excluding CRC) are hashed
-    /// with the previous hash to form a tamper-evident chain.
+    /// BLAKE3 hash chain state. `None` when the `hash-chain` feature is
+    /// disabled or for v5 journals (no hash chain). When active, each encoded
+    /// entry's bytes (excluding CRC) are hashed with the previous hash to
+    /// form a tamper-evident chain.
+    #[cfg(feature = "hash-chain")]
     hash_chain: Option<HashChain>,
 }
 
 /// Running BLAKE3 hash chain state for tamper evidence.
+#[cfg(feature = "hash-chain")]
 struct HashChain {
     /// Current chain hash: `hash_n = BLAKE3(encoded_bytes || hash_{n-1})`.
     current_hash: [u8; 32],
@@ -105,10 +108,15 @@ impl JournalWriter {
     ///
     /// Fails if the file already exists (use `open_append` for existing journals).
     pub fn create(path: &Path) -> Result<Self, JournalError> {
-        let mut genesis = [0u8; 32];
-        getrandom::fill(&mut genesis)
-            .map_err(|e| JournalError::Io(std::io::Error::other(e.to_string())))?;
-        Self::create_with_genesis(path, 1, genesis)
+        #[cfg(feature = "hash-chain")]
+        {
+            let mut genesis = [0u8; 32];
+            getrandom::fill(&mut genesis)
+                .map_err(|e| JournalError::Io(std::io::Error::other(e.to_string())))?;
+            Self::create_with_genesis(path, 1, genesis)
+        }
+        #[cfg(not(feature = "hash-chain"))]
+        Self::create_without_chain(path, 1)
     }
 
     /// Create a new journal file that continues from a given sequence number.
@@ -123,50 +131,27 @@ impl JournalWriter {
         starting_sequence: u64,
         genesis_hash: [u8; 32],
     ) -> Result<Self, JournalError> {
-        Self::create_with_genesis(path, starting_sequence, genesis_hash)
+        #[cfg(feature = "hash-chain")]
+        {
+            Self::create_with_genesis(path, starting_sequence, genesis_hash)
+        }
+        #[cfg(not(feature = "hash-chain"))]
+        {
+            let _ = genesis_hash;
+            Self::create_without_chain(path, starting_sequence)
+        }
     }
 
     /// Internal: create a new journal with a specific genesis hash.
+    #[cfg(feature = "hash-chain")]
     fn create_with_genesis(
         path: &Path,
         starting_sequence: u64,
         genesis: [u8; 32],
     ) -> Result<Self, JournalError> {
-        let file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create_new(true)
-            .open(path)?;
-
-        // Write file header at offset 0.
-        let mut header = [0u8; FILE_HEADER_SIZE];
-        codec::encode_file_header(&mut header);
-        file.write_all_at(&header, 0)?;
-
-        let write_pos = FILE_HEADER_SIZE as u64;
-
-        // Pre-allocate the first chunk. This extends the file and allocates
-        // disk blocks so subsequent writes don't trigger extent allocation.
-        let allocated_end = preallocate(&file, write_pos)?;
-
-        // Sync both the header and the extent metadata from fallocate.
-        // This is a one-time cost at journal creation.
-        file.sync_all()?;
-
-        let mut writer = Self {
-            file,
-            buffer: [0u8; MAX_ENTRY_SIZE],
-            batch_buf: Vec::with_capacity(BATCH_BUF_CAPACITY),
-            spare_buf: Some(Vec::with_capacity(BATCH_BUF_CAPACITY)),
-            next_sequence: starting_sequence,
-            path: path.to_path_buf(),
-            write_pos,
-            allocated_end,
-            hash_chain: None,
-        };
+        let mut writer = Self::create_bare(path, starting_sequence)?;
 
         // Write genesis hash as the first entry and initialize the chain.
-        // The genesis entry itself is hashed into the chain.
         let genesis_event = JournalEvent::GenesisHash { hash: genesis };
         let seq = writer.next_sequence;
         let timestamp_ns = wall_clock_nanos();
@@ -180,7 +165,6 @@ impl JournalWriter {
             events_since_checkpoint: 0,
         });
 
-        // Write the genesis entry to the batch buffer.
         writer
             .batch_buf
             .extend_from_slice(&writer.buffer[..written]);
@@ -188,6 +172,43 @@ impl JournalWriter {
         writer.flush_batch_sync()?;
 
         Ok(writer)
+    }
+
+    /// Internal: create a new journal without a hash chain.
+    #[cfg(not(feature = "hash-chain"))]
+    fn create_without_chain(path: &Path, starting_sequence: u64) -> Result<Self, JournalError> {
+        let writer = Self::create_bare(path, starting_sequence)?;
+        Ok(writer)
+    }
+
+    /// Shared file setup: header, pre-allocation, sync.
+    fn create_bare(path: &Path, starting_sequence: u64) -> Result<Self, JournalError> {
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(path)?;
+
+        let mut header = [0u8; FILE_HEADER_SIZE];
+        codec::encode_file_header(&mut header);
+        file.write_all_at(&header, 0)?;
+
+        let write_pos = FILE_HEADER_SIZE as u64;
+        let allocated_end = preallocate(&file, write_pos)?;
+        file.sync_all()?;
+
+        Ok(Self {
+            file,
+            buffer: [0u8; MAX_ENTRY_SIZE],
+            batch_buf: Vec::with_capacity(BATCH_BUF_CAPACITY),
+            spare_buf: Some(Vec::with_capacity(BATCH_BUF_CAPACITY)),
+            next_sequence: starting_sequence,
+            path: path.to_path_buf(),
+            write_pos,
+            allocated_end,
+            #[cfg(feature = "hash-chain")]
+            hash_chain: None,
+        })
     }
 
     /// Open an existing journal file for appending after recovery.
@@ -205,7 +226,10 @@ impl JournalWriter {
         path: &Path,
         last_seq: u64,
         valid_end: u64,
-        chain_hash: Option<[u8; 32]>,
+        #[cfg_attr(not(feature = "hash-chain"), allow(unused_variables))] chain_hash: Option<
+            [u8; 32],
+        >,
+        #[cfg_attr(not(feature = "hash-chain"), allow(unused_variables))]
         events_since_checkpoint: u64,
     ) -> Result<Self, JournalError> {
         let file = OpenOptions::new().read(true).write(true).open(path)?;
@@ -246,6 +270,7 @@ impl JournalWriter {
             path: path.to_path_buf(),
             write_pos: valid_end,
             allocated_end,
+            #[cfg(feature = "hash-chain")]
             hash_chain: chain_hash.map(|h| HashChain {
                 current_hash: h,
                 events_since_checkpoint,
@@ -301,6 +326,7 @@ impl JournalWriter {
 
         // Update the BLAKE3 hash chain: hash entry bytes (excluding CRC)
         // concatenated with the previous hash. ~15-30ns for ~112 bytes.
+        #[cfg(feature = "hash-chain")]
         if let Some(chain) = &mut self.hash_chain {
             let entry_bytes_len = written - 4; // exclude 4-byte CRC
             let mut hasher = blake3::Hasher::new();
@@ -314,6 +340,7 @@ impl JournalWriter {
         self.next_sequence += 1;
 
         // Auto-emit a checkpoint if we've hit the interval.
+        #[cfg(feature = "hash-chain")]
         if let Some(chain) = &self.hash_chain
             && chain.events_since_checkpoint >= CHECKPOINT_INTERVAL
         {
@@ -326,6 +353,7 @@ impl JournalWriter {
     }
 
     /// Emit a checkpoint entry into the batch buffer and reset the counter.
+    #[cfg(feature = "hash-chain")]
     fn emit_checkpoint(
         &mut self,
         chain_hash: [u8; 32],
@@ -471,17 +499,28 @@ impl JournalWriter {
         self.file.as_raw_fd()
     }
 
-    /// Current BLAKE3 chain hash, if hash chain is active (v6 journals).
-    /// Returns `None` for v5 journals or if no events have been written.
+    /// Current BLAKE3 chain hash, if hash chain is active.
+    /// Returns `None` when the `hash-chain` feature is disabled, for v5
+    /// journals, or if no events have been written.
     pub fn chain_hash(&self) -> Option<[u8; 32]> {
-        self.hash_chain.as_ref().map(|c| c.current_hash)
+        #[cfg(feature = "hash-chain")]
+        {
+            self.hash_chain.as_ref().map(|c| c.current_hash)
+        }
+        #[cfg(not(feature = "hash-chain"))]
+        None
     }
 
     /// Events since last checkpoint, if hash chain is active.
     pub fn events_since_checkpoint(&self) -> u64 {
-        self.hash_chain
-            .as_ref()
-            .map_or(0, |c| c.events_since_checkpoint)
+        #[cfg(feature = "hash-chain")]
+        {
+            self.hash_chain
+                .as_ref()
+                .map_or(0, |c| c.events_since_checkpoint)
+        }
+        #[cfg(not(feature = "hash-chain"))]
+        0
     }
 
     /// Read-only access to the pending batch buffer (encoded but not yet flushed).
@@ -624,6 +663,12 @@ mod tests {
     use crate::journal::reader::JournalReader;
     use crate::types::*;
 
+    /// First user-event sequence: 2 with hash-chain (genesis takes 1), 1 without.
+    #[cfg(feature = "hash-chain")]
+    const FIRST_SEQ: u64 = 2;
+    #[cfg(not(feature = "hash-chain"))]
+    const FIRST_SEQ: u64 = 1;
+
     fn nz(v: u64) -> NonZeroU64 {
         NonZeroU64::new(v).unwrap()
     }
@@ -661,11 +706,14 @@ mod tests {
         let path = dir.path().join("test.journal");
 
         let writer = JournalWriter::create(&path).unwrap();
-        // Genesis hash entry consumes sequence 1, so next is 2.
-        assert_eq!(writer.next_sequence(), 2);
+        // With hash-chain, genesis consumes seq 1 so next is 2; without, next is 1.
+        assert_eq!(writer.next_sequence(), FIRST_SEQ);
         assert_eq!(writer.path(), path);
-        // Hash chain should be active.
+        // Hash chain is active only with the feature.
+        #[cfg(feature = "hash-chain")]
         assert!(writer.chain_hash().is_some());
+        #[cfg(not(feature = "hash-chain"))]
+        assert!(writer.chain_hash().is_none());
 
         // File should be pre-allocated (64 MiB chunk).
         let file_len = std::fs::metadata(&path).unwrap().len();
@@ -696,15 +744,16 @@ mod tests {
         let mut writer = JournalWriter::create(&path).unwrap();
         let event = sample_event();
 
-        // Genesis consumed seq 1, so user events start at 2.
+        // With hash-chain, genesis consumed seq 1, so user events start at 2.
+        // Without hash-chain, user events start at 1.
         let seq1 = writer.append(&event).unwrap();
         let seq2 = writer.append(&event).unwrap();
         let seq3 = writer.append(&event).unwrap();
 
-        assert_eq!(seq1, 2);
-        assert_eq!(seq2, 3);
-        assert_eq!(seq3, 4);
-        assert_eq!(writer.next_sequence(), 5);
+        assert_eq!(seq1, FIRST_SEQ);
+        assert_eq!(seq2, FIRST_SEQ + 1);
+        assert_eq!(seq3, FIRST_SEQ + 2);
+        assert_eq!(writer.next_sequence(), FIRST_SEQ + 3);
     }
 
     #[test]
@@ -720,7 +769,7 @@ mod tests {
 
         let entries = read_all(&path);
         assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0].sequence, 2); // genesis consumed seq 1
+        assert_eq!(entries[0].sequence, FIRST_SEQ);
         assert_eq!(entries[0].event, event);
         assert!(entries[0].timestamp_ns > 0);
     }
@@ -734,7 +783,7 @@ mod tests {
         {
             let mut writer = JournalWriter::create(&path).unwrap();
             let seq = writer.append_no_sync(&event).unwrap();
-            assert_eq!(seq, 2); // genesis consumed seq 1
+            assert_eq!(seq, FIRST_SEQ);
         }
 
         let entries = read_all(&path);
@@ -773,7 +822,7 @@ mod tests {
         let entries = read_all(&path);
         assert_eq!(entries.len(), events.len());
         for (i, (entry, expected)) in entries.iter().zip(events.iter()).enumerate() {
-            assert_eq!(entry.sequence, (i as u64) + 2); // genesis consumed seq 1
+            assert_eq!(entry.sequence, (i as u64) + FIRST_SEQ);
             assert_eq!(&entry.event, expected);
         }
     }
@@ -789,7 +838,7 @@ mod tests {
         {
             let mut writer = JournalWriter::create(&path).unwrap();
             let seq = writer.batch_append_with_ts(&event, fixed_ts).unwrap();
-            assert_eq!(seq, 2); // genesis consumed seq 1
+            assert_eq!(seq, FIRST_SEQ);
             writer.flush_batch().unwrap();
         }
 
@@ -814,8 +863,8 @@ mod tests {
 
         let entries = read_all(&path);
         assert_eq!(entries.len(), 2);
-        assert_eq!(entries[0].sequence, 2); // genesis consumed seq 1
-        assert_eq!(entries[1].sequence, 3);
+        assert_eq!(entries[0].sequence, FIRST_SEQ);
+        assert_eq!(entries[1].sequence, FIRST_SEQ + 1);
     }
 
     #[test]
@@ -853,9 +902,9 @@ mod tests {
 
         let entries = read_all(&path);
         assert_eq!(entries.len(), 3);
-        assert_eq!(entries[0].sequence, 2); // genesis consumed seq 1
-        assert_eq!(entries[1].sequence, 3);
-        assert_eq!(entries[2].sequence, 4);
+        assert_eq!(entries[0].sequence, FIRST_SEQ);
+        assert_eq!(entries[1].sequence, FIRST_SEQ + 1);
+        assert_eq!(entries[2].sequence, FIRST_SEQ + 2);
     }
 
     #[test]
@@ -887,16 +936,17 @@ mod tests {
         {
             let mut writer =
                 JournalWriter::open_append(&path, last_seq, valid_end, None, 0).unwrap();
-            // Genesis(1) + 3 user events(2,3,4) → last_seq=4, next=5
-            assert_eq!(writer.next_sequence(), 5);
+            // With hash-chain: Genesis(1) + 3 user events(2,3,4) → last_seq=4, next=5
+            // Without: 3 user events(1,2,3) → last_seq=3, next=4
+            assert_eq!(writer.next_sequence(), FIRST_SEQ + 3);
             let seq = writer.append(&extra).unwrap();
-            assert_eq!(seq, 5);
+            assert_eq!(seq, FIRST_SEQ + 3);
         }
 
         // Read back all 4 entries (3 original + 1 new, genesis is transparent).
         let entries = read_all(&path);
         assert_eq!(entries.len(), 4);
-        assert_eq!(entries[3].sequence, 5);
+        assert_eq!(entries[3].sequence, FIRST_SEQ + 3);
         assert_eq!(entries[3].event, extra);
     }
 
@@ -1037,12 +1087,13 @@ mod tests {
 
         let entries = read_all(&path);
         assert_eq!(entries.len(), 3);
-        assert_eq!(entries[0].sequence, 2); // genesis consumed seq 1
-        assert_eq!(entries[1].sequence, 3);
-        assert_eq!(entries[2].sequence, 4);
+        assert_eq!(entries[0].sequence, FIRST_SEQ);
+        assert_eq!(entries[1].sequence, FIRST_SEQ + 1);
+        assert_eq!(entries[2].sequence, FIRST_SEQ + 2);
         assert_eq!(entries[2].event, cancel);
     }
 
+    #[cfg(feature = "hash-chain")]
     #[test]
     fn genesis_hash_written_as_first_entry() {
         let dir = tempfile::tempdir().unwrap();
@@ -1062,6 +1113,7 @@ mod tests {
         assert!(reader.chain_hash().is_some());
     }
 
+    #[cfg(feature = "hash-chain")]
     #[test]
     fn chain_hash_changes_with_each_event() {
         let dir = tempfile::tempdir().unwrap();
@@ -1079,6 +1131,7 @@ mod tests {
         assert_ne!(h1, h2);
     }
 
+    #[cfg(feature = "hash-chain")]
     #[test]
     fn reader_chain_hash_matches_writer() {
         let dir = tempfile::tempdir().unwrap();
@@ -1098,6 +1151,7 @@ mod tests {
         assert_eq!(reader.chain_hash().unwrap(), writer_hash);
     }
 
+    #[cfg(feature = "hash-chain")]
     #[test]
     fn checkpoint_auto_emitted_at_interval() {
         let dir = tempfile::tempdir().unwrap();
@@ -1127,6 +1181,7 @@ mod tests {
         assert_eq!(reader.chain_hash().unwrap(), checkpoint_hash);
     }
 
+    #[cfg(feature = "hash-chain")]
     #[test]
     fn multiple_checkpoints_emitted() {
         let dir = tempfile::tempdir().unwrap();
@@ -1156,6 +1211,7 @@ mod tests {
         assert_eq!(reader.chain_hash().unwrap(), writer_hash);
     }
 
+    #[cfg(feature = "hash-chain")]
     #[test]
     fn open_append_with_chain_hash_resumes_chain() {
         let dir = tempfile::tempdir().unwrap();
@@ -1227,6 +1283,7 @@ mod tests {
         assert!(writer.chain_hash().is_none());
     }
 
+    #[cfg(feature = "hash-chain")]
     #[test]
     fn batch_crossing_checkpoint_boundary() {
         let dir = tempfile::tempdir().unwrap();
@@ -1291,7 +1348,7 @@ mod tests {
         let entry_count;
         {
             let mut writer = JournalWriter::create(&primary_path).unwrap();
-            primary_genesis = writer.chain_hash().unwrap();
+            primary_genesis = writer.chain_hash().unwrap_or([0u8; 32]);
 
             // Encode events into batch buffer, then snapshot the bytes.
             for event in &events {
@@ -1308,14 +1365,14 @@ mod tests {
                 JournalWriter::create_continuing(&replica_path, 1, primary_genesis).unwrap();
             // Write the raw bytes captured from the primary.
             replica.write_raw_sync(&raw_bytes, entry_count).unwrap();
-            assert_eq!(replica.next_sequence(), 2 + entry_count);
+            assert_eq!(replica.next_sequence(), FIRST_SEQ + entry_count);
         }
 
         // Read back from the replica journal — should see the same events.
         let mut reader = JournalReader::open(&replica_path).unwrap();
         for (i, expected) in events.iter().enumerate() {
             let entry = reader.next_entry().unwrap().unwrap();
-            assert_eq!(entry.sequence, (i as u64) + 2); // genesis consumed seq 1
+            assert_eq!(entry.sequence, (i as u64) + FIRST_SEQ);
             assert_eq!(&entry.event, expected);
         }
         assert!(reader.next_entry().unwrap().is_none());
@@ -1333,7 +1390,9 @@ mod tests {
         writer.write_raw_sync(&data, 1).unwrap();
 
         assert_eq!(writer.write_pos(), pos_before + data.len() as u64);
-        assert_eq!(writer.next_sequence(), 3); // genesis(1) + genesis_created_next(2) + raw(1)
+        // With hash-chain: genesis(1) + next(2) + raw(1) = 3.
+        // Without: next(1) + raw(1) = 2.
+        assert_eq!(writer.next_sequence(), FIRST_SEQ + 1);
     }
 
     #[test]

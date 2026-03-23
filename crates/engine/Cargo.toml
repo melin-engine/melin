@@ -21,9 +21,16 @@ io-uring = ["dep:io-uring"]
 ## Print per-stage busy/idle utilization on shutdown. Identifies the pipeline
 ## bottleneck: the stage closest to 100% busy is the constraint.
 pipeline-stats = []
+## BLAKE3 tamper-evident hash chain. Hashes every journal entry into a
+## cryptographic chain verified at checkpoints. Catches deliberate tampering
+## (not just corruption — CRC32C handles that). Adds ~15-30ns per event.
+## Disable for maximum throughput when audit tamper-evidence is not required.
+hash-chain = ["dep:blake3"]
+
+default = []
 
 [dependencies]
-blake3 = "1"
+blake3 = { version = "1", optional = true }
 rustc-hash = "2"
 crc32c = "0.6"
 getrandom = "0.3"

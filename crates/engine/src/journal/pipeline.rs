@@ -1256,6 +1256,12 @@ mod tests {
     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
     use std::time::Duration;
 
+    /// First user-event sequence: 2 with hash-chain (genesis takes 1), 1 without.
+    #[cfg(feature = "hash-chain")]
+    const FIRST_SEQ: u64 = 2;
+    #[cfg(not(feature = "hash-chain"))]
+    const FIRST_SEQ: u64 = 1;
+
     fn limit_order(id: u64, account: AccountId, side: Side, price: u64, qty: u64) -> Order {
         Order {
             id: OrderId(id),
@@ -1583,6 +1589,7 @@ mod tests {
             "replication batch should have events"
         );
         assert!(!repl_data.is_empty(), "replication batch should have data");
+        #[cfg(feature = "hash-chain")]
         assert_ne!(
             repl_meta.chain_hash, [0u8; 32],
             "chain hash should be initialized"
@@ -1593,8 +1600,8 @@ mod tests {
         let (consumed, seq, _ts, event) = crate::journal::codec::decode(&repl_data).unwrap();
         assert!(consumed > 0);
         assert_eq!(
-            seq, 2,
-            "replication sequence should match journal (genesis=1, first user=2)"
+            seq, FIRST_SEQ,
+            "replication sequence should match journal first user event"
         );
         assert!(matches!(event, JournalEvent::SubmitOrder { .. }));
 
@@ -1604,11 +1611,15 @@ mod tests {
             use crate::journal::codec::FILE_HEADER_SIZE;
             let file_bytes = std::fs::read(&path).unwrap();
 
-            // Find the end of the genesis entry (first entry after file header).
+            // Find the start of user entries (after file header and genesis if present).
             let mut offset = FILE_HEADER_SIZE;
-            let genesis_len =
-                u16::from_le_bytes([file_bytes[offset + 2], file_bytes[offset + 3]]) as usize;
-            offset += 20 + genesis_len + 4;
+            #[cfg(feature = "hash-chain")]
+            {
+                // Skip past the genesis entry.
+                let genesis_len =
+                    u16::from_le_bytes([file_bytes[offset + 2], file_bytes[offset + 3]]) as usize;
+                offset += 20 + genesis_len + 4;
+            }
 
             // Find end of valid data via reader.
             let mut reader = crate::journal::JournalReader::open(&path).unwrap();

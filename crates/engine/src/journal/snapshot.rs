@@ -1461,6 +1461,7 @@ mod tests {
         ));
     }
 
+    #[cfg(feature = "hash-chain")]
     #[test]
     fn snapshot_chain_hash_round_trip() {
         let dir = tempfile::tempdir().unwrap();
@@ -1475,6 +1476,7 @@ mod tests {
         assert_eq!(loaded_hash, chain_hash);
     }
 
+    #[cfg(feature = "hash-chain")]
     #[test]
     fn snapshot_zero_chain_hash_round_trip() {
         let dir = tempfile::tempdir().unwrap();

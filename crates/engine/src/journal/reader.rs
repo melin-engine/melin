@@ -44,11 +44,13 @@ pub struct JournalReader {
     valid_file_end: u64,
     /// BLAKE3 hash chain verification state. Initialized when a GenesisHash
     /// entry is read, updated on each normal entry, verified at Checkpoints.
-    /// `None` for v5 journals (no hash chain).
+    /// `None` when `hash-chain` feature is disabled or for v5 journals.
+    #[cfg(feature = "hash-chain")]
     hash_chain: Option<ReaderHashChain>,
 }
 
 /// Hash chain state maintained by the reader for verification.
+#[cfg(feature = "hash-chain")]
 struct ReaderHashChain {
     /// Current running hash (recomputed from entry bytes during replay).
     current_hash: [u8; 32],
@@ -73,6 +75,7 @@ impl JournalReader {
             valid: 0,
             last_sequence: None,
             valid_file_end: FILE_HEADER_SIZE as u64,
+            #[cfg(feature = "hash-chain")]
             hash_chain: None,
         })
     }
@@ -159,70 +162,79 @@ impl JournalReader {
             }
         }
 
-        // Raw entry bytes excluding CRC (for hash chain computation).
-        let entry_bytes_end = self.pos + consumed - 4;
-
-        // Handle GenesisHash: (re)initialize the chain.
-        // Always reinitialize — even if the chain was seeded from a snapshot.
-        // The writer computes chain = hash(genesis_entry_bytes), so the reader
-        // must do the same to stay in sync. A pre-existing seed (from snapshot
-        // recovery) is intentionally overwritten; the genesis entry provides
-        // the authoritative chain starting point for this journal.
-        if let JournalEvent::GenesisHash { .. } = &event {
-            let genesis_hash = blake3::hash(&self.buffer[self.pos..entry_bytes_end]);
-            self.hash_chain = Some(ReaderHashChain {
-                current_hash: *genesis_hash.as_bytes(),
-                events_since_checkpoint: 0,
-            });
-            self.last_sequence = Some(sequence);
-            self.pos += consumed;
-            self.valid_file_end += consumed as u64;
-            return self.next_entry();
-        }
-
-        // For Checkpoint entries: verify the recorded hash matches the
-        // current chain state BEFORE hashing the checkpoint itself.
-        if let JournalEvent::Checkpoint {
-            chain_hash,
-            events_since_checkpoint,
-        } = &event
+        // --- BLAKE3 hash chain verification (feature-gated) ---
+        #[cfg(feature = "hash-chain")]
         {
-            if let Some(chain) = &self.hash_chain {
-                if chain.current_hash != *chain_hash {
-                    return Err(JournalError::HashChainMismatch {
-                        sequence,
-                        expected: *chain_hash,
-                        actual: chain.current_hash,
-                    });
-                }
-                if chain.events_since_checkpoint != *events_since_checkpoint {
-                    return Err(JournalError::CorruptEntry {
-                        sequence,
-                        reason: "checkpoint event count mismatch",
-                    });
-                }
+            // Raw entry bytes excluding CRC (for hash chain computation).
+            let entry_bytes_end = self.pos + consumed - 4;
+
+            // Handle GenesisHash: (re)initialize the chain.
+            if let JournalEvent::GenesisHash { .. } = &event {
+                let genesis_hash = blake3::hash(&self.buffer[self.pos..entry_bytes_end]);
+                self.hash_chain = Some(ReaderHashChain {
+                    current_hash: *genesis_hash.as_bytes(),
+                    events_since_checkpoint: 0,
+                });
+                self.last_sequence = Some(sequence);
+                self.pos += consumed;
+                self.valid_file_end += consumed as u64;
+                return self.next_entry();
             }
-            // Now hash the checkpoint entry itself into the chain.
+
+            // Checkpoint: verify hash, then hash the checkpoint itself.
+            if let JournalEvent::Checkpoint {
+                chain_hash,
+                events_since_checkpoint,
+            } = &event
+            {
+                if let Some(chain) = &self.hash_chain {
+                    if chain.current_hash != *chain_hash {
+                        return Err(JournalError::HashChainMismatch {
+                            sequence,
+                            expected: *chain_hash,
+                            actual: chain.current_hash,
+                        });
+                    }
+                    if chain.events_since_checkpoint != *events_since_checkpoint {
+                        return Err(JournalError::CorruptEntry {
+                            sequence,
+                            reason: "checkpoint event count mismatch",
+                        });
+                    }
+                }
+                if let Some(chain) = &mut self.hash_chain {
+                    let mut hasher = blake3::Hasher::new();
+                    hasher.update(&self.buffer[self.pos..entry_bytes_end]);
+                    hasher.update(&chain.current_hash);
+                    chain.current_hash = *hasher.finalize().as_bytes();
+                    chain.events_since_checkpoint = 0;
+                }
+                self.last_sequence = Some(sequence);
+                self.pos += consumed;
+                self.valid_file_end += consumed as u64;
+                return self.next_entry();
+            }
+
+            // Normal event: update hash chain.
             if let Some(chain) = &mut self.hash_chain {
                 let mut hasher = blake3::Hasher::new();
                 hasher.update(&self.buffer[self.pos..entry_bytes_end]);
                 hasher.update(&chain.current_hash);
                 chain.current_hash = *hasher.finalize().as_bytes();
-                chain.events_since_checkpoint = 0;
+                chain.events_since_checkpoint += 1;
             }
+        }
+
+        // Without hash-chain, skip GenesisHash/Checkpoint (no state change).
+        #[cfg(not(feature = "hash-chain"))]
+        if matches!(
+            event,
+            JournalEvent::GenesisHash { .. } | JournalEvent::Checkpoint { .. }
+        ) {
             self.last_sequence = Some(sequence);
             self.pos += consumed;
             self.valid_file_end += consumed as u64;
             return self.next_entry();
-        }
-
-        // Normal event: update hash chain.
-        if let Some(chain) = &mut self.hash_chain {
-            let mut hasher = blake3::Hasher::new();
-            hasher.update(&self.buffer[self.pos..entry_bytes_end]);
-            hasher.update(&chain.current_hash);
-            chain.current_hash = *hasher.finalize().as_bytes();
-            chain.events_since_checkpoint += 1;
         }
 
         self.last_sequence = Some(sequence);
@@ -248,33 +260,45 @@ impl JournalReader {
     }
 
     /// Current BLAKE3 chain hash after all entries read so far.
-    /// Returns `None` for v5 journals (no hash chain).
+    /// Returns `None` when `hash-chain` is disabled, for v5 journals, or
+    /// if no events have been read.
     pub fn chain_hash(&self) -> Option<[u8; 32]> {
-        self.hash_chain.as_ref().map(|c| c.current_hash)
+        #[cfg(feature = "hash-chain")]
+        {
+            self.hash_chain.as_ref().map(|c| c.current_hash)
+        }
+        #[cfg(not(feature = "hash-chain"))]
+        None
     }
 
     /// Events since last checkpoint in the hash chain.
     pub fn events_since_checkpoint(&self) -> u64 {
-        self.hash_chain
-            .as_ref()
-            .map_or(0, |c| c.events_since_checkpoint)
+        #[cfg(feature = "hash-chain")]
+        {
+            self.hash_chain
+                .as_ref()
+                .map_or(0, |c| c.events_since_checkpoint)
+        }
+        #[cfg(not(feature = "hash-chain"))]
+        0
     }
 
     /// Seed the hash chain from a snapshot's chain hash.
-    ///
-    /// For v6 journals this seed is overwritten when the GenesisHash entry is
-    /// read (genesis always reinitializes the chain). The seed is kept for
-    /// forward-compatibility with hypothetical partial journal reads that
-    /// lack a genesis entry.
     pub fn seed_chain_hash(&mut self, chain_hash: [u8; 32], _snap_sequence: u64) {
-        // Zero hash means no chain (v5 snapshot).
-        if chain_hash == [0u8; 32] {
-            return;
+        #[cfg(feature = "hash-chain")]
+        {
+            if chain_hash == [0u8; 32] {
+                return;
+            }
+            self.hash_chain = Some(ReaderHashChain {
+                current_hash: chain_hash,
+                events_since_checkpoint: 0,
+            });
         }
-        self.hash_chain = Some(ReaderHashChain {
-            current_hash: chain_hash,
-            events_since_checkpoint: 0,
-        });
+        #[cfg(not(feature = "hash-chain"))]
+        {
+            let _ = chain_hash;
+        }
     }
 
     /// Compact the buffer by moving unconsumed data to the front, then
@@ -322,6 +346,12 @@ mod tests {
     use super::*;
     use crate::journal::writer::JournalWriter;
     use crate::types::*;
+
+    /// First user-event sequence: 2 with hash-chain (genesis takes 1), 1 without.
+    #[cfg(feature = "hash-chain")]
+    const FIRST_SEQ: u64 = 2;
+    #[cfg(not(feature = "hash-chain"))]
+    const FIRST_SEQ: u64 = 1;
 
     fn nz(v: u64) -> NonZeroU64 {
         NonZeroU64::new(v).unwrap()
@@ -379,14 +409,16 @@ mod tests {
         let mut reader = JournalReader::open(&path).unwrap();
         for (i, expected) in events.iter().enumerate() {
             let entry = reader.next_entry().unwrap().unwrap();
-            // Genesis consumed seq 1, user events start at 2.
-            assert_eq!(entry.sequence, (i as u64) + 2);
+            assert_eq!(entry.sequence, (i as u64) + FIRST_SEQ);
             assert_eq!(&entry.event, expected);
             assert!(entry.timestamp_ns > 0);
         }
         assert!(reader.next_entry().unwrap().is_none());
-        // Hash chain should be active after reading a v6 journal.
+        // Hash chain is active only with the feature.
+        #[cfg(feature = "hash-chain")]
         assert!(reader.chain_hash().is_some());
+        #[cfg(not(feature = "hash-chain"))]
+        assert!(reader.chain_hash().is_none());
     }
 
     #[test]
@@ -399,8 +431,12 @@ mod tests {
         let mut reader = JournalReader::open(&path).unwrap();
         // Genesis entry is transparent — returns None for no user events.
         assert!(reader.next_entry().unwrap().is_none());
-        // valid_file_end includes the genesis entry.
+        // With hash-chain, valid_file_end includes the genesis entry.
+        // Without hash-chain, valid_file_end is at the file header.
+        #[cfg(feature = "hash-chain")]
         assert!(reader.valid_file_end() > FILE_HEADER_SIZE as u64);
+        #[cfg(not(feature = "hash-chain"))]
+        assert_eq!(reader.valid_file_end(), FILE_HEADER_SIZE as u64);
     }
 
     #[test]
@@ -431,10 +467,9 @@ mod tests {
 
         let mut reader = JournalReader::open(&path).unwrap();
         // Should read all but the last (truncated) entry.
-        // Genesis is transparent, so user events start at seq 2.
         for i in 0..events.len() - 1 {
             let entry = reader.next_entry().unwrap().unwrap();
-            assert_eq!(entry.sequence, (i as u64) + 2);
+            assert_eq!(entry.sequence, (i as u64) + FIRST_SEQ);
             assert_eq!(&entry.event, &events[i]);
         }
         // Truncated last entry returns None.
@@ -520,7 +555,7 @@ mod tests {
         let mut reader = JournalReader::open(&path).unwrap();
         for (i, expected) in events.iter().enumerate() {
             let entry = reader.next_entry().unwrap().unwrap();
-            assert_eq!(entry.sequence, (i as u64) + 2); // genesis consumed seq 1
+            assert_eq!(entry.sequence, (i as u64) + FIRST_SEQ);
             assert_eq!(&entry.event, expected);
         }
         assert!(reader.next_entry().unwrap().is_none());
@@ -561,15 +596,15 @@ mod tests {
         };
         writer.append(&extra).unwrap();
 
-        // Re-read everything. Genesis is transparent, user events start at seq 2.
+        // Re-read everything.
         let mut reader = JournalReader::open(&path).unwrap();
         for (i, expected) in events.iter().enumerate() {
             let entry = reader.next_entry().unwrap().unwrap();
-            assert_eq!(entry.sequence, (i as u64) + 2);
+            assert_eq!(entry.sequence, (i as u64) + FIRST_SEQ);
             assert_eq!(&entry.event, expected);
         }
         let entry = reader.next_entry().unwrap().unwrap();
-        assert_eq!(entry.sequence, (events.len() as u64) + 2);
+        assert_eq!(entry.sequence, (events.len() as u64) + FIRST_SEQ);
         assert_eq!(entry.event, extra);
         assert!(reader.next_entry().unwrap().is_none());
     }
@@ -589,14 +624,14 @@ mod tests {
                     amount: (i as u64) * 100,
                 };
                 let seq = writer.append(&event).unwrap();
-                assert_eq!(seq, (i as u64) + 2); // genesis consumed seq 1
+                assert_eq!(seq, (i as u64) + FIRST_SEQ);
             }
         }
 
         let mut reader = JournalReader::open(&path).unwrap();
         for i in 0..n {
             let entry = reader.next_entry().unwrap().unwrap();
-            assert_eq!(entry.sequence, (i as u64) + 2); // genesis consumed seq 1
+            assert_eq!(entry.sequence, (i as u64) + FIRST_SEQ);
             assert_eq!(
                 entry.event,
                 JournalEvent::Deposit {
@@ -609,6 +644,7 @@ mod tests {
         assert!(reader.next_entry().unwrap().is_none());
     }
 
+    #[cfg(feature = "hash-chain")]
     #[test]
     fn corrupted_checkpoint_detected() {
         use crate::journal::writer::CHECKPOINT_INTERVAL;
@@ -681,6 +717,7 @@ mod tests {
         assert!(found_mismatch, "expected HashChainMismatch error");
     }
 
+    #[cfg(feature = "hash-chain")]
     #[test]
     fn v5_journal_has_no_hash_chain() {
         use std::os::unix::fs::FileExt;
@@ -725,6 +762,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "hash-chain")]
     #[test]
     fn checkpoint_event_count_mismatch_detected() {
         use crate::journal::writer::CHECKPOINT_INTERVAL;
@@ -799,6 +837,7 @@ mod tests {
         assert!(found_error, "expected checkpoint event count mismatch");
     }
 
+    #[cfg(feature = "hash-chain")]
     #[test]
     fn tamper_between_checkpoints_detected_at_next_checkpoint() {
         use crate::journal::writer::CHECKPOINT_INTERVAL;
@@ -884,6 +923,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "hash-chain")]
     #[test]
     fn crash_recovery_preserves_chain_continuity() {
         let dir = tempfile::tempdir().unwrap();
