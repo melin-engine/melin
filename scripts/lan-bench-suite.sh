@@ -373,12 +373,6 @@ for f in /proc/irq/*/smp_affinity; do
 done
 echo "    Pinned ${pinned} IRQs to core 0 (${failed} unchanged)"'
 
-    # Reduce bond miimon on replica (server + bench done by lan-bench.sh).
-    ssh $SSH_OPTS "$REPLICA" 'if [ -d /sys/class/net/bond0 ]; then
-        echo 10000 > /sys/class/net/bond0/bonding/miimon 2>/dev/null || true
-        echo "  bond0 miimon → 10000 ms"
-    fi' 2>/dev/null || true
-
     # Clean journals on both primary and replica.
     JOURNAL_PATH="/mnt/journal/bench.journal"
     REPLICA_JOURNAL="/mnt/journal/replica.journal"

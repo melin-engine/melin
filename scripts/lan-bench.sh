@@ -176,28 +176,6 @@ pin_irqs "$BENCH" "bench"
 echo ""
 
 # ---------------------------------------------------------------------------
-# 4b. Reduce bonding driver jitter
-# ---------------------------------------------------------------------------
-# Cherry servers use 802.3ad bonding with miimon=100 (MII link check every
-# 100ms). Each check sends rescheduling IPIs to pipeline cores. The switch
-# doesn't support LACP anyway, so increase the interval to 10s during
-# benchmarks to reduce interrupt noise.
-reduce_bond_miimon() {
-    local host="$1"
-    local label="$2"
-    ssh $SSH_OPTS "$host" 'if [ -d /sys/class/net/bond0 ]; then
-        old=$(cat /sys/class/net/bond0/bonding/miimon 2>/dev/null)
-        echo 10000 > /sys/class/net/bond0/bonding/miimon 2>/dev/null || true
-        echo "  ${0##*/}: bond0 miimon: ${old} → 10000 ms"
-    fi' 2>/dev/null || true
-}
-
-echo "=== Reducing bond miimon interval ==="
-reduce_bond_miimon "$SERVER" "server"
-reduce_bond_miimon "$BENCH" "bench"
-echo ""
-
-# ---------------------------------------------------------------------------
 # 5. Start the engine on the server
 # ---------------------------------------------------------------------------
 echo "=== Starting engine on server ==="
