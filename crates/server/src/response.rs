@@ -286,6 +286,10 @@ pub fn run(
             }
         }
 
+        // One Instant::now() per batch for heartbeat tracking instead of
+        // per response — heartbeat interval is 10s, sub-ms precision is plenty.
+        let batch_now = Instant::now();
+
         for slot in &batch[..count] {
             #[cfg(feature = "latency-trace")]
             spsc_hist.record_ns(trace::trace_elapsed_ns(slot.match_complete_ts, consume_ts));
@@ -332,7 +336,7 @@ pub fn run(
                     continue;
                 }
 
-                state.last_send = Instant::now();
+                state.last_send = batch_now;
                 dirty_connections.insert(slot.connection_id);
 
                 // Record server-side end-to-end: reader recv → response flush.

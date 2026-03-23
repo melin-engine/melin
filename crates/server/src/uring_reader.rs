@@ -322,6 +322,8 @@ fn uring_reader_loop<R: AsRawFd>(
                 .map(|cqe| (cqe.user_data(), cqe.result(), cqe.flags())),
         );
 
+        let batch_now = Instant::now();
+
         for &(token, result, flags) in &cqes {
             // ── ProvideBuffers completion ──
             if token == PROVIDE_BUFS_TOKEN {
@@ -411,7 +413,7 @@ fn uring_reader_loop<R: AsRawFd>(
                 }
 
                 // Any successful recv resets the idle timeout.
-                entry.last_activity = Instant::now();
+                entry.last_activity = batch_now;
 
                 // Copy received data from the shared buffer pool into the
                 // connection's parse buffer.
