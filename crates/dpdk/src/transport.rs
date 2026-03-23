@@ -280,15 +280,33 @@ impl DpdkTransport {
             );
         }
 
-        self.device.poll_rx();
-
-        // Auto-learn MAC→IP from incoming frames and seed smoltcp's neighbor
-        // cache. Workaround for SR-IOV VFs that drop broadcast ARP replies.
+        // Seed neighbor cache from MACs learned in the previous cycle.
+        // Must happen before collect_rx_batch() so that the injected ARP
+        // replies are included in the batch.
         for (mac, ip_bytes) in self.device.take_learned_neighbors() {
             let ip = Ipv4Addr::new(ip_bytes[0], ip_bytes[1], ip_bytes[2], ip_bytes[3]);
             self.seed_neighbor(ip, mac);
         }
 
+        // Batch ingress: poll all ports in one pass and process frames
+        // via poll_ingress_batch(), bypassing the one-at-a-time
+        // Device::receive() trait dispatch.
+        let batch = self.device.collect_rx_batch();
+        if !batch.is_empty() {
+            let slices = batch.as_slices();
+            self.iface.poll_ingress_batch(
+                self.cached_timestamp,
+                &mut self.device,
+                &mut self.sockets,
+                &slices,
+            );
+        }
+        drop(batch);
+
+        // Egress + maintenance. Device::receive() returns None since
+        // collect_rx_batch() drained all rx state — only socket_egress
+        // (dispatch_burst for multi-segment TX) and ARP/timer maintenance
+        // run.
         self.iface
             .poll(self.cached_timestamp, &mut self.device, &mut self.sockets);
         self.check_listener();

@@ -156,6 +156,64 @@ impl DpdkDevice {
         self.mtu = mtu;
     }
 
+    /// Collect all pending frames for batch ingress processing.
+    ///
+    /// Polls all ports via `rx_burst`, performs MAC learning, and drains
+    /// injected frames (ARP replies for neighbor seeding). Returns an
+    /// `RxBatch` that owns the mbufs (freed on drop) and provides frame
+    /// data access.
+    ///
+    /// After this call, `Device::receive()` returns `None` — the batch
+    /// owns all received frames. Call `iface.poll()` after processing
+    /// the batch for egress and maintenance (ingress will be a no-op).
+    pub fn collect_rx_batch(&mut self) -> RxBatch {
+        let mut mbufs = Vec::with_capacity(BURST_SIZE * self.rx_ports.len());
+
+        for port in &mut self.rx_ports {
+            // SAFETY: port is started, rx_buf is correctly sized.
+            let count = unsafe {
+                ffi::dpdk_eth_rx_burst(port.port_id, 0, port.rx_buf.as_mut_ptr(), BURST_SIZE as u16)
+            };
+
+            for i in 0..count as usize {
+                let mbuf = port.rx_buf[i];
+
+                // MAC learning (same as Device::receive path).
+                let (data_ptr, data_len) = unsafe {
+                    let buf_addr = ffi::dpdk_mbuf_buf_addr(mbuf).cast::<u8>();
+                    let data_off = ffi::dpdk_mbuf_data_off(mbuf) as usize;
+                    (
+                        buf_addr.add(data_off),
+                        ffi::dpdk_mbuf_data_len(mbuf) as usize,
+                    )
+                };
+                if data_len >= 34 {
+                    let data = unsafe { std::slice::from_raw_parts(data_ptr, data_len) };
+                    if data[12] == 0x08 && data[13] == 0x00 {
+                        let mut src_mac = [0u8; 6];
+                        src_mac.copy_from_slice(&data[6..12]);
+                        let mut src_ip = [0u8; 4];
+                        src_ip.copy_from_slice(&data[26..30]);
+                        if !self.known_neighbors.contains(&src_ip) {
+                            self.known_neighbors.insert(src_ip);
+                            self.learned_neighbors.push((src_mac, src_ip));
+                        }
+                    }
+                }
+
+                mbufs.push(mbuf);
+            }
+
+            // Reset port rx state so Device::receive() returns None.
+            port.rx_count = 0;
+            port.rx_cursor = 0;
+        }
+
+        let injected = std::mem::take(&mut self.inject_queue);
+
+        RxBatch { mbufs, injected }
+    }
+
     /// Inject a raw Ethernet frame into smoltcp's RX path.
     /// Used to seed the neighbor cache with crafted ARP replies on SR-IOV
     /// VFs that can't receive broadcast ARP.
@@ -445,4 +503,106 @@ fn ipv4_pseudo_header_checksum(frame: &[u8]) -> u16 {
     sum = (sum & 0xFFFF) + (sum >> 16);
 
     sum as u16
+}
+
+/// Batch of received frames from `DpdkDevice::collect_rx_batch()`.
+///
+/// Holds raw mbuf pointers (freed on drop) and injected frames. Frame
+/// data remains valid until the batch is dropped — callers can build
+/// `&[&[u8]]` slices for `Interface::poll_ingress_batch()`.
+pub struct RxBatch {
+    /// NIC mbufs — data lives in hugepage memory until drop frees them.
+    mbufs: Vec<*mut ffi::rte_mbuf>,
+    /// Injected frames (ARP replies for neighbor seeding). Owned buffers.
+    injected: Vec<Vec<u8>>,
+}
+
+// SAFETY: RxBatch is only used from the single DPDK poll thread.
+unsafe impl Send for RxBatch {}
+
+impl RxBatch {
+    /// Total number of frames (NIC + injected).
+    pub fn len(&self) -> usize {
+        self.mbufs.len() + self.injected.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.mbufs.is_empty() && self.injected.is_empty()
+    }
+
+    /// Build a Vec of frame slices for `poll_ingress_batch()`.
+    /// Injected frames first (ARP), then NIC frames.
+    pub fn as_slices(&self) -> Vec<&[u8]> {
+        let mut slices = Vec::with_capacity(self.len());
+        for frame in &self.injected {
+            slices.push(frame.as_slice());
+        }
+        for &mbuf in &self.mbufs {
+            // SAFETY: mbuf data is valid until drop frees it.
+            let data = unsafe {
+                let buf_addr = ffi::dpdk_mbuf_buf_addr(mbuf).cast::<u8>();
+                let data_off = ffi::dpdk_mbuf_data_off(mbuf) as usize;
+                let ptr = buf_addr.add(data_off);
+                let len = ffi::dpdk_mbuf_data_len(mbuf) as usize;
+                std::slice::from_raw_parts(ptr, len)
+            };
+            slices.push(data);
+        }
+        slices
+    }
+}
+
+impl Drop for RxBatch {
+    fn drop(&mut self) {
+        for &mbuf in &self.mbufs {
+            unsafe {
+                ffi::dpdk_pktmbuf_free(mbuf);
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rx_batch_empty() {
+        let batch = RxBatch {
+            mbufs: Vec::new(),
+            injected: Vec::new(),
+        };
+        assert!(batch.is_empty());
+        assert_eq!(batch.len(), 0);
+        assert!(batch.as_slices().is_empty());
+    }
+
+    #[test]
+    fn rx_batch_injected_only() {
+        let arp_frame = vec![0xFFu8; 42];
+        let tcp_frame = vec![0xAAu8; 60];
+        let batch = RxBatch {
+            mbufs: Vec::new(),
+            injected: vec![arp_frame.clone(), tcp_frame.clone()],
+        };
+        assert!(!batch.is_empty());
+        assert_eq!(batch.len(), 2);
+        let slices = batch.as_slices();
+        assert_eq!(slices.len(), 2);
+        assert_eq!(slices[0], &arp_frame[..]);
+        assert_eq!(slices[1], &tcp_frame[..]);
+    }
+
+    #[test]
+    fn rx_batch_injected_ordering() {
+        // Injected frames must come before NIC frames in the slice array
+        // so ARP replies seed the neighbor cache before TCP SYNs.
+        let batch = RxBatch {
+            mbufs: Vec::new(),
+            injected: vec![vec![1, 2, 3], vec![4, 5, 6]],
+        };
+        let slices = batch.as_slices();
+        assert_eq!(slices[0], &[1, 2, 3]);
+        assert_eq!(slices[1], &[4, 5, 6]);
+    }
 }
