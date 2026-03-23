@@ -431,6 +431,7 @@ if [[ "$RUN_REPLICATION" == "1" && -n "$REPLICA_PUB" && -n "$REPLICA_VLAN" ]]; t
             --addr ${SERVER_VLAN}:9876 \
             --key bench.key \
             --json /tmp/bench-results.json \
+            --bench-cores 1 \
             100000000 --clients 16 --window 256"
 
     scp $SSH_OPTS -q "${SSH_USER}@${BENCH_PUB}:/tmp/bench-results.json" "${RESULTS_DIR}/4-replication.json" 2>/dev/null || true

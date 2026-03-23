@@ -193,6 +193,7 @@ ssh $SSH_OPTS "$BENCH" "cd ${REPO_DIR} && source ~/.cargo/env && \
         --addr ${BIND_ADDR} \
         --key bench.key \
         --json /tmp/bench-results.json \
+        --bench-cores 1 \
         ${BENCH_EXTRA_ARGS}"
 
 echo ""

@@ -78,12 +78,6 @@ const DEFAULT_CLIENTS: usize = 16;
 /// = 10 pinned threads total, leaving core 0 for OS/IRQ.
 const DEFAULT_BENCH_THREADS: usize = 4;
 
-/// First CPU core for bench thread pinning. Server uses cores 1-3 (pipeline),
-/// 4-5 (readers), and 6 (repl-sender), so bench threads start at core 7 to
-/// avoid contention for L1/L2 cache and reduce involuntary context switches.
-/// Thread i is pinned to core `BENCH_CORE_START + i`.
-const BENCH_CORE_START: usize = 7;
-
 /// Maximum frame payload size (matches protocol).
 const MAX_FRAME_SIZE: usize = 1024;
 
@@ -244,6 +238,13 @@ struct BenchArgs {
     /// (required for remote mode with --addr, auto-generated for embedded).
     #[arg(long)]
     key: Option<std::path::PathBuf>,
+    /// First CPU core for bench thread pinning. Thread i is pinned to core
+    /// bench_cores + i. When omitted, bench threads are not pinned (OS
+    /// scheduler decides). For local benchmarks use 7 (avoids server cores
+    /// 1-6). For remote benchmarks on a dedicated machine, use 1 with
+    /// isolcpus for tighter measurements.
+    #[arg(long)]
+    bench_cores: Option<usize>,
 }
 
 fn main() {
@@ -291,6 +292,7 @@ fn main() {
                 args.instruments,
                 json_path,
                 args.key.as_deref(),
+                args.bench_cores,
             );
         }
         other => {
@@ -698,6 +700,7 @@ fn run_roundtrip_bench(
     num_instruments: u32,
     json_path: Option<&std::path::Path>,
     key_path: Option<&std::path::Path>,
+    bench_core_start: Option<usize>,
 ) {
     // Remote mode: connect to an external engine, no embedded server.
     if let Some(addr) = remote_addr {
@@ -734,6 +737,7 @@ fn run_roundtrip_bench(
             &key,
             num_accounts,
             num_instruments,
+            bench_core_start,
         );
         return;
     }
@@ -795,6 +799,7 @@ fn run_roundtrip_bench(
             &bench_key,
             num_accounts,
             num_instruments,
+            bench_core_start,
         );
     } else {
         use melin_protocol::tcp::BlockingTcpListener;
@@ -825,6 +830,7 @@ fn run_roundtrip_bench(
             &bench_key,
             num_accounts,
             num_instruments,
+            bench_core_start,
         );
     }
 
@@ -1248,6 +1254,7 @@ fn run_roundtrip_inner<R, W, F>(
     key: &ed25519_dalek::SigningKey,
     num_accounts: u32,
     num_instruments: u32,
+    bench_core_start: Option<usize>,
 ) where
     R: std::io::Read + std::io::Write + AsRawFd + Send + 'static,
     W: Write + AsRawFd + Send + 'static,
@@ -1270,6 +1277,7 @@ fn run_roundtrip_inner<R, W, F>(
             key,
             num_accounts,
             num_instruments,
+            bench_core_start,
         );
     }
 
@@ -1290,6 +1298,7 @@ fn run_roundtrip_inner<R, W, F>(
             warmup,
             json_path,
             key,
+            bench_core_start,
         );
     }
 }
@@ -1311,6 +1320,7 @@ fn run_epoll_roundtrip<R, W, F>(
     warmup: usize,
     json_path: Option<&std::path::Path>,
     key: &ed25519_dalek::SigningKey,
+    bench_core_start: Option<usize>,
 ) where
     R: std::io::Read + std::io::Write + AsRawFd + Send + 'static,
     W: Write + AsRawFd + Send + 'static,
@@ -1418,12 +1428,14 @@ fn run_epoll_roundtrip<R, W, F>(
 
     for (i, conns) in thread_conns.into_iter().enumerate() {
         let barrier = Arc::clone(&barrier);
-        let core_id = BENCH_CORE_START + i;
+        let pin_core = bench_core_start.map(|s| s + i);
         let thread_progress = Arc::clone(&progress);
         let handle = std::thread::Builder::new()
             .name(format!("bench-{i}"))
             .spawn(move || {
-                if let Err(e) = melin_server::affinity::pin_to_core(core_id) {
+                if let Some(core_id) = pin_core
+                    && let Err(e) = melin_server::affinity::pin_to_core(core_id)
+                {
                     eprintln!("warning: bench-{i} could not pin to core {core_id}: {e}");
                 }
                 barrier.wait();
@@ -1557,6 +1569,7 @@ fn run_uring_roundtrip<R, W, F>(
     key: &ed25519_dalek::SigningKey,
     num_accounts: u32,
     num_instruments: u32,
+    bench_core_start: Option<usize>,
 ) where
     R: std::io::Read + std::io::Write + AsRawFd + Send + 'static,
     W: Write + AsRawFd + Send + 'static,
@@ -1671,13 +1684,15 @@ fn run_uring_roundtrip<R, W, F>(
         .into_iter()
         .enumerate()
         .map(|(i, conns)| {
-            let core_id = BENCH_CORE_START + i;
+            let pin_core = bench_core_start.map(|s| s + i);
             let bench_start = start;
             let thread_progress = Arc::clone(&progress);
             std::thread::Builder::new()
                 .name(format!("bench-{i}"))
                 .spawn(move || {
-                    if let Err(e) = melin_server::affinity::pin_to_core(core_id) {
+                    if let Some(core_id) = pin_core
+                        && let Err(e) = melin_server::affinity::pin_to_core(core_id)
+                    {
                         eprintln!("warning: could not pin bench-{i} to core {core_id}: {e}");
                     }
                     run_uring_loop(conns, window, bench_start, warmup, thread_progress)
@@ -1721,10 +1736,14 @@ fn run_uring_roundtrip<R, W, F>(
         extra_lines.push(format!("  Group commit delay: {group_commit_us} µs"));
     }
     extra_lines.push(format!("  Transport: {transport_name}"));
-    extra_lines.push(format!(
-        "  Bench threads: {num_threads} (io_uring, cores {BENCH_CORE_START}-{})",
-        BENCH_CORE_START + num_threads - 1
-    ));
+    extra_lines.push(if let Some(start) = bench_core_start {
+        format!(
+            "  Bench threads: {num_threads} (io_uring, cores {start}-{})",
+            start + num_threads - 1,
+        )
+    } else {
+        format!("  Bench threads: {num_threads} (io_uring, unpinned)")
+    });
     extra_lines.push(format!("  Window: {window}, Clients: {num_clients}"));
 
     // Sort time-series by elapsed time for stable plot output.

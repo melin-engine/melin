@@ -89,7 +89,7 @@ cargo run --release -p melin-bench [-- [OPTIONS] [PAIRS]]
 | `--uds` | false | Use Unix domain sockets instead of TCP (roundtrip mode only, local embedded server). |
 | `--clients` | 16 | Number of concurrent client connections (roundtrip mode). |
 | `--window` | 64 | Pipeline depth: number of requests in flight per client before waiting for a response. |
-| `--bench-threads` | 4 | Number of bench client threads. Each manages a subset of connections via epoll (ignored when compiled with the `io-uring` feature). Pinned to cores starting at core 6. |
+| `--bench-threads` | 4 | Number of bench client threads. Each manages a subset of connections via epoll (ignored when compiled with the `io-uring` feature). |
 | `--group-commit-us` | 0 | Group commit coalescing delay in microseconds. Adds an artificial delay before fsyncing to batch more events per sync. Beneficial for UDS transport; harmful for TCP (see CLAUDE.md dead ends). |
 | `--warmup` | 100,000 | Warmup orders per client (not included in measurements). Primes caches, branch predictors, and allocator state. |
 | `--journal <PATH>` | temp directory | Path for the journal file. Use a dedicated NVMe disk for realistic durability benchmarks. |
@@ -97,6 +97,7 @@ cargo run --release -p melin-bench [-- [OPTIONS] [PAIRS]]
 | `--instruments` | 100 | Number of instruments. |
 | `--json <PATH>` | (none) | Write results to a JSON file for machine-readable post-processing (saturation curve sweeps). |
 | `--key <PATH>` | (none) | Path to a 32-byte raw Ed25519 private key file. Required for remote mode (`--addr`). Auto-generated for embedded mode. |
+| `--bench-cores <N>` | (unpinned) | First CPU core for bench thread pinning. Thread i pins to core N+i. Omit for unpinned (OS scheduler decides). Use 7 for local benchmarks (avoids server cores 1-6). Use 1 for remote benchmarks on a dedicated machine with `isolcpus`. |
 
 ### Feature flags
 
@@ -171,9 +172,9 @@ All threads are pinned to specific CPU cores via `sched_setaffinity`. The layout
 | 1-3 | Pipeline (journal, matching, response) — set by server's `--cores` flag |
 | 4-5 | Reader pool threads |
 | 6 | Replication sender — set by server's `--cores` flag (4th value) |
-| 7+ | Bench client threads (`BENCH_CORE_START = 7`, hardcoded) |
+| 7+ | Bench client threads (when `--bench-cores 7` is passed) |
 
-Bench thread `i` is pinned to core `7 + i`. With 4 bench threads (default), cores 7-10 are used. The server's pipeline cores are configurable via `--cores`; the bench client's core start offset is not.
+Bench thread `i` is pinned to core `N + i` where N is the `--bench-cores` value. Without the flag, threads are unpinned. For local benchmarks, use `--bench-cores 7` to avoid server cores. For remote benchmarks on a dedicated machine, use `--bench-cores 1` with `isolcpus` for tighter measurements.
 
 ### IRQ affinity (`bench-isolate.sh`)
 
