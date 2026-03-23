@@ -27,6 +27,13 @@ const LISTEN_PORT: u16 = 9876;
 /// and the queue exceeds this, the connection is dropped.
 const MAX_TX_QUEUE_SIZE: usize = 64 * 1024;
 
+/// smoltcp TCP socket buffer size per direction (RX and TX).
+/// 64 KiB matches MAX_TX_QUEUE_SIZE and provides enough TCP window
+/// for pipelined trading (256+ in-flight messages at ~100 bytes each).
+/// The previous 1 KiB caused smoltcp to advertise a tiny TCP window,
+/// forcing stop-and-wait at 1 KiB granularity.
+const SOCKET_BUF_SIZE: usize = 64 * 1024;
+
 /// How often to refresh the smoltcp timestamp (in poll iterations).
 /// smoltcp only needs millisecond-precision timestamps for TCP timers
 /// (retransmit, keepalive). Refreshing every 100 iterations at ~1MHz
@@ -187,8 +194,8 @@ impl DpdkTransport {
         let mut sockets = SocketSet::new(Vec::with_capacity(MAX_CONNECTIONS));
 
         let listen_socket = {
-            let rx_buf = tcp::SocketBuffer::new(vec![0u8; 1024]);
-            let tx_buf = tcp::SocketBuffer::new(vec![0u8; 1024]);
+            let rx_buf = tcp::SocketBuffer::new(vec![0u8; SOCKET_BUF_SIZE]);
+            let tx_buf = tcp::SocketBuffer::new(vec![0u8; SOCKET_BUF_SIZE]);
             let mut socket = tcp::Socket::new(rx_buf, tx_buf);
             socket
                 .listen(config.listen_port)
@@ -274,8 +281,8 @@ impl DpdkTransport {
             let accepted_handle = self.listen_handle;
 
             let new_listener = {
-                let rx_buf = tcp::SocketBuffer::new(vec![0u8; 1024]);
-                let tx_buf = tcp::SocketBuffer::new(vec![0u8; 1024]);
+                let rx_buf = tcp::SocketBuffer::new(vec![0u8; SOCKET_BUF_SIZE]);
+                let tx_buf = tcp::SocketBuffer::new(vec![0u8; SOCKET_BUF_SIZE]);
                 let mut socket = tcp::Socket::new(rx_buf, tx_buf);
                 socket
                     .listen(self.listen_port)
