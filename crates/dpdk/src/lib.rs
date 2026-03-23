@@ -44,3 +44,8 @@ pub use eal::{Eal, EalError};
 pub use mempool::{Mempool, MempoolError};
 pub use port::{Port, PortError};
 pub use transport::{AcceptedConnection, DpdkConfig, DpdkTransport};
+
+/// Re-export smoltcp types used by the server's DPDK transport module.
+/// This ensures the server uses the same smoltcp crate instance as melin-dpdk,
+/// avoiding type mismatches when melin-dpdk is excluded from the workspace.
+pub use smoltcp::iface::SocketHandle;

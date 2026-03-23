@@ -12,7 +12,7 @@ no-fsync = ["melin-engine/no-fsync"]
 no-persist = ["melin-engine/no-persist"]
 latency-trace = ["melin-engine/latency-trace", "melin-protocol/latency-trace"]
 io-uring = ["melin-engine/io-uring", "dep:io-uring"]
-dpdk = ["dep:melin-dpdk", "dep:smoltcp"]
+dpdk = ["dep:melin-dpdk"]
 pipeline-stats = ["melin-engine/pipeline-stats"]
 
 [lib]
@@ -38,7 +38,6 @@ tikv-jemallocator = { workspace = true }
 tracing-subscriber = { workspace = true }
 io-uring = { version = "0.7", optional = true }
 melin-dpdk = { path = "../dpdk", optional = true }
-smoltcp = { version = "0.12", default-features = false, features = ["std", "medium-ethernet", "proto-ipv4", "socket-tcp"], optional = true }
 
 [dev-dependencies]
 tempfile = "3"

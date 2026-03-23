@@ -46,7 +46,7 @@ use melin_protocol::message::{ConnectionId, Request, ResponseKind};
 use rand::Rng;
 
 use crate::request as shared_request;
-use smoltcp::iface::SocketHandle;
+use melin_dpdk::SocketHandle;
 use tracing::debug;
 
 use crate::dpdk_response::{ControlEvent, TxFrame};
