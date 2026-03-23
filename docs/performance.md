@@ -84,6 +84,7 @@ The journal stage uses batch `pwritev2` + `RWF_DSYNC` (FUA) with 256 MiB pre-all
 | 3 | **Vectored response writes** | 5-10% throughput | Low | Not started |
 | 4 | **`#[inline(always)]` on hot-path methods** | 2-5% throughput | Trivial | Not started |
 | 5 | **Profile-Guided Optimization (PGO)** | 10-30% overall | Low | Not started |
+| 6 | **BOLT post-link optimization** | 5-15% on top of PGO | Low | Not started |
 
 **1. Embed ReservationSlot in RestingOrder.** Eliminates the global `order_info` FxHashMap. Every cancel/amend currently does 2 lookups + 1 remove on `order_info` (~15-30ns). With the slot stored in the resting order itself, that drops to zero. Needs to thread `ReservationSlot` through the OrderBook API.
 
@@ -94,6 +95,8 @@ The journal stage uses batch `pwritev2` + `RWF_DSYNC` (FUA) with 256 MiB pre-all
 **4. Inline hot-path exchange methods.** `cancel`, `cancel_replace`, `execute` are called millions of times. `#[inline(always)]` lets LLVM optimize across call boundaries.
 
 **5. PGO.** Two-pass build with `rustc -Cprofile-generate` / `-Cprofile-use`. Branch-heavy matching loops benefit most. Ideally profile against real market data, not the synthetic generator.
+
+**6. BOLT post-link optimization.** LLVM's BOLT reorders functions and basic blocks in the final binary based on runtime profiles, improving icache locality and branch prediction. Applied after linking — complementary to PGO. Meta reports 5-15% on top of PGO for large binaries. Requires `perf record -e cycles:u -j any,u` during a representative workload, then `llvm-bolt` to rewrite the binary.
 
 ### Network / transport
 
