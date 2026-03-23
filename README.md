@@ -208,47 +208,8 @@ Also needed: backpressure policy, gateway scalability (epoll/io_uring multiplexi
 - [ ] Real-world data replay (NASDAQ ITCH 5.0, Databento, Lobster — legal review needed)
 
 ### Performance Tuning
-- [x] Release profile: `lto = "fat"`, `codegen-units = 1`, `panic = "abort"`, `target-cpu=native`
-- [x] jemalloc (`tikv-jemallocator`)
-- [x] CPU core pinning for all pipeline, reader, and bench threads
-- [x] IRQ affinity pinning (`bench-isolate.sh`)
-- [x] Kernel boot isolation (`isolcpus`, `nohz_full`, `rcu_nocbs`)
-- [x] Reservation slab — `Vec<Reservation>` + free list replaces `HashMap<(AccountId, OrderId), Reservation>` for O(1) indexed access on every fill/cancel
-- [x] Reusable match price buffer — `match_price_buf` on OrderBook avoids heap allocation per aggressive order
-- [x] Flat Vec instrument dispatch — `Vec<Option<Box<InstrumentState>>>` indexed by `Symbol.0`, zero hashing on the hottest per-operation lookup
-- [x] Flat Vec max_order_id — `Vec<u64>` indexed by `AccountId.0`, eliminates per-submit hash
-- [x] FxHashMap (`rustc-hash`) for order_info, order_index, stop_index — ~4x faster hashing than SipHash for 12-byte composite keys
-- [x] Cache-friendly price levels — sorted `Vec<(Price, VecDeque)>` with binary search replaces `BTreeMap`. 5-20 levels fit in 1-3 L1 cache lines
-- [x] Right-sized HashMap pre-allocation — order_index 4K, order_info 32K (was 1M/2M). Keeps hash tables cache-resident in L2/L3 instead of causing random misses across multi-GB virtual address ranges. ~5% matching utilization reduction.
-- [x] Batched matching stage consumption — `consume_batch(32)` replaces per-event `try_consume()`. Amortizes one atomic Release store over 32 events. Benchmarked sizes 1–256; 32 is the sweet spot (+3% throughput, -50% p99 vs unbatched, no burstiness penalty).
 
-#### Bottleneck stack
-
-```
-Engine only:     TBD       ← Cherry measurement pending
-Pipeline:        TBD       ← Cherry measurement pending
-TCP no-persist:  8.0M/s    ← TCP stack overhead
-TCP + fsync:     4.0M/s    ← journal fsync halves it
-TCP + repl:      2.7M/s    ← replica RTT costs another 32%
-```
-
-#### Leads (estimated impact, not yet implemented)
-
-**Engine/pipeline throughput** (current: 4.0M/s with fsync, 8.0M/s no-persist):
-
-- [ ] **Embed `ReservationSlot` in `RestingOrder`** — eliminates the global `order_info` FxHashMap entirely. Every cancel/amend currently does 2 lookups + 1 remove on `order_info` (~15-30ns wasted). With the slot stored in the resting order itself, that drops to zero. Est. 5-10% throughput. Moderate complexity: needs to thread `ReservationSlot` through the OrderBook API.
-- [x] **Overlapped io_uring journal writes** — double-buffer design hides NVMe FUA latency behind next-batch accumulation. SINGLE_ISSUER, registered fd, busy-poll CQE reap. Active by default when `io-uring` feature is enabled.
-- [ ] **Vectored response writes** — batch multiple responses to the same connection into one `writev` syscall. Est. 5-10% throughput.
-- [ ] **`#[inline(always)]` on hot-path exchange methods** — `cancel`, `cancel_replace`, `execute` are called millions of times through dispatch. Inlining lets LLVM optimize across boundaries. Est. 2-5% throughput. Very low complexity.
-- [ ] **Monotonic sequence ID for order tracking** — assign a global `u32` sequence number at submission. Use it to index `order_info` (Exchange) and `order_index` (OrderBook) as flat `Vec` instead of `FxHashMap<(AccountId, OrderId), ...>`. Eliminates remaining hash lookups per execute/cancel. Requires threading the sequence ID through the wire protocol and orderbook.
-- [ ] **Profile-Guided Optimization (PGO)** — two-pass build with `rustc -Cprofile-generate` / `-Cprofile-use`. Typical gains 10-30% on branch-heavy matching loops. Payload-dependent: profiling against the synthetic generator will optimize for its branch patterns, not necessarily production traffic. Ideally profile against real market data replay (ITCH, Databento) or recorded production journals once available.
-
-**Network kernel bypass** (four mutually exclusive paths, ordered by effort/reward):
-
-- [ ] **io_uring improvements (kernel 6.12+)** — retry `IORING_RECVSEND_FIXED_BUF` for RECV (returned EINVAL on kernel 6.8, should work on 6.10+). Test `IORING_RECVSEND_BUNDLE` for batched recv. Est. 15-25% throughput gain. Low complexity, requires kernel upgrade.
-- [ ] **OpenOnload (Solarflare/AMD Xilinx NICs)** — kernel-bypass TCP via LD_PRELOAD, zero code changes. BSD-licensed. Est. 60-80% latency reduction, 2-4x throughput. Requires Solarflare NIC (~$500-1000). This is what most production exchanges use.
-- [ ] **AF_XDP + smoltcp userspace TCP** — full kernel bypass with Rust-native TCP stack over AF_XDP sockets. DaMoN '25 paper found AF_XDP disappoints vs DPDK for small-message request-response workloads due to remaining kernel overhead. Est. 20-40% latency reduction. Very high complexity (6+ months).
-- [ ] **DPDK + F-Stack (FreeBSD TCP in userspace)** — maximum performance (~40 cycles/msg, 3.5µs RTT). Requires DPDK-supported NIC, F-Stack has GPL concern. Est. 2-3x throughput. Extreme complexity.
+See [docs/performance.md](docs/performance.md) for the full performance profile, improvement roadmap, and completed optimizations.
 
 ## Project Structure
 
