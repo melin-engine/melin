@@ -275,6 +275,9 @@ struct BenchArgs {
     /// MTU for the DPDK interface. Use 9000 for jumbo frames. Must match server.
     #[arg(long, default_value_t = 1500)]
     dpdk_mtu: usize,
+    /// VLAN ID for hardware strip/insert. Required for dedicated NIC mode.
+    #[arg(long)]
+    dpdk_vlan: Option<u16>,
     /// CPU core for the DPDK bench poll thread.
     #[arg(long, default_value_t = 7)]
     dpdk_core: usize,
@@ -339,6 +342,7 @@ fn main() {
                             .map(|s| s.parse().expect("invalid --dpdk-gateway")),
                         server_addr: addr,
                         mtu: args.dpdk_mtu,
+                        vlan_id: args.dpdk_vlan,
                     },
                     args.pairs,
                     args.window,

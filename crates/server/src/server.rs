@@ -177,6 +177,12 @@ pub struct ServerConfig {
     #[arg(long, default_value_t = 1500)]
     pub dpdk_mtu: usize,
 
+    /// VLAN ID for hardware VLAN strip/insert. Required in dedicated NIC
+    /// mode (dpdk-setup-dedicated.sh) where the kernel doesn't handle VLAN
+    /// tags. Not needed for SR-IOV mode (the PF handles VLAN tagging).
+    #[arg(long)]
+    pub dpdk_vlan: Option<u16>,
+
     /// CPU core for the DPDK poll thread. This thread handles all NIC I/O
     /// and smoltcp TCP processing — it should be on an isolated core.
     /// Default: 7 (after the 3 pipeline cores + 2 reader cores).
@@ -220,6 +226,7 @@ impl Default for ServerConfig {
             dpdk_prefix_len: 24,
             dpdk_gateway: None,
             dpdk_mtu: 1500,
+            dpdk_vlan: None,
             dpdk_core: 7,
         }
     }

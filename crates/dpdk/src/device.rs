@@ -53,6 +53,8 @@ pub struct DpdkDevice {
     offloads: ChecksumOffloads,
     /// Cached TX offload flags (computed once at init, reused per packet).
     tx_ol_flags: u64,
+    /// VLAN ID for TX insert offload. 0 = no VLAN tagging.
+    tx_vlan_id: u16,
     /// Injected frames to feed into smoltcp's RX path (e.g., crafted ARP
     /// replies to seed the neighbor cache on SR-IOV VFs that drop broadcast).
     inject_queue: Vec<Vec<u8>>,
@@ -116,6 +118,7 @@ impl DpdkDevice {
             mtu: DEFAULT_MTU,
             offloads,
             tx_ol_flags,
+            tx_vlan_id: 0,
             inject_queue: Vec::new(),
             learned_neighbors: Vec::new(),
             known_neighbors: std::collections::HashSet::new(),
@@ -222,6 +225,16 @@ impl DpdkDevice {
         RxBatch { mbufs, injected }
     }
 
+    /// Set the VLAN ID for TX insert offload. When set, every outgoing
+    /// frame gets a VLAN tag inserted by the NIC. Used in dedicated NIC
+    /// mode where the kernel isn't handling VLAN tags.
+    pub fn set_vlan_id(&mut self, vlan_id: u16) {
+        self.tx_vlan_id = vlan_id;
+        // Add TX_VLAN flag to the pre-computed offload flags.
+        self.tx_ol_flags |= unsafe { ffi::dpdk_tx_vlan_flag() };
+        tracing::info!(vlan_id, "DPDK TX VLAN insert enabled");
+    }
+
     /// Inject a raw Ethernet frame into smoltcp's RX path.
     /// Used to seed the neighbor cache with crafted ARP replies on SR-IOV
     /// VFs that can't receive broadcast ARP.
@@ -278,6 +291,7 @@ impl Device for DpdkDevice {
                 port_id: self.tx_port_id,
                 mempool: self.mempool,
                 tx_ol_flags: self.tx_ol_flags,
+                tx_vlan_id: self.tx_vlan_id,
             };
             return Some((rx_token, tx_token));
         }
@@ -332,6 +346,7 @@ impl Device for DpdkDevice {
             port_id: self.tx_port_id,
             mempool: self.mempool,
             tx_ol_flags: self.tx_ol_flags,
+            tx_vlan_id: self.tx_vlan_id,
         };
 
         Some((rx_token, tx_token))
@@ -342,6 +357,7 @@ impl Device for DpdkDevice {
             port_id: self.tx_port_id,
             mempool: self.mempool,
             tx_ol_flags: self.tx_ol_flags,
+            tx_vlan_id: self.tx_vlan_id,
         })
     }
 
@@ -396,8 +412,10 @@ impl phy::RxToken for DpdkRxToken {
 pub struct DpdkTxToken {
     port_id: u16,
     mempool: *mut ffi::rte_mempool,
-    /// Pre-computed TX offload flags (IPv4 + TCP checksum offload).
+    /// Pre-computed TX offload flags (IPv4 + TCP checksum + VLAN insert).
     tx_ol_flags: u64,
+    /// VLAN ID for TX insert. 0 = no VLAN tagging.
+    tx_vlan_id: u16,
 }
 
 impl phy::TxToken for DpdkTxToken {
@@ -459,6 +477,18 @@ impl phy::TxToken for DpdkTxToken {
 
                 ffi::dpdk_mbuf_set_ol_flags(mbuf, self.tx_ol_flags);
                 ffi::dpdk_mbuf_set_tx_offload(mbuf, 14, 20, 0);
+            }
+
+            // VLAN insert: set TCI on every outgoing frame (not just TCP).
+            // The ol_flags TX_VLAN bit is already in tx_ol_flags if vlan_id != 0.
+            if self.tx_vlan_id != 0 {
+                // Ensure TX_VLAN flag is set even for non-TCP frames (ARP etc.)
+                // that skipped the checksum block above.
+                let current_flags = ffi::dpdk_mbuf_ol_flags(mbuf);
+                if current_flags & ffi::dpdk_tx_vlan_flag() == 0 {
+                    ffi::dpdk_mbuf_set_ol_flags(mbuf, current_flags | ffi::dpdk_tx_vlan_flag());
+                }
+                ffi::dpdk_mbuf_set_vlan_tci(mbuf, self.tx_vlan_id);
             }
         }
 

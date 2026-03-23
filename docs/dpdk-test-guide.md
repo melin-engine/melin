@@ -9,7 +9,7 @@ Two Cherry Servers on the same VLAN. IPs change per rental — check the Cherry 
 Throughout this guide:
 - `SERVER` = server public IP
 - `BENCH` = bench public IP
-- `SERVER_VLAN` = server VLAN IP (from `dpdk-setup.sh` output or `/etc/melin-dpdk.conf`)
+- `SERVER_VLAN` = server VLAN IP (from `dpdk-setup-sriov.sh` output or `/etc/melin-dpdk.conf`)
 
 ## 1. Setup (run once after reboot)
 
@@ -19,14 +19,14 @@ SR-IOV VF creation, driver binding, hugepages, and MTU are all runtime state —
 ```sh
 ssh root@SERVER
 cd ~/workspace/trading
-sudo ./scripts/dpdk-setup.sh          # creates VFs, binds to vfio-pci, sets MTU 9000
+sudo ./scripts/dpdk-setup-sriov.sh          # creates VFs, binds to vfio-pci, sets MTU 9000
 ```
 
 **On the bench machine** (if using DPDK bench client):
 ```sh
 ssh root@BENCH
 cd ~/workspace/trading
-sudo ./scripts/dpdk-setup.sh
+sudo ./scripts/dpdk-setup-sriov.sh
 ```
 
 Verify with:
@@ -52,7 +52,7 @@ git pull
 # Kernel TCP bench (no DPDK needed):
 cargo build --release -p melin-bench
 
-# OR DPDK bench (requires dpdk-setup.sh):
+# OR DPDK bench (requires dpdk-setup-sriov.sh):
 cargo build --release -p melin-bench --features dpdk --no-default-features
 ```
 
@@ -154,7 +154,7 @@ cd ~/workspace/trading
 - Both sides must use the same `--dpdk-mtu`
 - PF MTU must be >= frame MTU: `ip link show` on bond members
 - If switch doesn't support jumbo, use `--dpdk-mtu 1500` and
-  `./scripts/dpdk-setup.sh --mtu 1500`
+  `./scripts/dpdk-setup-sriov.sh --mtu 1500`
 
 ### Server crashes on startup
 - Check IOMMU: `dmesg | grep -i iommu`

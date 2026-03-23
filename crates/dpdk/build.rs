@@ -83,6 +83,10 @@ fn main() {
             uint64_t dpdk_tx_offload_tcp_cksum(void);\n\
             uint64_t dpdk_rx_offload_checksum(void);\n\
             uint64_t dpdk_tx_offload_checksum(void);\n\
+            uint64_t dpdk_rx_offload_vlan_strip(void);\n\
+            uint64_t dpdk_tx_offload_vlan_insert(void);\n\
+            uint64_t dpdk_tx_vlan_flag(void);\n\
+            void dpdk_mbuf_set_vlan_tci(struct rte_mbuf *m, uint16_t vlan_tci);\n\
             ",
         )
         .clang_args(&include_args)
@@ -122,6 +126,10 @@ fn main() {
         .allowlist_function("dpdk_tx_offload_tcp_cksum")
         .allowlist_function("dpdk_rx_offload_checksum")
         .allowlist_function("dpdk_tx_offload_checksum")
+        .allowlist_function("dpdk_rx_offload_vlan_strip")
+        .allowlist_function("dpdk_tx_offload_vlan_insert")
+        .allowlist_function("dpdk_tx_vlan_flag")
+        .allowlist_function("dpdk_mbuf_set_vlan_tci")
         // Types.
         .allowlist_type("rte_mbuf")
         .allowlist_type("rte_mempool")

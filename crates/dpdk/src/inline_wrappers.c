@@ -107,3 +107,22 @@ uint64_t dpdk_tx_offload_checksum(void) {
     return RTE_ETH_TX_OFFLOAD_IPV4_CKSUM |
            RTE_ETH_TX_OFFLOAD_TCP_CKSUM;
 }
+
+/* --- VLAN offload constants --- */
+uint64_t dpdk_rx_offload_vlan_strip(void) {
+    return RTE_ETH_RX_OFFLOAD_VLAN_STRIP;
+}
+
+uint64_t dpdk_tx_offload_vlan_insert(void) {
+    return RTE_ETH_TX_OFFLOAD_VLAN_INSERT;
+}
+
+/* TX VLAN flag for ol_flags — tells the NIC to insert a VLAN tag. */
+uint64_t dpdk_tx_vlan_flag(void) {
+    return RTE_MBUF_F_TX_VLAN;
+}
+
+/* Set the VLAN TCI (Tag Control Information) on an mbuf for TX insert. */
+void dpdk_mbuf_set_vlan_tci(struct rte_mbuf *m, uint16_t vlan_tci) {
+    m->vlan_tci = vlan_tci;
+}

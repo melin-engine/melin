@@ -73,6 +73,8 @@ pub struct DpdkBenchConfig {
     pub server_addr: std::net::SocketAddr,
     /// MTU for the DPDK interface. Must match the server's MTU.
     pub mtu: usize,
+    /// VLAN ID for hardware strip/insert. Required for dedicated NIC mode.
+    pub vlan_id: Option<u16>,
 }
 
 /// Run the DPDK roundtrip benchmark.
@@ -123,7 +125,8 @@ pub fn run_dpdk_roundtrip(
     let mut ports = Vec::with_capacity(config.port_ids.len());
     let mut combined_offloads: Option<melin_dpdk::port::ChecksumOffloads> = None;
     for &pid in &config.port_ids {
-        let mut port = Port::configure(pid, &mempool).expect("port config failed");
+        let mut port =
+            Port::configure_with_vlan(pid, &mempool, config.vlan_id).expect("port config failed");
         port.start().expect("port start failed");
         combined_offloads = Some(match combined_offloads {
             None => port.offloads,
@@ -138,6 +141,9 @@ pub fn run_dpdk_roundtrip(
     if config.mtu != 1500 {
         device.set_mtu(config.mtu);
         eprintln!("  DPDK jumbo frames: MTU {}", config.mtu);
+    }
+    if let Some(vlan_id) = config.vlan_id {
+        device.set_vlan_id(vlan_id);
     }
 
     let hw_addr = HardwareAddress::Ethernet(EthernetAddress(mac));

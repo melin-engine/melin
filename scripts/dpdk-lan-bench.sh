@@ -18,7 +18,7 @@
 # Prerequisites:
 #   - SSH access to both machines (as root)
 #   - Server: DPDK installed (dpdk-devel/libdpdk-dev), hugepages configured,
-#     NIC bound to vfio-pci (run dpdk-setup.sh first for SR-IOV)
+#     NIC bound to vfio-pci (run dpdk-setup-sriov.sh first for SR-IOV)
 #   - A VLAN/private network between the two machines
 #   - The bench machine can reach <server-vlan-ip> over the private network
 #
@@ -70,7 +70,7 @@ JOURNAL_PATH="${JOURNAL_PATH:-/mnt/journal/bench.journal}"
 SNAPSHOT_PATH="${SNAPSHOT_PATH:-/mnt/journal/bench.snapshot}"
 PORT=9876
 
-# Read DPDK config from the server (written by dpdk-setup.sh).
+# Read DPDK config from the server (written by dpdk-setup-sriov.sh).
 # Can be overridden via env vars.
 DPDK_CONF=$(ssh $SSH_OPTS "$SERVER" "cat /etc/melin-dpdk.conf 2>/dev/null" || true)
 if [[ -n "$DPDK_CONF" ]]; then

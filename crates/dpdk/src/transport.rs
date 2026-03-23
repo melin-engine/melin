@@ -73,6 +73,10 @@ pub struct DpdkConfig {
     /// MTU for the DPDK interface. 1500 for standard Ethernet, 9000 for
     /// jumbo frames (6x fewer TCP segments, ~6x less per-segment overhead).
     pub mtu: usize,
+    /// VLAN ID for hardware strip/insert. Used in dedicated NIC mode where
+    /// the kernel isn't handling VLAN tags. None = no VLAN offload (SR-IOV
+    /// mode where the PF handles VLAN tagging).
+    pub vlan_id: Option<u16>,
 }
 
 impl Default for DpdkConfig {
@@ -85,6 +89,7 @@ impl Default for DpdkConfig {
             gateway: None,
             listen_port: LISTEN_PORT,
             mtu: 1500,
+            vlan_id: None,
         }
     }
 }
@@ -192,7 +197,7 @@ impl DpdkTransport {
         let mut ports = Vec::with_capacity(config.port_ids.len());
         let mut combined_offloads: Option<ChecksumOffloads> = None;
         for &pid in &config.port_ids {
-            let mut port = Port::configure(pid, &mempool)?;
+            let mut port = Port::configure_with_vlan(pid, &mempool, config.vlan_id)?;
             port.start()?;
             combined_offloads = Some(match combined_offloads {
                 None => port.offloads,
@@ -207,6 +212,9 @@ impl DpdkTransport {
         if config.mtu != 1500 {
             device.set_mtu(config.mtu);
             tracing::info!(mtu = config.mtu, "DPDK jumbo frames enabled");
+        }
+        if let Some(vlan_id) = config.vlan_id {
+            device.set_vlan_id(vlan_id);
         }
 
         let hw_addr = HardwareAddress::Ethernet(EthernetAddress(mac));

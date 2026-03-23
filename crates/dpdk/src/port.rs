@@ -55,7 +55,18 @@ impl Port {
     ///
     /// `port_id` is the DPDK port index (typically 0 for the first NIC
     /// bound to DPDK). `mempool` provides the mbuf pool for RX DMA.
+    /// `vlan_id` enables hardware VLAN strip (RX) and insert (TX) for
+    /// dedicated NIC mode where the kernel isn't handling VLAN tags.
     pub fn configure(port_id: u16, mempool: &Mempool) -> Result<Self, PortError> {
+        Self::configure_with_vlan(port_id, mempool, None)
+    }
+
+    /// Configure with optional VLAN hardware offload.
+    pub fn configure_with_vlan(
+        port_id: u16,
+        mempool: &Mempool,
+        vlan_id: Option<u16>,
+    ) -> Result<Self, PortError> {
         // Get port info for default RX/TX config.
         let mut dev_info: ffi::rte_eth_dev_info = unsafe { std::mem::zeroed() };
         let ret = unsafe { ffi::rte_eth_dev_info_get(port_id, &mut dev_info) };
@@ -69,8 +80,28 @@ impl Port {
         let rx_cksum_wanted = unsafe { ffi::dpdk_rx_offload_checksum() };
         let tx_cksum_wanted = unsafe { ffi::dpdk_tx_offload_checksum() };
 
-        let rx_offloads = dev_info.rx_offload_capa & rx_cksum_wanted;
-        let tx_offloads = dev_info.tx_offload_capa & tx_cksum_wanted;
+        let mut rx_offloads = dev_info.rx_offload_capa & rx_cksum_wanted;
+        let mut tx_offloads = dev_info.tx_offload_capa & tx_cksum_wanted;
+
+        // Enable VLAN strip/insert if a VLAN ID is specified (dedicated NIC mode).
+        // Strip removes the 4-byte 802.1Q tag on RX so smoltcp sees plain Ethernet.
+        // Insert adds it back on TX so the switch routes to the correct VLAN.
+        let vlan_strip = unsafe { ffi::dpdk_rx_offload_vlan_strip() };
+        let vlan_insert = unsafe { ffi::dpdk_tx_offload_vlan_insert() };
+        if vlan_id.is_some() {
+            if dev_info.rx_offload_capa & vlan_strip != 0 {
+                rx_offloads |= vlan_strip;
+                tracing::info!(port_id, "VLAN strip enabled (RX)");
+            } else {
+                tracing::warn!(port_id, "NIC does not support RX VLAN strip");
+            }
+            if dev_info.tx_offload_capa & vlan_insert != 0 {
+                tx_offloads |= vlan_insert;
+                tracing::info!(port_id, "VLAN insert enabled (TX)");
+            } else {
+                tracing::warn!(port_id, "NIC does not support TX VLAN insert");
+            }
+        }
 
         let mut port_conf: ffi::rte_eth_conf = unsafe { std::mem::zeroed() };
         port_conf.rxmode.offloads = rx_offloads;
