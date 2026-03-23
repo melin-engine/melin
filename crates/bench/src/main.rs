@@ -1320,7 +1320,7 @@ fn run_roundtrip_inner<R, W, F>(
     F: Fn() -> (R, W),
 {
     // io_uring path: single-threaded event loop using io_uring RECV/SEND.
-    #[cfg(feature = "io-uring")]
+    #[cfg(all(feature = "io-uring", not(feature = "dpdk")))]
     {
         run_uring_roundtrip(
             connect,
@@ -1593,7 +1593,7 @@ pub(crate) fn spawn_progress_reporter(
 /// io_uring-based roundtrip benchmark. Uses a single thread with io_uring
 /// RECV for reads and io_uring SEND for writes, replacing the multi-threaded
 /// epoll + blocking-write approach.
-#[cfg(feature = "io-uring")]
+#[cfg(all(feature = "io-uring", not(feature = "dpdk")))]
 #[allow(clippy::too_many_arguments)]
 fn run_uring_roundtrip<R, W, F>(
     connect: F,
@@ -1792,16 +1792,16 @@ fn run_uring_roundtrip<R, W, F>(
 }
 
 /// Size of per-connection recv buffer for io_uring RECV.
-#[cfg(feature = "io-uring")]
+#[cfg(all(feature = "io-uring", not(feature = "dpdk")))]
 const URING_RECV_BUF_SIZE: usize = 4096;
 
 /// Flag bit in io_uring user_data to distinguish SEND from RECV CQEs.
 /// Bit 63 set = SEND completion, clear = RECV completion.
-#[cfg(feature = "io-uring")]
+#[cfg(all(feature = "io-uring", not(feature = "dpdk")))]
 const SEND_FLAG: u64 = 1 << 63;
 
 /// Per-connection state for the io_uring benchmark event loop.
-#[cfg(feature = "io-uring")]
+#[cfg(all(feature = "io-uring", not(feature = "dpdk")))]
 struct UringBenchConn {
     read_fd: RawFd,
     write_fd: RawFd,
@@ -1832,7 +1832,7 @@ struct UringBenchConn {
 /// uses RECV for reads and SEND for writes through one io_uring ring.
 /// Returns the cumulative histogram and (when `chart` feature is enabled)
 /// a time-series of interval latency percentiles for visualization.
-#[cfg(feature = "io-uring")]
+#[cfg(all(feature = "io-uring", not(feature = "dpdk")))]
 fn run_uring_loop(
     mut connections: Vec<UringBenchConn>,
     window: usize,
@@ -2002,7 +2002,7 @@ fn run_uring_loop(
 
 /// Fill send windows for all connections that have capacity and no pending send.
 /// Builds a length-prefixed send buffer and submits SEND SQEs.
-#[cfg(feature = "io-uring")]
+#[cfg(all(feature = "io-uring", not(feature = "dpdk")))]
 fn uring_fill_windows(
     ring: &mut io_uring::IoUring,
     connections: &mut [UringBenchConn],
