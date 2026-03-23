@@ -83,7 +83,7 @@ pub struct ServerConfig {
     pub max_connections: u64,
     /// Number of accounts to seed on first startup. Uses the
     /// ProvisionAccount event for O(accounts) seeding (~0.5s for 1M).
-    #[arg(long, default_value_t = 1_000_000)]
+    #[arg(long, default_value_t = 100_000)]
     pub accounts: u32,
     /// Number of instruments to seed on first startup.
     #[arg(long, default_value_t = 100)]
@@ -512,6 +512,8 @@ pub fn run_with_shutdown<L: BlockingTransportListener>(
         use melin_engine::journal::trace::trace_ts;
         use melin_engine::types::{AccountId, CurrencyId, InstrumentSpec, Symbol};
 
+        let seed_start = std::time::Instant::now();
+
         for i in 1..=config.instruments {
             producer.publish(InputSlot {
                 connection_id: 0,
@@ -527,6 +529,9 @@ pub fn run_with_shutdown<L: BlockingTransportListener>(
             });
         }
 
+        let instrument_elapsed = seed_start.elapsed();
+
+        let account_start = std::time::Instant::now();
         let mut last_published_seq = 0u64;
         for acct in 1..=config.accounts {
             last_published_seq = producer.publish(InputSlot {
@@ -539,6 +544,7 @@ pub fn run_with_shutdown<L: BlockingTransportListener>(
                 recv_ts: trace_ts(),
             });
         }
+        let publish_elapsed = account_start.elapsed();
 
         // Wait for all seed events to be fully processed by the entire
         // pipeline before accepting clients. Without this, early client
@@ -550,7 +556,9 @@ pub fn run_with_shutdown<L: BlockingTransportListener>(
         // - matching_cursor: matching stage has processed all seeds
         // - replication_cursor: replica has acked all seeds (u64::MAX if
         //   no replica is connected, so the check passes instantly)
+        let drain_start = std::time::Instant::now();
         let last_seed_seq = last_published_seq + 1; // cursor = next-to-consume
+
         while journal_cursor
             .get()
             .load(std::sync::atomic::Ordering::Acquire)
@@ -563,10 +571,15 @@ pub fn run_with_shutdown<L: BlockingTransportListener>(
         {
             std::hint::spin_loop();
         }
+        let drain_elapsed = drain_start.elapsed();
 
         info!(
             accounts = config.accounts,
             instruments = config.instruments,
+            instrument_ms = instrument_elapsed.as_millis(),
+            publish_ms = publish_elapsed.as_millis(),
+            drain_ms = drain_elapsed.as_millis(),
+            total_ms = seed_start.elapsed().as_millis(),
             "seeded test data through pipeline"
         );
     }
