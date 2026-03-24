@@ -5597,4 +5597,159 @@ mod tests {
 
         assert!(!exchange.accounts().has_balances(ACCT_A));
     }
+
+    #[test]
+    fn order_counts_zero_after_fok_no_fill() {
+        let mut exchange = Exchange::new();
+        exchange.add_instrument(btc_usd_spec());
+        exchange.deposit(ACCT_A, USD, 100_000);
+
+        let mut reports = Vec::new();
+        // FOK buy on empty book — rejected, no fill.
+        exchange.execute(
+            Symbol(1),
+            limit_order(1, ACCT_A, Side::Buy, 100, 10, TimeInForce::FOK),
+            &mut reports,
+        );
+        assert!(matches!(
+            reports[0],
+            ExecutionReport::Rejected {
+                reason: RejectReason::FOKCannotFill,
+                ..
+            }
+        ));
+
+        // No resting orders — withdraw should succeed.
+        assert!(exchange.withdraw(ACCT_A, USD, 1).is_ok());
+    }
+
+    #[test]
+    fn order_counts_zero_after_fok_full_fill() {
+        let mut exchange = Exchange::new();
+        exchange.add_instrument(btc_usd_spec());
+        exchange.deposit(ACCT_A, USD, 100_000);
+        exchange.deposit(ACCT_B, BTC, 100);
+
+        let mut reports = Vec::new();
+        // Seller rests.
+        exchange.execute(
+            Symbol(1),
+            limit_order(1, ACCT_B, Side::Sell, 100, 10, TimeInForce::GTC),
+            &mut reports,
+        );
+
+        // FOK buy fills entirely.
+        reports.clear();
+        exchange.execute(
+            Symbol(1),
+            limit_order(1, ACCT_A, Side::Buy, 100, 10, TimeInForce::FOK),
+            &mut reports,
+        );
+
+        // ACCT_A has no resting orders.
+        assert!(exchange.withdraw(ACCT_A, USD, 1).is_ok());
+    }
+
+    #[test]
+    fn order_counts_after_stp_cancel_newest() {
+        let mut exchange = Exchange::new();
+        exchange.add_instrument(btc_usd_spec());
+        exchange.deposit(ACCT_A, USD, 100_000);
+        exchange.deposit(ACCT_A, BTC, 100);
+
+        let mut reports = Vec::new();
+        // Place a resting sell.
+        exchange.execute(
+            Symbol(1),
+            Order {
+                id: OrderId(1),
+                account: ACCT_A,
+                side: Side::Sell,
+                order_type: OrderType::Limit {
+                    price: Price(NonZeroU64::new(100).unwrap()),
+                    post_only: false,
+                },
+                time_in_force: TimeInForce::GTC,
+                quantity: Quantity(NonZeroU64::new(10).unwrap()),
+                stp: SelfTradeProtection::CancelNewest,
+            },
+            &mut reports,
+        );
+
+        // Self-trade: buy crosses the sell. CancelNewest rejects the taker (buy).
+        reports.clear();
+        exchange.execute(
+            Symbol(1),
+            Order {
+                id: OrderId(2),
+                account: ACCT_A,
+                side: Side::Buy,
+                order_type: OrderType::Limit {
+                    price: Price(NonZeroU64::new(100).unwrap()),
+                    post_only: false,
+                },
+                time_in_force: TimeInForce::GTC,
+                quantity: Quantity(NonZeroU64::new(10).unwrap()),
+                stp: SelfTradeProtection::CancelNewest,
+            },
+            &mut reports,
+        );
+
+        // The maker (sell) still rests. Cancel it, then withdraw should succeed.
+        reports.clear();
+        exchange.cancel_all(ACCT_A, &mut reports);
+        assert!(exchange.withdraw(ACCT_A, USD, 1).is_ok());
+    }
+
+    #[test]
+    fn order_counts_after_stp_cancel_oldest() {
+        let mut exchange = Exchange::new();
+        exchange.add_instrument(btc_usd_spec());
+        exchange.deposit(ACCT_A, USD, 100_000);
+        exchange.deposit(ACCT_A, BTC, 100);
+
+        let mut reports = Vec::new();
+        // Place a resting sell.
+        exchange.execute(
+            Symbol(1),
+            Order {
+                id: OrderId(1),
+                account: ACCT_A,
+                side: Side::Sell,
+                order_type: OrderType::Limit {
+                    price: Price(NonZeroU64::new(100).unwrap()),
+                    post_only: false,
+                },
+                time_in_force: TimeInForce::GTC,
+                quantity: Quantity(NonZeroU64::new(10).unwrap()),
+                stp: SelfTradeProtection::CancelOldest,
+            },
+            &mut reports,
+        );
+
+        // Self-trade: buy crosses. CancelOldest cancels the maker (sell).
+        // The taker buy may rest if GTC.
+        reports.clear();
+        exchange.execute(
+            Symbol(1),
+            Order {
+                id: OrderId(2),
+                account: ACCT_A,
+                side: Side::Buy,
+                order_type: OrderType::Limit {
+                    price: Price(NonZeroU64::new(100).unwrap()),
+                    post_only: false,
+                },
+                time_in_force: TimeInForce::GTC,
+                quantity: Quantity(NonZeroU64::new(10).unwrap()),
+                stp: SelfTradeProtection::CancelOldest,
+            },
+            &mut reports,
+        );
+
+        // Cancel remaining, then withdraw.
+        reports.clear();
+        exchange.cancel_all(ACCT_A, &mut reports);
+        assert!(exchange.withdraw(ACCT_A, USD, 1).is_ok());
+    }
 }

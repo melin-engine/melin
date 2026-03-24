@@ -1173,4 +1173,60 @@ mod tests {
             1_000
         );
     }
+
+    #[test]
+    fn snapshot_round_trip_with_withdrawals() {
+        let dir = tempfile::tempdir().unwrap();
+        let journal_path = dir.path().join("snap_withdraw.journal");
+        let snap_path = dir.path().join("snap_withdraw.snapshot");
+
+        {
+            let mut je = JournaledExchange::create(&journal_path).unwrap();
+            je.add_instrument(btc_usd_spec()).unwrap();
+            je.deposit(ACCT_A, USD, 100_000).unwrap();
+            je.deposit(ACCT_A, BTC, 500).unwrap();
+            je.deposit(ACCT_B, USD, 50_000).unwrap();
+            je.deposit(ACCT_B, BTC, 200).unwrap();
+
+            // Trade: B sells 10 BTC to A at 100.
+            let mut reports = Vec::new();
+            je.execute(
+                Symbol(1),
+                limit_order(1, ACCT_B, Side::Sell, 100, 10),
+                &mut reports,
+            )
+            .unwrap();
+            reports.clear();
+            je.execute(
+                Symbol(1),
+                limit_order(1, ACCT_A, Side::Buy, 100, 10),
+                &mut reports,
+            )
+            .unwrap();
+
+            // Withdraw all of ACCT_B's USD (50_000 original + 1_000 from sale).
+            let b_usd = je.exchange().accounts().balance(ACCT_B, USD).available;
+            je.withdraw(ACCT_B, USD, b_usd).unwrap();
+
+            // Snapshot + rotate.
+            je.rotate(&snap_path).unwrap();
+
+            // One more deposit after rotation.
+            je.deposit(ACCT_A, USD, 999).unwrap();
+        }
+
+        // Recovery from snapshot + journal.
+        let je = JournaledExchange::recover_from_snapshot(&snap_path, &journal_path).unwrap();
+
+        // ACCT_A: 100K - 1000 (bought 10 @ 100) + 999 = 99_999 USD, 500 + 10 = 510 BTC
+        assert_eq!(
+            je.exchange().accounts().balance(ACCT_A, USD).available,
+            99_999
+        );
+        assert_eq!(je.exchange().accounts().balance(ACCT_A, BTC).available, 510);
+
+        // ACCT_B: 0 USD (withdrawn), 200 - 10 = 190 BTC
+        assert_eq!(je.exchange().accounts().balance(ACCT_B, USD).available, 0);
+        assert_eq!(je.exchange().accounts().balance(ACCT_B, BTC).available, 190);
+    }
 }
