@@ -316,7 +316,7 @@ LAN round-trip benchmarks at [`ed9241d`](../../commit/ed9241d). Two or three Che
 
 ![Saturation — clients](docs/plots/saturation-clients.svg)
 
-**Latency stability over time** (p99.9):
+**Latency stability over time** (p99.99):
 
 ![Latency stability — fsync](docs/plots/latency-stability-fsync.svg)
 

@@ -816,7 +816,7 @@ fn plot_stability(results: &[(TimeSeriesResult, String)], output: &PathBuf) {
 
     let max_lat = results
         .iter()
-        .flat_map(|(r, _)| r.time_series.iter().map(|p| p.p999_us))
+        .flat_map(|(r, _)| r.time_series.iter().map(|p| p.p9999_us))
         .fold(0.0f64, f64::max)
         * 1.2;
 
@@ -851,17 +851,16 @@ fn plot_stability(results: &[(TimeSeriesResult, String)], output: &PathBuf) {
         let mode = mode_from_filename(filename);
         let tp = format_throughput(result.throughput_ops);
 
-        // p99.9 line — one line per mode keeps the chart readable
-        // with 3+ runs (fsync, no-persist, replication).
-        let p999_points: Vec<(f64, f64)> = result
+        // p99.99 line — fewer points than p99.9, easier to read.
+        let p9999_points: Vec<(f64, f64)> = result
             .time_series
             .iter()
-            .map(|p| (p.elapsed_secs, p.p999_us))
+            .map(|p| (p.elapsed_secs, p.p9999_us))
             .collect();
         chart
-            .draw_series(LineSeries::new(p999_points, color.stroke_width(2)))
+            .draw_series(LineSeries::new(p9999_points, color.stroke_width(2)))
             .unwrap()
-            .label(format!("{mode} p99.9 ({tp})"))
+            .label(format!("{mode} p99.99 ({tp})"))
             .legend(move |(x, y)| {
                 PathElement::new(vec![(x, y), (x + 20, y)], color.stroke_width(2))
             });
