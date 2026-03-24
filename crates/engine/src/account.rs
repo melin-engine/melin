@@ -623,8 +623,9 @@ impl AccountManager {
 
     /// Check if an account has any non-zero balances.
     ///
-    /// O(n) scan of all entries — not for the hot path. Use for admin
-    /// operations, tests, and diagnostics only.
+    /// O(n) scan of all entries — test-only. If needed in production,
+    /// replace with a per-account non-zero currency counter.
+    #[cfg(test)]
     pub fn has_balances(&self, account: AccountId) -> bool {
         self.balances
             .iter()
