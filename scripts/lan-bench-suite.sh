@@ -26,9 +26,12 @@
 #   RUN_FSYNC=0|1        Peak throughput with full durability
 #   RUN_NOPERSIST=0|1    Peak throughput without persistence
 #   RUN_SINGLE=0|1       Single-order latency
-#   RUN_SWEEPS=0|1       Parameter sweeps (window, instruments)
+#   RUN_SWEEPS=0|1       Parameter sweeps (window, clients)
+#   RUN_SWEEP_INSTRUMENTS=0|1  Instrument count sweep (default: off)
+#   RUN_SWEEP_ACCOUNTS=0|1    Account count sweep (default: off)
 #   RUN_REPLICATION=0|1  Synchronous replication benchmark
 #   RUN_PLOTS=0|1        Generate plots from results
+#   RESULTS_DIR=<path>   Reuse existing results directory (e.g. for re-plotting)
 #   BENCH_BRANCH=<ref>   Checkout a specific branch on all machines
 #
 # Prerequisites:
@@ -56,19 +59,21 @@ RUN_FSYNC="${RUN_FSYNC:-1}"
 RUN_NOPERSIST="${RUN_NOPERSIST:-1}"
 RUN_SINGLE="${RUN_SINGLE:-1}"
 RUN_PIPELINE="${RUN_PIPELINE:-0}"
-RUN_SWEEPS="${RUN_SWEEPS:-1}"
+RUN_SWEEPS="${RUN_SWEEPS:-0}"
+RUN_SWEEP_INSTRUMENTS="${RUN_SWEEP_INSTRUMENTS:-0}"
+RUN_SWEEP_ACCOUNTS="${RUN_SWEEP_ACCOUNTS:-0}"
 RUN_REPLICATION="${RUN_REPLICATION:-1}"
 RUN_PLOTS="${RUN_PLOTS:-1}"
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 LAN_BENCH="${SCRIPT_DIR}/lan-bench.sh"
 
-SSH_OPTS="-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR"
+SSH_OPTS="-A -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR"
 SERVER="${SSH_USER}@${SERVER_PUB}"
 BENCH="${SSH_USER}@${BENCH_PUB}"
 REPO_DIR="~/workspace/trading"
 
-RESULTS_DIR="/tmp/lan-bench-suite-$(date +%Y%m%d-%H%M%S)"
+RESULTS_DIR="${RESULTS_DIR:-/tmp/lan-bench-suite-$(date +%Y%m%d-%H%M%S)}"
 mkdir -p "${RESULTS_DIR}"
 
 echo "============================================================"
@@ -155,7 +160,7 @@ if [[ "$RUN_NOPERSIST" == "1" ]]; then
 echo ""
 echo "============================================================"
 echo "  [2/3] Peak throughput — no persistence"
-echo "  250M pairs, 16 clients, window 512"
+echo "  250M pairs, 16 clients, window 256"
 echo "============================================================"
 echo ""
 
@@ -175,7 +180,7 @@ ssh $SSH_OPTS "$SERVER" "cd ${REPO_DIR} && source ~/.cargo/env && \
     cp target/release/melin-server.nopersist target/release/melin-server"
 
 "${LAN_BENCH}" "$SERVER_PUB" "$BENCH_PUB" "$SERVER_VLAN" "$SSH_USER" \
-    -- -- 250000000 --clients 16 --window 512
+    -- -- 100000000 --clients 16 --window 256
 
 cp /tmp/lan-bench-results.json "${RESULTS_DIR}/2-no-persist.json" 2>/dev/null || true
 
@@ -309,6 +314,7 @@ run_sweep "clients" \
     "c1024:--clients 1024 --window 4"
 
 # 4c. Instruments sweep (fixed clients=16, window=128)
+if [[ "$RUN_SWEEP_INSTRUMENTS" == "1" ]]; then
 INST_SWEEP_DIR="${RESULTS_DIR}/sweep-instruments"
 mkdir -p "${INST_SWEEP_DIR}"
 echo ""
@@ -326,10 +332,12 @@ for inst in 10 100 1000; do
     cp /tmp/lan-bench-results.json "${INST_SWEEP_DIR}/${label}.json" 2>/dev/null || true
     echo ""
 done
+fi
 
 # 4d. Account sweep (fixed clients=16, window=128)
 # Tests whether account count affects hot-path latency via cache pressure
-# on the flat balance array (account_id × stride × 16 bytes).
+# on the balance HashMap.
+if [[ "$RUN_SWEEP_ACCOUNTS" == "1" ]]; then
 ACCT_SWEEP_DIR="${RESULTS_DIR}/sweep-accounts"
 mkdir -p "${ACCT_SWEEP_DIR}"
 echo ""
@@ -347,6 +355,7 @@ for accts in 100000 1000000 10000000; do
     cp /tmp/lan-bench-results.json "${ACCT_SWEEP_DIR}/${label}.json" 2>/dev/null || true
     echo ""
 done
+fi
 
 fi
 
@@ -504,16 +513,16 @@ if command -v cargo &>/dev/null && [[ -f "$(dirname "$0")/../crates/bench/src/pl
         fi
     done
 
-    # Latency stability over time (from time-series data in JSON).
-    STABILITY_FILES=()
-    for f in "${RESULTS_DIR}/1-fsync.json" "${RESULTS_DIR}/4-replication.json"; do
-        [[ -f "$f" ]] && STABILITY_FILES+=("$f")
+    # Latency stability over time — one plot per mode.
+    for f_label in "1-fsync:fsync" "2-no-persist:no-persist" "4-replication:replication"; do
+        f="${f_label%%:*}"
+        label="${f_label##*:}"
+        if [[ -f "${RESULTS_DIR}/${f}.json" ]]; then
+            echo "  Generating latency stability: ${label}..."
+            "${PLOT_TOOL}" stability -o "${PLOT_DIR}/latency-stability-${label}.svg" \
+                "${RESULTS_DIR}/${f}.json" 2>&1
+        fi
     done
-    if [[ ${#STABILITY_FILES[@]} -gt 0 ]]; then
-        echo "  Generating latency stability..."
-        "${PLOT_TOOL}" stability -o "${PLOT_DIR}/latency-stability.svg" \
-            "${STABILITY_FILES[@]}" 2>&1
-    fi
 
     echo ""
     echo "  Plots written to docs/plots/"

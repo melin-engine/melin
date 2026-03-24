@@ -1,8 +1,26 @@
 # Melin
 
-Melin is a high-performance exchange matching engine written in Rust on the [LMAX disruptor architecture](https://martinfowler.com/articles/lmax.html), built for venues that cannot compromise on correctness, durability, or latency. It delivers 6.7M orders/sec with synchronous replication and full fsync durability, maintaining sub-millisecond p99.9 latency by pipelining persistence with execution without cutting corners. Its single-threaded core ensures deterministic behavior, with lock-free I/O and event sourcing providing replayability and optional BLAKE3 hash chains providing tamper-evident audit trails. Core exchange features such as risk controls, circuit breakers, fee models, and replication, are already implemented, with the system progressing toward full production readiness.
+Melin is a high-performance exchange matching engine written in Rust on the [LMAX disruptor architecture](https://martinfowler.com/articles/lmax.html), built for venues that cannot compromise on correctness, durability, or latency. It delivers 5M orders/sec with synchronous replication and full fsync durability, maintaining sub-millisecond p99.9 latency by pipelining persistence with execution without cutting corners. Its single-threaded core ensures deterministic behavior, with lock-free I/O and event sourcing providing replayability and optional BLAKE3 hash chains providing tamper-evident audit trails. Core exchange features such as risk controls, circuit breakers, fee models, and replication, are already implemented, with the system progressing toward full production readiness.
 
-## Architecture
+## Correct
+
+- **Strict price-time priority** — no order may jump the queue; matching correctness is verified by property-based tests across thousands of random order sequences
+- **Deterministic replay** — given the same journal, replay produces identical state bit-for-bit; the foundation of crash recovery, replication, and auditability
+- **Balance conservation** — funds are never created or destroyed; every reserve, fill, release, and withdrawal is tracked and verified by proptest invariants
+- **Client deduplication** — per-account order ID high-water mark prevents double execution on crash-recovery retry
+- **Extensive testing** — 344 tests including property-based (proptest), fuzz (bolero), snapshot round-trip, journal replay, and crash recovery scenarios
+
+## Durable
+
+- **Persist-before-ack** — pipelined journal I/O with full durability guarantee; matching latency overlapped against journal writes, acknowledgement gated on confirmed durability, not optimistically sent
+- **Synchronous replication** — journal batches streamed to a replica via a lock-free ring buffer; replica fsyncs and acks before the primary sends responses to clients (zero data loss)
+- **Event sourcing** — deterministic replay for crash recovery and audit; snapshots for fast restart; BLAKE3 hash chain for tamper evidence
+- **Journal rotation** — automatic snapshot and archive when journal size exceeds threshold; recovery from latest snapshot plus incremental journal
+- **Crash safety** — truncated writes detected via CRC32C checksums; partial entries discarded on recovery; tested with crash injection at every pipeline stage
+
+## Efficient
+
+### Architecture
 
 ```
                            ┌────────────────────────────────────────────────────────────┐
@@ -45,11 +63,36 @@ Melin is a high-performance exchange matching engine written in Rust on the [LMA
 
 - **Single-threaded matching engine** — no locks on the hot path; one thread executes all matching logic
 - **LMAX-style disruptor pipeline** ([docs/pipeline-architecture.md](docs/pipeline-architecture.md)) — 3 OS threads (journal, matching, response) on lock-free ring buffers; lock-free CAS-based multi-producer from reader pool; journal and matching run in parallel on the same events
-- **Persist-before-ack** — pipelined journal I/O with full durability guarantee; matching latency overlapped against journal writes, acknowledgement gated on confirmed durability, not optimistically sent
-- **Synchronous replication** — journal batches streamed to a replica via a lock-free ring buffer; replica fsyncs and acks before the primary sends responses to clients (zero data loss)
 - **Batch sync amortization** — under load, one sync covers many events; `pwritev2` with `RWF_DSYNC` (Force Unit Access) combines write + durability in a single syscall; `posix_fallocate` pre-allocates 64 MiB chunks so sync only flushes data pages, not extent metadata
-- **Event sourcing** — deterministic replay for crash recovery and audit; snapshots for fast restart; BLAKE3 hash chain for tamper evidence
 - **Mechanical sympathy** — cache-line-padded sequences, fixed-point pricing (no floats), pre-allocated buffers with no per-order allocations on the hot path
+
+- **Dedicated I/O threads** — epoll/io_uring reader pool with edge-triggered non-blocking I/O; response stage writes directly to sockets; zero async runtime (no tokio)
+- **io_uring transport** — multishot RECV with provided buffer groups eliminates SQE resubmission; separate read/write rings
+- **Pre-allocated everything** — reservation slab (2M slots), order book indices, and balance maps are pre-sized and page-faulted at startup; no allocations on the hot path
+- **jemalloc** — avoids glibc malloc fragmentation and lock contention under sustained load
+
+### Benchmarks
+
+LAN round-trip benchmarks at [`ed9241d`](../../commit/ed9241d). Two or three Cherry AMD Ryzen 9 9950X servers (16C @ 4.3 GHz, SMT disabled, 96 GB 5600 MHz RAM, 2x 1TB NVMe, 10 Gbps). Engine on one server with journal on a dedicated NVMe disk, benchmark client on the second, replica on the third (replication only). TCP over private VLAN, IRQs pinned to core 0. [Realistic order flow](crates/bench/). Reproducible via `scripts/lan-bench-suite.sh`.
+
+| Mode | Throughput | p50 | p99 | p99.9 | max | Parameters |
+|------|-----------|-----|-----|-------|-----|------------|
+| **Full durability** (fsync) | **8.1M/s** | 439 µs | 569 µs | 636 µs | 1,017 µs | 100M pairs, 16 clients, window 256 |
+| **Synchronous replication** | **5.8M/s** | 633 µs | 841 µs | 933 µs | 1,123 µs | 100M pairs, 16 clients, window 256, primary+replica |
+| **Single-order latency** | 13.7K/s | **72 µs** | 87 µs | 90 µs | 207 µs | 500K pairs, 1 client, window 1 |
+| **No persistence** | **8.1M/s** | 453 µs | 602 µs | 668 µs | 1,054 µs | 100M pairs, 16 clients, window 256 |
+
+**Latency CDF** — three peak-load modes on the same axes:
+
+![Latency CDF](docs/plots/latency-cdf.svg)
+
+**Latency stability over time** (p99.99, replication mode):
+
+![Latency stability — replication](docs/plots/latency-stability-replication.svg)
+
+### Bottleneck and next steps
+
+The TCP network stack is now the primary throughput limiter. The journal pipeline hides fsync latency at high pipelining depths. Further gains require reducing transport overhead: kernel bypass (AF_XDP, DPDK, or OpenOnload) would eliminate syscall overhead on the send/recv path. See [docs/performance.md](docs/performance.md) for the full analysis and optimization roadmap.
 
 ## Features
 
@@ -95,6 +138,10 @@ Checklist of features expected of a production trade execution engine. Items mar
 - [ ] Position/exposure limits
 - [ ] Order throttling (per-account rate limiting)
 - [x] Bulk account provisioning (`ProvisionAccount` journal event — O(accounts) seeding, ~0.5s for 1M accounts)
+- [x] Sparse account storage (memory scales with active accounts). Uses `astenn` extendible hashing (grows one bucket at a time, no full-table rehash spikes). See [docs/account-lifecycle.md](docs/account-lifecycle.md).
+- [x] Withdraw event (debit funds, auto-evict zero-balance entries)
+- [ ] Custodian permission role (Deposit/Withdraw only — no trading, no admin ops)
+- [x] Extendible hashing for account lookup tables (`astenn` — custom extendible hash table, grows one bucket at a time with bounded per-operation cost)
 
 ### Event Sourcing & Durability ([docs/journal.md](docs/journal.md))
 - [x] Write-ahead journal with CRC32C checksums
@@ -135,6 +182,7 @@ Checklist of features expected of a production trade execution engine. Items mar
 - [x] Client authentication (Ed25519 challenge-response handshake)
 - [ ] Per-account trading permissions
 - [x] Admin API (instrument management, deposits, circuit breaker controls, kill switch, risk limits, fee schedules, cancel-replace, live stats dashboard)
+- [ ] Idempotency for admin operations (deposits, withdrawals, instrument management — safe to retry on timeout without double-applying)
 
 ### Operations & Reliability ([docs/operations.md](docs/operations.md))
 - [x] Structured logging (`tracing` crate, error-level for server malfunctions only)
@@ -197,20 +245,6 @@ Ordered by importance for commercial readiness (exchange operators and investors
 
 Also needed: backpressure policy, gateway scalability (epoll/io_uring multiplexing), per-account permissions, crash injection tests (kill server at random points during load, verify recovery produces identical state — validates journal/snapshot/rotation crash safety end-to-end).
 
-### Benchmarking & Measurements ([docs/benchmarking.md](docs/benchmarking.md))
-- [x] Realistic order flow generator (power-law prices/sizes, cancels, fills, multiple accounts, STP diversity)
-- [x] Multi-threaded io_uring benchmark client (`--bench-threads`)
-- [x] JSON output for machine-readable results (`--json`)
-- [x] TUI charts: tail latency stability and latency histogram (`--features chart`)
-- [x] Dynamic percentile depth based on sample size
-- [ ] Saturation curve — sweep `--clients` and `--window`, plot latency vs throughput from JSON output
-- [ ] Multi-machine benchmark — run bench from multiple machines simultaneously (`--account-id`, `--order-id-offset`)
-- [ ] Real-world data replay (NASDAQ ITCH 5.0, Databento, Lobster — legal review needed)
-
-### Performance Tuning
-
-See [docs/performance.md](docs/performance.md) for the full performance profile, improvement roadmap, and completed optimizations.
-
 ## Project Structure
 
 ```
@@ -224,106 +258,6 @@ crates/
 ├── client/        Typed client library
 └── tui/           Terminal UI for interactive testing
 ```
-
-## Performance
-
-LAN round-trip benchmarks at [`4109456`](../../commit/4109456). Two or three Cherry AMD Ryzen 9 9900X servers (12C @ 4.4 GHz, SMT disabled, 96 GB 5600 MHz RAM, 2x 1TB NVMe, 10 Gbps). Engine on one server with journal on a dedicated NVMe disk, benchmark client on the second, replica on the third (replication only). TCP over private VLAN, IRQs pinned to core 0. [Realistic order flow](crates/bench/). Reproducible via `scripts/lan-bench-suite.sh`.
-
-### Headline numbers
-
-| Mode | Throughput | p50 | p99 | p99.9 | max |
-|------|-----------|-----|-----|-------|-----|
-| **Full durability** (fsync) | **8.1M orders/sec** | 440 µs | 549 µs | 593 µs | 1,560 µs |
-| **Synchronous replication** | **6.7M orders/sec** | 555 µs | 683 µs | 737 µs | 1,614 µs |
-| **Single-order latency** | 14.7K orders/sec | **68 µs** | 80 µs | 83 µs | 1,254 µs |
-| **No persistence** | **11.1M orders/sec** | 665 µs | 887 µs | 912 µs | 2,046 µs |
-| **Engine only** | **12.9M orders/sec** | 0.05 µs | 0.20 µs | 0.47 µs | 400 µs |
-
-### Peak-load throughput — full durability
-
-100M order pairs, 16 clients, 256 pipelined, `pwritev2` + `RWF_DSYNC` (FUA) journaling:
-
-| Metric | Value |
-|--------|-------|
-| **Throughput** | 8.1M orders/sec |
-| **p50** | 440 µs |
-| **p90** | 477 µs |
-| **p99** | 549 µs |
-| **p99.9** | 593 µs |
-| **p99.99** | 624 µs |
-| **p99.999** | 1,463 µs |
-| **max** | 1,560 µs |
-
-### Synchronous replication — full durability
-
-100M order pairs, 16 clients, 256 pipelined. Primary + replica, both with dedicated NVMe journals, ack-gated responses (zero data loss):
-
-| Metric | Value |
-|--------|-------|
-| **Throughput** | 6.7M orders/sec |
-| **p50** | 555 µs |
-| **p90** | 600 µs |
-| **p99** | 683 µs |
-| **p99.9** | 737 µs |
-| **p99.99** | 830 µs |
-| **p99.999** | 1,543 µs |
-| **max** | 1,614 µs |
-
-### Single-order latency — full durability
-
-500K order pairs, 1 client, no pipelining (window=1):
-
-| Metric | Value |
-|--------|-------|
-| **Throughput** | 14.7K orders/sec |
-| **p50** | 68 µs |
-| **p90** | 68 µs |
-| **p99** | 80 µs |
-| **p99.9** | 83 µs |
-| **p99.99** | 92 µs |
-| **p99.999** | 177 µs |
-| **max** | 1,254 µs |
-
-### Peak-load throughput — no persistence
-
-250M order pairs, 16 clients, 512 pipelined:
-
-| Metric | Value |
-|--------|-------|
-| **Throughput** | 11.1M orders/sec |
-| **p50** | 665 µs |
-| **p90** | 773 µs |
-| **p99** | 887 µs |
-| **p99.9** | 912 µs |
-| **p99.99** | 1,017 µs |
-| **p99.999** | 1,849 µs |
-| **max** | 2,046 µs |
-
-### Plots
-
-**Latency CDF** — three peak-load modes on the same axes:
-
-![Latency CDF](docs/plots/latency-cdf.svg)
-
-**Throughput vs. window depth** (fsync mode, 16 clients, 10M orders per point):
-
-![Saturation — window](docs/plots/saturation-window.svg)
-
-**Latency vs. client count** (fsync mode, constant 4096 total in-flight, 10M orders per point):
-
-![Saturation — clients](docs/plots/saturation-clients.svg)
-
-**Throughput vs. instrument count** (fsync mode, 16 clients, window 128):
-
-![Saturation — instruments](docs/plots/saturation-instruments.svg)
-
-**Throughput vs. account count** (fsync mode, 16 clients, window 128):
-
-![Saturation — accounts](docs/plots/saturation-accounts.svg)
-
-**Latency stability over time** (fsync and replication modes):
-
-![Latency stability](docs/plots/latency-stability.svg)
 
 ## License
 

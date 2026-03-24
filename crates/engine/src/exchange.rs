@@ -8,13 +8,12 @@
 //! stays single-threaded. Note: portfolio risk checks then require
 //! cross-shard message passing, adding latency and complexity.
 
-use rustc_hash::FxHashMap;
-
 use crate::account::{AccountManager, OrderInfo, ReservationSlot};
 use crate::orderbook::OrderBook;
 use crate::types::{
-    AccountId, CircuitBreakerConfig, CurrencyId, ExecutionReport, FeeSchedule, InstrumentSpec,
-    Order, OrderId, OrderType, Price, Quantity, RejectReason, RiskLimits, Side, Symbol,
+    AccountId, CircuitBreakerConfig, CurrencyId, ExecutionReport, FeeSchedule, HashMap,
+    InstrumentSpec, Order, OrderId, OrderType, Price, Quantity, RejectReason, RiskLimits, Side,
+    Symbol,
 };
 
 /// Helper: get an immutable reference to the InstrumentState at `symbol`.
@@ -63,12 +62,17 @@ pub struct Exchange {
     /// Keyed by the pair because different accounts can independently
     /// use the same OrderId. The `ReservationSlot` enables O(1) Vec-indexed
     /// access to the reservation slab (eliminating a second HashMap lookup).
-    order_info: FxHashMap<(AccountId, OrderId), OrderInfo>,
+    order_info: HashMap<(AccountId, OrderId), OrderInfo>,
     /// Per-account high-water mark for order IDs. Rejects submissions
     /// with `order_id <= max_seen[account]` to prevent duplicate execution
-    /// on crash-recovery retry. Flat Vec indexed by AccountId.0 for true
-    /// O(1) with zero hashing — one access per submit.
-    max_order_id: Vec<u64>,
+    /// on crash-recovery retry. Sparse HashMap: only accounts that have
+    /// submitted orders consume memory. Never evicted — prevents order ID
+    /// replay after account withdrawal.
+    max_order_id: HashMap<AccountId, u64>,
+    /// Per-account count of resting orders (entries in `order_info`).
+    /// Used to reject withdrawals while orders are outstanding.
+    /// Entries are removed when the count reaches zero.
+    order_counts: HashMap<AccountId, u32>,
     /// Reusable buffer for consumed (account, order) keys from
     /// `process_reports()`. Avoids per-order Vec allocation on the hot path.
     consumed_buf: Vec<(AccountId, OrderId)>,
@@ -82,8 +86,9 @@ impl Exchange {
         Self {
             instruments: Vec::new(),
             accounts: AccountManager::new(),
-            order_info: FxHashMap::default(),
-            max_order_id: Vec::new(),
+            order_info: HashMap::default(),
+            max_order_id: HashMap::default(),
+            order_counts: HashMap::default(),
             consumed_buf: Vec::new(),
             presized: false,
         }
@@ -104,9 +109,12 @@ impl Exchange {
             // Global across all instruments. Typical steady-state: 100
             // instruments × 200 resting orders = 20K entries. 32K slots
             // ≈ 1 MB — fits in L3 cache.
-            order_info: FxHashMap::with_capacity_and_hasher(32_768, Default::default()),
-            // 10K accounts × 8 bytes = 80 KB — negligible.
-            max_order_id: vec![0; 10_000],
+            order_info: HashMap::with_capacity_and_hasher(32_768, Default::default()),
+            // 1M accounts × ~32 bytes per entry ≈ 32 MB each. Covers
+            // the default benchmark (1M accounts) with no hot-path resizes.
+            // Pages are faulted during prefault() via insert/clear.
+            max_order_id: HashMap::with_capacity_and_hasher(1_000_000, Default::default()),
+            order_counts: HashMap::with_capacity_and_hasher(1_000_000, Default::default()),
             consumed_buf: Vec::with_capacity(256),
             presized: true,
         }
@@ -116,14 +124,21 @@ impl Exchange {
     pub(crate) fn from_parts(
         instruments: Vec<Option<Box<InstrumentState>>>,
         accounts: AccountManager,
-        order_info: FxHashMap<(AccountId, OrderId), OrderInfo>,
-        max_order_id: Vec<u64>,
+        order_info: HashMap<(AccountId, OrderId), OrderInfo>,
+        max_order_id: HashMap<AccountId, u64>,
     ) -> Self {
+        // Derive order_counts from order_info (count entries per account).
+        let mut order_counts: HashMap<AccountId, u32> =
+            HashMap::with_capacity_and_hasher(order_info.len(), Default::default());
+        for &(account, _) in order_info.keys() {
+            *order_counts.entry(account).or_default() += 1;
+        }
         Self {
             instruments,
             accounts,
             order_info,
             max_order_id,
+            order_counts,
             consumed_buf: Vec::new(),
             presized: false,
         }
@@ -175,9 +190,8 @@ impl Exchange {
     pub(crate) fn snapshot_max_order_id(&self) -> Vec<(AccountId, u64)> {
         self.max_order_id
             .iter()
-            .enumerate()
             .filter(|(_, hwm)| **hwm > 0)
-            .map(|(i, hwm)| (AccountId(i as u32), *hwm))
+            .map(|(&account, &hwm)| (account, hwm))
             .collect()
     }
 
@@ -250,8 +264,23 @@ impl Exchange {
             self.order_info.clear();
         }
 
-        // max_order_id is a flat Vec — pages already faulted by vec![0; N]
-        // in with_capacity(). No prefault needed.
+        // Fault max_order_id and order_counts pages. with_capacity()
+        // allocated the backing table but didn't write to it — insert
+        // dummy entries and clear to touch every page before the hot path.
+        if self.max_order_id.is_empty() {
+            let cap = self.max_order_id.capacity();
+            for i in 0..cap as u32 {
+                self.max_order_id.insert(AccountId(i), 0);
+            }
+            self.max_order_id.clear();
+        }
+        if self.order_counts.is_empty() {
+            let cap = self.order_counts.capacity();
+            for i in 0..cap as u32 {
+                self.order_counts.insert(AccountId(i), 0);
+            }
+            self.order_counts.clear();
+        }
 
         self.accounts.prefault();
 
@@ -331,13 +360,7 @@ impl Exchange {
         // outcome — a replayed InsufficientBalance rejection is harmless,
         // but a replayed fill is not. Clients must use a new OrderId for
         // genuinely new orders, even if the previous one was rejected.
-        // Grow the HWM Vec if this is a new account (admin-seeded accounts
-        // are covered by with_capacity; runtime growth is rare).
-        let acct_idx = order.account.0 as usize;
-        if acct_idx >= self.max_order_id.len() {
-            self.max_order_id.resize(acct_idx + 1, 0);
-        }
-        let hwm = &mut self.max_order_id[acct_idx];
+        let hwm = self.max_order_id.entry(order.account).or_insert(0);
         if order.id.0 <= *hwm {
             reports.push(ExecutionReport::Rejected {
                 order_id: order.id,
@@ -470,6 +493,7 @@ impl Exchange {
                 reservation: slot,
             },
         );
+        *self.order_counts.entry(order.account).or_default() += 1;
 
         let report_start = reports.len();
 
@@ -529,8 +553,14 @@ impl Exchange {
         // Clean up order_info for fully consumed orders (filled, cancelled,
         // or rejected). Without this, order_info leaks entries and triggers
         // increasingly expensive HashMap resizes on the hot path.
-        for &key in &self.consumed_buf {
-            self.order_info.remove(&key);
+        for &(account, order_id) in &self.consumed_buf {
+            self.order_info.remove(&(account, order_id));
+            if let Some(count) = self.order_counts.get_mut(&account) {
+                *count = count.saturating_sub(1);
+                if *count == 0 {
+                    self.order_counts.remove(&account);
+                }
+            }
         }
     }
 
@@ -559,8 +589,14 @@ impl Exchange {
                 &mut self.consumed_buf,
             );
 
-            for &key in &self.consumed_buf {
-                self.order_info.remove(&key);
+            for &(account, order_id) in &self.consumed_buf {
+                self.order_info.remove(&(account, order_id));
+                if let Some(count) = self.order_counts.get_mut(&account) {
+                    *count = count.saturating_sub(1);
+                    if *count == 0 {
+                        self.order_counts.remove(&account);
+                    }
+                }
             }
         }
     }
@@ -589,9 +625,32 @@ impl Exchange {
             .process_reports(new_reports, &self.order_info, &spec, &mut self.consumed_buf);
 
         // Clean up order_info for cancelled orders.
-        for &key in &self.consumed_buf {
-            self.order_info.remove(&key);
+        for &(account, order_id) in &self.consumed_buf {
+            self.order_info.remove(&(account, order_id));
+            if let Some(count) = self.order_counts.get_mut(&account) {
+                *count = count.saturating_sub(1);
+                if *count == 0 {
+                    self.order_counts.remove(&account);
+                }
+            }
         }
+    }
+
+    /// Withdraw funds from an account. Rejects if the account has resting
+    /// orders (must `CancelAll` first) or insufficient available balance.
+    /// Removes the balance entry if it reaches zero (memory cleanup).
+    pub fn withdraw(
+        &mut self,
+        account: AccountId,
+        currency: CurrencyId,
+        amount: u64,
+    ) -> Result<(), RejectReason> {
+        // Reject withdrawal if the account has resting orders — funds might
+        // be reserved. Caller must CancelAll first.
+        if self.order_counts.get(&account).copied().unwrap_or(0) > 0 {
+            return Err(RejectReason::HasRestingOrders);
+        }
+        self.accounts.withdraw(account, currency, amount)
     }
 
     /// Atomically amend a resting limit order's price and/or quantity.
@@ -5328,5 +5387,369 @@ mod tests {
             )),
             "rejected post-only should still consume the order ID"
         );
+    }
+
+    // --- Withdraw and account lifecycle ---
+
+    #[test]
+    fn withdraw_reduces_available() {
+        let mut exchange = Exchange::new();
+        exchange.add_instrument(btc_usd_spec());
+        exchange.deposit(ACCT_A, USD, 10_000);
+
+        exchange.withdraw(ACCT_A, USD, 3_000).unwrap();
+        assert_eq!(exchange.accounts().balance(ACCT_A, USD).available, 7_000);
+    }
+
+    #[test]
+    fn withdraw_insufficient_rejected() {
+        let mut exchange = Exchange::new();
+        exchange.add_instrument(btc_usd_spec());
+        exchange.deposit(ACCT_A, USD, 1_000);
+
+        let err = exchange.withdraw(ACCT_A, USD, 5_000).unwrap_err();
+        assert_eq!(err, RejectReason::InsufficientBalance);
+    }
+
+    #[test]
+    fn withdraw_with_resting_orders_rejected() {
+        let mut exchange = Exchange::new();
+        exchange.add_instrument(btc_usd_spec());
+        exchange.deposit(ACCT_A, USD, 10_000);
+
+        let mut reports = Vec::new();
+        exchange.execute(
+            Symbol(1),
+            limit_order(1, ACCT_A, Side::Buy, 100, 10, TimeInForce::GTC),
+            &mut reports,
+        );
+        assert!(matches!(reports[0], ExecutionReport::Placed { .. }));
+
+        // Can't withdraw while orders are resting.
+        let err = exchange.withdraw(ACCT_A, USD, 1_000).unwrap_err();
+        assert_eq!(err, RejectReason::HasRestingOrders);
+    }
+
+    #[test]
+    fn withdraw_after_cancel_all_succeeds() {
+        let mut exchange = Exchange::new();
+        exchange.add_instrument(btc_usd_spec());
+        exchange.deposit(ACCT_A, USD, 10_000);
+
+        let mut reports = Vec::new();
+        exchange.execute(
+            Symbol(1),
+            limit_order(1, ACCT_A, Side::Buy, 100, 10, TimeInForce::GTC),
+            &mut reports,
+        );
+
+        // Cancel all, then withdraw.
+        reports.clear();
+        exchange.cancel_all(ACCT_A, &mut reports);
+        exchange.withdraw(ACCT_A, USD, 10_000).unwrap();
+        assert_eq!(exchange.accounts().balance(ACCT_A, USD).available, 0);
+    }
+
+    #[test]
+    fn max_order_id_retained_after_full_withdrawal() {
+        let mut exchange = Exchange::new();
+        exchange.add_instrument(btc_usd_spec());
+        exchange.deposit(ACCT_A, USD, 10_000);
+        exchange.deposit(ACCT_A, BTC, 100);
+
+        // Submit and fill an order.
+        let mut reports = Vec::new();
+        exchange.deposit(ACCT_B, BTC, 100);
+        exchange.execute(
+            Symbol(1),
+            limit_order(1, ACCT_B, Side::Sell, 100, 10, TimeInForce::GTC),
+            &mut reports,
+        );
+        reports.clear();
+        exchange.execute(
+            Symbol(1),
+            limit_order(1, ACCT_A, Side::Buy, 100, 10, TimeInForce::GTC),
+            &mut reports,
+        );
+
+        // Withdraw everything.
+        exchange
+            .withdraw(
+                ACCT_A,
+                USD,
+                exchange.accounts().balance(ACCT_A, USD).available,
+            )
+            .unwrap();
+        exchange
+            .withdraw(
+                ACCT_A,
+                BTC,
+                exchange.accounts().balance(ACCT_A, BTC).available,
+            )
+            .unwrap();
+
+        // Account has no balances, but HWM is retained.
+        assert!(!exchange.accounts().has_balances(ACCT_A));
+
+        // Re-deposit and try to reuse OrderId 1 — should be rejected.
+        exchange.deposit(ACCT_A, USD, 10_000);
+        reports.clear();
+        exchange.execute(
+            Symbol(1),
+            limit_order(1, ACCT_A, Side::Buy, 100, 10, TimeInForce::GTC),
+            &mut reports,
+        );
+        assert!(matches!(
+            reports[0],
+            ExecutionReport::Rejected {
+                reason: RejectReason::DuplicateOrderId,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn order_counts_track_resting_orders() {
+        let mut exchange = Exchange::new();
+        exchange.add_instrument(btc_usd_spec());
+        exchange.deposit(ACCT_A, USD, 100_000);
+
+        let mut reports = Vec::new();
+        // Place 3 orders.
+        for i in 1..=3 {
+            exchange.execute(
+                Symbol(1),
+                limit_order(i, ACCT_A, Side::Buy, 100, 10, TimeInForce::GTC),
+                &mut reports,
+            );
+        }
+
+        // All 3 resting — withdraw should fail.
+        assert_eq!(
+            exchange.withdraw(ACCT_A, USD, 1).unwrap_err(),
+            RejectReason::HasRestingOrders
+        );
+
+        // Cancel all — withdraw should succeed.
+        reports.clear();
+        exchange.cancel_all(ACCT_A, &mut reports);
+        assert!(exchange.withdraw(ACCT_A, USD, 1).is_ok());
+    }
+
+    #[test]
+    fn order_counts_zero_after_ioc_fill() {
+        let mut exchange = Exchange::new();
+        exchange.add_instrument(btc_usd_spec());
+        exchange.deposit(ACCT_A, USD, 100_000);
+        exchange.deposit(ACCT_B, BTC, 100);
+
+        let mut reports = Vec::new();
+        // Seller places resting order.
+        exchange.execute(
+            Symbol(1),
+            limit_order(1, ACCT_B, Side::Sell, 100, 10, TimeInForce::GTC),
+            &mut reports,
+        );
+
+        // IOC buy fills immediately — should not leave resting count.
+        reports.clear();
+        exchange.execute(
+            Symbol(1),
+            limit_order(1, ACCT_A, Side::Buy, 100, 10, TimeInForce::IOC),
+            &mut reports,
+        );
+
+        // ACCT_A should have no resting orders — withdraw should work.
+        assert!(exchange.withdraw(ACCT_A, USD, 1).is_ok());
+    }
+
+    #[test]
+    fn withdraw_after_partial_fill_and_cancel() {
+        let mut exchange = Exchange::new();
+        exchange.add_instrument(btc_usd_spec());
+        exchange.deposit(ACCT_A, USD, 100_000);
+        exchange.deposit(ACCT_B, BTC, 100);
+
+        let mut reports = Vec::new();
+        // ACCT_A places GTC buy for 20 @ 100.
+        exchange.execute(
+            Symbol(1),
+            limit_order(1, ACCT_A, Side::Buy, 100, 20, TimeInForce::GTC),
+            &mut reports,
+        );
+
+        // ACCT_B fills 10 of 20.
+        reports.clear();
+        exchange.execute(
+            Symbol(1),
+            limit_order(1, ACCT_B, Side::Sell, 100, 10, TimeInForce::GTC),
+            &mut reports,
+        );
+
+        // Cancel remaining, then withdraw all.
+        reports.clear();
+        exchange.cancel_all(ACCT_A, &mut reports);
+
+        let usd_avail = exchange.accounts().balance(ACCT_A, USD).available;
+        exchange.withdraw(ACCT_A, USD, usd_avail).unwrap();
+        let btc_avail = exchange.accounts().balance(ACCT_A, BTC).available;
+        exchange.withdraw(ACCT_A, BTC, btc_avail).unwrap();
+
+        assert!(!exchange.accounts().has_balances(ACCT_A));
+    }
+
+    #[test]
+    fn order_counts_zero_after_fok_no_fill() {
+        let mut exchange = Exchange::new();
+        exchange.add_instrument(btc_usd_spec());
+        exchange.deposit(ACCT_A, USD, 100_000);
+
+        let mut reports = Vec::new();
+        // FOK buy on empty book — rejected, no fill.
+        exchange.execute(
+            Symbol(1),
+            limit_order(1, ACCT_A, Side::Buy, 100, 10, TimeInForce::FOK),
+            &mut reports,
+        );
+        assert!(matches!(
+            reports[0],
+            ExecutionReport::Rejected {
+                reason: RejectReason::FOKCannotFill,
+                ..
+            }
+        ));
+
+        // No resting orders — withdraw should succeed.
+        assert!(exchange.withdraw(ACCT_A, USD, 1).is_ok());
+    }
+
+    #[test]
+    fn order_counts_zero_after_fok_full_fill() {
+        let mut exchange = Exchange::new();
+        exchange.add_instrument(btc_usd_spec());
+        exchange.deposit(ACCT_A, USD, 100_000);
+        exchange.deposit(ACCT_B, BTC, 100);
+
+        let mut reports = Vec::new();
+        // Seller rests.
+        exchange.execute(
+            Symbol(1),
+            limit_order(1, ACCT_B, Side::Sell, 100, 10, TimeInForce::GTC),
+            &mut reports,
+        );
+
+        // FOK buy fills entirely.
+        reports.clear();
+        exchange.execute(
+            Symbol(1),
+            limit_order(1, ACCT_A, Side::Buy, 100, 10, TimeInForce::FOK),
+            &mut reports,
+        );
+
+        // ACCT_A has no resting orders.
+        assert!(exchange.withdraw(ACCT_A, USD, 1).is_ok());
+    }
+
+    #[test]
+    fn order_counts_after_stp_cancel_newest() {
+        let mut exchange = Exchange::new();
+        exchange.add_instrument(btc_usd_spec());
+        exchange.deposit(ACCT_A, USD, 100_000);
+        exchange.deposit(ACCT_A, BTC, 100);
+
+        let mut reports = Vec::new();
+        // Place a resting sell.
+        exchange.execute(
+            Symbol(1),
+            Order {
+                id: OrderId(1),
+                account: ACCT_A,
+                side: Side::Sell,
+                order_type: OrderType::Limit {
+                    price: Price(NonZeroU64::new(100).unwrap()),
+                    post_only: false,
+                },
+                time_in_force: TimeInForce::GTC,
+                quantity: Quantity(NonZeroU64::new(10).unwrap()),
+                stp: SelfTradeProtection::CancelNewest,
+            },
+            &mut reports,
+        );
+
+        // Self-trade: buy crosses the sell. CancelNewest rejects the taker (buy).
+        reports.clear();
+        exchange.execute(
+            Symbol(1),
+            Order {
+                id: OrderId(2),
+                account: ACCT_A,
+                side: Side::Buy,
+                order_type: OrderType::Limit {
+                    price: Price(NonZeroU64::new(100).unwrap()),
+                    post_only: false,
+                },
+                time_in_force: TimeInForce::GTC,
+                quantity: Quantity(NonZeroU64::new(10).unwrap()),
+                stp: SelfTradeProtection::CancelNewest,
+            },
+            &mut reports,
+        );
+
+        // The maker (sell) still rests. Cancel it, then withdraw should succeed.
+        reports.clear();
+        exchange.cancel_all(ACCT_A, &mut reports);
+        assert!(exchange.withdraw(ACCT_A, USD, 1).is_ok());
+    }
+
+    #[test]
+    fn order_counts_after_stp_cancel_oldest() {
+        let mut exchange = Exchange::new();
+        exchange.add_instrument(btc_usd_spec());
+        exchange.deposit(ACCT_A, USD, 100_000);
+        exchange.deposit(ACCT_A, BTC, 100);
+
+        let mut reports = Vec::new();
+        // Place a resting sell.
+        exchange.execute(
+            Symbol(1),
+            Order {
+                id: OrderId(1),
+                account: ACCT_A,
+                side: Side::Sell,
+                order_type: OrderType::Limit {
+                    price: Price(NonZeroU64::new(100).unwrap()),
+                    post_only: false,
+                },
+                time_in_force: TimeInForce::GTC,
+                quantity: Quantity(NonZeroU64::new(10).unwrap()),
+                stp: SelfTradeProtection::CancelOldest,
+            },
+            &mut reports,
+        );
+
+        // Self-trade: buy crosses. CancelOldest cancels the maker (sell).
+        // The taker buy may rest if GTC.
+        reports.clear();
+        exchange.execute(
+            Symbol(1),
+            Order {
+                id: OrderId(2),
+                account: ACCT_A,
+                side: Side::Buy,
+                order_type: OrderType::Limit {
+                    price: Price(NonZeroU64::new(100).unwrap()),
+                    post_only: false,
+                },
+                time_in_force: TimeInForce::GTC,
+                quantity: Quantity(NonZeroU64::new(10).unwrap()),
+                stp: SelfTradeProtection::CancelOldest,
+            },
+            &mut reports,
+        );
+
+        // Cancel remaining, then withdraw.
+        reports.clear();
+        exchange.cancel_all(ACCT_A, &mut reports);
+        assert!(exchange.withdraw(ACCT_A, USD, 1).is_ok());
     }
 }

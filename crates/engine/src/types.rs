@@ -5,6 +5,19 @@
 
 use std::num::NonZeroU64;
 
+/// HashMap with FxHash and extendible hashing (via `astenn`).
+///
+/// Uses `FxBuildHasher` (fast non-cryptographic hash) with `astenn::HashMap`
+/// which grows one bucket at a time instead of rehashing the entire table.
+/// Each insert that triggers growth only touches entries in the splitting
+/// bucket — bounded O(bucket_size) cost regardless of total table size.
+///
+/// Replaces `rustc_hash::FxHashMap` (hashbrown) which rehashes all entries
+/// at once when load factor is exceeded — causing deterministic latency
+/// spikes on the hot path when account population exceeds pre-allocated
+/// capacity.
+pub type HashMap<K, V> = astenn::HashMap<K, V, rustc_hash::FxBuildHasher>;
+
 /// Instrument/pair identifier.
 ///
 /// Uses a `u32` rather than a string to avoid heap allocation and enable
@@ -302,6 +315,9 @@ pub enum RejectReason {
     PriceWouldCross,
     /// Post-only order would immediately match against resting liquidity.
     PostOnlyWouldCross,
+    /// Withdrawal rejected because the account has resting orders.
+    /// Must CancelAll first.
+    HasRestingOrders,
 }
 
 #[cfg(test)]

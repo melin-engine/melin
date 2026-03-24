@@ -101,6 +101,11 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7c02d123df017efcdfbd739ef81735b36c5ba83ec3c59c80a9d7ecc718f92e50"
 
 [[package]]
+name = "astenn"
+version = "0.1.0"
+source = "git+ssh://git@github.com/pierre-l/astenn.git#d269f4d1f6269f2d52293a40bf93800013e243b4"
+
+[[package]]
 name = "autocfg"
 version = "1.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -948,6 +953,7 @@ version = "0.1.0"
 name = "melin-engine"
 version = "0.1.0"
 dependencies = [
+ "astenn",
  "blake3",
  "bolero",
  "crc32c",

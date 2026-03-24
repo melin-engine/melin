@@ -46,7 +46,8 @@ pub const FILE_MAGIC: u32 = 0x4A4F_5552;
 /// v3 → v4: added CancelAll event for kill switch.
 /// v4 → v5: added SetCircuitBreaker event for price bands + trading halts.
 /// v5 → v6: added GenesisHash + Checkpoint events for BLAKE3 hash chain.
-pub const FORMAT_VERSION: u16 = 6;
+/// v6 → v7: added Withdraw event for sparse account lifecycle.
+pub const FORMAT_VERSION: u16 = 7;
 
 /// File header size in bytes.
 pub const FILE_HEADER_SIZE: usize = 8;
@@ -73,6 +74,7 @@ const TAG_GENESIS_HASH: u8 = 9;
 const TAG_CHECKPOINT: u8 = 10;
 const TAG_SET_FEE_SCHEDULE: u8 = 11;
 const TAG_PROVISION_ACCOUNT: u8 = 12;
+const TAG_WITHDRAW: u8 = 13;
 
 /// OrderType tag encoding (codec-specific, not shared — order types are only
 /// in the journal format, not in snapshots).
@@ -290,6 +292,19 @@ pub fn encode(
             le::put_u64(&mut buf[pos..], *amount);
             pos += 8;
             TAG_PROVISION_ACCOUNT
+        }
+        JournalEvent::Withdraw {
+            account,
+            currency,
+            amount,
+        } => {
+            le::put_u32(&mut buf[pos..], account.0);
+            pos += 4;
+            le::put_u32(&mut buf[pos..], currency.0);
+            pos += 4;
+            le::put_u64(&mut buf[pos..], *amount);
+            pos += 8;
+            TAG_WITHDRAW
         }
     };
 
@@ -686,6 +701,19 @@ pub fn decode(buf: &[u8]) -> Result<(usize, u64, u64, JournalEvent), JournalErro
             let amount = le::get_u64(&payload[4..]);
             JournalEvent::ProvisionAccount { account, amount }
         }
+        TAG_WITHDRAW => {
+            if payload.len() < 16 {
+                return Err(JournalError::CorruptEntry {
+                    sequence,
+                    reason: "Withdraw payload too short",
+                });
+            }
+            JournalEvent::Withdraw {
+                account: AccountId(le::get_u32(&payload[0..])),
+                currency: CurrencyId(le::get_u32(&payload[4..])),
+                amount: le::get_u64(&payload[8..]),
+            }
+        }
         _ => {
             return Err(JournalError::CorruptEntry {
                 sequence,
@@ -983,6 +1011,11 @@ mod tests {
             JournalEvent::ProvisionAccount {
                 account: AccountId(42),
                 amount: u64::MAX / 4,
+            },
+            JournalEvent::Withdraw {
+                account: AccountId(42),
+                currency: CurrencyId(20),
+                amount: 500_000,
             },
         ]
     }

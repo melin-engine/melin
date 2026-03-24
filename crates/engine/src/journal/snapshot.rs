@@ -20,9 +20,7 @@
 //! | data           | ...     | var   | Serialized Exchange state          |
 //! | crc32c         | u32     | 4     | CRC32C of everything above         |
 
-use std::collections::{BTreeMap, HashMap, VecDeque};
-
-use rustc_hash::FxHashMap;
+use std::collections::{BTreeMap, HashMap as StdHashMap, VecDeque};
 use std::fs::{self, File};
 use std::io::{Read, Write};
 use std::num::NonZeroU64;
@@ -1055,14 +1053,14 @@ impl Exchange {
         use crate::exchange::InstrumentState;
 
         // Build per-symbol lookup tables from the flat snapshot Vecs.
-        let mut books_map: HashMap<Symbol, OrderBook> = HashMap::new();
+        let mut books_map: StdHashMap<Symbol, OrderBook> = StdHashMap::new();
         for (symbol, book_snap) in state.books {
             books_map.insert(symbol, OrderBook::restore(book_snap));
         }
-        let risk_map: HashMap<Symbol, RiskLimits> = state.risk_limits.into_iter().collect();
-        let cb_map: HashMap<Symbol, CircuitBreakerConfig> =
+        let risk_map: StdHashMap<Symbol, RiskLimits> = state.risk_limits.into_iter().collect();
+        let cb_map: StdHashMap<Symbol, CircuitBreakerConfig> =
             state.circuit_breakers.into_iter().collect();
-        let fee_map: HashMap<Symbol, FeeSchedule> = state.fee_schedules.into_iter().collect();
+        let fee_map: StdHashMap<Symbol, FeeSchedule> = state.fee_schedules.into_iter().collect();
 
         // Assemble consolidated InstrumentState Vec indexed by Symbol.0.
         let max_sym = state
@@ -1090,9 +1088,10 @@ impl Exchange {
 
         // Build order_info by combining saved sides with restored reservation slots.
         // Build a side lookup first, then merge with slot assignments.
-        let side_map: HashMap<(AccountId, OrderId), Side> = state.order_sides.into_iter().collect();
-        let mut order_info: FxHashMap<(AccountId, OrderId), OrderInfo> =
-            FxHashMap::with_capacity_and_hasher(side_map.len(), Default::default());
+        let side_map: StdHashMap<(AccountId, OrderId), Side> =
+            state.order_sides.into_iter().collect();
+        let mut order_info: crate::types::HashMap<(AccountId, OrderId), OrderInfo> =
+            crate::types::HashMap::with_capacity_and_hasher(side_map.len(), Default::default());
         for (key, slot) in slot_assignments {
             if let Some(&side) = side_map.get(&key) {
                 order_info.insert(
@@ -1105,16 +1104,13 @@ impl Exchange {
             }
         }
 
-        // Build flat Vec indexed by AccountId.0.
-        let max_acct = state
-            .max_order_id
-            .iter()
-            .map(|(a, _)| a.0 as usize)
-            .max()
-            .unwrap_or(0);
-        let mut max_order_id = vec![0u64; max_acct + 1];
+        // Build sparse HashMap from snapshot entries.
+        let mut max_order_id = crate::types::HashMap::with_capacity_and_hasher(
+            state.max_order_id.len(),
+            Default::default(),
+        );
         for (account, hwm) in state.max_order_id {
-            max_order_id[account.0 as usize] = hwm;
+            max_order_id.insert(account, hwm);
         }
 
         Self::from_parts(instruments, accounts, order_info, max_order_id)
@@ -1217,13 +1213,13 @@ impl OrderBook {
             btree
         };
 
-        let order_index: FxHashMap<(AccountId, OrderId), (Side, Price)> = snap
+        let order_index: crate::types::HashMap<(AccountId, OrderId), (Side, Price)> = snap
             .order_index
             .into_iter()
             .map(|(id, account, side, price)| ((account, id), (side, price)))
             .collect();
 
-        let stop_index: FxHashMap<(AccountId, OrderId), (Side, Price)> = snap
+        let stop_index: crate::types::HashMap<(AccountId, OrderId), (Side, Price)> = snap
             .stop_index
             .into_iter()
             .map(|(id, account, side, price)| ((account, id), (side, price)))

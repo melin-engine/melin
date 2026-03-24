@@ -85,7 +85,7 @@ BENCH_PUB="${POSITIONAL[1]}"
 SERVER_VLAN="${POSITIONAL[2]}"
 SSH_USER="${POSITIONAL[3]:-root}"
 
-SSH_OPTS="-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR"
+SSH_OPTS="-A -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR"
 SERVER="${SSH_USER}@${SERVER_PUB}"
 BENCH="${SSH_USER}@${BENCH_PUB}"
 

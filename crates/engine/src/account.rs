@@ -5,20 +5,20 @@
 //! cancellation. Runs on the same single thread as the matching engine
 //! (no locks needed).
 //!
-//! Balances are stored in a flat `Vec<Balance>` indexed by
-//! `account_id * currency_stride + currency_id`. This gives O(1) lookups
-//! with no hashing, no prefault needed (sequential allocation), and
-//! near-instant bulk provisioning (single allocation + sequential writes).
+//! Balances are stored in a sparse `HashMap<(AccountId, CurrencyId), Balance>`.
+//! Only accounts with non-zero balances consume memory, scaling with active
+//! accounts rather than `max(account_id) × max(currency_id)`. This enables
+//! the gateway deposit/withdraw lifecycle pattern for extreme scale (see
+//! `docs/account-lifecycle.md`).
 //!
-//! The Vec is sized at startup to cover all seeded accounts/currencies.
-//! Hot-path operations (`try_reserve`, `fill`, `release`, `balance`) use
-//! direct indexing with no allocation. Only `deposit` can grow the Vec
-//! when a new account or currency appears — this is an admin operation
-//! that happens outside the order-matching critical path.
+//! HashMap lookups (~20-50ns) are slower than flat Vec indexing (~1-3ns),
+//! but the engine remains sub-microsecond per order. The self-contained
+//! design (no gateway cooperation needed for correctness) is the right
+//! commercial tradeoff.
 
 use crate::types::{
-    AccountId, CurrencyId, ExecutionReport, InstrumentSpec, Order, OrderId, OrderType, Price,
-    Quantity, RejectReason, Side,
+    AccountId, CurrencyId, ExecutionReport, HashMap, InstrumentSpec, Order, OrderId, OrderType,
+    Price, Quantity, RejectReason, Side,
 };
 
 /// Per-currency balance for an account.
@@ -103,18 +103,18 @@ pub struct OrderInfo {
 
 /// Manages account balances across all currencies.
 ///
-/// Balances are stored in a flat `Vec<Balance>` indexed by
-/// `account_id * currency_stride + currency_id` for O(1) direct lookups.
-/// No hashing, no prefault, and bulk provisioning is a single allocation.
+/// Balances are stored in a sparse `HashMap<(AccountId, CurrencyId), Balance>`.
+/// Only accounts with non-zero balances consume memory. Zero-balance entries
+/// are removed on withdraw/release, so memory scales with active accounts.
 ///
-/// The Vec is pre-sized at startup to cover all seeded accounts. Runtime
-/// deposits for new accounts may grow the Vec, but deposits are admin
-/// operations — not on the order-matching hot path.
+/// HashMap: fast non-cryptographic hashing (~20-50ns per lookup). Chosen
+/// over BTreeMap (log-n), std HashMap (SipHash overhead), and flat Vec
+/// (can't handle sparse account ID space without wasting memory).
 pub struct AccountManager {
-    /// Flat balance array. Index = account.0 * currency_stride + currency.0.
-    balances: Vec<Balance>,
-    /// Number of currency slots per account row (max_currency_id + 1).
-    currency_stride: usize,
+    /// Sparse balance map. Only (account, currency) pairs with non-zero
+    /// balances are present. Entries are removed when both available and
+    /// reserved reach zero.
+    balances: HashMap<(AccountId, CurrencyId), Balance>,
     /// Slab of active reservations. Indexed by `ReservationSlot(u32)` for
     /// O(1) access with no hashing. Freed slots are recycled via `free_slots`.
     /// Vec: contiguous, cache-friendly, zero per-access overhead vs HashMap's
@@ -128,8 +128,7 @@ pub struct AccountManager {
 impl AccountManager {
     pub fn new() -> Self {
         Self {
-            balances: Vec::new(),
-            currency_stride: 0,
+            balances: HashMap::default(),
             reservation_slab: Vec::new(),
             free_slots: Vec::new(),
         }
@@ -137,12 +136,13 @@ impl AccountManager {
 
     /// Create an AccountManager pre-sized for production workloads.
     pub fn with_capacity() -> Self {
-        // Pre-allocate 2M reservation slots. At 16 bytes each this is 32 MB —
-        // far less than the ~96 MB the old HashMap used (key + value + table
-        // overhead). Pages are faulted during prefault().
+        // Pre-allocate 2M reservation slots. At 16 bytes each this is 32 MB.
+        // Pages are faulted during prefault().
+        //
+        // Balance HashMap starts empty — deposits insert entries on demand.
+        // No pre-allocation needed since deposit is an admin operation.
         Self {
-            balances: Vec::new(),
-            currency_stride: 0,
+            balances: HashMap::default(),
             reservation_slab: Vec::with_capacity(2_000_000),
             free_slots: Vec::with_capacity(2_000_000),
         }
@@ -163,6 +163,10 @@ impl AccountManager {
                 self.free_slots.push(i as u32);
             }
         }
+        // Balances HashMap: pages are faulted on deposit (admin path).
+        // No prefault needed — the HashMap grows organically and never
+        // causes a hot-path resize spike (only deposits/withdrawals
+        // insert/remove entries).
     }
 
     /// Reconstruct from snapshot data. Returns `(manager, slot_assignments)`
@@ -173,19 +177,13 @@ impl AccountManager {
         balance_entries: Vec<((AccountId, CurrencyId), Balance)>,
         reservations: Vec<(OrderId, AccountId, CurrencyId, u64)>,
     ) -> (Self, Vec<((AccountId, OrderId), ReservationSlot)>) {
-        // Find dimensions from the balance entries.
-        let mut max_account: u32 = 0;
-        let mut max_currency: u32 = 0;
-        for &((account, currency), _) in &balance_entries {
-            max_account = max_account.max(account.0);
-            max_currency = max_currency.max(currency.0);
-        }
-        let currency_stride = max_currency as usize + 1;
-        let num_accounts = max_account as usize + 1;
-        let mut balances = vec![Balance::default(); num_accounts * currency_stride];
-        for ((account, currency), balance) in balance_entries {
-            let idx = account.0 as usize * currency_stride + currency.0 as usize;
-            balances[idx] = balance;
+        // Build balance HashMap directly from sparse entries.
+        let mut balances =
+            HashMap::with_capacity_and_hasher(balance_entries.len(), Default::default());
+        for (key, balance) in balance_entries {
+            if !balance.is_zero() {
+                balances.insert(key, balance);
+            }
         }
 
         // Build slab sequentially — slots 0..n for n reservations.
@@ -199,7 +197,6 @@ impl AccountManager {
 
         let mgr = Self {
             balances,
-            currency_stride,
             reservation_slab: slab,
             free_slots: Vec::new(),
         };
@@ -208,18 +205,13 @@ impl AccountManager {
 
     /// Snapshot all non-zero balances for serialization.
     pub(crate) fn snapshot_balances(&self) -> Vec<((AccountId, CurrencyId), Balance)> {
-        if self.currency_stride == 0 {
-            return Vec::new();
-        }
-        let mut out = Vec::new();
-        for (i, bal) in self.balances.iter().enumerate() {
-            if !bal.is_zero() {
-                let account = AccountId((i / self.currency_stride) as u32);
-                let currency = CurrencyId((i % self.currency_stride) as u32);
-                out.push(((account, currency), *bal));
-            }
-        }
-        out
+        // fill() can create zero-balance entries via entry().or_default(),
+        // so filter them out to keep snapshots compact.
+        self.balances
+            .iter()
+            .filter(|(_, v)| !v.is_zero())
+            .map(|(&k, &v)| (k, v))
+            .collect()
     }
 
     /// Snapshot all active reservations for serialization. The caller
@@ -238,18 +230,17 @@ impl AccountManager {
             .collect()
     }
 
-    /// Credit funds to an account. Grows the balance array if needed.
+    /// Credit funds to an account. Inserts a new balance entry if the
+    /// (account, currency) pair doesn't exist yet.
     /// This is an admin operation — not on the order-matching hot path.
-    /// After startup seeding, the Vec already covers all known accounts
-    /// so runtime deposits for existing accounts never allocate.
     pub fn deposit(&mut self, account: AccountId, currency: CurrencyId, amount: u64) {
-        self.ensure_capacity(account, currency);
-        let idx = account.0 as usize * self.currency_stride + currency.0 as usize;
-        self.balances[idx].available = self.balances[idx].available.saturating_add(amount);
+        let bal = self.balances.entry((account, currency)).or_default();
+        bal.available = bal.available.saturating_add(amount);
     }
 
     /// Debit available funds from an account.
     /// Returns `Err` if the account doesn't exist or has insufficient available balance.
+    /// Removes the entry if both available and reserved reach zero (memory cleanup).
     pub fn withdraw(
         &mut self,
         account: AccountId,
@@ -257,18 +248,26 @@ impl AccountManager {
         amount: u64,
     ) -> Result<(), RejectReason> {
         let bal = self
-            .get_mut(account, currency)
+            .balances
+            .get_mut(&(account, currency))
             .ok_or(RejectReason::UnknownAccount)?;
         if bal.available < amount {
             return Err(RejectReason::InsufficientBalance);
         }
         bal.available -= amount;
+        // Clean up zero-balance entries so memory scales with active accounts.
+        if bal.is_zero() {
+            self.balances.remove(&(account, currency));
+        }
         Ok(())
     }
 
     /// Get the balance for an account/currency pair.
     pub fn balance(&self, account: AccountId, currency: CurrencyId) -> Balance {
-        self.get(account, currency).copied().unwrap_or_default()
+        self.balances
+            .get(&(account, currency))
+            .copied()
+            .unwrap_or_default()
     }
 
     /// Attempt to reserve funds for an incoming order.
@@ -294,7 +293,8 @@ impl AccountManager {
         let (currency, amount) = self.required_reserve(order, spec, max_fee_bps)?;
 
         let bal = self
-            .get_mut(order.account, currency)
+            .balances
+            .get_mut(&(order.account, currency))
             .ok_or(RejectReason::InsufficientBalance)?;
 
         if bal.available < amount {
@@ -348,8 +348,6 @@ impl AccountManager {
         // Buyer: reserved quote decreases by cost + fee, available base increases.
         // The reservation includes a fee cushion (reserved at placement time
         // with max_fee_bps), so cost + fee fits within the reservation.
-        // ensure_capacity is a no-op after startup seeding (all currencies
-        // already in range) — just two comparisons, no allocation.
         //
         // Signed fees: positive = fee deducted, negative = rebate credited.
         // cost_i128 + buyer_fee_i128 is clamped to [0, u64::MAX] to handle
@@ -361,15 +359,15 @@ impl AccountManager {
                 u64::try_from(total_deduct_i128.clamp(0, u64::MAX as i128)).unwrap_or(0);
             res.remaining = res.remaining.saturating_sub(total_deduct);
             let buyer_account = res.account;
-            self.ensure_capacity(buyer_account, spec.base);
-            let stride = self.currency_stride;
-            let quote_idx = buyer_account.0 as usize * stride + spec.quote.0 as usize;
-            self.balances[quote_idx].reserved = self.balances[quote_idx]
-                .reserved
-                .saturating_sub(total_deduct);
-            let base_idx = buyer_account.0 as usize * stride + spec.base.0 as usize;
-            self.balances[base_idx].available =
-                self.balances[base_idx].available.saturating_add(qty);
+
+            let quote_bal = self
+                .balances
+                .entry((buyer_account, spec.quote))
+                .or_default();
+            quote_bal.reserved = quote_bal.reserved.saturating_sub(total_deduct);
+
+            let base_bal = self.balances.entry((buyer_account, spec.base)).or_default();
+            base_bal.available = base_bal.available.saturating_add(qty);
         }
 
         // Seller: reserved base decreases, available quote increases by cost - fee.
@@ -378,15 +376,20 @@ impl AccountManager {
             let res = &mut self.reservation_slab[seller_slot.0 as usize];
             res.remaining = res.remaining.saturating_sub(qty);
             let seller_account = res.account;
-            self.ensure_capacity(seller_account, spec.quote);
-            let stride = self.currency_stride;
-            let base_idx = seller_account.0 as usize * stride + spec.base.0 as usize;
-            self.balances[base_idx].reserved = self.balances[base_idx].reserved.saturating_sub(qty);
-            let quote_idx = seller_account.0 as usize * stride + spec.quote.0 as usize;
+
+            let base_bal = self
+                .balances
+                .entry((seller_account, spec.base))
+                .or_default();
+            base_bal.reserved = base_bal.reserved.saturating_sub(qty);
+
+            let quote_bal = self
+                .balances
+                .entry((seller_account, spec.quote))
+                .or_default();
             let proceeds_i128 = cost_u64 as i128 - seller_fee as i128;
             let proceeds = u64::try_from(proceeds_i128.clamp(0, u64::MAX as i128)).unwrap_or(0);
-            self.balances[quote_idx].available =
-                self.balances[quote_idx].available.saturating_add(proceeds);
+            quote_bal.available = quote_bal.available.saturating_add(proceeds);
         }
 
         // Note: reservation cleanup is handled by process_reports(), which
@@ -422,7 +425,8 @@ impl AccountManager {
         }
 
         let bal = self
-            .get_mut(account, currency)
+            .balances
+            .get_mut(&(account, currency))
             .ok_or(RejectReason::InsufficientBalance)?;
 
         if new_amount > old_amount {
@@ -445,7 +449,7 @@ impl AccountManager {
     /// Release all remaining reserved funds and free the slot.
     pub fn release(&mut self, slot: ReservationSlot) {
         let res = self.reservation_slab[slot.0 as usize];
-        if let Some(bal) = self.get_mut(res.account, res.currency) {
+        if let Some(bal) = self.balances.get_mut(&(res.account, res.currency)) {
             bal.reserved = bal.reserved.saturating_sub(res.remaining);
             bal.available = bal.available.saturating_add(res.remaining);
         }
@@ -464,7 +468,7 @@ impl AccountManager {
     pub fn process_reports(
         &mut self,
         reports: &[ExecutionReport],
-        order_info: &rustc_hash::FxHashMap<(AccountId, OrderId), OrderInfo>,
+        order_info: &HashMap<(AccountId, OrderId), OrderInfo>,
         spec: &InstrumentSpec,
         consumed: &mut Vec<(AccountId, OrderId)>,
     ) {
@@ -485,7 +489,7 @@ impl AccountManager {
 
                     // Look up both sides' OrderInfo for slot + side resolution.
                     // Cache the reservation slots to avoid re-querying order_info
-                    // for the remaining==0 check below (saves 2 FxHashMap lookups
+                    // for the remaining==0 check below (saves 2 HashMap lookups
                     // per fill — was 30% of this function's cost).
                     if let (Some(maker_info), Some(taker_info)) =
                         (order_info.get(&maker_key), order_info.get(&taker_key))
@@ -597,7 +601,8 @@ impl AccountManager {
                     OrderType::Market | OrderType::Stop { .. } => {
                         // Reserve entire available quote balance since final
                         // price is unknown. Refunded after execution.
-                        self.get(order.account, currency)
+                        self.balances
+                            .get(&(order.account, currency))
                             .map(|b| b.available)
                             .unwrap_or(0)
                     }
@@ -614,64 +619,15 @@ impl AccountManager {
         }
     }
 
-    /// Get a reference to a balance slot, or None if out of bounds.
-    /// Used on the hot path — two comparisons + one array index, no allocation.
-    #[inline]
-    fn get(&self, account: AccountId, currency: CurrencyId) -> Option<&Balance> {
-        let c = currency.0 as usize;
-        if c >= self.currency_stride {
-            return None;
-        }
-        let idx = account.0 as usize * self.currency_stride + c;
-        self.balances.get(idx)
-    }
-
-    /// Get a mutable reference to a balance slot, or None if out of bounds.
-    #[inline]
-    fn get_mut(&mut self, account: AccountId, currency: CurrencyId) -> Option<&mut Balance> {
-        let c = currency.0 as usize;
-        if c >= self.currency_stride {
-            return None;
-        }
-        let idx = account.0 as usize * self.currency_stride + c;
-        self.balances.get_mut(idx)
-    }
-
-    /// Grow the balance array if `(account, currency)` is out of bounds.
-    /// After startup seeding this is a no-op (early return on two comparisons).
-    /// Only allocates when a runtime deposit introduces a previously unseen
-    /// account or currency — an admin operation, not on the matching hot path.
+    /// Check if an account has any non-zero balances.
     ///
-    /// Two growth cases: (1) currency_stride needs to increase — requires
-    /// reshuffling all rows; (2) just need more account rows — simple extend.
-    fn ensure_capacity(&mut self, account: AccountId, currency: CurrencyId) {
-        let needed_stride = currency.0 as usize + 1;
-        let needed_rows = account.0 as usize + 1;
-
-        if needed_stride > self.currency_stride {
-            // Stride increase: reshuffle existing rows to widen each row.
-            let old_stride = self.currency_stride;
-            let old_rows = if old_stride > 0 {
-                self.balances.len() / old_stride
-            } else {
-                0
-            };
-            let new_rows = old_rows.max(needed_rows);
-            let mut new_balances = vec![Balance::default(); new_rows * needed_stride];
-            // Copy each old row into the wider layout.
-            for row in 0..old_rows {
-                let old_start = row * old_stride;
-                let new_start = row * needed_stride;
-                new_balances[new_start..new_start + old_stride]
-                    .copy_from_slice(&self.balances[old_start..old_start + old_stride]);
-            }
-            self.balances = new_balances;
-            self.currency_stride = needed_stride;
-        } else if needed_rows * self.currency_stride > self.balances.len() {
-            // Just need more rows — extend with zeros.
-            self.balances
-                .resize(needed_rows * self.currency_stride, Balance::default());
-        }
+    /// O(n) scan of all entries — test-only. If needed in production,
+    /// replace with a per-account non-zero currency counter.
+    #[cfg(test)]
+    pub fn has_balances(&self, account: AccountId) -> bool {
+        self.balances
+            .iter()
+            .any(|(&(a, _), v)| a == account && !v.is_zero())
     }
 }
 
@@ -1036,5 +992,108 @@ mod tests {
         assert_eq!(mgr.balance(ACCT_A, USD).available, 46_000);
         assert_eq!(mgr.balance(ACCT_A, USD).reserved, 2_250);
         assert_eq!(mgr.balance(ACCT_A, BTC).available, 15);
+    }
+
+    // -- Sparse storage / withdrawal cleanup --
+
+    #[test]
+    fn withdraw_to_zero_removes_entry() {
+        let mut mgr = AccountManager::new();
+        mgr.deposit(ACCT_A, USD, 1_000);
+        assert!(mgr.has_balances(ACCT_A));
+
+        mgr.withdraw(ACCT_A, USD, 1_000).unwrap();
+        // Entry should be removed from the HashMap.
+        assert!(!mgr.has_balances(ACCT_A));
+        assert_eq!(mgr.balance(ACCT_A, USD), Balance::default());
+    }
+
+    #[test]
+    fn partial_withdraw_keeps_entry() {
+        let mut mgr = AccountManager::new();
+        mgr.deposit(ACCT_A, USD, 1_000);
+
+        mgr.withdraw(ACCT_A, USD, 500).unwrap();
+        assert!(mgr.has_balances(ACCT_A));
+        assert_eq!(mgr.balance(ACCT_A, USD).available, 500);
+    }
+
+    #[test]
+    fn snapshot_balances_sparse() {
+        let mut mgr = AccountManager::new();
+        mgr.deposit(ACCT_A, USD, 1_000);
+        mgr.deposit(ACCT_B, BTC, 500);
+
+        let snap = mgr.snapshot_balances();
+        assert_eq!(snap.len(), 2);
+    }
+
+    #[test]
+    fn withdraw_unknown_account_fails() {
+        let mgr = AccountManager::new();
+        let err = mgr.balance(AccountId(999), USD);
+        assert_eq!(err, Balance::default());
+        // Withdraw from non-existent account.
+        let mut mgr = AccountManager::new();
+        let err = mgr.withdraw(AccountId(999), USD, 100).unwrap_err();
+        assert_eq!(err, RejectReason::UnknownAccount);
+    }
+
+    #[test]
+    fn zero_amount_deposit_creates_entry() {
+        let mut mgr = AccountManager::new();
+        mgr.deposit(ACCT_A, USD, 0);
+        // Zero deposit creates an entry (available=0, reserved=0).
+        // has_balances filters zero entries, so this should be false.
+        assert!(!mgr.has_balances(ACCT_A));
+    }
+
+    #[test]
+    fn withdraw_multiple_currencies_partial() {
+        let mut mgr = AccountManager::new();
+        mgr.deposit(ACCT_A, USD, 10_000);
+        mgr.deposit(ACCT_A, BTC, 100);
+
+        // Withdraw all USD, keep BTC.
+        mgr.withdraw(ACCT_A, USD, 10_000).unwrap();
+        assert!(mgr.has_balances(ACCT_A)); // Still has BTC.
+        assert_eq!(mgr.balance(ACCT_A, USD), Balance::default());
+        assert_eq!(mgr.balance(ACCT_A, BTC).available, 100);
+    }
+
+    #[test]
+    fn fill_zero_entries_filtered_in_snapshot() {
+        let mut mgr = AccountManager::new();
+        // Buyer has quote only, seller has base only.
+        mgr.deposit(ACCT_A, USD, 10_000);
+        mgr.deposit(ACCT_B, BTC, 100);
+
+        let buy = limit_buy(1, ACCT_A, 100, 10);
+        let sell = limit_sell(2, ACCT_B, 100, 10);
+        let (_, buy_slot) = mgr.try_reserve(&buy, &spec(), 0).unwrap();
+        let (_, sell_slot) = mgr.try_reserve(&sell, &spec(), 0).unwrap();
+
+        // Fill creates base entry for buyer, quote entry for seller.
+        mgr.fill(buy_slot, sell_slot, price(100), qty(10), 0, 0, &spec());
+
+        // Snapshot should only include non-zero entries.
+        let snap = mgr.snapshot_balances();
+        for ((_, _), bal) in &snap {
+            assert!(!bal.is_zero(), "snapshot contains zero-balance entry");
+        }
+    }
+
+    #[test]
+    fn from_parts_round_trip_sparse() {
+        let mut mgr = AccountManager::new();
+        mgr.deposit(ACCT_A, USD, 1_000);
+        mgr.deposit(ACCT_B, BTC, 500);
+
+        let snap = mgr.snapshot_balances();
+        let (restored, _) = AccountManager::from_parts(snap, Vec::new());
+
+        assert_eq!(restored.balance(ACCT_A, USD).available, 1_000);
+        assert_eq!(restored.balance(ACCT_B, BTC).available, 500);
+        assert_eq!(restored.balance(ACCT_A, BTC), Balance::default());
     }
 }

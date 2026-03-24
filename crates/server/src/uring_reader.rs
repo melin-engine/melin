@@ -737,6 +737,15 @@ fn request_to_event(request: &Request) -> JournalEvent {
             currency,
             amount,
         },
+        Request::Withdraw {
+            account,
+            currency,
+            amount,
+        } => JournalEvent::Withdraw {
+            account,
+            currency,
+            amount,
+        },
         Request::SetRiskLimits { symbol, limits } => JournalEvent::SetRiskLimits { symbol, limits },
         Request::SetCircuitBreaker { symbol, config } => {
             JournalEvent::SetCircuitBreaker { symbol, config }

@@ -1056,6 +1056,13 @@ impl MatchingStage {
             JournalEvent::ProvisionAccount { account, amount } => {
                 self.exchange.provision_account(account, amount);
             }
+            JournalEvent::Withdraw {
+                account,
+                currency,
+                amount,
+            } => {
+                let _ = self.exchange.withdraw(account, currency, amount);
+            }
             JournalEvent::QueryStats => {
                 // Handled inline in the run loop before process_event is called.
                 // This arm exists only for exhaustiveness.
