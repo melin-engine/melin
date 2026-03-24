@@ -308,14 +308,6 @@ LAN round-trip benchmarks at [`ed9241d`](../../commit/ed9241d). Two or three Che
 
 ![Latency CDF](docs/plots/latency-cdf.svg)
 
-**Throughput vs. window depth** (fsync mode, 16 clients, 10M orders per point):
-
-![Saturation — window](docs/plots/saturation-window.svg)
-
-**Latency vs. client count** (fsync mode, constant 4096 total in-flight, 10M orders per point):
-
-![Saturation — clients](docs/plots/saturation-clients.svg)
-
 **Latency stability over time** (p99.99):
 
 ![Latency stability — fsync](docs/plots/latency-stability-fsync.svg)
