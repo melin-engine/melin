@@ -26,7 +26,9 @@
 #   RUN_FSYNC=0|1        Peak throughput with full durability
 #   RUN_NOPERSIST=0|1    Peak throughput without persistence
 #   RUN_SINGLE=0|1       Single-order latency
-#   RUN_SWEEPS=0|1       Parameter sweeps (window, instruments)
+#   RUN_SWEEPS=0|1       Parameter sweeps (window, clients)
+#   RUN_SWEEP_INSTRUMENTS=0|1  Instrument count sweep (default: off)
+#   RUN_SWEEP_ACCOUNTS=0|1    Account count sweep (default: off)
 #   RUN_REPLICATION=0|1  Synchronous replication benchmark
 #   RUN_PLOTS=0|1        Generate plots from results
 #   BENCH_BRANCH=<ref>   Checkout a specific branch on all machines
@@ -57,6 +59,8 @@ RUN_NOPERSIST="${RUN_NOPERSIST:-1}"
 RUN_SINGLE="${RUN_SINGLE:-1}"
 RUN_PIPELINE="${RUN_PIPELINE:-0}"
 RUN_SWEEPS="${RUN_SWEEPS:-1}"
+RUN_SWEEP_INSTRUMENTS="${RUN_SWEEP_INSTRUMENTS:-0}"
+RUN_SWEEP_ACCOUNTS="${RUN_SWEEP_ACCOUNTS:-0}"
 RUN_REPLICATION="${RUN_REPLICATION:-1}"
 RUN_PLOTS="${RUN_PLOTS:-1}"
 
@@ -309,6 +313,7 @@ run_sweep "clients" \
     "c1024:--clients 1024 --window 4"
 
 # 4c. Instruments sweep (fixed clients=16, window=128)
+if [[ "$RUN_SWEEP_INSTRUMENTS" == "1" ]]; then
 INST_SWEEP_DIR="${RESULTS_DIR}/sweep-instruments"
 mkdir -p "${INST_SWEEP_DIR}"
 echo ""
@@ -326,10 +331,12 @@ for inst in 10 100 1000; do
     cp /tmp/lan-bench-results.json "${INST_SWEEP_DIR}/${label}.json" 2>/dev/null || true
     echo ""
 done
+fi
 
 # 4d. Account sweep (fixed clients=16, window=128)
 # Tests whether account count affects hot-path latency via cache pressure
-# on the flat balance array (account_id × stride × 16 bytes).
+# on the balance HashMap.
+if [[ "$RUN_SWEEP_ACCOUNTS" == "1" ]]; then
 ACCT_SWEEP_DIR="${RESULTS_DIR}/sweep-accounts"
 mkdir -p "${ACCT_SWEEP_DIR}"
 echo ""
@@ -347,6 +354,7 @@ for accts in 100000 1000000 10000000; do
     cp /tmp/lan-bench-results.json "${ACCT_SWEEP_DIR}/${label}.json" 2>/dev/null || true
     echo ""
 done
+fi
 
 fi
 
