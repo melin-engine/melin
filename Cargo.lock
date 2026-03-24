@@ -103,7 +103,7 @@ checksum = "7c02d123df017efcdfbd739ef81735b36c5ba83ec3c59c80a9d7ecc718f92e50"
 [[package]]
 name = "astenn"
 version = "0.1.0"
-source = "git+ssh://git@github.com/pierre-l/astenn.git#8ea3ac8ba4e34a91a4b1fed456d57e43454f9c6b"
+source = "git+ssh://git@github.com/pierre-l/astenn.git#870e7d01a05b08e28c28816183d2c165fef5d68b"
 
 [[package]]
 name = "autocfg"
