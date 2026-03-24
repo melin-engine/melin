@@ -233,74 +233,12 @@ crates/
 
 LAN round-trip benchmarks at [`ed9241d`](../../commit/ed9241d). Two or three Cherry AMD Ryzen 9 9950X servers (16C @ 4.3 GHz, SMT disabled, 96 GB 5600 MHz RAM, 2x 1TB NVMe, 10 Gbps). Engine on one server with journal on a dedicated NVMe disk, benchmark client on the second, replica on the third (replication only). TCP over private VLAN, IRQs pinned to core 0. [Realistic order flow](crates/bench/). Reproducible via `scripts/lan-bench-suite.sh`.
 
-### Headline numbers
-
-| Mode | Throughput | p50 | p99 | p99.9 | max |
-|------|-----------|-----|-----|-------|-----|
-| **Full durability** (fsync) | **8.1M orders/sec** | 439 µs | 569 µs | 636 µs | 1,017 µs |
-| **Synchronous replication** | **5.8M orders/sec** | 633 µs | 841 µs | 933 µs | 1,123 µs |
-| **Single-order latency** | 13.7K orders/sec | **72 µs** | 87 µs | 90 µs | 207 µs |
-| **No persistence** | **8.1M orders/sec** | 453 µs | 602 µs | 668 µs | 1,054 µs |
-
-### Peak-load throughput — full durability
-
-100M order pairs, 16 clients, 256 pipelined, `pwritev2` + `RWF_DSYNC` (FUA) journaling:
-
-| Metric | Value |
-|--------|-------|
-| **Throughput** | 8.1M orders/sec |
-| **p50** | 439 µs |
-| **p90** | 511 µs |
-| **p99** | 569 µs |
-| **p99.9** | 636 µs |
-| **p99.99** | 841 µs |
-| **p99.999** | 901 µs |
-| **max** | 1,017 µs |
-
-### Synchronous replication — full durability
-
-100M order pairs, 16 clients, 256 pipelined. Primary + replica, both with dedicated NVMe journals, ack-gated responses (zero data loss):
-
-| Metric | Value |
-|--------|-------|
-| **Throughput** | 5.8M orders/sec |
-| **p50** | 633 µs |
-| **p90** | 745 µs |
-| **p99** | 841 µs |
-| **p99.9** | 933 µs |
-| **p99.99** | 991 µs |
-| **p99.999** | 1,065 µs |
-| **max** | 1,123 µs |
-
-### Single-order latency — full durability
-
-500K order pairs, 1 client, no pipelining (window=1):
-
-| Metric | Value |
-|--------|-------|
-| **Throughput** | 13.7K orders/sec |
-| **p50** | 72 µs |
-| **p90** | 73 µs |
-| **p99** | 87 µs |
-| **p99.9** | 90 µs |
-| **p99.99** | 99 µs |
-| **p99.999** | 188 µs |
-| **max** | 207 µs |
-
-### Peak-load throughput — no persistence
-
-100M order pairs, 16 clients, 256 pipelined:
-
-| Metric | Value |
-|--------|-------|
-| **Throughput** | 8.1M orders/sec |
-| **p50** | 453 µs |
-| **p90** | 536 µs |
-| **p99** | 602 µs |
-| **p99.9** | 668 µs |
-| **p99.99** | 871 µs |
-| **p99.999** | 921 µs |
-| **max** | 1,054 µs |
+| Mode | Throughput | p50 | p99 | p99.9 | max | Parameters |
+|------|-----------|-----|-----|-------|-----|------------|
+| **Full durability** (fsync) | **8.1M/s** | 439 µs | 569 µs | 636 µs | 1,017 µs | 100M pairs, 16 clients, window 256 |
+| **Synchronous replication** | **5.8M/s** | 633 µs | 841 µs | 933 µs | 1,123 µs | 100M pairs, 16 clients, window 256, primary+replica |
+| **Single-order latency** | 13.7K/s | **72 µs** | 87 µs | 90 µs | 207 µs | 500K pairs, 1 client, window 1 |
+| **No persistence** | **8.1M/s** | 453 µs | 602 µs | 668 µs | 1,054 µs | 100M pairs, 16 clients, window 256 |
 
 ### Plots
 
