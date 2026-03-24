@@ -332,7 +332,7 @@ fn plot_latency_cdf(results: &[LoadedResult], output: &PathBuf) {
             .filter_map(|(pct, val)| {
                 PERCENTILES
                     .iter()
-                    .position(|&(_, _, p)| (p - pct).abs() < 0.0001)
+                    .position(|&(_, _, p)| (p - pct).abs() < 0.000001)
                     .map(|idx| (idx, *val))
             })
             .collect();
