@@ -316,15 +316,7 @@ LAN round-trip benchmarks at [`ed9241d`](../../commit/ed9241d). Two or three Che
 
 ![Saturation — clients](docs/plots/saturation-clients.svg)
 
-**Throughput vs. instrument count** (fsync mode, 16 clients, window 128):
-
-![Saturation — instruments](docs/plots/saturation-instruments.svg)
-
-**Throughput vs. account count** (fsync mode, 16 clients, window 128):
-
-![Saturation — accounts](docs/plots/saturation-accounts.svg)
-
-**Latency stability over time** (fsync and replication modes):
+**Latency stability over time**:
 
 ![Latency stability](docs/plots/latency-stability.svg)
 
