@@ -851,32 +851,19 @@ fn plot_stability(results: &[(TimeSeriesResult, String)], output: &PathBuf) {
         let mode = mode_from_filename(filename);
         let tp = format_throughput(result.throughput_ops);
 
-        // p99 line.
-        let p99_points: Vec<(f64, f64)> = result
-            .time_series
-            .iter()
-            .map(|p| (p.elapsed_secs, p.p99_us))
-            .collect();
-        chart
-            .draw_series(LineSeries::new(p99_points, color.stroke_width(2)))
-            .unwrap()
-            .label(format!("{mode} p99 ({tp})"))
-            .legend(move |(x, y)| {
-                PathElement::new(vec![(x, y), (x + 20, y)], color.stroke_width(2))
-            });
-
-        // p99.9 line (dashed via thinner stroke).
+        // p99.9 line — one line per mode keeps the chart readable
+        // with 3+ runs (fsync, no-persist, replication).
         let p999_points: Vec<(f64, f64)> = result
             .time_series
             .iter()
             .map(|p| (p.elapsed_secs, p.p999_us))
             .collect();
         chart
-            .draw_series(LineSeries::new(p999_points, color.stroke_width(1)))
+            .draw_series(LineSeries::new(p999_points, color.stroke_width(2)))
             .unwrap()
-            .label(format!("{mode} p99.9"))
+            .label(format!("{mode} p99.9 ({tp})"))
             .legend(move |(x, y)| {
-                PathElement::new(vec![(x, y), (x + 20, y)], color.stroke_width(1))
+                PathElement::new(vec![(x, y), (x + 20, y)], color.stroke_width(2))
             });
     }
 
