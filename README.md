@@ -231,17 +231,16 @@ crates/
 
 ## Performance
 
-LAN round-trip benchmarks at [`4109456`](../../commit/4109456). Two or three Cherry AMD Ryzen 9 9900X servers (12C @ 4.4 GHz, SMT disabled, 96 GB 5600 MHz RAM, 2x 1TB NVMe, 10 Gbps). Engine on one server with journal on a dedicated NVMe disk, benchmark client on the second, replica on the third (replication only). TCP over private VLAN, IRQs pinned to core 0. [Realistic order flow](crates/bench/). Reproducible via `scripts/lan-bench-suite.sh`.
+LAN round-trip benchmarks at [`ed9241d`](../../commit/ed9241d). Two or three Cherry AMD Ryzen 9 9950X servers (16C @ 4.3 GHz, SMT disabled, 96 GB 5600 MHz RAM, 2x 1TB NVMe, 10 Gbps). Engine on one server with journal on a dedicated NVMe disk, benchmark client on the second, replica on the third (replication only). TCP over private VLAN, IRQs pinned to core 0. [Realistic order flow](crates/bench/). Reproducible via `scripts/lan-bench-suite.sh`.
 
 ### Headline numbers
 
 | Mode | Throughput | p50 | p99 | p99.9 | max |
 |------|-----------|-----|-----|-------|-----|
-| **Full durability** (fsync) | **8.1M orders/sec** | 440 µs | 549 µs | 593 µs | 1,560 µs |
-| **Synchronous replication** | **6.7M orders/sec** | 555 µs | 683 µs | 737 µs | 1,614 µs |
-| **Single-order latency** | 14.7K orders/sec | **68 µs** | 80 µs | 83 µs | 1,254 µs |
-| **No persistence** | **11.1M orders/sec** | 665 µs | 887 µs | 912 µs | 2,046 µs |
-| **Engine only** | **12.9M orders/sec** | 0.05 µs | 0.20 µs | 0.47 µs | 400 µs |
+| **Full durability** (fsync) | **8.1M orders/sec** | 439 µs | 569 µs | 636 µs | 1,017 µs |
+| **Synchronous replication** | **5.8M orders/sec** | 633 µs | 841 µs | 933 µs | 1,123 µs |
+| **Single-order latency** | 13.7K orders/sec | **72 µs** | 87 µs | 90 µs | 207 µs |
+| **No persistence** | **8.1M orders/sec** | 453 µs | 602 µs | 668 µs | 1,054 µs |
 
 ### Peak-load throughput — full durability
 
@@ -250,13 +249,13 @@ LAN round-trip benchmarks at [`4109456`](../../commit/4109456). Two or three Che
 | Metric | Value |
 |--------|-------|
 | **Throughput** | 8.1M orders/sec |
-| **p50** | 440 µs |
-| **p90** | 477 µs |
-| **p99** | 549 µs |
-| **p99.9** | 593 µs |
-| **p99.99** | 624 µs |
-| **p99.999** | 1,463 µs |
-| **max** | 1,560 µs |
+| **p50** | 439 µs |
+| **p90** | 511 µs |
+| **p99** | 569 µs |
+| **p99.9** | 636 µs |
+| **p99.99** | 841 µs |
+| **p99.999** | 901 µs |
+| **max** | 1,017 µs |
 
 ### Synchronous replication — full durability
 
@@ -264,14 +263,14 @@ LAN round-trip benchmarks at [`4109456`](../../commit/4109456). Two or three Che
 
 | Metric | Value |
 |--------|-------|
-| **Throughput** | 6.7M orders/sec |
-| **p50** | 555 µs |
-| **p90** | 600 µs |
-| **p99** | 683 µs |
-| **p99.9** | 737 µs |
-| **p99.99** | 830 µs |
-| **p99.999** | 1,543 µs |
-| **max** | 1,614 µs |
+| **Throughput** | 5.8M orders/sec |
+| **p50** | 633 µs |
+| **p90** | 745 µs |
+| **p99** | 841 µs |
+| **p99.9** | 933 µs |
+| **p99.99** | 991 µs |
+| **p99.999** | 1,065 µs |
+| **max** | 1,123 µs |
 
 ### Single-order latency — full durability
 
@@ -279,29 +278,29 @@ LAN round-trip benchmarks at [`4109456`](../../commit/4109456). Two or three Che
 
 | Metric | Value |
 |--------|-------|
-| **Throughput** | 14.7K orders/sec |
-| **p50** | 68 µs |
-| **p90** | 68 µs |
-| **p99** | 80 µs |
-| **p99.9** | 83 µs |
-| **p99.99** | 92 µs |
-| **p99.999** | 177 µs |
-| **max** | 1,254 µs |
+| **Throughput** | 13.7K orders/sec |
+| **p50** | 72 µs |
+| **p90** | 73 µs |
+| **p99** | 87 µs |
+| **p99.9** | 90 µs |
+| **p99.99** | 99 µs |
+| **p99.999** | 188 µs |
+| **max** | 207 µs |
 
 ### Peak-load throughput — no persistence
 
-250M order pairs, 16 clients, 512 pipelined:
+100M order pairs, 16 clients, 256 pipelined:
 
 | Metric | Value |
 |--------|-------|
-| **Throughput** | 11.1M orders/sec |
-| **p50** | 665 µs |
-| **p90** | 773 µs |
-| **p99** | 887 µs |
-| **p99.9** | 912 µs |
-| **p99.99** | 1,017 µs |
-| **p99.999** | 1,849 µs |
-| **max** | 2,046 µs |
+| **Throughput** | 8.1M orders/sec |
+| **p50** | 453 µs |
+| **p90** | 536 µs |
+| **p99** | 602 µs |
+| **p99.9** | 668 µs |
+| **p99.99** | 871 µs |
+| **p99.999** | 921 µs |
+| **max** | 1,054 µs |
 
 ### Plots
 
