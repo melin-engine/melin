@@ -1,6 +1,8 @@
 # CLAUDE.md
 
 > **This file must be kept up to date** as the project evolves — update structure, dependencies, and conventions whenever they change.
+>
+> **TODO**: Clean up this file once the sparse accounts feature (branch `feat/sparse-accounts`) is fully landed — update performance profile numbers with the HashMap overhead, verify the Dead Ends section doesn't reference flat Vec assumptions.
 
 ## Project
 
@@ -159,9 +161,9 @@ Options 2-5 are mutually exclusive kernel bypass paths (pick one). See README Pe
 
 ### `crates/engine/` — matching engine and event sourcing
 - `src/types.rs` — core types (OrderId, AccountId, CurrencyId, Price, Quantity, Order, ExecutionReport, InstrumentSpec, CircuitBreakerConfig, FeeSchedule, etc.)
-- `src/account.rs` — account balance management (flat `Vec<Balance>` indexed by `account_id * stride + currency_id` for O(1) lookups; deposit, withdraw, reserve, fill, release). Reservation slab (`Vec<Reservation>` + free list) for O(1) indexed access. `ReservationSlot` and `OrderInfo` types.
+- `src/account.rs` — account balance management (sparse `FxHashMap<(AccountId, CurrencyId), Balance>` — only non-zero balances consume memory; deposit, withdraw, reserve, fill, release). Reservation slab (`Vec<Reservation>` + free list) for O(1) indexed access. `ReservationSlot` and `OrderInfo` types. See [docs/account-lifecycle.md](docs/account-lifecycle.md).
 - `src/orderbook.rs` — order book with price-time priority matching and stop trigger logic. Price levels use sorted `Vec` with binary search (not BTreeMap) for cache locality. Order/stop indices use `FxHashMap` (rustc-hash).
-- `src/exchange.rs` — multi-instrument dispatcher with integrated balance validation, fee computation, cancel-replace. Instruments stored in flat `Vec<Option<Box<InstrumentState>>>` indexed by `Symbol.0` (no hashing). `max_order_id` is flat `Vec<u64>` indexed by `AccountId.0`.
+- `src/exchange.rs` — multi-instrument dispatcher with integrated balance validation, fee computation, cancel-replace, withdraw. Instruments stored in flat `Vec<Option<Box<InstrumentState>>>` indexed by `Symbol.0` (no hashing). `max_order_id` and `order_counts` are sparse `FxHashMap` (never evicted for HWM safety).
 - `src/journal/` — durable write-ahead log for event sourcing and crash recovery
   - `event.rs` — `JournalEvent` enum (input commands only)
   - `codec.rs` — binary encode/decode with CRC32C checksums

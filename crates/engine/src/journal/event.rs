@@ -36,6 +36,15 @@ pub enum JournalEvent {
     /// Cancel all resting orders and pending stops for an account
     /// across all instruments (kill switch).
     CancelAll { account: AccountId },
+    /// Debit available funds from an account. Rejects if the account has
+    /// resting orders (must CancelAll first) or insufficient balance.
+    /// Removes the balance entry when it reaches zero (memory cleanup
+    /// for the sparse account storage model).
+    Withdraw {
+        account: AccountId,
+        currency: CurrencyId,
+        amount: u64,
+    },
     /// Set circuit breaker configuration for an instrument.
     SetCircuitBreaker {
         symbol: Symbol,

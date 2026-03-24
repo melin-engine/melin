@@ -53,6 +53,14 @@ pub enum Request {
         currency: CurrencyId,
         amount: u64,
     },
+    /// Debit available funds from an account. Rejects if the account
+    /// has resting orders (must CancelAll first) or insufficient balance.
+    /// Removes the balance entry when it reaches zero.
+    Withdraw {
+        account: AccountId,
+        currency: CurrencyId,
+        amount: u64,
+    },
     /// Set or update fat-finger risk limits for an instrument.
     /// `None` fields clear the corresponding limit.
     SetRiskLimits { symbol: Symbol, limits: RiskLimits },
@@ -97,6 +105,7 @@ impl Request {
             self,
             Request::AddInstrument { .. }
                 | Request::Deposit { .. }
+                | Request::Withdraw { .. }
                 | Request::SetRiskLimits { .. }
                 | Request::SetCircuitBreaker { .. }
                 | Request::SetFeeSchedule { .. }

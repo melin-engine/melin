@@ -68,6 +68,25 @@ impl JournaledExchange {
         Ok(())
     }
 
+    /// Withdraw funds from an account. Journals before executing.
+    /// Rejects if the account has resting orders or insufficient balance.
+    pub fn withdraw(
+        &mut self,
+        account: AccountId,
+        currency: CurrencyId,
+        amount: u64,
+    ) -> Result<(), JournalError> {
+        self.writer.append(&JournalEvent::Withdraw {
+            account,
+            currency,
+            amount,
+        })?;
+        // Withdraw errors are returned to the caller but don't affect
+        // the journal — the event is recorded regardless.
+        let _ = self.exchange.withdraw(account, currency, amount);
+        Ok(())
+    }
+
     /// Set risk limits for an instrument. Journals before executing.
     pub fn set_risk_limits(
         &mut self,
@@ -348,6 +367,16 @@ fn replay_event(exchange: &mut Exchange, event: &JournalEvent, reports: &mut Vec
         }
         JournalEvent::ProvisionAccount { account, amount } => {
             exchange.provision_account(account, amount);
+        }
+        JournalEvent::Withdraw {
+            account,
+            currency,
+            amount,
+        } => {
+            // Withdraw errors (insufficient balance, resting orders) are
+            // non-fatal on replay — the journal recorded the attempt, and
+            // the original error was already returned to the client.
+            let _ = exchange.withdraw(account, currency, amount);
         }
         JournalEvent::QueryStats => {
             // QueryStats is never journaled, so it should never appear

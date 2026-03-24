@@ -302,6 +302,9 @@ pub enum RejectReason {
     PriceWouldCross,
     /// Post-only order would immediately match against resting liquidity.
     PostOnlyWouldCross,
+    /// Withdrawal rejected because the account has resting orders.
+    /// Must CancelAll first.
+    HasRestingOrders,
 }
 
 #[cfg(test)]

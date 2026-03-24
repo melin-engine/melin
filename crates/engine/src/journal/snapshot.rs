@@ -1105,16 +1105,13 @@ impl Exchange {
             }
         }
 
-        // Build flat Vec indexed by AccountId.0.
-        let max_acct = state
-            .max_order_id
-            .iter()
-            .map(|(a, _)| a.0 as usize)
-            .max()
-            .unwrap_or(0);
-        let mut max_order_id = vec![0u64; max_acct + 1];
+        // Build sparse HashMap from snapshot entries.
+        let mut max_order_id = rustc_hash::FxHashMap::with_capacity_and_hasher(
+            state.max_order_id.len(),
+            Default::default(),
+        );
         for (account, hwm) in state.max_order_id {
-            max_order_id[account.0 as usize] = hwm;
+            max_order_id.insert(account, hwm);
         }
 
         Self::from_parts(instruments, accounts, order_info, max_order_id)

@@ -41,6 +41,7 @@ const TAG_SET_CIRCUIT_BREAKER: u8 = 9;
 const TAG_CANCEL_REPLACE: u8 = 10;
 const TAG_SET_FEE_SCHEDULE: u8 = 31;
 const TAG_QUERY_STATS: u8 = 30;
+const TAG_WITHDRAW: u8 = 32;
 
 // --- Response tags ---
 const TAG_PLACED: u8 = 11;
@@ -79,6 +80,7 @@ const REJECT_OUTSIDE_PRICE_BAND: u8 = 10;
 const REJECT_UNKNOWN_ORDER: u8 = 11;
 const REJECT_PRICE_WOULD_CROSS: u8 = 12;
 const REJECT_POST_ONLY_WOULD_CROSS: u8 = 13;
+const REJECT_HAS_RESTING_ORDERS: u8 = 14;
 
 /// Encode a request into `buf`. Returns total bytes written (length prefix + tag + payload).
 ///
@@ -146,6 +148,20 @@ pub fn encode_request(request: &Request, buf: &mut [u8]) -> Result<usize, Protoc
             amount,
         } => {
             buf[pos] = TAG_DEPOSIT;
+            pos += 1;
+            le::put_u32(&mut buf[pos..], account.0);
+            pos += 4;
+            le::put_u32(&mut buf[pos..], currency.0);
+            pos += 4;
+            le::put_u64(&mut buf[pos..], *amount);
+            pos += 8;
+        }
+        Request::Withdraw {
+            account,
+            currency,
+            amount,
+        } => {
+            buf[pos] = TAG_WITHDRAW;
             pos += 1;
             le::put_u32(&mut buf[pos..], account.0);
             pos += 4;
@@ -306,6 +322,16 @@ pub fn decode_request(buf: &[u8]) -> Result<Request, ProtocolError> {
                 return Err(ProtocolError::Truncated);
             }
             Ok(Request::Deposit {
+                account: AccountId(le::get_u32(&payload[0..])),
+                currency: CurrencyId(le::get_u32(&payload[4..])),
+                amount: le::get_u64(&payload[8..]),
+            })
+        }
+        TAG_WITHDRAW => {
+            if payload.len() < 16 {
+                return Err(ProtocolError::Truncated);
+            }
+            Ok(Request::Withdraw {
                 account: AccountId(le::get_u32(&payload[0..])),
                 currency: CurrencyId(le::get_u32(&payload[4..])),
                 amount: le::get_u64(&payload[8..]),
@@ -937,6 +963,7 @@ fn encode_reject_reason(reason: RejectReason) -> u8 {
         RejectReason::UnknownOrder => REJECT_UNKNOWN_ORDER,
         RejectReason::PriceWouldCross => REJECT_PRICE_WOULD_CROSS,
         RejectReason::PostOnlyWouldCross => REJECT_POST_ONLY_WOULD_CROSS,
+        RejectReason::HasRestingOrders => REJECT_HAS_RESTING_ORDERS,
     }
 }
 
@@ -956,6 +983,7 @@ fn decode_reject_reason(b: u8) -> Result<RejectReason, ProtocolError> {
         REJECT_UNKNOWN_ORDER => Ok(RejectReason::UnknownOrder),
         REJECT_PRICE_WOULD_CROSS => Ok(RejectReason::PriceWouldCross),
         REJECT_POST_ONLY_WOULD_CROSS => Ok(RejectReason::PostOnlyWouldCross),
+        REJECT_HAS_RESTING_ORDERS => Ok(RejectReason::HasRestingOrders),
         _ => Err(ProtocolError::InvalidField("reject reason")),
     }
 }
@@ -1051,6 +1079,11 @@ mod tests {
                 account: AccountId(1),
                 currency: CurrencyId(2),
                 amount: 1_000_000,
+            },
+            Request::Withdraw {
+                account: AccountId(1),
+                currency: CurrencyId(2),
+                amount: 500_000,
             },
             Request::SetRiskLimits {
                 symbol: Symbol(1),

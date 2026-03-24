@@ -943,6 +943,13 @@ fn replay_event(
         JournalEvent::ProvisionAccount { account, amount } => {
             exchange.provision_account(*account, *amount);
         }
+        JournalEvent::Withdraw {
+            account,
+            currency,
+            amount,
+        } => {
+            let _ = exchange.withdraw(*account, *currency, *amount);
+        }
         JournalEvent::QueryStats
         | JournalEvent::GenesisHash { .. }
         | JournalEvent::Checkpoint { .. } => {
