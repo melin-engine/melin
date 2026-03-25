@@ -200,11 +200,16 @@ impl BookSide {
     fn remove_with_account(
         &mut self,
         price: Price,
+        account: AccountId,
         order_id: OrderId,
     ) -> Option<(AccountId, Quantity)> {
         let idx = self.search(price).ok()?;
         let level = &mut self.levels[idx].1;
-        let pos = level.iter().position(|o| o.id == order_id)?;
+        // Match on both account and order_id — two accounts may have the
+        // same OrderId resting at the same price level.
+        let pos = level
+            .iter()
+            .position(|o| o.id == order_id && o.account == account)?;
         let order = level.remove(pos).expect("position was valid");
         if level.is_empty() {
             self.levels.remove(idx);
@@ -478,7 +483,9 @@ impl OrderBook {
             Side::Sell => &self.asks,
         };
         let level = book_side.get(price)?;
-        let order = level.iter().find(|o| o.id == order_id)?;
+        let order = level
+            .iter()
+            .find(|o| o.id == order_id && o.account == account)?;
         Some((side, price, order.remaining))
     }
 
@@ -518,7 +525,9 @@ impl OrderBook {
         if old_price == new_price {
             // Same price level — check if we can keep time priority.
             let level = book_side.get_mut(old_price)?;
-            let pos = level.iter().position(|o| o.id == order_id)?;
+            let pos = level
+                .iter()
+                .position(|o| o.id == order_id && o.account == account)?;
             let old_remaining = level[pos].remaining;
 
             if new_quantity <= old_remaining {
@@ -536,7 +545,9 @@ impl OrderBook {
             // Manipulate the VecDeque directly to preserve the RestingOrder
             // (including account), since BookSide::remove only returns Quantity.
             let old_level = book_side.get_mut(old_price)?;
-            let pos = old_level.iter().position(|o| o.id == order_id)?;
+            let pos = old_level
+                .iter()
+                .position(|o| o.id == order_id && o.account == account)?;
             let mut order = old_level.remove(pos).expect("position was valid");
             let old_remaining = order.remaining;
             order.remaining = new_quantity;
@@ -597,7 +608,9 @@ impl OrderBook {
                 Side::Buy => &mut self.bids,
                 Side::Sell => &mut self.asks,
             };
-            if let Some((_acct, remaining)) = book_side.remove_with_account(price, order_id) {
+            if let Some((_acct, remaining)) =
+                book_side.remove_with_account(price, account, order_id)
+            {
                 reports.push(ExecutionReport::Cancelled {
                     order_id,
                     account,
@@ -614,7 +627,9 @@ impl OrderBook {
                 Side::Sell => &mut self.stop_sells,
             };
             if let Some(level) = stops.get_mut(&trigger_price)
-                && let Some(pos) = level.iter().position(|s| s.id == order_id)
+                && let Some(pos) = level
+                    .iter()
+                    .position(|s| s.id == order_id && s.account == account)
             {
                 let stop = level.remove(pos);
                 if level.is_empty() {
