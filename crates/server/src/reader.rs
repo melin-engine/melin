@@ -318,6 +318,7 @@ fn epoll_reader_loop<R: AsRawFd>(
                 process_connection(
                     conn,
                     &producer,
+                    &server_busy_frame,
                     batch_now,
                     #[cfg(feature = "latency-trace")]
                     &mut publish_hist,
@@ -445,6 +446,7 @@ fn remove_connection<R>(
 fn process_connection<R>(
     conn: &mut ConnectionState<R>,
     producer: &ring::MultiProducer<InputSlot>,
+    server_busy_frame: &[u8; 5],
     now: Instant,
     #[cfg(feature = "latency-trace")]
     publish_hist: &mut melin_engine::journal::trace::StageHistogram,
@@ -575,7 +577,7 @@ fn process_connection<R>(
                         // Stop draining this connection for this epoll round.
                         // Remaining bytes stay in the kernel recv buffer; epoll
                         // edge-trigger will re-fire on the next recv.
-                        break;
+                        return false;
                     }
 
                     #[cfg(feature = "latency-trace")]
@@ -688,5 +690,59 @@ fn request_to_event(request: &Request) -> JournalEvent {
         Request::Heartbeat | Request::ChallengeResponse { .. } => {
             unreachable!("heartbeats and auth messages filtered before request_to_event")
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use melin_engine::journal::pipeline::InputSlot;
+    use melin_engine::journal::trace::trace_ts;
+
+    /// Verify the pre-encoded ServerBusy frame decodes to the correct response.
+    #[test]
+    fn server_busy_frame_round_trip() {
+        let mut buf = [0u8; 8];
+        let n = codec::encode_response(
+            &melin_protocol::message::ResponseKind::ServerBusy,
+            &mut buf,
+        )
+        .expect("encode ServerBusy");
+        // 4-byte length prefix + 1-byte tag = 5 bytes.
+        assert_eq!(n, 5);
+
+        // Decode the payload (after the 4-byte length prefix).
+        let decoded = codec::decode_response(&buf[4..n]).expect("decode ServerBusy");
+        assert!(matches!(
+            decoded,
+            melin_protocol::message::ResponseKind::ServerBusy
+        ));
+    }
+
+    /// When the disruptor ring is full, try_publish must return Err(Full)
+    /// so the reader can send ServerBusy instead of spinning.
+    #[test]
+    fn try_publish_returns_full_when_ring_exhausted() {
+        // Smallest power-of-two ring: 2 slots, 1 consumer.
+        let (producer, mut consumers) = ring::DisruptorBuilder::<InputSlot>::new(2)
+            .add_consumer()
+            .build_multi_producer();
+        let _consumer = consumers.pop().unwrap();
+
+        let slot = InputSlot {
+            connection_id: 0,
+            key_hash: 0,
+            request_seq: 0,
+            event: melin_engine::journal::event::JournalEvent::QueryStats,
+            publish_ts: trace_ts(),
+            recv_ts: trace_ts(),
+        };
+
+        // Fill both slots.
+        assert!(producer.try_publish(slot).is_ok());
+        assert!(producer.try_publish(slot).is_ok());
+
+        // Third publish must fail — ring is full, consumer hasn't advanced.
+        assert!(producer.try_publish(slot).is_err());
     }
 }
