@@ -35,19 +35,34 @@ The server uses jemalloc by default (thread-local caches eliminate allocator loc
 | Flag | Default | Description |
 |------|---------|-------------|
 | `--bind` | `127.0.0.1:9876` | TCP address to bind. Use `0.0.0.0:9876` for LAN access. |
-| `--journal` | `melin.journal` | Path to the journal file. Use a dedicated NVMe for best latency. |
+| `--journal` | `trading.journal` | Path to the journal file. Use a dedicated NVMe for best latency. |
 | `--snapshot` | (derived) | Path to the snapshot file. If omitted, defaults to `<journal>.snapshot` (e.g., `trading.snapshot`). |
-| `--authorized-keys` | `authorized_keys` | Path to the Ed25519 authorized keys file. Every connection must authenticate before trading. |
+| `--authorized-keys` | `authorized_keys` | Path to the Ed25519 authorized keys file. Every connection must authenticate before trading. Ignored in replica mode (`--replica-of`). |
 | `--cores` | `1,2,3,6` | Pipeline core IDs: `journal,matching,response,repl-sender` (comma-separated). Core 0 should be reserved for OS/IRQ. |
 | `--readers` | `2` | Number of epoll reader threads. Each multiplexes connections via epoll. |
 | `--reader-cores` | `4` | First CPU core for reader threads. Reader thread `i` is pinned to core `reader_cores + i`. |
 | `--max-journal-mib` | `256` | Maximum journal size in MiB before automatic rotation at startup. Set to `0` to disable. |
+| `--max-journal-batch` | `4096` | Maximum events per journal fsync batch. Smaller values reduce tail latency; larger values improve throughput. |
 | `--group-commit-us` | `0` | Group commit coalescing delay in microseconds. Keep at `0` for TCP transport. Only useful with UDS (see CLAUDE.md). |
-| `--accounts` | `2` | Number of test accounts to seed on first startup (fresh journal only). |
-| `--instruments` | `2` | Number of test instruments to seed on first startup (fresh journal only). |
+| `--accounts` | `100000` | Number of accounts to seed on first startup (fresh journal only). |
+| `--instruments` | `100` | Number of instruments to seed on first startup (fresh journal only). |
 | `--heartbeat-interval-secs` | `10` | Seconds between heartbeats to idle connections. `0` to disable. |
 | `--connection-timeout-secs` | `30` | Seconds before disconnecting silent clients. `0` to disable. |
 | `--max-connections` | `1024` | Maximum concurrent authenticated connections. `0` for unlimited. Rejects new connections at the limit. |
+| `--yield-idle` | `false` | Yield to OS scheduler when pipeline threads are idle instead of busy-spinning. Use on shared machines without isolated cores. |
+
+#### Replication Flags
+
+The server supports synchronous replication. Exactly one of `--replication-bind`, `--standalone`, or `--replica-of` determines the replication mode. If none is specified, the server runs in implicit standalone mode (replication cursor at `u64::MAX`, responses gated only by the journal).
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--replication-bind` | (none) | Address to listen for replica connections (enables primary mode with synchronous replication). |
+| `--standalone` | `false` | Disable replication entirely (dev/test). Sets the replication cursor to `u64::MAX` so responses are gated only by the journal. |
+| `--replica-of` | (none) | Run as a replica connected to the given primary address. The server does not accept client connections in this mode. |
+| `--replication-batch-size` | `32` | Maximum replication ring batches to coalesce into a single TCP write+flush. Higher values reduce syscall overhead but increase per-write latency. |
+| `--replication-heartbeat-secs` | `5` | Seconds between primary-to-replica heartbeats. Used for disconnect detection. |
+| `--replication-ring-size` | `64` | Slots in the replication ring buffer (must be power of two). Each slot holds up to 512 KiB. More slots = more buffering before the journal stage backpressures. Default: 64 (32 MiB). |
 
 ### Startup Sequence
 
@@ -60,17 +75,39 @@ The server uses jemalloc by default (thread-local caches eliminate allocator loc
 7. Set listener to non-blocking mode.
 8. Enter accept loop, authenticating connections via Ed25519 challenge-response.
 
-### Minimal Production Launch
+### Minimal Production Launch (Standalone)
 
 ```sh
 ./target/release/melin-server \
     --bind 0.0.0.0:9876 \
-    --journal /mnt/nvme/melin.journal \
+    --journal /mnt/nvme/trading.journal \
     --authorized-keys /etc/trading/authorized_keys \
     --cores 1,2,3,6 \
     --readers 2 \
     --reader-cores 4 \
-    --max-journal-mib 512
+    --max-journal-mib 512 \
+    --standalone
+```
+
+### Production Launch with Replication
+
+```sh
+# Primary
+./target/release/melin-server \
+    --bind 0.0.0.0:9876 \
+    --journal /mnt/nvme/trading.journal \
+    --authorized-keys /etc/trading/authorized_keys \
+    --cores 1,2,3,6 \
+    --readers 2 \
+    --reader-cores 4 \
+    --max-journal-mib 512 \
+    --replication-bind 0.0.0.0:9877
+
+# Replica (separate machine)
+./target/release/melin-server \
+    --journal /mnt/nvme/trading.journal \
+    --cores 1,2,3,6 \
+    --replica-of <primary-ip>:9877
 ```
 
 ---
@@ -118,7 +155,7 @@ Rotation is triggered at startup when the journal exceeds `--max-journal-mib` (d
 
 1. **Save snapshot**: Writes the full exchange state (accounts, order books, instruments, circuit breakers, risk limits) to the snapshot file. Written atomically via `.tmp` + rename.
 2. **Archive old journal**: Renames the current journal using a numeric suffix scheme:
-   - `melin.journal` becomes `melin.journal.1`
+   - `trading.journal` becomes `trading.journal.1`
    - Existing `.1` becomes `.2`, `.2` becomes `.3`, etc.
    - Renames happen in reverse order to avoid overwriting.
 3. **Create new journal**: Opens a fresh journal file continuing the sequence numbering and BLAKE3 hash chain from where the old journal left off.
@@ -126,10 +163,10 @@ Rotation is triggered at startup when the journal exceeds `--max-journal-mib` (d
 ### Archive Naming
 
 ```
-melin.journal      <-- current (active)
-melin.journal.1    <-- previous rotation
-melin.journal.2    <-- two rotations ago
-melin.journal.3    <-- three rotations ago
+trading.journal      <-- current (active)
+trading.journal.1    <-- previous rotation
+trading.journal.2    <-- two rotations ago
+trading.journal.3    <-- three rotations ago
 ...
 ```
 
@@ -145,7 +182,7 @@ The snapshot file is always overwritten on each rotation -- only the latest snap
 | 1M orders/sec | ~280 GiB | ~6.7 TiB | ~47 TiB |
 | 5M orders/sec | ~1.4 TiB | ~33 TiB | ~235 TiB |
 
-The journal writer pre-allocates in 64 MiB chunks (`posix_fallocate`) to avoid filesystem metadata overhead during writes. The on-disk file size will be larger than the valid data by up to one chunk.
+The journal writer pre-allocates in 256 MiB chunks (`posix_fallocate`) to avoid filesystem metadata overhead during writes. The chunk size matches the default rotation threshold so a freshly created journal never needs mid-run extension. The on-disk file size will be larger than the valid data by up to one chunk.
 
 **Action items**:
 
@@ -170,6 +207,18 @@ Examples:
 
 **Action**: Investigate immediately. These indicate hardware failure, bugs, or resource exhaustion.
 
+### `warn` -- Degraded operation
+
+Not a bug, but needs attention. The server is still running but operating in a degraded state.
+
+Examples:
+- `core pinning failed` -- thread affinity could not be applied (performance impact)
+- `connection rejected: max_connections reached` -- at the connection limit, new clients turned away
+- `replica disconnected` -- replication link lost, degraded to local-only durability
+- `replica connection error` -- replication connection failed
+
+**Action**: Investigate promptly. These indicate resource pressure or infrastructure issues that could escalate.
+
 ### `info` -- Server lifecycle events
 
 Normal operational events. Safe to monitor in production.
@@ -190,7 +239,6 @@ High-volume in production. Enable only for debugging specific issues.
 Examples:
 - `new connection` -- client connected
 - `authenticated` -- client passed auth
-- `connection rejected: max_connections reached` -- at limit
 - `auth failed, dropping` -- bad credentials
 - `failed to set auth timeout` -- socket option issue
 
@@ -204,7 +252,7 @@ RUST_LOG=info ./target/release/melin-server ...
 RUST_LOG=debug ./target/release/melin-server ...
 
 # Debugging specific crate:
-RUST_LOG=trading_server=debug,trading_engine=info ./target/release/melin-server ...
+RUST_LOG=melin_server=debug,melin_engine=info ./target/release/melin-server ...
 ```
 
 ---
@@ -317,6 +365,16 @@ QueryStats is not journaled (no state change) and does not affect the hot path. 
 ```sh
 melin-admin <server-addr> <admin-key-file>
 ```
+
+### Compile Features
+
+| Feature | Default | Description |
+|---------|---------|-------------|
+| `io-uring` | **yes** | Use io_uring for journal writes. Falls back to `pwritev2` if disabled. |
+| `pipeline-stats` | no | Per-stage busy/idle counters for bottleneck analysis. |
+| `latency-trace` | no | Per-stage HDR histograms (adds ~tens of ns overhead per event). |
+| `no-fsync` | no | Skip all fsync calls and journal-cursor gating. **Unsafe for production** — data may not survive crashes. Useful for benchmarking to isolate I/O cost. |
+| `no-persist` | no | Skip journal writes entirely. **Unsafe for production.** |
 
 ### Pipeline Stats Feature
 
@@ -472,7 +530,7 @@ The pipeline does **not** crash on journal I/O errors. The journal stage logs th
 For best journal performance, use an NVMe drive with:
 
 - **Power Loss Protection (PLP)**: Ensures FUA writes are truly durable. Without PLP, the drive's write cache may lie about durability.
-- **Dedicated journal disk**: Avoids contention with OS I/O. The journal writer uses `pwritev2` with `RWF_DSYNC` (FUA) which bypasses the page cache, but sharing the disk with other workloads increases p99 latency.
+- **Dedicated journal disk**: Avoids contention with OS I/O. The journal writer uses io_uring (default) or `pwritev2` with `RWF_DSYNC` (FUA) which bypasses the page cache, but sharing the disk with other workloads increases p99 latency.
 
 ---
 
@@ -487,7 +545,7 @@ Each journal entry is approximately **80 bytes** (20-byte header + variable payl
 - Deposit: ~30-40 bytes
 - Hash chain checkpoints: ~77 bytes, emitted every 100K events
 
-The journal writer pre-allocates in **64 MiB chunks**. The on-disk file size jumps in 64 MiB increments.
+The journal writer pre-allocates in **256 MiB chunks**. The on-disk file size jumps in 256 MiB increments.
 
 ### Snapshot Size
 
@@ -520,7 +578,7 @@ Total ring buffer memory: approximately **144 MiB**. This is fixed regardless of
 |-----------|----------|
 | Ring buffers | ~144 MiB |
 | Exchange state (order books, accounts) | 10-500 MiB (depends on active orders) |
-| Journal pre-allocation | 64 MiB chunk |
+| Journal pre-allocation | 256 MiB chunk |
 | Connection state | ~4 KiB per connection |
 | jemalloc overhead | ~10-50 MiB |
 | **Total (typical)** | **300-800 MiB** |
