@@ -361,11 +361,11 @@ else
 fi
 
 echo "  Building default (TCP + io_uring)..."
-run_as_user "source $USER_HOME/.cargo/env && cd $REPO_DIR && cargo build --release" 2>&1 | tail -3
+run_as_user "source $USER_HOME/.cargo/env && cd $REPO_DIR && CARGO_NET_GIT_FETCH_WITH_CLI=true cargo build --release" 2>&1 | tail -3
 echo "  Default build: OK"
 
 echo "  Building with --features no-persist,pipeline-stats..."
-run_as_user "source $USER_HOME/.cargo/env && cd $REPO_DIR && cargo build --release -p melin-server --features no-persist,pipeline-stats" 2>&1 | tail -3
+run_as_user "source $USER_HOME/.cargo/env && cd $REPO_DIR && CARGO_NET_GIT_FETCH_WITH_CLI=true cargo build --release -p melin-server --features no-persist,pipeline-stats" 2>&1 | tail -3
 echo "  Bench build: OK"
 
 echo ""
