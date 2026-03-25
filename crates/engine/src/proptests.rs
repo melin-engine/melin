@@ -651,8 +651,7 @@ fn run_exchange_actions(
                 );
             }
         }
-        // Uncomment for debugging reservation/order_sides leaks:
-        // assert_exchange_consistent(&exchange, action_idx, &format!("{:?}", action));
+        assert_exchange_consistent(&exchange, action_idx, &format!("{:?}", action));
     }
     (exchange, action_order_ids, all_reports, withdrawn)
 }
