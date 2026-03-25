@@ -267,6 +267,17 @@ fn uring_reader_loop<R: AsRawFd>(
     shutdown: &AtomicBool,
 ) {
     let mut ring = IoUring::new(RING_SIZE).expect("failed to create io_uring instance");
+
+    // Pre-encode the ServerBusy response frame (length prefix + tag = 5 bytes).
+    let server_busy_frame = {
+        let mut buf = [0u8; 8];
+        let n = codec::encode_response(&melin_protocol::message::ResponseKind::ServerBusy, &mut buf)
+            .expect("ServerBusy encodes");
+        let mut frame = [0u8; 5];
+        frame.copy_from_slice(&buf[..n]);
+        frame
+    };
+
     let mut slab = ConnectionSlab::<R>::new();
     // Reverse map for cleanup when a connection's fd needs removal.
     // HashMap for O(1) lookup by fd. Sized for typical connection counts.
@@ -433,6 +444,7 @@ fn uring_reader_loop<R: AsRawFd>(
                 let drop_conn = process_frames(
                     entry,
                     &producer,
+                    &server_busy_frame,
                     #[cfg(feature = "latency-trace")]
                     &mut publish_hist,
                 );
@@ -610,6 +622,7 @@ fn push_eventfd_read(ring: &mut IoUring, wakeup_fd: RawFd, buf: *mut u8) {
 fn process_frames<R>(
     conn: &mut ConnectionEntry<R>,
     producer: &ring::MultiProducer<InputSlot>,
+    server_busy_frame: &[u8; 5],
     #[cfg(feature = "latency-trace")]
     publish_hist: &mut melin_engine::journal::trace::StageHistogram,
 ) -> bool {
@@ -692,14 +705,33 @@ fn process_frames<R>(
         #[cfg(feature = "latency-trace")]
         let pre_publish = trace_ts();
 
-        producer.publish(InputSlot {
-            connection_id: conn.connection_id,
-            key_hash: conn.key_hash,
-            request_seq: seq,
-            event,
-            publish_ts: trace_ts(),
-            recv_ts,
-        });
+        if producer
+            .try_publish(InputSlot {
+                connection_id: conn.connection_id,
+                key_hash: conn.key_hash,
+                request_seq: seq,
+                event,
+                publish_ts: trace_ts(),
+                recv_ts,
+            })
+            .is_err()
+        {
+            // Pipeline full — send ServerBusy directly on the socket.
+            debug!(
+                connection_id = conn.connection_id,
+                "pipeline full, sending ServerBusy"
+            );
+            unsafe {
+                libc::write(
+                    conn.fd,
+                    server_busy_frame.as_ptr().cast(),
+                    server_busy_frame.len(),
+                );
+            }
+            // Stop processing further frames — leave them in parse_buf
+            // for the next recv cycle.
+            break;
+        }
 
         #[cfg(feature = "latency-trace")]
         publish_hist.record_ns(melin_engine::journal::trace::trace_elapsed_ns(

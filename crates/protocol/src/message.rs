@@ -144,6 +144,11 @@ pub enum ResponseKind {
     /// other auth error. Server drops the connection after sending this.
     AuthFailed,
 
+    /// The server's input pipeline is full. The client should retry
+    /// after a brief backoff. Sent directly by the reader thread
+    /// without entering the pipeline. Tag-only, no payload.
+    ServerBusy,
+
     // --- Stats response ---
     /// Server stats snapshot. Sent in response to `QueryStats`.
     StatsHeader {

@@ -66,6 +66,8 @@ const TAG_CHALLENGE: u8 = 20;
 const TAG_AUTH_FAILED: u8 = 21;
 const TAG_REPLACED: u8 = 22;
 const TAG_STATS_HEADER: u8 = 23;
+/// Server pipeline full — client should retry after backoff.
+const TAG_SERVER_BUSY: u8 = 24;
 
 // --- OrderType tags (wire-specific, not shared with journal) ---
 const ORDER_TYPE_MARKET: u8 = 0;
@@ -544,6 +546,10 @@ pub fn encode_response(response: &ResponseKind, buf: &mut [u8]) -> Result<usize,
             buf[pos] = TAG_AUTH_FAILED;
             pos += 1;
         }
+        ResponseKind::ServerBusy => {
+            buf[pos] = TAG_SERVER_BUSY;
+            pos += 1;
+        }
         ResponseKind::StatsHeader {
             active_connections,
             events_processed,
@@ -589,6 +595,7 @@ pub fn decode_response(buf: &[u8]) -> Result<ResponseKind, ProtocolError> {
             Ok(ResponseKind::Challenge { nonce })
         }
         TAG_AUTH_FAILED => Ok(ResponseKind::AuthFailed),
+        TAG_SERVER_BUSY => Ok(ResponseKind::ServerBusy),
         TAG_PLACED | TAG_FILL | TAG_CANCELLED | TAG_TRIGGERED | TAG_REJECTED | TAG_REPLACED => {
             let report = decode_execution_report(tag, payload)?;
             Ok(ResponseKind::Report(report))
@@ -1325,6 +1332,7 @@ mod tests {
             ResponseKind::Heartbeat,
             ResponseKind::Challenge { nonce: [0xCC; 32] },
             ResponseKind::AuthFailed,
+            ResponseKind::ServerBusy,
             ResponseKind::StatsHeader {
                 active_connections: 5,
                 events_processed: 1_234_567,

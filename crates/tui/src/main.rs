@@ -537,6 +537,7 @@ fn client_thread(
                     let msg = match resp {
                         ResponseKind::Report(report) => format_report(report),
                         ResponseKind::EngineError => "ENGINE ERROR".into(),
+                        ResponseKind::ServerBusy => "SERVER BUSY (pipeline full)".into(),
                         ResponseKind::BatchEnd
                         | ResponseKind::ServerReady
                         | ResponseKind::Heartbeat

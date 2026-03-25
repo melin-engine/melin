@@ -1171,6 +1171,14 @@ fn run_epoll_loop<W: Write>(
                         let frame = &conn.payload_buf[..conn.payload_len];
                         let response = codec::decode_response(frame).expect("decode response");
 
+                        // ServerBusy = pipeline full, request was not processed.
+                        // Discard the inflight timestamp (no BatchEnd will come)
+                        // and let the window refill with a retry.
+                        if matches!(response, ResponseKind::ServerBusy) {
+                            conn.inflight_ts.pop_front();
+                            conn.send_cursor = conn.send_cursor.saturating_sub(1);
+                        }
+
                         if matches!(response, ResponseKind::BatchEnd) {
                             let sent_at = conn.inflight_ts.pop_front().expect(
                                 "inflight timestamp desync: got BatchEnd without matching send",

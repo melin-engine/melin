@@ -241,6 +241,17 @@ fn epoll_reader_loop<R: AsRawFd>(
 
     // Pre-size for a reasonable number of concurrent connections per reader thread.
     let mut connections: HashMap<RawFd, ConnectionState<R>> = HashMap::with_capacity(256);
+
+    // Pre-encode the ServerBusy response frame (length prefix + tag = 5 bytes).
+    // Sent directly via libc::write when the disruptor ring is full.
+    let server_busy_frame = {
+        let mut buf = [0u8; 8];
+        let n = codec::encode_response(&melin_protocol::message::ResponseKind::ServerBusy, &mut buf)
+            .expect("ServerBusy encodes");
+        let mut frame = [0u8; 5];
+        frame.copy_from_slice(&buf[..n]);
+        frame
+    };
     let mut events = vec![libc::epoll_event { events: 0, u64: 0 }; MAX_EPOLL_EVENTS];
 
     #[cfg(feature = "latency-trace")]
@@ -537,14 +548,35 @@ fn process_connection<R>(
                     #[cfg(feature = "latency-trace")]
                     let pre_publish = trace_ts();
 
-                    producer.publish(InputSlot {
-                        connection_id: conn.connection_id,
-                        key_hash: conn.key_hash,
-                        request_seq: seq,
-                        event,
-                        publish_ts: trace_ts(),
-                        recv_ts,
-                    });
+                    if producer
+                        .try_publish(InputSlot {
+                            connection_id: conn.connection_id,
+                            key_hash: conn.key_hash,
+                            request_seq: seq,
+                            event,
+                            publish_ts: trace_ts(),
+                            recv_ts,
+                        })
+                        .is_err()
+                    {
+                        // Pipeline full — send ServerBusy directly on the socket.
+                        // The 5-byte frame is atomic (well under SO_SNDBUF minimum).
+                        debug!(
+                            connection_id = conn.connection_id,
+                            "pipeline full, sending ServerBusy"
+                        );
+                        unsafe {
+                            libc::write(
+                                conn.fd,
+                                server_busy_frame.as_ptr().cast(),
+                                server_busy_frame.len(),
+                            );
+                        }
+                        // Stop draining this connection for this epoll round.
+                        // Remaining bytes stay in the kernel recv buffer; epoll
+                        // edge-trigger will re-fire on the next recv.
+                        break;
+                    }
 
                     #[cfg(feature = "latency-trace")]
                     publish_hist.record_ns(melin_engine::journal::trace::trace_elapsed_ns(
