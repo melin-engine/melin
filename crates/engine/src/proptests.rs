@@ -405,33 +405,34 @@ fn book_total_quantity(book: &OrderBook) -> u64 {
 #[cfg(test)]
 fn assert_exchange_consistent(exchange: &Exchange, action_idx: usize, action_desc: &str) {
     let order_sides = exchange.snapshot_order_sides();
-    let sides_ids: std::collections::HashSet<OrderId> =
-        order_sides.iter().map(|((_acct, id), _)| *id).collect();
+    // Key by (AccountId, OrderId) — two accounts may share the same OrderId.
+    let sides_ids: std::collections::HashSet<(AccountId, OrderId)> =
+        order_sides.iter().map(|((acct, id), _)| (*acct, *id)).collect();
 
     let reservations = exchange.snapshot_reservations();
-    let reserved_ids: std::collections::HashSet<OrderId> =
-        reservations.iter().map(|(id, _, _, _)| *id).collect();
+    let reserved_ids: std::collections::HashSet<(AccountId, OrderId)> =
+        reservations.iter().map(|(id, acct, _, _)| (*acct, *id)).collect();
 
-    let mut book_ids = std::collections::HashSet::new();
+    let mut book_ids: std::collections::HashSet<(AccountId, OrderId)> = std::collections::HashSet::new();
     for (_sym, book) in exchange.books() {
         for (_price, level) in book.bids().levels_iter() {
             for order in level {
-                book_ids.insert(order.id());
+                book_ids.insert((order.account(), order.id()));
             }
         }
         for (_price, level) in book.asks().levels_iter() {
             for order in level {
-                book_ids.insert(order.id());
+                book_ids.insert((order.account(), order.id()));
             }
         }
         for (_price, stops) in book.stop_buys() {
             for stop in stops {
-                book_ids.insert(stop.id());
+                book_ids.insert((stop.account(), stop.id()));
             }
         }
         for (_price, stops) in book.stop_sells() {
             for stop in stops {
-                book_ids.insert(stop.id());
+                book_ids.insert((stop.account(), stop.id()));
             }
         }
     }
@@ -730,17 +731,18 @@ proptest! {
 
         for (_price, level) in book.bids().levels_iter() {
             for order in level {
-                ids_from_book.insert(order.id());
+                ids_from_book.insert((order.account(), order.id()));
             }
         }
         for (_price, level) in book.asks().levels_iter() {
             for order in level {
-                ids_from_book.insert(order.id());
+                ids_from_book.insert((order.account(), order.id()));
             }
         }
 
-        let ids_from_index: std::collections::HashSet<OrderId> =
-            index.iter().map(|&(id, _, _, _)| id).collect();
+        // Key by (AccountId, OrderId) — two accounts may share the same OrderId.
+        let ids_from_index: std::collections::HashSet<(AccountId, OrderId)> =
+            index.iter().map(|&(id, acct, _, _)| (acct, id)).collect();
 
         prop_assert_eq!(
             ids_from_book.len(),
@@ -769,17 +771,17 @@ proptest! {
 
         for (_price, stops) in book.stop_buys() {
             for stop in stops {
-                stop_ids_from_book.insert(stop.id());
+                stop_ids_from_book.insert((stop.account(), stop.id()));
             }
         }
         for (_price, stops) in book.stop_sells() {
             for stop in stops {
-                stop_ids_from_book.insert(stop.id());
+                stop_ids_from_book.insert((stop.account(), stop.id()));
             }
         }
 
-        let stop_ids_from_index: std::collections::HashSet<OrderId> =
-            stop_idx.iter().map(|&(id, _, _, _)| id).collect();
+        let stop_ids_from_index: std::collections::HashSet<(AccountId, OrderId)> =
+            stop_idx.iter().map(|&(id, acct, _, _)| (acct, id)).collect();
 
         prop_assert_eq!(
             stop_ids_from_book,
@@ -1148,49 +1150,50 @@ proptest! {
         let (exchange, _, _, _) = run_exchange_actions(&actions);
 
         let reservations = exchange.snapshot_reservations();
-        let reserved_order_ids: std::collections::HashSet<OrderId> =
-            reservations.iter().map(|(id, _, _, _)| *id).collect();
+        // Key by (AccountId, OrderId) — two accounts may share the same OrderId.
+        let reserved_order_ids: std::collections::HashSet<(AccountId, OrderId)> =
+            reservations.iter().map(|(id, acct, _, _)| (*acct, *id)).collect();
 
-        // Collect all order IDs on the book (resting + pending stops).
+        // Collect all (account, order_id) pairs on the book (resting + pending stops).
         let mut book_order_ids = std::collections::HashSet::new();
         for (_sym, book) in exchange.books() {
             for (_price, level) in book.bids().levels_iter() {
                 for order in level {
-                    book_order_ids.insert(order.id());
+                    book_order_ids.insert((order.account(), order.id()));
                 }
             }
             for (_price, level) in book.asks().levels_iter() {
                 for order in level {
-                    book_order_ids.insert(order.id());
+                    book_order_ids.insert((order.account(), order.id()));
                 }
             }
             for (_price, stops) in book.stop_buys() {
                 for stop in stops {
-                    book_order_ids.insert(stop.id());
+                    book_order_ids.insert((stop.account(), stop.id()));
                 }
             }
             for (_price, stops) in book.stop_sells() {
                 for stop in stops {
-                    book_order_ids.insert(stop.id());
+                    book_order_ids.insert((stop.account(), stop.id()));
                 }
             }
         }
 
         // Every book order must have a reservation.
-        for &id in &book_order_ids {
+        for &(acct, id) in &book_order_ids {
             prop_assert!(
-                reserved_order_ids.contains(&id),
-                "order {} is on the book but has no reservation",
-                id.0
+                reserved_order_ids.contains(&(acct, id)),
+                "order ({:?}, {}) is on the book but has no reservation",
+                acct, id.0
             );
         }
 
         // Every reservation must correspond to a book order.
-        for &id in &reserved_order_ids {
+        for &(acct, id) in &reserved_order_ids {
             prop_assert!(
-                book_order_ids.contains(&id),
-                "reservation exists for order {} but it is not on the book",
-                id.0
+                book_order_ids.contains(&(acct, id)),
+                "reservation exists for ({:?}, {}) but it is not on the book",
+                acct, id.0
             );
         }
     }
@@ -1212,29 +1215,30 @@ proptest! {
         let (exchange, _, _, _) = run_exchange_actions(&actions);
 
         let order_sides = exchange.snapshot_order_sides();
-        let sides_ids: std::collections::HashSet<OrderId> =
-            order_sides.iter().map(|((_acct, id), _)| *id).collect();
+        // Key by (AccountId, OrderId) — two accounts may share the same OrderId.
+        let sides_ids: std::collections::HashSet<(AccountId, OrderId)> =
+            order_sides.iter().map(|((acct, id), _)| (*acct, *id)).collect();
 
         let mut book_order_ids = std::collections::HashSet::new();
         for (_sym, book) in exchange.books() {
             for (_price, level) in book.bids().levels_iter() {
                 for order in level {
-                    book_order_ids.insert(order.id());
+                    book_order_ids.insert((order.account(), order.id()));
                 }
             }
             for (_price, level) in book.asks().levels_iter() {
                 for order in level {
-                    book_order_ids.insert(order.id());
+                    book_order_ids.insert((order.account(), order.id()));
                 }
             }
             for (_price, stops) in book.stop_buys() {
                 for stop in stops {
-                    book_order_ids.insert(stop.id());
+                    book_order_ids.insert((stop.account(), stop.id()));
                 }
             }
             for (_price, stops) in book.stop_sells() {
                 for stop in stops {
-                    book_order_ids.insert(stop.id());
+                    book_order_ids.insert((stop.account(), stop.id()));
                 }
             }
         }
