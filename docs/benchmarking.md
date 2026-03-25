@@ -10,15 +10,15 @@ The suite offers three modes that progressively strip away layers of the stack, 
 
 Full end-to-end benchmark through the entire server. By default, an embedded server is spawned in-process and clients connect via TCP loopback. With `--addr=<ip:port>`, clients connect to a remote engine instead (LAN benchmark mode). With `--uds`, clients use Unix domain sockets.
 
-What it measures: client-perceived round-trip latency including TCP/UDS transport, kernel network stack, the epoll/io_uring reader pool, CAS-based multi-producer publication to the disruptor, journal fsync, matching engine execution, response stage journal-cursor gating, and the return trip through the socket.
+What it measures: client-perceived round-trip latency including transport, reader pool, disruptor publication, journal fsync, matching engine execution, response stage, and the return trip through the socket.
 
 This mode uses either an io_uring-based single-threaded event loop (default, via the `io-uring` feature) or an epoll-based multi-threaded event loop (with `--no-default-features`). Each bench thread runs its own io_uring ring or epoll instance and manages a subset of connections.
 
 ### `--mode=pipeline`
 
-Disruptor pipeline without network transport. Publishes `InputSlot` events directly to the `MultiProducer` ring buffer and drains `OutputSlot` responses from the SPSC consumer queue. The journal stage and matching stage run on their own threads, exactly as in the real server.
+Disruptor pipeline without network transport. Publishes events directly to the ring buffer and drains responses from the output queue. The journal stage and matching stage run on their own threads, exactly as in the real server.
 
-What it measures: journal I/O latency (pwritev2 + RWF_DSYNC) overlapped with matching engine execution, plus disruptor publication and SPSC drain overhead. Excludes all TCP/UDS syscall and kernel buffer costs.
+What it measures: journal I/O latency overlapped with matching engine execution, plus disruptor publication and drain overhead. Excludes all transport syscall and kernel buffer costs.
 
 Why numbers differ from roundtrip: the TCP/UDS network stack is the primary throughput limiter. Removing it reveals the raw pipeline throughput, which is substantially higher.
 
@@ -26,7 +26,7 @@ Why numbers differ from roundtrip: the TCP/UDS network stack is the primary thro
 
 Matching engine only. Calls `Exchange::execute()` and `Exchange::cancel()` directly in a tight loop on the calling thread. No disruptor, no journal, no I/O, no threads.
 
-What it measures: pure matching engine throughput and per-operation latency. This is the theoretical ceiling: the cost of order book operations (BTreeMap lookups, VecDeque manipulation, balance reservation math).
+What it measures: pure matching engine throughput and per-operation latency. This is the theoretical ceiling.
 
 Why numbers differ from pipeline: there is no journal fsync, no ring buffer synchronization, no cross-thread cache coherence traffic. This mode shows how fast the business logic runs in isolation.
 
@@ -48,8 +48,8 @@ All modes use the same realistic order flow generator (`crates/bench/src/generat
 
 ### Flow composition
 
-- **High cancel ratio**: 90% conditional cancel probability (configured via `cancel_ratio`). The realized unconditional ratio converges to approximately 47-52% because each cancel consumes a live order from the tracking pool, forcing new submits.
-- **Order types**: ~5% market orders (`market_order_ratio`), ~5% limit IOC (`ioc_ratio`), ~2% limit FOK (`fok_ratio`), remainder limit GTC.
+- **High cancel+amend ratio**: 90% conditional probability when live orders exist — 60% pure cancels (`cancel_ratio`) + 30% cancel-replace amendments (`cancel_replace_ratio`). The realized unconditional ratio converges to approximately 47-52% because each cancel/amend consumes a live order from the tracking pool, forcing new submits.
+- **Order types**: ~5% market orders (`market_order_ratio`), ~5% limit IOC (`ioc_ratio`), ~2% limit FOK (`fok_ratio`), ~3% stop/stop-limit (`stop_order_ratio`), remainder limit GTC. ~5% of non-aggressive GTC limits are post-only (`post_only_ratio`).
 - **Aggressive orders**: 10% of limit submits cross the spread (`aggression_ratio`) -- buys placed above mid-price, sells below -- producing immediate fills.
 - **Price placement**: power-law distribution around a mid-price (default 10,000 ticks). Exponent `price_alpha = 1.5` clusters orders near the inside of the book, with a long tail up to `max_price_offset = 200` ticks from mid.
 - **Order sizes**: power-law distribution with exponent `size_alpha = 2.0`, range 1 to 1,000 lots.
@@ -63,10 +63,10 @@ The generator maintains a circular buffer of 100,000 recently submitted GTC limi
 
 ### Pre-generation
 
-- Engine mode: `generate_events(count)` returns a `Vec<GeneratedEvent>` of `Submit` and `Cancel` variants.
-- Roundtrip mode: `generate_frames(count)` returns a `Vec<Vec<u8>>` of pre-encoded binary wire frames (without the 4-byte length prefix, which is prepended at send time).
+- Engine mode: generates in-memory event structs (submit and cancel variants).
+- Roundtrip mode: generates pre-encoded binary wire frames.
 
-Each client connection gets its own generator instance with a partitioned `start_order_id` range to avoid order ID collisions across connections.
+Each client connection gets its own generator instance with a partitioned order ID range to avoid collisions across connections.
 
 ## CLI Parameters
 
@@ -93,7 +93,7 @@ cargo run --release -p melin-bench [-- [OPTIONS] [PAIRS]]
 | `--group-commit-us` | 0 | Group commit coalescing delay in microseconds. Adds an artificial delay before fsyncing to batch more events per sync. Beneficial for UDS transport; harmful for TCP (see CLAUDE.md dead ends). |
 | `--warmup` | 100,000 | Warmup orders per client (not included in measurements). Primes caches, branch predictors, and allocator state. |
 | `--journal <PATH>` | temp directory | Path for the journal file. Use a dedicated NVMe disk for realistic durability benchmarks. |
-| `--accounts` | 1,000 | Number of trading accounts in the generator. |
+| `--accounts` | 10,000 | Number of trading accounts in the generator. |
 | `--instruments` | 100 | Number of instruments. |
 | `--json <PATH>` | (none) | Write results to a JSON file for machine-readable post-processing (saturation curve sweeps). |
 | `--key <PATH>` | (none) | Path to a 32-byte raw Ed25519 private key file. Required for remote mode (`--addr`). Auto-generated for embedded mode. |
@@ -110,19 +110,17 @@ cargo run --release -p melin-bench [-- [OPTIONS] [PAIRS]]
 
 ### Timing
 
-On x86_64, per-order latency is measured with `rdtscp` (Time Stamp Counter with serialization). Overhead is approximately 4 ns per read, compared to 15-25 ns for `Instant::now()` via the vDSO. The `rdtscp` instruction serializes: it waits for all prior instructions to retire before reading the counter, preventing the CPU from reordering the timestamp past the work being measured.
-
-TSC ticks are converted to nanoseconds using a calibration factor computed at startup: a 10 ms `thread::sleep` is measured with both `rdtscp` and `Instant::now()`, and the ratio `ticks / ns` is stored. On non-x86_64 platforms, `Instant::now()` is used as a fallback.
+On x86_64, per-order latency is measured with `rdtscp` for minimal overhead. TSC ticks are converted to nanoseconds using a calibration factor computed at startup. On non-x86_64 platforms, `Instant::now()` is used as a fallback.
 
 ### What is timed
 
-- **Engine mode**: `rdtscp` bracketing each `Exchange::execute()` or `Exchange::cancel()` call. Measures pure function call latency.
-- **Pipeline mode**: `Instant::now()` at publication to the disruptor, elapsed at `BatchEnd` consumption from the SPSC output queue. Measures end-to-end pipeline transit time.
-- **Roundtrip mode**: `Instant::now()` at frame send, elapsed when the corresponding `BatchEnd` response is received and decoded. Measures full network round-trip including kernel buffers and transport overhead.
+- **Engine mode**: timestamps bracketing each execute/cancel call. Measures pure function call latency.
+- **Pipeline mode**: timestamp at publication to the disruptor, elapsed at response consumption. Measures end-to-end pipeline transit time.
+- **Roundtrip mode**: timestamp at frame send, elapsed when the response is received and decoded. Measures full network round-trip.
 
 ### Histogram
 
-Latency samples are recorded into an HDR Histogram (`hdrhistogram` crate) with bounds of 1 ns to 10 seconds and 3 significant digits of precision. This provides sub-percent-accurate percentile reporting across the full dynamic range without fixed bucket boundaries.
+Latency samples are recorded into an HDR Histogram with 3 significant digits of precision, providing sub-percent-accurate percentile reporting across the full dynamic range.
 
 Warmup orders (default 100,000 per client) are excluded from the histogram. Only the measured portion contributes to reported percentiles.
 
@@ -136,11 +134,11 @@ The number of reported percentiles adapts to the sample size. Each additional "9
 - p99.999 requires at least 1,000,000 samples
 - ...and so on
 
-With 100M order pairs (200M measured orders), percentiles are reported through p99.99999.
+With large enough sample sizes, percentiles are reported to p99.99999 and beyond.
 
 ### JSON output
 
-With `--json <path>`, results are written as a single JSON object containing `label`, `measured_orders`, `warmup_orders`, `wall_ms`, `throughput_ops`, and a `latency` object with all computed percentiles in microseconds. This is designed for building saturation curves by sweeping `--clients` and `--window` across multiple runs.
+With `--json <path>`, results are written as a JSON object with throughput, order counts, and all computed percentiles. Designed for building saturation curves by sweeping `--clients` and `--window` across multiple runs.
 
 ## Pipelining
 
@@ -148,7 +146,7 @@ The `--window` flag controls how many requests each client keeps in flight simul
 
 ### How it works
 
-Each client maintains a FIFO of in-flight timestamps (`VecDeque<Instant>`). When a request is sent, its timestamp is pushed. When a `BatchEnd` response arrives, the oldest timestamp is popped and the round-trip latency is recorded. The client only sends new requests when the in-flight count is below `--window`.
+Each client maintains a FIFO of in-flight timestamps. When a request is sent, its timestamp is pushed. When a response arrives, the oldest timestamp is popped and the round-trip latency is recorded. The client only sends new requests when the in-flight count is below `--window`.
 
 ### Why it increases throughput
 
@@ -156,7 +154,7 @@ Without pipelining (`--window=1`), each order must complete the full round trip 
 
 ### Choosing a window size
 
-- `--window=1`: measures single-order latency with no amortization. This is the "how fast is one order" number (e.g., 70 us p50 with full durability).
+- `--window=1`: measures single-order latency with no amortization. This is the "how fast is one order" number.
 - `--window=64` (default): reasonable balance between throughput and per-order latency.
 - `--window=192-256`: saturates the pipeline for peak throughput measurements. Diminishing returns beyond this point; higher values mostly increase queueing delay without improving throughput.
 
@@ -198,7 +196,7 @@ Optional perf profiling:
 ```sh
 BENCH_PERF=1 sudo ./scripts/bench-isolate.sh [bench args]
 ```
-This samples kernel stacks on cores 1+ at 997 Hz. Warning: perf sampling itself introduces NMI-like interrupts that degrade latency (~20% throughput drop). Use for diagnosis only.
+This samples kernel stacks on cores 1+ at 997 Hz. Warning: perf sampling itself introduces NMI-like interrupts that degrade latency. Use for diagnosis only.
 
 ### Kernel boot parameters (`grub-bench.conf`)
 
@@ -209,7 +207,7 @@ isolcpus=nohz,domain,1-5 nohz_full=1-5 rcu_nocbs=1-5
 ```
 
 - `isolcpus=nohz,domain,1-5` -- removes cores 1-5 from scheduler load balancing and timer tick distribution. Only explicitly pinned threads run on these cores.
-- `nohz_full=1-5` -- stops the timer tick on cores 1-5 when only one task is running. Eliminates ~1-10 us jitter every 4 ms (HZ=250).
+- `nohz_full=1-5` -- stops the timer tick on cores 1-5 when only one task is running.
 - `rcu_nocbs=1-5` -- moves RCU callback processing off cores 1-5. Without this, RCU grace periods can still interrupt isolated cores.
 
 To apply: edit `/etc/default/grub`, append to `GRUB_CMDLINE_LINUX_DEFAULT`, run `sudo update-grub`, reboot.
@@ -238,15 +236,15 @@ All latency values are in microseconds. The histogram reports:
 
 ### Max latency outliers
 
-The max latency in engine-only mode (typically 20-120 us for 100M orders) is caused by System Management Interrupts (SMIs), Non-Maskable Interrupts (NMIs), and kernel interrupts that cannot be disabled from userspace. These events pause the CPU for 50-200 us. They occur roughly once per 20M orders and are not indicative of matching engine performance. The p99.99 is a more meaningful tail metric.
+The max latency in engine-only mode is caused by System Management Interrupts (SMIs), Non-Maskable Interrupts (NMIs), and kernel interrupts that cannot be disabled from userspace. These are not indicative of matching engine performance. The p99.99 is a more meaningful tail metric.
 
 On AMD CPUs, SMI counts cannot be measured (MSR 0x34 is Intel-specific). The `bench-isolate.sh` script attempts to read it and reports results on Intel hardware.
 
 ## Reproducing Published Benchmarks
 
-All published numbers use two Cherry AMD Ryzen 9950X servers (16C/32T, 192 GB RAM, 2x 1TB NVMe, 10 Gbps) with the engine on one server and the benchmark client on the other, connected via a private network.
+See the [README](../README.md#benchmarks) for the current hardware setup, benchmark parameters, and performance numbers. All LAN benchmarks are reproducible via `scripts/lan-bench-suite.sh`.
 
-### Peak-load with full durability (5.2M orders/sec)
+### Peak-load with full durability
 
 Engine server:
 ```sh
@@ -258,24 +256,15 @@ Bench client (separate machine):
 ./melin-bench 100000000 --addr <engine-ip>:9876 --window=256
 ```
 
-Uses 16 clients (default), 256 pipelined requests per client, 100M order pairs (200M orders).
-
-### Peak-load without persistence (11.2M orders/sec)
-
-Engine server started without journal persistence. Bench client:
-```sh
-./melin-bench 100000000 --addr <engine-ip>:9876 --window=192 --clients=32
-```
-
-### Single-order latency (70 us p50)
+### Single-order latency
 
 ```sh
-./melin-bench 1000000 --addr <engine-ip>:9876 --window=1 --clients=1
+./melin-bench 500000 --addr <engine-ip>:9876 --window=1 --clients=1
 ```
 
 No pipelining, no batching. Measures the true single-order round-trip time with full durability.
 
-### Engine-only (17.3M orders/sec)
+### Engine-only
 
 ```sh
 ./melin-bench 100000000 --mode=engine
@@ -303,11 +292,11 @@ The binary is at `target/release/melin-bench`.
 
 1. **Pre-generated orders**: all orders are generated into memory before the timed run. This means there are zero allocations on the hot path during measurement, which is realistic for the matching engine (it uses pre-allocated data structures) but means the benchmark does not measure order generation or parsing overhead.
 
-2. **Single instrument in pipeline mode**: the pipeline benchmark uses a single instrument with one funded account. The roundtrip and engine modes use configurable multi-instrument, multi-account workloads (defaults: 100 instruments, 1,000 accounts).
+2. **Single instrument in pipeline mode**: the pipeline benchmark uses a single instrument with one funded account. The roundtrip and engine modes use configurable multi-instrument, multi-account workloads (defaults: 100 instruments, 10,000 accounts).
 
 3. **No cross-symbol correlations**: the generator selects instruments uniformly at random. Real markets have correlated order flow across related instruments (e.g., an index ETF and its components). This does not affect matching engine performance but means the order book depth profile may differ from production.
 
-4. **Generous balances**: all accounts are funded with `u64::MAX / 4` per currency. Balance reservation rejections are rare, which means the benchmark exercises the successful-reservation path almost exclusively.
+4. **Generous balances**: all accounts are generously funded. Balance reservation rejections are rare, which means the benchmark exercises the successful-reservation path almost exclusively.
 
 5. **One order per request**: the benchmark sends one order per wire frame, matching real client behavior. It does not batch multiple orders into a single write, which would artificially inflate throughput numbers.
 
@@ -317,4 +306,4 @@ The binary is at `target/release/melin-bench`.
 
 8. **Warmup sensitivity**: the default 100,000 warmup orders per client is sufficient for cache and branch predictor priming, but very short runs (e.g., 1,000 pairs) may not reach steady state. Use at least 100,000 pairs for meaningful results.
 
-9. **TSC reliability**: the TSC-based timing assumes an invariant TSC (constant rate regardless of frequency scaling). This is true on modern x86_64 CPUs with `constant_tsc` and `nonstop_tsc` flags, but the calibration sleep may introduce a few percent of systematic error in the ticks-to-nanoseconds conversion.
+9. **TSC reliability**: the TSC-based timing assumes an invariant TSC (constant rate regardless of frequency scaling). This is true on modern x86_64 CPUs, but the calibration sleep may introduce a few percent of systematic error in the ticks-to-nanoseconds conversion.
