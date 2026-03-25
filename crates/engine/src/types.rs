@@ -322,6 +322,10 @@ pub enum RejectReason {
     /// was already processed for this authentication key. Prevents
     /// double-execution on retry after network failure.
     DuplicateRequest,
+    /// Replication is enabled but the replica is disconnected. All
+    /// state-mutating operations are rejected until the replica reconnects
+    /// to preserve the durability guarantee.
+    ReplicaDisconnected,
 }
 
 #[cfg(test)]

@@ -41,6 +41,7 @@ pub fn spawn(
     journal_cursor: Arc<Sequence>,
     replication_cursor: Arc<AtomicU64>,
     pipeline_healthy: Arc<AtomicBool>,
+    replica_connected: Option<Arc<AtomicBool>>,
     shutdown: Arc<AtomicBool>,
 ) -> Result<std::thread::JoinHandle<()>, std::io::Error> {
     let listener = TcpListener::bind(bind_addr)?;
@@ -58,6 +59,7 @@ pub fn spawn(
                 &journal_cursor,
                 &replication_cursor,
                 &pipeline_healthy,
+                &replica_connected,
                 &shutdown,
             );
         })
@@ -73,6 +75,7 @@ fn health_loop(
     journal_cursor: &Arc<Sequence>,
     replication_cursor: &AtomicU64,
     pipeline_healthy: &AtomicBool,
+    replica_connected: &Option<Arc<AtomicBool>>,
     shutdown: &AtomicBool,
 ) {
     while !shutdown.load(Ordering::Relaxed) {
@@ -85,6 +88,7 @@ fn health_loop(
                     journal_cursor,
                     replication_cursor,
                     pipeline_healthy,
+                    replica_connected,
                 );
             }
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
@@ -107,6 +111,7 @@ fn handle_health_connection(
     journal_cursor: &Arc<Sequence>,
     replication_cursor: &AtomicU64,
     pipeline_healthy: &AtomicBool,
+    replica_connected: &Option<Arc<AtomicBool>>,
 ) {
     // Short write timeout — health probes should not block the thread.
     let _ = stream.set_write_timeout(Some(Duration::from_secs(1)));
@@ -123,8 +128,15 @@ fn handle_health_connection(
         journal_seq.saturating_sub(repl_cursor)
     };
 
+    // Trading state: "trading" when standalone or replica connected,
+    // "halted" when replication is enabled but replica is disconnected.
+    let trading = replica_connected
+        .as_ref()
+        .is_none_or(|flag| flag.load(Ordering::Relaxed));
+    let trading_str = if trading { "trading" } else { "halted" };
+
     let status = if healthy { "OK" } else { "ERR" };
-    let response = format!("{status} {conns} {journal_seq} {repl_lag}\n");
+    let response = format!("{status} {conns} {journal_seq} {repl_lag} {trading_str}\n");
     if let Err(e) = stream.write_all(response.as_bytes()) {
         debug!(error = %e, "health write failed");
     }
@@ -136,11 +148,27 @@ mod tests {
     use std::io::Read;
 
     /// Helper: create a non-blocking listener and spawn the health loop.
-    /// Returns (addr, pipeline_healthy, shutdown_flag, join_handle).
+    /// Returns (addr, pipeline_healthy, replica_connected, shutdown_flag, join_handle).
+    /// `replica_connected` is None (standalone mode) unless overridden.
     fn start_health(
         active: u64,
         journal_seq: u64,
         repl_cursor: u64,
+    ) -> (
+        SocketAddr,
+        Arc<AtomicBool>,
+        Arc<AtomicBool>,
+        std::thread::JoinHandle<()>,
+    ) {
+        start_health_with_replica(active, journal_seq, repl_cursor, None)
+    }
+
+    /// Like `start_health` but with an explicit `replica_connected` flag.
+    fn start_health_with_replica(
+        active: u64,
+        journal_seq: u64,
+        repl_cursor: u64,
+        replica_connected: Option<Arc<AtomicBool>>,
     ) -> (
         SocketAddr,
         Arc<AtomicBool>,
@@ -161,10 +189,11 @@ mod tests {
         let j = Arc::clone(&journal);
         let r = Arc::clone(&repl);
         let h = Arc::clone(&healthy);
+        let rc = replica_connected;
         let s = Arc::clone(&shutdown);
 
         let handle = std::thread::spawn(move || {
-            health_loop(&listener, &a, &j, &r, &h, &s);
+            health_loop(&listener, &a, &j, &r, &h, &rc, &s);
         });
 
         (addr, healthy, shutdown, handle)
@@ -186,7 +215,7 @@ mod tests {
         let (addr, _healthy, shutdown, handle) = start_health(5, 42, 40);
 
         let buf = read_health(addr);
-        assert_eq!(buf, "OK 5 42 2\n");
+        assert_eq!(buf, "OK 5 42 2 trading\n");
 
         shutdown.store(true, Ordering::Relaxed);
         handle.join().unwrap();
@@ -198,7 +227,7 @@ mod tests {
         let (addr, _healthy, shutdown, handle) = start_health(0, 100, u64::MAX);
 
         let buf = read_health(addr);
-        assert_eq!(buf, "OK 0 100 0\n");
+        assert_eq!(buf, "OK 0 100 0 trading\n");
 
         shutdown.store(true, Ordering::Relaxed);
         handle.join().unwrap();
@@ -230,7 +259,7 @@ mod tests {
         healthy.store(false, Ordering::Relaxed);
 
         let buf = read_health(addr);
-        assert_eq!(buf, "ERR 3 50 0\n");
+        assert_eq!(buf, "ERR 3 50 0 trading\n");
 
         shutdown.store(true, Ordering::Relaxed);
         handle.join().unwrap();
@@ -260,6 +289,7 @@ mod tests {
             Arc::clone(&journal),
             Arc::clone(&repl),
             Arc::clone(&healthy),
+            None,
             Arc::clone(&shutdown),
         );
         // spawn binds to port 0 which is auto-assigned — we can't know the
@@ -282,6 +312,7 @@ mod tests {
             Arc::new(Sequence::new(AtomicU64::new(0))),
             Arc::new(AtomicU64::new(u64::MAX)),
             Arc::new(AtomicBool::new(true)),
+            None,
             Arc::new(AtomicBool::new(false)),
         );
         assert!(result.is_err(), "expected bind failure on occupied port");
@@ -326,6 +357,24 @@ mod tests {
             let buf = t.join().unwrap();
             assert!(buf.starts_with("OK "), "unexpected: {buf}");
         }
+
+        shutdown.store(true, Ordering::Relaxed);
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn health_shows_halted_when_replica_disconnected() {
+        let replica_flag = Arc::new(AtomicBool::new(false)); // disconnected
+        let (addr, _healthy, shutdown, handle) =
+            start_health_with_replica(5, 100, u64::MAX, Some(Arc::clone(&replica_flag)));
+
+        let buf = read_health(addr);
+        assert_eq!(buf, "OK 5 100 0 halted\n");
+
+        // Reconnect replica — should switch to trading.
+        replica_flag.store(true, Ordering::Relaxed);
+        let buf = read_health(addr);
+        assert_eq!(buf, "OK 5 100 0 trading\n");
 
         shutdown.store(true, Ordering::Relaxed);
         handle.join().unwrap();

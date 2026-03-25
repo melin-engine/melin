@@ -151,6 +151,7 @@ The TCP network stack is now the primary throughput limiter. The journal pipelin
 
 ### Redundancy & High Availability
 - Synchronous journal replication ([docs/replication.md](docs/replication.md)) — live WAL streaming to replica via lock-free ring buffer, ack-gated responses, replica receiver with deterministic replay
+- Automatic trading halt on replica disconnect — preserves durability guarantee, resumes on reconnect
 
 
 ## Project Structure

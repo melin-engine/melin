@@ -325,6 +325,7 @@ pub fn run_sender(
     genesis_entry: Vec<u8>,
     shutdown: &AtomicBool,
     replica_ready: &AtomicBool,
+    replica_connected: &AtomicBool,
     batch_size: usize,
     heartbeat_secs: u64,
     busy_spin: bool,
@@ -357,6 +358,8 @@ pub fn run_sender(
                 // Signal that a replica is connected — unblocks seed event
                 // publishing in the main thread.
                 replica_ready.store(true, Ordering::Release);
+                // Resume trading — matching stage will stop rejecting events.
+                replica_connected.store(true, Ordering::Release);
                 stream
             }
             Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
@@ -398,7 +401,10 @@ pub fn run_sender(
 
         // On disconnect, set cursor to u64::MAX to degrade to local-only.
         replication_cursor.store(u64::MAX, Ordering::Release);
-        warn!("replica disconnected — degraded to local-only durability");
+        // Halt trading — matching stage will reject all mutations until
+        // the replica reconnects.
+        replica_connected.store(false, Ordering::Release);
+        warn!("replica disconnected — trading halted, waiting for reconnect");
     }
 }
 

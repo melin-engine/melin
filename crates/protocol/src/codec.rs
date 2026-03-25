@@ -91,6 +91,7 @@ const REJECT_PRICE_WOULD_CROSS: u8 = 12;
 const REJECT_POST_ONLY_WOULD_CROSS: u8 = 13;
 const REJECT_HAS_RESTING_ORDERS: u8 = 14;
 const REJECT_DUPLICATE_REQUEST: u8 = 15;
+const REJECT_REPLICA_DISCONNECTED: u8 = 16;
 
 /// Encode a request into `buf`. Returns total bytes written (length prefix + seq + tag + payload).
 ///
@@ -1012,6 +1013,7 @@ fn encode_reject_reason(reason: RejectReason) -> u8 {
         RejectReason::PostOnlyWouldCross => REJECT_POST_ONLY_WOULD_CROSS,
         RejectReason::HasRestingOrders => REJECT_HAS_RESTING_ORDERS,
         RejectReason::DuplicateRequest => REJECT_DUPLICATE_REQUEST,
+        RejectReason::ReplicaDisconnected => REJECT_REPLICA_DISCONNECTED,
     }
 }
 
@@ -1033,6 +1035,7 @@ fn decode_reject_reason(b: u8) -> Result<RejectReason, ProtocolError> {
         REJECT_POST_ONLY_WOULD_CROSS => Ok(RejectReason::PostOnlyWouldCross),
         REJECT_HAS_RESTING_ORDERS => Ok(RejectReason::HasRestingOrders),
         REJECT_DUPLICATE_REQUEST => Ok(RejectReason::DuplicateRequest),
+        REJECT_REPLICA_DISCONNECTED => Ok(RejectReason::ReplicaDisconnected),
         _ => Err(ProtocolError::InvalidField("reject reason")),
     }
 }
@@ -1302,6 +1305,11 @@ mod tests {
                 order_id: OrderId(20),
                 account: AccountId(10),
                 reason: RejectReason::DuplicateRequest,
+            }),
+            ResponseKind::Report(ExecutionReport::Rejected {
+                order_id: OrderId(21),
+                account: AccountId(10),
+                reason: RejectReason::ReplicaDisconnected,
             }),
             ResponseKind::Report(ExecutionReport::Replaced {
                 order_id: OrderId(42),

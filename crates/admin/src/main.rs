@@ -1241,6 +1241,7 @@ fn format_report(report: &ExecutionReport) -> String {
                 RejectReason::PostOnlyWouldCross => "post-only would cross",
                 RejectReason::HasRestingOrders => "has resting orders",
                 RejectReason::DuplicateRequest => "duplicate request",
+                RejectReason::ReplicaDisconnected => "replica disconnected",
             };
             format!("REJECT  #{} ({reason_str})", order_id.0)
         }

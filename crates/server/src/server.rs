@@ -333,6 +333,7 @@ pub fn run_with_shutdown<L: BlockingTransportListener>(
         _events_processed,
         replication,
         replication_cursor,
+        replica_connected,
     ) = build_pipeline_with_replication(
         exchange,
         writer,
@@ -444,6 +445,9 @@ pub fn run_with_shutdown<L: BlockingTransportListener>(
         let s_repl = Arc::clone(&shutdown);
         let repl_cursor = Arc::clone(&replication_cursor);
         let ready_flag = Arc::clone(&replica_ready);
+        let connected_flag = replica_connected
+            .clone()
+            .expect("replica_connected must be Some when replication is enabled");
 
         let batch_size = config.replication_batch_size;
         let heartbeat_secs = config.replication_heartbeat_secs;
@@ -458,6 +462,7 @@ pub fn run_with_shutdown<L: BlockingTransportListener>(
                     genesis_entry,
                     &s_repl,
                     &ready_flag,
+                    &connected_flag,
                     batch_size,
                     heartbeat_secs,
                     busy_spin,
@@ -587,6 +592,7 @@ pub fn run_with_shutdown<L: BlockingTransportListener>(
             Arc::clone(&journal_cursor),
             Arc::clone(&replication_cursor),
             Arc::clone(&pipeline_healthy),
+            replica_connected.clone(),
             Arc::clone(&shutdown),
         )?)
     } else {

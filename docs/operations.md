@@ -368,7 +368,7 @@ nc 127.0.0.1 9877
 OK 42 1234567 0
 ```
 
-**Response format**: `OK|ERR <active_connections> <journal_seq> <replication_lag>\n`
+**Response format**: `OK|ERR <active_connections> <journal_seq> <replication_lag> trading|halted\n`
 
 | Field | Description |
 |-------|-------------|
@@ -376,10 +376,19 @@ OK 42 1234567 0
 | `active_connections` | Currently authenticated client connections |
 | `journal_seq` | Latest durable journal sequence number |
 | `replication_lag` | `journal_seq - replication_cursor` (0 in standalone mode) |
+| `trading` / `halted` | `trading` when accepting orders; `halted` when replica is disconnected (replication mode only) |
 
 **Configuration**: `--health-bind <addr:port>` (default `127.0.0.1:9877`). Omit the flag to disable.
 
-**Kubernetes**: Use as a TCP liveness probe on the health port. For basic liveness, check TCP connect success. For readiness, parse the first token and require `OK`.
+**Kubernetes**: Use as a TCP liveness probe on the health port. For basic liveness, check TCP connect success. For readiness, parse the first and last tokens and require `OK` + `trading`.
+
+### Halt on Replica Disconnect
+
+When replication is enabled (`--replication-bind`), the engine automatically halts trading if the replica disconnects. All state-mutating requests (orders, deposits, admin operations) are rejected with `ReplicaDisconnected` until the replica reconnects. QueryStats and heartbeats continue working.
+
+This preserves the durability guarantee: the engine never acks a response that isn't durable on both primary and replica. Without this, a primary crash after replica disconnect could lose acked events.
+
+Trading resumes automatically when the replica reconnects — no operator intervention needed. In standalone mode (no `--replication-bind`), this check is disabled.
 
 ### Admin Dashboard (QueryStats)
 
