@@ -1105,6 +1105,7 @@ fn nonblocking_fill(fd: RawFd, buf: &mut [u8], mut filled: usize, target: usize)
 fn run_epoll_loop<W: Write>(
     mut connections: Vec<BenchConnection<W>>,
     window: usize,
+    warmup: usize,
     progress: Arc<AtomicU64>,
 ) -> (Histogram<u64>, Option<Instant>) {
     let num_conns = connections.len();
@@ -1417,7 +1418,7 @@ fn run_epoll_roundtrip<R, W, F>(
                     eprintln!("warning: bench-{i} could not pin to core {core_id}: {e}");
                 }
                 barrier.wait();
-                run_epoll_loop(conns, window, thread_progress)
+                run_epoll_loop(conns, window, warmup, thread_progress)
             })
             .expect("spawn bench thread");
         handles.push(handle);
@@ -2027,7 +2028,7 @@ fn print_results(
     wall: Duration,
     extra_lines: &[String],
     json_path: Option<&std::path::Path>,
-    series: &TimeSeries,
+    series: &[LatencySample],
 ) {
     let throughput = (measured_orders as f64) / wall.as_secs_f64();
     let wall_ms = wall.as_micros() as f64 / 1000.0;

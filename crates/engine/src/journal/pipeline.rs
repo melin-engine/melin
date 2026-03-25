@@ -197,6 +197,8 @@ pub struct JournalStage {
     group_commit_delay: Duration,
     /// Maximum events per journal fsync batch. Capped at MAX_JOURNAL_BATCH
     /// (the stack array size). Smaller values reduce tail latency.
+    /// Only read when fsync is enabled (not `no-fsync` feature).
+    #[cfg_attr(feature = "no-fsync", allow(dead_code))]
     max_batch: usize,
     /// Optional replication ring producer. When `Some`, the journal stage
     /// copies encoded batch bytes into a pre-allocated ring slot after each

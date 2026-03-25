@@ -107,7 +107,7 @@ pub fn run(
     let mut cached_journal_pos: u64 = 0;
     // Suppress unused warnings when journal gating is disabled.
     #[cfg(feature = "no-fsync")]
-    let _ = &journal_cursor;
+    let _ = (&journal_cursor, &replication_cursor);
 
     #[cfg(feature = "latency-trace")]
     let mut spsc_hist =

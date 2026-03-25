@@ -90,7 +90,7 @@ pub fn run(
     let mut cached_journal_pos: u64 = 0;
     // Suppress unused warnings when journal gating is disabled.
     #[cfg(feature = "no-fsync")]
-    let _ = &journal_cursor;
+    let _ = (&journal_cursor, &replication_cursor);
 
     #[cfg(feature = "latency-trace")]
     let mut spsc_hist =
@@ -114,8 +114,7 @@ pub fn run(
         let written =
             codec::encode_response(&ResponseKind::Heartbeat, &mut buf).expect("heartbeat encodes");
         // write_frame expects payload without length prefix.
-        let payload = buf[4..written].to_vec();
-        payload
+        buf[4..written].to_vec()
     };
 
     // Coarse timestamp for heartbeat scan — avoids Instant::now() on every spin.

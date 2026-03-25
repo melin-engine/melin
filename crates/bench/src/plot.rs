@@ -755,12 +755,14 @@ struct TimeSeriesResult {
     time_series: Vec<TimeSeriesPoint>,
 }
 
+/// Deserialized from JSON time-series output; fields exist for schema
+/// compatibility even when not all are plotted.
 #[derive(Debug, Deserialize)]
+#[allow(dead_code)]
 struct TimeSeriesPoint {
     elapsed_secs: f64,
     p99_us: f64,
     p999_us: f64,
-    #[allow(dead_code)]
     p9999_us: f64,
 }
 
