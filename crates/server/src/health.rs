@@ -21,7 +21,7 @@
 //! - `journal_seq`: latest durable journal sequence number
 //! - `replication_lag`: `journal_seq - replication_cursor` (0 in standalone)
 
-use std::io::{Read as _, Write};
+use std::io::{Cursor, Read as _, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -123,23 +123,26 @@ impl HealthSnapshot {
         }
     }
 
-    /// One-line status string (no trailing newline — caller adds it).
-    fn status_line(&self) -> String {
+    /// Write the one-line status into `buf`. Returns bytes written.
+    fn write_status_line(&self, buf: &mut [u8]) -> usize {
         let status = if self.healthy { "OK" } else { "ERR" };
-        let trading_str = if self.trading { "trading" } else { "halted" };
-        format!(
-            "{status} {} {} {} {trading_str}",
+        let trading = if self.trading { "trading" } else { "halted" };
+        let mut c = Cursor::new(buf);
+        let _ = writeln!(
+            c,
+            "{status} {} {} {} {trading}",
             self.active_connections, self.journal_seq, self.replication_lag
-        )
+        );
+        c.position() as usize
     }
 
-    /// Prometheus text exposition format body.
-    fn prometheus_body(&self) -> Vec<u8> {
+    /// Write the Prometheus text exposition body into `buf`. Returns bytes written.
+    fn write_prometheus(&self, buf: &mut [u8]) -> usize {
         let healthy_val: u8 = if self.healthy { 1 } else { 0 };
         let trading_val: u8 = if self.trading { 1 } else { 0 };
-
-        // Pre-format into a Vec<u8> so we can compute Content-Length.
-        format!(
+        let mut c = Cursor::new(buf);
+        let _ = write!(
+            c,
             "# HELP melin_active_connections Current authenticated client connections.\n\
              # TYPE melin_active_connections gauge\n\
              melin_active_connections {}\n\
@@ -164,8 +167,8 @@ impl HealthSnapshot {
             self.replication_lag,
             healthy_val,
             trading_val,
-        )
-        .into_bytes()
+        );
+        c.position() as usize
     }
 }
 
@@ -235,10 +238,11 @@ fn detect_request(stream: &mut TcpStream) -> RequestKind {
     kind
 }
 
-/// Write a minimal HTTP/1.1 200 response with the given body.
-fn write_http_response(stream: &mut TcpStream, content_type: &str, body: &[u8]) {
-    // Build headers + body in one allocation, write in one syscall.
-    let header = format!(
+/// Write HTTP header + body into `buf`. Returns total bytes written.
+fn write_http(buf: &mut [u8], content_type: &str, body: &[u8]) -> usize {
+    let mut c = Cursor::new(buf);
+    let _ = write!(
+        c,
         "HTTP/1.1 200 OK\r\n\
          Content-Type: {content_type}\r\n\
          Content-Length: {}\r\n\
@@ -246,12 +250,8 @@ fn write_http_response(stream: &mut TcpStream, content_type: &str, body: &[u8]) 
          \r\n",
         body.len()
     );
-    let mut response = header.into_bytes();
-    response.extend_from_slice(body);
-
-    if let Err(e) = stream.write_all(&response) {
-        debug!(error = %e, "health write failed");
-    }
+    let _ = c.write_all(body);
+    c.position() as usize
 }
 
 /// Main health endpoint loop. Accepts connections and writes status.
@@ -293,6 +293,8 @@ fn health_loop(
 
 /// Collect snapshot, detect request kind, write the appropriate response.
 /// Best-effort — errors are debug-logged but don't affect the server.
+///
+/// Zero heap allocations — all formatting uses stack buffers.
 fn handle_health_connection(
     mut stream: TcpStream,
     active_connections: &AtomicU64,
@@ -316,25 +318,34 @@ fn handle_health_connection(
 
     let kind = detect_request(&mut stream);
 
-    match kind {
+    // Stack buffers — sized for worst case (all u64::MAX values).
+    // Body: Prometheus body is ~1 KiB with max-length u64 values.
+    // Response: body + HTTP headers (~200 bytes).
+    let mut body_buf = [0u8; 1280];
+    let mut resp_buf = [0u8; 1536];
+
+    let resp_len = match kind {
         RequestKind::Metrics => {
-            let body = snapshot.prometheus_body();
-            write_http_response(
-                &mut stream,
+            let body_len = snapshot.write_prometheus(&mut body_buf);
+            write_http(
+                &mut resp_buf,
                 "text/plain; version=0.0.4; charset=utf-8",
-                &body,
-            );
+                &body_buf[..body_len],
+            )
         }
         RequestKind::HttpHealth => {
-            let line = format!("{}\n", snapshot.status_line());
-            write_http_response(&mut stream, "text/plain; charset=utf-8", line.as_bytes());
+            let body_len = snapshot.write_status_line(&mut body_buf);
+            write_http(
+                &mut resp_buf,
+                "text/plain; charset=utf-8",
+                &body_buf[..body_len],
+            )
         }
-        RequestKind::PlainTcp => {
-            let line = format!("{}\n", snapshot.status_line());
-            if let Err(e) = stream.write_all(line.as_bytes()) {
-                debug!(error = %e, "health write failed");
-            }
-        }
+        RequestKind::PlainTcp => snapshot.write_status_line(&mut resp_buf),
+    };
+
+    if let Err(e) = stream.write_all(&resp_buf[..resp_len]) {
+        debug!(error = %e, "health write failed");
     }
 }
 
