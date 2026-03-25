@@ -6009,8 +6009,13 @@ mod tests {
             limit_order(2, ACCT_B, Side::Sell, 100, 10, TimeInForce::GTC),
             &mut reports,
         );
-        let fill = reports.iter().find(|r| matches!(r, ExecutionReport::Fill { .. }));
-        assert!(fill.is_some(), "ACCT_A's order should still be resting and fillable");
+        let fill = reports
+            .iter()
+            .find(|r| matches!(r, ExecutionReport::Fill { .. }));
+        assert!(
+            fill.is_some(),
+            "ACCT_A's order should still be resting and fillable"
+        );
     }
 
     #[test]
@@ -6093,7 +6098,11 @@ mod tests {
             .iter()
             .filter(|r| matches!(r, ExecutionReport::Fill { .. }))
             .collect();
-        assert_eq!(fills.len(), 1, "should only fill ACCT_B's order at price 100");
+        assert_eq!(
+            fills.len(),
+            1,
+            "should only fill ACCT_B's order at price 100"
+        );
     }
 
     #[test]

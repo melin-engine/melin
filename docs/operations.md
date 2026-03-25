@@ -50,6 +50,7 @@ The server uses jemalloc by default (thread-local caches eliminate allocator loc
 | `--connection-timeout-secs` | `30` | Seconds before disconnecting silent clients. `0` to disable. |
 | `--max-connections` | `1024` | Maximum concurrent authenticated connections. `0` for unlimited. Rejects new connections at the limit. |
 | `--yield-idle` | `false` | Yield to OS scheduler when pipeline threads are idle instead of busy-spinning. Use on shared machines without isolated cores. |
+| `--health-bind` | `127.0.0.1:9877` | Address for the health/liveness TCP endpoint. Returns `OK\|ERR <conns> <seq> <lag>`. Omit to disable. |
 
 #### Replication Flags
 
@@ -80,6 +81,7 @@ The server supports synchronous replication. Exactly one of `--replication-bind`
 ```sh
 ./target/release/melin-server \
     --bind 0.0.0.0:9876 \
+    --health-bind 0.0.0.0:9877 \
     --journal /mnt/nvme/trading.journal \
     --authorized-keys /etc/trading/authorized_keys \
     --cores 1,2,3,6 \
@@ -95,19 +97,20 @@ The server supports synchronous replication. Exactly one of `--replication-bind`
 # Primary
 ./target/release/melin-server \
     --bind 0.0.0.0:9876 \
+    --health-bind 0.0.0.0:9877 \
     --journal /mnt/nvme/trading.journal \
     --authorized-keys /etc/trading/authorized_keys \
     --cores 1,2,3,6 \
     --readers 2 \
     --reader-cores 4 \
     --max-journal-mib 512 \
-    --replication-bind 0.0.0.0:9877
+    --replication-bind 0.0.0.0:9878
 
 # Replica (separate machine)
 ./target/release/melin-server \
     --journal /mnt/nvme/trading.journal \
     --cores 1,2,3,6 \
-    --replica-of <primary-ip>:9877
+    --replica-of <primary-ip>:9878
 ```
 
 ---
@@ -365,17 +368,18 @@ nc 127.0.0.1 9877
 OK 42 1234567 0
 ```
 
-**Response format**: `OK <active_connections> <journal_seq> <replication_lag>\n`
+**Response format**: `OK|ERR <active_connections> <journal_seq> <replication_lag>\n`
 
 | Field | Description |
 |-------|-------------|
+| `OK` / `ERR` | `OK` when all pipeline threads are alive; `ERR` when a thread has died or the server is shutting down |
 | `active_connections` | Currently authenticated client connections |
 | `journal_seq` | Latest durable journal sequence number |
 | `replication_lag` | `journal_seq - replication_cursor` (0 in standalone mode) |
 
 **Configuration**: `--health-bind <addr:port>` (default `127.0.0.1:9877`). Omit the flag to disable.
 
-**Kubernetes**: Use as a TCP liveness probe on the health port. The probe succeeds if the TCP connect completes.
+**Kubernetes**: Use as a TCP liveness probe on the health port. For basic liveness, check TCP connect success. For readiness, parse the first token and require `OK`.
 
 ### Admin Dashboard (QueryStats)
 

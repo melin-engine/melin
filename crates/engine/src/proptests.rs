@@ -406,14 +406,19 @@ fn book_total_quantity(book: &OrderBook) -> u64 {
 fn assert_exchange_consistent(exchange: &Exchange, action_idx: usize, action_desc: &str) {
     let order_sides = exchange.snapshot_order_sides();
     // Key by (AccountId, OrderId) — two accounts may share the same OrderId.
-    let sides_ids: std::collections::HashSet<(AccountId, OrderId)> =
-        order_sides.iter().map(|((acct, id), _)| (*acct, *id)).collect();
+    let sides_ids: std::collections::HashSet<(AccountId, OrderId)> = order_sides
+        .iter()
+        .map(|((acct, id), _)| (*acct, *id))
+        .collect();
 
     let reservations = exchange.snapshot_reservations();
-    let reserved_ids: std::collections::HashSet<(AccountId, OrderId)> =
-        reservations.iter().map(|(id, acct, _, _)| (*acct, *id)).collect();
+    let reserved_ids: std::collections::HashSet<(AccountId, OrderId)> = reservations
+        .iter()
+        .map(|(id, acct, _, _)| (*acct, *id))
+        .collect();
 
-    let mut book_ids: std::collections::HashSet<(AccountId, OrderId)> = std::collections::HashSet::new();
+    let mut book_ids: std::collections::HashSet<(AccountId, OrderId)> =
+        std::collections::HashSet::new();
     for (_sym, book) in exchange.books() {
         for (_price, level) in book.bids().levels_iter() {
             for order in level {
