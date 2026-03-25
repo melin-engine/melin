@@ -313,6 +313,36 @@ impl<T> Clone for MultiProducer<T> {
 unsafe impl<T: Send> Send for MultiProducer<T> {}
 unsafe impl<T: Send> Sync for MultiProducer<T> {}
 
+/// Read-only handle to a disruptor producer cursor for monitoring.
+/// Type-erased so monitoring code doesn't depend on pipeline slot types.
+pub trait QueueCursor: Send + Sync {
+    /// Load the current cursor value (total items published/claimed).
+    fn load(&self) -> u64;
+}
+
+/// Type-erased wrapper around `Arc<Shared<T>>` for reading the producer cursor.
+/// One Box allocation at creation; one virtual dispatch + one atomic read per call.
+struct SharedCursor<T>(Arc<Shared<T>>);
+
+// Safety: SharedCursor only reads the atomic cursor — no access to buffer slots.
+// Shared<T> has `unsafe impl Send + Sync for T: Send`.
+unsafe impl<T: Send> Send for SharedCursor<T> {}
+unsafe impl<T: Send> Sync for SharedCursor<T> {}
+
+impl<T: Send> QueueCursor for SharedCursor<T> {
+    fn load(&self) -> u64 {
+        self.0.cursor.get().load(Ordering::Relaxed)
+    }
+}
+
+impl<T: Copy + Default + Send + 'static> MultiProducer<T> {
+    /// Returns a type-erased handle for reading the producer cursor.
+    /// Zero impact on the publish hot path — `Shared` internals are unchanged.
+    pub fn cursor_reader(&self) -> Box<dyn QueueCursor> {
+        Box::new(SharedCursor(Arc::clone(&self.shared)))
+    }
+}
+
 impl<T: Copy + Default> MultiProducer<T> {
     /// Try to publish a value. Returns `Err(Full)` if all slots are occupied
     /// (consumers haven't caught up).
@@ -882,6 +912,21 @@ mod tests {
         assert_eq!(c.try_consume(), Some((1, 20)));
         assert_eq!(c.try_consume(), Some((2, 30)));
         assert_eq!(c.try_consume(), None);
+    }
+
+    #[test]
+    fn multi_producer_cursor_reader() {
+        let (producer, _consumers) = DisruptorBuilder::<u64>::new(8)
+            .add_consumer()
+            .build_multi_producer();
+
+        let cursor = producer.cursor_reader();
+        assert_eq!(cursor.load(), 0);
+
+        producer.try_publish(10).unwrap();
+        producer.try_publish(20).unwrap();
+        producer.try_publish(30).unwrap();
+        assert_eq!(cursor.load(), 3);
     }
 
     #[test]

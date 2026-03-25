@@ -1234,6 +1234,7 @@ pub fn build_pipeline(
         journal_cursor,
         _matching_cursor,
         events_processed,
+        _input_cursor,
         _,
         _,
         _,
@@ -1286,6 +1287,7 @@ pub fn build_pipeline_with_replication(
     Arc<Sequence>,
     Arc<Sequence>,
     Arc<AtomicU64>,
+    Box<dyn ring::QueueCursor>,
     Option<ReplicationConsumer>,
     Arc<AtomicU64>,
     Option<Arc<AtomicBool>>,
@@ -1298,6 +1300,10 @@ pub fn build_pipeline_with_replication(
             .add_consumer() // consumer 0: journal, gated on producer
             .add_consumer() // consumer 1: matching, gated on producer (parallel)
             .build_multi_producer();
+
+    // Type-erased cursor reader for queue depth monitoring.
+    // Extracted before the producer is cloned to reader threads.
+    let input_cursor = input_producer.cursor_reader();
 
     let matching_consumer = consumers.pop().expect("matching consumer");
     let journal_consumer = consumers.pop().expect("journal consumer");
@@ -1372,6 +1378,7 @@ pub fn build_pipeline_with_replication(
         journal_cursor,
         matching_cursor,
         events_processed,
+        input_cursor,
         replication_consumer,
         replication_cursor,
         replica_connected,
@@ -1660,6 +1667,7 @@ mod tests {
             journal_cursor,
             _matching_cursor,
             _events_processed,
+            _input_cursor,
             replication_rx,
             replication_cursor,
             _replica_connected,
@@ -1823,7 +1831,7 @@ mod tests {
             let writer = JournalWriter::create(&path).unwrap();
             let active_conns = Arc::new(AtomicU64::new(0));
 
-            let (_, _, _, _, _, _, _, replication, replication_cursor, _) =
+            let (_, _, _, _, _, _, _, _, replication, replication_cursor, _) =
                 build_pipeline_with_replication(
                     exchange,
                     writer,
@@ -1845,7 +1853,7 @@ mod tests {
             let writer = JournalWriter::create(&path).unwrap();
             let active_conns = Arc::new(AtomicU64::new(0));
 
-            let (_, _, _, _, _, _, _, replication, replication_cursor, _) =
+            let (_, _, _, _, _, _, _, _, replication, replication_cursor, _) =
                 build_pipeline_with_replication(
                     exchange,
                     writer,

@@ -28,7 +28,25 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
 use melin_disruptor::padding::Sequence;
+use melin_disruptor::ring::QueueCursor;
 use tracing::{debug, error, info};
+
+/// Input disruptor capacity. Duplicated here to avoid depending on the engine
+/// crate — the value is stable (1 << 20 = 1,048,576 slots).
+const INPUT_QUEUE_CAPACITY: u64 = 1 << 20;
+
+/// Shared monitoring state passed to the health loop.
+/// Bundles all the atomics/cursors into one struct to avoid parameter explosion.
+struct HealthState {
+    active_connections: Arc<AtomicU64>,
+    events_processed: Arc<AtomicU64>,
+    journal_cursor: Arc<Sequence>,
+    matching_cursor: Arc<Sequence>,
+    input_cursor: Box<dyn QueueCursor>,
+    replication_cursor: Arc<AtomicU64>,
+    pipeline_healthy: Arc<AtomicBool>,
+    replica_connected: Option<Arc<AtomicBool>>,
+}
 
 /// Spawn the health endpoint thread. Returns the join handle.
 ///
@@ -38,11 +56,14 @@ use tracing::{debug, error, info};
 ///
 /// `pipeline_healthy` should be set to `true` at startup and flipped to
 /// `false` by the accept loop when a pipeline thread dies or on shutdown.
+#[allow(clippy::too_many_arguments)] // Bundled into HealthState internally.
 pub fn spawn(
     bind_addr: SocketAddr,
     active_connections: Arc<AtomicU64>,
     events_processed: Arc<AtomicU64>,
     journal_cursor: Arc<Sequence>,
+    matching_cursor: Arc<Sequence>,
+    input_cursor: Box<dyn QueueCursor>,
     replication_cursor: Arc<AtomicU64>,
     pipeline_healthy: Arc<AtomicBool>,
     replica_connected: Option<Arc<AtomicBool>>,
@@ -54,19 +75,21 @@ pub fn spawn(
 
     info!(addr = %bind_addr, "health endpoint listening");
 
+    let state = HealthState {
+        active_connections,
+        events_processed,
+        journal_cursor,
+        matching_cursor,
+        input_cursor,
+        replication_cursor,
+        pipeline_healthy,
+        replica_connected,
+    };
+
     let handle = std::thread::Builder::new()
         .name("health".into())
         .spawn(move || {
-            health_loop(
-                &listener,
-                &active_connections,
-                &events_processed,
-                &journal_cursor,
-                &replication_cursor,
-                &pipeline_healthy,
-                &replica_connected,
-                &shutdown,
-            );
+            health_loop(&listener, &state, &shutdown);
         })
         .expect("failed to spawn health thread");
 
@@ -81,24 +104,25 @@ struct HealthSnapshot {
     events_processed: u64,
     journal_seq: u64,
     replication_lag: u64,
+    input_queue_depth: u64,
     trading: bool,
 }
 
 impl HealthSnapshot {
     /// Collect a snapshot from the shared atomics.
-    fn collect(
-        active_connections: &AtomicU64,
-        events_processed: &AtomicU64,
-        journal_cursor: &Arc<Sequence>,
-        replication_cursor: &AtomicU64,
-        pipeline_healthy: &AtomicBool,
-        replica_connected: &Option<Arc<AtomicBool>>,
-    ) -> Self {
-        let healthy = pipeline_healthy.load(Ordering::Relaxed);
-        let conns = active_connections.load(Ordering::Relaxed);
-        let evts = events_processed.load(Ordering::Relaxed);
-        let journal_seq = journal_cursor.get().load(Ordering::Relaxed);
-        let repl_cursor = replication_cursor.load(Ordering::Relaxed);
+    fn collect(state: &HealthState) -> Self {
+        let healthy = state.pipeline_healthy.load(Ordering::Relaxed);
+        let conns = state.active_connections.load(Ordering::Relaxed);
+        let evts = state.events_processed.load(Ordering::Relaxed);
+        let journal_seq = state.journal_cursor.get().load(Ordering::Relaxed);
+        let repl_cursor = state.replication_cursor.load(Ordering::Relaxed);
+
+        // Input queue depth: producer_cursor - matching_cursor.
+        // Matching is the terminal consumer (gated on journal), so this
+        // is the total pending items in the input disruptor.
+        let producer_seq = state.input_cursor.load();
+        let matching_seq = state.matching_cursor.get().load(Ordering::Relaxed);
+        let input_queue_depth = producer_seq.saturating_sub(matching_seq);
 
         // Replication lag: 0 in standalone mode (cursor is u64::MAX).
         let replication_lag = if repl_cursor == u64::MAX {
@@ -109,7 +133,8 @@ impl HealthSnapshot {
 
         // Trading state: "trading" when standalone or replica connected,
         // "halted" when replication is enabled but replica is disconnected.
-        let trading = replica_connected
+        let trading = state
+            .replica_connected
             .as_ref()
             .is_none_or(|flag| flag.load(Ordering::Relaxed));
 
@@ -119,6 +144,7 @@ impl HealthSnapshot {
             events_processed: evts,
             journal_seq,
             replication_lag,
+            input_queue_depth,
             trading,
         }
     }
@@ -158,6 +184,12 @@ impl HealthSnapshot {
              # HELP melin_pipeline_healthy Whether the pipeline is healthy (1) or degraded (0).\n\
              # TYPE melin_pipeline_healthy gauge\n\
              melin_pipeline_healthy {}\n\
+             # HELP melin_input_queue_depth Items pending in the input disruptor.\n\
+             # TYPE melin_input_queue_depth gauge\n\
+             melin_input_queue_depth {}\n\
+             # HELP melin_input_queue_capacity Total input ring buffer capacity.\n\
+             # TYPE melin_input_queue_capacity gauge\n\
+             melin_input_queue_capacity {}\n\
              # HELP melin_trading_active Whether the engine is accepting orders (1) or halted (0).\n\
              # TYPE melin_trading_active gauge\n\
              melin_trading_active {}\n",
@@ -166,6 +198,8 @@ impl HealthSnapshot {
             self.journal_seq,
             self.replication_lag,
             healthy_val,
+            self.input_queue_depth,
+            INPUT_QUEUE_CAPACITY,
             trading_val,
         );
         c.position() as usize
@@ -255,29 +289,12 @@ fn write_http(buf: &mut [u8], content_type: &str, body: &[u8]) -> usize {
 }
 
 /// Main health endpoint loop. Accepts connections and writes status.
-fn health_loop(
-    listener: &TcpListener,
-    active_connections: &AtomicU64,
-    events_processed: &AtomicU64,
-    journal_cursor: &Arc<Sequence>,
-    replication_cursor: &AtomicU64,
-    pipeline_healthy: &AtomicBool,
-    replica_connected: &Option<Arc<AtomicBool>>,
-    shutdown: &AtomicBool,
-) {
+fn health_loop(listener: &TcpListener, state: &HealthState, shutdown: &AtomicBool) {
     while !shutdown.load(Ordering::Relaxed) {
         match listener.accept() {
             Ok((stream, addr)) => {
                 debug!(addr = %addr, "health check");
-                handle_health_connection(
-                    stream,
-                    active_connections,
-                    events_processed,
-                    journal_cursor,
-                    replication_cursor,
-                    pipeline_healthy,
-                    replica_connected,
-                );
+                handle_health_connection(stream, state);
             }
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                 // No pending connection — sleep briefly then retry.
@@ -295,34 +312,19 @@ fn health_loop(
 /// Best-effort — errors are debug-logged but don't affect the server.
 ///
 /// Zero heap allocations — all formatting uses stack buffers.
-fn handle_health_connection(
-    mut stream: TcpStream,
-    active_connections: &AtomicU64,
-    events_processed: &AtomicU64,
-    journal_cursor: &Arc<Sequence>,
-    replication_cursor: &AtomicU64,
-    pipeline_healthy: &AtomicBool,
-    replica_connected: &Option<Arc<AtomicBool>>,
-) {
+fn handle_health_connection(mut stream: TcpStream, state: &HealthState) {
     // Short write timeout — health probes should not block the thread.
     let _ = stream.set_write_timeout(Some(Duration::from_secs(1)));
 
-    let snapshot = HealthSnapshot::collect(
-        active_connections,
-        events_processed,
-        journal_cursor,
-        replication_cursor,
-        pipeline_healthy,
-        replica_connected,
-    );
+    let snapshot = HealthSnapshot::collect(state);
 
     let kind = detect_request(&mut stream);
 
     // Stack buffers — sized for worst case (all u64::MAX values).
     // Body: Prometheus body is ~1 KiB with max-length u64 values.
     // Response: body + HTTP headers (~200 bytes).
-    let mut body_buf = [0u8; 1280];
-    let mut resp_buf = [0u8; 1536];
+    let mut body_buf = [0u8; 1536];
+    let mut resp_buf = [0u8; 1792];
 
     let resp_len = match kind {
         RequestKind::Metrics => {
@@ -353,6 +355,14 @@ fn handle_health_connection(
 mod tests {
     use super::*;
     use std::io::Read;
+
+    /// Test-only QueueCursor backed by an AtomicU64.
+    struct MockCursor(AtomicU64);
+    impl QueueCursor for MockCursor {
+        fn load(&self) -> u64 {
+            self.0.load(Ordering::Relaxed)
+        }
+    }
 
     /// Helper: create a non-blocking listener and spawn the health loop.
     /// Returns (addr, events_processed, pipeline_healthy, shutdown_flag, join_handle).
@@ -391,20 +401,27 @@ mod tests {
         let active = Arc::new(AtomicU64::new(active));
         let events = Arc::new(AtomicU64::new(0));
         let journal = Arc::new(Sequence::new(AtomicU64::new(journal_seq)));
+        // Matching cursor = journal_seq (fully caught up) for most tests.
+        let matching = Arc::new(Sequence::new(AtomicU64::new(journal_seq)));
         let repl = Arc::new(AtomicU64::new(repl_cursor));
         let healthy = Arc::new(AtomicBool::new(true));
         let shutdown = Arc::new(AtomicBool::new(false));
 
-        let a = Arc::clone(&active);
-        let ev = Arc::clone(&events);
-        let j = Arc::clone(&journal);
-        let r = Arc::clone(&repl);
-        let h = Arc::clone(&healthy);
-        let rc = replica_connected;
         let s = Arc::clone(&shutdown);
+        let state = HealthState {
+            active_connections: active,
+            events_processed: Arc::clone(&events),
+            journal_cursor: journal,
+            matching_cursor: matching,
+            // Input cursor = journal_seq (empty queue) for most tests.
+            input_cursor: Box::new(MockCursor(AtomicU64::new(journal_seq))),
+            replication_cursor: repl,
+            pipeline_healthy: Arc::clone(&healthy),
+            replica_connected,
+        };
 
         let handle = std::thread::spawn(move || {
-            health_loop(&listener, &a, &ev, &j, &r, &h, &rc, &s);
+            health_loop(&listener, &state, &s);
         });
 
         (addr, events, healthy, shutdown, handle)
@@ -507,6 +524,7 @@ mod tests {
         let active = Arc::new(AtomicU64::new(7));
         let events = Arc::new(AtomicU64::new(0));
         let journal = Arc::new(Sequence::new(AtomicU64::new(99)));
+        let matching = Arc::new(Sequence::new(AtomicU64::new(99)));
         let repl = Arc::new(AtomicU64::new(u64::MAX));
         let healthy = Arc::new(AtomicBool::new(true));
         let shutdown = Arc::new(AtomicBool::new(false));
@@ -516,6 +534,8 @@ mod tests {
             Arc::clone(&active),
             Arc::clone(&events),
             Arc::clone(&journal),
+            Arc::clone(&matching),
+            Box::new(MockCursor(AtomicU64::new(99))),
             Arc::clone(&repl),
             Arc::clone(&healthy),
             None,
@@ -540,6 +560,8 @@ mod tests {
             Arc::new(AtomicU64::new(0)),
             Arc::new(AtomicU64::new(0)),
             Arc::new(Sequence::new(AtomicU64::new(0))),
+            Arc::new(Sequence::new(AtomicU64::new(0))),
+            Box::new(MockCursor(AtomicU64::new(0))),
             Arc::new(AtomicU64::new(u64::MAX)),
             Arc::new(AtomicBool::new(true)),
             None,
@@ -627,12 +649,14 @@ mod tests {
             "missing prometheus content type"
         );
 
-        // Verify all 6 metric lines.
+        // Verify all 8 metric lines.
         assert!(response.contains("melin_active_connections 5\n"));
         assert!(response.contains("melin_events_processed 1000\n"));
         assert!(response.contains("melin_journal_sequence 42\n"));
         assert!(response.contains("melin_replication_lag 2\n"));
         assert!(response.contains("melin_pipeline_healthy 1\n"));
+        assert!(response.contains("melin_input_queue_depth 0\n"));
+        assert!(response.contains("melin_input_queue_capacity 1048576\n"));
         assert!(response.contains("melin_trading_active 1\n"));
 
         shutdown.store(true, Ordering::Relaxed);
@@ -688,6 +712,44 @@ mod tests {
         assert!(
             response.contains("melin_events_processed 999999\n"),
             "events_processed not found in: {response}"
+        );
+
+        shutdown.store(true, Ordering::Relaxed);
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn input_queue_depth_in_metrics() {
+        // Set up with producer at 1000, matching at 900 → depth = 100.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let s = Arc::clone(&shutdown);
+        let state = HealthState {
+            active_connections: Arc::new(AtomicU64::new(0)),
+            events_processed: Arc::new(AtomicU64::new(0)),
+            journal_cursor: Arc::new(Sequence::new(AtomicU64::new(1000))),
+            matching_cursor: Arc::new(Sequence::new(AtomicU64::new(900))),
+            input_cursor: Box::new(MockCursor(AtomicU64::new(1000))),
+            replication_cursor: Arc::new(AtomicU64::new(u64::MAX)),
+            pipeline_healthy: Arc::new(AtomicBool::new(true)),
+            replica_connected: None,
+        };
+
+        let handle = std::thread::spawn(move || {
+            health_loop(&listener, &state, &s);
+        });
+
+        let response = http_request(addr, "GET /metrics HTTP/1.1\r\n\r\n");
+        assert!(
+            response.contains("melin_input_queue_depth 100\n"),
+            "expected depth 100, response: {response}"
+        );
+        assert!(
+            response.contains("melin_input_queue_capacity 1048576\n"),
+            "expected capacity metric, response: {response}"
         );
 
         shutdown.store(true, Ordering::Relaxed);

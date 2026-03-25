@@ -147,7 +147,7 @@ The TCP network stack is now the primary throughput limiter. The journal pipelin
 - Sparse account storage to reduce memory usage, see [docs/account-lifecycle.md](docs/account-lifecycle.md).
 
 ### Metrics & Observability
-- Prometheus metrics endpoint (`GET /metrics` on the health port — active connections, events processed, journal sequence, replication lag, pipeline health, trading state)
+- Prometheus metrics endpoint (`GET /metrics` on the health port — active connections, events processed, journal sequence, replication lag, pipeline health, input queue depth, trading state)
 - Admin TUI observability dashboard (live connection count, events processed, throughput, journal sequence — polled via `QueryStats` through the pipeline)
 
 ### Redundancy & High Availability

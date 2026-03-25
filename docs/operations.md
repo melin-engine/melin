@@ -415,6 +415,12 @@ melin_replication_lag 0
 # HELP melin_pipeline_healthy Whether the pipeline is healthy (1) or degraded (0).
 # TYPE melin_pipeline_healthy gauge
 melin_pipeline_healthy 1
+# HELP melin_input_queue_depth Items pending in the input disruptor.
+# TYPE melin_input_queue_depth gauge
+melin_input_queue_depth 128
+# HELP melin_input_queue_capacity Total input ring buffer capacity.
+# TYPE melin_input_queue_capacity gauge
+melin_input_queue_capacity 1048576
 # HELP melin_trading_active Whether the engine is accepting orders (1) or halted (0).
 # TYPE melin_trading_active gauge
 melin_trading_active 1
@@ -427,6 +433,8 @@ melin_trading_active 1
 | `melin_journal_sequence` | counter | Latest durable journal sequence number |
 | `melin_replication_lag` | gauge | `journal_seq - replication_cursor` (0 in standalone) |
 | `melin_pipeline_healthy` | gauge | 1 when all pipeline threads are alive, 0 otherwise |
+| `melin_input_queue_depth` | gauge | Items pending in the input disruptor (`producer - matching`) |
+| `melin_input_queue_capacity` | gauge | Total input ring buffer capacity (constant 1,048,576) |
 | `melin_trading_active` | gauge | 1 when accepting orders, 0 when halted |
 
 **Prometheus scrape config**:
