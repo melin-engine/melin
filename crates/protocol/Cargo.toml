@@ -12,5 +12,5 @@ ed25519-dalek = { workspace = true }
 melin-engine = { path = "../engine" }
 
 [dev-dependencies]
-bolero = "0.11"
+bolero = "0.13"
 tempfile = "3"

@@ -7,6 +7,6 @@ edition = "2024"
 melin-client = { path = "../client" }
 melin-protocol = { path = "../protocol" }
 ed25519-dalek = { workspace = true }
-ratatui = "0.29"
-crossterm = "0.28"
+ratatui = "0.30"
+crossterm = "0.29"
 tikv-jemallocator = { workspace = true }

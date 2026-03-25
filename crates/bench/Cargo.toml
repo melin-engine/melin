@@ -10,7 +10,6 @@ no-persist = ["melin-server/no-persist"]
 latency-trace = ["melin-server/latency-trace"]
 io-uring = ["melin-server/io-uring", "dep:io-uring"]
 pipeline-stats = ["melin-server/pipeline-stats"]
-chart = ["dep:ratatui", "dep:crossterm"]
 plot = ["dep:plotters"]
 
 [[bin]]
@@ -36,8 +35,6 @@ libc = { workspace = true }
 tikv-jemallocator = { workspace = true }
 tracing-subscriber = { workspace = true }
 io-uring = { version = "0.7", optional = true }
-ratatui = { version = "0.29", optional = true }
-crossterm = { version = "0.28", optional = true }
 plotters = { version = "0.3", optional = true, default-features = false, features = ["svg_backend", "line_series"] }
 rayon = "1"
 serde = { version = "1", features = ["derive"] }
