@@ -2,6 +2,17 @@
 
 Planned features not yet implemented. Ordered by category; see the [priority roadmap](#priority-roadmap) at the bottom for commercial-readiness ordering.
 
+## Priority Roadmap
+
+Ordered by importance for commercial readiness (exchange operators and investors).
+
+1. **Metrics & observability** — connection counts, queue depth, health endpoints. Operators need visibility.
+2. **Auction mechanisms** — opening/closing/volatility auctions. Differentiator for regulated venues.
+3. **Security hardening** — remaining [audit findings](security-audit.md): per-account order limits (SEC-03), order throttling (SEC-04), disk exhaustion handling (SEC-05), snapshot validation (SEC-09).
+
+Also needed: backpressure policy, gateway scalability (epoll/io_uring multiplexing), per-account permissions, crash injection tests (kill server at random points during load, verify recovery produces identical state — validates journal/snapshot/rotation crash safety end-to-end).
+
+
 ## Order Types
 - [ ] Iceberg (hidden quantity)
 
@@ -24,8 +35,6 @@ Planned features not yet implemented. Ordered by category; see the [priority roa
 - [ ] Output event log (durable ExecutionReport stream for audit trail)
 
 ## Networking
-- [ ] Batched io_uring SEND in response stage (reduce per-response syscall overhead)
-- [ ] TCP_CORK / MSG_MORE response batching (coalesce small frames into single TCP segments)
 - [ ] Backpressure handling (defined policy when disruptor is full)
 - [ ] TLS (encrypted client connections)
 - [ ] Investigate network protocol optims (do we need a length field?)
@@ -64,13 +73,4 @@ Most analytics can run on a **replica** replaying the journal, keeping the prima
 - [ ] Failover detection and promotion (leader election, split-brain prevention)
 - [ ] Client failover (reconnect to new primary, resume with sequence numbers)
 - [ ] Network partition handling (fencing, quorum-based decisions)
-
-## Priority Roadmap
-
-Ordered by importance for commercial readiness (exchange operators and investors).
-
-1. **Metrics & observability** — connection counts, queue depth, health endpoints. Operators need visibility.
-2. **Auction mechanisms** — opening/closing/volatility auctions. Differentiator for regulated venues.
-3. **Security hardening** — remaining [audit findings](security-audit.md): per-account order limits (SEC-03), order throttling (SEC-04), disk exhaustion handling (SEC-05), snapshot validation (SEC-09).
-
-Also needed: backpressure policy, gateway scalability (epoll/io_uring multiplexing), per-account permissions, crash injection tests (kill server at random points during load, verify recovery produces identical state — validates journal/snapshot/rotation crash safety end-to-end).
+- [ ] Snapshot schedule

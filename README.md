@@ -77,10 +77,9 @@ LAN round-trip benchmarks at [`ed9241d`](../../commit/ed9241d). Two or three Che
 
 | Mode | Throughput | p50 | p99 | p99.9 | max | Parameters |
 |------|-----------|-----|-----|-------|-----|------------|
+| **Single-order latency** | 13.7K/s | **72 µs** | 87 µs | 90 µs | 207 µs | 500K pairs, 1 client, window 1 |
 | **Full durability** (fsync) | **8.1M/s** | 439 µs | 569 µs | 636 µs | 1,017 µs | 100M pairs, 16 clients, window 256 |
 | **Synchronous replication** | **5.8M/s** | 633 µs | 841 µs | 933 µs | 1,123 µs | 100M pairs, 16 clients, window 256, primary+replica |
-| **Single-order latency** | 13.7K/s | **72 µs** | 87 µs | 90 µs | 207 µs | 500K pairs, 1 client, window 1 |
-| **No persistence** | **8.1M/s** | 453 µs | 602 µs | 668 µs | 1,054 µs | 100M pairs, 16 clients, window 256 |
 
 **Latency CDF** — three peak-load modes on the same axes:
 
@@ -119,8 +118,6 @@ The TCP network stack is now the primary throughput limiter. The journal pipelin
 - Kill switch (cancel all resting orders and pending stops for an account across all instruments)
 - Client deduplication (per-account OrderId high-water mark — prevents double-execution on crash-recovery retry)
 - Price band checks (static lower/upper bounds, per-instrument — part of circuit breaker config)
-- Bulk account provisioning (`ProvisionAccount` journal event — O(accounts) seeding, ~0.5s for 1M accounts)
-- Sparse account storage (memory scales with active accounts). Uses `astenn` extendible hashing (grows one bucket at a time, no full-table rehash spikes). See [docs/account-lifecycle.md](docs/account-lifecycle.md).
 - Withdraw event (debit funds, auto-evict zero-balance entries)
 
 ### Event Sourcing & Durability ([docs/journal.md](docs/journal.md))
@@ -147,6 +144,7 @@ The TCP network stack is now the primary throughput limiter. The journal pipelin
 ### Operations & Reliability ([docs/operations.md](docs/operations.md))
 - Structured logging (`tracing` crate, error-level for server malfunctions only)
 - Health checks / readiness probes (`ServerReady` wire handshake on connect)
+- Sparse account storage to reduce memory usage, see [docs/account-lifecycle.md](docs/account-lifecycle.md).
 
 ### Metrics & Observability
 - Admin TUI observability dashboard (live connection count, events processed, throughput, journal sequence — polled via `QueryStats` through the pipeline)
