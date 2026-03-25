@@ -1,76 +1,35 @@
 # Roadmap
 
-Planned features not yet implemented. Ordered by category; see the [priority roadmap](#priority-roadmap) at the bottom for commercial-readiness ordering.
+Planned features sorted by value/complexity ratio for commercial readiness (exchange operators and investors).
 
-## Priority Roadmap
-
-Ordered by importance for commercial readiness (exchange operators and investors).
-
-1. **Metrics & observability** — connection counts, queue depth, health endpoints. Operators need visibility.
-2. **Auction mechanisms** — opening/closing/volatility auctions. Differentiator for regulated venues.
-3. **Security hardening** — remaining [audit findings](security-audit.md): per-account order limits (SEC-03), order throttling (SEC-04), disk exhaustion handling (SEC-05), snapshot validation (SEC-09).
-
-Also needed: backpressure policy, gateway scalability (epoll/io_uring multiplexing), per-account permissions, crash injection tests (kill server at random points during load, verify recovery produces identical state — validates journal/snapshot/rotation crash safety end-to-end).
-
-
-## Order Types
-- [ ] Iceberg (hidden quantity)
-
-## Time-in-Force
-- [ ] GTD (Good-Til-Date)
-- [ ] Day
-
-## Matching Engine
-- [ ] Auction mechanisms (opening/closing/volatility auctions)
-
-## Fees
-- [ ] Tiered fee schedules (volume-based tiers, account-level overrides)
-
-## Risk & Accounting
-- [ ] Position/exposure limits
-- [ ] Order throttling (per-account rate limiting)
-- [ ] Custodian permission role — 4th permission level: can only Deposit and Withdraw, cannot trade or perform admin ops (instrument management, circuit breakers, risk limits, kill switch). Separates fund management from trading and exchange administration. Enables the gateway deposit/withdraw lifecycle pattern (see [docs/account-lifecycle.md](account-lifecycle.md)) without granting trading or admin privileges. Current roles: `Admin` (full access), `Trader` (submit/cancel orders), `ReadOnly` (heartbeats, future market data).
-
-## Event Sourcing & Durability
-- [ ] Output event log (durable ExecutionReport stream for audit trail)
-
-## Networking
-- [ ] Backpressure handling (defined policy when disruptor is full)
-- [ ] TLS (encrypted client connections)
-- [ ] Investigate network protocol optims (do we need a length field?)
-
-## Gateway
-- [ ] Output event channel from matching stage (broadcast — prerequisite for market data)
-- [ ] Market data dissemination (L2 snapshots, trade feed, BBO push updates)
-- [ ] Subscription management (subscribe/unsubscribe per instrument)
-- [ ] Reference data management (instrument lifecycle)
-
-## Authentication & Authorization
-- [ ] Per-account trading permissions
-
-## Metrics & Observability
-
-Most analytics can run on a **replica** replaying the journal, keeping the primary's hot path free of instrumentation jitter.
-
-### Primary node (lightweight, operational health)
-- [ ] Metrics transport (Prometheus endpoint or stats file — must not touch the hot path)
-- [ ] Disruptor queue depth / backpressure monitoring (input ring fill level)
-- [ ] Health/liveness endpoint (beyond current `ServerReady` handshake)
-
-### Replica or offline (journal-derived, zero primary impact)
-- [ ] Order/fill/cancel throughput counters (events per second by type)
-- [ ] Latency histograms (journal `timestamp_ns` → matching → response, per-event)
-- [ ] Volume analytics (traded volume per instrument, per account)
-- [ ] Book depth analytics (resting order counts, spread tracking)
-- [ ] Audit trail queries (full event history for regulatory compliance)
-- [ ] Fee/PnL accounting (when fees and position tracking exist)
-
-## Redundancy & High Availability
-- [ ] Halt trading on replica disconnect (currently degrades silently to local-only, acking un-replicated orders)
-- [ ] Catch-up from journal files (late-joining replica reads historical entries before live stream)
-- [ ] Snapshot transfer (replica too far behind for journal catch-up)
-- [ ] Manual promotion (operator command to promote replica to primary)
-- [ ] Failover detection and promotion (leader election, split-brain prevention)
-- [ ] Client failover (reconnect to new primary, resume with sequence numbers)
-- [ ] Network partition handling (fencing, quorum-based decisions)
-- [ ] Snapshot schedule
+| # | Feature | Commercial value | Complexity | Value/effort | Why |
+|---|---------|:---:|:---:|:---:|-----|
+| 1 | Health/liveness endpoint | High | Very low | ★★★★★ | Every ops team expects this. Trivial HTTP or TCP check. |
+| 2 | Halt trading on replica disconnect | High | Low | ★★★★★ | "What happens if the replica dies?" is a due diligence question. A flag + check in the accept path. |
+| 3 | Metrics transport (Prometheus) | High | Low | ★★★★☆ | Operators won't run blind. Expose counters already tracked via a side-channel. |
+| 4 | Disruptor queue depth monitoring | Medium | Very low | ★★★★☆ | Read the ring buffer cursors, expose as a metric. Near-free once metrics transport exists. |
+| 5 | Backpressure handling | High | Low | ★★★★☆ | "What happens when the ring is full?" — needs a clear answer. Reject-with-error is simplest. |
+| 6 | Day TIF | Medium | Very low | ★★★★☆ | Trivial — cancel at end-of-day. Most venues need it. |
+| 7 | Manual promotion | High | Medium | ★★★☆☆ | "How do I failover?" is a deal-breaker question. Admin command to promote replica. |
+| 8 | Output event channel | High | Medium | ★★★☆☆ | Prerequisite for market data, audit trail, and replica analytics. Unlocks many downstream features. |
+| 9 | GTD TIF | Low | Very low | ★★★☆☆ | Easy add, nice checkbox. Less asked-for than Day. |
+| 10 | Custodian role | Medium | Low | ★★★☆☆ | Separation of duties matters for regulated buyers. Small auth change. |
+| 11 | Per-account trading permissions | Medium | Medium | ★★★☆☆ | Multi-tenant deployments need account-level access control. |
+| 12 | Order throttling | Medium | Low | ★★★☆☆ | SEC-04 audit finding. Simple per-account counter on the hot path. |
+| 13 | Snapshot schedule | Medium | Low | ★★★☆☆ | Operators don't want to trigger snapshots manually. Timer + existing save logic. |
+| 14 | Output event log | High | Medium | ★★★☆☆ | Regulatory requirement, but depends on output event channel first. |
+| 15 | Reference data management | Medium | Medium | ★★★☆☆ | Instrument disable/remove. Operators expect lifecycle management. |
+| 16 | Catch-up from journal files | High | High | ★★☆☆☆ | Critical for production HA, but significant work (read historical segments, switch to live). |
+| 17 | TLS | Medium | Medium | ★★☆☆☆ | Some buyers require it (compliance). Most exchange deployments use VLAN instead. |
+| 18 | Tiered fee schedules | Medium | Medium | ★★☆☆☆ | Nice-to-have — most buyers customize fees anyway. |
+| 19 | Position/exposure limits | Medium | Medium | ★★☆☆☆ | Important for derivatives, less so for spot. |
+| 20 | Market data dissemination | High | High | ★★☆☆☆ | High value but large scope. Depends on output event channel. |
+| 21 | Iceberg orders | Low | Medium | ★★☆☆☆ | Niche. Only matters for venues with institutional flow. |
+| 22 | Auction mechanisms | High | Very high | ★☆☆☆☆ | Differentiator for regulated venues, but massive complexity (state machine, indicative pricing, uncrossing). |
+| 23 | Snapshot transfer | Medium | High | ★☆☆☆☆ | Needed for full HA, but catch-up from journal comes first. |
+| 24 | Client failover | Medium | High | ★☆☆☆☆ | Client-side reconnect + sequence resume. Significant protocol work. |
+| 25 | Failover detection + promotion | High | Very high | ★☆☆☆☆ | Leader election, split-brain — distributed systems hard mode. |
+| 26 | Network partition handling | High | Very high | ★☆☆☆☆ | Fencing, quorum. Same as above — extremely complex. |
+| 27 | Subscription management | Low | Medium | ★☆☆☆☆ | Only needed with market data. Out of scope without it. |
+| 28 | Replica analytics (6 items) | Low | Medium | ★☆☆☆☆ | Throughput counters, latency histograms, volume/book depth analytics, audit trail queries, fee/PnL accounting. Nice demos, but buyers build their own analytics. |
+| 29 | Protocol optims investigation | Low | Unknown | ★☆☆☆☆ | Research, not a feature. No commercial value until proven. |
