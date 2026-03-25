@@ -51,6 +51,7 @@ const TAG_CANCEL_REPLACE: u8 = 10;
 const TAG_SET_FEE_SCHEDULE: u8 = 31;
 const TAG_QUERY_STATS: u8 = 30;
 const TAG_WITHDRAW: u8 = 32;
+const TAG_END_OF_DAY: u8 = 33;
 
 // --- Response tags ---
 const TAG_PLACED: u8 = 11;
@@ -258,6 +259,10 @@ pub fn encode_request(request: &Request, seq: u64, buf: &mut [u8]) -> Result<usi
         }
         Request::QueryStats => {
             buf[pos] = TAG_QUERY_STATS;
+            pos += 1;
+        }
+        Request::EndOfDay => {
+            buf[pos] = TAG_END_OF_DAY;
             pos += 1;
         }
     }
@@ -487,6 +492,7 @@ pub fn decode_request(buf: &[u8]) -> Result<(u64, Request), ProtocolError> {
             ))
         }
         TAG_QUERY_STATS => Ok((seq, Request::QueryStats)),
+        TAG_END_OF_DAY => Ok((seq, Request::EndOfDay)),
         TAG_SET_FEE_SCHEDULE => {
             // symbol(4) + maker_fee_bps(2) + taker_fee_bps(2) = 8
             if payload.len() < 8 {
@@ -1203,6 +1209,7 @@ mod tests {
                 },
             },
             Request::QueryStats,
+            Request::EndOfDay,
         ]
     }
 

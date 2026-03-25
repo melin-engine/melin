@@ -18,6 +18,10 @@ pub(crate) struct RestingOrder {
     id: OrderId,
     account: AccountId,
     remaining: Quantity,
+    /// Stored to support selective cancellation (e.g., EndOfDay cancels
+    /// only Day orders, not GTC). IOC/FOK orders never rest, so this
+    /// is always GTC or Day in practice.
+    time_in_force: TimeInForce,
 }
 
 /// A pending stop order waiting to be triggered.
@@ -57,11 +61,17 @@ pub(crate) struct BookSide {
 
 impl RestingOrder {
     /// Create a new resting order (used by snapshot restore).
-    pub(crate) fn new(id: OrderId, account: AccountId, remaining: Quantity) -> Self {
+    pub(crate) fn new(
+        id: OrderId,
+        account: AccountId,
+        remaining: Quantity,
+        time_in_force: TimeInForce,
+    ) -> Self {
         Self {
             id,
             account,
             remaining,
+            time_in_force,
         }
     }
 
@@ -75,6 +85,10 @@ impl RestingOrder {
 
     pub(crate) fn remaining(&self) -> Quantity {
         self.remaining
+    }
+
+    pub(crate) fn time_in_force(&self) -> TimeInForce {
+        self.time_in_force
     }
 }
 
@@ -698,6 +712,46 @@ impl OrderBook {
         }
     }
 
+    /// Cancel all resting orders and pending stops with `TimeInForce::Day`.
+    /// Called at end-of-session. GTC orders are left untouched.
+    pub fn cancel_day_orders(&mut self, reports: &mut Vec<ExecutionReport>) {
+        let mut to_cancel: Vec<(AccountId, OrderId)> = Vec::new();
+
+        for (_, queue) in &self.bids.levels {
+            for order in queue {
+                if order.time_in_force == TimeInForce::Day {
+                    to_cancel.push((order.account, order.id));
+                }
+            }
+        }
+        for (_, queue) in &self.asks.levels {
+            for order in queue {
+                if order.time_in_force == TimeInForce::Day {
+                    to_cancel.push((order.account, order.id));
+                }
+            }
+        }
+
+        for stops in self.stop_buys.values() {
+            for stop in stops {
+                if stop.time_in_force == TimeInForce::Day {
+                    to_cancel.push((stop.account, stop.id));
+                }
+            }
+        }
+        for stops in self.stop_sells.values() {
+            for stop in stops {
+                if stop.time_in_force == TimeInForce::Day {
+                    to_cancel.push((stop.account, stop.id));
+                }
+            }
+        }
+
+        for (account, id) in to_cancel {
+            self.cancel(account, id, reports);
+        }
+    }
+
     fn execute_limit(&mut self, order: Order, price: Price, reports: &mut Vec<ExecutionReport>) {
         // Post-only: reject if the order would cross the spread.
         if let OrderType::Limit {
@@ -762,13 +816,16 @@ impl OrderBook {
                     });
                 } else {
                     match order.time_in_force {
-                        TimeInForce::GTC => {
+                        // GTC and Day both rest on the book. Day orders are
+                        // bulk-cancelled later by EndOfDay.
+                        TimeInForce::GTC | TimeInForce::Day => {
                             self.place_on_book(
                                 order.id,
                                 order.account,
                                 order.side,
                                 price,
                                 rem,
+                                order.time_in_force,
                                 reports,
                             );
                         }
@@ -1163,6 +1220,7 @@ impl OrderBook {
         side: Side,
         price: Price,
         quantity: Quantity,
+        time_in_force: TimeInForce,
         reports: &mut Vec<ExecutionReport>,
     ) {
         let book_side = match side {
@@ -1175,6 +1233,7 @@ impl OrderBook {
                 id,
                 account,
                 remaining: quantity,
+                time_in_force,
             },
         );
         self.order_index.insert((account, id), (side, price));

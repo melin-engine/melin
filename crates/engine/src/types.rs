@@ -193,6 +193,9 @@ pub enum TimeInForce {
     IOC,
     /// Fill-Or-Kill: fill entirely or cancel entirely.
     FOK,
+    /// Day: rests on the book like GTC, but automatically cancelled when
+    /// an `EndOfDay` event is processed.
+    Day,
 }
 
 /// Self-trade prevention mode, set per order.

@@ -1136,6 +1136,9 @@ impl MatchingStage {
             JournalEvent::CancelAll { account } => {
                 self.exchange.cancel_all(account, reports);
             }
+            JournalEvent::EndOfDay => {
+                self.exchange.end_of_day(reports);
+            }
             JournalEvent::SetCircuitBreaker { symbol, config } => {
                 self.exchange.set_circuit_breaker(symbol, config);
             }

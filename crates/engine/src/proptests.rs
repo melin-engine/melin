@@ -56,6 +56,7 @@ fn arb_tif() -> impl Strategy<Value = TimeInForce> {
         Just(TimeInForce::GTC),
         Just(TimeInForce::IOC),
         Just(TimeInForce::FOK),
+        Just(TimeInForce::Day),
     ]
 }
 

@@ -97,7 +97,7 @@ The TCP network stack is now the primary throughput limiter. The journal pipelin
 
 ### Order Types
 - Market, Limit, Stop (stop-loss), Stop-Limit
-- Time-in-force: GTC, IOC, FOK
+- Time-in-force: GTC, IOC, FOK, Day
 - Post-Only (maker-only, reject if would take)
 
 ### Matching Engine ([docs/matching-engine.md](docs/matching-engine.md))

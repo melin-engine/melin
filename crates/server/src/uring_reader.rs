@@ -816,6 +816,7 @@ fn request_to_event(request: &Request) -> JournalEvent {
             JournalEvent::SetFeeSchedule { symbol, schedule }
         }
         Request::QueryStats => JournalEvent::QueryStats,
+        Request::EndOfDay => JournalEvent::EndOfDay,
         Request::Heartbeat | Request::ChallengeResponse { .. } => {
             unreachable!("heartbeats and auth messages filtered before request_to_event")
         }

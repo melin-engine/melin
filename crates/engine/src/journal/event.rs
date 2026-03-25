@@ -70,6 +70,9 @@ pub enum JournalEvent {
     /// Internal only: not exposed via the wire protocol. Only the server's
     /// startup seeding path emits this event.
     ProvisionAccount { account: AccountId, amount: u64 },
+    /// Cancel all resting orders and pending stops with `TimeInForce::Day`
+    /// across all instruments. Triggered by an operator at end-of-session.
+    EndOfDay,
     /// Query server stats. Not journaled (no state change) — the journal
     /// stage skips this variant. Flows through the pipeline so the matching
     /// stage can read Exchange state without concurrency issues.

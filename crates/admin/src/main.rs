@@ -49,12 +49,14 @@ const ACTIONS: &[&str] = &[
     "Set Risk Limits",
     "Set Circuit Breaker",
     "Set Fee Schedule",
+    "End of Day",
 ];
 
 const TIF_OPTIONS: &[(&str, TimeInForce)] = &[
     ("GTC (Good-Til-Cancelled)", TimeInForce::GTC),
     ("IOC (Immediate-Or-Cancel)", TimeInForce::IOC),
     ("FOK (Fill-Or-Kill)", TimeInForce::FOK),
+    ("Day (cancel at end-of-day)", TimeInForce::Day),
 ];
 
 const STP_OPTIONS: &[(&str, SelfTradeProtection)] = &[
@@ -572,6 +574,11 @@ impl App {
                             buf: String::new(),
                             next: NextStep::FeeScheduleSymbol,
                         };
+                    }
+                    16 => {
+                        // End of Day — send immediately, no parameters.
+                        let _ = self.request_tx.send(Request::EndOfDay);
+                        self.log.push("Sent EndOfDay".into());
                     }
                     _ => {}
                 }

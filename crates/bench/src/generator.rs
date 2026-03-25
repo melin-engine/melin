@@ -105,6 +105,10 @@ pub struct GeneratorConfig {
     /// GTC limits since post-only + IOC/FOK is pointless.
     /// Default: 0.05 (5% of eligible limits).
     pub post_only_ratio: f64,
+    /// Probability that a resting limit order uses Day TIF instead of GTC.
+    /// Day orders are cancelled at end-of-session via `EndOfDay`.
+    /// Default: 0.10 (10% of resting limits).
+    pub day_order_ratio: f64,
     /// Conditional probability of a cancel-replace amendment when live orders
     /// exist. In real markets, market makers rapidly amend resting quotes —
     /// cancel-replace is more common than outright cancel.
@@ -137,6 +141,7 @@ impl Default for GeneratorConfig {
             fok_ratio: 0.02,
             stop_order_ratio: 0.03,
             post_only_ratio: 0.05,
+            day_order_ratio: 0.10,
             cancel_replace_ratio: 0.30,
             start_order_id: 1,
             seed: 42,
@@ -352,6 +357,10 @@ impl OrderFlowGenerator {
                 TimeInForce::FOK
             } else if tif_roll < self.config.fok_ratio + self.config.ioc_ratio {
                 TimeInForce::IOC
+            } else if tif_roll
+                < self.config.fok_ratio + self.config.ioc_ratio + self.config.day_order_ratio
+            {
+                TimeInForce::Day
             } else {
                 TimeInForce::GTC
             };
@@ -360,18 +369,18 @@ impl OrderFlowGenerator {
             // Aggressive post-only orders will be rejected by the engine,
             // which is realistic (clients sometimes submit post-only orders
             // that race against incoming fills and get rejected).
-            let post_only = tif == TimeInForce::GTC
+            let post_only = matches!(tif, TimeInForce::GTC | TimeInForce::Day)
                 && self.unit_dist.sample(&mut self.rng) < self.config.post_only_ratio;
             (OrderType::Limit { price, post_only }, tif)
         };
 
-        // Track orders that rest on the book (GTC limits and pending stops)
+        // Track orders that rest on the book (GTC/Day limits and pending stops)
         // for cancellation and amendment. Market/IOC/FOK don't rest.
         let rests = matches!(
             (&order_type, time_in_force),
-            (OrderType::Limit { .. }, TimeInForce::GTC)
-                | (OrderType::Stop { .. }, TimeInForce::GTC)
-                | (OrderType::StopLimit { .. }, TimeInForce::GTC)
+            (OrderType::Limit { .. }, TimeInForce::GTC | TimeInForce::Day)
+                | (OrderType::Stop { .. }, TimeInForce::GTC | TimeInForce::Day)
+                | (OrderType::StopLimit { .. }, TimeInForce::GTC | TimeInForce::Day)
         );
         if rests {
             let cap = self.live_orders.len();
@@ -673,7 +682,9 @@ mod tests {
             if let GeneratedEvent::Submit { order, .. } = ofg.next_event() {
                 match (&order.order_type, order.time_in_force) {
                     (OrderType::Market, _) => markets += 1,
-                    (OrderType::Limit { .. }, TimeInForce::GTC) => limit_gtc += 1,
+                    (OrderType::Limit { .. }, TimeInForce::GTC | TimeInForce::Day) => {
+                        limit_gtc += 1;
+                    }
                     (OrderType::Limit { .. }, TimeInForce::IOC) => limit_ioc += 1,
                     (OrderType::Limit { .. }, TimeInForce::FOK) => limit_fok += 1,
                     (OrderType::Stop { .. }, _) => stops += 1,
