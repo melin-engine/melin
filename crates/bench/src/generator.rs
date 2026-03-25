@@ -678,7 +678,6 @@ mod tests {
                     (OrderType::Limit { .. }, TimeInForce::FOK) => limit_fok += 1,
                     (OrderType::Stop { .. }, _) => stops += 1,
                     (OrderType::StopLimit { .. }, _) => stop_limits += 1,
-                    _ => {}
                 }
             }
         }

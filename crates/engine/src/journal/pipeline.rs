@@ -1692,14 +1692,21 @@ mod tests {
             let file_bytes = std::fs::read(&path).unwrap();
 
             // Find the start of user entries (after file header and genesis if present).
-            let mut offset = FILE_HEADER_SIZE;
-            #[cfg(feature = "hash-chain")]
-            {
-                // Skip past the genesis entry.
-                let genesis_len =
-                    u16::from_le_bytes([file_bytes[offset + 2], file_bytes[offset + 3]]) as usize;
-                offset += 20 + genesis_len + 4;
-            }
+            let offset = {
+                #[cfg(feature = "hash-chain")]
+                {
+                    // Skip past the genesis entry.
+                    let genesis_len = u16::from_le_bytes([
+                        file_bytes[FILE_HEADER_SIZE + 2],
+                        file_bytes[FILE_HEADER_SIZE + 3],
+                    ]) as usize;
+                    FILE_HEADER_SIZE + 20 + genesis_len + 4
+                }
+                #[cfg(not(feature = "hash-chain"))]
+                {
+                    FILE_HEADER_SIZE
+                }
+            };
 
             // Find end of valid data via reader.
             let mut reader = crate::journal::JournalReader::open(&path).unwrap();

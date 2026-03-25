@@ -1225,7 +1225,6 @@ mod tests {
         buf_v7[h] = 6; // TAG_CANCEL_ALL
         h += 1;
         le::put_u32(&mut buf_v7[h..], 5); // account
-        h += 4;
         let data_end = ENTRY_HEADER_SIZE + payload_len as usize;
         let crc = crc32c::crc32c(&buf_v7[..data_end]);
         le::put_u32(&mut buf_v7[data_end..], crc);
