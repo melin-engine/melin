@@ -1040,6 +1040,8 @@ pub fn run_dpdk(
         for i in 1..=config.instruments {
             producer.publish(InputSlot {
                 connection_id: 0,
+                key_hash: 0,
+                request_seq: 0,
                 event: JournalEvent::AddInstrument {
                     spec: InstrumentSpec {
                         symbol: Symbol(i),
@@ -1056,6 +1058,8 @@ pub fn run_dpdk(
         for acct in 1..=config.accounts {
             last_published_seq = producer.publish(InputSlot {
                 connection_id: 0,
+                key_hash: 0,
+                request_seq: 0,
                 event: JournalEvent::ProvisionAccount {
                     account: AccountId(acct),
                     amount: u64::MAX / 4,

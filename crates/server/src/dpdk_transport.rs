@@ -79,6 +79,9 @@ struct ConnectionState {
     addr: SocketAddr,
     handle: SocketHandle,
     auth: AuthState,
+    /// FxHash of the client's Ed25519 public key. Set after auth,
+    /// copied into every InputSlot for per-key idempotency dedup.
+    key_hash: u64,
     /// Incremental frame parsing state: accumulates bytes until a
     /// complete length-prefixed frame is available.
     parse_buf: Vec<u8>,
@@ -158,6 +161,7 @@ pub fn run_dpdk_poll(
                         nonce,
                         accepted_at: Instant::now(),
                     },
+                    key_hash: 0,
                     parse_buf: Vec::with_capacity(MAX_FRAME_SIZE + 4),
                 },
             );
@@ -298,8 +302,8 @@ fn process_auth_frame(
     let payload = conn.parse_buf[4..4 + frame_len].to_vec();
     conn.parse_buf.drain(..4 + frame_len);
 
-    // Decode the ChallengeResponse.
-    let request = match codec::decode_request(&payload) {
+    // Decode the ChallengeResponse (seq is ignored during auth).
+    let (_seq, request) = match codec::decode_request(&payload) {
         Ok(req) => req,
         Err(e) => {
             debug!(
@@ -381,7 +385,16 @@ fn process_auth_frame(
         "DPDK: authenticated"
     );
 
+    // Compute key hash for per-key idempotency dedup.
+    use std::hash::{Hash, Hasher};
+    let key_hash = {
+        let mut hasher = rustc_hash::FxHasher::default();
+        public_key_bytes.hash(&mut hasher);
+        hasher.finish()
+    };
+
     // Transition to authenticated state.
+    conn.key_hash = key_hash;
     conn.auth = AuthState::Authenticated {
         _permission: permission,
     };
@@ -441,13 +454,15 @@ fn process_trading_frames(
         let payload = &conn.parse_buf[cursor + 4..cursor + 4 + frame_len];
 
         match codec::decode_request(payload) {
-            Ok(request) => {
+            Ok((seq, request)) => {
                 if !shared_request::should_filter(&request) {
                     #[allow(clippy::let_unit_value)] // trace_ts() returns () without latency-trace
                     let recv_ts = trace_ts();
                     let event = shared_request::to_event(&request);
                     producer.publish(InputSlot {
                         connection_id: conn.connection_id.0,
+                        key_hash: conn.key_hash,
+                        request_seq: seq,
                         event,
                         #[allow(clippy::let_unit_value)]
                         publish_ts: trace_ts(),
