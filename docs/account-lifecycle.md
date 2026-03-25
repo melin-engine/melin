@@ -24,7 +24,7 @@ The self-contained design (no gateway cooperation needed for correctness) is the
 
 ### Memory cleanup
 
-Balance entries are automatically removed when both `available` and `reserved` reach zero, triggered by `Withdraw` events. HWM entries are **never evicted** — this prevents order ID replay after account withdrawal and re-deposit. At 12 bytes per trading account, HWM storage is negligible even at 10M accounts (~120 MB).
+Balance entries are automatically removed when both `available` and `reserved` reach zero, triggered by `Withdraw` events. HWM entries (`max_order_id` and `key_hwm`) are **never evicted** — this prevents order ID replay and request replay after account withdrawal and re-deposit. At ~12 bytes per account, HWM storage is negligible up to ~1B accounts (~32 GB). Beyond that, implement the `DeactivateAccount`/`ReactivateAccount` commands described below to evict and restore HWMs as part of the cold storage lifecycle.
 
 ## Withdraw Event
 
@@ -65,9 +65,9 @@ If the engine crashes between the gateway sending a `Withdraw` and persisting to
 
 ### HWM retention
 
-The order ID high-water mark is **never evicted**, even after full withdrawal. This is a safety mechanism: if an account is withdrawn and later re-deposited, old order IDs are still rejected. Without this, a client could replay stale order IDs after re-deposit.
+The order ID high-water mark (`max_order_id`) and per-key request sequence high-water mark (`key_hwm`) are **never evicted**, even after full withdrawal. This is a safety mechanism: if an account is withdrawn and later re-deposited, old order IDs and request sequences are still rejected. Without this, a client could replay stale order IDs or duplicate requests after re-deposit.
 
-If the gateway needs to reset the HWM (e.g., new session with fresh ID space), a dedicated `ResetHWM` event would be needed — but this is not implemented yet.
+For deployments exceeding ~1B accounts, the gateway cold storage lifecycle should be extended with `DeactivateAccount` and `ReactivateAccount(saved_hwm)` commands that evict and restore the HWM entries alongside the balance data. This keeps in-memory HWM storage proportional to active accounts rather than all-time accounts.
 
 ## Institutional considerations
 
