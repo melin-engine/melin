@@ -62,7 +62,7 @@ The server supports synchronous replication. Exactly one of `--replication-bind`
 | `--replica-of` | (none) | Run as a replica connected to the given primary address. The server does not accept client connections in this mode. |
 | `--replication-batch-size` | `32` | Maximum replication ring batches to coalesce into a single TCP write+flush. Higher values reduce syscall overhead but increase per-write latency. |
 | `--replication-heartbeat-secs` | `5` | Seconds between primary-to-replica heartbeats. Used for disconnect detection. |
-| `--replication-ring-size` | `64` | Slots in the replication ring buffer (must be power of two). Each slot holds up to 512 KiB. More slots = more buffering before the journal stage backpressures. Default: 64 (32 MiB). |
+| `--replication-ring-size` | `64` | Slots in the replication ring buffer (must be power of two). Each slot holds up to 512 KiB. More slots = more buffering before the journal stage backpressures. Default: 64 (32 MiB). See [Replication Ring Sizing](#replication-ring-sizing). |
 
 ### Startup Sequence
 
@@ -579,9 +579,31 @@ Total ring buffer memory: approximately **144 MiB**. This is fixed regardless of
 | Ring buffers | ~144 MiB |
 | Exchange state (order books, accounts) | 10-500 MiB (depends on active orders) |
 | Journal pre-allocation | 256 MiB chunk |
+| Replication ring (if enabled) | 32 MiB (64 slots × 512 KiB, tunable via `--replication-ring-size`) |
 | Connection state | ~4 KiB per connection |
 | jemalloc overhead | ~10-50 MiB |
-| **Total (typical)** | **300-800 MiB** |
+| **Total (typical)** | **300-800 MiB** (add replication ring if enabled) |
+
+### Replication Ring Sizing
+
+When replication is enabled, the journal stage publishes encoded batches to a pre-allocated ring buffer. The replication sender thread consumes the ring and writes batches over TCP to the replica. If the sender can't keep up (network congestion, replica GC pause), the ring fills and the journal stage **spin-waits** — stalling the entire pipeline.
+
+The default ring (64 slots × 512 KiB = 32 MiB) buffers approximately `64 × --max-journal-batch` events before backpressure:
+
+| Throughput | Events buffered (batch=4096) | Wall-clock headroom |
+|-----------|----------------------------|-------------------|
+| 100K orders/sec | ~262K events | ~2.6 s |
+| 1M orders/sec | ~262K events | ~262 ms |
+| 5M orders/sec | ~262K events | ~52 ms |
+| 10M orders/sec | ~262K events | ~26 ms |
+
+**When the default is sufficient**: same-rack replica on a dedicated NIC with sub-ms RTT. Under normal conditions the sender drains faster than the producer fills, and transient stalls are absorbed by the buffer.
+
+**When to increase**: cross-AZ replication, shared or congested networks, or very high throughput where 26 ms of headroom is tight (a single TCP retransmit timeout is typically 200 ms+). Doubling to 128 slots (64 MiB) or 256 slots (128 MiB) provides proportionally more jitter absorption.
+
+Increasing `--replication-ring-size` only helps with **transient** slowness. If the replica is persistently slower than the primary, no buffer size prevents backpressure — the replica must keep up at steady state.
+
+Note: when the replica **disconnects**, the replication cursor resets to `u64::MAX` and the pipeline degrades to local-only durability with no backpressure from the ring.
 
 ### Throughput vs. Disk Bandwidth
 
