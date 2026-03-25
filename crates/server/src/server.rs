@@ -330,7 +330,7 @@ pub fn run_with_shutdown<L: BlockingTransportListener>(
         output_consumer,
         journal_cursor,
         matching_cursor,
-        _events_processed,
+        events_processed,
         replication,
         replication_cursor,
         replica_connected,
@@ -589,6 +589,7 @@ pub fn run_with_shutdown<L: BlockingTransportListener>(
         Some(crate::health::spawn(
             health_addr,
             Arc::clone(&active_connections),
+            Arc::clone(&events_processed),
             Arc::clone(&journal_cursor),
             Arc::clone(&replication_cursor),
             Arc::clone(&pipeline_healthy),

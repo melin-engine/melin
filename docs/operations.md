@@ -357,18 +357,30 @@ systemctl disable --now irqbalance
 
 ### Health/Liveness Endpoint
 
-Plain TCP health check on a dedicated port (default `127.0.0.1:9877`). On connect, the server writes a one-line status and closes the connection. No authentication required.
+Dedicated health port (default `127.0.0.1:9877`). Supports three modes:
+
+1. **Plain TCP** (no data sent): writes a one-line status and closes — backward-compatible with `nc` and Kubernetes TCP probes.
+2. **HTTP `GET /`**: wraps the one-line status in an HTTP 200 response.
+3. **HTTP `GET /metrics`**: returns Prometheus text exposition format with all engine counters.
+
+No authentication required.
 
 ```sh
 # Quick liveness check (TCP connect succeeds = alive)
 nc -z 127.0.0.1 9877
 
-# Read status line
+# Read status line (plain TCP)
 nc 127.0.0.1 9877
-OK 42 1234567 0
+OK 42 1234567 0 trading
+
+# HTTP health check
+curl http://127.0.0.1:9877/
+
+# Prometheus metrics
+curl http://127.0.0.1:9877/metrics
 ```
 
-**Response format**: `OK|ERR <active_connections> <journal_seq> <replication_lag> trading|halted\n`
+**Plain-text response format**: `OK|ERR <active_connections> <journal_seq> <replication_lag> trading|halted\n`
 
 | Field | Description |
 |-------|-------------|
@@ -381,6 +393,51 @@ OK 42 1234567 0
 **Configuration**: `--health-bind <addr:port>` (default `127.0.0.1:9877`). Omit the flag to disable.
 
 **Kubernetes**: Use as a TCP liveness probe on the health port. For basic liveness, check TCP connect success. For readiness, parse the first and last tokens and require `OK` + `trading`.
+
+### Prometheus Metrics
+
+The `/metrics` endpoint exposes counters in Prometheus text exposition format. Zero new dependencies — the response is built from a hardcoded template.
+
+```sh
+curl http://127.0.0.1:9877/metrics
+# HELP melin_active_connections Current authenticated client connections.
+# TYPE melin_active_connections gauge
+melin_active_connections 42
+# HELP melin_events_processed Total events processed by the matching engine.
+# TYPE melin_events_processed counter
+melin_events_processed 1234567
+# HELP melin_journal_sequence Latest durable journal sequence number.
+# TYPE melin_journal_sequence counter
+melin_journal_sequence 1234567
+# HELP melin_replication_lag Journal sequence minus replication cursor.
+# TYPE melin_replication_lag gauge
+melin_replication_lag 0
+# HELP melin_pipeline_healthy Whether the pipeline is healthy (1) or degraded (0).
+# TYPE melin_pipeline_healthy gauge
+melin_pipeline_healthy 1
+# HELP melin_trading_active Whether the engine is accepting orders (1) or halted (0).
+# TYPE melin_trading_active gauge
+melin_trading_active 1
+```
+
+| Metric | Type | Description |
+|--------|------|-------------|
+| `melin_active_connections` | gauge | Currently authenticated client connections |
+| `melin_events_processed` | counter | Total events processed by the matching engine |
+| `melin_journal_sequence` | counter | Latest durable journal sequence number |
+| `melin_replication_lag` | gauge | `journal_seq - replication_cursor` (0 in standalone) |
+| `melin_pipeline_healthy` | gauge | 1 when all pipeline threads are alive, 0 otherwise |
+| `melin_trading_active` | gauge | 1 when accepting orders, 0 when halted |
+
+**Prometheus scrape config**:
+
+```yaml
+scrape_configs:
+  - job_name: melin
+    scrape_interval: 10s
+    static_configs:
+      - targets: ['127.0.0.1:9877']
+```
 
 ### Halt on Replica Disconnect
 

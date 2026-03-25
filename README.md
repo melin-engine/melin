@@ -143,10 +143,11 @@ The TCP network stack is now the primary throughput limiter. The journal pipelin
 
 ### Operations & Reliability ([docs/operations.md](docs/operations.md))
 - Structured logging (`tracing` crate, error-level for server malfunctions only)
-- Health/liveness TCP endpoint (`--health-bind`, returns `OK <conns> <seq> <lag>`)
+- Health/liveness TCP endpoint (`--health-bind`, returns `OK <conns> <seq> <lag>`) with Prometheus `/metrics` endpoint
 - Sparse account storage to reduce memory usage, see [docs/account-lifecycle.md](docs/account-lifecycle.md).
 
 ### Metrics & Observability
+- Prometheus metrics endpoint (`GET /metrics` on the health port — active connections, events processed, journal sequence, replication lag, pipeline health, trading state)
 - Admin TUI observability dashboard (live connection count, events processed, throughput, journal sequence — polled via `QueryStats` through the pipeline)
 
 ### Redundancy & High Availability
