@@ -52,6 +52,9 @@ pub struct ReaderRegistration<R> {
     pub addr: SocketAddr,
     /// Permission level established during the auth handshake.
     pub permission: Permission,
+    /// FxHash of the client's Ed25519 public key. Stored per-connection
+    /// and copied into every InputSlot for per-key idempotency dedup.
+    pub key_hash: u64,
 }
 
 /// One reader thread's channel + wakeup fd.
@@ -193,6 +196,9 @@ struct ConnectionState<R> {
     /// Permission level from auth handshake. Checked per-request on
     /// the reader thread (cold path), zero cost on the matching engine.
     permission: Permission,
+    /// FxHash of the client's Ed25519 public key. Copied into every
+    /// InputSlot for per-key idempotency dedup.
+    key_hash: u64,
     /// Owned reader — keeps the fd alive. Dropping closes the fd.
     _reader: R,
     fd: RawFd,
@@ -385,6 +391,7 @@ fn register_connection<R: AsRawFd>(
             connection_id: reg.connection_id.0,
             addr: reg.addr,
             permission: reg.permission,
+            key_hash: reg.key_hash,
             _reader: reg.reader,
             fd,
             len_buf: [0u8; 4],
@@ -478,8 +485,8 @@ fn process_connection<R>(
                     conn.reading_payload = false;
 
                     let frame = &conn.payload_buf[..conn.payload_len];
-                    let request = match codec::decode_request(frame) {
-                        Ok(req) => req,
+                    let (seq, request) = match codec::decode_request(frame) {
+                        Ok(pair) => pair,
                         Err(e) => {
                             debug!(
                                 connection_id = conn.connection_id,
@@ -532,6 +539,8 @@ fn process_connection<R>(
 
                     producer.publish(InputSlot {
                         connection_id: conn.connection_id,
+                        key_hash: conn.key_hash,
+                        request_seq: seq,
                         event,
                         publish_ts: trace_ts(),
                         recv_ts,

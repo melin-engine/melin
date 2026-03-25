@@ -73,6 +73,11 @@ pub struct Exchange {
     /// Used to reject withdrawals while orders are outstanding.
     /// Entries are removed when the count reaches zero.
     order_counts: HashMap<AccountId, u32>,
+    /// Per-key high-water mark for request sequences. Prevents duplicate
+    /// processing on retry after network failure. Keyed by u64 hash of
+    /// the client's Ed25519 public key. Never evicted — key count is
+    /// small (~100 max for any exchange).
+    key_hwm: HashMap<u64, u64>,
     /// Reusable buffer for consumed (account, order) keys from
     /// `process_reports()`. Avoids per-order Vec allocation on the hot path.
     consumed_buf: Vec<(AccountId, OrderId)>,
@@ -89,6 +94,7 @@ impl Exchange {
             order_info: HashMap::default(),
             max_order_id: HashMap::default(),
             order_counts: HashMap::default(),
+            key_hwm: HashMap::default(),
             consumed_buf: Vec::new(),
             presized: false,
         }
@@ -115,6 +121,7 @@ impl Exchange {
             // Pages are faulted during prefault() via insert/clear.
             max_order_id: HashMap::with_capacity_and_hasher(1_000_000, Default::default()),
             order_counts: HashMap::with_capacity_and_hasher(1_000_000, Default::default()),
+            key_hwm: HashMap::default(),
             consumed_buf: Vec::with_capacity(256),
             presized: true,
         }
@@ -126,6 +133,7 @@ impl Exchange {
         accounts: AccountManager,
         order_info: HashMap<(AccountId, OrderId), OrderInfo>,
         max_order_id: HashMap<AccountId, u64>,
+        key_hwm: HashMap<u64, u64>,
     ) -> Self {
         // Derive order_counts from order_info (count entries per account).
         let mut order_counts: HashMap<AccountId, u32> =
@@ -139,9 +147,35 @@ impl Exchange {
             order_info,
             max_order_id,
             order_counts,
+            key_hwm,
             consumed_buf: Vec::new(),
             presized: false,
         }
+    }
+
+    /// Check per-key request sequence for idempotency dedup.
+    /// Returns true if this is a new request (should be processed).
+    /// Returns false if duplicate (caller should reject with DuplicateRequest).
+    /// Exempt when key_hash == 0 (internal/seed events with no authenticated key).
+    pub fn check_request_seq(&mut self, key_hash: u64, request_seq: u64) -> bool {
+        if key_hash == 0 {
+            return true; // exempt: internal/seed events
+        }
+        let hwm = self.key_hwm.entry(key_hash).or_insert(0);
+        if request_seq <= *hwm {
+            return false; // duplicate
+        }
+        *hwm = request_seq;
+        true
+    }
+
+    /// Snapshot per-key request sequence HWMs for serialization.
+    pub(crate) fn snapshot_key_hwm(&self) -> Vec<(u64, u64)> {
+        self.key_hwm
+            .iter()
+            .filter(|(_, hwm)| **hwm > 0)
+            .map(|(&key, &hwm)| (key, hwm))
+            .collect()
     }
 
     /// Iterate over instrument specs (for snapshot serialization).
@@ -5751,5 +5785,166 @@ mod tests {
         reports.clear();
         exchange.cancel_all(ACCT_A, &mut reports);
         assert!(exchange.withdraw(ACCT_A, USD, 1).is_ok());
+    }
+
+    // --- Per-key request sequence dedup tests ---
+
+    #[test]
+    fn duplicate_request_rejected() {
+        let mut exchange = Exchange::new();
+        let key_hash: u64 = 0xDEAD_BEEF;
+
+        // First request with seq=1 should succeed.
+        assert!(exchange.check_request_seq(key_hash, 1));
+        // Same key, same seq=1 should be rejected.
+        assert!(!exchange.check_request_seq(key_hash, 1));
+        // Lower seq should also be rejected.
+        assert!(!exchange.check_request_seq(key_hash, 0));
+    }
+
+    #[test]
+    fn different_keys_overlapping_seqs() {
+        let mut exchange = Exchange::new();
+        let key_a: u64 = 0xAAAA;
+        let key_b: u64 = 0xBBBB;
+
+        // Both keys can use seq=1 independently.
+        assert!(exchange.check_request_seq(key_a, 1));
+        assert!(exchange.check_request_seq(key_b, 1));
+        // key_a advancing to seq=2 doesn't affect key_b.
+        assert!(exchange.check_request_seq(key_a, 2));
+        assert!(!exchange.check_request_seq(key_b, 1)); // still duplicate for key_b
+        assert!(exchange.check_request_seq(key_b, 2));
+    }
+
+    #[test]
+    fn key_hash_zero_exempt_from_dedup() {
+        let mut exchange = Exchange::new();
+
+        // key_hash=0 is exempt (internal/seed events) — always returns true.
+        assert!(exchange.check_request_seq(0, 1));
+        assert!(exchange.check_request_seq(0, 1)); // same seq, still passes
+        assert!(exchange.check_request_seq(0, 0)); // seq=0 also passes
+    }
+
+    #[test]
+    fn key_hwm_snapshot_round_trip() {
+        let mut exchange = Exchange::new();
+        let key_a: u64 = 0x1111;
+        let key_b: u64 = 0x2222;
+
+        exchange.check_request_seq(key_a, 5);
+        exchange.check_request_seq(key_b, 10);
+
+        let snap = exchange.snapshot_key_hwm();
+        assert_eq!(snap.len(), 2);
+
+        // Verify both entries are present (order may vary).
+        let mut sorted = snap.clone();
+        sorted.sort();
+        assert_eq!(sorted, vec![(key_a, 5), (key_b, 10)]);
+    }
+
+    #[test]
+    fn request_seq_must_be_strictly_increasing() {
+        let mut exchange = Exchange::new();
+        let key: u64 = 0xABCD;
+
+        // Gap in sequence is fine (3, then 10).
+        assert!(exchange.check_request_seq(key, 3));
+        assert!(exchange.check_request_seq(key, 10));
+        // seq=4..9 are now below HWM (10).
+        assert!(!exchange.check_request_seq(key, 4));
+        assert!(!exchange.check_request_seq(key, 9));
+        assert!(!exchange.check_request_seq(key, 10)); // equal = dup
+        assert!(exchange.check_request_seq(key, 11)); // strictly greater
+    }
+
+    #[test]
+    fn request_seq_zero_on_real_key_is_duplicate_after_any_request() {
+        let mut exchange = Exchange::new();
+        let key: u64 = 0xFF00;
+
+        // First request at seq=1 sets HWM to 1.
+        assert!(exchange.check_request_seq(key, 1));
+        // seq=0 is below HWM (1) — rejected as duplicate.
+        assert!(!exchange.check_request_seq(key, 0));
+    }
+
+    #[test]
+    fn request_seq_u64_max_accepted() {
+        let mut exchange = Exchange::new();
+        let key: u64 = 0x42;
+
+        // u64::MAX should be accepted as a valid seq.
+        assert!(exchange.check_request_seq(key, u64::MAX));
+        // Nothing can be strictly greater than u64::MAX.
+        assert!(!exchange.check_request_seq(key, u64::MAX));
+        assert!(!exchange.check_request_seq(key, u64::MAX - 1));
+    }
+
+    #[test]
+    fn dedup_interleaved_with_orders() {
+        // Verify that per-key dedup and per-account max_order_id are independent.
+        let mut exchange = Exchange::new();
+        exchange.add_instrument(btc_usd_spec());
+        exchange.deposit(ACCT_A, USD, 1_000_000);
+
+        let key: u64 = 0xAAAA;
+        let mut reports = Vec::new();
+
+        // Submit order via check_request_seq first (as the pipeline would).
+        assert!(exchange.check_request_seq(key, 1));
+        exchange.execute(
+            Symbol(1),
+            Order {
+                id: OrderId(100),
+                account: ACCT_A,
+                side: Side::Buy,
+                order_type: OrderType::Limit {
+                    price: price(100),
+                    post_only: false,
+                },
+                time_in_force: TimeInForce::GTC,
+                quantity: qty(1),
+                stp: SelfTradeProtection::default(),
+            },
+            &mut reports,
+        );
+        assert!(
+            reports
+                .iter()
+                .any(|r| matches!(r, ExecutionReport::Placed { .. }))
+        );
+
+        // Duplicate per-key seq should be caught before execute.
+        assert!(!exchange.check_request_seq(key, 1));
+
+        // But a new key seq with a duplicate order ID is caught by max_order_id.
+        reports.clear();
+        assert!(exchange.check_request_seq(key, 2));
+        exchange.execute(
+            Symbol(1),
+            Order {
+                id: OrderId(100), // same order ID as above
+                account: ACCT_A,
+                side: Side::Buy,
+                order_type: OrderType::Limit {
+                    price: price(100),
+                    post_only: false,
+                },
+                time_in_force: TimeInForce::GTC,
+                quantity: qty(1),
+                stp: SelfTradeProtection::default(),
+            },
+            &mut reports,
+        );
+        assert!(reports.iter().any(|r| matches!(
+            r,
+            ExecutionReport::Rejected {
+                reason: RejectReason::DuplicateOrderId,
+                ..
+            }
+        )));
     }
 }

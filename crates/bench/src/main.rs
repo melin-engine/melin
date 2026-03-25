@@ -586,6 +586,8 @@ fn run_pipeline_bench(
                 let ts = Instant::now();
                 producer.publish(InputSlot {
                     connection_id: 0,
+                    key_hash: 0,
+                    request_seq: 0,
                     event: JournalEvent::SubmitOrder {
                         symbol: Symbol(1),
                         order: Order {
@@ -915,7 +917,7 @@ fn auth_handshake(
         public_key: key.verifying_key().to_bytes(),
     };
     let mut buf = [0u8; 256];
-    let written = codec::encode_request(&request, &mut buf).expect("encode ChallengeResponse");
+    let written = codec::encode_request(&request, 0, &mut buf).expect("encode ChallengeResponse");
     std::io::Write::write_all(stream, &buf[..written]).expect("send ChallengeResponse");
     std::io::Write::flush(stream).expect("flush ChallengeResponse");
 
@@ -952,7 +954,7 @@ fn connect_uds(path: &std::path::Path) -> std::os::unix::net::UnixStream {
 /// connections during slow setup phases (e.g., 512 clients × ~100ms each).
 fn heartbeat_frame() -> [u8; 5] {
     let mut buf = [0u8; 128];
-    let n = codec::encode_request(&melin_protocol::message::Request::Heartbeat, &mut buf)
+    let n = codec::encode_request(&melin_protocol::message::Request::Heartbeat, 0, &mut buf)
         .expect("encode heartbeat");
     let mut frame = [0u8; 5];
     frame.copy_from_slice(&buf[..n]);

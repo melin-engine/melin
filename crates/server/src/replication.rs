@@ -868,8 +868,13 @@ fn replay_journal_bytes(
     let mut offset = 0;
     while offset < journal_bytes.len() {
         let remaining = &journal_bytes[offset..];
-        match melin_engine::journal::codec::decode(remaining) {
-            Ok((consumed, _sequence, _timestamp_ns, event)) => {
+        match melin_engine::journal::codec::decode(
+            remaining,
+            melin_engine::journal::codec::FORMAT_VERSION,
+        ) {
+            Ok((consumed, _sequence, _timestamp_ns, key_hash, request_seq, event)) => {
+                // Rebuild per-key HWM state on replica (same as primary replay).
+                exchange.check_request_seq(key_hash, request_seq);
                 replay_event(exchange, &event, reports);
                 offset += consumed;
             }

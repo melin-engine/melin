@@ -31,6 +31,7 @@ clap = { workspace = true }
 ed25519-dalek = { workspace = true }
 getrandom = "0.3"
 libc = { workspace = true }
+rustc-hash = "2"
 rand = { workspace = true }
 tracing = { workspace = true }
 tikv-jemallocator = { workspace = true }

@@ -27,7 +27,7 @@ use crate::journal::event::JournalEvent;
 use crate::journal::replication::{ReplicationConsumer, ReplicationProducer};
 use crate::journal::trace::{TraceTimestamp, trace_ts};
 use crate::journal::writer::JournalWriter;
-use crate::types::ExecutionReport;
+use crate::types::{AccountId, ExecutionReport, OrderId, RejectReason};
 
 use melin_disruptor::padding::Sequence;
 use melin_disruptor::ring;
@@ -83,6 +83,12 @@ const MAX_MATCHING_BATCH: usize = 32;
 pub struct InputSlot {
     /// Which client connection submitted this command.
     pub connection_id: u64,
+    /// FxHash of the client's Ed25519 public key. Used with `request_seq`
+    /// for per-key idempotency dedup. 0 for seed/internal events.
+    pub key_hash: u64,
+    /// Per-key monotonic request sequence number from the wire protocol.
+    /// Used with `key_hash` for idempotency dedup. 0 for seed/internal events.
+    pub request_seq: u64,
     /// The journaled event (order submit, cancel, etc.).
     pub event: JournalEvent,
     /// Timestamp when the publisher wrote this slot to the disruptor.
@@ -101,6 +107,8 @@ impl Default for InputSlot {
         // so the default value is never observed.
         Self {
             connection_id: 0,
+            key_hash: 0,
+            request_seq: 0,
             event: JournalEvent::Deposit {
                 account: crate::types::AccountId(0),
                 currency: crate::types::CurrencyId(0),
@@ -362,7 +370,12 @@ impl JournalStage {
                         if matches!(slot.event, JournalEvent::QueryStats) {
                             continue;
                         }
-                        if let Err(e) = self.writer.batch_append_with_ts(&slot.event, ts) {
+                        if let Err(e) = self.writer.batch_append_with_ts(
+                            &slot.event,
+                            ts,
+                            slot.key_hash,
+                            slot.request_seq,
+                        ) {
                             panic!("fatal journal encode error: {e}");
                         }
                     }
@@ -446,7 +459,12 @@ impl JournalStage {
                     if matches!(slot.event, JournalEvent::QueryStats) {
                         continue;
                     }
-                    if let Err(e) = self.writer.batch_append_with_ts(&slot.event, ts) {
+                    if let Err(e) = self.writer.batch_append_with_ts(
+                        &slot.event,
+                        ts,
+                        slot.key_hash,
+                        slot.request_seq,
+                    ) {
                         tracing::error!(error = %e, "journal encode error on drain");
                     }
                 }
@@ -602,7 +620,12 @@ impl JournalStage {
                     if matches!(slot.event, JournalEvent::QueryStats) {
                         continue;
                     }
-                    if let Err(e) = self.writer.batch_append_with_ts(&slot.event, ts) {
+                    if let Err(e) = self.writer.batch_append_with_ts(
+                        &slot.event,
+                        ts,
+                        slot.key_hash,
+                        slot.request_seq,
+                    ) {
                         panic!("fatal journal encode error: {e}");
                     }
                 }
@@ -925,7 +948,25 @@ impl MatchingStage {
                 }
 
                 local_events += 1;
-                self.process_event(slot, &mut reports);
+
+                // Per-key request dedup: check if this request's seq is
+                // strictly greater than the HWM for this key. Skip internal
+                // events (key_hash == 0) and QueryStats (already handled above).
+                if !self
+                    .exchange
+                    .check_request_seq(slot.key_hash, slot.request_seq)
+                {
+                    // Duplicate request — produce Rejected response.
+                    // Use OrderId(0) and AccountId(0) as placeholders since
+                    // we don't parse the specific order/account from the slot.
+                    reports.push(ExecutionReport::Rejected {
+                        order_id: OrderId(0),
+                        account: AccountId(0),
+                        reason: RejectReason::DuplicateRequest,
+                    });
+                } else {
+                    self.process_event(slot, &mut reports);
+                }
 
                 #[cfg(feature = "latency-trace")]
                 let exec_end = trace_ts();
@@ -978,7 +1019,20 @@ impl MatchingStage {
                 continue;
             }
             reports.clear();
-            self.process_event(&slot, reports);
+
+            // Per-key request dedup (same as the main run loop).
+            if !self
+                .exchange
+                .check_request_seq(slot.key_hash, slot.request_seq)
+            {
+                reports.push(ExecutionReport::Rejected {
+                    order_id: OrderId(0),
+                    account: AccountId(0),
+                    reason: RejectReason::DuplicateRequest,
+                });
+            } else {
+                self.process_event(&slot, reports);
+            }
 
             #[allow(clippy::let_unit_value)]
             let match_complete_ts = trace_ts();
@@ -1307,6 +1361,8 @@ mod tests {
 
         producer.publish(InputSlot {
             connection_id: 1,
+            key_hash: 0,
+            request_seq: 0,
             event: JournalEvent::AddInstrument {
                 spec: InstrumentSpec {
                     symbol: Symbol(1),
@@ -1319,6 +1375,8 @@ mod tests {
         });
         producer.publish(InputSlot {
             connection_id: 1,
+            key_hash: 0,
+            request_seq: 0,
             event: JournalEvent::Deposit {
                 account: AccountId(1),
                 currency: CurrencyId(1),
@@ -1383,6 +1441,8 @@ mod tests {
 
         input_producer.publish(InputSlot {
             connection_id: 42,
+            key_hash: 0,
+            request_seq: 0,
             event: JournalEvent::SubmitOrder {
                 symbol: Symbol(1),
                 order: limit_order(1, AccountId(2), Side::Sell, 100, 50),
@@ -1460,6 +1520,8 @@ mod tests {
         // Submit an order through the pipeline.
         input_producer.publish(InputSlot {
             connection_id: 1,
+            key_hash: 0,
+            request_seq: 0,
             event: JournalEvent::SubmitOrder {
                 symbol: Symbol(1),
                 order: limit_order(1, AccountId(2), Side::Sell, 100, 50),
@@ -1556,6 +1618,8 @@ mod tests {
         // Submit an order through the pipeline.
         input_producer.publish(InputSlot {
             connection_id: 1,
+            key_hash: 0,
+            request_seq: 0,
             event: JournalEvent::SubmitOrder {
                 symbol: Symbol(1),
                 order: limit_order(1, AccountId(2), Side::Sell, 100, 50),
@@ -1609,7 +1673,9 @@ mod tests {
 
         // Verify the replication batch contains valid journal entries with
         // the same sequence numbers as the on-disk journal.
-        let (consumed, seq, _ts, event) = crate::journal::codec::decode(&repl_data).unwrap();
+        let (consumed, seq, _ts, _kh, _rs, event) =
+            crate::journal::codec::decode(&repl_data, crate::journal::codec::FORMAT_VERSION)
+                .unwrap();
         assert!(consumed > 0);
         assert_eq!(
             seq, FIRST_SEQ,

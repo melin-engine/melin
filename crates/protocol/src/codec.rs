@@ -3,7 +3,16 @@
 //! Manual serialization (no serde) for zero allocation, predictable layout,
 //! and no format stability concerns across dependency versions.
 //!
-//! ## Frame layout (little-endian)
+//! ## Request frame layout (little-endian)
+//!
+//! | Field     | Type | Bytes | Purpose                              |
+//! |-----------|------|-------|--------------------------------------|
+//! | length    | u32  | 4     | Byte count of seq + type_tag + payload |
+//! | seq       | u64  | 8     | Per-key request sequence (idempotency) |
+//! | type_tag  | u8   | 1     | Message discriminant                 |
+//! | payload   | ...  | var   | Variant-specific fields              |
+//!
+//! ## Response frame layout (little-endian)
 //!
 //! | Field     | Type | Bytes | Purpose                              |
 //! |-----------|------|-------|--------------------------------------|
@@ -81,13 +90,18 @@ const REJECT_UNKNOWN_ORDER: u8 = 11;
 const REJECT_PRICE_WOULD_CROSS: u8 = 12;
 const REJECT_POST_ONLY_WOULD_CROSS: u8 = 13;
 const REJECT_HAS_RESTING_ORDERS: u8 = 14;
+const REJECT_DUPLICATE_REQUEST: u8 = 15;
 
-/// Encode a request into `buf`. Returns total bytes written (length prefix + tag + payload).
+/// Encode a request into `buf`. Returns total bytes written (length prefix + seq + tag + payload).
 ///
-/// The caller must ensure `buf` is large enough (128 bytes is always sufficient).
-pub fn encode_request(request: &Request, buf: &mut [u8]) -> Result<usize, ProtocolError> {
-    // Reserve 4 bytes for the length prefix, write tag + payload after it.
+/// The caller must ensure `buf` is large enough (136 bytes is always sufficient).
+/// `seq` is the per-key monotonic request sequence for idempotency dedup.
+/// Heartbeat and ChallengeResponse use `seq = 0` (exempt from dedup).
+pub fn encode_request(request: &Request, seq: u64, buf: &mut [u8]) -> Result<usize, ProtocolError> {
+    // Reserve 4 bytes for the length prefix, write seq + tag + payload after it.
     let mut pos = 4;
+    le::put_u64(&mut buf[pos..], seq);
+    pos += 8;
 
     match request {
         Request::SubmitOrder { symbol, order } => {
@@ -254,14 +268,17 @@ pub fn encode_request(request: &Request, buf: &mut [u8]) -> Result<usize, Protoc
 
 /// Decode a request from `buf` (after the length prefix has been stripped).
 ///
-/// `buf` should contain exactly the tag + payload bytes (no length prefix).
-pub fn decode_request(buf: &[u8]) -> Result<Request, ProtocolError> {
-    if buf.is_empty() {
+/// `buf` should contain exactly the seq + tag + payload bytes (no length prefix).
+/// Returns `(seq, Request)` where `seq` is the per-key idempotency sequence.
+pub fn decode_request(buf: &[u8]) -> Result<(u64, Request), ProtocolError> {
+    // Need at least seq(8) + tag(1) = 9 bytes.
+    if buf.len() < 9 {
         return Err(ProtocolError::Truncated);
     }
 
-    let tag = buf[0];
-    let payload = &buf[1..];
+    let seq = le::get_u64(&buf[0..]);
+    let tag = buf[8];
+    let payload = &buf[9..];
 
     match tag {
         TAG_SUBMIT_ORDER => {
@@ -270,28 +287,34 @@ pub fn decode_request(buf: &[u8]) -> Result<Request, ProtocolError> {
             }
             let symbol = Symbol(le::get_u32(&payload[0..]));
             let (_, order) = decode_order(&payload[4..])?;
-            Ok(Request::SubmitOrder { symbol, order })
+            Ok((seq, Request::SubmitOrder { symbol, order }))
         }
         TAG_CANCEL_ORDER => {
             // symbol(4) + account(4) + order_id(8) = 16
             if payload.len() < 16 {
                 return Err(ProtocolError::Truncated);
             }
-            Ok(Request::CancelOrder {
-                symbol: Symbol(le::get_u32(&payload[0..])),
-                account: AccountId(le::get_u32(&payload[4..])),
-                order_id: OrderId(le::get_u64(&payload[8..])),
-            })
+            Ok((
+                seq,
+                Request::CancelOrder {
+                    symbol: Symbol(le::get_u32(&payload[0..])),
+                    account: AccountId(le::get_u32(&payload[4..])),
+                    order_id: OrderId(le::get_u64(&payload[8..])),
+                },
+            ))
         }
         TAG_CANCEL_ALL => {
             if payload.len() < 4 {
                 return Err(ProtocolError::Truncated);
             }
-            Ok(Request::CancelAll {
-                account: AccountId(le::get_u32(&payload[0..])),
-            })
+            Ok((
+                seq,
+                Request::CancelAll {
+                    account: AccountId(le::get_u32(&payload[0..])),
+                },
+            ))
         }
-        TAG_REQUEST_HEARTBEAT => Ok(Request::Heartbeat),
+        TAG_REQUEST_HEARTBEAT => Ok((seq, Request::Heartbeat)),
         TAG_CHALLENGE_RESPONSE => {
             if payload.len() < 96 {
                 return Err(ProtocolError::Truncated);
@@ -300,42 +323,54 @@ pub fn decode_request(buf: &[u8]) -> Result<Request, ProtocolError> {
             signature.copy_from_slice(&payload[..64]);
             let mut public_key = [0u8; 32];
             public_key.copy_from_slice(&payload[64..96]);
-            Ok(Request::ChallengeResponse {
-                signature,
-                public_key,
-            })
+            Ok((
+                seq,
+                Request::ChallengeResponse {
+                    signature,
+                    public_key,
+                },
+            ))
         }
         TAG_ADD_INSTRUMENT => {
             if payload.len() < 12 {
                 return Err(ProtocolError::Truncated);
             }
-            Ok(Request::AddInstrument {
-                spec: InstrumentSpec {
-                    symbol: Symbol(le::get_u32(&payload[0..])),
-                    base: CurrencyId(le::get_u32(&payload[4..])),
-                    quote: CurrencyId(le::get_u32(&payload[8..])),
+            Ok((
+                seq,
+                Request::AddInstrument {
+                    spec: InstrumentSpec {
+                        symbol: Symbol(le::get_u32(&payload[0..])),
+                        base: CurrencyId(le::get_u32(&payload[4..])),
+                        quote: CurrencyId(le::get_u32(&payload[8..])),
+                    },
                 },
-            })
+            ))
         }
         TAG_DEPOSIT => {
             if payload.len() < 16 {
                 return Err(ProtocolError::Truncated);
             }
-            Ok(Request::Deposit {
-                account: AccountId(le::get_u32(&payload[0..])),
-                currency: CurrencyId(le::get_u32(&payload[4..])),
-                amount: le::get_u64(&payload[8..]),
-            })
+            Ok((
+                seq,
+                Request::Deposit {
+                    account: AccountId(le::get_u32(&payload[0..])),
+                    currency: CurrencyId(le::get_u32(&payload[4..])),
+                    amount: le::get_u64(&payload[8..]),
+                },
+            ))
         }
         TAG_WITHDRAW => {
             if payload.len() < 16 {
                 return Err(ProtocolError::Truncated);
             }
-            Ok(Request::Withdraw {
-                account: AccountId(le::get_u32(&payload[0..])),
-                currency: CurrencyId(le::get_u32(&payload[4..])),
-                amount: le::get_u64(&payload[8..]),
-            })
+            Ok((
+                seq,
+                Request::Withdraw {
+                    account: AccountId(le::get_u32(&payload[0..])),
+                    currency: CurrencyId(le::get_u32(&payload[4..])),
+                    amount: le::get_u64(&payload[8..]),
+                },
+            ))
         }
         TAG_SET_RISK_LIMITS => {
             if payload.len() < 5 {
@@ -367,13 +402,16 @@ pub fn decode_request(buf: &[u8]) -> Result<Request, ProtocolError> {
                 None
             };
 
-            Ok(Request::SetRiskLimits {
-                symbol,
-                limits: RiskLimits {
-                    max_order_qty,
-                    max_order_notional,
+            Ok((
+                seq,
+                Request::SetRiskLimits {
+                    symbol,
+                    limits: RiskLimits {
+                        max_order_qty,
+                        max_order_notional,
+                    },
                 },
-            })
+            ))
         }
         TAG_SET_CIRCUIT_BREAKER => {
             if payload.len() < 5 {
@@ -408,14 +446,17 @@ pub fn decode_request(buf: &[u8]) -> Result<Request, ProtocolError> {
 
             let halted = flags & 4 != 0;
 
-            Ok(Request::SetCircuitBreaker {
-                symbol,
-                config: CircuitBreakerConfig {
-                    price_band_lower,
-                    price_band_upper,
-                    halted,
+            Ok((
+                seq,
+                Request::SetCircuitBreaker {
+                    symbol,
+                    config: CircuitBreakerConfig {
+                        price_band_lower,
+                        price_band_upper,
+                        halted,
+                    },
                 },
-            })
+            ))
         }
         TAG_CANCEL_REPLACE => {
             // symbol(4) + account(4) + order_id(8) + new_price(8) + new_quantity(8) = 32
@@ -431,15 +472,18 @@ pub fn decode_request(buf: &[u8]) -> Result<Request, ProtocolError> {
             let new_quantity = NonZeroU64::new(le::get_u64(&payload[24..])).ok_or(
                 ProtocolError::InvalidField("cancel-replace new_quantity is zero"),
             )?;
-            Ok(Request::CancelReplace {
-                symbol,
-                account,
-                order_id,
-                new_price: Price(new_price),
-                new_quantity: Quantity(new_quantity),
-            })
+            Ok((
+                seq,
+                Request::CancelReplace {
+                    symbol,
+                    account,
+                    order_id,
+                    new_price: Price(new_price),
+                    new_quantity: Quantity(new_quantity),
+                },
+            ))
         }
-        TAG_QUERY_STATS => Ok(Request::QueryStats),
+        TAG_QUERY_STATS => Ok((seq, Request::QueryStats)),
         TAG_SET_FEE_SCHEDULE => {
             // symbol(4) + maker_fee_bps(2) + taker_fee_bps(2) = 8
             if payload.len() < 8 {
@@ -448,13 +492,16 @@ pub fn decode_request(buf: &[u8]) -> Result<Request, ProtocolError> {
             let symbol = Symbol(le::get_u32(&payload[0..]));
             let maker_fee_bps = le::get_i16(&payload[4..]);
             let taker_fee_bps = le::get_i16(&payload[6..]);
-            Ok(Request::SetFeeSchedule {
-                symbol,
-                schedule: FeeSchedule {
-                    maker_fee_bps,
-                    taker_fee_bps,
+            Ok((
+                seq,
+                Request::SetFeeSchedule {
+                    symbol,
+                    schedule: FeeSchedule {
+                        maker_fee_bps,
+                        taker_fee_bps,
+                    },
                 },
-            })
+            ))
         }
         _ => Err(ProtocolError::UnknownTag(tag)),
     }
@@ -964,6 +1011,7 @@ fn encode_reject_reason(reason: RejectReason) -> u8 {
         RejectReason::PriceWouldCross => REJECT_PRICE_WOULD_CROSS,
         RejectReason::PostOnlyWouldCross => REJECT_POST_ONLY_WOULD_CROSS,
         RejectReason::HasRestingOrders => REJECT_HAS_RESTING_ORDERS,
+        RejectReason::DuplicateRequest => REJECT_DUPLICATE_REQUEST,
     }
 }
 
@@ -984,6 +1032,7 @@ fn decode_reject_reason(b: u8) -> Result<RejectReason, ProtocolError> {
         REJECT_PRICE_WOULD_CROSS => Ok(RejectReason::PriceWouldCross),
         REJECT_POST_ONLY_WOULD_CROSS => Ok(RejectReason::PostOnlyWouldCross),
         REJECT_HAS_RESTING_ORDERS => Ok(RejectReason::HasRestingOrders),
+        REJECT_DUPLICATE_REQUEST => Ok(RejectReason::DuplicateRequest),
         _ => Err(ProtocolError::InvalidField("reject reason")),
     }
 }
@@ -1244,6 +1293,16 @@ mod tests {
                 account: AccountId(10),
                 reason: RejectReason::PostOnlyWouldCross,
             }),
+            ResponseKind::Report(ExecutionReport::Rejected {
+                order_id: OrderId(19),
+                account: AccountId(10),
+                reason: RejectReason::HasRestingOrders,
+            }),
+            ResponseKind::Report(ExecutionReport::Rejected {
+                order_id: OrderId(20),
+                account: AccountId(10),
+                reason: RejectReason::DuplicateRequest,
+            }),
             ResponseKind::Report(ExecutionReport::Replaced {
                 order_id: OrderId(42),
                 side: Side::Buy,
@@ -1272,9 +1331,11 @@ mod tests {
         let mut buf = [0u8; 256];
 
         for (i, request) in requests.iter().enumerate() {
-            let written = encode_request(request, &mut buf).unwrap();
+            let seq = (i as u64) + 1;
+            let written = encode_request(request, seq, &mut buf).unwrap();
             // Skip the 4-byte length prefix for decode.
-            let decoded = decode_request(&buf[4..written]).unwrap();
+            let (decoded_seq, decoded) = decode_request(&buf[4..written]).unwrap();
+            assert_eq!(decoded_seq, seq, "seq mismatch for variant {i}");
             assert_eq!(&decoded, request, "request variant {i}");
         }
     }
@@ -1293,17 +1354,27 @@ mod tests {
 
     #[test]
     fn truncated_request_detected() {
+        // Empty buffer — not enough for seq(8) + tag(1).
         let result = decode_request(&[]);
         assert!(matches!(result, Err(ProtocolError::Truncated)));
 
-        // Tag present but payload too short for SubmitOrder.
-        let result = decode_request(&[TAG_SUBMIT_ORDER, 0, 0]);
+        // Only 3 bytes — still too short for seq(8) + tag(1).
+        let result = decode_request(&[0; 3]);
+        assert!(matches!(result, Err(ProtocolError::Truncated)));
+
+        // seq(8) + tag present but payload too short for SubmitOrder.
+        let mut short = [0u8; 11];
+        short[8] = TAG_SUBMIT_ORDER;
+        let result = decode_request(&short);
         assert!(matches!(result, Err(ProtocolError::Truncated)));
     }
 
     #[test]
     fn unknown_request_tag_detected() {
-        let result = decode_request(&[255]);
+        // seq(8) + unknown tag byte.
+        let mut buf = [0u8; 9];
+        buf[8] = 255;
+        let result = decode_request(&buf);
         assert!(matches!(result, Err(ProtocolError::UnknownTag(255))));
     }
 
@@ -1326,10 +1397,47 @@ mod tests {
             account: AccountId(1),
             order_id: OrderId(42),
         };
-        let mut buf = [0u8; 128];
-        let written = encode_request(&request, &mut buf).unwrap();
+        let mut buf = [0u8; 136];
+        let written = encode_request(&request, 42, &mut buf).unwrap();
 
         let length = le::get_u32(&buf[0..]) as usize;
         assert_eq!(length, written - 4, "length prefix should be total - 4");
+    }
+
+    #[test]
+    fn seq_zero_round_trips() {
+        // Heartbeat and ChallengeResponse use seq=0.
+        let request = Request::Heartbeat;
+        let mut buf = [0u8; 136];
+        let written = encode_request(&request, 0, &mut buf).unwrap();
+        let (decoded_seq, decoded) = decode_request(&buf[4..written]).unwrap();
+        assert_eq!(decoded_seq, 0);
+        assert_eq!(decoded, request);
+    }
+
+    #[test]
+    fn seq_max_round_trips() {
+        let request = Request::Deposit {
+            account: AccountId(1),
+            currency: CurrencyId(2),
+            amount: 100,
+        };
+        let mut buf = [0u8; 136];
+        let written = encode_request(&request, u64::MAX, &mut buf).unwrap();
+        let (decoded_seq, decoded) = decode_request(&buf[4..written]).unwrap();
+        assert_eq!(decoded_seq, u64::MAX);
+        assert_eq!(decoded, request);
+    }
+
+    #[test]
+    fn length_prefix_includes_seq_bytes() {
+        // The length field must include seq(8) + tag(1) + payload.
+        let request = Request::Heartbeat;
+        let mut buf = [0u8; 136];
+        let written = encode_request(&request, 0, &mut buf).unwrap();
+        let length = le::get_u32(&buf[0..]) as usize;
+        // Heartbeat has no payload, so length = seq(8) + tag(1) = 9.
+        assert_eq!(length, 9);
+        assert_eq!(written, 4 + 9); // 4-byte prefix + 9 payload
     }
 }

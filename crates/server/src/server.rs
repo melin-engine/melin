@@ -17,6 +17,8 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
+use std::hash::{Hash, Hasher};
+
 use tracing::{debug, error, info, warn};
 
 use melin_engine::journal::JournaledExchange;
@@ -517,6 +519,8 @@ pub fn run_with_shutdown<L: BlockingTransportListener>(
         for i in 1..=config.instruments {
             producer.publish(InputSlot {
                 connection_id: 0,
+                key_hash: 0,
+                request_seq: 0,
                 event: JournalEvent::AddInstrument {
                     spec: InstrumentSpec {
                         symbol: Symbol(i),
@@ -536,6 +540,8 @@ pub fn run_with_shutdown<L: BlockingTransportListener>(
         for acct in 1..=config.accounts {
             last_published_seq = producer.publish(InputSlot {
                 connection_id: 0,
+                key_hash: 0,
+                request_seq: 0,
                 event: JournalEvent::ProvisionAccount {
                     account: AccountId(acct),
                     amount: u64::MAX / 4,
@@ -661,18 +667,27 @@ pub fn run_with_shutdown<L: BlockingTransportListener>(
         // 2. Read ChallengeResponse (signature + public key)
         // 3. Verify signature and look up key in authorized_keys
         // 4. Send ServerReady on success, AuthFailed on failure
-        let permission = match authenticate_connection(
+        let (permission, public_key_bytes) = match authenticate_connection(
             connection_id,
             addr,
             &mut std_read,
             &mut std_write,
             &authorized_keys,
         ) {
-            Ok(perm) => perm,
+            Ok(pair) => pair,
             Err(e) => {
                 debug!(connection_id = connection_id.0, addr = %addr, error = %e, "auth failed, dropping");
                 continue;
             }
+        };
+
+        // Hash the client's public key for per-key idempotency dedup.
+        // FxHash is fast and non-cryptographic — sufficient for dedup
+        // table keying (the public key itself is already authenticated).
+        let key_hash = {
+            let mut hasher = rustc_hash::FxHasher::default();
+            public_key_bytes.hash(&mut hasher);
+            hasher.finish()
         };
 
         active_connections.fetch_add(1, Ordering::Relaxed);
@@ -725,6 +740,7 @@ pub fn run_with_shutdown<L: BlockingTransportListener>(
             reader: std_read,
             addr,
             permission,
+            key_hash,
         });
     }
 
@@ -861,14 +877,14 @@ fn apply_affinity(thread_name: &str, core_id: usize) {
 /// Uses raw `read_exact` instead of `BufReader` to avoid over-reading
 /// bytes that belong to the first post-auth request.
 ///
-/// Returns the authenticated `Permission` on success.
+/// Returns `(Permission, public_key_bytes)` on success.
 fn authenticate_connection<R: std::io::Read, W: std::io::Write>(
     connection_id: ConnectionId,
     addr: SocketAddr,
     reader: &mut R,
     writer: &mut W,
     authorized_keys: &AuthorizedKeys,
-) -> Result<Permission, Box<dyn std::error::Error>> {
+) -> Result<(Permission, [u8; 32]), Box<dyn std::error::Error>> {
     use std::io;
 
     use ed25519_dalek::{Verifier, VerifyingKey};
@@ -906,8 +922,8 @@ fn authenticate_connection<R: std::io::Read, W: std::io::Write>(
         .read_exact(&mut frame_buf[..frame_len])
         .map_err(|e| io::Error::other(format!("read auth frame payload: {e}")))?;
 
-    let request = match codec::decode_request(&frame_buf[..frame_len]) {
-        Ok(req) => req,
+    let (_seq, request) = match codec::decode_request(&frame_buf[..frame_len]) {
+        Ok(pair) => pair,
         Err(e) => {
             send_auth_failed(writer);
             return Err(io::Error::other(format!("decode ChallengeResponse: {e}")).into());
@@ -962,7 +978,7 @@ fn authenticate_connection<R: std::io::Read, W: std::io::Write>(
         "authenticated"
     );
 
-    Ok(permission)
+    Ok((permission, public_key_bytes))
 }
 
 /// Set a read timeout on a raw fd via `setsockopt(SO_RCVTIMEO)`.
@@ -1110,6 +1126,7 @@ mod tests {
                 &mut writer,
                 &keys,
             )
+            .map(|(perm, _pk)| perm)
             .map_err(|e| e.to_string())
         })
     }
@@ -1135,7 +1152,7 @@ mod tests {
             public_key: key.verifying_key().to_bytes(),
         };
         let mut buf = [0u8; 256];
-        let written = codec::encode_request(&request, &mut buf).unwrap();
+        let written = codec::encode_request(&request, 0, &mut buf).unwrap();
         stream.write_all(&buf[..written]).unwrap();
         stream.flush().unwrap();
     }
@@ -1162,7 +1179,7 @@ mod tests {
             public_key: key.verifying_key().to_bytes(),
         };
         let mut buf = [0u8; 256];
-        let written = codec::encode_request(&request, &mut buf).unwrap();
+        let written = codec::encode_request(&request, 0, &mut buf).unwrap();
         stream.write_all(&buf[..written]).unwrap();
         stream.flush().unwrap();
     }
@@ -1254,7 +1271,7 @@ mod tests {
 
         // Send a Heartbeat instead of ChallengeResponse.
         let mut buf = [0u8; 16];
-        let written = codec::encode_request(&Request::Heartbeat, &mut buf).unwrap();
+        let written = codec::encode_request(&Request::Heartbeat, 0, &mut buf).unwrap();
         s2.write_all(&buf[..written]).unwrap();
         s2.flush().unwrap();
 

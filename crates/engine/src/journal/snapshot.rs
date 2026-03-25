@@ -54,7 +54,8 @@ const SNAP_MAGIC: u32 = 0x534E_4150;
 /// v5 → v6: added chain_hash for BLAKE3 hash chain continuity across snapshots.
 /// v6 → v7: order_sides keyed by (AccountId, OrderId), added fee schedules.
 /// v7 → v8: order_index and stop_index now store AccountId (21 bytes/entry vs 17).
-const SNAP_VERSION: u16 = 8;
+/// v8 → v9: added per-key request sequence HWMs for admin idempotency.
+const SNAP_VERSION: u16 = 9;
 
 /// Snapshot header size: magic(4) + version(2) + reserved(2) + sequence(8) + chain_hash(32) = 48.
 const SNAP_HEADER_SIZE: usize = 48;
@@ -137,7 +138,7 @@ pub fn load(path: &Path) -> Result<(Exchange, u64, [u8; 32]), JournalError> {
     // v5 header is 16 bytes, v6+ header is 48 bytes (adds 32-byte chain_hash).
     let (header_size, has_chain_hash) = match version {
         5 => (16usize, false),
-        6..=8 => (SNAP_HEADER_SIZE, true),
+        6..=9 => (SNAP_HEADER_SIZE, true),
         _ => return Err(JournalError::UnsupportedVersion { version }),
     };
 
@@ -201,6 +202,8 @@ pub(crate) struct ExchangeSnapshot {
     pub(crate) circuit_breakers: Vec<(Symbol, CircuitBreakerConfig)>,
     /// Per-instrument maker/taker fee schedules.
     pub(crate) fee_schedules: Vec<(Symbol, FeeSchedule)>,
+    /// Per-key request sequence HWMs for admin idempotency (v9+).
+    pub(crate) key_hwm: Vec<(u64, u64)>,
 }
 
 /// Serialized order book state for a single instrument.
@@ -338,6 +341,13 @@ fn encode_exchange_state(state: &ExchangeSnapshot, buf: &mut Vec<u8>) {
         le::push_u32(buf, symbol.0);
         le::push_i16(buf, schedule.maker_fee_bps);
         le::push_i16(buf, schedule.taker_fee_bps);
+    }
+
+    // Per-key request sequence HWMs (v9+).
+    le::push_u32(buf, state.key_hwm.len() as u32);
+    for (key_hash, hwm) in &state.key_hwm {
+        le::push_u64(buf, *key_hash);
+        le::push_u64(buf, *hwm);
     }
 }
 
@@ -709,6 +719,26 @@ fn decode_exchange_state(
         Vec::new()
     };
 
+    // Per-key request sequence HWMs (v9+).
+    let key_hwm = if version >= 9 && pos < buf.len() {
+        check(pos, 4)?;
+        let n = le::get_u32(&buf[pos..]) as usize;
+        pos += 4;
+        // Each entry: key_hash(8) + hwm(8) = 16 bytes.
+        validate_count(buf.len() - pos, n, 16)?;
+        let mut hwms = Vec::with_capacity(n);
+        for _ in 0..n {
+            check(pos, 16)?;
+            let key_hash = le::get_u64(&buf[pos..]);
+            let hwm = le::get_u64(&buf[pos + 8..]);
+            hwms.push((key_hash, hwm));
+            pos += 16;
+        }
+        hwms
+    } else {
+        Vec::new()
+    };
+
     Ok((
         pos,
         ExchangeSnapshot {
@@ -721,6 +751,7 @@ fn decode_exchange_state(
             risk_limits,
             circuit_breakers,
             fee_schedules,
+            key_hwm,
         },
     ))
 }
@@ -1034,6 +1065,7 @@ impl Exchange {
         let risk_limits = self.snapshot_risk_limits();
         let circuit_breakers = self.snapshot_circuit_breakers();
         let fee_schedules = self.snapshot_fee_schedules();
+        let key_hwm = self.snapshot_key_hwm();
 
         ExchangeSnapshot {
             instruments,
@@ -1045,6 +1077,7 @@ impl Exchange {
             risk_limits,
             circuit_breakers,
             fee_schedules,
+            key_hwm,
         }
     }
 
@@ -1113,7 +1146,17 @@ impl Exchange {
             max_order_id.insert(account, hwm);
         }
 
-        Self::from_parts(instruments, accounts, order_info, max_order_id)
+        // Build per-key request sequence HWM map from snapshot entries (v9+).
+        let mut key_hwm: crate::types::HashMap<u64, u64> =
+            crate::types::HashMap::with_capacity_and_hasher(
+                state.key_hwm.len(),
+                Default::default(),
+            );
+        for (key_hash, hwm) in state.key_hwm {
+            key_hwm.insert(key_hash, hwm);
+        }
+
+        Self::from_parts(instruments, accounts, order_info, max_order_id, key_hwm)
     }
 }
 

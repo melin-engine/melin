@@ -1003,6 +1003,7 @@ dependencies = [
  "melin-engine",
  "melin-protocol",
  "rand 0.9.2",
+ "rustc-hash",
  "tempfile",
  "tikv-jemallocator",
  "tracing",

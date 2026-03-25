@@ -164,7 +164,7 @@ mod tests {
             account: AccountId(1),
             order_id: OrderId(42),
         };
-        let written = codec::encode_request(&request, &mut encode_buf).unwrap();
+        let written = codec::encode_request(&request, 0, &mut encode_buf).unwrap();
         writer.write_frame(&encode_buf[4..written]).unwrap();
         writer.flush().unwrap();
 
@@ -200,7 +200,7 @@ mod tests {
                 account: AccountId(1),
                 order_id: OrderId(i),
             };
-            let written = codec::encode_request(&request, &mut encode_buf).unwrap();
+            let written = codec::encode_request(&request, 0, &mut encode_buf).unwrap();
             writer.write_frame(&encode_buf[4..written]).unwrap();
             writer.flush().unwrap();
 

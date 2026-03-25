@@ -15,7 +15,7 @@ use super::error::JournalError;
 use super::event::JournalEvent;
 use super::reader::JournalReader;
 use super::snapshot;
-use super::writer::JournalWriter;
+use crate::journal::writer::JournalWriter;
 
 /// Exchange wrapper that journals all input commands to a write-ahead log
 /// before executing them. Provides crash recovery via journal replay.
@@ -151,7 +151,13 @@ impl JournaledExchange {
         let mut reports = Vec::new();
 
         while let Some(entry) = reader.next_entry()? {
-            replay_event(&mut exchange, &entry.event, &mut reports);
+            replay_event(
+                &mut exchange,
+                &entry.event,
+                entry.key_hash,
+                entry.request_seq,
+                &mut reports,
+            );
             reports.clear();
         }
 
@@ -192,7 +198,13 @@ impl JournaledExchange {
         // Skip entries already captured by the snapshot.
         while let Some(entry) = reader.next_entry()? {
             if entry.sequence > snap_sequence {
-                replay_event(&mut exchange, &entry.event, &mut reports);
+                replay_event(
+                    &mut exchange,
+                    &entry.event,
+                    entry.key_hash,
+                    entry.request_seq,
+                    &mut reports,
+                );
                 reports.clear();
             }
         }
@@ -322,7 +334,22 @@ fn rotate_file(path: &Path) -> Result<(), JournalError> {
 }
 
 /// Replay a single journal event into an exchange. Used during recovery.
-fn replay_event(exchange: &mut Exchange, event: &JournalEvent, reports: &mut Vec<ExecutionReport>) {
+///
+/// Rebuilds the per-key request sequence HWM by calling `check_request_seq`
+/// on every event. Since the journal contains no duplicates (they were
+/// rejected at write time), this always returns true — the purpose is
+/// to reconstruct the HWM state for live dedup after recovery.
+fn replay_event(
+    exchange: &mut Exchange,
+    event: &JournalEvent,
+    key_hash: u64,
+    request_seq: u64,
+    reports: &mut Vec<ExecutionReport>,
+) {
+    // Rebuild per-key HWM state (always succeeds on journal replay — no
+    // duplicates in the journal).
+    exchange.check_request_seq(key_hash, request_seq);
+
     match *event {
         JournalEvent::AddInstrument { spec } => {
             exchange.add_instrument(spec);
@@ -563,7 +590,13 @@ mod tests {
         let mut replay_reports = Vec::new();
 
         while let Some(entry) = reader.next_entry().unwrap() {
-            replay_event(&mut replay_exchange, &entry.event, &mut replay_reports);
+            replay_event(
+                &mut replay_exchange,
+                &entry.event,
+                entry.key_hash,
+                entry.request_seq,
+                &mut replay_reports,
+            );
         }
 
         assert_eq!(original_reports, replay_reports);
@@ -1228,5 +1261,107 @@ mod tests {
         // ACCT_B: 0 USD (withdrawn), 200 - 10 = 190 BTC
         assert_eq!(je.exchange().accounts().balance(ACCT_B, USD).available, 0);
         assert_eq!(je.exchange().accounts().balance(ACCT_B, BTC).available, 190);
+    }
+
+    #[test]
+    fn key_hwm_survives_journal_replay() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.journal");
+
+        let key_hash: u64 = 0xCAFE;
+
+        // Write journal entries with key_hash + request_seq.
+        {
+            let mut writer = crate::journal::writer::JournalWriter::create(&path).unwrap();
+            let ts = crate::journal::writer::wall_clock_nanos();
+            // Deposit with seq=1
+            writer
+                .batch_append_with_ts(
+                    &JournalEvent::AddInstrument {
+                        spec: btc_usd_spec(),
+                    },
+                    ts,
+                    key_hash,
+                    1,
+                )
+                .unwrap();
+            // Deposit with seq=2
+            writer
+                .batch_append_with_ts(
+                    &JournalEvent::Deposit {
+                        account: ACCT_A,
+                        currency: USD,
+                        amount: 1000,
+                    },
+                    ts,
+                    key_hash,
+                    2,
+                )
+                .unwrap();
+            writer.flush_batch_sync().unwrap();
+        }
+
+        // Recover should rebuild the HWM.
+        let je = JournaledExchange::recover(&path).unwrap();
+        let exchange = je.exchange();
+
+        // The HWM for key_hash should be 2.
+        // Verify by checking that seq=2 would be rejected and seq=3 accepted.
+        let mut ex_clone = Exchange::new();
+        ex_clone.add_instrument(btc_usd_spec());
+        // Manually rebuild: check_request_seq(key_hash, 1) then (key_hash, 2)
+        // should advance HWM to 2.
+        // Since we can't directly read key_hwm, verify through snapshot.
+        let hwm_snap = exchange.snapshot_key_hwm();
+        assert_eq!(hwm_snap.len(), 1);
+        assert_eq!(hwm_snap[0], (key_hash, 2));
+    }
+
+    #[test]
+    fn key_hwm_survives_snapshot_round_trip() {
+        let dir = tempfile::tempdir().unwrap();
+        let journal_path = dir.path().join("test.journal");
+        let snapshot_path = dir.path().join("test.snap");
+
+        let key_hash: u64 = 0xBEEF;
+
+        // Create journaled exchange, write events with key_hash.
+        {
+            let mut writer = crate::journal::writer::JournalWriter::create(&journal_path).unwrap();
+            let ts = crate::journal::writer::wall_clock_nanos();
+            writer
+                .batch_append_with_ts(
+                    &JournalEvent::AddInstrument {
+                        spec: btc_usd_spec(),
+                    },
+                    ts,
+                    key_hash,
+                    1,
+                )
+                .unwrap();
+            writer
+                .batch_append_with_ts(
+                    &JournalEvent::Deposit {
+                        account: ACCT_A,
+                        currency: USD,
+                        amount: 5000,
+                    },
+                    ts,
+                    key_hash,
+                    5,
+                )
+                .unwrap();
+            writer.flush_batch_sync().unwrap();
+        }
+
+        // Recover and snapshot.
+        let je = JournaledExchange::recover(&journal_path).unwrap();
+        je.save_snapshot(&snapshot_path).unwrap();
+
+        // Load snapshot into a fresh exchange.
+        let (restored, _seq, _chain) = super::snapshot::load(&snapshot_path).unwrap();
+        let hwm = restored.snapshot_key_hwm();
+        assert_eq!(hwm.len(), 1);
+        assert_eq!(hwm[0], (key_hash, 5));
     }
 }

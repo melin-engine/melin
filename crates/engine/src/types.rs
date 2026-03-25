@@ -318,6 +318,10 @@ pub enum RejectReason {
     /// Withdrawal rejected because the account has resting orders.
     /// Must CancelAll first.
     HasRestingOrders,
+    /// Duplicate request — a request with this sequence number (or higher)
+    /// was already processed for this authentication key. Prevents
+    /// double-execution on retry after network failure.
+    DuplicateRequest,
 }
 
 #[cfg(test)]

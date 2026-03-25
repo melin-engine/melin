@@ -11,7 +11,7 @@ use crate::journal::codec;
 #[test]
 fn fuzz_journal_decode() {
     bolero::check!().for_each(|data: &[u8]| {
-        let _ = codec::decode(data);
+        let _ = codec::decode(data, codec::FORMAT_VERSION);
     });
 }
 
@@ -35,15 +35,16 @@ fn fuzz_journal_roundtrip() {
 
         let seq = 1u64;
         let ts = 1_700_000_000_000_000_000u64;
-        let mut buf = [0u8; 256];
+        let mut buf = [0u8; 272];
 
-        let written = match codec::encode(seq, ts, &event, &mut buf) {
+        let written = match codec::encode(seq, ts, 0, 0, &event, &mut buf) {
             Ok(n) => n,
             Err(_) => return,
         };
 
-        let (consumed, dec_seq, dec_ts, dec_event) =
-            codec::decode(&buf[..written]).expect("decode of freshly encoded event must succeed");
+        let (consumed, dec_seq, dec_ts, _kh, _rs, dec_event) =
+            codec::decode(&buf[..written], codec::FORMAT_VERSION)
+                .expect("decode of freshly encoded event must succeed");
 
         assert_eq!(consumed, written);
         assert_eq!(dec_seq, seq);

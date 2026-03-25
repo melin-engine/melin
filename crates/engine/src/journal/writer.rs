@@ -25,9 +25,10 @@ use super::codec::{self, FILE_HEADER_SIZE};
 use super::error::JournalError;
 use super::event::JournalEvent;
 
-/// Maximum encoded entry size. Generously sized — actual entries are ~65-85 bytes.
+/// Maximum encoded entry size. Generously sized — actual entries are ~81-101 bytes
+/// (v8 adds 16 bytes for key_hash + request_seq).
 /// Fixed-size array avoids per-write heap allocation on the hot path.
-const MAX_ENTRY_SIZE: usize = 128;
+const MAX_ENTRY_SIZE: usize = 144;
 
 /// Batch buffer capacity. Sized for MAX_JOURNAL_BATCH (4096) entries at
 /// ~104 bytes each (payload + 24-byte header/CRC) ≈ 416 KiB. Rounded up
@@ -157,7 +158,7 @@ impl JournalWriter {
         let genesis_event = JournalEvent::GenesisHash { hash: genesis };
         let seq = writer.next_sequence;
         let timestamp_ns = wall_clock_nanos();
-        let written = codec::encode(seq, timestamp_ns, &genesis_event, &mut writer.buffer)?;
+        let written = codec::encode(seq, timestamp_ns, 0, 0, &genesis_event, &mut writer.buffer)?;
 
         // Initialize chain: hash the genesis entry bytes (excluding CRC).
         let entry_bytes = &writer.buffer[..written - 4]; // exclude CRC
@@ -310,7 +311,7 @@ impl JournalWriter {
     /// Uses one `wall_clock_nanos()` call per event for the journal timestamp.
     /// For batches sharing a timestamp, use `batch_append_with_ts`.
     pub fn batch_append(&mut self, event: &JournalEvent) -> Result<u64, JournalError> {
-        self.batch_append_with_ts(event, wall_clock_nanos())
+        self.batch_append_with_ts(event, wall_clock_nanos(), 0, 0)
     }
 
     /// Encode an event into the batch buffer with a caller-provided timestamp.
@@ -322,9 +323,18 @@ impl JournalWriter {
         &mut self,
         event: &JournalEvent,
         timestamp_ns: u64,
+        key_hash: u64,
+        request_seq: u64,
     ) -> Result<u64, JournalError> {
         let seq = self.next_sequence;
-        let written = codec::encode(seq, timestamp_ns, event, &mut self.buffer)?;
+        let written = codec::encode(
+            seq,
+            timestamp_ns,
+            key_hash,
+            request_seq,
+            event,
+            &mut self.buffer,
+        )?;
 
         // Update the BLAKE3 hash chain: hash entry bytes (excluding CRC)
         // concatenated with the previous hash. ~15-30ns for ~112 bytes.
@@ -367,7 +377,7 @@ impl JournalWriter {
         };
         let seq = self.next_sequence;
         let ts = wall_clock_nanos();
-        let written = codec::encode(seq, ts, &checkpoint, &mut self.buffer)?;
+        let written = codec::encode(seq, ts, 0, 0, &checkpoint, &mut self.buffer)?;
 
         // Hash the checkpoint entry itself into the chain for continuity.
         if let Some(chain) = &mut self.hash_chain {
@@ -840,7 +850,7 @@ mod tests {
 
         {
             let mut writer = JournalWriter::create(&path).unwrap();
-            let seq = writer.batch_append_with_ts(&event, fixed_ts).unwrap();
+            let seq = writer.batch_append_with_ts(&event, fixed_ts, 0, 0).unwrap();
             assert_eq!(seq, FIRST_SEQ);
             writer.flush_batch().unwrap();
         }

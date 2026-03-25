@@ -60,9 +60,13 @@ impl From<ProtocolError> for ClientError {
 pub struct Client {
     reader: BlockingFrameReader<std::net::TcpStream>,
     writer: BlockingFrameWriter<std::net::TcpStream>,
-    /// Pre-allocated encode buffer. 128 bytes is sufficient for all
-    /// request types (the largest is SubmitOrder with a StopLimit at ~60 bytes).
-    encode_buf: [u8; 128],
+    /// Pre-allocated encode buffer. 136 bytes is sufficient for all
+    /// request types (seq(8) + tag(1) + largest payload ~60 bytes).
+    encode_buf: [u8; 136],
+    /// Per-connection monotonically increasing request sequence number.
+    /// Used with the server-side per-key idempotency dedup. Starts at 0
+    /// and increments before each send. Heartbeats use seq=0 (exempt).
+    next_seq: u64,
 }
 
 impl Client {
@@ -98,7 +102,7 @@ impl Client {
             public_key,
         };
         let mut encode_buf = [0u8; 256];
-        let written = codec::encode_request(&request, &mut encode_buf)?;
+        let written = codec::encode_request(&request, 0, &mut encode_buf)?;
         writer.write_frame(&encode_buf[4..written])?;
         writer.flush()?;
 
@@ -120,7 +124,8 @@ impl Client {
         Ok(Self {
             reader,
             writer,
-            encode_buf: [0u8; 128],
+            encode_buf: [0u8; 136],
+            next_seq: 0,
         })
     }
 
@@ -128,8 +133,10 @@ impl Client {
     ///
     /// Returns the list of responses (excluding the BatchEnd marker itself).
     pub fn send_request(&mut self, request: &Request) -> Result<Vec<ResponseKind>, ClientError> {
-        // Encode and send.
-        let written = codec::encode_request(request, &mut self.encode_buf)?;
+        // Increment the per-connection request sequence before each send.
+        // The server uses (key_hash, request_seq) for idempotency dedup.
+        self.next_seq += 1;
+        let written = codec::encode_request(request, self.next_seq, &mut self.encode_buf)?;
         // write_frame expects payload without length prefix; encode_request
         // writes [length(4) | tag+payload], so skip the prefix.
         self.writer.write_frame(&self.encode_buf[4..written])?;
@@ -212,7 +219,7 @@ mod tests {
 
         // Read ChallengeResponse.
         let frame = reader.read_frame().unwrap().unwrap();
-        let request = codec::decode_request(frame).unwrap();
+        let (_seq, request) = codec::decode_request(frame).unwrap();
         let (sig_bytes, pk_bytes) = match request {
             Request::ChallengeResponse {
                 signature,

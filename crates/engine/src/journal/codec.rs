@@ -8,7 +8,7 @@
 //! | Field          | Type | Bytes | Purpose                                |
 //! |----------------|------|-------|----------------------------------------|
 //! | file_magic     | u32  | 4     | `0x4A4F5552` ("JOUR")                  |
-//! | format_version | u16  | 2     | Current version = 6                    |
+//! | format_version | u16  | 2     | Current version = 8                    |
 //! | reserved       | u16  | 2     | Padding for alignment, zeroed          |
 //!
 //! ## Entry layout (little-endian, repeats after file header)
@@ -17,14 +17,16 @@
 //! |--------------|--------|-------|---------------------------------------|
 //! | magic        | u16    | 2     | `0x4A45` — misalignment detection     |
 //! | length       | u16    | 2     | Byte count after header, before CRC   |
-//! |              |        |       | (includes event_tag + payload)        |
 //! | sequence     | u64    | 8     | Monotonically increasing, starts at 1 |
 //! | timestamp_ns | u64    | 8     | Wall-clock nanos since epoch           |
+//! | key_hash     | u64    | 8     | FxHash of client Ed25519 pubkey (v8+) |
+//! | request_seq  | u64    | 8     | Per-key request sequence (v8+)        |
 //! | event_tag    | u8     | 1     | Discriminant for JournalEvent variant  |
 //! | payload      | varies | ≤64   | Variant fields                        |
 //! | crc32c       | u32    | 4     | CRC32C of all preceding bytes         |
 //!
-//! `length` = size of (event_tag + payload). Total entry size = 20 + length + 4.
+//! `length` = size of (key_hash + request_seq + event_tag + payload).
+//! Total entry size = 20 + length + 4.
 
 use std::num::NonZeroU64;
 
@@ -47,7 +49,8 @@ pub const FILE_MAGIC: u32 = 0x4A4F_5552;
 /// v4 → v5: added SetCircuitBreaker event for price bands + trading halts.
 /// v5 → v6: added GenesisHash + Checkpoint events for BLAKE3 hash chain.
 /// v6 → v7: added Withdraw event for sparse account lifecycle.
-pub const FORMAT_VERSION: u16 = 7;
+/// v7 → v8: added per-entry key_hash(8) + request_seq(8) for admin idempotency.
+pub const FORMAT_VERSION: u16 = 8;
 
 /// File header size in bytes.
 pub const FILE_HEADER_SIZE: usize = 8;
@@ -101,9 +104,10 @@ pub fn decode_file_header(buf: &[u8]) -> Result<u16, JournalError> {
         return Err(JournalError::InvalidFile);
     }
     let version = u16::from_le_bytes([buf[4], buf[5]]);
-    // Accept v5 (pre-hash-chain) and v6 (current). v5 journals are still
-    // readable — the reader simply won't have hash chain verification.
-    if version != FORMAT_VERSION && version != 5 {
+    // Accept v5 (pre-hash-chain), v7 (pre-idempotency), and v8 (current).
+    // v5 journals are readable — the reader simply won't have hash chain
+    // verification. v7 journals lack key_hash/request_seq fields.
+    if version != FORMAT_VERSION && version != 7 && version != 5 {
         return Err(JournalError::UnsupportedVersion { version });
     }
     Ok(version)
@@ -116,11 +120,13 @@ pub fn decode_file_header(buf: &[u8]) -> Result<u16, JournalError> {
 pub fn encode(
     sequence: u64,
     timestamp_ns: u64,
+    key_hash: u64,
+    request_seq: u64,
     event: &JournalEvent,
     buf: &mut [u8],
 ) -> Result<usize, JournalError> {
-    // Leave room for header, write event_tag + payload after it.
-    let payload_start = ENTRY_HEADER_SIZE + 1; // +1 for event_tag
+    // Leave room for header + key_hash(8) + request_seq(8) + event_tag(1).
+    let payload_start = ENTRY_HEADER_SIZE + 16 + 1;
     let mut pos = payload_start;
 
     let event_tag = match event {
@@ -308,7 +314,7 @@ pub fn encode(
         }
     };
 
-    // `length` covers event_tag(1) + payload bytes.
+    // `length` covers key_hash(8) + request_seq(8) + event_tag(1) + payload bytes.
     let length = pos - ENTRY_HEADER_SIZE;
     // Guard against future event types exceeding u16 range.
     let length_u16 = u16::try_from(length).map_err(|_| JournalError::CorruptEntry {
@@ -328,8 +334,12 @@ pub fn encode(
     h += 8;
     debug_assert_eq!(h, ENTRY_HEADER_SIZE);
 
-    // Write event tag.
-    buf[ENTRY_HEADER_SIZE] = event_tag;
+    // Write key_hash and request_seq (v8+, for admin idempotency dedup).
+    le::put_u64(&mut buf[ENTRY_HEADER_SIZE..], key_hash);
+    le::put_u64(&mut buf[ENTRY_HEADER_SIZE + 8..], request_seq);
+
+    // Write event tag (after key_hash + request_seq).
+    buf[ENTRY_HEADER_SIZE + 16] = event_tag;
 
     // CRC32C over everything before the checksum.
     let crc = crc32c::crc32c(&buf[..pos]);
@@ -341,9 +351,14 @@ pub fn encode(
 
 /// Decode a journal entry from `buf`.
 ///
-/// Returns `(bytes_consumed, sequence, timestamp_ns, event)` on success.
+/// Returns `(bytes_consumed, sequence, timestamp_ns, key_hash, request_seq, event)`.
+/// `version` determines the layout: v8+ entries have key_hash(8) + request_seq(8)
+/// after the header; older versions return (0, 0) for those fields.
 /// Returns `Err(TruncatedEntry)` if the buffer doesn't contain a complete entry.
-pub fn decode(buf: &[u8]) -> Result<(usize, u64, u64, JournalEvent), JournalError> {
+pub fn decode(
+    buf: &[u8],
+    version: u16,
+) -> Result<(usize, u64, u64, u64, u64, JournalEvent), JournalError> {
     // Need at least the fixed header to read length.
     if buf.len() < ENTRY_HEADER_SIZE + 1 + CRC_SIZE {
         return Err(JournalError::TruncatedEntry);
@@ -379,9 +394,25 @@ pub fn decode(buf: &[u8]) -> Result<(usize, u64, u64, JournalEvent), JournalErro
         });
     }
 
+    // Decode key_hash and request_seq (v8+). Older versions lack these
+    // fields — default to 0 (exempt from idempotency checking).
+    let (key_hash, request_seq, event_tag_offset) = if version >= 8 {
+        if payload_len < 17 {
+            return Err(JournalError::CorruptEntry {
+                sequence,
+                reason: "v8 entry too short for key_hash + request_seq + tag",
+            });
+        }
+        let kh = le::get_u64(&buf[ENTRY_HEADER_SIZE..]);
+        let rs = le::get_u64(&buf[ENTRY_HEADER_SIZE + 8..]);
+        (kh, rs, ENTRY_HEADER_SIZE + 16)
+    } else {
+        (0u64, 0u64, ENTRY_HEADER_SIZE)
+    };
+
     // Decode event.
-    let event_tag = buf[ENTRY_HEADER_SIZE];
-    let payload = &buf[ENTRY_HEADER_SIZE + 1..data_end];
+    let event_tag = buf[event_tag_offset];
+    let payload = &buf[event_tag_offset + 1..data_end];
 
     let event = match event_tag {
         TAG_ADD_INSTRUMENT => {
@@ -722,7 +753,14 @@ pub fn decode(buf: &[u8]) -> Result<(usize, u64, u64, JournalEvent), JournalErro
         }
     };
 
-    Ok((total_len, sequence, timestamp_ns, event))
+    Ok((
+        total_len,
+        sequence,
+        timestamp_ns,
+        key_hash,
+        request_seq,
+        event,
+    ))
 }
 
 /// Encode an `Order` into `buf`. Returns bytes written.
@@ -1029,8 +1067,9 @@ mod tests {
             let seq = (i as u64) + 1;
             let ts = 1_700_000_000_000_000_000 + (i as u64);
 
-            let written = encode(seq, ts, event, &mut buf).unwrap();
-            let (consumed, dec_seq, dec_ts, dec_event) = decode(&buf[..written]).unwrap();
+            let written = encode(seq, ts, 0, 0, event, &mut buf).unwrap();
+            let (consumed, dec_seq, dec_ts, _kh, _rs, dec_event) =
+                decode(&buf[..written], FORMAT_VERSION).unwrap();
 
             assert_eq!(consumed, written, "variant {i}");
             assert_eq!(dec_seq, seq, "variant {i}");
@@ -1047,12 +1086,12 @@ mod tests {
             amount: 999,
         };
         let mut buf = [0u8; 128];
-        let written = encode(1, 0, &event, &mut buf).unwrap();
+        let written = encode(1, 0, 0, 0, &event, &mut buf).unwrap();
 
         // Flip a bit in the payload.
         buf[ENTRY_HEADER_SIZE + 2] ^= 0x01;
 
-        let result = decode(&buf[..written]);
+        let result = decode(&buf[..written], FORMAT_VERSION);
         assert!(
             matches!(result, Err(JournalError::ChecksumMismatch { .. })),
             "expected ChecksumMismatch, got {result:?}"
@@ -1067,10 +1106,10 @@ mod tests {
             amount: 999,
         };
         let mut buf = [0u8; 128];
-        let written = encode(1, 0, &event, &mut buf).unwrap();
+        let written = encode(1, 0, 0, 0, &event, &mut buf).unwrap();
 
         // Pass truncated buffer.
-        let result = decode(&buf[..written - 1]);
+        let result = decode(&buf[..written - 1], FORMAT_VERSION);
         assert!(
             matches!(result, Err(JournalError::TruncatedEntry)),
             "expected TruncatedEntry, got {result:?}"
@@ -1115,15 +1154,16 @@ mod tests {
             amount: 100,
         };
         let mut buf = [0u8; 128];
-        let written = encode(1, 0, &event, &mut buf).unwrap();
+        let written = encode(1, 0, 0, 0, &event, &mut buf).unwrap();
 
         // Overwrite event tag with invalid value, then fix CRC.
-        buf[ENTRY_HEADER_SIZE] = 255;
+        // v8: event tag is at ENTRY_HEADER_SIZE + 16 (after key_hash + request_seq).
+        buf[ENTRY_HEADER_SIZE + 16] = 255;
         let data_end = written - CRC_SIZE;
         let new_crc = crc32c::crc32c(&buf[..data_end]);
         buf[data_end..written].copy_from_slice(&new_crc.to_le_bytes());
 
-        let result = decode(&buf[..written]);
+        let result = decode(&buf[..written], FORMAT_VERSION);
         assert!(
             matches!(
                 result,
@@ -1134,5 +1174,84 @@ mod tests {
             ),
             "expected CorruptEntry, got {result:?}"
         );
+    }
+
+    #[test]
+    fn key_hash_and_request_seq_round_trip() {
+        let event = JournalEvent::Deposit {
+            account: AccountId(7),
+            currency: CurrencyId(3),
+            amount: 999,
+        };
+        let key_hash: u64 = 0xDEAD_BEEF_CAFE_1234;
+        let request_seq: u64 = 42;
+        let mut buf = [0u8; 256];
+        let written = encode(1, 100, key_hash, request_seq, &event, &mut buf).unwrap();
+
+        let (consumed, seq, _ts, kh, rs, decoded) =
+            decode(&buf[..written], FORMAT_VERSION).unwrap();
+        assert_eq!(consumed, written);
+        assert_eq!(seq, 1);
+        assert_eq!(kh, key_hash);
+        assert_eq!(rs, request_seq);
+        assert_eq!(decoded, event);
+    }
+
+    #[test]
+    fn v7_decode_returns_zero_key_hash_and_seq() {
+        // Simulate a v7 entry (no key_hash/request_seq) by encoding with the
+        // old layout. Since we can't use the old encoder, manually build a v7
+        // entry: header(20) + event_tag(1) + payload + crc(4).
+        let event = JournalEvent::CancelAll {
+            account: AccountId(5),
+        };
+        // Encode as v8 first, then manually construct a v7 entry.
+        let mut buf_v8 = [0u8; 256];
+        let _ = encode(10, 200, 0xAA, 0xBB, &event, &mut buf_v8).unwrap();
+
+        // Build a v7 entry manually: header(20) + tag(1) + account(4) + crc(4)
+        let mut buf_v7 = [0u8; 256];
+        let payload_len: u16 = 1 + 4; // tag(1) + account(4)
+        let mut h = 0;
+        le::put_u16(&mut buf_v7[h..], ENTRY_MAGIC);
+        h += 2;
+        le::put_u16(&mut buf_v7[h..], payload_len);
+        h += 2;
+        le::put_u64(&mut buf_v7[h..], 10); // sequence
+        h += 8;
+        le::put_u64(&mut buf_v7[h..], 200); // timestamp
+        h += 8;
+        assert_eq!(h, ENTRY_HEADER_SIZE);
+        buf_v7[h] = 6; // TAG_CANCEL_ALL
+        h += 1;
+        le::put_u32(&mut buf_v7[h..], 5); // account
+        h += 4;
+        let data_end = ENTRY_HEADER_SIZE + payload_len as usize;
+        let crc = crc32c::crc32c(&buf_v7[..data_end]);
+        le::put_u32(&mut buf_v7[data_end..], crc);
+        let total = data_end + CRC_SIZE;
+
+        let (consumed, seq, _ts, kh, rs, decoded) = decode(&buf_v7[..total], 7).unwrap();
+        assert_eq!(consumed, total);
+        assert_eq!(seq, 10);
+        assert_eq!(kh, 0); // v7: no key_hash
+        assert_eq!(rs, 0); // v7: no request_seq
+        assert_eq!(decoded, event);
+    }
+
+    #[test]
+    fn zero_key_hash_and_seq_encoded_correctly() {
+        // Internal/seed events use key_hash=0, request_seq=0.
+        let event = JournalEvent::Deposit {
+            account: AccountId(1),
+            currency: CurrencyId(2),
+            amount: 100,
+        };
+        let mut buf = [0u8; 256];
+        let written = encode(1, 50, 0, 0, &event, &mut buf).unwrap();
+        let (_, _, _, kh, rs, decoded) = decode(&buf[..written], FORMAT_VERSION).unwrap();
+        assert_eq!(kh, 0);
+        assert_eq!(rs, 0);
+        assert_eq!(decoded, event);
     }
 }

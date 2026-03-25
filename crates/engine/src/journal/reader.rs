@@ -24,6 +24,11 @@ pub struct JournalEntry {
     pub sequence: u64,
     /// Wall-clock nanos since epoch at write time (informational, not for ordering).
     pub timestamp_ns: u64,
+    /// Hash of the client's Ed25519 public key (v8+). Zero for internal/seed
+    /// events or when reading pre-v8 journals.
+    pub key_hash: u64,
+    /// Per-key request sequence number (v8+). Zero for pre-v8 journals.
+    pub request_seq: u64,
     /// The event that was journaled.
     pub event: JournalEvent,
 }
@@ -42,6 +47,9 @@ pub struct JournalReader {
     /// Byte offset in the file of the end of the last successfully decoded entry.
     /// Used by recovery to know where to truncate trailing garbage.
     valid_file_end: u64,
+    /// Journal format version from the file header. Used to determine entry
+    /// layout during decoding (v8+ has key_hash/request_seq fields).
+    version: u16,
     /// BLAKE3 hash chain verification state. Initialized when a GenesisHash
     /// entry is read, updated on each normal entry, verified at Checkpoints.
     /// `None` when `hash-chain` feature is disabled or for v5 journals.
@@ -66,7 +74,7 @@ impl JournalReader {
         // Read and validate the file header.
         let mut header = [0u8; FILE_HEADER_SIZE];
         file.read_exact(&mut header)?;
-        codec::decode_file_header(&header)?;
+        let version = codec::decode_file_header(&header)?;
 
         Ok(Self {
             file,
@@ -75,6 +83,7 @@ impl JournalReader {
             valid: 0,
             last_sequence: None,
             valid_file_end: FILE_HEADER_SIZE as u64,
+            version,
             #[cfg(feature = "hash-chain")]
             hash_chain: None,
         })
@@ -104,10 +113,16 @@ impl JournalReader {
 
         let data = &self.buffer[self.pos..self.valid];
 
-        match codec::decode(data) {
-            Ok((consumed, sequence, timestamp_ns, event)) => {
-                self.validate_and_advance(consumed, sequence, timestamp_ns, event)
-            }
+        match codec::decode(data, self.version) {
+            Ok((consumed, sequence, timestamp_ns, key_hash, request_seq, event)) => self
+                .validate_and_advance(
+                    consumed,
+                    sequence,
+                    timestamp_ns,
+                    key_hash,
+                    request_seq,
+                    event,
+                ),
             Err(JournalError::TruncatedEntry) => {
                 // Could be a partial entry at EOF or we need more data.
                 if self.try_extend_buffer()? {
@@ -120,9 +135,16 @@ impl JournalReader {
                         return Ok(None);
                     }
 
-                    match codec::decode(data) {
-                        Ok((consumed, sequence, timestamp_ns, event)) => {
-                            self.validate_and_advance(consumed, sequence, timestamp_ns, event)
+                    match codec::decode(data, self.version) {
+                        Ok((consumed, sequence, timestamp_ns, key_hash, request_seq, event)) => {
+                            self.validate_and_advance(
+                                consumed,
+                                sequence,
+                                timestamp_ns,
+                                key_hash,
+                                request_seq,
+                                event,
+                            )
                         }
                         // Truly truncated — crash recovery case.
                         Err(JournalError::TruncatedEntry) => Ok(None),
@@ -147,6 +169,8 @@ impl JournalReader {
         consumed: usize,
         sequence: u64,
         timestamp_ns: u64,
+        key_hash: u64,
+        request_seq: u64,
         event: JournalEvent,
     ) -> Result<Option<JournalEntry>, JournalError> {
         // For the first entry, accept whatever sequence we find (supports
@@ -244,6 +268,8 @@ impl JournalReader {
         Ok(Some(JournalEntry {
             sequence,
             timestamp_ns,
+            key_hash,
+            request_seq,
             event,
         }))
     }
@@ -746,8 +772,8 @@ mod tests {
             currency: CurrencyId(0),
             amount: 100,
         };
-        let mut buf = [0u8; 128];
-        let written = crate::journal::codec::encode(1, 1000, &event, &mut buf).unwrap();
+        let mut buf = [0u8; 144];
+        let written = crate::journal::codec::encode(1, 1000, 0, 0, &event, &mut buf).unwrap();
         file.write_all_at(&buf[..written], 8).unwrap();
         drop(file);
 

@@ -255,7 +255,9 @@ impl OrderFlowGenerator {
     /// Generates all events upfront so RNG overhead doesn't pollute timing.
     pub fn generate_frames(&mut self, count: usize) -> Vec<Vec<u8>> {
         let mut frames = Vec::with_capacity(count);
-        let mut encode_buf = [0u8; 128];
+        let mut encode_buf = [0u8; 136];
+        // Per-connection monotonic sequence for idempotency dedup.
+        let mut seq: u64 = 0;
 
         for _ in 0..count {
             let event = self.next_event();
@@ -285,7 +287,8 @@ impl OrderFlowGenerator {
                 },
             };
 
-            let written = codec::encode_request(&request, &mut encode_buf).expect("encode");
+            seq += 1;
+            let written = codec::encode_request(&request, seq, &mut encode_buf).expect("encode");
             frames.push(encode_buf[4..written].to_vec());
         }
 
@@ -612,6 +615,8 @@ mod tests {
         for frame in &frames {
             let result = codec::decode_request(frame);
             assert!(result.is_ok(), "frame should decode: {result:?}");
+            let (seq, _request) = result.unwrap();
+            assert!(seq > 0, "frame seq should be > 0");
         }
     }
 
