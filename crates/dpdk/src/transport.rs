@@ -152,8 +152,9 @@ impl TxQueue {
     /// Advance the cursor after a successful send.
     fn advance(&mut self, n: usize) {
         self.cursor += n;
-        // Compact when the cursor passes halfway — amortized O(1).
-        if self.cursor > self.buf.len() / 2 && self.cursor > 4096 {
+        // Compact at 25% waste — tighter memory footprint under sustained
+        // send backpressure without excessive memmove frequency.
+        if self.cursor > self.buf.len() / 4 && self.cursor > 4096 {
             self.buf.drain(..self.cursor);
             self.cursor = 0;
         }
