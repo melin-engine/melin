@@ -346,7 +346,7 @@ checksum = "0fda2ff0d084019ba4d7c6f371c95d8fd75ce3524c3cb8fb653a3023f6323e64"
 [[package]]
 name = "smoltcp"
 version = "0.13.0"
-source = "git+ssh://git@github.com/pierre-l/fastcp.git?branch=feat%2Fzero-copy-rx#ea73835b80cd599b3dc047b4fe2d18dde3dedcf3"
+source = "git+ssh://git@github.com/pierre-l/fastcp.git?branch=feat%2Fzero-copy-rx#ce3bf8a8a1fb0e1eb8cef528c3dadcfccde6ed9b"
 dependencies = [
  "bitflags 1.3.2",
  "byteorder",

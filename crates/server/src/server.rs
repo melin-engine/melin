@@ -1076,12 +1076,14 @@ pub fn run_dpdk(
         input_producer,
         journal_stage,
         matching_stage,
-        output_consumer,
+        mut output_consumers,
         journal_cursor,
         matching_cursor,
-        _events_processed,
+        events_processed,
+        input_cursor,
         replication,
         replication_cursor,
+        replica_connected,
     ) = build_pipeline_with_replication(
         exchange,
         writer,
@@ -1091,6 +1093,7 @@ pub fn run_dpdk(
         config.max_journal_batch,
         config.replication_ring_size,
         !config.yield_idle,
+        false, // no event publisher in DPDK mode (yet)
     );
 
     let heartbeat_interval = config.heartbeat_interval();
@@ -1133,6 +1136,7 @@ pub fn run_dpdk(
         .expect("failed to spawn matching thread");
 
     // Spawn DPDK response stage (encodes to TX channel instead of kernel sockets).
+    let output_consumer = output_consumers.remove(0);
     let journal_cursor_response = Arc::clone(&journal_cursor);
     let replication_cursor_response = Arc::clone(&replication_cursor);
     let active_connections_response = Arc::clone(&active_connections);
@@ -1163,6 +1167,9 @@ pub fn run_dpdk(
         let s_repl = Arc::clone(&shutdown);
         let repl_cursor = Arc::clone(&replication_cursor);
         let ready_flag = Arc::clone(&replica_ready);
+        let connected_flag = replica_connected
+            .clone()
+            .expect("replica_connected must be Some when replication is enabled");
         let batch_size = config.replication_batch_size;
         let heartbeat_secs = config.replication_heartbeat_secs;
         let busy_spin = !config.yield_idle;
@@ -1177,6 +1184,7 @@ pub fn run_dpdk(
                     genesis_entry,
                     &s_repl,
                     &ready_flag,
+                    &connected_flag,
                     batch_size,
                     heartbeat_secs,
                     busy_spin,
@@ -1262,6 +1270,27 @@ pub fn run_dpdk(
         );
     }
 
+    // Pipeline health flag: true while all pipeline threads are alive.
+    let pipeline_healthy = Arc::new(AtomicBool::new(true));
+
+    // Spawn health/liveness endpoint (same as epoll path).
+    let health_handle = if let Some(health_addr) = config.health_bind {
+        Some(crate::health::spawn(
+            health_addr,
+            Arc::clone(&active_connections),
+            Arc::clone(&events_processed),
+            Arc::clone(&journal_cursor),
+            Arc::clone(&matching_cursor),
+            input_cursor,
+            Arc::clone(&replication_cursor),
+            Arc::clone(&pipeline_healthy),
+            replica_connected.clone(),
+            Arc::clone(&shutdown),
+        )?)
+    } else {
+        None
+    };
+
     info!(
         ip = %dpdk_config.ip_addr,
         port = dpdk_config.listen_port,
@@ -1286,6 +1315,7 @@ pub fn run_dpdk(
 
     // Shutdown sequence.
     info!("shutdown: draining pipeline");
+    pipeline_healthy.store(false, Ordering::Relaxed);
     shutdown.store(true, Ordering::Relaxed);
 
     let mut thread_panicked = false;
@@ -1311,6 +1341,10 @@ pub fn run_dpdk(
 
     if let Some(repl_sender_handle) = replication_handle {
         let _ = repl_sender_handle.join();
+    }
+
+    if let Some(h) = health_handle {
+        let _ = h.join();
     }
 
     info!("shutdown complete");

@@ -17,6 +17,7 @@ use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 use melin_disruptor::padding::Sequence;
+use melin_disruptor::ring;
 use melin_disruptor::spsc;
 
 use melin_engine::journal::pipeline::{OutputPayload, OutputSlot};
@@ -83,7 +84,7 @@ pub enum ControlEvent {
 /// - No flush syscalls — the DPDK poll thread handles transmission
 /// - Heartbeats are sent via the same `tx_out` channel
 pub fn run(
-    mut consumer: spsc::Consumer<OutputSlot>,
+    mut consumer: ring::Consumer<OutputSlot>,
     control_rx: mpsc::Receiver<ControlEvent>,
     journal_cursor: Arc<Sequence>,
     replication_cursor: Arc<AtomicU64>,
