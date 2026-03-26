@@ -315,11 +315,11 @@ fn process_auth_frame(
         return; // Incomplete — wait for more data.
     }
 
-    let payload = conn.parse_buf[4..4 + frame_len].to_vec();
-    conn.parse_buf.drain(..4 + frame_len);
+    // Borrow the payload directly — no heap allocation. Compact after processing.
+    let consumed = 4 + frame_len;
 
     // Decode the ChallengeResponse (seq is ignored during auth).
-    let (_seq, request) = match codec::decode_request(&payload) {
+    let (_seq, request) = match codec::decode_request(&conn.parse_buf[4..consumed]) {
         Ok(req) => req,
         Err(e) => {
             debug!(
@@ -327,10 +327,20 @@ fn process_auth_frame(
                 error = %e,
                 "DPDK: auth decode error"
             );
+            // Compact before returning.
+            let remaining = conn.parse_buf.len() - consumed;
+            conn.parse_buf.copy_within(consumed.., 0);
+            conn.parse_buf.truncate(remaining);
             send_auth_failed(conn, transport);
             return;
         }
     };
+
+    // Compact parse buffer now that the borrow is released.
+    // Single memmove instead of drain()'s per-byte shift.
+    let remaining = conn.parse_buf.len() - consumed;
+    conn.parse_buf.copy_within(consumed.., 0);
+    conn.parse_buf.truncate(remaining);
 
     let (signature_bytes, public_key_bytes) = match request {
         Request::ChallengeResponse {
