@@ -1198,6 +1198,15 @@ impl Exchange {
 
         Self::from_parts(instruments, accounts, order_info, max_order_id, key_hwm)
     }
+
+    /// Create a deep copy of this Exchange by round-tripping through the
+    /// snapshot representation. Used by the shadow snapshot stage to obtain
+    /// an independent replica of the exchange state at startup.
+    ///
+    /// Not suitable for the hot path — allocates extensively.
+    pub fn clone_via_snapshot(&self) -> Self {
+        Self::restore_state(self.snapshot_state())
+    }
 }
 
 impl OrderBook {

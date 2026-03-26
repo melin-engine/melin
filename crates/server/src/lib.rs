@@ -10,6 +10,7 @@ pub mod replication;
 #[cfg(not(feature = "io-uring"))]
 mod response;
 pub mod server;
+pub mod shadow;
 
 #[cfg(feature = "io-uring")]
 mod uring_reader;
