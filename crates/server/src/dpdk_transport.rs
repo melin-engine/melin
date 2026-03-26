@@ -114,6 +114,12 @@ pub fn run_dpdk_poll(
     // Reusable handle buffer to avoid per-poll allocation.
     let mut handle_buf: Vec<SocketHandle> = Vec::with_capacity(256);
 
+    // Pre-allocated parse buffer pool. Avoids heap allocation on accept
+    // by recycling buffers from disconnected connections.
+    let mut parse_buf_pool: Vec<Vec<u8>> = (0..256)
+        .map(|_| Vec::with_capacity(MAX_FRAME_SIZE + 4))
+        .collect();
+
     // Fast PRNG for auth nonces. Seeded from OS entropy once at startup,
     // then generates nonces without blocking. Auth nonces don't need
     // CSPRNG-grade randomness — they prevent replay attacks within a
@@ -162,7 +168,11 @@ pub fn run_dpdk_poll(
                         accepted_at: Instant::now(),
                     },
                     key_hash: 0,
-                    parse_buf: Vec::with_capacity(MAX_FRAME_SIZE + 4),
+                    // Reuse a pre-allocated buffer from the pool, or allocate
+                    // if the pool is exhausted (more connections than pre-allocated).
+                    parse_buf: parse_buf_pool
+                        .pop()
+                        .unwrap_or_else(|| Vec::with_capacity(MAX_FRAME_SIZE + 4)),
                 },
             );
         }
@@ -184,7 +194,10 @@ pub fn run_dpdk_poll(
                     connection_id: frame.connection_id,
                 });
                 id_to_handle.remove(&frame.connection_id);
-                connections.remove(&handle);
+                if let Some(mut removed) = connections.remove(&handle) {
+                    removed.parse_buf.clear();
+                    parse_buf_pool.push(removed.parse_buf);
+                }
             }
         }
 
@@ -208,7 +221,10 @@ pub fn run_dpdk_poll(
                     "DPDK: auth timeout, dropping connection"
                 );
                 transport.close(conn.handle);
-                connections.remove(&handle);
+                if let Some(mut removed) = connections.remove(&handle) {
+                    removed.parse_buf.clear();
+                    parse_buf_pool.push(removed.parse_buf);
+                }
                 continue;
             }
 
@@ -229,7 +245,10 @@ pub fn run_dpdk_poll(
                     }
                     transport.close(conn.handle);
                     id_to_handle.remove(&conn.connection_id.0);
-                    connections.remove(&handle);
+                    if let Some(mut removed) = connections.remove(&handle) {
+                    removed.parse_buf.clear();
+                    parse_buf_pool.push(removed.parse_buf);
+                }
                 }
                 continue;
             }
@@ -247,7 +266,10 @@ pub fn run_dpdk_poll(
                     connection_id: conn.connection_id.0,
                 });
                 id_to_handle.remove(&conn.connection_id.0);
-                connections.remove(&handle);
+                if let Some(mut removed) = connections.remove(&handle) {
+                    removed.parse_buf.clear();
+                    parse_buf_pool.push(removed.parse_buf);
+                }
                 continue;
             }
             conn.parse_buf.extend_from_slice(&read_buf[..n]);
