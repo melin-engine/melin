@@ -540,7 +540,7 @@ impl<'a> smoltcp::phy::Device for DpdkDeviceRef<'a> {
     where
         Self: 'b;
     type TxToken<'b>
-        = crate::device::DpdkTxToken
+        = crate::device::DpdkTxToken<'b>
     where
         Self: 'b;
 

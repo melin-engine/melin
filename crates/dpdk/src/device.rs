@@ -311,7 +311,7 @@ impl DpdkDevice {
 
 impl Device for DpdkDevice {
     type RxToken<'a> = DpdkRxToken;
-    type TxToken<'a> = DpdkTxToken;
+    type TxToken<'a> = DpdkTxToken<'a>;
 
     fn receive(&mut self, _timestamp: Instant) -> Option<(Self::RxToken<'_>, Self::TxToken<'_>)> {
         // Drain injected frames first (crafted ARP replies for neighbor
@@ -319,10 +319,10 @@ impl Device for DpdkDevice {
         if let Some(frame) = self.inject_queue.pop() {
             let rx_token = DpdkRxToken::Injected(frame);
             let tx_token = DpdkTxToken {
-                port_id: self.tx_port_id,
                 mempool: self.mempool,
                 tx_ol_flags: self.tx_ol_flags,
                 tx_vlan_id: self.tx_vlan_id,
+                tx_batch: &mut self.tx_batch,
             };
             return Some((rx_token, tx_token));
         }
@@ -374,10 +374,10 @@ impl Device for DpdkDevice {
             data_len,
         };
         let tx_token = DpdkTxToken {
-            port_id: self.tx_port_id,
             mempool: self.mempool,
             tx_ol_flags: self.tx_ol_flags,
             tx_vlan_id: self.tx_vlan_id,
+            tx_batch: &mut self.tx_batch,
         };
 
         Some((rx_token, tx_token))
