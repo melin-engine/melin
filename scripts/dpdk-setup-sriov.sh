@@ -105,6 +105,17 @@ if [[ "$DPDK_IP" == "auto" ]]; then
 fi
 
 # ---------------------------------------------------------------------------
+# Derive a fixed VF MAC from the DPDK IP.
+# With LACP, the switch can deliver a frame to either physical port. Each
+# PF only forwards to its own VFs by destination MAC — so both VFs must
+# share the same MAC. Derived from the IP so it's deterministic per server.
+# Locally-administered (0x02 first octet), unicast.
+# ---------------------------------------------------------------------------
+DPDK_IP_ONLY="${DPDK_IP%%/*}"
+IFS='.' read -r o1 o2 o3 o4 <<< "$DPDK_IP_ONLY"
+VF_MAC=$(printf "02:00:%02x:%02x:%02x:%02x" "$o1" "$o2" "$o3" "$o4")
+
+# ---------------------------------------------------------------------------
 # Preflight checks
 # ---------------------------------------------------------------------------
 
@@ -139,6 +150,7 @@ echo "  PF0: ${PF0_PCI} (${PF0_IFACE})"
 echo "  PF1: ${PF1_PCI} (${PF1_IFACE})"
 echo "  VLAN: ${VLAN_ID}"
 echo "  DPDK IP: ${DPDK_IP}"
+echo "  VF MAC: ${VF_MAC}"
 echo "  MTU: ${MTU}"
 echo ""
 
@@ -214,6 +226,11 @@ create_vf() {
     # Assign VLAN to VF so it sees VLAN-tagged trading traffic.
     ip link set "${iface}" vf 0 vlan "${VLAN_ID}"
     echo "  ${label}: VF 0 assigned VLAN ${VLAN_ID}"
+
+    # Set fixed MAC on VF. Both VFs share the same MAC so that LACP-hashed
+    # frames are forwarded to the VF regardless of which PF receives them.
+    ip link set "${iface}" vf 0 mac "${VF_MAC}"
+    echo "  ${label}: VF 0 MAC set to ${VF_MAC}"
 
     # Disable spoofcheck (needed for smoltcp to use its own MAC).
     ip link set "${iface}" vf 0 spoofchk off
@@ -292,6 +309,7 @@ DPDK_PREFIX=${DPDK_IP##*/}
 DPDK_PORT=0
 HUGE_DIR=/mnt/huge_2m
 MTU=${MTU}
+VF_MAC=${VF_MAC}
 EOF
 echo "  Config written to ${DPDK_CONF}"
 
