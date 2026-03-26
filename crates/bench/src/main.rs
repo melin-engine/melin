@@ -543,10 +543,11 @@ fn run_pipeline_bench(
         producer,
         journal_stage,
         matching_stage,
-        mut output_consumer,
+        mut output_consumers,
         _journal_cursor,
         _events_processed,
     ) = build_pipeline(exchange, writer, group_commit_delay, active_conns);
+    let mut output_consumer = output_consumers.pop().expect("response consumer");
 
     let shutdown = Arc::new(AtomicBool::new(false));
 

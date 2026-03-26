@@ -6,7 +6,7 @@ Planned features sorted by value/complexity ratio for commercial readiness (exch
 
 | # | Feature | Commercial value | Complexity | Value/effort | Why |
 |---|---------|:---:|:---:|:---:|-----|
-| 1 | Output event channel | High | Medium | ★★★☆☆ | Prerequisite for market data, audit trail, and replica analytics. Unlocks many downstream features. |
+| ~~1~~ | ~~Output event channel~~ | ~~High~~ | ~~Medium~~ | ~~★★★☆☆~~ | Done. `--event-bind` enables a TCP firehose of all execution events to subscribers. |
 | 2 | GTD TIF | Low | Very low | ★★★☆☆ | Easy add, nice checkbox. Less asked-for than Day. |
 | 3 | Snapshot schedule | Medium | Low | ★★★☆☆ | Operators don't want to trigger snapshots manually. Timer + existing save logic. |
 | 4 | Reference data management | Medium | Medium | ★★★☆☆ | Instrument disable/remove. Operators expect lifecycle management. |
@@ -38,3 +38,4 @@ Features targeting regulated venues, gateway responsibilities, or with limited n
 | Position/exposure limits | Important for derivatives, less so for spot. Defer until a derivatives buyer needs it. |
 | Tiered fee schedules | Volume-based tiers and per-account overrides. Can be implemented outside Melin — a fee service looks up the account's tier and sets the rate via the existing per-instrument fee API. |
 | TLS | Most exchange deployments use VLAN instead. Only needed for compliance-driven buyers. |
+| Hybrid UDP multicast + TCP recovery for event channel | Current event channel is pure TCP. Multicast would reduce latency for co-located subscribers but adds complexity (gap detection, retransmit). Defer until a buyer needs sub-microsecond market data. |

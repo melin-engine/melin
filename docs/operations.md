@@ -7,15 +7,16 @@ Production operations guide for the trading engine. Written for the person runni
 ## Table of Contents
 
 1. [Server Startup](#server-startup)
-2. [Recovery on Startup](#recovery-on-startup)
-3. [Journal Management](#journal-management)
-4. [Log Levels](#log-levels)
-5. [CPU Tuning](#cpu-tuning)
-6. [Monitoring](#monitoring)
-7. [Emergency Procedures](#emergency-procedures)
-8. [Crash Recovery Scenarios](#crash-recovery-scenarios)
-9. [Disk Failure](#disk-failure)
-10. [Capacity Planning](#capacity-planning)
+2. [Output Event Channel](#output-event-channel)
+3. [Recovery on Startup](#recovery-on-startup)
+4. [Journal Management](#journal-management)
+5. [Log Levels](#log-levels)
+6. [CPU Tuning](#cpu-tuning)
+7. [Monitoring](#monitoring)
+8. [Emergency Procedures](#emergency-procedures)
+9. [Crash Recovery Scenarios](#crash-recovery-scenarios)
+10. [Disk Failure](#disk-failure)
+11. [Capacity Planning](#capacity-planning)
 
 ---
 
@@ -38,7 +39,7 @@ The server uses jemalloc by default (thread-local caches eliminate allocator loc
 | `--journal` | `trading.journal` | Path to the journal file. Use a dedicated NVMe for best latency. |
 | `--snapshot` | (derived) | Path to the snapshot file. If omitted, defaults to `<journal>.snapshot` (e.g., `trading.snapshot`). |
 | `--authorized-keys` | `authorized_keys` | Path to the Ed25519 authorized keys file. Every connection must authenticate before trading. Ignored in replica mode (`--replica-of`). |
-| `--cores` | `1,2,3,6` | Pipeline core IDs: `journal,matching,response,repl-sender` (comma-separated). Core 0 should be reserved for OS/IRQ. |
+| `--cores` | `1,2,3,6,7` | Pipeline core IDs: `journal,matching,response,repl-sender,event-publisher` (comma-separated). Core 0 should be reserved for OS/IRQ. |
 | `--readers` | `2` | Number of epoll reader threads. Each multiplexes connections via epoll. |
 | `--reader-cores` | `4` | First CPU core for reader threads. Reader thread `i` is pinned to core `reader_cores + i`. |
 | `--max-journal-mib` | `256` | Maximum journal size in MiB before automatic rotation at startup. Set to `0` to disable. |
@@ -51,6 +52,7 @@ The server uses jemalloc by default (thread-local caches eliminate allocator loc
 | `--max-connections` | `1024` | Maximum concurrent authenticated connections. `0` for unlimited. Rejects new connections at the limit. |
 | `--yield-idle` | `false` | Yield to OS scheduler when pipeline threads are idle instead of busy-spinning. Use on shared machines without isolated cores. |
 | `--health-bind` | `127.0.0.1:9877` | Address for the health/liveness TCP endpoint. Returns `OK\|ERR <conns> <seq> <lag>`. Omit to disable. |
+| `--event-bind` | (none) | Address for the output event publisher. Subscribers connect to receive all execution events in real time (market data, fills, cancellations). Ed25519 auth required. Omit to disable. See [Output Event Channel](#output-event-channel). |
 
 #### Replication Flags
 
@@ -70,9 +72,9 @@ The server supports synchronous replication. Exactly one of `--replication-bind`
 1. Load authorized keys from `--authorized-keys`.
 2. Initialize or recover the exchange (see [Recovery on Startup](#recovery-on-startup)).
 3. Pre-fault all exchange hash map pages (avoids page faults on the hot path).
-4. Build the disruptor pipeline (input ring buffer + output SPSC queue).
+4. Build the disruptor pipeline (input ring + output ring).
 5. Spawn reader thread pool (epoll-based, one thread per `--readers`).
-6. Spawn 3-4 pipeline OS threads: journal, matching, response, and optionally repl-sender -- each pinned to its `--cores` value.
+6. Spawn 3-5 pipeline OS threads: journal, matching, response, optionally repl-sender, optionally event-publisher -- each pinned to its `--cores` value.
 7. Set listener to non-blocking mode.
 8. Enter accept loop, authenticating connections via Ed25519 challenge-response.
 
@@ -84,7 +86,7 @@ The server supports synchronous replication. Exactly one of `--replication-bind`
     --health-bind 0.0.0.0:9877 \
     --journal /mnt/nvme/trading.journal \
     --authorized-keys /etc/trading/authorized_keys \
-    --cores 1,2,3,6 \
+    --cores 1,2,3,6,7 \
     --readers 2 \
     --reader-cores 4 \
     --max-journal-mib 512 \
@@ -100,7 +102,7 @@ The server supports synchronous replication. Exactly one of `--replication-bind`
     --health-bind 0.0.0.0:9877 \
     --journal /mnt/nvme/trading.journal \
     --authorized-keys /etc/trading/authorized_keys \
-    --cores 1,2,3,6 \
+    --cores 1,2,3,6,7 \
     --readers 2 \
     --reader-cores 4 \
     --max-journal-mib 512 \
@@ -109,9 +111,83 @@ The server supports synchronous replication. Exactly one of `--replication-bind`
 # Replica (separate machine)
 ./target/release/melin-server \
     --journal /mnt/nvme/trading.journal \
-    --cores 1,2,3,6 \
+    --cores 1,2,3,6,7 \
     --replica-of <primary-ip>:9878
 ```
+
+## Output Event Channel
+
+The event channel provides a real-time firehose of all execution events (fills, placements, cancellations, stats) to TCP subscribers. Enable it with `--event-bind`:
+
+```sh
+./target/release/melin-server \
+    --bind 0.0.0.0:9876 \
+    --health-bind 0.0.0.0:9877 \
+    --event-bind 0.0.0.0:9879 \
+    --journal /mnt/nvme/trading.journal \
+    --authorized-keys /etc/trading/authorized_keys \
+    --cores 1,2,3,6,7 \
+    --readers 2 \
+    --reader-cores 4 \
+    --standalone
+```
+
+When `--event-bind` is omitted, the output ring has a single consumer (the response stage) — identical to before, zero overhead.
+
+### How it works
+
+The matching stage publishes to an output disruptor ring. Without `--event-bind`, the ring has one consumer (response stage). With it, the builder adds a second consumer for the event publisher thread:
+
+```
+Matching Stage
+    │
+    │ ring::Producer::publish()
+    ▼
+Output Disruptor Ring (1M slots, multi-consumer)
+    ├──► Consumer 0: Response Stage (per-client, gated on journal+repl cursors)
+    └──► Consumer 1: Event Publisher (TCP broadcast to all subscribers)
+```
+
+Both consumers are parallel. The producer is gated on the **slowest** consumer. In practice, the response stage (which waits for journal fsync) will always be the bottleneck — the event publisher does non-blocking writes with no durability gating, so it runs faster.
+
+### Subscriber protocol
+
+Subscribers connect to the `--event-bind` port and authenticate with the standard Ed25519 challenge-response handshake (same as the main trading port). Any permission level (ReadOnly or above) is accepted.
+
+After auth, the server sends a continuous stream of frames:
+
+```
+| ring_sequence (u64 LE) | length (u32 LE) | tag (u8) | payload (var) |
+```
+
+- **ring_sequence**: Monotonically increasing output ring sequence. Subscribers can detect gaps (missed events) if their last-seen sequence jumps by more than 1.
+- **length + tag + payload**: Standard response codec (same as the per-client response frames). Decodable with the `melin-protocol` crate's `codec::decode_response()`.
+
+Every event the matching stage produces appears on the event channel — fills, placements, cancellations, batch-end markers, stats snapshots, and engine errors. There is no filtering; subscribers receive the full firehose.
+
+### Slow subscriber policy
+
+The event publisher uses non-blocking TCP writes. If a subscriber's TCP send buffer is full (the subscriber isn't reading fast enough), the publisher disconnects it immediately rather than blocking. This prevents a slow subscriber from backpressuring the entire pipeline.
+
+Design your subscribers to read as fast as the publisher writes. If your subscriber does any processing, decouple ingestion from processing with an internal buffer.
+
+### Failure mode
+
+If the event publisher thread dies (panic), the server detects it in the accept loop's health check and initiates a full shutdown. This is necessary because a dead consumer stops advancing its ring progress counter, which would eventually cause the matching stage to backpressure and stall.
+
+### When to use
+
+| Use case | Description |
+|----------|-------------|
+| Market data gateway | Build L2/L3 order book snapshots, BBO feeds, trade tapes from the event stream |
+| Audit logger | Write all execution events to a separate audit database or file for regulatory compliance |
+| Analytics service | Real-time throughput counters, latency histograms, volume analytics |
+| Monitoring | External health checks that verify events are flowing |
+
+### When NOT to use
+
+- **The submitting client already gets responses** via the response stage. The event channel is for *third-party observers*, not for the trading client itself.
+- **For replay/recovery** use the journal file, not the event stream. The journal is the authoritative record.
 
 ---
 
@@ -273,14 +349,15 @@ The recommended core assignment for a production server:
 | 2 | Matching stage | `--cores ...,2,...` |
 | 3 | Response stage | `--cores ...,...,3,...` |
 | 4-5 | Reader threads | `--readers 2 --reader-cores 4` |
-| 6 | Replication sender | `--cores ...,...,...,6` |
-| 7+ | Available for other work (benchmarks, monitoring) | -- |
+| 6 | Replication sender | `--cores ...,...,...,6,...` |
+| 7 | Event publisher | `--cores ...,...,...,...,7` |
+| 8+ | Available for other work (benchmarks, monitoring) | -- |
 
 ### Core Pinning (`--cores`, `--readers`, `--reader-cores`)
 
 Each pipeline thread calls `sched_setaffinity` to pin itself to the specified core. If pinning fails, a warning is logged but the server continues.
 
-- `--cores 1,2,3,6` pins journal to core 1, matching to core 2, response to core 3, repl-sender to core 6.
+- `--cores 1,2,3,6,7` pins journal to core 1, matching to core 2, response to core 3, repl-sender to core 6, event-publisher to core 7.
 - `--readers 2 --reader-cores 4` pins reader 0 to core 4, reader 1 to core 5.
 
 ### Kernel Boot Parameters (GRUB)
@@ -288,7 +365,7 @@ Each pipeline thread calls `sched_setaffinity` to pin itself to the specified co
 For lowest latency, configure kernel boot parameters. Edit `/etc/default/grub` and append to `GRUB_CMDLINE_LINUX_DEFAULT`:
 
 ```
-isolcpus=nohz,domain,1-5 nohz_full=1-5 rcu_nocbs=1-5
+isolcpus=nohz,domain,1-7 nohz_full=1-7 rcu_nocbs=1-7
 ```
 
 Then apply:

@@ -47,18 +47,23 @@ Melin is a high-performance exchange core written in Rust on the [LMAX disruptor
   │  ack ─┐          │ring │   │ + RWF_DSYNC  │  │ .execute()   │                       │
   └───────┼──────────┘     │   └──────┬───────┘  └──────┬───────┘                       │
           │                │          │                 │                               │
-          │ repl cursor    │          │ journal cursor  │ output SPSC                   │
+          │ repl cursor    │          │ journal cursor  │ Output Disruptor Ring         │
           │                │          ▼                 ▼                               │
           │                │   ┌──────────────────────────────┐                         │
-          └──────────────► │   │       Response Thread        │                         │
-                           │   │                              │                         │
+          └──────────────► │   │       Response Thread        │ consumer 0              │
                            │   │  gates on min(journal cursor,│                         │
                            │   │      repl cursor)            │                         │
                            │   └──────────────┬───────────────┘                         │
                            │                  │                                         │
+                           │   ┌──────────────┴───────────────┐                         │
+                           │   │    Event Publisher Thread     │ consumer 1 (optional)   │
+                           │   │    (--event-bind, auth'd TCP) │                         │
+                           │   └──────────────┬───────────────┘                         │
+                           │                  │                                         │
                            └──────────────────┼─────────────────────────────────────────┘
                                               │
-  Clients ◄─TCP───────────────────────────────┘
+  Clients ◄─TCP──────────────────────────────┤
+  Subscribers ◄─TCP──────────────────────────┘
 ```
 
 - **Single-threaded matching engine** — no locks on the hot path; one thread executes all matching logic
@@ -147,6 +152,14 @@ The TCP network stack is now the primary throughput limiter. The journal pipelin
 - Structured logging (`tracing` crate, error-level for server malfunctions only)
 - Health/liveness TCP endpoint (`--health-bind`, returns `OK <conns> <seq> <lag>`) with Prometheus `/metrics` endpoint
 - Sparse account storage to reduce memory usage, see [docs/account-lifecycle.md](docs/account-lifecycle.md).
+
+### Output Event Channel
+- Real-time broadcast of all execution events (fills, placements, cancellations) to TCP subscribers via `--event-bind`
+- Second consumer on the output disruptor ring — zero overhead when disabled (single consumer, identical to before)
+- Ed25519 challenge-response authentication (ReadOnly permission or above)
+- Per-frame monotonic sequence numbers for gap detection
+- Slow subscriber policy: non-blocking writes, disconnect on `WouldBlock`
+- Foundation for market data gateways, analytics services, and audit loggers
 
 ### Metrics & Observability
 - Prometheus metrics endpoint (`GET /metrics` on the health port — active connections, events processed, journal sequence, replication lag, pipeline health, input queue depth, trading state)

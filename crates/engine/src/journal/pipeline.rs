@@ -31,7 +31,6 @@ use crate::types::{AccountId, ExecutionReport, OrderId, RejectReason};
 
 use melin_disruptor::padding::Sequence;
 use melin_disruptor::ring;
-use melin_disruptor::spsc;
 
 /// Ring buffer capacity for the input disruptor (journal + matching consumers).
 /// 2^20 = 1,048,576 slots. At ~72 bytes per slot, this is ~72 MiB — fits in
@@ -782,7 +781,7 @@ impl JournalStage {
 pub struct MatchingStage {
     exchange: Exchange,
     consumer: ring::Consumer<InputSlot>,
-    output: spsc::Producer<OutputSlot>,
+    output: ring::Producer<OutputSlot>,
     /// Monotonically increasing count of events processed. Relaxed ordering
     /// is sufficient — this is a diagnostic counter, not a synchronization
     /// primitive. One `fetch_add(1, Relaxed)` per event (~1ns).
@@ -807,7 +806,7 @@ impl MatchingStage {
     pub fn new(
         exchange: Exchange,
         consumer: ring::Consumer<InputSlot>,
-        output: spsc::Producer<OutputSlot>,
+        output: ring::Producer<OutputSlot>,
         events_processed: Arc<AtomicU64>,
         journal_cursor: Arc<Sequence>,
         active_connections: Arc<AtomicU64>,
@@ -1221,6 +1220,7 @@ fn print_utilization(stage: &str, busy: u64, idle: u64) {
 /// replication stage. The returned `Option<ReplicationStage>` and
 /// `Arc<AtomicU64>` (replication cursor) are used by the server to spawn
 /// the replication thread and gate the response stage.
+#[allow(clippy::type_complexity)]
 pub fn build_pipeline(
     exchange: Exchange,
     writer: JournalWriter,
@@ -1230,7 +1230,7 @@ pub fn build_pipeline(
     ring::MultiProducer<InputSlot>,
     JournalStage,
     MatchingStage,
-    spsc::Consumer<OutputSlot>,
+    Vec<ring::Consumer<OutputSlot>>,
     Arc<Sequence>,
     Arc<AtomicU64>,
 ) {
@@ -1238,7 +1238,7 @@ pub fn build_pipeline(
         producer,
         journal_stage,
         matching_stage,
-        output_consumer,
+        output_consumers,
         journal_cursor,
         _matching_cursor,
         events_processed,
@@ -1255,12 +1255,13 @@ pub fn build_pipeline(
         MAX_JOURNAL_BATCH,
         crate::journal::replication::REPLICATION_RING_CAPACITY,
         false,
+        false,
     );
     (
         producer,
         journal_stage,
         matching_stage,
-        output_consumer,
+        output_consumers,
         journal_cursor,
         events_processed,
     )
@@ -1277,7 +1278,7 @@ pub fn build_pipeline(
 /// Returns one `ReplicationConsumer` for the sender thread, and a
 /// `replication_cursor` `Arc<AtomicU64>` for the response stage.
 /// When replication is disabled, the cursor is `u64::MAX` (standalone mode).
-#[allow(clippy::type_complexity)]
+#[allow(clippy::type_complexity, clippy::too_many_arguments)]
 pub fn build_pipeline_with_replication(
     exchange: Exchange,
     writer: JournalWriter,
@@ -1287,11 +1288,12 @@ pub fn build_pipeline_with_replication(
     max_journal_batch: usize,
     replication_ring_size: usize,
     busy_spin: bool,
+    enable_event_publisher: bool,
 ) -> (
     ring::MultiProducer<InputSlot>,
     JournalStage,
     MatchingStage,
-    spsc::Consumer<OutputSlot>,
+    Vec<ring::Consumer<OutputSlot>>,
     Arc<Sequence>,
     Arc<Sequence>,
     Arc<AtomicU64>,
@@ -1324,8 +1326,15 @@ pub fn build_pipeline_with_replication(
     // last seed sequence before accepting clients.
     let matching_cursor = matching_consumer.progress_counter();
 
-    // Output SPSC: matching → response.
-    let (output_producer, output_consumer) = spsc::channel::<OutputSlot>(OUTPUT_RING_CAPACITY);
+    // Output disruptor ring: matching → response (+ optional event publisher).
+    // Single producer, N consumers (1 = response only, 2 = response + event publisher).
+    // Uses the same ring::Producer/Consumer API as the input disruptor.
+    let mut output_builder =
+        ring::DisruptorBuilder::<OutputSlot>::new(OUTPUT_RING_CAPACITY).add_consumer(); // consumer 0: response stage
+    if enable_event_publisher {
+        output_builder = output_builder.add_consumer(); // consumer 1: event publisher
+    }
+    let (output_producer, output_consumers) = output_builder.build();
 
     let events_processed = Arc::new(AtomicU64::new(0));
 
@@ -1382,7 +1391,7 @@ pub fn build_pipeline_with_replication(
         input_producer,
         journal_stage,
         matching_stage,
-        output_consumer,
+        output_consumers,
         journal_cursor,
         matching_cursor,
         events_processed,
@@ -1501,7 +1510,10 @@ mod tests {
             .build();
         let consumer = consumers.pop().unwrap();
 
-        let (output_producer, mut output_consumer) = spsc::channel::<OutputSlot>(64);
+        let (output_producer, mut output_consumers) = ring::DisruptorBuilder::<OutputSlot>::new(64)
+            .add_consumer()
+            .build();
+        let mut output_consumer = output_consumers.pop().unwrap();
 
         // Journal cursor and counters not used in this test — create dummies.
         let dummy_cursor = Arc::new(Sequence::new(AtomicU64::new(0)));
@@ -1587,10 +1599,11 @@ mod tests {
             input_producer,
             journal_stage,
             matching_stage,
-            mut output_consumer,
+            mut output_consumers,
             journal_cursor,
             _events_processed,
         ) = build_pipeline(exchange, writer, Duration::ZERO, active_conns);
+        let mut output_consumer = output_consumers.pop().unwrap();
 
         let shutdown = Arc::new(AtomicBool::new(false));
         let s1 = Arc::clone(&shutdown);
@@ -1671,7 +1684,7 @@ mod tests {
             input_producer,
             journal_stage,
             matching_stage,
-            mut output_consumer,
+            mut output_consumers,
             journal_cursor,
             _matching_cursor,
             _events_processed,
@@ -1688,7 +1701,9 @@ mod tests {
             MAX_JOURNAL_BATCH,
             REPLICATION_RING_CAPACITY,
             false,
+            false,
         );
+        let mut output_consumer = output_consumers.pop().unwrap();
 
         let mut repl_consumer = replication_rx.expect("replication should be enabled");
 
@@ -1849,6 +1864,7 @@ mod tests {
                     MAX_JOURNAL_BATCH,
                     REPLICATION_RING_CAPACITY,
                     false,
+                    false,
                 );
             assert!(replication.is_none());
             assert_eq!(replication_cursor.load(Ordering::Relaxed), u64::MAX);
@@ -1871,6 +1887,7 @@ mod tests {
                     MAX_JOURNAL_BATCH,
                     REPLICATION_RING_CAPACITY,
                     false,
+                    false,
                 );
             assert!(replication.is_some());
             assert_eq!(
@@ -1887,7 +1904,7 @@ mod tests {
         replica_connected: bool,
     ) -> (
         ring::Producer<InputSlot>,
-        spsc::Consumer<OutputSlot>,
+        ring::Consumer<OutputSlot>,
         Arc<AtomicBool>,
         Arc<AtomicBool>,
         std::thread::JoinHandle<Exchange>,
@@ -1904,7 +1921,10 @@ mod tests {
             .add_consumer()
             .build();
         let consumer = consumers.pop().unwrap();
-        let (output_producer, output_consumer) = spsc::channel::<OutputSlot>(64);
+        let (output_producer, mut output_consumers) = ring::DisruptorBuilder::<OutputSlot>::new(64)
+            .add_consumer()
+            .build();
+        let output_consumer = output_consumers.pop().unwrap();
 
         let dummy_cursor = Arc::new(Sequence::new(AtomicU64::new(0)));
         let events_counter = Arc::new(AtomicU64::new(0));
@@ -1930,7 +1950,7 @@ mod tests {
     }
 
     /// Consume outputs until we see a BatchEnd, returning all reports.
-    fn collect_reports(output: &mut spsc::Consumer<OutputSlot>) -> Vec<ExecutionReport> {
+    fn collect_reports(output: &mut ring::Consumer<OutputSlot>) -> Vec<ExecutionReport> {
         let mut reports = Vec::new();
         loop {
             if let Some((_, slot)) = output.try_consume() {
@@ -2114,7 +2134,10 @@ mod tests {
             .add_consumer()
             .build();
         let consumer = consumers.pop().unwrap();
-        let (output_producer, mut output_consumer) = spsc::channel::<OutputSlot>(64);
+        let (output_producer, mut output_consumers) = ring::DisruptorBuilder::<OutputSlot>::new(64)
+            .add_consumer()
+            .build();
+        let mut output_consumer = output_consumers.pop().unwrap();
 
         let stage = MatchingStage::new(
             exchange,

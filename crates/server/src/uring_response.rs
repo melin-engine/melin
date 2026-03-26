@@ -19,7 +19,7 @@ use io_uring::{IoUring, opcode, types};
 use tracing::{debug, error};
 
 use melin_disruptor::padding::Sequence;
-use melin_disruptor::spsc;
+use melin_disruptor::ring;
 
 use melin_engine::journal::pipeline::{OutputPayload, OutputSlot};
 #[cfg(feature = "latency-trace")]
@@ -84,7 +84,7 @@ struct ConnectionEntry {
 /// for journal + replication durability, and sends responses — but uses
 /// io_uring SEND instead of blocking `write(2)` syscalls.
 pub fn run(
-    mut consumer: spsc::Consumer<OutputSlot>,
+    mut consumer: ring::Consumer<OutputSlot>,
     control_rx: mpsc::Receiver<ControlEvent>,
     journal_cursor: Arc<Sequence>,
     replication_cursor: Arc<std::sync::atomic::AtomicU64>,

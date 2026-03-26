@@ -3,8 +3,8 @@
 //! On startup:
 //! 1. Recovers or creates the `JournaledExchange`.
 //! 2. Decomposes it into `(Exchange, JournalWriter)` via `into_parts()`.
-//! 3. Builds the disruptor pipeline (input ring buffer + output SPSC).
-//! 4. Spawns 4 OS threads: reader (epoll), journal, matching, response.
+//! 3. Builds the disruptor pipeline (input ring + output ring).
+//! 4. Spawns 3-5 OS threads: journal, matching, response, [repl-sender], [event-publisher].
 //! 5. Runs the accept loop, registering connections with the epoll reader.
 //!
 //! Fully synchronous — no async runtime needed. The single reader thread
@@ -60,7 +60,7 @@ pub struct ServerConfig {
     /// Pipeline core IDs: journal,matching,response[,repl-sender]
     /// (comma-separated). Core 0 is reserved for OS/IRQ handling.
     /// The 4th core (repl-sender) is used when replication is enabled.
-    #[arg(long, default_value = "1,2,3,6", value_parser = parse_cores)]
+    #[arg(long, default_value = "1,2,3,6,7", value_parser = parse_cores)]
     pub cores: PipelineCores,
     /// Number of epoll reader threads.
     #[arg(long, default_value_t = 2)]
@@ -152,6 +152,13 @@ pub struct ServerConfig {
     #[arg(long, default_value_t = false)]
     pub yield_idle: bool,
 
+    /// Address for the output event publisher. Subscribers connect here
+    /// to receive a real-time stream of all execution events (market data,
+    /// fills, cancellations). Ed25519 auth required (ReadOnly or above).
+    /// Omit to disable (ring has 1 consumer — identical to before).
+    #[arg(long)]
+    pub event_bind: Option<SocketAddr>,
+
     /// Address for the health/liveness TCP endpoint. On connect, returns
     /// a one-line status (`OK <conns> <journal_seq> <repl_lag>\n`) and
     /// closes. No auth required. Set to empty string to disable.
@@ -202,23 +209,24 @@ impl ServerConfig {
 
 /// Core assignments for pipeline threads.
 ///
-/// Four fields: journal, matching, response, and repl-sender.
-/// All four are always stored; the repl-sender core is only used
-/// when replication is enabled.
+/// Five fields: journal, matching, response, repl-sender, and event-publisher.
+/// All five are always stored; repl-sender is only used when replication is
+/// enabled, event-publisher only when `--event-bind` is set.
 #[derive(Debug, Clone, Copy)]
 pub struct PipelineCores {
     pub journal: usize,
     pub matching: usize,
     pub response: usize,
     pub repl_sender: usize,
+    pub event_publisher: usize,
 }
 
-/// Parse "j,m,r,s" into `PipelineCores` for pipeline core affinity.
+/// Parse "j,m,r,s,e" into `PipelineCores` for pipeline core affinity.
 fn parse_cores(s: &str) -> Result<PipelineCores, String> {
     let parts: Vec<&str> = s.split(',').collect();
-    if parts.len() != 4 {
+    if parts.len() != 5 {
         return Err(format!(
-            "expected 4 comma-separated core IDs (journal,matching,response,repl-sender), got {}",
+            "expected 5 comma-separated core IDs (journal,matching,response,repl-sender,event-publisher), got {}",
             parts.len()
         ));
     }
@@ -231,6 +239,7 @@ fn parse_cores(s: &str) -> Result<PipelineCores, String> {
         matching: parse(parts[1])?,
         response: parse(parts[2])?,
         repl_sender: parse(parts[3])?,
+        event_publisher: parse(parts[4])?,
     })
 }
 
@@ -238,7 +247,7 @@ fn parse_cores(s: &str) -> Result<PipelineCores, String> {
 ///
 /// 1. Initializes (or recovers) the `JournaledExchange`, then decomposes
 ///    it into `Exchange` and `JournalWriter` for the pipeline.
-/// 2. Builds the disruptor pipeline (input ring + output SPSC + stages).
+/// 2. Builds the disruptor pipeline (input ring + output ring + stages).
 /// 3. Spawns 3 OS threads: journal, matching, response.
 /// 4. Runs the accept loop, spawning a reader OS thread per connection.
 ///
@@ -393,11 +402,12 @@ fn run_as_primary<L: BlockingTransportListener>(
     };
 
     // Build the disruptor pipeline with optional replication consumer.
+    let enable_event_publisher = config.event_bind.is_some();
     let (
         input_producer,
         journal_stage,
         matching_stage,
-        output_consumer,
+        mut output_consumers,
         journal_cursor,
         matching_cursor,
         events_processed,
@@ -414,7 +424,16 @@ fn run_as_primary<L: BlockingTransportListener>(
         config.max_journal_batch,
         config.replication_ring_size,
         !config.yield_idle,
+        enable_event_publisher,
     );
+    // Consumer 0 is always the response stage. Consumer 1 (if present)
+    // is the event publisher — only created when --event-bind is set.
+    let output_consumer = output_consumers.remove(0);
+    let event_publisher_consumer = if enable_event_publisher {
+        Some(output_consumers.remove(0))
+    } else {
+        None
+    };
 
     // Control channel for connect/disconnect events → response stage.
     let (control_tx, control_rx) = std::sync::mpsc::channel();
@@ -547,6 +566,32 @@ fn run_as_primary<L: BlockingTransportListener>(
         if !config.standalone && config.replica_of.is_none() {
             info!("running in standalone mode (no replication)");
         }
+        None
+    };
+
+    // Spawn event publisher thread if enabled. Consumes from output ring
+    // consumer 1 and broadcasts all execution events to TCP subscribers.
+    let event_publisher_handle = if let Some(event_consumer) = event_publisher_consumer {
+        let event_bind = config.event_bind.expect("event_bind must be set");
+        let s_event = Arc::clone(&shutdown);
+        let event_keys = Arc::clone(&authorized_keys);
+        let event_handle = std::thread::Builder::new()
+            .name("event-publisher".into())
+            .spawn(move || {
+                apply_affinity("event-publisher", cores.event_publisher);
+                crate::event_publisher::run(
+                    event_consumer,
+                    event_bind,
+                    event_keys,
+                    &s_event,
+                    busy_spin,
+                );
+            })
+            .expect("failed to spawn event publisher thread");
+
+        info!(addr = %event_bind, "event publisher started");
+        Some(event_handle)
+    } else {
         None
     };
 
@@ -701,9 +746,13 @@ fn run_as_primary<L: BlockingTransportListener>(
         // shutdown or panic — if one is finished while shutdown is false,
         // it panicked. Re-check shutdown to avoid a TOCTOU race where a
         // clean shutdown signal arrives between the two checks.
+        let event_pub_died = event_publisher_handle
+            .as_ref()
+            .is_some_and(|h| h.is_finished());
         if (journal_handle.is_finished()
             || matching_handle.is_finished()
-            || response_handle.is_finished())
+            || response_handle.is_finished()
+            || event_pub_died)
             && !shutdown.load(Ordering::Relaxed)
         {
             error!("pipeline thread died, initiating shutdown");
@@ -864,6 +913,11 @@ fn run_as_primary<L: BlockingTransportListener>(
     // Join replication thread.
     if let Some(repl_sender_handle) = replication_handle {
         let _ = repl_sender_handle.join();
+    }
+
+    // Join event publisher thread.
+    if let Some(event_handle) = event_publisher_handle {
+        let _ = event_handle.join();
     }
 
     // Join health endpoint thread.
