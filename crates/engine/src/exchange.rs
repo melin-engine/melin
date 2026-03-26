@@ -6710,4 +6710,112 @@ mod tests {
         // Reservation released.
         assert_eq!(exchange.accounts().balance(ACCT_A, USD).reserved, 0);
     }
+
+    #[test]
+    fn gtd_partial_fill_then_remainder_expires() {
+        let mut exchange = Exchange::new();
+        let btc = Symbol(1);
+        exchange.add_instrument(btc_usd_spec());
+        exchange.deposit(ACCT_A, USD, 20_000);
+        exchange.deposit(ACCT_B, BTC, 100);
+
+        let mut reports = Vec::new();
+
+        // ACCT_A: GTD buy 10 @ 100, expiring at t=1000.
+        exchange.execute(
+            btc,
+            Order {
+                id: OrderId(1),
+                account: ACCT_A,
+                side: Side::Buy,
+                order_type: OrderType::Limit {
+                    price: price(100),
+                    post_only: false,
+                },
+                time_in_force: TimeInForce::GTD,
+                quantity: qty(10),
+                stp: SelfTradeProtection::Allow,
+                expiry_ns: 1000,
+            },
+            &mut reports,
+        );
+        reports.clear();
+
+        // ACCT_B: sell 3 @ 100 — partial fill against ACCT_A's GTD order.
+        exchange.execute(btc, market_order(1, ACCT_B, Side::Sell, 3), &mut reports);
+        // Should see Fill(3) + Cancelled(seller IOC remainder=0 is not emitted).
+        let fills: Vec<_> = reports
+            .iter()
+            .filter(|r| matches!(r, ExecutionReport::Fill { .. }))
+            .collect();
+        assert_eq!(fills.len(), 1);
+        reports.clear();
+
+        // Expire at t=1000 — remaining 7 should be cancelled.
+        exchange.expire_orders(1000, &mut reports);
+        assert_eq!(reports.len(), 1);
+        assert!(matches!(
+            reports[0],
+            ExecutionReport::Cancelled {
+                order_id: OrderId(1),
+                remaining_quantity,
+                ..
+            } if remaining_quantity.get() == 7
+        ));
+
+        // Reservation for the remaining 7 released (7 * 100 = 700).
+        assert_eq!(exchange.accounts().balance(ACCT_A, USD).reserved, 0);
+    }
+
+    #[test]
+    fn end_of_day_does_not_cancel_gtd_orders() {
+        let mut exchange = Exchange::new();
+        let btc = Symbol(1);
+        exchange.add_instrument(btc_usd_spec());
+        exchange.deposit(ACCT_A, USD, 20_000);
+
+        let mut reports = Vec::new();
+
+        // ACCT_A: GTD order expiring at t=5000.
+        exchange.execute(
+            btc,
+            Order {
+                id: OrderId(1),
+                account: ACCT_A,
+                side: Side::Buy,
+                order_type: OrderType::Limit {
+                    price: price(100),
+                    post_only: false,
+                },
+                time_in_force: TimeInForce::GTD,
+                quantity: qty(10),
+                stp: SelfTradeProtection::Allow,
+                expiry_ns: 5000,
+            },
+            &mut reports,
+        );
+        reports.clear();
+
+        // ACCT_A: Day order.
+        exchange.execute(
+            btc,
+            limit_order(2, ACCT_A, Side::Buy, 100, 5, TimeInForce::Day),
+            &mut reports,
+        );
+        reports.clear();
+
+        // EndOfDay cancels Day orders but NOT GTD.
+        exchange.end_of_day(&mut reports);
+        assert_eq!(reports.len(), 1);
+        assert!(matches!(
+            reports[0],
+            ExecutionReport::Cancelled {
+                order_id: OrderId(2),
+                ..
+            }
+        ));
+
+        // GTD order still on book — reservation still held.
+        assert!(exchange.accounts().balance(ACCT_A, USD).reserved > 0);
+    }
 }
