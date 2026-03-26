@@ -225,8 +225,7 @@ pub fn run_dpdk_poll(
                 continue;
             }
 
-            // Guard against unbounded buffer growth from slow/malicious clients.
-            // Check BEFORE recv so we don't append past the limit.
+            // Guard against unbounded buffer growth — check before recv.
             const MAX_PARSE_BUF: usize = 65536;
             if conn.parse_buf.len() >= MAX_PARSE_BUF {
                 debug!(
@@ -246,8 +245,8 @@ pub fn run_dpdk_poll(
                 continue;
             }
 
-            // Read available data directly into the connection's parse buffer,
-            // skipping the intermediate read_buf copy.
+            // Read directly into parse_buf, skipping the intermediate
+            // read_buf stack copy.
             let n = transport.recv_into_vec(conn.handle, &mut conn.parse_buf);
             if n == 0 {
                 if !transport.is_active(conn.handle) {
@@ -256,7 +255,6 @@ pub fn run_dpdk_poll(
                         addr = %conn.addr,
                         "DPDK: connection closed"
                     );
-                    // Only notify response stage if auth completed.
                     if matches!(conn.auth, AuthState::Authenticated { .. }) {
                         let _ = control_tx.send(ControlEvent::Disconnected {
                             connection_id: conn.connection_id.0,
