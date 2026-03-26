@@ -234,6 +234,22 @@ pub fn run_dpdk_poll(
                 continue;
             }
 
+            // Guard against unbounded buffer growth from slow/malicious clients.
+            const MAX_PARSE_BUF: usize = 65536;
+            if conn.parse_buf.len() + n > MAX_PARSE_BUF {
+                debug!(
+                    connection_id = conn.connection_id.0,
+                    buf_len = conn.parse_buf.len(),
+                    "parse buffer exceeded limit, dropping connection"
+                );
+                transport.close(conn.handle);
+                let _ = control_tx.send(ControlEvent::Disconnected {
+                    connection_id: conn.connection_id.0,
+                });
+                id_to_handle.remove(&conn.connection_id.0);
+                connections.remove(&handle);
+                continue;
+            }
             conn.parse_buf.extend_from_slice(&read_buf[..n]);
 
             // Process frames based on auth state.

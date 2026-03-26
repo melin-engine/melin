@@ -116,3 +116,18 @@ Core layout: 0=OS/IRQ, 1-3=pipeline (journal/matching/response), 4-5=readers, 6=
 | 5 | DPDK + F-Stack | 2-3x throughput | Extreme, GPL concern |
 
 Options 2-5 are mutually exclusive kernel bypass paths (pick one). See README Performance Tuning leads for details.
+
+### DPDK transport optimizations (branch: `feat/dpdk-optims`)
+
+| # | Optimization | Latency gain | Throughput gain | Risk |
+|---|-------------|:---:|:---:|------|
+| 1 | Batch TX submissions — coalesce pending TX into single `rte_eth_tx_burst` | 5-15µs p50 | 10-20% | Low |
+| 2 | Eliminate auth-path allocations — `to_vec()`+`drain()` → cursor pattern | ~50ns/auth | None (cold) | None |
+| 3 | Parse buffer size limit — unbounded inbound buffer → DoS vector | None | None | **Fixes DoS** |
+| 4 | TX queue compaction threshold — lower from 50% to 25% waste | 5-20µs tail | Marginal | Low |
+| 5 | Skip smoltcp poll on empty RX — avoid TCP state machine when no packets | 50-200ns/idle | 5-10% idle | Medium (timers) |
+| 6 | Zero-copy RX — read from mbuf directly, skip smoltcp copy | 100-500ns/pkt | 10-30% | High (lifetimes) |
+| 7 | Adaptive timestamp refresh — 1 during auth, 1000 steady-state | ~3ns/poll | Negligible | Low |
+| 8 | Pre-allocated connection pool — slab instead of per-accept heap alloc | ~200ns/accept | None (cold) | None |
+
+Implementation order: #3 (safety) → #2 (quick win) → #1 (batch TX) → #5 (skip idle polls).
