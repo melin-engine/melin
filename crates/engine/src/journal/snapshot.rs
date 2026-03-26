@@ -1596,6 +1596,44 @@ mod tests {
     }
 
     #[test]
+    fn clone_via_snapshot_produces_identical_state() {
+        let mut exchange = Exchange::new();
+        exchange.add_instrument(btc_usd_spec());
+        exchange.deposit(ACCT_A, USD, 100_000);
+        exchange.deposit(ACCT_B, BTC, 500);
+
+        let mut reports = Vec::new();
+        exchange.execute(
+            Symbol(1),
+            limit_order(1, ACCT_B, Side::Sell, 100, 50),
+            &mut reports,
+        );
+        reports.clear();
+
+        let cloned = exchange.clone_via_snapshot();
+
+        // Balances should match.
+        assert_eq!(
+            cloned.accounts().balance(ACCT_A, USD).available,
+            exchange.accounts().balance(ACCT_A, USD).available,
+        );
+        assert_eq!(
+            cloned.accounts().balance(ACCT_B, BTC).reserved,
+            exchange.accounts().balance(ACCT_B, BTC).reserved,
+        );
+
+        // Resting order should match — buy against it on the clone.
+        let mut clone_reports = Vec::new();
+        let mut mutable_clone = cloned;
+        mutable_clone.execute(
+            Symbol(1),
+            limit_order(2, ACCT_A, Side::Buy, 100, 10),
+            &mut clone_reports,
+        );
+        assert!(matches!(clone_reports[0], ExecutionReport::Fill { .. }));
+    }
+
+    #[test]
     fn corrupt_snapshot_detected() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("corrupt.snapshot");

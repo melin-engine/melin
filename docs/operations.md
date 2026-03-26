@@ -302,7 +302,7 @@ Input Disruptor Ring
 
 The shadow exchange runs on its own dedicated core and has no interaction with the primary matching engine. It reads from the same input ring buffer but through its own independent cursor. The primary matching stage is never blocked or slowed by the shadow — they are fully parallel consumers.
 
-The state shared between the shadow and primary is read via a `SeqLock`, which provides wait-free reads for the primary and wait-free writes for the shadow.
+The only state shared between stages is the BLAKE3 chain hash, published by the journal stage via a `SeqLock` after each fsync batch. The shadow reads it when taking a snapshot — one lock-free read per snapshot, no contention.
 
 ### Snapshot Placement
 
