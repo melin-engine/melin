@@ -22,6 +22,7 @@ use std::hash::{Hash, Hasher};
 
 use tracing::{debug, error, info, warn};
 
+use melin_engine::exchange::Exchange;
 use melin_engine::journal::JournaledExchange;
 use melin_engine::journal::pipeline::build_pipeline_with_replication;
 use melin_engine::journal::writer::JournalWriter;
@@ -156,6 +157,12 @@ pub struct ServerConfig {
     /// closes. No auth required. Set to empty string to disable.
     #[arg(long, default_value = "127.0.0.1:9877")]
     pub health_bind: Option<SocketAddr>,
+
+    /// TCP address for the promotion trigger endpoint (replica only).
+    /// An operator connects and sends `PROMOTE\n` to promote the replica
+    /// to primary. Ignored in primary mode.
+    #[arg(long)]
+    pub promote_bind: Option<SocketAddr>,
 }
 
 /// Delegates to clap so `#[arg(default_value...)]` is the single source of
@@ -265,7 +272,44 @@ pub fn run_with_shutdown<L: BlockingTransportListener>(
     //   - Verify state via BLAKE3 hash chain
     if let Some(primary_addr) = config.replica_of {
         info!(primary = %primary_addr, "starting in replica mode");
-        return crate::replication::run_receiver(primary_addr, &config.journal, &shutdown);
+
+        // Spawn promotion listener if configured.
+        let promote_flag = Arc::new(AtomicBool::new(false));
+        let _promote_handle = config.promote_bind.map(|addr| {
+            crate::promote::spawn(addr, Arc::clone(&promote_flag), Arc::clone(&shutdown))
+        });
+
+        match crate::replication::run_receiver(
+            primary_addr,
+            &config.journal,
+            &shutdown,
+            &promote_flag,
+        )? {
+            None => return Ok(()), // clean shutdown
+            Some((mut exchange, writer)) => {
+                // Promotion! Transition to primary mode.
+                info!("replica promoted — transitioning to primary");
+                exchange.prefault();
+
+                // Load authorized keys (skipped during replica mode).
+                let authorized_keys = Arc::new(AuthorizedKeys::load(&config.authorized_keys)?);
+                info!(
+                    keys = authorized_keys.len(),
+                    path = %config.authorized_keys.display(),
+                    "loaded authorized keys"
+                );
+
+                return run_as_primary(
+                    exchange,
+                    writer,
+                    listener,
+                    &config,
+                    shutdown,
+                    authorized_keys,
+                    false, // no seeding needed — state comes from replication
+                );
+            }
+        }
     }
 
     // Load authorized keys for challenge-response authentication.
@@ -286,6 +330,32 @@ pub fn run_with_shutdown<L: BlockingTransportListener>(
     // Pre-fault all HashMap pages so page faults happen now, not on the hot path.
     exchange.prefault();
 
+    run_as_primary(
+        exchange,
+        writer,
+        listener,
+        &config,
+        shutdown,
+        authorized_keys,
+        needs_seeding,
+    )
+}
+
+/// Run the server as a primary: build the disruptor pipeline, spawn
+/// pipeline threads, optionally seed instruments/accounts, then accept
+/// client connections.
+///
+/// Used by both the normal primary startup path and the promotion path
+/// (replica → primary transition).
+fn run_as_primary<L: BlockingTransportListener>(
+    exchange: Exchange,
+    writer: JournalWriter,
+    mut listener: L,
+    config: &ServerConfig,
+    shutdown: Arc<AtomicBool>,
+    authorized_keys: Arc<AuthorizedKeys>,
+    needs_seeding: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
     // Active connection counter shared between accept loop, response
     // stage, and matching stage (for stats queries).
     // Incremented on successful auth, decremented on disconnect.

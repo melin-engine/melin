@@ -11,6 +11,10 @@ path = "src/main.rs"
 name = "melin-keygen"
 path = "src/keygen.rs"
 
+[[bin]]
+name = "melin-promote"
+path = "src/promote.rs"
+
 [dependencies]
 melin-client = { path = "../client" }
 melin-protocol = { path = "../protocol" }

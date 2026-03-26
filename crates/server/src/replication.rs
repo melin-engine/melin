@@ -622,11 +622,17 @@ fn process_acks(
 /// entries, persists them locally, replays into the Exchange, and sends acks.
 ///
 /// Blocks until the connection drops or shutdown is signaled.
+/// Result of `run_receiver`: `None` = clean shutdown, `Some` = promotion
+/// triggered with the fully-replayed Exchange and positioned JournalWriter.
+pub type ReceiverResult =
+    Result<Option<(melin_engine::exchange::Exchange, melin_engine::journal::writer::JournalWriter)>, Box<dyn std::error::Error>>;
+
 pub fn run_receiver(
     primary_addr: SocketAddr,
     journal_path: &std::path::Path,
     shutdown: &AtomicBool,
-) -> Result<(), Box<dyn std::error::Error>> {
+    promote: &AtomicBool,
+) -> ReceiverResult {
     use melin_engine::exchange::Exchange;
     use melin_engine::journal::writer::JournalWriter;
 
@@ -744,7 +750,7 @@ pub fn run_receiver(
     // overhead from one-per-batch to one-per-TCP-read-burst.
     let mut journal_accum: Vec<u8> = Vec::with_capacity(128 * 1024);
     let mut accum_entry_count: u64 = 0;
-    let mut accum_end_sequence: u64;
+    let mut accum_end_sequence: u64 = 0;
     // Reusable frame buffer — grows to high-water mark, avoids per-frame
     // heap allocation in the hot receive loop.
     let mut frame_buf: Vec<u8> = Vec::with_capacity(64 * 1024);
@@ -753,7 +759,49 @@ pub fn run_receiver(
     loop {
         if shutdown.load(Ordering::Relaxed) {
             info!("replica shutting down");
-            return Ok(());
+            return Ok(None);
+        }
+
+        if promote.load(Ordering::Acquire) {
+            info!("promotion triggered — stopping replication, transitioning to primary");
+            // Drain any remaining data already in the TCP buffer to
+            // maximize data freshness before promotion.
+            let mut rpollfd = libc::pollfd {
+                fd: reader.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            loop {
+                rpollfd.revents = 0;
+                let ready = (unsafe { libc::poll(&mut rpollfd, 1, 0) }) > 0
+                    && (rpollfd.revents & libc::POLLIN) != 0;
+                if !ready {
+                    break;
+                }
+                if read_frame_into(&mut reader, &mut frame_buf, MAX_DATA_FRAME).is_err() {
+                    break;
+                }
+                match decode_primary_message(&frame_buf) {
+                    Ok(PrimaryMessage::DataBatch {
+                        end_sequence,
+                        entry_count,
+                        journal_bytes,
+                        ..
+                    }) => {
+                        journal_accum.extend_from_slice(&journal_bytes);
+                        accum_entry_count += entry_count as u64;
+                        accum_end_sequence = end_sequence;
+                    }
+                    _ => break,
+                }
+            }
+            // Fsync any accumulated data.
+            if !journal_accum.is_empty() {
+                journal_writer.write_raw_sync(&journal_accum, accum_entry_count)?;
+                replay_journal_bytes(&journal_accum, &mut exchange, &mut reports)?;
+                journal_accum.clear();
+            }
+            return Ok(Some((exchange, journal_writer)));
         }
 
         // Read the first frame (blocking, with the 5s timeout for

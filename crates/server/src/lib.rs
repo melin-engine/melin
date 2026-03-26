@@ -2,6 +2,7 @@
 
 pub mod affinity;
 pub mod health;
+pub mod promote;
 #[cfg(not(feature = "io-uring"))]
 mod reader;
 pub mod replication;
