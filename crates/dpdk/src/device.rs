@@ -69,6 +69,9 @@ pub struct DpdkDevice {
     batch_mbufs: Vec<*mut ffi::rte_mbuf>,
     /// Reusable injected-frames buffer for collect_rx_batch().
     batch_injected: Vec<Vec<u8>>,
+    /// Pending TX mbufs accumulated during smoltcp poll. Flushed in a
+    /// single `tx_burst(N)` call via `flush_tx()` after each poll cycle.
+    tx_batch: Vec<*mut ffi::rte_mbuf>,
 }
 
 // SAFETY: DpdkDevice is only used from the single DPDK poll thread.
@@ -124,7 +127,35 @@ impl DpdkDevice {
             known_neighbors: std::collections::HashSet::new(),
             batch_mbufs: Vec::with_capacity(BURST_SIZE * port_ids.len()),
             batch_injected: Vec::new(),
+            tx_batch: Vec::with_capacity(BURST_SIZE),
         }
+    }
+
+    /// Flush all pending TX mbufs in a single `tx_burst(N)` call.
+    /// Call after each `iface.poll()` cycle to batch outgoing packets.
+    pub fn flush_tx(&mut self) {
+        if self.tx_batch.is_empty() {
+            return;
+        }
+        let count = self.tx_batch.len();
+        let sent = unsafe {
+            ffi::dpdk_eth_tx_burst(
+                self.tx_port_id,
+                0,
+                self.tx_batch.as_mut_ptr(),
+                count as u16,
+            )
+        } as usize;
+        // Free any unsent mbufs (TX queue full).
+        for mbuf in &self.tx_batch[sent..] {
+            unsafe {
+                ffi::dpdk_pktmbuf_free(*mbuf);
+            }
+        }
+        if sent < count {
+            tracing::debug!(sent, total = count, "TX burst partial — queue full");
+        }
+        self.tx_batch.clear();
     }
 
     /// Poll all ports for received packets.
@@ -354,10 +385,10 @@ impl Device for DpdkDevice {
 
     fn transmit(&mut self, _timestamp: Instant) -> Option<Self::TxToken<'_>> {
         Some(DpdkTxToken {
-            port_id: self.tx_port_id,
             mempool: self.mempool,
             tx_ol_flags: self.tx_ol_flags,
             tx_vlan_id: self.tx_vlan_id,
+            tx_batch: &mut self.tx_batch,
         })
     }
 
@@ -408,17 +439,18 @@ impl phy::RxToken for DpdkRxToken {
     }
 }
 
-/// TX token: allocates an mbuf and sends one Ethernet frame.
-pub struct DpdkTxToken {
-    port_id: u16,
+/// TX token: allocates an mbuf and queues it for batched transmission.
+pub struct DpdkTxToken<'a> {
     mempool: *mut ffi::rte_mempool,
     /// Pre-computed TX offload flags (IPv4 + TCP checksum + VLAN insert).
     tx_ol_flags: u64,
     /// VLAN ID for TX insert. 0 = no VLAN tagging.
     tx_vlan_id: u16,
+    /// Batch buffer — mbufs are pushed here and flushed via `flush_tx()`.
+    tx_batch: &'a mut Vec<*mut ffi::rte_mbuf>,
 }
 
-impl phy::TxToken for DpdkTxToken {
+impl<'a> phy::TxToken for DpdkTxToken<'a> {
     fn consume<R, F>(self, len: usize, f: F) -> R
     where
         F: FnOnce(&mut [u8]) -> R,
@@ -492,14 +524,8 @@ impl phy::TxToken for DpdkTxToken {
             }
         }
 
-        let mut tx_mbuf = mbuf;
-        let sent = unsafe { ffi::dpdk_eth_tx_burst(self.port_id, 0, &mut tx_mbuf, 1) };
-        if sent == 0 {
-            unsafe {
-                ffi::dpdk_pktmbuf_free(mbuf);
-            }
-            tracing::debug!("TX queue full, dropped packet");
-        }
+        // Queue for batched transmission — flushed via flush_tx().
+        self.tx_batch.push(mbuf);
 
         result
     }

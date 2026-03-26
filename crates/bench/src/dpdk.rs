@@ -216,6 +216,7 @@ pub fn run_dpdk_roundtrip(
         }
         device.poll_rx();
         iface.poll(*cached_ts, device, sockets);
+        device.flush_tx();
     };
 
     // --- Connect, auth, and set up each client sequentially ---
@@ -571,6 +572,7 @@ fn dpdk_auth_all(
         }
         device.poll_rx();
         iface.poll(*cached_ts, device, sockets);
+        device.flush_tx();
 
         let mut all_done = true;
 
