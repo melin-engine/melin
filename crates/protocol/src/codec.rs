@@ -31,7 +31,7 @@ use std::num::NonZeroU64;
 use melin_engine::le;
 use melin_engine::types::{
     AccountId, CircuitBreakerConfig, CurrencyId, ExecutionReport, FeeSchedule, InstrumentSpec,
-    Order, OrderId, OrderType, Price, Quantity, RejectReason, RiskLimits, Symbol,
+    Order, OrderId, OrderType, Price, Quantity, RejectReason, RiskLimits, Symbol, TimeInForce,
 };
 
 use crate::error::ProtocolError;
@@ -52,6 +52,7 @@ const TAG_SET_FEE_SCHEDULE: u8 = 31;
 const TAG_QUERY_STATS: u8 = 30;
 const TAG_WITHDRAW: u8 = 32;
 const TAG_END_OF_DAY: u8 = 33;
+const TAG_EXPIRE_ORDERS: u8 = 34;
 
 // --- Response tags ---
 const TAG_PLACED: u8 = 11;
@@ -265,6 +266,12 @@ pub fn encode_request(request: &Request, seq: u64, buf: &mut [u8]) -> Result<usi
         Request::EndOfDay => {
             buf[pos] = TAG_END_OF_DAY;
             pos += 1;
+        }
+        Request::ExpireOrders { timestamp_ns } => {
+            buf[pos] = TAG_EXPIRE_ORDERS;
+            pos += 1;
+            le::put_u64(&mut buf[pos..], *timestamp_ns);
+            pos += 8;
         }
     }
 
@@ -494,6 +501,13 @@ pub fn decode_request(buf: &[u8]) -> Result<(u64, Request), ProtocolError> {
         }
         TAG_QUERY_STATS => Ok((seq, Request::QueryStats)),
         TAG_END_OF_DAY => Ok((seq, Request::EndOfDay)),
+        TAG_EXPIRE_ORDERS => {
+            if payload.len() < 8 {
+                return Err(ProtocolError::Truncated);
+            }
+            let timestamp_ns = le::get_u64(&payload[0..]);
+            Ok((seq, Request::ExpireOrders { timestamp_ns }))
+        }
         TAG_SET_FEE_SCHEDULE => {
             // symbol(4) + maker_fee_bps(2) + taker_fee_bps(2) = 8
             if payload.len() < 8 {
@@ -678,6 +692,13 @@ fn encode_order(order: &Order, buf: &mut [u8]) -> usize {
     buf[pos] = le::encode_stp(order.stp);
     pos += 1;
 
+    // Conditional expiry_ns: only written for GTD orders to avoid inflating
+    // every order's wire footprint by 8 bytes.
+    if order.time_in_force == TimeInForce::GTD {
+        le::put_u64(&mut buf[pos..], order.expiry_ns);
+        pos += 8;
+    }
+
     pos
 }
 
@@ -759,6 +780,18 @@ fn decode_order(buf: &[u8]) -> Result<(usize, Order), ProtocolError> {
         le::decode_stp(buf[pos]).ok_or(ProtocolError::InvalidField("self-trade protection"))?;
     pos += 1;
 
+    // Conditional expiry_ns: only present for GTD orders.
+    let expiry_ns = if time_in_force == TimeInForce::GTD {
+        if buf.len() < pos + 8 {
+            return Err(ProtocolError::Truncated);
+        }
+        let v = le::get_u64(&buf[pos..]);
+        pos += 8;
+        v
+    } else {
+        0
+    };
+
     Ok((
         pos,
         Order {
@@ -769,7 +802,7 @@ fn decode_order(buf: &[u8]) -> Result<(usize, Order), ProtocolError> {
             time_in_force,
             quantity: Quantity(quantity),
             stp,
-            expiry_ns: 0,
+            expiry_ns,
         },
     ))
 }
@@ -1218,6 +1251,26 @@ mod tests {
             },
             Request::QueryStats,
             Request::EndOfDay,
+            Request::ExpireOrders {
+                timestamp_ns: 1_700_000_000_000_000_000,
+            },
+            // GTD order — exercises conditional expiry_ns encoding.
+            Request::SubmitOrder {
+                symbol: Symbol(1),
+                order: Order {
+                    id: OrderId(200),
+                    account: AccountId(42),
+                    side: Side::Buy,
+                    order_type: OrderType::Limit {
+                        price: Price(nz(5000)),
+                        post_only: false,
+                    },
+                    time_in_force: TimeInForce::GTD,
+                    quantity: Quantity(nz(10)),
+                    stp: SelfTradeProtection::CancelNewest,
+                    expiry_ns: 1_800_000_000_000_000_000,
+                },
+            },
         ]
     }
 

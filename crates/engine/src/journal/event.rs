@@ -73,6 +73,9 @@ pub enum JournalEvent {
     /// Cancel all resting orders and pending stops with `TimeInForce::Day`
     /// across all instruments. Triggered by an operator at end-of-session.
     EndOfDay,
+    /// Expire all resting orders and pending stops with `TimeInForce::GTD`
+    /// whose `expiry_ns` <= `timestamp_ns`. Triggered by an operator.
+    ExpireOrders { timestamp_ns: u64 },
     /// Query server stats. Not journaled (no state change) — the journal
     /// stage skips this variant. Flows through the pipeline so the matching
     /// stage can read Exchange state without concurrency issues.

@@ -8,12 +8,12 @@
 //! Uses manual binary serialization (same approach as the journal codec)
 //! to avoid serde dependency.
 //!
-//! ## File format (v8)
+//! ## File format (v11)
 //!
 //! | Field          | Type    | Bytes | Purpose                            |
 //! |----------------|---------|-------|------------------------------------|
 //! | file_magic     | u32     | 4     | `0x534E4150` ("SNAP")              |
-//! | format_version | u16     | 2     | Current version = 8                |
+//! | format_version | u16     | 2     | Current version = 11               |
 //! | reserved       | u16     | 2     | Padding, zeroed                    |
 //! | sequence       | u64     | 8     | Journal sequence at snapshot       |
 //! | chain_hash     | [u8;32] | 32    | BLAKE3 hash chain state (v6+)      |
@@ -55,7 +55,8 @@ const SNAP_MAGIC: u32 = 0x534E_4150;
 /// v6 → v7: order_sides keyed by (AccountId, OrderId), added fee schedules.
 /// v7 → v8: order_index and stop_index now store AccountId (21 bytes/entry vs 17).
 /// v8 → v9: added per-key request sequence HWMs for admin idempotency.
-const SNAP_VERSION: u16 = 10;
+/// v10 → v11: added expiry_ns to resting orders and pending stops (GTD support).
+const SNAP_VERSION: u16 = 11;
 
 /// Snapshot header size: magic(4) + version(2) + reserved(2) + sequence(8) + chain_hash(32) = 48.
 const SNAP_HEADER_SIZE: usize = 48;
@@ -138,7 +139,7 @@ pub fn load(path: &Path) -> Result<(Exchange, u64, [u8; 32]), JournalError> {
     // v5 header is 16 bytes, v6+ header is 48 bytes (adds 32-byte chain_hash).
     let (header_size, has_chain_hash) = match version {
         5 => (16usize, false),
-        6..=10 => (SNAP_HEADER_SIZE, true),
+        6..=11 => (SNAP_HEADER_SIZE, true),
         _ => return Err(JournalError::UnsupportedVersion { version }),
     };
 
@@ -404,6 +405,8 @@ fn encode_book_side(levels: &[(Price, Vec<RestingOrderSnapshot>)], buf: &mut Vec
             le::push_u32(buf, order.account.0);
             le::push_u64(buf, order.remaining.get());
             buf.push(le::encode_tif(order.time_in_force));
+            // expiry_ns (v11+): needed for GTD orders to survive snapshot/restore.
+            le::push_u64(buf, order.expiry_ns);
         }
     }
 }
@@ -435,6 +438,8 @@ fn encode_stop_side(levels: &[(Price, Vec<PendingStopSnapshot>)], buf: &mut Vec<
                 None => buf.push(0),
             }
             buf.push(le::encode_stp(stop.stp));
+            // expiry_ns (v11+): needed for GTD stop orders to survive snapshot/restore.
+            le::push_u64(buf, stop.expiry_ns);
         }
     }
 }
@@ -777,11 +782,11 @@ fn decode_book_snapshot(buf: &[u8], version: u16) -> Result<(usize, BookSnapshot
     };
 
     // Bids.
-    let (consumed, bids) = decode_book_side_levels(&buf[pos..])?;
+    let (consumed, bids) = decode_book_side_levels(&buf[pos..], version)?;
     pos += consumed;
 
     // Asks.
-    let (consumed, asks) = decode_book_side_levels(&buf[pos..])?;
+    let (consumed, asks) = decode_book_side_levels(&buf[pos..], version)?;
     pos += consumed;
 
     // Order index: v8+ stores (order_id, account_id, side, price) — 21 bytes each.
@@ -818,11 +823,11 @@ fn decode_book_snapshot(buf: &[u8], version: u16) -> Result<(usize, BookSnapshot
     }
 
     // Stop buys.
-    let (consumed, stop_buys) = decode_stop_side_levels(&buf[pos..])?;
+    let (consumed, stop_buys) = decode_stop_side_levels(&buf[pos..], version)?;
     pos += consumed;
 
     // Stop sells.
-    let (consumed, stop_sells) = decode_stop_side_levels(&buf[pos..])?;
+    let (consumed, stop_sells) = decode_stop_side_levels(&buf[pos..], version)?;
     pos += consumed;
 
     // Stop index: v8+ stores (order_id, account_id, side, price) — 21 bytes each.
@@ -889,7 +894,10 @@ fn decode_book_snapshot(buf: &[u8], version: u16) -> Result<(usize, BookSnapshot
     ))
 }
 
-fn decode_book_side_levels(buf: &[u8]) -> Result<(usize, RestingLevels), JournalError> {
+fn decode_book_side_levels(
+    buf: &[u8],
+    version: u16,
+) -> Result<(usize, RestingLevels), JournalError> {
     let corrupt = |reason: &'static str| JournalError::CorruptEntry {
         sequence: 0,
         reason,
@@ -904,6 +912,9 @@ fn decode_book_side_levels(buf: &[u8]) -> Result<(usize, RestingLevels), Journal
     // Each level has at least 12 bytes (price + order count).
     validate_count(buf.len() - pos, n_levels, 12)?;
 
+    // Per-order size: v11+ adds expiry_ns(8) after tif.
+    let order_size: usize = if version >= 11 { 29 } else { 21 };
+
     let mut levels = Vec::with_capacity(n_levels);
     for _ in 0..n_levels {
         if pos + 12 > buf.len() {
@@ -915,11 +926,11 @@ fn decode_book_side_levels(buf: &[u8]) -> Result<(usize, RestingLevels), Journal
         let n_orders = le::get_u32(&buf[pos..]) as usize;
         pos += 4;
 
-        // Each order is 21 bytes: id(8) + account(4) + remaining(8) + tif(1).
-        validate_count(buf.len() - pos, n_orders, 21)?;
+        // Each order is id(8) + account(4) + remaining(8) + tif(1) [+ expiry_ns(8) in v11+].
+        validate_count(buf.len() - pos, n_orders, order_size)?;
         let mut orders = Vec::with_capacity(n_orders);
         for _ in 0..n_orders {
-            if pos + 21 > buf.len() {
+            if pos + order_size > buf.len() {
                 return Err(JournalError::TruncatedEntry);
             }
             let id = OrderId(le::get_u64(&buf[pos..]));
@@ -928,14 +939,21 @@ fn decode_book_side_levels(buf: &[u8]) -> Result<(usize, RestingLevels), Journal
                 .ok_or(corrupt("zero remaining quantity"))?;
             let time_in_force = le::decode_tif(buf[pos + 20])
                 .ok_or(corrupt("invalid time-in-force on resting order"))?;
+            pos += 21;
+            let expiry_ns = if version >= 11 {
+                let v = le::get_u64(&buf[pos..]);
+                pos += 8;
+                v
+            } else {
+                0
+            };
             orders.push(RestingOrderSnapshot {
                 id,
                 account,
                 remaining: Quantity(remaining_val),
                 time_in_force,
-                expiry_ns: 0,
+                expiry_ns,
             });
-            pos += 21;
         }
         levels.push((Price(price_val), orders));
     }
@@ -943,7 +961,7 @@ fn decode_book_side_levels(buf: &[u8]) -> Result<(usize, RestingLevels), Journal
     Ok((pos, levels))
 }
 
-fn decode_stop_side_levels(buf: &[u8]) -> Result<(usize, StopLevels), JournalError> {
+fn decode_stop_side_levels(buf: &[u8], version: u16) -> Result<(usize, StopLevels), JournalError> {
     let corrupt = |reason: &'static str| JournalError::CorruptEntry {
         sequence: 0,
         reason,
@@ -1037,6 +1055,18 @@ fn decode_stop_side_levels(buf: &[u8]) -> Result<(usize, StopLevels), JournalErr
             let stp = le::decode_stp(buf[pos]).ok_or(corrupt("invalid stp in stop"))?;
             pos += 1;
 
+            // expiry_ns (v11+): needed for GTD stop orders.
+            let expiry_ns = if version >= 11 {
+                if pos + 8 > buf.len() {
+                    return Err(JournalError::TruncatedEntry);
+                }
+                let v = le::get_u64(&buf[pos..]);
+                pos += 8;
+                v
+            } else {
+                0
+            };
+
             stops.push(PendingStopSnapshot {
                 id,
                 account,
@@ -1047,7 +1077,7 @@ fn decode_stop_side_levels(buf: &[u8]) -> Result<(usize, StopLevels), JournalErr
                 limit_price,
                 quote_budget,
                 stp,
-                expiry_ns: 0,
+                expiry_ns,
             });
         }
         levels.push((Price(trigger_val), stops));
