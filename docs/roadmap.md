@@ -15,8 +15,7 @@ Planned features sorted by value/complexity ratio for commercial readiness (exch
 | 7 | Catch-up from journal files | High | High | ★★☆☆☆ | Critical for production HA, but significant work (read historical segments, switch to live). |
 | 8 | Snapshot transfer | Medium | High | ★☆☆☆☆ | Needed for full HA, but catch-up from journal comes first. |
 | 9 | Protocol optims investigation | Low | Unknown | ★☆☆☆☆ | Research, not a feature. No commercial value until proven. |
-| 10 | Decouple fsync from ack latency | Medium | High | ★★☆☆☆ | Investigate designs where the ack is sent before (or in parallel with) fsync, without sacrificing durability guarantees. Could use techniques like battery-backed write cache assumptions, io_uring linked SQEs (write+fsync+send), or pipelining the ack with a "durable" flag on a subsequent message. Goal: reduce p99 latency without weakening the "ack = durable" contract. |
-| 11 | Full doc review | High | Low | ★★★★☆ | Many docs are stale after recent features (permissions, backpressure, Day TIF, promotion, health endpoint). Review and update all docs/ files, CLAUDE.md, and README. Do once all other MVP features are complete. |
+| 10 | Full doc review | High | Low | ★★★★☆ | Many docs are stale after recent features (permissions, backpressure, Day TIF, promotion, health endpoint). Review and update all docs/ files, CLAUDE.md, and README. Do once all other MVP features are complete. |
 
 ## Deferred
 
