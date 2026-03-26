@@ -11,7 +11,7 @@
 use crate::account::{AccountManager, OrderInfo, ReservationSlot};
 use crate::orderbook::OrderBook;
 use crate::types::{
-    AccountId, CircuitBreakerConfig, CurrencyId, ExecutionReport, FeeSchedule, HashMap,
+    AccountId, CircuitBreakerConfig, CurrencyId, ExecutionReport, FeeSchedule, HashMap, HashMap4,
     InstrumentSpec, Order, OrderId, OrderType, Price, Quantity, RejectReason, RiskLimits, Side,
     Symbol,
 };
@@ -62,17 +62,17 @@ pub struct Exchange {
     /// Keyed by the pair because different accounts can independently
     /// use the same OrderId. The `ReservationSlot` enables O(1) Vec-indexed
     /// access to the reservation slab (eliminating a second HashMap lookup).
-    order_info: HashMap<(AccountId, OrderId), OrderInfo>,
+    order_info: HashMap4<(AccountId, OrderId), OrderInfo>,
     /// Per-account high-water mark for order IDs. Rejects submissions
     /// with `order_id <= max_seen[account]` to prevent duplicate execution
     /// on crash-recovery retry. Sparse HashMap: only accounts that have
     /// submitted orders consume memory. Never evicted — prevents order ID
     /// replay after account withdrawal.
-    max_order_id: HashMap<AccountId, u64>,
+    max_order_id: HashMap4<AccountId, u64>,
     /// Per-account count of resting orders (entries in `order_info`).
     /// Used to reject withdrawals while orders are outstanding.
     /// Entries are removed when the count reaches zero.
-    order_counts: HashMap<AccountId, u32>,
+    order_counts: HashMap4<AccountId, u32>,
     /// Per-key high-water mark for request sequences. Prevents duplicate
     /// processing on retry after network failure. Keyed by u64 hash of
     /// the client's Ed25519 public key. Never evicted — key count is
@@ -91,9 +91,9 @@ impl Exchange {
         Self {
             instruments: Vec::new(),
             accounts: AccountManager::new(),
-            order_info: HashMap::default(),
-            max_order_id: HashMap::default(),
-            order_counts: HashMap::default(),
+            order_info: HashMap4::default(),
+            max_order_id: HashMap4::default(),
+            order_counts: HashMap4::default(),
             key_hwm: HashMap::default(),
             consumed_buf: Vec::new(),
             presized: false,
@@ -115,12 +115,12 @@ impl Exchange {
             // Global across all instruments. Typical steady-state: 100
             // instruments × 200 resting orders = 20K entries. 32K slots
             // ≈ 1 MB — fits in L3 cache.
-            order_info: HashMap::with_capacity_and_hasher(32_768, Default::default()),
+            order_info: HashMap4::with_capacity_and_hasher(32_768, Default::default()),
             // 1M accounts × ~32 bytes per entry ≈ 32 MB each. Covers
             // the default benchmark (1M accounts) with no hot-path resizes.
             // Pages are faulted during prefault() via insert/clear.
-            max_order_id: HashMap::with_capacity_and_hasher(1_000_000, Default::default()),
-            order_counts: HashMap::with_capacity_and_hasher(1_000_000, Default::default()),
+            max_order_id: HashMap4::with_capacity_and_hasher(1_000_000, Default::default()),
+            order_counts: HashMap4::with_capacity_and_hasher(1_000_000, Default::default()),
             key_hwm: HashMap::default(),
             consumed_buf: Vec::with_capacity(256),
             presized: true,
@@ -131,13 +131,13 @@ impl Exchange {
     pub(crate) fn from_parts(
         instruments: Vec<Option<Box<InstrumentState>>>,
         accounts: AccountManager,
-        order_info: HashMap<(AccountId, OrderId), OrderInfo>,
-        max_order_id: HashMap<AccountId, u64>,
+        order_info: HashMap4<(AccountId, OrderId), OrderInfo>,
+        max_order_id: HashMap4<AccountId, u64>,
         key_hwm: HashMap<u64, u64>,
     ) -> Self {
         // Derive order_counts from order_info (count entries per account).
-        let mut order_counts: HashMap<AccountId, u32> =
-            HashMap::with_capacity_and_hasher(order_info.len(), Default::default());
+        let mut order_counts: HashMap4<AccountId, u32> =
+            HashMap4::with_capacity_and_hasher(order_info.len(), Default::default());
         for &(account, _) in order_info.keys() {
             *order_counts.entry(account).or_default() += 1;
         }

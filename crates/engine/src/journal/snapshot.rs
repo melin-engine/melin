@@ -1128,8 +1128,8 @@ impl Exchange {
         // Build a side lookup first, then merge with slot assignments.
         let side_map: StdHashMap<(AccountId, OrderId), Side> =
             state.order_sides.into_iter().collect();
-        let mut order_info: crate::types::HashMap<(AccountId, OrderId), OrderInfo> =
-            crate::types::HashMap::with_capacity_and_hasher(side_map.len(), Default::default());
+        let mut order_info: crate::types::HashMap4<(AccountId, OrderId), OrderInfo> =
+            crate::types::HashMap4::with_capacity_and_hasher(side_map.len(), Default::default());
         for (key, slot) in slot_assignments {
             if let Some(&side) = side_map.get(&key) {
                 order_info.insert(
@@ -1142,8 +1142,8 @@ impl Exchange {
             }
         }
 
-        // Build sparse HashMap from snapshot entries.
-        let mut max_order_id = crate::types::HashMap::with_capacity_and_hasher(
+        // Build sparse HashMap4 from snapshot entries (4-entry buckets for hot path).
+        let mut max_order_id = crate::types::HashMap4::with_capacity_and_hasher(
             state.max_order_id.len(),
             Default::default(),
         );
@@ -1262,13 +1262,13 @@ impl OrderBook {
             btree
         };
 
-        let order_index: crate::types::HashMap<(AccountId, OrderId), (Side, Price)> = snap
+        let order_index: crate::types::HashMap4<(AccountId, OrderId), (Side, Price)> = snap
             .order_index
             .into_iter()
             .map(|(id, account, side, price)| ((account, id), (side, price)))
             .collect();
 
-        let stop_index: crate::types::HashMap<(AccountId, OrderId), (Side, Price)> = snap
+        let stop_index: crate::types::HashMap4<(AccountId, OrderId), (Side, Price)> = snap
             .stop_index
             .into_iter()
             .map(|(id, account, side, price)| ((account, id), (side, price)))

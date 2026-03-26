@@ -8,8 +8,8 @@ use std::collections::{BTreeMap, VecDeque};
 use std::num::NonZeroU64;
 
 use crate::types::{
-    AccountId, ExecutionReport, HashMap, Order, OrderId, OrderType, Price, Quantity, RejectReason,
-    SelfTradeProtection, Side, TimeInForce,
+    AccountId, ExecutionReport, HashMap, HashMap4, Order, OrderId, OrderType, Price, Quantity,
+    RejectReason, SelfTradeProtection, Side, TimeInForce,
 };
 
 /// A resting order on the book (the unfilled portion of a limit order).
@@ -293,7 +293,7 @@ pub struct OrderBook {
     /// need to scan the book. Keyed by (AccountId, OrderId) to eliminate
     /// cross-account collisions — different accounts can independently
     /// use the same OrderId without index conflicts.
-    order_index: HashMap<(AccountId, OrderId), (Side, Price)>,
+    order_index: HashMap4<(AccountId, OrderId), (Side, Price)>,
     /// BTreeMap keyed by trigger price so we can efficiently find all stops
     /// that should fire at a given trade price. Stop buys trigger when price
     /// rises (iterate from lowest trigger up), stop sells when price falls
@@ -303,7 +303,7 @@ pub struct OrderBook {
     /// Tracks which order IDs are pending stops, for cancel support.
     /// Keyed by (AccountId, OrderId) to match order_index and eliminate
     /// cross-account collisions.
-    stop_index: HashMap<(AccountId, OrderId), (Side, Price)>,
+    stop_index: HashMap4<(AccountId, OrderId), (Side, Price)>,
     /// Last trade price, used to determine which stops to trigger.
     last_trade_price: Option<Price>,
     /// Reusable buffers to avoid per-order allocations on the hot path.
@@ -328,10 +328,10 @@ impl OrderBook {
         Self {
             bids: BookSide::default(),
             asks: BookSide::default(),
-            order_index: HashMap::default(),
+            order_index: HashMap4::default(),
             stop_buys: BTreeMap::new(),
             stop_sells: BTreeMap::new(),
-            stop_index: HashMap::default(),
+            stop_index: HashMap4::default(),
             last_trade_price: None,
             trigger_price_buf: Vec::new(),
             triggered_buf: Vec::new(),
@@ -355,11 +355,11 @@ impl OrderBook {
             // 4096 slots ≈ 128 KB (key 12 B + value 16 B + control 1 B per
             // slot) — fits in L2 cache for fast probes. Typical book depth
             // is 100-2000 orders; resize cost at 4K is ~5 µs.
-            order_index: HashMap::with_capacity_and_hasher(4_096, Default::default()),
+            order_index: HashMap4::with_capacity_and_hasher(4_096, Default::default()),
             // BTreeMap is node-allocated — no resize spikes.
             stop_buys: BTreeMap::new(),
             stop_sells: BTreeMap::new(),
-            stop_index: HashMap::with_capacity_and_hasher(1_024, Default::default()),
+            stop_index: HashMap4::with_capacity_and_hasher(1_024, Default::default()),
             last_trade_price: None,
             trigger_price_buf: Vec::with_capacity(64),
             triggered_buf: Vec::with_capacity(64),
@@ -400,10 +400,10 @@ impl OrderBook {
     pub(crate) fn from_parts(
         bids: BookSide,
         asks: BookSide,
-        order_index: HashMap<(AccountId, OrderId), (Side, Price)>,
+        order_index: HashMap4<(AccountId, OrderId), (Side, Price)>,
         stop_buys: BTreeMap<Price, Vec<PendingStop>>,
         stop_sells: BTreeMap<Price, Vec<PendingStop>>,
-        stop_index: HashMap<(AccountId, OrderId), (Side, Price)>,
+        stop_index: HashMap4<(AccountId, OrderId), (Side, Price)>,
         last_trade_price: Option<Price>,
     ) -> Self {
         Self {

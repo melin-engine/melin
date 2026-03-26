@@ -17,8 +17,8 @@
 //! commercial tradeoff.
 
 use crate::types::{
-    AccountId, CurrencyId, ExecutionReport, HashMap, InstrumentSpec, Order, OrderId, OrderType,
-    Price, Quantity, RejectReason, Side,
+    AccountId, CurrencyId, ExecutionReport, HashMap, HashMap4, InstrumentSpec, Order, OrderId,
+    OrderType, Price, Quantity, RejectReason, Side,
 };
 
 /// Per-currency balance for an account.
@@ -114,7 +114,7 @@ pub struct AccountManager {
     /// Sparse balance map. Only (account, currency) pairs with non-zero
     /// balances are present. Entries are removed when both available and
     /// reserved reach zero.
-    balances: HashMap<(AccountId, CurrencyId), Balance>,
+    balances: HashMap4<(AccountId, CurrencyId), Balance>,
     /// Slab of active reservations. Indexed by `ReservationSlot(u32)` for
     /// O(1) access with no hashing. Freed slots are recycled via `free_slots`.
     /// Vec: contiguous, cache-friendly, zero per-access overhead vs HashMap's
@@ -128,7 +128,7 @@ pub struct AccountManager {
 impl AccountManager {
     pub fn new() -> Self {
         Self {
-            balances: HashMap::default(),
+            balances: HashMap4::default(),
             reservation_slab: Vec::new(),
             free_slots: Vec::new(),
         }
@@ -142,7 +142,7 @@ impl AccountManager {
         // Balance HashMap starts empty — deposits insert entries on demand.
         // No pre-allocation needed since deposit is an admin operation.
         Self {
-            balances: HashMap::default(),
+            balances: HashMap4::default(),
             reservation_slab: Vec::with_capacity(2_000_000),
             free_slots: Vec::with_capacity(2_000_000),
         }
@@ -177,9 +177,9 @@ impl AccountManager {
         balance_entries: Vec<((AccountId, CurrencyId), Balance)>,
         reservations: Vec<(OrderId, AccountId, CurrencyId, u64)>,
     ) -> (Self, Vec<((AccountId, OrderId), ReservationSlot)>) {
-        // Build balance HashMap directly from sparse entries.
+        // Build balance HashMap4 directly from sparse entries (4-entry buckets for hot path).
         let mut balances =
-            HashMap::with_capacity_and_hasher(balance_entries.len(), Default::default());
+            HashMap4::with_capacity_and_hasher(balance_entries.len(), Default::default());
         for (key, balance) in balance_entries {
             if !balance.is_zero() {
                 balances.insert(key, balance);
@@ -468,7 +468,7 @@ impl AccountManager {
     pub fn process_reports(
         &mut self,
         reports: &[ExecutionReport],
-        order_info: &HashMap<(AccountId, OrderId), OrderInfo>,
+        order_info: &HashMap4<(AccountId, OrderId), OrderInfo>,
         spec: &InstrumentSpec,
         consumed: &mut Vec<(AccountId, OrderId)>,
     ) {
