@@ -1536,6 +1536,57 @@ mod tests {
     }
 
     #[test]
+    fn snapshot_preserves_gtd_expiry() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("gtd.snapshot");
+
+        let mut exchange = Exchange::new();
+        exchange.add_instrument(btc_usd_spec());
+        exchange.deposit(ACCT_A, USD, 100_000);
+
+        let mut reports = Vec::new();
+
+        // Place a GTD order with expiry_ns = 5_000_000.
+        exchange.execute(
+            Symbol(1),
+            Order {
+                id: OrderId(1),
+                account: ACCT_A,
+                side: Side::Buy,
+                order_type: OrderType::Limit {
+                    price: price_val(100),
+                    post_only: false,
+                },
+                time_in_force: TimeInForce::GTD,
+                quantity: qty(10),
+                stp: SelfTradeProtection::Allow,
+                expiry_ns: 5_000_000,
+            },
+            &mut reports,
+        );
+        assert!(matches!(reports[0], ExecutionReport::Placed { .. }));
+        reports.clear();
+
+        save(&exchange, 20, [0u8; 32], &path).unwrap();
+        let (mut restored, _, _) = load(&path).unwrap();
+
+        // The GTD order should still be on the book and should expire
+        // at the original timestamp after restore.
+        restored.expire_orders(4_999_999, &mut reports);
+        assert!(reports.is_empty(), "should not expire before timestamp");
+
+        restored.expire_orders(5_000_000, &mut reports);
+        assert_eq!(reports.len(), 1);
+        assert!(matches!(
+            reports[0],
+            ExecutionReport::Cancelled {
+                order_id: OrderId(1),
+                ..
+            }
+        ));
+    }
+
+    #[test]
     fn corrupt_snapshot_detected() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("corrupt.snapshot");
