@@ -13,10 +13,9 @@ Planned features sorted by value/complexity ratio for commercial readiness (exch
 | 5 | Crash injection tests | High | Medium | ★★★☆☆ | Kill server at random points during load, verify recovery produces identical state. Validates journal/snapshot/rotation crash safety end-to-end. |
 | 6 | Failover tests | High | Medium | ★★★☆☆ | Kill primary during load, promote replica, verify no data loss and clients can reconnect. Validates the manual promotion path under realistic conditions. |
 | 7 | Catch-up from journal files | High | High | ★★☆☆☆ | Critical for production HA, but significant work (read historical segments, switch to live). |
-| 8 | Tiered fee schedules | Medium | Medium | ★★☆☆☆ | Nice-to-have — most buyers customize fees anyway. |
-| 9 | Snapshot transfer | Medium | High | ★☆☆☆☆ | Needed for full HA, but catch-up from journal comes first. |
-| 10 | Protocol optims investigation | Low | Unknown | ★☆☆☆☆ | Research, not a feature. No commercial value until proven. |
-| 11 | Full doc review | High | Low | ★★★★☆ | Many docs are stale after recent features (permissions, backpressure, Day TIF, promotion, health endpoint). Review and update all docs/ files, CLAUDE.md, and README. Do once all other MVP features are complete. |
+| 8 | Snapshot transfer | Medium | High | ★☆☆☆☆ | Needed for full HA, but catch-up from journal comes first. |
+| 9 | Protocol optims investigation | Low | Unknown | ★☆☆☆☆ | Research, not a feature. No commercial value until proven. |
+| 10 | Full doc review | High | Low | ★★★★☆ | Many docs are stale after recent features (permissions, backpressure, Day TIF, promotion, health endpoint). Review and update all docs/ files, CLAUDE.md, and README. Do once all other MVP features are complete. |
 
 ## Deferred
 
@@ -37,4 +36,5 @@ Features targeting regulated venues, gateway responsibilities, or with limited n
 | Network partition handling | Fencing, quorum-based decisions. Same as above — extremely complex. |
 | Dual / chain replication | Replicate to 2+ replicas for stronger durability guarantees. Chain replication (primary → replica A → replica B) reduces primary fan-out. Current architecture supports one replica only. |
 | Position/exposure limits | Important for derivatives, less so for spot. Defer until a derivatives buyer needs it. |
+| Tiered fee schedules | Volume-based tiers and per-account overrides. Can be implemented outside Melin — a fee service looks up the account's tier and sets the rate via the existing per-instrument fee API. |
 | TLS | Most exchange deployments use VLAN instead. Only needed for compliance-driven buyers. |
