@@ -96,13 +96,22 @@ pub fn save(
     let crc = crc32c::crc32c(&buf);
     buf.extend_from_slice(&crc.to_le_bytes());
 
-    // Write atomically: temp file → fsync → rename. A crash mid-write
-    // leaves only the temp file; the previous snapshot (if any) is intact.
+    // Write atomically: temp file → fsync → rotate previous → rename.
+    // A crash mid-write leaves only the temp file; the previous snapshot
+    // (if any) is intact. The `.prev` copy allows operators to roll back
+    // if the latest snapshot is corrupt or contains undesired state.
     let tmp_path = path.with_extension("snap.tmp");
     let mut file = File::create(&tmp_path)?;
     file.write_all(&buf)?;
     file.sync_data()?;
     drop(file);
+
+    // Rotate: preserve the current snapshot as `.snapshot.prev` before
+    // overwriting. Best-effort — if the current snapshot doesn't exist
+    // (first save) or the rename fails, we proceed anyway.
+    let prev_path = path.with_extension("snapshot.prev");
+    let _ = fs::rename(path, &prev_path);
+
     fs::rename(&tmp_path, path)?;
 
     Ok(())
@@ -1650,6 +1659,40 @@ mod tests {
             load(&path),
             Err(JournalError::ChecksumMismatch { .. })
         ));
+    }
+
+    #[test]
+    fn save_rotates_previous_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rotate.snapshot");
+        let prev_path = dir.path().join("rotate.snapshot.prev");
+
+        // First save — no previous snapshot exists.
+        let exchange = Exchange::new();
+        save(&exchange, 1, [0x11; 32], &path).unwrap();
+        assert!(path.exists());
+        assert!(!prev_path.exists());
+
+        let first_data = std::fs::read(&path).unwrap();
+
+        // Second save — first snapshot should be rotated to .prev.
+        save(&exchange, 2, [0x22; 32], &path).unwrap();
+        assert!(path.exists());
+        assert!(prev_path.exists());
+
+        // .prev should contain the first snapshot's bytes exactly.
+        let prev_data = std::fs::read(&prev_path).unwrap();
+        assert_eq!(prev_data, first_data);
+
+        // Current should be loadable with the second save's sequence.
+        let (_, seq, hash) = load(&path).unwrap();
+        assert_eq!(seq, 2);
+        assert_eq!(hash, [0x22; 32]);
+
+        // .prev should be loadable with the first save's sequence.
+        let (_, prev_seq, prev_hash) = load(&prev_path).unwrap();
+        assert_eq!(prev_seq, 1);
+        assert_eq!(prev_hash, [0x11; 32]);
     }
 
     #[cfg(feature = "hash-chain")]

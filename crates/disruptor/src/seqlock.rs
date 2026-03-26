@@ -77,12 +77,17 @@ impl<T: Copy> SeqLock<T> {
             }
 
             // Safety: sequence is even, so no write is in progress.
-            // The Acquire above ensures we see the completed write.
+            // The Acquire on seq1 ensures we see the completed write.
             let value = unsafe { *self.value.get() };
 
-            // Acquire fence ensures the value read completes before
-            // we re-read the sequence counter.
-            let seq2 = self.sequence.load(Ordering::Acquire);
+            // On weakly-ordered architectures (ARM/AArch64), the plain
+            // load of `value` above can be reordered past a subsequent
+            // atomic load at a different address. This Acquire fence
+            // ensures the value read completes before we re-read the
+            // sequence counter — without it, we could observe seq1==seq2
+            // while `value` contains a torn read.
+            std::sync::atomic::fence(Ordering::Acquire);
+            let seq2 = self.sequence.load(Ordering::Relaxed);
             if seq1 == seq2 {
                 return value;
             }

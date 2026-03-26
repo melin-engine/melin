@@ -59,11 +59,7 @@ pub fn run(
     batch.resize_with(SHADOW_BATCH_SIZE, InputSlot::default);
 
     let mut last_snapshot = Instant::now();
-    let mut last_seq: u64 = 0;
-    // Suppress "value never read" — last_seq is set in every batch iteration
-    // before the snapshot check, but we need a valid initial value for the
-    // edge case where shutdown fires before the first batch.
-    let _ = &last_seq;
+    let mut last_seq = 0u64;
     let mut idle_spins: u32 = 0;
 
     loop {
