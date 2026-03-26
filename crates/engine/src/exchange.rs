@@ -6818,4 +6818,80 @@ mod tests {
         // GTD order still on book — reservation still held.
         assert!(exchange.accounts().balance(ACCT_A, USD).reserved > 0);
     }
+
+    #[test]
+    fn gtd_stop_triggers_then_resting_order_expires() {
+        let mut exchange = Exchange::new();
+        let btc = Symbol(1);
+        exchange.add_instrument(btc_usd_spec());
+        exchange.deposit(ACCT_A, USD, 100_000);
+        exchange.deposit(ACCT_B, BTC, 100);
+        exchange.deposit(ACCT_B, USD, 100_000);
+
+        let mut reports = Vec::new();
+
+        // ACCT_A: GTD stop-limit buy, trigger @ 50, limit @ 55, expiry t=2000.
+        exchange.execute(
+            btc,
+            Order {
+                id: OrderId(1),
+                account: ACCT_A,
+                side: Side::Buy,
+                order_type: OrderType::StopLimit {
+                    trigger_price: price(50),
+                    limit_price: price(55),
+                },
+                time_in_force: TimeInForce::GTD,
+                quantity: qty(10),
+                stp: SelfTradeProtection::Allow,
+                expiry_ns: 2000,
+            },
+            &mut reports,
+        );
+        reports.clear();
+
+        // Create a trade at price 50 to trigger the stop.
+        // First place a resting sell, then a buy to cross.
+        exchange.execute(
+            btc,
+            limit_order(1, ACCT_B, Side::Sell, 50, 1, TimeInForce::GTC),
+            &mut reports,
+        );
+        reports.clear();
+
+        exchange.execute(
+            btc,
+            limit_order(2, ACCT_B, Side::Buy, 50, 1, TimeInForce::IOC),
+            &mut reports,
+        );
+        // This trade triggers the stop — ACCT_A's order becomes a limit @ 55.
+        let triggered = reports.iter().any(|r| {
+            matches!(
+                r,
+                ExecutionReport::Triggered {
+                    order_id: OrderId(1),
+                    ..
+                }
+            )
+        });
+        assert!(triggered, "stop should have triggered");
+        reports.clear();
+
+        // The triggered order is now resting as a limit @ 55.
+        // Expire at t=1999 — should NOT cancel.
+        exchange.expire_orders(1999, &mut reports);
+        assert!(reports.is_empty());
+
+        // Expire at t=2000 — should cancel the resting triggered order.
+        exchange.expire_orders(2000, &mut reports);
+        assert_eq!(reports.len(), 1);
+        assert!(matches!(
+            reports[0],
+            ExecutionReport::Cancelled {
+                order_id: OrderId(1),
+                ..
+            }
+        ));
+        assert_eq!(exchange.accounts().balance(ACCT_A, USD).reserved, 0);
+    }
 }
