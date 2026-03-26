@@ -1230,7 +1230,14 @@ impl OrderBook {
                 .map(|(price, orders)| {
                     let queue = orders
                         .into_iter()
-                        .map(|o| crate::orderbook::RestingOrder::new(o.id, o.account, o.remaining, o.time_in_force))
+                        .map(|o| {
+                            crate::orderbook::RestingOrder::new(
+                                o.id,
+                                o.account,
+                                o.remaining,
+                                o.time_in_force,
+                            )
+                        })
                         .collect();
                     (price, queue)
                 })

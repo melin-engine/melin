@@ -121,10 +121,7 @@ impl Request {
     /// Whether this request is a fund management operation (deposit/withdraw).
     /// Requires `Permission::Custodian`.
     pub fn is_fund_management(&self) -> bool {
-        matches!(
-            self,
-            Request::Deposit { .. } | Request::Withdraw { .. }
-        )
+        matches!(self, Request::Deposit { .. } | Request::Withdraw { .. })
     }
 }
 

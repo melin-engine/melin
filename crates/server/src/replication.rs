@@ -624,8 +624,13 @@ fn process_acks(
 /// Blocks until the connection drops or shutdown is signaled.
 /// Result of `run_receiver`: `None` = clean shutdown, `Some` = promotion
 /// triggered with the fully-replayed Exchange and positioned JournalWriter.
-pub type ReceiverResult =
-    Result<Option<(melin_engine::exchange::Exchange, melin_engine::journal::writer::JournalWriter)>, Box<dyn std::error::Error>>;
+pub type ReceiverResult = Result<
+    Option<(
+        melin_engine::exchange::Exchange,
+        melin_engine::journal::writer::JournalWriter,
+    )>,
+    Box<dyn std::error::Error>,
+>;
 
 pub fn run_receiver(
     primary_addr: SocketAddr,
@@ -750,7 +755,7 @@ pub fn run_receiver(
     // overhead from one-per-batch to one-per-TCP-read-burst.
     let mut journal_accum: Vec<u8> = Vec::with_capacity(128 * 1024);
     let mut accum_entry_count: u64 = 0;
-    let mut accum_end_sequence: u64 = 0;
+    let mut accum_end_sequence: u64;
     // Reusable frame buffer — grows to high-water mark, avoids per-frame
     // heap allocation in the hot receive loop.
     let mut frame_buf: Vec<u8> = Vec::with_capacity(64 * 1024);
@@ -783,14 +788,12 @@ pub fn run_receiver(
                 }
                 match decode_primary_message(&frame_buf) {
                     Ok(PrimaryMessage::DataBatch {
-                        end_sequence,
                         entry_count,
                         journal_bytes,
                         ..
                     }) => {
                         journal_accum.extend_from_slice(&journal_bytes);
                         accum_entry_count += entry_count as u64;
-                        accum_end_sequence = end_sequence;
                     }
                     _ => break,
                 }

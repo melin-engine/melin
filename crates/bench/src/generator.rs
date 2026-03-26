@@ -380,7 +380,10 @@ impl OrderFlowGenerator {
             (&order_type, time_in_force),
             (OrderType::Limit { .. }, TimeInForce::GTC | TimeInForce::Day)
                 | (OrderType::Stop { .. }, TimeInForce::GTC | TimeInForce::Day)
-                | (OrderType::StopLimit { .. }, TimeInForce::GTC | TimeInForce::Day)
+                | (
+                    OrderType::StopLimit { .. },
+                    TimeInForce::GTC | TimeInForce::Day
+                )
         );
         if rests {
             let cap = self.live_orders.len();

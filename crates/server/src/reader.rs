@@ -246,8 +246,9 @@ fn epoll_reader_loop<R: AsRawFd>(
     // Sent directly via libc::write when the disruptor ring is full.
     let server_busy_frame = {
         let mut buf = [0u8; 8];
-        let n = codec::encode_response(&melin_protocol::message::ResponseKind::ServerBusy, &mut buf)
-            .expect("ServerBusy encodes");
+        let n =
+            codec::encode_response(&melin_protocol::message::ResponseKind::ServerBusy, &mut buf)
+                .expect("ServerBusy encodes");
         let mut frame = [0u8; 5];
         frame.copy_from_slice(&buf[..n]);
         frame
@@ -727,11 +728,9 @@ mod tests {
     #[test]
     fn server_busy_frame_round_trip() {
         let mut buf = [0u8; 8];
-        let n = codec::encode_response(
-            &melin_protocol::message::ResponseKind::ServerBusy,
-            &mut buf,
-        )
-        .expect("encode ServerBusy");
+        let n =
+            codec::encode_response(&melin_protocol::message::ResponseKind::ServerBusy, &mut buf)
+                .expect("encode ServerBusy");
         // 4-byte length prefix + 1-byte tag = 5 bytes.
         assert_eq!(n, 5);
 

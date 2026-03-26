@@ -271,8 +271,9 @@ fn uring_reader_loop<R: AsRawFd>(
     // Pre-encode the ServerBusy response frame (length prefix + tag = 5 bytes).
     let server_busy_frame = {
         let mut buf = [0u8; 8];
-        let n = codec::encode_response(&melin_protocol::message::ResponseKind::ServerBusy, &mut buf)
-            .expect("ServerBusy encodes");
+        let n =
+            codec::encode_response(&melin_protocol::message::ResponseKind::ServerBusy, &mut buf)
+                .expect("ServerBusy encodes");
         let mut frame = [0u8; 5];
         frame.copy_from_slice(&buf[..n]);
         frame

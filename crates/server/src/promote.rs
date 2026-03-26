@@ -7,8 +7,8 @@
 
 use std::io::{BufRead, BufReader, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
@@ -71,9 +71,7 @@ fn run(bind_addr: SocketAddr, promote: &AtomicBool, shutdown: &AtomicBool) {
 
 /// Handle a single connection. Returns `true` if promotion was triggered.
 fn handle_connection(mut stream: TcpStream, promote: &AtomicBool) -> bool {
-    stream
-        .set_read_timeout(Some(Duration::from_secs(5)))
-        .ok();
+    stream.set_read_timeout(Some(Duration::from_secs(5))).ok();
 
     let cloned = match stream.try_clone() {
         Ok(s) => s,

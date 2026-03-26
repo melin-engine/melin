@@ -256,7 +256,7 @@ pub fn run<L: BlockingTransportListener>(
 /// a clean shutdown of all pipeline threads (useful for benchmarks that need
 /// to collect latency trace reports).
 pub fn run_with_shutdown<L: BlockingTransportListener>(
-    mut listener: L,
+    listener: L,
     config: ServerConfig,
     shutdown: Arc<AtomicBool>,
 ) -> Result<(), Box<dyn std::error::Error>> {

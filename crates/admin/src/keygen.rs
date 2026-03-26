@@ -38,7 +38,9 @@ fn main() {
     match permission.as_str() {
         "operator" | "trader" | "custodian" | "readonly" => {}
         other => {
-            eprintln!("error: invalid permission '{other}' (expected operator/trader/custodian/readonly)");
+            eprintln!(
+                "error: invalid permission '{other}' (expected operator/trader/custodian/readonly)"
+            );
             std::process::exit(1);
         }
     }
