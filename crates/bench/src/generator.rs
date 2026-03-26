@@ -415,6 +415,7 @@ impl OrderFlowGenerator {
                 time_in_force,
                 quantity,
                 stp: self.pick_stp(),
+                expiry_ns: 0,
             },
         }
     }
@@ -685,7 +686,10 @@ mod tests {
             if let GeneratedEvent::Submit { order, .. } = ofg.next_event() {
                 match (&order.order_type, order.time_in_force) {
                     (OrderType::Market, _) => markets += 1,
-                    (OrderType::Limit { .. }, TimeInForce::GTC | TimeInForce::Day) => {
+                    (
+                        OrderType::Limit { .. },
+                        TimeInForce::GTC | TimeInForce::Day | TimeInForce::GTD,
+                    ) => {
                         limit_gtc += 1;
                     }
                     (OrderType::Limit { .. }, TimeInForce::IOC) => limit_ioc += 1,

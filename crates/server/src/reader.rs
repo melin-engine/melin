@@ -712,6 +712,7 @@ fn request_to_event(request: &Request) -> JournalEvent {
         }
         Request::QueryStats => JournalEvent::QueryStats,
         Request::EndOfDay => JournalEvent::EndOfDay,
+        Request::ExpireOrders { timestamp_ns } => JournalEvent::ExpireOrders { timestamp_ns },
         Request::Heartbeat | Request::ChallengeResponse { .. } => {
             unreachable!("heartbeats and auth messages filtered before request_to_event")
         }

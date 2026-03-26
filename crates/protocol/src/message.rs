@@ -80,6 +80,10 @@ pub enum Request {
     /// across all instruments. Triggered by an operator at end-of-session.
     EndOfDay,
 
+    /// Expire all resting orders and pending stops with `TimeInForce::GTD`
+    /// whose `expiry_ns` <= `timestamp_ns`. Triggered by an operator.
+    ExpireOrders { timestamp_ns: u64 },
+
     // --- Query operations (Admin only) ---
     /// Request a snapshot of server stats (connections, throughput, book
     /// depth, balances). Tag-only, no payload. Flows through the pipeline
@@ -114,6 +118,7 @@ impl Request {
                 | Request::SetCircuitBreaker { .. }
                 | Request::SetFeeSchedule { .. }
                 | Request::EndOfDay
+                | Request::ExpireOrders { .. }
                 | Request::QueryStats
         )
     }

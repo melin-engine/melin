@@ -155,6 +155,7 @@ fn request_from_bytes(data: &[u8]) -> Option<Request> {
                     time_in_force: tif,
                     quantity: qty,
                     stp,
+                    expiry_ns: 0,
                 },
             })
         }

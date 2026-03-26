@@ -1143,6 +1143,9 @@ impl MatchingStage {
             JournalEvent::EndOfDay => {
                 self.exchange.end_of_day(reports);
             }
+            JournalEvent::ExpireOrders { timestamp_ns } => {
+                self.exchange.expire_orders(timestamp_ns, reports);
+            }
             JournalEvent::SetCircuitBreaker { symbol, config } => {
                 self.exchange.set_circuit_breaker(symbol, config);
             }
@@ -1429,6 +1432,7 @@ mod tests {
             time_in_force: TimeInForce::GTC,
             quantity: Quantity(NonZeroU64::new(qty).unwrap()),
             stp: SelfTradeProtection::Allow,
+            expiry_ns: 0,
         }
     }
 

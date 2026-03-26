@@ -380,6 +380,9 @@ fn replay_event(
         JournalEvent::EndOfDay => {
             exchange.end_of_day(reports);
         }
+        JournalEvent::ExpireOrders { timestamp_ns } => {
+            exchange.expire_orders(timestamp_ns, reports);
+        }
         JournalEvent::SetCircuitBreaker { symbol, config } => {
             exchange.set_circuit_breaker(symbol, config);
         }
@@ -464,6 +467,7 @@ mod tests {
             time_in_force: TimeInForce::GTC,
             quantity: qty(q),
             stp: SelfTradeProtection::Allow,
+            expiry_ns: 0,
         }
     }
 

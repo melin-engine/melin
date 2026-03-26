@@ -51,12 +51,17 @@ fn arb_side() -> impl Strategy<Value = Side> {
     prop_oneof![Just(Side::Buy), Just(Side::Sell)]
 }
 
-fn arb_tif() -> impl Strategy<Value = TimeInForce> {
+/// Generate a TIF value paired with an optional expiry_ns.
+/// GTD requires a non-zero expiry; other TIFs use 0.
+fn arb_tif() -> impl Strategy<Value = (TimeInForce, u64)> {
     prop_oneof![
-        Just(TimeInForce::GTC),
-        Just(TimeInForce::IOC),
-        Just(TimeInForce::FOK),
-        Just(TimeInForce::Day),
+        Just((TimeInForce::GTC, 0)),
+        Just((TimeInForce::IOC, 0)),
+        Just((TimeInForce::FOK, 0)),
+        Just((TimeInForce::Day, 0)),
+        // GTD with random expiry in a reasonable range (1..=10_000 ns).
+        // Small values so ExpireOrders actions with similar range can trigger cancellation.
+        (1u64..=10_000).prop_map(|exp| (TimeInForce::GTD, exp)),
     ]
 }
 
@@ -114,7 +119,7 @@ enum BookAction {
 fn arb_book_action() -> impl Strategy<Value = BookAction> {
     prop_oneof![
         4 => (arb_side(), arb_price(), arb_quantity(), arb_tif(), arb_stp()).prop_map(
-            |(side, price, quantity, tif, stp)| BookAction::Limit { side, price, quantity, tif, stp }
+            |(side, price, quantity, (tif, _expiry), stp)| BookAction::Limit { side, price, quantity, tif, stp }
         ),
         2 => (arb_side(), arb_quantity(), arb_stp()).prop_map(
             |(side, quantity, stp)| BookAction::Market { side, quantity, stp }
@@ -123,7 +128,7 @@ fn arb_book_action() -> impl Strategy<Value = BookAction> {
             |(side, trigger_price, quantity, stp)| BookAction::Stop { side, trigger_price, quantity, stp }
         ),
         1 => (arb_side(), arb_price(), arb_price(), arb_quantity(), arb_tif(), arb_stp()).prop_map(
-            |(side, trigger_price, limit_price, quantity, tif, stp)| BookAction::StopLimit {
+            |(side, trigger_price, limit_price, quantity, (tif, _expiry), stp)| BookAction::StopLimit {
                 side, trigger_price, limit_price, quantity, tif, stp,
             }
         ),
@@ -154,6 +159,8 @@ enum ExchangeAction {
         tif: TimeInForce,
         stp: SelfTradeProtection,
         post_only: bool,
+        /// Non-zero for GTD orders (expiry timestamp in ns).
+        expiry_ns: u64,
     },
     Market {
         account: AccountId,
@@ -176,6 +183,8 @@ enum ExchangeAction {
         quantity: Quantity,
         tif: TimeInForce,
         stp: SelfTradeProtection,
+        /// Non-zero for GTD orders (expiry timestamp in ns).
+        expiry_ns: u64,
     },
     Cancel {
         target_idx: usize,
@@ -192,6 +201,10 @@ enum ExchangeAction {
         lower: Option<Price>,
         upper: Option<Price>,
     },
+    /// Expire GTD orders at or before the given timestamp.
+    ExpireOrders {
+        timestamp_ns: u64,
+    },
 }
 
 fn arb_exchange_action() -> impl Strategy<Value = ExchangeAction> {
@@ -201,8 +214,8 @@ fn arb_exchange_action() -> impl Strategy<Value = ExchangeAction> {
                 account, currency, amount,
             }),
         4 => (arb_account(), arb_side(), arb_price(), arb_quantity(), arb_tif(), arb_stp(), proptest::bool::ANY)
-            .prop_map(|(account, side, price, quantity, tif, stp, post_only)| ExchangeAction::Limit {
-                account, side, price, quantity, tif, stp, post_only,
+            .prop_map(|(account, side, price, quantity, (tif, expiry_ns), stp, post_only)| ExchangeAction::Limit {
+                account, side, price, quantity, tif, stp, post_only, expiry_ns,
             }),
         2 => (arb_account(), arb_side(), arb_quantity(), arb_stp())
             .prop_map(|(account, side, quantity, stp)| ExchangeAction::Market {
@@ -213,8 +226,8 @@ fn arb_exchange_action() -> impl Strategy<Value = ExchangeAction> {
                 account, side, trigger_price, quantity, stp,
             }),
         1 => (arb_account(), arb_side(), arb_price(), arb_price(), arb_quantity(), arb_tif(), arb_stp())
-            .prop_map(|(account, side, trigger_price, limit_price, quantity, tif, stp)| ExchangeAction::StopLimit {
-                account, side, trigger_price, limit_price, quantity, tif, stp,
+            .prop_map(|(account, side, trigger_price, limit_price, quantity, (tif, expiry_ns), stp)| ExchangeAction::StopLimit {
+                account, side, trigger_price, limit_price, quantity, tif, stp, expiry_ns,
             }),
         1 => (0usize..200).prop_map(|target_idx| ExchangeAction::Cancel { target_idx }),
         1 => arb_account().prop_map(|account| ExchangeAction::CancelAll { account }),
@@ -223,6 +236,9 @@ fn arb_exchange_action() -> impl Strategy<Value = ExchangeAction> {
             .prop_map(|(halted, lower, upper)| ExchangeAction::SetCircuitBreaker {
                 halted, lower, upper,
             }),
+        // Occasional ExpireOrders to exercise GTD cancellation.
+        // Timestamp range matches GTD expiry range (1..=10_000).
+        1 => (1u64..=10_000).prop_map(|timestamp_ns| ExchangeAction::ExpireOrders { timestamp_ns }),
     ]
 }
 
@@ -267,6 +283,7 @@ fn run_book_actions(
                     time_in_force: *tif,
                     quantity: *quantity,
                     stp: *stp,
+                    expiry_ns: 0,
                 };
                 book.execute(order, None, &mut reports);
             }
@@ -286,6 +303,7 @@ fn run_book_actions(
                     time_in_force: TimeInForce::IOC,
                     quantity: *quantity,
                     stp: *stp,
+                    expiry_ns: 0,
                 };
                 book.execute(order, None, &mut reports);
             }
@@ -308,6 +326,7 @@ fn run_book_actions(
                     time_in_force: TimeInForce::GTC,
                     quantity: *quantity,
                     stp: *stp,
+                    expiry_ns: 0,
                 };
                 book.execute(order, None, &mut reports);
             }
@@ -333,6 +352,7 @@ fn run_book_actions(
                     time_in_force: *tif,
                     quantity: *quantity,
                     stp: *stp,
+                    expiry_ns: 0,
                 };
                 book.execute(order, None, &mut reports);
             }
@@ -506,6 +526,7 @@ fn run_exchange_actions(
                 tif,
                 stp,
                 post_only,
+                expiry_ns,
             } => {
                 let counter = next_id_per_account.entry(*account).or_insert(0);
                 *counter += 1;
@@ -522,6 +543,7 @@ fn run_exchange_actions(
                     time_in_force: *tif,
                     quantity: *quantity,
                     stp: *stp,
+                    expiry_ns: *expiry_ns,
                 };
                 exchange.execute(sym, order, &mut reports);
                 all_reports.extend_from_slice(&reports);
@@ -545,6 +567,7 @@ fn run_exchange_actions(
                     time_in_force: TimeInForce::IOC,
                     quantity: *quantity,
                     stp: *stp,
+                    expiry_ns: 0,
                 };
                 exchange.execute(sym, order, &mut reports);
                 all_reports.extend_from_slice(&reports);
@@ -571,6 +594,7 @@ fn run_exchange_actions(
                     time_in_force: TimeInForce::GTC,
                     quantity: *quantity,
                     stp: *stp,
+                    expiry_ns: 0,
                 };
                 exchange.execute(sym, order, &mut reports);
                 all_reports.extend_from_slice(&reports);
@@ -584,6 +608,7 @@ fn run_exchange_actions(
                 quantity,
                 tif,
                 stp,
+                expiry_ns,
             } => {
                 let counter = next_id_per_account.entry(*account).or_insert(0);
                 *counter += 1;
@@ -600,6 +625,7 @@ fn run_exchange_actions(
                     time_in_force: *tif,
                     quantity: *quantity,
                     stp: *stp,
+                    expiry_ns: *expiry_ns,
                 };
                 exchange.execute(sym, order, &mut reports);
                 all_reports.extend_from_slice(&reports);
@@ -650,6 +676,12 @@ fn run_exchange_actions(
                         halted: *halted,
                     },
                 );
+            }
+            ExchangeAction::ExpireOrders { timestamp_ns } => {
+                action_order_ids.push(None);
+                exchange.expire_orders(*timestamp_ns, &mut reports);
+                all_reports.extend_from_slice(&reports);
+                reports.clear();
             }
         }
         assert_exchange_consistent(&exchange, action_idx, &format!("{:?}", action));
@@ -899,6 +931,7 @@ proptest! {
                 time_in_force: TimeInForce::GTC,
                 quantity: *q,
                 stp: SelfTradeProtection::Allow,
+                expiry_ns: 0,
             };
             book.execute(order, None, &mut reports);
         }
@@ -912,6 +945,7 @@ proptest! {
             time_in_force: TimeInForce::IOC,
             quantity: Quantity(NonZeroU64::new(market_qty).unwrap()),
             stp: SelfTradeProtection::Allow,
+            expiry_ns: 0,
         };
         book.execute(market, None, &mut reports);
 
@@ -964,6 +998,7 @@ proptest! {
                 time_in_force: TimeInForce::GTC,
                 quantity: *q,
                 stp: SelfTradeProtection::Allow,
+                expiry_ns: 0,
             };
             book.execute(order, None, &mut reports);
         }
@@ -977,6 +1012,7 @@ proptest! {
             time_in_force: TimeInForce::IOC,
             quantity: Quantity(NonZeroU64::new(market_qty).unwrap()),
             stp: SelfTradeProtection::Allow,
+            expiry_ns: 0,
         };
         book.execute(market, None, &mut reports);
 
@@ -1077,6 +1113,7 @@ proptest! {
             time_in_force: TimeInForce::GTC,
             quantity: q,
             stp: SelfTradeProtection::Allow,
+            expiry_ns: 0,
         };
         let _ = mgr.try_reserve(&buy, &spec, 0);
 
@@ -1089,6 +1126,7 @@ proptest! {
             time_in_force: TimeInForce::GTC,
             quantity: q,
             stp: SelfTradeProtection::Allow,
+            expiry_ns: 0,
         };
         let _ = mgr.try_reserve(&sell, &spec, 0);
     }
@@ -1116,6 +1154,7 @@ proptest! {
             time_in_force: TimeInForce::GTC,
             quantity: q,
             stp: SelfTradeProtection::Allow,
+            expiry_ns: 0,
         };
         let sell = Order {
             id: OrderId(2),
@@ -1125,6 +1164,7 @@ proptest! {
             time_in_force: TimeInForce::GTC,
             quantity: q,
             stp: SelfTradeProtection::Allow,
+            expiry_ns: 0,
         };
 
         let buy_res = mgr.try_reserve(&buy, &spec, 0);
