@@ -3,8 +3,8 @@
 //! On startup:
 //! 1. Recovers or creates the `JournaledExchange`.
 //! 2. Decomposes it into `(Exchange, JournalWriter)` via `into_parts()`.
-//! 3. Builds the disruptor pipeline (input ring buffer + output SPSC).
-//! 4. Spawns 4 OS threads: reader (epoll), journal, matching, response.
+//! 3. Builds the disruptor pipeline (input ring + output ring).
+//! 4. Spawns 3-5 OS threads: journal, matching, response, [repl-sender], [event-publisher].
 //! 5. Runs the accept loop, registering connections with the epoll reader.
 //!
 //! Fully synchronous — no async runtime needed. The single reader thread
@@ -22,6 +22,7 @@ use std::hash::{Hash, Hasher};
 
 use tracing::{debug, error, info, warn};
 
+use melin_engine::exchange::Exchange;
 use melin_engine::journal::JournaledExchange;
 use melin_engine::journal::pipeline::build_pipeline_with_replication;
 use melin_engine::journal::writer::JournalWriter;
@@ -59,7 +60,7 @@ pub struct ServerConfig {
     /// Pipeline core IDs: journal,matching,response[,repl-sender]
     /// (comma-separated). Core 0 is reserved for OS/IRQ handling.
     /// The 4th core (repl-sender) is used when replication is enabled.
-    #[arg(long, default_value = "1,2,3,6", value_parser = parse_cores)]
+    #[arg(long, default_value = "1,2,3,6,7", value_parser = parse_cores)]
     pub cores: PipelineCores,
     /// Number of epoll reader threads.
     #[arg(long, default_value_t = 2)]
@@ -190,6 +191,25 @@ pub struct ServerConfig {
     /// Default: 7 (after the 3 pipeline cores + 2 reader cores).
     #[arg(long, default_value_t = 7)]
     pub dpdk_core: usize,
+
+    /// Address for the output event publisher. Subscribers connect here
+    /// to receive a real-time stream of all execution events (market data,
+    /// fills, cancellations). Ed25519 auth required (ReadOnly or above).
+    /// Omit to disable (ring has 1 consumer — identical to before).
+    #[arg(long)]
+    pub event_bind: Option<SocketAddr>,
+
+    /// Address for the health/liveness TCP endpoint. On connect, returns
+    /// a one-line status (`OK <conns> <journal_seq> <repl_lag>\n`) and
+    /// closes. No auth required. Set to empty string to disable.
+    #[arg(long, default_value = "127.0.0.1:9877")]
+    pub health_bind: Option<SocketAddr>,
+
+    /// TCP address for the promotion trigger endpoint (replica only).
+    /// An operator connects and sends `PROMOTE\n` to promote the replica
+    /// to primary. Ignored in primary mode.
+    #[arg(long)]
+    pub promote_bind: Option<SocketAddr>,
 }
 
 /// Delegates to clap so `#[arg(default_value...)]` is the single source of
@@ -210,6 +230,7 @@ impl Default for ServerConfig {
                 matching: 2,
                 response: 3,
                 repl_sender: 6,
+                event_publisher: 7,
             },
             readers: 2,
             reader_cores: 4,
@@ -237,6 +258,9 @@ impl Default for ServerConfig {
             dpdk_mtu: 1500,
             dpdk_vlan: None,
             dpdk_core: 7,
+            event_bind: None,
+            health_bind: Some("127.0.0.1:9877".parse().expect("valid default addr")),
+            promote_bind: None,
         }
     }
 }
@@ -268,23 +292,24 @@ impl ServerConfig {
 
 /// Core assignments for pipeline threads.
 ///
-/// Four fields: journal, matching, response, and repl-sender.
-/// All four are always stored; the repl-sender core is only used
-/// when replication is enabled.
+/// Five fields: journal, matching, response, repl-sender, and event-publisher.
+/// All five are always stored; repl-sender is only used when replication is
+/// enabled, event-publisher only when `--event-bind` is set.
 #[derive(Debug, Clone, Copy)]
 pub struct PipelineCores {
     pub journal: usize,
     pub matching: usize,
     pub response: usize,
     pub repl_sender: usize,
+    pub event_publisher: usize,
 }
 
-/// Parse "j,m,r,s" into `PipelineCores` for pipeline core affinity.
+/// Parse "j,m,r,s,e" into `PipelineCores` for pipeline core affinity.
 fn parse_cores(s: &str) -> Result<PipelineCores, String> {
     let parts: Vec<&str> = s.split(',').collect();
-    if parts.len() != 4 {
+    if parts.len() != 5 {
         return Err(format!(
-            "expected 4 comma-separated core IDs (journal,matching,response,repl-sender), got {}",
+            "expected 5 comma-separated core IDs (journal,matching,response,repl-sender,event-publisher), got {}",
             parts.len()
         ));
     }
@@ -297,6 +322,7 @@ fn parse_cores(s: &str) -> Result<PipelineCores, String> {
         matching: parse(parts[1])?,
         response: parse(parts[2])?,
         repl_sender: parse(parts[3])?,
+        event_publisher: parse(parts[4])?,
     })
 }
 
@@ -304,7 +330,7 @@ fn parse_cores(s: &str) -> Result<PipelineCores, String> {
 ///
 /// 1. Initializes (or recovers) the `JournaledExchange`, then decomposes
 ///    it into `Exchange` and `JournalWriter` for the pipeline.
-/// 2. Builds the disruptor pipeline (input ring + output SPSC + stages).
+/// 2. Builds the disruptor pipeline (input ring + output ring + stages).
 /// 3. Spawns 3 OS threads: journal, matching, response.
 /// 4. Runs the accept loop, spawning a reader OS thread per connection.
 ///
@@ -322,7 +348,7 @@ pub fn run<L: BlockingTransportListener>(
 /// a clean shutdown of all pipeline threads (useful for benchmarks that need
 /// to collect latency trace reports).
 pub fn run_with_shutdown<L: BlockingTransportListener>(
-    mut listener: L,
+    listener: L,
     config: ServerConfig,
     shutdown: Arc<AtomicBool>,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -338,7 +364,44 @@ pub fn run_with_shutdown<L: BlockingTransportListener>(
     //   - Verify state via BLAKE3 hash chain
     if let Some(primary_addr) = config.replica_of {
         info!(primary = %primary_addr, "starting in replica mode");
-        return crate::replication::run_receiver(primary_addr, &config.journal, &shutdown);
+
+        // Spawn promotion listener if configured.
+        let promote_flag = Arc::new(AtomicBool::new(false));
+        let _promote_handle = config.promote_bind.map(|addr| {
+            crate::promote::spawn(addr, Arc::clone(&promote_flag), Arc::clone(&shutdown))
+        });
+
+        match crate::replication::run_receiver(
+            primary_addr,
+            &config.journal,
+            &shutdown,
+            &promote_flag,
+        )? {
+            None => return Ok(()), // clean shutdown
+            Some((mut exchange, writer)) => {
+                // Promotion! Transition to primary mode.
+                info!("replica promoted — transitioning to primary");
+                exchange.prefault();
+
+                // Load authorized keys (skipped during replica mode).
+                let authorized_keys = Arc::new(AuthorizedKeys::load(&config.authorized_keys)?);
+                info!(
+                    keys = authorized_keys.len(),
+                    path = %config.authorized_keys.display(),
+                    "loaded authorized keys"
+                );
+
+                return run_as_primary(
+                    exchange,
+                    writer,
+                    listener,
+                    &config,
+                    shutdown,
+                    authorized_keys,
+                    false, // no seeding needed — state comes from replication
+                );
+            }
+        }
     }
 
     // Load authorized keys for challenge-response authentication.
@@ -359,6 +422,32 @@ pub fn run_with_shutdown<L: BlockingTransportListener>(
     // Pre-fault all HashMap pages so page faults happen now, not on the hot path.
     exchange.prefault();
 
+    run_as_primary(
+        exchange,
+        writer,
+        listener,
+        &config,
+        shutdown,
+        authorized_keys,
+        needs_seeding,
+    )
+}
+
+/// Run the server as a primary: build the disruptor pipeline, spawn
+/// pipeline threads, optionally seed instruments/accounts, then accept
+/// client connections.
+///
+/// Used by both the normal primary startup path and the promotion path
+/// (replica → primary transition).
+fn run_as_primary<L: BlockingTransportListener>(
+    exchange: Exchange,
+    writer: JournalWriter,
+    mut listener: L,
+    config: &ServerConfig,
+    shutdown: Arc<AtomicBool>,
+    authorized_keys: Arc<AuthorizedKeys>,
+    needs_seeding: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
     // Active connection counter shared between accept loop, response
     // stage, and matching stage (for stats queries).
     // Incremented on successful auth, decremented on disconnect.
@@ -396,16 +485,19 @@ pub fn run_with_shutdown<L: BlockingTransportListener>(
     };
 
     // Build the disruptor pipeline with optional replication consumer.
+    let enable_event_publisher = config.event_bind.is_some();
     let (
         input_producer,
         journal_stage,
         matching_stage,
-        output_consumer,
+        mut output_consumers,
         journal_cursor,
         matching_cursor,
-        _events_processed,
+        events_processed,
+        input_cursor,
         replication,
         replication_cursor,
+        replica_connected,
     ) = build_pipeline_with_replication(
         exchange,
         writer,
@@ -415,7 +507,16 @@ pub fn run_with_shutdown<L: BlockingTransportListener>(
         config.max_journal_batch,
         config.replication_ring_size,
         !config.yield_idle,
+        enable_event_publisher,
     );
+    // Consumer 0 is always the response stage. Consumer 1 (if present)
+    // is the event publisher — only created when --event-bind is set.
+    let output_consumer = output_consumers.remove(0);
+    let event_publisher_consumer = if enable_event_publisher {
+        Some(output_consumers.remove(0))
+    } else {
+        None
+    };
 
     // Control channel for connect/disconnect events → response stage.
     let (control_tx, control_rx) = std::sync::mpsc::channel();
@@ -517,6 +618,9 @@ pub fn run_with_shutdown<L: BlockingTransportListener>(
         let s_repl = Arc::clone(&shutdown);
         let repl_cursor = Arc::clone(&replication_cursor);
         let ready_flag = Arc::clone(&replica_ready);
+        let connected_flag = replica_connected
+            .clone()
+            .expect("replica_connected must be Some when replication is enabled");
 
         let batch_size = config.replication_batch_size;
         let heartbeat_secs = config.replication_heartbeat_secs;
@@ -531,6 +635,7 @@ pub fn run_with_shutdown<L: BlockingTransportListener>(
                     genesis_entry,
                     &s_repl,
                     &ready_flag,
+                    &connected_flag,
                     batch_size,
                     heartbeat_secs,
                     busy_spin,
@@ -544,6 +649,32 @@ pub fn run_with_shutdown<L: BlockingTransportListener>(
         if !config.standalone && config.replica_of.is_none() {
             info!("running in standalone mode (no replication)");
         }
+        None
+    };
+
+    // Spawn event publisher thread if enabled. Consumes from output ring
+    // consumer 1 and broadcasts all execution events to TCP subscribers.
+    let event_publisher_handle = if let Some(event_consumer) = event_publisher_consumer {
+        let event_bind = config.event_bind.expect("event_bind must be set");
+        let s_event = Arc::clone(&shutdown);
+        let event_keys = Arc::clone(&authorized_keys);
+        let event_handle = std::thread::Builder::new()
+            .name("event-publisher".into())
+            .spawn(move || {
+                apply_affinity("event-publisher", cores.event_publisher);
+                crate::event_publisher::run(
+                    event_consumer,
+                    event_bind,
+                    event_keys,
+                    &s_event,
+                    busy_spin,
+                );
+            })
+            .expect("failed to spawn event publisher thread");
+
+        info!(addr = %event_bind, "event publisher started");
+        Some(event_handle)
+    } else {
         None
     };
 
@@ -646,6 +777,30 @@ pub fn run_with_shutdown<L: BlockingTransportListener>(
         );
     }
 
+    // Pipeline health flag: true while all pipeline threads are alive.
+    // Flipped to false when a thread dies or on shutdown. Read by the
+    // health endpoint to distinguish OK from ERR.
+    let pipeline_healthy = Arc::new(AtomicBool::new(true));
+
+    // Spawn health/liveness endpoint before the accept loop so it's
+    // reachable as soon as the server is ready to accept connections.
+    let health_handle = if let Some(health_addr) = config.health_bind {
+        Some(crate::health::spawn(
+            health_addr,
+            Arc::clone(&active_connections),
+            Arc::clone(&events_processed),
+            Arc::clone(&journal_cursor),
+            Arc::clone(&matching_cursor),
+            input_cursor,
+            Arc::clone(&replication_cursor),
+            Arc::clone(&pipeline_healthy),
+            replica_connected.clone(),
+            Arc::clone(&shutdown),
+        )?)
+    } else {
+        None
+    };
+
     // Set the listener to non-blocking so accept() returns immediately
     // with WouldBlock when no connection is pending. This lets the accept
     // loop check the shutdown flag without blocking indefinitely.
@@ -674,12 +829,17 @@ pub fn run_with_shutdown<L: BlockingTransportListener>(
         // shutdown or panic — if one is finished while shutdown is false,
         // it panicked. Re-check shutdown to avoid a TOCTOU race where a
         // clean shutdown signal arrives between the two checks.
+        let event_pub_died = event_publisher_handle
+            .as_ref()
+            .is_some_and(|h| h.is_finished());
         if (journal_handle.is_finished()
             || matching_handle.is_finished()
-            || response_handle.is_finished())
+            || response_handle.is_finished()
+            || event_pub_died)
             && !shutdown.load(Ordering::Relaxed)
         {
             error!("pipeline thread died, initiating shutdown");
+            pipeline_healthy.store(false, Ordering::Relaxed);
             break;
         }
 
@@ -809,6 +969,7 @@ pub fn run_with_shutdown<L: BlockingTransportListener>(
     // 2. Now signal the pipeline. The journal and matching stages will
     //    drain any remaining events before exiting.
     info!("shutdown: draining pipeline");
+    pipeline_healthy.store(false, Ordering::Relaxed);
     shutdown.store(true, Ordering::Relaxed);
 
     let mut thread_panicked = false;
@@ -835,6 +996,16 @@ pub fn run_with_shutdown<L: BlockingTransportListener>(
     // Join replication thread.
     if let Some(repl_sender_handle) = replication_handle {
         let _ = repl_sender_handle.join();
+    }
+
+    // Join event publisher thread.
+    if let Some(event_handle) = event_publisher_handle {
+        let _ = event_handle.join();
+    }
+
+    // Join health endpoint thread.
+    if let Some(h) = health_handle {
+        let _ = h.join();
     }
 
     info!("shutdown complete");
@@ -1573,7 +1744,7 @@ mod tests {
 
     #[test]
     fn auth_admin_permission() {
-        let keys = keys_with_test_key("admin");
+        let keys = keys_with_test_key("operator");
         let key = test_key();
         let (s1, mut s2) = UnixStream::pair().unwrap();
 
@@ -1583,7 +1754,7 @@ mod tests {
         let resp = read_response(&mut s2);
         assert!(matches!(resp, ResponseKind::ServerReady));
 
-        assert_eq!(handle.join().unwrap().unwrap(), Permission::Admin);
+        assert_eq!(handle.join().unwrap().unwrap(), Permission::Operator);
     }
 
     #[test]
@@ -1603,7 +1774,7 @@ mod tests {
 
     #[test]
     fn auth_bad_signature_sends_auth_failed() {
-        let keys = keys_with_test_key("admin");
+        let keys = keys_with_test_key("operator");
         let key = test_key();
         let (s1, mut s2) = UnixStream::pair().unwrap();
 

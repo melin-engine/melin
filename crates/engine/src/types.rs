@@ -16,7 +16,15 @@ use std::num::NonZeroU64;
 /// at once when load factor is exceeded — causing deterministic latency
 /// spikes on the hot path when account population exceeds pre-allocated
 /// capacity.
+///
+/// Default bucket size is 8 (hash array fits in one cache line).
 pub type HashMap<K, V> = astenn::HashMap<K, V, rustc_hash::FxBuildHasher>;
+
+/// HashMap variant with 4-entry buckets for hot-path maps where point
+/// lookups dominate. Smaller buckets mean fewer comparisons per probe
+/// and a tighter working set in L1, at the cost of more frequent splits
+/// during growth.
+pub type HashMap4<K, V> = astenn::HashMap<K, V, rustc_hash::FxBuildHasher, 4>;
 
 /// Instrument/pair identifier.
 ///
@@ -193,6 +201,9 @@ pub enum TimeInForce {
     IOC,
     /// Fill-Or-Kill: fill entirely or cancel entirely.
     FOK,
+    /// Day: rests on the book like GTC, but automatically cancelled when
+    /// an `EndOfDay` event is processed.
+    Day,
 }
 
 /// Self-trade prevention mode, set per order.
@@ -322,6 +333,10 @@ pub enum RejectReason {
     /// was already processed for this authentication key. Prevents
     /// double-execution on retry after network failure.
     DuplicateRequest,
+    /// Replication is enabled but the replica is disconnected. All
+    /// state-mutating operations are rejected until the replica reconnects
+    /// to preserve the durability guarantee.
+    ReplicaDisconnected,
 }
 
 #[cfg(test)]

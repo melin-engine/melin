@@ -20,12 +20,21 @@ pub fn should_filter(request: &Request) -> bool {
 
 /// Check whether the given request is permitted for the connection's
 /// permission level. Returns `Ok(())` if allowed, `Err(reason)` if not.
+///
+/// Permission model:
+/// - Operator: exchange configuration (add instrument, risk limits, circuit breakers, fee schedules, end-of-day, stats)
+/// - Custodian: fund management (deposit, withdraw)
+/// - Trader: order submission, cancellation
+/// - ReadOnly: heartbeats only (filtered before this function)
 pub fn check_permission(request: &Request, permission: Permission) -> Result<(), &'static str> {
-    if request.requires_admin() && !permission.is_admin() {
-        return Err("non-admin attempted admin command");
+    if request.requires_operator() && !permission.is_operator() {
+        return Err("non-operator attempted operator command");
     }
-    if !request.requires_admin() && !permission.can_trade() {
-        return Err("read-only connection attempted trade");
+    if request.is_fund_management() && !permission.can_manage_funds() {
+        return Err("non-custodian attempted fund management");
+    }
+    if !request.requires_operator() && !request.is_fund_management() && !permission.can_trade() {
+        return Err("connection lacks trading permission");
     }
     Ok(())
 }
@@ -87,6 +96,7 @@ pub fn to_event(request: &Request) -> JournalEvent {
             JournalEvent::SetFeeSchedule { symbol, schedule }
         }
         Request::QueryStats => JournalEvent::QueryStats,
+        Request::EndOfDay => JournalEvent::EndOfDay,
         Request::Heartbeat | Request::ChallengeResponse { .. } => {
             unreachable!("heartbeats and auth messages must be filtered before to_event")
         }
@@ -157,7 +167,7 @@ mod tests {
     }
 
     #[test]
-    fn permission_admin_can_admin() {
+    fn permission_operator_can_operate() {
         let req = Request::AddInstrument {
             spec: InstrumentSpec {
                 symbol: Symbol(1),
@@ -165,17 +175,37 @@ mod tests {
                 quote: CurrencyId(2),
             },
         };
-        assert!(check_permission(&req, Permission::Admin).is_ok());
+        assert!(check_permission(&req, Permission::Operator).is_ok());
     }
 
     #[test]
-    fn permission_trader_cannot_admin() {
+    fn permission_trader_cannot_operate() {
         let req = Request::AddInstrument {
             spec: InstrumentSpec {
                 symbol: Symbol(1),
                 base: CurrencyId(1),
                 quote: CurrencyId(2),
             },
+        };
+        assert!(check_permission(&req, Permission::Trader).is_err());
+    }
+
+    #[test]
+    fn permission_custodian_can_deposit() {
+        let req = Request::Deposit {
+            account: AccountId(1),
+            currency: CurrencyId(1),
+            amount: 100,
+        };
+        assert!(check_permission(&req, Permission::Custodian).is_ok());
+    }
+
+    #[test]
+    fn permission_trader_cannot_deposit() {
+        let req = Request::Deposit {
+            account: AccountId(1),
+            currency: CurrencyId(1),
+            amount: 100,
         };
         assert!(check_permission(&req, Permission::Trader).is_err());
     }

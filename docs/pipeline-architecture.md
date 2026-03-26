@@ -12,15 +12,20 @@ The server uses a 3-stage pipeline plus a reader pool, modeled after the LMAX Di
   (N epoll threads,     | (1M-slot ring,    |     |
    MultiProducer CAS)   |  lock-free CAS)   |     +----> Matching Stage
                         +-------------------+              |
-                                                           | SPSC
+                                                           | Output Disruptor Ring
+                                                           | (multi-consumer)
                                                            v
                                               +----> Response Stage ----> Clients
+                                              |
+                                              +----> Event Publisher ----> Subscribers
+                                                     (optional, --event-bind)
 ```
 
 1. **Reader pool** -- N epoll-based threads (default 2) multiplex all client connections and publish decoded requests into the input disruptor via lock-free CAS (`MultiProducer`).
 2. **Journal stage** -- batch-encodes events and writes them durably to disk via `pwritev2` + `RWF_DSYNC` (FUA). Advances its cursor only after the durable write completes.
-3. **Matching stage** -- executes commands against the `Exchange` engine and publishes execution reports to an output SPSC queue. Runs in parallel with the journal stage (does not wait for fsync).
-4. **Response stage** -- consumes the output SPSC but gates on the journal cursor before sending responses to clients, enforcing the persist-before-ack invariant.
+3. **Matching stage** -- executes commands against the `Exchange` engine and publishes execution reports to an output disruptor ring. Runs in parallel with the journal stage (does not wait for fsync).
+4. **Response stage** -- consumes from the output ring but gates on the journal cursor before sending responses to clients, enforcing the persist-before-ack invariant.
+5. **Event publisher** (optional) -- second consumer on the output ring, enabled by `--event-bind`. Broadcasts all execution events to TCP subscribers for market data gateways, analytics, and audit loggers. Ed25519 auth required.
 
 **Why this design**: Single-threaded business logic (the matching stage) eliminates locks on the hot path. Parallelizing journal I/O with matching hides fsync latency. The persist-before-ack boundary is enforced at the response stage, not in the matching stage, so the engine never stalls waiting for disk.
 

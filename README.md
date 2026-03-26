@@ -1,6 +1,10 @@
 # Melin
 
-Melin is a high-performance exchange core written in Rust on the [LMAX disruptor architecture](https://martinfowler.com/articles/lmax.html), built for venues that cannot compromise on correctness, durability, or latency. It delivers 5M orders/sec with synchronous replication and full fsync durability, maintaining sub-millisecond p99.9 latency by pipelining persistence with execution without cutting corners. Beyond order matching, Melin handles account management, risk controls, circuit breakers, fee schedules, authentication, journaling, and replication — everything an exchange needs between the network edge and the trading API. Its single-threaded matching core ensures deterministic behavior, with lock-free I/O and event sourcing providing replayability and optional BLAKE3 hash chains providing tamper-evident audit trails.
+Melin is a high-performance exchange core written in Rust on the [LMAX disruptor architecture](https://martinfowler.com/articles/lmax.html), built for venues that cannot compromise on correctness, durability, or latency. It delivers over 5M orders/sec over LAN with synchronous replication and full fsync durability, with sub-100 µs p99.9 single-order latency, pipelining persistence with execution without cutting corners. Beyond order matching, Melin handles account management, risk controls, circuit breakers, fee schedules, authentication, journaling, and replication — everything an exchange needs between the network edge and the trading API. Its single-threaded matching core ensures deterministic behavior, with lock-free I/O and event sourcing providing replayability and tamper-evident audit trails.
+
+## Scope
+
+Melin is an exchange core: order matching, account management, risk controls, fee calculation, journaling, replication, and connection authentication. It handles everything between the network edge and the trading API. Gateway concerns — market data fan-out, client session management, per-account rate limiting, account identity and authorization, FIX/ITCH protocol translation — are out of scope and handled by upstream services that consume Melin's output event channel.
 
 ## Correct
 
@@ -8,7 +12,7 @@ Melin is a high-performance exchange core written in Rust on the [LMAX disruptor
 - **Deterministic replay** — given the same journal, replay produces identical state bit-for-bit; the foundation of crash recovery, replication, and auditability
 - **Balance conservation** — funds are never created or destroyed; every reserve, fill, release, and withdrawal is tracked and verified by proptest invariants
 - **Client deduplication** — per-account order ID high-water mark prevents double execution on crash-recovery retry
-- **Extensive testing** — 360 tests including property-based (proptest), fuzz (bolero), snapshot round-trip, journal replay, and crash recovery scenarios
+- **Extensive testing** — property-based tests (proptest) verify invariants across thousands of random order sequences: price-time priority on both sides, balance conservation across fills/cancels/fees/STP, volume conservation, reservation consistency, no self-trades under STP, deterministic replay, and overflow safety. Fuzz testing (bolero) covers journal and wire protocol decoding. Integration tests cover snapshot round-trip, journal replay, and crash recovery
 
 ## Durable
 
@@ -47,18 +51,23 @@ Melin is a high-performance exchange core written in Rust on the [LMAX disruptor
   │  ack ─┐          │ring │   │ + RWF_DSYNC  │  │ .execute()   │                       │
   └───────┼──────────┘     │   └──────┬───────┘  └──────┬───────┘                       │
           │                │          │                 │                               │
-          │ repl cursor    │          │ journal cursor  │ output SPSC                   │
+          │ repl cursor    │          │ journal cursor  │ Output Disruptor Ring         │
           │                │          ▼                 ▼                               │
           │                │   ┌──────────────────────────────┐                         │
-          └──────────────► │   │       Response Thread        │                         │
-                           │   │                              │                         │
+          └──────────────► │   │       Response Thread        │ consumer 0              │
                            │   │  gates on min(journal cursor,│                         │
                            │   │      repl cursor)            │                         │
                            │   └──────────────┬───────────────┘                         │
                            │                  │                                         │
+                           │   ┌──────────────┴───────────────┐                         │
+                           │   │    Event Publisher Thread     │ consumer 1 (optional)   │
+                           │   │    (--event-bind, auth'd TCP) │                         │
+                           │   └──────────────┬───────────────┘                         │
+                           │                  │                                         │
                            └──────────────────┼─────────────────────────────────────────┘
                                               │
-  Clients ◄─TCP───────────────────────────────┘
+  Clients ◄─TCP──────────────────────────────┤
+  Subscribers ◄─TCP──────────────────────────┘
 ```
 
 - **Single-threaded matching engine** — no locks on the hot path; one thread executes all matching logic
@@ -73,7 +82,7 @@ Melin is a high-performance exchange core written in Rust on the [LMAX disruptor
 
 ### Benchmarks
 
-LAN round-trip benchmarks at [`ed9241d`](../../commit/ed9241d). Two or three Cherry AMD Ryzen 9 9950X servers (16C @ 4.3 GHz, SMT disabled, 96 GB 5600 MHz RAM, 2x 1TB NVMe, 10 Gbps). Engine on one server with journal on a dedicated NVMe disk, benchmark client on the second, replica on the third (replication only). TCP over private VLAN, IRQs pinned to core 0. [Realistic order flow](crates/bench/). Reproducible via `scripts/lan-bench-suite.sh`.
+LAN round-trip benchmarks at [`ed9241d`](../../commit/ed9241d). Two or three Cherry AMD Ryzen 9 9950X servers (16C @ 4.3 GHz, SMT disabled, 96 GB 5600 MHz RAM, 2x 1TB NVMe, 10 Gbps). Engine on one server with journal on a dedicated NVMe disk, benchmark client on the second, replica on the third (replication only). TCP over private VLAN, IRQs pinned to core 0. [Realistic order flow](crates/bench/). Reproducible via `scripts/lan-bench-suite.sh`. For production deployment and OS tuning, see [docs/operations.md](docs/operations.md) and [docs/benchmarking.md](docs/benchmarking.md).
 
 | Mode | Throughput | p50 | p99 | p99.9 | max | Parameters |
 |------|-----------|-----|-----|-------|-----|------------|
@@ -97,7 +106,7 @@ The TCP network stack is now the primary throughput limiter. The journal pipelin
 
 ### Order Types
 - Market, Limit, Stop (stop-loss), Stop-Limit
-- Time-in-force: GTC, IOC, FOK
+- Time-in-force: GTC, IOC, FOK, Day
 - Post-Only (maker-only, reject if would take)
 
 ### Matching Engine ([docs/matching-engine.md](docs/matching-engine.md))
@@ -132,25 +141,38 @@ The TCP network stack is now the primary throughput limiter. The journal pipelin
 
 ### Networking ([docs/wire-protocol.md](docs/wire-protocol.md))
 - Custom binary wire protocol (length-prefixed framing)
-- Unix domain socket transport
+- TCP and Unix domain socket transports (kernel bypass via AF_XDP and DPDK in progress)
 - Epoll reader pool (edge-triggered, non-blocking) with dedicated I/O threads (zero tokio)
 - io_uring transport (separate read/write rings, multishot RECV with provided buffer groups)
+- Backpressure handling (explicit `ServerBusy` reject when the input pipeline is full — no silent drops or reader thread stalls; client should back off and retry). See [docs/wire-protocol.md](docs/wire-protocol.md)
 
 ### Authentication & Authorization ([docs/admin-guide.md](docs/admin-guide.md))
 - Client authentication (Ed25519 challenge-response handshake)
-- Admin API (instrument management, deposits, circuit breaker controls, kill switch, risk limits, fee schedules, cancel-replace, live stats dashboard)
+- Four permission roles with separation of duties: Operator (exchange configuration), Trader (order submission/cancellation), Custodian (deposit/withdraw), ReadOnly (heartbeats)
+- Operator API (instrument management, circuit breaker controls, kill switch, risk limits, fee schedules, end-of-day, live stats dashboard)
 - Idempotency for admin operations (per-key sequence numbers with duplicate rejection — safe to retry on timeout without double-applying)
 
 ### Operations & Reliability ([docs/operations.md](docs/operations.md))
 - Structured logging (`tracing` crate, error-level for server malfunctions only)
-- Health checks / readiness probes (`ServerReady` wire handshake on connect)
+- Health/liveness TCP endpoint (`--health-bind`, returns `OK <conns> <seq> <lag>`) with Prometheus `/metrics` endpoint
 - Sparse account storage to reduce memory usage, see [docs/account-lifecycle.md](docs/account-lifecycle.md).
 
+### Output Event Channel
+- Real-time broadcast of all execution events (fills, placements, cancellations) to TCP subscribers via `--event-bind`
+- Second consumer on the output disruptor ring — zero overhead when disabled (single consumer, identical to before)
+- Ed25519 challenge-response authentication (ReadOnly permission or above)
+- Per-frame monotonic sequence numbers for gap detection
+- Slow subscriber policy: non-blocking writes, disconnect on `WouldBlock`
+- Foundation for market data gateways, analytics services, and audit loggers
+
 ### Metrics & Observability
+- Prometheus metrics endpoint (`GET /metrics` on the health port — active connections, events processed, journal sequence, replication lag, pipeline health, input queue depth, trading state)
 - Admin TUI observability dashboard (live connection count, events processed, throughput, journal sequence — polled via `QueryStats` through the pipeline)
 
 ### Redundancy & High Availability
 - Synchronous journal replication ([docs/replication.md](docs/replication.md)) — live WAL streaming to replica via lock-free ring buffer, ack-gated responses, replica receiver with deterministic replay
+- Automatic trading halt on replica disconnect — new orders rejected with `ReplicaDisconnected`, orders already in the pipeline complete normally. Resumes instantly on reconnect (atomic flag flip). See [docs/operations.md](docs/operations.md)
+- Manual promotion — operator sends `PROMOTE` to the replica's trigger endpoint (`melin-promote <addr>`). In-process transition reuses the warm Exchange state with zero re-replay, sub-second switchover. See [docs/operations.md](docs/operations.md)
 
 
 ## Project Structure
@@ -159,7 +181,7 @@ The TCP network stack is now the primary throughput limiter. The journal pipelin
 crates/
 ├── disruptor/     Lock-free ring buffers (generic, no trading-domain knowledge)
 ├── engine/        Matching engine, order books, event sourcing, journal pipeline
-├── protocol/      Binary wire protocol, transport abstractions, blocking I/O
+├── protocol/      Binary wire protocol, codec, transport abstractions
 ├── server/        Server, pipeline orchestration, dedicated I/O threads
 ├── admin/         CLI admin tool (instruments, deposits, fees, risk, circuit breakers, live dashboard)
 ├── bench/         Benchmark suite (engine, pipeline, and full round-trip modes)
@@ -170,3 +192,5 @@ crates/
 ## License
 
 Copyright (c) 2026 Pierre Larger. All Rights Reserved.
+
+Commercial licensing available — contact [pierre.larger@gmail.com](mailto:pierre.larger@gmail.com).

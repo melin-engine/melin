@@ -240,6 +240,18 @@ fn epoll_reader_loop<R: AsRawFd>(
 
     // Pre-size for a reasonable number of concurrent connections per reader thread.
     let mut connections: HashMap<RawFd, ConnectionState<R>> = HashMap::with_capacity(256);
+
+    // Pre-encode the ServerBusy response frame (length prefix + tag = 5 bytes).
+    // Sent directly via libc::write when the disruptor ring is full.
+    let server_busy_frame = {
+        let mut buf = [0u8; 8];
+        let n =
+            codec::encode_response(&melin_protocol::message::ResponseKind::ServerBusy, &mut buf)
+                .expect("ServerBusy encodes");
+        let mut frame = [0u8; 5];
+        frame.copy_from_slice(&buf[..n]);
+        frame
+    };
     let mut events = vec![libc::epoll_event { events: 0, u64: 0 }; MAX_EPOLL_EVENTS];
 
     #[cfg(feature = "latency-trace")]
@@ -306,6 +318,7 @@ fn epoll_reader_loop<R: AsRawFd>(
                 process_connection(
                     conn,
                     &producer,
+                    &server_busy_frame,
                     batch_now,
                     #[cfg(feature = "latency-trace")]
                     &mut publish_hist,
@@ -433,6 +446,7 @@ fn remove_connection<R>(
 fn process_connection<R>(
     conn: &mut ConnectionState<R>,
     producer: &ring::MultiProducer<InputSlot>,
+    server_busy_frame: &[u8; 5],
     now: Instant,
     #[cfg(feature = "latency-trace")]
     publish_hist: &mut melin_engine::journal::trace::StageHistogram,
@@ -518,14 +532,47 @@ fn process_connection<R>(
                     #[cfg(feature = "latency-trace")]
                     let pre_publish = trace_ts();
 
-                    producer.publish(InputSlot {
-                        connection_id: conn.connection_id,
-                        key_hash: conn.key_hash,
-                        request_seq: seq,
-                        event,
-                        publish_ts: trace_ts(),
-                        recv_ts,
-                    });
+                    if producer
+                        .try_publish(InputSlot {
+                            connection_id: conn.connection_id,
+                            key_hash: conn.key_hash,
+                            request_seq: seq,
+                            event,
+                            publish_ts: trace_ts(),
+                            recv_ts,
+                        })
+                        .is_err()
+                    {
+                        // Pipeline full — send ServerBusy directly on the socket.
+                        // Best-effort: if the write fails (broken pipe, full send
+                        // buffer), the client will timeout and reconnect.
+                        debug!(
+                            connection_id = conn.connection_id,
+                            "pipeline full, sending ServerBusy"
+                        );
+                        let n = unsafe {
+                            libc::write(
+                                conn.fd,
+                                server_busy_frame.as_ptr().cast(),
+                                server_busy_frame.len(),
+                            )
+                        };
+                        if n != server_busy_frame.len() as isize {
+                            debug!(
+                                connection_id = conn.connection_id,
+                                written = n,
+                                "ServerBusy write incomplete"
+                            );
+                        }
+                        // Stop draining this connection for this epoll round.
+                        // Edge-trigger caveat: any bytes already in the kernel
+                        // recv buffer won't generate a new EPOLLIN (edge-trigger
+                        // only fires on new arrivals). Those frames are stranded
+                        // until the client sends new data — which it will, since
+                        // it just received ServerBusy and will retry or send the
+                        // next request.
+                        return false;
+                    }
 
                     #[cfg(feature = "latency-trace")]
                     publish_hist.record_ns(melin_engine::journal::trace::trace_elapsed_ns(
@@ -579,3 +626,54 @@ fn nonblocking_read(fd: RawFd, buf: &mut [u8], mut filled: usize, target: usize)
 }
 
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use melin_engine::journal::pipeline::InputSlot;
+    use melin_engine::journal::trace::trace_ts;
+
+    /// Verify the pre-encoded ServerBusy frame decodes to the correct response.
+    #[test]
+    fn server_busy_frame_round_trip() {
+        let mut buf = [0u8; 8];
+        let n =
+            codec::encode_response(&melin_protocol::message::ResponseKind::ServerBusy, &mut buf)
+                .expect("encode ServerBusy");
+        // 4-byte length prefix + 1-byte tag = 5 bytes.
+        assert_eq!(n, 5);
+
+        // Decode the payload (after the 4-byte length prefix).
+        let decoded = codec::decode_response(&buf[4..n]).expect("decode ServerBusy");
+        assert!(matches!(
+            decoded,
+            melin_protocol::message::ResponseKind::ServerBusy
+        ));
+    }
+
+    /// When the disruptor ring is full, try_publish must return Err(Full)
+    /// so the reader can send ServerBusy instead of spinning.
+    #[test]
+    fn try_publish_returns_full_when_ring_exhausted() {
+        // Smallest power-of-two ring: 2 slots, 1 consumer.
+        let (producer, mut consumers) = ring::DisruptorBuilder::<InputSlot>::new(2)
+            .add_consumer()
+            .build_multi_producer();
+        let _consumer = consumers.pop().unwrap();
+
+        let slot = InputSlot {
+            connection_id: 0,
+            key_hash: 0,
+            request_seq: 0,
+            event: melin_engine::journal::event::JournalEvent::QueryStats,
+            publish_ts: trace_ts(),
+            recv_ts: trace_ts(),
+        };
+
+        // Fill both slots.
+        assert!(producer.try_publish(slot).is_ok());
+        assert!(producer.try_publish(slot).is_ok());
+
+        // Third publish must fail — ring is full, consumer hasn't advanced.
+        assert!(producer.try_publish(slot).is_err());
+    }
+}

@@ -8,7 +8,7 @@ use std::collections::{BTreeMap, VecDeque};
 use std::num::NonZeroU64;
 
 use crate::types::{
-    AccountId, ExecutionReport, HashMap, Order, OrderId, OrderType, Price, Quantity, RejectReason,
+    AccountId, ExecutionReport, HashMap4, Order, OrderId, OrderType, Price, Quantity, RejectReason,
     SelfTradeProtection, Side, TimeInForce,
 };
 
@@ -18,6 +18,10 @@ pub(crate) struct RestingOrder {
     id: OrderId,
     account: AccountId,
     remaining: Quantity,
+    /// Stored to support selective cancellation (e.g., EndOfDay cancels
+    /// only Day orders, not GTC). IOC/FOK orders never rest, so this
+    /// is always GTC or Day in practice.
+    time_in_force: TimeInForce,
 }
 
 /// A pending stop order waiting to be triggered.
@@ -57,11 +61,17 @@ pub(crate) struct BookSide {
 
 impl RestingOrder {
     /// Create a new resting order (used by snapshot restore).
-    pub(crate) fn new(id: OrderId, account: AccountId, remaining: Quantity) -> Self {
+    pub(crate) fn new(
+        id: OrderId,
+        account: AccountId,
+        remaining: Quantity,
+        time_in_force: TimeInForce,
+    ) -> Self {
         Self {
             id,
             account,
             remaining,
+            time_in_force,
         }
     }
 
@@ -75,6 +85,10 @@ impl RestingOrder {
 
     pub(crate) fn remaining(&self) -> Quantity {
         self.remaining
+    }
+
+    pub(crate) fn time_in_force(&self) -> TimeInForce {
+        self.time_in_force
     }
 }
 
@@ -279,7 +293,7 @@ pub struct OrderBook {
     /// need to scan the book. Keyed by (AccountId, OrderId) to eliminate
     /// cross-account collisions — different accounts can independently
     /// use the same OrderId without index conflicts.
-    order_index: HashMap<(AccountId, OrderId), (Side, Price)>,
+    order_index: HashMap4<(AccountId, OrderId), (Side, Price)>,
     /// BTreeMap keyed by trigger price so we can efficiently find all stops
     /// that should fire at a given trade price. Stop buys trigger when price
     /// rises (iterate from lowest trigger up), stop sells when price falls
@@ -289,7 +303,7 @@ pub struct OrderBook {
     /// Tracks which order IDs are pending stops, for cancel support.
     /// Keyed by (AccountId, OrderId) to match order_index and eliminate
     /// cross-account collisions.
-    stop_index: HashMap<(AccountId, OrderId), (Side, Price)>,
+    stop_index: HashMap4<(AccountId, OrderId), (Side, Price)>,
     /// Last trade price, used to determine which stops to trigger.
     last_trade_price: Option<Price>,
     /// Reusable buffers to avoid per-order allocations on the hot path.
@@ -314,10 +328,10 @@ impl OrderBook {
         Self {
             bids: BookSide::default(),
             asks: BookSide::default(),
-            order_index: HashMap::default(),
+            order_index: HashMap4::default(),
             stop_buys: BTreeMap::new(),
             stop_sells: BTreeMap::new(),
-            stop_index: HashMap::default(),
+            stop_index: HashMap4::default(),
             last_trade_price: None,
             trigger_price_buf: Vec::new(),
             triggered_buf: Vec::new(),
@@ -341,11 +355,11 @@ impl OrderBook {
             // 4096 slots ≈ 128 KB (key 12 B + value 16 B + control 1 B per
             // slot) — fits in L2 cache for fast probes. Typical book depth
             // is 100-2000 orders; resize cost at 4K is ~5 µs.
-            order_index: HashMap::with_capacity_and_hasher(4_096, Default::default()),
+            order_index: HashMap4::with_capacity_and_hasher(4_096, Default::default()),
             // BTreeMap is node-allocated — no resize spikes.
             stop_buys: BTreeMap::new(),
             stop_sells: BTreeMap::new(),
-            stop_index: HashMap::with_capacity_and_hasher(1_024, Default::default()),
+            stop_index: HashMap4::with_capacity_and_hasher(1_024, Default::default()),
             last_trade_price: None,
             trigger_price_buf: Vec::with_capacity(64),
             triggered_buf: Vec::with_capacity(64),
@@ -386,10 +400,10 @@ impl OrderBook {
     pub(crate) fn from_parts(
         bids: BookSide,
         asks: BookSide,
-        order_index: HashMap<(AccountId, OrderId), (Side, Price)>,
+        order_index: HashMap4<(AccountId, OrderId), (Side, Price)>,
         stop_buys: BTreeMap<Price, Vec<PendingStop>>,
         stop_sells: BTreeMap<Price, Vec<PendingStop>>,
-        stop_index: HashMap<(AccountId, OrderId), (Side, Price)>,
+        stop_index: HashMap4<(AccountId, OrderId), (Side, Price)>,
         last_trade_price: Option<Price>,
     ) -> Self {
         Self {
@@ -698,6 +712,46 @@ impl OrderBook {
         }
     }
 
+    /// Cancel all resting orders and pending stops with `TimeInForce::Day`.
+    /// Called at end-of-session. GTC orders are left untouched.
+    pub fn cancel_day_orders(&mut self, reports: &mut Vec<ExecutionReport>) {
+        let mut to_cancel: Vec<(AccountId, OrderId)> = Vec::new();
+
+        for (_, queue) in &self.bids.levels {
+            for order in queue {
+                if order.time_in_force == TimeInForce::Day {
+                    to_cancel.push((order.account, order.id));
+                }
+            }
+        }
+        for (_, queue) in &self.asks.levels {
+            for order in queue {
+                if order.time_in_force == TimeInForce::Day {
+                    to_cancel.push((order.account, order.id));
+                }
+            }
+        }
+
+        for stops in self.stop_buys.values() {
+            for stop in stops {
+                if stop.time_in_force == TimeInForce::Day {
+                    to_cancel.push((stop.account, stop.id));
+                }
+            }
+        }
+        for stops in self.stop_sells.values() {
+            for stop in stops {
+                if stop.time_in_force == TimeInForce::Day {
+                    to_cancel.push((stop.account, stop.id));
+                }
+            }
+        }
+
+        for (account, id) in to_cancel {
+            self.cancel(account, id, reports);
+        }
+    }
+
     fn execute_limit(&mut self, order: Order, price: Price, reports: &mut Vec<ExecutionReport>) {
         // Post-only: reject if the order would cross the spread.
         if let OrderType::Limit {
@@ -762,13 +816,16 @@ impl OrderBook {
                     });
                 } else {
                     match order.time_in_force {
-                        TimeInForce::GTC => {
+                        // GTC and Day both rest on the book. Day orders are
+                        // bulk-cancelled later by EndOfDay.
+                        TimeInForce::GTC | TimeInForce::Day => {
                             self.place_on_book(
                                 order.id,
                                 order.account,
                                 order.side,
                                 price,
                                 rem,
+                                order.time_in_force,
                                 reports,
                             );
                         }
@@ -1163,6 +1220,7 @@ impl OrderBook {
         side: Side,
         price: Price,
         quantity: Quantity,
+        time_in_force: TimeInForce,
         reports: &mut Vec<ExecutionReport>,
     ) {
         let book_side = match side {
@@ -1175,6 +1233,7 @@ impl OrderBook {
                 id,
                 account,
                 remaining: quantity,
+                time_in_force,
             },
         );
         self.order_index.insert((account, id), (side, price));

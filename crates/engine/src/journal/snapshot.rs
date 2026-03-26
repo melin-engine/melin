@@ -31,7 +31,7 @@ use crate::exchange::Exchange;
 use crate::orderbook::OrderBook;
 use crate::types::{
     AccountId, CircuitBreakerConfig, CurrencyId, FeeSchedule, InstrumentSpec, OrderId, Price,
-    Quantity, RiskLimits, Side, Symbol,
+    Quantity, RiskLimits, Side, Symbol, TimeInForce,
 };
 
 use super::error::JournalError;
@@ -55,7 +55,7 @@ const SNAP_MAGIC: u32 = 0x534E_4150;
 /// v6 → v7: order_sides keyed by (AccountId, OrderId), added fee schedules.
 /// v7 → v8: order_index and stop_index now store AccountId (21 bytes/entry vs 17).
 /// v8 → v9: added per-key request sequence HWMs for admin idempotency.
-const SNAP_VERSION: u16 = 9;
+const SNAP_VERSION: u16 = 10;
 
 /// Snapshot header size: magic(4) + version(2) + reserved(2) + sequence(8) + chain_hash(32) = 48.
 const SNAP_HEADER_SIZE: usize = 48;
@@ -138,7 +138,7 @@ pub fn load(path: &Path) -> Result<(Exchange, u64, [u8; 32]), JournalError> {
     // v5 header is 16 bytes, v6+ header is 48 bytes (adds 32-byte chain_hash).
     let (header_size, has_chain_hash) = match version {
         5 => (16usize, false),
-        6..=9 => (SNAP_HEADER_SIZE, true),
+        6..=10 => (SNAP_HEADER_SIZE, true),
         _ => return Err(JournalError::UnsupportedVersion { version }),
     };
 
@@ -225,6 +225,7 @@ pub(crate) struct RestingOrderSnapshot {
     pub(crate) id: OrderId,
     pub(crate) account: AccountId,
     pub(crate) remaining: Quantity,
+    pub(crate) time_in_force: TimeInForce,
 }
 
 /// Serialized pending stop.
@@ -399,6 +400,7 @@ fn encode_book_side(levels: &[(Price, Vec<RestingOrderSnapshot>)], buf: &mut Vec
             le::push_u64(buf, order.id.0);
             le::push_u32(buf, order.account.0);
             le::push_u64(buf, order.remaining.get());
+            buf.push(le::encode_tif(order.time_in_force));
         }
     }
 }
@@ -910,23 +912,26 @@ fn decode_book_side_levels(buf: &[u8]) -> Result<(usize, RestingLevels), Journal
         let n_orders = le::get_u32(&buf[pos..]) as usize;
         pos += 4;
 
-        // Each order is 20 bytes.
-        validate_count(buf.len() - pos, n_orders, 20)?;
+        // Each order is 21 bytes: id(8) + account(4) + remaining(8) + tif(1).
+        validate_count(buf.len() - pos, n_orders, 21)?;
         let mut orders = Vec::with_capacity(n_orders);
         for _ in 0..n_orders {
-            if pos + 20 > buf.len() {
+            if pos + 21 > buf.len() {
                 return Err(JournalError::TruncatedEntry);
             }
             let id = OrderId(le::get_u64(&buf[pos..]));
             let account = AccountId(le::get_u32(&buf[pos + 8..]));
             let remaining_val = NonZeroU64::new(le::get_u64(&buf[pos + 12..]))
                 .ok_or(corrupt("zero remaining quantity"))?;
+            let time_in_force = le::decode_tif(buf[pos + 20])
+                .ok_or(corrupt("invalid time-in-force on resting order"))?;
             orders.push(RestingOrderSnapshot {
                 id,
                 account,
                 remaining: Quantity(remaining_val),
+                time_in_force,
             });
-            pos += 20;
+            pos += 21;
         }
         levels.push((Price(price_val), orders));
     }
@@ -1123,8 +1128,8 @@ impl Exchange {
         // Build a side lookup first, then merge with slot assignments.
         let side_map: StdHashMap<(AccountId, OrderId), Side> =
             state.order_sides.into_iter().collect();
-        let mut order_info: crate::types::HashMap<(AccountId, OrderId), OrderInfo> =
-            crate::types::HashMap::with_capacity_and_hasher(side_map.len(), Default::default());
+        let mut order_info: crate::types::HashMap4<(AccountId, OrderId), OrderInfo> =
+            crate::types::HashMap4::with_capacity_and_hasher(side_map.len(), Default::default());
         for (key, slot) in slot_assignments {
             if let Some(&side) = side_map.get(&key) {
                 order_info.insert(
@@ -1137,8 +1142,8 @@ impl Exchange {
             }
         }
 
-        // Build sparse HashMap from snapshot entries.
-        let mut max_order_id = crate::types::HashMap::with_capacity_and_hasher(
+        // Build sparse HashMap4 from snapshot entries (4-entry buckets for hot path).
+        let mut max_order_id = crate::types::HashMap4::with_capacity_and_hasher(
             state.max_order_id.len(),
             Default::default(),
         );
@@ -1173,6 +1178,7 @@ impl OrderBook {
                                 id: o.id(),
                                 account: o.account(),
                                 remaining: o.remaining(),
+                                time_in_force: o.time_in_force(),
                             })
                             .collect();
                         (price, orders)
@@ -1224,7 +1230,14 @@ impl OrderBook {
                 .map(|(price, orders)| {
                     let queue = orders
                         .into_iter()
-                        .map(|o| crate::orderbook::RestingOrder::new(o.id, o.account, o.remaining))
+                        .map(|o| {
+                            crate::orderbook::RestingOrder::new(
+                                o.id,
+                                o.account,
+                                o.remaining,
+                                o.time_in_force,
+                            )
+                        })
                         .collect();
                     (price, queue)
                 })
@@ -1256,13 +1269,13 @@ impl OrderBook {
             btree
         };
 
-        let order_index: crate::types::HashMap<(AccountId, OrderId), (Side, Price)> = snap
+        let order_index: crate::types::HashMap4<(AccountId, OrderId), (Side, Price)> = snap
             .order_index
             .into_iter()
             .map(|(id, account, side, price)| ((account, id), (side, price)))
             .collect();
 
-        let stop_index: crate::types::HashMap<(AccountId, OrderId), (Side, Price)> = snap
+        let stop_index: crate::types::HashMap4<(AccountId, OrderId), (Side, Price)> = snap
             .stop_index
             .into_iter()
             .map(|(id, account, side, price)| ((account, id), (side, price)))

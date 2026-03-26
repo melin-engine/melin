@@ -51,6 +51,7 @@ const TAG_CANCEL_REPLACE: u8 = 10;
 const TAG_SET_FEE_SCHEDULE: u8 = 31;
 const TAG_QUERY_STATS: u8 = 30;
 const TAG_WITHDRAW: u8 = 32;
+const TAG_END_OF_DAY: u8 = 33;
 
 // --- Response tags ---
 const TAG_PLACED: u8 = 11;
@@ -66,6 +67,8 @@ const TAG_CHALLENGE: u8 = 20;
 const TAG_AUTH_FAILED: u8 = 21;
 const TAG_REPLACED: u8 = 22;
 const TAG_STATS_HEADER: u8 = 23;
+/// Server pipeline full — client should retry after backoff.
+const TAG_SERVER_BUSY: u8 = 24;
 
 // --- OrderType tags (wire-specific, not shared with journal) ---
 const ORDER_TYPE_MARKET: u8 = 0;
@@ -91,6 +94,7 @@ const REJECT_PRICE_WOULD_CROSS: u8 = 12;
 const REJECT_POST_ONLY_WOULD_CROSS: u8 = 13;
 const REJECT_HAS_RESTING_ORDERS: u8 = 14;
 const REJECT_DUPLICATE_REQUEST: u8 = 15;
+const REJECT_REPLICA_DISCONNECTED: u8 = 16;
 
 /// Encode a request into `buf`. Returns total bytes written (length prefix + seq + tag + payload).
 ///
@@ -255,6 +259,10 @@ pub fn encode_request(request: &Request, seq: u64, buf: &mut [u8]) -> Result<usi
         }
         Request::QueryStats => {
             buf[pos] = TAG_QUERY_STATS;
+            pos += 1;
+        }
+        Request::EndOfDay => {
+            buf[pos] = TAG_END_OF_DAY;
             pos += 1;
         }
     }
@@ -484,6 +492,7 @@ pub fn decode_request(buf: &[u8]) -> Result<(u64, Request), ProtocolError> {
             ))
         }
         TAG_QUERY_STATS => Ok((seq, Request::QueryStats)),
+        TAG_END_OF_DAY => Ok((seq, Request::EndOfDay)),
         TAG_SET_FEE_SCHEDULE => {
             // symbol(4) + maker_fee_bps(2) + taker_fee_bps(2) = 8
             if payload.len() < 8 {
@@ -543,6 +552,10 @@ pub fn encode_response(response: &ResponseKind, buf: &mut [u8]) -> Result<usize,
             buf[pos] = TAG_AUTH_FAILED;
             pos += 1;
         }
+        ResponseKind::ServerBusy => {
+            buf[pos] = TAG_SERVER_BUSY;
+            pos += 1;
+        }
         ResponseKind::StatsHeader {
             active_connections,
             events_processed,
@@ -588,6 +601,7 @@ pub fn decode_response(buf: &[u8]) -> Result<ResponseKind, ProtocolError> {
             Ok(ResponseKind::Challenge { nonce })
         }
         TAG_AUTH_FAILED => Ok(ResponseKind::AuthFailed),
+        TAG_SERVER_BUSY => Ok(ResponseKind::ServerBusy),
         TAG_PLACED | TAG_FILL | TAG_CANCELLED | TAG_TRIGGERED | TAG_REJECTED | TAG_REPLACED => {
             let report = decode_execution_report(tag, payload)?;
             Ok(ResponseKind::Report(report))
@@ -1012,6 +1026,7 @@ fn encode_reject_reason(reason: RejectReason) -> u8 {
         RejectReason::PostOnlyWouldCross => REJECT_POST_ONLY_WOULD_CROSS,
         RejectReason::HasRestingOrders => REJECT_HAS_RESTING_ORDERS,
         RejectReason::DuplicateRequest => REJECT_DUPLICATE_REQUEST,
+        RejectReason::ReplicaDisconnected => REJECT_REPLICA_DISCONNECTED,
     }
 }
 
@@ -1033,6 +1048,7 @@ fn decode_reject_reason(b: u8) -> Result<RejectReason, ProtocolError> {
         REJECT_POST_ONLY_WOULD_CROSS => Ok(RejectReason::PostOnlyWouldCross),
         REJECT_HAS_RESTING_ORDERS => Ok(RejectReason::HasRestingOrders),
         REJECT_DUPLICATE_REQUEST => Ok(RejectReason::DuplicateRequest),
+        REJECT_REPLICA_DISCONNECTED => Ok(RejectReason::ReplicaDisconnected),
         _ => Err(ProtocolError::InvalidField("reject reason")),
     }
 }
@@ -1193,6 +1209,7 @@ mod tests {
                 },
             },
             Request::QueryStats,
+            Request::EndOfDay,
         ]
     }
 
@@ -1303,6 +1320,11 @@ mod tests {
                 account: AccountId(10),
                 reason: RejectReason::DuplicateRequest,
             }),
+            ResponseKind::Report(ExecutionReport::Rejected {
+                order_id: OrderId(21),
+                account: AccountId(10),
+                reason: RejectReason::ReplicaDisconnected,
+            }),
             ResponseKind::Report(ExecutionReport::Replaced {
                 order_id: OrderId(42),
                 side: Side::Buy,
@@ -1317,6 +1339,7 @@ mod tests {
             ResponseKind::Heartbeat,
             ResponseKind::Challenge { nonce: [0xCC; 32] },
             ResponseKind::AuthFailed,
+            ResponseKind::ServerBusy,
             ResponseKind::StatsHeader {
                 active_connections: 5,
                 events_processed: 1_234_567,

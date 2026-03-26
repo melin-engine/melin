@@ -312,12 +312,16 @@ The journal participates in a 3-stage LMAX disruptor pipeline:
         │                       │
    Journal Stage           Matching Stage
    (encode + sync)         (execute on Exchange)
-   advances cursor ──┐     publishes to output SPSC
+   advances cursor ──┐     publishes to output ring
                      │           │
                      ▼           │
-               Response Stage ◄──┘
-               gates on journal cursor
-               sends responses to clients
+               Output Disruptor Ring (multi-consumer)
+                     │
+            ┌────────┴────────┐
+            │                 │
+      Response Stage    Event Publisher
+      gates on cursor   (optional, --event-bind)
+      sends to clients  broadcasts to subscribers
 ```
 
 - **Journal and Matching run in parallel** on the same events. Matching does not wait for the journal — it executes immediately. This overlaps matching latency with journal I/O latency.

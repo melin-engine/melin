@@ -20,11 +20,12 @@
 //! resting book depth. Events are pre-generated before the measured run.
 //!
 //! Usage:
-//!     cargo run --release -p melin-bench [-- [--mode=roundtrip|pipeline|engine] [--uds] [--addr=<ip:port>] [--clients=N] [--window=N] [--group-commit-us=N] [--bench-threads=N] <order_pairs>]
+//!     cargo run --release -p melin-bench [-- [--mode=roundtrip|pipeline|engine] [--uds] [--addr=<ip:port>] [--health-addr=<ip:port>] [--clients=N] [--window=N] [--group-commit-us=N] [--bench-threads=N] <order_pairs>]
 //!
 //! Default: roundtrip mode, TCP transport, 1 client, 1,000,000 order pairs.
 
 mod generator;
+mod health_poller;
 
 #[cfg(feature = "dpdk")]
 mod dpdk;
@@ -281,6 +282,11 @@ struct BenchArgs {
     /// isolcpus for tighter measurements.
     #[arg(long)]
     bench_cores: Option<usize>,
+    /// Health endpoint address to poll for server metrics during the run
+    /// (roundtrip mode only). For embedded mode, auto-detected from server
+    /// config. For remote mode (`--addr`), must be provided explicitly.
+    #[arg(long)]
+    health_addr: Option<std::net::SocketAddr>,
 }
 
 fn main() {
@@ -373,6 +379,7 @@ fn main() {
                     json_path,
                     args.key.as_deref(),
                     args.bench_cores,
+                    args.health_addr,
                 );
             }
         }
@@ -569,6 +576,7 @@ fn run_engine_bench(
         ],
         json_path,
         &series,
+        &[],
     );
 }
 
@@ -616,10 +624,11 @@ fn run_pipeline_bench(
         producer,
         journal_stage,
         matching_stage,
-        mut output_consumer,
+        mut output_consumers,
         _journal_cursor,
         _events_processed,
     ) = build_pipeline(exchange, writer, group_commit_delay, active_conns);
+    let mut output_consumer = output_consumers.pop().expect("response consumer");
 
     let shutdown = Arc::new(AtomicBool::new(false));
 
@@ -745,6 +754,7 @@ fn run_pipeline_bench(
         &extra_lines,
         json_path,
         &Vec::new(),
+        &[],
     );
 
     println!();
@@ -784,6 +794,7 @@ fn run_roundtrip_bench(
     json_path: Option<&std::path::Path>,
     key_path: Option<&std::path::Path>,
     bench_core_start: Option<usize>,
+    health_addr: Option<std::net::SocketAddr>,
 ) {
     // Remote mode: connect to an external engine, no embedded server.
     if let Some(addr) = remote_addr {
@@ -821,6 +832,7 @@ fn run_roundtrip_bench(
             num_accounts,
             num_instruments,
             bench_core_start,
+            health_addr,
         );
         return;
     }
@@ -854,6 +866,9 @@ fn run_roundtrip_bench(
 
     let shutdown = Arc::new(AtomicBool::new(false));
 
+    // Capture health bind address before config is moved into the server thread.
+    let effective_health_addr = health_addr.or(config.health_bind);
+
     if use_uds {
         use melin_protocol::uds::BlockingUdsListener;
 
@@ -883,6 +898,7 @@ fn run_roundtrip_bench(
             num_accounts,
             num_instruments,
             bench_core_start,
+            effective_health_addr,
         );
     } else {
         use melin_protocol::tcp::BlockingTcpListener;
@@ -914,6 +930,7 @@ fn run_roundtrip_bench(
             num_accounts,
             num_instruments,
             bench_core_start,
+            effective_health_addr,
         );
     }
 
@@ -1283,6 +1300,14 @@ fn run_epoll_loop<W: Write>(
                         let frame = &conn.payload_buf[..conn.payload_len];
                         let response = codec::decode_response(frame).expect("decode response");
 
+                        // ServerBusy = pipeline full, request was not processed.
+                        // Discard the inflight timestamp (no BatchEnd will come).
+                        // Don't retry — the next frame in sequence will be sent
+                        // naturally as the window refills.
+                        if matches!(response, ResponseKind::ServerBusy) {
+                            conn.inflight_ts.pop_front();
+                        }
+
                         if matches!(response, ResponseKind::BatchEnd) {
                             let sent_at = conn.inflight_ts.pop_front().expect(
                                 "inflight timestamp desync: got BatchEnd without matching send",
@@ -1345,6 +1370,7 @@ fn run_roundtrip_inner<R, W, F>(
     num_accounts: u32,
     num_instruments: u32,
     bench_core_start: Option<usize>,
+    health_addr: Option<std::net::SocketAddr>,
 ) where
     R: std::io::Read + std::io::Write + AsRawFd + Send + 'static,
     W: Write + AsRawFd + Send + 'static,
@@ -1368,6 +1394,7 @@ fn run_roundtrip_inner<R, W, F>(
             num_accounts,
             num_instruments,
             bench_core_start,
+            health_addr,
         );
     }
 
@@ -1389,6 +1416,7 @@ fn run_roundtrip_inner<R, W, F>(
             json_path,
             key,
             bench_core_start,
+            health_addr,
         );
     }
 }
@@ -1411,6 +1439,7 @@ fn run_epoll_roundtrip<R, W, F>(
     json_path: Option<&std::path::Path>,
     key: &ed25519_dalek::SigningKey,
     bench_core_start: Option<usize>,
+    health_addr: Option<std::net::SocketAddr>,
 ) where
     R: std::io::Read + std::io::Write + AsRawFd + Send + 'static,
     W: Write + AsRawFd + Send + 'static,
@@ -1537,6 +1566,9 @@ fn run_epoll_roundtrip<R, W, F>(
         handles.push(handle);
     }
 
+    // Start health poller before releasing bench threads.
+    let health_poller = health_addr.map(health_poller::HealthPoller::start);
+
     // Release all threads simultaneously.
     barrier.wait();
     let blast_start = Instant::now();
@@ -1560,6 +1592,9 @@ fn run_epoll_roundtrip<R, W, F>(
     progress_shutdown.store(true, Ordering::Relaxed);
     let _ = progress_handle.join();
 
+    // Collect health samples.
+    let health_samples = health_poller.map(|p| p.stop()).unwrap_or_default();
+
     let end = Instant::now();
     let measured_wall = earliest_measured_start
         .map(|s| end.duration_since(s))
@@ -1582,6 +1617,7 @@ fn run_epoll_roundtrip<R, W, F>(
         &extra_lines,
         json_path,
         &[],
+        &health_samples,
     );
 
     // Signal server shutdown so pipeline threads can clean up and print
@@ -1662,6 +1698,7 @@ fn run_uring_roundtrip<R, W, F>(
     num_accounts: u32,
     num_instruments: u32,
     bench_core_start: Option<usize>,
+    health_addr: Option<std::net::SocketAddr>,
 ) where
     R: std::io::Read + std::io::Write + AsRawFd + Send + 'static,
     W: Write + AsRawFd + Send + 'static,
@@ -1756,6 +1793,9 @@ fn run_uring_roundtrip<R, W, F>(
         Arc::clone(&progress_shutdown),
     );
 
+    // Start health poller before bench threads.
+    let health_poller = health_addr.map(health_poller::HealthPoller::start);
+
     let start = Instant::now();
 
     // Spawn io_uring bench threads, each with its own ring and connection subset.
@@ -1802,6 +1842,9 @@ fn run_uring_roundtrip<R, W, F>(
     progress_shutdown.store(true, Ordering::Relaxed);
     let _ = progress_handle.join();
 
+    // Collect health samples.
+    let health_samples = health_poller.map(|p| p.stop()).unwrap_or_default();
+
     // Measure throughput over the measured phase only — from when the first
     // thread finished warmup until now. This covers all measured orders
     // from all threads without undercounting.
@@ -1837,6 +1880,7 @@ fn run_uring_roundtrip<R, W, F>(
         &extra_lines,
         json_path,
         &all_series,
+        &health_samples,
     );
 
     println!();
@@ -2133,6 +2177,7 @@ fn send_pending<W: Write>(connections: &mut [BenchConnection<W>], window: usize)
 
 /// Print benchmark results: header, throughput, latency histogram.
 /// Optionally writes results to a JSON file for post-processing.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn print_results(
     label: &str,
     measured_orders: usize,
@@ -2142,6 +2187,7 @@ pub(crate) fn print_results(
     extra_lines: &[String],
     json_path: Option<&std::path::Path>,
     series: &[LatencySample],
+    health_samples: &[health_poller::HealthSample],
 ) {
     let throughput = (measured_orders as f64) / wall.as_secs_f64();
     let wall_ms = wall.as_micros() as f64 / 1000.0;
@@ -2188,6 +2234,35 @@ pub(crate) fn print_results(
         threshold *= 10;
     }
     println!("    max:     {:>8.2} µs", histogram.max() as f64 / 1000.0);
+
+    // Print health summary if we have samples.
+    if !health_samples.is_empty() {
+        let duration = health_samples.last().map_or(0.0, |s| s.elapsed_secs)
+            - health_samples.first().map_or(0.0, |s| s.elapsed_secs);
+        let peak_depth = health_samples
+            .iter()
+            .map(|s| s.input_queue_depth)
+            .max()
+            .unwrap_or(0);
+        let capacity = health_samples
+            .iter()
+            .map(|s| s.input_queue_capacity)
+            .max()
+            .unwrap_or(0);
+        let final_events = health_samples.last().map_or(0, |s| s.events_processed);
+        println!();
+        println!(
+            "  Health ({} samples over {duration:.1}s)",
+            health_samples.len()
+        );
+        if capacity > 0 {
+            let pct = peak_depth as f64 / capacity as f64 * 100.0;
+            println!("    peak queue depth: {peak_depth} / {capacity} ({pct:.1}%)");
+        } else {
+            println!("    peak queue depth: {peak_depth}");
+        }
+        println!("    events processed: {final_events}");
+    }
 
     // Write JSON results if requested.
     if let Some(path) = json_path {
@@ -2239,8 +2314,32 @@ pub(crate) fn print_results(
             format!("[{}]", entries.join(","))
         };
 
+        // Serialize health samples.
+        let health_json = if health_samples.is_empty() {
+            String::from("[]")
+        } else {
+            let entries: Vec<String> = health_samples
+                .iter()
+                .map(|s| {
+                    format!(
+                        "{{\"elapsed_secs\":{:.3},\"active_connections\":{},\"events_processed\":{},\"journal_sequence\":{},\"replication_lag\":{},\"input_queue_depth\":{},\"input_queue_capacity\":{},\"pipeline_healthy\":{},\"trading_active\":{}}}",
+                        s.elapsed_secs,
+                        s.active_connections,
+                        s.events_processed,
+                        s.journal_sequence,
+                        s.replication_lag,
+                        s.input_queue_depth,
+                        s.input_queue_capacity,
+                        s.pipeline_healthy,
+                        s.trading_active,
+                    )
+                })
+                .collect();
+            format!("[{}]", entries.join(","))
+        };
+
         let json = format!(
-            "{{\"label\":\"{label}\",\"measured_orders\":{measured_orders},\"warmup_orders\":{warmup_orders},\"wall_ms\":{:.2},\"throughput_ops\":{:.0},\"latency\":{percentiles},\"time_series\":{ts_json}}}",
+            "{{\"label\":\"{label}\",\"measured_orders\":{measured_orders},\"warmup_orders\":{warmup_orders},\"wall_ms\":{:.2},\"throughput_ops\":{:.0},\"latency\":{percentiles},\"time_series\":{ts_json},\"health\":{health_json}}}",
             wall.as_secs_f64() * 1000.0,
             throughput,
         );

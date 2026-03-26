@@ -11,7 +11,7 @@
 use crate::account::{AccountManager, OrderInfo, ReservationSlot};
 use crate::orderbook::OrderBook;
 use crate::types::{
-    AccountId, CircuitBreakerConfig, CurrencyId, ExecutionReport, FeeSchedule, HashMap,
+    AccountId, CircuitBreakerConfig, CurrencyId, ExecutionReport, FeeSchedule, HashMap, HashMap4,
     InstrumentSpec, Order, OrderId, OrderType, Price, Quantity, RejectReason, RiskLimits, Side,
     Symbol,
 };
@@ -62,17 +62,17 @@ pub struct Exchange {
     /// Keyed by the pair because different accounts can independently
     /// use the same OrderId. The `ReservationSlot` enables O(1) Vec-indexed
     /// access to the reservation slab (eliminating a second HashMap lookup).
-    order_info: HashMap<(AccountId, OrderId), OrderInfo>,
+    order_info: HashMap4<(AccountId, OrderId), OrderInfo>,
     /// Per-account high-water mark for order IDs. Rejects submissions
     /// with `order_id <= max_seen[account]` to prevent duplicate execution
     /// on crash-recovery retry. Sparse HashMap: only accounts that have
     /// submitted orders consume memory. Never evicted — prevents order ID
     /// replay after account withdrawal.
-    max_order_id: HashMap<AccountId, u64>,
+    max_order_id: HashMap4<AccountId, u64>,
     /// Per-account count of resting orders (entries in `order_info`).
     /// Used to reject withdrawals while orders are outstanding.
     /// Entries are removed when the count reaches zero.
-    order_counts: HashMap<AccountId, u32>,
+    order_counts: HashMap4<AccountId, u32>,
     /// Per-key high-water mark for request sequences. Prevents duplicate
     /// processing on retry after network failure. Keyed by u64 hash of
     /// the client's Ed25519 public key. Never evicted — key count is
@@ -91,9 +91,9 @@ impl Exchange {
         Self {
             instruments: Vec::new(),
             accounts: AccountManager::new(),
-            order_info: HashMap::default(),
-            max_order_id: HashMap::default(),
-            order_counts: HashMap::default(),
+            order_info: HashMap4::default(),
+            max_order_id: HashMap4::default(),
+            order_counts: HashMap4::default(),
             key_hwm: HashMap::default(),
             consumed_buf: Vec::new(),
             presized: false,
@@ -115,12 +115,12 @@ impl Exchange {
             // Global across all instruments. Typical steady-state: 100
             // instruments × 200 resting orders = 20K entries. 32K slots
             // ≈ 1 MB — fits in L3 cache.
-            order_info: HashMap::with_capacity_and_hasher(32_768, Default::default()),
+            order_info: HashMap4::with_capacity_and_hasher(32_768, Default::default()),
             // 1M accounts × ~32 bytes per entry ≈ 32 MB each. Covers
             // the default benchmark (1M accounts) with no hot-path resizes.
             // Pages are faulted during prefault() via insert/clear.
-            max_order_id: HashMap::with_capacity_and_hasher(1_000_000, Default::default()),
-            order_counts: HashMap::with_capacity_and_hasher(1_000_000, Default::default()),
+            max_order_id: HashMap4::with_capacity_and_hasher(1_000_000, Default::default()),
+            order_counts: HashMap4::with_capacity_and_hasher(1_000_000, Default::default()),
             key_hwm: HashMap::default(),
             consumed_buf: Vec::with_capacity(256),
             presized: true,
@@ -131,13 +131,13 @@ impl Exchange {
     pub(crate) fn from_parts(
         instruments: Vec<Option<Box<InstrumentState>>>,
         accounts: AccountManager,
-        order_info: HashMap<(AccountId, OrderId), OrderInfo>,
-        max_order_id: HashMap<AccountId, u64>,
+        order_info: HashMap4<(AccountId, OrderId), OrderInfo>,
+        max_order_id: HashMap4<AccountId, u64>,
         key_hwm: HashMap<u64, u64>,
     ) -> Self {
         // Derive order_counts from order_info (count entries per account).
-        let mut order_counts: HashMap<AccountId, u32> =
-            HashMap::with_capacity_and_hasher(order_info.len(), Default::default());
+        let mut order_counts: HashMap4<AccountId, u32> =
+            HashMap4::with_capacity_and_hasher(order_info.len(), Default::default());
         for &(account, _) in order_info.keys() {
             *order_counts.entry(account).or_default() += 1;
         }
@@ -613,6 +613,40 @@ impl Exchange {
             let report_start = reports.len();
 
             inst.book.cancel_all_for_account(account, reports);
+
+            let new_reports = &reports[report_start..];
+            self.consumed_buf.clear();
+            self.accounts.process_reports(
+                new_reports,
+                &self.order_info,
+                &spec,
+                &mut self.consumed_buf,
+            );
+
+            for &(account, order_id) in &self.consumed_buf {
+                self.order_info.remove(&(account, order_id));
+                if let Some(count) = self.order_counts.get_mut(&account) {
+                    *count = count.saturating_sub(1);
+                    if *count == 0 {
+                        self.order_counts.remove(&account);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Cancel all resting orders and pending stops with `TimeInForce::Day`
+    /// across all instruments. Called at end-of-session.
+    pub fn end_of_day(&mut self, reports: &mut Vec<ExecutionReport>) {
+        for idx in 0..self.instruments.len() {
+            let Some(inst) = self.instruments[idx].as_deref_mut() else {
+                continue;
+            };
+            let spec = inst.spec;
+
+            let report_start = reports.len();
+
+            inst.book.cancel_day_orders(reports);
 
             let new_reports = &reports[report_start..];
             self.consumed_buf.clear();
@@ -6009,8 +6043,13 @@ mod tests {
             limit_order(2, ACCT_B, Side::Sell, 100, 10, TimeInForce::GTC),
             &mut reports,
         );
-        let fill = reports.iter().find(|r| matches!(r, ExecutionReport::Fill { .. }));
-        assert!(fill.is_some(), "ACCT_A's order should still be resting and fillable");
+        let fill = reports
+            .iter()
+            .find(|r| matches!(r, ExecutionReport::Fill { .. }));
+        assert!(
+            fill.is_some(),
+            "ACCT_A's order should still be resting and fillable"
+        );
     }
 
     #[test]
@@ -6093,7 +6132,11 @@ mod tests {
             .iter()
             .filter(|r| matches!(r, ExecutionReport::Fill { .. }))
             .collect();
-        assert_eq!(fills.len(), 1, "should only fill ACCT_B's order at price 100");
+        assert_eq!(
+            fills.len(),
+            1,
+            "should only fill ACCT_B's order at price 100"
+        );
     }
 
     #[test]
@@ -6155,6 +6198,184 @@ mod tests {
                 order_id: OrderId(1),
                 ..
             } if account == ACCT_B
+        ));
+    }
+
+    // -----------------------------------------------------------------------
+    // Day TIF + EndOfDay
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn day_order_places_on_book() {
+        let mut exchange = Exchange::new();
+        let btc = Symbol(1);
+        exchange.add_instrument(btc_usd_spec());
+        exchange.deposit(ACCT_A, USD, 10_000);
+
+        let mut reports = Vec::new();
+        exchange.execute(
+            btc,
+            limit_order(1, ACCT_A, Side::Buy, 100, 10, TimeInForce::Day),
+            &mut reports,
+        );
+        assert!(matches!(reports[0], ExecutionReport::Placed { .. }));
+        assert_eq!(exchange.accounts().balance(ACCT_A, USD).reserved, 1_000);
+    }
+
+    #[test]
+    fn end_of_day_cancels_day_orders_not_gtc() {
+        let mut exchange = Exchange::new();
+        let btc = Symbol(1);
+        exchange.add_instrument(btc_usd_spec());
+        exchange.deposit(ACCT_A, USD, 20_000);
+        exchange.deposit(ACCT_B, USD, 20_000);
+
+        let mut reports = Vec::new();
+
+        // ACCT_A: Day order.
+        exchange.execute(
+            btc,
+            limit_order(1, ACCT_A, Side::Buy, 100, 10, TimeInForce::Day),
+            &mut reports,
+        );
+        reports.clear();
+
+        // ACCT_B: GTC order at the same price.
+        exchange.execute(
+            btc,
+            limit_order(1, ACCT_B, Side::Buy, 100, 5, TimeInForce::GTC),
+            &mut reports,
+        );
+        reports.clear();
+
+        // EndOfDay should cancel ACCT_A's Day order but not ACCT_B's GTC.
+        exchange.end_of_day(&mut reports);
+        assert_eq!(reports.len(), 1);
+        assert!(matches!(
+            reports[0],
+            ExecutionReport::Cancelled {
+                account,
+                order_id: OrderId(1),
+                ..
+            } if account == ACCT_A
+        ));
+
+        // ACCT_A's balance fully released, ACCT_B's still reserved.
+        assert_eq!(exchange.accounts().balance(ACCT_A, USD).reserved, 0);
+        assert_eq!(exchange.accounts().balance(ACCT_A, USD).available, 20_000);
+        assert_eq!(exchange.accounts().balance(ACCT_B, USD).reserved, 500);
+    }
+
+    #[test]
+    fn end_of_day_on_empty_book_is_noop() {
+        let mut exchange = Exchange::new();
+        exchange.add_instrument(btc_usd_spec());
+
+        let mut reports = Vec::new();
+        exchange.end_of_day(&mut reports);
+        assert!(reports.is_empty());
+    }
+
+    #[test]
+    fn day_order_partially_fills_then_cancelled_at_eod() {
+        let mut exchange = Exchange::new();
+        let btc = Symbol(1);
+        exchange.add_instrument(btc_usd_spec());
+        exchange.deposit(ACCT_A, USD, 10_000);
+        exchange.deposit(ACCT_B, BTC, 100);
+
+        let mut reports = Vec::new();
+
+        // ACCT_A: Day buy limit @ 100, qty 10.
+        exchange.execute(
+            btc,
+            limit_order(1, ACCT_A, Side::Buy, 100, 10, TimeInForce::Day),
+            &mut reports,
+        );
+        reports.clear();
+
+        // ACCT_B: sell 3, partially filling the Day order.
+        exchange.execute(
+            btc,
+            limit_order(1, ACCT_B, Side::Sell, 100, 3, TimeInForce::IOC),
+            &mut reports,
+        );
+        let fills: Vec<_> = reports
+            .iter()
+            .filter(|r| matches!(r, ExecutionReport::Fill { .. }))
+            .collect();
+        assert_eq!(fills.len(), 1);
+        reports.clear();
+
+        // EndOfDay cancels the remaining 7.
+        exchange.end_of_day(&mut reports);
+        assert_eq!(reports.len(), 1);
+        assert!(matches!(
+            reports[0],
+            ExecutionReport::Cancelled {
+                remaining_quantity,
+                ..
+            } if remaining_quantity.get() == 7
+        ));
+
+        // All reservations released.
+        assert_eq!(exchange.accounts().balance(ACCT_A, USD).reserved, 0);
+    }
+
+    #[test]
+    fn end_of_day_cancels_day_stop_orders() {
+        let mut exchange = Exchange::new();
+        let btc = Symbol(1);
+        exchange.add_instrument(btc_usd_spec());
+        exchange.deposit(ACCT_A, USD, 100_000);
+
+        let mut reports = Vec::new();
+
+        // Day stop order.
+        exchange.execute(
+            btc,
+            Order {
+                id: OrderId(1),
+                account: ACCT_A,
+                side: Side::Buy,
+                order_type: OrderType::Stop {
+                    trigger_price: price(200),
+                },
+                time_in_force: TimeInForce::Day,
+                quantity: qty(10),
+                stp: SelfTradeProtection::Allow,
+            },
+            &mut reports,
+        );
+        reports.clear();
+
+        // GTC stop order.
+        exchange.execute(
+            btc,
+            Order {
+                id: OrderId(2),
+                account: ACCT_A,
+                side: Side::Buy,
+                order_type: OrderType::Stop {
+                    trigger_price: price(200),
+                },
+                time_in_force: TimeInForce::GTC,
+                quantity: qty(5),
+                stp: SelfTradeProtection::Allow,
+            },
+            &mut reports,
+        );
+        reports.clear();
+
+        // EndOfDay cancels only the Day stop.
+        exchange.end_of_day(&mut reports);
+        assert_eq!(reports.len(), 1);
+        assert!(matches!(
+            reports[0],
+            ExecutionReport::Cancelled {
+                order_id: OrderId(1),
+                ..
+            }
         ));
     }
 }

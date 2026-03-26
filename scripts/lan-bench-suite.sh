@@ -33,6 +33,7 @@
 #   RUN_PLOTS=0|1        Generate plots from results
 #   RESULTS_DIR=<path>   Reuse existing results directory (e.g. for re-plotting)
 #   BENCH_BRANCH=<ref>   Checkout a specific branch on all machines
+#   BENCH_COMMIT=<hash>  Checkout a specific commit on all machines (mutually exclusive with BENCH_BRANCH)
 #
 # Prerequisites:
 #   - Same as lan-bench.sh (SSH access, cherry-deploy.sh setup, VLAN)
@@ -90,12 +91,22 @@ echo ""
 # ---------------------------------------------------------------------------
 # Build both binaries upfront (release + no-persist variant)
 # ---------------------------------------------------------------------------
-# BENCH_BRANCH env var: checkout a specific branch on all machines.
-# Usage: BENCH_BRANCH=feat/replication ./scripts/lan-bench-suite.sh ...
+# BENCH_BRANCH: checkout a specific branch on all machines.
+# BENCH_COMMIT: checkout a specific commit hash on all machines.
+# Only one may be specified.
+if [[ -n "${BENCH_BRANCH:-}" && -n "${BENCH_COMMIT:-}" ]]; then
+    echo "error: BENCH_BRANCH and BENCH_COMMIT are mutually exclusive" >&2
+    exit 1
+fi
+
 GIT_CMD="git pull --ff-only"
 if [[ -n "${BENCH_BRANCH:-}" ]]; then
     GIT_CMD="git fetch origin && git checkout ${BENCH_BRANCH} && git reset --hard origin/${BENCH_BRANCH}"
     echo "=== Using branch: ${BENCH_BRANCH} ==="
+    echo ""
+elif [[ -n "${BENCH_COMMIT:-}" ]]; then
+    GIT_CMD="git fetch origin && git checkout ${BENCH_COMMIT}"
+    echo "=== Using commit: ${BENCH_COMMIT} ==="
     echo ""
 fi
 
@@ -123,12 +134,12 @@ echo "=== Setting up auth keys ==="
 ssh $SSH_OPTS "$BENCH" "cd ${REPO_DIR} && \
     if [[ ! -f bench.key ]]; then \
         source ~/.cargo/env && \
-        cargo run --release -p melin-admin --bin melin-keygen -- bench admin && \
+        cargo run --release -p melin-admin --bin melin-keygen -- bench trader && \
         echo 'Generated bench.key'; \
     else \
         echo 'bench.key already exists'; \
     fi"
-AUTH_LINE=$(ssh $SSH_OPTS "$BENCH" "cd ${REPO_DIR} && cat bench.pub | xargs -I{} echo 'admin {} bench'")
+AUTH_LINE=$(ssh $SSH_OPTS "$BENCH" "cd ${REPO_DIR} && cat bench.pub | xargs -I{} echo 'trader {} bench'")
 ssh $SSH_OPTS "$SERVER" "cd ${REPO_DIR} && echo '${AUTH_LINE}' > authorized_keys"
 echo "  Auth keys configured."
 echo ""
@@ -402,6 +413,7 @@ echo "    Pinned ${pinned} IRQs to core 0 (${failed} unchanged)"'
     sleep 1
     ssh $SSH_OPTS "$SERVER" "RUST_LOG=info nohup ${REPO_DIR}/target/release/melin-server \
             --bind ${SERVER_VLAN}:9876 \
+            --health-bind ${SERVER_VLAN}:9878 \
             --journal ${JOURNAL_PATH} \
             --authorized-keys ${REPO_DIR}/authorized_keys \
             --replication-bind ${SERVER_VLAN}:${REPL_PORT} \
@@ -450,6 +462,7 @@ echo "    Pinned ${pinned} IRQs to core 0 (${failed} unchanged)"'
     ssh $SSH_OPTS "$BENCH" "cd ${REPO_DIR} && source ~/.cargo/env && \
         ./target/release/melin-bench \
             --addr ${SERVER_VLAN}:9876 \
+            --health-addr ${SERVER_VLAN}:9878 \
             --key bench.key \
             --json /tmp/bench-results.json \
             --bench-cores 1 \
@@ -520,6 +533,17 @@ if command -v cargo &>/dev/null && [[ -f "$(dirname "$0")/../crates/bench/src/pl
         if [[ -f "${RESULTS_DIR}/${f}.json" ]]; then
             echo "  Generating latency stability: ${label}..."
             "${PLOT_TOOL}" stability -o "${PLOT_DIR}/latency-stability-${label}.svg" \
+                "${RESULTS_DIR}/${f}.json" 2>&1
+        fi
+    done
+
+    # Server health metrics over time — one set of plots per mode.
+    for f_label in "1-fsync:fsync" "2-no-persist:no-persist" "4-replication:replication"; do
+        f="${f_label%%:*}"
+        label="${f_label##*:}"
+        if [[ -f "${RESULTS_DIR}/${f}.json" ]]; then
+            echo "  Generating health plots: ${label}..."
+            "${PLOT_TOOL}" health -o "${PLOT_DIR}/health-${label}" \
                 "${RESULTS_DIR}/${f}.json" 2>&1
         fi
     done

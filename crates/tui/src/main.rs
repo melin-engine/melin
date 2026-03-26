@@ -488,6 +488,7 @@ fn format_report(report: &ExecutionReport) -> String {
                 RejectReason::PostOnlyWouldCross => "post-only would cross",
                 RejectReason::HasRestingOrders => "has resting orders",
                 RejectReason::DuplicateRequest => "duplicate request",
+                RejectReason::ReplicaDisconnected => "replica disconnected",
             };
             format!("REJECT  #{} ({reason_str})", order_id.0)
         }
@@ -536,6 +537,7 @@ fn client_thread(
                     let msg = match resp {
                         ResponseKind::Report(report) => format_report(report),
                         ResponseKind::EngineError => "ENGINE ERROR".into(),
+                        ResponseKind::ServerBusy => "SERVER BUSY (pipeline full)".into(),
                         ResponseKind::BatchEnd
                         | ResponseKind::ServerReady
                         | ResponseKind::Heartbeat

@@ -25,6 +25,8 @@ pub enum ClientError {
     /// Server rejected the Ed25519 challenge-response authentication
     /// (unknown key, invalid signature, or wrong key permissions).
     AuthFailed,
+    /// Server pipeline is full. The caller should retry after a brief backoff.
+    ServerBusy,
 }
 
 impl std::fmt::Display for ClientError {
@@ -34,6 +36,7 @@ impl std::fmt::Display for ClientError {
             Self::Protocol(e) => write!(f, "protocol error: {e}"),
             Self::Disconnected => write!(f, "disconnected from server"),
             Self::AuthFailed => write!(f, "authentication failed"),
+            Self::ServerBusy => write!(f, "server busy (pipeline full), retry after backoff"),
         }
     }
 }
@@ -152,6 +155,9 @@ impl Client {
             match response {
                 ResponseKind::BatchEnd => break,
                 ResponseKind::Heartbeat | ResponseKind::ServerReady => continue,
+                ResponseKind::ServerBusy => {
+                    return Err(ClientError::ServerBusy);
+                }
                 other => responses.push(other),
             }
         }

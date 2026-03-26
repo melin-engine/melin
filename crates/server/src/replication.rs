@@ -325,6 +325,7 @@ pub fn run_sender(
     genesis_entry: Vec<u8>,
     shutdown: &AtomicBool,
     replica_ready: &AtomicBool,
+    replica_connected: &AtomicBool,
     batch_size: usize,
     heartbeat_secs: u64,
     busy_spin: bool,
@@ -357,6 +358,8 @@ pub fn run_sender(
                 // Signal that a replica is connected — unblocks seed event
                 // publishing in the main thread.
                 replica_ready.store(true, Ordering::Release);
+                // Resume trading — matching stage will stop rejecting events.
+                replica_connected.store(true, Ordering::Release);
                 stream
             }
             Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
@@ -398,7 +401,10 @@ pub fn run_sender(
 
         // On disconnect, set cursor to u64::MAX to degrade to local-only.
         replication_cursor.store(u64::MAX, Ordering::Release);
-        warn!("replica disconnected — degraded to local-only durability");
+        // Halt trading — matching stage will reject all mutations until
+        // the replica reconnects.
+        replica_connected.store(false, Ordering::Release);
+        warn!("replica disconnected — trading halted, waiting for reconnect");
     }
 }
 
@@ -616,11 +622,22 @@ fn process_acks(
 /// entries, persists them locally, replays into the Exchange, and sends acks.
 ///
 /// Blocks until the connection drops or shutdown is signaled.
+/// Result of `run_receiver`: `None` = clean shutdown, `Some` = promotion
+/// triggered with the fully-replayed Exchange and positioned JournalWriter.
+pub type ReceiverResult = Result<
+    Option<(
+        melin_engine::exchange::Exchange,
+        melin_engine::journal::writer::JournalWriter,
+    )>,
+    Box<dyn std::error::Error>,
+>;
+
 pub fn run_receiver(
     primary_addr: SocketAddr,
     journal_path: &std::path::Path,
     shutdown: &AtomicBool,
-) -> Result<(), Box<dyn std::error::Error>> {
+    promote: &AtomicBool,
+) -> ReceiverResult {
     use melin_engine::exchange::Exchange;
     use melin_engine::journal::writer::JournalWriter;
 
@@ -747,7 +764,47 @@ pub fn run_receiver(
     loop {
         if shutdown.load(Ordering::Relaxed) {
             info!("replica shutting down");
-            return Ok(());
+            return Ok(None);
+        }
+
+        if promote.load(Ordering::Acquire) {
+            info!("promotion triggered — stopping replication, transitioning to primary");
+            // Drain any remaining data already in the TCP buffer to
+            // maximize data freshness before promotion.
+            let mut rpollfd = libc::pollfd {
+                fd: reader.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            loop {
+                rpollfd.revents = 0;
+                let ready = (unsafe { libc::poll(&mut rpollfd, 1, 0) }) > 0
+                    && (rpollfd.revents & libc::POLLIN) != 0;
+                if !ready {
+                    break;
+                }
+                if read_frame_into(&mut reader, &mut frame_buf, MAX_DATA_FRAME).is_err() {
+                    break;
+                }
+                match decode_primary_message(&frame_buf) {
+                    Ok(PrimaryMessage::DataBatch {
+                        entry_count,
+                        journal_bytes,
+                        ..
+                    }) => {
+                        journal_accum.extend_from_slice(&journal_bytes);
+                        accum_entry_count += entry_count as u64;
+                    }
+                    _ => break,
+                }
+            }
+            // Fsync any accumulated data.
+            if !journal_accum.is_empty() {
+                journal_writer.write_raw_sync(&journal_accum, accum_entry_count)?;
+                replay_journal_bytes(&journal_accum, &mut exchange, &mut reports)?;
+                journal_accum.clear();
+            }
+            return Ok(Some((exchange, journal_writer)));
         }
 
         // Read the first frame (blocking, with the 5s timeout for
@@ -922,6 +979,9 @@ fn replay_event(
         }
         JournalEvent::CancelAll { account } => {
             exchange.cancel_all(*account, reports);
+        }
+        JournalEvent::EndOfDay => {
+            exchange.end_of_day(reports);
         }
         JournalEvent::SetCircuitBreaker { symbol, config } => {
             exchange.set_circuit_breaker(*symbol, *config);

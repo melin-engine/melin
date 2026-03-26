@@ -1,0 +1,502 @@
+//! Event publisher — broadcasts all execution events to TCP subscribers.
+//!
+//! Consumes from the output disruptor ring (consumer 1) and writes
+//! every event to all connected subscribers. This provides a firehose
+//! stream for market data gateways, analytics services, and audit loggers.
+//!
+//! Wire format per frame:
+//! ```text
+//! | sequence (u64 LE) | length (u32 LE) | tag (u8) | payload (var) |
+//! ```
+//! The sequence number is the output ring's monotonic sequence for gap
+//! detection by subscribers. The rest is the standard response codec
+//! from `crates/protocol/src/codec.rs`.
+//!
+//! Slow subscriber policy: if a TCP write returns `WouldBlock`, the subscriber
+//! is disconnected immediately. The publisher must never block on a slow client.
+//!
+//! Ed25519 challenge-response auth is required (ReadOnly permission or above).
+
+use std::io::{self, Write};
+use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+
+use tracing::{debug, error, info, warn};
+
+use melin_disruptor::ring;
+use melin_engine::journal::pipeline::{OutputPayload, OutputSlot};
+use melin_protocol::auth::AuthorizedKeys;
+use melin_protocol::codec;
+use melin_protocol::message::ResponseKind;
+
+/// Maximum number of output slots consumed per batch.
+const MAX_BATCH: usize = 1024;
+
+/// Maximum encoded frame size: 8 (sequence) + 128 (response) = 136 bytes.
+const MAX_FRAME_BUF: usize = 136;
+
+/// Per-subscriber state.
+struct Subscriber {
+    stream: TcpStream,
+    addr: SocketAddr,
+}
+
+/// Convert an `OutputPayload` to the wire `ResponseKind`.
+fn payload_to_response(payload: OutputPayload) -> ResponseKind {
+    match payload {
+        OutputPayload::Report(report) => ResponseKind::Report(report),
+        OutputPayload::BatchEnd => ResponseKind::BatchEnd,
+        OutputPayload::EngineError => ResponseKind::EngineError,
+        OutputPayload::StatsHeader {
+            active_connections,
+            events_processed,
+            journal_sequence,
+        } => ResponseKind::StatsHeader {
+            active_connections,
+            events_processed,
+            journal_sequence,
+        },
+    }
+}
+
+/// Run the event publisher loop. Blocks the calling thread until shutdown.
+///
+/// Binds a TCP listener, accepts subscribers with Ed25519 auth, and
+/// broadcasts all output ring events to every connected subscriber.
+pub fn run(
+    mut consumer: ring::Consumer<OutputSlot>,
+    bind_addr: SocketAddr,
+    authorized_keys: Arc<AuthorizedKeys>,
+    shutdown: &AtomicBool,
+    busy_spin: bool,
+) {
+    let listener = match TcpListener::bind(bind_addr) {
+        Ok(l) => l,
+        Err(e) => {
+            error!(addr = %bind_addr, error = %e, "event publisher: failed to bind");
+            return;
+        }
+    };
+    // Non-blocking accept so we can interleave ring consumption.
+    listener
+        .set_nonblocking(true)
+        .expect("set listener non-blocking");
+
+    // Active subscribers. Vec is fine — we expect few subscribers (< 10)
+    // and linear scan on each event is cheaper than HashMap overhead.
+    let mut subscribers: Vec<Subscriber> = Vec::new();
+
+    let mut batch = [OutputSlot::default(); MAX_BATCH];
+    let mut frame_buf = [0u8; MAX_FRAME_BUF];
+    let mut idle_spins: u32 = 0;
+
+    while !shutdown.load(Ordering::Relaxed) {
+        // Accept new connections (non-blocking).
+        accept_subscribers(&listener, &authorized_keys, &mut subscribers);
+
+        // Consume from the ring. Track the starting sequence before the
+        // batch read so we can stamp each frame with its ring sequence.
+        let batch_start_seq = consumer.next_read();
+        let count = consumer.consume_batch(&mut batch, MAX_BATCH);
+        if count == 0 {
+            // No events — yield or spin depending on mode.
+            if busy_spin || idle_spins < 1000 {
+                idle_spins = idle_spins.wrapping_add(1);
+                std::hint::spin_loop();
+            } else {
+                std::thread::yield_now();
+            }
+            continue;
+        }
+        idle_spins = 0;
+
+        // Broadcast each event to all subscribers.
+        for (idx, slot) in batch[..count].iter().enumerate() {
+            let kind = payload_to_response(slot.payload);
+            // Encode: 8-byte ring sequence prefix + standard response frame.
+            // The ring sequence is monotonically increasing and gap-free,
+            // allowing subscribers to detect missed events.
+            let ring_seq = batch_start_seq + idx as u64;
+            frame_buf[..8].copy_from_slice(&ring_seq.to_le_bytes());
+            let response_len = match codec::encode_response(&kind, &mut frame_buf[8..]) {
+                Ok(n) => n,
+                Err(e) => {
+                    debug!(error = %e, "event publisher: encode failed, skipping");
+                    continue;
+                }
+            };
+            let total_len = 8 + response_len;
+            let frame = &frame_buf[..total_len];
+
+            // Write to all subscribers, removing failed ones via retain.
+            // retain iterates once without allocation — better than collecting
+            // indices into a Vec on every event.
+            subscribers.retain_mut(|sub| match sub.stream.write_all(frame) {
+                Ok(()) => true,
+                Err(e) => {
+                    if e.kind() == io::ErrorKind::WouldBlock {
+                        debug!(addr = %sub.addr, "event subscriber too slow, disconnecting");
+                    } else {
+                        debug!(addr = %sub.addr, error = %e, "event subscriber write error");
+                    }
+                    false
+                }
+            });
+        }
+    }
+
+    info!(
+        subscribers = subscribers.len(),
+        "event publisher shutting down"
+    );
+}
+
+/// Accept pending connections, authenticate them, and add to subscribers.
+fn accept_subscribers(
+    listener: &TcpListener,
+    authorized_keys: &AuthorizedKeys,
+    subscribers: &mut Vec<Subscriber>,
+) {
+    loop {
+        match listener.accept() {
+            Ok((stream, addr)) => {
+                match authenticate_subscriber(&stream, addr, authorized_keys) {
+                    Ok(()) => {
+                        // Set non-blocking for the data path — slow subscribers
+                        // get disconnected on WouldBlock rather than blocking
+                        // the publisher.
+                        if let Err(e) = stream.set_nonblocking(true) {
+                            debug!(addr = %addr, error = %e, "failed to set non-blocking");
+                            continue;
+                        }
+                        info!(addr = %addr, "event subscriber connected");
+                        subscribers.push(Subscriber { stream, addr });
+                    }
+                    Err(e) => {
+                        debug!(addr = %addr, error = %e, "event subscriber auth failed");
+                    }
+                }
+            }
+            Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => break,
+            Err(e) => {
+                warn!(error = %e, "event publisher: accept error");
+                break;
+            }
+        }
+    }
+}
+
+/// Run Ed25519 challenge-response authentication on a subscriber connection.
+///
+/// Reuses the same protocol as `server.rs` — Challenge/ChallengeResponse/ServerReady.
+/// Accepts any permission level (ReadOnly or above). Blocks briefly during
+/// handshake (cold path, before setting non-blocking for data).
+fn authenticate_subscriber(
+    stream: &TcpStream,
+    addr: SocketAddr,
+    authorized_keys: &AuthorizedKeys,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use ed25519_dalek::{Verifier, VerifyingKey};
+    use melin_protocol::message::Request;
+
+    // Set a read timeout for the auth handshake to prevent slow clients
+    // from stalling the publisher.
+    stream.set_read_timeout(Some(std::time::Duration::from_secs(5)))?;
+    stream.set_nonblocking(false)?;
+
+    // Clone the stream so we have separate read and write handles.
+    // The underlying fd is shared — both clones refer to the same socket.
+    let mut write_stream = stream.try_clone()?;
+    let mut read_stream = stream;
+
+    // Generate a 32-byte random nonce (OsRng, SEC-10).
+    let mut nonce = [0u8; 32];
+    getrandom::fill(&mut nonce).map_err(|e| io::Error::other(format!("getrandom failed: {e}")))?;
+
+    // Send Challenge.
+    let mut buf = [0u8; 64];
+    let written = codec::encode_response(&ResponseKind::Challenge { nonce }, &mut buf)
+        .map_err(|e| io::Error::other(format!("encode Challenge: {e}")))?;
+    write_stream.write_all(&buf[..written])?;
+    write_stream.flush()?;
+
+    // Read ChallengeResponse frame.
+    let mut len_buf = [0u8; 4];
+    io::Read::read_exact(&mut read_stream, &mut len_buf)?;
+    let frame_len = u32::from_le_bytes(len_buf) as usize;
+    if frame_len > 256 {
+        send_auth_failed(&mut write_stream);
+        return Err(io::Error::other(format!("auth frame too large: {frame_len}")).into());
+    }
+    let mut frame_buf = [0u8; 256];
+    io::Read::read_exact(&mut read_stream, &mut frame_buf[..frame_len])?;
+
+    let (_seq, request) = match codec::decode_request(&frame_buf[..frame_len]) {
+        Ok(pair) => pair,
+        Err(e) => {
+            send_auth_failed(&mut write_stream);
+            return Err(io::Error::other(format!("decode ChallengeResponse: {e}")).into());
+        }
+    };
+
+    let (signature_bytes, public_key_bytes) = match request {
+        Request::ChallengeResponse {
+            signature,
+            public_key,
+        } => (signature, public_key),
+        other => {
+            send_auth_failed(&mut write_stream);
+            return Err(format!(
+                "expected ChallengeResponse, got {:?}",
+                std::mem::discriminant(&other)
+            )
+            .into());
+        }
+    };
+
+    // Look up the public key in authorized_keys.
+    let _permission = match authorized_keys.lookup(&public_key_bytes) {
+        Some(perm) => perm,
+        None => {
+            send_auth_failed(&mut write_stream);
+            return Err("unknown public key".into());
+        }
+    };
+
+    // Verify the Ed25519 signature over the nonce.
+    let verifying_key = VerifyingKey::from_bytes(&public_key_bytes).map_err(|e| {
+        send_auth_failed(&mut write_stream);
+        io::Error::other(format!("invalid public key: {e}"))
+    })?;
+    let signature = ed25519_dalek::Signature::from_bytes(&signature_bytes);
+    verifying_key.verify(&nonce, &signature).map_err(|e| {
+        send_auth_failed(&mut write_stream);
+        io::Error::other(format!("signature verification failed: {e}"))
+    })?;
+
+    // Auth succeeded — send ServerReady.
+    let written = codec::encode_response(&ResponseKind::ServerReady, &mut buf)
+        .map_err(|e| io::Error::other(format!("encode ServerReady: {e}")))?;
+    write_stream.write_all(&buf[..written])?;
+    write_stream.flush()?;
+
+    debug!(addr = %addr, "event subscriber authenticated");
+    Ok(())
+}
+
+/// Best-effort send of AuthFailed to the client.
+fn send_auth_failed(writer: &mut dyn Write) {
+    let mut buf = [0u8; 8];
+    if let Ok(n) = codec::encode_response(&ResponseKind::AuthFailed, &mut buf) {
+        let _ = writer.write_all(&buf[..n]);
+        let _ = writer.flush();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use melin_engine::journal::pipeline::OutputSlot;
+    use melin_engine::types::*;
+
+    #[test]
+    fn frame_encoding_with_sequence_prefix() {
+        // Test the frame wire format: u64 ring sequence + standard response.
+        let kind = payload_to_response(OutputPayload::Report(ExecutionReport::Placed {
+            order_id: OrderId(100),
+            side: Side::Buy,
+            price: Price(std::num::NonZeroU64::new(100).unwrap()),
+            quantity: Quantity(std::num::NonZeroU64::new(50).unwrap()),
+        }));
+
+        let ring_seq: u64 = 42;
+        let mut buf = [0u8; MAX_FRAME_BUF];
+        buf[..8].copy_from_slice(&ring_seq.to_le_bytes());
+        let response_len = codec::encode_response(&kind, &mut buf[8..]).unwrap();
+        let total_len = 8 + response_len;
+
+        // Verify sequence prefix.
+        let decoded_seq = u64::from_le_bytes(buf[..8].try_into().unwrap());
+        assert_eq!(decoded_seq, 42);
+
+        // Verify the response portion decodes correctly.
+        // Skip the 8-byte sequence prefix, then read the 4-byte length prefix.
+        let len = u32::from_le_bytes(buf[8..12].try_into().unwrap()) as usize;
+        let decoded = codec::decode_response(&buf[12..12 + len]).unwrap();
+        assert!(matches!(
+            decoded,
+            ResponseKind::Report(ExecutionReport::Placed {
+                order_id: OrderId(100),
+                ..
+            })
+        ));
+
+        // Total frame size is reasonable.
+        assert!(total_len <= MAX_FRAME_BUF);
+        assert!(total_len > 8); // at least sequence + some response
+    }
+
+    #[test]
+    fn payload_to_response_all_variants() {
+        // Report
+        let r = payload_to_response(OutputPayload::Report(ExecutionReport::Placed {
+            order_id: OrderId(1),
+            side: Side::Buy,
+            price: Price(std::num::NonZeroU64::new(50).unwrap()),
+            quantity: Quantity(std::num::NonZeroU64::new(10).unwrap()),
+        }));
+        assert!(matches!(r, ResponseKind::Report(_)));
+
+        // BatchEnd
+        let r = payload_to_response(OutputPayload::BatchEnd);
+        assert!(matches!(r, ResponseKind::BatchEnd));
+
+        // EngineError
+        let r = payload_to_response(OutputPayload::EngineError);
+        assert!(matches!(r, ResponseKind::EngineError));
+
+        // StatsHeader
+        let r = payload_to_response(OutputPayload::StatsHeader {
+            active_connections: 5,
+            events_processed: 1000,
+            journal_sequence: 500,
+        });
+        assert!(matches!(r, ResponseKind::StatsHeader { .. }));
+    }
+
+    #[test]
+    fn slow_subscriber_disconnected() {
+        // Simulate a slow subscriber by creating a TCP pair where the
+        // reader never reads, causing the writer's send buffer to fill.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let _client = TcpStream::connect(addr).unwrap();
+        let (server_stream, client_addr) = listener.accept().unwrap();
+        server_stream.set_nonblocking(true).unwrap();
+
+        // Set a tiny send buffer to trigger WouldBlock quickly.
+        // On Linux, minimum is typically 2304 bytes.
+        unsafe {
+            let size: libc::c_int = 1;
+            libc::setsockopt(
+                std::os::unix::io::AsRawFd::as_raw_fd(&server_stream),
+                libc::SOL_SOCKET,
+                libc::SO_SNDBUF,
+                &size as *const _ as *const libc::c_void,
+                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+            );
+        }
+
+        let mut sub = Subscriber {
+            stream: server_stream,
+            addr: client_addr,
+        };
+
+        // Write large frames until we get WouldBlock.
+        let frame = [0u8; 4096];
+        let mut got_error = false;
+        for _ in 0..1000 {
+            if sub.stream.write_all(&frame).is_err() {
+                got_error = true;
+                break;
+            }
+        }
+        assert!(got_error, "expected WouldBlock from slow subscriber");
+    }
+
+    #[test]
+    fn multiple_subscribers_receive_same_frame() {
+        // Two subscribers should receive identical frames.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let mut client1 = TcpStream::connect(addr).unwrap();
+        let (server1, addr1) = listener.accept().unwrap();
+        server1.set_nonblocking(true).unwrap();
+
+        let mut client2 = TcpStream::connect(addr).unwrap();
+        let (server2, addr2) = listener.accept().unwrap();
+        server2.set_nonblocking(true).unwrap();
+
+        let mut subscribers = vec![
+            Subscriber {
+                stream: server1,
+                addr: addr1,
+            },
+            Subscriber {
+                stream: server2,
+                addr: addr2,
+            },
+        ];
+
+        // Write a frame to both.
+        let kind = payload_to_response(OutputPayload::BatchEnd);
+        let mut frame_buf = [0u8; MAX_FRAME_BUF];
+        let ring_seq: u64 = 7;
+        frame_buf[..8].copy_from_slice(&ring_seq.to_le_bytes());
+        let response_len = codec::encode_response(&kind, &mut frame_buf[8..]).unwrap();
+        let total_len = 8 + response_len;
+        let frame = &frame_buf[..total_len];
+
+        for sub in &mut subscribers {
+            sub.stream.write_all(frame).unwrap();
+        }
+
+        // Both clients should receive the same bytes.
+        client1
+            .set_read_timeout(Some(std::time::Duration::from_secs(1)))
+            .unwrap();
+        client2
+            .set_read_timeout(Some(std::time::Duration::from_secs(1)))
+            .unwrap();
+
+        let mut buf1 = [0u8; 64];
+        let mut buf2 = [0u8; 64];
+        let n1 = io::Read::read(&mut client1, &mut buf1).unwrap();
+        let n2 = io::Read::read(&mut client2, &mut buf2).unwrap();
+
+        assert_eq!(n1, total_len);
+        assert_eq!(n2, total_len);
+        assert_eq!(&buf1[..n1], &buf2[..n2]);
+
+        // Verify sequence in both.
+        let seq1 = u64::from_le_bytes(buf1[..8].try_into().unwrap());
+        let seq2 = u64::from_le_bytes(buf2[..8].try_into().unwrap());
+        assert_eq!(seq1, 7);
+        assert_eq!(seq2, 7);
+    }
+
+    #[test]
+    fn shutdown_stops_publisher() {
+        use melin_protocol::auth::AuthorizedKeys;
+
+        let (_, consumer) = ring::DisruptorBuilder::<OutputSlot>::new(64)
+            .add_consumer()
+            .build();
+        let consumer = consumer.into_iter().next().unwrap();
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener);
+
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let shutdown2 = Arc::clone(&shutdown);
+
+        let keys = Arc::new(AuthorizedKeys::parse("").unwrap());
+        let handle = std::thread::Builder::new()
+            .name("test-publisher".into())
+            .spawn(move || {
+                run(consumer, addr, keys, &shutdown2, false);
+            })
+            .unwrap();
+
+        // Give it a moment to start, then signal shutdown.
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        shutdown.store(true, Ordering::Relaxed);
+
+        // Should exit promptly.
+        handle.join().unwrap();
+    }
+}

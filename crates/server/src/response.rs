@@ -1,6 +1,6 @@
 //! Response stage — routes matching output directly to connection sockets.
 //!
-//! Consumes from the output SPSC queue (matching → response) and writes
+//! Consumes from the output disruptor ring (matching → response) and writes
 //! encoded responses directly to each connection's blocking socket writer.
 //! Before sending, waits for the journal cursor to confirm durability —
 //! this is the persist-before-ack boundary.
@@ -16,7 +16,7 @@ use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 use melin_disruptor::padding::Sequence;
-use melin_disruptor::spsc;
+use melin_disruptor::ring;
 
 use melin_engine::journal::pipeline::{OutputPayload, OutputSlot};
 #[cfg(feature = "latency-trace")]
@@ -60,7 +60,7 @@ struct ConnectionState {
 
 /// Run the response stage loop. Blocks the calling thread until shutdown.
 ///
-/// Consumes from the output SPSC and writes encoded responses directly
+/// Consumes from the output ring and writes encoded responses directly
 /// to each connection's socket. For each output slot, waits until both
 /// the journal cursor and replication cursor have advanced past `input_seq`
 /// before writing — ensuring the client never receives a response for an
@@ -69,7 +69,7 @@ struct ConnectionState {
 /// When replication is disabled (standalone mode), `replication_cursor` is
 /// initialized to `u64::MAX` so `min(journal, MAX) = journal`.
 pub fn run(
-    mut consumer: spsc::Consumer<OutputSlot>,
+    mut consumer: ring::Consumer<OutputSlot>,
     control_rx: mpsc::Receiver<ControlEvent>,
     journal_cursor: Arc<Sequence>,
     replication_cursor: Arc<AtomicU64>,

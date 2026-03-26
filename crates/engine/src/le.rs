@@ -86,12 +86,13 @@ pub fn decode_side(b: u8) -> Option<Side> {
     }
 }
 
-/// TimeInForce encoding: GTC=0, IOC=1, FOK=2.
+/// TimeInForce encoding: GTC=0, IOC=1, FOK=2, Day=3.
 pub fn encode_tif(tif: TimeInForce) -> u8 {
     match tif {
         TimeInForce::GTC => 0,
         TimeInForce::IOC => 1,
         TimeInForce::FOK => 2,
+        TimeInForce::Day => 3,
     }
 }
 
@@ -100,6 +101,7 @@ pub fn decode_tif(b: u8) -> Option<TimeInForce> {
         0 => Some(TimeInForce::GTC),
         1 => Some(TimeInForce::IOC),
         2 => Some(TimeInForce::FOK),
+        3 => Some(TimeInForce::Day),
         _ => None,
     }
 }

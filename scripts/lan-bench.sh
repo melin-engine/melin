@@ -93,13 +93,14 @@ REPO_DIR="~/workspace/trading"
 JOURNAL_PATH="${JOURNAL_PATH:-/mnt/journal/bench.journal}"
 SNAPSHOT_PATH="${SNAPSHOT_PATH:-/mnt/journal/bench.snapshot}"
 BIND_ADDR="${SERVER_VLAN}:9876"
+HEALTH_ADDR="${SERVER_VLAN}:9877"
 CARGO_BUILD_FLAGS="${CARGO_BUILD_FLAGS:---release}"
 
 echo "=== LAN Benchmark ==="
 echo "  Server:      ${SERVER} (VLAN: ${SERVER_VLAN})"
 echo "  Bench:       ${BENCH}"
-echo "  Server args: --bind ${BIND_ADDR} --journal ${JOURNAL_PATH} --authorized-keys ...${SERVER_EXTRA_ARGS}"
-echo "  Bench args:  --addr ${BIND_ADDR} --key bench.key --json ...${BENCH_EXTRA_ARGS}"
+echo "  Server args: --bind ${BIND_ADDR} --health-bind ${HEALTH_ADDR} --journal ${JOURNAL_PATH} --authorized-keys ...${SERVER_EXTRA_ARGS}"
+echo "  Bench args:  --addr ${BIND_ADDR} --health-addr ${HEALTH_ADDR} --key bench.key --json ...${BENCH_EXTRA_ARGS}"
 echo ""
 
 # ---------------------------------------------------------------------------
@@ -109,11 +110,12 @@ build_remote() {
     local host="$1"
     local label="$2"
     echo "=== Building on ${label} (${host}) ==="
-    # BENCH_BRANCH env var: checkout a specific branch instead of pulling main.
-    # Usage: BENCH_BRANCH=feat/replication ./scripts/lan-bench.sh ...
+    # BENCH_BRANCH or BENCH_COMMIT: checkout a specific ref on all machines.
     local git_cmd="git pull --ff-only"
     if [[ -n "${BENCH_BRANCH:-}" ]]; then
         git_cmd="git fetch origin && git checkout ${BENCH_BRANCH} && git pull origin ${BENCH_BRANCH}"
+    elif [[ -n "${BENCH_COMMIT:-}" ]]; then
+        git_cmd="git fetch origin && git checkout ${BENCH_COMMIT}"
     fi
     ssh $SSH_OPTS "$host" "cd ${REPO_DIR} && ${git_cmd} && source ~/.cargo/env && cargo build ${CARGO_BUILD_FLAGS}" 2>&1 | tail -3
     echo "  ${label} build: OK"
@@ -130,14 +132,14 @@ echo "=== Setting up auth keys ==="
 ssh $SSH_OPTS "$BENCH" "cd ${REPO_DIR} && \
     if [[ ! -f bench.key ]]; then \
         source ~/.cargo/env && \
-        cargo run --release -p melin-admin --bin melin-keygen -- bench admin && \
+        cargo run --release -p melin-admin --bin melin-keygen -- bench trader && \
         echo 'Generated bench.key'; \
     else \
         echo 'bench.key already exists'; \
     fi"
 
 # Copy the authorized_keys line to the server.
-AUTH_LINE=$(ssh $SSH_OPTS "$BENCH" "cd ${REPO_DIR} && cat bench.pub | xargs -I{} echo 'admin {} bench'")
+AUTH_LINE=$(ssh $SSH_OPTS "$BENCH" "cd ${REPO_DIR} && cat bench.pub | xargs -I{} echo 'trader {} bench'")
 ssh $SSH_OPTS "$SERVER" "cd ${REPO_DIR} && echo '${AUTH_LINE}' > authorized_keys"
 echo "  Auth keys configured."
 echo ""
@@ -184,6 +186,7 @@ ssh $SSH_OPTS "$SERVER" "pkill -x melin-server 2>/dev/null; true"
 sleep 1
 ssh $SSH_OPTS "$SERVER" "RUST_LOG=info nohup ${REPO_DIR}/target/release/melin-server \
         --bind ${BIND_ADDR} \
+        --health-bind ${HEALTH_ADDR} \
         --journal ${JOURNAL_PATH} \
         --authorized-keys ${REPO_DIR}/authorized_keys \
         ${SERVER_EXTRA_ARGS} \
@@ -214,6 +217,7 @@ echo ""
 ssh $SSH_OPTS "$BENCH" "cd ${REPO_DIR} && source ~/.cargo/env && \
     ./target/release/melin-bench \
         --addr ${BIND_ADDR} \
+        --health-addr ${HEALTH_ADDR} \
         --key bench.key \
         --json /tmp/bench-results.json \
         --bench-cores 1 \

@@ -13,31 +13,51 @@ use base64::engine::general_purpose::STANDARD as BASE64;
 
 /// Permission level assigned to an authenticated connection.
 ///
-/// Uses a simple three-tier model: Admin > Trader > ReadOnly.
+/// Four specialized roles with no overlap — separation of duties:
+///   Operator: exchange configuration (instruments, risk, circuit breakers)
+///   Trader: order submission and cancellation
+///   Custodian: fund management (deposit/withdraw)
+///   ReadOnly: observation only (heartbeats, future market data)
+///
+/// No single role has full access. An organization needing both trading
+/// and admin uses separate keys for each role.
+///
 /// Checked on the reader thread (cold per-request check) with zero
 /// cost on the matching engine hot path.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Permission {
-    /// Full access including future admin commands (circuit breakers,
-    /// instrument management, kill switch for other accounts).
-    Admin,
-    /// Submit/cancel orders, heartbeats — all current `Request` types.
+    /// Exchange configuration: instrument management, circuit breakers,
+    /// risk limits, fee schedules, end-of-day, stats. Cannot trade or
+    /// manage funds.
+    Operator,
+    /// Submit/cancel orders and heartbeats. Cannot perform admin ops
+    /// or fund management (deposit/withdraw).
     Trader,
+    /// Deposit and withdraw only. Cannot trade or perform admin ops.
+    /// Separates fund management from trading and exchange administration.
+    Custodian,
     /// Heartbeats only. Future: market data subscriptions.
     ReadOnly,
 }
 
 impl Permission {
     /// Whether this permission level allows trading operations
-    /// (submit order, cancel order, cancel all).
+    /// (submit order, cancel order, cancel all, cancel-replace).
     pub fn can_trade(self) -> bool {
-        matches!(self, Permission::Admin | Permission::Trader)
+        matches!(self, Permission::Trader)
     }
 
     /// Whether this permission level allows administrative operations
-    /// (add instrument, deposit, set risk limits).
-    pub fn is_admin(self) -> bool {
-        matches!(self, Permission::Admin)
+    /// (add instrument, set risk limits, circuit breakers, fee schedules,
+    /// end-of-day, query stats).
+    pub fn is_operator(self) -> bool {
+        matches!(self, Permission::Operator)
+    }
+
+    /// Whether this permission level allows fund management operations
+    /// (deposit, withdraw).
+    pub fn can_manage_funds(self) -> bool {
+        matches!(self, Permission::Custodian)
     }
 }
 
@@ -87,12 +107,13 @@ impl AuthorizedKeys {
                 .ok_or_else(|| format!("line {}: missing public key", line_num + 1))?;
 
             let permission = match perm_str {
-                "admin" => Permission::Admin,
+                "operator" => Permission::Operator,
                 "trader" => Permission::Trader,
+                "custodian" => Permission::Custodian,
                 "readonly" => Permission::ReadOnly,
                 other => {
                     return Err(format!(
-                        "line {}: unknown permission '{}' (expected admin/trader/readonly)",
+                        "line {}: unknown permission '{}' (expected operator/trader/custodian/readonly)",
                         line_num + 1,
                         other
                     ));
@@ -144,7 +165,7 @@ mod tests {
     fn parse_valid_keys_file() {
         let content = "\
 # Auth keys file
-admin AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA= ops-team
+operator AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA= ops-team
 trader AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE= market-maker-1
 readonly AgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgI= monitoring
 ";
@@ -156,7 +177,7 @@ readonly AgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgI= monitoring
             .unwrap();
         let mut k = [0u8; 32];
         k.copy_from_slice(&admin_key);
-        assert_eq!(keys.lookup(&k), Some(Permission::Admin));
+        assert_eq!(keys.lookup(&k), Some(Permission::Operator));
     }
 
     #[test]
@@ -165,7 +186,7 @@ readonly AgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgI= monitoring
 # comment
    # indented comment
 
-admin AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA= test
+operator AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA= test
 ";
         let keys = AuthorizedKeys::parse(content).unwrap();
         assert_eq!(keys.len(), 1);
@@ -181,7 +202,7 @@ admin AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA= test
 
     #[test]
     fn parse_rejects_wrong_key_length() {
-        let content = "admin AQID test\n"; // 3 bytes, not 32
+        let content = "operator AQID test\n"; // 3 bytes, not 32
         let result = AuthorizedKeys::parse(content);
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("32 bytes"));
@@ -195,22 +216,40 @@ admin AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA= test
 
     #[test]
     fn permission_can_trade() {
-        assert!(Permission::Admin.can_trade());
+        assert!(!Permission::Operator.can_trade());
         assert!(Permission::Trader.can_trade());
+        assert!(!Permission::Custodian.can_trade());
         assert!(!Permission::ReadOnly.can_trade());
     }
 
     #[test]
-    fn permission_is_admin() {
-        assert!(Permission::Admin.is_admin());
-        assert!(!Permission::Trader.is_admin());
-        assert!(!Permission::ReadOnly.is_admin());
+    fn permission_is_operator() {
+        assert!(Permission::Operator.is_operator());
+        assert!(!Permission::Trader.is_operator());
+        assert!(!Permission::Custodian.is_operator());
+        assert!(!Permission::ReadOnly.is_operator());
+    }
+
+    #[test]
+    fn permission_can_manage_funds() {
+        assert!(!Permission::Operator.can_manage_funds());
+        assert!(!Permission::Trader.can_manage_funds());
+        assert!(Permission::Custodian.can_manage_funds());
+        assert!(!Permission::ReadOnly.can_manage_funds());
+    }
+
+    #[test]
+    fn custodian_key_parsed_from_file() {
+        let content = "custodian AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA= treasury\n";
+        let keys = AuthorizedKeys::parse(content).unwrap();
+        let pub_key = [0u8; 32];
+        assert_eq!(keys.lookup(&pub_key), Some(Permission::Custodian));
     }
 
     #[test]
     fn duplicate_key_last_permission_wins() {
         let content = "\
-admin AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA= first
+operator AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA= first
 readonly AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA= second
 ";
         let keys = AuthorizedKeys::parse(content).unwrap();
@@ -235,7 +274,7 @@ readonly AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA= second
 
     #[test]
     fn parse_rejects_invalid_base64() {
-        let content = "admin not-valid-base64!!! test\n";
+        let content = "operator not-valid-base64!!! test\n";
         let result = AuthorizedKeys::parse(content);
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("invalid base64"));

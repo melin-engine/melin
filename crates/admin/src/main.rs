@@ -49,12 +49,14 @@ const ACTIONS: &[&str] = &[
     "Set Risk Limits",
     "Set Circuit Breaker",
     "Set Fee Schedule",
+    "End of Day",
 ];
 
 const TIF_OPTIONS: &[(&str, TimeInForce)] = &[
     ("GTC (Good-Til-Cancelled)", TimeInForce::GTC),
     ("IOC (Immediate-Or-Cancel)", TimeInForce::IOC),
     ("FOK (Fill-Or-Kill)", TimeInForce::FOK),
+    ("Day (cancel at end-of-day)", TimeInForce::Day),
 ];
 
 const STP_OPTIONS: &[(&str, SelfTradeProtection)] = &[
@@ -572,6 +574,11 @@ impl App {
                             buf: String::new(),
                             next: NextStep::FeeScheduleSymbol,
                         };
+                    }
+                    16 => {
+                        // End of Day — send immediately, no parameters.
+                        let _ = self.request_tx.send(Request::EndOfDay);
+                        self.log.push("Sent EndOfDay".into());
                     }
                     _ => {}
                 }
@@ -1241,6 +1248,7 @@ fn format_report(report: &ExecutionReport) -> String {
                 RejectReason::PostOnlyWouldCross => "post-only would cross",
                 RejectReason::HasRestingOrders => "has resting orders",
                 RejectReason::DuplicateRequest => "duplicate request",
+                RejectReason::ReplicaDisconnected => "replica disconnected",
             };
             format!("REJECT  #{} ({reason_str})", order_id.0)
         }
@@ -1293,6 +1301,7 @@ fn client_thread(
                     let msg = match resp {
                         ResponseKind::Report(report) => format_report(report),
                         ResponseKind::EngineError => "ENGINE ERROR".into(),
+                        ResponseKind::ServerBusy => "SERVER BUSY (pipeline full)".into(),
                         ResponseKind::BatchEnd
                         | ResponseKind::ServerReady
                         | ResponseKind::Heartbeat

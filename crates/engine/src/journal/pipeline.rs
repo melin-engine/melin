@@ -19,7 +19,7 @@
 //! while preserving persist-before-ack at the response boundary.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
 use crate::exchange::Exchange;
@@ -31,7 +31,6 @@ use crate::types::{AccountId, ExecutionReport, OrderId, RejectReason};
 
 use melin_disruptor::padding::Sequence;
 use melin_disruptor::ring;
-use melin_disruptor::spsc;
 
 /// Ring buffer capacity for the input disruptor (journal + matching consumers).
 /// 2^20 = 1,048,576 slots. At ~72 bytes per slot, this is ~72 MiB — fits in
@@ -782,7 +781,7 @@ impl JournalStage {
 pub struct MatchingStage {
     exchange: Exchange,
     consumer: ring::Consumer<InputSlot>,
-    output: spsc::Producer<OutputSlot>,
+    output: ring::Producer<OutputSlot>,
     /// Monotonically increasing count of events processed. Relaxed ordering
     /// is sufficient — this is a diagnostic counter, not a synchronization
     /// primitive. One `fetch_add(1, Relaxed)` per event (~1ns).
@@ -794,6 +793,10 @@ pub struct MatchingStage {
     /// Active connection count, shared with the server accept loop.
     /// Read only when processing `QueryStats` (once per second at most).
     active_connections: Arc<AtomicU64>,
+    /// When `Some`, replication is enabled. One Relaxed load per event
+    /// (~1ns). `false` = replica disconnected → reject all mutations.
+    /// `None` = standalone mode → no halt check.
+    replica_connected: Option<Arc<AtomicBool>>,
     /// When true, never yield — spin indefinitely. See [`idle_wait`].
     busy_spin: bool,
 }
@@ -803,10 +806,11 @@ impl MatchingStage {
     pub fn new(
         exchange: Exchange,
         consumer: ring::Consumer<InputSlot>,
-        output: spsc::Producer<OutputSlot>,
+        output: ring::Producer<OutputSlot>,
         events_processed: Arc<AtomicU64>,
         journal_cursor: Arc<Sequence>,
         active_connections: Arc<AtomicU64>,
+        replica_connected: Option<Arc<AtomicBool>>,
         busy_spin: bool,
     ) -> Self {
         Self {
@@ -816,7 +820,40 @@ impl MatchingStage {
             events_processed,
             journal_cursor,
             active_connections,
+            replica_connected,
             busy_spin,
+        }
+    }
+
+    /// Returns true if trading is halted due to replica disconnect.
+    /// Always false in standalone mode (replica_connected is None).
+    fn is_halted(&self) -> bool {
+        self.replica_connected
+            .as_ref()
+            .is_some_and(|flag| !flag.load(Ordering::Relaxed))
+    }
+
+    /// Extract the order ID from the event for reject reports, or OrderId(0) if N/A.
+    fn extract_order_id(event: &JournalEvent) -> OrderId {
+        match event {
+            JournalEvent::SubmitOrder { order, .. } => order.id,
+            JournalEvent::CancelOrder { order_id, .. }
+            | JournalEvent::CancelReplace { order_id, .. } => *order_id,
+            _ => OrderId(0),
+        }
+    }
+
+    /// Extract the account ID from the event for reject reports, or AccountId(0) if N/A.
+    fn extract_account_id(event: &JournalEvent) -> AccountId {
+        match event {
+            JournalEvent::SubmitOrder { order, .. } => order.account,
+            JournalEvent::CancelOrder { account, .. }
+            | JournalEvent::CancelAll { account }
+            | JournalEvent::CancelReplace { account, .. }
+            | JournalEvent::Deposit { account, .. }
+            | JournalEvent::Withdraw { account, .. }
+            | JournalEvent::ProvisionAccount { account, .. } => *account,
+            _ => AccountId(0),
         }
     }
 
@@ -841,7 +878,7 @@ impl MatchingStage {
         let mut idle_spins: u32 = 0;
         // Thread-local events counter — plain u64 increment (~0.3ns) instead
         // of atomic fetch_add (~5-8ns). Flushed to the shared Arc<AtomicU64>
-        // only when QueryStats fires (~1/sec) or on shutdown.
+        // once per batch, on QueryStats, and on shutdown.
         let mut local_events: u64 = 0;
 
         let mut batch = [InputSlot::default(); MAX_MATCHING_BATCH];
@@ -951,10 +988,15 @@ impl MatchingStage {
 
                 local_events += 1;
 
-                // Per-key request dedup: check if this request's seq is
-                // strictly greater than the HWM for this key. Skip internal
-                // events (key_hash == 0) and QueryStats (already handled above).
-                if !self
+                // Halt check first: reject before advancing any HWMs so the
+                // client can safely retry the same seq after reconnect.
+                if self.is_halted() {
+                    reports.push(ExecutionReport::Rejected {
+                        order_id: Self::extract_order_id(&slot.event),
+                        account: Self::extract_account_id(&slot.event),
+                        reason: RejectReason::ReplicaDisconnected,
+                    });
+                } else if !self
                     .exchange
                     .check_request_seq(slot.key_hash, slot.request_seq)
                 {
@@ -1003,6 +1045,11 @@ impl MatchingStage {
                     recv_ts: slot.recv_ts,
                 });
             }
+
+            // Flush the thread-local counter once per batch so the health
+            // endpoint can observe progress. One Relaxed store per batch
+            // (~1ns) is negligible compared to per-event atomic increment.
+            self.events_processed.store(local_events, Ordering::Relaxed);
         }
     }
 
@@ -1022,8 +1069,14 @@ impl MatchingStage {
             }
             reports.clear();
 
-            // Per-key request dedup (same as the main run loop).
-            if !self
+            // Halt check first, then dedup (same order as the main run loop).
+            if self.is_halted() {
+                reports.push(ExecutionReport::Rejected {
+                    order_id: Self::extract_order_id(&slot.event),
+                    account: Self::extract_account_id(&slot.event),
+                    reason: RejectReason::ReplicaDisconnected,
+                });
+            } else if !self
                 .exchange
                 .check_request_seq(slot.key_hash, slot.request_seq)
             {
@@ -1086,6 +1139,9 @@ impl MatchingStage {
             }
             JournalEvent::CancelAll { account } => {
                 self.exchange.cancel_all(account, reports);
+            }
+            JournalEvent::EndOfDay => {
+                self.exchange.end_of_day(reports);
             }
             JournalEvent::SetCircuitBreaker { symbol, config } => {
                 self.exchange.set_circuit_breaker(symbol, config);
@@ -1164,6 +1220,7 @@ fn print_utilization(stage: &str, busy: u64, idle: u64) {
 /// replication stage. The returned `Option<ReplicationStage>` and
 /// `Arc<AtomicU64>` (replication cursor) are used by the server to spawn
 /// the replication thread and gate the response stage.
+#[allow(clippy::type_complexity)]
 pub fn build_pipeline(
     exchange: Exchange,
     writer: JournalWriter,
@@ -1173,7 +1230,7 @@ pub fn build_pipeline(
     ring::MultiProducer<InputSlot>,
     JournalStage,
     MatchingStage,
-    spsc::Consumer<OutputSlot>,
+    Vec<ring::Consumer<OutputSlot>>,
     Arc<Sequence>,
     Arc<AtomicU64>,
 ) {
@@ -1181,10 +1238,12 @@ pub fn build_pipeline(
         producer,
         journal_stage,
         matching_stage,
-        output_consumer,
+        output_consumers,
         journal_cursor,
         _matching_cursor,
         events_processed,
+        _input_cursor,
+        _,
         _,
         _,
     ) = build_pipeline_with_replication(
@@ -1196,12 +1255,13 @@ pub fn build_pipeline(
         MAX_JOURNAL_BATCH,
         crate::journal::replication::REPLICATION_RING_CAPACITY,
         false,
+        false,
     );
     (
         producer,
         journal_stage,
         matching_stage,
-        output_consumer,
+        output_consumers,
         journal_cursor,
         events_processed,
     )
@@ -1218,7 +1278,7 @@ pub fn build_pipeline(
 /// Returns one `ReplicationConsumer` for the sender thread, and a
 /// `replication_cursor` `Arc<AtomicU64>` for the response stage.
 /// When replication is disabled, the cursor is `u64::MAX` (standalone mode).
-#[allow(clippy::type_complexity)]
+#[allow(clippy::type_complexity, clippy::too_many_arguments)]
 pub fn build_pipeline_with_replication(
     exchange: Exchange,
     writer: JournalWriter,
@@ -1228,16 +1288,19 @@ pub fn build_pipeline_with_replication(
     max_journal_batch: usize,
     replication_ring_size: usize,
     busy_spin: bool,
+    enable_event_publisher: bool,
 ) -> (
     ring::MultiProducer<InputSlot>,
     JournalStage,
     MatchingStage,
-    spsc::Consumer<OutputSlot>,
+    Vec<ring::Consumer<OutputSlot>>,
     Arc<Sequence>,
     Arc<Sequence>,
     Arc<AtomicU64>,
+    Box<dyn ring::QueueCursor>,
     Option<ReplicationConsumer>,
     Arc<AtomicU64>,
+    Option<Arc<AtomicBool>>,
 ) {
     // Input disruptor: N producers (reader threads), 2 parallel consumers.
     // MultiProducer allows lock-free concurrent publishing from all reader
@@ -1247,6 +1310,10 @@ pub fn build_pipeline_with_replication(
             .add_consumer() // consumer 0: journal, gated on producer
             .add_consumer() // consumer 1: matching, gated on producer (parallel)
             .build_multi_producer();
+
+    // Type-erased cursor reader for queue depth monitoring.
+    // Extracted before the producer is cloned to reader threads.
+    let input_cursor = input_producer.cursor_reader();
 
     let matching_consumer = consumers.pop().expect("matching consumer");
     let journal_consumer = consumers.pop().expect("journal consumer");
@@ -1259,8 +1326,15 @@ pub fn build_pipeline_with_replication(
     // last seed sequence before accepting clients.
     let matching_cursor = matching_consumer.progress_counter();
 
-    // Output SPSC: matching → response.
-    let (output_producer, output_consumer) = spsc::channel::<OutputSlot>(OUTPUT_RING_CAPACITY);
+    // Output disruptor ring: matching → response (+ optional event publisher).
+    // Single producer, N consumers (1 = response only, 2 = response + event publisher).
+    // Uses the same ring::Producer/Consumer API as the input disruptor.
+    let mut output_builder =
+        ring::DisruptorBuilder::<OutputSlot>::new(OUTPUT_RING_CAPACITY).add_consumer(); // consumer 0: response stage
+    if enable_event_publisher {
+        output_builder = output_builder.add_consumer(); // consumer 1: event publisher
+    }
+    let (output_producer, output_consumers) = output_builder.build();
 
     let events_processed = Arc::new(AtomicU64::new(0));
 
@@ -1283,6 +1357,17 @@ pub fn build_pipeline_with_replication(
         None
     };
 
+    // Replica-connected flag: when replication is enabled, starts false
+    // (no replica yet). The replication sender sets it to true on connect,
+    // false on disconnect. The matching stage checks it (one Relaxed load
+    // per event) and rejects all mutations when false. In standalone mode,
+    // None — no halt check.
+    let replica_connected = if enable_replication {
+        Some(Arc::new(AtomicBool::new(false)))
+    } else {
+        None
+    };
+
     let matching_stage = MatchingStage::new(
         exchange,
         matching_consumer,
@@ -1290,6 +1375,7 @@ pub fn build_pipeline_with_replication(
         Arc::clone(&events_processed),
         Arc::clone(&journal_cursor),
         active_connections,
+        replica_connected.clone(),
         busy_spin,
     );
 
@@ -1305,12 +1391,14 @@ pub fn build_pipeline_with_replication(
         input_producer,
         journal_stage,
         matching_stage,
-        output_consumer,
+        output_consumers,
         journal_cursor,
         matching_cursor,
         events_processed,
+        input_cursor,
         replication_consumer,
         replication_cursor,
+        replica_connected,
     )
 }
 
@@ -1422,7 +1510,10 @@ mod tests {
             .build();
         let consumer = consumers.pop().unwrap();
 
-        let (output_producer, mut output_consumer) = spsc::channel::<OutputSlot>(64);
+        let (output_producer, mut output_consumers) = ring::DisruptorBuilder::<OutputSlot>::new(64)
+            .add_consumer()
+            .build();
+        let mut output_consumer = output_consumers.pop().unwrap();
 
         // Journal cursor and counters not used in this test — create dummies.
         let dummy_cursor = Arc::new(Sequence::new(AtomicU64::new(0)));
@@ -1435,6 +1526,7 @@ mod tests {
             events_counter,
             dummy_cursor,
             active_conns,
+            None, // standalone — no halt check
             false,
         );
 
@@ -1507,10 +1599,11 @@ mod tests {
             input_producer,
             journal_stage,
             matching_stage,
-            mut output_consumer,
+            mut output_consumers,
             journal_cursor,
             _events_processed,
         ) = build_pipeline(exchange, writer, Duration::ZERO, active_conns);
+        let mut output_consumer = output_consumers.pop().unwrap();
 
         let shutdown = Arc::new(AtomicBool::new(false));
         let s1 = Arc::clone(&shutdown);
@@ -1591,12 +1684,14 @@ mod tests {
             input_producer,
             journal_stage,
             matching_stage,
-            mut output_consumer,
+            mut output_consumers,
             journal_cursor,
             _matching_cursor,
             _events_processed,
+            _input_cursor,
             replication_rx,
             replication_cursor,
+            _replica_connected,
         ) = build_pipeline_with_replication(
             exchange,
             writer,
@@ -1606,9 +1701,16 @@ mod tests {
             MAX_JOURNAL_BATCH,
             REPLICATION_RING_CAPACITY,
             false,
+            false,
         );
+        let mut output_consumer = output_consumers.pop().unwrap();
 
         let mut repl_consumer = replication_rx.expect("replication should be enabled");
+
+        // Simulate a connected replica so the matching stage doesn't halt.
+        if let Some(ref flag) = _replica_connected {
+            flag.store(true, Ordering::Relaxed);
+        }
 
         let shutdown = Arc::new(AtomicBool::new(false));
         let s1 = Arc::clone(&shutdown);
@@ -1692,14 +1794,21 @@ mod tests {
             let file_bytes = std::fs::read(&path).unwrap();
 
             // Find the start of user entries (after file header and genesis if present).
-            let mut offset = FILE_HEADER_SIZE;
-            #[cfg(feature = "hash-chain")]
-            {
-                // Skip past the genesis entry.
-                let genesis_len =
-                    u16::from_le_bytes([file_bytes[offset + 2], file_bytes[offset + 3]]) as usize;
-                offset += 20 + genesis_len + 4;
-            }
+            let offset = {
+                #[cfg(feature = "hash-chain")]
+                {
+                    // Skip past the genesis entry.
+                    let genesis_len = u16::from_le_bytes([
+                        file_bytes[FILE_HEADER_SIZE + 2],
+                        file_bytes[FILE_HEADER_SIZE + 3],
+                    ]) as usize;
+                    FILE_HEADER_SIZE + 20 + genesis_len + 4
+                }
+                #[cfg(not(feature = "hash-chain"))]
+                {
+                    FILE_HEADER_SIZE
+                }
+            };
 
             // Find end of valid data via reader.
             let mut reader = crate::journal::JournalReader::open(&path).unwrap();
@@ -1745,7 +1854,7 @@ mod tests {
             let writer = JournalWriter::create(&path).unwrap();
             let active_conns = Arc::new(AtomicU64::new(0));
 
-            let (_, _, _, _, _, _, _, replication, replication_cursor) =
+            let (_, _, _, _, _, _, _, _, replication, replication_cursor, _) =
                 build_pipeline_with_replication(
                     exchange,
                     writer,
@@ -1754,6 +1863,7 @@ mod tests {
                     false,
                     MAX_JOURNAL_BATCH,
                     REPLICATION_RING_CAPACITY,
+                    false,
                     false,
                 );
             assert!(replication.is_none());
@@ -1767,7 +1877,7 @@ mod tests {
             let writer = JournalWriter::create(&path).unwrap();
             let active_conns = Arc::new(AtomicU64::new(0));
 
-            let (_, _, _, _, _, _, _, replication, replication_cursor) =
+            let (_, _, _, _, _, _, _, _, replication, replication_cursor, _) =
                 build_pipeline_with_replication(
                     exchange,
                     writer,
@@ -1777,6 +1887,7 @@ mod tests {
                     MAX_JOURNAL_BATCH,
                     REPLICATION_RING_CAPACITY,
                     false,
+                    false,
                 );
             assert!(replication.is_some());
             assert_eq!(
@@ -1785,5 +1896,285 @@ mod tests {
                 "replication cursor should start at MAX even when enabled"
             );
         }
+    }
+
+    /// Helper: build a minimal matching stage with a replica_connected flag.
+    /// Returns (input_producer, output_consumer, replica_flag, shutdown, join_handle).
+    fn start_matching_with_halt(
+        replica_connected: bool,
+    ) -> (
+        ring::Producer<InputSlot>,
+        ring::Consumer<OutputSlot>,
+        Arc<AtomicBool>,
+        Arc<AtomicBool>,
+        std::thread::JoinHandle<Exchange>,
+    ) {
+        let mut exchange = Exchange::new();
+        exchange.add_instrument(InstrumentSpec {
+            symbol: Symbol(1),
+            base: CurrencyId(0),
+            quote: CurrencyId(1),
+        });
+        exchange.deposit(AccountId(1), CurrencyId(1), 1_000_000);
+
+        let (input_producer, mut consumers) = ring::DisruptorBuilder::<InputSlot>::new(64)
+            .add_consumer()
+            .build();
+        let consumer = consumers.pop().unwrap();
+        let (output_producer, mut output_consumers) = ring::DisruptorBuilder::<OutputSlot>::new(64)
+            .add_consumer()
+            .build();
+        let output_consumer = output_consumers.pop().unwrap();
+
+        let dummy_cursor = Arc::new(Sequence::new(AtomicU64::new(0)));
+        let events_counter = Arc::new(AtomicU64::new(0));
+        let active_conns = Arc::new(AtomicU64::new(0));
+        let flag = Arc::new(AtomicBool::new(replica_connected));
+
+        let stage = MatchingStage::new(
+            exchange,
+            consumer,
+            output_producer,
+            events_counter,
+            dummy_cursor,
+            active_conns,
+            Some(Arc::clone(&flag)),
+            false,
+        );
+
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let s = Arc::clone(&shutdown);
+        let handle = std::thread::spawn(move || stage.run(&s));
+
+        (input_producer, output_consumer, flag, shutdown, handle)
+    }
+
+    /// Consume outputs until we see a BatchEnd, returning all reports.
+    fn collect_reports(output: &mut ring::Consumer<OutputSlot>) -> Vec<ExecutionReport> {
+        let mut reports = Vec::new();
+        loop {
+            if let Some((_, slot)) = output.try_consume() {
+                match slot.payload {
+                    OutputPayload::Report(r) => reports.push(r),
+                    OutputPayload::BatchEnd => return reports,
+                    _ => {}
+                }
+            }
+            std::hint::spin_loop();
+        }
+    }
+
+    #[test]
+    fn halt_rejects_submit_order() {
+        let (mut input, mut output, _flag, shutdown, handle) = start_matching_with_halt(false);
+
+        input.publish(InputSlot {
+            connection_id: 1,
+            key_hash: 0xAA,
+            request_seq: 1,
+            event: JournalEvent::SubmitOrder {
+                symbol: Symbol(1),
+                order: limit_order(100, AccountId(1), Side::Buy, 50, 10),
+            },
+            publish_ts: trace_ts(),
+            recv_ts: trace_ts(),
+        });
+
+        let reports = collect_reports(&mut output);
+        assert_eq!(reports.len(), 1);
+        assert!(matches!(
+            reports[0],
+            ExecutionReport::Rejected {
+                order_id: OrderId(100),
+                account: AccountId(1),
+                reason: RejectReason::ReplicaDisconnected,
+            }
+        ));
+
+        shutdown.store(true, Ordering::Relaxed);
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn halt_rejects_deposit() {
+        let (mut input, mut output, _flag, shutdown, handle) = start_matching_with_halt(false);
+
+        input.publish(InputSlot {
+            connection_id: 1,
+            key_hash: 0,
+            request_seq: 0,
+            event: JournalEvent::Deposit {
+                account: AccountId(1),
+                currency: CurrencyId(1),
+                amount: 100,
+            },
+            publish_ts: trace_ts(),
+            recv_ts: trace_ts(),
+        });
+
+        let reports = collect_reports(&mut output);
+        assert_eq!(reports.len(), 1);
+        assert!(matches!(
+            reports[0],
+            ExecutionReport::Rejected {
+                reason: RejectReason::ReplicaDisconnected,
+                ..
+            }
+        ));
+
+        shutdown.store(true, Ordering::Relaxed);
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn halt_allows_query_stats() {
+        let (mut input, mut output, _flag, shutdown, handle) = start_matching_with_halt(false);
+
+        input.publish(InputSlot {
+            connection_id: 1,
+            key_hash: 0,
+            request_seq: 0,
+            event: JournalEvent::QueryStats,
+            publish_ts: trace_ts(),
+            recv_ts: trace_ts(),
+        });
+
+        // QueryStats produces StatsHeader + BatchEnd, not a Rejected.
+        let mut got_stats = false;
+        let mut got_batch_end = false;
+        for _ in 0..1_000_000 {
+            if let Some((_, slot)) = output.try_consume() {
+                match slot.payload {
+                    OutputPayload::StatsHeader { .. } => got_stats = true,
+                    OutputPayload::BatchEnd => {
+                        got_batch_end = true;
+                        break;
+                    }
+                    OutputPayload::Report(ExecutionReport::Rejected { reason, .. }) => {
+                        panic!("QueryStats should not be rejected, got: {reason:?}");
+                    }
+                    _ => {}
+                }
+            }
+            std::hint::spin_loop();
+        }
+        assert!(got_stats, "should have received StatsHeader");
+        assert!(got_batch_end, "should have received BatchEnd");
+
+        shutdown.store(true, Ordering::Relaxed);
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn halt_then_reconnect_resumes_trading() {
+        let (mut input, mut output, flag, shutdown, handle) = start_matching_with_halt(false);
+
+        // Submit while halted — rejected.
+        input.publish(InputSlot {
+            connection_id: 1,
+            key_hash: 0xBB,
+            request_seq: 1,
+            event: JournalEvent::SubmitOrder {
+                symbol: Symbol(1),
+                order: limit_order(200, AccountId(1), Side::Buy, 50, 10),
+            },
+            publish_ts: trace_ts(),
+            recv_ts: trace_ts(),
+        });
+
+        let reports = collect_reports(&mut output);
+        assert!(matches!(
+            reports[0],
+            ExecutionReport::Rejected {
+                reason: RejectReason::ReplicaDisconnected,
+                ..
+            }
+        ));
+
+        // Reconnect replica.
+        flag.store(true, Ordering::Relaxed);
+
+        // Retry the same seq — should succeed now (HWM was not advanced).
+        input.publish(InputSlot {
+            connection_id: 1,
+            key_hash: 0xBB,
+            request_seq: 1,
+            event: JournalEvent::SubmitOrder {
+                symbol: Symbol(1),
+                order: limit_order(200, AccountId(1), Side::Buy, 50, 10),
+            },
+            publish_ts: trace_ts(),
+            recv_ts: trace_ts(),
+        });
+
+        let reports = collect_reports(&mut output);
+        assert!(
+            reports
+                .iter()
+                .any(|r| matches!(r, ExecutionReport::Placed { .. })),
+            "order should be placed after reconnect, got: {reports:?}"
+        );
+
+        shutdown.store(true, Ordering::Relaxed);
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn standalone_mode_no_halt() {
+        // replica_connected = None → no halt check, events always processed.
+        let mut exchange = Exchange::new();
+        exchange.add_instrument(InstrumentSpec {
+            symbol: Symbol(1),
+            base: CurrencyId(0),
+            quote: CurrencyId(1),
+        });
+        exchange.deposit(AccountId(1), CurrencyId(1), 1_000_000);
+
+        let (mut input_producer, mut consumers) = ring::DisruptorBuilder::<InputSlot>::new(64)
+            .add_consumer()
+            .build();
+        let consumer = consumers.pop().unwrap();
+        let (output_producer, mut output_consumers) = ring::DisruptorBuilder::<OutputSlot>::new(64)
+            .add_consumer()
+            .build();
+        let mut output_consumer = output_consumers.pop().unwrap();
+
+        let stage = MatchingStage::new(
+            exchange,
+            consumer,
+            output_producer,
+            Arc::new(AtomicU64::new(0)),
+            Arc::new(Sequence::new(AtomicU64::new(0))),
+            Arc::new(AtomicU64::new(0)),
+            None, // standalone
+            false,
+        );
+
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let s = Arc::clone(&shutdown);
+        let handle = std::thread::spawn(move || stage.run(&s));
+
+        input_producer.publish(InputSlot {
+            connection_id: 1,
+            key_hash: 0,
+            request_seq: 0,
+            event: JournalEvent::SubmitOrder {
+                symbol: Symbol(1),
+                order: limit_order(1, AccountId(1), Side::Buy, 50, 10),
+            },
+            publish_ts: trace_ts(),
+            recv_ts: trace_ts(),
+        });
+
+        let reports = collect_reports(&mut output_consumer);
+        assert!(
+            reports
+                .iter()
+                .any(|r| matches!(r, ExecutionReport::Placed { .. })),
+            "standalone mode should process normally, got: {reports:?}"
+        );
+
+        shutdown.store(true, Ordering::Relaxed);
+        handle.join().unwrap();
     }
 }

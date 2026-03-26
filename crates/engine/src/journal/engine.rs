@@ -377,6 +377,9 @@ fn replay_event(
         JournalEvent::CancelAll { account } => {
             exchange.cancel_all(account, reports);
         }
+        JournalEvent::EndOfDay => {
+            exchange.end_of_day(reports);
+        }
         JournalEvent::SetCircuitBreaker { symbol, config } => {
             exchange.set_circuit_breaker(symbol, config);
         }

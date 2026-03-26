@@ -78,6 +78,7 @@ const TAG_CHECKPOINT: u8 = 10;
 const TAG_SET_FEE_SCHEDULE: u8 = 11;
 const TAG_PROVISION_ACCOUNT: u8 = 12;
 const TAG_WITHDRAW: u8 = 13;
+const TAG_END_OF_DAY: u8 = 14;
 
 /// OrderType tag encoding (codec-specific, not shared — order types are only
 /// in the journal format, not in snapshots).
@@ -259,6 +260,10 @@ pub fn encode(
             le::put_u64(&mut buf[pos..], new_quantity.get());
             pos += 8;
             TAG_CANCEL_REPLACE
+        }
+        JournalEvent::EndOfDay => {
+            // No payload — tag only.
+            TAG_END_OF_DAY
         }
         JournalEvent::QueryStats => {
             // QueryStats is never journaled — the journal stage filters it
@@ -745,6 +750,7 @@ pub fn decode(
                 amount: le::get_u64(&payload[8..]),
             }
         }
+        TAG_END_OF_DAY => JournalEvent::EndOfDay,
         _ => {
             return Err(JournalError::CorruptEntry {
                 sequence,
@@ -1225,7 +1231,6 @@ mod tests {
         buf_v7[h] = 6; // TAG_CANCEL_ALL
         h += 1;
         le::put_u32(&mut buf_v7[h..], 5); // account
-        h += 4;
         let data_end = ENTRY_HEADER_SIZE + payload_len as usize;
         let crc = crc32c::crc32c(&buf_v7[..data_end]);
         le::put_u32(&mut buf_v7[data_end..], crc);

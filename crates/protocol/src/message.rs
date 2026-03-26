@@ -2,7 +2,7 @@
 //!
 //! Includes both trading operations (submit/cancel) and administrative
 //! commands (add instrument, deposit, set risk limits). Administrative
-//! commands require `Permission::Admin` and are gated on the reader thread.
+//! commands require `Permission::Operator` and are gated on the reader thread.
 
 use melin_engine::types::{
     AccountId, CircuitBreakerConfig, CurrencyId, ExecutionReport, FeeSchedule, InstrumentSpec,
@@ -76,6 +76,10 @@ pub enum Request {
         schedule: FeeSchedule,
     },
 
+    /// Cancel all resting orders and pending stops with `TimeInForce::Day`
+    /// across all instruments. Triggered by an operator at end-of-session.
+    EndOfDay,
+
     // --- Query operations (Admin only) ---
     /// Request a snapshot of server stats (connections, throughput, book
     /// depth, balances). Tag-only, no payload. Flows through the pipeline
@@ -99,18 +103,25 @@ pub enum Request {
 }
 
 impl Request {
-    /// Whether this request requires `Permission::Admin`.
-    pub fn requires_admin(&self) -> bool {
+    /// Whether this request requires `Permission::Operator`.
+    /// Deposit and Withdraw are excluded — they require `can_manage_funds`
+    /// instead, which is satisfied by Custodian only.
+    pub fn requires_operator(&self) -> bool {
         matches!(
             self,
             Request::AddInstrument { .. }
-                | Request::Deposit { .. }
-                | Request::Withdraw { .. }
                 | Request::SetRiskLimits { .. }
                 | Request::SetCircuitBreaker { .. }
                 | Request::SetFeeSchedule { .. }
+                | Request::EndOfDay
                 | Request::QueryStats
         )
+    }
+
+    /// Whether this request is a fund management operation (deposit/withdraw).
+    /// Requires `Permission::Custodian`.
+    pub fn is_fund_management(&self) -> bool {
+        matches!(self, Request::Deposit { .. } | Request::Withdraw { .. })
     }
 }
 
@@ -143,6 +154,11 @@ pub enum ResponseKind {
     /// Authentication failed — invalid signature, unknown key, or
     /// other auth error. Server drops the connection after sending this.
     AuthFailed,
+
+    /// The server's input pipeline is full. The client should retry
+    /// after a brief backoff. Sent directly by the reader thread
+    /// without entering the pipeline. Tag-only, no payload.
+    ServerBusy,
 
     // --- Stats response ---
     /// Server stats snapshot. Sent in response to `QueryStats`.
