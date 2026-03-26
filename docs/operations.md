@@ -10,13 +10,14 @@ Production operations guide for the trading engine. Written for the person runni
 2. [Output Event Channel](#output-event-channel)
 3. [Recovery on Startup](#recovery-on-startup)
 4. [Journal Management](#journal-management)
-5. [Log Levels](#log-levels)
-6. [CPU Tuning](#cpu-tuning)
-7. [Monitoring](#monitoring)
-8. [Emergency Procedures](#emergency-procedures)
-9. [Crash Recovery Scenarios](#crash-recovery-scenarios)
-10. [Disk Failure](#disk-failure)
-11. [Capacity Planning](#capacity-planning)
+5. [Scheduled Snapshots](#scheduled-snapshots)
+6. [Log Levels](#log-levels)
+7. [CPU Tuning](#cpu-tuning)
+8. [Monitoring](#monitoring)
+9. [Emergency Procedures](#emergency-procedures)
+10. [Crash Recovery Scenarios](#crash-recovery-scenarios)
+11. [Disk Failure](#disk-failure)
+12. [Capacity Planning](#capacity-planning)
 
 ---
 
@@ -53,6 +54,8 @@ The server uses jemalloc by default (thread-local caches eliminate allocator loc
 | `--yield-idle` | `false` | Yield to OS scheduler when pipeline threads are idle instead of busy-spinning. Use on shared machines without isolated cores. |
 | `--health-bind` | `127.0.0.1:9877` | Address for the health/liveness TCP endpoint. Returns `OK\|ERR <conns> <seq> <lag>`. Omit to disable. |
 | `--event-bind` | (none) | Address for the output event publisher. Subscribers connect to receive all execution events in real time (market data, fills, cancellations). Ed25519 auth required. Omit to disable. See [Output Event Channel](#output-event-channel). |
+| `--snapshot-interval-secs` | `0` | Interval in seconds for automatic snapshots via the shadow exchange. `0` = disabled (startup-only snapshots). When enabled, a shadow exchange replays events on a separate thread and takes periodic snapshots without pausing the primary matching engine. See [Scheduled Snapshots](#scheduled-snapshots). |
+| `--snapshot-path` | (derived) | Path for snapshot files. Defaults to journal path with `.snapshot` extension. **Recommended: place on the OS disk, not the journal NVMe, to avoid I/O jitter on the hot path.** |
 
 #### Replication Flags
 
@@ -74,7 +77,7 @@ The server supports synchronous replication. Exactly one of `--replication-bind`
 3. Pre-fault all exchange hash map pages (avoids page faults on the hot path).
 4. Build the disruptor pipeline (input ring + output ring).
 5. Spawn reader thread pool (epoll-based, one thread per `--readers`).
-6. Spawn 3-5 pipeline OS threads: journal, matching, response, optionally repl-sender, optionally event-publisher -- each pinned to its `--cores` value.
+6. Spawn 3-6 pipeline OS threads: journal, matching, response, optionally repl-sender, optionally event-publisher, optionally shadow exchange -- each pinned to its `--cores` value.
 7. Set listener to non-blocking mode.
 8. Enter accept loop, authenticating connections via Ed25519 challenge-response.
 
@@ -271,6 +274,63 @@ The journal writer pre-allocates in 256 MiB chunks (`posix_fallocate`) to avoid 
 
 ---
 
+## Scheduled Snapshots
+
+### Architecture
+
+When `--snapshot-interval-secs` is set to a non-zero value, the server spawns a **shadow exchange** on a dedicated thread. The shadow exchange is a third consumer on the input disruptor ring, gated on the journal cursor (it only processes events after the journal has confirmed durability). It replays every event through its own independent copy of the exchange state, and periodically saves a snapshot to disk.
+
+```
+Input Disruptor Ring
+    ├──► Consumer 0: Journal Stage (pwritev2 + RWF_DSYNC)
+    ├──► Consumer 1: Matching Stage (primary Exchange)
+    └──► Consumer 2: Shadow Stage (shadow Exchange, gated on journal cursor)
+                          │
+                          ▼
+                    Periodic snapshot save
+                    (every --snapshot-interval-secs)
+```
+
+### How It Works
+
+1. The shadow stage consumes events from the input disruptor, always behind the journal cursor, ensuring it only processes durable events.
+2. It replays each event through its own `Exchange` instance, maintaining identical state to the primary.
+3. At each configured interval, the shadow exchange saves its state to the snapshot file. The snapshot is written atomically (`.tmp` + rename).
+4. Between snapshot writes, the shadow catches up to the current journal position before the next snapshot interval fires.
+
+### Zero Impact on Matching Engine
+
+The shadow exchange runs on its own dedicated core and has no interaction with the primary matching engine. It reads from the same input ring buffer but through its own independent cursor. The primary matching stage is never blocked or slowed by the shadow — they are fully parallel consumers.
+
+The state shared between the shadow and primary is read via a `SeqLock`, which provides wait-free reads for the primary and wait-free writes for the shadow.
+
+### Snapshot Placement
+
+**Recommended: place the snapshot file on the OS disk, not the journal NVMe.** The snapshot write is a bulk I/O operation (tens of MiB) that could cause I/O jitter on the journal NVMe if co-located. Use `--snapshot-path` to specify an explicit path on a separate disk:
+
+```sh
+./target/release/melin-server \
+    --journal /mnt/nvme/trading.journal \
+    --snapshot-path /var/lib/melin/trading.snapshot \
+    --snapshot-interval-secs 60 \
+    --cores 1,2,3,6,7,8 \
+    ...
+```
+
+If `--snapshot-path` is omitted, the snapshot defaults to `<journal>.snapshot` (e.g., `/mnt/nvme/trading.snapshot`), which shares the journal NVMe.
+
+### Catch-Up Behavior
+
+After each snapshot write (which may take tens of milliseconds for a large exchange state), the shadow stage falls behind the journal cursor. It catches up by processing events at full speed until it reaches the current journal position. Under sustained high throughput, the shadow may never be fully "caught up" — it continuously trails the primary by some lag. This is expected and harmless; the snapshot reflects a consistent point-in-time state that is always more recent than the previous snapshot.
+
+### Failure Mode
+
+If the shadow thread panics or dies, the server detects this via the pipeline health check and initiates a **full shutdown**. This is necessary because a dead consumer on the input disruptor stops advancing its ring progress counter, which would eventually cause the ring to fill and stall the journal and matching stages.
+
+If scheduled snapshots are not critical to your deployment, you can disable them (`--snapshot-interval-secs 0`, the default) to eliminate this failure mode entirely.
+
+---
+
 ## Log Levels
 
 Log output uses `tracing` with the `RUST_LOG` environment variable. The conventions are strict:
@@ -350,14 +410,15 @@ The recommended core assignment for a production server:
 | 3 | Response stage | `--cores ...,...,3,...` |
 | 4-5 | Reader threads | `--readers 2 --reader-cores 4` |
 | 6 | Replication sender | `--cores ...,...,...,6,...` |
-| 7 | Event publisher | `--cores ...,...,...,...,7` |
-| 8+ | Available for other work (benchmarks, monitoring) | -- |
+| 7 | Event publisher | `--cores ...,...,...,...,7,...` |
+| 8 | Shadow exchange (scheduled snapshots) | `--cores ...,...,...,...,...,8` |
+| 9+ | Available for other work (benchmarks, monitoring) | -- |
 
 ### Core Pinning (`--cores`, `--readers`, `--reader-cores`)
 
 Each pipeline thread calls `sched_setaffinity` to pin itself to the specified core. If pinning fails, a warning is logged but the server continues.
 
-- `--cores 1,2,3,6,7,8` pins journal to core 1, matching to core 2, response to core 3, repl-sender to core 6, event-publisher to core 7, shadow to core 8.
+- `--cores 1,2,3,6,7,8` pins journal to core 1, matching to core 2, response to core 3, repl-sender to core 6, event-publisher to core 7, shadow exchange to core 8.
 - `--readers 2 --reader-cores 4` pins reader 0 to core 4, reader 1 to core 5.
 
 ### Kernel Boot Parameters (GRUB)
@@ -365,7 +426,7 @@ Each pipeline thread calls `sched_setaffinity` to pin itself to the specified co
 For lowest latency, configure kernel boot parameters. Edit `/etc/default/grub` and append to `GRUB_CMDLINE_LINUX_DEFAULT`:
 
 ```
-isolcpus=nohz,domain,1-7 nohz_full=1-7 rcu_nocbs=1-7
+isolcpus=nohz,domain,1-8 nohz_full=1-8 rcu_nocbs=1-8
 ```
 
 Then apply:

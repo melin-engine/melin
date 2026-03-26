@@ -138,6 +138,7 @@ The TCP network stack is now the primary throughput limiter. The journal pipelin
 - Pipelined io_uring async fsync with group commit
 - Journal rotation (automatic snapshot + archive when size threshold exceeded at startup)
 - BLAKE3 hash chain with periodic checkpoints (tamper evidence, replica consistency verification)
+- Scheduled snapshots via shadow exchange — periodic snapshots taken on a dedicated thread without pausing the matching engine (`--snapshot-interval-secs`)
 
 ### Networking ([docs/wire-protocol.md](docs/wire-protocol.md))
 - Custom binary wire protocol (length-prefixed framing)
