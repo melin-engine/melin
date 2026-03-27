@@ -28,6 +28,7 @@ Features targeting regulated venues, gateway responsibilities, or with limited n
 
 | Feature | Why deferred |
 |---------|-------------|
+| Dual-NVMe journal hedging | Two journal threads on separate NVMe drives, response stage gates on the fastest. Cuts tail latency from P(slow) to P(slow)². Free durability redundancy. Low complexity but requires a second NVMe slot. Revisit when journal fsync is the dominant tail contributor. |
 | AF_XDP transport | DaMoN '25 found AF_XDP disappoints vs DPDK for small-message request-response workloads. DPDK transport already in progress. Revisit if DPDK proves insufficient. |
 | Per-account trading permissions | Gateway concern — each firm's gateway instance restricts which accounts that connection can trade. Multi-tenant access control. |
 | Order throttling | Gateway concern — rate limit per-account before requests reach the engine. SEC-04 audit finding. |
