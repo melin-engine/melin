@@ -50,6 +50,7 @@ const ACTIONS: &[&str] = &[
     "Set Circuit Breaker",
     "Set Fee Schedule",
     "End of Day",
+    "Expire Orders (GTD)",
 ];
 
 const TIF_OPTIONS: &[(&str, TimeInForce)] = &[
@@ -57,6 +58,7 @@ const TIF_OPTIONS: &[(&str, TimeInForce)] = &[
     ("IOC (Immediate-Or-Cancel)", TimeInForce::IOC),
     ("FOK (Fill-Or-Kill)", TimeInForce::FOK),
     ("Day (cancel at end-of-day)", TimeInForce::Day),
+    ("GTD (Good-Til-Date)", TimeInForce::GTD),
 ];
 
 const STP_OPTIONS: &[(&str, SelfTradeProtection)] = &[
@@ -101,6 +103,8 @@ struct OrderFields {
     trigger_price: Option<u64>,
     /// Quantity in lots.
     quantity: Option<u64>,
+    /// Expiry timestamp in nanoseconds since Unix epoch (GTD only).
+    expiry_ns: u64,
 }
 
 impl OrderFields {
@@ -114,6 +118,7 @@ impl OrderFields {
             price: None,
             trigger_price: None,
             quantity: None,
+            expiry_ns: 0,
         }
     }
 
@@ -220,6 +225,10 @@ enum NextStep {
     /// Fee schedule: entered maker bps, enter taker fee bps.
     /// `i16` to support negative values (rebates).
     FeeScheduleTakerBps { symbol: u32, maker_bps: i16 },
+    /// Expire orders: enter timestamp_ns.
+    ExpireOrdersTimestamp,
+    /// GTD expiry: after TIF selection, enter expiry timestamp_ns.
+    AfterTifExpiry { collected: OrderFields },
 }
 
 struct App {
@@ -491,6 +500,10 @@ impl App {
                         buf: String::new(),
                         next: NextStep::FeeScheduleMakerBps { symbol: *symbol },
                     },
+                    NextStep::ExpireOrdersTimestamp => Screen::ActionMenu,
+                    NextStep::AfterTifExpiry { collected } => Screen::TifMenu {
+                        collected: collected.clone(),
+                    },
                 }
             }
         };
@@ -579,6 +592,14 @@ impl App {
                         // End of Day — send immediately, no parameters.
                         let _ = self.request_tx.send(Request::EndOfDay);
                         self.log.push("Sent EndOfDay".into());
+                    }
+                    17 => {
+                        // Expire Orders (GTD) — ask for timestamp_ns.
+                        self.screen = Screen::NumberInput {
+                            label: "Timestamp (ns since Unix epoch)",
+                            buf: String::new(),
+                            next: NextStep::ExpireOrdersTimestamp,
+                        };
                     }
                     _ => {}
                 }
@@ -1020,13 +1041,39 @@ impl App {
                         self.screen = Screen::ActionMenu;
                         self.cursor = 0;
                     }
+
+                    // --- Expire orders flow ---
+                    NextStep::ExpireOrdersTimestamp => {
+                        let request = Request::ExpireOrders { timestamp_ns: val };
+                        self.log
+                            .push(format!("→ EXPIRE ORDERS at timestamp_ns={val}"));
+                        let _ = self.request_tx.send(request);
+                        self.screen = Screen::ActionMenu;
+                        self.cursor = 0;
+                    }
+
+                    // --- GTD expiry input after TIF selection ---
+                    NextStep::AfterTifExpiry { mut collected } => {
+                        collected.expiry_ns = val;
+                        self.screen = Screen::StpMenu { collected };
+                        self.cursor = 0;
+                    }
                 }
             }
 
             Screen::TifMenu { collected } => {
                 let mut collected = collected.clone();
                 collected.tif = TIF_OPTIONS[self.cursor].1;
-                self.screen = Screen::StpMenu { collected };
+                if collected.tif == TimeInForce::GTD {
+                    // GTD requires an expiry timestamp — prompt for it.
+                    self.screen = Screen::NumberInput {
+                        label: "Expiry (ns since Unix epoch)",
+                        buf: String::new(),
+                        next: NextStep::AfterTifExpiry { collected },
+                    };
+                } else {
+                    self.screen = Screen::StpMenu { collected };
+                }
                 self.cursor = 0;
             }
 
@@ -1093,6 +1140,7 @@ impl App {
             time_in_force: f.tif,
             quantity: qty,
             stp: f.stp,
+            expiry_ns: f.expiry_ns,
         };
 
         let side_str = if f.side() == Side::Buy { "BUY" } else { "SELL" };
@@ -1249,6 +1297,7 @@ fn format_report(report: &ExecutionReport) -> String {
                 RejectReason::HasRestingOrders => "has resting orders",
                 RejectReason::DuplicateRequest => "duplicate request",
                 RejectReason::ReplicaDisconnected => "replica disconnected",
+                RejectReason::InvalidExpiry => "invalid expiry",
             };
             format!("REJECT  #{} ({reason_str})", order_id.0)
         }

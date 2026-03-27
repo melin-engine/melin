@@ -57,10 +57,11 @@ pub struct ServerConfig {
     /// Path to a snapshot file for faster recovery.
     #[arg(long)]
     pub snapshot: Option<PathBuf>,
-    /// Pipeline core IDs: journal,matching,response[,repl-sender]
+    /// Pipeline core IDs: journal,matching,response,repl-sender,event-publisher,shadow
     /// (comma-separated). Core 0 is reserved for OS/IRQ handling.
-    /// The 4th core (repl-sender) is used when replication is enabled.
-    #[arg(long, default_value = "1,2,3,6,7", value_parser = parse_cores)]
+    /// repl-sender is used when replication is enabled, event-publisher when
+    /// `--event-bind` is set, shadow when `--snapshot-interval-secs` > 0.
+    #[arg(long, default_value = "1,2,3,6,7,8", value_parser = parse_cores)]
     pub cores: PipelineCores,
     /// Number of epoll reader threads.
     #[arg(long, default_value_t = 2)]
@@ -204,6 +205,18 @@ pub struct ServerConfig {
     /// to primary. Ignored in primary mode.
     #[arg(long)]
     pub promote_bind: Option<SocketAddr>,
+
+    /// Interval in seconds between automatic shadow snapshots. The shadow
+    /// stage replays journaled events on a cloned Exchange and saves a
+    /// consistent snapshot at this cadence — no hot-path stall. Set to 0
+    /// (default) to disable shadow snapshots entirely.
+    #[arg(long, default_value_t = 0)]
+    pub snapshot_interval_secs: u64,
+
+    /// Path for shadow snapshots. Defaults to the journal path with a
+    /// `.snapshot` extension (same as the startup snapshot path).
+    #[arg(long)]
+    pub snapshot_path: Option<PathBuf>,
 }
 
 /// Delegates to clap so `#[arg(default_value...)]` is the single source of
@@ -225,6 +238,7 @@ impl Default for ServerConfig {
                 response: 3,
                 repl_sender: 6,
                 event_publisher: 7,
+                shadow: 8,
             },
             readers: 2,
             reader_cores: 4,
@@ -254,6 +268,8 @@ impl Default for ServerConfig {
             event_bind: None,
             health_bind: Some("127.0.0.1:9877".parse().expect("valid default addr")),
             promote_bind: None,
+            snapshot_interval_secs: 0,
+            snapshot_path: None,
         }
     }
 }
@@ -281,13 +297,22 @@ impl ServerConfig {
             Some(std::time::Duration::from_secs(self.connection_timeout_secs))
         }
     }
+
+    /// Snapshot path for the shadow stage. Uses the explicit `--snapshot-path`
+    /// if set, otherwise derives from the journal path with `.snapshot` extension.
+    pub fn shadow_snapshot_path(&self) -> PathBuf {
+        self.snapshot_path
+            .clone()
+            .unwrap_or_else(|| self.journal.with_extension("snapshot"))
+    }
 }
 
 /// Core assignments for pipeline threads.
 ///
-/// Five fields: journal, matching, response, repl-sender, and event-publisher.
-/// All five are always stored; repl-sender is only used when replication is
-/// enabled, event-publisher only when `--event-bind` is set.
+/// Six fields: journal, matching, response, repl-sender, event-publisher,
+/// and shadow. All are always stored; repl-sender is only used when
+/// replication is enabled, event-publisher only when `--event-bind` is set,
+/// and shadow only when `--snapshot-interval-secs` > 0.
 #[derive(Debug, Clone, Copy)]
 pub struct PipelineCores {
     pub journal: usize,
@@ -295,14 +320,15 @@ pub struct PipelineCores {
     pub response: usize,
     pub repl_sender: usize,
     pub event_publisher: usize,
+    pub shadow: usize,
 }
 
-/// Parse "j,m,r,s,e" into `PipelineCores` for pipeline core affinity.
+/// Parse "j,m,r,s,e,sh" into `PipelineCores` for pipeline core affinity.
 fn parse_cores(s: &str) -> Result<PipelineCores, String> {
     let parts: Vec<&str> = s.split(',').collect();
-    if parts.len() != 5 {
+    if parts.len() != 6 {
         return Err(format!(
-            "expected 5 comma-separated core IDs (journal,matching,response,repl-sender,event-publisher), got {}",
+            "expected 6 comma-separated core IDs (journal,matching,response,repl-sender,event-publisher,shadow), got {}",
             parts.len()
         ));
     }
@@ -316,6 +342,7 @@ fn parse_cores(s: &str) -> Result<PipelineCores, String> {
         response: parse(parts[2])?,
         repl_sender: parse(parts[3])?,
         event_publisher: parse(parts[4])?,
+        shadow: parse(parts[5])?,
     })
 }
 
@@ -477,6 +504,16 @@ fn run_as_primary<L: BlockingTransportListener>(
         Vec::new()
     };
 
+    // Clone the exchange for the shadow snapshot stage before the pipeline
+    // consumes it. Uses snapshot_state() + restore_state() round-trip since
+    // Exchange doesn't implement Clone (internal data structures are complex).
+    let enable_shadow = config.snapshot_interval_secs > 0;
+    let shadow_exchange = if enable_shadow {
+        Some(exchange.clone_via_snapshot())
+    } else {
+        None
+    };
+
     // Build the disruptor pipeline with optional replication consumer.
     let enable_event_publisher = config.event_bind.is_some();
     let (
@@ -491,6 +528,8 @@ fn run_as_primary<L: BlockingTransportListener>(
         replication,
         replication_cursor,
         replica_connected,
+        shadow_consumer,
+        chain_hash_lock,
     ) = build_pipeline_with_replication(
         exchange,
         writer,
@@ -501,6 +540,7 @@ fn run_as_primary<L: BlockingTransportListener>(
         config.replication_ring_size,
         !config.yield_idle,
         enable_event_publisher,
+        enable_shadow,
     );
     // Consumer 0 is always the response stage. Consumer 1 (if present)
     // is the event publisher — only created when --event-bind is set.
@@ -671,6 +711,41 @@ fn run_as_primary<L: BlockingTransportListener>(
         None
     };
 
+    // Spawn shadow snapshot thread if enabled. The shadow stage replays
+    // journal-fsynced events on a cloned Exchange and saves periodic
+    // snapshots — fully off the hot path.
+    let shadow_handle = if let Some(shadow_cons) = shadow_consumer {
+        let snap_path = config.shadow_snapshot_path();
+        let interval = std::time::Duration::from_secs(config.snapshot_interval_secs);
+        let chain_hash = chain_hash_lock.expect("chain hash lock must be Some when shadow enabled");
+        let shadow_ex = shadow_exchange.expect("shadow exchange must be Some when shadow enabled");
+        let s_shadow = Arc::clone(&shutdown);
+        let handle = std::thread::Builder::new()
+            .name("shadow".into())
+            .spawn(move || {
+                apply_affinity("shadow", cores.shadow);
+                crate::shadow::run(
+                    shadow_cons,
+                    shadow_ex,
+                    snap_path,
+                    interval,
+                    chain_hash,
+                    &s_shadow,
+                    busy_spin,
+                );
+            })
+            .expect("failed to spawn shadow thread");
+
+        info!(
+            interval_secs = config.snapshot_interval_secs,
+            path = %config.shadow_snapshot_path().display(),
+            "shadow snapshot stage started"
+        );
+        Some(handle)
+    } else {
+        None
+    };
+
     // Seed instruments and accounts through the pipeline on first startup.
     // Events flow through journal + matching + replication like regular
     // trading events. Must happen after pipeline threads start (they
@@ -825,10 +900,12 @@ fn run_as_primary<L: BlockingTransportListener>(
         let event_pub_died = event_publisher_handle
             .as_ref()
             .is_some_and(|h| h.is_finished());
+        let shadow_died = shadow_handle.as_ref().is_some_and(|h| h.is_finished());
         if (journal_handle.is_finished()
             || matching_handle.is_finished()
             || response_handle.is_finished()
-            || event_pub_died)
+            || event_pub_died
+            || shadow_died)
             && !shutdown.load(Ordering::Relaxed)
         {
             error!("pipeline thread died, initiating shutdown");
@@ -996,6 +1073,11 @@ fn run_as_primary<L: BlockingTransportListener>(
         let _ = event_handle.join();
     }
 
+    // Join shadow snapshot thread.
+    if let Some(shadow_h) = shadow_handle {
+        let _ = shadow_h.join();
+    }
+
     // Join health endpoint thread.
     if let Some(h) = health_handle {
         let _ = h.join();
@@ -1076,7 +1158,9 @@ pub fn run_dpdk(
         Vec::new()
     };
 
-    // Build disruptor pipeline.
+    // Build disruptor pipeline (same flags as the kernel TCP path).
+    let enable_event_publisher = config.event_bind.is_some();
+    let enable_shadow = config.snapshot_interval_secs > 0;
     let (
         input_producer,
         journal_stage,
@@ -1089,6 +1173,8 @@ pub fn run_dpdk(
         replication,
         replication_cursor,
         replica_connected,
+        _shadow_consumer,
+        _chain_hash_lock,
     ) = build_pipeline_with_replication(
         exchange,
         writer,
@@ -1098,7 +1184,8 @@ pub fn run_dpdk(
         config.max_journal_batch,
         config.replication_ring_size,
         !config.yield_idle,
-        false, // no event publisher in DPDK mode (yet)
+        enable_event_publisher,
+        enable_shadow,
     );
 
     let heartbeat_interval = config.heartbeat_interval();

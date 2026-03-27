@@ -677,6 +677,7 @@ mod tests {
             time_in_force: TimeInForce::GTC,
             quantity: qty(q),
             stp: SelfTradeProtection::Allow,
+            expiry_ns: 0,
         }
     }
 
@@ -692,6 +693,7 @@ mod tests {
             time_in_force: TimeInForce::GTC,
             quantity: qty(q),
             stp: SelfTradeProtection::Allow,
+            expiry_ns: 0,
         }
     }
 
@@ -704,6 +706,7 @@ mod tests {
             time_in_force: TimeInForce::IOC,
             quantity: qty(q),
             stp: SelfTradeProtection::Allow,
+            expiry_ns: 0,
         }
     }
 
@@ -716,6 +719,7 @@ mod tests {
             time_in_force: TimeInForce::IOC,
             quantity: qty(q),
             stp: SelfTradeProtection::Allow,
+            expiry_ns: 0,
         }
     }
 

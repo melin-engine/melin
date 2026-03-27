@@ -9,4 +9,5 @@
 
 pub mod padding;
 pub mod ring;
+pub mod seqlock;
 pub mod spsc;

@@ -983,6 +983,9 @@ fn replay_event(
         JournalEvent::EndOfDay => {
             exchange.end_of_day(reports);
         }
+        JournalEvent::ExpireOrders { timestamp_ns } => {
+            exchange.expire_orders(*timestamp_ns, reports);
+        }
         JournalEvent::SetCircuitBreaker { symbol, config } => {
             exchange.set_circuit_breaker(*symbol, *config);
         }

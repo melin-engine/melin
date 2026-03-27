@@ -97,6 +97,7 @@ pub fn to_event(request: &Request) -> JournalEvent {
         }
         Request::QueryStats => JournalEvent::QueryStats,
         Request::EndOfDay => JournalEvent::EndOfDay,
+        Request::ExpireOrders { timestamp_ns } => JournalEvent::ExpireOrders { timestamp_ns },
         Request::Heartbeat | Request::ChallengeResponse { .. } => {
             unreachable!("heartbeats and auth messages must be filtered before to_event")
         }
@@ -138,6 +139,7 @@ mod tests {
                 quantity: Quantity(NonZeroU64::new(10).unwrap()),
                 time_in_force: TimeInForce::GTC,
                 stp: SelfTradeProtection::CancelNewest,
+                expiry_ns: 0,
             },
         };
         assert!(!should_filter(&req));
@@ -221,6 +223,7 @@ mod tests {
             quantity: Quantity(NonZeroU64::new(10).unwrap()),
             time_in_force: TimeInForce::GTC,
             stp: SelfTradeProtection::Allow,
+            expiry_ns: 0,
         };
         to_event(&Request::SubmitOrder {
             symbol: Symbol(1),

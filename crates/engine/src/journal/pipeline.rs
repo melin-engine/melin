@@ -31,6 +31,7 @@ use crate::types::{AccountId, ExecutionReport, OrderId, RejectReason};
 
 use melin_disruptor::padding::Sequence;
 use melin_disruptor::ring;
+use melin_disruptor::seqlock::SeqLock;
 
 /// Ring buffer capacity for the input disruptor (journal + matching consumers).
 /// 2^20 = 1,048,576 slots. At ~72 bytes per slot, this is ~72 MiB — fits in
@@ -204,6 +205,10 @@ pub struct JournalStage {
     /// `flush_batch_sync()`. No heap allocation — just a memcpy into the
     /// ring's pre-allocated buffer. When `None`, replication is disabled.
     replication_producer: Option<ReplicationProducer>,
+    /// Optional SeqLock for publishing the BLAKE3 chain hash to the shadow
+    /// snapshot stage. Updated once per fsync batch (cold path). `None` when
+    /// shadow snapshots are disabled — no allocation or write overhead.
+    chain_hash: Option<Arc<SeqLock<[u8; 32]>>>,
     /// When true, never yield to the OS scheduler — spin indefinitely with
     /// PAUSE. Requires isolated cores (`isolcpus`). See [`idle_wait`].
     busy_spin: bool,
@@ -229,6 +234,7 @@ impl JournalStage {
             group_commit_delay,
             max_batch: max_batch.min(MAX_JOURNAL_BATCH),
             replication_producer: None,
+            chain_hash: None,
             busy_spin,
         }
     }
@@ -238,6 +244,13 @@ impl JournalStage {
     /// No heap allocation — just a memcpy into a pre-allocated buffer.
     pub fn set_replication_producer(&mut self, producer: ReplicationProducer) {
         self.replication_producer = Some(producer);
+    }
+
+    /// Set the SeqLock for publishing the BLAKE3 chain hash to the shadow
+    /// snapshot stage. Called once during pipeline construction when shadow
+    /// snapshots are enabled.
+    pub fn set_chain_hash_lock(&mut self, lock: Arc<SeqLock<[u8; 32]>>) {
+        self.chain_hash = Some(lock);
     }
 
     /// Run the journal stage loop.
@@ -430,6 +443,8 @@ impl JournalStage {
                     }
 
                     self.consumer.commit(pending);
+                    self.publish_chain_hash();
+
                     pending = 0;
                     #[cfg(not(feature = "no-fsync"))]
                     {
@@ -443,6 +458,18 @@ impl JournalStage {
                 }
                 idle_wait(&mut idle_spins, self.busy_spin);
             }
+        }
+    }
+
+    /// Publish the current BLAKE3 chain hash to the shadow snapshot stage
+    /// via the SeqLock. Called once per fsync batch (cold path). No-op when
+    /// shadow snapshots are disabled or hash-chain is not active.
+    #[inline]
+    fn publish_chain_hash(&self) {
+        if let Some(ref lock) = self.chain_hash
+            && let Some(hash) = self.writer.chain_hash()
+        {
+            lock.store(hash);
         }
     }
 
@@ -564,6 +591,7 @@ impl JournalStage {
                 if let Some((batch_data, seq)) = inflight.take() {
                     self.wait_for_cqe(&mut ring, &batch_data);
                     self.consumer.set_progress(seq);
+                    self.publish_chain_hash();
                     self.writer.confirm_async_write(batch_data);
                 }
                 // Flush any pending buffered data synchronously.
@@ -597,6 +625,7 @@ impl JournalStage {
                 }
                 // Advance cursor: these events are now durable.
                 self.consumer.set_progress(seq);
+                self.publish_chain_hash();
                 let completed = inflight.take().expect("checked above");
                 self.writer.confirm_async_write(completed.0);
             }
@@ -655,6 +684,7 @@ impl JournalStage {
                     );
                 }
                 self.consumer.set_progress(seq);
+                self.publish_chain_hash();
                 let completed = inflight.take().expect("checked above");
                 self.writer.confirm_async_write(completed.0);
             }
@@ -680,6 +710,7 @@ impl JournalStage {
                     if let Some((batch_data, seq)) = inflight.take() {
                         self.wait_for_cqe(&mut ring, &batch_data);
                         self.consumer.set_progress(seq);
+                        self.publish_chain_hash();
                         self.writer.confirm_async_write(batch_data);
                     }
 
@@ -1143,6 +1174,9 @@ impl MatchingStage {
             JournalEvent::EndOfDay => {
                 self.exchange.end_of_day(reports);
             }
+            JournalEvent::ExpireOrders { timestamp_ns } => {
+                self.exchange.expire_orders(timestamp_ns, reports);
+            }
             JournalEvent::SetCircuitBreaker { symbol, config } => {
                 self.exchange.set_circuit_breaker(symbol, config);
             }
@@ -1246,6 +1280,8 @@ pub fn build_pipeline(
         _,
         _,
         _,
+        _,
+        _,
     ) = build_pipeline_with_replication(
         exchange,
         writer,
@@ -1254,6 +1290,7 @@ pub fn build_pipeline(
         false,
         MAX_JOURNAL_BATCH,
         crate::journal::replication::REPLICATION_RING_CAPACITY,
+        false,
         false,
         false,
     );
@@ -1289,6 +1326,7 @@ pub fn build_pipeline_with_replication(
     replication_ring_size: usize,
     busy_spin: bool,
     enable_event_publisher: bool,
+    enable_shadow: bool,
 ) -> (
     ring::MultiProducer<InputSlot>,
     JournalStage,
@@ -1301,20 +1339,34 @@ pub fn build_pipeline_with_replication(
     Option<ReplicationConsumer>,
     Arc<AtomicU64>,
     Option<Arc<AtomicBool>>,
+    Option<ring::Consumer<InputSlot>>,
+    Option<Arc<SeqLock<[u8; 32]>>>,
 ) {
-    // Input disruptor: N producers (reader threads), 2 parallel consumers.
+    // Input disruptor: N producers (reader threads), 2+ parallel consumers.
     // MultiProducer allows lock-free concurrent publishing from all reader
     // threads, eliminating the Mutex that previously serialized access.
-    let (input_producer, mut consumers) =
-        ring::DisruptorBuilder::<InputSlot>::new(INPUT_RING_CAPACITY)
-            .add_consumer() // consumer 0: journal, gated on producer
-            .add_consumer() // consumer 1: matching, gated on producer (parallel)
-            .build_multi_producer();
+    // When shadow snapshots are enabled, a third consumer is chained after
+    // journal (consumer 0) — it only sees events that have been durably fsynced.
+    let mut builder = ring::DisruptorBuilder::<InputSlot>::new(INPUT_RING_CAPACITY)
+        .add_consumer() // consumer 0: journal, gated on producer
+        .add_consumer(); // consumer 1: matching, gated on producer (parallel)
+    if enable_shadow {
+        builder = builder.add_consumer_after(0); // consumer 2: shadow, gated on journal
+    }
+    let (input_producer, mut consumers) = builder.build_multi_producer();
 
     // Type-erased cursor reader for queue depth monitoring.
     // Extracted before the producer is cloned to reader threads.
     let input_cursor = input_producer.cursor_reader();
 
+    // Pop consumers in reverse order of addition. With shadow enabled the
+    // build order is [journal(0), matching(1), shadow(2)], so pop yields:
+    // shadow(2), matching(1), journal(0).
+    let shadow_consumer = if enable_shadow {
+        Some(consumers.pop().expect("shadow consumer"))
+    } else {
+        None
+    };
     let matching_consumer = consumers.pop().expect("matching consumer");
     let journal_consumer = consumers.pop().expect("journal consumer");
 
@@ -1353,6 +1405,18 @@ pub fn build_pipeline_with_replication(
             crate::journal::replication::build_replication_ring(1, replication_ring_size);
         journal_stage.set_replication_producer(producer);
         Some(ring_consumers.pop().expect("replication consumer"))
+    } else {
+        None
+    };
+
+    // SeqLock for publishing the BLAKE3 chain hash to the shadow snapshot
+    // stage. Allocated only when shadow is enabled — zero overhead otherwise.
+    // Initialized to all-zeros; the journal stage writes the real hash after
+    // the first fsync batch.
+    let chain_hash_lock = if enable_shadow {
+        let lock = Arc::new(SeqLock::new([0u8; 32]));
+        journal_stage.set_chain_hash_lock(Arc::clone(&lock));
+        Some(lock)
     } else {
         None
     };
@@ -1399,6 +1463,8 @@ pub fn build_pipeline_with_replication(
         replication_consumer,
         replication_cursor,
         replica_connected,
+        shadow_consumer,
+        chain_hash_lock,
     )
 }
 
@@ -1429,6 +1495,7 @@ mod tests {
             time_in_force: TimeInForce::GTC,
             quantity: Quantity(NonZeroU64::new(qty).unwrap()),
             stp: SelfTradeProtection::Allow,
+            expiry_ns: 0,
         }
     }
 
@@ -1692,6 +1759,8 @@ mod tests {
             replication_rx,
             replication_cursor,
             _replica_connected,
+            _shadow_consumer,
+            _chain_hash_lock,
         ) = build_pipeline_with_replication(
             exchange,
             writer,
@@ -1700,6 +1769,7 @@ mod tests {
             true,
             MAX_JOURNAL_BATCH,
             REPLICATION_RING_CAPACITY,
+            false,
             false,
             false,
         );
@@ -1854,7 +1924,7 @@ mod tests {
             let writer = JournalWriter::create(&path).unwrap();
             let active_conns = Arc::new(AtomicU64::new(0));
 
-            let (_, _, _, _, _, _, _, _, replication, replication_cursor, _) =
+            let (_, _, _, _, _, _, _, _, replication, replication_cursor, _, _, _) =
                 build_pipeline_with_replication(
                     exchange,
                     writer,
@@ -1863,6 +1933,7 @@ mod tests {
                     false,
                     MAX_JOURNAL_BATCH,
                     REPLICATION_RING_CAPACITY,
+                    false,
                     false,
                     false,
                 );
@@ -1877,7 +1948,7 @@ mod tests {
             let writer = JournalWriter::create(&path).unwrap();
             let active_conns = Arc::new(AtomicU64::new(0));
 
-            let (_, _, _, _, _, _, _, _, replication, replication_cursor, _) =
+            let (_, _, _, _, _, _, _, _, replication, replication_cursor, _, _, _) =
                 build_pipeline_with_replication(
                     exchange,
                     writer,
@@ -1886,6 +1957,7 @@ mod tests {
                     true,
                     MAX_JOURNAL_BATCH,
                     REPLICATION_RING_CAPACITY,
+                    false,
                     false,
                     false,
                 );

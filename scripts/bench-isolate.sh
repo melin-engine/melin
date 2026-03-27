@@ -13,7 +13,7 @@
 #   4. irqbalance → stopped (prevents daemon from redistributing IRQs)
 #
 # Core layout: 0=OS/IRQ, 1-3=pipeline (journal/matching/response),
-# 4-5=reader threads / DPDK poll threads, 6=repl-sender, 7=event-publisher, 8+=bench threads.
+# 4-5=reader threads (or DPDK poll threads), 6=repl-sender, 7=event-publisher, 8=shadow, 9+=bench threads.
 # All pinned via sched_setaffinity.
 # All settings are saved and restored on exit (including Ctrl-C / errors).
 # Kernel dmesg is captured before/after to correlate spikes with kernel events.
@@ -116,7 +116,7 @@ else
 fi
 
 # 4. Pin all IRQs to core 0. This keeps hardware interrupts (NIC, NVMe,
-#    USB, etc.) off pipeline cores 1-5 and bench cores 6+. Core 0 is
+#    USB, etc.) off pipeline cores 1-8 and bench cores 9+. Core 0 is
 #    reserved for OS work and interrupt handling.
 #    smp_affinity is a hex bitmask — "1" = core 0 only.
 irq_pinned=0
@@ -231,7 +231,7 @@ echo ""
 
 # Run as the invoking user (SUDO_USER), not root.
 # No taskset — all threads self-pin via sched_setaffinity:
-# cores 1-3 pipeline, 4-5 readers, 6+ bench threads.
+# cores 1-3 pipeline, 4-5 readers, 6=repl-sender, 7=event-publisher, 8=shadow, 9+ bench threads.
 CARGO_BIN="$(sudo -u "${SUDO_USER}" bash -lc 'which cargo')"
 sudo -u "${SUDO_USER}" \
     "$CARGO_BIN" run --release -p melin-bench "$@"

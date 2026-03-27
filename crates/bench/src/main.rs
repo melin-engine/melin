@@ -692,6 +692,7 @@ fn run_pipeline_bench(
                             time_in_force: TimeInForce::GTC,
                             quantity: Quantity(nz(1)),
                             stp: SelfTradeProtection::Allow,
+                            expiry_ns: 0,
                         },
                     },
                     publish_ts: trace_ts(),

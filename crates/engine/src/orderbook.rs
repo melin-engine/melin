@@ -20,8 +20,10 @@ pub(crate) struct RestingOrder {
     remaining: Quantity,
     /// Stored to support selective cancellation (e.g., EndOfDay cancels
     /// only Day orders, not GTC). IOC/FOK orders never rest, so this
-    /// is always GTC or Day in practice.
+    /// is always GTC, Day, or GTD in practice.
     time_in_force: TimeInForce,
+    /// Expiry time in nanoseconds (GTD orders). Zero for non-GTD.
+    expiry_ns: u64,
 }
 
 /// A pending stop order waiting to be triggered.
@@ -42,6 +44,8 @@ pub(crate) struct PendingStop {
     quote_budget: Option<u64>,
     /// Self-trade prevention mode, preserved from the original order.
     stp: SelfTradeProtection,
+    /// Expiry time in nanoseconds (GTD orders). Zero for non-GTD.
+    expiry_ns: u64,
 }
 
 /// One side of the order book (either all bids or all asks).
@@ -66,12 +70,14 @@ impl RestingOrder {
         account: AccountId,
         remaining: Quantity,
         time_in_force: TimeInForce,
+        expiry_ns: u64,
     ) -> Self {
         Self {
             id,
             account,
             remaining,
             time_in_force,
+            expiry_ns,
         }
     }
 
@@ -90,6 +96,10 @@ impl RestingOrder {
     pub(crate) fn time_in_force(&self) -> TimeInForce {
         self.time_in_force
     }
+
+    pub(crate) fn expiry_ns(&self) -> u64 {
+        self.expiry_ns
+    }
 }
 
 impl PendingStop {
@@ -105,6 +115,7 @@ impl PendingStop {
         limit_price: Option<Price>,
         quote_budget: Option<u64>,
         stp: SelfTradeProtection,
+        expiry_ns: u64,
     ) -> Self {
         Self {
             id,
@@ -116,6 +127,7 @@ impl PendingStop {
             limit_price,
             quote_budget,
             stp,
+            expiry_ns,
         }
     }
 
@@ -153,6 +165,10 @@ impl PendingStop {
 
     pub(crate) fn stp(&self) -> SelfTradeProtection {
         self.stp
+    }
+
+    pub(crate) fn expiry_ns(&self) -> u64 {
+        self.expiry_ns
     }
 }
 
@@ -752,6 +768,63 @@ impl OrderBook {
         }
     }
 
+    /// Cancel all GTD orders whose expiry time has passed.
+    ///
+    /// Scans resting orders (bids + asks) and pending stops, cancelling any
+    /// with `time_in_force == GTD && expiry_ns > 0 && expiry_ns <= now_ns`.
+    /// Same pattern as `cancel_day_orders` — collect IDs first, then cancel
+    /// to avoid borrowing conflicts.
+    pub fn cancel_expired_orders(&mut self, now_ns: u64, reports: &mut Vec<ExecutionReport>) {
+        // Collect first to avoid borrow conflict with self.cancel().
+        let mut to_cancel: Vec<(AccountId, OrderId)> = Vec::new();
+
+        for (_, queue) in &self.bids.levels {
+            for order in queue {
+                if order.time_in_force == TimeInForce::GTD
+                    && order.expiry_ns > 0
+                    && order.expiry_ns <= now_ns
+                {
+                    to_cancel.push((order.account, order.id));
+                }
+            }
+        }
+        for (_, queue) in &self.asks.levels {
+            for order in queue {
+                if order.time_in_force == TimeInForce::GTD
+                    && order.expiry_ns > 0
+                    && order.expiry_ns <= now_ns
+                {
+                    to_cancel.push((order.account, order.id));
+                }
+            }
+        }
+
+        for stops in self.stop_buys.values() {
+            for stop in stops {
+                if stop.time_in_force == TimeInForce::GTD
+                    && stop.expiry_ns > 0
+                    && stop.expiry_ns <= now_ns
+                {
+                    to_cancel.push((stop.account, stop.id));
+                }
+            }
+        }
+        for stops in self.stop_sells.values() {
+            for stop in stops {
+                if stop.time_in_force == TimeInForce::GTD
+                    && stop.expiry_ns > 0
+                    && stop.expiry_ns <= now_ns
+                {
+                    to_cancel.push((stop.account, stop.id));
+                }
+            }
+        }
+
+        for (account, id) in to_cancel {
+            self.cancel(account, id, reports);
+        }
+    }
+
     fn execute_limit(&mut self, order: Order, price: Price, reports: &mut Vec<ExecutionReport>) {
         // Post-only: reject if the order would cross the spread.
         if let OrderType::Limit {
@@ -816,9 +889,10 @@ impl OrderBook {
                     });
                 } else {
                     match order.time_in_force {
-                        // GTC and Day both rest on the book. Day orders are
-                        // bulk-cancelled later by EndOfDay.
-                        TimeInForce::GTC | TimeInForce::Day => {
+                        // GTC, Day, and GTD all rest on the book. Day orders
+                        // are bulk-cancelled by EndOfDay; GTD orders are
+                        // bulk-cancelled by ExpireOrders.
+                        TimeInForce::GTC | TimeInForce::Day | TimeInForce::GTD => {
                             self.place_on_book(
                                 order.id,
                                 order.account,
@@ -826,6 +900,7 @@ impl OrderBook {
                                 price,
                                 rem,
                                 order.time_in_force,
+                                order.expiry_ns,
                                 reports,
                             );
                         }
@@ -1106,6 +1181,7 @@ impl OrderBook {
             limit_price,
             quote_budget,
             stp: order.stp,
+            expiry_ns: order.expiry_ns,
         };
         let stops = match order.side {
             Side::Buy => &mut self.stop_buys,
@@ -1196,6 +1272,7 @@ impl OrderBook {
                 time_in_force: stop.time_in_force,
                 quantity: stop.quantity,
                 stp: stop.stp,
+                expiry_ns: stop.expiry_ns,
             };
 
             // Re-enter execute but skip check_triggers to avoid recursion —
@@ -1213,6 +1290,7 @@ impl OrderBook {
         self.triggered_buf = triggered;
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn place_on_book(
         &mut self,
         id: OrderId,
@@ -1221,6 +1299,7 @@ impl OrderBook {
         price: Price,
         quantity: Quantity,
         time_in_force: TimeInForce,
+        expiry_ns: u64,
         reports: &mut Vec<ExecutionReport>,
     ) {
         let book_side = match side {
@@ -1234,6 +1313,7 @@ impl OrderBook {
                 account,
                 remaining: quantity,
                 time_in_force,
+                expiry_ns,
             },
         );
         self.order_index.insert((account, id), (side, price));
@@ -1297,6 +1377,7 @@ mod tests {
             time_in_force: tif,
             quantity: qty(q),
             stp: SelfTradeProtection::Allow,
+            expiry_ns: 0,
         }
     }
 
@@ -1309,6 +1390,7 @@ mod tests {
             time_in_force: tif,
             quantity: qty(q),
             stp: SelfTradeProtection::Allow,
+            expiry_ns: 0,
         }
     }
 
@@ -2059,6 +2141,7 @@ mod tests {
             time_in_force: tif,
             quantity: qty(q),
             stp: SelfTradeProtection::Allow,
+            expiry_ns: 0,
         }
     }
 
@@ -2081,6 +2164,7 @@ mod tests {
             time_in_force: tif,
             quantity: qty(q),
             stp: SelfTradeProtection::Allow,
+            expiry_ns: 0,
         }
     }
 
@@ -2324,5 +2408,138 @@ mod tests {
         assert_eq!(reports.len(), 1);
         assert!(matches!(reports[0], ExecutionReport::Fill { .. }));
         assert!(book.is_empty());
+    }
+
+    // -- GTD expiration tests --
+
+    /// Helper: create a GTD limit order with an expiry timestamp.
+    fn gtd_limit_order(id: u64, side: Side, p: u64, q: u64, expiry_ns: u64) -> Order {
+        Order {
+            id: OrderId(id),
+            account: TEST_ACCOUNT,
+            side,
+            order_type: OrderType::Limit {
+                price: price(p),
+                post_only: false,
+            },
+            time_in_force: TimeInForce::GTD,
+            quantity: qty(q),
+            stp: SelfTradeProtection::Allow,
+            expiry_ns,
+        }
+    }
+
+    /// Helper: create a GTD stop order with an expiry timestamp.
+    fn gtd_stop_order(id: u64, side: Side, trigger: u64, q: u64, expiry_ns: u64) -> Order {
+        Order {
+            id: OrderId(id),
+            account: TEST_ACCOUNT,
+            side,
+            order_type: OrderType::Stop {
+                trigger_price: price(trigger),
+            },
+            time_in_force: TimeInForce::GTD,
+            quantity: qty(q),
+            stp: SelfTradeProtection::Allow,
+            expiry_ns,
+        }
+    }
+
+    #[test]
+    fn gtd_order_expires_when_timestamp_reached() {
+        let mut book = OrderBook::new();
+        let mut reports = Vec::new();
+
+        // Place a GTD buy order expiring at t=1000.
+        book.execute(
+            gtd_limit_order(1, Side::Buy, 100, 10, 1000),
+            None,
+            &mut reports,
+        );
+        assert_eq!(reports.len(), 1);
+        assert!(matches!(reports[0], ExecutionReport::Placed { .. }));
+        reports.clear();
+
+        // Expire at t=1000 (exactly at expiry) — should cancel.
+        book.cancel_expired_orders(1000, &mut reports);
+        assert_eq!(reports.len(), 1);
+        assert!(matches!(
+            reports[0],
+            ExecutionReport::Cancelled {
+                order_id: OrderId(1),
+                remaining_quantity,
+                ..
+            } if remaining_quantity.get() == 10
+        ));
+        assert!(book.is_empty());
+    }
+
+    #[test]
+    fn gtd_order_does_not_expire_before_timestamp() {
+        let mut book = OrderBook::new();
+        let mut reports = Vec::new();
+
+        // Place a GTD buy order expiring at t=1000.
+        book.execute(
+            gtd_limit_order(1, Side::Buy, 100, 10, 1000),
+            None,
+            &mut reports,
+        );
+        reports.clear();
+
+        // Expire at t=999 — should NOT cancel.
+        book.cancel_expired_orders(999, &mut reports);
+        assert!(reports.is_empty());
+        assert!(!book.is_empty());
+    }
+
+    #[test]
+    fn non_gtd_orders_not_affected_by_cancel_expired() {
+        let mut book = OrderBook::new();
+        let mut reports = Vec::new();
+
+        // GTC order.
+        book.execute(
+            limit_order(1, Side::Buy, 100, 10, TimeInForce::GTC),
+            None,
+            &mut reports,
+        );
+        // Day order.
+        book.execute(
+            limit_order(2, Side::Sell, 200, 5, TimeInForce::Day),
+            None,
+            &mut reports,
+        );
+        reports.clear();
+
+        // cancel_expired_orders should not touch GTC or Day orders.
+        book.cancel_expired_orders(u64::MAX, &mut reports);
+        assert!(reports.is_empty());
+    }
+
+    #[test]
+    fn gtd_pending_stop_expires() {
+        let mut book = OrderBook::new();
+        let mut reports = Vec::new();
+
+        // Place a GTD stop buy expiring at t=5000.
+        // At the orderbook level, stops are silently stored (no Placed report).
+        book.execute(
+            gtd_stop_order(1, Side::Buy, 200, 10, 5000),
+            None,
+            &mut reports,
+        );
+        assert!(reports.is_empty());
+
+        // Expire at t=5000 — stop should be cancelled.
+        book.cancel_expired_orders(5000, &mut reports);
+        assert_eq!(reports.len(), 1);
+        assert!(matches!(
+            reports[0],
+            ExecutionReport::Cancelled {
+                order_id: OrderId(1),
+                ..
+            }
+        ));
     }
 }

@@ -204,6 +204,10 @@ pub enum TimeInForce {
     /// Day: rests on the book like GTC, but automatically cancelled when
     /// an `EndOfDay` event is processed.
     Day,
+    /// Good-Till-Date: rests on the book until the specified expiry time,
+    /// then automatically cancelled when an `ExpireOrders` event is
+    /// processed with a timestamp >= the order's `expiry_ns`.
+    GTD,
 }
 
 /// Self-trade prevention mode, set per order.
@@ -236,6 +240,10 @@ pub struct Order {
     pub quantity: Quantity,
     /// Self-trade prevention mode.
     pub stp: SelfTradeProtection,
+    /// Expiry time in nanoseconds since Unix epoch. Only meaningful when
+    /// `time_in_force` is `GTD`. Zero for all other TIF variants.
+    /// Compared against the timestamp in `ExpireOrders` events.
+    pub expiry_ns: u64,
 }
 
 /// Events emitted by the matching engine.
@@ -337,6 +345,9 @@ pub enum RejectReason {
     /// state-mutating operations are rejected until the replica reconnects
     /// to preserve the durability guarantee.
     ReplicaDisconnected,
+    /// GTD order with expiry_ns == 0 (missing expiry), or non-GTD order
+    /// with expiry_ns != 0 (unexpected expiry).
+    InvalidExpiry,
 }
 
 #[cfg(test)]

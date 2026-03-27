@@ -8,12 +8,12 @@
 //! Uses manual binary serialization (same approach as the journal codec)
 //! to avoid serde dependency.
 //!
-//! ## File format (v8)
+//! ## File format (v11)
 //!
 //! | Field          | Type    | Bytes | Purpose                            |
 //! |----------------|---------|-------|------------------------------------|
 //! | file_magic     | u32     | 4     | `0x534E4150` ("SNAP")              |
-//! | format_version | u16     | 2     | Current version = 8                |
+//! | format_version | u16     | 2     | Current version = 11               |
 //! | reserved       | u16     | 2     | Padding, zeroed                    |
 //! | sequence       | u64     | 8     | Journal sequence at snapshot       |
 //! | chain_hash     | [u8;32] | 32    | BLAKE3 hash chain state (v6+)      |
@@ -55,7 +55,8 @@ const SNAP_MAGIC: u32 = 0x534E_4150;
 /// v6 → v7: order_sides keyed by (AccountId, OrderId), added fee schedules.
 /// v7 → v8: order_index and stop_index now store AccountId (21 bytes/entry vs 17).
 /// v8 → v9: added per-key request sequence HWMs for admin idempotency.
-const SNAP_VERSION: u16 = 10;
+/// v10 → v11: added expiry_ns to resting orders and pending stops (GTD support).
+const SNAP_VERSION: u16 = 11;
 
 /// Snapshot header size: magic(4) + version(2) + reserved(2) + sequence(8) + chain_hash(32) = 48.
 const SNAP_HEADER_SIZE: usize = 48;
@@ -95,13 +96,22 @@ pub fn save(
     let crc = crc32c::crc32c(&buf);
     buf.extend_from_slice(&crc.to_le_bytes());
 
-    // Write atomically: temp file → fsync → rename. A crash mid-write
-    // leaves only the temp file; the previous snapshot (if any) is intact.
+    // Write atomically: temp file → fsync → rotate previous → rename.
+    // A crash mid-write leaves only the temp file; the previous snapshot
+    // (if any) is intact. The `.prev` copy allows operators to roll back
+    // if the latest snapshot is corrupt or contains undesired state.
     let tmp_path = path.with_extension("snap.tmp");
     let mut file = File::create(&tmp_path)?;
     file.write_all(&buf)?;
     file.sync_data()?;
     drop(file);
+
+    // Rotate: preserve the current snapshot as `.snapshot.prev` before
+    // overwriting. Best-effort — if the current snapshot doesn't exist
+    // (first save) or the rename fails, we proceed anyway.
+    let prev_path = path.with_extension("snapshot.prev");
+    let _ = fs::rename(path, &prev_path);
+
     fs::rename(&tmp_path, path)?;
 
     Ok(())
@@ -138,7 +148,7 @@ pub fn load(path: &Path) -> Result<(Exchange, u64, [u8; 32]), JournalError> {
     // v5 header is 16 bytes, v6+ header is 48 bytes (adds 32-byte chain_hash).
     let (header_size, has_chain_hash) = match version {
         5 => (16usize, false),
-        6..=10 => (SNAP_HEADER_SIZE, true),
+        6..=11 => (SNAP_HEADER_SIZE, true),
         _ => return Err(JournalError::UnsupportedVersion { version }),
     };
 
@@ -226,6 +236,7 @@ pub(crate) struct RestingOrderSnapshot {
     pub(crate) account: AccountId,
     pub(crate) remaining: Quantity,
     pub(crate) time_in_force: TimeInForce,
+    pub(crate) expiry_ns: u64,
 }
 
 /// Serialized pending stop.
@@ -242,6 +253,8 @@ pub(crate) struct PendingStopSnapshot {
     pub(crate) quote_budget: Option<u64>,
     /// Self-trade prevention mode.
     pub(crate) stp: crate::types::SelfTradeProtection,
+    /// Expiry time in nanoseconds (GTD orders). Zero for non-GTD.
+    pub(crate) expiry_ns: u64,
 }
 
 // --- Encoding helpers ---
@@ -401,6 +414,8 @@ fn encode_book_side(levels: &[(Price, Vec<RestingOrderSnapshot>)], buf: &mut Vec
             le::push_u32(buf, order.account.0);
             le::push_u64(buf, order.remaining.get());
             buf.push(le::encode_tif(order.time_in_force));
+            // expiry_ns (v11+): needed for GTD orders to survive snapshot/restore.
+            le::push_u64(buf, order.expiry_ns);
         }
     }
 }
@@ -432,6 +447,8 @@ fn encode_stop_side(levels: &[(Price, Vec<PendingStopSnapshot>)], buf: &mut Vec<
                 None => buf.push(0),
             }
             buf.push(le::encode_stp(stop.stp));
+            // expiry_ns (v11+): needed for GTD stop orders to survive snapshot/restore.
+            le::push_u64(buf, stop.expiry_ns);
         }
     }
 }
@@ -774,11 +791,11 @@ fn decode_book_snapshot(buf: &[u8], version: u16) -> Result<(usize, BookSnapshot
     };
 
     // Bids.
-    let (consumed, bids) = decode_book_side_levels(&buf[pos..])?;
+    let (consumed, bids) = decode_book_side_levels(&buf[pos..], version)?;
     pos += consumed;
 
     // Asks.
-    let (consumed, asks) = decode_book_side_levels(&buf[pos..])?;
+    let (consumed, asks) = decode_book_side_levels(&buf[pos..], version)?;
     pos += consumed;
 
     // Order index: v8+ stores (order_id, account_id, side, price) — 21 bytes each.
@@ -815,11 +832,11 @@ fn decode_book_snapshot(buf: &[u8], version: u16) -> Result<(usize, BookSnapshot
     }
 
     // Stop buys.
-    let (consumed, stop_buys) = decode_stop_side_levels(&buf[pos..])?;
+    let (consumed, stop_buys) = decode_stop_side_levels(&buf[pos..], version)?;
     pos += consumed;
 
     // Stop sells.
-    let (consumed, stop_sells) = decode_stop_side_levels(&buf[pos..])?;
+    let (consumed, stop_sells) = decode_stop_side_levels(&buf[pos..], version)?;
     pos += consumed;
 
     // Stop index: v8+ stores (order_id, account_id, side, price) — 21 bytes each.
@@ -886,7 +903,10 @@ fn decode_book_snapshot(buf: &[u8], version: u16) -> Result<(usize, BookSnapshot
     ))
 }
 
-fn decode_book_side_levels(buf: &[u8]) -> Result<(usize, RestingLevels), JournalError> {
+fn decode_book_side_levels(
+    buf: &[u8],
+    version: u16,
+) -> Result<(usize, RestingLevels), JournalError> {
     let corrupt = |reason: &'static str| JournalError::CorruptEntry {
         sequence: 0,
         reason,
@@ -901,6 +921,9 @@ fn decode_book_side_levels(buf: &[u8]) -> Result<(usize, RestingLevels), Journal
     // Each level has at least 12 bytes (price + order count).
     validate_count(buf.len() - pos, n_levels, 12)?;
 
+    // Per-order size: v11+ adds expiry_ns(8) after tif.
+    let order_size: usize = if version >= 11 { 29 } else { 21 };
+
     let mut levels = Vec::with_capacity(n_levels);
     for _ in 0..n_levels {
         if pos + 12 > buf.len() {
@@ -912,11 +935,11 @@ fn decode_book_side_levels(buf: &[u8]) -> Result<(usize, RestingLevels), Journal
         let n_orders = le::get_u32(&buf[pos..]) as usize;
         pos += 4;
 
-        // Each order is 21 bytes: id(8) + account(4) + remaining(8) + tif(1).
-        validate_count(buf.len() - pos, n_orders, 21)?;
+        // Each order is id(8) + account(4) + remaining(8) + tif(1) [+ expiry_ns(8) in v11+].
+        validate_count(buf.len() - pos, n_orders, order_size)?;
         let mut orders = Vec::with_capacity(n_orders);
         for _ in 0..n_orders {
-            if pos + 21 > buf.len() {
+            if pos + order_size > buf.len() {
                 return Err(JournalError::TruncatedEntry);
             }
             let id = OrderId(le::get_u64(&buf[pos..]));
@@ -925,13 +948,21 @@ fn decode_book_side_levels(buf: &[u8]) -> Result<(usize, RestingLevels), Journal
                 .ok_or(corrupt("zero remaining quantity"))?;
             let time_in_force = le::decode_tif(buf[pos + 20])
                 .ok_or(corrupt("invalid time-in-force on resting order"))?;
+            pos += 21;
+            let expiry_ns = if version >= 11 {
+                let v = le::get_u64(&buf[pos..]);
+                pos += 8;
+                v
+            } else {
+                0
+            };
             orders.push(RestingOrderSnapshot {
                 id,
                 account,
                 remaining: Quantity(remaining_val),
                 time_in_force,
+                expiry_ns,
             });
-            pos += 21;
         }
         levels.push((Price(price_val), orders));
     }
@@ -939,7 +970,7 @@ fn decode_book_side_levels(buf: &[u8]) -> Result<(usize, RestingLevels), Journal
     Ok((pos, levels))
 }
 
-fn decode_stop_side_levels(buf: &[u8]) -> Result<(usize, StopLevels), JournalError> {
+fn decode_stop_side_levels(buf: &[u8], version: u16) -> Result<(usize, StopLevels), JournalError> {
     let corrupt = |reason: &'static str| JournalError::CorruptEntry {
         sequence: 0,
         reason,
@@ -1033,6 +1064,18 @@ fn decode_stop_side_levels(buf: &[u8]) -> Result<(usize, StopLevels), JournalErr
             let stp = le::decode_stp(buf[pos]).ok_or(corrupt("invalid stp in stop"))?;
             pos += 1;
 
+            // expiry_ns (v11+): needed for GTD stop orders.
+            let expiry_ns = if version >= 11 {
+                if pos + 8 > buf.len() {
+                    return Err(JournalError::TruncatedEntry);
+                }
+                let v = le::get_u64(&buf[pos..]);
+                pos += 8;
+                v
+            } else {
+                0
+            };
+
             stops.push(PendingStopSnapshot {
                 id,
                 account,
@@ -1043,6 +1086,7 @@ fn decode_stop_side_levels(buf: &[u8]) -> Result<(usize, StopLevels), JournalErr
                 limit_price,
                 quote_budget,
                 stp,
+                expiry_ns,
             });
         }
         levels.push((Price(trigger_val), stops));
@@ -1163,6 +1207,15 @@ impl Exchange {
 
         Self::from_parts(instruments, accounts, order_info, max_order_id, key_hwm)
     }
+
+    /// Create a deep copy of this Exchange by round-tripping through the
+    /// snapshot representation. Used by the shadow snapshot stage to obtain
+    /// an independent replica of the exchange state at startup.
+    ///
+    /// Not suitable for the hot path — allocates extensively.
+    pub fn clone_via_snapshot(&self) -> Self {
+        Self::restore_state(self.snapshot_state())
+    }
 }
 
 impl OrderBook {
@@ -1179,6 +1232,7 @@ impl OrderBook {
                                 account: o.account(),
                                 remaining: o.remaining(),
                                 time_in_force: o.time_in_force(),
+                                expiry_ns: o.expiry_ns(),
                             })
                             .collect();
                         (price, orders)
@@ -1202,6 +1256,7 @@ impl OrderBook {
                             limit_price: s.limit_price(),
                             quote_budget: s.quote_budget(),
                             stp: s.stp(),
+                            expiry_ns: s.expiry_ns(),
                         })
                         .collect();
                     (trigger_price, snaps)
@@ -1236,6 +1291,7 @@ impl OrderBook {
                                 o.account,
                                 o.remaining,
                                 o.time_in_force,
+                                o.expiry_ns,
                             )
                         })
                         .collect();
@@ -1261,6 +1317,7 @@ impl OrderBook {
                             s.limit_price,
                             s.quote_budget,
                             s.stp,
+                            s.expiry_ns,
                         )
                     })
                     .collect();
@@ -1334,6 +1391,7 @@ mod tests {
             time_in_force: TimeInForce::GTC,
             quantity: qty(q),
             stp: SelfTradeProtection::Allow,
+            expiry_ns: 0,
         }
     }
 
@@ -1496,6 +1554,95 @@ mod tests {
     }
 
     #[test]
+    fn snapshot_preserves_gtd_expiry() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("gtd.snapshot");
+
+        let mut exchange = Exchange::new();
+        exchange.add_instrument(btc_usd_spec());
+        exchange.deposit(ACCT_A, USD, 100_000);
+
+        let mut reports = Vec::new();
+
+        // Place a GTD order with expiry_ns = 5_000_000.
+        exchange.execute(
+            Symbol(1),
+            Order {
+                id: OrderId(1),
+                account: ACCT_A,
+                side: Side::Buy,
+                order_type: OrderType::Limit {
+                    price: price_val(100),
+                    post_only: false,
+                },
+                time_in_force: TimeInForce::GTD,
+                quantity: qty(10),
+                stp: SelfTradeProtection::Allow,
+                expiry_ns: 5_000_000,
+            },
+            &mut reports,
+        );
+        assert!(matches!(reports[0], ExecutionReport::Placed { .. }));
+        reports.clear();
+
+        save(&exchange, 20, [0u8; 32], &path).unwrap();
+        let (mut restored, _, _) = load(&path).unwrap();
+
+        // The GTD order should still be on the book and should expire
+        // at the original timestamp after restore.
+        restored.expire_orders(4_999_999, &mut reports);
+        assert!(reports.is_empty(), "should not expire before timestamp");
+
+        restored.expire_orders(5_000_000, &mut reports);
+        assert_eq!(reports.len(), 1);
+        assert!(matches!(
+            reports[0],
+            ExecutionReport::Cancelled {
+                order_id: OrderId(1),
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn clone_via_snapshot_produces_identical_state() {
+        let mut exchange = Exchange::new();
+        exchange.add_instrument(btc_usd_spec());
+        exchange.deposit(ACCT_A, USD, 100_000);
+        exchange.deposit(ACCT_B, BTC, 500);
+
+        let mut reports = Vec::new();
+        exchange.execute(
+            Symbol(1),
+            limit_order(1, ACCT_B, Side::Sell, 100, 50),
+            &mut reports,
+        );
+        reports.clear();
+
+        let cloned = exchange.clone_via_snapshot();
+
+        // Balances should match.
+        assert_eq!(
+            cloned.accounts().balance(ACCT_A, USD).available,
+            exchange.accounts().balance(ACCT_A, USD).available,
+        );
+        assert_eq!(
+            cloned.accounts().balance(ACCT_B, BTC).reserved,
+            exchange.accounts().balance(ACCT_B, BTC).reserved,
+        );
+
+        // Resting order should match — buy against it on the clone.
+        let mut clone_reports = Vec::new();
+        let mut mutable_clone = cloned;
+        mutable_clone.execute(
+            Symbol(1),
+            limit_order(2, ACCT_A, Side::Buy, 100, 10),
+            &mut clone_reports,
+        );
+        assert!(matches!(clone_reports[0], ExecutionReport::Fill { .. }));
+    }
+
+    #[test]
     fn corrupt_snapshot_detected() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("corrupt.snapshot");
@@ -1512,6 +1659,40 @@ mod tests {
             load(&path),
             Err(JournalError::ChecksumMismatch { .. })
         ));
+    }
+
+    #[test]
+    fn save_rotates_previous_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rotate.snapshot");
+        let prev_path = dir.path().join("rotate.snapshot.prev");
+
+        // First save — no previous snapshot exists.
+        let exchange = Exchange::new();
+        save(&exchange, 1, [0x11; 32], &path).unwrap();
+        assert!(path.exists());
+        assert!(!prev_path.exists());
+
+        let first_data = std::fs::read(&path).unwrap();
+
+        // Second save — first snapshot should be rotated to .prev.
+        save(&exchange, 2, [0x22; 32], &path).unwrap();
+        assert!(path.exists());
+        assert!(prev_path.exists());
+
+        // .prev should contain the first snapshot's bytes exactly.
+        let prev_data = std::fs::read(&prev_path).unwrap();
+        assert_eq!(prev_data, first_data);
+
+        // Current should be loadable with the second save's sequence.
+        let (_, seq, hash) = load(&path).unwrap();
+        assert_eq!(seq, 2);
+        assert_eq!(hash, [0x22; 32]);
+
+        // .prev should be loadable with the first save's sequence.
+        let (_, prev_seq, prev_hash) = load(&prev_path).unwrap();
+        assert_eq!(prev_seq, 1);
+        assert_eq!(prev_hash, [0x11; 32]);
     }
 
     #[cfg(feature = "hash-chain")]

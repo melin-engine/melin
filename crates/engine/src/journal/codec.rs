@@ -8,7 +8,7 @@
 //! | Field          | Type | Bytes | Purpose                                |
 //! |----------------|------|-------|----------------------------------------|
 //! | file_magic     | u32  | 4     | `0x4A4F5552` ("JOUR")                  |
-//! | format_version | u16  | 2     | Current version = 8                    |
+//! | format_version | u16  | 2     | Current version = 9                    |
 //! | reserved       | u16  | 2     | Padding for alignment, zeroed          |
 //!
 //! ## Entry layout (little-endian, repeats after file header)
@@ -32,7 +32,7 @@ use std::num::NonZeroU64;
 
 use crate::types::{
     AccountId, CircuitBreakerConfig, CurrencyId, FeeSchedule, InstrumentSpec, Order, OrderId,
-    OrderType, Price, Quantity, RiskLimits, Symbol,
+    OrderType, Price, Quantity, RiskLimits, Symbol, TimeInForce,
 };
 
 use super::error::JournalError;
@@ -50,7 +50,8 @@ pub const FILE_MAGIC: u32 = 0x4A4F_5552;
 /// v5 → v6: added GenesisHash + Checkpoint events for BLAKE3 hash chain.
 /// v6 → v7: added Withdraw event for sparse account lifecycle.
 /// v7 → v8: added per-entry key_hash(8) + request_seq(8) for admin idempotency.
-pub const FORMAT_VERSION: u16 = 8;
+/// v8 → v9: added ExpireOrders event + conditional expiry_ns in order encoding (GTD only).
+pub const FORMAT_VERSION: u16 = 9;
 
 /// File header size in bytes.
 pub const FILE_HEADER_SIZE: usize = 8;
@@ -79,6 +80,7 @@ const TAG_SET_FEE_SCHEDULE: u8 = 11;
 const TAG_PROVISION_ACCOUNT: u8 = 12;
 const TAG_WITHDRAW: u8 = 13;
 const TAG_END_OF_DAY: u8 = 14;
+const TAG_EXPIRE_ORDERS: u8 = 15;
 
 /// OrderType tag encoding (codec-specific, not shared — order types are only
 /// in the journal format, not in snapshots).
@@ -105,10 +107,11 @@ pub fn decode_file_header(buf: &[u8]) -> Result<u16, JournalError> {
         return Err(JournalError::InvalidFile);
     }
     let version = u16::from_le_bytes([buf[4], buf[5]]);
-    // Accept v5 (pre-hash-chain), v7 (pre-idempotency), and v8 (current).
+    // Accept v5 (pre-hash-chain), v7 (pre-idempotency), v8 (pre-GTD), and v9 (current).
     // v5 journals are readable — the reader simply won't have hash chain
     // verification. v7 journals lack key_hash/request_seq fields.
-    if version != FORMAT_VERSION && version != 7 && version != 5 {
+    // v8 journals lack conditional expiry_ns in order encoding.
+    if version != FORMAT_VERSION && version != 8 && version != 7 && version != 5 {
         return Err(JournalError::UnsupportedVersion { version });
     }
     Ok(version)
@@ -264,6 +267,11 @@ pub fn encode(
         JournalEvent::EndOfDay => {
             // No payload — tag only.
             TAG_END_OF_DAY
+        }
+        JournalEvent::ExpireOrders { timestamp_ns } => {
+            le::put_u64(&mut buf[pos..], *timestamp_ns);
+            pos += 8;
+            TAG_EXPIRE_ORDERS
         }
         JournalEvent::QueryStats => {
             // QueryStats is never journaled — the journal stage filters it
@@ -751,6 +759,17 @@ pub fn decode(
             }
         }
         TAG_END_OF_DAY => JournalEvent::EndOfDay,
+        TAG_EXPIRE_ORDERS => {
+            if payload.len() < 8 {
+                return Err(JournalError::CorruptEntry {
+                    sequence,
+                    reason: "ExpireOrders payload too short",
+                });
+            }
+            JournalEvent::ExpireOrders {
+                timestamp_ns: le::get_u64(&payload[0..]),
+            }
+        }
         _ => {
             return Err(JournalError::CorruptEntry {
                 sequence,
@@ -822,6 +841,13 @@ fn encode_order(order: &Order, buf: &mut [u8]) -> usize {
     pos += 8;
     buf[pos] = le::encode_stp(order.stp);
     pos += 1;
+
+    // Conditional expiry_ns: only written for GTD orders to avoid inflating
+    // every order's journal footprint by 8 bytes.
+    if order.time_in_force == TimeInForce::GTD {
+        le::put_u64(&mut buf[pos..], order.expiry_ns);
+        pos += 8;
+    }
 
     pos
 }
@@ -901,6 +927,18 @@ fn decode_order(buf: &[u8], sequence: u64) -> Result<(usize, Order), JournalErro
     let stp = le::decode_stp(buf[pos]).ok_or(corrupt("invalid self-trade protection"))?;
     pos += 1;
 
+    // Conditional expiry_ns: only present for GTD orders.
+    let expiry_ns = if time_in_force == TimeInForce::GTD {
+        if buf.len() < pos + 8 {
+            return Err(corrupt("GTD order missing expiry_ns"));
+        }
+        let v = le::get_u64(&buf[pos..]);
+        pos += 8;
+        v
+    } else {
+        0
+    };
+
     Ok((
         pos,
         Order {
@@ -911,6 +949,7 @@ fn decode_order(buf: &[u8], sequence: u64) -> Result<(usize, Order), JournalErro
             time_in_force,
             quantity: Quantity(quantity),
             stp,
+            expiry_ns,
         },
     ))
 }
@@ -952,6 +991,7 @@ mod tests {
                     time_in_force: TimeInForce::GTC,
                     quantity: Quantity(nz(10)),
                     stp: SelfTradeProtection::CancelNewest,
+                    expiry_ns: 0,
                 },
             },
             JournalEvent::SubmitOrder {
@@ -964,6 +1004,7 @@ mod tests {
                     time_in_force: TimeInForce::IOC,
                     quantity: Quantity(nz(5)),
                     stp: SelfTradeProtection::Allow,
+                    expiry_ns: 0,
                 },
             },
             JournalEvent::SubmitOrder {
@@ -978,6 +1019,7 @@ mod tests {
                     time_in_force: TimeInForce::GTC,
                     quantity: Quantity(nz(20)),
                     stp: SelfTradeProtection::CancelOldest,
+                    expiry_ns: 0,
                 },
             },
             JournalEvent::SubmitOrder {
@@ -993,6 +1035,7 @@ mod tests {
                     time_in_force: TimeInForce::FOK,
                     quantity: Quantity(nz(15)),
                     stp: SelfTradeProtection::CancelBoth,
+                    expiry_ns: 0,
                 },
             },
             JournalEvent::CancelOrder {
@@ -1060,6 +1103,27 @@ mod tests {
                 account: AccountId(42),
                 currency: CurrencyId(20),
                 amount: 500_000,
+            },
+            JournalEvent::EndOfDay,
+            JournalEvent::ExpireOrders {
+                timestamp_ns: 1_700_000_000_000_000_000,
+            },
+            // GTD order — exercises conditional expiry_ns encoding.
+            JournalEvent::SubmitOrder {
+                symbol: Symbol(1),
+                order: Order {
+                    id: OrderId(200),
+                    account: AccountId(42),
+                    side: Side::Buy,
+                    order_type: OrderType::Limit {
+                        price: Price(nz(5000)),
+                        post_only: false,
+                    },
+                    time_in_force: TimeInForce::GTD,
+                    quantity: Quantity(nz(10)),
+                    stp: SelfTradeProtection::CancelNewest,
+                    expiry_ns: 1_800_000_000_000_000_000,
+                },
             },
         ]
     }

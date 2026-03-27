@@ -39,7 +39,7 @@ const SYMBOLS: &[(&str, u32)] = &[("BTC/USD", 1), ("ETH/USD", 2)];
 const ACCOUNTS: &[(&str, u32)] = &[("Account 1", 1), ("Account 2", 2)];
 
 /// Time-in-force options.
-const TIF_OPTIONS: &[(&str, u8)] = &[("GTC", 0), ("IOC", 1), ("FOK", 2)];
+const TIF_OPTIONS: &[(&str, u8)] = &[("GTC", 0), ("IOC", 1), ("FOK", 2), ("Day", 3), ("GTD", 4)];
 
 // ── App state ───────────────────────────────────────────────────────
 
@@ -356,6 +356,8 @@ impl App {
         let tif = match tif_idx {
             1 => TimeInForce::IOC,
             2 => TimeInForce::FOK,
+            3 => TimeInForce::Day,
+            4 => TimeInForce::GTD,
             _ => TimeInForce::GTC,
         };
 
@@ -381,6 +383,7 @@ impl App {
             time_in_force: tif,
             quantity: qty,
             stp: SelfTradeProtection::default(),
+            expiry_ns: 0,
         };
 
         let side_str = if side == Side::Buy { "BUY" } else { "SELL" };
@@ -489,6 +492,7 @@ fn format_report(report: &ExecutionReport) -> String {
                 RejectReason::HasRestingOrders => "has resting orders",
                 RejectReason::DuplicateRequest => "duplicate request",
                 RejectReason::ReplicaDisconnected => "replica disconnected",
+                RejectReason::InvalidExpiry => "invalid expiry",
             };
             format!("REJECT  #{} ({reason_str})", order_id.0)
         }
