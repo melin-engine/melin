@@ -1022,8 +1022,19 @@ pub fn run_dpdk(
     dpdk_config: melin_dpdk::DpdkConfig,
     shutdown: Arc<AtomicBool>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    // Initialize DPDK transport (EAL, mempool, port, smoltcp).
-    let transport = melin_dpdk::DpdkTransport::init(&dpdk_config)?;
+    // Initialize shared DPDK resources (EAL, mempool, ports with N queues).
+    let num_dpdk_threads = config.readers as usize;
+    let shared = melin_dpdk::DpdkShared::init(&dpdk_config)?;
+
+    // Create per-thread transports (each gets its own queue pair + smoltcp stack).
+    let mut transports = Vec::with_capacity(num_dpdk_threads);
+    for q in 0..num_dpdk_threads {
+        transports.push(melin_dpdk::DpdkTransport::from_shared(
+            &shared,
+            &dpdk_config,
+            q as u16,
+        )?);
+    }
 
     // Load authorized keys for challenge-response authentication.
     let authorized_keys = Arc::new(AuthorizedKeys::load(&config.authorized_keys)?);
@@ -1298,28 +1309,69 @@ pub fn run_dpdk(
     info!(
         ip = %dpdk_config.ip_addr,
         port = dpdk_config.listen_port,
+        num_dpdk_threads,
         "DPDK transport listening"
     );
 
-    // Pin the DPDK poll thread to its dedicated core. This thread
-    // handles all NIC I/O and smoltcp TCP processing — must not share
-    // a core with pipeline threads.
-    apply_affinity("dpdk-poll-0", config.reader_cores);
+    // Spawn N-1 DPDK poll threads (queues 1..N). Queue 0 runs on the
+    // main thread below. Each thread gets its own transport, SPSC
+    // consumer, and a clone of the MultiProducer.
+    let connection_timeout = config.connection_timeout();
+    let max_conns = config.max_connections;
+    let reader_cores = config.reader_cores;
+    let mut dpdk_handles = Vec::with_capacity(num_dpdk_threads.saturating_sub(1));
 
-    // Run the DPDK poll loop on this thread (the main thread).
-    // This blocks until shutdown.
+    for i in (1..num_dpdk_threads).rev() {
+        let transport_i = transports.pop().expect("transport for thread");
+        let tx_rx_i = tx_consumers.pop().expect("SPSC consumer for thread");
+        let producer_i = input_producer.clone();
+        let control_i = control_tx.clone();
+        let shutdown_i = Arc::clone(&shutdown);
+        let active_i = Arc::clone(&active_connections);
+        let keys_i = Arc::clone(&authorized_keys);
+
+        let handle = std::thread::Builder::new()
+            .name(format!("dpdk-poll-{i}"))
+            .spawn(move || {
+                apply_affinity(&format!("dpdk-poll-{i}"), reader_cores + i);
+                crate::dpdk_transport::run_dpdk_poll(
+                    transport_i,
+                    producer_i,
+                    control_i,
+                    tx_rx_i,
+                    &shutdown_i,
+                    keys_i,
+                    connection_timeout,
+                    max_conns,
+                    active_i,
+                    i as u8,
+                );
+            })
+            .expect("failed to spawn DPDK poll thread");
+        dpdk_handles.push(handle);
+    }
+
+    // Queue 0 runs on the main thread.
+    apply_affinity("dpdk-poll-0", reader_cores);
+    let transport_0 = transports.remove(0);
+    let tx_rx_0 = tx_consumers.remove(0);
     crate::dpdk_transport::run_dpdk_poll(
-        transport,
+        transport_0,
         input_producer,
         control_tx,
-        tx_consumers.remove(0),
+        tx_rx_0,
         &shutdown,
         authorized_keys,
-        config.connection_timeout(),
-        config.max_connections,
+        connection_timeout,
+        max_conns,
         Arc::clone(&active_connections),
-        0, // thread_id — single thread for now, Step 8 will spawn N threads
+        0,
     );
+
+    // Join DPDK poll threads before shutdown sequence.
+    for h in dpdk_handles {
+        let _ = h.join();
+    }
 
     // Shutdown sequence.
     info!("shutdown: draining pipeline");
