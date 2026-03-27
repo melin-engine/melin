@@ -49,35 +49,6 @@ See [README.md](README.md#features) for implemented features and [docs/roadmap.m
 
 See [README.md](README.md#features) for implemented features and [docs/roadmap.md](docs/roadmap.md) for planned features.
 
-## DPDK Transport (`feat/dpdk-rss` branch, based on `feat/dpdk-zerocopy-rx`)
-
-**Feature flag**: `--features dpdk` (compile-time, replaces io-uring/epoll transport)
-
-DPDK kernel-bypass networking — bypasses the Linux kernel TCP stack entirely. Uses DPDK for NIC I/O (`rx_burst`/`tx_burst`) and a smoltcp fork ([fastcp](https://github.com/pierre-l/fastcp)) for userspace TCP. The engine pipeline is unaware of DPDK.
-
-**Architecture**: N parallel poll threads, each with its own NIC queue pair and smoltcp stack. RSS (Receive Side Scaling) distributes TCP flows across queues in hardware. No shared mutable state between threads. `--readers` controls the thread count (same CLI arg as kernel TCP reader threads); `--reader-cores` controls where they pin. Queue count auto-clamps to NIC maximum (TAP devices get 1).
-
-**Crate**: `crates/dpdk/` — gated behind `dpdk-sys` feature. Compiles as an empty shell without libdpdk, lives in the workspace unconditionally. Source files in `src/dpdk/` submodule. `DpdkShared` holds global resources (EAL, mempool, ports); `DpdkTransport` is per-thread (device, Interface, SocketSet).
-
-**Scripts**: `dpdk-server.sh` (auto-detect config, start server), `dpdk-setup-sriov.sh` (VF creation for ice + ixgbe), `dpdk-test.sh` (testpmd environment check), `dpdk-smoke-test.sh` (TAP), `dpdk-e2e-smoke-test.sh` (veth + af_packet, both sides DPDK).
-
-**Core layout**: 0=OS/IRQ, 1-3=pipeline (journal/matching/response), 4-5=readers or DPDK poll threads, 6=repl-sender, 7=event-publisher, 8+=bench.
-
-**Tested hardware**: Intel 82599/X520 (ixgbe) SR-IOV on EPYC 4564P, LACP bond, Cherry Servers. Intel E810 (ice) supported but untested on current servers (IOMMU issues on some rentals).
-
-**Benchmark results** (1 client, window 1, single-order round-trip, full journal durability):
-
-| Transport | p50 | p90 | p99 | Hardware |
-|-----------|-----|-----|-----|----------|
-| Kernel TCP | 71 µs | 71 µs | 114 µs | EPYC 4564P, 82599 10GbE |
-| DPDK (server only) | 59 µs | 61 µs | 113 µs | same |
-| DPDK (e2e) | **37 µs** | **38 µs** | **101 µs** | same |
-
-**Response routing**: thread_id is encoded in bits 56..63 of connection_id. The response stage extracts it with a shift to route TxFrames to the correct per-thread SPSC channel in O(1).
-
-**Known remaining gaps**:
-- Needs merge with main (shadow exchange, snapshot schedule, updated PipelineCores)
-
 ## Dead Ends / Investigated & Rejected
 **How to apply:** The matching engine is not the bottleneck. The journal fsync stage gates pipeline throughput; TCP pipelining (window=256) effectively hides fsync latency. Further throughput gains require reducing transport overhead (UDS, kernel bypass) or journal I/O optimization (overlapped io_uring writes). See Performance Tuning leads in the README.
 
