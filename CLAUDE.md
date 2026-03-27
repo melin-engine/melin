@@ -49,86 +49,41 @@ See [README.md](README.md#features) for implemented features and [docs/roadmap.m
 
 See [README.md](README.md#features) for implemented features and [docs/roadmap.md](docs/roadmap.md) for planned features.
 
-## In Progress
+## DPDK Transport (`feat/dpdk-zerocopy-rx` branch)
 
-### DPDK kernel-bypass transport (`feat/dpdk-transport` branch)
+**Feature flag**: `--features dpdk` (compile-time, replaces io-uring/epoll transport)
 
-**Date**: 2026-03-22 | **Feature flag**: `--features dpdk` (compile-time, replaces io-uring/epoll transport)
+DPDK kernel-bypass networking — bypasses the Linux kernel TCP stack entirely. Uses DPDK for NIC I/O (`rx_burst`/`tx_burst`) and a smoltcp fork ([fastcp](https://github.com/pierre-l/fastcp)) for userspace TCP. The engine pipeline is unaware of DPDK.
 
-DPDK kernel-bypass networking at the transport edge — bypasses the Linux kernel TCP stack entirely. Uses DPDK for NIC I/O (`rx_burst`/`tx_burst`) and smoltcp for userspace TCP processing. The engine pipeline is completely unaware of DPDK.
+**Crate**: `crates/dpdk/` — gated behind `dpdk-sys` feature. Compiles as an empty shell without libdpdk, lives in the workspace unconditionally. Source files in `src/dpdk/` submodule.
 
-**What works:**
-- Full transport layer: `crates/dpdk/` (EAL, mempool, port, smoltcp Device, C wrappers for inline DPDK functions)
-- DPDK poll thread replaces epoll reader pool: NIC polling, smoltcp TCP, frame decode, disruptor publish
-- Separate DPDK response stage: encodes to mpsc TX channel, DPDK poll thread drains into smoltcp sockets
-- Non-blocking Ed25519 auth handshake state machine (Challenge → ChallengeResponse → ServerReady)
-- Core pinning for DPDK poll thread (`--dpdk-core`, default 7)
-- CLI args: `--dpdk-eal-args`, `--dpdk-port`, `--dpdk-ip`, `--dpdk-prefix-len`, `--dpdk-gateway`, `--dpdk-core`
-- Smoke test passes end-to-end via TAP virtual device (p50=17µs)
-- DPDK bench client (`crates/bench/src/dpdk.rs`): smoltcp outbound connections, non-blocking auth, pipelined send/recv
-- 35 unit tests (frame parsing, request mapping, shared request module)
-- SR-IOV setup script auto-detects bond slaves, PCI addresses, VLAN ID (`scripts/dpdk-setup.sh`)
-- Shared `request.rs` module eliminates request processing duplication across all 3 transport backends
-- **Validated on real hardware**: Intel X710 SR-IOV VF on Cherry Servers (Ubuntu 24.04, AMD EPYC). DPDK `net_iavf` driver probes the VF, smoltcp listens on the VLAN IP. Server starts and accepts connections.
+**Scripts**: `dpdk-server.sh` (auto-detect config, start server), `dpdk-setup-sriov.sh` (VF creation for ice + ixgbe), `dpdk-test.sh` (testpmd environment check), `dpdk-smoke-test.sh` (TAP), `dpdk-e2e-smoke-test.sh` (veth + af_packet, both sides DPDK).
 
-**Server requirements for DPDK SR-IOV:**
-- NIC must expose SR-IOV PCI capability. Check before renting:
-  `lspci | grep -i ethernet; find /sys/bus/pci/devices/ -name sriov_totalvfs -exec sh -c 'echo "$(basename $(dirname {})): $(cat {})"' \;`
-- If `sriov_totalvfs` shows a number > 0, the NIC works. The model matters less than whether SR-IOV is exposed.
-- Ubuntu 24.04's HWE kernel (6.14) and GA kernel (6.8) both work with Intel X710 SR-IOV.
-- Ubuntu 24.04's kernels do NOT have SR-IOV for Intel E810-XXV SFP (tested, confirmed missing).
-- Debian Trixie's ice module lacks SR-IOV entirely. Don't use Debian for DPDK.
-- Two servers on the same VLAN required for benchmarking — switches don't hairpin traffic to the same server.
+**Core layout**: 0=OS/IRQ, 1-3=pipeline, 4-5=readers, 6=repl-sender, 7=event-publisher, 8=DPDK poll, 9+=bench.
 
-**Benchmark results (Cherry Servers, AMD EPYC, Intel X710 10GbE, VLAN, Debian 6.12 kernel):**
+**Tested hardware**: Intel 82599/X520 (ixgbe) SR-IOV on EPYC 4564P, LACP bond, Cherry Servers. Intel E810 (ice) supported but untested on current servers (IOMMU issues on some rentals).
 
-Compared DPDK+smoltcp server vs kernel TCP server, both with kernel TCP bench client, 1 client, window 256, 10M order pairs, full journal durability:
+**Benchmark results** (1 client, window 1, single-order round-trip, full journal durability):
 
-| Transport | Throughput | p50 | p99 | p99.9 | max |
-|-----------|-----------|-----|-----|-------|-----|
-| Kernel TCP (io_uring) | 669K ord/s | 347 µs | 444 µs | 488 µs | 4.5 ms |
-| DPDK + smoltcp | 446K ord/s | 471 µs | 707 µs | 10.2 ms | 43.1 ms |
+| Transport | p50 | p90 | p99 | Hardware |
+|-----------|-----|-----|-----|----------|
+| Kernel TCP | 71 µs | 71 µs | 114 µs | EPYC 4564P, 82599 10GbE |
+| DPDK (server only) | 59 µs | 61 µs | 113 µs | same |
+| DPDK (e2e) | **38 µs** | **38 µs** | **102 µs** | same |
 
-**Result: kernel TCP is faster on this hardware.** smoltcp's software TCP processing (checksums, per-packet handling, no TSO/GRO) adds more overhead than the syscalls it eliminates. The DPDK path would benefit from:
-- Hardware checksum offload (smoltcp computes in software)
-- Direct PF binding instead of SR-IOV VF (eliminates PF switching fabric overhead)
-- A NIC with Mellanox-style bifurcated driver (avoids SR-IOV entirely)
-- Raw UDP transport (eliminates TCP overhead altogether)
+**Throughput bottleneck**: single DPDK poll thread handles all NIC I/O, TCP processing, frame parsing, and disruptor publish. Peaks at ~2M orders/sec vs ~5M for kernel TCP (which parallelizes across 2 reader threads). See [docs/roadmap.md](docs/roadmap.md) for optimization plan (split RX/TX, RSS, batch publish).
 
-**Known gaps (not yet implemented):**
-- **X710 VF drops broadcast ARP**: VFs only receive unicast frames. Bench must pre-populate ARP (`ip neigh add`) or use unicast ARP. This blocks DPDK-to-DPDK testing. Mellanox ConnectX NICs support broadcast on VFs natively.
-- **Server can't accept new connections after first client disconnects**: smoltcp listener doesn't recover — must restart server between runs.
-- **No idle connection timeout**: authenticated connections have no timeout (epoll/uring path uses `--connection-timeout-secs`).
-- **No `max_connections` enforcement**: the DPDK poll loop accepts all connections without checking the limit.
-- **`active_connections` counter not wired**: counter exists but is never incremented/decremented.
+**Known remaining gaps**:
+- No idle connection timeout in DPDK path
+- No `max_connections` enforcement
+- `active_connections` counter not wired
+- Needs merge with main (shadow exchange, snapshot schedule, updated PipelineCores)
 
 ## Dead Ends / Investigated & Rejected
 **How to apply:** The matching engine is not the bottleneck. The journal fsync stage gates pipeline throughput; TCP pipelining (window=256) effectively hides fsync latency. Further throughput gains require reducing transport overhead (UDS, kernel bypass) or journal I/O optimization (overlapped io_uring writes). See Performance Tuning leads in the README.
-
-Core layout: 0=OS/IRQ, 1-3=pipeline (journal/matching/response), 4-5=readers, 6=repl-sender, 7=event-publisher, 8+=bench.
 
 ### Prioritized performance leads
 
 | Priority | Optimization | Est. gain | Complexity |
 |----------|-------------|-----------|------------|
 | 1 | Embed ReservationSlot in RestingOrder | 5-10% matching | Moderate |
-
-| 4 | AF_XDP + smoltcp userspace TCP | 20-40% latency | Very high (6+ months) |
-| 5 | DPDK + F-Stack | 2-3x throughput | Extreme, GPL concern |
-
-Options 2-5 are mutually exclusive kernel bypass paths (pick one). See README Performance Tuning leads for details.
-
-### DPDK transport optimizations (branch: `feat/dpdk-optims`)
-
-| # | Optimization | Latency gain | Throughput gain | Risk |
-|---|-------------|:---:|:---:|------|
-| 1 | Batch TX submissions — coalesce pending TX into single `rte_eth_tx_burst` | 5-15µs p50 | 10-20% | Low |
-| 2 | Eliminate auth-path allocations — `to_vec()`+`drain()` → cursor pattern | ~50ns/auth | None (cold) | None |
-| 3 | Parse buffer size limit — unbounded inbound buffer → DoS vector | None | None | **Fixes DoS** |
-| 4 | TX queue compaction threshold — lower from 50% to 25% waste | 5-20µs tail | Marginal | Low |
-| 5 | Skip smoltcp poll on empty RX — avoid TCP state machine when no packets | 50-200ns/idle | 5-10% idle | Medium (timers) |
-| 6 | Zero-copy RX — read from mbuf directly, skip smoltcp copy | 100-500ns/pkt | 10-30% | High (lifetimes) |
-| 7 | Adaptive timestamp refresh — 1 during auth, 1000 steady-state | ~3ns/poll | Negligible | Low |
-| 8 | Pre-allocated connection pool — slab instead of per-accept heap alloc | ~200ns/accept | None (cold) | None |
-
-Implementation order: #3 (safety) → #2 (quick win) → #1 (batch TX) → #5 (skip idle polls).
