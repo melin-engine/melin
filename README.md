@@ -102,7 +102,7 @@ The latency floor — one order at a time, no pipelining, no queuing.
 | Kernel TCP | 72 µs | 87 µs | 90 µs | 207 µs | Ryzen 9 9950X, 10 GbE |
 | **DPDK kernel bypass** | **37 µs** | **38 µs** | **101 µs** | 1,775 µs | EPYC 4564P, Intel 82599 10 GbE SR-IOV |
 
-The DPDK result is an early experimental measurement with end-to-end kernel bypass (both client and server) on budget server-class hardware — not purpose-built low-latency infrastructure. 47% p50 reduction vs kernel TCP on the same machines.
+The DPDK result is an early experimental measurement with end-to-end kernel bypass (both client and server) on budget server-class hardware — not purpose-built low-latency infrastructure and with SR-IOV (dedicated or bifurcated would be better). 47% p50 reduction vs kernel TCP on the same machines.
 
 **Latency CDF** — peak-load modes on the same axes:
 
