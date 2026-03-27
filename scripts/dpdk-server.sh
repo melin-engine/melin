@@ -97,10 +97,16 @@ DPDK_VLAN_ARG=""
 DPDK_MTU_ARG=""
 
 if ls /sys/bus/pci/drivers/vfio-pci/0000:* &>/dev/null; then
-    # SR-IOV mode — VFs are bound to vfio-pci.
+    # SR-IOV mode — VFs are bound to vfio-pci. Use both ports for LACP
+    # bonds so traffic arriving on either bond member is received.
     MODE="SR-IOV"
+    VF_COUNT=$(ls -d /sys/bus/pci/drivers/vfio-pci/0000:* 2>/dev/null | wc -l)
     EAL_ARGS="${EAL_ARGS:+$EAL_ARGS }--huge-dir=$HUGE_DIR"
-    DPDK_PORTS_ARG="--dpdk-ports $DPDK_PORT"
+    if [[ "$VF_COUNT" -ge 2 ]]; then
+        DPDK_PORTS_ARG="--dpdk-ports 0,1"
+    else
+        DPDK_PORTS_ARG="--dpdk-ports $DPDK_PORT"
+    fi
     if [[ -n "${VLAN_ID:-}" ]]; then
         DPDK_VLAN_ARG="--dpdk-vlan $VLAN_ID"
     fi
