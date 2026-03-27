@@ -499,8 +499,15 @@ fn run_engine_bench(
     let mut cancels: u64 = 0;
     let mut amends: u64 = 0;
 
+    // Track the N slowest orders for post-run diagnostics.
+    // Min-heap by latency: the smallest is at the top so we can
+    // efficiently evict it when a slower order arrives.
+    const SLOWEST_N: usize = 10;
+    let mut slowest: std::collections::BinaryHeap<std::cmp::Reverse<(u64, usize, usize, u64)>> =
+        std::collections::BinaryHeap::with_capacity(SLOWEST_N + 1);
+
     let start = Instant::now();
-    for event in &events[warmup..] {
+    for (i, event) in events[warmup..].iter().enumerate() {
         reports.clear();
 
         #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
@@ -549,6 +556,19 @@ fn run_engine_bench(
         interval_hist.record(elapsed_ns).expect("record interval");
         interval_count += 1;
         maybe_sample(&mut interval_hist, &mut interval_count, &mut series, start);
+
+        // Track top-N slowest using a min-heap capped at SLOWEST_N.
+        // Only compute wall-clock offset when actually inserting (rare path).
+        if slowest.len() < SLOWEST_N {
+            let offset_us = start.elapsed().as_micros() as u64;
+            slowest.push(std::cmp::Reverse((elapsed_ns, i, reports.len(), offset_us)));
+        } else if let Some(&std::cmp::Reverse((min_ns, _, _, _))) = slowest.peek() {
+            if elapsed_ns > min_ns {
+                let offset_us = start.elapsed().as_micros() as u64;
+                slowest.pop();
+                slowest.push(std::cmp::Reverse((elapsed_ns, i, reports.len(), offset_us)));
+            }
+        }
     }
     let wall = start.elapsed();
 
@@ -581,6 +601,17 @@ fn run_engine_bench(
         &series,
         &[],
     );
+
+    // Print the slowest orders for tail latency diagnosis.
+    let mut sorted: Vec<_> = slowest.into_iter().map(|std::cmp::Reverse(e)| e).collect();
+    sorted.sort_by(|a, b| b.0.cmp(&a.0)); // descending by latency
+    println!("\n  Slowest {SLOWEST_N} Orders");
+    for (latency_ns, event_idx, num_reports, offset_us) in &sorted {
+        let event = &events[warmup + event_idx];
+        let latency_us = *latency_ns as f64 / 1000.0;
+        let offset_ms = *offset_us as f64 / 1000.0;
+        println!("    {latency_us:>7.2}µs  @{offset_ms:>7.1}ms  reports={num_reports}  {event:?}");
+    }
 }
 
 // ===========================================================================

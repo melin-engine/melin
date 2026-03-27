@@ -1333,6 +1333,12 @@ impl OrderBook {
             return;
         };
 
+        // Fast path: skip all BTreeMap iteration when no stops are pending.
+        // Stops are ~3% of order flow; the other 97% of orders pay zero cost.
+        if self.stop_buys.is_empty() && self.stop_sells.is_empty() {
+            return;
+        }
+
         // Stop buys: trigger when trade price >= trigger price.
         // Collect all triggers at or below the trade price (ascending order).
         self.trigger_price_buf.clear();
