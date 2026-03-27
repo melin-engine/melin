@@ -278,7 +278,17 @@ pub fn run_dpdk_roundtrip(
                 start_order_id: order_id_offset + 1,
                 ..Default::default()
             });
+            // Pre-build wire frames: [u32 LE length][payload].
+            // Single send_slice per frame instead of two (prefix + payload).
             flow.generate_frames(total_orders)
+                .into_iter()
+                .map(|payload| {
+                    let mut wire = Vec::with_capacity(4 + payload.len());
+                    wire.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+                    wire.extend_from_slice(&payload);
+                    wire
+                })
+                .collect::<Vec<_>>()
         };
 
         connections.push(DpdkBenchConn {
@@ -352,7 +362,6 @@ pub fn run_dpdk_roundtrip(
         Histogram::<u64>::new_with_bounds(1, 10_000_000_000, 3).expect("interval histogram");
     let mut interval_count: usize = 0;
     let mut series: TimeSeries = Vec::new();
-    let mut recv_buf = [0u8; 4096];
 
     loop {
         poll(
@@ -394,49 +403,29 @@ pub fn run_dpdk_roundtrip(
                 && conn.send_cursor < conn.total_orders
                 && socket.can_send()
             {
-                let payload = &conn.frames[conn.send_cursor];
-                // Build length-prefixed wire frame: [u32 LE length][payload].
-                let len_prefix = (payload.len() as u32).to_le_bytes();
-                let wire_len = 4 + payload.len();
-
-                // Try to send the length prefix first.
-                let sent = match socket.send_slice(&len_prefix) {
-                    Ok(n) if n == 4 => {
-                        // Prefix sent, now send payload.
-                        match socket.send_slice(payload) {
-                            Ok(n) if n == payload.len() => wire_len,
-                            Ok(n) => {
-                                // Partial payload — buffer remainder.
-                                conn.send_pending.extend_from_slice(&payload[n..]);
-                                wire_len
-                            }
-                            Err(_) => {
-                                // Payload failed — buffer entire payload.
-                                conn.send_pending.extend_from_slice(payload);
-                                wire_len
-                            }
-                        }
+                // Frames are pre-built with length prefix: [u32 LE len][payload].
+                let wire_frame = &conn.frames[conn.send_cursor];
+                match socket.send_slice(wire_frame) {
+                    Ok(n) if n == wire_frame.len() => {}
+                    Ok(n) if n > 0 => {
+                        // Partial send — buffer remainder.
+                        conn.send_pending.extend_from_slice(&wire_frame[n..]);
                     }
-                    Ok(n) => {
-                        // Partial prefix — buffer remainder of prefix + payload.
-                        conn.send_pending.extend_from_slice(&len_prefix[n..]);
-                        conn.send_pending.extend_from_slice(payload);
-                        wire_len
-                    }
+                    Ok(_) => break,
                     Err(_) => break,
-                };
-                if sent == 0 {
-                    break;
                 }
                 conn.inflight_ts.push_back(Instant::now());
                 conn.send_cursor += 1;
             }
 
-            // --- Recv: drain all available data from smoltcp socket ---
+            // --- Recv: drain directly into parse_buf (no intermediate copy) ---
             while socket.can_recv() {
-                match socket.recv_slice(&mut recv_buf) {
-                    Ok(0) | Err(_) => break,
-                    Ok(n) => conn.parse_buf.extend_from_slice(&recv_buf[..n]),
+                match socket.recv(|data| {
+                    conn.parse_buf.extend_from_slice(data);
+                    (data.len(), ())
+                }) {
+                    Ok(()) => {}
+                    Err(_) => break,
                 }
             }
 
