@@ -114,6 +114,11 @@ pub fn run_dpdk_poll(
     let mut id_to_handle: HashMap<u64, SocketHandle> = HashMap::with_capacity(256);
     let mut next_connection_id: u64 = 1;
 
+    // Batch buffer for disruptor publish — accumulate decoded events from
+    // all connections, then publish in a tight loop. Reduces interleaving
+    // between smoltcp/parsing and ring buffer operations.
+    let mut publish_batch: Vec<InputSlot> = Vec::with_capacity(256);
+
     // Reusable handle buffer to avoid per-poll allocation.
     let mut handle_buf: Vec<SocketHandle> = Vec::with_capacity(256);
 
@@ -333,7 +338,7 @@ pub fn run_dpdk_poll(
                     process_trading_frames(
                         conn,
                         &mut transport,
-                        &producer,
+                        &mut publish_batch,
                         &control_tx,
                         &mut id_to_handle,
                         &active_connections,
@@ -345,6 +350,14 @@ pub fn run_dpdk_poll(
             if was_waiting && matches!(conn.auth, AuthState::Authenticated { .. }) {
                 active_connections.fetch_add(1, Ordering::Relaxed);
             }
+        }
+
+        // 5. Flush accumulated events to the disruptor in a tight loop.
+        // Publishing separately from parsing improves cache locality —
+        // all ring buffer writes happen together without interleaving
+        // with smoltcp/codec operations.
+        for slot in publish_batch.drain(..) {
+            producer.publish(slot);
         }
     }
 }
@@ -519,7 +532,7 @@ fn send_auth_failed(conn: &ConnectionState, transport: &mut DpdkTransport) {
 fn process_trading_frames(
     conn: &mut ConnectionState,
     transport: &mut DpdkTransport,
-    producer: &ring::MultiProducer<InputSlot>,
+    batch: &mut Vec<InputSlot>,
     control_tx: &mpsc::Sender<ControlEvent>,
     id_to_handle: &mut HashMap<u64, SocketHandle>,
     active_connections: &std::sync::atomic::AtomicU64,
@@ -556,7 +569,7 @@ fn process_trading_frames(
                     #[allow(clippy::let_unit_value)] // trace_ts() returns () without latency-trace
                     let recv_ts = trace_ts();
                     let event = shared_request::to_event(&request);
-                    producer.publish(InputSlot {
+                    batch.push(InputSlot {
                         connection_id: conn.connection_id.0,
                         key_hash: conn.key_hash,
                         request_seq: seq,
