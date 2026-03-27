@@ -60,9 +60,9 @@ echo ""
 echo "=== Auth keys ==="
 ssh $SSH_OPTS "$SERVER" "cd ${REPO} && \
     if [[ ! -f bench.key ]]; then \
-        ./target/release/melin-keygen bench admin; \
+        ./target/release/melin-keygen bench trader; \
     fi && \
-    echo \"admin \$(cat bench.pub) bench\" > authorized_keys"
+    echo \"trader \$(cat bench.pub) bench\" > authorized_keys"
 ssh $SSH_OPTS "$SERVER" "cat ${REPO}/bench.key" | ssh $SSH_OPTS "$BENCH" "cat > ${REPO}/bench.key"
 echo "  Done"
 echo ""

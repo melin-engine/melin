@@ -91,8 +91,8 @@ echo ""
 # --- Auth keys ---
 echo "=== Auth keys ==="
 cd "$TMPDIR"
-"$PROJECT_DIR/target/release/melin-keygen" bench admin
-echo "admin $(cat bench.pub | tr -d '\n') bench" > authorized_keys
+"$PROJECT_DIR/target/release/melin-keygen" bench trader
+echo "trader $(cat bench.pub | tr -d '\n') bench" > authorized_keys
 echo "  Generated"
 echo ""
 

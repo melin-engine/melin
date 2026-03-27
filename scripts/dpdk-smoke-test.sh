@@ -70,6 +70,13 @@ cleanup() {
         umount "$HUGE_2M_MOUNT" 2>/dev/null || true
     fi
 
+    # Restore target/ ownership — this script runs as root (sudo) so
+    # cargo builds leave root-owned files that block non-root builds.
+    if [[ -n "${SUDO_USER:-}" ]]; then
+        chown -R "$SUDO_USER:$SUDO_USER" "$PROJECT_DIR/target" 2>/dev/null || true
+        echo "  Restored target/ ownership to $SUDO_USER"
+    fi
+
     # Clean up temp dir.
     rm -rf "$TMPDIR"
     echo "  Temp dir cleaned: $TMPDIR"
@@ -124,9 +131,9 @@ echo ""
 # --- 3. Auth keys ---
 echo "=== Auth keys ==="
 cd "$TMPDIR"
-"$PROJECT_DIR/target/release/melin-keygen" bench admin
+"$PROJECT_DIR/target/release/melin-keygen" bench trader
 # keygen creates bench.key and bench.pub
-echo "admin $(cat bench.pub | tr -d '\n') bench" > authorized_keys
+echo "trader $(cat bench.pub | tr -d '\n') bench" > authorized_keys
 echo "  Generated bench.key + authorized_keys"
 echo ""
 

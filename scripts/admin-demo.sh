@@ -11,9 +11,9 @@ cargo build --bin melin-server --bin melin-keygen --bin melin-admin --quiet
 
 echo "==> Generating keypair..."
 cd "$TMPDIR"
-cargo run --manifest-path "$OLDPWD/Cargo.toml" --bin melin-keygen --quiet -- admin admin
+cargo run --manifest-path "$OLDPWD/Cargo.toml" --bin melin-keygen --quiet -- admin operator
 # Extract the authorized_keys line from keygen output and write to file.
-echo "admin $(cat admin.pub | tr -d '\n') admin" > authorized_keys
+echo "operator $(cat admin.pub | tr -d '\n') admin" > authorized_keys
 
 echo "==> Starting server..."
 cargo run --manifest-path "$OLDPWD/Cargo.toml" --bin melin-server --quiet -- \
