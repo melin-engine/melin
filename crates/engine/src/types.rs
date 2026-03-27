@@ -299,6 +299,20 @@ pub enum ExecutionReport {
     },
 }
 
+/// Opaque handle to a reservation in the slab. O(1) Vec-indexed access,
+/// no hashing. Valid from `try_reserve` until `release` or fill completion.
+///
+/// u32 index: supports up to ~4 billion concurrent reservations. At 2M
+/// pre-allocated slots this is more than sufficient.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ReservationSlot(pub(crate) u32);
+
+impl ReservationSlot {
+    /// Sentinel value for prefault dummy entries and snapshot restore
+    /// (before real slots are injected). Never used in production matching.
+    pub const DUMMY: Self = Self(u32::MAX);
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RejectReason {
     /// Market order with no liquidity on the opposite side.

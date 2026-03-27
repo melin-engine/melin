@@ -285,7 +285,7 @@ fn run_book_actions(
                     stp: *stp,
                     expiry_ns: 0,
                 };
-                book.execute(order, None, &mut reports);
+                book.execute(order, None, ReservationSlot::DUMMY, &mut reports);
             }
             BookAction::Market {
                 side,
@@ -305,7 +305,7 @@ fn run_book_actions(
                     stp: *stp,
                     expiry_ns: 0,
                 };
-                book.execute(order, None, &mut reports);
+                book.execute(order, None, ReservationSlot::DUMMY, &mut reports);
             }
             BookAction::Stop {
                 side,
@@ -328,7 +328,7 @@ fn run_book_actions(
                     stp: *stp,
                     expiry_ns: 0,
                 };
-                book.execute(order, None, &mut reports);
+                book.execute(order, None, ReservationSlot::DUMMY, &mut reports);
             }
             BookAction::StopLimit {
                 side,
@@ -354,7 +354,7 @@ fn run_book_actions(
                     stp: *stp,
                     expiry_ns: 0,
                 };
-                book.execute(order, None, &mut reports);
+                book.execute(order, None, ReservationSlot::DUMMY, &mut reports);
             }
             BookAction::Cancel { target_idx } => {
                 action_order_ids.push(None);
@@ -933,7 +933,7 @@ proptest! {
                 stp: SelfTradeProtection::Allow,
                 expiry_ns: 0,
             };
-            book.execute(order, None, &mut reports);
+            book.execute(order, None, ReservationSlot::DUMMY, &mut reports);
         }
         reports.clear();
 
@@ -947,7 +947,7 @@ proptest! {
             stp: SelfTradeProtection::Allow,
             expiry_ns: 0,
         };
-        book.execute(market, None, &mut reports);
+        book.execute(market, None, ReservationSlot::DUMMY, &mut reports);
 
         let fills: Vec<(Price, OrderId)> = reports
             .iter()
@@ -1000,7 +1000,7 @@ proptest! {
                 stp: SelfTradeProtection::Allow,
                 expiry_ns: 0,
             };
-            book.execute(order, None, &mut reports);
+            book.execute(order, None, ReservationSlot::DUMMY, &mut reports);
         }
         reports.clear();
 
@@ -1014,7 +1014,7 @@ proptest! {
             stp: SelfTradeProtection::Allow,
             expiry_ns: 0,
         };
-        book.execute(market, None, &mut reports);
+        book.execute(market, None, ReservationSlot::DUMMY, &mut reports);
 
         let fills: Vec<(Price, OrderId)> = reports
             .iter()

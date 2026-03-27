@@ -26,12 +26,12 @@ use std::io::{Read, Write};
 use std::num::NonZeroU64;
 use std::path::Path;
 
-use crate::account::{AccountManager, Balance, OrderInfo};
+use crate::account::{AccountManager, Balance};
 use crate::exchange::Exchange;
 use crate::orderbook::OrderBook;
 use crate::types::{
     AccountId, CircuitBreakerConfig, CurrencyId, FeeSchedule, InstrumentSpec, OrderId, Price,
-    Quantity, RiskLimits, Side, Symbol, TimeInForce,
+    Quantity, ReservationSlot, RiskLimits, Side, Symbol, TimeInForce,
 };
 
 use super::error::JournalError;
@@ -1168,21 +1168,12 @@ impl Exchange {
         let (accounts, slot_assignments) =
             AccountManager::from_parts(state.balances, state.reservations);
 
-        // Build order_info by combining saved sides with restored reservation slots.
-        // Build a side lookup first, then merge with slot assignments.
-        let side_map: StdHashMap<(AccountId, OrderId), Side> =
-            state.order_sides.into_iter().collect();
-        let mut order_info: crate::types::HashMap4<(AccountId, OrderId), OrderInfo> =
-            crate::types::HashMap4::with_capacity_and_hasher(side_map.len(), Default::default());
-        for (key, slot) in slot_assignments {
-            if let Some(&side) = side_map.get(&key) {
-                order_info.insert(
-                    key,
-                    OrderInfo {
-                        side,
-                        reservation: slot,
-                    },
-                );
+        // Inject reservation slots into each instrument's order book.
+        // The books were restored with DUMMY slots; now patch them with
+        // the real slots from the account manager's slab.
+        for inst in &mut instruments {
+            if let Some(inst) = inst.as_deref_mut() {
+                inst.book.inject_reservation_slots(&slot_assignments);
             }
         }
 
@@ -1205,7 +1196,7 @@ impl Exchange {
             key_hwm.insert(key_hash, hwm);
         }
 
-        Self::from_parts(instruments, accounts, order_info, max_order_id, key_hwm)
+        Self::from_parts(instruments, accounts, max_order_id, key_hwm)
     }
 
     /// Create a deep copy of this Exchange by round-tripping through the
@@ -1277,7 +1268,7 @@ impl OrderBook {
 
     /// Restore an order book from a snapshot.
     pub(crate) fn restore(snap: BookSnapshot) -> Self {
-        let restore_side = |levels: Vec<(Price, Vec<RestingOrderSnapshot>)>| {
+        let restore_side = |levels: Vec<(Price, Vec<RestingOrderSnapshot>)>, side: Side| {
             // Build sorted Vec of (Price, VecDeque) — input is already sorted
             // by price from the snapshot codec.
             let sorted: Vec<(Price, VecDeque<crate::orderbook::RestingOrder>)> = levels
@@ -1292,6 +1283,8 @@ impl OrderBook {
                                 o.remaining,
                                 o.time_in_force,
                                 o.expiry_ns,
+                                side,
+                                ReservationSlot::DUMMY,
                             )
                         })
                         .collect();
@@ -1318,6 +1311,7 @@ impl OrderBook {
                             s.quote_budget,
                             s.stp,
                             s.expiry_ns,
+                            ReservationSlot::DUMMY,
                         )
                     })
                     .collect();
@@ -1326,10 +1320,15 @@ impl OrderBook {
             btree
         };
 
-        let order_index: crate::types::HashMap4<(AccountId, OrderId), (Side, Price)> = snap
+        let order_index: crate::types::HashMap4<
+            (AccountId, OrderId),
+            (Side, Price, ReservationSlot),
+        > = snap
             .order_index
             .into_iter()
-            .map(|(id, account, side, price)| ((account, id), (side, price)))
+            .map(|(id, account, side, price)| {
+                ((account, id), (side, price, ReservationSlot::DUMMY))
+            })
             .collect();
 
         let stop_index: crate::types::HashMap4<(AccountId, OrderId), (Side, Price)> = snap
@@ -1339,8 +1338,8 @@ impl OrderBook {
             .collect();
 
         Self::from_parts(
-            restore_side(snap.bids),
-            restore_side(snap.asks),
+            restore_side(snap.bids, Side::Buy),
+            restore_side(snap.asks, Side::Sell),
             order_index,
             restore_stops(snap.stop_buys),
             restore_stops(snap.stop_sells),

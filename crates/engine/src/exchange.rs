@@ -8,12 +8,12 @@
 //! stays single-threaded. Note: portfolio risk checks then require
 //! cross-shard message passing, adding latency and complexity.
 
-use crate::account::{AccountManager, OrderInfo, ReservationSlot};
+use crate::account::AccountManager;
 use crate::orderbook::OrderBook;
 use crate::types::{
     AccountId, CircuitBreakerConfig, CurrencyId, ExecutionReport, FeeSchedule, HashMap, HashMap4,
-    InstrumentSpec, Order, OrderId, OrderType, Price, Quantity, RejectReason, RiskLimits, Side,
-    Symbol, TimeInForce,
+    InstrumentSpec, Order, OrderId, OrderType, Price, Quantity, RejectReason, ReservationSlot,
+    RiskLimits, Side, Symbol, TimeInForce,
 };
 
 /// Helper: get an immutable reference to the InstrumentState at `symbol`.
@@ -58,18 +58,13 @@ pub struct Exchange {
     instruments: Vec<Option<Box<InstrumentState>>>,
     /// Shared account balance manager across all instruments.
     accounts: AccountManager,
-    /// Tracks order side and reservation slot by (account, order_id).
-    /// Keyed by the pair because different accounts can independently
-    /// use the same OrderId. The `ReservationSlot` enables O(1) Vec-indexed
-    /// access to the reservation slab (eliminating a second HashMap lookup).
-    order_info: HashMap4<(AccountId, OrderId), OrderInfo>,
     /// Per-account high-water mark for order IDs. Rejects submissions
     /// with `order_id <= max_seen[account]` to prevent duplicate execution
     /// on crash-recovery retry. Sparse HashMap: only accounts that have
     /// submitted orders consume memory. Never evicted — prevents order ID
     /// replay after account withdrawal.
     max_order_id: HashMap4<AccountId, u64>,
-    /// Per-account count of resting orders (entries in `order_info`).
+    /// Per-account count of resting orders (on the book or pending stops).
     /// Used to reject withdrawals while orders are outstanding.
     /// Entries are removed when the count reaches zero.
     order_counts: HashMap4<AccountId, u32>,
@@ -78,9 +73,6 @@ pub struct Exchange {
     /// the client's Ed25519 public key. Never evicted — key count is
     /// small (~100 max for any exchange).
     key_hwm: HashMap<u64, u64>,
-    /// Reusable buffer for consumed (account, order) keys from
-    /// `process_reports()`. Avoids per-order Vec allocation on the hot path.
-    consumed_buf: Vec<(AccountId, OrderId)>,
     /// When true, new order books are created with generous pre-allocation
     /// to avoid HashMap resize spikes on the hot path.
     presized: bool,
@@ -91,38 +83,25 @@ impl Exchange {
         Self {
             instruments: Vec::new(),
             accounts: AccountManager::new(),
-            order_info: HashMap4::default(),
             max_order_id: HashMap4::default(),
             order_counts: HashMap4::default(),
             key_hwm: HashMap::default(),
-            consumed_buf: Vec::new(),
             presized: false,
         }
     }
 
     /// Create an Exchange pre-sized for production workloads.
-    ///
-    /// HashMap capacities are kept small enough to stay cache-resident.
-    /// Oversized tables (millions of slots) cause every probe to miss
-    /// L2/L3 cache, adding ~40-80 ns per HashMap operation. A 32K-slot
-    /// order_info table is ~1 MB and fits in L3; resize at 32K is ~50 µs
-    /// (rare, appears in p99.99 at most).
     pub fn with_capacity() -> Self {
         Self {
             // 64 instrument slots — each empty slot is 8 bytes (null Box ptr).
             instruments: Vec::with_capacity(64),
             accounts: AccountManager::with_capacity(),
-            // Global across all instruments. Typical steady-state: 100
-            // instruments × 200 resting orders = 20K entries. 32K slots
-            // ≈ 1 MB — fits in L3 cache.
-            order_info: HashMap4::with_capacity_and_hasher(32_768, Default::default()),
             // 1M accounts × ~32 bytes per entry ≈ 32 MB each. Covers
             // the default benchmark (1M accounts) with no hot-path resizes.
             // Pages are faulted during prefault() via insert/clear.
             max_order_id: HashMap4::with_capacity_and_hasher(1_000_000, Default::default()),
             order_counts: HashMap4::with_capacity_and_hasher(1_000_000, Default::default()),
             key_hwm: HashMap::default(),
-            consumed_buf: Vec::with_capacity(256),
             presized: true,
         }
     }
@@ -131,24 +110,27 @@ impl Exchange {
     pub(crate) fn from_parts(
         instruments: Vec<Option<Box<InstrumentState>>>,
         accounts: AccountManager,
-        order_info: HashMap4<(AccountId, OrderId), OrderInfo>,
         max_order_id: HashMap4<AccountId, u64>,
         key_hwm: HashMap<u64, u64>,
     ) -> Self {
-        // Derive order_counts from order_info (count entries per account).
-        let mut order_counts: HashMap4<AccountId, u32> =
-            HashMap4::with_capacity_and_hasher(order_info.len(), Default::default());
-        for &(account, _) in order_info.keys() {
-            *order_counts.entry(account).or_default() += 1;
+        // Derive order_counts from order_index across all instruments.
+        let mut order_counts: HashMap4<AccountId, u32> = HashMap4::default();
+        for inst in &instruments {
+            if let Some(inst) = inst.as_deref() {
+                for ((account, _), _) in inst.book.active_order_slots() {
+                    *order_counts.entry(account).or_default() += 1;
+                }
+                for ((account, _), _) in inst.book.active_stop_slots() {
+                    *order_counts.entry(account).or_default() += 1;
+                }
+            }
         }
         Self {
             instruments,
             accounts,
-            order_info,
             max_order_id,
             order_counts,
             key_hwm,
-            consumed_buf: Vec::new(),
             presized: false,
         }
     }
@@ -198,22 +180,38 @@ impl Exchange {
     /// Only serializes the side; reservation slots are ephemeral and
     /// reassigned on restore.
     pub(crate) fn snapshot_order_sides(&self) -> Vec<((AccountId, OrderId), Side)> {
-        self.order_info
-            .iter()
-            .map(|(&key, info)| (key, info.side))
-            .collect()
+        let mut sides = Vec::new();
+        for inst in &self.instruments {
+            if let Some(inst) = inst.as_deref() {
+                for (key, (side, _slot)) in inst.book.active_order_slots() {
+                    sides.push((key, side));
+                }
+                for (key, (side, _slot)) in inst.book.active_stop_slots() {
+                    sides.push((key, side));
+                }
+            }
+        }
+        sides
     }
 
-    /// Collect active reservation slot assignments for snapshot serialization.
+    /// Collect active reservation slot assignments from all instruments.
     fn active_reservation_slots(&self) -> Vec<((AccountId, OrderId), ReservationSlot)> {
-        self.order_info
-            .iter()
-            .map(|(&key, info)| (key, info.reservation))
-            .collect()
+        let mut slots = Vec::new();
+        for inst in &self.instruments {
+            if let Some(inst) = inst.as_deref() {
+                for (key, (_side, slot)) in inst.book.active_order_slots() {
+                    slots.push((key, slot));
+                }
+                for (key, (_side, slot)) in inst.book.active_stop_slots() {
+                    slots.push((key, slot));
+                }
+            }
+        }
+        slots
     }
 
     /// Snapshot all active reservations. Delegates to AccountManager with
-    /// the live slot assignments from order_info.
+    /// the active slot assignments.
     pub(crate) fn snapshot_reservations(&self) -> Vec<(OrderId, AccountId, CurrencyId, u64)> {
         let active = self.active_reservation_slots();
         self.accounts.snapshot_reservations(&active)
@@ -285,19 +283,6 @@ impl Exchange {
     /// orders. Skips maps that already contain data — their pages are already
     /// faulted from the insertions that populated them.
     pub fn prefault(&mut self) {
-        if self.order_info.is_empty() {
-            let cap = self.order_info.capacity();
-            let dummy_info = OrderInfo {
-                side: Side::Buy,
-                reservation: ReservationSlot::DUMMY,
-            };
-            for i in 0..cap {
-                self.order_info
-                    .insert((AccountId(0), OrderId(i as u64)), dummy_info);
-            }
-            self.order_info.clear();
-        }
-
         // Fault max_order_id and order_counts pages. with_capacity()
         // allocated the backing table but didn't write to it — insert
         // dummy entries and clear to touch every page before the hot path.
@@ -538,76 +523,163 @@ impl Exchange {
             _ => None,
         };
 
-        // Track the order's side and reservation slot for fill processing.
-        self.order_info.insert(
-            (order.account, order.id),
-            OrderInfo {
-                side: order.side,
-                reservation: slot,
-            },
-        );
         *self.order_counts.entry(order.account).or_default() += 1;
 
+        let _taker_side = order.side;
+        let taker_account = order.account;
+        let taker_id = order.id;
         let report_start = reports.len();
 
         // Single mutable lookup: book, fees all from the same struct.
         let inst =
             inst_mut(&mut self.instruments, symbol).expect("instrument verified to exist above");
-        inst.book.execute(order, quote_budget, reports);
+        inst.book.execute(order, quote_budget, slot, reports);
 
         // Compute fees on fills before balance updates.
         apply_fees(&mut reports[report_start..], &inst.fee_schedule);
 
-        // Process reports to update balances.
-        let new_reports = &reports[report_start..];
-        self.consumed_buf.clear();
-        self.accounts
-            .process_reports(new_reports, &self.order_info, &spec, &mut self.consumed_buf);
-
-        // Buy-side orders may have leftover reservation after fills due to
-        // price improvement: a limit buy at price 100 filling at price 80
-        // reserved 100×qty but only spent 80×qty, leaving 20×qty in the
-        // reservation. Market/stop buys reserve the entire available quote
-        // balance, making this even more likely. The Fill handler in
-        // process_reports only cleans up reservations when remaining == 0,
-        // which won't happen with price improvement.
+        // Process reports to update balances. Mirrors the old process_reports
+        // logic but resolves slots from the book instead of a separate HashMap.
         //
-        // Scan all order IDs from fill reports. If any has a leftover
-        // reservation but is no longer on the book (fully filled), release
-        // the unused portion. This also handles triggered stops whose fill
-        // didn't exhaust their budget-based reservation.
-        let inst = inst_ref(&self.instruments, symbol).expect("instrument verified to exist above");
+        // consumed_slots: fully-filled or STP-cancelled makers, with their
+        // reservation slots. Typically 0-5 entries per aggressive order.
+        let consumed: Vec<(AccountId, OrderId, Side, ReservationSlot)> =
+            inst.book.drain_consumed_slots().collect();
+
+        // Track which (account, order_id) pairs are fully done (slot freed).
+        // Used to avoid double-free and to decrement order_counts.
+        let mut freed: Vec<(AccountId, OrderId)> = Vec::new();
+
         for report in &reports[report_start..] {
-            if let ExecutionReport::Fill {
-                maker_order_id,
-                taker_order_id,
-                maker_account,
-                taker_account,
-                ..
-            } = report
-            {
-                for &(account, id) in &[
-                    (*maker_account, *maker_order_id),
-                    (*taker_account, *taker_order_id),
-                ] {
-                    if !self.consumed_buf.contains(&(account, id))
-                        && self.order_info.contains_key(&(account, id))
-                        && !inst.book.has_order(account, id)
-                        && !inst.book.has_stop(account, id)
-                    {
-                        let info = self.order_info[&(account, id)];
-                        self.accounts.release(info.reservation);
-                        self.consumed_buf.push((account, id));
+            match *report {
+                ExecutionReport::Fill {
+                    maker_order_id,
+                    taker_order_id,
+                    maker_account,
+                    taker_account: fill_taker_account,
+                    price,
+                    quantity,
+                    maker_fee,
+                    taker_fee,
+                } => {
+                    // Resolve maker slot: consumed list (fully filled) or
+                    // order_index (partially filled, still on book).
+                    let maker_info = consumed
+                        .iter()
+                        .find(|(a, id, _, _)| *a == maker_account && *id == maker_order_id)
+                        .map(|(_, _, side, slot)| (*side, *slot))
+                        .or_else(|| {
+                            inst.book
+                                .peek_order_location(maker_account, maker_order_id)
+                                .map(|(side, _, slot)| (side, slot))
+                        });
+
+                    let Some((maker_side, maker_slot)) = maker_info else {
+                        continue;
+                    };
+
+                    // Resolve taker slot. The fill's taker may be the original
+                    // order (use `slot`) or a triggered stop (use slot from
+                    // consumed_slots, where check_triggers pushed it).
+                    let taker_slot =
+                        if fill_taker_account == taker_account && taker_order_id == taker_id {
+                            slot
+                        } else {
+                            // Triggered stop's slot — look up in consumed.
+                            match consumed
+                                .iter()
+                                .find(|(a, id, _, _)| {
+                                    *a == fill_taker_account && *id == taker_order_id
+                                })
+                                .map(|(_, _, _, s)| *s)
+                            {
+                                Some(s) => s,
+                                None => continue,
+                            }
+                        };
+
+                    let (buyer_slot, seller_slot, buyer_fee, seller_fee) = match maker_side {
+                        Side::Buy => (maker_slot, taker_slot, maker_fee, taker_fee),
+                        Side::Sell => (taker_slot, maker_slot, taker_fee, maker_fee),
+                    };
+                    self.accounts.fill(
+                        buyer_slot,
+                        seller_slot,
+                        price,
+                        quantity,
+                        buyer_fee,
+                        seller_fee,
+                        &spec,
+                    );
+
+                    // Free fully consumed reservation slots (remaining == 0).
+                    if self.accounts.reservation_remaining(maker_slot) == 0 {
+                        self.accounts.free_slot(maker_slot);
+                        freed.push((maker_account, maker_order_id));
+                    }
+                    if self.accounts.reservation_remaining(taker_slot) == 0 {
+                        self.accounts.free_slot(taker_slot);
+                        freed.push((fill_taker_account, taker_order_id));
                     }
                 }
+                ExecutionReport::Cancelled {
+                    order_id, account, ..
+                } => {
+                    let key = (account, order_id);
+                    if freed.contains(&key) {
+                        continue;
+                    }
+                    // Cancelled: taker or STP-cancelled maker.
+                    if account == taker_account && order_id == taker_id {
+                        self.accounts.release(slot);
+                    } else if let Some((_, _, _, maker_slot)) = consumed
+                        .iter()
+                        .find(|(a, id, _, _)| *a == account && *id == order_id)
+                    {
+                        self.accounts.release(*maker_slot);
+                    }
+                    freed.push(key);
+                }
+                ExecutionReport::Rejected {
+                    order_id, account, ..
+                } => {
+                    let key = (account, order_id);
+                    if freed.contains(&key) {
+                        continue;
+                    }
+                    if account == taker_account && order_id == taker_id {
+                        self.accounts.release(slot);
+                    } else if let Some((_, _, _, triggered_slot)) = consumed
+                        .iter()
+                        .find(|(a, id, _, _)| *a == account && *id == order_id)
+                    {
+                        self.accounts.release(*triggered_slot);
+                    }
+                    freed.push(key);
+                }
+                _ => {}
             }
         }
 
-        // Clean up order_info for fully consumed orders (filled, cancelled,
-        // or rejected). Without this, order_info leaks entries and triggers
-        // increasingly expensive HashMap resizes on the hot path.
-        for &(account, order_id) in &self.consumed_buf {
-            self.order_info.remove(&(account, order_id));
+        // Release leftover reservations for orders no longer on the book
+        // (price improvement, market buy budget surplus, etc.).
+        let inst = inst_ref(&self.instruments, symbol).expect("instrument verified to exist above");
+        if !freed.contains(&(taker_account, taker_id))
+            && !inst.book.has_order(taker_account, taker_id)
+            && !inst.book.has_stop(taker_account, taker_id)
+        {
+            self.accounts.release(slot);
+            freed.push((taker_account, taker_id));
+        }
+        for &(account, order_id, _, maker_slot) in &consumed {
+            if !freed.contains(&(account, order_id)) {
+                self.accounts.release(maker_slot);
+                freed.push((account, order_id));
+            }
+        }
+
+        // Decrement order_counts for all freed orders.
+        for &(account, _) in &freed {
             if let Some(count) = self.order_counts.get_mut(&account) {
                 *count = count.saturating_sub(1);
                 if *count == 0 {
@@ -620,35 +692,37 @@ impl Exchange {
     /// Cancel all resting orders and pending stops for an account across
     /// all instruments (kill switch). Releases all associated reservations.
     pub fn cancel_all(&mut self, account: AccountId, reports: &mut Vec<ExecutionReport>) {
-        // Iterate by index to avoid collecting symbols into a Vec.
-        // We need mutable access to each instrument's book, but also need
-        // self.accounts and self.order_info, so we index explicitly.
         for idx in 0..self.instruments.len() {
             let Some(inst) = self.instruments[idx].as_deref_mut() else {
                 continue;
             };
-            let spec = inst.spec;
 
             let report_start = reports.len();
 
+            // cancel_all_for_account calls cancel() internally, which
+            // returns slots. But since it's a bulk operation that iterates
+            // then cancels, the returned slots are discarded — instead we
+            // collect from consumed_slots after.
             inst.book.cancel_all_for_account(account, reports);
 
-            let new_reports = &reports[report_start..];
-            self.consumed_buf.clear();
-            self.accounts.process_reports(
-                new_reports,
-                &self.order_info,
-                &spec,
-                &mut self.consumed_buf,
-            );
+            // Each cancel pushed its slot to consumed_slots.
+            // Release all of them.
+            let consumed: Vec<(AccountId, OrderId, Side, ReservationSlot)> =
+                inst.book.drain_consumed_slots().collect();
+            for &(_, _, _, slot) in &consumed {
+                self.accounts.release(slot);
+            }
 
-            for &(account, order_id) in &self.consumed_buf {
-                self.order_info.remove(&(account, order_id));
-                if let Some(count) = self.order_counts.get_mut(&account) {
-                    *count = count.saturating_sub(1);
-                    if *count == 0 {
-                        self.order_counts.remove(&account);
-                    }
+            // Also release slots returned directly by cancel() — those
+            // are for resting orders. For bulk cancel, cancel() is called
+            // internally by cancel_all_for_account which discards the
+            // return value, so slots are in consumed_slots already.
+
+            let n_cancelled = reports.len() - report_start;
+            if let Some(count) = self.order_counts.get_mut(&account) {
+                *count = count.saturating_sub(n_cancelled as u32);
+                if *count == 0 {
+                    self.order_counts.remove(&account);
                 }
             }
         }
@@ -661,23 +735,11 @@ impl Exchange {
             let Some(inst) = self.instruments[idx].as_deref_mut() else {
                 continue;
             };
-            let spec = inst.spec;
-
-            let report_start = reports.len();
 
             inst.book.cancel_day_orders(reports);
 
-            let new_reports = &reports[report_start..];
-            self.consumed_buf.clear();
-            self.accounts.process_reports(
-                new_reports,
-                &self.order_info,
-                &spec,
-                &mut self.consumed_buf,
-            );
-
-            for &(account, order_id) in &self.consumed_buf {
-                self.order_info.remove(&(account, order_id));
+            for (account, _, _, slot) in inst.book.drain_consumed_slots() {
+                self.accounts.release(slot);
                 if let Some(count) = self.order_counts.get_mut(&account) {
                     *count = count.saturating_sub(1);
                     if *count == 0 {
@@ -696,23 +758,11 @@ impl Exchange {
             let Some(inst) = self.instruments[idx].as_deref_mut() else {
                 continue;
             };
-            let spec = inst.spec;
-
-            let report_start = reports.len();
 
             inst.book.cancel_expired_orders(now_ns, reports);
 
-            let new_reports = &reports[report_start..];
-            self.consumed_buf.clear();
-            self.accounts.process_reports(
-                new_reports,
-                &self.order_info,
-                &spec,
-                &mut self.consumed_buf,
-            );
-
-            for &(account, order_id) in &self.consumed_buf {
-                self.order_info.remove(&(account, order_id));
+            for (account, _, _, slot) in inst.book.drain_consumed_slots() {
+                self.accounts.release(slot);
                 if let Some(count) = self.order_counts.get_mut(&account) {
                     *count = count.saturating_sub(1);
                     if *count == 0 {
@@ -734,21 +784,9 @@ impl Exchange {
         let Some(inst) = inst_mut(&mut self.instruments, symbol) else {
             return;
         };
-        let spec = inst.spec;
 
-        let report_start = reports.len();
-
-        inst.book.cancel(account, order_id, reports);
-
-        // Release reserved funds if cancellation succeeded.
-        let new_reports = &reports[report_start..];
-        self.consumed_buf.clear();
-        self.accounts
-            .process_reports(new_reports, &self.order_info, &spec, &mut self.consumed_buf);
-
-        // Clean up order_info for cancelled orders.
-        for &(account, order_id) in &self.consumed_buf {
-            self.order_info.remove(&(account, order_id));
+        if let Some(slot) = inst.book.cancel(account, order_id, reports) {
+            self.accounts.release(slot);
             if let Some(count) = self.order_counts.get_mut(&account) {
                 *count = count.saturating_sub(1);
                 if *count == 0 {
@@ -813,7 +851,7 @@ impl Exchange {
         // 1. Order must exist as a resting limit order.
         // Use peek_order_location (O(1) index lookup) for validation —
         // the VecDeque scan for old_remaining is deferred to replace_order.
-        let Some((side, _old_price)) = inst.book.peek_order_location(account, order_id) else {
+        let Some((side, _old_price, slot)) = inst.book.peek_order_location(account, order_id) else {
             reports.push(ExecutionReport::Rejected {
                 order_id,
                 account,
@@ -929,19 +967,7 @@ impl Exchange {
             Side::Sell => new_quantity.get(),
         };
 
-        // Look up the reservation slot for this order.
-        let slot = match self.order_info.get(&(account, order_id)) {
-            Some(info) => info.reservation,
-            None => {
-                reports.push(ExecutionReport::Rejected {
-                    order_id,
-                    account,
-                    reason: RejectReason::UnknownOrder,
-                });
-                return;
-            }
-        };
-
+        // The reservation slot was already retrieved from peek_order_location above.
         if let Err(reason) = self.accounts.try_adjust_reservation(slot, new_required) {
             reports.push(ExecutionReport::Rejected {
                 order_id,

@@ -17,8 +17,8 @@
 //! commercial tradeoff.
 
 use crate::types::{
-    AccountId, CurrencyId, ExecutionReport, HashMap4, InstrumentSpec, Order, OrderId, OrderType,
-    Price, Quantity, RejectReason, Side,
+    AccountId, CurrencyId, HashMap4, InstrumentSpec, Order, OrderId, OrderType, Price, Quantity,
+    RejectReason, Side,
 };
 
 /// Per-currency balance for an account.
@@ -79,27 +79,8 @@ impl Reservation {
     }
 }
 
-/// Opaque handle to a reservation in the slab. O(1) Vec-indexed access,
-/// no hashing. Valid from `try_reserve` until `release` or fill completion.
-///
-/// u32 index: supports up to ~4 billion concurrent reservations. At 2M
-/// pre-allocated slots this is more than sufficient.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct ReservationSlot(u32);
-
-impl ReservationSlot {
-    /// Sentinel value for prefault dummy entries. Never used in production.
-    pub const DUMMY: Self = Self(u32::MAX);
-}
-
-/// Tracks order side and reservation slot for a resting or in-flight order.
-/// Stored in Exchange's order tracking map, providing O(1) reservation
-/// access via the slot index (instead of a second HashMap lookup).
-#[derive(Debug, Clone, Copy)]
-pub struct OrderInfo {
-    pub side: Side,
-    pub reservation: ReservationSlot,
-}
+// Re-export for backward compatibility with existing imports.
+pub use crate::types::ReservationSlot;
 
 /// Manages account balances across all currencies.
 ///
@@ -446,6 +427,18 @@ impl AccountManager {
         Ok(())
     }
 
+    /// Read the remaining reserved amount for a slot. Used after `fill()`
+    /// to check if the reservation is fully consumed (remaining == 0).
+    pub fn reservation_remaining(&self, slot: ReservationSlot) -> u64 {
+        self.reservation_slab[slot.0 as usize].remaining
+    }
+
+    /// Free a reservation slot without releasing funds. Used when the
+    /// reservation was already fully consumed by `fill()` (remaining == 0).
+    pub fn free_slot(&mut self, slot: ReservationSlot) {
+        self.free_slots.push(slot.0);
+    }
+
     /// Release all remaining reserved funds and free the slot.
     pub fn release(&mut self, slot: ReservationSlot) {
         let res = self.reservation_slab[slot.0 as usize];
@@ -454,108 +447,6 @@ impl AccountManager {
             bal.available = bal.available.saturating_add(res.remaining);
         }
         self.free_slots.push(slot.0);
-    }
-
-    /// Process execution reports to update balances.
-    /// Call this after the order book processes an order.
-    ///
-    /// Uses the `order_info` map to resolve `(AccountId, OrderId)` pairs from
-    /// execution reports into `ReservationSlot` handles for O(1) slab access.
-    ///
-    /// Returns order IDs whose reservations are fully consumed (remaining
-    /// reached zero on fill, or released on cancel/reject). The caller
-    /// should use this to clean up any per-order tracking maps.
-    pub fn process_reports(
-        &mut self,
-        reports: &[ExecutionReport],
-        order_info: &HashMap4<(AccountId, OrderId), OrderInfo>,
-        spec: &InstrumentSpec,
-        consumed: &mut Vec<(AccountId, OrderId)>,
-    ) {
-        for report in reports {
-            match *report {
-                ExecutionReport::Fill {
-                    maker_order_id,
-                    taker_order_id,
-                    maker_account,
-                    taker_account,
-                    price,
-                    quantity,
-                    maker_fee,
-                    taker_fee,
-                } => {
-                    let maker_key = (maker_account, maker_order_id);
-                    let taker_key = (taker_account, taker_order_id);
-
-                    // Look up both sides' OrderInfo for slot + side resolution.
-                    // Cache the reservation slots to avoid re-querying order_info
-                    // for the remaining==0 check below (saves 2 HashMap lookups
-                    // per fill — was 30% of this function's cost).
-                    if let (Some(maker_info), Some(taker_info)) =
-                        (order_info.get(&maker_key), order_info.get(&taker_key))
-                    {
-                        let maker_slot = maker_info.reservation;
-                        let taker_slot = taker_info.reservation;
-
-                        // Determine buyer/seller slots and fees from maker side.
-                        let (buyer_slot, seller_slot, buyer_fee, seller_fee) = match maker_info.side
-                        {
-                            Side::Buy => (maker_slot, taker_slot, maker_fee, taker_fee),
-                            Side::Sell => (taker_slot, maker_slot, taker_fee, maker_fee),
-                        };
-                        self.fill(
-                            buyer_slot,
-                            seller_slot,
-                            price,
-                            quantity,
-                            buyer_fee,
-                            seller_fee,
-                            spec,
-                        );
-
-                        // Free fully consumed reservations (remaining == 0).
-                        // Uses cached slots — no re-lookup needed.
-                        if self.reservation_slab[maker_slot.0 as usize].remaining == 0 {
-                            self.free_slots.push(maker_slot.0);
-                            consumed.push(maker_key);
-                        }
-                        if self.reservation_slab[taker_slot.0 as usize].remaining == 0 {
-                            self.free_slots.push(taker_slot.0);
-                            consumed.push(taker_key);
-                        }
-                    }
-                }
-                ExecutionReport::Cancelled {
-                    order_id, account, ..
-                } => {
-                    let key = (account, order_id);
-                    // Skip if already consumed (e.g., fill set remaining to 0
-                    // earlier in this batch, then IOC cancelled the unfilled
-                    // remainder). Without this guard, we'd double-free the slab
-                    // slot and corrupt a future reservation.
-                    if !consumed.contains(&key) {
-                        if let Some(info) = order_info.get(&key) {
-                            self.release(info.reservation);
-                        }
-                        consumed.push(key);
-                    }
-                }
-                ExecutionReport::Rejected {
-                    order_id, account, ..
-                } => {
-                    let key = (account, order_id);
-                    if !consumed.contains(&key) {
-                        if let Some(info) = order_info.get(&key) {
-                            self.release(info.reservation);
-                        }
-                        consumed.push(key);
-                    }
-                }
-                ExecutionReport::Placed { .. }
-                | ExecutionReport::Triggered { .. }
-                | ExecutionReport::Replaced { .. } => {}
-            }
-        }
     }
 
     /// Allocate a slab slot for a new reservation. O(1): pops from the free
