@@ -63,8 +63,11 @@ pub struct DpdkDevice {
     /// via crafted ARP replies (workaround for SR-IOV VFs that drop
     /// broadcast ARP).
     learned_neighbors: Vec<([u8; 6], [u8; 4])>,
-    /// Set of IPs we've already seeded to avoid repeated injections.
-    known_neighbors: std::collections::HashSet<[u8; 4]>,
+    /// IP → last-seeded timestamp. Only re-seed a neighbor after a cooldown
+    /// period to avoid flooding the injected frame queue on every packet from
+    /// a known peer. Cooldown must be shorter than smoltcp's neighbor cache
+    /// expiry (~60s) to prevent stale entries.
+    known_neighbors: std::collections::HashMap<[u8; 4], std::time::Instant>,
     /// Reusable mbuf buffer for collect_rx_batch() to avoid per-poll allocation.
     batch_mbufs: Vec<*mut ffi::rte_mbuf>,
     /// Reusable injected-frames buffer for collect_rx_batch().
@@ -124,7 +127,7 @@ impl DpdkDevice {
             tx_vlan_id: 0,
             inject_queue: Vec::new(),
             learned_neighbors: Vec::new(),
-            known_neighbors: std::collections::HashSet::new(),
+            known_neighbors: std::collections::HashMap::new(),
             batch_mbufs: Vec::with_capacity(BURST_SIZE * port_ids.len()),
             batch_injected: Vec::new(),
             tx_batch: Vec::with_capacity(BURST_SIZE),
@@ -211,10 +214,7 @@ impl DpdkDevice {
         let mut mbufs = std::mem::take(&mut self.batch_mbufs);
         mbufs.clear();
 
-        // Clear per-batch dedup so MACs are re-learned across poll cycles.
-        // smoltcp's neighbor cache entries expire (~60s), so we must
-        // re-seed periodically — not just on first sight.
-        self.known_neighbors.clear();
+        let now = std::time::Instant::now();
 
         for port in &mut self.rx_ports {
             // SAFETY: port is started, rx_buf is correctly sized.
@@ -241,8 +241,17 @@ impl DpdkDevice {
                         src_mac.copy_from_slice(&data[6..12]);
                         let mut src_ip = [0u8; 4];
                         src_ip.copy_from_slice(&data[26..30]);
-                        if !self.known_neighbors.contains(&src_ip) {
-                            self.known_neighbors.insert(src_ip);
+                        // Re-seed every 30s — must be shorter than smoltcp's
+                        // neighbor cache expiry (~60s) but long enough to
+                        // avoid injecting ARP replies on every packet.
+                        const RESEED_INTERVAL: std::time::Duration =
+                            std::time::Duration::from_secs(30);
+                        let needs_seed = self
+                            .known_neighbors
+                            .get(&src_ip)
+                            .is_none_or(|last| now.duration_since(*last) >= RESEED_INTERVAL);
+                        if needs_seed {
+                            self.known_neighbors.insert(src_ip, now);
                             self.learned_neighbors.push((src_mac, src_ip));
                         }
                     }
@@ -362,8 +371,15 @@ impl Device for DpdkDevice {
                 src_mac.copy_from_slice(&data[6..12]);
                 let mut src_ip = [0u8; 4];
                 src_ip.copy_from_slice(&data[26..30]);
-                if !self.known_neighbors.contains(&src_ip) {
-                    self.known_neighbors.insert(src_ip);
+                let now = std::time::Instant::now();
+                const RESEED_INTERVAL: std::time::Duration =
+                    std::time::Duration::from_secs(30);
+                let needs_seed = self
+                    .known_neighbors
+                    .get(&src_ip)
+                    .is_none_or(|last| now.duration_since(*last) >= RESEED_INTERVAL);
+                if needs_seed {
+                    self.known_neighbors.insert(src_ip, now);
                     self.learned_neighbors.push((src_mac, src_ip));
                 }
             }

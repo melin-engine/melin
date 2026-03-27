@@ -532,7 +532,7 @@ impl DpdkTransport {
 
         self.device.inject_rx(frame.to_vec());
 
-        tracing::info!(
+        tracing::debug!(
             peer_ip = %ip,
             peer_mac = ?mac,
             "seeded neighbor cache with ARP reply"
