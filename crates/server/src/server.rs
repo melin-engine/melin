@@ -1023,8 +1023,9 @@ pub fn run_dpdk(
     shutdown: Arc<AtomicBool>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // Initialize shared DPDK resources (EAL, mempool, ports with N queues).
-    let num_dpdk_threads = config.readers as usize;
     let shared = melin_dpdk::DpdkShared::init(&dpdk_config)?;
+    // Actual queue count may be less than requested (TAP only supports 1).
+    let num_dpdk_threads = shared.num_queues as usize;
 
     // Create per-thread transports (each gets its own queue pair + smoltcp stack).
     let mut transports = Vec::with_capacity(num_dpdk_threads);

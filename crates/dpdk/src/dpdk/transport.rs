@@ -124,6 +124,9 @@ pub struct DpdkShared {
     /// Raw mempool pointer for DpdkDevice creation. Thread-safe — DPDK
     /// mempools use per-lcore caches for lock-free alloc/free.
     pub mempool_raw: *mut crate::ffi::rte_mempool,
+    /// Actual number of queue pairs configured (may be less than requested
+    /// if the NIC doesn't support that many).
+    pub num_queues: u16,
 }
 
 // Safety: DpdkShared fields are either DPDK thread-safe (mempool) or
@@ -246,6 +249,10 @@ impl DpdkShared {
         let mac = ports[0].mac_addr();
         let mempool_raw = mempool.as_raw();
 
+        // Use the actual queue count from the first port (may be less
+        // than requested if the NIC doesn't support that many).
+        let actual_queues = ports[0].num_queues;
+
         Ok(Arc::new(DpdkShared {
             _ports: ports,
             _mempool: mempool,
@@ -253,6 +260,7 @@ impl DpdkShared {
             offloads,
             mac,
             mempool_raw,
+            num_queues: actual_queues,
         }))
     }
 }

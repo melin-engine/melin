@@ -79,6 +79,20 @@ impl Port {
             return Err(PortError::InfoFailed(ret));
         }
 
+        // Clamp to NIC's maximum supported queues. TAP devices only
+        // support 1 queue; real NICs typically support 4-128.
+        let max_queues = dev_info.max_rx_queues.min(dev_info.max_tx_queues).max(1);
+        let requested_queues = num_queues;
+        let num_queues = num_queues.min(max_queues);
+        if num_queues < requested_queues {
+            tracing::warn!(
+                port_id,
+                requested = requested_queues,
+                actual = num_queues,
+                "clamped queue count to NIC maximum"
+            );
+        }
+
         // Query NIC capabilities and enable hardware checksum offloads
         // where supported. Checksum offload eliminates per-packet software
         // checksum computation in smoltcp — the NIC computes/verifies instead.
