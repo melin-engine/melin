@@ -525,7 +525,6 @@ impl Exchange {
 
         *self.order_counts.entry(order.account).or_default() += 1;
 
-        let _taker_side = order.side;
         let taker_account = order.account;
         let taker_id = order.id;
         let report_start = reports.len();
@@ -579,20 +578,29 @@ impl Exchange {
                     };
 
                     // Resolve taker slot. The fill's taker may be the original
-                    // order (use `slot`) or a triggered stop (use slot from
-                    // consumed_slots, where check_triggers pushed it).
+                    // order (use `slot`) or a triggered stop (consumed_slots
+                    // if fully filled/cancelled, or order_index if it rested).
                     let taker_slot =
                         if fill_taker_account == taker_account && taker_order_id == taker_id {
                             slot
                         } else {
-                            // Triggered stop's slot — look up in consumed.
+                            // Triggered stop's slot — check consumed first,
+                            // then order_index (stop-limit that partially
+                            // filled and rested).
                             match consumed
                                 .iter()
                                 .find(|(a, id, _, _)| {
                                     *a == fill_taker_account && *id == taker_order_id
                                 })
                                 .map(|(_, _, _, s)| *s)
-                            {
+                                .or_else(|| {
+                                    inst.book
+                                        .peek_order_location(
+                                            fill_taker_account,
+                                            taker_order_id,
+                                        )
+                                        .map(|(_, _, s)| s)
+                                }) {
                                 Some(s) => s,
                                 None => continue,
                             }
@@ -699,24 +707,14 @@ impl Exchange {
 
             let report_start = reports.len();
 
-            // cancel_all_for_account calls cancel() internally, which
-            // returns slots. But since it's a bulk operation that iterates
-            // then cancels, the returned slots are discarded — instead we
-            // collect from consumed_slots after.
             inst.book.cancel_all_for_account(account, reports);
 
-            // Each cancel pushed its slot to consumed_slots.
-            // Release all of them.
+            // cancel_all_for_account collects returned slots in consumed_slots.
             let consumed: Vec<(AccountId, OrderId, Side, ReservationSlot)> =
                 inst.book.drain_consumed_slots().collect();
             for &(_, _, _, slot) in &consumed {
                 self.accounts.release(slot);
             }
-
-            // Also release slots returned directly by cancel() — those
-            // are for resting orders. For bulk cancel, cancel() is called
-            // internally by cancel_all_for_account which discards the
-            // return value, so slots are in consumed_slots already.
 
             let n_cancelled = reports.len() - report_start;
             if let Some(count) = self.order_counts.get_mut(&account) {
@@ -785,7 +783,7 @@ impl Exchange {
             return;
         };
 
-        if let Some(slot) = inst.book.cancel(account, order_id, reports) {
+        if let Some((_side, slot)) = inst.book.cancel(account, order_id, reports) {
             self.accounts.release(slot);
             if let Some(count) = self.order_counts.get_mut(&account) {
                 *count = count.saturating_sub(1);
@@ -6919,5 +6917,215 @@ mod tests {
             }
         ));
         assert_eq!(exchange.accounts().balance(ACCT_A, USD).reserved, 0);
+    }
+
+    /// Triggered stop: stop sell triggers via a trade, triggered market
+    /// sell fills. Verifies that the stop's embedded reservation slot is
+    /// carried through check_triggers → execute_market → fill and that
+    /// balances are conserved.
+    #[test]
+    fn triggered_stop_fill_balance_conservation() {
+        let mut exchange = Exchange::new();
+        let spec = btc_usd_spec();
+        exchange.add_instrument(spec);
+
+        // Acct A: buyer with USD. Acct B: seller with BTC.
+        exchange.deposit(ACCT_A, USD, 100_000);
+        exchange.deposit(ACCT_B, BTC, 100);
+
+        let mut reports = Vec::new();
+
+        // Acct B places a stop sell at trigger=500, qty=10.
+        exchange.execute(
+            spec.symbol,
+            Order {
+                id: OrderId(1),
+                account: ACCT_B,
+                side: Side::Sell,
+                order_type: OrderType::Stop {
+                    trigger_price: price(500),
+                },
+                time_in_force: TimeInForce::GTC,
+                quantity: qty(10),
+                stp: SelfTradeProtection::Allow,
+                expiry_ns: 0,
+            },
+            &mut reports,
+        );
+        reports.clear();
+
+        // Acct B places a limit sell at price=500, qty=5.
+        exchange.execute(
+            spec.symbol,
+            limit_order(2, ACCT_B, Side::Sell, 500, 5, TimeInForce::GTC),
+            &mut reports,
+        );
+        reports.clear();
+
+        // Acct A buys with market order qty=15. This should:
+        // 1. Fill 5 against the limit sell at 500
+        // 2. Trade at 500 triggers the stop sell
+        // 3. Triggered stop becomes market sell — no bids left, so cancelled
+        exchange.execute(
+            spec.symbol,
+            Order {
+                id: OrderId(1),
+                account: ACCT_A,
+                side: Side::Buy,
+                order_type: OrderType::Market,
+                time_in_force: TimeInForce::GTC,
+                quantity: qty(15),
+                stp: SelfTradeProtection::Allow,
+                expiry_ns: 0,
+            },
+            &mut reports,
+        );
+
+        // Verify balance conservation.
+        let bal_a_usd = exchange.accounts().balance(ACCT_A, USD);
+        let bal_b_usd = exchange.accounts().balance(ACCT_B, USD);
+        let total_usd = bal_a_usd.available + bal_a_usd.reserved
+            + bal_b_usd.available + bal_b_usd.reserved;
+        assert_eq!(total_usd, 100_000, "USD conservation violated");
+
+        let bal_a_btc = exchange.accounts().balance(ACCT_A, BTC);
+        let bal_b_btc = exchange.accounts().balance(ACCT_B, BTC);
+        let total_btc = bal_a_btc.available + bal_a_btc.reserved
+            + bal_b_btc.available + bal_b_btc.reserved;
+        assert_eq!(total_btc, 100, "BTC conservation violated");
+
+        // No reservations should remain (all orders consumed or cancelled).
+        assert_eq!(bal_a_usd.reserved, 0);
+        assert_eq!(bal_b_btc.reserved, 0);
+    }
+
+    /// Triggered stop-limit that partially fills and rests: verifies
+    /// the triggered order's slot is resolvable from order_index for
+    /// fill accounting.
+    #[test]
+    fn triggered_stop_limit_partial_fill_rests() {
+        let mut exchange = Exchange::new();
+        let spec = btc_usd_spec();
+        exchange.add_instrument(spec);
+
+        exchange.deposit(ACCT_A, USD, 100_000);
+        exchange.deposit(ACCT_B, BTC, 100);
+
+        let mut reports = Vec::new();
+
+        // Acct B places a stop-limit: trigger=500, limit=400, sell qty=10.
+        exchange.execute(
+            spec.symbol,
+            Order {
+                id: OrderId(1),
+                account: ACCT_B,
+                side: Side::Sell,
+                order_type: OrderType::StopLimit {
+                    trigger_price: price(500),
+                    limit_price: price(400),
+                },
+                time_in_force: TimeInForce::GTC,
+                quantity: qty(10),
+                stp: SelfTradeProtection::Allow,
+                expiry_ns: 0,
+            },
+            &mut reports,
+        );
+        reports.clear();
+
+        // Acct A places a limit buy at 500, qty=5.
+        exchange.execute(
+            spec.symbol,
+            limit_order(1, ACCT_A, Side::Buy, 500, 5, TimeInForce::GTC),
+            &mut reports,
+        );
+        reports.clear();
+
+        // Acct B places a limit sell at 500, qty=1 to create a trade.
+        exchange.execute(
+            spec.symbol,
+            limit_order(2, ACCT_B, Side::Sell, 500, 1, TimeInForce::GTC),
+            &mut reports,
+        );
+        // This trade at 500 triggers the stop-limit. The triggered limit
+        // sell at 400 can match Acct A's buy at 500 (price 400 <= 500).
+        // Acct A's buy has qty=5, triggered sell has qty=10 → partial fill.
+        // Remaining 6 rests on the ask side at 400 (5 were consumed by
+        // the initial sell + the fill).
+
+        // Verify balance conservation.
+        let bal_a_usd = exchange.accounts().balance(ACCT_A, USD);
+        let bal_b_usd = exchange.accounts().balance(ACCT_B, USD);
+        let total_usd = bal_a_usd.available + bal_a_usd.reserved
+            + bal_b_usd.available + bal_b_usd.reserved;
+        assert_eq!(total_usd, 100_000, "USD conservation violated");
+
+        let bal_a_btc = exchange.accounts().balance(ACCT_A, BTC);
+        let bal_b_btc = exchange.accounts().balance(ACCT_B, BTC);
+        let total_btc = bal_a_btc.available + bal_a_btc.reserved
+            + bal_b_btc.available + bal_b_btc.reserved;
+        assert_eq!(total_btc, 100, "BTC conservation violated");
+    }
+
+    /// Snapshot round-trip: verifies that reservation slots survive
+    /// save/restore and that post-restore operations work correctly.
+    #[test]
+    fn snapshot_roundtrip_reservation_integrity() {
+        let mut exchange = Exchange::new();
+        let spec = btc_usd_spec();
+        exchange.add_instrument(spec);
+
+        exchange.deposit(ACCT_A, USD, 100_000);
+        exchange.deposit(ACCT_B, BTC, 100);
+
+        let mut reports = Vec::new();
+
+        // Place a resting sell order.
+        exchange.execute(
+            spec.symbol,
+            limit_order(1, ACCT_B, Side::Sell, 500, 10, TimeInForce::GTC),
+            &mut reports,
+        );
+        reports.clear();
+
+        // Snapshot and restore.
+        let restored = exchange.clone_via_snapshot();
+
+        // Verify the restored exchange has the correct reserved balance.
+        let bal = restored.accounts().balance(ACCT_B, BTC);
+        assert_eq!(bal.reserved, 10, "post-restore: seller reservation lost");
+
+        // Execute a fill against the restored resting order.
+        let mut restored = restored;
+        exchange.execute(
+            spec.symbol,
+            limit_order(1, ACCT_A, Side::Buy, 500, 5, TimeInForce::GTC),
+            &mut reports,
+        );
+        restored.execute(
+            spec.symbol,
+            limit_order(1, ACCT_A, Side::Buy, 500, 5, TimeInForce::GTC),
+            &mut reports,
+        );
+
+        // Both should have the same balances after the fill.
+        let orig_a_usd = exchange.accounts().balance(ACCT_A, USD);
+        let rest_a_usd = restored.accounts().balance(ACCT_A, USD);
+        assert_eq!(orig_a_usd.available, rest_a_usd.available);
+        assert_eq!(orig_a_usd.reserved, rest_a_usd.reserved);
+
+        let orig_b_btc = exchange.accounts().balance(ACCT_B, BTC);
+        let rest_b_btc = restored.accounts().balance(ACCT_B, BTC);
+        assert_eq!(orig_b_btc.available, rest_b_btc.available);
+        assert_eq!(orig_b_btc.reserved, rest_b_btc.reserved);
+
+        // Cancel the remaining resting order on the restored exchange.
+        reports.clear();
+        restored.cancel(spec.symbol, ACCT_B, OrderId(1), &mut reports);
+        assert_eq!(
+            restored.accounts().balance(ACCT_B, BTC).reserved,
+            0,
+            "post-restore cancel: reservation not released"
+        );
     }
 }

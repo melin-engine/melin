@@ -688,14 +688,14 @@ impl OrderBook {
 
     /// Cancel a resting or pending stop order by (account, order_id).
     ///
-    /// Returns the `ReservationSlot` of the cancelled order (if found)
+    /// Returns the `(Side, ReservationSlot)` of the cancelled order (if found)
     /// so the caller can release the reservation directly.
     pub fn cancel(
         &mut self,
         account: AccountId,
         order_id: OrderId,
         reports: &mut Vec<ExecutionReport>,
-    ) -> Option<ReservationSlot> {
+    ) -> Option<(Side, ReservationSlot)> {
         // Try resting orders first.
         if let Some((side, price, slot)) = self.order_index.remove(&(account, order_id)) {
             let book_side = match side {
@@ -711,7 +711,7 @@ impl OrderBook {
                     remaining_quantity: remaining,
                 });
             }
-            return Some(slot);
+            return Some((side, slot));
         }
 
         // Try pending stops.
@@ -735,7 +735,7 @@ impl OrderBook {
                     account: stop.account,
                     remaining_quantity: stop.quantity,
                 });
-                return Some(slot);
+                return Some((side, slot));
             }
         }
         None
@@ -793,10 +793,8 @@ impl OrderBook {
         // order_index/stop_index, BookSide levels, and report generation.
         // Collect returned slots into consumed_slots for the caller.
         for id in to_cancel {
-            if let Some(slot) = self.cancel(account, id, reports) {
-                // Look up side from the cancelled order. Since it was just
-                // removed, we use the side from the report.
-                self.consumed_slots.push((account, id, Side::Buy, slot));
+            if let Some((side, slot)) = self.cancel(account, id, reports) {
+                self.consumed_slots.push((account, id, side, slot));
             }
         }
     }
@@ -838,8 +836,8 @@ impl OrderBook {
         }
 
         for (account, id) in to_cancel {
-            if let Some(slot) = self.cancel(account, id, reports) {
-                self.consumed_slots.push((account, id, Side::Buy, slot));
+            if let Some((side, slot)) = self.cancel(account, id, reports) {
+                self.consumed_slots.push((account, id, side, slot));
             }
         }
     }
@@ -897,8 +895,8 @@ impl OrderBook {
         }
 
         for (account, id) in to_cancel {
-            if let Some(slot) = self.cancel(account, id, reports) {
-                self.consumed_slots.push((account, id, Side::Buy, slot));
+            if let Some((side, slot)) = self.cancel(account, id, reports) {
+                self.consumed_slots.push((account, id, side, slot));
             }
         }
     }

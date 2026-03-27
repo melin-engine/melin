@@ -152,7 +152,7 @@ impl AccountManager {
 
     /// Reconstruct from snapshot data. Returns `(manager, slot_assignments)`
     /// where `slot_assignments` maps each `(AccountId, OrderId)` to its
-    /// `ReservationSlot` so the caller can build `OrderInfo` entries.
+    /// `ReservationSlot` so the caller can inject them into order books.
     #[allow(clippy::type_complexity)]
     pub(crate) fn from_parts(
         balance_entries: Vec<((AccountId, CurrencyId), Balance)>,
@@ -373,15 +373,8 @@ impl AccountManager {
             quote_bal.available = quote_bal.available.saturating_add(proceeds);
         }
 
-        // Note: reservation cleanup is handled by process_reports(), which
-        // checks remaining == 0 after each fill and returns the consumed IDs.
-        // Do NOT clean up here — process_reports needs the entry to exist
-        // so it can report consumed IDs back to Exchange for order_info cleanup.
-    }
-
-    /// Check if a reservation's remaining amount is zero.
-    pub fn is_reservation_empty(&self, slot: ReservationSlot) -> bool {
-        self.reservation_slab[slot.0 as usize].remaining == 0
+        // Note: reservation cleanup (free_slot when remaining == 0) is
+        // handled by Exchange after fill, not here.
     }
 
     /// Adjust an existing reservation in-place for cancel-replace.
