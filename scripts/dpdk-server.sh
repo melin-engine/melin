@@ -132,6 +132,9 @@ echo "  Auth:     $AUTH_KEYS"
 echo "============================================================"
 echo ""
 
+# Clean old journal to avoid replaying stale state.
+rm -f "$JOURNAL"*
+
 cd "$PROJECT_DIR"
 exec cargo run --release -p melin-server --features dpdk --no-default-features -- \
     --bind 0.0.0.0:9876 \
