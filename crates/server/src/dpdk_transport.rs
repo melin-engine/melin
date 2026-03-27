@@ -47,7 +47,7 @@ use rand::Rng;
 
 use crate::request as shared_request;
 use melin_dpdk::SocketHandle;
-use tracing::debug;
+use tracing::{debug, warn};
 
 use crate::dpdk_response::{ControlEvent, TxFrame};
 
@@ -105,6 +105,7 @@ pub fn run_dpdk_poll(
     shutdown: &AtomicBool,
     authorized_keys: Arc<AuthorizedKeys>,
     connection_timeout: Option<Duration>,
+    max_connections: u64,
 ) {
     // Map from smoltcp SocketHandle → connection state.
     let mut connections: HashMap<SocketHandle, ConnectionState> = HashMap::with_capacity(256);
@@ -137,6 +138,16 @@ pub fn run_dpdk_poll(
 
         // 2. Accept new connections and start auth handshake.
         for accepted in transport.take_accepted() {
+            // Enforce max_connections limit.
+            if max_connections > 0 && connections.len() as u64 >= max_connections {
+                warn!(
+                    peer = %accepted.peer,
+                    "DPDK: connection rejected: max_connections reached"
+                );
+                transport.close(accepted.handle);
+                continue;
+            }
+
             let conn_id = ConnectionId(next_connection_id);
             next_connection_id += 1;
 

@@ -1313,6 +1313,7 @@ pub fn run_dpdk(
         &shutdown,
         authorized_keys,
         config.connection_timeout(),
+        config.max_connections,
     );
 
     // Shutdown sequence.
