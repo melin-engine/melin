@@ -1,17 +1,50 @@
-# DPDK Test Guide — Cherry Servers
+# DPDK Test Guide
 
-Step-by-step procedure for testing the DPDK kernel-bypass transport on Cherry Servers with Intel X710 SR-IOV.
+Step-by-step procedure for testing the DPDK kernel-bypass transport.
 
-## Machines
+## Local Testing (no servers needed)
+
+### Smoke tests
+
+```sh
+# Server-side DPDK only (kernel TCP bench client, TAP device):
+sudo ./scripts/dpdk-smoke-test.sh
+
+# Both sides DPDK (veth pair + af_packet):
+sudo ./scripts/dpdk-e2e-smoke-test.sh
+
+# Kernel TCP baseline (no DPDK, no root):
+./scripts/smoke-test.sh
+```
+
+### Environment verification
+
+Use `dpdk-testpmd` to verify DPDK works independently of the application:
+
+```sh
+# Quick port check:
+sudo ./scripts/dpdk-test.sh
+
+# ICMP echo (test L2/L3 connectivity from bench machine):
+sudo ./scripts/dpdk-test.sh icmpecho
+
+# Interactive forward mode (check LACP both-port RX):
+sudo ./scripts/dpdk-test.sh forward
+```
+
+## Remote Testing — Cherry Servers
 
 Two Cherry Servers on the same VLAN. IPs change per rental — check the Cherry dashboard for public IPs and `ip addr show bond0.*` for VLAN IPs.
+
+Supported NICs:
+- Intel E810 (ice driver)
+- Intel 82599 / X520 / X540 (ixgbe driver)
 
 Throughout this guide:
 - `SERVER` = server public IP
 - `BENCH` = bench public IP
-- `SERVER_VLAN` = server VLAN IP (from `dpdk-setup-sriov.sh` output or `/etc/melin-dpdk.conf`)
 
-## 1. Setup (run once after reboot)
+### 1. Setup (run once after reboot)
 
 SR-IOV VF creation, driver binding, hugepages, and MTU are all runtime state — lost on reboot.
 
@@ -19,7 +52,7 @@ SR-IOV VF creation, driver binding, hugepages, and MTU are all runtime state —
 ```sh
 ssh root@SERVER
 cd ~/workspace/trading
-sudo ./scripts/dpdk-setup-sriov.sh          # creates VFs, binds to vfio-pci, sets MTU 9000
+sudo ./scripts/dpdk-setup-sriov.sh
 ```
 
 **On the bench machine** (if using DPDK bench client):
@@ -36,7 +69,7 @@ ls /sys/bus/pci/drivers/vfio-pci/ | grep 0000   # VFs bound
 grep -i huge /proc/meminfo              # hugepages allocated
 ```
 
-## 2. Build
+### 2. Build
 
 **On the server:**
 ```sh
@@ -50,134 +83,121 @@ cargo build --release -p melin-server --features dpdk --no-default-features
 cd ~/workspace/trading
 git pull
 # Kernel TCP bench (no DPDK needed):
-cargo build --release -p melin-bench
+cargo build --release --bin melin-bench
 
 # OR DPDK bench (requires dpdk-setup-sriov.sh):
 cargo build --release -p melin-bench --features dpdk --no-default-features
 ```
 
-## 3. Auth keys
+### 3. Auth keys
 
 Generate on the bench machine, copy to the server:
 ```sh
 # On bench:
 cd ~/workspace/trading
-cargo run --release --bin melin-keygen -- bench admin
+cargo run --release --bin melin-keygen -- bench trader
 # Creates bench.key (private) and bench.pub (public)
 
 # Copy public key to server's authorized_keys:
 scp bench.pub root@SERVER:~/workspace/trading/
-ssh root@SERVER "cd ~/workspace/trading && echo 'admin $(cat bench.pub) bench' > authorized_keys"
+ssh root@SERVER "cd ~/workspace/trading && echo 'trader $(cat bench.pub) bench' > authorized_keys"
 ```
 
-Or if keys already exist, just sync:
-```sh
-scp root@SERVER:~/workspace/trading/authorized_keys ./
-scp root@SERVER:~/workspace/trading/bench.key ./
-```
-
-## 4. Start the server
+### 4. Start the server
 
 ```sh
 ssh root@SERVER
 cd ~/workspace/trading
-
-# Clean old journal
 rm -f /mnt/journal/bench.journal*
-
-# Start with dual-port polling + jumbo frames
-RUST_LOG=info ./target/release/melin-server \
-    --bind 0.0.0.0:9876 \
-    --journal /mnt/journal/bench.journal \
-    --authorized-keys authorized_keys \
-    --standalone \
-    --dpdk-eal-args='--huge-dir=/mnt/huge_2m' \
-    --dpdk-ports 0,1 \
-    --dpdk-ip SERVER_VLAN \
-    --dpdk-prefix-len 24 \
-    --dpdk-mtu 9000
+sudo ./scripts/dpdk-server.sh
 ```
+
+The script auto-detects DPDK IP from `/etc/melin-dpdk.conf`, uses both VF ports for LACP, and falls back to TAP mode if no SR-IOV is available.
 
 Look for these log lines to confirm startup:
 ```
 DPDK transport initialized
 DPDK port configured
 DPDK port started
+DPDK transport listening
 ```
 
-## 5. Run the benchmark
+### 5. Run the benchmark
 
-### Kernel TCP bench client (simplest)
+**Kernel TCP bench client (simplest):**
 ```sh
 ssh root@BENCH
 cd ~/workspace/trading
+DPDK_IP=$(ssh root@SERVER "grep DPDK_IP /etc/melin-dpdk.conf | cut -d= -f2")
 
-./target/release/melin-bench \
-    --addr SERVER_VLAN:9876 \
+cargo run --release --bin melin-bench -- \
+    --addr $DPDK_IP:9876 \
     --key bench.key \
     --clients 1 \
     --window 256 \
     10000000
 ```
 
-### DPDK bench client (both sides bypass kernel)
-
-Core layout on the bench machine: core 0 = OS, core 7 = DPDK poll
-thread (`--dpdk-core 7`). No server threads on this machine, so
-`--bench-cores` is not needed (only relevant for embedded mode).
-
+**DPDK bench client (both sides bypass kernel):**
 ```sh
-./target/release/melin-bench \
-    --addr SERVER_VLAN:9876 \
+DPDK_IP=$(ssh root@SERVER "grep DPDK_IP /etc/melin-dpdk.conf | cut -d= -f2")
+source /etc/melin-dpdk.conf  # loads local DPDK_IP, HUGE_DIR, etc.
+
+cargo run --release --bin melin-bench --features dpdk --no-default-features -- \
+    --addr $DPDK_IP:9876 \
     --key bench.key \
     --clients 1 \
     --window 256 \
-    --dpdk-eal-args='--huge-dir=/mnt/huge_2m' \
+    --dpdk-eal-args="--huge-dir=$HUGE_DIR" \
     --dpdk-ports 0,1 \
-    --dpdk-ip BENCH_VLAN \
+    --dpdk-ip $DPDK_IP \
     --dpdk-prefix-len 24 \
+    --dpdk-core 7 \
     10000000
 ```
 
-## 6. Troubleshooting
+### 6. Troubleshooting
 
-### "connection refused" or auth failure
-- Check `authorized_keys` on server matches `bench.pub` on bench
-- Check `bench.key` exists on bench machine
-
-### Intermittent connection failures
+#### Connection hangs or intermittent failures
 - Use `--dpdk-ports 0,1` (not `--dpdk-ports 0`) — LACP bonds hash
   traffic across both PFs, single-port polling misses ~50%
+- Check `authorized_keys` uses `trader` permission (not `admin` or `operator`)
+- First connection after server restart may take a moment (ARP learning)
 
-### No packets received
+#### No packets received
 - Verify VFs are bound: `ls /sys/bus/pci/drivers/vfio-pci/ | grep 0000`
 - Check hugepages: `grep -i huge /proc/meminfo`
-- Check server log: `RUST_LOG=debug` for per-packet logging
+- Use `sudo ./scripts/dpdk-test.sh` to verify DPDK environment independently
+- Check server log with `RUST_LOG=debug` for per-packet logging
 
-### Jumbo frame issues
-- Both sides must use the same `--dpdk-mtu`
-- PF MTU must be >= frame MTU: `ip link show` on bond members
-- If switch doesn't support jumbo, use `--dpdk-mtu 1500` and
-  `./scripts/dpdk-setup-sriov.sh --mtu 1500`
-
-### Server crashes on startup
+#### Server crashes on startup
 - Check IOMMU: `dmesg | grep -i iommu`
+- Ensure `intel_iommu=on iommu=pt` in kernel cmdline (cherry-setup.sh adds this)
 - Check VF exists: `lspci | grep -i virtual`
 - Clean stale DPDK state: `rm -rf /var/run/dpdk/rte`
 
-## 7. What to compare
+#### Server segfaults on exit
+- This was a drop-order bug (EAL cleaned up before mempool). Fixed in commit `7b44832`.
+- If using an older build, pull and rebuild.
+
+#### Permission errors (0 orders processed)
+- `trader` permission is required for trading orders
+- `operator` can only do admin commands, not trade
+- Check: `grep trader authorized_keys` on the server
+
+### 7. What to compare
 
 Run the same workload with kernel TCP to get a baseline:
 ```sh
-# On server (no DPDK):
-./target/release/melin-server \
-    --bind SERVER_VLAN:9876 \
+# On server (no DPDK, default features):
+cargo run --release --bin melin-server -- \
+    --bind 0.0.0.0:9876 \
     --journal /mnt/journal/bench.journal \
     --authorized-keys authorized_keys \
     --standalone
 
 # On bench:
-./target/release/melin-bench \
+cargo run --release --bin melin-bench -- \
     --addr SERVER_VLAN:9876 \
     --key bench.key \
     --clients 1 --window 256 \
