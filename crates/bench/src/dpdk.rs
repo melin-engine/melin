@@ -90,6 +90,7 @@ pub fn run_dpdk_roundtrip(
     num_accounts: u32,
     num_instruments: u32,
     core_id: usize,
+    health_addr: Option<std::net::SocketAddr>,
 ) {
     // Pin to dedicated core.
     if let Err(e) = melin_server::affinity::pin_to_core(core_id) {
@@ -354,6 +355,8 @@ pub fn run_dpdk_roundtrip(
         Arc::clone(&progress_shutdown),
     );
 
+    let health_poller = health_addr.map(crate::health_poller::HealthPoller::start);
+
     let start = Instant::now();
     let mut measured_start: Option<Instant> = None;
 
@@ -536,7 +539,9 @@ pub fn run_dpdk_roundtrip(
         &extra_lines,
         json_path,
         &series,
-        &[], // no health samples in DPDK mode
+        &health_poller
+            .map(|p| p.stop())
+            .unwrap_or_default(),
     );
 }
 

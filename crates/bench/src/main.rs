@@ -35,7 +35,9 @@ mod dpdk;
 #[global_allocator]
 static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
+#[cfg(not(feature = "dpdk"))]
 use std::collections::VecDeque;
+
 #[cfg(not(any(feature = "io-uring", feature = "dpdk")))]
 use std::io;
 #[cfg(not(feature = "dpdk"))]
@@ -359,6 +361,7 @@ fn main() {
                     args.accounts,
                     args.instruments,
                     args.dpdk_core,
+                    args.health_addr,
                 );
             }
 
@@ -1052,29 +1055,6 @@ fn connect_uds(path: &std::path::Path) -> std::os::unix::net::UnixStream {
 /// Pre-encoded heartbeat wire frame (length prefix + tag). Used during setup
 /// to keep already-connected clients alive while remaining clients connect.
 /// The server's idle timeout (default 30s) would otherwise drop early
-/// connections during slow setup phases (e.g., 512 clients × ~100ms each).
-#[cfg(not(feature = "dpdk"))]
-fn heartbeat_frame() -> [u8; 5] {
-    let mut buf = [0u8; 128];
-    let n = codec::encode_request(&melin_protocol::message::Request::Heartbeat, 0, &mut buf)
-        .expect("encode heartbeat");
-    let mut frame = [0u8; 5];
-    frame.copy_from_slice(&buf[..n]);
-    frame
-}
-
-/// Send a heartbeat on every established connection to reset the server's
-/// idle timer. Uses raw `write(2)` on the write fd — sockets are still in
-/// blocking mode during setup, so the small 5-byte write completes
-/// immediately.
-#[cfg(not(feature = "dpdk"))]
-fn keepalive_established(write_fds: &[RawFd], heartbeat: &[u8; 5]) {
-    for &fd in write_fds {
-        unsafe {
-            libc::write(fd, heartbeat.as_ptr().cast(), heartbeat.len());
-        }
-    }
-}
 // ---------------------------------------------------------------------------
 // Per-connection state
 // ---------------------------------------------------------------------------
