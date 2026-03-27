@@ -188,8 +188,9 @@ pub struct ServerConfig {
 
     /// CPU core for the DPDK poll thread. This thread handles all NIC I/O
     /// and smoltcp TCP processing — it should be on an isolated core.
-    /// Default: 7 (after the 3 pipeline cores + 2 reader cores).
-    #[arg(long, default_value_t = 7)]
+    /// Default: 8 (after pipeline 1-3, readers 4-5, repl-sender 6,
+    /// event-publisher 7).
+    #[arg(long, default_value_t = 8)]
     pub dpdk_core: usize,
 
     /// Address for the output event publisher. Subscribers connect here
@@ -257,7 +258,7 @@ impl Default for ServerConfig {
             dpdk_gateway: None,
             dpdk_mtu: 1500,
             dpdk_vlan: None,
-            dpdk_core: 7,
+            dpdk_core: 8,
             event_bind: None,
             health_bind: Some("127.0.0.1:9877".parse().expect("valid default addr")),
             promote_bind: None,

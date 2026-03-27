@@ -38,7 +38,7 @@ fi
 CONF="/etc/melin-dpdk.conf"
 HUGE_DIR="/mnt/huge_2m"
 DPDK_PORT="${DPDK_PORT:-0}"
-DPDK_CORE="${DPDK_CORE:-7}"
+DPDK_CORE="${DPDK_CORE:-8}"
 DPDK_PREFIX="${DPDK_PREFIX:-24}"
 MTU="${MTU:-1500}"
 JOURNAL="${JOURNAL:-/mnt/journal/bench.journal}"
