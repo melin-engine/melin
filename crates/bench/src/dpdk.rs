@@ -363,6 +363,12 @@ pub fn run_dpdk_roundtrip(
     let mut interval_count: usize = 0;
     let mut series: TimeSeries = Vec::new();
 
+    // Poll every N connections to keep the NIC busy during the
+    // connection iteration. Without this, smoltcp's TX buffer fills
+    // up with 16 connections at window 256, and the NIC sits idle
+    // until the next flush_tx() at the end of the loop.
+    const POLL_EVERY_N_CONNS: usize = 4;
+
     loop {
         poll(
             &mut device,
@@ -374,7 +380,19 @@ pub fn run_dpdk_roundtrip(
 
         let mut all_done = true;
 
-        for conn in &mut connections {
+        for i in 0..connections.len() {
+            // Mid-iteration poll to flush TX and receive new data.
+            if i > 0 && i % POLL_EVERY_N_CONNS == 0 {
+                poll(
+                    &mut device,
+                    &mut iface,
+                    &mut sockets,
+                    &mut poll_count,
+                    &mut cached_ts,
+                );
+            }
+
+            let conn = &mut connections[i];
             if conn.done {
                 continue;
             }
