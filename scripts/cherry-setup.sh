@@ -135,7 +135,7 @@ echo ""
 # ---------------------------------------------------------------------------
 # Core isolation, tick suppression, and latency tuning — all persistent
 # across reboots via GRUB.
-#   isolcpus/nohz_full/rcu_nocbs: isolate cores 1-8 from scheduler/timers/RCU
+#   isolcpus/nohz_full/rcu_nocbs: isolate cores 1-7 from scheduler/timers/RCU
 #   Core 7 is the DPDK poll thread (smoltcp + NIC I/O).
 #   nmi_watchdog=0: disable NMI watchdog (eliminates periodic NMI interrupts)
 #   transparent_hugepage=never: disable THP (khugepaged compaction causes 1-4ms stalls)
@@ -144,7 +144,7 @@ echo ""
 #   skew_tick=1: offset timer ticks across cores to reduce kernel lock contention
 #   nosmt: disable hyperthreading — prevents HT siblings from polluting L1/L2 on pipeline cores
 GRUB_FILE="/etc/default/grub"
-BENCH_PARAMS="isolcpus=nohz,domain,1-8 nohz_full=1-8 rcu_nocbs=1-8 nmi_watchdog=0 transparent_hugepage=never cpufreq.default_governor=performance processor.max_cstate=1 skew_tick=1 nosmt"
+BENCH_PARAMS="isolcpus=nohz,domain,1-7 nohz_full=1-7 rcu_nocbs=1-7 nmi_watchdog=0 transparent_hugepage=never cpufreq.default_governor=performance processor.max_cstate=1 skew_tick=1 nosmt"
 # IOMMU for DPDK SR-IOV (vfio-pci). intel_iommu=on enables the IOMMU
 # (required for vfio-pci to manage VFs); iommu=pt sets passthrough mode
 # so DMA bypasses IOMMU translation for performance.
@@ -435,8 +435,8 @@ echo ""
 echo "Next steps:"
 echo "  1. Reboot if kernel boot params were added (isolcpus)"
 echo "  2. Verify after reboot:"
-echo "     cat /sys/devices/system/cpu/isolated   # should show: 1-8"
-echo "     cat /sys/devices/system/cpu/nohz_full  # should show: 1-8"
+echo "     cat /sys/devices/system/cpu/isolated   # should show: 1-7"
+echo "     cat /sys/devices/system/cpu/nohz_full  # should show: 1-7"
 echo ""
 echo "  3. Run the LAN benchmark from your local machine:"
 echo "     ./scripts/lan-bench.sh <server-pub-ip> <bench-pub-ip> <server-vlan-ip>"

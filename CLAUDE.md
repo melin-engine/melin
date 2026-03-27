@@ -61,7 +61,7 @@ DPDK kernel-bypass networking — bypasses the Linux kernel TCP stack entirely. 
 
 **Scripts**: `dpdk-server.sh` (auto-detect config, start server), `dpdk-setup-sriov.sh` (VF creation for ice + ixgbe), `dpdk-test.sh` (testpmd environment check), `dpdk-smoke-test.sh` (TAP), `dpdk-e2e-smoke-test.sh` (veth + af_packet, both sides DPDK).
 
-**Core layout**: 0=OS/IRQ, 1-3=pipeline (journal/matching/response), 4-5=DPDK poll threads (reuses reader cores), 6=repl-sender, 7=event-publisher, 8+=bench.
+**Core layout**: 0=OS/IRQ, 1-3=pipeline (journal/matching/response), 4-5=readers or DPDK poll threads, 6=repl-sender, 7=event-publisher, 8+=bench.
 
 **Tested hardware**: Intel 82599/X520 (ixgbe) SR-IOV on EPYC 4564P, LACP bond, Cherry Servers. Intel E810 (ice) supported but untested on current servers (IOMMU issues on some rentals).
 
