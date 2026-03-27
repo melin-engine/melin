@@ -94,7 +94,7 @@ checksum = "7c02d123df017efcdfbd739ef81735b36c5ba83ec3c59c80a9d7ecc718f92e50"
 [[package]]
 name = "astenn"
 version = "0.1.0"
-source = "git+ssh://git@github.com/pierre-l/astenn.git#1c62db9c87e9443f49a66eb8830c38deca2122bb"
+source = "git+ssh://git@github.com/pierre-l/astenn.git#791ac347ba593eddec94834824f747b74c6e2e5a"
 
 [[package]]
 name = "atomic"
