@@ -123,6 +123,9 @@ pub struct DpdkTransport {
     cached_timestamp: Instant,
     /// Poll iteration counter for timestamp refresh.
     poll_count: u32,
+    /// Total pending TX bytes across all connections. Avoids iterating
+    /// tx_queues.values().any() on every poll cycle.
+    pending_tx_bytes: usize,
     /// Reusable handle buffer to avoid per-poll allocation.
     handle_buf: Vec<SocketHandle>,
 }
@@ -290,6 +293,7 @@ impl DpdkTransport {
             tx_queues: HashMap::new(),
             cached_timestamp: now,
             poll_count: 0,
+            pending_tx_bytes: 0,
             handle_buf: Vec::with_capacity(MAX_CONNECTIONS),
         })
     }
@@ -352,8 +356,7 @@ impl DpdkTransport {
         // Egress + maintenance (TCP timers, ARP, socket_egress).
         // Skip when idle: no RX data, no pending TX, and timers not due.
         // Piggyback timer checks on the timestamp refresh interval.
-        let has_pending_tx = !self.tx_queues.is_empty()
-            && self.tx_queues.values().any(|q| q.queued_bytes() > 0);
+        let has_pending_tx = self.pending_tx_bytes > 0;
         if rx_had_data || has_pending_tx || self.poll_count.is_multiple_of(TIMESTAMP_REFRESH_INTERVAL) {
             self.flush_tx_queues();
             self.iface
@@ -432,6 +435,7 @@ impl DpdkTransport {
             let sent = socket.send_slice(queue.pending()).unwrap_or(0);
             if sent > 0 {
                 queue.advance(sent);
+                self.pending_tx_bytes -= sent;
             }
         }
     }
@@ -476,6 +480,7 @@ impl DpdkTransport {
             return false;
         }
         queue.push(data);
+        self.pending_tx_bytes += data.len();
         true
     }
 
@@ -492,7 +497,9 @@ impl DpdkTransport {
         let socket = self.sockets.get_mut::<tcp::Socket>(handle);
         socket.abort();
         self.sockets.remove(handle);
-        self.tx_queues.remove(&handle);
+        if let Some(q) = self.tx_queues.remove(&handle) {
+            self.pending_tx_bytes -= q.queued_bytes();
+        }
     }
 
     /// Seed smoltcp's neighbor cache by injecting a crafted ARP reply.
