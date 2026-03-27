@@ -145,10 +145,10 @@ echo ""
 #   nosmt: disable hyperthreading — prevents HT siblings from polluting L1/L2 on pipeline cores
 GRUB_FILE="/etc/default/grub"
 BENCH_PARAMS="isolcpus=nohz,domain,1-7 nohz_full=1-7 rcu_nocbs=1-7 nmi_watchdog=0 transparent_hugepage=never cpufreq.default_governor=performance processor.max_cstate=1 skew_tick=1 nosmt"
-# IOMMU passthrough for DPDK SR-IOV (vfio-pci). Works on both AMD and Intel.
-# amd_iommu/intel_iommu enables the IOMMU; iommu=pt sets passthrough mode
-# so DMA bypasses the IOMMU translation for performance.
-IOMMU_PARAMS="iommu=pt"
+# IOMMU for DPDK SR-IOV (vfio-pci). intel_iommu=on enables the IOMMU
+# (required for vfio-pci to manage VFs); iommu=pt sets passthrough mode
+# so DMA bypasses IOMMU translation for performance.
+IOMMU_PARAMS="intel_iommu=on iommu=pt"
 
 if [[ -f "$GRUB_FILE" ]]; then
     NEEDS_UPDATE=0
@@ -159,7 +159,7 @@ if [[ -f "$GRUB_FILE" ]]; then
         NEEDS_UPDATE=1
     fi
 
-    if ! grep -q "iommu=pt" "$GRUB_FILE" 2>/dev/null; then
+    if ! grep -q "intel_iommu=on" "$GRUB_FILE" 2>/dev/null; then
         echo "  Adding IOMMU passthrough for DPDK: $IOMMU_PARAMS"
         NEEDS_UPDATE=1
     fi
@@ -171,7 +171,7 @@ if [[ -f "$GRUB_FILE" ]]; then
         if ! grep -q "isolcpus" "$GRUB_FILE" 2>/dev/null; then
             ADD_PARAMS="$BENCH_PARAMS"
         fi
-        if ! grep -q "iommu=pt" "$GRUB_FILE" 2>/dev/null; then
+        if ! grep -q "intel_iommu=on" "$GRUB_FILE" 2>/dev/null; then
             ADD_PARAMS="$ADD_PARAMS $IOMMU_PARAMS"
         fi
         sed -i "s/^GRUB_CMDLINE_LINUX_DEFAULT=\"\(.*\)\"/GRUB_CMDLINE_LINUX_DEFAULT=\"\1 $ADD_PARAMS\"/" "$GRUB_FILE"
