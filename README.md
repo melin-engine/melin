@@ -82,15 +82,29 @@ Melin is an exchange core: order matching, account management, risk controls, fe
 
 ### Benchmarks
 
-LAN round-trip benchmarks at [`ed9241d`](../../commit/ed9241d). Two or three Cherry AMD Ryzen 9 9950X servers (16C @ 4.3 GHz, SMT disabled, 96 GB 5600 MHz RAM, 2x 1TB NVMe, 10 Gbps). Engine on one server with journal on a dedicated NVMe disk, benchmark client on the second, replica on the third (replication only). TCP over private VLAN, IRQs pinned to core 0. [Realistic order flow](crates/bench/). Reproducible via `scripts/lan-bench-suite.sh`. For production deployment and OS tuning, see [docs/operations.md](docs/operations.md) and [docs/benchmarking.md](docs/benchmarking.md).
+All numbers are **full round-trip** (client sends order → server journals to NVMe with fsync → matching engine executes → response arrives at client). Every order is durably persisted before acknowledgement. [Realistic order flow](crates/bench/). Reproducible via `scripts/lan-bench-suite.sh`. For production deployment and OS tuning, see [docs/operations.md](docs/operations.md) and [docs/benchmarking.md](docs/benchmarking.md).
 
-| Mode | Throughput | p50 | p99 | p99.9 | max | Parameters |
-|------|-----------|-----|-----|-------|-----|------------|
-| **Single-order latency** | 13.7K/s | **72 µs** | 87 µs | 90 µs | 207 µs | 500K pairs, 1 client, window 1 |
-| **Full durability** (fsync) | **8.1M/s** | 439 µs | 569 µs | 636 µs | 1,017 µs | 100M pairs, 16 clients, window 256 |
-| **Synchronous replication** | **5.8M/s** | 633 µs | 841 µs | 933 µs | 1,123 µs | 100M pairs, 16 clients, window 256, primary+replica |
+#### Peak throughput (16 clients, window 256)
 
-**Latency CDF** — three peak-load modes on the same axes:
+Kernel TCP over 10 Gbps private VLAN. Two or three Cherry AMD Ryzen 9 9950X servers (16C, SMT off, dedicated NVMe journal). Commit [`ed9241d`](../../commit/ed9241d).
+
+| Durability | Throughput | p50 | p99 | p99.9 | max |
+|------------|-----------|-----|-----|-------|-----|
+| **Local fsync** | **8.1M/s** | 439 µs | 569 µs | 636 µs | 1,017 µs |
+| **Synchronous replication** (fsync + replica ack) | **5.8M/s** | 633 µs | 841 µs | 933 µs | 1,123 µs |
+
+#### Single-order latency (1 client, window 1)
+
+The latency floor — one order at a time, no pipelining, no queuing.
+
+| Transport | p50 | p90 | p99 | max | Hardware |
+|-----------|-----|-----|-----|-----|----------|
+| Kernel TCP | 72 µs | 87 µs | 90 µs | 207 µs | Ryzen 9 9950X, 10 GbE |
+| **DPDK kernel bypass** | **38 µs** | **38 µs** | **102 µs** | 2,943 µs | EPYC 4564P, Intel 82599 10 GbE SR-IOV |
+
+The DPDK result is an early experimental measurement with end-to-end kernel bypass (both client and server) on budget server-class hardware — not purpose-built low-latency infrastructure. 47% p50 reduction vs kernel TCP on the same machines.
+
+**Latency CDF** — peak-load modes on the same axes:
 
 ![Latency CDF](docs/plots/latency-cdf.svg)
 
@@ -101,8 +115,6 @@ LAN round-trip benchmarks at [`ed9241d`](../../commit/ed9241d). Two or three Che
 ### Bottleneck and next steps
 
 The TCP network stack is now the primary throughput limiter. The journal pipeline hides fsync latency at high pipelining depths. Further gains require reducing transport overhead: kernel bypass (AF_XDP, DPDK, or OpenOnload) would eliminate syscall overhead on the send/recv path. See [docs/performance.md](docs/performance.md) for the full analysis and optimization roadmap.
-
-Early DPDK SR-IOV testing (end-to-end kernel bypass on both client and server) on AMD EPYC 4564P servers with Intel 82599 10GbE NICs achieved **38 µs p90 round-trip latency** (single order, window 1) — a 47% reduction from kernel TCP on the same hardware. This is on budget server-class hardware, not purpose-built low-latency infrastructure.
 
 ## Features
 
