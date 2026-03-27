@@ -93,6 +93,9 @@ fn generate_bindings() {
             uint64_t dpdk_tx_offload_vlan_insert(void);\n\
             uint64_t dpdk_tx_vlan_flag(void);\n\
             void dpdk_mbuf_set_vlan_tci(struct rte_mbuf *m, uint16_t vlan_tci);\n\
+            uint64_t dpdk_eth_rss_ip(void);\n\
+            uint64_t dpdk_eth_rss_tcp(void);\n\
+            uint64_t dpdk_eth_mq_rx_rss(void);\n\
             ",
         )
         .clang_args(&include_args)
@@ -136,6 +139,10 @@ fn generate_bindings() {
         .allowlist_function("dpdk_tx_offload_vlan_insert")
         .allowlist_function("dpdk_tx_vlan_flag")
         .allowlist_function("dpdk_mbuf_set_vlan_tci")
+        // RSS constants.
+        .allowlist_function("dpdk_eth_rss_ip")
+        .allowlist_function("dpdk_eth_rss_tcp")
+        .allowlist_function("dpdk_eth_mq_rx_rss")
         // Types.
         .allowlist_type("rte_mbuf")
         .allowlist_type("rte_mempool")

@@ -126,3 +126,17 @@ uint64_t dpdk_tx_vlan_flag(void) {
 void dpdk_mbuf_set_vlan_tci(struct rte_mbuf *m, uint16_t vlan_tci) {
     m->vlan_tci = vlan_tci;
 }
+
+/* RSS (Receive Side Scaling) constants — exposed as functions because
+   bindgen cannot access C preprocessor macros. */
+uint64_t dpdk_eth_rss_ip(void) {
+    return RTE_ETH_RSS_IP;
+}
+
+uint64_t dpdk_eth_rss_tcp(void) {
+    return RTE_ETH_RSS_TCP;
+}
+
+uint64_t dpdk_eth_mq_rx_rss(void) {
+    return RTE_ETH_MQ_RX_RSS;
+}
