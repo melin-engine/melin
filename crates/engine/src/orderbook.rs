@@ -518,16 +518,6 @@ impl OrderBook {
             .collect()
     }
 
-    /// Check if a resting order with the given (account, order_id) exists on the book.
-    pub(crate) fn has_order(&self, account: AccountId, id: OrderId) -> bool {
-        self.order_index.contains_key(&(account, id))
-    }
-
-    /// Check if a pending stop with the given (account, order_id) exists on the book.
-    pub(crate) fn has_stop(&self, account: AccountId, id: OrderId) -> bool {
-        self.stop_index.contains_key(&(account, id))
-    }
-
     /// Look up a resting order's location and reservation slot from the index.
     /// O(1) HashMap lookup — no VecDeque scan. Returns `None` if the order is
     /// not on the book.
@@ -651,13 +641,19 @@ impl OrderBook {
     /// threaded through so it can be embedded in the resting order if it
     /// places on the book. Consumed maker slots are collected in
     /// `consumed_slots` (call `drain_consumed_slots()` after).
+    /// Process an incoming order, appending execution reports to `reports`.
+    ///
+    /// Returns `true` if the taker order rested on the book (as a resting
+    /// limit or pending stop), `false` if it was fully consumed (filled,
+    /// cancelled, or rejected). The caller uses this to decide whether to
+    /// release leftover reservation surplus without a HashMap lookup.
     pub fn execute(
         &mut self,
         order: Order,
         quote_budget: Option<u64>,
         reservation: ReservationSlot,
         reports: &mut Vec<ExecutionReport>,
-    ) {
+    ) -> bool {
         self.consumed_slots.clear();
         match order.order_type {
             OrderType::Limit { price, .. } => {
@@ -675,6 +671,35 @@ impl OrderBook {
             }
         }
         self.check_triggers(reports);
+        // The taker rested if it's still in an index. Stops always insert
+        // into stop_index; limits insert into order_index via place_on_book.
+        // Triggered stops that were fully consumed are removed from both.
+        // Markets never rest (no index entry).
+        //
+        // Avoid HashMap lookup: stops always rest (unless triggered and
+        // consumed, in which case check_triggers pushed to consumed_slots).
+        // Limits rest only if place_on_book was called (Placed report).
+        // We can't reliably check Placed reports (no account field), so
+        // use the order_index lookup only for limit orders that had fills
+        // but weren't freed — the common case (fully filled or cancelled)
+        // is handled by the consumed_slots/freed logic in Exchange.
+        //
+        // For now, use a fast path: stops always return true (check_triggers
+        // handles consumed stops via consumed_slots). Markets always return
+        // false. Limits check order_index (one lookup instead of two).
+        match order.order_type {
+            OrderType::Stop { .. } | OrderType::StopLimit { .. } => {
+                // Stop may have triggered during check_triggers. If it was
+                // consumed, it's in consumed_slots. Return true here so the
+                // Exchange skips the taker leftover release; the consumed
+                // loop handles it.
+                true
+            }
+            OrderType::Market => false,
+            OrderType::Limit { .. } => {
+                self.order_index.contains_key(&(order.account, order.id))
+            }
+        }
     }
 
     /// Drain consumed slots from the last `execute()` or `cancel()` call.

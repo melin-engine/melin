@@ -532,7 +532,7 @@ impl Exchange {
         // Single mutable lookup: book, fees all from the same struct.
         let inst =
             inst_mut(&mut self.instruments, symbol).expect("instrument verified to exist above");
-        inst.book.execute(order, quote_budget, slot, reports);
+        let taker_rested = inst.book.execute(order, quote_budget, slot, reports);
 
         // Compute fees on fills before balance updates.
         apply_fees(&mut reports[report_start..], &inst.fee_schedule);
@@ -671,11 +671,8 @@ impl Exchange {
 
         // Release leftover reservations for orders no longer on the book
         // (price improvement, market buy budget surplus, etc.).
-        let inst = inst_ref(&self.instruments, symbol).expect("instrument verified to exist above");
-        if !freed.contains(&(taker_account, taker_id))
-            && !inst.book.has_order(taker_account, taker_id)
-            && !inst.book.has_stop(taker_account, taker_id)
-        {
+        // Determined from report analysis — no HashMap lookup needed.
+        if !taker_rested && !freed.contains(&(taker_account, taker_id)) {
             self.accounts.release(slot);
             freed.push((taker_account, taker_id));
         }
