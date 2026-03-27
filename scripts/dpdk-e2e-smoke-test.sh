@@ -206,7 +206,7 @@ echo ""
     --dpdk-ip "$BENCH_IP" \
     --dpdk-prefix-len "$PREFIX" \
     --dpdk-core 5 \
-    1000 \
+    300000 \
     2>&1 | tee "$TMPDIR/bench.log"
 
 BENCH_EXIT=$?
