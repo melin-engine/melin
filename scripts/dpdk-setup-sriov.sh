@@ -1,25 +1,23 @@
 #!/usr/bin/env bash
-# Set up DPDK with SR-IOV VFs on Intel E810 (bifurcated mode).
+# Set up DPDK with SR-IOV VFs on Intel NICs (E810/ice and 82599/ixgbe).
 #
 # Creates a VF on each bond member port, configures them for VLAN
 # trading traffic, and binds them to vfio-pci for DPDK use. The bond
 # and PFs are untouched — SSH/management traffic continues normally.
 #
+# Supported NICs:
+#   - Intel E810 (ice driver, iavf VF driver)
+#   - Intel 82599 / X520 / X540 (ixgbe driver, ixgbevf VF driver)
+#
 # Prerequisites:
-#   - Intel E810 NICs with ice driver
 #   - IOMMU enabled (intel_iommu=on iommu=pt in kernel cmdline)
 #   - Root access
 #
 # Usage:
-#   ./scripts/dpdk-setup.sh [--vlan 1461] [--ip 10.189.210.100/24]
+#   ./scripts/dpdk-setup-sriov.sh [--vlan 1461] [--ip 10.189.210.100/24]
 #
 # After running this script, start the server with:
-#   ./target/release/melin-server \
-#       --dpdk-port 0 \
-#       --dpdk-ip <dpdk-ip>/24 \
-#       --dpdk-gateway <gateway> \
-#       --journal /mnt/journal/bench.journal \
-#       --authorized-keys authorized_keys
+#   sudo ./scripts/dpdk-server.sh
 
 set -euo pipefail
 
@@ -45,6 +43,18 @@ PF0_PCI="${PF0_PCI}"
 PF1_PCI="${PF1_PCI}"
 PF0_IFACE="${PF0_IFACE}"
 PF1_IFACE="${PF1_IFACE}"
+
+# Detect PF driver (ice or ixgbe).
+PF_DRIVER=$(ethtool -i "$PF0_IFACE" 2>/dev/null | awk '/^driver:/{print $2}')
+case "$PF_DRIVER" in
+    ice)    NIC_NAME="E810"; VF_DRIVER="iavf" ;;
+    ixgbe)  NIC_NAME="82599/X520"; VF_DRIVER="ixgbevf" ;;
+    *)
+        echo "error: unsupported PF driver '$PF_DRIVER' on $PF0_IFACE" >&2
+        echo "  Supported: ice (E810), ixgbe (82599/X520/X540)" >&2
+        exit 1
+        ;;
+esac
 
 # VLAN ID for trading traffic. Auto-detect from bond VLAN interface if not set.
 if [[ -z "${VLAN_ID:-}" ]]; then
@@ -145,9 +155,17 @@ if [[ ! -f "/sys/bus/pci/devices/${PF0_PCI}/sriov_totalvfs" ]]; then
     exit 1
 fi
 
-echo "=== DPDK SR-IOV Setup for Intel E810 ==="
+TOTAL_VFS=$(cat "/sys/bus/pci/devices/${PF0_PCI}/sriov_totalvfs")
+if [[ "$TOTAL_VFS" -eq 0 ]]; then
+    echo "error: sriov_totalvfs is 0 on ${PF0_PCI}" >&2
+    echo "  IOMMU may not be enabled. Add 'intel_iommu=on iommu=pt' to kernel cmdline and reboot." >&2
+    exit 1
+fi
+
+echo "=== DPDK SR-IOV Setup ($NIC_NAME / $PF_DRIVER) ==="
 echo "  PF0: ${PF0_PCI} (${PF0_IFACE})"
 echo "  PF1: ${PF1_PCI} (${PF1_IFACE})"
+echo "  Driver: ${PF_DRIVER} (VF: ${VF_DRIVER})"
 echo "  VLAN: ${VLAN_ID}"
 echo "  DPDK IP: ${DPDK_IP}"
 echo "  VF MAC: ${VF_MAC}"
@@ -191,9 +209,13 @@ echo "--- Loading vfio-pci module ---"
 modprobe vfio-pci
 echo "  vfio-pci loaded"
 
-# Enable unsafe IOMMU mode if IOMMU groups aren't properly isolated.
+# Enable unsafe no-IOMMU mode if IOMMU groups aren't properly isolated.
+# ixgbe NICs commonly place PF+VFs in the same IOMMU group, which causes
+# vfio-pci to reject the bind. This workaround skips IOMMU isolation —
+# acceptable for single-tenant benchmark servers, not for shared hosts.
 if [[ -f /sys/module/vfio/parameters/enable_unsafe_noiommu_mode ]]; then
     echo 1 > /sys/module/vfio/parameters/enable_unsafe_noiommu_mode 2>/dev/null || true
+    echo "  noiommu mode enabled (fallback for shared IOMMU groups)"
 fi
 
 # ---------------------------------------------------------------------------
@@ -212,14 +234,13 @@ create_vf() {
     current=$(cat "/sys/bus/pci/devices/${pci}/sriov_numvfs" 2>/dev/null || echo 0)
     if [[ "$current" -gt 0 ]]; then
         echo "  ${label}: ${current} VFs already exist, skipping creation"
-        return
+    else
+        echo 1 > "/sys/bus/pci/devices/${pci}/sriov_numvfs"
+        echo "  ${label}: created 1 VF"
+        sleep 1
     fi
 
-    echo 1 > "/sys/bus/pci/devices/${pci}/sriov_numvfs"
-    echo "  ${label}: created 1 VF"
-    sleep 1
-
-    # Trust VF 0 (required for DCF and flow rule offloading).
+    # Trust VF 0 (required for DCF on ice, and for MAC changes on ixgbe).
     ip link set "${iface}" vf 0 trust on
     echo "  ${label}: VF 0 trusted"
 
@@ -236,10 +257,24 @@ create_vf() {
     ip link set "${iface}" vf 0 spoofchk off
     echo "  ${label}: VF 0 spoofcheck disabled"
 
-    # Set jumbo MTU on the PF so VFs can use large frames.
-    # Reduces TCP segment count ~6x (MSS 8960 vs 1460).
+    # Set MTU on the PF so VFs can use large frames.
     ip link set "${iface}" mtu "${MTU}"
     echo "  ${label}: MTU set to ${MTU}"
+
+    # On ixgbe, the VF driver must be reloaded for MAC changes to take
+    # effect. Unbind and rebind the VF from its kernel driver.
+    if [[ "$PF_DRIVER" == "ixgbe" ]]; then
+        local vf_pci
+        vf_pci=$(readlink -f "/sys/bus/pci/devices/${pci}/virtfn0" | xargs basename)
+        if [[ -e "/sys/bus/pci/devices/${vf_pci}/driver" ]]; then
+            local vf_drv
+            vf_drv=$(basename "$(readlink -f "/sys/bus/pci/devices/${vf_pci}/driver")")
+            echo "${vf_pci}" > "/sys/bus/pci/devices/${vf_pci}/driver/unbind" 2>/dev/null || true
+            echo "${vf_pci}" > "/sys/bus/pci/drivers/${vf_drv}/bind" 2>/dev/null || true
+            echo "  ${label}: reloaded VF driver (${vf_drv}) for MAC change"
+            sleep 1
+        fi
+    fi
 }
 
 create_vf "${PF0_PCI}" "${PF0_IFACE}" "PF0"
@@ -266,7 +301,7 @@ bind_vf() {
 
     echo "  ${label}: VF at ${vf_pci}"
 
-    # Unbind from current driver (iavf).
+    # Unbind from current driver (iavf or ixgbevf).
     if [[ -e "/sys/bus/pci/devices/${vf_pci}/driver" ]]; then
         echo "${vf_pci}" > "/sys/bus/pci/devices/${vf_pci}/driver/unbind" 2>/dev/null || true
         echo "  ${label}: unbound from kernel driver"
@@ -301,7 +336,7 @@ ls -la /sys/bus/pci/drivers/vfio-pci/ 2>/dev/null | grep "0000:" || echo "  (non
 VF0_PCI=$(readlink -f "/sys/bus/pci/devices/${PF0_PCI}/virtfn0" 2>/dev/null | xargs basename 2>/dev/null || echo "?")
 VF1_PCI=$(readlink -f "/sys/bus/pci/devices/${PF1_PCI}/virtfn0" 2>/dev/null | xargs basename 2>/dev/null || echo "?")
 
-# Save DPDK config for use by dpdk-lan-bench.sh.
+# Save DPDK config for use by dpdk-server.sh and dpdk-lan-bench.sh.
 DPDK_CONF="/etc/melin-dpdk.conf"
 cat > "$DPDK_CONF" <<EOF
 DPDK_IP=${DPDK_IP%%/*}
@@ -310,11 +345,12 @@ DPDK_PORT=0
 HUGE_DIR=/mnt/huge_2m
 MTU=${MTU}
 VF_MAC=${VF_MAC}
+VLAN_ID=${VLAN_ID}
 EOF
 echo "  Config written to ${DPDK_CONF}"
 
 echo ""
-echo "=== Setup complete ==="
+echo "=== Setup complete ($NIC_NAME / $PF_DRIVER) ==="
 echo ""
 echo "  VF0 (on PF0): ${VF0_PCI} → vfio-pci"
 echo "  VF1 (on PF1): ${VF1_PCI} → vfio-pci"
@@ -322,11 +358,4 @@ echo "  Bond: untouched (LACP active)"
 echo "  Hugepages: ${ACTUAL} x 2MB"
 echo ""
 echo "  Start the server with:"
-echo "    ./target/release/melin-server \\"
-echo "      --dpdk-eal-args='--huge-dir=/mnt/huge_2m' \\"
-echo "      --dpdk-port 0 \\"
-echo "      --dpdk-ip ${DPDK_IP%%/*} \\"
-echo "      --dpdk-prefix-len 24 \\"
-echo "      --journal /mnt/journal/bench.journal \\"
-echo "      --authorized-keys authorized_keys \\"
-echo "      --standalone"
+echo "    sudo ./scripts/dpdk-server.sh"
