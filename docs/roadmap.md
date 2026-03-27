@@ -14,11 +14,24 @@ Planned features sorted by value/complexity ratio for commercial readiness (exch
 | 6 | Catch-up from journal files | High | High | ★★☆☆☆ | Critical for production HA, but significant work (read historical segments, switch to live). |
 | 7 | Snapshot transfer | Medium | High | ★☆☆☆☆ | Needed for full HA, but catch-up from journal comes first. |
 | 8 | AF_XDP transport | High | High | ★★☆☆☆ | Kernel bypass via XDP sockets. Eliminates TCP syscall overhead. Requires decoupling the `io-uring` feature flag: currently it gates both journal I/O and transport. Must be able to use io_uring for journal fsync with AF_XDP for transport to benefit from both. |
-| 9 | DPDK transport | High | Very high | ★☆☆☆☆ | Full userspace networking via DPDK + smoltcp. Prototype on `feat/dpdk-bench` but blocked on Cherry's LACP. Needs bare metal with non-bonded switch ports. Same io_uring decoupling requirement as AF_XDP. |
-| 10 | SPDK journal | High | High | ★★☆☆☆ | Userspace NVMe driver for journal writes. Bypasses kernel block layer — submits FUA write commands directly to the NVMe submission queue. Eliminates pwritev2 syscall overhead. Works on 9950X Cherry servers (IOMMU active). Only impactful after transport bottleneck is solved (AF_XDP/DPDK). |
-| 11 | Protocol optims investigation | Low | Unknown | ★☆☆☆☆ | Research, not a feature. No commercial value until proven. |
+| 9 | SPDK journal | High | High | ★★☆☆☆ | Userspace NVMe driver for journal writes. Bypasses kernel block layer — submits FUA write commands directly to the NVMe submission queue. Eliminates pwritev2 syscall overhead. Works on 9950X Cherry servers (IOMMU active). Only impactful after transport bottleneck is solved (AF_XDP/DPDK). |
+| 10 | Protocol optims investigation | Low | Unknown | ★☆☆☆☆ | Research, not a feature. No commercial value until proven. |
 | 12 | Full doc review | High | Low | ★★★★☆ | Many docs are stale after recent features (permissions, backpressure, Day TIF, promotion, health endpoint). Review and update all docs/ files, CLAUDE.md, and README. Do once all other MVP features are complete. |
 | 13 | Brand setup (domain, GitHub org, email) | Medium | Low | ★★★☆☆ | Register melin.io/melin.com, set up contact@ email, create GitHub org, transfer repo, switch commit email going forward. Do not rewrite history. |
+
+## DPDK Transport Optimization
+
+Working DPDK kernel-bypass transport on `feat/dpdk-zerocopy-rx`. SR-IOV tested on ixgbe (82599) and ice (E810) with LACP bonds. Early results: **38 µs p90** single-order round-trip (e2e kernel bypass), 47% lower than kernel TCP on the same hardware.
+
+Current bottleneck: single DPDK poll thread handles all NIC I/O, TCP processing, frame parsing, and disruptor publish.
+
+| # | Optimization | Est. impact | Complexity | Description |
+|---|-------------|------------|------------|-------------|
+| 1 | Batch disruptor publish | 10-20% throughput | Low | Accumulate parsed frames and publish in a single batch instead of one `producer.publish()` per frame. Amortizes ring buffer overhead. |
+| 2 | Split RX/TX onto separate cores | ~2x throughput | Medium | RX core: `rx_burst` → `poll_ingress_batch` → frame parse → disruptor publish. TX core: SPSC drain → `queue_send` → `flush_tx_queues` → `iface.poll` egress. RX and TX are independent — splitting roughly doubles throughput. |
+| 3 | Reduce tracing overhead | 5-10% throughput | Low | Build with `max_level_info` or `max_level_warn` for production. Even gated `debug!` macros hit the tracing filter check on every call site. |
+| 4 | RSS (Receive Side Scaling) | ~Nx throughput | High | Multiple RX queues on the NIC, each polled by a separate thread. NIC hashes flows by (src/dst IP+port). Requires per-queue smoltcp instances or shared-nothing design. |
+| 5 | Bypass smoltcp on hot path | Significant latency | Very high | For connected+authenticated clients, parse TCP directly from raw Ethernet frames. Eliminates smoltcp's per-packet overhead (neighbor lookup, socket dispatch, congestion window, timer checks). Custom minimal TCP for steady-state data path only. |
 
 ## Deferred
 
