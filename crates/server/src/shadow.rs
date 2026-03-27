@@ -59,7 +59,6 @@ pub fn run(
     batch.resize_with(SHADOW_BATCH_SIZE, InputSlot::default);
 
     let mut last_snapshot = Instant::now();
-    let mut last_seq = 0u64;
     let mut idle_spins: u32 = 0;
 
     loop {
@@ -83,7 +82,7 @@ pub fn run(
         // Track the last consumed input sequence.
         // consumer.next_read() is the *next* sequence to read, so the last
         // consumed is next_read - 1.
-        last_seq = consumer.next_read() - 1;
+        let last_seq = consumer.next_read() - 1;
 
         // Check if a snapshot is due. Only runs after processing events —
         // no point snapshotting unchanged state during idle periods.
@@ -211,19 +210,25 @@ mod tests {
     #[test]
     fn dispatch_event_produces_identical_state_to_direct_calls() {
         // Process the same events two ways: dispatch_event (shadow path)
-        // and direct Exchange method calls (matching path). Snapshot both
-        // and verify identical state.
+        // and direct Exchange method calls (matching path). Exercises
+        // every JournalEvent variant that mutates exchange state.
         let mut shadow = Exchange::new();
         let mut primary = Exchange::new();
         let mut reports = Vec::new();
 
         let events = vec![
+            // --- Instrument setup ---
             JournalEvent::AddInstrument {
                 spec: InstrumentSpec {
                     symbol: Symbol(1),
                     base: CurrencyId(0),
                     quote: CurrencyId(1),
                 },
+            },
+            // --- Account provisioning and deposits ---
+            JournalEvent::ProvisionAccount {
+                account: AccountId(1),
+                amount: 200_000,
             },
             JournalEvent::Deposit {
                 account: AccountId(1),
@@ -235,6 +240,37 @@ mod tests {
                 currency: CurrencyId(0),
                 amount: 500,
             },
+            JournalEvent::Deposit {
+                account: AccountId(2),
+                currency: CurrencyId(1),
+                amount: 50_000,
+            },
+            // --- Risk limits ---
+            JournalEvent::SetRiskLimits {
+                symbol: Symbol(1),
+                limits: RiskLimits {
+                    max_order_qty: Some(qty(1000)),
+                    max_order_notional: None,
+                },
+            },
+            // --- Circuit breaker ---
+            JournalEvent::SetCircuitBreaker {
+                symbol: Symbol(1),
+                config: CircuitBreakerConfig {
+                    price_band_lower: Some(price(50)),
+                    price_band_upper: Some(price(200)),
+                    halted: false,
+                },
+            },
+            // --- Fee schedule ---
+            JournalEvent::SetFeeSchedule {
+                symbol: Symbol(1),
+                schedule: FeeSchedule {
+                    maker_fee_bps: -5,
+                    taker_fee_bps: 10,
+                },
+            },
+            // --- Place a sell order (rests on book) ---
             JournalEvent::SubmitOrder {
                 symbol: Symbol(1),
                 order: Order {
@@ -251,6 +287,38 @@ mod tests {
                     expiry_ns: 0,
                 },
             },
+            // --- Place a second sell order to cancel later ---
+            JournalEvent::SubmitOrder {
+                symbol: Symbol(1),
+                order: Order {
+                    id: OrderId(2),
+                    account: AccountId(2),
+                    side: Side::Sell,
+                    order_type: OrderType::Limit {
+                        price: price(110),
+                        post_only: false,
+                    },
+                    time_in_force: TimeInForce::GTC,
+                    quantity: qty(30),
+                    stp: SelfTradeProtection::Allow,
+                    expiry_ns: 0,
+                },
+            },
+            // --- Cancel-replace: move order 2 to price 105, qty 25 ---
+            JournalEvent::CancelReplace {
+                symbol: Symbol(1),
+                account: AccountId(2),
+                order_id: OrderId(2),
+                new_price: price(105),
+                new_quantity: qty(25),
+            },
+            // --- Cancel order 2 ---
+            JournalEvent::CancelOrder {
+                account: AccountId(2),
+                order_id: OrderId(2),
+                symbol: Symbol(1),
+            },
+            // --- Partial fill: buy 20 of the 50-lot sell ---
             JournalEvent::SubmitOrder {
                 symbol: Symbol(1),
                 order: Order {
@@ -267,6 +335,64 @@ mod tests {
                     expiry_ns: 0,
                 },
             },
+            // --- Withdraw some funds ---
+            JournalEvent::Withdraw {
+                account: AccountId(1),
+                currency: CurrencyId(1),
+                amount: 5_000,
+            },
+            // --- Place an order with expiry for ExpireOrders ---
+            JournalEvent::SubmitOrder {
+                symbol: Symbol(1),
+                order: Order {
+                    id: OrderId(3),
+                    account: AccountId(1),
+                    side: Side::Buy,
+                    order_type: OrderType::Limit {
+                        price: price(90),
+                        post_only: false,
+                    },
+                    time_in_force: TimeInForce::GTD,
+                    quantity: qty(10),
+                    stp: SelfTradeProtection::Allow,
+                    expiry_ns: 1_000_000,
+                },
+            },
+            // --- Expire orders older than timestamp ---
+            JournalEvent::ExpireOrders {
+                timestamp_ns: 2_000_000,
+            },
+            // --- Place an order then cancel all for that account ---
+            JournalEvent::SubmitOrder {
+                symbol: Symbol(1),
+                order: Order {
+                    id: OrderId(4),
+                    account: AccountId(1),
+                    side: Side::Buy,
+                    order_type: OrderType::Limit {
+                        price: price(80),
+                        post_only: false,
+                    },
+                    time_in_force: TimeInForce::GTC,
+                    quantity: qty(5),
+                    stp: SelfTradeProtection::Allow,
+                    expiry_ns: 0,
+                },
+            },
+            JournalEvent::CancelAll {
+                account: AccountId(1),
+            },
+            // --- No-ops that should not affect state ---
+            JournalEvent::QueryStats,
+            JournalEvent::GenesisHash {
+                hash: [0xAA; 32],
+            },
+            JournalEvent::Checkpoint {
+                chain_hash: [0xBB; 32],
+                events_since_checkpoint: 99,
+            },
+            // --- End of day ---
+            JournalEvent::EndOfDay,
         ];
 
         // Shadow path: dispatch_event.
@@ -274,9 +400,10 @@ mod tests {
             dispatch_event(&mut shadow, event, &mut reports);
         }
 
-        // Primary path: direct method calls.
+        // Primary path: direct method calls (mirrors dispatch_event logic).
         let mut primary_reports = Vec::new();
         for event in &events {
+            primary_reports.clear();
             match *event {
                 JournalEvent::AddInstrument { spec } => primary.add_instrument(spec),
                 JournalEvent::Deposit {
@@ -286,22 +413,79 @@ mod tests {
                 } => primary.deposit(account, currency, amount),
                 JournalEvent::SubmitOrder { symbol, order } => {
                     primary.execute(symbol, order, &mut primary_reports);
-                    primary_reports.clear();
                 }
-                _ => {}
+                JournalEvent::CancelOrder {
+                    account,
+                    order_id,
+                    symbol,
+                } => {
+                    primary.cancel(symbol, account, order_id, &mut primary_reports);
+                }
+                JournalEvent::SetRiskLimits { symbol, limits } => {
+                    primary.set_risk_limits(symbol, limits);
+                }
+                JournalEvent::CancelAll { account } => {
+                    primary.cancel_all(account, &mut primary_reports);
+                }
+                JournalEvent::EndOfDay => {
+                    primary.end_of_day(&mut primary_reports);
+                }
+                JournalEvent::ExpireOrders { timestamp_ns } => {
+                    primary.expire_orders(timestamp_ns, &mut primary_reports);
+                }
+                JournalEvent::SetCircuitBreaker { symbol, config } => {
+                    primary.set_circuit_breaker(symbol, config);
+                }
+                JournalEvent::CancelReplace {
+                    symbol,
+                    account,
+                    order_id,
+                    new_price,
+                    new_quantity,
+                } => {
+                    primary.cancel_replace(
+                        symbol,
+                        account,
+                        order_id,
+                        new_price,
+                        new_quantity,
+                        &mut primary_reports,
+                    );
+                }
+                JournalEvent::SetFeeSchedule { symbol, schedule } => {
+                    primary.set_fee_schedule(symbol, schedule);
+                }
+                JournalEvent::ProvisionAccount { account, amount } => {
+                    primary.provision_account(account, amount);
+                }
+                JournalEvent::Withdraw {
+                    account,
+                    currency,
+                    amount,
+                } => {
+                    let _ = primary.withdraw(account, currency, amount);
+                }
+                JournalEvent::QueryStats
+                | JournalEvent::GenesisHash { .. }
+                | JournalEvent::Checkpoint { .. } => {}
             }
         }
 
-        // Both exchanges should have identical balances.
-        let acct1_shadow = shadow.accounts().balance(AccountId(1), CurrencyId(1));
-        let acct1_primary = primary.accounts().balance(AccountId(1), CurrencyId(1));
-        assert_eq!(acct1_shadow.available, acct1_primary.available);
-        assert_eq!(acct1_shadow.reserved, acct1_primary.reserved);
+        // Verify identical state by saving both exchanges to snapshot
+        // files and comparing the raw bytes. This catches differences in
+        // any internal structure (balances, order books, reservations,
+        // instrument config, risk limits, circuit breakers, fee schedules).
+        let dir = tempfile::tempdir().unwrap();
+        let shadow_path = dir.path().join("shadow.snapshot");
+        let primary_path = dir.path().join("primary.snapshot");
+        let hash = [0u8; 32];
 
-        let acct2_shadow = shadow.accounts().balance(AccountId(2), CurrencyId(0));
-        let acct2_primary = primary.accounts().balance(AccountId(2), CurrencyId(0));
-        assert_eq!(acct2_shadow.available, acct2_primary.available);
-        assert_eq!(acct2_shadow.reserved, acct2_primary.reserved);
+        snapshot::save(&shadow, 1, hash, &shadow_path).unwrap();
+        snapshot::save(&primary, 1, hash, &primary_path).unwrap();
+
+        let shadow_bytes = std::fs::read(&shadow_path).unwrap();
+        let primary_bytes = std::fs::read(&primary_path).unwrap();
+        assert_eq!(shadow_bytes, primary_bytes, "snapshot state diverged");
     }
 
     #[test]

@@ -295,7 +295,7 @@ Input Disruptor Ring
 
 1. The shadow stage consumes events from the input disruptor, always behind the journal cursor, ensuring it only processes durable events.
 2. It replays each event through its own `Exchange` instance, maintaining identical state to the primary.
-3. At each configured interval, the shadow exchange saves its state to the snapshot file. The snapshot is written atomically (`.tmp` + rename).
+3. At each configured interval, the shadow exchange saves its state to the snapshot file. The snapshot is written atomically (`.tmp` + fsync + rename). Before each rename, the previous snapshot is rotated to `.snapshot.prev` as a rollback point.
 4. Between snapshot writes, the shadow catches up to the current journal position before the next snapshot interval fires.
 
 ### Zero Impact on Matching Engine
@@ -318,6 +318,21 @@ The only state shared between stages is the BLAKE3 chain hash, published by the 
 ```
 
 If `--snapshot-path` is omitted, the snapshot defaults to `<journal>.snapshot` (e.g., `/mnt/nvme/trading.snapshot`), which shares the journal NVMe.
+
+### Snapshot Rotation
+
+Each snapshot save rotates the previous snapshot to `<path>.prev` before writing the new one. This gives operators a one-deep rollback point:
+
+- `trading.snapshot` — the latest snapshot (most recent interval).
+- `trading.snapshot.prev` — the previous snapshot (one interval older).
+
+If the latest snapshot is corrupt or contains undesired state (e.g., bad market data caused incorrect fills), operators can recover from the `.prev` snapshot by renaming it back:
+
+```sh
+mv trading.snapshot.prev trading.snapshot
+```
+
+The rotation is best-effort: if the `.prev` rename fails (e.g., permission error), the save proceeds anyway — losing the rollback point is preferable to failing the snapshot entirely. On first save after startup, there is no previous snapshot to rotate, so no `.prev` file is created.
 
 ### Catch-Up Behavior
 
