@@ -223,7 +223,6 @@ ssh $SSH_OPTS "$SERVER" "RUST_LOG=info nohup ${REPO_DIR}/target/release/melin-se
         --dpdk-ip ${DPDK_IP} \
         --dpdk-prefix-len ${DPDK_PREFIX} \
         --dpdk-ports ${DPDK_PORT} \
-        --dpdk-core ${DPDK_CORE} \
     >/tmp/melin-server.log 2>&1 </dev/null &" </dev/null
 
 # Wait for server. Can't use nc -z (smoltcp doesn't respond to kernel probes).

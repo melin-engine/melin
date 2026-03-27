@@ -39,7 +39,6 @@ fi
 CONF="/etc/melin-dpdk.conf"
 HUGE_DIR="/mnt/huge_2m"
 DPDK_PORT="${DPDK_PORT:-0}"
-DPDK_CORE="${DPDK_CORE:-8}"
 DPDK_PREFIX="${DPDK_PREFIX:-24}"
 MTU="${MTU:-1500}"
 JOURNAL="${JOURNAL:-/mnt/journal/bench.journal}"
@@ -127,7 +126,7 @@ echo ""
 echo "============================================================"
 echo "  Melin DPDK Server ($MODE)"
 echo "  DPDK IP:  $DPDK_IP/$DPDK_PREFIX"
-echo "  Core:     $DPDK_CORE"
+echo "  Readers:  ${READERS:-2} (DPDK poll threads)"
 echo "  Journal:  $JOURNAL"
 echo "  Auth:     $AUTH_KEYS"
 echo "============================================================"
@@ -157,7 +156,6 @@ exec cargo run --release -p melin-server --features "$FEATURES" --no-default-fea
     --dpdk-eal-args="$EAL_ARGS" \
     --dpdk-ip "$DPDK_IP" \
     --dpdk-prefix-len "$DPDK_PREFIX" \
-    --dpdk-core "$DPDK_CORE" \
     $DPDK_PORTS_ARG \
     $DPDK_VLAN_ARG \
     $DPDK_MTU_ARG \
