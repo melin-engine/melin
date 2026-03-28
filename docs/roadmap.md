@@ -28,6 +28,7 @@ Features targeting regulated venues, gateway responsibilities, or with limited n
 
 | Feature | Why deferred |
 |---------|-------------|
+| io_uring SQPOLL | `IORING_SETUP_SQPOLL` eliminates `io_uring_enter()` syscall (~1-2µs) per submission. Measured 15% p50 improvement on loopback but tail regresses on SMT-enabled machines due to SQPOLL kernel threads contending with pipeline threads. Needs Cherry server testing with SMT off and `setup_sqpoll_cpu()` pinning. Branch: `feat/uring-sqpoll`. |
 | Response gate bottleneck counter | Expose a metric counting how often the response stage blocked on the journal cursor vs the replication cursor. Currently `min(journal, replication)` is opaque — no visibility into which is the tail latency contributor. Low complexity, expose via health/metrics endpoint. |
 | Dual-NVMe journal hedging | Two journal threads on separate NVMe drives, response stage gates on the fastest. Cuts tail latency from P(slow) to P(slow)². Free durability redundancy. Low complexity but requires a second NVMe slot. Revisit when journal fsync is the dominant tail contributor. |
 | AF_XDP transport | DaMoN '25 found AF_XDP disappoints vs DPDK for small-message request-response workloads. DPDK transport already in progress. Revisit if DPDK proves insufficient. |

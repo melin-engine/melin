@@ -11,6 +11,7 @@
 #   3. IRQ affinity → pin all interrupts to core 0 (keeps hardware interrupts
 #      off pipeline/reader/bench cores)
 #   4. irqbalance → stopped (prevents daemon from redistributing IRQs)
+#   7. SO_BUSY_POLL → 50µs (NIC rx queue spin-polling, reduces recv wakeup latency)
 #
 # Core layout: 0=OS/IRQ, 1-3=pipeline (journal/matching/response),
 # 4-5=reader threads (or DPDK poll threads), 6=repl-sender, 7=event-publisher, 8=shadow, 9+=bench threads.
@@ -31,6 +32,8 @@ ORIG_GOVERNOR=$(cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor 2>/dev
 ORIG_NMI=$(cat /proc/sys/kernel/nmi_watchdog 2>/dev/null || echo "1")
 ORIG_THP=$(cat /sys/kernel/mm/transparent_hugepage/enabled 2>/dev/null | grep -o '\[.*\]' | tr -d '[]' || echo "always")
 ORIG_WB_CPUMASK=$(cat /sys/bus/workqueue/devices/writeback/cpumask 2>/dev/null || true)
+ORIG_BUSY_READ=$(cat /proc/sys/net/core/busy_read 2>/dev/null || echo "0")
+ORIG_BUSY_POLL=$(cat /proc/sys/net/core/busy_poll 2>/dev/null || echo "0")
 IRQBALANCE_WAS_RUNNING=false
 if systemctl is-active --quiet irqbalance 2>/dev/null; then
     IRQBALANCE_WAS_RUNNING=true
@@ -78,6 +81,11 @@ restore() {
     if [[ -n "$ORIG_WB_CPUMASK" ]]; then
         echo "$ORIG_WB_CPUMASK" > /sys/bus/workqueue/devices/writeback/cpumask 2>/dev/null || true
     fi
+
+    # Restore SO_BUSY_POLL.
+    echo "$ORIG_BUSY_READ" > /proc/sys/net/core/busy_read 2>/dev/null || true
+    echo "$ORIG_BUSY_POLL" > /proc/sys/net/core/busy_poll 2>/dev/null || true
+    echo "  SO_BUSY_POLL → ${ORIG_BUSY_POLL} (busy_read → ${ORIG_BUSY_READ})"
 
     # Restart irqbalance if it was running.
     if $IRQBALANCE_WAS_RUNNING; then
@@ -149,6 +157,13 @@ for cpumask_file in /sys/bus/workqueue/devices/*/cpumask; do
     fi
 done
 echo "  workqueue affinity → pinned ${wq_pinned} workqueues to core 0"
+
+# 7. Enable SO_BUSY_POLL. The kernel spin-polls the NIC rx queue for up
+#    to 50µs instead of sleeping for an interrupt. Reduces recv wakeup
+#    latency on real NICs (minimal effect on loopback).
+echo 50 > /proc/sys/net/core/busy_read 2>/dev/null || true
+echo 50 > /proc/sys/net/core/busy_poll 2>/dev/null || true
+echo "  SO_BUSY_POLL → 50µs (was: busy_read=${ORIG_BUSY_READ}, busy_poll=${ORIG_BUSY_POLL})"
 
 # --- Report kernel boot tuning (read-only, set via GRUB) ---
 
