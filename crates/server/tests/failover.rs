@@ -611,10 +611,6 @@ fn crashed_primary_recovers_from_journal() {
         )),
         "expected DuplicateOrderId on recovered primary, got: {r:?}"
     );
-
-    // Clean up.
-    let _ = recovered.child.kill();
-    let _ = recovered.child.wait();
 }
 
 /// Reconnect with the SAME key after failover and retry the last request.
