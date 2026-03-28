@@ -242,6 +242,8 @@ struct TestCluster {
     promote_port: u16,
     key: SigningKey,
     key2: SigningKey,
+    bin: PathBuf,
+    keys_path: PathBuf,
     _tmp: tempfile::TempDir,
 }
 
@@ -307,6 +309,8 @@ impl TestCluster {
             promote_port: replica_promote_port,
             key,
             key2,
+            bin,
+            keys_path,
             _tmp: tmp,
         }
     }
@@ -518,5 +522,148 @@ fn kill_without_waiting_for_replication() {
             }
         )),
         "expected DuplicateOrderId for id={last_acked_id}, got: {r:?}"
+    );
+}
+
+/// After killing the primary and promoting the replica, restart the old
+/// primary from its journal in standalone mode. Verify it recovers to the
+/// same state (can place orders, rejects duplicates). This tests journal
+/// crash recovery on a server that was SIGKILLed.
+#[test]
+fn crashed_primary_recovers_from_journal() {
+    let mut cluster = TestCluster::start();
+    let mut client = cluster.connect_primary();
+
+    // Submit orders with fills to create interesting state.
+    for i in 1..=10u64 {
+        submit_order(&mut client, i, 2, 1, Side::Sell, 100 + i, 5);
+    }
+    for i in 11..=20u64 {
+        submit_order(&mut client, i, 1, 1, Side::Buy, 200, 3);
+    }
+
+    cluster.wait_replicated();
+
+    // SIGKILL the primary (unclean shutdown — partial writes possible).
+    unsafe {
+        libc::kill(cluster.primary.child.id() as i32, libc::SIGKILL);
+    }
+    let _ = cluster.primary.child.wait();
+
+    // Restart the old primary from its journal in standalone mode.
+    // The journal may have a trailing partial write from the SIGKILL —
+    // recovery must truncate it and continue.
+    let primary_journal = cluster._tmp.path().join("primary.journal");
+    assert!(primary_journal.exists(), "primary journal must exist");
+
+    let recovered_client_port = free_port();
+    let recovered_health_port = free_port();
+    let mut recovered = {
+        let child = Command::new(&cluster.bin)
+            .args([
+                "--bind", &format!("127.0.0.1:{recovered_client_port}"),
+                "--health-bind", &format!("127.0.0.1:{recovered_health_port}"),
+                "--standalone",
+                "--journal", primary_journal.to_str().expect("valid path"),
+                "--authorized-keys", cluster.keys_path.to_str().expect("valid path"),
+                "--accounts", "10",
+                "--instruments", "2",
+                "--connection-timeout-secs", "0",
+                "--yield-idle",
+                "--cores", "0,0,0,0,0,0",
+                "--readers", "1",
+                "--reader-cores", "0",
+            ])
+            .stdout(Stdio::inherit())
+            .stderr(Stdio::inherit())
+            .spawn()
+            .expect("spawn recovered primary");
+        ServerProcess {
+            child,
+            client_addr: format!("127.0.0.1:{recovered_client_port}").parse().unwrap(),
+            health_addr: format!("127.0.0.1:{recovered_health_port}").parse().unwrap(),
+        }
+    };
+
+    wait_healthy(recovered.health_addr, Duration::from_secs(30));
+    std::thread::sleep(Duration::from_secs(1));
+
+    let mut client3 = Client::connect(recovered.client_addr, &cluster.key2)
+        .expect("connect to recovered primary");
+
+    // New order must succeed — proves recovery restored instruments + balances.
+    // May fill against resting orders that survived recovery, so accept
+    // either Placed or Fill.
+    let r = submit_order(&mut client3, 21, 1, 1, Side::Buy, 300, 1);
+    let accepted = has_report(&r, |rep| matches!(rep, melin_protocol::types::ExecutionReport::Placed { .. }))
+        || has_report(&r, |rep| matches!(rep, melin_protocol::types::ExecutionReport::Fill { .. }));
+    assert!(accepted, "expected Placed or Fill on recovered primary, got: {r:?}");
+
+    // Duplicate of an old order must be rejected — proves HWM recovered.
+    let r = submit_order(&mut client3, 10, 2, 1, Side::Sell, 100, 5);
+    assert!(
+        has_report(&r, |rep| matches!(
+            rep,
+            melin_protocol::types::ExecutionReport::Rejected {
+                reason: melin_protocol::types::RejectReason::DuplicateOrderId,
+                ..
+            }
+        )),
+        "expected DuplicateOrderId on recovered primary, got: {r:?}"
+    );
+
+    // Clean up.
+    let _ = recovered.child.kill();
+    let _ = recovered.child.wait();
+}
+
+/// Reconnect with the SAME key after failover and retry the last request.
+/// The per-key request sequence HWM must reject it as DuplicateRequest
+/// (not re-execute it). This tests that the per-key dedup state survives
+/// replication and promotion.
+#[test]
+fn same_key_retry_after_failover_is_rejected() {
+    let mut cluster = TestCluster::start();
+    let mut client = cluster.connect_primary();
+
+    // Submit 10 orders. The client's internal next_seq reaches 10.
+    for i in 1..=10u64 {
+        submit_order(&mut client, i, 1, 1, Side::Buy, 100, 10);
+    }
+
+    cluster.wait_replicated();
+
+    // Record the client's last request sequence (next_seq was incremented
+    // to 10 after the 10th send_request). We'll need to replicate this
+    // exact state on the new connection.
+    drop(client);
+
+    // Kill + promote.
+    let promote_addr: SocketAddr =
+        format!("127.0.0.1:{}", cluster.promote_port).parse().unwrap();
+    unsafe {
+        libc::kill(cluster.primary.child.id() as i32, libc::SIGKILL);
+    }
+    let _ = cluster.primary.child.wait();
+    promote(promote_addr);
+    wait_healthy(cluster.replica.health_addr, Duration::from_secs(30));
+    std::thread::sleep(Duration::from_secs(1));
+
+    // Reconnect with the SAME key (key, not key2). The promoted replica's
+    // per-key HWM for this key should be 10 (from the 10 requests above).
+    // A fresh Client starts at next_seq=0, so the first send uses seq=1.
+    // Since 1 <= 10 (the HWM), it should be rejected as DuplicateRequest.
+    let mut client_retry = Client::connect(cluster.replica.client_addr, &cluster.key)
+        .expect("reconnect with same key");
+    let r = submit_order(&mut client_retry, 11, 1, 1, Side::Buy, 100, 10);
+    assert!(
+        has_report(&r, |rep| matches!(
+            rep,
+            melin_protocol::types::ExecutionReport::Rejected {
+                reason: melin_protocol::types::RejectReason::DuplicateRequest,
+                ..
+            }
+        )),
+        "expected DuplicateRequest for stale seq on same key, got: {r:?}"
     );
 }
