@@ -125,10 +125,11 @@ The TCP network stack is now the primary throughput limiter. The journal pipelin
 
 ### Matching Engine ([docs/matching-engine.md](docs/matching-engine.md))
 - Strict price-time priority (sorted Vec + binary search order book)
-- Execution reports: Fill (with fees), Placed, Triggered, Cancelled, Rejected, Replaced
+- Execution reports: Fill (with fees), Placed, Triggered, Cancelled, Rejected, Replaced, InstrumentStatusChanged
 - Multi-instrument exchange with shared account balances
 - Cancel-replace / order amendment (atomic price/qty modify; preserves queue priority when price unchanged, loses priority on price change)
 - Circuit breakers (price bands, trading halts — per-instrument `CircuitBreakerConfig`)
+- Instrument lifecycle management (disable/enable/remove — disable cancels all resting orders atomically, remove reclaims memory)
 
 ### Fees ([docs/fee-model.md](docs/fee-model.md))
 - Maker/taker fee model (per-instrument `FeeSchedule` in basis points, configurable via admin API)
@@ -164,7 +165,7 @@ The TCP network stack is now the primary throughput limiter. The journal pipelin
 ### Authentication & Authorization ([docs/admin-guide.md](docs/admin-guide.md))
 - Client authentication (Ed25519 challenge-response handshake)
 - Four permission roles with separation of duties: Operator (exchange configuration), Trader (order submission/cancellation), Custodian (deposit/withdraw), ReadOnly (heartbeats)
-- Operator API (instrument management, circuit breaker controls, kill switch, risk limits, fee schedules, end-of-day, live stats dashboard)
+- Operator API (instrument management, instrument lifecycle (disable/enable/remove), circuit breaker controls, kill switch, risk limits, fee schedules, end-of-day, live stats dashboard)
 - Idempotency for admin operations (per-key sequence numbers with duplicate rejection — safe to retry on timeout without double-applying)
 
 ### Operations & Reliability ([docs/operations.md](docs/operations.md))

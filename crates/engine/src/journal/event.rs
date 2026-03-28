@@ -76,6 +76,14 @@ pub enum JournalEvent {
     /// Expire all resting orders and pending stops with `TimeInForce::GTD`
     /// whose `expiry_ns` <= `timestamp_ns`. Triggered by an operator.
     ExpireOrders { timestamp_ns: u64 },
+    /// Disable an instrument: reject new orders and cancel all resting
+    /// orders and pending stops. Re-enable is possible.
+    DisableInstrument { symbol: Symbol },
+    /// Re-enable a disabled instrument for trading.
+    EnableInstrument { symbol: Symbol },
+    /// Permanently remove a disabled instrument. Only succeeds if the
+    /// instrument is disabled and has no resting orders.
+    RemoveInstrument { symbol: Symbol },
     /// Query server stats. Not journaled (no state change) — the journal
     /// stage skips this variant. Flows through the pipeline so the matching
     /// stage can read Exchange state without concurrency issues.

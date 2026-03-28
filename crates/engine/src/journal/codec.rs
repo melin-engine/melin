@@ -81,6 +81,9 @@ const TAG_PROVISION_ACCOUNT: u8 = 12;
 const TAG_WITHDRAW: u8 = 13;
 const TAG_END_OF_DAY: u8 = 14;
 const TAG_EXPIRE_ORDERS: u8 = 15;
+const TAG_DISABLE_INSTRUMENT: u8 = 16;
+const TAG_ENABLE_INSTRUMENT: u8 = 17;
+const TAG_REMOVE_INSTRUMENT: u8 = 18;
 
 /// OrderType tag encoding (codec-specific, not shared — order types are only
 /// in the journal format, not in snapshots).
@@ -272,6 +275,21 @@ pub fn encode(
             le::put_u64(&mut buf[pos..], *timestamp_ns);
             pos += 8;
             TAG_EXPIRE_ORDERS
+        }
+        JournalEvent::DisableInstrument { symbol } => {
+            le::put_u32(&mut buf[pos..], symbol.0);
+            pos += 4;
+            TAG_DISABLE_INSTRUMENT
+        }
+        JournalEvent::EnableInstrument { symbol } => {
+            le::put_u32(&mut buf[pos..], symbol.0);
+            pos += 4;
+            TAG_ENABLE_INSTRUMENT
+        }
+        JournalEvent::RemoveInstrument { symbol } => {
+            le::put_u32(&mut buf[pos..], symbol.0);
+            pos += 4;
+            TAG_REMOVE_INSTRUMENT
         }
         JournalEvent::QueryStats => {
             // QueryStats is never journaled — the journal stage filters it
@@ -770,6 +788,39 @@ pub fn decode(
                 timestamp_ns: le::get_u64(&payload[0..]),
             }
         }
+        TAG_DISABLE_INSTRUMENT => {
+            if payload.len() < 4 {
+                return Err(JournalError::CorruptEntry {
+                    sequence,
+                    reason: "DisableInstrument payload too short",
+                });
+            }
+            JournalEvent::DisableInstrument {
+                symbol: Symbol(le::get_u32(&payload[0..])),
+            }
+        }
+        TAG_ENABLE_INSTRUMENT => {
+            if payload.len() < 4 {
+                return Err(JournalError::CorruptEntry {
+                    sequence,
+                    reason: "EnableInstrument payload too short",
+                });
+            }
+            JournalEvent::EnableInstrument {
+                symbol: Symbol(le::get_u32(&payload[0..])),
+            }
+        }
+        TAG_REMOVE_INSTRUMENT => {
+            if payload.len() < 4 {
+                return Err(JournalError::CorruptEntry {
+                    sequence,
+                    reason: "RemoveInstrument payload too short",
+                });
+            }
+            JournalEvent::RemoveInstrument {
+                symbol: Symbol(le::get_u32(&payload[0..])),
+            }
+        }
         _ => {
             return Err(JournalError::CorruptEntry {
                 sequence,
@@ -1125,6 +1176,9 @@ mod tests {
                     expiry_ns: 1_800_000_000_000_000_000,
                 },
             },
+            JournalEvent::DisableInstrument { symbol: Symbol(1) },
+            JournalEvent::EnableInstrument { symbol: Symbol(1) },
+            JournalEvent::RemoveInstrument { symbol: Symbol(1) },
         ]
     }
 

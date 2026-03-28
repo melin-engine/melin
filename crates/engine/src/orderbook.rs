@@ -1474,12 +1474,48 @@ impl OrderBook {
         });
     }
 
-    #[cfg(test)]
-    fn is_empty(&self) -> bool {
+    /// Returns true if the book has no resting orders and no pending stops.
+    pub fn is_empty(&self) -> bool {
         self.bids.is_empty()
             && self.asks.is_empty()
             && self.stop_buys.is_empty()
             && self.stop_sells.is_empty()
+    }
+
+    /// Cancel ALL resting orders and pending stops regardless of account or TIF.
+    /// Used when disabling an instrument. Same pattern as `cancel_day_orders` —
+    /// collect IDs first, then cancel to avoid borrowing conflicts.
+    pub fn cancel_all_orders(&mut self, reports: &mut Vec<ExecutionReport>) {
+        self.consumed_slots.clear();
+        let mut to_cancel: Vec<(AccountId, OrderId)> = Vec::new();
+
+        for (_, queue) in &self.bids.levels {
+            for order in queue {
+                to_cancel.push((order.account, order.id));
+            }
+        }
+        for (_, queue) in &self.asks.levels {
+            for order in queue {
+                to_cancel.push((order.account, order.id));
+            }
+        }
+
+        for stops in self.stop_buys.values() {
+            for stop in stops {
+                to_cancel.push((stop.account, stop.id));
+            }
+        }
+        for stops in self.stop_sells.values() {
+            for stop in stops {
+                to_cancel.push((stop.account, stop.id));
+            }
+        }
+
+        for (account, id) in to_cancel {
+            if let Some((side, slot)) = self.cancel(account, id, reports) {
+                self.consumed_slots.push((account, id, side, slot));
+            }
+        }
     }
 
     fn opposite_side(&self, side: Side) -> &BookSide {

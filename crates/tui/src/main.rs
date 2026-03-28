@@ -17,8 +17,8 @@ use ratatui::widgets::{Block, Borders, Clear, List, ListItem, Paragraph};
 use melin_client::Client;
 use melin_protocol::message::{Request, ResponseKind};
 use melin_protocol::types::{
-    AccountId, ExecutionReport, Order, OrderId, OrderType, Price, Quantity, RejectReason,
-    SelfTradeProtection, Side, Symbol, TimeInForce,
+    AccountId, ExecutionReport, InstrumentStatus, Order, OrderId, OrderType, Price, Quantity,
+    RejectReason, SelfTradeProtection, Side, Symbol, TimeInForce,
 };
 
 // ── Menu definitions ────────────────────────────────────────────────
@@ -493,6 +493,7 @@ fn format_report(report: &ExecutionReport) -> String {
                 RejectReason::DuplicateRequest => "duplicate request",
                 RejectReason::ReplicaDisconnected => "replica disconnected",
                 RejectReason::InvalidExpiry => "invalid expiry",
+                RejectReason::InstrumentDisabled => "instrument disabled",
             };
             format!("REJECT  #{} ({reason_str})", order_id.0)
         }
@@ -509,6 +510,14 @@ fn format_report(report: &ExecutionReport) -> String {
                 "REPLACE #{} {} @{}→{} x{}→{}",
                 order_id.0, side_str, old_price.0, new_price.0, old_remaining.0, new_remaining.0,
             )
+        }
+        ExecutionReport::InstrumentStatusChanged { symbol, status } => {
+            let status_str = match status {
+                InstrumentStatus::Enabled => "ENABLED",
+                InstrumentStatus::Disabled => "DISABLED",
+                InstrumentStatus::Removed => "REMOVED",
+            };
+            format!("INSTRUMENT {} → {}", symbol.0, status_str)
         }
     }
 }

@@ -84,6 +84,15 @@ pub enum Request {
     /// whose `expiry_ns` <= `timestamp_ns`. Triggered by an operator.
     ExpireOrders { timestamp_ns: u64 },
 
+    /// Disable an instrument: reject new orders and cancel all resting
+    /// orders and pending stops. Re-enable is possible.
+    DisableInstrument { symbol: Symbol },
+    /// Re-enable a previously disabled instrument for trading.
+    EnableInstrument { symbol: Symbol },
+    /// Permanently remove a disabled instrument. Only succeeds if the
+    /// instrument is disabled and has no resting orders.
+    RemoveInstrument { symbol: Symbol },
+
     // --- Query operations (Admin only) ---
     /// Request a snapshot of server stats (connections, throughput, book
     /// depth, balances). Tag-only, no payload. Flows through the pipeline
@@ -119,6 +128,9 @@ impl Request {
                 | Request::SetFeeSchedule { .. }
                 | Request::EndOfDay
                 | Request::ExpireOrders { .. }
+                | Request::DisableInstrument { .. }
+                | Request::EnableInstrument { .. }
+                | Request::RemoveInstrument { .. }
                 | Request::QueryStats
         )
     }

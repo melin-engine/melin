@@ -1018,6 +1018,15 @@ fn replay_event(
         } => {
             let _ = exchange.withdraw(*account, *currency, *amount);
         }
+        JournalEvent::DisableInstrument { symbol } => {
+            exchange.disable_instrument(*symbol, reports);
+        }
+        JournalEvent::EnableInstrument { symbol } => {
+            exchange.enable_instrument(*symbol, reports);
+        }
+        JournalEvent::RemoveInstrument { symbol } => {
+            exchange.remove_instrument(*symbol, reports);
+        }
         JournalEvent::QueryStats
         | JournalEvent::GenesisHash { .. }
         | JournalEvent::Checkpoint { .. } => {

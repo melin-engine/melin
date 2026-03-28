@@ -141,6 +141,42 @@ impl JournaledExchange {
         Ok(())
     }
 
+    /// Disable an instrument. Journals before executing.
+    pub fn disable_instrument(
+        &mut self,
+        symbol: Symbol,
+        reports: &mut Vec<ExecutionReport>,
+    ) -> Result<(), JournalError> {
+        self.writer
+            .append(&JournalEvent::DisableInstrument { symbol })?;
+        self.exchange.disable_instrument(symbol, reports);
+        Ok(())
+    }
+
+    /// Re-enable a disabled instrument. Journals before executing.
+    pub fn enable_instrument(
+        &mut self,
+        symbol: Symbol,
+        reports: &mut Vec<ExecutionReport>,
+    ) -> Result<(), JournalError> {
+        self.writer
+            .append(&JournalEvent::EnableInstrument { symbol })?;
+        self.exchange.enable_instrument(symbol, reports);
+        Ok(())
+    }
+
+    /// Remove a disabled instrument. Journals before executing.
+    pub fn remove_instrument(
+        &mut self,
+        symbol: Symbol,
+        reports: &mut Vec<ExecutionReport>,
+    ) -> Result<(), JournalError> {
+        self.writer
+            .append(&JournalEvent::RemoveInstrument { symbol })?;
+        self.exchange.remove_instrument(symbol, reports);
+        Ok(())
+    }
+
     /// Recover from an existing journal file by replaying all events.
     ///
     /// Truncates any trailing garbage from a partial write (crash recovery),
@@ -410,6 +446,15 @@ fn replay_event(
             // non-fatal on replay — the journal recorded the attempt, and
             // the original error was already returned to the client.
             let _ = exchange.withdraw(account, currency, amount);
+        }
+        JournalEvent::DisableInstrument { symbol } => {
+            exchange.disable_instrument(symbol, reports);
+        }
+        JournalEvent::EnableInstrument { symbol } => {
+            exchange.enable_instrument(symbol, reports);
+        }
+        JournalEvent::RemoveInstrument { symbol } => {
+            exchange.remove_instrument(symbol, reports);
         }
         JournalEvent::QueryStats => {
             // QueryStats is never journaled, so it should never appear

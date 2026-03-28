@@ -21,7 +21,7 @@ mod fuzz_tests;
 pub mod types {
     pub use melin_engine::types::{
         AccountId, CircuitBreakerConfig, CurrencyId, ExecutionReport, FeeSchedule, InstrumentSpec,
-        Order, OrderId, OrderType, Price, Quantity, RejectReason, RiskLimits, SelfTradeProtection,
-        Side, Symbol, TimeInForce,
+        InstrumentStatus, Order, OrderId, OrderType, Price, Quantity, RejectReason, RiskLimits,
+        SelfTradeProtection, Side, Symbol, TimeInForce,
     };
 }

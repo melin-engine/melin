@@ -113,7 +113,7 @@ fn journal_event_from_bytes(data: &[u8]) -> Option<JournalEvent> {
         return None;
     }
 
-    match data[0] % 7 {
+    match data[0] % 11 {
         0 => {
             // AddInstrument.
             Some(JournalEvent::AddInstrument {
@@ -230,6 +230,24 @@ fn journal_event_from_bytes(data: &[u8]) -> Option<JournalEvent> {
             // CancelAll.
             Some(JournalEvent::CancelAll {
                 account: AccountId(u32_at(data, 1)?),
+            })
+        }
+        7 => {
+            // DisableInstrument.
+            Some(JournalEvent::DisableInstrument {
+                symbol: Symbol(u32_at(data, 1)?),
+            })
+        }
+        8 => {
+            // EnableInstrument.
+            Some(JournalEvent::EnableInstrument {
+                symbol: Symbol(u32_at(data, 1)?),
+            })
+        }
+        9 => {
+            // RemoveInstrument.
+            Some(JournalEvent::RemoveInstrument {
+                symbol: Symbol(u32_at(data, 1)?),
             })
         }
         _ => {

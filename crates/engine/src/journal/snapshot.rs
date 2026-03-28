@@ -56,7 +56,8 @@ const SNAP_MAGIC: u32 = 0x534E_4150;
 /// v7 → v8: order_index and stop_index now store AccountId (21 bytes/entry vs 17).
 /// v8 → v9: added per-key request sequence HWMs for admin idempotency.
 /// v10 → v11: added expiry_ns to resting orders and pending stops (GTD support).
-const SNAP_VERSION: u16 = 11;
+/// v11 → v12: added per-instrument disabled flag for instrument lifecycle management.
+const SNAP_VERSION: u16 = 12;
 
 /// Snapshot header size: magic(4) + version(2) + reserved(2) + sequence(8) + chain_hash(32) = 48.
 const SNAP_HEADER_SIZE: usize = 48;
@@ -148,7 +149,7 @@ pub fn load(path: &Path) -> Result<(Exchange, u64, [u8; 32]), JournalError> {
     // v5 header is 16 bytes, v6+ header is 48 bytes (adds 32-byte chain_hash).
     let (header_size, has_chain_hash) = match version {
         5 => (16usize, false),
-        6..=11 => (SNAP_HEADER_SIZE, true),
+        6..=12 => (SNAP_HEADER_SIZE, true),
         _ => return Err(JournalError::UnsupportedVersion { version }),
     };
 
@@ -214,6 +215,8 @@ pub(crate) struct ExchangeSnapshot {
     pub(crate) fee_schedules: Vec<(Symbol, FeeSchedule)>,
     /// Per-key request sequence HWMs for admin idempotency (v9+).
     pub(crate) key_hwm: Vec<(u64, u64)>,
+    /// Set of disabled instrument symbols (v12+).
+    pub(crate) disabled_instruments: Vec<Symbol>,
 }
 
 /// Serialized order book state for a single instrument.
@@ -362,6 +365,12 @@ fn encode_exchange_state(state: &ExchangeSnapshot, buf: &mut Vec<u8>) {
     for (key_hash, hwm) in &state.key_hwm {
         le::push_u64(buf, *key_hash);
         le::push_u64(buf, *hwm);
+    }
+
+    // Disabled instruments (v12+).
+    le::push_u32(buf, state.disabled_instruments.len() as u32);
+    for symbol in &state.disabled_instruments {
+        le::push_u32(buf, symbol.0);
     }
 }
 
@@ -758,6 +767,24 @@ fn decode_exchange_state(
         Vec::new()
     };
 
+    // Disabled instruments (v12+).
+    let disabled_instruments = if version >= 12 && pos < buf.len() {
+        check(pos, 4)?;
+        let n = le::get_u32(&buf[pos..]) as usize;
+        pos += 4;
+        // Each entry: symbol(4) = 4 bytes.
+        validate_count(buf.len() - pos, n, 4)?;
+        let mut disabled = Vec::with_capacity(n);
+        for _ in 0..n {
+            check(pos, 4)?;
+            disabled.push(Symbol(le::get_u32(&buf[pos..])));
+            pos += 4;
+        }
+        disabled
+    } else {
+        Vec::new()
+    };
+
     Ok((
         pos,
         ExchangeSnapshot {
@@ -771,6 +798,7 @@ fn decode_exchange_state(
             circuit_breakers,
             fee_schedules,
             key_hwm,
+            disabled_instruments,
         },
     ))
 }
@@ -1115,6 +1143,7 @@ impl Exchange {
         let circuit_breakers = self.snapshot_circuit_breakers();
         let fee_schedules = self.snapshot_fee_schedules();
         let key_hwm = self.snapshot_key_hwm();
+        let disabled_instruments = self.snapshot_disabled_instruments();
 
         ExchangeSnapshot {
             instruments,
@@ -1127,6 +1156,7 @@ impl Exchange {
             circuit_breakers,
             fee_schedules,
             key_hwm,
+            disabled_instruments,
         }
     }
 
@@ -1143,6 +1173,8 @@ impl Exchange {
         let cb_map: StdHashMap<Symbol, CircuitBreakerConfig> =
             state.circuit_breakers.into_iter().collect();
         let fee_map: StdHashMap<Symbol, FeeSchedule> = state.fee_schedules.into_iter().collect();
+        let disabled_set: std::collections::HashSet<Symbol> =
+            state.disabled_instruments.into_iter().collect();
 
         // Assemble consolidated InstrumentState Vec indexed by Symbol.0.
         let max_sym = state
@@ -1162,6 +1194,7 @@ impl Exchange {
                 risk_limits: risk_map.get(&spec.symbol).copied().unwrap_or_default(),
                 circuit_breaker: cb_map.get(&spec.symbol).copied().unwrap_or_default(),
                 fee_schedule: fee_map.get(&spec.symbol).copied().unwrap_or_default(),
+                disabled: disabled_set.contains(&spec.symbol),
             }));
         }
 

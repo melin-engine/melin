@@ -31,7 +31,8 @@ use std::num::NonZeroU64;
 use melin_engine::le;
 use melin_engine::types::{
     AccountId, CircuitBreakerConfig, CurrencyId, ExecutionReport, FeeSchedule, InstrumentSpec,
-    Order, OrderId, OrderType, Price, Quantity, RejectReason, RiskLimits, Symbol, TimeInForce,
+    InstrumentStatus, Order, OrderId, OrderType, Price, Quantity, RejectReason, RiskLimits, Symbol,
+    TimeInForce,
 };
 
 use crate::error::ProtocolError;
@@ -53,6 +54,9 @@ const TAG_QUERY_STATS: u8 = 30;
 const TAG_WITHDRAW: u8 = 32;
 const TAG_END_OF_DAY: u8 = 33;
 const TAG_EXPIRE_ORDERS: u8 = 34;
+const TAG_DISABLE_INSTRUMENT: u8 = 35;
+const TAG_ENABLE_INSTRUMENT: u8 = 36;
+const TAG_REMOVE_INSTRUMENT: u8 = 37;
 
 // --- Response tags ---
 const TAG_PLACED: u8 = 11;
@@ -70,6 +74,7 @@ const TAG_REPLACED: u8 = 22;
 const TAG_STATS_HEADER: u8 = 23;
 /// Server pipeline full — client should retry after backoff.
 const TAG_SERVER_BUSY: u8 = 24;
+const TAG_INSTRUMENT_STATUS_CHANGED: u8 = 25;
 
 // --- OrderType tags (wire-specific, not shared with journal) ---
 const ORDER_TYPE_MARKET: u8 = 0;
@@ -97,6 +102,7 @@ const REJECT_HAS_RESTING_ORDERS: u8 = 14;
 const REJECT_DUPLICATE_REQUEST: u8 = 15;
 const REJECT_REPLICA_DISCONNECTED: u8 = 16;
 const REJECT_INVALID_EXPIRY: u8 = 17;
+const REJECT_INSTRUMENT_DISABLED: u8 = 18;
 
 /// Encode a request into `buf`. Returns total bytes written (length prefix + seq + tag + payload).
 ///
@@ -272,6 +278,24 @@ pub fn encode_request(request: &Request, seq: u64, buf: &mut [u8]) -> Result<usi
             pos += 1;
             le::put_u64(&mut buf[pos..], *timestamp_ns);
             pos += 8;
+        }
+        Request::DisableInstrument { symbol } => {
+            buf[pos] = TAG_DISABLE_INSTRUMENT;
+            pos += 1;
+            le::put_u32(&mut buf[pos..], symbol.0);
+            pos += 4;
+        }
+        Request::EnableInstrument { symbol } => {
+            buf[pos] = TAG_ENABLE_INSTRUMENT;
+            pos += 1;
+            le::put_u32(&mut buf[pos..], symbol.0);
+            pos += 4;
+        }
+        Request::RemoveInstrument { symbol } => {
+            buf[pos] = TAG_REMOVE_INSTRUMENT;
+            pos += 1;
+            le::put_u32(&mut buf[pos..], symbol.0);
+            pos += 4;
         }
     }
 
@@ -527,6 +551,39 @@ pub fn decode_request(buf: &[u8]) -> Result<(u64, Request), ProtocolError> {
                 },
             ))
         }
+        TAG_DISABLE_INSTRUMENT => {
+            if payload.len() < 4 {
+                return Err(ProtocolError::Truncated);
+            }
+            Ok((
+                seq,
+                Request::DisableInstrument {
+                    symbol: Symbol(le::get_u32(&payload[0..])),
+                },
+            ))
+        }
+        TAG_ENABLE_INSTRUMENT => {
+            if payload.len() < 4 {
+                return Err(ProtocolError::Truncated);
+            }
+            Ok((
+                seq,
+                Request::EnableInstrument {
+                    symbol: Symbol(le::get_u32(&payload[0..])),
+                },
+            ))
+        }
+        TAG_REMOVE_INSTRUMENT => {
+            if payload.len() < 4 {
+                return Err(ProtocolError::Truncated);
+            }
+            Ok((
+                seq,
+                Request::RemoveInstrument {
+                    symbol: Symbol(le::get_u32(&payload[0..])),
+                },
+            ))
+        }
         _ => Err(ProtocolError::UnknownTag(tag)),
     }
 }
@@ -617,7 +674,13 @@ pub fn decode_response(buf: &[u8]) -> Result<ResponseKind, ProtocolError> {
         }
         TAG_AUTH_FAILED => Ok(ResponseKind::AuthFailed),
         TAG_SERVER_BUSY => Ok(ResponseKind::ServerBusy),
-        TAG_PLACED | TAG_FILL | TAG_CANCELLED | TAG_TRIGGERED | TAG_REJECTED | TAG_REPLACED => {
+        TAG_PLACED
+        | TAG_FILL
+        | TAG_CANCELLED
+        | TAG_TRIGGERED
+        | TAG_REJECTED
+        | TAG_REPLACED
+        | TAG_INSTRUMENT_STATUS_CHANGED => {
             let report = decode_execution_report(tag, payload)?;
             Ok(ResponseKind::Report(report))
         }
@@ -922,6 +985,14 @@ fn encode_execution_report(report: &ExecutionReport, buf: &mut [u8]) -> usize {
             le::put_u64(&mut buf[pos..], new_remaining.get());
             pos += 8;
         }
+        ExecutionReport::InstrumentStatusChanged { symbol, status } => {
+            buf[pos] = TAG_INSTRUMENT_STATUS_CHANGED;
+            pos += 1;
+            le::put_u32(&mut buf[pos..], symbol.0);
+            pos += 4;
+            buf[pos] = *status as u8;
+            pos += 1;
+        }
     }
 
     pos
@@ -1039,6 +1110,20 @@ fn decode_execution_report(tag: u8, payload: &[u8]) -> Result<ExecutionReport, P
                 new_remaining: Quantity(new_remaining),
             })
         }
+        TAG_INSTRUMENT_STATUS_CHANGED => {
+            // symbol(4) + status(1) = 5
+            if payload.len() < 5 {
+                return Err(ProtocolError::Truncated);
+            }
+            let symbol = Symbol(le::get_u32(&payload[0..]));
+            let status = match payload[4] {
+                0 => InstrumentStatus::Enabled,
+                1 => InstrumentStatus::Disabled,
+                2 => InstrumentStatus::Removed,
+                _ => return Err(ProtocolError::InvalidField("instrument status")),
+            };
+            Ok(ExecutionReport::InstrumentStatusChanged { symbol, status })
+        }
         _ => Err(ProtocolError::UnknownTag(tag)),
     }
 }
@@ -1063,6 +1148,7 @@ fn encode_reject_reason(reason: RejectReason) -> u8 {
         RejectReason::DuplicateRequest => REJECT_DUPLICATE_REQUEST,
         RejectReason::ReplicaDisconnected => REJECT_REPLICA_DISCONNECTED,
         RejectReason::InvalidExpiry => REJECT_INVALID_EXPIRY,
+        RejectReason::InstrumentDisabled => REJECT_INSTRUMENT_DISABLED,
     }
 }
 
@@ -1086,6 +1172,7 @@ fn decode_reject_reason(b: u8) -> Result<RejectReason, ProtocolError> {
         REJECT_DUPLICATE_REQUEST => Ok(RejectReason::DuplicateRequest),
         REJECT_REPLICA_DISCONNECTED => Ok(RejectReason::ReplicaDisconnected),
         REJECT_INVALID_EXPIRY => Ok(RejectReason::InvalidExpiry),
+        REJECT_INSTRUMENT_DISABLED => Ok(RejectReason::InstrumentDisabled),
         _ => Err(ProtocolError::InvalidField("reject reason")),
     }
 }
@@ -1271,6 +1358,9 @@ mod tests {
                     expiry_ns: 1_800_000_000_000_000_000,
                 },
             },
+            Request::DisableInstrument { symbol: Symbol(1) },
+            Request::EnableInstrument { symbol: Symbol(2) },
+            Request::RemoveInstrument { symbol: Symbol(3) },
         ]
     }
 
@@ -1385,6 +1475,28 @@ mod tests {
                 order_id: OrderId(21),
                 account: AccountId(10),
                 reason: RejectReason::ReplicaDisconnected,
+            }),
+            ResponseKind::Report(ExecutionReport::Rejected {
+                order_id: OrderId(22),
+                account: AccountId(10),
+                reason: RejectReason::InvalidExpiry,
+            }),
+            ResponseKind::Report(ExecutionReport::Rejected {
+                order_id: OrderId(23),
+                account: AccountId(10),
+                reason: RejectReason::InstrumentDisabled,
+            }),
+            ResponseKind::Report(ExecutionReport::InstrumentStatusChanged {
+                symbol: Symbol(1),
+                status: InstrumentStatus::Disabled,
+            }),
+            ResponseKind::Report(ExecutionReport::InstrumentStatusChanged {
+                symbol: Symbol(2),
+                status: InstrumentStatus::Enabled,
+            }),
+            ResponseKind::Report(ExecutionReport::InstrumentStatusChanged {
+                symbol: Symbol(3),
+                status: InstrumentStatus::Removed,
             }),
             ResponseKind::Report(ExecutionReport::Replaced {
                 order_id: OrderId(42),

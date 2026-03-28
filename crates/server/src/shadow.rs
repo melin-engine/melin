@@ -179,6 +179,15 @@ fn dispatch_event(
             // Best-effort — shadow doesn't propagate withdrawal errors.
             let _ = exchange.withdraw(account, currency, amount);
         }
+        JournalEvent::DisableInstrument { symbol } => {
+            exchange.disable_instrument(symbol, reports);
+        }
+        JournalEvent::EnableInstrument { symbol } => {
+            exchange.enable_instrument(symbol, reports);
+        }
+        JournalEvent::RemoveInstrument { symbol } => {
+            exchange.remove_instrument(symbol, reports);
+        }
         JournalEvent::QueryStats => {
             // Read-only — no state change.
         }
@@ -384,13 +393,46 @@ mod tests {
             },
             // --- No-ops that should not affect state ---
             JournalEvent::QueryStats,
-            JournalEvent::GenesisHash {
-                hash: [0xAA; 32],
-            },
+            JournalEvent::GenesisHash { hash: [0xAA; 32] },
             JournalEvent::Checkpoint {
                 chain_hash: [0xBB; 32],
                 events_since_checkpoint: 99,
             },
+            // --- Instrument lifecycle ---
+            // Add a second instrument, place an order, then disable (cancels order),
+            // enable, and disable+remove.
+            JournalEvent::AddInstrument {
+                spec: InstrumentSpec {
+                    symbol: Symbol(2),
+                    base: CurrencyId(2),
+                    quote: CurrencyId(1),
+                },
+            },
+            JournalEvent::Deposit {
+                account: AccountId(1),
+                currency: CurrencyId(2),
+                amount: 10_000,
+            },
+            JournalEvent::SubmitOrder {
+                symbol: Symbol(2),
+                order: Order {
+                    id: OrderId(10),
+                    account: AccountId(1),
+                    side: Side::Buy,
+                    order_type: OrderType::Limit {
+                        price: price(50),
+                        post_only: false,
+                    },
+                    time_in_force: TimeInForce::GTC,
+                    quantity: qty(5),
+                    stp: SelfTradeProtection::Allow,
+                    expiry_ns: 0,
+                },
+            },
+            JournalEvent::DisableInstrument { symbol: Symbol(2) },
+            JournalEvent::EnableInstrument { symbol: Symbol(2) },
+            JournalEvent::DisableInstrument { symbol: Symbol(2) },
+            JournalEvent::RemoveInstrument { symbol: Symbol(2) },
             // --- End of day ---
             JournalEvent::EndOfDay,
         ];
@@ -464,6 +506,15 @@ mod tests {
                     amount,
                 } => {
                     let _ = primary.withdraw(account, currency, amount);
+                }
+                JournalEvent::DisableInstrument { symbol } => {
+                    primary.disable_instrument(symbol, &mut primary_reports);
+                }
+                JournalEvent::EnableInstrument { symbol } => {
+                    primary.enable_instrument(symbol, &mut primary_reports);
+                }
+                JournalEvent::RemoveInstrument { symbol } => {
+                    primary.remove_instrument(symbol, &mut primary_reports);
                 }
                 JournalEvent::QueryStats
                 | JournalEvent::GenesisHash { .. }

@@ -169,6 +169,19 @@ impl Price {
     }
 }
 
+/// Instrument lifecycle status, managed by operator commands.
+///
+/// `#[repr(u8)]` for stable wire encoding (1 byte in snapshot/protocol).
+/// Three-state lifecycle: Enabled (normal trading) → Disabled (no new orders,
+/// all resting orders cancelled) → Removed (slot freed for reuse).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum InstrumentStatus {
+    Enabled = 0,
+    Disabled = 1,
+    Removed = 2,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Side {
     Buy,
@@ -297,6 +310,11 @@ pub enum ExecutionReport {
         old_remaining: Quantity,
         new_remaining: Quantity,
     },
+    /// Instrument lifecycle status changed (disabled, enabled, or removed).
+    InstrumentStatusChanged {
+        symbol: Symbol,
+        status: InstrumentStatus,
+    },
 }
 
 /// Opaque handle to a reservation in the slab. O(1) Vec-indexed access,
@@ -362,6 +380,8 @@ pub enum RejectReason {
     /// GTD order with expiry_ns == 0 (missing expiry), or non-GTD order
     /// with expiry_ns != 0 (unexpected expiry).
     InvalidExpiry,
+    /// Instrument is disabled — no new orders or amendments accepted.
+    InstrumentDisabled,
 }
 
 #[cfg(test)]

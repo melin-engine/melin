@@ -1209,6 +1209,15 @@ impl MatchingStage {
             } => {
                 let _ = self.exchange.withdraw(account, currency, amount);
             }
+            JournalEvent::DisableInstrument { symbol } => {
+                self.exchange.disable_instrument(symbol, reports);
+            }
+            JournalEvent::EnableInstrument { symbol } => {
+                self.exchange.enable_instrument(symbol, reports);
+            }
+            JournalEvent::RemoveInstrument { symbol } => {
+                self.exchange.remove_instrument(symbol, reports);
+            }
             JournalEvent::QueryStats => {
                 // Handled inline in the run loop before process_event is called.
                 // This arm exists only for exhaustiveness.

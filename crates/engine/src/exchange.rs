@@ -12,8 +12,8 @@ use crate::account::AccountManager;
 use crate::orderbook::OrderBook;
 use crate::types::{
     AccountId, CircuitBreakerConfig, CurrencyId, ExecutionReport, FeeSchedule, HashMap, HashMap4,
-    InstrumentSpec, Order, OrderId, OrderType, Price, Quantity, RejectReason, ReservationSlot,
-    RiskLimits, Side, Symbol, TimeInForce,
+    InstrumentSpec, InstrumentStatus, Order, OrderId, OrderType, Price, Quantity, RejectReason,
+    ReservationSlot, RiskLimits, Side, Symbol, TimeInForce,
 };
 
 /// Helper: get an immutable reference to the InstrumentState at `symbol`.
@@ -47,6 +47,9 @@ pub(crate) struct InstrumentState {
     pub(crate) risk_limits: RiskLimits,
     pub(crate) circuit_breaker: CircuitBreakerConfig,
     pub(crate) fee_schedule: FeeSchedule,
+    /// When true, the instrument is disabled — no new orders or amendments
+    /// are accepted. All resting orders are cancelled on disable.
+    pub(crate) disabled: bool,
 }
 
 /// Top-level exchange managing multiple instruments.
@@ -331,6 +334,7 @@ impl Exchange {
                 risk_limits: RiskLimits::default(),
                 circuit_breaker: CircuitBreakerConfig::default(),
                 fee_schedule: FeeSchedule::default(),
+                disabled: false,
             }));
         }
     }
@@ -368,6 +372,16 @@ impl Exchange {
             });
             return;
         };
+        // Disabled instruments reject before HWM advance — the order is
+        // never "processed", same as UnknownSymbol.
+        if inst.disabled {
+            reports.push(ExecutionReport::Rejected {
+                order_id: order.id,
+                account: order.account,
+                reason: RejectReason::InstrumentDisabled,
+            });
+            return;
+        }
         // Copy spec before taking mutable borrow on instruments below.
         // InstrumentSpec is Copy (3 × u32 = 12 bytes).
         let spec = inst.spec;
@@ -768,6 +782,85 @@ impl Exchange {
         }
     }
 
+    /// Disable an instrument: reject future orders and cancel all resting
+    /// orders and pending stops. Idempotent — disabling an already-disabled
+    /// instrument is a no-op (no reports emitted).
+    pub fn disable_instrument(&mut self, symbol: Symbol, reports: &mut Vec<ExecutionReport>) {
+        let Some(inst) = inst_mut(&mut self.instruments, symbol) else {
+            return;
+        };
+        if inst.disabled {
+            return;
+        }
+        inst.disabled = true;
+
+        inst.book.cancel_all_orders(reports);
+
+        // Release reservations — same pattern as end_of_day.
+        for (account, _, _, slot) in inst.book.drain_consumed_slots() {
+            self.accounts.release(slot);
+            if let Some(count) = self.order_counts.get_mut(&account) {
+                *count = count.saturating_sub(1);
+                if *count == 0 {
+                    self.order_counts.remove(&account);
+                }
+            }
+        }
+
+        reports.push(ExecutionReport::InstrumentStatusChanged {
+            symbol,
+            status: InstrumentStatus::Disabled,
+        });
+    }
+
+    /// Re-enable a previously disabled instrument, allowing new orders.
+    pub fn enable_instrument(&mut self, symbol: Symbol, reports: &mut Vec<ExecutionReport>) {
+        let Some(inst) = inst_mut(&mut self.instruments, symbol) else {
+            return;
+        };
+        if !inst.disabled {
+            return;
+        }
+        inst.disabled = false;
+
+        reports.push(ExecutionReport::InstrumentStatusChanged {
+            symbol,
+            status: InstrumentStatus::Enabled,
+        });
+    }
+
+    /// Permanently remove a disabled instrument, reclaiming memory.
+    /// Only succeeds if the instrument is disabled and has no resting orders
+    /// (which disable guarantees). Active instruments must be disabled first.
+    pub fn remove_instrument(&mut self, symbol: Symbol, reports: &mut Vec<ExecutionReport>) {
+        let idx = symbol.0 as usize;
+        if idx >= self.instruments.len() {
+            return;
+        }
+        let dominated = self.instruments[idx]
+            .as_ref()
+            .is_some_and(|inst| inst.disabled && inst.book.is_empty());
+        if !dominated {
+            return;
+        }
+        self.instruments[idx] = None;
+
+        reports.push(ExecutionReport::InstrumentStatusChanged {
+            symbol,
+            status: InstrumentStatus::Removed,
+        });
+    }
+
+    /// Snapshot the disabled instrument symbols for serialization.
+    pub(crate) fn snapshot_disabled_instruments(&self) -> Vec<Symbol> {
+        self.instruments
+            .iter()
+            .filter_map(|slot| slot.as_deref())
+            .filter(|inst| inst.disabled)
+            .map(|inst| inst.spec.symbol)
+            .collect()
+    }
+
     /// Cancel a resting order on the given instrument.
     pub fn cancel(
         &mut self,
@@ -842,6 +935,17 @@ impl Exchange {
             });
             return;
         };
+
+        // Disabled instruments reject cancel-replace — all orders were
+        // already cancelled during disable.
+        if inst.disabled {
+            reports.push(ExecutionReport::Rejected {
+                order_id,
+                account,
+                reason: RejectReason::InstrumentDisabled,
+            });
+            return;
+        }
 
         // 1. Order must exist as a resting limit order.
         // Use peek_order_location (O(1) index lookup) for validation —
@@ -7124,5 +7228,305 @@ mod tests {
             0,
             "post-restore cancel: reservation not released"
         );
+    }
+
+    // --- Instrument lifecycle tests ---
+
+    #[test]
+    fn disable_instrument_cancels_all_orders() {
+        let mut exchange = Exchange::new();
+        exchange.add_instrument(btc_usd_spec());
+        exchange.deposit(ACCT_A, USD, 1_000_000);
+        exchange.deposit(ACCT_B, BTC, 1000);
+
+        let mut reports = Vec::new();
+        exchange.execute(
+            Symbol(1),
+            limit_order(1, ACCT_A, Side::Buy, 100, 10, TimeInForce::GTC),
+            &mut reports,
+        );
+        exchange.execute(
+            Symbol(1),
+            limit_order(2, ACCT_A, Side::Buy, 99, 20, TimeInForce::GTC),
+            &mut reports,
+        );
+        exchange.execute(
+            Symbol(1),
+            limit_order(100, ACCT_B, Side::Sell, 200, 5, TimeInForce::GTC),
+            &mut reports,
+        );
+        reports.clear();
+
+        exchange.disable_instrument(Symbol(1), &mut reports);
+
+        let cancelled_count = reports
+            .iter()
+            .filter(|r| matches!(r, ExecutionReport::Cancelled { .. }))
+            .count();
+        assert_eq!(cancelled_count, 3);
+        assert!(matches!(
+            reports.last().unwrap(),
+            ExecutionReport::InstrumentStatusChanged {
+                status: InstrumentStatus::Disabled,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn disable_instrument_releases_reservations() {
+        let mut exchange = Exchange::new();
+        exchange.add_instrument(btc_usd_spec());
+        exchange.deposit(ACCT_A, USD, 10_000);
+
+        let mut reports = Vec::new();
+        exchange.execute(
+            Symbol(1),
+            limit_order(1, ACCT_A, Side::Buy, 100, 50, TimeInForce::GTC),
+            &mut reports,
+        );
+        assert_eq!(exchange.accounts().balance(ACCT_A, USD).available, 5_000);
+        assert_eq!(exchange.accounts().balance(ACCT_A, USD).reserved, 5_000);
+
+        reports.clear();
+        exchange.disable_instrument(Symbol(1), &mut reports);
+
+        assert_eq!(exchange.accounts().balance(ACCT_A, USD).available, 10_000);
+        assert_eq!(exchange.accounts().balance(ACCT_A, USD).reserved, 0);
+    }
+
+    #[test]
+    fn disabled_instrument_rejects_new_orders() {
+        let mut exchange = Exchange::new();
+        exchange.add_instrument(btc_usd_spec());
+        exchange.deposit(ACCT_A, USD, 10_000);
+
+        let mut reports = Vec::new();
+        exchange.disable_instrument(Symbol(1), &mut reports);
+        reports.clear();
+
+        exchange.execute(
+            Symbol(1),
+            limit_order(1, ACCT_A, Side::Buy, 100, 10, TimeInForce::GTC),
+            &mut reports,
+        );
+        assert_eq!(reports.len(), 1);
+        assert!(matches!(
+            reports[0],
+            ExecutionReport::Rejected {
+                reason: RejectReason::InstrumentDisabled,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn enable_instrument_allows_trading() {
+        let mut exchange = Exchange::new();
+        exchange.add_instrument(btc_usd_spec());
+        exchange.deposit(ACCT_A, USD, 10_000);
+
+        let mut reports = Vec::new();
+        exchange.disable_instrument(Symbol(1), &mut reports);
+        reports.clear();
+
+        exchange.enable_instrument(Symbol(1), &mut reports);
+        assert!(matches!(
+            reports.last().unwrap(),
+            ExecutionReport::InstrumentStatusChanged {
+                status: InstrumentStatus::Enabled,
+                ..
+            }
+        ));
+        reports.clear();
+
+        exchange.execute(
+            Symbol(1),
+            limit_order(1, ACCT_A, Side::Buy, 100, 10, TimeInForce::GTC),
+            &mut reports,
+        );
+        assert!(matches!(reports[0], ExecutionReport::Placed { .. }));
+    }
+
+    #[test]
+    fn remove_only_when_disabled() {
+        let mut exchange = Exchange::new();
+        exchange.add_instrument(btc_usd_spec());
+
+        let mut reports = Vec::new();
+        exchange.remove_instrument(Symbol(1), &mut reports);
+        assert!(reports.is_empty());
+
+        exchange.deposit(ACCT_A, USD, 10_000);
+        exchange.execute(
+            Symbol(1),
+            limit_order(1, ACCT_A, Side::Buy, 100, 10, TimeInForce::GTC),
+            &mut reports,
+        );
+        assert!(matches!(reports[0], ExecutionReport::Placed { .. }));
+    }
+
+    #[test]
+    fn remove_frees_slot() {
+        let mut exchange = Exchange::new();
+        exchange.add_instrument(btc_usd_spec());
+
+        let mut reports = Vec::new();
+        exchange.disable_instrument(Symbol(1), &mut reports);
+        reports.clear();
+
+        exchange.remove_instrument(Symbol(1), &mut reports);
+        assert!(matches!(
+            reports.last().unwrap(),
+            ExecutionReport::InstrumentStatusChanged {
+                status: InstrumentStatus::Removed,
+                ..
+            }
+        ));
+        reports.clear();
+
+        exchange.deposit(ACCT_A, USD, 10_000);
+        exchange.execute(
+            Symbol(1),
+            limit_order(1, ACCT_A, Side::Buy, 100, 10, TimeInForce::GTC),
+            &mut reports,
+        );
+        assert!(matches!(
+            reports[0],
+            ExecutionReport::Rejected {
+                reason: RejectReason::UnknownSymbol,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn disable_is_idempotent() {
+        let mut exchange = Exchange::new();
+        exchange.add_instrument(btc_usd_spec());
+
+        let mut reports = Vec::new();
+        exchange.disable_instrument(Symbol(1), &mut reports);
+        reports.clear();
+
+        exchange.disable_instrument(Symbol(1), &mut reports);
+        assert!(reports.is_empty());
+    }
+
+    #[test]
+    fn add_after_remove() {
+        let mut exchange = Exchange::new();
+        exchange.add_instrument(btc_usd_spec());
+
+        let mut reports = Vec::new();
+        exchange.disable_instrument(Symbol(1), &mut reports);
+        exchange.remove_instrument(Symbol(1), &mut reports);
+        reports.clear();
+
+        exchange.add_instrument(btc_usd_spec());
+        exchange.deposit(ACCT_A, USD, 10_000);
+        exchange.execute(
+            Symbol(1),
+            limit_order(1, ACCT_A, Side::Buy, 100, 10, TimeInForce::GTC),
+            &mut reports,
+        );
+        assert!(matches!(reports[0], ExecutionReport::Placed { .. }));
+    }
+
+    #[test]
+    fn disable_cancels_pending_stops() {
+        let mut exchange = Exchange::new();
+        exchange.add_instrument(btc_usd_spec());
+        exchange.deposit(ACCT_A, USD, 1_000_000);
+
+        let mut reports = Vec::new();
+        exchange.execute(
+            Symbol(1),
+            Order {
+                id: OrderId(1),
+                account: ACCT_A,
+                side: Side::Buy,
+                order_type: OrderType::Stop {
+                    trigger_price: price(500),
+                },
+                time_in_force: TimeInForce::GTC,
+                quantity: qty(10),
+                stp: SelfTradeProtection::Allow,
+                expiry_ns: 0,
+            },
+            &mut reports,
+        );
+        reports.clear();
+
+        exchange.disable_instrument(Symbol(1), &mut reports);
+
+        let cancelled_count = reports
+            .iter()
+            .filter(|r| matches!(r, ExecutionReport::Cancelled { .. }))
+            .count();
+        assert_eq!(cancelled_count, 1);
+    }
+
+    #[test]
+    fn cancel_replace_on_disabled_instrument() {
+        let mut exchange = Exchange::new();
+        exchange.add_instrument(btc_usd_spec());
+        exchange.deposit(ACCT_A, USD, 10_000);
+
+        let mut reports = Vec::new();
+        exchange.execute(
+            Symbol(1),
+            limit_order(1, ACCT_A, Side::Buy, 100, 10, TimeInForce::GTC),
+            &mut reports,
+        );
+        reports.clear();
+
+        exchange.disable_instrument(Symbol(1), &mut reports);
+        reports.clear();
+
+        exchange.cancel_replace(
+            Symbol(1),
+            ACCT_A,
+            OrderId(1),
+            price(110),
+            qty(10),
+            &mut reports,
+        );
+        assert_eq!(reports.len(), 1);
+        assert!(matches!(
+            reports[0],
+            ExecutionReport::Rejected {
+                reason: RejectReason::InstrumentDisabled,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn cancel_on_disabled_instrument_is_noop() {
+        let mut exchange = Exchange::new();
+        exchange.add_instrument(btc_usd_spec());
+        exchange.deposit(ACCT_A, USD, 10_000);
+
+        let mut reports = Vec::new();
+        exchange.execute(
+            Symbol(1),
+            limit_order(1, ACCT_A, Side::Buy, 100, 10, TimeInForce::GTC),
+            &mut reports,
+        );
+        reports.clear();
+
+        exchange.disable_instrument(Symbol(1), &mut reports);
+        assert_eq!(
+            reports
+                .iter()
+                .filter(|r| matches!(r, ExecutionReport::Cancelled { .. }))
+                .count(),
+            1
+        );
+        reports.clear();
+
+        exchange.cancel(Symbol(1), ACCT_A, OrderId(1), &mut reports);
+        assert!(reports.is_empty());
     }
 }

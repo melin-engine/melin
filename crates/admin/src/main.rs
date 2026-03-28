@@ -23,8 +23,8 @@ use melin_client::{Client, StatsSnapshot};
 use melin_protocol::message::{Request, ResponseKind};
 use melin_protocol::types::{
     AccountId, CircuitBreakerConfig, CurrencyId, ExecutionReport, FeeSchedule, InstrumentSpec,
-    Order, OrderId, OrderType, Price, Quantity, RejectReason, RiskLimits, SelfTradeProtection,
-    Side, Symbol, TimeInForce,
+    InstrumentStatus, Order, OrderId, OrderType, Price, Quantity, RejectReason, RiskLimits,
+    SelfTradeProtection, Side, Symbol, TimeInForce,
 };
 
 // ── Menu definitions ────────────────────────────────────────────────
@@ -51,6 +51,10 @@ const ACTIONS: &[&str] = &[
     "Set Fee Schedule",
     "End of Day",
     "Expire Orders (GTD)",
+    // Lifecycle (18-20)
+    "Disable Instrument",
+    "Enable Instrument",
+    "Remove Instrument",
 ];
 
 const TIF_OPTIONS: &[(&str, TimeInForce)] = &[
@@ -227,6 +231,12 @@ enum NextStep {
     FeeScheduleTakerBps { symbol: u32, maker_bps: i16 },
     /// Expire orders: enter timestamp_ns.
     ExpireOrdersTimestamp,
+    /// Disable instrument: enter symbol ID.
+    DisableInstrumentSymbol,
+    /// Enable instrument: enter symbol ID.
+    EnableInstrumentSymbol,
+    /// Remove instrument: enter symbol ID.
+    RemoveInstrumentSymbol,
     /// GTD expiry: after TIF selection, enter expiry timestamp_ns.
     AfterTifExpiry { collected: OrderFields },
 }
@@ -501,6 +511,9 @@ impl App {
                         next: NextStep::FeeScheduleMakerBps { symbol: *symbol },
                     },
                     NextStep::ExpireOrdersTimestamp => Screen::ActionMenu,
+                    NextStep::DisableInstrumentSymbol => Screen::ActionMenu,
+                    NextStep::EnableInstrumentSymbol => Screen::ActionMenu,
+                    NextStep::RemoveInstrumentSymbol => Screen::ActionMenu,
                     NextStep::AfterTifExpiry { collected } => Screen::TifMenu {
                         collected: collected.clone(),
                     },
@@ -599,6 +612,30 @@ impl App {
                             label: "Timestamp (ns since Unix epoch)",
                             buf: String::new(),
                             next: NextStep::ExpireOrdersTimestamp,
+                        };
+                    }
+                    18 => {
+                        // Disable Instrument — ask for symbol.
+                        self.screen = Screen::NumberInput {
+                            label: "Symbol ID",
+                            buf: String::new(),
+                            next: NextStep::DisableInstrumentSymbol,
+                        };
+                    }
+                    19 => {
+                        // Enable Instrument — ask for symbol.
+                        self.screen = Screen::NumberInput {
+                            label: "Symbol ID",
+                            buf: String::new(),
+                            next: NextStep::EnableInstrumentSymbol,
+                        };
+                    }
+                    20 => {
+                        // Remove Instrument — ask for symbol.
+                        self.screen = Screen::NumberInput {
+                            label: "Symbol ID",
+                            buf: String::new(),
+                            next: NextStep::RemoveInstrumentSymbol,
                         };
                     }
                     _ => {}
@@ -1052,6 +1089,35 @@ impl App {
                         self.cursor = 0;
                     }
 
+                    // --- Instrument lifecycle flows ---
+                    NextStep::DisableInstrumentSymbol => {
+                        let request = Request::DisableInstrument {
+                            symbol: Symbol(val as u32),
+                        };
+                        self.log.push(format!("→ DISABLE INSTRUMENT symbol={val}"));
+                        let _ = self.request_tx.send(request);
+                        self.screen = Screen::ActionMenu;
+                        self.cursor = 0;
+                    }
+                    NextStep::EnableInstrumentSymbol => {
+                        let request = Request::EnableInstrument {
+                            symbol: Symbol(val as u32),
+                        };
+                        self.log.push(format!("→ ENABLE INSTRUMENT symbol={val}"));
+                        let _ = self.request_tx.send(request);
+                        self.screen = Screen::ActionMenu;
+                        self.cursor = 0;
+                    }
+                    NextStep::RemoveInstrumentSymbol => {
+                        let request = Request::RemoveInstrument {
+                            symbol: Symbol(val as u32),
+                        };
+                        self.log.push(format!("→ REMOVE INSTRUMENT symbol={val}"));
+                        let _ = self.request_tx.send(request);
+                        self.screen = Screen::ActionMenu;
+                        self.cursor = 0;
+                    }
+
                     // --- GTD expiry input after TIF selection ---
                     NextStep::AfterTifExpiry { mut collected } => {
                         collected.expiry_ns = val;
@@ -1298,6 +1364,7 @@ fn format_report(report: &ExecutionReport) -> String {
                 RejectReason::DuplicateRequest => "duplicate request",
                 RejectReason::ReplicaDisconnected => "replica disconnected",
                 RejectReason::InvalidExpiry => "invalid expiry",
+                RejectReason::InstrumentDisabled => "instrument disabled",
             };
             format!("REJECT  #{} ({reason_str})", order_id.0)
         }
@@ -1314,6 +1381,14 @@ fn format_report(report: &ExecutionReport) -> String {
                 "REPLACE #{} {} @{}→{} x{}→{}",
                 order_id.0, side_str, old_price.0, new_price.0, old_remaining.0, new_remaining.0,
             )
+        }
+        ExecutionReport::InstrumentStatusChanged { symbol, status } => {
+            let status_str = match status {
+                InstrumentStatus::Enabled => "ENABLED",
+                InstrumentStatus::Disabled => "DISABLED",
+                InstrumentStatus::Removed => "REMOVED",
+            };
+            format!("INSTRUMENT {} → {}", symbol.0, status_str)
         }
     }
 }
