@@ -817,7 +817,37 @@ pub fn run_receiver(
                 continue;
             }
             Err(e) => {
-                return Err(format!("read error from primary: {e}").into());
+                // Primary disconnected (crash, network failure, or graceful
+                // shutdown). Instead of exiting, wait for the operator to
+                // promote this replica. The replica's journal is durable and
+                // the Exchange state is consistent up to the last acked
+                // sequence.
+                warn!(error = %e, "primary disconnected — waiting for promotion");
+
+                // Flush any accumulated but un-acked data before waiting.
+                if !journal_accum.is_empty() {
+                    journal_writer.write_raw_sync(
+                        &journal_accum,
+                        accum_entry_count,
+                    )?;
+                    replay_journal_bytes(
+                        &journal_accum,
+                        &mut exchange,
+                        &mut reports,
+                    )?;
+                    journal_accum.clear();
+                }
+
+                loop {
+                    if shutdown.load(Ordering::Relaxed) {
+                        return Ok(None);
+                    }
+                    if promote.load(Ordering::Acquire) {
+                        info!("promotion triggered after primary disconnect");
+                        return Ok(Some((exchange, journal_writer)));
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(100));
+                }
             }
         }
 

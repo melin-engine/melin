@@ -42,3 +42,7 @@ melin-dpdk = { path = "../dpdk", optional = true }
 
 [dev-dependencies]
 tempfile = "3"
+melin-client = { path = "../client" }
+melin-protocol = { path = "../protocol" }
+ed25519-dalek = { workspace = true }
+base64 = { workspace = true }

@@ -163,6 +163,11 @@ impl Exchange {
             .collect()
     }
 
+    /// Number of active instruments (for diagnostics).
+    pub fn instrument_count(&self) -> usize {
+        self.instruments.iter().filter(|s| s.is_some()).count()
+    }
+
     /// Iterate over instrument specs (for snapshot serialization).
     pub(crate) fn instrument_specs(&self) -> impl Iterator<Item = &InstrumentSpec> {
         self.instruments
