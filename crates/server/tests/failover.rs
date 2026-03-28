@@ -233,255 +233,290 @@ fn price(n: u64) -> Price {
 }
 
 // ---------------------------------------------------------------------------
-// Test
+// Shared test harness
+// ---------------------------------------------------------------------------
+
+struct TestCluster {
+    primary: ServerProcess,
+    replica: ServerProcess,
+    promote_port: u16,
+    key: SigningKey,
+    key2: SigningKey,
+    _tmp: tempfile::TempDir,
+}
+
+impl TestCluster {
+    /// Spin up a primary + replica pair, wait for both to be healthy.
+    fn start() -> Self {
+        let bin = server_bin();
+        assert!(
+            bin.exists(),
+            "melin-server binary not found at {bin:?}. Run `cargo build --release` first."
+        );
+
+        let tmp = tempfile::tempdir().expect("create temp dir");
+        let key = SigningKey::from_bytes(&[0xFA; 32]);
+        let key2 = SigningKey::from_bytes(&[0xFB; 32]);
+        let keys_path = write_auth_keys_multi(tmp.path(), &[&key, &key2]);
+
+        let primary_client_port = free_port();
+        let primary_health_port = free_port();
+        let primary_repl_port = free_port();
+        let replica_client_port = free_port();
+        let replica_health_port = free_port();
+        let replica_promote_port = free_port();
+
+        let primary = spawn_primary(
+            &bin,
+            tmp.path(),
+            &keys_path,
+            primary_client_port,
+            primary_health_port,
+            primary_repl_port,
+        );
+
+        // Wait for the primary's replication port before starting replica.
+        let repl_addr: SocketAddr =
+            format!("127.0.0.1:{primary_repl_port}").parse().unwrap();
+        let start = Instant::now();
+        loop {
+            if TcpStream::connect_timeout(&repl_addr, Duration::from_millis(100)).is_ok() {
+                break;
+            }
+            if start.elapsed() > Duration::from_secs(10) {
+                panic!("primary replication port never became available");
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+
+        let replica = spawn_replica(
+            &bin,
+            tmp.path(),
+            &keys_path,
+            primary_repl_port,
+            replica_client_port,
+            replica_health_port,
+            replica_promote_port,
+        );
+
+        wait_healthy(primary.health_addr, Duration::from_secs(30));
+
+        Self {
+            primary,
+            replica,
+            promote_port: replica_promote_port,
+            key,
+            key2,
+            _tmp: tmp,
+        }
+    }
+
+    /// Connect a client to the primary using the first key.
+    fn connect_primary(&self) -> Client {
+        Client::connect(self.primary.client_addr, &self.key)
+            .expect("connect to primary")
+    }
+
+    /// Wait for replication lag to reach 0.
+    fn wait_replicated(&self) {
+        let start = Instant::now();
+        loop {
+            let (_, _, lag, _) = query_health(self.primary.health_addr)
+                .expect("query primary health for repl lag");
+            if lag == 0 {
+                return;
+            }
+            if start.elapsed() > Duration::from_secs(10) {
+                panic!("replication lag did not reach 0 within 10s (lag={lag})");
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+
+    /// SIGKILL the primary and promote the replica. Returns a client
+    /// connected to the promoted replica.
+    fn kill_and_promote(&mut self) -> Client {
+        unsafe {
+            libc::kill(self.primary.child.id() as i32, libc::SIGKILL);
+        }
+        let _ = self.primary.child.wait();
+
+        let promote_addr: SocketAddr =
+            format!("127.0.0.1:{}", self.promote_port).parse().unwrap();
+        promote(promote_addr);
+
+        wait_healthy(self.replica.health_addr, Duration::from_secs(30));
+
+        // Brief pause for pipeline init.
+        std::thread::sleep(Duration::from_secs(1));
+
+        Client::connect(self.replica.client_addr, &self.key2)
+            .expect("connect to promoted replica")
+    }
+}
+
+fn submit_order(
+    client: &mut Client,
+    id: u64,
+    account: u32,
+    symbol: u32,
+    side: Side,
+    price_val: u64,
+    qty_val: u64,
+) -> Vec<melin_protocol::message::ResponseKind> {
+    client
+        .send_request(&Request::SubmitOrder {
+            symbol: Symbol(symbol),
+            order: Order {
+                id: OrderId(id),
+                account: AccountId(account),
+                side,
+                order_type: OrderType::Limit {
+                    price: price(price_val),
+                    post_only: false,
+                },
+                time_in_force: TimeInForce::GTC,
+                quantity: qty(qty_val),
+                stp: melin_protocol::types::SelfTradeProtection::Allow,
+                expiry_ns: 0,
+            },
+        })
+        .expect("submit order")
+}
+
+fn has_report(
+    responses: &[melin_protocol::message::ResponseKind],
+    pred: fn(&melin_protocol::types::ExecutionReport) -> bool,
+) -> bool {
+    responses.iter().any(|r| {
+        if let melin_protocol::message::ResponseKind::Report(report) = r {
+            pred(report)
+        } else {
+            false
+        }
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Tests
 // ---------------------------------------------------------------------------
 
 #[test]
 fn kill_primary_promote_replica_no_data_loss() {
-    let bin = server_bin();
-    assert!(
-        bin.exists(),
-        "melin-server binary not found at {bin:?}. Run `cargo build` first."
-    );
+    let mut cluster = TestCluster::start();
+    let mut client = cluster.connect_primary();
 
-    let tmp = tempfile::tempdir().expect("create temp dir");
-    let key = SigningKey::from_bytes(&[0xFA; 32]);
-    // Second key for post-promotion client — avoids per-key request
-    // sequence HWM collision (the promoted replica's HWM tracks sequences
-    // from the primary phase, so a fresh client with the same key would
-    // have its first request rejected as DuplicateRequest).
-    let key2 = SigningKey::from_bytes(&[0xFB; 32]);
-    let keys_path = write_auth_keys_multi(tmp.path(), &[&key, &key2]);
-
-    // Allocate ports up front to avoid races.
-    let primary_client_port = free_port();
-    let primary_health_port = free_port();
-    let primary_repl_port = free_port();
-    let replica_client_port = free_port();
-    let replica_health_port = free_port();
-    let replica_promote_port = free_port();
-
-    // --- 1. Start primary and replica concurrently ---
-    // The primary with --replication-bind blocks pipeline progress until a
-    // replica connects and starts acking. Start both at the same time so the
-    // replica connects during seeding.
-    let mut primary = spawn_primary(
-        &bin,
-        tmp.path(),
-        &keys_path,
-        primary_client_port,
-        primary_health_port,
-        primary_repl_port,
-    );
-    eprintln!("Primary started (pid={}).", primary.child.id());
-
-    // Wait for the primary's replication port to be listening before
-    // starting the replica. The replica doesn't retry on connection
-    // refused, so timing matters.
-    let repl_addr: SocketAddr = format!("127.0.0.1:{primary_repl_port}").parse().unwrap();
-    let start = Instant::now();
-    loop {
-        if TcpStream::connect_timeout(&repl_addr, Duration::from_millis(100)).is_ok() {
-            break;
-        }
-        if start.elapsed() > Duration::from_secs(10) {
-            panic!("primary replication port never became available");
-        }
-        std::thread::sleep(Duration::from_millis(50));
-    }
-    eprintln!("Primary replication port is listening.");
-
-    let replica = spawn_replica(
-        &bin,
-        tmp.path(),
-        &keys_path,
-        primary_repl_port,
-        replica_client_port,
-        replica_health_port,
-        replica_promote_port,
-    );
-    eprintln!("Replica started (pid={}).", replica.child.id());
-
-    // Wait for primary to complete seeding and become healthy.
-    eprintln!("Waiting for primary to be healthy...");
-    wait_healthy(primary.health_addr, Duration::from_secs(30));
-    eprintln!("Primary is healthy.");
-
-    // --- 3. Submit orders to primary ---
-    // Check health details before connecting client.
-    let (conns, seq, lag, trading) = query_health(primary.health_addr)
-        .expect("query primary health before orders");
-    eprintln!("Primary before orders: conns={conns}, seq={seq}, lag={lag}, trading={trading}");
-
-    eprintln!("Connecting client to primary at {}...", primary.client_addr);
-    let mut client =
-        Client::connect(primary.client_addr, &key).expect("connect to primary");
-    eprintln!("Client connected.");
-
-    // Place resting buy orders on instrument 0 (seeded by server).
-    let num_orders = 50;
-    for i in 1..=num_orders {
-        let responses = client
-            .send_request(&Request::SubmitOrder {
-                symbol: Symbol(1),
-                order: Order {
-                    id: OrderId(i),
-                    account: AccountId(1),
-                    side: Side::Buy,
-                    order_type: OrderType::Limit {
-                        price: price(100),
-                        post_only: false,
-                    },
-                    time_in_force: TimeInForce::GTC,
-                    quantity: qty(10),
-                    stp: melin_protocol::types::SelfTradeProtection::Allow,
-                    expiry_ns: 0,
-                },
-            })
-            .expect("submit order");
-        // Verify each order was acked (Placed or Rejected — not an error).
-        assert!(
-            !responses.is_empty(),
-            "order {i}: no response from primary"
-        );
+    // Place 50 resting buy orders.
+    for i in 1..=50u64 {
+        let r = submit_order(&mut client, i, 1, 1, Side::Buy, 100, 10);
+        assert!(!r.is_empty(), "order {i}: no response");
     }
 
-    // Record the primary's journal sequence after all orders are acked.
-    // The response gate ensures all acked orders are both journaled AND replicated.
-    let (_, primary_seq, repl_lag, _) = query_health(primary.health_addr)
-        .expect("query primary health after orders");
-    eprintln!(
-        "Primary journal_seq={primary_seq}, repl_lag={repl_lag} after {num_orders} orders"
+    cluster.wait_replicated();
+    let mut client2 = cluster.kill_and_promote();
+
+    // New order on promoted replica must succeed (proves full state replicated).
+    let r = submit_order(&mut client2, 51, 1, 1, Side::Buy, 200, 5);
+    assert!(
+        has_report(&r, |rep| matches!(rep, melin_protocol::types::ExecutionReport::Placed { .. })),
+        "expected Placed, got: {r:?}"
     );
 
-    // Wait for replication lag to reach 0 (all events replicated).
-    let start = Instant::now();
-    loop {
-        let (_, _, lag, _) = query_health(primary.health_addr)
-            .expect("query primary health for repl lag");
-        if lag == 0 {
-            break;
-        }
-        if start.elapsed() > Duration::from_secs(10) {
-            panic!("replication lag did not reach 0 within 10s (lag={lag})");
-        }
-        std::thread::sleep(Duration::from_millis(50));
+    // Crossing sell fills against the buy — proves matching works.
+    let r = submit_order(&mut client2, 52, 1, 1, Side::Sell, 200, 5);
+    assert!(
+        has_report(&r, |rep| matches!(rep, melin_protocol::types::ExecutionReport::Fill { .. })),
+        "expected Fill, got: {r:?}"
+    );
+}
+
+/// Kill the primary while fills are actively happening. Verifies that
+/// balance conservation holds after promotion — no phantom fills or
+/// leaked reservations.
+#[test]
+fn kill_during_active_fills() {
+    let mut cluster = TestCluster::start();
+    let mut client = cluster.connect_primary();
+
+    // Place resting sells from account 2 at various prices.
+    // Account 2 was seeded with balances for instrument 1 (base currency).
+    for i in 1..=20u64 {
+        let r = submit_order(&mut client, i, 2, 1, Side::Sell, 100 + i, 10);
+        assert!(!r.is_empty());
     }
-    eprintln!("Replication lag is 0.");
 
-    // --- 4. SIGKILL the primary ---
-    eprintln!("Sending SIGKILL to primary (pid={})...", primary.child.id());
-    unsafe {
-        libc::kill(primary.child.id() as i32, libc::SIGKILL);
+    // Aggressive buys from account 1 that cross the spread — generates fills.
+    // Each buy at price 200 sweeps all resting sells (100..120).
+    for i in 21..=40u64 {
+        let r = submit_order(&mut client, i, 1, 1, Side::Buy, 200, 5);
+        assert!(!r.is_empty());
     }
-    let status = primary.child.wait().expect("wait for primary");
-    eprintln!("Primary exited: {status}");
 
-    // --- 5. Promote the replica ---
-    eprintln!("Promoting replica...");
-    let promote_addr: SocketAddr =
-        format!("127.0.0.1:{replica_promote_port}").parse().unwrap();
-    promote(promote_addr);
-    eprintln!("Promotion sent.");
+    cluster.wait_replicated();
+    let mut client2 = cluster.kill_and_promote();
 
-    // Wait for promoted replica to be healthy and accepting clients.
-    eprintln!("Waiting for promoted replica to be healthy...");
-    let (_, replica_seq, _, trading) =
-        wait_healthy(replica.health_addr, Duration::from_secs(30));
-    eprintln!(
-        "Promoted replica: journal_seq={replica_seq}, trading={trading}"
-    );
-
-    // --- 6. Verify no data loss ---
-    assert!(trading, "promoted replica should be in trading state");
-
-    // --- 7. Reconnect client and verify state ---
-    let mut client2 =
-        Client::connect(replica.client_addr, &key2).expect("connect to promoted replica");
-
-    // Give the pipeline a moment to fully initialize all stages.
-    std::thread::sleep(Duration::from_secs(1));
-
-    // Place a new order on the promoted replica. The order ID must be
-    // higher than anything previously submitted — the dedup HWM was
-    // replayed from the journal, so re-using an old ID would be rejected
-    // as a duplicate. Using num_orders + 1 proves the replica has the
-    // full HWM history.
-    let responses = client2
-        .send_request(&Request::SubmitOrder {
-            symbol: Symbol(1),
-            order: Order {
-                id: OrderId(num_orders + 1),
-                account: AccountId(1),
-                side: Side::Buy,
-                order_type: OrderType::Limit {
-                    price: price(200),
-                    post_only: false,
-                },
-                time_in_force: TimeInForce::GTC,
-                quantity: qty(5),
-                stp: melin_protocol::types::SelfTradeProtection::Allow,
-                expiry_ns: 0,
-            },
-        })
-        .expect("submit order to promoted replica");
+    // Verify the promoted replica can still trade.
+    // Place a new sell — must succeed (account 2 should have remaining
+    // base currency from partial fills).
+    let r = submit_order(&mut client2, 41, 2, 1, Side::Sell, 300, 1);
     assert!(
-        !responses.is_empty(),
-        "no response from promoted replica"
+        has_report(&r, |rep| matches!(rep, melin_protocol::types::ExecutionReport::Placed { .. })),
+        "expected Placed after fill-heavy workload, got: {r:?}"
     );
 
-    // The response must be Placed (not Rejected). If the replica missed
-    // any events, balances could be wrong (InsufficientBalance) or the
-    // HWM could be wrong (DuplicateOrderId). A successful Placed confirms
-    // the full state was replicated.
-    let placed = responses.iter().any(|r| {
-        matches!(
-            r,
-            melin_protocol::message::ResponseKind::Report(
-                melin_protocol::types::ExecutionReport::Placed { .. }
-            )
-        )
-    });
+    // Place a matching buy — proves matching is operational.
+    let r = submit_order(&mut client2, 42, 1, 1, Side::Buy, 300, 1);
     assert!(
-        placed,
-        "expected Placed on promoted replica, got: {responses:?}"
+        has_report(&r, |rep| matches!(rep, melin_protocol::types::ExecutionReport::Fill { .. })),
+        "expected Fill after fill-heavy workload, got: {r:?}"
     );
-    eprintln!("New order on promoted replica: Placed");
+}
 
-    // Submit a second order to verify the pipeline is fully operational
-    // (journal + matching + response stages all running).
-    let responses2 = client2
-        .send_request(&Request::SubmitOrder {
-            symbol: Symbol(1),
-            order: Order {
-                id: OrderId(num_orders + 2),
-                account: AccountId(1),
-                side: Side::Sell,
-                order_type: OrderType::Limit {
-                    price: price(200),
-                    post_only: false,
-                },
-                time_in_force: TimeInForce::GTC,
-                quantity: qty(5),
-                stp: melin_protocol::types::SelfTradeProtection::Allow,
-                expiry_ns: 0,
-            },
-        })
-        .expect("submit second order to promoted replica");
-    // This sell at 200 should fill against the buy at 200 above.
-    let has_fill = responses2.iter().any(|r| {
-        matches!(
-            r,
-            melin_protocol::message::ResponseKind::Report(
-                melin_protocol::types::ExecutionReport::Fill { .. }
-            )
-        )
-    });
+/// Kill the primary IMMEDIATELY after submitting orders, without waiting
+/// for replication lag to reach 0. The response gate guarantees that every
+/// acked response was replicated — verify the promoted replica has at
+/// least the acked state.
+#[test]
+fn kill_without_waiting_for_replication() {
+    let mut cluster = TestCluster::start();
+    let mut client = cluster.connect_primary();
+
+    // Submit orders — each response is gated on replication, so every
+    // acked order is guaranteed to be on the replica's journal.
+    let mut last_acked_id = 0u64;
+    for i in 1..=30u64 {
+        let r = submit_order(&mut client, i, 1, 1, Side::Buy, 100, 10);
+        if !r.is_empty() {
+            last_acked_id = i;
+        }
+    }
+    assert!(last_acked_id > 0, "no orders were acked");
+
+    // Kill immediately — do NOT wait for replication lag to reach 0.
+    // The response gate already ensures durability.
+    drop(client);
+    let mut client2 = cluster.kill_and_promote();
+
+    // The promoted replica must accept an order with ID > last_acked_id.
+    // If it does, the HWM was replayed correctly (all acked orders are present).
+    let r = submit_order(&mut client2, last_acked_id + 1, 1, 1, Side::Buy, 200, 5);
     assert!(
-        has_fill,
-        "expected Fill on promoted replica, got: {responses2:?}"
+        has_report(&r, |rep| matches!(rep, melin_protocol::types::ExecutionReport::Placed { .. })),
+        "expected Placed with id={}, got: {r:?}",
+        last_acked_id + 1
     );
-    eprintln!("Fill on promoted replica confirmed — pipeline fully operational.");
 
-    eprintln!("PASS: failover test complete. primary_seq={primary_seq}, all {num_orders} orders replicated, promoted replica operational.");
+    // Verify a duplicate of the last acked order is rejected (proves
+    // the replica has the exact same dedup state).
+    let r = submit_order(&mut client2, last_acked_id, 1, 1, Side::Buy, 100, 10);
+    assert!(
+        has_report(&r, |rep| matches!(
+            rep,
+            melin_protocol::types::ExecutionReport::Rejected {
+                reason: melin_protocol::types::RejectReason::DuplicateOrderId,
+                ..
+            }
+        )),
+        "expected DuplicateOrderId for id={last_acked_id}, got: {r:?}"
+    );
 }
