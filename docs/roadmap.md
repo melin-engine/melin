@@ -7,13 +7,11 @@ Planned features sorted by value/complexity ratio for commercial readiness (exch
 | # | Feature | Commercial value | Complexity | Value/effort | Why |
 |---|---------|:---:|:---:|:---:|-----|
 | 1 | Reference data management | Medium | Medium | ★★★☆☆ | Instrument disable/remove. Operators expect lifecycle management. |
-| 2 | Crash injection tests | High | Medium | ★★★☆☆ | Kill server at random points during load, verify recovery produces identical state. Validates journal/snapshot/rotation crash safety end-to-end. |
-| 3 | Failover tests | High | Medium | ★★★☆☆ | Kill primary during load, promote replica, verify no data loss and clients can reconnect. Validates the manual promotion path under realistic conditions. |
-| 4 | Catch-up from journal files | High | High | ★★☆☆☆ | Critical for production HA, but significant work (read historical segments, switch to live). |
-| 5 | Snapshot transfer | Medium | High | ★☆☆☆☆ | Needed for full HA, but catch-up from journal comes first. |
-| 6 | SPDK journal | High | High | ★★☆☆☆ | Userspace NVMe driver for journal writes. Bypasses kernel block layer — submits FUA write commands directly to the NVMe submission queue. Eliminates pwritev2 syscall overhead. Works on 9950X Cherry servers (IOMMU active). Only impactful after transport bottleneck is solved (AF_XDP/DPDK). |
-| 7 | Full doc review | High | Low | ★★★★☆ | Many docs are stale after recent features (permissions, backpressure, Day TIF, GTD TIF, promotion, health endpoint). Review and update all docs/ files, CLAUDE.md, and README. Do once all other MVP features are complete. |
-| 8 | Brand setup (domain, GitHub org, email) | Medium | Low | ★★★☆☆ | Register melin.io/melin.com, set up contact@ email, create GitHub org, transfer repo, switch commit email going forward. Do not rewrite history. |
+| 2 | Failover tests | High | Medium | ★★★☆☆ | Kill primary during load, promote replica, verify no data loss and clients can reconnect. Validates the manual promotion path under realistic conditions. |
+| 3 | Catch-up from journal files | High | High | ★★☆☆☆ | Critical for production HA, but significant work (read historical segments, switch to live). |
+| 4 | Snapshot transfer | Medium | High | ★☆☆☆☆ | Needed for full HA, but catch-up from journal comes first. |
+| 5 | Full doc review | High | Low | ★★★★☆ | Many docs are stale after recent features (permissions, backpressure, Day TIF, GTD TIF, promotion, health endpoint). Review and update all docs/ files, CLAUDE.md, and README. Do once all other MVP features are complete. |
+| 6 | Brand setup (domain, GitHub org, email) | Medium | Low | ★★★☆☆ | Register melin.io/melin.com, set up contact@ email, create GitHub org, transfer repo, switch commit email going forward. Do not rewrite history. |
 
 ## DPDK Transport Optimization
 
@@ -28,6 +26,8 @@ Features targeting regulated venues, gateway responsibilities, or with limited n
 
 | Feature | Why deferred |
 |---------|-------------|
+| SPDK journal | Userspace NVMe driver for journal writes. Bypasses kernel block layer entirely. TCP pipelining already hides fsync latency (fsync and no-persist throughput converged at ~8M/s), so the kernel block layer is no longer a bottleneck. High complexity, minimal expected gain. |
+| io_uring SQPOLL | `IORING_SETUP_SQPOLL` eliminates `io_uring_enter()` syscall (~1-2µs) per submission. Measured 15% p50 improvement on loopback but tail regresses on SMT-enabled machines due to SQPOLL kernel threads contending with pipeline threads. Needs Cherry server testing with SMT off and `setup_sqpoll_cpu()` pinning. Branch: `feat/uring-sqpoll`. |
 | Response gate bottleneck counter | Expose a metric counting how often the response stage blocked on the journal cursor vs the replication cursor. Currently `min(journal, replication)` is opaque — no visibility into which is the tail latency contributor. Low complexity, expose via health/metrics endpoint. |
 | Dual-NVMe journal hedging | Two journal threads on separate NVMe drives, response stage gates on the fastest. Cuts tail latency from P(slow) to P(slow)². Free durability redundancy. Low complexity but requires a second NVMe slot. Revisit when journal fsync is the dominant tail contributor. |
 | AF_XDP transport | DaMoN '25 found AF_XDP disappoints vs DPDK for small-message request-response workloads. DPDK transport already in progress. Revisit if DPDK proves insufficient. |

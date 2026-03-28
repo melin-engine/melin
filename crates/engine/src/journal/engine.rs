@@ -1416,4 +1416,692 @@ mod tests {
         assert_eq!(hwm.len(), 1);
         assert_eq!(hwm[0], (key_hash, 5));
     }
+
+    // ---------------------------------------------------------------
+    // Crash injection tests
+    // ---------------------------------------------------------------
+
+    /// Helper: copy a file byte-for-byte so truncation tests don't destroy the original.
+    fn copy_file(src: &Path, dst: &Path) {
+        std::fs::copy(src, dst).unwrap();
+    }
+
+    /// Helper: find the byte offset where valid journal data ends
+    /// (after the last fully-written entry, before pre-allocated space).
+    fn valid_data_end(path: &Path) -> u64 {
+        let mut reader = crate::journal::reader::JournalReader::open(path).unwrap();
+        while reader.next_entry().unwrap().is_some() {}
+        reader.valid_file_end()
+    }
+
+    /// Helper: build a non-trivial exchange state with multiple event types.
+    /// Returns the number of user-visible events written.
+    fn build_workload(je: &mut JournaledExchange) -> usize {
+        let mut reports = Vec::new();
+        let mut count = 0;
+
+        // Instrument + deposits.
+        je.add_instrument(btc_usd_spec()).unwrap();
+        count += 1;
+        je.deposit(ACCT_A, USD, 10_000_000).unwrap();
+        count += 1;
+        je.deposit(ACCT_B, BTC, 10_000).unwrap();
+        count += 1;
+        je.deposit(ACCT_B, USD, 5_000_000).unwrap();
+        count += 1;
+
+        // Risk limits.
+        je.set_risk_limits(
+            Symbol(1),
+            RiskLimits {
+                max_order_qty: Some(qty(5000)),
+                max_order_notional: Some(500_000_000),
+            },
+        )
+        .unwrap();
+        count += 1;
+
+        // Circuit breaker.
+        je.set_circuit_breaker(
+            Symbol(1),
+            CircuitBreakerConfig {
+                price_band_lower: Some(price(50)),
+                price_band_upper: Some(price(200)),
+                halted: false,
+            },
+        )
+        .unwrap();
+        count += 1;
+
+        // Resting sells from ACCT_B.
+        for i in 1..=10 {
+            je.execute(
+                Symbol(1),
+                limit_order(i, ACCT_B, Side::Sell, 100 + i, 100),
+                &mut reports,
+            )
+            .unwrap();
+            count += 1;
+        }
+
+        // Resting buys from ACCT_A.
+        for i in 11..=20 {
+            je.execute(
+                Symbol(1),
+                limit_order(i, ACCT_A, Side::Buy, 90 - (i - 11), 50),
+                &mut reports,
+            )
+            .unwrap();
+            count += 1;
+        }
+
+        // Aggressive buy that fills against lowest ask.
+        je.execute(
+            Symbol(1),
+            limit_order(21, ACCT_A, Side::Buy, 101, 30),
+            &mut reports,
+        )
+        .unwrap();
+        count += 1;
+
+        // Cancel some resting orders.
+        for id in [12, 14, 16] {
+            je.cancel(Symbol(1), ACCT_A, OrderId(id), &mut reports)
+                .unwrap();
+            count += 1;
+        }
+
+        // Withdraw.
+        je.withdraw(ACCT_A, USD, 1_000).unwrap();
+        count += 1;
+
+        count
+    }
+
+    /// Exhaustive crash simulation: truncate the journal at *every* byte offset
+    /// from the file header through the valid data end. For each truncation,
+    /// verify that recovery succeeds and the engine can continue appending.
+    ///
+    /// Uses a small workload (5 events) to keep the byte range manageable
+    /// (~500 bytes → ~500 iterations). The larger workload is exercised
+    /// by `crash_recovery_under_realistic_load` with sampled truncation points.
+    #[test]
+    fn crash_at_every_byte_offset_recovers() {
+        let dir = tempfile::tempdir().unwrap();
+        let original = dir.path().join("original.journal");
+
+        {
+            let mut je = JournaledExchange::create(&original).unwrap();
+            je.add_instrument(btc_usd_spec()).unwrap();
+            je.deposit(ACCT_A, USD, 100_000).unwrap();
+            je.deposit(ACCT_B, BTC, 500).unwrap();
+            let mut reports = Vec::new();
+            je.execute(
+                Symbol(1),
+                limit_order(1, ACCT_B, Side::Sell, 100, 50),
+                &mut reports,
+            )
+            .unwrap();
+            je.execute(
+                Symbol(1),
+                limit_order(2, ACCT_A, Side::Buy, 100, 30),
+                &mut reports,
+            )
+            .unwrap();
+        }
+
+        let end = valid_data_end(&original);
+        let header_end = crate::journal::codec::FILE_HEADER_SIZE as u64;
+        assert!(end > header_end, "journal should have data beyond header");
+
+        let work = dir.path().join("work.journal");
+
+        // Shrink the original to its valid data size. The pre-allocated file
+        // is 256 MiB; copying that per iteration dominates runtime.
+        {
+            let f = std::fs::OpenOptions::new().write(true).open(&original).unwrap();
+            f.set_len(end).unwrap();
+        }
+
+        for trunc_at in header_end..=end {
+            // Copy the (now small) original and truncate.
+            copy_file(&original, &work);
+            {
+                let f = std::fs::OpenOptions::new().write(true).open(&work).unwrap();
+                f.set_len(trunc_at).unwrap();
+            }
+
+            // Recovery must not panic or error.
+            let mut je = JournaledExchange::recover(&work).unwrap();
+
+            // Sequence must be valid (at least 1, the starting point for an empty journal).
+            assert!(je.next_sequence() >= 1, "seq underflow at byte {trunc_at}");
+
+            // Must be able to append after recovery.
+            je.deposit(ACCT_A, USD, 1).unwrap();
+
+            // Double-recovery of the post-append journal must also succeed.
+            drop(je);
+            let je2 = JournaledExchange::recover(&work).unwrap();
+            // At least 2: the deposit we appended (seq 1) + next is 2.
+            assert!(je2.next_sequence() >= 2, "double-recovery seq too low at byte {trunc_at}");
+        }
+    }
+
+    /// Crash during or after snapshot-based rotation: truncate the *new*
+    /// journal at every byte, recover from snapshot + truncated journal.
+    /// Also tests the "journal missing after rotation" edge case.
+    #[test]
+    fn crash_during_snapshot_rotation_recovers() {
+        let dir = tempfile::tempdir().unwrap();
+        let journal_path = dir.path().join("rotation.journal");
+        let snap_path = dir.path().join("rotation.snapshot");
+
+        // Build state, rotate, add more events after rotation.
+        let mut engine = JournaledExchange::create(&journal_path).unwrap();
+        build_workload(&mut engine);
+        engine.rotate(&snap_path).unwrap();
+
+        // Post-rotation events.
+        let mut reports = Vec::new();
+        engine.deposit(ACCT_A, USD, 777).unwrap();
+        engine
+            .execute(
+                Symbol(1),
+                limit_order(100, ACCT_A, Side::Buy, 80, 10),
+                &mut reports,
+            )
+            .unwrap();
+        let final_seq = engine.next_sequence();
+        drop(engine);
+
+        // Snapshot state (for comparison when all post-rotation events are lost).
+        let (snap_exchange, snap_seq, _snap_hash) =
+            super::snapshot::load(&snap_path).unwrap();
+        let snap_bal_a_usd = snap_exchange.accounts().balance(ACCT_A, USD).available;
+
+        let end = valid_data_end(&journal_path);
+        let header_end = crate::journal::codec::FILE_HEADER_SIZE as u64;
+
+        let work_journal = dir.path().join("work.journal");
+
+        // Shrink the post-rotation journal to its valid data size to
+        // avoid copying the 256 MiB pre-allocated file each iteration.
+        {
+            let f = std::fs::OpenOptions::new()
+                .write(true)
+                .open(&journal_path)
+                .unwrap();
+            f.set_len(end).unwrap();
+        }
+
+        // Truncate at every byte in the new (post-rotation) journal.
+        for trunc_at in header_end..=end {
+            copy_file(&journal_path, &work_journal);
+            {
+                let f = std::fs::OpenOptions::new()
+                    .write(true)
+                    .open(&work_journal)
+                    .unwrap();
+                f.set_len(trunc_at).unwrap();
+            }
+
+            let je =
+                JournaledExchange::recover_from_snapshot(&snap_path, &work_journal).unwrap();
+
+            // Sequence must be between snapshot seq and final seq (inclusive of snap+1
+            // because the new journal's genesis consumes one seq with hash-chain).
+            assert!(
+                je.next_sequence() <= final_seq,
+                "seq overshoot at byte {trunc_at}: {} > {final_seq}",
+                je.next_sequence()
+            );
+            assert!(
+                je.next_sequence() > snap_seq,
+                "seq undershot snapshot at byte {trunc_at}"
+            );
+        }
+
+        // Edge case: journal file missing entirely after rotation.
+        // Recovery should succeed from snapshot alone.
+        std::fs::remove_file(&journal_path).ok();
+        // The server's init_engine handles this case by loading the snapshot
+        // and creating a fresh journal. Simulate that path here.
+        let (exchange, seq, chain_hash) = super::snapshot::load(&snap_path).unwrap();
+        let writer = crate::journal::writer::JournalWriter::create_continuing(
+            &journal_path,
+            seq + 1,
+            chain_hash,
+        )
+        .unwrap();
+        let je = JournaledExchange::from_parts(exchange, writer);
+        assert_eq!(
+            je.exchange().accounts().balance(ACCT_A, USD).available,
+            snap_bal_a_usd
+        );
+    }
+
+    /// Replay remaining events after crash to verify deterministic recovery.
+    ///
+    /// Strategy: write N events, record each event + the journal byte offset
+    /// after it. For a sample of truncation points, recover, replay the
+    /// remaining events on the recovered exchange, and verify the final state
+    /// matches the reference.
+    #[test]
+    fn crash_recovery_under_realistic_load() {
+        let dir = tempfile::tempdir().unwrap();
+        let original = dir.path().join("realistic.journal");
+
+        // Collect events so we can replay them individually.
+        let events = build_event_list();
+
+        // Write all events, recording the valid-data-end after each one.
+        let mut checkpoints: Vec<(u64, u64)> = Vec::new(); // (seq_after, file_pos_after)
+        {
+            let mut je = JournaledExchange::create(&original).unwrap();
+            let mut reports = Vec::new();
+            for evt in &events {
+                apply_event(&mut je, evt, &mut reports);
+                reports.clear();
+                // Flush to get stable file position.
+                checkpoints.push((je.next_sequence(), valid_data_end(&original)));
+            }
+        }
+
+        // Reference state: recover from the full journal.
+        let reference = JournaledExchange::recover(&original).unwrap();
+        let ref_bal_a_usd = reference.exchange().accounts().balance(ACCT_A, USD).available;
+        let ref_bal_a_btc = reference.exchange().accounts().balance(ACCT_A, BTC).available;
+        let ref_bal_b_usd = reference.exchange().accounts().balance(ACCT_B, USD).available;
+        let ref_bal_b_btc = reference.exchange().accounts().balance(ACCT_B, BTC).available;
+        let ref_seq = reference.next_sequence();
+        drop(reference);
+
+        // Sample truncation points: every 5th event boundary.
+        // Shrink to valid data size to avoid copying 256 MiB per iteration.
+        let original_end = valid_data_end(&original);
+        {
+            let f = std::fs::OpenOptions::new().write(true).open(&original).unwrap();
+            f.set_len(original_end).unwrap();
+        }
+
+        let work = dir.path().join("work.journal");
+        for (i, &(_seq, file_pos)) in checkpoints.iter().enumerate().step_by(5) {
+            copy_file(&original, &work);
+            {
+                let f = std::fs::OpenOptions::new().write(true).open(&work).unwrap();
+                f.set_len(file_pos).unwrap();
+            }
+
+            // Recover from truncated journal.
+            let mut je = JournaledExchange::recover(&work).unwrap();
+            let _recovered_seq = je.next_sequence();
+
+            // Replay the remaining events (those after the truncation point).
+            // Events 0..=i were written; event i is the last one fully on disk
+            // at file_pos. We need to replay events starting from i+1.
+            let mut reports = Vec::new();
+            for evt in &events[(i + 1)..] {
+                apply_event(&mut je, evt, &mut reports);
+                reports.clear();
+            }
+
+            // Final state must match reference.
+            assert_eq!(
+                je.exchange().accounts().balance(ACCT_A, USD).available,
+                ref_bal_a_usd,
+                "ACCT_A USD mismatch after crash at event {i}"
+            );
+            assert_eq!(
+                je.exchange().accounts().balance(ACCT_A, BTC).available,
+                ref_bal_a_btc,
+                "ACCT_A BTC mismatch after crash at event {i}"
+            );
+            assert_eq!(
+                je.exchange().accounts().balance(ACCT_B, USD).available,
+                ref_bal_b_usd,
+                "ACCT_B USD mismatch after crash at event {i}"
+            );
+            assert_eq!(
+                je.exchange().accounts().balance(ACCT_B, BTC).available,
+                ref_bal_b_btc,
+                "ACCT_B BTC mismatch after crash at event {i}"
+            );
+            assert_eq!(
+                je.next_sequence(),
+                ref_seq,
+                "sequence mismatch after crash at event {i}"
+            );
+            // Note: chain hash is NOT compared here because re-appended events
+            // have different wall-clock timestamps, producing different hashes.
+            // Chain hash integrity is validated by the other crash tests that
+            // don't re-append (they only verify recovery succeeds).
+        }
+    }
+
+    /// Verify every state type survives crash recovery.
+    #[test]
+    fn crash_recovery_preserves_all_state_types() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("all_state.journal");
+
+        let mut reports = Vec::new();
+        {
+            let mut je = JournaledExchange::create(&path).unwrap();
+
+            // Instrument.
+            je.add_instrument(btc_usd_spec()).unwrap();
+
+            // Deposits.
+            je.deposit(ACCT_A, USD, 10_000_000).unwrap();
+            je.deposit(ACCT_B, BTC, 10_000).unwrap();
+            je.deposit(ACCT_B, USD, 5_000_000).unwrap();
+
+            // Risk limits.
+            je.set_risk_limits(
+                Symbol(1),
+                RiskLimits {
+                    max_order_qty: Some(qty(9999)),
+                    max_order_notional: Some(123_456_789),
+                },
+            )
+            .unwrap();
+
+            // Circuit breaker.
+            je.set_circuit_breaker(
+                Symbol(1),
+                CircuitBreakerConfig {
+                    price_band_lower: Some(price(10)),
+                    price_band_upper: Some(price(500)),
+                    halted: false,
+                },
+            )
+            .unwrap();
+
+            // Resting orders (buy side + sell side).
+            je.execute(
+                Symbol(1),
+                limit_order(1, ACCT_A, Side::Buy, 95, 200),
+                &mut reports,
+            )
+            .unwrap();
+            je.execute(
+                Symbol(1),
+                limit_order(1, ACCT_B, Side::Sell, 105, 300),
+                &mut reports,
+            )
+            .unwrap();
+
+            // Capture reference state.
+            reports.clear();
+        }
+
+        // Recover and verify every state type.
+        let je = JournaledExchange::recover(&path).unwrap();
+        let ex = je.exchange();
+
+        // Balances.
+        // ACCT_A: 10M USD deposited, 95*200 = 19000 reserved for buy.
+        assert_eq!(ex.accounts().balance(ACCT_A, USD).available, 10_000_000 - 19_000);
+        assert_eq!(ex.accounts().balance(ACCT_A, USD).reserved, 19_000);
+        assert_eq!(ex.accounts().balance(ACCT_B, BTC).available, 10_000 - 300);
+        assert_eq!(ex.accounts().balance(ACCT_B, BTC).reserved, 300);
+
+        // Risk limits.
+        let rl = ex.snapshot_risk_limits();
+        assert_eq!(rl.len(), 1);
+        assert_eq!(rl[0].0, Symbol(1));
+        assert_eq!(rl[0].1.max_order_qty, Some(qty(9999)));
+        assert_eq!(rl[0].1.max_order_notional, Some(123_456_789));
+
+        // Circuit breaker.
+        let cb = ex.snapshot_circuit_breakers();
+        assert_eq!(cb.len(), 1);
+        assert_eq!(cb[0].0, Symbol(1));
+        assert_eq!(cb[0].1.price_band_lower, Some(price(10)));
+        assert_eq!(cb[0].1.price_band_upper, Some(price(500)));
+        assert!(!cb[0].1.halted);
+
+        // Resting orders exist on both sides.
+        let order_sides = ex.snapshot_order_sides();
+        let has_buy = order_sides.iter().any(|(_, s)| *s == Side::Buy);
+        let has_sell = order_sides.iter().any(|(_, s)| *s == Side::Sell);
+        assert!(has_buy, "buy orders should be present");
+        assert!(has_sell, "sell orders should be present");
+
+        // Instrument registered.
+        let specs: Vec<_> = ex.instrument_specs().collect();
+        assert_eq!(specs.len(), 1);
+        assert_eq!(specs[0].symbol, Symbol(1));
+    }
+
+    /// Crash recovery across multiple rotations: build state over 3 rotation
+    /// cycles, truncate the final journal segment at various points, and
+    /// verify recovery from the latest snapshot + truncated journal.
+    #[test]
+    fn multiple_rotation_crash_recovery() {
+        let dir = tempfile::tempdir().unwrap();
+        let journal_path = dir.path().join("multi_rot.journal");
+        let snap_path = dir.path().join("multi_rot.snapshot");
+
+        let mut reports = Vec::new();
+        let mut engine = JournaledExchange::create(&journal_path).unwrap();
+        engine.add_instrument(btc_usd_spec()).unwrap();
+        engine.deposit(ACCT_A, USD, 10_000_000).unwrap();
+        engine.deposit(ACCT_B, BTC, 10_000).unwrap();
+
+        // Rotation 1.
+        engine
+            .execute(
+                Symbol(1),
+                limit_order(1, ACCT_B, Side::Sell, 100, 50),
+                &mut reports,
+            )
+            .unwrap();
+        engine.rotate(&snap_path).unwrap();
+
+        // Rotation 2.
+        engine
+            .execute(
+                Symbol(1),
+                limit_order(2, ACCT_A, Side::Buy, 100, 20),
+                &mut reports,
+            )
+            .unwrap();
+        engine.deposit(ACCT_A, BTC, 500).unwrap();
+        engine.rotate(&snap_path).unwrap();
+
+        // Rotation 3.
+        engine.deposit(ACCT_B, USD, 999).unwrap();
+        engine
+            .execute(
+                Symbol(1),
+                limit_order(3, ACCT_A, Side::Buy, 100, 10),
+                &mut reports,
+            )
+            .unwrap();
+        engine.rotate(&snap_path).unwrap();
+
+        // Post-rotation events in the final journal segment.
+        engine.deposit(ACCT_A, USD, 111).unwrap();
+        engine.deposit(ACCT_B, BTC, 222).unwrap();
+        engine
+            .execute(
+                Symbol(1),
+                limit_order(4, ACCT_B, Side::Sell, 110, 100),
+                &mut reports,
+            )
+            .unwrap();
+
+        // Reference state.
+        let ref_bal_a_usd = engine.exchange().accounts().balance(ACCT_A, USD).available;
+        let ref_bal_b_btc = engine.exchange().accounts().balance(ACCT_B, BTC).available;
+        let final_seq = engine.next_sequence();
+        drop(engine);
+
+        let end = valid_data_end(&journal_path);
+        let header_end = crate::journal::codec::FILE_HEADER_SIZE as u64;
+
+        let work = dir.path().join("work_multi.journal");
+
+        // Shrink to valid data size to avoid copying 256 MiB per iteration.
+        {
+            let f = std::fs::OpenOptions::new()
+                .write(true)
+                .open(&journal_path)
+                .unwrap();
+            f.set_len(end).unwrap();
+        }
+
+        // Truncate at every 10th byte to keep runtime reasonable.
+        let mut trunc_at = header_end;
+        while trunc_at <= end {
+            copy_file(&journal_path, &work);
+            {
+                let f = std::fs::OpenOptions::new().write(true).open(&work).unwrap();
+                f.set_len(trunc_at).unwrap();
+            }
+
+            let je =
+                JournaledExchange::recover_from_snapshot(&snap_path, &work).unwrap();
+
+            // Sequence must not exceed the full reference.
+            assert!(
+                je.next_sequence() <= final_seq,
+                "seq overshoot at byte {trunc_at}"
+            );
+
+            // Must be able to append after recovery.
+            drop(je);
+            let mut je2 =
+                JournaledExchange::recover_from_snapshot(&snap_path, &work).unwrap();
+            je2.deposit(ACCT_A, USD, 1).unwrap();
+
+            trunc_at += 10;
+        }
+
+        // Full recovery (no truncation) must match reference.
+        let full = JournaledExchange::recover_from_snapshot(&snap_path, &journal_path).unwrap();
+        assert_eq!(
+            full.exchange().accounts().balance(ACCT_A, USD).available,
+            ref_bal_a_usd
+        );
+        assert_eq!(
+            full.exchange().accounts().balance(ACCT_B, BTC).available,
+            ref_bal_b_btc
+        );
+    }
+
+    // -- Helpers for crash_recovery_under_realistic_load --
+
+    /// A journalable event for replay testing.
+    enum TestEvent {
+        AddInstrument(InstrumentSpec),
+        Deposit(AccountId, CurrencyId, u64),
+        Submit(Symbol, Order),
+        Cancel(Symbol, AccountId, OrderId),
+        SetRiskLimits(Symbol, RiskLimits),
+        SetCircuitBreaker(Symbol, CircuitBreakerConfig),
+        Withdraw(AccountId, CurrencyId, u64),
+    }
+
+    /// Build a deterministic list of events exercising multiple code paths.
+    fn build_event_list() -> Vec<TestEvent> {
+        let mut events = Vec::new();
+
+        // Setup.
+        events.push(TestEvent::AddInstrument(btc_usd_spec()));
+        events.push(TestEvent::Deposit(ACCT_A, USD, 50_000_000));
+        events.push(TestEvent::Deposit(ACCT_B, BTC, 100_000));
+        events.push(TestEvent::Deposit(ACCT_B, USD, 10_000_000));
+
+        // Config.
+        events.push(TestEvent::SetRiskLimits(
+            Symbol(1),
+            RiskLimits {
+                max_order_qty: Some(qty(10_000)),
+                max_order_notional: None,
+            },
+        ));
+        events.push(TestEvent::SetCircuitBreaker(
+            Symbol(1),
+            CircuitBreakerConfig {
+                price_band_lower: Some(price(1)),
+                price_band_upper: Some(price(10_000)),
+                halted: false,
+            },
+        ));
+
+        // Build up the order book: 20 sell levels, 20 buy levels.
+        for i in 1..=20 {
+            events.push(TestEvent::Submit(
+                Symbol(1),
+                limit_order(i, ACCT_B, Side::Sell, 100 + i, 500),
+            ));
+        }
+        for i in 21..=40 {
+            events.push(TestEvent::Submit(
+                Symbol(1),
+                limit_order(i, ACCT_A, Side::Buy, 100 - (i - 20), 300),
+            ));
+        }
+
+        // Aggressive orders that fill.
+        for i in 41..=50 {
+            events.push(TestEvent::Submit(
+                Symbol(1),
+                limit_order(i, ACCT_A, Side::Buy, 101, 10),
+            ));
+        }
+
+        // Cancels.
+        for id in [22, 25, 28, 31, 34, 37] {
+            events.push(TestEvent::Cancel(Symbol(1), ACCT_A, OrderId(id)));
+        }
+
+        // Withdrawals.
+        events.push(TestEvent::Withdraw(ACCT_A, USD, 1_000));
+        events.push(TestEvent::Withdraw(ACCT_B, BTC, 500));
+
+        // More orders after cancels.
+        for i in 51..=60 {
+            events.push(TestEvent::Submit(
+                Symbol(1),
+                limit_order(i, ACCT_A, Side::Buy, 85 + (i - 51), 100),
+            ));
+        }
+
+        events
+    }
+
+    /// Apply a TestEvent to a JournaledExchange.
+    fn apply_event(
+        je: &mut JournaledExchange,
+        evt: &TestEvent,
+        reports: &mut Vec<ExecutionReport>,
+    ) {
+        match evt {
+            TestEvent::AddInstrument(spec) => {
+                je.add_instrument(*spec).unwrap();
+            }
+            TestEvent::Deposit(acct, cur, amt) => {
+                je.deposit(*acct, *cur, *amt).unwrap();
+            }
+            TestEvent::Submit(sym, order) => {
+                je.execute(*sym, *order, reports).unwrap();
+            }
+            TestEvent::Cancel(sym, acct, oid) => {
+                je.cancel(*sym, *acct, *oid, reports).unwrap();
+            }
+            TestEvent::SetRiskLimits(sym, lim) => {
+                je.set_risk_limits(*sym, *lim).unwrap();
+            }
+            TestEvent::SetCircuitBreaker(sym, cfg) => {
+                je.set_circuit_breaker(*sym, *cfg).unwrap();
+            }
+            TestEvent::Withdraw(acct, cur, amt) => {
+                je.withdraw(*acct, *cur, *amt).unwrap();
+            }
+        }
+    }
 }
