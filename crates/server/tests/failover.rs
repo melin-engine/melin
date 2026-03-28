@@ -33,17 +33,16 @@ use melin_protocol::types::{
 /// Find the melin-server binary. In integration tests for the server crate,
 /// Cargo sets `CARGO_BIN_EXE_melin-server` automatically.
 fn server_bin() -> PathBuf {
-    // Prefer the release binary — the debug binary is too slow for
-    // pipeline prefaulting and account seeding. Fall back to debug
-    // if release hasn't been built.
+    // Use CARGO_BIN_EXE (debug binary, same compilation as the test).
+    // This ensures the test binary and server binary use the same codec.
+    if let Ok(p) = std::env::var("CARGO_BIN_EXE_melin-server") {
+        return PathBuf::from(p);
+    }
+    // Fallback: release binary.
     let release = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../../target/release/melin-server");
     if release.exists() {
         return release;
-    }
-    // Integration tests in the same package get this env var (debug binary).
-    if let Ok(p) = std::env::var("CARGO_BIN_EXE_melin-server") {
-        return PathBuf::from(p);
     }
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../../target/debug/melin-server")
@@ -400,6 +399,9 @@ fn kill_primary_promote_replica_no_data_loss() {
     let mut client2 =
         Client::connect(replica.client_addr, &key2).expect("connect to promoted replica");
 
+    // Give the pipeline a moment to fully initialize all stages.
+    std::thread::sleep(Duration::from_secs(1));
+
     // Place a new order on the promoted replica. The order ID must be
     // higher than anything previously submitted — the dedup HWM was
     // replayed from the journal, so re-using an old ID would be rejected
@@ -407,7 +409,7 @@ fn kill_primary_promote_replica_no_data_loss() {
     // full HWM history.
     let responses = client2
         .send_request(&Request::SubmitOrder {
-            symbol: Symbol(0),
+            symbol: Symbol(1),
             order: Order {
                 id: OrderId(num_orders + 1),
                 account: AccountId(1),
@@ -450,7 +452,7 @@ fn kill_primary_promote_replica_no_data_loss() {
     // (journal + matching + response stages all running).
     let responses2 = client2
         .send_request(&Request::SubmitOrder {
-            symbol: Symbol(0),
+            symbol: Symbol(1),
             order: Order {
                 id: OrderId(num_orders + 2),
                 account: AccountId(1),
