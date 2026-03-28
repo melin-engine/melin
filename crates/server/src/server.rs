@@ -1148,9 +1148,83 @@ pub fn run_dpdk(
     // Actual queue count may be less than requested (TAP only supports 1).
     let num_dpdk_threads = shared.num_queues as usize;
 
+    // --- Replica mode (DPDK) ---
+    // If --replica-of is set, run the DPDK replication receiver instead
+    // of the primary path. The receiver uses one queue pair for the
+    // outbound connection to the primary.
+    if let Some(primary_addr) = config.replica_of {
+        info!(primary = %primary_addr, "starting in replica mode (DPDK)");
+
+        let promote_flag = Arc::new(AtomicBool::new(false));
+        let _promote_handle = config.promote_bind.map(|addr| {
+            crate::promote::spawn(addr, Arc::clone(&promote_flag), Arc::clone(&shutdown))
+        });
+
+        // Use queue 0 for the replication receiver's smoltcp connection.
+        // Listen port is unused (receiver connects outbound, doesn't listen),
+        // but DpdkTransport requires one — use an ephemeral port.
+        let repl_transport = melin_dpdk::DpdkTransport::from_shared_with_port(
+            &shared,
+            &dpdk_config,
+            0,
+            39999, // Ephemeral — receiver connects outbound, doesn't accept.
+        )?;
+
+        let primary_ipv4 = match primary_addr.ip() {
+            std::net::IpAddr::V4(ip) => ip,
+            std::net::IpAddr::V6(_) => {
+                return Err("DPDK replication requires IPv4".into());
+            }
+        };
+
+        match crate::replication::run_receiver_dpdk(
+            repl_transport,
+            primary_ipv4,
+            primary_addr.port(),
+            &config.journal,
+            &shutdown,
+            &promote_flag,
+        )? {
+            None => return Ok(()), // clean shutdown
+            Some((mut exchange, writer)) => {
+                // Promotion! Transition to primary mode (DPDK).
+                info!("replica promoted (DPDK) — transitioning to primary");
+                exchange.prefault();
+
+                let authorized_keys = Arc::new(AuthorizedKeys::load(&config.authorized_keys)?);
+                info!(
+                    keys = authorized_keys.len(),
+                    path = %config.authorized_keys.display(),
+                    "loaded authorized keys"
+                );
+
+                // TODO: run_as_primary_dpdk — for now, fall back to
+                // kernel TCP primary after promotion.
+                warn!("DPDK primary promotion not yet implemented — falling back to kernel TCP");
+                let listener = melin_protocol::tcp::BlockingTcpListener::bind(config.bind)?;
+                return run_as_primary(
+                    exchange,
+                    writer,
+                    listener,
+                    &config,
+                    shutdown,
+                    authorized_keys,
+                    false,
+                );
+            }
+        }
+    }
+
     // Create per-thread transports (each gets its own queue pair + smoltcp stack).
-    let mut transports = Vec::with_capacity(num_dpdk_threads);
-    for q in 0..num_dpdk_threads {
+    // In primary mode with replication, the last queue is reserved for the
+    // replication sender — only create client transports for queues 0..N-1.
+    let num_client_queues = if config.replication_bind.is_some() {
+        num_dpdk_threads.saturating_sub(1)
+    } else {
+        num_dpdk_threads
+    };
+    let mut transports = Vec::with_capacity(num_client_queues);
+    for q in 0..num_client_queues {
         transports.push(melin_dpdk::DpdkTransport::from_shared(
             &shared,
             &dpdk_config,
@@ -1299,46 +1373,58 @@ pub fn run_dpdk(
         })
         .expect("failed to spawn response thread");
 
-    // Spawn replication sender if enabled (identical to epoll path).
+    // Spawn DPDK replication sender if enabled. Uses its own DPDK queue pair
+    // and smoltcp stack so the replication channel goes through kernel bypass.
     let replica_ready = Arc::new(AtomicBool::new(false));
-    let replication_handle = if let Some((repl_consumer_1, repl_consumer_2)) = replication_consumers
+    // DPDK replication sender currently supports single-replica only.
+    // The second consumer from the dual-replica pipeline is unused here.
+    let replication_handle = if let Some((repl_consumer_1, _repl_consumer_2)) = replication_consumers
     {
         let repl_bind = config
             .replication_bind
             .expect("replication_bind must be set");
+        let repl_port = repl_bind.port();
+
+        // Create a DpdkTransport for the replication sender with its own
+        // queue pair. The queue ID is num_dpdk_threads (the next available
+        // after the client poll threads).
+        let repl_transport = melin_dpdk::DpdkTransport::from_shared_with_port(
+            &shared,
+            &dpdk_config,
+            num_dpdk_threads as u16,
+            repl_port,
+        )
+        .expect("failed to create DPDK transport for replication");
+
         let s_repl = Arc::clone(&shutdown);
         let repl_cursor = Arc::clone(&replication_cursor);
         let ready_flag = Arc::clone(&replica_ready);
-        let connected_counter = replicas_connected
-            .clone()
-            .expect("replicas_connected must be Some when replication is enabled");
+        // DPDK sender uses AtomicBool (single-replica). The dual-replica
+        // AtomicU32 counter is used by the DPDK poll loop (passed separately).
+        let connected_flag = Arc::new(AtomicBool::new(false));
+        let connected_bridge = Arc::clone(&connected_flag);
         let batch_size = config.replication_batch_size;
         let heartbeat_secs = config.replication_heartbeat_secs;
         let busy_spin = !config.yield_idle;
-        let journal_path = config.journal.clone();
-        let repl_auth_keys = Arc::clone(&authorized_keys);
         let repl_sender_handle = std::thread::Builder::new()
             .name("repl-sender".into())
             .spawn(move || {
                 apply_affinity("repl-sender", cores.repl_sender);
-                crate::replication::run_sender(
-                    repl_bind,
+                crate::replication::run_sender_dpdk(
+                    repl_transport,
                     repl_consumer_1,
-                    repl_consumer_2,
                     repl_cursor,
                     genesis_entry,
-                    journal_path,
-                    repl_auth_keys,
                     &s_repl,
                     &ready_flag,
-                    &connected_counter,
+                    &connected_bridge,
                     batch_size,
                     heartbeat_secs,
                     busy_spin,
                 );
             })
             .expect("failed to spawn replication sender thread");
-        info!(addr = %repl_bind, "replication listener started");
+        info!(addr = %repl_bind, "DPDK replication sender started");
         Some(repl_sender_handle)
     } else {
         if !config.standalone && config.replica_of.is_none() {

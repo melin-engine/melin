@@ -74,7 +74,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             listen_port: config.bind.port(),
             mtu: config.dpdk_mtu,
             vlan_id: config.dpdk_vlan,
-            num_queues: config.readers as u16,
+            // Extra queue pair for the replication sender when replication
+            // is enabled. The repl-sender thread gets its own smoltcp stack.
+            num_queues: if config.replication_bind.is_some() || config.replica_of.is_some() {
+                config.readers as u16 + 1
+            } else {
+                config.readers as u16
+            },
         };
         melin_server::server::run_dpdk(config, dpdk_config, shutdown)
     }

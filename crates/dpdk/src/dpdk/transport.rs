@@ -61,6 +61,7 @@ const SOCKET_BUF_SIZE: usize = 64 * 1024;
 const TIMESTAMP_REFRESH_INTERVAL: u32 = 100;
 
 /// Configuration for the DPDK transport.
+#[derive(Clone)]
 pub struct DpdkConfig {
     pub eal_args: Vec<String>,
     /// DPDK port IDs to poll. The first port is used for TX; all ports
@@ -357,6 +358,64 @@ impl DpdkTransport {
             pending_tx_bytes: 0,
             handle_buf: Vec::with_capacity(MAX_CONNECTIONS),
         })
+    }
+
+    /// Like `from_shared` but overrides the listen port.
+    ///
+    /// Used by the replication sender to listen on the replication port
+    /// instead of the trading port, while sharing the same DPDK NIC and
+    /// IP address.
+    pub fn from_shared_with_port(
+        shared: &Arc<DpdkShared>,
+        config: &DpdkConfig,
+        queue_id: u16,
+        listen_port: u16,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
+        let mut overridden = config.clone();
+        overridden.listen_port = listen_port;
+        Self::from_shared(shared, &overridden, queue_id)
+    }
+
+    /// Open an outbound TCP connection to a remote endpoint.
+    ///
+    /// Creates a new smoltcp TCP socket, calls `socket.connect()` to
+    /// initiate the TCP handshake, and returns the socket handle. The
+    /// caller must poll the transport until `is_connected(handle)` returns
+    /// true before sending data.
+    pub fn connect_to(
+        &mut self,
+        remote_ip: std::net::Ipv4Addr,
+        remote_port: u16,
+        local_port: u16,
+    ) -> SocketHandle {
+        let rx_buf = tcp::SocketBuffer::new(vec![0u8; SOCKET_BUF_SIZE]);
+        let tx_buf = tcp::SocketBuffer::new(vec![0u8; SOCKET_BUF_SIZE]);
+        let mut socket = tcp::Socket::new(rx_buf, tx_buf);
+        tune_socket(&mut socket);
+
+        let remote_addr = Ipv4Address::new(
+            remote_ip.octets()[0],
+            remote_ip.octets()[1],
+            remote_ip.octets()[2],
+            remote_ip.octets()[3],
+        );
+        let local_ip = self.iface.ipv4_addr().expect("interface has IPv4 address");
+        socket
+            .connect(
+                self.iface.context(),
+                (IpAddress::Ipv4(remote_addr), remote_port),
+                (IpAddress::Ipv4(local_ip), local_port),
+            )
+            .expect("smoltcp connect failed");
+
+        self.sockets.add(socket)
+    }
+
+    /// Check if a socket has completed the TCP handshake and is ready
+    /// for data transfer (both send and receive directions open).
+    pub fn is_connected(&mut self, handle: SocketHandle) -> bool {
+        let socket = self.sockets.get_mut::<tcp::Socket>(handle);
+        socket.may_send() && socket.may_recv()
     }
 
     /// Convenience: initialize shared resources + create a single-queue transport.

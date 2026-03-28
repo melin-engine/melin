@@ -1606,6 +1606,565 @@ fn replay_event(
     }
 }
 
+// --- DPDK replication (smoltcp transport) ---
+
+/// Result of trying to extract one length-prefixed frame from a buffer.
+#[cfg(feature = "dpdk")]
+enum FrameResult {
+    /// Complete frame found: payload starts at index 0, frame ends at index 1.
+    Complete(usize, usize),
+    /// Not enough data for a complete frame — wait for more.
+    Incomplete,
+    /// Frame exceeds max_size or is malformed — connection should be dropped.
+    Oversized,
+}
+
+/// Try to extract one length-prefixed frame from a receive buffer.
+#[cfg(feature = "dpdk")]
+fn try_extract_frame(buf: &[u8], max_size: usize) -> FrameResult {
+    if buf.len() < 4 {
+        return FrameResult::Incomplete;
+    }
+    let len = u32::from_le_bytes(buf[0..4].try_into().unwrap()) as usize;
+    if len == 0 || len > max_size {
+        return FrameResult::Oversized;
+    }
+    if buf.len() < 4 + len {
+        return FrameResult::Incomplete;
+    }
+    FrameResult::Complete(4, 4 + len)
+}
+
+/// Compact a receive buffer by removing consumed bytes from the front.
+#[cfg(feature = "dpdk")]
+fn compact_recv_buf(buf: &mut Vec<u8>, consumed: usize) {
+    if consumed > 0 {
+        buf.drain(..consumed);
+    }
+}
+
+/// DPDK variant of the replication sender. Uses a `DpdkTransport` (smoltcp)
+/// instead of kernel TCP. The replication sender thread gets its own DPDK
+/// queue pair for independent NIC access.
+///
+/// The protocol is identical to `run_sender` — same wire format, same
+/// handshake, same streaming logic. Only the I/O primitives differ.
+#[cfg(feature = "dpdk")]
+pub fn run_sender_dpdk(
+    mut transport: melin_dpdk::DpdkTransport,
+    mut repl_consumer: ReplicationConsumer,
+    replication_cursor: Arc<AtomicU64>,
+    genesis_entry: Vec<u8>,
+    shutdown: &AtomicBool,
+    replica_ready: &AtomicBool,
+    replica_connected: &AtomicBool,
+    batch_size: usize,
+    heartbeat_secs: u64,
+    busy_spin: bool,
+) {
+    info!("DPDK replication sender started");
+
+    /// Sender state machine.
+    enum State {
+        /// Waiting for a replica to connect.
+        WaitingForReplica,
+        /// Replica connected, performing handshake.
+        Handshaking(melin_dpdk::SocketHandle),
+        /// Streaming journal data to replica.
+        Streaming(melin_dpdk::SocketHandle),
+    }
+
+    let mut state = State::WaitingForReplica;
+    let mut recv_buf: Vec<u8> = Vec::with_capacity(4096);
+    let mut send_buf: Vec<u8> = Vec::with_capacity(512 * 1024);
+    let heartbeat_interval = std::time::Duration::from_secs(heartbeat_secs);
+    let mut last_send = std::time::Instant::now();
+    let mut last_sequence: u64 = 0;
+    let mut last_chain_hash: [u8; 32] = [0u8; 32];
+
+    loop {
+        if shutdown.load(Ordering::Relaxed) {
+            info!("DPDK replication sender shutting down");
+            return;
+        }
+
+        // Drive smoltcp (rx/tx, timers, retransmit).
+        transport.poll();
+
+        match state {
+            State::WaitingForReplica => {
+                // Check for accepted connections.
+                let accepted = transport.take_accepted();
+                if let Some(conn) = accepted.into_iter().next() {
+                    info!(peer = ?conn.peer, "replica connected via DPDK");
+                    replica_ready.store(true, Ordering::Release);
+                    replica_connected.store(true, Ordering::Release);
+                    recv_buf.clear();
+                    state = State::Handshaking(conn.handle);
+                    continue;
+                }
+
+                // Drain batches to avoid blocking the replication ring.
+                if replica_ready.load(Ordering::Relaxed) {
+                    drain_batches_while_waiting(&mut repl_consumer);
+                }
+
+                if busy_spin {
+                    std::hint::spin_loop();
+                } else {
+                    std::thread::yield_now();
+                }
+            }
+
+            State::Handshaking(handle) => {
+                // Try to read handshake frame.
+                transport.recv_into_vec(handle, &mut recv_buf);
+
+                match try_extract_frame(&recv_buf, MAX_CONTROL_FRAME) {
+                    FrameResult::Complete(payload_start, frame_end) => {
+                        let payload = &recv_buf[payload_start..frame_end];
+                        match decode_replica_message(payload) {
+                            Ok(ReplicaMessage::Handshake(h)) => {
+                                info!(
+                                    last_sequence = h.last_sequence,
+                                    "replica handshake received (DPDK)"
+                                );
+
+                                // Send StreamStart.
+                                send_buf.clear();
+                                encode_stream_start(
+                                    h.last_sequence,
+                                    &genesis_entry,
+                                    &mut send_buf,
+                                );
+                                transport.queue_send(handle, &send_buf);
+                                send_buf.clear();
+
+                                // Reset cursor.
+                                replication_cursor
+                                    .store(h.last_sequence + 1, Ordering::Release);
+
+                                last_sequence = h.last_sequence;
+                                last_chain_hash = h.chain_hash;
+                                last_send = std::time::Instant::now();
+
+                                compact_recv_buf(&mut recv_buf, frame_end);
+                                state = State::Streaming(handle);
+                            }
+                            Ok(ReplicaMessage::Ack(_)) => {
+                                warn!("expected Handshake, got Ack — disconnecting");
+                                transport.close(handle);
+                                replication_cursor.store(u64::MAX, Ordering::Release);
+                                replica_connected.store(false, Ordering::Release);
+                                state = State::WaitingForReplica;
+                            }
+                            Err(e) => {
+                                warn!(error = %e, "failed to decode handshake — disconnecting");
+                                transport.close(handle);
+                                replication_cursor.store(u64::MAX, Ordering::Release);
+                                replica_connected.store(false, Ordering::Release);
+                                state = State::WaitingForReplica;
+                            }
+                        }
+                    }
+                    FrameResult::Oversized => {
+                        warn!("oversized handshake frame — disconnecting");
+                        transport.close(handle);
+                        replication_cursor.store(u64::MAX, Ordering::Release);
+                        replica_connected.store(false, Ordering::Release);
+                        state = State::WaitingForReplica;
+                    }
+                    FrameResult::Incomplete => {} // Wait for more data.
+                }
+
+                // Check for disconnect during handshake.
+                if matches!(state, State::Handshaking(h) if !transport.is_active(h)) {
+                    warn!("replica disconnected during handshake");
+                    replication_cursor.store(u64::MAX, Ordering::Release);
+                    replica_connected.store(false, Ordering::Release);
+                    state = State::WaitingForReplica;
+                }
+            }
+
+            State::Streaming(handle) => {
+                // 1. Process acks (non-blocking).
+                transport.recv_into_vec(handle, &mut recv_buf);
+                let mut consumed = 0;
+                let mut ack_error = false;
+                loop {
+                    let remaining = &recv_buf[consumed..];
+                    match try_extract_frame(remaining, MAX_CONTROL_FRAME) {
+                        FrameResult::Complete(payload_start, frame_end) => {
+                            let payload = &remaining[payload_start..frame_end];
+                            if let Ok(ReplicaMessage::Ack(ack)) = decode_replica_message(payload) {
+                                let new_val = ack.acked_sequence + 1;
+                                let _ = replication_cursor.fetch_max(new_val, Ordering::Release);
+                            }
+                            consumed += frame_end;
+                        }
+                        FrameResult::Oversized => {
+                            warn!("oversized ack frame from replica — disconnecting");
+                            ack_error = true;
+                            break;
+                        }
+                        FrameResult::Incomplete => break,
+                    }
+                }
+                compact_recv_buf(&mut recv_buf, consumed);
+                if ack_error {
+                    transport.close(handle);
+                    replication_cursor.store(u64::MAX, Ordering::Release);
+                    replica_connected.store(false, Ordering::Release);
+                    recv_buf.clear();
+                    state = State::WaitingForReplica;
+                    continue;
+                }
+
+                // 2. Send data batches.
+                send_buf.clear();
+                let mut batches_sent = 0;
+                if let Some((meta, data)) = repl_consumer.try_read() {
+                    encode_data_batch(
+                        meta.end_sequence,
+                        &meta.chain_hash,
+                        meta.entry_count,
+                        data,
+                        &mut send_buf,
+                    );
+                    repl_consumer.commit();
+                    last_sequence = meta.end_sequence;
+                    last_chain_hash = meta.chain_hash;
+                    batches_sent += 1;
+
+                    // Coalesce more batches.
+                    for _ in 1..batch_size {
+                        if let Some((meta, data)) = repl_consumer.try_read() {
+                            encode_data_batch(
+                                meta.end_sequence,
+                                &meta.chain_hash,
+                                meta.entry_count,
+                                data,
+                                &mut send_buf,
+                            );
+                            repl_consumer.commit();
+                            last_sequence = meta.end_sequence;
+                            last_chain_hash = meta.chain_hash;
+                            batches_sent += 1;
+                        } else {
+                            break;
+                        }
+                    }
+
+                    transport.queue_send(handle, &send_buf);
+                    last_send = std::time::Instant::now();
+                }
+
+                // 3. Heartbeat if idle.
+                if batches_sent == 0 && last_send.elapsed() >= heartbeat_interval {
+                    send_buf.clear();
+                    encode_heartbeat(last_sequence, &last_chain_hash, &mut send_buf);
+                    transport.queue_send(handle, &send_buf);
+                    last_send = std::time::Instant::now();
+                }
+
+                // 4. Check for disconnect.
+                if !transport.is_active(handle) {
+                    warn!("replica disconnected (DPDK) — trading halted");
+                    replication_cursor.store(u64::MAX, Ordering::Release);
+                    replica_connected.store(false, Ordering::Release);
+                    recv_buf.clear();
+                    state = State::WaitingForReplica;
+                    continue;
+                }
+
+                if batches_sent == 0 {
+                    if busy_spin {
+                        std::hint::spin_loop();
+                    } else {
+                        std::thread::yield_now();
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// DPDK variant of the replication receiver. Uses a `DpdkTransport` (smoltcp)
+/// to connect to the primary via DPDK instead of kernel TCP.
+///
+/// The protocol is identical to `run_receiver` — same wire format, same
+/// fsync-then-ack-then-replay pattern. Only the I/O primitives differ.
+#[cfg(feature = "dpdk")]
+pub fn run_receiver_dpdk(
+    mut transport: melin_dpdk::DpdkTransport,
+    primary_ip: std::net::Ipv4Addr,
+    primary_port: u16,
+    journal_path: &std::path::Path,
+    shutdown: &AtomicBool,
+    promote: &AtomicBool,
+) -> ReceiverResult {
+    use melin_engine::exchange::Exchange;
+    use melin_engine::journal::writer::JournalWriter;
+
+    info!(
+        primary_ip = %primary_ip,
+        primary_port,
+        "connecting to primary as replica (DPDK)"
+    );
+
+    // Determine our current state from the local journal (if any).
+    let (mut exchange, mut journal_writer, last_sequence, chain_hash) = if journal_path.exists() {
+        let engine = melin_engine::journal::JournaledExchange::recover(journal_path)?;
+        let next = engine.next_sequence();
+        let last = next.saturating_sub(1);
+        let hash = engine.writer_chain_hash().unwrap_or([0u8; 32]);
+        let (exchange, writer) = engine.into_parts();
+        (Some(exchange), Some(writer), last, hash)
+    } else {
+        (None, None, 0u64, [0u8; 32])
+    };
+
+    // Connect to primary via smoltcp.
+    let handle = transport.connect_to(primary_ip, primary_port, 40000);
+
+    // Poll until TCP handshake completes.
+    loop {
+        if shutdown.load(Ordering::Relaxed) {
+            return Ok(None);
+        }
+        transport.poll();
+        if transport.is_connected(handle) {
+            break;
+        }
+        std::thread::yield_now();
+    }
+    info!("connected to primary (DPDK)");
+
+    // Send handshake.
+    let mut send_buf = Vec::with_capacity(64);
+    let handshake = Handshake {
+        last_sequence,
+        chain_hash,
+    };
+    encode_handshake(&handshake, &mut send_buf);
+    transport.queue_send(handle, &send_buf);
+    send_buf.clear();
+
+    // Read StreamStart.
+    let mut recv_buf: Vec<u8> = Vec::with_capacity(4096);
+    let primary_genesis_entry = loop {
+        if shutdown.load(Ordering::Relaxed) {
+            return Ok(None);
+        }
+        transport.poll();
+        transport.recv_into_vec(handle, &mut recv_buf);
+
+        match try_extract_frame(&recv_buf, MAX_CONTROL_FRAME) {
+            FrameResult::Complete(payload_start, frame_end) => {
+                let payload = &recv_buf[payload_start..frame_end];
+                let response = decode_primary_message(payload)?;
+                compact_recv_buf(&mut recv_buf, frame_end);
+                match response {
+                    PrimaryMessage::StreamStart {
+                        start_sequence,
+                        genesis_entry,
+                    } => {
+                        info!(start_sequence, "streaming started (DPDK)");
+                        break genesis_entry;
+                    }
+                    PrimaryMessage::NeedSnapshot => {
+                        return Err(
+                            "primary says we need a snapshot transfer (not yet implemented)".into(),
+                        );
+                    }
+                    PrimaryMessage::HashMismatch => {
+                        return Err("chain hash mismatch — replica has divergent history".into());
+                    }
+                    other => {
+                        return Err(format!("unexpected response: {other:?}").into());
+                    }
+                }
+            }
+            FrameResult::Oversized => {
+                return Err("oversized frame from primary during handshake".into());
+            }
+            FrameResult::Incomplete => {}
+        }
+
+        if !transport.is_active(handle) {
+            return Err("disconnected from primary before StreamStart".into());
+        }
+        std::thread::yield_now();
+    };
+
+    // Create journal for fresh replica using the primary's raw genesis entry.
+    if journal_writer.is_none() {
+        use melin_engine::journal::codec::{self as journal_codec, FILE_HEADER_SIZE};
+        use std::fs::OpenOptions;
+        use std::os::unix::fs::FileExt;
+
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(journal_path)?;
+        let mut header = [0u8; FILE_HEADER_SIZE];
+        journal_codec::encode_file_header(&mut header);
+        file.write_all_at(&header, 0)?;
+        file.write_all_at(&primary_genesis_entry, FILE_HEADER_SIZE as u64)?;
+        file.sync_all()?;
+
+        let genesis_chain_hash = {
+            let entry_len = primary_genesis_entry.len();
+            let hash = blake3::hash(&primary_genesis_entry[..entry_len - 4]);
+            *hash.as_bytes()
+        };
+
+        let valid_end = FILE_HEADER_SIZE as u64 + primary_genesis_entry.len() as u64;
+        let writer = JournalWriter::open_append(
+            journal_path,
+            1, // genesis consumed sequence 1
+            valid_end,
+            Some(genesis_chain_hash),
+            0,
+        )?;
+        exchange = Some(Exchange::new());
+        journal_writer = Some(writer);
+    }
+
+    let mut exchange = exchange.expect("exchange initialized");
+    let mut journal_writer = journal_writer.expect("journal_writer initialized");
+    let mut reports: Vec<melin_engine::types::ExecutionReport> = Vec::with_capacity(256);
+
+    // Accumulation buffer for coalescing DataBatch frames into one fsync.
+    let mut journal_accum: Vec<u8> = Vec::with_capacity(128 * 1024);
+    let mut accum_entry_count: u64 = 0;
+    let mut accum_end_sequence: u64 = 0;
+
+    // Main receive loop.
+    loop {
+        if shutdown.load(Ordering::Relaxed) {
+            info!("replica shutting down (DPDK)");
+            return Ok(None);
+        }
+
+        if promote.load(Ordering::Acquire) {
+            info!("promotion triggered (DPDK) — stopping replication");
+            // Drain remaining data from smoltcp buffer.
+            loop {
+                transport.poll();
+                let before = recv_buf.len();
+                transport.recv_into_vec(handle, &mut recv_buf);
+                if recv_buf.len() == before {
+                    break;
+                }
+                // Parse any complete DataBatch frames.
+                let mut consumed = 0;
+                loop {
+                    let remaining = &recv_buf[consumed..];
+                    match try_extract_frame(remaining, MAX_DATA_FRAME) {
+                        FrameResult::Complete(ps, fe) => {
+                            if let Ok(PrimaryMessage::DataBatch {
+                                entry_count,
+                                journal_bytes,
+                                ..
+                            }) = decode_primary_message(&remaining[ps..fe])
+                            {
+                                journal_accum.extend_from_slice(&journal_bytes);
+                                accum_entry_count += entry_count as u64;
+                            }
+                            consumed += fe;
+                        }
+                        _ => {
+                            break;
+                        }
+                    }
+                }
+                compact_recv_buf(&mut recv_buf, consumed);
+            }
+            if !journal_accum.is_empty() {
+                journal_writer.write_raw_sync(&journal_accum, accum_entry_count)?;
+                replay_journal_bytes(&journal_accum, &mut exchange, &mut reports)?;
+                journal_accum.clear();
+            }
+            return Ok(Some((exchange, journal_writer)));
+        }
+
+        // Poll smoltcp and receive data.
+        transport.poll();
+        transport.recv_into_vec(handle, &mut recv_buf);
+
+        // Check for disconnect.
+        if !transport.is_active(handle) && recv_buf.is_empty() {
+            return Err("disconnected from primary (DPDK)".into());
+        }
+
+        // Parse frames from the receive buffer.
+        let mut consumed = 0;
+        let mut got_data = false;
+        loop {
+            let remaining = &recv_buf[consumed..];
+            match try_extract_frame(remaining, MAX_DATA_FRAME) {
+                FrameResult::Complete(payload_start, frame_end) => {
+                    let payload = &remaining[payload_start..frame_end];
+                    match decode_primary_message(payload) {
+                        Ok(PrimaryMessage::DataBatch {
+                            end_sequence,
+                            entry_count,
+                            journal_bytes,
+                            ..
+                        }) => {
+                            journal_accum.extend_from_slice(&journal_bytes);
+                            accum_entry_count += entry_count as u64;
+                            accum_end_sequence = end_sequence;
+                            got_data = true;
+                        }
+                        Ok(PrimaryMessage::Heartbeat {
+                            sequence,
+                            chain_hash: _,
+                        }) => {
+                            debug!(sequence, "heartbeat from primary (DPDK)");
+                        }
+                        Ok(other) => {
+                            debug!("unexpected message during streaming: {other:?}");
+                        }
+                        Err(e) => {
+                            return Err(format!("failed to decode primary message: {e}").into());
+                        }
+                    }
+                    consumed += frame_end;
+                }
+                FrameResult::Oversized => {
+                    return Err("oversized frame from primary during streaming".into());
+                }
+                FrameResult::Incomplete => break,
+            }
+        }
+        compact_recv_buf(&mut recv_buf, consumed);
+
+        // Fsync + ack + replay if we accumulated data.
+        if got_data {
+            journal_writer.write_raw_sync(&journal_accum, accum_entry_count)?;
+
+            // Ack immediately — data is durable on disk.
+            send_buf.clear();
+            let ack = Ack {
+                acked_sequence: accum_end_sequence,
+            };
+            encode_ack(&ack, &mut send_buf);
+            transport.queue_send(handle, &send_buf);
+
+            // Replay AFTER acking — not on the critical path.
+            replay_journal_bytes(&journal_accum, &mut exchange, &mut reports)?;
+
+            journal_accum.clear();
+            accum_entry_count = 0;
+        } else {
+            std::thread::yield_now();
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
