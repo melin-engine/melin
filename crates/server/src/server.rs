@@ -1386,12 +1386,12 @@ pub fn run_dpdk(
         let repl_port = repl_bind.port();
 
         // Create a DpdkTransport for the replication sender with its own
-        // queue pair. The queue ID is num_dpdk_threads (the next available
-        // after the client poll threads).
+        // queue pair. Client transports use queues 0..num_client_queues-1;
+        // the replication sender gets the next one (num_client_queues).
         let repl_transport = melin_dpdk::DpdkTransport::from_shared_with_port(
             &shared,
             &dpdk_config,
-            num_dpdk_threads as u16,
+            num_client_queues as u16,
             repl_port,
         )
         .expect("failed to create DPDK transport for replication");
