@@ -289,6 +289,11 @@ struct BenchArgs {
     /// config. For remote mode (`--addr`), must be provided explicitly.
     #[arg(long)]
     health_addr: Option<std::net::SocketAddr>,
+    /// Maximum events per journal fsync batch (pipeline mode only). Smaller
+    /// values reduce tail latency, larger values improve throughput with
+    /// real fsync. Default 4096. Try 256 for low-latency no-persist runs.
+    #[arg(long, default_value_t = 4096)]
+    max_journal_batch: usize,
 }
 
 fn main() {
@@ -319,6 +324,7 @@ fn main() {
                 args.warmup,
                 args.journal,
                 json_path,
+                args.max_journal_batch,
             );
         }
         "roundtrip" => {
@@ -629,10 +635,11 @@ fn run_pipeline_bench(
     warmup: usize,
     journal_path: Option<std::path::PathBuf>,
     json_path: Option<&std::path::Path>,
+    max_journal_batch: usize,
 ) {
     use melin_engine::journal::JournalWriter;
     use melin_engine::journal::event::JournalEvent;
-    use melin_engine::journal::pipeline::{InputSlot, build_pipeline};
+    use melin_engine::journal::pipeline::{InputSlot, build_pipeline_with_replication};
     use melin_engine::journal::trace::trace_ts;
 
     let nz = |v: u64| NonZeroU64::new(v).expect("non-zero");
@@ -660,8 +667,26 @@ fn run_pipeline_bench(
         matching_stage,
         mut output_consumers,
         _journal_cursor,
+        _matching_cursor,
         _events_processed,
-    ) = build_pipeline(exchange, writer, group_commit_delay, active_conns);
+        _input_cursor,
+        _,
+        _,
+        _,
+        _,
+        _,
+    ) = build_pipeline_with_replication(
+        exchange,
+        writer,
+        group_commit_delay,
+        active_conns,
+        false, // no replication
+        max_journal_batch,
+        melin_engine::journal::replication::REPLICATION_RING_CAPACITY,
+        false, // busy_spin
+        false, // event_publisher
+        false, // shadow
+    );
     let mut output_consumer = output_consumers.pop().expect("response consumer");
 
     let shutdown = Arc::new(AtomicBool::new(false));
