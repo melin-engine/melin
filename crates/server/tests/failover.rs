@@ -1018,6 +1018,17 @@ fn replacement_replica_catches_up_from_journal() {
     );
     // Verify the source journal has actual entries (not just genesis).
     {
+        use std::io::Read as _;
+        let mut f = std::fs::File::open(&replica1_journal).expect("open source journal");
+        let mut header = [0u8; 256];
+        f.read_exact(&mut header).expect("read header");
+        // File header = 8 bytes, then entries start.
+        // Print first 256 bytes to see what's in the file.
+        eprintln!(
+            "Source journal first 256 bytes: {:?}",
+            &header[..128]
+        );
+
         let engine = melin_engine::journal::JournaledExchange::recover(&replica1_journal)
             .expect("recover source journal");
         let next_seq = engine.next_sequence();
