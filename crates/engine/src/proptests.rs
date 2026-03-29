@@ -201,6 +201,17 @@ enum ExchangeAction {
         lower: Option<Price>,
         upper: Option<Price>,
     },
+    /// Cancel-replace a previous resting limit order.
+    CancelReplace {
+        target_idx: usize,
+        new_price: Price,
+        new_quantity: Quantity,
+    },
+    /// Set maker/taker fee schedule on the instrument.
+    SetFeeSchedule {
+        maker_fee_bps: i16,
+        taker_fee_bps: i16,
+    },
     /// Expire GTD orders at or before the given timestamp.
     ExpireOrders {
         timestamp_ns: u64,
@@ -236,6 +247,16 @@ fn arb_exchange_action() -> impl Strategy<Value = ExchangeAction> {
             .prop_map(|(halted, lower, upper)| ExchangeAction::SetCircuitBreaker {
                 halted, lower, upper,
             }),
+        // Cancel-replace a previous order with new price/quantity.
+        2 => (0usize..200, arb_price(), arb_quantity()).prop_map(|(target_idx, new_price, new_quantity)| {
+            ExchangeAction::CancelReplace { target_idx, new_price, new_quantity }
+        }),
+        // Set fee schedule (basis points, 0..=100). Rebates (negative fees)
+        // are excluded: they create value funded by the exchange operator's
+        // pre-deposited fee account balance, which the proptest doesn't set up.
+        1 => (0i16..=100, 0i16..=100).prop_map(|(maker_fee_bps, taker_fee_bps)| {
+            ExchangeAction::SetFeeSchedule { maker_fee_bps, taker_fee_bps }
+        }),
         // Occasional ExpireOrders to exercise GTD cancellation.
         // Timestamp range matches GTD expiry range (1..=10_000).
         1 => (1u64..=10_000).prop_map(|timestamp_ns| ExchangeAction::ExpireOrders { timestamp_ns }),
@@ -677,6 +698,40 @@ fn run_exchange_actions(
                     },
                 );
             }
+            ExchangeAction::CancelReplace {
+                target_idx,
+                new_price,
+                new_quantity,
+            } => {
+                action_order_ids.push(None);
+                if *target_idx < action_idx {
+                    if let Some((id, account)) = action_order_ids[*target_idx] {
+                        exchange.cancel_replace(
+                            sym,
+                            account,
+                            id,
+                            *new_price,
+                            *new_quantity,
+                            &mut reports,
+                        );
+                        all_reports.extend_from_slice(&reports);
+                        reports.clear();
+                    }
+                }
+            }
+            ExchangeAction::SetFeeSchedule {
+                maker_fee_bps,
+                taker_fee_bps,
+            } => {
+                action_order_ids.push(None);
+                exchange.set_fee_schedule(
+                    sym,
+                    FeeSchedule {
+                        maker_fee_bps: *maker_fee_bps,
+                        taker_fee_bps: *taker_fee_bps,
+                    },
+                );
+            }
             ExchangeAction::ExpireOrders { timestamp_ns } => {
                 action_order_ids.push(None);
                 exchange.expire_orders(*timestamp_ns, &mut reports);
@@ -866,15 +921,19 @@ proptest! {
         let total_withdrawn_btc = *withdrawn.get(&BTC).unwrap_or(&0);
         let total_withdrawn_usd = *withdrawn.get(&USD).unwrap_or(&0);
 
+        use crate::account::FEE_ACCOUNT;
+
         let accounts = exchange.accounts();
-        let system_btc: u128 = [ACCT_A, ACCT_B]
+        // Include the fee collection account in the system total.
+        let all_accounts = [ACCT_A, ACCT_B, FEE_ACCOUNT];
+        let system_btc: u128 = all_accounts
             .iter()
             .map(|a| {
                 let b = accounts.balance(*a, BTC);
                 b.available as u128 + b.reserved as u128
             })
             .sum();
-        let system_usd: u128 = [ACCT_A, ACCT_B]
+        let system_usd: u128 = all_accounts
             .iter()
             .map(|a| {
                 let b = accounts.balance(*a, USD);
@@ -885,11 +944,8 @@ proptest! {
         let net_btc = total_deposited_btc.saturating_sub(total_withdrawn_btc);
         let net_usd = total_deposited_usd.saturating_sub(total_withdrawn_usd);
 
-        // Skip check when deposits would saturate u64 (saturating_add clips
-        // individual balances, so the system total diverges from deposited).
-        // Strict equality: no FeeSchedule is set in the proptest, so fees
-        // are always zero. If fees are added to the strategy, track
-        // total_fees and use `system == net - fees` instead.
+        // Strict equality: fees are credited to FEE_ACCOUNT, so they stay
+        // in the system. No value is created or destroyed.
         if total_deposited_btc <= u64::MAX as u128 && total_deposited_usd <= u64::MAX as u128 {
             prop_assert_eq!(
                 system_btc, net_btc,

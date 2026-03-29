@@ -21,6 +21,11 @@ use crate::types::{
     RejectReason, Side,
 };
 
+/// Reserved account for collected trading fees. Fees deducted from traders
+/// are credited here so they remain in the system (balance conservation).
+/// The exchange operator can withdraw from this account via the admin API.
+pub const FEE_ACCOUNT: AccountId = AccountId(0);
+
 /// Per-currency balance for an account.
 ///
 /// Split into `available` (free to use) and `reserved` (locked by open orders).
@@ -328,17 +333,22 @@ impl AccountManager {
 
         // Buyer: reserved quote decreases by cost + fee, available base increases.
         // The reservation includes a fee cushion (reserved at placement time
-        // with max_fee_bps), so cost + fee fits within the reservation.
+        // with max_fee_bps), so cost + fee normally fits within the reservation.
+        // If the fee schedule changed after order placement, the cushion may
+        // be insufficient — saturating_sub prevents underflow, and the actual
+        // deducted amount is tracked for fee account crediting below.
         //
         // Signed fees: positive = fee deducted, negative = rebate credited.
-        // cost_i128 + buyer_fee_i128 is clamped to [0, u64::MAX] to handle
-        // rebates that exceed cost (defensive; shouldn't happen in practice).
+        let buyer_actual_deducted;
         {
             let res = &mut self.reservation_slab[buyer_slot.0 as usize];
             let total_deduct_i128 = cost_u64 as i128 + buyer_fee as i128;
             let total_deduct =
                 u64::try_from(total_deduct_i128.clamp(0, u64::MAX as i128)).unwrap_or(0);
+            // Track actual deduction (may be less than requested due to saturation).
+            let old_remaining = res.remaining;
             res.remaining = res.remaining.saturating_sub(total_deduct);
+            buyer_actual_deducted = old_remaining - res.remaining;
             let buyer_account = res.account;
 
             let quote_bal = self
@@ -353,6 +363,7 @@ impl AccountManager {
 
         // Seller: reserved base decreases, available quote increases by cost - fee.
         // Signed: cost - positive_fee = less proceeds; cost - negative_fee = more proceeds (rebate).
+        let seller_actual_proceeds;
         {
             let res = &mut self.reservation_slab[seller_slot.0 as usize];
             res.remaining = res.remaining.saturating_sub(qty);
@@ -371,6 +382,32 @@ impl AccountManager {
             let proceeds_i128 = cost_u64 as i128 - seller_fee as i128;
             let proceeds = u64::try_from(proceeds_i128.clamp(0, u64::MAX as i128)).unwrap_or(0);
             quote_bal.available = quote_bal.available.saturating_add(proceeds);
+            seller_actual_proceeds = proceeds;
+        }
+
+        // Credit fees to the fee collection account. The fee credited is
+        // computed from actual balance movements to maintain conservation:
+        //   fee_credit = buyer_deducted - seller_proceeds
+        // This equals buyer_fee + seller_fee when reservations have
+        // sufficient cushion, but is naturally capped when saturation occurs
+        // (e.g., fee schedule changed after order placement).
+        let fee_credit = buyer_actual_deducted as i128 - seller_actual_proceeds as i128;
+        if fee_credit > 0 {
+            let fee_bal = self
+                .balances
+                .entry((FEE_ACCOUNT, spec.quote))
+                .or_default();
+            fee_bal.available = fee_bal
+                .available
+                .saturating_add(u64::try_from(fee_credit).unwrap_or(u64::MAX));
+        } else if fee_credit < 0 {
+            // Net rebate: funded from fee account.
+            let rebate = u64::try_from(-fee_credit).unwrap_or(u64::MAX);
+            let fee_bal = self
+                .balances
+                .entry((FEE_ACCOUNT, spec.quote))
+                .or_default();
+            fee_bal.available = fee_bal.available.saturating_sub(rebate);
         }
 
         // Note: reservation cleanup (free_slot when remaining == 0) is
