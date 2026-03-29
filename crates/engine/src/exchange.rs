@@ -7743,4 +7743,454 @@ mod tests {
             + fee.available as u128;
         assert_eq!(total, 20_000, "USD must be conserved with stop+fee change");
     }
+
+    // -- Targeted edge-case tests --
+
+    /// Cancel-replace to a price that would cross the spread must be rejected.
+    #[test]
+    fn cancel_replace_crossing_spread_rejected() {
+        let mut exchange = Exchange::new();
+        exchange.add_instrument(btc_usd_spec());
+        exchange.deposit(ACCT_A, USD, 100_000);
+        exchange.deposit(ACCT_B, BTC, 100);
+
+        let mut reports = Vec::new();
+
+        // Sell 10@100 (ask).
+        exchange.execute(
+            Symbol(1),
+            limit_order(1, ACCT_B, Side::Sell, 100, 10, TimeInForce::GTC),
+            &mut reports,
+        );
+        reports.clear();
+
+        // Buy 10@90 (bid, resting below spread).
+        exchange.execute(
+            Symbol(1),
+            limit_order(1, ACCT_A, Side::Buy, 90, 10, TimeInForce::GTC),
+            &mut reports,
+        );
+        reports.clear();
+
+        // Amend buy from 90 to 100 — would cross the ask at 100.
+        exchange.cancel_replace(
+            Symbol(1),
+            ACCT_A,
+            OrderId(1),
+            price(100),
+            qty(10),
+            &mut reports,
+        );
+        assert!(
+            reports.iter().any(|r| matches!(r, ExecutionReport::Rejected {
+                reason: RejectReason::PriceWouldCross, ..
+            })),
+            "cancel-replace crossing spread must be rejected"
+        );
+        // Original order should still be resting at 90.
+        reports.clear();
+        exchange.cancel(Symbol(1), ACCT_A, OrderId(1), &mut reports);
+        assert!(
+            reports.iter().any(|r| matches!(r, ExecutionReport::Cancelled { .. })),
+            "original order should still be on book after rejected amend"
+        );
+    }
+
+    /// FOK with STP exclusion: only liquidity is from the same account.
+    /// FOK must reject because the self-trade would be prevented.
+    #[test]
+    fn fok_stp_rejects_when_only_self_liquidity() {
+        let mut exchange = Exchange::new();
+        exchange.add_instrument(btc_usd_spec());
+        exchange.deposit(ACCT_A, USD, 100_000);
+        exchange.deposit(ACCT_A, BTC, 100);
+
+        let mut reports = Vec::new();
+
+        // ACCT_A sells 10@100.
+        exchange.execute(
+            Symbol(1),
+            limit_order(1, ACCT_A, Side::Sell, 100, 10, TimeInForce::GTC),
+            &mut reports,
+        );
+        reports.clear();
+
+        // ACCT_A FOK buy 10@100 with STP CancelNewest — only liquidity
+        // is own order, which STP would cancel. FOK must reject.
+        exchange.execute(
+            Symbol(1),
+            Order {
+                id: OrderId(2),
+                account: ACCT_A,
+                side: Side::Buy,
+                order_type: OrderType::Limit { price: price(100), post_only: false },
+                time_in_force: TimeInForce::FOK,
+                quantity: qty(10),
+                stp: SelfTradeProtection::CancelNewest,
+                expiry_ns: 0,
+            },
+            &mut reports,
+        );
+
+        // Should be rejected, not filled.
+        assert!(
+            reports.iter().any(|r| matches!(r, ExecutionReport::Rejected { .. })),
+            "FOK with only self-liquidity and STP must reject"
+        );
+        assert!(
+            !reports.iter().any(|r| matches!(r, ExecutionReport::Fill { .. })),
+            "FOK must never partially fill"
+        );
+    }
+
+    /// FOK with STP Allow: same-account liquidity should fill normally.
+    #[test]
+    fn fok_stp_allow_fills_self() {
+        let mut exchange = Exchange::new();
+        exchange.add_instrument(btc_usd_spec());
+        exchange.deposit(ACCT_A, USD, 100_000);
+        exchange.deposit(ACCT_A, BTC, 100);
+
+        let mut reports = Vec::new();
+
+        // ACCT_A sells 10@100.
+        exchange.execute(
+            Symbol(1),
+            limit_order(1, ACCT_A, Side::Sell, 100, 10, TimeInForce::GTC),
+            &mut reports,
+        );
+        reports.clear();
+
+        // ACCT_A FOK buy 10@100 with STP Allow — self-trade allowed.
+        exchange.execute(
+            Symbol(1),
+            Order {
+                id: OrderId(2),
+                account: ACCT_A,
+                side: Side::Buy,
+                order_type: OrderType::Limit { price: price(100), post_only: false },
+                time_in_force: TimeInForce::FOK,
+                quantity: qty(10),
+                stp: SelfTradeProtection::Allow,
+                expiry_ns: 0,
+            },
+            &mut reports,
+        );
+
+        assert!(
+            reports.iter().any(|r| matches!(r, ExecutionReport::Fill { .. })),
+            "FOK with STP Allow should fill against own order"
+        );
+    }
+
+    /// Per-fill fee rounding: buyer_deducted + seller_proceeds + fee_credit == cost
+    /// for every individual fill.
+    #[test]
+    fn per_fill_fee_rounding_conservation() {
+        use crate::account::FEE_ACCOUNT;
+
+        let mut exchange = Exchange::new();
+        exchange.add_instrument(btc_usd_spec());
+
+        // Use odd prices/quantities to maximize rounding effects.
+        exchange.set_fee_schedule(
+            Symbol(1),
+            FeeSchedule {
+                maker_fee_bps: 3, // 0.03%
+                taker_fee_bps: 7, // 0.07%
+            },
+        );
+
+        exchange.deposit(ACCT_A, USD, 10_000_000);
+        exchange.deposit(ACCT_B, BTC, 10_000);
+
+        let mut reports = Vec::new();
+
+        // Place asks at various odd prices.
+        for (id, p, q) in [(1, 137, 13), (2, 251, 7), (3, 499, 3), (4, 1009, 1)] {
+            exchange.execute(
+                Symbol(1),
+                limit_order(id, ACCT_B, Side::Sell, p, q, TimeInForce::GTC),
+                &mut reports,
+            );
+            reports.clear();
+        }
+
+        // Aggressive buy that sweeps all levels.
+        exchange.execute(
+            Symbol(1),
+            limit_order(1, ACCT_A, Side::Buy, 1100, 30, TimeInForce::GTC),
+            &mut reports,
+        );
+
+        // Check system conservation after all fills.
+        let a = exchange.accounts().balance(ACCT_A, USD);
+        let b = exchange.accounts().balance(ACCT_B, USD);
+        let fee = exchange.accounts().balance(FEE_ACCOUNT, USD);
+        let total = a.available as u128 + a.reserved as u128
+            + b.available as u128 + b.reserved as u128
+            + fee.available as u128;
+        assert_eq!(total, 10_000_000, "USD must be conserved across all fills with odd rounding");
+    }
+
+    /// Stop trigger cascade: a fill triggers stop A, which fills and triggers stop B.
+    #[test]
+    fn stop_trigger_cascade() {
+        let mut exchange = Exchange::new();
+        exchange.add_instrument(btc_usd_spec());
+        exchange.deposit(ACCT_A, USD, 1_000_000);
+        exchange.deposit(ACCT_A, BTC, 1_000);
+        exchange.deposit(ACCT_B, USD, 1_000_000);
+        exchange.deposit(ACCT_B, BTC, 1_000);
+
+        let mut reports = Vec::new();
+
+        // Sell liquidity at multiple levels (ACCT_B provides asks).
+        for (id, p) in [(1, 100), (2, 105), (3, 110)] {
+            exchange.execute(
+                Symbol(1),
+                limit_order(id, ACCT_B, Side::Sell, p, 10, TimeInForce::GTC),
+                &mut reports,
+            );
+        }
+        reports.clear();
+
+        // ACCT_A places stop-buy orders that chain:
+        // Stop at trigger=95 → market buy (fills at 100, setting last_trade=100)
+        // Stop at trigger=100 → market buy (triggers from the fill above)
+        exchange.execute(
+            Symbol(1),
+            Order {
+                id: OrderId(1),
+                account: ACCT_A,
+                side: Side::Buy,
+                order_type: OrderType::Stop { trigger_price: price(100) },
+                time_in_force: TimeInForce::GTC,
+                quantity: qty(5),
+                stp: SelfTradeProtection::Allow,
+                expiry_ns: 0,
+            },
+            &mut reports,
+        );
+        reports.clear();
+
+        exchange.execute(
+            Symbol(1),
+            Order {
+                id: OrderId(2),
+                account: ACCT_A,
+                side: Side::Buy,
+                order_type: OrderType::Stop { trigger_price: price(105) },
+                time_in_force: TimeInForce::GTC,
+                quantity: qty(3),
+                stp: SelfTradeProtection::Allow,
+                expiry_ns: 0,
+            },
+            &mut reports,
+        );
+        reports.clear();
+
+        // Trigger the cascade: ACCT_B buys 1@100 (uses ACCT_B so ACCT_A's
+        // balance isn't exhausted by stop reservations).
+        // This fills against ACCT_B's own sell@100 (STP Allow), setting
+        // last_trade=100. check_triggers fires: stop@100 triggers → market
+        // buy fills remaining asks at 100. Stop@105 needs last_trade >= 105
+        // but fills were at 100, so it should NOT trigger.
+        exchange.execute(
+            Symbol(1),
+            limit_order(4, ACCT_B, Side::Buy, 100, 1, TimeInForce::GTC),
+            &mut reports,
+        );
+
+        // We should see: the initial fill (1@100) + triggered stop fill.
+        let fills: Vec<_> = reports
+            .iter()
+            .filter(|r| matches!(r, ExecutionReport::Fill { .. }))
+            .collect();
+        let triggers: Vec<_> = reports
+            .iter()
+            .filter(|r| matches!(r, ExecutionReport::Triggered { .. }))
+            .collect();
+
+        assert!(
+            !fills.is_empty(),
+            "should have at least one fill"
+        );
+        assert!(
+            triggers.len() <= 1,
+            "stop@105 should not trigger (last_trade=100 < 105)"
+        );
+    }
+
+    /// Cancel-replace preserves time priority when price unchanged and qty decreases.
+    #[test]
+    fn cancel_replace_preserves_priority_on_qty_decrease() {
+        let mut exchange = Exchange::new();
+        exchange.add_instrument(btc_usd_spec());
+        exchange.deposit(ACCT_A, BTC, 1_000);
+        exchange.deposit(ACCT_B, USD, 1_000_000);
+
+        let mut reports = Vec::new();
+
+        // Three sells at 100: ids 1, 2, 3 in order.
+        for id in 1..=3 {
+            exchange.execute(
+                Symbol(1),
+                limit_order(id, ACCT_A, Side::Sell, 100, 10, TimeInForce::GTC),
+                &mut reports,
+            );
+        }
+        reports.clear();
+
+        // Amend order 2: same price, lower qty (5 instead of 10).
+        // Should preserve time priority (still between 1 and 3).
+        exchange.cancel_replace(
+            Symbol(1),
+            ACCT_A,
+            OrderId(2),
+            price(100),
+            qty(5),
+            &mut reports,
+        );
+        assert!(reports.iter().any(|r| matches!(r, ExecutionReport::Replaced { .. })));
+        reports.clear();
+
+        // Buy 15@100 — should fill 10 from order 1, then 5 from order 2.
+        exchange.execute(
+            Symbol(1),
+            limit_order(1, ACCT_B, Side::Buy, 100, 15, TimeInForce::GTC),
+            &mut reports,
+        );
+
+        let fills: Vec<_> = reports
+            .iter()
+            .filter_map(|r| match r {
+                ExecutionReport::Fill { maker_order_id, quantity, .. } => {
+                    Some((maker_order_id.0, quantity.get()))
+                }
+                _ => None,
+            })
+            .collect();
+
+        assert_eq!(fills, vec![(1, 10), (2, 5)], "order 2 should fill after 1 (priority preserved)");
+    }
+
+    /// Cancel-replace loses priority on price change.
+    #[test]
+    fn cancel_replace_loses_priority_on_price_change() {
+        let mut exchange = Exchange::new();
+        exchange.add_instrument(btc_usd_spec());
+        exchange.deposit(ACCT_A, BTC, 1_000);
+        exchange.deposit(ACCT_B, USD, 1_000_000);
+
+        let mut reports = Vec::new();
+
+        // Three sells at 100: ids 1, 2, 3.
+        for id in 1..=3 {
+            exchange.execute(
+                Symbol(1),
+                limit_order(id, ACCT_A, Side::Sell, 100, 10, TimeInForce::GTC),
+                &mut reports,
+            );
+        }
+        reports.clear();
+
+        // Amend order 2: change price to 99, then back to 100. Loses priority.
+        exchange.cancel_replace(Symbol(1), ACCT_A, OrderId(2), price(99), qty(10), &mut reports);
+        reports.clear();
+        exchange.cancel_replace(Symbol(1), ACCT_A, OrderId(2), price(100), qty(10), &mut reports);
+        reports.clear();
+
+        // Buy 25@100 — should fill 1 (10), then 3 (10), then 2 (5).
+        exchange.execute(
+            Symbol(1),
+            limit_order(1, ACCT_B, Side::Buy, 100, 25, TimeInForce::GTC),
+            &mut reports,
+        );
+
+        let fills: Vec<_> = reports
+            .iter()
+            .filter_map(|r| match r {
+                ExecutionReport::Fill { maker_order_id, quantity, .. } => {
+                    Some((maker_order_id.0, quantity.get()))
+                }
+                _ => None,
+            })
+            .collect();
+
+        assert_eq!(fills, vec![(1, 10), (3, 10), (2, 5)], "order 2 should fill last (priority lost on price change)");
+    }
+
+    /// Snapshot round-trip preserves fee account balance.
+    #[test]
+    fn snapshot_preserves_fee_account() {
+        use crate::account::FEE_ACCOUNT;
+        use crate::journal::snapshot;
+
+        let mut exchange = Exchange::new();
+        exchange.add_instrument(btc_usd_spec());
+        exchange.deposit(ACCT_A, USD, 100_000);
+        exchange.deposit(ACCT_B, BTC, 100);
+
+        exchange.set_fee_schedule(
+            Symbol(1),
+            FeeSchedule { maker_fee_bps: 10, taker_fee_bps: 20 },
+        );
+
+        let mut reports = Vec::new();
+        exchange.execute(
+            Symbol(1),
+            limit_order(1, ACCT_B, Side::Sell, 100, 10, TimeInForce::GTC),
+            &mut reports,
+        );
+        reports.clear();
+        exchange.execute(
+            Symbol(1),
+            limit_order(1, ACCT_A, Side::Buy, 100, 10, TimeInForce::GTC),
+            &mut reports,
+        );
+
+        let fee_before = exchange.accounts().balance(FEE_ACCOUNT, USD).available;
+        assert!(fee_before > 0, "fees should have been collected");
+
+        // Save and load snapshot.
+        let dir = tempfile::tempdir().unwrap();
+        let snap_path = dir.path().join("test.snapshot");
+        snapshot::save(&exchange, 100, [0u8; 32], &snap_path).unwrap();
+        let (restored, _, _) = snapshot::load(&snap_path).unwrap();
+
+        let fee_after = restored.accounts().balance(FEE_ACCOUNT, USD).available;
+        assert_eq!(fee_before, fee_after, "fee account must survive snapshot round-trip");
+    }
+
+    /// Market order on an empty book is rejected with NoLiquidity.
+    #[test]
+    fn market_order_empty_book_rejected() {
+        let mut exchange = Exchange::new();
+        exchange.add_instrument(btc_usd_spec());
+        exchange.deposit(ACCT_A, USD, 100_000);
+
+        let mut reports = Vec::new();
+        exchange.execute(
+            Symbol(1),
+            Order {
+                id: OrderId(1),
+                account: ACCT_A,
+                side: Side::Buy,
+                order_type: OrderType::Market,
+                time_in_force: TimeInForce::IOC,
+                quantity: qty(10),
+                stp: SelfTradeProtection::Allow,
+                expiry_ns: 0,
+            },
+            &mut reports,
+        );
+
+        assert!(
+            reports.iter().any(|r| matches!(r, ExecutionReport::Rejected {
+                reason: RejectReason::NoLiquidity, ..
+            })),
+            "market order on empty book must be rejected with NoLiquidity"
+        );
+    }
 }
