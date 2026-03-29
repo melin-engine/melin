@@ -658,6 +658,7 @@ fn run_as_primary<L: BlockingTransportListener>(
 
         let batch_size = config.replication_batch_size;
         let heartbeat_secs = config.replication_heartbeat_secs;
+        let journal_path = config.journal.clone();
         let repl_sender_handle = std::thread::Builder::new()
             .name("repl-sender".into())
             .spawn(move || {
@@ -668,6 +669,7 @@ fn run_as_primary<L: BlockingTransportListener>(
                     repl_consumer_2,
                     repl_cursor,
                     genesis_entry,
+                    journal_path,
                     &s_repl,
                     &ready_flag,
                     &connected_counter,
@@ -1280,6 +1282,7 @@ pub fn run_dpdk(
         let batch_size = config.replication_batch_size;
         let heartbeat_secs = config.replication_heartbeat_secs;
         let busy_spin = !config.yield_idle;
+        let journal_path = config.journal.clone();
         let repl_sender_handle = std::thread::Builder::new()
             .name("repl-sender".into())
             .spawn(move || {
@@ -1290,6 +1293,7 @@ pub fn run_dpdk(
                     repl_consumer_2,
                     repl_cursor,
                     genesis_entry,
+                    journal_path,
                     &s_repl,
                     &ready_flag,
                     &connected_counter,

@@ -57,13 +57,13 @@ pub const FORMAT_VERSION: u16 = 9;
 pub const FILE_HEADER_SIZE: usize = 8;
 
 /// Entry header size: magic(2) + length(2) + sequence(8) + timestamp(8) = 20 bytes.
-const ENTRY_HEADER_SIZE: usize = 20;
+pub(crate) const ENTRY_HEADER_SIZE: usize = 20;
 
 /// Entry magic bytes for corruption/misalignment detection.
 const ENTRY_MAGIC: u16 = 0x4A45;
 
 /// CRC32C checksum size in bytes.
-const CRC_SIZE: usize = 4;
+pub(crate) const CRC_SIZE: usize = 4;
 
 /// Event tag discriminants.
 const TAG_ADD_INSTRUMENT: u8 = 1;
