@@ -25,7 +25,7 @@
 //! - No catch-up from journal files (replica must be connected from start)
 //! - No chain hash verification on received DataBatch (CRC per-entry only)
 //! - No handshake validation (NeedSnapshot/HashMismatch never sent)
-//! - Single replica only (second connection replaces first)
+//! - Dual replication (up to 2 replicas in parallel)
 //!
 //! See `docs/replication.md` for the full design document and limitation details.
 
@@ -33,7 +33,7 @@ use std::io::{self, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::os::unix::io::AsRawFd;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
 use tracing::{debug, error, info, warn};
 
@@ -320,12 +320,13 @@ fn decode_primary_message(payload: &[u8]) -> io::Result<PrimaryMessage> {
 #[allow(clippy::too_many_arguments)]
 pub fn run_sender(
     bind_addr: SocketAddr,
-    mut repl_consumer: ReplicationConsumer,
+    repl_consumer_1: ReplicationConsumer,
+    repl_consumer_2: ReplicationConsumer,
     replication_cursor: Arc<AtomicU64>,
     genesis_entry: Vec<u8>,
     shutdown: &AtomicBool,
     replica_ready: &AtomicBool,
-    replica_connected: &AtomicBool,
+    replicas_connected: &AtomicU32,
     batch_size: usize,
     heartbeat_secs: u64,
     busy_spin: bool,
@@ -345,67 +346,158 @@ pub fn run_sender(
 
     info!(addr = %bind_addr, "replication sender listening");
 
+    // Two replica slots, each with its own ring consumer and thread handle.
+    // The accept loop fills empty slots. When a replica disconnects, its
+    // slot becomes available for a new connection. The consumer is `None`
+    // while a handler thread owns it (moved into the thread, returned on exit).
+    struct ReplicaSlot {
+        consumer: Option<ReplicationConsumer>,
+        handle: Option<std::thread::JoinHandle<ReplicationConsumer>>,
+    }
+
+    let mut slots = [
+        ReplicaSlot { consumer: Some(repl_consumer_1), handle: None },
+        ReplicaSlot { consumer: Some(repl_consumer_2), handle: None },
+    ];
+
     loop {
         if shutdown.load(Ordering::Relaxed) {
             info!("replication sender shutting down");
+            // Wait for active replica threads to finish.
+            for slot in &mut slots {
+                if let Some(handle) = slot.handle.take() {
+                    if let Ok(consumer) = handle.join() {
+                        slot.consumer = Some(consumer);
+                    }
+                }
+            }
             return;
         }
 
-        // Accept ONE replica connection at a time (single-replica v1).
-        let stream = match listener.accept() {
-            Ok((stream, addr)) => {
-                info!(addr = %addr, "replica connected");
-                // Signal that a replica is connected — unblocks seed event
-                // publishing in the main thread.
-                replica_ready.store(true, Ordering::Release);
-                // Resume trading — matching stage will stop rejecting events.
-                replica_connected.store(true, Ordering::Release);
-                stream
-            }
-            Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
-                // No pending connection — drain batches to avoid blocking the
-                // replication ring. Only drain after the first replica has
-                // connected; before that, seed data must be preserved.
-                if replica_ready.load(Ordering::Relaxed) {
-                    drain_batches_while_waiting(&mut repl_consumer);
+        // Collect finished replica threads (disconnected replicas).
+        for (i, slot) in slots.iter_mut().enumerate() {
+            if let Some(ref handle) = slot.handle {
+                if handle.is_finished() {
+                    let handle = slot.handle.take().expect("just checked is_some");
+                    match handle.join() {
+                        Ok(consumer) => {
+                            slot.consumer = Some(consumer);
+                            replicas_connected.fetch_sub(1, Ordering::Release);
+                            warn!(slot = i, "replica disconnected");
+                            if replicas_connected.load(Ordering::Relaxed) == 0 {
+                                warn!("all replicas disconnected — trading halted");
+                            }
+                        }
+                        Err(_) => {
+                            error!(slot = i, "replica handler thread panicked");
+                            // Consumer is lost — can't recover this slot.
+                            // The ring will backpressure on this consumer forever.
+                            // In practice, this is a fatal server bug.
+                        }
+                    }
                 }
-                std::thread::sleep(std::time::Duration::from_millis(100));
-                continue;
             }
-            Err(e) => {
-                error!(error = %e, "replication accept error");
-                std::thread::sleep(std::time::Duration::from_millis(100));
-                continue;
-            }
-        };
-
-        // Set TCP_NODELAY for low-latency replication.
-        if let Err(e) = stream.set_nodelay(true) {
-            debug!(error = %e, "failed to set TCP_NODELAY on replica connection");
         }
 
-        // Handle this replica connection until it disconnects.
-        match handle_replica_connection(
-            stream,
-            &mut repl_consumer,
-            &replication_cursor,
-            &genesis_entry,
-            shutdown,
-            batch_size,
-            heartbeat_secs,
-            busy_spin,
-        ) {
-            Ok(()) => warn!("replica disconnected cleanly"),
-            Err(e) => warn!(error = %e, "replica connection error"),
+        // Find a slot that has a consumer available (not in use by a thread).
+        let empty_slot = slots.iter().position(|s| s.handle.is_none() && s.consumer.is_some());
+
+        // Accept a connection if there's an empty slot.
+        if let Some(slot_idx) = empty_slot {
+            match listener.accept() {
+                Ok((stream, addr)) => {
+                    info!(addr = %addr, slot = slot_idx, "replica connected");
+                    if let Err(e) = stream.set_nodelay(true) {
+                        debug!(error = %e, "failed to set TCP_NODELAY on replica connection");
+                    }
+
+                    // Signal that at least one replica is connected.
+                    replica_ready.store(true, Ordering::Release);
+                    replicas_connected.fetch_add(1, Ordering::Release);
+
+                    // Take the consumer out of the slot for the handler thread.
+                    // The slot's consumer becomes None while the thread owns it.
+                    let consumer = slots[slot_idx]
+                        .consumer
+                        .take()
+                        .expect("empty_slot check guarantees consumer is Some");
+
+                    let cursor = Arc::clone(&replication_cursor);
+                    let genesis = genesis_entry.clone();
+                    let shutdown_flag = shutdown as *const AtomicBool as usize;
+                    let handle = std::thread::Builder::new()
+                        .name(format!("repl-{slot_idx}"))
+                        .spawn(move || {
+                            // Safety: shutdown outlives this thread (it's on the
+                            // parent's stack, which blocks on join during shutdown).
+                            let shutdown_ref =
+                                unsafe { &*(shutdown_flag as *const AtomicBool) };
+                            run_replica_slot(
+                                stream,
+                                consumer,
+                                cursor,
+                                genesis,
+                                shutdown_ref,
+                                batch_size,
+                                heartbeat_secs,
+                                busy_spin,
+                            )
+                        })
+                        .expect("spawn replica handler thread");
+                    slots[slot_idx].handle = Some(handle);
+                }
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                    // No pending connection.
+                }
+                Err(e) => {
+                    error!(error = %e, "replication accept error");
+                }
+            }
         }
 
-        // On disconnect, set cursor to u64::MAX to degrade to local-only.
-        replication_cursor.store(u64::MAX, Ordering::Release);
-        // Halt trading — matching stage will reject all mutations until
-        // the replica reconnects.
-        replica_connected.store(false, Ordering::Release);
-        warn!("replica disconnected — trading halted, waiting for reconnect");
+        // Drain batches on idle consumers to prevent ring backpressure.
+        // Only drain after the first replica has connected (seed data
+        // must be preserved for the first connection).
+        if replica_ready.load(Ordering::Relaxed) {
+            for slot in &mut slots {
+                if slot.handle.is_none() {
+                    if let Some(ref mut consumer) = slot.consumer {
+                        drain_batches_while_waiting(consumer);
+                    }
+                }
+            }
+        }
+
+        std::thread::sleep(std::time::Duration::from_millis(50));
     }
+}
+
+/// Handle a single replica connection on a dedicated thread.
+/// Returns the consumer when the connection ends (for slot reuse).
+fn run_replica_slot(
+    stream: TcpStream,
+    mut consumer: ReplicationConsumer,
+    replication_cursor: Arc<AtomicU64>,
+    genesis_entry: Vec<u8>,
+    shutdown: &AtomicBool,
+    batch_size: usize,
+    heartbeat_secs: u64,
+    busy_spin: bool,
+) -> ReplicationConsumer {
+    match handle_replica_connection(
+        stream,
+        &mut consumer,
+        &replication_cursor,
+        &genesis_entry,
+        shutdown,
+        batch_size,
+        heartbeat_secs,
+        busy_spin,
+    ) {
+        Ok(()) => info!("replica disconnected cleanly"),
+        Err(e) => warn!(error = %e, "replica connection error"),
+    }
+    consumer
 }
 
 /// Drain pending batches from the ring without blocking.
@@ -476,15 +568,18 @@ fn handle_replica_connection(
         revents: 0,
     };
 
-    // Reset the replication cursor from u64::MAX (disconnect state) so
-    // that subsequent fetch_max calls from ack processing can advance it.
-    // Without this reset, fetch_max(ack_seq) would be a no-op since
-    // u64::MAX > any ack_seq, permanently disabling replication gating.
-    //
-    // Set to handshake.last_sequence + 1: events up to last_sequence are
-    // already durable on the replica (it reported them in the handshake).
-    // Events after that will gate until the replica acks them.
-    replication_cursor.store(handshake.last_sequence + 1, Ordering::Release);
+    // Engage the replication cursor so the response stage gates on
+    // replica acks. Uses compare_exchange to only lower the cursor from
+    // u64::MAX (no replicas connected). If another replica is already
+    // connected (cursor < MAX), this is a no-op — their acks already
+    // maintain the cursor. Subsequent acks from this replica advance
+    // the cursor via fetch_max in process_acks.
+    let _ = replication_cursor.compare_exchange(
+        u64::MAX,
+        handshake.last_sequence + 1,
+        Ordering::Release,
+        Ordering::Relaxed,
+    );
 
     let heartbeat_interval = std::time::Duration::from_secs(heartbeat_secs);
     let mut last_send = std::time::Instant::now();

@@ -24,7 +24,7 @@
 use std::io::{Cursor, Read as _, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::time::Duration;
 
 use melin_disruptor::padding::Sequence;
@@ -45,7 +45,7 @@ struct HealthState {
     input_cursor: Box<dyn QueueCursor>,
     replication_cursor: Arc<AtomicU64>,
     pipeline_healthy: Arc<AtomicBool>,
-    replica_connected: Option<Arc<AtomicBool>>,
+    replicas_connected: Option<Arc<AtomicU32>>,
 }
 
 /// Spawn the health endpoint thread. Returns the join handle.
@@ -66,7 +66,7 @@ pub fn spawn(
     input_cursor: Box<dyn QueueCursor>,
     replication_cursor: Arc<AtomicU64>,
     pipeline_healthy: Arc<AtomicBool>,
-    replica_connected: Option<Arc<AtomicBool>>,
+    replicas_connected: Option<Arc<AtomicU32>>,
     shutdown: Arc<AtomicBool>,
 ) -> Result<std::thread::JoinHandle<()>, std::io::Error> {
     let listener = TcpListener::bind(bind_addr)?;
@@ -83,7 +83,7 @@ pub fn spawn(
         input_cursor,
         replication_cursor,
         pipeline_healthy,
-        replica_connected,
+        replicas_connected,
     };
 
     let handle = std::thread::Builder::new()
@@ -131,12 +131,13 @@ impl HealthSnapshot {
             journal_seq.saturating_sub(repl_cursor)
         };
 
-        // Trading state: "trading" when standalone or replica connected,
-        // "halted" when replication is enabled but replica is disconnected.
+        // Trading state: "trading" when standalone or at least one replica
+        // connected, "halted" when replication is enabled but all replicas
+        // are disconnected.
         let trading = state
-            .replica_connected
+            .replicas_connected
             .as_ref()
-            .is_none_or(|flag| flag.load(Ordering::Relaxed));
+            .is_none_or(|count| count.load(Ordering::Relaxed) > 0);
 
         Self {
             healthy,
@@ -366,7 +367,7 @@ mod tests {
 
     /// Helper: create a non-blocking listener and spawn the health loop.
     /// Returns (addr, events_processed, pipeline_healthy, shutdown_flag, join_handle).
-    /// `replica_connected` is None (standalone mode) unless overridden.
+    /// `replicas_connected` is None (standalone mode) unless overridden.
     fn start_health(
         active: u64,
         journal_seq: u64,
@@ -381,12 +382,12 @@ mod tests {
         start_health_with_replica(active, journal_seq, repl_cursor, None)
     }
 
-    /// Like `start_health` but with an explicit `replica_connected` flag.
+    /// Like `start_health` but with an explicit `replicas_connected` flag.
     fn start_health_with_replica(
         active: u64,
         journal_seq: u64,
         repl_cursor: u64,
-        replica_connected: Option<Arc<AtomicBool>>,
+        replicas_connected: Option<Arc<AtomicU32>>,
     ) -> (
         SocketAddr,
         Arc<AtomicU64>,
@@ -417,7 +418,7 @@ mod tests {
             input_cursor: Box::new(MockCursor(AtomicU64::new(journal_seq))),
             replication_cursor: repl,
             pipeline_healthy: Arc::clone(&healthy),
-            replica_connected,
+            replicas_connected,
         };
 
         let handle = std::thread::spawn(move || {
@@ -616,15 +617,15 @@ mod tests {
 
     #[test]
     fn health_shows_halted_when_replica_disconnected() {
-        let replica_flag = Arc::new(AtomicBool::new(false)); // disconnected
+        let replica_count = Arc::new(AtomicU32::new(0)); // no replicas connected
         let (addr, _events, _healthy, shutdown, handle) =
-            start_health_with_replica(5, 100, u64::MAX, Some(Arc::clone(&replica_flag)));
+            start_health_with_replica(5, 100, u64::MAX, Some(Arc::clone(&replica_count)));
 
         let buf = read_health(addr);
         assert_eq!(buf, "OK 5 100 0 halted\n");
 
-        // Reconnect replica — should switch to trading.
-        replica_flag.store(true, Ordering::Relaxed);
+        // Connect a replica — should switch to trading.
+        replica_count.store(1, Ordering::Relaxed);
         let buf = read_health(addr);
         assert_eq!(buf, "OK 5 100 0 trading\n");
 
@@ -666,9 +667,9 @@ mod tests {
     #[test]
     fn metrics_boolean_encoding() {
         // Verify that unhealthy + halted → 0 values.
-        let replica_flag = Arc::new(AtomicBool::new(false)); // disconnected → halted
+        let replica_count = Arc::new(AtomicU32::new(0)); // disconnected → halted
         let (addr, _events, healthy, shutdown, handle) =
-            start_health_with_replica(0, 0, u64::MAX, Some(Arc::clone(&replica_flag)));
+            start_health_with_replica(0, 0, u64::MAX, Some(Arc::clone(&replica_count)));
 
         healthy.store(false, Ordering::Relaxed);
 
@@ -735,7 +736,7 @@ mod tests {
             input_cursor: Box::new(MockCursor(AtomicU64::new(1000))),
             replication_cursor: Arc::new(AtomicU64::new(u64::MAX)),
             pipeline_healthy: Arc::new(AtomicBool::new(true)),
-            replica_connected: None,
+            replicas_connected: None,
         };
 
         let handle = std::thread::spawn(move || {

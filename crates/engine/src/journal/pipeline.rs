@@ -19,7 +19,7 @@
 //! while preserving persist-before-ack at the response boundary.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::time::Duration;
 
 use crate::exchange::Exchange;
@@ -825,9 +825,9 @@ pub struct MatchingStage {
     /// Read only when processing `QueryStats` (once per second at most).
     active_connections: Arc<AtomicU64>,
     /// When `Some`, replication is enabled. One Relaxed load per event
-    /// (~1ns). `false` = replica disconnected → reject all mutations.
+    /// (~1ns). `0` = no replicas connected → reject all mutations.
     /// `None` = standalone mode → no halt check.
-    replica_connected: Option<Arc<AtomicBool>>,
+    replicas_connected: Option<Arc<AtomicU32>>,
     /// When true, never yield — spin indefinitely. See [`idle_wait`].
     busy_spin: bool,
 }
@@ -841,7 +841,7 @@ impl MatchingStage {
         events_processed: Arc<AtomicU64>,
         journal_cursor: Arc<Sequence>,
         active_connections: Arc<AtomicU64>,
-        replica_connected: Option<Arc<AtomicBool>>,
+        replicas_connected: Option<Arc<AtomicU32>>,
         busy_spin: bool,
     ) -> Self {
         Self {
@@ -851,17 +851,17 @@ impl MatchingStage {
             events_processed,
             journal_cursor,
             active_connections,
-            replica_connected,
+            replicas_connected,
             busy_spin,
         }
     }
 
-    /// Returns true if trading is halted due to replica disconnect.
-    /// Always false in standalone mode (replica_connected is None).
+    /// Returns true if trading is halted due to all replicas disconnected.
+    /// Always false in standalone mode (replicas_connected is None).
     fn is_halted(&self) -> bool {
-        self.replica_connected
+        self.replicas_connected
             .as_ref()
-            .is_some_and(|flag| !flag.load(Ordering::Relaxed))
+            .is_some_and(|count| count.load(Ordering::Relaxed) == 0)
     }
 
     /// Extract the order ID from the event for reject reports, or OrderId(0) if N/A.
@@ -1345,9 +1345,9 @@ pub fn build_pipeline_with_replication(
     Arc<Sequence>,
     Arc<AtomicU64>,
     Box<dyn ring::QueueCursor>,
-    Option<ReplicationConsumer>,
+    Option<(ReplicationConsumer, ReplicationConsumer)>,
     Arc<AtomicU64>,
-    Option<Arc<AtomicBool>>,
+    Option<Arc<AtomicU32>>,
     Option<ring::Consumer<InputSlot>>,
     Option<Arc<SeqLock<[u8; 32]>>>,
 ) {
@@ -1407,13 +1407,16 @@ pub fn build_pipeline_with_replication(
         busy_spin,
     );
 
-    // Build the replication ring if enabled. Each slot holds up to 128 KiB.
-    // Single consumer for v1 (one replica).
-    let replication_consumer = if enable_replication {
+    // Build the replication ring if enabled. Two consumers for dual
+    // replication — each replica gets its own independent ring consumer.
+    // The ring handles backpressure from the slowest consumer.
+    let replication_consumers = if enable_replication {
         let (producer, mut ring_consumers) =
-            crate::journal::replication::build_replication_ring(1, replication_ring_size);
+            crate::journal::replication::build_replication_ring(2, replication_ring_size);
         journal_stage.set_replication_producer(producer);
-        Some(ring_consumers.pop().expect("replication consumer"))
+        let consumer_2 = ring_consumers.pop().expect("second replication consumer");
+        let consumer_1 = ring_consumers.pop().expect("first replication consumer");
+        Some((consumer_1, consumer_2))
     } else {
         None
     };
@@ -1430,13 +1433,13 @@ pub fn build_pipeline_with_replication(
         None
     };
 
-    // Replica-connected flag: when replication is enabled, starts false
-    // (no replica yet). The replication sender sets it to true on connect,
-    // false on disconnect. The matching stage checks it (one Relaxed load
-    // per event) and rejects all mutations when false. In standalone mode,
-    // None — no halt check.
-    let replica_connected = if enable_replication {
-        Some(Arc::new(AtomicBool::new(false)))
+    // Connected replica count: when replication is enabled, starts at 0
+    // (no replicas yet). The replication sender increments on connect,
+    // decrements on disconnect. The matching stage checks it (one Relaxed
+    // load per event) and rejects all mutations when 0. In standalone
+    // mode, None — no halt check. u32 counter supports dual replication.
+    let replicas_connected = if enable_replication {
+        Some(Arc::new(AtomicU32::new(0)))
     } else {
         None
     };
@@ -1448,7 +1451,7 @@ pub fn build_pipeline_with_replication(
         Arc::clone(&events_processed),
         Arc::clone(&journal_cursor),
         active_connections,
-        replica_connected.clone(),
+        replicas_connected.clone(),
         busy_spin,
     );
 
@@ -1469,9 +1472,9 @@ pub fn build_pipeline_with_replication(
         matching_cursor,
         events_processed,
         input_cursor,
-        replication_consumer,
+        replication_consumers,
         replication_cursor,
-        replica_connected,
+        replicas_connected,
         shadow_consumer,
         chain_hash_lock,
     )
@@ -1767,7 +1770,7 @@ mod tests {
             _input_cursor,
             replication_rx,
             replication_cursor,
-            _replica_connected,
+            _replicas_connected,
             _shadow_consumer,
             _chain_hash_lock,
         ) = build_pipeline_with_replication(
@@ -1784,11 +1787,12 @@ mod tests {
         );
         let mut output_consumer = output_consumers.pop().unwrap();
 
-        let mut repl_consumer = replication_rx.expect("replication should be enabled");
+        let (mut repl_consumer, _repl_consumer_2) =
+            replication_rx.expect("replication should be enabled");
 
         // Simulate a connected replica so the matching stage doesn't halt.
-        if let Some(ref flag) = _replica_connected {
-            flag.store(true, Ordering::Relaxed);
+        if let Some(ref count) = _replicas_connected {
+            count.store(1, Ordering::Relaxed);
         }
 
         let shutdown = Arc::new(AtomicBool::new(false));
@@ -1979,14 +1983,14 @@ mod tests {
         }
     }
 
-    /// Helper: build a minimal matching stage with a replica_connected flag.
-    /// Returns (input_producer, output_consumer, replica_flag, shutdown, join_handle).
+    /// Helper: build a minimal matching stage with a replicas_connected counter.
+    /// Returns (input_producer, output_consumer, connected_counter, shutdown, join_handle).
     fn start_matching_with_halt(
-        replica_connected: bool,
+        initial_connected: u32,
     ) -> (
         ring::Producer<InputSlot>,
         ring::Consumer<OutputSlot>,
-        Arc<AtomicBool>,
+        Arc<AtomicU32>,
         Arc<AtomicBool>,
         std::thread::JoinHandle<Exchange>,
     ) {
@@ -2010,7 +2014,7 @@ mod tests {
         let dummy_cursor = Arc::new(Sequence::new(AtomicU64::new(0)));
         let events_counter = Arc::new(AtomicU64::new(0));
         let active_conns = Arc::new(AtomicU64::new(0));
-        let flag = Arc::new(AtomicBool::new(replica_connected));
+        let counter = Arc::new(AtomicU32::new(initial_connected));
 
         let stage = MatchingStage::new(
             exchange,
@@ -2019,7 +2023,7 @@ mod tests {
             events_counter,
             dummy_cursor,
             active_conns,
-            Some(Arc::clone(&flag)),
+            Some(Arc::clone(&counter)),
             false,
         );
 
@@ -2027,7 +2031,7 @@ mod tests {
         let s = Arc::clone(&shutdown);
         let handle = std::thread::spawn(move || stage.run(&s));
 
-        (input_producer, output_consumer, flag, shutdown, handle)
+        (input_producer, output_consumer, counter, shutdown, handle)
     }
 
     /// Consume outputs until we see a BatchEnd, returning all reports.
@@ -2047,7 +2051,7 @@ mod tests {
 
     #[test]
     fn halt_rejects_submit_order() {
-        let (mut input, mut output, _flag, shutdown, handle) = start_matching_with_halt(false);
+        let (mut input, mut output, _flag, shutdown, handle) = start_matching_with_halt(0);
 
         input.publish(InputSlot {
             connection_id: 1,
@@ -2078,7 +2082,7 @@ mod tests {
 
     #[test]
     fn halt_rejects_deposit() {
-        let (mut input, mut output, _flag, shutdown, handle) = start_matching_with_halt(false);
+        let (mut input, mut output, _flag, shutdown, handle) = start_matching_with_halt(0);
 
         input.publish(InputSlot {
             connection_id: 1,
@@ -2109,7 +2113,7 @@ mod tests {
 
     #[test]
     fn halt_allows_query_stats() {
-        let (mut input, mut output, _flag, shutdown, handle) = start_matching_with_halt(false);
+        let (mut input, mut output, _flag, shutdown, handle) = start_matching_with_halt(0);
 
         input.publish(InputSlot {
             connection_id: 1,
@@ -2148,7 +2152,7 @@ mod tests {
 
     #[test]
     fn halt_then_reconnect_resumes_trading() {
-        let (mut input, mut output, flag, shutdown, handle) = start_matching_with_halt(false);
+        let (mut input, mut output, flag, shutdown, handle) = start_matching_with_halt(0);
 
         // Submit while halted — rejected.
         input.publish(InputSlot {
@@ -2173,7 +2177,7 @@ mod tests {
         ));
 
         // Reconnect replica.
-        flag.store(true, Ordering::Relaxed);
+        flag.store(1, Ordering::Relaxed);
 
         // Retry the same seq — should succeed now (HWM was not advanced).
         input.publish(InputSlot {
@@ -2202,7 +2206,7 @@ mod tests {
 
     #[test]
     fn standalone_mode_no_halt() {
-        // replica_connected = None → no halt check, events always processed.
+        // replicas_connected = None → no halt check, events always processed.
         let mut exchange = Exchange::new();
         exchange.add_instrument(InstrumentSpec {
             symbol: Symbol(1),

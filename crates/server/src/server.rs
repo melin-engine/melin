@@ -525,9 +525,9 @@ fn run_as_primary<L: BlockingTransportListener>(
         matching_cursor,
         events_processed,
         input_cursor,
-        replication,
+        replication_consumers,
         replication_cursor,
-        replica_connected,
+        replicas_connected,
         shadow_consumer,
         chain_hash_lock,
     ) = build_pipeline_with_replication(
@@ -644,16 +644,17 @@ fn run_as_primary<L: BlockingTransportListener>(
     // `replica_ready` is set when the first replica connects — seeding waits
     // on this to ensure seed events aren't drained before the replica arrives.
     let replica_ready = Arc::new(AtomicBool::new(false));
-    let replication_handle = if let Some(repl_consumer) = replication {
+    let replication_handle = if let Some((repl_consumer_1, repl_consumer_2)) = replication_consumers
+    {
         let repl_bind = config
             .replication_bind
             .expect("replication_bind must be set");
         let s_repl = Arc::clone(&shutdown);
         let repl_cursor = Arc::clone(&replication_cursor);
         let ready_flag = Arc::clone(&replica_ready);
-        let connected_flag = replica_connected
+        let connected_counter = replicas_connected
             .clone()
-            .expect("replica_connected must be Some when replication is enabled");
+            .expect("replicas_connected must be Some when replication is enabled");
 
         let batch_size = config.replication_batch_size;
         let heartbeat_secs = config.replication_heartbeat_secs;
@@ -663,12 +664,13 @@ fn run_as_primary<L: BlockingTransportListener>(
                 apply_affinity("repl-sender", cores.repl_sender);
                 crate::replication::run_sender(
                     repl_bind,
-                    repl_consumer,
+                    repl_consumer_1,
+                    repl_consumer_2,
                     repl_cursor,
                     genesis_entry,
                     &s_repl,
                     &ready_flag,
-                    &connected_flag,
+                    &connected_counter,
                     batch_size,
                     heartbeat_secs,
                     busy_spin,
@@ -862,7 +864,7 @@ fn run_as_primary<L: BlockingTransportListener>(
             input_cursor,
             Arc::clone(&replication_cursor),
             Arc::clone(&pipeline_healthy),
-            replica_connected.clone(),
+            replicas_connected.clone(),
             Arc::clone(&shutdown),
         )?)
     } else {
@@ -1170,9 +1172,9 @@ pub fn run_dpdk(
         matching_cursor,
         events_processed,
         input_cursor,
-        replication,
+        replication_consumers,
         replication_cursor,
-        replica_connected,
+        replicas_connected,
         _shadow_consumer,
         _chain_hash_lock,
     ) = build_pipeline_with_replication(
@@ -1263,16 +1265,18 @@ pub fn run_dpdk(
 
     // Spawn replication sender if enabled (identical to epoll path).
     let replica_ready = Arc::new(AtomicBool::new(false));
-    let replication_handle = if let Some(repl_consumer) = replication {
+    let replication_handle = if let Some((repl_consumer_1, repl_consumer_2)) =
+        replication_consumers
+    {
         let repl_bind = config
             .replication_bind
             .expect("replication_bind must be set");
         let s_repl = Arc::clone(&shutdown);
         let repl_cursor = Arc::clone(&replication_cursor);
         let ready_flag = Arc::clone(&replica_ready);
-        let connected_flag = replica_connected
+        let connected_counter = replicas_connected
             .clone()
-            .expect("replica_connected must be Some when replication is enabled");
+            .expect("replicas_connected must be Some when replication is enabled");
         let batch_size = config.replication_batch_size;
         let heartbeat_secs = config.replication_heartbeat_secs;
         let busy_spin = !config.yield_idle;
@@ -1282,12 +1286,13 @@ pub fn run_dpdk(
                 apply_affinity("repl-sender", cores.repl_sender);
                 crate::replication::run_sender(
                     repl_bind,
-                    repl_consumer,
+                    repl_consumer_1,
+                    repl_consumer_2,
                     repl_cursor,
                     genesis_entry,
                     &s_repl,
                     &ready_flag,
-                    &connected_flag,
+                    &connected_counter,
                     batch_size,
                     heartbeat_secs,
                     busy_spin,
@@ -1387,7 +1392,7 @@ pub fn run_dpdk(
             input_cursor,
             Arc::clone(&replication_cursor),
             Arc::clone(&pipeline_healthy),
-            replica_connected.clone(),
+            replicas_connected.clone(),
             Arc::clone(&shutdown),
         )?)
     } else {
