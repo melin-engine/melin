@@ -99,7 +99,7 @@ The DPDK result is an early experimental measurement with end-to-end kernel bypa
 
 ### Bottleneck and next steps
 
-The TCP network stack is now the primary throughput limiter. The journal pipeline hides fsync latency at high pipelining depths. Further gains require reducing transport overhead: kernel bypass (AF_XDP, DPDK, or OpenOnload) would eliminate syscall overhead on the send/recv path.
+The TCP network stack is the primary throughput limiter. The journal pipeline hides fsync latency at high pipelining depths. DPDK kernel bypass (landed, experimental) halves single-order p50 latency; further transport tuning is the main remaining optimization vector.
 
 ## Features
 
@@ -119,6 +119,7 @@ The TCP network stack is now the primary throughput limiter. The journal pipelin
 ### [Fees](docs/fee-model.md)
 - Maker/taker fee model (per-instrument `FeeSchedule` in basis points, configurable via admin API)
 - Fee deduction on fill (fees in quote currency, deducted from buyer reservation and seller proceeds, reported in `ExecutionReport::Fill`)
+- Collected fees credited to a dedicated fee account — operators can withdraw via admin API; balance conservation enforced across all accounts
 
 ### [Risk & Accounting](docs/risk-checks.md)
 - Per-account, per-currency balance management (reserve on order, update on fill, release on cancel)
@@ -132,12 +133,11 @@ The TCP network stack is now the primary throughput limiter. The journal pipelin
 ### [Event Sourcing & Durability](docs/journal.md)
 - Write-ahead journal with CRC32C checksums and BLAKE3 hash chain (tamper evidence, replica consistency)
 - Persist-before-ack: matching latency overlapped against journal writes, acknowledgement gated on confirmed durability
-- Batch journal I/O via LMAX disruptor ring buffer pipeline (`pwritev2` + `RWF_DSYNC`, pipelined io_uring async fsync with group commit)
+- Batch journal I/O via LMAX disruptor ring buffer pipeline (`pwritev2` + `RWF_DSYNC`)
 - Pre-allocated storage (`posix_fallocate`) for reduced fsync latency
 - Snapshot save/load for fast recovery; journal rotation (automatic snapshot + archive when size threshold exceeded)
 - Deterministic replay from journal for crash recovery and audit
 - Scheduled snapshots via shadow exchange — periodic snapshots on a dedicated thread without pausing the matching engine (`--snapshot-interval-secs`)
-- Crash injection tests at every byte offset, during snapshot rotation, and under realistic load
 
 ### [Replication & High Availability](docs/replication.md)
 - Synchronous dual replication — live WAL streaming to 2 replicas via lock-free ring buffer; replicas fsync and ack before the primary sends responses to clients (zero acknowledged data loss)
@@ -148,7 +148,7 @@ The TCP network stack is now the primary throughput limiter. The journal pipelin
 
 ### [Networking](docs/wire-protocol.md)
 - Custom binary wire protocol (length-prefixed framing)
-- TCP and Unix domain socket transports (kernel bypass via DPDK in progress)
+- TCP, Unix domain socket, and DPDK kernel bypass transports
 - Epoll reader pool (edge-triggered, non-blocking) with dedicated I/O threads (zero tokio)
 - io_uring transport (separate read/write rings, multishot RECV with provided buffer groups)
 - Backpressure handling (explicit `ServerBusy` reject when the input pipeline is full — client should back off and retry)
@@ -167,25 +167,12 @@ The TCP network stack is now the primary throughput limiter. The journal pipelin
 - Sparse account storage to reduce memory usage, see [account lifecycle](docs/account-lifecycle.md)
 
 ### Testing
-- Property-based tests (proptest): price-time priority, balance conservation, volume conservation, reservation consistency, no self-trades under STP, deterministic replay, overflow safety
+- Property-based tests (proptest): price-time priority, balance conservation, volume conservation, reservation consistency, no self-trades under STP, deterministic replay, overflow safety, cancel-replace invariants, fee accounting
+- Cross-engine differential testing against independent matching engine implementations and a naive reference oracle (100K+ randomized events)
 - Fuzz testing (bolero): journal codec, wire protocol codec
 - Crash injection tests: truncation at every byte offset, during snapshot rotation, under realistic load, across multiple rotation cycles
 - Multi-process failover tests: SIGKILL primary, promote replica, dual-replication failover, journal catch-up for replacement replicas, verify state consistency and no data loss
 - Integration tests: snapshot round-trip, journal replay, shadow stage determinism
-
-## Project Structure
-
-```
-crates/
-├── disruptor/     Lock-free ring buffers (generic, no trading-domain knowledge)
-├── engine/        Matching engine, order books, event sourcing, journal pipeline
-├── protocol/      Binary wire protocol, codec, transport abstractions
-├── server/        Server, pipeline orchestration, dedicated I/O threads
-├── admin/         CLI admin tool (instruments, deposits, fees, risk, circuit breakers, live dashboard)
-├── bench/         Benchmark suite (engine, pipeline, and full round-trip modes)
-├── client/        Typed client library
-└── tui/           Terminal UI for interactive testing
-```
 
 ## License
 
