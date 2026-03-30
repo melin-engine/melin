@@ -2,9 +2,7 @@
 
 Melin is a high-performance exchange core written in Rust on the [LMAX disruptor architecture](https://martinfowler.com/articles/lmax.html), built for venues that cannot compromise on correctness, durability, or performance.
 
-Melin handles order matching, account balances, risk controls, circuit breakers, fee schedules, journaling, and replication — the critical path of an exchange, from order ingestion to durable execution.
-
-It doesn't handle gateway concerns such as market data fan-out, client session management, per-account rate limiting, account identity and authorization, FIX/ITCH protocol translation, cold storage. These are out of scope and handled by upstream services that consume Melin's output event channel.
+Melin handles order matching, account balances, risk controls, circuit breakers, fee schedules, journaling, and replication — the critical path of an exchange, from order ingestion to durable execution. Gateway concerns (market data fan-out, session management, protocol translation) are out of scope and handled by upstream services that consume Melin's output event channel.
 
 ## Why Melin
 
@@ -98,10 +96,6 @@ The DPDK result is an early experimental measurement with end-to-end kernel bypa
 **Latency stability over time** (p99.99, replication mode):
 
 ![Latency stability — replication](docs/plots/latency-stability-replication.svg)
-
-### Bottleneck and next steps
-
-The TCP network stack is the primary throughput limiter. The journal pipeline hides fsync latency at high pipelining depths. DPDK kernel bypass (landed, experimental) halves single-order p50 latency; further transport tuning is the main remaining optimization vector.
 
 ## Features
 
