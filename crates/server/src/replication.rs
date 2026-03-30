@@ -544,15 +544,15 @@ fn discover_journal_files(journal_path: &std::path::Path) -> Vec<std::path::Path
 /// Stream historical journal entries to a catching-up replica.
 ///
 /// Reads raw entry bytes from the primary's journal files and sends
-/// them as DataBatch frames. Periodically drains the replication ring
-/// to prevent backpressure on the journal stage.
+/// them as DataBatch frames. Does NOT consume from the replication ring
+/// during catch-up — the ring accumulates live data. The caller must
+/// drain overlapping ring entries after catch-up completes.
 ///
 /// Returns the last sequence sent, or 0 if no entries were sent.
 fn catch_up_from_journal(
     journal_path: &std::path::Path,
     last_sequence: u64,
     writer: &mut TcpStream,
-    repl_consumer: &mut ReplicationConsumer,
     shutdown: &AtomicBool,
 ) -> io::Result<u64> {
     use melin_engine::journal::reader::RawJournalScanner;
@@ -656,19 +656,6 @@ fn catch_up_from_journal(
 
             end_sequence = batch_end_seq;
             batches_sent += 1;
-
-            // Periodically drain the replication ring to prevent backpressure
-            // on the journal stage. Every 16 batches, commit ring entries
-            // that the catch-up has already covered.
-            if batches_sent % 16 == 0 {
-                while let Some((meta, _data)) = repl_consumer.try_read() {
-                    repl_consumer.commit();
-                    // Stop draining if we've caught up to live data.
-                    if meta.end_sequence > end_sequence {
-                        break;
-                    }
-                }
-            }
         }
     }
 
@@ -720,22 +707,20 @@ fn handle_replica_connection(
     writer.flush()?;
     send_buf.clear();
 
-    // Catch up from journal files if the replica has existing state but
-    // is behind the primary's live stream. Fresh replicas (last_sequence=0)
-    // get everything from live ring streaming — catch-up would race with
-    // the journal writer during seeding. For fresh replica deployment,
-    // copy the primary's journal files to the replica first, then start.
-    let catchup_end = if handshake.last_sequence > 0 {
-        catch_up_from_journal(
-            journal_path,
-            handshake.last_sequence,
-            &mut writer,
-            repl_consumer,
-            shutdown,
-        )?
-    } else {
-        0
-    };
+    // Catch up from journal files. Reads the primary's journal archives
+    // and current journal, sends historical entries as DataBatch frames.
+    // The replication ring is NOT consumed during catch-up — it accumulates
+    // live data. After catch-up, overlapping ring entries are drained.
+    //
+    // For a fresh replica (last_sequence=0), this streams the entire
+    // journal history. For a reconnecting replica, only the gap since
+    // its last acked sequence.
+    let catchup_end = catch_up_from_journal(
+        journal_path,
+        handshake.last_sequence,
+        &mut writer,
+        shutdown,
+    )?;
 
     // Drain overlapping ring entries — the ring may contain entries that
     // were already sent during catch-up. Only discard entries whose
