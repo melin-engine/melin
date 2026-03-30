@@ -14,8 +14,7 @@ Planned features sorted by value/complexity ratio for commercial readiness (exch
 
 | # | Optimization | Est. impact | Complexity | Description |
 |---|-------------|------------|------------|-------------|
-| 1 | Reduce tracing overhead | 5-10% throughput | Low | Build with `max_level_info` or `max_level_warn` for production. Even gated `debug!` macros hit the tracing filter check on every call site. |
-| 2 | Bypass smoltcp on hot path | Significant latency | Very high | For connected+authenticated clients, parse TCP directly from raw Ethernet frames. Eliminates smoltcp's per-packet overhead (neighbor lookup, socket dispatch, congestion window, timer checks). Custom minimal TCP for steady-state data path only. |
+| 1 | Bypass smoltcp on hot path | Significant latency | Very high | For connected+authenticated clients, parse TCP directly from raw Ethernet frames. Eliminates smoltcp's per-packet overhead (neighbor lookup, socket dispatch, congestion window, timer checks). Custom minimal TCP for steady-state data path only. |
 
 ## Deferred
 
