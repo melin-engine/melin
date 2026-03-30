@@ -1489,6 +1489,16 @@ mod tests {
     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
     use std::time::Duration;
 
+    /// Return type for `start_matching_with_halt`:
+    /// (input_producer, output_consumer, connected_counter, shutdown, join_handle).
+    type MatchingHaltResult = (
+        ring::Producer<InputSlot>,
+        ring::Consumer<OutputSlot>,
+        Arc<AtomicU32>,
+        Arc<AtomicBool>,
+        std::thread::JoinHandle<Exchange>,
+    );
+
     /// First user-event sequence: 2 with hash-chain (genesis takes 1), 1 without.
     #[cfg(feature = "hash-chain")]
     const FIRST_SEQ: u64 = 2;
@@ -1985,15 +1995,7 @@ mod tests {
 
     /// Helper: build a minimal matching stage with a replicas_connected counter.
     /// Returns (input_producer, output_consumer, connected_counter, shutdown, join_handle).
-    fn start_matching_with_halt(
-        initial_connected: u32,
-    ) -> (
-        ring::Producer<InputSlot>,
-        ring::Consumer<OutputSlot>,
-        Arc<AtomicU32>,
-        Arc<AtomicBool>,
-        std::thread::JoinHandle<Exchange>,
-    ) {
+    fn start_matching_with_halt(initial_connected: u32) -> MatchingHaltResult {
         let mut exchange = Exchange::new();
         exchange.add_instrument(InstrumentSpec {
             symbol: Symbol(1),

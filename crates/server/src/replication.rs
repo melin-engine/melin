@@ -3501,7 +3501,7 @@ mod tests {
         let snap_path = tmp.path().join("test.snapshot");
 
         // Write a file smaller than the 48-byte header.
-        std::fs::write(&snap_path, &[0u8; 20]).unwrap();
+        std::fs::write(&snap_path, [0u8; 20]).unwrap();
 
         let snap_data = std::fs::read(&snap_path).unwrap();
         assert!(

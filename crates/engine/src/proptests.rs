@@ -379,10 +379,10 @@ fn run_book_actions(
             }
             BookAction::Cancel { target_idx } => {
                 action_order_ids.push(None);
-                if *target_idx < action_idx {
-                    if let Some(id) = action_order_ids[*target_idx] {
-                        book.cancel(TEST_ACCOUNT, id, &mut reports);
-                    }
+                if *target_idx < action_idx
+                    && let Some(id) = action_order_ids[*target_idx]
+                {
+                    book.cancel(TEST_ACCOUNT, id, &mut reports);
                 }
             }
         }
@@ -429,12 +429,12 @@ fn book_total_quantity(book: &OrderBook) -> u64 {
             total += order.remaining().get();
         }
     }
-    for (_price, stops) in book.stop_buys() {
+    for stops in book.stop_buys().values() {
         for stop in stops {
             total += stop.quantity().get();
         }
     }
-    for (_price, stops) in book.stop_sells() {
+    for stops in book.stop_sells().values() {
         for stop in stops {
             total += stop.quantity().get();
         }
@@ -472,12 +472,12 @@ fn assert_exchange_consistent(exchange: &Exchange, action_idx: usize, action_des
                 book_ids.insert((order.account(), order.id()));
             }
         }
-        for (_price, stops) in book.stop_buys() {
+        for stops in book.stop_buys().values() {
             for stop in stops {
                 book_ids.insert((stop.account(), stop.id()));
             }
         }
-        for (_price, stops) in book.stop_sells() {
+        for stops in book.stop_sells().values() {
             for stop in stops {
                 book_ids.insert((stop.account(), stop.id()));
             }
@@ -506,16 +506,18 @@ fn assert_exchange_consistent(exchange: &Exchange, action_idx: usize, action_des
     );
 }
 
-/// Run a sequence of ExchangeActions and return final exchange state plus all reports.
-/// Also returns total withdrawn amounts per currency (from WithdrawAll actions).
-fn run_exchange_actions(
-    actions: &[ExchangeAction],
-) -> (
+/// Return type for `run_exchange_actions`:
+/// (exchange, action_order_ids, all_reports, withdrawn_amounts).
+type ExchangeActionResult = (
     Exchange,
     Vec<Option<(OrderId, AccountId)>>,
     Vec<ExecutionReport>,
     HashMap<CurrencyId, u128>,
-) {
+);
+
+/// Run a sequence of ExchangeActions and return final exchange state plus all reports.
+/// Also returns total withdrawn amounts per currency (from WithdrawAll actions).
+fn run_exchange_actions(actions: &[ExchangeAction]) -> ExchangeActionResult {
     let mut exchange = Exchange::new();
     exchange.add_instrument(btc_usd_spec());
     let mut reports = Vec::new();
@@ -654,12 +656,12 @@ fn run_exchange_actions(
             }
             ExchangeAction::Cancel { target_idx } => {
                 action_order_ids.push(None);
-                if *target_idx < action_idx {
-                    if let Some((id, account)) = action_order_ids[*target_idx] {
-                        exchange.cancel(sym, account, id, &mut reports);
-                        all_reports.extend_from_slice(&reports);
-                        reports.clear();
-                    }
+                if *target_idx < action_idx
+                    && let Some((id, account)) = action_order_ids[*target_idx]
+                {
+                    exchange.cancel(sym, account, id, &mut reports);
+                    all_reports.extend_from_slice(&reports);
+                    reports.clear();
                 }
             }
             ExchangeAction::CancelAll { account } => {
@@ -704,19 +706,19 @@ fn run_exchange_actions(
                 new_quantity,
             } => {
                 action_order_ids.push(None);
-                if *target_idx < action_idx {
-                    if let Some((id, account)) = action_order_ids[*target_idx] {
-                        exchange.cancel_replace(
-                            sym,
-                            account,
-                            id,
-                            *new_price,
-                            *new_quantity,
-                            &mut reports,
-                        );
-                        all_reports.extend_from_slice(&reports);
-                        reports.clear();
-                    }
+                if *target_idx < action_idx
+                    && let Some((id, account)) = action_order_ids[*target_idx]
+                {
+                    exchange.cancel_replace(
+                        sym,
+                        account,
+                        id,
+                        *new_price,
+                        *new_quantity,
+                        &mut reports,
+                    );
+                    all_reports.extend_from_slice(&reports);
+                    reports.clear();
                 }
             }
             ExchangeAction::SetFeeSchedule {
@@ -862,12 +864,12 @@ proptest! {
         let stop_idx = book.snapshot_stop_index();
         let mut stop_ids_from_book = std::collections::HashSet::new();
 
-        for (_price, stops) in book.stop_buys() {
+        for stops in book.stop_buys().values() {
             for stop in stops {
                 stop_ids_from_book.insert((stop.account(), stop.id()));
             }
         }
-        for (_price, stops) in book.stop_sells() {
+        for stops in book.stop_sells().values() {
             for stop in stops {
                 stop_ids_from_book.insert((stop.account(), stop.id()));
             }
@@ -1269,12 +1271,12 @@ proptest! {
                     book_order_ids.insert((order.account(), order.id()));
                 }
             }
-            for (_price, stops) in book.stop_buys() {
+            for stops in book.stop_buys().values() {
                 for stop in stops {
                     book_order_ids.insert((stop.account(), stop.id()));
                 }
             }
-            for (_price, stops) in book.stop_sells() {
+            for stops in book.stop_sells().values() {
                 for stop in stops {
                     book_order_ids.insert((stop.account(), stop.id()));
                 }
@@ -1333,12 +1335,12 @@ proptest! {
                     book_order_ids.insert((order.account(), order.id()));
                 }
             }
-            for (_price, stops) in book.stop_buys() {
+            for stops in book.stop_buys().values() {
                 for stop in stops {
                     book_order_ids.insert((stop.account(), stop.id()));
                 }
             }
-            for (_price, stops) in book.stop_sells() {
+            for stops in book.stop_sells().values() {
                 for stop in stops {
                     book_order_ids.insert((stop.account(), stop.id()));
                 }

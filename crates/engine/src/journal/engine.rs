@@ -2112,30 +2112,29 @@ mod tests {
 
     /// Build a deterministic list of events exercising multiple code paths.
     fn build_event_list() -> Vec<TestEvent> {
-        let mut events = Vec::new();
-
-        // Setup.
-        events.push(TestEvent::AddInstrument(btc_usd_spec()));
-        events.push(TestEvent::Deposit(ACCT_A, USD, 50_000_000));
-        events.push(TestEvent::Deposit(ACCT_B, BTC, 100_000));
-        events.push(TestEvent::Deposit(ACCT_B, USD, 10_000_000));
-
-        // Config.
-        events.push(TestEvent::SetRiskLimits(
-            Symbol(1),
-            RiskLimits {
-                max_order_qty: Some(qty(10_000)),
-                max_order_notional: None,
-            },
-        ));
-        events.push(TestEvent::SetCircuitBreaker(
-            Symbol(1),
-            CircuitBreakerConfig {
-                price_band_lower: Some(price(1)),
-                price_band_upper: Some(price(10_000)),
-                halted: false,
-            },
-        ));
+        let mut events = vec![
+            // Setup.
+            TestEvent::AddInstrument(btc_usd_spec()),
+            TestEvent::Deposit(ACCT_A, USD, 50_000_000),
+            TestEvent::Deposit(ACCT_B, BTC, 100_000),
+            TestEvent::Deposit(ACCT_B, USD, 10_000_000),
+            // Config.
+            TestEvent::SetRiskLimits(
+                Symbol(1),
+                RiskLimits {
+                    max_order_qty: Some(qty(10_000)),
+                    max_order_notional: None,
+                },
+            ),
+            TestEvent::SetCircuitBreaker(
+                Symbol(1),
+                CircuitBreakerConfig {
+                    price_band_lower: Some(price(1)),
+                    price_band_upper: Some(price(10_000)),
+                    halted: false,
+                },
+            ),
+        ];
 
         // Build up the order book: 20 sell levels, 20 buy levels.
         for i in 1..=20 {

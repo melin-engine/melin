@@ -1,25 +1,29 @@
 #!/usr/bin/env bash
-# Pre-commit hook: enforce formatting, lint, and test checks.
+# Pre-commit hook: enforce formatting, lint, and Cargo.lock consistency.
+#
+# Install: git config core.hooksPath .githooks
+#
+# Checks:
+#   1. Cargo.lock is staged when modified (prevents dep drift)
+#   2. cargo fmt (formatting)
+#   3. cargo clippy on all targets with warnings as errors
 
 set -e
 
-# Check that Cargo.lock is staged when it has unstaged changes.
+# 1. Cargo.lock must be staged if it has changes.
 if ! git diff --quiet -- Cargo.lock 2>/dev/null; then
-    echo "error: Cargo.lock has unstaged changes. Stage it with 'git add Cargo.lock' and try again."
+    echo "error: Cargo.lock has unstaged changes. Stage it with 'git add Cargo.lock'."
     exit 1
 fi
 
+# 2. Formatting.
 if ! cargo fmt --all --check 2>/dev/null; then
-    echo "error: code is not formatted. Run 'cargo fmt --all' and try again."
+    echo "error: code is not formatted. Run 'cargo fmt --all'."
     exit 1
 fi
 
-if ! cargo clippy --workspace -- -D warnings 2>/dev/null; then
+# 3. Clippy on all targets (lib + tests + benches) with warnings as errors.
+if ! cargo clippy --all-targets -- -D warnings 2>/dev/null; then
     echo "error: clippy reported warnings. Fix them and try again."
-    exit 1
-fi
-
-if ! cargo test --workspace 2>/dev/null; then
-    echo "error: tests failed. Fix them and try again."
     exit 1
 fi

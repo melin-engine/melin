@@ -219,11 +219,10 @@ impl JournalReader {
             } = &event
             {
                 if let Some(chain) = &mut self.hash_chain {
-                    // Finalize: feed the checkpoint entry bytes + previous
-                    // chain hash, then compare with the recorded hash.
-                    chain
-                        .batch_hasher
-                        .update(&self.buffer[self.pos..entry_bytes_end]);
+                    // Finalize: feed accumulated event bytes + previous chain
+                    // hash, then compare with the recorded hash. The checkpoint
+                    // entry itself is NOT part of this hash — it goes into the
+                    // next batch (matching writer behaviour).
                     chain.batch_hasher.update(&chain.current_hash);
                     let computed = *chain.batch_hasher.finalize().as_bytes();
 
@@ -299,10 +298,23 @@ impl JournalReader {
     /// Current BLAKE3 chain hash after all entries read so far.
     /// Returns `None` when `hash-chain` is disabled, for v5 journals, or
     /// if no events have been read.
+    ///
+    /// When events have been accumulated since the last checkpoint (or
+    /// genesis), computes the hash on-demand by cloning the incremental
+    /// hasher and finalizing with the previous chain hash. When no events
+    /// are pending, returns the stored checkpoint/genesis hash directly.
     pub fn chain_hash(&self) -> Option<[u8; 32]> {
         #[cfg(feature = "hash-chain")]
         {
-            self.hash_chain.as_ref().map(|c| c.current_hash)
+            self.hash_chain.as_ref().map(|c| {
+                if c.events_since_checkpoint == 0 {
+                    c.current_hash
+                } else {
+                    let mut h = c.batch_hasher.clone();
+                    h.update(&c.current_hash);
+                    *h.finalize().as_bytes()
+                }
+            })
         }
         #[cfg(not(feature = "hash-chain"))]
         None
@@ -337,6 +349,22 @@ impl JournalReader {
         {
             let _ = chain_hash;
         }
+    }
+
+    /// Extract the raw hash chain state for use by a resumed writer.
+    ///
+    /// Returns `(current_hash, batch_hasher, events_since_checkpoint)`:
+    /// - `current_hash`: the chain hash from the last checkpoint (or genesis)
+    /// - `batch_hasher`: incremental hasher with entry bytes since last checkpoint
+    /// - `events_since_checkpoint`: event count since last checkpoint
+    ///
+    /// This allows the writer to reconstruct the exact hasher state needed
+    /// for correct checkpoint computation after crash recovery.
+    #[cfg(feature = "hash-chain")]
+    pub fn take_chain_state(&mut self) -> Option<([u8; 32], blake3::Hasher, u64)> {
+        self.hash_chain
+            .take()
+            .map(|c| (c.current_hash, c.batch_hasher, c.events_since_checkpoint))
     }
 
     /// Compact the buffer by moving unconsumed data to the front, then
@@ -665,10 +693,10 @@ mod tests {
 
         let mut reader = JournalReader::open(&path).unwrap();
         // Should read all but the last (truncated) entry.
-        for i in 0..events.len() - 1 {
+        for (i, event) in events.iter().enumerate().take(events.len() - 1) {
             let entry = reader.next_entry().unwrap().unwrap();
             assert_eq!(entry.sequence, (i as u64) + FIRST_SEQ);
-            assert_eq!(&entry.event, &events[i]);
+            assert_eq!(&entry.event, event);
         }
         // Truncated last entry returns None.
         assert!(reader.next_entry().unwrap().is_none());
@@ -869,22 +897,24 @@ mod tests {
         // The checkpoint has tag 10 (TAG_CHECKPOINT).
         {
             let mut data = std::fs::read(&path).unwrap();
-            // Scan for the checkpoint tag. Entry format:
-            // magic(2) + length(2) + seq(8) + ts(8) + tag(1) + payload...
+            // Scan for the checkpoint tag. v9 entry format:
+            // magic(2) + length(2) + seq(8) + ts(8) + key_hash(8) +
+            // request_seq(8) + tag(1) + payload...
+            // Tag is at offset + 36 (ENTRY_HEADER_SIZE + 16).
             let mut offset = FILE_HEADER_SIZE;
             let mut found = false;
-            while offset + 25 < data.len() {
+            while offset + 41 < data.len() {
                 let magic = u16::from_le_bytes([data[offset], data[offset + 1]]);
                 if magic != 0x4A45 {
                     break;
                 }
                 let length = u16::from_le_bytes([data[offset + 2], data[offset + 3]]) as usize;
                 let total = 20 + length + 4;
-                let tag = data[offset + 20];
+                let tag = data[offset + 36]; // ENTRY_HEADER_SIZE(20) + key_hash(8) + request_seq(8)
                 if tag == 10 {
                     // Corrupt the chain_hash in the checkpoint payload.
-                    // Payload starts at offset+21 (after tag).
-                    data[offset + 21] ^= 0xFF;
+                    // Payload starts at offset+37 (after tag).
+                    data[offset + 37] ^= 0xFF;
                     // Fix CRC so it's not caught by CRC check first.
                     let data_end = offset + 20 + length;
                     let new_crc = crc32c::crc32c(&data[offset..data_end]);
@@ -937,14 +967,28 @@ mod tests {
         header[4..6].copy_from_slice(&5u16.to_le_bytes());
         file.write_all_at(&header, 0).unwrap();
 
-        // Write a Deposit entry at sequence 1.
+        // Write a Deposit entry at sequence 1 in v5 format (no key_hash/
+        // request_seq fields). v5 layout: header(20) + tag(1) + payload + CRC(4).
+        // Deposit payload: account(4) + currency(4) + amount(8) = 16 bytes.
         let event = JournalEvent::Deposit {
             account: AccountId(1),
             currency: CurrencyId(0),
             amount: 100,
         };
-        let mut buf = [0u8; 144];
-        let written = crate::journal::codec::encode(1, 1000, 0, 0, &event, &mut buf).unwrap();
+        let mut buf = [0u8; 64];
+        let payload_len: u16 = 17; // tag(1) + account(4) + currency(4) + amount(8)
+        buf[0..2].copy_from_slice(&0x4A45u16.to_le_bytes()); // ENTRY_MAGIC
+        buf[2..4].copy_from_slice(&payload_len.to_le_bytes());
+        buf[4..12].copy_from_slice(&1u64.to_le_bytes()); // sequence
+        buf[12..20].copy_from_slice(&1000u64.to_le_bytes()); // timestamp_ns
+        buf[20] = 2; // TAG_DEPOSIT
+        buf[21..25].copy_from_slice(&1u32.to_le_bytes()); // account
+        buf[25..29].copy_from_slice(&0u32.to_le_bytes()); // currency
+        buf[29..37].copy_from_slice(&100u64.to_le_bytes()); // amount
+        let data_end = 20 + payload_len as usize; // 37
+        let crc = crc32c::crc32c(&buf[..data_end]);
+        buf[data_end..data_end + 4].copy_from_slice(&crc.to_le_bytes());
+        let written = data_end + 4; // 41
         file.write_all_at(&buf[..written], 8).unwrap();
         drop(file);
 
@@ -983,23 +1027,25 @@ mod tests {
         }
 
         // Find the checkpoint and corrupt its events_since_checkpoint field
-        // (at offset +32 in the payload, after the 32-byte chain_hash).
+        // (at offset +32 in the event payload, after the 32-byte chain_hash).
         {
             let mut data = std::fs::read(&path).unwrap();
             let mut offset = FILE_HEADER_SIZE;
             let mut found = false;
-            while offset + 25 < data.len() {
+            while offset + 41 < data.len() {
                 let magic = u16::from_le_bytes([data[offset], data[offset + 1]]);
                 if magic != 0x4A45 {
                     break;
                 }
                 let length = u16::from_le_bytes([data[offset + 2], data[offset + 3]]) as usize;
                 let total = 20 + length + 4;
-                let tag = data[offset + 20];
+                // v9: tag is at ENTRY_HEADER_SIZE(20) + key_hash(8) + request_seq(8)
+                let tag = data[offset + 36];
                 if tag == 10 {
-                    // events_since_checkpoint is at payload offset 32 (after
-                    // 32-byte chain_hash). Payload starts at offset+21.
-                    let count_offset = offset + 21 + 32;
+                    // events_since_checkpoint is at event payload offset 32
+                    // (after 32-byte chain_hash). Event payload starts at
+                    // offset+37 (after tag).
+                    let count_offset = offset + 37 + 32;
                     // Write a wrong count (keep chain_hash correct).
                     data[count_offset..count_offset + 8].copy_from_slice(&12345u64.to_le_bytes());
                     // Fix CRC.

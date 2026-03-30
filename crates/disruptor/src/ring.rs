@@ -726,8 +726,8 @@ mod tests {
         let mut buf = [0u64; 32];
         let count = consumers[0].consume_batch(&mut buf, 32);
         assert_eq!(count, 10);
-        for i in 0..10 {
-            assert_eq!(buf[i], i as u64 * 100);
+        for (i, item) in buf.iter().enumerate().take(10) {
+            assert_eq!(*item, i as u64 * 100);
         }
 
         assert_eq!(consumers[0].consume_batch(&mut buf, 32), 0);
@@ -971,8 +971,8 @@ mod tests {
         let mut buf = [0u64; 32];
         let count = consumers[0].consume_batch(&mut buf, 32);
         assert_eq!(count, 10);
-        for i in 0..10 {
-            assert_eq!(buf[i], i as u64 * 100);
+        for (i, item) in buf.iter().enumerate().take(10) {
+            assert_eq!(*item, i as u64 * 100);
         }
     }
 

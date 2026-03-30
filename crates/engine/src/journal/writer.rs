@@ -24,6 +24,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use super::codec::{self, FILE_HEADER_SIZE};
 use super::error::JournalError;
 use super::event::JournalEvent;
+#[cfg(feature = "hash-chain")]
+use super::reader::JournalReader;
 
 /// Maximum encoded entry size. Generously sized — actual entries are ~81-101 bytes
 /// (v8 adds 16 bytes for key_hash + request_seq).
@@ -97,17 +99,20 @@ pub struct JournalWriter {
 /// Running BLAKE3 hash chain state for tamper evidence.
 ///
 /// Uses batch-level hashing for performance: entry bytes are fed into an
-/// incremental hasher during `batch_append`, and finalized once per batch
-/// during `flush_batch_sync`. This amortizes the finalize + chain
-/// concatenation cost across ~4096 entries per batch.
+/// incremental hasher during `batch_append`, finalized at checkpoint
+/// boundaries (every `CHECKPOINT_INTERVAL` events). The chain hash is
+/// computed on-demand by `chain_hash()` via clone + finalize — no
+/// per-flush finalization needed.
 ///
-/// Chain: `hash_n = BLAKE3(batch_bytes || hash_{n-1})` where batch_bytes
-/// is the concatenation of all entry bytes (excluding CRCs) in the batch.
+/// Chain: `hash_n = BLAKE3(segment_bytes || hash_{n-1})` where segment_bytes
+/// is the concatenation of all entry bytes (excluding CRCs) between
+/// checkpoints.
 #[cfg(feature = "hash-chain")]
 struct HashChain {
-    /// Previous batch's chain hash, concatenated with batch bytes at finalize.
+    /// Chain hash from the last checkpoint (or genesis). Used as the
+    /// suffix in the next finalization.
     current_hash: [u8; 32],
-    /// Incremental hasher accumulating entry bytes for the current batch.
+    /// Incremental hasher accumulating entry bytes since last checkpoint.
     batch_hasher: blake3::Hasher,
     /// Events since last checkpoint. When this reaches `CHECKPOINT_INTERVAL`,
     /// a Checkpoint entry is auto-emitted.
@@ -301,7 +306,8 @@ impl JournalWriter {
             end
         };
 
-        Ok(Self {
+        #[allow(unused_mut)] // mut needed only with hash-chain for emit_checkpoint
+        let mut writer = Self {
             file,
             buffer: [0u8; MAX_ENTRY_SIZE],
             batch_buf: Vec::with_capacity(BATCH_BUF_CAPACITY),
@@ -314,9 +320,35 @@ impl JournalWriter {
             hash_chain: chain_hash.map(|h| HashChain {
                 current_hash: h,
                 batch_hasher: blake3::Hasher::new(),
-                events_since_checkpoint,
+                events_since_checkpoint: 0,
             }),
-        })
+        };
+
+        // When resuming mid-segment (events since last checkpoint > 0),
+        // reconstruct the batch_hasher by re-reading journal entries since
+        // the last checkpoint. This ensures the writer can compute the
+        // correct next checkpoint hash that includes all events in the
+        // segment, not just the ones written after the resume.
+        #[cfg(feature = "hash-chain")]
+        if events_since_checkpoint > 0
+            && let Some(chain) = &mut writer.hash_chain
+        {
+            // Re-read the journal to rebuild the incremental hasher.
+            // The reader accumulates entry bytes into its batch_hasher
+            // between checkpoints — we extract that state.
+            let mut reader = JournalReader::open(path)?;
+            while reader.next_entry()?.is_some() {}
+            // The reader's raw chain state (current_hash from last
+            // checkpoint, batch_hasher with accumulated events) is what
+            // we need to continue the chain correctly.
+            if let Some((raw_hash, hasher, count)) = reader.take_chain_state() {
+                chain.current_hash = raw_hash;
+                chain.batch_hasher = hasher;
+                chain.events_since_checkpoint = count;
+            }
+        }
+
+        Ok(writer)
     }
 
     /// Append an event to the journal and flush to disk.
@@ -420,10 +452,11 @@ impl JournalWriter {
         let ts = wall_clock_nanos();
         let written = codec::encode(seq, ts, 0, 0, &checkpoint, &mut self.buffer)?;
 
-        // Feed checkpoint entry into the batch hasher for continuity.
+        // Reset the event counter. The checkpoint entry itself is NOT fed
+        // into the new batch hasher — it acts as a seal for the preceding
+        // segment. This keeps the hash chain deterministic regardless of
+        // write batching strategy.
         if let Some(chain) = &mut self.hash_chain {
-            let entry_bytes_len = written - 4;
-            chain.batch_hasher.update(&self.buffer[..entry_bytes_len]);
             chain.events_since_checkpoint = 0;
         }
 
@@ -472,15 +505,9 @@ impl JournalWriter {
             self.file.write_all_at(&self.batch_buf, self.write_pos)?;
         }
 
-        // Finalize the batch hash chain. Concatenate the previous chain hash
-        // with the accumulated entry bytes and produce the new chain hash.
-        // One finalize per batch (~4096 entries) instead of per entry.
-        #[cfg(feature = "hash-chain")]
-        if let Some(chain) = &mut self.hash_chain {
-            chain.batch_hasher.update(&chain.current_hash);
-            chain.current_hash = *chain.batch_hasher.finalize().as_bytes();
-            chain.batch_hasher = blake3::Hasher::new();
-        }
+        // Hash chain is NOT finalized per-flush — only at checkpoint
+        // boundaries. This ensures the chain is deterministic regardless of
+        // write batching strategy. chain_hash() computes on-demand.
 
         self.write_pos += self.batch_buf.len() as u64;
         self.batch_buf.clear();
@@ -506,13 +533,8 @@ impl JournalWriter {
         }
         self.ensure_allocated(self.batch_buf.len() as u64)?;
 
-        // Finalize batch hash before handing off the buffer.
-        #[cfg(feature = "hash-chain")]
-        if let Some(chain) = &mut self.hash_chain {
-            chain.batch_hasher.update(&chain.current_hash);
-            chain.current_hash = *chain.batch_hasher.finalize().as_bytes();
-            chain.batch_hasher = blake3::Hasher::new();
-        }
+        // Hash chain is NOT finalized per-flush — only at checkpoint
+        // boundaries. chain_hash() computes on-demand.
 
         let offset = self.write_pos;
         self.write_pos += self.batch_buf.len() as u64;
@@ -570,10 +592,23 @@ impl JournalWriter {
     /// Current BLAKE3 chain hash, if hash chain is active.
     /// Returns `None` when the `hash-chain` feature is disabled, for v5
     /// journals, or if no events have been written.
+    ///
+    /// When events have been accumulated since the last checkpoint (or
+    /// genesis), computes the hash on-demand by cloning the incremental
+    /// hasher and finalizing with the previous chain hash. When no events
+    /// are pending, returns the stored checkpoint/genesis hash directly.
     pub fn chain_hash(&self) -> Option<[u8; 32]> {
         #[cfg(feature = "hash-chain")]
         {
-            self.hash_chain.as_ref().map(|c| c.current_hash)
+            self.hash_chain.as_ref().map(|c| {
+                if c.events_since_checkpoint == 0 {
+                    c.current_hash
+                } else {
+                    let mut h = c.batch_hasher.clone();
+                    h.update(&c.current_hash);
+                    *h.finalize().as_bytes()
+                }
+            })
         }
         #[cfg(not(feature = "hash-chain"))]
         None

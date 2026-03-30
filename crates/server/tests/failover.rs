@@ -1678,7 +1678,6 @@ fn snapshot_transfer_when_archives_purged() {
 
     let primary_client_port = free_port();
     let primary_health_port = free_port();
-    let primary_repl_port = free_port();
 
     // Start primary with --snapshot-interval-secs 1 to trigger periodic
     // shadow snapshots, so a .snapshot file exists for transfer.

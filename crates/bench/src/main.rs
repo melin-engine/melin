@@ -568,12 +568,12 @@ fn run_engine_bench(
         if slowest.len() < SLOWEST_N {
             let offset_us = start.elapsed().as_micros() as u64;
             slowest.push(std::cmp::Reverse((elapsed_ns, i, reports.len(), offset_us)));
-        } else if let Some(&std::cmp::Reverse((min_ns, _, _, _))) = slowest.peek() {
-            if elapsed_ns > min_ns {
-                let offset_us = start.elapsed().as_micros() as u64;
-                slowest.pop();
-                slowest.push(std::cmp::Reverse((elapsed_ns, i, reports.len(), offset_us)));
-            }
+        } else if let Some(&std::cmp::Reverse((min_ns, _, _, _))) = slowest.peek()
+            && elapsed_ns > min_ns
+        {
+            let offset_us = start.elapsed().as_micros() as u64;
+            slowest.pop();
+            slowest.push(std::cmp::Reverse((elapsed_ns, i, reports.len(), offset_us)));
         }
     }
     let wall = start.elapsed();

@@ -217,8 +217,8 @@ mod tests {
         let mut buf = [0u64; 32];
         let count = consumer.consume_batch(&mut buf, 32);
         assert_eq!(count, 8);
-        for i in 0..8 {
-            assert_eq!(buf[i], i as u64 * 10);
+        for (i, item) in buf.iter().enumerate().take(8) {
+            assert_eq!(*item, i as u64 * 10);
         }
     }
 

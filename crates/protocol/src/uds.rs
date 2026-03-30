@@ -95,7 +95,7 @@ mod tests {
             let mut writer = BlockingFrameWriter::new(write);
 
             let frame = reader.read_frame().unwrap().unwrap();
-            writer.write_frame(&frame).unwrap();
+            writer.write_frame(frame).unwrap();
             writer.flush().unwrap();
         });
 
