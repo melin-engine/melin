@@ -50,10 +50,4 @@ See [README.md](README.md#features) for implemented features and [docs/roadmap.m
 See [README.md](README.md#features) for implemented features and [docs/roadmap.md](docs/roadmap.md) for planned features.
 
 ## Dead Ends / Investigated & Rejected
-**How to apply:** The matching engine is not the bottleneck. The journal fsync stage gates pipeline throughput; TCP pipelining (window=256) effectively hides fsync latency. Further throughput gains require reducing transport overhead (UDS, kernel bypass) or journal I/O optimization (overlapped io_uring writes). See Performance Tuning leads in the README.
-
-### Prioritized performance leads
-
-| Priority | Optimization | Est. gain | Complexity |
-|----------|-------------|-----------|------------|
-| 1 | Embed ReservationSlot in RestingOrder | 5-10% matching | Moderate |
+**How to apply:** The matching engine is not the bottleneck. The journal fsync stage gates pipeline throughput; TCP pipelining (window=256) effectively hides fsync latency. Further throughput gains require reducing transport overhead (UDS, kernel bypass) or journal I/O optimization (overlapped io_uring writes). Performance optimization leads are tracked in [docs/roadmap.md](docs/roadmap.md) (deferred section).
