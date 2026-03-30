@@ -91,6 +91,8 @@ A server started with `--replica-of <primary_addr>` runs in replica mode:
 - Writes raw bytes to a local journal via `write_raw_sync()` for durability.
 - Replays entries into a local `Exchange` for state.
 - Sends `Ack` frames after each durable write.
+- Saves periodic snapshots every 5M events during catch-up, so a crash doesn't require replaying from genesis.
+- On restart, uses `recover_from_snapshot` if a snapshot exists alongside the journal.
 - Does **not** accept client connections (read-only state).
 
 ## CLI Flags

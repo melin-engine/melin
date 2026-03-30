@@ -945,9 +945,18 @@ pub fn run_receiver(
     // Determine our current state from the local journal (if any).
     // For fresh starts, we defer journal creation until after the handshake
     // so we can use the primary's genesis hash.
+    let snapshot_path = journal_path.with_extension("snapshot");
     let (mut exchange, mut journal_writer, last_sequence, chain_hash) = if journal_path.exists() {
-        // Recover from existing journal.
-        let engine = melin_engine::journal::JournaledExchange::recover(journal_path)?;
+        // Recover from snapshot + journal (fast) or journal only (full replay).
+        let engine = if snapshot_path.exists() {
+            info!("recovering replica from snapshot + journal");
+            melin_engine::journal::JournaledExchange::recover_from_snapshot(
+                &snapshot_path,
+                journal_path,
+            )?
+        } else {
+            melin_engine::journal::JournaledExchange::recover(journal_path)?
+        };
         // next_sequence is the next to assign, so last written = next - 1.
         // If next_sequence is 1, no user events have been written (only genesis).
         let next = engine.next_sequence();
@@ -1046,6 +1055,13 @@ pub fn run_receiver(
     let mut journal_accum: Vec<u8> = Vec::with_capacity(128 * 1024);
     let mut accum_entry_count: u64 = 0;
     let mut accum_end_sequence: u64;
+
+    // Periodic snapshot during catch-up. Saves the Exchange state so a
+    // crash during catch-up doesn't require replaying from genesis.
+    // Snapshot every 5M events (~400 MB of journal at ~80 bytes/entry).
+    const SNAPSHOT_INTERVAL: u64 = 5_000_000;
+    // snapshot_path already declared above (used for recovery too).
+    let mut events_since_snapshot: u64 = 0;
     // Reusable frame buffer — grows to high-water mark, avoids per-frame
     // heap allocation in the hot receive loop.
     let mut frame_buf: Vec<u8> = Vec::with_capacity(64 * 1024);
@@ -1208,8 +1224,29 @@ pub fn run_receiver(
                 // on crash recovery, the replica replays from its journal.
                 replay_journal_bytes(&journal_accum, &mut exchange, &mut reports)?;
 
+                events_since_snapshot += accum_entry_count;
                 journal_accum.clear();
                 accum_entry_count = 0;
+
+                // Periodic snapshot so a crash during catch-up doesn't
+                // require replaying from genesis. The snapshot captures
+                // the Exchange state at the current journal position.
+                if events_since_snapshot >= SNAPSHOT_INTERVAL {
+                    let seq = journal_writer.next_sequence().saturating_sub(1);
+                    // Chain hash is zero — write_raw_sync doesn't update the
+                    // writer's chain state (it writes pre-encoded bytes). Zero
+                    // is safe: on recovery, seed_chain_hash([0;32]) is a no-op
+                    // and the reader rebuilds the chain from journal entries.
+                    let chain_hash = [0u8; 32];
+                    if let Err(e) =
+                        melin_engine::journal::snapshot::save(&exchange, seq, chain_hash, &snapshot_path)
+                    {
+                        warn!(error = %e, "failed to save replica snapshot (non-fatal)");
+                    } else {
+                        info!(sequence = seq, "replica snapshot saved");
+                    }
+                    events_since_snapshot = 0;
+                }
             }
             PrimaryMessage::Heartbeat {
                 sequence,
