@@ -1,18 +1,20 @@
 # Melin
 
-Melin is a high-performance exchange core written in Rust on the [LMAX disruptor architecture](https://martinfowler.com/articles/lmax.html), built for venues that cannot compromise on correctness, durability, or latency. It delivers over 5M orders/sec over LAN with synchronous replication and full fsync durability, with sub-100 µs p99.9 single-order latency, pipelining persistence with execution without cutting corners. Beyond order matching, Melin handles account management, risk controls, circuit breakers, fee schedules, authentication, journaling, and replication — everything an exchange needs between the network edge and the trading API.
+Melin is a high-performance exchange core written in Rust on the [LMAX disruptor architecture](https://martinfowler.com/articles/lmax.html), built for venues that cannot compromise on correctness, durability, or performance.
 
-## Scope
+Melin handles order matching, account balances, risk controls, circuit breakers, fee schedules, journaling, and replication — the critical path of an exchange, from order ingestion to durable execution.
 
-Melin is an exchange core: order matching, account management, risk controls, fee calculation, journaling, replication, and connection authentication. It handles everything between the network edge and the trading API. Gateway concerns such as market data fan-out, client session management, per-account rate limiting, account identity and authorization, FIX/ITCH protocol translation, are out of scope and handled by upstream services that consume Melin's output event channel.
+It doesn't handle gateway concerns such as market data fan-out, client session management, per-account rate limiting, account identity and authorization, FIX/ITCH protocol translation, cold storage. These are out of scope and handled by upstream services that consume Melin's output event channel.
 
 ## Why Melin
 
-**Correct** — strict price-time priority verified by property-based tests across thousands of random order sequences; cross-validated against independent matching engine implementations and real market data to surface edge cases that single-engine testing misses; deterministic replay guarantees identical state from the same journal; balance conservation enforced by proptest invariants; fuzz testing covers journal and wire protocol decoding.
+Melin is:
 
-**Durable** — every order is persisted (pwritev2 + RWF_DSYNC) and replicated before acknowledgement; crash recovery via journal replay with CRC32C integrity checks; BLAKE3 hash chain for tamper evidence.
+**Correct** — strict price-time priority verified by property-based tests across thousands of random order sequences; cross-validated against independent matching engine implementations and real market data to surface edge cases that single-engine testing misses; deterministic replay guarantees identical state from the same journal; balance conservation enforced by proptest invariants; fuzz testing covers journal and wire protocol decoding. Hundres of test scenarios have been written to make sure Melin is correct.
 
-**Efficient** — single-threaded matching engine on a lock-free disruptor pipeline; journal and matching run in parallel; no allocations on the hot path; 8.1M orders/sec local fsync, 5.8M/sec with synchronous replication.
+**Durable** — every order is persisted (pwritev2 + RWF_DSYNC) and replicated before acknowledgement; crash recovery via journal replay with CRC32C integrity checks; BLAKE3 hash chain for tamper evidence. Melin supports dual-replication to survive and recover from major outage scenarios.
+
+**Efficient** — single-threaded matching engine on a lock-free disruptor pipeline for maximum, with journal, matching and replication running in parallel. Melin can handle 8.1M orders/sec over LAN with local fsync, 5.8M/sec with synchronous replication, with a sub-100 µs p99.9 single-order latency.
 
 ## Architecture
 
