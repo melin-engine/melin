@@ -7,16 +7,20 @@
 #   3. Single-order latency (1 client, no pipelining, full durability)
 #   4. Parameter sweeps (window, instruments)
 #   5. Peak throughput with synchronous replication (optional, needs replica)
+#   5b. Peak throughput with dual synchronous replication (optional, needs 2 replicas)
 #
 # Usage:
-#   ./scripts/lan-bench-suite.sh <server-public-ip> <bench-public-ip> <server-vlan-ip> [user] [replica-public-ip] [replica-vlan-ip]
+#   ./scripts/lan-bench-suite.sh <server-public-ip> <bench-public-ip> <server-vlan-ip> [user] [replica-public-ip] [replica-vlan-ip] [replica2-public-ip] [replica2-vlan-ip]
 #
 # Examples:
 #   # Without replication (2 servers):
 #   ./scripts/lan-bench-suite.sh 84.32.176.142 84.32.176.143 10.0.0.1
 #
-#   # With replication (3 servers):
+#   # With single replication (3 servers):
 #   ./scripts/lan-bench-suite.sh 84.32.176.142 84.32.176.143 10.0.0.1 root 84.32.176.144 10.0.0.3
+#
+#   # With dual replication (4 servers):
+#   ./scripts/lan-bench-suite.sh 84.32.176.142 84.32.176.143 10.0.0.1 root 84.32.176.144 10.0.0.3 84.32.176.145 10.0.0.4
 #
 #   # Only run the replication benchmark:
 #   RUN_FSYNC=0 RUN_NOPERSIST=0 RUN_SINGLE=0 RUN_SWEEPS=0 RUN_PLOTS=0 \
@@ -30,6 +34,7 @@
 #   RUN_SWEEP_INSTRUMENTS=0|1  Instrument count sweep (default: off)
 #   RUN_SWEEP_ACCOUNTS=0|1    Account count sweep (default: off)
 #   RUN_REPLICATION=0|1  Synchronous replication benchmark
+#   RUN_DUAL_REPLICATION=0|1  Dual synchronous replication benchmark (needs 2 replicas)
 #   RUN_PLOTS=0|1        Generate plots from results
 #   RESULTS_DIR=<path>   Reuse existing results directory (e.g. for re-plotting)
 #   BENCH_BRANCH=<ref>   Checkout a specific branch on all machines
@@ -42,7 +47,7 @@
 set -euo pipefail
 
 if [[ $# -lt 3 ]]; then
-    echo "usage: $0 <server-public-ip> <bench-public-ip> <server-vlan-ip> [user] [replica-public-ip] [replica-vlan-ip]"
+    echo "usage: $0 <server-public-ip> <bench-public-ip> <server-vlan-ip> [user] [replica-public-ip] [replica-vlan-ip] [replica2-public-ip] [replica2-vlan-ip]"
     exit 1
 fi
 
@@ -52,7 +57,10 @@ SERVER_VLAN="$3"
 SSH_USER="${4:-root}"
 REPLICA_PUB="${5:-}"
 REPLICA_VLAN="${6:-}"
+REPLICA2_PUB="${7:-}"
+REPLICA2_VLAN="${8:-}"
 REPLICA="${REPLICA_PUB:+${SSH_USER}@${REPLICA_PUB}}"
+REPLICA2="${REPLICA2_PUB:+${SSH_USER}@${REPLICA2_PUB}}"
 REPL_PORT=9877
 
 # Toggle individual benchmarks (default: all enabled).
@@ -64,6 +72,7 @@ RUN_SWEEPS="${RUN_SWEEPS:-0}"
 RUN_SWEEP_INSTRUMENTS="${RUN_SWEEP_INSTRUMENTS:-0}"
 RUN_SWEEP_ACCOUNTS="${RUN_SWEEP_ACCOUNTS:-0}"
 RUN_REPLICATION="${RUN_REPLICATION:-1}"
+RUN_DUAL_REPLICATION="${RUN_DUAL_REPLICATION:-1}"
 RUN_PLOTS="${RUN_PLOTS:-1}"
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -82,7 +91,10 @@ echo "  README Benchmark Suite"
 echo "  Server:  ${SERVER_PUB} (VLAN: ${SERVER_VLAN})"
 echo "  Bench:   ${BENCH_PUB}"
 if [[ -n "$REPLICA_PUB" ]]; then
-echo "  Replica: ${REPLICA_PUB} (VLAN: ${REPLICA_VLAN})"
+echo "  Replica1: ${REPLICA_PUB} (VLAN: ${REPLICA_VLAN})"
+fi
+if [[ -n "$REPLICA2_PUB" ]]; then
+echo "  Replica2: ${REPLICA2_PUB} (VLAN: ${REPLICA2_VLAN})"
 fi
 echo "  Results: ${RESULTS_DIR}"
 echo "============================================================"
@@ -114,6 +126,9 @@ echo "=== Building release binaries on all machines ==="
 BUILD_HOSTS=("${SERVER}" "${BENCH}")
 if [[ -n "$REPLICA" ]]; then
     BUILD_HOSTS+=("${REPLICA}")
+fi
+if [[ -n "$REPLICA2" ]]; then
+    BUILD_HOSTS+=("${REPLICA2}")
 fi
 NOPERSIST_BUILD=""
 if [[ "$RUN_NOPERSIST" == "1" ]]; then
@@ -488,6 +503,134 @@ else
 fi
 
 # ---------------------------------------------------------------------------
+# 5b. Dual replication benchmark (optional — requires two replica servers)
+# ---------------------------------------------------------------------------
+if [[ "$RUN_DUAL_REPLICATION" == "1" && -n "$REPLICA_PUB" && -n "$REPLICA_VLAN" && -n "$REPLICA2_PUB" && -n "$REPLICA2_VLAN" ]]; then
+    echo ""
+    echo "============================================================"
+    echo "  [5b] Peak throughput — full durability + dual sync replication"
+    echo "  100M pairs, 16 clients, window 256"
+    echo "============================================================"
+    echo ""
+
+    # Pin IRQs to core 0 on both replicas.
+    for host_label in "replica1:$REPLICA" "replica2:$REPLICA2"; do
+        label="${host_label%%:*}"
+        host="${host_label#*:}"
+        echo "  Pinning IRQs to core 0 on ${label}..."
+        ssh $SSH_OPTS "$host" 'pinned=0; failed=0
+for f in /proc/irq/*/smp_affinity; do
+    if echo 1 > "$f" 2>/dev/null; then
+        pinned=$((pinned + 1))
+    else
+        failed=$((failed + 1))
+    fi
+done
+echo "    Pinned ${pinned} IRQs to core 0 (${failed} unchanged)"'
+    done
+
+    # Clean journals on primary and both replicas.
+    JOURNAL_PATH="/mnt/journal/bench.journal"
+    REPLICA_JOURNAL="/mnt/journal/replica.journal"
+    REPLICA2_JOURNAL="/mnt/journal/replica2.journal"
+    ssh $SSH_OPTS "$SERVER" "rm -f ${JOURNAL_PATH} ${JOURNAL_PATH}.* 2>/dev/null; true"
+    ssh $SSH_OPTS "$REPLICA" "rm -f ${REPLICA_JOURNAL} ${REPLICA_JOURNAL}.* 2>/dev/null; true"
+    ssh $SSH_OPTS "$REPLICA2" "rm -f ${REPLICA2_JOURNAL} ${REPLICA2_JOURNAL}.* 2>/dev/null; true"
+
+    # Start primary.
+    echo "  Starting primary on ${SERVER} with --replication-bind..."
+    ssh $SSH_OPTS "$SERVER" "pkill -x melin-server 2>/dev/null; true"
+    sleep 1
+    ssh $SSH_OPTS "$SERVER" "RUST_LOG=info nohup ${REPO_DIR}/target/release/melin-server \
+            --bind ${SERVER_VLAN}:9876 \
+            --health-bind ${SERVER_VLAN}:9878 \
+            --journal ${JOURNAL_PATH} \
+            --authorized-keys ${REPO_DIR}/authorized_keys \
+            --replication-bind ${SERVER_VLAN}:${REPL_PORT} \
+        >/tmp/melin-server.log 2>&1 </dev/null &" </dev/null
+
+    # Wait for the replication listener.
+    echo "  Waiting for replication listener..."
+    for i in $(seq 1 30); do
+        if ssh $SSH_OPTS "$SERVER" "grep -q 'replication sender listening' /tmp/melin-server.log 2>/dev/null"; then
+            echo "  Replication listener ready (took ${i}s)."
+            break
+        fi
+        if [[ $i -eq 30 ]]; then
+            echo "  ERROR: Replication listener did not start. Check /tmp/melin-server.log"
+            ssh $SSH_OPTS "$SERVER" "tail -20 /tmp/melin-server.log" 2>/dev/null || true
+        fi
+        sleep 1
+    done
+
+    # Start both replicas — they connect to the same replication port.
+    echo "  Starting replica1 on ${REPLICA}..."
+    ssh $SSH_OPTS "$REPLICA" "pkill -x melin-server 2>/dev/null; true"
+    sleep 1
+    ssh $SSH_OPTS "$REPLICA" "RUST_LOG=info nohup ${REPO_DIR}/target/release/melin-server \
+            --replica-of ${SERVER_VLAN}:${REPL_PORT} \
+            --journal ${REPLICA_JOURNAL} \
+        >/tmp/trading-replica.log 2>&1 </dev/null &" </dev/null
+
+    echo "  Starting replica2 on ${REPLICA2}..."
+    ssh $SSH_OPTS "$REPLICA2" "pkill -x melin-server 2>/dev/null; true"
+    sleep 1
+    ssh $SSH_OPTS "$REPLICA2" "RUST_LOG=info nohup ${REPO_DIR}/target/release/melin-server \
+            --replica-of ${SERVER_VLAN}:${REPL_PORT} \
+            --journal ${REPLICA2_JOURNAL} \
+        >/tmp/trading-replica.log 2>&1 </dev/null &" </dev/null
+
+    # Wait for primary to seed and start accepting clients.
+    # With dual replication, the primary waits for BOTH replicas before seeding.
+    echo "  Waiting for primary to seed and start accepting clients..."
+    for i in $(seq 1 120); do
+        if ssh $SSH_OPTS "$SERVER" "grep -q 'listening' /tmp/melin-server.log 2>/dev/null"; then
+            echo "  Primary is ready (took ${i}s)."
+            break
+        fi
+        if [[ $i -eq 120 ]]; then
+            echo "  ERROR: Primary did not become ready. Check /tmp/melin-server.log"
+            ssh $SSH_OPTS "$SERVER" "tail -20 /tmp/melin-server.log" 2>/dev/null || true
+        fi
+        sleep 1
+    done
+
+    # Run the benchmark.
+    echo "  Running benchmark..."
+    ssh $SSH_OPTS "$BENCH" "cd ${REPO_DIR} && source ~/.cargo/env && \
+        ./target/release/melin-bench \
+            --addr ${SERVER_VLAN}:9876 \
+            --health-addr ${SERVER_VLAN}:9878 \
+            --key bench.key \
+            --json /tmp/bench-results.json \
+            --bench-cores 1 \
+            100000000 --clients 16 --window 256"
+
+    scp $SSH_OPTS -q "${SSH_USER}@${BENCH_PUB}:/tmp/bench-results.json" "${RESULTS_DIR}/5-dual-replication.json" 2>/dev/null || true
+
+    # Stop all servers.
+    ssh $SSH_OPTS "$SERVER" "pkill -INT -x melin-server 2>/dev/null; true"
+    ssh $SSH_OPTS "$REPLICA" "pkill -INT -x melin-server 2>/dev/null; true"
+    ssh $SSH_OPTS "$REPLICA2" "pkill -INT -x melin-server 2>/dev/null; true"
+    sleep 2
+    echo "  Servers stopped."
+
+    # Verify journal consistency on both replicas.
+    echo ""
+    echo "  Verifying journal consistency (replica1)..."
+    "${SCRIPT_DIR}/journal-verify.sh" "$SERVER" "$JOURNAL_PATH" "$REPLICA" "$REPLICA_JOURNAL"
+    echo "  Verifying journal consistency (replica2)..."
+    "${SCRIPT_DIR}/journal-verify.sh" "$SERVER" "$JOURNAL_PATH" "$REPLICA2" "$REPLICA2_JOURNAL"
+    echo ""
+else
+    if [[ "$RUN_DUAL_REPLICATION" == "1" ]]; then
+        echo ""
+        echo "  (skipping dual replication benchmark — need two replica servers)"
+        echo ""
+    fi
+fi
+
+# ---------------------------------------------------------------------------
 # 6. Generate plots
 # ---------------------------------------------------------------------------
 if [[ "$RUN_PLOTS" == "1" ]]; then
@@ -514,6 +657,9 @@ if command -v cargo &>/dev/null && [[ -f "$(dirname "$0")/../crates/bench/src/pl
     if [[ -f "${RESULTS_DIR}/4-replication.json" ]]; then
         CDF_FILES+=("${RESULTS_DIR}/4-replication.json")
     fi
+    if [[ -f "${RESULTS_DIR}/5-dual-replication.json" ]]; then
+        CDF_FILES+=("${RESULTS_DIR}/5-dual-replication.json")
+    fi
     "${PLOT_TOOL}" latency-cdf -o "${PLOT_DIR}/latency-cdf.svg" \
         "${CDF_FILES[@]}" 2>&1
 
@@ -527,7 +673,7 @@ if command -v cargo &>/dev/null && [[ -f "$(dirname "$0")/../crates/bench/src/pl
     done
 
     # Latency stability over time — one plot per mode.
-    for f_label in "1-fsync:fsync" "2-no-persist:no-persist" "4-replication:replication"; do
+    for f_label in "1-fsync:fsync" "2-no-persist:no-persist" "4-replication:replication" "5-dual-replication:dual-replication"; do
         f="${f_label%%:*}"
         label="${f_label##*:}"
         if [[ -f "${RESULTS_DIR}/${f}.json" ]]; then
@@ -538,7 +684,7 @@ if command -v cargo &>/dev/null && [[ -f "$(dirname "$0")/../crates/bench/src/pl
     done
 
     # Server health metrics over time — one set of plots per mode.
-    for f_label in "1-fsync:fsync" "2-no-persist:no-persist" "4-replication:replication"; do
+    for f_label in "1-fsync:fsync" "2-no-persist:no-persist" "4-replication:replication" "5-dual-replication:dual-replication"; do
         f="${f_label%%:*}"
         label="${f_label##*:}"
         if [[ -f "${RESULTS_DIR}/${f}.json" ]]; then
