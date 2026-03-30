@@ -1455,17 +1455,20 @@ pub fn run_receiver(
 
             info!(snap_sequence, snap_len, "receiving snapshot");
 
-            // Receive chunks into a temp file.
+            // Receive chunks into a temp file, computing CRC incrementally
+            // to avoid re-reading the entire file after write.
             let tmp_path = snapshot_path.with_extension("snapshot.tmp");
             {
                 let mut tmp_file = std::fs::File::create(&tmp_path)?;
                 let mut received: u64 = 0;
+                let mut running_crc: u32 = 0;
                 loop {
                     let chunk_frame = read_frame(&mut reader, MAX_DATA_FRAME)?;
                     match decode_primary_message(&chunk_frame)? {
                         PrimaryMessage::SnapshotChunk(data) => {
                             std::io::Write::write_all(&mut tmp_file, &data)?;
                             received += data.len() as u64;
+                            running_crc = crc32c::crc32c_append(running_crc, &data);
                         }
                         PrimaryMessage::SnapshotEnd {
                             crc32c: expected_crc,
@@ -1478,17 +1481,17 @@ pub fn run_receiver(
                                 let _ = std::fs::remove_file(&tmp_path);
                                 return Err(format!(
                                     "snapshot length mismatch: expected {snap_len} bytes, got {received}"
-                                ).into());
+                                )
+                                .into());
                             }
 
-                            // Verify CRC over the received file.
-                            let file_data = std::fs::read(&tmp_path)?;
-                            let actual_crc = crc32c::crc32c(&file_data);
-                            if actual_crc != expected_crc {
+                            // Verify CRC computed incrementally during receive.
+                            if running_crc != expected_crc {
                                 let _ = std::fs::remove_file(&tmp_path);
                                 return Err(format!(
-                                    "snapshot CRC mismatch: expected {expected_crc:#x}, got {actual_crc:#x}"
-                                ).into());
+                                    "snapshot CRC mismatch: expected {expected_crc:#x}, got {running_crc:#x}"
+                                )
+                                .into());
                             }
 
                             // Rename temp to final.
