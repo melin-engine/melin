@@ -81,10 +81,19 @@ REPLICA2="${REPLICA2_PUB:+${SSH_USER}@${REPLICA2_PUB}}"
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_DIR="~/workspace/trading"
-JOURNAL_PATH="/mnt/journal/bench.journal"
-SNAPSHOT_PATH="/mnt/journal/bench.snapshot"
+JOURNAL_PATH="${JOURNAL_PATH:-/mnt/journal/bench.journal}"
+SNAPSHOT_PATH="${SNAPSHOT_PATH:-/mnt/journal/bench.snapshot}"
+JOURNAL_DIR="$(dirname "$JOURNAL_PATH")"
+REPLICA_JOURNAL="${JOURNAL_DIR}/replica.journal"
+REPLICA2_JOURNAL="${JOURNAL_DIR}/replica2.journal"
 REPL_PORT=9877
 RUN_PLOTS="${RUN_PLOTS:-0}"
+
+# Order counts — override for quick smoke tests.
+THROUGHPUT_ORDERS="${THROUGHPUT_ORDERS:-100000000}"
+SINGLE_ORDERS="${SINGLE_ORDERS:-500000}"
+ORDERS_PER_SWEEP="${ORDERS_PER_SWEEP:-10000000}"
+LOCAL_ORDERS="${LOCAL_ORDERS:-100000000}"
 
 RESULTS_DIR="${RESULTS_DIR:-/tmp/lan-bench-suite-$(date +%Y%m%d-%H%M%S)}"
 mkdir -p "${RESULTS_DIR}"
@@ -117,8 +126,8 @@ trap cleanup EXIT
 # Valid combos. Each transport lists its supported workloads.
 # "local" workloads (engine-only, pipeline-only) run independently of transport.
 VALID_TCP="throughput no-persist single sweep-window sweep-clients sweep-instruments sweep-accounts"
-VALID_TCP_REPL="throughput"
-VALID_TCP_DUAL_REPL="throughput"
+VALID_TCP_REPL="throughput single"
+VALID_TCP_DUAL_REPL="throughput single"
 VALID_DPDK="throughput single"
 VALID_DPDK_REPL="throughput"
 LOCAL_WORKLOADS="engine-only pipeline-only"
@@ -446,7 +455,7 @@ transport_stop_tcp() {
 }
 
 transport_start_tcp_repl() {
-    local replica_journal="/mnt/journal/replica.journal"
+    local replica_journal="${REPLICA_JOURNAL}"
     clean_journal "$SERVER" "$JOURNAL_PATH"
     clean_journal "$REPLICA" "$replica_journal"
     pin_irqs "$SERVER" "server"
@@ -482,12 +491,12 @@ transport_start_tcp_repl() {
 transport_stop_tcp_repl() {
     stop_servers "$SERVER" "$REPLICA"
     echo "  Verifying journal consistency..."
-    "${SCRIPT_DIR}/journal-verify.sh" "$SERVER" "$JOURNAL_PATH" "$REPLICA" "/mnt/journal/replica.journal"
+    "${SCRIPT_DIR}/journal-verify.sh" "$SERVER" "$JOURNAL_PATH" "$REPLICA" "${REPLICA_JOURNAL}"
 }
 
 transport_start_tcp_dual_repl() {
-    local replica_journal="/mnt/journal/replica.journal"
-    local replica2_journal="/mnt/journal/replica2.journal"
+    local replica_journal="${REPLICA_JOURNAL}"
+    local replica2_journal="${REPLICA2_JOURNAL}"
     clean_journal "$SERVER" "$JOURNAL_PATH"
     clean_journal "$REPLICA" "$replica_journal"
     clean_journal "$REPLICA2" "$replica2_journal"
@@ -534,9 +543,9 @@ transport_start_tcp_dual_repl() {
 transport_stop_tcp_dual_repl() {
     stop_servers "$SERVER" "$REPLICA" "$REPLICA2"
     echo "  Verifying journal consistency (replica1)..."
-    "${SCRIPT_DIR}/journal-verify.sh" "$SERVER" "$JOURNAL_PATH" "$REPLICA" "/mnt/journal/replica.journal"
+    "${SCRIPT_DIR}/journal-verify.sh" "$SERVER" "$JOURNAL_PATH" "$REPLICA" "${REPLICA_JOURNAL}"
     echo "  Verifying journal consistency (replica2)..."
-    "${SCRIPT_DIR}/journal-verify.sh" "$SERVER" "$JOURNAL_PATH" "$REPLICA2" "/mnt/journal/replica2.journal"
+    "${SCRIPT_DIR}/journal-verify.sh" "$SERVER" "$JOURNAL_PATH" "$REPLICA2" "${REPLICA2_JOURNAL}"
 }
 
 # --- DPDK transports ---
@@ -634,7 +643,7 @@ transport_stop_dpdk() {
 
 transport_start_dpdk_repl() {
     dpdk_sriov_setup
-    local replica_journal="/mnt/journal/replica.journal"
+    local replica_journal="${REPLICA_JOURNAL}"
     clean_journal "$SERVER" "$JOURNAL_PATH"
     clean_journal "$REPLICA" "$replica_journal"
     pin_irqs "$SERVER" "server"
@@ -693,7 +702,7 @@ transport_start_dpdk_repl() {
 transport_stop_dpdk_repl() {
     stop_servers "$SERVER" "$REPLICA"
     echo "  Verifying DPDK replication journal consistency..."
-    "${SCRIPT_DIR}/journal-verify.sh" "$SERVER" "$JOURNAL_PATH" "$REPLICA" "/mnt/journal/replica.journal"
+    "${SCRIPT_DIR}/journal-verify.sh" "$SERVER" "$JOURNAL_PATH" "$REPLICA" "${REPLICA_JOURNAL}"
 }
 
 # ---------------------------------------------------------------------------
@@ -705,7 +714,7 @@ workload_throughput() {
     echo ""
     echo "============================================================"
     echo "  [${transport}] Peak throughput — full durability"
-    echo "  100M pairs, 16 clients, window 256"
+    echo "  ${THROUGHPUT_ORDERS} pairs, 16 clients, window 256"
     echo "============================================================"
     echo ""
 
@@ -716,9 +725,9 @@ workload_throughput() {
                 --key bench.key \
                 --json /tmp/bench-results.json \
                 ${BENCH_DPDK_ARGS} \
-                100000000 --clients 16 --window 256"
+                ${THROUGHPUT_ORDERS} --clients 16 --window 256"
     else
-        run_bench "$CURRENT_BIND" "$CURRENT_HEALTH" 100000000 --clients 16 --window 256
+        run_bench "$CURRENT_BIND" "$CURRENT_HEALTH" "${THROUGHPUT_ORDERS}" --clients 16 --window 256
     fi
     collect_result "${transport}-throughput"
 }
@@ -728,7 +737,7 @@ workload_no_persist() {
     echo ""
     echo "============================================================"
     echo "  [${transport}] Peak throughput — no persistence"
-    echo "  100M pairs, 16 clients, window 256"
+    echo "  ${THROUGHPUT_ORDERS} pairs, 16 clients, window 256"
     echo "============================================================"
     echo ""
 
@@ -746,7 +755,7 @@ workload_no_persist() {
     transport_stop_tcp
     transport_start_tcp
 
-    run_bench "$CURRENT_BIND" "$CURRENT_HEALTH" 100000000 --clients 16 --window 256
+    run_bench "$CURRENT_BIND" "$CURRENT_HEALTH" "${THROUGHPUT_ORDERS}" --clients 16 --window 256
     collect_result "${transport}-no-persist"
 
     # Restore.
@@ -764,7 +773,7 @@ workload_single() {
     echo ""
     echo "============================================================"
     echo "  [${transport}] Single-order latency — full durability"
-    echo "  500K pairs, 1 client, window 1"
+    echo "  ${SINGLE_ORDERS} pairs, 1 client, window 1"
     echo "============================================================"
     echo ""
 
@@ -775,9 +784,9 @@ workload_single() {
                 --key bench.key \
                 --json /tmp/bench-results.json \
                 ${BENCH_DPDK_ARGS} \
-                500000 --clients 1 --window 1"
+                ${SINGLE_ORDERS} --clients 1 --window 1"
     else
-        run_bench "$CURRENT_BIND" "$CURRENT_HEALTH" 500000 --clients 1 --window 1
+        run_bench "$CURRENT_BIND" "$CURRENT_HEALTH" "${SINGLE_ORDERS}" --clients 1 --window 1
     fi
     collect_result "${transport}-single"
 }
@@ -786,7 +795,7 @@ workload_engine_only() {
     echo ""
     echo "============================================================"
     echo "  [local] Engine only — matching engine, no journal, no network"
-    echo "  100M pairs"
+    echo "  ${LOCAL_ORDERS} pairs"
     echo "============================================================"
     echo ""
 
@@ -794,7 +803,7 @@ workload_engine_only() {
         ./target/release/melin-bench \
             --mode engine \
             --json /tmp/bench-results.json \
-            100000000"
+            ${LOCAL_ORDERS}"
 
     scp $SSH_OPTS -q "${SSH_USER}@${SERVER_PUB}:/tmp/bench-results.json" \
         "${RESULTS_DIR}/local-engine-only.json" 2>/dev/null || true
@@ -804,7 +813,7 @@ workload_pipeline_only() {
     echo ""
     echo "============================================================"
     echo "  [local] Pipeline — journal + matching, no network"
-    echo "  100M pairs, window 256"
+    echo "  ${LOCAL_ORDERS} pairs, window 256"
     echo "============================================================"
     echo ""
 
@@ -816,15 +825,13 @@ workload_pipeline_only() {
             --window 256 \
             --journal ${JOURNAL_PATH} \
             --json /tmp/bench-results.json \
-            100000000"
+            ${LOCAL_ORDERS}"
 
     scp $SSH_OPTS -q "${SSH_USER}@${SERVER_PUB}:/tmp/bench-results.json" \
         "${RESULTS_DIR}/local-pipeline-only.json" 2>/dev/null || true
 }
 
 # --- Sweeps ---
-
-ORDERS_PER_SWEEP=10000000
 
 # Run a sweep: for each config, restart the server and run the bench.
 # Usage: run_sweep <sweep-name> <transport> <configs...>
