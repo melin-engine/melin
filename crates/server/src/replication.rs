@@ -23,6 +23,9 @@
 //! - **StreamStart**: `[len:u32][0x10][start_sequence:u64]`
 //! - **NeedSnapshot**: `[len:u32][0x11]`
 //! - **HashMismatch**: `[len:u32][0x12]`
+//! - **SnapshotBegin**: `[len:u32][0x13][snapshot_len:u64][snap_sequence:u64][snap_chain_hash:[u8;32]]`
+//! - **SnapshotChunk**: `[len:u32][0x14][data...]`
+//! - **SnapshotEnd**: `[len:u32][0x15][crc32c:u32]`
 //! - **DataBatch**: `[len:u32][0x20][end_sequence:u64][chain_hash:[u8;32]][journal_bytes...]`
 //! - **Heartbeat**: `[len:u32][0x30][sequence:u64][chain_hash:[u8;32]]`
 //!

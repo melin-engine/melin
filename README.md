@@ -142,6 +142,7 @@ The TCP network stack is the primary throughput limiter. The journal pipeline hi
 ### [Replication & High Availability](docs/replication.md)
 - Synchronous dual replication — live WAL streaming to 2 replicas via lock-free ring buffer; replicas fsync and ack before the primary sends responses to clients (zero acknowledged data loss)
 - Journal catch-up — new replicas automatically catch up from the primary's journal files before switching to live streaming; enables replica replacement with zero downtime
+- Snapshot transfer — when journal archives have been purged, the primary transfers its snapshot over the replication channel; the replica loads the snapshot and resumes from there
 - Automatic trading halt when all replicas disconnect — trading continues with at least one replica; resumes instantly on reconnect
 - Manual promotion — operator sends `PROMOTE` to the replica's trigger endpoint; in-process transition reuses the warm Exchange state with zero re-replay, sub-second switchover
 - Multi-process failover tests — SIGKILL primary under load, promote replica, verify no data loss and clients can reconnect
