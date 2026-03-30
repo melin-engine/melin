@@ -1,58 +1,69 @@
 #!/usr/bin/env bash
-# Run the README benchmarks on a LAN setup (two Cherry servers).
+# Run the README benchmarks on a LAN setup (two+ Cherry servers).
 #
-# Reproduces:
-#   1. Peak throughput with full durability (fsync)
-#   2. Peak throughput without persistence (no-persist)
-#   3. Single-order latency (1 client, no pipelining, full durability)
-#   4. Parameter sweeps (window, instruments)
-#   5. Peak throughput with synchronous replication (optional, needs replica)
-#   5b. Peak throughput with dual synchronous replication (optional, needs 2 replicas)
-#   6. DPDK kernel bypass benchmarks (fsync, single-order, replication)
+# Benchmarks are organized as a transport × workload matrix:
+#
+#   Transports (how the server runs):
+#     tcp             Kernel TCP, standalone (no replication)
+#     tcp-repl        Kernel TCP + 1 synchronous replica
+#     tcp-dual-repl   Kernel TCP + 2 synchronous replicas
+#     dpdk            DPDK kernel bypass, standalone
+#     dpdk-repl       DPDK + 1 synchronous replica (e2e DPDK)
+#
+#   Workloads (what the bench runs):
+#     throughput      Peak throughput — 100M pairs, 16 clients, window 256
+#     no-persist      Peak throughput without journal fsync (tcp only)
+#     single          Single-order latency — 500K pairs, 1 client, window 1
+#     engine-only     Matching engine only — no journal, no network (local)
+#     pipeline-only   Journal + matching — no network (local)
+#     sweep-window    Window parameter sweep
+#     sweep-clients   Client count sweep (constant in-flight)
+#     sweep-instruments  Instrument count sweep
+#     sweep-accounts  Account count sweep
 #
 # Usage:
-#   ./scripts/lan-bench-suite.sh <server-public-ip> <bench-public-ip> <server-vlan-ip> [user] [replica-public-ip] [replica-vlan-ip] [replica2-public-ip] [replica2-vlan-ip]
+#   ./scripts/lan-bench-suite.sh <server-pub-ip> <bench-pub-ip> <server-vlan-ip> [user] \
+#       [replica-pub-ip] [replica-vlan-ip] [replica2-pub-ip] [replica2-vlan-ip]
 #
 # Examples:
-#   # Without replication (2 servers):
-#   ./scripts/lan-bench-suite.sh 84.32.176.142 84.32.176.143 10.0.0.1
+#   # Dual replication throughput only (default):
+#   ./scripts/lan-bench-suite.sh 84.32.176.142 84.32.176.143 10.0.0.1 root \
+#       84.32.176.144 10.0.0.3 84.32.176.145 10.0.0.4
 #
-#   # With single replication (3 servers):
-#   ./scripts/lan-bench-suite.sh 84.32.176.142 84.32.176.143 10.0.0.1 root 84.32.176.144 10.0.0.3
+#   # All TCP workloads:
+#   TRANSPORTS=tcp WORKLOADS=all ./scripts/lan-bench-suite.sh ...
 #
-#   # With dual replication (4 servers):
-#   ./scripts/lan-bench-suite.sh 84.32.176.142 84.32.176.143 10.0.0.1 root 84.32.176.144 10.0.0.3 84.32.176.145 10.0.0.4
+#   # Specific combo:
+#   TRANSPORTS=tcp,tcp-repl WORKLOADS=throughput,single ./scripts/lan-bench-suite.sh ...
 #
-#   # Only run the replication benchmark:
-#   RUN_FSYNC=0 RUN_NOPERSIST=0 RUN_SINGLE=0 RUN_SWEEPS=0 RUN_PLOTS=0 \
-#     ./scripts/lan-bench-suite.sh ... root 84.32.176.144 10.0.0.3
+# Environment variables:
+#   TRANSPORTS=<list>   Comma-separated transports (default: tcp-dual-repl)
+#   WORKLOADS=<list>    Comma-separated workloads (default: throughput)
+#   RUN_PLOTS=0|1       Generate plots from results (default: 0)
+#   RESULTS_DIR=<path>  Reuse existing results directory
+#   BENCH_BRANCH=<ref>  Checkout a specific branch on all machines
+#   BENCH_COMMIT=<hash> Checkout a specific commit (mutually exclusive with BENCH_BRANCH)
 #
-# Environment variables (all default to 1 = enabled):
-#   RUN_FSYNC=0|1        Peak throughput with full durability
-#   RUN_NOPERSIST=0|1    Peak throughput without persistence
-#   RUN_SINGLE=0|1       Single-order latency
-#   RUN_SWEEPS=0|1       Parameter sweeps (window, clients)
-#   RUN_SWEEP_INSTRUMENTS=0|1  Instrument count sweep (default: off)
-#   RUN_SWEEP_ACCOUNTS=0|1    Account count sweep (default: off)
-#   RUN_REPLICATION=0|1  Synchronous replication benchmark
-#   RUN_DUAL_REPLICATION=0|1  Dual synchronous replication benchmark (needs 2 replicas)
-#   RUN_DPDK=0|1         DPDK kernel bypass benchmarks (fsync, single-order, replication)
-#   RUN_PLOTS=0|1        Generate plots from results
-#   RESULTS_DIR=<path>   Reuse existing results directory (e.g. for re-plotting)
-#   BENCH_BRANCH=<ref>   Checkout a specific branch on all machines
-#   BENCH_COMMIT=<hash>  Checkout a specific commit on all machines (mutually exclusive with BENCH_BRANCH)
+# Special values:
+#   TRANSPORTS=all      All transports valid for the available infrastructure
+#   WORKLOADS=all       All workloads valid for each transport
 #
 # Prerequisites:
-#   - Same as lan-bench.sh (SSH access, cherry-deploy.sh setup, VLAN)
-#   - Run bench-isolate.sh on both machines before this script for stable numbers
+#   - SSH access to all machines (as root by default)
+#   - cherry-deploy.sh or cherry-setup.sh completed on all machines
+#   - VLAN/private network between machines
+#   - bench-isolate.sh run on all machines for stable numbers
 
 set -euo pipefail
 
 if [[ $# -lt 3 ]]; then
-    echo "usage: $0 <server-public-ip> <bench-public-ip> <server-vlan-ip> [user] [replica-public-ip] [replica-vlan-ip] [replica2-public-ip] [replica2-vlan-ip]"
+    echo "usage: $0 <server-pub-ip> <bench-pub-ip> <server-vlan-ip> [user] [replica-pub-ip] [replica-vlan-ip] [replica2-pub-ip] [replica2-vlan-ip]"
     exit 1
 fi
 
+# ---------------------------------------------------------------------------
+# Parse positional arguments
+# ---------------------------------------------------------------------------
 SERVER_PUB="$1"
 BENCH_PUB="$2"
 SERVER_VLAN="$3"
@@ -61,55 +72,162 @@ REPLICA_PUB="${5:-}"
 REPLICA_VLAN="${6:-}"
 REPLICA2_PUB="${7:-}"
 REPLICA2_VLAN="${8:-}"
-REPLICA="${REPLICA_PUB:+${SSH_USER}@${REPLICA_PUB}}"
-REPLICA2="${REPLICA2_PUB:+${SSH_USER}@${REPLICA2_PUB}}"
-REPL_PORT=9877
-
-# Toggle individual benchmarks (default: all enabled).
-RUN_FSYNC="${RUN_FSYNC:-1}"
-RUN_NOPERSIST="${RUN_NOPERSIST:-1}"
-RUN_SINGLE="${RUN_SINGLE:-1}"
-RUN_PIPELINE="${RUN_PIPELINE:-0}"
-RUN_SWEEPS="${RUN_SWEEPS:-0}"
-RUN_SWEEP_INSTRUMENTS="${RUN_SWEEP_INSTRUMENTS:-0}"
-RUN_SWEEP_ACCOUNTS="${RUN_SWEEP_ACCOUNTS:-0}"
-RUN_REPLICATION="${RUN_REPLICATION:-1}"
-RUN_DUAL_REPLICATION="${RUN_DUAL_REPLICATION:-1}"
-RUN_DPDK="${RUN_DPDK:-1}"
-RUN_PLOTS="${RUN_PLOTS:-1}"
-
-SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-LAN_BENCH="${SCRIPT_DIR}/lan-bench.sh"
-DPDK_LAN_BENCH="${SCRIPT_DIR}/dpdk-lan-bench.sh"
 
 SSH_OPTS="-A -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR"
 SERVER="${SSH_USER}@${SERVER_PUB}"
 BENCH="${SSH_USER}@${BENCH_PUB}"
+REPLICA="${REPLICA_PUB:+${SSH_USER}@${REPLICA_PUB}}"
+REPLICA2="${REPLICA2_PUB:+${SSH_USER}@${REPLICA2_PUB}}"
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_DIR="~/workspace/trading"
+JOURNAL_PATH="/mnt/journal/bench.journal"
+SNAPSHOT_PATH="/mnt/journal/bench.snapshot"
+REPL_PORT=9877
+RUN_PLOTS="${RUN_PLOTS:-0}"
 
 RESULTS_DIR="${RESULTS_DIR:-/tmp/lan-bench-suite-$(date +%Y%m%d-%H%M%S)}"
 mkdir -p "${RESULTS_DIR}"
 
+# Track whether DPDK was used (need reboot at end).
+DPDK_RAN=0
+# Track no-persist binary swap for cleanup.
+NOPERSIST_SWAPPED=0
+
+# ---------------------------------------------------------------------------
+# Cleanup trap — kill servers and restore binary on exit/interrupt
+# ---------------------------------------------------------------------------
+cleanup() {
+    if [[ "${NOPERSIST_SWAPPED}" == "1" ]]; then
+        echo "  Restoring durable server binary..."
+        ssh $SSH_OPTS "$SERVER" "cd ${REPO_DIR} && \
+            cp target/release/melin-server.persist target/release/melin-server 2>/dev/null || true && \
+            rm -f target/release/melin-server.persist target/release/melin-server.nopersist" 2>/dev/null || true
+    fi
+    for host in "$SERVER" ${REPLICA:+"$REPLICA"} ${REPLICA2:+"$REPLICA2"}; do
+        ssh $SSH_OPTS "$host" "pkill -INT -x melin-server 2>/dev/null; true" 2>/dev/null || true
+    done
+}
+trap cleanup EXIT
+
+# ---------------------------------------------------------------------------
+# Resolve transport × workload matrix
+# ---------------------------------------------------------------------------
+
+# Valid combos. Each transport lists its supported workloads.
+# "local" workloads (engine-only, pipeline-only) run independently of transport.
+VALID_TCP="throughput no-persist single sweep-window sweep-clients sweep-instruments sweep-accounts"
+VALID_TCP_REPL="throughput"
+VALID_TCP_DUAL_REPL="throughput"
+VALID_DPDK="throughput single"
+VALID_DPDK_REPL="throughput"
+LOCAL_WORKLOADS="engine-only pipeline-only"
+ALL_WORKLOADS="throughput no-persist single engine-only pipeline-only sweep-window sweep-clients sweep-instruments sweep-accounts"
+
+# Defaults.
+TRANSPORTS="${TRANSPORTS:-tcp-dual-repl}"
+WORKLOADS="${WORKLOADS:-throughput}"
+
+# Expand "all".
+if [[ "$TRANSPORTS" == "all" ]]; then
+    TRANSPORTS="tcp"
+    if [[ -n "$REPLICA_PUB" ]]; then TRANSPORTS="${TRANSPORTS},tcp-repl"; fi
+    if [[ -n "$REPLICA2_PUB" ]]; then TRANSPORTS="${TRANSPORTS},tcp-dual-repl"; fi
+    TRANSPORTS="${TRANSPORTS},dpdk"
+    if [[ -n "$REPLICA_PUB" ]]; then TRANSPORTS="${TRANSPORTS},dpdk-repl"; fi
+fi
+if [[ "$WORKLOADS" == "all" ]]; then
+    WORKLOADS="${ALL_WORKLOADS// /,}"
+fi
+
+# Convert to arrays.
+IFS=',' read -ra TRANSPORT_LIST <<< "$TRANSPORTS"
+IFS=',' read -ra WORKLOAD_LIST <<< "$WORKLOADS"
+
+# Validate infrastructure requirements and build run matrix.
+MATRIX=()
+LOCAL_MATRIX=()
+
+for workload in "${WORKLOAD_LIST[@]}"; do
+    workload="$(echo "$workload" | xargs)" # trim whitespace
+    if [[ " ${LOCAL_WORKLOADS} " == *" ${workload} "* ]]; then
+        LOCAL_MATRIX+=("$workload")
+        continue
+    fi
+
+    for transport in "${TRANSPORT_LIST[@]}"; do
+        transport="$(echo "$transport" | xargs)"
+
+        # Check infrastructure.
+        case "$transport" in
+            tcp-repl|dpdk-repl)
+                if [[ -z "$REPLICA_PUB" || -z "$REPLICA_VLAN" ]]; then
+                    echo "  SKIP ${transport}:${workload} — no replica server specified"
+                    continue
+                fi ;;
+            tcp-dual-repl)
+                if [[ -z "$REPLICA_PUB" || -z "$REPLICA2_PUB" ]]; then
+                    echo "  SKIP ${transport}:${workload} — need two replica servers"
+                    continue
+                fi ;;
+        esac
+
+        # Check valid combo.
+        valid_list=""
+        case "$transport" in
+            tcp)            valid_list="$VALID_TCP" ;;
+            tcp-repl)       valid_list="$VALID_TCP_REPL" ;;
+            tcp-dual-repl)  valid_list="$VALID_TCP_DUAL_REPL" ;;
+            dpdk)           valid_list="$VALID_DPDK" ;;
+            dpdk-repl)      valid_list="$VALID_DPDK_REPL" ;;
+            *)
+                echo "  SKIP unknown transport: ${transport}"
+                continue ;;
+        esac
+
+        if [[ " ${valid_list} " != *" ${workload} "* ]]; then
+            echo "  SKIP ${transport}:${workload} — not a valid combo"
+            continue
+        fi
+
+        MATRIX+=("${transport}:${workload}")
+    done
+done
+
+if [[ ${#MATRIX[@]} -eq 0 && ${#LOCAL_MATRIX[@]} -eq 0 ]]; then
+    echo "error: no valid transport:workload combos to run" >&2
+    exit 1
+fi
+
+# ---------------------------------------------------------------------------
+# Print plan
+# ---------------------------------------------------------------------------
+echo ""
 echo "============================================================"
-echo "  README Benchmark Suite"
+echo "  Benchmark Suite"
 echo "  Server:  ${SERVER_PUB} (VLAN: ${SERVER_VLAN})"
 echo "  Bench:   ${BENCH_PUB}"
 if [[ -n "$REPLICA_PUB" ]]; then
-echo "  Replica1: ${REPLICA_PUB} (VLAN: ${REPLICA_VLAN})"
+    echo "  Replica: ${REPLICA_PUB} (VLAN: ${REPLICA_VLAN})"
 fi
 if [[ -n "$REPLICA2_PUB" ]]; then
-echo "  Replica2: ${REPLICA2_PUB} (VLAN: ${REPLICA2_VLAN})"
+    echo "  Replica2: ${REPLICA2_PUB} (VLAN: ${REPLICA2_VLAN})"
 fi
 echo "  Results: ${RESULTS_DIR}"
+echo ""
+echo "  Plan:"
+for item in "${LOCAL_MATRIX[@]+"${LOCAL_MATRIX[@]}"}"; do
+    echo "    local : ${item}"
+done
+for item in "${MATRIX[@]}"; do
+    echo "    ${item%%:*} : ${item#*:}"
+done
 echo "============================================================"
 echo ""
 
 # ---------------------------------------------------------------------------
-# Build both binaries upfront (release + no-persist variant)
+# Build binaries
 # ---------------------------------------------------------------------------
-# BENCH_BRANCH: checkout a specific branch on all machines.
-# BENCH_COMMIT: checkout a specific commit hash on all machines.
-# Only one may be specified.
 if [[ -n "${BENCH_BRANCH:-}" && -n "${BENCH_COMMIT:-}" ]]; then
     echo "error: BENCH_BRANCH and BENCH_COMMIT are mutually exclusive" >&2
     exit 1
@@ -119,30 +237,49 @@ GIT_CMD="git pull --ff-only"
 if [[ -n "${BENCH_BRANCH:-}" ]]; then
     GIT_CMD="git fetch origin && git checkout ${BENCH_BRANCH} && git reset --hard origin/${BENCH_BRANCH}"
     echo "=== Using branch: ${BENCH_BRANCH} ==="
-    echo ""
 elif [[ -n "${BENCH_COMMIT:-}" ]]; then
     GIT_CMD="git fetch origin && git checkout ${BENCH_COMMIT}"
     echo "=== Using commit: ${BENCH_COMMIT} ==="
-    echo ""
 fi
 
-echo "=== Building release binaries on all machines ==="
-BUILD_HOSTS=("${SERVER}" "${BENCH}")
-if [[ -n "$REPLICA" ]]; then
-    BUILD_HOSTS+=("${REPLICA}")
+# Determine what to build.
+NEED_NOPERSIST=0
+NEED_DPDK=0
+for item in "${MATRIX[@]}"; do
+    case "${item#*:}" in no-persist) NEED_NOPERSIST=1 ;; esac
+    case "${item%%:*}" in dpdk|dpdk-repl) NEED_DPDK=1 ;; esac
+done
+
+echo "=== Building release binaries ==="
+BUILD_HOSTS=("$SERVER" "$BENCH")
+if [[ -n "$REPLICA" ]]; then BUILD_HOSTS+=("$REPLICA"); fi
+if [[ -n "$REPLICA2" ]]; then BUILD_HOSTS+=("$REPLICA2"); fi
+
+EXTRA_BUILD=""
+if [[ "$NEED_NOPERSIST" == "1" ]]; then
+    EXTRA_BUILD="&& cargo build --release --features no-persist"
 fi
-if [[ -n "$REPLICA2" ]]; then
-    BUILD_HOSTS+=("${REPLICA2}")
-fi
-NOPERSIST_BUILD=""
-if [[ "$RUN_NOPERSIST" == "1" ]]; then
-    NOPERSIST_BUILD="&& cargo build --release --features no-persist"
-fi
+
 for HOST in "${BUILD_HOSTS[@]}"; do
     echo "  Building on ${HOST}..."
     ssh $SSH_OPTS "$HOST" "cd ${REPO_DIR} && ${GIT_CMD} && source ~/.cargo/env && \
-        cargo build --release ${NOPERSIST_BUILD}" 2>&1 | tail -3
+        cargo build --release ${EXTRA_BUILD}" 2>&1 | tail -3
 done
+
+# DPDK build on server (and replica if dpdk-repl).
+if [[ "$NEED_DPDK" == "1" ]]; then
+    echo "  Building DPDK server..."
+    ssh $SSH_OPTS "$SERVER" "cd ${REPO_DIR} && source ~/.cargo/env && \
+        cargo build --release -p melin-server --features dpdk --no-default-features" 2>&1 | tail -3
+    for item in "${MATRIX[@]}"; do
+        if [[ "${item%%:*}" == "dpdk-repl" && -n "$REPLICA" ]]; then
+            echo "  Building DPDK server on replica..."
+            ssh $SSH_OPTS "$REPLICA" "cd ${REPO_DIR} && source ~/.cargo/env && \
+                cargo build --release -p melin-server --features dpdk --no-default-features" 2>&1 | tail -3
+            break
+        fi
+    done
+fi
 echo "  Builds complete."
 echo ""
 
@@ -150,6 +287,8 @@ echo ""
 # Generate auth keys (shared setup — needed by all benchmarks)
 # ---------------------------------------------------------------------------
 echo "=== Setting up auth keys ==="
+
+# Generate trader key on bench machine.
 ssh $SSH_OPTS "$BENCH" "cd ${REPO_DIR} && \
     if [[ ! -f bench.key ]]; then \
         source ~/.cargo/env && \
@@ -158,391 +297,162 @@ ssh $SSH_OPTS "$BENCH" "cd ${REPO_DIR} && \
     else \
         echo 'bench.key already exists'; \
     fi"
+
 AUTH_LINE=$(ssh $SSH_OPTS "$BENCH" "cd ${REPO_DIR} && cat bench.pub | xargs -I{} echo 'trader {} bench'")
-ssh $SSH_OPTS "$SERVER" "cd ${REPO_DIR} && echo '${AUTH_LINE}' > authorized_keys"
+
+# Generate replication key on server if any replication transport is used.
+REPL_AUTH_LINE=""
+HAS_REPL=0
+for item in "${MATRIX[@]}"; do
+    case "${item%%:*}" in *repl*) HAS_REPL=1; break ;; esac
+done
+
+if [[ "$HAS_REPL" == "1" ]]; then
+    ssh $SSH_OPTS "$SERVER" "cd ${REPO_DIR} && \
+        if [[ ! -f repl.key ]]; then \
+            source ~/.cargo/env && \
+            cargo run --release -p melin-admin --bin melin-keygen -- repl replication && \
+            echo 'Generated repl.key'; \
+        else \
+            echo 'repl.key already exists'; \
+        fi"
+    REPL_AUTH_LINE=$(ssh $SSH_OPTS "$SERVER" "cd ${REPO_DIR} && cat repl.pub | xargs -I{} echo 'replication {} repl'")
+
+    # Copy replication key to replica(s).
+    if [[ -n "$REPLICA" ]]; then
+        scp $SSH_OPTS -q "${SSH_USER}@${SERVER_PUB}:${REPO_DIR}/repl.key" /tmp/repl.key
+        scp $SSH_OPTS -q /tmp/repl.key "${REPLICA}:${REPO_DIR}/repl.key"
+        echo "  Distributed replication key to replica"
+    fi
+    if [[ -n "$REPLICA2" ]]; then
+        scp $SSH_OPTS -q /tmp/repl.key "${REPLICA2}:${REPO_DIR}/repl.key"
+        echo "  Distributed replication key to replica2"
+    fi
+    rm -f /tmp/repl.key
+fi
+
+# Write authorized_keys on server (trader + replication).
+FULL_AUTH="${AUTH_LINE}"
+if [[ -n "$REPL_AUTH_LINE" ]]; then
+    FULL_AUTH="${FULL_AUTH}\n${REPL_AUTH_LINE}"
+fi
+ssh $SSH_OPTS "$SERVER" "cd ${REPO_DIR} && echo -e '${FULL_AUTH}' > authorized_keys"
 echo "  Auth keys configured."
 echo ""
 
-# Prevent lan-bench.sh from rebuilding (we already built).
+# Prevent sub-scripts from rebuilding.
 export CARGO_BUILD_FLAGS="--release"
 
 # ---------------------------------------------------------------------------
-# 1. Peak throughput — full durability (fsync)
+# Shared helpers
 # ---------------------------------------------------------------------------
-if [[ "$RUN_FSYNC" == "1" ]]; then
-echo ""
-echo "============================================================"
-echo "  [1/3] Peak throughput — full durability"
-echo "  100M pairs, 16 clients, window 256"
-echo "============================================================"
-echo ""
 
-"${LAN_BENCH}" "$SERVER_PUB" "$BENCH_PUB" "$SERVER_VLAN" "$SSH_USER" \
-    -- -- 100000000 --clients 16 --window 256
+pin_irqs() {
+    local host="$1" label="$2"
+    echo "  Pinning IRQs on ${label}..."
+    ssh $SSH_OPTS "$host" 'pinned=0; failed=0
+for f in /proc/irq/*/smp_affinity; do
+    if echo 1 > "$f" 2>/dev/null; then
+        pinned=$((pinned + 1))
+    else
+        failed=$((failed + 1))
+    fi
+done
+echo "    Pinned ${pinned} IRQs to core 0 (${failed} unchanged)"'
+}
 
-cp /tmp/lan-bench-results.json "${RESULTS_DIR}/1-fsync.json" 2>/dev/null || true
-fi
+clean_journal() {
+    local host="$1" path="$2"
+    ssh $SSH_OPTS "$host" "rm -f ${path} ${path}.* ${path%.journal}.snapshot ${path%.journal}.snapshot.* 2>/dev/null; true"
+}
 
-# ---------------------------------------------------------------------------
-# 2. Peak throughput — no persistence
-# ---------------------------------------------------------------------------
-if [[ "$RUN_NOPERSIST" == "1" ]]; then
-echo ""
-echo "============================================================"
-echo "  [2/3] Peak throughput — no persistence"
-echo "  250M pairs, 16 clients, window 256"
-echo "============================================================"
-echo ""
-
-# For no-persist, we need to swap the server binary. The lan-bench.sh script
-# always uses target/release/melin-server, so we swap it temporarily.
-echo "  Swapping in no-persist server binary..."
-ssh $SSH_OPTS "$SERVER" "cd ${REPO_DIR} && \
-    cp target/release/melin-server target/release/melin-server.bak && \
-    cp target/release/melin-server target/release/melin-server.persist && \
-    find target/release/deps -name 'trading_server-*' -newer target/release/melin-server -executable 2>/dev/null | head -1 | xargs -I{} cp {} target/release/melin-server || true"
-
-# The no-persist build produces the binary with the no-persist feature compiled in.
-# We need to explicitly copy it. The feature flag is compiled into the binary at build time.
-ssh $SSH_OPTS "$SERVER" "cd ${REPO_DIR} && source ~/.cargo/env && \
-    cargo build --release --features no-persist 2>&1 | tail -1 && \
-    cp target/release/melin-server target/release/melin-server.nopersist && \
-    cp target/release/melin-server.nopersist target/release/melin-server"
-
-"${LAN_BENCH}" "$SERVER_PUB" "$BENCH_PUB" "$SERVER_VLAN" "$SSH_USER" \
-    -- -- 100000000 --clients 16 --window 256
-
-cp /tmp/lan-bench-results.json "${RESULTS_DIR}/2-no-persist.json" 2>/dev/null || true
-
-# Restore the normal (durable) binary.
-echo "  Restoring durable server binary..."
-ssh $SSH_OPTS "$SERVER" "cd ${REPO_DIR} && \
-    cp target/release/melin-server.persist target/release/melin-server 2>/dev/null || true && \
-    rm -f target/release/melin-server.bak target/release/melin-server.persist target/release/melin-server.nopersist"
-fi
-
-# ---------------------------------------------------------------------------
-# 3. Single-order latency — full durability, 1 client, no pipelining
-# ---------------------------------------------------------------------------
-if [[ "$RUN_SINGLE" == "1" ]]; then
-echo ""
-echo "============================================================"
-echo "  [3/3] Single-order latency — full durability"
-echo "  500K pairs, 1 client, window 1"
-echo "============================================================"
-echo ""
-
-"${LAN_BENCH}" "$SERVER_PUB" "$BENCH_PUB" "$SERVER_VLAN" "$SSH_USER" \
-    -- -- 500000 --clients 1 --window 1
-
-cp /tmp/lan-bench-results.json "${RESULTS_DIR}/3-single-order.json" 2>/dev/null || true
-fi
-
-# ---------------------------------------------------------------------------
-# 4. Pipeline breakdown — engine-only and pipeline (no network)
-# ---------------------------------------------------------------------------
-if [[ "$RUN_PIPELINE" == "1" ]]; then
-
-PIPELINE_PAIRS=100000000
-PIPELINE_WINDOW=256
-
-# 4a. Engine only — matching engine without journal or network.
-# Runs on the server machine (same CPU as production benchmarks).
-echo ""
-echo "============================================================"
-echo "  Engine only — matching engine, no journal, no network"
-echo "  ${PIPELINE_PAIRS} pairs, window ${PIPELINE_WINDOW}"
-echo "============================================================"
-echo ""
-
-ssh $SSH_OPTS "$SERVER" "cd ${REPO_DIR} && source ~/.cargo/env && \
-    ./target/release/melin-bench \
-        --mode engine \
-        --json /tmp/bench-results.json \
-        ${PIPELINE_PAIRS}"
-
-scp $SSH_OPTS -q "${SSH_USER}@${SERVER_PUB}:/tmp/bench-results.json" "${RESULTS_DIR}/5-engine-only.json" 2>/dev/null || true
-
-# 4b. Pipeline (no network) — journal + matching, no TCP.
-# Uses the dedicated NVMe journal disk for realistic fsync costs.
-echo ""
-echo "============================================================"
-echo "  Pipeline — journal + matching, no network"
-echo "  ${PIPELINE_PAIRS} pairs, window ${PIPELINE_WINDOW}"
-echo "============================================================"
-echo ""
-
-JOURNAL_PATH="/mnt/journal/bench.journal"
-ssh $SSH_OPTS "$SERVER" "rm -f ${JOURNAL_PATH} ${JOURNAL_PATH}.* 2>/dev/null; true"
-
-ssh $SSH_OPTS "$SERVER" "cd ${REPO_DIR} && source ~/.cargo/env && \
-    ./target/release/melin-bench \
-        --mode pipeline \
-        --window ${PIPELINE_WINDOW} \
-        --journal ${JOURNAL_PATH} \
-        --json /tmp/bench-results.json \
-        ${PIPELINE_PAIRS}"
-
-scp $SSH_OPTS -q "${SSH_USER}@${SERVER_PUB}:/tmp/bench-results.json" "${RESULTS_DIR}/6-pipeline.json" 2>/dev/null || true
-
-fi
-
-# ---------------------------------------------------------------------------
-# Helper: run a sweep and collect results into a subdirectory.
-# Usage: run_sweep <sweep-name> <orders> <configs...>
-#   Each config is: "label:--clients N --window W --accounts A --instruments I"
-#   The label is used for the JSON filename.
-# ---------------------------------------------------------------------------
-ORDERS_PER_SWEEP=10000000
-
-run_sweep() {
-    local sweep_name="$1"
-    shift
-    local sweep_dir="${RESULTS_DIR}/sweep-${sweep_name}"
-    mkdir -p "${sweep_dir}"
-
-    echo ""
-    echo "============================================================"
-    echo "  Sweep: ${sweep_name}"
-    echo "  ${ORDERS_PER_SWEEP} orders per point"
-    echo "============================================================"
-    echo ""
-
-    for config in "$@"; do
-        local label="${config%%:*}"
-        local bench_args="${config#*:}"
-        echo "--- ${label} ---"
-
-        "${LAN_BENCH}" "$SERVER_PUB" "$BENCH_PUB" "$SERVER_VLAN" "$SSH_USER" \
-            -- -- ${ORDERS_PER_SWEEP} ${bench_args}
-
-        cp /tmp/lan-bench-results.json "${sweep_dir}/${label}.json" 2>/dev/null || true
-        echo ""
+wait_for_log() {
+    local host="$1" log_file="$2" pattern="$3" timeout="${4:-120}" label="${5:-server}"
+    for i in $(seq 1 "$timeout"); do
+        if ssh $SSH_OPTS "$host" "grep -q '${pattern}' ${log_file} 2>/dev/null"; then
+            echo "  ${label} ready (took ${i}s)."
+            return 0
+        fi
+        if [[ $i -eq "$timeout" ]]; then
+            echo "  ERROR: ${label} did not become ready within ${timeout}s."
+            ssh $SSH_OPTS "$host" "tail -20 ${log_file}" 2>/dev/null || true
+            return 1
+        fi
+        sleep 1
     done
 }
 
-# ---------------------------------------------------------------------------
-# 4. Sweeps — one parameter at a time, others held fixed
-# ---------------------------------------------------------------------------
-if [[ "$RUN_SWEEPS" == "1" ]]; then
-
-# 4a. Window sweep (fixed clients=16, accounts/instruments=server defaults)
-run_sweep "window" \
-    "w32:--clients 16 --window 32" \
-    "w64:--clients 16 --window 64" \
-    "w128:--clients 16 --window 128" \
-    "w256:--clients 16 --window 256" \
-    "w512:--clients 16 --window 512"
-
-# 4b. Client sweep (constant total in-flight = 4096, fixed 10M orders per point)
-# Window adjusted so clients × window = 4096, isolating client count effects.
-run_sweep "clients" \
-    "c64:--clients 64 --window 64" \
-    "c128:--clients 128 --window 32" \
-    "c256:--clients 256 --window 16" \
-    "c512:--clients 512 --window 8" \
-    "c1024:--clients 1024 --window 4"
-
-# 4c. Instruments sweep (fixed clients=16, window=128)
-if [[ "$RUN_SWEEP_INSTRUMENTS" == "1" ]]; then
-INST_SWEEP_DIR="${RESULTS_DIR}/sweep-instruments"
-mkdir -p "${INST_SWEEP_DIR}"
-echo ""
-echo "============================================================"
-echo "  Sweep: instruments"
-echo "  ${ORDERS_PER_SWEEP} orders per point"
-echo "============================================================"
-echo ""
-for inst in 10 100 1000; do
-    label="i${inst}"
-    echo "--- instruments=${inst} ---"
-    "${LAN_BENCH}" "$SERVER_PUB" "$BENCH_PUB" "$SERVER_VLAN" "$SSH_USER" \
-        -- --instruments "${inst}" \
-        -- ${ORDERS_PER_SWEEP} --clients 16 --window 128
-    cp /tmp/lan-bench-results.json "${INST_SWEEP_DIR}/${label}.json" 2>/dev/null || true
-    echo ""
-done
-fi
-
-# 4d. Account sweep (fixed clients=16, window=128)
-# Tests whether account count affects hot-path latency via cache pressure
-# on the balance HashMap.
-if [[ "$RUN_SWEEP_ACCOUNTS" == "1" ]]; then
-ACCT_SWEEP_DIR="${RESULTS_DIR}/sweep-accounts"
-mkdir -p "${ACCT_SWEEP_DIR}"
-echo ""
-echo "============================================================"
-echo "  Sweep: accounts"
-echo "  ${ORDERS_PER_SWEEP} orders per point"
-echo "============================================================"
-echo ""
-for accts in 100000 1000000 10000000; do
-    label="a${accts}"
-    echo "--- accounts=${accts} ---"
-    "${LAN_BENCH}" "$SERVER_PUB" "$BENCH_PUB" "$SERVER_VLAN" "$SSH_USER" \
-        -- --accounts "${accts}" \
-        -- ${ORDERS_PER_SWEEP} --clients 16 --window 128 --accounts "${accts}"
-    cp /tmp/lan-bench-results.json "${ACCT_SWEEP_DIR}/${label}.json" 2>/dev/null || true
-    echo ""
-done
-fi
-
-fi
-
-# ---------------------------------------------------------------------------
-# 5. Replication benchmark (optional — requires replica server)
-# ---------------------------------------------------------------------------
-if [[ "$RUN_REPLICATION" == "1" && -n "$REPLICA_PUB" && -n "$REPLICA_VLAN" ]]; then
-    echo ""
-    echo "============================================================"
-    echo "  [5] Peak throughput — full durability + sync replication"
-    echo "  100M pairs, 16 clients, window 256"
-    echo "============================================================"
-    echo ""
-
-    # Pin IRQs to core 0 on the replica (server + bench are pinned by lan-bench.sh).
-    echo "  Pinning IRQs to core 0 on replica..."
-    ssh $SSH_OPTS "$REPLICA" 'pinned=0; failed=0
-for f in /proc/irq/*/smp_affinity; do
-    if echo 1 > "$f" 2>/dev/null; then
-        pinned=$((pinned + 1))
-    else
-        failed=$((failed + 1))
-    fi
-done
-echo "    Pinned ${pinned} IRQs to core 0 (${failed} unchanged)"'
-
-    # Clean journals on both primary and replica.
-    JOURNAL_PATH="/mnt/journal/bench.journal"
-    REPLICA_JOURNAL="/mnt/journal/replica.journal"
-    ssh $SSH_OPTS "$SERVER" "rm -f ${JOURNAL_PATH} ${JOURNAL_PATH}.* 2>/dev/null; true"
-    ssh $SSH_OPTS "$REPLICA" "rm -f ${REPLICA_JOURNAL} ${REPLICA_JOURNAL}.* 2>/dev/null; true"
-
-    # Verify replica can reach primary on VLAN.
-    if ! ssh $SSH_OPTS "$REPLICA" "nc -z -w 3 ${SERVER_VLAN} 22" 2>/dev/null; then
-        echo "  WARNING: replica cannot reach ${SERVER_VLAN} on VLAN — replication may fail"
-    fi
-
-    # Start primary — it blocks on replica_ready before seeding, so the
-    # "listening" log only appears after the replica connects AND seeding
-    # completes. Start order: primary → wait for repl port → replica →
-    # wait for "listening" (seeding done, accept loop running).
-    echo "  Starting primary on ${SERVER} with --replication-bind..."
-    ssh $SSH_OPTS "$SERVER" "pkill -x melin-server 2>/dev/null; true"
-    sleep 1
-    ssh $SSH_OPTS "$SERVER" "RUST_LOG=info nohup ${REPO_DIR}/target/release/melin-server \
-            --bind ${SERVER_VLAN}:9876 \
-            --health-bind ${SERVER_VLAN}:9878 \
-            --journal ${JOURNAL_PATH} \
-            --authorized-keys ${REPO_DIR}/authorized_keys \
-            --replication-bind ${SERVER_VLAN}:${REPL_PORT} \
-        >/tmp/melin-server.log 2>&1 </dev/null &" </dev/null
-
-    # Wait for the replication listener to be ready before starting the replica.
-    echo "  Waiting for replication listener..."
-    for i in $(seq 1 30); do
-        if ssh $SSH_OPTS "$SERVER" "grep -q 'replication sender listening' /tmp/melin-server.log 2>/dev/null"; then
-            echo "  Replication listener ready (took ${i}s)."
-            break
-        fi
-        if [[ $i -eq 30 ]]; then
-            echo "  ERROR: Replication listener did not start. Check /tmp/melin-server.log"
-            ssh $SSH_OPTS "$SERVER" "tail -20 /tmp/melin-server.log" 2>/dev/null || true
-        fi
-        sleep 1
+stop_servers() {
+    for host in "$@"; do
+        ssh $SSH_OPTS "$host" "pkill -INT -x melin-server 2>/dev/null; true"
     done
+    sleep 2
+}
 
-    # Start replica — connects to primary's replication port.
-    echo "  Starting replica on ${REPLICA}..."
-    ssh $SSH_OPTS "$REPLICA" "pkill -x melin-server 2>/dev/null; true"
-    sleep 1
-    ssh $SSH_OPTS "$REPLICA" "RUST_LOG=info nohup ${REPO_DIR}/target/release/melin-server \
-            --replica-of ${SERVER_VLAN}:${REPL_PORT} \
-            --journal ${REPLICA_JOURNAL} \
-        >/tmp/trading-replica.log 2>&1 </dev/null &" </dev/null
-
-    # Wait for "listening" — printed after replica connects, seeding completes,
-    # and the accept loop starts. This is the true "ready for clients" signal.
-    echo "  Waiting for primary to seed and start accepting clients..."
-    for i in $(seq 1 120); do
-        if ssh $SSH_OPTS "$SERVER" "grep -q 'listening' /tmp/melin-server.log 2>/dev/null"; then
-            echo "  Primary is ready (took ${i}s)."
-            break
-        fi
-        if [[ $i -eq 120 ]]; then
-            echo "  ERROR: Primary did not become ready. Check /tmp/melin-server.log"
-            ssh $SSH_OPTS "$SERVER" "tail -20 /tmp/melin-server.log" 2>/dev/null || true
-        fi
-        sleep 1
-    done
-
-    # Run the benchmark against the primary (same as fsync benchmark).
-    echo "  Running benchmark..."
+# Run the bench client against an already-running server.
+# Usage: run_bench <server_addr> <health_addr> <orders> <extra_bench_args...>
+run_bench() {
+    local server_addr="$1" health_addr="$2" orders="$3"
+    shift 3
     ssh $SSH_OPTS "$BENCH" "cd ${REPO_DIR} && source ~/.cargo/env && \
         ./target/release/melin-bench \
-            --addr ${SERVER_VLAN}:9876 \
-            --health-addr ${SERVER_VLAN}:9878 \
+            --addr ${server_addr} \
+            --health-addr ${health_addr} \
             --key bench.key \
             --json /tmp/bench-results.json \
             --bench-cores 1 \
-            100000000 --clients 16 --window 256"
+            ${orders} $*"
+}
 
-    scp $SSH_OPTS -q "${SSH_USER}@${BENCH_PUB}:/tmp/bench-results.json" "${RESULTS_DIR}/4-replication.json" 2>/dev/null || true
-
-    # Stop both servers.
-    ssh $SSH_OPTS "$SERVER" "pkill -INT -x melin-server 2>/dev/null; true"
-    ssh $SSH_OPTS "$REPLICA" "pkill -INT -x melin-server 2>/dev/null; true"
-    sleep 2
-    echo "  Servers stopped."
-
-    # Verify journal consistency between primary and replica.
-    echo ""
-    echo "  Verifying journal consistency..."
-    "${SCRIPT_DIR}/journal-verify.sh" "$SERVER" "$JOURNAL_PATH" "$REPLICA" "$REPLICA_JOURNAL"
-    echo ""
-else
-    echo ""
-    echo "  (skipping replication benchmark — no replica server specified)"
-    echo ""
-fi
+collect_result() {
+    local name="$1"
+    scp $SSH_OPTS -q "${SSH_USER}@${BENCH_PUB}:/tmp/bench-results.json" "${RESULTS_DIR}/${name}.json" 2>/dev/null || true
+}
 
 # ---------------------------------------------------------------------------
-# 5b. Dual replication benchmark (optional — requires two replica servers)
+# Transport setup/teardown functions
 # ---------------------------------------------------------------------------
-if [[ "$RUN_DUAL_REPLICATION" == "1" && -n "$REPLICA_PUB" && -n "$REPLICA_VLAN" && -n "$REPLICA2_PUB" && -n "$REPLICA2_VLAN" ]]; then
-    echo ""
-    echo "============================================================"
-    echo "  [5b] Peak throughput — full durability + dual sync replication"
-    echo "  100M pairs, 16 clients, window 256"
-    echo "============================================================"
-    echo ""
 
-    # Pin IRQs to core 0 on both replicas.
-    for host_label in "replica1:$REPLICA" "replica2:$REPLICA2"; do
-        label="${host_label%%:*}"
-        host="${host_label#*:}"
-        echo "  Pinning IRQs to core 0 on ${label}..."
-        ssh $SSH_OPTS "$host" 'pinned=0; failed=0
-for f in /proc/irq/*/smp_affinity; do
-    if echo 1 > "$f" 2>/dev/null; then
-        pinned=$((pinned + 1))
-    else
-        failed=$((failed + 1))
-    fi
-done
-echo "    Pinned ${pinned} IRQs to core 0 (${failed} unchanged)"'
-    done
+# Each transport has:
+#   transport_start_<t>   — clean journal, start server, wait for ready
+#   transport_stop_<t>    — stop servers, optionally verify journals
+# Global setup (IRQ pinning, DPDK sriov) is done once before the transport group.
 
-    # Clean journals on primary and both replicas.
-    JOURNAL_PATH="/mnt/journal/bench.journal"
-    REPLICA_JOURNAL="/mnt/journal/replica.journal"
-    REPLICA2_JOURNAL="/mnt/journal/replica2.journal"
-    ssh $SSH_OPTS "$SERVER" "rm -f ${JOURNAL_PATH} ${JOURNAL_PATH}.* 2>/dev/null; true"
-    ssh $SSH_OPTS "$REPLICA" "rm -f ${REPLICA_JOURNAL} ${REPLICA_JOURNAL}.* 2>/dev/null; true"
-    ssh $SSH_OPTS "$REPLICA2" "rm -f ${REPLICA2_JOURNAL} ${REPLICA2_JOURNAL}.* 2>/dev/null; true"
+CURRENT_BIND=""
+CURRENT_HEALTH=""
 
-    # Start primary.
-    echo "  Starting primary on ${SERVER} with --replication-bind..."
+transport_start_tcp() {
+    clean_journal "$SERVER" "$JOURNAL_PATH"
+    pin_irqs "$SERVER" "server"
+    pin_irqs "$BENCH" "bench"
+
+    ssh $SSH_OPTS "$SERVER" "pkill -x melin-server 2>/dev/null; true"
+    sleep 1
+    ssh $SSH_OPTS "$SERVER" "RUST_LOG=info nohup ${REPO_DIR}/target/release/melin-server \
+            --bind ${SERVER_VLAN}:9876 \
+            --health-bind ${SERVER_VLAN}:9878 \
+            --journal ${JOURNAL_PATH} \
+            --authorized-keys ${REPO_DIR}/authorized_keys \
+            ${SERVER_EXTRA_ARGS:-} \
+        >/tmp/melin-server.log 2>&1 </dev/null &" </dev/null
+
+    wait_for_log "$SERVER" "/tmp/melin-server.log" "listening" 120 "Server"
+    CURRENT_BIND="${SERVER_VLAN}:9876"
+    CURRENT_HEALTH="${SERVER_VLAN}:9878"
+}
+
+transport_stop_tcp() {
+    stop_servers "$SERVER"
+}
+
+transport_start_tcp_repl() {
+    local replica_journal="/mnt/journal/replica.journal"
+    clean_journal "$SERVER" "$JOURNAL_PATH"
+    clean_journal "$REPLICA" "$replica_journal"
+    pin_irqs "$SERVER" "server"
+    pin_irqs "$BENCH" "bench"
+    pin_irqs "$REPLICA" "replica"
+
     ssh $SSH_OPTS "$SERVER" "pkill -x melin-server 2>/dev/null; true"
     sleep 1
     ssh $SSH_OPTS "$SERVER" "RUST_LOG=info nohup ${REPO_DIR}/target/release/melin-server \
@@ -553,398 +463,592 @@ echo "    Pinned ${pinned} IRQs to core 0 (${failed} unchanged)"'
             --replication-bind ${SERVER_VLAN}:${REPL_PORT} \
         >/tmp/melin-server.log 2>&1 </dev/null &" </dev/null
 
-    # Wait for the replication listener.
-    echo "  Waiting for replication listener..."
-    for i in $(seq 1 30); do
-        if ssh $SSH_OPTS "$SERVER" "grep -q 'replication sender listening' /tmp/melin-server.log 2>/dev/null"; then
-            echo "  Replication listener ready (took ${i}s)."
-            break
-        fi
-        if [[ $i -eq 30 ]]; then
-            echo "  ERROR: Replication listener did not start. Check /tmp/melin-server.log"
-            ssh $SSH_OPTS "$SERVER" "tail -20 /tmp/melin-server.log" 2>/dev/null || true
-        fi
-        sleep 1
-    done
+    wait_for_log "$SERVER" "/tmp/melin-server.log" "replication sender listening" 30 "Replication listener"
 
-    # Start both replicas — they connect to the same replication port.
-    echo "  Starting replica1 on ${REPLICA}..."
     ssh $SSH_OPTS "$REPLICA" "pkill -x melin-server 2>/dev/null; true"
     sleep 1
     ssh $SSH_OPTS "$REPLICA" "RUST_LOG=info nohup ${REPO_DIR}/target/release/melin-server \
             --replica-of ${SERVER_VLAN}:${REPL_PORT} \
-            --journal ${REPLICA_JOURNAL} \
+            --replication-key ${REPO_DIR}/repl.key \
+            --journal ${replica_journal} \
+            --authorized-keys ${REPO_DIR}/authorized_keys \
         >/tmp/trading-replica.log 2>&1 </dev/null &" </dev/null
 
-    echo "  Starting replica2 on ${REPLICA2}..."
+    wait_for_log "$SERVER" "/tmp/melin-server.log" "listening" 120 "Primary"
+    CURRENT_BIND="${SERVER_VLAN}:9876"
+    CURRENT_HEALTH="${SERVER_VLAN}:9878"
+}
+
+transport_stop_tcp_repl() {
+    stop_servers "$SERVER" "$REPLICA"
+    echo "  Verifying journal consistency..."
+    "${SCRIPT_DIR}/journal-verify.sh" "$SERVER" "$JOURNAL_PATH" "$REPLICA" "/mnt/journal/replica.journal"
+}
+
+transport_start_tcp_dual_repl() {
+    local replica_journal="/mnt/journal/replica.journal"
+    local replica2_journal="/mnt/journal/replica2.journal"
+    clean_journal "$SERVER" "$JOURNAL_PATH"
+    clean_journal "$REPLICA" "$replica_journal"
+    clean_journal "$REPLICA2" "$replica2_journal"
+    pin_irqs "$SERVER" "server"
+    pin_irqs "$BENCH" "bench"
+    pin_irqs "$REPLICA" "replica1"
+    pin_irqs "$REPLICA2" "replica2"
+
+    ssh $SSH_OPTS "$SERVER" "pkill -x melin-server 2>/dev/null; true"
+    sleep 1
+    ssh $SSH_OPTS "$SERVER" "RUST_LOG=info nohup ${REPO_DIR}/target/release/melin-server \
+            --bind ${SERVER_VLAN}:9876 \
+            --health-bind ${SERVER_VLAN}:9878 \
+            --journal ${JOURNAL_PATH} \
+            --authorized-keys ${REPO_DIR}/authorized_keys \
+            --replication-bind ${SERVER_VLAN}:${REPL_PORT} \
+        >/tmp/melin-server.log 2>&1 </dev/null &" </dev/null
+
+    wait_for_log "$SERVER" "/tmp/melin-server.log" "replication sender listening" 30 "Replication listener"
+
+    ssh $SSH_OPTS "$REPLICA" "pkill -x melin-server 2>/dev/null; true"
+    sleep 1
+    ssh $SSH_OPTS "$REPLICA" "RUST_LOG=info nohup ${REPO_DIR}/target/release/melin-server \
+            --replica-of ${SERVER_VLAN}:${REPL_PORT} \
+            --replication-key ${REPO_DIR}/repl.key \
+            --journal ${replica_journal} \
+            --authorized-keys ${REPO_DIR}/authorized_keys \
+        >/tmp/trading-replica.log 2>&1 </dev/null &" </dev/null
+
     ssh $SSH_OPTS "$REPLICA2" "pkill -x melin-server 2>/dev/null; true"
     sleep 1
     ssh $SSH_OPTS "$REPLICA2" "RUST_LOG=info nohup ${REPO_DIR}/target/release/melin-server \
             --replica-of ${SERVER_VLAN}:${REPL_PORT} \
-            --journal ${REPLICA2_JOURNAL} \
+            --replication-key ${REPO_DIR}/repl.key \
+            --journal ${replica2_journal} \
+            --authorized-keys ${REPO_DIR}/authorized_keys \
         >/tmp/trading-replica.log 2>&1 </dev/null &" </dev/null
 
-    # Wait for primary to seed and start accepting clients.
-    # With dual replication, the primary waits for BOTH replicas before seeding.
-    echo "  Waiting for primary to seed and start accepting clients..."
-    for i in $(seq 1 120); do
-        if ssh $SSH_OPTS "$SERVER" "grep -q 'listening' /tmp/melin-server.log 2>/dev/null"; then
-            echo "  Primary is ready (took ${i}s)."
-            break
-        fi
-        if [[ $i -eq 120 ]]; then
-            echo "  ERROR: Primary did not become ready. Check /tmp/melin-server.log"
-            ssh $SSH_OPTS "$SERVER" "tail -20 /tmp/melin-server.log" 2>/dev/null || true
-        fi
-        sleep 1
+    wait_for_log "$SERVER" "/tmp/melin-server.log" "listening" 120 "Primary"
+    CURRENT_BIND="${SERVER_VLAN}:9876"
+    CURRENT_HEALTH="${SERVER_VLAN}:9878"
+}
+
+transport_stop_tcp_dual_repl() {
+    stop_servers "$SERVER" "$REPLICA" "$REPLICA2"
+    echo "  Verifying journal consistency (replica1)..."
+    "${SCRIPT_DIR}/journal-verify.sh" "$SERVER" "$JOURNAL_PATH" "$REPLICA" "/mnt/journal/replica.journal"
+    echo "  Verifying journal consistency (replica2)..."
+    "${SCRIPT_DIR}/journal-verify.sh" "$SERVER" "$JOURNAL_PATH" "$REPLICA2" "/mnt/journal/replica2.journal"
+}
+
+# --- DPDK transports ---
+
+# Load DPDK config from /etc/melin-dpdk.conf on a host.
+# Populates DPDK_IP, DPDK_PREFIX, DPDK_PORT from the remote config.
+load_dpdk_config() {
+    local host="$1" prefix="$2"
+    local conf
+    conf=$(ssh $SSH_OPTS "$host" "cat /etc/melin-dpdk.conf 2>/dev/null" || true)
+    if [[ -n "$conf" ]]; then
+        local ip port dpdk_prefix
+        ip=$(echo "$conf" | grep "^DPDK_IP=" | cut -d= -f2)
+        port=$(echo "$conf" | grep "^DPDK_PORT=" | cut -d= -f2)
+        dpdk_prefix=$(echo "$conf" | grep "^DPDK_PREFIX=" | cut -d= -f2)
+        eval "${prefix}_DPDK_IP=${ip:-}"
+        eval "${prefix}_DPDK_PORT=${port:-0}"
+        eval "${prefix}_DPDK_PREFIX=${dpdk_prefix:-24}"
+    fi
+}
+
+DPDK_SRIOV_DONE=0
+
+dpdk_sriov_setup() {
+    if [[ "$DPDK_SRIOV_DONE" == "1" ]]; then return; fi
+
+    echo ""
+    echo "=== Setting up DPDK SR-IOV ==="
+    local hosts=("$SERVER" "$BENCH")
+    if [[ -n "$REPLICA" ]]; then
+        for item in "${MATRIX[@]}"; do
+            if [[ "${item%%:*}" == "dpdk-repl" ]]; then hosts+=("$REPLICA"); break; fi
+        done
+    fi
+    for HOST in "${hosts[@]}"; do
+        echo "  Setting up DPDK on ${HOST}..."
+        ssh $SSH_OPTS "$HOST" "cd ${REPO_DIR} && sudo ./scripts/dpdk-setup-sriov.sh" 2>&1 | tail -5
     done
 
-    # Run the benchmark.
-    echo "  Running benchmark..."
-    ssh $SSH_OPTS "$BENCH" "cd ${REPO_DIR} && source ~/.cargo/env && \
-        ./target/release/melin-bench \
-            --addr ${SERVER_VLAN}:9876 \
-            --health-addr ${SERVER_VLAN}:9878 \
-            --key bench.key \
-            --json /tmp/bench-results.json \
-            --bench-cores 1 \
-            100000000 --clients 16 --window 256"
-
-    scp $SSH_OPTS -q "${SSH_USER}@${BENCH_PUB}:/tmp/bench-results.json" "${RESULTS_DIR}/5-dual-replication.json" 2>/dev/null || true
-
-    # Stop all servers.
-    ssh $SSH_OPTS "$SERVER" "pkill -INT -x melin-server 2>/dev/null; true"
-    ssh $SSH_OPTS "$REPLICA" "pkill -INT -x melin-server 2>/dev/null; true"
-    ssh $SSH_OPTS "$REPLICA2" "pkill -INT -x melin-server 2>/dev/null; true"
-    sleep 2
-    echo "  Servers stopped."
-
-    # Verify journal consistency on both replicas.
-    echo ""
-    echo "  Verifying journal consistency (replica1)..."
-    "${SCRIPT_DIR}/journal-verify.sh" "$SERVER" "$JOURNAL_PATH" "$REPLICA" "$REPLICA_JOURNAL"
-    echo "  Verifying journal consistency (replica2)..."
-    "${SCRIPT_DIR}/journal-verify.sh" "$SERVER" "$JOURNAL_PATH" "$REPLICA2" "$REPLICA2_JOURNAL"
-    echo ""
-else
-    if [[ "$RUN_DUAL_REPLICATION" == "1" ]]; then
-        echo ""
-        echo "  (skipping dual replication benchmark — need two replica servers)"
-        echo ""
-    fi
-fi
-
-# ---------------------------------------------------------------------------
-# 6. DPDK kernel bypass benchmarks
-# ---------------------------------------------------------------------------
-if [[ "$RUN_DPDK" == "1" ]]; then
-
-echo ""
-echo "============================================================"
-echo "  DPDK — Setting up SR-IOV on server and bench"
-echo "============================================================"
-echo ""
-
-DPDK_SETUP_HOSTS=("$SERVER" "$BENCH")
-if [[ -n "$REPLICA" && "$RUN_REPLICATION" == "1" ]]; then
-    DPDK_SETUP_HOSTS+=("$REPLICA")
-fi
-for HOST in "${DPDK_SETUP_HOSTS[@]}"; do
-    echo "  Setting up DPDK on ${HOST}..."
-    ssh $SSH_OPTS "$HOST" "cd ${REPO_DIR} && sudo ./scripts/dpdk-setup-sriov.sh" 2>&1 | tail -5
-    echo ""
-done
-
-# Read DPDK config from server (written by dpdk-setup-sriov.sh).
-DPDK_CONF=$(ssh $SSH_OPTS "$SERVER" "cat /etc/melin-dpdk.conf 2>/dev/null" || true)
-if [[ -n "$DPDK_CONF" ]]; then
-    eval "$DPDK_CONF"
-    echo "  Server DPDK config: IP=${DPDK_IP}, port=${DPDK_PORT}"
-fi
-DPDK_IP="${DPDK_IP:-${SERVER_VLAN}}"
-
-# 6a. DPDK peak throughput — full durability (fsync)
-echo ""
-echo "============================================================"
-echo "  DPDK [1/3] Peak throughput — full durability"
-echo "  100M pairs, 16 clients, window 256"
-echo "============================================================"
-echo ""
-
-"${DPDK_LAN_BENCH}" "$SERVER_PUB" "$BENCH_PUB" "$SERVER_VLAN" "$SSH_USER" \
-    -- 100000000 --clients 16 --window 256
-
-cp /tmp/dpdk-bench-results.json "${RESULTS_DIR}/7-dpdk-fsync.json" 2>/dev/null || true
-
-# 6b. DPDK single-order latency — full durability, 1 client, no pipelining
-echo ""
-echo "============================================================"
-echo "  DPDK [2/3] Single-order latency — full durability"
-echo "  500K pairs, 1 client, window 1"
-echo "============================================================"
-echo ""
-
-"${DPDK_LAN_BENCH}" "$SERVER_PUB" "$BENCH_PUB" "$SERVER_VLAN" "$SSH_USER" \
-    -- 500000 --clients 1 --window 1
-
-cp /tmp/dpdk-bench-results.json "${RESULTS_DIR}/8-dpdk-single-order.json" 2>/dev/null || true
-
-# 6c. DPDK replication (optional — requires replica server)
-# Full e2e DPDK: primary sender and replica receiver both use smoltcp.
-# Replication binds on the DPDK IP, not the kernel VLAN IP.
-if [[ -n "$REPLICA_PUB" && -n "$REPLICA_VLAN" && "$RUN_REPLICATION" == "1" ]]; then
-    echo ""
-    echo "============================================================"
-    echo "  DPDK [3/3] Peak throughput — full durability + sync replication"
-    echo "  100M pairs, 16 clients, window 256"
-    echo "  (e2e DPDK: client + replication channels)"
-    echo "============================================================"
+    load_dpdk_config "$SERVER" "SERVER"
+    load_dpdk_config "$BENCH" "BENCH"
+    SERVER_DPDK_IP="${SERVER_DPDK_IP:-${SERVER_VLAN}}"
+    SERVER_DPDK_PORT="${SERVER_DPDK_PORT:-0}"
+    SERVER_DPDK_PREFIX="${SERVER_DPDK_PREFIX:-24}"
+    BENCH_DPDK_PORT="${BENCH_DPDK_PORT:-0}"
+    BENCH_DPDK_PREFIX="${BENCH_DPDK_PREFIX:-24}"
+    echo "  Server DPDK: IP=${SERVER_DPDK_IP}, port=${SERVER_DPDK_PORT}"
     echo ""
 
-    # Read replica DPDK config (written by dpdk-setup-sriov.sh earlier).
-    REPLICA_DPDK_CONF=$(ssh $SSH_OPTS "$REPLICA" "cat /etc/melin-dpdk.conf 2>/dev/null" || true)
-    REPLICA_DPDK_IP=""
-    REPLICA_DPDK_PREFIX=""
-    REPLICA_DPDK_PORT="0"
-    if [[ -n "$REPLICA_DPDK_CONF" ]]; then
-        REPLICA_DPDK_IP=$(echo "$REPLICA_DPDK_CONF" | grep "^DPDK_IP=" | cut -d= -f2)
-        REPLICA_DPDK_PREFIX=$(echo "$REPLICA_DPDK_CONF" | grep "^DPDK_PREFIX=" | cut -d= -f2)
-        REPLICA_DPDK_PORT=$(echo "$REPLICA_DPDK_CONF" | grep "^DPDK_PORT=" | cut -d= -f2)
-        echo "  Replica DPDK config: IP=${REPLICA_DPDK_IP}, port=${REPLICA_DPDK_PORT}"
-    fi
-    REPLICA_DPDK_IP="${REPLICA_DPDK_IP:-${REPLICA_VLAN}}"
-    REPLICA_DPDK_PREFIX="${REPLICA_DPDK_PREFIX:-24}"
+    DPDK_SRIOV_DONE=1
+}
 
-    # Build DPDK server on replica.
-    echo "  Building DPDK server on replica..."
-    ssh $SSH_OPTS "$REPLICA" "cd ${REPO_DIR} && source ~/.cargo/env && \
-        cargo build --release -p melin-server --features dpdk --no-default-features" 2>&1 | tail -3
+HUGE_DIR="${HUGE_DIR:-/mnt/huge_2m}"
+BENCH_DPDK_CORE="${BENCH_DPDK_CORE:-7}"
 
-    # Pin IRQs to core 0 on the replica.
-    echo "  Pinning IRQs to core 0 on replica..."
-    ssh $SSH_OPTS "$REPLICA" 'pinned=0; failed=0
-for f in /proc/irq/*/smp_affinity; do
-    if echo 1 > "$f" 2>/dev/null; then
-        pinned=$((pinned + 1))
-    else
-        failed=$((failed + 1))
-    fi
-done
-echo "    Pinned ${pinned} IRQs to core 0 (${failed} unchanged)"'
+transport_start_dpdk() {
+    dpdk_sriov_setup
+    clean_journal "$SERVER" "$JOURNAL_PATH"
+    pin_irqs "$SERVER" "server"
+    pin_irqs "$BENCH" "bench"
 
-    # Clean journals on both primary and replica.
-    JOURNAL_PATH="/mnt/journal/bench.journal"
-    REPLICA_JOURNAL="/mnt/journal/replica.journal"
-    ssh $SSH_OPTS "$SERVER" "rm -f ${JOURNAL_PATH} ${JOURNAL_PATH}.* 2>/dev/null; true"
-    ssh $SSH_OPTS "$REPLICA" "rm -f ${REPLICA_JOURNAL} ${REPLICA_JOURNAL}.* 2>/dev/null; true"
-
-    DPDK_PREFIX="${DPDK_PREFIX:-24}"
-    DPDK_PORT="${DPDK_PORT:-0}"
-    HUGE_DIR="${HUGE_DIR:-/mnt/huge_2m}"
-
-    EAL_FULL="--huge-dir=${HUGE_DIR}"
-
-    # Start DPDK primary with replication on the DPDK IP.
-    echo "  Starting DPDK primary on ${SERVER} with --replication-bind..."
     ssh $SSH_OPTS "$SERVER" "pkill -x melin-server 2>/dev/null; true"
     sleep 1
     ssh $SSH_OPTS "$SERVER" "RUST_LOG=info nohup ${REPO_DIR}/target/release/melin-server \
             --bind 0.0.0.0:9876 \
             --journal ${JOURNAL_PATH} \
             --authorized-keys ${REPO_DIR}/authorized_keys \
-            --replication-bind ${DPDK_IP}:${REPL_PORT} \
-            --dpdk-eal-args='${EAL_FULL}' \
-            --dpdk-ip ${DPDK_IP} \
-            --dpdk-prefix-len ${DPDK_PREFIX} \
-            --dpdk-ports ${DPDK_PORT} \
+            --dpdk-eal-args='--huge-dir=${HUGE_DIR}' \
+            --dpdk-ip ${SERVER_DPDK_IP} \
+            --dpdk-prefix-len ${SERVER_DPDK_PREFIX} \
+            --dpdk-ports ${SERVER_DPDK_PORT} \
         >/tmp/melin-server.log 2>&1 </dev/null &" </dev/null
 
-    # Wait for the replication listener (smoltcp).
-    echo "  Waiting for DPDK replication listener..."
-    for i in $(seq 1 30); do
-        if ssh $SSH_OPTS "$SERVER" "grep -q 'DPDK replication sender started' /tmp/melin-server.log 2>/dev/null"; then
-            echo "  Replication listener ready (took ${i}s)."
-            break
-        fi
-        if [[ $i -eq 30 ]]; then
-            echo "  ERROR: Replication listener did not start. Check /tmp/melin-server.log"
-            ssh $SSH_OPTS "$SERVER" "tail -20 /tmp/melin-server.log" 2>/dev/null || true
-        fi
-        sleep 1
-    done
+    # DPDK server doesn't respond to kernel nc — wait via log.
+    wait_for_log "$SERVER" "/tmp/melin-server.log" "listening" 120 "DPDK server"
 
-    # Start DPDK replica — connects to primary's DPDK IP via smoltcp.
-    REPLICA_EAL_FULL="--huge-dir=${HUGE_DIR}"
-    echo "  Starting DPDK replica on ${REPLICA}..."
+    local bench_eal="--huge-dir=${HUGE_DIR}"
+    if [[ -n "${BENCH_DPDK_EAL_ARGS:-}" ]]; then
+        bench_eal="${BENCH_DPDK_EAL_ARGS} ${bench_eal}"
+    fi
+    # Export bench DPDK args for run_bench_dpdk.
+    BENCH_DPDK_ARGS="--dpdk-eal-args='${bench_eal}' --dpdk-ports ${BENCH_DPDK_PORT} --dpdk-core ${BENCH_DPDK_CORE}"
+    if [[ -n "${BENCH_DPDK_IP:-}" ]]; then
+        BENCH_DPDK_ARGS="${BENCH_DPDK_ARGS} --dpdk-ip ${BENCH_DPDK_IP} --dpdk-prefix-len ${BENCH_DPDK_PREFIX}"
+    fi
+
+    CURRENT_BIND="${SERVER_DPDK_IP}:9876"
+    CURRENT_HEALTH=""  # No health endpoint with DPDK (smoltcp).
+    DPDK_RAN=1
+}
+
+transport_stop_dpdk() {
+    stop_servers "$SERVER"
+}
+
+transport_start_dpdk_repl() {
+    dpdk_sriov_setup
+    local replica_journal="/mnt/journal/replica.journal"
+    clean_journal "$SERVER" "$JOURNAL_PATH"
+    clean_journal "$REPLICA" "$replica_journal"
+    pin_irqs "$SERVER" "server"
+    pin_irqs "$BENCH" "bench"
+    pin_irqs "$REPLICA" "replica"
+
+    load_dpdk_config "$REPLICA" "REPLICA"
+    REPLICA_DPDK_IP="${REPLICA_DPDK_IP:-${REPLICA_VLAN}}"
+    REPLICA_DPDK_PORT="${REPLICA_DPDK_PORT:-0}"
+    REPLICA_DPDK_PREFIX="${REPLICA_DPDK_PREFIX:-24}"
+
+    ssh $SSH_OPTS "$SERVER" "pkill -x melin-server 2>/dev/null; true"
+    sleep 1
+    ssh $SSH_OPTS "$SERVER" "RUST_LOG=info nohup ${REPO_DIR}/target/release/melin-server \
+            --bind 0.0.0.0:9876 \
+            --journal ${JOURNAL_PATH} \
+            --authorized-keys ${REPO_DIR}/authorized_keys \
+            --replication-bind ${SERVER_DPDK_IP}:${REPL_PORT} \
+            --dpdk-eal-args='--huge-dir=${HUGE_DIR}' \
+            --dpdk-ip ${SERVER_DPDK_IP} \
+            --dpdk-prefix-len ${SERVER_DPDK_PREFIX} \
+            --dpdk-ports ${SERVER_DPDK_PORT} \
+        >/tmp/melin-server.log 2>&1 </dev/null &" </dev/null
+
+    wait_for_log "$SERVER" "/tmp/melin-server.log" "DPDK replication sender started" 30 "DPDK replication listener"
+
     ssh $SSH_OPTS "$REPLICA" "pkill -x melin-server 2>/dev/null; true"
     sleep 1
     ssh $SSH_OPTS "$REPLICA" "RUST_LOG=info nohup ${REPO_DIR}/target/release/melin-server \
-            --replica-of ${DPDK_IP}:${REPL_PORT} \
-            --journal ${REPLICA_JOURNAL} \
-            --dpdk-eal-args='${REPLICA_EAL_FULL}' \
+            --replica-of ${SERVER_DPDK_IP}:${REPL_PORT} \
+            --replication-key ${REPO_DIR}/repl.key \
+            --journal ${replica_journal} \
+            --authorized-keys ${REPO_DIR}/authorized_keys \
+            --dpdk-eal-args='--huge-dir=${HUGE_DIR}' \
             --dpdk-ip ${REPLICA_DPDK_IP} \
             --dpdk-prefix-len ${REPLICA_DPDK_PREFIX} \
             --dpdk-ports ${REPLICA_DPDK_PORT} \
         >/tmp/trading-replica.log 2>&1 </dev/null &" </dev/null
 
-    # Wait for primary to seed and start accepting clients.
-    echo "  Waiting for primary to seed and start accepting clients..."
-    for i in $(seq 1 120); do
-        if ssh $SSH_OPTS "$SERVER" "grep -q 'listening' /tmp/melin-server.log 2>/dev/null"; then
-            echo "  Primary is ready (took ${i}s)."
-            break
+    wait_for_log "$SERVER" "/tmp/melin-server.log" "listening" 120 "DPDK primary"
+
+    local bench_eal="--huge-dir=${HUGE_DIR}"
+    if [[ -n "${BENCH_DPDK_EAL_ARGS:-}" ]]; then
+        bench_eal="${BENCH_DPDK_EAL_ARGS} ${bench_eal}"
+    fi
+    BENCH_DPDK_ARGS="--dpdk-eal-args='${bench_eal}' --dpdk-ports ${BENCH_DPDK_PORT} --dpdk-core ${BENCH_DPDK_CORE}"
+    if [[ -n "${BENCH_DPDK_IP:-}" ]]; then
+        BENCH_DPDK_ARGS="${BENCH_DPDK_ARGS} --dpdk-ip ${BENCH_DPDK_IP} --dpdk-prefix-len ${BENCH_DPDK_PREFIX}"
+    fi
+
+    CURRENT_BIND="${SERVER_DPDK_IP}:9876"
+    CURRENT_HEALTH=""
+    DPDK_RAN=1
+}
+
+transport_stop_dpdk_repl() {
+    stop_servers "$SERVER" "$REPLICA"
+    echo "  Verifying DPDK replication journal consistency..."
+    "${SCRIPT_DIR}/journal-verify.sh" "$SERVER" "$JOURNAL_PATH" "$REPLICA" "/mnt/journal/replica.journal"
+}
+
+# ---------------------------------------------------------------------------
+# Workload functions
+# ---------------------------------------------------------------------------
+
+workload_throughput() {
+    local transport="$1"
+    echo ""
+    echo "============================================================"
+    echo "  [${transport}] Peak throughput — full durability"
+    echo "  100M pairs, 16 clients, window 256"
+    echo "============================================================"
+    echo ""
+
+    if [[ "$transport" == dpdk* ]]; then
+        ssh $SSH_OPTS "$BENCH" "cd ${REPO_DIR} && source ~/.cargo/env && \
+            ./target/release/melin-bench \
+                --addr ${CURRENT_BIND} \
+                --key bench.key \
+                --json /tmp/bench-results.json \
+                ${BENCH_DPDK_ARGS} \
+                100000000 --clients 16 --window 256"
+    else
+        run_bench "$CURRENT_BIND" "$CURRENT_HEALTH" 100000000 --clients 16 --window 256
+    fi
+    collect_result "${transport}-throughput"
+}
+
+workload_no_persist() {
+    local transport="$1"
+    echo ""
+    echo "============================================================"
+    echo "  [${transport}] Peak throughput — no persistence"
+    echo "  100M pairs, 16 clients, window 256"
+    echo "============================================================"
+    echo ""
+
+    # Swap to no-persist binary.
+    echo "  Swapping in no-persist server binary..."
+    ssh $SSH_OPTS "$SERVER" "cd ${REPO_DIR} && \
+        cp target/release/melin-server target/release/melin-server.persist && \
+        source ~/.cargo/env && \
+        cargo build --release --features no-persist 2>&1 | tail -1 && \
+        cp target/release/melin-server target/release/melin-server.nopersist && \
+        cp target/release/melin-server.nopersist target/release/melin-server"
+    NOPERSIST_SWAPPED=1
+
+    # Need to restart with the swapped binary. Stop current, restart.
+    transport_stop_tcp
+    transport_start_tcp
+
+    run_bench "$CURRENT_BIND" "$CURRENT_HEALTH" 100000000 --clients 16 --window 256
+    collect_result "${transport}-no-persist"
+
+    # Restore.
+    echo "  Restoring durable server binary..."
+    transport_stop_tcp
+    ssh $SSH_OPTS "$SERVER" "cd ${REPO_DIR} && \
+        cp target/release/melin-server.persist target/release/melin-server 2>/dev/null || true && \
+        rm -f target/release/melin-server.persist target/release/melin-server.nopersist"
+    NOPERSIST_SWAPPED=0
+    transport_start_tcp
+}
+
+workload_single() {
+    local transport="$1"
+    echo ""
+    echo "============================================================"
+    echo "  [${transport}] Single-order latency — full durability"
+    echo "  500K pairs, 1 client, window 1"
+    echo "============================================================"
+    echo ""
+
+    if [[ "$transport" == dpdk* ]]; then
+        ssh $SSH_OPTS "$BENCH" "cd ${REPO_DIR} && source ~/.cargo/env && \
+            ./target/release/melin-bench \
+                --addr ${CURRENT_BIND} \
+                --key bench.key \
+                --json /tmp/bench-results.json \
+                ${BENCH_DPDK_ARGS} \
+                500000 --clients 1 --window 1"
+    else
+        run_bench "$CURRENT_BIND" "$CURRENT_HEALTH" 500000 --clients 1 --window 1
+    fi
+    collect_result "${transport}-single"
+}
+
+workload_engine_only() {
+    echo ""
+    echo "============================================================"
+    echo "  [local] Engine only — matching engine, no journal, no network"
+    echo "  100M pairs"
+    echo "============================================================"
+    echo ""
+
+    ssh $SSH_OPTS "$SERVER" "cd ${REPO_DIR} && source ~/.cargo/env && \
+        ./target/release/melin-bench \
+            --mode engine \
+            --json /tmp/bench-results.json \
+            100000000"
+
+    scp $SSH_OPTS -q "${SSH_USER}@${SERVER_PUB}:/tmp/bench-results.json" \
+        "${RESULTS_DIR}/local-engine-only.json" 2>/dev/null || true
+}
+
+workload_pipeline_only() {
+    echo ""
+    echo "============================================================"
+    echo "  [local] Pipeline — journal + matching, no network"
+    echo "  100M pairs, window 256"
+    echo "============================================================"
+    echo ""
+
+    clean_journal "$SERVER" "$JOURNAL_PATH"
+
+    ssh $SSH_OPTS "$SERVER" "cd ${REPO_DIR} && source ~/.cargo/env && \
+        ./target/release/melin-bench \
+            --mode pipeline \
+            --window 256 \
+            --journal ${JOURNAL_PATH} \
+            --json /tmp/bench-results.json \
+            100000000"
+
+    scp $SSH_OPTS -q "${SSH_USER}@${SERVER_PUB}:/tmp/bench-results.json" \
+        "${RESULTS_DIR}/local-pipeline-only.json" 2>/dev/null || true
+}
+
+# --- Sweeps ---
+
+ORDERS_PER_SWEEP=10000000
+
+# Run a sweep: for each config, restart the server and run the bench.
+# Usage: run_sweep <sweep-name> <transport> <configs...>
+#   Each config is "label:bench-args" or "label:server-args:bench-args"
+run_sweep() {
+    local sweep_name="$1" transport="$2"
+    shift 2
+    local sweep_dir="${RESULTS_DIR}/sweep-${sweep_name}"
+    mkdir -p "${sweep_dir}"
+
+    echo ""
+    echo "============================================================"
+    echo "  [${transport}] Sweep: ${sweep_name}"
+    echo "  ${ORDERS_PER_SWEEP} orders per point"
+    echo "============================================================"
+    echo ""
+
+    local start_fn="transport_start_${transport//-/_}"
+    local stop_fn="transport_stop_${transport//-/_}"
+
+    for config in "$@"; do
+        local label="${config%%:*}"
+        local rest="${config#*:}"
+        local server_extra="" bench_args=""
+        if [[ "$rest" == *:* ]]; then
+            server_extra="${rest%%:*}"
+            bench_args="${rest#*:}"
+        else
+            bench_args="$rest"
         fi
-        if [[ $i -eq 120 ]]; then
-            echo "  ERROR: Primary did not become ready. Check /tmp/melin-server.log"
-            ssh $SSH_OPTS "$SERVER" "tail -20 /tmp/melin-server.log" 2>/dev/null || true
+
+        echo "--- ${label} ---"
+
+        # For sweeps with server args, we need to set SERVER_EXTRA_ARGS.
+        SERVER_EXTRA_ARGS="${server_extra}"
+        "${stop_fn}" 2>/dev/null || true
+        "${start_fn}"
+        run_bench "$CURRENT_BIND" "$CURRENT_HEALTH" ${ORDERS_PER_SWEEP} ${bench_args}
+        collect_result "_sweep_tmp"
+        cp "${RESULTS_DIR}/_sweep_tmp.json" "${sweep_dir}/${label}.json" 2>/dev/null || true
+        rm -f "${RESULTS_DIR}/_sweep_tmp.json"
+        "${stop_fn}"
+        SERVER_EXTRA_ARGS=""
+        echo ""
+    done
+}
+
+workload_sweep_window() {
+    local transport="$1"
+    run_sweep "window" "$transport" \
+        "w32:--clients 16 --window 32" \
+        "w64:--clients 16 --window 64" \
+        "w128:--clients 16 --window 128" \
+        "w256:--clients 16 --window 256" \
+        "w512:--clients 16 --window 512"
+}
+
+workload_sweep_clients() {
+    local transport="$1"
+    run_sweep "clients" "$transport" \
+        "c64:--clients 64 --window 64" \
+        "c128:--clients 128 --window 32" \
+        "c256:--clients 256 --window 16" \
+        "c512:--clients 512 --window 8" \
+        "c1024:--clients 1024 --window 4"
+}
+
+workload_sweep_instruments() {
+    local transport="$1"
+    run_sweep "instruments" "$transport" \
+        "i10:--instruments 10:--clients 16 --window 128" \
+        "i100:--instruments 100:--clients 16 --window 128" \
+        "i1000:--instruments 1000:--clients 16 --window 128"
+}
+
+workload_sweep_accounts() {
+    local transport="$1"
+    run_sweep "accounts" "$transport" \
+        "a100000:--accounts 100000:--clients 16 --window 128 --accounts 100000" \
+        "a1000000:--accounts 1000000:--clients 16 --window 128 --accounts 1000000" \
+        "a10000000:--accounts 10000000:--clients 16 --window 128 --accounts 10000000"
+}
+
+# ---------------------------------------------------------------------------
+# Main execution loop
+# ---------------------------------------------------------------------------
+
+# Run local workloads first (no transport needed).
+for workload in "${LOCAL_MATRIX[@]+"${LOCAL_MATRIX[@]}"}"; do
+    fn="workload_${workload//-/_}"
+    echo ""
+    echo ">>> Running local workload: ${workload}"
+    "$fn"
+done
+
+# Group by transport: start/stop server per workload, but do global setup
+# (DPDK sriov) only once.
+# Collect unique transports in order.
+declare -A SEEN_TRANSPORTS
+ORDERED_TRANSPORTS=()
+for item in "${MATRIX[@]}"; do
+    t="${item%%:*}"
+    if [[ -z "${SEEN_TRANSPORTS[$t]:-}" ]]; then
+        SEEN_TRANSPORTS[$t]=1
+        ORDERED_TRANSPORTS+=("$t")
+    fi
+done
+
+for transport in "${ORDERED_TRANSPORTS[@]}"; do
+    start_fn="transport_start_${transport//-/_}"
+    stop_fn="transport_stop_${transport//-/_}"
+
+    # Collect workloads for this transport.
+    TRANSPORT_WORKLOADS=()
+    for item in "${MATRIX[@]}"; do
+        if [[ "${item%%:*}" == "$transport" ]]; then
+            TRANSPORT_WORKLOADS+=("${item#*:}")
         fi
-        sleep 1
     done
 
-    # Read bench DPDK config.
-    BENCH_DPDK_CONF=$(ssh $SSH_OPTS "$BENCH" "cat /etc/melin-dpdk.conf 2>/dev/null" || true)
-    BENCH_DPDK_IP=""
-    BENCH_DPDK_PREFIX_VAL="${DPDK_PREFIX}"
-    if [[ -n "$BENCH_DPDK_CONF" ]]; then
-        BENCH_DPDK_IP=$(echo "$BENCH_DPDK_CONF" | grep "^DPDK_IP=" | cut -d= -f2)
-        BENCH_DPDK_PREFIX_VAL=$(echo "$BENCH_DPDK_CONF" | grep "^DPDK_PREFIX=" | cut -d= -f2)
+    # Separate sweep workloads (they handle their own start/stop) from
+    # regular workloads (need start before, stop after).
+    REGULAR_WORKLOADS=()
+    SWEEP_WORKLOADS=()
+    for w in "${TRANSPORT_WORKLOADS[@]}"; do
+        case "$w" in
+            sweep-*) SWEEP_WORKLOADS+=("$w") ;;
+            # no-persist handles its own restart cycle.
+            no-persist) SWEEP_WORKLOADS+=("$w") ;;
+            *) REGULAR_WORKLOADS+=("$w") ;;
+        esac
+    done
+
+    # Run regular workloads with a single start/stop cycle.
+    if [[ ${#REGULAR_WORKLOADS[@]} -gt 0 ]]; then
+        echo ""
+        echo ">>> Starting transport: ${transport}"
+        "$start_fn"
+
+        for workload in "${REGULAR_WORKLOADS[@]}"; do
+            fn="workload_${workload//-/_}"
+            "$fn" "$transport"
+        done
+
+        "$stop_fn"
     fi
-    BENCH_DPDK_PORT="${BENCH_DPDK_PORT:-0}"
-    BENCH_DPDK_CORE="${BENCH_DPDK_CORE:-7}"
-    BENCH_DPDK_EAL_ARGS="${BENCH_DPDK_EAL_ARGS:-}"
 
-    BENCH_EAL_FULL="${BENCH_DPDK_EAL_ARGS}"
-    if [[ -n "$BENCH_EAL_FULL" ]]; then
-        BENCH_EAL_FULL="${BENCH_EAL_FULL} --huge-dir=${HUGE_DIR}"
-    else
-        BENCH_EAL_FULL="--huge-dir=${HUGE_DIR}"
-    fi
-
-    BENCH_DPDK_ARGS="--dpdk-eal-args='${BENCH_EAL_FULL}' --dpdk-ports ${BENCH_DPDK_PORT} --dpdk-core ${BENCH_DPDK_CORE}"
-    if [[ -n "$BENCH_DPDK_IP" ]]; then
-        BENCH_DPDK_ARGS="${BENCH_DPDK_ARGS} --dpdk-ip ${BENCH_DPDK_IP} --dpdk-prefix-len ${BENCH_DPDK_PREFIX_VAL}"
-    fi
-
-    # Run the benchmark against the DPDK primary.
-    echo "  Running DPDK replication benchmark..."
-    ssh $SSH_OPTS "$BENCH" "cd ${REPO_DIR} && source ~/.cargo/env && \
-        ./target/release/melin-bench \
-            --addr ${DPDK_IP}:9876 \
-            --key bench.key \
-            --json /tmp/dpdk-bench-results.json \
-            ${BENCH_DPDK_ARGS} \
-            100000000 --clients 16 --window 256"
-
-    scp $SSH_OPTS -q "${SSH_USER}@${BENCH_PUB}:/tmp/dpdk-bench-results.json" "${RESULTS_DIR}/9-dpdk-replication.json" 2>/dev/null || true
-
-    # Stop both servers.
-    ssh $SSH_OPTS "$SERVER" "pkill -INT -x melin-server 2>/dev/null; true"
-    ssh $SSH_OPTS "$REPLICA" "pkill -INT -x melin-server 2>/dev/null; true"
-    sleep 2
-    echo "  Servers stopped."
-
-    # Verify journal consistency.
-    echo ""
-    echo "  Verifying DPDK replication journal consistency..."
-    "${SCRIPT_DIR}/journal-verify.sh" "$SERVER" "$JOURNAL_PATH" "$REPLICA" "$REPLICA_JOURNAL"
-    echo ""
-else
-    echo ""
-    echo "  (skipping DPDK replication benchmark — no replica server specified)"
-    echo ""
-fi
-
-# Reboot all machines to discard vfio-pci bindings and restore kernel NIC drivers.
-echo ""
-echo "============================================================"
-echo "  Rebooting all machines to clean up DPDK state"
-echo "============================================================"
-echo ""
-REBOOT_HOSTS=("$SERVER" "$BENCH")
-if [[ -n "$REPLICA" ]]; then
-    REBOOT_HOSTS+=("$REPLICA")
-fi
-for HOST in "${REBOOT_HOSTS[@]}"; do
-    echo "  Rebooting ${HOST}..."
-    ssh $SSH_OPTS "$HOST" "nohup bash -c 'sleep 1 && reboot' >/dev/null 2>&1 &" </dev/null || true
+    # Run sweep and no-persist workloads (each manages its own server lifecycle).
+    for workload in "${SWEEP_WORKLOADS[@]}"; do
+        fn="workload_${workload//-/_}"
+        "$fn" "$transport"
+    done
 done
-echo "  Reboot initiated on all machines."
 
+# ---------------------------------------------------------------------------
+# DPDK cleanup: reboot if any DPDK transport ran
+# ---------------------------------------------------------------------------
+if [[ "$DPDK_RAN" == "1" ]]; then
+    echo ""
+    echo "============================================================"
+    echo "  Rebooting all machines to clean up DPDK state"
+    echo "============================================================"
+    echo ""
+    REBOOT_HOSTS=("$SERVER" "$BENCH")
+    if [[ -n "$REPLICA" ]]; then REBOOT_HOSTS+=("$REPLICA"); fi
+    if [[ -n "$REPLICA2" ]]; then REBOOT_HOSTS+=("$REPLICA2"); fi
+    for HOST in "${REBOOT_HOSTS[@]}"; do
+        echo "  Rebooting ${HOST}..."
+        ssh $SSH_OPTS "$HOST" "nohup bash -c 'sleep 1 && reboot' >/dev/null 2>&1 &" </dev/null || true
+    done
+    echo "  Reboot initiated."
 fi
 
 # ---------------------------------------------------------------------------
-# 7. Generate plots
+# Generate plots
 # ---------------------------------------------------------------------------
 if [[ "$RUN_PLOTS" == "1" ]]; then
-echo ""
-echo "============================================================"
-echo "  Generating plots"
-echo "============================================================"
-echo ""
-
-if command -v cargo &>/dev/null && [[ -f "$(dirname "$0")/../crates/bench/src/plot.rs" ]]; then
-    LOCAL_REPO="$(cd "$(dirname "$0")/.." && pwd)"
-    PLOT_DIR="${LOCAL_REPO}/docs/plots"
-    mkdir -p "${PLOT_DIR}"
-
-    echo "  Building plot tool..."
-    (cd "$LOCAL_REPO" && cargo build --release -p melin-bench --features plot --bin melin-plot 2>&1 | tail -1)
-    PLOT_TOOL="${LOCAL_REPO}/target/release/melin-plot"
-
-    echo "  Generating latency CDF..."
-    CDF_FILES=(
-        "${RESULTS_DIR}/1-fsync.json"
-        "${RESULTS_DIR}/2-no-persist.json"
-    )
-    if [[ -f "${RESULTS_DIR}/4-replication.json" ]]; then
-        CDF_FILES+=("${RESULTS_DIR}/4-replication.json")
-    fi
-    if [[ -f "${RESULTS_DIR}/5-dual-replication.json" ]]; then
-        CDF_FILES+=("${RESULTS_DIR}/5-dual-replication.json")
-    fi
-    if [[ -f "${RESULTS_DIR}/7-dpdk-fsync.json" ]]; then
-        CDF_FILES+=("${RESULTS_DIR}/7-dpdk-fsync.json")
-    fi
-    if [[ -f "${RESULTS_DIR}/9-dpdk-replication.json" ]]; then
-        CDF_FILES+=("${RESULTS_DIR}/9-dpdk-replication.json")
-    fi
-    "${PLOT_TOOL}" latency-cdf -o "${PLOT_DIR}/latency-cdf.svg" \
-        "${CDF_FILES[@]}" 2>&1
-
-    for sweep in window clients instruments accounts; do
-        dir="${RESULTS_DIR}/sweep-${sweep}"
-        if [[ -d "$dir" ]] && ls "${dir}"/*.json &>/dev/null; then
-            echo "  Generating sweep plot: ${sweep}..."
-            "${PLOT_TOOL}" sweep -o "${PLOT_DIR}/saturation-${sweep}.svg" \
-                "${dir}"/*.json 2>&1
-        fi
-    done
-
-    # Latency stability over time — one plot per mode.
-    for f_label in "1-fsync:fsync" "2-no-persist:no-persist" "4-replication:replication" "5-dual-replication:dual-replication" "7-dpdk-fsync:dpdk-fsync" "9-dpdk-replication:dpdk-replication"; do
-        f="${f_label%%:*}"
-        label="${f_label##*:}"
-        if [[ -f "${RESULTS_DIR}/${f}.json" ]]; then
-            echo "  Generating latency stability: ${label}..."
-            "${PLOT_TOOL}" stability -o "${PLOT_DIR}/latency-stability-${label}.svg" \
-                "${RESULTS_DIR}/${f}.json" 2>&1
-        fi
-    done
-
-    # Server health metrics over time — one set of plots per mode.
-    for f_label in "1-fsync:fsync" "2-no-persist:no-persist" "4-replication:replication" "5-dual-replication:dual-replication" "7-dpdk-fsync:dpdk-fsync" "9-dpdk-replication:dpdk-replication"; do
-        f="${f_label%%:*}"
-        label="${f_label##*:}"
-        if [[ -f "${RESULTS_DIR}/${f}.json" ]]; then
-            echo "  Generating health plots: ${label}..."
-            "${PLOT_TOOL}" health -o "${PLOT_DIR}/health-${label}" \
-                "${RESULTS_DIR}/${f}.json" 2>&1
-        fi
-    done
-
     echo ""
-    echo "  Plots written to docs/plots/"
-fi
+    echo "============================================================"
+    echo "  Generating plots"
+    echo "============================================================"
+    echo ""
+
+    if command -v cargo &>/dev/null && [[ -f "${SCRIPT_DIR}/../crates/bench/src/plot.rs" ]]; then
+        LOCAL_REPO="$(cd "${SCRIPT_DIR}/.." && pwd)"
+        PLOT_DIR="${LOCAL_REPO}/docs/plots"
+        mkdir -p "${PLOT_DIR}"
+
+        echo "  Building plot tool..."
+        (cd "$LOCAL_REPO" && cargo build --release -p melin-bench --features plot --bin melin-plot 2>&1 | tail -1)
+        PLOT_TOOL="${LOCAL_REPO}/target/release/melin-plot"
+
+        # Latency CDF — all throughput and no-persist results.
+        CDF_FILES=()
+        for f in "${RESULTS_DIR}"/*-throughput.json "${RESULTS_DIR}"/*-no-persist.json; do
+            [[ -f "$f" ]] && CDF_FILES+=("$f")
+        done
+        if [[ ${#CDF_FILES[@]} -gt 0 ]]; then
+            echo "  Generating latency CDF..."
+            "${PLOT_TOOL}" latency-cdf -o "${PLOT_DIR}/latency-cdf.svg" "${CDF_FILES[@]}" 2>&1
+        fi
+
+        # Sweep plots.
+        for sweep in window clients instruments accounts; do
+            dir="${RESULTS_DIR}/sweep-${sweep}"
+            if [[ -d "$dir" ]] && ls "${dir}"/*.json &>/dev/null; then
+                echo "  Generating sweep plot: ${sweep}..."
+                "${PLOT_TOOL}" sweep -o "${PLOT_DIR}/saturation-${sweep}.svg" "${dir}"/*.json 2>&1
+            fi
+        done
+
+        # Latency stability and health plots — all non-sweep JSON files.
+        for f in "${RESULTS_DIR}"/*.json; do
+            [[ -f "$f" ]] || continue
+            label="$(basename "$f" .json)"
+            echo "  Generating stability: ${label}..."
+            "${PLOT_TOOL}" stability -o "${PLOT_DIR}/latency-stability-${label}.svg" "$f" 2>&1
+            echo "  Generating health: ${label}..."
+            "${PLOT_TOOL}" health -o "${PLOT_DIR}/health-${label}" "$f" 2>&1
+        done
+
+        echo ""
+        echo "  Plots written to docs/plots/"
+    fi
 fi
 
 # ---------------------------------------------------------------------------
