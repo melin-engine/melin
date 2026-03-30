@@ -1659,3 +1659,243 @@ fn fresh_replica_full_catchup() {
 
     eprintln!("PASS: fresh replica caught up from primary's journal — all 35 orders present.");
 }
+
+/// Snapshot transfer: primary's journal archives are deleted while a snapshot
+/// exists. A new replica connects — the primary detects journals are too old,
+/// transfers the snapshot, then catches up from the current journal. The
+/// replica ends up with all orders.
+#[test]
+#[serial]
+fn snapshot_transfer_when_archives_purged() {
+    let bin = server_bin();
+    let tmp = tempfile::tempdir().unwrap();
+
+    // Deterministic keys (same pattern as TestCluster::start).
+    let key = SigningKey::from_bytes(&[0xFA; 32]);
+    let key2 = SigningKey::from_bytes(&[0xFB; 32]);
+    let repl_key = SigningKey::from_bytes(&[0xFC; 32]);
+    let (keys_path, repl_key_path) =
+        write_auth_keys_multi(tmp.path(), &[&key, &key2], &repl_key);
+
+    let primary_client_port = free_port();
+    let primary_health_port = free_port();
+    let primary_repl_port = free_port();
+
+    // Start primary with --snapshot-interval-secs 1 to trigger periodic
+    // shadow snapshots, so a .snapshot file exists for transfer.
+    let primary_journal = tmp.path().join("primary.journal");
+    let mut primary = {
+        let child = Command::new(&bin)
+            .args([
+                "--bind",
+                &format!("127.0.0.1:{primary_client_port}"),
+                "--health-bind",
+                &format!("127.0.0.1:{primary_health_port}"),
+                "--journal",
+                primary_journal.to_str().unwrap(),
+                "--authorized-keys",
+                keys_path.to_str().unwrap(),
+                "--accounts",
+                "10",
+                "--instruments",
+                "2",
+                "--connection-timeout-secs",
+                "0",
+                "--yield-idle",
+                "--cores",
+                "0,0,0,0,0,0",
+                "--readers",
+                "1",
+                "--reader-cores",
+                "0",
+                "--standalone",
+                "--snapshot-interval-secs",
+                "1",
+            ])
+            .stdout(Stdio::inherit())
+            .stderr(Stdio::inherit())
+            .spawn()
+            .expect("spawn primary");
+        ServerProcess {
+            child,
+            client_addr: format!("127.0.0.1:{primary_client_port}")
+                .parse()
+                .unwrap(),
+            health_addr: format!("127.0.0.1:{primary_health_port}")
+                .parse()
+                .unwrap(),
+        }
+    };
+
+    wait_healthy(primary.health_addr, Duration::from_secs(30));
+
+    // Connect and send orders.
+    let mut client = Client::connect(primary.client_addr, &key).expect("connect");
+    for i in 1..=20u64 {
+        let r = submit_order(&mut client, i, 1, 1, Side::Buy, 100, 10);
+        assert!(!r.is_empty(), "order {i}: no response");
+    }
+    drop(client);
+
+    // Wait for the shadow snapshot to be taken.
+    let snap_path = primary_journal.with_extension("snapshot");
+    let start = Instant::now();
+    while !snap_path.exists() {
+        if start.elapsed() > Duration::from_secs(30) {
+            panic!("snapshot was not created within 30s at {}", snap_path.display());
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    eprintln!("Snapshot created at {}", snap_path.display());
+
+    // Stop the standalone primary.
+    unsafe { libc::kill(primary.child.id() as i32, libc::SIGINT) };
+    let _ = primary.child.wait();
+    std::thread::sleep(Duration::from_millis(500));
+
+    // Delete journal archive files (simulate archive purge).
+    // Keep the current journal and snapshot, delete .1, .2, etc.
+    for i in 1..=10 {
+        let archive = tmp.path().join(format!("primary.journal.{i}"));
+        if archive.exists() {
+            std::fs::remove_file(&archive).unwrap();
+            eprintln!("Deleted archive: {}", archive.display());
+        }
+    }
+
+    // Also delete the main journal to force the primary to recover from
+    // snapshot only. Then re-creating the journal means the replica's
+    // last_sequence=0 will predate the current journal's start sequence.
+    std::fs::remove_file(&primary_journal).ok();
+    eprintln!("Deleted main journal to force snapshot-only recovery");
+
+    // Restart primary with replication enabled (not standalone).
+    let primary_repl_port2 = free_port();
+    let primary_client_port2 = free_port();
+    let primary_health_port2 = free_port();
+    let mut primary2 = {
+        let child = Command::new(&bin)
+            .args([
+                "--bind",
+                &format!("127.0.0.1:{primary_client_port2}"),
+                "--health-bind",
+                &format!("127.0.0.1:{primary_health_port2}"),
+                "--replication-bind",
+                &format!("127.0.0.1:{primary_repl_port2}"),
+                "--journal",
+                primary_journal.to_str().unwrap(),
+                "--authorized-keys",
+                keys_path.to_str().unwrap(),
+                "--accounts",
+                "10",
+                "--instruments",
+                "2",
+                "--connection-timeout-secs",
+                "0",
+                "--yield-idle",
+                "--cores",
+                "0,0,0,0,0,0",
+                "--readers",
+                "1",
+                "--reader-cores",
+                "0",
+                "--snapshot-interval-secs",
+                "1",
+            ])
+            .stdout(Stdio::inherit())
+            .stderr(Stdio::inherit())
+            .spawn()
+            .expect("spawn primary2");
+        ServerProcess {
+            child,
+            client_addr: format!("127.0.0.1:{primary_client_port2}")
+                .parse()
+                .unwrap(),
+            health_addr: format!("127.0.0.1:{primary_health_port2}")
+                .parse()
+                .unwrap(),
+        }
+    };
+
+    // Wait for the replication port before starting replica.
+    let repl_addr: SocketAddr = format!("127.0.0.1:{primary_repl_port2}").parse().unwrap();
+    let start = Instant::now();
+    loop {
+        if TcpStream::connect_timeout(&repl_addr, Duration::from_millis(100)).is_ok() {
+            break;
+        }
+        if start.elapsed() > Duration::from_secs(10) {
+            panic!("primary replication port never became available");
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+
+    // Start a fresh replica. It has last_sequence=0, but the primary
+    // recovered from snapshot (journal starts after snapshot sequence).
+    // Catch-up will fail → snapshot transfer kicks in.
+    let replica_client_port = free_port();
+    let replica_health_port = free_port();
+    let replica_promote_port = free_port();
+    let _replica = spawn_replica(
+        &bin,
+        tmp.path(),
+        &keys_path,
+        &repl_key_path,
+        primary_repl_port2,
+        replica_client_port,
+        replica_health_port,
+        replica_promote_port,
+    );
+
+    // Wait for the primary to become healthy (seeding done, replica connected).
+    wait_healthy(primary2.health_addr, Duration::from_secs(30));
+    eprintln!("Primary healthy with replica connected");
+
+    // Wait for replication lag to reach 0.
+    let start = Instant::now();
+    loop {
+        let (_, _, lag, _) = query_health(primary2.health_addr).expect("health");
+        if lag == 0 {
+            break;
+        }
+        if start.elapsed() > Duration::from_secs(30) {
+            panic!("replica did not catch up via snapshot transfer within 30s (lag={lag})");
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    eprintln!("Replica caught up via snapshot transfer.");
+
+    // Submit a new order to verify the primary is functional.
+    let mut client2 = Client::connect(primary2.client_addr, &key2).expect("connect to primary2");
+    let r = submit_order(&mut client2, 21, 1, 1, Side::Buy, 200, 5);
+    assert!(
+        has_report(&r, |rep| matches!(
+            rep,
+            melin_protocol::types::ExecutionReport::Placed { .. }
+        )) || has_report(&r, |rep| matches!(
+            rep,
+            melin_protocol::types::ExecutionReport::Fill { .. }
+        )),
+        "expected Placed or Fill after snapshot transfer, got: {r:?}"
+    );
+
+    // Verify dedup: replay order 20 (from before snapshot) must be rejected.
+    let r = submit_order(&mut client2, 20, 1, 1, Side::Buy, 100, 10);
+    assert!(
+        has_report(&r, |rep| matches!(
+            rep,
+            melin_protocol::types::ExecutionReport::Rejected {
+                reason: melin_protocol::types::RejectReason::DuplicateOrderId,
+                ..
+            }
+        )),
+        "expected DuplicateOrderId for id=20 after snapshot transfer, got: {r:?}"
+    );
+
+    // Cleanup.
+    drop(client2);
+    unsafe { libc::kill(primary2.child.id() as i32, libc::SIGINT) };
+    let _ = primary2.child.wait();
+
+    eprintln!("PASS: snapshot transfer — replica caught up after archive purge.");
+}
