@@ -48,11 +48,12 @@ The response stage gates on `min(journal_cursor, replication_cursor)` instead of
 |---|---|---|
 | `--standalone` (dev/test) | `u64::MAX` | `min(journal, MAX) = journal` — no replication |
 | `--replication-bind`, no replica connected | `u64::MAX` | Same as standalone — server works normally |
-| Replica connected, acking | Latest acked seq | Waits for both journal + replica |
-| Replica disconnects | `u64::MAX` | Degrades to local-only, operator alerted |
+| Replica(s) connected, acking | Latest acked seq | Waits for both journal + replica |
+| One replica disconnects (other still connected) | Maintained by surviving replica | Trading continues normally |
+| All replicas disconnect | `u64::MAX` | Degrades to local-only, trading halted, operator alerted |
 | Replica reconnects | Resumes from ack | Gate re-engages |
 
-The cursor is **always initialized to `u64::MAX`**, even when replication is enabled. This ensures the server starts immediately and serves clients without waiting for a replica. The cursor only engages when a replica connects and starts sending acks. On disconnect, it resets to `u64::MAX`.
+The cursor is **always initialized to `u64::MAX`**, even when replication is enabled. This ensures the server starts immediately and serves clients without waiting for a replica. The cursor only engages when a replica connects and starts sending acks. On all-disconnect, it resets to `u64::MAX`.
 
 The cursor update is **monotonic** (`fetch_max`) — a stale ack (e.g., from a previous connection) cannot regress the cursor to a lower value.
 
@@ -80,7 +81,7 @@ Length-prefixed frames, little-endian. Runs over a dedicated TCP connection sepa
 ### Design rationale
 
 - **Journal byte reuse**: DataBatch payloads contain the exact bytes from the primary's journal file. The replica writes them directly via `write_raw_sync()`, producing a byte-for-byte copy. No re-encoding, no second serialization format.
-- **Single replica (v1)**: The primary accepts one replica connection at a time. If a second replica connects, it replaces the first.
+- **Dual replication**: The primary accepts up to 2 concurrent replica connections, each with its own replication ring consumer and handler thread. If a replica disconnects, its slot becomes available for a new connection. Trading halts only when all replicas disconnect.
 
 ## Replica Mode
 
@@ -141,13 +142,9 @@ This works for both reconnecting replicas (`last_sequence > 0`, catches up the g
 
 The primary's raw genesis entry bytes (including the original timestamp) are sent in the `StreamStart` response. Fresh replicas write these bytes directly to the journal file, producing a byte-identical genesis entry. The BLAKE3 hash chain starts from the exact same encoded bytes, so checkpoint entries from the primary verify correctly on replica replay.
 
-### Single replica only
+### ~~Single replica only~~ (FIXED)
 
-**What**: The primary accepts one replica connection at a time. A second connection replaces the first (the previous connection's cursor is set to `u64::MAX`).
-
-**Impact**: No quorum-based replication. If the single replica fails, the primary degrades to local-only.
-
-**Resolution**: Accept N connections, track per-replica cursors, gate on a configurable quorum (e.g., majority).
+Dual replication is now supported — the primary accepts up to 2 concurrent replica connections, each with its own replication ring consumer and handler thread. If one replica fails, trading continues with the surviving replica. Trading halts only when all replicas disconnect. The replication cursor uses `fetch_max` so either replica's acks advance the response gate.
 
 ### Backpressure from replication channel can stall the pipeline
 

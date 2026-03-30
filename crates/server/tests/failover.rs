@@ -23,8 +23,7 @@ use ed25519_dalek::SigningKey;
 use melin_client::Client;
 use melin_protocol::message::Request;
 use melin_protocol::types::{
-    AccountId, Order, OrderId, OrderType, Price, Quantity, Side, Symbol,
-    TimeInForce,
+    AccountId, Order, OrderId, OrderType, Price, Quantity, Side, Symbol, TimeInForce,
 };
 
 // ---------------------------------------------------------------------------
@@ -40,25 +39,27 @@ fn server_bin() -> PathBuf {
         return PathBuf::from(p);
     }
     // Fallback: release binary.
-    let release = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../../target/release/melin-server");
+    let release =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/release/melin-server");
     if release.exists() {
         return release;
     }
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../../target/debug/melin-server")
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/debug/melin-server")
 }
 
 /// Find a free TCP port by binding to port 0.
 fn free_port() -> u16 {
-    let listener =
-        std::net::TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
     listener.local_addr().expect("local addr").port()
 }
 
 /// Write an authorized_keys file for multiple test keys, plus a
 /// replication key. Returns (authorized_keys_path, replication_key_path).
-fn write_auth_keys_multi(dir: &Path, keys: &[&SigningKey], repl_key: &SigningKey) -> (PathBuf, PathBuf) {
+fn write_auth_keys_multi(
+    dir: &Path,
+    keys: &[&SigningKey],
+    repl_key: &SigningKey,
+) -> (PathBuf, PathBuf) {
     let path = dir.join("authorized_keys");
     let mut content = String::new();
     for (i, key) in keys.iter().enumerate() {
@@ -89,9 +90,7 @@ fn wait_healthy(addr: SocketAddr, timeout: Duration) -> (u64, u64, u64, bool) {
     let start = Instant::now();
     loop {
         if start.elapsed() > timeout {
-            panic!(
-                "health endpoint {addr} did not respond within {timeout:?}"
-            );
+            panic!("health endpoint {addr} did not respond within {timeout:?}");
         }
         if let Ok(status) = query_health(addr) {
             return status;
@@ -102,10 +101,7 @@ fn wait_healthy(addr: SocketAddr, timeout: Duration) -> (u64, u64, u64, bool) {
 
 /// Query the health endpoint once. Returns (conns, journal_seq, repl_lag, trading).
 fn query_health(addr: SocketAddr) -> Result<(u64, u64, u64, bool), Box<dyn std::error::Error>> {
-    let mut stream = TcpStream::connect_timeout(
-        &addr,
-        Duration::from_secs(1),
-    )?;
+    let mut stream = TcpStream::connect_timeout(&addr, Duration::from_secs(1))?;
     stream.set_read_timeout(Some(Duration::from_secs(2)))?;
     let mut buf = [0u8; 256];
     let n = stream.read(&mut buf)?;
@@ -125,26 +121,18 @@ fn query_health(addr: SocketAddr) -> Result<(u64, u64, u64, bool), Box<dyn std::
 
 /// Send PROMOTE to the promotion endpoint.
 fn promote(addr: SocketAddr) {
-    let mut stream = TcpStream::connect_timeout(
-        &addr,
-        Duration::from_secs(5),
-    )
-    .expect("connect to promotion endpoint");
+    let mut stream = TcpStream::connect_timeout(&addr, Duration::from_secs(5))
+        .expect("connect to promotion endpoint");
     stream
         .set_read_timeout(Some(Duration::from_secs(5)))
         .expect("set read timeout");
-    stream
-        .write_all(b"PROMOTE\n")
-        .expect("send PROMOTE");
+    stream.write_all(b"PROMOTE\n").expect("send PROMOTE");
     let mut reader = BufReader::new(&stream);
     let mut response = String::new();
     reader
         .read_line(&mut response)
         .expect("read promotion response");
-    assert!(
-        response.trim() == "OK",
-        "promotion failed: {response}"
-    );
+    assert!(response.trim() == "OK", "promotion failed: {response}");
 }
 
 struct ServerProcess {
@@ -173,19 +161,30 @@ fn spawn_primary(
     let journal = tmp_dir.join("primary.journal");
     let child = Command::new(bin)
         .args([
-            "--bind", &format!("127.0.0.1:{client_port}"),
-            "--health-bind", &format!("127.0.0.1:{health_port}"),
-            "--replication-bind", &format!("127.0.0.1:{replication_port}"),
-            "--journal", journal.to_str().expect("valid path"),
-            "--authorized-keys", keys_path.to_str().expect("valid path"),
-            "--accounts", "10",
-            "--instruments", "2",
-            "--connection-timeout-secs", "0",
+            "--bind",
+            &format!("127.0.0.1:{client_port}"),
+            "--health-bind",
+            &format!("127.0.0.1:{health_port}"),
+            "--replication-bind",
+            &format!("127.0.0.1:{replication_port}"),
+            "--journal",
+            journal.to_str().expect("valid path"),
+            "--authorized-keys",
+            keys_path.to_str().expect("valid path"),
+            "--accounts",
+            "10",
+            "--instruments",
+            "2",
+            "--connection-timeout-secs",
+            "0",
             "--yield-idle",
             // Reduce core count to avoid conflicts in CI.
-            "--cores", "0,0,0,0,0,0",
-            "--readers", "1",
-            "--reader-cores", "0",
+            "--cores",
+            "0,0,0,0,0,0",
+            "--readers",
+            "1",
+            "--reader-cores",
+            "0",
         ])
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit())
@@ -210,9 +209,20 @@ fn spawn_replica(
     health_port: u16,
     promote_port: u16,
 ) -> ServerProcess {
-    spawn_replica_named(bin, tmp_dir, keys_path, repl_key_path, primary_repl_port, client_port, health_port, promote_port, "replica")
+    spawn_replica_named(
+        bin,
+        tmp_dir,
+        keys_path,
+        repl_key_path,
+        primary_repl_port,
+        client_port,
+        health_port,
+        promote_port,
+        "replica",
+    )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn spawn_replica_named(
     bin: &Path,
     tmp_dir: &Path,
@@ -227,18 +237,29 @@ fn spawn_replica_named(
     let journal = tmp_dir.join(format!("{name}.journal"));
     let child = Command::new(bin)
         .args([
-            "--bind", &format!("127.0.0.1:{client_port}"),
-            "--health-bind", &format!("127.0.0.1:{health_port}"),
-            "--replica-of", &format!("127.0.0.1:{primary_repl_port}"),
-            "--replication-key", repl_key_path.to_str().expect("valid path"),
-            "--promote-bind", &format!("127.0.0.1:{promote_port}"),
-            "--journal", journal.to_str().expect("valid path"),
-            "--authorized-keys", keys_path.to_str().expect("valid path"),
-            "--connection-timeout-secs", "0",
+            "--bind",
+            &format!("127.0.0.1:{client_port}"),
+            "--health-bind",
+            &format!("127.0.0.1:{health_port}"),
+            "--replica-of",
+            &format!("127.0.0.1:{primary_repl_port}"),
+            "--replication-key",
+            repl_key_path.to_str().expect("valid path"),
+            "--promote-bind",
+            &format!("127.0.0.1:{promote_port}"),
+            "--journal",
+            journal.to_str().expect("valid path"),
+            "--authorized-keys",
+            keys_path.to_str().expect("valid path"),
+            "--connection-timeout-secs",
+            "0",
             "--yield-idle",
-            "--cores", "0,0,0,0,0,0",
-            "--readers", "1",
-            "--reader-cores", "0",
+            "--cores",
+            "0,0,0,0,0,0",
+            "--readers",
+            "1",
+            "--reader-cores",
+            "0",
         ])
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit())
@@ -290,7 +311,8 @@ impl TestCluster {
         let key = SigningKey::from_bytes(&[0xFA; 32]);
         let key2 = SigningKey::from_bytes(&[0xFB; 32]);
         let repl_key = SigningKey::from_bytes(&[0xFC; 32]);
-        let (keys_path, repl_key_path) = write_auth_keys_multi(tmp.path(), &[&key, &key2], &repl_key);
+        let (keys_path, repl_key_path) =
+            write_auth_keys_multi(tmp.path(), &[&key, &key2], &repl_key);
 
         let primary_client_port = free_port();
         let primary_health_port = free_port();
@@ -309,8 +331,7 @@ impl TestCluster {
         );
 
         // Wait for the primary's replication port before starting replica.
-        let repl_addr: SocketAddr =
-            format!("127.0.0.1:{primary_repl_port}").parse().unwrap();
+        let repl_addr: SocketAddr = format!("127.0.0.1:{primary_repl_port}").parse().unwrap();
         let start = Instant::now();
         loop {
             if TcpStream::connect_timeout(&repl_addr, Duration::from_millis(100)).is_ok() {
@@ -350,16 +371,15 @@ impl TestCluster {
 
     /// Connect a client to the primary using the first key.
     fn connect_primary(&self) -> Client {
-        Client::connect(self.primary.client_addr, &self.key)
-            .expect("connect to primary")
+        Client::connect(self.primary.client_addr, &self.key).expect("connect to primary")
     }
 
     /// Wait for replication lag to reach 0.
     fn wait_replicated(&self) {
         let start = Instant::now();
         loop {
-            let (_, _, lag, _) = query_health(self.primary.health_addr)
-                .expect("query primary health for repl lag");
+            let (_, _, lag, _) =
+                query_health(self.primary.health_addr).expect("query primary health for repl lag");
             if lag == 0 {
                 return;
             }
@@ -378,8 +398,7 @@ impl TestCluster {
         }
         let _ = self.primary.child.wait();
 
-        let promote_addr: SocketAddr =
-            format!("127.0.0.1:{}", self.promote_port).parse().unwrap();
+        let promote_addr: SocketAddr = format!("127.0.0.1:{}", self.promote_port).parse().unwrap();
         promote(promote_addr);
 
         wait_healthy(self.replica.health_addr, Duration::from_secs(30));
@@ -387,8 +406,7 @@ impl TestCluster {
         // Brief pause for pipeline init.
         std::thread::sleep(Duration::from_secs(1));
 
-        Client::connect(self.replica.client_addr, &self.key2)
-            .expect("connect to promoted replica")
+        Client::connect(self.replica.client_addr, &self.key2).expect("connect to promoted replica")
     }
 }
 
@@ -456,14 +474,20 @@ fn kill_primary_promote_replica_no_data_loss() {
     // New order on promoted replica must succeed (proves full state replicated).
     let r = submit_order(&mut client2, 51, 1, 1, Side::Buy, 200, 5);
     assert!(
-        has_report(&r, |rep| matches!(rep, melin_protocol::types::ExecutionReport::Placed { .. })),
+        has_report(&r, |rep| matches!(
+            rep,
+            melin_protocol::types::ExecutionReport::Placed { .. }
+        )),
         "expected Placed, got: {r:?}"
     );
 
     // Crossing sell fills against the buy — proves matching works.
     let r = submit_order(&mut client2, 52, 1, 1, Side::Sell, 200, 5);
     assert!(
-        has_report(&r, |rep| matches!(rep, melin_protocol::types::ExecutionReport::Fill { .. })),
+        has_report(&r, |rep| matches!(
+            rep,
+            melin_protocol::types::ExecutionReport::Fill { .. }
+        )),
         "expected Fill, got: {r:?}"
     );
 }
@@ -499,14 +523,20 @@ fn kill_during_active_fills() {
     // base currency from partial fills).
     let r = submit_order(&mut client2, 41, 2, 1, Side::Sell, 300, 1);
     assert!(
-        has_report(&r, |rep| matches!(rep, melin_protocol::types::ExecutionReport::Placed { .. })),
+        has_report(&r, |rep| matches!(
+            rep,
+            melin_protocol::types::ExecutionReport::Placed { .. }
+        )),
         "expected Placed after fill-heavy workload, got: {r:?}"
     );
 
     // Place a matching buy — proves matching is operational.
     let r = submit_order(&mut client2, 42, 1, 1, Side::Buy, 300, 1);
     assert!(
-        has_report(&r, |rep| matches!(rep, melin_protocol::types::ExecutionReport::Fill { .. })),
+        has_report(&r, |rep| matches!(
+            rep,
+            melin_protocol::types::ExecutionReport::Fill { .. }
+        )),
         "expected Fill after fill-heavy workload, got: {r:?}"
     );
 }
@@ -541,7 +571,10 @@ fn kill_without_waiting_for_replication() {
     // If it does, the HWM was replayed correctly (all acked orders are present).
     let r = submit_order(&mut client2, last_acked_id + 1, 1, 1, Side::Buy, 200, 5);
     assert!(
-        has_report(&r, |rep| matches!(rep, melin_protocol::types::ExecutionReport::Placed { .. })),
+        has_report(&r, |rep| matches!(
+            rep,
+            melin_protocol::types::ExecutionReport::Placed { .. }
+        )),
         "expected Placed with id={}, got: {r:?}",
         last_acked_id + 1
     );
@@ -598,18 +631,28 @@ fn crashed_primary_recovers_from_journal() {
     let recovered = {
         let child = Command::new(&cluster.bin)
             .args([
-                "--bind", &format!("127.0.0.1:{recovered_client_port}"),
-                "--health-bind", &format!("127.0.0.1:{recovered_health_port}"),
+                "--bind",
+                &format!("127.0.0.1:{recovered_client_port}"),
+                "--health-bind",
+                &format!("127.0.0.1:{recovered_health_port}"),
                 "--standalone",
-                "--journal", primary_journal.to_str().expect("valid path"),
-                "--authorized-keys", cluster.keys_path.to_str().expect("valid path"),
-                "--accounts", "10",
-                "--instruments", "2",
-                "--connection-timeout-secs", "0",
+                "--journal",
+                primary_journal.to_str().expect("valid path"),
+                "--authorized-keys",
+                cluster.keys_path.to_str().expect("valid path"),
+                "--accounts",
+                "10",
+                "--instruments",
+                "2",
+                "--connection-timeout-secs",
+                "0",
                 "--yield-idle",
-                "--cores", "0,0,0,0,0,0",
-                "--readers", "1",
-                "--reader-cores", "0",
+                "--cores",
+                "0,0,0,0,0,0",
+                "--readers",
+                "1",
+                "--reader-cores",
+                "0",
             ])
             .stdout(Stdio::inherit())
             .stderr(Stdio::inherit())
@@ -617,8 +660,12 @@ fn crashed_primary_recovers_from_journal() {
             .expect("spawn recovered primary");
         ServerProcess {
             child,
-            client_addr: format!("127.0.0.1:{recovered_client_port}").parse().unwrap(),
-            health_addr: format!("127.0.0.1:{recovered_health_port}").parse().unwrap(),
+            client_addr: format!("127.0.0.1:{recovered_client_port}")
+                .parse()
+                .unwrap(),
+            health_addr: format!("127.0.0.1:{recovered_health_port}")
+                .parse()
+                .unwrap(),
         }
     };
 
@@ -632,9 +679,15 @@ fn crashed_primary_recovers_from_journal() {
     // May fill against resting orders that survived recovery, so accept
     // either Placed or Fill.
     let r = submit_order(&mut client3, 21, 1, 1, Side::Buy, 300, 1);
-    let accepted = has_report(&r, |rep| matches!(rep, melin_protocol::types::ExecutionReport::Placed { .. }))
-        || has_report(&r, |rep| matches!(rep, melin_protocol::types::ExecutionReport::Fill { .. }));
-    assert!(accepted, "expected Placed or Fill on recovered primary, got: {r:?}");
+    let accepted = has_report(&r, |rep| {
+        matches!(rep, melin_protocol::types::ExecutionReport::Placed { .. })
+    }) || has_report(&r, |rep| {
+        matches!(rep, melin_protocol::types::ExecutionReport::Fill { .. })
+    });
+    assert!(
+        accepted,
+        "expected Placed or Fill on recovered primary, got: {r:?}"
+    );
 
     // Duplicate of an old order must be rejected — proves HWM recovered.
     let r = submit_order(&mut client3, 10, 2, 1, Side::Sell, 100, 5);
@@ -673,8 +726,9 @@ fn same_key_retry_after_failover_is_rejected() {
     drop(client);
 
     // Kill + promote.
-    let promote_addr: SocketAddr =
-        format!("127.0.0.1:{}", cluster.promote_port).parse().unwrap();
+    let promote_addr: SocketAddr = format!("127.0.0.1:{}", cluster.promote_port)
+        .parse()
+        .unwrap();
     unsafe {
         libc::kill(cluster.primary.child.id() as i32, libc::SIGKILL);
     }
@@ -728,7 +782,8 @@ impl DualCluster {
         let key = SigningKey::from_bytes(&[0xFA; 32]);
         let key2 = SigningKey::from_bytes(&[0xFB; 32]);
         let repl_key = SigningKey::from_bytes(&[0xFC; 32]);
-        let (keys_path, repl_key_path) = write_auth_keys_multi(tmp.path(), &[&key, &key2], &repl_key);
+        let (keys_path, repl_key_path) =
+            write_auth_keys_multi(tmp.path(), &[&key, &key2], &repl_key);
 
         let primary_client_port = free_port();
         let primary_health_port = free_port();
@@ -741,13 +796,16 @@ impl DualCluster {
         let r2_promote = free_port();
 
         let primary = spawn_primary(
-            &bin, tmp.path(), &keys_path,
-            primary_client_port, primary_health_port, primary_repl_port,
+            &bin,
+            tmp.path(),
+            &keys_path,
+            primary_client_port,
+            primary_health_port,
+            primary_repl_port,
         );
 
         // Wait for replication port.
-        let repl_addr: SocketAddr =
-            format!("127.0.0.1:{primary_repl_port}").parse().unwrap();
+        let repl_addr: SocketAddr = format!("127.0.0.1:{primary_repl_port}").parse().unwrap();
         let start = Instant::now();
         loop {
             if TcpStream::connect_timeout(&repl_addr, Duration::from_millis(100)).is_ok() {
@@ -760,36 +818,56 @@ impl DualCluster {
         }
 
         let replica1 = spawn_replica_named(
-            &bin, tmp.path(), &keys_path, &repl_key_path, primary_repl_port,
-            r1_client, r1_health, r1_promote, "replica1",
+            &bin,
+            tmp.path(),
+            &keys_path,
+            &repl_key_path,
+            primary_repl_port,
+            r1_client,
+            r1_health,
+            r1_promote,
+            "replica1",
         );
         let replica2 = spawn_replica_named(
-            &bin, tmp.path(), &keys_path, &repl_key_path, primary_repl_port,
-            r2_client, r2_health, r2_promote, "replica2",
+            &bin,
+            tmp.path(),
+            &keys_path,
+            &repl_key_path,
+            primary_repl_port,
+            r2_client,
+            r2_health,
+            r2_promote,
+            "replica2",
         );
 
         wait_healthy(primary.health_addr, Duration::from_secs(30));
 
         Self {
-            primary, primary_repl_port,
-            replica1, replica2,
+            primary,
+            primary_repl_port,
+            replica1,
+            replica2,
             replica1_promote_port: r1_promote,
             replica2_promote_port: r2_promote,
-            key, key2, repl_key_path, _tmp: tmp,
+            key,
+            key2,
+            repl_key_path,
+            _tmp: tmp,
         }
     }
 
     fn connect_primary(&self) -> Client {
-        Client::connect(self.primary.client_addr, &self.key)
-            .expect("connect to primary")
+        Client::connect(self.primary.client_addr, &self.key).expect("connect to primary")
     }
 
     fn wait_replicated(&self) {
         let start = Instant::now();
         loop {
-            let (_, _, lag, _) = query_health(self.primary.health_addr)
-                .expect("query health for lag");
-            if lag == 0 { return; }
+            let (_, _, lag, _) =
+                query_health(self.primary.health_addr).expect("query health for lag");
+            if lag == 0 {
+                return;
+            }
             if start.elapsed() > Duration::from_secs(10) {
                 panic!("replication lag did not reach 0 (lag={lag})");
             }
@@ -798,23 +876,30 @@ impl DualCluster {
     }
 
     fn kill_primary(&mut self) {
-        unsafe { libc::kill(self.primary.child.id() as i32, libc::SIGKILL); }
+        unsafe {
+            libc::kill(self.primary.child.id() as i32, libc::SIGKILL);
+        }
         let _ = self.primary.child.wait();
     }
 
     fn kill_replica1(&mut self) {
-        unsafe { libc::kill(self.replica1.child.id() as i32, libc::SIGKILL); }
+        unsafe {
+            libc::kill(self.replica1.child.id() as i32, libc::SIGKILL);
+        }
         let _ = self.replica1.child.wait();
     }
 
     fn kill_replica2(&mut self) {
-        unsafe { libc::kill(self.replica2.child.id() as i32, libc::SIGKILL); }
+        unsafe {
+            libc::kill(self.replica2.child.id() as i32, libc::SIGKILL);
+        }
         let _ = self.replica2.child.wait();
     }
 
     fn promote_replica1(&self) -> Client {
-        let addr: SocketAddr =
-            format!("127.0.0.1:{}", self.replica1_promote_port).parse().unwrap();
+        let addr: SocketAddr = format!("127.0.0.1:{}", self.replica1_promote_port)
+            .parse()
+            .unwrap();
         promote(addr);
         wait_healthy(self.replica1.health_addr, Duration::from_secs(30));
         std::thread::sleep(Duration::from_secs(1));
@@ -823,8 +908,9 @@ impl DualCluster {
     }
 
     fn promote_replica2(&self) -> Client {
-        let addr: SocketAddr =
-            format!("127.0.0.1:{}", self.replica2_promote_port).parse().unwrap();
+        let addr: SocketAddr = format!("127.0.0.1:{}", self.replica2_promote_port)
+            .parse()
+            .unwrap();
         promote(addr);
         wait_healthy(self.replica2.health_addr, Duration::from_secs(30));
         std::thread::sleep(Duration::from_secs(1));
@@ -860,12 +946,18 @@ fn dual_replication_survives_one_replica_failure() {
     // Kill replica 1 — trading should continue.
     cluster.kill_replica1();
     std::thread::sleep(Duration::from_millis(500));
-    assert!(cluster.primary_trading(), "should still be trading with one replica");
+    assert!(
+        cluster.primary_trading(),
+        "should still be trading with one replica"
+    );
 
     // Submit more orders with only replica 2 alive.
     for i in 21..=40u64 {
         let r = submit_order(&mut client, i, 1, 1, Side::Buy, 100, 10);
-        assert!(!r.is_empty(), "order {i}: no response after replica 1 death");
+        assert!(
+            !r.is_empty(),
+            "order {i}: no response after replica 1 death"
+        );
     }
     cluster.wait_replicated();
 
@@ -877,7 +969,10 @@ fn dual_replication_survives_one_replica_failure() {
     // All 40 orders must be present.
     let r = submit_order(&mut client2, 41, 1, 1, Side::Buy, 200, 5);
     assert!(
-        has_report(&r, |rep| matches!(rep, melin_protocol::types::ExecutionReport::Placed { .. })),
+        has_report(&r, |rep| matches!(
+            rep,
+            melin_protocol::types::ExecutionReport::Placed { .. }
+        )),
         "expected Placed, got: {r:?}"
     );
 }
@@ -902,7 +997,10 @@ fn dual_replication_halts_when_both_disconnect() {
     std::thread::sleep(Duration::from_millis(1000));
 
     // Trading should be halted.
-    assert!(!cluster.primary_trading(), "should be halted with no replicas");
+    assert!(
+        !cluster.primary_trading(),
+        "should be halted with no replicas"
+    );
 
     // Orders should be rejected.
     let r = submit_order(&mut client, 11, 1, 1, Side::Buy, 100, 10);
@@ -950,7 +1048,10 @@ fn dual_replication_promote_replica1_after_replica2_dies() {
 
     let r = submit_order(&mut client2, 31, 1, 1, Side::Buy, 200, 5);
     assert!(
-        has_report(&r, |rep| matches!(rep, melin_protocol::types::ExecutionReport::Placed { .. })),
+        has_report(&r, |rep| matches!(
+            rep,
+            melin_protocol::types::ExecutionReport::Placed { .. }
+        )),
         "expected Placed on promoted replica 1, got: {r:?}"
     );
 }
@@ -993,13 +1094,19 @@ fn dual_replication_with_fills_then_failover() {
 
     // Place + fill on promoted replica — proves matching state is correct.
     let r = submit_order(&mut client2, 31, 2, 1, Side::Sell, 500, 1);
-    let accepted = has_report(&r, |rep| matches!(rep, melin_protocol::types::ExecutionReport::Placed { .. }))
-        || has_report(&r, |rep| matches!(rep, melin_protocol::types::ExecutionReport::Fill { .. }));
+    let accepted = has_report(&r, |rep| {
+        matches!(rep, melin_protocol::types::ExecutionReport::Placed { .. })
+    }) || has_report(&r, |rep| {
+        matches!(rep, melin_protocol::types::ExecutionReport::Fill { .. })
+    });
     assert!(accepted, "expected Placed or Fill, got: {r:?}");
 
     let r = submit_order(&mut client2, 32, 1, 1, Side::Buy, 500, 1);
     assert!(
-        has_report(&r, |rep| matches!(rep, melin_protocol::types::ExecutionReport::Fill { .. })),
+        has_report(&r, |rep| matches!(
+            rep,
+            melin_protocol::types::ExecutionReport::Fill { .. }
+        )),
         "expected Fill on promoted replica, got: {r:?}"
     );
 }
@@ -1038,8 +1145,7 @@ fn replacement_replica_catches_up_from_journal() {
     // The replacement will recover from this stale journal, connect to the
     // primary, and catch up the missed orders (21-40) via journal streaming.
     let replacement_journal = cluster._tmp.path().join("replacement.journal");
-    std::fs::copy(&replica1_journal, &replacement_journal)
-        .expect("copy replica journal");
+    std::fs::copy(&replica1_journal, &replacement_journal).expect("copy replica journal");
     assert!(
         replacement_journal.exists(),
         "replacement journal must exist after copy"
@@ -1062,18 +1168,34 @@ fn replacement_replica_catches_up_from_journal() {
     let _replacement = {
         let child = Command::new(&bin)
             .args([
-                "--bind", &format!("127.0.0.1:{r3_client}"),
-                "--health-bind", &format!("127.0.0.1:{r3_health}"),
-                "--replica-of", &format!("127.0.0.1:{}", cluster.primary_repl_port),
-                "--replication-key", cluster.repl_key_path.to_str().unwrap(),
-                "--promote-bind", &format!("127.0.0.1:{r3_promote}"),
-                "--journal", replacement_journal.to_str().expect("valid path"),
-                "--authorized-keys", cluster._tmp.path().join("authorized_keys").to_str().expect("valid path"),
-                "--connection-timeout-secs", "0",
+                "--bind",
+                &format!("127.0.0.1:{r3_client}"),
+                "--health-bind",
+                &format!("127.0.0.1:{r3_health}"),
+                "--replica-of",
+                &format!("127.0.0.1:{}", cluster.primary_repl_port),
+                "--replication-key",
+                cluster.repl_key_path.to_str().unwrap(),
+                "--promote-bind",
+                &format!("127.0.0.1:{r3_promote}"),
+                "--journal",
+                replacement_journal.to_str().expect("valid path"),
+                "--authorized-keys",
+                cluster
+                    ._tmp
+                    .path()
+                    .join("authorized_keys")
+                    .to_str()
+                    .expect("valid path"),
+                "--connection-timeout-secs",
+                "0",
                 "--yield-idle",
-                "--cores", "0,0,0,0,0,0",
-                "--readers", "1",
-                "--reader-cores", "0",
+                "--cores",
+                "0,0,0,0,0,0",
+                "--readers",
+                "1",
+                "--reader-cores",
+                "0",
             ])
             .stdout(Stdio::inherit())
             .stderr(Stdio::inherit())
@@ -1090,8 +1212,8 @@ fn replacement_replica_catches_up_from_journal() {
     // replica must catch up and start acking.
     let start = Instant::now();
     loop {
-        let (_, _, lag, _) = query_health(cluster.primary.health_addr)
-            .expect("query primary health");
+        let (_, _, lag, _) =
+            query_health(cluster.primary.health_addr).expect("query primary health");
         if lag == 0 {
             break;
         }
@@ -1113,11 +1235,9 @@ fn replacement_replica_catches_up_from_journal() {
     drop(client);
     cluster.kill_primary();
 
-    let promote_addr: SocketAddr =
-        format!("127.0.0.1:{r3_promote}").parse().unwrap();
+    let promote_addr: SocketAddr = format!("127.0.0.1:{r3_promote}").parse().unwrap();
     promote(promote_addr);
-    let r3_health_addr: SocketAddr =
-        format!("127.0.0.1:{r3_health}").parse().unwrap();
+    let r3_health_addr: SocketAddr = format!("127.0.0.1:{r3_health}").parse().unwrap();
     wait_healthy(r3_health_addr, Duration::from_secs(30));
     std::thread::sleep(Duration::from_secs(1));
 
@@ -1130,7 +1250,10 @@ fn replacement_replica_catches_up_from_journal() {
     // All 50 orders must be present — ID 51 succeeds, duplicate of 50 rejected.
     let r = submit_order(&mut client2, 51, 1, 1, Side::Buy, 200, 5);
     assert!(
-        has_report(&r, |rep| matches!(rep, melin_protocol::types::ExecutionReport::Placed { .. })),
+        has_report(&r, |rep| matches!(
+            rep,
+            melin_protocol::types::ExecutionReport::Placed { .. }
+        )),
         "expected Placed on promoted replacement, got: {r:?}"
     );
 
@@ -1187,18 +1310,34 @@ fn catchup_with_fills_during_gap() {
     let _replacement = {
         let child = Command::new(&bin)
             .args([
-                "--bind", &format!("127.0.0.1:{r3_client}"),
-                "--health-bind", &format!("127.0.0.1:{r3_health}"),
-                "--replica-of", &format!("127.0.0.1:{}", cluster.primary_repl_port),
-                "--replication-key", cluster.repl_key_path.to_str().unwrap(),
-                "--promote-bind", &format!("127.0.0.1:{r3_promote}"),
-                "--journal", replacement_journal.to_str().unwrap(),
-                "--authorized-keys", cluster._tmp.path().join("authorized_keys").to_str().unwrap(),
-                "--connection-timeout-secs", "0",
+                "--bind",
+                &format!("127.0.0.1:{r3_client}"),
+                "--health-bind",
+                &format!("127.0.0.1:{r3_health}"),
+                "--replica-of",
+                &format!("127.0.0.1:{}", cluster.primary_repl_port),
+                "--replication-key",
+                cluster.repl_key_path.to_str().unwrap(),
+                "--promote-bind",
+                &format!("127.0.0.1:{r3_promote}"),
+                "--journal",
+                replacement_journal.to_str().unwrap(),
+                "--authorized-keys",
+                cluster
+                    ._tmp
+                    .path()
+                    .join("authorized_keys")
+                    .to_str()
+                    .unwrap(),
+                "--connection-timeout-secs",
+                "0",
                 "--yield-idle",
-                "--cores", "0,0,0,0,0,0",
-                "--readers", "1",
-                "--reader-cores", "0",
+                "--cores",
+                "0,0,0,0,0,0",
+                "--readers",
+                "1",
+                "--reader-cores",
+                "0",
             ])
             .stdout(Stdio::inherit())
             .stderr(Stdio::inherit())
@@ -1215,7 +1354,9 @@ fn catchup_with_fills_during_gap() {
     let start = Instant::now();
     loop {
         let (_, _, lag, _) = query_health(cluster.primary.health_addr).expect("health");
-        if lag == 0 { break; }
+        if lag == 0 {
+            break;
+        }
         if start.elapsed() > Duration::from_secs(30) {
             panic!("catch-up timeout (lag={lag})");
         }
@@ -1226,7 +1367,10 @@ fn catchup_with_fills_during_gap() {
     drop(client);
     cluster.kill_primary();
     promote(format!("127.0.0.1:{r3_promote}").parse().unwrap());
-    wait_healthy(format!("127.0.0.1:{r3_health}").parse().unwrap(), Duration::from_secs(30));
+    wait_healthy(
+        format!("127.0.0.1:{r3_health}").parse().unwrap(),
+        Duration::from_secs(30),
+    );
     std::thread::sleep(Duration::from_secs(1));
 
     let mut client2 = Client::connect(
@@ -1237,13 +1381,19 @@ fn catchup_with_fills_during_gap() {
 
     // Place a sell + matching buy to verify balances are correct.
     let r = submit_order(&mut client2, 21, 2, 1, Side::Sell, 500, 1);
-    let accepted = has_report(&r, |rep| matches!(rep, melin_protocol::types::ExecutionReport::Placed { .. }))
-        || has_report(&r, |rep| matches!(rep, melin_protocol::types::ExecutionReport::Fill { .. }));
+    let accepted = has_report(&r, |rep| {
+        matches!(rep, melin_protocol::types::ExecutionReport::Placed { .. })
+    }) || has_report(&r, |rep| {
+        matches!(rep, melin_protocol::types::ExecutionReport::Fill { .. })
+    });
     assert!(accepted, "expected Placed or Fill, got: {r:?}");
 
     let r = submit_order(&mut client2, 22, 1, 1, Side::Buy, 500, 1);
     assert!(
-        has_report(&r, |rep| matches!(rep, melin_protocol::types::ExecutionReport::Fill { .. })),
+        has_report(&r, |rep| matches!(
+            rep,
+            melin_protocol::types::ExecutionReport::Fill { .. }
+        )),
         "expected Fill after catch-up with fills, got: {r:?}"
     );
 
@@ -1283,18 +1433,34 @@ fn catchup_then_immediate_failover() {
     let _replacement = {
         let child = Command::new(&bin)
             .args([
-                "--bind", &format!("127.0.0.1:{r3_client}"),
-                "--health-bind", &format!("127.0.0.1:{r3_health}"),
-                "--replica-of", &format!("127.0.0.1:{}", cluster.primary_repl_port),
-                "--replication-key", cluster.repl_key_path.to_str().unwrap(),
-                "--promote-bind", &format!("127.0.0.1:{r3_promote}"),
-                "--journal", replacement_journal.to_str().unwrap(),
-                "--authorized-keys", cluster._tmp.path().join("authorized_keys").to_str().unwrap(),
-                "--connection-timeout-secs", "0",
+                "--bind",
+                &format!("127.0.0.1:{r3_client}"),
+                "--health-bind",
+                &format!("127.0.0.1:{r3_health}"),
+                "--replica-of",
+                &format!("127.0.0.1:{}", cluster.primary_repl_port),
+                "--replication-key",
+                cluster.repl_key_path.to_str().unwrap(),
+                "--promote-bind",
+                &format!("127.0.0.1:{r3_promote}"),
+                "--journal",
+                replacement_journal.to_str().unwrap(),
+                "--authorized-keys",
+                cluster
+                    ._tmp
+                    .path()
+                    .join("authorized_keys")
+                    .to_str()
+                    .unwrap(),
+                "--connection-timeout-secs",
+                "0",
                 "--yield-idle",
-                "--cores", "0,0,0,0,0,0",
-                "--readers", "1",
-                "--reader-cores", "0",
+                "--cores",
+                "0,0,0,0,0,0",
+                "--readers",
+                "1",
+                "--reader-cores",
+                "0",
             ])
             .stdout(Stdio::inherit())
             .stderr(Stdio::inherit())
@@ -1311,7 +1477,9 @@ fn catchup_then_immediate_failover() {
     let start = Instant::now();
     loop {
         let (_, _, lag, _) = query_health(cluster.primary.health_addr).expect("health");
-        if lag == 0 { break; }
+        if lag == 0 {
+            break;
+        }
         if start.elapsed() > Duration::from_secs(30) {
             panic!("catch-up timeout (lag={lag})");
         }
@@ -1322,7 +1490,10 @@ fn catchup_then_immediate_failover() {
     drop(client);
     cluster.kill_primary();
     promote(format!("127.0.0.1:{r3_promote}").parse().unwrap());
-    wait_healthy(format!("127.0.0.1:{r3_health}").parse().unwrap(), Duration::from_secs(30));
+    wait_healthy(
+        format!("127.0.0.1:{r3_health}").parse().unwrap(),
+        Duration::from_secs(30),
+    );
     std::thread::sleep(Duration::from_secs(1));
 
     let mut client2 = Client::connect(
@@ -1334,7 +1505,10 @@ fn catchup_then_immediate_failover() {
     // All 30 orders must be present.
     let r = submit_order(&mut client2, 31, 1, 1, Side::Buy, 200, 5);
     assert!(
-        has_report(&r, |rep| matches!(rep, melin_protocol::types::ExecutionReport::Placed { .. })),
+        has_report(&r, |rep| matches!(
+            rep,
+            melin_protocol::types::ExecutionReport::Placed { .. }
+        )),
         "expected Placed, got: {r:?}"
     );
 
@@ -1384,19 +1558,34 @@ fn fresh_replica_full_catchup() {
     let _replacement = {
         let child = Command::new(&bin)
             .args([
-                "--bind", &format!("127.0.0.1:{r3_client}"),
-                "--health-bind", &format!("127.0.0.1:{r3_health}"),
-                "--replica-of", &format!("127.0.0.1:{}", cluster.primary_repl_port),
-                "--replication-key", cluster.repl_key_path.to_str().unwrap(),
-                "--promote-bind", &format!("127.0.0.1:{r3_promote}"),
-                "--journal", fresh_journal.to_str().unwrap(),
+                "--bind",
+                &format!("127.0.0.1:{r3_client}"),
+                "--health-bind",
+                &format!("127.0.0.1:{r3_health}"),
+                "--replica-of",
+                &format!("127.0.0.1:{}", cluster.primary_repl_port),
+                "--replication-key",
+                cluster.repl_key_path.to_str().unwrap(),
+                "--promote-bind",
+                &format!("127.0.0.1:{r3_promote}"),
+                "--journal",
+                fresh_journal.to_str().unwrap(),
                 "--authorized-keys",
-                cluster._tmp.path().join("authorized_keys").to_str().unwrap(),
-                "--connection-timeout-secs", "0",
+                cluster
+                    ._tmp
+                    .path()
+                    .join("authorized_keys")
+                    .to_str()
+                    .unwrap(),
+                "--connection-timeout-secs",
+                "0",
                 "--yield-idle",
-                "--cores", "0,0,0,0,0,0",
-                "--readers", "1",
-                "--reader-cores", "0",
+                "--cores",
+                "0,0,0,0,0,0",
+                "--readers",
+                "1",
+                "--reader-cores",
+                "0",
             ])
             .stdout(Stdio::inherit())
             .stderr(Stdio::inherit())
@@ -1413,7 +1602,9 @@ fn fresh_replica_full_catchup() {
     let start = Instant::now();
     loop {
         let (_, _, lag, _) = query_health(cluster.primary.health_addr).expect("health");
-        if lag == 0 { break; }
+        if lag == 0 {
+            break;
+        }
         if start.elapsed() > Duration::from_secs(30) {
             panic!("fresh replica did not catch up within 30s (lag={lag})");
         }

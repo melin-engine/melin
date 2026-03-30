@@ -264,8 +264,7 @@ operator AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA= test
 
     #[test]
     fn replication_key_parsed_from_file() {
-        let content =
-            "replication AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA= replica-1\n";
+        let content = "replication AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA= replica-1\n";
         let keys = AuthorizedKeys::parse(content).unwrap();
         let pub_key = [0u8; 32];
         assert_eq!(keys.lookup(&pub_key), Some(Permission::Replication));

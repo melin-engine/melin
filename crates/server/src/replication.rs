@@ -452,8 +452,16 @@ pub fn run_sender(
     }
 
     let mut slots = [
-        ReplicaSlot { consumer: Some(repl_consumer_1), handle: None, has_connected: false },
-        ReplicaSlot { consumer: Some(repl_consumer_2), handle: None, has_connected: false },
+        ReplicaSlot {
+            consumer: Some(repl_consumer_1),
+            handle: None,
+            has_connected: false,
+        },
+        ReplicaSlot {
+            consumer: Some(repl_consumer_2),
+            handle: None,
+            has_connected: false,
+        },
     ];
 
     loop {
@@ -461,10 +469,10 @@ pub fn run_sender(
             info!("replication sender shutting down");
             // Wait for active replica threads to finish.
             for slot in &mut slots {
-                if let Some(handle) = slot.handle.take() {
-                    if let Ok(consumer) = handle.join() {
-                        slot.consumer = Some(consumer);
-                    }
+                if let Some(handle) = slot.handle.take()
+                    && let Ok(consumer) = handle.join()
+                {
+                    slot.consumer = Some(consumer);
                 }
             }
             return;
@@ -472,31 +480,33 @@ pub fn run_sender(
 
         // Collect finished replica threads (disconnected replicas).
         for (i, slot) in slots.iter_mut().enumerate() {
-            if let Some(ref handle) = slot.handle {
-                if handle.is_finished() {
-                    let handle = slot.handle.take().expect("just checked is_some");
-                    match handle.join() {
-                        Ok(consumer) => {
-                            slot.consumer = Some(consumer);
-                            replicas_connected.fetch_sub(1, Ordering::Release);
-                            warn!(slot = i, "replica disconnected");
-                            if replicas_connected.load(Ordering::Relaxed) == 0 {
-                                warn!("all replicas disconnected — trading halted");
-                            }
+            if let Some(ref handle) = slot.handle
+                && handle.is_finished()
+            {
+                let handle = slot.handle.take().expect("just checked is_some");
+                match handle.join() {
+                    Ok(consumer) => {
+                        slot.consumer = Some(consumer);
+                        replicas_connected.fetch_sub(1, Ordering::Release);
+                        warn!(slot = i, "replica disconnected");
+                        if replicas_connected.load(Ordering::Relaxed) == 0 {
+                            warn!("all replicas disconnected — trading halted");
                         }
-                        Err(_) => {
-                            error!(slot = i, "replica handler thread panicked");
-                            // Consumer is lost — can't recover this slot.
-                            // The ring will backpressure on this consumer forever.
-                            // In practice, this is a fatal server bug.
-                        }
+                    }
+                    Err(_) => {
+                        error!(slot = i, "replica handler thread panicked");
+                        // Consumer is lost — can't recover this slot.
+                        // The ring will backpressure on this consumer forever.
+                        // In practice, this is a fatal server bug.
                     }
                 }
             }
         }
 
         // Find a slot that has a consumer available (not in use by a thread).
-        let empty_slot = slots.iter().position(|s| s.handle.is_none() && s.consumer.is_some());
+        let empty_slot = slots
+            .iter()
+            .position(|s| s.handle.is_none() && s.consumer.is_some());
 
         // Accept a connection if there's an empty slot.
         if let Some(slot_idx) = empty_slot {
@@ -529,8 +539,7 @@ pub fn run_sender(
                         .spawn(move || {
                             // Safety: shutdown outlives this thread (it's on the
                             // parent's stack, which blocks on join during shutdown).
-                            let shutdown_ref =
-                                unsafe { &*(shutdown_flag as *const AtomicBool) };
+                            let shutdown_ref = unsafe { &*(shutdown_flag as *const AtomicBool) };
                             run_replica_slot(
                                 stream,
                                 consumer,
@@ -562,10 +571,11 @@ pub fn run_sender(
         // replica. With journal catch-up, a late-joining replica gets
         // historical data from the primary's journal files instead.
         for slot in &mut slots {
-            if slot.handle.is_none() && slot.has_connected {
-                if let Some(ref mut consumer) = slot.consumer {
-                    drain_batches_while_waiting(consumer);
-                }
+            if slot.handle.is_none()
+                && slot.has_connected
+                && let Some(ref mut consumer) = slot.consumer
+            {
+                drain_batches_while_waiting(consumer);
             }
         }
 
@@ -575,6 +585,7 @@ pub fn run_sender(
 
 /// Handle a single replica connection on a dedicated thread.
 /// Returns the consumer when the connection ends (for slot reuse).
+#[allow(clippy::too_many_arguments)]
 fn run_replica_slot(
     stream: TcpStream,
     mut consumer: ReplicationConsumer,
@@ -669,13 +680,12 @@ fn catch_up_from_journal(
             if let Some(first_seq) = scanner
                 .first_sequence()
                 .map_err(|e| io::Error::other(format!("read {}: {e}", path.display())))?
+                && first_seq <= last_sequence
             {
-                if first_seq <= last_sequence {
-                    // This file starts at or before our target — start here.
-                    start_file_idx = i;
-                    found = true;
-                    break;
-                }
+                // This file starts at or before our target — start here.
+                start_file_idx = i;
+                found = true;
+                break;
             }
         }
         if !found {
@@ -754,10 +764,7 @@ fn catch_up_from_journal(
         }
     }
 
-    info!(
-        end_sequence,
-        batches_sent, "journal catch-up complete"
-    );
+    info!(end_sequence, batches_sent, "journal catch-up complete");
 
     Ok(end_sequence)
 }
@@ -776,8 +783,7 @@ fn authenticate_replica(
 
     // Generate random nonce.
     let mut nonce = [0u8; 32];
-    getrandom::fill(&mut nonce)
-        .map_err(|e| io::Error::other(format!("getrandom failed: {e}")))?;
+    getrandom::fill(&mut nonce).map_err(|e| io::Error::other(format!("getrandom failed: {e}")))?;
 
     // Send Challenge.
     let mut buf = Vec::with_capacity(64);
@@ -861,11 +867,7 @@ fn authenticate_with_primary(
 
     // Send ChallengeResponse.
     let mut buf = Vec::with_capacity(128);
-    encode_challenge_response(
-        &signature.to_bytes(),
-        pubkey.as_bytes(),
-        &mut buf,
-    );
+    encode_challenge_response(&signature.to_bytes(), pubkey.as_bytes(), &mut buf);
     writer.write_all(&buf)?;
     writer.flush()?;
 
@@ -877,6 +879,7 @@ fn authenticate_with_primary(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn handle_replica_connection(
     stream: TcpStream,
     repl_consumer: &mut ReplicationConsumer,
@@ -929,12 +932,8 @@ fn handle_replica_connection(
     // For a fresh replica (last_sequence=0), this streams the entire
     // journal history. For a reconnecting replica, only the gap since
     // its last acked sequence.
-    let catchup_end = catch_up_from_journal(
-        journal_path,
-        handshake.last_sequence,
-        &mut writer,
-        shutdown,
-    )?;
+    let catchup_end =
+        catch_up_from_journal(journal_path, handshake.last_sequence, &mut writer, shutdown)?;
 
     // Drain overlapping ring entries — the ring may contain entries that
     // were already sent during catch-up. Only discard entries whose
@@ -1351,15 +1350,8 @@ pub fn run_receiver(
 
                 // Flush any accumulated but un-acked data before waiting.
                 if !journal_accum.is_empty() {
-                    journal_writer.write_raw_sync(
-                        &journal_accum,
-                        accum_entry_count,
-                    )?;
-                    replay_journal_bytes(
-                        &journal_accum,
-                        &mut exchange,
-                        &mut reports,
-                    )?;
+                    journal_writer.write_raw_sync(&journal_accum, accum_entry_count)?;
+                    replay_journal_bytes(&journal_accum, &mut exchange, &mut reports)?;
                     journal_accum.clear();
                 }
 
@@ -1457,9 +1449,12 @@ pub fn run_receiver(
                     // is safe: on recovery, seed_chain_hash([0;32]) is a no-op
                     // and the reader rebuilds the chain from journal entries.
                     let chain_hash = [0u8; 32];
-                    if let Err(e) =
-                        melin_engine::journal::snapshot::save(&exchange, seq, chain_hash, &snapshot_path)
-                    {
+                    if let Err(e) = melin_engine::journal::snapshot::save(
+                        &exchange,
+                        seq,
+                        chain_hash,
+                        &snapshot_path,
+                    ) {
                         warn!(error = %e, "failed to save replica snapshot (non-fatal)");
                     } else {
                         info!(sequence = seq, "replica snapshot saved");
@@ -1829,8 +1824,7 @@ mod tests {
             repl_key.verifying_key().to_bytes(),
         );
         let keys_content = format!("replication {pub_b64} test-replica\n");
-        let authorized_keys =
-            melin_protocol::auth::AuthorizedKeys::parse(&keys_content).unwrap();
+        let authorized_keys = melin_protocol::auth::AuthorizedKeys::parse(&keys_content).unwrap();
 
         let (primary_stream, replica_stream) = UnixStream::pair().unwrap();
         primary_stream
@@ -1867,8 +1861,7 @@ mod tests {
             authorized_key.verifying_key().to_bytes(),
         );
         let keys_content = format!("replication {pub_b64} authorized-replica\n");
-        let authorized_keys =
-            melin_protocol::auth::AuthorizedKeys::parse(&keys_content).unwrap();
+        let authorized_keys = melin_protocol::auth::AuthorizedKeys::parse(&keys_content).unwrap();
 
         let (primary_stream, replica_stream) = UnixStream::pair().unwrap();
         primary_stream
@@ -1907,8 +1900,7 @@ mod tests {
             key.verifying_key().to_bytes(),
         );
         let keys_content = format!("trader {pub_b64} wrong-role\n");
-        let authorized_keys =
-            melin_protocol::auth::AuthorizedKeys::parse(&keys_content).unwrap();
+        let authorized_keys = melin_protocol::auth::AuthorizedKeys::parse(&keys_content).unwrap();
 
         let (primary_stream, replica_stream) = UnixStream::pair().unwrap();
         primary_stream
@@ -2046,7 +2038,7 @@ mod tests {
         assert_eq!(cursor.load(Ordering::Acquire), u64::MAX);
 
         // Simulate reconnect: cursor set back to handshake value.
-        cursor.store(0 + 1, Ordering::Release);
+        cursor.store(1, Ordering::Release);
         assert_eq!(cursor.load(Ordering::Acquire), 1);
     }
 

@@ -1250,8 +1250,7 @@ pub fn run_dpdk(
     let mut tx_producers = Vec::with_capacity(num_dpdk_threads);
     let mut tx_consumers = Vec::with_capacity(num_dpdk_threads);
     for _ in 0..num_dpdk_threads {
-        let (tx_out, tx_rx) =
-            melin_disruptor::spsc::channel::<crate::dpdk_response::TxFrame>(4096);
+        let (tx_out, tx_rx) = melin_disruptor::spsc::channel::<crate::dpdk_response::TxFrame>(4096);
         tx_producers.push(tx_out);
         tx_consumers.push(tx_rx);
     }
@@ -1302,8 +1301,7 @@ pub fn run_dpdk(
 
     // Spawn replication sender if enabled (identical to epoll path).
     let replica_ready = Arc::new(AtomicBool::new(false));
-    let replication_handle = if let Some((repl_consumer_1, repl_consumer_2)) =
-        replication_consumers
+    let replication_handle = if let Some((repl_consumer_1, repl_consumer_2)) = replication_consumers
     {
         let repl_bind = config
             .replication_bind

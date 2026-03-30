@@ -44,7 +44,7 @@ Features targeting regulated venues, gateway responsibilities, or with limited n
 | Auction mechanisms | Regulated venues only. Massive complexity (state machine, indicative pricing, uncrossing). |
 | Failover detection + promotion | Leader election, split-brain prevention. Distributed systems hard mode — manual promotion covers the MVP. |
 | Network partition handling | Fencing, quorum-based decisions. Same as above — extremely complex. |
-| Dual / chain replication | Replicate to 2+ replicas for stronger durability guarantees. Chain replication (primary → replica A → replica B) reduces primary fan-out. Current architecture supports one replica only. |
+| Chain replication | Chain replication (primary → replica A → replica B) reduces primary fan-out. Dual parallel replication (up to 2 replicas) is implemented; chain topology is deferred. |
 | Position/exposure limits | Important for derivatives, less so for spot. Defer until a derivatives buyer needs it. |
 | Tiered fee schedules | Volume-based tiers and per-account overrides. Can be implemented outside Melin — a fee service looks up the account's tier and sets the rate via the existing per-instrument fee API. |
 | TLS | Most exchange deployments use VLAN instead. Only needed for compliance-driven buyers. |
