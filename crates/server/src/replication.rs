@@ -324,6 +324,7 @@ pub fn run_sender(
     repl_consumer_2: ReplicationConsumer,
     replication_cursor: Arc<AtomicU64>,
     genesis_entry: Vec<u8>,
+    journal_path: std::path::PathBuf,
     shutdown: &AtomicBool,
     replica_ready: &AtomicBool,
     replicas_connected: &AtomicU32,
@@ -353,11 +354,15 @@ pub fn run_sender(
     struct ReplicaSlot {
         consumer: Option<ReplicationConsumer>,
         handle: Option<std::thread::JoinHandle<ReplicationConsumer>>,
+        /// True after this slot has had at least one connection. Ring
+        /// data is only drained on idle slots that have connected before
+        /// — a never-connected slot preserves seed data for its first replica.
+        has_connected: bool,
     }
 
     let mut slots = [
-        ReplicaSlot { consumer: Some(repl_consumer_1), handle: None },
-        ReplicaSlot { consumer: Some(repl_consumer_2), handle: None },
+        ReplicaSlot { consumer: Some(repl_consumer_1), handle: None, has_connected: false },
+        ReplicaSlot { consumer: Some(repl_consumer_2), handle: None, has_connected: false },
     ];
 
     loop {
@@ -414,6 +419,7 @@ pub fn run_sender(
                     // Signal that at least one replica is connected.
                     replica_ready.store(true, Ordering::Release);
                     replicas_connected.fetch_add(1, Ordering::Release);
+                    slots[slot_idx].has_connected = true;
 
                     // Take the consumer out of the slot for the handler thread.
                     // The slot's consumer becomes None while the thread owns it.
@@ -424,6 +430,7 @@ pub fn run_sender(
 
                     let cursor = Arc::clone(&replication_cursor);
                     let genesis = genesis_entry.clone();
+                    let jpath = journal_path.clone();
                     let shutdown_flag = shutdown as *const AtomicBool as usize;
                     let handle = std::thread::Builder::new()
                         .name(format!("repl-{slot_idx}"))
@@ -437,6 +444,7 @@ pub fn run_sender(
                                 consumer,
                                 cursor,
                                 genesis,
+                                jpath,
                                 shutdown_ref,
                                 batch_size,
                                 heartbeat_secs,
@@ -456,14 +464,14 @@ pub fn run_sender(
         }
 
         // Drain batches on idle consumers to prevent ring backpressure.
-        // Only drain after the first replica has connected (seed data
-        // must be preserved for the first connection).
-        if replica_ready.load(Ordering::Relaxed) {
-            for slot in &mut slots {
-                if slot.handle.is_none() {
-                    if let Some(ref mut consumer) = slot.consumer {
-                        drain_batches_while_waiting(consumer);
-                    }
+        // Only drain consumers that have had at least one connection —
+        // never-connected consumers preserve seed data for their first
+        // replica. With journal catch-up, a late-joining replica gets
+        // historical data from the primary's journal files instead.
+        for slot in &mut slots {
+            if slot.handle.is_none() && slot.has_connected {
+                if let Some(ref mut consumer) = slot.consumer {
+                    drain_batches_while_waiting(consumer);
                 }
             }
         }
@@ -479,6 +487,7 @@ fn run_replica_slot(
     mut consumer: ReplicationConsumer,
     replication_cursor: Arc<AtomicU64>,
     genesis_entry: Vec<u8>,
+    journal_path: std::path::PathBuf,
     shutdown: &AtomicBool,
     batch_size: usize,
     heartbeat_secs: u64,
@@ -489,6 +498,7 @@ fn run_replica_slot(
         &mut consumer,
         &replication_cursor,
         &genesis_entry,
+        &journal_path,
         shutdown,
         batch_size,
         heartbeat_secs,
@@ -509,12 +519,161 @@ fn drain_batches_while_waiting(consumer: &mut ReplicationConsumer) {
     }
 }
 
-/// Handle a single replica connection: handshake, streaming, ack processing.
+/// Discover journal archive files, sorted oldest to newest.
+/// Returns `[path.3, path.2, path.1, path]` — only files that exist.
+fn discover_journal_files(journal_path: &std::path::Path) -> Vec<std::path::PathBuf> {
+    let mut archives = Vec::new();
+    let mut n = 1u32;
+    loop {
+        let archive = std::path::PathBuf::from(format!("{}.{n}", journal_path.display()));
+        if !archive.exists() {
+            break;
+        }
+        archives.push(archive);
+        n += 1;
+    }
+    // Reverse so oldest is first (highest number = oldest).
+    archives.reverse();
+    // Current journal is newest.
+    if journal_path.exists() {
+        archives.push(journal_path.to_path_buf());
+    }
+    archives
+}
+
+/// Stream historical journal entries to a catching-up replica.
+///
+/// Reads raw entry bytes from the primary's journal files and sends
+/// them as DataBatch frames. Does NOT consume from the replication ring
+/// during catch-up — the ring accumulates live data. The caller must
+/// drain overlapping ring entries after catch-up completes.
+///
+/// Returns the last sequence sent, or 0 if no entries were sent.
+fn catch_up_from_journal(
+    journal_path: &std::path::Path,
+    last_sequence: u64,
+    writer: &mut TcpStream,
+    shutdown: &AtomicBool,
+) -> io::Result<u64> {
+    use melin_engine::journal::reader::RawJournalScanner;
+
+    let files = discover_journal_files(journal_path);
+    if files.is_empty() {
+        return Ok(last_sequence);
+    }
+
+    // Find the first file that contains entries after last_sequence.
+    // For a fresh replica (last_sequence=0), start from the oldest file.
+    let mut start_file_idx = 0;
+    if last_sequence > 0 {
+        // Scan files from newest to oldest to find which contains our target.
+        let mut found = false;
+        for (i, path) in files.iter().enumerate().rev() {
+            let mut scanner = RawJournalScanner::open(path)
+                .map_err(|e| io::Error::other(format!("open journal {}: {e}", path.display())))?;
+            if let Some(first_seq) = scanner
+                .first_sequence()
+                .map_err(|e| io::Error::other(format!("read {}: {e}", path.display())))?
+            {
+                if first_seq <= last_sequence {
+                    // This file starts at or before our target — start here.
+                    start_file_idx = i;
+                    found = true;
+                    break;
+                }
+            }
+        }
+        if !found {
+            // All files start after our target — journal archives were purged.
+            // The replica needs a snapshot transfer (not implemented).
+            warn!(
+                last_sequence,
+                "replica's last_sequence predates all available journal files"
+            );
+            return Err(io::Error::other("journals too old for catch-up"));
+        }
+    }
+
+    let mut send_buf = Vec::with_capacity(128 * 1024);
+    let mut batch_buf = Vec::with_capacity(64 * 1024);
+    let mut end_sequence = last_sequence;
+    let mut batches_sent = 0u64;
+
+    info!(
+        last_sequence,
+        files = files.len(),
+        start_file = start_file_idx,
+        "starting journal catch-up"
+    );
+
+    for path in &files[start_file_idx..] {
+        if shutdown.load(Ordering::Relaxed) {
+            return Ok(end_sequence);
+        }
+
+        let mut scanner = RawJournalScanner::open(path)
+            .map_err(|e| io::Error::other(format!("open journal {}: {e}", path.display())))?;
+
+        // Skip entries the replica already has.
+        if end_sequence > 0 {
+            scanner
+                .skip_to_after(end_sequence)
+                .map_err(|e| io::Error::other(format!("skip in {}: {e}", path.display())))?;
+        }
+
+        // Read and send batches of raw entries.
+        // Target ~64 KiB per DataBatch frame (~800 entries at ~80 bytes each).
+        loop {
+            if shutdown.load(Ordering::Relaxed) {
+                return Ok(end_sequence);
+            }
+
+            batch_buf.clear();
+            let batch = scanner
+                .read_raw_batch(&mut batch_buf, 64 * 1024)
+                .map_err(|e| io::Error::other(format!("read {}: {e}", path.display())))?;
+
+            let Some((entry_count, batch_end_seq)) = batch else {
+                break; // EOF on this file.
+            };
+
+            // Encode and send DataBatch frame.
+            // Chain hash is zeroed — chain verification is a documented v1 limitation.
+            encode_data_batch(
+                batch_end_seq,
+                &[0u8; 32],
+                entry_count,
+                &batch_buf,
+                &mut send_buf,
+            );
+            writer
+                .write_all(&send_buf)
+                .map_err(|e| io::Error::other(format!("write catch-up batch: {e}")))?;
+            writer
+                .flush()
+                .map_err(|e| io::Error::other(format!("flush catch-up batch: {e}")))?;
+            send_buf.clear();
+
+            end_sequence = batch_end_seq;
+            batches_sent += 1;
+        }
+    }
+
+    info!(
+        end_sequence,
+        batches_sent, "journal catch-up complete"
+    );
+
+    Ok(end_sequence)
+}
+
+/// Handle a single replica connection: handshake, catch-up, streaming, ack processing.
 fn handle_replica_connection(
     stream: TcpStream,
     repl_consumer: &mut ReplicationConsumer,
     replication_cursor: &Arc<AtomicU64>,
     genesis_entry: &[u8],
+    journal_path: &std::path::Path,
     shutdown: &AtomicBool,
     batch_size: usize,
     heartbeat_secs: u64,
@@ -540,11 +699,6 @@ fn handle_replica_connection(
         "replica handshake received"
     );
 
-    // For v1, we don't do catch-up from journal files — just start streaming
-    // from the live feed. The replica must start from the beginning or have
-    // been caught up previously.
-    // TODO(step 4): Add catch-up from journal file for late-joining replicas.
-
     // Send StreamStart with the primary's raw genesis entry so the replica
     // can write a byte-identical genesis to its journal.
     let mut send_buf = Vec::with_capacity(128);
@@ -552,6 +706,47 @@ fn handle_replica_connection(
     writer.write_all(&send_buf)?;
     writer.flush()?;
     send_buf.clear();
+
+    // Catch up from journal files. Reads the primary's journal archives
+    // and current journal, sends historical entries as DataBatch frames.
+    // The replication ring is NOT consumed during catch-up — it accumulates
+    // live data. After catch-up, overlapping ring entries are drained.
+    //
+    // For a fresh replica (last_sequence=0), this streams the entire
+    // journal history. For a reconnecting replica, only the gap since
+    // its last acked sequence.
+    let catchup_end = catch_up_from_journal(
+        journal_path,
+        handshake.last_sequence,
+        &mut writer,
+        shutdown,
+    )?;
+
+    // Drain overlapping ring entries — the ring may contain entries that
+    // were already sent during catch-up. Only discard entries whose
+    // end_sequence is fully covered by the catch-up. Entries beyond
+    // catch-up are left in the ring for the live streaming loop.
+    if catchup_end > 0 {
+        while let Some((meta, _data)) = repl_consumer.try_read() {
+            if meta.end_sequence > catchup_end {
+                // This batch has new data beyond catch-up. Send it now
+                // and commit so the live loop starts clean.
+                encode_data_batch(
+                    meta.end_sequence,
+                    &meta.chain_hash,
+                    meta.entry_count,
+                    _data,
+                    &mut send_buf,
+                );
+                repl_consumer.commit();
+                writer.write_all(&send_buf)?;
+                writer.flush()?;
+                send_buf.clear();
+                break;
+            }
+            repl_consumer.commit();
+        }
+    }
 
     // Short read timeout for process_acks. The actual availability check
     // uses poll(0) — this timeout only applies after poll confirms data

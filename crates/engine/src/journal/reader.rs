@@ -8,8 +8,9 @@ use std::fs::File;
 use std::io::Read;
 use std::path::Path;
 
-use super::codec::{self, FILE_HEADER_SIZE};
+use super::codec::{self, FILE_HEADER_SIZE, ENTRY_HEADER_SIZE, CRC_SIZE};
 use super::error::JournalError;
+use crate::le;
 use super::event::JournalEvent;
 
 /// Initial read buffer size. Grows if needed, but entries are typically <100 bytes.
@@ -360,6 +361,164 @@ impl JournalReader {
         let n = self.file.read(&mut self.buffer[self.valid..])?;
         self.valid += n;
         Ok(n > 0)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// RawJournalScanner — lightweight raw byte reader for replication catch-up
+// ---------------------------------------------------------------------------
+
+/// Reads raw journal entry bytes without full decoding. Used by the
+/// replication sender to stream historical entries to a catching-up
+/// replica. Only extracts entry boundaries (via the length field) and
+/// sequence numbers — no CRC validation, no event parsing.
+///
+/// The journal was already validated when written; re-validating during
+/// catch-up would add unnecessary CPU overhead for millions of entries.
+pub struct RawJournalScanner {
+    file: File,
+    /// Read buffer — entries are read into this, then raw bytes copied out.
+    buf: Vec<u8>,
+    /// Current read position within `buf`.
+    pos: usize,
+    /// Number of valid bytes in `buf`.
+    valid: usize,
+}
+
+impl RawJournalScanner {
+    /// Open a journal file for raw scanning. Validates the file header.
+    pub fn open(path: &Path) -> Result<Self, JournalError> {
+        let mut file = File::open(path)?;
+        let mut header = [0u8; FILE_HEADER_SIZE];
+        file.read_exact(&mut header)?;
+        // Validate header (version check) but don't store version —
+        // the scanner only reads entry boundaries, not event payloads.
+        let _version = codec::decode_file_header(&header)?;
+
+        Ok(Self {
+            file,
+            buf: vec![0u8; 64 * 1024], // 64 KiB read buffer
+            pos: 0,
+            valid: 0,
+        })
+    }
+
+    /// Peek at the first entry's sequence number without advancing.
+    /// Returns `None` if the file has no entries (empty or only header).
+    pub fn first_sequence(&mut self) -> Result<Option<u64>, JournalError> {
+        self.ensure_available(ENTRY_HEADER_SIZE)?;
+        let available = self.valid - self.pos;
+        if available < ENTRY_HEADER_SIZE {
+            return Ok(None);
+        }
+        // Zero magic = pre-allocated space, no entries.
+        if self.buf[self.pos] == 0 && self.buf[self.pos + 1] == 0 {
+            return Ok(None);
+        }
+        // Sequence is at offset 4 within the entry (after magic + length).
+        Ok(Some(le::get_u64(&self.buf[self.pos + 4..])))
+    }
+
+    /// Skip forward past all entries with sequence ≤ `target_seq`.
+    /// After this call, the next `read_raw_batch` will return entries
+    /// starting from the first entry with sequence > `target_seq`.
+    pub fn skip_to_after(&mut self, target_seq: u64) -> Result<(), JournalError> {
+        loop {
+            self.ensure_available(ENTRY_HEADER_SIZE)?;
+            let available = self.valid - self.pos;
+            if available < ENTRY_HEADER_SIZE {
+                return Ok(()); // EOF
+            }
+            // Zero magic = end of data.
+            if self.buf[self.pos] == 0 && self.buf[self.pos + 1] == 0 {
+                return Ok(());
+            }
+            let entry_seq = le::get_u64(&self.buf[self.pos + 4..]);
+            if entry_seq > target_seq {
+                return Ok(()); // Found the first entry past target.
+            }
+            // Skip this entry.
+            let payload_len = le::get_u16(&self.buf[self.pos + 2..]) as usize;
+            let total = ENTRY_HEADER_SIZE + payload_len + CRC_SIZE;
+            self.ensure_available(total)?;
+            if self.valid - self.pos < total {
+                return Ok(()); // Truncated entry at EOF.
+            }
+            self.pos += total;
+        }
+    }
+
+    /// Read raw entry bytes into `out`, up to `max_bytes` total.
+    /// Returns `Some((entry_count, end_sequence))` with the number of
+    /// entries and the last sequence in the batch. Returns `None` at EOF
+    /// or when no complete entry fits within `max_bytes`.
+    pub fn read_raw_batch(
+        &mut self,
+        out: &mut Vec<u8>,
+        max_bytes: usize,
+    ) -> Result<Option<(u32, u64)>, JournalError> {
+        let mut count = 0u32;
+        let mut end_seq = 0u64;
+        let batch_start = out.len();
+
+        loop {
+            self.ensure_available(ENTRY_HEADER_SIZE)?;
+            let available = self.valid - self.pos;
+            if available < ENTRY_HEADER_SIZE {
+                break; // EOF
+            }
+            if self.buf[self.pos] == 0 && self.buf[self.pos + 1] == 0 {
+                break; // Pre-allocated space.
+            }
+
+            let payload_len = le::get_u16(&self.buf[self.pos + 2..]) as usize;
+            let total = ENTRY_HEADER_SIZE + payload_len + CRC_SIZE;
+
+            // Don't exceed max_bytes (but always include at least one entry).
+            if count > 0 && (out.len() - batch_start) + total > max_bytes {
+                break;
+            }
+
+            self.ensure_available(total)?;
+            if self.valid - self.pos < total {
+                break; // Truncated entry at EOF.
+            }
+
+            end_seq = le::get_u64(&self.buf[self.pos + 4..]);
+            out.extend_from_slice(&self.buf[self.pos..self.pos + total]);
+            self.pos += total;
+            count += 1;
+        }
+
+        if count == 0 {
+            Ok(None)
+        } else {
+            Ok(Some((count, end_seq)))
+        }
+    }
+
+    /// Ensure at least `needed` bytes are available in the buffer.
+    /// Compacts and refills as needed.
+    fn ensure_available(&mut self, needed: usize) -> Result<(), JournalError> {
+        while self.valid - self.pos < needed {
+            // Compact: move remaining data to the start.
+            if self.pos > 0 {
+                self.buf.copy_within(self.pos..self.valid, 0);
+                self.valid -= self.pos;
+                self.pos = 0;
+            }
+            // Grow buffer if needed.
+            if self.buf.len() < needed {
+                self.buf.resize(needed, 0);
+            }
+            // Read more data.
+            let n = self.file.read(&mut self.buf[self.valid..])?;
+            if n == 0 {
+                return Ok(()); // EOF — caller checks available bytes.
+            }
+            self.valid += n;
+        }
+        Ok(())
     }
 }
 

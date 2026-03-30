@@ -140,8 +140,9 @@ The TCP network stack is now the primary throughput limiter. The journal pipelin
 - Crash injection tests at every byte offset, during snapshot rotation, and under realistic load
 
 ### [Replication & High Availability](docs/replication.md)
-- Synchronous journal replication — live WAL streaming to replica via lock-free ring buffer; replica fsyncs and acks before the primary sends responses to clients (zero acknowledged data loss)
-- Automatic trading halt on replica disconnect — new orders rejected with `ReplicaDisconnected`, resumes instantly on reconnect ([operations](docs/operations.md))
+- Synchronous dual replication — live WAL streaming to 2 replicas via lock-free ring buffer; replicas fsync and ack before the primary sends responses to clients (zero acknowledged data loss)
+- Journal catch-up — new replicas automatically catch up from the primary's journal files before switching to live streaming; enables replica replacement with zero downtime
+- Automatic trading halt when all replicas disconnect — trading continues with at least one replica; resumes instantly on reconnect
 - Manual promotion — operator sends `PROMOTE` to the replica's trigger endpoint; in-process transition reuses the warm Exchange state with zero re-replay, sub-second switchover
 - Multi-process failover tests — SIGKILL primary under load, promote replica, verify no data loss and clients can reconnect
 
@@ -169,7 +170,7 @@ The TCP network stack is now the primary throughput limiter. The journal pipelin
 - Property-based tests (proptest): price-time priority, balance conservation, volume conservation, reservation consistency, no self-trades under STP, deterministic replay, overflow safety
 - Fuzz testing (bolero): journal codec, wire protocol codec
 - Crash injection tests: truncation at every byte offset, during snapshot rotation, under realistic load, across multiple rotation cycles
-- Multi-process failover tests: SIGKILL primary, promote replica, verify state consistency and no data loss
+- Multi-process failover tests: SIGKILL primary, promote replica, dual-replication failover, journal catch-up for replacement replicas, verify state consistency and no data loss
 - Integration tests: snapshot round-trip, journal replay, shadow stage determinism
 
 ## Project Structure

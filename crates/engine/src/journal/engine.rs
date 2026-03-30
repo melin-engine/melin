@@ -186,15 +186,33 @@ impl JournaledExchange {
         let mut exchange = Exchange::with_capacity();
         let mut reports = Vec::new();
 
-        while let Some(entry) = reader.next_entry()? {
-            replay_event(
-                &mut exchange,
-                &entry.event,
-                entry.key_hash,
-                entry.request_seq,
-                &mut reports,
-            );
-            reports.clear();
+        loop {
+            match reader.next_entry() {
+                Ok(Some(entry)) => {
+                    replay_event(
+                        &mut exchange,
+                        &entry.event,
+                        entry.key_hash,
+                        entry.request_seq,
+                        &mut reports,
+                    );
+                    reports.clear();
+                }
+                Ok(None) => break, // EOF or truncated entry.
+                Err(JournalError::SequenceGap { expected, actual }) => {
+                    // Sequence gap — likely from a SIGKILL during a batched
+                    // write. Treat as end-of-valid-data: the entries before
+                    // the gap are consistent, the rest is discarded.
+                    // The writer will truncate at this point on open_append.
+                    tracing::warn!(
+                        expected,
+                        actual,
+                        "sequence gap during recovery — truncating at gap"
+                    );
+                    break;
+                }
+                Err(e) => return Err(e),
+            }
         }
 
         let last_seq = reader.last_sequence().unwrap_or(0);
@@ -232,16 +250,30 @@ impl JournaledExchange {
         let mut reports = Vec::new();
 
         // Skip entries already captured by the snapshot.
-        while let Some(entry) = reader.next_entry()? {
-            if entry.sequence > snap_sequence {
-                replay_event(
-                    &mut exchange,
-                    &entry.event,
-                    entry.key_hash,
-                    entry.request_seq,
-                    &mut reports,
-                );
-                reports.clear();
+        loop {
+            match reader.next_entry() {
+                Ok(Some(entry)) => {
+                    if entry.sequence > snap_sequence {
+                        replay_event(
+                            &mut exchange,
+                            &entry.event,
+                            entry.key_hash,
+                            entry.request_seq,
+                            &mut reports,
+                        );
+                        reports.clear();
+                    }
+                }
+                Ok(None) => break,
+                Err(JournalError::SequenceGap { expected, actual }) => {
+                    tracing::warn!(
+                        expected,
+                        actual,
+                        "sequence gap during snapshot recovery — truncating at gap"
+                    );
+                    break;
+                }
+                Err(e) => return Err(e),
             }
         }
 

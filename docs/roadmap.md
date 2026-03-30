@@ -6,13 +6,12 @@ Planned features sorted by value/complexity ratio for commercial readiness (exch
 
 | # | Feature | Commercial value | Complexity | Value/effort | Why |
 |---|---------|:---:|:---:|:---:|-----|
-| 1 | Catch-up from journal files | High | High | ★★☆☆☆ | Critical for production HA, but significant work (read historical segments, switch to live). |
-| 2 | Snapshot transfer | Medium | High | ★☆☆☆☆ | Needed for full HA, but catch-up from journal comes first. |
-| 3 | DPDK replication e2e testing | High | Low | ★★★★☆ | Test DPDK replication (smoltcp sender + receiver) on real multi-queue NICs with the bench suite. Virtual devices (TAP, af_packet) only support 1 queue so can't smoke-test locally. Branch: `feat/dpdk-bench-suite` has the implementation + bench suite integration. Needs SR-IOV hardware to validate. |
-| 4 | Cross-engine differential testing | High | Medium | ★★★☆☆ | Build or use an independent matching engine implementation as a reference oracle. Feed identical order streams to both engines and compare execution reports. Catches correctness bugs that property tests miss — edge cases in price-time priority, partial fills at level boundaries, cancel-replace races, STP interactions. |
-| 5 | Targeted edge-case tests | High | Low | ★★★★☆ | Cancel-replace crossing the spread, FOK+STP interaction, per-fill fee rounding conservation, stop trigger cascades, cancel-replace priority preservation, snapshot round-trip with fees, market order on empty book, GTD expiry during matching. Branch: `feat/targeted-edge-case-tests`. |
-| 6 | Full doc review | High | Low | ★★★★☆ | Many docs are stale after recent features (permissions, backpressure, Day TIF, GTD TIF, promotion, health endpoint). Review and update all docs/ files, CLAUDE.md, and README. Do once all other MVP features are complete. |
-| 7 | Brand setup (domain, GitHub org, email) | Medium | Low | ★★★☆☆ | Register melin.io/melin.com, set up contact@ email, create GitHub org, transfer repo, switch commit email going forward. Do not rewrite history. |
+| 1 | Snapshot transfer | High | Medium | ★★★☆☆ | When journal archives have been purged, the primary transfers a snapshot + current journal to the replica over TCP. Fallback for journal catch-up when historical files are unavailable. Required for production — operators will rotate and purge old archives. |
+| 2 | DPDK replication e2e testing | High | Low | ★★★★☆ | Test DPDK replication (smoltcp sender + receiver) on real multi-queue NICs with the bench suite. Virtual devices (TAP, af_packet) only support 1 queue so can't smoke-test locally. Branch: `feat/dpdk-bench-suite` has the implementation + bench suite integration. Needs SR-IOV hardware to validate. |
+| 3 | Cross-engine differential testing | High | Medium | ★★★☆☆ | Build or use an independent matching engine implementation as a reference oracle. Feed identical order streams to both engines and compare execution reports. Catches correctness bugs that property tests miss — edge cases in price-time priority, partial fills at level boundaries, cancel-replace races, STP interactions. |
+| 4 | Targeted edge-case tests | High | Low | ★★★★☆ | Cancel-replace crossing the spread, FOK+STP interaction, per-fill fee rounding conservation, stop trigger cascades, cancel-replace priority preservation, snapshot round-trip with fees, market order on empty book, GTD expiry during matching. Branch: `feat/targeted-edge-case-tests`. |
+| 5 | Full doc review | High | Low | ★★★★☆ | Many docs are stale after recent features (permissions, backpressure, Day TIF, GTD TIF, promotion, health endpoint). Review and update all docs/ files, CLAUDE.md, and README. Do once all other MVP features are complete. |
+| 6 | Brand setup (domain, GitHub org, email) | Medium | Low | ★★★☆☆ | Register melin.io/melin.com, set up contact@ email, create GitHub org, transfer repo, switch commit email going forward. Do not rewrite history. |
 
 ## DPDK Transport Optimization
 
