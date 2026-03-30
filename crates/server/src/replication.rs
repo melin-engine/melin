@@ -1433,7 +1433,7 @@ pub fn run_receiver(
 
             // Receive SnapshotBegin.
             let begin_frame = read_frame(&mut reader, MAX_CONTROL_FRAME)?;
-            let (snap_len, snap_sequence, snap_chain_hash) =
+            let (snap_len, snap_sequence, _snap_chain_hash) =
                 match decode_primary_message(&begin_frame)? {
                     PrimaryMessage::SnapshotBegin {
                         snapshot_len,
