@@ -8,7 +8,7 @@ Melin handles order matching, account balances, risk controls, circuit breakers,
 
 Melin is:
 
-**Correct** — strict price-time priority verified by property-based tests across thousands of random order sequences; cross-validated against independent matching engine implementations and real market data to surface edge cases that single-engine testing misses; deterministic replay guarantees identical state from the same journal; balance conservation enforced by proptest invariants; fuzz testing covers journal and wire protocol decoding. Hundreds of test scenarios were written to make sure Melin is correct.
+**Correct** — strict price-time priority verified by property-based tests across thousands of random order sequences; cross-validated against independent matching engine implementations and real market data to surface edge cases that single-engine testing misses; deterministic replay guarantees identical state from the same journal. Verified by property-based, fuzz, crash-injection, cross-engine differential, and multi-process failover tests — hundreds of scenarios in total.
 
 **Durable** — every order is persisted (pwritev2 + RWF_DSYNC) and replicated before acknowledgement; crash recovery via journal replay with CRC32C integrity checks; BLAKE3 hash chain for tamper evidence. Melin supports dual-replication to survive and recover from major outage scenarios.
 
@@ -54,35 +54,34 @@ The DPDK result is an early experimental measurement with end-to-end kernel bypa
 - Post-Only (maker-only, reject if would take)
 
 ### [Matching Engine](docs/matching-engine.md)
-- Strict price-time priority (sorted Vec + binary search order book)
+- Strict price-time priority
 - Execution reports: Fill (with fees), Placed, Triggered, Cancelled, Rejected, Replaced, InstrumentStatusChanged
 - Multi-instrument exchange with shared account balances
 - Cancel-replace / order amendment (atomic price/qty modify; preserves queue priority when price unchanged, loses priority on price change)
-- Circuit breakers (price bands, trading halts — per-instrument `CircuitBreakerConfig`)
+- Circuit breakers (price bands, trading halts — configurable per instrument)
 - Instrument lifecycle management (disable/enable/remove — disable cancels all resting orders atomically, remove reclaims memory)
 
 ### [Fees](docs/fee-model.md)
-- Maker/taker fee model (per-instrument `FeeSchedule` in basis points, configurable via admin API)
-- Fee deduction on fill (fees in quote currency, deducted from buyer reservation and seller proceeds, reported in `ExecutionReport::Fill`)
+- Maker/taker fee model (per-instrument, in basis points, configurable via admin API)
+- Fee deduction on fill (fees in quote currency, deducted from buyer reservation and seller proceeds)
 - Collected fees credited to a dedicated fee account — operators can withdraw via admin API; balance conservation enforced across all accounts
 
 ### [Risk & Accounting](docs/risk-checks.md)
 - Per-account, per-currency balance management (reserve on order, update on fill, release on cancel)
 - Self-trade prevention (per-order modes: CancelNewest, CancelOldest, CancelBoth)
-- Fat finger checks (max order size, max notional value — per-instrument configurable `RiskLimits`)
+- Fat finger checks (max order size, max notional value — configurable per instrument)
 - Kill switch (cancel all resting orders and pending stops for an account across all instruments)
-- Per-account OrderId high-water mark (prevents double-execution on crash-recovery retry)
-- Price band checks (static lower/upper bounds, per-instrument — part of circuit breaker config)
-- Withdraw event (debit funds, auto-evict zero-balance entries)
+- Per-account order ID high-water mark (prevents double-execution on crash-recovery retry)
+- Price band checks (static lower/upper bounds, per-instrument)
+- Withdraw (debit funds, auto-evict zero-balance entries)
 
 ### [Event Sourcing & Durability](docs/journal.md)
 - Write-ahead journal with CRC32C checksums and BLAKE3 hash chain (tamper evidence, replica consistency)
-- Persist-before-ack: matching latency overlapped against journal writes, acknowledgement gated on confirmed durability
-- Batch journal I/O via LMAX disruptor ring buffer pipeline (`pwritev2` + `RWF_DSYNC`)
-- Pre-allocated storage (`posix_fallocate`) for reduced fsync latency
+- Persist-before-ack: matching overlapped against journal writes, acknowledgement gated on confirmed durability
+- Batch journal I/O with pre-allocated storage for reduced fsync latency
 - Snapshot save/load for fast recovery; journal rotation (automatic snapshot + archive when size threshold exceeded)
 - Deterministic replay from journal for crash recovery and audit
-- Scheduled snapshots via shadow exchange — periodic snapshots on a dedicated thread without pausing the matching engine (`--snapshot-interval-secs`)
+- Scheduled snapshots on a dedicated thread without pausing the matching engine
 
 ### [Replication & High Availability](docs/replication.md)
 - Synchronous dual replication — live WAL streaming to 2 replicas via lock-free ring buffer; replicas fsync and ack before the primary sends responses to clients (zero acknowledged data loss)
@@ -95,10 +94,9 @@ The DPDK result is an early experimental measurement with end-to-end kernel bypa
 ### [Networking](docs/wire-protocol.md)
 - Custom binary wire protocol (length-prefixed framing)
 - TCP, Unix domain socket, and DPDK kernel bypass transports
-- Epoll reader pool (edge-triggered, non-blocking) with dedicated I/O threads (zero tokio)
-- io_uring transport (separate read/write rings, multishot RECV with provided buffer groups)
-- Backpressure handling (explicit `ServerBusy` reject when the input pipeline is full — client should back off and retry)
-- Output event channel — real-time broadcast of all execution events to authenticated TCP subscribers via `--event-bind`; per-frame monotonic sequence numbers for gap detection; slow subscriber disconnect
+- Epoll and io_uring transports with dedicated I/O threads
+- Backpressure handling (reject when the input pipeline is full — client backs off and retries)
+- Output event channel — real-time broadcast of all execution events to authenticated subscribers; monotonic sequence numbers for gap detection
 
 ### [Authentication & Authorization](docs/admin-guide.md)
 - Ed25519 challenge-response handshake
@@ -107,18 +105,10 @@ The DPDK result is an early experimental measurement with end-to-end kernel bypa
 - Per-key idempotency (sequence numbers with duplicate rejection — safe to retry on timeout without double-applying)
 
 ### [Operations](docs/operations.md)
-- Structured logging (`tracing` crate, error-level for server malfunctions only)
-- Health/liveness TCP endpoint (`--health-bind`) with Prometheus `/metrics` endpoint (active connections, events processed, journal sequence, replication lag, pipeline health, input queue depth, trading state)
+- Structured logging (error-level for server malfunctions only)
+- Health/liveness endpoint with Prometheus metrics (active connections, events processed, journal sequence, replication lag, pipeline health, input queue depth, trading state)
 - Admin TUI dashboard (live connection count, events processed, throughput, journal sequence)
 - Sparse account storage to reduce memory usage, see [account lifecycle](docs/account-lifecycle.md)
-
-### Testing
-- Property-based tests (proptest): price-time priority, balance conservation, volume conservation, reservation consistency, no self-trades under STP, deterministic replay, overflow safety, cancel-replace invariants, fee accounting
-- Cross-engine differential testing against independent matching engine implementations and a naive reference oracle (100K+ randomized events)
-- Fuzz testing (bolero): journal codec, wire protocol codec
-- Crash injection tests: truncation at every byte offset, during snapshot rotation, under realistic load, across multiple rotation cycles
-- Multi-process failover tests: SIGKILL primary, promote replica, dual-replication failover, journal catch-up for replacement replicas, verify state consistency and no data loss
-- Integration tests: snapshot round-trip, journal replay, shadow stage determinism
 
 ## License
 
