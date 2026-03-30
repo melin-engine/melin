@@ -6,13 +6,21 @@ Melin handles order matching, account balances, risk controls, circuit breakers,
 
 ## Why Melin
 
-Melin is:
+**Correct** — every order matches exactly where it should, every time.
+- Strict price-time priority verified by property-based tests across thousands of random order sequences
+- Cross-validated against independent matching engine implementations and real market data
+- Deterministic replay guarantees identical state from the same journal
+- Verified by property-based, fuzz, crash-injection, cross-engine differential, and multi-process failover tests — hundreds of scenarios in total
 
-**Correct** — strict price-time priority verified by property-based tests across thousands of random order sequences; cross-validated against independent matching engine implementations and real market data to surface edge cases that single-engine testing misses; deterministic replay guarantees identical state from the same journal. Verified by property-based, fuzz, crash-injection, cross-engine differential, and multi-process failover tests — hundreds of scenarios in total.
+**Durable** — every order is persisted and replicated before acknowledgement.
+- Crash recovery via journal replay with CRC32C integrity checks
+- BLAKE3 hash chain for tamper evidence
+- Dual-replication to survive and recover from major outage scenarios
 
-**Durable** — every order is persisted (pwritev2 + RWF_DSYNC) and replicated before acknowledgement; crash recovery via journal replay with CRC32C integrity checks; BLAKE3 hash chain for tamper evidence. Melin supports dual-replication to survive and recover from major outage scenarios.
-
-**Efficient** — single-threaded matching engine on a lock-free disruptor pipeline for the best compromise between maximum throughput and minimum latency, with journal, matching and replication running in parallel. Melin can handle 8.1M orders/sec over LAN with local fsync, 5.8M/sec with synchronous replication, with a sub-100 µs p99.9 single-order latency. All of this on regular datacenter-grade hardware.
+**Efficient** — 8.1M orders/sec with full durability on regular datacenter hardware.
+- Single-threaded matching engine on a lock-free disruptor pipeline
+- Journal, matching, and replication run in parallel
+- Sub-100 µs p99.9 single-order latency
 
 ## LAN Benchmarks
 
