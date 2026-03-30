@@ -848,6 +848,58 @@ mod tests {
     }
 
     #[test]
+    fn snapshot_recovery_with_zero_chain_hash() {
+        // Simulates the replica catch-up scenario: snapshot is saved with
+        // chain_hash = [0;32] because write_raw_sync doesn't update the
+        // writer's chain state. Recovery must still produce correct Exchange
+        // state by replaying post-snapshot journal entries without chain
+        // verification (seed_chain_hash is a no-op for zero hash).
+        let dir = tempfile::tempdir().unwrap();
+        let journal_path = dir.path().join("zero_hash.journal");
+        let snap_path = dir.path().join("zero_hash.snapshot");
+
+        let expected_seq;
+        {
+            let mut je = JournaledExchange::create(&journal_path).unwrap();
+            je.add_instrument(btc_usd_spec()).unwrap();
+            je.deposit(ACCT_A, USD, 100_000).unwrap();
+            je.deposit(ACCT_B, BTC, 500).unwrap();
+
+            // Save snapshot with zero chain hash (replica scenario).
+            let seq = je.next_sequence().saturating_sub(1);
+            snapshot::save(je.exchange(), seq, [0u8; 32], &snap_path).unwrap();
+
+            // More events after the zero-hash snapshot.
+            let mut reports = Vec::new();
+            je.execute(
+                Symbol(1),
+                limit_order(1, ACCT_B, Side::Sell, 100, 50),
+                &mut reports,
+            )
+            .unwrap();
+            je.execute(
+                Symbol(1),
+                limit_order(2, ACCT_A, Side::Buy, 100, 20),
+                &mut reports,
+            )
+            .unwrap();
+            expected_seq = je.next_sequence();
+        }
+
+        // Recover from snapshot (zero chain hash) + journal.
+        let je = JournaledExchange::recover_from_snapshot(&snap_path, &journal_path).unwrap();
+        assert_eq!(je.next_sequence(), expected_seq);
+        // Buyer got 20 BTC from fill.
+        assert_eq!(je.exchange().accounts().balance(ACCT_A, BTC).available, 20);
+        // Seller: 500 - 50 reserved + 20 filled = 450 available, 30 resting.
+        assert_eq!(
+            je.exchange().accounts().balance(ACCT_B, BTC).available,
+            450
+        );
+        assert_eq!(je.exchange().accounts().balance(ACCT_B, BTC).reserved, 30);
+    }
+
+    #[test]
     fn journal_replay_restores_circuit_breaker_state() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("cb_replay.journal");

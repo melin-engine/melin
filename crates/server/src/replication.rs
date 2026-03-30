@@ -1108,6 +1108,7 @@ pub fn run_receiver(
             if !journal_accum.is_empty() {
                 journal_writer.write_raw_sync(&journal_accum, accum_entry_count)?;
                 replay_journal_bytes(&journal_accum, &mut exchange, &mut reports)?;
+                events_since_snapshot += accum_entry_count;
                 journal_accum.clear();
             }
             return Ok(Some((exchange, journal_writer)));
@@ -1141,6 +1142,7 @@ pub fn run_receiver(
                         &mut exchange,
                         &mut reports,
                     )?;
+                    events_since_snapshot += accum_entry_count;
                     journal_accum.clear();
                 }
 
