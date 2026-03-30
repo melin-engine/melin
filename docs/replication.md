@@ -109,9 +109,9 @@ These are known limitations of the current implementation. Each is documented he
 
 ### ~~No catch-up from journal files~~ (IMPLEMENTED)
 
-When a replica connects with `last_sequence > 0` (has existing state from a previous connection or a journal file copy), the primary reads its journal archive files and streams historical entries as DataBatch frames before switching to live ring data. The `RawJournalScanner` reads entry boundaries without full decoding (no CRC validation, no event parsing) for efficient streaming.
+When a replica connects, the primary reads its journal archive files and streams historical entries as DataBatch frames before switching to live ring data. The `RawJournalScanner` reads entry boundaries without full decoding (no CRC validation, no event parsing) for efficient streaming. The replication ring is NOT consumed during catch-up — live data accumulates in the ring and overlapping entries are drained after catch-up completes.
 
-**Fresh replica deployment**: copy the primary's journal file to the replica first (`cp` while the primary is running — writes use `pwritev2` with `RWF_DSYNC`, reads are consistent), then start the replica. It recovers from the copy, connects with a non-zero `last_sequence`, and catch-up fills the small gap. Fresh replicas without a journal copy (`last_sequence=0`) receive all data via live ring streaming.
+This works for both reconnecting replicas (`last_sequence > 0`, catches up the gap) and fresh replicas (`last_sequence = 0`, streams the entire journal history). No operator intervention required — a new replica can join a running primary at any time.
 
 ### No chain hash verification on received DataBatch
 
