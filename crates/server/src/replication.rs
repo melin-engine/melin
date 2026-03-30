@@ -28,9 +28,8 @@
 //!
 //! ## v1 Limitations
 //!
-//! - No catch-up from journal files (replica must be connected from start)
 //! - No chain hash verification on received DataBatch (CRC per-entry only)
-//! - No handshake validation (NeedSnapshot/HashMismatch never sent)
+//! - No handshake chain hash validation (HashMismatch never sent)
 //! - Dual replication (up to 2 replicas in parallel)
 //!
 //! See `docs/replication.md` for the full design document and limitation details.
@@ -740,6 +739,36 @@ enum CatchUpResult {
     NeedSnapshot,
 }
 
+/// Check if journal catch-up is possible without sending any data.
+/// Returns true if the journal archives contain the replica's last_sequence,
+/// false if the archives have been purged and a snapshot transfer is needed.
+fn can_catch_up_from_journal(
+    journal_path: &std::path::Path,
+    last_sequence: u64,
+) -> io::Result<bool> {
+    use melin_engine::journal::reader::RawJournalScanner;
+
+    let files = discover_journal_files(journal_path);
+    if files.is_empty() || last_sequence == 0 {
+        // No files or fresh replica — catch-up will handle it.
+        return Ok(true);
+    }
+
+    // Check if any file starts at or before the target sequence.
+    for path in files.iter().rev() {
+        let mut scanner = RawJournalScanner::open(path)
+            .map_err(|e| io::Error::other(format!("open journal {}: {e}", path.display())))?;
+        if let Some(first_seq) = scanner
+            .first_sequence()
+            .map_err(|e| io::Error::other(format!("read {}: {e}", path.display())))?
+            && first_seq <= last_sequence
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 /// Returns the last sequence sent, or 0 if no entries were sent.
 fn catch_up_from_journal(
     journal_path: &std::path::Path,
@@ -1004,21 +1033,28 @@ fn handle_replica_connection(
 
     let mut send_buf = Vec::with_capacity(128);
 
-    // Send StreamStart with the primary's raw genesis entry so the replica
-    // can write a byte-identical genesis to its journal.
-    encode_stream_start(handshake.last_sequence, genesis_entry, &mut send_buf);
-    writer.write_all(&send_buf)?;
-    writer.flush()?;
-    send_buf.clear();
+    // Probe whether journal catch-up is possible before committing to
+    // a protocol path. This avoids sending StreamStart only to discover
+    // the journals are too old.
+    let can_catch_up = can_catch_up_from_journal(journal_path, handshake.last_sequence)?;
 
-    // Catch up from journal files. Reads the primary's journal archives
-    // and current journal, sends historical entries as DataBatch frames.
-    let catchup_result =
-        catch_up_from_journal(journal_path, handshake.last_sequence, &mut writer, shutdown)?;
+    let catchup_end = if can_catch_up {
+        // Normal path: send StreamStart, then catch up from journal files.
+        encode_stream_start(handshake.last_sequence, genesis_entry, &mut send_buf);
+        writer.write_all(&send_buf)?;
+        writer.flush()?;
+        send_buf.clear();
 
-    let catchup_end = match catchup_result {
-        CatchUpResult::Ok(end) => end,
-        CatchUpResult::NeedSnapshot => {
+        let catchup_result =
+            catch_up_from_journal(journal_path, handshake.last_sequence, &mut writer, shutdown)?;
+        match catchup_result {
+            CatchUpResult::Ok(end) => end,
+            CatchUpResult::NeedSnapshot => {
+                // Shouldn't happen — we already checked. But handle gracefully.
+                return Err(io::Error::other("catch-up failed unexpectedly after probe"));
+            }
+        }
+    } else {
             // Replica's state predates all journal archives. Transfer a snapshot.
             let snap_path = journal_path.with_extension("snapshot");
             if !snap_path.exists() {
@@ -1088,20 +1124,27 @@ fn handle_replica_connection(
 
             info!(snap_sequence, "snapshot transfer complete");
 
+            // Send StreamStart so the replica can set up its journal after
+            // loading the snapshot. The start_sequence is the snapshot's
+            // sequence — catch-up will send entries after this.
+            encode_stream_start(snap_sequence, genesis_entry, &mut send_buf);
+            writer.write_all(&send_buf)?;
+            writer.flush()?;
+            send_buf.clear();
+
             // Catch up from the snapshot's sequence using the current journal.
             // The current journal starts at snap_sequence+1 (rotation boundary).
             let post_snap_result = catch_up_from_journal(
                 journal_path, snap_sequence, &mut writer, shutdown,
             )?;
-            match post_snap_result {
-                CatchUpResult::Ok(end) => end,
-                CatchUpResult::NeedSnapshot => {
-                    // This shouldn't happen — we just transferred a snapshot
-                    // and the current journal should cover from snap_sequence.
-                    return Err(io::Error::other(
-                        "catch-up failed even after snapshot transfer",
-                    ));
-                }
+        match post_snap_result {
+            CatchUpResult::Ok(end) => end,
+            CatchUpResult::NeedSnapshot => {
+                // This shouldn't happen — we just transferred a snapshot
+                // and the current journal should cover from snap_sequence.
+                return Err(io::Error::other(
+                    "catch-up failed even after snapshot transfer",
+                ));
             }
         }
     };
@@ -1464,10 +1507,20 @@ pub fn run_receiver(
             )?;
             journal_writer = Some(writer);
 
-            // Fall through to the DataBatch loop. The primary will catch up
-            // from snap_sequence using the current journal and send DataBatch
-            // frames, followed by live streaming.
-            Vec::new() // genesis_entry not needed
+            // Read the StreamStart that the primary sends after the snapshot.
+            // It carries the genesis entry and start_sequence.
+            let ss_frame = read_frame(&mut reader, MAX_CONTROL_FRAME)?;
+            match decode_primary_message(&ss_frame)? {
+                PrimaryMessage::StreamStart { start_sequence, genesis_entry } => {
+                    info!(start_sequence, "streaming resumed after snapshot transfer");
+                    genesis_entry
+                }
+                other => {
+                    return Err(
+                        format!("expected StreamStart after snapshot, got {other:?}").into(),
+                    );
+                }
+            }
         }
         PrimaryMessage::HashMismatch => {
             return Err("chain hash mismatch — replica has divergent history".into());

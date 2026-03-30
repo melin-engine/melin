@@ -73,7 +73,10 @@ Length-prefixed frames, little-endian. Runs over a dedicated TCP connection sepa
 | Message | Layout | Purpose |
 |---|---|---|
 | StreamStart | `[len:u32][type=0x10][start_sequence:u64][genesis_len:u32][genesis_entry_bytes...]` | Confirms handshake, includes raw genesis entry for byte-identical hash chain |
-| NeedSnapshot | `[len:u32][type=0x11]` | Replica is too far behind; needs a snapshot transfer (future, not implemented) |
+| NeedSnapshot | `[len:u32][type=0x11]` | Replica is too far behind; triggers snapshot transfer |
+| SnapshotBegin | `[len:u32][type=0x13][snapshot_len:u64][snap_sequence:u64][snap_chain_hash:[u8;32]]` | Start of snapshot transfer with metadata |
+| SnapshotChunk | `[len:u32][type=0x14][data...]` | Chunk of snapshot data (up to 64 KiB) |
+| SnapshotEnd | `[len:u32][type=0x15][crc32c:u32]` | End of snapshot transfer with CRC32C for integrity |
 | HashMismatch | `[len:u32][type=0x12]` | Chain hash doesn't match at the replica's reported sequence (not yet validated) |
 | DataBatch | `[len:u32][type=0x20][end_sequence:u64][chain_hash:[u8;32]][journal_bytes...]` | Batch of encoded journal entries with trailing chain hash |
 | Heartbeat | `[len:u32][type=0x30][sequence:u64][chain_hash:[u8;32]]` | Periodic idle keepalive (5-second interval) with current state |
@@ -132,7 +135,7 @@ This works for both reconnecting replicas (`last_sequence > 0`, catches up the g
 
 **What**: The primary does not validate the replica's `chain_hash` from the Handshake against its own journal at the replica's reported `last_sequence`. It unconditionally sends `StreamStart`.
 
-**Impact**: A replica with divergent history (e.g., connected to a different primary previously, or with a corrupted journal) will be accepted without warning. The `NeedSnapshot` and `HashMismatch` response types are defined in the protocol but never sent.
+**Impact**: A replica with divergent history (e.g., connected to a different primary previously, or with a corrupted journal) will be accepted without warning. The `HashMismatch` response type is defined in the protocol but never sent. (`NeedSnapshot` is now sent when journal archives are too old — see snapshot transfer below.)
 
 **Why deferred**: Validating the chain hash at an arbitrary historical sequence requires either keeping a mapping of sequence→chain_hash (expensive) or re-reading the journal from genesis (slow). For v1, the assumption is that replicas are fresh or were connected to this primary.
 
