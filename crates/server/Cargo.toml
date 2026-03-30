@@ -29,6 +29,7 @@ melin-disruptor = { path = "../disruptor" }
 melin-protocol = { path = "../protocol" }
 blake3 = "1"
 clap = { workspace = true }
+crc32c = "0.6"
 ed25519-dalek = { workspace = true }
 getrandom = "0.3"
 libc = { workspace = true }

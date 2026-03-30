@@ -58,6 +58,9 @@ const MSG_AUTH_FAILED: u8 = 0x06;
 const MSG_STREAM_START: u8 = 0x10;
 const MSG_NEED_SNAPSHOT: u8 = 0x11;
 const MSG_HASH_MISMATCH: u8 = 0x12;
+const MSG_SNAPSHOT_BEGIN: u8 = 0x13;
+const MSG_SNAPSHOT_CHUNK: u8 = 0x14;
+const MSG_SNAPSHOT_END: u8 = 0x15;
 const MSG_DATA_BATCH: u8 = 0x20;
 const MSG_HEARTBEAT: u8 = 0x30;
 
@@ -95,6 +98,21 @@ pub enum PrimaryMessage {
     },
     NeedSnapshot,
     HashMismatch,
+    /// Start of a snapshot transfer. Sent after NeedSnapshot.
+    SnapshotBegin {
+        /// Total snapshot file size in bytes.
+        snapshot_len: u64,
+        /// Journal sequence at which the snapshot was taken.
+        snap_sequence: u64,
+        /// BLAKE3 chain hash at the snapshot point.
+        snap_chain_hash: [u8; 32],
+    },
+    /// A chunk of snapshot data. Sent repeatedly after SnapshotBegin.
+    SnapshotChunk(Vec<u8>),
+    /// End of snapshot transfer. Contains CRC32C of the entire snapshot file.
+    SnapshotEnd {
+        crc32c: u32,
+    },
     DataBatch {
         end_sequence: u64,
         chain_hash: [u8; 32],
@@ -227,11 +245,44 @@ fn encode_stream_start(start_sequence: u64, genesis_entry_bytes: &[u8], buf: &mu
 }
 
 /// Encode a NeedSnapshot message.
-#[allow(dead_code)] // Used in future catch-up implementation.
 fn encode_need_snapshot(buf: &mut Vec<u8>) {
     let payload_len: u32 = 1;
     buf.extend_from_slice(&payload_len.to_le_bytes());
     buf.push(MSG_NEED_SNAPSHOT);
+}
+
+/// Encode a SnapshotBegin message.
+fn encode_snapshot_begin(
+    snapshot_len: u64,
+    snap_sequence: u64,
+    snap_chain_hash: &[u8; 32],
+    buf: &mut Vec<u8>,
+) {
+    // type(1) + snapshot_len(8) + snap_sequence(8) + snap_chain_hash(32)
+    let payload_len: u32 = 1 + 8 + 8 + 32;
+    buf.extend_from_slice(&payload_len.to_le_bytes());
+    buf.push(MSG_SNAPSHOT_BEGIN);
+    buf.extend_from_slice(&snapshot_len.to_le_bytes());
+    buf.extend_from_slice(&snap_sequence.to_le_bytes());
+    buf.extend_from_slice(snap_chain_hash);
+}
+
+/// Encode a SnapshotChunk message.
+fn encode_snapshot_chunk(data: &[u8], buf: &mut Vec<u8>) {
+    // type(1) + data
+    let payload_len: u32 = (1 + data.len()) as u32;
+    buf.extend_from_slice(&payload_len.to_le_bytes());
+    buf.push(MSG_SNAPSHOT_CHUNK);
+    buf.extend_from_slice(data);
+}
+
+/// Encode a SnapshotEnd message.
+fn encode_snapshot_end(crc32c: u32, buf: &mut Vec<u8>) {
+    // type(1) + crc32c(4)
+    let payload_len: u32 = 1 + 4;
+    buf.extend_from_slice(&payload_len.to_le_bytes());
+    buf.push(MSG_SNAPSHOT_END);
+    buf.extend_from_slice(&crc32c.to_le_bytes());
 }
 
 /// Encode a HashMismatch message.
@@ -361,6 +412,31 @@ fn decode_primary_message(payload: &[u8]) -> io::Result<PrimaryMessage> {
         }
         MSG_NEED_SNAPSHOT => Ok(PrimaryMessage::NeedSnapshot),
         MSG_HASH_MISMATCH => Ok(PrimaryMessage::HashMismatch),
+        MSG_SNAPSHOT_BEGIN => {
+            if payload.len() < 1 + 8 + 8 + 32 {
+                return Err(io::Error::other("SnapshotBegin too short"));
+            }
+            let snapshot_len = u64::from_le_bytes(payload[1..9].try_into().unwrap());
+            let snap_sequence = u64::from_le_bytes(payload[9..17].try_into().unwrap());
+            let mut snap_chain_hash = [0u8; 32];
+            snap_chain_hash.copy_from_slice(&payload[17..49]);
+            Ok(PrimaryMessage::SnapshotBegin {
+                snapshot_len,
+                snap_sequence,
+                snap_chain_hash,
+            })
+        }
+        MSG_SNAPSHOT_CHUNK => {
+            let data = payload[1..].to_vec();
+            Ok(PrimaryMessage::SnapshotChunk(data))
+        }
+        MSG_SNAPSHOT_END => {
+            if payload.len() < 1 + 4 {
+                return Err(io::Error::other("SnapshotEnd too short"));
+            }
+            let crc32c = u32::from_le_bytes(payload[1..5].try_into().unwrap());
+            Ok(PrimaryMessage::SnapshotEnd { crc32c })
+        }
         MSG_DATA_BATCH => {
             if payload.len() < 1 + 8 + 32 + 4 {
                 return Err(io::Error::other("DataBatch too short"));
@@ -654,18 +730,28 @@ fn discover_journal_files(journal_path: &std::path::Path) -> Vec<std::path::Path
 /// during catch-up — the ring accumulates live data. The caller must
 /// drain overlapping ring entries after catch-up completes.
 ///
+/// Result of a journal catch-up attempt.
+enum CatchUpResult {
+    /// Catch-up succeeded. Contains the last sequence sent (or the input
+    /// last_sequence if no entries were sent).
+    Ok(u64),
+    /// Replica's last_sequence predates all available journal files.
+    /// The primary must transfer a snapshot instead.
+    NeedSnapshot,
+}
+
 /// Returns the last sequence sent, or 0 if no entries were sent.
 fn catch_up_from_journal(
     journal_path: &std::path::Path,
     last_sequence: u64,
     writer: &mut TcpStream,
     shutdown: &AtomicBool,
-) -> io::Result<u64> {
+) -> io::Result<CatchUpResult> {
     use melin_engine::journal::reader::RawJournalScanner;
 
     let files = discover_journal_files(journal_path);
     if files.is_empty() {
-        return Ok(last_sequence);
+        return Ok(CatchUpResult::Ok(last_sequence));
     }
 
     // Find the first file that contains entries after last_sequence.
@@ -690,12 +776,12 @@ fn catch_up_from_journal(
         }
         if !found {
             // All files start after our target — journal archives were purged.
-            // The replica needs a snapshot transfer (not implemented).
+            // The replica needs a snapshot transfer.
             warn!(
                 last_sequence,
-                "replica's last_sequence predates all available journal files"
+                "replica's last_sequence predates all available journal files — snapshot transfer required"
             );
-            return Err(io::Error::other("journals too old for catch-up"));
+            return Ok(CatchUpResult::NeedSnapshot);
         }
     }
 
@@ -713,7 +799,7 @@ fn catch_up_from_journal(
 
     for path in &files[start_file_idx..] {
         if shutdown.load(Ordering::Relaxed) {
-            return Ok(end_sequence);
+            return Ok(CatchUpResult::Ok(end_sequence));
         }
 
         let mut scanner = RawJournalScanner::open(path)
@@ -730,7 +816,7 @@ fn catch_up_from_journal(
         // Target ~64 KiB per DataBatch frame (~800 entries at ~80 bytes each).
         loop {
             if shutdown.load(Ordering::Relaxed) {
-                return Ok(end_sequence);
+                return Ok(CatchUpResult::Ok(end_sequence));
             }
 
             batch_buf.clear();
@@ -766,7 +852,7 @@ fn catch_up_from_journal(
 
     info!(end_sequence, batches_sent, "journal catch-up complete");
 
-    Ok(end_sequence)
+    Ok(CatchUpResult::Ok(end_sequence))
 }
 
 /// Authenticate a replica connection (primary side).
@@ -916,9 +1002,10 @@ fn handle_replica_connection(
         "replica handshake received"
     );
 
+    let mut send_buf = Vec::with_capacity(128);
+
     // Send StreamStart with the primary's raw genesis entry so the replica
     // can write a byte-identical genesis to its journal.
-    let mut send_buf = Vec::with_capacity(128);
     encode_stream_start(handshake.last_sequence, genesis_entry, &mut send_buf);
     writer.write_all(&send_buf)?;
     writer.flush()?;
@@ -926,14 +1013,98 @@ fn handle_replica_connection(
 
     // Catch up from journal files. Reads the primary's journal archives
     // and current journal, sends historical entries as DataBatch frames.
-    // The replication ring is NOT consumed during catch-up — it accumulates
-    // live data. After catch-up, overlapping ring entries are drained.
-    //
-    // For a fresh replica (last_sequence=0), this streams the entire
-    // journal history. For a reconnecting replica, only the gap since
-    // its last acked sequence.
-    let catchup_end =
+    let catchup_result =
         catch_up_from_journal(journal_path, handshake.last_sequence, &mut writer, shutdown)?;
+
+    let catchup_end = match catchup_result {
+        CatchUpResult::Ok(end) => end,
+        CatchUpResult::NeedSnapshot => {
+            // Replica's state predates all journal archives. Transfer a snapshot.
+            let snap_path = journal_path.with_extension("snapshot");
+            if !snap_path.exists() {
+                error!(
+                    "snapshot transfer requested but no snapshot file at {}",
+                    snap_path.display()
+                );
+                return Err(io::Error::other(
+                    "snapshot transfer required but no snapshot available \
+                     — enable --snapshot-interval-secs or trigger a journal rotation",
+                ));
+            }
+
+            // Send NeedSnapshot to tell the replica to prepare.
+            encode_need_snapshot(&mut send_buf);
+            writer.write_all(&send_buf)?;
+            writer.flush()?;
+            send_buf.clear();
+
+            // Read snapshot file header to get sequence and chain hash.
+            let snap_data = std::fs::read(&snap_path).map_err(|e| {
+                io::Error::other(format!("read snapshot {}: {e}", snap_path.display()))
+            })?;
+            let snap_len = snap_data.len() as u64;
+
+            // Parse header: magic(4) + version(2) + reserved(2) + sequence(8) + chain_hash(32)
+            if snap_data.len() < 48 {
+                return Err(io::Error::other("snapshot file too small for header"));
+            }
+            let snap_sequence = u64::from_le_bytes(snap_data[8..16].try_into().unwrap());
+            let mut snap_chain_hash = [0u8; 32];
+            snap_chain_hash.copy_from_slice(&snap_data[16..48]);
+
+            info!(
+                snap_sequence,
+                snap_len,
+                path = %snap_path.display(),
+                "transferring snapshot to replica"
+            );
+
+            // Send SnapshotBegin.
+            encode_snapshot_begin(snap_len, snap_sequence, &snap_chain_hash, &mut send_buf);
+            writer.write_all(&send_buf)?;
+            writer.flush()?;
+            send_buf.clear();
+
+            // Stream snapshot in 64 KiB chunks.
+            const CHUNK_SIZE: usize = 64 * 1024;
+            let mut offset = 0;
+            while offset < snap_data.len() {
+                let end = (offset + CHUNK_SIZE).min(snap_data.len());
+                encode_snapshot_chunk(&snap_data[offset..end], &mut send_buf);
+                writer.write_all(&send_buf)?;
+                send_buf.clear();
+                offset = end;
+            }
+            writer.flush()?;
+
+            // Send SnapshotEnd with CRC32C of the entire file.
+            // The snapshot file already has a CRC at the end, but we
+            // compute one over the entire file for transfer integrity.
+            let transfer_crc = crc32c::crc32c(&snap_data);
+            encode_snapshot_end(transfer_crc, &mut send_buf);
+            writer.write_all(&send_buf)?;
+            writer.flush()?;
+            send_buf.clear();
+
+            info!(snap_sequence, "snapshot transfer complete");
+
+            // Catch up from the snapshot's sequence using the current journal.
+            // The current journal starts at snap_sequence+1 (rotation boundary).
+            let post_snap_result = catch_up_from_journal(
+                journal_path, snap_sequence, &mut writer, shutdown,
+            )?;
+            match post_snap_result {
+                CatchUpResult::Ok(end) => end,
+                CatchUpResult::NeedSnapshot => {
+                    // This shouldn't happen — we just transferred a snapshot
+                    // and the current journal should cover from snap_sequence.
+                    return Err(io::Error::other(
+                        "catch-up failed even after snapshot transfer",
+                    ));
+                }
+            }
+        }
+    };
 
     // Drain overlapping ring entries — the ring may contain entries that
     // were already sent during catch-up. Only discard entries whose
@@ -1209,7 +1380,94 @@ pub fn run_receiver(
             genesis_entry
         }
         PrimaryMessage::NeedSnapshot => {
-            return Err("primary says we need a snapshot transfer (not yet implemented)".into());
+            // Primary's journal archives don't go back far enough.
+            // Receive a snapshot transfer, then resume streaming.
+            info!("primary requires snapshot transfer — receiving snapshot");
+
+            // Delete stale local state.
+            let _ = std::fs::remove_file(journal_path);
+            let _ = std::fs::remove_file(&snapshot_path);
+
+            // Receive SnapshotBegin.
+            let begin_frame = read_frame(&mut reader, MAX_CONTROL_FRAME)?;
+            let (snap_len, snap_sequence, snap_chain_hash) =
+                match decode_primary_message(&begin_frame)? {
+                    PrimaryMessage::SnapshotBegin {
+                        snapshot_len,
+                        snap_sequence,
+                        snap_chain_hash,
+                    } => (snapshot_len, snap_sequence, snap_chain_hash),
+                    other => {
+                        return Err(
+                            format!("expected SnapshotBegin, got {other:?}").into(),
+                        );
+                    }
+                };
+
+            info!(snap_sequence, snap_len, "receiving snapshot");
+
+            // Receive chunks into a temp file.
+            let tmp_path = snapshot_path.with_extension("snapshot.tmp");
+            {
+                let mut tmp_file = std::fs::File::create(&tmp_path)?;
+                let mut received: u64 = 0;
+                loop {
+                    let chunk_frame = read_frame(&mut reader, MAX_DATA_FRAME)?;
+                    match decode_primary_message(&chunk_frame)? {
+                        PrimaryMessage::SnapshotChunk(data) => {
+                            std::io::Write::write_all(&mut tmp_file, &data)?;
+                            received += data.len() as u64;
+                        }
+                        PrimaryMessage::SnapshotEnd { crc32c: expected_crc } => {
+                            tmp_file.sync_all()?;
+                            drop(tmp_file);
+
+                            // Verify CRC over the received file.
+                            let file_data = std::fs::read(&tmp_path)?;
+                            let actual_crc = crc32c::crc32c(&file_data);
+                            if actual_crc != expected_crc {
+                                let _ = std::fs::remove_file(&tmp_path);
+                                return Err(format!(
+                                    "snapshot CRC mismatch: expected {expected_crc:#x}, got {actual_crc:#x}"
+                                ).into());
+                            }
+
+                            // Rename temp to final.
+                            std::fs::rename(&tmp_path, &snapshot_path)?;
+                            info!(
+                                snap_sequence,
+                                received,
+                                "snapshot received and verified"
+                            );
+                            break;
+                        }
+                        other => {
+                            let _ = std::fs::remove_file(&tmp_path);
+                            return Err(
+                                format!("expected SnapshotChunk/End, got {other:?}").into(),
+                            );
+                        }
+                    }
+                }
+            }
+
+            // Load the snapshot.
+            let (snap_exchange, snap_seq, snap_hash) =
+                melin_engine::journal::snapshot::load(&snapshot_path)?;
+            exchange = Some(snap_exchange);
+
+            // Create a fresh journal continuing from the snapshot point.
+            let writer = JournalWriter::create_continuing(
+                journal_path,
+                snap_seq + 1,
+                snap_hash,
+            )?;
+            journal_writer = Some(writer);
+
+            // Fall through to the DataBatch loop. The primary will catch up
+            // from snap_sequence using the current journal and send DataBatch
+            // frames, followed by live streaming.
+            Vec::new() // genesis_entry not needed
         }
         PrimaryMessage::HashMismatch => {
             return Err("chain hash mismatch — replica has divergent history".into());
@@ -1476,6 +1734,11 @@ pub fn run_receiver(
             }
             PrimaryMessage::HashMismatch => {
                 return Err("chain hash mismatch from primary".into());
+            }
+            PrimaryMessage::SnapshotBegin { .. }
+            | PrimaryMessage::SnapshotChunk(_)
+            | PrimaryMessage::SnapshotEnd { .. } => {
+                debug!("unexpected snapshot message during streaming");
             }
         }
     }
@@ -2818,5 +3081,57 @@ mod tests {
         p_writer.flush().unwrap();
 
         replica_handle.join().unwrap();
+    }
+
+    #[test]
+    fn snapshot_begin_encode_decode_round_trip() {
+        let mut buf = Vec::new();
+        encode_snapshot_begin(1_000_000, 42, &[0xAB; 32], &mut buf);
+
+        let payload = &buf[4..];
+        let msg = decode_primary_message(payload).unwrap();
+        match msg {
+            PrimaryMessage::SnapshotBegin {
+                snapshot_len,
+                snap_sequence,
+                snap_chain_hash,
+            } => {
+                assert_eq!(snapshot_len, 1_000_000);
+                assert_eq!(snap_sequence, 42);
+                assert_eq!(snap_chain_hash, [0xAB; 32]);
+            }
+            _ => panic!("expected SnapshotBegin"),
+        }
+    }
+
+    #[test]
+    fn snapshot_chunk_encode_decode_round_trip() {
+        let data = vec![1, 2, 3, 4, 5, 6, 7, 8];
+        let mut buf = Vec::new();
+        encode_snapshot_chunk(&data, &mut buf);
+
+        let payload = &buf[4..];
+        let msg = decode_primary_message(payload).unwrap();
+        match msg {
+            PrimaryMessage::SnapshotChunk(chunk) => {
+                assert_eq!(chunk, data);
+            }
+            _ => panic!("expected SnapshotChunk"),
+        }
+    }
+
+    #[test]
+    fn snapshot_end_encode_decode_round_trip() {
+        let mut buf = Vec::new();
+        encode_snapshot_end(0xDEADBEEF, &mut buf);
+
+        let payload = &buf[4..];
+        let msg = decode_primary_message(payload).unwrap();
+        match msg {
+            PrimaryMessage::SnapshotEnd { crc32c } => {
+                assert_eq!(crc32c, 0xDEADBEEF);
+            }
+            _ => panic!("expected SnapshotEnd"),
+        }
     }
 }
