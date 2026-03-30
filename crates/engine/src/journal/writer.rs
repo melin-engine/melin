@@ -198,6 +198,32 @@ impl JournalWriter {
 
         let write_pos = FILE_HEADER_SIZE as u64;
         let allocated_end = preallocate(&file, write_pos)?;
+
+        // Pre-fault all pages in the preallocated region so the first write
+        // to each 4 KB page doesn't trigger a page fault on the hot path.
+        // MADV_POPULATE_WRITE forces the kernel to allocate and zero-fill
+        // pages now (startup cost ~10-30ms for 256 MB) instead of lazily
+        // during io_uring writes where a fault adds 10-100µs tail latency.
+        #[cfg(target_os = "linux")]
+        {
+            use std::os::unix::io::AsRawFd;
+            let ptr = unsafe {
+                libc::mmap(
+                    std::ptr::null_mut(),
+                    allocated_end as libc::size_t,
+                    libc::PROT_WRITE,
+                    libc::MAP_SHARED,
+                    file.as_raw_fd(),
+                    0,
+                )
+            };
+            if ptr != libc::MAP_FAILED {
+                // MADV_POPULATE_WRITE (23) pre-faults pages for writing.
+                unsafe { libc::madvise(ptr, allocated_end as libc::size_t, 23) };
+                unsafe { libc::munmap(ptr, allocated_end as libc::size_t) };
+            }
+        }
+
         file.sync_all()?;
 
         Ok(Self {

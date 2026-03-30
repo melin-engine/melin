@@ -69,10 +69,10 @@ fn idle_wait(idle_spins: &mut u32, busy_spin: bool) {
 /// Maximum events consumed per disruptor batch in the matching stage.
 /// Amortizes one atomic Release store over N events. Keep small to avoid
 /// burstiness that causes the response stage to wait on the journal cursor.
-/// Benchmarked: 32 is the sweet spot — lower values underperform due to
-/// consume_batch overhead, higher values (64+) add burstiness with no
-/// throughput gain. At ~100 ns/event, 32 events = ~3.2 µs burst.
-const MAX_MATCHING_BATCH: usize = 32;
+/// 16 events × ~100 ns/event = ~1.6 µs worst-case batch queuing jitter.
+/// Halved from 32 to reduce tail latency at the cost of 2x more atomic
+/// stores per second (~5-8ns each, negligible at this batch size).
+const MAX_MATCHING_BATCH: usize = 16;
 
 /// Slot in the input disruptor ring buffer.
 ///
