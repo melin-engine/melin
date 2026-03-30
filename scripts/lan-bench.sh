@@ -93,7 +93,7 @@ REPO_DIR="~/workspace/trading"
 JOURNAL_PATH="${JOURNAL_PATH:-/mnt/journal/bench.journal}"
 SNAPSHOT_PATH="${SNAPSHOT_PATH:-/mnt/journal/bench.snapshot}"
 BIND_ADDR="${SERVER_VLAN}:9876"
-HEALTH_ADDR="${SERVER_VLAN}:9877"
+HEALTH_ADDR="${SERVER_VLAN}:9878"
 CARGO_BUILD_FLAGS="${CARGO_BUILD_FLAGS:---release}"
 
 echo "=== LAN Benchmark ==="

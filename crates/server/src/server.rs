@@ -197,7 +197,7 @@ pub struct ServerConfig {
     /// Address for the health/liveness TCP endpoint. On connect, returns
     /// a one-line status (`OK <conns> <journal_seq> <repl_lag>\n`) and
     /// closes. No auth required. Set to empty string to disable.
-    #[arg(long, default_value = "127.0.0.1:9877")]
+    #[arg(long, default_value = "127.0.0.1:9878")]
     pub health_bind: Option<SocketAddr>,
 
     /// TCP address for the promotion trigger endpoint (replica only).
@@ -266,7 +266,7 @@ impl Default for ServerConfig {
             dpdk_mtu: 1500,
             dpdk_vlan: None,
             event_bind: None,
-            health_bind: Some("127.0.0.1:9877".parse().expect("valid default addr")),
+            health_bind: Some("127.0.0.1:9878".parse().expect("valid default addr")),
             promote_bind: None,
             snapshot_interval_secs: 0,
             snapshot_path: None,

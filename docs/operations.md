@@ -52,7 +52,7 @@ The server uses jemalloc by default (thread-local caches eliminate allocator loc
 | `--connection-timeout-secs` | `30` | Seconds before disconnecting silent clients. `0` to disable. |
 | `--max-connections` | `1024` | Maximum concurrent authenticated connections. `0` for unlimited. Rejects new connections at the limit. |
 | `--yield-idle` | `false` | Yield to OS scheduler when pipeline threads are idle instead of busy-spinning. Use on shared machines without isolated cores. |
-| `--health-bind` | `127.0.0.1:9877` | Address for the health/liveness TCP endpoint. Returns `OK\|ERR <conns> <seq> <lag>`. Omit to disable. |
+| `--health-bind` | `127.0.0.1:9878` | Address for the health/liveness TCP endpoint. Returns `OK\|ERR <conns> <seq> <lag>`. Omit to disable. |
 | `--event-bind` | (none) | Address for the output event publisher. Subscribers connect to receive all execution events in real time (market data, fills, cancellations). Ed25519 auth required. Omit to disable. See [Output Event Channel](#output-event-channel). |
 | `--snapshot-interval-secs` | `0` | Interval in seconds for automatic snapshots via the shadow exchange. `0` = disabled (startup-only snapshots). When enabled, a shadow exchange replays events on a separate thread and takes periodic snapshots without pausing the primary matching engine. See [Scheduled Snapshots](#scheduled-snapshots). |
 | `--snapshot-path` | (derived) | Path for snapshot files. Defaults to journal path with `.snapshot` extension. **Recommended: place on the OS disk, not the journal NVMe, to avoid I/O jitter on the hot path.** |
@@ -86,7 +86,7 @@ The server supports synchronous replication. Exactly one of `--replication-bind`
 ```sh
 ./target/release/melin-server \
     --bind 0.0.0.0:9876 \
-    --health-bind 0.0.0.0:9877 \
+    --health-bind 0.0.0.0:9878 \
     --journal /mnt/nvme/trading.journal \
     --authorized-keys /etc/trading/authorized_keys \
     --cores 1,2,3,6,7,8 \
@@ -102,7 +102,7 @@ The server supports synchronous replication. Exactly one of `--replication-bind`
 # Primary
 ./target/release/melin-server \
     --bind 0.0.0.0:9876 \
-    --health-bind 0.0.0.0:9877 \
+    --health-bind 0.0.0.0:9878 \
     --journal /mnt/nvme/trading.journal \
     --authorized-keys /etc/trading/authorized_keys \
     --cores 1,2,3,6,7,8 \
@@ -125,7 +125,7 @@ The event channel provides a real-time firehose of all execution events (fills, 
 ```sh
 ./target/release/melin-server \
     --bind 0.0.0.0:9876 \
-    --health-bind 0.0.0.0:9877 \
+    --health-bind 0.0.0.0:9878 \
     --event-bind 0.0.0.0:9879 \
     --journal /mnt/nvme/trading.journal \
     --authorized-keys /etc/trading/authorized_keys \
@@ -510,7 +510,7 @@ systemctl disable --now irqbalance
 
 ### Health/Liveness Endpoint
 
-Dedicated health port (default `127.0.0.1:9877`). Supports three modes:
+Dedicated health port (default `127.0.0.1:9878`). Supports three modes:
 
 1. **Plain TCP** (no data sent): writes a one-line status and closes — backward-compatible with `nc` and Kubernetes TCP probes.
 2. **HTTP `GET /`**: wraps the one-line status in an HTTP 200 response.
@@ -527,10 +527,10 @@ nc 127.0.0.1 9877
 OK 42 1234567 0 trading
 
 # HTTP health check
-curl http://127.0.0.1:9877/
+curl http://127.0.0.1:9878/
 
 # Prometheus metrics
-curl http://127.0.0.1:9877/metrics
+curl http://127.0.0.1:9878/metrics
 ```
 
 **Plain-text response format**: `OK|ERR <active_connections> <journal_seq> <replication_lag> trading|halted\n`
@@ -543,7 +543,7 @@ curl http://127.0.0.1:9877/metrics
 | `replication_lag` | `journal_seq - replication_cursor` (0 in standalone mode) |
 | `trading` / `halted` | `trading` when accepting orders; `halted` when replica is disconnected (replication mode only) |
 
-**Configuration**: `--health-bind <addr:port>` (default `127.0.0.1:9877`). Omit the flag to disable.
+**Configuration**: `--health-bind <addr:port>` (default `127.0.0.1:9878`). Omit the flag to disable.
 
 **Kubernetes**: Use as a TCP liveness probe on the health port. For basic liveness, check TCP connect success. For readiness, parse the first and last tokens and require `OK` + `trading`.
 
@@ -552,7 +552,7 @@ curl http://127.0.0.1:9877/metrics
 The `/metrics` endpoint exposes counters in Prometheus text exposition format. Zero new dependencies — the response is built from a hardcoded template.
 
 ```sh
-curl http://127.0.0.1:9877/metrics
+curl http://127.0.0.1:9878/metrics
 # HELP melin_active_connections Current authenticated client connections.
 # TYPE melin_active_connections gauge
 melin_active_connections 42
@@ -597,7 +597,7 @@ scrape_configs:
   - job_name: melin
     scrape_interval: 10s
     static_configs:
-      - targets: ['127.0.0.1:9877']
+      - targets: ['127.0.0.1:9878']
 ```
 
 ### Halt on Replica Disconnect
