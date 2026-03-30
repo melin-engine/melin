@@ -383,8 +383,6 @@ pub struct RawJournalScanner {
     pos: usize,
     /// Number of valid bytes in `buf`.
     valid: usize,
-    /// Journal format version from the file header.
-    version: u16,
 }
 
 impl RawJournalScanner {
@@ -393,14 +391,15 @@ impl RawJournalScanner {
         let mut file = File::open(path)?;
         let mut header = [0u8; FILE_HEADER_SIZE];
         file.read_exact(&mut header)?;
-        let version = codec::decode_file_header(&header)?;
+        // Validate header (version check) but don't store version —
+        // the scanner only reads entry boundaries, not event payloads.
+        let _version = codec::decode_file_header(&header)?;
 
         Ok(Self {
             file,
             buf: vec![0u8; 64 * 1024], // 64 KiB read buffer
             pos: 0,
             valid: 0,
-            version,
         })
     }
 

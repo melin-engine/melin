@@ -107,15 +107,11 @@ A server started with `--replica-of <primary_addr>` runs in replica mode:
 
 These are known limitations of the current implementation. Each is documented here with the reason it was deferred and the plan for resolution.
 
-### No catch-up from journal files
+### ~~No catch-up from journal files~~ (IMPLEMENTED)
 
-**What**: When a replica connects with `last_sequence` behind the primary's live stream, the primary does NOT read historical entries from the journal file. It starts streaming from the live feed only.
+When a replica connects with `last_sequence > 0` (has existing state from a previous connection or a journal file copy), the primary reads its journal archive files and streams historical entries as DataBatch frames before switching to live ring data. The `RawJournalScanner` reads entry boundaries without full decoding (no CRC validation, no event parsing) for efficient streaming.
 
-**Impact**: A replica must be connected from the start (or from a point where the live stream covers all missed events). A late-joining replica that missed events while disconnected will have a gap.
-
-**Why deferred**: Catch-up requires reading from potentially rotated journal files (`.1`, `.2` archives) and coordinating the transition from historical to live streaming. This is substantial complexity that doesn't block the core replication mechanism.
-
-**Resolution**: Read from `JournalReader` on the primary side during handshake when `replica.last_sequence < earliest_live_sequence`. Stream historical entries as DataBatch frames, then switch to the live channel.
+**Fresh replica deployment**: copy the primary's journal file to the replica first (`cp` while the primary is running — writes use `pwritev2` with `RWF_DSYNC`, reads are consistent), then start the replica. It recovers from the copy, connects with a non-zero `last_sequence`, and catch-up fills the small gap. Fresh replicas without a journal copy (`last_sequence=0`) receive all data via live ring streaming.
 
 ### No chain hash verification on received DataBatch
 
@@ -171,10 +167,6 @@ The primary's raw genesis entry bytes (including the original timestamp) are sen
 
 ## Future Work
 
-- **Catch-up from journal files** — see limitation above
 - **Chain hash verification** — see limitation above
-- **Snapshot transfer**: When a replica is too far behind for journal catch-up (journal rotated away), the primary transfers a snapshot + remaining journal.
-- **Manual promotion**: An operator command to promote a replica to primary (stop replication, start accepting clients).
 - **Automatic failover**: Leader election / consensus for automatic promotion. Requires fencing to prevent split-brain.
-- **Multi-replica**: Accept N replica connections, gate on a quorum.
 - **Async replication**: Optional mode where the response stage does not gate on the replication cursor (lower latency, data loss window).

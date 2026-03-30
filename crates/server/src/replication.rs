@@ -738,13 +738,28 @@ fn handle_replica_connection(
     };
 
     // Drain overlapping ring entries — the ring may contain entries that
-    // were already sent during catch-up.
+    // were already sent during catch-up. Only discard entries whose
+    // end_sequence is fully covered by the catch-up. Entries beyond
+    // catch-up are left in the ring for the live streaming loop.
     if catchup_end > 0 {
         while let Some((meta, _data)) = repl_consumer.try_read() {
-            repl_consumer.commit();
             if meta.end_sequence > catchup_end {
+                // This batch has new data beyond catch-up. Send it now
+                // and commit so the live loop starts clean.
+                encode_data_batch(
+                    meta.end_sequence,
+                    &meta.chain_hash,
+                    meta.entry_count,
+                    _data,
+                    &mut send_buf,
+                );
+                repl_consumer.commit();
+                writer.write_all(&send_buf)?;
+                writer.flush()?;
+                send_buf.clear();
                 break;
             }
+            repl_consumer.commit();
         }
     }
 
