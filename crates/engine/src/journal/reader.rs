@@ -59,10 +59,14 @@ pub struct JournalReader {
 }
 
 /// Hash chain state maintained by the reader for verification.
+/// Uses the same batch-level hashing as the writer: entry bytes are fed
+/// into an incremental hasher, finalized at checkpoints.
 #[cfg(feature = "hash-chain")]
 struct ReaderHashChain {
-    /// Current running hash (recomputed from entry bytes during replay).
+    /// Chain hash from the last checkpoint (or genesis).
     current_hash: [u8; 32],
+    /// Incremental hasher accumulating entry bytes since last checkpoint.
+    batch_hasher: blake3::Hasher,
     /// Events since last checkpoint (for verification against Checkpoint entries).
     events_since_checkpoint: u64,
 }
@@ -198,6 +202,7 @@ impl JournalReader {
                 let genesis_hash = blake3::hash(&self.buffer[self.pos..entry_bytes_end]);
                 self.hash_chain = Some(ReaderHashChain {
                     current_hash: *genesis_hash.as_bytes(),
+                    batch_hasher: blake3::Hasher::new(),
                     events_since_checkpoint: 0,
                 });
                 self.last_sequence = Some(sequence);
@@ -206,18 +211,25 @@ impl JournalReader {
                 return self.next_entry();
             }
 
-            // Checkpoint: verify hash, then hash the checkpoint itself.
+            // Checkpoint: finalize accumulated batch hash and verify against
+            // the checkpoint's recorded hash.
             if let JournalEvent::Checkpoint {
                 chain_hash,
                 events_since_checkpoint,
             } = &event
             {
-                if let Some(chain) = &self.hash_chain {
-                    if chain.current_hash != *chain_hash {
+                if let Some(chain) = &mut self.hash_chain {
+                    // Finalize: feed the checkpoint entry bytes + previous
+                    // chain hash, then compare with the recorded hash.
+                    chain.batch_hasher.update(&self.buffer[self.pos..entry_bytes_end]);
+                    chain.batch_hasher.update(&chain.current_hash);
+                    let computed = *chain.batch_hasher.finalize().as_bytes();
+
+                    if computed != *chain_hash {
                         return Err(JournalError::HashChainMismatch {
                             sequence,
                             expected: *chain_hash,
-                            actual: chain.current_hash,
+                            actual: computed,
                         });
                     }
                     if chain.events_since_checkpoint != *events_since_checkpoint {
@@ -226,12 +238,9 @@ impl JournalReader {
                             reason: "checkpoint event count mismatch",
                         });
                     }
-                }
-                if let Some(chain) = &mut self.hash_chain {
-                    let mut hasher = blake3::Hasher::new();
-                    hasher.update(&self.buffer[self.pos..entry_bytes_end]);
-                    hasher.update(&chain.current_hash);
-                    chain.current_hash = *hasher.finalize().as_bytes();
+
+                    chain.current_hash = computed;
+                    chain.batch_hasher = blake3::Hasher::new();
                     chain.events_since_checkpoint = 0;
                 }
                 self.last_sequence = Some(sequence);
@@ -240,12 +249,9 @@ impl JournalReader {
                 return self.next_entry();
             }
 
-            // Normal event: update hash chain.
+            // Normal event: feed bytes into incremental batch hasher.
             if let Some(chain) = &mut self.hash_chain {
-                let mut hasher = blake3::Hasher::new();
-                hasher.update(&self.buffer[self.pos..entry_bytes_end]);
-                hasher.update(&chain.current_hash);
-                chain.current_hash = *hasher.finalize().as_bytes();
+                chain.batch_hasher.update(&self.buffer[self.pos..entry_bytes_end]);
                 chain.events_since_checkpoint += 1;
             }
         }
@@ -319,6 +325,7 @@ impl JournalReader {
             }
             self.hash_chain = Some(ReaderHashChain {
                 current_hash: chain_hash,
+                batch_hasher: blake3::Hasher::new(),
                 events_since_checkpoint: 0,
             });
         }

@@ -95,10 +95,20 @@ pub struct JournalWriter {
 }
 
 /// Running BLAKE3 hash chain state for tamper evidence.
+///
+/// Uses batch-level hashing for performance: entry bytes are fed into an
+/// incremental hasher during `batch_append`, and finalized once per batch
+/// during `flush_batch_sync`. This amortizes the finalize + chain
+/// concatenation cost across ~4096 entries per batch.
+///
+/// Chain: `hash_n = BLAKE3(batch_bytes || hash_{n-1})` where batch_bytes
+/// is the concatenation of all entry bytes (excluding CRCs) in the batch.
 #[cfg(feature = "hash-chain")]
 struct HashChain {
-    /// Current chain hash: `hash_n = BLAKE3(encoded_bytes || hash_{n-1})`.
+    /// Previous batch's chain hash, concatenated with batch bytes at finalize.
     current_hash: [u8; 32],
+    /// Incremental hasher accumulating entry bytes for the current batch.
+    batch_hasher: blake3::Hasher,
     /// Events since last checkpoint. When this reaches `CHECKPOINT_INTERVAL`,
     /// a Checkpoint entry is auto-emitted.
     events_since_checkpoint: u64,
@@ -165,6 +175,7 @@ impl JournalWriter {
         let hash = blake3::hash(entry_bytes);
         writer.hash_chain = Some(HashChain {
             current_hash: *hash.as_bytes(),
+            batch_hasher: blake3::Hasher::new(),
             events_since_checkpoint: 0,
         });
 
@@ -276,6 +287,7 @@ impl JournalWriter {
             #[cfg(feature = "hash-chain")]
             hash_chain: chain_hash.map(|h| HashChain {
                 current_hash: h,
+                batch_hasher: blake3::Hasher::new(),
                 events_since_checkpoint,
             }),
         })
@@ -336,15 +348,12 @@ impl JournalWriter {
             &mut self.buffer,
         )?;
 
-        // Update the BLAKE3 hash chain: hash entry bytes (excluding CRC)
-        // concatenated with the previous hash. ~15-30ns for ~112 bytes.
+        // Feed entry bytes (excluding CRC) into the batch hasher.
+        // No finalize here — that happens once per batch in flush_batch_sync.
         #[cfg(feature = "hash-chain")]
         if let Some(chain) = &mut self.hash_chain {
             let entry_bytes_len = written - 4; // exclude 4-byte CRC
-            let mut hasher = blake3::Hasher::new();
-            hasher.update(&self.buffer[..entry_bytes_len]);
-            hasher.update(&chain.current_hash);
-            chain.current_hash = *hasher.finalize().as_bytes();
+            chain.batch_hasher.update(&self.buffer[..entry_bytes_len]);
             chain.events_since_checkpoint += 1;
         }
 
@@ -352,11 +361,17 @@ impl JournalWriter {
         self.next_sequence += 1;
 
         // Auto-emit a checkpoint if we've hit the interval.
+        // Finalize the batch hasher to get the current hash (including all
+        // entries accumulated since the last flush/checkpoint).
         #[cfg(feature = "hash-chain")]
-        if let Some(chain) = &self.hash_chain
+        if let Some(chain) = &mut self.hash_chain
             && chain.events_since_checkpoint >= CHECKPOINT_INTERVAL
         {
-            let checkpoint_hash = chain.current_hash;
+            // Finalize accumulated entries + previous chain hash.
+            chain.batch_hasher.update(&chain.current_hash);
+            let checkpoint_hash = *chain.batch_hasher.finalize().as_bytes();
+            chain.current_hash = checkpoint_hash;
+            chain.batch_hasher = blake3::Hasher::new();
             let count = chain.events_since_checkpoint;
             self.emit_checkpoint(checkpoint_hash, count)?;
         }
@@ -379,13 +394,10 @@ impl JournalWriter {
         let ts = wall_clock_nanos();
         let written = codec::encode(seq, ts, 0, 0, &checkpoint, &mut self.buffer)?;
 
-        // Hash the checkpoint entry itself into the chain for continuity.
+        // Feed checkpoint entry into the batch hasher for continuity.
         if let Some(chain) = &mut self.hash_chain {
             let entry_bytes_len = written - 4;
-            let mut hasher = blake3::Hasher::new();
-            hasher.update(&self.buffer[..entry_bytes_len]);
-            hasher.update(&chain.current_hash);
-            chain.current_hash = *hasher.finalize().as_bytes();
+            chain.batch_hasher.update(&self.buffer[..entry_bytes_len]);
             chain.events_since_checkpoint = 0;
         }
 
@@ -434,6 +446,16 @@ impl JournalWriter {
             self.file.write_all_at(&self.batch_buf, self.write_pos)?;
         }
 
+        // Finalize the batch hash chain. Concatenate the previous chain hash
+        // with the accumulated entry bytes and produce the new chain hash.
+        // One finalize per batch (~4096 entries) instead of per entry.
+        #[cfg(feature = "hash-chain")]
+        if let Some(chain) = &mut self.hash_chain {
+            chain.batch_hasher.update(&chain.current_hash);
+            chain.current_hash = *chain.batch_hasher.finalize().as_bytes();
+            chain.batch_hasher = blake3::Hasher::new();
+        }
+
         self.write_pos += self.batch_buf.len() as u64;
         self.batch_buf.clear();
         Ok(())
@@ -457,6 +479,14 @@ impl JournalWriter {
             return Ok(None);
         }
         self.ensure_allocated(self.batch_buf.len() as u64)?;
+
+        // Finalize batch hash before handing off the buffer.
+        #[cfg(feature = "hash-chain")]
+        if let Some(chain) = &mut self.hash_chain {
+            chain.batch_hasher.update(&chain.current_hash);
+            chain.current_hash = *chain.batch_hasher.finalize().as_bytes();
+            chain.batch_hasher = blake3::Hasher::new();
+        }
 
         let offset = self.write_pos;
         self.write_pos += self.batch_buf.len() as u64;
