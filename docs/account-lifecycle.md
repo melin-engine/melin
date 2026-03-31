@@ -8,17 +8,17 @@ At 1M accounts x 200 currencies x 16 bytes = **3.2 GB for balances alone**. This
 
 ## Solution
 
-Replace flat `Vec` with sparse `FxHashMap`:
+Replace flat `Vec` with sparse `HashMap` (via `astenn` extendible hashing — grows one bucket at a time, no full-table rehash spikes):
 
-- **Balances**: `FxHashMap<(AccountId, CurrencyId), Balance>` — only accounts with non-zero balances consume memory
-- **Order ID HWM**: `FxHashMap<AccountId, u64>` — only accounts that have submitted orders
-- **Order counts**: `FxHashMap<AccountId, u32>` — tracks resting orders per account for withdrawal safety
+- **Balances**: `HashMap<(AccountId, CurrencyId), Balance>` — only accounts with non-zero balances consume memory
+- **Order ID HWM**: `HashMap<AccountId, u64>` — only accounts that have submitted orders
+- **Order counts**: `HashMap<AccountId, u32>` — tracks resting orders per account for withdrawal safety
 
 The reservation slab (`Vec<Reservation>` with free list) remains unchanged — it's indexed by opaque `ReservationSlot(u32)`, not by account ID, and is already efficiently managed.
 
 ### Performance tradeoff
 
-FxHashMap lookups (~20-50ns) are slower than flat Vec indexing (~1-3ns). With 4+ balance lookups per order, this adds ~80-200ns to the hot path. The engine moves from ~77ns/order to ~200-300ns/order — still sub-microsecond, still faster than any competing product.
+`astenn::HashMap` lookups (~20-50ns) are slower than flat Vec indexing (~1-3ns), but unlike `FxHashMap` (hashbrown), growth is amortized — each insert that triggers growth only touches entries in the splitting bucket, not the entire table. This trades ~19% throughput regression for predictable, spike-free latency. With 4+ balance lookups per order, the engine is still sub-microsecond per order.
 
 The self-contained design (no gateway cooperation needed for correctness) is the right commercial tradeoff.
 

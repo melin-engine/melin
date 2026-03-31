@@ -14,14 +14,16 @@ melin-keygen <name> <permission>
 
 **Permissions** are one of:
 
-- `admin` -- full access (instrument setup, deposits, risk config, trading)
-- `trader` -- trading operations only
-- `readonly` -- observation only
+- `operator` -- exchange configuration (instruments, risk limits, circuit breakers, fee schedules, lifecycle management)
+- `trader` -- trading operations (submit, cancel, cancel-replace, cancel-all)
+- `custodian` -- fund management (deposit, withdraw)
+- `readonly` -- observation only (heartbeats)
+- `replication` -- replica-to-primary connections only
 
 **Example:**
 
 ```sh
-melin-keygen ops admin
+melin-keygen ops operator
 ```
 
 This produces two files and prints instructions to stdout:
@@ -39,7 +41,7 @@ Generated keypair:
   Public key:  ops.pub
 
 Add this line to your authorized_keys file:
-  admin AAAA...base64...== ops
+  operator AAAA...base64...== ops
 ```
 
 Copy that last line into the server's `authorized_keys` file before starting the server. The tool refuses to overwrite an existing `.key` file to prevent accidental key loss.
@@ -92,24 +94,30 @@ The screen is divided into three regions:
 
 The main action menu lists all operations, grouped by category:
 
-| # | Action | Category |
-|---|--------|----------|
-| 0 | Limit Buy | Trading |
-| 1 | Limit Sell | Trading |
-| 2 | Market Buy | Trading |
-| 3 | Market Sell | Trading |
-| 4 | Stop Buy | Trading |
-| 5 | Stop Sell | Trading |
-| 6 | Stop-Limit Buy | Trading |
-| 7 | Stop-Limit Sell | Trading |
-| 8 | Cancel Order | Cancel / Amend |
-| 9 | Cancel All | Cancel / Amend |
-| 10 | Cancel-Replace | Cancel / Amend |
-| 11 | Add Instrument | Admin |
-| 12 | Deposit | Admin |
-| 13 | Set Risk Limits | Admin |
-| 14 | Set Circuit Breaker | Admin |
-| 15 | Set Fee Schedule | Admin |
+| # | Action | Category | Permission |
+|---|--------|----------|------------|
+| 0 | Limit Buy | Trading | Trader |
+| 1 | Limit Sell | Trading | Trader |
+| 2 | Market Buy | Trading | Trader |
+| 3 | Market Sell | Trading | Trader |
+| 4 | Stop Buy | Trading | Trader |
+| 5 | Stop Sell | Trading | Trader |
+| 6 | Stop-Limit Buy | Trading | Trader |
+| 7 | Stop-Limit Sell | Trading | Trader |
+| 8 | Cancel Order | Cancel / Amend | Trader |
+| 9 | Cancel All | Cancel / Amend | Trader |
+| 10 | Cancel-Replace | Cancel / Amend | Trader |
+| 11 | Add Instrument | Admin | Operator |
+| 12 | Deposit | Admin | Custodian |
+| 13 | Set Risk Limits | Admin | Operator |
+| 14 | Set Circuit Breaker | Admin | Operator |
+| 15 | Set Fee Schedule | Admin | Operator |
+| 16 | Withdraw | Admin | Custodian |
+| 17 | Disable Instrument | Admin | Operator |
+| 18 | Enable Instrument | Admin | Operator |
+| 19 | Remove Instrument | Admin | Operator |
+| 20 | End of Day | Admin | Operator |
+| 21 | Expire Orders | Admin | Operator |
 
 Navigate with arrow keys and press Enter to start the corresponding wizard.
 
@@ -276,10 +284,10 @@ When halted, all new orders for that instrument are rejected with `trading halte
 Configures per-instrument maker/taker fees.
 
 1. **Symbol ID** -- which instrument.
-2. **Maker Fee** -- fee in basis points (0-10000). A value of `0` means no maker fee. `10` means 0.10%.
-3. **Taker Fee** -- fee in basis points (0-10000).
+2. **Maker Fee** -- fee in basis points (-10000 to 10000). A value of `0` means no maker fee. `10` means 0.10%. Negative values are rebates (exchange pays the maker).
+3. **Taker Fee** -- fee in basis points (-10000 to 10000).
 
-Fees are applied at fill time and reported in the execution report. Both values are non-negative integers (0-10000 bps). Maker rebates (negative fees) are not currently supported.
+Fees are applied at fill time and reported in the execution report. Both values are signed integers (-10000 to 10000 bps). Negative values represent rebates -- the exchange credits the maker/taker instead of charging them. Collected fees are credited to the fee collection account (AccountId 0).
 
 ## Live Dashboard
 
@@ -327,7 +335,7 @@ The log retains up to 10,000 entries before pruning older messages.
 ## Typical Workflow: Setting Up a New Market
 
 ```
-1. Generate keys:         melin-keygen ops admin
+1. Generate keys:         melin-keygen ops operator
 2. Add key to server:     (append authorized_keys line to server config)
 3. Start the server:      melin-server --addr 0.0.0.0:9000 ...
 4. Connect admin:         melin-admin 127.0.0.1:9000 ops.key

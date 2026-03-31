@@ -136,7 +136,13 @@ If any check fails, the original order remains untouched on the book with its or
 | `PriceWouldCross` | Cancel-replace: new price would cross the opposite best price. |
 | `NoLiquidity` | Market order with no liquidity on the opposite side. |
 | `FOKCannotFill` | Fill-or-Kill order cannot be fully filled. |
-| `SelfTradePrevented` | Self-trade prevention triggered: order would match against the same account. |
+| `SelfTradePrevented` | Self-trade prevention triggered — order would match against the same account. |
+| `PostOnlyWouldCross` | Post-only limit order would immediately match against resting liquidity. |
+| `HasRestingOrders` | Withdrawal rejected — account has resting orders (must CancelAll first). |
+| `DuplicateRequest` | Per-key request sequence already processed (idempotency dedup). |
+| `ReplicaDisconnected` | Replication is enabled but all replicas are disconnected — state-mutating operations blocked. |
+| `InvalidExpiry` | GTD order with missing expiry, or non-GTD order with unexpected expiry. |
+| `InstrumentDisabled` | Instrument is disabled — no new orders or amendments accepted. |
 
 ## Configuration
 

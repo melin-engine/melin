@@ -51,14 +51,14 @@ SR-IOV VF creation, driver binding, hugepages, and MTU are all runtime state —
 **On the server:**
 ```sh
 ssh root@SERVER
-cd ~/workspace/trading
+cd ~/workspace/melin
 sudo ./scripts/dpdk-setup-sriov.sh
 ```
 
 **On the bench machine** (if using DPDK bench client):
 ```sh
 ssh root@BENCH
-cd ~/workspace/trading
+cd ~/workspace/melin
 sudo ./scripts/dpdk-setup-sriov.sh
 ```
 
@@ -73,14 +73,14 @@ grep -i huge /proc/meminfo              # hugepages allocated
 
 **On the server:**
 ```sh
-cd ~/workspace/trading
+cd ~/workspace/melin
 git pull
 cargo build --release -p melin-server --features dpdk --no-default-features
 ```
 
 **On the bench machine:**
 ```sh
-cd ~/workspace/trading
+cd ~/workspace/melin
 git pull
 # Kernel TCP bench (no DPDK needed):
 cargo build --release --bin melin-bench
@@ -94,20 +94,20 @@ cargo build --release -p melin-bench --features dpdk --no-default-features
 Generate on the bench machine, copy to the server:
 ```sh
 # On bench:
-cd ~/workspace/trading
+cd ~/workspace/melin
 cargo run --release --bin melin-keygen -- bench trader
 # Creates bench.key (private) and bench.pub (public)
 
 # Copy public key to server's authorized_keys:
-scp bench.pub root@SERVER:~/workspace/trading/
-ssh root@SERVER "cd ~/workspace/trading && echo 'trader $(cat bench.pub) bench' > authorized_keys"
+scp bench.pub root@SERVER:~/workspace/melin/
+ssh root@SERVER "cd ~/workspace/melin && echo 'trader $(cat bench.pub) bench' > authorized_keys"
 ```
 
 ### 4. Start the server
 
 ```sh
 ssh root@SERVER
-cd ~/workspace/trading
+cd ~/workspace/melin
 rm -f /mnt/journal/bench.journal*
 sudo ./scripts/dpdk-server.sh
 ```
@@ -127,7 +127,7 @@ DPDK transport listening
 **Kernel TCP bench client (simplest):**
 ```sh
 ssh root@BENCH
-cd ~/workspace/trading
+cd ~/workspace/melin
 DPDK_IP=$(ssh root@SERVER "grep DPDK_IP /etc/melin-dpdk.conf | cut -d= -f2")
 
 cargo run --release --bin melin-bench -- \

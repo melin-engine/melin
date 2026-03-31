@@ -43,12 +43,13 @@ The input disruptor is a multi-producer, multi-consumer ring buffer defined in `
 
 The `MultiProducer` is `Clone + Send + Sync` -- each reader thread holds its own clone. No mutex is needed. The per-slot generation array costs approximately 4 MiB (1M slots x 4 bytes).
 
-**Consumers**: Two consumers are registered in parallel, both gated on the producer only (not on each other):
+**Consumers**: Two or three consumers are registered in parallel, both gated on the producer only (not on each other):
 
 - **Consumer 0**: Journal stage
 - **Consumer 1**: Matching stage
+- **Consumer 2** (optional): Shadow exchange stage (when `--snapshot-interval-secs > 0`). Gated on the journal cursor — it only processes events after they are durable. Takes periodic snapshots on a dedicated thread without pausing the matching engine.
 
-Because both consumers are gated only on the producer, they can process events concurrently. The journal stage does not block the matching stage, and vice versa. Backpressure is applied by the producer checking the minimum progress of all terminal consumers (both journal and matching) before claiming new slots.
+Because the journal and matching consumers are gated only on the producer, they can process events concurrently. The journal stage does not block the matching stage, and vice versa. Backpressure is applied by the producer checking the minimum progress of all terminal consumers before claiming new slots.
 
 **`InputSlot` layout** (~72 bytes):
 
@@ -169,6 +170,8 @@ The output SPSC queue connects the matching stage to the response stage. Defined
 
 **Capacity**: `OUTPUT_RING_CAPACITY = 1 << 20` (1,048,576 slots). Matches the input ring size because one input event can produce multiple output messages (e.g., a market order sweeping many price levels produces one `Fill` per level plus a `BatchEnd`).
 
+**Multi-consumer**: When `--event-bind` is set, the output ring has two consumers: (1) the response stage (per-client, gated on journal+repl cursors), and (2) the event publisher (TCP broadcast to subscribers). Both consumers run in parallel. The producer is gated on the slowest consumer.
+
 **`OutputSlot` layout**:
 
 | Field | Description |
@@ -185,15 +188,18 @@ The SPSC uses two cache-line-padded atomic counters (`head` and `tail`) for coor
 
 ## Threading Model
 
-The server spawns 3 dedicated OS threads for the pipeline plus N reader threads:
+The server spawns 3-6 dedicated OS threads for the pipeline plus N reader threads:
 
-| Thread | Default Core | Role |
-|--------|-------------|------|
-| Journal | 1 | Durable write-ahead log |
-| Matching | 2 | Order execution (single-writer) |
-| Response | 3 | Client socket writes |
-| Reader 0 | 4 | Epoll-based connection multiplexing |
-| Reader 1 | 5 | Epoll-based connection multiplexing |
+| Thread | Default Core | Role | Optional? |
+|--------|-------------|------|-----------|
+| Journal | 1 | Durable write-ahead log | No |
+| Matching | 2 | Order execution (single-writer) | No |
+| Response | 3 | Client socket writes | No |
+| Reader 0 | 4 | Epoll-based connection multiplexing | No |
+| Reader 1 | 5 | Epoll-based connection multiplexing | No |
+| Repl Sender | 6 | Stream journal batches to replicas | Yes (`--replication-bind`) |
+| Event Publisher | 7 | Broadcast execution events to subscribers | Yes (`--event-bind`) |
+| Shadow Exchange | 8 | Periodic snapshots without pausing matching | Yes (`--snapshot-interval-secs`) |
 
 Core 0 is reserved for OS/IRQ handling.
 
@@ -231,7 +237,7 @@ Because the journal and matching consumers run in parallel (not chained), the ma
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--cores` | `1,2,3,6` | Pipeline core IDs: journal, matching, response, repl-sender (comma-separated) |
+| `--cores` | `1,2,3,6,7,8` | Pipeline core IDs: journal, matching, response, repl-sender, event-publisher, shadow (comma-separated) |
 | `--readers` | `2` | Number of epoll reader threads |
 | `--reader-cores` | `4` | First CPU core for reader thread pinning (reader i -> core reader_cores + i) |
 | `--group-commit-us` | `0` | Group commit coalescing delay in microseconds. Keep at 0 for TCP. |

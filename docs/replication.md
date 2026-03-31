@@ -28,7 +28,7 @@ Replica:
 
 ### Pipeline integration
 
-Replication is integrated into the `JournalStage` rather than running as a separate disruptor consumer. Before each `flush_batch_sync()`, the journal stage copies its pending batch buffer into a pre-allocated slot in a lock-free replication ring (64 slots × 128 KiB = 8 MiB). The replication sender thread consumes from this ring and streams batches to the replica. This guarantees the replicated bytes are **identical** to what was written to disk — same sequences, timestamps, CRC checksums, and checkpoint entries. No heap allocation on the journal thread — just a flat memcpy into the ring.
+Replication is integrated into the `JournalStage` rather than running as a separate disruptor consumer. Before each `flush_batch_sync()`, the journal stage copies its pending batch buffer into a pre-allocated slot in a lock-free replication ring (configurable via `--replication-ring-size`, default 256 slots × 512 KiB = 128 MiB). The replication sender thread consumes from this ring and streams batches to the replica. This guarantees the replicated bytes are **identical** to what was written to disk — same sequences, timestamps, CRC checksums, and checkpoint entries. No heap allocation on the journal thread — just a flat memcpy into the ring.
 
 This design avoids a class of bugs where a separate replication consumer would re-encode events independently, producing different timestamps, missing auto-emitted checkpoint entries, and diverging BLAKE3 chain hashes.
 
@@ -108,8 +108,33 @@ A server started with `--replica-of <primary_addr>` runs in replica mode:
 | `--standalone` | No | `false` | Explicitly disable replication (dev/test) |
 | `--replica-of <addr>` | No | — | Run as a replica connected to the given primary |
 | `--replication-key <path>` | Replica | — | Ed25519 private key for replication auth. Required when `--replica-of` is set. The corresponding public key must be in the primary's `authorized_keys` with `replication` permission. |
+| `--promote-bind <addr>` | Replica | — | Address to listen for promotion commands. An operator sends `PROMOTE\n` to trigger in-process transition from replica to primary. |
 
 `--replication-bind` and `--standalone` are mutually exclusive. `--replica-of` is mutually exclusive with both. If none are specified, the server runs in standalone mode.
+
+## Snapshot Transfer
+
+When a replica is too far behind and the primary's journal archives have been purged (the needed entries no longer exist in any `.journal.N` file), the primary sends a `NeedSnapshot` message followed by a snapshot transfer:
+
+1. **SnapshotBegin**: metadata frame with snapshot size, sequence, and chain hash.
+2. **SnapshotChunk**: the snapshot data in 64 KiB chunks.
+3. **SnapshotEnd**: CRC32C checksum of the entire snapshot payload for integrity verification.
+
+The replica receives the chunks, writes the snapshot to a temporary file, verifies the CRC, atomically renames to the snapshot path, loads the snapshot into its Exchange, and resumes normal replication from the snapshot's sequence. This enables fresh replicas to bootstrap from a running primary without needing the full journal history.
+
+The CRC32C is computed incrementally on the primary as chunks are read from disk, and verified incrementally on the replica as chunks are received — no need to buffer the entire snapshot in memory.
+
+## Manual Promotion
+
+A replica can be promoted to primary via the `--promote-bind` endpoint. The operator connects to the promotion port and sends `PROMOTE\n`. The replica:
+
+1. Sets the `promote` flag, which causes the replication receiver to exit its main loop.
+2. Transitions in-process from replica to primary: the warm Exchange state is reused directly — no journal re-replay, no snapshot reload.
+3. Starts accepting client connections on the `--bind` address.
+
+This achieves sub-second switchover. The `melin-promote` binary (in `crates/admin/`) automates this: it connects to the promotion endpoint, sends the promote command, and waits for confirmation.
+
+**Important**: after promotion, the old primary must be stopped to prevent split-brain (two primaries accepting writes). Automatic fencing is not yet implemented — see Future Work.
 
 ## Current Limitations (v1)
 
@@ -151,7 +176,7 @@ Dual replication is now supported — the primary accepts up to 2 concurrent rep
 
 ### Backpressure from replication channel can stall the pipeline
 
-**What**: The journal stage publishes to a lock-free replication ring (64 slots × 128 KiB). If the sender thread is slow (network saturated, replica not acking), the ring fills and the journal stage spins in `try_claim()`. This blocks the journal stage, which blocks the disruptor, which blocks all reader threads.
+**What**: The journal stage publishes to a lock-free replication ring (default 256 slots × 512 KiB = 128 MiB, configurable via `--replication-ring-size`). If the sender thread is slow (network saturated, replica not acking), the ring fills and the journal stage spins in `try_claim()`. This blocks the journal stage, which blocks the disruptor, which blocks all reader threads.
 
 **Impact**: Under extreme replication lag, client request processing stalls. The 1M-slot disruptor ring provides substantial buffering before this happens (~100ms at 10M events/sec), but a multi-second network partition would trigger it.
 
@@ -172,5 +197,6 @@ Dual replication is now supported — the primary accepts up to 2 concurrent rep
 ## Future Work
 
 - **Chain hash verification** — see limitation above
-- **Automatic failover**: Leader election / consensus for automatic promotion. Requires fencing to prevent split-brain.
+- **Automatic failover**: Leader election / consensus for automatic promotion. Requires fencing to prevent split-brain. Manual promotion via `--promote-bind` is implemented.
 - **Async replication**: Optional mode where the response stage does not gate on the replication cursor (lower latency, data loss window).
+- **Split-brain fencing**: After manual promotion, the old primary must be stopped manually. Automatic fencing (STONITH, epoch-based fencing) is not yet implemented.

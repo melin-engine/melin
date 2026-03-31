@@ -23,7 +23,7 @@ Executes immediately at the best available prices on the opposite side. A market
 ### Limit
 
 ```rust
-OrderType::Limit { price: Price }
+OrderType::Limit { price: Price, post_only: bool }
 ```
 
 Executes at the specified `price` or better. The order first matches against the opposite side at prices that would satisfy it (asks <= price for buys, bids >= price for sells). Any unfilled remainder is handled according to the order's `TimeInForce`:
@@ -31,6 +31,10 @@ Executes at the specified `price` or better. The order first matches against the
 - **GTC**: remainder is placed on the book as a `RestingOrder`.
 - **IOC**: remainder is cancelled.
 - **FOK**: see the FOK section below -- the order is rejected upfront if it cannot fill entirely.
+- **Day**: remainder rests like GTC, but is automatically cancelled when an `EndOfDay` event is processed.
+- **GTD**: remainder rests like GTC, but is automatically cancelled when an `ExpireOrders` event with `timestamp_ns >= order.expiry_ns` is processed.
+
+**Post-Only mode**: When `post_only` is `true`, the order is rejected with `PostOnlyWouldCross` if it would immediately match against resting liquidity (cross the spread). This guarantees maker-only execution. Post-only is only meaningful for GTC/Day/GTD limit orders -- IOC and FOK are inherently taker-side.
 
 ### Stop
 
@@ -79,6 +83,16 @@ When self-trade prevention is active (any mode other than `Allow`), the FOK pre-
 
 FOK applies to both market and limit orders. A FOK limit buy checks available ask quantity at prices <= the limit price. A FOK market order checks total opposite-side quantity with no price bound.
 
+### Day
+
+The unfilled remainder is placed on the book like GTC. However, when the operator sends an `EndOfDay` event, all Day orders across all instruments are cancelled. This supports session-based markets where resting orders do not carry over to the next trading day.
+
+### GTD (Good-Til-Date)
+
+The unfilled remainder is placed on the book like GTC, but carries an `expiry_ns` timestamp (nanoseconds since Unix epoch). When the operator sends an `ExpireOrders { timestamp_ns }` event, all GTD orders with `expiry_ns <= timestamp_ns` are cancelled. The operator is responsible for sending `ExpireOrders` at the appropriate time (e.g., via a periodic timer).
+
+GTD orders must have a non-zero `expiry_ns`; non-GTD orders must have `expiry_ns == 0`. Violations are rejected with `InvalidExpiry`.
+
 ---
 
 ## Matching Algorithm
@@ -92,12 +106,14 @@ The engine implements strict **price-time priority** (also called FIFO matching)
 
 ### Book data structure
 
-Each side of the book (`BookSide`) uses a `BTreeMap<Price, VecDeque<RestingOrder>>`:
+Each side of the book (`BookSide`) uses a **sorted `Vec<(Price, VecDeque<RestingOrder>)>`** with binary search:
 
-- **`BTreeMap`** keeps price levels in sorted order. This allows efficient iteration from the best price without re-sorting: `iter()` for asks (ascending, lowest first) and `iter().rev()` for bids (descending, highest first). Insert and remove are O(log n) per price level.
+- **Sorted `Vec`** keeps price levels in sorted order. Typical books have 10-100 active price levels; at ~16 bytes per level entry, the entire Vec fits in L1/L2 cache. Binary search for a price level is O(log n). Insert and remove shift entries but are fast for small n -- the shift is a single `memcpy` in L1. `BTreeMap`'s node-per-entry layout scatters across heap pages and incurs cache misses on traversal.
 - **`VecDeque`** at each price level maintains FIFO ordering. `push_back` for new orders and `pop_front` for fills are both O(1).
 
 An auxiliary **`HashMap<OrderId, (Side, Price)>`** (`order_index`) provides O(1) amortized lookup for cancel operations, avoiding a linear scan of the book.
+
+Stop orders use **`BTreeMap<Price, Vec<PendingStop>>`** for `stop_buys` and `stop_sells`, keyed by trigger price. BTreeMap is appropriate here because stop books can have many more price levels (no consolidation at inside prices) and are not on the matching hot path.
 
 ### Matching walk
 
@@ -267,10 +283,46 @@ Rejection reasons:
 - `OutsidePriceBand` -- limit/stop-limit price outside `[price_band_lower, price_band_upper]`.
 - `UnknownOrder` -- cancel-replace target not found on the book.
 - `PriceWouldCross` -- cancel-replace new price crosses the opposite best price.
+- `PostOnlyWouldCross` -- post-only limit order would immediately match.
+- `HasRestingOrders` -- withdrawal rejected because the account has resting orders.
+- `DuplicateRequest` -- per-key request sequence already processed.
+- `ReplicaDisconnected` -- replication enabled but replica disconnected; state-mutating operations blocked.
+- `InvalidExpiry` -- GTD order missing expiry, or non-GTD order with unexpected expiry.
+- `InstrumentDisabled` -- instrument is disabled; no new orders accepted.
 
 ### `Replaced`
 
 Emitted on successful cancel-replace. Fields: `order_id`, `side`, `old_price`, `new_price`, `old_remaining`, `new_remaining`.
+
+### `InstrumentStatusChanged`
+
+Emitted when an instrument's lifecycle status changes. Fields: `symbol`, `status: InstrumentStatus` (Enabled, Disabled, or Removed).
+
+---
+
+## Instrument Lifecycle
+
+Instruments go through three states: **Enabled** (default, accepts orders), **Disabled** (rejects new orders), and **Removed** (permanent, memory reclaimed).
+
+### DisableInstrument
+
+Disables an instrument. All resting orders and pending stops are cancelled (each emitting a `Cancelled` report), followed by an `InstrumentStatusChanged { status: Disabled }` report. New order submissions for the instrument are rejected with `InstrumentDisabled`.
+
+### EnableInstrument
+
+Re-enables a previously disabled instrument. Emits `InstrumentStatusChanged { status: Enabled }`. New orders are accepted again.
+
+### RemoveInstrument
+
+Permanently removes a disabled instrument and reclaims its memory. Only succeeds if the instrument is currently disabled and has no resting orders. Emits `InstrumentStatusChanged { status: Removed }`. After removal, the symbol is unknown -- submissions are rejected with `UnknownSymbol`.
+
+### EndOfDay
+
+Cancels all resting orders and pending stops with `TimeInForce::Day` across all instruments. Each cancelled order emits a `Cancelled` report.
+
+### ExpireOrders
+
+Cancels all resting orders and pending stops with `TimeInForce::GTD` whose `expiry_ns <= timestamp_ns`. Each cancelled order emits a `Cancelled` report.
 
 ---
 

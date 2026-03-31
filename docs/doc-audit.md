@@ -6,17 +6,9 @@ Logical errors, security gaps, and design concerns found during review of all do
 
 ## Critical
 
-### 1. admin-guide.md claims negative maker fees (rebates) are supported
+### ~~1. admin-guide.md claims negative maker fees (rebates) are supported~~
 
-**Location**: `docs/admin-guide.md`, line 282
-
-**Claim**: "Typical exchange configurations use negative maker fees (rebates) and positive taker fees, but the admin tool accepts any value in the 0-10000 range."
-
-**Reality**: `FeeSchedule` uses `u16` for both `maker_fee_bps` and `taker_fee_bps`. An unsigned 16-bit integer cannot represent negative values. The system does not support maker rebates.
-
-**Risk**: An operator reading this doc may attempt to configure a rebate (e.g., -2 bps for makers), fail silently (the value wraps or is rejected by the input parser), and not realize the fee schedule is wrong. This could result in incorrect fee billing.
-
-**Fix**: Remove the rebate claim. State that both fields are non-negative (0-10000 bps). If rebates are a product requirement, they need a signed fee type and balance credit logic.
+**Status**: **FIXED** — `FeeSchedule` now uses `i16` for both `maker_fee_bps` and `taker_fee_bps`. Rebates (negative fees) are fully supported. `ExecutionReport::Fill` uses `i64` for `maker_fee` and `taker_fee`. Fees are credited to `FEE_ACCOUNT` (AccountId 0). Docs updated accordingly.
 
 ---
 
@@ -92,15 +84,9 @@ Logical errors, security gaps, and design concerns found during review of all do
 
 ---
 
-### 7. Large AccountId or CurrencyId values cause unbounded memory allocation
+### ~~7. Large AccountId or CurrencyId values cause unbounded memory allocation~~
 
-**Location**: `docs/balance-management.md` (flat Vec indexing)
-
-**Description**: The flat `Vec<Balance>` is indexed by `account_id * currency_stride + currency_id`. If an admin deposits for `AccountId(1_000_000)` with `CurrencyId(1_000)`, the Vec grows to `1_000_000 * 1_001 = ~1 billion` entries at 16 bytes each = ~16 GB. There is no upper bound on account or currency IDs.
-
-**Risk**: A malicious or careless admin could OOM the server with a single deposit command using a large account or currency ID. Since deposits require Admin permission, this is limited to trusted operators, but accidental fat-finger deposits (e.g., `account_id = 1000000` instead of `100`) could still cause problems.
-
-**Recommendation**: Document the memory implications of large IDs. Consider adding a configurable cap on AccountId and CurrencyId values, rejecting deposits for IDs above the cap.
+**Status**: **FIXED** — flat `Vec` storage was replaced with sparse `astenn::HashMap` (extendible hashing). Memory is proportional to the number of active accounts/currencies, not to `max(account_id) * max(currency_id)`. Large IDs are no longer a concern. The referenced `docs/balance-management.md` file never existed — the relevant doc is `docs/account-lifecycle.md`.
 
 ---
 
@@ -150,13 +136,13 @@ Logical errors, security gaps, and design concerns found during review of all do
 
 | # | Severity | Category | Description |
 |---|----------|----------|-------------|
-| 1 | Critical | Doc error | admin-guide claims rebates supported (u16 can't be negative) |
+| 1 | ~~Critical~~ | ~~Doc error~~ | ~~admin-guide claims rebates supported~~ FIXED — fees are now i16, rebates supported |
 | 2 | Critical | Security | Any Trader key can act on any account (no per-account auth) |
 | 3 | Critical | Logic | Fee increase silently under-charges resting orders |
 | 4 | Important | Security | No wire integrity after auth (MITM possible on untrusted networks) |
 | 5 | Important | Operations | No global halt command (must halt instruments one by one) |
 | 6 | Important | Security | Keys can't be revoked without restart |
-| 7 | Important | Security | Large IDs cause unbounded memory allocation |
+| 7 | ~~Important~~ | ~~Security~~ | ~~Large IDs cause unbounded memory allocation~~ FIXED — sparse HashMap storage |
 | 8 | Minor | Logic | Stop cascade depth=1 delays secondary triggers |
 | 9 | Minor | Logic | FOK + CancelOldest STP overly conservative |
 | 10 | Minor | Efficiency | Response stage spin-wait during journal stalls |

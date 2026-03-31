@@ -21,11 +21,11 @@ This document describes the write-ahead journal, snapshot system, crash recovery
 ```
 Offset  Size  Field           Value
 0       4     file_magic      0x4A4F5552 ("JOUR")
-4       2     format_version  6
+4       2     format_version  9
 6       2     reserved        0
 ```
 
-The header is written when the journal is created and never modified. `format_version` is checked on open; v5 and v6 are accepted (v5 journals are readable but lack hash chain verification).
+The header is written when the journal is created and never modified. `format_version` is checked on open; v5, v7, v8, and v9 are accepted (v5 journals lack hash chain verification; v7-v8 lack newer event types).
 
 ### Entry Layout (repeats after header)
 
@@ -74,18 +74,19 @@ Total entry size: `20 + length + 4` bytes. Typical entries are 40-85 bytes.
 | 0 | 4 | symbol (u32) |
 | 4 | var | order (see below) |
 
-**Order encoding** (variable length, 24-40 bytes):
+**Order encoding** (variable length, 24-48 bytes):
 
 | Offset | Size | Field |
 |--------|------|-------|
 | 0 | 8 | order_id (u64) |
 | 8 | 4 | account_id (u32) |
 | 12 | 1 | side (0=Buy, 1=Sell) |
-| 13 | 1 | order_type_tag (0=Market, 1=Limit, 2=Stop, 3=StopLimit) |
-| 14 | var | order_type_fields — Market: 0 bytes; Limit: 8 (price); Stop: 8 (trigger); StopLimit: 16 (trigger + price) |
-| 14+N | 1 | time_in_force (0=GTC, 1=IOC, 2=FOK) |
+| 13 | 1 | order_type_tag (0=Market, 1=Limit, 2=Stop, 3=StopLimit, 4=LimitPostOnly) |
+| 14 | var | order_type_fields — Market: 0 bytes; Limit/PostOnly: 8 (price); Stop: 8 (trigger); StopLimit: 16 (trigger + price) |
+| 14+N | 1 | time_in_force (0=GTC, 1=IOC, 2=FOK, 3=Day, 4=GTD) |
 | 15+N | 8 | quantity (u64) |
 | 23+N | 1 | self_trade_prevention (0=Allow, 1=CancelNewest, 2=CancelOldest, 3=CancelBoth) |
+| 24+N | 0 or 8 | expiry_ns (u64, only present when tif=GTD) |
 
 **SetRiskLimits (tag=5)** — 6-22 bytes
 
@@ -145,8 +146,55 @@ Auto-emitted every 100K events. The reader verifies the chain hash and event cou
 | Offset | Size | Field |
 |--------|------|-------|
 | 0 | 4 | symbol (u32) |
-| 4 | 2 | maker_fee_bps (u16) |
-| 6 | 2 | taker_fee_bps (u16) |
+| 4 | 2 | maker_fee_bps (i16) |
+| 6 | 2 | taker_fee_bps (i16) |
+
+**ProvisionAccount (tag=12)** — 12 bytes
+
+| Offset | Size | Field |
+|--------|------|-------|
+| 0 | 4 | account_id (u32) |
+| 4 | 8 | amount (u64) |
+
+Internal-only: bulk seeding event. Not exposed via the wire protocol.
+
+**Withdraw (tag=13)** — 16 bytes
+
+| Offset | Size | Field |
+|--------|------|-------|
+| 0 | 4 | account_id (u32) |
+| 4 | 4 | currency_id (u32) |
+| 8 | 8 | amount (u64) |
+
+**EndOfDay (tag=14)** — 0 bytes
+
+Cancels all Day TIF orders across all instruments.
+
+**ExpireOrders (tag=15)** — 8 bytes
+
+| Offset | Size | Field |
+|--------|------|-------|
+| 0 | 8 | timestamp_ns (u64) |
+
+Expires all GTD orders with `expiry_ns <= timestamp_ns`.
+
+**DisableInstrument (tag=16)** — 4 bytes
+
+| Offset | Size | Field |
+|--------|------|-------|
+| 0 | 4 | symbol (u32) |
+
+**EnableInstrument (tag=17)** — 4 bytes
+
+| Offset | Size | Field |
+|--------|------|-------|
+| 0 | 4 | symbol (u32) |
+
+**RemoveInstrument (tag=18)** — 4 bytes
+
+| Offset | Size | Field |
+|--------|------|-------|
+| 0 | 4 | symbol (u32) |
 
 ## Durability
 
@@ -156,7 +204,7 @@ The journal uses `pwritev2` with the `RWF_DSYNC` flag (Force Unit Access). On NV
 
 ### Pre-allocation
 
-On creation and when space runs low, the writer calls `posix_fallocate` to extend the file by 64 MiB. This pre-allocates disk extents (blocks) without writing zeros. Subsequent syncs only flush data pages — no extent metadata updates are needed, which would otherwise require a more expensive metadata sync.
+On creation and when space runs low, the writer calls `posix_fallocate` to extend the file by 256 MiB. This pre-allocates disk extents (blocks) without writing zeros. Subsequent syncs only flush data pages — no extent metadata updates are needed, which would otherwise require a more expensive metadata sync.
 
 ### Batch Amortization
 
@@ -219,7 +267,7 @@ This avoids replaying the entire journal from genesis. Recovery time is proporti
 ```
 Offset  Size  Field           Value
 0       4     file_magic      0x534E4150 ("SNAP")
-4       2     format_version  7
+4       2     format_version  12
 6       2     reserved        0
 8       8     sequence        journal sequence number at snapshot time
 16      32    chain_hash      BLAKE3 hash chain state (v6+; zeros for v5)
@@ -340,7 +388,7 @@ The journal participates in a 3-stage LMAX disruptor pipeline:
 
 ## Format Versioning
 
-Both the journal and snapshot have independent `format_version` fields. Current journal version: **6**. Current snapshot version: **7**.
+Both the journal and snapshot have independent `format_version` fields. Current journal version: **9**. Current snapshot version: **12**.
 
 ### Journal Version History
 
@@ -352,6 +400,9 @@ Both the journal and snapshot have independent `format_version` fields. Current 
 | 4 | Added `CancelAll` event (tag=6) for kill switch |
 | 5 | Added `SetCircuitBreaker` event (tag=7) for price bands + trading halts |
 | 6 | Added `GenesisHash` (tag=9), `Checkpoint` (tag=10) for BLAKE3 hash chain; `CancelReplace` (tag=8); `SetFeeSchedule` (tag=11) |
+| 7 | Added `ProvisionAccount` (tag=12), `Withdraw` (tag=13); signed fees (i16); `CancelOrder` now includes `account_id` |
+| 8 | Added `post_only` flag to Limit order type (wire tag=4); `LimitPostOnly` variant |
+| 9 | Added `ExpireOrders` (tag=15), `EndOfDay` (tag=14), `DisableInstrument` (tag=16), `EnableInstrument` (tag=17), `RemoveInstrument` (tag=18); conditional `expiry_ns` in Order encoding for GTD; Day and GTD time-in-force variants |
 
 ### Snapshot Version History
 
@@ -364,11 +415,16 @@ Both the journal and snapshot have independent `format_version` fields. Current 
 | 5 | Added per-instrument `CircuitBreakerConfig` for price bands + halts |
 | 6 | Added `chain_hash` (32 bytes) in header for BLAKE3 hash chain continuity |
 | 7 | Order sides keyed by `(AccountId, OrderId)` instead of `OrderId`; added per-instrument fee schedules |
+| 8 | Added `Withdraw` event support; signed fee types (i16/i64); fee collection account |
+| 9 | Added `post_only` flag to resting orders and pending stops |
+| 10 | Added per-key request sequence HWM for idempotency dedup |
+| 11 | Added `InstrumentStatus` per instrument; `order_counts` per account |
+| 12 | Added `expiry_ns` to orders (GTD support); Day TIF resting orders |
 
 ### Compatibility Rules
 
-- The journal reader accepts v5 and v6 files. V5 journals are readable but lack hash chain verification.
-- The snapshot reader accepts v5, v6, and v7 files. V5 snapshots use a 16-byte header (no chain hash). V6 snapshots use the old `OrderId`-only key format for order sides and lack fee schedules.
+- The journal reader accepts v5, v7, v8, and v9 files. V5 journals lack hash chain verification; v7-v8 lack newer event types but are otherwise compatible.
+- The snapshot reader accepts recent versions with backward-compatible loading. Older snapshots may lack fields (fee schedules, key HWMs, instrument status, expiry) which default to safe values on load.
 - Older versions are rejected with `UnsupportedVersion`.
 
 ## Migration Procedure
@@ -398,7 +454,7 @@ When changing the journal or snapshot format (adding fields, changing encoding, 
 
 Adding a new `JournalEvent` variant (e.g., `SetPriceBands`, `HaltInstrument`) requires:
 
-1. Assign a new event tag (next available: 12).
+1. Assign a new event tag (next available: 19).
 2. Add encode/decode logic to the codec.
 3. Bump `FORMAT_VERSION` (old readers will reject the new file, which is correct).
 4. Follow the standard upgrade procedure above.
@@ -419,7 +475,7 @@ Inserting a field in the middle or changing field sizes breaks all entries in th
 
 ### Journal File Growth
 
-The journal grows monotonically. Pre-allocation extends it in 64 MiB chunks. A single entry is ~40-85 bytes, so 64 MiB covers roughly 800K-1.6M entries before the next allocation.
+The journal grows monotonically. Pre-allocation extends it in 256 MiB chunks. A single entry is ~40-85 bytes, so 256 MiB covers roughly 3.2M-6.4M entries before the next allocation.
 
 At sustained 830K orders/sec (with fsync), the journal grows at ~50-70 MB/sec. Journal rotation triggers at startup when the file exceeds `--max-journal-mib` (default 256 MiB), creating a snapshot and archiving the old journal.
 

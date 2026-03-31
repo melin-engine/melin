@@ -90,7 +90,7 @@ cargo run --release -p melin-bench [-- [OPTIONS] [PAIRS]]
 | `--clients` | 16 | Number of concurrent client connections (roundtrip mode). |
 | `--window` | 64 | Pipeline depth: number of requests in flight per client before waiting for a response. |
 | `--bench-threads` | 4 | Number of bench client threads. Each manages a subset of connections via epoll (ignored when compiled with the `io-uring` feature). |
-| `--group-commit-us` | 0 | Group commit coalescing delay in microseconds. Adds an artificial delay before fsyncing to batch more events per sync. Beneficial for UDS transport; harmful for TCP (see CLAUDE.md dead ends). |
+| `--group-commit-us` | 0 | Group commit coalescing delay in microseconds. Adds an artificial delay before fsyncing to batch more events per sync. Beneficial for UDS transport; harmful for TCP (see [roadmap deferred section](roadmap.md#deferred)). |
 | `--warmup` | 100,000 | Warmup orders per client (not included in measurements). Primes caches, branch predictors, and allocator state. |
 | `--journal <PATH>` | temp directory | Path for the journal file. Use a dedicated NVMe disk for realistic durability benchmarks. |
 | `--accounts` | 10,000 | Number of trading accounts in the generator. |

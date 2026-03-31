@@ -1,6 +1,8 @@
 # Maker/Taker Fee Model
 
-Fees are configured per instrument in basis points (bps, where 100 bps = 1%). If no fee schedule is set, both rates default to zero. Fee schedules can be changed at runtime via `SetFeeSchedule`; changes apply to all subsequent fills, including fills on orders placed before the change.
+Fees are configured per instrument in basis points (bps, where 100 bps = 1%). Both maker and taker fees are signed (`i16`, range -10000 to 10000): positive values are fees charged to the trader, negative values are rebates paid by the exchange. If no fee schedule is set, both rates default to zero. Fee schedules can be changed at runtime via `SetFeeSchedule`; changes apply to all subsequent fills, including fills on orders placed before the change.
+
+Collected fees are credited to a dedicated **fee collection account** (`AccountId(0)`). This account is never evicted and always exists. Operators can withdraw accumulated fees via the Withdraw command.
 
 ## Maker vs Taker
 
@@ -26,4 +28,6 @@ The cushion uses the same truncating integer division as fee computation, so `cu
 
 ## Dynamic Fee Schedule Changes
 
-Because the fee cushion is computed at order placement using the fee schedule active at that moment, a fee increase could theoretically cause a resting order's cushion to be insufficient. This is handled by saturating arithmetic in the balance manager — the reservation covers what it can, and any shortfall is absorbed.
+Because the fee cushion is computed at order placement using the fee schedule active at that moment, a fee schedule increase could cause a resting buy order's cushion to be insufficient for the new fee. The exchange absorbs the shortfall via saturating arithmetic — the buyer pays `min(actual_fee, cushion_at_placement_time)` rather than the full configured fee rate. There is no log or audit trail entry for the shortfall.
+
+**Recommendation**: To avoid silent fee shortfalls, increase fee schedules only when no resting buy orders exist for the instrument (e.g., after a trading halt and CancelAll).

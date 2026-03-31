@@ -77,7 +77,7 @@ When the journal disk fills, `posix_fallocate` returns ENOSPC. The error propaga
 
 **Impact**: Server becomes unresponsive. Requires manual intervention.
 **Exploitable remotely**: Indirectly — submit enough orders to fill the disk.
-**Mitigation**: Monitor disk usage, reject new orders when disk exceeds a threshold. Implement journal rotation.
+**Mitigation**: Monitor disk usage, reject new orders when disk exceeds a threshold. Journal rotation is now implemented (`--max-journal-mib`, default 256 MiB) — triggers at startup when the journal exceeds the threshold.
 
 ---
 

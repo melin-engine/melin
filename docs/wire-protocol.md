@@ -2,11 +2,32 @@
 
 Binary wire protocol for client-server communication over TCP or Unix domain sockets. Manual serialization (no serde) for zero allocation, predictable layout, and no format stability concerns across dependency versions.
 
-All multi-byte integers are **little-endian**. No CRC on the wire -- TCP handles integrity.
+All multi-byte integers are **little-endian**. No CRC on the wire -- TCP handles integrity. The protocol assumes a trusted network (isolated VLAN). It is NOT safe over untrusted networks without TLS or an equivalent transport-layer encryption.
 
 ## Frame Format
 
-Every message is wrapped in a length-prefixed frame:
+### Request Frame
+
+Every client-to-server message includes a per-key request sequence number for idempotency:
+
+```
++----------------+-----------+----------+-----------+
+| length (4B LE) | seq (8B)  | tag (1B) | payload   |
++----------------+-----------+----------+-----------+
+```
+
+| Field   | Type | Size    | Description                                              |
+|---------|------|---------|----------------------------------------------------------|
+| length  | u32  | 4 bytes | Byte count of seq + tag + payload (excludes itself)      |
+| seq     | u64  | 8 bytes | Per-key request sequence for idempotency (0 for heartbeat/auth) |
+| tag     | u8   | 1 byte  | Message type discriminant                                |
+| payload | ...  | 0..N    | Variant-specific fields                                  |
+
+The `seq` field is a monotonically increasing counter per authentication key. The server tracks a high-water mark per key and rejects requests with `DuplicateRequest` if `seq <= hwm`. This makes retries safe after network failures -- the server silently deduplicates already-processed requests. Heartbeat and ChallengeResponse use `seq = 0` (exempt from dedup).
+
+### Response Frame
+
+Server-to-client messages omit the sequence field:
 
 ```
 +----------------+----------+-----------+
@@ -39,7 +60,7 @@ These types appear throughout the field layouts below:
 | Price      | 8 bytes   | u64 LE (NonZeroU64, must not be zero) |
 | Quantity   | 8 bytes   | u64 LE (NonZeroU64, must not be zero) |
 | Side       | 1 byte    | 0 = Buy, 1 = Sell                     |
-| TimeInForce| 1 byte    | 0 = GTC, 1 = IOC, 2 = FOK            |
+| TimeInForce| 1 byte    | 0 = GTC, 1 = IOC, 2 = FOK, 3 = Day, 4 = GTD |
 | SelfTradePrevention | 1 byte | 0 = Allow, 1 = CancelNewest, 2 = CancelOldest, 3 = CancelBoth |
 
 ### Order Encoding
@@ -47,7 +68,7 @@ These types appear throughout the field layouts below:
 Orders are encoded inline within `SubmitOrder` requests. The layout is variable-length because the order type fields differ:
 
 ```
-id(8) + account(4) + side(1) + order_type_tag(1) + order_type_fields(0..16) + tif(1) + quantity(8) + stp(1)
+id(8) + account(4) + side(1) + order_type_tag(1) + order_type_fields(0..16) + tif(1) + quantity(8) + stp(1) + [expiry_ns(8)]
 ```
 
 | Offset | Field           | Size   | Notes                                    |
@@ -57,48 +78,56 @@ id(8) + account(4) + side(1) + order_type_tag(1) + order_type_fields(0..16) + ti
 | 12     | side            | 1      | 0=Buy, 1=Sell                            |
 | 13     | order_type_tag  | 1      | See below                                |
 | 14     | order_type_data | 0..16  | Variable, depends on order_type_tag      |
-| ...    | time_in_force   | 1      | 0=GTC, 1=IOC, 2=FOK                     |
+| ...    | time_in_force   | 1      | 0=GTC, 1=IOC, 2=FOK, 3=Day, 4=GTD      |
 | ...    | quantity        | 8      | u64 LE (NonZeroU64)                      |
 | ...    | stp             | 1      | Self-trade prevention mode               |
+| ...    | expiry_ns       | 0 or 8 | Only present for GTD (tif=4): u64 LE nanoseconds since Unix epoch |
 
 **Order type tags and fields**:
 
-| Tag | Type      | Extra fields                                   | Extra size |
-|-----|-----------|------------------------------------------------|------------|
-| 0   | Market    | (none)                                         | 0 bytes    |
-| 1   | Limit     | price (u64 LE)                                 | 8 bytes    |
-| 2   | Stop      | trigger_price (u64 LE)                         | 8 bytes    |
-| 3   | StopLimit | trigger_price (u64 LE) + limit_price (u64 LE)  | 16 bytes   |
+| Tag | Type           | Extra fields                                   | Extra size |
+|-----|----------------|------------------------------------------------|------------|
+| 0   | Market         | (none)                                         | 0 bytes    |
+| 1   | Limit          | price (u64 LE)                                 | 8 bytes    |
+| 2   | Stop           | trigger_price (u64 LE)                         | 8 bytes    |
+| 3   | StopLimit      | trigger_price (u64 LE) + limit_price (u64 LE)  | 16 bytes   |
+| 4   | Limit PostOnly | price (u64 LE)                                 | 8 bytes    |
 
-Total order size: 24 bytes (Market) to 40 bytes (StopLimit).
+Total order size: 24 bytes (Market, no expiry) to 48 bytes (StopLimit + GTD expiry).
 
 ---
 
 ## Request Messages (Client to Server)
 
-| Tag | Name              | Permission     | Payload size         |
-|-----|-------------------|----------------|----------------------|
-| 1   | SubmitOrder       | Admin, Trader  | 4 + 24..40 (variable)|
-| 2   | CancelOrder       | Admin, Trader  | 12                   |
-| 3   | Heartbeat         | Any            | 0                    |
-| 4   | CancelAll         | Admin, Trader  | 4                    |
-| 5   | ChallengeResponse | Any (pre-auth) | 96                   |
-| 6   | AddInstrument     | Admin          | 12                   |
-| 7   | Deposit           | Admin          | 16                   |
-| 8   | SetRiskLimits     | Admin          | 5..21 (variable)     |
-| 9   | SetCircuitBreaker | Admin          | 5..21 (variable)     |
-| 10  | CancelReplace     | Admin, Trader  | 28                   |
-| 30  | QueryStats        | Admin          | 0                    |
-| 31  | SetFeeSchedule    | Admin          | 8                    |
+| Tag | Name              | Permission        | Payload size         |
+|-----|-------------------|-------------------|----------------------|
+| 1   | SubmitOrder       | Operator, Trader  | 4 + 24..48 (variable)|
+| 2   | CancelOrder       | Operator, Trader  | 16                   |
+| 3   | Heartbeat         | Any               | 0                    |
+| 4   | CancelAll         | Operator, Trader  | 4                    |
+| 5   | ChallengeResponse | Any (pre-auth)    | 96                   |
+| 6   | AddInstrument     | Operator          | 12                   |
+| 7   | Deposit           | Custodian         | 16                   |
+| 8   | SetRiskLimits     | Operator          | 5..21 (variable)     |
+| 9   | SetCircuitBreaker | Operator          | 5..21 (variable)     |
+| 10  | CancelReplace     | Operator, Trader  | 28                   |
+| 30  | QueryStats        | Operator          | 0                    |
+| 31  | SetFeeSchedule    | Operator          | 8                    |
+| 32  | Withdraw          | Custodian         | 16                   |
+| 33  | EndOfDay          | Operator          | 0                    |
+| 34  | ExpireOrders      | Operator          | 8                    |
+| 35  | DisableInstrument | Operator          | 4                    |
+| 36  | EnableInstrument  | Operator          | 4                    |
+| 37  | RemoveInstrument  | Operator          | 4                    |
 
-Payload sizes above exclude the 1-byte tag. The frame length = 1 (tag) + payload size.
+Payload sizes above exclude the 1-byte tag and 8-byte seq. The frame length = 8 (seq) + 1 (tag) + payload size.
 
 ### Tag 1: SubmitOrder
 
 | Offset | Field  | Size     |
 |--------|--------|----------|
 | 0      | symbol | 4 (u32)  |
-| 4      | order  | 24..40   |
+| 4      | order  | 24..48   |
 
 The order is encoded inline per the Order Encoding section above.
 
@@ -107,7 +136,8 @@ The order is encoded inline per the Order Encoding section above.
 | Offset | Field    | Size     |
 |--------|----------|----------|
 | 0      | symbol   | 4 (u32)  |
-| 4      | order_id | 8 (u64)  |
+| 4      | account  | 4 (u32)  |
+| 8      | order_id | 8 (u64)  |
 
 ### Tag 3: Heartbeat
 
@@ -199,30 +229,78 @@ No payload. Tag-only message. Requests a server stats snapshot. Response is a St
 | Offset | Field          | Size     |
 |--------|----------------|----------|
 | 0      | symbol         | 4 (u32)  |
-| 4      | maker_fee_bps  | 2 (u16)  |
-| 6      | taker_fee_bps  | 2 (u16)  |
+| 4      | maker_fee_bps  | 2 (i16)  |
+| 6      | taker_fee_bps  | 2 (i16)  |
 
-Fee values are in basis points (1 bps = 0.01%).
+Fee values are in basis points (1 bps = 0.01%). Negative values are rebates (exchange pays the maker/taker). Range: -10000 to 10000.
+
+### Tag 32: Withdraw
+
+| Offset | Field    | Size     |
+|--------|----------|----------|
+| 0      | account  | 4 (u32)  |
+| 4      | currency | 4 (u32)  |
+| 8      | amount   | 8 (u64)  |
+
+Debits funds from an account. Rejects with `HasRestingOrders` if the account has resting orders (must `CancelAll` first). Rejects with `InsufficientBalance` if the account lacks funds. Removes the balance entry when it reaches zero.
+
+### Tag 33: EndOfDay
+
+No payload. Cancels all resting orders and pending stops with `TimeInForce::Day` across all instruments. Triggered by an operator at end-of-session.
+
+### Tag 34: ExpireOrders
+
+| Offset | Field        | Size     |
+|--------|--------------|----------|
+| 0      | timestamp_ns | 8 (u64)  |
+
+Expires all resting orders and pending stops with `TimeInForce::GTD` whose `expiry_ns <= timestamp_ns`. Triggered by an operator.
+
+### Tag 35: DisableInstrument
+
+| Offset | Field  | Size     |
+|--------|--------|----------|
+| 0      | symbol | 4 (u32)  |
+
+Disables an instrument: rejects new orders and cancels all resting orders and pending stops. Re-enable is possible.
+
+### Tag 36: EnableInstrument
+
+| Offset | Field  | Size     |
+|--------|--------|----------|
+| 0      | symbol | 4 (u32)  |
+
+Re-enables a previously disabled instrument for trading.
+
+### Tag 37: RemoveInstrument
+
+| Offset | Field  | Size     |
+|--------|--------|----------|
+| 0      | symbol | 4 (u32)  |
+
+Permanently removes a disabled instrument. Only succeeds if the instrument is disabled and has no resting orders.
 
 ---
 
 ## Response Messages (Server to Client)
 
-| Tag | Name              | Payload size |
-|-----|-------------------|--------------|
-| 11  | Placed            | 25           |
-| 12  | Fill              | 56           |
-| 13  | Cancelled         | 20           |
-| 14  | Triggered         | 16           |
-| 15  | Rejected          | 13           |
-| 16  | EngineError       | 0            |
-| 17  | BatchEnd          | 0            |
-| 18  | ServerReady       | 0            |
-| 19  | Heartbeat         | 0            |
-| 20  | Challenge         | 32           |
-| 21  | AuthFailed        | 0            |
-| 22  | Replaced          | 41           |
-| 23  | StatsHeader       | 24           |
+| Tag | Name                     | Payload size |
+|-----|--------------------------|--------------|
+| 11  | Placed                   | 25           |
+| 12  | Fill                     | 56           |
+| 13  | Cancelled                | 20           |
+| 14  | Triggered                | 16           |
+| 15  | Rejected                 | 13           |
+| 16  | EngineError              | 0            |
+| 17  | BatchEnd                 | 0            |
+| 18  | ServerReady              | 0            |
+| 19  | Heartbeat                | 0            |
+| 20  | Challenge                | 32           |
+| 21  | AuthFailed               | 0            |
+| 22  | Replaced                 | 41           |
+| 23  | StatsHeader              | 24           |
+| 24  | ServerBusy               | 0            |
+| 25  | InstrumentStatusChanged  | 5            |
 
 ### Tag 11: Placed
 
@@ -247,8 +325,10 @@ Reports a trade execution between a maker and taker.
 | 20     | taker_account  | 4 (u32)  |
 | 24     | price          | 8 (u64)  |
 | 32     | quantity       | 8 (u64)  |
-| 40     | maker_fee      | 8 (u64)  |
-| 48     | taker_fee      | 8 (u64)  |
+| 40     | maker_fee      | 8 (i64)  |
+| 48     | taker_fee      | 8 (i64)  |
+
+Fees are signed: positive = fee charged, negative = rebate credited. Both values are in quote currency.
 
 ### Tag 13: Cancelled
 
@@ -296,6 +376,12 @@ Reports that an order was rejected by the matching engine.
 | 10   | OutsidePriceBand      |
 | 11   | UnknownOrder          |
 | 12   | PriceWouldCross       |
+| 13   | PostOnlyWouldCross    |
+| 14   | HasRestingOrders      |
+| 15   | DuplicateRequest      |
+| 16   | ReplicaDisconnected   |
+| 17   | InvalidExpiry         |
+| 18   | InstrumentDisabled    |
 
 ### Tag 16: EngineError
 
@@ -347,6 +433,21 @@ Server stats snapshot, sent in response to `QueryStats`.
 | 0      | active_connections | 8 (u64)  |
 | 8      | events_processed   | 8 (u64)  |
 | 16     | journal_sequence   | 8 (u64)  |
+
+### Tag 24: ServerBusy
+
+No payload. The server's input pipeline is full. The client should retry after a brief backoff. Sent directly by the reader thread without entering the pipeline -- this ensures the server can always respond even when the pipeline is saturated.
+
+### Tag 25: InstrumentStatusChanged
+
+Reports a change in instrument lifecycle status.
+
+| Offset | Field  | Size     |
+|--------|--------|----------|
+| 0      | symbol | 4 (u32)  |
+| 4      | status | 1        |
+
+**Status codes**: 0 = Enabled, 1 = Disabled, 2 = Removed.
 
 ---
 
@@ -403,33 +504,53 @@ Permission levels are assigned per public key in the `authorized_keys` file and 
 
 ### Permission levels
 
-| Level    | Trading | Admin | Heartbeat |
-|----------|---------|-------|-----------|
-| Admin    | Yes     | Yes   | Yes       |
-| Trader   | Yes     | No    | Yes       |
-| ReadOnly | No      | No    | Yes       |
+| Level       | Trading | Operator (Config) | Fund Mgmt | Heartbeat |
+|-------------|---------|-------------------|-----------|-----------|
+| Operator    | No      | Yes               | No        | Yes       |
+| Trader      | Yes     | No                | No        | Yes       |
+| Custodian   | No      | No                | Yes       | Yes       |
+| ReadOnly    | No      | No                | No        | Yes       |
+| Replication | --      | --                | --        | --        |
 
-**Trading operations** (require `Admin` or `Trader`):
+**Trading operations** (require `Trader`):
 - SubmitOrder, CancelOrder, CancelAll, CancelReplace
 
-**Administrative operations** (require `Admin`):
-- AddInstrument, Deposit, SetRiskLimits, SetCircuitBreaker, SetFeeSchedule, QueryStats
+**Operator operations** (require `Operator`):
+- AddInstrument, SetRiskLimits, SetCircuitBreaker, SetFeeSchedule, QueryStats, EndOfDay, ExpireOrders, DisableInstrument, EnableInstrument, RemoveInstrument
+
+**Fund management operations** (require `Custodian`):
+- Deposit, Withdraw
+
+**Replication** (require `Replication`):
+- Used for replica-to-primary connections only. Not available for client operations.
 
 **Universal operations** (any permission level):
 - Heartbeat
 
-Permission checking uses `Request::requires_admin()` for admin gating and `Permission::can_trade()` for trading gating. Requests that fail the permission check are dropped on the reader thread and never reach the matching engine.
+Permission checking uses `Request::requires_operator()` for operator gating, `Request::is_fund_management()` for custodian gating, and `Permission::can_trade()` for trading gating. Requests that fail the permission check are dropped on the reader thread and never reach the matching engine.
 
 ### Authorized keys file format
 
 ```
 # <permission> <base64-public-key> <optional-comment>
-admin AAAA...base64...= ops-team
+operator AAAA...base64...= ops-team
 trader BBBB...base64...= market-maker-1
+custodian CCCC...base64...= treasury
 readonly DDDD...base64...= monitoring
+replication EEEE...base64...= replica-1
 ```
 
 Lines starting with `#` and empty lines are ignored. Public keys are 32-byte Ed25519 keys encoded in standard base64. If a key appears multiple times, the last entry wins.
+
+---
+
+## Per-Key Idempotency
+
+Every request frame includes a `seq` field (u64) -- a per-key monotonic sequence number. The server tracks a high-water mark per authentication key (identified by a hash of the public key). If a request arrives with `seq <= hwm`, it is rejected with `DuplicateRequest`.
+
+This makes retries safe: if a client sends an order, loses the connection before receiving the response, and reconnects with the same key, it can safely retry with the same `seq`. If the original request was already processed, the retry is rejected as a duplicate. If it wasn't processed (the server crashed before journaling it), the retry succeeds normally.
+
+The HWM is persisted in the journal and restored on recovery. Heartbeat and ChallengeResponse use `seq = 0` and are exempt from dedup.
 
 ---
 
@@ -470,50 +591,33 @@ For requests that produce a single response (e.g., `CancelOrder` produces one `C
 
 ### Example 1: Heartbeat Request
 
-The simplest possible message -- tag only, no payload.
+The simplest possible message -- tag only, no payload. Seq is 0 (heartbeats are exempt from dedup).
 
 ```
-Frame (5 bytes total):
-  [01 00 00 00]   length = 1 (LE u32)
+Frame (13 bytes total):
+  [09 00 00 00]   length = 9 (LE u32: 8 seq + 1 tag)
+  [00 00 00 00    seq = 0 (LE u64)
+   00 00 00 00]
   [03]            tag = 3 (Heartbeat)
 ```
 
 ### Example 2: CancelOrder Request
 
-Cancel order ID 42 on symbol 1.
+Cancel order ID 42 on symbol 1, account 5, request seq 7.
 
 ```
-Frame (17 bytes total):
-  [0D 00 00 00]   length = 13 (LE u32)
+Frame (25 bytes total):
+  [15 00 00 00]   length = 21 (LE u32: 8 seq + 1 tag + 12 payload)
+  [07 00 00 00    seq = 7 (LE u64)
+   00 00 00 00]
   [02]            tag = 2 (CancelOrder)
   [01 00 00 00]   symbol = 1 (LE u32)
+  [05 00 00 00]   account = 5 (LE u32)
   [2A 00 00 00    order_id = 42 (LE u64)
    00 00 00 00]
 ```
 
-### Example 3: SubmitOrder Request (Limit Buy)
-
-Submit a GTC limit buy: order ID 100, account 42, price 5000, quantity 10, STP=CancelNewest, on symbol 1.
-
-```
-Frame (34 bytes total):
-  [1E 00 00 00]   length = 30 (LE u32: 1 tag + 4 symbol + 25 order)
-  [01]            tag = 1 (SubmitOrder)
-  [01 00 00 00]   symbol = 1 (LE u32)
-  [64 00 00 00    order.id = 100 (LE u64)
-   00 00 00 00]
-  [2A 00 00 00]   order.account = 42 (LE u32)
-  [00]            order.side = 0 (Buy)
-  [01]            order.order_type_tag = 1 (Limit)
-  [88 13 00 00    order.price = 5000 (LE u64)
-   00 00 00 00]
-  [00]            order.time_in_force = 0 (GTC)
-  [0A 00 00 00    order.quantity = 10 (LE u64)
-   00 00 00 00]
-  [01]            order.stp = 1 (CancelNewest)
-```
-
-### Example 4: BatchEnd Response
+### Example 3: BatchEnd Response
 
 ```
 Frame (5 bytes total):
@@ -521,7 +625,7 @@ Frame (5 bytes total):
   [11]            tag = 17 (BatchEnd)
 ```
 
-### Example 5: Challenge Response (server to client)
+### Example 4: Challenge Response (server to client)
 
 ```
 Frame (37 bytes total):
