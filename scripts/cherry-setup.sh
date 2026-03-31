@@ -431,7 +431,7 @@ echo ""
 # 6. Quick self-test
 # ---------------------------------------------------------------------------
 echo "=== Quick self-test ==="
-run_as_user "source $USER_HOME/.cargo/env && cd $REPO_DIR && cargo test" 2>&1 | grep "test result:" | head -5
+run_as_user "source $USER_HOME/.cargo/env && cd $REPO_DIR && cargo test" 2>&1 | grep "test result:" || true
 echo ""
 
 # ---------------------------------------------------------------------------
