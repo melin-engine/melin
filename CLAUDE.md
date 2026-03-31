@@ -1,8 +1,6 @@
 # CLAUDE.md
 
 > **This file must be kept up to date** as the project evolves — update structure, dependencies, and conventions whenever they change.
->
-> **DONE**: Replaced `FxHashMap` with `astenn` (extendible hashing) for all engine HashMaps — grows one bucket at a time, no full-table rehash spikes. ~19% throughput regression vs flat Vec is the cost of sparse storage.
 
 ## Project
 
