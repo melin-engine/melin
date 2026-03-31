@@ -1634,21 +1634,36 @@ pub fn run_receiver(
             );
         })
         .expect("spawn replica shadow thread");
-    let mut shadow_handle = Some(shadow_handle);
-
-    /// Stop the replica shadow thread and wait for it to finish.
-    fn stop_shadow(shutdown: &AtomicBool, handle: &mut Option<std::thread::JoinHandle<()>>) {
-        shutdown.store(true, Ordering::Relaxed);
-        if let Some(h) = handle.take() {
-            let _ = h.join();
+    /// RAII guard that stops the shadow thread on drop. Ensures the thread
+    /// is joined on all exit paths (including early `?` returns and errors)
+    /// so it's never leaked.
+    struct ShadowGuard {
+        shutdown: Arc<AtomicBool>,
+        handle: Option<std::thread::JoinHandle<()>>,
+    }
+    impl ShadowGuard {
+        fn stop(&mut self) {
+            self.shutdown.store(true, Ordering::Relaxed);
+            if let Some(h) = self.handle.take() {
+                let _ = h.join();
+            }
         }
     }
+    impl Drop for ShadowGuard {
+        fn drop(&mut self) {
+            self.stop();
+        }
+    }
+    let mut shadow_guard = ShadowGuard {
+        shutdown: Arc::clone(&shadow_shutdown),
+        handle: Some(shadow_handle),
+    };
 
     // Main receive loop.
     loop {
         if shutdown.load(Ordering::Relaxed) {
             info!("replica shutting down");
-            stop_shadow(&shadow_shutdown, &mut shadow_handle);
+            shadow_guard.stop();
             return Ok(None);
         }
 
@@ -1689,7 +1704,7 @@ pub fn run_receiver(
                 replay_journal_bytes(&journal_accum, &mut exchange, &mut reports, None)?;
                 journal_accum.clear();
             }
-            stop_shadow(&shadow_shutdown, &mut shadow_handle);
+            shadow_guard.stop();
             return Ok(Some((exchange, journal_writer)));
         }
 
@@ -1718,7 +1733,7 @@ pub fn run_receiver(
                 }
 
                 // Shut down shadow thread — no more events to replay.
-                stop_shadow(&shadow_shutdown, &mut shadow_handle);
+                shadow_guard.stop();
 
                 loop {
                     if shutdown.load(Ordering::Relaxed) {
