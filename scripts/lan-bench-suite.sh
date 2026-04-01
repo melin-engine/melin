@@ -481,7 +481,7 @@ transport_start_tcp() {
             ${SERVER_EXTRA_ARGS:-} \
         >/tmp/melin-server.log 2>&1 </dev/null &" </dev/null
 
-    wait_for_log "$SERVER" "/tmp/melin-server.log" "listening" 120 "Server"
+    wait_for_log "$SERVER" "/tmp/melin-server.log" "listening addr=${SERVER_VLAN}:9876" 120 "Server"
     CURRENT_BIND="${SERVER_VLAN}:9876"
     CURRENT_HEALTH="${SERVER_VLAN}:9878"
 }
@@ -519,7 +519,7 @@ transport_start_tcp_repl() {
             --authorized-keys ${REPO_DIR}/authorized_keys \
         >/tmp/trading-replica.log 2>&1 </dev/null &" </dev/null
 
-    wait_for_log "$SERVER" "/tmp/melin-server.log" "listening" 120 "Primary"
+    wait_for_log "$SERVER" "/tmp/melin-server.log" "listening addr=${SERVER_VLAN}:9876" 120 "Primary"
     CURRENT_BIND="${SERVER_VLAN}:9876"
     CURRENT_HEALTH="${SERVER_VLAN}:9878"
 }
@@ -571,7 +571,7 @@ transport_start_tcp_dual_repl() {
             --authorized-keys ${REPO_DIR}/authorized_keys \
         >/tmp/trading-replica.log 2>&1 </dev/null &" </dev/null
 
-    wait_for_log "$SERVER" "/tmp/melin-server.log" "listening" 120 "Primary"
+    wait_for_log "$SERVER" "/tmp/melin-server.log" "listening addr=${SERVER_VLAN}:9876" 120 "Primary"
     CURRENT_BIND="${SERVER_VLAN}:9876"
     CURRENT_HEALTH="${SERVER_VLAN}:9878"
 }
