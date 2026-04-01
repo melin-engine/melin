@@ -1673,28 +1673,6 @@ pub fn run_receiver(
         None
     };
 
-    /// Shut down the pipeline and extract Exchange + JournalWriter from
-    /// the stage threads. Returns None if a thread panicked.
-    fn shutdown_pipeline(
-        shutdown_flag: &AtomicBool,
-        journal_handle: std::thread::JoinHandle<melin_engine::journal::writer::JournalWriter>,
-        matching_handle: std::thread::JoinHandle<melin_engine::exchange::Exchange>,
-        drain_handle: std::thread::JoinHandle<()>,
-        shadow_handle: Option<std::thread::JoinHandle<()>>,
-    ) -> Option<(
-        melin_engine::exchange::Exchange,
-        melin_engine::journal::writer::JournalWriter,
-    )> {
-        shutdown_flag.store(true, Ordering::Relaxed);
-        let writer = journal_handle.join().ok()?;
-        let exchange = matching_handle.join().ok()?;
-        let _ = drain_handle.join();
-        if let Some(h) = shadow_handle {
-            let _ = h.join();
-        }
-        Some((exchange, writer))
-    }
-
     // Reusable buffers for the receive loop.
     let mut frame_buf: Vec<u8> = Vec::with_capacity(64 * 1024);
     let mut journal_accum: Vec<u8> = Vec::with_capacity(128 * 1024);
@@ -1881,6 +1859,29 @@ pub fn run_receiver(
 }
 
 /// Drain DataBatch frames from the TCP buffer using non-blocking poll(0).
+/// Shut down the replica pipeline and extract Exchange + JournalWriter from
+/// the stage threads. Returns None if a thread panicked.
+fn shutdown_pipeline(
+    shutdown_flag: &AtomicBool,
+    journal_handle: std::thread::JoinHandle<melin_engine::journal::writer::JournalWriter>,
+    matching_handle: std::thread::JoinHandle<melin_engine::exchange::Exchange>,
+    drain_handle: std::thread::JoinHandle<()>,
+    shadow_handle: Option<std::thread::JoinHandle<()>>,
+) -> Option<(
+    melin_engine::exchange::Exchange,
+    melin_engine::journal::writer::JournalWriter,
+)> {
+    shutdown_flag.store(true, Ordering::Relaxed);
+    let writer = journal_handle.join().ok()?;
+    let exchange = matching_handle.join().ok()?;
+    let _ = drain_handle.join();
+    if let Some(h) = shadow_handle {
+        let _ = h.join();
+    }
+    Some((exchange, writer))
+}
+
+/// Drain DataBatch frames from the TCP buffer using non-blocking poll(0).
 fn drain_tcp_data_batches(
     reader: &mut TcpStream,
     frame_buf: &mut Vec<u8>,
@@ -1986,156 +1987,6 @@ fn publish_batch_to_pipeline(
     }
 
     Ok(())
-}
-
-/// Replay journal events against the exchange (same as MatchingStage::process_event
-/// but without the output SPSC publishing — replicas don't serve clients).
-///
-/// The reports Vec is caller-owned and reused across calls to avoid
-/// per-event heap allocation.
-/// Decode and replay journal entries from raw bytes into the exchange.
-/// Called AFTER the ack is sent — not on the critical path.
-/// Used by the DPDK receiver path (TCP receiver uses the pipeline instead).
-#[allow(dead_code)]
-fn replay_journal_bytes(
-    journal_bytes: &[u8],
-    exchange: &mut melin_engine::exchange::Exchange,
-    reports: &mut Vec<melin_engine::types::ExecutionReport>,
-    mut shadow_producer: Option<
-        &mut melin_disruptor::ring::Producer<melin_engine::journal::pipeline::InputSlot>,
-    >,
-) -> Result<(), Box<dyn std::error::Error>> {
-    use melin_engine::journal::pipeline::InputSlot;
-
-    let mut offset = 0;
-    while offset < journal_bytes.len() {
-        let remaining = &journal_bytes[offset..];
-        match melin_engine::journal::codec::decode(
-            remaining,
-            melin_engine::journal::codec::FORMAT_VERSION,
-        ) {
-            Ok((consumed, _sequence, _timestamp_ns, key_hash, request_seq, event)) => {
-                // Rebuild per-key HWM state on replica (same as primary replay).
-                exchange.check_request_seq(key_hash, request_seq);
-                replay_event(exchange, &event, reports);
-
-                // Feed the shadow exchange via the disruptor ring.
-                // try_publish avoids blocking the receive thread if the
-                // shadow falls behind — missed events are acceptable since
-                // the shadow's snapshot is best-effort (journal is the
-                // source of truth for recovery).
-                if let Some(ref mut producer) = shadow_producer {
-                    let _ = producer.try_publish(InputSlot {
-                        connection_id: 0,
-                        key_hash,
-                        request_seq,
-                        event,
-                        publish_ts: Default::default(),
-                        recv_ts: Default::default(),
-                    });
-                }
-
-                offset += consumed;
-            }
-            Err(e) => {
-                return Err(
-                    format!("failed to decode journal entry at offset {offset}: {e}").into(),
-                );
-            }
-        }
-    }
-    Ok(())
-}
-
-#[allow(dead_code)]
-fn replay_event(
-    exchange: &mut melin_engine::exchange::Exchange,
-    event: &melin_engine::journal::event::JournalEvent,
-    reports: &mut Vec<melin_engine::types::ExecutionReport>,
-) {
-    use melin_engine::journal::event::JournalEvent;
-
-    reports.clear();
-    match event {
-        JournalEvent::AddInstrument { spec } => {
-            exchange.add_instrument(*spec);
-        }
-        JournalEvent::Deposit {
-            account,
-            currency,
-            amount,
-        } => {
-            exchange.deposit(*account, *currency, *amount);
-        }
-        JournalEvent::SubmitOrder { symbol, order } => {
-            exchange.execute(*symbol, *order, reports);
-        }
-        JournalEvent::CancelOrder {
-            symbol,
-            account,
-            order_id,
-        } => {
-            exchange.cancel(*symbol, *account, *order_id, reports);
-        }
-        JournalEvent::SetRiskLimits { symbol, limits } => {
-            exchange.set_risk_limits(*symbol, *limits);
-        }
-        JournalEvent::CancelAll { account } => {
-            exchange.cancel_all(*account, reports);
-        }
-        JournalEvent::EndOfDay => {
-            exchange.end_of_day(reports);
-        }
-        JournalEvent::ExpireOrders { timestamp_ns } => {
-            exchange.expire_orders(*timestamp_ns, reports);
-        }
-        JournalEvent::SetCircuitBreaker { symbol, config } => {
-            exchange.set_circuit_breaker(*symbol, *config);
-        }
-        JournalEvent::CancelReplace {
-            symbol,
-            account,
-            order_id,
-            new_price,
-            new_quantity,
-        } => {
-            exchange.cancel_replace(
-                *symbol,
-                *account,
-                *order_id,
-                *new_price,
-                *new_quantity,
-                reports,
-            );
-        }
-        JournalEvent::SetFeeSchedule { symbol, schedule } => {
-            exchange.set_fee_schedule(*symbol, *schedule);
-        }
-        JournalEvent::ProvisionAccount { account, amount } => {
-            exchange.provision_account(*account, *amount);
-        }
-        JournalEvent::Withdraw {
-            account,
-            currency,
-            amount,
-        } => {
-            let _ = exchange.withdraw(*account, *currency, *amount);
-        }
-        JournalEvent::DisableInstrument { symbol } => {
-            exchange.disable_instrument(*symbol, reports);
-        }
-        JournalEvent::EnableInstrument { symbol } => {
-            exchange.enable_instrument(*symbol, reports);
-        }
-        JournalEvent::RemoveInstrument { symbol } => {
-            exchange.remove_instrument(*symbol, reports);
-        }
-        JournalEvent::QueryStats
-        | JournalEvent::GenesisHash { .. }
-        | JournalEvent::Checkpoint { .. } => {
-            // No state change.
-        }
-    }
 }
 
 // --- DPDK replication (smoltcp transport) ---
@@ -2559,19 +2410,102 @@ pub fn run_receiver_dpdk(
         journal_writer = Some(writer);
     }
 
-    let mut exchange = exchange.expect("exchange initialized");
-    let mut journal_writer = journal_writer.expect("journal_writer initialized");
-    let mut reports: Vec<melin_engine::types::ExecutionReport> = Vec::with_capacity(256);
+    let exchange = exchange.expect("exchange initialized");
+    let journal_writer = journal_writer.expect("journal_writer initialized");
 
-    // Accumulation buffer for coalescing DataBatch frames into one fsync.
+    // Build the replica pipeline — same as the TCP receiver.
+    let (
+        input_producer,
+        journal_stage,
+        matching_stage,
+        drain_consumer,
+        journal_cursor,
+        _matching_cursor,
+        raw_journal_tx,
+        shadow_consumer,
+        chain_hash_lock,
+    ) = melin_engine::journal::pipeline::build_replica_pipeline(
+        exchange,
+        journal_writer,
+        4096,
+        false, // don't busy-spin on replica
+        true,  // enable shadow for snapshots
+    );
+
+    let pipeline_shutdown = Arc::new(AtomicBool::new(false));
+
+    let ps = Arc::clone(&pipeline_shutdown);
+    let journal_handle = std::thread::Builder::new()
+        .name("journal".into())
+        .spawn(move || journal_stage.run(&ps))
+        .expect("spawn journal thread");
+
+    let ps = Arc::clone(&pipeline_shutdown);
+    let matching_handle = std::thread::Builder::new()
+        .name("matching".into())
+        .spawn(move || matching_stage.run(&ps))
+        .expect("spawn matching thread");
+
+    let ps = Arc::clone(&pipeline_shutdown);
+    let drain_handle = std::thread::Builder::new()
+        .name("drain".into())
+        .spawn(move || {
+            let mut consumer = drain_consumer;
+            let mut batch = vec![melin_engine::journal::pipeline::OutputSlot::default(); 256];
+            loop {
+                if ps.load(Ordering::Relaxed) {
+                    return;
+                }
+                let count = consumer.consume_batch(&mut batch, 256);
+                if count == 0 {
+                    std::thread::yield_now();
+                }
+            }
+        })
+        .expect("spawn drain thread");
+
+    let snapshot_path = journal_path.with_extension("snapshot");
+    let shadow_handle = if let Some(shadow_cons) = shadow_consumer {
+        let snap_path = snapshot_path.clone();
+        let chain_lock = chain_hash_lock.expect("chain hash lock with shadow");
+        let ps = Arc::clone(&pipeline_shutdown);
+        Some(
+            std::thread::Builder::new()
+                .name("replica-shadow".into())
+                .spawn(move || {
+                    crate::shadow::run(
+                        shadow_cons,
+                        melin_engine::exchange::Exchange::new(),
+                        snap_path,
+                        std::time::Duration::from_secs(30),
+                        chain_lock,
+                        &ps,
+                        false,
+                    );
+                })
+                .expect("spawn shadow thread"),
+        )
+    } else {
+        None
+    };
+
     let mut journal_accum: Vec<u8> = Vec::with_capacity(128 * 1024);
-    let mut accum_entry_count: u64 = 0;
+    let mut accum_entry_count: u32 = 0;
     let mut accum_end_sequence: u64 = 0;
+    let mut accum_chain_hash: [u8; 32] = [0u8; 32];
 
     // Main receive loop.
     loop {
         if shutdown.load(Ordering::Relaxed) {
             info!("replica shutting down (DPDK)");
+            drop(raw_journal_tx);
+            shutdown_pipeline(
+                &pipeline_shutdown,
+                journal_handle,
+                matching_handle,
+                drain_handle,
+                shadow_handle,
+            );
             return Ok(None);
         }
 
@@ -2585,36 +2519,53 @@ pub fn run_receiver_dpdk(
                 if recv_buf.len() == before {
                     break;
                 }
-                // Parse any complete DataBatch frames.
                 let mut consumed = 0;
                 loop {
                     let remaining = &recv_buf[consumed..];
                     match try_extract_frame(remaining, MAX_DATA_FRAME) {
                         FrameResult::Complete(ps, fe) => {
                             if let Ok(PrimaryMessage::DataBatch {
+                                end_sequence,
                                 entry_count,
                                 journal_bytes,
-                                ..
+                                chain_hash: batch_chain_hash,
                             }) = decode_primary_message(&remaining[ps..fe])
                             {
                                 journal_accum.extend_from_slice(&journal_bytes);
-                                accum_entry_count += entry_count as u64;
+                                accum_entry_count += entry_count;
+                                accum_end_sequence = end_sequence;
+                                accum_chain_hash = batch_chain_hash;
                             }
                             consumed += fe;
                         }
-                        _ => {
-                            break;
-                        }
+                        _ => break,
                     }
                 }
                 compact_recv_buf(&mut recv_buf, consumed);
             }
             if !journal_accum.is_empty() {
-                journal_writer.write_raw_sync(&journal_accum, accum_entry_count)?;
-                replay_journal_bytes(&journal_accum, &mut exchange, &mut reports, None)?;
+                let _ = publish_batch_to_pipeline(
+                    &journal_accum,
+                    accum_entry_count,
+                    accum_end_sequence,
+                    accum_chain_hash,
+                    &input_producer,
+                    &raw_journal_tx,
+                    &journal_cursor,
+                );
                 journal_accum.clear();
             }
-            return Ok(Some((exchange, journal_writer)));
+            drop(raw_journal_tx);
+            return match shutdown_pipeline(
+                &pipeline_shutdown,
+                journal_handle,
+                matching_handle,
+                drain_handle,
+                shadow_handle,
+            ) {
+                Some((exchange, writer)) => Ok(Some((exchange, writer))),
+                None => Err("pipeline thread panicked during promotion (DPDK)".into()),
+            };
         }
 
         // Poll smoltcp and receive data.
@@ -2623,6 +2574,14 @@ pub fn run_receiver_dpdk(
 
         // Check for disconnect.
         if !transport.is_active(handle) && recv_buf.is_empty() {
+            drop(raw_journal_tx);
+            shutdown_pipeline(
+                &pipeline_shutdown,
+                journal_handle,
+                matching_handle,
+                drain_handle,
+                shadow_handle,
+            );
             return Err("disconnected from primary (DPDK)".into());
         }
 
@@ -2639,11 +2598,12 @@ pub fn run_receiver_dpdk(
                             end_sequence,
                             entry_count,
                             journal_bytes,
-                            ..
+                            chain_hash: batch_chain_hash,
                         }) => {
                             journal_accum.extend_from_slice(&journal_bytes);
-                            accum_entry_count += entry_count as u64;
+                            accum_entry_count += entry_count;
                             accum_end_sequence = end_sequence;
+                            accum_chain_hash = batch_chain_hash;
                             got_data = true;
                         }
                         Ok(PrimaryMessage::Heartbeat {
@@ -2656,12 +2616,28 @@ pub fn run_receiver_dpdk(
                             debug!("unexpected message during streaming: {other:?}");
                         }
                         Err(e) => {
+                            drop(raw_journal_tx);
+                            shutdown_pipeline(
+                                &pipeline_shutdown,
+                                journal_handle,
+                                matching_handle,
+                                drain_handle,
+                                shadow_handle,
+                            );
                             return Err(format!("failed to decode primary message: {e}").into());
                         }
                     }
                     consumed += frame_end;
                 }
                 FrameResult::Oversized => {
+                    drop(raw_journal_tx);
+                    shutdown_pipeline(
+                        &pipeline_shutdown,
+                        journal_handle,
+                        matching_handle,
+                        drain_handle,
+                        shadow_handle,
+                    );
                     return Err("oversized frame from primary during streaming".into());
                 }
                 FrameResult::Incomplete => break,
@@ -2669,20 +2645,25 @@ pub fn run_receiver_dpdk(
         }
         compact_recv_buf(&mut recv_buf, consumed);
 
-        // Fsync + ack + replay if we accumulated data.
+        // Publish to pipeline, wait for fsync, then ack.
         if got_data {
-            journal_writer.write_raw_sync(&journal_accum, accum_entry_count)?;
+            publish_batch_to_pipeline(
+                &journal_accum,
+                accum_entry_count,
+                accum_end_sequence,
+                accum_chain_hash,
+                &input_producer,
+                &raw_journal_tx,
+                &journal_cursor,
+            )?;
 
-            // Ack immediately — data is durable on disk.
+            // Ack — data is durable.
             send_buf.clear();
             let ack = Ack {
                 acked_sequence: accum_end_sequence,
             };
             encode_ack(&ack, &mut send_buf);
             transport.queue_send(handle, &send_buf);
-
-            // Replay AFTER acking — not on the critical path.
-            replay_journal_bytes(&journal_accum, &mut exchange, &mut reports, None)?;
 
             journal_accum.clear();
             accum_entry_count = 0;
