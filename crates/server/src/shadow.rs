@@ -60,6 +60,9 @@ pub fn run(
 
     let mut last_snapshot = Instant::now();
     let mut idle_spins: u32 = 0;
+    // Track whether any events have been consumed. Prevents snapshotting
+    // empty state before the first event arrives.
+    let mut has_events = false;
 
     loop {
         if shutdown.load(Ordering::Relaxed) {
@@ -69,43 +72,57 @@ pub fn run(
 
         let count = consumer.consume_batch(&mut batch, SHADOW_BATCH_SIZE);
         if count == 0 {
+            // Check snapshot timer even when idle — events may have been
+            // consumed before the interval elapsed, and no more events
+            // will arrive to trigger the post-consume check.
+            if has_events && last_snapshot.elapsed() >= snapshot_interval {
+                let last_seq = consumer.next_read().saturating_sub(1);
+                save_snapshot(&exchange, last_seq, &chain_hash_lock, &snapshot_path);
+                last_snapshot = Instant::now();
+            }
             idle_wait(&mut idle_spins, busy_spin);
             continue;
         }
         idle_spins = 0;
+        has_events = true;
 
         // Replay each event on the shadow exchange.
         for slot in &batch[..count] {
             dispatch_event(&mut exchange, &slot.event, &mut reports);
         }
 
-        // Track the last consumed input sequence.
-        // consumer.next_read() is the *next* sequence to read, so the last
-        // consumed is next_read - 1.
-        let last_seq = consumer.next_read() - 1;
-
-        // Check if a snapshot is due. Only runs after processing events —
-        // no point snapshotting unchanged state during idle periods.
+        // Check if a snapshot is due.
         if last_snapshot.elapsed() >= snapshot_interval {
-            let chain_hash = chain_hash_lock.load();
-            match snapshot::save(&exchange, last_seq, chain_hash, &snapshot_path) {
-                Ok(()) => {
-                    info!(
-                        sequence = last_seq,
-                        path = %snapshot_path.display(),
-                        "shadow snapshot saved"
-                    );
-                }
-                Err(e) => {
-                    error!(
-                        sequence = last_seq,
-                        error = %e,
-                        path = %snapshot_path.display(),
-                        "shadow snapshot failed"
-                    );
-                }
-            }
+            let last_seq = consumer.next_read() - 1;
+            save_snapshot(&exchange, last_seq, &chain_hash_lock, &snapshot_path);
             last_snapshot = Instant::now();
+        }
+    }
+}
+
+/// Save a shadow snapshot, logging success or failure.
+fn save_snapshot(
+    exchange: &Exchange,
+    sequence: u64,
+    chain_hash_lock: &Arc<SeqLock<[u8; 32]>>,
+    path: &std::path::Path,
+) {
+    let chain_hash = chain_hash_lock.load();
+    match snapshot::save(exchange, sequence, chain_hash, path) {
+        Ok(()) => {
+            info!(
+                sequence,
+                path = %path.display(),
+                "shadow snapshot saved"
+            );
+        }
+        Err(e) => {
+            error!(
+                sequence,
+                error = %e,
+                path = %path.display(),
+                "shadow snapshot failed"
+            );
         }
     }
 }
@@ -617,8 +634,9 @@ mod tests {
             })
             .unwrap();
 
-        // Publish an initial event immediately — processed before the
-        // interval elapses, so no snapshot yet.
+        // Publish both events before the interval elapses so the snapshot
+        // captures both deposits. The idle-check fires the snapshot after
+        // the 50ms interval even without new events arriving.
         producer.publish(InputSlot {
             connection_id: 0,
             key_hash: 0,
@@ -631,10 +649,6 @@ mod tests {
             publish_ts: Default::default(),
             recv_ts: Default::default(),
         });
-
-        // Wait for the interval to elapse, then publish another event
-        // to trigger the snapshot check.
-        std::thread::sleep(Duration::from_millis(100));
         producer.publish(InputSlot {
             connection_id: 0,
             key_hash: 0,
@@ -648,7 +662,8 @@ mod tests {
             recv_ts: Default::default(),
         });
 
-        // Wait for the snapshot to be written.
+        // Wait for the snapshot to be written (idle-check triggers it
+        // after the 50ms interval elapses).
         let deadline = Instant::now() + Duration::from_secs(2);
         while !snap_path.exists() && Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(10));

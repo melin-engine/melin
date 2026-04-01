@@ -30,6 +30,7 @@ See [README.md](README.md#features) for implemented features and [docs/roadmap.m
 - **Never push without explicit confirmation** — always ask for review before pushing. Do not push unless the user confirms.
 - **Commit intermediary steps** — for large multi-step tasks, commit each logical step separately rather than batching everything into one giant commit. This keeps history clean and bisectable. Always ask for review after each commit before moving to the next.
 - **Always check `Cargo.lock`** — when dependencies change, `Cargo.lock` must be staged and committed alongside `Cargo.toml` changes. The pre-commit hook enforces this.
+- **Never skip hooks** — do not use `--no-verify` to bypass the pre-commit hook. If the hook fails (clippy warnings, formatting), fix the issue first. The hook exists to catch problems before they enter history.
 
 ## Key Design Constraints
 

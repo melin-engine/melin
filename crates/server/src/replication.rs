@@ -1715,8 +1715,6 @@ pub fn run_receiver(
                     &raw_journal_tx,
                     &journal_cursor,
                 )?;
-                journal_accum.clear();
-                accum_entry_count = 0;
             }
             // Shut down pipeline and extract Exchange + JournalWriter.
             drop(raw_journal_tx); // unblock journal stage if waiting on channel
@@ -1753,8 +1751,6 @@ pub fn run_receiver(
                         &raw_journal_tx,
                         &journal_cursor,
                     );
-                    journal_accum.clear();
-                    accum_entry_count = 0;
                 }
                 // Wait for promotion or shutdown.
                 loop {
