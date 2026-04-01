@@ -87,10 +87,7 @@ fn run(
 ///
 /// Returns `Ok(())` if the connection authenticated with an operator key.
 /// Returns `Err` with a reason string on any failure.
-fn authenticate(
-    stream: &mut TcpStream,
-    authorized_keys: &AuthorizedKeys,
-) -> Result<(), String> {
+fn authenticate(stream: &mut TcpStream, authorized_keys: &AuthorizedKeys) -> Result<(), String> {
     // Generate a 32-byte random nonce.
     let mut nonce = [0u8; 32];
     getrandom::fill(&mut nonce).map_err(|e| format!("getrandom failed: {e}"))?;
@@ -102,7 +99,9 @@ fn authenticate(
     stream
         .write_all(&buf[..written])
         .map_err(|e| format!("send Challenge: {e}"))?;
-    stream.flush().map_err(|e| format!("flush Challenge: {e}"))?;
+    stream
+        .flush()
+        .map_err(|e| format!("flush Challenge: {e}"))?;
 
     // Read ChallengeResponse frame (length-prefixed).
     let mut len_buf = [0u8; 4];
@@ -147,7 +146,9 @@ fn authenticate(
     };
     if permission != Permission::Operator {
         send_auth_failed(stream);
-        return Err(format!("promotion requires operator key, got {permission:?}"));
+        return Err(format!(
+            "promotion requires operator key, got {permission:?}"
+        ));
     }
 
     // Verify the Ed25519 signature over the nonce.
@@ -349,12 +350,7 @@ mod tests {
         let (key, auth_keys) = operator_keys();
         let promote = Arc::new(AtomicBool::new(false));
         let shutdown = Arc::new(AtomicBool::new(false));
-        let _handle = spawn(
-            addr,
-            Arc::clone(&promote),
-            Arc::clone(&shutdown),
-            auth_keys,
-        );
+        let _handle = spawn(addr, Arc::clone(&promote), Arc::clone(&shutdown), auth_keys);
 
         std::thread::sleep(Duration::from_millis(200));
 
@@ -384,12 +380,7 @@ mod tests {
         let (_key, auth_keys) = operator_keys();
         let promote = Arc::new(AtomicBool::new(false));
         let shutdown = Arc::new(AtomicBool::new(false));
-        let _handle = spawn(
-            addr,
-            Arc::clone(&promote),
-            Arc::clone(&shutdown),
-            auth_keys,
-        );
+        let _handle = spawn(addr, Arc::clone(&promote), Arc::clone(&shutdown), auth_keys);
 
         std::thread::sleep(Duration::from_millis(200));
 
@@ -415,12 +406,7 @@ mod tests {
         let (_key, auth_keys) = operator_keys();
         let promote = Arc::new(AtomicBool::new(false));
         let shutdown = Arc::new(AtomicBool::new(false));
-        let _handle = spawn(
-            addr,
-            Arc::clone(&promote),
-            Arc::clone(&shutdown),
-            auth_keys,
-        );
+        let _handle = spawn(addr, Arc::clone(&promote), Arc::clone(&shutdown), auth_keys);
 
         std::thread::sleep(Duration::from_millis(200));
 
@@ -443,12 +429,7 @@ mod tests {
         let (trader_key, auth_keys) = trader_keys();
         let promote = Arc::new(AtomicBool::new(false));
         let shutdown = Arc::new(AtomicBool::new(false));
-        let _handle = spawn(
-            addr,
-            Arc::clone(&promote),
-            Arc::clone(&shutdown),
-            auth_keys,
-        );
+        let _handle = spawn(addr, Arc::clone(&promote), Arc::clone(&shutdown), auth_keys);
 
         std::thread::sleep(Duration::from_millis(200));
 
@@ -472,12 +453,7 @@ mod tests {
         let (operator_key, auth_keys) = operator_keys();
         let promote = Arc::new(AtomicBool::new(false));
         let shutdown = Arc::new(AtomicBool::new(false));
-        let _handle = spawn(
-            addr,
-            Arc::clone(&promote),
-            Arc::clone(&shutdown),
-            auth_keys,
-        );
+        let _handle = spawn(addr, Arc::clone(&promote), Arc::clone(&shutdown), auth_keys);
 
         std::thread::sleep(Duration::from_millis(200));
 
@@ -530,12 +506,7 @@ mod tests {
         let (_key, auth_keys) = operator_keys();
         let promote = Arc::new(AtomicBool::new(false));
         let shutdown = Arc::new(AtomicBool::new(false));
-        let _handle = spawn(
-            addr,
-            Arc::clone(&promote),
-            Arc::clone(&shutdown),
-            auth_keys,
-        );
+        let _handle = spawn(addr, Arc::clone(&promote), Arc::clone(&shutdown), auth_keys);
 
         std::thread::sleep(Duration::from_millis(200));
 

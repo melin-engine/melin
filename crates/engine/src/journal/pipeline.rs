@@ -462,8 +462,10 @@ impl JournalStage {
                             let bytes = self.writer.pending_batch_bytes();
                             if !bytes.is_empty() {
                                 let end_seq = self.writer.next_sequence() - 1;
-                                let chain = self.writer.chain_hash().unwrap_or([0u8; 32]);
-                                producer.publish(bytes, end_seq, chain, pending as u32);
+                                // Chain hash is zeroed — replicas don't verify
+                                // per-batch chain hashes (only checkpoint hashes).
+                                // Avoids the O(n) hasher clone on every batch.
+                                producer.publish(bytes, end_seq, [0u8; 32], pending as u32);
                             }
                         }
 
