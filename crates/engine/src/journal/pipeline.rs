@@ -20,6 +20,7 @@
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::mpsc;
 use std::time::Duration;
 
 use crate::exchange::Exchange;
@@ -212,6 +213,25 @@ pub struct JournalStage {
     /// When true, never yield to the OS scheduler — spin indefinitely with
     /// PAUSE. Requires isolated cores (`isolcpus`). See [`idle_wait`].
     busy_spin: bool,
+    /// In replica mode, receives pre-encoded journal byte batches from the
+    /// replication receiver thread. The journal stage writes these raw bytes
+    /// instead of encoding events from the disruptor. This preserves
+    /// byte-identical journals between primary and replica.
+    raw_journal_rx: Option<mpsc::Receiver<RawJournalBatch>>,
+}
+
+/// Pre-encoded journal batch from the primary, sent by the replication
+/// receiver to the journal stage via a bounded channel. The journal stage
+/// writes these bytes with `write_raw_sync` instead of encoding events.
+pub struct RawJournalBatch {
+    /// Raw journal entry bytes (already encoded by the primary).
+    pub bytes: Vec<u8>,
+    /// Journal sequence of the last entry in this batch.
+    pub end_sequence: u64,
+    /// BLAKE3 chain hash after all entries in this batch.
+    pub chain_hash: [u8; 32],
+    /// Number of journal entries in this batch.
+    pub entry_count: u32,
 }
 
 impl JournalStage {
@@ -236,7 +256,15 @@ impl JournalStage {
             replication_producer: None,
             chain_hash: None,
             busy_spin,
+            raw_journal_rx: None,
         }
+    }
+
+    /// Set the raw journal receiver for replica mode. When set, the journal
+    /// stage writes pre-encoded bytes from the replication receiver instead
+    /// of encoding events from the disruptor.
+    pub fn set_raw_journal_receiver(&mut self, rx: mpsc::Receiver<RawJournalBatch>) {
+        self.raw_journal_rx = Some(rx);
     }
 
     /// Set the replication ring producer. When set, the journal stage
@@ -261,6 +289,12 @@ impl JournalStage {
     ///
     /// Returns the `JournalWriter` on shutdown for clean resource release.
     pub fn run(self, shutdown: &std::sync::atomic::AtomicBool) -> JournalWriter {
+        // Replica mode: write raw bytes from the replication receiver
+        // instead of encoding events from the disruptor.
+        if self.raw_journal_rx.is_some() {
+            return self.run_replica(shutdown);
+        }
+
         #[cfg(all(
             feature = "io-uring",
             not(feature = "no-fsync"),
@@ -457,6 +491,69 @@ impl JournalStage {
                     idle_count += 1;
                 }
                 idle_wait(&mut idle_spins, self.busy_spin);
+            }
+        }
+    }
+
+    /// Replica journal loop: writes pre-encoded bytes from the replication
+    /// receiver while consuming (and discarding) events from the disruptor
+    /// to advance the cursor. The cursor advance happens AFTER `write_raw_sync`
+    /// completes, preserving the persist-before-ack guarantee.
+    fn run_replica(mut self, shutdown: &std::sync::atomic::AtomicBool) -> JournalWriter {
+        let rx = self
+            .raw_journal_rx
+            .take()
+            .expect("run_replica called without raw_journal_rx");
+        let mut batch = [InputSlot::default(); MAX_JOURNAL_BATCH];
+        let mut idle_spins: u32 = 0;
+
+        loop {
+            if shutdown.load(Ordering::Relaxed) {
+                // Drain remaining disruptor events before shutdown.
+                self.drain_remaining(&mut batch);
+                return self.writer;
+            }
+
+            // Try to receive a raw journal batch from the replication receiver.
+            match rx.try_recv() {
+                Ok(raw_batch) => {
+                    idle_spins = 0;
+
+                    // Write raw bytes to journal (durable write).
+                    self.writer
+                        .write_raw_sync(&raw_batch.bytes, raw_batch.entry_count as u64)
+                        .unwrap_or_else(|e| panic!("fatal replica journal I/O error: {e}"));
+
+                    self.publish_chain_hash();
+
+                    // Consume the corresponding events from the disruptor to
+                    // advance the cursor. The receiver published exactly
+                    // entry_count events before sending this raw batch.
+                    let mut remaining = raw_batch.entry_count as usize;
+                    while remaining > 0 {
+                        let count = self
+                            .consumer
+                            .read_batch(&mut batch, remaining.min(MAX_JOURNAL_BATCH));
+                        if count > 0 {
+                            // Discard events — they were already encoded in
+                            // raw_batch.bytes by the primary.
+                            self.consumer.commit(count);
+                            remaining -= count;
+                        } else {
+                            // Events not yet published to the disruptor by
+                            // the receiver thread — spin briefly.
+                            std::hint::spin_loop();
+                        }
+                    }
+                }
+                Err(mpsc::TryRecvError::Empty) => {
+                    idle_wait(&mut idle_spins, self.busy_spin);
+                }
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    // Receiver thread exited — drain and shut down.
+                    self.drain_remaining(&mut batch);
+                    return self.writer;
+                }
             }
         }
     }
@@ -1475,6 +1572,113 @@ pub fn build_pipeline_with_replication(
         replication_consumers,
         replication_cursor,
         replicas_connected,
+        shadow_consumer,
+        chain_hash_lock,
+    )
+}
+
+/// Build a pipeline for replica mode. Same disruptor stages as the primary
+/// (journal → matching → shadow), but:
+/// - No replication ring (this IS the replica)
+/// - No `replicas_connected` halt check
+/// - Journal stage uses raw-write mode (pre-encoded bytes from primary)
+/// - Output disruptor has a single drain consumer (no response stage)
+///
+/// Returns the input producer (for the replication receiver), the pipeline
+/// stages, the journal cursor (for ack gating), and a `SyncSender` for
+/// sending raw journal batches to the journal stage.
+#[allow(clippy::type_complexity)]
+pub fn build_replica_pipeline(
+    exchange: Exchange,
+    writer: JournalWriter,
+    max_journal_batch: usize,
+    busy_spin: bool,
+    enable_shadow: bool,
+) -> (
+    ring::MultiProducer<InputSlot>,
+    JournalStage,
+    MatchingStage,
+    ring::Consumer<OutputSlot>,
+    Arc<Sequence>,
+    Arc<Sequence>,
+    mpsc::SyncSender<RawJournalBatch>,
+    Option<ring::Consumer<InputSlot>>,
+    Option<Arc<SeqLock<[u8; 32]>>>,
+) {
+    // Input disruptor: same topology as primary (journal + matching in parallel,
+    // optional shadow gated on journal).
+    let mut builder = ring::DisruptorBuilder::<InputSlot>::new(INPUT_RING_CAPACITY)
+        .add_consumer() // consumer 0: journal
+        .add_consumer(); // consumer 1: matching (parallel)
+    if enable_shadow {
+        builder = builder.add_consumer_after(0); // consumer 2: shadow, gated on journal
+    }
+    let (input_producer, mut consumers) = builder.build_multi_producer();
+
+    let shadow_consumer = if enable_shadow {
+        Some(consumers.pop().expect("shadow consumer"))
+    } else {
+        None
+    };
+    let matching_consumer = consumers.pop().expect("matching consumer");
+    let journal_consumer = consumers.pop().expect("journal consumer");
+
+    let journal_cursor = journal_consumer.progress_counter();
+    let matching_cursor = matching_consumer.progress_counter();
+
+    // Output disruptor: single drain consumer (no response stage on replica).
+    let output_builder =
+        ring::DisruptorBuilder::<OutputSlot>::new(OUTPUT_RING_CAPACITY).add_consumer();
+    let (output_producer, mut output_consumers) = output_builder.build();
+    let drain_consumer = output_consumers.pop().expect("drain consumer");
+
+    let events_processed = Arc::new(AtomicU64::new(0));
+
+    // Journal stage in replica mode: raw-write via bounded channel.
+    // Channel capacity 4: enough buffering for a few batches without
+    // unbounded growth. The receiver thread blocks on send if the
+    // journal stage can't keep up (backpressure).
+    let (raw_tx, raw_rx) = mpsc::sync_channel::<RawJournalBatch>(4);
+    let mut journal_stage = JournalStage::new(
+        writer,
+        journal_consumer,
+        Duration::ZERO, // no group commit delay in replica mode
+        max_journal_batch,
+        busy_spin,
+    );
+    journal_stage.set_raw_journal_receiver(raw_rx);
+
+    // Chain hash SeqLock for shadow snapshots.
+    let chain_hash_lock = if enable_shadow {
+        let lock = Arc::new(SeqLock::new([0u8; 32]));
+        journal_stage.set_chain_hash_lock(Arc::clone(&lock));
+        Some(lock)
+    } else {
+        None
+    };
+
+    // Matching stage: same as primary but with no replicas_connected check
+    // (None = standalone mode, never halts on replica disconnect).
+    let active_connections = Arc::new(AtomicU64::new(0));
+    let matching_stage = MatchingStage::new(
+        exchange,
+        matching_consumer,
+        output_producer,
+        Arc::clone(&events_processed),
+        Arc::clone(&journal_cursor),
+        active_connections,
+        None, // no replicas_connected halt check on replica
+        busy_spin,
+    );
+
+    (
+        input_producer,
+        journal_stage,
+        matching_stage,
+        drain_consumer,
+        journal_cursor,
+        matching_cursor,
+        raw_tx,
         shadow_consumer,
         chain_hash_lock,
     )
