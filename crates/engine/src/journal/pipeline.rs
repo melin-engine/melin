@@ -2537,7 +2537,7 @@ mod tests {
                 connection_id: 0,
                 key_hash: 0,
                 request_seq: 0,
-                event: event.clone(),
+                event: *event,
                 publish_ts: trace_ts(),
                 recv_ts: trace_ts(),
             });
@@ -2571,9 +2571,15 @@ mod tests {
         {
             let mut reader = crate::journal::JournalReader::open(&replica_path).unwrap();
             let e1 = reader.next_entry().unwrap().unwrap();
-            assert!(matches!(e1.event, JournalEvent::Deposit { amount: 500, .. }));
+            assert!(matches!(
+                e1.event,
+                JournalEvent::Deposit { amount: 500, .. }
+            ));
             let e2 = reader.next_entry().unwrap().unwrap();
-            assert!(matches!(e2.event, JournalEvent::Deposit { amount: 300, .. }));
+            assert!(matches!(
+                e2.event,
+                JournalEvent::Deposit { amount: 300, .. }
+            ));
             assert!(reader.next_entry().unwrap().is_none());
         }
     }
@@ -2645,7 +2651,7 @@ mod tests {
             connection_id: 0,
             key_hash: 0,
             request_seq: 0,
-            event: deposit.clone(),
+            event: deposit,
             publish_ts: trace_ts(),
             recv_ts: trace_ts(),
         });

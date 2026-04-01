@@ -2,5 +2,6 @@
 crates/dpdk/target/
 *.journal
 proptest-regressions/
-test.key
-test.pub
+authorized_keys
+*.key
+*.pub

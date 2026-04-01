@@ -9,7 +9,7 @@
 //!     melin-keygen <name> <permission>
 //!
 //! Example:
-//!     melin-keygen ops admin
+//!     melin-keygen ops operator
 //!     melin-keygen market-maker trader
 //!     melin-keygen monitor readonly
 

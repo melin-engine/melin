@@ -364,6 +364,19 @@ if [[ -n "$REPL_AUTH_LINE" ]]; then
     FULL_AUTH="${FULL_AUTH}\n${REPL_AUTH_LINE}"
 fi
 ssh $SSH_OPTS "$SERVER" "cd ${REPO_DIR} && echo -e '${FULL_AUTH}' > authorized_keys"
+
+# Distribute authorized_keys to replicas so they don't use stale files.
+if [[ -n "$REPLICA" ]]; then
+    scp $SSH_OPTS -q "${SSH_USER}@${SERVER_PUB}:${REPO_DIR}/authorized_keys" /tmp/bench-authorized_keys
+    scp $SSH_OPTS -q /tmp/bench-authorized_keys "${REPLICA}:${REPO_DIR}/authorized_keys"
+    echo "  Distributed authorized_keys to replica"
+fi
+if [[ -n "$REPLICA2" ]]; then
+    scp $SSH_OPTS -q /tmp/bench-authorized_keys "${REPLICA2}:${REPO_DIR}/authorized_keys"
+    echo "  Distributed authorized_keys to replica2"
+fi
+rm -f /tmp/bench-authorized_keys
+
 echo "  Auth keys configured."
 echo ""
 
