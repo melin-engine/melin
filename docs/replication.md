@@ -8,29 +8,30 @@ Synchronous journal replication from a primary server to a replica, providing ze
 
 ```
 Primary:
-  Readers → Disruptor → JournalStage  (consumer 0) → disk + replication channel
+  Readers → Disruptor → JournalStage  (consumer 0) → disk + replication rings
                        → MatchingStage (consumer 1) → OutputSPSC
 
-  JournalStage: after flush_batch_sync(), sends a copy of the
-  exact bytes written to disk to the replication sender thread.
+  JournalStage: after flush_batch_sync(), publishes batch bytes to
+  two independent SPSC replication rings (one per replica slot).
 
-  ReplicationSender thread: streams DataBatch frames to replica,
-  processes acks, updates replication_cursor.
+  ReplicationSender threads: each consumes from its own ring,
+  streams DataBatch frames to its replica, processes acks,
+  updates replication_cursor.
 
   ResponseStage gates on min(journal_cursor, replication_cursor)
 
 Replica:
-  TCP → ReplicationReceiver → decode entries, verify CRC
-      → write_raw_sync() (byte-for-byte copy to local journal)
-      → replay into Exchange (state)
-      → ack sequence back to primary
+  TCP → ReplicationReceiver → decode entries, publish to disruptor
+      → JournalStage writes raw bytes (byte-for-byte copy)
+      → MatchingStage replays into Exchange (warm state)
+      → ack sequence back to primary after journal cursor advances
 ```
 
-### Pipeline integration
+### Replication rings and fault isolation
 
-Replication is integrated into the `JournalStage` rather than running as a separate disruptor consumer. Before each `flush_batch_sync()`, the journal stage copies its pending batch buffer into a pre-allocated slot in a lock-free replication ring (configurable via `--replication-ring-size`, default 256 slots × 512 KiB = 128 MiB). The replication sender thread consumes from this ring and streams batches to the replica. This guarantees the replicated bytes are **identical** to what was written to disk — same sequences, timestamps, CRC checksums, and checkpoint entries. No heap allocation on the journal thread — just a flat memcpy into the ring.
+Each replica slot has its own independent ring buffer (configurable via `--replication-ring-size`, default 64 slots x 512 KiB = 32 MiB per ring, 64 MiB total for dual replication). The replicated bytes are identical to what is written to the primary's journal — same sequences, timestamps, CRC checksums, and checkpoint entries.
 
-This design avoids a class of bugs where a separate replication consumer would re-encode events independently, producing different timestamps, missing auto-emitted checkpoint entries, and diverging BLAKE3 chain hashes.
+**Fault isolation**: a slow replica only stalls its own ring, not the other replica's. If a ring is full for longer than 500ms (replica not keeping up), the primary automatically disconnects that replica and frees the ring. The slot becomes available for a new connection. The surviving replica and client trading are unaffected.
 
 ### Ack-after-replicate
 
@@ -195,15 +196,6 @@ The primary's raw genesis entry bytes (including the original timestamp) are sen
 
 Dual replication is now supported — the primary accepts up to 2 concurrent replica connections, each with its own replication ring consumer and handler thread. If one replica fails, trading continues with the surviving replica. Trading halts only when all replicas disconnect. The replication cursor uses `fetch_max` so either replica's acks advance the response gate.
 
-### Backpressure from replication channel can stall the pipeline
-
-**What**: The journal stage publishes to a lock-free replication ring (default 256 slots × 512 KiB = 128 MiB, configurable via `--replication-ring-size`). If the sender thread is slow (network saturated, replica not acking), the ring fills and the journal stage spins in `try_claim()`. This blocks the journal stage, which blocks the disruptor, which blocks all reader threads.
-
-**Impact**: Under extreme replication lag, client request processing stalls. The 1M-slot disruptor ring provides substantial buffering before this happens (~100ms at 10M events/sec), but a multi-second network partition would trigger it.
-
-**Mitigation**: On replica disconnect, the sender thread drains the ring (discards batches) and the cursor resets to `u64::MAX`, unblocking the pipeline.
-
-**Resolution**: Consider a non-blocking publish with overflow detection, or increasing the ring capacity (currently 64 slots = 8 MiB).
 
 ### `read_frame` partial read on timeout
 

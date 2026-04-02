@@ -254,10 +254,10 @@ fi
 
 GIT_CMD="git pull --ff-only"
 if [[ -n "${BENCH_BRANCH:-}" ]]; then
-    GIT_CMD="git fetch origin && git checkout ${BENCH_BRANCH} && git reset --hard origin/${BENCH_BRANCH}"
+    GIT_CMD="git fetch origin && git checkout ${BENCH_BRANCH} && git reset --hard origin/${BENCH_BRANCH} && find crates -name '*.rs' -exec touch {} +"
     echo "=== Using branch: ${BENCH_BRANCH} ==="
 elif [[ -n "${BENCH_COMMIT:-}" ]]; then
-    GIT_CMD="git fetch origin && git checkout ${BENCH_COMMIT}"
+    GIT_CMD="git fetch origin && git checkout ${BENCH_COMMIT} && find crates -name '*.rs' -exec touch {} +"
     echo "=== Using commit: ${BENCH_COMMIT} ==="
 fi
 
@@ -517,6 +517,7 @@ transport_start_tcp_repl() {
             --replication-key ${REPO_DIR}/repl.key \
             --journal ${replica_journal} \
             --authorized-keys ${REPO_DIR}/authorized_keys \
+            ${REPLICA_EXTRA_ARGS:-} \
         >/tmp/trading-replica.log 2>&1 </dev/null &" </dev/null
 
     wait_for_log "$SERVER" "/tmp/melin-server.log" "listening addr=${SERVER_VLAN}:9876" 120 "Primary"
@@ -560,6 +561,7 @@ transport_start_tcp_dual_repl() {
             --replication-key ${REPO_DIR}/repl.key \
             --journal ${replica_journal} \
             --authorized-keys ${REPO_DIR}/authorized_keys \
+            ${REPLICA_EXTRA_ARGS:-} \
         >/tmp/trading-replica.log 2>&1 </dev/null &" </dev/null
 
     ssh $SSH_OPTS "$REPLICA2" "pkill -x melin-server 2>/dev/null; true"
@@ -569,6 +571,7 @@ transport_start_tcp_dual_repl() {
             --replication-key ${REPO_DIR}/repl.key \
             --journal ${replica2_journal} \
             --authorized-keys ${REPO_DIR}/authorized_keys \
+            ${REPLICA_EXTRA_ARGS:-} \
         >/tmp/trading-replica.log 2>&1 </dev/null &" </dev/null
 
     wait_for_log "$SERVER" "/tmp/melin-server.log" "listening addr=${SERVER_VLAN}:9876" 120 "Primary"
@@ -1172,9 +1175,9 @@ if [[ "$RUN_PLOTS" == "1" ]]; then
             [[ -f "$f" ]] || continue
             label="$(basename "$f" .json)"
             echo "  Generating stability: ${label}..."
-            "${PLOT_TOOL}" stability -o "${PLOT_DIR}/latency-stability-${label}.svg" "$f" 2>&1
+            "${PLOT_TOOL}" stability -o "${PLOT_DIR}/latency-stability-${label}.svg" "$f" 2>&1 || true
             echo "  Generating health: ${label}..."
-            "${PLOT_TOOL}" health -o "${PLOT_DIR}/health-${label}" "$f" 2>&1
+            "${PLOT_TOOL}" health -o "${PLOT_DIR}/health-${label}" "$f" 2>&1 || true
         done
 
         echo ""

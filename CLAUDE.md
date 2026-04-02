@@ -22,6 +22,7 @@ See [README.md](README.md#features) for implemented features and [docs/roadmap.m
 - **No silently ignored results** — do not use `let _ =` to discard `Result` values unless there is a clear reason (e.g., best-effort diagnostic writes). Handle errors explicitly.
 - **Comment data structure and type choices** — always add a comment justifying why a specific collection, data structure, or numeric type was chosen (e.g., why `BTreeMap` over `HashMap`, why `u64` over `u128`).
 - **Log levels** — `error!`: server malfunctions only (bugs, journal I/O failures) — must never fire due to bad client input or client network issues. `warn!`: degraded operation that isn't a bug but needs attention (e.g., CPU pinning failed, resource limits approaching, unexpected-but-handled conditions). `info!`: server lifecycle events (start, stop, recovery). `debug!`: client-caused events (connections, disconnects, malformed messages, write failures).
+- **Documentation audience** — files in `docs/` are written for exchange operators and customers, not contributors. Describe behavior, guarantees, and operational impact. Avoid implementation details (struct names, function names, borrow checker workarounds). Use `~~strikethrough~~` sparingly — prefer removing resolved items entirely rather than cluttering docs with changelog-style history.
 
 ### Git
 - **No co-authored commits** — do not add `Co-Authored-By` trailers.
@@ -47,6 +48,10 @@ See [README.md](README.md#features) for implemented features and [docs/roadmap.m
 ## Roadmap
 
 See [README.md](README.md#features) for implemented features and [docs/roadmap.md](docs/roadmap.md) for planned features.
+
+## Working Style
+- **Propose the best fix, not the simplest** — when there are multiple approaches, present the options with trade-offs and recommend the best one. Don't default to the quick hack.
+- **Review before committing** — always review your own changes for correctness (including edge cases), test coverage, and documentation before attempting to commit. Don't rely on the user to catch issues.
 
 ## Dead Ends / Investigated & Rejected
 **How to apply:** The matching engine is not the bottleneck. The journal fsync stage gates pipeline throughput; TCP pipelining (window=256) effectively hides fsync latency. Further throughput gains require reducing transport overhead (UDS, kernel bypass) or journal I/O optimization (overlapped io_uring writes). Performance optimization leads are tracked in [docs/roadmap.md](docs/roadmap.md) (deferred section).
