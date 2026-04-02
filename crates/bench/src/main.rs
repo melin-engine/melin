@@ -675,6 +675,7 @@ fn run_pipeline_bench(
         _,
         _,
         _,
+        _,
     ) = build_pipeline_with_replication(
         exchange,
         writer,

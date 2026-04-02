@@ -1390,6 +1390,7 @@ pub fn build_pipeline(
         _,
         _,
         _,
+        _,
     ) = build_pipeline_with_replication(
         exchange,
         writer,
@@ -1422,6 +1423,21 @@ pub fn build_pipeline(
 ///
 /// Returns one `ReplicationConsumer` for the sender thread, and a
 /// `replication_cursor` `Arc<AtomicU64>` for the response stage.
+/// Handles for monitoring replication ring drain progress.
+///
+/// The server gates on ring drain after seeding: it waits for all ring
+/// consumers (sender threads) to have read every published batch. This
+/// is stronger than no gate (replicas might miss seeds) and faster than
+/// waiting for replica TCP acks (no network round-trip). Deadlock-free
+/// because the ring backpressures (spins) instead of dropping batches.
+pub struct ReplicationRingProgress {
+    /// Producer cursor: total batches published to the ring.
+    pub producer_cursor: Box<dyn ring::QueueCursor>,
+    /// Consumer progress counters (one per replica slot). Each counter
+    /// tracks how many batches that consumer has committed.
+    pub consumer_cursors: Vec<Arc<Sequence>>,
+}
+
 /// When replication is disabled, the cursor is `u64::MAX` (standalone mode).
 #[allow(clippy::type_complexity, clippy::too_many_arguments)]
 pub fn build_pipeline_with_replication(
@@ -1449,6 +1465,7 @@ pub fn build_pipeline_with_replication(
     Option<Arc<AtomicU32>>,
     Option<ring::Consumer<InputSlot>>,
     Option<Arc<SeqLock<[u8; 32]>>>,
+    Option<ReplicationRingProgress>,
 ) {
     // Input disruptor: N producers (reader threads), 2+ parallel consumers.
     // MultiProducer allows lock-free concurrent publishing from all reader
@@ -1509,15 +1526,26 @@ pub fn build_pipeline_with_replication(
     // Build the replication ring if enabled. Two consumers for dual
     // replication — each replica gets its own independent ring consumer.
     // The ring handles backpressure from the slowest consumer.
-    let replication_consumers = if enable_replication {
+    let (replication_consumers, replication_ring_progress) = if enable_replication {
         let (producer, mut ring_consumers) =
             crate::journal::replication::build_replication_ring(2, replication_ring_size);
+
+        // Capture progress handles BEFORE moving producer/consumers into
+        // their owning threads. These are Arc-shared atomics — cheap to clone.
+        let ring_progress = ReplicationRingProgress {
+            producer_cursor: producer.cursor_reader(),
+            consumer_cursors: ring_consumers
+                .iter()
+                .map(|c| c.progress_counter())
+                .collect(),
+        };
+
         journal_stage.set_replication_producer(producer);
         let consumer_2 = ring_consumers.pop().expect("second replication consumer");
         let consumer_1 = ring_consumers.pop().expect("first replication consumer");
-        Some((consumer_1, consumer_2))
+        (Some((consumer_1, consumer_2)), Some(ring_progress))
     } else {
-        None
+        (None, None)
     };
 
     // SeqLock for publishing the BLAKE3 chain hash to the shadow snapshot
@@ -1576,6 +1604,7 @@ pub fn build_pipeline_with_replication(
         replicas_connected,
         shadow_consumer,
         chain_hash_lock,
+        replication_ring_progress,
     )
 }
 
@@ -1989,6 +2018,7 @@ mod tests {
             _replicas_connected,
             _shadow_consumer,
             _chain_hash_lock,
+            _ring_progress,
         ) = build_pipeline_with_replication(
             exchange,
             writer,
@@ -2153,7 +2183,7 @@ mod tests {
             let writer = JournalWriter::create(&path).unwrap();
             let active_conns = Arc::new(AtomicU64::new(0));
 
-            let (_, _, _, _, _, _, _, _, replication, replication_cursor, _, _, _) =
+            let (_, _, _, _, _, _, _, _, replication, replication_cursor, _, _, _, _) =
                 build_pipeline_with_replication(
                     exchange,
                     writer,
@@ -2177,7 +2207,7 @@ mod tests {
             let writer = JournalWriter::create(&path).unwrap();
             let active_conns = Arc::new(AtomicU64::new(0));
 
-            let (_, _, _, _, _, _, _, _, replication, replication_cursor, _, _, _) =
+            let (_, _, _, _, _, _, _, _, replication, replication_cursor, _, _, _, _) =
                 build_pipeline_with_replication(
                     exchange,
                     writer,

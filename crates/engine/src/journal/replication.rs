@@ -144,6 +144,13 @@ impl ReplicationProducer {
             }
         }
     }
+
+    /// Type-erased handle for reading the producer's published sequence.
+    /// Used to gate on ring drain (all consumers have consumed all
+    /// published batches) without depending on replica TCP acks.
+    pub fn cursor_reader(&self) -> Box<dyn melin_disruptor::ring::QueueCursor> {
+        self.inner.cursor_reader()
+    }
 }
 
 /// Consumer end of the replication ring. One per replica sender thread.

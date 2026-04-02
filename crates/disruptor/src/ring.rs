@@ -280,6 +280,15 @@ impl<T: Copy + Default> Producer<T> {
     pub fn capacity(&self) -> u64 {
         self.shared.buffer.mask + 1
     }
+
+    /// Returns a type-erased handle for reading the producer cursor.
+    /// Same API as [`MultiProducer::cursor_reader`].
+    pub fn cursor_reader(&self) -> Box<dyn QueueCursor>
+    where
+        T: Send + 'static,
+    {
+        Box::new(SharedCursor(Arc::clone(&self.shared)))
+    }
 }
 
 /// Multi-producer end of the disruptor. Multiple threads can publish

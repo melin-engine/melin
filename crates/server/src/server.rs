@@ -569,6 +569,7 @@ fn run_as_primary<L: BlockingTransportListener>(
         replicas_connected,
         shadow_consumer,
         chain_hash_lock,
+        replication_ring_progress,
     ) = build_pipeline_with_replication(
         exchange,
         writer,
@@ -854,16 +855,17 @@ fn run_as_primary<L: BlockingTransportListener>(
         }
         let publish_elapsed = account_start.elapsed();
 
-        // Wait for all seed events to be fully processed by the entire
-        // pipeline before accepting clients. Without this, early client
-        // orders compete with seed events for pipeline time (journal fsync,
-        // matching, replication), contaminating benchmark results.
+        // Wait for all seed events to be fully processed by the pipeline
+        // before accepting clients. Without this, early client orders
+        // compete with seed events for pipeline time, contaminating
+        // benchmark results.
         //
-        // Gates on three cursors (all in disruptor sequence space):
-        // - journal_cursor: journal stage has written + fsynced all seeds
-        // - matching_cursor: matching stage has processed all seeds
-        // - replication_cursor: replica has acked all seeds (u64::MAX if
-        //   no replica is connected, so the check passes instantly)
+        // Gates on journal + matching cursors (disruptor sequence space),
+        // then waits for the replication ring to be fully consumed. This
+        // confirms sender threads have read all seed batches from the ring
+        // (sent or being sent to replicas). Stronger than no gate, faster
+        // than waiting for replica TCP acks, and deadlock-free because the
+        // ring backpressures instead of dropping batches.
         let drain_start = std::time::Instant::now();
         let last_seed_seq = last_published_seq + 1; // cursor = next-to-consume
 
@@ -875,9 +877,22 @@ fn run_as_primary<L: BlockingTransportListener>(
                 .get()
                 .load(std::sync::atomic::Ordering::Acquire)
                 < last_seed_seq
-            || replication_cursor.load(std::sync::atomic::Ordering::Acquire) < last_seed_seq
         {
             std::hint::spin_loop();
+        }
+
+        // After journal + matching are done, wait for the replication ring
+        // consumers to have read all published batches. The producer cursor
+        // is stable at this point (no more seed publishes).
+        if let Some(ref ring_progress) = replication_ring_progress {
+            let producer_seq = ring_progress.producer_cursor.load();
+            while !ring_progress
+                .consumer_cursors
+                .iter()
+                .all(|c| c.get().load(std::sync::atomic::Ordering::Acquire) >= producer_seq)
+            {
+                std::hint::spin_loop();
+            }
         }
         let drain_elapsed = drain_start.elapsed();
 
@@ -1303,6 +1318,7 @@ pub fn run_dpdk(
         replicas_connected,
         _shadow_consumer,
         _chain_hash_lock,
+        replication_ring_progress,
     ) = build_pipeline_with_replication(
         exchange,
         writer,
@@ -1496,7 +1512,8 @@ pub fn run_dpdk(
             });
         }
 
-        // Wait for seeding to complete through the entire pipeline.
+        // Wait for seeding to complete through journal + matching stages,
+        // then wait for the replication ring to drain. See TCP path comment.
         let last_seed_seq = last_published_seq + 1;
         while journal_cursor
             .get()
@@ -1506,9 +1523,18 @@ pub fn run_dpdk(
                 .get()
                 .load(std::sync::atomic::Ordering::Acquire)
                 < last_seed_seq
-            || replication_cursor.load(std::sync::atomic::Ordering::Acquire) < last_seed_seq
         {
             std::hint::spin_loop();
+        }
+        if let Some(ref ring_progress) = replication_ring_progress {
+            let producer_seq = ring_progress.producer_cursor.load();
+            while !ring_progress
+                .consumer_cursors
+                .iter()
+                .all(|c| c.get().load(std::sync::atomic::Ordering::Acquire) >= producer_seq)
+            {
+                std::hint::spin_loop();
+            }
         }
 
         info!(
