@@ -681,6 +681,7 @@ pub fn run_sender(
                     let auth_keys = Arc::clone(&authorized_keys);
                     let slot_metrics = Arc::clone(&metrics);
                     let slot_active = Arc::clone(&active_flags[slot_idx]);
+                    let slot_evict = Arc::clone(&evict_flags[slot_idx]);
                     let shutdown_flag = shutdown as *const AtomicBool as usize;
                     let ready_flag = replica_ready as *const AtomicBool as usize;
                     let handle = std::thread::Builder::new()
@@ -707,6 +708,7 @@ pub fn run_sender(
                                 shutdown_ref,
                                 ready_ref,
                                 &slot_active,
+                                &slot_evict,
                                 &slot_metrics,
                                 slot_idx,
                                 batch_size,
@@ -747,6 +749,7 @@ fn run_replica_slot(
     shutdown: &AtomicBool,
     replica_ready: &AtomicBool,
     active_flag: &AtomicBool,
+    evict_flag: &AtomicBool,
     metrics: &ReplicationMetrics,
     slot_idx: usize,
     batch_size: usize,
@@ -763,6 +766,7 @@ fn run_replica_slot(
         shutdown,
         replica_ready,
         active_flag,
+        evict_flag,
         metrics,
         slot_idx,
         batch_size,
@@ -1080,6 +1084,7 @@ fn handle_replica_connection(
     shutdown: &AtomicBool,
     replica_ready: &AtomicBool,
     active_flag: &AtomicBool,
+    evict_flag: &AtomicBool,
     metrics: &ReplicationMetrics,
     slot_idx: usize,
     batch_size: usize,
@@ -1312,6 +1317,14 @@ fn handle_replica_connection(
 
     loop {
         if shutdown.load(Ordering::Relaxed) {
+            return Ok(());
+        }
+
+        // Check if the journal stage evicted this ring (ring was full).
+        // Exit so the sender thread can reclaim the slot — the replica
+        // will reconnect and catch up from journal files.
+        if evict_flag.load(Ordering::Relaxed) {
+            info!(slot = slot_idx, "handler exiting: evicted by journal stage");
             return Ok(());
         }
 
