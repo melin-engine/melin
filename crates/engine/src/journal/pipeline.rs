@@ -200,21 +200,11 @@ pub struct JournalStage {
     /// Only read when fsync is enabled (not `no-fsync` feature).
     #[cfg_attr(feature = "no-fsync", allow(dead_code))]
     max_batch: usize,
-    /// Independent replication ring producers (one per replica slot). The
-    /// journal stage publishes each batch to both rings sequentially. When
-    /// a ring is full for longer than the backpressure timeout, the journal
-    /// stage sets the corresponding eviction flag and stops publishing to
-    /// that ring. `[None, None]` when replication is disabled.
-    replication_producers: [Option<ReplicationProducer>; 2],
-    /// Per-ring eviction flags. Set by the journal stage when a ring has
-    /// been full for longer than the backpressure timeout. Cleared by the
-    /// sender thread after disconnecting the slow replica.
-    replication_evict: [Arc<AtomicBool>; 2],
-    /// Per-ring active flags. Set by the handler thread when a replica
-    /// enters the live streaming loop (actively consuming from the ring).
-    /// Cleared by the sender thread on disconnect. The journal stage only
-    /// publishes to active rings — no idle drain needed.
-    replication_active: [Arc<AtomicBool>; 2],
+    /// Replication state, boxed to keep the struct small on the hot path.
+    /// In standalone mode this is a null-like default (no producers, no
+    /// flags). The Box indirection keeps the JournalStage struct the same
+    /// cache layout as on main, avoiding tail latency regression.
+    repl: Box<ReplicationState>,
     /// Optional SeqLock for publishing the BLAKE3 chain hash to the shadow
     /// snapshot stage. Updated once per fsync batch (cold path). `None` when
     /// shadow snapshots are disabled — no allocation or write overhead.
@@ -228,6 +218,34 @@ pub struct JournalStage {
     /// disruptor. This preserves byte-identical journals between primary
     /// and replica.
     raw_journal_rx: Option<RawBatchReceiver>,
+}
+
+/// Replication state for the journal stage. Boxed in JournalStage to
+/// avoid inflating the struct size on the hot path (standalone mode has
+/// no replication but the struct layout affects cache behavior).
+struct ReplicationState {
+    /// Independent replication ring producers (one per replica slot).
+    producers: [Option<ReplicationProducer>; 2],
+    /// Per-ring eviction flags.
+    evict: [Arc<AtomicBool>; 2],
+    /// Per-ring active flags.
+    active: [Arc<AtomicBool>; 2],
+}
+
+impl Default for ReplicationState {
+    fn default() -> Self {
+        Self {
+            producers: [None, None],
+            evict: [
+                Arc::new(AtomicBool::new(false)),
+                Arc::new(AtomicBool::new(false)),
+            ],
+            active: [
+                Arc::new(AtomicBool::new(false)),
+                Arc::new(AtomicBool::new(false)),
+            ],
+        }
+    }
 }
 
 /// Pre-encoded journal batch from the primary, sent by the replication
@@ -372,15 +390,7 @@ impl JournalStage {
             consumer,
             group_commit_delay,
             max_batch: max_batch.min(MAX_JOURNAL_BATCH),
-            replication_producers: [None, None],
-            replication_evict: [
-                Arc::new(AtomicBool::new(false)),
-                Arc::new(AtomicBool::new(false)),
-            ],
-            replication_active: [
-                Arc::new(AtomicBool::new(false)),
-                Arc::new(AtomicBool::new(false)),
-            ],
+            repl: Box::default(),
             chain_hash: None,
             busy_spin,
             raw_journal_rx: None,
@@ -405,9 +415,9 @@ impl JournalStage {
         active_flags: [Arc<AtomicBool>; 2],
     ) {
         let [p0, p1] = producers;
-        self.replication_producers = [Some(p0), Some(p1)];
-        self.replication_evict = evict_flags;
-        self.replication_active = active_flags;
+        self.repl.producers = [Some(p0), Some(p1)];
+        self.repl.evict = evict_flags;
+        self.repl.active = active_flags;
     }
 
     /// Set the SeqLock for publishing the BLAKE3 chain hash to the shadow
@@ -594,14 +604,16 @@ impl JournalStage {
                         // ring slot — no heap allocation.
                         // Only when persistence is enabled — with no-persist,
                         // batch_buf is never cleared and would grow unbounded.
-                        {
+                        // Guard: skip entirely in standalone mode (both producers None).
+                        // One field read — no atomics, no function call on the hot path.
+                        if self.repl.producers[0].is_some() || self.repl.producers[1].is_some() {
                             let bytes = self.writer.pending_batch_bytes();
                             if !bytes.is_empty() {
                                 let end_seq = self.writer.next_sequence() - 1;
                                 Self::publish_to_replication_rings(
-                                    &mut self.replication_producers,
-                                    &self.replication_evict,
-                                    &self.replication_active,
+                                    &mut self.repl.producers,
+                                    &self.repl.evict,
+                                    &self.repl.active,
                                     bytes,
                                     end_seq,
                                     [0u8; 32],
@@ -778,15 +790,15 @@ impl JournalStage {
                 }
 
                 // Snapshot for replication before flush.
-                {
+                if self.repl.producers[0].is_some() || self.repl.producers[1].is_some() {
                     let bytes = self.writer.pending_batch_bytes();
                     if !bytes.is_empty() {
                         let end_seq = self.writer.next_sequence() - 1;
                         let chain = self.writer.chain_hash().unwrap_or([0u8; 32]);
                         Self::publish_to_replication_rings(
-                            &mut self.replication_producers,
-                            &self.replication_evict,
-                            &self.replication_active,
+                            &mut self.repl.producers,
+                            &self.repl.evict,
+                            &self.repl.active,
                             bytes,
                             end_seq,
                             chain,
@@ -1004,15 +1016,15 @@ impl JournalStage {
 
                     // Snapshot batch bytes for replication BEFORE
                     // take_batch_for_async_write (which swaps the buffer).
-                    {
+                    if self.repl.producers[0].is_some() || self.repl.producers[1].is_some() {
                         let bytes = self.writer.pending_batch_bytes();
                         if !bytes.is_empty() {
                             let end_seq = self.writer.next_sequence() - 1;
                             let chain = self.writer.chain_hash().unwrap_or([0u8; 32]);
                             Self::publish_to_replication_rings(
-                                &mut self.replication_producers,
-                                &self.replication_evict,
-                                &self.replication_active,
+                                &mut self.repl.producers,
+                                &self.repl.evict,
+                                &self.repl.active,
                                 bytes,
                                 end_seq,
                                 chain,
