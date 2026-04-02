@@ -39,6 +39,33 @@ pub fn pin_to_core(core_id: usize) -> Result<usize, String> {
     }
 }
 
+/// Clear CPU affinity for the calling thread, allowing it to run on any core.
+///
+/// Child threads spawned from a pinned parent inherit the parent's
+/// single-core affinity mask. Call this at the start of the child thread
+/// to restore the full core set.
+pub fn clear_affinity() -> Result<(), String> {
+    unsafe {
+        let mut set: libc::cpu_set_t = std::mem::zeroed();
+        // Set all cores. On systems with fewer cores, the extra bits
+        // are ignored by the kernel.
+        for i in 0..libc::CPU_SETSIZE as usize {
+            libc::CPU_SET(i, &mut set);
+        }
+
+        let ret = libc::sched_setaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &set);
+
+        if ret == 0 {
+            Ok(())
+        } else {
+            Err(format!(
+                "sched_setaffinity (clear) failed: {}",
+                std::io::Error::last_os_error()
+            ))
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

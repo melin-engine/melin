@@ -686,6 +686,12 @@ pub fn run_sender(
                     let handle = std::thread::Builder::new()
                         .name(format!("repl-{slot_idx}"))
                         .spawn(move || {
+                            // Clear inherited CPU affinity from the sender
+                            // thread (pinned to core 6). The handler does TCP
+                            // I/O and doesn't need a dedicated core.
+                            if let Err(e) = crate::affinity::clear_affinity() {
+                                tracing::warn!(error = e, "failed to clear handler affinity");
+                            }
                             // Safety: shutdown and replica_ready outlive this thread
                             // (they're on the parent's stack, which blocks on join
                             // during shutdown).
