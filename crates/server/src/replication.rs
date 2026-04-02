@@ -833,12 +833,12 @@ fn catch_up_from_journal(
         let mut scanner = RawJournalScanner::open(path)
             .map_err(|e| io::Error::other(format!("open journal {}: {e}", path.display())))?;
 
-        // Skip entries the replica already has.
-        if end_sequence > 0 {
-            scanner
-                .skip_to_after(end_sequence)
-                .map_err(|e| io::Error::other(format!("skip in {}: {e}", path.display())))?;
-        }
+        // Skip entries the replica already has. Always skip at least
+        // genesis (seq 1) — it's delivered via StreamStart, not catch-up.
+        let skip_to = end_sequence.max(1);
+        scanner
+            .skip_to_after(skip_to)
+            .map_err(|e| io::Error::other(format!("skip in {}: {e}", path.display())))?;
 
         // Read and send batches of raw entries.
         // Target ~64 KiB per DataBatch frame (~800 entries at ~80 bytes each).
