@@ -19,8 +19,7 @@
 //! while preserving persist-before-ack at the response boundary.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
-use std::sync::mpsc;
+use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicU64, Ordering};
 use std::time::Duration;
 
 use crate::exchange::Exchange;
@@ -201,11 +200,21 @@ pub struct JournalStage {
     /// Only read when fsync is enabled (not `no-fsync` feature).
     #[cfg_attr(feature = "no-fsync", allow(dead_code))]
     max_batch: usize,
-    /// Optional replication ring producer. When `Some`, the journal stage
-    /// copies encoded batch bytes into a pre-allocated ring slot after each
-    /// `flush_batch_sync()`. No heap allocation — just a memcpy into the
-    /// ring's pre-allocated buffer. When `None`, replication is disabled.
-    replication_producer: Option<ReplicationProducer>,
+    /// Independent replication ring producers (one per replica slot). The
+    /// journal stage publishes each batch to both rings sequentially. When
+    /// a ring is full for longer than the backpressure timeout, the journal
+    /// stage sets the corresponding eviction flag and stops publishing to
+    /// that ring. `[None, None]` when replication is disabled.
+    replication_producers: [Option<ReplicationProducer>; 2],
+    /// Per-ring eviction flags. Set by the journal stage when a ring has
+    /// been full for longer than the backpressure timeout. Cleared by the
+    /// sender thread after disconnecting the slow replica.
+    replication_evict: [Arc<AtomicBool>; 2],
+    /// Per-ring active flags. Set by the handler thread when a replica
+    /// enters the live streaming loop (actively consuming from the ring).
+    /// Cleared by the sender thread on disconnect. The journal stage only
+    /// publishes to active rings — no idle drain needed.
+    replication_active: [Arc<AtomicBool>; 2],
     /// Optional SeqLock for publishing the BLAKE3 chain hash to the shadow
     /// snapshot stage. Updated once per fsync batch (cold path). `None` when
     /// shadow snapshots are disabled — no allocation or write overhead.
@@ -214,15 +223,16 @@ pub struct JournalStage {
     /// PAUSE. Requires isolated cores (`isolcpus`). See [`idle_wait`].
     busy_spin: bool,
     /// In replica mode, receives pre-encoded journal byte batches from the
-    /// replication receiver thread. The journal stage writes these raw bytes
-    /// instead of encoding events from the disruptor. This preserves
-    /// byte-identical journals between primary and replica.
-    raw_journal_rx: Option<mpsc::Receiver<RawJournalBatch>>,
+    /// replication receiver thread via a lock-free hand-off. The journal
+    /// stage writes these raw bytes instead of encoding events from the
+    /// disruptor. This preserves byte-identical journals between primary
+    /// and replica.
+    raw_journal_rx: Option<RawBatchReceiver>,
 }
 
 /// Pre-encoded journal batch from the primary, sent by the replication
-/// receiver to the journal stage via a bounded channel. The journal stage
-/// writes these bytes with `write_raw_sync` instead of encoding events.
+/// receiver to the journal stage via a lock-free hand-off. The journal
+/// stage writes these bytes with `write_raw_sync` instead of encoding events.
 pub struct RawJournalBatch {
     /// Raw journal entry bytes (already encoded by the primary).
     pub bytes: Vec<u8>,
@@ -232,6 +242,115 @@ pub struct RawJournalBatch {
     pub chain_hash: [u8; 32],
     /// Number of journal entries in this batch.
     pub entry_count: u32,
+}
+
+/// Lock-free single-slot hand-off between the replication receiver and
+/// the journal stage. Replaces `mpsc::sync_channel` to avoid the lock
+/// starvation that occurs when the journal stage busy-spins on
+/// `try_recv()` and monopolizes the channel's internal synchronization.
+///
+/// The sender stores a `Box<RawJournalBatch>` via `AtomicPtr::store`.
+/// The receiver takes it via `AtomicPtr::swap(null)`. When the slot is
+/// occupied (previous batch not yet consumed), the sender spins — but
+/// since the receiver (journal stage) consumes batches in ~1ms (NVMe
+/// fsync), this rarely happens. Producer and consumer access the same
+/// atomic pointer, but the access pattern (store-once then poll) avoids
+/// the cache-line thrashing caused by `mpsc`'s internal mutex.
+#[derive(Default)]
+pub struct RawBatchSlot {
+    ptr: AtomicPtr<RawJournalBatch>,
+}
+
+// Safety: the AtomicPtr is the sole access path. Only one sender and one
+// receiver use it (SPSC). Send/Sync is safe because atomic operations
+// provide the necessary synchronization.
+unsafe impl Send for RawBatchSlot {}
+unsafe impl Sync for RawBatchSlot {}
+
+impl RawBatchSlot {
+    pub fn new() -> Self {
+        Self {
+            ptr: AtomicPtr::new(std::ptr::null_mut()),
+        }
+    }
+}
+
+/// Sender half of the lock-free hand-off. Owned by the replication
+/// receiver thread.
+pub struct RawBatchSender {
+    slot: Arc<RawBatchSlot>,
+}
+
+impl RawBatchSender {
+    /// Send a batch. Spins if the previous batch hasn't been consumed
+    /// yet. In practice this rarely happens — the journal stage
+    /// consumes batches in ~1ms.
+    pub fn send(&self, batch: RawJournalBatch) {
+        let raw = Box::into_raw(Box::new(batch));
+        // Spin until the slot is empty (previous batch consumed).
+        loop {
+            let prev = self
+                .slot
+                .ptr
+                .compare_exchange(
+                    std::ptr::null_mut(),
+                    raw,
+                    Ordering::Release,
+                    Ordering::Relaxed,
+                )
+                .err();
+            if prev.is_none() {
+                return; // Successfully stored.
+            }
+            std::hint::spin_loop();
+        }
+    }
+}
+
+impl Drop for RawBatchSender {
+    fn drop(&mut self) {
+        // If a batch is in the slot when the sender is dropped, free it.
+        let ptr = self.slot.ptr.swap(std::ptr::null_mut(), Ordering::Acquire);
+        if !ptr.is_null() {
+            unsafe { drop(Box::from_raw(ptr)) };
+        }
+    }
+}
+
+/// Receiver half of the lock-free hand-off. Owned by the journal stage
+/// thread.
+pub struct RawBatchReceiver {
+    slot: Arc<RawBatchSlot>,
+}
+
+impl RawBatchReceiver {
+    /// Try to receive a batch without blocking. Returns `None` if the
+    /// slot is empty. Uses a load-first pattern: the Acquire load is a
+    /// plain read that doesn't bounce the cache line, so the spinning
+    /// journal stage doesn't starve the sender. Only the swap (when
+    /// data is available) acquires exclusive ownership.
+    pub fn try_recv(&self) -> Option<RawJournalBatch> {
+        // Fast check — plain read, no cache line bounce.
+        let ptr = self.slot.ptr.load(Ordering::Acquire);
+        if ptr.is_null() {
+            return None;
+        }
+        // Data available — take ownership. SPSC guarantees no race.
+        let ptr = self.slot.ptr.swap(std::ptr::null_mut(), Ordering::Relaxed);
+        debug_assert!(!ptr.is_null());
+        Some(*unsafe { Box::from_raw(ptr) })
+    }
+}
+
+/// Create a lock-free single-slot hand-off pair.
+pub fn raw_batch_channel() -> (RawBatchSender, RawBatchReceiver) {
+    let slot = Arc::new(RawBatchSlot::new());
+    (
+        RawBatchSender {
+            slot: Arc::clone(&slot),
+        },
+        RawBatchReceiver { slot },
+    )
 }
 
 impl JournalStage {
@@ -253,7 +372,15 @@ impl JournalStage {
             consumer,
             group_commit_delay,
             max_batch: max_batch.min(MAX_JOURNAL_BATCH),
-            replication_producer: None,
+            replication_producers: [None, None],
+            replication_evict: [
+                Arc::new(AtomicBool::new(false)),
+                Arc::new(AtomicBool::new(false)),
+            ],
+            replication_active: [
+                Arc::new(AtomicBool::new(false)),
+                Arc::new(AtomicBool::new(false)),
+            ],
             chain_hash: None,
             busy_spin,
             raw_journal_rx: None,
@@ -263,15 +390,24 @@ impl JournalStage {
     /// Set the raw journal receiver for replica mode. When set, the journal
     /// stage writes pre-encoded bytes from the replication receiver instead
     /// of encoding events from the disruptor.
-    pub fn set_raw_journal_receiver(&mut self, rx: mpsc::Receiver<RawJournalBatch>) {
+    pub fn set_raw_journal_receiver(&mut self, rx: RawBatchReceiver) {
         self.raw_journal_rx = Some(rx);
     }
 
-    /// Set the replication ring producer. When set, the journal stage
-    /// copies encoded batch bytes into the ring after `flush_batch_sync()`.
-    /// No heap allocation — just a memcpy into a pre-allocated buffer.
-    pub fn set_replication_producer(&mut self, producer: ReplicationProducer) {
-        self.replication_producer = Some(producer);
+    /// Set independent replication ring producers (one per replica slot)
+    /// and their shared eviction/active flags. The journal stage only
+    /// publishes to rings where `active` is true, and sets the eviction
+    /// flag on backpressure timeout.
+    pub fn set_replication_producers(
+        &mut self,
+        producers: [ReplicationProducer; 2],
+        evict_flags: [Arc<AtomicBool>; 2],
+        active_flags: [Arc<AtomicBool>; 2],
+    ) {
+        let [p0, p1] = producers;
+        self.replication_producers = [Some(p0), Some(p1)];
+        self.replication_evict = evict_flags;
+        self.replication_active = active_flags;
     }
 
     /// Set the SeqLock for publishing the BLAKE3 chain hash to the shadow
@@ -458,14 +594,19 @@ impl JournalStage {
                         // ring slot — no heap allocation.
                         // Only when persistence is enabled — with no-persist,
                         // batch_buf is never cleared and would grow unbounded.
-                        if let Some(producer) = &mut self.replication_producer {
+                        {
                             let bytes = self.writer.pending_batch_bytes();
                             if !bytes.is_empty() {
                                 let end_seq = self.writer.next_sequence() - 1;
-                                // Chain hash is zeroed — replicas don't verify
-                                // per-batch chain hashes (only checkpoint hashes).
-                                // Avoids the O(n) hasher clone on every batch.
-                                producer.publish(bytes, end_seq, [0u8; 32], pending as u32);
+                                Self::publish_to_replication_rings(
+                                    &mut self.replication_producers,
+                                    &self.replication_evict,
+                                    &self.replication_active,
+                                    bytes,
+                                    end_seq,
+                                    [0u8; 32],
+                                    pending as u32,
+                                );
                             }
                         }
 
@@ -516,45 +657,85 @@ impl JournalStage {
                 return self.writer;
             }
 
-            // Try to receive a raw journal batch from the replication receiver.
-            match rx.try_recv() {
-                Ok(raw_batch) => {
-                    idle_spins = 0;
+            // Try to receive a raw journal batch from the replication
+            // receiver via the lock-free hand-off.
+            if let Some(raw_batch) = rx.try_recv() {
+                idle_spins = 0;
 
-                    // Write raw bytes to journal (durable write).
-                    self.writer
-                        .write_raw_sync(&raw_batch.bytes, raw_batch.entry_count as u64)
-                        .unwrap_or_else(|e| panic!("fatal replica journal I/O error: {e}"));
+                // Write raw bytes to journal (durable write).
+                self.writer
+                    .write_raw_sync(&raw_batch.bytes, raw_batch.entry_count as u64)
+                    .unwrap_or_else(|e| panic!("fatal replica journal I/O error: {e}"));
 
-                    self.publish_chain_hash();
+                self.publish_chain_hash();
 
-                    // Consume the corresponding events from the disruptor to
-                    // advance the cursor. The receiver published exactly
-                    // entry_count events before sending this raw batch.
-                    let mut remaining = raw_batch.entry_count as usize;
-                    while remaining > 0 {
-                        let count = self
-                            .consumer
-                            .read_batch(&mut batch, remaining.min(MAX_JOURNAL_BATCH));
-                        if count > 0 {
-                            // Discard events — they were already encoded in
-                            // raw_batch.bytes by the primary.
-                            self.consumer.commit(count);
-                            remaining -= count;
-                        } else {
-                            // Events not yet published to the disruptor by
-                            // the receiver thread — spin briefly.
-                            std::hint::spin_loop();
-                        }
+                // Consume the corresponding events from the disruptor to
+                // advance the cursor. The receiver published exactly
+                // entry_count events before sending this raw batch.
+                let mut remaining = raw_batch.entry_count as usize;
+                while remaining > 0 {
+                    let count = self
+                        .consumer
+                        .read_batch(&mut batch, remaining.min(MAX_JOURNAL_BATCH));
+                    if count > 0 {
+                        // Discard events — they were already encoded in
+                        // raw_batch.bytes by the primary.
+                        self.consumer.commit(count);
+                        remaining -= count;
+                    } else {
+                        // Events not yet published to the disruptor by
+                        // the receiver thread — spin briefly.
+                        std::hint::spin_loop();
                     }
                 }
-                Err(mpsc::TryRecvError::Empty) => {
-                    idle_wait(&mut idle_spins, self.busy_spin);
+            } else {
+                idle_wait(&mut idle_spins, self.busy_spin);
+            }
+        }
+    }
+
+    /// Publish a batch to all active replication rings. Fully non-blocking:
+    /// a single `try_publish` per ring, no spinning. If a ring is full,
+    /// the replica is evicted immediately — a skipped batch would create
+    /// a sequence gap in the replica's journal that can only be repaired
+    /// by reconnection and catch-up from journal files.
+    ///
+    /// This ensures a slow replica NEVER stalls the pipeline. The healthy
+    /// replica's ring gets data at full speed.
+    ///
+    /// Free function to avoid borrow conflicts with `self.writer`.
+    fn publish_to_replication_rings(
+        producers: &mut [Option<ReplicationProducer>; 2],
+        evict_flags: &[Arc<AtomicBool>; 2],
+        active_flags: &[Arc<AtomicBool>; 2],
+        bytes: &[u8],
+        end_seq: u64,
+        chain_hash: [u8; 32],
+        entry_count: u32,
+    ) {
+        for i in 0..2 {
+            if let Some(ref mut producer) = producers[i] {
+                if !active_flags[i].load(Ordering::Relaxed) {
+                    continue;
                 }
-                Err(mpsc::TryRecvError::Disconnected) => {
-                    // Receiver thread exited — drain and shut down.
-                    self.drain_remaining(&mut batch);
-                    return self.writer;
+                if evict_flags[i].load(Ordering::Relaxed) {
+                    continue;
+                }
+                if producer
+                    .try_publish(bytes, end_seq, chain_hash, entry_count)
+                    .is_err()
+                {
+                    // Ring full — evict immediately. A skipped batch creates
+                    // a sequence gap in the replica's journal that can only
+                    // be repaired by reconnection + catch-up from journal
+                    // files. Continuing to publish would deliver subsequent
+                    // batches with a hole, corrupting the replica's state.
+                    evict_flags[i].store(true, Ordering::Release);
+                    tracing::warn!(
+                        ring = i,
+                        end_seq,
+                        "replication ring full — evicting replica (would create sequence gap)"
+                    );
                 }
             }
         }
@@ -597,12 +778,20 @@ impl JournalStage {
                 }
 
                 // Snapshot for replication before flush.
-                if let Some(producer) = &mut self.replication_producer {
+                {
                     let bytes = self.writer.pending_batch_bytes();
                     if !bytes.is_empty() {
                         let end_seq = self.writer.next_sequence() - 1;
                         let chain = self.writer.chain_hash().unwrap_or([0u8; 32]);
-                        producer.publish(bytes, end_seq, chain, count as u32);
+                        Self::publish_to_replication_rings(
+                            &mut self.replication_producers,
+                            &self.replication_evict,
+                            &self.replication_active,
+                            bytes,
+                            end_seq,
+                            chain,
+                            count as u32,
+                        );
                     }
                 }
 
@@ -815,12 +1004,20 @@ impl JournalStage {
 
                     // Snapshot batch bytes for replication BEFORE
                     // take_batch_for_async_write (which swaps the buffer).
-                    if let Some(producer) = &mut self.replication_producer {
+                    {
                         let bytes = self.writer.pending_batch_bytes();
                         if !bytes.is_empty() {
                             let end_seq = self.writer.next_sequence() - 1;
                             let chain = self.writer.chain_hash().unwrap_or([0u8; 32]);
-                            producer.publish(bytes, end_seq, chain, pending as u32);
+                            Self::publish_to_replication_rings(
+                                &mut self.replication_producers,
+                                &self.replication_evict,
+                                &self.replication_active,
+                                bytes,
+                                end_seq,
+                                chain,
+                                pending as u32,
+                            );
                         }
                     }
 
@@ -1431,11 +1628,19 @@ pub fn build_pipeline(
 /// waiting for replica TCP acks (no network round-trip). Deadlock-free
 /// because the ring backpressures (spins) instead of dropping batches.
 pub struct ReplicationRingProgress {
-    /// Producer cursor: total batches published to the ring.
-    pub producer_cursor: Box<dyn ring::QueueCursor>,
-    /// Consumer progress counters (one per replica slot). Each counter
-    /// tracks how many batches that consumer has committed.
+    /// Producer cursors (one per independent ring).
+    pub producer_cursors: Vec<Box<dyn ring::QueueCursor>>,
+    /// Consumer progress counters (one per independent ring, paired
+    /// with the corresponding producer cursor by index).
     pub consumer_cursors: Vec<Arc<Sequence>>,
+    /// Per-ring eviction flags. Set by the journal stage when a publish
+    /// times out. Cleared by the sender thread after disconnecting the
+    /// slow replica.
+    pub evict_flags: [Arc<AtomicBool>; 2],
+    /// Per-ring active flags. Set by the handler thread when the replica
+    /// enters the live streaming loop. The journal stage only publishes
+    /// to active rings.
+    pub active_flags: [Arc<AtomicBool>; 2],
 }
 
 /// When replication is disabled, the cursor is `u64::MAX` (standalone mode).
@@ -1523,27 +1728,45 @@ pub fn build_pipeline_with_replication(
         busy_spin,
     );
 
-    // Build the replication ring if enabled. Two consumers for dual
-    // replication — each replica gets its own independent ring consumer.
-    // The ring handles backpressure from the slowest consumer.
+    // Build two independent SPSC replication rings (one per replica slot).
+    // Each ring has its own producer and consumer, so a slow replica only
+    // stalls its own ring — not the other replica's. The journal stage
+    // publishes to both rings sequentially; on timeout, sets an eviction
+    // flag and stops publishing to the stalled ring.
     let (replication_consumers, replication_ring_progress) = if enable_replication {
-        let (producer, mut ring_consumers) =
-            crate::journal::replication::build_replication_ring(2, replication_ring_size);
+        let (producer_0, mut consumers_0) =
+            crate::journal::replication::build_replication_ring(1, replication_ring_size);
+        let (producer_1, mut consumers_1) =
+            crate::journal::replication::build_replication_ring(1, replication_ring_size);
 
-        // Capture progress handles BEFORE moving producer/consumers into
-        // their owning threads. These are Arc-shared atomics — cheap to clone.
+        let evict_flags = [
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicBool::new(false)),
+        ];
+        let active_flags = [
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicBool::new(false)),
+        ];
+
         let ring_progress = ReplicationRingProgress {
-            producer_cursor: producer.cursor_reader(),
-            consumer_cursors: ring_consumers
-                .iter()
-                .map(|c| c.progress_counter())
-                .collect(),
+            producer_cursors: vec![producer_0.cursor_reader(), producer_1.cursor_reader()],
+            consumer_cursors: vec![
+                consumers_0[0].progress_counter(),
+                consumers_1[0].progress_counter(),
+            ],
+            evict_flags: [Arc::clone(&evict_flags[0]), Arc::clone(&evict_flags[1])],
+            active_flags: [Arc::clone(&active_flags[0]), Arc::clone(&active_flags[1])],
         };
 
-        journal_stage.set_replication_producer(producer);
-        let consumer_2 = ring_consumers.pop().expect("second replication consumer");
-        let consumer_1 = ring_consumers.pop().expect("first replication consumer");
-        (Some((consumer_1, consumer_2)), Some(ring_progress))
+        journal_stage.set_replication_producers(
+            [producer_0, producer_1],
+            [Arc::clone(&evict_flags[0]), Arc::clone(&evict_flags[1])],
+            [Arc::clone(&active_flags[0]), Arc::clone(&active_flags[1])],
+        );
+
+        let consumer_0 = consumers_0.pop().expect("ring 0 consumer");
+        let consumer_1 = consumers_1.pop().expect("ring 1 consumer");
+        (Some((consumer_0, consumer_1)), Some(ring_progress))
     } else {
         (None, None)
     };
@@ -1616,8 +1839,8 @@ pub fn build_pipeline_with_replication(
 /// - Output disruptor has a single drain consumer (no response stage)
 ///
 /// Returns the input producer (for the replication receiver), the pipeline
-/// stages, the journal cursor (for ack gating), and a `SyncSender` for
-/// sending raw journal batches to the journal stage.
+/// stages, the journal cursor (for ack gating), and a `RawBatchSender`
+/// for sending raw journal batches to the journal stage.
 #[allow(clippy::type_complexity)]
 pub fn build_replica_pipeline(
     exchange: Exchange,
@@ -1632,7 +1855,7 @@ pub fn build_replica_pipeline(
     ring::Consumer<OutputSlot>,
     Arc<Sequence>,
     Arc<Sequence>,
-    mpsc::SyncSender<RawJournalBatch>,
+    RawBatchSender,
     Option<ring::Consumer<InputSlot>>,
     Option<Arc<SeqLock<[u8; 32]>>>,
 ) {
@@ -1665,11 +1888,12 @@ pub fn build_replica_pipeline(
 
     let events_processed = Arc::new(AtomicU64::new(0));
 
-    // Journal stage in replica mode: raw-write via bounded channel.
-    // Channel capacity 4: enough buffering for a few batches without
-    // unbounded growth. The receiver thread blocks on send if the
-    // journal stage can't keep up (backpressure).
-    let (raw_tx, raw_rx) = mpsc::sync_channel::<RawJournalBatch>(4);
+    // Journal stage in replica mode: raw-write via lock-free hand-off.
+    // Single-slot (one batch in flight). The receiver thread spins on
+    // send if the journal stage hasn't consumed the previous batch yet
+    // (backpressure). Lock-free to avoid starvation when the journal
+    // stage busy-spins on try_recv.
+    let (raw_tx, raw_rx) = raw_batch_channel();
     let mut journal_stage = JournalStage::new(
         writer,
         journal_consumer,
@@ -2036,9 +2260,13 @@ mod tests {
         let (mut repl_consumer, _repl_consumer_2) =
             replication_rx.expect("replication should be enabled");
 
-        // Simulate a connected replica so the matching stage doesn't halt.
+        // Simulate a connected replica so the matching stage doesn't halt
+        // and the journal stage publishes to replication rings.
         if let Some(ref count) = _replicas_connected {
             count.store(1, Ordering::Relaxed);
+        }
+        if let Some(ref rp) = _ring_progress {
+            rp.active_flags[0].store(true, Ordering::Relaxed);
         }
 
         let shutdown = Arc::new(AtomicBool::new(false));
@@ -2545,7 +2773,7 @@ mod tests {
         let consumer = consumers.pop().unwrap();
         let journal_cursor = consumer.progress_counter();
 
-        let (raw_tx, raw_rx) = std::sync::mpsc::sync_channel::<RawJournalBatch>(4);
+        let (raw_tx, raw_rx) = raw_batch_channel();
 
         let mut stage = JournalStage::new(
             replica_writer,
@@ -2574,14 +2802,12 @@ mod tests {
         }
 
         // Send raw bytes via the channel.
-        raw_tx
-            .send(RawJournalBatch {
-                bytes: raw_bytes,
-                end_sequence: FIRST_SEQ + entry_count as u64 - 1,
-                chain_hash: [0u8; 32],
-                entry_count,
-            })
-            .unwrap();
+        raw_tx.send(RawJournalBatch {
+            bytes: raw_bytes,
+            end_sequence: FIRST_SEQ + entry_count as u64 - 1,
+            chain_hash: [0u8; 32],
+            entry_count,
+        });
 
         // Wait for the journal cursor to advance past our events.
         let deadline = std::time::Instant::now() + Duration::from_secs(2);
@@ -2685,14 +2911,12 @@ mod tests {
             publish_ts: trace_ts(),
             recv_ts: trace_ts(),
         });
-        raw_tx
-            .send(RawJournalBatch {
-                bytes: raw_bytes,
-                end_sequence: FIRST_SEQ,
-                chain_hash: [0u8; 32],
-                entry_count: 1,
-            })
-            .unwrap();
+        raw_tx.send(RawJournalBatch {
+            bytes: raw_bytes,
+            end_sequence: FIRST_SEQ,
+            chain_hash: [0u8; 32],
+            entry_count: 1,
+        });
 
         // Wait for journal cursor.
         let deadline = std::time::Instant::now() + Duration::from_secs(2);

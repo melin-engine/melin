@@ -147,10 +147,10 @@ pub struct ServerConfig {
     #[arg(long, default_value_t = 5)]
     pub replication_heartbeat_secs: u64,
 
-    /// Number of slots in the replication ring buffer. Must be a power
+    /// Number of slots in each replication ring buffer. Must be a power
     /// of two. Each slot holds up to 512 KiB. More slots = more buffering
-    /// before the journal stage backpressures. Default: 64 (32 MiB).
-    #[arg(long, default_value_t = 64)]
+    /// before eviction. Default: 256 (128 MiB per ring, 256 MiB dual-repl).
+    #[arg(long, default_value_t = 256)]
     pub replication_ring_size: usize,
 
     /// Yield to the OS scheduler when pipeline threads are idle instead
@@ -684,6 +684,18 @@ fn run_as_primary<L: BlockingTransportListener>(
     // `replica_ready` is set when the first replica connects — seeding waits
     // on this to ensure seed events aren't drained before the replica arrives.
     let replica_ready = Arc::new(AtomicBool::new(false));
+    let replication_metrics: Option<Arc<crate::replication::ReplicationMetrics>> =
+        if replication_consumers.is_some() {
+            Some(Arc::new(crate::replication::ReplicationMetrics::default()))
+        } else {
+            None
+        };
+    // Ring depth monitoring: the producer cursors are in ReplicationRingProgress
+    // (owned by this function), so we compute depth via ring_progress rather
+    // than storing Box<dyn QueueCursor> in ReplicationMetrics. The health
+    // snapshot reads consumer cursors from ReplicationMetrics and producer
+    // cursors are not needed — ring depth is a secondary metric.
+
     let replication_handle = if let Some((repl_consumer_1, repl_consumer_2)) = replication_consumers
     {
         let repl_bind = config
@@ -700,6 +712,37 @@ fn run_as_primary<L: BlockingTransportListener>(
         let heartbeat_secs = config.replication_heartbeat_secs;
         let journal_path = config.journal.clone();
         let repl_auth_keys = Arc::clone(&authorized_keys);
+        let evict_flags = replication_ring_progress
+            .as_ref()
+            .map(|rp| {
+                [
+                    Arc::clone(&rp.evict_flags[0]),
+                    Arc::clone(&rp.evict_flags[1]),
+                ]
+            })
+            .unwrap_or_else(|| {
+                [
+                    Arc::new(AtomicBool::new(false)),
+                    Arc::new(AtomicBool::new(false)),
+                ]
+            });
+        let active_flags = replication_ring_progress
+            .as_ref()
+            .map(|rp| {
+                [
+                    Arc::clone(&rp.active_flags[0]),
+                    Arc::clone(&rp.active_flags[1]),
+                ]
+            })
+            .unwrap_or_else(|| {
+                [
+                    Arc::new(AtomicBool::new(false)),
+                    Arc::new(AtomicBool::new(false)),
+                ]
+            });
+        let repl_metrics = replication_metrics
+            .clone()
+            .expect("replication_metrics must be Some when replication is enabled");
         let repl_sender_handle = std::thread::Builder::new()
             .name("repl-sender".into())
             .spawn(move || {
@@ -715,6 +758,9 @@ fn run_as_primary<L: BlockingTransportListener>(
                     &s_repl,
                     &ready_flag,
                     &connected_counter,
+                    evict_flags,
+                    active_flags,
+                    repl_metrics,
                     batch_size,
                     heartbeat_secs,
                     busy_spin,
@@ -869,6 +915,17 @@ fn run_as_primary<L: BlockingTransportListener>(
         let drain_start = std::time::Instant::now();
         let last_seed_seq = last_published_seq + 1; // cursor = next-to-consume
 
+        info!(
+            last_seed_seq,
+            journal = journal_cursor
+                .get()
+                .load(std::sync::atomic::Ordering::Relaxed),
+            matching = matching_cursor
+                .get()
+                .load(std::sync::atomic::Ordering::Relaxed),
+            "seed drain: waiting for pipeline cursors"
+        );
+
         while journal_cursor
             .get()
             .load(std::sync::atomic::Ordering::Acquire)
@@ -881,19 +938,29 @@ fn run_as_primary<L: BlockingTransportListener>(
             std::hint::spin_loop();
         }
 
-        // After journal + matching are done, wait for the replication ring
-        // consumers to have read all published batches. The producer cursor
-        // is stable at this point (no more seed publishes).
+        info!("seed drain: pipeline cursors reached target");
+
+        // After journal + matching are done, wait for each ACTIVE
+        // replication ring's consumer to have read all published batches.
+        // Inactive rings (no connected replica) were never published to,
+        // so their producer cursor is 0 — no wait needed.
         if let Some(ref ring_progress) = replication_ring_progress {
-            let producer_seq = ring_progress.producer_cursor.load();
-            while !ring_progress
-                .consumer_cursors
-                .iter()
-                .all(|c| c.get().load(std::sync::atomic::Ordering::Acquire) >= producer_seq)
-            {
-                std::hint::spin_loop();
+            for i in 0..ring_progress.producer_cursors.len() {
+                if !ring_progress.active_flags[i].load(std::sync::atomic::Ordering::Relaxed) {
+                    continue;
+                }
+                let target = ring_progress.producer_cursors[i].load();
+                while ring_progress.consumer_cursors[i]
+                    .get()
+                    .load(std::sync::atomic::Ordering::Acquire)
+                    < target
+                {
+                    std::hint::spin_loop();
+                }
             }
         }
+
+        info!("seed drain: replication rings drained");
         let drain_elapsed = drain_start.elapsed();
 
         info!(
@@ -925,6 +992,7 @@ fn run_as_primary<L: BlockingTransportListener>(
             Arc::clone(&replication_cursor),
             Arc::clone(&pipeline_healthy),
             replicas_connected.clone(),
+            replication_metrics.clone(),
             Arc::clone(&shutdown),
         )?)
     } else {
@@ -1407,6 +1475,12 @@ pub fn run_dpdk(
     // Spawn DPDK replication sender if enabled. Uses its own DPDK queue pair
     // and smoltcp stack so the replication channel goes through kernel bypass.
     let replica_ready = Arc::new(AtomicBool::new(false));
+    let replication_metrics: Option<Arc<crate::replication::ReplicationMetrics>> =
+        if replication_consumers.is_some() {
+            Some(Arc::new(crate::replication::ReplicationMetrics::default()))
+        } else {
+            None
+        };
     // DPDK replication sender currently supports single-replica only.
     // The second consumer from the dual-replica pipeline is unused here.
     let replication_handle =
@@ -1437,6 +1511,13 @@ pub fn run_dpdk(
             let batch_size = config.replication_batch_size;
             let heartbeat_secs = config.replication_heartbeat_secs;
             let busy_spin = !config.yield_idle;
+            let repl_metrics = replication_metrics
+                .clone()
+                .expect("replication_metrics must be Some when replication is enabled");
+            let dpdk_active_flag = replication_ring_progress
+                .as_ref()
+                .map(|rp| Arc::clone(&rp.active_flags[0]))
+                .unwrap_or_else(|| Arc::new(AtomicBool::new(false)));
             let repl_sender_handle = std::thread::Builder::new()
                 .name("repl-sender".into())
                 .spawn(move || {
@@ -1449,6 +1530,8 @@ pub fn run_dpdk(
                         &s_repl,
                         &ready_flag,
                         &connected_bridge,
+                        dpdk_active_flag,
+                        repl_metrics,
                         batch_size,
                         heartbeat_secs,
                         busy_spin,
@@ -1527,13 +1610,18 @@ pub fn run_dpdk(
             std::hint::spin_loop();
         }
         if let Some(ref ring_progress) = replication_ring_progress {
-            let producer_seq = ring_progress.producer_cursor.load();
-            while !ring_progress
-                .consumer_cursors
-                .iter()
-                .all(|c| c.get().load(std::sync::atomic::Ordering::Acquire) >= producer_seq)
-            {
-                std::hint::spin_loop();
+            for i in 0..ring_progress.producer_cursors.len() {
+                if !ring_progress.active_flags[i].load(std::sync::atomic::Ordering::Relaxed) {
+                    continue;
+                }
+                let target = ring_progress.producer_cursors[i].load();
+                while ring_progress.consumer_cursors[i]
+                    .get()
+                    .load(std::sync::atomic::Ordering::Acquire)
+                    < target
+                {
+                    std::hint::spin_loop();
+                }
             }
         }
 
@@ -1559,6 +1647,7 @@ pub fn run_dpdk(
             Arc::clone(&replication_cursor),
             Arc::clone(&pipeline_healthy),
             replicas_connected.clone(),
+            replication_metrics.clone(),
             Arc::clone(&shutdown),
         )?)
     } else {

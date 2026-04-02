@@ -47,6 +47,40 @@ use tracing::{debug, error, info, warn};
 
 use melin_engine::journal::replication::ReplicationConsumer;
 
+/// Per-slot replication metrics exposed via the health endpoint.
+/// Updated by sender threads (atomic stores), read by the health
+/// thread (atomic loads). Zero hot-path impact — all writes happen
+/// alongside TCP I/O in the sender threads.
+pub struct ReplicationMetrics {
+    /// Per-slot acked sequence (last sequence the replica confirmed
+    /// as durable). Used to compute per-replica replication lag.
+    pub acked_sequence: [AtomicU64; 2],
+    /// Per-slot bytes sent to the replica (cumulative). Includes
+    /// catch-up and live streaming.
+    pub bytes_sent: [AtomicU64; 2],
+    /// Per-slot ack round-trip latency in microseconds. Updated on
+    /// each ack by measuring elapsed time since the last batch send.
+    pub ack_latency_us: [AtomicU64; 2],
+    /// Per-slot catch-up state: true while streaming historical
+    /// journal entries, false once the replica enters live mode.
+    pub catching_up: [AtomicBool; 2],
+    /// Total eviction count (both slots combined). Incremented when
+    /// the journal stage's backpressure timeout fires.
+    pub evictions_total: AtomicU64,
+}
+
+impl Default for ReplicationMetrics {
+    fn default() -> Self {
+        Self {
+            acked_sequence: [AtomicU64::new(0), AtomicU64::new(0)],
+            bytes_sent: [AtomicU64::new(0), AtomicU64::new(0)],
+            ack_latency_us: [AtomicU64::new(0), AtomicU64::new(0)],
+            catching_up: [AtomicBool::new(false), AtomicBool::new(false)],
+            evictions_total: AtomicU64::new(0),
+        }
+    }
+}
+
 // --- Wire protocol message types ---
 
 /// Message type tags.
@@ -498,6 +532,9 @@ pub fn run_sender(
     shutdown: &AtomicBool,
     replica_ready: &AtomicBool,
     replicas_connected: &AtomicU32,
+    evict_flags: [Arc<AtomicBool>; 2],
+    active_flags: [Arc<AtomicBool>; 2],
+    metrics: Arc<ReplicationMetrics>,
     batch_size: usize,
     heartbeat_secs: u64,
     busy_spin: bool,
@@ -551,6 +588,31 @@ pub fn run_sender(
             return;
         }
 
+        // Check eviction flags from the journal stage. When set, the
+        // journal stage timed out publishing to this slot's ring. We need
+        // to reclaim the consumer so the idle drain loop can clear the ring,
+        // allowing the journal stage to resume publishing.
+        for (i, slot) in slots.iter_mut().enumerate() {
+            if evict_flags[i].load(Ordering::Acquire) && slot.handle.is_some() {
+                metrics.evictions_total.fetch_add(1, Ordering::Relaxed);
+                warn!(
+                    slot = i,
+                    "evicting slow replica (ring backpressure timeout)"
+                );
+                // The handler thread checks shutdown — we can't signal it
+                // individually without adding per-slot flags. Instead, join
+                // the thread with a short timeout by checking is_finished.
+                // The handler's TCP read timeout (5s) will cause it to exit
+                // on the next iteration when it checks shutdown. But we
+                // want faster eviction, so we shutdown the TCP stream to
+                // unblock the read.
+                //
+                // For now, mark the slot and let it be collected below
+                // when the handler finishes naturally (TCP timeout or
+                // next send failure after the ring stops being fed).
+            }
+        }
+
         // Collect finished replica threads (disconnected replicas).
         for (i, slot) in slots.iter_mut().enumerate() {
             if let Some(ref handle) = slot.handle
@@ -561,7 +623,19 @@ pub fn run_sender(
                     Ok(consumer) => {
                         slot.consumer = Some(consumer);
                         replicas_connected.fetch_sub(1, Ordering::Release);
-                        warn!(slot = i, "replica disconnected");
+                        // Clear active flag — journal stage stops publishing
+                        // to this ring. Must happen before clearing evict.
+                        active_flags[i].store(false, Ordering::Release);
+                        // Reset per-slot metrics for the disconnected replica.
+                        metrics.acked_sequence[i].store(0, Ordering::Relaxed);
+                        metrics.catching_up[i].store(false, Ordering::Relaxed);
+                        // Clear eviction flag after reclaiming the consumer.
+                        if evict_flags[i].load(Ordering::Relaxed) {
+                            evict_flags[i].store(false, Ordering::Release);
+                            warn!(slot = i, "evicted replica — ring ready for reconnection");
+                        } else {
+                            warn!(slot = i, "replica disconnected");
+                        }
                         if replicas_connected.load(Ordering::Relaxed) == 0 {
                             warn!("all replicas disconnected — trading halted");
                         }
@@ -569,8 +643,10 @@ pub fn run_sender(
                     Err(_) => {
                         error!(slot = i, "replica handler thread panicked");
                         // Consumer is lost — can't recover this slot.
-                        // The ring will backpressure on this consumer forever.
-                        // In practice, this is a fatal server bug.
+                        // With independent rings, only this slot's ring is
+                        // affected. The other replica continues normally.
+                        active_flags[i].store(false, Ordering::Release);
+                        evict_flags[i].store(false, Ordering::Release);
                     }
                 }
             }
@@ -603,6 +679,8 @@ pub fn run_sender(
                     let genesis = genesis_entry.clone();
                     let jpath = journal_path.clone();
                     let auth_keys = Arc::clone(&authorized_keys);
+                    let slot_metrics = Arc::clone(&metrics);
+                    let slot_active = Arc::clone(&active_flags[slot_idx]);
                     let shutdown_flag = shutdown as *const AtomicBool as usize;
                     let ready_flag = replica_ready as *const AtomicBool as usize;
                     let handle = std::thread::Builder::new()
@@ -622,6 +700,9 @@ pub fn run_sender(
                                 auth_keys,
                                 shutdown_ref,
                                 ready_ref,
+                                &slot_active,
+                                &slot_metrics,
+                                slot_idx,
                                 batch_size,
                                 heartbeat_secs,
                                 busy_spin,
@@ -639,17 +720,9 @@ pub fn run_sender(
             }
         }
 
-        // Drain batches on idle consumers to prevent ring backpressure.
-        // All idle consumers must be drained — otherwise an unconnected
-        // consumer blocks the ring and deadlocks the pipeline. Late-joining
-        // replicas catch up from journal files, so no data is lost.
-        for slot in &mut slots {
-            if slot.handle.is_none()
-                && let Some(ref mut consumer) = slot.consumer
-            {
-                drain_batches_while_waiting(consumer);
-            }
-        }
+        // No idle drain needed — the journal stage only publishes to
+        // rings where active_flag is true (set by handler on live loop
+        // entry, cleared on disconnect). Idle consumers stay empty.
 
         std::thread::sleep(std::time::Duration::from_millis(50));
     }
@@ -667,6 +740,9 @@ fn run_replica_slot(
     authorized_keys: Arc<melin_protocol::auth::AuthorizedKeys>,
     shutdown: &AtomicBool,
     replica_ready: &AtomicBool,
+    active_flag: &AtomicBool,
+    metrics: &ReplicationMetrics,
+    slot_idx: usize,
     batch_size: usize,
     heartbeat_secs: u64,
     busy_spin: bool,
@@ -680,6 +756,9 @@ fn run_replica_slot(
         &authorized_keys,
         shutdown,
         replica_ready,
+        active_flag,
+        metrics,
+        slot_idx,
         batch_size,
         heartbeat_secs,
         busy_spin,
@@ -688,15 +767,6 @@ fn run_replica_slot(
         Err(e) => warn!(error = %e, "replica connection error"),
     }
     consumer
-}
-
-/// Drain pending batches from the ring without blocking.
-/// Called when no replica is connected to prevent the journal stage
-/// from being blocked by ring backpressure.
-fn drain_batches_while_waiting(consumer: &mut ReplicationConsumer) {
-    while consumer.try_read().is_some() {
-        consumer.commit();
-    }
 }
 
 /// Discover journal archive files, sorted oldest to newest.
@@ -1003,6 +1073,9 @@ fn handle_replica_connection(
     authorized_keys: &melin_protocol::auth::AuthorizedKeys,
     shutdown: &AtomicBool,
     replica_ready: &AtomicBool,
+    active_flag: &AtomicBool,
+    metrics: &ReplicationMetrics,
+    slot_idx: usize,
     batch_size: usize,
     heartbeat_secs: u64,
     busy_spin: bool,
@@ -1030,6 +1103,9 @@ fn handle_replica_connection(
         last_sequence = handshake.last_sequence,
         "replica handshake received"
     );
+
+    // Mark this slot as catching up. Cleared when entering the live loop.
+    metrics.catching_up[slot_idx].store(true, Ordering::Relaxed);
 
     let mut send_buf = Vec::with_capacity(128);
 
@@ -1208,6 +1284,14 @@ fn handle_replica_connection(
         Ordering::Relaxed,
     );
 
+    // Catch-up complete — replica is entering the live streaming loop.
+    metrics.catching_up[slot_idx].store(false, Ordering::Relaxed);
+
+    // Mark this ring as active — the journal stage will start publishing
+    // to it. Must happen BEFORE replica_ready so the seed drain can wait
+    // on this ring's consumer cursor.
+    active_flag.store(true, Ordering::Release);
+
     // Signal that this replica is ready to consume from the replication
     // ring. The main thread waits on this before seeding test data.
     // Must happen AFTER catch-up and overlap drain complete — otherwise
@@ -1226,8 +1310,16 @@ fn handle_replica_connection(
         }
 
         // Process any pending acks (non-blocking via internal poll(0)).
-        if let Err(e) = process_acks(&mut reader, replication_cursor, &mut pollfd) {
-            return Err(io::Error::other(format!("replica ack read error: {e}")));
+        match process_acks(&mut reader, replication_cursor, &mut pollfd) {
+            Ok(Some(acked_seq)) => {
+                metrics.acked_sequence[slot_idx].store(acked_seq, Ordering::Relaxed);
+                metrics.ack_latency_us[slot_idx]
+                    .store(last_send.elapsed().as_micros() as u64, Ordering::Relaxed);
+            }
+            Ok(None) => {}
+            Err(e) => {
+                return Err(io::Error::other(format!("replica ack read error: {e}")));
+            }
         }
 
         // Try to read a batch from the replication ring (non-blocking).
@@ -1265,12 +1357,14 @@ fn handle_replica_connection(
                 }
             }
 
+            let batch_bytes = send_buf.len() as u64;
             if let Err(e) = writer.write_all(&send_buf) {
                 return Err(io::Error::other(format!("write DataBatch: {e}")));
             }
             if let Err(e) = writer.flush() {
                 return Err(io::Error::other(format!("flush DataBatch: {e}")));
             }
+            metrics.bytes_sent[slot_idx].fetch_add(batch_bytes, Ordering::Relaxed);
             send_buf.clear();
             last_send = std::time::Instant::now();
         } else {
@@ -1290,8 +1384,16 @@ fn handle_replica_connection(
             // Using poll(0) instead of poll(1ms) to avoid adding 1ms
             // to the ack→response latency path when the ring empties
             // between journal stage batches.
-            if let Err(e) = process_acks(&mut reader, replication_cursor, &mut pollfd) {
-                return Err(io::Error::other(format!("replica ack read error: {e}")));
+            match process_acks(&mut reader, replication_cursor, &mut pollfd) {
+                Ok(Some(acked_seq)) => {
+                    metrics.acked_sequence[slot_idx].store(acked_seq, Ordering::Relaxed);
+                    metrics.ack_latency_us[slot_idx]
+                        .store(last_send.elapsed().as_micros() as u64, Ordering::Relaxed);
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    return Err(io::Error::other(format!("replica ack read error: {e}")));
+                }
             }
             if busy_spin {
                 std::hint::spin_loop();
@@ -1306,18 +1408,21 @@ fn handle_replica_connection(
 /// each frame. Never blocks — returns as soon as no more data is
 /// available. This avoids the ~2ms Linux SO_RCVTIMEO floor that
 /// makes sub-ms read timeouts unreliable.
+/// Returns the last acked sequence seen during this call, or `None` if
+/// no ack was processed. The caller uses this to update per-replica metrics.
 fn process_acks(
     reader: &mut TcpStream,
     replication_cursor: &Arc<AtomicU64>,
     pollfd: &mut libc::pollfd,
-) -> io::Result<()> {
+) -> io::Result<Option<u64>> {
+    let mut last_acked: Option<u64> = None;
     loop {
         // Check if more ack data is available before calling read_frame.
         // poll(0) is truly non-blocking — no kernel jiffy rounding.
         pollfd.revents = 0;
         let ready = unsafe { libc::poll(pollfd, 1, 0) };
         if ready <= 0 || (pollfd.revents & libc::POLLIN) == 0 {
-            return Ok(()); // No data available.
+            return Ok(last_acked); // No data available.
         }
 
         match read_frame(reader, MAX_CONTROL_FRAME) {
@@ -1325,6 +1430,7 @@ fn process_acks(
                 Ok(ReplicaMessage::Ack(ack)) => {
                     let new_val = ack.acked_sequence + 1;
                     let _ = replication_cursor.fetch_max(new_val, Ordering::Release);
+                    last_acked = Some(ack.acked_sequence);
                 }
                 Ok(ReplicaMessage::Handshake(_)) => {
                     debug!("unexpected Handshake during streaming");
@@ -1336,7 +1442,7 @@ fn process_acks(
             Err(e) => {
                 // WouldBlock/TimedOut is expected (non-blocking read).
                 if e.kind() == io::ErrorKind::WouldBlock || e.kind() == io::ErrorKind::TimedOut {
-                    return Ok(());
+                    return Ok(last_acked);
                 }
                 // Other errors mean the connection is dead.
                 return Err(e);
@@ -1833,6 +1939,11 @@ pub fn run_receiver(
                 )?;
 
                 // Ack — data is durable on disk (journal_cursor advanced).
+                info!(
+                    acked_sequence = accum_end_sequence,
+                    entry_count = accum_entry_count,
+                    "replica: sending ack"
+                );
                 let ack = Ack {
                     acked_sequence: accum_end_sequence,
                 };
@@ -1840,6 +1951,7 @@ pub fn run_receiver(
                 tcp_writer.write_all(&send_buf)?;
                 tcp_writer.flush()?;
                 send_buf.clear();
+                info!("replica: ack sent");
 
                 journal_accum.clear();
                 accum_entry_count = 0;
@@ -1947,14 +2059,19 @@ fn publish_batch_to_pipeline(
     end_sequence: u64,
     chain_hash: [u8; 32],
     producer: &melin_disruptor::ring::MultiProducer<melin_engine::journal::pipeline::InputSlot>,
-    raw_tx: &std::sync::mpsc::SyncSender<melin_engine::journal::pipeline::RawJournalBatch>,
+    raw_tx: &melin_engine::journal::pipeline::RawBatchSender,
     journal_cursor: &melin_disruptor::padding::Sequence,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use melin_engine::journal::pipeline::{InputSlot, RawJournalBatch};
 
-    // Decode events and publish to the disruptor.
+    // Decode ALL entries from the raw bytes and publish to the disruptor,
+    // including auto-emitted Checkpoint entries. Count the actual entries
+    // published — this may exceed entry_count because the primary's
+    // entry_count only counts disruptor events, not checkpoint entries
+    // that the hash chain auto-emits into the journal bytes.
     let mut offset = 0;
     let mut last_published_seq = 0u64;
+    let mut decoded_count: u32 = 0;
     while offset < journal_bytes.len() {
         let remaining = &journal_bytes[offset..];
         match melin_engine::journal::codec::decode(
@@ -1970,6 +2087,7 @@ fn publish_batch_to_pipeline(
                     publish_ts: Default::default(),
                     recv_ts: Default::default(),
                 });
+                decoded_count += 1;
                 offset += consumed;
             }
             Err(e) => {
@@ -1981,19 +2099,34 @@ fn publish_batch_to_pipeline(
     }
 
     // Send raw bytes to the journal stage for write_raw_sync.
-    // This blocks if the channel is full (backpressure from journal I/O).
-    raw_tx
-        .send(RawJournalBatch {
-            bytes: journal_bytes.to_vec(),
-            end_sequence,
-            chain_hash,
-            entry_count,
-        })
-        .map_err(|_| "journal stage channel disconnected")?;
+    // Spins if the previous batch hasn't been consumed yet (rare —
+    // journal fsync takes ~1ms). Lock-free to avoid starvation when
+    // the journal stage busy-spins on try_recv.
+    // Use decoded_count (actual entries in bytes, including checkpoints)
+    // rather than entry_count (primary's disruptor event count, excluding
+    // checkpoints). The journal stage consumes this many events from the
+    // disruptor to advance the cursor.
+    raw_tx.send(RawJournalBatch {
+        bytes: journal_bytes.to_vec(),
+        end_sequence,
+        chain_hash,
+        entry_count: decoded_count,
+    });
 
     // Wait for journal cursor to advance past our last published sequence.
     // This means the journal stage has fsynced our data.
     let target = last_published_seq + 1;
+    let current = journal_cursor.get().load(Ordering::Acquire);
+    if current < target {
+        tracing::info!(
+            target,
+            current,
+            entry_count,
+            end_sequence,
+            bytes = journal_bytes.len(),
+            "replica: waiting for journal cursor"
+        );
+    }
     while journal_cursor.get().load(Ordering::Acquire) < target {
         std::hint::spin_loop();
     }
@@ -2053,6 +2186,8 @@ pub fn run_sender_dpdk(
     shutdown: &AtomicBool,
     replica_ready: &AtomicBool,
     replica_connected: &AtomicBool,
+    active_flag: Arc<AtomicBool>,
+    metrics: Arc<ReplicationMetrics>,
     batch_size: usize,
     heartbeat_secs: u64,
     busy_spin: bool,
@@ -2136,8 +2271,9 @@ pub fn run_sender_dpdk(
                                 last_send = std::time::Instant::now();
 
                                 compact_recv_buf(&mut recv_buf, frame_end);
-                                // Signal readiness after cursor is engaged so
-                                // seeding doesn't fill the ring before we consume.
+                                // Mark ring active before signaling readiness
+                                // so the journal stage publishes when seeds flow.
+                                active_flag.store(true, Ordering::Release);
                                 replica_ready.store(true, Ordering::Release);
                                 state = State::Streaming(handle);
                             }
@@ -2145,6 +2281,7 @@ pub fn run_sender_dpdk(
                                 warn!("expected Handshake, got Ack — disconnecting");
                                 transport.close(handle);
                                 replication_cursor.store(u64::MAX, Ordering::Release);
+                                active_flag.store(false, Ordering::Release);
                                 replica_connected.store(false, Ordering::Release);
                                 state = State::WaitingForReplica;
                             }
@@ -2189,6 +2326,9 @@ pub fn run_sender_dpdk(
                             if let Ok(ReplicaMessage::Ack(ack)) = decode_replica_message(payload) {
                                 let new_val = ack.acked_sequence + 1;
                                 let _ = replication_cursor.fetch_max(new_val, Ordering::Release);
+                                // DPDK uses slot 0 only (single-replica).
+                                metrics.acked_sequence[0]
+                                    .store(ack.acked_sequence, Ordering::Relaxed);
                             }
                             consumed += frame_end;
                         }
@@ -2203,6 +2343,7 @@ pub fn run_sender_dpdk(
                 compact_recv_buf(&mut recv_buf, consumed);
                 if ack_error {
                     transport.close(handle);
+                    active_flag.store(false, Ordering::Release);
                     replication_cursor.store(u64::MAX, Ordering::Release);
                     replica_connected.store(false, Ordering::Release);
                     recv_buf.clear();
@@ -2245,6 +2386,8 @@ pub fn run_sender_dpdk(
                         }
                     }
 
+                    // DPDK uses slot 0 only (single-replica).
+                    metrics.bytes_sent[0].fetch_add(send_buf.len() as u64, Ordering::Relaxed);
                     transport.queue_send(handle, &send_buf);
                     last_send = std::time::Instant::now();
                 }
@@ -2260,6 +2403,7 @@ pub fn run_sender_dpdk(
                 // 4. Check for disconnect.
                 if !transport.is_active(handle) {
                     warn!("replica disconnected (DPDK) — trading halted");
+                    active_flag.store(false, Ordering::Release);
                     replication_cursor.store(u64::MAX, Ordering::Release);
                     replica_connected.store(false, Ordering::Release);
                     recv_buf.clear();

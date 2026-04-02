@@ -20,11 +20,11 @@ use melin_disruptor::padding::Sequence;
 const CHUNK_SIZE: usize = 512 * 1024;
 
 /// Capacity of the replication ring (number of batch slots).
-/// 2^6 = 64 slots. At 512 KiB per slot, total buffer = 32 MiB (same
-/// total as previous 256 × 128 KiB). Provides buffering for ~262K events
-/// (64 batches × 4096 events/batch) before backpressure reaches the
-/// journal stage.
-pub const REPLICATION_RING_CAPACITY: usize = 1 << 6;
+/// 2^8 = 256 slots. At 512 KiB per slot, total buffer = 128 MiB per
+/// ring (256 MiB for dual replication). Provides ~156ms of buffering
+/// at 1635 batches/sec (6.7M events/sec ÷ 4096 events/batch), enough
+/// to absorb TCP send latency without evicting replicas during bursts.
+pub const REPLICATION_RING_CAPACITY: usize = 1 << 8;
 
 /// Metadata for one replication batch. Small and `Copy` — carried in the
 /// disruptor ring slot. The actual byte data lives in the shared buffer
@@ -68,6 +68,11 @@ pub struct ReplicationProducer {
     inner: melin_disruptor::ring::Producer<ReplicationMeta>,
     buffers: Arc<SharedBuffers>,
 }
+
+/// Error returned by [`ReplicationProducer::try_publish_timeout`] when
+/// the ring remained full for the entire timeout duration.
+#[derive(Debug)]
+pub struct BackpressureTimeout;
 
 impl ReplicationProducer {
     /// Publish a batch of encoded journal bytes to the ring.
@@ -143,6 +148,97 @@ impl ReplicationProducer {
                 Err(_) => std::hint::spin_loop(),
             }
         }
+    }
+
+    /// Non-blocking publish attempt. Returns `Ok(())` if the ring had
+    /// space, `Err(BackpressureTimeout)` if the ring was full.
+    pub fn try_publish(
+        &mut self,
+        data: &[u8],
+        end_sequence: u64,
+        chain_hash: [u8; 32],
+        entry_count: u32,
+    ) -> Result<(), BackpressureTimeout> {
+        assert!(
+            data.len() <= CHUNK_SIZE,
+            "replication batch too large: {} > {CHUNK_SIZE}",
+            data.len()
+        );
+        match self.inner.try_claim() {
+            Ok(seq) => {
+                self.write_and_publish(seq, data, end_sequence, chain_hash, entry_count);
+                Ok(())
+            }
+            Err(_) => Err(BackpressureTimeout),
+        }
+    }
+
+    /// Publish with a timeout. Returns `Ok(())` on success,
+    /// `Err(BackpressureTimeout)` if the ring remained full for longer
+    /// than `timeout`. Only calls
+    /// `Instant::now()` when the ring is full (backpressure path), so the
+    /// normal fast path has zero overhead.
+    pub fn try_publish_timeout(
+        &mut self,
+        data: &[u8],
+        end_sequence: u64,
+        chain_hash: [u8; 32],
+        entry_count: u32,
+        timeout: std::time::Duration,
+    ) -> Result<(), BackpressureTimeout> {
+        assert!(
+            data.len() <= CHUNK_SIZE,
+            "replication batch too large: {} > {CHUNK_SIZE}",
+            data.len()
+        );
+
+        // Fast path: try once before touching the clock.
+        if let Ok(seq) = self.inner.try_claim() {
+            self.write_and_publish(seq, data, end_sequence, chain_hash, entry_count);
+            return Ok(());
+        }
+
+        // Slow path: ring is full, spin with timeout.
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
+            match self.inner.try_claim() {
+                Ok(seq) => {
+                    self.write_and_publish(seq, data, end_sequence, chain_hash, entry_count);
+                    return Ok(());
+                }
+                Err(_) => {
+                    if std::time::Instant::now() >= deadline {
+                        return Err(BackpressureTimeout);
+                    }
+                    std::hint::spin_loop();
+                }
+            }
+        }
+    }
+
+    /// Write byte data and publish metadata for a claimed slot.
+    fn write_and_publish(
+        &mut self,
+        seq: u64,
+        data: &[u8],
+        end_sequence: u64,
+        chain_hash: [u8; 32],
+        entry_count: u32,
+    ) {
+        let idx = (seq & self.buffers.mask) as usize;
+        unsafe {
+            let chunk = &mut *self.buffers.chunks[idx].get();
+            chunk[..data.len()].copy_from_slice(data);
+        }
+        self.inner.publish_claimed(
+            seq,
+            ReplicationMeta {
+                len: data.len() as u32,
+                entry_count,
+                end_sequence,
+                chain_hash,
+            },
+        );
     }
 
     /// Type-erased handle for reading the producer's published sequence.
@@ -399,5 +495,44 @@ mod tests {
         for (i, val) in received.iter().enumerate() {
             assert_eq!(*val, i as u64);
         }
+    }
+
+    #[test]
+    fn try_publish_timeout_succeeds_when_ring_has_space() {
+        let (mut producer, mut consumers) = build_replication_ring(1, REPLICATION_RING_CAPACITY);
+        let consumer = &mut consumers[0];
+
+        let result = producer.try_publish_timeout(
+            b"data",
+            1,
+            [0; 32],
+            1,
+            std::time::Duration::from_millis(10),
+        );
+        assert!(result.is_ok());
+
+        let (meta, data) = consumer.try_read().unwrap();
+        assert_eq!(meta.end_sequence, 1);
+        assert_eq!(data, b"data");
+        consumer.commit();
+    }
+
+    #[test]
+    fn try_publish_timeout_fails_when_ring_full() {
+        // Capacity 2: fill both slots without consuming → ring is full.
+        let (mut producer, _consumers) = build_replication_ring(1, 2);
+
+        producer.publish(b"a", 1, [0; 32], 1);
+        producer.publish(b"b", 2, [0; 32], 1);
+
+        // Ring is full — timeout should fire quickly.
+        let start = std::time::Instant::now();
+        let result =
+            producer.try_publish_timeout(b"c", 3, [0; 32], 1, std::time::Duration::from_millis(50));
+        let elapsed = start.elapsed();
+
+        assert!(result.is_err());
+        assert!(elapsed >= std::time::Duration::from_millis(50));
+        assert!(elapsed < std::time::Duration::from_millis(200));
     }
 }
