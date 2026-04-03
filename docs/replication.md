@@ -107,9 +107,9 @@ A server started with `--replica-of <primary_addr>` runs in replica mode:
 ```
 TCP Stream → Replication Receiver (decode + publish)
                     ↓                     ↓
-              Input Disruptor        raw_journal_tx (bounded channel, cap 4)
+              Input Disruptor        SPSC Ring (8 slots)
               ┌─────┼─────┐               ↓
-              │     │     │         Journal Stage (write_raw_sync)
+              │     │     │         Journal Stage (io_uring Write+RWF_DSYNC)
           Journal Matching Shadow
           Stage   Stage   Stage
               │     │     │
@@ -120,7 +120,7 @@ TCP Stream → Replication Receiver (decode + publish)
          Ack to primary
 ```
 
-The receiver thread publishes decoded events to the input disruptor and sends the raw journal bytes to the journal stage via a bounded `mpsc::SyncSender` (capacity 4). The journal stage writes the raw bytes with `write_raw_sync`, then consumes (and discards) the corresponding disruptor events to advance its cursor. The receiver spin-waits on the journal cursor to confirm durability before sending the ack.
+The receiver thread publishes decoded events to the input disruptor and sends the raw journal bytes to the journal stage via a bounded lock-free SPSC ring (8 slots). The journal stage submits async `Write+RWF_DSYNC` operations via io_uring, then consumes (and discards) the corresponding disruptor events after the CQE confirms durability. The SPSC ring decouples the receiver's TCP loop from NVMe write latency — the receiver can push up to 8 batches ahead while previous writes are in flight. The receiver spin-waits on the journal cursor before sending the ack.
 
 ## CLI Flags
 

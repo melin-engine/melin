@@ -1828,7 +1828,6 @@ pub fn run_receiver(
     // Reusable buffers for the receive loop.
     let mut frame_buf: Vec<u8> = Vec::with_capacity(64 * 1024);
     let mut journal_accum: Vec<u8> = Vec::with_capacity(128 * 1024);
-    let mut accum_entry_count: u32 = 0;
     let mut accum_end_sequence: u64 = 0;
     let mut accum_chain_hash: [u8; 32] = [0u8; 32];
 
@@ -1853,7 +1852,6 @@ pub fn run_receiver(
                 &mut reader,
                 &mut frame_buf,
                 &mut journal_accum,
-                &mut accum_entry_count,
                 &mut accum_end_sequence,
                 &mut accum_chain_hash,
             );
@@ -1861,7 +1859,6 @@ pub fn run_receiver(
             if !journal_accum.is_empty() {
                 publish_batch_to_pipeline(
                     &journal_accum,
-                    accum_entry_count,
                     accum_end_sequence,
                     accum_chain_hash,
                     &input_producer,
@@ -1897,7 +1894,6 @@ pub fn run_receiver(
                 if !journal_accum.is_empty() {
                     let _ = publish_batch_to_pipeline(
                         &journal_accum,
-                        accum_entry_count,
                         accum_end_sequence,
                         accum_chain_hash,
                         &input_producer,
@@ -1942,11 +1938,10 @@ pub fn run_receiver(
             PrimaryMessage::DataBatch {
                 end_sequence,
                 chain_hash: batch_chain_hash,
-                entry_count,
+                entry_count: _,
                 journal_bytes,
             } => {
                 journal_accum.extend_from_slice(&journal_bytes);
-                accum_entry_count += entry_count;
                 accum_end_sequence = end_sequence;
                 accum_chain_hash = batch_chain_hash;
 
@@ -1955,29 +1950,28 @@ pub fn run_receiver(
                     &mut reader,
                     &mut frame_buf,
                     &mut journal_accum,
-                    &mut accum_entry_count,
                     &mut accum_end_sequence,
                     &mut accum_chain_hash,
                 );
 
-                // Publish events to the disruptor and raw bytes to the
-                // journal stage. Wait for journal fsync, then ack.
-                publish_batch_to_pipeline(
+                // Submit events to the disruptor and raw bytes to the
+                // journal stage's SPSC ring (non-blocking). The journal
+                // stage writes them via io_uring asynchronously.
+                let target = submit_batch_to_pipeline(
                     &journal_accum,
-                    accum_entry_count,
                     accum_end_sequence,
                     accum_chain_hash,
                     &input_producer,
                     &raw_journal_tx,
-                    &journal_cursor,
                 )?;
 
-                // Ack — data is durable on disk (journal_cursor advanced).
-                info!(
-                    acked_sequence = accum_end_sequence,
-                    entry_count = accum_entry_count,
-                    "replica: sending ack"
-                );
+                // Wait for the journal cursor to confirm durability,
+                // then send the ack. With the SPSC ring and io_uring
+                // on the journal stage, the wait may be shorter than
+                // one NVMe write because previously submitted batches
+                // are already in-flight.
+                wait_for_journal_cursor(&journal_cursor, target);
+
                 let ack = Ack {
                     acked_sequence: accum_end_sequence,
                 };
@@ -1985,10 +1979,8 @@ pub fn run_receiver(
                 tcp_writer.write_all(&send_buf)?;
                 tcp_writer.flush()?;
                 send_buf.clear();
-                info!("replica: ack sent");
 
                 journal_accum.clear();
-                accum_entry_count = 0;
             }
             PrimaryMessage::Heartbeat {
                 sequence,
@@ -2042,7 +2034,6 @@ fn drain_tcp_data_batches(
     reader: &mut TcpStream,
     frame_buf: &mut Vec<u8>,
     journal_accum: &mut Vec<u8>,
-    accum_entry_count: &mut u32,
     accum_end_sequence: &mut u64,
     accum_chain_hash: &mut [u8; 32],
 ) {
@@ -2070,12 +2061,11 @@ fn drain_tcp_data_batches(
         match decode_primary_message(frame_buf) {
             Ok(PrimaryMessage::DataBatch {
                 end_sequence,
-                entry_count,
+                entry_count: _,
                 journal_bytes,
                 chain_hash,
             }) => {
                 journal_accum.extend_from_slice(&journal_bytes);
-                *accum_entry_count += entry_count;
                 *accum_end_sequence = end_sequence;
                 *accum_chain_hash = chain_hash;
             }
@@ -2084,18 +2074,23 @@ fn drain_tcp_data_batches(
     }
 }
 
-/// Decode accumulated journal bytes into events, publish each to the
-/// input disruptor, send the raw bytes to the journal stage, and wait
-/// for the journal cursor to advance (fsync complete).
-fn publish_batch_to_pipeline(
+/// Decode accumulated journal bytes into events, publish to the input
+/// disruptor, and send raw bytes to the journal stage's SPSC ring.
+/// Returns the disruptor sequence target that the caller must wait for
+/// before sending an ack (ensures persist-before-ack).
+///
+/// This function is NON-BLOCKING — it pushes to the SPSC ring and
+/// returns immediately (unless the ring is full, in which case it
+/// spins briefly). The caller can submit multiple batches before
+/// waiting, allowing the journal stage to overlap NVMe writes with
+/// TCP receives.
+fn submit_batch_to_pipeline(
     journal_bytes: &[u8],
-    entry_count: u32,
     end_sequence: u64,
     chain_hash: [u8; 32],
     producer: &melin_disruptor::ring::MultiProducer<melin_engine::journal::pipeline::InputSlot>,
     raw_tx: &melin_engine::journal::pipeline::RawBatchSender,
-    journal_cursor: &melin_disruptor::padding::Sequence,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> Result<u64, Box<dyn std::error::Error>> {
     use melin_engine::journal::pipeline::{InputSlot, RawJournalBatch};
 
     // Decode ALL entries from the raw bytes and publish to the disruptor,
@@ -2132,14 +2127,9 @@ fn publish_batch_to_pipeline(
         }
     }
 
-    // Send raw bytes to the journal stage for write_raw_sync.
-    // Spins if the previous batch hasn't been consumed yet (rare —
-    // journal fsync takes ~1ms). Lock-free to avoid starvation when
-    // the journal stage busy-spins on try_recv.
-    // Use decoded_count (actual entries in bytes, including checkpoints)
-    // rather than entry_count (primary's disruptor event count, excluding
-    // checkpoints). The journal stage consumes this many events from the
-    // disruptor to advance the cursor.
+    // Send raw bytes to the journal stage via the bounded SPSC ring.
+    // The ring has 8 slots — the receiver can pipeline up to 8 batches
+    // ahead of the journal stage's NVMe writes.
     raw_tx.send(RawJournalBatch {
         bytes: journal_bytes.to_vec(),
         end_sequence,
@@ -2147,24 +2137,32 @@ fn publish_batch_to_pipeline(
         entry_count: decoded_count,
     });
 
-    // Wait for journal cursor to advance past our last published sequence.
-    // This means the journal stage has fsynced our data.
-    let target = last_published_seq + 1;
-    let current = journal_cursor.get().load(Ordering::Acquire);
-    if current < target {
-        tracing::info!(
-            target,
-            current,
-            entry_count,
-            end_sequence,
-            bytes = journal_bytes.len(),
-            "replica: waiting for journal cursor"
-        );
-    }
+    // Return the disruptor target — the caller waits for this before
+    // sending an ack.
+    Ok(last_published_seq + 1)
+}
+
+/// Wait for the journal cursor to reach the target sequence,
+/// confirming all submitted batches are durable on disk.
+fn wait_for_journal_cursor(journal_cursor: &melin_disruptor::padding::Sequence, target: u64) {
     while journal_cursor.get().load(Ordering::Acquire) < target {
         std::hint::spin_loop();
     }
+}
 
+/// Legacy wrapper: submit + wait + return. Used by code paths that
+/// haven't been updated to the split submit/wait pattern yet.
+fn publish_batch_to_pipeline(
+    journal_bytes: &[u8],
+    end_sequence: u64,
+    chain_hash: [u8; 32],
+    producer: &melin_disruptor::ring::MultiProducer<melin_engine::journal::pipeline::InputSlot>,
+    raw_tx: &melin_engine::journal::pipeline::RawBatchSender,
+    journal_cursor: &melin_disruptor::padding::Sequence,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let target =
+        submit_batch_to_pipeline(journal_bytes, end_sequence, chain_hash, producer, raw_tx)?;
+    wait_for_journal_cursor(journal_cursor, target);
     Ok(())
 }
 
@@ -2267,8 +2265,8 @@ pub fn run_sender_dpdk(
                     continue;
                 }
 
-                // Drain batches to avoid blocking the replication ring.
-                drain_batches_while_waiting(&mut repl_consumer);
+                // Ring is inactive (active_flag=false) — the journal
+                // stage skips it, so no drain needed.
 
                 if busy_spin {
                     std::hint::spin_loop();
@@ -2683,7 +2681,6 @@ pub fn run_receiver_dpdk(
     };
 
     let mut journal_accum: Vec<u8> = Vec::with_capacity(128 * 1024);
-    let mut accum_entry_count: u32 = 0;
     let mut accum_end_sequence: u64 = 0;
     let mut accum_chain_hash: [u8; 32] = [0u8; 32];
 
@@ -2719,13 +2716,12 @@ pub fn run_receiver_dpdk(
                         FrameResult::Complete(ps, fe) => {
                             if let Ok(PrimaryMessage::DataBatch {
                                 end_sequence,
-                                entry_count,
+                                entry_count: _,
                                 journal_bytes,
                                 chain_hash: batch_chain_hash,
                             }) = decode_primary_message(&remaining[ps..fe])
                             {
                                 journal_accum.extend_from_slice(&journal_bytes);
-                                accum_entry_count += entry_count;
                                 accum_end_sequence = end_sequence;
                                 accum_chain_hash = batch_chain_hash;
                             }
@@ -2739,7 +2735,6 @@ pub fn run_receiver_dpdk(
             if !journal_accum.is_empty() {
                 let _ = publish_batch_to_pipeline(
                     &journal_accum,
-                    accum_entry_count,
                     accum_end_sequence,
                     accum_chain_hash,
                     &input_producer,
@@ -2789,12 +2784,11 @@ pub fn run_receiver_dpdk(
                     match decode_primary_message(payload) {
                         Ok(PrimaryMessage::DataBatch {
                             end_sequence,
-                            entry_count,
+                            entry_count: _,
                             journal_bytes,
                             chain_hash: batch_chain_hash,
                         }) => {
                             journal_accum.extend_from_slice(&journal_bytes);
-                            accum_entry_count += entry_count;
                             accum_end_sequence = end_sequence;
                             accum_chain_hash = batch_chain_hash;
                             got_data = true;
@@ -2838,17 +2832,17 @@ pub fn run_receiver_dpdk(
         }
         compact_recv_buf(&mut recv_buf, consumed);
 
-        // Publish to pipeline, wait for fsync, then ack.
+        // Submit to pipeline (non-blocking), wait for journal
+        // cursor, then ack.
         if got_data {
-            publish_batch_to_pipeline(
+            let target = submit_batch_to_pipeline(
                 &journal_accum,
-                accum_entry_count,
                 accum_end_sequence,
                 accum_chain_hash,
                 &input_producer,
                 &raw_journal_tx,
-                &journal_cursor,
             )?;
+            wait_for_journal_cursor(&journal_cursor, target);
 
             // Ack — data is durable.
             send_buf.clear();
@@ -2859,7 +2853,6 @@ pub fn run_receiver_dpdk(
             transport.queue_send(handle, &send_buf);
 
             journal_accum.clear();
-            accum_entry_count = 0;
         } else {
             std::thread::yield_now();
         }
