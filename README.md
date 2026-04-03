@@ -28,7 +28,7 @@ All numbers are **full round-trip** (client sends order → server journals to N
 
 ### Peak throughput (16 clients, window 256)
 
-Kernel TCP over 10 Gbps private VLAN. Three Cherry AMD Ryzen 9 9950X servers (16C, SMT off, dedicated NVMe journal). Commit [`d7bab52`](../../commit/d7bab52).
+Kernel TCP over 10 Gbps private VLAN. Three AMD Ryzen 9 9950X servers (16C, SMT off, dedicated NVMe journal). Commit [`d7bab52`](../../commit/d7bab52).
 
 | Durability | Throughput | p50 | p99 | p99.9 | max |
 |------------|-----------|-----|-----|-------|-----|
@@ -36,7 +36,7 @@ Kernel TCP over 10 Gbps private VLAN. Three Cherry AMD Ryzen 9 9950X servers (16
 | **Synchronous replication** (1 replica) | **4.0M/s** | 896 µs | 1,133 µs | 1,371 µs | 3,463 µs |
 | **Dual synchronous replication** (2 replicas) | **4.5M/s** | 867 µs | 1,040 µs | 1,150 µs | 2,204 µs |
 
-Dual replication is faster than single because the response gate uses `fetch_max` — the fastest replica's ack unblocks the response, and two replicas provide more ack throughput than one.
+Dual replication is the typical production setup for the strongest durability guarantees. It is faster than single replication because the primary only waits for the fastest replica's ack before responding to the client.
 
 ### Single-order latency (1 client, window 1)
 
@@ -47,8 +47,6 @@ The latency floor — one order at a time, no pipelining, no queuing.
 | Kernel TCP (standalone) | 56 µs | 57 µs | 68 µs | 1,041 µs |
 | **Synchronous replication** (1 replica) | 55 µs | 62 µs | 66 µs | 168 µs |
 | **Dual synchronous replication** (2 replicas) | **55 µs** | **64 µs** | **71 µs** | 891 µs |
-
-Adding replication does not increase median latency — the io_uring RECV/SEND path on both primary and replica eliminates syscall overhead. The replication round-trip (primary fsync + network + replica fsync + ack) overlaps with the primary's own journal write.
 
 **Latency CDF** — peak-load modes on the same axes:
 
