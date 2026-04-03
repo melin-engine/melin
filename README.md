@@ -17,10 +17,10 @@ Melin handles order matching, account balances, risk controls, circuit breakers,
 - BLAKE3 hash chain for tamper evidence
 - Dual-replication to survive and recover from major outage scenarios
 
-**Efficient** — 8.1M orders/sec with full durability on regular datacenter hardware.
+**Efficient** — 4.5M orders/sec with synchronous dual replication on regular datacenter hardware.
 - Single-threaded matching engine on a lock-free disruptor pipeline
-- Journal, matching, and replication run in parallel
-- Sub-100 µs p99.9 single-order latency
+- Journal, matching, and replication run in parallel via io_uring
+- Sub-100 µs p99.9 single-order latency with dual replication
 
 ## LAN Benchmarks
 
@@ -28,31 +28,35 @@ All numbers are **full round-trip** (client sends order → server journals to N
 
 ### Peak throughput (16 clients, window 256)
 
-Kernel TCP over 10 Gbps private VLAN. Two or three Cherry AMD Ryzen 9 9950X servers (16C, SMT off, dedicated NVMe journal). Commit [`ed9241d`](../../commit/ed9241d).
+Kernel TCP over 10 Gbps private VLAN. Three Cherry AMD Ryzen 9 9950X servers (16C, SMT off, dedicated NVMe journal). Commit [`d7bab52`](../../commit/d7bab52).
 
 | Durability | Throughput | p50 | p99 | p99.9 | max |
 |------------|-----------|-----|-----|-------|-----|
-| **Local fsync** | **8.1M/s** | 439 µs | 569 µs | 636 µs | 1,017 µs |
-| **Synchronous replication** (fsync + replica ack) | **5.8M/s** | 633 µs | 841 µs | 933 µs | 1,123 µs |
+| **Local fsync** | **6.7M/s** | 533 µs | 671 µs | 717 µs | 2,302 µs |
+| **Synchronous replication** (1 replica) | **4.0M/s** | 896 µs | 1,133 µs | 1,371 µs | 3,463 µs |
+| **Dual synchronous replication** (2 replicas) | **4.5M/s** | 867 µs | 1,040 µs | 1,150 µs | 2,204 µs |
+
+Dual replication is faster than single because the response gate uses `fetch_max` — the fastest replica's ack unblocks the response, and two replicas provide more ack throughput than one.
 
 ### Single-order latency (1 client, window 1)
 
 The latency floor — one order at a time, no pipelining, no queuing.
 
-| Transport | p50 | p90 | p99 | max | Hardware |
-|-----------|-----|-----|-----|-----|----------|
-| Kernel TCP | 72 µs | 87 µs | 90 µs | 207 µs | Ryzen 9 9950X, 10 GbE |
-| **DPDK kernel bypass** | **37 µs** | **38 µs** | **101 µs** | 1,775 µs | EPYC 4564P, Intel 82599 10 GbE SR-IOV |
+| Durability | p50 | p90 | p99 | max |
+|-----------|-----|-----|-----|-----|
+| Kernel TCP (standalone) | 56 µs | 57 µs | 68 µs | 1,041 µs |
+| **Synchronous replication** (1 replica) | 55 µs | 62 µs | 66 µs | 168 µs |
+| **Dual synchronous replication** (2 replicas) | **55 µs** | **64 µs** | **71 µs** | 891 µs |
 
-The DPDK result is an early experimental measurement with end-to-end kernel bypass (both client and server) on budget server-class hardware — not purpose-built low-latency infrastructure and with SR-IOV (dedicated or bifurcated would be better). 47% p50 reduction vs kernel TCP on the same machines.
+Adding replication does not increase median latency — the io_uring RECV/SEND path on both primary and replica eliminates syscall overhead. The replication round-trip (primary fsync + network + replica fsync + ack) overlaps with the primary's own journal write.
 
 **Latency CDF** — peak-load modes on the same axes:
 
-![Latency CDF](docs/plots/latency-cdf.svg)
+![Latency CDF](docs/plots/latency-cdf.png)
 
-**Latency stability over time** (p99.99, replication mode):
+**Latency stability over time** (p99.99, dual replication throughput mode):
 
-![Latency stability — replication](docs/plots/latency-stability-replication.svg)
+![Latency stability — dual replication](docs/plots/latency-stability-tcp-dual-repl-throughput.png)
 
 ## Features
 
