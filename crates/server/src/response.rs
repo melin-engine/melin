@@ -88,6 +88,13 @@ pub fn run(
     // Cached journal cursor value to avoid atomic reads on every slot.
     #[cfg(not(feature = "no-fsync"))]
     let mut cached_journal_pos: u64 = 0;
+    // Track which cursor is the bottleneck when the response stage waits.
+    // journal_gated: journal_cursor < needed when we first enter the wait.
+    // repl_gated: replication_cursor < needed when we first enter the wait.
+    #[cfg(not(feature = "no-fsync"))]
+    let mut journal_gated: u64 = 0;
+    #[cfg(not(feature = "no-fsync"))]
+    let mut repl_gated: u64 = 0;
     // Suppress unused warnings when journal gating is disabled.
     #[cfg(feature = "no-fsync")]
     let _ = (&journal_cursor, &replication_cursor);
@@ -148,6 +155,19 @@ pub fn run(
             }
             #[cfg(feature = "pipeline-stats")]
             print_utilization("response", busy_count, idle_count);
+            #[cfg(not(feature = "no-fsync"))]
+            {
+                let total = journal_gated + repl_gated;
+                if total > 0 {
+                    tracing::info!(
+                        journal_gated,
+                        repl_gated,
+                        total,
+                        repl_pct = repl_gated * 100 / total,
+                        "response gate stats"
+                    );
+                }
+            }
             return;
         }
 
@@ -273,14 +293,22 @@ pub fn run(
                 .expect("non-empty batch");
             let needed = max_seq + 1;
             if cached_journal_pos < needed {
-                loop {
+                // Snapshot which cursor(s) are behind on the first
+                // iteration to identify the bottleneck.
+                let journal_pos = journal_cursor.get().load(Ordering::Acquire);
+                let repl_pos = replication_cursor.load(Ordering::Acquire);
+                if journal_pos < needed {
+                    journal_gated += 1;
+                }
+                if repl_pos < needed {
+                    repl_gated += 1;
+                }
+                cached_journal_pos = journal_pos.min(repl_pos);
+                while cached_journal_pos < needed {
+                    std::hint::spin_loop();
                     let journal_pos = journal_cursor.get().load(Ordering::Acquire);
                     let repl_pos = replication_cursor.load(Ordering::Acquire);
                     cached_journal_pos = journal_pos.min(repl_pos);
-                    if cached_journal_pos >= needed {
-                        break;
-                    }
-                    std::hint::spin_loop();
                 }
             }
         }
