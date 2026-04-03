@@ -217,8 +217,8 @@ pub struct ServerConfig {
     /// Interval in seconds between automatic shadow snapshots. The shadow
     /// stage replays journaled events on a cloned Exchange and saves a
     /// consistent snapshot at this cadence — no hot-path stall. Set to 0
-    /// (default) to disable shadow snapshots entirely.
-    #[arg(long, default_value_t = 0)]
+    /// to disable shadow snapshots entirely.
+    #[arg(long, default_value_t = 30)]
     pub snapshot_interval_secs: u64,
 
     /// Path for shadow snapshots. Defaults to the journal path with a
@@ -279,7 +279,7 @@ impl Default for ServerConfig {
             event_bind: None,
             health_bind: Some("127.0.0.1:9878".parse().expect("valid default addr")),
             promote_bind: None,
-            snapshot_interval_secs: 0,
+            snapshot_interval_secs: 30,
             snapshot_path: None,
         }
     }
@@ -452,6 +452,8 @@ pub fn run_with_shutdown<L: BlockingTransportListener>(
             &signing_key,
             &shutdown,
             &promote_flag,
+            config.snapshot_interval_secs,
+            config.shadow_snapshot_path(),
         )? {
             None => return Ok(()), // clean shutdown
             Some((mut exchange, writer)) => {
@@ -1300,6 +1302,8 @@ pub fn run_dpdk(
             &config.journal,
             &shutdown,
             &promote_flag,
+            config.snapshot_interval_secs,
+            config.shadow_snapshot_path(),
         )? {
             None => return Ok(()), // clean shutdown
             Some((mut exchange, writer)) => {

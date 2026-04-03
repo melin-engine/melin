@@ -1507,6 +1507,8 @@ pub fn run_receiver(
     signing_key: &ed25519_dalek::SigningKey,
     shutdown: &AtomicBool,
     promote: &AtomicBool,
+    snapshot_interval_secs: u64,
+    snapshot_path: std::path::PathBuf,
 ) -> ReceiverResult {
     use melin_engine::exchange::Exchange;
     use melin_engine::journal::writer::JournalWriter;
@@ -1529,7 +1531,6 @@ pub fn run_receiver(
     // Determine our current state from the local journal (if any).
     // For fresh starts, we defer journal creation until after the handshake
     // so we can use the primary's genesis hash.
-    let snapshot_path = journal_path.with_extension("snapshot");
     let (mut exchange, mut journal_writer, last_sequence, chain_hash) = if journal_path.exists() {
         // Recover from snapshot + journal (fast) or journal only (full replay).
         let engine = if snapshot_path.exists() {
@@ -1745,6 +1746,7 @@ pub fn run_receiver(
     // matching → shadow), with the replication receiver feeding the disruptor
     // instead of reader threads. The journal stage writes raw bytes from
     // a side channel instead of encoding events.
+    let enable_shadow = snapshot_interval_secs > 0;
     let (
         input_producer,
         journal_stage,
@@ -1760,7 +1762,7 @@ pub fn run_receiver(
         journal_writer,
         4096,  // max_journal_batch
         false, // don't busy-spin on replica
-        true,  // enable shadow for snapshots
+        enable_shadow,
     );
 
     // RAII guard for pipeline threads — ensures all threads are joined on
@@ -1813,7 +1815,7 @@ pub fn run_receiver(
                         shadow_cons,
                         shadow_exchange,
                         snap_path,
-                        std::time::Duration::from_secs(30),
+                        std::time::Duration::from_secs(snapshot_interval_secs),
                         chain_lock,
                         &ps,
                         false,
@@ -2468,6 +2470,8 @@ pub fn run_receiver_dpdk(
     journal_path: &std::path::Path,
     shutdown: &AtomicBool,
     promote: &AtomicBool,
+    snapshot_interval_secs: u64,
+    snapshot_path: std::path::PathBuf,
 ) -> ReceiverResult {
     use melin_engine::exchange::Exchange;
     use melin_engine::journal::writer::JournalWriter;
@@ -2605,6 +2609,7 @@ pub fn run_receiver_dpdk(
     let shadow_exchange = exchange.clone_via_snapshot();
 
     // Build the replica pipeline — same as the TCP receiver.
+    let enable_shadow = snapshot_interval_secs > 0;
     let (
         input_producer,
         journal_stage,
@@ -2620,7 +2625,7 @@ pub fn run_receiver_dpdk(
         journal_writer,
         4096,
         false, // don't busy-spin on replica
-        true,  // enable shadow for snapshots
+        enable_shadow,
     );
 
     let pipeline_shutdown = Arc::new(AtomicBool::new(false));
@@ -2655,7 +2660,6 @@ pub fn run_receiver_dpdk(
         })
         .expect("spawn drain thread");
 
-    let snapshot_path = journal_path.with_extension("snapshot");
     let shadow_handle = if let Some(shadow_cons) = shadow_consumer {
         let snap_path = snapshot_path.clone();
         let chain_lock = chain_hash_lock.expect("chain hash lock with shadow");
@@ -2668,7 +2672,7 @@ pub fn run_receiver_dpdk(
                         shadow_cons,
                         shadow_exchange,
                         snap_path,
-                        std::time::Duration::from_secs(30),
+                        std::time::Duration::from_secs(snapshot_interval_secs),
                         chain_lock,
                         &ps,
                         false,
