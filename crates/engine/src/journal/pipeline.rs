@@ -262,112 +262,121 @@ pub struct RawJournalBatch {
     pub entry_count: u32,
 }
 
-/// Lock-free single-slot hand-off between the replication receiver and
-/// the journal stage. Replaces `mpsc::sync_channel` to avoid the lock
-/// starvation that occurs when the journal stage busy-spins on
-/// `try_recv()` and monopolizes the channel's internal synchronization.
+/// Lock-free bounded SPSC ring for passing raw journal batches from the
+/// replication receiver to the journal stage. Capacity 8 allows the
+/// receiver to pipeline multiple batches while the journal stage writes
+/// them to NVMe via io_uring, overlapping TCP receives with disk I/O.
 ///
-/// The sender stores a `Box<RawJournalBatch>` via `AtomicPtr::store`.
-/// The receiver takes it via `AtomicPtr::swap(null)`. When the slot is
-/// occupied (previous batch not yet consumed), the sender spins — but
-/// since the receiver (journal stage) consumes batches in ~1ms (NVMe
-/// fsync), this rarely happens. Producer and consumer access the same
-/// atomic pointer, but the access pattern (store-once then poll) avoids
-/// the cache-line thrashing caused by `mpsc`'s internal mutex.
-#[derive(Default)]
-pub struct RawBatchSlot {
-    ptr: AtomicPtr<RawJournalBatch>,
+/// Uses separate cache-padded head/tail indices to avoid false sharing.
+/// Slots are `AtomicPtr<RawJournalBatch>` — ownership transfers via
+/// store/load. The sender advances `head`, the receiver advances `tail`.
+///
+/// Number of slots in the raw batch ring. Must be a power of two.
+const RAW_RING_CAPACITY: usize = 8;
+const RAW_RING_MASK: usize = RAW_RING_CAPACITY - 1;
+
+struct RawBatchRing {
+    slots: [AtomicPtr<RawJournalBatch>; RAW_RING_CAPACITY],
+    /// Next slot to write (producer). Cache-padded to avoid false
+    /// sharing with `tail` on the consumer's cache line.
+    head: melin_disruptor::padding::CachePadded<AtomicU64>,
+    /// Next slot to read (consumer).
+    tail: melin_disruptor::padding::CachePadded<AtomicU64>,
 }
 
-// Safety: the AtomicPtr is the sole access path. Only one sender and one
-// receiver use it (SPSC). Send/Sync is safe because atomic operations
-// provide the necessary synchronization.
-unsafe impl Send for RawBatchSlot {}
-unsafe impl Sync for RawBatchSlot {}
+unsafe impl Send for RawBatchRing {}
+unsafe impl Sync for RawBatchRing {}
 
-impl RawBatchSlot {
-    pub fn new() -> Self {
+impl RawBatchRing {
+    fn new() -> Self {
+        // Initialize all slots to null. Each slot is an independent
+        // AtomicPtr — the const is used only for array initialization.
+        #[allow(clippy::declare_interior_mutable_const)]
+        const NULL: AtomicPtr<RawJournalBatch> = AtomicPtr::new(std::ptr::null_mut());
         Self {
-            ptr: AtomicPtr::new(std::ptr::null_mut()),
+            slots: [NULL; RAW_RING_CAPACITY],
+            head: melin_disruptor::padding::CachePadded::new(AtomicU64::new(0)),
+            tail: melin_disruptor::padding::CachePadded::new(AtomicU64::new(0)),
         }
     }
 }
 
-/// Sender half of the lock-free hand-off. Owned by the replication
+/// Sender half of the bounded SPSC ring. Owned by the replication
 /// receiver thread.
 pub struct RawBatchSender {
-    slot: Arc<RawBatchSlot>,
+    ring: Arc<RawBatchRing>,
 }
 
 impl RawBatchSender {
-    /// Send a batch. Spins if the previous batch hasn't been consumed
-    /// yet. In practice this rarely happens — the journal stage
-    /// consumes batches in ~1ms.
+    /// Send a batch. Spins if the ring is full (all slots occupied).
+    /// With 8 slots and ~10-30µs per NVMe write, the ring absorbs
+    /// ~80-240µs of receiver-ahead-of-journal pipelining.
     pub fn send(&self, batch: RawJournalBatch) {
         let raw = Box::into_raw(Box::new(batch));
-        // Spin until the slot is empty (previous batch consumed).
         loop {
-            let prev = self
-                .slot
-                .ptr
-                .compare_exchange(
-                    std::ptr::null_mut(),
-                    raw,
-                    Ordering::Release,
-                    Ordering::Relaxed,
-                )
-                .err();
-            if prev.is_none() {
-                return; // Successfully stored.
+            let head = self.ring.head.get().load(Ordering::Relaxed);
+            let tail = self.ring.tail.get().load(Ordering::Acquire);
+            if (head - tail) < RAW_RING_CAPACITY as u64 {
+                let idx = (head as usize) & RAW_RING_MASK;
+                self.ring.slots[idx].store(raw, Ordering::Relaxed);
+                self.ring.head.get().store(head + 1, Ordering::Release);
+                return;
             }
             std::hint::spin_loop();
         }
     }
 }
 
-impl Drop for RawBatchSender {
+// Cleanup lives on `RawBatchRing` so it runs AFTER both sender and
+// receiver are dropped (the last `Arc` reference triggers `Drop`).
+// Putting it on `RawBatchSender` would race with a receiver that's
+// still calling `try_recv`.
+impl Drop for RawBatchRing {
     fn drop(&mut self) {
-        // If a batch is in the slot when the sender is dropped, free it.
-        let ptr = self.slot.ptr.swap(std::ptr::null_mut(), Ordering::Acquire);
-        if !ptr.is_null() {
-            unsafe { drop(Box::from_raw(ptr)) };
+        let head = self.head.get().load(Ordering::Relaxed);
+        let tail = self.tail.get().load(Ordering::Relaxed);
+        for i in tail..head {
+            let idx = (i as usize) & RAW_RING_MASK;
+            let ptr = self.slots[idx].load(Ordering::Relaxed);
+            if !ptr.is_null() {
+                unsafe { drop(Box::from_raw(ptr)) };
+            }
         }
     }
 }
 
-/// Receiver half of the lock-free hand-off. Owned by the journal stage
+/// Receiver half of the bounded SPSC ring. Owned by the journal stage
 /// thread.
 pub struct RawBatchReceiver {
-    slot: Arc<RawBatchSlot>,
+    ring: Arc<RawBatchRing>,
 }
 
 impl RawBatchReceiver {
     /// Try to receive a batch without blocking. Returns `None` if the
-    /// slot is empty. Uses a load-first pattern: the Acquire load is a
-    /// plain read that doesn't bounce the cache line, so the spinning
-    /// journal stage doesn't starve the sender. Only the swap (when
-    /// data is available) acquires exclusive ownership.
+    /// ring is empty. Uses load-first on `head` (plain read, no cache
+    /// line bounce) to avoid starving the sender.
     pub fn try_recv(&self) -> Option<RawJournalBatch> {
-        // Fast check — plain read, no cache line bounce.
-        let ptr = self.slot.ptr.load(Ordering::Acquire);
-        if ptr.is_null() {
+        let tail = self.ring.tail.get().load(Ordering::Relaxed);
+        let head = self.ring.head.get().load(Ordering::Acquire);
+        if tail >= head {
             return None;
         }
-        // Data available — take ownership. SPSC guarantees no race.
-        let ptr = self.slot.ptr.swap(std::ptr::null_mut(), Ordering::Relaxed);
+        let idx = (tail as usize) & RAW_RING_MASK;
+        let ptr = self.ring.slots[idx].load(Ordering::Acquire);
         debug_assert!(!ptr.is_null());
+        self.ring.tail.get().store(tail + 1, Ordering::Release);
         Some(*unsafe { Box::from_raw(ptr) })
     }
 }
 
-/// Create a lock-free single-slot hand-off pair.
+/// Create a bounded SPSC ring for raw journal batch transfer.
 pub fn raw_batch_channel() -> (RawBatchSender, RawBatchReceiver) {
-    let slot = Arc::new(RawBatchSlot::new());
+    let ring = Arc::new(RawBatchRing::new());
     (
         RawBatchSender {
-            slot: Arc::clone(&slot),
+            ring: Arc::clone(&ring),
         },
-        RawBatchReceiver { slot },
+        RawBatchReceiver { ring },
     )
 }
 
@@ -438,7 +447,22 @@ impl JournalStage {
         // Replica mode: write raw bytes from the replication receiver
         // instead of encoding events from the disruptor.
         if self.raw_journal_rx.is_some() {
-            return self.run_replica(shutdown);
+            #[cfg(all(
+                feature = "io-uring",
+                not(feature = "no-fsync"),
+                not(feature = "no-persist")
+            ))]
+            {
+                return self.run_replica_uring(shutdown);
+            }
+            #[cfg(not(all(
+                feature = "io-uring",
+                not(feature = "no-fsync"),
+                not(feature = "no-persist")
+            )))]
+            {
+                return self.run_replica(shutdown);
+            }
         }
 
         #[cfg(all(
@@ -654,6 +678,11 @@ impl JournalStage {
     /// receiver while consuming (and discarding) events from the disruptor
     /// to advance the cursor. The cursor advance happens AFTER `write_raw_sync`
     /// completes, preserving the persist-before-ack guarantee.
+    #[cfg(not(all(
+        feature = "io-uring",
+        not(feature = "no-fsync"),
+        not(feature = "no-persist")
+    )))]
     fn run_replica(mut self, shutdown: &std::sync::atomic::AtomicBool) -> JournalWriter {
         let rx = self
             .raw_journal_rx
@@ -702,6 +731,168 @@ impl JournalStage {
                 }
             } else {
                 idle_wait(&mut idle_spins, self.busy_spin);
+            }
+        }
+    }
+
+    /// Replica journal loop with io_uring overlapped writes. Same
+    /// double-buffering as the primary's `run_uring`: submits an async
+    /// Write+RWF_DSYNC while receiving the next batch from the SPSC
+    /// ring. Advances the cursor only after the CQE confirms durability.
+    ///
+    /// This overlaps NVMe writes with TCP receives, eliminating the
+    /// serialized write_raw_sync + cursor wait bottleneck.
+    #[cfg(all(
+        feature = "io-uring",
+        not(feature = "no-fsync"),
+        not(feature = "no-persist")
+    ))]
+    /// Replica journal loop using io_uring overlapped writes.
+    ///
+    /// Receives pre-encoded journal batches from the replication handler
+    /// via a bounded SPSC ring and submits Write+RWF_DSYNC SQEs
+    /// asynchronously. The cursor advances AFTER the CQE confirms
+    /// durability, preserving the persist-before-ack guarantee.
+    ///
+    /// The SPSC ring decouples the replication handler's TCP receive
+    /// loop from the NVMe write latency: the handler can push up to
+    /// 8 batches ahead while previous writes are in flight.
+    fn run_replica_uring(mut self, shutdown: &std::sync::atomic::AtomicBool) -> JournalWriter {
+        use io_uring::{IoUring, opcode, types};
+
+        let rx = self
+            .raw_journal_rx
+            .take()
+            .expect("run_replica_uring called without raw_journal_rx");
+        let mut batch = [InputSlot::default(); MAX_JOURNAL_BATCH];
+        let mut idle_spins: u32 = 0;
+
+        // Set up io_uring — same as the primary's run_uring.
+        let mut ring: IoUring = IoUring::builder()
+            .setup_single_issuer()
+            .build(8)
+            .expect("io_uring init failed");
+
+        let raw_fd = self.writer.fd();
+        ring.submitter()
+            .register_files(&[raw_fd])
+            .expect("io_uring register_files failed");
+
+        // Pin io-wq workers to core 0.
+        {
+            let mut cpuset: libc::cpu_set_t = unsafe { std::mem::zeroed() };
+            unsafe { libc::CPU_SET(0, &mut cpuset) };
+            ring.submitter()
+                .register_iowq_aff(&cpuset)
+                .expect("io_uring register_iowq_aff failed");
+        }
+
+        // In-flight state: the async batch + entry count for disruptor
+        // consumption after the CQE.
+        struct InflightRaw {
+            batch: super::writer::AsyncWriteBatch,
+            entry_count: usize,
+        }
+        let mut inflight: Option<InflightRaw> = None;
+
+        loop {
+            // --- Shutdown ---
+            if shutdown.load(Ordering::Relaxed) {
+                if let Some(inf) = inflight.take() {
+                    self.wait_for_cqe(&mut ring, &inf.batch);
+                    self.consume_disruptor_events(&mut batch, inf.entry_count);
+                    self.writer.confirm_raw_async_write(inf.batch);
+                }
+                self.drain_remaining(&mut batch);
+                return self.writer;
+            }
+
+            // --- Reap CQE (non-blocking) ---
+            if let Some(ref inf) = inflight
+                && let Some(cqe) = ring.completion().next()
+            {
+                let result = cqe.result();
+                if result < 0 {
+                    panic!(
+                        "fatal replica journal I/O error: io_uring write returned errno {}",
+                        -result
+                    );
+                } else if (result as usize) != inf.batch.buf.len() {
+                    panic!(
+                        "fatal replica journal I/O error: short write ({} of {} bytes)",
+                        result,
+                        inf.batch.buf.len()
+                    );
+                }
+
+                // Safe: the `if let Some(ref inf)` guard ensures
+                // `inflight` is `Some` here.
+                let completed = inflight.take().expect("checked by if-let");
+                self.consume_disruptor_events(&mut batch, completed.entry_count);
+                self.publish_chain_hash();
+                self.writer.confirm_raw_async_write(completed.batch);
+            }
+
+            // --- Submit next batch (if nothing in-flight) ---
+            if inflight.is_none() {
+                if let Some(raw_batch) = rx.try_recv() {
+                    idle_spins = 0;
+                    let entry_count = raw_batch.entry_count as usize;
+
+                    let async_batch = self
+                        .writer
+                        .take_raw_for_async_write(raw_batch.bytes, raw_batch.entry_count as u64)
+                        .unwrap_or_else(|e| panic!("fatal replica journal I/O error: {e}"));
+
+                    let sqe = opcode::Write::new(
+                        types::Fixed(0),
+                        async_batch.buf.as_ptr(),
+                        async_batch.buf.len() as u32,
+                    )
+                    .offset(async_batch.offset)
+                    .rw_flags(libc::RWF_DSYNC)
+                    .build()
+                    .user_data(1);
+
+                    unsafe {
+                        ring.submission().push(&sqe).expect("SQ full");
+                    }
+                    ring.submit().expect("io_uring submit failed");
+
+                    inflight = Some(InflightRaw {
+                        batch: async_batch,
+                        entry_count,
+                    });
+                } else {
+                    idle_wait(&mut idle_spins, self.busy_spin);
+                }
+            } else {
+                // Write in-flight — don't submit another, just idle-wait
+                // for the CQE. The NVMe is busy; trying to submit more
+                // would just queue in the kernel.
+                idle_wait(&mut idle_spins, self.busy_spin);
+            }
+        }
+    }
+
+    /// Consume exactly `count` events from the input disruptor,
+    /// advancing the cursor. Used by the replica after an async raw
+    /// write completes.
+    #[cfg(all(
+        feature = "io-uring",
+        not(feature = "no-fsync"),
+        not(feature = "no-persist")
+    ))]
+    fn consume_disruptor_events(&mut self, batch: &mut [InputSlot], mut remaining: usize) {
+        while remaining > 0 {
+            let count = self
+                .consumer
+                .read_batch(batch, remaining.min(MAX_JOURNAL_BATCH));
+            if count > 0 {
+                self.consumer.commit(count);
+                remaining -= count;
+            } else {
+                std::hint::spin_loop();
             }
         }
     }
@@ -2963,5 +3154,141 @@ mod tests {
                 JournalEvent::Deposit { amount: 1_000, .. }
             ));
         }
+    }
+
+    // --- SPSC ring unit tests ---
+
+    #[test]
+    fn raw_batch_ring_send_recv() {
+        let (tx, rx) = raw_batch_channel();
+        tx.send(RawJournalBatch {
+            bytes: vec![1, 2, 3],
+            end_sequence: 10,
+            chain_hash: [0u8; 32],
+            entry_count: 1,
+        });
+        let batch = rx.try_recv().unwrap();
+        assert_eq!(batch.bytes, vec![1, 2, 3]);
+        assert_eq!(batch.end_sequence, 10);
+        assert_eq!(batch.entry_count, 1);
+    }
+
+    #[test]
+    fn raw_batch_ring_empty_returns_none() {
+        let (_tx, rx) = raw_batch_channel();
+        assert!(rx.try_recv().is_none());
+    }
+
+    #[test]
+    fn raw_batch_ring_fill_all_slots() {
+        let (tx, rx) = raw_batch_channel();
+        // Fill all 8 slots.
+        for i in 0..RAW_RING_CAPACITY {
+            tx.send(RawJournalBatch {
+                bytes: vec![i as u8],
+                end_sequence: i as u64,
+                chain_hash: [0u8; 32],
+                entry_count: 1,
+            });
+        }
+        // Drain all.
+        for i in 0..RAW_RING_CAPACITY {
+            let batch = rx.try_recv().unwrap();
+            assert_eq!(batch.bytes, vec![i as u8]);
+            assert_eq!(batch.end_sequence, i as u64);
+        }
+        assert!(rx.try_recv().is_none());
+    }
+
+    #[test]
+    fn raw_batch_ring_wraps_around() {
+        let (tx, rx) = raw_batch_channel();
+        // Send and receive more than capacity to exercise wrap-around.
+        for round in 0..3u64 {
+            for slot in 0..RAW_RING_CAPACITY as u64 {
+                let seq = round * RAW_RING_CAPACITY as u64 + slot;
+                tx.send(RawJournalBatch {
+                    bytes: vec![seq as u8],
+                    end_sequence: seq,
+                    chain_hash: [0u8; 32],
+                    entry_count: 1,
+                });
+            }
+            for slot in 0..RAW_RING_CAPACITY as u64 {
+                let seq = round * RAW_RING_CAPACITY as u64 + slot;
+                let batch = rx.try_recv().unwrap();
+                assert_eq!(batch.end_sequence, seq);
+            }
+            assert!(rx.try_recv().is_none());
+        }
+    }
+
+    #[test]
+    fn raw_batch_ring_concurrent_send_recv() {
+        use std::thread;
+
+        let (tx, rx) = raw_batch_channel();
+        let count = 10_000u64;
+
+        let producer = thread::spawn(move || {
+            for i in 0..count {
+                tx.send(RawJournalBatch {
+                    bytes: vec![(i & 0xFF) as u8],
+                    end_sequence: i,
+                    chain_hash: [0u8; 32],
+                    entry_count: 1,
+                });
+            }
+        });
+
+        let consumer = thread::spawn(move || {
+            let mut received = 0u64;
+            while received < count {
+                if let Some(batch) = rx.try_recv() {
+                    assert_eq!(batch.end_sequence, received);
+                    received += 1;
+                } else {
+                    std::hint::spin_loop();
+                }
+            }
+        });
+
+        producer.join().unwrap();
+        consumer.join().unwrap();
+    }
+
+    #[test]
+    fn raw_batch_ring_drop_cleans_up_unconsumed() {
+        let (tx, rx) = raw_batch_channel();
+        // Send 3 batches, only consume 1.
+        for i in 0..3 {
+            tx.send(RawJournalBatch {
+                bytes: vec![i],
+                end_sequence: i as u64,
+                chain_hash: [0u8; 32],
+                entry_count: 1,
+            });
+        }
+        let _ = rx.try_recv(); // Consume 1
+        // Drop both — the RawBatchRing::drop should free the remaining 2
+        // without leaking. (Miri would catch leaks if run with it.)
+        drop(tx);
+        drop(rx);
+    }
+
+    #[test]
+    fn raw_batch_ring_sender_drops_before_receiver() {
+        let (tx, rx) = raw_batch_channel();
+        tx.send(RawJournalBatch {
+            bytes: vec![42],
+            end_sequence: 1,
+            chain_hash: [0u8; 32],
+            entry_count: 1,
+        });
+        // Drop sender first — receiver should still read the batch.
+        drop(tx);
+        let batch = rx.try_recv().unwrap();
+        assert_eq!(batch.bytes, vec![42]);
+        assert!(rx.try_recv().is_none());
     }
 }

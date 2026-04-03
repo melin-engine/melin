@@ -554,6 +554,36 @@ impl JournalWriter {
         self.spare_buf = Some(batch.buf);
     }
 
+    /// Prepare a raw byte buffer for async writing via io_uring.
+    ///
+    /// Used by the replica journal stage to write pre-encoded bytes
+    /// from the primary. Same as `take_batch_for_async_write` but takes
+    /// external raw bytes instead of draining the internal `batch_buf`.
+    ///
+    /// Advances `write_pos` and `next_sequence` immediately. The caller
+    /// must NOT advance the journal cursor until the CQE confirms
+    /// durability, then call `confirm_raw_async_write()`.
+    pub fn take_raw_for_async_write(
+        &mut self,
+        data: Vec<u8>,
+        entry_count: u64,
+    ) -> Result<AsyncWriteBatch, JournalError> {
+        self.ensure_allocated(data.len() as u64)?;
+        let offset = self.write_pos;
+        self.write_pos += data.len() as u64;
+        self.next_sequence += entry_count;
+        Ok(AsyncWriteBatch { buf: data, offset })
+    }
+
+    /// Return a completed raw async write batch's buffer. Unlike
+    /// `confirm_async_write`, the buffer is NOT returned to the spare
+    /// pool (raw buffers come from the SPSC ring, not the writer's
+    /// internal pool).
+    pub fn confirm_raw_async_write(&mut self, _batch: AsyncWriteBatch) {
+        // Buffer is dropped — it came from the RawJournalBatch, not
+        // the writer's spare pool.
+    }
+
     /// Flush the journal to disk (fdatasync).
     ///
     /// Legacy sync path — only used during shutdown drain. Production
@@ -1508,5 +1538,45 @@ mod tests {
 
         assert_eq!(writer.write_pos(), pos);
         assert_eq!(writer.next_sequence(), seq);
+    }
+
+    #[test]
+    fn take_raw_for_async_write_advances_position() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.journal");
+        let mut writer = JournalWriter::create(&path).unwrap();
+        let pos_before = writer.write_pos;
+        let seq_before = writer.next_sequence;
+
+        let data = vec![1u8; 128];
+        let batch = writer.take_raw_for_async_write(data.clone(), 3).unwrap();
+
+        // Position and sequence should advance.
+        assert_eq!(batch.offset, pos_before);
+        assert_eq!(batch.buf, data);
+        assert_eq!(writer.write_pos, pos_before + 128);
+        assert_eq!(writer.next_sequence, seq_before + 3);
+    }
+
+    #[test]
+    fn confirm_raw_async_write_does_not_recycle_buffer() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.journal");
+        let mut writer = JournalWriter::create(&path).unwrap();
+
+        // Take the spare buffer first so we can verify it stays empty.
+        let _ = writer.spare_buf.take();
+        assert!(writer.spare_buf.is_none());
+
+        let data = vec![1u8; 64];
+        let batch = writer.take_raw_for_async_write(data, 1).unwrap();
+
+        // confirm_raw_async_write drops the buffer — does NOT recycle
+        // it into spare_buf (unlike confirm_async_write for primary).
+        writer.confirm_raw_async_write(batch);
+        assert!(
+            writer.spare_buf.is_none(),
+            "raw buffers should not be recycled into spare_buf"
+        );
     }
 }

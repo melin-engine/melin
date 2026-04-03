@@ -52,6 +52,10 @@ See [README.md](README.md#features) for implemented features and [docs/roadmap.m
 ## Working Style
 - **Propose the best fix, not the simplest** — when there are multiple approaches, present the options with trade-offs and recommend the best one. Don't default to the quick hack.
 - **Review before committing** — always review your own changes for correctness (including edge cases), test coverage, and documentation before attempting to commit. Don't rely on the user to catch issues.
+- **One-liner commands** — when giving the user shell commands to run, always format them as a single line that can be copy-pasted directly. Do not use backslash continuations or multi-line formatting.
+
+## Local Build Notes
+- **DPDK feature check** — the Android NDK clang in PATH breaks the DPDK build (AVX header errors). Use `PATH=/usr/bin:/usr/local/bin:$PATH cargo check --features dpdk --no-default-features -p melin-server` to pick up the system clang (`/usr/bin/clang`, Ubuntu 18.1.3).
 
 ## Dead Ends / Investigated & Rejected
 **How to apply:** The matching engine is not the bottleneck. The journal fsync stage gates pipeline throughput; TCP pipelining (window=256) effectively hides fsync latency. Further throughput gains require reducing transport overhead (UDS, kernel bypass) or journal I/O optimization (overlapped io_uring writes). Performance optimization leads are tracked in [docs/roadmap.md](docs/roadmap.md) (deferred section).
