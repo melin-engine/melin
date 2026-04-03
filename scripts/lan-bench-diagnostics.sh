@@ -1,29 +1,32 @@
 #!/usr/bin/env bash
 # Run a LAN benchmark while capturing system diagnostics to help identify
-# the source of tail latency spikes (4ms+ max latency).
+# the source of tail latency spikes.
 #
-# Wraps lan-bench.sh with additional remote data collection on the server:
+# Wraps lan-bench.sh with additional remote data collection on the
+# target machine (server, bench, or both):
 #   - Kernel boot params (isolcpus, nohz_full, rcu_nocbs)
 #   - CPU governor, NMI watchdog, THP state
-#   - IRQ affinity for pipeline cores
+#   - IRQ affinity for monitored cores
 #   - /proc/interrupts before and after (diff shows which IRQs fired)
 #   - dmesg before and after (kernel events during bench)
-#   - perf sched record on pipeline cores (optional, PERF=1)
+#   - perf sched record on monitored cores (optional, PERF=1)
 #   - SMI count via MSR 0x34 (Intel only)
-#   - Workqueue and kthread placement on pipeline cores
+#   - Workqueue and kthread placement on monitored cores
 #
 # Usage:
-#   ./scripts/lan-bench-latency.sh <server-public-ip> <bench-public-ip> <server-vlan-ip> [user] [-- server-args... -- bench-args...]
+#   ./scripts/lan-bench-diagnostics.sh <server-pub-ip> <bench-pub-ip> <server-vlan-ip> [user] [-- server-args... -- bench-args...]
 #
 # Environment variables:
-#   PERF=1              Enable perf sched recording on pipeline cores (adds overhead)
-#   PIPELINE_CORES=1-3  Cores to monitor (default: 1-3)
+#   DIAG_TARGET=server|bench|both  Which machine to diagnose (default: server)
+#   PERF=1              Enable perf sched recording on target (adds overhead)
+#   PIPELINE_CORES=1-3  Server cores to monitor (default: 1-3)
+#   BENCH_CORES=1-4     Bench cores to monitor (default: 1-4)
 #   BENCH_BRANCH=<ref>  Checkout a specific branch on all machines
 #
 # Examples:
-#   ./scripts/lan-bench-latency.sh 84.32.70.218 84.32.70.221 10.184.12.27
-#   PERF=1 ./scripts/lan-bench-latency.sh 84.32.70.218 84.32.70.221 10.184.12.27 root \
-#       -- -- 10000000 --clients 16 --window 256
+#   ./scripts/lan-bench-diagnostics.sh 1.2.3.4 5.6.7.8 10.0.0.1
+#   DIAG_TARGET=bench ./scripts/lan-bench-diagnostics.sh 1.2.3.4 5.6.7.8 10.0.0.1
+#   DIAG_TARGET=both PERF=1 ./scripts/lan-bench-diagnostics.sh 1.2.3.4 5.6.7.8 10.0.0.1
 #
 # Output:
 #   Results and diagnostics saved to /tmp/lan-bench-latency-<timestamp>/
@@ -31,10 +34,18 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+DIAG_TARGET="${DIAG_TARGET:-server}"
 PIPELINE_CORES="${PIPELINE_CORES:-1-3}"
+BENCH_CORES="${BENCH_CORES:-1-4}"
 PERF="${PERF:-0}"
 RESULTS_DIR="/tmp/lan-bench-latency-$(date +%Y%m%d-%H%M%S)"
 mkdir -p "${RESULTS_DIR}"
+
+# Validate DIAG_TARGET.
+case "$DIAG_TARGET" in
+    server|bench|both) ;;
+    *) echo "error: DIAG_TARGET must be server, bench, or both (got: ${DIAG_TARGET})" >&2; exit 1 ;;
+esac
 
 # ---------------------------------------------------------------------------
 # Parse arguments (same format as lan-bench.sh)
@@ -57,12 +68,14 @@ done
 if [[ ${#POSITIONAL[@]} -lt 3 ]]; then
     echo "usage: $0 <server-public-ip> <bench-public-ip> <server-vlan-ip> [user] [-- server-args... -- bench-args...]"
     echo ""
-    echo "Wraps lan-bench.sh with system diagnostic capture on the server."
+    echo "Wraps lan-bench.sh with system diagnostic capture."
     echo "Results saved to /tmp/lan-bench-latency-<timestamp>/"
     echo ""
     echo "Environment variables:"
-    echo "  PERF=1              Enable perf sched recording on pipeline cores"
-    echo "  PIPELINE_CORES=1-3  Cores to monitor (default: 1-3)"
+    echo "  DIAG_TARGET=server|bench|both  Which machine to diagnose (default: server)"
+    echo "  PERF=1              Enable perf sched recording on target"
+    echo "  PIPELINE_CORES=1-3  Server cores to monitor (default: 1-3)"
+    echo "  BENCH_CORES=1-4     Bench cores to monitor (default: 1-4)"
     echo "  BENCH_BRANCH=<ref>  Checkout a specific branch"
     exit 1
 fi
@@ -76,22 +89,29 @@ SSH_OPTS="-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLeve
 SERVER="${SSH_USER}@${SERVER_PUB}"
 BENCH="${SSH_USER}@${BENCH_PUB}"
 
+diag_server() { [[ "$DIAG_TARGET" == "server" || "$DIAG_TARGET" == "both" ]]; }
+diag_bench()  { [[ "$DIAG_TARGET" == "bench"  || "$DIAG_TARGET" == "both" ]]; }
+
 echo "============================================================"
 echo "  Latency Diagnostic Benchmark"
 echo "  Server:  ${SERVER_PUB} (VLAN: ${SERVER_VLAN})"
 echo "  Bench:   ${BENCH_PUB}"
-echo "  Cores:   ${PIPELINE_CORES}"
+echo "  Target:  ${DIAG_TARGET}"
+if diag_server; then echo "  Server cores: ${PIPELINE_CORES}"; fi
+if diag_bench;  then echo "  Bench cores:  ${BENCH_CORES}"; fi
 echo "  Perf:    ${PERF}"
 echo "  Results: ${RESULTS_DIR}"
 echo "============================================================"
 echo ""
 
 # ---------------------------------------------------------------------------
-# 1. Capture system state BEFORE the benchmark
+# Helper: capture system state on a remote host
 # ---------------------------------------------------------------------------
-echo "=== Capturing pre-benchmark system state ==="
+capture_system_state() {
+    local host="$1" label="$2" cores="$3" prefix="$4"
 
-ssh $SSH_OPTS "$SERVER" "bash -s" <<'REMOTE_DIAG' > "${RESULTS_DIR}/system-state.txt"
+    echo "  [${label}] Capturing system state (cores ${cores})..."
+    ssh $SSH_OPTS "$host" "bash -s" <<'REMOTE_DIAG' > "${RESULTS_DIR}/${prefix}-system-state.txt"
 echo "=== Kernel boot params ==="
 cat /proc/cmdline
 echo ""
@@ -130,25 +150,20 @@ echo "=== Workqueue cpumask (writeback) ==="
 cat /sys/bus/workqueue/devices/writeback/cpumask 2>/dev/null || echo "N/A"
 echo ""
 REMOTE_DIAG
-echo "  System state → ${RESULTS_DIR}/system-state.txt"
 
-# Capture IRQ affinity for pipeline cores.
-ssh $SSH_OPTS "$SERVER" "bash -s ${PIPELINE_CORES}" <<'REMOTE_IRQ' > "${RESULTS_DIR}/irq-affinity.txt"
+    ssh $SSH_OPTS "$host" "bash -s ${cores}" <<'REMOTE_IRQ' > "${RESULTS_DIR}/${prefix}-irq-affinity.txt"
 CORES="$1"
 echo "=== IRQ affinity (checking for IRQs on cores ${CORES}) ==="
 echo ""
-# Show IRQs that have affinity including any pipeline core.
-# Parse the core range into individual core numbers.
 IFS='-' read -r lo hi <<< "$CORES"
 hi="${hi:-$lo}"
 echo "Monitoring cores: ${lo}-${hi}"
 echo ""
-echo "IRQs with affinity overlapping pipeline cores:"
+echo "IRQs with affinity overlapping monitored cores:"
 for f in /proc/irq/*/smp_affinity_list; do
     irq="${f#/proc/irq/}"
     irq="${irq%/smp_affinity_list}"
     list=$(cat "$f" 2>/dev/null) || continue
-    # Check if any pipeline core is in the affinity list.
     for c in $(seq "$lo" "$hi"); do
         if echo "$list" | grep -qE "(^|,)${c}(-|,|$)"; then
             action=$(cat "/proc/irq/${irq}/actions" 2>/dev/null || echo "?")
@@ -158,77 +173,31 @@ for f in /proc/irq/*/smp_affinity_list; do
     done
 done
 REMOTE_IRQ
-echo "  IRQ affinity → ${RESULTS_DIR}/irq-affinity.txt"
 
-# Capture /proc/interrupts snapshot.
-ssh $SSH_OPTS "$SERVER" "cat /proc/interrupts" > "${RESULTS_DIR}/interrupts-before.txt"
-echo "  Interrupts snapshot → ${RESULTS_DIR}/interrupts-before.txt"
+    ssh $SSH_OPTS "$host" "cat /proc/interrupts" > "${RESULTS_DIR}/${prefix}-interrupts-before.txt"
 
-# Record dmesg line count so we can extract only new messages later.
-DMESG_BEFORE_LINES=$(ssh $SSH_OPTS "$SERVER" "dmesg | wc -l")
-echo "  dmesg baseline: ${DMESG_BEFORE_LINES} lines"
-
-# Check for processes on pipeline cores.
-ssh $SSH_OPTS "$SERVER" "bash -s ${PIPELINE_CORES}" <<'REMOTE_PS' > "${RESULTS_DIR}/processes-on-cores.txt"
+    ssh $SSH_OPTS "$host" "bash -s ${cores}" <<'REMOTE_PS' > "${RESULTS_DIR}/${prefix}-processes-on-cores.txt"
 IFS='-' read -r lo hi <<< "$1"
 hi="${hi:-$lo}"
 echo "=== Processes running on cores ${lo}-${hi} ==="
 ps -eo pid,psr,comm | awk -v lo="$lo" -v hi="$hi" '$2 >= lo && $2 <= hi { print }'
 REMOTE_PS
-echo "  Processes on pipeline cores → ${RESULTS_DIR}/processes-on-cores.txt"
-
-# SMI count (Intel MSR 0x34).
-SMI_BEFORE=$(ssh $SSH_OPTS "$SERVER" "modprobe msr 2>/dev/null; rdmsr -p 0 0x34 2>/dev/null || true")
-if [[ -n "$SMI_BEFORE" ]]; then
-    echo "  SMI count before: ${SMI_BEFORE}"
-else
-    echo "  SMI count: (MSR 0x34 not readable — AMD or no msr-tools)"
-fi
-
-echo ""
+}
 
 # ---------------------------------------------------------------------------
-# 2. Start perf sched recording if requested
+# Helper: capture post-benchmark interrupt diff
 # ---------------------------------------------------------------------------
-PERF_PID=""
-if [[ "$PERF" == "1" ]]; then
-    echo "=== Starting perf sched record on server (cores ${PIPELINE_CORES}) ==="
-    echo "  WARNING: perf sampling adds overhead — results are diagnostic only"
-    ssh $SSH_OPTS "$SERVER" "nohup perf sched record -C ${PIPELINE_CORES} -o /tmp/bench-perf-sched.data -- sleep 300 >/dev/null 2>&1 </dev/null &
-        echo \$!" > "${RESULTS_DIR}/perf-pid.txt"
-    PERF_PID=$(cat "${RESULTS_DIR}/perf-pid.txt")
-    echo "  perf PID: ${PERF_PID}"
-    echo ""
-fi
+capture_post_state() {
+    local host="$1" label="$2" cores="$3" prefix="$4"
 
-# ---------------------------------------------------------------------------
-# 3. Run the actual benchmark via lan-bench.sh
-# ---------------------------------------------------------------------------
-echo "=== Running benchmark ==="
-echo ""
+    ssh $SSH_OPTS "$host" "cat /proc/interrupts" > "${RESULTS_DIR}/${prefix}-interrupts-after.txt"
 
-"${SCRIPT_DIR}/lan-bench.sh" "${POSITIONAL[@]}" "${PASS_THROUGH[@]+"${PASS_THROUGH[@]}"}"
-
-echo ""
-
-# ---------------------------------------------------------------------------
-# 4. Capture system state AFTER the benchmark
-# ---------------------------------------------------------------------------
-echo "=== Capturing post-benchmark diagnostics ==="
-
-# /proc/interrupts after.
-ssh $SSH_OPTS "$SERVER" "cat /proc/interrupts" > "${RESULTS_DIR}/interrupts-after.txt"
-
-# Diff interrupts to show which IRQs fired during the benchmark.
-# Parse the header to find pipeline core columns, then diff counts.
-python3 - "${RESULTS_DIR}/interrupts-before.txt" "${RESULTS_DIR}/interrupts-after.txt" "$PIPELINE_CORES" > "${RESULTS_DIR}/interrupts-diff.txt" 2>/dev/null <<'PYDIFF' || true
-import sys, re
+    python3 - "${RESULTS_DIR}/${prefix}-interrupts-before.txt" "${RESULTS_DIR}/${prefix}-interrupts-after.txt" "$cores" > "${RESULTS_DIR}/${prefix}-interrupts-diff.txt" 2>/dev/null <<'PYDIFF' || true
+import sys
 
 def parse_interrupts(path):
     with open(path) as f:
         lines = f.readlines()
-    header = lines[0].split()
-    cpus = [h for h in header if h.startswith('CPU')]
     rows = {}
     for line in lines[1:]:
         parts = line.split()
@@ -236,20 +205,20 @@ def parse_interrupts(path):
             continue
         irq = parts[0].rstrip(':')
         counts = []
-        for i, p in enumerate(parts[1:]):
+        for p in parts[1:]:
             if p.isdigit():
                 counts.append(int(p))
             else:
                 break
         action = ' '.join(parts[1+len(counts):])
         rows[irq] = (counts, action)
-    return cpus, rows
+    return rows
 
 lo, hi = sys.argv[3].split('-') if '-' in sys.argv[3] else (sys.argv[3], sys.argv[3])
 lo, hi = int(lo), int(hi)
 
-cpus_b, rows_b = parse_interrupts(sys.argv[1])
-cpus_a, rows_a = parse_interrupts(sys.argv[2])
+rows_b = parse_interrupts(sys.argv[1])
+rows_a = parse_interrupts(sys.argv[2])
 
 print(f"IRQ interrupts on cores {lo}-{hi} during benchmark:")
 print(f"{'IRQ':<8} {'Count':>10}  {'Action'}")
@@ -276,22 +245,122 @@ for delta, irq, action in results:
 print("-" * 60)
 print(f"{'TOTAL':<8} {total:>10}")
 PYDIFF
-echo "  Interrupt diff → ${RESULTS_DIR}/interrupts-diff.txt"
-cat "${RESULTS_DIR}/interrupts-diff.txt"
-echo ""
 
-# dmesg diff — extract only lines that appeared during the benchmark.
-DMESG_AFTER_LINES=$(ssh $SSH_OPTS "$SERVER" "dmesg | wc -l")
-dmesg_new=$((DMESG_AFTER_LINES - DMESG_BEFORE_LINES))
-if [[ $dmesg_new -gt 0 ]]; then
-    ssh $SSH_OPTS "$SERVER" "dmesg --time-format iso 2>/dev/null || dmesg" | tail -n "$dmesg_new" > "${RESULTS_DIR}/dmesg-diff.txt"
-    echo "=== Kernel messages during benchmark (${dmesg_new} new lines) ==="
-    cat "${RESULTS_DIR}/dmesg-diff.txt"
-else
-    echo "=== Kernel messages during benchmark ==="
-    echo "  (none)"
+    echo "  [${label}] Interrupt diff (cores ${cores}):"
+    cat "${RESULTS_DIR}/${prefix}-interrupts-diff.txt"
+    echo ""
+}
+
+# ---------------------------------------------------------------------------
+# Helper: capture dmesg diff
+# ---------------------------------------------------------------------------
+capture_dmesg_diff() {
+    local host="$1" label="$2" prefix="$3" before_lines="$4"
+
+    local after_lines
+    after_lines=$(ssh $SSH_OPTS "$host" "dmesg | wc -l")
+    local new_lines=$((after_lines - before_lines))
+    if [[ $new_lines -gt 0 ]]; then
+        ssh $SSH_OPTS "$host" "dmesg --time-format iso 2>/dev/null || dmesg" | tail -n "$new_lines" > "${RESULTS_DIR}/${prefix}-dmesg-diff.txt"
+        echo "=== ${label} kernel messages (${new_lines} new lines) ==="
+        cat "${RESULTS_DIR}/${prefix}-dmesg-diff.txt"
+    else
+        echo "=== ${label} kernel messages: (none) ==="
+    fi
+    echo ""
+}
+
+# ---------------------------------------------------------------------------
+# Helper: collect perf results
+# ---------------------------------------------------------------------------
+collect_perf() {
+    local host="$1" label="$2" pid="$3" prefix="$4"
+    if [[ -z "$pid" ]]; then return; fi
+
+    echo "  Stopping ${label} perf..."
+    ssh $SSH_OPTS "$host" "kill -INT ${pid} 2>/dev/null; sleep 2"
+
+    ssh $SSH_OPTS "$host" "perf sched latency -i /tmp/bench-perf-sched.data --sort max 2>/dev/null | head -40" \
+        > "${RESULTS_DIR}/${prefix}-perf-sched-latency.txt" 2>/dev/null || true
+    echo "  [${label}] perf sched latency:"
+    cat "${RESULTS_DIR}/${prefix}-perf-sched-latency.txt"
+    echo ""
+
+    scp $SSH_OPTS -q "$host":/tmp/bench-perf-sched.data "${RESULTS_DIR}/${prefix}-perf-sched.data" 2>/dev/null || true
+}
+
+# ---------------------------------------------------------------------------
+# 1. Capture pre-benchmark system state
+# ---------------------------------------------------------------------------
+echo "=== Capturing pre-benchmark system state ==="
+if diag_server; then
+    capture_system_state "$SERVER" "server" "$PIPELINE_CORES" "server"
+    SERVER_DMESG_BEFORE=$(ssh $SSH_OPTS "$SERVER" "dmesg | wc -l")
+fi
+if diag_bench; then
+    capture_system_state "$BENCH" "bench" "$BENCH_CORES" "bench"
+    BENCH_DMESG_BEFORE=$(ssh $SSH_OPTS "$BENCH" "dmesg | wc -l")
+fi
+
+# SMI count (Intel MSR 0x34) — server only.
+SMI_BEFORE=""
+if diag_server; then
+    SMI_BEFORE=$(ssh $SSH_OPTS "$SERVER" "modprobe msr 2>/dev/null; rdmsr -p 0 0x34 2>/dev/null || true")
+    if [[ -n "$SMI_BEFORE" ]]; then
+        echo "  Server SMI count before: ${SMI_BEFORE}"
+    else
+        echo "  Server SMI count: (MSR 0x34 not readable — AMD or no msr-tools)"
+    fi
 fi
 echo ""
+
+# ---------------------------------------------------------------------------
+# 2. Start perf sched recording if requested
+# ---------------------------------------------------------------------------
+SERVER_PERF_PID=""
+BENCH_PERF_PID=""
+if [[ "$PERF" == "1" ]]; then
+    echo "=== Starting perf sched record ==="
+    echo "  WARNING: perf sampling adds overhead — results are diagnostic only"
+    if diag_server; then
+        ssh $SSH_OPTS "$SERVER" "nohup perf sched record -C ${PIPELINE_CORES} -o /tmp/bench-perf-sched.data -- sleep 300 >/dev/null 2>&1 </dev/null &
+            echo \$!" > "${RESULTS_DIR}/server-perf-pid.txt"
+        SERVER_PERF_PID=$(cat "${RESULTS_DIR}/server-perf-pid.txt")
+        echo "  Server perf PID: ${SERVER_PERF_PID} (cores ${PIPELINE_CORES})"
+    fi
+    if diag_bench; then
+        ssh $SSH_OPTS "$BENCH" "nohup perf sched record -C ${BENCH_CORES} -o /tmp/bench-perf-sched.data -- sleep 300 >/dev/null 2>&1 </dev/null &
+            echo \$!" > "${RESULTS_DIR}/bench-perf-pid.txt"
+        BENCH_PERF_PID=$(cat "${RESULTS_DIR}/bench-perf-pid.txt")
+        echo "  Bench perf PID: ${BENCH_PERF_PID} (cores ${BENCH_CORES})"
+    fi
+    echo ""
+fi
+
+# ---------------------------------------------------------------------------
+# 3. Run the actual benchmark via lan-bench.sh
+# ---------------------------------------------------------------------------
+echo "=== Running benchmark ==="
+echo ""
+
+"${SCRIPT_DIR}/lan-bench.sh" "${POSITIONAL[@]}" "${PASS_THROUGH[@]+"${PASS_THROUGH[@]}"}"
+
+echo ""
+
+# ---------------------------------------------------------------------------
+# 4. Capture post-benchmark diagnostics
+# ---------------------------------------------------------------------------
+echo "=== Capturing post-benchmark diagnostics ==="
+echo ""
+
+if diag_server; then
+    capture_post_state "$SERVER" "server" "$PIPELINE_CORES" "server"
+    capture_dmesg_diff "$SERVER" "Server" "server" "$SERVER_DMESG_BEFORE"
+fi
+if diag_bench; then
+    capture_post_state "$BENCH" "bench" "$BENCH_CORES" "bench"
+    capture_dmesg_diff "$BENCH" "Bench" "bench" "$BENCH_DMESG_BEFORE"
+fi
 
 # SMI count after.
 if [[ -n "$SMI_BEFORE" ]]; then
@@ -314,21 +383,10 @@ fi
 # ---------------------------------------------------------------------------
 # 5. Stop perf and collect results
 # ---------------------------------------------------------------------------
-if [[ -n "$PERF_PID" ]]; then
-    echo "=== Stopping perf and collecting results ==="
-    ssh $SSH_OPTS "$SERVER" "kill -INT ${PERF_PID} 2>/dev/null; sleep 2"
-
-    # Get scheduling latency summary.
-    ssh $SSH_OPTS "$SERVER" "perf sched latency -i /tmp/bench-perf-sched.data --sort max 2>/dev/null | head -40" \
-        > "${RESULTS_DIR}/perf-sched-latency.txt" 2>/dev/null || true
-    echo "  perf sched latency → ${RESULTS_DIR}/perf-sched-latency.txt"
-    cat "${RESULTS_DIR}/perf-sched-latency.txt"
-    echo ""
-
-    # Copy raw perf data for offline analysis.
-    scp $SSH_OPTS -q "$SERVER":/tmp/bench-perf-sched.data "${RESULTS_DIR}/perf-sched.data" 2>/dev/null || true
-    echo "  Raw perf data → ${RESULTS_DIR}/perf-sched.data"
-    echo ""
+if [[ "$PERF" == "1" ]]; then
+    echo "=== Collecting perf results ==="
+    if diag_server; then collect_perf "$SERVER" "server" "$SERVER_PERF_PID" "server"; fi
+    if diag_bench;  then collect_perf "$BENCH" "bench" "$BENCH_PERF_PID" "bench"; fi
 fi
 
 # ---------------------------------------------------------------------------
