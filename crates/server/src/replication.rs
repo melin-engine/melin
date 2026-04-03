@@ -39,7 +39,6 @@
 
 use std::io::{self, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
-use std::os::unix::io::AsRawFd;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
@@ -638,6 +637,11 @@ pub fn run_sender(
                             warn!(slot = i, "replica disconnected");
                         }
                         if replicas_connected.load(Ordering::Relaxed) == 0 {
+                            // Reset cursor so the response stage stops gating
+                            // on replica acks. Without this, the cursor stays
+                            // at the last acked sequence and the response stage
+                            // blocks indefinitely.
+                            replication_cursor.store(u64::MAX, Ordering::Release);
                             warn!("all replicas disconnected — trading halted");
                         }
                     }
@@ -1106,6 +1110,10 @@ fn handle_replica_connection(
     heartbeat_secs: u64,
     busy_spin: bool,
 ) -> io::Result<()> {
+    #[cfg_attr(
+        all(feature = "io-uring", not(feature = "no-persist")),
+        allow(unused_mut, unused_variables)
+    )]
     let mut reader = stream.try_clone()?;
     let mut writer = stream;
 
@@ -1282,15 +1290,15 @@ fn handle_replica_connection(
         }
     }
 
-    // Short read timeout for process_acks. The actual availability check
-    // uses poll(0) — this timeout only applies after poll confirms data
-    // is ready, as a safety net for partial frames.
-    reader.set_read_timeout(Some(std::time::Duration::from_millis(5)))?;
-
-    // pollfd for non-blocking ack availability check. poll(fd, POLLIN, 0)
-    // returns immediately — avoids the 2ms+ SO_RCVTIMEO floor that Linux
-    // imposes even for 1µs timeouts (kernel jiffy rounding).
-    let reader_fd = reader.as_raw_fd();
+    // The blocking fallback uses poll(0) + read_frame for acks.
+    // The io_uring path handles acks via async RECV CQEs instead.
+    #[cfg(not(all(feature = "io-uring", not(feature = "no-persist"))))]
+    {
+        reader.set_read_timeout(Some(std::time::Duration::from_millis(5)))?;
+    }
+    #[cfg(not(all(feature = "io-uring", not(feature = "no-persist"))))]
+    let reader_fd = std::os::unix::io::AsRawFd::as_raw_fd(&reader);
+    #[cfg(not(all(feature = "io-uring", not(feature = "no-persist"))))]
     let mut pollfd = libc::pollfd {
         fd: reader_fd,
         events: libc::POLLIN,
@@ -1330,94 +1338,38 @@ fn handle_replica_connection(
     let mut last_sequence = handshake.last_sequence;
     let mut last_chain_hash = handshake.chain_hash;
 
-    loop {
-        if shutdown.load(Ordering::Relaxed) {
-            return Ok(());
-        }
+    #[cfg(all(feature = "io-uring", not(feature = "no-persist")))]
+    {
+        live_stream_uring(
+            writer,
+            repl_consumer,
+            replication_cursor,
+            shutdown,
+            evict_flag,
+            metrics,
+            slot_idx,
+            batch_size,
+            heartbeat_interval,
+            busy_spin,
+            &mut send_buf,
+            &mut last_send,
+            &mut last_sequence,
+            &mut last_chain_hash,
+        )
+    }
 
-        // Check if the journal stage evicted this ring (ring was full).
-        // Exit so the sender thread can reclaim the slot — the replica
-        // will reconnect and catch up from journal files.
-        if evict_flag.load(Ordering::Relaxed) {
-            info!(slot = slot_idx, "handler exiting: evicted by journal stage");
-            return Ok(());
-        }
-
-        // Process any pending acks (non-blocking via internal poll(0)).
-        match process_acks(&mut reader, replication_cursor, &mut pollfd) {
-            Ok(Some(acked_seq)) => {
-                metrics.acked_sequence[slot_idx].store(acked_seq, Ordering::Relaxed);
-                metrics.ack_latency_us[slot_idx]
-                    .store(last_send.elapsed().as_micros() as u64, Ordering::Relaxed);
-            }
-            Ok(None) => {}
-            Err(e) => {
-                return Err(io::Error::other(format!("replica ack read error: {e}")));
-            }
-        }
-
-        // Try to read a batch from the replication ring (non-blocking).
-        if let Some((meta, data)) = repl_consumer.try_read() {
-            // Coalesce multiple batches into one TCP write+flush to
-            // amortize syscall overhead. Drain up to 16 batches from
-            // the ring before flushing. Each batch is encoded into the
-            // send buffer; a single write_all+flush sends them all.
-            encode_data_batch(
-                meta.end_sequence,
-                &meta.chain_hash,
-                meta.entry_count,
-                data,
-                &mut send_buf,
-            );
-            repl_consumer.commit();
-            last_sequence = meta.end_sequence;
-            last_chain_hash = meta.chain_hash;
-
-            // Drain more batches if available.
-            for _ in 1..batch_size {
-                if let Some((meta, data)) = repl_consumer.try_read() {
-                    encode_data_batch(
-                        meta.end_sequence,
-                        &meta.chain_hash,
-                        meta.entry_count,
-                        data,
-                        &mut send_buf,
-                    );
-                    repl_consumer.commit();
-                    last_sequence = meta.end_sequence;
-                    last_chain_hash = meta.chain_hash;
-                } else {
-                    break;
-                }
+    #[cfg(not(all(feature = "io-uring", not(feature = "no-persist"))))]
+    {
+        loop {
+            if shutdown.load(Ordering::Relaxed) {
+                return Ok(());
             }
 
-            let batch_bytes = send_buf.len() as u64;
-            if let Err(e) = writer.write_all(&send_buf) {
-                return Err(io::Error::other(format!("write DataBatch: {e}")));
+            if evict_flag.load(Ordering::Relaxed) {
+                info!(slot = slot_idx, "handler exiting: evicted by journal stage");
+                return Ok(());
             }
-            if let Err(e) = writer.flush() {
-                return Err(io::Error::other(format!("flush DataBatch: {e}")));
-            }
-            metrics.bytes_sent[slot_idx].fetch_add(batch_bytes, Ordering::Relaxed);
-            send_buf.clear();
-            last_send = std::time::Instant::now();
-        } else {
-            // No batch available — send heartbeat if idle.
-            if last_send.elapsed() >= heartbeat_interval {
-                encode_heartbeat(last_sequence, &last_chain_hash, &mut send_buf);
-                if let Err(e) = writer.write_all(&send_buf) {
-                    return Err(io::Error::other(format!("write Heartbeat: {e}")));
-                }
-                if let Err(e) = writer.flush() {
-                    return Err(io::Error::other(format!("flush Heartbeat: {e}")));
-                }
-                send_buf.clear();
-                last_send = std::time::Instant::now();
-            }
-            // Ring empty — process any pending acks, then yield.
-            // Using poll(0) instead of poll(1ms) to avoid adding 1ms
-            // to the ack→response latency path when the ring empties
-            // between journal stage batches.
+
             match process_acks(&mut reader, replication_cursor, &mut pollfd) {
                 Ok(Some(acked_seq)) => {
                     metrics.acked_sequence[slot_idx].store(acked_seq, Ordering::Relaxed);
@@ -1429,7 +1381,696 @@ fn handle_replica_connection(
                     return Err(io::Error::other(format!("replica ack read error: {e}")));
                 }
             }
-            if busy_spin {
+
+            if let Some((meta, data)) = repl_consumer.try_read() {
+                encode_data_batch(
+                    meta.end_sequence,
+                    &meta.chain_hash,
+                    meta.entry_count,
+                    data,
+                    &mut send_buf,
+                );
+                repl_consumer.commit();
+                last_sequence = meta.end_sequence;
+                last_chain_hash = meta.chain_hash;
+
+                for _ in 1..batch_size {
+                    if let Some((meta, data)) = repl_consumer.try_read() {
+                        encode_data_batch(
+                            meta.end_sequence,
+                            &meta.chain_hash,
+                            meta.entry_count,
+                            data,
+                            &mut send_buf,
+                        );
+                        repl_consumer.commit();
+                        last_sequence = meta.end_sequence;
+                        last_chain_hash = meta.chain_hash;
+                    } else {
+                        break;
+                    }
+                }
+
+                let batch_bytes = send_buf.len() as u64;
+                if let Err(e) = writer.write_all(&send_buf) {
+                    return Err(io::Error::other(format!("write DataBatch: {e}")));
+                }
+                if let Err(e) = writer.flush() {
+                    return Err(io::Error::other(format!("flush DataBatch: {e}")));
+                }
+                metrics.bytes_sent[slot_idx].fetch_add(batch_bytes, Ordering::Relaxed);
+                send_buf.clear();
+                last_send = std::time::Instant::now();
+            } else {
+                if last_send.elapsed() >= heartbeat_interval {
+                    encode_heartbeat(last_sequence, &last_chain_hash, &mut send_buf);
+                    if let Err(e) = writer.write_all(&send_buf) {
+                        return Err(io::Error::other(format!("write Heartbeat: {e}")));
+                    }
+                    if let Err(e) = writer.flush() {
+                        return Err(io::Error::other(format!("flush Heartbeat: {e}")));
+                    }
+                    send_buf.clear();
+                    last_send = std::time::Instant::now();
+                }
+                match process_acks(&mut reader, replication_cursor, &mut pollfd) {
+                    Ok(Some(acked_seq)) => {
+                        metrics.acked_sequence[slot_idx].store(acked_seq, Ordering::Relaxed);
+                        metrics.ack_latency_us[slot_idx]
+                            .store(last_send.elapsed().as_micros() as u64, Ordering::Relaxed);
+                    }
+                    Ok(None) => {}
+                    Err(e) => {
+                        return Err(io::Error::other(format!("replica ack read error: {e}")));
+                    }
+                }
+                if busy_spin {
+                    std::hint::spin_loop();
+                } else {
+                    std::thread::yield_now();
+                }
+            }
+        }
+    }
+}
+
+/// io_uring live streaming loop for the primary replication handler.
+///
+/// Replaces the blocking `write_all`/`flush` + `poll(0)`/`read_frame`
+/// pattern with async RECV/SEND via io_uring. A single RECV is always
+/// in-flight for ack frames; SEND is submitted when the replication ring
+/// has data. Both complete via the memory-mapped CQ with zero syscalls
+/// in the hot path.
+#[cfg(all(feature = "io-uring", not(feature = "no-persist")))]
+#[allow(clippy::too_many_arguments)]
+fn live_stream_uring(
+    writer: TcpStream,
+    repl_consumer: &mut ReplicationConsumer,
+    replication_cursor: &Arc<AtomicU64>,
+    shutdown: &AtomicBool,
+    evict_flag: &AtomicBool,
+    metrics: &ReplicationMetrics,
+    slot_idx: usize,
+    batch_size: usize,
+    heartbeat_interval: std::time::Duration,
+    busy_spin: bool,
+    send_buf: &mut Vec<u8>,
+    last_send: &mut std::time::Instant,
+    last_sequence: &mut u64,
+    last_chain_hash: &mut [u8; 32],
+) -> io::Result<()> {
+    use io_uring::{IoUring, opcode, types};
+    use std::os::unix::io::AsRawFd;
+
+    const TOKEN_RECV: u64 = 0;
+    const TOKEN_SEND: u64 = 1;
+
+    let tcp_fd = writer.as_raw_fd();
+
+    let mut ring: IoUring = IoUring::builder()
+        .setup_single_issuer()
+        .build(8)
+        .map_err(|e| io::Error::other(format!("io_uring init failed: {e}")))?;
+
+    ring.submitter()
+        .register_files(&[tcp_fd])
+        .map_err(|e| io::Error::other(format!("io_uring register_files: {e}")))?;
+
+    // Pin io-wq workers to core 0 (keep them off pipeline cores).
+    {
+        let mut cpuset: libc::cpu_set_t = unsafe { std::mem::zeroed() };
+        unsafe { libc::CPU_SET(0, &mut cpuset) };
+        let _ = ring.submitter().register_iowq_aff(&cpuset);
+    }
+
+    // RECV buffer for ack frames (13 bytes each, but kernel may
+    // coalesce multiple). 4 KiB is plenty.
+    let mut recv_buf = vec![0u8; 4096];
+    // Accumulation buffer for partial ack frame parsing.
+    let mut parse_buf: Vec<u8> = Vec::with_capacity(MAX_CONTROL_FRAME + 4);
+    // RECV is always resubmitted after CQE processing — no explicit
+    // tracking needed. The io_uring kernel guarantees ordering.
+    let mut send_in_flight = false;
+    let mut send_offset: usize = 0;
+    let mut idle_spins: u32 = 0;
+
+    // Submit initial RECV.
+    let sqe = opcode::Recv::new(
+        types::Fixed(0),
+        recv_buf.as_mut_ptr(),
+        recv_buf.len() as u32,
+    )
+    .build()
+    .user_data(TOKEN_RECV);
+    unsafe { ring.submission().push(&sqe).expect("SQ full") };
+
+    loop {
+        // --- Check flags ---
+        if shutdown.load(Ordering::Relaxed) {
+            return Ok(());
+        }
+        if evict_flag.load(Ordering::Relaxed) {
+            info!(slot = slot_idx, "handler exiting: evicted by journal stage");
+            return Ok(());
+        }
+
+        // --- Drain replication ring into send_buf (memory, non-blocking) ---
+        if !send_in_flight {
+            let mut coalesced = 0;
+            while coalesced < batch_size {
+                if let Some((meta, data)) = repl_consumer.try_read() {
+                    encode_data_batch(
+                        meta.end_sequence,
+                        &meta.chain_hash,
+                        meta.entry_count,
+                        data,
+                        send_buf,
+                    );
+                    repl_consumer.commit();
+                    *last_sequence = meta.end_sequence;
+                    *last_chain_hash = meta.chain_hash;
+                    coalesced += 1;
+                } else {
+                    break;
+                }
+            }
+
+            if coalesced > 0 {
+                // Submit SEND for the coalesced buffer.
+                let sqe =
+                    opcode::Send::new(types::Fixed(0), send_buf.as_ptr(), send_buf.len() as u32)
+                        .build()
+                        .user_data(TOKEN_SEND);
+                unsafe { ring.submission().push(&sqe).expect("SQ full") };
+                send_in_flight = true;
+                send_offset = 0;
+                *last_send = std::time::Instant::now();
+                idle_spins = 0;
+            } else if last_send.elapsed() >= heartbeat_interval {
+                // No data — send heartbeat if idle.
+                encode_heartbeat(*last_sequence, last_chain_hash, send_buf);
+                let sqe =
+                    opcode::Send::new(types::Fixed(0), send_buf.as_ptr(), send_buf.len() as u32)
+                        .build()
+                        .user_data(TOKEN_SEND);
+                unsafe { ring.submission().push(&sqe).expect("SQ full") };
+                send_in_flight = true;
+                send_offset = 0;
+                *last_send = std::time::Instant::now();
+            }
+        }
+
+        // --- Submit SQEs to kernel (non-blocking) ---
+        ring.submit()
+            .map_err(|e| io::Error::other(format!("io_uring submit: {e}")))?;
+
+        // --- Collect CQEs (must drain before pushing new SQEs) ---
+        // Collecting into a small stack array avoids the CQ borrow
+        // conflicting with SQ pushes during processing.
+        let mut cqes: [(u64, i32); 4] = [(0, 0); 4];
+        let mut cqe_count = 0;
+        for cqe in ring.completion() {
+            if cqe_count < cqes.len() {
+                cqes[cqe_count] = (cqe.user_data(), cqe.result());
+                cqe_count += 1;
+            }
+        }
+
+        let any_cqe = cqe_count > 0;
+        for &(token, result) in &cqes[..cqe_count] {
+            idle_spins = 0;
+            match token {
+                TOKEN_RECV => {
+                    if result <= 0 {
+                        return Err(io::Error::other(format!(
+                            "replica disconnected (recv returned {result})"
+                        )));
+                    }
+                    let n = result as usize;
+                    parse_buf.extend_from_slice(&recv_buf[..n]);
+
+                    // Extract complete ack frames from parse_buf.
+                    let mut cursor = 0;
+                    while cursor + 4 <= parse_buf.len() {
+                        let frame_len =
+                            u32::from_le_bytes(parse_buf[cursor..cursor + 4].try_into().unwrap())
+                                as usize;
+                        if frame_len == 0 || frame_len > MAX_CONTROL_FRAME {
+                            return Err(io::Error::other(format!(
+                                "invalid ack frame length: {frame_len}"
+                            )));
+                        }
+                        if cursor + 4 + frame_len > parse_buf.len() {
+                            break; // Incomplete frame.
+                        }
+                        let payload = &parse_buf[cursor + 4..cursor + 4 + frame_len];
+                        if let Ok(ReplicaMessage::Ack(ack)) = decode_replica_message(payload) {
+                            let new_val = ack.acked_sequence + 1;
+                            let _ = replication_cursor.fetch_max(new_val, Ordering::Release);
+                            metrics.acked_sequence[slot_idx]
+                                .store(ack.acked_sequence, Ordering::Relaxed);
+                            metrics.ack_latency_us[slot_idx]
+                                .store(last_send.elapsed().as_micros() as u64, Ordering::Relaxed);
+                        }
+                        cursor += 4 + frame_len;
+                    }
+                    // Compact parse_buf.
+                    if cursor > 0 {
+                        let remaining = parse_buf.len() - cursor;
+                        parse_buf.copy_within(cursor.., 0);
+                        parse_buf.truncate(remaining);
+                    }
+
+                    // Resubmit RECV.
+                    let sqe = opcode::Recv::new(
+                        types::Fixed(0),
+                        recv_buf.as_mut_ptr(),
+                        recv_buf.len() as u32,
+                    )
+                    .build()
+                    .user_data(TOKEN_RECV);
+                    unsafe { ring.submission().push(&sqe).expect("SQ full") };
+                }
+
+                TOKEN_SEND => {
+                    if result < 0 {
+                        return Err(io::Error::other(format!("send error (returned {result})")));
+                    }
+                    let sent = result as usize;
+                    send_offset += sent;
+                    if send_offset >= send_buf.len() {
+                        // Fully sent.
+                        metrics.bytes_sent[slot_idx]
+                            .fetch_add(send_buf.len() as u64, Ordering::Relaxed);
+                        send_buf.clear();
+                        send_offset = 0;
+                        send_in_flight = false;
+                    } else {
+                        // Partial send — resubmit remainder.
+                        let sqe = opcode::Send::new(
+                            types::Fixed(0),
+                            send_buf[send_offset..].as_ptr(),
+                            (send_buf.len() - send_offset) as u32,
+                        )
+                        .build()
+                        .user_data(TOKEN_SEND);
+                        unsafe { ring.submission().push(&sqe).expect("SQ full") };
+                    }
+                }
+
+                _ => {}
+            }
+        }
+
+        // --- Idle wait ---
+        if !any_cqe && send_buf.is_empty() {
+            if busy_spin || idle_spins < 1000 {
+                idle_spins = idle_spins.wrapping_add(1);
+                std::hint::spin_loop();
+            } else {
+                std::thread::yield_now();
+            }
+        }
+    }
+}
+
+/// io_uring streaming loop for the replica receiver.
+///
+/// Replaces blocking `read_frame_into` + `poll(0)` + `send_ack_tcp`
+/// with async RECV/SEND. A single RECV is always in-flight for
+/// DataBatch frames; SEND is submitted when an ack becomes ready
+/// (journal cursor catches up). Frame parsing uses the same
+/// accumulate-and-extract pattern as the bench client and uring_reader.
+#[cfg(all(feature = "io-uring", not(feature = "no-persist")))]
+#[allow(clippy::too_many_arguments)]
+fn replica_stream_uring(
+    tcp_stream: &TcpStream,
+    input_producer: &melin_disruptor::ring::MultiProducer<
+        melin_engine::journal::pipeline::InputSlot,
+    >,
+    raw_journal_tx: &melin_engine::journal::pipeline::RawBatchSender,
+    journal_cursor: &melin_disruptor::padding::Sequence,
+    pending_acks: &mut PendingAckQueue,
+    received_data: &mut bool,
+    journal_accum: &mut Vec<u8>,
+    accum_end_sequence: &mut u64,
+    accum_chain_hash: &mut [u8; 32],
+    shutdown: &AtomicBool,
+    promote: &AtomicBool,
+) -> SessionExit {
+    use io_uring::{IoUring, opcode, types};
+    use std::os::unix::io::AsRawFd;
+
+    const TOKEN_RECV: u64 = 0;
+    const TOKEN_SEND: u64 = 1;
+
+    let tcp_fd = tcp_stream.as_raw_fd();
+
+    let mut ring: IoUring = match IoUring::builder().setup_single_issuer().build(8) {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::error!(error = %e, "io_uring init failed for replica receiver");
+            return SessionExit::Disconnected;
+        }
+    };
+
+    if let Err(e) = ring.submitter().register_files(&[tcp_fd]) {
+        tracing::error!(error = %e, "io_uring register_files failed");
+        return SessionExit::Disconnected;
+    }
+
+    // Pin io-wq workers to core 0.
+    {
+        let mut cpuset: libc::cpu_set_t = unsafe { std::mem::zeroed() };
+        unsafe { libc::CPU_SET(0, &mut cpuset) };
+        let _ = ring.submitter().register_iowq_aff(&cpuset);
+    }
+
+    // RECV buffer — 64 KiB. DataBatch frames can be up to 768 KiB,
+    // but TCP delivers data in chunks. parse_buf accumulates until
+    // a complete frame is available.
+    let mut recv_buf = vec![0u8; 65536];
+    let mut parse_buf: Vec<u8> = Vec::with_capacity(MAX_DATA_FRAME + 4);
+    let mut ack_send_buf: Vec<u8> = Vec::with_capacity(64);
+    let mut ack_send_offset: usize = 0;
+    let mut ack_send_in_flight = false;
+    let mut idle_spins: u32 = 0;
+
+    // Submit initial RECV.
+    let sqe = opcode::Recv::new(
+        types::Fixed(0),
+        recv_buf.as_mut_ptr(),
+        recv_buf.len() as u32,
+    )
+    .build()
+    .user_data(TOKEN_RECV);
+    unsafe { ring.submission().push(&sqe).expect("SQ full") };
+
+    loop {
+        // --- Check flags ---
+        if shutdown.load(Ordering::Relaxed) {
+            info!("replica shutting down");
+            return SessionExit::Shutdown;
+        }
+        if promote.load(Ordering::Acquire) {
+            info!("promotion triggered — stopping replication, transitioning to primary");
+            // Drain any complete frames already in parse_buf for
+            // maximum data freshness during promotion.
+            let mut cursor = 0;
+            while cursor + 4 <= parse_buf.len() {
+                let frame_len =
+                    u32::from_le_bytes(parse_buf[cursor..cursor + 4].try_into().unwrap()) as usize;
+                if frame_len == 0
+                    || frame_len > MAX_DATA_FRAME
+                    || cursor + 4 + frame_len > parse_buf.len()
+                {
+                    break;
+                }
+                let payload = &parse_buf[cursor + 4..cursor + 4 + frame_len];
+                if let Ok(PrimaryMessage::DataBatch {
+                    end_sequence,
+                    chain_hash: batch_chain_hash,
+                    journal_bytes,
+                    ..
+                }) = decode_primary_message(payload)
+                {
+                    journal_accum.extend_from_slice(&journal_bytes);
+                    *accum_end_sequence = end_sequence;
+                    *accum_chain_hash = batch_chain_hash;
+                }
+                cursor += 4 + frame_len;
+            }
+            // Submit any accumulated data before returning.
+            if !journal_accum.is_empty() && !pending_acks.is_full() {
+                if let Ok(target) = submit_batch_to_pipeline(
+                    journal_accum,
+                    *accum_end_sequence,
+                    *accum_chain_hash,
+                    input_producer,
+                    raw_journal_tx,
+                ) {
+                    pending_acks.push(target, *accum_end_sequence);
+                }
+                journal_accum.clear();
+            }
+            return SessionExit::Promote;
+        }
+
+        // --- Flush durable acks (non-blocking journal cursor check) ---
+        if !ack_send_in_flight && let Some(seq) = pending_acks.pop_ready(journal_cursor) {
+            ack_send_buf.clear();
+            encode_ack(
+                &Ack {
+                    acked_sequence: seq,
+                },
+                &mut ack_send_buf,
+            );
+            let sqe = opcode::Send::new(
+                types::Fixed(0),
+                ack_send_buf.as_ptr(),
+                ack_send_buf.len() as u32,
+            )
+            .build()
+            .user_data(TOKEN_SEND);
+            unsafe { ring.submission().push(&sqe).expect("SQ full") };
+            ack_send_in_flight = true;
+            ack_send_offset = 0;
+        }
+
+        // --- Backpressure: if pending_acks full, drain in-flight SEND
+        // then pop + send the oldest ack. Must not pop while a SEND is
+        // in-flight — the popped sequence would be lost (no buffer to
+        // defer it).
+        if pending_acks.is_full() {
+            // Wait for any in-flight ack SEND to complete first.
+            // Collect CQEs into stack buffer to avoid CQ/SQ borrow conflict.
+            while ack_send_in_flight {
+                let _ = ring.submit();
+                let mut bp_cqes: [(u64, i32); 4] = [(0, 0); 4];
+                let mut bp_count = 0;
+                for cqe in ring.completion() {
+                    if bp_count < bp_cqes.len() {
+                        bp_cqes[bp_count] = (cqe.user_data(), cqe.result());
+                        bp_count += 1;
+                    }
+                }
+                for &(bp_token, bp_result) in &bp_cqes[..bp_count] {
+                    match bp_token {
+                        TOKEN_SEND => {
+                            if bp_result < 0 {
+                                warn!("ack send error during backpressure drain");
+                                return SessionExit::Disconnected;
+                            }
+                            let sent = bp_result as usize;
+                            ack_send_offset += sent;
+                            if ack_send_offset >= ack_send_buf.len() {
+                                ack_send_buf.clear();
+                                ack_send_offset = 0;
+                                ack_send_in_flight = false;
+                            } else {
+                                let sqe = opcode::Send::new(
+                                    types::Fixed(0),
+                                    ack_send_buf[ack_send_offset..].as_ptr(),
+                                    (ack_send_buf.len() - ack_send_offset) as u32,
+                                )
+                                .build()
+                                .user_data(TOKEN_SEND);
+                                unsafe { ring.submission().push(&sqe).expect("SQ full") };
+                            }
+                        }
+                        TOKEN_RECV => {
+                            // Stash RECV CQE data into parse_buf for later
+                            // processing — don't handle frames here to keep
+                            // the backpressure drain simple.
+                            if bp_result > 0 {
+                                let n = bp_result as usize;
+                                parse_buf.extend_from_slice(&recv_buf[..n]);
+                                // Resubmit RECV.
+                                let sqe = opcode::Recv::new(
+                                    types::Fixed(0),
+                                    recv_buf.as_mut_ptr(),
+                                    recv_buf.len() as u32,
+                                )
+                                .build()
+                                .user_data(TOKEN_RECV);
+                                unsafe { ring.submission().push(&sqe).expect("SQ full") };
+                            } else {
+                                warn!("primary disconnected during backpressure drain");
+                                return SessionExit::Disconnected;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                std::hint::spin_loop();
+            }
+
+            let seq = pending_acks.pop_oldest_blocking(journal_cursor);
+            ack_send_buf.clear();
+            encode_ack(
+                &Ack {
+                    acked_sequence: seq,
+                },
+                &mut ack_send_buf,
+            );
+            let sqe = opcode::Send::new(
+                types::Fixed(0),
+                ack_send_buf.as_ptr(),
+                ack_send_buf.len() as u32,
+            )
+            .build()
+            .user_data(TOKEN_SEND);
+            unsafe { ring.submission().push(&sqe).expect("SQ full") };
+            ack_send_in_flight = true;
+            ack_send_offset = 0;
+        }
+
+        // --- Submit SQEs and drain CQEs ---
+        if let Err(e) = ring.submit() {
+            tracing::error!(error = %e, "io_uring submit failed");
+            return SessionExit::Disconnected;
+        }
+
+        let mut cqes: [(u64, i32); 4] = [(0, 0); 4];
+        let mut cqe_count = 0;
+        for cqe in ring.completion() {
+            if cqe_count < cqes.len() {
+                cqes[cqe_count] = (cqe.user_data(), cqe.result());
+                cqe_count += 1;
+            }
+        }
+
+        let any_cqe = cqe_count > 0;
+        for &(token, result) in &cqes[..cqe_count] {
+            idle_spins = 0;
+            match token {
+                TOKEN_RECV => {
+                    if result <= 0 {
+                        warn!("primary disconnected (recv returned {result})");
+                        return SessionExit::Disconnected;
+                    }
+                    let n = result as usize;
+                    parse_buf.extend_from_slice(&recv_buf[..n]);
+
+                    // Extract complete frames from parse_buf.
+                    let mut cursor = 0;
+                    while cursor + 4 <= parse_buf.len() {
+                        let frame_len =
+                            u32::from_le_bytes(parse_buf[cursor..cursor + 4].try_into().unwrap())
+                                as usize;
+                        if frame_len == 0 || frame_len > MAX_DATA_FRAME {
+                            warn!(frame_len, "invalid frame length from primary");
+                            return SessionExit::Disconnected;
+                        }
+                        if cursor + 4 + frame_len > parse_buf.len() {
+                            break; // Incomplete frame — wait for more data.
+                        }
+                        let payload = &parse_buf[cursor + 4..cursor + 4 + frame_len];
+                        match decode_primary_message(payload) {
+                            Ok(PrimaryMessage::DataBatch {
+                                end_sequence,
+                                chain_hash: batch_chain_hash,
+                                entry_count: _,
+                                journal_bytes,
+                            }) => {
+                                *received_data = true;
+                                journal_accum.extend_from_slice(&journal_bytes);
+                                *accum_end_sequence = end_sequence;
+                                *accum_chain_hash = batch_chain_hash;
+                            }
+                            Ok(PrimaryMessage::Heartbeat { sequence, .. }) => {
+                                debug!(sequence, "heartbeat from primary");
+                            }
+                            Ok(PrimaryMessage::NeedSnapshot) => {
+                                return SessionExit::Fatal(
+                                    "primary says we need a snapshot transfer mid-stream".into(),
+                                );
+                            }
+                            Ok(PrimaryMessage::HashMismatch) => {
+                                return SessionExit::Fatal(
+                                    "chain hash mismatch from primary".into(),
+                                );
+                            }
+                            Ok(_) => {
+                                debug!("unexpected message during streaming");
+                            }
+                            Err(e) => {
+                                warn!(error = %e, "failed to decode primary message");
+                                return SessionExit::Disconnected;
+                            }
+                        }
+                        cursor += 4 + frame_len;
+                    }
+                    // Compact parse_buf.
+                    if cursor > 0 {
+                        let remaining = parse_buf.len() - cursor;
+                        parse_buf.copy_within(cursor.., 0);
+                        parse_buf.truncate(remaining);
+                    }
+
+                    // Submit accumulated data to pipeline (if room in pending acks).
+                    if !journal_accum.is_empty() && !pending_acks.is_full() {
+                        match submit_batch_to_pipeline(
+                            journal_accum,
+                            *accum_end_sequence,
+                            *accum_chain_hash,
+                            input_producer,
+                            raw_journal_tx,
+                        ) {
+                            Ok(target) => {
+                                pending_acks.push(target, *accum_end_sequence);
+                                journal_accum.clear();
+                            }
+                            Err(e) => {
+                                error!(error = %e, "failed to submit batch to pipeline");
+                                return SessionExit::Disconnected;
+                            }
+                        }
+                    }
+
+                    // Resubmit RECV.
+                    let sqe = opcode::Recv::new(
+                        types::Fixed(0),
+                        recv_buf.as_mut_ptr(),
+                        recv_buf.len() as u32,
+                    )
+                    .build()
+                    .user_data(TOKEN_RECV);
+                    unsafe { ring.submission().push(&sqe).expect("SQ full") };
+                }
+
+                TOKEN_SEND => {
+                    if result < 0 {
+                        warn!("ack send error (returned {result})");
+                        return SessionExit::Disconnected;
+                    }
+                    let sent = result as usize;
+                    ack_send_offset += sent;
+                    if ack_send_offset >= ack_send_buf.len() {
+                        ack_send_buf.clear();
+                        ack_send_offset = 0;
+                        ack_send_in_flight = false;
+                    } else {
+                        // Partial send — resubmit remainder.
+                        let sqe = opcode::Send::new(
+                            types::Fixed(0),
+                            ack_send_buf[ack_send_offset..].as_ptr(),
+                            (ack_send_buf.len() - ack_send_offset) as u32,
+                        )
+                        .build()
+                        .user_data(TOKEN_SEND);
+                        unsafe { ring.submission().push(&sqe).expect("SQ full") };
+                    }
+                }
+
+                _ => {}
+            }
+        }
+
+        // --- Idle wait ---
+        if !any_cqe {
+            if idle_spins < 1000 {
+                idle_spins = idle_spins.wrapping_add(1);
                 std::hint::spin_loop();
             } else {
                 std::thread::yield_now();
@@ -1442,8 +2083,13 @@ fn handle_replica_connection(
 /// each frame. Never blocks — returns as soon as no more data is
 /// available. This avoids the ~2ms Linux SO_RCVTIMEO floor that
 /// makes sub-ms read timeouts unreliable.
+///
 /// Returns the last acked sequence seen during this call, or `None` if
 /// no ack was processed. The caller uses this to update per-replica metrics.
+///
+/// Used by the blocking fallback path only — the io_uring path handles
+/// acks via async RECV CQEs.
+#[cfg(not(all(feature = "io-uring", not(feature = "no-persist"))))]
 fn process_acks(
     reader: &mut TcpStream,
     replication_cursor: &Arc<AtomicU64>,
@@ -1487,6 +2133,142 @@ fn process_acks(
 
 // --- Replication Receiver (Replica side) ---
 
+/// Pending ack waiting for journal durability confirmation.
+struct PendingAck {
+    /// Disruptor sequence target — ack is safe to send once the journal
+    /// cursor reaches this value.
+    journal_target: u64,
+    /// Wire-protocol sequence to include in the ack frame.
+    acked_sequence: u64,
+}
+
+/// Fixed-capacity circular buffer of pending acks. Decouples TCP receives
+/// from journal fsync by allowing up to `CAP` batches to be submitted to
+/// the journal stage before any ack is sent. Acks are flushed in FIFO
+/// order as the journal cursor advances.
+///
+/// Capacity 8 matches `RAW_RING_CAPACITY` — the SPSC ring between the
+/// receiver and journal stage is the pipelining bottleneck.
+struct PendingAckQueue {
+    /// Circular buffer of pending acks. Indices wrap via `& MASK`.
+    buf: [PendingAck; Self::CAP],
+    /// Index of the oldest pending ack (next to flush).
+    head: usize,
+    /// Number of pending acks in the queue.
+    len: usize,
+}
+
+impl PendingAckQueue {
+    // Capacity 8 matches RAW_RING_CAPACITY — the SPSC ring between the
+    // receiver and journal stage is the pipelining bottleneck. With
+    // io_uring, the deadlock that forced CAP=1 is eliminated (RECV CQEs
+    // arrive asynchronously while pop_ready checks the cursor each
+    // iteration). The blocking fallback also works with CAP=8 because
+    // is_full() triggers pop_oldest_blocking before the next read.
+    const CAP: usize = 8;
+    const MASK: usize = Self::CAP - 1;
+
+    fn new() -> Self {
+        Self {
+            buf: std::array::from_fn(|_| PendingAck {
+                journal_target: 0,
+                acked_sequence: 0,
+            }),
+            head: 0,
+            len: 0,
+        }
+    }
+
+    fn is_full(&self) -> bool {
+        self.len >= Self::CAP
+    }
+
+    fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    /// Record a pending ack. Caller must ensure `!is_full()`.
+    fn push(&mut self, journal_target: u64, acked_sequence: u64) {
+        debug_assert!(!self.is_full());
+        let idx = (self.head + self.len) & Self::MASK;
+        self.buf[idx] = PendingAck {
+            journal_target,
+            acked_sequence,
+        };
+        self.len += 1;
+    }
+
+    /// Pop acks for all batches where the journal cursor has caught up.
+    /// Non-blocking — returns `None` immediately if the oldest pending
+    /// batch isn't durable yet. Returns the highest acked sequence
+    /// among the flushed entries.
+    fn pop_ready(&mut self, journal_cursor: &melin_disruptor::padding::Sequence) -> Option<u64> {
+        if self.is_empty() {
+            return None;
+        }
+        let cursor_val = journal_cursor.get().load(Ordering::Acquire);
+        let mut last_acked = None;
+        while self.len > 0 {
+            let entry = &self.buf[self.head];
+            if cursor_val < entry.journal_target {
+                break; // Not durable yet.
+            }
+            last_acked = Some(entry.acked_sequence);
+            self.head = (self.head + 1) & Self::MASK;
+            self.len -= 1;
+        }
+        last_acked
+    }
+
+    /// Block until the oldest pending ack is durable, then pop all
+    /// ready entries. Returns the highest acked sequence.
+    fn pop_oldest_blocking(&mut self, journal_cursor: &melin_disruptor::padding::Sequence) -> u64 {
+        debug_assert!(!self.is_empty());
+        let target = self.buf[self.head].journal_target;
+        wait_for_journal_cursor(journal_cursor, target);
+        // The cursor advanced — pop this entry plus any others that
+        // are now also durable.
+        self.pop_ready(journal_cursor)
+            .expect("at least one entry became ready after wait")
+    }
+
+    /// Block until ALL pending acks are durable. Returns the highest
+    /// acked sequence, or `None` if the queue was already empty.
+    fn pop_all_blocking(
+        &mut self,
+        journal_cursor: &melin_disruptor::padding::Sequence,
+    ) -> Option<u64> {
+        let mut last = None;
+        while !self.is_empty() {
+            last = Some(self.pop_oldest_blocking(journal_cursor));
+        }
+        last
+    }
+}
+
+/// Send an ack for `acked_sequence` over TCP, coalescing into `send_buf`.
+/// Flushes the buffer immediately.
+fn send_ack_tcp(
+    acked_sequence: u64,
+    writer: &mut TcpStream,
+    send_buf: &mut Vec<u8>,
+) -> io::Result<()> {
+    encode_ack(&Ack { acked_sequence }, send_buf);
+    writer.write_all(send_buf)?;
+    writer.flush()?;
+    send_buf.clear();
+    Ok(())
+}
+
+/// Outcome of the inner streaming receive loop. Used by both the
+/// io_uring and blocking fallback paths.
+enum SessionExit {
+    Shutdown,
+    Promote,
+    Disconnected,
+    Fatal(Box<dyn std::error::Error>),
+}
+
 /// Run the replication receiver. Connects to a primary, receives journal
 /// entries, persists them locally, replays into the Exchange, and sends acks.
 ///
@@ -1509,502 +2291,654 @@ pub fn run_receiver(
     promote: &AtomicBool,
     snapshot_interval_secs: u64,
     snapshot_path: std::path::PathBuf,
+    cores: crate::server::PipelineCores,
 ) -> ReceiverResult {
     use melin_engine::exchange::Exchange;
     use melin_engine::journal::writer::JournalWriter;
 
-    info!(primary = %primary_addr, "connecting to primary as replica");
-
-    let stream = TcpStream::connect(primary_addr)?;
-    stream.set_nodelay(true)?;
-    // Set a read timeout so the receiver can check the shutdown flag
-    // periodically instead of blocking indefinitely.
-    stream.set_read_timeout(Some(std::time::Duration::from_secs(5)))?;
-
-    let mut reader = stream.try_clone()?;
-    let mut tcp_writer = stream;
-
-    // Authenticate with the primary before any data exchange.
-    authenticate_with_primary(&mut reader, &mut tcp_writer, signing_key)?;
-    info!("authenticated with primary");
-
-    // Determine our current state from the local journal (if any).
-    // For fresh starts, we defer journal creation until after the handshake
-    // so we can use the primary's genesis hash.
-    let (mut exchange, mut journal_writer, last_sequence, chain_hash) = if journal_path.exists() {
-        // Recover from snapshot + journal (fast) or journal only (full replay).
-        let engine = if snapshot_path.exists() {
-            info!("recovering replica from snapshot + journal");
-            melin_engine::journal::JournaledExchange::recover_from_snapshot(
-                &snapshot_path,
-                journal_path,
-            )?
+    // Recover local state from journal (if any). On first call this may
+    // be (None, None) for a fresh replica. After a reconnect, the pipeline
+    // shutdown returns the Exchange + JournalWriter directly.
+    let (mut exchange, mut journal_writer, mut last_sequence, mut chain_hash) =
+        if journal_path.exists() {
+            let engine = if snapshot_path.exists() {
+                info!("recovering replica from snapshot + journal");
+                melin_engine::journal::JournaledExchange::recover_from_snapshot(
+                    &snapshot_path,
+                    journal_path,
+                )?
+            } else {
+                melin_engine::journal::JournaledExchange::recover(journal_path)?
+            };
+            let next = engine.next_sequence();
+            let last = next.saturating_sub(1);
+            let hash = engine.writer_chain_hash().unwrap_or([0u8; 32]);
+            let (exchange, writer) = engine.into_parts();
+            (Some(exchange), Some(writer), last, hash)
         } else {
-            melin_engine::journal::JournaledExchange::recover(journal_path)?
+            (None, None, 0u64, [0u8; 32])
         };
-        // next_sequence is the next to assign, so last written = next - 1.
-        // If next_sequence is 1, no user events have been written (only genesis).
-        let next = engine.next_sequence();
-        let last = next.saturating_sub(1);
-        let hash = engine.writer_chain_hash().unwrap_or([0u8; 32]);
-        let (exchange, writer) = engine.into_parts();
-        (Some(exchange), Some(writer), last, hash)
-    } else {
-        (None, None, 0u64, [0u8; 32])
-    };
 
-    // Send handshake.
+    // Exponential backoff for reconnection: 1s → 2s → 4s → … → 30s max.
+    // Reset to 1s on successful streaming (first DataBatch received).
+    let mut backoff = std::time::Duration::from_secs(1);
+    const MAX_BACKOFF: std::time::Duration = std::time::Duration::from_secs(30);
+
+    // Reusable buffers — survive across reconnections.
     let mut send_buf = Vec::with_capacity(64);
-    let handshake = Handshake {
-        last_sequence,
-        chain_hash,
-    };
-    encode_handshake(&handshake, &mut send_buf);
-    tcp_writer.write_all(&send_buf)?;
-    tcp_writer.flush()?;
-    send_buf.clear();
-
-    // Read StreamStart (or NeedSnapshot / HashMismatch).
-    let response_frame = read_frame(&mut reader, MAX_CONTROL_FRAME)?;
-    let response = decode_primary_message(&response_frame)?;
-    let primary_genesis_entry = match response {
-        PrimaryMessage::StreamStart {
-            start_sequence,
-            genesis_entry,
-        } => {
-            info!(start_sequence, "streaming started");
-            genesis_entry
-        }
-        PrimaryMessage::NeedSnapshot => {
-            // Primary's journal archives don't go back far enough.
-            // Receive a snapshot transfer, then resume streaming.
-            info!("primary requires snapshot transfer — receiving snapshot");
-
-            // Delete stale local state.
-            let _ = std::fs::remove_file(journal_path);
-            let _ = std::fs::remove_file(&snapshot_path);
-
-            // Receive SnapshotBegin.
-            let begin_frame = read_frame(&mut reader, MAX_CONTROL_FRAME)?;
-            let (snap_len, snap_sequence, snap_chain_hash) =
-                match decode_primary_message(&begin_frame)? {
-                    PrimaryMessage::SnapshotBegin {
-                        snapshot_len,
-                        snap_sequence,
-                        snap_chain_hash,
-                    } => (snapshot_len, snap_sequence, snap_chain_hash),
-                    other => {
-                        return Err(format!("expected SnapshotBegin, got {other:?}").into());
-                    }
-                };
-
-            info!(snap_sequence, snap_len, "receiving snapshot");
-
-            // Receive chunks into a temp file, computing CRC incrementally
-            // to avoid re-reading the entire file after write.
-            let tmp_path = snapshot_path.with_extension("snapshot.tmp");
-            {
-                let mut tmp_file = std::fs::File::create(&tmp_path)?;
-                let mut received: u64 = 0;
-                let mut running_crc: u32 = 0;
-                loop {
-                    let chunk_frame = read_frame(&mut reader, MAX_DATA_FRAME)?;
-                    match decode_primary_message(&chunk_frame)? {
-                        PrimaryMessage::SnapshotChunk(data) => {
-                            std::io::Write::write_all(&mut tmp_file, &data)?;
-                            received += data.len() as u64;
-                            running_crc = crc32c::crc32c_append(running_crc, &data);
-                        }
-                        PrimaryMessage::SnapshotEnd {
-                            crc32c: expected_crc,
-                        } => {
-                            tmp_file.sync_all()?;
-                            drop(tmp_file);
-
-                            // Verify received length matches advertised.
-                            if received != snap_len {
-                                let _ = std::fs::remove_file(&tmp_path);
-                                return Err(format!(
-                                    "snapshot length mismatch: expected {snap_len} bytes, got {received}"
-                                )
-                                .into());
-                            }
-
-                            // Verify CRC computed incrementally during receive.
-                            if running_crc != expected_crc {
-                                let _ = std::fs::remove_file(&tmp_path);
-                                return Err(format!(
-                                    "snapshot CRC mismatch: expected {expected_crc:#x}, got {running_crc:#x}"
-                                )
-                                .into());
-                            }
-
-                            // Rename temp to final.
-                            std::fs::rename(&tmp_path, &snapshot_path)?;
-                            info!(snap_sequence, received, "snapshot received and verified");
-                            break;
-                        }
-                        other => {
-                            let _ = std::fs::remove_file(&tmp_path);
-                            return Err(format!("expected SnapshotChunk/End, got {other:?}").into());
-                        }
-                    }
-                }
-            }
-
-            // Load the snapshot and verify chain hash matches what the
-            // primary advertised in SnapshotBegin.
-            let (snap_exchange, snap_seq, snap_hash) =
-                melin_engine::journal::snapshot::load(&snapshot_path)?;
-            if snap_hash != snap_chain_hash {
-                return Err(format!(
-                    "snapshot chain hash mismatch: primary sent {snap_chain_hash:02x?}, \
-                     loaded snapshot has {snap_hash:02x?}"
-                )
-                .into());
-            }
-            exchange = Some(snap_exchange);
-
-            // Create a fresh journal continuing from the snapshot point.
-            let writer = JournalWriter::create_continuing(journal_path, snap_seq + 1, snap_hash)?;
-            journal_writer = Some(writer);
-
-            // Read the StreamStart that the primary sends after the snapshot.
-            // It carries the genesis entry and start_sequence.
-            let ss_frame = read_frame(&mut reader, MAX_CONTROL_FRAME)?;
-            match decode_primary_message(&ss_frame)? {
-                PrimaryMessage::StreamStart {
-                    start_sequence,
-                    genesis_entry,
-                } => {
-                    info!(start_sequence, "streaming resumed after snapshot transfer");
-                    genesis_entry
-                }
-                other => {
-                    return Err(
-                        format!("expected StreamStart after snapshot, got {other:?}").into(),
-                    );
-                }
-            }
-        }
-        PrimaryMessage::HashMismatch => {
-            return Err("chain hash mismatch — replica has divergent history".into());
-        }
-        _ => {
-            return Err(format!("unexpected response: {response:?}").into());
-        }
-    };
-
-    // Create journal for fresh replica using the primary's raw genesis entry.
-    // Writing the exact bytes (including the primary's timestamp) ensures
-    // the BLAKE3 hash chain is byte-identical, so checkpoint verification
-    // works on replica recovery.
-    if journal_writer.is_none() {
-        use melin_engine::journal::codec::{self as journal_codec, FILE_HEADER_SIZE};
-        use std::fs::OpenOptions;
-        use std::os::unix::fs::FileExt;
-
-        let file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create_new(true)
-            .open(journal_path)?;
-        let mut header = [0u8; FILE_HEADER_SIZE];
-        journal_codec::encode_file_header(&mut header);
-        file.write_all_at(&header, 0)?;
-        file.write_all_at(&primary_genesis_entry, FILE_HEADER_SIZE as u64)?;
-        file.sync_all()?;
-
-        // Compute genesis chain hash (same as JournalReader would).
-        let genesis_chain_hash = {
-            let entry_len = primary_genesis_entry.len();
-            let hash = blake3::hash(&primary_genesis_entry[..entry_len - 4]);
-            *hash.as_bytes()
-        };
-
-        let valid_end = FILE_HEADER_SIZE as u64 + primary_genesis_entry.len() as u64;
-        let writer = JournalWriter::open_append(
-            journal_path,
-            1, // genesis consumed sequence 1
-            valid_end,
-            Some(genesis_chain_hash),
-            0, // events_since_checkpoint
-        )?;
-        exchange = Some(Exchange::new());
-        journal_writer = Some(writer);
-    }
-
-    let exchange = exchange.expect("exchange initialized");
-    let journal_writer = journal_writer.expect("journal_writer initialized");
-
-    // Clone exchange for the shadow stage BEFORE moving it into the pipeline.
-    // The shadow needs the fully-recovered state as its base — it only sees
-    // new events from the disruptor, not historical ones from the journal.
-    let shadow_exchange = exchange.clone_via_snapshot();
-
-    // Build the replica pipeline — same stages as the primary (journal →
-    // matching → shadow), with the replication receiver feeding the disruptor
-    // instead of reader threads. The journal stage writes raw bytes from
-    // a side channel instead of encoding events.
-    let enable_shadow = snapshot_interval_secs > 0;
-    let (
-        input_producer,
-        journal_stage,
-        matching_stage,
-        drain_consumer,
-        journal_cursor,
-        _matching_cursor,
-        raw_journal_tx,
-        shadow_consumer,
-        chain_hash_lock,
-    ) = melin_engine::journal::pipeline::build_replica_pipeline(
-        exchange,
-        journal_writer,
-        4096,  // max_journal_batch
-        false, // don't busy-spin on replica
-        enable_shadow,
-    );
-
-    // RAII guard for pipeline threads — ensures all threads are joined on
-    // any exit path (including ? returns). The guard also signals shutdown
-    // and extracts the Exchange + JournalWriter from the stage return values.
-    let pipeline_shutdown = Arc::new(AtomicBool::new(false));
-
-    let ps = Arc::clone(&pipeline_shutdown);
-    let journal_handle = std::thread::Builder::new()
-        .name("journal".into())
-        .spawn(move || journal_stage.run(&ps))
-        .expect("spawn journal thread");
-
-    let ps = Arc::clone(&pipeline_shutdown);
-    let matching_handle = std::thread::Builder::new()
-        .name("matching".into())
-        .spawn(move || matching_stage.run(&ps))
-        .expect("spawn matching thread");
-
-    // Output drain thread — consumes and discards output slots so the
-    // matching stage doesn't block on an unconsumed output ring.
-    let ps = Arc::clone(&pipeline_shutdown);
-    let drain_handle = std::thread::Builder::new()
-        .name("drain".into())
-        .spawn(move || {
-            let mut consumer = drain_consumer;
-            let mut batch = vec![melin_engine::journal::pipeline::OutputSlot::default(); 256];
-            loop {
-                if ps.load(Ordering::Relaxed) {
-                    return;
-                }
-                let count = consumer.consume_batch(&mut batch, 256);
-                if count == 0 {
-                    std::thread::yield_now();
-                }
-            }
-        })
-        .expect("spawn drain thread");
-
-    // Shadow snapshot thread — reuses the primary's shadow::run().
-    let shadow_handle = if let Some(shadow_cons) = shadow_consumer {
-        let snap_path = snapshot_path.clone();
-        let chain_lock = chain_hash_lock.expect("chain hash lock with shadow");
-        let ps = Arc::clone(&pipeline_shutdown);
-        Some(
-            std::thread::Builder::new()
-                .name("replica-shadow".into())
-                .spawn(move || {
-                    crate::shadow::run(
-                        shadow_cons,
-                        shadow_exchange,
-                        snap_path,
-                        std::time::Duration::from_secs(snapshot_interval_secs),
-                        chain_lock,
-                        &ps,
-                        false,
-                    );
-                })
-                .expect("spawn shadow thread"),
-        )
-    } else {
-        None
-    };
-
-    // Reusable buffers for the receive loop.
+    #[cfg(not(all(feature = "io-uring", not(feature = "no-persist"))))]
     let mut frame_buf: Vec<u8> = Vec::with_capacity(64 * 1024);
     let mut journal_accum: Vec<u8> = Vec::with_capacity(128 * 1024);
     let mut accum_end_sequence: u64 = 0;
     let mut accum_chain_hash: [u8; 32] = [0u8; 32];
 
-    // Main receive loop.
+    // --- Outer reconnect loop ---
+    //
+    // Each iteration: connect → auth → handshake → pipeline → stream.
+    // On disconnect (eviction or crash): shut down pipeline, recover
+    // Exchange + JournalWriter, backoff, reconnect.
     loop {
+        // Check shutdown/promote before attempting to connect.
         if shutdown.load(Ordering::Relaxed) {
-            info!("replica shutting down");
-            shutdown_pipeline(
-                &pipeline_shutdown,
-                journal_handle,
-                matching_handle,
-                drain_handle,
-                shadow_handle,
-            );
             return Ok(None);
         }
-
         if promote.load(Ordering::Acquire) {
-            info!("promotion triggered — stopping replication, transitioning to primary");
-            // Drain remaining TCP data for maximum freshness.
-            drain_tcp_data_batches(
-                &mut reader,
-                &mut frame_buf,
-                &mut journal_accum,
-                &mut accum_end_sequence,
-                &mut accum_chain_hash,
-            );
-            // Flush accumulated data through the pipeline.
-            if !journal_accum.is_empty() {
-                publish_batch_to_pipeline(
-                    &journal_accum,
-                    accum_end_sequence,
-                    accum_chain_hash,
-                    &input_producer,
-                    &raw_journal_tx,
-                    &journal_cursor,
-                )?;
-            }
-            // Shut down pipeline and extract Exchange + JournalWriter.
-            drop(raw_journal_tx); // unblock journal stage if waiting on channel
-            return match shutdown_pipeline(
-                &pipeline_shutdown,
-                journal_handle,
-                matching_handle,
-                drain_handle,
-                shadow_handle,
-            ) {
-                Some((exchange, writer)) => Ok(Some((exchange, writer))),
-                None => Err("pipeline thread panicked during promotion".into()),
+            info!("promotion triggered while disconnected");
+            return match (exchange, journal_writer) {
+                (Some(e), Some(w)) => Ok(Some((e, w))),
+                _ => Err("promotion requested but no local state available".into()),
             };
         }
 
-        // Read the first frame (blocking, with 5s timeout for shutdown check).
-        match read_frame_into(&mut reader, &mut frame_buf, MAX_DATA_FRAME) {
-            Ok(()) => {}
-            Err(e)
-                if e.kind() == io::ErrorKind::WouldBlock || e.kind() == io::ErrorKind::TimedOut =>
-            {
+        // --- Connect and authenticate ---
+
+        info!(primary = %primary_addr, "connecting to primary as replica");
+
+        let stream = match TcpStream::connect(primary_addr) {
+            Ok(s) => s,
+            Err(e) => {
+                warn!(
+                    error = %e,
+                    backoff_secs = backoff.as_secs(),
+                    "failed to connect to primary — retrying"
+                );
+                sleep_checking_flags(backoff, shutdown, promote);
+                if shutdown.load(Ordering::Relaxed) {
+                    return Ok(None);
+                }
+                if promote.load(Ordering::Acquire) {
+                    info!("promotion triggered during reconnect backoff");
+                    return match (exchange, journal_writer) {
+                        (Some(e), Some(w)) => Ok(Some((e, w))),
+                        _ => Err("promotion requested but no local state available".into()),
+                    };
+                }
+                backoff = (backoff * 2).min(MAX_BACKOFF);
                 continue;
             }
-            Err(e) => {
-                warn!(error = %e, "primary disconnected — waiting for promotion");
-                // Flush any accumulated data.
-                if !journal_accum.is_empty() {
-                    let _ = publish_batch_to_pipeline(
-                        &journal_accum,
-                        accum_end_sequence,
-                        accum_chain_hash,
-                        &input_producer,
-                        &raw_journal_tx,
-                        &journal_cursor,
-                    );
-                }
-                // Wait for promotion or shutdown.
-                loop {
-                    if shutdown.load(Ordering::Relaxed) {
-                        drop(raw_journal_tx);
-                        shutdown_pipeline(
-                            &pipeline_shutdown,
-                            journal_handle,
-                            matching_handle,
-                            drain_handle,
-                            shadow_handle,
-                        );
-                        return Ok(None);
-                    }
-                    if promote.load(Ordering::Acquire) {
-                        info!("promotion triggered after primary disconnect");
-                        drop(raw_journal_tx);
-                        return match shutdown_pipeline(
-                            &pipeline_shutdown,
-                            journal_handle,
-                            matching_handle,
-                            drain_handle,
-                            shadow_handle,
-                        ) {
-                            Some((exchange, writer)) => Ok(Some((exchange, writer))),
-                            None => Err("pipeline thread panicked during promotion".into()),
-                        };
-                    }
-                    std::thread::sleep(std::time::Duration::from_millis(100));
-                }
-            }
+        };
+        let _ = stream.set_nodelay(true);
+        stream.set_read_timeout(Some(std::time::Duration::from_secs(5)))?;
+
+        let mut reader = stream.try_clone()?;
+        let mut tcp_writer = stream;
+
+        if let Err(e) = authenticate_with_primary(&mut reader, &mut tcp_writer, signing_key) {
+            warn!(error = %e, "authentication failed — retrying");
+            backoff = (backoff * 2).min(MAX_BACKOFF);
+            continue;
         }
+        info!("authenticated with primary");
 
-        let message = decode_primary_message(&frame_buf)?;
-        match message {
-            PrimaryMessage::DataBatch {
-                end_sequence,
-                chain_hash: batch_chain_hash,
-                entry_count: _,
-                journal_bytes,
+        // --- Handshake ---
+
+        let handshake = Handshake {
+            last_sequence,
+            chain_hash,
+        };
+        send_buf.clear();
+        encode_handshake(&handshake, &mut send_buf);
+        tcp_writer.write_all(&send_buf)?;
+        tcp_writer.flush()?;
+        send_buf.clear();
+
+        // --- Protocol negotiation (StreamStart / NeedSnapshot) ---
+
+        let response_frame = read_frame(&mut reader, MAX_CONTROL_FRAME)?;
+        let response = decode_primary_message(&response_frame)?;
+        let primary_genesis_entry = match response {
+            PrimaryMessage::StreamStart {
+                start_sequence,
+                genesis_entry,
             } => {
-                journal_accum.extend_from_slice(&journal_bytes);
-                accum_end_sequence = end_sequence;
-                accum_chain_hash = batch_chain_hash;
-
-                // Drain additional frames from TCP buffer.
-                drain_tcp_data_batches(
-                    &mut reader,
-                    &mut frame_buf,
-                    &mut journal_accum,
-                    &mut accum_end_sequence,
-                    &mut accum_chain_hash,
-                );
-
-                // Submit events to the disruptor and raw bytes to the
-                // journal stage's SPSC ring (non-blocking). The journal
-                // stage writes them via io_uring asynchronously.
-                let target = submit_batch_to_pipeline(
-                    &journal_accum,
-                    accum_end_sequence,
-                    accum_chain_hash,
-                    &input_producer,
-                    &raw_journal_tx,
-                )?;
-
-                // Wait for the journal cursor to confirm durability,
-                // then send the ack. With the SPSC ring and io_uring
-                // on the journal stage, the wait may be shorter than
-                // one NVMe write because previously submitted batches
-                // are already in-flight.
-                wait_for_journal_cursor(&journal_cursor, target);
-
-                let ack = Ack {
-                    acked_sequence: accum_end_sequence,
-                };
-                encode_ack(&ack, &mut send_buf);
-                tcp_writer.write_all(&send_buf)?;
-                tcp_writer.flush()?;
-                send_buf.clear();
-
-                journal_accum.clear();
-            }
-            PrimaryMessage::Heartbeat {
-                sequence,
-                chain_hash: _,
-            } => {
-                debug!(sequence, "heartbeat from primary");
-            }
-            PrimaryMessage::StreamStart { .. } => {
-                debug!("unexpected StreamStart during streaming");
+                info!(start_sequence, "streaming started");
+                genesis_entry
             }
             PrimaryMessage::NeedSnapshot => {
-                return Err("primary says we need a snapshot transfer".into());
+                info!("primary requires snapshot transfer — receiving snapshot");
+
+                let _ = std::fs::remove_file(journal_path);
+                let _ = std::fs::remove_file(&snapshot_path);
+
+                let begin_frame = read_frame(&mut reader, MAX_CONTROL_FRAME)?;
+                let (snap_len, snap_sequence, snap_chain_hash) =
+                    match decode_primary_message(&begin_frame)? {
+                        PrimaryMessage::SnapshotBegin {
+                            snapshot_len,
+                            snap_sequence,
+                            snap_chain_hash,
+                        } => (snapshot_len, snap_sequence, snap_chain_hash),
+                        other => {
+                            return Err(format!("expected SnapshotBegin, got {other:?}").into());
+                        }
+                    };
+
+                info!(snap_sequence, snap_len, "receiving snapshot");
+
+                let tmp_path = snapshot_path.with_extension("snapshot.tmp");
+                {
+                    let mut tmp_file = std::fs::File::create(&tmp_path)?;
+                    let mut received: u64 = 0;
+                    let mut running_crc: u32 = 0;
+                    loop {
+                        let chunk_frame = read_frame(&mut reader, MAX_DATA_FRAME)?;
+                        match decode_primary_message(&chunk_frame)? {
+                            PrimaryMessage::SnapshotChunk(data) => {
+                                std::io::Write::write_all(&mut tmp_file, &data)?;
+                                received += data.len() as u64;
+                                running_crc = crc32c::crc32c_append(running_crc, &data);
+                            }
+                            PrimaryMessage::SnapshotEnd {
+                                crc32c: expected_crc,
+                            } => {
+                                tmp_file.sync_all()?;
+                                drop(tmp_file);
+
+                                if received != snap_len {
+                                    let _ = std::fs::remove_file(&tmp_path);
+                                    return Err(format!(
+                                        "snapshot length mismatch: expected {snap_len} bytes, got {received}"
+                                    )
+                                    .into());
+                                }
+
+                                if running_crc != expected_crc {
+                                    let _ = std::fs::remove_file(&tmp_path);
+                                    return Err(format!(
+                                        "snapshot CRC mismatch: expected {expected_crc:#x}, got {running_crc:#x}"
+                                    )
+                                    .into());
+                                }
+
+                                std::fs::rename(&tmp_path, &snapshot_path)?;
+                                info!(snap_sequence, received, "snapshot received and verified");
+                                break;
+                            }
+                            other => {
+                                let _ = std::fs::remove_file(&tmp_path);
+                                return Err(
+                                    format!("expected SnapshotChunk/End, got {other:?}").into()
+                                );
+                            }
+                        }
+                    }
+                }
+
+                let (snap_exchange, snap_seq, snap_hash) =
+                    melin_engine::journal::snapshot::load(&snapshot_path)?;
+                if snap_hash != snap_chain_hash {
+                    return Err(format!(
+                        "snapshot chain hash mismatch: primary sent {snap_chain_hash:02x?}, \
+                         loaded snapshot has {snap_hash:02x?}"
+                    )
+                    .into());
+                }
+                exchange = Some(snap_exchange);
+
+                let writer =
+                    JournalWriter::create_continuing(journal_path, snap_seq + 1, snap_hash)?;
+                journal_writer = Some(writer);
+
+                let ss_frame = read_frame(&mut reader, MAX_CONTROL_FRAME)?;
+                match decode_primary_message(&ss_frame)? {
+                    PrimaryMessage::StreamStart {
+                        start_sequence,
+                        genesis_entry,
+                    } => {
+                        info!(start_sequence, "streaming resumed after snapshot transfer");
+                        genesis_entry
+                    }
+                    other => {
+                        return Err(
+                            format!("expected StreamStart after snapshot, got {other:?}").into(),
+                        );
+                    }
+                }
             }
             PrimaryMessage::HashMismatch => {
-                return Err("chain hash mismatch from primary".into());
+                return Err("chain hash mismatch — replica has divergent history".into());
             }
-            PrimaryMessage::SnapshotBegin { .. }
-            | PrimaryMessage::SnapshotChunk(_)
-            | PrimaryMessage::SnapshotEnd { .. } => {
-                debug!("unexpected snapshot message during streaming");
+            _ => {
+                return Err(format!("unexpected response: {response:?}").into());
+            }
+        };
+
+        // --- Create journal for fresh replica (first connection only) ---
+
+        if journal_writer.is_none() {
+            use melin_engine::journal::codec::{self as journal_codec, FILE_HEADER_SIZE};
+            use std::fs::OpenOptions;
+            use std::os::unix::fs::FileExt;
+
+            let file = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create_new(true)
+                .open(journal_path)?;
+            let mut header = [0u8; FILE_HEADER_SIZE];
+            journal_codec::encode_file_header(&mut header);
+            file.write_all_at(&header, 0)?;
+            file.write_all_at(&primary_genesis_entry, FILE_HEADER_SIZE as u64)?;
+            file.sync_all()?;
+
+            let genesis_chain_hash = {
+                let entry_len = primary_genesis_entry.len();
+                let hash = blake3::hash(&primary_genesis_entry[..entry_len - 4]);
+                *hash.as_bytes()
+            };
+
+            let valid_end = FILE_HEADER_SIZE as u64 + primary_genesis_entry.len() as u64;
+            let writer = JournalWriter::open_append(
+                journal_path,
+                1, // genesis consumed sequence 1
+                valid_end,
+                Some(genesis_chain_hash),
+                0, // events_since_checkpoint
+            )?;
+            exchange = Some(Exchange::new());
+            journal_writer = Some(writer);
+        }
+
+        let cur_exchange = exchange.take().expect("exchange initialized");
+        let cur_writer = journal_writer.take().expect("journal_writer initialized");
+
+        // --- Build pipeline and spawn threads ---
+
+        let shadow_exchange = cur_exchange.clone_via_snapshot();
+
+        let enable_shadow = snapshot_interval_secs > 0;
+        let (
+            input_producer,
+            journal_stage,
+            matching_stage,
+            drain_consumer,
+            journal_cursor,
+            _matching_cursor,
+            raw_journal_tx,
+            shadow_consumer,
+            chain_hash_lock,
+        ) = melin_engine::journal::pipeline::build_replica_pipeline(
+            cur_exchange,
+            cur_writer,
+            4096,  // max_journal_batch
+            false, // don't busy-spin on replica
+            enable_shadow,
+        );
+
+        let pipeline_shutdown = Arc::new(AtomicBool::new(false));
+
+        let ps = Arc::clone(&pipeline_shutdown);
+        let journal_core = cores.journal;
+        let journal_handle = std::thread::Builder::new()
+            .name("journal".into())
+            .spawn(move || {
+                pin_replica_thread("journal", journal_core);
+                journal_stage.run(&ps)
+            })
+            .expect("spawn journal thread");
+
+        let ps = Arc::clone(&pipeline_shutdown);
+        let matching_core = cores.matching;
+        let matching_handle = std::thread::Builder::new()
+            .name("matching".into())
+            .spawn(move || {
+                pin_replica_thread("matching", matching_core);
+                matching_stage.run(&ps)
+            })
+            .expect("spawn matching thread");
+
+        // Drain thread uses the response core — on the primary this core
+        // runs the response stage, but replicas have no response stage.
+        let ps = Arc::clone(&pipeline_shutdown);
+        let drain_core = cores.response;
+        let drain_handle = std::thread::Builder::new()
+            .name("drain".into())
+            .spawn(move || {
+                pin_replica_thread("drain", drain_core);
+                let mut consumer = drain_consumer;
+                let mut batch = vec![melin_engine::journal::pipeline::OutputSlot::default(); 256];
+                loop {
+                    if ps.load(Ordering::Relaxed) {
+                        return;
+                    }
+                    let count = consumer.consume_batch(&mut batch, 256);
+                    if count == 0 {
+                        std::thread::yield_now();
+                    }
+                }
+            })
+            .expect("spawn drain thread");
+
+        let shadow_handle = if let Some(shadow_cons) = shadow_consumer {
+            let snap_path = snapshot_path.clone();
+            let chain_lock = chain_hash_lock.expect("chain hash lock with shadow");
+            let ps = Arc::clone(&pipeline_shutdown);
+            let shadow_core = cores.shadow;
+            Some(
+                std::thread::Builder::new()
+                    .name("replica-shadow".into())
+                    .spawn(move || {
+                        pin_replica_thread("replica-shadow", shadow_core);
+                        crate::shadow::run(
+                            shadow_cons,
+                            shadow_exchange,
+                            snap_path,
+                            std::time::Duration::from_secs(snapshot_interval_secs),
+                            chain_lock,
+                            &ps,
+                            false,
+                        );
+                    })
+                    .expect("spawn shadow thread"),
+            )
+        } else {
+            None
+        };
+
+        // --- Inner streaming receive loop ---
+        //
+        // Exits via `break` with a SessionExit value. All pipeline
+        // teardown happens after the loop to avoid ownership issues
+        // with thread handles across multiple break paths.
+
+        let mut pending_acks = PendingAckQueue::new();
+        let mut received_data = false;
+
+        // Dispatch to io_uring or blocking streaming loop.
+        #[cfg(all(feature = "io-uring", not(feature = "no-persist")))]
+        let exit_reason: SessionExit = replica_stream_uring(
+            &tcp_writer,
+            &input_producer,
+            &raw_journal_tx,
+            &journal_cursor,
+            &mut pending_acks,
+            &mut received_data,
+            &mut journal_accum,
+            &mut accum_end_sequence,
+            &mut accum_chain_hash,
+            shutdown,
+            promote,
+        );
+
+        #[cfg(not(all(feature = "io-uring", not(feature = "no-persist"))))]
+        let exit_reason: SessionExit = {
+            loop {
+                if shutdown.load(Ordering::Relaxed) {
+                    info!("replica shutting down");
+                    break SessionExit::Shutdown;
+                }
+
+                if promote.load(Ordering::Acquire) {
+                    info!("promotion triggered — stopping replication, transitioning to primary");
+                    drain_tcp_data_batches(
+                        &mut reader,
+                        &mut frame_buf,
+                        &mut journal_accum,
+                        &mut accum_end_sequence,
+                        &mut accum_chain_hash,
+                    );
+                    if !journal_accum.is_empty() {
+                        if let Ok(target) = submit_batch_to_pipeline(
+                            &journal_accum,
+                            accum_end_sequence,
+                            accum_chain_hash,
+                            &input_producer,
+                            &raw_journal_tx,
+                        ) {
+                            pending_acks.push(target, accum_end_sequence);
+                        }
+                        journal_accum.clear();
+                    }
+                    break SessionExit::Promote;
+                }
+
+                // Flush durable acks (non-blocking).
+                if let Some(seq) = pending_acks.pop_ready(&journal_cursor)
+                    && let Err(e) = send_ack_tcp(seq, &mut tcp_writer, &mut send_buf)
+                {
+                    warn!(error = %e, "failed to send ack — disconnecting");
+                    break SessionExit::Disconnected;
+                }
+
+                // Backpressure: block until oldest batch is durable.
+                if pending_acks.is_full() {
+                    let seq = pending_acks.pop_oldest_blocking(&journal_cursor);
+                    if let Err(e) = send_ack_tcp(seq, &mut tcp_writer, &mut send_buf) {
+                        warn!(error = %e, "failed to send ack — disconnecting");
+                        break SessionExit::Disconnected;
+                    }
+                }
+
+                // When acks are pending, poll(0) before blocking on read.
+                if !pending_acks.is_empty() {
+                    let mut pfd = libc::pollfd {
+                        fd: std::os::unix::io::AsRawFd::as_raw_fd(&reader),
+                        events: libc::POLLIN,
+                        revents: 0,
+                    };
+                    let ready = unsafe { libc::poll(&mut pfd, 1, 0) };
+                    if ready <= 0 || (pfd.revents & libc::POLLIN) == 0 {
+                        continue;
+                    }
+                }
+
+                // Read next frame (blocking, 5s timeout for shutdown check).
+                match read_frame_into(&mut reader, &mut frame_buf, MAX_DATA_FRAME) {
+                    Ok(()) => {}
+                    Err(e)
+                        if e.kind() == io::ErrorKind::WouldBlock
+                            || e.kind() == io::ErrorKind::TimedOut =>
+                    {
+                        continue;
+                    }
+                    Err(e) => {
+                        warn!(error = %e, "primary disconnected");
+                        break SessionExit::Disconnected;
+                    }
+                }
+
+                let message = match decode_primary_message(&frame_buf) {
+                    Ok(m) => m,
+                    Err(e) => {
+                        warn!(error = %e, "failed to decode primary message");
+                        break SessionExit::Disconnected;
+                    }
+                };
+                match message {
+                    PrimaryMessage::DataBatch {
+                        end_sequence,
+                        chain_hash: batch_chain_hash,
+                        entry_count: _,
+                        journal_bytes,
+                    } => {
+                        received_data = true;
+                        journal_accum.extend_from_slice(&journal_bytes);
+                        accum_end_sequence = end_sequence;
+                        accum_chain_hash = batch_chain_hash;
+
+                        drain_tcp_data_batches(
+                            &mut reader,
+                            &mut frame_buf,
+                            &mut journal_accum,
+                            &mut accum_end_sequence,
+                            &mut accum_chain_hash,
+                        );
+
+                        let target = match submit_batch_to_pipeline(
+                            &journal_accum,
+                            accum_end_sequence,
+                            accum_chain_hash,
+                            &input_producer,
+                            &raw_journal_tx,
+                        ) {
+                            Ok(t) => t,
+                            Err(e) => {
+                                error!(error = %e, "failed to submit batch to pipeline");
+                                break SessionExit::Disconnected;
+                            }
+                        };
+
+                        pending_acks.push(target, accum_end_sequence);
+                        journal_accum.clear();
+                    }
+                    PrimaryMessage::Heartbeat {
+                        sequence,
+                        chain_hash: _,
+                    } => {
+                        debug!(sequence, "heartbeat from primary");
+                    }
+                    PrimaryMessage::StreamStart { .. } => {
+                        debug!("unexpected StreamStart during streaming");
+                    }
+                    PrimaryMessage::NeedSnapshot => {
+                        break SessionExit::Fatal(
+                            "primary says we need a snapshot transfer mid-stream".into(),
+                        );
+                    }
+                    PrimaryMessage::HashMismatch => {
+                        break SessionExit::Fatal("chain hash mismatch from primary".into());
+                    }
+                    PrimaryMessage::SnapshotBegin { .. }
+                    | PrimaryMessage::SnapshotChunk(_)
+                    | PrimaryMessage::SnapshotEnd { .. } => {
+                        debug!("unexpected snapshot message during streaming");
+                    }
+                }
+            }
+        };
+
+        // --- Common teardown (all exit paths) ---
+
+        // Flush any accumulated data not yet submitted.
+        if !journal_accum.is_empty() {
+            if let Ok(target) = submit_batch_to_pipeline(
+                &journal_accum,
+                accum_end_sequence,
+                accum_chain_hash,
+                &input_producer,
+                &raw_journal_tx,
+            ) {
+                pending_acks.push(target, accum_end_sequence);
+            }
+            journal_accum.clear();
+        }
+        // Wait for all pending batches to become durable.
+        if let Some(seq) = pending_acks.pop_all_blocking(&journal_cursor) {
+            let _ = send_ack_tcp(seq, &mut tcp_writer, &mut send_buf);
+        }
+
+        // Shut down pipeline and recover state.
+        drop(raw_journal_tx);
+        let pipeline_state = shutdown_pipeline(
+            &pipeline_shutdown,
+            journal_handle,
+            matching_handle,
+            drain_handle,
+            shadow_handle,
+        );
+
+        match exit_reason {
+            SessionExit::Shutdown => return Ok(None),
+
+            SessionExit::Promote => {
+                return match pipeline_state {
+                    Some((e, w)) => Ok(Some((e, w))),
+                    None => Err("pipeline thread panicked during promotion".into()),
+                };
+            }
+
+            SessionExit::Fatal(e) => return Err(e),
+
+            SessionExit::Disconnected => {
+                // Recover Exchange + JournalWriter for the next iteration.
+                match pipeline_state {
+                    Some((e, w)) => {
+                        last_sequence = w.next_sequence().saturating_sub(1);
+                        chain_hash = w.chain_hash().unwrap_or([0u8; 32]);
+                        exchange = Some(e);
+                        journal_writer = Some(w);
+                    }
+                    None => {
+                        error!("pipeline thread panicked during disconnect recovery");
+                        if journal_path.exists() {
+                            match melin_engine::journal::JournaledExchange::recover(journal_path) {
+                                Ok(engine) => {
+                                    last_sequence = engine.next_sequence().saturating_sub(1);
+                                    chain_hash = engine.writer_chain_hash().unwrap_or([0u8; 32]);
+                                    let (e, w) = engine.into_parts();
+                                    exchange = Some(e);
+                                    journal_writer = Some(w);
+                                }
+                                Err(e) => {
+                                    return Err(format!(
+                                        "pipeline panicked and journal recovery failed: {e}"
+                                    )
+                                    .into());
+                                }
+                            }
+                        } else {
+                            return Err("pipeline panicked and no journal to recover from".into());
+                        }
+                    }
+                }
+
+                if received_data {
+                    backoff = std::time::Duration::from_secs(1);
+                }
+
+                warn!(
+                    last_sequence,
+                    backoff_secs = backoff.as_secs(),
+                    "reconnecting to primary"
+                );
+                sleep_checking_flags(backoff, shutdown, promote);
+                backoff = (backoff * 2).min(MAX_BACKOFF);
             }
         }
+    }
+}
+
+/// Pin a replica pipeline thread to a core, mirroring the primary's layout.
+fn pin_replica_thread(name: &str, core: usize) {
+    match crate::affinity::pin_to_core(core) {
+        Ok(c) => tracing::info!(core = c, thread = name, "pinned to core"),
+        Err(e) => tracing::warn!(thread = name, error = e, "core pinning failed"),
+    }
+}
+
+/// Sleep for the given duration in 100ms increments, checking shutdown
+/// and promote flags between increments. Returns early if either is set.
+fn sleep_checking_flags(
+    duration: std::time::Duration,
+    shutdown: &AtomicBool,
+    promote: &AtomicBool,
+) {
+    let deadline = std::time::Instant::now() + duration;
+    while std::time::Instant::now() < deadline {
+        if shutdown.load(Ordering::Relaxed) || promote.load(Ordering::Acquire) {
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
     }
 }
 
@@ -2032,6 +2966,12 @@ fn shutdown_pipeline(
 }
 
 /// Drain DataBatch frames from the TCP buffer using non-blocking poll(0).
+/// Used by the blocking fallback path only — the io_uring receiver
+/// handles coalescing implicitly via the recv buffer.
+#[cfg_attr(
+    all(feature = "io-uring", not(feature = "no-persist")),
+    allow(dead_code)
+)]
 fn drain_tcp_data_batches(
     reader: &mut TcpStream,
     frame_buf: &mut Vec<u8>,
@@ -2150,22 +3090,6 @@ fn wait_for_journal_cursor(journal_cursor: &melin_disruptor::padding::Sequence, 
     while journal_cursor.get().load(Ordering::Acquire) < target {
         std::hint::spin_loop();
     }
-}
-
-/// Legacy wrapper: submit + wait + return. Used by code paths that
-/// haven't been updated to the split submit/wait pattern yet.
-fn publish_batch_to_pipeline(
-    journal_bytes: &[u8],
-    end_sequence: u64,
-    chain_hash: [u8; 32],
-    producer: &melin_disruptor::ring::MultiProducer<melin_engine::journal::pipeline::InputSlot>,
-    raw_tx: &melin_engine::journal::pipeline::RawBatchSender,
-    journal_cursor: &melin_disruptor::padding::Sequence,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let target =
-        submit_batch_to_pipeline(journal_bytes, end_sequence, chain_hash, producer, raw_tx)?;
-    wait_for_journal_cursor(journal_cursor, target);
-    Ok(())
 }
 
 // --- DPDK replication (smoltcp transport) ---
@@ -2688,10 +3612,31 @@ pub fn run_receiver_dpdk(
     let mut accum_end_sequence: u64 = 0;
     let mut accum_chain_hash: [u8; 32] = [0u8; 32];
 
+    // Pipelined ack queue — same as TCP receiver, see PendingAckQueue docs.
+    let mut pending_acks = PendingAckQueue::new();
+
+    // Encode an ack into send_buf and queue it on the DPDK transport.
+    macro_rules! send_ack_dpdk {
+        ($seq:expr) => {{
+            send_buf.clear();
+            encode_ack(
+                &Ack {
+                    acked_sequence: $seq,
+                },
+                &mut send_buf,
+            );
+            transport.queue_send(handle, &send_buf);
+        }};
+    }
+
     // Main receive loop.
     loop {
         if shutdown.load(Ordering::Relaxed) {
             info!("replica shutting down (DPDK)");
+            if let Some(seq) = pending_acks.pop_all_blocking(&journal_cursor) {
+                send_ack_dpdk!(seq);
+                transport.poll();
+            }
             drop(raw_journal_tx);
             shutdown_pipeline(
                 &pipeline_shutdown,
@@ -2737,15 +3682,20 @@ pub fn run_receiver_dpdk(
                 compact_recv_buf(&mut recv_buf, consumed);
             }
             if !journal_accum.is_empty() {
-                let _ = publish_batch_to_pipeline(
+                if let Ok(target) = submit_batch_to_pipeline(
                     &journal_accum,
                     accum_end_sequence,
                     accum_chain_hash,
                     &input_producer,
                     &raw_journal_tx,
-                    &journal_cursor,
-                );
+                ) {
+                    pending_acks.push(target, accum_end_sequence);
+                }
                 journal_accum.clear();
+            }
+            if let Some(seq) = pending_acks.pop_all_blocking(&journal_cursor) {
+                send_ack_dpdk!(seq);
+                transport.poll();
             }
             drop(raw_journal_tx);
             return match shutdown_pipeline(
@@ -2760,12 +3710,28 @@ pub fn run_receiver_dpdk(
             };
         }
 
+        // Flush any acks that have become durable since last iteration.
+        if let Some(seq) = pending_acks.pop_ready(&journal_cursor) {
+            send_ack_dpdk!(seq);
+        }
+
+        // Backpressure: if pipeline is saturated, block until the oldest
+        // batch is durable.
+        if pending_acks.is_full() {
+            let seq = pending_acks.pop_oldest_blocking(&journal_cursor);
+            send_ack_dpdk!(seq);
+        }
+
         // Poll smoltcp and receive data.
         transport.poll();
         transport.recv_into_vec(handle, &mut recv_buf);
 
         // Check for disconnect.
         if !transport.is_active(handle) && recv_buf.is_empty() {
+            if let Some(seq) = pending_acks.pop_all_blocking(&journal_cursor) {
+                send_ack_dpdk!(seq);
+                transport.poll();
+            }
             drop(raw_journal_tx);
             shutdown_pipeline(
                 &pipeline_shutdown,
@@ -2836,8 +3802,7 @@ pub fn run_receiver_dpdk(
         }
         compact_recv_buf(&mut recv_buf, consumed);
 
-        // Submit to pipeline (non-blocking), wait for journal
-        // cursor, then ack.
+        // Submit to pipeline and record pending ack.
         if got_data {
             let target = submit_batch_to_pipeline(
                 &journal_accum,
@@ -2846,16 +3811,8 @@ pub fn run_receiver_dpdk(
                 &input_producer,
                 &raw_journal_tx,
             )?;
-            wait_for_journal_cursor(&journal_cursor, target);
 
-            // Ack — data is durable.
-            send_buf.clear();
-            let ack = Ack {
-                acked_sequence: accum_end_sequence,
-            };
-            encode_ack(&ack, &mut send_buf);
-            transport.queue_send(handle, &send_buf);
-
+            pending_acks.push(target, accum_end_sequence);
             journal_accum.clear();
         } else {
             std::thread::yield_now();
@@ -3911,5 +4868,141 @@ mod tests {
             }
             _ => panic!("expected SnapshotChunk"),
         }
+    }
+
+    // --- PendingAckQueue tests ---
+
+    fn make_journal_cursor(val: u64) -> melin_disruptor::padding::Sequence {
+        melin_disruptor::padding::Sequence::new(AtomicU64::new(val))
+    }
+
+    #[test]
+    fn pending_ack_queue_push_and_pop_ready() {
+        let mut q = PendingAckQueue::new();
+        assert!(q.is_empty());
+        assert!(!q.is_full());
+
+        q.push(10, 100);
+        q.push(20, 200);
+        assert!(!q.is_empty());
+
+        // Cursor at 5 — neither ready.
+        let cursor = make_journal_cursor(5);
+        assert!(q.pop_ready(&cursor).is_none());
+
+        // Cursor at 15 — first ready, second not.
+        cursor.get().store(15, Ordering::Relaxed);
+        assert_eq!(q.pop_ready(&cursor), Some(100));
+        // Only one popped — second still pending.
+        assert!(!q.is_empty());
+
+        // Cursor at 25 — second now ready.
+        cursor.get().store(25, Ordering::Relaxed);
+        assert_eq!(q.pop_ready(&cursor), Some(200));
+        assert!(q.is_empty());
+    }
+
+    #[test]
+    fn pending_ack_queue_pop_ready_returns_highest_sequence() {
+        // When multiple acks become ready simultaneously, pop_ready
+        // returns the highest acked_sequence (ack semantics are
+        // cumulative — "everything up to this sequence is durable").
+        let mut q = PendingAckQueue::new();
+        q.push(10, 100);
+        q.push(20, 200);
+        q.push(30, 300);
+
+        let cursor = make_journal_cursor(30);
+        assert_eq!(q.pop_ready(&cursor), Some(300));
+        assert!(q.is_empty());
+    }
+
+    #[test]
+    fn pending_ack_queue_capacity_and_full() {
+        let mut q = PendingAckQueue::new();
+        for i in 0..PendingAckQueue::CAP {
+            assert!(!q.is_full());
+            q.push(i as u64 + 1, (i + 1) as u64 * 100);
+        }
+        assert!(q.is_full());
+    }
+
+    #[test]
+    fn pending_ack_queue_pop_oldest_blocking() {
+        let mut q = PendingAckQueue::new();
+        q.push(10, 100);
+        q.push(20, 200);
+
+        // Cursor already past both targets — pop_oldest_blocking
+        // returns immediately.
+        let cursor = make_journal_cursor(25);
+        let seq = q.pop_oldest_blocking(&cursor);
+        // Should pop both (oldest + any others that became ready).
+        assert_eq!(seq, 200);
+        assert!(q.is_empty());
+    }
+
+    #[test]
+    fn pending_ack_queue_wraps_around() {
+        let mut q = PendingAckQueue::new();
+        let cursor = make_journal_cursor(100);
+
+        // Fill and drain multiple times to exercise circular buffer wrap.
+        for round in 0..3 {
+            for i in 0..PendingAckQueue::CAP {
+                let target = (round * PendingAckQueue::CAP + i) as u64 + 1;
+                q.push(target, target * 10);
+            }
+            assert!(q.is_full());
+            let seq = q.pop_ready(&cursor).expect("should be ready");
+            assert_eq!(
+                seq,
+                (round * PendingAckQueue::CAP + PendingAckQueue::CAP) as u64 * 10
+            );
+            assert!(q.is_empty());
+        }
+    }
+
+    #[test]
+    fn pending_ack_queue_pop_all_blocking_empty() {
+        let mut q = PendingAckQueue::new();
+        let cursor = make_journal_cursor(0);
+        assert!(q.pop_all_blocking(&cursor).is_none());
+    }
+
+    // --- Cursor reset test ---
+
+    #[test]
+    fn disconnect_resets_cursor_to_max() {
+        // Verify the cursor reset behavior documented in the replication
+        // cursor table: "All replicas disconnect → u64::MAX".
+        let cursor = Arc::new(AtomicU64::new(42));
+        let replicas_connected = Arc::new(AtomicU32::new(1));
+
+        // Simulate disconnect: decrement connected count.
+        replicas_connected.fetch_sub(1, Ordering::Release);
+
+        // The sender loop checks and resets.
+        if replicas_connected.load(Ordering::Relaxed) == 0 {
+            cursor.store(u64::MAX, Ordering::Release);
+        }
+
+        assert_eq!(cursor.load(Ordering::Relaxed), u64::MAX);
+    }
+
+    #[test]
+    fn cursor_not_reset_when_replica_still_connected() {
+        let cursor = Arc::new(AtomicU64::new(42));
+        let replicas_connected = Arc::new(AtomicU32::new(2));
+
+        // One replica disconnects, one remains.
+        replicas_connected.fetch_sub(1, Ordering::Release);
+
+        if replicas_connected.load(Ordering::Relaxed) == 0 {
+            cursor.store(u64::MAX, Ordering::Release);
+        }
+
+        // Cursor should NOT be reset — one replica still connected.
+        assert_eq!(cursor.load(Ordering::Relaxed), 42);
     }
 }

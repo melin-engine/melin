@@ -454,6 +454,7 @@ pub fn run_with_shutdown<L: BlockingTransportListener>(
             &promote_flag,
             config.snapshot_interval_secs,
             config.shadow_snapshot_path(),
+            config.cores,
         )? {
             None => return Ok(()), // clean shutdown
             Some((mut exchange, writer)) => {

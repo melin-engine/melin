@@ -15,8 +15,8 @@ Primary:
   two independent SPSC replication rings (one per replica slot).
 
   ReplicationSender threads: each consumes from its own ring,
-  streams DataBatch frames to its replica, processes acks,
-  updates replication_cursor.
+  streams DataBatch frames to its replica via io_uring SEND,
+  receives acks via io_uring RECV, updates replication_cursor.
 
   ResponseStage gates on min(journal_cursor, replication_cursor)
 
@@ -97,8 +97,11 @@ A server started with `--replica-of <primary_addr>` runs in replica mode:
 - Uses the same pipeline architecture as the primary (journal stage → matching stage → shadow stage), with the replication receiver feeding the input disruptor instead of reader threads.
 - The journal stage writes pre-encoded bytes from the primary via `write_raw_sync()` (byte-identical journals) instead of re-encoding events from the disruptor.
 - The matching stage replays events into a local `Exchange` to maintain warm state for promotion.
-- Sends `Ack` frames after the journal stage confirms durable write (cursor advance).
-- The shadow stage runs on a dedicated thread with a cloned `Exchange`, saving periodic snapshots (30s interval) so a crash doesn't require replaying from genesis.
+- Sends `Ack` frames after the journal stage confirms durable write (cursor advance). Acks are pipelined: up to 8 batches can be submitted to the journal stage before the first ack is sent, overlapping NVMe writes with TCP receives.
+- Both the primary sender and replica receiver use io_uring for TCP I/O (async RECV/SEND), eliminating poll/read/write syscalls from the streaming hot path. The blocking fallback is used when io_uring is not available.
+- The replica pipeline threads (journal, matching, drain, shadow) are pinned to the same cores as the primary, matching the `--cores` layout.
+- If the primary disconnects or evicts the replica, the receiver automatically reconnects with exponential backoff (1s → 30s cap), recovers state from the pipeline shutdown, and resumes from its last durable sequence.
+- The shadow stage runs on a dedicated thread with a cloned `Exchange`, saving periodic snapshots so a crash doesn't require replaying from genesis.
 - On restart, uses `recover_from_snapshot` if a snapshot exists alongside the journal.
 - Does **not** accept client connections (read-only state).
 
@@ -120,7 +123,9 @@ TCP Stream → Replication Receiver (decode + publish)
          Ack to primary
 ```
 
-The receiver thread publishes decoded events to the input disruptor and sends the raw journal bytes to the journal stage via a bounded lock-free SPSC ring (8 slots). The journal stage submits async `Write+RWF_DSYNC` operations via io_uring, then consumes (and discards) the corresponding disruptor events after the CQE confirms durability. The SPSC ring decouples the receiver's TCP loop from NVMe write latency — the receiver can push up to 8 batches ahead while previous writes are in flight. The receiver spin-waits on the journal cursor before sending the ack.
+The receiver thread uses io_uring for TCP I/O: a single RECV is always in-flight for DataBatch frames, and SEND is submitted when an ack becomes ready. It publishes decoded events to the input disruptor and sends the raw journal bytes to the journal stage via a bounded lock-free SPSC ring (8 slots). The journal stage submits async `Write+RWF_DSYNC` operations via io_uring, then consumes (and discards) the corresponding disruptor events after the CQE confirms durability.
+
+The SPSC ring + pipelined ack queue (8 entries) decouple the receiver's TCP loop from NVMe write latency — the receiver can push up to 8 batches ahead while previous writes are in flight. Acks are sent as soon as the journal cursor confirms durability, checked on every event loop iteration with zero syscall overhead.
 
 ## CLI Flags
 

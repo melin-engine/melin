@@ -50,6 +50,7 @@
 #   RESULTS_DIR=<path>  Reuse existing results directory
 #   BENCH_BRANCH=<ref>  Checkout a specific branch on all machines
 #   BENCH_COMMIT=<hash> Checkout a specific commit (mutually exclusive with BENCH_BRANCH)
+#   CLEAN_BUILD=1       Run cargo clean before building (forces full recompile)
 #
 # Special values:
 #   TRANSPORTS=all      All transports valid for the available infrastructure
@@ -279,10 +280,16 @@ if [[ "$NEED_NOPERSIST" == "1" ]]; then
     EXTRA_BUILD="&& cargo build --release --features no-persist"
 fi
 
+CLEAN_CMD=""
+if [[ "${CLEAN_BUILD:-0}" == "1" ]]; then
+    CLEAN_CMD="cargo clean &&"
+    echo "  (CLEAN_BUILD=1 — full recompile)"
+fi
+
 for HOST in "${BUILD_HOSTS[@]}"; do
     echo "  Building on ${HOST}..."
     ssh $SSH_OPTS "$HOST" "cd ${REPO_DIR} && ${GIT_CMD} && source ~/.cargo/env && \
-        cargo build --release ${EXTRA_BUILD}" 2>&1 | tail -3
+        ${CLEAN_CMD} cargo build --release ${EXTRA_BUILD}" 2>&1 | tail -3
 done
 
 # DPDK build on server (and replica if dpdk-repl).
@@ -509,6 +516,7 @@ transport_start_tcp_repl() {
             --journal ${JOURNAL_PATH} \
             --authorized-keys ${REPO_DIR}/authorized_keys \
             --replication-bind ${SERVER_VLAN}:${REPL_PORT} \
+            ${SERVER_EXTRA_ARGS:-} \
         >/tmp/melin-server.log 2>&1 </dev/null &" </dev/null
 
     wait_for_log "$SERVER" "/tmp/melin-server.log" "replication sender listening" 30 "Replication listener"
@@ -553,6 +561,7 @@ transport_start_tcp_dual_repl() {
             --journal ${JOURNAL_PATH} \
             --authorized-keys ${REPO_DIR}/authorized_keys \
             --replication-bind ${SERVER_VLAN}:${REPL_PORT} \
+            ${SERVER_EXTRA_ARGS:-} \
         >/tmp/melin-server.log 2>&1 </dev/null &" </dev/null
 
     wait_for_log "$SERVER" "/tmp/melin-server.log" "replication sender listening" 30 "Replication listener"
