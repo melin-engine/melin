@@ -56,6 +56,12 @@ The latency floor — one order at a time, no pipelining, no queuing.
 
 ![Latency stability — dual replication](docs/plots/latency-stability-tcp-dual-repl-throughput.png)
 
+### Going further
+
+- **DPDK kernel bypass** for both client and replication transport is under active experimentation and should bring significant latency and throughput improvements by eliminating kernel TCP overhead entirely.
+- **SPDK** and **dual-NVMe hedged writes** are being evaluated to reduce journal fsync tail latency.
+- **Instrument-level sharding** of the matching engine across multiple cores would lift the single-threaded matching bottleneck for workloads spanning many independent order books.
+
 ## Features
 
 ### Order Types
