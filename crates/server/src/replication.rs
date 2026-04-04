@@ -3182,9 +3182,6 @@ pub fn run_sender_dpdk(
         /// Per-slot acked cursor. `u64::MAX` when not streaming —
         /// doesn't block the replication cursor (min of both slots).
         acked_cursor: u64,
-        /// When the ring was last full (consumer.try_read() returned None
-        /// while in Streaming state). Used for eviction timeout detection.
-        ring_full_since: Option<std::time::Instant>,
     }
 
     let [consumer_0, consumer_1] = repl_consumers;
@@ -3203,7 +3200,6 @@ pub fn run_sender_dpdk(
             last_sequence: 0,
             last_chain_hash: [0u8; 32],
             acked_cursor: u64::MAX,
-            ring_full_since: None,
         },
         DpdkReplicaSlot {
             state: SlotState::Idle,
@@ -3216,13 +3212,8 @@ pub fn run_sender_dpdk(
             last_sequence: 0,
             last_chain_hash: [0u8; 32],
             acked_cursor: u64::MAX,
-            ring_full_since: None,
         },
     ];
-
-    /// Eviction timeout: disconnect replicas that can't keep up with the
-    /// ring for this long. Matches the journal stage's publish timeout.
-    const EVICTION_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(500);
 
     loop {
         if shutdown.load(Ordering::Relaxed) {
@@ -3266,7 +3257,6 @@ pub fn run_sender_dpdk(
                 metrics.acked_sequence[i].store(0, Ordering::Relaxed);
                 metrics.catching_up[i].store(false, Ordering::Relaxed);
                 slot.acked_cursor = u64::MAX;
-                slot.ring_full_since = None;
                 slot.recv_buf.clear();
                 slot.state = SlotState::Idle;
                 replicas_connected.fetch_sub(1, Ordering::Release);
@@ -3423,7 +3413,6 @@ pub fn run_sender_dpdk(
                                     slot.last_sequence = h.last_sequence;
                                     slot.last_chain_hash = h.chain_hash;
                                     slot.last_send = std::time::Instant::now();
-                                    slot.ring_full_since = None;
 
                                     // Drain overlapping ring entries from catch-up.
                                     while let Some((meta, _data)) = slot.consumer.try_read() {
@@ -3519,9 +3508,11 @@ pub fn run_sender_dpdk(
                                     metrics.acked_sequence[slot_idx]
                                         .store(ack.acked_sequence, Ordering::Relaxed);
                                     // Update global cursor to min of both slots.
+                                    // Use store (not fetch_max): when a second replica
+                                    // connects with a lower acked position, the cursor
+                                    // must decrease to reflect the new min.
                                     let min_cursor = slot.acked_cursor.min(other_acked);
-                                    let _ =
-                                        replication_cursor.fetch_max(min_cursor, Ordering::Release);
+                                    replication_cursor.store(min_cursor, Ordering::Release);
                                 }
                                 consumed += frame_end;
                             }
@@ -3541,7 +3532,6 @@ pub fn run_sender_dpdk(
                         transport.close(handle);
                         slot.active_flag.store(false, Ordering::Release);
                         slot.acked_cursor = u64::MAX;
-                        slot.ring_full_since = None;
                         metrics.acked_sequence[slot_idx].store(0, Ordering::Relaxed);
                         slot.recv_buf.clear();
                         slot.state = SlotState::Idle;
@@ -3557,7 +3547,6 @@ pub fn run_sender_dpdk(
                     slot.send_buf.clear();
                     let mut batches_sent = 0;
                     if let Some((meta, data)) = slot.consumer.try_read() {
-                        slot.ring_full_since = None;
                         encode_data_batch(
                             meta.end_sequence,
                             &meta.chain_hash,
@@ -3593,14 +3582,6 @@ pub fn run_sender_dpdk(
                             .fetch_add(slot.send_buf.len() as u64, Ordering::Relaxed);
                         transport.queue_send(handle, &slot.send_buf);
                         slot.last_send = std::time::Instant::now();
-                    } else if matches!(slot.state, SlotState::Streaming(_)) {
-                        // Ring empty — track for eviction timeout.
-                        // Only start the timer if the evict_flag is already set
-                        // (meaning the journal stage is blocked on this ring).
-                        if slot.evict_flag.load(Ordering::Relaxed) && slot.ring_full_since.is_none()
-                        {
-                            slot.ring_full_since = Some(std::time::Instant::now());
-                        }
                     }
 
                     // 3. Heartbeat if idle.
@@ -3620,7 +3601,6 @@ pub fn run_sender_dpdk(
                         warn!(slot = slot_idx, "replica disconnected (DPDK)");
                         slot.active_flag.store(false, Ordering::Release);
                         slot.acked_cursor = u64::MAX;
-                        slot.ring_full_since = None;
                         metrics.acked_sequence[slot_idx].store(0, Ordering::Relaxed);
                         slot.recv_buf.clear();
                         slot.state = SlotState::Idle;
@@ -3632,29 +3612,10 @@ pub fn run_sender_dpdk(
                         continue;
                     }
 
-                    // 5. Eviction timeout — replica too slow.
-                    if let Some(since) = slot.ring_full_since
-                        && since.elapsed() >= EVICTION_TIMEOUT
-                    {
-                        metrics.evictions_total.fetch_add(1, Ordering::Relaxed);
-                        warn!(
-                            slot = slot_idx,
-                            "evicting slow replica (ring drain timeout, DPDK)"
-                        );
-                        transport.close(handle);
-                        slot.active_flag.store(false, Ordering::Release);
-                        slot.evict_flag.store(false, Ordering::Release);
-                        slot.acked_cursor = u64::MAX;
-                        slot.ring_full_since = None;
-                        metrics.acked_sequence[slot_idx].store(0, Ordering::Relaxed);
-                        slot.recv_buf.clear();
-                        slot.state = SlotState::Idle;
-                        replicas_connected.fetch_sub(1, Ordering::Release);
-                        if replicas_connected.load(Ordering::Relaxed) == 0 {
-                            replication_cursor.store(u64::MAX, Ordering::Release);
-                            warn!("all replicas disconnected — trading halted");
-                        }
-                    }
+                    // Eviction is handled by the journal-stage evict_flag check
+                    // at the top of the loop (lines 3254+). No timeout-based
+                    // eviction here — try_read() returning None means the
+                    // consumer caught up, not that it's slow.
                 }
             }
         }
@@ -3756,6 +3717,12 @@ fn catch_up_from_journal_dpdk(
             // Flush TX periodically to keep smoltcp and the NIC flowing.
             transport.poll();
 
+            if !transport.is_active(handle) {
+                return Err(io::Error::other(
+                    "replica disconnected during journal catch-up",
+                ));
+            }
+
             end_sequence = batch_end_seq;
             batches_sent += 1;
         }
@@ -3830,6 +3797,11 @@ fn snapshot_transfer_dpdk(
         // Flush periodically to avoid overwhelming the TX queue.
         if offset % (CHUNK_SIZE * 8) == 0 {
             transport.poll();
+            if !transport.is_active(handle) {
+                return Err(io::Error::other(
+                    "replica disconnected during snapshot transfer",
+                ));
+            }
         }
         offset = end;
     }
@@ -4015,7 +3987,13 @@ pub fn run_receiver_dpdk(
                         PrimaryMessage::NeedSnapshot => {
                             info!("primary requires snapshot transfer — receiving snapshot (DPDK)");
 
-                            // Remove stale local state.
+                            // Remove stale local state. Invalidate the in-memory
+                            // Exchange and JournalWriter — their underlying files
+                            // are about to be deleted. Without this, a failed
+                            // snapshot transfer would leave stale state that
+                            // the reconnect loop mistakes for valid.
+                            exchange = None;
+                            journal_writer = None;
                             let _ = std::fs::remove_file(journal_path);
                             let _ = std::fs::remove_file(&snapshot_path);
 
@@ -4068,6 +4046,7 @@ pub fn run_receiver_dpdk(
 
             if !transport.is_active(handle) {
                 warn!("disconnected from primary during handshake (DPDK)");
+                transport.close(handle);
                 sleep_checking_flags(backoff, shutdown, promote);
                 backoff = (backoff * 2).min(MAX_BACKOFF);
                 break Vec::new(); // trigger reconnect via empty check
@@ -4075,8 +4054,9 @@ pub fn run_receiver_dpdk(
             std::thread::yield_now();
         };
 
-        // If genesis entry is empty, we failed handshake — reconnect.
-        if primary_genesis_entry.is_empty() && journal_writer.is_none() {
+        // Empty genesis entry means the handshake loop exited via a
+        // failure path (disconnect or snapshot error) — reconnect.
+        if primary_genesis_entry.is_empty() {
             continue;
         }
 
