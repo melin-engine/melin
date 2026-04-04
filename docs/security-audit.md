@@ -18,9 +18,9 @@ The primary risks are:
 
 ### SEC-01: Response stage blocks on slow clients (HIGH)
 
-**File**: `crates/server/src/response.rs:298`
+**File**: `crates/server/src/response.rs`
 
-The response stage calls `BlockingFrameWriter::write_frame()` without a write timeout. If a client stops reading (closes read side or reads very slowly), the TCP send buffer fills and `write_all()` blocks. Since the response stage is a **single thread** serving all clients, one slow client stalls responses to every other client.
+The response stage writes to client sockets on a **single thread** serving all clients. If a client stops reading, one slow client could stall responses to every other client.
 
 **Impact**: Latency spike or complete stall for all clients.
 **Exploitable remotely**: Yes — connect, authenticate, stop reading.
@@ -144,7 +144,7 @@ Auth nonce uses `rand::fill(&mut nonce)` which defaults to the thread-local CSPR
 
 ### SEC-11: No explicit auth state on connections (LOW)
 
-**File**: `crates/server/src/reader.rs:173-198`
+**File**: `crates/server/src/reader.rs`
 
 Connection state has no `is_authenticated` field. Authentication is enforced structurally (only authenticated connections reach the reader), but a future refactor could accidentally allow unauthenticated traffic.
 

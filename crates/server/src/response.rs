@@ -1,19 +1,22 @@
-//! Response stage — routes matching output directly to connection sockets.
+//! io_uring-based response stage — routes matching output to connections via
+//! `IORING_OP_SEND`.
 //!
-//! Consumes from the output disruptor ring (matching → response) and writes
-//! encoded responses directly to each connection's blocking socket writer.
-//! Before sending, waits for the journal cursor to confirm durability —
-//! this is the persist-before-ack boundary.
+//! Replaces the blocking `write(2)` + `BufWriter` flush path with batched
+//! io_uring sends. Instead of N `write(2)` syscalls (one per dirty connection
+//! on flush), we submit N SEND SQEs in a single `io_uring_enter` call.
 //!
-//! Runs on a dedicated OS thread. No tokio involvement — eliminates
-//! async scheduling jitter from the response path.
+//! Same SPSC consumption and journal cursor gating as `response.rs`.
+//! Runs on a dedicated OS thread.
 
 use std::collections::{HashMap, HashSet};
-use std::io::Write;
+use std::os::unix::io::RawFd;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
+
+use io_uring::{IoUring, opcode, types};
+use tracing::{debug, error};
 
 use melin_disruptor::padding::Sequence;
 use melin_disruptor::ring;
@@ -22,7 +25,6 @@ use melin_engine::journal::pipeline::{OutputPayload, OutputSlot};
 #[cfg(feature = "latency-trace")]
 use melin_engine::journal::trace;
 
-use melin_protocol::blocking::BlockingFrameWriter;
 use melin_protocol::codec;
 use melin_protocol::message::ResponseKind;
 
@@ -33,54 +35,54 @@ const MAX_BATCH: usize = 1024;
 /// so 128 bytes is generous.
 const MAX_RESPONSE_BUF: usize = 128;
 
-/// Control plane events for connection registration.
-///
-/// Sent on a `std::sync::mpsc` channel (not the disruptor) because
-/// connect/disconnect is rare and not on the hot path.
-///
-/// Uses `Box<dyn Write + Send>` to erase the concrete stream type
-/// (TCP or UDS). The vtable dispatch cost is negligible compared to
-/// the syscall cost of write_all.
-pub enum ControlEvent {
-    /// Register a new connection's blocking writer.
-    Connected {
-        connection_id: u64,
-        writer: BlockingFrameWriter<Box<dyn Write + Send>>,
-    },
-    /// Remove a disconnected connection's writer.
-    Disconnected { connection_id: u64 },
-}
+/// io_uring submission queue depth for sends. Must be ≥ max concurrent
+/// connections to avoid SQ overflow when all connections are dirty.
+/// Power of 2 for io_uring alignment. 4096 supports 1024+ client
+/// benchmarks where all connections flush simultaneously.
+const RING_SIZE: u32 = 4096;
 
-/// Per-connection state for the response stage.
-struct ConnectionState {
-    writer: BlockingFrameWriter<Box<dyn Write + Send>>,
+/// Maximum accumulated send buffer per connection (64 KiB). If a client
+/// falls behind and the buffer exceeds this, the connection is dropped.
+/// 64 KiB holds ~500 response frames — well beyond any reasonable lag.
+const MAX_SEND_BUF: usize = 64 * 1024;
+
+pub use crate::server::ControlEvent;
+
+/// Per-connection state for batched io_uring sends.
+struct ConnectionEntry {
+    fd: RawFd,
+    /// Owns the write half of the socket to keep the fd alive.
+    _owner: Box<dyn Send>,
+    /// Accumulates encoded response frames between flushes.
+    /// The full wire frame (length prefix + payload) is appended here.
+    /// Vec's internal data pointer is heap-stable, so io_uring SEND SQEs
+    /// referencing `as_ptr()` remain valid even if the HashMap relocates
+    /// this struct — as long as we don't reallocate the Vec during in-flight sends.
+    send_buf: Vec<u8>,
     /// Last time data was sent to this connection. Used for heartbeat scheduling.
     last_send: Instant,
 }
 
-/// Run the response stage loop. Blocks the calling thread until shutdown.
+/// Run the io_uring response stage loop. Blocks the calling thread until shutdown.
 ///
-/// Consumes from the output ring and writes encoded responses directly
-/// to each connection's socket. For each output slot, waits until both
-/// the journal cursor and replication cursor have advanced past `input_seq`
-/// before writing — ensuring the client never receives a response for an
-/// event that isn't yet durable locally AND replicated.
-///
-/// When replication is disabled (standalone mode), `replication_cursor` is
-/// initialized to `u64::MAX` so `min(journal, MAX) = journal`.
+/// Same semantics as `response::run` — consumes from the output SPSC, waits
+/// for journal + replication durability, and sends responses — but uses
+/// io_uring SEND instead of blocking `write(2)` syscalls.
 pub fn run(
     mut consumer: ring::Consumer<OutputSlot>,
     control_rx: mpsc::Receiver<ControlEvent>,
     journal_cursor: Arc<Sequence>,
-    replication_cursor: Arc<AtomicU64>,
+    replication_cursor: Arc<std::sync::atomic::AtomicU64>,
     shutdown: &AtomicBool,
     heartbeat_interval: Option<Duration>,
-    active_connections: Arc<AtomicU64>,
     busy_spin: bool,
 ) {
-    // Connection table: maps connection IDs to their state (writer + last_send).
+    let mut ring =
+        IoUring::new(RING_SIZE).expect("failed to create io_uring instance for response stage");
+
+    // Connection table: maps connection IDs to their state.
     // HashMap for O(1) lookup. Pre-sized for a reasonable number of concurrent clients.
-    let mut connections: HashMap<u64, ConnectionState> = HashMap::with_capacity(256);
+    let mut connections: HashMap<u64, ConnectionEntry> = HashMap::with_capacity(256);
 
     let mut batch = [OutputSlot::default(); MAX_BATCH];
     let mut encode_buf = [0u8; MAX_RESPONSE_BUF];
@@ -88,13 +90,6 @@ pub fn run(
     // Cached journal cursor value to avoid atomic reads on every slot.
     #[cfg(not(feature = "no-fsync"))]
     let mut cached_journal_pos: u64 = 0;
-    // Track which cursor is the bottleneck when the response stage waits.
-    // journal_gated: journal_cursor < needed when we first enter the wait.
-    // repl_gated: replication_cursor < needed when we first enter the wait.
-    #[cfg(not(feature = "no-fsync"))]
-    let mut journal_gated: u64 = 0;
-    #[cfg(not(feature = "no-fsync"))]
-    let mut repl_gated: u64 = 0;
     // Suppress unused warnings when journal gating is disabled.
     #[cfg(feature = "no-fsync")]
     let _ = (&journal_cursor, &replication_cursor);
@@ -110,25 +105,29 @@ pub fn run(
         trace::StageHistogram::new("server e2e (reader recv → response flush)");
 
     // Track connections with buffered (unflushed) writes across batches.
-    // Under high load, we process many SPSC batches before flushing,
-    // amortizing the cost of N flush syscalls (one per connection) across
-    // many batches instead of paying it every batch.
     let mut dirty_connections: HashSet<u64> = HashSet::new();
 
-    // Pre-encode the heartbeat response frame once. Tag-only (1 byte payload).
-    let heartbeat_frame = {
+    // Connections to remove after flush (send errors).
+    let mut to_remove: Vec<u64> = Vec::new();
+
+    // Pre-allocated CQE collection buffer. Must collect CQEs before
+    // processing because the CQ borrow must end before mutating connections.
+    // Pre-sized to RING_SIZE to avoid per-iteration heap allocation.
+    let mut cqes: Vec<(u64, i32)> = Vec::with_capacity(RING_SIZE as usize);
+
+    // Pre-encode the heartbeat response frame once. Full wire frame
+    // (length prefix + tag) for direct append to send_buf.
+    let heartbeat_wire_frame = {
         let mut buf = [0u8; 8];
         let written =
             codec::encode_response(&ResponseKind::Heartbeat, &mut buf).expect("heartbeat encodes");
-        // write_frame expects payload without length prefix.
-        buf[4..written].to_vec()
+        buf[..written].to_vec()
     };
 
     // Coarse timestamp for heartbeat scan — avoids Instant::now() on every spin.
     let mut last_heartbeat_scan = Instant::now();
 
-    // Adaptive spin: spin first (fast wakeup), yield after threshold
-    // to avoid aggressive OS preemption of this pipeline thread.
+    // Adaptive spin: spin first (fast wakeup), yield after threshold.
     let mut idle_spins: u32 = 0;
 
     #[cfg(feature = "pipeline-stats")]
@@ -138,14 +137,16 @@ pub fn run(
 
     loop {
         if shutdown.load(Ordering::Relaxed) {
-            // Flush any remaining buffered writes before shutdown.
-            // Best-effort: clients may have disconnected already.
-            for conn_id in &dirty_connections {
-                if let Some(state) = connections.get_mut(conn_id)
-                    && let Err(e) = state.writer.flush()
-                {
-                    tracing::debug!(conn = conn_id, "flush on shutdown: {e}");
-                }
+            // Best-effort flush before shutdown.
+            if !dirty_connections.is_empty() {
+                flush_sends(
+                    &mut ring,
+                    &mut connections,
+                    &dirty_connections,
+                    &mut to_remove,
+                    &mut cqes,
+                );
+                dirty_connections.clear();
             }
             #[cfg(feature = "latency-trace")]
             {
@@ -155,19 +156,6 @@ pub fn run(
             }
             #[cfg(feature = "pipeline-stats")]
             print_utilization("response", busy_count, idle_count);
-            #[cfg(not(feature = "no-fsync"))]
-            {
-                let total = journal_gated + repl_gated;
-                if total > 0 {
-                    tracing::info!(
-                        journal_gated,
-                        repl_gated,
-                        total,
-                        repl_pct = repl_gated * 100 / total,
-                        "response gate stats"
-                    );
-                }
-            }
             return;
         }
 
@@ -176,20 +164,24 @@ pub fn run(
             match event {
                 ControlEvent::Connected {
                     connection_id,
+                    fd,
                     writer,
                 } => {
+                    // The writer keeps the fd alive — store it as the owner.
+                    let owner: Box<dyn Send> = Box::new(writer);
                     connections.insert(
                         connection_id,
-                        ConnectionState {
-                            writer,
+                        ConnectionEntry {
+                            fd,
+                            _owner: owner,
+                            send_buf: Vec::with_capacity(4096),
                             last_send: Instant::now(),
                         },
                     );
                 }
                 ControlEvent::Disconnected { connection_id } => {
-                    if connections.remove(&connection_id).is_some() {
-                        active_connections.fetch_sub(1, Ordering::Relaxed);
-                    }
+                    connections.remove(&connection_id);
+                    dirty_connections.remove(&connection_id);
                 }
             }
         }
@@ -197,25 +189,19 @@ pub fn run(
         // Consume output slots from matching stage.
         let count = consumer.consume_batch(&mut batch, MAX_BATCH);
         if count == 0 {
-            // SPSC is empty — flush all dirty connections before spinning.
-            // This is the adaptive flushing strategy: under high load, we
-            // process many batches before reaching this point, amortizing
-            // flush syscall overhead across thousands of entries. Under low
-            // load, we reach this quickly and flush promptly.
+            // SPSC is empty — flush all dirty connections via io_uring.
             if !dirty_connections.is_empty() {
-                for conn_id in dirty_connections.drain() {
-                    if let Some(state) = connections.get_mut(&conn_id)
-                        && let Err(e) = state.writer.flush()
-                    {
-                        tracing::debug!(
-                            connection_id = conn_id,
-                            error = %e,
-                            "flush error, dropping connection"
-                        );
-                        connections.remove(&conn_id);
-                        active_connections.fetch_sub(1, Ordering::Relaxed);
-                    }
+                flush_sends(
+                    &mut ring,
+                    &mut connections,
+                    &dirty_connections,
+                    &mut to_remove,
+                    &mut cqes,
+                );
+                for conn_id in to_remove.drain(..) {
+                    connections.remove(&conn_id);
                 }
+                dirty_connections.clear();
             }
 
             // Send heartbeats to idle connections. Only checked during
@@ -225,36 +211,30 @@ pub fn run(
                 // Coarse gate: only scan at most once per second.
                 if now.duration_since(last_heartbeat_scan) >= Duration::from_secs(1) {
                     last_heartbeat_scan = now;
-                    let mut failed: Vec<u64> = Vec::new();
-                    for (&conn_id, state) in connections.iter_mut() {
-                        if now.duration_since(state.last_send) >= interval {
-                            if let Err(e) = state.writer.write_frame(&heartbeat_frame) {
-                                tracing::debug!(
-                                    connection_id = conn_id,
-                                    error = %e,
-                                    "heartbeat write error, dropping connection"
-                                );
-                                failed.push(conn_id);
-                                continue;
-                            }
-                            if let Err(e) = state.writer.flush() {
-                                tracing::debug!(
-                                    connection_id = conn_id,
-                                    error = %e,
-                                    "heartbeat flush error, dropping connection"
-                                );
-                                failed.push(conn_id);
-                                continue;
-                            }
-                            state.last_send = now;
+                    for (&conn_id, entry) in connections.iter_mut() {
+                        if now.duration_since(entry.last_send) >= interval {
+                            entry.send_buf.extend_from_slice(&heartbeat_wire_frame);
+                            dirty_connections.insert(conn_id);
+                            entry.last_send = now;
                         }
                     }
-                    for conn_id in failed {
-                        connections.remove(&conn_id);
-                        active_connections.fetch_sub(1, Ordering::Relaxed);
+                    // Flush the heartbeat sends immediately.
+                    if !dirty_connections.is_empty() {
+                        flush_sends(
+                            &mut ring,
+                            &mut connections,
+                            &dirty_connections,
+                            &mut to_remove,
+                            &mut cqes,
+                        );
+                        for conn_id in to_remove.drain(..) {
+                            connections.remove(&conn_id);
+                        }
+                        dirty_connections.clear();
                     }
                 }
             }
+
             #[cfg(feature = "pipeline-stats")]
             {
                 idle_count += 1;
@@ -276,14 +256,7 @@ pub fn run(
         #[cfg(feature = "latency-trace")]
         let consume_ts = trace::trace_ts();
 
-        // Wait for both journal AND replication to confirm the entire batch.
-        // Find the highest input_seq in the batch and wait once, rather
-        // than spin-waiting per event. This eliminates redundant atomic
-        // loads when the batch contains many events from different clients.
-        //
-        // The effective cursor is min(journal_cursor, replication_cursor).
-        // When replication is disabled, replication_cursor = u64::MAX so
-        // min(journal, MAX) = journal — no change in behavior.
+        // Wait for both journal AND replication to confirm the batch.
         #[cfg(not(feature = "no-fsync"))]
         {
             let max_seq = batch[..count]
@@ -293,28 +266,18 @@ pub fn run(
                 .expect("non-empty batch");
             let needed = max_seq + 1;
             if cached_journal_pos < needed {
-                // Snapshot which cursor(s) are behind on the first
-                // iteration to identify the bottleneck.
-                let journal_pos = journal_cursor.get().load(Ordering::Acquire);
-                let repl_pos = replication_cursor.load(Ordering::Acquire);
-                if journal_pos < needed {
-                    journal_gated += 1;
-                }
-                if repl_pos < needed {
-                    repl_gated += 1;
-                }
-                cached_journal_pos = journal_pos.min(repl_pos);
-                while cached_journal_pos < needed {
-                    std::hint::spin_loop();
+                loop {
                     let journal_pos = journal_cursor.get().load(Ordering::Acquire);
                     let repl_pos = replication_cursor.load(Ordering::Acquire);
                     cached_journal_pos = journal_pos.min(repl_pos);
+                    if cached_journal_pos >= needed {
+                        break;
+                    }
+                    std::hint::spin_loop();
                 }
             }
         }
 
-        // One Instant::now() per batch for heartbeat tracking instead of
-        // per response — heartbeat interval is 10s, sub-ms precision is plenty.
         let batch_now = Instant::now();
 
         for slot in &batch[..count] {
@@ -336,8 +299,8 @@ pub fn run(
                 },
             };
 
-            if let Some(state) = connections.get_mut(&slot.connection_id) {
-                // Encode the response directly to wire format.
+            if let Some(entry) = connections.get_mut(&slot.connection_id) {
+                // Encode the response (includes 4-byte length prefix).
                 let written = match codec::encode_response(&kind, &mut encode_buf) {
                     Ok(n) => n,
                     Err(e) => {
@@ -350,20 +313,24 @@ pub fn run(
                     }
                 };
 
-                // write_frame expects the payload (tag + fields), not the
-                // length prefix. encode_response writes [length(4) | tag+payload].
-                if let Err(e) = state.writer.write_frame(&encode_buf[4..written]) {
-                    tracing::debug!(
+                // Drop slow clients whose send buffer has grown too large.
+                // This prevents unbounded memory growth from a single laggy
+                // connection causing allocator pressure and tail latency spikes.
+                if entry.send_buf.len() + written > MAX_SEND_BUF {
+                    debug!(
                         connection_id = slot.connection_id,
-                        error = %e,
-                        "write error, dropping connection"
+                        send_buf_len = entry.send_buf.len(),
+                        "send buffer exceeded limit, dropping connection"
                     );
-                    connections.remove(&slot.connection_id);
-                    active_connections.fetch_sub(1, Ordering::Relaxed);
+                    to_remove.push(slot.connection_id);
                     continue;
                 }
 
-                state.last_send = batch_now;
+                // Append the full wire frame to the connection's send buffer.
+                // encode_response writes [length(4) | payload], which is the
+                // complete wire format — no extra framing needed.
+                entry.send_buf.extend_from_slice(&encode_buf[..written]);
+                entry.last_send = batch_now;
                 dirty_connections.insert(slot.connection_id);
 
                 // Record server-side end-to-end: reader recv → response flush.
@@ -375,8 +342,141 @@ pub fn run(
             }
         }
 
+        // Remove connections that exceeded the send buffer limit.
+        for conn_id in to_remove.drain(..) {
+            connections.remove(&conn_id);
+            dirty_connections.remove(&conn_id);
+        }
+
         #[cfg(feature = "latency-trace")]
         dispatch_hist.record_ns(trace::trace_elapsed_ns(consume_ts, trace::trace_ts()));
+    }
+}
+
+/// Submit io_uring SEND SQEs for all dirty connections and wait for completions.
+///
+/// Each dirty connection's accumulated send buffer is sent in a single SEND
+/// operation. Partial sends are retried until all bytes are delivered.
+/// Failed connections are collected in `to_remove` for the caller to clean up.
+fn flush_sends(
+    ring: &mut IoUring,
+    connections: &mut HashMap<u64, ConnectionEntry>,
+    dirty: &HashSet<u64>,
+    to_remove: &mut Vec<u64>,
+    cqes: &mut Vec<(u64, i32)>,
+) {
+    // Submit SEND SQEs for all dirty connections.
+    let mut pending: usize = 0;
+    for &conn_id in dirty {
+        if let Some(entry) = connections.get(&conn_id) {
+            if entry.send_buf.is_empty() {
+                continue;
+            }
+            let sqe = opcode::Send::new(
+                types::Fd(entry.fd),
+                entry.send_buf.as_ptr(),
+                entry.send_buf.len() as u32,
+            )
+            .build()
+            .user_data(conn_id);
+
+            unsafe {
+                ring.submission()
+                    .push(&sqe)
+                    .expect("io_uring SQ full — increase RING_SIZE");
+            }
+            pending += 1;
+        }
+    }
+
+    if pending == 0 {
+        return;
+    }
+
+    // Submit and wait for all completions.
+    if let Err(e) = ring.submit_and_wait(pending) {
+        error!(error = %e, "io_uring submit_and_wait failed in response stage");
+        return;
+    }
+
+    // Drain completions into pre-allocated buffer. Must collect to
+    // release CQ borrow before mutating connections.
+    cqes.clear();
+    cqes.extend(ring.completion().map(|cqe| (cqe.user_data(), cqe.result())));
+
+    for &(conn_id, result) in cqes.iter() {
+        if result < 0 {
+            debug!(
+                connection_id = conn_id,
+                error = result,
+                "send error, dropping connection"
+            );
+            to_remove.push(conn_id);
+            continue;
+        }
+
+        let sent = result as usize;
+        if let Some(entry) = connections.get_mut(&conn_id) {
+            if sent >= entry.send_buf.len() {
+                entry.send_buf.clear();
+            } else {
+                // Partial send — drain sent bytes, retry remainder.
+                // Rare for small response frames over TCP/UDS but must
+                // be handled for correctness (e.g., send buffer pressure).
+                entry.send_buf.drain(..sent);
+                retry_send(ring, entry, conn_id, to_remove);
+            }
+        }
+    }
+}
+
+/// Retry sending remaining bytes after a partial send. Loops until the
+/// entire buffer is delivered or an error occurs.
+fn retry_send(
+    ring: &mut IoUring,
+    entry: &mut ConnectionEntry,
+    conn_id: u64,
+    to_remove: &mut Vec<u64>,
+) {
+    while !entry.send_buf.is_empty() {
+        let sqe = opcode::Send::new(
+            types::Fd(entry.fd),
+            entry.send_buf.as_ptr(),
+            entry.send_buf.len() as u32,
+        )
+        .build()
+        .user_data(conn_id);
+
+        unsafe {
+            ring.submission()
+                .push(&sqe)
+                .expect("io_uring SQ full during send retry");
+        }
+
+        if let Err(e) = ring.submit_and_wait(1) {
+            debug!(connection_id = conn_id, error = %e, "send retry failed");
+            to_remove.push(conn_id);
+            return;
+        }
+
+        if let Some(cqe) = ring.completion().next() {
+            let result = cqe.result();
+            if result <= 0 {
+                debug!(
+                    connection_id = conn_id,
+                    error = result,
+                    "send retry error, dropping connection"
+                );
+                to_remove.push(conn_id);
+                return;
+            }
+            let sent = result as usize;
+            if sent >= entry.send_buf.len() {
+                entry.send_buf.clear();
+            } else {
+                entry.send_buf.drain(..sent);
+            }
+        }
     }
 }
 

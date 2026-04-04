@@ -7,7 +7,7 @@
 #
 # Flow:
 #   1. Allocate hugepages (if needed)
-#   2. Build server with --features dpdk (no io-uring)
+#   2. Build server with --features dpdk
 #   3. Build keygen + bench (default features)
 #   4. Generate auth keys
 #   5. Start server with DPDK TAP device

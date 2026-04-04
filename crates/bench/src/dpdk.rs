@@ -1,6 +1,6 @@
 //! DPDK kernel-bypass benchmark client.
 //!
-//! Replaces the epoll/io_uring event loop with a single-threaded smoltcp
+//! Replaces the io_uring event loop with a single-threaded smoltcp
 //! poll loop over DPDK. All connections share one smoltcp interface on
 //! one DPDK port. The bench client initiates outbound TCP connections
 //! to the server via `socket.connect()`.

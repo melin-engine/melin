@@ -14,10 +14,8 @@ no-persist = ["no-fsync"]
 ## Record per-stage latency histograms and print a summary on shutdown.
 ## Adds ~20ns of clock overhead per event. Not for production.
 latency-trace = ["dep:hdrhistogram"]
-## Enable io_uring-based overlapped journal writes. The journal stage submits
-## Write+RWF_DSYNC SQEs and accumulates the next batch while the NVMe FUA
-## write is in flight (double-buffering). Requires Linux 5.6+.
-io-uring = ["dep:io-uring"]
+## Kept for backward compatibility — io_uring is now always used.
+io-uring = []
 ## Print per-stage busy/idle utilization on shutdown. Identifies the pipeline
 ## bottleneck: the stage closest to 100% busy is the constraint.
 pipeline-stats = []
@@ -35,7 +33,7 @@ rustc-hash = "2"
 crc32c = "0.6"
 getrandom = "0.3"
 hdrhistogram = { version = "7", optional = true }
-io-uring = { version = "0.7", optional = true }
+io-uring = "0.7"
 libc = { workspace = true }
 tracing = { workspace = true }
 melin-disruptor = { path = "../disruptor" }

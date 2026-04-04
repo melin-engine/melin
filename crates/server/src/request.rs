@@ -1,5 +1,5 @@
 //! Shared request processing logic used by all transport backends
-//! (epoll reader, io_uring reader, DPDK transport).
+//! (io_uring reader, DPDK transport).
 //!
 //! Extracting these functions avoids duplicating critical permission
 //! enforcement and request→event conversion across transport impls.

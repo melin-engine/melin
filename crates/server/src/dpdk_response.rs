@@ -68,7 +68,7 @@ impl TxFrame {
 
 /// Control plane events for connection registration (DPDK variant).
 ///
-/// Unlike the epoll variant, this doesn't carry a socket writer —
+/// Unlike the TCP variant, this doesn't carry a socket writer —
 /// the DPDK poll thread owns all socket state.
 pub enum ControlEvent {
     /// A new connection was accepted by the DPDK poll thread.
@@ -79,7 +79,7 @@ pub enum ControlEvent {
 
 /// Run the DPDK response stage loop. Blocks the calling thread until shutdown.
 ///
-/// Identical to the epoll response stage except:
+/// Identical to the TCP response stage except:
 /// - No socket writers — encoded frames are sent via `tx_out` channel
 /// - No flush syscalls — the DPDK poll thread handles transmission
 /// - Heartbeats are sent via the same `tx_out` channel

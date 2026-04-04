@@ -438,47 +438,26 @@ impl JournalStage {
 
     /// Run the journal stage loop.
     ///
-    /// Dispatches to the io_uring overlapped path when the `io-uring`
-    /// feature is enabled and fsync is active. Falls back to the
-    /// synchronous `pwritev2+RWF_DSYNC` path otherwise.
+    /// Dispatches to the io_uring overlapped path for journal writes.
+    /// With `no-fsync` or `no-persist` features, falls back to
+    /// synchronous writes (io_uring overlapping is only useful with fsync).
     ///
     /// Returns the `JournalWriter` on shutdown for clean resource release.
     pub fn run(self, shutdown: &std::sync::atomic::AtomicBool) -> JournalWriter {
-        // Replica mode: write raw bytes from the replication receiver
-        // instead of encoding events from the disruptor.
+        let use_uring = !cfg!(feature = "no-fsync") && !cfg!(feature = "no-persist");
+
         if self.raw_journal_rx.is_some() {
-            #[cfg(all(
-                feature = "io-uring",
-                not(feature = "no-fsync"),
-                not(feature = "no-persist")
-            ))]
-            {
+            // Replica mode: write raw bytes from the replication receiver.
+            if use_uring {
                 return self.run_replica_uring(shutdown);
-            }
-            #[cfg(not(all(
-                feature = "io-uring",
-                not(feature = "no-fsync"),
-                not(feature = "no-persist")
-            )))]
-            {
+            } else {
                 return self.run_replica(shutdown);
             }
         }
 
-        #[cfg(all(
-            feature = "io-uring",
-            not(feature = "no-fsync"),
-            not(feature = "no-persist")
-        ))]
-        {
+        if use_uring {
             self.run_uring(shutdown)
-        }
-        #[cfg(not(all(
-            feature = "io-uring",
-            not(feature = "no-fsync"),
-            not(feature = "no-persist")
-        )))]
-        {
+        } else {
             self.run_sync(shutdown)
         }
     }
@@ -489,14 +468,6 @@ impl JournalStage {
     /// journal cursor is only advanced **after** the write is durable.
     /// The response stage checks this cursor before sending — this is
     /// the persist-before-ack boundary.
-    #[cfg_attr(
-        all(
-            feature = "io-uring",
-            not(feature = "no-fsync"),
-            not(feature = "no-persist")
-        ),
-        allow(dead_code)
-    )]
     fn run_sync(mut self, shutdown: &std::sync::atomic::AtomicBool) -> JournalWriter {
         #[cfg(not(feature = "no-fsync"))]
         use std::time::Instant;
@@ -678,11 +649,6 @@ impl JournalStage {
     /// receiver while consuming (and discarding) events from the disruptor
     /// to advance the cursor. The cursor advance happens AFTER `write_raw_sync`
     /// completes, preserving the persist-before-ack guarantee.
-    #[cfg(not(all(
-        feature = "io-uring",
-        not(feature = "no-fsync"),
-        not(feature = "no-persist")
-    )))]
     fn run_replica(mut self, shutdown: &std::sync::atomic::AtomicBool) -> JournalWriter {
         let rx = self
             .raw_journal_rx
@@ -742,11 +708,6 @@ impl JournalStage {
     ///
     /// This overlaps NVMe writes with TCP receives, eliminating the
     /// serialized write_raw_sync + cursor wait bottleneck.
-    #[cfg(all(
-        feature = "io-uring",
-        not(feature = "no-fsync"),
-        not(feature = "no-persist")
-    ))]
     /// Replica journal loop using io_uring overlapped writes.
     ///
     /// Receives pre-encoded journal batches from the replication handler
@@ -878,11 +839,6 @@ impl JournalStage {
     /// Consume exactly `count` events from the input disruptor,
     /// advancing the cursor. Used by the replica after an async raw
     /// write completes.
-    #[cfg(all(
-        feature = "io-uring",
-        not(feature = "no-fsync"),
-        not(feature = "no-persist")
-    ))]
     fn consume_disruptor_events(&mut self, batch: &mut [InputSlot], mut remaining: usize) {
         while remaining > 0 {
             let count = self
@@ -1013,11 +969,6 @@ impl JournalStage {
     ///
     /// Cursor only advances after the CQE confirms durability — the
     /// persist-before-ack guarantee is preserved.
-    #[cfg(all(
-        feature = "io-uring",
-        not(feature = "no-fsync"),
-        not(feature = "no-persist")
-    ))]
     fn run_uring(mut self, shutdown: &std::sync::atomic::AtomicBool) -> JournalWriter {
         use io_uring::{IoUring, opcode, types};
         use std::time::Instant;
@@ -1273,11 +1224,6 @@ impl JournalStage {
     /// IRQ affinity) and become visible here via the shared memory mapping.
     /// The journal thread is pinned to a dedicated core, so busy-polling
     /// is appropriate and avoids kernel sleep/wake jitter entirely.
-    #[cfg(all(
-        feature = "io-uring",
-        not(feature = "no-fsync"),
-        not(feature = "no-persist")
-    ))]
     fn wait_for_cqe(
         &self,
         ring: &mut io_uring::IoUring,

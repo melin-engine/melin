@@ -98,7 +98,7 @@ A server started with `--replica-of <primary_addr>` runs in replica mode:
 - The journal stage writes pre-encoded bytes from the primary via `write_raw_sync()` (byte-identical journals) instead of re-encoding events from the disruptor.
 - The matching stage replays events into a local `Exchange` to maintain warm state for promotion.
 - Sends `Ack` frames after the journal stage confirms durable write (cursor advance). Acks are pipelined: up to 8 batches can be submitted to the journal stage before the first ack is sent, overlapping NVMe writes with TCP receives.
-- Both the primary sender and replica receiver use io_uring for TCP I/O (async RECV/SEND), eliminating poll/read/write syscalls from the streaming hot path. The blocking fallback is used when io_uring is not available.
+- Both the primary sender and replica receiver use io_uring for TCP I/O (async RECV/SEND), eliminating poll/read/write syscalls from the streaming hot path.
 - The replica pipeline threads (journal, matching, drain, shadow) are pinned to the same cores as the primary, matching the `--cores` layout.
 - If the primary disconnects or evicts the replica, the receiver automatically reconnects with exponential backoff (1s → 30s cap), recovers state from the pipeline shutdown, and resumes from its last durable sequence.
 - The shadow stage runs on a dedicated thread with a cloned `Exchange`, saving periodic snapshots so a crash doesn't require replaying from genesis.

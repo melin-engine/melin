@@ -110,7 +110,7 @@ The latency floor — one order at a time, no pipelining, no queuing.
 ### [Networking](docs/wire-protocol.md)
 - Custom binary wire protocol (length-prefixed framing)
 - TCP, Unix domain socket, and DPDK kernel bypass transports
-- Epoll and io_uring transports with dedicated I/O threads
+- io_uring transport with dedicated I/O threads (multishot RECV, batched SEND)
 - Backpressure handling (reject when the input pipeline is full — client backs off and retries)
 - Output event channel — real-time broadcast of all execution events to authenticated subscribers; monotonic sequence numbers for gap detection
 

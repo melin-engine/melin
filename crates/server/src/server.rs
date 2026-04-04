@@ -5,14 +5,13 @@
 //! 2. Decomposes it into `(Exchange, JournalWriter)` via `into_parts()`.
 //! 3. Builds the disruptor pipeline (input ring + output ring).
 //! 4. Spawns 3-5 OS threads: journal, matching, response, [repl-sender], [event-publisher].
-//! 5. Runs the accept loop, registering connections with the epoll reader.
+//! 5. Runs the accept loop, registering connections with the io_uring reader.
 //!
-//! Fully synchronous — no async runtime needed. The single reader thread
-//! uses epoll to multiplex all connections, eliminating thread oversubscription.
-//! The response thread writes directly to sockets.
+//! Fully synchronous — no async runtime needed. Reader threads use io_uring
+//! with multishot RECV to multiplex connections, eliminating thread
+//! oversubscription. The response thread writes via io_uring SEND.
 
 use std::net::SocketAddr;
-#[cfg(feature = "io-uring")]
 use std::os::unix::io::AsRawFd;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -28,21 +27,9 @@ use melin_engine::journal::pipeline::build_pipeline_with_replication;
 use melin_engine::journal::writer::JournalWriter;
 
 use melin_protocol::auth::{AuthorizedKeys, Permission};
+use melin_protocol::blocking::BlockingFrameWriter;
 use melin_protocol::message::ConnectionId;
 use melin_protocol::transport::BlockingTransportListener;
-
-#[cfg(not(feature = "io-uring"))]
-use melin_protocol::blocking::BlockingFrameWriter;
-
-#[cfg(not(feature = "io-uring"))]
-use crate::reader::{self, ReaderRegistration};
-#[cfg(not(feature = "io-uring"))]
-use crate::response::ControlEvent;
-
-#[cfg(feature = "io-uring")]
-use crate::uring_reader::{self as reader, ReaderRegistration};
-#[cfg(feature = "io-uring")]
-use crate::uring_response::ControlEvent;
 
 /// Server configuration, parsed from CLI arguments via clap.
 #[derive(clap::Parser)]
@@ -64,7 +51,7 @@ pub struct ServerConfig {
     /// repl-handler-0/1 are for the per-replica TCP handler threads (0 = unpinned).
     #[arg(long, default_value = "1,2,3,6,7,8,9,10", value_parser = parse_cores)]
     pub cores: PipelineCores,
-    /// Number of epoll reader threads.
+    /// Number of io_uring reader threads.
     #[arg(long, default_value_t = 2)]
     pub readers: usize,
     /// First CPU core for reader thread pinning. Reader thread i is
@@ -508,6 +495,19 @@ pub fn run_with_shutdown<L: BlockingTransportListener>(
 /// pipeline threads, optionally seed instruments/accounts, then accept
 /// client connections.
 ///
+/// Control event for the response stage. The io_uring response path reads
+/// `fd` for I/O; the `writer` keeps the fd alive via ownership.
+pub enum ControlEvent {
+    Connected {
+        connection_id: u64,
+        fd: std::os::unix::io::RawFd,
+        writer: BlockingFrameWriter<Box<dyn std::io::Write + Send>>,
+    },
+    Disconnected {
+        connection_id: u64,
+    },
+}
+
 /// Used by both the normal primary startup path and the promotion path
 /// (replica → primary transition).
 fn run_as_primary<L: BlockingTransportListener>(
@@ -606,11 +606,11 @@ fn run_as_primary<L: BlockingTransportListener>(
     // Control channel for connect/disconnect events → response stage.
     let (control_tx, control_rx) = std::sync::mpsc::channel();
 
-    // Spawn the epoll reader thread pool. Connections are distributed
-    // round-robin across reader threads. Each thread uses epoll to
-    // multiplex its connections and MultiProducer to publish to the
-    // disruptor. With 2 readers (cores 4-5) + 3 pipeline (cores 1-3) =
-    // 5 pinned OS threads, no oversubscription even with hundreds of connections.
+    // Spawn the io_uring reader thread pool. Connections are distributed
+    // round-robin across reader threads. Each thread uses io_uring with
+    // multishot RECV to multiplex its connections and MultiProducer to
+    // publish to the disruptor. With 2 readers (cores 4-5) + 3 pipeline
+    // (cores 1-3) = 5 pinned OS threads, no oversubscription.
     let connection_timeout = config.connection_timeout();
     let heartbeat_interval = config.heartbeat_interval();
 
@@ -624,7 +624,7 @@ fn run_as_primary<L: BlockingTransportListener>(
     };
 
     let reader_shutdown = Arc::new(AtomicBool::new(false));
-    let mut reader_handle = reader::spawn_reader_pool(
+    let mut reader_handle = crate::reader::spawn_reader_pool(
         config.readers,
         input_producer,
         control_tx.clone(),
@@ -654,9 +654,6 @@ fn run_as_primary<L: BlockingTransportListener>(
         })
         .expect("failed to spawn matching thread");
 
-    #[cfg_attr(feature = "io-uring", allow(unused_variables))]
-    let active_connections_response = Arc::clone(&active_connections);
-
     // Clone cursors for the response thread — the originals are needed
     // later for seed drain gating.
     let journal_cursor_response = Arc::clone(&journal_cursor);
@@ -667,19 +664,7 @@ fn run_as_primary<L: BlockingTransportListener>(
         .name("response".into())
         .spawn(move || {
             apply_affinity("response", cores.response);
-            #[cfg(not(feature = "io-uring"))]
             crate::response::run(
-                output_consumer,
-                control_rx,
-                journal_cursor_response,
-                replication_cursor_response,
-                &s3,
-                heartbeat_interval,
-                active_connections_response,
-                busy_spin,
-            );
-            #[cfg(feature = "io-uring")]
-            crate::uring_response::run(
                 output_consumer,
                 control_rx,
                 journal_cursor_response,
@@ -1122,10 +1107,10 @@ fn run_as_primary<L: BlockingTransportListener>(
 
         active_connections.fetch_add(1, Ordering::Relaxed);
 
-        // Clear the read timeout before handing to the epoll reader.
-        // Epoll uses non-blocking I/O, so the timeout is irrelevant, but
-        // clearing it avoids surprising behavior if the fd is ever used
-        // in blocking mode again.
+        // Clear the read timeout before handing to the io_uring reader.
+        // io_uring uses kernel-managed I/O, so the timeout is irrelevant,
+        // but clearing it avoids surprising behavior if the fd is ever
+        // used in blocking mode again.
         if let Err(e) = set_read_timeout(&std_read, None) {
             debug!(connection_id = connection_id.0, error = %e, "failed to clear auth timeout");
         }
@@ -1141,31 +1126,20 @@ fn run_as_primary<L: BlockingTransportListener>(
         // Register the writer with the response thread before the reader.
         // This ensures the response stage has the writer before any
         // requests arrive from this connection.
-        #[cfg(not(feature = "io-uring"))]
-        let control_event = {
-            let boxed_writer: Box<dyn std::io::Write + Send> = Box::new(std_write);
-            ControlEvent::Connected {
-                connection_id: connection_id.0,
-                writer: BlockingFrameWriter::new(boxed_writer),
-            }
-        };
-        #[cfg(feature = "io-uring")]
-        let control_event = {
-            let fd = std_write.as_raw_fd();
-            let owner: Box<dyn Send> = Box::new(std_write);
-            ControlEvent::Connected {
-                connection_id: connection_id.0,
-                fd,
-                _owner: owner,
-            }
+        let fd = std_write.as_raw_fd();
+        let boxed_writer: Box<dyn std::io::Write + Send> = Box::new(std_write);
+        let control_event = ControlEvent::Connected {
+            connection_id: connection_id.0,
+            fd,
+            writer: BlockingFrameWriter::new(boxed_writer),
         };
         if control_tx.send(control_event).is_err() {
             info!("response thread gone, shutting down");
             break;
         }
 
-        // Register the reader fd with the epoll reader thread.
-        reader_handle.register(ReaderRegistration {
+        // Register the reader fd with the io_uring reader thread.
+        reader_handle.register(crate::reader::ReaderRegistration {
             connection_id,
             reader: std_read,
             addr,
@@ -1361,7 +1335,7 @@ pub fn run_dpdk(
 
     let active_connections = Arc::new(AtomicU64::new(0));
 
-    // Replication setup (same as epoll path).
+    // Replication setup (same as TCP path).
     let enable_replication = config.replication_bind.is_some();
     if enable_replication && config.standalone {
         return Err("--replication-bind and --standalone are mutually exclusive".into());
@@ -1443,7 +1417,7 @@ pub fn run_dpdk(
         tx_consumers.push(tx_rx);
     }
 
-    // Spawn pipeline threads (journal, matching — identical to epoll path).
+    // Spawn pipeline threads (journal, matching — identical to TCP path).
     let cores = config.cores;
 
     let s1 = Arc::clone(&shutdown);
@@ -1674,7 +1648,7 @@ pub fn run_dpdk(
     // Pipeline health flag: true while all pipeline threads are alive.
     let pipeline_healthy = Arc::new(AtomicBool::new(true));
 
-    // Spawn health/liveness endpoint (same as epoll path).
+    // Spawn health/liveness endpoint (same as TCP path).
     let health_handle = if let Some(health_addr) = config.health_bind {
         Some(crate::health::spawn(
             health_addr,
@@ -1929,7 +1903,7 @@ fn authenticate_connection<R: std::io::Read, W: std::io::Write>(
     // Read ChallengeResponse frame directly (no BufReader). Using raw
     // read_exact avoids BufReader over-reading bytes that belong to the
     // first post-auth request — those bytes would be lost when the
-    // BufReader is dropped and the fd moves to the epoll reader.
+    // BufReader is dropped and the fd moves to the io_uring reader.
     let mut len_buf = [0u8; 4];
     reader
         .read_exact(&mut len_buf)

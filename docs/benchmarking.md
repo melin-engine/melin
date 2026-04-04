@@ -12,7 +12,7 @@ Full end-to-end benchmark through the entire server. By default, an embedded ser
 
 What it measures: client-perceived round-trip latency including transport, reader pool, disruptor publication, journal fsync, matching engine execution, response stage, and the return trip through the socket.
 
-This mode uses either an io_uring-based single-threaded event loop (default, via the `io-uring` feature) or an epoll-based multi-threaded event loop (with `--no-default-features`). Each bench thread runs its own io_uring ring or epoll instance and manages a subset of connections.
+Each bench thread runs its own io_uring ring (RECV/SEND) and manages a subset of connections.
 
 ### `--mode=pipeline`
 
@@ -39,7 +39,7 @@ Why numbers differ from pipeline: there is no journal fsync, no ring buffer sync
 | Journal (fsync) | -- | yes | yes |
 | Response stage | -- | -- | yes |
 | TCP/UDS transport | -- | -- | yes |
-| Reader pool (epoll) | -- | -- | yes |
+| Reader pool (io_uring) | -- | -- | yes |
 | Ed25519 auth handshake | -- | -- | yes |
 
 ## Order Generation
@@ -89,7 +89,7 @@ cargo run --release -p melin-bench [-- [OPTIONS] [PAIRS]]
 | `--uds` | false | Use Unix domain sockets instead of TCP (roundtrip mode only, local embedded server). |
 | `--clients` | 16 | Number of concurrent client connections (roundtrip mode). |
 | `--window` | 64 | Pipeline depth: number of requests in flight per client before waiting for a response. |
-| `--bench-threads` | 4 | Number of bench client threads. Each manages a subset of connections via epoll (ignored when compiled with the `io-uring` feature). |
+| `--bench-threads` | 4 | Number of bench client threads. Each runs its own io_uring ring and manages a subset of connections. |
 | `--group-commit-us` | 0 | Group commit coalescing delay in microseconds. Adds an artificial delay before fsyncing to batch more events per sync. Beneficial for UDS transport; harmful for TCP (see [roadmap deferred section](roadmap.md#deferred)). |
 | `--warmup` | 100,000 | Warmup orders per client (not included in measurements). Primes caches, branch predictors, and allocator state. |
 | `--journal <PATH>` | temp directory | Path for the journal file. Use a dedicated NVMe disk for realistic durability benchmarks. |
@@ -103,7 +103,7 @@ cargo run --release -p melin-bench [-- [OPTIONS] [PAIRS]]
 
 | Feature | Effect |
 |---------|--------|
-| `io-uring` | Use io_uring RECV/SEND instead of epoll + blocking writes for the bench client. Single-threaded event loop per bench thread. |
+| `io-uring` | No-op (kept for backward compatibility). io_uring is now always used. |
 | `chart` | After the benchmark, display a TUI with two views: (1) tail latency stability over time (p99/p99.9/p99.99 time series, sampled every 1,000 orders), and (2) latency distribution histogram. Press Tab to switch views, q to exit. |
 
 ## Measurement Methodology

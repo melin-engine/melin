@@ -42,7 +42,7 @@ cargo run --release -p melin-bench -- --clients=32 --window=8 1000000  # 32 conc
 | `--uds` | off | Use Unix domain socket instead of TCP (roundtrip only) |
 | `--clients=N` | `1` | Number of concurrent client connections (roundtrip only) |
 | `--window=N` | `64` | In-flight orders per client (roundtrip, pipeline) |
-| `--bench-threads=N` | `4` | Epoll client threads (roundtrip only) |
+| `--bench-threads=N` | `4` | io_uring client threads (roundtrip only) |
 | `--group-commit-us=N` | `0` | Journal fsync coalescing delay in microseconds (roundtrip, pipeline) |
 | `<order_pairs>` | `1000000` | Number of order pairs (total orders = pairs x 2) |
 

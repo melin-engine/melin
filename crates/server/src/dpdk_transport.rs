@@ -1,6 +1,6 @@
 //! DPDK transport integration — single poll thread for NIC I/O + TCP.
 //!
-//! Replaces both the epoll reader pool and the response stage's socket
+//! Replaces both the io_uring reader pool and the response stage's socket
 //! writes. A single DPDK poll thread owns all NIC I/O:
 //!
 //! - **Inbound**: `rx_burst` → smoltcp → frame decode → disruptor publish
@@ -51,7 +51,7 @@ use tracing::{debug, warn};
 
 use crate::dpdk_response::{ControlEvent, TxFrame};
 
-/// Maximum frame payload size (matches epoll reader).
+/// Maximum frame payload size (matches reader).
 const MAX_FRAME_SIZE: usize = 1024;
 
 /// Auth handshake timeout. Connections that don't complete auth within
@@ -92,7 +92,7 @@ struct ConnectionState {
 
 /// Run the DPDK poll loop.
 ///
-/// This replaces the epoll reader pool. It accepts connections, drives
+/// This replaces the io_uring reader pool. It accepts connections, drives
 /// auth handshakes, parses frames, publishes events to the disruptor,
 /// and drains the TX channel from the response stage into smoltcp sockets.
 ///

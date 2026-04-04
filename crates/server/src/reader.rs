@@ -1,21 +1,19 @@
-//! Epoll-based multiplexed reader pool.
+//! io_uring-based multiplexed reader with multishot RECV.
 //!
-//! Replaces the per-connection reader thread model (N threads for N connections)
-//! with a small pool of reader threads (default 2), each using `epoll` to
-//! multiplex a subset of connections. This eliminates thread oversubscription
-//! (32 clients → 2 reader threads + 3 pipeline = 5 pinned threads) while
-//! maintaining parallel I/O throughput. Reader threads are pinned to
-//! dedicated cores (default 4-5) to avoid cache contention with the pipeline.
+//! Uses `IORING_OP_RECV` with `IORING_RECV_MULTISHOT` — a single SQE per
+//! connection produces multiple CQEs as data arrives, eliminating the
+//! resubmission overhead of standard RECV. Combined with provided buffer
+//! groups (`IOSQE_BUFFER_SELECT`), the kernel selects a buffer from a
+//! shared pool for each recv, replacing per-connection buffer allocations.
 //!
-//! Each connection's fd is set to `O_NONBLOCK` and registered with epoll in
-//! edge-triggered mode. When data arrives, the reader performs incremental
-//! (non-blocking) frame parsing: length prefix first, then payload. Complete
-//! frames are decoded and published to the disruptor via `MultiProducer`.
+//! Uses a single reader thread — io_uring is efficient enough for hundreds
+//! of connections. New connections are registered via eventfd wakeup.
 //!
-//! New connections are assigned round-robin across reader threads.
+//! Connection state is stored in a slab (index-stable Vec) so that io_uring
+//! user_data carries a slab index, not an fd. This avoids fd-reuse races
+//! where a recycled fd number could match a stale CQE.
 
 use std::collections::HashMap;
-use std::io;
 use std::net::SocketAddr;
 use std::os::unix::io::{AsRawFd, RawFd};
 use std::sync::Arc;
@@ -24,25 +22,55 @@ use std::sync::mpsc;
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
+use io_uring::{IoUring, opcode, types};
 use tracing::{debug, error};
 
+use crate::server::ControlEvent;
 use melin_disruptor::ring;
 use melin_engine::journal::pipeline::InputSlot;
 use melin_engine::journal::trace::trace_ts;
 use melin_protocol::auth::Permission;
 use melin_protocol::codec;
-use melin_protocol::message::ConnectionId;
 
-use crate::response::ControlEvent;
+/// Size of each provided buffer. 4 KiB accommodates multiple frames per
+/// recv (frames are typically <100 bytes).
+const BUF_SIZE: usize = 4096;
+
+/// Number of provided buffers in the shared pool. Must be large enough
+/// to handle concurrent in-flight recvs across all connections. When the
+/// pool is exhausted, multishot terminates and is resubmitted after buffers
+/// are re-provided. 2048 supports up to ~1024 connections per reader
+/// thread with headroom for burst re-provision lag.
+const NUM_BUFFERS: u16 = 2048;
+
+/// Buffer group ID for the provided recv buffer pool.
+const BUF_GROUP_ID: u16 = 0;
 
 /// Maximum frame payload size (matches `BlockingFrameReader`).
 const MAX_FRAME_SIZE: usize = 1024;
 
-/// Maximum epoll events returned per `epoll_wait` call.
-const MAX_EPOLL_EVENTS: usize = 64;
+/// io_uring submission queue depth. Power of 2, sized for up to ~1024
+/// connections per reader thread (multishot RECVs + eventfd read +
+/// buffer re-provisions).
+const RING_SIZE: u32 = 4096;
 
-/// Sentinel token for the eventfd in epoll event data.
+/// User data sentinel for the eventfd read SQE.
 const EVENTFD_TOKEN: u64 = u64::MAX;
+
+/// User data sentinel for ProvideBuffers CQEs. These are best-effort
+/// re-provisions — we log errors but don't act on success.
+const PROVIDE_BUFS_TOKEN: u64 = u64::MAX - 1;
+
+/// CQE flag: buffer ID is valid in upper 16 bits of flags.
+const IORING_CQE_F_BUFFER: u32 = 1 << 0;
+
+/// CQE flag: more completions coming from this multishot operation.
+const IORING_CQE_F_MORE: u32 = 1 << 1;
+
+/// Bit shift to extract buffer ID from CQE flags.
+const IORING_CQE_BUFFER_SHIFT: u32 = 16;
+
+use melin_protocol::message::ConnectionId;
 
 /// Command sent from the accept loop to a reader thread.
 pub struct ReaderRegistration<R> {
@@ -56,140 +84,104 @@ pub struct ReaderRegistration<R> {
     pub key_hash: u64,
 }
 
-/// One reader thread's channel + wakeup fd.
-struct ReaderThread<R> {
+/// Handle for the accept loop to register connections with the io_uring reader.
+pub struct UringReaderHandle<R> {
     tx: mpsc::Sender<ReaderRegistration<R>>,
     event_fd: RawFd,
-}
-
-/// Handle for the accept loop to register connections with the reader pool.
-///
-/// Distributes connections round-robin across reader threads.
-pub struct EpollReaderHandle<R> {
-    threads: Vec<ReaderThread<R>>,
-    join_handles: Vec<JoinHandle<()>>,
-    next: usize,
+    join_handle: Option<JoinHandle<()>>,
     shutdown: Arc<AtomicBool>,
 }
 
-impl<R> EpollReaderHandle<R> {
-    /// Register a new connection with the next reader thread (round-robin).
+impl<R> UringReaderHandle<R> {
+    /// Register a new connection with the reader thread.
     ///
     /// If the reader thread's channel is dead (thread panicked), logs an
     /// error and signals shutdown so the server can restart cleanly.
     pub fn register(&mut self, registration: ReaderRegistration<R>) {
-        let idx = self.next % self.threads.len();
-        self.next += 1;
-
-        let thread = &self.threads[idx];
-        if thread.tx.send(registration).is_ok() {
-            // Signal the eventfd to wake the reader thread from epoll_wait.
+        if self.tx.send(registration).is_ok() {
+            // Signal the eventfd to wake the reader from io_uring_enter.
             let val: u64 = 1;
             unsafe {
-                libc::write(
-                    thread.event_fd,
-                    &val as *const u64 as *const libc::c_void,
-                    8,
-                );
+                libc::write(self.event_fd, &val as *const u64 as *const libc::c_void, 8);
             }
         } else {
-            error!(
-                thread = idx,
-                "reader thread dead, cannot register connection"
-            );
+            error!("reader thread dead, cannot register connection");
             self.shutdown.store(true, Ordering::Relaxed);
         }
     }
 
-    /// Signal all reader threads to shut down and wake them from epoll_wait.
+    /// Signal the reader thread to shut down and wake it from io_uring_enter.
     pub fn shutdown(&self) {
         self.shutdown.store(true, Ordering::Relaxed);
-        // Wake each reader thread so it sees the shutdown flag.
-        for thread in &self.threads {
-            let val: u64 = 1;
-            unsafe {
-                libc::write(
-                    thread.event_fd,
-                    &val as *const u64 as *const libc::c_void,
-                    8,
-                );
-            }
+        let val: u64 = 1;
+        unsafe {
+            libc::write(self.event_fd, &val as *const u64 as *const libc::c_void, 8);
         }
     }
 
-    /// Join all reader threads. Call after `shutdown()`.
-    pub fn join(self) {
-        for (i, handle) in self.join_handles.into_iter().enumerate() {
-            if let Err(panic) = handle.join() {
-                let msg = panic
-                    .downcast_ref::<&str>()
-                    .copied()
-                    .or_else(|| panic.downcast_ref::<String>().map(|s| s.as_str()))
-                    .unwrap_or("<non-string panic>");
-                error!(thread = i, message = msg, "reader thread panicked");
-            }
+    /// Join the reader thread. Call after `shutdown()`.
+    pub fn join(mut self) {
+        if let Some(handle) = self.join_handle.take()
+            && let Err(panic) = handle.join()
+        {
+            let msg = panic
+                .downcast_ref::<&str>()
+                .copied()
+                .or_else(|| panic.downcast_ref::<String>().map(|s| s.as_str()))
+                .unwrap_or("<non-string panic>");
+            error!(message = msg, "reader thread panicked");
         }
     }
 }
 
-/// Spawn a pool of epoll reader threads. Returns a handle for registering
-/// connections via round-robin assignment.
+/// Spawn the io_uring reader thread. Returns a handle for registering
+/// connections.
 ///
-/// Each reader thread has its own epoll instance and manages its own subset
-/// of connections independently. `MultiProducer` is cloned per thread for
-/// lock-free concurrent publishing.
+/// Uses a single thread since io_uring efficiently batches I/O for
+/// hundreds of connections.
+/// The `num_threads` parameter is accepted for future scaling but
+/// only one thread is spawned.
 pub fn spawn_reader_pool<R: AsRawFd + Send + 'static>(
-    num_threads: usize,
+    _num_threads: usize,
     producer: ring::MultiProducer<InputSlot>,
     control_tx: mpsc::Sender<ControlEvent>,
     core_start: usize,
     connection_timeout: Option<Duration>,
     shutdown: Arc<AtomicBool>,
-) -> EpollReaderHandle<R> {
-    assert!(num_threads > 0, "need at least 1 reader thread");
+) -> UringReaderHandle<R> {
+    let (tx, rx) = mpsc::channel();
 
-    let mut threads = Vec::with_capacity(num_threads);
-    let mut join_handles = Vec::with_capacity(num_threads);
+    let event_fd = unsafe { libc::eventfd(0, libc::EFD_NONBLOCK) };
+    assert!(event_fd >= 0, "eventfd creation failed");
 
-    for i in 0..num_threads {
-        let (tx, rx) = mpsc::channel();
+    let wakeup_fd = event_fd;
+    let shutdown_clone = Arc::clone(&shutdown);
 
-        // Create eventfd for wakeup signaling (non-blocking).
-        let event_fd = unsafe { libc::eventfd(0, libc::EFD_NONBLOCK) };
-        assert!(event_fd >= 0, "eventfd creation failed");
+    let handle = std::thread::Builder::new()
+        .name("uring-reader".into())
+        .spawn(move || {
+            match crate::affinity::pin_to_core(core_start) {
+                Ok(c) => tracing::info!(thread = "uring-reader", core = c, "pinned to core"),
+                Err(e) => tracing::warn!(thread = "uring-reader", core = core_start, error = %e, "failed to pin"),
+            }
+            reader_loop(rx, wakeup_fd, producer, &control_tx, connection_timeout, &shutdown_clone);
+        })
+        .expect("failed to spawn uring reader thread");
 
-        let producer_clone = producer.clone();
-        let control_tx_clone = control_tx.clone();
-        let wakeup_fd = event_fd;
-        let core_id = core_start + i;
-
-        let timeout = connection_timeout;
-        let shutdown_clone = Arc::clone(&shutdown);
-        let handle = std::thread::Builder::new()
-            .name(format!("reader-{i}"))
-            .spawn(move || {
-                match crate::affinity::pin_to_core(core_id) {
-                    Ok(c) => tracing::info!(thread = "reader-{i}", core = c, "pinned to core"),
-                    Err(e) => tracing::warn!(thread = "reader-{i}", core = core_id, error = %e, "failed to pin"),
-                }
-                epoll_reader_loop(rx, wakeup_fd, producer_clone, &control_tx_clone, timeout, &shutdown_clone);
-            })
-            .expect("failed to spawn reader thread");
-
-        threads.push(ReaderThread { tx, event_fd });
-        join_handles.push(handle);
-    }
-
-    EpollReaderHandle {
-        threads,
-        join_handles,
-        next: 0,
+    UringReaderHandle {
+        tx,
+        event_fd,
+        join_handle: Some(handle),
         shutdown,
     }
 }
 
-/// Per-connection state for incremental (non-blocking) frame parsing.
-struct ConnectionState<R> {
+// ---------------------------------------------------------------------------
+// Slab-based connection storage
+// ---------------------------------------------------------------------------
+
+/// Per-connection state for multishot io_uring recv + incremental frame parsing.
+struct ConnectionEntry<R> {
     connection_id: u64,
     addr: SocketAddr,
     /// Permission level from auth handshake. Checked per-request on
@@ -201,25 +193,70 @@ struct ConnectionState<R> {
     /// Owned reader — keeps the fd alive. Dropping closes the fd.
     _reader: R,
     fd: RawFd,
-    /// 4-byte length prefix buffer.
-    len_buf: [u8; 4],
-    /// Bytes filled in `len_buf`.
-    len_filled: usize,
-    /// Frame payload buffer (fixed-size, avoids per-frame allocation).
-    payload_buf: [u8; MAX_FRAME_SIZE],
-    /// Expected payload length (parsed from length prefix).
-    payload_len: usize,
-    /// Bytes filled in `payload_buf`.
-    payload_filled: usize,
-    /// True when we've parsed the length prefix and are reading payload.
-    reading_payload: bool,
+    /// Accumulated bytes not yet parsed into complete frames.
+    /// Grows when partial frames arrive, shrinks when frames are consumed.
+    parse_buf: Vec<u8>,
+    /// True if a multishot RecvMulti is currently active for this connection.
+    /// Multishot stays active until the kernel clears IORING_CQE_F_MORE
+    /// (e.g., buffer pool exhaustion, socket error, or EOF).
+    multishot_active: bool,
     /// Last time any data was received on this connection. Used for
     /// idle timeout detection.
     last_activity: Instant,
 }
 
-/// Main epoll reader loop. Runs until the channel is disconnected.
-fn epoll_reader_loop<R: AsRawFd>(
+/// Index-stable allocator for connection state. Slab indices are used as
+/// io_uring user_data, avoiding fd-reuse races.
+struct ConnectionSlab<R> {
+    entries: Vec<Option<ConnectionEntry<R>>>,
+    /// Recycled indices for O(1) allocation.
+    free: Vec<usize>,
+}
+
+impl<R> ConnectionSlab<R> {
+    fn new() -> Self {
+        Self {
+            entries: Vec::with_capacity(256),
+            free: Vec::new(),
+        }
+    }
+
+    /// Insert a connection, returning its stable slab index.
+    fn insert(&mut self, entry: ConnectionEntry<R>) -> usize {
+        if let Some(idx) = self.free.pop() {
+            self.entries[idx] = Some(entry);
+            idx
+        } else {
+            let idx = self.entries.len();
+            self.entries.push(Some(entry));
+            idx
+        }
+    }
+
+    fn get_mut(&mut self, idx: usize) -> Option<&mut ConnectionEntry<R>> {
+        self.entries.get_mut(idx).and_then(|e| e.as_mut())
+    }
+
+    /// Remove and return a connection entry, recycling its index.
+    fn remove(&mut self, idx: usize) -> Option<ConnectionEntry<R>> {
+        if let Some(slot) = self.entries.get_mut(idx) {
+            let removed = slot.take();
+            if removed.is_some() {
+                self.free.push(idx);
+            }
+            removed
+        } else {
+            None
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Main loop
+// ---------------------------------------------------------------------------
+
+/// Main io_uring reader loop. Runs until channel disconnection.
+fn reader_loop<R: AsRawFd>(
     command_rx: mpsc::Receiver<ReaderRegistration<R>>,
     wakeup_fd: RawFd,
     producer: ring::MultiProducer<InputSlot>,
@@ -227,22 +264,9 @@ fn epoll_reader_loop<R: AsRawFd>(
     connection_timeout: Option<Duration>,
     shutdown: &AtomicBool,
 ) {
-    let epoll_fd = unsafe { libc::epoll_create1(0) };
-    assert!(epoll_fd >= 0, "epoll_create1 failed");
-
-    // Register the wakeup eventfd with epoll (edge-triggered).
-    let mut ev = libc::epoll_event {
-        events: (libc::EPOLLIN | libc::EPOLLET) as u32,
-        u64: EVENTFD_TOKEN,
-    };
-    let ret = unsafe { libc::epoll_ctl(epoll_fd, libc::EPOLL_CTL_ADD, wakeup_fd, &mut ev) };
-    assert!(ret == 0, "epoll_ctl add eventfd failed");
-
-    // Pre-size for a reasonable number of concurrent connections per reader thread.
-    let mut connections: HashMap<RawFd, ConnectionState<R>> = HashMap::with_capacity(256);
+    let mut ring = IoUring::new(RING_SIZE).expect("failed to create io_uring instance");
 
     // Pre-encode the ServerBusy response frame (length prefix + tag = 5 bytes).
-    // Sent directly via libc::write when the disruptor ring is full.
     let server_busy_frame = {
         let mut buf = [0u8; 8];
         let n =
@@ -252,115 +276,243 @@ fn epoll_reader_loop<R: AsRawFd>(
         frame.copy_from_slice(&buf[..n]);
         frame
     };
-    let mut events = vec![libc::epoll_event { events: 0, u64: 0 }; MAX_EPOLL_EVENTS];
+
+    let mut slab = ConnectionSlab::<R>::new();
+    // Reverse map for cleanup when a connection's fd needs removal.
+    // HashMap for O(1) lookup by fd. Sized for typical connection counts.
+    let mut fd_to_slab: HashMap<RawFd, usize> = HashMap::with_capacity(256);
+
+    // Eventfd read buffer — boxed for pointer stability across SQE lifetimes.
+    let mut eventfd_buf: Box<[u8; 8]> = Box::new([0u8; 8]);
+
+    // Shared buffer pool for provided buffers. Contiguous allocation of
+    // NUM_BUFFERS × BUF_SIZE bytes. The kernel selects a buffer from this
+    // pool for each recv completion, identified by buffer ID in the CQE.
+    let mut buffer_pool = vec![0u8; NUM_BUFFERS as usize * BUF_SIZE].into_boxed_slice();
+
+    // Pre-allocated CQE collection buffer. We must collect CQEs before
+    // processing because the CQ borrow must end before pushing new SQEs.
+    // Stores (user_data, result, flags) — flags needed for buffer ID and
+    // multishot continuation.
+    let mut cqes: Vec<(u64, i32, u32)> = Vec::with_capacity(RING_SIZE as usize);
+
+    // Register the provided buffer pool with io_uring.
+    register_buffer_pool(&mut ring, buffer_pool.as_mut_ptr());
+
+    // Submit the initial eventfd read so we wake on first connection.
+    push_eventfd_read(&mut ring, wakeup_fd, eventfd_buf.as_mut_ptr());
 
     #[cfg(feature = "latency-trace")]
     let mut publish_hist = melin_engine::journal::trace::StageHistogram::new(
         "reader: publish (decode → disruptor publish)",
     );
 
-    // epoll_wait timeout: 1000ms to periodically check the shutdown flag
-    // and scan for stale connections. The eventfd wakeup provides immediate
-    // responsiveness for new connections and shutdown signals.
-    let epoll_timeout_ms: i32 = 1000;
-
     // Coarse gate for timeout scanning — avoids scanning on every
-    // epoll_wait return during high throughput. Only scans when >=1 second
-    // has elapsed since the last scan.
+    // submit_and_wait return during high throughput.
     let mut last_timeout_scan = Instant::now();
+    // Pre-allocated buffer for stale connection indices to avoid
+    // heap allocation inside the hot loop.
+    let mut stale: Vec<(usize, u64, RawFd)> = Vec::new();
 
     loop {
         if shutdown.load(Ordering::Relaxed) {
             break;
         }
 
-        let nfds = unsafe {
-            libc::epoll_wait(
-                epoll_fd,
-                events.as_mut_ptr(),
-                MAX_EPOLL_EVENTS as i32,
-                epoll_timeout_ms,
-            )
-        };
-
-        if nfds < 0 {
-            let err = io::Error::last_os_error();
-            if err.kind() == io::ErrorKind::Interrupted {
-                continue;
+        // Submit any pending SQEs and block until at least 1 CQE is ready.
+        match ring.submit_and_wait(1) {
+            Ok(_) => {}
+            Err(ref e) if e.raw_os_error() == Some(libc::EINTR) => continue,
+            Err(e) => {
+                error!(error = %e, "io_uring submit_and_wait error");
+                break;
             }
-            error!(error = %err, "epoll_wait error");
-            break;
         }
 
-        // One Instant::now() per epoll batch for connection timeout tracking
-        // instead of per frame — timeout is 30s, sub-ms precision is plenty.
+        // Drain all available CQEs into the pre-allocated buffer.
+        // Must collect before processing because the CQ borrow must end
+        // before we can push new SQEs to the SQ.
+        cqes.clear();
+        cqes.extend(
+            ring.completion()
+                .map(|cqe| (cqe.user_data(), cqe.result(), cqe.flags())),
+        );
+
         let batch_now = Instant::now();
 
-        for event in &events[..nfds as usize] {
-            let token = event.u64;
-
-            if token == EVENTFD_TOKEN {
-                // Drain the eventfd.
-                let mut buf: u64 = 0;
-                unsafe {
-                    libc::read(wakeup_fd, &mut buf as *mut u64 as *mut libc::c_void, 8);
-                }
-                // Process pending registrations.
-                while let Ok(reg) = command_rx.try_recv() {
-                    register_connection(epoll_fd, reg, &mut connections);
+        for &(token, result, flags) in &cqes {
+            // ── ProvideBuffers completion ──
+            if token == PROVIDE_BUFS_TOKEN {
+                if result < 0 {
+                    error!(error = result, "ProvideBuffers failed");
                 }
                 continue;
             }
 
-            // Connection fd is ready.
-            let fd = token as RawFd;
-            let disconnected = if let Some(conn) = connections.get_mut(&fd) {
-                process_connection(
-                    conn,
-                    &producer,
-                    &server_busy_frame,
-                    batch_now,
-                    #[cfg(feature = "latency-trace")]
-                    &mut publish_hist,
-                )
+            // ── Eventfd wakeup ──
+            if token == EVENTFD_TOKEN {
+                if result >= 0 {
+                    // Process all pending registrations.
+                    while let Ok(reg) = command_rx.try_recv() {
+                        let fd = reg.reader.as_raw_fd();
+                        let entry = ConnectionEntry {
+                            connection_id: reg.connection_id.0,
+                            addr: reg.addr,
+                            permission: reg.permission,
+                            key_hash: reg.key_hash,
+                            fd,
+                            _reader: reg.reader,
+                            parse_buf: Vec::with_capacity(MAX_FRAME_SIZE + 4),
+                            multishot_active: false,
+                            last_activity: Instant::now(),
+                        };
+                        let idx = slab.insert(entry);
+                        fd_to_slab.insert(fd, idx);
+
+                        // Submit multishot RECV for this connection.
+                        push_recv_multi(&mut ring, &mut slab, idx);
+                    }
+                } else {
+                    error!(error = result, "eventfd read error");
+                }
+
+                // Re-submit eventfd read for the next wakeup.
+                push_eventfd_read(&mut ring, wakeup_fd, eventfd_buf.as_mut_ptr());
+                continue;
+            }
+
+            // ── Connection multishot RECV completion ──
+
+            let slab_idx = token as usize;
+            let has_more = (flags & IORING_CQE_F_MORE) != 0;
+
+            if result <= 0 {
+                // Disconnect (0) or error (negative errno).
+                if let Some(removed) = slab.remove(slab_idx) {
+                    if result == 0 {
+                        debug!(
+                            connection_id = removed.connection_id,
+                            addr = %removed.addr,
+                            "client disconnected"
+                        );
+                    } else {
+                        debug!(
+                            connection_id = removed.connection_id,
+                            addr = %removed.addr,
+                            error = result,
+                            "recv error"
+                        );
+                    }
+                    fd_to_slab.remove(&removed.fd);
+                    let _ = control_tx.send(ControlEvent::Disconnected {
+                        connection_id: removed.connection_id,
+                    });
+                }
+                continue;
+            }
+
+            let n = result as usize;
+
+            // Extract the buffer ID from the CQE flags. The kernel sets
+            // IORING_CQE_F_BUFFER and encodes the buffer ID in bits 16-31.
+            let buf_id = if (flags & IORING_CQE_F_BUFFER) != 0 {
+                (flags >> IORING_CQE_BUFFER_SHIFT) as usize
             } else {
-                false
+                // Should not happen with provided buffers — defensive skip.
+                debug!(slab_idx, "recv CQE without buffer flag");
+                continue;
             };
 
-            if disconnected {
-                remove_connection(epoll_fd, fd, &mut connections, control_tx);
+            // Feed received bytes into the frame parser from the shared pool.
+            let action = if let Some(entry) = slab.get_mut(slab_idx) {
+                if !has_more {
+                    entry.multishot_active = false;
+                }
+
+                // Any successful recv resets the idle timeout.
+                entry.last_activity = batch_now;
+
+                // Copy received data from the shared buffer pool into the
+                // connection's parse buffer.
+                let buf_start = buf_id * BUF_SIZE;
+                entry
+                    .parse_buf
+                    .extend_from_slice(&buffer_pool[buf_start..buf_start + n]);
+
+                // Extract and publish complete frames.
+                let drop_conn = process_frames(
+                    entry,
+                    &producer,
+                    &server_busy_frame,
+                    #[cfg(feature = "latency-trace")]
+                    &mut publish_hist,
+                );
+                if drop_conn {
+                    Action::Remove {
+                        connection_id: entry.connection_id,
+                        fd: entry.fd,
+                    }
+                } else if !has_more {
+                    // Multishot terminated (buffer pool exhaustion or kernel
+                    // decision) but connection is healthy — resubmit.
+                    Action::Resubmit
+                } else {
+                    Action::None
+                }
+            } else {
+                // Stale CQE for a removed connection — ignore.
+                Action::None
+            };
+
+            // Re-provide the consumed buffer back to the pool. Must happen
+            // after we've copied the data out. Pushed to SQ and submitted
+            // on the next submit_and_wait.
+            re_provide_buffer(&mut ring, buffer_pool.as_mut_ptr(), buf_id);
+
+            match action {
+                Action::Remove { connection_id, fd } => {
+                    slab.remove(slab_idx);
+                    fd_to_slab.remove(&fd);
+                    let _ = control_tx.send(ControlEvent::Disconnected { connection_id });
+                }
+                Action::Resubmit => {
+                    push_recv_multi(&mut ring, &mut slab, slab_idx);
+                }
+                Action::None => {}
             }
         }
 
         // Scan for idle connections that have exceeded the timeout.
         // Coarse gate: only scan once per second to avoid unnecessary
-        // iteration during high-throughput phases when epoll_wait returns
-        // immediately with events.
+        // iteration during high-throughput phases when submit_and_wait
+        // returns immediately with CQEs.
         if let Some(timeout) = connection_timeout {
             let now = Instant::now();
             if now.duration_since(last_timeout_scan) >= Duration::from_secs(1) {
                 last_timeout_scan = now;
-                let stale_fds: Vec<RawFd> = connections
-                    .iter()
-                    .filter(|(_, conn)| now.duration_since(conn.last_activity) > timeout)
-                    .map(|(&fd, _)| fd)
-                    .collect();
-                for fd in stale_fds {
-                    if let Some(conn) = connections.get(&fd) {
+                stale.clear();
+                for (idx, slot) in slab.entries.iter().enumerate() {
+                    if let Some(entry) = slot
+                        && now.duration_since(entry.last_activity) > timeout
+                    {
                         debug!(
-                            connection_id = conn.connection_id,
-                            addr = %conn.addr,
+                            connection_id = entry.connection_id,
+                            addr = %entry.addr,
                             "connection timed out"
                         );
+                        stale.push((idx, entry.connection_id, entry.fd));
                     }
-                    remove_connection(epoll_fd, fd, &mut connections, control_tx);
+                }
+                for &(idx, connection_id, fd) in &stale {
+                    slab.remove(idx);
+                    fd_to_slab.remove(&fd);
+                    let _ = control_tx.send(ControlEvent::Disconnected { connection_id });
                 }
             }
         }
     }
 
     unsafe {
-        libc::close(epoll_fd);
         libc::close(wakeup_fd);
     }
 
@@ -368,311 +520,222 @@ fn epoll_reader_loop<R: AsRawFd>(
     publish_hist.print_report();
 }
 
-/// Register a new connection: set non-blocking, add to epoll, store state.
-fn register_connection<R: AsRawFd>(
-    epoll_fd: RawFd,
-    reg: ReaderRegistration<R>,
-    connections: &mut HashMap<RawFd, ConnectionState<R>>,
-) {
-    let fd = reg.reader.as_raw_fd();
+/// What to do after processing a RECV CQE.
+enum Action {
+    /// Multishot terminated but connection healthy — resubmit RecvMulti.
+    Resubmit,
+    /// Connection should be removed (malformed frame).
+    Remove { connection_id: u64, fd: RawFd },
+    /// Multishot still active — nothing to do.
+    None,
+}
 
-    // Set non-blocking.
+// ---------------------------------------------------------------------------
+// SQE helpers
+// ---------------------------------------------------------------------------
+
+/// Register the provided buffer pool with io_uring via ProvideBuffers.
+/// Submits synchronously and panics on failure — called once at startup.
+fn register_buffer_pool(ring: &mut IoUring, pool_ptr: *mut u8) {
+    let sqe = opcode::ProvideBuffers::new(pool_ptr, BUF_SIZE as i32, NUM_BUFFERS, BUF_GROUP_ID, 0)
+        .build()
+        .user_data(PROVIDE_BUFS_TOKEN);
+
     unsafe {
-        let flags = libc::fcntl(fd, libc::F_GETFL);
-        libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
+        ring.submission()
+            .push(&sqe)
+            .expect("io_uring SQ full during buffer pool registration");
     }
 
-    // Register with epoll (edge-triggered).
-    let mut conn_ev = libc::epoll_event {
-        events: (libc::EPOLLIN | libc::EPOLLET) as u32,
-        u64: fd as u64,
+    ring.submit_and_wait(1)
+        .expect("io_uring submit failed during buffer pool registration");
+
+    // Check the completion result.
+    let cqe = ring
+        .completion()
+        .next()
+        .expect("no CQE after ProvideBuffers");
+    assert!(cqe.result() >= 0, "ProvideBuffers failed: {}", cqe.result());
+}
+
+/// Re-provide a single consumed buffer back to the pool. Pushed to SQ
+/// without immediate submission — batched with the next submit_and_wait.
+fn re_provide_buffer(ring: &mut IoUring, pool_ptr: *mut u8, buf_id: usize) {
+    let buf_ptr = unsafe { pool_ptr.add(buf_id * BUF_SIZE) };
+    let sqe = opcode::ProvideBuffers::new(buf_ptr, BUF_SIZE as i32, 1, BUF_GROUP_ID, buf_id as u16)
+        .build()
+        .user_data(PROVIDE_BUFS_TOKEN);
+
+    unsafe {
+        ring.submission()
+            .push(&sqe)
+            .expect("io_uring SQ full — increase RING_SIZE");
+    }
+}
+
+/// Push a multishot RECV SQE for a connection. The kernel will produce
+/// CQEs continuously until EOF, error, or buffer pool exhaustion —
+/// no resubmission needed unless multishot terminates.
+fn push_recv_multi<R>(ring: &mut IoUring, slab: &mut ConnectionSlab<R>, idx: usize) {
+    let entry = match slab.get_mut(idx) {
+        Some(e) => e,
+        None => return,
     };
-    let ret = unsafe { libc::epoll_ctl(epoll_fd, libc::EPOLL_CTL_ADD, fd, &mut conn_ev) };
-    if ret < 0 {
-        debug!(
-            connection_id = reg.connection_id.0,
-            error = %io::Error::last_os_error(),
-            "epoll_ctl add failed"
-        );
+
+    if entry.multishot_active {
         return;
     }
 
-    connections.insert(
-        fd,
-        ConnectionState {
-            connection_id: reg.connection_id.0,
-            addr: reg.addr,
-            permission: reg.permission,
-            key_hash: reg.key_hash,
-            _reader: reg.reader,
-            fd,
-            len_buf: [0u8; 4],
-            len_filled: 0,
-            payload_buf: [0u8; MAX_FRAME_SIZE],
-            payload_len: 0,
-            payload_filled: 0,
-            reading_payload: false,
-            last_activity: Instant::now(),
-        },
-    );
+    let sqe = opcode::RecvMulti::new(types::Fd(entry.fd), BUF_GROUP_ID)
+        .build()
+        .user_data(idx as u64);
+
+    unsafe {
+        ring.submission()
+            .push(&sqe)
+            .expect("io_uring SQ full — increase RING_SIZE");
+    }
+    entry.multishot_active = true;
 }
 
-/// Remove a disconnected connection: deregister from epoll, notify response stage.
-fn remove_connection<R>(
-    epoll_fd: RawFd,
-    fd: RawFd,
-    connections: &mut HashMap<RawFd, ConnectionState<R>>,
-    control_tx: &mpsc::Sender<ControlEvent>,
-) {
-    if let Some(conn) = connections.remove(&fd) {
-        debug!(
-            connection_id = conn.connection_id,
-            addr = %conn.addr,
-            "client disconnected"
-        );
-        unsafe {
-            libc::epoll_ctl(epoll_fd, libc::EPOLL_CTL_DEL, fd, std::ptr::null_mut());
-        }
-        // Best-effort: receiver may have shut down during server teardown.
-        let _ = control_tx.send(ControlEvent::Disconnected {
-            connection_id: conn.connection_id,
-        });
+/// Push a READ SQE for the eventfd (wakeup notification).
+fn push_eventfd_read(ring: &mut IoUring, wakeup_fd: RawFd, buf: *mut u8) {
+    let sqe = opcode::Read::new(types::Fd(wakeup_fd), buf, 8)
+        .build()
+        .user_data(EVENTFD_TOKEN);
+
+    unsafe {
+        ring.submission()
+            .push(&sqe)
+            .expect("io_uring SQ full — increase RING_SIZE");
     }
 }
 
-/// Process available data on a connection. Returns `true` if disconnected.
-///
-/// With edge-triggered epoll, we drain all available data (loop until EAGAIN).
-fn process_connection<R>(
-    conn: &mut ConnectionState<R>,
+// ---------------------------------------------------------------------------
+// Frame parsing
+// ---------------------------------------------------------------------------
+
+/// Extract complete frames from the connection's parse buffer, decode them,
+/// and publish to the disruptor. Returns `true` if the connection should be
+/// dropped (e.g., oversized frame).
+fn process_frames<R>(
+    conn: &mut ConnectionEntry<R>,
     producer: &ring::MultiProducer<InputSlot>,
     server_busy_frame: &[u8; 5],
-    now: Instant,
     #[cfg(feature = "latency-trace")]
     publish_hist: &mut melin_engine::journal::trace::StageHistogram,
 ) -> bool {
-    loop {
-        // Step 1: Read 4-byte length prefix.
-        if !conn.reading_payload {
-            match nonblocking_read(conn.fd, &mut conn.len_buf, conn.len_filled, 4) {
-                ReadResult::Complete(filled) => {
-                    conn.len_filled = filled;
-                    if filled < 4 {
-                        return false; // EAGAIN
-                    }
-                    // Any successful read resets the idle timeout.
-                    conn.last_activity = now;
-                    let len = u32::from_le_bytes(conn.len_buf) as usize;
-                    if len > MAX_FRAME_SIZE {
-                        debug!(
-                            connection_id = conn.connection_id,
-                            addr = %conn.addr,
-                            frame_len = len,
-                            "frame too large, dropping connection"
-                        );
-                        return true;
-                    }
-                    conn.payload_len = len;
-                    conn.payload_filled = 0;
-                    conn.reading_payload = true;
-                    conn.len_filled = 0;
-                }
-                ReadResult::Disconnected => return true,
-                ReadResult::Error => return true,
-            }
+    let mut cursor = 0;
+
+    while cursor + 4 <= conn.parse_buf.len() {
+        // Read 4-byte little-endian length prefix.
+        let len_bytes: [u8; 4] = conn.parse_buf[cursor..cursor + 4]
+            .try_into()
+            .expect("slice is exactly 4 bytes");
+        let frame_len = u32::from_le_bytes(len_bytes) as usize;
+
+        if frame_len > MAX_FRAME_SIZE {
+            debug!(
+                connection_id = conn.connection_id,
+                addr = %conn.addr,
+                frame_len,
+                "frame too large, dropping connection"
+            );
+            return true;
         }
 
-        // Step 2: Read payload.
-        if conn.reading_payload {
-            match nonblocking_read(
-                conn.fd,
-                &mut conn.payload_buf,
-                conn.payload_filled,
-                conn.payload_len,
-            ) {
-                ReadResult::Complete(filled) => {
-                    conn.payload_filled = filled;
-                    if filled < conn.payload_len {
-                        return false; // EAGAIN
-                    }
-                    conn.reading_payload = false;
-
-                    let frame = &conn.payload_buf[..conn.payload_len];
-                    let (seq, request) = match codec::decode_request(frame) {
-                        Ok(pair) => pair,
-                        Err(e) => {
-                            debug!(
-                                connection_id = conn.connection_id,
-                                addr = %conn.addr,
-                                error = %e,
-                                "decode error"
-                            );
-                            continue;
-                        }
-                    };
-
-                    if crate::request::should_filter(&request) {
-                        continue;
-                    }
-
-                    if let Err(reason) = crate::request::check_permission(&request, conn.permission)
-                    {
-                        debug!(
-                            connection_id = conn.connection_id,
-                            reason, "permission denied, dropping request"
-                        );
-                        continue;
-                    }
-
-                    #[allow(clippy::let_unit_value)]
-                    let recv_ts = trace_ts();
-
-                    let event = crate::request::to_event(&request);
-
-                    #[cfg(feature = "latency-trace")]
-                    let pre_publish = trace_ts();
-
-                    if producer
-                        .try_publish(InputSlot {
-                            connection_id: conn.connection_id,
-                            key_hash: conn.key_hash,
-                            request_seq: seq,
-                            event,
-                            publish_ts: trace_ts(),
-                            recv_ts,
-                        })
-                        .is_err()
-                    {
-                        // Pipeline full — send ServerBusy directly on the socket.
-                        // Best-effort: if the write fails (broken pipe, full send
-                        // buffer), the client will timeout and reconnect.
-                        debug!(
-                            connection_id = conn.connection_id,
-                            "pipeline full, sending ServerBusy"
-                        );
-                        let n = unsafe {
-                            libc::write(
-                                conn.fd,
-                                server_busy_frame.as_ptr().cast(),
-                                server_busy_frame.len(),
-                            )
-                        };
-                        if n != server_busy_frame.len() as isize {
-                            debug!(
-                                connection_id = conn.connection_id,
-                                written = n,
-                                "ServerBusy write incomplete"
-                            );
-                        }
-                        // Stop draining this connection for this epoll round.
-                        // Edge-trigger caveat: any bytes already in the kernel
-                        // recv buffer won't generate a new EPOLLIN (edge-trigger
-                        // only fires on new arrivals). Those frames are stranded
-                        // until the client sends new data — which it will, since
-                        // it just received ServerBusy and will retry or send the
-                        // next request.
-                        return false;
-                    }
-
-                    #[cfg(feature = "latency-trace")]
-                    publish_hist.record_ns(melin_engine::journal::trace::trace_elapsed_ns(
-                        pre_publish,
-                        trace_ts(),
-                    ));
-
-                    // Edge-triggered: keep draining.
-                    continue;
-                }
-                ReadResult::Disconnected => return true,
-                ReadResult::Error => return true,
-            }
+        // Wait for the complete frame before parsing.
+        if cursor + 4 + frame_len > conn.parse_buf.len() {
+            break;
         }
-    }
-}
 
-/// Result of a non-blocking read attempt.
-enum ReadResult {
-    /// Read progressed to `filled` bytes. If `filled < target`, EAGAIN.
-    Complete(usize),
-    /// Peer disconnected (read returned 0).
-    Disconnected,
-    /// I/O error (not EAGAIN/EWOULDBLOCK).
-    Error,
-}
+        let frame = &conn.parse_buf[cursor + 4..cursor + 4 + frame_len];
+        cursor += 4 + frame_len;
 
-/// Non-blocking read into `buf[filled..target]`.
-fn nonblocking_read(fd: RawFd, buf: &mut [u8], mut filled: usize, target: usize) -> ReadResult {
-    while filled < target {
-        let n = unsafe {
-            libc::read(
-                fd,
-                buf[filled..target].as_mut_ptr() as *mut libc::c_void,
-                target - filled,
-            )
+        let (seq, request) = match codec::decode_request(frame) {
+            Ok(pair) => pair,
+            Err(e) => {
+                debug!(
+                    connection_id = conn.connection_id,
+                    addr = %conn.addr,
+                    error = %e,
+                    "decode error"
+                );
+                continue;
+            }
         };
-        if n > 0 {
-            filled += n as usize;
-        } else if n == 0 {
-            return ReadResult::Disconnected;
-        } else {
-            let err = io::Error::last_os_error();
-            if err.kind() == io::ErrorKind::WouldBlock {
-                return ReadResult::Complete(filled);
-            }
-            return ReadResult::Error;
+
+        if crate::request::should_filter(&request) {
+            continue;
         }
-    }
-    ReadResult::Complete(filled)
-}
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use melin_engine::journal::pipeline::InputSlot;
-    use melin_engine::journal::trace::trace_ts;
+        if let Err(reason) = crate::request::check_permission(&request, conn.permission) {
+            debug!(
+                connection_id = conn.connection_id,
+                reason, "permission denied, dropping request"
+            );
+            continue;
+        }
 
-    /// Verify the pre-encoded ServerBusy frame decodes to the correct response.
-    #[test]
-    fn server_busy_frame_round_trip() {
-        let mut buf = [0u8; 8];
-        let n =
-            codec::encode_response(&melin_protocol::message::ResponseKind::ServerBusy, &mut buf)
-                .expect("encode ServerBusy");
-        // 4-byte length prefix + 1-byte tag = 5 bytes.
-        assert_eq!(n, 5);
+        #[allow(clippy::let_unit_value)]
+        let recv_ts = trace_ts();
 
-        // Decode the payload (after the 4-byte length prefix).
-        let decoded = codec::decode_response(&buf[4..n]).expect("decode ServerBusy");
-        assert!(matches!(
-            decoded,
-            melin_protocol::message::ResponseKind::ServerBusy
+        let event = crate::request::to_event(&request);
+
+        #[cfg(feature = "latency-trace")]
+        let pre_publish = trace_ts();
+
+        if producer
+            .try_publish(InputSlot {
+                connection_id: conn.connection_id,
+                key_hash: conn.key_hash,
+                request_seq: seq,
+                event,
+                publish_ts: trace_ts(),
+                recv_ts,
+            })
+            .is_err()
+        {
+            // Pipeline full — send ServerBusy directly on the socket.
+            // Best-effort: if the write fails, the client will timeout.
+            debug!(
+                connection_id = conn.connection_id,
+                "pipeline full, sending ServerBusy"
+            );
+            let n = unsafe {
+                libc::write(
+                    conn.fd,
+                    server_busy_frame.as_ptr().cast(),
+                    server_busy_frame.len(),
+                )
+            };
+            if n != server_busy_frame.len() as isize {
+                debug!(
+                    connection_id = conn.connection_id,
+                    written = n,
+                    "ServerBusy write incomplete"
+                );
+            }
+            // Stop processing further frames — leave them in parse_buf
+            // for the next recv cycle.
+            break;
+        }
+
+        #[cfg(feature = "latency-trace")]
+        publish_hist.record_ns(melin_engine::journal::trace::trace_elapsed_ns(
+            pre_publish,
+            trace_ts(),
         ));
     }
 
-    /// When the disruptor ring is full, try_publish must return Err(Full)
-    /// so the reader can send ServerBusy instead of spinning.
-    #[test]
-    fn try_publish_returns_full_when_ring_exhausted() {
-        // Smallest power-of-two ring: 2 slots, 1 consumer.
-        let (producer, mut consumers) = ring::DisruptorBuilder::<InputSlot>::new(2)
-            .add_consumer()
-            .build_multi_producer();
-        let _consumer = consumers.pop().unwrap();
-
-        let slot = InputSlot {
-            connection_id: 0,
-            key_hash: 0,
-            request_seq: 0,
-            event: melin_engine::journal::event::JournalEvent::QueryStats,
-            publish_ts: trace_ts(),
-            recv_ts: trace_ts(),
-        };
-
-        // Fill both slots.
-        assert!(producer.try_publish(slot).is_ok());
-        assert!(producer.try_publish(slot).is_ok());
-
-        // Third publish must fail — ring is full, consumer hasn't advanced.
-        assert!(producer.try_publish(slot).is_err());
+    // Compact: shift remaining bytes to the front of the parse buffer.
+    // Uses copy_within + truncate instead of drain() to avoid the
+    // Drain iterator overhead.
+    if cursor > 0 {
+        let remaining = conn.parse_buf.len() - cursor;
+        conn.parse_buf.copy_within(cursor.., 0);
+        conn.parse_buf.truncate(remaining);
     }
+
+    false
 }

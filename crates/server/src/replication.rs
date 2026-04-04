@@ -374,26 +374,6 @@ fn read_frame(reader: &mut impl Read, max_size: usize) -> io::Result<Vec<u8>> {
     Ok(buf)
 }
 
-/// Read a length-prefixed frame into a reusable buffer. Avoids per-frame
-/// heap allocation — the caller owns the Vec and it grows to high-water
-/// mark then stays there.
-fn read_frame_into(reader: &mut impl Read, buf: &mut Vec<u8>, max_size: usize) -> io::Result<()> {
-    let mut len_buf = [0u8; 4];
-    reader.read_exact(&mut len_buf)?;
-    let len = u32::from_le_bytes(len_buf) as usize;
-    if len > max_size {
-        return Err(io::Error::other(format!(
-            "frame too large: {len} > {max_size}"
-        )));
-    }
-    if len == 0 {
-        return Err(io::Error::other("empty frame"));
-    }
-    buf.resize(len, 0);
-    reader.read_exact(buf)?;
-    Ok(())
-}
-
 /// Decode a replica message from a frame payload.
 fn decode_replica_message(payload: &[u8]) -> io::Result<ReplicaMessage> {
     if payload.is_empty() {
@@ -1110,10 +1090,6 @@ fn handle_replica_connection(
     heartbeat_secs: u64,
     busy_spin: bool,
 ) -> io::Result<()> {
-    #[cfg_attr(
-        all(feature = "io-uring", not(feature = "no-persist")),
-        allow(unused_mut, unused_variables)
-    )]
     let mut reader = stream.try_clone()?;
     let mut writer = stream;
 
@@ -1290,21 +1266,6 @@ fn handle_replica_connection(
         }
     }
 
-    // The blocking fallback uses poll(0) + read_frame for acks.
-    // The io_uring path handles acks via async RECV CQEs instead.
-    #[cfg(not(all(feature = "io-uring", not(feature = "no-persist"))))]
-    {
-        reader.set_read_timeout(Some(std::time::Duration::from_millis(5)))?;
-    }
-    #[cfg(not(all(feature = "io-uring", not(feature = "no-persist"))))]
-    let reader_fd = std::os::unix::io::AsRawFd::as_raw_fd(&reader);
-    #[cfg(not(all(feature = "io-uring", not(feature = "no-persist"))))]
-    let mut pollfd = libc::pollfd {
-        fd: reader_fd,
-        events: libc::POLLIN,
-        revents: 0,
-    };
-
     // Engage the replication cursor so the response stage gates on
     // replica acks. Uses compare_exchange to only lower the cursor from
     // u64::MAX (no replicas connected). If another replica is already
@@ -1338,130 +1299,30 @@ fn handle_replica_connection(
     let mut last_sequence = handshake.last_sequence;
     let mut last_chain_hash = handshake.chain_hash;
 
-    #[cfg(all(feature = "io-uring", not(feature = "no-persist")))]
-    {
-        live_stream_uring(
-            writer,
-            repl_consumer,
-            replication_cursor,
-            shutdown,
-            evict_flag,
-            metrics,
-            slot_idx,
-            batch_size,
-            heartbeat_interval,
-            busy_spin,
-            &mut send_buf,
-            &mut last_send,
-            &mut last_sequence,
-            &mut last_chain_hash,
-        )
-    }
-
-    #[cfg(not(all(feature = "io-uring", not(feature = "no-persist"))))]
-    {
-        loop {
-            if shutdown.load(Ordering::Relaxed) {
-                return Ok(());
-            }
-
-            if evict_flag.load(Ordering::Relaxed) {
-                info!(slot = slot_idx, "handler exiting: evicted by journal stage");
-                return Ok(());
-            }
-
-            match process_acks(&mut reader, replication_cursor, &mut pollfd) {
-                Ok(Some(acked_seq)) => {
-                    metrics.acked_sequence[slot_idx].store(acked_seq, Ordering::Relaxed);
-                    metrics.ack_latency_us[slot_idx]
-                        .store(last_send.elapsed().as_micros() as u64, Ordering::Relaxed);
-                }
-                Ok(None) => {}
-                Err(e) => {
-                    return Err(io::Error::other(format!("replica ack read error: {e}")));
-                }
-            }
-
-            if let Some((meta, data)) = repl_consumer.try_read() {
-                encode_data_batch(
-                    meta.end_sequence,
-                    &meta.chain_hash,
-                    meta.entry_count,
-                    data,
-                    &mut send_buf,
-                );
-                repl_consumer.commit();
-                last_sequence = meta.end_sequence;
-                last_chain_hash = meta.chain_hash;
-
-                for _ in 1..batch_size {
-                    if let Some((meta, data)) = repl_consumer.try_read() {
-                        encode_data_batch(
-                            meta.end_sequence,
-                            &meta.chain_hash,
-                            meta.entry_count,
-                            data,
-                            &mut send_buf,
-                        );
-                        repl_consumer.commit();
-                        last_sequence = meta.end_sequence;
-                        last_chain_hash = meta.chain_hash;
-                    } else {
-                        break;
-                    }
-                }
-
-                let batch_bytes = send_buf.len() as u64;
-                if let Err(e) = writer.write_all(&send_buf) {
-                    return Err(io::Error::other(format!("write DataBatch: {e}")));
-                }
-                if let Err(e) = writer.flush() {
-                    return Err(io::Error::other(format!("flush DataBatch: {e}")));
-                }
-                metrics.bytes_sent[slot_idx].fetch_add(batch_bytes, Ordering::Relaxed);
-                send_buf.clear();
-                last_send = std::time::Instant::now();
-            } else {
-                if last_send.elapsed() >= heartbeat_interval {
-                    encode_heartbeat(last_sequence, &last_chain_hash, &mut send_buf);
-                    if let Err(e) = writer.write_all(&send_buf) {
-                        return Err(io::Error::other(format!("write Heartbeat: {e}")));
-                    }
-                    if let Err(e) = writer.flush() {
-                        return Err(io::Error::other(format!("flush Heartbeat: {e}")));
-                    }
-                    send_buf.clear();
-                    last_send = std::time::Instant::now();
-                }
-                match process_acks(&mut reader, replication_cursor, &mut pollfd) {
-                    Ok(Some(acked_seq)) => {
-                        metrics.acked_sequence[slot_idx].store(acked_seq, Ordering::Relaxed);
-                        metrics.ack_latency_us[slot_idx]
-                            .store(last_send.elapsed().as_micros() as u64, Ordering::Relaxed);
-                    }
-                    Ok(None) => {}
-                    Err(e) => {
-                        return Err(io::Error::other(format!("replica ack read error: {e}")));
-                    }
-                }
-                if busy_spin {
-                    std::hint::spin_loop();
-                } else {
-                    std::thread::yield_now();
-                }
-            }
-        }
-    }
+    live_stream_uring(
+        writer,
+        repl_consumer,
+        replication_cursor,
+        shutdown,
+        evict_flag,
+        metrics,
+        slot_idx,
+        batch_size,
+        heartbeat_interval,
+        busy_spin,
+        &mut send_buf,
+        &mut last_send,
+        &mut last_sequence,
+        &mut last_chain_hash,
+    )
 }
 
 /// io_uring live streaming loop for the primary replication handler.
 ///
-/// Replaces the blocking `write_all`/`flush` + `poll(0)`/`read_frame`
-/// pattern with async RECV/SEND via io_uring. A single RECV is always
+/// Live streaming loop using async RECV/SEND via io_uring. A single RECV is always
 /// in-flight for ack frames; SEND is submitted when the replication ring
 /// has data. Both complete via the memory-mapped CQ with zero syscalls
 /// in the hot path.
-#[cfg(all(feature = "io-uring", not(feature = "no-persist")))]
 #[allow(clippy::too_many_arguments)]
 fn live_stream_uring(
     writer: TcpStream,
@@ -1696,12 +1557,11 @@ fn live_stream_uring(
 
 /// io_uring streaming loop for the replica receiver.
 ///
-/// Replaces blocking `read_frame_into` + `poll(0)` + `send_ack_tcp`
+/// io_uring streaming receive loop for the replica. Uses async RECV/SEND
 /// with async RECV/SEND. A single RECV is always in-flight for
 /// DataBatch frames; SEND is submitted when an ack becomes ready
 /// (journal cursor catches up). Frame parsing uses the same
-/// accumulate-and-extract pattern as the bench client and uring_reader.
-#[cfg(all(feature = "io-uring", not(feature = "no-persist")))]
+/// accumulate-and-extract pattern as the bench client and reader.
 #[allow(clippy::too_many_arguments)]
 fn replica_stream_uring(
     tcp_stream: &TcpStream,
@@ -2079,58 +1939,6 @@ fn replica_stream_uring(
     }
 }
 
-/// Read and process ack frames from the replica using poll(0) for
-/// each frame. Never blocks — returns as soon as no more data is
-/// available. This avoids the ~2ms Linux SO_RCVTIMEO floor that
-/// makes sub-ms read timeouts unreliable.
-///
-/// Returns the last acked sequence seen during this call, or `None` if
-/// no ack was processed. The caller uses this to update per-replica metrics.
-///
-/// Used by the blocking fallback path only — the io_uring path handles
-/// acks via async RECV CQEs.
-#[cfg(not(all(feature = "io-uring", not(feature = "no-persist"))))]
-fn process_acks(
-    reader: &mut TcpStream,
-    replication_cursor: &Arc<AtomicU64>,
-    pollfd: &mut libc::pollfd,
-) -> io::Result<Option<u64>> {
-    let mut last_acked: Option<u64> = None;
-    loop {
-        // Check if more ack data is available before calling read_frame.
-        // poll(0) is truly non-blocking — no kernel jiffy rounding.
-        pollfd.revents = 0;
-        let ready = unsafe { libc::poll(pollfd, 1, 0) };
-        if ready <= 0 || (pollfd.revents & libc::POLLIN) == 0 {
-            return Ok(last_acked); // No data available.
-        }
-
-        match read_frame(reader, MAX_CONTROL_FRAME) {
-            Ok(payload) => match decode_replica_message(&payload) {
-                Ok(ReplicaMessage::Ack(ack)) => {
-                    let new_val = ack.acked_sequence + 1;
-                    let _ = replication_cursor.fetch_max(new_val, Ordering::Release);
-                    last_acked = Some(ack.acked_sequence);
-                }
-                Ok(ReplicaMessage::Handshake(_)) => {
-                    debug!("unexpected Handshake during streaming");
-                }
-                Err(e) => {
-                    debug!(error = %e, "failed to decode replica message");
-                }
-            },
-            Err(e) => {
-                // WouldBlock/TimedOut is expected (non-blocking read).
-                if e.kind() == io::ErrorKind::WouldBlock || e.kind() == io::ErrorKind::TimedOut {
-                    return Ok(last_acked);
-                }
-                // Other errors mean the connection is dead.
-                return Err(e);
-            }
-        }
-    }
-}
-
 // --- Replication Receiver (Replica side) ---
 
 /// Pending ack waiting for journal durability confirmation.
@@ -2163,8 +1971,7 @@ impl PendingAckQueue {
     // receiver and journal stage is the pipelining bottleneck. With
     // io_uring, the deadlock that forced CAP=1 is eliminated (RECV CQEs
     // arrive asynchronously while pop_ready checks the cursor each
-    // iteration). The blocking fallback also works with CAP=8 because
-    // is_full() triggers pop_oldest_blocking before the next read.
+    // iteration).
     const CAP: usize = 8;
     const MASK: usize = Self::CAP - 1;
 
@@ -2260,8 +2067,7 @@ fn send_ack_tcp(
     Ok(())
 }
 
-/// Outcome of the inner streaming receive loop. Used by both the
-/// io_uring and blocking fallback paths.
+/// Outcome of the inner streaming receive loop.
 enum SessionExit {
     Shutdown,
     Promote,
@@ -2283,6 +2089,7 @@ pub type ReceiverResult = Result<
     Box<dyn std::error::Error>,
 >;
 
+#[allow(clippy::too_many_arguments)]
 pub fn run_receiver(
     primary_addr: SocketAddr,
     journal_path: &std::path::Path,
@@ -2326,8 +2133,6 @@ pub fn run_receiver(
 
     // Reusable buffers — survive across reconnections.
     let mut send_buf = Vec::with_capacity(64);
-    #[cfg(not(all(feature = "io-uring", not(feature = "no-persist"))))]
-    let mut frame_buf: Vec<u8> = Vec::with_capacity(64 * 1024);
     let mut journal_accum: Vec<u8> = Vec::with_capacity(128 * 1024);
     let mut accum_end_sequence: u64 = 0;
     let mut accum_chain_hash: [u8; 32] = [0u8; 32];
@@ -2664,8 +2469,6 @@ pub fn run_receiver(
         let mut pending_acks = PendingAckQueue::new();
         let mut received_data = false;
 
-        // Dispatch to io_uring or blocking streaming loop.
-        #[cfg(all(feature = "io-uring", not(feature = "no-persist")))]
         let exit_reason: SessionExit = replica_stream_uring(
             &tcp_writer,
             &input_producer,
@@ -2679,153 +2482,6 @@ pub fn run_receiver(
             shutdown,
             promote,
         );
-
-        #[cfg(not(all(feature = "io-uring", not(feature = "no-persist"))))]
-        let exit_reason: SessionExit = {
-            loop {
-                if shutdown.load(Ordering::Relaxed) {
-                    info!("replica shutting down");
-                    break SessionExit::Shutdown;
-                }
-
-                if promote.load(Ordering::Acquire) {
-                    info!("promotion triggered — stopping replication, transitioning to primary");
-                    drain_tcp_data_batches(
-                        &mut reader,
-                        &mut frame_buf,
-                        &mut journal_accum,
-                        &mut accum_end_sequence,
-                        &mut accum_chain_hash,
-                    );
-                    if !journal_accum.is_empty() {
-                        if let Ok(target) = submit_batch_to_pipeline(
-                            &journal_accum,
-                            accum_end_sequence,
-                            accum_chain_hash,
-                            &input_producer,
-                            &raw_journal_tx,
-                        ) {
-                            pending_acks.push(target, accum_end_sequence);
-                        }
-                        journal_accum.clear();
-                    }
-                    break SessionExit::Promote;
-                }
-
-                // Flush durable acks (non-blocking).
-                if let Some(seq) = pending_acks.pop_ready(&journal_cursor)
-                    && let Err(e) = send_ack_tcp(seq, &mut tcp_writer, &mut send_buf)
-                {
-                    warn!(error = %e, "failed to send ack — disconnecting");
-                    break SessionExit::Disconnected;
-                }
-
-                // Backpressure: block until oldest batch is durable.
-                if pending_acks.is_full() {
-                    let seq = pending_acks.pop_oldest_blocking(&journal_cursor);
-                    if let Err(e) = send_ack_tcp(seq, &mut tcp_writer, &mut send_buf) {
-                        warn!(error = %e, "failed to send ack — disconnecting");
-                        break SessionExit::Disconnected;
-                    }
-                }
-
-                // When acks are pending, poll(0) before blocking on read.
-                if !pending_acks.is_empty() {
-                    let mut pfd = libc::pollfd {
-                        fd: std::os::unix::io::AsRawFd::as_raw_fd(&reader),
-                        events: libc::POLLIN,
-                        revents: 0,
-                    };
-                    let ready = unsafe { libc::poll(&mut pfd, 1, 0) };
-                    if ready <= 0 || (pfd.revents & libc::POLLIN) == 0 {
-                        continue;
-                    }
-                }
-
-                // Read next frame (blocking, 5s timeout for shutdown check).
-                match read_frame_into(&mut reader, &mut frame_buf, MAX_DATA_FRAME) {
-                    Ok(()) => {}
-                    Err(e)
-                        if e.kind() == io::ErrorKind::WouldBlock
-                            || e.kind() == io::ErrorKind::TimedOut =>
-                    {
-                        continue;
-                    }
-                    Err(e) => {
-                        warn!(error = %e, "primary disconnected");
-                        break SessionExit::Disconnected;
-                    }
-                }
-
-                let message = match decode_primary_message(&frame_buf) {
-                    Ok(m) => m,
-                    Err(e) => {
-                        warn!(error = %e, "failed to decode primary message");
-                        break SessionExit::Disconnected;
-                    }
-                };
-                match message {
-                    PrimaryMessage::DataBatch {
-                        end_sequence,
-                        chain_hash: batch_chain_hash,
-                        entry_count: _,
-                        journal_bytes,
-                    } => {
-                        received_data = true;
-                        journal_accum.extend_from_slice(&journal_bytes);
-                        accum_end_sequence = end_sequence;
-                        accum_chain_hash = batch_chain_hash;
-
-                        drain_tcp_data_batches(
-                            &mut reader,
-                            &mut frame_buf,
-                            &mut journal_accum,
-                            &mut accum_end_sequence,
-                            &mut accum_chain_hash,
-                        );
-
-                        let target = match submit_batch_to_pipeline(
-                            &journal_accum,
-                            accum_end_sequence,
-                            accum_chain_hash,
-                            &input_producer,
-                            &raw_journal_tx,
-                        ) {
-                            Ok(t) => t,
-                            Err(e) => {
-                                error!(error = %e, "failed to submit batch to pipeline");
-                                break SessionExit::Disconnected;
-                            }
-                        };
-
-                        pending_acks.push(target, accum_end_sequence);
-                        journal_accum.clear();
-                    }
-                    PrimaryMessage::Heartbeat {
-                        sequence,
-                        chain_hash: _,
-                    } => {
-                        debug!(sequence, "heartbeat from primary");
-                    }
-                    PrimaryMessage::StreamStart { .. } => {
-                        debug!("unexpected StreamStart during streaming");
-                    }
-                    PrimaryMessage::NeedSnapshot => {
-                        break SessionExit::Fatal(
-                            "primary says we need a snapshot transfer mid-stream".into(),
-                        );
-                    }
-                    PrimaryMessage::HashMismatch => {
-                        break SessionExit::Fatal("chain hash mismatch from primary".into());
-                    }
-                    PrimaryMessage::SnapshotBegin { .. }
-                    | PrimaryMessage::SnapshotChunk(_)
-                    | PrimaryMessage::SnapshotEnd { .. } => {
-                        debug!("unexpected snapshot message during streaming");
-                    }
-                }
-            }
-        };
 
         // --- Common teardown (all exit paths) ---
 
@@ -2942,7 +2598,6 @@ fn sleep_checking_flags(
     }
 }
 
-/// Drain DataBatch frames from the TCP buffer using non-blocking poll(0).
 /// Shut down the replica pipeline and extract Exchange + JournalWriter from
 /// the stage threads. Returns None if a thread panicked.
 fn shutdown_pipeline(
@@ -2963,57 +2618,6 @@ fn shutdown_pipeline(
         let _ = h.join();
     }
     Some((exchange, writer))
-}
-
-/// Drain DataBatch frames from the TCP buffer using non-blocking poll(0).
-/// Used by the blocking fallback path only — the io_uring receiver
-/// handles coalescing implicitly via the recv buffer.
-#[cfg_attr(
-    all(feature = "io-uring", not(feature = "no-persist")),
-    allow(dead_code)
-)]
-fn drain_tcp_data_batches(
-    reader: &mut TcpStream,
-    frame_buf: &mut Vec<u8>,
-    journal_accum: &mut Vec<u8>,
-    accum_end_sequence: &mut u64,
-    accum_chain_hash: &mut [u8; 32],
-) {
-    let mut rpollfd = libc::pollfd {
-        fd: std::os::unix::io::AsRawFd::as_raw_fd(reader),
-        events: libc::POLLIN,
-        revents: 0,
-    };
-    loop {
-        rpollfd.revents = 0;
-        let ready = (unsafe { libc::poll(&mut rpollfd, 1, 0) }) > 0
-            && (rpollfd.revents & libc::POLLIN) != 0;
-        if !ready {
-            break;
-        }
-        match read_frame_into(reader, frame_buf, MAX_DATA_FRAME) {
-            Ok(()) => {}
-            Err(e)
-                if e.kind() == io::ErrorKind::WouldBlock || e.kind() == io::ErrorKind::TimedOut =>
-            {
-                break;
-            }
-            Err(_) => break,
-        }
-        match decode_primary_message(frame_buf) {
-            Ok(PrimaryMessage::DataBatch {
-                end_sequence,
-                entry_count: _,
-                journal_bytes,
-                chain_hash,
-            }) => {
-                journal_accum.extend_from_slice(&journal_bytes);
-                *accum_end_sequence = end_sequence;
-                *accum_chain_hash = chain_hash;
-            }
-            _ => break,
-        }
-    }
 }
 
 /// Decode accumulated journal bytes into events, publish to the input

@@ -9,7 +9,7 @@ The server uses a 3-stage pipeline plus a reader pool, modeled after the LMAX Di
 ```
                         +-------------------+
   Reader Pool --------->| Input Disruptor   |-----+----> Journal Stage
-  (N epoll threads,     | (1M-slot ring,    |     |
+  (N io_uring threads,  | (1M-slot ring,    |     |
    MultiProducer CAS)   |  lock-free CAS)   |     +----> Matching Stage
                         +-------------------+              |
                                                            | Output Disruptor Ring
@@ -21,7 +21,7 @@ The server uses a 3-stage pipeline plus a reader pool, modeled after the LMAX Di
                                                      (optional, --event-bind)
 ```
 
-1. **Reader pool** -- N epoll-based threads (default 2) multiplex all client connections and publish decoded requests into the input disruptor via lock-free CAS (`MultiProducer`).
+1. **Reader pool** -- N io_uring-based threads (default 2) multiplex all client connections using multishot RECV and publish decoded requests into the input disruptor via lock-free CAS (`MultiProducer`).
 2. **Journal stage** -- batch-encodes events and writes them durably to disk via `pwritev2` + `RWF_DSYNC` (FUA). Advances its cursor only after the durable write completes.
 3. **Matching stage** -- executes commands against the `Exchange` engine and publishes execution reports to an output disruptor ring. Runs in parallel with the journal stage (does not wait for fsync).
 4. **Response stage** -- consumes from the output ring but gates on the journal cursor before sending responses to clients, enforcing the persist-before-ack invariant.
@@ -125,7 +125,7 @@ Same adaptive spinning as the journal stage: 1,000 spin loops, then `yield_now()
 
 ## Response Stage
 
-Defined in `crates/server/src/response.rs`.
+Defined in `crates/server/src/response.rs` (io_uring-based SEND).
 
 The response stage runs on a dedicated OS thread and is the final stage in the pipeline. It consumes from the output SPSC and writes encoded responses to client sockets.
 
@@ -195,8 +195,8 @@ The server spawns 3-6 dedicated OS threads for the pipeline plus N reader thread
 | Journal | 1 | Durable write-ahead log | No |
 | Matching | 2 | Order execution (single-writer) | No |
 | Response | 3 | Client socket writes | No |
-| Reader 0 | 4 | Epoll-based connection multiplexing | No |
-| Reader 1 | 5 | Epoll-based connection multiplexing | No |
+| Reader 0 | 4 | io_uring-based connection multiplexing | No |
+| Reader 1 | 5 | io_uring-based connection multiplexing | No |
 | Repl Sender | 6 | Stream journal batches to replicas | Yes (`--replication-bind`) |
 | Event Publisher | 7 | Broadcast execution events to subscribers | Yes (`--event-bind`) |
 | Shadow Exchange | 8 | Periodic snapshots without pausing matching | Yes (`--snapshot-interval-secs`) |
@@ -211,7 +211,7 @@ Reader threads are pinned to cores starting at `--reader-cores` (default 4). Rea
 
 ### Why not async
 
-The server is fully synchronous -- no async runtime. Eliminating tokio removes async scheduling jitter from the response path and simplifies reasoning about thread ownership. The reader threads use epoll directly (via libc) for connection multiplexing, and the pipeline threads use spin-wait loops with adaptive yielding.
+The server is fully synchronous -- no async runtime. Eliminating tokio removes async scheduling jitter from the response path and simplifies reasoning about thread ownership. The reader threads use io_uring with multishot RECV for connection multiplexing, and the pipeline threads use spin-wait loops with adaptive yielding.
 
 ## Persist-Before-Ack Invariant
 
@@ -238,7 +238,7 @@ Because the journal and matching consumers run in parallel (not chained), the ma
 | Flag | Default | Description |
 |------|---------|-------------|
 | `--cores` | `1,2,3,6,7,8` | Pipeline core IDs: journal, matching, response, repl-sender, event-publisher, shadow (comma-separated) |
-| `--readers` | `2` | Number of epoll reader threads |
+| `--readers` | `2` | Number of io_uring reader threads |
 | `--reader-cores` | `4` | First CPU core for reader thread pinning (reader i -> core reader_cores + i) |
 | `--group-commit-us` | `0` | Group commit coalescing delay in microseconds. Keep at 0 for TCP. |
 | `--heartbeat-interval-secs` | `10` | Heartbeat interval for idle connections (0 to disable) |
@@ -253,7 +253,7 @@ Because the journal and matching consumers run in parallel (not chained), the ma
 | `no-fsync` | Disables `RWF_DSYNC` / `fdatasync`. Events are written to the journal file but not synced. The journal cursor advances immediately after encoding (no sync trigger logic). Useful for development. |
 | `pipeline-stats` | Enables busy/idle utilization counters on each stage. Printed on shutdown showing percentage busy, total busy iterations, and total idle iterations. |
 | `latency-trace` | Enables per-event timestamps at each pipeline boundary. Tracks: disruptor wakeup latency (publish to consume), batch processing time, SPSC wakeup latency, dispatch latency, and server-side end-to-end (reader recv to response flush). Histograms are printed on shutdown. The `TraceTimestamp` type is `()` (zero-sized) when disabled, so there is no overhead in production builds. |
-| `io-uring` | Replaces the epoll reader and blocking response writer with io_uring-based implementations. |
+| `io-uring` | No-op (kept for backward compatibility). io_uring is now always used for readers, response writes, and replication I/O. |
 
 ## Key Constants
 
@@ -264,4 +264,4 @@ Because the journal and matching consumers run in parallel (not chained), the ma
 | `MAX_JOURNAL_BATCH` | `1024` | `crates/engine/src/journal/pipeline.rs` |
 | `MAX_BATCH` (response) | `1024` | `crates/server/src/response.rs` |
 | `MAX_RESPONSE_BUF` | `128` bytes | `crates/server/src/response.rs` |
-| `MAX_EPOLL_EVENTS` | `64` | `crates/server/src/reader.rs` |
+| `NUM_BUFFERS` | `2048` | `crates/server/src/reader.rs` (io_uring provided buffer pool) |

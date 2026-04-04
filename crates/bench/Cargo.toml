@@ -4,11 +4,12 @@ version = "0.1.0"
 edition = "2024"
 
 [features]
-default = ["io-uring"]
+default = []
 no-fsync = ["melin-engine/no-fsync"]
 no-persist = ["melin-server/no-persist"]
 latency-trace = ["melin-server/latency-trace"]
-io-uring = ["melin-server/io-uring", "dep:io-uring"]
+## Kept for backward compatibility — io_uring is now always used.
+io-uring = []
 dpdk = ["dep:melin-dpdk", "melin-dpdk/dpdk-sys", "dep:smoltcp"]
 pipeline-stats = ["melin-server/pipeline-stats"]
 plot = ["dep:plotters"]
@@ -35,7 +36,7 @@ rand = "0.9"
 libc = { workspace = true }
 tikv-jemallocator = { workspace = true }
 tracing-subscriber = { workspace = true }
-io-uring = { version = "0.7", optional = true }
+io-uring = "0.7"
 melin-dpdk = { path = "../dpdk", optional = true }
 smoltcp = { version = "0.13", default-features = false, features = ["std", "medium-ethernet", "proto-ipv4", "socket-tcp"], optional = true }
 ratatui = { version = "0.29", optional = true }
