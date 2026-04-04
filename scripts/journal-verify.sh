@@ -25,7 +25,7 @@ SERVER2="$3"
 JOURNAL2="$4"
 
 SSH_OPTS="-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR"
-REPO_DIR="~/workspace/trading"
+REPO_DIR="~/workspace/melin"
 
 echo "=== Journal Verification ==="
 echo ""

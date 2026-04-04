@@ -64,7 +64,7 @@ SSH_OPTS="-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLeve
 SERVER="${SSH_USER}@${SERVER_PUB}"
 BENCH="${SSH_USER}@${BENCH_PUB}"
 
-REPO_DIR="~/workspace/trading"
+REPO_DIR="~/workspace/melin"
 JOURNAL_PATH="${JOURNAL_PATH:-/mnt/journal/bench.journal}"
 SNAPSHOT_PATH="${SNAPSHOT_PATH:-/mnt/journal/bench.snapshot}"
 PORT=9876

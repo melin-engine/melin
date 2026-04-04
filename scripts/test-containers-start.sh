@@ -31,7 +31,7 @@ CLIENT="bench-client"
 REPLICA="bench-replica"
 REPLICA2="bench-replica2"
 IMAGE="ubuntu:24.04"
-REPO_DIR="/root/workspace/trading"
+REPO_DIR="/root/workspace/melin"
 
 # Parse flags.
 WITH_REPLICA=false
@@ -142,7 +142,7 @@ EOF
     docker exec "$name" bash -c "
         source /root/.cargo/env && \
         mkdir -p /root/workspace && \
-        git clone git@github.com:pierre-l/trading.git $REPO_DIR && \
+        git clone git@github.com:pierre-l/melin.git $REPO_DIR && \
         cd $REPO_DIR && \
         $CHECKOUT_CMD
         cargo build --release

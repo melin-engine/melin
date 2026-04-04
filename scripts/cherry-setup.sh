@@ -404,7 +404,7 @@ echo ""
 # ---------------------------------------------------------------------------
 echo "=== Cloning and building ==="
 
-REPO_DIR="$USER_HOME/workspace/trading"
+REPO_DIR="$USER_HOME/workspace/melin"
 
 if [[ -d "$REPO_DIR/.git" ]]; then
     echo "  Repo already exists at $REPO_DIR, pulling latest..."
@@ -413,7 +413,7 @@ else
     echo "  Cloning repo..."
     mkdir -p "$USER_HOME/workspace"
     chown "$USER_NAME:" "$USER_HOME/workspace"
-    run_as_user "git clone git@github.com:pierre-l/trading.git $REPO_DIR"
+    run_as_user "git clone git@github.com:pierre-l/melin.git $REPO_DIR"
     run_as_user "cd $REPO_DIR && git checkout main"
 fi
 

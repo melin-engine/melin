@@ -71,7 +71,7 @@ echo "=== Copying local scripts into containers ==="
 for c in bench-server bench-client bench-replica bench-replica2; do
     for script in lan-bench-suite.sh journal-verify.sh lan-bench.sh dpdk-lan-bench.sh; do
         if [[ -f "${SCRIPT_DIR}/${script}" ]]; then
-            docker cp "${SCRIPT_DIR}/${script}" "$c":/root/workspace/trading/scripts/"${script}"
+            docker cp "${SCRIPT_DIR}/${script}" "$c":/root/workspace/melin/scripts/"${script}"
         fi
     done
     docker exec "$c" mkdir -p /tmp/journal

@@ -37,8 +37,8 @@ The server uses jemalloc by default (thread-local caches eliminate allocator loc
 | Flag | Default | Description |
 |------|---------|-------------|
 | `--bind` | `127.0.0.1:9876` | TCP address to bind. Use `0.0.0.0:9876` for LAN access. |
-| `--journal` | `trading.journal` | Path to the journal file. Use a dedicated NVMe for best latency. |
-| `--snapshot` | (derived) | Path to the snapshot file. If omitted, defaults to `<journal>.snapshot` (e.g., `trading.snapshot`). |
+| `--journal` | `melin.journal` | Path to the journal file. Use a dedicated NVMe for best latency. |
+| `--snapshot` | (derived) | Path to the snapshot file. If omitted, defaults to `<journal>.snapshot` (e.g., `melin.snapshot`). |
 | `--authorized-keys` | `authorized_keys` | Path to the Ed25519 authorized keys file. Every connection must authenticate before trading. Ignored in replica mode (`--replica-of`). |
 | `--cores` | `1,2,3,6,7,8` | Pipeline core IDs: `journal,matching,response,repl-sender,event-publisher,shadow` (comma-separated). Core 0 should be reserved for OS/IRQ. |
 | `--readers` | `2` | Number of epoll reader threads. Each multiplexes connections via epoll. |
@@ -89,8 +89,8 @@ The server supports synchronous replication. Exactly one of `--replication-bind`
 ./target/release/melin-server \
     --bind 0.0.0.0:9876 \
     --health-bind 0.0.0.0:9878 \
-    --journal /mnt/nvme/trading.journal \
-    --authorized-keys /etc/trading/authorized_keys \
+    --journal /mnt/nvme/melin.journal \
+    --authorized-keys /etc/melin/authorized_keys \
     --cores 1,2,3,6,7,8 \
     --readers 2 \
     --reader-cores 4 \
@@ -105,8 +105,8 @@ The server supports synchronous replication. Exactly one of `--replication-bind`
 ./target/release/melin-server \
     --bind 0.0.0.0:9876 \
     --health-bind 0.0.0.0:9878 \
-    --journal /mnt/nvme/trading.journal \
-    --authorized-keys /etc/trading/authorized_keys \
+    --journal /mnt/nvme/melin.journal \
+    --authorized-keys /etc/melin/authorized_keys \
     --cores 1,2,3,6,7,8 \
     --readers 2 \
     --reader-cores 4 \
@@ -115,7 +115,7 @@ The server supports synchronous replication. Exactly one of `--replication-bind`
 
 # Replica (separate machine)
 ./target/release/melin-server \
-    --journal /mnt/nvme/trading.journal \
+    --journal /mnt/nvme/melin.journal \
     --cores 1,2,3,6,7,8 \
     --replica-of <primary-ip>:9877 \
     --replication-key /etc/melin/replication.key
@@ -130,8 +130,8 @@ The event channel provides a real-time firehose of all execution events (fills, 
     --bind 0.0.0.0:9876 \
     --health-bind 0.0.0.0:9878 \
     --event-bind 0.0.0.0:9879 \
-    --journal /mnt/nvme/trading.journal \
-    --authorized-keys /etc/trading/authorized_keys \
+    --journal /mnt/nvme/melin.journal \
+    --authorized-keys /etc/melin/authorized_keys \
     --cores 1,2,3,6,7,8 \
     --readers 2 \
     --reader-cores 4 \
@@ -240,7 +240,7 @@ Rotation is triggered at startup when the journal exceeds `--max-journal-mib` (d
 
 1. **Save snapshot**: Writes the full exchange state (accounts, order books, instruments, circuit breakers, risk limits) to the snapshot file. Written atomically via `.tmp` + rename.
 2. **Archive old journal**: Renames the current journal using a numeric suffix scheme:
-   - `trading.journal` becomes `trading.journal.1`
+   - `melin.journal` becomes `melin.journal.1`
    - Existing `.1` becomes `.2`, `.2` becomes `.3`, etc.
    - Renames happen in reverse order to avoid overwriting.
 3. **Create new journal**: Opens a fresh journal file continuing the sequence numbering and BLAKE3 hash chain from where the old journal left off.
@@ -248,10 +248,10 @@ Rotation is triggered at startup when the journal exceeds `--max-journal-mib` (d
 ### Archive Naming
 
 ```
-trading.journal      <-- current (active)
-trading.journal.1    <-- previous rotation
-trading.journal.2    <-- two rotations ago
-trading.journal.3    <-- three rotations ago
+melin.journal      <-- current (active)
+melin.journal.1    <-- previous rotation
+melin.journal.2    <-- two rotations ago
+melin.journal.3    <-- three rotations ago
 ...
 ```
 
@@ -313,26 +313,26 @@ The only state shared between stages is the BLAKE3 chain hash, published by the 
 
 ```sh
 ./target/release/melin-server \
-    --journal /mnt/nvme/trading.journal \
-    --snapshot-path /var/lib/melin/trading.snapshot \
+    --journal /mnt/nvme/melin.journal \
+    --snapshot-path /var/lib/melin/melin.snapshot \
     --snapshot-interval-secs 60 \
     --cores 1,2,3,6,7,8 \
     ...
 ```
 
-If `--snapshot-path` is omitted, the snapshot defaults to `<journal>.snapshot` (e.g., `/mnt/nvme/trading.snapshot`), which shares the journal NVMe.
+If `--snapshot-path` is omitted, the snapshot defaults to `<journal>.snapshot` (e.g., `/mnt/nvme/melin.snapshot`), which shares the journal NVMe.
 
 ### Snapshot Rotation
 
 Each snapshot save rotates the previous snapshot to `<path>.prev` before writing the new one. This gives operators a one-deep rollback point:
 
-- `trading.snapshot` — the latest snapshot (most recent interval).
-- `trading.snapshot.prev` — the previous snapshot (one interval older).
+- `melin.snapshot` — the latest snapshot (most recent interval).
+- `melin.snapshot.prev` — the previous snapshot (one interval older).
 
 If the latest snapshot is corrupt or contains undesired state (e.g., bad market data caused incorrect fills), operators can recover from the `.prev` snapshot by renaming it back:
 
 ```sh
-mv trading.snapshot.prev trading.snapshot
+mv melin.snapshot.prev melin.snapshot
 ```
 
 The rotation is best-effort: if the `.prev` rename fails (e.g., permission error), the save proceeds anyway — losing the rollback point is preferable to failing the snapshot entirely. On first save after startup, there is no previous snapshot to rotate, so no `.prev` file is created.

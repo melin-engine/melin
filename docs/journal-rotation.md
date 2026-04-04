@@ -13,10 +13,10 @@ Journal rotation prevents unbounded disk growth by periodically snapshotting and
 ## File Layout
 
 ```
-trading.journal          Current journal (active writes)
-trading.snapshot         Latest snapshot (from most recent rotation)
-trading.journal.1        Previous journal (archived by last rotation)
-trading.journal.2        Journal before that (archived by rotation before last)
+melin.journal          Current journal (active writes)
+melin.snapshot         Latest snapshot (from most recent rotation)
+melin.journal.1        Previous journal (archived by last rotation)
+melin.journal.2        Journal before that (archived by rotation before last)
 ...
 ```
 
@@ -25,8 +25,8 @@ trading.journal.2        Journal before that (archived by rotation before last)
 Rotation happens **at server startup**, not during live operation. When `--max-journal-mib` is set (default: 256 MiB) and the journal exceeds that threshold after recovery, the server:
 
 1. Saves a snapshot at the current sequence boundary
-2. Renames `trading.journal` to `trading.journal.1` (bumping existing archives: `.1` -> `.2`, `.2` -> `.3`, etc.)
-3. Creates a new `trading.journal` continuing from the next sequence number
+2. Renames `melin.journal` to `melin.journal.1` (bumping existing archives: `.1` -> `.2`, `.2` -> `.3`, etc.)
+3. Creates a new `melin.journal` continuing from the next sequence number
 
 The server then proceeds to start the pipeline with the fresh journal.
 
@@ -48,7 +48,7 @@ The server evaluates recovery mode at startup in this priority order:
 
 ### 1. Snapshot + journal both exist
 
-**Files present:** `trading.snapshot`, `trading.journal`
+**Files present:** `melin.snapshot`, `melin.journal`
 
 **Recovery flow:**
 1. Load snapshot (restores state as of sequence N)
@@ -62,7 +62,7 @@ The server evaluates recovery mode at startup in this priority order:
 
 ### 2. Snapshot exists, journal missing
 
-**Files present:** `trading.snapshot` (no `trading.journal`)
+**Files present:** `melin.snapshot` (no `melin.journal`)
 
 **Recovery flow:**
 1. Load snapshot (restores state as of sequence N)
@@ -72,7 +72,7 @@ The server evaluates recovery mode at startup in this priority order:
 
 ### 3. Journal exists, no snapshot
 
-**Files present:** `trading.journal` (no `trading.snapshot`)
+**Files present:** `melin.journal` (no `melin.snapshot`)
 
 **Recovery flow:**
 1. Open journal, replay all entries from sequence 1
@@ -93,9 +93,9 @@ The server evaluates recovery mode at startup in this priority order:
 
 ### 5. Crash during snapshot write
 
-The snapshot is written atomically: data goes to `trading.snapshot.tmp`, is synced to disk, then renamed to `trading.snapshot`. If the server crashes during the write, the `.tmp` file contains partial data but the rename never happens. On restart:
+The snapshot is written atomically: data goes to `melin.snapshot.tmp`, is synced to disk, then renamed to `melin.snapshot`. If the server crashes during the write, the `.tmp` file contains partial data but the rename never happens. On restart:
 
-- If a previous `trading.snapshot` exists, it is used (still valid from the prior rotation)
+- If a previous `melin.snapshot` exists, it is used (still valid from the prior rotation)
 - If no previous snapshot exists, falls through to journal-only recovery (#3)
 
 No data loss in either case.
@@ -119,7 +119,7 @@ The journal pre-allocates 64 MiB chunks via `posix_fallocate()` to avoid extent 
 
 | Flag | Default | Description |
 |---|---|---|
-| `--journal <path>` | `trading.journal` | Path to the active journal file |
+| `--journal <path>` | `melin.journal` | Path to the active journal file |
 | `--snapshot <path>` | (derived: `<journal>.snapshot`) | Explicit snapshot path. If not set, the server checks `<journal-path-with-.snapshot-extension>` |
 | `--max-journal-mib <N>` | `256` | Rotate when journal exceeds N MiB at startup. Set to 0 to disable |
 

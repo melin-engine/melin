@@ -344,7 +344,7 @@ Every v6 journal maintains a running BLAKE3 hash chain for tamper evidence and r
 When the journal file exceeds the configured size threshold (`--max-journal-mib`, default 256 MiB), rotation triggers at startup:
 
 1. **Save snapshot** at the current sequence boundary (includes chain hash).
-2. **Archive old journal** by renaming: `trading.journal` → `trading.journal.1` (bumping existing archives: `.1` → `.2`, etc.).
+2. **Archive old journal** by renaming: `melin.journal` → `melin.journal.1` (bumping existing archives: `.1` → `.2`, etc.).
 3. **Create new journal** continuing from the same sequence with a genesis hash = old chain hash.
 
 Recovery from snapshot + new journal produces identical state. Old journals are kept for audit.

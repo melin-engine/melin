@@ -103,4 +103,4 @@ fi
 
 echo ""
 echo "=== Deployment complete. Connecting... ==="
-exec ssh -t "$REMOTE" "cd ~/workspace/trading && exec bash --login"
+exec ssh -t "$REMOTE" "cd ~/workspace/melin && exec bash --login"

@@ -88,7 +88,7 @@ REPLICA="${REPLICA_PUB:+${SSH_USER}@${REPLICA_PUB}}"
 REPLICA2="${REPLICA2_PUB:+${SSH_USER}@${REPLICA2_PUB}}"
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-REPO_DIR="~/workspace/trading"
+REPO_DIR="~/workspace/melin"
 JOURNAL_PATH="${JOURNAL_PATH:-/mnt/journal/bench.journal}"
 SNAPSHOT_PATH="${SNAPSHOT_PATH:-/mnt/journal/bench.snapshot}"
 JOURNAL_DIR="$(dirname "$JOURNAL_PATH")"
@@ -529,7 +529,7 @@ transport_start_tcp_repl() {
             --journal ${replica_journal} \
             --authorized-keys ${REPO_DIR}/authorized_keys \
             ${REPLICA_EXTRA_ARGS:-} \
-        >/tmp/trading-replica.log 2>&1 </dev/null &" </dev/null
+        >/tmp/melin-replica.log 2>&1 </dev/null &" </dev/null
 
     wait_for_log "$SERVER" "/tmp/melin-server.log" "listening addr=${SERVER_VLAN}:9876" 120 "Primary"
     CURRENT_BIND="${SERVER_VLAN}:9876"
@@ -574,7 +574,7 @@ transport_start_tcp_dual_repl() {
             --journal ${replica_journal} \
             --authorized-keys ${REPO_DIR}/authorized_keys \
             ${REPLICA_EXTRA_ARGS:-} \
-        >/tmp/trading-replica.log 2>&1 </dev/null &" </dev/null
+        >/tmp/melin-replica.log 2>&1 </dev/null &" </dev/null
 
     ssh $SSH_OPTS "$REPLICA2" "pkill -x melin-server 2>/dev/null; true"
     sleep 1
@@ -584,7 +584,7 @@ transport_start_tcp_dual_repl() {
             --journal ${replica2_journal} \
             --authorized-keys ${REPO_DIR}/authorized_keys \
             ${REPLICA_EXTRA_ARGS:-} \
-        >/tmp/trading-replica.log 2>&1 </dev/null &" </dev/null
+        >/tmp/melin-replica.log 2>&1 </dev/null &" </dev/null
 
     wait_for_log "$SERVER" "/tmp/melin-server.log" "listening addr=${SERVER_VLAN}:9876" 120 "Primary"
     CURRENT_BIND="${SERVER_VLAN}:9876"
@@ -804,7 +804,7 @@ transport_start_dpdk_repl() {
             --dpdk-ip ${REPLICA_DPDK_IP} \
             --dpdk-prefix-len ${REPLICA_DPDK_PREFIX} \
             --dpdk-ports ${REPLICA_DPDK_PORT} \
-        >/tmp/trading-replica.log 2>&1 </dev/null &" </dev/null
+        >/tmp/melin-replica.log 2>&1 </dev/null &" </dev/null
 
     wait_for_log "$SERVER" "/tmp/melin-server.log" "listening" 120 "DPDK primary"
 

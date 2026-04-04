@@ -52,7 +52,7 @@ pub struct ServerConfig {
     #[arg(long, default_value = "127.0.0.1:9876")]
     pub bind: SocketAddr,
     /// Path to the journal file for durable event sourcing.
-    #[arg(long, default_value = "trading.journal")]
+    #[arg(long, default_value = "melin.journal")]
     pub journal: PathBuf,
     /// Path to a snapshot file for faster recovery.
     #[arg(long)]
@@ -238,7 +238,7 @@ impl Default for ServerConfig {
         // mirror those clap defaults plus the dpdk extras.
         Self {
             bind: "127.0.0.1:9876".parse().expect("valid default addr"),
-            journal: PathBuf::from("trading.journal"),
+            journal: PathBuf::from("melin.journal"),
             snapshot: None,
             cores: PipelineCores {
                 journal: 1,
