@@ -1,14 +1,27 @@
-//! CPU core pinning for pipeline threads.
+//! CPU core pinning and real-time scheduling for pipeline threads.
 //!
-//! Uses `sched_setaffinity` directly via libc — no wrapper crate needed.
+//! Uses `sched_setaffinity` and `sched_setscheduler` directly via libc.
 //! Pinning each pipeline thread to a dedicated core eliminates involuntary
 //! context switches and keeps hot data in L1/L2 cache, reducing p99/p99.9
 //! latency jitter from ~5-20µs per core migration to near zero.
+//!
+//! `SCHED_FIFO` (real-time FIFO scheduling) prevents the CFS scheduler from
+//! preempting pipeline threads for lower-priority work. On isolated cores
+//! (`isolcpus` + `nohz_full`) this is belt-and-suspenders — the kernel
+//! rarely schedules anything else there — but it eliminates the residual
+//! risk of a kernel thread or workqueue temporarily preempting a pipeline
+//! thread. Requires `CAP_SYS_NICE` or root; degrades gracefully to
+//! `SCHED_OTHER` if unavailable.
 
-/// Pin the calling thread to the specified logical CPU core.
+/// Pin the calling thread to the specified logical CPU core and set
+/// `SCHED_FIFO` real-time scheduling priority.
 ///
 /// Must be called from within the target thread (uses tid 0 = "self").
 /// Returns the core ID on success for logging convenience.
+///
+/// `SCHED_FIFO` failure is non-fatal: the thread continues with default
+/// scheduling. This allows running without `CAP_SYS_NICE` during
+/// development while getting real-time priority in production.
 pub fn pin_to_core(core_id: usize) -> Result<usize, String> {
     // cpu_set_t supports up to 1024 CPUs on Linux. Validate before
     // calling CPU_SET to avoid a panic in the libc wrapper.
@@ -28,22 +41,46 @@ pub fn pin_to_core(core_id: usize) -> Result<usize, String> {
             &set,
         );
 
-        if ret == 0 {
-            Ok(core_id)
-        } else {
-            Err(format!(
+        if ret != 0 {
+            return Err(format!(
                 "sched_setaffinity failed for core {core_id}: {}",
                 std::io::Error::last_os_error()
-            ))
+            ));
+        }
+    }
+
+    // Set SCHED_FIFO with minimum real-time priority (1). Higher
+    // priorities are reserved for kernel threads like migration and
+    // watchdog. Priority 1 is sufficient — on an isolated core there
+    // is no contention with other RT tasks.
+    set_realtime_fifo(1);
+
+    Ok(core_id)
+}
+
+/// Attempt to set `SCHED_FIFO` real-time scheduling on the calling thread.
+fn set_realtime_fifo(priority: i32) {
+    unsafe {
+        let param = libc::sched_param {
+            sched_priority: priority,
+        };
+        let ret = libc::sched_setscheduler(0, libc::SCHED_FIFO, &param);
+        if ret != 0 {
+            // Non-fatal: EPERM when running without CAP_SYS_NICE.
+            tracing::warn!(
+                error = %std::io::Error::last_os_error(),
+                "SCHED_FIFO failed (run as root or grant CAP_SYS_NICE)"
+            );
         }
     }
 }
 
-/// Clear CPU affinity for the calling thread, allowing it to run on any core.
+/// Clear CPU affinity and reset scheduling policy for the calling thread.
 ///
-/// Child threads spawned from a pinned parent inherit the parent's
-/// single-core affinity mask. Call this at the start of the child thread
-/// to restore the full core set.
+/// Child threads spawned from a pinned parent inherit both the parent's
+/// single-core affinity mask and its `SCHED_FIFO` policy. Call this at
+/// the start of the child thread to restore the full core set and
+/// default `SCHED_OTHER` scheduling.
 pub fn clear_affinity() -> Result<(), String> {
     unsafe {
         let mut set: libc::cpu_set_t = std::mem::zeroed();
@@ -55,14 +92,26 @@ pub fn clear_affinity() -> Result<(), String> {
 
         let ret = libc::sched_setaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &set);
 
-        if ret == 0 {
-            Ok(())
-        } else {
-            Err(format!(
+        if ret != 0 {
+            return Err(format!(
                 "sched_setaffinity (clear) failed: {}",
                 std::io::Error::last_os_error()
-            ))
+            ));
         }
+
+        // Reset to default CFS scheduling. If the parent was
+        // SCHED_FIFO, the child inherits it — a non-pinned thread
+        // with SCHED_FIFO could starve other work on shared cores.
+        let param = libc::sched_param { sched_priority: 0 };
+        let ret = libc::sched_setscheduler(0, libc::SCHED_OTHER, &param);
+        if ret != 0 {
+            return Err(format!(
+                "sched_setscheduler (SCHED_OTHER) failed: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+
+        Ok(())
     }
 }
 
