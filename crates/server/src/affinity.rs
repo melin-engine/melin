@@ -12,12 +12,23 @@
 //! risk of a kernel thread or workqueue temporarily preempting a pipeline
 //! thread. Requires `CAP_SYS_NICE` or root; degrades gracefully to
 //! `SCHED_OTHER` if unavailable.
+//!
+//! **Core 0 exception**: `SCHED_FIFO` is never set on core 0. Core 0 is
+//! the housekeeping core shared by the kernel, IRQ handlers, and other
+//! system processes. Real-time priority there would starve critical work.
+//! In tests, all cores default to 0 (`--cores 0,0,0,...`) — without this
+//! guard, multiple server processes with RT threads on core 0 starve the
+//! test harness.
 
 /// Pin the calling thread to the specified logical CPU core and set
 /// `SCHED_FIFO` real-time scheduling priority.
 ///
 /// Must be called from within the target thread (uses tid 0 = "self").
 /// Returns the core ID on success for logging convenience.
+///
+/// `SCHED_FIFO` is only set on non-zero cores. Core 0 is the shared
+/// housekeeping core — RT priority there starves the kernel and other
+/// processes.
 ///
 /// `SCHED_FIFO` failure is non-fatal: the thread continues with default
 /// scheduling. This allows running without `CAP_SYS_NICE` during
@@ -49,11 +60,12 @@ pub fn pin_to_core(core_id: usize) -> Result<usize, String> {
         }
     }
 
-    // Set SCHED_FIFO with minimum real-time priority (1). Higher
-    // priorities are reserved for kernel threads like migration and
-    // watchdog. Priority 1 is sufficient — on an isolated core there
-    // is no contention with other RT tasks.
-    set_realtime_fifo(1);
+    // Set SCHED_FIFO with minimum real-time priority (1) on isolated
+    // cores only. Core 0 is the housekeeping core — RT priority there
+    // would starve the kernel, IRQ handlers, and other processes.
+    if core_id > 0 {
+        set_realtime_fifo(1);
+    }
 
     Ok(core_id)
 }
