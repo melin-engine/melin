@@ -141,6 +141,16 @@ pub struct ServerConfig {
     #[arg(long, default_value_t = 256)]
     pub replication_ring_size: usize,
 
+    /// Disable quorum-based durability. By default, when 2 replicas have
+    /// acked an event the response stage sends without waiting for the local
+    /// journal fsync — removing NVMe tail latency from the critical path.
+    /// The journal still writes (for local crash recovery) but does not gate
+    /// client responses. Falls back to fsync-gated mode automatically when
+    /// fewer than 2 replicas are connected. This flag forces fsync-gated
+    /// mode unconditionally (useful for debugging).
+    #[arg(long, default_value_t = false)]
+    pub no_quorum_durability: bool,
+
     /// Yield to the OS scheduler when pipeline threads are idle instead
     /// of busy-spinning. Use on shared machines without isolated cores to
     /// avoid starving other processes. Default (no flag) is busy-spin,
@@ -255,6 +265,7 @@ impl Default for ServerConfig {
             max_journal_batch: 1024,
             replication_heartbeat_secs: 5,
             replication_ring_size: 256,
+            no_quorum_durability: false,
             yield_idle: false,
             dpdk_eal_args: String::new(),
             dpdk_ports: vec![0],
@@ -530,7 +541,6 @@ fn run_as_primary<L: BlockingTransportListener>(
     if enable_replication && config.standalone {
         return Err("--replication-bind and --standalone are mutually exclusive".into());
     }
-
     // Read the raw genesis entry bytes from the journal file before
     // moving the writer into the pipeline. Sent to the replica during
     // handshake so it can write a byte-identical genesis, ensuring the
@@ -594,6 +604,14 @@ fn run_as_primary<L: BlockingTransportListener>(
         enable_event_publisher,
         enable_shadow,
     );
+    // Fastest-replica cursor: `max(slot0_acked, slot1_acked)`. Used by the
+    // response stage for quorum durability — an event is durable if either
+    // both replicas acked (replication_cursor) or the journal fsynced and
+    // the fastest replica acked (journal_cursor.min(fastest_replica_cursor)).
+    // Initialized to u64::MAX so `min(journal, u64::MAX) = journal` when
+    // no replicas are connected.
+    let fastest_replica_cursor = Arc::new(AtomicU64::new(u64::MAX));
+
     // Consumer 0 is always the response stage. Consumer 1 (if present)
     // is the event publisher — only created when --event-bind is set.
     let output_consumer = output_consumers.remove(0);
@@ -658,6 +676,8 @@ fn run_as_primary<L: BlockingTransportListener>(
     // later for seed drain gating.
     let journal_cursor_response = Arc::clone(&journal_cursor);
     let replication_cursor_response = Arc::clone(&replication_cursor);
+    let fastest_replica_cursor_response = Arc::clone(&fastest_replica_cursor);
+    let quorum_durability = !config.no_quorum_durability;
     let s3 = Arc::clone(&shutdown);
     let busy_spin = !config.yield_idle;
     let response_handle = std::thread::Builder::new()
@@ -669,6 +689,8 @@ fn run_as_primary<L: BlockingTransportListener>(
                 control_rx,
                 journal_cursor_response,
                 replication_cursor_response,
+                fastest_replica_cursor_response,
+                quorum_durability,
                 &s3,
                 heartbeat_interval,
                 busy_spin,
@@ -700,6 +722,7 @@ fn run_as_primary<L: BlockingTransportListener>(
             .expect("replication_bind must be set");
         let s_repl = Arc::clone(&shutdown);
         let repl_cursor = Arc::clone(&replication_cursor);
+        let fastest_repl_cursor = Arc::clone(&fastest_replica_cursor);
         let ready_flag = Arc::clone(&replica_ready);
         let connected_counter = replicas_connected
             .clone()
@@ -750,6 +773,7 @@ fn run_as_primary<L: BlockingTransportListener>(
                     repl_consumer_1,
                     repl_consumer_2,
                     repl_cursor,
+                    fastest_repl_cursor,
                     genesis_entry,
                     journal_path,
                     repl_auth_keys,
@@ -1399,6 +1423,9 @@ pub fn run_dpdk(
         None
     };
 
+    // Fastest-replica cursor (see TCP path for explanation).
+    let fastest_replica_cursor = Arc::new(AtomicU64::new(u64::MAX));
+
     // Control channel: DPDK poll thread → response stage (connect/disconnect).
     let (control_tx, control_rx) = std::sync::mpsc::channel();
 
@@ -1442,6 +1469,8 @@ pub fn run_dpdk(
     let output_consumer = output_consumers.remove(0);
     let journal_cursor_response = Arc::clone(&journal_cursor);
     let replication_cursor_response = Arc::clone(&replication_cursor);
+    let fastest_replica_cursor_response = Arc::clone(&fastest_replica_cursor);
+    let quorum_durability = !config.no_quorum_durability;
     let active_connections_response = Arc::clone(&active_connections);
     let s3 = Arc::clone(&shutdown);
     let response_handle = std::thread::Builder::new()
@@ -1453,6 +1482,8 @@ pub fn run_dpdk(
                 control_rx,
                 journal_cursor_response,
                 replication_cursor_response,
+                fastest_replica_cursor_response,
+                quorum_durability,
                 &s3,
                 heartbeat_interval,
                 active_connections_response,
@@ -1490,6 +1521,7 @@ pub fn run_dpdk(
 
         let s_repl = Arc::clone(&shutdown);
         let repl_cursor = Arc::clone(&replication_cursor);
+        let fastest_repl_cursor = Arc::clone(&fastest_replica_cursor);
         let ready_flag = Arc::clone(&replica_ready);
         let batch_size = config.replication_batch_size;
         let heartbeat_secs = config.replication_heartbeat_secs;
@@ -1537,6 +1569,7 @@ pub fn run_dpdk(
                     repl_transport,
                     [repl_consumer_1, repl_consumer_2],
                     repl_cursor,
+                    fastest_repl_cursor,
                     genesis_entry,
                     journal_path,
                     &s_repl,

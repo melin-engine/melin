@@ -61,6 +61,8 @@ The server uses jemalloc by default (thread-local caches eliminate allocator loc
 
 The server supports synchronous replication. Exactly one of `--replication-bind`, `--standalone`, or `--replica-of` determines the replication mode. If none is specified, the server runs in implicit standalone mode (replication cursor at `u64::MAX`, responses gated only by the journal).
 
+With quorum durability (default), when 2 replicas are connected the response stage gates on replication acks alone — the local journal still writes but does not block responses. This removes NVMe fsync tail variance from the critical path. When fewer than 2 replicas are connected, responses are automatically gated on both journal and replication.
+
 | Flag | Default | Description |
 |------|---------|-------------|
 | `--replication-bind` | (none) | Address to listen for replica connections (enables primary mode with synchronous replication). |
@@ -70,6 +72,7 @@ The server supports synchronous replication. Exactly one of `--replication-bind`
 | `--replication-batch-size` | `32` | Maximum replication ring batches to coalesce into a single TCP write+flush. Higher values reduce syscall overhead but increase per-write latency. |
 | `--replication-heartbeat-secs` | `5` | Seconds between primary-to-replica heartbeats. Used for disconnect detection. |
 | `--replication-ring-size` | `256` | Slots in the replication ring buffer (must be power of two). Each slot holds up to 512 KiB. More slots = more buffering before the journal stage backpressures. Default: 256 (128 MiB). See [Replication Ring Sizing](#replication-ring-sizing). |
+| `--no-quorum-durability` | `false` | Force fsync-gated mode even when 2 replicas are connected. Useful for debugging. |
 | `--promote-bind` | (none) | Address to listen for promotion commands (replica mode only). An operator sends `PROMOTE\n` to trigger in-process transition from replica to primary. |
 
 ### Startup Sequence
@@ -864,7 +867,7 @@ The default ring (256 slots × 512 KiB = 128 MiB) buffers approximately `256 × 
 
 Increasing `--replication-ring-size` only helps with **transient** slowness. If the replica is persistently slower than the primary, no buffer size prevents backpressure — the replica must keep up at steady state.
 
-Note: when the replica **disconnects**, the replication cursor resets to `u64::MAX` and the pipeline degrades to local-only durability with no backpressure from the ring.
+Note: when a replica **disconnects**, the replication cursor resets to `u64::MAX` and the pipeline degrades to fsync-gated durability (if fewer than 2 replicas remain connected) with no backpressure from the ring.
 
 ### Throughput vs. Disk Bandwidth
 

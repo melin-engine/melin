@@ -2,7 +2,7 @@
 
 ## Overview
 
-Synchronous journal replication from a primary server to a replica, providing zero-data-loss failover capability. The primary streams journal entries to the replica over TCP; the replica persists them locally and acknowledges. Client responses are gated on **both** local journal durability and replica acknowledgement — a client never learns about an event that the replica hasn't durably stored.
+Synchronous journal replication from a primary server to a replica, providing zero-data-loss failover capability. The primary streams journal entries to the replica over TCP; the replica persists them locally and acknowledges. With quorum durability (default), when 2 replicas are connected, client responses are gated on replication acknowledgement alone — the journal still writes for local crash recovery but does not block responses. When fewer than 2 replicas are connected, responses are gated on both local journal durability and replication. A client never learns about an event that isn't durably stored on at least two nodes.
 
 ## Architecture
 
@@ -18,7 +18,8 @@ Primary:
   streams DataBatch frames to its replica via io_uring SEND,
   receives acks via io_uring RECV, updates replication_cursor.
 
-  ResponseStage gates on min(journal_cursor, replication_cursor)
+  ResponseStage gates on replication_cursor (quorum mode, 2 replicas)
+  or min(journal_cursor, replication_cursor) (degraded/no-quorum mode)
 
 Replica:
   TCP → ReplicationReceiver → decode entries, publish to disruptor
@@ -33,23 +34,33 @@ Each replica slot has its own independent ring buffer (configurable via `--repli
 
 **Fault isolation**: a slow replica only stalls its own ring, not the other replica's. If a ring is full for longer than 500ms (replica not keeping up), the primary automatically disconnects that replica and frees the ring. The slot becomes available for a new connection. The surviving replica and client trading are unaffected.
 
-### Ack-after-replicate
+### Ack-after-replicate and quorum durability
 
-The response stage gates on `min(journal_cursor, replication_cursor)` instead of just `journal_cursor`. This ensures:
+The response stage enforces durability before sending client responses. An event is durable when it exists on at least two nodes:
 
-- A client only receives a response once the event is **locally durable** AND **replicated**.
-- On failover, the replica has every event the client was told about.
-- No data loss window — same guarantee as Raft commit.
+```
+durable = max(both_replicas_acked, min(journal_synced, fastest_replica_acked))
+```
 
-**Latency impact**: adds ~100-200 µs (LAN round-trip) to client-perceived latency. Throughput is unaffected — batching amortizes the round-trip across many events.
+This gives the best of both paths:
+
+- If **both replicas ack before fsync** completes → respond immediately (NVMe off the critical path)
+- If **one replica is slow but fsync is fast** → respond as soon as fsync + fast replica confirms (two durable copies via different routes)
+- If **0-1 replicas connected** → fall back to `min(journal, replication)` (local fsync required)
+- **`--no-quorum-durability`**: forces `min(journal, replication)` unconditionally, useful for debugging
+
+In all modes, a client never receives a response for an event that isn't durably stored. On failover, the replica has every event the client was told about. Same guarantee as Raft commit.
+
+**Latency impact**: quorum mode removes NVMe fsync tail variance (1-5ms GC spikes) from the critical path when both replicas are healthy. When one replica lags, fsync + the fast replica still provides two durable copies without waiting for the slow one. Throughput is unaffected — batching amortizes the round-trip across many events.
 
 ### Replication cursor behavior
 
-| Scenario | `replication_cursor` | Response gate effect |
-|---|---|---|
-| `--standalone` (dev/test) | `u64::MAX` | `min(journal, MAX) = journal` — no replication |
-| `--replication-bind`, no replica connected | `u64::MAX` | Same as standalone — server works normally |
-| Replica(s) connected, acking | Latest acked seq | Waits for both journal + replica |
+| Scenario | `replication_cursor` (min) | `fastest_replica_cursor` (max) | Response gate |
+|---|---|---|---|
+| `--standalone` | `u64::MAX` | `u64::MAX` | `min(journal, MAX) = journal` |
+| No replicas connected | `u64::MAX` | `u64::MAX` | Same as standalone |
+| 1 replica connected | Acked seq | Same value | `min(journal, repl)` |
+| 2 replicas, quorum mode | `min(slot0, slot1)` | `max(slot0, slot1)` | `max(min_repl, min(journal, max_repl))` |
 | One replica disconnects (other still connected) | Maintained by surviving replica | Trading continues normally |
 | All replicas disconnect | `u64::MAX` | Degrades to local-only, trading halted, operator alerted |
 | Replica reconnects | Resumes from ack | Gate re-engages |

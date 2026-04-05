@@ -54,6 +54,4 @@ See [README.md](README.md#features) for implemented features and [docs/roadmap.m
 - **Review before committing** — always review your own changes for correctness (including edge cases), test coverage, and documentation before attempting to commit. Don't rely on the user to catch issues.
 - **One-liner commands** — when giving the user shell commands to run, always format them as a single line that can be copy-pasted directly. Do not use backslash continuations or multi-line formatting.
 
-## Local Build Notes
-- **DPDK feature check** — `cargo check --features dpdk --no-default-features -p melin-server`. The build script auto-detects the system clang (`/usr/bin/clang`) to avoid Android NDK clang AVX header issues.
 

@@ -129,13 +129,16 @@ Defined in `crates/server/src/response.rs` (io_uring-based SEND).
 
 The response stage runs on a dedicated OS thread and is the final stage in the pipeline. It consumes from the output SPSC and writes encoded responses to client sockets.
 
-### Journal cursor gating (persist-before-ack)
+### Durability gating (persist-before-ack)
 
 Before sending any response, the response stage verifies that the corresponding event is durable:
 
 1. For each batch consumed from the SPSC, find the maximum `input_seq` across all slots.
-2. If the cached journal cursor position is less than `max_seq + 1`, spin-wait on the journal cursor (`Ordering::Acquire`) until it advances past that value.
-3. Once confirmed, encode and send all responses in the batch.
+2. Determine the durable position:
+   - **Quorum mode** (default, 2 replicas connected): `replication_cursor` — both replicas have acked, NVMe fsync is off the critical path.
+   - **Degraded/standalone mode** (0-1 replicas): `min(journal_cursor, replication_cursor)` — local fsync is required.
+3. If the durable position is less than `max_seq + 1`, spin-wait until it advances.
+4. Once confirmed, encode and send all responses in the batch.
 
 The journal cursor value is cached across batches to avoid redundant atomic loads when the journal is ahead of the response stage.
 
@@ -170,7 +173,7 @@ The output SPSC queue connects the matching stage to the response stage. Defined
 
 **Capacity**: `OUTPUT_RING_CAPACITY = 1 << 20` (1,048,576 slots). Matches the input ring size because one input event can produce multiple output messages (e.g., a market order sweeping many price levels produces one `Fill` per level plus a `BatchEnd`).
 
-**Multi-consumer**: When `--event-bind` is set, the output ring has two consumers: (1) the response stage (per-client, gated on journal+repl cursors), and (2) the event publisher (TCP broadcast to subscribers). Both consumers run in parallel. The producer is gated on the slowest consumer.
+**Multi-consumer**: When `--event-bind` is set, the output ring has two consumers: (1) the response stage (per-client, gated on durability cursors), and (2) the event publisher (TCP broadcast to subscribers). Both consumers run in parallel. The producer is gated on the slowest consumer.
 
 **`OutputSlot` layout**:
 

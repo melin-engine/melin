@@ -88,6 +88,8 @@ pub fn run(
     control_rx: mpsc::Receiver<ControlEvent>,
     journal_cursor: Arc<Sequence>,
     replication_cursor: Arc<AtomicU64>,
+    fastest_replica_cursor: Arc<AtomicU64>,
+    quorum_durability: bool,
     shutdown: &AtomicBool,
     heartbeat_interval: Option<Duration>,
     active_connections: Arc<AtomicU64>,
@@ -99,11 +101,16 @@ pub fn run(
     let mut batch = [OutputSlot::default(); MAX_BATCH];
     let mut encode_buf = [0u8; MAX_RESPONSE_BUF];
 
-    // Cached journal cursor value to avoid atomic reads on every slot.
+    // Cached durability position (see response.rs for full explanation).
     #[cfg(not(feature = "no-fsync"))]
-    let mut cached_journal_pos: u64 = 0;
+    let mut cached_durable_pos: u64 = 0;
     #[cfg(feature = "no-fsync")]
-    let _ = &journal_cursor;
+    let _ = (
+        &journal_cursor,
+        &replication_cursor,
+        &fastest_replica_cursor,
+        quorum_durability,
+    );
 
     // Pre-encode heartbeat frame (fixed-size, no heap allocation).
     let mut heartbeat_frame = [0u8; 8];
@@ -171,7 +178,7 @@ pub fn run(
         }
         idle_spins = 0;
 
-        // Wait for journal + replication to confirm the entire batch.
+        // Wait for durability (see response.rs for full explanation).
         #[cfg(not(feature = "no-fsync"))]
         {
             let max_seq = batch[..count]
@@ -180,12 +187,17 @@ pub fn run(
                 .max()
                 .expect("non-empty batch");
             let needed = max_seq + 1;
-            if cached_journal_pos < needed {
+            if cached_durable_pos < needed {
                 loop {
                     let journal_pos = journal_cursor.get().load(Ordering::Acquire);
-                    let repl_pos = replication_cursor.load(Ordering::Acquire);
-                    cached_journal_pos = journal_pos.min(repl_pos);
-                    if cached_journal_pos >= needed {
+                    let repl_min = replication_cursor.load(Ordering::Acquire);
+                    cached_durable_pos = if quorum_durability {
+                        let repl_max = fastest_replica_cursor.load(Ordering::Acquire);
+                        repl_min.max(journal_pos.min(repl_max))
+                    } else {
+                        journal_pos.min(repl_min)
+                    };
+                    if cached_durable_pos >= needed {
                         break;
                     }
                     std::hint::spin_loop();

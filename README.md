@@ -36,7 +36,7 @@ Kernel TCP over 10 Gbps private VLAN. Three AMD Ryzen 9 9950X servers (16C, SMT 
 | **Synchronous replication** (1 replica) | **4.0M/s** | 896 µs | 1,133 µs | 1,371 µs | 3,463 µs |
 | **Dual synchronous replication** (2 replicas) | **4.5M/s** | 867 µs | 1,040 µs | 1,150 µs | 2,204 µs |
 
-Dual replication is the typical production setup for the strongest durability guarantees. It is faster than single replication because the primary only waits for the fastest replica's ack before responding to the client.
+Dual replication is the typical production setup for the strongest durability guarantees. With quorum durability (default), the primary gates responses on replication acks alone when both replicas are connected — the local journal still writes for crash recovery but NVMe fsync variance is off the critical path. This can be faster than single replication, where local fsync is always required.
 
 ### Single-order latency (1 client, window 1)
 

@@ -505,6 +505,7 @@ pub fn run_sender(
     repl_consumer_1: ReplicationConsumer,
     repl_consumer_2: ReplicationConsumer,
     replication_cursor: Arc<AtomicU64>,
+    fastest_replica_cursor: Arc<AtomicU64>,
     genesis_entry: Vec<u8>,
     journal_path: std::path::PathBuf,
     authorized_keys: Arc<melin_protocol::auth::AuthorizedKeys>,
@@ -617,12 +618,20 @@ pub fn run_sender(
                             warn!(slot = i, "replica disconnected");
                         }
                         if replicas_connected.load(Ordering::Relaxed) == 0 {
-                            // Reset cursor so the response stage stops gating
+                            // Reset cursors so the response stage stops gating
                             // on replica acks. Without this, the cursor stays
                             // at the last acked sequence and the response stage
                             // blocks indefinitely.
                             replication_cursor.store(u64::MAX, Ordering::Release);
+                            fastest_replica_cursor.store(u64::MAX, Ordering::Release);
                             warn!("all replicas disconnected — trading halted");
+                        } else {
+                            // One replica disconnected, the other is still
+                            // streaming. Reset fastest_replica_cursor to the
+                            // min cursor (safe lower bound) — the surviving
+                            // handler's next fetch_max will correct it upward.
+                            let min_pos = replication_cursor.load(Ordering::Acquire);
+                            fastest_replica_cursor.store(min_pos, Ordering::Release);
                         }
                     }
                     Err(_) => {
@@ -661,6 +670,7 @@ pub fn run_sender(
                         .expect("empty_slot check guarantees consumer is Some");
 
                     let cursor = Arc::clone(&replication_cursor);
+                    let fastest_cursor = Arc::clone(&fastest_replica_cursor);
                     let genesis = genesis_entry.clone();
                     let jpath = journal_path.clone();
                     let auth_keys = Arc::clone(&authorized_keys);
@@ -701,6 +711,7 @@ pub fn run_sender(
                                 stream,
                                 consumer,
                                 cursor,
+                                fastest_cursor,
                                 genesis,
                                 jpath,
                                 auth_keys,
@@ -742,6 +753,7 @@ fn run_replica_slot(
     stream: TcpStream,
     mut consumer: ReplicationConsumer,
     replication_cursor: Arc<AtomicU64>,
+    fastest_replica_cursor: Arc<AtomicU64>,
     genesis_entry: Vec<u8>,
     journal_path: std::path::PathBuf,
     authorized_keys: Arc<melin_protocol::auth::AuthorizedKeys>,
@@ -759,6 +771,7 @@ fn run_replica_slot(
         stream,
         &mut consumer,
         &replication_cursor,
+        &fastest_replica_cursor,
         &genesis_entry,
         &journal_path,
         &authorized_keys,
@@ -1077,6 +1090,7 @@ fn handle_replica_connection(
     stream: TcpStream,
     repl_consumer: &mut ReplicationConsumer,
     replication_cursor: &Arc<AtomicU64>,
+    fastest_replica_cursor: &Arc<AtomicU64>,
     genesis_entry: &[u8],
     journal_path: &std::path::Path,
     authorized_keys: &melin_protocol::auth::AuthorizedKeys,
@@ -1303,6 +1317,7 @@ fn handle_replica_connection(
         writer,
         repl_consumer,
         replication_cursor,
+        fastest_replica_cursor,
         shutdown,
         evict_flag,
         metrics,
@@ -1328,6 +1343,7 @@ fn live_stream_uring(
     writer: TcpStream,
     repl_consumer: &mut ReplicationConsumer,
     replication_cursor: &Arc<AtomicU64>,
+    fastest_replica_cursor: &Arc<AtomicU64>,
     shutdown: &AtomicBool,
     evict_flag: &AtomicBool,
     metrics: &ReplicationMetrics,
@@ -1488,6 +1504,7 @@ fn live_stream_uring(
                         if let Ok(ReplicaMessage::Ack(ack)) = decode_replica_message(payload) {
                             let new_val = ack.acked_sequence + 1;
                             let _ = replication_cursor.fetch_max(new_val, Ordering::Release);
+                            let _ = fastest_replica_cursor.fetch_max(new_val, Ordering::Release);
                             metrics.acked_sequence[slot_idx]
                                 .store(ack.acked_sequence, Ordering::Relaxed);
                             metrics.ack_latency_us[slot_idx]
@@ -2748,8 +2765,23 @@ fn compact_recv_buf(buf: &mut Vec<u8>, consumed: usize) {
 /// `u64::MAX` so they don't block. Uses `store` (not `fetch_max`) because
 /// the cursor must be able to *decrease* when a second replica connects
 /// with a lower acked position.
-fn update_dual_replication_cursor(this_acked: u64, other_acked: u64, cursor: &AtomicU64) {
-    cursor.store(this_acked.min(other_acked), Ordering::Release);
+/// Update both replication cursors after an ack.
+///
+/// - `cursor_min`: `min(slot0, slot1)` — both replicas have confirmed up to here.
+/// - `cursor_max`: `max(slot0, slot1)` — fastest replica has confirmed up to here.
+///
+/// The response stage uses these for quorum durability:
+/// `durable = max(cursor_min, min(journal, cursor_max))`
+/// i.e., an event is durable if *either* both replicas acked *or* the
+/// journal fsynced and the fastest replica acked (two distinct durable copies).
+fn update_dual_replication_cursor(
+    this_acked: u64,
+    other_acked: u64,
+    cursor_min: &AtomicU64,
+    cursor_max: &AtomicU64,
+) {
+    cursor_min.store(this_acked.min(other_acked), Ordering::Release);
+    cursor_max.store(this_acked.max(other_acked), Ordering::Release);
 }
 
 /// The protocol is identical to `run_sender` — same wire format, same
@@ -2759,6 +2791,7 @@ pub fn run_sender_dpdk(
     mut transport: melin_dpdk::DpdkTransport,
     repl_consumers: [ReplicationConsumer; 2],
     replication_cursor: Arc<AtomicU64>,
+    fastest_replica_cursor: Arc<AtomicU64>,
     genesis_entry: Vec<u8>,
     journal_path: std::path::PathBuf,
     shutdown: &AtomicBool,
@@ -2877,6 +2910,7 @@ pub fn run_sender_dpdk(
                 replicas_connected.fetch_sub(1, Ordering::Release);
                 if replicas_connected.load(Ordering::Relaxed) == 0 {
                     replication_cursor.store(u64::MAX, Ordering::Release);
+                    fastest_replica_cursor.store(u64::MAX, Ordering::Release);
                     warn!("all replicas disconnected — trading halted");
                 }
             }
@@ -2922,6 +2956,7 @@ pub fn run_sender_dpdk(
                         replicas_connected.fetch_sub(1, Ordering::Release);
                         if replicas_connected.load(Ordering::Relaxed) == 0 {
                             replication_cursor.store(u64::MAX, Ordering::Release);
+                            fastest_replica_cursor.store(u64::MAX, Ordering::Release);
                         }
                         continue;
                     }
@@ -3062,6 +3097,7 @@ pub fn run_sender_dpdk(
                                         slot.acked_cursor,
                                         other_acked,
                                         &replication_cursor,
+                                        &fastest_replica_cursor,
                                     );
 
                                     metrics.catching_up[slot_idx].store(false, Ordering::Relaxed);
@@ -3078,6 +3114,7 @@ pub fn run_sender_dpdk(
                                     replicas_connected.fetch_sub(1, Ordering::Release);
                                     if replicas_connected.load(Ordering::Relaxed) == 0 {
                                         replication_cursor.store(u64::MAX, Ordering::Release);
+                                        fastest_replica_cursor.store(u64::MAX, Ordering::Release);
                                     }
                                 }
                                 Err(e) => {
@@ -3088,6 +3125,7 @@ pub fn run_sender_dpdk(
                                     replicas_connected.fetch_sub(1, Ordering::Release);
                                     if replicas_connected.load(Ordering::Relaxed) == 0 {
                                         replication_cursor.store(u64::MAX, Ordering::Release);
+                                        fastest_replica_cursor.store(u64::MAX, Ordering::Release);
                                     }
                                 }
                             }
@@ -3100,6 +3138,7 @@ pub fn run_sender_dpdk(
                             replicas_connected.fetch_sub(1, Ordering::Release);
                             if replicas_connected.load(Ordering::Relaxed) == 0 {
                                 replication_cursor.store(u64::MAX, Ordering::Release);
+                                fastest_replica_cursor.store(u64::MAX, Ordering::Release);
                             }
                         }
                         FrameResult::Incomplete => {} // Wait for more data.
@@ -3128,6 +3167,7 @@ pub fn run_sender_dpdk(
                                         slot.acked_cursor,
                                         other_acked,
                                         &replication_cursor,
+                                        &fastest_replica_cursor,
                                     );
                                 }
                                 consumed += frame_end;
@@ -3154,6 +3194,7 @@ pub fn run_sender_dpdk(
                         replicas_connected.fetch_sub(1, Ordering::Release);
                         if replicas_connected.load(Ordering::Relaxed) == 0 {
                             replication_cursor.store(u64::MAX, Ordering::Release);
+                            fastest_replica_cursor.store(u64::MAX, Ordering::Release);
                             warn!("all replicas disconnected — trading halted");
                         }
                         continue;
@@ -3223,6 +3264,7 @@ pub fn run_sender_dpdk(
                         replicas_connected.fetch_sub(1, Ordering::Release);
                         if replicas_connected.load(Ordering::Relaxed) == 0 {
                             replication_cursor.store(u64::MAX, Ordering::Release);
+                            fastest_replica_cursor.store(u64::MAX, Ordering::Release);
                             warn!("all replicas disconnected — trading halted");
                         }
                         continue;
@@ -5357,77 +5399,90 @@ mod tests {
     // --- Dual-replica cursor update tests ---
 
     #[test]
-    fn dual_cursor_takes_min_of_both_slots() {
-        let cursor = Arc::new(AtomicU64::new(0));
-        // Slot 0 at seq 100, slot 1 at seq 50 → cursor = 50.
-        update_dual_replication_cursor(100, 50, &cursor);
-        assert_eq!(cursor.load(Ordering::Relaxed), 50);
+    fn dual_cursor_takes_min_and_max_of_both_slots() {
+        let cursor_min = Arc::new(AtomicU64::new(0));
+        let cursor_max = Arc::new(AtomicU64::new(0));
+        // Slot 0 at seq 100, slot 1 at seq 50 → min = 50, max = 100.
+        update_dual_replication_cursor(100, 50, &cursor_min, &cursor_max);
+        assert_eq!(cursor_min.load(Ordering::Relaxed), 50);
+        assert_eq!(cursor_max.load(Ordering::Relaxed), 100);
     }
 
     #[test]
     fn dual_cursor_idle_slot_uses_max() {
-        let cursor = Arc::new(AtomicU64::new(0));
-        // Slot 0 at seq 100, slot 1 idle (u64::MAX) → cursor = 100.
-        update_dual_replication_cursor(100, u64::MAX, &cursor);
-        assert_eq!(cursor.load(Ordering::Relaxed), 100);
+        let cursor_min = Arc::new(AtomicU64::new(0));
+        let cursor_max = Arc::new(AtomicU64::new(0));
+        // Slot 0 at seq 100, slot 1 idle (u64::MAX) → min = 100, max = u64::MAX.
+        update_dual_replication_cursor(100, u64::MAX, &cursor_min, &cursor_max);
+        assert_eq!(cursor_min.load(Ordering::Relaxed), 100);
+        assert_eq!(cursor_max.load(Ordering::Relaxed), u64::MAX);
     }
 
     #[test]
     fn dual_cursor_both_idle() {
-        let cursor = Arc::new(AtomicU64::new(42));
-        // Both idle → cursor = u64::MAX (no replicas gating).
-        update_dual_replication_cursor(u64::MAX, u64::MAX, &cursor);
-        assert_eq!(cursor.load(Ordering::Relaxed), u64::MAX);
+        let cursor_min = Arc::new(AtomicU64::new(42));
+        let cursor_max = Arc::new(AtomicU64::new(42));
+        // Both idle → min = max = u64::MAX (no replicas gating).
+        update_dual_replication_cursor(u64::MAX, u64::MAX, &cursor_min, &cursor_max);
+        assert_eq!(cursor_min.load(Ordering::Relaxed), u64::MAX);
+        assert_eq!(cursor_max.load(Ordering::Relaxed), u64::MAX);
     }
 
     #[test]
     fn dual_cursor_decreases_when_slower_replica_connects() {
-        // This is the bug that fetch_max would miss: slot 0 is at 100,
-        // then slot 1 connects at 50. The cursor must drop from 100 to 50.
-        let cursor = Arc::new(AtomicU64::new(0));
+        let cursor_min = Arc::new(AtomicU64::new(0));
+        let cursor_max = Arc::new(AtomicU64::new(0));
 
-        // Slot 0 streaming alone → cursor = 100.
-        update_dual_replication_cursor(100, u64::MAX, &cursor);
-        assert_eq!(cursor.load(Ordering::Relaxed), 100);
+        // Slot 0 streaming alone → min = 100, max = u64::MAX.
+        update_dual_replication_cursor(100, u64::MAX, &cursor_min, &cursor_max);
+        assert_eq!(cursor_min.load(Ordering::Relaxed), 100);
 
         // Slot 1 connects with acked_cursor = 51 (last_sequence 50).
-        // Cursor must decrease to 51.
-        update_dual_replication_cursor(51, 100, &cursor);
-        assert_eq!(cursor.load(Ordering::Relaxed), 51);
+        // Min must decrease to 51, max stays at 100.
+        update_dual_replication_cursor(51, 100, &cursor_min, &cursor_max);
+        assert_eq!(cursor_min.load(Ordering::Relaxed), 51);
+        assert_eq!(cursor_max.load(Ordering::Relaxed), 100);
     }
 
     #[test]
     fn dual_cursor_advances_as_slower_replica_catches_up() {
-        let cursor = Arc::new(AtomicU64::new(0));
+        let cursor_min = Arc::new(AtomicU64::new(0));
+        let cursor_max = Arc::new(AtomicU64::new(0));
 
-        // Initial: slot 0 at 100, slot 1 at 51 → cursor = 51.
-        update_dual_replication_cursor(51, 100, &cursor);
-        assert_eq!(cursor.load(Ordering::Relaxed), 51);
+        // Initial: slot 0 at 100, slot 1 at 51 → min = 51, max = 100.
+        update_dual_replication_cursor(51, 100, &cursor_min, &cursor_max);
+        assert_eq!(cursor_min.load(Ordering::Relaxed), 51);
+        assert_eq!(cursor_max.load(Ordering::Relaxed), 100);
 
-        // Slot 1 catches up to 80 → cursor = 80.
-        update_dual_replication_cursor(80, 100, &cursor);
-        assert_eq!(cursor.load(Ordering::Relaxed), 80);
+        // Slot 1 catches up to 80 → min = 80, max = 100.
+        update_dual_replication_cursor(80, 100, &cursor_min, &cursor_max);
+        assert_eq!(cursor_min.load(Ordering::Relaxed), 80);
 
-        // Slot 1 catches up to 100 → cursor = 100.
-        update_dual_replication_cursor(100, 100, &cursor);
-        assert_eq!(cursor.load(Ordering::Relaxed), 100);
+        // Both at 100 → min = max = 100.
+        update_dual_replication_cursor(100, 100, &cursor_min, &cursor_max);
+        assert_eq!(cursor_min.load(Ordering::Relaxed), 100);
+        assert_eq!(cursor_max.load(Ordering::Relaxed), 100);
 
-        // Both advance → cursor = 150.
-        update_dual_replication_cursor(150, 150, &cursor);
-        assert_eq!(cursor.load(Ordering::Relaxed), 150);
+        // Both advance → min = max = 150.
+        update_dual_replication_cursor(150, 150, &cursor_min, &cursor_max);
+        assert_eq!(cursor_min.load(Ordering::Relaxed), 150);
+        assert_eq!(cursor_max.load(Ordering::Relaxed), 150);
     }
 
     #[test]
     fn dual_cursor_slot_disconnect_raises_to_surviving() {
-        let cursor = Arc::new(AtomicU64::new(0));
+        let cursor_min = Arc::new(AtomicU64::new(0));
+        let cursor_max = Arc::new(AtomicU64::new(0));
 
-        // Both streaming: slot 0 at 100, slot 1 at 80 → cursor = 80.
-        update_dual_replication_cursor(80, 100, &cursor);
-        assert_eq!(cursor.load(Ordering::Relaxed), 80);
+        // Both streaming: slot 0 at 100, slot 1 at 80 → min = 80, max = 100.
+        update_dual_replication_cursor(80, 100, &cursor_min, &cursor_max);
+        assert_eq!(cursor_min.load(Ordering::Relaxed), 80);
+        assert_eq!(cursor_max.load(Ordering::Relaxed), 100);
 
-        // Slot 1 disconnects (goes to u64::MAX) → cursor = 100.
-        update_dual_replication_cursor(100, u64::MAX, &cursor);
-        assert_eq!(cursor.load(Ordering::Relaxed), 100);
+        // Slot 1 disconnects (goes to u64::MAX) → min = 100, max = u64::MAX.
+        update_dual_replication_cursor(100, u64::MAX, &cursor_min, &cursor_max);
+        assert_eq!(cursor_min.load(Ordering::Relaxed), 100);
+        assert_eq!(cursor_max.load(Ordering::Relaxed), u64::MAX);
     }
 
     // --- Cursor reset test ---
