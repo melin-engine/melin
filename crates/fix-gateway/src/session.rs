@@ -107,6 +107,14 @@ pub struct Session {
     /// Monotonic ExecID counter for FIX execution reports (tag 17).
     exec_id: u64,
 
+    // ── Rate limiting ──
+    /// Maximum inbound messages per second (0 = unlimited).
+    max_msgs_per_sec: u32,
+    /// Messages received in the current one-second window.
+    rate_msg_count: u32,
+    /// Start of the current rate-limit window.
+    rate_window_start: Instant,
+
     // ── Auth state ──
     /// Nonce from the Melin Challenge, kept until auth completes.
     auth_nonce: Option<[u8; 32]>,
@@ -148,6 +156,10 @@ impl Session {
             signing_key: None,
             session_config_idx: None,
             exec_id: 1,
+
+            max_msgs_per_sec: 0,
+            rate_msg_count: 0,
+            rate_window_start: now,
 
             auth_nonce: None,
             connect_addr: None,
@@ -227,6 +239,15 @@ impl Session {
             "FIX Logon received"
         );
 
+        // Validate MsgSeqNum — Logon must be sequence 1.
+        if let Some(seq) = msg.msg_seq_num() {
+            if seq != 1 {
+                warn!(sender = sender_comp_id, seq, "Logon MsgSeqNum must be 1");
+                self.queue_fix_logout(config, "MsgSeqNum must be 1 on Logon");
+                return SessionAction::Close;
+            }
+        }
+
         // Extract HeartBtInt (default 30s).
         let heartbeat_secs: u64 = msg
             .get_str(tags::HEART_BT_INT)
@@ -249,6 +270,7 @@ impl Session {
         self.heartbeat_interval = Duration::from_secs(heartbeat_secs);
         self.signing_key = Some(signing_key);
         self.session_config_idx = Some(cfg_idx);
+        self.max_msgs_per_sec = session_config.max_msgs_per_sec;
         self.fix_inbound_seq = 2; // Logon was seq 1.
 
         // Transition: start Melin TCP connect.
@@ -461,7 +483,13 @@ impl Session {
             tags::MSG_NEW_ORDER_SINGLE
             | tags::MSG_ORDER_CANCEL_REQUEST
             | tags::MSG_ORDER_CANCEL_REPLACE => {
-                self.translate_and_send_order(msg_type, &msg, config, symbol_map)
+                if self.check_rate_limit() {
+                    self.translate_and_send_order(msg_type, &msg, config, symbol_map)
+                } else {
+                    warn!(sender = %self.sender_comp_id, "message rate limit exceeded");
+                    self.queue_fix_reject(config, "message rate limit exceeded");
+                    SessionAction::SendFix
+                }
             }
             _ => {
                 warn!(
@@ -641,6 +669,31 @@ impl Session {
         self.fix_send_buf.extend_from_slice(msg);
         self.fix_outbound_seq += 1;
         self.last_fix_sent = Instant::now();
+    }
+
+    // -----------------------------------------------------------------------
+    // Rate limiting
+    // -----------------------------------------------------------------------
+
+    /// Returns true if the message is allowed, false if rate-limited.
+    /// Uses a simple per-second sliding window: counts messages in the
+    /// current one-second window and rejects when the limit is exceeded.
+    fn check_rate_limit(&mut self) -> bool {
+        if self.max_msgs_per_sec == 0 {
+            return true; // Unlimited.
+        }
+        let now = Instant::now();
+        if now.duration_since(self.rate_window_start) >= Duration::from_secs(1) {
+            // New window.
+            self.rate_window_start = now;
+            self.rate_msg_count = 1;
+            true
+        } else if self.rate_msg_count < self.max_msgs_per_sec {
+            self.rate_msg_count += 1;
+            true
+        } else {
+            false
+        }
     }
 
     // -----------------------------------------------------------------------

@@ -9,7 +9,7 @@
 
 use std::collections::HashMap;
 use std::net::TcpListener;
-use std::os::unix::io::{AsRawFd, RawFd};
+use std::os::unix::io::{AsRawFd, IntoRawFd, RawFd};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
@@ -175,10 +175,9 @@ impl Gateway {
         config: &'static GatewayConfig,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         let mut ring = IoUring::new(RING_SIZE)?;
-        let listener_fd = listener.as_raw_fd();
-
-        // Leak the listener to keep the fd alive for the program's lifetime.
-        std::mem::forget(listener);
+        // Take ownership of the fd so it stays open for the program's
+        // lifetime without leaking the TcpListener wrapper.
+        let listener_fd = listener.into_raw_fd();
 
         // Register the provided buffer pool.
         let mut buffer_pool =

@@ -34,6 +34,10 @@ pub struct SessionConfig {
     /// Path to the Ed25519 private key (32-byte raw seed) for
     /// authenticating to melin-server on behalf of this session.
     pub key_path: PathBuf,
+    /// Maximum inbound FIX messages per second (order + cancel + replace).
+    /// 0 or absent = unlimited.
+    #[serde(default)]
+    pub max_msgs_per_sec: u32,
 }
 
 /// Symbol mapping: FIX symbol string → Melin Symbol ID + price/qty scaling.
