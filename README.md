@@ -24,17 +24,17 @@ Melin handles order matching, account balances, risk controls, circuit breakers,
 
 ## LAN Benchmarks
 
-All numbers are **full round-trip** (client sends order → server journals to NVMe with fsync → matching engine executes → response arrives at client). Every order is durably persisted before acknowledgement. [Realistic order flow](crates/bench/src/generator.rs). Reproducible via `scripts/lan-bench-suite.sh`. For production deployment and OS tuning, see [operations](docs/operations.md) and [benchmarking](docs/benchmarking.md).
+All numbers are **full round-trip** (client sends order → server journals to NVMe with fsync → matching engine executes → response arrives at client) over LAN using four AMD Ryzen 9 9950X servers (16C, SMT off, dedicated NVMe journal, 1 benchmark, 1 primary, 2 replicas). Commit [`46441eb`](../../commit/46441eb). Every order is durably persisted before acknowledgement. [Realistic order flow](crates/bench/src/generator.rs). Reproducible via `scripts/lan-bench-suite.sh`. For production deployment and OS tuning, see [operations](docs/operations.md) and [benchmarking](docs/benchmarking.md).
 
 ### Peak throughput (16 clients, window 256)
 
-Kernel TCP over 10 Gbps private VLAN. Three AMD Ryzen 9 9950X servers (16C, SMT off, dedicated NVMe journal). Commit [`46441eb`](../../commit/46441eb).
+Kernel TCP over 10 Gbps private VLAN. 
 
-| Durability | Throughput | p50 | p99 | p99.9 | max |
-|------------|-----------|-----|-----|-------|-----|
-| **Local fsync** | **6.7M/s** | 583 µs | 715 µs | 769 µs | 1,076 µs |
-| **Synchronous replication** (1 replica) | **4.0M/s** | 916 µs | 1,141 µs | 1,236 µs | 4,702 µs |
-| **Dual synchronous replication** (2 replicas) | **4.0M/s** | 985 µs | 1,346 µs | 1,488 µs | 1,843 µs |
+| Durability | Throughput | p50 | p99 | p99.9 | p99.99 | max |
+|------------|-----------|-----|-----|-------|--------|-----|
+| **Local fsync** | **6.7M/s** | 583 µs | 715 µs | 769 µs | 812 µs | 1,076 µs |
+| **Synchronous replication** (1 replica) | **4.0M/s** | 916 µs | 1,141 µs | 1,236 µs | 1,672 µs | 4,702 µs |
+| **Dual synchronous replication** (2 replicas) | **4.0M/s** | 985 µs | 1,346 µs | 1,488 µs | 1,680 µs | 1,843 µs |
 
 Dual replication is the typical production setup for the strongest durability guarantees. With quorum durability (default), the primary only needs 2 of 3 durable copies (journal + 2 replicas) before responding — removing NVMe fsync tail variance from the critical path when both replicas are healthy. Single replication always requires both local fsync and the replica ack.
 
@@ -42,11 +42,11 @@ Dual replication is the typical production setup for the strongest durability gu
 
 The latency floor — one order at a time, no pipelining, no queuing.
 
-| Durability | p50 | p90 | p99 | max |
-|-----------|-----|-----|-----|-----|
-| Kernel TCP (standalone) | 58 µs | 60 µs | 71 µs | 192 µs |
-| **Synchronous replication** (1 replica) | 57 µs | 61 µs | 68 µs | 167 µs |
-| **Dual synchronous replication** (2 replicas) | **35 µs** | **39 µs** | **46 µs** | 293 µs |
+| Durability | p50 | p90 | p99 | p99.9 | p99.99 | max |
+|-----------|-----|-----|-----|-------|--------|-----|
+| Kernel TCP (standalone) | 58 µs | 60 µs | 71 µs | 73 µs | 126 µs | 192 µs |
+| **Synchronous replication** (1 replica) | 57 µs | 61 µs | 68 µs | 77 µs | 95 µs | 167 µs |
+| **Dual synchronous replication** (2 replicas) | **35 µs** | **39 µs** | **46 µs** | **54 µs** | **74 µs** | 293 µs |
 
 **Latency CDF** — peak-load modes on the same axes:
 

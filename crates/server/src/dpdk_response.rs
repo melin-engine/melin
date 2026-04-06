@@ -280,10 +280,7 @@ fn process_control_events(
     while let Ok(event) = control_rx.try_recv() {
         match event {
             ControlEvent::Connected { connection_id } => {
-                connections.insert(
-                    connection_id,
-                    ConnectionHeartbeat { last_send: now },
-                );
+                connections.insert(connection_id, ConnectionHeartbeat { last_send: now });
             }
             ControlEvent::Disconnected { connection_id } => {
                 if connections.remove(&connection_id).is_some() {
