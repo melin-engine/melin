@@ -67,7 +67,7 @@ In all modes, a client never receives a response for an event that isn't durably
 
 The cursor is **always initialized to `u64::MAX`**, even when replication is enabled. This ensures the server starts immediately and serves clients without waiting for a replica. The cursor only engages when a replica connects and starts sending acks. On all-disconnect, it resets to `u64::MAX`.
 
-The cursor update is **monotonic** (`fetch_max`) — a stale ack (e.g., from a previous connection) cannot regress the cursor to a lower value.
+Each handler thread maintains a per-slot acked position and recomputes the shared cursors as `min`/`max` of both slots on every ack. This allows the cursors to decrease when a slower replica connects or a faster one disconnects.
 
 ## Wire Protocol
 
@@ -174,6 +174,43 @@ This achieves sub-second switchover. The `melin-promote` binary (in `crates/admi
 
 **Important**: after promotion, the old primary must be stopped to prevent split-brain (two primaries accepting writes). Automatic fencing is not yet implemented — see Future Work.
 
+## Cluster Recovery with Quorum Durability
+
+With quorum durability, the primary can acknowledge events before the local journal fsyncs — durability is guaranteed by the two replica copies. This means after a crash, the three nodes may have different journal lengths. The quorum formula `max(repl_min, min(journal, repl_max))` computes the **median** of the three journal positions. The median is exactly the set of events acknowledged to clients.
+
+### Which journal is authoritative?
+
+After a cluster-wide outage, each node restarts with its own journal. The three journals may differ:
+
+| Node | Journal length | Status |
+|------|---------------|--------|
+| **Shortest** | Behind the acked frontier | Missing events that were acked via the replication-only path (both replicas confirmed, local fsync hadn't completed) |
+| **Middle** | Matches the acked frontier | Contains exactly the events clients were told about |
+| **Longest** | Ahead of the acked frontier | Has extra entries that were replicated but not yet acked to clients (the other replica hadn't confirmed) |
+
+**The middle journal is always correct.** It represents the quorum commit point — every event in it was confirmed on at least two nodes before the client was notified.
+
+### Recovery procedure
+
+1. **Stop all three nodes** if not already stopped.
+2. **Compare journal end sequences** on all three nodes using `melin-admin journal-info`.
+3. **Sort by sequence**: identify the shortest, middle, and longest.
+4. **Promote the middle node** — its journal is authoritative. If two nodes have the same length, either is valid (they have the same entries).
+5. **Start the middle node as primary.**
+6. **Connect the other two nodes as replicas.** The shortest catches up from the new primary's journal (normal replica catch-up). The longest reconnects and its extra entries are harmlessly overwritten during catch-up (the primary's journal is authoritative after promotion).
+
+### Single-node failures (no full outage)
+
+Most failures don't require the full recovery procedure:
+
+- **Primary crashes, both replicas alive**: promote either replica (both have all acked events). The one with the longer journal avoids catch-up, but either is safe. The old primary reconnects as a replica and catches up.
+- **One replica crashes, primary + other replica alive**: the cluster continues in degraded mode (`min(journal, repl)` gating). The crashed replica reconnects and catches up automatically. No operator action needed.
+- **Middle node crashes** (regardless of role): the shortest node already has the missing entries in its replication pipeline — they are in-flight or being fsynced. The system continues with the two surviving nodes. No data loss, no operator action.
+
+### Non-quorum mode
+
+With `--no-quorum-durability`, every acked event is both locally fsynced and replicated. The primary's journal is always the longest or tied. Recovery is simpler: promote any replica, reconnect the old primary as a replica. No journal comparison needed.
+
 ## Current Limitations (v1)
 
 These are known limitations of the current implementation. Each is documented here with the reason it was deferred and the plan for resolution.
@@ -210,7 +247,7 @@ The primary's raw genesis entry bytes (including the original timestamp) are sen
 
 ### ~~Single replica only~~ (FIXED)
 
-Dual replication is now supported — the primary accepts up to 2 concurrent replica connections, each with its own replication ring consumer and handler thread. If one replica fails, trading continues with the surviving replica. Trading halts only when all replicas disconnect. The replication cursor uses `fetch_max` so either replica's acks advance the response gate.
+Dual replication is now supported — the primary accepts up to 2 concurrent replica connections, each with its own replication ring consumer and handler thread. If one replica fails, trading continues with the surviving replica. Trading halts only when all replicas disconnect. Per-slot acked cursors track each replica's position independently; the shared cursors are recomputed as `min(slot0, slot1)` and `max(slot0, slot1)` on every ack.
 
 
 ### `read_frame` partial read on timeout
