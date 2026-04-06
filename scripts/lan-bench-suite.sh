@@ -609,10 +609,10 @@ load_dpdk_config() {
     conf=$(ssh $SSH_OPTS "$host" "cat /etc/melin-dpdk.conf 2>/dev/null" || true)
     if [[ -n "$conf" ]]; then
         local ip port dpdk_prefix mode eal_args
-        ip=$(echo "$conf" | grep "^DPDK_IP=" | cut -d= -f2)
-        port=$(echo "$conf" | grep "^DPDK_PORT=" | cut -d= -f2)
-        dpdk_prefix=$(echo "$conf" | grep "^DPDK_PREFIX=" | cut -d= -f2)
-        mode=$(echo "$conf" | grep "^DPDK_MODE=" | cut -d= -f2)
+        ip=$(echo "$conf" | grep "^DPDK_IP=" | cut -d= -f2 || true)
+        port=$(echo "$conf" | grep "^DPDK_PORT=" | cut -d= -f2 || true)
+        dpdk_prefix=$(echo "$conf" | grep "^DPDK_PREFIX=" | cut -d= -f2 || true)
+        mode=$(echo "$conf" | grep "^DPDK_MODE=" | cut -d= -f2 || true)
         eal_args=$(echo "$conf" | grep "^DPDK_EAL_ARGS=" | cut -d= -f2- || true)
         eval "${prefix}_DPDK_IP=${ip:-}"
         eval "${prefix}_DPDK_PORT=${port:-0}"
