@@ -958,3 +958,266 @@ fn socket_addr_to_sockaddr(addr: std::net::SocketAddr) -> libc::sockaddr_in {
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// Integration tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::fix::parse::FixMessage;
+    use crate::fix::serialize::FixMessageBuilder;
+    use crate::fix::tags;
+    use std::io::{Read, Write};
+    use std::net::TcpStream;
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicU64;
+    use std::thread::JoinHandle;
+
+    // -----------------------------------------------------------------------
+    // Scaffolding
+    // -----------------------------------------------------------------------
+
+    /// Write a deterministic 32-byte Ed25519 seed to a unique temp path
+    /// and return the path. Leaks at process exit.
+    fn make_key_file() -> std::path::PathBuf {
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let pid = std::process::id();
+        let path = std::env::temp_dir().join(format!("melin-fix-it-key-{pid}-{n}.bin"));
+        std::fs::write(&path, [0xABu8; 32]).unwrap();
+        path
+    }
+
+    /// Build and leak a `GatewayConfig` for the lifetime of the test
+    /// process. The listen_addr is a placeholder — `Gateway::new` takes
+    /// the `TcpListener` directly and never reads this field.
+    fn make_config(sender: &str, target: &str) -> &'static GatewayConfig {
+        let key_path = make_key_file();
+        let toml = format!(
+            r#"
+server_addr = "127.0.0.1:1"
+listen_addr = "127.0.0.1:1"
+target_comp_id = "{target}"
+
+[[session]]
+sender_comp_id = "{sender}"
+account_id = 7
+key_path = "{}"
+
+[[symbol]]
+fix_symbol = "BTC/USD"
+melin_symbol = 1
+tick_size_inverse = 100
+lot_size_inverse = 1
+"#,
+            key_path.display()
+        );
+        let config: GatewayConfig = toml::from_str(&toml).unwrap();
+        Box::leak(Box::new(config))
+    }
+
+    fn logon_bytes(sender: &str, target: &str, seq: u64) -> Vec<u8> {
+        FixMessageBuilder::new(tags::MSG_LOGON)
+            .str_tag(tags::ENCRYPT_METHOD, "0")
+            .str_tag(tags::HEART_BT_INT, "30")
+            .build(sender, target, seq)
+    }
+
+    /// Handle wrapping a running gateway thread. Shutting down requires
+    /// waking the event loop from `submit_and_wait(1)` — we do that by
+    /// opening a short-lived dummy connection that fires an Accept CQE.
+    struct GwHandle {
+        port: u16,
+        shutdown: Arc<AtomicBool>,
+        join: Option<JoinHandle<()>>,
+    }
+    impl GwHandle {
+        fn shutdown(mut self) {
+            self.shutdown.store(true, Ordering::Relaxed);
+            // Wake the blocked submit_and_wait.
+            let _ = TcpStream::connect(("127.0.0.1", self.port));
+            if let Some(j) = self.join.take() {
+                j.join().expect("gateway thread panicked");
+            }
+        }
+    }
+    impl Drop for GwHandle {
+        fn drop(&mut self) {
+            if let Some(j) = self.join.take() {
+                self.shutdown.store(true, Ordering::Relaxed);
+                let _ = TcpStream::connect(("127.0.0.1", self.port));
+                let _ = j.join();
+            }
+        }
+    }
+
+    fn init_tracing() {
+        use std::sync::Once;
+        static ONCE: Once = Once::new();
+        ONCE.call_once(|| {
+            let _ = tracing_subscriber::fmt()
+                .with_env_filter(
+                    tracing_subscriber::EnvFilter::try_from_default_env()
+                        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("debug")),
+                )
+                .with_test_writer()
+                .try_init();
+        });
+    }
+
+    fn spawn_gateway(config: &'static GatewayConfig) -> GwHandle {
+        init_tracing();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let shutdown_clone = shutdown.clone();
+        let join = std::thread::spawn(move || {
+            let mut gw = Gateway::new(listener, config).expect("gateway new");
+            gw.run(&shutdown_clone).expect("gateway run");
+        });
+        GwHandle {
+            port,
+            shutdown,
+            join: Some(join),
+        }
+    }
+
+    /// Read one complete FIX message from a TCP stream with a timeout.
+    /// Uses `try_extract_message` to frame.
+    fn read_fix_message(stream: &mut TcpStream) -> Vec<u8> {
+        stream
+            .set_read_timeout(Some(Duration::from_secs(3)))
+            .unwrap();
+        let mut buf = Vec::with_capacity(256);
+        let mut tmp = [0u8; 256];
+        loop {
+            if let Some(msg) = crate::fix::parse::try_extract_message(&mut buf) {
+                return msg;
+            }
+            match stream.read(&mut tmp) {
+                Ok(0) => panic!(
+                    "unexpected EOF before complete FIX message (got {} bytes so far)",
+                    buf.len()
+                ),
+                Ok(n) => buf.extend_from_slice(&tmp[..n]),
+                Err(e) => panic!("read error waiting for FIX message: {e}"),
+            }
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn unknown_sender_gets_logout_and_disconnects() {
+        let config = make_config("FIRM_A", "MELIN");
+        let gw = spawn_gateway(config);
+
+        let mut client = TcpStream::connect(("127.0.0.1", gw.port)).unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(3)))
+            .unwrap();
+
+        let logon = logon_bytes("UNKNOWN_FIRM", "MELIN", 1);
+        client.write_all(&logon).unwrap();
+
+        // Server should send a Logout and then close the connection.
+        let raw = read_fix_message(&mut client);
+        let msg = FixMessage::parse(&raw).expect("valid FIX Logout");
+        assert_eq!(msg.msg_type(), tags::MSG_LOGOUT);
+
+        // Next read should return EOF (server closed).
+        let mut tail = [0u8; 64];
+        let n = client.read(&mut tail).expect("final read");
+        assert_eq!(n, 0, "expected EOF after Logout");
+
+        drop(client);
+        gw.shutdown();
+    }
+
+    #[test]
+    fn non_logon_first_message_is_rejected() {
+        let config = make_config("FIRM_A", "MELIN");
+        let gw = spawn_gateway(config);
+
+        let mut client = TcpStream::connect(("127.0.0.1", gw.port)).unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(3)))
+            .unwrap();
+
+        // Send a Heartbeat as the first message — must be Logon.
+        let hb = FixMessageBuilder::new(tags::MSG_HEARTBEAT).build("FIRM_A", "MELIN", 1);
+        client.write_all(&hb).unwrap();
+
+        let raw = read_fix_message(&mut client);
+        let msg = FixMessage::parse(&raw).unwrap();
+        assert_eq!(msg.msg_type(), tags::MSG_LOGOUT);
+
+        let mut tail = [0u8; 64];
+        assert_eq!(client.read(&mut tail).unwrap(), 0);
+
+        drop(client);
+        gw.shutdown();
+    }
+
+    #[test]
+    fn garbage_first_bytes_close_connection() {
+        let config = make_config("FIRM_A", "MELIN");
+        let gw = spawn_gateway(config);
+
+        let mut client = TcpStream::connect(("127.0.0.1", gw.port)).unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(3)))
+            .unwrap();
+
+        // Bytes that look like a complete (but invalid) FIX message so
+        // try_extract_message frames them — checksum validation then
+        // rejects them and the gateway closes the socket.
+        // Minimal shape: 8=FIX.4.2\x019=5\x0135=0\x0110=000\x01
+        client
+            .write_all(b"8=FIX.4.2\x019=5\x0135=0\x0110=000\x01")
+            .unwrap();
+
+        // Gateway should close without sending anything (malformed
+        // Logon never produces a Logout — see handle_logon).
+        let mut buf = [0u8; 64];
+        let n = client.read(&mut buf).expect("read after garbage");
+        assert_eq!(n, 0, "expected EOF for malformed Logon");
+
+        drop(client);
+        gw.shutdown();
+    }
+
+    #[test]
+    fn two_concurrent_clients_each_get_logout() {
+        let config = make_config("FIRM_A", "MELIN");
+        let gw = spawn_gateway(config);
+
+        let mut c1 = TcpStream::connect(("127.0.0.1", gw.port)).unwrap();
+        let mut c2 = TcpStream::connect(("127.0.0.1", gw.port)).unwrap();
+        c1.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+        c2.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+
+        c1.write_all(&logon_bytes("UNKNOWN_A", "MELIN", 1)).unwrap();
+        c2.write_all(&logon_bytes("UNKNOWN_B", "MELIN", 1)).unwrap();
+
+        let raw1 = read_fix_message(&mut c1);
+        let raw2 = read_fix_message(&mut c2);
+        let m1 = FixMessage::parse(&raw1).unwrap();
+        let m2 = FixMessage::parse(&raw2).unwrap();
+        assert_eq!(m1.msg_type(), tags::MSG_LOGOUT);
+        assert_eq!(m2.msg_type(), tags::MSG_LOGOUT);
+
+        // Both should EOF independently.
+        let mut tail = [0u8; 16];
+        assert_eq!(c1.read(&mut tail).unwrap(), 0);
+        assert_eq!(c2.read(&mut tail).unwrap(), 0);
+
+        drop(c1);
+        drop(c2);
+        gw.shutdown();
+    }
+}
