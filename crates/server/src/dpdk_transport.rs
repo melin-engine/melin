@@ -215,7 +215,6 @@ pub fn run_dpdk_poll(
                 let _ = control_tx.send(ControlEvent::Disconnected {
                     connection_id: frame.connection_id,
                 });
-                active_connections.fetch_sub(1, Ordering::Relaxed);
                 id_to_handle.remove(&frame.connection_id);
                 if let Some(mut removed) = connections.remove(&handle) {
                     removed.parse_buf.clear();
@@ -271,7 +270,6 @@ pub fn run_dpdk_poll(
                 let _ = control_tx.send(ControlEvent::Disconnected {
                     connection_id: conn.connection_id.0,
                 });
-                active_connections.fetch_sub(1, Ordering::Relaxed);
                 id_to_handle.remove(&conn.connection_id.0);
                 if let Some(mut removed) = connections.remove(&handle) {
                     removed.parse_buf.clear();
@@ -297,7 +295,6 @@ pub fn run_dpdk_poll(
                         let _ = control_tx.send(ControlEvent::Disconnected {
                             connection_id: conn.connection_id.0,
                         });
-                        active_connections.fetch_sub(1, Ordering::Relaxed);
                     }
                     transport.close(conn.handle);
                     id_to_handle.remove(&conn.connection_id.0);
@@ -320,7 +317,6 @@ pub fn run_dpdk_poll(
                     let _ = control_tx.send(ControlEvent::Disconnected {
                         connection_id: conn.connection_id.0,
                     });
-                    active_connections.fetch_sub(1, Ordering::Relaxed);
                     id_to_handle.remove(&conn.connection_id.0);
                     if let Some(mut removed) = connections.remove(&handle) {
                         removed.parse_buf.clear();
@@ -352,7 +348,6 @@ pub fn run_dpdk_poll(
                         &mut publish_batch,
                         &control_tx,
                         &mut id_to_handle,
-                        &active_connections,
                     );
                 }
             }
@@ -546,7 +541,6 @@ fn process_trading_frames(
     batch: &mut Vec<InputSlot>,
     control_tx: &mpsc::Sender<ControlEvent>,
     id_to_handle: &mut HashMap<u64, SocketHandle>,
-    active_connections: &std::sync::atomic::AtomicU64,
 ) {
     let mut cursor = 0;
 
@@ -565,7 +559,6 @@ fn process_trading_frames(
                 let _ = control_tx.send(ControlEvent::Disconnected {
                     connection_id: conn.connection_id.0,
                 });
-                active_connections.fetch_sub(1, Ordering::Relaxed);
                 id_to_handle.remove(&conn.connection_id.0);
                 conn.parse_buf.clear();
                 return;
@@ -738,10 +731,12 @@ mod tests {
             side,
             order_type: OrderType::Limit {
                 price: Price(NonZeroU64::new(100).unwrap()),
+                post_only: false,
             },
             quantity: Quantity(NonZeroU64::new(10).unwrap()),
             time_in_force: TimeInForce::GTC,
             stp: SelfTradeProtection::CancelNewest,
+            expiry_ns: 0,
         }
     }
 
@@ -886,13 +881,13 @@ mod tests {
             order,
         };
         let mut buf = [0u8; 256];
-        let written = codec::encode_request(&req, &mut buf).unwrap();
+        let written = codec::encode_request(&req, 0, &mut buf).unwrap();
 
         // encode_request writes [u32 length][payload].
         let frame = try_extract_frame(&buf[..written]);
         match frame {
             FrameResult::Complete(payload) => {
-                let decoded = codec::decode_request(payload).unwrap();
+                let (_, decoded) = codec::decode_request(payload).unwrap();
                 assert!(
                     matches!(decoded, Request::SubmitOrder { symbol, .. } if symbol == Symbol(5))
                 );
@@ -909,12 +904,12 @@ mod tests {
             order_id: OrderId(3),
         };
         let mut buf = [0u8; 256];
-        let written = codec::encode_request(&req, &mut buf).unwrap();
+        let written = codec::encode_request(&req, 0, &mut buf).unwrap();
 
         let frame = try_extract_frame(&buf[..written]);
         match frame {
             FrameResult::Complete(payload) => {
-                let decoded = codec::decode_request(payload).unwrap();
+                let (_, decoded) = codec::decode_request(payload).unwrap();
                 assert!(
                     matches!(decoded, Request::CancelOrder { order_id, .. } if order_id == OrderId(3))
                 );
@@ -929,7 +924,7 @@ mod tests {
     fn incremental_frame_accumulation() {
         let req = Request::Heartbeat;
         let mut wire = [0u8; 64];
-        let written = codec::encode_request(&req, &mut wire).unwrap();
+        let written = codec::encode_request(&req, 0, &mut wire).unwrap();
         let wire = &wire[..written];
 
         // Feed bytes one at a time into a parse buffer.
@@ -956,8 +951,8 @@ mod tests {
         let req2 = Request::QueryStats;
         let mut buf1 = [0u8; 64];
         let mut buf2 = [0u8; 64];
-        let w1 = codec::encode_request(&req1, &mut buf1).unwrap();
-        let w2 = codec::encode_request(&req2, &mut buf2).unwrap();
+        let w1 = codec::encode_request(&req1, 0, &mut buf1).unwrap();
+        let w2 = codec::encode_request(&req2, 0, &mut buf2).unwrap();
 
         // Concatenate two frames.
         let mut combined = Vec::new();
@@ -968,7 +963,7 @@ mod tests {
         let result1 = try_extract_frame(&combined);
         let payload1_len = match result1 {
             FrameResult::Complete(p) => {
-                let decoded = codec::decode_request(p).unwrap();
+                let (_, decoded) = codec::decode_request(p).unwrap();
                 assert!(matches!(decoded, Request::Heartbeat));
                 p.len()
             }
@@ -982,7 +977,7 @@ mod tests {
         let result2 = try_extract_frame(remaining);
         match result2 {
             FrameResult::Complete(p) => {
-                let decoded = codec::decode_request(p).unwrap();
+                let (_, decoded) = codec::decode_request(p).unwrap();
                 assert!(matches!(decoded, Request::QueryStats));
             }
             other => panic!("expected Complete, got {other:?}"),

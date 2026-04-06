@@ -119,23 +119,15 @@ pub fn run(
         }
 
         // Poll control channel for connect/disconnect.
-        while let Ok(event) = control_rx.try_recv() {
-            match event {
-                ControlEvent::Connected { connection_id } => {
-                    connections.insert(
-                        connection_id,
-                        ConnectionHeartbeat {
-                            last_send: last_heartbeat_scan,
-                        },
-                    );
-                }
-                ControlEvent::Disconnected { connection_id } => {
-                    if connections.remove(&connection_id).is_some() {
-                        active_connections.fetch_sub(1, Ordering::Relaxed);
-                    }
-                }
-            }
-        }
+        // Counter accounting: the response stage is the sole owner of
+        // active_connections decrements. The poll thread increments on
+        // auth success and sends ControlEvent::Disconnected on close.
+        process_control_events(
+            &control_rx,
+            &mut connections,
+            &active_connections,
+            last_heartbeat_scan,
+        );
 
         // Consume output slots from matching stage.
         let count = consumer.consume_batch(&mut batch, MAX_BATCH);
@@ -258,4 +250,142 @@ pub fn run(
 /// thread owns socket state.
 struct ConnectionHeartbeat {
     last_send: Instant,
+}
+
+/// Process a batch of control events, updating the connection map and
+/// active_connections counter.
+///
+/// Extracted from the `run()` loop so the counter accounting invariant
+/// can be unit-tested: the response stage is the **sole owner** of
+/// `active_connections` decrements. The poll thread increments on auth
+/// success and sends `Disconnected`; this function handles the decrement.
+fn process_control_events(
+    control_rx: &mpsc::Receiver<ControlEvent>,
+    connections: &mut HashMap<u64, ConnectionHeartbeat>,
+    active_connections: &AtomicU64,
+    now: Instant,
+) {
+    while let Ok(event) = control_rx.try_recv() {
+        match event {
+            ControlEvent::Connected { connection_id } => {
+                connections.insert(
+                    connection_id,
+                    ConnectionHeartbeat { last_send: now },
+                );
+            }
+            ControlEvent::Disconnected { connection_id } => {
+                if connections.remove(&connection_id).is_some() {
+                    active_connections.fetch_sub(1, Ordering::Relaxed);
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::AtomicU64;
+    use std::sync::mpsc;
+    use std::time::Instant;
+
+    /// Simulate the poll thread's side: increment counter on auth, send
+    /// Disconnected on close. The response stage (process_control_events)
+    /// owns the decrement.
+    #[test]
+    fn active_connections_single_lifecycle() {
+        let counter = AtomicU64::new(0);
+        let (tx, rx) = mpsc::channel();
+        let mut connections = HashMap::new();
+        let now = Instant::now();
+
+        // Poll thread: auth succeeds → increment.
+        counter.fetch_add(1, Ordering::Relaxed);
+        tx.send(ControlEvent::Connected { connection_id: 1 })
+            .unwrap();
+        process_control_events(&rx, &mut connections, &counter, now);
+        assert_eq!(counter.load(Ordering::Relaxed), 1);
+        assert_eq!(connections.len(), 1);
+
+        // Poll thread: connection closes → send Disconnected (no decrement).
+        tx.send(ControlEvent::Disconnected { connection_id: 1 })
+            .unwrap();
+        process_control_events(&rx, &mut connections, &counter, now);
+        assert_eq!(counter.load(Ordering::Relaxed), 0);
+        assert_eq!(connections.len(), 0);
+    }
+
+    /// Disconnected for an unknown connection (e.g., pre-auth drop or
+    /// duplicate event) must not decrement the counter.
+    #[test]
+    fn disconnect_unknown_connection_no_decrement() {
+        let counter = AtomicU64::new(0);
+        let (tx, rx) = mpsc::channel();
+        let mut connections = HashMap::new();
+        let now = Instant::now();
+
+        tx.send(ControlEvent::Disconnected { connection_id: 999 })
+            .unwrap();
+        process_control_events(&rx, &mut connections, &counter, now);
+        // Counter must stay at 0 — not wrap to u64::MAX.
+        assert_eq!(counter.load(Ordering::Relaxed), 0);
+    }
+
+    /// Multiple connections with interleaved connect/disconnect.
+    #[test]
+    fn active_connections_multiple_lifecycle() {
+        let counter = AtomicU64::new(0);
+        let (tx, rx) = mpsc::channel();
+        let mut connections = HashMap::new();
+        let now = Instant::now();
+
+        // Three connections authenticate.
+        for id in 1..=3 {
+            counter.fetch_add(1, Ordering::Relaxed);
+            tx.send(ControlEvent::Connected { connection_id: id })
+                .unwrap();
+        }
+        process_control_events(&rx, &mut connections, &counter, now);
+        assert_eq!(counter.load(Ordering::Relaxed), 3);
+        assert_eq!(connections.len(), 3);
+
+        // Connection 2 disconnects.
+        tx.send(ControlEvent::Disconnected { connection_id: 2 })
+            .unwrap();
+        process_control_events(&rx, &mut connections, &counter, now);
+        assert_eq!(counter.load(Ordering::Relaxed), 2);
+        assert_eq!(connections.len(), 2);
+
+        // Remaining two disconnect.
+        tx.send(ControlEvent::Disconnected { connection_id: 1 })
+            .unwrap();
+        tx.send(ControlEvent::Disconnected { connection_id: 3 })
+            .unwrap();
+        process_control_events(&rx, &mut connections, &counter, now);
+        assert_eq!(counter.load(Ordering::Relaxed), 0);
+        assert_eq!(connections.len(), 0);
+    }
+
+    /// Duplicate Disconnected for the same connection must only decrement
+    /// once (the second remove returns None).
+    #[test]
+    fn duplicate_disconnect_single_decrement() {
+        let counter = AtomicU64::new(0);
+        let (tx, rx) = mpsc::channel();
+        let mut connections = HashMap::new();
+        let now = Instant::now();
+
+        counter.fetch_add(1, Ordering::Relaxed);
+        tx.send(ControlEvent::Connected { connection_id: 1 })
+            .unwrap();
+        process_control_events(&rx, &mut connections, &counter, now);
+
+        // Two Disconnected events for the same connection.
+        tx.send(ControlEvent::Disconnected { connection_id: 1 })
+            .unwrap();
+        tx.send(ControlEvent::Disconnected { connection_id: 1 })
+            .unwrap();
+        process_control_events(&rx, &mut connections, &counter, now);
+        assert_eq!(counter.load(Ordering::Relaxed), 0);
+    }
 }
