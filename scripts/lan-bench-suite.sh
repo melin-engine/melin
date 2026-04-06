@@ -657,10 +657,15 @@ dpdk_sriov_setup() {
             echo "  Setting up DPDK on ${HOST}..."
             ssh $SSH_OPTS "$HOST" "cd ${REPO_DIR} && sudo ./scripts/dpdk/dpdk-setup-sriov.sh" 2>&1 | tail -5
         done
+        # Re-read configs after setup wrote them (VLAN_ID, DPDK_MODE, etc.).
+        load_dpdk_config "$SERVER" "SERVER"
+        SERVER_DPDK_IP="${SERVER_DPDK_IP:-${SERVER_VLAN}}"
+        SERVER_DPDK_PORT="${SERVER_DPDK_PORT:-0}"
+        SERVER_DPDK_PREFIX="${SERVER_DPDK_PREFIX:-24}"
+        DPDK_MODE="${SERVER_DPDK_MODE:-sriov}"
         load_dpdk_config "$BENCH" "BENCH"
-        # SR-IOV mode: DPDK build is the main binary (cherry-setup.sh builds with --features dpdk).
         DPDK_SERVER_BIN="${REPO_DIR}/target/release/melin-server"
-        echo "  Server DPDK: IP=${SERVER_DPDK_IP}, port=${SERVER_DPDK_PORT}, mode=sriov"
+        echo "  Server DPDK: IP=${SERVER_DPDK_IP}, port=${SERVER_DPDK_PORT}, mode=${DPDK_MODE}"
         echo ""
     fi
 
