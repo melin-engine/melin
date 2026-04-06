@@ -17,10 +17,10 @@ Melin handles order matching, account balances, risk controls, circuit breakers,
 - BLAKE3 hash chain for tamper evidence
 - Dual-replication to survive and recover from major outage scenarios
 
-**Efficient** — 4.5M orders/sec with synchronous dual replication on regular datacenter hardware.
+**Efficient** — 4.0M orders/sec with synchronous dual replication on regular datacenter hardware.
 - Single-threaded matching engine on a lock-free disruptor pipeline
 - Journal, matching, and replication run in parallel via io_uring
-- Sub-100 µs p99.9 single-order latency with dual replication
+- Sub-50 µs p99 single-order latency with quorum durability (dual replication)
 
 ## LAN Benchmarks
 
@@ -28,15 +28,15 @@ All numbers are **full round-trip** (client sends order → server journals to N
 
 ### Peak throughput (16 clients, window 256)
 
-Kernel TCP over 10 Gbps private VLAN. Three AMD Ryzen 9 9950X servers (16C, SMT off, dedicated NVMe journal). Commit [`d7bab52`](../../commit/d7bab52).
+Kernel TCP over 10 Gbps private VLAN. Three AMD Ryzen 9 9950X servers (16C, SMT off, dedicated NVMe journal). Commit [`46441eb`](../../commit/46441eb).
 
 | Durability | Throughput | p50 | p99 | p99.9 | max |
 |------------|-----------|-----|-----|-------|-----|
-| **Local fsync** | **6.7M/s** | 533 µs | 671 µs | 717 µs | 2,302 µs |
-| **Synchronous replication** (1 replica) | **4.0M/s** | 896 µs | 1,133 µs | 1,371 µs | 3,463 µs |
-| **Dual synchronous replication** (2 replicas) | **4.5M/s** | 867 µs | 1,040 µs | 1,150 µs | 2,204 µs |
+| **Local fsync** | **6.7M/s** | 583 µs | 715 µs | 769 µs | 1,076 µs |
+| **Synchronous replication** (1 replica) | **4.0M/s** | 916 µs | 1,141 µs | 1,236 µs | 4,702 µs |
+| **Dual synchronous replication** (2 replicas) | **4.0M/s** | 985 µs | 1,346 µs | 1,488 µs | 1,843 µs |
 
-Dual replication is the typical production setup for the strongest durability guarantees. With quorum durability (default), the primary gates responses on replication acks alone when both replicas are connected — the local journal still writes for crash recovery but NVMe fsync variance is off the critical path. This can be faster than single replication, where local fsync is always required.
+Dual replication is the typical production setup for the strongest durability guarantees. With quorum durability (default), the primary only needs 2 of 3 durable copies (journal + 2 replicas) before responding — removing NVMe fsync tail variance from the critical path when both replicas are healthy. Single replication always requires both local fsync and the replica ack.
 
 ### Single-order latency (1 client, window 1)
 
@@ -44,9 +44,9 @@ The latency floor — one order at a time, no pipelining, no queuing.
 
 | Durability | p50 | p90 | p99 | max |
 |-----------|-----|-----|-----|-----|
-| Kernel TCP (standalone) | 56 µs | 57 µs | 68 µs | 1,041 µs |
-| **Synchronous replication** (1 replica) | 55 µs | 62 µs | 66 µs | 168 µs |
-| **Dual synchronous replication** (2 replicas) | **55 µs** | **64 µs** | **71 µs** | 891 µs |
+| Kernel TCP (standalone) | 58 µs | 60 µs | 71 µs | 192 µs |
+| **Synchronous replication** (1 replica) | 57 µs | 61 µs | 68 µs | 167 µs |
+| **Dual synchronous replication** (2 replicas) | **35 µs** | **39 µs** | **46 µs** | 293 µs |
 
 **Latency CDF** — peak-load modes on the same axes:
 

@@ -59,7 +59,7 @@ In all modes, a client never receives a response for an event that isn't durably
 |---|---|---|---|
 | `--standalone` | `u64::MAX` | `u64::MAX` | `min(journal, MAX) = journal` |
 | No replicas connected | `u64::MAX` | `u64::MAX` | Same as standalone |
-| 1 replica connected | Acked seq | Same value | `min(journal, repl)` |
+| 1 replica connected | Acked seq | `u64::MAX` (idle slot) | `min(journal, repl)` |
 | 2 replicas, quorum mode | `min(slot0, slot1)` | `max(slot0, slot1)` | `max(min_repl, min(journal, max_repl))` |
 | One replica disconnects (other still connected) | Maintained by surviving replica | Trading continues normally |
 | All replicas disconnect | `u64::MAX` | Degrades to local-only, trading halted, operator alerted |
