@@ -1580,6 +1580,7 @@ name = "melin-fix-gateway"
 version = "0.1.0"
 dependencies = [
  "ed25519-dalek",
+ "io-uring",
  "libc",
  "melin-engine",
  "melin-protocol",

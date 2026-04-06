@@ -287,6 +287,46 @@ pub fn read_message(reader: &mut impl std::io::Read) -> std::io::Result<Option<V
     }
 }
 
+/// Try to extract one complete FIX message from the front of `buf`.
+///
+/// Scans for the CheckSum terminator pattern (`\x0110=xxx\x01`). If a
+/// complete message is found, drains it from `buf` and returns it.
+/// Returns `None` if the buffer does not yet contain a complete message.
+///
+/// This is the io_uring-friendly counterpart to `read_message`: it
+/// operates on an accumulated byte buffer instead of a streaming reader.
+pub fn try_extract_message(buf: &mut Vec<u8>) -> Option<Vec<u8>> {
+    // Minimum valid FIX message: "8=FIX.4.2\x019=N\x0135=X\x0110=000\x01"
+    // That's ~30 bytes. Short-circuit if obviously incomplete.
+    if buf.len() < 20 {
+        return None;
+    }
+
+    // Scan for the checksum terminator: SOH + "10=" + 3 digits + SOH.
+    // The checksum is always the last field, so the first occurrence of
+    // this pattern marks the end of the first complete message.
+    let bytes = buf.as_slice();
+    for i in 0..bytes.len().saturating_sub(7) {
+        // Match: \x0110=ddd\x01
+        if bytes[i] == tags::SOH
+            && bytes[i + 1] == b'1'
+            && bytes[i + 2] == b'0'
+            && bytes[i + 3] == b'='
+        {
+            // Find the trailing SOH after the 3-digit checksum value.
+            // Checksum is exactly 3 digits, so the SOH is at i+7.
+            if i + 7 < bytes.len() && bytes[i + 7] == tags::SOH {
+                let msg_end = i + 8; // inclusive of trailing SOH
+                let msg = buf[..msg_end].to_vec();
+                buf.drain(..msg_end);
+                return Some(msg);
+            }
+        }
+    }
+
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -365,5 +405,52 @@ mod tests {
         let mut cursor = std::io::Cursor::new(&[] as &[u8]);
         let result = read_message(&mut cursor).unwrap();
         assert!(result.is_none());
+    }
+
+    #[test]
+    fn extract_complete_message() {
+        let raw = sample_heartbeat();
+        let mut buf = raw.clone();
+        let extracted = try_extract_message(&mut buf).unwrap();
+        assert_eq!(extracted, raw);
+        assert!(buf.is_empty());
+    }
+
+    #[test]
+    fn extract_incomplete_message() {
+        let raw = sample_heartbeat();
+        // Truncate — missing the trailing SOH of the checksum.
+        let mut buf = raw[..raw.len() - 1].to_vec();
+        assert!(try_extract_message(&mut buf).is_none());
+        // Buffer unchanged.
+        assert_eq!(buf.len(), raw.len() - 1);
+    }
+
+    #[test]
+    fn extract_two_messages() {
+        let msg1 = sample_heartbeat();
+        let msg2 = FixMessageBuilder::new(tags::MSG_NEW_ORDER_SINGLE)
+            .str_tag(tags::CL_ORD_ID, "X")
+            .str_tag(tags::SYMBOL, "A")
+            .str_tag(tags::SIDE, "1")
+            .str_tag(tags::ORDER_QTY, "1")
+            .str_tag(tags::ORD_TYPE, "1")
+            .build("S", "T", 2);
+
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&msg1);
+        buf.extend_from_slice(&msg2);
+
+        let first = try_extract_message(&mut buf).unwrap();
+        assert_eq!(first, msg1);
+        let second = try_extract_message(&mut buf).unwrap();
+        assert_eq!(second, msg2);
+        assert!(buf.is_empty());
+    }
+
+    #[test]
+    fn extract_empty_buffer() {
+        let mut buf = Vec::new();
+        assert!(try_extract_message(&mut buf).is_none());
     }
 }

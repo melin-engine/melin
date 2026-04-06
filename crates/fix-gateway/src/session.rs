@@ -1,453 +1,597 @@
-//! FIX session management: Logon handshake, heartbeat, message routing,
-//! and two-thread forwarding between FIX client and Melin server.
+//! FIX session state machine driven by io_uring CQE events.
+//!
+//! Each `Session` owns all its state (no Arc, no Mutex). The event loop
+//! calls `handle_fix_message` and `try_process_melin_frame` as data
+//! arrives, and the session responds with a `SessionAction` indicating
+//! what I/O the event loop should perform.
 
 use std::collections::HashMap;
-use std::io::{self, Write};
-use std::net::TcpStream;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::os::unix::io::RawFd;
 use std::time::{Duration, Instant};
 
 use ed25519_dalek::{Signer, SigningKey};
 use tracing::{debug, error, info, warn};
 
 use melin_engine::types::AccountId;
-use melin_protocol::blocking::{BlockingFrameReader, BlockingFrameWriter};
 use melin_protocol::codec;
-use melin_protocol::message::ResponseKind;
+use melin_protocol::message::{Request, ResponseKind};
 
 use crate::config::{GatewayConfig, SymbolConfig};
-use crate::fix::parse::{self, FixMessage};
+use crate::event_loop::SessionAction;
+use crate::fix::parse::FixMessage;
 use crate::fix::serialize::FixMessageBuilder;
 use crate::fix::tags;
 use crate::id_map::ClOrdIdMap;
 use crate::translate::{self, TranslateContext};
 
-/// Run a FIX session for one client connection.
-///
-/// Handles the full lifecycle: Logon, message forwarding, Logout.
-/// Blocks until the session ends (client disconnect or error).
-pub fn run_session(
-    client_stream: TcpStream,
-    config: &GatewayConfig,
-    shutdown: &AtomicBool,
-) {
-    let peer = client_stream
-        .peer_addr()
-        .map(|a| a.to_string())
-        .unwrap_or_else(|_| "unknown".into());
-    info!(peer = %peer, "FIX client connected");
+// ---------------------------------------------------------------------------
+// Session state
+// ---------------------------------------------------------------------------
 
-    if let Err(e) = run_session_inner(client_stream, config, shutdown) {
-        debug!(peer = %peer, error = %e, "FIX session ended");
-    } else {
-        info!(peer = %peer, "FIX session ended cleanly");
-    }
+/// States a FIX session progresses through.
+#[derive(Debug)]
+pub enum SessionState {
+    /// Waiting for the FIX Logon message from the client.
+    AwaitingLogon,
+    /// Melin TCP connect in progress (io_uring CONNECT submitted).
+    ConnectingMelin,
+    /// Waiting for the Melin Challenge frame after TCP connect.
+    AwaitingChallenge,
+    /// ChallengeResponse sent, waiting for ServerReady/AuthFailed.
+    AwaitingAuthResult,
+    /// Fully active — bidirectional FIX ↔ Melin forwarding.
+    Active,
+    /// Logout initiated, pending cleanup.
+    Closing,
 }
 
-fn run_session_inner(
-    mut client_stream: TcpStream,
-    config: &GatewayConfig,
-    shutdown: &AtomicBool,
-) -> Result<(), Box<dyn std::error::Error>> {
-    // Set a read timeout so we can check for shutdown periodically.
-    client_stream.set_read_timeout(Some(Duration::from_secs(5)))?;
-    client_stream.set_nodelay(true)?;
+/// Per-FIX-session state. Owned entirely by the event loop thread.
+pub struct Session {
+    pub state: SessionState,
 
-    // ── Phase 1: Await Logon ───────────────────────────────────────
+    // ── FIX client side ──
+    pub fix_fd: RawFd,
+    pub fix_parse_buf: Vec<u8>,
+    pub fix_send_buf: Vec<u8>,
+    /// Expected next inbound MsgSeqNum from the FIX client.
+    fix_inbound_seq: u64,
+    /// Next outbound MsgSeqNum to the FIX client.
+    fix_outbound_seq: u64,
+    pub sender_comp_id: String,
+    pub heartbeat_interval: Duration,
+    pub last_fix_recv: Instant,
+    pub fix_multishot_active: bool,
 
-    let logon_raw = loop {
-        if shutdown.load(Ordering::Relaxed) {
-            return Ok(());
+    // ── Melin server side ──
+    pub melin_fd: Option<RawFd>,
+    pub melin_parse_buf: Vec<u8>,
+    pub melin_send_buf: Vec<u8>,
+    /// Melin request sequence number (per-key monotonic).
+    melin_seq: u64,
+    /// Reusable encode buffer for Melin requests.
+    melin_encode_buf: [u8; 136],
+    pub melin_multishot_active: bool,
+
+    // ── Session-owned data ──
+    id_map: ClOrdIdMap,
+    account_id: AccountId,
+    signing_key: Option<SigningKey>,
+    /// Index into config.sessions for this FIX session.
+    session_config_idx: Option<usize>,
+    /// Monotonic ExecID counter for FIX execution reports (tag 17).
+    exec_id: u64,
+
+    // ── Auth state ──
+    /// Nonce from the Melin Challenge, kept until auth completes.
+    auth_nonce: Option<[u8; 32]>,
+
+    // ── Connect state ──
+    /// Stored sockaddr for the io_uring CONNECT SQE lifetime.
+    pub connect_addr: Option<libc::sockaddr_in>,
+}
+
+impl Session {
+    /// Create a new session for a just-accepted FIX client socket.
+    pub fn new(fix_fd: RawFd, now: Instant) -> Self {
+        Self {
+            state: SessionState::AwaitingLogon,
+            fix_fd,
+            fix_parse_buf: Vec::with_capacity(512),
+            fix_send_buf: Vec::with_capacity(512),
+            fix_inbound_seq: 1,
+            fix_outbound_seq: 1,
+            sender_comp_id: String::new(),
+            heartbeat_interval: Duration::from_secs(30),
+            last_fix_recv: now,
+            fix_multishot_active: false,
+
+            melin_fd: None,
+            melin_parse_buf: Vec::with_capacity(256),
+            melin_send_buf: Vec::with_capacity(256),
+            melin_seq: 0,
+            melin_encode_buf: [0u8; 136],
+            melin_multishot_active: false,
+
+            id_map: ClOrdIdMap::new(),
+            account_id: AccountId(0),
+            signing_key: None,
+            session_config_idx: None,
+            exec_id: 1,
+
+            auth_nonce: None,
+            connect_addr: None,
         }
-        match parse::read_message(&mut client_stream)? {
-            Some(raw) => break raw,
-            None => return Ok(()), // Client disconnected before Logon.
-        }
-    };
-    let logon_msg = FixMessage::parse(&logon_raw)?;
-
-    if logon_msg.msg_type() != tags::MSG_LOGON {
-        send_logout(&mut client_stream, config, "UNKNOWN", 1, "first message must be Logon")?;
-        return Err("first message was not Logon".into());
     }
 
-    let sender_comp_id = logon_msg
-        .sender_comp_id()
-        .ok_or("Logon missing SenderCompID")?;
+    // -----------------------------------------------------------------------
+    // FIX message dispatch
+    // -----------------------------------------------------------------------
 
-    // Look up session config.
-    let session_map = config.session_map();
-    let session_idx = session_map
-        .get(sender_comp_id)
-        .ok_or_else(|| format!("unknown SenderCompID: {sender_comp_id}"))?;
-    let session_config = &config.sessions[*session_idx];
-
-    info!(
-        sender = sender_comp_id,
-        account = session_config.account_id,
-        "FIX Logon received"
-    );
-
-    // HeartBtInt from Logon (default 30s).
-    let heartbeat_secs: u64 = logon_msg
-        .get_str(tags::HEART_BT_INT)
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(30);
-
-    // ── Phase 2: Connect to Melin server ───────────────────────────
-
-    let melin_stream = TcpStream::connect_timeout(
-        &config.server_addr,
-        Duration::from_secs(10),
-    )?;
-    melin_stream.set_nodelay(true)?;
-
-    // Authenticate with Ed25519.
-    let signing_key = load_signing_key(&session_config.key_path)?;
-    let (melin_reader, melin_writer) = authenticate_melin(melin_stream, &signing_key)?;
-
-    info!(
-        sender = sender_comp_id,
-        server = %config.server_addr,
-        "authenticated with Melin server"
-    );
-
-    // ── Phase 3: Send Logon response ───────────────────────────────
-
-    let mut outbound_seq: u64 = 1;
-    let logon_response = FixMessageBuilder::new(tags::MSG_LOGON)
-        .str_tag(tags::ENCRYPT_METHOD, "0")
-        .u64_tag(tags::HEART_BT_INT, heartbeat_secs)
-        .build(&config.target_comp_id, sender_comp_id, outbound_seq);
-    client_stream.write_all(&logon_response)?;
-    client_stream.flush()?;
-    outbound_seq += 1;
-
-    // ── Phase 4: Two-thread message forwarding ─────────────────────
-
-    let session_done = Arc::new(AtomicBool::new(false));
-
-    // Build symbol lookup map.
-    let symbol_map: HashMap<String, SymbolConfig> = config
-        .symbols
-        .iter()
-        .cloned()
-        .map(|s| (s.fix_symbol.clone(), s))
-        .collect();
-
-    // Shared state for the outbound thread.
-    let sender_id = sender_comp_id.to_owned();
-    let target_id = config.target_comp_id.clone();
-
-    // Clone stream for outbound thread.
-    let mut fix_writer = client_stream.try_clone()?;
-
-    let done_flag = Arc::clone(&session_done);
-    let outbound_symbols: HashMap<String, SymbolConfig> = symbol_map
-        .iter()
-        .map(|(k, v)| (k.clone(), v.clone()))
-        .collect();
-
-    // The outbound thread reads from Melin and sends FIX execution reports.
-    // It needs its own id_map reference — we use a shared mutex since
-    // both threads need to access it (inbound inserts, outbound reads).
-    let id_map = Arc::new(std::sync::Mutex::new(ClOrdIdMap::new()));
-    let outbound_id_map = Arc::clone(&id_map);
-
-    let outbound_handle = std::thread::Builder::new()
-        .name(format!("fix-out-{sender_id}"))
-        .spawn(move || {
-            run_outbound(
-                melin_reader,
-                &mut fix_writer,
-                &outbound_id_map,
-                &outbound_symbols,
-                &sender_id,
-                &target_id,
-                &mut outbound_seq,
-                &done_flag,
-            );
-        })?;
-
-    // The inbound thread reads FIX messages and sends Melin requests.
-    let mut inbound_seq: u64 = 1; // Expected next MsgSeqNum from client.
-    let mut melin_seq: u64 = 1; // Melin request sequence.
-    let mut encode_buf = [0u8; 136];
-    let heartbeat_interval = Duration::from_secs(heartbeat_secs);
-    let mut last_recv = Instant::now();
-
-    loop {
-        if shutdown.load(Ordering::Relaxed) || session_done.load(Ordering::Relaxed) {
-            break;
+    /// Handle a complete FIX message received from the client.
+    /// Returns an action for the event loop.
+    pub fn handle_fix_message(
+        &mut self,
+        raw: &[u8],
+        config: &GatewayConfig,
+        session_map: &HashMap<String, usize>,
+        symbol_map: &HashMap<String, SymbolConfig>,
+    ) -> SessionAction {
+        match self.state {
+            SessionState::AwaitingLogon => self.handle_logon(raw, config, session_map),
+            SessionState::Active => self.handle_active_fix(raw, config, symbol_map),
+            _ => {
+                // Received FIX data in a non-ready state — ignore.
+                debug!(state = ?self.state, "FIX message received in non-ready state");
+                SessionAction::None
+            }
         }
+    }
 
-        // Read next FIX message (with timeout for shutdown checking).
-        let raw = match parse::read_message(&mut client_stream) {
-            Ok(Some(raw)) => raw,
-            Ok(None) => {
-                info!("FIX client disconnected");
-                break;
-            }
-            Err(e) if e.kind() == io::ErrorKind::WouldBlock || e.kind() == io::ErrorKind::TimedOut => {
-                // Check if we should send a heartbeat.
-                if last_recv.elapsed() > heartbeat_interval * 2 {
-                    // Client is unresponsive — disconnect.
-                    warn!("FIX client heartbeat timeout");
-                    break;
-                }
-                continue;
-            }
+    // -----------------------------------------------------------------------
+    // Logon
+    // -----------------------------------------------------------------------
+
+    fn handle_logon(
+        &mut self,
+        raw: &[u8],
+        config: &GatewayConfig,
+        session_map: &HashMap<String, usize>,
+    ) -> SessionAction {
+        let msg = match FixMessage::parse(raw) {
+            Ok(m) => m,
             Err(e) => {
-                debug!(error = %e, "FIX read error");
-                break;
+                warn!(error = %e, "malformed FIX Logon");
+                return SessionAction::Close;
             }
         };
 
-        last_recv = Instant::now();
+        if msg.msg_type() != tags::MSG_LOGON {
+            self.queue_fix_logout(config, "first message must be Logon");
+            return SessionAction::Close;
+        }
 
-        let msg = match FixMessage::parse(&raw) {
-            Ok(m) => m,
+        let sender_comp_id = match msg.sender_comp_id() {
+            Some(s) => s,
+            None => {
+                self.queue_fix_logout(config, "Logon missing SenderCompID");
+                return SessionAction::Close;
+            }
+        };
+
+        // Look up session config.
+        let cfg_idx = match session_map.get(sender_comp_id) {
+            Some(&idx) => idx,
+            None => {
+                warn!(sender = sender_comp_id, "unknown SenderCompID");
+                self.queue_fix_logout(config, "unknown SenderCompID");
+                return SessionAction::Close;
+            }
+        };
+
+        let session_config = &config.sessions[cfg_idx];
+
+        info!(
+            sender = sender_comp_id,
+            account = session_config.account_id,
+            "FIX Logon received"
+        );
+
+        // Extract HeartBtInt (default 30s).
+        let heartbeat_secs: u64 = msg
+            .get_str(tags::HEART_BT_INT)
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(30);
+
+        // Load the signing key for Melin authentication.
+        let signing_key = match load_signing_key(&session_config.key_path) {
+            Ok(k) => k,
             Err(e) => {
-                warn!(error = %e, "malformed FIX message, sending Reject");
-                // Send session-level Reject.
-                let reject = FixMessageBuilder::new(tags::MSG_REJECT)
-                    .str_tag(tags::TEXT, &e.to_string())
+                error!(error = %e, "failed to load signing key");
+                self.queue_fix_logout(config, "internal error");
+                return SessionAction::Close;
+            }
+        };
+
+        // Store session info.
+        self.sender_comp_id = sender_comp_id.to_owned();
+        self.account_id = AccountId(session_config.account_id);
+        self.heartbeat_interval = Duration::from_secs(heartbeat_secs);
+        self.signing_key = Some(signing_key);
+        self.session_config_idx = Some(cfg_idx);
+        self.fix_inbound_seq = 2; // Logon was seq 1.
+
+        // Transition: start Melin TCP connect.
+        self.state = SessionState::ConnectingMelin;
+        SessionAction::ConnectMelin
+    }
+
+    // -----------------------------------------------------------------------
+    // Melin auth state machine (driven by Melin RECV)
+    // -----------------------------------------------------------------------
+
+    /// Called by the event loop when the Melin TCP connect completes.
+    pub fn on_melin_connected(&mut self, _now: Instant) {
+        self.state = SessionState::AwaitingChallenge;
+    }
+
+    /// Try to process one complete Melin frame from `melin_parse_buf`.
+    /// Returns an action for the event loop.
+    pub fn try_process_melin_frame(
+        &mut self,
+        config: &GatewayConfig,
+        symbol_map: &HashMap<String, SymbolConfig>,
+        _now: Instant,
+    ) -> SessionAction {
+        // Melin uses length-prefixed framing: [u32 LE length][payload].
+        let buf = &self.melin_parse_buf;
+        if buf.len() < 4 {
+            return SessionAction::None;
+        }
+        let frame_len = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]) as usize;
+        if buf.len() < 4 + frame_len {
+            return SessionAction::None; // Incomplete frame.
+        }
+
+        // Extract the frame payload.
+        let payload = self.melin_parse_buf[4..4 + frame_len].to_vec();
+        self.melin_parse_buf.drain(..4 + frame_len);
+
+        match self.state {
+            SessionState::AwaitingChallenge => self.handle_challenge(&payload, config),
+            SessionState::AwaitingAuthResult => self.handle_auth_result(&payload, config),
+            SessionState::Active => self.handle_active_melin(&payload, config, symbol_map),
+            _ => {
+                debug!(state = ?self.state, "Melin frame in unexpected state");
+                SessionAction::None
+            }
+        }
+    }
+
+    fn handle_challenge(&mut self, payload: &[u8], config: &GatewayConfig) -> SessionAction {
+        let response = match codec::decode_response(payload) {
+            Ok(r) => r,
+            Err(e) => {
+                error!(error = %e, "failed to decode Melin Challenge");
+                self.queue_fix_logout(config, "internal error");
+                return SessionAction::Close;
+            }
+        };
+
+        let nonce = match response {
+            ResponseKind::Challenge { nonce } => nonce,
+            other => {
+                error!(response = ?other, "expected Challenge from Melin server");
+                self.queue_fix_logout(config, "internal error");
+                return SessionAction::Close;
+            }
+        };
+
+        // Sign the nonce with the session's Ed25519 key.
+        let signing_key = match &self.signing_key {
+            Some(k) => k,
+            None => {
+                error!("no signing key loaded");
+                return SessionAction::Close;
+            }
+        };
+
+        let signature = signing_key.sign(&nonce);
+        let request = Request::ChallengeResponse {
+            signature: signature.to_bytes(),
+            public_key: signing_key.verifying_key().to_bytes(),
+        };
+
+        // Encode ChallengeResponse into Melin send buffer.
+        let written = match codec::encode_request(&request, 0, &mut self.melin_encode_buf) {
+            Ok(n) => n,
+            Err(e) => {
+                error!(error = %e, "failed to encode ChallengeResponse");
+                return SessionAction::Close;
+            }
+        };
+        self.melin_send_buf
+            .extend_from_slice(&self.melin_encode_buf[..written]);
+
+        self.auth_nonce = Some(nonce);
+        self.state = SessionState::AwaitingAuthResult;
+        SessionAction::SendMelin
+    }
+
+    fn handle_auth_result(&mut self, payload: &[u8], config: &GatewayConfig) -> SessionAction {
+        let response = match codec::decode_response(payload) {
+            Ok(r) => r,
+            Err(e) => {
+                error!(error = %e, "failed to decode Melin auth result");
+                self.queue_fix_logout(config, "internal error");
+                return SessionAction::Close;
+            }
+        };
+
+        match response {
+            ResponseKind::ServerReady => {
+                info!(
+                    sender = %self.sender_comp_id,
+                    "Melin authentication succeeded"
+                );
+
+                // Send FIX Logon response to the client.
+                let logon_response = FixMessageBuilder::new(tags::MSG_LOGON)
+                    .str_tag(tags::ENCRYPT_METHOD, "0")
+                    .u64_tag(tags::HEART_BT_INT, self.heartbeat_interval.as_secs())
                     .build(
                         &config.target_comp_id,
-                        sender_comp_id,
-                        outbound_seq,
+                        &self.sender_comp_id,
+                        self.fix_outbound_seq,
                     );
-                let _ = client_stream.write_all(&reject);
-                let _ = client_stream.flush();
-                outbound_seq += 1;
-                continue;
+                self.fix_send_buf.extend_from_slice(&logon_response);
+                self.fix_outbound_seq += 1;
+
+                // Clean up auth state.
+                self.auth_nonce = None;
+                self.signing_key = None;
+
+                self.state = SessionState::Active;
+                SessionAction::SendFix
+            }
+            ResponseKind::AuthFailed => {
+                warn!(sender = %self.sender_comp_id, "Melin authentication failed");
+                self.queue_fix_logout(config, "authentication failed");
+                SessionAction::Close
+            }
+            other => {
+                error!(response = ?other, "unexpected Melin auth response");
+                self.queue_fix_logout(config, "internal error");
+                SessionAction::Close
+            }
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Active state — FIX message handling
+    // -----------------------------------------------------------------------
+
+    fn handle_active_fix(
+        &mut self,
+        raw: &[u8],
+        config: &GatewayConfig,
+        symbol_map: &HashMap<String, SymbolConfig>,
+    ) -> SessionAction {
+        let msg = match FixMessage::parse(raw) {
+            Ok(m) => m,
+            Err(e) => {
+                warn!(error = %e, "malformed FIX message");
+                self.queue_fix_reject(config, &e.to_string());
+                return SessionAction::SendFix;
             }
         };
 
         // Validate MsgSeqNum.
         if let Some(seq) = msg.msg_seq_num() {
-            if seq < inbound_seq {
+            if seq < self.fix_inbound_seq {
                 // Duplicate — ignore.
-                continue;
+                return SessionAction::None;
             }
-            if seq > inbound_seq {
+            if seq > self.fix_inbound_seq {
                 // Gap — disconnect (v1: no gap fill).
-                warn!(expected = inbound_seq, got = seq, "MsgSeqNum gap, disconnecting");
-                let _ = send_logout(
-                    &mut client_stream,
-                    config,
-                    sender_comp_id,
-                    outbound_seq,
-                    "MsgSeqNum too high, expected sequence reset",
+                warn!(
+                    expected = self.fix_inbound_seq,
+                    got = seq,
+                    "MsgSeqNum gap"
                 );
-                break;
+                self.queue_fix_logout(config, "MsgSeqNum too high, expected sequence reset");
+                return SessionAction::Close;
             }
-            inbound_seq += 1;
+            self.fix_inbound_seq += 1;
         }
 
-        // Route by MsgType.
         let msg_type = msg.msg_type();
         match msg_type {
-            tags::MSG_HEARTBEAT => {
-                // Client heartbeat — no action needed.
-            }
+            tags::MSG_HEARTBEAT => SessionAction::None,
             tags::MSG_TEST_REQUEST => {
-                // Respond with Heartbeat containing TestReqID.
                 let test_req_id = msg.get_str(tags::TEST_REQ_ID).unwrap_or("");
                 let hb = FixMessageBuilder::new(tags::MSG_HEARTBEAT)
                     .str_tag(tags::TEST_REQ_ID, test_req_id)
                     .build(
                         &config.target_comp_id,
-                        sender_comp_id,
-                        outbound_seq,
+                        &self.sender_comp_id,
+                        self.fix_outbound_seq,
                     );
-                client_stream.write_all(&hb)?;
-                client_stream.flush()?;
-                outbound_seq += 1;
+                self.fix_send_buf.extend_from_slice(&hb);
+                self.fix_outbound_seq += 1;
+                SessionAction::SendFix
             }
             tags::MSG_LOGOUT => {
-                info!("FIX Logout received");
-                let _ = send_logout(
-                    &mut client_stream,
-                    config,
-                    sender_comp_id,
-                    outbound_seq,
-                    "Logout acknowledged",
-                );
-                break;
+                info!(sender = %self.sender_comp_id, "FIX Logout received");
+                self.queue_fix_logout(config, "Logout acknowledged");
+                SessionAction::Close
             }
-            tags::MSG_NEW_ORDER_SINGLE | tags::MSG_ORDER_CANCEL_REQUEST | tags::MSG_ORDER_CANCEL_REPLACE => {
-                let mut map = id_map.lock().unwrap();
-                let mut ctx = TranslateContext {
-                    account_id: AccountId(session_config.account_id),
-                    symbols: &symbol_map,
-                    id_map: &mut map,
-                };
-
-                let request = match msg_type {
-                    tags::MSG_NEW_ORDER_SINGLE => translate::new_order_single(&msg, &mut ctx),
-                    tags::MSG_ORDER_CANCEL_REQUEST => translate::cancel_order(&msg, &mut ctx),
-                    tags::MSG_ORDER_CANCEL_REPLACE => translate::cancel_replace(&msg, &mut ctx),
-                    _ => unreachable!(),
-                };
-
-                match request {
-                    Ok(req) => {
-                        melin_seq += 1;
-                        let written = codec::encode_request(&req, melin_seq, &mut encode_buf)?;
-                        melin_writer.lock().unwrap().write_frame(&encode_buf[4..written])?;
-                        melin_writer.lock().unwrap().flush()?;
-                    }
-                    Err(e) => {
-                        warn!(error = %e, "FIX translation error");
-                        // Send BusinessReject or Reject.
-                        let reject = FixMessageBuilder::new(tags::MSG_REJECT)
-                            .str_tag(tags::TEXT, &e.to_string())
-                            .build(
-                                &config.target_comp_id,
-                                sender_comp_id,
-                                outbound_seq,
-                            );
-                        client_stream.write_all(&reject)?;
-                        client_stream.flush()?;
-                        outbound_seq += 1;
-                    }
-                }
+            tags::MSG_NEW_ORDER_SINGLE
+            | tags::MSG_ORDER_CANCEL_REQUEST
+            | tags::MSG_ORDER_CANCEL_REPLACE => {
+                self.translate_and_send_order(msg_type, &msg, config, symbol_map)
             }
             _ => {
-                warn!(msg_type = ?std::str::from_utf8(msg_type), "unsupported FIX message type");
-                let reject = FixMessageBuilder::new(tags::MSG_REJECT)
-                    .str_tag(tags::TEXT, "unsupported message type")
-                    .build(
-                        &config.target_comp_id,
-                        sender_comp_id,
-                        outbound_seq,
-                    );
-                client_stream.write_all(&reject)?;
-                client_stream.flush()?;
-                outbound_seq += 1;
+                warn!(
+                    msg_type = ?std::str::from_utf8(msg_type),
+                    "unsupported FIX message type"
+                );
+                self.queue_fix_reject(config, "unsupported message type");
+                SessionAction::SendFix
             }
         }
     }
 
-    // Signal outbound thread to stop and wait.
-    session_done.store(true, Ordering::Relaxed);
-    let _ = outbound_handle.join();
-
-    Ok(())
-}
-
-/// Outbound thread: reads Melin responses and sends FIX execution reports.
-fn run_outbound(
-    mut melin_reader: BlockingFrameReader<TcpStream>,
-    fix_writer: &mut TcpStream,
-    id_map: &std::sync::Mutex<ClOrdIdMap>,
-    symbols: &HashMap<String, SymbolConfig>,
-    sender: &str,
-    target: &str,
-    seq: &mut u64,
-    done: &AtomicBool,
-) {
-    let mut exec_id: u64 = 1;
-
-    // Build reverse symbol lookup: Melin symbol ID → (fix_symbol, config).
-    let _reverse_symbols: HashMap<u32, (&str, &SymbolConfig)> = symbols
-        .iter()
-        .map(|(name, cfg)| (cfg.melin_symbol, (name.as_str(), cfg)))
-        .collect();
-
-    // Default symbol info for unknown symbols.
-    let default_symbol = "UNKNOWN";
-    let default_tick = 1u64;
-    let default_lot = 1u64;
-
-    loop {
-        if done.load(Ordering::Relaxed) {
-            return;
-        }
-
-        let frame = match melin_reader.read_frame() {
-            Ok(Some(f)) => f.to_vec(), // Copy out of reader's internal buffer.
-            Ok(None) => {
-                info!("Melin server disconnected");
-                done.store(true, Ordering::Relaxed);
-                return;
-            }
-            Err(e)
-                if e.kind() == io::ErrorKind::WouldBlock
-                    || e.kind() == io::ErrorKind::TimedOut =>
-            {
-                continue;
-            }
-            Err(e) => {
-                debug!(error = %e, "Melin read error");
-                done.store(true, Ordering::Relaxed);
-                return;
-            }
+    fn translate_and_send_order(
+        &mut self,
+        msg_type: &[u8],
+        msg: &FixMessage<'_>,
+        config: &GatewayConfig,
+        symbol_map: &HashMap<String, SymbolConfig>,
+    ) -> SessionAction {
+        let mut ctx = TranslateContext {
+            account_id: self.account_id,
+            symbols: symbol_map,
+            id_map: &mut self.id_map,
         };
 
-        let response = match codec::decode_response(&frame) {
+        let request = match msg_type {
+            b if b == tags::MSG_NEW_ORDER_SINGLE => translate::new_order_single(msg, &mut ctx),
+            b if b == tags::MSG_ORDER_CANCEL_REQUEST => translate::cancel_order(msg, &mut ctx),
+            b if b == tags::MSG_ORDER_CANCEL_REPLACE => translate::cancel_replace(msg, &mut ctx),
+            _ => unreachable!(),
+        };
+
+        match request {
+            Ok(req) => {
+                self.melin_seq += 1;
+                match codec::encode_request(&req, self.melin_seq, &mut self.melin_encode_buf) {
+                    Ok(written) => {
+                        self.melin_send_buf
+                            .extend_from_slice(&self.melin_encode_buf[..written]);
+                        SessionAction::SendMelin
+                    }
+                    Err(e) => {
+                        error!(error = %e, "failed to encode Melin request");
+                        self.queue_fix_reject(config, "internal error");
+                        SessionAction::SendFix
+                    }
+                }
+            }
+            Err(e) => {
+                warn!(error = %e, "FIX translation error");
+                self.queue_fix_reject(config, &e.to_string());
+                SessionAction::SendFix
+            }
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Active state — Melin response handling
+    // -----------------------------------------------------------------------
+
+    fn handle_active_melin(
+        &mut self,
+        payload: &[u8],
+        config: &GatewayConfig,
+        _symbol_map: &HashMap<String, SymbolConfig>,
+    ) -> SessionAction {
+        let response = match codec::decode_response(payload) {
             Ok(r) => r,
             Err(e) => {
                 warn!(error = %e, "failed to decode Melin response");
-                continue;
+                return SessionAction::None;
             }
         };
 
         match response {
             ResponseKind::Report(ref report) => {
-                // Determine symbol for this report (best-effort).
-                let (sym_str, tick_inv, lot_inv) = match report {
-                    // Reports don't carry the symbol — we'd need to track
-                    // order→symbol mapping. For v1, use a default.
-                    _ => (default_symbol, default_tick, default_lot),
-                };
+                // TODO: track order→symbol mapping for proper symbol/tick
+                // resolution. For v1, use defaults.
+                let default_symbol = "UNKNOWN";
+                let default_tick = 1u64;
+                let default_lot = 1u64;
 
-                let map = id_map.lock().unwrap();
                 let fix_msg = translate::execution_report_to_fix(
-                    report, &map, sym_str, tick_inv, lot_inv, target, sender, *seq, exec_id,
+                    report,
+                    &self.id_map,
+                    default_symbol,
+                    default_tick,
+                    default_lot,
+                    &config.target_comp_id,
+                    &self.sender_comp_id,
+                    self.fix_outbound_seq,
+                    self.exec_id,
                 );
-                drop(map);
 
                 if !fix_msg.is_empty() {
-                    if let Err(e) = fix_writer.write_all(&fix_msg) {
-                        debug!(error = %e, "FIX write error");
-                        done.store(true, Ordering::Relaxed);
-                        return;
-                    }
-                    let _ = fix_writer.flush();
-                    *seq += 1;
-                    exec_id += 1;
+                    self.fix_send_buf.extend_from_slice(&fix_msg);
+                    self.fix_outbound_seq += 1;
+                    self.exec_id += 1;
+                    SessionAction::SendFix
+                } else {
+                    SessionAction::None
                 }
             }
             ResponseKind::BatchEnd | ResponseKind::Heartbeat | ResponseKind::ServerReady => {
-                // Ignore session-level Melin messages.
+                SessionAction::None
             }
             ResponseKind::ServerBusy => {
-                warn!("Melin server busy — pipeline full");
+                warn!(sender = %self.sender_comp_id, "Melin server busy");
+                SessionAction::None
             }
             ResponseKind::EngineError => {
-                error!("Melin engine error received");
+                error!(sender = %self.sender_comp_id, "Melin engine error");
+                SessionAction::None
             }
-            _ => {}
+            _ => SessionAction::None,
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // FIX message builders
+    // -----------------------------------------------------------------------
+
+    fn queue_fix_logout(&mut self, config: &GatewayConfig, text: &str) {
+        let target = if self.sender_comp_id.is_empty() {
+            "UNKNOWN"
+        } else {
+            &self.sender_comp_id
+        };
+        let msg = FixMessageBuilder::new(tags::MSG_LOGOUT)
+            .str_tag(tags::TEXT, text)
+            .build(&config.target_comp_id, target, self.fix_outbound_seq);
+        self.fix_send_buf.extend_from_slice(&msg);
+        self.fix_outbound_seq += 1;
+        self.state = SessionState::Closing;
+    }
+
+    fn queue_fix_reject(&mut self, config: &GatewayConfig, text: &str) {
+        let msg = FixMessageBuilder::new(tags::MSG_REJECT)
+            .str_tag(tags::TEXT, text)
+            .build(
+                &config.target_comp_id,
+                &self.sender_comp_id,
+                self.fix_outbound_seq,
+            );
+        self.fix_send_buf.extend_from_slice(&msg);
+        self.fix_outbound_seq += 1;
+    }
+}
+
+impl Drop for Session {
+    fn drop(&mut self) {
+        // Close the FIX client socket.
+        unsafe { libc::close(self.fix_fd) };
+        // Close the Melin socket if open.
+        if let Some(fd) = self.melin_fd {
+            unsafe { libc::close(fd) };
         }
     }
 }
 
-fn send_logout(
-    stream: &mut TcpStream,
-    config: &GatewayConfig,
-    target: &str,
-    seq: u64,
-    text: &str,
-) -> io::Result<()> {
-    let msg = FixMessageBuilder::new(tags::MSG_LOGOUT)
-        .str_tag(tags::TEXT, text)
-        .build(&config.target_comp_id, target, seq);
-    stream.write_all(&msg)?;
-    stream.flush()
-}
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
 
 /// Load a 32-byte Ed25519 private key seed from a file.
 fn load_signing_key(path: &std::path::Path) -> Result<SigningKey, Box<dyn std::error::Error>> {
@@ -463,60 +607,4 @@ fn load_signing_key(path: &std::path::Path) -> Result<SigningKey, Box<dyn std::e
     let mut bytes = [0u8; 32];
     bytes.copy_from_slice(&seed);
     Ok(SigningKey::from_bytes(&bytes))
-}
-
-/// Authenticate with melin-server using Ed25519 challenge-response.
-/// Returns (reader, writer) for the authenticated connection.
-///
-/// Same handshake as `melin-client::Client::connect()`, but returns
-/// the raw reader/writer instead of a `Client` so we can use them
-/// from separate threads.
-fn authenticate_melin(
-    stream: TcpStream,
-    signing_key: &SigningKey,
-) -> Result<
-    (
-        BlockingFrameReader<TcpStream>,
-        Arc<std::sync::Mutex<BlockingFrameWriter<TcpStream>>>,
-    ),
-    Box<dyn std::error::Error>,
-> {
-    let reader_stream = stream.try_clone()?;
-    // Set read timeout for the outbound thread's blocking reads.
-    reader_stream.set_read_timeout(Some(Duration::from_secs(5)))?;
-    let mut reader = BlockingFrameReader::new(reader_stream);
-    let mut writer = BlockingFrameWriter::new(stream);
-
-    // Read Challenge.
-    let frame = reader
-        .read_frame()?
-        .ok_or("server closed before Challenge")?;
-    let challenge = codec::decode_response(frame)?;
-    let nonce = match challenge {
-        ResponseKind::Challenge { nonce } => nonce,
-        _ => return Err("expected Challenge from server".into()),
-    };
-
-    // Sign and send ChallengeResponse.
-    let signature = signing_key.sign(&nonce);
-    let request = melin_protocol::message::Request::ChallengeResponse {
-        signature: signature.to_bytes(),
-        public_key: signing_key.verifying_key().to_bytes(),
-    };
-    let mut buf = [0u8; 136];
-    let written = codec::encode_request(&request, 0, &mut buf)?;
-    writer.write_frame(&buf[4..written])?;
-    writer.flush()?;
-
-    // Read auth result.
-    let frame = reader
-        .read_frame()?
-        .ok_or("server closed before auth result")?;
-    match codec::decode_response(frame)? {
-        ResponseKind::ServerReady => {}
-        ResponseKind::AuthFailed => return Err("authentication failed".into()),
-        other => return Err(format!("unexpected auth response: {other:?}").into()),
-    }
-
-    Ok((reader, Arc::new(std::sync::Mutex::new(writer))))
 }
