@@ -7,10 +7,41 @@
 
 use std::io::{self, Write};
 use std::net::{SocketAddr, TcpStream};
+use std::os::unix::io::RawFd;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use tracing::{debug, error, info, warn};
+
+/// Force the kernel to send a TCP ACK immediately rather than holding
+/// it in the delayed-ACK timer (~40 ms on Linux). Linux clears
+/// `TCP_QUICKACK` after each ACK it sends, so this must be re-armed
+/// after every received batch — otherwise the next ACK falls back to
+/// delayed-ACK behavior. Best-effort: a failure here only costs
+/// latency, not correctness.
+#[inline]
+fn arm_tcp_quickack(fd: RawFd) {
+    let on: libc::c_int = 1;
+    // SAFETY: fd is a live socket fd owned by the caller for the
+    // lifetime of this call; the option pointer is to a stack-local
+    // i32 with the right size.
+    let rc = unsafe {
+        libc::setsockopt(
+            fd,
+            libc::IPPROTO_TCP,
+            libc::TCP_QUICKACK,
+            &on as *const libc::c_int as *const libc::c_void,
+            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+        )
+    };
+    if rc != 0 {
+        // Discarded errno: TCP_QUICKACK is best-effort. The hot
+        // re-arm path runs once per RECV completion and we don't
+        // want to allocate a tracing event for every received
+        // batch in the steady state.
+        let _ = rc;
+    }
+}
 
 use super::auth::authenticate_with_primary;
 use super::protocol::{
@@ -65,6 +96,14 @@ fn replica_stream_uring(
         tracing::error!(error = %e, "io_uring register_files failed");
         return SessionExit::Disconnected;
     }
+
+    // Arm TCP_QUICKACK so the kernel ACKs incoming WAL batches
+    // immediately instead of waiting on the delayed-ACK timer. The
+    // sender's TCP send window can't advance until the ACK lands;
+    // a 40 ms delay here directly bottlenecks replication throughput.
+    // Linux clears the flag after each ACK, so we re-arm it on every
+    // RECV completion below.
+    arm_tcp_quickack(tcp_fd);
 
     // Pin io-wq workers to core 0.
     {
@@ -210,6 +249,7 @@ fn replica_stream_uring(
                             // processing — don't handle frames here to keep
                             // the backpressure drain simple.
                             if bp_result > 0 {
+                                arm_tcp_quickack(tcp_fd);
                                 let n = bp_result as usize;
                                 parse_buf.extend_from_slice(&recv_buf[..n]);
                                 // Resubmit RECV.
@@ -276,6 +316,11 @@ fn replica_stream_uring(
                         warn!("primary disconnected (recv returned {result})");
                         return SessionExit::Disconnected;
                     }
+                    // Re-arm TCP_QUICKACK: Linux clears it after each
+                    // kernel ACK, so we have to set it again for the
+                    // ACK that this recv just generated to bypass the
+                    // delayed-ACK timer.
+                    arm_tcp_quickack(tcp_fd);
                     let n = result as usize;
                     parse_buf.extend_from_slice(&recv_buf[..n]);
 
