@@ -66,7 +66,14 @@ impl FixMessageBuilder {
 
         // Body = MsgType + header fields + user fields
         // (MsgType is already in self.body from new())
-        let msg_type_end = self.body.iter().position(|&b| b == tags::SOH).unwrap() + 1;
+        // Safe: `new()` always pushes "35=<type>\x01" into self.body,
+        // so an SOH is guaranteed to exist.
+        let msg_type_end = self
+            .body
+            .iter()
+            .position(|&b| b == tags::SOH)
+            .expect("MsgType SOH inserted by FixMessageBuilder::new")
+            + 1;
         let mut full_body = Vec::with_capacity(self.body.len() + header_fields.len());
         full_body.extend_from_slice(&self.body[..msg_type_end]);
         full_body.extend_from_slice(&header_fields);

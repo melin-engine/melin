@@ -180,8 +180,10 @@ impl<'a> FixMessage<'a> {
 
     /// Get the MsgType (tag 35) as bytes.
     pub fn msg_type(&self) -> &'a [u8] {
-        // Safe: parse() validated MsgType exists.
-        self.get(tags::MSG_TYPE).unwrap()
+        // Safe: parse() rejects messages without MsgType, so any
+        // FixMessage value reaching this method has tag 35.
+        self.get(tags::MSG_TYPE)
+            .expect("MsgType validated by FixMessage::parse")
     }
 
     /// Get the SenderCompID (tag 49) as a string.
