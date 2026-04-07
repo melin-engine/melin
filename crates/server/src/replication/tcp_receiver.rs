@@ -112,10 +112,16 @@ fn replica_stream_uring(
         let _ = ring.submitter().register_iowq_aff(&cpuset);
     }
 
-    // RECV buffer — 64 KiB. DataBatch frames can be up to 768 KiB,
-    // but TCP delivers data in chunks. parse_buf accumulates until
-    // a complete frame is available.
-    let mut recv_buf = vec![0u8; 65536];
+    // RECV buffer — sized to hold a full max DataBatch frame in a
+    // single recv. With a 64 KiB buffer the kernel had to fragment
+    // each ~165 KiB batch into 3 cqes, and parsing the first chunk
+    // blocked the next recv (single in-flight RECV). A buffer matching
+    // MAX_DATA_FRAME lets one recv drain whatever the kernel queued
+    // during the previous parse pass.
+    // Vec<u8> chosen for owned heap allocation with a cheap as_mut_ptr;
+    // Box<[u8; N]> would force a fixed compile-time size which we
+    // intentionally tie to MAX_DATA_FRAME at runtime.
+    let mut recv_buf = vec![0u8; MAX_DATA_FRAME];
     let mut parse_buf: Vec<u8> = Vec::with_capacity(MAX_DATA_FRAME + 4);
     let mut ack_send_buf: Vec<u8> = Vec::with_capacity(64);
     let mut ack_send_offset: usize = 0;
