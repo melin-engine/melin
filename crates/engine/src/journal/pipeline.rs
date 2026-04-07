@@ -1652,6 +1652,11 @@ impl MatchingStage {
                 currency,
                 amount,
             } => {
+                // Replay path: rejections (insufficient balance, resting
+                // orders, unknown account) are deterministic — they
+                // reproduce the original live outcome and were already
+                // surfaced to the client at the time. Discarding here is
+                // intentional and safe.
                 let _ = self.exchange.withdraw(account, currency, amount);
             }
             JournalEvent::DisableInstrument { symbol } => {

@@ -2,6 +2,8 @@
 
 use std::fmt;
 
+use crate::types::RejectReason;
+
 /// Format a 32-byte hash as a hex string (first 8 bytes for readability).
 fn hex(hash: &[u8; 32]) -> String {
     hash.iter()
@@ -38,6 +40,11 @@ pub enum JournalError {
         expected: [u8; 32],
         actual: [u8; 32],
     },
+    /// The journaled command was durably recorded but the underlying
+    /// exchange operation rejected it (e.g., insufficient balance,
+    /// unknown account). The journal entry is still appended so that
+    /// replay reproduces the same outcome deterministically.
+    Rejected(RejectReason),
 }
 
 impl fmt::Display for JournalError {
@@ -73,6 +80,7 @@ impl fmt::Display for JournalError {
                 hex(expected),
                 hex(actual)
             ),
+            Self::Rejected(reason) => write!(f, "command rejected: {reason:?}"),
         }
     }
 }

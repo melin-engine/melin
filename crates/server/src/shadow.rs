@@ -193,7 +193,9 @@ fn dispatch_event(
             currency,
             amount,
         } => {
-            // Best-effort — shadow doesn't propagate withdrawal errors.
+            // Replay path: deterministic — rejections reproduce the
+            // original live outcome and were already surfaced to the
+            // client. Discarding here is intentional and safe.
             let _ = exchange.withdraw(account, currency, amount);
         }
         JournalEvent::DisableInstrument { symbol } => {
@@ -522,6 +524,7 @@ mod tests {
                     currency,
                     amount,
                 } => {
+                    // Replay path: deterministic — see note in apply_event.
                     let _ = primary.withdraw(account, currency, amount);
                 }
                 JournalEvent::DisableInstrument { symbol } => {

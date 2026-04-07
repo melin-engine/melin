@@ -70,6 +70,11 @@ impl JournaledExchange {
 
     /// Withdraw funds from an account. Journals before executing.
     /// Rejects if the account has resting orders or insufficient balance.
+    ///
+    /// The journal entry is appended unconditionally so that replay
+    /// reproduces the same rejection deterministically. Business-level
+    /// rejections (insufficient balance, unknown account, resting orders)
+    /// are surfaced to the caller as `JournalError::Rejected`.
     pub fn withdraw(
         &mut self,
         account: AccountId,
@@ -81,10 +86,9 @@ impl JournaledExchange {
             currency,
             amount,
         })?;
-        // Withdraw errors are returned to the caller but don't affect
-        // the journal — the event is recorded regardless.
-        let _ = self.exchange.withdraw(account, currency, amount);
-        Ok(())
+        self.exchange
+            .withdraw(account, currency, amount)
+            .map_err(JournalError::Rejected)
     }
 
     /// Set risk limits for an instrument. Journals before executing.
@@ -1305,6 +1309,70 @@ mod tests {
     }
 
     #[test]
+    fn withdraw_insufficient_balance_returns_error() {
+        // Regression: JournaledExchange::withdraw used to silently discard
+        // the underlying RejectReason and return Ok, hiding failures from
+        // the caller. The journaled event must still be recorded (for
+        // deterministic replay), but the API must surface the rejection.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("withdraw_err.journal");
+
+        let mut je = JournaledExchange::create(&path).unwrap();
+        je.deposit(ACCT_A, USD, 100).unwrap();
+
+        let err = je.withdraw(ACCT_A, USD, 200).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                JournalError::Rejected(RejectReason::InsufficientBalance)
+            ),
+            "expected Rejected(InsufficientBalance), got {err:?}"
+        );
+
+        // Balance must be unchanged.
+        assert_eq!(je.exchange().accounts().balance(ACCT_A, USD).available, 100);
+    }
+
+    #[test]
+    fn withdraw_with_resting_orders_returns_error() {
+        // A withdraw against an account with resting orders must be rejected
+        // and the rejection must be surfaced to the caller. The journal entry
+        // is still appended so replay reproduces the same outcome.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("withdraw_resting.journal");
+
+        let mut je = JournaledExchange::create(&path).unwrap();
+        je.add_instrument(btc_usd_spec()).unwrap();
+        je.deposit(ACCT_A, USD, 100_000).unwrap();
+
+        let mut reports = Vec::new();
+        je.execute(
+            Symbol(1),
+            limit_order(1, ACCT_A, Side::Buy, 100, 10),
+            &mut reports,
+        )
+        .unwrap();
+
+        let err = je.withdraw(ACCT_A, USD, 1).unwrap_err();
+        assert!(
+            matches!(err, JournalError::Rejected(RejectReason::HasRestingOrders)),
+            "expected Rejected(HasRestingOrders), got {err:?}"
+        );
+    }
+
+    #[test]
+    fn withdraw_unknown_account_returns_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("withdraw_unknown.journal");
+        let mut je = JournaledExchange::create(&path).unwrap();
+        let err = je.withdraw(ACCT_A, USD, 1).unwrap_err();
+        assert!(
+            matches!(err, JournalError::Rejected(RejectReason::UnknownAccount)),
+            "expected Rejected(UnknownAccount), got {err:?}"
+        );
+    }
+
+    #[test]
     fn journal_replay_rejected_withdraw_is_noop() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("withdraw_rejected.journal");
@@ -1323,8 +1391,13 @@ mod tests {
             )
             .unwrap();
 
-            // This withdraw is journaled but rejected at execution.
-            let _ = je.withdraw(ACCT_A, USD, 1_000);
+            // This withdraw is journaled but rejected at execution because
+            // the account has a resting order. The error must be surfaced.
+            let err = je.withdraw(ACCT_A, USD, 1_000).unwrap_err();
+            assert!(
+                matches!(err, JournalError::Rejected(RejectReason::HasRestingOrders)),
+                "expected Rejected(HasRestingOrders), got {err:?}"
+            );
         }
 
         // Replay: the rejected withdraw should be a no-op.
@@ -1592,7 +1665,10 @@ mod tests {
             count += 1;
         }
 
-        // Withdraw.
+        // Withdraw — must cancel resting orders first, otherwise the
+        // withdraw is rejected with HasRestingOrders.
+        je.cancel_all(ACCT_A, &mut reports).unwrap();
+        count += 1;
         je.withdraw(ACCT_A, USD, 1_000).unwrap();
         count += 1;
 
@@ -2204,7 +2280,13 @@ mod tests {
                 je.set_circuit_breaker(*sym, *cfg).unwrap();
             }
             TestEvent::Withdraw(acct, cur, amt) => {
-                je.withdraw(*acct, *cur, *amt).unwrap();
+                // Random workload may legitimately hit rejections
+                // (insufficient balance, resting orders); replay must
+                // still reproduce them deterministically.
+                match je.withdraw(*acct, *cur, *amt) {
+                    Ok(()) | Err(JournalError::Rejected(_)) => {}
+                    Err(e) => panic!("unexpected journal error: {e:?}"),
+                }
             }
         }
     }
