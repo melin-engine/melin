@@ -47,6 +47,7 @@ use tracing::{debug, error, info, warn};
 use melin_engine::journal::replication::ReplicationConsumer;
 
 mod auth;
+mod catchup;
 mod protocol;
 
 // Re-export the public wire-protocol types so the module's public API
@@ -56,6 +57,9 @@ mod protocol;
 pub use protocol::{Ack, Handshake, PrimaryMessage, ReplicaMessage};
 
 use auth::{authenticate_replica, authenticate_with_primary};
+#[cfg(feature = "dpdk")]
+use catchup::discover_journal_files;
+use catchup::{CatchUpResult, can_catch_up_from_journal, catch_up_from_journal};
 use protocol::{
     MAX_CONTROL_FRAME, MAX_DATA_FRAME, decode_primary_message, decode_replica_message, encode_ack,
     encode_data_batch, encode_handshake, encode_heartbeat, encode_need_snapshot,
@@ -413,190 +417,6 @@ fn run_replica_slot(
         Err(e) => warn!(error = %e, "replica connection error"),
     }
     consumer
-}
-
-/// Discover journal archive files, sorted oldest to newest.
-/// Returns `[path.3, path.2, path.1, path]` — only files that exist.
-fn discover_journal_files(journal_path: &std::path::Path) -> Vec<std::path::PathBuf> {
-    let mut archives = Vec::new();
-    let mut n = 1u32;
-    loop {
-        let archive = std::path::PathBuf::from(format!("{}.{n}", journal_path.display()));
-        if !archive.exists() {
-            break;
-        }
-        archives.push(archive);
-        n += 1;
-    }
-    // Reverse so oldest is first (highest number = oldest).
-    archives.reverse();
-    // Current journal is newest.
-    if journal_path.exists() {
-        archives.push(journal_path.to_path_buf());
-    }
-    archives
-}
-
-/// Stream historical journal entries to a catching-up replica.
-///
-/// Reads raw entry bytes from the primary's journal files and sends
-/// them as DataBatch frames. Does NOT consume from the replication ring
-/// during catch-up — the ring accumulates live data. The caller must
-/// drain overlapping ring entries after catch-up completes.
-///
-/// Result of a journal catch-up attempt.
-enum CatchUpResult {
-    /// Catch-up succeeded. Contains the last sequence sent (or the input
-    /// last_sequence if no entries were sent).
-    Ok(u64),
-    /// Replica's last_sequence predates all available journal files.
-    /// The primary must transfer a snapshot instead.
-    NeedSnapshot,
-}
-
-/// Check if journal catch-up is possible without sending any data.
-/// Returns true if the journal archives contain the replica's last_sequence,
-/// false if the archives have been purged and a snapshot transfer is needed.
-fn can_catch_up_from_journal(
-    journal_path: &std::path::Path,
-    last_sequence: u64,
-) -> io::Result<bool> {
-    use melin_engine::journal::reader::RawJournalScanner;
-
-    let files = discover_journal_files(journal_path);
-    if files.is_empty() || last_sequence == 0 {
-        // No files or fresh replica — catch-up will handle it.
-        return Ok(true);
-    }
-
-    // Check if any file starts at or before the target sequence.
-    for path in files.iter().rev() {
-        let mut scanner = RawJournalScanner::open(path)
-            .map_err(|e| io::Error::other(format!("open journal {}: {e}", path.display())))?;
-        if let Some(first_seq) = scanner
-            .first_sequence()
-            .map_err(|e| io::Error::other(format!("read {}: {e}", path.display())))?
-            && first_seq <= last_sequence
-        {
-            return Ok(true);
-        }
-    }
-    Ok(false)
-}
-
-/// Returns the last sequence sent, or 0 if no entries were sent.
-fn catch_up_from_journal(
-    journal_path: &std::path::Path,
-    last_sequence: u64,
-    writer: &mut TcpStream,
-    shutdown: &AtomicBool,
-) -> io::Result<CatchUpResult> {
-    use melin_engine::journal::reader::RawJournalScanner;
-
-    let files = discover_journal_files(journal_path);
-    if files.is_empty() {
-        return Ok(CatchUpResult::Ok(last_sequence));
-    }
-
-    // Find the first file that contains entries after last_sequence.
-    // For a fresh replica (last_sequence=0), start from the oldest file.
-    let mut start_file_idx = 0;
-    if last_sequence > 0 {
-        // Scan files from newest to oldest to find which contains our target.
-        let mut found = false;
-        for (i, path) in files.iter().enumerate().rev() {
-            let mut scanner = RawJournalScanner::open(path)
-                .map_err(|e| io::Error::other(format!("open journal {}: {e}", path.display())))?;
-            if let Some(first_seq) = scanner
-                .first_sequence()
-                .map_err(|e| io::Error::other(format!("read {}: {e}", path.display())))?
-                && first_seq <= last_sequence
-            {
-                // This file starts at or before our target — start here.
-                start_file_idx = i;
-                found = true;
-                break;
-            }
-        }
-        if !found {
-            // All files start after our target — journal archives were purged.
-            // The replica needs a snapshot transfer.
-            warn!(
-                last_sequence,
-                "replica's last_sequence predates all available journal files — snapshot transfer required"
-            );
-            return Ok(CatchUpResult::NeedSnapshot);
-        }
-    }
-
-    let mut send_buf = Vec::with_capacity(128 * 1024);
-    let mut batch_buf = Vec::with_capacity(64 * 1024);
-    let mut end_sequence = last_sequence;
-    let mut batches_sent = 0u64;
-
-    info!(
-        last_sequence,
-        files = files.len(),
-        start_file = start_file_idx,
-        "starting journal catch-up"
-    );
-
-    for path in &files[start_file_idx..] {
-        if shutdown.load(Ordering::Relaxed) {
-            return Ok(CatchUpResult::Ok(end_sequence));
-        }
-
-        let mut scanner = RawJournalScanner::open(path)
-            .map_err(|e| io::Error::other(format!("open journal {}: {e}", path.display())))?;
-
-        // Skip entries the replica already has. Always skip at least
-        // genesis (seq 1) — it's delivered via StreamStart, not catch-up.
-        let skip_to = end_sequence.max(1);
-        scanner
-            .skip_to_after(skip_to)
-            .map_err(|e| io::Error::other(format!("skip in {}: {e}", path.display())))?;
-
-        // Read and send batches of raw entries.
-        // Target ~64 KiB per DataBatch frame (~800 entries at ~80 bytes each).
-        loop {
-            if shutdown.load(Ordering::Relaxed) {
-                return Ok(CatchUpResult::Ok(end_sequence));
-            }
-
-            batch_buf.clear();
-            let batch = scanner
-                .read_raw_batch(&mut batch_buf, 64 * 1024)
-                .map_err(|e| io::Error::other(format!("read {}: {e}", path.display())))?;
-
-            let Some((entry_count, batch_end_seq)) = batch else {
-                break; // EOF on this file.
-            };
-
-            // Encode and send DataBatch frame.
-            // Chain hash is zeroed — chain verification is a documented v1 limitation.
-            encode_data_batch(
-                batch_end_seq,
-                &[0u8; 32],
-                entry_count,
-                &batch_buf,
-                &mut send_buf,
-            );
-            writer
-                .write_all(&send_buf)
-                .map_err(|e| io::Error::other(format!("write catch-up batch: {e}")))?;
-            writer
-                .flush()
-                .map_err(|e| io::Error::other(format!("flush catch-up batch: {e}")))?;
-            send_buf.clear();
-
-            end_sequence = batch_end_seq;
-            batches_sent += 1;
-        }
-    }
-
-    info!(end_sequence, batches_sent, "journal catch-up complete");
-
-    Ok(CatchUpResult::Ok(end_sequence))
 }
 
 #[allow(clippy::too_many_arguments)]
