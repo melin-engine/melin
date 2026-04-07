@@ -533,7 +533,12 @@ pub fn run_receiver(
                 continue;
             }
         };
-        let _ = stream.set_nodelay(true);
+        if let Err(e) = stream.set_nodelay(true) {
+            // Don't bail — Nagle adds latency but doesn't break correctness.
+            // Surface it so a misconfigured kernel doesn't silently kill
+            // replication throughput.
+            warn!(error = %e, "failed to set TCP_NODELAY on replica receive socket");
+        }
         stream.set_read_timeout(Some(std::time::Duration::from_secs(5)))?;
 
         let mut reader = stream.try_clone()?;
