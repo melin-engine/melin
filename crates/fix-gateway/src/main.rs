@@ -28,6 +28,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Initialize tracing.
     tracing_subscriber::fmt()
         .with_env_filter(
+            // Discard try_from_default_env error: it returns Err
+            // when RUST_LOG is unset, which is the normal case.
+            // Fall back to a sensible default.
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
         )
@@ -46,7 +49,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 i += 2;
             }
             "--core" if i + 1 < args.len() => {
+                // Discard parse error: a malformed --core value
+                // leaves `pin_core` as None, which means "do not pin
+                // to any core". A later warn! covers the case.
                 pin_core = args[i + 1].parse().ok();
+                if pin_core.is_none() {
+                    warn!(value = %args[i + 1], "invalid --core value, not pinning");
+                }
                 i += 2;
             }
             _ => {
@@ -79,7 +88,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Shutdown signal.
     let shutdown = Arc::new(AtomicBool::new(false));
-    setup_signal_handler(&shutdown);
+    setup_signal_handler(&shutdown)?;
 
     // Bind the TCP listener.
     let listener = TcpListener::bind(config.listen_addr)?;
@@ -141,7 +150,7 @@ fn pin_to_core(core: usize) {
 /// Set up signal handling: block SIGINT/SIGTERM on the main thread, then
 /// spawn a dedicated thread that waits for them via sigwait and sets the
 /// shutdown flag. This is the only additional thread — it's off the hot path.
-fn setup_signal_handler(shutdown: &Arc<AtomicBool>) {
+fn setup_signal_handler(shutdown: &Arc<AtomicBool>) -> std::io::Result<()> {
     let flag = Arc::clone(shutdown);
 
     // Block signals on the main thread so they're delivered to the signal thread.
@@ -153,7 +162,10 @@ fn setup_signal_handler(shutdown: &Arc<AtomicBool>) {
         libc::sigprocmask(libc::SIG_BLOCK, &sigset, std::ptr::null_mut());
     }
 
-    let _ = std::thread::Builder::new()
+    // Spawn the dedicated signal-handling thread. Failure to spawn
+    // here would leave the gateway with no graceful shutdown path —
+    // surface it as a startup error rather than dropping the result.
+    std::thread::Builder::new()
         .name("signal".into())
         .spawn(move || {
             unsafe {
@@ -165,5 +177,6 @@ fn setup_signal_handler(shutdown: &Arc<AtomicBool>) {
                 libc::sigwait(&sigset, &mut sig);
             }
             flag.store(true, Ordering::Relaxed);
-        });
+        })?;
+    Ok(())
 }

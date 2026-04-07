@@ -326,7 +326,8 @@ impl Session {
             return SessionAction::Close;
         }
 
-        // Extract HeartBtInt (default 30s).
+        // Extract HeartBtInt. Discard parse error: a malformed value
+        // (or missing tag) falls back to the FIX 4.2 default of 30 s.
         let heartbeat_secs: u64 = msg
             .get_str(tags::HEART_BT_INT)
             .and_then(|s| s.parse().ok())
@@ -605,6 +606,9 @@ impl Session {
                 self.metrics
                     .resend_requests_received_total
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                // Discard parse errors: a malformed BeginSeqNo or
+                // EndSeqNo collapses into None and is rejected by the
+                // (None, None) match arm below.
                 let begin = msg.get_str(tags::BEGIN_SEQ_NO).and_then(|s| s.parse().ok());
                 let end = msg.get_str(tags::END_SEQ_NO).and_then(|s| s.parse().ok());
                 match (begin, end) {
@@ -1062,6 +1066,8 @@ impl Session {
         msg: &FixMessage<'_>,
         config: &GatewayConfig,
     ) -> SessionAction {
+        // Discard parse error: a malformed NewSeqNo collapses into
+        // None and is rejected by the None branch below.
         let new_seq = match msg
             .get_str(tags::NEW_SEQ_NO)
             .and_then(|s| s.parse::<u64>().ok())

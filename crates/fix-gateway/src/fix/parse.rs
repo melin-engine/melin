@@ -175,6 +175,10 @@ impl<'a> FixMessage<'a> {
 
     /// Get the first value for a tag as a UTF-8 string.
     pub fn get_str(&self, tag: u32) -> Option<&'a str> {
+        // Discard from_utf8 error: an invalid UTF-8 value is the
+        // same outcome as a missing tag for the caller. FIX 4.2
+        // values are ASCII in practice; non-ASCII would be
+        // rejected upstream by the per-field parser.
         self.get(tag).and_then(|v| std::str::from_utf8(v).ok())
     }
 
@@ -231,6 +235,13 @@ fn find_checksum_start(data: &[u8]) -> Option<usize> {
     }
     None
 }
+
+// The four helpers below all discard their from_utf8 and parse
+// errors. The caller — `FixMessage::parse` and friends — only needs
+// to know whether the bytes form a valid integer; the specific error
+// (non-UTF8 vs out-of-range vs trailing garbage) is the same outcome:
+// the message is malformed and gets rejected with a generic parse
+// error.
 
 fn parse_u32(bytes: &[u8]) -> Option<u32> {
     std::str::from_utf8(bytes).ok()?.parse().ok()

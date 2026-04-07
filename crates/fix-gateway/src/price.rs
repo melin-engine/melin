@@ -34,6 +34,9 @@ pub fn decimal_to_ticks(s: &str, inverse: u64) -> Option<u64> {
     let int_val: u64 = if integer_part.is_empty() {
         0
     } else {
+        // Discard parse error: a malformed integer part is the same
+        // outcome as None for the caller — `decimal_to_ticks` returns
+        // None for any non-numeric input.
         integer_part.parse().ok()?
     };
 
@@ -49,6 +52,8 @@ pub fn decimal_to_ticks(s: &str, inverse: u64) -> Option<u64> {
         while padded.len() < inverse_digits {
             padded.push('0');
         }
+        // Discard parse error: same rationale as the integer part —
+        // a malformed fractional part propagates as None.
         padded.parse().ok()?
     } else {
         // More decimal places than tick size supports — reject.
