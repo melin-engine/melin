@@ -23,6 +23,7 @@ use tracing::{debug, error, info, warn};
 
 use melin_engine::exchange::Exchange;
 use melin_engine::journal::JournaledExchange;
+use melin_engine::journal::error::JournalError;
 use melin_engine::journal::pipeline::build_pipeline_with_replication;
 use melin_engine::journal::writer::JournalWriter;
 
@@ -517,6 +518,81 @@ pub enum ControlEvent {
     Disconnected {
         connection_id: u64,
     },
+}
+
+/// Joinable handles for every long-lived thread spawned by a primary.
+/// Optional handles are `None` when their feature is disabled (e.g.,
+/// no replication, no health endpoint) or unsupported on a transport
+/// (e.g., DPDK runs without an event publisher or shadow snapshotter).
+struct PipelineHandles {
+    journal: std::thread::JoinHandle<Result<JournalWriter, JournalError>>,
+    matching: std::thread::JoinHandle<Exchange>,
+    response: std::thread::JoinHandle<()>,
+    replication: Option<std::thread::JoinHandle<()>>,
+    event_publisher: Option<std::thread::JoinHandle<()>>,
+    shadow: Option<std::thread::JoinHandle<()>>,
+    health: Option<std::thread::JoinHandle<()>>,
+}
+
+/// Drain the pipeline and join every worker thread, surfacing panics
+/// and journal-stage errors as a single `pipeline failure` return.
+///
+/// `extras` is a list of pre-joined results (used by the DPDK path,
+/// which joins its poll threads before draining the pipeline).
+fn shutdown_pipeline_stages(
+    handles: PipelineHandles,
+    extras: Vec<(String, std::thread::Result<()>)>,
+    pipeline_healthy: &AtomicBool,
+    shutdown: &AtomicBool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    info!("shutdown: draining pipeline");
+    pipeline_healthy.store(false, Ordering::Relaxed);
+    shutdown.store(true, Ordering::Relaxed);
+
+    let mut thread_panicked = false;
+    let mut check_join = |name: &str, result: std::thread::Result<()>| {
+        if let Err(panic) = result {
+            let msg = panic
+                .downcast_ref::<&str>()
+                .copied()
+                .or_else(|| panic.downcast_ref::<String>().map(|s| s.as_str()))
+                .unwrap_or("<non-string panic>");
+            error!(thread = name, message = msg, "pipeline thread panicked");
+            thread_panicked = true;
+        }
+    };
+
+    let journal_result = handles.journal.join();
+    let journal_failed = matches!(&journal_result, Ok(Err(_)));
+    if let Ok(Err(ref e)) = journal_result {
+        error!(thread = "journal", error = %e, "journal stage returned error");
+    }
+    check_join("journal", journal_result.map(|_| ()));
+    check_join("matching", handles.matching.join().map(|_| ()));
+    check_join("response", handles.response.join());
+    for (name, r) in extras {
+        check_join(&name, r);
+    }
+    if let Some(h) = handles.replication {
+        check_join("replication-sender", h.join());
+    }
+    if let Some(h) = handles.event_publisher {
+        check_join("event-publisher", h.join());
+    }
+    if let Some(h) = handles.shadow {
+        check_join("shadow", h.join());
+    }
+    if let Some(h) = handles.health {
+        check_join("health", h.join());
+    }
+
+    if thread_panicked || journal_failed {
+        error!("shutdown complete (with pipeline failure)");
+        return Err("pipeline failure".into());
+    }
+
+    info!("shutdown complete");
+    Ok(())
 }
 
 /// Used by both the normal primary startup path and the promotion path
@@ -1182,56 +1258,21 @@ fn run_as_primary<L: BlockingTransportListener>(
     reader_handle.shutdown();
     reader_handle.join();
 
-    // 2. Now signal the pipeline. The journal and matching stages will
-    //    drain any remaining events before exiting.
-    info!("shutdown: draining pipeline");
-    pipeline_healthy.store(false, Ordering::Relaxed);
-    shutdown.store(true, Ordering::Relaxed);
-
-    let mut thread_panicked = false;
-    let mut check_join = |name: &str, result: std::thread::Result<_>| {
-        if let Err(panic) = result {
-            let msg = panic
-                .downcast_ref::<&str>()
-                .copied()
-                .or_else(|| panic.downcast_ref::<String>().map(|s| s.as_str()))
-                .unwrap_or("<non-string panic>");
-            error!(thread = name, message = msg, "pipeline thread panicked");
-            thread_panicked = true;
-        }
-    };
-    let journal_result = journal_handle.join();
-    let journal_failed = matches!(&journal_result, Ok(Err(_)));
-    if let Ok(Err(ref e)) = journal_result {
-        error!(thread = "journal", error = %e, "journal stage returned error");
-    }
-    check_join("journal", journal_result.map(|_| ()));
-    check_join("matching", matching_handle.join().map(|_| ()));
-    check_join("response", response_handle.join().map(|_| ()));
-
-    // Join auxiliary threads — surface any panics through the same
-    // check_join helper so the operator sees a log line and shutdown
-    // exits with a non-zero status.
-    if let Some(repl_sender_handle) = replication_handle {
-        check_join("replication-sender", repl_sender_handle.join());
-    }
-    if let Some(event_handle) = event_publisher_handle {
-        check_join("event-publisher", event_handle.join());
-    }
-    if let Some(shadow_h) = shadow_handle {
-        check_join("shadow", shadow_h.join());
-    }
-    if let Some(h) = health_handle {
-        check_join("health", h.join());
-    }
-
-    if thread_panicked || journal_failed {
-        error!("shutdown complete (with pipeline failure)");
-        return Err("pipeline failure".into());
-    }
-
-    info!("shutdown complete");
-    Ok(())
+    // 2. Now drain the pipeline and join every worker thread.
+    shutdown_pipeline_stages(
+        PipelineHandles {
+            journal: journal_handle,
+            matching: matching_handle,
+            response: response_handle,
+            replication: replication_handle,
+            event_publisher: event_publisher_handle,
+            shadow: shadow_handle,
+            health: health_handle,
+        },
+        Vec::new(),
+        &pipeline_healthy,
+        &shutdown,
+    )
 }
 
 /// Run the trading server with DPDK kernel-bypass networking.
@@ -1777,51 +1818,29 @@ pub fn run_dpdk(
         }
     }
 
-    // Join DPDK poll threads before shutdown sequence.
-    let dpdk_join_results: Vec<_> = dpdk_handles.into_iter().map(|h| h.join()).collect();
+    // Join DPDK poll threads before draining the pipeline — they're the
+    // ingress producers, so they must stop pushing before journal/matching
+    // can drain.
+    let dpdk_extras: Vec<(String, std::thread::Result<()>)> = dpdk_handles
+        .into_iter()
+        .enumerate()
+        .map(|(i, h)| (format!("dpdk-poll-{i}"), h.join()))
+        .collect();
 
-    // Shutdown sequence.
-    info!("shutdown: draining pipeline");
-    pipeline_healthy.store(false, Ordering::Relaxed);
-    shutdown.store(true, Ordering::Relaxed);
-
-    let mut thread_panicked = false;
-    let mut check_join = |name: &str, result: std::thread::Result<_>| {
-        if let Err(panic) = result {
-            let msg = panic
-                .downcast_ref::<&str>()
-                .copied()
-                .or_else(|| panic.downcast_ref::<String>().map(|s| s.as_str()))
-                .unwrap_or("<non-string panic>");
-            error!(thread = name, message = msg, "pipeline thread panicked");
-            thread_panicked = true;
-        }
-    };
-    let journal_result = journal_handle.join();
-    let journal_failed = matches!(&journal_result, Ok(Err(_)));
-    if let Ok(Err(ref e)) = journal_result {
-        error!(thread = "journal", error = %e, "journal stage returned error");
-    }
-    check_join("journal", journal_result.map(|_| ()));
-    check_join("matching", matching_handle.join().map(|_| ()));
-    check_join("response", response_handle.join().map(|_| ()));
-    for (i, r) in dpdk_join_results.into_iter().enumerate() {
-        check_join(&format!("dpdk-poll-{i}"), r);
-    }
-    if let Some(repl_sender_handle) = replication_handle {
-        check_join("replication-sender", repl_sender_handle.join());
-    }
-    if let Some(h) = health_handle {
-        check_join("health", h.join());
-    }
-
-    if thread_panicked || journal_failed {
-        error!("shutdown complete (with pipeline failure)");
-        return Err("pipeline failure".into());
-    }
-
-    info!("shutdown complete");
-    Ok(())
+    shutdown_pipeline_stages(
+        PipelineHandles {
+            journal: journal_handle,
+            matching: matching_handle,
+            response: response_handle,
+            replication: replication_handle,
+            event_publisher: None,
+            shadow: None,
+            health: health_handle,
+        },
+        dpdk_extras,
+        &pipeline_healthy,
+        &shutdown,
+    )
 }
 
 /// Initialize or recover the JournaledExchange from disk.
