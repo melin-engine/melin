@@ -1584,6 +1584,7 @@ dependencies = [
  "libc",
  "melin-engine",
  "melin-protocol",
+ "proptest",
  "serde",
  "toml",
  "tracing",

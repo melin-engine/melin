@@ -408,3 +408,179 @@ mod tests {
         assert!(try_extract_message(&mut buf).is_none());
     }
 }
+
+#[cfg(test)]
+mod proptests {
+    //! Property-based tests for the FIX parser. The parser is the
+    //! gateway's outermost trust boundary; these tests aim at:
+    //!   * round-trip stability with the serializer,
+    //!   * no panics on arbitrary inputs,
+    //!   * single-byte corruption is always detected, and
+    //!   * frame extraction is stable under trailing garbage.
+    use super::*;
+    use crate::fix::serialize::FixMessageBuilder;
+    use proptest::prelude::*;
+
+    /// Bytes that are safe to embed inside a FIX field value:
+    /// printable ASCII (0x20..=0x7e) excluding `=` (the tag/value
+    /// separator) and SOH (the field terminator). Anything else would
+    /// either confuse the parser or be rejected at a higher layer.
+    fn fix_safe_string(max_len: usize) -> impl Strategy<Value = String> {
+        proptest::collection::vec(
+            (0x20u8..=0x7eu8).prop_filter("no '=' or SOH", |b| *b != b'=' && *b != tags::SOH),
+            1..=max_len,
+        )
+        .prop_map(|v| String::from_utf8(v).unwrap())
+    }
+
+    /// One of the standard FIX 4.2 MsgType bytes the gateway emits.
+    /// Restricted to known types so the strategy never produces
+    /// something the builder couldn't legitimately have created.
+    fn msg_type() -> impl Strategy<Value = &'static [u8]> {
+        prop_oneof![
+            Just(tags::MSG_HEARTBEAT),
+            Just(tags::MSG_TEST_REQUEST),
+            Just(tags::MSG_LOGON),
+            Just(tags::MSG_LOGOUT),
+            Just(tags::MSG_NEW_ORDER_SINGLE),
+            Just(tags::MSG_EXECUTION_REPORT),
+            Just(tags::MSG_RESEND_REQUEST),
+            Just(tags::MSG_SEQUENCE_RESET),
+        ]
+    }
+
+    /// User-defined field tag. Avoids the small standard tag space the
+    /// builder injects (so the round-trip assertions stay clean).
+    fn user_tag() -> impl Strategy<Value = u32> {
+        // Tags > 1000 are well clear of every constant in tags.rs.
+        1001u32..10_000u32
+    }
+
+    proptest! {
+        // Trust-boundary properties run with a higher case count than
+        // proptest's default 256 — the parser is the gateway's outer
+        // attack surface and the extra cases are cheap (~ms total).
+        #![proptest_config(ProptestConfig::with_cases(2048))]
+
+        /// Round-trip: build a message, parse it back, every field we
+        /// put in shows up in the parse output with the right value.
+        #[test]
+        fn round_trip_preserves_header_and_user_fields(
+            mt in msg_type(),
+            sender in fix_safe_string(16),
+            target in fix_safe_string(16),
+            seq in 1u64..=u64::MAX,
+            user_fields in proptest::collection::vec(
+                (user_tag(), fix_safe_string(32)),
+                0..8,
+            ),
+        ) {
+            // Deduplicate tags so the "first occurrence" semantics of
+            // FixMessage::get are unambiguous in the assertion below.
+            let mut seen = std::collections::HashSet::new();
+            let user_fields: Vec<_> = user_fields
+                .into_iter()
+                .filter(|(t, _)| seen.insert(*t))
+                .collect();
+
+            let mut builder = FixMessageBuilder::new(mt);
+            for (t, v) in &user_fields {
+                builder = builder.str_tag(*t, v);
+            }
+            let raw = builder.build(&sender, &target, seq);
+
+            let msg = FixMessage::parse(&raw).expect("valid round trip");
+            prop_assert_eq!(msg.msg_type(), mt);
+            prop_assert_eq!(msg.sender_comp_id(), Some(sender.as_str()));
+            prop_assert_eq!(msg.target_comp_id(), Some(target.as_str()));
+            prop_assert_eq!(msg.msg_seq_num(), Some(seq));
+            for (t, v) in &user_fields {
+                prop_assert_eq!(msg.get_str(*t), Some(v.as_str()));
+            }
+        }
+
+        /// The parser must never panic on arbitrary bytes — the worst
+        /// it may do is return Err. This is the trust-boundary
+        /// guarantee: a hostile peer cannot crash the gateway by
+        /// sending malformed FIX-ish bytes.
+        #[test]
+        fn parse_does_not_panic_on_arbitrary_bytes(
+            data in proptest::collection::vec(any::<u8>(), 0..512)
+        ) {
+            let _ = FixMessage::parse(&data);
+        }
+
+        /// try_extract_message must also never panic and must never
+        /// return more bytes than the input. If it returns Some, the
+        /// returned slice is what was at the front of the buffer.
+        #[test]
+        fn try_extract_message_does_not_panic_on_arbitrary_bytes(
+            data in proptest::collection::vec(any::<u8>(), 0..512)
+        ) {
+            let mut buf = data.clone();
+            let _ = try_extract_message(&mut buf);
+            prop_assert!(buf.len() <= data.len());
+        }
+
+        /// Flipping a single byte in the body of a valid message
+        /// must always be detected. The parser may surface this as
+        /// any of: malformed field, body-length mismatch, checksum
+        /// mismatch, or one of the structural errors — but it must
+        /// not silently accept a tampered message.
+        #[test]
+        fn single_byte_corruption_in_body_is_always_detected(
+            mt in msg_type(),
+            sender in fix_safe_string(8),
+            target in fix_safe_string(8),
+            seq in 1u64..=1_000_000u64,
+            body_field in fix_safe_string(8),
+            flip_idx in any::<usize>(),
+            xor_mask in 1u8..=255u8,
+        ) {
+            let mut raw = FixMessageBuilder::new(mt)
+                .str_tag(tags::TEXT, &body_field)
+                .build(&sender, &target, seq);
+
+            // Pick an index inside the body region (between the
+            // BodyLength SOH and the start of "10="). Corrupting bytes
+            // outside that range would either invalidate framing in
+            // ways the test doesn't care about (header) or rebuild a
+            // self-consistent checksum (trailer).
+            let body_start = find_body_start(&raw).unwrap();
+            let cs_start = find_checksum_start(&raw).unwrap();
+            prop_assume!(cs_start > body_start);
+            let target_idx = body_start + (flip_idx % (cs_start - body_start));
+
+            let original = raw[target_idx];
+            raw[target_idx] = original ^ xor_mask;
+            // Flipping `=` or SOH is allowed — it's still a corrupted
+            // byte the parser must reject.
+            prop_assert!(
+                FixMessage::parse(&raw).is_err(),
+                "tampered byte at {} ({:#x} -> {:#x}) was silently accepted",
+                target_idx, original, raw[target_idx]
+            );
+        }
+
+        /// Concatenating a valid message with arbitrary trailing bytes
+        /// must yield the original message back from
+        /// try_extract_message, leaving the trailing bytes in the
+        /// buffer. This is the framing contract the event loop relies
+        /// on under partial reads.
+        #[test]
+        fn extract_is_stable_under_trailing_garbage(
+            mt in msg_type(),
+            sender in fix_safe_string(8),
+            target in fix_safe_string(8),
+            seq in 1u64..=1_000_000u64,
+            tail in proptest::collection::vec(any::<u8>(), 0..64),
+        ) {
+            let raw = FixMessageBuilder::new(mt).build(&sender, &target, seq);
+            let mut buf = raw.clone();
+            buf.extend_from_slice(&tail);
+            let extracted = try_extract_message(&mut buf).expect("frame visible");
+            prop_assert_eq!(&extracted, &raw);
+            prop_assert_eq!(buf.as_slice(), tail.as_slice());
+        }
+    }
+}
