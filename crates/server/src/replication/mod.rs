@@ -181,6 +181,23 @@ impl PendingAckQueue {
         last_acked
     }
 
+    /// Pop ALL pending acks immediately, ignoring the journal cursor.
+    /// Used by `--async-replica-ack` mode where the receiver acks on
+    /// arrival rather than after fsync. Returns the highest acked
+    /// sequence among the popped entries, or `None` if empty.
+    pub(super) fn pop_all_async(&mut self) -> Option<u64> {
+        if self.is_empty() {
+            return None;
+        }
+        let mut last_acked = None;
+        while self.len > 0 {
+            last_acked = Some(self.buf[self.head].acked_sequence);
+            self.head = (self.head + 1) & Self::MASK;
+            self.len -= 1;
+        }
+        last_acked
+    }
+
     /// Block until the oldest pending ack is durable, then pop all
     /// ready entries. Returns the highest acked sequence.
     pub(super) fn pop_oldest_blocking(

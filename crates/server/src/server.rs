@@ -136,6 +136,21 @@ pub struct ServerConfig {
     #[arg(long, default_value_t = 5)]
     pub replication_heartbeat_secs: u64,
 
+    /// Acknowledge replicated batches as soon as they are received and
+    /// queued for the local journal stage, instead of waiting for the
+    /// local fsync to complete. Removes ~50–80µs of fsync latency from
+    /// the replication round-trip, lifting steady-state throughput.
+    ///
+    /// Durability tradeoff: a replica crash before its local fsync can
+    /// lose recently-acked batches from that replica's journal. The
+    /// primary still has them on disk and re-syncs the replica via the
+    /// catch-up protocol on reconnect, so end-to-end no data is lost
+    /// unless the primary's disk also fails simultaneously. Acceptable
+    /// for venues where dual-disk-failure is mitigated by separate means
+    /// (RAID, three-way replication, off-site journaling).
+    #[arg(long, default_value_t = false)]
+    pub async_replica_ack: bool,
+
     /// Number of slots in each replication ring buffer. Must be a power
     /// of two. Each slot holds up to 512 KiB. More slots = more buffering
     /// before eviction. Default: 256 (128 MiB per ring, 256 MiB dual-repl).
@@ -265,6 +280,7 @@ impl Default for ServerConfig {
             replication_batch_size: 32,
             max_journal_batch: 1024,
             replication_heartbeat_secs: 5,
+            async_replica_ack: false,
             replication_ring_size: 256,
             no_quorum_durability: false,
             yield_idle: false,
@@ -454,6 +470,7 @@ pub fn run_with_shutdown<L: BlockingTransportListener>(
             config.snapshot_interval_secs,
             config.shadow_snapshot_path(),
             config.cores,
+            config.async_replica_ack,
         )? {
             None => return Ok(()), // clean shutdown
             Some((mut exchange, writer)) => {

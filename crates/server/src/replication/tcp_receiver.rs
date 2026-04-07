@@ -75,6 +75,7 @@ fn replica_stream_uring(
     accum_chain_hash: &mut [u8; 32],
     shutdown: &AtomicBool,
     promote: &AtomicBool,
+    async_ack: bool,
 ) -> SessionExit {
     use io_uring::{IoUring, opcode, types};
     use std::os::unix::io::AsRawFd;
@@ -231,8 +232,27 @@ fn replica_stream_uring(
             return SessionExit::Promote;
         }
 
-        // --- Flush durable acks (non-blocking journal cursor check) ---
-        if !ack_send_in_flight && let Some(seq) = pending_acks.pop_ready(journal_cursor) {
+        // --- Flush acks ---
+        // Sync mode (default): wait for the journal cursor to advance past
+        // each pending batch's target before acking — guarantees the data
+        // is fsynced locally before the primary considers this replica
+        // durable.
+        //
+        // Async mode (`--async-replica-ack`): pop the oldest pending ack
+        // ignoring the journal cursor — acks as soon as the SEND slot is
+        // free. Removes ~50–80µs of fsync latency from the critical path
+        // at the cost of weaker per-replica durability semantics; see the
+        // CLI flag docs for the failure-mode analysis.
+        let ready_seq = if !ack_send_in_flight {
+            if async_ack {
+                pending_acks.pop_all_async()
+            } else {
+                pending_acks.pop_ready(journal_cursor)
+            }
+        } else {
+            None
+        };
+        if let Some(seq) = ready_seq {
             ack_send_buf.clear();
             encode_ack(
                 &Ack {
@@ -361,7 +381,16 @@ fn replica_stream_uring(
                 std::hint::spin_loop();
             }
 
-            let seq = pending_acks.pop_oldest_blocking(journal_cursor);
+            // After draining the in-flight SEND, drop all pending acks at
+            // once. In sync mode, wait for the journal to catch up first;
+            // in async mode, ack immediately without waiting on fsync.
+            let seq = if async_ack {
+                pending_acks
+                    .pop_all_async()
+                    .expect("non-empty queue after backpressure drain")
+            } else {
+                pending_acks.pop_oldest_blocking(journal_cursor)
+            };
             ack_send_buf.clear();
             encode_ack(
                 &Ack {
@@ -643,6 +672,7 @@ pub fn run_receiver(
     snapshot_interval_secs: u64,
     snapshot_path: std::path::PathBuf,
     cores: crate::server::PipelineCores,
+    async_ack: bool,
 ) -> ReceiverResult {
     use melin_engine::exchange::Exchange;
     use melin_engine::journal::writer::JournalWriter;
@@ -1056,6 +1086,7 @@ pub fn run_receiver(
             &mut accum_chain_hash,
             shutdown,
             promote,
+            async_ack,
         );
 
         // --- Common teardown (all exit paths) ---
