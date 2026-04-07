@@ -505,6 +505,14 @@ impl Session {
         // cancel any pending TestRequest probe.
         self.test_request_sent_at = None;
 
+        // SequenceReset (35=4) must be handled BEFORE the seq
+        // validation below — its entire purpose is to override the
+        // expected inbound seq, so the regular gap-detection path
+        // would either trigger a redundant ResendRequest or drop it.
+        if msg.msg_type() == tags::MSG_SEQUENCE_RESET {
+            return self.handle_sequence_reset(&msg, config);
+        }
+
         // Validate MsgSeqNum (FIX 4.2 §4.6 gap recovery).
         //
         // - seq < expected: stale duplicate (or replayed PossDup), ignore
@@ -981,6 +989,57 @@ impl Session {
             self.fix_send_buf.extend_from_slice(&bytes);
         }
         self.last_fix_sent = Instant::now();
+    }
+
+    /// Apply an inbound SequenceReset (35=4). Per FIX 4.2 §4.7.4
+    /// gap-fill (GapFillFlag=Y) and hard reset (GapFillFlag=N or
+    /// absent) both override `fix_inbound_seq` to NewSeqNo. NewSeqNo
+    /// must be strictly greater than the current expected inbound
+    /// seq; lower values are a misuse and get rejected.
+    fn handle_sequence_reset(
+        &mut self,
+        msg: &FixMessage<'_>,
+        config: &GatewayConfig,
+    ) -> SessionAction {
+        let new_seq = match msg
+            .get_str(tags::NEW_SEQ_NO)
+            .and_then(|s| s.parse::<u64>().ok())
+        {
+            Some(n) => n,
+            None => {
+                warn!(sender = %self.sender_comp_id, "SequenceReset missing NewSeqNo");
+                self.queue_fix_reject(config, "SequenceReset missing NewSeqNo");
+                return SessionAction::SendFix;
+            }
+        };
+
+        if new_seq <= self.fix_inbound_seq {
+            warn!(
+                sender = %self.sender_comp_id,
+                new_seq,
+                expected = self.fix_inbound_seq,
+                "SequenceReset NewSeqNo not greater than expected"
+            );
+            self.queue_fix_reject(config, "SequenceReset NewSeqNo too low");
+            return SessionAction::SendFix;
+        }
+
+        info!(
+            sender = %self.sender_comp_id,
+            new_seq,
+            prev = self.fix_inbound_seq,
+            "applying SequenceReset"
+        );
+        self.fix_inbound_seq = new_seq;
+
+        // Catching up may close the in-flight ResendRequest gap.
+        if let Some(hw) = self.resend_high_water
+            && self.fix_inbound_seq > hw
+        {
+            self.resend_high_water = None;
+        }
+
+        SessionAction::None
     }
 
     /// Build and queue a ResendRequest (35=2). `end` of 0 means
@@ -2619,6 +2678,135 @@ lot_size_inverse = 1
         // new seq numbers and don't re-store messages.
         assert_eq!(s.fix_outbound_seq, seq_after_send);
         assert_eq!(s.outbound_store.len(), store_len_after_send);
+    }
+
+    // -----------------------------------------------------------------------
+    // SequenceReset (35=4) handling
+    // -----------------------------------------------------------------------
+
+    /// Build a SequenceReset message. `gap_fill` toggles GapFillFlag.
+    fn sequence_reset_msg(
+        sender: &str,
+        target: &str,
+        msg_seq: u64,
+        new_seq: u64,
+        gap_fill: bool,
+    ) -> Vec<u8> {
+        let mut b =
+            FixMessageBuilder::new(tags::MSG_SEQUENCE_RESET).u64_tag(tags::NEW_SEQ_NO, new_seq);
+        if gap_fill {
+            b = b.str_tag(tags::GAP_FILL_FLAG, "Y");
+        }
+        b.build(sender, target, msg_seq)
+    }
+
+    #[test]
+    fn sequence_reset_gap_fill_advances_inbound_seq() {
+        let config = make_config("FIRM_A", "MELIN");
+        let smap = session_map(&config);
+        let sym = symbol_map(&config);
+        let mut s = active_session(&config, Instant::now());
+        s.fix_inbound_seq = 2;
+
+        // GapFill telling us to skip 2..=4, expect 5 next.
+        let raw = sequence_reset_msg("FIRM_A", "MELIN", 2, 5, true);
+        let action = s.handle_fix_message(&raw, &config, &smap, &sym);
+        assert_eq!(action, SessionAction::None);
+        assert_eq!(s.fix_inbound_seq, 5);
+    }
+
+    #[test]
+    fn sequence_reset_hard_reset_advances_inbound_seq() {
+        let config = make_config("FIRM_A", "MELIN");
+        let smap = session_map(&config);
+        let sym = symbol_map(&config);
+        let mut s = active_session(&config, Instant::now());
+        s.fix_inbound_seq = 2;
+
+        // Hard reset (no GapFillFlag) — operator-initiated.
+        let raw = sequence_reset_msg("FIRM_A", "MELIN", 999, 100, false);
+        let action = s.handle_fix_message(&raw, &config, &smap, &sym);
+        assert_eq!(action, SessionAction::None);
+        assert_eq!(s.fix_inbound_seq, 100);
+    }
+
+    #[test]
+    fn sequence_reset_clears_resend_high_water_when_caught_up() {
+        let config = make_config("FIRM_A", "MELIN");
+        let smap = session_map(&config);
+        let sym = symbol_map(&config);
+        let mut s = active_session(&config, Instant::now());
+        s.fix_inbound_seq = 2;
+
+        // Trigger a gap so resend_high_water is set.
+        let m = new_order_msg("FIRM_A", "MELIN", 6, "ORDX");
+        s.handle_fix_message(&m, &config, &smap, &sym);
+        let _ = drain_send_buf(&mut s);
+        assert_eq!(s.resend_high_water, Some(6));
+
+        // Peer responds with a GapFill that jumps past the high water.
+        let raw = sequence_reset_msg("FIRM_A", "MELIN", 2, 7, true);
+        s.handle_fix_message(&raw, &config, &smap, &sym);
+        assert_eq!(s.fix_inbound_seq, 7);
+        assert_eq!(s.resend_high_water, None);
+    }
+
+    #[test]
+    fn sequence_reset_with_low_new_seq_is_rejected() {
+        let config = make_config("FIRM_A", "MELIN");
+        let smap = session_map(&config);
+        let sym = symbol_map(&config);
+        let mut s = active_session(&config, Instant::now());
+        s.fix_inbound_seq = 5;
+
+        // NewSeqNo=3 < expected=5: misuse, must be rejected.
+        let raw = sequence_reset_msg("FIRM_A", "MELIN", 1, 3, true);
+        let action = s.handle_fix_message(&raw, &config, &smap, &sym);
+        assert_eq!(action, SessionAction::SendFix);
+        assert_eq!(s.fix_inbound_seq, 5, "inbound seq must not regress");
+        let parsed = FixMessage::parse(&s.fix_send_buf).unwrap();
+        assert_eq!(parsed.msg_type(), tags::MSG_REJECT);
+    }
+
+    #[test]
+    fn sequence_reset_missing_new_seq_no_is_rejected() {
+        let config = make_config("FIRM_A", "MELIN");
+        let smap = session_map(&config);
+        let sym = symbol_map(&config);
+        let mut s = active_session(&config, Instant::now());
+
+        // SequenceReset with no NewSeqNo tag at all.
+        let raw = FixMessageBuilder::new(tags::MSG_SEQUENCE_RESET)
+            .str_tag(tags::GAP_FILL_FLAG, "Y")
+            .build("FIRM_A", "MELIN", 2);
+        let action = s.handle_fix_message(&raw, &config, &smap, &sym);
+        assert_eq!(action, SessionAction::SendFix);
+        let parsed = FixMessage::parse(&s.fix_send_buf).unwrap();
+        assert_eq!(parsed.msg_type(), tags::MSG_REJECT);
+    }
+
+    #[test]
+    fn sequence_reset_bypasses_gap_check_to_avoid_loop() {
+        // Critical: a SequenceReset whose own MsgSeqNum looks "wrong"
+        // must NOT trigger another ResendRequest. Otherwise the gap
+        // recovery becomes an infinite loop.
+        let config = make_config("FIRM_A", "MELIN");
+        let smap = session_map(&config);
+        let sym = symbol_map(&config);
+        let mut s = active_session(&config, Instant::now());
+        s.fix_inbound_seq = 2;
+
+        // SequenceReset with msg_seq=999 (way ahead) advancing to 10.
+        // This is the typical gap-fill case where the peer's RR
+        // response carries the first-skipped seq in MsgSeqNum.
+        let raw = sequence_reset_msg("FIRM_A", "MELIN", 999, 10, true);
+        let action = s.handle_fix_message(&raw, &config, &smap, &sym);
+        assert_eq!(action, SessionAction::None, "must not emit RR");
+        assert_eq!(s.fix_inbound_seq, 10);
+        assert!(
+            s.fix_send_buf.is_empty(),
+            "no outbound bytes should be queued"
+        );
     }
 
     #[test]
