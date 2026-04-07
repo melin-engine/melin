@@ -6,10 +6,8 @@ Planned features sorted by value/complexity ratio for commercial readiness (exch
 
 | # | Feature | Commercial value | Complexity | Value/effort | Why |
 |---|---------|:---:|:---:|:---:|-----|
-| 1 | Replication handler send throughput | High | Medium | ★★★★★ | The handler thread (repl-0/repl-1) sends ring batches to replicas via TCP. Under high throughput (~6.7M events/sec), the ring fills faster than the handler drains it, triggering eviction. Possible causes: handler inherits sender's CPU affinity (core 6 contention), TCP coalescing sends ~10MB writes that exceed socket buffer, or process_acks poll overhead. Investigate with per-batch send timing and core pinning. |
-| 2 | DPDK replication e2e testing | High | Low | ★★★★☆ | Test DPDK replication (smoltcp sender + receiver) on real multi-queue NICs with the bench suite. Virtual devices (TAP, af_packet) only support 1 queue so can't smoke-test locally. Branch: `feat/dpdk-bench-suite` has the implementation + bench suite integration. Needs SR-IOV hardware to validate. |
-| 2 | ~~Full doc review~~ | High | Low | ★★★★☆ | **DONE** — all docs/ files reviewed and updated for current codebase (permissions model, version numbers, missing features, stale data structures, ring sizing, paths). |
-| 3 | Brand setup (domain, GitHub org, email) | Medium | Low | ★★★☆☆ | Register melin.io/melin.com, set up contact@ email, create GitHub org, transfer repo, switch commit email going forward. Do not rewrite history. |
+| 1 | DPDK replication e2e testing | High | Low | ★★★★☆ | Test DPDK replication (smoltcp sender + receiver) on real multi-queue NICs with the bench suite. Virtual devices (TAP, af_packet) only support 1 queue so can't smoke-test locally. Branch: `feat/dpdk-bench-suite` has the implementation + bench suite integration. Needs SR-IOV hardware to validate. |
+| 2 | Brand setup (domain, GitHub org, email) | Medium | Low | ★★★☆☆ | Register melin.io/melin.com, set up contact@ email, create GitHub org, transfer repo, switch commit email going forward. Do not rewrite history. |
 
 ## FIX Gateway Hardening
 
@@ -18,11 +16,8 @@ Follow-ups to take the FIX 4.2 gateway from minimum-viable to production-ready f
 | # | Feature | Commercial value | Complexity | Value/effort | Why |
 |---|---------|:---:|:---:|:---:|-----|
 | 1 | Third-party FIX client soak test | High | Low | ★★★★★ | Current end-to-end tests use our own serializer on both sides — a closed loop that can't catch interop bugs. Run a sustained session against QuickFIX/J (or similar) to validate against an independent implementation. |
-| 2 | Parser fuzz / property tests | High | Low | ★★★★★ | The FIX parser is the public attack surface. Fuzz tag-value framing, body-length boundaries, checksum corner cases, oversized messages, and SOH placement. Property tests on serialize↔parse round-trips. |
-| 3 | Gateway metrics surface | High | Low | ★★★★☆ | No Prometheus surface specific to the gateway. Need: active sessions, msgs/sec per session, resend request count, store eviction count, rate-limit hits, parse errors. Expose via the existing health/metrics endpoint. |
-| 4 | Drop Copy sessions | Medium | Medium | ★★★☆☆ | Read-only mirror sessions that receive every exec report for a configured set of accounts. Required by most institutional FIX deployments for back-office reconciliation. |
-| 5 | IPv6 support | Medium | Low | ★★★☆☆ | `server_addr` and `listen_addr` are IPv4-only today (validation rejects IPv6). Many modern data centers require IPv6 dual-stack. |
-| 6 | Market data (35=V/W/X) | Medium | High | ★★☆☆☆ | MarketDataRequest, snapshot/full refresh, incremental refresh. Requires a feed builder that consumes the engine's output event channel and maintains per-subscription book state. Larger surface than order entry. |
+| 2 | IPv6 support | Medium | Low | ★★★☆☆ | `server_addr` and `listen_addr` are IPv4-only today (validation rejects IPv6). Many modern data centers require IPv6 dual-stack. |
+| 3 | Market data (35=V/W/X) | Medium | High | ★★☆☆☆ | MarketDataRequest, snapshot/full refresh, incremental refresh. Requires a feed builder that consumes the engine's output event channel and maintains per-subscription book state. Larger surface than order entry. |
 
 ## DPDK Transport Optimization
 
@@ -46,9 +41,6 @@ Features targeting regulated venues, gateway responsibilities, or with limited n
 | Dual-NVMe journal hedging | Two journal threads on separate NVMe drives, response stage gates on the fastest. Cuts tail latency from P(slow) to P(slow)². Free durability redundancy. Low complexity but requires a second NVMe slot. Revisit when journal fsync is the dominant tail contributor. |
 | AF_XDP transport | DaMoN '25 found AF_XDP disappoints vs DPDK for small-message request-response workloads. DPDK transport already in progress. Revisit if DPDK proves insufficient. |
 | Per-account trading permissions | Gateway concern — each firm's gateway instance restricts which accounts that connection can trade. Multi-tenant access control. |
-| Order throttling | Gateway concern — rate limit per-account before requests reach the engine. SEC-04 audit finding. |
-| Client failover | Gateway concern — reconnect + sequence resume is session management, not engine logic. |
-| Market data dissemination | Gateway concern — fan-out, L2 book building, BBO computation consumes the output event channel. Engine's job stops at emitting events. |
 | Replica analytics (6 items) | External service — throughput counters, latency histograms, volume/book depth analytics, audit trail queries, fee/PnL. Consumes the journal stream, not engine code. |
 | Output event log | Regulatory audit trail. Depends on output event channel. |
 | Subscription management | Gateway concern — the engine broadcasts, the gateway filters per-subscriber. |
