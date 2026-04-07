@@ -175,7 +175,7 @@ fn replica_stream_uring(
     let mut idle_spins: u32 = 0;
     // Submit initial multishot RECV. The kernel will produce CQEs
     // continuously until EOF, error, or buffer pool exhaustion.
-    let sqe = opcode::RecvMulti::new(types::Fixed(0), RECV_BUF_GROUP_ID)
+    let sqe = opcode::RecvMulti::new(types::Fd(tcp_fd), RECV_BUF_GROUP_ID)
         .build()
         .user_data(TOKEN_RECV);
     unsafe { ring.submission().push(&sqe).expect("SQ full") };
@@ -560,7 +560,7 @@ fn replica_stream_uring(
         // kernel buffer pool reset). Re-arm so the kernel keeps
         // pushing cqes as data arrives.
         if !multishot_active {
-            let sqe = opcode::RecvMulti::new(types::Fixed(0), RECV_BUF_GROUP_ID)
+            let sqe = opcode::RecvMulti::new(types::Fd(tcp_fd), RECV_BUF_GROUP_ID)
                 .build()
                 .user_data(TOKEN_RECV);
             unsafe { ring.submission().push(&sqe).expect("SQ full") };
