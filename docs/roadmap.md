@@ -11,6 +11,19 @@ Planned features sorted by value/complexity ratio for commercial readiness (exch
 | 2 | ~~Full doc review~~ | High | Low | ★★★★☆ | **DONE** — all docs/ files reviewed and updated for current codebase (permissions model, version numbers, missing features, stale data structures, ring sizing, paths). |
 | 3 | Brand setup (domain, GitHub org, email) | Medium | Low | ★★★☆☆ | Register melin.io/melin.com, set up contact@ email, create GitHub org, transfer repo, switch commit email going forward. Do not rewrite history. |
 
+## FIX Gateway Hardening
+
+Follow-ups to take the FIX 4.2 gateway from minimum-viable to production-ready for a real exchange operator. The foundation (sessions, gap recovery, order entry, exec reports) is on `main`; these items make it deployable.
+
+| # | Feature | Commercial value | Complexity | Value/effort | Why |
+|---|---------|:---:|:---:|:---:|-----|
+| 1 | Third-party FIX client soak test | High | Low | ★★★★★ | Current end-to-end tests use our own serializer on both sides — a closed loop that can't catch interop bugs. Run a sustained session against QuickFIX/J (or similar) to validate against an independent implementation. |
+| 2 | Parser fuzz / property tests | High | Low | ★★★★★ | The FIX parser is the public attack surface. Fuzz tag-value framing, body-length boundaries, checksum corner cases, oversized messages, and SOH placement. Property tests on serialize↔parse round-trips. |
+| 3 | Gateway metrics surface | High | Low | ★★★★☆ | No Prometheus surface specific to the gateway. Need: active sessions, msgs/sec per session, resend request count, store eviction count, rate-limit hits, parse errors. Expose via the existing health/metrics endpoint. |
+| 4 | Drop Copy sessions | Medium | Medium | ★★★☆☆ | Read-only mirror sessions that receive every exec report for a configured set of accounts. Required by most institutional FIX deployments for back-office reconciliation. |
+| 5 | IPv6 support | Medium | Low | ★★★☆☆ | `server_addr` and `listen_addr` are IPv4-only today (validation rejects IPv6). Many modern data centers require IPv6 dual-stack. |
+| 6 | Market data (35=V/W/X) | Medium | High | ★★☆☆☆ | MarketDataRequest, snapshot/full refresh, incremental refresh. Requires a feed builder that consumes the engine's output event channel and maintains per-subscription book state. Larger surface than order entry. |
+
 ## DPDK Transport Optimization
 
 | # | Optimization | Est. impact | Complexity | Description |
