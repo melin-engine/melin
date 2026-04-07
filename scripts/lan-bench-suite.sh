@@ -43,6 +43,7 @@
 #   THROUGHPUT_ORDERS=N     Orders for throughput workload (default: 100000000)
 #   THROUGHPUT_CLIENTS=N   Clients for throughput workload (default: 16)
 #   THROUGHPUT_WINDOW=N    Window for throughput workload (default: 256)
+#   BENCH_THREADS=N        Number of bench client io_uring threads (default: bench default)
 #   SINGLE_ORDERS=N        Orders for single-order workload (default: 500000)
 #   WARMUP_ORDERS=N        Warmup orders per client (default: bench default 100000)
 #   ORDERS_PER_SWEEP=N     Orders per sweep data point (default: 10000000)
@@ -448,6 +449,10 @@ run_bench() {
     if [[ -n "${WARMUP_ORDERS}" ]]; then
         warmup_arg="--warmup ${WARMUP_ORDERS}"
     fi
+    local threads_arg=""
+    if [[ -n "${BENCH_THREADS:-}" ]]; then
+        threads_arg="--bench-threads ${BENCH_THREADS}"
+    fi
     ssh $SSH_OPTS "$BENCH" "cd ${REPO_DIR} && source ~/.cargo/env && \
         ./target/release/melin-bench \
             --addr ${server_addr} \
@@ -455,7 +460,7 @@ run_bench() {
             --key bench.key \
             --json /tmp/bench-results.json \
             --bench-cores 1 \
-            ${warmup_arg} \
+            ${warmup_arg} ${threads_arg} \
             ${orders} $*"
 }
 
@@ -858,6 +863,8 @@ workload_throughput() {
 
     local warmup_arg=""
     if [[ -n "${WARMUP_ORDERS}" ]]; then warmup_arg="--warmup ${WARMUP_ORDERS}"; fi
+    local threads_arg=""
+    if [[ -n "${BENCH_THREADS:-}" ]]; then threads_arg="--bench-threads ${BENCH_THREADS}"; fi
 
     if [[ "$transport" == dpdk* ]]; then
         ssh $SSH_OPTS "$BENCH" "cd ${REPO_DIR} && source ~/.cargo/env && \
@@ -865,7 +872,7 @@ workload_throughput() {
                 --addr ${CURRENT_BIND} \
                 --key bench.key \
                 --json /tmp/bench-results.json \
-                ${BENCH_DPDK_ARGS} ${warmup_arg} \
+                ${BENCH_DPDK_ARGS} ${warmup_arg} ${threads_arg} \
                 ${THROUGHPUT_ORDERS} --clients ${THROUGHPUT_CLIENTS} --window ${THROUGHPUT_WINDOW}"
     else
         run_bench "$CURRENT_BIND" "$CURRENT_HEALTH" "${THROUGHPUT_ORDERS}" --clients "${THROUGHPUT_CLIENTS}" --window "${THROUGHPUT_WINDOW}"
