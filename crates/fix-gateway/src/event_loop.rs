@@ -993,11 +993,17 @@ mod tests {
     /// Build and leak a `GatewayConfig` for the lifetime of the test
     /// process. The listen_addr is a placeholder — `Gateway::new` takes
     /// the `TcpListener` directly and never reads this field.
-    fn make_config(sender: &str, target: &str) -> &'static GatewayConfig {
+    /// `server_port` is the port the Melin stub (or a bogus unused
+    /// port) is listening on.
+    fn make_config_with_port(
+        sender: &str,
+        target: &str,
+        server_port: u16,
+    ) -> &'static GatewayConfig {
         let key_path = make_key_file();
         let toml = format!(
             r#"
-server_addr = "127.0.0.1:1"
+server_addr = "127.0.0.1:{server_port}"
 listen_addr = "127.0.0.1:1"
 target_comp_id = "{target}"
 
@@ -1016,6 +1022,13 @@ lot_size_inverse = 1
         );
         let config: GatewayConfig = toml::from_str(&toml).unwrap();
         Box::leak(Box::new(config))
+    }
+
+    /// Default config for tests that never reach the Melin connect
+    /// path. Points `server_addr` at a bogus port (1) that will never
+    /// be dialed.
+    fn make_config(sender: &str, target: &str) -> &'static GatewayConfig {
+        make_config_with_port(sender, target, 1)
     }
 
     fn logon_bytes(sender: &str, target: &str, seq: u64) -> Vec<u8> {
@@ -1189,6 +1202,260 @@ lot_size_inverse = 1
 
         drop(client);
         gw.shutdown();
+    }
+
+    // -----------------------------------------------------------------------
+    // End-to-end tests with a loopback Melin stub
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn authenticated_logon_flow() {
+        use crate::test_stub::MelinStub;
+
+        // Boot the stub FIRST so the gateway's config points at a live
+        // port. The stub is idle until the gateway dials it.
+        let stub = MelinStub::start();
+        let config = make_config_with_port("FIRM_A", "MELIN", stub.port());
+        let gw = spawn_gateway(config);
+
+        let mut client = TcpStream::connect(("127.0.0.1", gw.port)).unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+
+        // Send a valid Logon. The gateway should:
+        //   1. Parse and validate Logon
+        //   2. io_uring CONNECT to the stub
+        //   3. Receive Challenge, sign the nonce, send ChallengeResponse
+        //   4. Receive ServerReady
+        //   5. Send a FIX Logon ack back to the client
+        client
+            .write_all(&logon_bytes("FIRM_A", "MELIN", 1))
+            .unwrap();
+
+        let raw = read_fix_message(&mut client);
+        let msg = FixMessage::parse(&raw).expect("valid FIX Logon ack");
+        assert_eq!(
+            msg.msg_type(),
+            tags::MSG_LOGON,
+            "expected Logon ack, got {:?}",
+            std::str::from_utf8(msg.msg_type())
+        );
+        assert_eq!(msg.sender_comp_id(), Some("MELIN"));
+
+        drop(client);
+        gw.shutdown();
+        drop(stub);
+    }
+
+    #[test]
+    fn new_order_single_round_trip_to_execution_report() {
+        use crate::test_stub::MelinStub;
+        use melin_engine::types::{ExecutionReport, Price, Quantity, Side};
+        use melin_protocol::message::{Request, ResponseKind};
+        use std::num::NonZeroU64;
+
+        let stub = MelinStub::start();
+        let config = make_config_with_port("FIRM_A", "MELIN", stub.port());
+        let gw = spawn_gateway(config);
+
+        let mut client = TcpStream::connect(("127.0.0.1", gw.port)).unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+
+        // Logon handshake.
+        client
+            .write_all(&logon_bytes("FIRM_A", "MELIN", 1))
+            .unwrap();
+        let raw = read_fix_message(&mut client);
+        let ack = FixMessage::parse(&raw).unwrap();
+        assert_eq!(ack.msg_type(), tags::MSG_LOGON);
+
+        // Send a NewOrderSingle.
+        let nos = FixMessageBuilder::new(tags::MSG_NEW_ORDER_SINGLE)
+            .str_tag(tags::CL_ORD_ID, "ORD1")
+            .str_tag(tags::SYMBOL, "BTC/USD")
+            .str_tag(tags::SIDE, "1")
+            .str_tag(tags::ORD_TYPE, "2")
+            .str_tag(tags::PRICE, "50000.00")
+            .str_tag(tags::ORDER_QTY, "10")
+            .str_tag(tags::TIME_IN_FORCE, "1")
+            .build("FIRM_A", "MELIN", 2);
+        client.write_all(&nos).unwrap();
+
+        // The stub should receive the translated SubmitOrder.
+        let (_seq, req) = stub.next_request(Duration::from_secs(3));
+        let order_id = match req {
+            Request::SubmitOrder { symbol, order } => {
+                assert_eq!(symbol.0, 1);
+                assert_eq!(order.side, Side::Buy);
+                order.id
+            }
+            other => panic!("expected SubmitOrder, got {other:?}"),
+        };
+
+        // Push a Placed execution report back. The gateway should
+        // translate it into a FIX ExecutionReport and forward it.
+        stub.send_response(ResponseKind::Report(ExecutionReport::Placed {
+            order_id,
+            side: Side::Buy,
+            price: Price(NonZeroU64::new(5_000_000).unwrap()),
+            quantity: Quantity(NonZeroU64::new(10).unwrap()),
+        }));
+
+        let raw = read_fix_message(&mut client);
+        let er = FixMessage::parse(&raw).unwrap();
+        assert_eq!(er.msg_type(), tags::MSG_EXECUTION_REPORT);
+        assert_eq!(er.get_str(tags::CL_ORD_ID), Some("ORD1"));
+        assert_eq!(er.get_str(tags::EXEC_TYPE), Some("0")); // New
+        assert_eq!(er.get_str(tags::SYMBOL), Some("BTC/USD"));
+        assert_eq!(er.get_str(tags::PRICE), Some("50000.00"));
+
+        drop(client);
+        gw.shutdown();
+        drop(stub);
+    }
+
+    #[test]
+    fn cancel_rejected_by_engine_yields_order_cancel_reject() {
+        use crate::test_stub::MelinStub;
+        use melin_engine::types::{ExecutionReport, RejectReason};
+        use melin_protocol::message::{Request, ResponseKind};
+
+        let stub = MelinStub::start();
+        let config = make_config_with_port("FIRM_A", "MELIN", stub.port());
+        let gw = spawn_gateway(config);
+
+        let mut client = TcpStream::connect(("127.0.0.1", gw.port)).unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+
+        // Logon.
+        client
+            .write_all(&logon_bytes("FIRM_A", "MELIN", 1))
+            .unwrap();
+        let raw = read_fix_message(&mut client);
+        assert_eq!(FixMessage::parse(&raw).unwrap().msg_type(), tags::MSG_LOGON);
+
+        // Submit an order so the session has a ClOrdID → OrderId mapping.
+        let nos = FixMessageBuilder::new(tags::MSG_NEW_ORDER_SINGLE)
+            .str_tag(tags::CL_ORD_ID, "ORD1")
+            .str_tag(tags::SYMBOL, "BTC/USD")
+            .str_tag(tags::SIDE, "1")
+            .str_tag(tags::ORD_TYPE, "2")
+            .str_tag(tags::PRICE, "50000.00")
+            .str_tag(tags::ORDER_QTY, "10")
+            .str_tag(tags::TIME_IN_FORCE, "1")
+            .build("FIRM_A", "MELIN", 2);
+        client.write_all(&nos).unwrap();
+        let (_, req) = stub.next_request(Duration::from_secs(3));
+        let order_id = match req {
+            Request::SubmitOrder { order, .. } => order.id,
+            other => panic!("expected SubmitOrder, got {other:?}"),
+        };
+
+        // Now send a cancel for it.
+        let cxl = FixMessageBuilder::new(tags::MSG_ORDER_CANCEL_REQUEST)
+            .str_tag(tags::CL_ORD_ID, "CXL1")
+            .str_tag(tags::ORIG_CL_ORD_ID, "ORD1")
+            .str_tag(tags::SYMBOL, "BTC/USD")
+            .str_tag(tags::SIDE, "1")
+            .str_tag(tags::ORDER_QTY, "10")
+            .build("FIRM_A", "MELIN", 3);
+        client.write_all(&cxl).unwrap();
+
+        let (_, req) = stub.next_request(Duration::from_secs(3));
+        match req {
+            Request::CancelOrder {
+                order_id: cancel_target,
+                ..
+            } => assert_eq!(cancel_target, order_id),
+            other => panic!("expected CancelOrder, got {other:?}"),
+        }
+
+        // Engine rejects the cancel (e.g. already filled).
+        stub.send_response(ResponseKind::Report(ExecutionReport::Rejected {
+            order_id,
+            account: melin_engine::types::AccountId(7),
+            reason: RejectReason::UnknownOrder,
+        }));
+
+        // Gateway should emit an OrderCancelReject (35=9), not an ER.
+        let raw = read_fix_message(&mut client);
+        let reject = FixMessage::parse(&raw).unwrap();
+        assert_eq!(reject.msg_type(), tags::MSG_ORDER_CANCEL_REJECT);
+        assert_eq!(reject.get_str(tags::CL_ORD_ID), Some("CXL1"));
+        assert_eq!(reject.get_str(tags::ORIG_CL_ORD_ID), Some("ORD1"));
+
+        drop(client);
+        gw.shutdown();
+        drop(stub);
+    }
+
+    #[test]
+    fn auth_failed_from_melin_closes_client_session() {
+        // This variant of the stub answers the handshake with AuthFailed
+        // instead of ServerReady. The gateway should Logout the client
+        // and close the connection.
+        //
+        // The existing `MelinStub` auto-sends ServerReady, so we bypass
+        // it and use a bespoke one-shot listener here.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let server_port = listener.local_addr().unwrap().port();
+        let stub_thread = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            // Send Challenge.
+            let mut buf = [0u8; 64];
+            let n = melin_protocol::codec::encode_response(
+                &melin_protocol::message::ResponseKind::Challenge { nonce: [0u8; 32] },
+                &mut buf,
+            )
+            .unwrap();
+            stream.write_all(&buf[..n]).unwrap();
+
+            // Read and discard the ChallengeResponse frame.
+            let mut len_buf = [0u8; 4];
+            stream.read_exact(&mut len_buf).unwrap();
+            let len = u32::from_le_bytes(len_buf) as usize;
+            let mut payload = vec![0u8; len];
+            stream.read_exact(&mut payload).unwrap();
+
+            // Send AuthFailed instead of ServerReady.
+            let n = melin_protocol::codec::encode_response(
+                &melin_protocol::message::ResponseKind::AuthFailed,
+                &mut buf,
+            )
+            .unwrap();
+            stream.write_all(&buf[..n]).unwrap();
+            // Let the gateway see the AuthFailed and react.
+            let _ = stream.read(&mut buf);
+        });
+
+        let config = make_config_with_port("FIRM_A", "MELIN", server_port);
+        let gw = spawn_gateway(config);
+
+        let mut client = TcpStream::connect(("127.0.0.1", gw.port)).unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        client
+            .write_all(&logon_bytes("FIRM_A", "MELIN", 1))
+            .unwrap();
+
+        // Expect a Logout (not a Logon ack).
+        let raw = read_fix_message(&mut client);
+        let msg = FixMessage::parse(&raw).unwrap();
+        assert_eq!(msg.msg_type(), tags::MSG_LOGOUT);
+
+        // Connection should close.
+        let mut tail = [0u8; 16];
+        assert_eq!(client.read(&mut tail).unwrap(), 0);
+
+        drop(client);
+        gw.shutdown();
+        let _ = stub_thread.join();
     }
 
     #[test]

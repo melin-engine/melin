@@ -13,6 +13,8 @@ mod fix;
 mod id_map;
 mod price;
 mod session;
+#[cfg(test)]
+mod test_stub;
 mod translate;
 
 use std::net::TcpListener;
