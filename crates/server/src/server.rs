@@ -1209,29 +1209,25 @@ fn run_as_primary<L: BlockingTransportListener>(
     check_join("matching", matching_handle.join().map(|_| ()));
     check_join("response", response_handle.join().map(|_| ()));
 
+    // Join auxiliary threads — surface any panics through the same
+    // check_join helper so the operator sees a log line and shutdown
+    // exits with a non-zero status.
+    if let Some(repl_sender_handle) = replication_handle {
+        check_join("replication-sender", repl_sender_handle.join());
+    }
+    if let Some(event_handle) = event_publisher_handle {
+        check_join("event-publisher", event_handle.join());
+    }
+    if let Some(shadow_h) = shadow_handle {
+        check_join("shadow", shadow_h.join());
+    }
+    if let Some(h) = health_handle {
+        check_join("health", h.join());
+    }
+
     if thread_panicked || journal_failed {
         error!("shutdown complete (with pipeline failure)");
         return Err("pipeline failure".into());
-    }
-
-    // Join replication thread.
-    if let Some(repl_sender_handle) = replication_handle {
-        let _ = repl_sender_handle.join();
-    }
-
-    // Join event publisher thread.
-    if let Some(event_handle) = event_publisher_handle {
-        let _ = event_handle.join();
-    }
-
-    // Join shadow snapshot thread.
-    if let Some(shadow_h) = shadow_handle {
-        let _ = shadow_h.join();
-    }
-
-    // Join health endpoint thread.
-    if let Some(h) = health_handle {
-        let _ = h.join();
     }
 
     info!("shutdown complete");
@@ -1782,9 +1778,7 @@ pub fn run_dpdk(
     }
 
     // Join DPDK poll threads before shutdown sequence.
-    for h in dpdk_handles {
-        let _ = h.join();
-    }
+    let dpdk_join_results: Vec<_> = dpdk_handles.into_iter().map(|h| h.join()).collect();
 
     // Shutdown sequence.
     info!("shutdown: draining pipeline");
@@ -1811,18 +1805,19 @@ pub fn run_dpdk(
     check_join("journal", journal_result.map(|_| ()));
     check_join("matching", matching_handle.join().map(|_| ()));
     check_join("response", response_handle.join().map(|_| ()));
+    for (i, r) in dpdk_join_results.into_iter().enumerate() {
+        check_join(&format!("dpdk-poll-{i}"), r);
+    }
+    if let Some(repl_sender_handle) = replication_handle {
+        check_join("replication-sender", repl_sender_handle.join());
+    }
+    if let Some(h) = health_handle {
+        check_join("health", h.join());
+    }
 
     if thread_panicked || journal_failed {
         error!("shutdown complete (with pipeline failure)");
         return Err("pipeline failure".into());
-    }
-
-    if let Some(repl_sender_handle) = replication_handle {
-        let _ = repl_sender_handle.join();
-    }
-
-    if let Some(h) = health_handle {
-        let _ = h.join();
     }
 
     info!("shutdown complete");
