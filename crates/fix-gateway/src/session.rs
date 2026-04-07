@@ -1718,4 +1718,239 @@ lot_size_inverse = 1
         assert_eq!(action, SessionAction::None);
         assert!(s.fix_send_buf.is_empty());
     }
+
+    // -----------------------------------------------------------------------
+    // Remaining branches
+    // -----------------------------------------------------------------------
+
+    /// Build a CancelReplace request referencing an existing ClOrdID.
+    fn cancel_replace_msg(
+        sender: &str,
+        target: &str,
+        seq: u64,
+        clord: &str,
+        orig: &str,
+    ) -> Vec<u8> {
+        FixMessageBuilder::new(tags::MSG_ORDER_CANCEL_REPLACE)
+            .str_tag(tags::CL_ORD_ID, clord)
+            .str_tag(tags::ORIG_CL_ORD_ID, orig)
+            .str_tag(tags::SYMBOL, "BTC/USD")
+            .str_tag(tags::SIDE, "1")
+            .str_tag(tags::ORD_TYPE, "2")
+            .str_tag(tags::PRICE, "51000.00")
+            .str_tag(tags::ORDER_QTY, "15")
+            .str_tag(tags::TIME_IN_FORCE, "1")
+            .build(sender, target, seq)
+    }
+
+    #[test]
+    fn active_cancel_replace_tracks_pending_with_is_replace_true() {
+        let config = make_config("FIRM_A", "MELIN");
+        let smap = session_map(&config);
+        let sym = symbol_map(&config);
+        let mut s = active_session(&config, Instant::now());
+
+        // Seed the id_map with an order.
+        let order = new_order_msg("FIRM_A", "MELIN", 2, "ORD1");
+        s.handle_fix_message(&order, &config, &smap, &sym);
+        let order_id = s.id_map.get_order_id("ORD1").unwrap();
+
+        // Cancel-replace it.
+        let rpl = cancel_replace_msg("FIRM_A", "MELIN", 3, "RPL1", "ORD1");
+        let action = s.handle_fix_message(&rpl, &config, &smap, &sym);
+        assert_eq!(action, SessionAction::SendMelin);
+
+        let pending = s
+            .pending_cancels
+            .get(&order_id)
+            .expect("pending cancel-replace not tracked");
+        assert_eq!(pending.cancel_clord_id, "RPL1");
+        assert!(pending.is_replace, "is_replace should be true for 35=G");
+    }
+
+    #[test]
+    fn melin_rejected_pending_replace_emits_cancel_reject_for_replace() {
+        let config = make_config("FIRM_A", "MELIN");
+        let sym = symbol_map(&config);
+        let mut s = active_session(&config, Instant::now());
+
+        let order_id = s.id_map.insert("ORD1");
+        s.pending_cancels.insert(
+            order_id,
+            PendingCancel {
+                cancel_clord_id: "RPL1".to_owned(),
+                is_replace: true,
+            },
+        );
+
+        push_melin_response(
+            &mut s,
+            &ResponseKind::Report(ExecutionReport::Rejected {
+                order_id,
+                account: AccountId(7),
+                reason: RejectReason::UnknownOrder,
+            }),
+        );
+
+        let action = s.try_process_melin_frame(&config, &sym, Instant::now());
+        assert_eq!(action, SessionAction::SendFix);
+
+        let parsed = FixMessage::parse(&s.fix_send_buf).unwrap();
+        assert_eq!(parsed.msg_type(), tags::MSG_ORDER_CANCEL_REJECT);
+        // CxlRejResponseTo=2 means the reject is for a cancel-replace
+        // (per FIX 4.2: 1=cancel, 2=cancel/replace).
+        assert_eq!(parsed.get_str(tags::CXL_REJ_RESPONSE_TO), Some("2"));
+        assert!(!s.pending_cancels.contains_key(&order_id));
+    }
+
+    #[test]
+    fn melin_triggered_emits_execution_report() {
+        let config = make_config("FIRM_A", "MELIN");
+        let sym = symbol_map(&config);
+        let mut s = active_session(&config, Instant::now());
+
+        let order_id = s.id_map.insert("STOP1");
+        s.order_symbols.insert(
+            order_id,
+            OrderSymbolInfo {
+                fix_symbol: "BTC/USD".to_owned(),
+                tick_inverse: 100,
+                lot_inverse: 1,
+                side: Side::Sell,
+            },
+        );
+
+        push_melin_response(
+            &mut s,
+            &ResponseKind::Report(ExecutionReport::Triggered {
+                order_id,
+                trigger_price: px(4_800_000),
+            }),
+        );
+
+        let action = s.try_process_melin_frame(&config, &sym, Instant::now());
+        assert_eq!(action, SessionAction::SendFix);
+
+        let parsed = FixMessage::parse(&s.fix_send_buf).unwrap();
+        assert_eq!(parsed.msg_type(), tags::MSG_EXECUTION_REPORT);
+        assert_eq!(parsed.get_str(tags::EXEC_TYPE), Some("L")); // Triggered
+        assert_eq!(parsed.get_str(tags::STOP_PX), Some("48000.00"));
+        assert_eq!(parsed.get_str(tags::SIDE), Some("2")); // Sell via tracked info
+    }
+
+    #[test]
+    fn melin_replaced_emits_execution_report_and_clears_pending() {
+        let config = make_config("FIRM_A", "MELIN");
+        let sym = symbol_map(&config);
+        let mut s = active_session(&config, Instant::now());
+
+        let order_id = s.id_map.insert("ORD1");
+        s.order_symbols.insert(
+            order_id,
+            OrderSymbolInfo {
+                fix_symbol: "BTC/USD".to_owned(),
+                tick_inverse: 100,
+                lot_inverse: 1,
+                side: Side::Buy,
+            },
+        );
+        // Replace-in-flight: pending_cancels populated.
+        s.pending_cancels.insert(
+            order_id,
+            PendingCancel {
+                cancel_clord_id: "RPL1".to_owned(),
+                is_replace: true,
+            },
+        );
+
+        push_melin_response(
+            &mut s,
+            &ResponseKind::Report(ExecutionReport::Replaced {
+                order_id,
+                side: Side::Buy,
+                old_price: px(5_000_000),
+                new_price: px(5_100_000),
+                old_remaining: qty(10),
+                new_remaining: qty(15),
+            }),
+        );
+
+        let action = s.try_process_melin_frame(&config, &sym, Instant::now());
+        assert_eq!(action, SessionAction::SendFix);
+        assert!(
+            !s.pending_cancels.contains_key(&order_id),
+            "successful Replaced should clear pending_cancels"
+        );
+
+        let parsed = FixMessage::parse(&s.fix_send_buf).unwrap();
+        assert_eq!(parsed.msg_type(), tags::MSG_EXECUTION_REPORT);
+        assert_eq!(parsed.get_str(tags::EXEC_TYPE), Some("5")); // Replace
+        assert_eq!(parsed.get_str(tags::PRICE), Some("51000.00"));
+        assert_eq!(parsed.get_str(tags::LEAVES_QTY), Some("15"));
+    }
+
+    #[test]
+    fn rate_limit_resets_after_window_rolls_over() {
+        let mut config = make_config("FIRM_A", "MELIN");
+        config.sessions[0].max_msgs_per_sec = 1;
+        let smap = session_map(&config);
+        let sym = symbol_map(&config);
+
+        let t0 = Instant::now();
+        let mut s = active_session(&config, t0);
+        s.max_msgs_per_sec = 1;
+        s.rate_window_start = t0;
+
+        // First message of window: allowed.
+        let m1 = new_order_msg("FIRM_A", "MELIN", 2, "ORD1");
+        assert_eq!(
+            s.handle_fix_message(&m1, &config, &smap, &sym),
+            SessionAction::SendMelin
+        );
+
+        // Second within the same window: rejected.
+        let m2 = new_order_msg("FIRM_A", "MELIN", 3, "ORD2");
+        assert_eq!(
+            s.handle_fix_message(&m2, &config, &smap, &sym),
+            SessionAction::SendFix
+        );
+
+        // Rewind the window start so check_rate_limit sees >1s elapsed
+        // and starts a fresh window. (check_rate_limit uses Instant::now
+        // internally, so rewinding the stored start is the cleanest way
+        // to simulate elapsed time without a clock abstraction.)
+        s.rate_window_start = Instant::now() - Duration::from_secs(2);
+
+        let m3 = new_order_msg("FIRM_A", "MELIN", 4, "ORD3");
+        assert_eq!(
+            s.handle_fix_message(&m3, &config, &smap, &sym),
+            SessionAction::SendMelin,
+            "window should have rolled over"
+        );
+        assert_eq!(s.rate_msg_count, 1, "counter should have reset to 1");
+    }
+
+    #[test]
+    fn melin_undecodable_response_is_silently_dropped() {
+        let config = make_config("FIRM_A", "MELIN");
+        let sym = symbol_map(&config);
+        let mut s = active_session(&config, Instant::now());
+
+        // Inject a length-prefixed frame with a bogus tag byte that
+        // codec::decode_response will reject. `handle_active_melin`
+        // should log a warning and return SessionAction::None — NOT
+        // close the session (decode errors from the engine must not
+        // take the session down).
+        let payload = [0xFFu8]; // Invalid tag.
+        let len = (payload.len() as u32).to_le_bytes();
+        s.melin_parse_buf.extend_from_slice(&len);
+        s.melin_parse_buf.extend_from_slice(&payload);
+
+        let action = s.try_process_melin_frame(&config, &sym, Instant::now());
+        assert_eq!(action, SessionAction::None);
+        // Session stays Active.
+        assert!(matches!(s.state, SessionState::Active));
+        // No FIX bytes queued.
+        assert!(s.fix_send_buf.is_empty());
+    }
 }
