@@ -27,6 +27,7 @@ See [README.md](README.md#features) for implemented features and [docs/roadmap.m
 ### Git
 - **No co-authored commits** — do not add `Co-Authored-By` trailers.
 - **Conventional Commits** — all commit messages must follow the [Conventional Commits](https://www.conventionalcommits.org/) spec (e.g., `feat:`, `fix:`, `refactor:`, `test:`, `docs:`, `chore:`).
+- **Concise commit messages** — keep the subject line short and the body tight. Lead with what changed and why; skip exhaustive enumerations of every touched line. The diff is already in the commit — the message should add context, not duplicate it.
 - **Never commit without explicit request** — do NOT commit unless the user explicitly asks (e.g. "commit", "commit and push"). Completing a task does NOT imply permission to commit. Always wait for the user to request the commit.
 - **Never push without explicit confirmation** — always ask for review before pushing. Do not push unless the user confirms.
 - **Commit intermediary steps** — for large multi-step tasks, commit each logical step separately rather than batching everything into one giant commit. This keeps history clean and bisectable. Always ask for review after each commit before moving to the next.

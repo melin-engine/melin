@@ -11,7 +11,7 @@
 //! with multishot RECV to multiplex connections, eliminating thread
 //! oversubscription. The response thread writes via io_uring SEND.
 
-use std::net::SocketAddr;
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::os::unix::io::AsRawFd;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -234,7 +234,7 @@ impl Default for ServerConfig {
         // Main uses `Self::parse_from(["melin-server"])` — the values below
         // mirror those clap defaults plus the dpdk extras.
         Self {
-            bind: "127.0.0.1:9876".parse().expect("valid default addr"),
+            bind: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 9876),
             journal: PathBuf::from("melin.journal"),
             snapshot: None,
             cores: PipelineCores {
@@ -275,7 +275,7 @@ impl Default for ServerConfig {
             dpdk_mtu: 1500,
             dpdk_vlan: None,
             event_bind: None,
-            health_bind: Some("127.0.0.1:9878".parse().expect("valid default addr")),
+            health_bind: Some(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 9878)),
             promote_bind: None,
             snapshot_interval_secs: 3000,
             snapshot_path: None,
@@ -661,7 +661,7 @@ fn run_as_primary<L: BlockingTransportListener>(
             apply_affinity("journal", cores.journal);
             journal_stage.run(&s1)
         })
-        .expect("failed to spawn journal thread");
+        .map_err(|e| format!("spawn journal thread: {e}"))?;
 
     let s2 = Arc::clone(&shutdown);
     let matching_handle = std::thread::Builder::new()
@@ -670,7 +670,7 @@ fn run_as_primary<L: BlockingTransportListener>(
             apply_affinity("matching", cores.matching);
             matching_stage.run(&s2)
         })
-        .expect("failed to spawn matching thread");
+        .map_err(|e| format!("spawn matching thread: {e}"))?;
 
     // Clone cursors for the response thread — the originals are needed
     // later for seed drain gating.
@@ -696,7 +696,7 @@ fn run_as_primary<L: BlockingTransportListener>(
                 busy_spin,
             );
         })
-        .expect("failed to spawn response thread");
+        .map_err(|e| format!("spawn response thread: {e}"))?;
 
     // Spawn replication sender thread if enabled. The journal stage publishes
     // encoded batches to a pre-allocated ring; the sender thread consumes them.
@@ -719,14 +719,14 @@ fn run_as_primary<L: BlockingTransportListener>(
     {
         let repl_bind = config
             .replication_bind
-            .expect("replication_bind must be set");
+            .ok_or("replication_bind must be set when replication is enabled")?;
         let s_repl = Arc::clone(&shutdown);
         let repl_cursor = Arc::clone(&replication_cursor);
         let fastest_repl_cursor = Arc::clone(&fastest_replica_cursor);
         let ready_flag = Arc::clone(&replica_ready);
         let connected_counter = replicas_connected
             .clone()
-            .expect("replicas_connected must be Some when replication is enabled");
+            .ok_or("replicas_connected must be Some when replication is enabled")?;
 
         let batch_size = config.replication_batch_size;
         let heartbeat_secs = config.replication_heartbeat_secs;
@@ -762,7 +762,7 @@ fn run_as_primary<L: BlockingTransportListener>(
             });
         let repl_metrics = replication_metrics
             .clone()
-            .expect("replication_metrics must be Some when replication is enabled");
+            .ok_or("replication_metrics must be Some when replication is enabled")?;
         let handler_cores = [cores.repl_handler_0, cores.repl_handler_1];
         let repl_sender_handle = std::thread::Builder::new()
             .name("repl-sender".into())
@@ -789,7 +789,7 @@ fn run_as_primary<L: BlockingTransportListener>(
                     busy_spin,
                 );
             })
-            .expect("failed to spawn replication sender thread");
+            .map_err(|e| format!("spawn replication sender thread: {e}"))?;
 
         info!(addr = %repl_bind, "replication listener started");
         Some(repl_sender_handle)
@@ -803,7 +803,9 @@ fn run_as_primary<L: BlockingTransportListener>(
     // Spawn event publisher thread if enabled. Consumes from output ring
     // consumer 1 and broadcasts all execution events to TCP subscribers.
     let event_publisher_handle = if let Some(event_consumer) = event_publisher_consumer {
-        let event_bind = config.event_bind.expect("event_bind must be set");
+        let event_bind = config
+            .event_bind
+            .ok_or("event_bind must be set when event publisher is enabled")?;
         let s_event = Arc::clone(&shutdown);
         let event_keys = Arc::clone(&authorized_keys);
         let event_handle = std::thread::Builder::new()
@@ -818,7 +820,7 @@ fn run_as_primary<L: BlockingTransportListener>(
                     busy_spin,
                 );
             })
-            .expect("failed to spawn event publisher thread");
+            .map_err(|e| format!("spawn event publisher thread: {e}"))?;
 
         info!(addr = %event_bind, "event publisher started");
         Some(event_handle)
@@ -832,8 +834,10 @@ fn run_as_primary<L: BlockingTransportListener>(
     let shadow_handle = if let Some(shadow_cons) = shadow_consumer {
         let snap_path = config.shadow_snapshot_path();
         let interval = std::time::Duration::from_secs(config.snapshot_interval_secs);
-        let chain_hash = chain_hash_lock.expect("chain hash lock must be Some when shadow enabled");
-        let shadow_ex = shadow_exchange.expect("shadow exchange must be Some when shadow enabled");
+        let chain_hash =
+            chain_hash_lock.ok_or("chain hash lock must be Some when shadow is enabled")?;
+        let shadow_ex =
+            shadow_exchange.ok_or("shadow exchange must be Some when shadow is enabled")?;
         let s_shadow = Arc::clone(&shutdown);
         let handle = std::thread::Builder::new()
             .name("shadow".into())
@@ -849,7 +853,7 @@ fn run_as_primary<L: BlockingTransportListener>(
                     busy_spin,
                 );
             })
-            .expect("failed to spawn shadow thread");
+            .map_err(|e| format!("spawn shadow thread: {e}"))?;
 
         info!(
             interval_secs = config.snapshot_interval_secs,
@@ -1454,7 +1458,7 @@ pub fn run_dpdk(
             apply_affinity("journal", cores.journal);
             journal_stage.run(&s1)
         })
-        .expect("failed to spawn journal thread");
+        .map_err(|e| format!("spawn journal thread: {e}"))?;
 
     let s2 = Arc::clone(&shutdown);
     let matching_handle = std::thread::Builder::new()
@@ -1463,7 +1467,7 @@ pub fn run_dpdk(
             apply_affinity("matching", cores.matching);
             matching_stage.run(&s2)
         })
-        .expect("failed to spawn matching thread");
+        .map_err(|e| format!("spawn matching thread: {e}"))?;
 
     // Spawn DPDK response stage (encodes to TX channel instead of kernel sockets).
     let output_consumer = output_consumers.remove(0);
@@ -1490,7 +1494,7 @@ pub fn run_dpdk(
                 tx_producers,
             );
         })
-        .expect("failed to spawn response thread");
+        .map_err(|e| format!("spawn response thread: {e}"))?;
 
     // Spawn DPDK replication sender if enabled. Uses its own DPDK queue pair
     // and smoltcp stack so the replication channel goes through kernel bypass.
@@ -1505,7 +1509,7 @@ pub fn run_dpdk(
     {
         let repl_bind = config
             .replication_bind
-            .expect("replication_bind must be set");
+            .ok_or("replication_bind must be set when replication is enabled")?;
         let repl_port = repl_bind.port();
 
         // Create a DpdkTransport for the replication sender with its own
@@ -1517,7 +1521,7 @@ pub fn run_dpdk(
             num_client_queues as u16,
             repl_port,
         )
-        .expect("failed to create DPDK transport for replication");
+        .map_err(|e| format!("create DPDK transport for replication: {e}"))?;
 
         let s_repl = Arc::clone(&shutdown);
         let repl_cursor = Arc::clone(&replication_cursor);
@@ -1528,10 +1532,10 @@ pub fn run_dpdk(
         let busy_spin = !config.yield_idle;
         let repl_metrics = replication_metrics
             .clone()
-            .expect("replication_metrics must be Some when replication is enabled");
+            .ok_or("replication_metrics must be Some when replication is enabled")?;
         let connected_counter = replicas_connected
             .clone()
-            .expect("replicas_connected must be Some when replication is enabled");
+            .ok_or("replicas_connected must be Some when replication is enabled")?;
         let dpdk_active_flags: [Arc<AtomicBool>; 2] = replication_ring_progress
             .as_ref()
             .map(|rp| {
@@ -1583,7 +1587,7 @@ pub fn run_dpdk(
                     busy_spin,
                 );
             })
-            .expect("failed to spawn replication sender thread");
+            .map_err(|e| format!("spawn replication sender thread: {e}"))?;
         info!(addr = %repl_bind, "DPDK replication sender started (dual-replica)");
         Some(repl_sender_handle)
     } else {
@@ -1741,7 +1745,7 @@ pub fn run_dpdk(
                     i as u8,
                 );
             })
-            .expect("failed to spawn DPDK poll thread");
+            .map_err(|e| format!("spawn DPDK poll thread: {e}"))?;
         dpdk_handles.push(handle);
     }
 
