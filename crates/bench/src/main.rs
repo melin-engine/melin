@@ -1035,12 +1035,42 @@ fn start_server<L: BlockingTransportListener>(
 }
 
 /// Connect to TCP server with retry (up to 50 attempts, 10ms apart).
+///
+/// Also enables `SO_BUSY_POLL` on the connected socket. The bench's
+/// io_uring loop already busy-spins on CQEs, so the kernel's NIC
+/// busy-poll uses cycles that would otherwise be wasted spinning, and
+/// it removes the softirq → wakeup handoff from every server response
+/// — tightening the bench's measurement floor so we observe the
+/// server's true latency rather than the bench's own client-side
+/// scheduler jitter.
 #[cfg(not(feature = "dpdk"))]
 fn connect_tcp(addr: std::net::SocketAddr) -> std::net::TcpStream {
+    use std::os::unix::io::AsRawFd;
     let mut last_err = None;
     for _ in 0..50 {
         match std::net::TcpStream::connect(addr) {
-            Ok(s) => return s,
+            Ok(s) => {
+                // Best-effort SO_BUSY_POLL; failure is logged via stderr
+                // but does not abort the bench (the kernel may reject
+                // it without CAP_NET_ADMIN, in which case we measure
+                // with the default scheduler-wakeup cost — still
+                // accurate, just slightly noisier).
+                let val: libc::c_int = 50;
+                let rc = unsafe {
+                    libc::setsockopt(
+                        s.as_raw_fd(),
+                        libc::SOL_SOCKET,
+                        libc::SO_BUSY_POLL,
+                        &val as *const libc::c_int as *const libc::c_void,
+                        std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+                    )
+                };
+                if rc != 0 {
+                    let err = std::io::Error::last_os_error();
+                    eprintln!("warning: SO_BUSY_POLL setsockopt failed: {err}");
+                }
+                return s;
+            }
             Err(e) => {
                 last_err = Some(e);
                 std::thread::sleep(Duration::from_millis(10));
