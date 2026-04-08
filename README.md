@@ -2,7 +2,7 @@
 
 Melin is a high-performance exchange core written in Rust on the [LMAX disruptor architecture](https://martinfowler.com/articles/lmax.html), built for venues that cannot compromise on correctness, durability, or performance.
 
-Melin handles order matching, account balances, risk controls, circuit breakers, fee schedules, journaling, and replication — the critical path of an exchange, from order ingestion to durable execution. Gateway concerns (market data fan-out, session management, protocol translation) are out of scope and handled by upstream services that consume Melin's output event channel.
+Melin handles order matching, account balances, risk controls, circuit breakers, fee schedules, journaling, and replication — the critical path of an exchange, from order ingestion to durable execution.
 
 ## Why Melin
 
@@ -10,7 +10,7 @@ Melin handles order matching, account balances, risk controls, circuit breakers,
 - Strict price-time priority verified by property-based tests across thousands of random order sequences
 - Cross-validated against independent matching engine implementations and real market data
 - Deterministic replay guarantees identical state from the same journal
-- Verified by property-based, fuzz, crash-injection, cross-engine differential, and multi-process failover tests — hundreds of scenarios in total
+- Verified by property-based, fuzz, crash-injection, cross-engine differential, and multi-process failover tests — more than 700 scenarios in total
 
 **Durable** — every order is persisted and replicated before acknowledgement.
 - Crash recovery via journal replay with CRC32C integrity checks
@@ -24,7 +24,7 @@ Melin handles order matching, account balances, risk controls, circuit breakers,
 
 ## LAN Benchmarks
 
-All numbers are **full round-trip** (client sends order → server journals to NVMe with fsync → matching engine executes → response arrives at client) over LAN using four AMD Ryzen 9 9950X servers (16C, SMT off, dedicated NVMe journal, 1 benchmark, 1 primary, 2 replicas). Commit [`46441eb`](../../commit/46441eb). Every order is durably persisted before acknowledgement. [Realistic order flow](crates/bench/src/generator.rs). Reproducible via `scripts/lan-bench-suite.sh`. For production deployment and OS tuning, see [operations](docs/operations.md) and [benchmarking](docs/benchmarking.md).
+All numbers are **full round-trip** (client sends order → server journals to NVMe with fsync → matching engine executes → response arrives at client) over LAN using four AMD Ryzen 9 9950X servers (16C, SMT off, dedicated NVMe journal, 10Gb/s NIC, 1 benchmark, 1 primary, 2 replicas). Commit [`46441eb`](../../commit/46441eb). Every order is durably persisted before acknowledgement. [Realistic order flow](crates/bench/src/generator.rs). Reproducible via `scripts/lan-bench-suite.sh`. For production deployment and OS tuning, see [operations](docs/operations.md) and [benchmarking](docs/benchmarking.md).
 
 ### Peak throughput (16 clients, window 256)
 
@@ -32,7 +32,7 @@ Kernel TCP over 10 Gbps private VLAN.
 
 | Durability | Throughput | p50 | p99 | p99.9 | p99.99 | max |
 |------------|-----------|-----|-----|-------|--------|-----|
-| **Local fsync** | **6.7M/s** | 583 µs | 715 µs | 769 µs | 812 µs | 1,076 µs |
+| **Standalone persistence** | **6.7M/s** | 583 µs | 715 µs | 769 µs | 812 µs | 1,076 µs |
 | **Synchronous replication** (1 replica) | **4.0M/s** | 916 µs | 1,141 µs | 1,236 µs | 1,672 µs | 4,702 µs |
 | **Dual synchronous replication** (2 replicas) | **4.0M/s** | 985 µs | 1,346 µs | 1,488 µs | 1,680 µs | 1,843 µs |
 
@@ -44,7 +44,7 @@ The latency floor — one order at a time, no pipelining, no queuing.
 
 | Durability | p50 | p90 | p99 | p99.9 | p99.99 | max |
 |-----------|-----|-----|-----|-------|--------|-----|
-| Kernel TCP (standalone) | 58 µs | 60 µs | 71 µs | 73 µs | 126 µs | 192 µs |
+| Standalone persistence | 58 µs | 60 µs | 71 µs | 73 µs | 126 µs | 192 µs |
 | **Synchronous replication** (1 replica) | 57 µs | 61 µs | 68 µs | 77 µs | 95 µs | 167 µs |
 | **Dual synchronous replication** (2 replicas) | **35 µs** | **39 µs** | **46 µs** | **54 µs** | **74 µs** | 293 µs |
 
@@ -111,14 +111,15 @@ Note that **adding a second replica makes the engine faster, not slower**. With 
 
 ### [FIX 4.2 Gateway](docs/fix-gateway.md)
 - Single-threaded io_uring event loop terminating many concurrent FIX 4.2 sessions
-- Stateless session model — each connection starts at MsgSeqNum 1 with a clean slate
+- Stateless session model — each connection starts at MsgSeqNum 1; cross-reconnect recovery is handled by the output event channel, not by a persisted FIX session store
 - Standard FIX 4.2 §4.6/§4.7 gap recovery (ResendRequest, SequenceReset-GapFill) on both directions
 - Bounded per-session outbound store with automatic GapFill for evicted ranges
 - TargetCompID validation, heartbeat / TestRequest liveness, configurable per-session message rate limits
 
 ### [Networking](docs/wire-protocol.md)
-- Custom binary wire protocol (length-prefixed framing)
-- TCP, Unix domain socket, and DPDK kernel bypass transports
+- Custom binary wire protocol
+- TCP, Unix domain socket
+- DPDK kernel bypass transports (experimental)
 - io_uring transport with dedicated I/O threads (multishot RECV, batched SEND)
 - Backpressure handling (reject when the input pipeline is full — client backs off and retries)
 - Output event channel — real-time broadcast of all execution events to authenticated subscribers; monotonic sequence numbers for gap detection
@@ -130,7 +131,7 @@ Note that **adding a second replica makes the engine faster, not slower**. With 
 - Per-key idempotency (sequence numbers with duplicate rejection — safe to retry on timeout without double-applying)
 
 ### [Operations](docs/operations.md)
-- Structured logging (error-level for server malfunctions only)
+- Structured logging with disciplined error levels (`error!` reserved for server malfunctions — never client-induced)
 - Health/liveness endpoint with Prometheus metrics (active connections, events processed, journal sequence, replication lag, pipeline health, input queue depth, trading state)
 - Admin TUI dashboard (live connection count, events processed, throughput, journal sequence)
 - Sparse account storage to reduce memory usage, see [account lifecycle](docs/account-lifecycle.md)
