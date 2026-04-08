@@ -99,6 +99,15 @@ REPLICA2_JOURNAL="${JOURNAL_DIR}/replica2.journal"
 REPL_PORT=9877
 RUN_PLOTS="${RUN_PLOTS:-0}"
 
+# Replica args. Default enables --async-replica-ack: replicas ack as soon as
+# the batch is queued for their local journal, before fsync completes. This
+# removes one NVMe write from the replication round-trip (~50–80µs on
+# enterprise NVMe) while keeping the primary's local fsync synchronous, so
+# committed data is still durable on the primary's disk + in the replicas'
+# RAM at ack time. See docs/replication.md for the full durability model.
+# Override with REPLICA_EXTRA_ARGS="" to restore strict sync acks.
+REPLICA_EXTRA_ARGS="${REPLICA_EXTRA_ARGS---async-replica-ack}"
+
 # Order counts — override for quick smoke tests.
 THROUGHPUT_ORDERS="${THROUGHPUT_ORDERS:-100000000}"
 THROUGHPUT_CLIENTS="${THROUGHPUT_CLIENTS:-16}"
@@ -823,6 +832,7 @@ transport_start_dpdk_repl() {
             --dpdk-ip ${REPLICA_DPDK_IP} \
             --dpdk-prefix-len ${REPLICA_DPDK_PREFIX} \
             --dpdk-ports ${REPLICA_DPDK_PORT} \
+            ${REPLICA_EXTRA_ARGS:-} \
         >/tmp/melin-replica.log 2>&1 </dev/null &" </dev/null
 
     wait_for_log "$SERVER" "/tmp/melin-server.log" "listening" 120 "DPDK primary"
