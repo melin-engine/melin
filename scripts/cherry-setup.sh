@@ -143,7 +143,13 @@ echo ""
 # ---------------------------------------------------------------------------
 # Core isolation, tick suppression, and latency tuning — all persistent
 # across reboots via GRUB.
-#   isolcpus/nohz_full/rcu_nocbs: isolate cores 1-10 from scheduler/timers/RCU
+#   isolcpus/nohz_full/rcu_nocbs: isolate cores 1..N-1 from scheduler/timers/RCU,
+#     where N is the number of physical cores (detected at setup time so the
+#     same script works on a 16-core 9950X and a 24-core EPYC 9255). Only
+#     core 0 is left for the kernel/IRQ/housekeeping work; everything else
+#     is reserved for explicitly-pinned Melin pipeline threads. This avoids
+#     hardcoding a range that straddles CCD boundaries on parts with fewer
+#     cores per CCD than expected.
 #   nmi_watchdog=0: disable NMI watchdog (eliminates periodic NMI interrupts)
 #   transparent_hugepage=never: disable THP (khugepaged compaction causes 1-4ms stalls)
 #   cpufreq.default_governor=performance: lock max CPU frequency (no scaling transitions)
@@ -151,7 +157,20 @@ echo ""
 #   skew_tick=1: offset timer ticks across cores to reduce kernel lock contention
 #   nosmt: disable hyperthreading — prevents HT siblings from polluting L1/L2 on pipeline cores
 GRUB_FILE="/etc/default/grub"
-BENCH_PARAMS="isolcpus=nohz,domain,1-10 nohz_full=1-10 rcu_nocbs=1-10 nmi_watchdog=0 transparent_hugepage=never cpufreq.default_governor=performance processor.max_cstate=1 skew_tick=1 nosmt"
+
+# Count unique physical cores. `lscpu -p=CORE` lists one row per logical CPU
+# with its physical core ID; sort -u collapses SMT siblings. nosmt is set
+# below in BENCH_PARAMS, so this matches the post-reboot online CPU count.
+PHYSICAL_CORES=$(lscpu -p=CORE 2>/dev/null | grep -v '^#' | sort -un | wc -l)
+if [[ -z "$PHYSICAL_CORES" || "$PHYSICAL_CORES" -lt 2 ]]; then
+    PHYSICAL_CORES=$(nproc 2>/dev/null || echo 16)
+    echo "  warning: lscpu core detection failed, falling back to nproc=$PHYSICAL_CORES"
+fi
+LAST_ISOLATED=$((PHYSICAL_CORES - 1))
+ISOLATED_RANGE="1-${LAST_ISOLATED}"
+echo "  detected $PHYSICAL_CORES physical cores → isolating ${ISOLATED_RANGE}"
+
+BENCH_PARAMS="isolcpus=nohz,domain,${ISOLATED_RANGE} nohz_full=${ISOLATED_RANGE} rcu_nocbs=${ISOLATED_RANGE} nmi_watchdog=0 transparent_hugepage=never cpufreq.default_governor=performance processor.max_cstate=1 skew_tick=1 nosmt"
 # IOMMU for DPDK/vfio-pci. iommu=pt sets passthrough mode so DMA
 # bypasses IOMMU translation for performance. intel_iommu=on is
 # Intel-specific; on AMD (EPYC, Ryzen) the kernel uses AMD-Vi
@@ -164,11 +183,23 @@ fi
 
 if [[ -f "$GRUB_FILE" ]]; then
     NEEDS_UPDATE=0
+    NEEDS_RANGE_REWRITE=0
 
     if ! grep -q "isolcpus" "$GRUB_FILE" 2>/dev/null; then
         echo "=== Adding kernel boot parameters ==="
         echo "  Adding: $BENCH_PARAMS"
         NEEDS_UPDATE=1
+    else
+        # isolcpus is present — check whether the range matches what this
+        # host actually needs. A 9950X-tuned config (1-10) on a 24-core
+        # 9255 leaves cores 11-23 unisolated, which is exactly the bug
+        # this script is meant to prevent.
+        CURRENT_RANGE=$(grep -oE 'isolcpus=nohz,domain,[0-9-]+' "$GRUB_FILE" | sed 's/^isolcpus=nohz,domain,//')
+        if [[ -n "$CURRENT_RANGE" && "$CURRENT_RANGE" != "$ISOLATED_RANGE" ]]; then
+            echo "=== Updating isolcpus range ==="
+            echo "  Current: $CURRENT_RANGE → Desired: $ISOLATED_RANGE"
+            NEEDS_RANGE_REWRITE=1
+        fi
     fi
 
     if ! grep -q "iommu=pt" "$GRUB_FILE" 2>/dev/null; then
@@ -176,17 +207,32 @@ if [[ -f "$GRUB_FILE" ]]; then
         NEEDS_UPDATE=1
     fi
 
-    if [[ "$NEEDS_UPDATE" -eq 1 ]]; then
+    if [[ "$NEEDS_UPDATE" -eq 1 || "$NEEDS_RANGE_REWRITE" -eq 1 ]]; then
         cp "$GRUB_FILE" "${GRUB_FILE}.bak"
-        # Build the full param string from what's missing.
-        ADD_PARAMS=""
-        if ! grep -q "isolcpus" "$GRUB_FILE" 2>/dev/null; then
-            ADD_PARAMS="$BENCH_PARAMS"
+
+        if [[ "$NEEDS_RANGE_REWRITE" -eq 1 ]]; then
+            # Rewrite the three core-range parameters in place. We match
+            # the parameter name + value so unrelated numeric ranges
+            # elsewhere on the line are unaffected.
+            sed -i -E "s/isolcpus=nohz,domain,[0-9-]+/isolcpus=nohz,domain,${ISOLATED_RANGE}/" "$GRUB_FILE"
+            sed -i -E "s/nohz_full=[0-9-]+/nohz_full=${ISOLATED_RANGE}/" "$GRUB_FILE"
+            sed -i -E "s/rcu_nocbs=[0-9-]+/rcu_nocbs=${ISOLATED_RANGE}/" "$GRUB_FILE"
         fi
-        if ! grep -q "iommu=pt" "$GRUB_FILE" 2>/dev/null; then
-            ADD_PARAMS="$ADD_PARAMS $IOMMU_PARAMS"
+
+        if [[ "$NEEDS_UPDATE" -eq 1 ]]; then
+            # Append any missing parameter blocks (initial install path).
+            ADD_PARAMS=""
+            if ! grep -q "isolcpus" "$GRUB_FILE" 2>/dev/null; then
+                ADD_PARAMS="$BENCH_PARAMS"
+            fi
+            if ! grep -q "iommu=pt" "$GRUB_FILE" 2>/dev/null; then
+                ADD_PARAMS="$ADD_PARAMS $IOMMU_PARAMS"
+            fi
+            if [[ -n "$ADD_PARAMS" ]]; then
+                sed -i "s/^GRUB_CMDLINE_LINUX_DEFAULT=\"\(.*\)\"/GRUB_CMDLINE_LINUX_DEFAULT=\"\1 $ADD_PARAMS\"/" "$GRUB_FILE"
+            fi
         fi
-        sed -i "s/^GRUB_CMDLINE_LINUX_DEFAULT=\"\(.*\)\"/GRUB_CMDLINE_LINUX_DEFAULT=\"\1 $ADD_PARAMS\"/" "$GRUB_FILE"
+
         update-grub
         touch /tmp/.cherry-needs-reboot
         echo "  *** REBOOT REQUIRED for new kernel params to take effect ***"
