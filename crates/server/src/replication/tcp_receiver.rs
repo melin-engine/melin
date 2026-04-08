@@ -53,13 +53,25 @@ use super::{
     submit_batch_to_pipeline,
 };
 
-/// io_uring streaming loop for the replica receiver.
+/// io_uring streaming receive loop for the replica.
 ///
-/// io_uring streaming receive loop for the replica. Uses async RECV/SEND
-/// with async RECV/SEND. A single RECV is always in-flight for
-/// DataBatch frames; SEND is submitted when an ack becomes ready
-/// (journal cursor catches up). Frame parsing uses the same
-/// accumulate-and-extract pattern as the bench client and reader.
+/// Uses `IORING_OP_RECV_MULTI` against a 16-buffer provided buffer pool
+/// for incoming `DataBatch` frames, so the kernel can deliver multiple
+/// completions while the receive thread is decoding the previous one.
+/// Acks are sent via single-shot SEND when the gating condition is
+/// satisfied:
+///
+/// - Sync mode (default): the local journal cursor must advance past
+///   the batch's target sequence — guarantees the data is fsynced on
+///   this replica's disk before the primary considers it durable.
+/// - Async mode (`async_ack = true`, set by `--async-replica-ack`):
+///   pop and ack as soon as the previous SEND completes; durability is
+///   asserted by "data is queued for the local journal stage" rather
+///   than "data is on disk." Removes ~50–80µs from the replication
+///   round-trip; see `docs/replication.md` for the failure-mode analysis.
+///
+/// Frame parsing uses the same accumulate-and-extract pattern as the
+/// bench client and reader.
 #[allow(clippy::too_many_arguments)]
 fn replica_stream_uring(
     tcp_stream: &TcpStream,

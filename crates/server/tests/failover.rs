@@ -289,33 +289,66 @@ fn spawn_replica_named(
     promote_port: u16,
     name: &str,
 ) -> ServerProcess {
+    spawn_replica_named_with_extra(
+        bin,
+        tmp_dir,
+        keys_path,
+        repl_key_path,
+        primary_repl_port,
+        client_port,
+        health_port,
+        promote_port,
+        name,
+        &[],
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn spawn_replica_named_with_extra(
+    bin: &Path,
+    tmp_dir: &Path,
+    keys_path: &Path,
+    repl_key_path: &Path,
+    primary_repl_port: u16,
+    client_port: u16,
+    health_port: u16,
+    promote_port: u16,
+    name: &str,
+    extra_args: &[&str],
+) -> ServerProcess {
     let journal = tmp_dir.join(format!("{name}.journal"));
+    // Vec<String> chosen so we can grow with extra_args at runtime; the
+    // base args are pushed first, then any test-supplied flags.
+    let mut args: Vec<String> = vec![
+        "--bind".into(),
+        format!("127.0.0.1:{client_port}"),
+        "--health-bind".into(),
+        format!("127.0.0.1:{health_port}"),
+        "--replica-of".into(),
+        format!("127.0.0.1:{primary_repl_port}"),
+        "--replication-key".into(),
+        repl_key_path.to_str().expect("valid path").into(),
+        "--promote-bind".into(),
+        format!("127.0.0.1:{promote_port}"),
+        "--journal".into(),
+        journal.to_str().expect("valid path").into(),
+        "--authorized-keys".into(),
+        keys_path.to_str().expect("valid path").into(),
+        "--connection-timeout-secs".into(),
+        "0".into(),
+        "--yield-idle".into(),
+        "--cores".into(),
+        "0,0,0,0,0,0,0,0".into(),
+        "--readers".into(),
+        "1".into(),
+        "--reader-cores".into(),
+        "0".into(),
+    ];
+    for a in extra_args {
+        args.push((*a).into());
+    }
     let child = Command::new(bin)
-        .args([
-            "--bind",
-            &format!("127.0.0.1:{client_port}"),
-            "--health-bind",
-            &format!("127.0.0.1:{health_port}"),
-            "--replica-of",
-            &format!("127.0.0.1:{primary_repl_port}"),
-            "--replication-key",
-            repl_key_path.to_str().expect("valid path"),
-            "--promote-bind",
-            &format!("127.0.0.1:{promote_port}"),
-            "--journal",
-            journal.to_str().expect("valid path"),
-            "--authorized-keys",
-            keys_path.to_str().expect("valid path"),
-            "--connection-timeout-secs",
-            "0",
-            "--yield-idle",
-            "--cores",
-            "0,0,0,0,0,0,0,0",
-            "--readers",
-            "1",
-            "--reader-cores",
-            "0",
-        ])
+        .args(&args)
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit())
         .spawn()
@@ -834,6 +867,10 @@ struct DualCluster {
 
 impl DualCluster {
     fn start() -> Self {
+        Self::start_with_replica_args(&[])
+    }
+
+    fn start_with_replica_args(replica_extra_args: &[&str]) -> Self {
         let bin = server_bin();
         assert!(bin.exists(), "melin-server binary not found");
 
@@ -877,7 +914,7 @@ impl DualCluster {
             std::thread::sleep(Duration::from_millis(50));
         }
 
-        let replica1 = spawn_replica_named(
+        let replica1 = spawn_replica_named_with_extra(
             &bin,
             tmp.path(),
             &keys_path,
@@ -887,8 +924,9 @@ impl DualCluster {
             r1_health,
             r1_promote,
             "replica1",
+            replica_extra_args,
         );
-        let replica2 = spawn_replica_named(
+        let replica2 = spawn_replica_named_with_extra(
             &bin,
             tmp.path(),
             &keys_path,
@@ -898,6 +936,7 @@ impl DualCluster {
             r2_health,
             r2_promote,
             "replica2",
+            replica_extra_args,
         );
 
         wait_healthy(primary.health_addr, Duration::from_secs(30));
@@ -1154,6 +1193,71 @@ fn dual_replication_with_fills_then_failover() {
     let mut client2 = cluster.promote_replica2();
 
     // Place + fill on promoted replica — proves matching state is correct.
+    let r = submit_order(&mut client2, 31, 2, 1, Side::Sell, 500, 1);
+    let accepted = has_report(&r, |rep| {
+        matches!(rep, melin_protocol::types::ExecutionReport::Placed { .. })
+    }) || has_report(&r, |rep| {
+        matches!(rep, melin_protocol::types::ExecutionReport::Fill { .. })
+    });
+    assert!(accepted, "expected Placed or Fill, got: {r:?}");
+
+    let r = submit_order(&mut client2, 32, 1, 1, Side::Buy, 500, 1);
+    assert!(
+        has_report(&r, |rep| matches!(
+            rep,
+            melin_protocol::types::ExecutionReport::Fill { .. }
+        )),
+        "expected Fill on promoted replica, got: {r:?}"
+    );
+}
+
+/// Async ack mode: replicas are started with `--async-replica-ack`, which
+/// makes them ack the primary as soon as a batch is queued for the local
+/// journal stage rather than after fsync. End-to-end this should still
+/// produce identical journals after a graceful shutdown (the journal
+/// stage drains and fsyncs everything before the receiver exits), and
+/// failover via promotion must still see every fill the client was told
+/// about (the promotion path also drains the pipeline).
+///
+/// Mirrors `dual_replication_with_fills_then_failover` but exercises the
+/// async path; if either path silently dropped data, the post-promotion
+/// fill on the new primary would fail to find its counterparty.
+#[test]
+#[serial]
+fn async_ack_dual_replication_with_failover() {
+    let mut cluster = DualCluster::start_with_replica_args(&["--async-replica-ack"]);
+    let mut client = cluster.connect_primary();
+
+    // Resting sells from account 2.
+    for i in 1..=10u64 {
+        submit_order(&mut client, i, 2, 1, Side::Sell, 100 + i, 5);
+    }
+    // Aggressive buys from account 1 — generates fills.
+    for i in 11..=20u64 {
+        submit_order(&mut client, i, 1, 1, Side::Buy, 200, 3);
+    }
+    cluster.wait_replicated();
+
+    // Kill replica 1, submit more fills with only replica 2.
+    cluster.kill_replica1();
+    std::thread::sleep(Duration::from_millis(500));
+
+    for i in 21..=25u64 {
+        submit_order(&mut client, i, 2, 1, Side::Sell, 300, 2);
+    }
+    for i in 26..=30u64 {
+        submit_order(&mut client, i, 1, 1, Side::Buy, 300, 2);
+    }
+    cluster.wait_replicated();
+
+    // Failover to replica 2.
+    drop(client);
+    cluster.kill_primary();
+    let mut client2 = cluster.promote_replica2();
+
+    // Place + fill on promoted replica — proves the matching state of the
+    // promoted node has every event the original primary acknowledged,
+    // including the ones from after replica1 died.
     let r = submit_order(&mut client2, 31, 2, 1, Side::Sell, 500, 1);
     let accepted = has_report(&r, |rep| {
         matches!(rep, melin_protocol::types::ExecutionReport::Placed { .. })

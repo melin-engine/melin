@@ -1495,6 +1495,34 @@ mod tests {
     }
 
     #[test]
+    fn pending_ack_queue_pop_all_async_returns_highest_and_drains() {
+        // Async mode: cursor is irrelevant; everything pops at once and the
+        // highest sequence wins (cumulative ack semantics).
+        let mut q = PendingAckQueue::new();
+        assert!(q.pop_all_async().is_none(), "empty queue returns None");
+
+        q.push(10, 100);
+        q.push(20, 200);
+        q.push(30, 300);
+        assert_eq!(q.pop_all_async(), Some(300));
+        assert!(q.is_empty(), "pop_all_async drains the queue");
+        assert!(q.pop_all_async().is_none(), "second call returns None");
+    }
+
+    #[test]
+    fn pending_ack_queue_pop_all_async_ignores_cursor() {
+        // Even with the cursor stuck at 0 (e.g. journal stage stalled),
+        // async mode acks every pending entry — that's the whole point of
+        // the flag, durability is shifted from per-entry fsync to the
+        // primary's response gate.
+        let mut q = PendingAckQueue::new();
+        q.push(u64::MAX, 100);
+        q.push(u64::MAX, 200);
+        assert_eq!(q.pop_all_async(), Some(200));
+        assert!(q.is_empty());
+    }
+
+    #[test]
     fn pending_ack_queue_capacity_and_full() {
         let mut q = PendingAckQueue::new();
         for i in 0..PendingAckQueue::CAP {

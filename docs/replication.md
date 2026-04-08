@@ -53,6 +53,40 @@ In all modes, a client never receives a response for an event that isn't durably
 
 **Latency impact**: quorum mode removes NVMe fsync tail variance (1-5ms GC spikes) from the critical path when both replicas are healthy. When one replica lags, fsync + the fast replica still provides two durable copies without waiting for the slow one. Throughput is unaffected — batching amortizes the round-trip across many events.
 
+### Async replica ack (`--async-replica-ack`)
+
+By default, each replica fsyncs an incoming batch to its local NVMe before sending the corresponding `Ack` to the primary. The replica's contribution to the durability gate (`replicas_acked`) therefore means "two physical disks confirm the data" — the strongest tier.
+
+Setting `--async-replica-ack` on a replica makes it ack as soon as the batch is queued for its local journal stage, before fsync completes. This removes one NVMe write (~50–80µs on enterprise NVMe) from the replication round-trip. The local fsync still happens — just in parallel with the primary's response release rather than gating it.
+
+**What changes for the durability gate:**
+
+Pre-`--async-replica-ack` — `replicas_acked` means *both replicas have the data fsynced on disk*.
+
+With `--async-replica-ack` — `replicas_acked` means *both replicas have the data in RAM and are committed to fsyncing it*. The primary's own journal fsync is still synchronous, so when the primary tells a client "your trade is filled" the data is durable on:
+
+1. The primary's local NVMe (fsynced) — synchronously verified
+2. Replica1's RAM, fsync in flight
+3. Replica2's RAM, fsync in flight
+
+**Failure modes:**
+
+| Scenario | Sync ack (default) | `--async-replica-ack` |
+|---|---|---|
+| Primary crashes (recoverable) | Recovers from local journal. ✓ | Same. ✓ |
+| One replica crashes alone | Catches up from primary on reconnect via the catch-up protocol. ✓ | Same — the in-flight (acked-but-not-fsynced) entries are missing from the dead replica's disk, but the primary still has them on disk and re-streams them via catch-up. ✓ |
+| Both replicas crash simultaneously | Trading halts; replicas catch up on restart. ✓ | Same. ✓ |
+| Primary disk fails, promote a replica | The promoted replica has every fill the client was told about. ✓ | The promoted replica may be missing the last ~50–80µs of fills, because those were "acked" without fsync and the primary's disk (the only other copy) is now gone. **Data loss window: ~50–80µs of recent fills.** |
+| Primary AND a replica crash within ~80µs of a fill confirmation | Survivable: the surviving replica has every confirmed fill on disk. ✓ | Same surviving-replica caveat as the row above — there's a ~80µs window where the surviving replica may be missing the most recent fills. |
+
+**When to use it:**
+
+`--async-replica-ack` is appropriate when the primary's local disk write is *already redundant* (capacitor-backed enterprise NVMe with power-loss protection, or RAID-1/10 underneath the journal), so the replica's fsync is a defense-in-depth backup rather than the load-bearing durability mechanism. Under those conditions, the ~50–80µs latency improvement comes essentially free — the only failure mode it weakens (primary disk dies within 80µs of a fill) is already mitigated by the hardware.
+
+Conversely, on commodity NVMe with no power-loss protection or RAID, the replica's fsync is genuinely the second copy of the data and removing it from the critical path is reckless. Leave the flag off.
+
+The flag is set per-replica, not on the primary. Mixing modes across replicas is supported: one replica can run sync, the other async, and the response gate will use whichever ack arrives first via the `fastest_replica_acked` term.
+
 ### Replication cursor behavior
 
 | Scenario | `replication_cursor` (min) | `fastest_replica_cursor` (max) | Response gate |
@@ -108,7 +142,7 @@ A server started with `--replica-of <primary_addr>` runs in replica mode:
 - Uses the same pipeline architecture as the primary (journal stage → matching stage → shadow stage), with the replication receiver feeding the input disruptor instead of reader threads.
 - The journal stage writes pre-encoded bytes from the primary via `write_raw_sync()` (byte-identical journals) instead of re-encoding events from the disruptor.
 - The matching stage replays events into a local `Exchange` to maintain warm state for promotion.
-- Sends `Ack` frames after the journal stage confirms durable write (cursor advance). Acks are pipelined: up to 8 batches can be submitted to the journal stage before the first ack is sent, overlapping NVMe writes with TCP receives.
+- Sends `Ack` frames after the journal stage confirms durable write (cursor advance). Acks are pipelined: up to 8 batches can be submitted to the journal stage before the first ack is sent, overlapping NVMe writes with TCP receives. With `--async-replica-ack`, acks are sent the moment a batch is queued for the journal stage rather than after fsync — see the durability tradeoff section above.
 - Both the primary sender and replica receiver use io_uring for TCP I/O (async RECV/SEND), eliminating poll/read/write syscalls from the streaming hot path.
 - The replica pipeline threads (journal, matching, drain, shadow) are pinned to the same cores as the primary, matching the `--cores` layout.
 - If the primary disconnects or evicts the replica, the receiver automatically reconnects with exponential backoff (1s → 30s cap), recovers state from the pipeline shutdown, and resumes from its last durable sequence.
@@ -147,6 +181,7 @@ The SPSC ring + pipelined ack queue (8 entries) decouple the receiver's TCP loop
 | `--replica-of <addr>` | No | — | Run as a replica connected to the given primary |
 | `--replication-key <path>` | Replica | — | Ed25519 private key for replication auth. Required when `--replica-of` is set. The corresponding public key must be in the primary's `authorized_keys` with `replication` permission. |
 | `--promote-bind <addr>` | Replica | — | Address to listen for promotion commands. An operator sends `PROMOTE\n` to trigger in-process transition from replica to primary. |
+| `--async-replica-ack` | Replica | `false` | Ack incoming batches as soon as they are queued for the local journal stage instead of waiting for fsync. Removes ~50–80µs from the replication round-trip; documented durability tradeoff above. |
 
 `--replication-bind` and `--standalone` are mutually exclusive. `--replica-of` is mutually exclusive with both. If none are specified, the server runs in standalone mode.
 
@@ -264,5 +299,5 @@ Dual replication is now supported — the primary accepts up to 2 concurrent rep
 
 - **Chain hash verification** — see limitation above
 - **Automatic failover**: Leader election / consensus for automatic promotion. Requires fencing to prevent split-brain. Manual promotion via `--promote-bind` is implemented.
-- **Async replication**: Optional mode where the response stage does not gate on the replication cursor (lower latency, data loss window).
+- **Fully async replication**: Optional mode where the primary's response stage does not gate on the replication cursor at all — only on local fsync. Larger data-loss window than `--async-replica-ack` (which still gates on the replica having the data in RAM). Useful for venues that treat replication purely as a hot standby and accept any post-crash divergence.
 - **Split-brain fencing**: After manual promotion, the old primary must be stopped manually. Automatic fencing (STONITH, epoch-based fencing) is not yet implemented.
