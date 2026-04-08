@@ -48,6 +48,8 @@ The latency floor — one order at a time, no pipelining, no queuing.
 | **Synchronous replication** (1 replica) | 57 µs | 61 µs | 68 µs | 77 µs | 95 µs | 167 µs |
 | **Dual synchronous replication** (2 replicas) | **35 µs** | **39 µs** | **46 µs** | **54 µs** | **74 µs** | 293 µs |
 
+Note that **adding a second replica makes the engine faster, not slower**. With quorum durability, the response stage releases an order as soon as the *fastest* of `{local fsync, replica 1 ack, replica 2 ack}` confirms — replicas race the local NVMe rather than serialize behind it. Two replicas turn that into the minimum of three independent durability paths, which collapses the tail and pulls the median below the standalone (no-replica) configuration. Stronger durability and lower latency are usually a tradeoff; here they reinforce each other.
+
 **Latency CDF** — peak-load modes on the same axes:
 
 ![Latency CDF](docs/plots/latency-cdf.png)
