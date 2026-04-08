@@ -336,6 +336,8 @@ impl Gateway {
 
         // Set TCP_NODELAY on the new socket.
         set_tcp_nodelay(fd);
+        // Enable SO_BUSY_POLL — gateway loop spins on the io_uring CQ.
+        set_busy_poll(fd);
 
         let peer = get_peer_addr(fd);
         info!(peer = %peer, fd, "FIX client connected");
@@ -481,6 +483,7 @@ impl Gateway {
         }
 
         set_tcp_nodelay(fd);
+        set_busy_poll(fd);
 
         if let Some(session) = self.sessions.get_mut(idx) {
             session.melin_fd = Some(fd);
@@ -934,6 +937,27 @@ fn set_tcp_nodelay(fd: RawFd) {
             &val as *const _ as *const libc::c_void,
             std::mem::size_of_val(&val) as libc::socklen_t,
         );
+    }
+}
+
+/// Enable kernel busy-polling on the FIX client socket. Removes the
+/// softirq->wakeup handoff for incoming bytes; safe to apply because the
+/// gateway's io_uring loop already busy-spins on the CQ. 50us window
+/// matches the Melin server-side value.
+fn set_busy_poll(fd: RawFd) {
+    let val: libc::c_int = 50;
+    let rc = unsafe {
+        libc::setsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_BUSY_POLL,
+            &val as *const _ as *const libc::c_void,
+            std::mem::size_of_val(&val) as libc::socklen_t,
+        )
+    };
+    if rc != 0 {
+        let err = std::io::Error::last_os_error();
+        debug!(fd, error = %err, "failed to set SO_BUSY_POLL on FIX client socket");
     }
 }
 
