@@ -22,6 +22,8 @@ Melin handles order matching, account balances, risk controls, circuit breakers,
 - Journal, matching, and replication run in parallel via io_uring
 - Sub-50 µs p99 single-order latency with quorum durability (dual replication)
 
+**Design partners wanted.** We are looking for one or two design partners willing to run Melin in a non-critical capacity — internal crossing, a new instrument, a parallel-run alongside an existing engine — in exchange for direct engineering support and influence over the roadmap. Get in touch: [contact@melin-engine.com](mailto:contact@melin-engine.com).
+
 ## LAN Benchmarks
 
 All numbers are **full round-trip**:
@@ -145,6 +147,6 @@ Note that **adding a second replica makes the engine faster, not slower**. With 
 
 ## License
 
-Copyright (c) 2026 Pierre Larger. All Rights Reserved.
+Copyright (c) 2026 P.L.S.C. All Rights Reserved.
 
-Commercial licensing available — contact [pierre.larger@gmail.com](mailto:pierre.larger@gmail.com).
+Commercial licensing available — contact [contact@melin-engine.com](mailto:contact@melin-engine.com).
