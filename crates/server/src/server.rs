@@ -1236,6 +1236,23 @@ fn run_as_primary<L: BlockingTransportListener>(
             debug!(connection_id = connection_id.0, error = %e, "failed to clear auth timeout");
         }
 
+        // Enable SO_BUSY_POLL on the client data socket. The reader
+        // thread already busy-spins on io_uring CQEs, so the kernel's
+        // NIC busy-poll happens during cycles that would have been
+        // spent spinning anyway — net cost is zero, and we avoid the
+        // softirq → wakeup handoff for every recv on this connection.
+        if let Err(e) = set_busy_poll(&std_read, BUSY_POLL_US) {
+            // Best-effort: a kernel without CAP_NET_ADMIN or with
+            // SO_BUSY_POLL disabled by sysctl will reject this. Logged
+            // as debug — it's a per-connection event and only affects
+            // latency, not correctness.
+            debug!(
+                connection_id = connection_id.0,
+                error = %e,
+                "failed to set SO_BUSY_POLL on client socket"
+            );
+        }
+
         // Set a write timeout on the response socket so a slow/stalled
         // client cannot block the response thread (SEC-01). If a write
         // takes longer than this, it returns EAGAIN and the response
@@ -2088,6 +2105,48 @@ fn set_read_timeout<F: std::os::unix::io::AsRawFd>(
     }
     Ok(())
 }
+
+/// Enable `SO_BUSY_POLL` on a TCP data socket so the kernel busy-polls
+/// the NIC for incoming data instead of going to sleep on the softirq
+/// → wakeup handoff. Removes scheduler-wakeup latency from the recv
+/// path on hardware where IRQ delivery is the dominant per-packet cost
+/// (e.g. ixgbe-class NICs). 50 µs covers a typical LAN ack RTT.
+///
+/// Best-effort: requires `CAP_NET_ADMIN` (or unprivileged operation
+/// permitted via sysctl). Failures are surfaced as warnings by the
+/// caller — they only cost latency, not correctness, and we don't want
+/// a misconfigured kernel to halt connection acceptance.
+///
+/// Only beneficial when the receiving thread is already busy-spinning
+/// (otherwise the spin cost is wasted on idle connections). All
+/// callers in Melin meet that condition: client reader threads spin on
+/// io_uring CQEs, the replication sender's ack-recv thread spins, and
+/// the bench client thread spins.
+fn set_busy_poll<F: std::os::unix::io::AsRawFd>(fd: &F, micros: i32) -> std::io::Result<()> {
+    // SAFETY: fd is a live socket fd owned by the caller for the
+    // duration of the call; the option pointer is to a stack-local i32
+    // with the right size for SO_BUSY_POLL.
+    let val: libc::c_int = micros;
+    let ret = unsafe {
+        libc::setsockopt(
+            fd.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_BUSY_POLL,
+            &val as *const libc::c_int as *const libc::c_void,
+            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+        )
+    };
+    if ret < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+/// Default `SO_BUSY_POLL` window in microseconds. Matches the value
+/// already used on the replica receive socket; chosen to cover a
+/// typical LAN round-trip without burning excessive CPU on quiet
+/// connections.
+const BUSY_POLL_US: i32 = 50;
 
 /// Set `SO_SNDTIMEO` on a socket. Prevents blocking writes from stalling
 /// the response thread when a client stops reading (SEC-01).
