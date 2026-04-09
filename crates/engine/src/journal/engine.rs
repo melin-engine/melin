@@ -7,8 +7,8 @@ use std::path::Path;
 
 use crate::exchange::Exchange;
 use crate::types::{
-    AccountId, CircuitBreakerConfig, CurrencyId, ExecutionReport, InstrumentSpec, Order, OrderId,
-    RiskLimits, Symbol,
+    AccountId, CircuitBreakerConfig, CurrencyId, ExecutionReport, FeeSchedule, InstrumentSpec,
+    Order, OrderId, RiskLimits, Symbol,
 };
 
 use super::error::JournalError;
@@ -112,6 +112,18 @@ impl JournaledExchange {
         self.writer
             .append(&JournalEvent::SetCircuitBreaker { symbol, config })?;
         self.exchange.set_circuit_breaker(symbol, config);
+        Ok(())
+    }
+
+    /// Set the fee schedule for an instrument. Journals before executing.
+    pub fn set_fee_schedule(
+        &mut self,
+        symbol: Symbol,
+        schedule: FeeSchedule,
+    ) -> Result<(), JournalError> {
+        self.writer
+            .append(&JournalEvent::SetFeeSchedule { symbol, schedule })?;
+        self.exchange.set_fee_schedule(symbol, schedule);
         Ok(())
     }
 
@@ -2289,5 +2301,78 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// SetFeeSchedule events survive journal replay: fees set before a fill
+    /// produce the same fee account balance after recovery.
+    #[test]
+    fn journal_replay_preserves_fee_schedule() {
+        use crate::account::FEE_ACCOUNT;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("fees.journal");
+
+        let fee_account_balance;
+        let acct_a_usd;
+        let acct_b_usd;
+        {
+            let mut je = JournaledExchange::create(&path).unwrap();
+            je.add_instrument(btc_usd_spec()).unwrap();
+            je.deposit(ACCT_A, USD, 100_000).unwrap();
+            je.deposit(ACCT_B, BTC, 100).unwrap();
+
+            // Set fees BEFORE the fill.
+            je.set_fee_schedule(
+                Symbol(1),
+                FeeSchedule {
+                    maker_fee_bps: 10,
+                    taker_fee_bps: 20,
+                },
+            )
+            .unwrap();
+
+            let mut reports = Vec::new();
+            // Maker sell.
+            je.execute(
+                Symbol(1),
+                limit_order(1, ACCT_B, Side::Sell, 1000, 10),
+                &mut reports,
+            )
+            .unwrap();
+            // Taker buy → fills with fees.
+            je.execute(
+                Symbol(1),
+                limit_order(1, ACCT_A, Side::Buy, 1000, 10),
+                &mut reports,
+            )
+            .unwrap();
+
+            fee_account_balance = je.exchange().accounts().balance(FEE_ACCOUNT, USD).available;
+            acct_a_usd = je.exchange().accounts().balance(ACCT_A, USD);
+            acct_b_usd = je.exchange().accounts().balance(ACCT_B, USD);
+
+            // cost=10_000, maker_fee=10, taker_fee=20, total=30.
+            assert_eq!(fee_account_balance, 30);
+        }
+
+        // Recover from journal and verify fee schedule was replayed.
+        let recovered = JournaledExchange::recover(&path).unwrap();
+        assert_eq!(
+            recovered
+                .exchange()
+                .accounts()
+                .balance(FEE_ACCOUNT, USD)
+                .available,
+            fee_account_balance,
+            "fee account balance must match after journal replay"
+        );
+        assert_eq!(
+            recovered.exchange().accounts().balance(ACCT_A, USD),
+            acct_a_usd,
+        );
+        assert_eq!(
+            recovered.exchange().accounts().balance(ACCT_B, USD),
+            acct_b_usd,
+        );
     }
 }
