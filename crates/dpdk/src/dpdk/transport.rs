@@ -221,8 +221,9 @@ impl DpdkShared {
         }
 
         // Scale mempool for number of queues and ports.
+        // TODO: revert 4x multiplier after debugging 948K stall
         let num_mbufs: u32 =
-            8192 * (config.port_ids.len() as u32).max(1) * (config.num_queues as u32).max(1);
+            8192 * 4 * (config.port_ids.len() as u32).max(1) * (config.num_queues as u32).max(1);
         let mempool = if config.mtu > 1500 {
             Mempool::create_for_mtu("pktmbuf_pool", num_mbufs, config.mtu as u16, 0)?
         } else {
