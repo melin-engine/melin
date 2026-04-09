@@ -9013,4 +9013,78 @@ mod tests {
             "no fill should occur due to STP"
         );
     }
+
+    /// Negative maker fee (rebate) debits the FEE_ACCOUNT. When net fees
+    /// are negative (rebate > taker fee), the fee account funds the rebate.
+    #[test]
+    fn rebate_debits_fee_account() {
+        use crate::account::FEE_ACCOUNT;
+
+        let mut exchange = Exchange::new();
+        let spec = btc_usd_spec();
+        exchange.add_instrument(spec);
+
+        exchange.deposit(ACCT_A, USD, 100_000);
+        exchange.deposit(ACCT_B, BTC, 100);
+
+        // First: a normal trade to seed the fee account.
+        exchange.set_fee_schedule(
+            spec.symbol,
+            FeeSchedule {
+                maker_fee_bps: 10,
+                taker_fee_bps: 20,
+            },
+        );
+        let mut reports = Vec::new();
+        exchange.execute(
+            spec.symbol,
+            limit_order(1, ACCT_B, Side::Sell, 1000, 10, TimeInForce::GTC),
+            &mut reports,
+        );
+        exchange.execute(
+            spec.symbol,
+            limit_order(1, ACCT_A, Side::Buy, 1000, 10, TimeInForce::GTC),
+            &mut reports,
+        );
+
+        // cost=10_000, maker_fee=10, taker_fee=20, fee_credit=30.
+        let fee_after_first = exchange.accounts().balance(FEE_ACCOUNT, USD).available;
+        assert_eq!(fee_after_first, 30);
+        reports.clear();
+
+        // Now switch to rebate schedule: -50 bps maker, 10 bps taker.
+        exchange.set_fee_schedule(
+            spec.symbol,
+            FeeSchedule {
+                maker_fee_bps: -50,
+                taker_fee_bps: 10,
+            },
+        );
+
+        // Second trade: ACCT_A sells (new BTC from first fill), ACCT_B buys.
+        exchange.deposit(ACCT_B, USD, 100_000);
+        exchange.execute(
+            spec.symbol,
+            limit_order(2, ACCT_A, Side::Sell, 1000, 5, TimeInForce::GTC),
+            &mut reports,
+        );
+        exchange.execute(
+            spec.symbol,
+            limit_order(2, ACCT_B, Side::Buy, 1000, 5, TimeInForce::GTC),
+            &mut reports,
+        );
+
+        // cost=5000, maker_fee=5000*(-50)/10_000=-25, taker_fee=5000*10/10_000=5.
+        // Net fee_credit = buyer_deducted - seller_proceeds.
+        // buyer_deducted = cost + taker_fee = 5000 + 5 = 5005.
+        // seller_proceeds = cost - maker_fee = 5000 - (-25) = 5025.
+        // fee_credit = 5005 - 5025 = -20 → FEE_ACCOUNT debited by 20.
+        let fee_after_second = exchange.accounts().balance(FEE_ACCOUNT, USD).available;
+        assert_eq!(
+            fee_after_second,
+            fee_after_first - 20,
+            "rebate should debit fee account: had {fee_after_first}, expected {} after rebate",
+            fee_after_first - 20
+        );
+    }
 }
