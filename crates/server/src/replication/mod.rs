@@ -717,6 +717,77 @@ mod tests {
         assert!(replica_result.is_err());
     }
 
+    /// A replica that sends a validly-formatted but tampered signature
+    /// (correct public key, wrong signature bytes) is rejected.
+    #[test]
+    fn auth_rejects_invalid_signature() {
+        use ed25519_dalek::SigningKey;
+        use std::os::unix::net::UnixStream;
+
+        // Register the correct key.
+        let correct_key = SigningKey::from_bytes(&[0xDD; 32]);
+        let pub_b64 = base64::Engine::encode(
+            &base64::engine::general_purpose::STANDARD,
+            correct_key.verifying_key().to_bytes(),
+        );
+        let keys_content = format!("replication {pub_b64} test-replica\n");
+        let authorized_keys = melin_protocol::auth::AuthorizedKeys::parse(&keys_content).unwrap();
+
+        let (primary_stream, replica_stream) = UnixStream::pair().unwrap();
+        primary_stream
+            .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+            .unwrap();
+        replica_stream
+            .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+            .unwrap();
+
+        // Replica side: read challenge, but sign with a DIFFERENT key,
+        // then send the response with the correct public key (spoofing).
+        let replica_handle = std::thread::spawn(move || {
+            use super::protocol::*;
+
+            let mut reader = replica_stream.try_clone().unwrap();
+            let mut writer = replica_stream;
+
+            // Read the challenge.
+            let frame = read_frame(&mut reader, MAX_CONTROL_FRAME).unwrap();
+            let nonce = decode_challenge(&frame).unwrap();
+
+            // Sign with a WRONG key but send the CORRECT public key.
+            let wrong_key = SigningKey::from_bytes(&[0xEE; 32]);
+            let bad_signature = ed25519_dalek::Signer::sign(&wrong_key, &nonce);
+            let correct_pubkey = correct_key.verifying_key();
+
+            let mut buf = Vec::with_capacity(128);
+            encode_challenge_response(
+                &bad_signature.to_bytes(),
+                correct_pubkey.as_bytes(),
+                &mut buf,
+            );
+            writer.write_all(&buf).unwrap();
+            writer.flush().unwrap();
+
+            // Should receive AuthFailed.
+            let result_frame = read_frame(&mut reader, MAX_CONTROL_FRAME).unwrap();
+            let ok = decode_auth_result(&result_frame).unwrap();
+            assert!(!ok, "should receive auth failure");
+        });
+
+        let mut reader = primary_stream.try_clone().unwrap();
+        let mut writer = primary_stream;
+        let result = authenticate_replica(&mut reader, &mut writer, &authorized_keys);
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("signature verification failed"),
+            "should fail on signature verification"
+        );
+
+        replica_handle.join().unwrap();
+    }
+
     #[test]
     fn sender_receiver_end_to_end() {
         use std::os::unix::net::UnixStream;
