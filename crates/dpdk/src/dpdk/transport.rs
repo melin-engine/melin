@@ -4,7 +4,7 @@
 //! The transport owns the DPDK port and smoltcp interface. The server's
 //! DPDK poll thread calls `poll()` in a tight loop to drive all I/O.
 
-use std::collections::HashMap;
+use astenn::HashMap;
 use std::net::Ipv4Addr;
 use std::sync::Arc;
 
@@ -158,8 +158,6 @@ pub struct DpdkTransport {
     /// Total pending TX bytes across all connections. Avoids iterating
     /// tx_queues.values().any() on every poll cycle.
     pending_tx_bytes: usize,
-    /// Reusable handle buffer to avoid per-poll allocation.
-    handle_buf: Vec<SocketHandle>,
 }
 
 /// Per-connection TX queue with cursor to avoid drain() memmoves.
@@ -356,7 +354,6 @@ impl DpdkTransport {
             cached_timestamp: now,
             poll_count: 0,
             pending_tx_bytes: 0,
-            handle_buf: Vec::with_capacity(MAX_CONNECTIONS),
         })
     }
 
@@ -547,21 +544,15 @@ impl DpdkTransport {
     }
 
     fn flush_tx_queues(&mut self) {
-        self.handle_buf.clear();
-        self.handle_buf.extend(self.tx_queues.keys().copied());
-
-        for handle in 0..self.handle_buf.len() {
-            let h = self.handle_buf[handle];
-            let queue = match self.tx_queues.get_mut(&h) {
-                Some(q) if q.queued_bytes() > 0 => q,
-                _ => continue,
-            };
-
-            let socket = self.sockets.get_mut::<tcp::Socket>(h);
+        // Split borrow: iterate tx_queues while mutating sockets.
+        for (&handle, queue) in self.tx_queues.iter_mut() {
+            if queue.queued_bytes() == 0 {
+                continue;
+            }
+            let socket = self.sockets.get_mut::<tcp::Socket>(handle);
             if !socket.can_send() {
                 continue;
             }
-
             let sent = socket.send_slice(queue.pending()).unwrap_or(0);
             if sent > 0 {
                 queue.advance(sent);

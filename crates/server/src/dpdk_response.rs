@@ -10,7 +10,7 @@
 //! This decoupling is necessary because smoltcp is single-threaded — only
 //! the DPDK poll thread can call `socket.send_slice()`.
 
-use std::collections::HashMap;
+use astenn::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc;

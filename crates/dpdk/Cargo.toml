@@ -21,6 +21,7 @@ smoltcp = { version = "0.13", default-features = false, features = [
     "log",
 ] }
 tracing = "0.1"
+astenn = { git = "ssh://git@github.com/pierre-l/astenn.git" }
 libc = { version = "0.2", optional = true }
 
 [build-dependencies]

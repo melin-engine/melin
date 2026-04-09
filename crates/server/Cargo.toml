@@ -45,6 +45,7 @@ tikv-jemallocator = { workspace = true }
 tracing-subscriber = { workspace = true }
 io-uring = "0.7"
 melin-dpdk = { path = "../dpdk", optional = true }
+astenn = { git = "ssh://git@github.com/pierre-l/astenn.git" }
 
 [dev-dependencies]
 tempfile = "3"

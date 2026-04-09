@@ -28,7 +28,7 @@
 //! Core 3:   Response stage    (encodes to SPSC queues instead of kernel sockets)
 //! ```
 
-use std::collections::HashMap;
+use astenn::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};

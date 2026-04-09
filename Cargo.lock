@@ -1548,6 +1548,7 @@ version = "0.1.0"
 name = "melin-dpdk"
 version = "0.1.0"
 dependencies = [
+ "astenn",
  "bindgen",
  "cc",
  "libc",
@@ -1606,6 +1607,7 @@ dependencies = [
 name = "melin-server"
 version = "0.1.0"
 dependencies = [
+ "astenn",
  "base64 0.22.1",
  "blake3",
  "clap",
