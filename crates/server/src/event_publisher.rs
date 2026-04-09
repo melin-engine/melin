@@ -468,6 +468,127 @@ mod tests {
         assert_eq!(seq2, 7);
     }
 
+    /// Verify that sequential ring sequences produce monotonically increasing
+    /// sequence numbers in frames, allowing subscribers to detect gaps.
+    #[test]
+    fn monotonic_sequence_numbers_in_frames() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let mut client = TcpStream::connect(addr).unwrap();
+        let (server_stream, client_addr) = listener.accept().unwrap();
+        server_stream.set_nonblocking(true).unwrap();
+
+        let mut sub = Subscriber {
+            stream: server_stream,
+            addr: client_addr,
+        };
+
+        // Send 10 frames with consecutive ring sequences.
+        for seq in 0u64..10 {
+            let kind = payload_to_response(OutputPayload::BatchEnd);
+            let mut frame_buf = [0u8; MAX_FRAME_BUF];
+            frame_buf[..8].copy_from_slice(&seq.to_le_bytes());
+            let response_len = codec::encode_response(&kind, &mut frame_buf[8..]).unwrap();
+            sub.stream
+                .write_all(&frame_buf[..8 + response_len])
+                .unwrap();
+        }
+
+        // Client reads all 10 and verifies monotonic, gap-free sequences.
+        client
+            .set_read_timeout(Some(std::time::Duration::from_secs(1)))
+            .unwrap();
+        let mut buf = [0u8; 2048];
+        let mut total_read = 0;
+        while total_read < 10 * 13 {
+            // Each BatchEnd frame is ~13 bytes (8 seq + 5 response).
+            match io::Read::read(&mut client, &mut buf[total_read..]) {
+                Ok(n) if n > 0 => total_read += n,
+                _ => break,
+            }
+        }
+
+        // Parse sequences out of the received data. Each frame starts with
+        // a u64 LE sequence, then a 4-byte length-prefixed response.
+        let mut offset = 0;
+        let mut prev_seq: Option<u64> = None;
+        let mut count = 0;
+        while offset + 12 <= total_read {
+            let seq = u64::from_le_bytes(buf[offset..offset + 8].try_into().unwrap());
+            let len = u32::from_le_bytes(buf[offset + 8..offset + 12].try_into().unwrap()) as usize;
+            if offset + 12 + len > total_read {
+                break;
+            }
+            if let Some(prev) = prev_seq {
+                assert_eq!(
+                    seq,
+                    prev + 1,
+                    "sequence gap detected: prev={prev}, current={seq}"
+                );
+            }
+            prev_seq = Some(seq);
+            offset += 8 + 4 + len;
+            count += 1;
+        }
+        assert_eq!(count, 10, "expected 10 frames");
+    }
+
+    /// Verify that when one subscriber fails mid-batch, the other still
+    /// receives all frames (failed subscriber is removed, not fatal).
+    #[test]
+    fn failed_subscriber_does_not_affect_others() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let mut client1 = TcpStream::connect(addr).unwrap();
+        let (server1, addr1) = listener.accept().unwrap();
+        server1.set_nonblocking(true).unwrap();
+
+        let _client2 = TcpStream::connect(addr).unwrap();
+        let (server2, addr2) = listener.accept().unwrap();
+        server2.set_nonblocking(true).unwrap();
+
+        let mut subscribers = vec![
+            Subscriber {
+                stream: server1,
+                addr: addr1,
+            },
+            Subscriber {
+                stream: server2,
+                addr: addr2,
+            },
+        ];
+
+        // Drop client2 to cause writes to subscriber2 to fail.
+        drop(_client2);
+        // Give the OS a moment to process the close.
+        std::thread::sleep(std::time::Duration::from_millis(10));
+
+        // Write frames and use retain to remove failed subscribers.
+        let kind = payload_to_response(OutputPayload::BatchEnd);
+        let mut frame_buf = [0u8; MAX_FRAME_BUF];
+        frame_buf[..8].copy_from_slice(&0u64.to_le_bytes());
+        let response_len = codec::encode_response(&kind, &mut frame_buf[8..]).unwrap();
+        let frame = &frame_buf[..8 + response_len];
+
+        // Pump enough frames for the broken pipe to manifest.
+        for _ in 0..10 {
+            subscribers.retain_mut(|sub| sub.stream.write_all(frame).is_ok());
+        }
+
+        // Client1 should still be connected and receiving.
+        client1
+            .set_read_timeout(Some(std::time::Duration::from_secs(1)))
+            .unwrap();
+        let mut buf = [0u8; 256];
+        let n = io::Read::read(&mut client1, &mut buf).unwrap();
+        assert!(n > 0, "client1 should receive data");
+
+        // Subscriber2 should have been removed.
+        assert_eq!(subscribers.len(), 1, "failed subscriber should be removed");
+    }
+
     #[test]
     fn shutdown_stops_publisher() {
         use melin_protocol::auth::AuthorizedKeys;
