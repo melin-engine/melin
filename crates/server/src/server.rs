@@ -1443,6 +1443,15 @@ pub fn run_dpdk(
     let (mut exchange, writer) = engine.into_parts();
     exchange.prefault();
 
+    // Clone exchange state for the shadow snapshot stage before moving
+    // exchange into the pipeline (same as the kernel TCP path).
+    let enable_shadow = config.snapshot_interval_secs > 0;
+    let shadow_exchange = if enable_shadow {
+        Some(exchange.clone_via_snapshot())
+    } else {
+        None
+    };
+
     let active_connections = Arc::new(AtomicU64::new(0));
 
     // Replication setup (same as TCP path).
@@ -1484,8 +1493,8 @@ pub fn run_dpdk(
         replication_consumers,
         replication_cursor,
         replicas_connected,
-        _shadow_consumer,
-        _chain_hash_lock,
+        shadow_consumer,
+        chain_hash_lock,
         replication_ring_progress,
     ) = build_pipeline_with_replication(
         exchange,
@@ -1577,6 +1586,42 @@ pub fn run_dpdk(
             );
         })
         .map_err(|e| format!("spawn response thread: {e}"))?;
+
+    // Spawn shadow snapshot thread if enabled (same as kernel TCP path).
+    let busy_spin = !config.yield_idle;
+    let shadow_handle = if let Some(shadow_cons) = shadow_consumer {
+        let snap_path = config.shadow_snapshot_path();
+        let interval = std::time::Duration::from_secs(config.snapshot_interval_secs);
+        let chain_hash =
+            chain_hash_lock.ok_or("chain hash lock must be Some when shadow is enabled")?;
+        let shadow_ex =
+            shadow_exchange.ok_or("shadow exchange must be Some when shadow is enabled")?;
+        let s_shadow = Arc::clone(&shutdown);
+        let handle = std::thread::Builder::new()
+            .name("shadow".into())
+            .spawn(move || {
+                apply_affinity("shadow", cores.shadow);
+                crate::shadow::run(
+                    shadow_cons,
+                    shadow_ex,
+                    snap_path,
+                    interval,
+                    chain_hash,
+                    &s_shadow,
+                    busy_spin,
+                );
+            })
+            .map_err(|e| format!("spawn shadow thread: {e}"))?;
+
+        info!(
+            interval_secs = config.snapshot_interval_secs,
+            path = %config.shadow_snapshot_path().display(),
+            "shadow snapshot stage started"
+        );
+        Some(handle)
+    } else {
+        None
+    };
 
     // Spawn DPDK replication sender if enabled. Uses its own DPDK queue pair
     // and smoltcp stack so the replication channel goes through kernel bypass.
@@ -1874,7 +1919,7 @@ pub fn run_dpdk(
             response: response_handle,
             replication: replication_handle,
             event_publisher: None,
-            shadow: None,
+            shadow: shadow_handle,
             health: health_handle,
         },
         dpdk_extras,
