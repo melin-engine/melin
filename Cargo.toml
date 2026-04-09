@@ -35,4 +35,4 @@ opt-level = 2
 # Use fastcp fork of smoltcp with dispatch_burst() (multi-segment TCP
 # egress), batch ingress, and cached hardware address lookup.
 [patch.crates-io]
-smoltcp = { git = "ssh://git@github.com/pierre-l/fastcp.git", branch = "feat/zero-copy-rx" }
+smoltcp = { git = "ssh://git@github.com/pierre-l/fastcp.git" }
