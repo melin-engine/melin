@@ -8631,4 +8631,102 @@ mod tests {
             "market order on empty book must be rejected with NoLiquidity"
         );
     }
+
+    /// FOK buy that requires liquidity across multiple price levels:
+    /// enough total quantity exists but spread across 3 levels.
+    #[test]
+    fn fok_fills_across_multiple_price_levels() {
+        let mut exchange = Exchange::new();
+        let spec = btc_usd_spec();
+        exchange.add_instrument(spec);
+
+        exchange.deposit(ACCT_A, USD, 1_000_000);
+        exchange.deposit(ACCT_B, BTC, 100);
+
+        let mut reports = Vec::new();
+
+        // ACCT_B: asks at 3 levels: 5@100, 5@101, 5@102.
+        for (id, p) in [(1, 100), (2, 101), (3, 102)] {
+            exchange.execute(
+                spec.symbol,
+                limit_order(id, ACCT_B, Side::Sell, p, 5, TimeInForce::GTC),
+                &mut reports,
+            );
+        }
+        reports.clear();
+
+        // ACCT_A: FOK buy 12@102 — needs 5@100 + 5@101 + 2@102 = 12.
+        exchange.execute(
+            spec.symbol,
+            limit_order(1, ACCT_A, Side::Buy, 102, 12, TimeInForce::FOK),
+            &mut reports,
+        );
+
+        let fills: Vec<_> = reports
+            .iter()
+            .filter(|r| matches!(r, ExecutionReport::Fill { .. }))
+            .collect();
+        assert_eq!(fills.len(), 3, "FOK should fill across 3 price levels");
+
+        // No rejection or cancellation — fully filled.
+        assert!(
+            !reports.iter().any(|r| matches!(
+                r,
+                ExecutionReport::Rejected { .. } | ExecutionReport::Cancelled { .. }
+            )),
+            "FOK should not be rejected or cancelled"
+        );
+
+        // ACCT_A should own 12 BTC.
+        let bal = exchange.accounts().balance(ACCT_A, BTC);
+        assert_eq!(bal.available, 12);
+    }
+
+    /// FOK buy that has enough quantity at one level but not enough
+    /// across all levels within the limit price — must be rejected
+    /// without any fills.
+    #[test]
+    fn fok_rejected_insufficient_across_levels() {
+        let mut exchange = Exchange::new();
+        let spec = btc_usd_spec();
+        exchange.add_instrument(spec);
+
+        exchange.deposit(ACCT_A, USD, 1_000_000);
+        exchange.deposit(ACCT_B, BTC, 100);
+
+        let mut reports = Vec::new();
+
+        // ACCT_B: 5@100 + 5@101 = 10 total within limit 101.
+        exchange.execute(
+            spec.symbol,
+            limit_order(1, ACCT_B, Side::Sell, 100, 5, TimeInForce::GTC),
+            &mut reports,
+        );
+        exchange.execute(
+            spec.symbol,
+            limit_order(2, ACCT_B, Side::Sell, 101, 5, TimeInForce::GTC),
+            &mut reports,
+        );
+        reports.clear();
+
+        // FOK buy 15@101 — only 10 available, should reject entirely.
+        exchange.execute(
+            spec.symbol,
+            limit_order(1, ACCT_A, Side::Buy, 101, 15, TimeInForce::FOK),
+            &mut reports,
+        );
+
+        assert_eq!(reports.len(), 1);
+        assert!(matches!(
+            reports[0],
+            ExecutionReport::Rejected {
+                reason: RejectReason::FOKCannotFill,
+                ..
+            }
+        ));
+
+        // Resting orders untouched.
+        let bal = exchange.accounts().balance(ACCT_B, BTC);
+        assert_eq!(bal.reserved, 10, "resting asks should be untouched");
+    }
 }
