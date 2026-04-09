@@ -47,12 +47,17 @@ const LISTEN_PORT: u16 = 9876;
 /// and the queue exceeds this, the connection is dropped.
 const MAX_TX_QUEUE_SIZE: usize = 64 * 1024;
 
-/// smoltcp TCP socket buffer size per direction (RX and TX).
-/// 64 KiB matches MAX_TX_QUEUE_SIZE and provides enough TCP window
-/// for pipelined trading (256+ in-flight messages at ~100 bytes each).
-/// The previous 1 KiB caused smoltcp to advertise a tiny TCP window,
-/// forcing stop-and-wait at 1 KiB granularity.
-const SOCKET_BUF_SIZE: usize = 64 * 1024;
+/// smoltcp TCP RX buffer size. Determines the advertised receive window.
+/// 64 KiB provides enough window for pipelined trading (256+ in-flight
+/// messages at ~100 bytes each).
+const SOCKET_RX_BUF_SIZE: usize = 64 * 1024;
+
+/// smoltcp TCP TX buffer size. Controls how much response data queues
+/// per connection before dispatch_burst generates TCP segments. Smaller
+/// values reduce per-socket egress burst size, improving p99 latency
+/// with many connections (fewer segments serialized per egress pass).
+/// 16 KiB ≈ 11 segments at 1500 MTU vs 43 segments with 64 KiB.
+const SOCKET_TX_BUF_SIZE: usize = 16 * 1024;
 
 /// How often to refresh the smoltcp timestamp (in poll iterations).
 /// smoltcp only needs millisecond-precision timestamps for TCP timers
@@ -158,8 +163,6 @@ pub struct DpdkTransport {
     /// Total pending TX bytes across all connections. Avoids iterating
     /// tx_queues.values().any() on every poll cycle.
     pending_tx_bytes: usize,
-    /// Reusable handle buffer to avoid per-poll allocation.
-    handle_buf: Vec<SocketHandle>,
 }
 
 /// Per-connection TX queue with cursor to avoid drain() memmoves.
@@ -325,8 +328,8 @@ impl DpdkTransport {
         let mut sockets = SocketSet::new(Vec::with_capacity(MAX_CONNECTIONS));
 
         let listen_socket = {
-            let rx_buf = tcp::SocketBuffer::new(vec![0u8; SOCKET_BUF_SIZE]);
-            let tx_buf = tcp::SocketBuffer::new(vec![0u8; SOCKET_BUF_SIZE]);
+            let rx_buf = tcp::SocketBuffer::new(vec![0u8; SOCKET_RX_BUF_SIZE]);
+            let tx_buf = tcp::SocketBuffer::new(vec![0u8; SOCKET_TX_BUF_SIZE]);
             let mut socket = tcp::Socket::new(rx_buf, tx_buf);
             tune_socket(&mut socket);
             socket
@@ -356,7 +359,6 @@ impl DpdkTransport {
             cached_timestamp: now,
             poll_count: 0,
             pending_tx_bytes: 0,
-            handle_buf: Vec::with_capacity(MAX_CONNECTIONS),
         })
     }
 
@@ -388,8 +390,8 @@ impl DpdkTransport {
         remote_port: u16,
         local_port: u16,
     ) -> SocketHandle {
-        let rx_buf = tcp::SocketBuffer::new(vec![0u8; SOCKET_BUF_SIZE]);
-        let tx_buf = tcp::SocketBuffer::new(vec![0u8; SOCKET_BUF_SIZE]);
+        let rx_buf = tcp::SocketBuffer::new(vec![0u8; SOCKET_RX_BUF_SIZE]);
+        let tx_buf = tcp::SocketBuffer::new(vec![0u8; SOCKET_TX_BUF_SIZE]);
         let mut socket = tcp::Socket::new(rx_buf, tx_buf);
         tune_socket(&mut socket);
 
@@ -526,8 +528,8 @@ impl DpdkTransport {
             let accepted_handle = self.listen_handle;
 
             let new_listener = {
-                let rx_buf = tcp::SocketBuffer::new(vec![0u8; SOCKET_BUF_SIZE]);
-                let tx_buf = tcp::SocketBuffer::new(vec![0u8; SOCKET_BUF_SIZE]);
+                let rx_buf = tcp::SocketBuffer::new(vec![0u8; SOCKET_RX_BUF_SIZE]);
+                let tx_buf = tcp::SocketBuffer::new(vec![0u8; SOCKET_TX_BUF_SIZE]);
                 let mut socket = tcp::Socket::new(rx_buf, tx_buf);
                 tune_socket(&mut socket);
                 socket
@@ -547,21 +549,15 @@ impl DpdkTransport {
     }
 
     fn flush_tx_queues(&mut self) {
-        self.handle_buf.clear();
-        self.handle_buf.extend(self.tx_queues.keys().copied());
-
-        for handle in 0..self.handle_buf.len() {
-            let h = self.handle_buf[handle];
-            let queue = match self.tx_queues.get_mut(&h) {
-                Some(q) if q.queued_bytes() > 0 => q,
-                _ => continue,
-            };
-
-            let socket = self.sockets.get_mut::<tcp::Socket>(h);
+        // Split borrow: iterate tx_queues while mutating sockets.
+        for (&handle, queue) in self.tx_queues.iter_mut() {
+            if queue.queued_bytes() == 0 {
+                continue;
+            }
+            let socket = self.sockets.get_mut::<tcp::Socket>(handle);
             if !socket.can_send() {
                 continue;
             }
-
             let sent = socket.send_slice(queue.pending()).unwrap_or(0);
             if sent > 0 {
                 queue.advance(sent);
