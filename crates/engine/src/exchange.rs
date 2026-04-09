@@ -8729,4 +8729,57 @@ mod tests {
         let bal = exchange.accounts().balance(ACCT_B, BTC);
         assert_eq!(bal.reserved, 10, "resting asks should be untouched");
     }
+
+    /// Operators can withdraw collected fees from the FEE_ACCOUNT.
+    #[test]
+    fn fee_account_withdrawal() {
+        use crate::account::FEE_ACCOUNT;
+
+        let mut exchange = Exchange::new();
+        exchange.add_instrument(btc_usd_spec());
+        exchange.deposit(ACCT_A, USD, 100_000);
+        exchange.deposit(ACCT_B, BTC, 100);
+
+        exchange.set_fee_schedule(
+            Symbol(1),
+            FeeSchedule {
+                maker_fee_bps: 10,
+                taker_fee_bps: 20,
+            },
+        );
+
+        let mut reports = Vec::new();
+
+        // Create a fill to generate fees.
+        exchange.execute(
+            Symbol(1),
+            limit_order(1, ACCT_B, Side::Sell, 100, 10, TimeInForce::GTC),
+            &mut reports,
+        );
+        exchange.execute(
+            Symbol(1),
+            limit_order(1, ACCT_A, Side::Buy, 100, 10, TimeInForce::GTC),
+            &mut reports,
+        );
+
+        // cost=1000, maker_fee=1, taker_fee=2 → FEE_ACCOUNT has 3 USD.
+        let fee_bal = exchange.accounts().balance(FEE_ACCOUNT, USD);
+        assert_eq!(fee_bal.available, 3);
+
+        // Withdraw 2 of the 3.
+        let result = exchange.withdraw(FEE_ACCOUNT, USD, 2);
+        assert!(result.is_ok(), "fee account withdrawal should succeed");
+        let fee_bal = exchange.accounts().balance(FEE_ACCOUNT, USD);
+        assert_eq!(fee_bal.available, 1);
+
+        // Withdraw the remaining 1.
+        let result = exchange.withdraw(FEE_ACCOUNT, USD, 1);
+        assert!(result.is_ok());
+        let fee_bal = exchange.accounts().balance(FEE_ACCOUNT, USD);
+        assert_eq!(fee_bal.available, 0);
+
+        // Over-withdraw fails.
+        let result = exchange.withdraw(FEE_ACCOUNT, USD, 1);
+        assert!(result.is_err(), "over-withdrawing fee account should fail");
+    }
 }
