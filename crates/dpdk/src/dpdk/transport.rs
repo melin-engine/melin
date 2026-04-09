@@ -632,6 +632,49 @@ impl DpdkTransport {
         }
     }
 
+    /// Send a gratuitous ARP out the NIC so the switch learns our MAC.
+    ///
+    /// SR-IOV VFs can't receive broadcast ARP (promiscuous mode unsupported),
+    /// so remote hosts' ARP requests go unanswered and the switch never learns
+    /// the VF's MAC from an ARP reply. A gratuitous ARP (ARP request where
+    /// sender and target IP are both ours) is broadcast by definition, and
+    /// when the switch sees it *sourced* from our MAC, it installs a forwarding
+    /// entry. After this, unicast frames destined to our MAC reach the VF.
+    ///
+    /// Call once after transport initialization.
+    pub fn send_gratuitous_arp(&mut self) {
+        let our_mac = self._shared.mac;
+        let our_ip = self.iface.ipv4_addr().expect("interface has IPv4 address");
+
+        // Gratuitous ARP: Ethernet broadcast + ARP request where
+        // sender_ip == target_ip (RFC 5227).
+        let mut frame = [0u8; 42]; // 14 (eth) + 28 (ARP) = 42 bytes
+
+        // Ethernet header: broadcast destination.
+        frame[0..6].copy_from_slice(&[0xff, 0xff, 0xff, 0xff, 0xff, 0xff]);
+        frame[6..12].copy_from_slice(&our_mac);
+        frame[12..14].copy_from_slice(&[0x08, 0x06]); // EtherType: ARP
+
+        // ARP payload.
+        frame[14..16].copy_from_slice(&[0x00, 0x01]); // hardware type: Ethernet
+        frame[16..18].copy_from_slice(&[0x08, 0x00]); // protocol type: IPv4
+        frame[18] = 6; // hardware addr len
+        frame[19] = 4; // protocol addr len
+        frame[20..22].copy_from_slice(&[0x00, 0x01]); // operation: request
+        frame[22..28].copy_from_slice(&our_mac); // sender hardware addr
+        frame[28..32].copy_from_slice(&our_ip.octets()); // sender protocol addr
+        frame[32..38].copy_from_slice(&[0x00; 6]); // target hardware addr (zero)
+        frame[38..42].copy_from_slice(&our_ip.octets()); // target protocol addr (= sender)
+
+        self.device.send_raw_frame(&frame);
+
+        tracing::info!(
+            mac = ?our_mac,
+            ip = %our_ip,
+            "sent gratuitous ARP (switch MAC learning)"
+        );
+    }
+
     /// Seed smoltcp's neighbor cache by injecting a crafted ARP reply.
     ///
     /// SR-IOV VFs on Intel X710 (and similar NICs) can't receive broadcast

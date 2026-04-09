@@ -647,11 +647,14 @@ load_dpdk_config() {
         dpdk_prefix=$(echo "$conf" | grep "^DPDK_PREFIX=" | cut -d= -f2 || true)
         mode=$(echo "$conf" | grep "^DPDK_MODE=" | cut -d= -f2 || true)
         eal_args=$(echo "$conf" | grep "^DPDK_EAL_ARGS=" | cut -d= -f2- || true)
+        local vlan_id
+        vlan_id=$(echo "$conf" | grep "^VLAN_ID=" | cut -d= -f2 || true)
         eval "${prefix}_DPDK_IP=${ip:-}"
         eval "${prefix}_DPDK_PORT=${port:-0}"
         eval "${prefix}_DPDK_PREFIX=${dpdk_prefix:-24}"
         eval "${prefix}_DPDK_MODE=${mode:-sriov}"
         eval "${prefix}_DPDK_EAL_ARGS='${eal_args:-}'"
+        eval "${prefix}_DPDK_VLAN=${vlan_id:-}"
     fi
 }
 
@@ -693,16 +696,31 @@ dpdk_sriov_setup() {
         # Re-read configs after setup wrote them (VLAN_ID, DPDK_MODE, etc.).
         load_dpdk_config "$SERVER" "SERVER"
         SERVER_DPDK_IP="${SERVER_DPDK_IP:-${SERVER_VLAN}}"
-        SERVER_DPDK_PORT="${SERVER_DPDK_PORT:-0}"
         SERVER_DPDK_PREFIX="${SERVER_DPDK_PREFIX:-24}"
         DPDK_MODE="${SERVER_DPDK_MODE:-sriov}"
         load_dpdk_config "$BENCH" "BENCH"
         DPDK_SERVER_BIN="${REPO_DIR}/target/release/melin-server"
+        # Auto-detect VF count for LACP bonds: use both ports so traffic
+        # arriving on either bond member's VF is received.
+        local vf_count
+        vf_count=$(ssh $SSH_OPTS "$SERVER" "ls -d /sys/bus/pci/drivers/vfio-pci/0000:* 2>/dev/null | wc -l" || echo 0)
+        if [[ "$vf_count" -ge 2 ]]; then
+            SERVER_DPDK_PORT="0,1"
+        else
+            SERVER_DPDK_PORT="${SERVER_DPDK_PORT:-0}"
+        fi
         echo "  Server DPDK: IP=${SERVER_DPDK_IP}, port=${SERVER_DPDK_PORT}, mode=${DPDK_MODE}"
         echo ""
     fi
 
-    BENCH_DPDK_PORT="${BENCH_DPDK_PORT:-0}"
+    # Auto-detect VF count on bench for LACP bonds.
+    local bench_vf_count
+    bench_vf_count=$(ssh $SSH_OPTS "$BENCH" "ls -d /sys/bus/pci/drivers/vfio-pci/0000:* 2>/dev/null | wc -l" || echo 0)
+    if [[ "$bench_vf_count" -ge 2 ]]; then
+        BENCH_DPDK_PORT="0,1"
+    else
+        BENCH_DPDK_PORT="${BENCH_DPDK_PORT:-0}"
+    fi
     BENCH_DPDK_PREFIX="${BENCH_DPDK_PREFIX:-24}"
     DPDK_SRIOV_DONE=1
 }
@@ -750,6 +768,11 @@ transport_start_dpdk() {
         server_eal="--huge-dir=${HUGE_DIR}"
     fi
 
+    local vlan_arg=""
+    if [[ -n "${SERVER_DPDK_VLAN:-}" ]]; then
+        vlan_arg="--dpdk-vlan ${SERVER_DPDK_VLAN}"
+    fi
+
     ssh $SSH_OPTS "$SERVER" "pkill -x melin-server 2>/dev/null; pkill -x melin-server.dpdk 2>/dev/null; true"
     sleep 1
     ssh $SSH_OPTS "$SERVER" "NO_COLOR=1 RUST_LOG=info nohup ${DPDK_SERVER_BIN} \
@@ -761,6 +784,7 @@ transport_start_dpdk() {
             --dpdk-ip ${SERVER_DPDK_IP} \
             --dpdk-prefix-len ${SERVER_DPDK_PREFIX} \
             --dpdk-ports ${SERVER_DPDK_PORT} \
+            ${vlan_arg} \
         >/tmp/melin-server.log 2>&1 </dev/null &" </dev/null
 
     wait_for_log "$SERVER" "/tmp/melin-server.log" "listening" 120 "DPDK server"
@@ -776,7 +800,11 @@ transport_start_dpdk() {
         if [[ -n "${BENCH_DPDK_EAL_ARGS:-}" ]]; then
             bench_eal="${BENCH_DPDK_EAL_ARGS} ${bench_eal}"
         fi
-        BENCH_DPDK_ARGS="--dpdk-eal-args='${bench_eal}' --dpdk-ports ${BENCH_DPDK_PORT} --dpdk-core ${BENCH_DPDK_CORE}"
+        local bench_vlan_arg=""
+        if [[ -n "${BENCH_DPDK_VLAN:-}" ]]; then
+            bench_vlan_arg="--dpdk-vlan ${BENCH_DPDK_VLAN}"
+        fi
+        BENCH_DPDK_ARGS="--dpdk-eal-args='${bench_eal}' --dpdk-ports ${BENCH_DPDK_PORT} --dpdk-core ${BENCH_DPDK_CORE} ${bench_vlan_arg}"
         if [[ -n "${BENCH_DPDK_IP:-}" ]]; then
             BENCH_DPDK_ARGS="${BENCH_DPDK_ARGS} --dpdk-ip ${BENCH_DPDK_IP} --dpdk-prefix-len ${BENCH_DPDK_PREFIX}"
         fi
@@ -804,8 +832,14 @@ transport_start_dpdk_repl() {
 
     load_dpdk_config "$REPLICA" "REPLICA"
     REPLICA_DPDK_IP="${REPLICA_DPDK_IP:-${REPLICA_VLAN}}"
-    REPLICA_DPDK_PORT="${REPLICA_DPDK_PORT:-0}"
     REPLICA_DPDK_PREFIX="${REPLICA_DPDK_PREFIX:-24}"
+    local replica_vf_count
+    replica_vf_count=$(ssh $SSH_OPTS "$REPLICA" "ls -d /sys/bus/pci/drivers/vfio-pci/0000:* 2>/dev/null | wc -l" || echo 0)
+    if [[ "$replica_vf_count" -ge 2 ]]; then
+        REPLICA_DPDK_PORT="0,1"
+    else
+        REPLICA_DPDK_PORT="${REPLICA_DPDK_PORT:-0}"
+    fi
 
     local server_eal replica_eal
     if [[ "$DPDK_MODE" == "tap" ]]; then

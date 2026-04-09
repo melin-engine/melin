@@ -317,6 +317,31 @@ impl DpdkDevice {
         tracing::info!(vlan_id, "DPDK TX VLAN insert enabled");
     }
 
+    /// Send a raw Ethernet frame out the NIC, bypassing smoltcp.
+    ///
+    /// Used for gratuitous ARP on startup (switch MAC learning) and other
+    /// control frames that aren't part of a TCP connection.
+    pub fn send_raw_frame(&mut self, frame: &[u8]) {
+        let mbuf = unsafe { ffi::dpdk_pktmbuf_alloc(self.mempool) };
+        assert!(!mbuf.is_null(), "mbuf alloc failed for raw frame TX");
+        unsafe {
+            let buf_addr = ffi::dpdk_mbuf_buf_addr(mbuf).cast::<u8>();
+            let data_off = ffi::dpdk_mbuf_data_off(mbuf) as usize;
+            let data_ptr = buf_addr.add(data_off);
+            std::ptr::copy_nonoverlapping(frame.as_ptr(), data_ptr, frame.len());
+            ffi::dpdk_mbuf_set_data_len(mbuf, frame.len() as u16);
+            ffi::dpdk_mbuf_set_pkt_len(mbuf, frame.len() as u32);
+
+            // Set VLAN tag if configured.
+            if self.tx_vlan_id != 0 {
+                ffi::dpdk_mbuf_set_ol_flags(mbuf, ffi::dpdk_tx_vlan_flag());
+                ffi::dpdk_mbuf_set_vlan_tci(mbuf, self.tx_vlan_id);
+            }
+        }
+        self.tx_batch.push(mbuf);
+        self.flush_tx();
+    }
+
     /// Inject a raw Ethernet frame into smoltcp's RX path.
     /// Used to seed the neighbor cache with crafted ARP replies on SR-IOV
     /// VFs that can't receive broadcast ARP.

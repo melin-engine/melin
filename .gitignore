@@ -6,6 +6,9 @@ authorized_keys
 *.key
 *.pub
 
+# QEMU VM images for DPDK virtio testing.
+scripts/dpdk/.cache/
+
 # Bench plots — only README-referenced PNGs are versioned.
 # Everything else can be regenerated via melin-plot.
 docs/plots/*.svg

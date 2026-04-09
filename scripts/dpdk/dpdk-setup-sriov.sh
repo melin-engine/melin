@@ -217,6 +217,25 @@ fi
 # 3. Create VFs on both bond member ports
 # ---------------------------------------------------------------------------
 
+# Skip setup entirely if VFs are already bound to vfio-pci (idempotent).
+# After a previous DPDK run, VFs stay bound to vfio-pci and the ixgbe
+# VF driver reload would hang trying to unbind from vfio-pci.
+VF0_PCI_CHECK=$(readlink -f "/sys/bus/pci/devices/${PF0_PCI}/virtfn0" 2>/dev/null | xargs basename 2>/dev/null || true)
+if [[ -n "$VF0_PCI_CHECK" && -e "/sys/bus/pci/drivers/vfio-pci/${VF0_PCI_CHECK}" ]]; then
+    echo ""
+    echo "  VFs already bound to vfio-pci, skipping setup"
+    echo ""
+    echo "=== Setup complete ($NIC_NAME / $PF_DRIVER) ==="
+    echo ""
+    echo "  Bond: untouched (LACP active)"
+    ACTUAL=$(cat /sys/kernel/mm/hugepages/hugepages-2048kB/nr_hugepages)
+    echo "  Hugepages: ${ACTUAL} x 2MB"
+    echo ""
+    echo "  Start the server with:"
+    echo "    sudo ./scripts/dpdk/dpdk-server.sh"
+    exit 0
+fi
+
 echo ""
 echo "--- Creating SR-IOV VFs ---"
 

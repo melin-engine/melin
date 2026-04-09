@@ -1360,12 +1360,13 @@ pub fn run_dpdk(
         // Use queue 0 for the replication receiver's smoltcp connection.
         // Listen port is unused (receiver connects outbound, doesn't listen),
         // but DpdkTransport requires one — use an ephemeral port.
-        let repl_transport = melin_dpdk::DpdkTransport::from_shared_with_port(
+        let mut repl_transport = melin_dpdk::DpdkTransport::from_shared_with_port(
             &shared,
             &dpdk_config,
             0,
             39999, // Ephemeral — receiver connects outbound, doesn't accept.
         )?;
+        repl_transport.send_gratuitous_arp();
 
         let primary_ipv4 = match primary_addr.ip() {
             std::net::IpAddr::V4(ip) => ip,
@@ -1417,11 +1418,16 @@ pub fn run_dpdk(
     };
     let mut transports = Vec::with_capacity(num_client_queues);
     for q in 0..num_client_queues {
-        transports.push(melin_dpdk::DpdkTransport::from_shared(
-            &shared,
-            &dpdk_config,
-            q as u16,
-        )?);
+        let mut transport =
+            melin_dpdk::DpdkTransport::from_shared(&shared, &dpdk_config, q as u16)?;
+        // Send a gratuitous ARP from the first queue so the switch learns
+        // our VF's MAC address. Without this, SR-IOV VFs that can't enable
+        // promiscuous mode are unreachable — the switch has no forwarding
+        // entry and drops unicast frames to our MAC.
+        if q == 0 {
+            transport.send_gratuitous_arp();
+        }
+        transports.push(transport);
     }
 
     // Load authorized keys for challenge-response authentication.
