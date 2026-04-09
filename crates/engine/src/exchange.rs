@@ -8877,4 +8877,140 @@ mod tests {
         let fee_bal = exchange.accounts().balance(FEE_ACCOUNT, USD);
         assert_eq!(fee_bal.available, 180, "aggregated fee account");
     }
+
+    /// Post-only buy that would cross a resting sell from the SAME account
+    /// is rejected as PostOnlyWouldTake (post-only checked before STP).
+    #[test]
+    fn post_only_rejected_before_stp_evaluated() {
+        let mut exchange = Exchange::new();
+        let spec = btc_usd_spec();
+        exchange.add_instrument(spec);
+
+        exchange.deposit(ACCT_A, USD, 100_000);
+        exchange.deposit(ACCT_A, BTC, 100);
+
+        let mut reports = Vec::new();
+
+        // ACCT_A: resting sell @ 500.
+        exchange.execute(
+            spec.symbol,
+            limit_order(1, ACCT_A, Side::Sell, 500, 10, TimeInForce::GTC),
+            &mut reports,
+        );
+        reports.clear();
+
+        // ACCT_A: post-only buy @ 500 with CancelNewest STP.
+        // Would cross own sell → post-only rejects before STP fires.
+        exchange.execute(
+            spec.symbol,
+            Order {
+                id: OrderId(2),
+                account: ACCT_A,
+                side: Side::Buy,
+                order_type: OrderType::Limit {
+                    price: price(500),
+                    post_only: true,
+                },
+                time_in_force: TimeInForce::GTC,
+                quantity: qty(5),
+                stp: SelfTradeProtection::CancelNewest,
+                expiry_ns: 0,
+            },
+            &mut reports,
+        );
+
+        assert_eq!(reports.len(), 1);
+        assert!(
+            matches!(
+                reports[0],
+                ExecutionReport::Rejected {
+                    order_id: OrderId(2),
+                    reason: RejectReason::PostOnlyWouldCross,
+                    ..
+                }
+            ),
+            "post-only should reject before STP is evaluated: {:?}",
+            reports[0]
+        );
+
+        // Original sell should be untouched.
+        let bal = exchange.accounts().balance(ACCT_A, BTC);
+        assert_eq!(bal.reserved, 10);
+    }
+
+    /// Post-only buy that does NOT cross (different account's sell is above),
+    /// rests, and then is filled as a maker when a sell arrives.
+    /// Verifies post-only orders with STP work correctly as makers.
+    #[test]
+    fn post_only_with_stp_rests_and_fills_as_maker() {
+        let mut exchange = Exchange::new();
+        let spec = btc_usd_spec();
+        exchange.add_instrument(spec);
+
+        exchange.deposit(ACCT_A, USD, 100_000);
+        exchange.deposit(ACCT_A, BTC, 100);
+        exchange.deposit(ACCT_B, BTC, 100);
+
+        let mut reports = Vec::new();
+
+        // ACCT_A: post-only buy @ 400, CancelOldest STP.
+        exchange.execute(
+            spec.symbol,
+            Order {
+                id: OrderId(1),
+                account: ACCT_A,
+                side: Side::Buy,
+                order_type: OrderType::Limit {
+                    price: price(400),
+                    post_only: true,
+                },
+                time_in_force: TimeInForce::GTC,
+                quantity: qty(10),
+                stp: SelfTradeProtection::CancelOldest,
+                expiry_ns: 0,
+            },
+            &mut reports,
+        );
+        assert!(matches!(reports[0], ExecutionReport::Placed { .. }));
+        reports.clear();
+
+        // ACCT_A: sell @ 400 (same account) → STP CancelOldest cancels
+        // the resting post-only buy, taker continues.
+        exchange.execute(
+            spec.symbol,
+            Order {
+                id: OrderId(2),
+                account: ACCT_A,
+                side: Side::Sell,
+                order_type: OrderType::Limit {
+                    price: price(400),
+                    post_only: false,
+                },
+                time_in_force: TimeInForce::GTC,
+                quantity: qty(5),
+                stp: SelfTradeProtection::CancelOldest,
+                expiry_ns: 0,
+            },
+            &mut reports,
+        );
+
+        // STP CancelOldest should cancel the resting buy and the sell rests.
+        assert!(
+            reports.iter().any(|r| matches!(
+                r,
+                ExecutionReport::Cancelled {
+                    order_id: OrderId(1),
+                    ..
+                }
+            )),
+            "STP CancelOldest should cancel the resting post-only buy"
+        );
+        // No fill should occur.
+        assert!(
+            !reports
+                .iter()
+                .any(|r| matches!(r, ExecutionReport::Fill { .. })),
+            "no fill should occur due to STP"
+        );
+    }
 }
