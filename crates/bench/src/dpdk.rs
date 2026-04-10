@@ -51,8 +51,10 @@ struct DpdkBenchConn {
     send_cursor: usize,
     /// Pending send bytes (partial frame that didn't fit in smoltcp TX buffer).
     send_pending: Vec<u8>,
-    /// FIFO of send timestamps for in-flight orders.
-    inflight_ts: VecDeque<Instant>,
+    /// FIFO of send timestamps (TSC ticks) for in-flight orders.
+    /// `u64` instead of `Instant` to avoid ~15-25ns vDSO overhead per
+    /// timestamp on the hot path.
+    inflight_ts: VecDeque<u64>,
     /// Number of BatchEnd responses received (including warmup).
     batch_count: usize,
     /// Total orders this connection must process.
@@ -356,6 +358,7 @@ pub fn run_dpdk_roundtrip(
 
     let health_poller = health_addr.map(crate::health_poller::HealthPoller::start);
 
+    let ticks_per_ns = crate::calibrate_tsc();
     let start = Instant::now();
     let mut measured_start: Option<Instant> = None;
 
@@ -435,7 +438,7 @@ pub fn run_dpdk_roundtrip(
                     Ok(_) => break,
                     Err(_) => break,
                 }
-                conn.inflight_ts.push_back(Instant::now());
+                conn.inflight_ts.push_back(crate::rdtscp());
                 conn.send_cursor += 1;
             }
 
@@ -475,8 +478,9 @@ pub fn run_dpdk_roundtrip(
                         if measured_start.is_none() {
                             measured_start = Some(Instant::now());
                         }
-                        if let Some(send_ts) = conn.inflight_ts.pop_front() {
-                            let latency_ns = send_ts.elapsed().as_nanos() as u64;
+                        if let Some(sent_tsc) = conn.inflight_ts.pop_front() {
+                            let latency_ns =
+                                crate::tsc_to_ns(crate::rdtscp() - sent_tsc, ticks_per_ns);
                             histogram.record(latency_ns).ok();
                             interval_hist.record(latency_ns).ok();
                             interval_count += 1;

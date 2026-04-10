@@ -101,7 +101,7 @@ const MAX_FRAME_SIZE: usize = 1024;
 /// being measured.
 #[cfg(target_arch = "x86_64")]
 #[inline(always)]
-fn rdtscp() -> u64 {
+pub(crate) fn rdtscp() -> u64 {
     unsafe {
         let mut _aux: u32 = 0;
         core::arch::x86_64::__rdtscp(&mut _aux)
@@ -114,7 +114,7 @@ fn rdtscp() -> u64 {
 /// relative to the work being measured.
 #[cfg(target_arch = "aarch64")]
 #[inline(always)]
-fn rdtscp() -> u64 {
+pub(crate) fn rdtscp() -> u64 {
     let cnt: u64;
     unsafe {
         core::arch::asm!(
@@ -130,7 +130,7 @@ fn rdtscp() -> u64 {
 /// Calibrate TSC/counter ticks per nanosecond by measuring a short sleep
 /// against `Instant::now()`. Returns the conversion factor (ticks / ns).
 #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
-fn calibrate_tsc() -> f64 {
+pub(crate) fn calibrate_tsc() -> f64 {
     // Warm up the counter path.
     for _ in 0..100 {
         let _ = rdtscp();
@@ -149,7 +149,7 @@ fn calibrate_tsc() -> f64 {
 /// Convert counter tick delta to nanoseconds using a pre-calibrated factor.
 #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 #[inline(always)]
-fn tsc_to_ns(ticks: u64, ticks_per_ns: f64) -> u64 {
+pub(crate) fn tsc_to_ns(ticks: u64, ticks_per_ns: f64) -> u64 {
     (ticks as f64 / ticks_per_ns) as u64
 }
 
@@ -1498,7 +1498,9 @@ struct UringBenchConn {
     // Pipelining state
     frames: Vec<Vec<u8>>,
     send_cursor: usize,
-    inflight_ts: VecDeque<Instant>,
+    /// TSC tick at send time. `u64` instead of `Instant` to avoid
+    /// ~15-25ns vDSO overhead per timestamp on the hot path.
+    inflight_ts: VecDeque<u64>,
     batch_count: usize,
     total_orders: usize,
     done: bool,
@@ -1518,6 +1520,7 @@ fn run_uring_loop(
 ) -> (Histogram<u64>, TimeSeries, Option<Instant>) {
     use io_uring::{IoUring, opcode, types};
 
+    let ticks_per_ns = calibrate_tsc();
     let n = connections.len();
     // 4096 entries: supports up to 1024 connections per thread (RECV +
     // SEND per connection, plus headroom for partial-send resubmissions).
@@ -1619,10 +1622,10 @@ fn run_uring_loop(
                     cursor += 4 + frame_len;
 
                     if matches!(response, ResponseKind::BatchEnd) {
-                        let sent_at = conn.inflight_ts.pop_front().expect(
+                        let sent_tsc = conn.inflight_ts.pop_front().expect(
                             "inflight timestamp desync: got BatchEnd without matching send",
                         );
-                        let latency_ns = sent_at.elapsed().as_nanos() as u64;
+                        let latency_ns = tsc_to_ns(rdtscp() - sent_tsc, ticks_per_ns);
                         if conn.batch_count >= warmup {
                             if measured_start.is_none() {
                                 measured_start = Some(Instant::now());
@@ -1695,13 +1698,12 @@ fn uring_fill_windows(
 
         // Fill the send buffer with as many frames as the window allows.
         while conn.inflight_ts.len() < window && conn.send_cursor < conn.total_orders {
-            let ts = Instant::now();
             let frame = &conn.frames[conn.send_cursor];
             // Write the length-prefixed wire frame into the send buffer.
             let len = frame.len() as u32;
             conn.send_buf.extend_from_slice(&len.to_le_bytes());
             conn.send_buf.extend_from_slice(frame);
-            conn.inflight_ts.push_back(ts);
+            conn.inflight_ts.push_back(rdtscp());
             conn.send_cursor += 1;
         }
 
