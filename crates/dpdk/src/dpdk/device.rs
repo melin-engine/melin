@@ -148,8 +148,10 @@ impl DpdkDevice {
         }
     }
 
-    /// Flush all pending TX mbufs in a single `tx_burst(N)` call.
-    /// Call after each `iface.poll()` cycle to batch outgoing packets.
+    /// Flush pending TX mbufs via `tx_burst`. Unsent mbufs are retained
+    /// for retry on the next flush rather than freed — freeing them causes
+    /// silent TCP data loss that triggers smoltcp's retransmit timer (1ms+),
+    /// which dominates tail latency.
     pub fn flush_tx(&mut self) {
         if self.tx_batch.is_empty() {
             return;
@@ -163,16 +165,12 @@ impl DpdkDevice {
                 count as u16,
             )
         } as usize;
-        // Free any unsent mbufs (TX queue full).
-        for mbuf in &self.tx_batch[sent..] {
-            unsafe {
-                ffi::dpdk_pktmbuf_free(*mbuf);
-            }
+        if sent == count {
+            self.tx_batch.clear();
+        } else {
+            // Keep unsent mbufs for retry — shift them to the front.
+            self.tx_batch.drain(..sent);
         }
-        if sent < count {
-            tracing::debug!(sent, total = count, "TX burst partial — queue full");
-        }
-        self.tx_batch.clear();
     }
 
     /// Poll all ports for received packets.
