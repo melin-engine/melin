@@ -18,6 +18,7 @@ smoltcp = { version = "0.13", default-features = false, features = [
     "medium-ethernet",
     "proto-ipv4",
     "socket-tcp",
+    "socket-tcp-zero-copy-rx",
     "log",
 ] }
 tracing = "0.1"

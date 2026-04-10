@@ -85,6 +85,7 @@ fn generate_bindings() {
                                        struct rte_mbuf **tx_pkts, uint16_t nb_pkts);\n\
             struct rte_mbuf *dpdk_pktmbuf_alloc(struct rte_mempool *mp);\n\
             void dpdk_pktmbuf_free(struct rte_mbuf *m);\n\
+            void dpdk_mbuf_refcnt_update(struct rte_mbuf *m, int16_t value);\n\
             void dpdk_mempool_free(struct rte_mempool *mp);\n\
             uint16_t dpdk_mbuf_default_buf_size(void);\n\
             uint16_t dpdk_mbuf_data_off(const struct rte_mbuf *m);\n\
@@ -133,6 +134,7 @@ fn generate_bindings() {
         .allowlist_function("dpdk_eth_tx_burst")
         .allowlist_function("dpdk_pktmbuf_alloc")
         .allowlist_function("dpdk_pktmbuf_free")
+        .allowlist_function("dpdk_mbuf_refcnt_update")
         .allowlist_function("dpdk_mempool_free")
         .allowlist_function("dpdk_mbuf_default_buf_size")
         .allowlist_function("dpdk_mbuf_data_off")

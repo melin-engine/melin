@@ -679,9 +679,39 @@ impl RxBatch {
         }
         i
     }
-}
 
-impl RxBatch {
+    /// Write (slice, handle) pairs for zero-copy ingress. Injected frames
+    /// get a zeroed handle (they aren't mbufs and go through the regular path).
+    pub fn write_slices_with_handles<'a, F>(
+        &'a self,
+        out: &mut [std::mem::MaybeUninit<(&'a [u8], smoltcp::socket::tcp::OpaqueFrameHandle)>],
+        mbuf_to_handle: F,
+    ) -> usize
+    where
+        F: Fn(*mut ffi::rte_mbuf) -> smoltcp::socket::tcp::OpaqueFrameHandle,
+    {
+        let mut i = 0;
+        // Injected frames (ARP) get a zeroed handle — they go through
+        // the regular ingress path, not zero-copy TCP.
+        let zero_handle = smoltcp::socket::tcp::OpaqueFrameHandle::from_bytes([0; 16]);
+        for frame in &self.injected {
+            out[i] = std::mem::MaybeUninit::new((frame.as_slice(), zero_handle));
+            i += 1;
+        }
+        for &mbuf in &self.mbufs {
+            let data = unsafe {
+                let buf_addr = ffi::dpdk_mbuf_buf_addr(mbuf).cast::<u8>();
+                let data_off = ffi::dpdk_mbuf_data_off(mbuf) as usize;
+                let ptr = buf_addr.add(data_off);
+                let len = ffi::dpdk_mbuf_data_len(mbuf) as usize;
+                std::slice::from_raw_parts(ptr, len)
+            };
+            out[i] = std::mem::MaybeUninit::new((data, mbuf_to_handle(mbuf)));
+            i += 1;
+        }
+        i
+    }
+
     /// Free mbufs and return the reusable Vec buffers to the device.
     /// Must be called instead of dropping to avoid per-poll allocation.
     pub fn recycle(mut self, device: &mut DpdkDevice) {

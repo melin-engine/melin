@@ -28,6 +28,10 @@ void dpdk_pktmbuf_free(struct rte_mbuf *m) {
     rte_pktmbuf_free(m);
 }
 
+void dpdk_mbuf_refcnt_update(struct rte_mbuf *m, int16_t value) {
+    rte_mbuf_refcnt_update(m, value);
+}
+
 void dpdk_mempool_free(struct rte_mempool *mp) {
     rte_mempool_free(mp);
 }
