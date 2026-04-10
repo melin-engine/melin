@@ -46,6 +46,7 @@ Features targeting regulated venues, gateway responsibilities, or with limited n
 | Subscription management | Gateway concern — the engine broadcasts, the gateway filters per-subscriber. |
 | Iceberg orders | Niche — only matters for venues with institutional flow. |
 | Auction mechanisms | Regulated venues only. Massive complexity (state machine, indicative pricing, uncrossing). |
+| Replication chain hash verification | The wire protocol carries chain hashes in handshakes, heartbeats, and data batches, but the replica never verifies them against its local journal state. The primary unconditionally sends `StreamStart` without checking the replica's reported hash. Implementing verification would detect silent replica divergence (bit-rot, misrouted journal files) and trigger automatic snapshot re-sync. Deferred because validating a hash at an arbitrary historical sequence requires either a sequence→hash index or a journal re-scan. |
 | Failover detection + promotion | Leader election, split-brain prevention. Distributed systems hard mode — manual promotion covers the MVP. |
 | Network partition handling | Fencing, quorum-based decisions. Same as above — extremely complex. |
 | Chain replication | Chain replication (primary → replica A → replica B) reduces primary fan-out. Dual parallel replication (up to 2 replicas) is implemented; chain topology is deferred. |
