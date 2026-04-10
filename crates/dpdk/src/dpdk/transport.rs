@@ -34,7 +34,7 @@ use crate::port::{ChecksumOffloads, Port};
 fn tune_socket(socket: &mut tcp::Socket<'_>) {
     socket.set_nagle_enabled(false);
     socket.set_ack_delay(None);
-    socket.set_min_rto(smoltcp::time::Duration::from_millis(10));
+    socket.set_min_rto(smoltcp::time::Duration::from_millis(1));
     socket.set_initial_rto(smoltcp::time::Duration::from_millis(50));
     socket.set_initial_congestion_window(64 * 1024);
 }
