@@ -29,6 +29,7 @@ use std::time::Duration;
 
 use melin_disruptor::padding::Sequence;
 use melin_disruptor::ring::QueueCursor;
+use melin_engine::journal::pipeline::StageUtilization;
 use tracing::{debug, error, info};
 
 /// Input disruptor capacity. Duplicated here to avoid depending on the engine
@@ -48,6 +49,10 @@ struct HealthState {
     replicas_connected: Option<Arc<AtomicU32>>,
     /// Per-replica replication metrics. None in standalone mode.
     replication_metrics: Option<Arc<crate::replication::ReplicationMetrics>>,
+    /// Per-stage busy/idle utilization counters.
+    journal_utilization: Arc<StageUtilization>,
+    matching_utilization: Arc<StageUtilization>,
+    response_utilization: Arc<StageUtilization>,
 }
 
 /// Spawn the health endpoint thread. Returns the join handle.
@@ -70,6 +75,9 @@ pub fn spawn(
     pipeline_healthy: Arc<AtomicBool>,
     replicas_connected: Option<Arc<AtomicU32>>,
     replication_metrics: Option<Arc<crate::replication::ReplicationMetrics>>,
+    journal_utilization: Arc<StageUtilization>,
+    matching_utilization: Arc<StageUtilization>,
+    response_utilization: Arc<StageUtilization>,
     shutdown: Arc<AtomicBool>,
 ) -> Result<std::thread::JoinHandle<()>, std::io::Error> {
     let listener = TcpListener::bind(bind_addr)?;
@@ -88,6 +96,9 @@ pub fn spawn(
         pipeline_healthy,
         replicas_connected,
         replication_metrics,
+        journal_utilization,
+        matching_utilization,
+        response_utilization,
     };
 
     let handle = std::thread::Builder::new()
@@ -125,6 +136,14 @@ struct HealthSnapshot {
     per_replica_acked_sequence: [u64; 2],
     /// Total replica eviction count.
     evictions_total: u64,
+    /// Per-stage busy/idle iteration counters for utilization monitoring.
+    /// Monotonic counters — Prometheus `rate()` gives utilization over any window.
+    journal_busy: u64,
+    journal_idle: u64,
+    matching_busy: u64,
+    matching_idle: u64,
+    response_busy: u64,
+    response_idle: u64,
 }
 
 impl HealthSnapshot {
@@ -221,6 +240,12 @@ impl HealthSnapshot {
             per_replica_catching_up,
             per_replica_acked_sequence,
             evictions_total,
+            journal_busy: state.journal_utilization.busy.load(Ordering::Relaxed),
+            journal_idle: state.journal_utilization.idle.load(Ordering::Relaxed),
+            matching_busy: state.matching_utilization.busy.load(Ordering::Relaxed),
+            matching_idle: state.matching_utilization.idle.load(Ordering::Relaxed),
+            response_busy: state.response_utilization.busy.load(Ordering::Relaxed),
+            response_idle: state.response_utilization.idle.load(Ordering::Relaxed),
         }
     }
 
@@ -303,7 +328,17 @@ impl HealthSnapshot {
              melin_replica_catching_up{{slot=\"1\"}} {}\n\
              # HELP melin_replica_evictions_total Total replica evictions due to ring backpressure.\n\
              # TYPE melin_replica_evictions_total counter\n\
-             melin_replica_evictions_total {}\n",
+             melin_replica_evictions_total {}\n\
+             # HELP melin_stage_busy_total Cumulative busy iterations per pipeline stage (journal/response: batches, matching: events).\n\
+             # TYPE melin_stage_busy_total counter\n\
+             melin_stage_busy_total{{stage=\"journal\"}} {}\n\
+             melin_stage_busy_total{{stage=\"matching\"}} {}\n\
+             melin_stage_busy_total{{stage=\"response\"}} {}\n\
+             # HELP melin_stage_idle_total Cumulative idle iterations per pipeline stage.\n\
+             # TYPE melin_stage_idle_total counter\n\
+             melin_stage_idle_total{{stage=\"journal\"}} {}\n\
+             melin_stage_idle_total{{stage=\"matching\"}} {}\n\
+             melin_stage_idle_total{{stage=\"response\"}} {}\n",
             self.active_connections,
             self.events_processed,
             self.journal_seq,
@@ -324,6 +359,12 @@ impl HealthSnapshot {
             catching_0,
             catching_1,
             self.evictions_total,
+            self.journal_busy,
+            self.matching_busy,
+            self.response_busy,
+            self.journal_idle,
+            self.matching_idle,
+            self.response_idle,
         );
         c.position() as usize
     }
@@ -447,8 +488,8 @@ fn handle_health_connection(mut stream: TcpStream, state: &HealthState) {
     // Body: Prometheus body is ~3 KiB with max-length u64 values
     // (includes per-replica replication metrics).
     // Response: body + HTTP headers (~200 bytes).
-    let mut body_buf = [0u8; 4096];
-    let mut resp_buf = [0u8; 4352];
+    let mut body_buf = [0u8; 5120];
+    let mut resp_buf = [0u8; 5376];
 
     let resp_len = match kind {
         RequestKind::Metrics => {
@@ -543,6 +584,9 @@ mod tests {
             pipeline_healthy: Arc::clone(&healthy),
             replicas_connected,
             replication_metrics: None,
+            journal_utilization: Arc::new(StageUtilization::new()),
+            matching_utilization: Arc::new(StageUtilization::new()),
+            response_utilization: Arc::new(StageUtilization::new()),
         };
 
         let handle = std::thread::spawn(move || {
@@ -665,6 +709,9 @@ mod tests {
             Arc::clone(&healthy),
             None,
             None,
+            Arc::new(StageUtilization::new()),
+            Arc::new(StageUtilization::new()),
+            Arc::new(StageUtilization::new()),
             Arc::clone(&shutdown),
         );
         // spawn binds to port 0 which is auto-assigned — we can't know the
@@ -692,6 +739,9 @@ mod tests {
             Arc::new(AtomicBool::new(true)),
             None,
             None,
+            Arc::new(StageUtilization::new()),
+            Arc::new(StageUtilization::new()),
+            Arc::new(StageUtilization::new()),
             Arc::new(AtomicBool::new(false)),
         );
         assert!(result.is_err(), "expected bind failure on occupied port");
@@ -864,6 +914,9 @@ mod tests {
             pipeline_healthy: Arc::new(AtomicBool::new(true)),
             replicas_connected: None,
             replication_metrics: None,
+            journal_utilization: Arc::new(StageUtilization::new()),
+            matching_utilization: Arc::new(StageUtilization::new()),
+            response_utilization: Arc::new(StageUtilization::new()),
         };
 
         let handle = std::thread::spawn(move || {
@@ -878,6 +931,67 @@ mod tests {
         assert!(
             response.contains("melin_input_queue_capacity 1048576\n"),
             "expected capacity metric, response: {response}"
+        );
+
+        shutdown.store(true, Ordering::Relaxed);
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn stage_utilization_in_metrics() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let s = Arc::clone(&shutdown);
+
+        let journal_util = Arc::new(StageUtilization::new());
+        journal_util.busy.store(500, Ordering::Relaxed);
+        journal_util.idle.store(9500, Ordering::Relaxed);
+
+        let matching_util = Arc::new(StageUtilization::new());
+        matching_util.busy.store(2000, Ordering::Relaxed);
+        matching_util.idle.store(8000, Ordering::Relaxed);
+
+        let response_util = Arc::new(StageUtilization::new());
+        // Response left at 0/0 — verifies zero counters render correctly.
+
+        let state = HealthState {
+            active_connections: Arc::new(AtomicU64::new(0)),
+            events_processed: Arc::new(AtomicU64::new(0)),
+            journal_cursor: Arc::new(Sequence::new(AtomicU64::new(0))),
+            matching_cursor: Arc::new(Sequence::new(AtomicU64::new(0))),
+            input_cursor: Box::new(MockCursor(AtomicU64::new(0))),
+            replication_cursor: Arc::new(AtomicU64::new(u64::MAX)),
+            pipeline_healthy: Arc::new(AtomicBool::new(true)),
+            replicas_connected: None,
+            replication_metrics: None,
+            journal_utilization: journal_util,
+            matching_utilization: matching_util,
+            response_utilization: response_util,
+        };
+
+        let handle = std::thread::spawn(move || {
+            health_loop(&listener, &state, &s);
+        });
+
+        let response = http_request(addr, "GET /metrics HTTP/1.1\r\n\r\n");
+        assert!(
+            response.contains("melin_stage_busy_total{stage=\"journal\"} 500\n"),
+            "journal busy not found in: {response}"
+        );
+        assert!(
+            response.contains("melin_stage_idle_total{stage=\"journal\"} 9500\n"),
+            "journal idle not found in: {response}"
+        );
+        assert!(
+            response.contains("melin_stage_busy_total{stage=\"matching\"} 2000\n"),
+            "matching busy not found in: {response}"
+        );
+        assert!(
+            response.contains("melin_stage_busy_total{stage=\"response\"} 0\n"),
+            "response busy not found in: {response}"
         );
 
         shutdown.store(true, Ordering::Relaxed);

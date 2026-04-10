@@ -1028,6 +1028,12 @@ fn cmd_health(args: &[String]) {
         "Cumulative Bytes Sent Per Replica",
         "Bytes",
     );
+
+    // Pipeline stage utilization plot (from health metrics, not log parsing).
+    plot_health_utilization(
+        &all_results,
+        &PathBuf::from(format!("{stem}-utilization.svg")),
+    );
 }
 
 /// Plot input queue depth over time — the primary saturation indicator.
@@ -1373,6 +1379,102 @@ fn plot_health_extra_metric(
     });
 }
 
+/// Plot per-stage utilization over time. Computes `delta(busy) / delta(busy+idle)`
+/// between successive health samples to derive instantaneous utilization percentage.
+fn plot_health_utilization(results: &[(HealthResult, String)], output: &PathBuf) {
+    const STAGES: [&str; 3] = ["journal", "matching", "response"];
+    const BUSY_KEYS: [&str; 3] = [
+        "melin_stage_busy_total_stage_journal",
+        "melin_stage_busy_total_stage_matching",
+        "melin_stage_busy_total_stage_response",
+    ];
+    const IDLE_KEYS: [&str; 3] = [
+        "melin_stage_idle_total_stage_journal",
+        "melin_stage_idle_total_stage_matching",
+        "melin_stage_idle_total_stage_response",
+    ];
+
+    // Check if any sample has utilization data.
+    let has_data = results.iter().any(|(r, _)| {
+        r.health
+            .iter()
+            .any(|h| BUSY_KEYS.iter().any(|k| h.extra_f64(k) > 0.0))
+    });
+    if !has_data {
+        return;
+    }
+
+    let max_time = health_max_time(results) * 1.05;
+
+    render_both!(output, (900, 500), |root| {
+        root.fill(&WHITE).unwrap();
+
+        let mut chart = ChartBuilder::on(&root)
+            .caption("Pipeline Stage Utilization", ("sans-serif", 22).into_font())
+            .margin(15)
+            .x_label_area_size(50)
+            .y_label_area_size(70)
+            .build_cartesian_2d(0.0..max_time, 0.0..105.0)
+            .unwrap();
+
+        chart
+            .configure_mesh()
+            .x_desc("Time (seconds)")
+            .y_desc("Utilization %")
+            .x_label_formatter(&|v| format!("{:.0}s", v))
+            .y_label_formatter(&|v| format!("{:.0}%", v))
+            .draw()
+            .unwrap();
+
+        for (i, (result, filename)) in results.iter().enumerate() {
+            let mode = mode_from_filename(filename);
+            let tp = format_throughput(result.throughput_ops);
+
+            for (stage_idx, stage_name) in STAGES.iter().enumerate() {
+                let color_idx = i * STAGES.len() + stage_idx;
+                let color = COLORS[color_idx % COLORS.len()];
+
+                // Compute instantaneous utilization from delta of counters.
+                let points: Vec<(f64, f64)> = result
+                    .health
+                    .windows(2)
+                    .filter_map(|pair| {
+                        let (prev, cur) = (&pair[0], &pair[1]);
+                        let d_busy = cur.extra_f64(BUSY_KEYS[stage_idx])
+                            - prev.extra_f64(BUSY_KEYS[stage_idx]);
+                        let d_idle = cur.extra_f64(IDLE_KEYS[stage_idx])
+                            - prev.extra_f64(IDLE_KEYS[stage_idx]);
+                        let total = d_busy + d_idle;
+                        if total > 0.0 {
+                            Some((cur.elapsed_secs, d_busy / total * 100.0))
+                        } else {
+                            None
+                        }
+                    })
+                    .collect();
+
+                if !points.is_empty() {
+                    chart
+                        .draw_series(LineSeries::new(points, color.stroke_width(2)))
+                        .unwrap()
+                        .label(format!("{mode} {stage_name} ({tp})"))
+                        .legend(move |(x, y)| {
+                            PathElement::new(vec![(x, y), (x + 20, y)], color.stroke_width(2))
+                        });
+                }
+            }
+        }
+
+        chart
+            .configure_series_labels()
+            .position(SeriesLabelPosition::UpperRight)
+            .background_style(WHITE.mix(0.8))
+            .border_style(BLACK.mix(0.3))
+            .draw()
+            .unwrap();
+    });
+}
+
 /// Maximum elapsed time across all health samples.
 fn health_max_time(results: &[(HealthResult, String)]) -> f64 {
     results
@@ -1575,6 +1677,10 @@ fn cmd_all(args: &[String]) {
                 &PathBuf::from(format!("{stem}-replication-lag.svg")),
             );
         }
+        plot_health_utilization(
+            &health_results,
+            &PathBuf::from(format!("{stem}-utilization.svg")),
+        );
     } else {
         eprintln!("skipping health plots (no files with health data)");
     }

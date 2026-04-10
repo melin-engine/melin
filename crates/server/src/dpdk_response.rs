@@ -20,7 +20,7 @@ use melin_disruptor::padding::Sequence;
 use melin_disruptor::ring;
 use melin_disruptor::spsc;
 
-use melin_engine::journal::pipeline::{OutputPayload, OutputSlot};
+use melin_engine::journal::pipeline::{OutputPayload, OutputSlot, StageUtilization};
 
 use melin_protocol::codec;
 use melin_protocol::message::ResponseKind;
@@ -94,6 +94,7 @@ pub fn run(
     heartbeat_interval: Option<Duration>,
     active_connections: Arc<AtomicU64>,
     mut tx_producers: Vec<spsc::Producer<TxFrame>>,
+    utilization: Arc<StageUtilization>,
 ) {
     // Track known connections (for heartbeat scheduling).
     let mut connections: HashMap<u64, ConnectionHeartbeat> = HashMap::with_capacity(256);
@@ -119,9 +120,13 @@ pub fn run(
 
     let mut last_heartbeat_scan = Instant::now();
     let mut idle_spins: u32 = 0;
+    let mut busy_count: u64 = 0;
+    let mut idle_count: u64 = 0;
 
     loop {
         if shutdown.load(Ordering::Relaxed) {
+            utilization.busy.store(busy_count, Ordering::Relaxed);
+            utilization.idle.store(idle_count, Ordering::Relaxed);
             return;
         }
 
@@ -168,6 +173,11 @@ pub fn run(
                 }
             }
 
+            idle_count += 1;
+            if idle_count.is_multiple_of(1024) {
+                utilization.busy.store(busy_count, Ordering::Relaxed);
+                utilization.idle.store(idle_count, Ordering::Relaxed);
+            }
             if idle_spins < 1000 {
                 idle_spins += 1;
                 std::hint::spin_loop();
@@ -177,6 +187,7 @@ pub fn run(
             continue;
         }
         idle_spins = 0;
+        busy_count += 1;
 
         // Wait for durability (see response.rs for full explanation).
         #[cfg(not(feature = "no-fsync"))]

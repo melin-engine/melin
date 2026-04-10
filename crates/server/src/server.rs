@@ -749,6 +749,11 @@ fn run_as_primary<L: BlockingTransportListener>(
     // Spawn pipeline OS threads.
     let cores = config.cores;
 
+    // Extract utilization handles before stages are moved into threads.
+    let journal_utilization = journal_stage.utilization();
+    let matching_utilization = matching_stage.utilization();
+    let response_utilization = Arc::new(melin_engine::journal::pipeline::StageUtilization::new());
+
     let s1 = Arc::clone(&shutdown);
     let journal_handle = std::thread::Builder::new()
         .name("journal".into())
@@ -775,6 +780,7 @@ fn run_as_primary<L: BlockingTransportListener>(
     let quorum_durability = !config.no_quorum_durability;
     let s3 = Arc::clone(&shutdown);
     let busy_spin = !config.yield_idle;
+    let response_utilization_thread = Arc::clone(&response_utilization);
     let response_handle = std::thread::Builder::new()
         .name("response".into())
         .spawn(move || {
@@ -789,6 +795,7 @@ fn run_as_primary<L: BlockingTransportListener>(
                 &s3,
                 heartbeat_interval,
                 busy_spin,
+                response_utilization_thread,
             );
         })
         .map_err(|e| format!("spawn response thread: {e}"))?;
@@ -1115,6 +1122,9 @@ fn run_as_primary<L: BlockingTransportListener>(
             Arc::clone(&pipeline_healthy),
             replicas_connected.clone(),
             replication_metrics.clone(),
+            Arc::clone(&journal_utilization),
+            Arc::clone(&matching_utilization),
+            Arc::clone(&response_utilization),
             Arc::clone(&shutdown),
         )?)
     } else {
@@ -1544,6 +1554,11 @@ pub fn run_dpdk(
     // Spawn pipeline threads (journal, matching — identical to TCP path).
     let cores = config.cores;
 
+    // Extract utilization handles before stages are moved into threads.
+    let journal_utilization = journal_stage.utilization();
+    let matching_utilization = matching_stage.utilization();
+    let response_utilization = Arc::new(melin_engine::journal::pipeline::StageUtilization::new());
+
     let s1 = Arc::clone(&shutdown);
     let journal_handle = std::thread::Builder::new()
         .name("journal".into())
@@ -1570,6 +1585,7 @@ pub fn run_dpdk(
     let quorum_durability = !config.no_quorum_durability;
     let active_connections_response = Arc::clone(&active_connections);
     let s3 = Arc::clone(&shutdown);
+    let response_utilization_thread = Arc::clone(&response_utilization);
     let response_handle = std::thread::Builder::new()
         .name("response".into())
         .spawn(move || {
@@ -1585,6 +1601,7 @@ pub fn run_dpdk(
                 heartbeat_interval,
                 active_connections_response,
                 tx_producers,
+                response_utilization_thread,
             );
         })
         .map_err(|e| format!("spawn response thread: {e}"))?;
@@ -1827,6 +1844,9 @@ pub fn run_dpdk(
             Arc::clone(&pipeline_healthy),
             replicas_connected.clone(),
             replication_metrics.clone(),
+            Arc::clone(&journal_utilization),
+            Arc::clone(&matching_utilization),
+            Arc::clone(&response_utilization),
             Arc::clone(&shutdown),
         )?)
     } else {

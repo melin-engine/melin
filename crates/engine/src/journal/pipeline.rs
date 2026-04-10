@@ -34,6 +34,37 @@ use melin_disruptor::padding::Sequence;
 use melin_disruptor::ring;
 use melin_disruptor::seqlock::SeqLock;
 
+/// Per-stage busy/idle iteration counters for pipeline utilization monitoring.
+///
+/// Each pipeline stage (journal, matching, response) owns one instance.
+/// The stage thread increments local `u64` counters and periodically flushes
+/// to these shared atomics. The health endpoint reads with `Relaxed` ordering
+/// — no hot-path contention since the stage thread is the only writer.
+///
+/// Prometheus exposes these as monotonic counters; `rate(busy) / rate(busy+idle)`
+/// gives utilization over any window.
+pub struct StageUtilization {
+    /// Cumulative iterations where the stage had work to do.
+    pub busy: AtomicU64,
+    /// Cumulative iterations where the stage was idle (no input available).
+    pub idle: AtomicU64,
+}
+
+impl StageUtilization {
+    pub fn new() -> Self {
+        Self {
+            busy: AtomicU64::new(0),
+            idle: AtomicU64::new(0),
+        }
+    }
+}
+
+impl Default for StageUtilization {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// Ring buffer capacity for the input disruptor (journal + matching consumers).
 /// 2^20 = 1,048,576 slots. At ~72 bytes per slot, this is ~72 MiB — fits in
 /// L3 cache on modern server CPUs. Provides ~100 ms of buffering at 10M
@@ -219,6 +250,8 @@ pub struct JournalStage {
     /// disruptor. This preserves byte-identical journals between primary
     /// and replica.
     raw_journal_rx: Option<RawBatchReceiver>,
+    /// Shared busy/idle counters for health endpoint monitoring.
+    utilization: Arc<StageUtilization>,
 }
 
 /// Replication state for the journal stage. Boxed in JournalStage to
@@ -404,7 +437,13 @@ impl JournalStage {
             chain_hash: None,
             busy_spin,
             raw_journal_rx: None,
+            utilization: Arc::new(StageUtilization::new()),
         }
+    }
+
+    /// Shared utilization counters for health endpoint monitoring.
+    pub fn utilization(&self) -> Arc<StageUtilization> {
+        Arc::clone(&self.utilization)
     }
 
     /// Set the raw journal receiver for replica mode. When set, the journal
@@ -490,9 +529,7 @@ impl JournalStage {
         #[cfg(not(feature = "no-fsync"))]
         let mut first_write_ts: Option<Instant> = None;
 
-        #[cfg(feature = "pipeline-stats")]
         let mut busy_count: u64 = 0;
-        #[cfg(feature = "pipeline-stats")]
         let mut idle_count: u64 = 0;
 
         #[cfg(feature = "latency-trace")]
@@ -519,6 +556,8 @@ impl JournalStage {
                     wakeup_hist.print_report();
                     batch_hist.print_report();
                 }
+                self.utilization.busy.store(busy_count, Ordering::Relaxed);
+                self.utilization.idle.store(idle_count, Ordering::Relaxed);
                 #[cfg(feature = "pipeline-stats")]
                 print_utilization("journal", busy_count, idle_count);
                 return Ok(self.writer);
@@ -534,10 +573,7 @@ impl JournalStage {
 
             if count > 0 {
                 idle_spins = 0;
-                #[cfg(feature = "pipeline-stats")]
-                {
-                    busy_count += 1;
-                }
+                busy_count += 1;
 
                 #[cfg(feature = "latency-trace")]
                 let batch_start = trace_ts();
@@ -645,9 +681,13 @@ impl JournalStage {
                     }
                 }
             } else {
-                #[cfg(feature = "pipeline-stats")]
-                {
-                    idle_count += 1;
+                idle_count += 1;
+                // Periodically flush utilization counters so the health
+                // endpoint has a reasonably fresh view without adding
+                // atomic stores on the busy path.
+                if idle_count.is_multiple_of(1024) {
+                    self.utilization.busy.store(busy_count, Ordering::Relaxed);
+                    self.utilization.idle.store(idle_count, Ordering::Relaxed);
                 }
                 idle_wait(&mut idle_spins, self.busy_spin);
             }
@@ -669,11 +709,15 @@ impl JournalStage {
         })?;
         let mut batch = [InputSlot::default(); MAX_JOURNAL_BATCH];
         let mut idle_spins: u32 = 0;
+        let mut busy_count: u64 = 0;
+        let mut idle_count: u64 = 0;
 
         loop {
             if shutdown.load(Ordering::Relaxed) {
                 // Drain remaining disruptor events before shutdown.
                 self.drain_remaining(&mut batch);
+                self.utilization.busy.store(busy_count, Ordering::Relaxed);
+                self.utilization.idle.store(idle_count, Ordering::Relaxed);
                 return Ok(self.writer);
             }
 
@@ -681,6 +725,7 @@ impl JournalStage {
             // receiver via the lock-free hand-off.
             if let Some(raw_batch) = rx.try_recv() {
                 idle_spins = 0;
+                busy_count += 1;
 
                 // Write raw bytes to journal (durable write).
                 self.writer
@@ -714,6 +759,11 @@ impl JournalStage {
                     }
                 }
             } else {
+                idle_count += 1;
+                if idle_count.is_multiple_of(1024) {
+                    self.utilization.busy.store(busy_count, Ordering::Relaxed);
+                    self.utilization.idle.store(idle_count, Ordering::Relaxed);
+                }
                 idle_wait(&mut idle_spins, self.busy_spin);
             }
         }
@@ -749,6 +799,8 @@ impl JournalStage {
         })?;
         let mut batch = [InputSlot::default(); MAX_JOURNAL_BATCH];
         let mut idle_spins: u32 = 0;
+        let mut busy_count: u64 = 0;
+        let mut idle_count: u64 = 0;
 
         // Set up io_uring — same as the primary's run_uring.
         let mut ring: IoUring = IoUring::builder()
@@ -791,6 +843,8 @@ impl JournalStage {
                     self.writer.confirm_raw_async_write(inf.batch);
                 }
                 self.drain_remaining(&mut batch);
+                self.utilization.busy.store(busy_count, Ordering::Relaxed);
+                self.utilization.idle.store(idle_count, Ordering::Relaxed);
                 return Ok(self.writer);
             }
 
@@ -824,6 +878,7 @@ impl JournalStage {
             if inflight.is_none() {
                 if let Some(raw_batch) = rx.try_recv() {
                     idle_spins = 0;
+                    busy_count += 1;
                     let entry_count = raw_batch.entry_count as usize;
 
                     let async_batch = self
@@ -856,12 +911,22 @@ impl JournalStage {
                         entry_count,
                     });
                 } else {
+                    idle_count += 1;
+                    if idle_count.is_multiple_of(1024) {
+                        self.utilization.busy.store(busy_count, Ordering::Relaxed);
+                        self.utilization.idle.store(idle_count, Ordering::Relaxed);
+                    }
                     idle_wait(&mut idle_spins, self.busy_spin);
                 }
             } else {
                 // Write in-flight — don't submit another, just idle-wait
                 // for the CQE. The NVMe is busy; trying to submit more
                 // would just queue in the kernel.
+                idle_count += 1;
+                if idle_count.is_multiple_of(1024) {
+                    self.utilization.busy.store(busy_count, Ordering::Relaxed);
+                    self.utilization.idle.store(idle_count, Ordering::Relaxed);
+                }
                 idle_wait(&mut idle_spins, self.busy_spin);
             }
         }
@@ -1059,9 +1124,7 @@ impl JournalStage {
         // exactly the events covered by the durable write.
         let mut inflight: Option<(super::writer::AsyncWriteBatch, u64)> = None;
 
-        #[cfg(feature = "pipeline-stats")]
         let mut busy_count: u64 = 0;
-        #[cfg(feature = "pipeline-stats")]
         let mut idle_count: u64 = 0;
 
         loop {
@@ -1082,6 +1145,8 @@ impl JournalStage {
                     self.consumer.commit(pending);
                 }
                 self.drain_remaining(&mut batch);
+                self.utilization.busy.store(busy_count, Ordering::Relaxed);
+                self.utilization.idle.store(idle_count, Ordering::Relaxed);
                 #[cfg(feature = "pipeline-stats")]
                 print_utilization("journal", busy_count, idle_count);
                 return Ok(self.writer);
@@ -1120,10 +1185,7 @@ impl JournalStage {
 
             if count > 0 {
                 idle_spins = 0;
-                #[cfg(feature = "pipeline-stats")]
-                {
-                    busy_count += 1;
-                }
+                busy_count += 1;
 
                 let ts = crate::journal::writer::wall_clock_nanos();
                 for slot in &batch[..count] {
@@ -1248,9 +1310,10 @@ impl JournalStage {
                     first_write_ts = None;
                 }
             } else {
-                #[cfg(feature = "pipeline-stats")]
-                {
-                    idle_count += 1;
+                idle_count += 1;
+                if idle_count.is_multiple_of(1024) {
+                    self.utilization.busy.store(busy_count, Ordering::Relaxed);
+                    self.utilization.idle.store(idle_count, Ordering::Relaxed);
                 }
                 idle_wait(&mut idle_spins, self.busy_spin);
             }
@@ -1315,6 +1378,8 @@ pub struct MatchingStage {
     replicas_connected: Option<Arc<AtomicU32>>,
     /// When true, never yield — spin indefinitely. See [`idle_wait`].
     busy_spin: bool,
+    /// Shared busy/idle counters for health endpoint monitoring.
+    utilization: Arc<StageUtilization>,
 }
 
 impl MatchingStage {
@@ -1338,7 +1403,13 @@ impl MatchingStage {
             active_connections,
             replicas_connected,
             busy_spin,
+            utilization: Arc::new(StageUtilization::new()),
         }
+    }
+
+    /// Shared utilization counters for health endpoint monitoring.
+    pub fn utilization(&self) -> Arc<StageUtilization> {
+        Arc::clone(&self.utilization)
     }
 
     /// Returns true if trading is halted due to all replicas disconnected.
@@ -1399,9 +1470,7 @@ impl MatchingStage {
 
         let mut batch = [InputSlot::default(); MAX_MATCHING_BATCH];
 
-        #[cfg(feature = "pipeline-stats")]
         let mut busy_count: u64 = 0;
-        #[cfg(feature = "pipeline-stats")]
         let mut idle_count: u64 = 0;
 
         #[cfg(feature = "latency-trace")]
@@ -1418,6 +1487,8 @@ impl MatchingStage {
                 self.drain_remaining(&mut reports);
                 // Flush the thread-local counter to the shared atomic.
                 self.events_processed.store(local_events, Ordering::Relaxed);
+                self.utilization.busy.store(busy_count, Ordering::Relaxed);
+                self.utilization.idle.store(idle_count, Ordering::Relaxed);
                 #[cfg(feature = "latency-trace")]
                 {
                     wakeup_hist.print_report();
@@ -1431,9 +1502,10 @@ impl MatchingStage {
             let batch_start = self.consumer.next_read();
             let count = self.consumer.consume_batch(&mut batch, MAX_MATCHING_BATCH);
             if count == 0 {
-                #[cfg(feature = "pipeline-stats")]
-                {
-                    idle_count += 1;
+                idle_count += 1;
+                if idle_count.is_multiple_of(1024) {
+                    self.utilization.busy.store(busy_count, Ordering::Relaxed);
+                    self.utilization.idle.store(idle_count, Ordering::Relaxed);
                 }
                 idle_wait(&mut idle_spins, self.busy_spin);
                 continue;
@@ -1442,11 +1514,7 @@ impl MatchingStage {
 
             for (i, slot) in batch[..count].iter().enumerate() {
                 let input_seq = batch_start + i as u64;
-
-                #[cfg(feature = "pipeline-stats")]
-                {
-                    busy_count += 1;
-                }
+                busy_count += 1;
 
                 #[cfg(feature = "latency-trace")]
                 {
@@ -1476,8 +1544,10 @@ impl MatchingStage {
                     #[allow(clippy::let_unit_value)]
                     let match_complete_ts = trace_ts();
 
-                    // Flush the thread-local counter so the snapshot is current.
+                    // Flush thread-local counters so the snapshot is current.
                     self.events_processed.store(local_events, Ordering::Relaxed);
+                    self.utilization.busy.store(busy_count, Ordering::Relaxed);
+                    self.utilization.idle.store(idle_count, Ordering::Relaxed);
 
                     let journal_sequence = self.journal_cursor.get().load(Ordering::Relaxed);
                     let active_connections = self.active_connections.load(Ordering::Relaxed);

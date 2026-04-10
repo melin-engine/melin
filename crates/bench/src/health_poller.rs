@@ -111,7 +111,7 @@ fn scrape_metrics(addr: SocketAddr, start: Instant) -> Option<HealthSample> {
 
     // Read the full response. The metrics payload is ~3 KiB with
     // per-replica replication metrics.
-    let mut buf = [0u8; 4096];
+    let mut buf = [0u8; 8192];
     let mut total = 0;
     loop {
         match stream.read(&mut buf[total..]) {

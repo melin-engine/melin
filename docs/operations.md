@@ -598,6 +598,10 @@ melin_trading_active 1
 | `melin_input_queue_depth` | gauge | Items pending in the input disruptor (`producer - matching`) |
 | `melin_input_queue_capacity` | gauge | Total input ring buffer capacity (constant 1,048,576) |
 | `melin_trading_active` | gauge | 1 when accepting orders, 0 when halted |
+| `melin_stage_busy_total{stage="..."}` | counter | Cumulative busy iterations per stage (journal/response: batches, matching: events) |
+| `melin_stage_idle_total{stage="..."}` | counter | Cumulative idle iterations per stage |
+
+Use `rate(melin_stage_busy_total) / (rate(melin_stage_busy_total) + rate(melin_stage_idle_total))` for per-stage utilization percentage. The matching stage counts events (not batches), so its utilization is directly proportional to throughput.
 
 **Prometheus scrape config**:
 
@@ -641,15 +645,15 @@ melin-admin <server-addr> <admin-key-file>
 | `no-fsync` | no | Skip all fsync calls and journal-cursor gating. **Unsafe for production** — data may not survive crashes. Useful for benchmarking to isolate I/O cost. |
 | `no-persist` | no | Skip journal writes entirely. **Unsafe for production.** |
 
-### Pipeline Stats Feature
+### Pipeline Utilization
 
-Compile with the `pipeline-stats` feature to enable per-stage busy/idle counters:
+Per-stage busy/idle counters are always exposed via the `/metrics` endpoint (`melin_stage_busy_total`, `melin_stage_idle_total`). These are zero-overhead on the hot path: each stage increments a thread-local `u64` and flushes to a shared atomic every 1024 idle spins or on batch boundaries.
+
+The `pipeline-stats` feature adds a summary log line on shutdown with the final utilization percentages. Useful for quick single-run analysis without a Prometheus setup:
 
 ```sh
 cargo build --release --features pipeline-stats
 ```
-
-This adds counters tracking how many iterations each stage spent busy vs. idle. Useful for identifying bottlenecks (e.g., response stage at 25% busy indicates TCP overhead).
 
 ### Latency Trace Feature
 

@@ -21,7 +21,7 @@ use tracing::{debug, error};
 use melin_disruptor::padding::Sequence;
 use melin_disruptor::ring;
 
-use melin_engine::journal::pipeline::{OutputPayload, OutputSlot};
+use melin_engine::journal::pipeline::{OutputPayload, OutputSlot, StageUtilization};
 #[cfg(feature = "latency-trace")]
 use melin_engine::journal::trace;
 
@@ -84,6 +84,7 @@ pub fn run(
     shutdown: &AtomicBool,
     heartbeat_interval: Option<Duration>,
     busy_spin: bool,
+    utilization: Arc<StageUtilization>,
 ) {
     let mut ring =
         IoUring::new(RING_SIZE).expect("failed to create io_uring instance for response stage");
@@ -145,9 +146,7 @@ pub fn run(
     // Adaptive spin: spin first (fast wakeup), yield after threshold.
     let mut idle_spins: u32 = 0;
 
-    #[cfg(feature = "pipeline-stats")]
     let mut busy_count: u64 = 0;
-    #[cfg(feature = "pipeline-stats")]
     let mut idle_count: u64 = 0;
 
     loop {
@@ -169,6 +168,8 @@ pub fn run(
                 dispatch_hist.print_report();
                 server_e2e_hist.print_report();
             }
+            utilization.busy.store(busy_count, Ordering::Relaxed);
+            utilization.idle.store(idle_count, Ordering::Relaxed);
             #[cfg(feature = "pipeline-stats")]
             print_utilization("response", busy_count, idle_count);
             return;
@@ -250,9 +251,10 @@ pub fn run(
                 }
             }
 
-            #[cfg(feature = "pipeline-stats")]
-            {
-                idle_count += 1;
+            idle_count += 1;
+            if idle_count.is_multiple_of(1024) {
+                utilization.busy.store(busy_count, Ordering::Relaxed);
+                utilization.idle.store(idle_count, Ordering::Relaxed);
             }
             if busy_spin || idle_spins < 1000 {
                 idle_spins = idle_spins.wrapping_add(1);
@@ -263,10 +265,7 @@ pub fn run(
             continue;
         }
         idle_spins = 0;
-        #[cfg(feature = "pipeline-stats")]
-        {
-            busy_count += 1;
-        }
+        busy_count += 1;
 
         #[cfg(feature = "latency-trace")]
         let consume_ts = trace::trace_ts();
