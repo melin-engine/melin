@@ -245,7 +245,9 @@ pub fn run_dpdk_roundtrip(
         socket.set_initial_rto(smoltcp::time::Duration::from_millis(50));
         socket.set_initial_congestion_window(64 * 1024);
 
-        let local_port = 50000 + client_id as u16;
+        // Randomize ephemeral port base to avoid colliding with TIME_WAIT
+        // entries from a previous bench run against the same server.
+        let local_port = 49152 + (std::process::id() as u16 % 8192) + client_id as u16;
         socket
             .connect(
                 iface.context(),
