@@ -1194,6 +1194,10 @@ fn run_roundtrip_inner<R, W, F>(
 
 /// Spawn a background thread that prints periodic progress to stderr.
 /// Returns a handle; the thread exits when `shutdown` is set to true.
+///
+/// Pinned to core 0 (OS/IRQ core) so it never preempts bench I/O threads.
+/// Uses raw `write(2)` on fd 2 instead of `eprintln!` to avoid the stderr
+/// mutex, which can block bench threads that also write to stderr.
 pub(crate) fn spawn_progress_reporter(
     completed: Arc<AtomicU64>,
     total_orders: u64,
@@ -1202,6 +1206,10 @@ pub(crate) fn spawn_progress_reporter(
     std::thread::Builder::new()
         .name("progress".into())
         .spawn(move || {
+            // Pin to core 0 so the progress thread never lands on a bench
+            // core and causes involuntary preemption or TLB shootdowns.
+            let _ = melin_server::affinity::pin_to_core(0);
+
             let start = Instant::now();
             let mut last_completed: u64 = 0;
             let mut last_time = start;
@@ -1220,10 +1228,22 @@ pub(crate) fn spawn_progress_reporter(
                 let elapsed = now.duration_since(start).as_secs_f64();
                 let pct = current as f64 / total_orders as f64 * 100.0;
 
-                eprintln!(
+                // Format into a stack buffer and write(2) directly to fd 2.
+                // Avoids the stderr mutex that eprintln! holds, which can
+                // block bench threads doing eprintln! on error paths.
+                use std::io::Write as _;
+                let mut buf = [0u8; 128];
+                let mut cursor = std::io::Cursor::new(&mut buf[..]);
+                let _ = writeln!(
+                    cursor,
                     "  [{elapsed:.1}s] {current} / {total_orders} orders ({pct:.1}%)  {:.0}K/s",
                     rate / 1000.0,
                 );
+                let len = cursor.position() as usize;
+                // Best-effort write — progress display is non-critical.
+                unsafe {
+                    libc::write(2, buf.as_ptr() as *const libc::c_void, len);
+                }
 
                 last_completed = current;
                 last_time = now;
