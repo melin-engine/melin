@@ -184,6 +184,78 @@ pub fn run_dpdk_roundtrip(
             .expect("default route");
     }
 
+    // SR-IOV VFs can't receive broadcast ARP, so normal ARP resolution
+    // fails. Two workarounds:
+    // 1. Send a gratuitous ARP so the switch learns our MAC.
+    // 2. Seed the server's MAC into smoltcp's neighbor cache via a crafted
+    //    ARP reply. The server's VF MAC is derived from its DPDK IP
+    //    (02:00:IP[0]:IP[1]:IP[2]:IP[3]) — same scheme as dpdk-setup-sriov.sh.
+    {
+        let our_ip = config.local_ip.octets();
+        let mut frame = [0u8; 42];
+        // Ethernet header: broadcast destination
+        frame[0..6].copy_from_slice(&[0xff; 6]);
+        frame[6..12].copy_from_slice(&mac);
+        frame[12..14].copy_from_slice(&[0x08, 0x06]); // ARP
+        // ARP: Ethernet + IPv4, request
+        frame[14..16].copy_from_slice(&[0x00, 0x01]); // hardware type: Ethernet
+        frame[16..18].copy_from_slice(&[0x08, 0x00]); // protocol type: IPv4
+        frame[18] = 6; // hardware size
+        frame[19] = 4; // protocol size
+        frame[20..22].copy_from_slice(&[0x00, 0x01]); // opcode: request
+        frame[22..28].copy_from_slice(&mac); // sender MAC
+        frame[28..32].copy_from_slice(&our_ip); // sender IP
+        frame[32..38].copy_from_slice(&[0xff; 6]); // target MAC
+        frame[38..42].copy_from_slice(&our_ip); // target IP = sender IP (gratuitous)
+        device.send_raw_frame(&frame);
+
+        // Seed the server's MAC into our neighbor cache.
+        let server_ip_bytes = match config.server_addr.ip() {
+            std::net::IpAddr::V4(v4) => v4.octets(),
+            _ => panic!("IPv6 not supported"),
+        };
+        let server_mac = [
+            0x02,
+            0x00,
+            server_ip_bytes[0],
+            server_ip_bytes[1],
+            server_ip_bytes[2],
+            server_ip_bytes[3],
+        ];
+        // Inject a crafted ARP reply into smoltcp so it learns the server's MAC.
+        let mut arp_reply = [0u8; 42];
+        arp_reply[0..6].copy_from_slice(&mac); // dest: us
+        arp_reply[6..12].copy_from_slice(&server_mac); // src: server
+        arp_reply[12..14].copy_from_slice(&[0x08, 0x06]); // ARP
+        arp_reply[14..16].copy_from_slice(&[0x00, 0x01]); // HW type
+        arp_reply[16..18].copy_from_slice(&[0x08, 0x00]); // Proto type
+        arp_reply[18] = 6;
+        arp_reply[19] = 4;
+        arp_reply[20..22].copy_from_slice(&[0x00, 0x02]); // opcode: reply
+        arp_reply[22..28].copy_from_slice(&server_mac);
+        arp_reply[28..32].copy_from_slice(&server_ip_bytes);
+        arp_reply[32..38].copy_from_slice(&mac);
+        arp_reply[38..42].copy_from_slice(&our_ip);
+        device.inject_rx(arp_reply.to_vec());
+
+        // Process the injected ARP reply so smoltcp populates its cache.
+        // Use a temporary empty socket set — no sockets needed for ARP.
+        let mut tmp_sockets = SocketSet::new(Vec::new());
+        device.poll_rx();
+        iface.poll(now, &mut device, &mut tmp_sockets);
+        device.flush_tx();
+
+        eprintln!(
+            "  ARP: sent gratuitous, seeded server MAC {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
+            server_mac[0],
+            server_mac[1],
+            server_mac[2],
+            server_mac[3],
+            server_mac[4],
+            server_mac[5]
+        );
+    }
+
     let mut sockets = SocketSet::new(Vec::with_capacity(num_clients + 1));
     let mut cached_ts = now;
     let mut poll_count: u32 = 0;
