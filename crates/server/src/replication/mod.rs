@@ -397,7 +397,7 @@ mod tests {
         encode_auth_failed, encode_auth_ok, encode_challenge, encode_challenge_response,
         encode_data_batch, encode_handshake, encode_hash_mismatch, encode_heartbeat,
         encode_need_snapshot, encode_snapshot_begin, encode_snapshot_chunk, encode_snapshot_end,
-        encode_stream_start, read_frame,
+        encode_stream_start, read_frame, try_decode_data_batch,
     };
     use super::*;
 
@@ -481,6 +481,65 @@ mod tests {
             }
             _ => panic!("expected DataBatch"),
         }
+    }
+
+    #[test]
+    fn try_decode_data_batch_fast_path_matches_general_decoder() {
+        // The fast path is only correct if it returns the exact same
+        // header fields as the general decoder and a slice whose contents
+        // equal the original journal bytes. Verify on a representative
+        // payload: non-trivial length, non-zero chain hash, non-zero
+        // entry count.
+        let journal_bytes: Vec<u8> = (0..256u16).map(|i| (i & 0xFF) as u8).collect();
+        let chain_hash = [0x5Au8; 32];
+        let mut buf = Vec::new();
+        encode_data_batch(4242, &chain_hash, 17, &journal_bytes, &mut buf);
+        let payload = &buf[4..];
+
+        let (end_seq, hash, count, slice) = try_decode_data_batch(payload).expect("fast path");
+        assert_eq!(end_seq, 4242);
+        assert_eq!(hash, chain_hash);
+        assert_eq!(count, 17);
+        assert_eq!(slice, journal_bytes.as_slice());
+        // The fast-path slice must borrow from `payload`, not own a copy.
+        assert!(slice.as_ptr() >= payload.as_ptr());
+        assert!(slice.as_ptr() as usize + slice.len() <= payload.as_ptr() as usize + payload.len());
+    }
+
+    #[test]
+    fn try_decode_data_batch_rejects_non_data_batch() {
+        // Heartbeat frame: different type tag → fast path must return None
+        // so the caller falls through to the general decoder.
+        let mut buf = Vec::new();
+        encode_heartbeat(42, &[0; 32], &mut buf);
+        assert!(try_decode_data_batch(&buf[4..]).is_none());
+
+        // Ack frame: replica-to-primary, same check.
+        let mut buf = Vec::new();
+        encode_ack(&Ack { acked_sequence: 7 }, &mut buf);
+        assert!(try_decode_data_batch(&buf[4..]).is_none());
+
+        // DataBatch-tagged but truncated below the fixed header: fast
+        // path returns None; the general decoder then surfaces the
+        // truncation as a protocol error (tested separately via the
+        // general decoder).
+        let mut short = vec![super::protocol::MSG_DATA_BATCH];
+        short.extend_from_slice(&[0u8; 10]); // Well short of 45-byte header.
+        assert!(try_decode_data_batch(&short).is_none());
+    }
+
+    #[test]
+    fn try_decode_data_batch_empty_journal_bytes() {
+        // Minimum-size DataBatch: 45-byte header and zero-length journal
+        // bytes. Should decode cleanly and return an empty slice (not
+        // error out).
+        let mut buf = Vec::new();
+        encode_data_batch(1, &[0u8; 32], 0, &[], &mut buf);
+        let payload = &buf[4..];
+        let (end_seq, _hash, count, slice) = try_decode_data_batch(payload).expect("empty-ok");
+        assert_eq!(end_seq, 1);
+        assert_eq!(count, 0);
+        assert!(slice.is_empty());
     }
 
     #[test]

@@ -344,6 +344,36 @@ pub(super) fn decode_replica_message(payload: &[u8]) -> io::Result<ReplicaMessag
     }
 }
 
+/// Fast-path decoder for `DataBatch` frames. Returns a *borrowed* slice
+/// into `payload` so the receiver hot path can copy journal bytes directly
+/// into its accumulator without the `Vec<u8>` allocation that the general
+/// [`decode_primary_message`] performs on the `MSG_DATA_BATCH` arm.
+///
+/// Returns `None` in two cases:
+/// - the payload is not a `DataBatch` (different type tag) — the caller
+///   should fall back to [`decode_primary_message`] to handle control
+///   messages (heartbeats, hash-mismatch, etc.).
+/// - the payload *is* tagged as a `DataBatch` but is shorter than the
+///   fixed header — indistinguishable from the non-data case here, so the
+///   caller's general-decoder fallback will surface the truncation as a
+///   protocol error.
+pub(super) fn try_decode_data_batch(payload: &[u8]) -> Option<(u64, [u8; 32], u32, &[u8])> {
+    // Layout: type(1) + end_sequence(8) + chain_hash(32) + entry_count(4) + journal_bytes
+    const HEADER: usize = 1 + 8 + 32 + 4;
+    if payload.len() < HEADER || payload[0] != MSG_DATA_BATCH {
+        return None;
+    }
+    let end_sequence = u64::from_le_bytes(payload[1..9].try_into().ok()?);
+    // Fixed-size array copy — explicit so the borrow checker can reason
+    // about `chain_hash` independently from the returned `journal_bytes`
+    // slice, which still borrows from `payload`.
+    let mut chain_hash = [0u8; 32];
+    chain_hash.copy_from_slice(&payload[9..41]);
+    let entry_count = u32::from_le_bytes(payload[41..45].try_into().ok()?);
+    let journal_bytes = &payload[HEADER..];
+    Some((end_sequence, chain_hash, entry_count, journal_bytes))
+}
+
 /// Decode a primary message from a frame payload.
 pub(super) fn decode_primary_message(payload: &[u8]) -> io::Result<PrimaryMessage> {
     if payload.is_empty() {

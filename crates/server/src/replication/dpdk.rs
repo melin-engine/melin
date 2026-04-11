@@ -19,7 +19,7 @@ use super::protocol::{
     Ack, Handshake, MAX_CONTROL_FRAME, MAX_DATA_FRAME, PrimaryMessage, ReplicaMessage,
     decode_primary_message, decode_replica_message, encode_ack, encode_data_batch,
     encode_handshake, encode_heartbeat, encode_need_snapshot, encode_snapshot_begin,
-    encode_snapshot_chunk, encode_snapshot_end, encode_stream_start,
+    encode_snapshot_chunk, encode_snapshot_end, encode_stream_start, try_decode_data_batch,
 };
 use super::{
     PendingAckQueue, ReceiverResult, ReplicationMetrics, shutdown_pipeline, sleep_checking_flags,
@@ -1171,14 +1171,17 @@ pub fn run_receiver_dpdk(
                         let remaining = &recv_buf[consumed..];
                         match try_extract_frame(remaining, MAX_DATA_FRAME) {
                             FrameResult::Complete(ps, fe) => {
-                                if let Ok(PrimaryMessage::DataBatch {
+                                // Fast path: borrowed decoder avoids the Vec
+                                // allocation on steady-state DataBatch frames.
+                                // Mirrors the io_uring receiver path.
+                                if let Some((
                                     end_sequence,
-                                    entry_count: _,
+                                    batch_chain_hash,
+                                    _entry_count,
                                     journal_bytes,
-                                    chain_hash: batch_chain_hash,
-                                }) = decode_primary_message(&remaining[ps..fe])
+                                )) = try_decode_data_batch(&remaining[ps..fe])
                                 {
-                                    journal_accum.extend_from_slice(&journal_bytes);
+                                    journal_accum.extend_from_slice(journal_bytes);
                                     accum_end_sequence = end_sequence;
                                     accum_chain_hash = batch_chain_hash;
                                 }
@@ -1251,38 +1254,57 @@ pub fn run_receiver_dpdk(
                 match try_extract_frame(remaining, MAX_DATA_FRAME) {
                     FrameResult::Complete(payload_start, frame_end) => {
                         let payload = &remaining[payload_start..frame_end];
-                        match decode_primary_message(payload) {
-                            Ok(PrimaryMessage::DataBatch {
-                                end_sequence,
-                                entry_count: _,
-                                journal_bytes,
-                                chain_hash: batch_chain_hash,
-                            }) => {
-                                journal_accum.extend_from_slice(&journal_bytes);
-                                accum_end_sequence = end_sequence;
-                                accum_chain_hash = batch_chain_hash;
-                                got_data = true;
-                                received_data = true;
-                            }
-                            Ok(PrimaryMessage::Heartbeat {
-                                sequence,
-                                chain_hash: _,
-                            }) => {
-                                debug!(sequence, "heartbeat from primary (DPDK)");
-                            }
-                            Ok(other) => {
-                                debug!("unexpected message during streaming: {other:?}");
-                            }
-                            Err(e) => {
-                                drop(raw_journal_tx);
-                                shutdown_pipeline(
-                                    &pipeline_shutdown,
-                                    journal_handle,
-                                    matching_handle,
-                                    drain_handle,
-                                    shadow_handle,
-                                );
-                                return Err(format!("failed to decode primary message: {e}").into());
+                        // Fast path: borrowed DataBatch decoder avoids the
+                        // per-batch Vec allocation that used to dominate the
+                        // DPDK replica's CPU profile under load.
+                        if let Some((end_sequence, batch_chain_hash, _entry_count, journal_bytes)) =
+                            try_decode_data_batch(payload)
+                        {
+                            journal_accum.extend_from_slice(journal_bytes);
+                            accum_end_sequence = end_sequence;
+                            accum_chain_hash = batch_chain_hash;
+                            got_data = true;
+                            received_data = true;
+                        } else {
+                            match decode_primary_message(payload) {
+                                Ok(PrimaryMessage::Heartbeat {
+                                    sequence,
+                                    chain_hash: _,
+                                }) => {
+                                    debug!(sequence, "heartbeat from primary (DPDK)");
+                                }
+                                Ok(PrimaryMessage::DataBatch { .. }) => {
+                                    // try_decode_data_batch rejected this frame
+                                    // as too short; the general decoder should
+                                    // have surfaced it as Err. Treat as a
+                                    // protocol violation.
+                                    warn!("malformed DataBatch slipped past fast path (DPDK)");
+                                    drop(raw_journal_tx);
+                                    shutdown_pipeline(
+                                        &pipeline_shutdown,
+                                        journal_handle,
+                                        matching_handle,
+                                        drain_handle,
+                                        shadow_handle,
+                                    );
+                                    return Err("malformed DataBatch".into());
+                                }
+                                Ok(other) => {
+                                    debug!("unexpected message during streaming: {other:?}");
+                                }
+                                Err(e) => {
+                                    drop(raw_journal_tx);
+                                    shutdown_pipeline(
+                                        &pipeline_shutdown,
+                                        journal_handle,
+                                        matching_handle,
+                                        drain_handle,
+                                        shadow_handle,
+                                    );
+                                    return Err(
+                                        format!("failed to decode primary message: {e}").into()
+                                    );
+                                }
                             }
                         }
                         consumed += frame_end;

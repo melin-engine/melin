@@ -46,7 +46,7 @@ fn arm_tcp_quickack(fd: RawFd) {
 use super::auth::authenticate_with_primary;
 use super::protocol::{
     Ack, Handshake, MAX_CONTROL_FRAME, MAX_DATA_FRAME, PrimaryMessage, decode_primary_message,
-    encode_ack, encode_handshake, read_frame,
+    encode_ack, encode_handshake, read_frame, try_decode_data_batch,
 };
 use super::{
     PendingAckQueue, pin_replica_thread, shutdown_pipeline, sleep_checking_flags,
@@ -215,14 +215,15 @@ fn replica_stream_uring(
                     break;
                 }
                 let payload = &parse_buf[cursor + 4..cursor + 4 + frame_len];
-                if let Ok(PrimaryMessage::DataBatch {
-                    end_sequence,
-                    chain_hash: batch_chain_hash,
-                    journal_bytes,
-                    ..
-                }) = decode_primary_message(payload)
+                // Same fast path as the steady-state loop — promotion
+                // drain runs once per failover, so the saved allocation
+                // only matters if there's a large pre-promotion backlog
+                // in parse_buf. Consistency with the main loop keeps
+                // the two code paths in sync.
+                if let Some((end_sequence, batch_chain_hash, _entry_count, journal_bytes)) =
+                    try_decode_data_batch(payload)
                 {
-                    journal_accum.extend_from_slice(&journal_bytes);
+                    journal_accum.extend_from_slice(journal_bytes);
                     *accum_end_sequence = end_sequence;
                     *accum_chain_hash = batch_chain_hash;
                 }
@@ -517,37 +518,55 @@ fn replica_stream_uring(
                             break; // Incomplete frame — wait for more data.
                         }
                         let payload = &parse_buf[cursor + 4..cursor + 4 + frame_len];
-                        match decode_primary_message(payload) {
-                            Ok(PrimaryMessage::DataBatch {
-                                end_sequence,
-                                chain_hash: batch_chain_hash,
-                                entry_count: _,
-                                journal_bytes,
-                            }) => {
-                                *received_data = true;
-                                journal_accum.extend_from_slice(&journal_bytes);
-                                *accum_end_sequence = end_sequence;
-                                *accum_chain_hash = batch_chain_hash;
-                            }
-                            Ok(PrimaryMessage::Heartbeat { sequence, .. }) => {
-                                debug!(sequence, "heartbeat from primary");
-                            }
-                            Ok(PrimaryMessage::NeedSnapshot) => {
-                                return SessionExit::Fatal(
-                                    "primary says we need a snapshot transfer mid-stream".into(),
-                                );
-                            }
-                            Ok(PrimaryMessage::HashMismatch) => {
-                                return SessionExit::Fatal(
-                                    "chain hash mismatch from primary".into(),
-                                );
-                            }
-                            Ok(_) => {
-                                debug!("unexpected message during streaming");
-                            }
-                            Err(e) => {
-                                warn!(error = %e, "failed to decode primary message");
-                                return SessionExit::Disconnected;
+                        // Fast path: steady-state traffic is ~100% DataBatch
+                        // frames. `try_decode_data_batch` returns a slice
+                        // borrowed directly from `parse_buf`, avoiding the
+                        // ~40 KB Vec allocation that the general decoder
+                        // would perform on every batch.
+                        if let Some((end_sequence, batch_chain_hash, _entry_count, journal_bytes)) =
+                            try_decode_data_batch(payload)
+                        {
+                            *received_data = true;
+                            journal_accum.extend_from_slice(journal_bytes);
+                            *accum_end_sequence = end_sequence;
+                            *accum_chain_hash = batch_chain_hash;
+                        } else {
+                            // Control messages (heartbeat, need-snapshot,
+                            // hash-mismatch) fall through to the general
+                            // decoder. Rare compared to DataBatch, so the
+                            // allocation cost here is irrelevant.
+                            match decode_primary_message(payload) {
+                                Ok(PrimaryMessage::Heartbeat { sequence, .. }) => {
+                                    debug!(sequence, "heartbeat from primary");
+                                }
+                                Ok(PrimaryMessage::NeedSnapshot) => {
+                                    return SessionExit::Fatal(
+                                        "primary says we need a snapshot transfer mid-stream"
+                                            .into(),
+                                    );
+                                }
+                                Ok(PrimaryMessage::HashMismatch) => {
+                                    return SessionExit::Fatal(
+                                        "chain hash mismatch from primary".into(),
+                                    );
+                                }
+                                Ok(PrimaryMessage::DataBatch { .. }) => {
+                                    // `try_decode_data_batch` rejected this
+                                    // payload as too short for the fixed
+                                    // header, so the general decoder should
+                                    // have surfaced it as an error. Reach
+                                    // here means the general decoder accepted
+                                    // it — treat as a protocol violation.
+                                    warn!("malformed DataBatch slipped past fast path");
+                                    return SessionExit::Disconnected;
+                                }
+                                Ok(_) => {
+                                    debug!("unexpected message during streaming");
+                                }
+                                Err(e) => {
+                                    warn!(error = %e, "failed to decode primary message");
+                                    return SessionExit::Disconnected;
+                                }
                             }
                         }
                         cursor += 4 + frame_len;
