@@ -1,10 +1,10 @@
 [package]
-name = "melin-fix-gateway"
+name = "melin-oe-gateway"
 version = "0.1.0"
 edition = "2024"
 
 [[bin]]
-name = "melin-fix-gateway"
+name = "melin-oe-gateway"
 path = "src/main.rs"
 
 [dependencies]

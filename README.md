@@ -118,7 +118,7 @@ Note that **adding a second replica makes the engine faster, not slower**. With 
 - Manual promotion — operator sends `PROMOTE` to the replica's trigger endpoint; in-process transition reuses the warm Exchange state with zero re-replay, sub-second switchover
 - Multi-process failover tests — SIGKILL primary under load, promote replica, verify no data loss and clients can reconnect
 
-### [FIX 4.2 Gateway](docs/fix-gateway.md)
+### [FIX Gateway (OE)](docs/oe-gateway.md)
 - Single-threaded io_uring event loop terminating many concurrent FIX 4.2 sessions
 - Stateless session model — each connection starts at MsgSeqNum 1; cross-reconnect recovery is handled by the output event channel, not by a persisted FIX session store
 - Standard FIX 4.2 §4.6/§4.7 gap recovery (ResendRequest, SequenceReset-GapFill) on both directions

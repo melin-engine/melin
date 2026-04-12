@@ -5,7 +5,7 @@
 //! core. No threads on the hot path, no mutexes, no shared state.
 //!
 //! Usage:
-//!   melin-fix-gateway --config gateway.toml [--core N]
+//!   melin-oe-gateway --config gateway.toml [--core N]
 
 mod config;
 mod event_loop;
@@ -59,14 +59,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 i += 2;
             }
             _ => {
-                eprintln!("usage: melin-fix-gateway --config <path> [--core N]");
+                eprintln!("usage: melin-oe-gateway --config <path> [--core N]");
                 std::process::exit(1);
             }
         }
     }
 
     let config_path = config_path.unwrap_or_else(|| {
-        eprintln!("usage: melin-fix-gateway --config <path> [--core N]");
+        eprintln!("usage: melin-oe-gateway --config <path> [--core N]");
         std::process::exit(1);
     });
 
