@@ -20,6 +20,7 @@ use crate::config::{GatewayConfig, SymbolConfig};
 use crate::event_loop::SessionAction;
 use crate::id_map::ClOrdIdMap;
 use crate::metrics::GatewayMetrics;
+use crate::price;
 use crate::translate::{self, TranslateContext};
 use melin_gateway_core::fix::parse::FixMessage;
 use melin_gateway_core::fix::serialize::FixMessageBuilder;
@@ -153,6 +154,11 @@ pub struct Session {
     session_config_idx: Option<usize>,
     /// Monotonic ExecID counter for FIX execution reports (tag 17).
     exec_id: u64,
+    /// Tracks live order state for H/AF queries. Updated from every
+    /// ExecutionReport. Keyed by internal OrderId.
+    /// HashMap: O(1) lookup by OrderId, which is the primary access pattern
+    /// for both individual status requests and mass status iteration.
+    order_ledger: HashMap<OrderId, translate::OrderLiveState>,
 
     // ── Rate limiting ──
     /// Maximum inbound messages per second (0 = unlimited).
@@ -210,6 +216,7 @@ impl Session {
             signing_key: None,
             session_config_idx: None,
             exec_id: 1,
+            order_ledger: HashMap::new(),
 
             max_msgs_per_sec: 0,
             rate_msg_count: 0,
@@ -637,6 +644,10 @@ impl Session {
                     SessionAction::SendFix
                 }
             }
+            tags::MSG_ORDER_STATUS_REQUEST => self.handle_order_status_request(&msg, config),
+            tags::MSG_ORDER_MASS_STATUS_REQUEST => {
+                self.handle_order_mass_status_request(&msg, config)
+            }
             _ => {
                 warn!(
                     msg_type = ?std::str::from_utf8(msg_type),
@@ -793,6 +804,13 @@ impl Session {
                             );
                             self.queue_fix_raw(&msg);
                             self.exec_id += 1;
+                            self.update_fill_ledger(
+                                *maker_order_id,
+                                *fill_price,
+                                *quantity,
+                                li,
+                                side,
+                            );
                             sent = true;
                         }
 
@@ -820,6 +838,13 @@ impl Session {
                             );
                             self.queue_fix_raw(&msg);
                             self.exec_id += 1;
+                            self.update_fill_ledger(
+                                *taker_order_id,
+                                *fill_price,
+                                *quantity,
+                                li,
+                                side,
+                            );
                             sent = true;
                         }
 
@@ -885,9 +910,12 @@ impl Session {
 
                         let info = order_id.and_then(|id| self.order_symbols.get(&id));
                         let (sym, ti, li, side) = sym_info_or_default(info);
+                        // Clone sym so the borrow on order_symbols ends
+                        // before the mutable borrow in update_ledger_from_report.
+                        let sym_owned = sym.to_owned();
                         let ctx = translate::FixCtx {
                             id_map: &self.id_map,
-                            symbol_str: sym,
+                            symbol_str: &sym_owned,
                             tick_inverse: ti,
                             lot_inverse: li,
                             sender: &config.target_comp_id,
@@ -905,6 +933,7 @@ impl Session {
                         if !fix_msg.is_empty() {
                             self.queue_fix_raw(&fix_msg);
                             self.exec_id += 1;
+                            self.update_ledger_from_report(report, &sym_owned, ti, li, side);
                             SessionAction::SendFix
                         } else {
                             SessionAction::None
@@ -925,6 +954,233 @@ impl Session {
             }
             _ => SessionAction::None,
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // Order ledger updates
+    // -----------------------------------------------------------------------
+
+    /// Update the order ledger from a Placed/Cancelled/Replaced/Triggered report.
+    fn update_ledger_from_report(
+        &mut self,
+        report: &ExecutionReport,
+        sym: &str,
+        tick_inverse: u64,
+        lot_inverse: u64,
+        side: Side,
+    ) {
+        match report {
+            ExecutionReport::Placed {
+                order_id,
+                price,
+                quantity,
+                ..
+            } => {
+                self.order_ledger.insert(
+                    *order_id,
+                    translate::OrderLiveState {
+                        symbol_str: sym.to_owned(),
+                        side: translate::fix_side(side),
+                        price: price::ticks_to_decimal(price.get(), tick_inverse),
+                        ord_status: "0", // New
+                        leaves_qty: price::ticks_to_decimal(quantity.get(), lot_inverse),
+                        cum_qty: 0,
+                        avg_px: 0,
+                        order_qty: price::ticks_to_decimal(quantity.get(), lot_inverse),
+                    },
+                );
+            }
+            ExecutionReport::Cancelled { order_id, .. } => {
+                if let Some(state) = self.order_ledger.get_mut(order_id) {
+                    state.ord_status = "4"; // Canceled
+                    state.leaves_qty = "0".to_owned();
+                }
+            }
+            ExecutionReport::Replaced {
+                order_id,
+                new_price,
+                new_remaining,
+                side: rep_side,
+                ..
+            } => {
+                if let Some(state) = self.order_ledger.get_mut(order_id) {
+                    state.price = price::ticks_to_decimal(new_price.get(), tick_inverse);
+                    state.leaves_qty = price::ticks_to_decimal(new_remaining.get(), lot_inverse);
+                    state.order_qty = price::ticks_to_decimal(new_remaining.get(), lot_inverse);
+                    state.side = translate::fix_side(*rep_side);
+                    state.ord_status = "0"; // Still resting
+                }
+            }
+            // Triggered and InstrumentStatusChanged don't affect order lifecycle.
+            _ => {}
+        }
+    }
+
+    /// Update the order ledger after a fill for a specific order.
+    fn update_fill_ledger(
+        &mut self,
+        order_id: OrderId,
+        fill_price: melin_engine::types::Price,
+        fill_quantity: melin_engine::types::Quantity,
+        lot_inverse: u64,
+        side: Side,
+    ) {
+        if let Some(state) = self.order_ledger.get_mut(&order_id) {
+            let fill_qty_raw = fill_quantity.get();
+            state.cum_qty += fill_qty_raw;
+            // Weighted average: avg_px = (old_avg * old_cum + fill_px * fill_qty) / new_cum
+            let old_cum = state.cum_qty - fill_qty_raw;
+            state.avg_px = if state.cum_qty > 0 {
+                (state.avg_px * old_cum + fill_price.get() * fill_qty_raw) / state.cum_qty
+            } else {
+                fill_price.get()
+            };
+
+            // Parse leaves_qty as raw ticks, subtract fill, re-format.
+            // If parsing fails (shouldn't happen), treat as fully filled.
+            let old_leaves_raw: u64 =
+                price::decimal_to_ticks(&state.leaves_qty, lot_inverse).unwrap_or(0);
+            let new_leaves_raw = old_leaves_raw.saturating_sub(fill_qty_raw);
+            state.leaves_qty = price::ticks_to_decimal(new_leaves_raw, lot_inverse);
+            state.ord_status = if new_leaves_raw == 0 { "2" } else { "1" };
+        } else {
+            // Order not in ledger (e.g., IOC taker that was never placed).
+            // Insert a minimal entry reflecting the fill.
+            let info = self.order_symbols.get(&order_id);
+            let sym = info.map_or("UNKNOWN", |i| i.fix_symbol.as_str());
+            self.order_ledger.insert(
+                order_id,
+                translate::OrderLiveState {
+                    symbol_str: sym.to_owned(),
+                    side: translate::fix_side(side),
+                    price: "0".to_owned(),
+                    ord_status: "2", // Filled
+                    leaves_qty: "0".to_owned(),
+                    cum_qty: fill_quantity.get(),
+                    avg_px: fill_price.get(),
+                    order_qty: price::ticks_to_decimal(fill_quantity.get(), lot_inverse),
+                },
+            );
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Order status queries (H, AF)
+    // -----------------------------------------------------------------------
+
+    fn handle_order_status_request(
+        &mut self,
+        msg: &FixMessage<'_>,
+        config: &GatewayConfig,
+    ) -> SessionAction {
+        // Try OrderID (tag 37) first, then ClOrdID (tag 11).
+        let order_id = msg
+            .get_str(tags::ORDER_ID)
+            .and_then(|s| s.parse::<u64>().ok())
+            .map(OrderId)
+            .or_else(|| {
+                msg.get_str(tags::CL_ORD_ID)
+                    .and_then(|c| self.id_map.get_order_id(c))
+            });
+
+        let Some(oid) = order_id else {
+            self.queue_fix_reject(config, "unknown order");
+            return SessionAction::SendFix;
+        };
+
+        let Some(state) = self.order_ledger.get(&oid) else {
+            self.queue_fix_reject(config, "unknown order");
+            return SessionAction::SendFix;
+        };
+
+        let clord_id = self.id_map.get_clord_id(oid).unwrap_or("UNKNOWN");
+        let exec_id_str = self.exec_id.to_string();
+        let report = translate::order_status_report(
+            &config.target_comp_id,
+            &self.sender_comp_id,
+            self.fix_outbound_seq,
+            oid.0,
+            clord_id,
+            &exec_id_str,
+            state,
+        );
+        self.queue_fix_raw(&report);
+        self.exec_id += 1;
+        SessionAction::SendFix
+    }
+
+    fn handle_order_mass_status_request(
+        &mut self,
+        msg: &FixMessage<'_>,
+        config: &GatewayConfig,
+    ) -> SessionAction {
+        let mass_req_id = msg.get_str(tags::MASS_STATUS_REQ_ID).unwrap_or("0");
+        let req_type = msg.get_str(tags::MASS_STATUS_REQ_TYPE).unwrap_or("1");
+        let symbol_filter = if req_type == "7" {
+            msg.get_str(tags::SYMBOL)
+        } else {
+            None
+        };
+
+        // Collect matching active orders (ord_status "0" New or "1" PartiallyFilled).
+        // Collect into a Vec first to avoid borrowing self immutably while
+        // mutating through queue_fix_raw.
+        let matches: Vec<(OrderId, translate::OrderLiveState)> = self
+            .order_ledger
+            .iter()
+            .filter(|(_, s)| s.ord_status == "0" || s.ord_status == "1")
+            .filter(|(_, s)| {
+                symbol_filter.is_none() || symbol_filter == Some(s.symbol_str.as_str())
+            })
+            .map(|(oid, s)| (*oid, s.clone()))
+            .collect();
+
+        if matches.is_empty() {
+            let exec_id_str = self.exec_id.to_string();
+            let report = translate::order_mass_status_empty(
+                &config.target_comp_id,
+                &self.sender_comp_id,
+                self.fix_outbound_seq,
+                mass_req_id,
+                &exec_id_str,
+            );
+            self.queue_fix_raw(&report);
+            self.exec_id += 1;
+            return SessionAction::SendFix;
+        }
+
+        let total = matches.len();
+        for (i, (oid, state)) in matches.iter().enumerate() {
+            let clord_id = self.id_map.get_clord_id(*oid).unwrap_or("UNKNOWN");
+            let exec_id_str = self.exec_id.to_string();
+            let mut builder = FixMessageBuilder::new(tags::MSG_EXECUTION_REPORT)
+                .str_tag(tags::ORDER_ID, &oid.0.to_string())
+                .str_tag(tags::CL_ORD_ID, clord_id)
+                .str_tag(tags::EXEC_ID, &exec_id_str)
+                .str_tag(tags::EXEC_TYPE, "I") // OrderStatus
+                .str_tag(tags::ORD_STATUS, state.ord_status)
+                .str_tag(tags::SYMBOL, &state.symbol_str)
+                .str_tag(tags::SIDE, state.side)
+                .str_tag(tags::ORDER_QTY, &state.order_qty)
+                .str_tag(tags::PRICE, &state.price)
+                .str_tag(tags::LEAVES_QTY, &state.leaves_qty)
+                .str_tag(tags::CUM_QTY, &state.cum_qty.to_string())
+                .str_tag(tags::AVG_PX, &state.avg_px.to_string())
+                .str_tag(tags::MASS_STATUS_REQ_ID, mass_req_id)
+                .str_tag(tags::TOT_NUM_REPORTS, &total.to_string());
+            if i + 1 == total {
+                builder = builder.str_tag(tags::LAST_RPT_REQUESTED, "Y");
+            }
+            let report = builder.build(
+                &config.target_comp_id,
+                &self.sender_comp_id,
+                self.fix_outbound_seq,
+            );
+            self.queue_fix_raw(&report);
+            self.exec_id += 1;
+        }
+
+        SessionAction::SendFix
     }
 
     // -----------------------------------------------------------------------

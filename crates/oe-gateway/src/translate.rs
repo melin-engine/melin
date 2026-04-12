@@ -562,7 +562,7 @@ pub fn execution_report_to_fix(
     }
 }
 
-fn fix_side(side: Side) -> &'static str {
+pub(crate) fn fix_side(side: Side) -> &'static str {
     match side {
         Side::Buy => "1",
         Side::Sell => "2",
@@ -682,9 +682,6 @@ pub fn cancel_reject_to_fix(
 // Order status queries (H, AF)
 // ---------------------------------------------------------------------------
 
-// Allow dead_code: these types and functions are exercised by tests
-// and will be called from session.rs when dispatch is wired.
-#[allow(dead_code)]
 /// Live state of a single order, tracked per-session from ExecutionReports.
 #[derive(Debug, Clone)]
 pub struct OrderLiveState {
@@ -702,7 +699,6 @@ pub struct OrderLiveState {
 /// Build an ExecutionReport (35=8) for an OrderStatusRequest (H) response.
 ///
 /// ExecType=I (OrderStatus) — a non-event report purely answering a query.
-#[allow(dead_code)] // Used when session dispatch is wired.
 pub fn order_status_report(
     sender: &str,
     target: &str,
@@ -732,7 +728,6 @@ pub fn order_status_report(
 /// OrderMassStatusRequest (AF) when there are no matching orders.
 ///
 /// `TotNumReports=0` signals "query complete, nothing found".
-#[allow(dead_code)] // Used when session dispatch is wired.
 pub fn order_mass_status_empty(
     sender: &str,
     target: &str,
