@@ -762,7 +762,7 @@ proptest! {
     /// were counted in total_submitted, so fills are counted with a factor of 2.
     #[test]
     fn volume_conservation(actions in arb_book_actions()) {
-        let mut book = OrderBook::new();
+        let mut book = OrderBook::new(Symbol(0));
         let (reports, order_ids) = run_book_actions(&mut book, &actions);
         let submitted_map = build_submitted_quantities(&actions, &order_ids);
 
@@ -817,7 +817,7 @@ proptest! {
     /// Same for stop_index vs stop_buys/stop_sells.
     #[test]
     fn book_index_consistency(actions in arb_book_actions()) {
-        let mut book = OrderBook::new();
+        let mut book = OrderBook::new(Symbol(0));
         let _ = run_book_actions(&mut book, &actions);
 
         // --- Resting orders ---
@@ -978,7 +978,7 @@ proptest! {
         orders in proptest::collection::vec((arb_price(), arb_quantity()), 2..=50),
         market_qty in 1u64..=50_000,
     ) {
-        let mut book = OrderBook::new();
+        let mut book = OrderBook::new(Symbol(0));
         let mut reports = Vec::new();
 
         for (i, (p, q)) in orders.iter().enumerate() {
@@ -1045,7 +1045,7 @@ proptest! {
         orders in proptest::collection::vec((arb_price(), arb_quantity()), 2..=50),
         market_qty in 1u64..=50_000,
     ) {
-        let mut book = OrderBook::new();
+        let mut book = OrderBook::new(Symbol(0));
         let mut reports = Vec::new();
 
         for (i, (p, q)) in orders.iter().enumerate() {

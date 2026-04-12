@@ -28,7 +28,7 @@ use crate::journal::event::JournalEvent;
 use crate::journal::replication::{ReplicationConsumer, ReplicationProducer};
 use crate::journal::trace::{TraceTimestamp, trace_ts};
 use crate::journal::writer::JournalWriter;
-use crate::types::{AccountId, ExecutionReport, OrderId, RejectReason};
+use crate::types::{AccountId, ExecutionReport, OrderId, RejectReason, Symbol};
 
 use melin_disruptor::padding::Sequence;
 use melin_disruptor::ring;
@@ -1603,6 +1603,19 @@ impl MatchingStage {
         }
     }
 
+    /// Extract the symbol from the event for reject reports, or Symbol(0) if N/A.
+    fn extract_symbol(event: &JournalEvent) -> Symbol {
+        match event {
+            JournalEvent::SubmitOrder { symbol, .. }
+            | JournalEvent::CancelOrder { symbol, .. }
+            | JournalEvent::CancelReplace { symbol, .. }
+            | JournalEvent::SetRiskLimits { symbol, .. }
+            | JournalEvent::SetCircuitBreaker { symbol, .. }
+            | JournalEvent::SetFeeSchedule { symbol, .. } => *symbol,
+            _ => Symbol(0),
+        }
+    }
+
     /// Run the matching stage loop. Blocks until shutdown.
     ///
     /// Uses small-batch consumption from the disruptor to amortize the
@@ -1738,6 +1751,7 @@ impl MatchingStage {
                 if self.is_halted() {
                     reports.push(ExecutionReport::Rejected {
                         order_id: Self::extract_order_id(&slot.event),
+                        symbol: Self::extract_symbol(&slot.event),
                         account: Self::extract_account_id(&slot.event),
                         reason: RejectReason::ReplicaDisconnected,
                     });
@@ -1750,6 +1764,7 @@ impl MatchingStage {
                     // we don't parse the specific order/account from the slot.
                     reports.push(ExecutionReport::Rejected {
                         order_id: OrderId(0),
+                        symbol: Symbol(0),
                         account: AccountId(0),
                         reason: RejectReason::DuplicateRequest,
                     });
@@ -1818,6 +1833,7 @@ impl MatchingStage {
             if self.is_halted() {
                 reports.push(ExecutionReport::Rejected {
                     order_id: Self::extract_order_id(&slot.event),
+                    symbol: Self::extract_symbol(&slot.event),
                     account: Self::extract_account_id(&slot.event),
                     reason: RejectReason::ReplicaDisconnected,
                 });
@@ -1827,6 +1843,7 @@ impl MatchingStage {
             {
                 reports.push(ExecutionReport::Rejected {
                     order_id: OrderId(0),
+                    symbol: Symbol(0),
                     account: AccountId(0),
                     reason: RejectReason::DuplicateRequest,
                 });
@@ -2962,6 +2979,7 @@ mod tests {
                 order_id: OrderId(100),
                 account: AccountId(1),
                 reason: RejectReason::ReplicaDisconnected,
+                ..
             }
         ));
 

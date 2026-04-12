@@ -9,7 +9,7 @@ use std::num::NonZeroU64;
 
 use crate::types::{
     AccountId, ExecutionReport, HashMap4, Order, OrderId, OrderType, Price, Quantity, RejectReason,
-    ReservationSlot, SelfTradeProtection, Side, TimeInForce,
+    ReservationSlot, SelfTradeProtection, Side, Symbol, TimeInForce,
 };
 
 /// A resting order on the book (the unfilled portion of a limit order).
@@ -324,6 +324,10 @@ impl BookSide {
 /// Central limit order book for a single instrument.
 #[derive(Debug)]
 pub struct OrderBook {
+    /// Symbol this book belongs to. Carried on every emitted
+    /// `ExecutionReport` so downstream consumers (gateways, mirrors)
+    /// can route events without external context.
+    symbol: Symbol,
     bids: BookSide,
     asks: BookSide,
     /// HashMap: O(1) amortized lookup for cancel operations. Maps
@@ -363,15 +367,10 @@ pub struct OrderBook {
     consumed_slots: Vec<(AccountId, OrderId, Side, ReservationSlot)>,
 }
 
-impl Default for OrderBook {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 impl OrderBook {
-    pub fn new() -> Self {
+    pub fn new(symbol: Symbol) -> Self {
         Self {
+            symbol,
             bids: BookSide::default(),
             asks: BookSide::default(),
             order_index: HashMap4::default(),
@@ -394,8 +393,9 @@ impl OrderBook {
     /// dominating the cost of cancel and cancel-replace operations.
     /// Hashbrown resizes by doubling, so a 4K→8K resize moves ~128 KB —
     /// a one-time ~5 µs stall that appears in p99.99 at most.
-    pub fn with_capacity() -> Self {
+    pub fn with_capacity(symbol: Symbol) -> Self {
         Self {
+            symbol,
             bids: BookSide::default(),
             asks: BookSide::default(),
             // One entry per resting order for O(1) cancel lookups.
@@ -451,6 +451,7 @@ impl OrderBook {
     /// Call `inject_reservation_slots()` after account restore to set
     /// the real slot values.
     pub(crate) fn from_parts(
+        symbol: Symbol,
         bids: BookSide,
         asks: BookSide,
         order_index: HashMap4<(AccountId, OrderId), (Side, Price, ReservationSlot)>,
@@ -460,6 +461,7 @@ impl OrderBook {
         last_trade_price: Option<Price>,
     ) -> Self {
         Self {
+            symbol,
             bids,
             asks,
             order_index,
@@ -728,6 +730,7 @@ impl OrderBook {
             {
                 reports.push(ExecutionReport::Cancelled {
                     order_id,
+                    symbol: self.symbol,
                     account,
                     remaining_quantity: remaining,
                 });
@@ -753,6 +756,7 @@ impl OrderBook {
                 let slot = stop.reservation;
                 reports.push(ExecutionReport::Cancelled {
                     order_id,
+                    symbol: self.symbol,
                     account: stop.account,
                     remaining_quantity: stop.quantity,
                 });
@@ -941,6 +945,7 @@ impl OrderBook {
             if would_cross {
                 reports.push(ExecutionReport::Rejected {
                     order_id: order.id,
+                    symbol: self.symbol,
                     account: order.account,
                     reason: RejectReason::PostOnlyWouldCross,
                 });
@@ -963,6 +968,7 @@ impl OrderBook {
             if available < order.quantity.get() {
                 reports.push(ExecutionReport::Rejected {
                     order_id: order.id,
+                    symbol: self.symbol,
                     account: order.account,
                     reason: RejectReason::FOKCannotFill,
                 });
@@ -987,6 +993,7 @@ impl OrderBook {
                     // STP terminated matching — cancel the taker regardless of TIF.
                     reports.push(ExecutionReport::Cancelled {
                         order_id: order.id,
+                        symbol: self.symbol,
                         account: order.account,
                         remaining_quantity: rem,
                     });
@@ -1011,6 +1018,7 @@ impl OrderBook {
                         TimeInForce::IOC | TimeInForce::FOK => {
                             reports.push(ExecutionReport::Cancelled {
                                 order_id: order.id,
+                                symbol: self.symbol,
                                 account: order.account,
                                 remaining_quantity: rem,
                             });
@@ -1043,6 +1051,7 @@ impl OrderBook {
             if available < order.quantity.get() {
                 reports.push(ExecutionReport::Rejected {
                     order_id: order.id,
+                    symbol: self.symbol,
                     account: order.account,
                     reason: RejectReason::FOKCannotFill,
                 });
@@ -1054,6 +1063,7 @@ impl OrderBook {
         if opposite.is_empty() {
             reports.push(ExecutionReport::Rejected {
                 order_id: order.id,
+                symbol: self.symbol,
                 account: order.account,
                 reason: RejectReason::NoLiquidity,
             });
@@ -1076,6 +1086,7 @@ impl OrderBook {
             // (STP cancellation also results in cancelling the remainder.)
             reports.push(ExecutionReport::Cancelled {
                 order_id: order.id,
+                symbol: self.symbol,
                 account: order.account,
                 remaining_quantity: rem,
             });
@@ -1177,6 +1188,7 @@ impl OrderBook {
                             ));
                             reports.push(ExecutionReport::Cancelled {
                                 order_id: cancelled_maker.id,
+                                symbol: self.symbol,
                                 account: cancelled_maker.account,
                                 remaining_quantity: cancelled_maker.remaining,
                             });
@@ -1195,6 +1207,7 @@ impl OrderBook {
                             ));
                             reports.push(ExecutionReport::Cancelled {
                                 order_id: cancelled_maker.id,
+                                symbol: self.symbol,
                                 account: cancelled_maker.account,
                                 remaining_quantity: cancelled_maker.remaining,
                             });
@@ -1229,6 +1242,7 @@ impl OrderBook {
                 reports.push(ExecutionReport::Fill {
                     maker_order_id: maker.id,
                     taker_order_id: taker_id,
+                    symbol: self.symbol,
                     maker_account: maker.account,
                     taker_account,
                     price,
@@ -1383,6 +1397,8 @@ impl OrderBook {
         for stop in triggered.drain(..) {
             reports.push(ExecutionReport::Triggered {
                 order_id: stop.id,
+                symbol: self.symbol,
+                account: stop.account,
                 trigger_price: stop.trigger_price,
             });
 
@@ -1464,6 +1480,8 @@ impl OrderBook {
             .insert((account, id), (side, price, reservation));
         reports.push(ExecutionReport::Placed {
             order_id: id,
+            symbol: self.symbol,
+            account,
             side,
             price,
             quantity,
@@ -1613,6 +1631,9 @@ mod tests {
     use std::num::NonZeroU64;
 
     use super::*;
+    use crate::types::Symbol;
+
+    const TEST_SYMBOL: Symbol = Symbol(1);
 
     fn qty(n: u64) -> Quantity {
         Quantity(NonZeroU64::new(n).unwrap())
@@ -1658,7 +1679,7 @@ mod tests {
 
     #[test]
     fn limit_order_rests_on_empty_book() {
-        let mut book = OrderBook::new();
+        let mut book = OrderBook::new(TEST_SYMBOL);
         let mut reports = Vec::new();
         book.execute(
             limit_order(1, Side::Buy, 100, 10, TimeInForce::GTC),
@@ -1672,6 +1693,8 @@ mod tests {
             reports[0],
             ExecutionReport::Placed {
                 order_id: OrderId(1),
+                symbol: TEST_SYMBOL,
+                account: TEST_ACCOUNT,
                 side: Side::Buy,
                 ..
             }
@@ -1690,7 +1713,7 @@ mod tests {
 
     #[test]
     fn non_crossing_limit_orders_both_rest() {
-        let mut book = OrderBook::new();
+        let mut book = OrderBook::new(TEST_SYMBOL);
         let mut reports = Vec::new();
 
         // Bid at 100, ask at 200 — no cross.
@@ -1735,7 +1758,7 @@ mod tests {
 
     #[test]
     fn limit_buy_matches_resting_ask() {
-        let mut book = OrderBook::new();
+        let mut book = OrderBook::new(TEST_SYMBOL);
         let mut reports = Vec::new();
 
         book.execute(
@@ -1760,6 +1783,7 @@ mod tests {
             ExecutionReport::Fill {
                 maker_order_id: OrderId(1),
                 taker_order_id: OrderId(2),
+                symbol: TEST_SYMBOL,
                 maker_account: TEST_ACCOUNT,
                 taker_account: TEST_ACCOUNT,
                 price: price(100),
@@ -1774,7 +1798,7 @@ mod tests {
 
     #[test]
     fn limit_buy_matches_at_better_price() {
-        let mut book = OrderBook::new();
+        let mut book = OrderBook::new(TEST_SYMBOL);
         let mut reports = Vec::new();
 
         // Resting ask at 90.
@@ -1800,6 +1824,7 @@ mod tests {
             ExecutionReport::Fill {
                 maker_order_id: OrderId(1),
                 taker_order_id: OrderId(2),
+                symbol: TEST_SYMBOL,
                 maker_account: TEST_ACCOUNT,
                 taker_account: TEST_ACCOUNT,
                 price: price(90),
@@ -1814,7 +1839,7 @@ mod tests {
 
     #[test]
     fn partial_fill_remainder_rests() {
-        let mut book = OrderBook::new();
+        let mut book = OrderBook::new(TEST_SYMBOL);
         let mut reports = Vec::new();
 
         book.execute(
@@ -1839,6 +1864,7 @@ mod tests {
             ExecutionReport::Fill {
                 maker_order_id: OrderId(1),
                 taker_order_id: OrderId(2),
+                symbol: TEST_SYMBOL,
                 maker_account: TEST_ACCOUNT,
                 taker_account: TEST_ACCOUNT,
                 price: price(100),
@@ -1851,6 +1877,8 @@ mod tests {
             reports[1],
             ExecutionReport::Placed {
                 order_id: OrderId(2),
+                symbol: TEST_SYMBOL,
+                account: TEST_ACCOUNT,
                 side: Side::Buy,
                 price: price(100),
                 quantity: qty(5),
@@ -1872,7 +1900,7 @@ mod tests {
 
     #[test]
     fn price_time_priority() {
-        let mut book = OrderBook::new();
+        let mut book = OrderBook::new(TEST_SYMBOL);
         let mut reports = Vec::new();
 
         // Two asks at price 100, first one should fill first.
@@ -1904,6 +1932,7 @@ mod tests {
             ExecutionReport::Fill {
                 maker_order_id: OrderId(1),
                 taker_order_id: OrderId(3),
+                symbol: TEST_SYMBOL,
                 maker_account: TEST_ACCOUNT,
                 taker_account: TEST_ACCOUNT,
                 price: price(100),
@@ -1917,6 +1946,7 @@ mod tests {
             ExecutionReport::Fill {
                 maker_order_id: OrderId(2),
                 taker_order_id: OrderId(3),
+                symbol: TEST_SYMBOL,
                 maker_account: TEST_ACCOUNT,
                 taker_account: TEST_ACCOUNT,
                 price: price(100),
@@ -1940,7 +1970,7 @@ mod tests {
 
     #[test]
     fn price_priority_best_price_first() {
-        let mut book = OrderBook::new();
+        let mut book = OrderBook::new(TEST_SYMBOL);
         let mut reports = Vec::new();
 
         // Asks at 110, then 100. Buy should hit 100 first.
@@ -1971,6 +2001,7 @@ mod tests {
             ExecutionReport::Fill {
                 maker_order_id: OrderId(2),
                 taker_order_id: OrderId(3),
+                symbol: TEST_SYMBOL,
                 maker_account: TEST_ACCOUNT,
                 taker_account: TEST_ACCOUNT,
                 price: price(100),
@@ -1997,7 +2028,7 @@ mod tests {
 
     #[test]
     fn market_buy_fills_against_asks() {
-        let mut book = OrderBook::new();
+        let mut book = OrderBook::new(TEST_SYMBOL);
         let mut reports = Vec::new();
 
         book.execute(
@@ -2022,7 +2053,7 @@ mod tests {
 
     #[test]
     fn market_order_rejected_on_empty_book() {
-        let mut book = OrderBook::new();
+        let mut book = OrderBook::new(TEST_SYMBOL);
         let mut reports = Vec::new();
 
         book.execute(
@@ -2037,6 +2068,7 @@ mod tests {
             reports[0],
             ExecutionReport::Rejected {
                 order_id: OrderId(1),
+                symbol: TEST_SYMBOL,
                 account: TEST_ACCOUNT,
                 reason: RejectReason::NoLiquidity,
             }
@@ -2045,7 +2077,7 @@ mod tests {
 
     #[test]
     fn market_order_partial_fill_cancels_remainder() {
-        let mut book = OrderBook::new();
+        let mut book = OrderBook::new(TEST_SYMBOL);
         let mut reports = Vec::new();
 
         book.execute(
@@ -2070,6 +2102,7 @@ mod tests {
             reports[1],
             ExecutionReport::Cancelled {
                 order_id: OrderId(2),
+                symbol: TEST_SYMBOL,
                 account: TEST_ACCOUNT,
                 remaining_quantity: qty(5),
             }
@@ -2081,7 +2114,7 @@ mod tests {
 
     #[test]
     fn ioc_limit_cancels_unfilled_remainder() {
-        let mut book = OrderBook::new();
+        let mut book = OrderBook::new(TEST_SYMBOL);
         let mut reports = Vec::new();
 
         book.execute(
@@ -2105,6 +2138,7 @@ mod tests {
             reports[1],
             ExecutionReport::Cancelled {
                 order_id: OrderId(2),
+                symbol: TEST_SYMBOL,
                 account: TEST_ACCOUNT,
                 remaining_quantity: qty(5),
             }
@@ -2116,7 +2150,7 @@ mod tests {
 
     #[test]
     fn fok_rejected_when_insufficient_quantity() {
-        let mut book = OrderBook::new();
+        let mut book = OrderBook::new(TEST_SYMBOL);
         let mut reports = Vec::new();
 
         book.execute(
@@ -2140,6 +2174,7 @@ mod tests {
             reports[0],
             ExecutionReport::Rejected {
                 order_id: OrderId(2),
+                symbol: TEST_SYMBOL,
                 account: TEST_ACCOUNT,
                 reason: RejectReason::FOKCannotFill,
             }
@@ -2159,7 +2194,7 @@ mod tests {
 
     #[test]
     fn fok_fills_entirely_when_sufficient() {
-        let mut book = OrderBook::new();
+        let mut book = OrderBook::new(TEST_SYMBOL);
         let mut reports = Vec::new();
 
         book.execute(
@@ -2186,7 +2221,7 @@ mod tests {
 
     #[test]
     fn cancel_resting_order() {
-        let mut book = OrderBook::new();
+        let mut book = OrderBook::new(TEST_SYMBOL);
         let mut reports = Vec::new();
 
         book.execute(
@@ -2204,6 +2239,7 @@ mod tests {
             reports[0],
             ExecutionReport::Cancelled {
                 order_id: OrderId(1),
+                symbol: TEST_SYMBOL,
                 account: TEST_ACCOUNT,
                 remaining_quantity: qty(10),
             }
@@ -2213,7 +2249,7 @@ mod tests {
 
     #[test]
     fn cancel_unknown_order_is_noop() {
-        let mut book = OrderBook::new();
+        let mut book = OrderBook::new(TEST_SYMBOL);
         let mut reports = Vec::new();
 
         book.cancel(TEST_ACCOUNT, OrderId(999), &mut reports);
@@ -2223,7 +2259,7 @@ mod tests {
 
     #[test]
     fn cancelled_order_does_not_match() {
-        let mut book = OrderBook::new();
+        let mut book = OrderBook::new(TEST_SYMBOL);
         let mut reports = Vec::new();
 
         book.execute(
@@ -2257,7 +2293,7 @@ mod tests {
 
     #[test]
     fn market_order_sweeps_multiple_price_levels() {
-        let mut book = OrderBook::new();
+        let mut book = OrderBook::new(TEST_SYMBOL);
         let mut reports = Vec::new();
 
         book.execute(
@@ -2294,6 +2330,7 @@ mod tests {
             ExecutionReport::Fill {
                 maker_order_id: OrderId(1),
                 taker_order_id: OrderId(4),
+                symbol: TEST_SYMBOL,
                 maker_account: TEST_ACCOUNT,
                 taker_account: TEST_ACCOUNT,
                 price: price(100),
@@ -2307,6 +2344,7 @@ mod tests {
             ExecutionReport::Fill {
                 maker_order_id: OrderId(2),
                 taker_order_id: OrderId(4),
+                symbol: TEST_SYMBOL,
                 maker_account: TEST_ACCOUNT,
                 taker_account: TEST_ACCOUNT,
                 price: price(101),
@@ -2320,6 +2358,7 @@ mod tests {
             ExecutionReport::Fill {
                 maker_order_id: OrderId(3),
                 taker_order_id: OrderId(4),
+                symbol: TEST_SYMBOL,
                 maker_account: TEST_ACCOUNT,
                 taker_account: TEST_ACCOUNT,
                 price: price(102),
@@ -2345,7 +2384,7 @@ mod tests {
 
     #[test]
     fn limit_sell_matches_resting_bid() {
-        let mut book = OrderBook::new();
+        let mut book = OrderBook::new(TEST_SYMBOL);
         let mut reports = Vec::new();
 
         book.execute(
@@ -2369,6 +2408,7 @@ mod tests {
             ExecutionReport::Fill {
                 maker_order_id: OrderId(1),
                 taker_order_id: OrderId(2),
+                symbol: TEST_SYMBOL,
                 maker_account: TEST_ACCOUNT,
                 taker_account: TEST_ACCOUNT,
                 price: price(100),
@@ -2382,7 +2422,7 @@ mod tests {
 
     #[test]
     fn sell_matches_best_bid_first() {
-        let mut book = OrderBook::new();
+        let mut book = OrderBook::new(TEST_SYMBOL);
         let mut reports = Vec::new();
 
         // Bids at 90 and 100. Sell should hit 100 first.
@@ -2413,6 +2453,7 @@ mod tests {
             ExecutionReport::Fill {
                 maker_order_id: OrderId(2),
                 taker_order_id: OrderId(3),
+                symbol: TEST_SYMBOL,
                 maker_account: TEST_ACCOUNT,
                 taker_account: TEST_ACCOUNT,
                 price: price(100),
@@ -2477,7 +2518,7 @@ mod tests {
 
     #[test]
     fn stop_buy_triggers_on_trade_at_trigger_price() {
-        let mut book = OrderBook::new();
+        let mut book = OrderBook::new(TEST_SYMBOL);
         let mut reports = Vec::new();
 
         // Place a resting ask at 100 and a stop buy that triggers at 100.
@@ -2515,6 +2556,8 @@ mod tests {
             reports[1],
             ExecutionReport::Triggered {
                 order_id: OrderId(2),
+                symbol: TEST_SYMBOL,
+                account: TEST_ACCOUNT,
                 trigger_price: price(100),
             }
         );
@@ -2530,7 +2573,7 @@ mod tests {
 
     #[test]
     fn stop_sell_triggers_on_trade_at_trigger_price() {
-        let mut book = OrderBook::new();
+        let mut book = OrderBook::new(TEST_SYMBOL);
         let mut reports = Vec::new();
 
         // Place a resting bid at 100 and a stop sell that triggers at 100.
@@ -2567,6 +2610,8 @@ mod tests {
             reports[1],
             ExecutionReport::Triggered {
                 order_id: OrderId(2),
+                symbol: TEST_SYMBOL,
+                account: TEST_ACCOUNT,
                 trigger_price: price(100),
             }
         );
@@ -2582,7 +2627,7 @@ mod tests {
 
     #[test]
     fn stop_buy_does_not_trigger_below_price() {
-        let mut book = OrderBook::new();
+        let mut book = OrderBook::new(TEST_SYMBOL);
         let mut reports = Vec::new();
 
         // Stop buy at 110, but trade happens at 100.
@@ -2624,7 +2669,7 @@ mod tests {
     /// (not just at it). Trigger condition: trade_price >= trigger_price.
     #[test]
     fn stop_buy_triggers_above_trigger_price() {
-        let mut book = OrderBook::new();
+        let mut book = OrderBook::new(TEST_SYMBOL);
         let mut reports = Vec::new();
 
         // Resting asks at 100 and 110.
@@ -2673,7 +2718,7 @@ mod tests {
     /// (not just at it). Trigger condition: trade_price <= trigger_price.
     #[test]
     fn stop_sell_triggers_below_trigger_price() {
-        let mut book = OrderBook::new();
+        let mut book = OrderBook::new(TEST_SYMBOL);
         let mut reports = Vec::new();
 
         // Resting bids at 100 and 90.
@@ -2721,7 +2766,7 @@ mod tests {
     /// Stop sell does NOT trigger when trade price is above trigger price.
     #[test]
     fn stop_sell_does_not_trigger_above_price() {
-        let mut book = OrderBook::new();
+        let mut book = OrderBook::new(TEST_SYMBOL);
         let mut reports = Vec::new();
 
         // Resting bid at 100 and stop sell at trigger 90.
@@ -2759,7 +2804,7 @@ mod tests {
 
     #[test]
     fn stop_limit_triggers_and_rests() {
-        let mut book = OrderBook::new();
+        let mut book = OrderBook::new(TEST_SYMBOL);
         let mut reports = Vec::new();
 
         // Resting ask at 100, stop-limit buy: trigger at 100, limit at 95.
@@ -2796,6 +2841,8 @@ mod tests {
             reports[1],
             ExecutionReport::Triggered {
                 order_id: OrderId(2),
+                symbol: TEST_SYMBOL,
+                account: TEST_ACCOUNT,
                 trigger_price: price(100),
             }
         );
@@ -2804,6 +2851,8 @@ mod tests {
             reports[2],
             ExecutionReport::Placed {
                 order_id: OrderId(2),
+                symbol: TEST_SYMBOL,
+                account: TEST_ACCOUNT,
                 side: Side::Buy,
                 ..
             }
@@ -2812,7 +2861,7 @@ mod tests {
 
     #[test]
     fn cancel_pending_stop_order() {
-        let mut book = OrderBook::new();
+        let mut book = OrderBook::new(TEST_SYMBOL);
         let mut reports = Vec::new();
 
         book.execute(
@@ -2830,6 +2879,7 @@ mod tests {
             reports[0],
             ExecutionReport::Cancelled {
                 order_id: OrderId(1),
+                symbol: TEST_SYMBOL,
                 account: TEST_ACCOUNT,
                 remaining_quantity: qty(10),
             }
@@ -2839,7 +2889,7 @@ mod tests {
 
     #[test]
     fn cancelled_stop_does_not_trigger() {
-        let mut book = OrderBook::new();
+        let mut book = OrderBook::new(TEST_SYMBOL);
         let mut reports = Vec::new();
 
         book.execute(
@@ -2907,7 +2957,7 @@ mod tests {
 
     #[test]
     fn gtd_order_expires_when_timestamp_reached() {
-        let mut book = OrderBook::new();
+        let mut book = OrderBook::new(TEST_SYMBOL);
         let mut reports = Vec::new();
 
         // Place a GTD buy order expiring at t=1000.
@@ -2937,7 +2987,7 @@ mod tests {
 
     #[test]
     fn gtd_order_does_not_expire_before_timestamp() {
-        let mut book = OrderBook::new();
+        let mut book = OrderBook::new(TEST_SYMBOL);
         let mut reports = Vec::new();
 
         // Place a GTD buy order expiring at t=1000.
@@ -2957,7 +3007,7 @@ mod tests {
 
     #[test]
     fn non_gtd_orders_not_affected_by_cancel_expired() {
-        let mut book = OrderBook::new();
+        let mut book = OrderBook::new(TEST_SYMBOL);
         let mut reports = Vec::new();
 
         // GTC order.
@@ -2983,7 +3033,7 @@ mod tests {
 
     #[test]
     fn gtd_pending_stop_expires() {
-        let mut book = OrderBook::new();
+        let mut book = OrderBook::new(TEST_SYMBOL);
         let mut reports = Vec::new();
 
         // Place a GTD stop buy expiring at t=5000.

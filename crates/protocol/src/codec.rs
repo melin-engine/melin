@@ -879,6 +879,8 @@ fn encode_execution_report(report: &ExecutionReport, buf: &mut [u8]) -> usize {
     match report {
         ExecutionReport::Placed {
             order_id,
+            symbol,
+            account,
             side,
             price,
             quantity,
@@ -887,6 +889,10 @@ fn encode_execution_report(report: &ExecutionReport, buf: &mut [u8]) -> usize {
             pos += 1;
             le::put_u64(&mut buf[pos..], order_id.0);
             pos += 8;
+            le::put_u32(&mut buf[pos..], symbol.0);
+            pos += 4;
+            le::put_u32(&mut buf[pos..], account.0);
+            pos += 4;
             buf[pos] = le::encode_side(*side);
             pos += 1;
             le::put_u64(&mut buf[pos..], price.get());
@@ -897,6 +903,7 @@ fn encode_execution_report(report: &ExecutionReport, buf: &mut [u8]) -> usize {
         ExecutionReport::Fill {
             maker_order_id,
             taker_order_id,
+            symbol,
             maker_account,
             taker_account,
             price,
@@ -910,6 +917,8 @@ fn encode_execution_report(report: &ExecutionReport, buf: &mut [u8]) -> usize {
             pos += 8;
             le::put_u64(&mut buf[pos..], taker_order_id.0);
             pos += 8;
+            le::put_u32(&mut buf[pos..], symbol.0);
+            pos += 4;
             le::put_u32(&mut buf[pos..], maker_account.0);
             pos += 4;
             le::put_u32(&mut buf[pos..], taker_account.0);
@@ -925,6 +934,7 @@ fn encode_execution_report(report: &ExecutionReport, buf: &mut [u8]) -> usize {
         }
         ExecutionReport::Cancelled {
             order_id,
+            symbol,
             account,
             remaining_quantity,
         } => {
@@ -932,6 +942,8 @@ fn encode_execution_report(report: &ExecutionReport, buf: &mut [u8]) -> usize {
             pos += 1;
             le::put_u64(&mut buf[pos..], order_id.0);
             pos += 8;
+            le::put_u32(&mut buf[pos..], symbol.0);
+            pos += 4;
             le::put_u32(&mut buf[pos..], account.0);
             pos += 4;
             le::put_u64(&mut buf[pos..], remaining_quantity.get());
@@ -939,17 +951,24 @@ fn encode_execution_report(report: &ExecutionReport, buf: &mut [u8]) -> usize {
         }
         ExecutionReport::Triggered {
             order_id,
+            symbol,
+            account,
             trigger_price,
         } => {
             buf[pos] = TAG_TRIGGERED;
             pos += 1;
             le::put_u64(&mut buf[pos..], order_id.0);
             pos += 8;
+            le::put_u32(&mut buf[pos..], symbol.0);
+            pos += 4;
+            le::put_u32(&mut buf[pos..], account.0);
+            pos += 4;
             le::put_u64(&mut buf[pos..], trigger_price.get());
             pos += 8;
         }
         ExecutionReport::Rejected {
             order_id,
+            symbol,
             account,
             reason,
         } => {
@@ -957,6 +976,8 @@ fn encode_execution_report(report: &ExecutionReport, buf: &mut [u8]) -> usize {
             pos += 1;
             le::put_u64(&mut buf[pos..], order_id.0);
             pos += 8;
+            le::put_u32(&mut buf[pos..], symbol.0);
+            pos += 4;
             le::put_u32(&mut buf[pos..], account.0);
             pos += 4;
             buf[pos] = encode_reject_reason(*reason);
@@ -964,6 +985,8 @@ fn encode_execution_report(report: &ExecutionReport, buf: &mut [u8]) -> usize {
         }
         ExecutionReport::Replaced {
             order_id,
+            symbol,
+            account,
             side,
             old_price,
             new_price,
@@ -974,6 +997,10 @@ fn encode_execution_report(report: &ExecutionReport, buf: &mut [u8]) -> usize {
             pos += 1;
             le::put_u64(&mut buf[pos..], order_id.0);
             pos += 8;
+            le::put_u32(&mut buf[pos..], symbol.0);
+            pos += 4;
+            le::put_u32(&mut buf[pos..], account.0);
+            pos += 4;
             buf[pos] = le::encode_side(*side);
             pos += 1;
             le::put_u64(&mut buf[pos..], old_price.get());
@@ -1002,39 +1029,48 @@ fn encode_execution_report(report: &ExecutionReport, buf: &mut [u8]) -> usize {
 fn decode_execution_report(tag: u8, payload: &[u8]) -> Result<ExecutionReport, ProtocolError> {
     match tag {
         TAG_PLACED => {
-            if payload.len() < 25 {
+            // order_id(8) + symbol(4) + account(4) + side(1) + price(8) + quantity(8) = 33
+            if payload.len() < 33 {
                 return Err(ProtocolError::Truncated);
             }
             let order_id = OrderId(le::get_u64(&payload[0..]));
-            let side = le::decode_side(payload[8]).ok_or(ProtocolError::InvalidField("side"))?;
-            let price = NonZeroU64::new(le::get_u64(&payload[9..]))
+            let symbol = Symbol(le::get_u32(&payload[8..]));
+            let account = AccountId(le::get_u32(&payload[12..]));
+            let side = le::decode_side(payload[16]).ok_or(ProtocolError::InvalidField("side"))?;
+            let price = NonZeroU64::new(le::get_u64(&payload[17..]))
                 .ok_or(ProtocolError::InvalidField("placed price is zero"))?;
-            let quantity = NonZeroU64::new(le::get_u64(&payload[17..]))
+            let quantity = NonZeroU64::new(le::get_u64(&payload[25..]))
                 .ok_or(ProtocolError::InvalidField("placed quantity is zero"))?;
             Ok(ExecutionReport::Placed {
                 order_id,
+                symbol,
+                account,
                 side,
                 price: Price(price),
                 quantity: Quantity(quantity),
             })
         }
         TAG_FILL => {
-            if payload.len() < 56 {
+            // maker_id(8) + taker_id(8) + symbol(4) + maker_acct(4) + taker_acct(4) +
+            // price(8) + qty(8) + maker_fee(8) + taker_fee(8) = 60
+            if payload.len() < 60 {
                 return Err(ProtocolError::Truncated);
             }
             let maker_order_id = OrderId(le::get_u64(&payload[0..]));
             let taker_order_id = OrderId(le::get_u64(&payload[8..]));
-            let maker_account = AccountId(le::get_u32(&payload[16..]));
-            let taker_account = AccountId(le::get_u32(&payload[20..]));
-            let price = NonZeroU64::new(le::get_u64(&payload[24..]))
+            let symbol = Symbol(le::get_u32(&payload[16..]));
+            let maker_account = AccountId(le::get_u32(&payload[20..]));
+            let taker_account = AccountId(le::get_u32(&payload[24..]));
+            let price = NonZeroU64::new(le::get_u64(&payload[28..]))
                 .ok_or(ProtocolError::InvalidField("fill price is zero"))?;
-            let quantity = NonZeroU64::new(le::get_u64(&payload[32..]))
+            let quantity = NonZeroU64::new(le::get_u64(&payload[36..]))
                 .ok_or(ProtocolError::InvalidField("fill quantity is zero"))?;
-            let maker_fee = le::get_u64(&payload[40..]) as i64;
-            let taker_fee = le::get_u64(&payload[48..]) as i64;
+            let maker_fee = le::get_u64(&payload[44..]) as i64;
+            let taker_fee = le::get_u64(&payload[52..]) as i64;
             Ok(ExecutionReport::Fill {
                 maker_order_id,
                 taker_order_id,
+                symbol,
                 maker_account,
                 taker_account,
                 price: Price(price),
@@ -1044,65 +1080,79 @@ fn decode_execution_report(tag: u8, payload: &[u8]) -> Result<ExecutionReport, P
             })
         }
         TAG_CANCELLED => {
-            // order_id(8) + account(4) + remaining(8) = 20
-            if payload.len() < 20 {
+            // order_id(8) + symbol(4) + account(4) + remaining(8) = 24
+            if payload.len() < 24 {
                 return Err(ProtocolError::Truncated);
             }
             let order_id = OrderId(le::get_u64(&payload[0..]));
-            let account = AccountId(le::get_u32(&payload[8..]));
-            let remaining = NonZeroU64::new(le::get_u64(&payload[12..]))
+            let symbol = Symbol(le::get_u32(&payload[8..]));
+            let account = AccountId(le::get_u32(&payload[12..]));
+            let remaining = NonZeroU64::new(le::get_u64(&payload[16..]))
                 .ok_or(ProtocolError::InvalidField("cancelled remaining is zero"))?;
             Ok(ExecutionReport::Cancelled {
                 order_id,
+                symbol,
                 account,
                 remaining_quantity: Quantity(remaining),
             })
         }
         TAG_TRIGGERED => {
-            if payload.len() < 16 {
+            // order_id(8) + symbol(4) + account(4) + trigger_price(8) = 24
+            if payload.len() < 24 {
                 return Err(ProtocolError::Truncated);
             }
             let order_id = OrderId(le::get_u64(&payload[0..]));
-            let trigger_price = NonZeroU64::new(le::get_u64(&payload[8..]))
+            let symbol = Symbol(le::get_u32(&payload[8..]));
+            let account = AccountId(le::get_u32(&payload[12..]));
+            let trigger_price = NonZeroU64::new(le::get_u64(&payload[16..]))
                 .ok_or(ProtocolError::InvalidField("trigger price is zero"))?;
             Ok(ExecutionReport::Triggered {
                 order_id,
+                symbol,
+                account,
                 trigger_price: Price(trigger_price),
             })
         }
         TAG_REJECTED => {
-            // order_id(8) + account(4) + reason(1) = 13
-            if payload.len() < 13 {
+            // order_id(8) + symbol(4) + account(4) + reason(1) = 17
+            if payload.len() < 17 {
                 return Err(ProtocolError::Truncated);
             }
             let order_id = OrderId(le::get_u64(&payload[0..]));
-            let account = AccountId(le::get_u32(&payload[8..]));
-            let reason = decode_reject_reason(payload[12])?;
+            let symbol = Symbol(le::get_u32(&payload[8..]));
+            let account = AccountId(le::get_u32(&payload[12..]));
+            let reason = decode_reject_reason(payload[16])?;
             Ok(ExecutionReport::Rejected {
                 order_id,
+                symbol,
                 account,
                 reason,
             })
         }
         TAG_REPLACED => {
-            // order_id(8) + side(1) + old_price(8) + new_price(8) + old_remaining(8) + new_remaining(8) = 41
-            if payload.len() < 41 {
+            // order_id(8) + symbol(4) + account(4) + side(1) + old_price(8) + new_price(8) +
+            // old_remaining(8) + new_remaining(8) = 49
+            if payload.len() < 49 {
                 return Err(ProtocolError::Truncated);
             }
             let order_id = OrderId(le::get_u64(&payload[0..]));
-            let side = le::decode_side(payload[8]).ok_or(ProtocolError::InvalidField("side"))?;
-            let old_price = NonZeroU64::new(le::get_u64(&payload[9..]))
+            let symbol = Symbol(le::get_u32(&payload[8..]));
+            let account = AccountId(le::get_u32(&payload[12..]));
+            let side = le::decode_side(payload[16]).ok_or(ProtocolError::InvalidField("side"))?;
+            let old_price = NonZeroU64::new(le::get_u64(&payload[17..]))
                 .ok_or(ProtocolError::InvalidField("replaced old_price is zero"))?;
-            let new_price = NonZeroU64::new(le::get_u64(&payload[17..]))
+            let new_price = NonZeroU64::new(le::get_u64(&payload[25..]))
                 .ok_or(ProtocolError::InvalidField("replaced new_price is zero"))?;
-            let old_remaining = NonZeroU64::new(le::get_u64(&payload[25..])).ok_or(
+            let old_remaining = NonZeroU64::new(le::get_u64(&payload[33..])).ok_or(
                 ProtocolError::InvalidField("replaced old_remaining is zero"),
             )?;
-            let new_remaining = NonZeroU64::new(le::get_u64(&payload[33..])).ok_or(
+            let new_remaining = NonZeroU64::new(le::get_u64(&payload[41..])).ok_or(
                 ProtocolError::InvalidField("replaced new_remaining is zero"),
             )?;
             Ok(ExecutionReport::Replaced {
                 order_id,
+                symbol,
+                account,
                 side,
                 old_price: Price(old_price),
                 new_price: Price(new_price),
@@ -1368,6 +1418,8 @@ mod tests {
         vec![
             ResponseKind::Report(ExecutionReport::Placed {
                 order_id: OrderId(1),
+                symbol: Symbol(7),
+                account: AccountId(42),
                 side: Side::Buy,
                 price: Price(nz(100)),
                 quantity: Quantity(nz(50)),
@@ -1375,6 +1427,7 @@ mod tests {
             ResponseKind::Report(ExecutionReport::Fill {
                 maker_order_id: OrderId(1),
                 taker_order_id: OrderId(2),
+                symbol: Symbol(3),
                 maker_account: AccountId(10),
                 taker_account: AccountId(20),
                 price: Price(nz(100)),
@@ -1384,105 +1437,127 @@ mod tests {
             }),
             ResponseKind::Report(ExecutionReport::Cancelled {
                 order_id: OrderId(3),
+                symbol: Symbol(2),
                 account: AccountId(10),
                 remaining_quantity: Quantity(nz(5)),
             }),
             ResponseKind::Report(ExecutionReport::Triggered {
                 order_id: OrderId(4),
+                symbol: Symbol(4),
+                account: AccountId(33),
                 trigger_price: Price(nz(200)),
             }),
             ResponseKind::Report(ExecutionReport::Rejected {
                 order_id: OrderId(5),
+                symbol: Symbol(6),
                 account: AccountId(10),
                 reason: RejectReason::NoLiquidity,
             }),
             ResponseKind::Report(ExecutionReport::Rejected {
                 order_id: OrderId(6),
+                symbol: Symbol(1),
                 account: AccountId(10),
                 reason: RejectReason::FOKCannotFill,
             }),
             ResponseKind::Report(ExecutionReport::Rejected {
                 order_id: OrderId(7),
+                symbol: Symbol(1),
                 account: AccountId(10),
                 reason: RejectReason::InsufficientBalance,
             }),
             ResponseKind::Report(ExecutionReport::Rejected {
                 order_id: OrderId(8),
+                symbol: Symbol(1),
                 account: AccountId(10),
                 reason: RejectReason::UnknownAccount,
             }),
             ResponseKind::Report(ExecutionReport::Rejected {
                 order_id: OrderId(9),
+                symbol: Symbol(1),
                 account: AccountId(10),
                 reason: RejectReason::UnknownSymbol,
             }),
             ResponseKind::Report(ExecutionReport::Rejected {
                 order_id: OrderId(10),
+                symbol: Symbol(1),
                 account: AccountId(10),
                 reason: RejectReason::SelfTradePrevented,
             }),
             ResponseKind::Report(ExecutionReport::Rejected {
                 order_id: OrderId(11),
+                symbol: Symbol(1),
                 account: AccountId(10),
                 reason: RejectReason::DuplicateOrderId,
             }),
             ResponseKind::Report(ExecutionReport::Rejected {
                 order_id: OrderId(12),
+                symbol: Symbol(1),
                 account: AccountId(10),
                 reason: RejectReason::ExceedsMaxOrderQty,
             }),
             ResponseKind::Report(ExecutionReport::Rejected {
                 order_id: OrderId(13),
+                symbol: Symbol(1),
                 account: AccountId(10),
                 reason: RejectReason::ExceedsMaxNotional,
             }),
             ResponseKind::Report(ExecutionReport::Rejected {
                 order_id: OrderId(14),
+                symbol: Symbol(1),
                 account: AccountId(10),
                 reason: RejectReason::TradingHalted,
             }),
             ResponseKind::Report(ExecutionReport::Rejected {
                 order_id: OrderId(15),
+                symbol: Symbol(1),
                 account: AccountId(10),
                 reason: RejectReason::OutsidePriceBand,
             }),
             ResponseKind::Report(ExecutionReport::Rejected {
                 order_id: OrderId(16),
+                symbol: Symbol(1),
                 account: AccountId(10),
                 reason: RejectReason::UnknownOrder,
             }),
             ResponseKind::Report(ExecutionReport::Rejected {
                 order_id: OrderId(17),
+                symbol: Symbol(1),
                 account: AccountId(10),
                 reason: RejectReason::PriceWouldCross,
             }),
             ResponseKind::Report(ExecutionReport::Rejected {
                 order_id: OrderId(18),
+                symbol: Symbol(1),
                 account: AccountId(10),
                 reason: RejectReason::PostOnlyWouldCross,
             }),
             ResponseKind::Report(ExecutionReport::Rejected {
                 order_id: OrderId(19),
+                symbol: Symbol(1),
                 account: AccountId(10),
                 reason: RejectReason::HasRestingOrders,
             }),
             ResponseKind::Report(ExecutionReport::Rejected {
                 order_id: OrderId(20),
+                symbol: Symbol(1),
                 account: AccountId(10),
                 reason: RejectReason::DuplicateRequest,
             }),
             ResponseKind::Report(ExecutionReport::Rejected {
                 order_id: OrderId(21),
+                symbol: Symbol(1),
                 account: AccountId(10),
                 reason: RejectReason::ReplicaDisconnected,
             }),
             ResponseKind::Report(ExecutionReport::Rejected {
                 order_id: OrderId(22),
+                symbol: Symbol(1),
                 account: AccountId(10),
                 reason: RejectReason::InvalidExpiry,
             }),
             ResponseKind::Report(ExecutionReport::Rejected {
                 order_id: OrderId(23),
+                symbol: Symbol(1),
                 account: AccountId(10),
                 reason: RejectReason::InstrumentDisabled,
             }),
@@ -1500,6 +1575,8 @@ mod tests {
             }),
             ResponseKind::Report(ExecutionReport::Replaced {
                 order_id: OrderId(42),
+                symbol: Symbol(5),
+                account: AccountId(99),
                 side: Side::Buy,
                 old_price: Price(nz(5000)),
                 new_price: Price(nz(5500)),

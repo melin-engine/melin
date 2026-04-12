@@ -379,6 +379,8 @@ pub fn execution_report_to_fix(
     match report {
         ExecutionReport::Placed {
             order_id,
+            symbol: _,
+            account: _,
             side,
             price,
             quantity,
@@ -536,6 +538,8 @@ pub fn execution_report_to_fix(
         }
         ExecutionReport::Triggered {
             order_id,
+            symbol: _,
+            account: _,
             trigger_price,
         } => {
             let clord_id = resolve_clord_id(id_map, *order_id, "Triggered");
@@ -1254,6 +1258,8 @@ mod tests {
 
         let report = ExecutionReport::Placed {
             order_id: OrderId(1),
+            symbol: Symbol(1),
+            account: AccountId(1),
             side: Side::Buy,
             price: Price(NonZeroU64::new(5_000_000).unwrap()),
             quantity: Quantity(NonZeroU64::new(10).unwrap()),
@@ -1281,6 +1287,7 @@ mod tests {
         let report = ExecutionReport::Fill {
             maker_order_id: OrderId(1),
             taker_order_id: OrderId(2),
+            symbol: Symbol(1),
             maker_account: AccountId(10),
             taker_account: AccountId(20),
             price: Price(NonZeroU64::new(5_000_000).unwrap()),
@@ -1307,6 +1314,7 @@ mod tests {
 
         let report = ExecutionReport::Cancelled {
             order_id: OrderId(1),
+            symbol: Symbol(1),
             account: AccountId(1),
             remaining_quantity: Quantity(NonZeroU64::new(5).unwrap()),
         };
@@ -1329,6 +1337,7 @@ mod tests {
 
         let report = ExecutionReport::Rejected {
             order_id: OrderId(1),
+            symbol: Symbol(1),
             account: AccountId(1),
             reason: RejectReason::InsufficientBalance,
         };
@@ -1349,6 +1358,8 @@ mod tests {
 
         let report = ExecutionReport::Replaced {
             order_id: OrderId(1),
+            symbol: Symbol(1),
+            account: AccountId(1),
             side: Side::Sell,
             old_price: Price(NonZeroU64::new(5_000_000).unwrap()),
             new_price: Price(NonZeroU64::new(5_100_000).unwrap()),
@@ -1373,6 +1384,8 @@ mod tests {
 
         let report = ExecutionReport::Triggered {
             order_id: OrderId(1),
+            symbol: Symbol(1),
+            account: AccountId(1),
             trigger_price: Price(NonZeroU64::new(4_800_000).unwrap()),
         };
 
@@ -1404,6 +1417,8 @@ mod tests {
 
         let report = ExecutionReport::Placed {
             order_id: OrderId(999),
+            symbol: Symbol(1),
+            account: AccountId(1),
             side: Side::Buy,
             price: Price(NonZeroU64::new(100).unwrap()),
             quantity: Quantity(NonZeroU64::new(1).unwrap()),

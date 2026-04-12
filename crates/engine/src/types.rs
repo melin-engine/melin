@@ -265,6 +265,8 @@ pub enum ExecutionReport {
     /// Order was placed on the book (resting).
     Placed {
         order_id: OrderId,
+        symbol: Symbol,
+        account: AccountId,
         side: Side,
         price: Price,
         quantity: Quantity,
@@ -273,6 +275,7 @@ pub enum ExecutionReport {
     Fill {
         maker_order_id: OrderId,
         taker_order_id: OrderId,
+        symbol: Symbol,
         maker_account: AccountId,
         taker_account: AccountId,
         price: Price,
@@ -287,23 +290,29 @@ pub enum ExecutionReport {
     /// Order was cancelled (or remainder cancelled for IOC).
     Cancelled {
         order_id: OrderId,
+        symbol: Symbol,
         account: AccountId,
         remaining_quantity: Quantity,
     },
     /// A stop order was triggered by a trade at the given price.
     Triggered {
         order_id: OrderId,
+        symbol: Symbol,
+        account: AccountId,
         trigger_price: Price,
     },
     /// Order was rejected (e.g., market order on empty book, FOK can't fill).
     Rejected {
         order_id: OrderId,
+        symbol: Symbol,
         account: AccountId,
         reason: RejectReason,
     },
     /// Order was amended via cancel-replace. Emitted on success.
     Replaced {
         order_id: OrderId,
+        symbol: Symbol,
+        account: AccountId,
         side: Side,
         old_price: Price,
         new_price: Price,

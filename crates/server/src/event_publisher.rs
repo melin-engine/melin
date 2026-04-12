@@ -305,6 +305,8 @@ mod tests {
         // Test the frame wire format: u64 ring sequence + standard response.
         let kind = payload_to_response(OutputPayload::Report(ExecutionReport::Placed {
             order_id: OrderId(100),
+            symbol: Symbol(1),
+            account: AccountId(1),
             side: Side::Buy,
             price: Price(std::num::NonZeroU64::new(100).unwrap()),
             quantity: Quantity(std::num::NonZeroU64::new(50).unwrap()),
@@ -342,6 +344,8 @@ mod tests {
         // Report
         let r = payload_to_response(OutputPayload::Report(ExecutionReport::Placed {
             order_id: OrderId(1),
+            symbol: Symbol(1),
+            account: AccountId(1),
             side: Side::Buy,
             price: Price(std::num::NonZeroU64::new(50).unwrap()),
             quantity: Quantity(std::num::NonZeroU64::new(10).unwrap()),

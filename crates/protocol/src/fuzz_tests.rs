@@ -203,6 +203,8 @@ fn response_from_bytes(data: &[u8]) -> Option<ResponseKind> {
             let quantity = Quantity(nz64(data, 18)?);
             Some(ResponseKind::Report(ExecutionReport::Placed {
                 order_id,
+                symbol: Symbol(1),
+                account: AccountId(1),
                 side,
                 price,
                 quantity,
@@ -219,6 +221,7 @@ fn response_from_bytes(data: &[u8]) -> Option<ResponseKind> {
             Some(ResponseKind::Report(ExecutionReport::Fill {
                 maker_order_id,
                 taker_order_id,
+                symbol: Symbol(1),
                 maker_account,
                 taker_account,
                 price,
@@ -234,6 +237,7 @@ fn response_from_bytes(data: &[u8]) -> Option<ResponseKind> {
             let remaining = Quantity(nz64(data, 13)?);
             Some(ResponseKind::Report(ExecutionReport::Cancelled {
                 order_id,
+                symbol: Symbol(1),
                 account,
                 remaining_quantity: remaining,
             }))
@@ -244,6 +248,8 @@ fn response_from_bytes(data: &[u8]) -> Option<ResponseKind> {
             let trigger_price = Price(nz64(data, 9)?);
             Some(ResponseKind::Report(ExecutionReport::Triggered {
                 order_id,
+                symbol: Symbol(1),
+                account: AccountId(1),
                 trigger_price,
             }))
         }
@@ -269,6 +275,7 @@ fn response_from_bytes(data: &[u8]) -> Option<ResponseKind> {
             };
             Some(ResponseKind::Report(ExecutionReport::Rejected {
                 order_id,
+                symbol: Symbol(1),
                 account,
                 reason,
             }))

@@ -1404,7 +1404,7 @@ lot_size_inverse = 1
     #[test]
     fn new_order_single_round_trip_to_execution_report() {
         use crate::test_stub::MelinStub;
-        use melin_engine::types::{ExecutionReport, Price, Quantity, Side};
+        use melin_engine::types::{AccountId, ExecutionReport, Price, Quantity, Side, Symbol};
         use melin_protocol::message::{Request, ResponseKind};
         use std::num::NonZeroU64;
 
@@ -1452,6 +1452,8 @@ lot_size_inverse = 1
         // translate it into a FIX ExecutionReport and forward it.
         stub.send_response(ResponseKind::Report(ExecutionReport::Placed {
             order_id,
+            symbol: Symbol(1),
+            account: AccountId(7),
             side: Side::Buy,
             price: Price(NonZeroU64::new(5_000_000).unwrap()),
             quantity: Quantity(NonZeroU64::new(10).unwrap()),
@@ -1473,7 +1475,7 @@ lot_size_inverse = 1
     #[test]
     fn resend_request_replays_through_real_io_uring() {
         use crate::test_stub::MelinStub;
-        use melin_engine::types::{ExecutionReport, Price, Quantity, Side};
+        use melin_engine::types::{AccountId, ExecutionReport, Price, Quantity, Side, Symbol};
         use melin_protocol::message::{Request, ResponseKind};
         use std::num::NonZeroU64;
 
@@ -1510,6 +1512,8 @@ lot_size_inverse = 1
         };
         stub.send_response(ResponseKind::Report(ExecutionReport::Placed {
             order_id,
+            symbol: Symbol(1),
+            account: AccountId(7),
             side: Side::Buy,
             price: Price(NonZeroU64::new(5_000_000).unwrap()),
             quantity: Quantity(NonZeroU64::new(10).unwrap()),
@@ -1558,7 +1562,7 @@ lot_size_inverse = 1
     #[test]
     fn cancel_rejected_by_engine_yields_order_cancel_reject() {
         use crate::test_stub::MelinStub;
-        use melin_engine::types::{ExecutionReport, RejectReason};
+        use melin_engine::types::{AccountId, ExecutionReport, RejectReason, Symbol};
         use melin_protocol::message::{Request, ResponseKind};
 
         let stub = MelinStub::start();
@@ -1616,7 +1620,8 @@ lot_size_inverse = 1
         // Engine rejects the cancel (e.g. already filled).
         stub.send_response(ResponseKind::Report(ExecutionReport::Rejected {
             order_id,
-            account: melin_engine::types::AccountId(7),
+            symbol: Symbol(1),
+            account: AccountId(7),
             reason: RejectReason::UnknownOrder,
         }));
 

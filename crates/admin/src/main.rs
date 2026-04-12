@@ -1301,14 +1301,16 @@ fn format_report(report: &ExecutionReport) -> String {
     match *report {
         ExecutionReport::Placed {
             order_id,
+            symbol,
+            account,
             side,
             price,
             quantity,
         } => {
             let side_str = if side == Side::Buy { "BUY" } else { "SELL" };
             format!(
-                "PLACED  #{} {} @{} x{}",
-                order_id.0, side_str, price.0, quantity.0,
+                "PLACED  #{} sym={} {} @{} x{} acct={}",
+                order_id.0, symbol.0, side_str, price.0, quantity.0, account.0,
             )
         }
         ExecutionReport::Fill {
@@ -1340,8 +1342,13 @@ fn format_report(report: &ExecutionReport) -> String {
         ),
         ExecutionReport::Triggered {
             order_id,
+            symbol,
+            account,
             trigger_price,
-        } => format!("TRIGGER #{} @{}", order_id.0, trigger_price.0),
+        } => format!(
+            "TRIGGER #{} sym={} @{} acct={}",
+            order_id.0, symbol.0, trigger_price.0, account.0,
+        ),
         ExecutionReport::Rejected {
             order_id, reason, ..
         } => {
@@ -1370,6 +1377,8 @@ fn format_report(report: &ExecutionReport) -> String {
         }
         ExecutionReport::Replaced {
             order_id,
+            symbol,
+            account,
             side,
             old_price,
             new_price,
@@ -1378,8 +1387,15 @@ fn format_report(report: &ExecutionReport) -> String {
         } => {
             let side_str = if side == Side::Buy { "BUY" } else { "SELL" };
             format!(
-                "REPLACE #{} {} @{}→{} x{}→{}",
-                order_id.0, side_str, old_price.0, new_price.0, old_remaining.0, new_remaining.0,
+                "REPLACE #{} sym={} {} @{}→{} x{}→{} acct={}",
+                order_id.0,
+                symbol.0,
+                side_str,
+                old_price.0,
+                new_price.0,
+                old_remaining.0,
+                new_remaining.0,
+                account.0,
             )
         }
         ExecutionReport::InstrumentStatusChanged { symbol, status } => {

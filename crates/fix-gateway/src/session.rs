@@ -1946,6 +1946,8 @@ lot_size_inverse = 1
             &mut s,
             &ResponseKind::Report(ExecutionReport::Placed {
                 order_id,
+                symbol: Symbol(1),
+                account: AccountId(7),
                 side: Side::Buy,
                 price: px(5_000_000),
                 quantity: qty(10),
@@ -1989,6 +1991,7 @@ lot_size_inverse = 1
             &ResponseKind::Report(ExecutionReport::Fill {
                 maker_order_id: maker,
                 taker_order_id: taker,
+                symbol: Symbol(1),
                 maker_account: AccountId(7),
                 taker_account: AccountId(7),
                 price: px(5_000_000),
@@ -2037,6 +2040,7 @@ lot_size_inverse = 1
             &ResponseKind::Report(ExecutionReport::Fill {
                 maker_order_id: OrderId(999),
                 taker_order_id: OrderId(1000),
+                symbol: Symbol(1),
                 maker_account: AccountId(99),
                 taker_account: AccountId(100),
                 price: px(5_000_000),
@@ -2070,6 +2074,7 @@ lot_size_inverse = 1
             &mut s,
             &ResponseKind::Report(ExecutionReport::Rejected {
                 order_id,
+                symbol: Symbol(1),
                 account: AccountId(7),
                 reason: RejectReason::UnknownOrder,
             }),
@@ -2096,6 +2101,7 @@ lot_size_inverse = 1
             &mut s,
             &ResponseKind::Report(ExecutionReport::Rejected {
                 order_id,
+                symbol: Symbol(1),
                 account: AccountId(7),
                 reason: RejectReason::InsufficientBalance,
             }),
@@ -2137,6 +2143,7 @@ lot_size_inverse = 1
             &mut s,
             &ResponseKind::Report(ExecutionReport::Cancelled {
                 order_id,
+                symbol: Symbol(1),
                 account: AccountId(7),
                 remaining_quantity: qty(5),
             }),
@@ -2238,6 +2245,7 @@ lot_size_inverse = 1
             &mut s,
             &ResponseKind::Report(ExecutionReport::Rejected {
                 order_id,
+                symbol: Symbol(1),
                 account: AccountId(7),
                 reason: RejectReason::UnknownOrder,
             }),
@@ -2275,6 +2283,8 @@ lot_size_inverse = 1
             &mut s,
             &ResponseKind::Report(ExecutionReport::Triggered {
                 order_id,
+                symbol: Symbol(1),
+                account: AccountId(7),
                 trigger_price: px(4_800_000),
             }),
         );
@@ -2318,6 +2328,8 @@ lot_size_inverse = 1
             &mut s,
             &ResponseKind::Report(ExecutionReport::Replaced {
                 order_id,
+                symbol: Symbol(1),
+                account: AccountId(7),
                 side: Side::Buy,
                 old_price: px(5_000_000),
                 new_price: px(5_100_000),
@@ -2681,6 +2693,8 @@ lot_size_inverse = 1
                 &mut s,
                 &ResponseKind::Report(ExecutionReport::Placed {
                     order_id,
+                    symbol: Symbol(1),
+                    account: AccountId(7),
                     side: Side::Buy,
                     price: px(5_000_000),
                     quantity: qty(10),
@@ -2777,6 +2791,8 @@ lot_size_inverse = 1
             &mut s,
             &ResponseKind::Report(ExecutionReport::Placed {
                 order_id,
+                symbol: Symbol(1),
+                account: AccountId(7),
                 side: Side::Buy,
                 price: px(5_000_000),
                 quantity: qty(10),
@@ -2793,6 +2809,8 @@ lot_size_inverse = 1
             &mut s,
             &ResponseKind::Report(ExecutionReport::Placed {
                 order_id,
+                symbol: Symbol(1),
+                account: AccountId(7),
                 side: Side::Buy,
                 price: px(5_000_000),
                 quantity: qty(10),
@@ -2998,6 +3016,8 @@ lot_size_inverse = 1
             &mut s,
             &ResponseKind::Report(ExecutionReport::Placed {
                 order_id,
+                symbol: Symbol(1),
+                account: AccountId(7),
                 side: Side::Buy,
                 price: px(5_000_000),
                 quantity: qty(10),

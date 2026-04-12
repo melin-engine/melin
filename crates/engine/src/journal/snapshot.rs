@@ -1167,7 +1167,7 @@ impl Exchange {
         // Build per-symbol lookup tables from the flat snapshot Vecs.
         let mut books_map: StdHashMap<Symbol, OrderBook> = StdHashMap::new();
         for (symbol, book_snap) in state.books {
-            books_map.insert(symbol, OrderBook::restore(book_snap));
+            books_map.insert(symbol, OrderBook::restore(symbol, book_snap));
         }
         let risk_map: StdHashMap<Symbol, RiskLimits> = state.risk_limits.into_iter().collect();
         let cb_map: StdHashMap<Symbol, CircuitBreakerConfig> =
@@ -1187,7 +1187,9 @@ impl Exchange {
         instruments.resize_with(max_sym + 1, || None);
         for spec in &state.instruments {
             let idx = spec.symbol.0 as usize;
-            let book = books_map.remove(&spec.symbol).unwrap_or_default();
+            let book = books_map
+                .remove(&spec.symbol)
+                .unwrap_or_else(|| OrderBook::new(spec.symbol));
             instruments[idx] = Some(Box::new(InstrumentState {
                 spec: *spec,
                 book,
@@ -1300,7 +1302,7 @@ impl OrderBook {
     }
 
     /// Restore an order book from a snapshot.
-    pub(crate) fn restore(snap: BookSnapshot) -> Self {
+    pub(crate) fn restore(symbol: Symbol, snap: BookSnapshot) -> Self {
         let restore_side = |levels: Vec<(Price, Vec<RestingOrderSnapshot>)>, side: Side| {
             // Build sorted Vec of (Price, VecDeque) — input is already sorted
             // by price from the snapshot codec.
@@ -1371,6 +1373,7 @@ impl OrderBook {
             .collect();
 
         Self::from_parts(
+            symbol,
             restore_side(snap.bids, Side::Buy),
             restore_side(snap.asks, Side::Sell),
             order_index,

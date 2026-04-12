@@ -329,9 +329,9 @@ impl Exchange {
         // Only insert if slot is empty (don't overwrite existing instrument).
         if self.instruments[idx].is_none() {
             let book = if self.presized {
-                OrderBook::with_capacity()
+                OrderBook::with_capacity(spec.symbol)
             } else {
-                OrderBook::new()
+                OrderBook::new(spec.symbol)
             };
             self.instruments[idx] = Some(Box::new(InstrumentState {
                 spec,
@@ -372,6 +372,7 @@ impl Exchange {
         let Some(inst) = inst_ref(&self.instruments, symbol) else {
             reports.push(ExecutionReport::Rejected {
                 order_id: order.id,
+                symbol,
                 account: order.account,
                 reason: RejectReason::UnknownSymbol,
             });
@@ -382,6 +383,7 @@ impl Exchange {
         if inst.disabled {
             reports.push(ExecutionReport::Rejected {
                 order_id: order.id,
+                symbol,
                 account: order.account,
                 reason: RejectReason::InstrumentDisabled,
             });
@@ -402,6 +404,7 @@ impl Exchange {
         if order.id.0 <= *hwm {
             reports.push(ExecutionReport::Rejected {
                 order_id: order.id,
+                symbol,
                 account: order.account,
                 reason: RejectReason::DuplicateOrderId,
             });
@@ -420,6 +423,7 @@ impl Exchange {
         if cb.halted {
             reports.push(ExecutionReport::Rejected {
                 order_id: order.id,
+                symbol,
                 account: order.account,
                 reason: RejectReason::TradingHalted,
             });
@@ -442,6 +446,7 @@ impl Exchange {
             {
                 reports.push(ExecutionReport::Rejected {
                     order_id: order.id,
+                    symbol,
                     account: order.account,
                     reason: RejectReason::OutsidePriceBand,
                 });
@@ -452,6 +457,7 @@ impl Exchange {
             {
                 reports.push(ExecutionReport::Rejected {
                     order_id: order.id,
+                    symbol,
                     account: order.account,
                     reason: RejectReason::OutsidePriceBand,
                 });
@@ -466,6 +472,7 @@ impl Exchange {
         {
             reports.push(ExecutionReport::Rejected {
                 order_id: order.id,
+                symbol,
                 account: order.account,
                 reason: RejectReason::ExceedsMaxOrderQty,
             });
@@ -485,6 +492,7 @@ impl Exchange {
                 if notional > max_notional as u128 {
                     reports.push(ExecutionReport::Rejected {
                         order_id: order.id,
+                        symbol,
                         account: order.account,
                         reason: RejectReason::ExceedsMaxNotional,
                     });
@@ -498,6 +506,7 @@ impl Exchange {
         if order.time_in_force == TimeInForce::GTD && order.expiry_ns == 0 {
             reports.push(ExecutionReport::Rejected {
                 order_id: order.id,
+                symbol,
                 account: order.account,
                 reason: RejectReason::InvalidExpiry,
             });
@@ -506,6 +515,7 @@ impl Exchange {
         if order.time_in_force != TimeInForce::GTD && order.expiry_ns != 0 {
             reports.push(ExecutionReport::Rejected {
                 order_id: order.id,
+                symbol,
                 account: order.account,
                 reason: RejectReason::InvalidExpiry,
             });
@@ -526,6 +536,7 @@ impl Exchange {
             Err(reason) => {
                 reports.push(ExecutionReport::Rejected {
                     order_id: order.id,
+                    symbol,
                     account: order.account,
                     reason,
                 });
@@ -573,6 +584,7 @@ impl Exchange {
                 ExecutionReport::Fill {
                     maker_order_id,
                     taker_order_id,
+                    symbol: _,
                     maker_account,
                     taker_account: fill_taker_account,
                     price,
@@ -931,6 +943,7 @@ impl Exchange {
         let Some(inst) = inst_ref(&self.instruments, symbol) else {
             reports.push(ExecutionReport::Rejected {
                 order_id,
+                symbol,
                 account,
                 reason: RejectReason::UnknownSymbol,
             });
@@ -942,6 +955,7 @@ impl Exchange {
         if inst.disabled {
             reports.push(ExecutionReport::Rejected {
                 order_id,
+                symbol,
                 account,
                 reason: RejectReason::InstrumentDisabled,
             });
@@ -955,6 +969,7 @@ impl Exchange {
         else {
             reports.push(ExecutionReport::Rejected {
                 order_id,
+                symbol,
                 account,
                 reason: RejectReason::UnknownOrder,
             });
@@ -966,6 +981,7 @@ impl Exchange {
         if cb.halted {
             reports.push(ExecutionReport::Rejected {
                 order_id,
+                symbol,
                 account,
                 reason: RejectReason::TradingHalted,
             });
@@ -976,6 +992,7 @@ impl Exchange {
         {
             reports.push(ExecutionReport::Rejected {
                 order_id,
+                symbol,
                 account,
                 reason: RejectReason::OutsidePriceBand,
             });
@@ -986,6 +1003,7 @@ impl Exchange {
         {
             reports.push(ExecutionReport::Rejected {
                 order_id,
+                symbol,
                 account,
                 reason: RejectReason::OutsidePriceBand,
             });
@@ -999,6 +1017,7 @@ impl Exchange {
         {
             reports.push(ExecutionReport::Rejected {
                 order_id,
+                symbol,
                 account,
                 reason: RejectReason::ExceedsMaxOrderQty,
             });
@@ -1009,6 +1028,7 @@ impl Exchange {
             if notional > max_notional as u128 {
                 reports.push(ExecutionReport::Rejected {
                     order_id,
+                    symbol,
                     account,
                     reason: RejectReason::ExceedsMaxNotional,
                 });
@@ -1033,6 +1053,7 @@ impl Exchange {
         if would_cross {
             reports.push(ExecutionReport::Rejected {
                 order_id,
+                symbol,
                 account,
                 reason: RejectReason::PriceWouldCross,
             });
@@ -1058,6 +1079,7 @@ impl Exchange {
                     Err(_) => {
                         reports.push(ExecutionReport::Rejected {
                             order_id,
+                            symbol,
                             account,
                             reason: RejectReason::InsufficientBalance,
                         });
@@ -1072,6 +1094,7 @@ impl Exchange {
         if let Err(reason) = self.accounts.try_adjust_reservation(slot, new_required) {
             reports.push(ExecutionReport::Rejected {
                 order_id,
+                symbol,
                 account,
                 reason,
             });
@@ -1091,6 +1114,8 @@ impl Exchange {
 
         reports.push(ExecutionReport::Replaced {
             order_id,
+            symbol,
+            account,
             side,
             old_price,
             new_price,
@@ -1228,6 +1253,7 @@ mod tests {
             reports[0],
             ExecutionReport::Rejected {
                 order_id: OrderId(1),
+                symbol: Symbol(1),
                 account: ACCT_A,
                 reason: RejectReason::UnknownSymbol,
             }
@@ -1253,6 +1279,7 @@ mod tests {
             reports[0],
             ExecutionReport::Rejected {
                 order_id: OrderId(1),
+                symbol: btc,
                 account: ACCT_A,
                 reason: RejectReason::InsufficientBalance,
             }
@@ -1410,6 +1437,7 @@ mod tests {
             reports[0],
             ExecutionReport::Rejected {
                 order_id: OrderId(2),
+                symbol: eth,
                 account: ACCT_A,
                 reason: RejectReason::InsufficientBalance,
             }
@@ -4483,6 +4511,8 @@ mod tests {
             reports[0],
             ExecutionReport::Replaced {
                 order_id: OrderId(1),
+                symbol: btc,
+                account: ACCT_A,
                 side: Side::Buy,
                 old_price: price(100),
                 new_price: price(120),
@@ -4622,6 +4652,7 @@ mod tests {
             reports[0],
             ExecutionReport::Rejected {
                 order_id: OrderId(1),
+                symbol: btc,
                 account: ACCT_A,
                 reason: RejectReason::InsufficientBalance,
             }
@@ -4648,6 +4679,7 @@ mod tests {
             reports[0],
             ExecutionReport::Rejected {
                 order_id: OrderId(999),
+                symbol: btc,
                 account: ACCT_A,
                 reason: RejectReason::UnknownOrder,
             }
@@ -4675,6 +4707,7 @@ mod tests {
             reports[0],
             ExecutionReport::Rejected {
                 order_id: OrderId(1),
+                symbol: Symbol(42),
                 account: ACCT_A,
                 reason: RejectReason::UnknownSymbol,
             }
@@ -4715,6 +4748,7 @@ mod tests {
             reports[0],
             ExecutionReport::Rejected {
                 order_id: OrderId(1),
+                symbol: btc,
                 account: ACCT_A,
                 reason: RejectReason::PriceWouldCross,
             }
@@ -4759,6 +4793,7 @@ mod tests {
             reports[0],
             ExecutionReport::Rejected {
                 order_id: OrderId(1),
+                symbol: btc,
                 account: ACCT_A,
                 reason: RejectReason::TradingHalted,
             }
@@ -4804,6 +4839,7 @@ mod tests {
             reports[0],
             ExecutionReport::Rejected {
                 order_id: OrderId(1),
+                symbol: btc,
                 account: ACCT_A,
                 reason: RejectReason::OutsidePriceBand,
             }
@@ -4848,6 +4884,7 @@ mod tests {
             reports[0],
             ExecutionReport::Rejected {
                 order_id: OrderId(1),
+                symbol: btc,
                 account: ACCT_A,
                 reason: RejectReason::ExceedsMaxOrderQty,
             }
@@ -4893,6 +4930,8 @@ mod tests {
             reports[0],
             ExecutionReport::Replaced {
                 order_id: OrderId(1),
+                symbol: btc,
+                account: ACCT_A,
                 side: Side::Buy,
                 old_price: price(100),
                 new_price: price(90),
@@ -4937,6 +4976,8 @@ mod tests {
             reports[0],
             ExecutionReport::Replaced {
                 order_id: OrderId(1),
+                symbol: btc,
+                account: ACCT_A,
                 side: Side::Sell,
                 old_price: price(200),
                 new_price: price(180),
@@ -4975,6 +5016,8 @@ mod tests {
             reports[0],
             ExecutionReport::Replaced {
                 order_id: OrderId(1),
+                symbol: btc,
+                account: ACCT_A,
                 side: Side::Buy,
                 old_price: price(100),
                 new_price: price(100),
