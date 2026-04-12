@@ -9,7 +9,6 @@
 
 mod config;
 mod event_loop;
-mod fix;
 mod id_map;
 mod metrics;
 mod price;

@@ -12,11 +12,11 @@ use melin_engine::types::{
 use melin_protocol::message::Request;
 
 use crate::config::SymbolConfig;
-use crate::fix::parse::FixMessage;
-use crate::fix::serialize::FixMessageBuilder;
-use crate::fix::tags;
 use crate::id_map::ClOrdIdMap;
 use crate::price;
+use melin_gateway_core::fix::parse::FixMessage;
+use melin_gateway_core::fix::serialize::FixMessageBuilder;
+use melin_gateway_core::fix::tags;
 
 /// Look up a ClOrdID for an OrderId, logging a warning on miss.
 ///
@@ -688,9 +688,9 @@ pub fn cancel_reject_to_fix(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::fix::parse::FixMessage;
-    use crate::fix::serialize::FixMessageBuilder;
     use melin_engine::types::OrderId;
+    use melin_gateway_core::fix::parse::FixMessage;
+    use melin_gateway_core::fix::serialize::FixMessageBuilder;
     use std::collections::HashMap;
 
     /// Build a `FixCtx` for tests using the standard MELIN/FIRM pair.

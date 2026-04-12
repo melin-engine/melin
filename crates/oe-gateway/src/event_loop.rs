@@ -434,7 +434,9 @@ impl Gateway {
                 None => return,
             };
 
-            let raw = match crate::fix::parse::try_extract_message(&mut session.fix_parse_buf) {
+            let raw = match melin_gateway_core::fix::parse::try_extract_message(
+                &mut session.fix_parse_buf,
+            ) {
                 Some(raw) => raw,
                 None => return, // No complete message yet.
             };
@@ -1010,9 +1012,9 @@ fn socket_addr_to_sockaddr(addr: std::net::SocketAddr) -> libc::sockaddr_in {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::fix::parse::FixMessage;
-    use crate::fix::serialize::FixMessageBuilder;
-    use crate::fix::tags;
+    use melin_gateway_core::fix::parse::FixMessage;
+    use melin_gateway_core::fix::serialize::FixMessageBuilder;
+    use melin_gateway_core::fix::tags;
     use std::io::{Read, Write};
     use std::net::TcpStream;
     use std::sync::Arc;
@@ -1170,7 +1172,9 @@ lot_size_inverse = 1
         fn read_message(&mut self) -> Vec<u8> {
             let mut tmp = [0u8; 256];
             loop {
-                if let Some(msg) = crate::fix::parse::try_extract_message(&mut self.accum) {
+                if let Some(msg) =
+                    melin_gateway_core::fix::parse::try_extract_message(&mut self.accum)
+                {
                     return msg;
                 }
                 match self.stream.read(&mut tmp) {
@@ -1197,7 +1201,7 @@ lot_size_inverse = 1
         let mut buf = Vec::with_capacity(256);
         let mut tmp = [0u8; 256];
         loop {
-            if let Some(msg) = crate::fix::parse::try_extract_message(&mut buf) {
+            if let Some(msg) = melin_gateway_core::fix::parse::try_extract_message(&mut buf) {
                 return msg;
             }
             match stream.read(&mut tmp) {

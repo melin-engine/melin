@@ -1576,6 +1576,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "melin-gateway-core"
+version = "0.1.0"
+dependencies = [
+ "ed25519-dalek",
+ "proptest",
+ "tracing",
+]
+
+[[package]]
 name = "melin-oe-gateway"
 version = "0.1.0"
 dependencies = [
@@ -1583,6 +1592,7 @@ dependencies = [
  "io-uring",
  "libc",
  "melin-engine",
+ "melin-gateway-core",
  "melin-protocol",
  "proptest",
  "serde",

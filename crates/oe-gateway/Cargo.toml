@@ -8,6 +8,7 @@ name = "melin-oe-gateway"
 path = "src/main.rs"
 
 [dependencies]
+melin-gateway-core = { path = "../gateway-core" }
 melin-protocol = { path = "../protocol" }
 melin-engine = { path = "../engine" }
 ed25519-dalek = { workspace = true }

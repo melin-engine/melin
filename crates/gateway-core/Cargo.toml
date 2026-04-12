@@ -1,0 +1,11 @@
+[package]
+name = "melin-gateway-core"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+ed25519-dalek = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+proptest = "1"

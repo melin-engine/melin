@@ -18,12 +18,12 @@ use melin_protocol::message::{Request, ResponseKind};
 
 use crate::config::{GatewayConfig, SymbolConfig};
 use crate::event_loop::SessionAction;
-use crate::fix::parse::FixMessage;
-use crate::fix::serialize::FixMessageBuilder;
-use crate::fix::tags;
 use crate::id_map::ClOrdIdMap;
 use crate::metrics::GatewayMetrics;
 use crate::translate::{self, TranslateContext};
+use melin_gateway_core::fix::parse::FixMessage;
+use melin_gateway_core::fix::serialize::FixMessageBuilder;
+use melin_gateway_core::fix::tags;
 
 /// Maximum outbound messages retained per session for ResendRequest
 /// replay. At ~250 bytes/msg this caps the store at ~2.5 MB per
@@ -1372,20 +1372,9 @@ fn rebuild_with_poss_dup(stored_bytes: &[u8], sender: &str, target: &str) -> Vec
     builder.build(sender, target, seq)
 }
 
-/// Load a 32-byte Ed25519 private key seed from a file.
+/// Delegates to `melin_gateway_core::auth::load_signing_key`.
 fn load_signing_key(path: &std::path::Path) -> Result<SigningKey, Box<dyn std::error::Error>> {
-    let seed = std::fs::read(path)?;
-    if seed.len() != 32 {
-        return Err(format!(
-            "key file must be 32 bytes, got {} ({})",
-            seed.len(),
-            path.display()
-        )
-        .into());
-    }
-    let mut bytes = [0u8; 32];
-    bytes.copy_from_slice(&seed);
-    Ok(SigningKey::from_bytes(&bytes))
+    melin_gateway_core::auth::load_signing_key(path)
 }
 
 // ---------------------------------------------------------------------------
@@ -1395,10 +1384,10 @@ fn load_signing_key(path: &std::path::Path) -> Result<SigningKey, Box<dyn std::e
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::fix::serialize::FixMessageBuilder;
     use melin_engine::types::{
         ExecutionReport, InstrumentStatus, Price, Quantity, RejectReason, Side, Symbol,
     };
+    use melin_gateway_core::fix::serialize::FixMessageBuilder;
     use melin_protocol::message::ResponseKind;
     use std::num::NonZeroU64;
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -2008,8 +1997,10 @@ lot_size_inverse = 1
         // Drain them one at a time using the same framing helper the
         // event loop uses.
         let mut buf = s.fix_send_buf.clone();
-        let raw1 = crate::fix::parse::try_extract_message(&mut buf).expect("first msg");
-        let raw2 = crate::fix::parse::try_extract_message(&mut buf).expect("second msg");
+        let raw1 =
+            melin_gateway_core::fix::parse::try_extract_message(&mut buf).expect("first msg");
+        let raw2 =
+            melin_gateway_core::fix::parse::try_extract_message(&mut buf).expect("second msg");
         assert!(buf.is_empty(), "exactly two messages expected");
 
         let first = FixMessage::parse(&raw1).unwrap();
@@ -2587,7 +2578,7 @@ lot_size_inverse = 1
     fn drain_send_buf(s: &mut Session) -> Vec<Vec<u8>> {
         let mut out = Vec::new();
         let mut buf = std::mem::take(&mut s.fix_send_buf);
-        while let Some(m) = crate::fix::parse::try_extract_message(&mut buf) {
+        while let Some(m) = melin_gateway_core::fix::parse::try_extract_message(&mut buf) {
             out.push(m);
         }
         // Anything that didn't frame goes back.
