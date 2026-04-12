@@ -48,6 +48,14 @@ pub struct StageUtilization {
     pub busy: AtomicU64,
     /// Cumulative iterations where the stage was idle (no input available).
     pub idle: AtomicU64,
+    /// Cumulative gate-wait events where the journal cursor was the last
+    /// to reach the needed position (journal fsync was the bottleneck).
+    /// Only used by the response stage; always 0 for journal/matching.
+    pub gate_journal: AtomicU64,
+    /// Cumulative gate-wait events where the replication cursor was the
+    /// last to reach the needed position (replica ack was the bottleneck).
+    /// Only used by the response stage; always 0 for journal/matching.
+    pub gate_replication: AtomicU64,
 }
 
 impl StageUtilization {
@@ -55,6 +63,8 @@ impl StageUtilization {
         Self {
             busy: AtomicU64::new(0),
             idle: AtomicU64::new(0),
+            gate_journal: AtomicU64::new(0),
+            gate_replication: AtomicU64::new(0),
         }
     }
 }

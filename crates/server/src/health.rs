@@ -144,6 +144,10 @@ struct HealthSnapshot {
     matching_idle: u64,
     response_busy: u64,
     response_idle: u64,
+    /// Response gate-wait events where the journal cursor was the bottleneck.
+    response_gate_journal: u64,
+    /// Response gate-wait events where the replication cursor was the bottleneck.
+    response_gate_replication: u64,
 }
 
 impl HealthSnapshot {
@@ -246,6 +250,14 @@ impl HealthSnapshot {
             matching_idle: state.matching_utilization.idle.load(Ordering::Relaxed),
             response_busy: state.response_utilization.busy.load(Ordering::Relaxed),
             response_idle: state.response_utilization.idle.load(Ordering::Relaxed),
+            response_gate_journal: state
+                .response_utilization
+                .gate_journal
+                .load(Ordering::Relaxed),
+            response_gate_replication: state
+                .response_utilization
+                .gate_replication
+                .load(Ordering::Relaxed),
         }
     }
 
@@ -338,7 +350,11 @@ impl HealthSnapshot {
              # TYPE melin_stage_idle_total counter\n\
              melin_stage_idle_total{{stage=\"journal\"}} {}\n\
              melin_stage_idle_total{{stage=\"matching\"}} {}\n\
-             melin_stage_idle_total{{stage=\"response\"}} {}\n",
+             melin_stage_idle_total{{stage=\"response\"}} {}\n\
+             # HELP melin_response_gate_total Gate-wait events by bottleneck (journal fsync vs replica ack).\n\
+             # TYPE melin_response_gate_total counter\n\
+             melin_response_gate_total{{blocker=\"journal\"}} {}\n\
+             melin_response_gate_total{{blocker=\"replication\"}} {}\n",
             self.active_connections,
             self.events_processed,
             self.journal_seq,
@@ -365,6 +381,8 @@ impl HealthSnapshot {
             self.journal_idle,
             self.matching_idle,
             self.response_idle,
+            self.response_gate_journal,
+            self.response_gate_replication,
         );
         c.position() as usize
     }

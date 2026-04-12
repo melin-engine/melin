@@ -209,6 +209,12 @@ pub fn run(
                         quorum_durability,
                     );
                     if cached_durable_pos >= needed {
+                        // Which cursor was slower — see response.rs comment.
+                        if journal_pos <= repl_min {
+                            utilization.gate_journal.fetch_add(1, Ordering::Relaxed);
+                        } else {
+                            utilization.gate_replication.fetch_add(1, Ordering::Relaxed);
+                        }
                         break;
                     }
                     std::hint::spin_loop();

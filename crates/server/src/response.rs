@@ -308,6 +308,17 @@ pub fn run(
                     );
 
                     if cached_durable_pos >= needed {
+                        // Record which cursor was slower at the moment the
+                        // gate opened. This answers "which subsystem should
+                        // I optimize?" — not "which path provided durability"
+                        // (in quorum mode, durability can come from replicas
+                        // alone even when the journal is slower).
+                        // Relaxed is fine — health reads are infrequent.
+                        if journal_pos <= repl_min {
+                            utilization.gate_journal.fetch_add(1, Ordering::Relaxed);
+                        } else {
+                            utilization.gate_replication.fetch_add(1, Ordering::Relaxed);
+                        }
                         break;
                     }
                     std::hint::spin_loop();
@@ -669,5 +680,103 @@ mod tests {
     fn standalone_journal_at_zero() {
         let pos = durable_pos(0, u64::MAX, u64::MAX, true);
         assert_eq!(pos, 0);
+    }
+
+    // --- Gate bottleneck attribution ---
+    //
+    // The response stage increments gate_journal when journal_pos <= repl_min
+    // at the moment the gate opens, and gate_replication otherwise. These
+    // tests verify the attribution logic matches the durable_pos formula.
+
+    use melin_engine::journal::pipeline::StageUtilization;
+    use std::sync::Arc;
+
+    /// Simulate the attribution logic at the moment the gate opens.
+    /// Passes cursor values that make durable_pos >= needed, then
+    /// checks which counter (journal or replication) was incremented.
+    fn simulate_gate(
+        journal_pos: u64,
+        repl_min: u64,
+        repl_max: u64,
+        quorum: bool,
+        needed: u64,
+    ) -> (&'static str, Arc<StageUtilization>) {
+        let util = Arc::new(StageUtilization::new());
+        let durable = durable_pos(journal_pos, repl_min, repl_max, quorum);
+        assert!(
+            durable >= needed,
+            "test setup error: durable_pos ({durable}) < needed ({needed})"
+        );
+        // Same attribution logic as the response stage spin loop.
+        {
+            if journal_pos <= repl_min {
+                util.gate_journal
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            } else {
+                util.gate_replication
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+        let j = util.gate_journal.load(std::sync::atomic::Ordering::Relaxed);
+        let r = util
+            .gate_replication
+            .load(std::sync::atomic::Ordering::Relaxed);
+        let label = if j > 0 && r == 0 {
+            "journal"
+        } else if r > 0 && j == 0 {
+            "replication"
+        } else {
+            "none"
+        };
+        (label, util)
+    }
+
+    #[test]
+    fn gate_bottleneck_standalone_journal() {
+        // Standalone mode: repl_min = u64::MAX, journal is the only path.
+        // journal_pos (50) <= repl_min (MAX) → attributed to journal.
+        let (label, _) = simulate_gate(50, u64::MAX, u64::MAX, false, 50);
+        assert_eq!(label, "journal");
+    }
+
+    #[test]
+    fn gate_bottleneck_journal_slower_than_replication() {
+        // Both connected, journal behind replication.
+        // journal_pos (50) <= repl_min (100) → journal was the bottleneck.
+        let (label, _) = simulate_gate(50, 100, 120, false, 50);
+        assert_eq!(label, "journal");
+    }
+
+    #[test]
+    fn gate_bottleneck_replication_slower_than_journal() {
+        // Journal ahead, replication behind.
+        // journal_pos (200) > repl_min (50) → replication was the bottleneck.
+        let (label, _) = simulate_gate(200, 50, 80, false, 50);
+        assert_eq!(label, "replication");
+    }
+
+    #[test]
+    fn gate_bottleneck_both_equal() {
+        // Both cursors at the same position. journal_pos (100) <= repl_min
+        // (100), so attributed to journal (tie-break favors journal).
+        let (label, _) = simulate_gate(100, 100, 100, false, 100);
+        assert_eq!(label, "journal");
+    }
+
+    #[test]
+    fn gate_bottleneck_quorum_journal_slower() {
+        // Quorum mode: both replicas at 100+, journal at 50.
+        // durable = max(100, min(50, 120)) = 100. Journal is slower.
+        let (label, _) = simulate_gate(50, 100, 120, true, 100);
+        assert_eq!(label, "journal");
+    }
+
+    #[test]
+    fn gate_bottleneck_quorum_replication_slower() {
+        // Quorum mode: journal at 200, slow replica at 50, fast at 80.
+        // durable = max(50, min(200, 80)) = max(50, 80) = 80.
+        // journal_pos (200) > repl_min (50) → replication.
+        let (label, _) = simulate_gate(200, 50, 80, true, 80);
+        assert_eq!(label, "replication");
     }
 }

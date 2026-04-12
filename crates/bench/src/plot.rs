@@ -1029,6 +1029,19 @@ fn cmd_health(args: &[String]) {
         "Bytes",
     );
 
+    // Response gate bottleneck: journal vs replication gate-wait events.
+    plot_health_extra_metric(
+        &all_results,
+        &PathBuf::from(format!("{stem}-response-gate.svg")),
+        &[
+            "melin_response_gate_total_blocker_journal",
+            "melin_response_gate_total_blocker_replication",
+        ],
+        &["journal", "replication"],
+        "Response Gate Bottleneck (cumulative events)",
+        "Events",
+    );
+
     // Pipeline stage utilization plot (from health metrics, not log parsing).
     plot_health_utilization(
         &all_results,
