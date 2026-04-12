@@ -207,7 +207,7 @@ fn dispatch_event(
         JournalEvent::RemoveInstrument { symbol } => {
             exchange.remove_instrument(symbol, reports);
         }
-        JournalEvent::QueryStats => {
+        JournalEvent::QueryStats | JournalEvent::QueryPosition { .. } => {
             // Read-only — no state change.
         }
         JournalEvent::GenesisHash { .. } | JournalEvent::Checkpoint { .. } => {
@@ -537,6 +537,7 @@ mod tests {
                     primary.remove_instrument(symbol, &mut primary_reports);
                 }
                 JournalEvent::QueryStats
+                | JournalEvent::QueryPosition { .. }
                 | JournalEvent::GenesisHash { .. }
                 | JournalEvent::Checkpoint { .. } => {}
             }

@@ -41,8 +41,9 @@ use melin_protocol::message::{Request, ResponseKind};
 /// Maximum number of output slots consumed per batch.
 const MAX_BATCH: usize = 1024;
 
-/// Maximum encoded frame size: 8 (sequence) + 128 (response) = 136 bytes.
-const MAX_FRAME_BUF: usize = 136;
+/// Maximum encoded frame size: 8 (sequence) + 512 (response) = 520 bytes.
+/// PositionSnapshot is the largest variant at up to 330 bytes; 512 covers all.
+const MAX_FRAME_BUF: usize = 520;
 
 /// Subscriber lifecycle state.
 enum SubscriberState {
@@ -86,6 +87,15 @@ fn payload_to_response(payload: OutputPayload) -> ResponseKind {
             active_connections,
             events_processed,
             journal_sequence,
+        },
+        OutputPayload::PositionSnapshot {
+            account,
+            balances,
+            count,
+        } => ResponseKind::PositionSnapshot {
+            account,
+            balances,
+            count,
         },
     }
 }

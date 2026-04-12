@@ -148,6 +148,10 @@ pub struct Session {
     /// Tracks pending cancel/replace requests by original order ID.
     /// Used to distinguish OrderCancelReject from ExecutionReport on rejection.
     pending_cancels: HashMap<OrderId, PendingCancel>,
+    /// FIFO queue of pending QueryPosition PosReqIDs. Responses arrive in
+    /// request order (single melin connection per session), so the oldest
+    /// entry matches the next PositionSnapshot. VecDeque for O(1) push/pop.
+    pending_positions: VecDeque<String>,
     account_id: AccountId,
     signing_key: Option<SigningKey>,
     /// Index into config.sessions for this FIX session.
@@ -212,6 +216,7 @@ impl Session {
             id_map: ClOrdIdMap::new(),
             order_symbols: HashMap::new(),
             pending_cancels: HashMap::new(),
+            pending_positions: VecDeque::new(),
             account_id: AccountId(0),
             signing_key: None,
             session_config_idx: None,
@@ -648,6 +653,7 @@ impl Session {
             tags::MSG_ORDER_MASS_STATUS_REQUEST => {
                 self.handle_order_mass_status_request(&msg, config)
             }
+            tags::MSG_REQUEST_FOR_POSITIONS => self.handle_request_for_positions(&msg, config),
             _ => {
                 warn!(
                     msg_type = ?std::str::from_utf8(msg_type),
@@ -952,6 +958,38 @@ impl Session {
                 error!(sender = %self.sender_comp_id, "Melin engine error");
                 SessionAction::None
             }
+            ResponseKind::PositionSnapshot {
+                account: _,
+                balances,
+                count,
+            } => {
+                let pos_req_id = self
+                    .pending_positions
+                    .pop_front()
+                    .unwrap_or_else(|| "UNKNOWN".to_owned());
+
+                // Look up currency names from the session config index.
+                let session_account_str = self.account_id.0.to_string();
+                let bal_entries: Vec<translate::BalanceEntry> = balances[..count as usize]
+                    .iter()
+                    .map(|&(currency, free, reserved)| translate::BalanceEntry {
+                        currency: currency.0.to_string(),
+                        free,
+                        reserved,
+                    })
+                    .collect();
+
+                let msg = translate::position_report_to_fix(
+                    &config.target_comp_id,
+                    &self.sender_comp_id,
+                    self.fix_outbound_seq,
+                    &pos_req_id,
+                    &session_account_str,
+                    &bal_entries,
+                );
+                self.queue_fix_raw(&msg);
+                SessionAction::SendFix
+            }
             _ => SessionAction::None,
         }
     }
@@ -1181,6 +1219,34 @@ impl Session {
         }
 
         SessionAction::SendFix
+    }
+
+    fn handle_request_for_positions(
+        &mut self,
+        msg: &FixMessage<'_>,
+        config: &GatewayConfig,
+    ) -> SessionAction {
+        let pos_req_id = match msg.get_str(tags::POS_REQ_ID) {
+            Some(id) => id.to_owned(),
+            None => {
+                warn!(sender = %self.sender_comp_id, "RequestForPositions missing PosReqID (710)");
+                self.queue_fix_reject(config, "missing PosReqID");
+                return SessionAction::SendFix;
+            }
+        };
+
+        let request = Request::QueryPosition {
+            account: self.account_id,
+        };
+        let melin_seq = self.melin_seq;
+        self.melin_seq += 1;
+        let written = codec::encode_request(&request, melin_seq, &mut self.melin_encode_buf)
+            .expect("QueryPosition encodes within 136 bytes");
+        self.melin_send_buf
+            .extend_from_slice(&self.melin_encode_buf[..written]);
+
+        self.pending_positions.push_back(pos_req_id);
+        SessionAction::SendMelin
     }
 
     // -----------------------------------------------------------------------

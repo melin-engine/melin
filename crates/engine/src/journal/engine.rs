@@ -504,9 +504,9 @@ fn replay_event(
         JournalEvent::RemoveInstrument { symbol } => {
             exchange.remove_instrument(symbol, reports);
         }
-        JournalEvent::QueryStats => {
-            // QueryStats is never journaled, so it should never appear
-            // during replay. No-op if it somehow does.
+        JournalEvent::QueryStats | JournalEvent::QueryPosition { .. } => {
+            // Read-only queries are never journaled, so they should never
+            // appear during replay. No-op if they somehow do.
         }
         JournalEvent::GenesisHash { .. } | JournalEvent::Checkpoint { .. } => {
             // Hash chain metadata — no exchange state change.

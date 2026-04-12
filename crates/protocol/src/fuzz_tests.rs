@@ -53,7 +53,7 @@ fn fuzz_wire_response_roundtrip() {
             return;
         };
 
-        let mut buf = [0u8; 256];
+        let mut buf = [0u8; 512];
         let written = match codec::encode_response(&response, &mut buf) {
             Ok(n) => n,
             Err(_) => return,
@@ -105,7 +105,7 @@ fn request_from_bytes(data: &[u8]) -> Option<Request> {
         return None;
     }
 
-    match data[0] % 6 {
+    match data[0] % 7 {
         0 => {
             // SubmitOrder.
             if data.len() < 29 {
@@ -182,7 +182,7 @@ fn request_from_bytes(data: &[u8]) -> Option<Request> {
                 public_key,
             })
         }
-        _ => {
+        5 => {
             // Subscribe.
             if data.len() < 2 {
                 return None;
@@ -197,6 +197,12 @@ fn request_from_bytes(data: &[u8]) -> Option<Request> {
             }
             Some(Request::Subscribe { symbols, count })
         }
+        _ => {
+            // QueryPosition.
+            Some(Request::QueryPosition {
+                account: AccountId(u32_at(data, 1)?),
+            })
+        }
     }
 }
 
@@ -205,7 +211,7 @@ fn response_from_bytes(data: &[u8]) -> Option<ResponseKind> {
         return None;
     }
 
-    match data[0] % 13 {
+    match data[0] % 14 {
         0 => {
             // Placed.
             let order_id = OrderId(u64_at(data, 1)?);
@@ -339,10 +345,35 @@ fn response_from_bytes(data: &[u8]) -> Option<ResponseKind> {
                 level_count,
             })
         }
-        _ => {
+        12 => {
             // SnapshotComplete.
             let last_applied_seq = u64_at(data, 1)?;
             Some(ResponseKind::SnapshotComplete { last_applied_seq })
+        }
+        _ => {
+            // PositionSnapshot.
+            let account = AccountId(u32_at(data, 1)?);
+            if data.len() < 6 {
+                return None;
+            }
+            let count = data[5] % 17; // 0..=16
+            if data.len() < 6 + (count as usize) * 20 {
+                return None;
+            }
+            let mut balances = [(CurrencyId(0), 0u64, 0u64); 16];
+            for (i, entry) in balances.iter_mut().enumerate().take(count as usize) {
+                let off = 6 + i * 20;
+                *entry = (
+                    CurrencyId(u32_at(data, off)?),
+                    u64_at(data, off + 4)?,
+                    u64_at(data, off + 12)?,
+                );
+            }
+            Some(ResponseKind::PositionSnapshot {
+                account,
+                balances,
+                count,
+            })
         }
     }
 }

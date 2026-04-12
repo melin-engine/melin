@@ -88,6 +88,10 @@ pub enum JournalEvent {
     /// stage skips this variant. Flows through the pipeline so the matching
     /// stage can read Exchange state without concurrency issues.
     QueryStats,
+    /// Query account balances. Not journaled (no state change) — the journal
+    /// stage skips this variant. Flows through the pipeline so the matching
+    /// stage can read Exchange state without concurrency issues.
+    QueryPosition { account: AccountId },
     /// First entry in every v6 journal. Contains random bytes (fresh journal)
     /// or the chain hash at the rotation boundary (rotated journal). Seeds
     /// the BLAKE3 hash chain for tamper evidence and replica consistency.

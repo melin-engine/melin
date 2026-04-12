@@ -1450,7 +1450,8 @@ fn client_thread(
                         | ResponseKind::BookSnapshotBegin { .. }
                         | ResponseKind::BookSnapshotLevel { .. }
                         | ResponseKind::BookSnapshotEnd { .. }
-                        | ResponseKind::SnapshotComplete { .. } => continue,
+                        | ResponseKind::SnapshotComplete { .. }
+                        | ResponseKind::PositionSnapshot { .. } => continue,
                         ResponseKind::StatsHeader {
                             active_connections,
                             events_processed,

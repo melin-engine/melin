@@ -28,7 +28,7 @@ use crate::journal::event::JournalEvent;
 use crate::journal::replication::{ReplicationConsumer, ReplicationProducer};
 use crate::journal::trace::{TraceTimestamp, trace_ts};
 use crate::journal::writer::JournalWriter;
-use crate::types::{AccountId, ExecutionReport, OrderId, RejectReason, Symbol};
+use crate::types::{AccountId, CurrencyId, ExecutionReport, OrderId, RejectReason, Symbol};
 
 use melin_disruptor::padding::Sequence;
 use melin_disruptor::ring;
@@ -187,7 +187,13 @@ pub struct OutputSlot {
 }
 
 /// Payload within an output slot.
+///
+/// PositionSnapshot (389 bytes) dominates the enum size, but OutputPayload must
+/// be `Copy` for zero-allocation ring buffer transport. Boxing would add heap
+/// indirection on the hot path. Position queries are infrequent (operator/trader
+/// initiated), so the per-slot overhead is acceptable.
 #[derive(Debug, Clone, Copy)]
+#[allow(clippy::large_enum_variant)]
 pub enum OutputPayload {
     /// An execution report from matching.
     Report(ExecutionReport),
@@ -200,6 +206,14 @@ pub enum OutputPayload {
         active_connections: u64,
         events_processed: u64,
         journal_sequence: u64,
+    },
+    /// Account balance snapshot in response to `QueryPosition`.
+    PositionSnapshot {
+        account: AccountId,
+        /// (currency_id, free_balance, reserved_balance) tuples.
+        /// Fixed-size array avoids heap allocation. Max 16 currencies.
+        balances: [(CurrencyId, u64, u64); 16],
+        count: u8,
     },
 }
 
@@ -745,7 +759,10 @@ impl JournalStage {
                 {
                     let ts = crate::journal::writer::wall_clock_nanos();
                     for slot in &batch[..count] {
-                        if matches!(slot.event, JournalEvent::QueryStats) {
+                        if matches!(
+                            slot.event,
+                            JournalEvent::QueryStats | JournalEvent::QueryPosition { .. }
+                        ) {
                             continue;
                         }
                         self.writer
@@ -1182,7 +1199,10 @@ impl JournalStage {
             {
                 let ts = crate::journal::writer::wall_clock_nanos();
                 for slot in &batch[..count] {
-                    if matches!(slot.event, JournalEvent::QueryStats) {
+                    if matches!(
+                        slot.event,
+                        JournalEvent::QueryStats | JournalEvent::QueryPosition { .. }
+                    ) {
                         continue;
                     }
                     if let Err(e) = self.writer.batch_append_with_ts(
@@ -1352,7 +1372,10 @@ impl JournalStage {
 
                 let ts = crate::journal::writer::wall_clock_nanos();
                 for slot in &batch[..count] {
-                    if matches!(slot.event, JournalEvent::QueryStats) {
+                    if matches!(
+                        slot.event,
+                        JournalEvent::QueryStats | JournalEvent::QueryPosition { .. }
+                    ) {
                         continue;
                     }
                     self.writer
@@ -1460,7 +1483,7 @@ impl JournalStage {
                             inflight = Some((async_batch, seq));
                         }
                         Ok(None) => {
-                            // Buffer was empty (all QueryStats), just commit.
+                            // Buffer was empty (all read-only queries), just commit.
                             self.consumer.commit(pending);
                         }
                         Err(e) => {
@@ -1702,9 +1725,9 @@ impl MatchingStage {
                 #[cfg(feature = "latency-trace")]
                 let exec_start = trace_ts();
 
-                // QueryStats is handled inline — it reads matching-stage-owned
-                // state and publishes directly without touching the Exchange.
-                // Not counted in events_processed (it's not a trading event).
+                // QueryStats and QueryPosition are handled inline — they read
+                // matching-stage-owned state and publish directly without
+                // touching the Exchange. Not counted in events_processed.
                 if matches!(slot.event, JournalEvent::QueryStats) {
                     #[cfg(feature = "latency-trace")]
                     let exec_end = trace_ts();
@@ -1730,6 +1753,39 @@ impl MatchingStage {
                             active_connections,
                             events_processed: local_events,
                             journal_sequence,
+                        },
+                        match_complete_ts,
+                        recv_ts: slot.recv_ts,
+                    });
+                    self.output.publish(OutputSlot {
+                        connection_id: slot.connection_id,
+                        input_seq,
+                        payload: OutputPayload::BatchEnd,
+                        match_complete_ts,
+                        recv_ts: slot.recv_ts,
+                    });
+                    continue;
+                }
+
+                if let JournalEvent::QueryPosition { account } = slot.event {
+                    #[cfg(feature = "latency-trace")]
+                    let exec_end = trace_ts();
+                    #[cfg(feature = "latency-trace")]
+                    execute_hist.record_ns(crate::journal::trace::trace_elapsed_ns(
+                        exec_start, exec_end,
+                    ));
+
+                    #[allow(clippy::let_unit_value)]
+                    let match_complete_ts = trace_ts();
+
+                    let (balances, count) = self.exchange.accounts().balances_for(account);
+                    self.output.publish(OutputSlot {
+                        connection_id: slot.connection_id,
+                        input_seq,
+                        payload: OutputPayload::PositionSnapshot {
+                            account,
+                            balances,
+                            count,
                         },
                         match_complete_ts,
                         recv_ts: slot.recv_ts,
@@ -1822,9 +1878,12 @@ impl MatchingStage {
             let Some((input_seq, slot)) = entry else {
                 break;
             };
-            // Stats queries are meaningless during shutdown — skip to avoid
-            // emitting a bare BatchEnd without a preceding StatsHeader.
-            if matches!(slot.event, JournalEvent::QueryStats) {
+            // Read-only queries are meaningless during shutdown — skip to avoid
+            // emitting a bare BatchEnd without a preceding response.
+            if matches!(
+                slot.event,
+                JournalEvent::QueryStats | JournalEvent::QueryPosition { .. }
+            ) {
                 continue;
             }
             reports.clear();
@@ -1954,7 +2013,7 @@ impl MatchingStage {
             JournalEvent::RemoveInstrument { symbol } => {
                 self.exchange.remove_instrument(symbol, reports);
             }
-            JournalEvent::QueryStats => {
+            JournalEvent::QueryStats | JournalEvent::QueryPosition { .. } => {
                 // Handled inline in the run loop before process_event is called.
                 // This arm exists only for exhaustiveness.
             }

@@ -118,6 +118,10 @@ pub enum Request {
     /// Sent after auth+ServerReady. `count == 0` means all symbols.
     /// Fixed-size array avoids heap allocation on the codec hot path.
     Subscribe { symbols: [Symbol; 8], count: u8 },
+
+    /// Query balances for an account. Flows through the pipeline like QueryStats
+    /// so the matching stage can read Exchange state without concurrency issues.
+    QueryPosition { account: AccountId },
 }
 
 impl Request {
@@ -148,7 +152,13 @@ impl Request {
 }
 
 /// Server → client response payload.
+///
+/// PositionSnapshot (389 bytes) dominates the enum size, but ResponseKind must
+/// be `Copy` for zero-allocation codec paths. Boxing would add heap indirection.
+/// Position queries are infrequent (trader/operator initiated), so the per-value
+/// overhead is acceptable on the response path.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(clippy::large_enum_variant)]
 pub enum ResponseKind {
     /// An execution report from the matching engine.
     Report(ExecutionReport),
@@ -211,4 +221,14 @@ pub enum ResponseKind {
     BookSnapshotEnd { symbol: Symbol, level_count: u32 },
     /// All requested snapshots have been sent.
     SnapshotComplete { last_applied_seq: u64 },
+
+    /// Account balance snapshot in response to `QueryPosition`.
+    PositionSnapshot {
+        account: AccountId,
+        /// (currency_id, free_balance, reserved_balance) tuples.
+        /// Fixed-size array avoids heap allocation. Max 16 currencies per account.
+        balances: [(CurrencyId, u64, u64); 16],
+        /// Number of valid entries in `balances`. Remaining slots are zeroed.
+        count: u8,
+    },
 }

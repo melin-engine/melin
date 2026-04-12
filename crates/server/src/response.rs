@@ -31,9 +31,10 @@ use melin_protocol::message::ResponseKind;
 /// Maximum number of output slots consumed per batch.
 const MAX_BATCH: usize = 1024;
 
-/// Maximum encoded response size. Responses are small (execution reports),
-/// so 128 bytes is generous.
-const MAX_RESPONSE_BUF: usize = 128;
+/// Maximum encoded response size. PositionSnapshot is the largest variant
+/// at up to 330 bytes (length(4) + tag(1) + account(4) + count(1) +
+/// 16*(currency(4)+free(8)+reserved(8))). 512 bytes covers all variants.
+const MAX_RESPONSE_BUF: usize = 512;
 
 /// io_uring submission queue depth for sends. Must be ≥ max concurrent
 /// connections to avoid SQ overflow when all connections are dirty.
@@ -344,6 +345,15 @@ pub fn run(
                     active_connections,
                     events_processed,
                     journal_sequence,
+                },
+                OutputPayload::PositionSnapshot {
+                    account,
+                    balances,
+                    count,
+                } => ResponseKind::PositionSnapshot {
+                    account,
+                    balances,
+                    count,
                 },
             };
 

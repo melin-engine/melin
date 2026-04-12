@@ -58,6 +58,7 @@ const TAG_DISABLE_INSTRUMENT: u8 = 35;
 const TAG_ENABLE_INSTRUMENT: u8 = 36;
 const TAG_REMOVE_INSTRUMENT: u8 = 37;
 const TAG_SUBSCRIBE: u8 = 38;
+const TAG_QUERY_POSITION: u8 = 39;
 
 // --- Response tags ---
 const TAG_PLACED: u8 = 11;
@@ -80,6 +81,7 @@ const TAG_BOOK_SNAPSHOT_BEGIN: u8 = 40;
 const TAG_BOOK_SNAPSHOT_LEVEL: u8 = 41;
 const TAG_BOOK_SNAPSHOT_END: u8 = 42;
 const TAG_SNAPSHOT_COMPLETE: u8 = 43;
+const TAG_POSITION_SNAPSHOT: u8 = 44;
 
 // --- OrderType tags (wire-specific, not shared with journal) ---
 const ORDER_TYPE_MARKET: u8 = 0;
@@ -311,6 +313,12 @@ pub fn encode_request(request: &Request, seq: u64, buf: &mut [u8]) -> Result<usi
                 le::put_u32(&mut buf[pos..], sym.0);
                 pos += 4;
             }
+        }
+        Request::QueryPosition { account } => {
+            buf[pos] = TAG_QUERY_POSITION;
+            pos += 1;
+            le::put_u32(&mut buf[pos..], account.0);
+            pos += 4;
         }
     }
 
@@ -618,13 +626,27 @@ pub fn decode_request(buf: &[u8]) -> Result<(u64, Request), ProtocolError> {
             }
             Ok((seq, Request::Subscribe { symbols, count }))
         }
+        TAG_QUERY_POSITION => {
+            // account(4)
+            if payload.len() < 4 {
+                return Err(ProtocolError::Truncated);
+            }
+            Ok((
+                seq,
+                Request::QueryPosition {
+                    account: AccountId(le::get_u32(&payload[0..])),
+                },
+            ))
+        }
         _ => Err(ProtocolError::UnknownTag(tag)),
     }
 }
 
 /// Encode a response into `buf`. Returns total bytes written (length prefix + tag + payload).
 ///
-/// The caller must ensure `buf` is large enough (128 bytes is always sufficient).
+/// The caller must ensure `buf` is large enough. PositionSnapshot is the
+/// largest variant at up to 330 bytes (length(4) + tag(1) + account(4) +
+/// count(1) + 16*(currency(4)+free(8)+reserved(8))). 512 bytes is generous.
 pub fn encode_response(response: &ResponseKind, buf: &mut [u8]) -> Result<usize, ProtocolError> {
     let mut pos = 4; // reserve for length prefix
 
@@ -723,6 +745,27 @@ pub fn encode_response(response: &ResponseKind, buf: &mut [u8]) -> Result<usize,
             pos += 1;
             le::put_u64(&mut buf[pos..], *last_applied_seq);
             pos += 8;
+        }
+        ResponseKind::PositionSnapshot {
+            account,
+            balances,
+            count,
+        } => {
+            buf[pos] = TAG_POSITION_SNAPSHOT;
+            pos += 1;
+            le::put_u32(&mut buf[pos..], account.0);
+            pos += 4;
+            buf[pos] = *count;
+            pos += 1;
+            // Each entry: currency(4) + free(8) + reserved(8) = 20 bytes.
+            for &(currency, free, reserved) in &balances[..(*count as usize)] {
+                le::put_u32(&mut buf[pos..], currency.0);
+                pos += 4;
+                le::put_u64(&mut buf[pos..], free);
+                pos += 8;
+                le::put_u64(&mut buf[pos..], reserved);
+                pos += 8;
+            }
         }
     }
 
@@ -823,6 +866,35 @@ pub fn decode_response(buf: &[u8]) -> Result<ResponseKind, ProtocolError> {
             }
             Ok(ResponseKind::SnapshotComplete {
                 last_applied_seq: le::get_u64(&payload[0..]),
+            })
+        }
+        TAG_POSITION_SNAPSHOT => {
+            // account(4) + count(1) + count*(currency(4) + free(8) + reserved(8))
+            if payload.len() < 5 {
+                return Err(ProtocolError::Truncated);
+            }
+            let account = AccountId(le::get_u32(&payload[0..]));
+            let count = payload[4];
+            if count > 16 {
+                return Err(ProtocolError::InvalidField("position snapshot count > 16"));
+            }
+            let needed = 5 + (count as usize) * 20;
+            if payload.len() < needed {
+                return Err(ProtocolError::Truncated);
+            }
+            let mut balances = [(CurrencyId(0), 0u64, 0u64); 16];
+            for (i, entry) in balances.iter_mut().enumerate().take(count as usize) {
+                let off = 5 + i * 20;
+                *entry = (
+                    CurrencyId(le::get_u32(&payload[off..])),
+                    le::get_u64(&payload[off + 4..]),
+                    le::get_u64(&payload[off + 12..]),
+                );
+            }
+            Ok(ResponseKind::PositionSnapshot {
+                account,
+                balances,
+                count,
             })
         }
         _ => Err(ProtocolError::UnknownTag(tag)),
@@ -1554,6 +1626,9 @@ mod tests {
                 ],
                 count: 2,
             },
+            Request::QueryPosition {
+                account: AccountId(42),
+            },
         ]
     }
 
@@ -1756,6 +1831,16 @@ mod tests {
             ResponseKind::SnapshotComplete {
                 last_applied_seq: 9_876_543,
             },
+            ResponseKind::PositionSnapshot {
+                account: AccountId(42),
+                balances: {
+                    let mut b = [(CurrencyId(0), 0, 0); 16];
+                    b[0] = (CurrencyId(1), 100_000, 25_000);
+                    b[1] = (CurrencyId(2), 50_000, 10_000);
+                    b
+                },
+                count: 2,
+            },
         ]
     }
 
@@ -1777,7 +1862,7 @@ mod tests {
     #[test]
     fn response_round_trip_all_variants() {
         let responses = make_responses();
-        let mut buf = [0u8; 128];
+        let mut buf = [0u8; 512];
 
         for (i, response) in responses.iter().enumerate() {
             let written = encode_response(response, &mut buf).unwrap();

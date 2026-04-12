@@ -291,12 +291,13 @@ pub fn encode(
             pos += 4;
             TAG_REMOVE_INSTRUMENT
         }
-        JournalEvent::QueryStats => {
-            // QueryStats is never journaled — the journal stage filters it
-            // out before calling batch_append. This arm should never execute.
+        JournalEvent::QueryStats | JournalEvent::QueryPosition { .. } => {
+            // Read-only queries are never journaled — the journal stage
+            // filters them out before calling batch_append. This arm
+            // should never execute.
             return Err(JournalError::CorruptEntry {
                 sequence,
-                reason: "QueryStats must not be journaled",
+                reason: "read-only queries must not be journaled",
             });
         }
         JournalEvent::GenesisHash { hash } => {

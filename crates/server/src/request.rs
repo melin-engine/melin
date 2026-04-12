@@ -96,6 +96,7 @@ pub fn to_event(request: &Request) -> JournalEvent {
             JournalEvent::SetFeeSchedule { symbol, schedule }
         }
         Request::QueryStats => JournalEvent::QueryStats,
+        Request::QueryPosition { account } => JournalEvent::QueryPosition { account },
         Request::EndOfDay => JournalEvent::EndOfDay,
         Request::ExpireOrders { timestamp_ns } => JournalEvent::ExpireOrders { timestamp_ns },
         Request::DisableInstrument { symbol } => JournalEvent::DisableInstrument { symbol },
@@ -241,6 +242,9 @@ mod tests {
             account: AccountId(1),
         });
         to_event(&Request::QueryStats);
+        to_event(&Request::QueryPosition {
+            account: AccountId(1),
+        });
     }
 
     #[test]

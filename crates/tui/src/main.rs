@@ -576,7 +576,8 @@ fn client_thread(
                         | ResponseKind::BookSnapshotBegin { .. }
                         | ResponseKind::BookSnapshotLevel { .. }
                         | ResponseKind::BookSnapshotEnd { .. }
-                        | ResponseKind::SnapshotComplete { .. } => continue,
+                        | ResponseKind::SnapshotComplete { .. }
+                        | ResponseKind::PositionSnapshot { .. } => continue,
                     };
                     let _ = response_tx.send(msg);
                 }

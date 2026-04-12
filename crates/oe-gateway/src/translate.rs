@@ -750,7 +750,6 @@ pub fn order_mass_status_empty(
 // ---------------------------------------------------------------------------
 
 /// One currency balance entry in a PositionReport.
-#[allow(dead_code)] // Used when session dispatch is wired.
 pub struct BalanceEntry {
     pub currency: String,
     pub free: u64,
@@ -758,7 +757,6 @@ pub struct BalanceEntry {
 }
 
 /// Build a PositionReport (35=AP) for a RequestForPositions (AN) response.
-#[allow(dead_code)] // Used when session dispatch is wired.
 pub fn position_report_to_fix(
     sender: &str,
     target: &str,
