@@ -1,16 +1,22 @@
-//! Event publisher — broadcasts all execution events to TCP subscribers.
+//! Event publisher — broadcasts execution events to TCP subscribers
+//! with book-snapshot-on-subscribe support.
 //!
-//! Consumes from the output disruptor ring (consumer 1) and writes
-//! every event to all connected subscribers. This provides a firehose
-//! stream for market data gateways, analytics services, and audit loggers.
+//! Consumes from the output disruptor ring (consumer 1) and maintains
+//! a per-symbol `BookMirror`. New subscribers receive a snapshot of the
+//! current book state before joining the live firehose.
 //!
-//! Wire format per frame:
+//! Wire format per firehose frame:
 //! ```text
 //! | sequence (u64 LE) | length (u32 LE) | tag (u8) | payload (var) |
 //! ```
 //! The sequence number is the output ring's monotonic sequence for gap
 //! detection by subscribers. The rest is the standard response codec
 //! from `crates/protocol/src/codec.rs`.
+//!
+//! Subscription protocol (after Ed25519 auth + ServerReady):
+//! 1. Client sends `Subscribe { symbols, count }` (count=0 → all symbols)
+//! 2. Server sends `BookSnapshotBegin/Level/End` per symbol, then `SnapshotComplete`
+//! 3. Server switches to non-blocking and starts the live firehose
 //!
 //! Slow subscriber policy: if a TCP write returns `WouldBlock`, the subscriber
 //! is disconnected immediately. The publisher must never block on a slow client.
@@ -26,9 +32,11 @@ use tracing::{debug, error, info, warn};
 
 use melin_disruptor::ring;
 use melin_engine::journal::pipeline::{OutputPayload, OutputSlot};
+use melin_engine::types::{ExecutionReport, Symbol};
+use melin_market_data::mirror::BookMirror;
 use melin_protocol::auth::AuthorizedKeys;
 use melin_protocol::codec;
-use melin_protocol::message::ResponseKind;
+use melin_protocol::message::{Request, ResponseKind};
 
 /// Maximum number of output slots consumed per batch.
 const MAX_BATCH: usize = 1024;
@@ -36,10 +44,32 @@ const MAX_BATCH: usize = 1024;
 /// Maximum encoded frame size: 8 (sequence) + 128 (response) = 136 bytes.
 const MAX_FRAME_BUF: usize = 136;
 
+/// Subscriber lifecycle state.
+enum SubscriberState {
+    /// Waiting for `Subscribe` request (socket is blocking with read timeout).
+    AwaitingSubscription,
+    /// Active firehose (socket is non-blocking).
+    Streaming,
+}
+
 /// Per-subscriber state.
 struct Subscriber {
     stream: TcpStream,
     addr: SocketAddr,
+    state: SubscriberState,
+}
+
+/// Extract the symbol from an `ExecutionReport`.
+fn report_symbol(report: &ExecutionReport) -> Symbol {
+    match *report {
+        ExecutionReport::Placed { symbol, .. }
+        | ExecutionReport::Fill { symbol, .. }
+        | ExecutionReport::Cancelled { symbol, .. }
+        | ExecutionReport::Triggered { symbol, .. }
+        | ExecutionReport::Rejected { symbol, .. }
+        | ExecutionReport::Replaced { symbol, .. }
+        | ExecutionReport::InstrumentStatusChanged { symbol, .. } => symbol,
+    }
 }
 
 /// Convert an `OutputPayload` to the wire `ResponseKind`.
@@ -62,8 +92,9 @@ fn payload_to_response(payload: OutputPayload) -> ResponseKind {
 
 /// Run the event publisher loop. Blocks the calling thread until shutdown.
 ///
-/// Binds a TCP listener, accepts subscribers with Ed25519 auth, and
-/// broadcasts all output ring events to every connected subscriber.
+/// Binds a TCP listener, accepts subscribers with Ed25519 auth, waits
+/// for a `Subscribe` request, sends a book snapshot, then streams the
+/// live firehose.
 pub fn run(
     mut consumer: ring::Consumer<OutputSlot>,
     bind_addr: SocketAddr,
@@ -83,9 +114,14 @@ pub fn run(
         .set_nonblocking(true)
         .expect("set listener non-blocking");
 
-    // Active subscribers. Vec is fine — we expect few subscribers (< 10)
-    // and linear scan on each event is cheaper than HashMap overhead.
     let mut subscribers: Vec<Subscriber> = Vec::new();
+    // Per-symbol book mirrors, updated from every Report event.
+    // rustc_hash::FxHashMap: fast non-crypto hash, no rehash spikes
+    // (few symbols — typically < 100).
+    let mut mirrors: rustc_hash::FxHashMap<Symbol, BookMirror> = rustc_hash::FxHashMap::default();
+    // Tracks the last consumed ring sequence. Used as `last_applied_seq`
+    // in snapshot frames so the subscriber knows where the firehose resumes.
+    let mut last_seq: u64 = 0;
 
     let mut batch = [OutputSlot::default(); MAX_BATCH];
     let mut frame_buf = [0u8; MAX_FRAME_BUF];
@@ -95,12 +131,13 @@ pub fn run(
         // Accept new connections (non-blocking).
         accept_subscribers(&listener, &authorized_keys, &mut subscribers);
 
-        // Consume from the ring. Track the starting sequence before the
-        // batch read so we can stamp each frame with its ring sequence.
+        // Process pending subscribers: read Subscribe request, send snapshot.
+        process_pending_subscribers(&mut subscribers, &mirrors, last_seq);
+
+        // Consume from the ring.
         let batch_start_seq = consumer.next_read();
         let count = consumer.consume_batch(&mut batch, MAX_BATCH);
         if count == 0 {
-            // No events — yield or spin depending on mode.
             if busy_spin || idle_spins < 1000 {
                 idle_spins = idle_spins.wrapping_add(1);
                 std::hint::spin_loop();
@@ -111,13 +148,21 @@ pub fn run(
         }
         idle_spins = 0;
 
-        // Broadcast each event to all subscribers.
+        // Process each event: update mirrors, then broadcast to streaming subscribers.
         for (idx, slot) in batch[..count].iter().enumerate() {
-            let kind = payload_to_response(slot.payload);
-            // Encode: 8-byte ring sequence prefix + standard response frame.
-            // The ring sequence is monotonically increasing and gap-free,
-            // allowing subscribers to detect missed events.
             let ring_seq = batch_start_seq + idx as u64;
+
+            // Update mirror for Report events.
+            if let OutputPayload::Report(ref report) = slot.payload {
+                let sym = report_symbol(report);
+                let mirror = mirrors.entry(sym).or_insert_with(|| BookMirror::new(sym));
+                mirror.apply(report);
+            }
+
+            last_seq = ring_seq;
+
+            // Encode and broadcast.
+            let kind = payload_to_response(slot.payload);
             frame_buf[..8].copy_from_slice(&ring_seq.to_le_bytes());
             let response_len = match codec::encode_response(&kind, &mut frame_buf[8..]) {
                 Ok(n) => n,
@@ -129,18 +174,21 @@ pub fn run(
             let total_len = 8 + response_len;
             let frame = &frame_buf[..total_len];
 
-            // Write to all subscribers, removing failed ones via retain.
-            // retain iterates once without allocation — better than collecting
-            // indices into a Vec on every event.
-            subscribers.retain_mut(|sub| match sub.stream.write_all(frame) {
-                Ok(()) => true,
-                Err(e) => {
-                    if e.kind() == io::ErrorKind::WouldBlock {
-                        debug!(addr = %sub.addr, "event subscriber too slow, disconnecting");
-                    } else {
-                        debug!(addr = %sub.addr, error = %e, "event subscriber write error");
+            // Write to streaming subscribers only, removing failed ones.
+            subscribers.retain_mut(|sub| {
+                if !matches!(sub.state, SubscriberState::Streaming) {
+                    return true; // keep pending subscribers
+                }
+                match sub.stream.write_all(frame) {
+                    Ok(()) => true,
+                    Err(e) => {
+                        if e.kind() == io::ErrorKind::WouldBlock {
+                            debug!(addr = %sub.addr, "event subscriber too slow, disconnecting");
+                        } else {
+                            debug!(addr = %sub.addr, error = %e, "event subscriber write error");
+                        }
+                        false
                     }
-                    false
                 }
             });
         }
@@ -152,7 +200,7 @@ pub fn run(
     );
 }
 
-/// Accept pending connections, authenticate them, and add to subscribers.
+/// Accept pending connections, authenticate, and add as AwaitingSubscription.
 fn accept_subscribers(
     listener: &TcpListener,
     authorized_keys: &AuthorizedKeys,
@@ -163,15 +211,15 @@ fn accept_subscribers(
             Ok((stream, addr)) => {
                 match authenticate_subscriber(&stream, addr, authorized_keys) {
                     Ok(()) => {
-                        // Set non-blocking for the data path — slow subscribers
-                        // get disconnected on WouldBlock rather than blocking
-                        // the publisher.
-                        if let Err(e) = stream.set_nonblocking(true) {
-                            debug!(addr = %addr, error = %e, "failed to set non-blocking");
-                            continue;
-                        }
-                        info!(addr = %addr, "event subscriber connected");
-                        subscribers.push(Subscriber { stream, addr });
+                        // Leave in blocking mode with a read timeout for the
+                        // Subscribe handshake. Switched to non-blocking after
+                        // snapshot delivery.
+                        info!(addr = %addr, "event subscriber authenticated, awaiting subscription");
+                        subscribers.push(Subscriber {
+                            stream,
+                            addr,
+                            state: SubscriberState::AwaitingSubscription,
+                        });
                     }
                     Err(e) => {
                         debug!(addr = %addr, error = %e, "event subscriber auth failed");
@@ -187,6 +235,180 @@ fn accept_subscribers(
     }
 }
 
+/// Check pending subscribers for incoming `Subscribe` requests.
+/// On success, send snapshot and transition to Streaming.
+fn process_pending_subscribers(
+    subscribers: &mut Vec<Subscriber>,
+    mirrors: &rustc_hash::FxHashMap<Symbol, BookMirror>,
+    last_seq: u64,
+) {
+    subscribers.retain_mut(|sub| {
+        if !matches!(sub.state, SubscriberState::AwaitingSubscription) {
+            return true;
+        }
+        match try_read_subscribe(&sub.stream) {
+            Ok(Some(symbols)) => {
+                if let Err(e) = send_snapshot(&mut sub.stream, &symbols, mirrors, last_seq) {
+                    debug!(addr = %sub.addr, error = %e, "snapshot send failed");
+                    return false;
+                }
+                if let Err(e) = sub.stream.set_nonblocking(true) {
+                    debug!(addr = %sub.addr, error = %e, "set non-blocking failed");
+                    return false;
+                }
+                sub.state = SubscriberState::Streaming;
+                info!(addr = %sub.addr, symbols = symbols.len(), "subscriber streaming");
+                true
+            }
+            Ok(None) => true, // no data yet
+            Err(e) => {
+                debug!(addr = %sub.addr, error = %e, "subscribe read failed");
+                false
+            }
+        }
+    });
+}
+
+/// Try to read a `Subscribe` request from a pending subscriber.
+///
+/// Uses a 1ms read timeout to avoid blocking the main loop. Returns
+/// `Ok(None)` if no data is available yet, `Ok(Some(symbols))` on
+/// success, or `Err` on protocol violation / socket error.
+fn try_read_subscribe(
+    stream: &TcpStream,
+) -> Result<Option<Vec<Symbol>>, Box<dyn std::error::Error>> {
+    // Short timeout — this runs on every main-loop iteration for
+    // pending subscribers, so it must not block.
+    stream.set_read_timeout(Some(std::time::Duration::from_millis(1)))?;
+
+    let mut len_buf = [0u8; 4];
+    match io::Read::read_exact(&mut &*stream, &mut len_buf) {
+        Ok(()) => {}
+        Err(e) if e.kind() == io::ErrorKind::WouldBlock || e.kind() == io::ErrorKind::TimedOut => {
+            return Ok(None);
+        }
+        Err(e) => return Err(e.into()),
+    }
+
+    let frame_len = u32::from_le_bytes(len_buf) as usize;
+    if frame_len > 256 {
+        return Err(io::Error::other(format!("subscribe frame too large: {frame_len}")).into());
+    }
+    let mut frame_buf = [0u8; 256];
+    io::Read::read_exact(&mut &*stream, &mut frame_buf[..frame_len])?;
+
+    let (_seq, request) = codec::decode_request(&frame_buf[..frame_len])?;
+    match request {
+        Request::Subscribe { symbols, count } => {
+            let n = count as usize;
+            if n == 0 {
+                // Wildcard — empty vec signals "all symbols".
+                Ok(Some(Vec::new()))
+            } else {
+                Ok(Some(symbols[..n].to_vec()))
+            }
+        }
+        other => Err(format!(
+            "expected Subscribe, got {:?}",
+            std::mem::discriminant(&other)
+        )
+        .into()),
+    }
+}
+
+/// Send a book snapshot to a subscriber (blocking writes, cold path).
+///
+/// For each requested symbol (or all if `symbols` is empty), sends
+/// `BookSnapshotBegin`, one `BookSnapshotLevel` per level, then
+/// `BookSnapshotEnd`. Finally sends `SnapshotComplete`.
+fn send_snapshot(
+    stream: &mut TcpStream,
+    requested: &[Symbol],
+    mirrors: &rustc_hash::FxHashMap<Symbol, BookMirror>,
+    last_seq: u64,
+) -> io::Result<()> {
+    use melin_engine::types::Side;
+
+    let mut buf = [0u8; MAX_FRAME_BUF];
+
+    // Determine which symbols to snapshot.
+    let symbols: Vec<Symbol> = if requested.is_empty() {
+        // Wildcard: all known symbols.
+        mirrors.keys().copied().collect()
+    } else {
+        requested.to_vec()
+    };
+
+    for &sym in &symbols {
+        // Begin.
+        let begin = ResponseKind::BookSnapshotBegin {
+            symbol: sym,
+            last_applied_seq: last_seq,
+        };
+        write_snapshot_frame(stream, &mut buf, last_seq, &begin)?;
+
+        let mut level_count: u32 = 0;
+
+        if let Some(mirror) = mirrors.get(&sym) {
+            // Bids: descending price order (best bid first).
+            for (&price, level) in mirror.bids().iter().rev() {
+                let frame = ResponseKind::BookSnapshotLevel {
+                    symbol: sym,
+                    side: Side::Buy,
+                    price,
+                    qty: level.total_qty,
+                    order_count: level.order_count,
+                };
+                write_snapshot_frame(stream, &mut buf, last_seq, &frame)?;
+                level_count += 1;
+            }
+
+            // Asks: ascending price order (best ask first).
+            for (&price, level) in mirror.asks().iter() {
+                let frame = ResponseKind::BookSnapshotLevel {
+                    symbol: sym,
+                    side: Side::Sell,
+                    price,
+                    qty: level.total_qty,
+                    order_count: level.order_count,
+                };
+                write_snapshot_frame(stream, &mut buf, last_seq, &frame)?;
+                level_count += 1;
+            }
+        }
+        // Empty mirror (no events yet) → Begin/End with zero levels.
+
+        // End.
+        let end = ResponseKind::BookSnapshotEnd {
+            symbol: sym,
+            level_count,
+        };
+        write_snapshot_frame(stream, &mut buf, last_seq, &end)?;
+    }
+
+    // Complete.
+    let complete = ResponseKind::SnapshotComplete {
+        last_applied_seq: last_seq,
+    };
+    write_snapshot_frame(stream, &mut buf, last_seq, &complete)?;
+    stream.flush()?;
+
+    Ok(())
+}
+
+/// Encode a snapshot response as a sequence-prefixed frame and write it.
+fn write_snapshot_frame(
+    stream: &mut TcpStream,
+    buf: &mut [u8; MAX_FRAME_BUF],
+    seq: u64,
+    kind: &ResponseKind,
+) -> io::Result<()> {
+    buf[..8].copy_from_slice(&seq.to_le_bytes());
+    let response_len = codec::encode_response(kind, &mut buf[8..])
+        .map_err(|e| io::Error::other(format!("encode snapshot frame: {e}")))?;
+    stream.write_all(&buf[..8 + response_len])
+}
+
 /// Run Ed25519 challenge-response authentication on a subscriber connection.
 ///
 /// Reuses the same protocol as `server.rs` — Challenge/ChallengeResponse/ServerReady.
@@ -198,7 +420,6 @@ fn authenticate_subscriber(
     authorized_keys: &AuthorizedKeys,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use ed25519_dalek::{Verifier, VerifyingKey};
-    use melin_protocol::message::Request;
 
     // Set a read timeout for the auth handshake to prevent slow clients
     // from stalling the publisher.
@@ -289,6 +510,7 @@ fn authenticate_subscriber(
 fn send_auth_failed(writer: &mut dyn Write) {
     let mut buf = [0u8; 8];
     if let Ok(n) = codec::encode_response(&ResponseKind::AuthFailed, &mut buf) {
+        // Best-effort: ignore write errors during auth failure notification.
         let _ = writer.write_all(&buf[..n]);
         let _ = writer.flush();
     }
@@ -299,6 +521,16 @@ mod tests {
     use super::*;
     use melin_engine::journal::pipeline::OutputSlot;
     use melin_engine::types::*;
+
+    /// Helper to create a Streaming subscriber for tests that bypass
+    /// the auth + subscribe handshake.
+    fn test_subscriber(stream: TcpStream, addr: SocketAddr) -> Subscriber {
+        Subscriber {
+            stream,
+            addr,
+            state: SubscriberState::Streaming,
+        }
+    }
 
     #[test]
     fn frame_encoding_with_sequence_prefix() {
@@ -323,7 +555,6 @@ mod tests {
         assert_eq!(decoded_seq, 42);
 
         // Verify the response portion decodes correctly.
-        // Skip the 8-byte sequence prefix, then read the 4-byte length prefix.
         let len = u32::from_le_bytes(buf[8..12].try_into().unwrap()) as usize;
         let decoded = codec::decode_response(&buf[12..12 + len]).unwrap();
         assert!(matches!(
@@ -334,14 +565,12 @@ mod tests {
             })
         ));
 
-        // Total frame size is reasonable.
         assert!(total_len <= MAX_FRAME_BUF);
-        assert!(total_len > 8); // at least sequence + some response
+        assert!(total_len > 8);
     }
 
     #[test]
     fn payload_to_response_all_variants() {
-        // Report
         let r = payload_to_response(OutputPayload::Report(ExecutionReport::Placed {
             order_id: OrderId(1),
             symbol: Symbol(1),
@@ -352,15 +581,12 @@ mod tests {
         }));
         assert!(matches!(r, ResponseKind::Report(_)));
 
-        // BatchEnd
         let r = payload_to_response(OutputPayload::BatchEnd);
         assert!(matches!(r, ResponseKind::BatchEnd));
 
-        // EngineError
         let r = payload_to_response(OutputPayload::EngineError);
         assert!(matches!(r, ResponseKind::EngineError));
 
-        // StatsHeader
         let r = payload_to_response(OutputPayload::StatsHeader {
             active_connections: 5,
             events_processed: 1000,
@@ -371,8 +597,6 @@ mod tests {
 
     #[test]
     fn slow_subscriber_disconnected() {
-        // Simulate a slow subscriber by creating a TCP pair where the
-        // reader never reads, causing the writer's send buffer to fill.
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
 
@@ -380,8 +604,6 @@ mod tests {
         let (server_stream, client_addr) = listener.accept().unwrap();
         server_stream.set_nonblocking(true).unwrap();
 
-        // Set a tiny send buffer to trigger WouldBlock quickly.
-        // On Linux, minimum is typically 2304 bytes.
         unsafe {
             let size: libc::c_int = 1;
             libc::setsockopt(
@@ -393,12 +615,8 @@ mod tests {
             );
         }
 
-        let mut sub = Subscriber {
-            stream: server_stream,
-            addr: client_addr,
-        };
+        let mut sub = test_subscriber(server_stream, client_addr);
 
-        // Write large frames until we get WouldBlock.
         let frame = [0u8; 4096];
         let mut got_error = false;
         for _ in 0..1000 {
@@ -412,7 +630,6 @@ mod tests {
 
     #[test]
     fn multiple_subscribers_receive_same_frame() {
-        // Two subscribers should receive identical frames.
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
 
@@ -425,17 +642,10 @@ mod tests {
         server2.set_nonblocking(true).unwrap();
 
         let mut subscribers = vec![
-            Subscriber {
-                stream: server1,
-                addr: addr1,
-            },
-            Subscriber {
-                stream: server2,
-                addr: addr2,
-            },
+            test_subscriber(server1, addr1),
+            test_subscriber(server2, addr2),
         ];
 
-        // Write a frame to both.
         let kind = payload_to_response(OutputPayload::BatchEnd);
         let mut frame_buf = [0u8; MAX_FRAME_BUF];
         let ring_seq: u64 = 7;
@@ -448,7 +658,6 @@ mod tests {
             sub.stream.write_all(frame).unwrap();
         }
 
-        // Both clients should receive the same bytes.
         client1
             .set_read_timeout(Some(std::time::Duration::from_secs(1)))
             .unwrap();
@@ -465,15 +674,12 @@ mod tests {
         assert_eq!(n2, total_len);
         assert_eq!(&buf1[..n1], &buf2[..n2]);
 
-        // Verify sequence in both.
         let seq1 = u64::from_le_bytes(buf1[..8].try_into().unwrap());
         let seq2 = u64::from_le_bytes(buf2[..8].try_into().unwrap());
         assert_eq!(seq1, 7);
         assert_eq!(seq2, 7);
     }
 
-    /// Verify that sequential ring sequences produce monotonically increasing
-    /// sequence numbers in frames, allowing subscribers to detect gaps.
     #[test]
     fn monotonic_sequence_numbers_in_frames() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -483,12 +689,8 @@ mod tests {
         let (server_stream, client_addr) = listener.accept().unwrap();
         server_stream.set_nonblocking(true).unwrap();
 
-        let mut sub = Subscriber {
-            stream: server_stream,
-            addr: client_addr,
-        };
+        let mut sub = test_subscriber(server_stream, client_addr);
 
-        // Send 10 frames with consecutive ring sequences.
         for seq in 0u64..10 {
             let kind = payload_to_response(OutputPayload::BatchEnd);
             let mut frame_buf = [0u8; MAX_FRAME_BUF];
@@ -499,22 +701,18 @@ mod tests {
                 .unwrap();
         }
 
-        // Client reads all 10 and verifies monotonic, gap-free sequences.
         client
             .set_read_timeout(Some(std::time::Duration::from_secs(1)))
             .unwrap();
         let mut buf = [0u8; 2048];
         let mut total_read = 0;
         while total_read < 10 * 13 {
-            // Each BatchEnd frame is ~13 bytes (8 seq + 5 response).
             match io::Read::read(&mut client, &mut buf[total_read..]) {
                 Ok(n) if n > 0 => total_read += n,
                 _ => break,
             }
         }
 
-        // Parse sequences out of the received data. Each frame starts with
-        // a u64 LE sequence, then a 4-byte length-prefixed response.
         let mut offset = 0;
         let mut prev_seq: Option<u64> = None;
         let mut count = 0;
@@ -538,8 +736,6 @@ mod tests {
         assert_eq!(count, 10, "expected 10 frames");
     }
 
-    /// Verify that when one subscriber fails mid-batch, the other still
-    /// receives all frames (failed subscriber is removed, not fatal).
     #[test]
     fn failed_subscriber_does_not_affect_others() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -554,34 +750,23 @@ mod tests {
         server2.set_nonblocking(true).unwrap();
 
         let mut subscribers = vec![
-            Subscriber {
-                stream: server1,
-                addr: addr1,
-            },
-            Subscriber {
-                stream: server2,
-                addr: addr2,
-            },
+            test_subscriber(server1, addr1),
+            test_subscriber(server2, addr2),
         ];
 
-        // Drop client2 to cause writes to subscriber2 to fail.
         drop(_client2);
-        // Give the OS a moment to process the close.
         std::thread::sleep(std::time::Duration::from_millis(10));
 
-        // Write frames and use retain to remove failed subscribers.
         let kind = payload_to_response(OutputPayload::BatchEnd);
         let mut frame_buf = [0u8; MAX_FRAME_BUF];
         frame_buf[..8].copy_from_slice(&0u64.to_le_bytes());
         let response_len = codec::encode_response(&kind, &mut frame_buf[8..]).unwrap();
         let frame = &frame_buf[..8 + response_len];
 
-        // Pump enough frames for the broken pipe to manifest.
         for _ in 0..10 {
             subscribers.retain_mut(|sub| sub.stream.write_all(frame).is_ok());
         }
 
-        // Client1 should still be connected and receiving.
         client1
             .set_read_timeout(Some(std::time::Duration::from_secs(1)))
             .unwrap();
@@ -589,7 +774,6 @@ mod tests {
         let n = io::Read::read(&mut client1, &mut buf).unwrap();
         assert!(n > 0, "client1 should receive data");
 
-        // Subscriber2 should have been removed.
         assert_eq!(subscribers.len(), 1, "failed subscriber should be removed");
     }
 
@@ -617,11 +801,204 @@ mod tests {
             })
             .unwrap();
 
-        // Give it a moment to start, then signal shutdown.
         std::thread::sleep(std::time::Duration::from_millis(50));
         shutdown.store(true, Ordering::Relaxed);
 
-        // Should exit promptly.
         handle.join().unwrap();
+    }
+
+    #[test]
+    fn send_snapshot_empty_book() {
+        // Snapshot of an empty mirror map should produce Begin/End/Complete.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let mut client = TcpStream::connect(addr).unwrap();
+        let (mut server, _) = listener.accept().unwrap();
+
+        let mirrors = rustc_hash::FxHashMap::default();
+        send_snapshot(&mut server, &[Symbol(1)], &mirrors, 42).unwrap();
+
+        client
+            .set_read_timeout(Some(std::time::Duration::from_secs(1)))
+            .unwrap();
+        let mut buf = [0u8; 512];
+        let mut total = 0;
+        loop {
+            match io::Read::read(&mut client, &mut buf[total..]) {
+                Ok(n) if n > 0 => total += n,
+                _ => break,
+            }
+        }
+
+        // Parse frames: expect Begin, End, Complete.
+        let mut offset = 0;
+        let mut responses = Vec::new();
+        while offset + 12 <= total {
+            let _seq = u64::from_le_bytes(buf[offset..offset + 8].try_into().unwrap());
+            let len = u32::from_le_bytes(buf[offset + 8..offset + 12].try_into().unwrap()) as usize;
+            if offset + 12 + len > total {
+                break;
+            }
+            let resp = codec::decode_response(&buf[offset + 12..offset + 12 + len]).unwrap();
+            responses.push(resp);
+            offset += 8 + 4 + len;
+        }
+
+        assert_eq!(responses.len(), 3);
+        assert!(matches!(
+            responses[0],
+            ResponseKind::BookSnapshotBegin {
+                symbol: Symbol(1),
+                last_applied_seq: 42,
+            }
+        ));
+        assert!(matches!(
+            responses[1],
+            ResponseKind::BookSnapshotEnd {
+                symbol: Symbol(1),
+                level_count: 0,
+            }
+        ));
+        assert!(matches!(
+            responses[2],
+            ResponseKind::SnapshotComplete {
+                last_applied_seq: 42,
+            }
+        ));
+    }
+
+    #[test]
+    fn send_snapshot_with_levels() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let mut client = TcpStream::connect(addr).unwrap();
+        let (mut server, _) = listener.accept().unwrap();
+
+        // Build a mirror with known state.
+        let mut mirror = BookMirror::new(Symbol(1));
+        mirror.apply(&ExecutionReport::Placed {
+            order_id: OrderId(1),
+            symbol: Symbol(1),
+            account: AccountId(1),
+            side: Side::Buy,
+            price: Price(std::num::NonZeroU64::new(100).unwrap()),
+            quantity: Quantity(std::num::NonZeroU64::new(10).unwrap()),
+        });
+        mirror.apply(&ExecutionReport::Placed {
+            order_id: OrderId(2),
+            symbol: Symbol(1),
+            account: AccountId(1),
+            side: Side::Sell,
+            price: Price(std::num::NonZeroU64::new(200).unwrap()),
+            quantity: Quantity(std::num::NonZeroU64::new(5).unwrap()),
+        });
+
+        let mut mirrors = rustc_hash::FxHashMap::default();
+        mirrors.insert(Symbol(1), mirror);
+
+        send_snapshot(&mut server, &[Symbol(1)], &mirrors, 99).unwrap();
+
+        client
+            .set_read_timeout(Some(std::time::Duration::from_secs(1)))
+            .unwrap();
+        let mut buf = [0u8; 1024];
+        let mut total = 0;
+        loop {
+            match io::Read::read(&mut client, &mut buf[total..]) {
+                Ok(n) if n > 0 => total += n,
+                _ => break,
+            }
+        }
+
+        let mut offset = 0;
+        let mut responses = Vec::new();
+        while offset + 12 <= total {
+            let len = u32::from_le_bytes(buf[offset + 8..offset + 12].try_into().unwrap()) as usize;
+            if offset + 12 + len > total {
+                break;
+            }
+            let resp = codec::decode_response(&buf[offset + 12..offset + 12 + len]).unwrap();
+            responses.push(resp);
+            offset += 8 + 4 + len;
+        }
+
+        // Begin, BidLevel, AskLevel, End, Complete = 5 frames.
+        assert_eq!(responses.len(), 5);
+        assert!(matches!(
+            responses[0],
+            ResponseKind::BookSnapshotBegin {
+                symbol: Symbol(1),
+                ..
+            }
+        ));
+        // Bid level.
+        assert!(matches!(
+            responses[1],
+            ResponseKind::BookSnapshotLevel {
+                symbol: Symbol(1),
+                side: Side::Buy,
+                qty: 10,
+                order_count: 1,
+                ..
+            }
+        ));
+        // Ask level.
+        assert!(matches!(
+            responses[2],
+            ResponseKind::BookSnapshotLevel {
+                symbol: Symbol(1),
+                side: Side::Sell,
+                qty: 5,
+                order_count: 1,
+                ..
+            }
+        ));
+        assert!(matches!(
+            responses[3],
+            ResponseKind::BookSnapshotEnd {
+                symbol: Symbol(1),
+                level_count: 2,
+            }
+        ));
+        assert!(matches!(
+            responses[4],
+            ResponseKind::SnapshotComplete {
+                last_applied_seq: 99
+            }
+        ));
+    }
+
+    #[test]
+    fn report_symbol_extracts_all_variants() {
+        let sym = Symbol(42);
+        assert_eq!(
+            report_symbol(&ExecutionReport::Placed {
+                order_id: OrderId(1),
+                symbol: sym,
+                account: AccountId(1),
+                side: Side::Buy,
+                price: Price(std::num::NonZeroU64::new(1).unwrap()),
+                quantity: Quantity(std::num::NonZeroU64::new(1).unwrap()),
+            }),
+            sym
+        );
+        assert_eq!(
+            report_symbol(&ExecutionReport::Rejected {
+                order_id: OrderId(1),
+                symbol: sym,
+                account: AccountId(1),
+                reason: melin_engine::types::RejectReason::NoLiquidity,
+            }),
+            sym
+        );
+        assert_eq!(
+            report_symbol(&ExecutionReport::InstrumentStatusChanged {
+                symbol: sym,
+                status: InstrumentStatus::Enabled,
+            }),
+            sym
+        );
     }
 }

@@ -14,7 +14,7 @@ use melin_protocol::message::Request;
 pub fn should_filter(request: &Request) -> bool {
     matches!(
         request,
-        Request::Heartbeat | Request::ChallengeResponse { .. }
+        Request::Heartbeat | Request::ChallengeResponse { .. } | Request::Subscribe { .. }
     )
 }
 
@@ -101,8 +101,8 @@ pub fn to_event(request: &Request) -> JournalEvent {
         Request::DisableInstrument { symbol } => JournalEvent::DisableInstrument { symbol },
         Request::EnableInstrument { symbol } => JournalEvent::EnableInstrument { symbol },
         Request::RemoveInstrument { symbol } => JournalEvent::RemoveInstrument { symbol },
-        Request::Heartbeat | Request::ChallengeResponse { .. } => {
-            unreachable!("heartbeats and auth messages must be filtered before to_event")
+        Request::Heartbeat | Request::ChallengeResponse { .. } | Request::Subscribe { .. } => {
+            unreachable!("heartbeats, auth, and subscribe must be filtered before to_event")
         }
     }
 }

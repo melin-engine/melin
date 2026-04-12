@@ -572,7 +572,11 @@ fn client_thread(
                         | ResponseKind::Heartbeat
                         | ResponseKind::Challenge { .. }
                         | ResponseKind::AuthFailed
-                        | ResponseKind::StatsHeader { .. } => continue,
+                        | ResponseKind::StatsHeader { .. }
+                        | ResponseKind::BookSnapshotBegin { .. }
+                        | ResponseKind::BookSnapshotLevel { .. }
+                        | ResponseKind::BookSnapshotEnd { .. }
+                        | ResponseKind::SnapshotComplete { .. } => continue,
                     };
                     let _ = response_tx.send(msg);
                 }

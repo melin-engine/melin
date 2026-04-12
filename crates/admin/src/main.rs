@@ -1446,7 +1446,11 @@ fn client_thread(
                         | ResponseKind::ServerReady
                         | ResponseKind::Heartbeat
                         | ResponseKind::Challenge { .. }
-                        | ResponseKind::AuthFailed => continue,
+                        | ResponseKind::AuthFailed
+                        | ResponseKind::BookSnapshotBegin { .. }
+                        | ResponseKind::BookSnapshotLevel { .. }
+                        | ResponseKind::BookSnapshotEnd { .. }
+                        | ResponseKind::SnapshotComplete { .. } => continue,
                         ResponseKind::StatsHeader {
                             active_connections,
                             events_processed,

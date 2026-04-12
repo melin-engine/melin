@@ -6,7 +6,7 @@
 
 use melin_engine::types::{
     AccountId, CircuitBreakerConfig, CurrencyId, ExecutionReport, FeeSchedule, InstrumentSpec,
-    Order, OrderId, Price, Quantity, RiskLimits, Symbol,
+    Order, OrderId, Price, Quantity, RiskLimits, Side, Symbol,
 };
 
 /// Connection identifier assigned by the server.
@@ -113,6 +113,11 @@ pub enum Request {
         /// Client's Ed25519 public key (32 bytes).
         public_key: [u8; 32],
     },
+
+    /// Subscribe to the event firehose for specific symbols.
+    /// Sent after auth+ServerReady. `count == 0` means all symbols.
+    /// Fixed-size array avoids heap allocation on the codec hot path.
+    Subscribe { symbols: [Symbol; 8], count: u8 },
 }
 
 impl Request {
@@ -187,4 +192,23 @@ pub enum ResponseKind {
         /// Current journal sequence number (last durable event).
         journal_sequence: u64,
     },
+
+    // --- Market-data snapshot ---
+    /// Start of a book snapshot for one symbol.
+    BookSnapshotBegin {
+        symbol: Symbol,
+        last_applied_seq: u64,
+    },
+    /// One price level in a book snapshot.
+    BookSnapshotLevel {
+        symbol: Symbol,
+        side: Side,
+        price: Price,
+        qty: u64,
+        order_count: u32,
+    },
+    /// End of a book snapshot for one symbol.
+    BookSnapshotEnd { symbol: Symbol, level_count: u32 },
+    /// All requested snapshots have been sent.
+    SnapshotComplete { last_applied_seq: u64 },
 }

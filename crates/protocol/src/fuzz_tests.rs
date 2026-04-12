@@ -105,7 +105,7 @@ fn request_from_bytes(data: &[u8]) -> Option<Request> {
         return None;
     }
 
-    match data[0] % 5 {
+    match data[0] % 6 {
         0 => {
             // SubmitOrder.
             if data.len() < 29 {
@@ -168,7 +168,7 @@ fn request_from_bytes(data: &[u8]) -> Option<Request> {
             account: AccountId(u32_at(data, 1)?),
         }),
         3 => Some(Request::Heartbeat),
-        _ => {
+        4 => {
             // ChallengeResponse.
             if data.len() < 97 {
                 return None;
@@ -182,6 +182,21 @@ fn request_from_bytes(data: &[u8]) -> Option<Request> {
                 public_key,
             })
         }
+        _ => {
+            // Subscribe.
+            if data.len() < 2 {
+                return None;
+            }
+            let count = data[1] % 9; // 0..=8
+            if data.len() < 2 + (count as usize) * 4 {
+                return None;
+            }
+            let mut symbols = [Symbol(0); 8];
+            for (i, sym) in symbols.iter_mut().enumerate().take(count as usize) {
+                *sym = Symbol(u32_at(data, 2 + i * 4)?);
+            }
+            Some(Request::Subscribe { symbols, count })
+        }
     }
 }
 
@@ -190,7 +205,7 @@ fn response_from_bytes(data: &[u8]) -> Option<ResponseKind> {
         return None;
     }
 
-    match data[0] % 9 {
+    match data[0] % 13 {
         0 => {
             // Placed.
             let order_id = OrderId(u64_at(data, 1)?);
@@ -283,6 +298,51 @@ fn response_from_bytes(data: &[u8]) -> Option<ResponseKind> {
         5 => Some(ResponseKind::EngineError),
         6 => Some(ResponseKind::BatchEnd),
         7 => Some(ResponseKind::ServerReady),
-        _ => Some(ResponseKind::Heartbeat),
+        8 => Some(ResponseKind::Heartbeat),
+        9 => {
+            // BookSnapshotBegin.
+            let symbol = Symbol(u32_at(data, 1)?);
+            let last_applied_seq = u64_at(data, 5)?;
+            Some(ResponseKind::BookSnapshotBegin {
+                symbol,
+                last_applied_seq,
+            })
+        }
+        10 => {
+            // BookSnapshotLevel.
+            if data.len() < 26 {
+                return None;
+            }
+            let symbol = Symbol(u32_at(data, 1)?);
+            let side = if data[5] & 1 == 0 {
+                Side::Buy
+            } else {
+                Side::Sell
+            };
+            let price = Price(nz64(data, 6)?);
+            let qty = u64_at(data, 14)?;
+            let order_count = u32_at(data, 22)?;
+            Some(ResponseKind::BookSnapshotLevel {
+                symbol,
+                side,
+                price,
+                qty,
+                order_count,
+            })
+        }
+        11 => {
+            // BookSnapshotEnd.
+            let symbol = Symbol(u32_at(data, 1)?);
+            let level_count = u32_at(data, 5)?;
+            Some(ResponseKind::BookSnapshotEnd {
+                symbol,
+                level_count,
+            })
+        }
+        _ => {
+            // SnapshotComplete.
+            let last_applied_seq = u64_at(data, 1)?;
+            Some(ResponseKind::SnapshotComplete { last_applied_seq })
+        }
     }
 }

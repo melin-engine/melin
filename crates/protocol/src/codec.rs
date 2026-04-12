@@ -57,6 +57,7 @@ const TAG_EXPIRE_ORDERS: u8 = 34;
 const TAG_DISABLE_INSTRUMENT: u8 = 35;
 const TAG_ENABLE_INSTRUMENT: u8 = 36;
 const TAG_REMOVE_INSTRUMENT: u8 = 37;
+const TAG_SUBSCRIBE: u8 = 38;
 
 // --- Response tags ---
 const TAG_PLACED: u8 = 11;
@@ -75,6 +76,10 @@ const TAG_STATS_HEADER: u8 = 23;
 /// Server pipeline full — client should retry after backoff.
 const TAG_SERVER_BUSY: u8 = 24;
 const TAG_INSTRUMENT_STATUS_CHANGED: u8 = 25;
+const TAG_BOOK_SNAPSHOT_BEGIN: u8 = 40;
+const TAG_BOOK_SNAPSHOT_LEVEL: u8 = 41;
+const TAG_BOOK_SNAPSHOT_END: u8 = 42;
+const TAG_SNAPSHOT_COMPLETE: u8 = 43;
 
 // --- OrderType tags (wire-specific, not shared with journal) ---
 const ORDER_TYPE_MARKET: u8 = 0;
@@ -296,6 +301,16 @@ pub fn encode_request(request: &Request, seq: u64, buf: &mut [u8]) -> Result<usi
             pos += 1;
             le::put_u32(&mut buf[pos..], symbol.0);
             pos += 4;
+        }
+        Request::Subscribe { symbols, count } => {
+            buf[pos] = TAG_SUBSCRIBE;
+            pos += 1;
+            buf[pos] = *count;
+            pos += 1;
+            for sym in &symbols[..(*count as usize)] {
+                le::put_u32(&mut buf[pos..], sym.0);
+                pos += 4;
+            }
         }
     }
 
@@ -584,6 +599,25 @@ pub fn decode_request(buf: &[u8]) -> Result<(u64, Request), ProtocolError> {
                 },
             ))
         }
+        TAG_SUBSCRIBE => {
+            // count(1) + count×symbol(4)
+            if payload.is_empty() {
+                return Err(ProtocolError::Truncated);
+            }
+            let count = payload[0];
+            if count > 8 {
+                return Err(ProtocolError::InvalidField("subscribe count > 8"));
+            }
+            let needed = 1 + (count as usize) * 4;
+            if payload.len() < needed {
+                return Err(ProtocolError::Truncated);
+            }
+            let mut symbols = [Symbol(0); 8];
+            for i in 0..count as usize {
+                symbols[i] = Symbol(le::get_u32(&payload[1 + i * 4..]));
+            }
+            Ok((seq, Request::Subscribe { symbols, count }))
+        }
         _ => Err(ProtocolError::UnknownTag(tag)),
     }
 }
@@ -642,6 +676,54 @@ pub fn encode_response(response: &ResponseKind, buf: &mut [u8]) -> Result<usize,
             le::put_u64(&mut buf[pos..], *journal_sequence);
             pos += 8;
         }
+        ResponseKind::BookSnapshotBegin {
+            symbol,
+            last_applied_seq,
+        } => {
+            buf[pos] = TAG_BOOK_SNAPSHOT_BEGIN;
+            pos += 1;
+            le::put_u32(&mut buf[pos..], symbol.0);
+            pos += 4;
+            le::put_u64(&mut buf[pos..], *last_applied_seq);
+            pos += 8;
+        }
+        ResponseKind::BookSnapshotLevel {
+            symbol,
+            side,
+            price,
+            qty,
+            order_count,
+        } => {
+            buf[pos] = TAG_BOOK_SNAPSHOT_LEVEL;
+            pos += 1;
+            le::put_u32(&mut buf[pos..], symbol.0);
+            pos += 4;
+            buf[pos] = le::encode_side(*side);
+            pos += 1;
+            le::put_u64(&mut buf[pos..], price.get());
+            pos += 8;
+            le::put_u64(&mut buf[pos..], *qty);
+            pos += 8;
+            le::put_u32(&mut buf[pos..], *order_count);
+            pos += 4;
+        }
+        ResponseKind::BookSnapshotEnd {
+            symbol,
+            level_count,
+        } => {
+            buf[pos] = TAG_BOOK_SNAPSHOT_END;
+            pos += 1;
+            le::put_u32(&mut buf[pos..], symbol.0);
+            pos += 4;
+            le::put_u32(&mut buf[pos..], *level_count);
+            pos += 4;
+        }
+        ResponseKind::SnapshotComplete { last_applied_seq } => {
+            buf[pos] = TAG_SNAPSHOT_COMPLETE;
+            pos += 1;
+            le::put_u64(&mut buf[pos..], *last_applied_seq);
+            pos += 8;
+        }
     }
 
     let payload_len = pos - 4;
@@ -693,6 +775,54 @@ pub fn decode_response(buf: &[u8]) -> Result<ResponseKind, ProtocolError> {
                 active_connections: le::get_u64(&payload[0..]),
                 events_processed: le::get_u64(&payload[8..]),
                 journal_sequence: le::get_u64(&payload[16..]),
+            })
+        }
+        TAG_BOOK_SNAPSHOT_BEGIN => {
+            // symbol(4) + last_applied_seq(8) = 12
+            if payload.len() < 12 {
+                return Err(ProtocolError::Truncated);
+            }
+            Ok(ResponseKind::BookSnapshotBegin {
+                symbol: Symbol(le::get_u32(&payload[0..])),
+                last_applied_seq: le::get_u64(&payload[4..]),
+            })
+        }
+        TAG_BOOK_SNAPSHOT_LEVEL => {
+            // symbol(4) + side(1) + price(8) + qty(8) + order_count(4) = 25
+            if payload.len() < 25 {
+                return Err(ProtocolError::Truncated);
+            }
+            let symbol = Symbol(le::get_u32(&payload[0..]));
+            let side = le::decode_side(payload[4]).ok_or(ProtocolError::InvalidField("side"))?;
+            let price = NonZeroU64::new(le::get_u64(&payload[5..]))
+                .ok_or(ProtocolError::InvalidField("snapshot level price is zero"))?;
+            let qty = le::get_u64(&payload[13..]);
+            let order_count = le::get_u32(&payload[21..]);
+            Ok(ResponseKind::BookSnapshotLevel {
+                symbol,
+                side,
+                price: Price(price),
+                qty,
+                order_count,
+            })
+        }
+        TAG_BOOK_SNAPSHOT_END => {
+            // symbol(4) + level_count(4) = 8
+            if payload.len() < 8 {
+                return Err(ProtocolError::Truncated);
+            }
+            Ok(ResponseKind::BookSnapshotEnd {
+                symbol: Symbol(le::get_u32(&payload[0..])),
+                level_count: le::get_u32(&payload[4..]),
+            })
+        }
+        TAG_SNAPSHOT_COMPLETE => {
+            // last_applied_seq(8)
+            if payload.len() < 8 {
+                return Err(ProtocolError::Truncated);
+            }
+            Ok(ResponseKind::SnapshotComplete {
+                last_applied_seq: le::get_u64(&payload[0..]),
             })
         }
         _ => Err(ProtocolError::UnknownTag(tag)),
@@ -1411,6 +1541,19 @@ mod tests {
             Request::DisableInstrument { symbol: Symbol(1) },
             Request::EnableInstrument { symbol: Symbol(2) },
             Request::RemoveInstrument { symbol: Symbol(3) },
+            Request::Subscribe {
+                symbols: [
+                    Symbol(10),
+                    Symbol(20),
+                    Symbol(0),
+                    Symbol(0),
+                    Symbol(0),
+                    Symbol(0),
+                    Symbol(0),
+                    Symbol(0),
+                ],
+                count: 2,
+            },
         ]
     }
 
@@ -1594,6 +1737,24 @@ mod tests {
                 active_connections: 5,
                 events_processed: 1_234_567,
                 journal_sequence: 1_234_567,
+            },
+            ResponseKind::BookSnapshotBegin {
+                symbol: Symbol(42),
+                last_applied_seq: 9_876_543,
+            },
+            ResponseKind::BookSnapshotLevel {
+                symbol: Symbol(42),
+                side: Side::Buy,
+                price: Price(nz(50_000)),
+                qty: 1_500,
+                order_count: 12,
+            },
+            ResponseKind::BookSnapshotEnd {
+                symbol: Symbol(42),
+                level_count: 25,
+            },
+            ResponseKind::SnapshotComplete {
+                last_applied_seq: 9_876_543,
             },
         ]
     }
