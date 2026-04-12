@@ -384,7 +384,7 @@ impl MdSession {
             self.queue_fix(&logout);
             SessionAction::Close
         } else if msg_type == tags::MSG_MARKET_DATA_REQUEST {
-            // TODO: Phase 7 — dispatch V to MarketDataCore.
+            // TODO: dispatch V to MarketDataCore for live subscription.
             debug!(sender = %self.sender_comp_id, "MarketDataRequest received (not yet implemented)");
             let reject = FixMessageBuilder::new(tags::MSG_MD_REQUEST_REJECT)
                 .str_tag(tags::MD_REQ_ID, msg.get_str(tags::MD_REQ_ID).unwrap_or(""))
@@ -396,6 +396,8 @@ impl MdSession {
                 );
             self.queue_fix(&reject);
             SessionAction::SendFix
+        } else if msg_type == tags::MSG_SECURITY_LIST_REQUEST {
+            self.handle_security_list_request(&msg, config)
         } else {
             // Unknown or unsupported message type — send Reject.
             debug!(
@@ -406,6 +408,45 @@ impl MdSession {
             self.queue_fix_reject(config, "unsupported MsgType");
             SessionAction::SendFix
         }
+    }
+
+    /// Handle SecurityListRequest (35=x). Responds with a SecurityList (35=y)
+    /// containing all configured symbols.
+    fn handle_security_list_request(
+        &mut self,
+        msg: &FixMessage<'_>,
+        config: &GatewayConfig,
+    ) -> SessionAction {
+        let req_id = msg.get_str(tags::SECURITY_REQ_ID).unwrap_or("");
+        info!(sender = %self.sender_comp_id, req_id, "SecurityListRequest");
+
+        let symbols: Vec<crate::translate::SecurityInfo> = config
+            .symbols
+            .iter()
+            .map(|(name, sym_cfg)| crate::translate::SecurityInfo {
+                symbol: name.clone(),
+                base_ccy: sym_cfg.base_ccy.clone(),
+                quote_ccy: sym_cfg.quote_ccy.clone(),
+                min_price_increment: if sym_cfg.tick_inverse > 1 {
+                    crate::translate::ticks_to_decimal(1, sym_cfg.tick_inverse)
+                } else {
+                    "1".to_string()
+                },
+                round_lot: if sym_cfg.lot_inverse > 1 {
+                    crate::translate::ticks_to_decimal(1, sym_cfg.lot_inverse)
+                } else {
+                    "1".to_string()
+                },
+            })
+            .collect();
+
+        let response = crate::translate::security_list_to_fix(req_id, &symbols).build(
+            &config.sender_comp_id,
+            &self.sender_comp_id,
+            self.fix_outbound_seq,
+        );
+        self.queue_fix(&response);
+        SessionAction::SendFix
     }
 }
 
@@ -1077,6 +1118,66 @@ mod tests {
                 .unwrap_or("")
                 .contains("TargetCompID")
         );
+
+        gw.shutdown();
+    }
+
+    #[test]
+    fn security_list_request_response() {
+        let mut config = GatewayConfig {
+            listen: "127.0.0.1:0".parse().unwrap(),
+            event_publisher: "127.0.0.1:1".parse().unwrap(),
+            authorized_keys: std::path::PathBuf::new(),
+            subscriber_key: std::path::PathBuf::new(),
+            core: 0,
+            sender_comp_id: "MELIN-MD".to_string(),
+            symbols: std::collections::HashMap::new(),
+        };
+        config.symbols.insert(
+            "BTCUSD".to_string(),
+            crate::config::SymbolConfig {
+                id: 1,
+                tick_inverse: 100,
+                lot_inverse: 1,
+                base_ccy: "BTC".to_string(),
+                quote_ccy: "USD".to_string(),
+            },
+        );
+        let config: &'static GatewayConfig = Box::leak(Box::new(config));
+        let gw = spawn_gateway(config);
+
+        let mut stream = TcpStream::connect(format!("127.0.0.1:{}", gw.port)).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+
+        // Logon first.
+        let logon = logon_bytes("CLIENT", "MELIN-MD", 1);
+        stream.write_all(&logon).unwrap();
+        stream.flush().unwrap();
+        let _ = read_fix_message(&mut stream); // consume Logon response
+
+        // Send SecurityListRequest.
+        let req = FixMessageBuilder::new(tags::MSG_SECURITY_LIST_REQUEST)
+            .str_tag(tags::SECURITY_REQ_ID, "SLR1")
+            .str_tag(tags::SECURITY_LIST_REQUEST_TYPE, "0")
+            .build("CLIENT", "MELIN-MD", 2);
+        stream.write_all(&req).unwrap();
+        stream.flush().unwrap();
+
+        // Read SecurityList response.
+        let resp = read_fix_message(&mut stream);
+        let msg = FixMessage::parse(&resp).unwrap();
+        assert_eq!(msg.msg_type(), tags::MSG_SECURITY_LIST);
+        assert_eq!(msg.get_str(tags::SECURITY_REQ_ID), Some("SLR1"));
+        assert_eq!(msg.get_str(tags::NO_RELATED_SYM), Some("1"));
+
+        let sym_fields: Vec<_> = msg
+            .fields_iter()
+            .filter(|f| f.tag == tags::SYMBOL)
+            .collect();
+        assert_eq!(sym_fields.len(), 1);
+        assert_eq!(std::str::from_utf8(sym_fields[0].value).unwrap(), "BTCUSD");
 
         gw.shutdown();
     }

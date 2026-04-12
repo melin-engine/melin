@@ -61,6 +61,16 @@ pub const NO_RELATED_SYM: u32 = 146;
 pub const NUMBER_OF_ORDERS: u32 = 346;
 pub const MD_REQ_REJ_REASON: u32 = 281;
 
+// --- Security list tags (FIX 4.4) ---
+pub const SECURITY_REQ_ID: u32 = 320;
+pub const SECURITY_LIST_REQUEST_TYPE: u32 = 559;
+pub const SECURITY_RESPONSE_ID: u32 = 322;
+pub const SECURITY_REQUEST_RESULT: u32 = 560;
+pub const MIN_PRICE_INCREMENT: u32 = 969;
+pub const ROUND_LOT: u32 = 561;
+pub const CURRENCY: u32 = 15;
+pub const SETTL_CURRENCY: u32 = 120;
+
 // --- MsgType values (Tag 35) ---
 pub const MSG_HEARTBEAT: &[u8] = b"0";
 pub const MSG_TEST_REQUEST: &[u8] = b"1";
@@ -78,6 +88,8 @@ pub const MSG_MARKET_DATA_REQUEST: &[u8] = b"V";
 pub const MSG_MD_SNAPSHOT: &[u8] = b"W";
 pub const MSG_MD_INCREMENTAL: &[u8] = b"X";
 pub const MSG_MD_REQUEST_REJECT: &[u8] = b"Y";
+pub const MSG_SECURITY_LIST_REQUEST: &[u8] = b"x";
+pub const MSG_SECURITY_LIST: &[u8] = b"y";
 
 pub const FIX_VERSION: &[u8] = b"FIX.4.4";
 

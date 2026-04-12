@@ -68,11 +68,86 @@ pub fn md_request_reject(md_req_id: &str, reason: &str, text: &str) -> FixMessag
     builder
 }
 
+/// Build a `MarketDataIncrementalRefresh` (35=X) message.
+///
+/// Each update carries `MDUpdateAction` (0=New, 1=Change, 2=Delete),
+/// `MDEntryType` (0=Bid, 1=Offer), price, size, and order count.
+pub fn md_incremental_to_fix(
+    md_req_id: &str,
+    updates: &[IncrementalEntry<'_>],
+) -> FixMessageBuilder {
+    let mut builder = FixMessageBuilder::new(tags::MSG_MD_INCREMENTAL);
+    builder = builder
+        .str_tag(tags::MD_REQ_ID, md_req_id)
+        .str_tag(tags::NO_MD_ENTRIES, &updates.len().to_string());
+
+    for entry in updates {
+        builder = builder
+            .str_tag(tags::MD_UPDATE_ACTION, entry.action)
+            .str_tag(tags::MD_ENTRY_TYPE, entry.entry_type)
+            .str_tag(tags::SYMBOL, entry.symbol)
+            .str_tag(tags::MD_ENTRY_PX, &entry.price)
+            .str_tag(tags::MD_ENTRY_SIZE, &entry.size)
+            .str_tag(tags::NUMBER_OF_ORDERS, &entry.order_count);
+    }
+
+    builder
+}
+
+/// One entry in an incremental refresh message.
+pub struct IncrementalEntry<'a> {
+    /// "0" = New, "1" = Change, "2" = Delete
+    pub action: &'a str,
+    /// "0" = Bid, "1" = Offer, "2" = Trade
+    pub entry_type: &'a str,
+    pub symbol: &'a str,
+    pub price: String,
+    pub size: String,
+    pub order_count: String,
+}
+
+/// Build a `SecurityList` (35=y) message.
+///
+/// Responds to a `SecurityListRequest (x)` with all configured symbols.
+pub fn security_list_to_fix(security_req_id: &str, symbols: &[SecurityInfo]) -> FixMessageBuilder {
+    let mut builder = FixMessageBuilder::new(tags::MSG_SECURITY_LIST);
+    builder = builder
+        .str_tag(tags::SECURITY_REQ_ID, security_req_id)
+        .str_tag(tags::SECURITY_RESPONSE_ID, security_req_id)
+        // SecurityRequestResult=0 (valid request)
+        .str_tag(tags::SECURITY_REQUEST_RESULT, "0")
+        .str_tag(tags::NO_RELATED_SYM, &symbols.len().to_string());
+
+    for sym in symbols {
+        builder = builder
+            .str_tag(tags::SYMBOL, &sym.symbol)
+            .str_tag(tags::CURRENCY, &sym.base_ccy)
+            .str_tag(tags::SETTL_CURRENCY, &sym.quote_ccy);
+        if !sym.min_price_increment.is_empty() {
+            builder = builder.str_tag(tags::MIN_PRICE_INCREMENT, &sym.min_price_increment);
+        }
+        if !sym.round_lot.is_empty() {
+            builder = builder.str_tag(tags::ROUND_LOT, &sym.round_lot);
+        }
+    }
+
+    builder
+}
+
+/// Security metadata for the SecurityList response.
+pub struct SecurityInfo {
+    pub symbol: String,
+    pub base_ccy: String,
+    pub quote_ccy: String,
+    pub min_price_increment: String,
+    pub round_lot: String,
+}
+
 /// Convert integer ticks to a decimal string.
 ///
 /// `tick_inverse` is the divisor (e.g. 100 → 2 decimal places).
 /// tick_inverse=1 produces integer output (no decimal point).
-fn ticks_to_decimal(ticks: u64, tick_inverse: u64) -> String {
+pub fn ticks_to_decimal(ticks: u64, tick_inverse: u64) -> String {
     if tick_inverse <= 1 {
         return ticks.to_string();
     }
@@ -188,5 +263,80 @@ mod tests {
     #[test]
     fn ticks_to_decimal_three_places() {
         assert_eq!(ticks_to_decimal(12345, 1000), "12.345");
+    }
+
+    #[test]
+    fn security_list_response() {
+        let symbols = vec![
+            SecurityInfo {
+                symbol: "BTCUSD".to_string(),
+                base_ccy: "BTC".to_string(),
+                quote_ccy: "USD".to_string(),
+                min_price_increment: "0.01".to_string(),
+                round_lot: "1".to_string(),
+            },
+            SecurityInfo {
+                symbol: "ETHUSD".to_string(),
+                base_ccy: "ETH".to_string(),
+                quote_ccy: "USD".to_string(),
+                min_price_increment: "0.1".to_string(),
+                round_lot: "1".to_string(),
+            },
+        ];
+
+        let builder = security_list_to_fix("REQ42", &symbols);
+        let msg = builder.build("MELIN", "CLIENT", 1);
+        let parsed = FixMessage::parse(&msg).unwrap();
+
+        assert_eq!(parsed.msg_type(), tags::MSG_SECURITY_LIST);
+        assert_eq!(parsed.get_str(tags::SECURITY_REQ_ID), Some("REQ42"));
+        assert_eq!(parsed.get_str(tags::SECURITY_REQUEST_RESULT), Some("0"));
+        assert_eq!(parsed.get_str(tags::NO_RELATED_SYM), Some("2"));
+
+        let sym_fields: Vec<_> = parsed
+            .fields_iter()
+            .filter(|f| f.tag == tags::SYMBOL)
+            .collect();
+        assert_eq!(sym_fields.len(), 2);
+        assert_eq!(std::str::from_utf8(sym_fields[0].value).unwrap(), "BTCUSD");
+        assert_eq!(std::str::from_utf8(sym_fields[1].value).unwrap(), "ETHUSD");
+    }
+
+    #[test]
+    fn incremental_refresh() {
+        let updates = vec![
+            IncrementalEntry {
+                action: "1",     // Change
+                entry_type: "0", // Bid
+                symbol: "BTCUSD",
+                price: "100.50".to_string(),
+                size: "25".to_string(),
+                order_count: "3".to_string(),
+            },
+            IncrementalEntry {
+                action: "2",     // Delete
+                entry_type: "1", // Offer
+                symbol: "BTCUSD",
+                price: "101.00".to_string(),
+                size: "0".to_string(),
+                order_count: "0".to_string(),
+            },
+        ];
+
+        let builder = md_incremental_to_fix("REQ1", &updates);
+        let msg = builder.build("MELIN", "CLIENT", 1);
+        let parsed = FixMessage::parse(&msg).unwrap();
+
+        assert_eq!(parsed.msg_type(), tags::MSG_MD_INCREMENTAL);
+        assert_eq!(parsed.get_str(tags::MD_REQ_ID), Some("REQ1"));
+        assert_eq!(parsed.get_str(tags::NO_MD_ENTRIES), Some("2"));
+
+        let actions: Vec<_> = parsed
+            .fields_iter()
+            .filter(|f| f.tag == tags::MD_UPDATE_ACTION)
+            .collect();
+        assert_eq!(actions.len(), 2);
+        assert_eq!(actions[0].value, b"1"); // Change
+        assert_eq!(actions[1].value, b"2"); // Delete
     }
 }

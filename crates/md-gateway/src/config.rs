@@ -41,6 +41,12 @@ pub struct SymbolConfig {
     /// Lot size inverse (e.g. 1 for integer lots).
     #[serde(default = "default_lot_inverse")]
     pub lot_inverse: u64,
+    /// Base currency (e.g. "BTC"). Used in SecurityList responses.
+    #[serde(default)]
+    pub base_ccy: String,
+    /// Quote currency (e.g. "USD"). Used in SecurityList responses.
+    #[serde(default)]
+    pub quote_ccy: String,
 }
 
 fn default_tick_inverse() -> u64 {
