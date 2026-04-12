@@ -12,6 +12,7 @@
 use std::net::TcpListener;
 use std::os::unix::io::{IntoRawFd, RawFd};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use io_uring::{IoUring, opcode, types};
@@ -20,6 +21,7 @@ use tracing::{debug, error, info, warn};
 use melin_gateway_core::fix::parse::FixMessage;
 use melin_gateway_core::fix::serialize::FixMessageBuilder;
 use melin_gateway_core::fix::tags;
+use melin_market_data::core::MdState;
 
 use crate::config::GatewayConfig;
 
@@ -236,10 +238,15 @@ impl MdSession {
 
     /// Handle one complete FIX message. Returns the action the event
     /// loop should take.
-    fn handle_fix_message(&mut self, raw: &[u8], config: &GatewayConfig) -> SessionAction {
+    fn handle_fix_message(
+        &mut self,
+        raw: &[u8],
+        config: &GatewayConfig,
+        md_state: &Arc<RwLock<MdState>>,
+    ) -> SessionAction {
         match self.state {
             SessionState::AwaitingLogon => self.handle_logon(raw, config),
-            SessionState::Active => self.handle_active_fix(raw, config),
+            SessionState::Active => self.handle_active_fix(raw, config, md_state),
             SessionState::Closing => {
                 // Draining — ignore further inbound messages.
                 SessionAction::None
@@ -324,10 +331,13 @@ impl MdSession {
         SessionAction::SendFix
     }
 
-    /// Handle a FIX message on an active session. For now, only
-    /// Heartbeat/TestRequest/Logout are handled. MarketDataRequest (V)
-    /// handling will be added in a follow-up.
-    fn handle_active_fix(&mut self, raw: &[u8], config: &GatewayConfig) -> SessionAction {
+    /// Handle a FIX message on an active session.
+    fn handle_active_fix(
+        &mut self,
+        raw: &[u8],
+        config: &GatewayConfig,
+        md_state: &Arc<RwLock<MdState>>,
+    ) -> SessionAction {
         let msg = match FixMessage::parse(raw) {
             Ok(m) => m,
             Err(e) => {
@@ -384,18 +394,7 @@ impl MdSession {
             self.queue_fix(&logout);
             SessionAction::Close
         } else if msg_type == tags::MSG_MARKET_DATA_REQUEST {
-            // TODO: dispatch V to MarketDataCore for live subscription.
-            debug!(sender = %self.sender_comp_id, "MarketDataRequest received (not yet implemented)");
-            let reject = FixMessageBuilder::new(tags::MSG_MD_REQUEST_REJECT)
-                .str_tag(tags::MD_REQ_ID, msg.get_str(tags::MD_REQ_ID).unwrap_or(""))
-                .str_tag(tags::TEXT, "market data not yet available")
-                .build(
-                    &config.sender_comp_id,
-                    &self.sender_comp_id,
-                    self.fix_outbound_seq,
-                );
-            self.queue_fix(&reject);
-            SessionAction::SendFix
+            self.handle_market_data_request(&msg, config, md_state)
         } else if msg_type == tags::MSG_SECURITY_LIST_REQUEST {
             self.handle_security_list_request(&msg, config)
         } else {
@@ -411,6 +410,96 @@ impl MdSession {
     }
 
     /// Handle SecurityListRequest (35=x). Responds with a SecurityList (35=y)
+    /// Handle MarketDataRequest (35=V). Reads the current book state
+    /// from the shared mirrors and sends a MarketDataSnapshotFullRefresh (W).
+    fn handle_market_data_request(
+        &mut self,
+        msg: &FixMessage<'_>,
+        config: &GatewayConfig,
+        md_state: &Arc<RwLock<MdState>>,
+    ) -> SessionAction {
+        let md_req_id = msg.get_str(tags::MD_REQ_ID).unwrap_or("");
+
+        // Collect requested symbols from the NoRelatedSym group.
+        let requested_symbols: Vec<&str> = msg
+            .fields_iter()
+            .filter(|f| f.tag == tags::SYMBOL)
+            .filter_map(|f| std::str::from_utf8(f.value).ok())
+            .collect();
+
+        if requested_symbols.is_empty() {
+            let reject =
+                crate::translate::md_request_reject(md_req_id, "0", "no symbols specified").build(
+                    &config.sender_comp_id,
+                    &self.sender_comp_id,
+                    self.fix_outbound_seq,
+                );
+            self.queue_fix(&reject);
+            return SessionAction::SendFix;
+        }
+
+        // Read the shared mirror state.
+        let state = match md_state.read() {
+            Ok(s) => s,
+            Err(_) => {
+                let reject = crate::translate::md_request_reject(md_req_id, "0", "internal error")
+                    .build(
+                        &config.sender_comp_id,
+                        &self.sender_comp_id,
+                        self.fix_outbound_seq,
+                    );
+                self.queue_fix(&reject);
+                return SessionAction::SendFix;
+            }
+        };
+
+        if !state.ready {
+            let reject =
+                crate::translate::md_request_reject(md_req_id, "0", "market data not ready").build(
+                    &config.sender_comp_id,
+                    &self.sender_comp_id,
+                    self.fix_outbound_seq,
+                );
+            self.queue_fix(&reject);
+            return SessionAction::SendFix;
+        }
+
+        // Send one W per requested symbol.
+        for sym_str in &requested_symbols {
+            // Look up symbol ID from config.
+            let sym_cfg = config.symbols.get(*sym_str);
+            let sym_id = sym_cfg.map(|c| melin_engine::types::Symbol(c.id));
+            let tick_inverse = sym_cfg.map_or(1, |c| c.tick_inverse);
+
+            let (bids, asks) = if let Some(id) = sym_id
+                && let Some(mirror) = state.mirrors.get(&id)
+            {
+                // Collect levels: bids descending, asks ascending.
+                let bids: Vec<_> = mirror.bids().iter().rev().map(|(&p, &l)| (p, l)).collect();
+                let asks: Vec<_> = mirror.asks().iter().map(|(&p, &l)| (p, l)).collect();
+                (bids, asks)
+            } else {
+                (Vec::new(), Vec::new())
+            };
+
+            let snapshot = crate::translate::md_snapshot_to_fix(
+                md_req_id,
+                sym_str,
+                &bids,
+                &asks,
+                tick_inverse,
+            )
+            .build(
+                &config.sender_comp_id,
+                &self.sender_comp_id,
+                self.fix_outbound_seq,
+            );
+            self.queue_fix(&snapshot);
+        }
+
+        SessionAction::SendFix
+    }
+
     /// containing all configured symbols.
     fn handle_security_list_request(
         &mut self,
@@ -476,6 +565,8 @@ pub struct MdGateway {
     config: &'static GatewayConfig,
     listener_fd: RawFd,
     sessions: Slab,
+    /// Shared book mirror state from the MarketDataCore thread.
+    md_state: Arc<RwLock<MdState>>,
     /// Contiguous buffer pool for io_uring provided buffers.
     buffer_pool: Box<[u8]>,
     /// Pre-allocated CQE drain buffer: (user_data, result, flags).
@@ -503,6 +594,7 @@ impl MdGateway {
     pub fn new(
         listener: TcpListener,
         config: &'static GatewayConfig,
+        md_state: Arc<RwLock<MdState>>,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         let mut ring = IoUring::new(RING_SIZE)?;
         // Take ownership of the fd so it stays open for the program's
@@ -518,6 +610,7 @@ impl MdGateway {
             config,
             listener_fd,
             sessions: Slab::new(),
+            md_state,
             buffer_pool,
             cqes: Vec::with_capacity(RING_SIZE as usize),
             to_remove: Vec::new(),
@@ -747,7 +840,7 @@ impl MdGateway {
                 None => return, // No complete message yet.
             };
 
-            let action = session.handle_fix_message(&raw, self.config);
+            let action = session.handle_fix_message(&raw, self.config, &self.md_state);
 
             match action {
                 SessionAction::None => {}
@@ -1020,7 +1113,8 @@ mod tests {
         let handle = std::thread::Builder::new()
             .name("test-md-gw".into())
             .spawn(move || {
-                let mut gw = MdGateway::new(listener, config).unwrap();
+                let state = Arc::new(RwLock::new(MdState::new()));
+                let mut gw = MdGateway::new(listener, config, state).unwrap();
                 let _ = gw.run(&s);
             })
             .unwrap();

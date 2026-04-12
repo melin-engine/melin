@@ -11,6 +11,7 @@
 //! bounded window of recent trades per symbol.
 
 pub mod cold_start;
+pub mod core;
 pub mod index;
 pub mod mirror;
 #[cfg(test)]

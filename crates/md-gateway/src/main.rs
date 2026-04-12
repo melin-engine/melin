@@ -11,6 +11,10 @@ mod config;
 pub mod event_loop;
 pub mod translate;
 
+use std::net::TcpListener;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, RwLock};
+
 fn main() {
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -59,7 +63,58 @@ fn main() {
         "melin-md-gateway starting"
     );
 
-    // TODO: Phase 6 — io_uring event loop, FIX session handling,
-    // MarketDataCore thread, and FIX V/W/Y dispatch.
-    tracing::warn!("md-gateway event loop not yet implemented");
+    let shutdown = Arc::new(AtomicBool::new(false));
+
+    // Shared book mirror state between the core thread and the event loop.
+    let md_state = Arc::new(RwLock::new(melin_market_data::core::MdState::new()));
+
+    // Collect symbol IDs for the Subscribe request.
+    let symbol_ids: Vec<melin_engine::types::Symbol> = config
+        .symbols
+        .values()
+        .map(|s| melin_engine::types::Symbol(s.id))
+        .collect();
+
+    // Spawn the MarketDataCore thread — connects to the event publisher,
+    // receives the snapshot, and applies firehose events to the shared mirrors.
+    let core_state = Arc::clone(&md_state);
+    let core_shutdown = Arc::clone(&shutdown);
+    let core_addr = config.event_publisher;
+    let core_handle = std::thread::Builder::new()
+        .name("md-core".into())
+        .spawn(move || {
+            melin_market_data::core::run(
+                melin_market_data::core::CoreConfig {
+                    event_publisher_addr: core_addr,
+                    symbols: symbol_ids,
+                },
+                core_state,
+                &core_shutdown,
+            );
+        })
+        .expect("spawn md-core thread");
+
+    // Leak config so it can be passed as &'static to the event loop.
+    let config: &'static config::GatewayConfig = Box::leak(Box::new(config));
+
+    // Bind and run the io_uring event loop.
+    let listener = TcpListener::bind(config.listen).unwrap_or_else(|e| {
+        eprintln!("failed to bind {}: {e}", config.listen);
+        std::process::exit(1);
+    });
+
+    let mut gw = event_loop::MdGateway::new(listener, config, md_state).unwrap_or_else(|e| {
+        eprintln!("failed to create gateway: {e}");
+        std::process::exit(1);
+    });
+
+    if let Err(e) = gw.run(&shutdown) {
+        tracing::error!(error = %e, "md-gateway event loop error");
+    }
+
+    // Signal core thread to stop and wait for it.
+    shutdown.store(true, Ordering::Relaxed);
+    let _ = core_handle.join();
+
+    tracing::info!("melin-md-gateway stopped");
 }
