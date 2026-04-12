@@ -1,4 +1,4 @@
-//! FIX 4.2 order entry gateway for Melin.
+//! FIX 4.4 order entry gateway for Melin.
 //!
 //! Single-threaded io_uring event loop that multiplexes all FIX client
 //! connections and their corresponding Melin server connections on one

@@ -118,7 +118,7 @@ pub struct Session {
     melin_encode_buf: [u8; 136],
     pub melin_multishot_active: bool,
 
-    // ── Outbound message store (FIX 4.2 §4.6/4.7 ResendRequest) ──
+    // ── Outbound message store (FIX 4.4 §4.6/4.7 ResendRequest) ──
     /// Every outbound FIX message is retained here, keyed by the
     /// MsgSeqNum it was sent with, for the lifetime of the session.
     /// On a ResendRequest from the peer we replay these in order
@@ -134,7 +134,7 @@ pub struct Session {
     /// would otherwise grow this without limit. When full, the oldest
     /// entry is evicted on each new push. A subsequent ResendRequest
     /// for an evicted seq is answered with a SequenceReset-GapFill
-    /// covering the missing range, which FIX 4.2 §4.7 explicitly
+    /// covering the missing range, which FIX 4.4 §4.7 explicitly
     /// permits when stored messages are no longer available.
     /// VecDeque so eviction at the front is O(1).
     outbound_store: VecDeque<(u64, Vec<u8>)>,
@@ -277,7 +277,7 @@ impl Session {
             return SessionAction::Close;
         }
 
-        // FIX 4.2 §4.5: every message must carry a TargetCompID that
+        // FIX 4.4 §4.5: every message must carry a TargetCompID that
         // matches the receiver's configured SenderCompID. A mismatch
         // is a client-side misconfiguration — reply with Logout and
         // disconnect rather than attempting recovery.
@@ -327,7 +327,7 @@ impl Session {
         }
 
         // Extract HeartBtInt. Discard parse error: a malformed value
-        // (or missing tag) falls back to the FIX 4.2 default of 30 s.
+        // (or missing tag) falls back to the FIX 4.4 default of 30 s.
         let heartbeat_secs: u64 = msg
             .get_str(tags::HEART_BT_INT)
             .and_then(|s| s.parse().ok())
@@ -544,7 +544,7 @@ impl Session {
             return self.handle_sequence_reset(&msg, config);
         }
 
-        // Validate MsgSeqNum (FIX 4.2 §4.6 gap recovery).
+        // Validate MsgSeqNum (FIX 4.4 §4.6 gap recovery).
         //
         // - seq < expected: stale duplicate (or replayed PossDup), ignore
         // - seq > expected: gap. Send a ResendRequest covering
@@ -945,7 +945,7 @@ impl Session {
     }
 
     /// Replay messages from the outbound store in response to a peer
-    /// ResendRequest. FIX 4.2 §4.7:
+    /// ResendRequest. FIX 4.4 §4.7:
     ///
     /// - Application messages are re-sent verbatim with the same
     ///   MsgSeqNum but with PossDupFlag=Y and OrigSendingTime added.
@@ -980,7 +980,7 @@ impl Session {
         let mut to_emit: Vec<Vec<u8>> = Vec::new();
 
         // If the store has been evicted past `begin`, the messages in
-        // [begin, oldest_stored) are gone. FIX 4.2 §4.7 permits
+        // [begin, oldest_stored) are gone. FIX 4.4 §4.7 permits
         // answering with a SequenceReset-GapFill that skips the
         // missing range. Synthesize one before the normal replay.
         if let Some((oldest, _)) = self.outbound_store.front()
@@ -1056,7 +1056,7 @@ impl Session {
         self.last_fix_sent = Instant::now();
     }
 
-    /// Apply an inbound SequenceReset (35=4). Per FIX 4.2 §4.7.4
+    /// Apply an inbound SequenceReset (35=4). Per FIX 4.4 §4.7.4
     /// gap-fill (GapFillFlag=Y) and hard reset (GapFillFlag=N or
     /// absent) both override `fix_inbound_seq` to NewSeqNo. NewSeqNo
     /// must be strictly greater than the current expected inbound
@@ -1110,7 +1110,7 @@ impl Session {
     }
 
     /// Build and queue a ResendRequest (35=2). `end` of 0 means
-    /// "through infinity" per FIX 4.2 — the peer should resend
+    /// "through infinity" per FIX 4.4 — the peer should resend
     /// everything from `begin` onward.
     fn queue_resend_request(&mut self, config: &GatewayConfig, begin: u64, end: u64) {
         self.metrics
@@ -1304,7 +1304,7 @@ fn report_order_id(report: &ExecutionReport) -> Option<OrderId> {
 }
 
 /// Whether a stored outbound message is an administrative message
-/// per FIX 4.2 §4.7. Admin messages are NEVER replayed on
+/// per FIX 4.4 §4.7. Admin messages are NEVER replayed on
 /// ResendRequest — they are collapsed into a SequenceReset-GapFill.
 fn stored_msg_is_admin(stored_bytes: &[u8]) -> bool {
     let parsed = match FixMessage::parse(stored_bytes) {
@@ -1702,7 +1702,7 @@ lot_size_inverse = 1
     #[test]
     fn active_seq_gap_triggers_resend_request_not_close() {
         // Behavior change in the ResendRequest commit: a seq gap is
-        // recoverable per FIX 4.2 §4.6 — the gateway must request a
+        // recoverable per FIX 4.4 §4.6 — the gateway must request a
         // resend instead of dropping the session. The dedicated
         // resend tests below cover the full state transitions; this
         // test pins the high-level contract.
@@ -1826,7 +1826,7 @@ lot_size_inverse = 1
         let last_msg_start = s
             .fix_send_buf
             .windows(11)
-            .rposition(|w| w.starts_with(b"8=FIX.4.2\x01"))
+            .rposition(|w| w.starts_with(b"8=FIX.4.4\x01"))
             .unwrap();
         let parsed = FixMessage::parse(&s.fix_send_buf[last_msg_start..]).unwrap();
         assert_eq!(parsed.msg_type(), tags::MSG_REJECT);
@@ -2248,7 +2248,7 @@ lot_size_inverse = 1
         let parsed = FixMessage::parse(&s.fix_send_buf).unwrap();
         assert_eq!(parsed.msg_type(), tags::MSG_ORDER_CANCEL_REJECT);
         // CxlRejResponseTo=2 means the reject is for a cancel-replace
-        // (per FIX 4.2: 1=cancel, 2=cancel/replace).
+        // (per FIX 4.4: 1=cancel, 2=cancel/replace).
         assert_eq!(parsed.get_str(tags::CXL_REJ_RESPONSE_TO), Some("2"));
         assert!(!s.pending_cancels.contains_key(&order_id));
     }

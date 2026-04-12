@@ -1,4 +1,4 @@
-//! FIX 4.2 tag constants and message type codes.
+//! FIX 4.4 tag constants and message type codes.
 
 // --- Standard header/trailer tags ---
 pub const BEGIN_STRING: u32 = 8;
@@ -62,7 +62,7 @@ pub const MSG_ORDER_CANCEL_REPLACE: &[u8] = b"G";
 pub const MSG_EXECUTION_REPORT: &[u8] = b"8";
 pub const MSG_ORDER_CANCEL_REJECT: &[u8] = b"9";
 
-pub const FIX_4_2: &[u8] = b"FIX.4.2";
+pub const FIX_VERSION: &[u8] = b"FIX.4.4";
 
 /// SOH delimiter (0x01) used to separate FIX fields.
 pub const SOH: u8 = 0x01;

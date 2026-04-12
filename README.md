@@ -119,9 +119,9 @@ Note that **adding a second replica makes the engine faster, not slower**. With 
 - Multi-process failover tests — SIGKILL primary under load, promote replica, verify no data loss and clients can reconnect
 
 ### [FIX Gateway (OE)](docs/oe-gateway.md)
-- Single-threaded io_uring event loop terminating many concurrent FIX 4.2 sessions
+- Single-threaded io_uring event loop terminating many concurrent FIX 4.4 sessions
 - Stateless session model — each connection starts at MsgSeqNum 1; cross-reconnect recovery is handled by the output event channel, not by a persisted FIX session store
-- Standard FIX 4.2 §4.6/§4.7 gap recovery (ResendRequest, SequenceReset-GapFill) on both directions
+- Standard FIX 4.4 §4.6/§4.7 gap recovery (ResendRequest, SequenceReset-GapFill) on both directions
 - Bounded per-session outbound store with automatic GapFill for evicted ranges
 - TargetCompID validation, heartbeat / TestRequest liveness, configurable per-session message rate limits
 

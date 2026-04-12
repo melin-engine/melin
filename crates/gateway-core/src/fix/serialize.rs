@@ -88,7 +88,7 @@ impl FixMessageBuilder {
         // Build the full message.
         let mut msg = Vec::with_capacity(body_len + 32);
         // BeginString
-        append_field(&mut msg, tags::BEGIN_STRING, tags::FIX_4_2);
+        append_field(&mut msg, tags::BEGIN_STRING, tags::FIX_VERSION);
         // BodyLength
         append_field(&mut msg, tags::BODY_LENGTH, body_len_str.as_bytes());
         // Body
@@ -160,8 +160,8 @@ mod tests {
     #[test]
     fn build_heartbeat() {
         let msg = FixMessageBuilder::new(tags::MSG_HEARTBEAT).build("SENDER", "TARGET", 1);
-        // Should start with "8=FIX.4.2\x01"
-        assert!(msg.starts_with(b"8=FIX.4.2\x01"));
+        // Should start with "8=FIX.4.4\x01"
+        assert!(msg.starts_with(b"8=FIX.4.4\x01"));
         // Should end with "10=xxx\x01"
         let s = std::str::from_utf8(&msg).unwrap();
         assert!(s.contains("35=0\x01"));

@@ -28,8 +28,8 @@ mod tests {
 
     #[test]
     fn checksum_simple() {
-        // "8=FIX.4.2\x019=5\x0135=0\x01" — manually computed
-        let data = b"8=FIX.4.2\x019=5\x0135=0\x01";
+        // "8=FIX.4.4\x019=5\x0135=0\x01" — manually computed
+        let data = b"8=FIX.4.4\x019=5\x0135=0\x01";
         let cs = compute(data);
         let formatted = format(cs);
         // Verify format is 3 digits

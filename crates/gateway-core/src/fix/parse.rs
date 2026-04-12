@@ -28,7 +28,7 @@ pub enum ParseError {
     InvalidTag,
     /// First field must be BeginString (8).
     MissingBeginString,
-    /// BeginString value is not FIX.4.2.
+    /// BeginString value is not FIX.4.4.
     UnsupportedVersion,
     /// Second field must be BodyLength (9).
     MissingBodyLength,
@@ -51,7 +51,7 @@ impl std::fmt::Display for ParseError {
             Self::MalformedField => write!(f, "malformed field (missing '=')"),
             Self::InvalidTag => write!(f, "invalid tag number"),
             Self::MissingBeginString => write!(f, "first field must be BeginString (8)"),
-            Self::UnsupportedVersion => write!(f, "unsupported FIX version (expected FIX.4.2)"),
+            Self::UnsupportedVersion => write!(f, "unsupported FIX version (expected FIX.4.4)"),
             Self::MissingBodyLength => write!(f, "second field must be BodyLength (9)"),
             Self::InvalidBodyLength => write!(f, "invalid BodyLength value"),
             Self::BodyLengthMismatch { declared, actual } => {
@@ -79,7 +79,7 @@ impl<'a> FixMessage<'a> {
     /// message ending with the CheckSum field and a trailing SOH.
     ///
     /// Validates:
-    /// - BeginString (8) = FIX.4.2
+    /// - BeginString (8) = FIX.4.4
     /// - BodyLength (9) matches actual body length
     /// - CheckSum (10) matches computed checksum
     /// - MsgType (35) is present
@@ -113,7 +113,7 @@ impl<'a> FixMessage<'a> {
         if fields[0].tag != tags::BEGIN_STRING {
             return Err(ParseError::MissingBeginString);
         }
-        if fields[0].value != tags::FIX_4_2 {
+        if fields[0].value != tags::FIX_VERSION {
             return Err(ParseError::UnsupportedVersion);
         }
 
@@ -176,7 +176,7 @@ impl<'a> FixMessage<'a> {
     /// Get the first value for a tag as a UTF-8 string.
     pub fn get_str(&self, tag: u32) -> Option<&'a str> {
         // Discard from_utf8 error: an invalid UTF-8 value is the
-        // same outcome as a missing tag for the caller. FIX 4.2
+        // same outcome as a missing tag for the caller. FIX 4.4
         // values are ASCII in practice; non-ASCII would be
         // rejected upstream by the per-field parser.
         self.get(tag).and_then(|v| std::str::from_utf8(v).ok())
@@ -268,18 +268,18 @@ fn parse_u64_slice(bytes: &[u8]) -> Option<u64> {
 /// This is the io_uring-friendly counterpart to `read_message`: it
 /// operates on an accumulated byte buffer instead of a streaming reader.
 pub fn try_extract_message(buf: &mut Vec<u8>) -> Option<Vec<u8>> {
-    // Minimum valid FIX message: "8=FIX.4.2\x019=N\x0135=X\x0110=000\x01"
+    // Minimum valid FIX message: "8=FIX.4.4\x019=N\x0135=X\x0110=000\x01"
     // That's ~30 bytes. Short-circuit if obviously incomplete.
     if buf.len() < 20 {
         return None;
     }
 
-    // Defense in depth: a valid FIX 4.2 frame always starts with the
-    // `8=FIX.4.2\x01` prefix. If the buffer starts with anything else,
+    // Defense in depth: a valid FIX 4.4 frame always starts with the
+    // `8=FIX.4.4\x01` prefix. If the buffer starts with anything else,
     // we're either looking at a stream framing bug or actively
     // misaligned data — refuse to extract garbage that just happens
     // to contain a `\x0110=xxx\x01` pattern downstream.
-    const PREFIX: &[u8] = b"8=FIX.4.2\x01";
+    const PREFIX: &[u8] = b"8=FIX.4.4\x01";
     if !buf.starts_with(PREFIX) {
         return None;
     }
@@ -335,7 +335,7 @@ mod tests {
 
     #[test]
     fn parse_bad_version() {
-        let raw = b"8=FIX.4.4\x019=5\x0135=0\x0110=000\x01";
+        let raw = b"8=FIX.4.2\x019=5\x0135=0\x0110=000\x01";
         let result = FixMessage::parse(raw);
         assert!(matches!(result, Err(ParseError::UnsupportedVersion)));
     }
@@ -444,7 +444,7 @@ mod proptests {
         .prop_map(|v| String::from_utf8(v).unwrap())
     }
 
-    /// One of the standard FIX 4.2 MsgType bytes the gateway emits.
+    /// One of the standard FIX 4.4 MsgType bytes the gateway emits.
     /// Restricted to known types so the strategy never produces
     /// something the builder couldn't legitimately have created.
     fn msg_type() -> impl Strategy<Value = &'static [u8]> {

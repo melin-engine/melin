@@ -11,7 +11,7 @@ Planned features sorted by value/complexity ratio for commercial readiness (exch
 
 ## FIX Gateway Hardening
 
-Follow-ups to take the FIX 4.2 gateway from minimum-viable to production-ready for a real exchange operator. The foundation (sessions, gap recovery, order entry, exec reports) is on `main`; these items make it deployable.
+Follow-ups to take the FIX 4.4 gateway from minimum-viable to production-ready for a real exchange operator. The foundation (sessions, gap recovery, order entry, exec reports) is on `main`; these items make it deployable.
 
 | # | Feature | Commercial value | Complexity | Value/effort | Why |
 |---|---------|:---:|:---:|:---:|-----|

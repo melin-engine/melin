@@ -1346,9 +1346,9 @@ lot_size_inverse = 1
         // Bytes that look like a complete (but invalid) FIX message so
         // try_extract_message frames them — checksum validation then
         // rejects them and the gateway closes the socket.
-        // Minimal shape: 8=FIX.4.2\x019=5\x0135=0\x0110=000\x01
+        // Minimal shape: 8=FIX.4.4\x019=5\x0135=0\x0110=000\x01
         client
-            .write_all(b"8=FIX.4.2\x019=5\x0135=0\x0110=000\x01")
+            .write_all(b"8=FIX.4.4\x019=5\x0135=0\x0110=000\x01")
             .unwrap();
 
         // Gateway should close without sending anything (malformed

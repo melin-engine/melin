@@ -1,6 +1,6 @@
 # FIX Gateway
 
-The FIX gateway is the front door for clients that speak FIX 4.2. It
+The FIX gateway is the front door for clients that speak FIX 4.4. It
 terminates FIX sessions, translates orders into the internal Melin
 protocol, and translates execution reports back to FIX. One gateway
 process can serve many concurrent FIX clients on a single thread,
@@ -30,7 +30,7 @@ sequence continuity across connections must reconcile out of band
 The first message on a new connection must be a `Logon (35=A)` with
 `MsgSeqNum = 1`. The gateway validates:
 
-- `BeginString` is `FIX.4.2`
+- `BeginString` is `FIX.4.4`
 - `TargetCompID` matches the gateway's configured `target_comp_id`
 - `SenderCompID` resolves to a configured session entry
 - `MsgSeqNum` is exactly `1`
@@ -46,7 +46,7 @@ to the client with a `Logon` ack once the upstream is ready.
 
 ## Sequence numbers and gap recovery
 
-The gateway implements the standard FIX 4.2 §4.6/§4.7 gap recovery
+The gateway implements the standard FIX 4.4 §4.6/§4.7 gap recovery
 flow on both directions.
 
 ### Inbound gaps (peer is ahead of us)
@@ -83,7 +83,7 @@ new push.
 
 If a peer requests resend of a sequence that has been evicted, the
 gateway answers with a `SequenceReset-GapFill` covering the missing
-range. This is explicitly permitted by FIX 4.2 §4.7 and tells the peer
+range. This is explicitly permitted by FIX 4.4 §4.7 and tells the peer
 that the messages are no longer available; the peer must treat the
 range as gap-filled and continue. **Operators should size session
 flows so that legitimate gap recovery never spans more than 10k
