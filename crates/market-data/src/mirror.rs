@@ -8,7 +8,9 @@
 use std::collections::BTreeMap;
 use std::num::NonZeroU64;
 
-use melin_engine::types::{ExecutionReport, InstrumentStatus, Price, Quantity, Side, Symbol};
+use melin_engine::types::{
+    ExecutionReport, InstrumentStatus, OrderId, Price, Quantity, Side, Symbol,
+};
 
 use crate::index::{OrderIndex, RestingOrder};
 use crate::trade_ring::{Trade, TradeRing};
@@ -246,6 +248,22 @@ impl BookMirror {
                 }
             }
         }
+    }
+
+    // -- Cold-start seeding (used by snapshot parser) --
+
+    /// Seed a level directly from a snapshot. Inserts the level into the
+    /// BTreeMap and adds a synthetic index entry. This bypasses the normal
+    /// `apply(Placed)` path which always sets `order_count=1`.
+    pub fn seed_level(&mut self, synthetic_order_id: OrderId, order: RestingOrder, level: Level) {
+        let book = self.book_side_mut(order.side);
+        let entry = book.entry(order.price).or_insert(Level {
+            total_qty: 0,
+            order_count: 0,
+        });
+        entry.total_qty = level.total_qty;
+        entry.order_count = level.order_count;
+        self.index.insert(synthetic_order_id, order);
     }
 
     // -- Internal helpers --

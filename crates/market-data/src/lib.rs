@@ -10,8 +10,10 @@
 //! resolved back to the correct price level. The `TradeRing` keeps a
 //! bounded window of recent trades per symbol.
 
+pub mod cold_start;
 pub mod index;
 pub mod mirror;
 #[cfg(test)]
 mod proptests;
+pub mod subscriber;
 pub mod trade_ring;

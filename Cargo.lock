@@ -1588,6 +1588,7 @@ name = "melin-market-data"
 version = "0.1.0"
 dependencies = [
  "melin-engine",
+ "melin-protocol",
  "proptest",
  "tracing",
 ]
