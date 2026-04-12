@@ -1678,6 +1678,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "melin-tui-fix-client"
+version = "0.1.0"
+dependencies = [
+ "crossterm 0.29.0",
+ "melin-gateway-core",
+ "ratatui 0.30.0",
+]
+
+[[package]]
 name = "memchr"
 version = "2.8.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
