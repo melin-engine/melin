@@ -57,6 +57,11 @@ cleanup() {
     echo ""
     echo "Stopping container..."
     docker stop "$CONTAINER_NAME" 2>/dev/null || true
+    if [ -s tui.log ]; then
+        echo ""
+        echo "=== TUI log (tui.log) ==="
+        cat tui.log
+    fi
 }
 trap cleanup EXIT INT TERM
 
