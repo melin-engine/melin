@@ -23,7 +23,7 @@ if [ ! -f "$DATA_DIR/trader.key" ]; then
     melin-keygen trader operator
     # keygen also writes trader.pub with base64 pubkey
     PUBKEY=$(cat trader.pub | tr -d '\n')
-    echo "operator $PUBKEY trader" > authorized_keys
+    echo "trader $PUBKEY trader" > authorized_keys
     # Also write a .pub.b64 for the md-gateway core (not yet signing)
     echo "$PUBKEY" > trader.pub.b64
     echo "  trader.key + authorized_keys created"

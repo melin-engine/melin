@@ -5,7 +5,7 @@
 //! to both the oe-gateway and md-gateway.
 
 use std::io::{self, Read, Write};
-use std::net::{SocketAddr, TcpStream};
+use std::net::TcpStream;
 use std::time::Duration;
 
 use melin_gateway_core::fix::parse::{self, FixMessage};
@@ -25,14 +25,20 @@ pub struct FixClient {
 impl FixClient {
     /// Connect to a FIX gateway and perform the Logon handshake.
     ///
+    /// `addr` is resolved via DNS so hostnames like "localhost:9000" work.
     /// Blocks until the Logon response is received or the timeout expires.
     pub fn connect(
-        addr: SocketAddr,
+        addr: &str,
         sender_comp_id: &str,
         target_comp_id: &str,
         heartbeat_secs: u64,
     ) -> Result<Self, Box<dyn std::error::Error>> {
-        let stream = TcpStream::connect_timeout(&addr, Duration::from_secs(5))?;
+        use std::net::ToSocketAddrs;
+        let sock = addr
+            .to_socket_addrs()?
+            .next()
+            .ok_or_else(|| format!("no address resolved for {addr}"))?;
+        let stream = TcpStream::connect_timeout(&sock, Duration::from_secs(5))?;
         stream.set_read_timeout(Some(Duration::from_secs(5)))?;
         stream.set_nodelay(true)?;
 
