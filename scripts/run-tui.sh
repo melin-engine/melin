@@ -57,6 +57,9 @@ cleanup() {
     echo ""
     echo "Stopping container..."
     docker stop "$CONTAINER_NAME" 2>/dev/null || true
+    echo ""
+    echo "=== Container logs ==="
+    docker logs "$CONTAINER_NAME" 2>/dev/null || true
     if [ -s tui.log ]; then
         echo ""
         echo "=== TUI log (tui.log) ==="
