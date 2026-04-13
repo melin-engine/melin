@@ -994,7 +994,7 @@ fn run_as_primary<L: BlockingTransportListener>(
 
         let seed_start = std::time::Instant::now();
 
-        for i in 1..=config.instruments {
+        for i in 0..config.instruments {
             producer.publish(InputSlot {
                 connection_id: 0,
                 key_hash: 0,
@@ -1002,8 +1002,8 @@ fn run_as_primary<L: BlockingTransportListener>(
                 event: JournalEvent::AddInstrument {
                     spec: InstrumentSpec {
                         symbol: Symbol(i),
-                        base: CurrencyId(i * 2 - 1),
-                        quote: CurrencyId(i * 2),
+                        base: CurrencyId(i * 2),
+                        quote: CurrencyId(i * 2 + 1),
                     },
                 },
                 publish_ts: trace_ts(),
@@ -1759,7 +1759,7 @@ pub fn run_dpdk(
         use melin_engine::journal::trace::trace_ts;
         use melin_engine::types::{AccountId, CurrencyId, InstrumentSpec, Symbol};
 
-        for i in 1..=config.instruments {
+        for i in 0..config.instruments {
             producer.publish(InputSlot {
                 connection_id: 0,
                 key_hash: 0,
@@ -1767,8 +1767,8 @@ pub fn run_dpdk(
                 event: JournalEvent::AddInstrument {
                     spec: InstrumentSpec {
                         symbol: Symbol(i),
-                        base: CurrencyId(i * 2 - 1),
-                        quote: CurrencyId(i * 2),
+                        base: CurrencyId(i * 2),
+                        quote: CurrencyId(i * 2 + 1),
                     },
                 },
                 publish_ts: trace_ts(),
