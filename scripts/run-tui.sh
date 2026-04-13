@@ -9,9 +9,12 @@
 
 set -euo pipefail
 
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+REPO_DIR="$(dirname "$SCRIPT_DIR")"
 DATA_DIR="${DATA_DIR:-/tmp/melin-data}"
 IMAGE="${IMAGE:-melin}"
 CONTAINER_NAME="melin-dev"
+TUI_LOG="$REPO_DIR/tui.log"
 
 # Parse args
 REBUILD=0
@@ -55,15 +58,15 @@ echo ""
 # Stop container on exit regardless of how TUI exits
 cleanup() {
     echo ""
-    echo "Stopping container..."
-    docker stop "$CONTAINER_NAME" 2>/dev/null || true
-    echo ""
     echo "=== Container logs ==="
     docker logs "$CONTAINER_NAME" 2>/dev/null || true
-    if [ -s tui.log ]; then
+    echo ""
+    echo "Stopping container..."
+    docker stop "$CONTAINER_NAME" 2>/dev/null || true
+    if [ -s "$TUI_LOG" ]; then
         echo ""
-        echo "=== TUI log (tui.log) ==="
-        cat tui.log
+        echo "=== TUI log ==="
+        cat "$TUI_LOG"
     fi
 }
 trap cleanup EXIT INT TERM
