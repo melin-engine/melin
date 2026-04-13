@@ -1587,6 +1587,7 @@ dependencies = [
 name = "melin-market-data"
 version = "0.1.0"
 dependencies = [
+ "ed25519-dalek",
  "melin-engine",
  "melin-protocol",
  "proptest",

@@ -7,10 +7,12 @@
 use std::collections::HashMap;
 use std::io::{self, Read, Write};
 use std::net::{SocketAddr, TcpStream};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
+use ed25519_dalek::{Signer, SigningKey};
 use melin_engine::types::{ExecutionReport, Symbol};
 use melin_protocol::codec;
 use melin_protocol::message::{Request, ResponseKind};
@@ -53,6 +55,9 @@ pub struct CoreConfig {
     pub event_publisher_addr: SocketAddr,
     /// Symbols to subscribe to (empty = all).
     pub symbols: Vec<Symbol>,
+    /// Path to the Ed25519 private key (32-byte raw seed) for
+    /// authenticating to the event publisher.
+    pub key_path: PathBuf,
 }
 
 /// Run the MarketDataCore loop. Blocks the calling thread until shutdown.
@@ -95,9 +100,13 @@ fn run_session(
     tracing::info!(addr = %config.event_publisher_addr, "connected to event publisher");
 
     // Step 1: Auth handshake (client side).
+    // Load the Ed25519 signing key.
+    let signing_key = load_signing_key(&config.key_path)?;
+    let public_key = signing_key.verifying_key();
+
     // Read Challenge from publisher.
     let challenge = read_response(&mut stream)?;
-    let _nonce = match challenge {
+    let nonce = match challenge {
         ResponseKind::Challenge { nonce } => nonce,
         other => {
             return Err(format!(
@@ -108,15 +117,11 @@ fn run_session(
         }
     };
 
-    // For now, skip real Ed25519 auth — send a dummy ChallengeResponse.
-    // The event publisher requires auth, but for local dev the keys can
-    // be configured to accept any signature. A proper client-side signer
-    // will be added when the TUI wires up real key management.
-    //
-    // TODO: Add real Ed25519 signing with the subscriber_key from config.
+    // Sign the nonce and send ChallengeResponse.
+    let signature = signing_key.sign(&nonce);
     let auth_request = Request::ChallengeResponse {
-        signature: [0u8; 64],
-        public_key: [0u8; 32],
+        signature: signature.to_bytes(),
+        public_key: public_key.to_bytes(),
     };
     send_request(&mut stream, &auth_request, 0)?;
 
@@ -199,6 +204,22 @@ fn report_symbol(report: &ExecutionReport) -> Symbol {
         | ExecutionReport::Replaced { symbol, .. }
         | ExecutionReport::InstrumentStatusChanged { symbol, .. } => symbol,
     }
+}
+
+/// Load a 32-byte Ed25519 signing key seed from a file.
+fn load_signing_key(path: &std::path::Path) -> Result<SigningKey, Box<dyn std::error::Error>> {
+    let seed = std::fs::read(path)?;
+    if seed.len() != 32 {
+        return Err(format!(
+            "key file must be 32 bytes, got {} ({})",
+            seed.len(),
+            path.display()
+        )
+        .into());
+    }
+    let mut bytes = [0u8; 32];
+    bytes.copy_from_slice(&seed);
+    Ok(SigningKey::from_bytes(&bytes))
 }
 
 /// Read a single length-prefixed response from the stream.

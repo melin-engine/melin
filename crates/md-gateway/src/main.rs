@@ -80,6 +80,7 @@ fn main() {
     let core_state = Arc::clone(&md_state);
     let core_shutdown = Arc::clone(&shutdown);
     let core_addr = config.event_publisher;
+    let core_key_path = config.subscriber_key.clone();
     let core_handle = std::thread::Builder::new()
         .name("md-core".into())
         .spawn(move || {
@@ -87,6 +88,7 @@ fn main() {
                 melin_market_data::core::CoreConfig {
                     event_publisher_addr: core_addr,
                     symbols: symbol_ids,
+                    key_path: core_key_path,
                 },
                 core_state,
                 &core_shutdown,

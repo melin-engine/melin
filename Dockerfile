@@ -1,10 +1,11 @@
+# syntax=docker/dockerfile:1
 # Multi-stage build for the melin all-in-one image.
 #
 # Contains: melin-server, melin-oe-gateway, melin-md-gateway, melin-keygen.
 # Does NOT include melin-tui-fix-client — run that on the host.
 #
-# Build:
-#   docker build -t melin .
+# Build (requires SSH agent for private git deps):
+#   docker build --ssh default -t melin .
 #
 # Run:
 #   docker run --rm -p 9000:9000 -p 9001:9001 melin
@@ -15,7 +16,12 @@
 #     --sender TRADER --oe-target MELIN-OE --md-target MELIN-MD
 
 # --- Builder stage ---
-FROM rust:1.86-bookworm AS builder
+FROM rust:1.88-bookworm AS builder
+
+# Install git + openssh for private GitHub dependencies (astenn, fastcp).
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    git openssh-client \
+    && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /build
 
@@ -28,11 +34,11 @@ COPY crates crates
 # runtime host. Use a portable baseline instead.
 RUN mkdir -p .cargo && printf '[build]\nrustflags = []\n' > .cargo/config.toml
 
-# Strip the smoltcp SSH patch — it requires GitHub SSH access and is only
-# used by the DPDK crate which we don't build here.
-RUN sed -i '/\[patch\.crates-io\]/,/^$/d' Cargo.toml
-
-RUN cargo build --release \
+# Build with SSH agent forwarding for private git deps (astenn, fastcp).
+# Requires: docker build --ssh default .
+RUN --mount=type=ssh \
+    mkdir -p ~/.ssh && ssh-keyscan github.com >> ~/.ssh/known_hosts 2>/dev/null && \
+    cargo build --release \
     -p melin-server \
     -p melin-oe-gateway \
     -p melin-md-gateway \
