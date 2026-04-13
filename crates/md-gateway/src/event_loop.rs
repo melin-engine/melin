@@ -1105,6 +1105,13 @@ mod tests {
     }
 
     fn spawn_gateway(config: &'static GatewayConfig) -> GwHandle {
+        spawn_gateway_with_state(config, Arc::new(RwLock::new(MdState::new())))
+    }
+
+    fn spawn_gateway_with_state(
+        config: &'static GatewayConfig,
+        state: Arc<RwLock<MdState>>,
+    ) -> GwHandle {
         let listener = TcpListener::bind(config.listen).unwrap();
         let port = listener.local_addr().unwrap().port();
         let shutdown = Arc::new(AtomicBool::new(false));
@@ -1113,7 +1120,6 @@ mod tests {
         let handle = std::thread::Builder::new()
             .name("test-md-gw".into())
             .spawn(move || {
-                let state = Arc::new(RwLock::new(MdState::new()));
                 let mut gw = MdGateway::new(listener, config, state).unwrap();
                 let _ = gw.run(&s);
             })
@@ -1211,6 +1217,224 @@ mod tests {
             msg.get_str(tags::TEXT)
                 .unwrap_or("")
                 .contains("TargetCompID")
+        );
+
+        gw.shutdown();
+    }
+
+    /// Build a config with a single BTCUSD symbol (id=1, tick_inverse=1, lot_inverse=1).
+    fn make_config_with_btcusd() -> &'static GatewayConfig {
+        let mut config = GatewayConfig {
+            listen: "127.0.0.1:0".parse().unwrap(),
+            event_publisher: "127.0.0.1:1".parse().unwrap(),
+            authorized_keys: std::path::PathBuf::new(),
+            subscriber_key: std::path::PathBuf::new(),
+            core: 0,
+            sender_comp_id: "MELIN-MD".to_string(),
+            symbols: std::collections::HashMap::new(),
+        };
+        config.symbols.insert(
+            "BTCUSD".to_string(),
+            crate::config::SymbolConfig {
+                id: 1,
+                tick_inverse: 1,
+                lot_inverse: 1,
+                base_ccy: "BTC".to_string(),
+                quote_ccy: "USD".to_string(),
+            },
+        );
+        Box::leak(Box::new(config))
+    }
+
+    /// Build a MarketDataRequest (35=V) FIX message.
+    fn market_data_request_bytes(
+        sender: &str,
+        target: &str,
+        seq: u64,
+        md_req_id: &str,
+        symbols: &[&str],
+    ) -> Vec<u8> {
+        let mut builder = FixMessageBuilder::new(tags::MSG_MARKET_DATA_REQUEST)
+            .str_tag(tags::MD_REQ_ID, md_req_id)
+            .str_tag(tags::SUBSCRIPTION_REQUEST_TYPE, "1")
+            .str_tag(tags::NO_RELATED_SYM, &symbols.len().to_string());
+        for sym in symbols {
+            builder = builder.str_tag(tags::SYMBOL, sym);
+        }
+        builder.build(sender, target, seq)
+    }
+
+    #[test]
+    fn market_data_request_returns_snapshot() {
+        use melin_engine::types::{
+            AccountId, ExecutionReport, OrderId, Price, Quantity, Side, Symbol,
+        };
+        use melin_market_data::mirror::BookMirror;
+        use std::num::NonZeroU64;
+
+        let config = make_config_with_btcusd();
+
+        // Seed MdState with a book for Symbol(1).
+        let state = Arc::new(RwLock::new(MdState::new()));
+        {
+            let mut s = state.write().unwrap();
+            let mut mirror = BookMirror::new(Symbol(1));
+            // Place a bid at price 100 qty 10.
+            mirror.apply(&ExecutionReport::Placed {
+                order_id: OrderId(1),
+                symbol: Symbol(1),
+                account: AccountId(1),
+                side: Side::Buy,
+                price: Price(NonZeroU64::new(100).unwrap()),
+                quantity: Quantity(NonZeroU64::new(10).unwrap()),
+            });
+            // Place an ask at price 200 qty 5.
+            mirror.apply(&ExecutionReport::Placed {
+                order_id: OrderId(2),
+                symbol: Symbol(1),
+                account: AccountId(1),
+                side: Side::Sell,
+                price: Price(NonZeroU64::new(200).unwrap()),
+                quantity: Quantity(NonZeroU64::new(5).unwrap()),
+            });
+            s.mirrors.insert(Symbol(1), mirror);
+            s.ready = true;
+        }
+
+        let gw = spawn_gateway_with_state(config, state);
+
+        let mut stream = TcpStream::connect(format!("127.0.0.1:{}", gw.port)).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+
+        // Logon.
+        let logon = logon_bytes("CLIENT", "MELIN-MD", 1);
+        stream.write_all(&logon).unwrap();
+        stream.flush().unwrap();
+        let _ = read_fix_message(&mut stream); // consume Logon response
+
+        // Send MarketDataRequest.
+        let req = market_data_request_bytes("CLIENT", "MELIN-MD", 2, "REQ1", &["BTCUSD"]);
+        stream.write_all(&req).unwrap();
+        stream.flush().unwrap();
+
+        // Read MarketDataSnapshotFullRefresh (35=W).
+        let resp = read_fix_message(&mut stream);
+        let msg = FixMessage::parse(&resp).unwrap();
+        assert_eq!(msg.msg_type(), tags::MSG_MD_SNAPSHOT);
+        assert_eq!(msg.get_str(tags::MD_REQ_ID), Some("REQ1"));
+        assert_eq!(msg.get_str(tags::SYMBOL), Some("BTCUSD"));
+        assert_eq!(msg.get_str(tags::NO_MD_ENTRIES), Some("2"));
+
+        // Verify entry types: first entry is bid (0), second is ask (1).
+        let entry_types: Vec<_> = msg
+            .fields_iter()
+            .filter(|f| f.tag == tags::MD_ENTRY_TYPE)
+            .map(|f| std::str::from_utf8(f.value).unwrap().to_string())
+            .collect();
+        assert_eq!(entry_types, vec!["0", "1"]);
+
+        // Verify prices.
+        let prices: Vec<_> = msg
+            .fields_iter()
+            .filter(|f| f.tag == tags::MD_ENTRY_PX)
+            .map(|f| std::str::from_utf8(f.value).unwrap().to_string())
+            .collect();
+        assert_eq!(prices, vec!["100", "200"]);
+
+        // Verify sizes.
+        let sizes: Vec<_> = msg
+            .fields_iter()
+            .filter(|f| f.tag == tags::MD_ENTRY_SIZE)
+            .map(|f| std::str::from_utf8(f.value).unwrap().to_string())
+            .collect();
+        assert_eq!(sizes, vec!["10", "5"]);
+
+        gw.shutdown();
+    }
+
+    #[test]
+    fn market_data_request_rejects_when_not_ready() {
+        let config = make_config_with_btcusd();
+
+        // MdState with ready = false (the default).
+        let state = Arc::new(RwLock::new(MdState::new()));
+
+        let gw = spawn_gateway_with_state(config, state);
+
+        let mut stream = TcpStream::connect(format!("127.0.0.1:{}", gw.port)).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+
+        // Logon.
+        let logon = logon_bytes("CLIENT", "MELIN-MD", 1);
+        stream.write_all(&logon).unwrap();
+        stream.flush().unwrap();
+        let _ = read_fix_message(&mut stream); // consume Logon response
+
+        // Send MarketDataRequest.
+        let req = market_data_request_bytes("CLIENT", "MELIN-MD", 2, "REQ1", &["BTCUSD"]);
+        stream.write_all(&req).unwrap();
+        stream.flush().unwrap();
+
+        // Should get a MarketDataRequestReject (35=Y).
+        let resp = read_fix_message(&mut stream);
+        let msg = FixMessage::parse(&resp).unwrap();
+        assert_eq!(msg.msg_type(), tags::MSG_MD_REQUEST_REJECT);
+        assert_eq!(msg.get_str(tags::MD_REQ_ID), Some("REQ1"));
+        assert!(
+            msg.get_str(tags::TEXT).unwrap_or("").contains("not ready"),
+            "expected reject text to mention 'not ready', got: {:?}",
+            msg.get_str(tags::TEXT)
+        );
+
+        gw.shutdown();
+    }
+
+    #[test]
+    fn market_data_request_rejects_empty_symbols() {
+        let config = make_config_with_btcusd();
+
+        // Ready state, but we send a V with no Symbol tags.
+        let state = Arc::new(RwLock::new(MdState::new()));
+        {
+            let mut s = state.write().unwrap();
+            s.ready = true;
+        }
+
+        let gw = spawn_gateway_with_state(config, state);
+
+        let mut stream = TcpStream::connect(format!("127.0.0.1:{}", gw.port)).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+
+        // Logon.
+        let logon = logon_bytes("CLIENT", "MELIN-MD", 1);
+        stream.write_all(&logon).unwrap();
+        stream.flush().unwrap();
+        let _ = read_fix_message(&mut stream); // consume Logon response
+
+        // Send MarketDataRequest with no Symbol tags.
+        let req = FixMessageBuilder::new(tags::MSG_MARKET_DATA_REQUEST)
+            .str_tag(tags::MD_REQ_ID, "REQ1")
+            .str_tag(tags::SUBSCRIPTION_REQUEST_TYPE, "1")
+            .str_tag(tags::NO_RELATED_SYM, "0")
+            .build("CLIENT", "MELIN-MD", 2);
+        stream.write_all(&req).unwrap();
+        stream.flush().unwrap();
+
+        // Should get a MarketDataRequestReject (35=Y).
+        let resp = read_fix_message(&mut stream);
+        let msg = FixMessage::parse(&resp).unwrap();
+        assert_eq!(msg.msg_type(), tags::MSG_MD_REQUEST_REJECT);
+        assert_eq!(msg.get_str(tags::MD_REQ_ID), Some("REQ1"));
+        assert!(
+            msg.get_str(tags::TEXT).unwrap_or("").contains("no symbols"),
+            "expected reject text to mention 'no symbols', got: {:?}",
+            msg.get_str(tags::TEXT)
         );
 
         gw.shutdown();

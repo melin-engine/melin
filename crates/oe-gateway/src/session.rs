@@ -3507,4 +3507,167 @@ lot_size_inverse = 1
         // No FIX bytes queued.
         assert!(s.fix_send_buf.is_empty());
     }
+
+    // -----------------------------------------------------------------------
+    // OrderStatusRequest (35=H) / OrderMassStatusRequest (35=AF)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn order_status_request_returns_report() {
+        let config = make_config("FIRM_A", "MELIN");
+        let smap = session_map(&config);
+        let sym = symbol_map(&config);
+        let mut s = active_session(&config, Instant::now());
+
+        // Seed ledger with a known order.
+        let order_id = s.id_map.insert("ORD1");
+        s.order_ledger.insert(
+            order_id,
+            translate::OrderLiveState {
+                symbol_str: "BTC/USD".to_string(),
+                side: "1",
+                price: "50000".to_string(),
+                ord_status: "0",
+                leaves_qty: "10".to_string(),
+                cum_qty: 0,
+                avg_px: 0,
+                order_qty: "10".to_string(),
+            },
+        );
+
+        let raw = FixMessageBuilder::new(tags::MSG_ORDER_STATUS_REQUEST)
+            .str_tag(tags::ORDER_ID, &order_id.0.to_string())
+            .build("FIRM_A", "MELIN", 2);
+        let action = s.handle_fix_message(&raw, &config, &smap, &sym);
+
+        assert_eq!(action, SessionAction::SendFix);
+        let parsed = FixMessage::parse(&s.fix_send_buf).unwrap();
+        assert_eq!(parsed.msg_type(), tags::MSG_EXECUTION_REPORT);
+        assert_eq!(parsed.get_str(tags::EXEC_TYPE), Some("I"));
+        assert_eq!(parsed.get_str(tags::ORD_STATUS), Some("0"));
+        assert_eq!(parsed.get_str(tags::SYMBOL), Some("BTC/USD"));
+        assert_eq!(parsed.get_str(tags::SIDE), Some("1"));
+        assert_eq!(parsed.get_str(tags::CL_ORD_ID), Some("ORD1"));
+        assert_eq!(
+            parsed.get_str(tags::ORDER_ID),
+            Some(order_id.0.to_string().as_str())
+        );
+    }
+
+    #[test]
+    fn order_status_request_unknown_order_rejects() {
+        let config = make_config("FIRM_A", "MELIN");
+        let smap = session_map(&config);
+        let sym = symbol_map(&config);
+        let mut s = active_session(&config, Instant::now());
+
+        // No orders in ledger or id_map — request an unknown OrderID.
+        let raw = FixMessageBuilder::new(tags::MSG_ORDER_STATUS_REQUEST)
+            .str_tag(tags::ORDER_ID, "999")
+            .build("FIRM_A", "MELIN", 2);
+        let action = s.handle_fix_message(&raw, &config, &smap, &sym);
+
+        assert_eq!(action, SessionAction::SendFix);
+        let parsed = FixMessage::parse(&s.fix_send_buf).unwrap();
+        assert_eq!(parsed.msg_type(), tags::MSG_REJECT);
+    }
+
+    #[test]
+    fn order_mass_status_empty_returns_zero_reports() {
+        let config = make_config("FIRM_A", "MELIN");
+        let smap = session_map(&config);
+        let sym = symbol_map(&config);
+        let mut s = active_session(&config, Instant::now());
+
+        // Empty ledger — send AF with MassStatusReqType=1 (all orders).
+        let raw = FixMessageBuilder::new(tags::MSG_ORDER_MASS_STATUS_REQUEST)
+            .str_tag(tags::MASS_STATUS_REQ_ID, "MSR1")
+            .str_tag(tags::MASS_STATUS_REQ_TYPE, "1")
+            .build("FIRM_A", "MELIN", 2);
+        let action = s.handle_fix_message(&raw, &config, &smap, &sym);
+
+        assert_eq!(action, SessionAction::SendFix);
+        let parsed = FixMessage::parse(&s.fix_send_buf).unwrap();
+        assert_eq!(parsed.msg_type(), tags::MSG_EXECUTION_REPORT);
+        assert_eq!(parsed.get_str(tags::TOT_NUM_REPORTS), Some("0"));
+        assert_eq!(parsed.get_str(tags::LAST_RPT_REQUESTED), Some("Y"));
+        assert_eq!(parsed.get_str(tags::MASS_STATUS_REQ_ID), Some("MSR1"));
+    }
+
+    #[test]
+    fn order_mass_status_returns_active_orders() {
+        let config = make_config("FIRM_A", "MELIN");
+        let smap = session_map(&config);
+        let sym = symbol_map(&config);
+        let mut s = active_session(&config, Instant::now());
+
+        // Insert 2 active orders and 1 cancelled order.
+        let oid1 = s.id_map.insert("ORD1");
+        let oid2 = s.id_map.insert("ORD2");
+        let oid3 = s.id_map.insert("ORD3");
+
+        let active_state = |sym: &str| translate::OrderLiveState {
+            symbol_str: sym.to_string(),
+            side: "1",
+            price: "50000".to_string(),
+            ord_status: "0",
+            leaves_qty: "10".to_string(),
+            cum_qty: 0,
+            avg_px: 0,
+            order_qty: "10".to_string(),
+        };
+
+        s.order_ledger.insert(oid1, active_state("BTC/USD"));
+        s.order_ledger.insert(oid2, active_state("BTC/USD"));
+        s.order_ledger.insert(
+            oid3,
+            translate::OrderLiveState {
+                symbol_str: "BTC/USD".to_string(),
+                side: "2",
+                price: "49000".to_string(),
+                ord_status: "4", // Cancelled — should be excluded.
+                leaves_qty: "0".to_string(),
+                cum_qty: 5,
+                avg_px: 49000,
+                order_qty: "5".to_string(),
+            },
+        );
+
+        let raw = FixMessageBuilder::new(tags::MSG_ORDER_MASS_STATUS_REQUEST)
+            .str_tag(tags::MASS_STATUS_REQ_ID, "MSR2")
+            .str_tag(tags::MASS_STATUS_REQ_TYPE, "1")
+            .build("FIRM_A", "MELIN", 2);
+        let action = s.handle_fix_message(&raw, &config, &smap, &sym);
+
+        assert_eq!(action, SessionAction::SendFix);
+
+        // Drain all FIX messages from the send buffer.
+        let msgs = drain_send_buf(&mut s);
+        assert_eq!(msgs.len(), 2, "only the 2 active orders should be reported");
+
+        for (i, raw_msg) in msgs.iter().enumerate() {
+            let parsed = FixMessage::parse(raw_msg).unwrap();
+            assert_eq!(parsed.msg_type(), tags::MSG_EXECUTION_REPORT);
+            assert_eq!(parsed.get_str(tags::EXEC_TYPE), Some("I"));
+            assert_eq!(parsed.get_str(tags::MASS_STATUS_REQ_ID), Some("MSR2"));
+            assert_eq!(parsed.get_str(tags::TOT_NUM_REPORTS), Some("2"));
+
+            // Only the last report should have LastRptRequested=Y.
+            if i + 1 == msgs.len() {
+                assert_eq!(parsed.get_str(tags::LAST_RPT_REQUESTED), Some("Y"));
+            } else {
+                assert_eq!(parsed.get_str(tags::LAST_RPT_REQUESTED), None);
+            }
+        }
+
+        // Verify the cancelled order (ORD3) is not present.
+        let reported_clords: Vec<_> = msgs
+            .iter()
+            .filter_map(|m| {
+                let p = FixMessage::parse(m).unwrap();
+                p.get_str(tags::CL_ORD_ID).map(String::from)
+            })
+            .collect();
+        assert!(!reported_clords.contains(&"ORD3".to_string()));
+    }
 }

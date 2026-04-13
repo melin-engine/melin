@@ -306,6 +306,110 @@ mod tests {
     }
 
     #[test]
+    fn parse_snapshot_truncated_stream() {
+        // Stream ends after BookSnapshotBegin — no End or Complete.
+        let mut data = Vec::new();
+        data.extend(encode_frame(
+            0,
+            &ResponseKind::BookSnapshotBegin {
+                symbol: Symbol(1),
+                last_applied_seq: 42,
+            },
+        ));
+
+        let mut cursor = io::Cursor::new(data);
+        match parse_snapshot(&mut cursor) {
+            Err(SnapshotError::Io(e)) => {
+                assert_eq!(e.kind(), io::ErrorKind::UnexpectedEof);
+            }
+            Err(other) => panic!("expected Io(UnexpectedEof), got: {other}"),
+            Ok(_) => panic!("expected error, got Ok"),
+        }
+    }
+
+    #[test]
+    fn parse_snapshot_ignores_non_snapshot_frames() {
+        // Insert a Heartbeat between Begin and End — it should be silently
+        // ignored by the `_ => {}` catch-all arm.
+        let mut data = Vec::new();
+        data.extend(encode_frame(
+            0,
+            &ResponseKind::BookSnapshotBegin {
+                symbol: Symbol(1),
+                last_applied_seq: 42,
+            },
+        ));
+        data.extend(encode_frame(0, &ResponseKind::Heartbeat));
+        data.extend(encode_frame(
+            0,
+            &ResponseKind::BookSnapshotEnd {
+                symbol: Symbol(1),
+                level_count: 0,
+            },
+        ));
+        data.extend(encode_frame(
+            0,
+            &ResponseKind::SnapshotComplete {
+                last_applied_seq: 42,
+            },
+        ));
+
+        let mut cursor = io::Cursor::new(data);
+        let result = parse_snapshot(&mut cursor).unwrap();
+
+        assert_eq!(result.mirrors.len(), 1);
+        assert_eq!(result.mirrors[0].0, Symbol(1));
+        assert!(result.mirrors[0].1.bids().is_empty());
+        assert!(result.mirrors[0].1.asks().is_empty());
+        assert_eq!(result.last_applied_seq, 42);
+    }
+
+    #[test]
+    fn parse_snapshot_zero_qty_level_skipped() {
+        // A BookSnapshotLevel with qty=0 should be ignored by the
+        // NonZeroU64 guard in seed_level.
+        let mut data = Vec::new();
+        data.extend(encode_frame(
+            0,
+            &ResponseKind::BookSnapshotBegin {
+                symbol: Symbol(1),
+                last_applied_seq: 42,
+            },
+        ));
+        data.extend(encode_frame(
+            0,
+            &ResponseKind::BookSnapshotLevel {
+                symbol: Symbol(1),
+                side: Side::Buy,
+                price: price(100),
+                qty: 0,
+                order_count: 1,
+            },
+        ));
+        data.extend(encode_frame(
+            0,
+            &ResponseKind::BookSnapshotEnd {
+                symbol: Symbol(1),
+                level_count: 0,
+            },
+        ));
+        data.extend(encode_frame(
+            0,
+            &ResponseKind::SnapshotComplete {
+                last_applied_seq: 42,
+            },
+        ));
+
+        let mut cursor = io::Cursor::new(data);
+        let result = parse_snapshot(&mut cursor).unwrap();
+
+        assert_eq!(result.mirrors.len(), 1);
+        // The zero-qty level must not appear in the mirror.
+        assert!(result.mirrors[0].1.bids().is_empty());
+        assert!(result.mirrors[0].1.asks().is_empty());
+    }
+
+    #[test]
     fn parse_multi_symbol_snapshot() {
         let mut data = Vec::new();
         // Symbol 1

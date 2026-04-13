@@ -1959,4 +1959,123 @@ mod tests {
         assert_eq!(length, 9);
         assert_eq!(written, 4 + 9); // 4-byte prefix + 9 payload
     }
+
+    #[test]
+    fn subscribe_request_zero_symbols_roundtrip() {
+        // count=0 means wildcard subscribe (all symbols).
+        let request = Request::Subscribe {
+            symbols: [Symbol(0); 8],
+            count: 0,
+        };
+        let mut buf = [0u8; 136];
+        let written = encode_request(&request, 1, &mut buf).unwrap();
+        let (seq, decoded) = decode_request(&buf[4..written]).unwrap();
+        assert_eq!(seq, 1);
+        if let Request::Subscribe { count, .. } = decoded {
+            assert_eq!(count, 0);
+        } else {
+            panic!("expected Subscribe, got {decoded:?}");
+        }
+    }
+
+    #[test]
+    fn subscribe_request_max_symbols_roundtrip() {
+        // count=8, all symbol slots filled with distinct values.
+        let symbols = [
+            Symbol(1),
+            Symbol(2),
+            Symbol(3),
+            Symbol(4),
+            Symbol(5),
+            Symbol(6),
+            Symbol(7),
+            Symbol(8),
+        ];
+        let request = Request::Subscribe { symbols, count: 8 };
+        let mut buf = [0u8; 136];
+        let written = encode_request(&request, 1, &mut buf).unwrap();
+        let (_seq, decoded) = decode_request(&buf[4..written]).unwrap();
+        if let Request::Subscribe {
+            symbols: decoded_syms,
+            count,
+        } = decoded
+        {
+            assert_eq!(count, 8);
+            for i in 0..8 {
+                assert_eq!(decoded_syms[i], symbols[i], "symbol mismatch at index {i}");
+            }
+        } else {
+            panic!("expected Subscribe, got {decoded:?}");
+        }
+    }
+
+    #[test]
+    fn position_snapshot_empty_roundtrip() {
+        let response = ResponseKind::PositionSnapshot {
+            account: AccountId(99),
+            balances: [(CurrencyId(0), 0, 0); 16],
+            count: 0,
+        };
+        let mut buf = [0u8; 512];
+        let written = encode_response(&response, &mut buf).unwrap();
+        let decoded = decode_response(&buf[4..written]).unwrap();
+        if let ResponseKind::PositionSnapshot { account, count, .. } = decoded {
+            assert_eq!(account, AccountId(99));
+            assert_eq!(count, 0);
+        } else {
+            panic!("expected PositionSnapshot, got {decoded:?}");
+        }
+    }
+
+    #[test]
+    fn position_snapshot_max_currencies_roundtrip() {
+        // Fill all 16 slots with distinct values.
+        let mut balances = [(CurrencyId(0), 0u64, 0u64); 16];
+        for (i, entry) in balances.iter_mut().enumerate() {
+            *entry = (
+                CurrencyId((i + 1) as u32),
+                (i as u64 + 1) * 1000,
+                (i as u64 + 1) * 100,
+            );
+        }
+        let response = ResponseKind::PositionSnapshot {
+            account: AccountId(7),
+            balances,
+            count: 16,
+        };
+        let mut buf = [0u8; 512];
+        let written = encode_response(&response, &mut buf).unwrap();
+        let decoded = decode_response(&buf[4..written]).unwrap();
+        if let ResponseKind::PositionSnapshot {
+            account,
+            balances: dec_bal,
+            count,
+        } = decoded
+        {
+            assert_eq!(account, AccountId(7));
+            assert_eq!(count, 16);
+            for i in 0..16 {
+                assert_eq!(dec_bal[i].0, balances[i].0, "currency mismatch at {i}");
+                assert_eq!(dec_bal[i].1, balances[i].1, "free mismatch at {i}");
+                assert_eq!(dec_bal[i].2, balances[i].2, "reserved mismatch at {i}");
+            }
+        } else {
+            panic!("expected PositionSnapshot, got {decoded:?}");
+        }
+    }
+
+    #[test]
+    fn position_snapshot_count_over_16_rejected() {
+        // Manually build a payload with count=17 — should be rejected.
+        // Layout: tag(1) + account(4) + count(1) = 6 bytes minimum.
+        let mut payload = vec![0u8; 6];
+        payload[0] = TAG_POSITION_SNAPSHOT;
+        le::put_u32(&mut payload[1..], 1); // account
+        payload[5] = 17; // count > 16
+        let result = decode_response(&payload);
+        assert!(
+            matches!(result, Err(ProtocolError::InvalidField(_))),
+            "expected InvalidField, got {result:?}"
+        );
+    }
 }
