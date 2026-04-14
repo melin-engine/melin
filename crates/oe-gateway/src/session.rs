@@ -970,7 +970,10 @@ impl Session {
 
                 // Look up currency names from the session config index.
                 let session_account_str = self.account_id.0.to_string();
-                let bal_entries: Vec<translate::BalanceEntry> = balances[..count as usize]
+                // Cap count to array length defensively — the codec already
+                // validates count ≤ 16, but we don't trust wire data here.
+                let n = std::cmp::min(count as usize, balances.len());
+                let bal_entries: Vec<translate::BalanceEntry> = balances[..n]
                     .iter()
                     .map(|&(currency, free, reserved)| translate::BalanceEntry {
                         currency: currency.0.to_string(),

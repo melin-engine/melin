@@ -758,7 +758,8 @@ pub fn encode_response(response: &ResponseKind, buf: &mut [u8]) -> Result<usize,
             buf[pos] = *count;
             pos += 1;
             // Each entry: currency(4) + free(8) + reserved(8) = 20 bytes.
-            for &(currency, free, reserved) in &balances[..(*count as usize)] {
+            let n = std::cmp::min(*count as usize, balances.len());
+            for &(currency, free, reserved) in &balances[..n] {
                 le::put_u32(&mut buf[pos..], currency.0);
                 pos += 4;
                 le::put_u64(&mut buf[pos..], free);
