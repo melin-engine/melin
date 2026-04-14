@@ -755,7 +755,18 @@ fn pwritev2_dsync(
 fn preallocate(file: &File, current_end: u64) -> Result<u64, JournalError> {
     let target = current_end + PREALLOC_CHUNK;
 
-    let ret = unsafe { libc::posix_fallocate(file.as_raw_fd(), 0, target as libc::off_t) };
+    // Allocate only the new chunk [current_end, target), not [0, target).
+    // posix_fallocate(fd, 0, target) walks the entire extent tree from
+    // offset 0 on every call to verify already-allocated extents, which
+    // takes O(file_size) as the file grows — causing linearly growing
+    // latency spikes under sustained write load.
+    let ret = unsafe {
+        libc::posix_fallocate(
+            file.as_raw_fd(),
+            current_end as libc::off_t,
+            PREALLOC_CHUNK as libc::off_t,
+        )
+    };
 
     if ret == 0 {
         return Ok(target);
