@@ -653,22 +653,7 @@ fn run_pipeline_bench(
 
     let group_commit_delay = Duration::from_micros(group_commit_us);
     let active_conns = Arc::new(AtomicU64::new(0));
-    let (
-        producer,
-        journal_stage,
-        matching_stage,
-        mut output_consumers,
-        _journal_cursor,
-        _matching_cursor,
-        _events_processed,
-        _input_cursor,
-        _,
-        _,
-        _,
-        _,
-        _,
-        _,
-    ) = build_pipeline_with_replication(
+    let mut out = build_pipeline_with_replication(
         exchange,
         writer,
         group_commit_delay,
@@ -680,18 +665,20 @@ fn run_pipeline_bench(
         false, // event_publisher
         false, // shadow
     );
-    let mut output_consumer = output_consumers.pop().expect("response consumer");
+    let mut output_consumer = out.output_consumers.pop().expect("response consumer");
 
     let shutdown = Arc::new(AtomicBool::new(false));
 
     // Spawn journal and matching stage threads.
     let shutdown_j = Arc::clone(&shutdown);
+    let journal_stage = out.journal_stage;
     let journal_handle = std::thread::Builder::new()
         .name("journal".into())
         .spawn(move || journal_stage.run(&shutdown_j))
         .expect("spawn journal thread");
 
     let shutdown_m = Arc::clone(&shutdown);
+    let matching_stage = out.matching_stage;
     let matching_handle = std::thread::Builder::new()
         .name("matching".into())
         .spawn(move || matching_stage.run(&shutdown_m))
@@ -715,6 +702,7 @@ fn run_pipeline_bench(
     let (mut ts_tx, mut ts_rx) = melin_disruptor::spsc::channel::<u64>(window.next_power_of_two());
 
     // Publisher thread: continuously feeds events into the disruptor.
+    let producer = out.input_producer;
     let inflight_pub = Arc::clone(&inflight);
     let publish_handle = std::thread::Builder::new()
         .name("pipeline-pub".into())

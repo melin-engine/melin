@@ -2047,62 +2047,35 @@ fn print_utilization(stage: &str, busy: u64, idle: u64) {
 /// wait for journal sync — the response stage gates on the journal cursor
 /// (and replication cursor when active) instead.
 ///
-/// The caller (server) is responsible for building the response stage
-/// and spawning all threads.
-///
-/// When `enable_replication` is true, a 3rd consumer is added for the
-/// replication stage. The returned `Option<ReplicationStage>` and
-/// `Arc<AtomicU64>` (replication cursor) are used by the server to spawn
-/// the replication thread and gate the response stage.
-#[allow(clippy::type_complexity)]
-pub fn build_pipeline(
-    exchange: Exchange,
-    writer: JournalWriter,
-    group_commit_delay: Duration,
-    active_connections: Arc<AtomicU64>,
-) -> (
-    ring::MultiProducer<InputSlot>,
-    JournalStage,
-    MatchingStage,
-    Vec<ring::Consumer<OutputSlot>>,
-    Arc<Sequence>,
-    Arc<AtomicU64>,
-) {
-    let (
-        producer,
-        journal_stage,
-        matching_stage,
-        output_consumers,
-        journal_cursor,
-        _matching_cursor,
-        events_processed,
-        _input_cursor,
-        _,
-        _,
-        _,
-        _,
-        _,
-        _,
-    ) = build_pipeline_with_replication(
-        exchange,
-        writer,
-        group_commit_delay,
-        active_connections,
-        false,
-        MAX_JOURNAL_BATCH,
-        crate::journal::replication::REPLICATION_RING_CAPACITY,
-        false,
-        false,
-        false,
-    );
-    (
-        producer,
-        journal_stage,
-        matching_stage,
-        output_consumers,
-        journal_cursor,
-        events_processed,
-    )
+/// Assembled pipeline stages and handles returned by [`build_pipeline_with_replication`].
+pub struct Pipeline {
+    pub input_producer: ring::MultiProducer<InputSlot>,
+    pub journal_stage: JournalStage,
+    pub matching_stage: MatchingStage,
+    pub output_consumers: Vec<ring::Consumer<OutputSlot>>,
+    pub journal_cursor: Arc<Sequence>,
+    pub matching_cursor: Arc<Sequence>,
+    pub events_processed: Arc<AtomicU64>,
+    pub input_cursor: Box<dyn ring::QueueCursor>,
+    pub replication_consumers: Option<(ReplicationConsumer, ReplicationConsumer)>,
+    pub replication_cursor: Arc<AtomicU64>,
+    pub replicas_connected: Option<Arc<AtomicU32>>,
+    pub shadow_consumer: Option<ring::Consumer<InputSlot>>,
+    pub chain_hash_lock: Option<Arc<SeqLock<[u8; 32]>>>,
+    pub replication_ring_progress: Option<ReplicationRingProgress>,
+}
+
+/// Assembled replica pipeline stages and handles returned by [`build_replica_pipeline`].
+pub struct ReplicaPipeline {
+    pub input_producer: ring::MultiProducer<InputSlot>,
+    pub journal_stage: JournalStage,
+    pub matching_stage: MatchingStage,
+    pub drain_consumer: ring::Consumer<OutputSlot>,
+    pub journal_cursor: Arc<Sequence>,
+    pub matching_cursor: Arc<Sequence>,
+    pub raw_journal_tx: RawBatchSender,
+    pub shadow_consumer: Option<ring::Consumer<InputSlot>>,
+    pub chain_hash_lock: Option<Arc<SeqLock<[u8; 32]>>>,
 }
 
 /// Build the pipeline with optional replication support.
@@ -2139,7 +2112,7 @@ pub struct ReplicationRingProgress {
 }
 
 /// When replication is disabled, the cursor is `u64::MAX` (standalone mode).
-#[allow(clippy::type_complexity, clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)]
 pub fn build_pipeline_with_replication(
     exchange: Exchange,
     writer: JournalWriter,
@@ -2151,22 +2124,7 @@ pub fn build_pipeline_with_replication(
     busy_spin: bool,
     enable_event_publisher: bool,
     enable_shadow: bool,
-) -> (
-    ring::MultiProducer<InputSlot>,
-    JournalStage,
-    MatchingStage,
-    Vec<ring::Consumer<OutputSlot>>,
-    Arc<Sequence>,
-    Arc<Sequence>,
-    Arc<AtomicU64>,
-    Box<dyn ring::QueueCursor>,
-    Option<(ReplicationConsumer, ReplicationConsumer)>,
-    Arc<AtomicU64>,
-    Option<Arc<AtomicU32>>,
-    Option<ring::Consumer<InputSlot>>,
-    Option<Arc<SeqLock<[u8; 32]>>>,
-    Option<ReplicationRingProgress>,
-) {
+) -> Pipeline {
     // Input disruptor: N producers (reader threads), 2+ parallel consumers.
     // MultiProducer allows lock-free concurrent publishing from all reader
     // threads, eliminating the Mutex that previously serialized access.
@@ -2308,7 +2266,7 @@ pub fn build_pipeline_with_replication(
     // This means: `min(journal_cursor, u64::MAX) = journal_cursor`.
     let replication_cursor = Arc::new(AtomicU64::new(u64::MAX));
 
-    (
+    Pipeline {
         input_producer,
         journal_stage,
         matching_stage,
@@ -2323,7 +2281,7 @@ pub fn build_pipeline_with_replication(
         shadow_consumer,
         chain_hash_lock,
         replication_ring_progress,
-    )
+    }
 }
 
 /// Build a pipeline for replica mode. Same disruptor stages as the primary
@@ -2336,24 +2294,13 @@ pub fn build_pipeline_with_replication(
 /// Returns the input producer (for the replication receiver), the pipeline
 /// stages, the journal cursor (for ack gating), and a `RawBatchSender`
 /// for sending raw journal batches to the journal stage.
-#[allow(clippy::type_complexity)]
 pub fn build_replica_pipeline(
     exchange: Exchange,
     writer: JournalWriter,
     max_journal_batch: usize,
     busy_spin: bool,
     enable_shadow: bool,
-) -> (
-    ring::MultiProducer<InputSlot>,
-    JournalStage,
-    MatchingStage,
-    ring::Consumer<OutputSlot>,
-    Arc<Sequence>,
-    Arc<Sequence>,
-    RawBatchSender,
-    Option<ring::Consumer<InputSlot>>,
-    Option<Arc<SeqLock<[u8; 32]>>>,
-) {
+) -> ReplicaPipeline {
     // Input disruptor: same topology as primary (journal + matching in parallel,
     // optional shadow gated on journal).
     let mut builder = ring::DisruptorBuilder::<InputSlot>::new(INPUT_RING_CAPACITY)
@@ -2421,17 +2368,17 @@ pub fn build_replica_pipeline(
         busy_spin,
     );
 
-    (
+    ReplicaPipeline {
         input_producer,
         journal_stage,
         matching_stage,
         drain_consumer,
         journal_cursor,
         matching_cursor,
-        raw_tx,
+        raw_journal_tx: raw_tx,
         shadow_consumer,
         chain_hash_lock,
-    )
+    }
 }
 
 #[cfg(test)]
@@ -2638,15 +2585,23 @@ mod tests {
         let writer = JournalWriter::create(&path).unwrap();
 
         let active_conns = Arc::new(AtomicU64::new(0));
-        let (
-            input_producer,
-            journal_stage,
-            matching_stage,
-            mut output_consumers,
-            journal_cursor,
-            _events_processed,
-        ) = build_pipeline(exchange, writer, Duration::ZERO, active_conns);
-        let mut output_consumer = output_consumers.pop().unwrap();
+        let mut out = build_pipeline_with_replication(
+            exchange,
+            writer,
+            Duration::ZERO,
+            active_conns,
+            false,
+            MAX_JOURNAL_BATCH,
+            REPLICATION_RING_CAPACITY,
+            false,
+            false,
+            false,
+        );
+        let input_producer = out.input_producer;
+        let journal_stage = out.journal_stage;
+        let matching_stage = out.matching_stage;
+        let journal_cursor = out.journal_cursor;
+        let mut output_consumer = out.output_consumers.pop().unwrap();
 
         let shutdown = Arc::new(AtomicBool::new(false));
         let s1 = Arc::clone(&shutdown);
@@ -2723,22 +2678,7 @@ mod tests {
         let writer = JournalWriter::create(&path).unwrap();
 
         let active_conns = Arc::new(AtomicU64::new(0));
-        let (
-            input_producer,
-            journal_stage,
-            matching_stage,
-            mut output_consumers,
-            journal_cursor,
-            _matching_cursor,
-            _events_processed,
-            _input_cursor,
-            replication_rx,
-            replication_cursor,
-            _replicas_connected,
-            _shadow_consumer,
-            _chain_hash_lock,
-            _ring_progress,
-        ) = build_pipeline_with_replication(
+        let mut out = build_pipeline_with_replication(
             exchange,
             writer,
             Duration::ZERO,
@@ -2750,19 +2690,26 @@ mod tests {
             false,
             false,
         );
-        let mut output_consumer = output_consumers.pop().unwrap();
+        let mut output_consumer = out.output_consumers.pop().unwrap();
 
-        let (mut repl_consumer, _repl_consumer_2) =
-            replication_rx.expect("replication should be enabled");
+        let (mut repl_consumer, _repl_consumer_2) = out
+            .replication_consumers
+            .expect("replication should be enabled");
 
         // Simulate a connected replica so the matching stage doesn't halt
         // and the journal stage publishes to replication rings.
-        if let Some(ref count) = _replicas_connected {
+        if let Some(ref count) = out.replicas_connected {
             count.store(1, Ordering::Relaxed);
         }
-        if let Some(ref rp) = _ring_progress {
+        if let Some(ref rp) = out.replication_ring_progress {
             rp.active_flags[0].store(true, Ordering::Relaxed);
         }
+
+        let journal_stage = out.journal_stage;
+        let matching_stage = out.matching_stage;
+        let input_producer = out.input_producer;
+        let journal_cursor = out.journal_cursor;
+        let replication_cursor = out.replication_cursor;
 
         let shutdown = Arc::new(AtomicBool::new(false));
         let s1 = Arc::clone(&shutdown);
@@ -2906,21 +2853,20 @@ mod tests {
             let writer = JournalWriter::create(&path).unwrap();
             let active_conns = Arc::new(AtomicU64::new(0));
 
-            let (_, _, _, _, _, _, _, _, replication, replication_cursor, _, _, _, _) =
-                build_pipeline_with_replication(
-                    exchange,
-                    writer,
-                    Duration::ZERO,
-                    active_conns,
-                    false,
-                    MAX_JOURNAL_BATCH,
-                    REPLICATION_RING_CAPACITY,
-                    false,
-                    false,
-                    false,
-                );
-            assert!(replication.is_none());
-            assert_eq!(replication_cursor.load(Ordering::Relaxed), u64::MAX);
+            let out = build_pipeline_with_replication(
+                exchange,
+                writer,
+                Duration::ZERO,
+                active_conns,
+                false,
+                MAX_JOURNAL_BATCH,
+                REPLICATION_RING_CAPACITY,
+                false,
+                false,
+                false,
+            );
+            assert!(out.replication_consumers.is_none());
+            assert_eq!(out.replication_cursor.load(Ordering::Relaxed), u64::MAX);
         }
 
         // Replication enabled — cursor still starts at u64::MAX.
@@ -2930,22 +2876,21 @@ mod tests {
             let writer = JournalWriter::create(&path).unwrap();
             let active_conns = Arc::new(AtomicU64::new(0));
 
-            let (_, _, _, _, _, _, _, _, replication, replication_cursor, _, _, _, _) =
-                build_pipeline_with_replication(
-                    exchange,
-                    writer,
-                    Duration::ZERO,
-                    active_conns,
-                    true,
-                    MAX_JOURNAL_BATCH,
-                    REPLICATION_RING_CAPACITY,
-                    false,
-                    false,
-                    false,
-                );
-            assert!(replication.is_some());
+            let out = build_pipeline_with_replication(
+                exchange,
+                writer,
+                Duration::ZERO,
+                active_conns,
+                true,
+                MAX_JOURNAL_BATCH,
+                REPLICATION_RING_CAPACITY,
+                false,
+                false,
+                false,
+            );
+            assert!(out.replication_consumers.is_some());
             assert_eq!(
-                replication_cursor.load(Ordering::Relaxed),
+                out.replication_cursor.load(Ordering::Relaxed),
                 u64::MAX,
                 "replication cursor should start at MAX even when enabled"
             );
@@ -3362,30 +3307,22 @@ mod tests {
         // Build the replica pipeline.
         let exchange = Exchange::new();
         let writer = crate::journal::writer::JournalWriter::create(&replica_path).unwrap();
-        let (
-            input_producer,
-            journal_stage,
-            matching_stage,
-            drain_consumer,
-            journal_cursor,
-            _matching_cursor,
-            raw_tx,
-            _shadow_consumer,
-            _chain_hash_lock,
-        ) = build_replica_pipeline(exchange, writer, MAX_JOURNAL_BATCH, false, false);
+        let out = build_replica_pipeline(exchange, writer, MAX_JOURNAL_BATCH, false, false);
 
         let shutdown = Arc::new(AtomicBool::new(false));
 
         let s = Arc::clone(&shutdown);
+        let journal_stage = out.journal_stage;
         let j_handle = std::thread::spawn(move || journal_stage.run(&s));
 
         let s = Arc::clone(&shutdown);
+        let matching_stage = out.matching_stage;
         let m_handle = std::thread::spawn(move || matching_stage.run(&s));
 
         // Drain output so matching stage doesn't block.
         let s = Arc::clone(&shutdown);
         let d_handle = std::thread::spawn(move || {
-            let mut consumer = drain_consumer;
+            let mut consumer = out.drain_consumer;
             let mut batch = vec![OutputSlot::default(); 64];
             loop {
                 if s.load(Ordering::Relaxed) {
@@ -3398,6 +3335,10 @@ mod tests {
             }
         });
 
+        let input_producer = out.input_producer;
+        let raw_journal_tx = out.raw_journal_tx;
+        let journal_cursor = out.journal_cursor;
+
         // Publish event to disruptor and raw bytes to journal stage.
         input_producer.publish(InputSlot {
             connection_id: 0,
@@ -3407,7 +3348,7 @@ mod tests {
             publish_ts: trace_ts(),
             recv_ts: trace_ts(),
         });
-        raw_tx.send(&raw_bytes, FIRST_SEQ, [0u8; 32], 1);
+        raw_journal_tx.send(&raw_bytes, FIRST_SEQ, [0u8; 32], 1);
 
         // Wait for journal cursor.
         let deadline = std::time::Instant::now() + Duration::from_secs(2);
@@ -3420,7 +3361,7 @@ mod tests {
         }
 
         // Shut down pipeline.
-        drop(raw_tx); // unblock journal stage
+        drop(raw_journal_tx); // unblock journal stage
         shutdown.store(true, Ordering::Relaxed);
         let _writer = j_handle.join().unwrap();
         let exchange = m_handle.join().unwrap();

@@ -1043,23 +1043,21 @@ pub fn run_receiver_dpdk(
 
         // Build the replica pipeline — same as the TCP receiver.
         let enable_shadow = snapshot_interval_secs > 0;
-        let (
-            input_producer,
-            journal_stage,
-            matching_stage,
-            drain_consumer,
-            journal_cursor,
-            _matching_cursor,
-            raw_journal_tx,
-            shadow_consumer,
-            chain_hash_lock,
-        ) = melin_engine::journal::pipeline::build_replica_pipeline(
+        let pipeline = melin_engine::journal::pipeline::build_replica_pipeline(
             cur_exchange,
             cur_writer,
             4096,
             false,
             enable_shadow,
         );
+        let input_producer = pipeline.input_producer;
+        let journal_stage = pipeline.journal_stage;
+        let matching_stage = pipeline.matching_stage;
+        let drain_consumer = pipeline.drain_consumer;
+        let journal_cursor = pipeline.journal_cursor;
+        let raw_journal_tx = pipeline.raw_journal_tx;
+        let shadow_consumer = pipeline.shadow_consumer;
+        let chain_hash_lock = pipeline.chain_hash_lock;
 
         let pipeline_shutdown = Arc::new(AtomicBool::new(false));
 

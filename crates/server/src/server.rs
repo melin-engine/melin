@@ -24,7 +24,7 @@ use tracing::{debug, error, info, warn};
 use melin_engine::exchange::Exchange;
 use melin_engine::journal::JournaledExchange;
 use melin_engine::journal::error::JournalError;
-use melin_engine::journal::pipeline::build_pipeline_with_replication;
+use melin_engine::journal::pipeline::{Pipeline, build_pipeline_with_replication};
 use melin_engine::journal::writer::JournalWriter;
 
 use melin_protocol::auth::{AuthorizedKeys, Permission};
@@ -672,7 +672,7 @@ fn run_as_primary<L: BlockingTransportListener>(
 
     // Build the disruptor pipeline with optional replication consumer.
     let enable_event_publisher = config.event_bind.is_some();
-    let (
+    let Pipeline {
         input_producer,
         journal_stage,
         matching_stage,
@@ -687,7 +687,7 @@ fn run_as_primary<L: BlockingTransportListener>(
         shadow_consumer,
         chain_hash_lock,
         replication_ring_progress,
-    ) = build_pipeline_with_replication(
+    } = build_pipeline_with_replication(
         exchange,
         writer,
         config.group_commit_delay(),
@@ -1493,7 +1493,7 @@ pub fn run_dpdk(
     // Build disruptor pipeline (same flags as the kernel TCP path).
     let enable_event_publisher = config.event_bind.is_some();
     let enable_shadow = config.snapshot_interval_secs > 0;
-    let (
+    let Pipeline {
         input_producer,
         journal_stage,
         matching_stage,
@@ -1508,7 +1508,7 @@ pub fn run_dpdk(
         shadow_consumer,
         chain_hash_lock,
         replication_ring_progress,
-    ) = build_pipeline_with_replication(
+    } = build_pipeline_with_replication(
         exchange,
         writer,
         config.group_commit_delay(),

@@ -232,14 +232,6 @@ impl BookSide {
         }
     }
 
-    /// Get an immutable reference to the queue at a price level.
-    fn get(&self, price: Price) -> Option<&VecDeque<RestingOrder>> {
-        match self.search(price) {
-            Ok(idx) => Some(&self.levels[idx].1),
-            Err(_) => None,
-        }
-    }
-
     /// Remove the price level entirely.
     fn remove_level(&mut self, price: Price) {
         if let Ok(idx) = self.search(price) {
@@ -527,28 +519,6 @@ impl OrderBook {
         order_id: OrderId,
     ) -> Option<(Side, Price, ReservationSlot)> {
         self.order_index.get(&(account, order_id)).copied()
-    }
-
-    /// Look up a resting order's current state: (side, price, remaining).
-    /// Returns `None` if the order is not on the book.
-    /// NOTE: This performs an O(n) VecDeque scan to find `remaining`. If you
-    /// only need side/price, use `peek_order_location` instead.
-    #[allow(dead_code)]
-    pub(crate) fn get_resting_order(
-        &self,
-        account: AccountId,
-        order_id: OrderId,
-    ) -> Option<(Side, Price, Quantity)> {
-        let &(side, price, _slot) = self.order_index.get(&(account, order_id))?;
-        let book_side = match side {
-            Side::Buy => &self.bids,
-            Side::Sell => &self.asks,
-        };
-        let level = book_side.get(price)?;
-        let order = level
-            .iter()
-            .find(|o| o.id == order_id && o.account == account)?;
-        Some((side, price, order.remaining))
     }
 
     /// Best bid price (highest), or `None` if the bid side is empty.
