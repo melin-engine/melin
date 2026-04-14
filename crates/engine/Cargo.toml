@@ -4,13 +4,10 @@ version = "0.1.0"
 edition = "2024"
 
 [features]
-## Skip all fsync calls in the journal writer. Unsafe for production — data
-## will not survive crashes — but useful for benchmarking to isolate I/O cost.
-no-fsync = []
-## Skip all journal I/O (no writes, no fsync). Implies `no-fsync`. Unsafe for
-## production — nothing is persisted — but useful for benchmarking to measure
-## pure pipeline + matching latency without any disk I/O.
-no-persist = ["no-fsync"]
+## Skip all journal I/O (no writes, no fsync). Unsafe for production —
+## nothing is persisted — but useful for benchmarking to measure pure
+## pipeline + matching latency without any disk I/O.
+no-persist = []
 ## Record per-stage latency histograms and print a summary on shutdown.
 ## Adds ~20ns of clock overhead per event. Not for production.
 latency-trace = ["dep:hdrhistogram"]

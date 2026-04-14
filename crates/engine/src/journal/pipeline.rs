@@ -248,13 +248,9 @@ pub struct JournalStage {
     /// write, allowing more events to accumulate in the batch. At high
     /// event rates, the batch fills naturally and the delay rarely fires.
     /// Zero means sync immediately (no delay).
-    /// Only read when fsync is enabled (not `no-fsync` feature).
-    #[cfg_attr(feature = "no-fsync", allow(dead_code))]
     group_commit_delay: Duration,
     /// Maximum events per journal fsync batch. Capped at MAX_JOURNAL_BATCH
     /// (the stack array size). Smaller values reduce tail latency.
-    /// Only read when fsync is enabled (not `no-fsync` feature).
-    #[cfg_attr(feature = "no-fsync", allow(dead_code))]
     max_batch: usize,
     /// Replication state, boxed to keep the struct small on the hot path.
     /// In standalone mode this is a null-like default (no producers, no
@@ -639,15 +635,15 @@ impl JournalStage {
     /// Run the journal stage loop.
     ///
     /// Dispatches to the io_uring overlapped path for journal writes.
-    /// With `no-fsync` or `no-persist` features, falls back to
-    /// synchronous writes (io_uring overlapping is only useful with fsync).
+    /// With the `no-persist` feature, falls back to synchronous writes
+    /// (io_uring overlapping is only useful with actual disk I/O).
     ///
     /// Returns the `JournalWriter` on shutdown for clean resource release.
     pub fn run(
         self,
         shutdown: &std::sync::atomic::AtomicBool,
     ) -> Result<JournalWriter, JournalError> {
-        let use_uring = !cfg!(feature = "no-fsync") && !cfg!(feature = "no-persist");
+        let use_uring = !cfg!(feature = "no-persist");
 
         if self.raw_journal_rx.is_some() {
             // Replica mode: write raw bytes from the replication receiver.
@@ -675,18 +671,15 @@ impl JournalStage {
         mut self,
         shutdown: &std::sync::atomic::AtomicBool,
     ) -> Result<JournalWriter, JournalError> {
-        #[cfg(not(feature = "no-fsync"))]
         use std::time::Instant;
 
         let mut batch = [InputSlot::default(); MAX_JOURNAL_BATCH];
-        #[cfg(not(feature = "no-fsync"))]
         let delay = self.group_commit_delay;
         let mut idle_spins: u32 = 0;
 
         // Total events encoded since last sync/commit.
         let mut pending: usize = 0;
         // Timestamp of first unsynced write (for group commit delay).
-        #[cfg(not(feature = "no-fsync"))]
         let mut first_write_ts: Option<Instant> = None;
 
         let mut busy_count: u64 = 0;
@@ -776,7 +769,6 @@ impl JournalStage {
                     }
                 }
                 pending += count;
-                #[cfg(not(feature = "no-fsync"))]
                 if first_write_ts.is_none() {
                     first_write_ts = Some(Instant::now());
                 }
@@ -790,12 +782,9 @@ impl JournalStage {
 
             // Sync when: we have data AND (batch full OR delay expired OR no delay).
             if pending > 0 {
-                #[cfg(not(feature = "no-fsync"))]
                 let should_sync = pending >= self.max_batch
                     || delay.is_zero()
                     || first_write_ts.is_some_and(|ts| ts.elapsed() >= delay);
-                #[cfg(feature = "no-fsync")]
-                let should_sync = true;
 
                 if should_sync {
                     #[cfg(not(feature = "no-persist"))]
@@ -838,10 +827,7 @@ impl JournalStage {
                     self.publish_chain_hash();
 
                     pending = 0;
-                    #[cfg(not(feature = "no-fsync"))]
-                    {
-                        first_write_ts = None;
-                    }
+                    first_write_ts = None;
                 }
             } else {
                 idle_count += 1;

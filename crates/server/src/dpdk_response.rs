@@ -104,15 +104,7 @@ pub fn run(
     let mut encode_buf = [0u8; MAX_RESPONSE_BUF];
 
     // Cached durability position (see response.rs for full explanation).
-    #[cfg(not(feature = "no-fsync"))]
     let mut cached_durable_pos: u64 = 0;
-    #[cfg(feature = "no-fsync")]
-    let _ = (
-        &journal_cursor,
-        &replication_cursor,
-        &fastest_replica_cursor,
-        quorum_durability,
-    );
 
     // Pre-encode heartbeat frame (fixed-size, no heap allocation).
     let mut heartbeat_frame = [0u8; 8];
@@ -191,7 +183,6 @@ pub fn run(
         busy_count += 1;
 
         // Wait for durability (see response.rs for full explanation).
-        #[cfg(not(feature = "no-fsync"))]
         {
             let max_seq = batch[..count]
                 .iter()

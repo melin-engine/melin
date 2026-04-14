@@ -5,7 +5,6 @@ edition = "2024"
 
 [features]
 default = []
-no-fsync = ["melin-engine/no-fsync"]
 no-persist = ["melin-server/no-persist"]
 latency-trace = ["melin-server/latency-trace"]
 ## Kept for backward compatibility — io_uring is now always used.

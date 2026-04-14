@@ -21,7 +21,6 @@ Builds the full disruptor pipeline (journal + matching stages on separate OS thr
 ```sh
 cargo run --release -p melin-bench -- --mode=pipeline 1000000
 cargo run --release -p melin-bench --features no-persist -- --mode=pipeline 1000000   # skip journal I/O
-cargo run --release -p melin-bench --features no-fsync  -- --mode=pipeline 1000000    # journal writes, no fsync
 ```
 
 ### `--mode=roundtrip` (default)
@@ -71,7 +70,6 @@ Generator parameters are drawn from published academic research on limit order b
 
 | Feature | Effect |
 |---------|--------|
-| `no-fsync` | Skip fsync calls (journal still writes, but no durability guarantee) |
 | `no-persist` | Skip all journal I/O (no writes, no fsync) |
 | `io-uring` | Use io_uring for async fsync with group commit |
 | `latency-trace` | Print per-stage latency histograms on shutdown |

@@ -484,21 +484,13 @@ impl JournalWriter {
     /// write instead of write + full cache flush (`fdatasync`). This
     /// reduces sync latency from ~1-7 ms to ~10-100 µs for small writes.
     ///
-    /// Falls back to plain `pwrite` when the `no-fsync` feature is enabled.
     pub fn flush_batch_sync(&mut self) -> Result<(), JournalError> {
         if self.batch_buf.is_empty() {
             return Ok(());
         }
         self.ensure_allocated(self.batch_buf.len() as u64)?;
 
-        #[cfg(not(feature = "no-fsync"))]
-        {
-            pwritev2_dsync(self.file.as_raw_fd(), &self.batch_buf, self.write_pos)?;
-        }
-        #[cfg(feature = "no-fsync")]
-        {
-            self.file.write_all_at(&self.batch_buf, self.write_pos)?;
-        }
+        pwritev2_dsync(self.file.as_raw_fd(), &self.batch_buf, self.write_pos)?;
 
         // Hash chain is NOT finalized per-flush — only at checkpoint
         // boundaries. This ensures the chain is deterministic regardless of
@@ -588,7 +580,6 @@ impl JournalWriter {
     /// Legacy sync path — only used during shutdown drain. Production
     /// hot path uses `flush_batch_sync()` (pwritev2 + RWF_DSYNC) instead.
     pub fn sync(&mut self) -> Result<(), JournalError> {
-        #[cfg(not(feature = "no-fsync"))]
         self.file.sync_data()?;
         Ok(())
     }
@@ -676,14 +667,7 @@ impl JournalWriter {
         }
         self.ensure_allocated(data.len() as u64)?;
 
-        #[cfg(not(feature = "no-fsync"))]
-        {
-            pwritev2_dsync(self.file.as_raw_fd(), data, self.write_pos)?;
-        }
-        #[cfg(feature = "no-fsync")]
-        {
-            self.file.write_all_at(data, self.write_pos)?;
-        }
+        pwritev2_dsync(self.file.as_raw_fd(), data, self.write_pos)?;
 
         self.write_pos += data.len() as u64;
         self.next_sequence += entry_count;
@@ -720,7 +704,6 @@ impl JournalWriter {
 /// of write + full cache flush. Much faster than write + fdatasync for small
 /// writes because FUA only persists the written sectors, while fdatasync
 /// drains the entire NVMe write queue.
-#[cfg(not(feature = "no-fsync"))]
 fn pwritev2_dsync(
     fd: std::os::unix::io::RawFd,
     buf: &[u8],

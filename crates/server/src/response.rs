@@ -100,16 +100,7 @@ pub fn run(
     // Cached durability position to avoid atomic reads on every slot.
     // This is the minimum confirmed-durable sequence across all durability
     // sources (journal + replication, or replication-only in quorum mode).
-    #[cfg(not(feature = "no-fsync"))]
     let mut cached_durable_pos: u64 = 0;
-    // Suppress unused warnings when journal gating is disabled.
-    #[cfg(feature = "no-fsync")]
-    let _ = (
-        &journal_cursor,
-        &replication_cursor,
-        &fastest_replica_cursor,
-        quorum_durability,
-    );
 
     #[cfg(feature = "latency-trace")]
     let mut spsc_hist =
@@ -288,7 +279,6 @@ pub fn run(
         //
         // Without quorum (--no-quorum-durability): gate on
         // min(journal_cursor, replication_cursor) as before.
-        #[cfg(not(feature = "no-fsync"))]
         {
             let max_seq = batch[..count]
                 .iter()

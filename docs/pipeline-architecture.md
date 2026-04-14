@@ -255,7 +255,6 @@ Because the journal and matching consumers run in parallel (not chained), the ma
 | Feature | Effect |
 |---------|--------|
 | `no-persist` | Disables journal writes entirely. Events are still sequenced through the disruptor but not written to disk. Used for benchmarking engine throughput without I/O overhead. |
-| `no-fsync` | Disables `RWF_DSYNC` / `fdatasync`. Events are written to the journal file but not synced. The journal cursor advances immediately after encoding (no sync trigger logic). Useful for development. |
 | `pipeline-stats` | Enables busy/idle utilization counters on each stage. Printed on shutdown showing percentage busy, total busy iterations, and total idle iterations. |
 | `latency-trace` | Enables per-event timestamps at each pipeline boundary. Tracks: disruptor wakeup latency (publish to consume), batch processing time, SPSC wakeup latency, dispatch latency, and server-side end-to-end (reader recv to response flush). Histograms are printed on shutdown. The `TraceTimestamp` type is `()` (zero-sized) when disabled, so there is no overhead in production builds. |
 | `io-uring` | No-op (kept for backward compatibility). io_uring is now always used for readers, response writes, and replication I/O. |

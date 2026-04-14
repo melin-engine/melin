@@ -382,7 +382,6 @@ The journal participates in a 3-stage LMAX disruptor pipeline:
 | Feature | Effect |
 |---------|--------|
 | `no-persist` | Journal stage skips all I/O. Cursor advances immediately. For benchmarking the pipeline + network ceiling. |
-| `no-fsync` | Journal stage writes but does not sync. Data may be lost on crash. For testing only. |
 | `pipeline-stats` | Prints per-stage busy/idle utilization percentages on shutdown. |
 | `latency-trace` | Records per-event, per-stage latency in histograms (adds timestamp fields to slots). |
 

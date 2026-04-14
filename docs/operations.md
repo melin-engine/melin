@@ -642,7 +642,6 @@ melin-admin <server-addr> <admin-key-file>
 | `io-uring` | **yes** | Use io_uring for journal writes. Falls back to `pwritev2` if disabled. |
 | `pipeline-stats` | no | Per-stage busy/idle counters for bottleneck analysis. |
 | `latency-trace` | no | Per-stage HDR histograms (adds ~tens of ns overhead per event). |
-| `no-fsync` | no | Skip all fsync calls and journal-cursor gating. **Unsafe for production** — data may not survive crashes. Useful for benchmarking to isolate I/O cost. |
 | `no-persist` | no | Skip journal writes entirely. **Unsafe for production.** |
 
 ### Pipeline Utilization
