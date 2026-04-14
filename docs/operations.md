@@ -799,6 +799,7 @@ For best journal performance, use an NVMe drive with:
 
 - **Power Loss Protection (PLP)**: Ensures FUA writes are truly durable. Without PLP, the drive's write cache may lie about durability.
 - **Dedicated journal disk**: Avoids contention with OS I/O. The journal writer uses io_uring (default) or `pwritev2` with `RWF_DSYNC` (FUA) which bypasses the page cache, but sharing the disk with other workloads increases p99 latency.
+- **Mount with `noatime`**: Prevents inode mtime/atime updates on every write. Without `noatime`, these metadata changes accumulate in ext4's jbd2 transaction buffer and trigger periodic full cache flushes (~1-2ms stalls every few seconds).
 
 ---
 

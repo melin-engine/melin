@@ -215,6 +215,7 @@ impl JournalWriter {
 
         let write_pos = FILE_HEADER_SIZE as u64;
         let allocated_end = preallocate(&file, write_pos)?;
+        zero_range_extents(&file, write_pos, allocated_end);
 
         // Pre-fault all pages in the preallocated region so the first write
         // to each 4 KB page doesn't trigger a page fault on the hot path.
@@ -690,7 +691,9 @@ impl JournalWriter {
         if self.write_pos + bytes_needed <= self.allocated_end {
             return Ok(());
         }
+        let old_end = self.allocated_end;
         self.allocated_end = preallocate(&self.file, self.write_pos)?;
+        zero_range_extents(&self.file, old_end, self.allocated_end);
         Ok(())
     }
 }
@@ -760,6 +763,43 @@ fn preallocate(file: &File, current_end: u64) -> Result<u64, JournalError> {
     // correct, just without the full metadata-skip benefit on fsync.
     file.set_len(target)?;
     Ok(target)
+}
+
+/// Mark pre-allocated extents as written zeros using `FALLOC_FL_ZERO_RANGE`.
+///
+/// On ext4, `posix_fallocate` creates "unwritten" extents. The first write
+/// to an unwritten block triggers a metadata status change (unwritten →
+/// written) that goes into the ext4 jbd2 transaction buffer. Every ~5s
+/// (default `commit` interval), jbd2 commits these transactions with a full
+/// NVMe cache flush (`REQ_PREFLUSH`), stalling concurrent `pwritev2+RWF_DSYNC`
+/// writes for 1-2ms.
+///
+/// `FALLOC_FL_ZERO_RANGE` pre-converts extents to "written + zeroed",
+/// eliminating per-write metadata updates and the resulting jbd2 flush storms.
+///
+/// Best-effort: failures are logged at warn level and ignored. The fallback
+/// is periodic 1-2ms tail latency spikes, not data loss.
+fn zero_range_extents(file: &File, start: u64, end: u64) {
+    if start >= end {
+        return;
+    }
+    // FALLOC_FL_ZERO_RANGE = 0x10
+    let ret = unsafe {
+        libc::fallocate(
+            file.as_raw_fd(),
+            0x10,
+            start as libc::off_t,
+            (end - start) as libc::off_t,
+        )
+    };
+    if ret < 0 {
+        tracing::warn!(
+            errno = unsafe { *libc::__errno_location() },
+            start,
+            end,
+            "FALLOC_FL_ZERO_RANGE failed — expect periodic 1-2ms tail latency spikes"
+        );
+    }
 }
 
 /// Wall-clock nanoseconds since Unix epoch. Used for informational timestamps
