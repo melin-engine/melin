@@ -119,6 +119,8 @@ Total order size: 24 bytes (Market, no expiry) to 48 bytes (StopLimit + GTD expi
 | 35  | DisableInstrument | Operator          | 4                    |
 | 36  | EnableInstrument  | Operator          | 4                    |
 | 37  | RemoveInstrument  | Operator          | 4                    |
+| 38  | Subscribe         | Any (internal)    | 1 + count×4          |
+| 39  | QueryPosition     | Trader            | 4                    |
 
 Payload sizes above exclude the 1-byte tag and 8-byte seq. The frame length = 8 (seq) + 1 (tag) + payload size.
 
@@ -280,6 +282,25 @@ Re-enables a previously disabled instrument for trading.
 
 Permanently removes a disabled instrument. Only succeeds if the instrument is disabled and has no resting orders.
 
+### Tag 38: Subscribe
+
+Sent by the market-data gateway's internal consumer to the event publisher after authentication. Requests book snapshots and a live event firehose for the listed symbols.
+
+| Offset | Field   | Size          |
+|--------|---------|---------------|
+| 0      | count   | 1 (u8)        |
+| 1      | symbols | count×4 (u32) |
+
+`count = 0` subscribes to all symbols. Maximum 8 symbols per request (fixed-size array avoids heap allocation on the codec hot path).
+
+### Tag 39: QueryPosition
+
+Query account balances. Flows through the pipeline so the matching stage can read Exchange state without concurrency issues.
+
+| Offset | Field   | Size     |
+|--------|---------|----------|
+| 0      | account | 4 (u32)  |
+
 ---
 
 ## Response Messages (Server to Client)
@@ -301,6 +322,11 @@ Permanently removes a disabled instrument. Only succeeds if the instrument is di
 | 23  | StatsHeader              | 24           |
 | 24  | ServerBusy               | 0            |
 | 25  | InstrumentStatusChanged  | 5            |
+| 40  | BookSnapshotBegin        | 12           |
+| 41  | BookSnapshotLevel        | 25           |
+| 42  | BookSnapshotEnd          | 8            |
+| 43  | SnapshotComplete         | 8            |
+| 44  | PositionSnapshot         | 5 + count×20 |
 
 ### Tag 11: Placed
 
@@ -448,6 +474,64 @@ Reports a change in instrument lifecycle status.
 | 4      | status | 1        |
 
 **Status codes**: 0 = Enabled, 1 = Disabled, 2 = Removed.
+
+### Tag 40: BookSnapshotBegin
+
+Start of a book snapshot for one symbol. Sent by the event publisher during the Subscribe handshake.
+
+| Offset | Field            | Size     |
+|--------|------------------|----------|
+| 0      | symbol           | 4 (u32)  |
+| 4      | last_applied_seq | 8 (u64)  |
+
+### Tag 41: BookSnapshotLevel
+
+One price level in a book snapshot.
+
+| Offset | Field       | Size     |
+|--------|-------------|----------|
+| 0      | symbol      | 4 (u32)  |
+| 4      | side        | 1        |
+| 5      | price       | 8 (u64)  |
+| 13     | qty         | 8 (u64)  |
+| 21     | order_count | 4 (u32)  |
+
+### Tag 42: BookSnapshotEnd
+
+End of a book snapshot for one symbol.
+
+| Offset | Field       | Size     |
+|--------|-------------|----------|
+| 0      | symbol      | 4 (u32)  |
+| 4      | level_count | 4 (u32)  |
+
+### Tag 43: SnapshotComplete
+
+All requested book snapshots have been sent. The firehose resumes from `last_applied_seq + 1`.
+
+| Offset | Field            | Size     |
+|--------|------------------|----------|
+| 0      | last_applied_seq | 8 (u64)  |
+
+### Tag 44: PositionSnapshot
+
+Account balance snapshot in response to QueryPosition.
+
+| Offset | Field    | Size          |
+|--------|----------|---------------|
+| 0      | account  | 4 (u32)       |
+| 4      | count    | 1 (u8)        |
+| 5      | balances | count×20      |
+
+Each balance entry (20 bytes):
+
+| Offset | Field    | Size     |
+|--------|----------|----------|
+| 0      | currency | 4 (u32)  |
+| 4      | free     | 8 (u64)  |
+| 12     | reserved | 8 (u64)  |
+
+Maximum 16 entries per snapshot (capped by the engine).
 
 ---
 
