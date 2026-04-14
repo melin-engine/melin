@@ -993,7 +993,7 @@ impl JournalStage {
             // --- Shutdown ---
             if shutdown.load(Ordering::Relaxed) {
                 if let Some(inf) = inflight.take() {
-                    self.wait_for_cqe(&mut ring, inf.slot.len());
+                    self.wait_for_cqe(&mut ring, inf.slot.len())?;
                     self.consume_disruptor_events(&mut batch, inf.entry_count);
                     // `inf.slot` drops at end of scope, releasing it.
                 }
@@ -1295,16 +1295,14 @@ impl JournalStage {
             if shutdown.load(std::sync::atomic::Ordering::Relaxed) {
                 // Wait for in-flight write to complete.
                 if let Some((batch_data, seq)) = inflight.take() {
-                    self.wait_for_cqe(&mut ring, batch_data.buf.len());
+                    self.wait_for_cqe(&mut ring, batch_data.buf.len())?;
                     self.consumer.set_progress(seq);
                     self.publish_chain_hash();
                     self.writer.confirm_async_write(batch_data);
                 }
                 // Flush any pending buffered data synchronously.
                 if pending > 0 {
-                    if let Err(e) = self.writer.flush_batch_sync() {
-                        tracing::error!(error = %e, "journal sync error on shutdown");
-                    }
+                    self.writer.flush_batch_sync()?;
                     self.consumer.commit(pending);
                 }
                 self.drain_remaining(&mut batch);
@@ -1323,13 +1321,16 @@ impl JournalStage {
             {
                 let result = cqe.result();
                 if result < 0 {
-                    tracing::error!(errno = -result, "io_uring journal write failed");
+                    return Err(JournalError::Io(std::io::Error::other(format!(
+                        "io_uring journal write failed (errno {})",
+                        -result
+                    ))));
                 } else if (result as usize) != batch_data.buf.len() {
-                    tracing::error!(
-                        written = result,
-                        expected = batch_data.buf.len(),
-                        "io_uring journal short write"
-                    );
+                    return Err(JournalError::Io(std::io::Error::other(format!(
+                        "io_uring journal short write ({} of {} bytes)",
+                        result,
+                        batch_data.buf.len()
+                    ))));
                 }
                 // Advance cursor: these events are now durable.
                 self.consumer.set_progress(seq);
@@ -1380,13 +1381,16 @@ impl JournalStage {
             {
                 let result = cqe.result();
                 if result < 0 {
-                    tracing::error!(errno = -result, "io_uring journal write failed");
+                    return Err(JournalError::Io(std::io::Error::other(format!(
+                        "io_uring journal write failed (errno {})",
+                        -result
+                    ))));
                 } else if (result as usize) != batch_data.buf.len() {
-                    tracing::error!(
-                        written = result,
-                        expected = batch_data.buf.len(),
-                        "io_uring journal short write"
-                    );
+                    return Err(JournalError::Io(std::io::Error::other(format!(
+                        "io_uring journal short write ({} of {} bytes)",
+                        result,
+                        batch_data.buf.len()
+                    ))));
                 }
                 self.consumer.set_progress(seq);
                 self.publish_chain_hash();
@@ -1413,7 +1417,7 @@ impl JournalStage {
                     // If a write is still in-flight, block until it completes
                     // (backpressure — both buffers full).
                     if let Some((batch_data, seq)) = inflight.take() {
-                        self.wait_for_cqe(&mut ring, batch_data.buf.len());
+                        self.wait_for_cqe(&mut ring, batch_data.buf.len())?;
                         self.consumer.set_progress(seq);
                         self.publish_chain_hash();
                         self.writer.confirm_async_write(batch_data);
@@ -1490,20 +1494,26 @@ impl JournalStage {
     /// IRQ affinity) and become visible here via the shared memory mapping.
     /// The journal thread is pinned to a dedicated core, so busy-polling
     /// is appropriate and avoids kernel sleep/wake jitter entirely.
-    fn wait_for_cqe(&self, ring: &mut io_uring::IoUring, expected_len: usize) {
+    fn wait_for_cqe(
+        &self,
+        ring: &mut io_uring::IoUring,
+        expected_len: usize,
+    ) -> Result<(), JournalError> {
         loop {
             if let Some(cqe) = ring.completion().next() {
                 let result = cqe.result();
                 if result < 0 {
-                    tracing::error!(errno = -result, "io_uring journal write failed (drain)");
+                    return Err(JournalError::Io(std::io::Error::other(format!(
+                        "io_uring journal write failed (errno {})",
+                        -result
+                    ))));
                 } else if (result as usize) != expected_len {
-                    tracing::error!(
-                        written = result,
-                        expected = expected_len,
-                        "io_uring journal short write (drain)"
-                    );
+                    return Err(JournalError::Io(std::io::Error::other(format!(
+                        "io_uring journal short write ({} of {expected_len} bytes)",
+                        result,
+                    ))));
                 }
-                return;
+                return Ok(());
             }
             std::hint::spin_loop();
         }
