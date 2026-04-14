@@ -38,21 +38,21 @@ const INPUT_QUEUE_CAPACITY: u64 = 1 << 20;
 
 /// Shared monitoring state passed to the health loop.
 /// Bundles all the atomics/cursors into one struct to avoid parameter explosion.
-struct HealthState {
-    active_connections: Arc<AtomicU64>,
-    events_processed: Arc<AtomicU64>,
-    journal_cursor: Arc<Sequence>,
-    matching_cursor: Arc<Sequence>,
-    input_cursor: Box<dyn QueueCursor>,
-    replication_cursor: Arc<AtomicU64>,
-    pipeline_healthy: Arc<AtomicBool>,
-    replicas_connected: Option<Arc<AtomicU32>>,
+pub struct HealthState {
+    pub active_connections: Arc<AtomicU64>,
+    pub events_processed: Arc<AtomicU64>,
+    pub journal_cursor: Arc<Sequence>,
+    pub matching_cursor: Arc<Sequence>,
+    pub input_cursor: Box<dyn QueueCursor>,
+    pub replication_cursor: Arc<AtomicU64>,
+    pub pipeline_healthy: Arc<AtomicBool>,
+    pub replicas_connected: Option<Arc<AtomicU32>>,
     /// Per-replica replication metrics. None in standalone mode.
-    replication_metrics: Option<Arc<crate::replication::ReplicationMetrics>>,
+    pub replication_metrics: Option<Arc<crate::replication::ReplicationMetrics>>,
     /// Per-stage busy/idle utilization counters.
-    journal_utilization: Arc<StageUtilization>,
-    matching_utilization: Arc<StageUtilization>,
-    response_utilization: Arc<StageUtilization>,
+    pub journal_utilization: Arc<StageUtilization>,
+    pub matching_utilization: Arc<StageUtilization>,
+    pub response_utilization: Arc<StageUtilization>,
 }
 
 /// Spawn the health endpoint thread. Returns the join handle.
@@ -63,21 +63,9 @@ struct HealthState {
 ///
 /// `pipeline_healthy` should be set to `true` at startup and flipped to
 /// `false` by the accept loop when a pipeline thread dies or on shutdown.
-#[allow(clippy::too_many_arguments)] // Bundled into HealthState internally.
 pub fn spawn(
     bind_addr: SocketAddr,
-    active_connections: Arc<AtomicU64>,
-    events_processed: Arc<AtomicU64>,
-    journal_cursor: Arc<Sequence>,
-    matching_cursor: Arc<Sequence>,
-    input_cursor: Box<dyn QueueCursor>,
-    replication_cursor: Arc<AtomicU64>,
-    pipeline_healthy: Arc<AtomicBool>,
-    replicas_connected: Option<Arc<AtomicU32>>,
-    replication_metrics: Option<Arc<crate::replication::ReplicationMetrics>>,
-    journal_utilization: Arc<StageUtilization>,
-    matching_utilization: Arc<StageUtilization>,
-    response_utilization: Arc<StageUtilization>,
+    state: HealthState,
     shutdown: Arc<AtomicBool>,
 ) -> Result<std::thread::JoinHandle<()>, std::io::Error> {
     let listener = TcpListener::bind(bind_addr)?;
@@ -85,21 +73,6 @@ pub fn spawn(
     listener.set_nonblocking(true)?;
 
     info!(addr = %bind_addr, "health endpoint listening");
-
-    let state = HealthState {
-        active_connections,
-        events_processed,
-        journal_cursor,
-        matching_cursor,
-        input_cursor,
-        replication_cursor,
-        pipeline_healthy,
-        replicas_connected,
-        replication_metrics,
-        journal_utilization,
-        matching_utilization,
-        response_utilization,
-    };
 
     let handle = std::thread::Builder::new()
         .name("health".into())
@@ -718,18 +691,20 @@ mod tests {
 
         let handle = spawn(
             "127.0.0.1:0".parse().unwrap(),
-            Arc::clone(&active),
-            Arc::clone(&events),
-            Arc::clone(&journal),
-            Arc::clone(&matching),
-            Box::new(MockCursor(AtomicU64::new(99))),
-            Arc::clone(&repl),
-            Arc::clone(&healthy),
-            None,
-            None,
-            Arc::new(StageUtilization::new()),
-            Arc::new(StageUtilization::new()),
-            Arc::new(StageUtilization::new()),
+            HealthState {
+                active_connections: Arc::clone(&active),
+                events_processed: Arc::clone(&events),
+                journal_cursor: Arc::clone(&journal),
+                matching_cursor: Arc::clone(&matching),
+                input_cursor: Box::new(MockCursor(AtomicU64::new(99))),
+                replication_cursor: Arc::clone(&repl),
+                pipeline_healthy: Arc::clone(&healthy),
+                replicas_connected: None,
+                replication_metrics: None,
+                journal_utilization: Arc::new(StageUtilization::new()),
+                matching_utilization: Arc::new(StageUtilization::new()),
+                response_utilization: Arc::new(StageUtilization::new()),
+            },
             Arc::clone(&shutdown),
         );
         // spawn binds to port 0 which is auto-assigned — we can't know the
@@ -748,18 +723,20 @@ mod tests {
 
         let result = spawn(
             addr,
-            Arc::new(AtomicU64::new(0)),
-            Arc::new(AtomicU64::new(0)),
-            Arc::new(Sequence::new(AtomicU64::new(0))),
-            Arc::new(Sequence::new(AtomicU64::new(0))),
-            Box::new(MockCursor(AtomicU64::new(0))),
-            Arc::new(AtomicU64::new(u64::MAX)),
-            Arc::new(AtomicBool::new(true)),
-            None,
-            None,
-            Arc::new(StageUtilization::new()),
-            Arc::new(StageUtilization::new()),
-            Arc::new(StageUtilization::new()),
+            HealthState {
+                active_connections: Arc::new(AtomicU64::new(0)),
+                events_processed: Arc::new(AtomicU64::new(0)),
+                journal_cursor: Arc::new(Sequence::new(AtomicU64::new(0))),
+                matching_cursor: Arc::new(Sequence::new(AtomicU64::new(0))),
+                input_cursor: Box::new(MockCursor(AtomicU64::new(0))),
+                replication_cursor: Arc::new(AtomicU64::new(u64::MAX)),
+                pipeline_healthy: Arc::new(AtomicBool::new(true)),
+                replicas_connected: None,
+                replication_metrics: None,
+                journal_utilization: Arc::new(StageUtilization::new()),
+                matching_utilization: Arc::new(StageUtilization::new()),
+                response_utilization: Arc::new(StageUtilization::new()),
+            },
             Arc::new(AtomicBool::new(false)),
         );
         assert!(result.is_err(), "expected bind failure on occupied port");
