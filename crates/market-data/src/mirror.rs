@@ -641,4 +641,64 @@ mod tests {
         assert!(m.order_index().is_empty());
         assert_eq!(m.trades().len(), 2);
     }
+
+    // -- Edge cases --
+
+    #[test]
+    fn fill_qty_exceeds_remaining_saturates() {
+        let mut m = BookMirror::new(SYM);
+        m.apply(&placed(1, Side::Buy, 100, 10));
+        // Fill with more than remaining — saturating_sub prevents panic,
+        // order is removed (remainder = 0).
+        m.apply(&fill(1, 99, 100, 15));
+        assert!(m.bids().is_empty());
+        assert!(m.order_index().is_empty());
+        assert_eq!(m.trades().len(), 1);
+    }
+
+    #[test]
+    fn replace_unknown_order_adds_level_without_panic() {
+        let mut m = BookMirror::new(SYM);
+        // Replace on a non-existent order — debits a missing level (no-op),
+        // credits the new level. Index update is a no-op (get_mut returns None).
+        m.apply(&replaced(999, Side::Buy, 100, 110, 10, 10));
+        // New level was credited even though old level was absent.
+        assert_eq!(
+            m.bids().get(&price(110)),
+            Some(&Level {
+                total_qty: 10,
+                order_count: 1
+            })
+        );
+        // Index has no entry for 999 — Replace doesn't insert, only mutates.
+        assert!(m.order_index().is_empty());
+    }
+
+    #[test]
+    fn sequential_fills_reduce_to_zero() {
+        let mut m = BookMirror::new(SYM);
+        m.apply(&placed(1, Side::Sell, 200, 30));
+        m.apply(&fill(1, 10, 200, 10)); // 20 remaining
+        m.apply(&fill(1, 11, 200, 10)); // 10 remaining
+        m.apply(&fill(1, 12, 200, 10)); // 0 remaining — removed
+
+        assert!(m.asks().is_empty());
+        assert!(m.order_index().is_empty());
+        assert_eq!(m.trades().len(), 3);
+    }
+
+    #[test]
+    fn cancel_unknown_leaves_book_unchanged() {
+        let mut m = BookMirror::new(SYM);
+        m.apply(&placed(1, Side::Buy, 100, 10));
+        // Cancel a different order — should not affect order 1.
+        assert!(!m.apply(&cancelled(999, 5)));
+        assert_eq!(
+            m.bids().get(&price(100)),
+            Some(&Level {
+                total_qty: 10,
+                order_count: 1
+            })
+        );
+    }
 }
