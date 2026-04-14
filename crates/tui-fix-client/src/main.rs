@@ -629,7 +629,8 @@ fn run_md_session(addr: &str, sender: &str, target: &str, tx: &Sender<UiMsg>) {
     let mut req_n: u64 = 0;
     loop {
         if last_request.elapsed() >= Duration::from_secs(1) {
-            for sym in &symbols {
+            // Subscribe to the first discovered symbol only.
+            if let Some(sym) = symbols.first() {
                 req_n += 1;
                 let mdr = FixMessageBuilder::new(tags::MSG_MARKET_DATA_REQUEST)
                     .str_tag(tags::MD_REQ_ID, &format!("MD{req_n}"))
