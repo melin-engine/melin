@@ -24,37 +24,55 @@ use super::{ReplicationMetrics, update_dual_replication_cursor};
 
 // --- Replication Sender (Primary side) ---
 
-/// Run the replication sender. Listens for a single replica connection,
+/// Owned state for the replication sender thread.
+pub struct Sender {
+    pub bind_addr: SocketAddr,
+    pub repl_consumer_1: ReplicationConsumer,
+    pub repl_consumer_2: ReplicationConsumer,
+    pub replication_cursor: Arc<AtomicU64>,
+    pub fastest_replica_cursor: Arc<AtomicU64>,
+    /// Raw genesis entry bytes (encoded GenesisHash journal entry), sent to
+    /// replicas in `StreamStart` so they write a byte-identical genesis.
+    pub genesis_entry: Vec<u8>,
+    pub journal_path: std::path::PathBuf,
+    pub authorized_keys: Arc<melin_protocol::auth::AuthorizedKeys>,
+    pub evict_flags: [Arc<AtomicBool>; 2],
+    pub active_flags: [Arc<AtomicBool>; 2],
+    pub metrics: Arc<ReplicationMetrics>,
+    pub handler_cores: [usize; 2],
+    pub batch_size: usize,
+    pub heartbeat_secs: u64,
+    pub busy_spin: bool,
+}
+
+/// Run the replication sender. Listens for replica connections,
 /// streams journal data batches, processes acks, and updates the
 /// replication cursor.
 ///
-/// `genesis_entry` is the primary's raw genesis entry bytes (the encoded
-/// GenesisHash journal entry), sent to the replica in `StreamStart` so it
-/// can write a byte-identical genesis to its journal. This ensures the
-/// BLAKE3 hash chain starts from the exact same encoded bytes.
-///
 /// Runs on a dedicated thread. Blocks until shutdown.
-#[allow(clippy::too_many_arguments)]
 pub fn run_sender(
-    bind_addr: SocketAddr,
-    repl_consumer_1: ReplicationConsumer,
-    repl_consumer_2: ReplicationConsumer,
-    replication_cursor: Arc<AtomicU64>,
-    fastest_replica_cursor: Arc<AtomicU64>,
-    genesis_entry: Vec<u8>,
-    journal_path: std::path::PathBuf,
-    authorized_keys: Arc<melin_protocol::auth::AuthorizedKeys>,
+    config: Sender,
     shutdown: &AtomicBool,
     replica_ready: &AtomicBool,
     replicas_connected: &AtomicU32,
-    evict_flags: [Arc<AtomicBool>; 2],
-    active_flags: [Arc<AtomicBool>; 2],
-    metrics: Arc<ReplicationMetrics>,
-    handler_cores: [usize; 2],
-    batch_size: usize,
-    heartbeat_secs: u64,
-    busy_spin: bool,
 ) {
+    let Sender {
+        bind_addr,
+        repl_consumer_1,
+        repl_consumer_2,
+        replication_cursor,
+        fastest_replica_cursor,
+        genesis_entry,
+        journal_path,
+        authorized_keys,
+        evict_flags,
+        active_flags,
+        metrics,
+        handler_cores,
+        batch_size,
+        heartbeat_secs,
+        busy_spin,
+    } = config;
     let listener = match TcpListener::bind(bind_addr) {
         Ok(l) => l,
         Err(e) => {
@@ -258,26 +276,25 @@ pub fn run_sender(
                             // during shutdown).
                             let shutdown_ref = unsafe { &*(shutdown_flag as *const AtomicBool) };
                             let ready_ref = unsafe { &*(ready_flag as *const AtomicBool) };
-                            run_replica_slot(
-                                stream,
-                                consumer,
-                                cursor,
-                                fastest_cursor,
-                                this_slot_acked,
-                                other_slot_acked,
-                                genesis,
-                                jpath,
-                                auth_keys,
-                                shutdown_ref,
-                                ready_ref,
-                                &slot_active,
-                                &slot_evict,
-                                &slot_metrics,
+                            let ctx = SlotContext {
+                                replication_cursor: &cursor,
+                                fastest_replica_cursor: &fastest_cursor,
+                                this_slot_acked: &this_slot_acked,
+                                other_slot_acked: &other_slot_acked,
+                                genesis_entry: &genesis,
+                                journal_path: &jpath,
+                                authorized_keys: &auth_keys,
+                                shutdown: shutdown_ref,
+                                replica_ready: ready_ref,
+                                active_flag: &slot_active,
+                                evict_flag: &slot_evict,
+                                metrics: &slot_metrics,
                                 slot_idx,
                                 batch_size,
                                 heartbeat_secs,
                                 busy_spin,
-                            )
+                            };
+                            run_replica_slot(stream, consumer, &ctx)
                         })
                         .expect("spawn replica handler thread");
                     slots[slot_idx].handle = Some(handle);
@@ -299,76 +316,67 @@ pub fn run_sender(
     }
 }
 
-/// Handle a single replica connection on a dedicated thread.
-/// Returns the consumer when the connection ends (for slot reuse).
-#[allow(clippy::too_many_arguments)]
-fn run_replica_slot(
-    stream: TcpStream,
-    mut consumer: ReplicationConsumer,
-    replication_cursor: Arc<AtomicU64>,
-    fastest_replica_cursor: Arc<AtomicU64>,
-    this_slot_acked: Arc<AtomicU64>,
-    other_slot_acked: Arc<AtomicU64>,
-    genesis_entry: Vec<u8>,
-    journal_path: std::path::PathBuf,
-    authorized_keys: Arc<melin_protocol::auth::AuthorizedKeys>,
-    shutdown: &AtomicBool,
-    replica_ready: &AtomicBool,
-    active_flag: &AtomicBool,
-    evict_flag: &AtomicBool,
-    metrics: &ReplicationMetrics,
+/// Per-slot state shared across the replica handler call chain
+/// (`run_replica_slot` → `handle_replica_connection` → `live_stream_uring`).
+struct SlotContext<'a> {
+    replication_cursor: &'a Arc<AtomicU64>,
+    fastest_replica_cursor: &'a Arc<AtomicU64>,
+    this_slot_acked: &'a Arc<AtomicU64>,
+    other_slot_acked: &'a Arc<AtomicU64>,
+    genesis_entry: &'a [u8],
+    journal_path: &'a std::path::Path,
+    authorized_keys: &'a melin_protocol::auth::AuthorizedKeys,
+    shutdown: &'a AtomicBool,
+    replica_ready: &'a AtomicBool,
+    active_flag: &'a AtomicBool,
+    evict_flag: &'a AtomicBool,
+    metrics: &'a ReplicationMetrics,
     slot_idx: usize,
     batch_size: usize,
     heartbeat_secs: u64,
     busy_spin: bool,
+}
+
+/// Handle a single replica connection on a dedicated thread.
+/// Returns the consumer when the connection ends (for slot reuse).
+fn run_replica_slot(
+    stream: TcpStream,
+    mut consumer: ReplicationConsumer,
+    ctx: &SlotContext<'_>,
 ) -> ReplicationConsumer {
-    match handle_replica_connection(
-        stream,
-        &mut consumer,
-        &replication_cursor,
-        &fastest_replica_cursor,
-        &this_slot_acked,
-        &other_slot_acked,
-        &genesis_entry,
-        &journal_path,
-        &authorized_keys,
-        shutdown,
-        replica_ready,
-        active_flag,
-        evict_flag,
-        metrics,
-        slot_idx,
-        batch_size,
-        heartbeat_secs,
-        busy_spin,
-    ) {
+    match handle_replica_connection(stream, &mut consumer, ctx) {
         Ok(()) => info!("replica disconnected cleanly"),
         Err(e) => warn!(error = %e, "replica connection error"),
     }
     consumer
 }
 
-#[allow(clippy::too_many_arguments)]
 fn handle_replica_connection(
     stream: TcpStream,
     repl_consumer: &mut ReplicationConsumer,
-    replication_cursor: &Arc<AtomicU64>,
-    fastest_replica_cursor: &Arc<AtomicU64>,
-    this_slot_acked: &Arc<AtomicU64>,
-    other_slot_acked: &Arc<AtomicU64>,
-    genesis_entry: &[u8],
-    journal_path: &std::path::Path,
-    authorized_keys: &melin_protocol::auth::AuthorizedKeys,
-    shutdown: &AtomicBool,
-    replica_ready: &AtomicBool,
-    active_flag: &AtomicBool,
-    evict_flag: &AtomicBool,
-    metrics: &ReplicationMetrics,
-    slot_idx: usize,
-    batch_size: usize,
-    heartbeat_secs: u64,
-    busy_spin: bool,
+    ctx: &SlotContext<'_>,
 ) -> io::Result<()> {
+    let SlotContext {
+        replication_cursor,
+        fastest_replica_cursor,
+        this_slot_acked,
+        other_slot_acked,
+        genesis_entry,
+        journal_path,
+        authorized_keys,
+        shutdown,
+        replica_ready,
+        active_flag,
+        evict_flag: _,
+        metrics,
+        slot_idx,
+        batch_size: _,
+        heartbeat_secs,
+        busy_spin: _,
+    } = ctx;
+    let slot_idx = *slot_idx;
+    let heartbeat_secs = *heartbeat_secs;
+
     let mut reader = stream.try_clone()?;
     let mut writer = stream;
 
@@ -580,17 +588,8 @@ fn handle_replica_connection(
     live_stream_uring(
         writer,
         repl_consumer,
-        replication_cursor,
-        fastest_replica_cursor,
-        this_slot_acked,
-        other_slot_acked,
-        shutdown,
-        evict_flag,
-        metrics,
-        slot_idx,
-        batch_size,
+        ctx,
         heartbeat_interval,
-        busy_spin,
         &mut send_buf,
         &mut last_send,
         &mut last_sequence,
@@ -604,26 +603,39 @@ fn handle_replica_connection(
 /// in-flight for ack frames; SEND is submitted when the replication ring
 /// has data. Both complete via the memory-mapped CQ with zero syscalls
 /// in the hot path.
-#[allow(clippy::too_many_arguments)]
 fn live_stream_uring(
     writer: TcpStream,
     repl_consumer: &mut ReplicationConsumer,
-    replication_cursor: &Arc<AtomicU64>,
-    fastest_replica_cursor: &Arc<AtomicU64>,
-    this_slot_acked: &Arc<AtomicU64>,
-    other_slot_acked: &Arc<AtomicU64>,
-    shutdown: &AtomicBool,
-    evict_flag: &AtomicBool,
-    metrics: &ReplicationMetrics,
-    slot_idx: usize,
-    batch_size: usize,
+    ctx: &SlotContext<'_>,
     heartbeat_interval: std::time::Duration,
-    busy_spin: bool,
     send_buf: &mut Vec<u8>,
     last_send: &mut std::time::Instant,
     last_sequence: &mut u64,
     last_chain_hash: &mut [u8; 32],
 ) -> io::Result<()> {
+    let SlotContext {
+        replication_cursor,
+        fastest_replica_cursor,
+        this_slot_acked,
+        other_slot_acked,
+        shutdown,
+        evict_flag,
+        metrics,
+        slot_idx,
+        batch_size,
+        busy_spin,
+        // Only used during handshake/catch-up (handle_replica_connection).
+        genesis_entry: _,
+        journal_path: _,
+        authorized_keys: _,
+        replica_ready: _,
+        active_flag: _,
+        heartbeat_secs: _,
+    } = ctx;
+    let slot_idx = *slot_idx;
+    let batch_size = *batch_size;
+    let busy_spin = *busy_spin;
+
     use io_uring::{IoUring, opcode, types};
     use std::os::unix::io::AsRawFd;
 

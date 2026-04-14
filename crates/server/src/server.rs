@@ -873,24 +873,26 @@ fn run_as_primary<L: BlockingTransportListener>(
             .spawn(move || {
                 apply_affinity("repl-sender", cores.repl_sender);
                 crate::replication::run_sender(
-                    repl_bind,
-                    repl_consumer_1,
-                    repl_consumer_2,
-                    repl_cursor,
-                    fastest_repl_cursor,
-                    genesis_entry,
-                    journal_path,
-                    repl_auth_keys,
+                    crate::replication::Sender {
+                        bind_addr: repl_bind,
+                        repl_consumer_1,
+                        repl_consumer_2,
+                        replication_cursor: repl_cursor,
+                        fastest_replica_cursor: fastest_repl_cursor,
+                        genesis_entry,
+                        journal_path,
+                        authorized_keys: repl_auth_keys,
+                        evict_flags,
+                        active_flags,
+                        metrics: repl_metrics,
+                        handler_cores,
+                        batch_size,
+                        heartbeat_secs,
+                        busy_spin,
+                    },
                     &s_repl,
                     &ready_flag,
                     &connected_counter,
-                    evict_flags,
-                    active_flags,
-                    repl_metrics,
-                    handler_cores,
-                    batch_size,
-                    heartbeat_secs,
-                    busy_spin,
                 );
             })
             .map_err(|e| format!("spawn replication sender thread: {e}"))?;

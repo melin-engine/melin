@@ -56,7 +56,7 @@ pub use protocol::{Ack, Handshake, PrimaryMessage, ReplicaMessage};
 #[cfg(feature = "dpdk")]
 pub use dpdk::{run_receiver_dpdk, run_sender_dpdk};
 pub use tcp_receiver::{ReceiverResult, run_receiver};
-pub use tcp_sender::run_sender;
+pub use tcp_sender::{Sender, run_sender};
 
 /// Per-slot replication metrics exposed via the health endpoint.
 /// Updated by sender threads (atomic stores), read by the health
