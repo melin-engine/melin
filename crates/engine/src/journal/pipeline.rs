@@ -2662,6 +2662,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(feature = "no-persist"))]
     fn journal_stage_sends_replication_batches() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("repl_pipeline.journal");

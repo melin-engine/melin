@@ -743,6 +743,18 @@ impl Drop for RxBatch {
 mod tests {
     use super::*;
 
+    /// Collect frame slices from an `RxBatch` into a `Vec` for test assertions.
+    fn collect_slices<'a>(batch: &'a RxBatch) -> Vec<&'a [u8]> {
+        let n = batch.len();
+        let mut buf = vec![std::mem::MaybeUninit::uninit(); n];
+        let written = batch.write_slices(&mut buf);
+        // SAFETY: `write_slices` initialised `buf[..written]`.
+        buf[..written]
+            .iter()
+            .map(|s| unsafe { s.assume_init() })
+            .collect()
+    }
+
     #[test]
     fn rx_batch_empty() {
         let batch = RxBatch {
@@ -751,7 +763,7 @@ mod tests {
         };
         assert!(batch.is_empty());
         assert_eq!(batch.len(), 0);
-        assert!(batch.as_slices().is_empty());
+        assert!(collect_slices(&batch).is_empty());
     }
 
     #[test]
@@ -764,7 +776,7 @@ mod tests {
         };
         assert!(!batch.is_empty());
         assert_eq!(batch.len(), 2);
-        let slices = batch.as_slices();
+        let slices = collect_slices(&batch);
         assert_eq!(slices.len(), 2);
         assert_eq!(slices[0], &arp_frame[..]);
         assert_eq!(slices[1], &tcp_frame[..]);
@@ -778,7 +790,7 @@ mod tests {
             mbufs: Vec::new(),
             injected: vec![vec![1, 2, 3], vec![4, 5, 6]],
         };
-        let slices = batch.as_slices();
+        let slices = collect_slices(&batch);
         assert_eq!(slices[0], &[1, 2, 3]);
         assert_eq!(slices[1], &[4, 5, 6]);
     }
