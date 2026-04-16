@@ -2,8 +2,10 @@
 //!
 //! The JournalStage sends byte-for-byte copies of encoded journal batches
 //! through a bounded channel. The `ReplicationSender` streams them to the
-//! replica as `DataBatch` frames. The replica writes them directly to its
-//! local journal via `write_raw_sync()` and replays into its Exchange.
+//! replica as `DataBatch` frames. The replica decodes events from the
+//! batch, publishes them to its input disruptor with pre-assigned
+//! sequences and timestamps, and the replica's JournalStage re-encodes
+//! and persists them independently.
 //!
 //! ## Wire Protocol
 //!
@@ -106,8 +108,8 @@ pub(super) struct PendingAck {
 /// the journal stage before any ack is sent. Acks are flushed in FIFO
 /// order as the journal cursor advances.
 ///
-/// Capacity 8 matches `RAW_RING_CAPACITY` — the SPSC ring between the
-/// receiver and journal stage is the pipelining bottleneck.
+/// Capacity 8 provides enough headroom to pipeline ~8 batches ahead of
+/// the journal stage's NVMe writes without stalling the receiver.
 pub(super) struct PendingAckQueue {
     /// Circular buffer of pending acks. Indices wrap via `& MASK`.
     buf: [PendingAck; Self::CAP],
@@ -118,11 +120,10 @@ pub(super) struct PendingAckQueue {
 }
 
 impl PendingAckQueue {
-    // Capacity 8 matches RAW_RING_CAPACITY — the SPSC ring between the
-    // receiver and journal stage is the pipelining bottleneck. With
-    // io_uring, the deadlock that forced CAP=1 is eliminated (RECV CQEs
-    // arrive asynchronously while pop_ready checks the cursor each
-    // iteration).
+    // Capacity 8 provides enough headroom to pipeline ~8 batches ahead
+    // of the journal stage's NVMe writes. With io_uring, the deadlock
+    // that forced CAP=1 is eliminated (RECV CQEs arrive asynchronously
+    // while pop_ready checks the cursor each iteration).
     const CAP: usize = 8;
     const MASK: usize = Self::CAP - 1;
 
@@ -286,50 +287,48 @@ pub(super) fn shutdown_pipeline(
     Some((exchange, writer))
 }
 
-/// Decode accumulated journal bytes into events, publish to the input
-/// disruptor, and send raw bytes to the journal stage's SPSC ring.
+/// Decode accumulated journal bytes into events and publish to the input
+/// disruptor with pre-assigned sequences and timestamps from the primary.
 /// Returns the disruptor sequence target that the caller must wait for
 /// before sending an ack (ensures persist-before-ack).
 ///
-/// This function is NON-BLOCKING — it pushes to the SPSC ring and
-/// returns immediately (unless the ring is full, in which case it
-/// spins briefly). The caller can submit multiple batches before
-/// waiting, allowing the journal stage to overlap NVMe writes with
-/// TCP receives.
+/// Checkpoint events are filtered out — each node auto-emits its own
+/// checkpoints independently during encoding. All other events (including
+/// GenesisHash from journal rotation) are published with the primary's
+/// sequence and timestamp so the replica's JournalStage can encode them
+/// with identical sequence numbers.
 pub(super) fn submit_batch_to_pipeline(
     journal_bytes: &[u8],
-    end_sequence: u64,
-    chain_hash: [u8; 32],
     producer: &melin_disruptor::ring::MultiProducer<melin_engine::journal::pipeline::InputSlot>,
-    raw_tx: &melin_engine::journal::pipeline::RawBatchSender,
 ) -> Result<u64, Box<dyn std::error::Error>> {
+    use melin_engine::journal::event::JournalEvent;
     use melin_engine::journal::pipeline::InputSlot;
 
-    // Decode ALL entries from the raw bytes and publish to the disruptor,
-    // including auto-emitted Checkpoint entries. Count the actual entries
-    // published — this may exceed entry_count because the primary's
-    // entry_count only counts disruptor events, not checkpoint entries
-    // that the hash chain auto-emits into the journal bytes.
     let mut offset = 0;
     let mut last_published_seq = 0u64;
-    let mut decoded_count: u32 = 0;
     while offset < journal_bytes.len() {
         let remaining = &journal_bytes[offset..];
         match melin_engine::journal::codec::decode(
             remaining,
             melin_engine::journal::codec::FORMAT_VERSION,
         ) {
-            Ok((consumed, _sequence, _timestamp_ns, key_hash, request_seq, event)) => {
+            Ok((consumed, sequence, timestamp_ns, key_hash, request_seq, event)) => {
+                offset += consumed;
+                // Skip checkpoint entries — each node auto-emits its own
+                // during encoding. Publishing them would cause duplicates.
+                if matches!(event, JournalEvent::Checkpoint { .. }) {
+                    continue;
+                }
                 last_published_seq = producer.publish(InputSlot {
                     connection_id: 0,
                     key_hash,
                     request_seq,
+                    sequence,
+                    timestamp_ns,
                     event,
                     publish_ts: Default::default(),
                     recv_ts: Default::default(),
                 });
-                decoded_count += 1;
-                offset += consumed;
             }
             Err(e) => {
                 return Err(
@@ -338,13 +337,6 @@ pub(super) fn submit_batch_to_pipeline(
             }
         }
     }
-
-    // Send raw bytes to the journal stage via the pre-allocated SPSC
-    // ring. `send` copies into the next free slot buffer — no heap
-    // allocation, no intermediate `Vec::to_vec()` on the hot path. The
-    // ring has 8 slots, so the receiver can pipeline up to 8 batches
-    // ahead of the journal stage's NVMe writes.
-    raw_tx.send(journal_bytes, end_sequence, chain_hash, decoded_count);
 
     // Return the disruptor target — the caller waits for this before
     // sending an ack.

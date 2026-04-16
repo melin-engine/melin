@@ -120,7 +120,8 @@ const MAX_MATCHING_BATCH: usize = 16;
 ///
 /// Carries a connection ID alongside the event so the response stage knows
 /// where to route execution reports. `Copy` for zero-cost ring buffer ops.
-/// ~72 bytes: connection_id(8) + JournalEvent(~60) + padding.
+/// ~88 bytes: connection_id(8) + key_hash(8) + request_seq(8) + sequence(8)
+/// + timestamp_ns(8) + JournalEvent(~60) + padding.
 #[derive(Debug, Clone, Copy)]
 pub struct InputSlot {
     /// Which client connection submitted this command.
@@ -131,6 +132,15 @@ pub struct InputSlot {
     /// Per-key monotonic request sequence number from the wire protocol.
     /// Used with `key_hash` for idempotency dedup. 0 for seed/internal events.
     pub request_seq: u64,
+    /// Pre-assigned journal sequence number. Non-zero when the event was
+    /// received from a primary via replication (the sequence is the
+    /// primary's journal sequence). Zero when published by a local reader
+    /// thread (the JournalStage allocates the sequence during encoding).
+    pub sequence: u64,
+    /// Pre-assigned wall-clock timestamp (nanoseconds since epoch). Non-zero
+    /// when received from a primary via replication. Zero when published by
+    /// a local reader thread (the JournalStage assigns a batch timestamp).
+    pub timestamp_ns: u64,
     /// The journaled event (order submit, cancel, etc.).
     pub event: JournalEvent,
     /// Timestamp when the publisher wrote this slot to the disruptor.
@@ -151,6 +161,8 @@ impl Default for InputSlot {
             connection_id: 0,
             key_hash: 0,
             request_seq: 0,
+            sequence: 0,
+            timestamp_ns: 0,
             event: JournalEvent::Deposit {
                 account: crate::types::AccountId(0),
                 currency: crate::types::CurrencyId(0),
@@ -264,12 +276,6 @@ pub struct JournalStage {
     /// When true, never yield to the OS scheduler — spin indefinitely with
     /// PAUSE. Requires isolated cores (`isolcpus`). See [`idle_wait`].
     busy_spin: bool,
-    /// In replica mode, receives pre-encoded journal byte batches from the
-    /// replication receiver thread via a lock-free hand-off. The journal
-    /// stage writes these raw bytes instead of encoding events from the
-    /// disruptor. This preserves byte-identical journals between primary
-    /// and replica.
-    raw_journal_rx: Option<RawBatchReceiver>,
     /// Shared busy/idle counters for health endpoint monitoring.
     utilization: Arc<StageUtilization>,
 }
@@ -302,274 +308,6 @@ impl Default for ReplicationState {
     }
 }
 
-/// Metadata for one raw batch in the SPSC ring. Small and `Copy` — the
-/// journal bytes themselves live in the pre-allocated slot buffer at the
-/// same ring index. The `len` field records how many bytes of the slot
-/// are valid for this batch; the rest is leftover capacity from prior
-/// batches and must not be read.
-#[derive(Clone, Copy, Default)]
-struct RawJournalMeta {
-    len: u32,
-    entry_count: u32,
-    end_sequence: u64,
-    chain_hash: [u8; 32],
-}
-
-/// Number of slots in the raw batch ring. Must be a power of two. At 8
-/// slots the receiver can pipeline ~8 batches ahead of the journal
-/// stage's NVMe writes.
-const RAW_RING_CAPACITY: usize = 8;
-const RAW_RING_MASK: u64 = (RAW_RING_CAPACITY as u64) - 1;
-
-/// Initial per-slot buffer capacity. Sized for the common case of one
-/// `journal_accum` gather per RECV pass on the replica receiver (a
-/// coalesced batch from the primary is usually ~40 KB, worst observed
-/// under stress is a few hundred KB). The slot buffer is a `Vec<u8>`
-/// so it can grow amortized on the rare burst that exceeds this — the
-/// per-slot capacity only affects allocator traffic during cold-start
-/// and burst tails, never the steady-state hot path.
-const RAW_SLOT_INITIAL_CAPACITY: usize = 1 << 20; // 1 MiB
-
-/// Lock-free bounded SPSC ring for passing raw journal batches from the
-/// replication receiver to the journal stage. Zero-allocation on the
-/// hot path: the receiver writes directly into a pre-allocated slot
-/// buffer, the journal stage reads the slot in place (borrowed) and
-/// submits io_uring writes against the slot memory, then releases the
-/// slot via [`RawBatchSlot::drop`] once the CQE confirms durability.
-///
-/// `head`/`tail` are cache-padded so false sharing can't bounce the
-/// producer and consumer cache lines against each other.
-///
-/// `Vec<u8>` is chosen over a fixed `[u8; N]` array per slot so that
-/// the rare burst batch larger than [`RAW_SLOT_INITIAL_CAPACITY`] grows
-/// amortized instead of panicking; the amortized cost only fires in
-/// the tail of a burst, not the steady state.
-struct RawBatchRing {
-    /// Per-slot byte buffers. `UnsafeCell` for interior mutability —
-    /// mutual exclusion between producer and consumer is enforced by
-    /// the head/tail ring protocol, not the type system.
-    slots: Box<[std::cell::UnsafeCell<Vec<u8>>]>,
-    /// Per-slot metadata. Published with the slot's bytes under the
-    /// same Release store on `head`, so the consumer's Acquire load
-    /// on `head` sees both consistently.
-    metas: Box<[std::cell::UnsafeCell<RawJournalMeta>]>,
-    /// Next slot to write (producer). Cache-padded to avoid false
-    /// sharing with `tail` on the consumer's cache line.
-    head: melin_disruptor::padding::CachePadded<AtomicU64>,
-    /// Next slot to read (consumer).
-    tail: melin_disruptor::padding::CachePadded<AtomicU64>,
-}
-
-unsafe impl Send for RawBatchRing {}
-unsafe impl Sync for RawBatchRing {}
-
-impl RawBatchRing {
-    fn new() -> Self {
-        let slots: Vec<std::cell::UnsafeCell<Vec<u8>>> = (0..RAW_RING_CAPACITY)
-            .map(|_| std::cell::UnsafeCell::new(Vec::with_capacity(RAW_SLOT_INITIAL_CAPACITY)))
-            .collect();
-        let metas: Vec<std::cell::UnsafeCell<RawJournalMeta>> = (0..RAW_RING_CAPACITY)
-            .map(|_| std::cell::UnsafeCell::new(RawJournalMeta::default()))
-            .collect();
-        Self {
-            slots: slots.into_boxed_slice(),
-            metas: metas.into_boxed_slice(),
-            head: melin_disruptor::padding::CachePadded::new(AtomicU64::new(0)),
-            tail: melin_disruptor::padding::CachePadded::new(AtomicU64::new(0)),
-        }
-    }
-}
-
-/// Sender half of the bounded SPSC ring. Owned by the replication
-/// receiver thread.
-pub struct RawBatchSender {
-    ring: Arc<RawBatchRing>,
-}
-
-impl RawBatchSender {
-    /// Publish a raw journal batch into the ring. Copies `bytes` into
-    /// the next free slot buffer, writes the metadata, and releases the
-    /// slot to the receiver. Spins if all slots are occupied — with 8
-    /// slots and ~10–30 µs per NVMe write, the ring absorbs ~80–240 µs
-    /// of receiver-ahead-of-journal pipelining.
-    ///
-    /// The slot buffer is a `Vec<u8>` with `RAW_SLOT_INITIAL_CAPACITY`
-    /// headroom; larger batches grow the Vec amortized without altering
-    /// the ring protocol.
-    ///
-    /// # Panics
-    /// Panics if `bytes.len() > u32::MAX`. The wire format caps batches
-    /// at a few hundred KB so this is unreachable in practice, but the
-    /// explicit check prevents a silent truncation of `len` in the slot
-    /// metadata (which would translate to a short/empty journal write).
-    pub fn send(&self, bytes: &[u8], end_sequence: u64, chain_hash: [u8; 32], entry_count: u32) {
-        assert!(
-            bytes.len() <= u32::MAX as usize,
-            "raw batch too large for u32 len field: {}",
-            bytes.len()
-        );
-        loop {
-            let head = self.ring.head.get().load(Ordering::Relaxed);
-            let tail = self.ring.tail.get().load(Ordering::Acquire);
-            if (head - tail) < RAW_RING_CAPACITY as u64 {
-                let idx = (head & RAW_RING_MASK) as usize;
-                // SAFETY: the ring protocol guarantees the consumer is
-                // not touching slot `idx` — `tail <= head - CAP` means
-                // the consumer is at least one full wrap behind. We are
-                // the sole producer, so no other thread writes this slot.
-                unsafe {
-                    let slot = &mut *self.ring.slots[idx].get();
-                    slot.clear();
-                    slot.extend_from_slice(bytes);
-                    *self.ring.metas[idx].get() = RawJournalMeta {
-                        len: bytes.len() as u32,
-                        entry_count,
-                        end_sequence,
-                        chain_hash,
-                    };
-                }
-                // Release-store on `head` publishes both the slot bytes
-                // and the metadata write above. Pairs with the Acquire
-                // load in `RawBatchReceiver::try_recv`.
-                self.ring.head.get().store(head + 1, Ordering::Release);
-                return;
-            }
-            std::hint::spin_loop();
-        }
-    }
-}
-
-/// Handle to a raw batch slot held by the journal stage. The slot's
-/// byte buffer is pinned in the ring for the lifetime of this handle —
-/// the sender will not overwrite it until `Drop` advances `tail`.
-///
-/// This is the zero-copy hand-off: the journal stage submits an
-/// io_uring Write with a pointer derived from this handle, carries the
-/// handle in its in-flight state, and drops it after the CQE confirms
-/// durability. Dropping releases the slot back to the sender.
-///
-/// The raw pointer + `Arc<RawBatchRing>` pair is used instead of a
-/// borrowed slice so the handle is `'static` and can live in the
-/// journal stage's `Option<InflightRaw>` across loop iterations without
-/// tangling the borrow checker in self-referential lifetimes.
-pub struct RawBatchSlot {
-    ring: Arc<RawBatchRing>,
-    ptr: *const u8,
-    len: usize,
-    pub end_sequence: u64,
-    pub chain_hash: [u8; 32],
-    pub entry_count: u32,
-}
-
-// SAFETY: `RawBatchSlot` is moved between the receiver thread and the
-// journal-stage thread by value (no aliasing). The raw pointer is
-// derived from `Arc<RawBatchRing>` memory that outlives the handle,
-// and the ring protocol keeps the slot pinned for the handle's
-// lifetime. `Sync` is deliberately NOT implemented — only one thread
-// holds the handle at a time.
-unsafe impl Send for RawBatchSlot {}
-
-impl RawBatchSlot {
-    /// Borrowed view of the journal bytes in the pinned slot.
-    pub fn bytes(&self) -> &[u8] {
-        // SAFETY: the slot memory is pinned by the ring protocol
-        // between `try_recv` and `Drop`. The `Arc<RawBatchRing>` field
-        // keeps the backing storage alive for the slice lifetime.
-        unsafe { std::slice::from_raw_parts(self.ptr, self.len) }
-    }
-
-    /// Raw pointer into the slot buffer. Used by the journal stage's
-    /// io_uring Write submission — the kernel reads directly from this
-    /// address, so the slot must remain pinned until the CQE lands.
-    pub fn as_ptr(&self) -> *const u8 {
-        self.ptr
-    }
-
-    /// Number of valid journal bytes in the slot.
-    pub fn len(&self) -> usize {
-        self.len
-    }
-
-    /// True when the slot contains no journal bytes. Included so
-    /// `self.len()` can be paired with `self.is_empty()` without
-    /// tripping clippy's `len_without_is_empty` lint.
-    pub fn is_empty(&self) -> bool {
-        self.len == 0
-    }
-}
-
-impl Drop for RawBatchSlot {
-    fn drop(&mut self) {
-        // Release the slot back to the sender. SPSC: we are the sole
-        // consumer, so a plain load + store on `tail` is correct; the
-        // Release ordering pairs with the sender's Acquire load on
-        // `tail` in its backpressure check.
-        let tail = self.ring.tail.get().load(Ordering::Relaxed);
-        self.ring.tail.get().store(tail + 1, Ordering::Release);
-    }
-}
-
-/// Receiver half of the bounded SPSC ring. Owned by the journal stage
-/// thread.
-pub struct RawBatchReceiver {
-    ring: Arc<RawBatchRing>,
-}
-
-impl RawBatchReceiver {
-    /// Try to receive a raw batch without blocking. Returns `None` if
-    /// the ring is empty. The returned [`RawBatchSlot`] pins the slot
-    /// until dropped.
-    ///
-    /// # Single-outstanding contract
-    ///
-    /// Callers must drop the previous slot before calling `try_recv`
-    /// again. Violating this is **not** memory-unsafe — the sender's
-    /// backpressure keeps the slot pinned as long as any handle exists
-    /// — but it causes silent data loss: the second call returns the
-    /// *same* slot (both reads see the pre-drop `tail`), and dropping
-    /// both handles advances `tail` twice, skipping the next batch
-    /// entirely. The journal stage enforces the invariant structurally
-    /// via its `Option<InflightRaw>` state machine — there is only one
-    /// legitimate caller and it cannot violate the contract.
-    pub fn try_recv(&self) -> Option<RawBatchSlot> {
-        let tail = self.ring.tail.get().load(Ordering::Relaxed);
-        let head = self.ring.head.get().load(Ordering::Acquire);
-        if tail >= head {
-            return None;
-        }
-        let idx = (tail & RAW_RING_MASK) as usize;
-        // SAFETY: the Acquire load on `head` pairs with the sender's
-        // Release store, so the slot's byte buffer and metadata writes
-        // are visible. The sender's backpressure check ensures slot
-        // `idx` is not touched again until we advance `tail` via
-        // `RawBatchSlot::drop`.
-        let (ptr, meta) = unsafe {
-            let slot = &*self.ring.slots[idx].get();
-            let meta = *self.ring.metas[idx].get();
-            (slot.as_ptr(), meta)
-        };
-        Some(RawBatchSlot {
-            ring: Arc::clone(&self.ring),
-            ptr,
-            len: meta.len as usize,
-            end_sequence: meta.end_sequence,
-            chain_hash: meta.chain_hash,
-            entry_count: meta.entry_count,
-        })
-    }
-}
-
-/// Create a bounded SPSC ring for raw journal batch transfer.
-pub fn raw_batch_channel() -> (RawBatchSender, RawBatchReceiver) {
-    let ring = Arc::new(RawBatchRing::new());
-    (
-        RawBatchSender {
-            ring: Arc::clone(&ring),
-        },
-        RawBatchReceiver { ring },
-    )
-}
-
 impl JournalStage {
     /// Create a new journal stage.
     ///
@@ -592,7 +330,6 @@ impl JournalStage {
             repl: Box::default(),
             chain_hash: None,
             busy_spin,
-            raw_journal_rx: None,
             utilization: Arc::new(StageUtilization::new()),
         }
     }
@@ -600,13 +337,6 @@ impl JournalStage {
     /// Shared utilization counters for health endpoint monitoring.
     pub fn utilization(&self) -> Arc<StageUtilization> {
         Arc::clone(&self.utilization)
-    }
-
-    /// Set the raw journal receiver for replica mode. When set, the journal
-    /// stage writes pre-encoded bytes from the replication receiver instead
-    /// of encoding events from the disruptor.
-    pub fn set_raw_journal_receiver(&mut self, rx: RawBatchReceiver) {
-        self.raw_journal_rx = Some(rx);
     }
 
     /// Set independent replication ring producers (one per replica slot)
@@ -644,15 +374,6 @@ impl JournalStage {
         shutdown: &std::sync::atomic::AtomicBool,
     ) -> Result<JournalWriter, JournalError> {
         let use_uring = !cfg!(feature = "no-persist");
-
-        if self.raw_journal_rx.is_some() {
-            // Replica mode: write raw bytes from the replication receiver.
-            if use_uring {
-                return self.run_replica_uring(shutdown);
-            } else {
-                return self.run_replica(shutdown);
-            }
-        }
 
         if use_uring {
             self.run_uring(shutdown)
@@ -743,27 +464,35 @@ impl JournalStage {
                 // Data stays in the buffer until the sync point — one
                 // pwritev2+RWF_DSYNC replaces multiple pwrites + fdatasync.
                 // QueryStats is not journaled (no state change).
-                // One clock_gettime per batch instead of per event. Events
-                // within a batch share a timestamp — ordering is preserved by
-                // sequence numbers. If per-event wall-clock timestamps become
-                // a regulatory requirement (MiFID II, SEC CAT), revert to
-                // batch_append() which calls clock_gettime per event.
+                // Checkpoint events from the replication stream are skipped —
+                // each node auto-emits its own checkpoints independently.
                 //
-                // Two-step sequencing: allocate_sequence() is called
-                // separately from encode_event() so that sequence assignment
-                // can later be moved to an earlier pipeline stage (input
-                // replication).
+                // Sequence/timestamp assignment: if the slot carries a
+                // pre-assigned sequence (non-zero, from replication), use it
+                // and keep the writer's counter in sync. Otherwise allocate
+                // locally (primary mode). One clock_gettime per batch in
+                // primary mode; replicas use the primary's timestamp.
                 #[cfg(not(feature = "no-persist"))]
                 {
-                    let ts = crate::journal::writer::wall_clock_nanos();
+                    let batch_ts = crate::journal::writer::wall_clock_nanos();
                     for slot in &batch[..count] {
                         if matches!(
                             slot.event,
-                            JournalEvent::QueryStats | JournalEvent::QueryPosition { .. }
+                            JournalEvent::QueryStats
+                                | JournalEvent::QueryPosition { .. }
+                                | JournalEvent::Checkpoint { .. }
                         ) {
                             continue;
                         }
-                        let seq = self.writer.allocate_sequence();
+                        let (seq, ts) = if slot.sequence != 0 {
+                            // Replica: use primary's pre-assigned sequence
+                            // and timestamp. Sync the writer's counter so
+                            // auto-emitted checkpoints get correct sequences.
+                            self.writer.set_next_sequence(slot.sequence + 1);
+                            (slot.sequence, slot.timestamp_ns)
+                        } else {
+                            (self.writer.allocate_sequence(), batch_ts)
+                        };
                         self.writer
                             .encode_event(seq, ts, &slot.event, slot.key_hash, slot.request_seq)
                             .map_err(|e| {
@@ -849,278 +578,6 @@ impl JournalStage {
         }
     }
 
-    /// Replica journal loop: writes pre-encoded bytes from the replication
-    /// receiver while consuming (and discarding) events from the disruptor
-    /// to advance the cursor. The cursor advance happens AFTER `write_raw_sync`
-    /// completes, preserving the persist-before-ack guarantee.
-    fn run_replica(
-        mut self,
-        shutdown: &std::sync::atomic::AtomicBool,
-    ) -> Result<JournalWriter, JournalError> {
-        let rx = self.raw_journal_rx.take().ok_or_else(|| {
-            JournalError::Io(std::io::Error::other(
-                "run_replica called without raw_journal_rx",
-            ))
-        })?;
-        let mut batch = [InputSlot::default(); MAX_JOURNAL_BATCH];
-        let mut idle_spins: u32 = 0;
-        let mut busy_count: u64 = 0;
-        let mut idle_count: u64 = 0;
-
-        loop {
-            if shutdown.load(Ordering::Relaxed) {
-                // Drain remaining disruptor events before shutdown.
-                self.drain_remaining(&mut batch);
-                self.utilization.busy.store(busy_count, Ordering::Relaxed);
-                self.utilization.idle.store(idle_count, Ordering::Relaxed);
-                return Ok(self.writer);
-            }
-
-            // Try to receive a raw journal batch from the replication
-            // receiver via the lock-free hand-off. The returned slot
-            // borrows directly from the ring's pre-allocated buffer —
-            // no Vec ownership transfer, no intermediate copy. Dropped
-            // at the end of this arm to release the slot back.
-            if let Some(raw_slot) = rx.try_recv() {
-                idle_spins = 0;
-                busy_count += 1;
-
-                // Write raw bytes to journal (durable write) straight
-                // from the slot memory. write_raw_sync takes `&[u8]`,
-                // so this is genuinely zero-copy at the user-space
-                // boundary — the kernel's pwritev2 reads from the slot.
-                self.writer
-                    .write_raw_sync(raw_slot.bytes(), raw_slot.entry_count as u64)
-                    .map_err(|e| {
-                        JournalError::Io(std::io::Error::other(format!(
-                            "replica journal write_raw_sync (end_seq {}): {e}",
-                            raw_slot.end_sequence
-                        )))
-                    })?;
-
-                self.publish_chain_hash();
-
-                // Consume the corresponding events from the disruptor to
-                // advance the cursor. The receiver published exactly
-                // `entry_count` events before sending this raw batch.
-                let mut remaining = raw_slot.entry_count as usize;
-                while remaining > 0 {
-                    let count = self
-                        .consumer
-                        .read_batch(&mut batch, remaining.min(MAX_JOURNAL_BATCH));
-                    if count > 0 {
-                        // Discard events — they were already encoded in
-                        // the slot bytes by the primary.
-                        self.consumer.commit(count);
-                        remaining -= count;
-                    } else {
-                        // Events not yet published to the disruptor by
-                        // the receiver thread — spin briefly.
-                        std::hint::spin_loop();
-                    }
-                }
-                // `raw_slot` drops here, advancing the raw-batch ring's
-                // `tail` and releasing the slot back to the sender.
-            } else {
-                idle_count += 1;
-                if idle_count.is_multiple_of(1024) {
-                    self.utilization.busy.store(busy_count, Ordering::Relaxed);
-                    self.utilization.idle.store(idle_count, Ordering::Relaxed);
-                }
-                idle_wait(&mut idle_spins, self.busy_spin);
-            }
-        }
-    }
-
-    /// Replica journal loop with io_uring overlapped writes. Same
-    /// double-buffering as the primary's `run_uring`: submits an async
-    /// Write+RWF_DSYNC while receiving the next batch from the SPSC
-    /// ring. Advances the cursor only after the CQE confirms durability.
-    ///
-    /// This overlaps NVMe writes with TCP receives, eliminating the
-    /// serialized write_raw_sync + cursor wait bottleneck.
-    /// Replica journal loop using io_uring overlapped writes.
-    ///
-    /// Receives pre-encoded journal batches from the replication handler
-    /// via a bounded SPSC ring and submits Write+RWF_DSYNC SQEs
-    /// asynchronously. The cursor advances AFTER the CQE confirms
-    /// durability, preserving the persist-before-ack guarantee.
-    ///
-    /// The SPSC ring decouples the replication handler's TCP receive
-    /// loop from the NVMe write latency: the handler can push up to
-    /// 8 batches ahead while previous writes are in flight.
-    fn run_replica_uring(
-        mut self,
-        shutdown: &std::sync::atomic::AtomicBool,
-    ) -> Result<JournalWriter, JournalError> {
-        use io_uring::{IoUring, opcode, types};
-
-        let rx = self.raw_journal_rx.take().ok_or_else(|| {
-            JournalError::Io(std::io::Error::other(
-                "run_replica_uring called without raw_journal_rx",
-            ))
-        })?;
-        let mut batch = [InputSlot::default(); MAX_JOURNAL_BATCH];
-        let mut idle_spins: u32 = 0;
-        let mut busy_count: u64 = 0;
-        let mut idle_count: u64 = 0;
-
-        // Set up io_uring — same as the primary's run_uring.
-        let mut ring: IoUring = IoUring::builder()
-            .setup_single_issuer()
-            .build(8)
-            .map_err(|e| JournalError::Io(std::io::Error::other(format!("io_uring init: {e}"))))?;
-
-        let raw_fd = self.writer.fd();
-        ring.submitter().register_files(&[raw_fd]).map_err(|e| {
-            JournalError::Io(std::io::Error::other(format!(
-                "io_uring register_files: {e}"
-            )))
-        })?;
-
-        // Pin io-wq workers to core 0.
-        {
-            let mut cpuset: libc::cpu_set_t = unsafe { std::mem::zeroed() };
-            unsafe { libc::CPU_SET(0, &mut cpuset) };
-            ring.submitter().register_iowq_aff(&cpuset).map_err(|e| {
-                JournalError::Io(std::io::Error::other(format!(
-                    "io_uring register_iowq_aff: {e}"
-                )))
-            })?;
-        }
-
-        // In-flight state. The slot stays pinned in the raw-batch ring
-        // until it is dropped from this field; that drop releases the
-        // slot's buffer back to the replication receiver thread.
-        struct InflightRaw {
-            slot: super::pipeline::RawBatchSlot,
-            entry_count: usize,
-        }
-        let mut inflight: Option<InflightRaw> = None;
-
-        loop {
-            // --- Shutdown ---
-            if shutdown.load(Ordering::Relaxed) {
-                if let Some(inf) = inflight.take() {
-                    self.wait_for_cqe(&mut ring, inf.slot.len())?;
-                    self.consume_disruptor_events(&mut batch, inf.entry_count);
-                    // `inf.slot` drops at end of scope, releasing it.
-                }
-                self.drain_remaining(&mut batch);
-                self.utilization.busy.store(busy_count, Ordering::Relaxed);
-                self.utilization.idle.store(idle_count, Ordering::Relaxed);
-                return Ok(self.writer);
-            }
-
-            // --- Reap CQE (non-blocking) ---
-            if let Some(ref inf) = inflight
-                && let Some(cqe) = ring.completion().next()
-            {
-                let result = cqe.result();
-                if result < 0 {
-                    return Err(JournalError::Io(std::io::Error::other(format!(
-                        "replica journal io_uring write returned errno {}",
-                        -result
-                    ))));
-                } else if (result as usize) != inf.slot.len() {
-                    return Err(JournalError::Io(std::io::Error::other(format!(
-                        "replica journal short write ({} of {} bytes)",
-                        result,
-                        inf.slot.len()
-                    ))));
-                }
-
-                // Safe: the `if let Some(ref inf)` guard ensures
-                // `inflight` is `Some` here.
-                let completed = inflight.take().expect("checked by if-let");
-                self.consume_disruptor_events(&mut batch, completed.entry_count);
-                self.publish_chain_hash();
-                // `completed.slot` drops here — releases the raw-batch
-                // ring slot back to the replication receiver. The
-                // receiver can now reuse that slot for the next batch.
-                drop(completed);
-            }
-
-            // --- Submit next batch (if nothing in-flight) ---
-            if inflight.is_none() {
-                if let Some(raw_slot) = rx.try_recv() {
-                    idle_spins = 0;
-                    busy_count += 1;
-                    let entry_count = raw_slot.entry_count as usize;
-                    let len = raw_slot.len();
-
-                    // Reserve the file offset and eagerly advance the
-                    // writer's `write_pos` / `next_sequence`. The CQE
-                    // will confirm durability; only then do we advance
-                    // the journal cursor.
-                    let offset = self
-                        .writer
-                        .reserve_raw_async_write(len as u64, raw_slot.entry_count as u64)
-                        .map_err(|e| {
-                            JournalError::Io(std::io::Error::other(format!(
-                                "replica journal reserve_raw_async_write (end_seq {}): {e}",
-                                raw_slot.end_sequence
-                            )))
-                        })?;
-
-                    // Submit the Write SQE with a raw pointer straight
-                    // into the raw-batch ring slot. The slot is pinned
-                    // by `raw_slot` / `inflight` until the CQE lands,
-                    // so the kernel reads stable memory.
-                    let sqe = opcode::Write::new(types::Fixed(0), raw_slot.as_ptr(), len as u32)
-                        .offset(offset)
-                        .rw_flags(libc::RWF_DSYNC)
-                        .build()
-                        .user_data(1);
-
-                    unsafe {
-                        ring.submission().push(&sqe).expect("SQ full");
-                    }
-                    ring.submit().expect("io_uring submit failed");
-
-                    inflight = Some(InflightRaw {
-                        slot: raw_slot,
-                        entry_count,
-                    });
-                } else {
-                    idle_count += 1;
-                    if idle_count.is_multiple_of(1024) {
-                        self.utilization.busy.store(busy_count, Ordering::Relaxed);
-                        self.utilization.idle.store(idle_count, Ordering::Relaxed);
-                    }
-                    idle_wait(&mut idle_spins, self.busy_spin);
-                }
-            } else {
-                // Write in-flight — don't submit another, just idle-wait
-                // for the CQE. The NVMe is busy; trying to submit more
-                // would just queue in the kernel.
-                idle_count += 1;
-                if idle_count.is_multiple_of(1024) {
-                    self.utilization.busy.store(busy_count, Ordering::Relaxed);
-                    self.utilization.idle.store(idle_count, Ordering::Relaxed);
-                }
-                idle_wait(&mut idle_spins, self.busy_spin);
-            }
-        }
-    }
-
-    /// Consume exactly `count` events from the input disruptor,
-    /// advancing the cursor. Used by the replica after an async raw
-    /// write completes.
-    fn consume_disruptor_events(&mut self, batch: &mut [InputSlot], mut remaining: usize) {
-        while remaining > 0 {
-            let count = self
-                .consumer
-                .read_batch(batch, remaining.min(MAX_JOURNAL_BATCH));
-            if count > 0 {
-                self.consumer.commit(count);
-                remaining -= count;
-            } else {
-                std::hint::spin_loop();
-            }
-        }
-    }
-
     /// Publish a batch to all active replication rings. Fully non-blocking:
     /// a single `try_publish` per ring, no spinning. If a ring is full,
     /// the replica is evicted immediately — a skipped batch would create
@@ -1189,15 +646,22 @@ impl JournalStage {
             }
             #[cfg(not(feature = "no-persist"))]
             {
-                let ts = crate::journal::writer::wall_clock_nanos();
+                let batch_ts = crate::journal::writer::wall_clock_nanos();
                 for slot in &batch[..count] {
                     if matches!(
                         slot.event,
-                        JournalEvent::QueryStats | JournalEvent::QueryPosition { .. }
+                        JournalEvent::QueryStats
+                            | JournalEvent::QueryPosition { .. }
+                            | JournalEvent::Checkpoint { .. }
                     ) {
                         continue;
                     }
-                    let seq = self.writer.allocate_sequence();
+                    let (seq, ts) = if slot.sequence != 0 {
+                        self.writer.set_next_sequence(slot.sequence + 1);
+                        (slot.sequence, slot.timestamp_ns)
+                    } else {
+                        (self.writer.allocate_sequence(), batch_ts)
+                    };
                     if let Err(e) = self.writer.encode_event(
                         seq,
                         ts,
@@ -1365,15 +829,22 @@ impl JournalStage {
                 idle_spins = 0;
                 busy_count += 1;
 
-                let ts = crate::journal::writer::wall_clock_nanos();
+                let batch_ts = crate::journal::writer::wall_clock_nanos();
                 for slot in &batch[..count] {
                     if matches!(
                         slot.event,
-                        JournalEvent::QueryStats | JournalEvent::QueryPosition { .. }
+                        JournalEvent::QueryStats
+                            | JournalEvent::QueryPosition { .. }
+                            | JournalEvent::Checkpoint { .. }
                     ) {
                         continue;
                     }
-                    let seq = self.writer.allocate_sequence();
+                    let (seq, ts) = if slot.sequence != 0 {
+                        self.writer.set_next_sequence(slot.sequence + 1);
+                        (slot.sequence, slot.timestamp_ns)
+                    } else {
+                        (self.writer.allocate_sequence(), batch_ts)
+                    };
                     self.writer
                         .encode_event(seq, ts, &slot.event, slot.key_hash, slot.request_seq)
                         .map_err(|e| {
@@ -2082,7 +1553,6 @@ pub struct ReplicaPipeline {
     pub drain_consumer: ring::Consumer<OutputSlot>,
     pub journal_cursor: Arc<Sequence>,
     pub matching_cursor: Arc<Sequence>,
-    pub raw_journal_tx: RawBatchSender,
     pub shadow_consumer: Option<ring::Consumer<InputSlot>>,
     pub chain_hash_lock: Option<Arc<SeqLock<[u8; 32]>>>,
 }
@@ -2297,12 +1767,13 @@ pub fn build_pipeline_with_replication(
 /// (journal → matching → shadow), but:
 /// - No replication ring (this IS the replica)
 /// - No `replicas_connected` halt check
-/// - Journal stage uses raw-write mode (pre-encoded bytes from primary)
 /// - Output disruptor has a single drain consumer (no response stage)
 ///
-/// Returns the input producer (for the replication receiver), the pipeline
-/// stages, the journal cursor (for ack gating), and a `RawBatchSender`
-/// for sending raw journal batches to the journal stage.
+/// The replica's journal stage encodes events from the disruptor using
+/// the pre-assigned sequences and timestamps carried in each `InputSlot`
+/// (set by the replication receiver from the primary's batch metadata).
+/// This produces byte-identical journal entries without a separate
+/// raw-write path.
 pub fn build_replica_pipeline(
     exchange: Exchange,
     writer: JournalWriter,
@@ -2344,7 +1815,6 @@ pub fn build_replica_pipeline(
     // send if the journal stage hasn't consumed the previous batch yet
     // (backpressure). Lock-free to avoid starvation when the journal
     // stage busy-spins on try_recv.
-    let (raw_tx, raw_rx) = raw_batch_channel();
     let mut journal_stage = JournalStage::new(
         writer,
         journal_consumer,
@@ -2352,7 +1822,6 @@ pub fn build_replica_pipeline(
         max_journal_batch,
         busy_spin,
     );
-    journal_stage.set_raw_journal_receiver(raw_rx);
 
     // Chain hash SeqLock for shadow snapshots.
     let chain_hash_lock = if enable_shadow {
@@ -2384,7 +1853,6 @@ pub fn build_replica_pipeline(
         drain_consumer,
         journal_cursor,
         matching_cursor,
-        raw_journal_tx: raw_tx,
         shadow_consumer,
         chain_hash_lock,
     }
@@ -2452,6 +1920,8 @@ mod tests {
             connection_id: 1,
             key_hash: 0,
             request_seq: 0,
+            sequence: 0,
+            timestamp_ns: 0,
             event: JournalEvent::AddInstrument {
                 spec: InstrumentSpec {
                     symbol: Symbol(1),
@@ -2466,6 +1936,8 @@ mod tests {
             connection_id: 1,
             key_hash: 0,
             request_seq: 0,
+            sequence: 0,
+            timestamp_ns: 0,
             event: JournalEvent::Deposit {
                 account: AccountId(1),
                 currency: CurrencyId(1),
@@ -2536,6 +2008,8 @@ mod tests {
             connection_id: 42,
             key_hash: 0,
             request_seq: 0,
+            sequence: 0,
+            timestamp_ns: 0,
             event: JournalEvent::SubmitOrder {
                 symbol: Symbol(1),
                 order: limit_order(1, AccountId(2), Side::Sell, 100, 50),
@@ -2624,6 +2098,8 @@ mod tests {
             connection_id: 1,
             key_hash: 0,
             request_seq: 0,
+            sequence: 0,
+            timestamp_ns: 0,
             event: JournalEvent::SubmitOrder {
                 symbol: Symbol(1),
                 order: limit_order(1, AccountId(2), Side::Sell, 100, 50),
@@ -2733,6 +2209,8 @@ mod tests {
             connection_id: 1,
             key_hash: 0,
             request_seq: 0,
+            sequence: 0,
+            timestamp_ns: 0,
             event: JournalEvent::SubmitOrder {
                 symbol: Symbol(1),
                 order: limit_order(1, AccountId(2), Side::Sell, 100, 50),
@@ -2973,6 +2451,8 @@ mod tests {
             connection_id: 1,
             key_hash: 0xAA,
             request_seq: 1,
+            sequence: 0,
+            timestamp_ns: 0,
             event: JournalEvent::SubmitOrder {
                 symbol: Symbol(1),
                 order: limit_order(100, AccountId(1), Side::Buy, 50, 10),
@@ -3005,6 +2485,8 @@ mod tests {
             connection_id: 1,
             key_hash: 0,
             request_seq: 0,
+            sequence: 0,
+            timestamp_ns: 0,
             event: JournalEvent::Deposit {
                 account: AccountId(1),
                 currency: CurrencyId(1),
@@ -3036,6 +2518,8 @@ mod tests {
             connection_id: 1,
             key_hash: 0,
             request_seq: 0,
+            sequence: 0,
+            timestamp_ns: 0,
             event: JournalEvent::QueryStats,
             publish_ts: trace_ts(),
             recv_ts: trace_ts(),
@@ -3076,6 +2560,8 @@ mod tests {
             connection_id: 1,
             key_hash: 0xBB,
             request_seq: 1,
+            sequence: 0,
+            timestamp_ns: 0,
             event: JournalEvent::SubmitOrder {
                 symbol: Symbol(1),
                 order: limit_order(200, AccountId(1), Side::Buy, 50, 10),
@@ -3101,6 +2587,8 @@ mod tests {
             connection_id: 1,
             key_hash: 0xBB,
             request_seq: 1,
+            sequence: 0,
+            timestamp_ns: 0,
             event: JournalEvent::SubmitOrder {
                 symbol: Symbol(1),
                 order: limit_order(200, AccountId(1), Side::Buy, 50, 10),
@@ -3160,6 +2648,8 @@ mod tests {
             connection_id: 1,
             key_hash: 0,
             request_seq: 0,
+            sequence: 0,
+            timestamp_ns: 0,
             event: JournalEvent::SubmitOrder {
                 symbol: Symbol(1),
                 order: limit_order(1, AccountId(1), Side::Buy, 50, 10),
@@ -3178,387 +2668,5 @@ mod tests {
 
         shutdown.store(true, Ordering::Relaxed);
         handle.join().unwrap();
-    }
-
-    /// Journal stage in replica mode: writes raw bytes from a channel and
-    /// advances the disruptor cursor only after the durable write.
-    #[test]
-    fn replica_journal_stage_writes_raw_bytes_and_advances_cursor() {
-        let dir = tempfile::tempdir().unwrap();
-        let primary_path = dir.path().join("primary.journal");
-        let replica_path = dir.path().join("replica.journal");
-
-        // Write events to a primary journal to get raw bytes.
-        let events = vec![
-            JournalEvent::Deposit {
-                account: AccountId(1),
-                currency: CurrencyId(0),
-                amount: 500,
-            },
-            JournalEvent::Deposit {
-                account: AccountId(2),
-                currency: CurrencyId(0),
-                amount: 300,
-            },
-        ];
-
-        let raw_bytes;
-        let entry_count;
-        {
-            let mut writer = crate::journal::writer::JournalWriter::create(&primary_path).unwrap();
-            for event in &events {
-                writer.batch_append(event).unwrap();
-            }
-            raw_bytes = writer.pending_batch_bytes().to_vec();
-            entry_count = events.len() as u32;
-            writer.flush_batch_sync().unwrap();
-        }
-
-        // Set up replica pipeline components: disruptor + journal stage with
-        // raw_journal_rx.
-        let replica_writer = crate::journal::writer::JournalWriter::create(&replica_path).unwrap();
-
-        let (input_producer, mut consumers) = ring::DisruptorBuilder::<InputSlot>::new(64)
-            .add_consumer()
-            .build_multi_producer();
-        let consumer = consumers.pop().unwrap();
-        let journal_cursor = consumer.progress_counter();
-
-        let (raw_tx, raw_rx) = raw_batch_channel();
-
-        let mut stage = JournalStage::new(
-            replica_writer,
-            consumer,
-            Duration::ZERO,
-            MAX_JOURNAL_BATCH,
-            false,
-        );
-        stage.set_raw_journal_receiver(raw_rx);
-
-        let shutdown = Arc::new(AtomicBool::new(false));
-        let shutdown2 = Arc::clone(&shutdown);
-        let handle = std::thread::spawn(move || stage.run(&shutdown2));
-
-        // Publish events to the disruptor (same as the replication receiver
-        // would do) so the journal stage can advance the cursor.
-        for event in &events {
-            input_producer.publish(InputSlot {
-                connection_id: 0,
-                key_hash: 0,
-                request_seq: 0,
-                event: *event,
-                publish_ts: trace_ts(),
-                recv_ts: trace_ts(),
-            });
-        }
-
-        // Send raw bytes via the pre-allocated channel.
-        raw_tx.send(
-            &raw_bytes,
-            FIRST_SEQ + entry_count as u64 - 1,
-            [0u8; 32],
-            entry_count,
-        );
-
-        // Wait for the journal cursor to advance past our events.
-        let deadline = std::time::Instant::now() + Duration::from_secs(2);
-        while journal_cursor.get().load(Ordering::Acquire) < entry_count as u64 {
-            assert!(
-                std::time::Instant::now() < deadline,
-                "timeout waiting for replica journal cursor"
-            );
-            std::hint::spin_loop();
-        }
-
-        // Shut down and verify the replica journal has the correct entries.
-        shutdown.store(true, Ordering::Relaxed);
-        let _writer = handle.join().unwrap();
-
-        #[cfg(not(feature = "no-persist"))]
-        {
-            let mut reader = crate::journal::JournalReader::open(&replica_path).unwrap();
-            let e1 = reader.next_entry().unwrap().unwrap();
-            assert!(matches!(
-                e1.event,
-                JournalEvent::Deposit { amount: 500, .. }
-            ));
-            let e2 = reader.next_entry().unwrap().unwrap();
-            assert!(matches!(
-                e2.event,
-                JournalEvent::Deposit { amount: 300, .. }
-            ));
-            assert!(reader.next_entry().unwrap().is_none());
-        }
-    }
-
-    /// `build_replica_pipeline` produces a working pipeline: events published
-    /// to the input disruptor are processed by the matching stage, and raw
-    /// bytes sent to the journal stage are written to disk.
-    #[test]
-    fn build_replica_pipeline_end_to_end() {
-        let dir = tempfile::tempdir().unwrap();
-        let primary_path = dir.path().join("primary.journal");
-        let replica_path = dir.path().join("replica.journal");
-
-        // Prepare a primary journal to get raw bytes.
-        let deposit = JournalEvent::Deposit {
-            account: AccountId(1),
-            currency: CurrencyId(0),
-            amount: 1_000,
-        };
-        let raw_bytes;
-        {
-            let mut writer = crate::journal::writer::JournalWriter::create(&primary_path).unwrap();
-            writer.batch_append(&deposit).unwrap();
-            raw_bytes = writer.pending_batch_bytes().to_vec();
-            writer.flush_batch_sync().unwrap();
-        }
-
-        // Build the replica pipeline.
-        let exchange = Exchange::new();
-        let writer = crate::journal::writer::JournalWriter::create(&replica_path).unwrap();
-        let out = build_replica_pipeline(exchange, writer, MAX_JOURNAL_BATCH, false, false);
-
-        let shutdown = Arc::new(AtomicBool::new(false));
-
-        let s = Arc::clone(&shutdown);
-        let journal_stage = out.journal_stage;
-        let j_handle = std::thread::spawn(move || journal_stage.run(&s));
-
-        let s = Arc::clone(&shutdown);
-        let matching_stage = out.matching_stage;
-        let m_handle = std::thread::spawn(move || matching_stage.run(&s));
-
-        // Drain output so matching stage doesn't block.
-        let s = Arc::clone(&shutdown);
-        let d_handle = std::thread::spawn(move || {
-            let mut consumer = out.drain_consumer;
-            let mut batch = vec![OutputSlot::default(); 64];
-            loop {
-                if s.load(Ordering::Relaxed) {
-                    return;
-                }
-                let count = consumer.consume_batch(&mut batch, 64);
-                if count == 0 {
-                    std::thread::yield_now();
-                }
-            }
-        });
-
-        let input_producer = out.input_producer;
-        let raw_journal_tx = out.raw_journal_tx;
-        let journal_cursor = out.journal_cursor;
-
-        // Publish event to disruptor and raw bytes to journal stage.
-        input_producer.publish(InputSlot {
-            connection_id: 0,
-            key_hash: 0,
-            request_seq: 0,
-            event: deposit,
-            publish_ts: trace_ts(),
-            recv_ts: trace_ts(),
-        });
-        raw_journal_tx.send(&raw_bytes, FIRST_SEQ, [0u8; 32], 1);
-
-        // Wait for journal cursor.
-        let deadline = std::time::Instant::now() + Duration::from_secs(2);
-        while journal_cursor.get().load(Ordering::Acquire) < 1 {
-            assert!(
-                std::time::Instant::now() < deadline,
-                "timeout waiting for journal cursor"
-            );
-            std::hint::spin_loop();
-        }
-
-        // Shut down pipeline.
-        drop(raw_journal_tx); // unblock journal stage
-        shutdown.store(true, Ordering::Relaxed);
-        let _writer = j_handle.join().unwrap();
-        let exchange = m_handle.join().unwrap();
-        let _ = d_handle.join();
-
-        // Verify matching stage applied the deposit.
-        assert!(
-            exchange.accounts().has_balances(AccountId(1)),
-            "matching stage should have applied the deposit"
-        );
-
-        // Verify journal has the entry.
-        #[cfg(not(feature = "no-persist"))]
-        {
-            let mut reader = crate::journal::JournalReader::open(&replica_path).unwrap();
-            let entry = reader.next_entry().unwrap().unwrap();
-            assert!(matches!(
-                entry.event,
-                JournalEvent::Deposit { amount: 1_000, .. }
-            ));
-        }
-    }
-
-    // --- SPSC ring unit tests ---
-
-    #[test]
-    fn raw_batch_ring_send_recv() {
-        let (tx, rx) = raw_batch_channel();
-        tx.send(&[1, 2, 3], 10, [0u8; 32], 1);
-        let slot = rx.try_recv().unwrap();
-        assert_eq!(slot.bytes(), &[1, 2, 3]);
-        assert_eq!(slot.end_sequence, 10);
-        assert_eq!(slot.entry_count, 1);
-    }
-
-    #[test]
-    fn raw_batch_ring_empty_returns_none() {
-        let (_tx, rx) = raw_batch_channel();
-        assert!(rx.try_recv().is_none());
-    }
-
-    #[test]
-    fn raw_batch_ring_fill_all_slots() {
-        let (tx, rx) = raw_batch_channel();
-        // Fill all 8 slots.
-        for i in 0..RAW_RING_CAPACITY {
-            tx.send(&[i as u8], i as u64, [0u8; 32], 1);
-        }
-        // Drain all — each slot handle drops at end-of-iteration,
-        // advancing `tail` and releasing the slot back to the sender.
-        for i in 0..RAW_RING_CAPACITY {
-            let slot = rx.try_recv().unwrap();
-            assert_eq!(slot.bytes(), &[i as u8]);
-            assert_eq!(slot.end_sequence, i as u64);
-        }
-        assert!(rx.try_recv().is_none());
-    }
-
-    #[test]
-    fn raw_batch_ring_wraps_around() {
-        let (tx, rx) = raw_batch_channel();
-        // Send and receive more than capacity to exercise wrap-around.
-        for round in 0..3u64 {
-            for slot in 0..RAW_RING_CAPACITY as u64 {
-                let seq = round * RAW_RING_CAPACITY as u64 + slot;
-                tx.send(&[seq as u8], seq, [0u8; 32], 1);
-            }
-            for slot in 0..RAW_RING_CAPACITY as u64 {
-                let seq = round * RAW_RING_CAPACITY as u64 + slot;
-                let handle = rx.try_recv().unwrap();
-                assert_eq!(handle.end_sequence, seq);
-            }
-            assert!(rx.try_recv().is_none());
-        }
-    }
-
-    #[test]
-    fn raw_batch_ring_concurrent_send_recv() {
-        use std::thread;
-
-        let (tx, rx) = raw_batch_channel();
-        let count = 10_000u64;
-
-        let producer = thread::spawn(move || {
-            for i in 0..count {
-                tx.send(&[(i & 0xFF) as u8], i, [0u8; 32], 1);
-            }
-        });
-
-        let consumer = thread::spawn(move || {
-            let mut received = 0u64;
-            while received < count {
-                if let Some(handle) = rx.try_recv() {
-                    assert_eq!(handle.end_sequence, received);
-                    received += 1;
-                } else {
-                    std::hint::spin_loop();
-                }
-            }
-        });
-
-        producer.join().unwrap();
-        consumer.join().unwrap();
-    }
-
-    #[test]
-    fn raw_batch_ring_drop_releases_uncommitted_slots() {
-        // The new ring holds its slot buffers inline (no boxed
-        // payloads), so there's nothing to leak if the channel is
-        // dropped with outstanding batches — the Box<[UnsafeCell<Vec>]>
-        // drops cleanly. This test exists to catch future regressions
-        // where a drop impl might start to matter.
-        let (tx, rx) = raw_batch_channel();
-        for i in 0..3u8 {
-            tx.send(&[i], i as u64, [0u8; 32], 1);
-        }
-        let _ = rx.try_recv(); // Consume 1, dropping its handle here.
-        drop(tx);
-        drop(rx);
-    }
-
-    #[test]
-    fn raw_batch_ring_sender_drops_before_receiver() {
-        let (tx, rx) = raw_batch_channel();
-        tx.send(&[42], 1, [0u8; 32], 1);
-        // Drop sender first — the Arc<RawBatchRing> in the slot handle
-        // keeps the backing storage alive, so the receiver still reads
-        // the batch cleanly.
-        drop(tx);
-        let slot = rx.try_recv().unwrap();
-        assert_eq!(slot.bytes(), &[42]);
-        drop(slot);
-        assert!(rx.try_recv().is_none());
-    }
-
-    #[test]
-    fn raw_batch_ring_slot_grows_past_initial_capacity() {
-        // The slot buffer starts at RAW_SLOT_INITIAL_CAPACITY (1 MiB) but
-        // is a `Vec<u8>` so it grows amortized on larger bursts. Send a
-        // batch that exceeds the initial capacity and verify the payload
-        // round-trips correctly.
-        let (tx, rx) = raw_batch_channel();
-        let big: Vec<u8> = (0..(RAW_SLOT_INITIAL_CAPACITY + 4096))
-            .map(|i| (i & 0xFF) as u8)
-            .collect();
-        tx.send(&big, 99, [0xCC; 32], 1);
-        let slot = rx.try_recv().unwrap();
-        assert_eq!(slot.len(), big.len());
-        assert_eq!(slot.bytes(), big.as_slice());
-        assert_eq!(slot.end_sequence, 99);
-        assert_eq!(slot.chain_hash, [0xCC; 32]);
-
-        // After the slot is released, the sender can reuse it for a
-        // smaller batch. The Vec keeps its grown capacity; no realloc
-        // on the next send.
-        drop(slot);
-        tx.send(&[1, 2, 3], 100, [0; 32], 1);
-        let next = rx.try_recv().unwrap();
-        assert_eq!(next.bytes(), &[1, 2, 3]);
-    }
-
-    #[test]
-    fn raw_batch_ring_slot_pins_buffer_until_drop() {
-        // The sender must not overwrite a slot while its handle is
-        // held by the consumer. Verify by keeping a slot alive across
-        // multiple sends that would otherwise wrap onto it.
-        let (tx, rx) = raw_batch_channel();
-        tx.send(&[0xAA, 0xBB, 0xCC], 1, [0u8; 32], 1);
-        let slot = rx.try_recv().unwrap();
-
-        // Fill the remaining 7 slots — sender is blocked from reusing
-        // slot[0] because `slot` is still held by us (tail hasn't
-        // advanced). This succeeds because CAP - 1 = 7 slots remain.
-        for i in 1..RAW_RING_CAPACITY as u64 {
-            tx.send(&[i as u8], i + 1, [0u8; 32], 1);
-        }
-
-        // The first slot's bytes must still be intact — the held handle
-        // pinned them.
-        assert_eq!(slot.bytes(), &[0xAA, 0xBB, 0xCC]);
-        assert_eq!(slot.end_sequence, 1);
-        drop(slot); // Release slot 0 back to the sender.
-
-        // Now drain the remaining 7.
-        for i in 1..RAW_RING_CAPACITY as u64 {
-            let next = rx.try_recv().unwrap();
-            assert_eq!(next.end_sequence, i + 1);
-        }
     }
 }

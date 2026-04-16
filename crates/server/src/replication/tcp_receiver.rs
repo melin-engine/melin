@@ -78,7 +78,6 @@ fn replica_stream_uring(
     input_producer: &melin_disruptor::ring::MultiProducer<
         melin_engine::journal::pipeline::InputSlot,
     >,
-    raw_journal_tx: &melin_engine::journal::pipeline::RawBatchSender,
     journal_cursor: &melin_disruptor::padding::Sequence,
     pending_acks: &mut PendingAckQueue,
     received_data: &mut bool,
@@ -231,13 +230,7 @@ fn replica_stream_uring(
             }
             // Submit any accumulated data before returning.
             if !journal_accum.is_empty() && !pending_acks.is_full() {
-                if let Ok(target) = submit_batch_to_pipeline(
-                    journal_accum,
-                    *accum_end_sequence,
-                    *accum_chain_hash,
-                    input_producer,
-                    raw_journal_tx,
-                ) {
+                if let Ok(target) = submit_batch_to_pipeline(journal_accum, input_producer) {
                     pending_acks.push(target, *accum_end_sequence);
                 }
                 journal_accum.clear();
@@ -580,13 +573,7 @@ fn replica_stream_uring(
 
                     // Submit accumulated data to pipeline (if room in pending acks).
                     if !journal_accum.is_empty() && !pending_acks.is_full() {
-                        match submit_batch_to_pipeline(
-                            journal_accum,
-                            *accum_end_sequence,
-                            *accum_chain_hash,
-                            input_producer,
-                            raw_journal_tx,
-                        ) {
+                        match submit_batch_to_pipeline(journal_accum, input_producer) {
                             Ok(target) => {
                                 pending_acks.push(target, *accum_end_sequence);
                                 journal_accum.clear();
@@ -1020,7 +1007,6 @@ pub fn run_receiver(
         let matching_stage = pipeline.matching_stage;
         let drain_consumer = pipeline.drain_consumer;
         let journal_cursor = pipeline.journal_cursor;
-        let raw_journal_tx = pipeline.raw_journal_tx;
         let shadow_consumer = pipeline.shadow_consumer;
         let chain_hash_lock = pipeline.chain_hash_lock;
 
@@ -1106,7 +1092,6 @@ pub fn run_receiver(
         let exit_reason: SessionExit = replica_stream_uring(
             &tcp_writer,
             &input_producer,
-            &raw_journal_tx,
             &journal_cursor,
             &mut pending_acks,
             &mut received_data,
@@ -1122,13 +1107,7 @@ pub fn run_receiver(
 
         // Flush any accumulated data not yet submitted.
         if !journal_accum.is_empty() {
-            if let Ok(target) = submit_batch_to_pipeline(
-                &journal_accum,
-                accum_end_sequence,
-                accum_chain_hash,
-                &input_producer,
-                &raw_journal_tx,
-            ) {
+            if let Ok(target) = submit_batch_to_pipeline(&journal_accum, &input_producer) {
                 pending_acks.push(target, accum_end_sequence);
             }
             journal_accum.clear();
@@ -1139,7 +1118,6 @@ pub fn run_receiver(
         }
 
         // Shut down pipeline and recover state.
-        drop(raw_journal_tx);
         let pipeline_state = shutdown_pipeline(
             &pipeline_shutdown,
             journal_handle,

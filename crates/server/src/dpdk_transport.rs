@@ -577,6 +577,8 @@ fn process_trading_frames(
                         connection_id: conn.connection_id.0,
                         key_hash: conn.key_hash,
                         request_seq: seq,
+                        sequence: 0,
+                        timestamp_ns: 0,
                         event,
                         #[allow(clippy::let_unit_value)]
                         publish_ts: trace_ts(),

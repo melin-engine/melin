@@ -1003,6 +1003,8 @@ fn run_as_primary<L: BlockingTransportListener>(
                 connection_id: 0,
                 key_hash: 0,
                 request_seq: 0,
+                sequence: 0,
+                timestamp_ns: 0,
                 event: JournalEvent::AddInstrument {
                     spec: InstrumentSpec {
                         symbol: Symbol(i),
@@ -1024,6 +1026,8 @@ fn run_as_primary<L: BlockingTransportListener>(
                 connection_id: 0,
                 key_hash: 0,
                 request_seq: 0,
+                sequence: 0,
+                timestamp_ns: 0,
                 event: JournalEvent::ProvisionAccount {
                     account: AccountId(acct),
                     amount: u64::MAX / 4,
@@ -1770,6 +1774,8 @@ pub fn run_dpdk(
                 connection_id: 0,
                 key_hash: 0,
                 request_seq: 0,
+                sequence: 0,
+                timestamp_ns: 0,
                 event: JournalEvent::AddInstrument {
                     spec: InstrumentSpec {
                         symbol: Symbol(i),
@@ -1788,6 +1794,8 @@ pub fn run_dpdk(
                 connection_id: 0,
                 key_hash: 0,
                 request_seq: 0,
+                sequence: 0,
+                timestamp_ns: 0,
                 event: JournalEvent::ProvisionAccount {
                     account: AccountId(acct),
                     amount: u64::MAX / 4,

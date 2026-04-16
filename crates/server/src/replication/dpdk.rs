@@ -1055,7 +1055,6 @@ pub fn run_receiver_dpdk(
         let matching_stage = pipeline.matching_stage;
         let drain_consumer = pipeline.drain_consumer;
         let journal_cursor = pipeline.journal_cursor;
-        let raw_journal_tx = pipeline.raw_journal_tx;
         let shadow_consumer = pipeline.shadow_consumer;
         let chain_hash_lock = pipeline.chain_hash_lock;
 
@@ -1143,7 +1142,6 @@ pub fn run_receiver_dpdk(
                     send_ack_dpdk!(seq);
                     transport.poll();
                 }
-                drop(raw_journal_tx);
                 shutdown_pipeline(
                     &pipeline_shutdown,
                     journal_handle,
@@ -1191,13 +1189,7 @@ pub fn run_receiver_dpdk(
                     compact_recv_buf(&mut recv_buf, consumed);
                 }
                 if !journal_accum.is_empty() {
-                    if let Ok(target) = submit_batch_to_pipeline(
-                        &journal_accum,
-                        accum_end_sequence,
-                        accum_chain_hash,
-                        &input_producer,
-                        &raw_journal_tx,
-                    ) {
+                    if let Ok(target) = submit_batch_to_pipeline(&journal_accum, &input_producer) {
                         pending_acks.push(target, accum_end_sequence);
                     }
                     journal_accum.clear();
@@ -1206,7 +1198,6 @@ pub fn run_receiver_dpdk(
                     send_ack_dpdk!(seq);
                     transport.poll();
                 }
-                drop(raw_journal_tx);
                 return match shutdown_pipeline(
                     &pipeline_shutdown,
                     journal_handle,
@@ -1277,7 +1268,6 @@ pub fn run_receiver_dpdk(
                                     // have surfaced it as Err. Treat as a
                                     // protocol violation.
                                     warn!("malformed DataBatch slipped past fast path (DPDK)");
-                                    drop(raw_journal_tx);
                                     shutdown_pipeline(
                                         &pipeline_shutdown,
                                         journal_handle,
@@ -1291,7 +1281,6 @@ pub fn run_receiver_dpdk(
                                     debug!("unexpected message during streaming: {other:?}");
                                 }
                                 Err(e) => {
-                                    drop(raw_journal_tx);
                                     shutdown_pipeline(
                                         &pipeline_shutdown,
                                         journal_handle,
@@ -1308,7 +1297,6 @@ pub fn run_receiver_dpdk(
                         consumed += frame_end;
                     }
                     FrameResult::Oversized => {
-                        drop(raw_journal_tx);
                         shutdown_pipeline(
                             &pipeline_shutdown,
                             journal_handle,
@@ -1325,13 +1313,7 @@ pub fn run_receiver_dpdk(
 
             // Submit to pipeline and record pending ack.
             if got_data {
-                let target = submit_batch_to_pipeline(
-                    &journal_accum,
-                    accum_end_sequence,
-                    accum_chain_hash,
-                    &input_producer,
-                    &raw_journal_tx,
-                )?;
+                let target = submit_batch_to_pipeline(&journal_accum, &input_producer)?;
 
                 pending_acks.push(target, accum_end_sequence);
                 journal_accum.clear();
@@ -1342,7 +1324,6 @@ pub fn run_receiver_dpdk(
 
         // --- Disconnect handling: recover state and reconnect ---
         let _disconnected = session_exit; // false = disconnected
-        drop(raw_journal_tx);
 
         match shutdown_pipeline(
             &pipeline_shutdown,

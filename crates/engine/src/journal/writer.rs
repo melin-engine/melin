@@ -597,12 +597,10 @@ impl JournalWriter {
     /// not advance the journal cursor until the CQE confirms durability.
     ///
     /// Unlike the primary path's `take_batch_for_async_write`, there is
-    /// no owned buffer to carry through the CQE here — the slot memory
-    /// is pinned by the raw-batch ring protocol, and the receiver
-    /// releases it by dropping the [`super::pipeline::RawBatchSlot`]
-    /// handle after the CQE lands. Consequently there is no "confirm"
-    /// counterpart: the writer state is already consistent at the end
-    /// of this call.
+    /// no owned buffer to carry through the CQE here — the caller is
+    /// responsible for pinning the data buffer until the write completes.
+    /// Consequently there is no "confirm" counterpart: the writer state
+    /// is already consistent at the end of this call.
     pub fn reserve_raw_async_write(
         &mut self,
         len: u64,
@@ -627,6 +625,15 @@ impl JournalWriter {
     /// Current next sequence number (useful for snapshot coordination).
     pub fn next_sequence(&self) -> u64 {
         self.next_sequence
+    }
+
+    /// Set the next sequence number.
+    ///
+    /// Used by the replica to keep the writer's internal counter in sync
+    /// with the primary's pre-assigned sequences. This ensures that
+    /// auto-emitted checkpoint entries get the correct sequence numbers.
+    pub fn set_next_sequence(&mut self, seq: u64) {
+        self.next_sequence = seq;
     }
 
     /// Current byte offset in the journal file (size of valid data).

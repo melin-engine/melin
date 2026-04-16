@@ -645,6 +645,8 @@ mod tests {
             connection_id: 0,
             key_hash: 0,
             request_seq: 0,
+            sequence: 0,
+            timestamp_ns: 0,
             event: JournalEvent::Deposit {
                 account: AccountId(1),
                 currency: CurrencyId(1),
@@ -657,6 +659,8 @@ mod tests {
             connection_id: 0,
             key_hash: 0,
             request_seq: 0,
+            sequence: 0,
+            timestamp_ns: 0,
             event: JournalEvent::Deposit {
                 account: AccountId(1),
                 currency: CurrencyId(1),

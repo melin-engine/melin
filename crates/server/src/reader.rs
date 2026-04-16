@@ -690,6 +690,8 @@ fn process_frames<R>(
                 connection_id: conn.connection_id,
                 key_hash: conn.key_hash,
                 request_seq: seq,
+                sequence: 0,
+                timestamp_ns: 0,
                 event,
                 publish_ts: trace_ts(),
                 recv_ts,
