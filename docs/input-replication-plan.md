@@ -29,39 +29,23 @@ Every node — primary and replica — runs the full pipeline: encoding, matchin
 
 ## Migration Steps
 
-### Step 1: Extract an Explicit Sequencer Stage
+### ~~Step 1: Extract an Explicit Sequencer Stage~~ (DONE)
 
-**Goal**: Make the "assign sequence + timestamp" step a separable, identifiable stage on the primary, distinct from journal encoding.
+Separated `allocate_sequence()` from `encode_event()` on `JournalWriter`. Added `sequence` and `timestamp_ns` fields to `InputSlot`. JournalStage batch loops use the explicit two-step pattern. No behavioral change — pure refactor.
 
-Today, sequencing is implicit — events get sequence numbers as part of journal encoding in `JournalStage`. Extract this so that:
+### ~~Steps 2+3: Replicas Encode Independently~~ (DONE)
 
-- Input commands receive a sequence number and a canonical timestamp before they enter the disruptor.
-- The sequence + timestamp travel with the command through the pipeline.
-- `JournalStage` and `MatchingStage` consume already-sequenced inputs.
+Combined Steps 2 and 3 into a single change. The wire format is unchanged — `JournalEvent` already contains only input commands, so the DataBatch payload is already a serialized input stream.
 
-This is a refactor with no behavioral change. The replication stream still carries journal output after this step.
+What changed:
+- `submit_batch_to_pipeline` now populates `InputSlot.sequence` and `InputSlot.timestamp_ns` from decoded entries (previously ignored). Checkpoint events are filtered out.
+- Replica JournalStage runs in normal encode mode (`run_sync`/`run_uring`) instead of `run_replica` raw-write mode.
+- When `slot.sequence != 0`, the JournalStage uses the pre-assigned sequence and timestamp from the primary, keeping journals aligned.
+- Removed the entire `RawBatch` infrastructure (~900 lines): `write_raw_sync`, `RawBatchSender/Receiver/Ring`, `run_replica`, `run_replica_uring`.
 
-### Step 2: Replicate Sequenced Inputs Instead of Journal Output
+Every node now runs the full pipeline independently. Promotion means "start accepting clients."
 
-**Goal**: Change the replication stream from encoded journal bytes to sequenced input commands.
-
-- The replication ring payload changes from `&[u8]` (journal bytes) to sequenced input commands.
-- The primary publishes to the replication ring after sequencing but before processing.
-- The wire protocol `DataBatch` frame carries serialized input commands instead of journal entry bytes.
-- The replica receives input commands, not journal bytes.
-
-This is the core change. After this step, the replica has the raw inputs but still needs to process them.
-
-### Step 3: Replicas Run the Full Exchange Pipeline
-
-**Goal**: Replicas process inputs through their own Exchange instead of replaying journal output.
-
-- Remove `write_raw_sync` path from replica `JournalStage`.
-- Replica runs the same pipeline as primary: sequenced input → MatchingStage → JournalStage (encodes its own output).
-- Replica journals are self-encoded (no longer byte-identical to primary, but logically identical).
-- Ack semantics change: the replica acks after its own journal stage confirms durable write of processed output, not after writing raw bytes.
-
-After this step, every node is a full state machine. Promotion means "start accepting clients" — the Exchange is already running independently.
+**Known limitation**: journal rotation on the primary inserts a `GenesisHash` entry that may cause the replica's checkpoint counter to drift. Without rotation, sequences are guaranteed to align.
 
 ### Step 4: Add Divergence Detection
 

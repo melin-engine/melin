@@ -1772,8 +1772,10 @@ pub fn build_pipeline_with_replication(
 /// The replica's journal stage encodes events from the disruptor using
 /// the pre-assigned sequences and timestamps carried in each `InputSlot`
 /// (set by the replication receiver from the primary's batch metadata).
-/// This produces byte-identical journal entries without a separate
-/// raw-write path.
+/// Journals are logically identical across nodes (same sequences, same
+/// events) but not byte-identical (each node stamps its own wall-clock
+/// on the batch when `slot.sequence == 0`, and checkpoint timing may
+/// vary after journal rotation).
 pub fn build_replica_pipeline(
     exchange: Exchange,
     writer: JournalWriter,
@@ -1810,11 +1812,8 @@ pub fn build_replica_pipeline(
 
     let events_processed = Arc::new(AtomicU64::new(0));
 
-    // Journal stage in replica mode: raw-write via lock-free hand-off.
-    // Single-slot (one batch in flight). The receiver thread spins on
-    // send if the journal stage hasn't consumed the previous batch yet
-    // (backpressure). Lock-free to avoid starvation when the journal
-    // stage busy-spins on try_recv.
+    // Journal stage: same as primary (encode mode). Pre-assigned sequences
+    // in each InputSlot keep the replica's journal aligned with the primary.
     let mut journal_stage = JournalStage::new(
         writer,
         journal_consumer,
@@ -1961,6 +1960,86 @@ mod tests {
             assert!(matches!(entry1.event, JournalEvent::AddInstrument { .. }));
             let entry2 = reader.next_entry().unwrap().unwrap();
             assert!(matches!(entry2.event, JournalEvent::Deposit { .. }));
+            assert!(reader.next_entry().unwrap().is_none());
+        }
+    }
+
+    /// Verify the JournalStage uses pre-assigned sequences and timestamps
+    /// when `InputSlot.sequence != 0` (replica mode). The encoded journal
+    /// entries must carry the primary's sequence numbers, not locally
+    /// allocated ones.
+    #[test]
+    fn journal_stage_uses_preassigned_sequences() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("preseq.journal");
+
+        let writer = JournalWriter::create(&path).unwrap();
+
+        let (mut producer, mut consumers) = ring::DisruptorBuilder::<InputSlot>::new(64)
+            .add_consumer()
+            .build();
+
+        let consumer = consumers.pop().unwrap();
+        let stage = JournalStage::new(writer, consumer, Duration::ZERO, MAX_JOURNAL_BATCH, false);
+
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let shutdown2 = Arc::clone(&shutdown);
+
+        // Publish events with pre-assigned sequences (simulating replica mode).
+        // Use sequence numbers starting at 100 to make it obvious they're
+        // not locally allocated (which would start at FIRST_SEQ = 2).
+        producer.publish(InputSlot {
+            connection_id: 0,
+            key_hash: 0,
+            request_seq: 0,
+            sequence: 100,
+            timestamp_ns: 1_700_000_000_000_000_000, // fixed timestamp
+            event: JournalEvent::AddInstrument {
+                spec: InstrumentSpec {
+                    symbol: Symbol(1),
+                    base: CurrencyId(0),
+                    quote: CurrencyId(1),
+                },
+            },
+            publish_ts: trace_ts(),
+            recv_ts: trace_ts(),
+        });
+        producer.publish(InputSlot {
+            connection_id: 0,
+            key_hash: 0,
+            request_seq: 0,
+            sequence: 101,
+            timestamp_ns: 1_700_000_000_000_000_001,
+            event: JournalEvent::Deposit {
+                account: AccountId(1),
+                currency: CurrencyId(0),
+                amount: 500,
+            },
+            publish_ts: trace_ts(),
+            recv_ts: trace_ts(),
+        });
+
+        let handle = std::thread::spawn(move || stage.run(&shutdown2));
+
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        shutdown.store(true, Ordering::Relaxed);
+        let _writer = handle.join().unwrap();
+
+        // Verify the encoded journal entries carry the pre-assigned sequences
+        // and timestamps, not locally allocated ones.
+        #[cfg(not(feature = "no-persist"))]
+        {
+            let mut reader = crate::journal::JournalReader::open(&path).unwrap();
+            let entry1 = reader.next_entry().unwrap().unwrap();
+            assert_eq!(entry1.sequence, 100);
+            assert_eq!(entry1.timestamp_ns, 1_700_000_000_000_000_000);
+            assert!(matches!(entry1.event, JournalEvent::AddInstrument { .. }));
+
+            let entry2 = reader.next_entry().unwrap().unwrap();
+            assert_eq!(entry2.sequence, 101);
+            assert_eq!(entry2.timestamp_ns, 1_700_000_000_000_000_001);
+            assert!(matches!(entry2.event, JournalEvent::Deposit { .. }));
+
             assert!(reader.next_entry().unwrap().is_none());
         }
     }
