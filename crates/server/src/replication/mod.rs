@@ -292,16 +292,15 @@ pub(super) fn shutdown_pipeline(
 /// Returns the disruptor sequence target that the caller must wait for
 /// before sending an ack (ensures persist-before-ack).
 ///
-/// Checkpoint events are filtered out — each node auto-emits its own
-/// checkpoints independently during encoding. All other events (including
-/// GenesisHash from journal rotation) are published with the primary's
-/// sequence and timestamp so the replica's JournalStage can encode them
-/// with identical sequence numbers.
+/// All events are published, including Checkpoint entries from the
+/// primary. The JournalStage skips encoding checkpoints (each node
+/// auto-emits its own), but uses the primary's checkpoint chain hash
+/// for divergence detection — a mismatch means the replica's
+/// independently encoded journal has diverged from the primary's.
 pub(super) fn submit_batch_to_pipeline(
     journal_bytes: &[u8],
     producer: &melin_disruptor::ring::MultiProducer<melin_engine::journal::pipeline::InputSlot>,
 ) -> Result<u64, Box<dyn std::error::Error>> {
-    use melin_engine::journal::event::JournalEvent;
     use melin_engine::journal::pipeline::InputSlot;
 
     let mut offset = 0;
@@ -314,11 +313,6 @@ pub(super) fn submit_batch_to_pipeline(
         ) {
             Ok((consumed, sequence, timestamp_ns, key_hash, request_seq, event)) => {
                 offset += consumed;
-                // Skip checkpoint entries — each node auto-emits its own
-                // during encoding. Publishing them would cause duplicates.
-                if matches!(event, JournalEvent::Checkpoint { .. }) {
-                    continue;
-                }
                 last_published_seq = producer.publish(InputSlot {
                     connection_id: 0,
                     key_hash,

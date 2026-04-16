@@ -478,16 +478,22 @@ impl JournalStage {
                     for slot in &batch[..count] {
                         if matches!(
                             slot.event,
-                            JournalEvent::QueryStats
-                                | JournalEvent::QueryPosition { .. }
-                                | JournalEvent::Checkpoint { .. }
+                            JournalEvent::QueryStats | JournalEvent::QueryPosition { .. }
                         ) {
                             continue;
                         }
+                        // Checkpoint events from the primary are not
+                        // encoded (each node auto-emits its own), but
+                        // their chain hash is verified for divergence
+                        // detection.
+                        if let JournalEvent::Checkpoint { chain_hash, .. } = &slot.event {
+                            #[cfg(feature = "hash-chain")]
+                            if slot.sequence != 0 {
+                                self.verify_primary_checkpoint(chain_hash, slot.sequence)?;
+                            }
+                            continue;
+                        }
                         let (seq, ts) = if slot.sequence != 0 {
-                            // Replica: use primary's pre-assigned sequence
-                            // and timestamp. Sync the writer's counter so
-                            // auto-emitted checkpoints get correct sequences.
                             self.writer.set_next_sequence(slot.sequence + 1);
                             (slot.sequence, slot.timestamp_ns)
                         } else {
@@ -637,6 +643,34 @@ impl JournalStage {
         }
     }
 
+    /// Verify the replica's chain hash against a checkpoint from the
+    /// primary. Called when the JournalStage encounters a Checkpoint
+    /// event with a pre-assigned sequence (replica mode). The replica's
+    /// writer has just auto-emitted its own checkpoint at the same
+    /// position, so the chain hashes must match.
+    ///
+    /// Returns `Err` on mismatch — the caller should shut down the
+    /// pipeline to prevent silent divergence.
+    ///
+    /// No-op when the `hash-chain` feature is disabled (checkpoints
+    /// don't exist without it).
+    #[cfg(feature = "hash-chain")]
+    fn verify_primary_checkpoint(
+        &self,
+        primary_hash: &[u8; 32],
+        sequence: u64,
+    ) -> Result<(), JournalError> {
+        if let Some(local_hash) = self.writer.chain_hash()
+            && local_hash != *primary_hash
+        {
+            return Err(JournalError::Io(std::io::Error::other(format!(
+                "divergence detected at checkpoint seq {sequence}: \
+                 replica hash {local_hash:02x?} != primary hash {primary_hash:02x?}"
+            ))));
+        }
+        Ok(())
+    }
+
     /// Drain any remaining entries from the ring buffer on shutdown.
     fn drain_remaining(&mut self, batch: &mut [InputSlot]) {
         loop {
@@ -650,10 +684,18 @@ impl JournalStage {
                 for slot in &batch[..count] {
                     if matches!(
                         slot.event,
-                        JournalEvent::QueryStats
-                            | JournalEvent::QueryPosition { .. }
-                            | JournalEvent::Checkpoint { .. }
+                        JournalEvent::QueryStats | JournalEvent::QueryPosition { .. }
                     ) {
+                        continue;
+                    }
+                    if let JournalEvent::Checkpoint { chain_hash, .. } = &slot.event {
+                        #[cfg(feature = "hash-chain")]
+                        if slot.sequence != 0
+                            && let Err(e) =
+                                self.verify_primary_checkpoint(chain_hash, slot.sequence)
+                        {
+                            tracing::error!(error = %e, "divergence on drain");
+                        }
                         continue;
                     }
                     let (seq, ts) = if slot.sequence != 0 {
@@ -833,10 +875,15 @@ impl JournalStage {
                 for slot in &batch[..count] {
                     if matches!(
                         slot.event,
-                        JournalEvent::QueryStats
-                            | JournalEvent::QueryPosition { .. }
-                            | JournalEvent::Checkpoint { .. }
+                        JournalEvent::QueryStats | JournalEvent::QueryPosition { .. }
                     ) {
+                        continue;
+                    }
+                    if let JournalEvent::Checkpoint { chain_hash, .. } = &slot.event {
+                        #[cfg(feature = "hash-chain")]
+                        if slot.sequence != 0 {
+                            self.verify_primary_checkpoint(chain_hash, slot.sequence)?;
+                        }
                         continue;
                     }
                     let (seq, ts) = if slot.sequence != 0 {
