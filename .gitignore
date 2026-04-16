@@ -12,13 +12,6 @@ scripts/dpdk/.cache/
 
 # Bench plots — only README-referenced PNGs are versioned.
 # Everything else can be regenerated via melin-plot.
-docs/plots/*.svg
-docs/plots/health-*.png
-docs/plots/latency-stability-tcp-single*.png
-docs/plots/latency-stability-tcp-throughput*.png
-docs/plots/latency-stability-tcp-repl-single*.png
-docs/plots/latency-stability-tcp-repl-throughput*.png
-docs/plots/latency-stability-tcp-dual-repl-single*.png
-docs/plots/latency-stability-tcp-no-persist*.png
-docs/plots/latency-stability-fsync*.png
-docs/plots/latency-stability-no-persist*.png
+docs/plots/*
+!docs/plots/latency-cdf.png
+!docs/plots/latency-stability-tcp-dual-repl-throughput.png
