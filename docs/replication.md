@@ -23,14 +23,15 @@ Primary:
 
 Replica:
   TCP → ReplicationReceiver → decode entries, publish to disruptor
-      → JournalStage writes raw bytes (byte-for-byte copy)
-      → MatchingStage replays into Exchange (warm state)
+                                (with pre-assigned sequences + timestamps)
+      → JournalStage encodes independently (same sequences as primary)
+      → MatchingStage processes through own Exchange
       → ack sequence back to primary after journal cursor advances
 ```
 
 ### Replication rings and fault isolation
 
-Each replica slot has its own independent ring buffer (configurable via `--replication-ring-size`, default 64 slots x 512 KiB = 32 MiB per ring, 64 MiB total for dual replication). The replicated bytes are identical to what is written to the primary's journal — same sequences, timestamps, CRC checksums, and checkpoint entries.
+Each replica slot has its own independent ring buffer (configurable via `--replication-ring-size`, default 64 slots x 512 KiB = 32 MiB per ring, 64 MiB total for dual replication). The replicated bytes are the encoded journal batches from the primary. The replica decodes them, publishes events to its own pipeline with the primary's pre-assigned sequences and timestamps, and encodes its own journal independently. Journals are logically identical (same sequences, same events) but each node encodes independently.
 
 **Fault isolation**: a slow replica only stalls its own ring, not the other replica's. If a ring is full for longer than 500ms (replica not keeping up), the primary automatically disconnects that replica and frees the ring. The slot becomes available for a new connection. The surviving replica and client trading are unaffected.
 
@@ -129,7 +130,7 @@ Length-prefixed frames, little-endian. Runs over a dedicated TCP connection sepa
 
 ### Design rationale
 
-- **Journal byte reuse**: DataBatch payloads contain the exact bytes from the primary's journal file. The replica writes them directly via `write_raw_sync()`, producing a byte-for-byte copy. No re-encoding, no second serialization format.
+- **Independent encoding**: DataBatch payloads contain encoded journal entries from the primary. The replica decodes them, extracts the pre-assigned sequences and timestamps, and re-encodes through its own JournalStage. Journals are logically identical across nodes (same sequences, same events), enabling deterministic replay and independent verification.
 - **Dual replication**: The primary accepts up to 2 concurrent replica connections, each with its own replication ring consumer and handler thread. If a replica disconnects, its slot becomes available for a new connection. Trading halts only when all replicas disconnect.
 
 ## Replica Mode
@@ -140,8 +141,8 @@ A server started with `--replica-of <primary_addr>` runs in replica mode:
 - Connects to the primary and sends a `Handshake`.
 - Receives `DataBatch` frames, decodes entries, publishes them to a local disruptor pipeline.
 - Uses the same pipeline architecture as the primary (journal stage → matching stage → shadow stage), with the replication receiver feeding the input disruptor instead of reader threads.
-- The journal stage writes pre-encoded bytes from the primary via `write_raw_sync()` (byte-identical journals) instead of re-encoding events from the disruptor.
-- The matching stage replays events into a local `Exchange` to maintain warm state for promotion.
+- The journal stage encodes events independently using the primary's pre-assigned sequences and timestamps (carried in each `InputSlot`). Each node produces its own journal — logically identical to the primary's but independently encoded.
+- The matching stage processes events through its own `Exchange` independently, maintaining warm state for promotion.
 - Sends `Ack` frames after the journal stage confirms durable write (cursor advance). Acks are pipelined: up to 8 batches can be submitted to the journal stage before the first ack is sent, overlapping NVMe writes with TCP receives. With `--async-replica-ack`, acks are sent the moment a batch is queued for the journal stage rather than after fsync — see the durability tradeoff section above.
 - Both the primary sender and replica receiver use io_uring for TCP I/O (async RECV/SEND), eliminating poll/read/write syscalls from the streaming hot path.
 - The replica pipeline threads (journal, matching, drain, shadow) are pinned to the same cores as the primary, matching the `--cores` layout.
@@ -153,11 +154,11 @@ A server started with `--replica-of <primary_addr>` runs in replica mode:
 ### Replica pipeline topology
 
 ```
-TCP Stream → Replication Receiver (decode + publish)
-                    ↓                     ↓
-              Input Disruptor        SPSC Ring (8 slots)
-              ┌─────┼─────┐               ↓
-              │     │     │         Journal Stage (io_uring Write+RWF_DSYNC)
+TCP Stream → Replication Receiver (decode + publish with pre-assigned seq/ts)
+                    ↓
+              Input Disruptor
+              ┌─────┼─────┐
+              │     │     │
           Journal Matching Shadow
           Stage   Stage   Stage
               │     │     │
@@ -168,9 +169,9 @@ TCP Stream → Replication Receiver (decode + publish)
          Ack to primary
 ```
 
-The receiver thread uses io_uring for TCP I/O: a single RECV is always in-flight for DataBatch frames, and SEND is submitted when an ack becomes ready. It publishes decoded events to the input disruptor and sends the raw journal bytes to the journal stage via a bounded lock-free SPSC ring (8 slots). The journal stage submits async `Write+RWF_DSYNC` operations via io_uring, then consumes (and discards) the corresponding disruptor events after the CQE confirms durability.
+The receiver thread uses io_uring for TCP I/O: a single RECV is always in-flight for DataBatch frames, and SEND is submitted when an ack becomes ready. It decodes events from DataBatch frames and publishes them to the input disruptor with the primary's pre-assigned sequences and timestamps. Checkpoint events are filtered out — each node auto-emits its own. The journal and matching stages consume events in parallel (same topology as the primary).
 
-The SPSC ring + pipelined ack queue (8 entries) decouple the receiver's TCP loop from NVMe write latency — the receiver can push up to 8 batches ahead while previous writes are in flight. Acks are sent as soon as the journal cursor confirms durability, checked on every event loop iteration with zero syscall overhead.
+The pipelined ack queue (8 entries) decouples the receiver's TCP loop from NVMe write latency — the receiver can push up to 8 batches ahead while previous writes are in flight. Acks are sent as soon as the journal cursor confirms durability, checked on every event loop iteration with zero syscall overhead.
 
 ## CLI Flags
 
@@ -278,7 +279,7 @@ This works for both reconnecting replicas (`last_sequence > 0`, catches up the g
 
 ### ~~Fresh replica genesis hash diverges from primary~~ (FIXED)
 
-The primary's raw genesis entry bytes (including the original timestamp) are sent in the `StreamStart` response. Fresh replicas write these bytes directly to the journal file, producing a byte-identical genesis entry. The BLAKE3 hash chain starts from the exact same encoded bytes, so checkpoint entries from the primary verify correctly on replica replay.
+The primary's raw genesis entry bytes (including the original timestamp) are sent in the `StreamStart` response. Fresh replicas write these bytes directly to the journal file, producing a byte-identical genesis entry. The BLAKE3 hash chain starts from the exact same encoded bytes. Subsequent entries are encoded independently by each node using pre-assigned sequences from the primary, keeping journals logically aligned.
 
 ### ~~Single replica only~~ (FIXED)
 

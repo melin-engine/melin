@@ -385,6 +385,10 @@ impl JournalWriter {
     /// Avoids the `clock_gettime` syscall per event when the caller can batch
     /// a single timestamp for the entire batch. Same semantics as `batch_append`
     /// but uses the provided timestamp instead of calling `wall_clock_nanos()`.
+    ///
+    /// Convenience wrapper: allocates a sequence number and encodes in one call.
+    /// For explicit control over sequencing (e.g., input replication), use
+    /// [`allocate_sequence`] + [`encode_event`] separately.
     pub fn batch_append_with_ts(
         &mut self,
         event: &JournalEvent,
@@ -392,7 +396,43 @@ impl JournalWriter {
         key_hash: u64,
         request_seq: u64,
     ) -> Result<u64, JournalError> {
+        let seq = self.allocate_sequence();
+        self.encode_event(seq, timestamp_ns, event, key_hash, request_seq)?;
+        Ok(seq)
+    }
+
+    /// Allocate the next journal sequence number.
+    ///
+    /// Returns the allocated sequence and advances the internal counter.
+    /// The returned sequence should be passed to [`encode_event`] for
+    /// encoding. This two-step pattern separates sequence assignment from
+    /// encoding, enabling the sequencing decision to be made (and
+    /// replicated) independently of journal persistence.
+    pub fn allocate_sequence(&mut self) -> u64 {
         let seq = self.next_sequence;
+        self.next_sequence += 1;
+        seq
+    }
+
+    /// Encode a single event into the batch buffer using a pre-assigned
+    /// sequence number.
+    ///
+    /// Does NOT allocate or advance the internal sequence counter — the
+    /// caller is responsible for obtaining the sequence via
+    /// [`allocate_sequence`] or an external sequencer. This separation
+    /// enables moving sequence assignment to an earlier pipeline stage
+    /// without changing the encoding logic.
+    ///
+    /// Also handles hash-chain bookkeeping and auto-emits checkpoint
+    /// entries when the checkpoint interval is reached.
+    pub fn encode_event(
+        &mut self,
+        seq: u64,
+        timestamp_ns: u64,
+        event: &JournalEvent,
+        key_hash: u64,
+        request_seq: u64,
+    ) -> Result<(), JournalError> {
         let written = codec::encode(
             seq,
             timestamp_ns,
@@ -408,11 +448,15 @@ impl JournalWriter {
         if let Some(chain) = &mut self.hash_chain {
             let entry_bytes_len = written - 4; // exclude 4-byte CRC
             chain.batch_hasher.update(&self.buffer[..entry_bytes_len]);
-            chain.events_since_checkpoint += 1;
+            // GenesisHash initializes the chain — don't count it toward
+            // the checkpoint interval. Matches create_with_genesis() which
+            // sets events_since_checkpoint = 0 after writing the genesis.
+            if !matches!(event, JournalEvent::GenesisHash { .. }) {
+                chain.events_since_checkpoint += 1;
+            }
         }
 
         self.batch_buf.extend_from_slice(&self.buffer[..written]);
-        self.next_sequence += 1;
 
         // Auto-emit a checkpoint if we've hit the interval.
         // Finalize the batch hasher to get the current hash (including all
@@ -430,7 +474,7 @@ impl JournalWriter {
             self.emit_checkpoint(checkpoint_hash, count)?;
         }
 
-        Ok(seq)
+        Ok(())
     }
 
     /// Emit a checkpoint entry into the batch buffer and reset the counter.
@@ -547,35 +591,6 @@ impl JournalWriter {
         self.spare_buf = Some(batch.buf);
     }
 
-    /// Prepare a raw byte buffer for async writing via io_uring.
-    ///
-    /// Used by the replica journal stage to write pre-encoded bytes
-    /// Reserve a file offset for an upcoming raw async write from the
-    /// replication ring, and eagerly advance `write_pos` and
-    /// `next_sequence` by the recorded batch size. The caller submits
-    /// an io_uring Write against the returned offset using a pointer
-    /// into the raw-batch ring slot (no intermediate buffer), and must
-    /// not advance the journal cursor until the CQE confirms durability.
-    ///
-    /// Unlike the primary path's `take_batch_for_async_write`, there is
-    /// no owned buffer to carry through the CQE here — the slot memory
-    /// is pinned by the raw-batch ring protocol, and the receiver
-    /// releases it by dropping the [`super::pipeline::RawBatchSlot`]
-    /// handle after the CQE lands. Consequently there is no "confirm"
-    /// counterpart: the writer state is already consistent at the end
-    /// of this call.
-    pub fn reserve_raw_async_write(
-        &mut self,
-        len: u64,
-        entry_count: u64,
-    ) -> Result<u64, JournalError> {
-        self.ensure_allocated(len)?;
-        let offset = self.write_pos;
-        self.write_pos += len;
-        self.next_sequence += entry_count;
-        Ok(offset)
-    }
-
     /// Flush the journal to disk (fdatasync).
     ///
     /// Legacy sync path — only used during shutdown drain. Production
@@ -588,6 +603,15 @@ impl JournalWriter {
     /// Current next sequence number (useful for snapshot coordination).
     pub fn next_sequence(&self) -> u64 {
         self.next_sequence
+    }
+
+    /// Set the next sequence number.
+    ///
+    /// Used by the replica to keep the writer's internal counter in sync
+    /// with the primary's pre-assigned sequences. This ensures that
+    /// auto-emitted checkpoint entries get the correct sequence numbers.
+    pub fn set_next_sequence(&mut self, seq: u64) {
+        self.next_sequence = seq;
     }
 
     /// Current byte offset in the journal file (size of valid data).
@@ -651,28 +675,6 @@ impl JournalWriter {
     /// Returns an empty slice if no data is pending.
     pub fn pending_batch_bytes(&self) -> &[u8] {
         &self.batch_buf
-    }
-
-    /// Write pre-encoded journal bytes directly to the file with durability.
-    ///
-    /// Used by the replication receiver to write bytes received from the
-    /// primary without re-encoding. The bytes must be valid journal entries
-    /// (the caller is responsible for CRC and sequence validation).
-    ///
-    /// Advances `write_pos` and `next_sequence` to account for the written
-    /// data. Does NOT update the hash chain — the receiver tracks chain
-    /// state separately if needed.
-    pub fn write_raw_sync(&mut self, data: &[u8], entry_count: u64) -> Result<(), JournalError> {
-        if data.is_empty() {
-            return Ok(());
-        }
-        self.ensure_allocated(data.len() as u64)?;
-
-        pwritev2_dsync(self.file.as_raw_fd(), data, self.write_pos)?;
-
-        self.write_pos += data.len() as u64;
-        self.next_sequence += entry_count;
-        Ok(())
     }
 
     /// Ensure enough pre-allocated space exists for the next write.
@@ -1485,127 +1487,69 @@ mod tests {
         assert_eq!(reader.chain_hash().unwrap(), writer_hash);
     }
 
+    /// Verify that encoding a GenesisHash via `encode_event` does NOT
+    /// increment `events_since_checkpoint`, matching the behavior of
+    /// `create_with_genesis` (which initializes the counter to 0).
+    /// This prevents checkpoint timing drift between primary and replica
+    /// after journal rotation.
+    #[cfg(feature = "hash-chain")]
     #[test]
-    fn write_raw_sync_produces_readable_journal() {
+    fn genesis_hash_does_not_increment_checkpoint_counter() {
         let dir = tempfile::tempdir().unwrap();
-        let primary_path = dir.path().join("primary.journal");
-        let replica_path = dir.path().join("replica.journal");
-
-        // Write events to the primary journal normally.
-        let events = vec![
-            JournalEvent::Deposit {
-                account: AccountId(1),
-                currency: CurrencyId(0),
-                amount: 100,
-            },
-            JournalEvent::Deposit {
-                account: AccountId(2),
-                currency: CurrencyId(0),
-                amount: 200,
-            },
-            sample_event(),
-        ];
-
-        let primary_genesis;
-        let raw_bytes;
-        let entry_count;
-        {
-            let mut writer = JournalWriter::create(&primary_path).unwrap();
-            primary_genesis = writer.chain_hash().unwrap_or([0u8; 32]);
-
-            // Encode events into batch buffer, then snapshot the bytes.
-            for event in &events {
-                writer.batch_append(event).unwrap();
-            }
-            raw_bytes = writer.pending_batch_bytes().to_vec();
-            entry_count = events.len() as u64;
-            writer.flush_batch_sync().unwrap();
-        }
-
-        // Create the replica journal with the same genesis hash.
-        {
-            let mut replica =
-                JournalWriter::create_continuing(&replica_path, 1, primary_genesis).unwrap();
-            // Write the raw bytes captured from the primary.
-            replica.write_raw_sync(&raw_bytes, entry_count).unwrap();
-            assert_eq!(replica.next_sequence(), FIRST_SEQ + entry_count);
-        }
-
-        // Read back from the replica journal — should see the same events.
-        let mut reader = JournalReader::open(&replica_path).unwrap();
-        for (i, expected) in events.iter().enumerate() {
-            let entry = reader.next_entry().unwrap().unwrap();
-            assert_eq!(entry.sequence, (i as u64) + FIRST_SEQ);
-            assert_eq!(&entry.event, expected);
-        }
-        assert!(reader.next_entry().unwrap().is_none());
-    }
-
-    #[test]
-    fn write_raw_sync_advances_write_pos() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("raw_pos.journal");
-
-        let mut writer = JournalWriter::create(&path).unwrap();
-        let pos_before = writer.write_pos();
-
-        let data = [0x4A, 0x45, 0x00, 0x01, 0x02, 0x00, 0x00, 0x00]; // fake entry bytes
-        writer.write_raw_sync(&data, 1).unwrap();
-
-        assert_eq!(writer.write_pos(), pos_before + data.len() as u64);
-        // With hash-chain: genesis(1) + next(2) + raw(1) = 3.
-        // Without: next(1) + raw(1) = 2.
-        assert_eq!(writer.next_sequence(), FIRST_SEQ + 1);
-    }
-
-    #[test]
-    fn write_raw_sync_empty_is_noop() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("raw_empty.journal");
-
-        let mut writer = JournalWriter::create(&path).unwrap();
-        let pos = writer.write_pos();
-        let seq = writer.next_sequence();
-
-        writer.write_raw_sync(&[], 0).unwrap();
-
-        assert_eq!(writer.write_pos(), pos);
-        assert_eq!(writer.next_sequence(), seq);
-    }
-
-    #[test]
-    fn reserve_raw_async_write_advances_position() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("test.journal");
-        let mut writer = JournalWriter::create(&path).unwrap();
-        let pos_before = writer.write_pos;
-        let seq_before = writer.next_sequence;
-
-        let offset = writer.reserve_raw_async_write(128, 3).unwrap();
-
-        // Offset returned is the pre-reservation position; writer state
-        // advances eagerly so subsequent reservations don't collide.
-        assert_eq!(offset, pos_before);
-        assert_eq!(writer.write_pos, pos_before + 128);
-        assert_eq!(writer.next_sequence, seq_before + 3);
-    }
-
-    #[test]
-    fn reserve_raw_async_write_does_not_touch_spare_buffer() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("test.journal");
+        let path = dir.path().join("genesis_counter.journal");
         let mut writer = JournalWriter::create(&path).unwrap();
 
-        // Spare buffer belongs to the primary double-buffering path; the
-        // raw-batch ring owns its own slot memory, so reservation must
-        // not borrow or release the spare buffer in either direction.
-        let _ = writer.spare_buf.take();
-        assert!(writer.spare_buf.is_none());
+        assert_eq!(writer.events_since_checkpoint(), 0);
 
-        let _ = writer.reserve_raw_async_write(64, 1).unwrap();
-        assert!(
-            writer.spare_buf.is_none(),
-            "raw reservations must leave spare_buf alone"
+        // A regular event should increment the counter.
+        let seq = writer.allocate_sequence();
+        writer
+            .encode_event(
+                seq,
+                1_000_000_000,
+                &JournalEvent::Deposit {
+                    account: AccountId(1),
+                    currency: CurrencyId(0),
+                    amount: 100,
+                },
+                0,
+                0,
+            )
+            .unwrap();
+        assert_eq!(writer.events_since_checkpoint(), 1);
+
+        // A GenesisHash event should NOT increment the counter.
+        let seq = writer.allocate_sequence();
+        writer
+            .encode_event(
+                seq,
+                1_000_000_001,
+                &JournalEvent::GenesisHash { hash: [0xAB; 32] },
+                0,
+                0,
+            )
+            .unwrap();
+        assert_eq!(
+            writer.events_since_checkpoint(),
+            1,
+            "GenesisHash must not increment events_since_checkpoint"
         );
+
+        // Another regular event should increment normally.
+        let seq = writer.allocate_sequence();
+        writer
+            .encode_event(
+                seq,
+                1_000_000_002,
+                &JournalEvent::Deposit {
+                    account: AccountId(2),
+                    currency: CurrencyId(0),
+                    amount: 200,
+                },
+                0,
+                0,
+            )
+            .unwrap();
+        assert_eq!(writer.events_since_checkpoint(), 2);
     }
 }

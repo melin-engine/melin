@@ -865,11 +865,11 @@ mod tests {
 
     #[test]
     fn snapshot_recovery_with_zero_chain_hash() {
-        // Simulates the replica catch-up scenario: snapshot is saved with
-        // chain_hash = [0;32] because write_raw_sync doesn't update the
-        // writer's chain state. Recovery must still produce correct Exchange
-        // state by replaying post-snapshot journal entries without chain
-        // verification (seed_chain_hash is a no-op for zero hash).
+        // Simulates recovery from a snapshot saved with chain_hash = [0;32]
+        // (e.g., an older snapshot before hash chain tracking). Recovery must
+        // still produce correct Exchange state by replaying post-snapshot
+        // journal entries without chain verification (seed_chain_hash is a
+        // no-op for zero hash).
         let dir = tempfile::tempdir().unwrap();
         let journal_path = dir.path().join("zero_hash.journal");
         let snap_path = dir.path().join("zero_hash.snapshot");

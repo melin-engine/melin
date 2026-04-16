@@ -674,6 +674,7 @@ fn run_as_primary<L: BlockingTransportListener>(
     let enable_event_publisher = config.event_bind.is_some();
     let Pipeline {
         input_producer,
+        sequencer,
         journal_stage,
         matching_stage,
         mut output_consumers,
@@ -744,6 +745,7 @@ fn run_as_primary<L: BlockingTransportListener>(
         config.reader_cores,
         connection_timeout,
         Arc::clone(&reader_shutdown),
+        Arc::clone(&sequencer),
     );
 
     // Spawn pipeline OS threads.
@@ -994,6 +996,7 @@ fn run_as_primary<L: BlockingTransportListener>(
         use melin_engine::journal::event::JournalEvent;
         use melin_engine::journal::pipeline::InputSlot;
         use melin_engine::journal::trace::trace_ts;
+        use melin_engine::journal::writer::wall_clock_nanos;
         use melin_engine::types::{AccountId, CurrencyId, InstrumentSpec, Symbol};
 
         let seed_start = std::time::Instant::now();
@@ -1003,6 +1006,8 @@ fn run_as_primary<L: BlockingTransportListener>(
                 connection_id: 0,
                 key_hash: 0,
                 request_seq: 0,
+                sequence: sequencer.next(),
+                timestamp_ns: wall_clock_nanos(),
                 event: JournalEvent::AddInstrument {
                     spec: InstrumentSpec {
                         symbol: Symbol(i),
@@ -1024,6 +1029,8 @@ fn run_as_primary<L: BlockingTransportListener>(
                 connection_id: 0,
                 key_hash: 0,
                 request_seq: 0,
+                sequence: sequencer.next(),
+                timestamp_ns: wall_clock_nanos(),
                 event: JournalEvent::ProvisionAccount {
                     account: AccountId(acct),
                     amount: u64::MAX / 4,
@@ -1501,6 +1508,7 @@ pub fn run_dpdk(
     let enable_shadow = config.snapshot_interval_secs > 0;
     let Pipeline {
         input_producer,
+        sequencer,
         journal_stage,
         matching_stage,
         mut output_consumers,
@@ -1763,6 +1771,7 @@ pub fn run_dpdk(
         use melin_engine::journal::event::JournalEvent;
         use melin_engine::journal::pipeline::InputSlot;
         use melin_engine::journal::trace::trace_ts;
+        use melin_engine::journal::writer::wall_clock_nanos;
         use melin_engine::types::{AccountId, CurrencyId, InstrumentSpec, Symbol};
 
         for i in 0..config.instruments {
@@ -1770,6 +1779,8 @@ pub fn run_dpdk(
                 connection_id: 0,
                 key_hash: 0,
                 request_seq: 0,
+                sequence: sequencer.next(),
+                timestamp_ns: wall_clock_nanos(),
                 event: JournalEvent::AddInstrument {
                     spec: InstrumentSpec {
                         symbol: Symbol(i),
@@ -1788,6 +1799,8 @@ pub fn run_dpdk(
                 connection_id: 0,
                 key_hash: 0,
                 request_seq: 0,
+                sequence: sequencer.next(),
+                timestamp_ns: wall_clock_nanos(),
                 event: JournalEvent::ProvisionAccount {
                     account: AccountId(acct),
                     amount: u64::MAX / 4,
@@ -1885,6 +1898,7 @@ pub fn run_dpdk(
         let active_i = Arc::clone(&active_connections);
         let keys_i = Arc::clone(&authorized_keys);
 
+        let sequencer_i = Arc::clone(&sequencer);
         let handle = std::thread::Builder::new()
             .name(format!("dpdk-poll-{i}"))
             .spawn(move || {
@@ -1900,6 +1914,7 @@ pub fn run_dpdk(
                     max_conns,
                     active_i,
                     i as u8,
+                    sequencer_i,
                 );
             })
             .map_err(|e| format!("spawn DPDK poll thread: {e}"))?;
@@ -1922,6 +1937,7 @@ pub fn run_dpdk(
             max_conns,
             Arc::clone(&active_connections),
             0,
+            sequencer,
         );
     } else {
         // No client queues (e.g., single-queue NIC with replication taking

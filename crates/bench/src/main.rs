@@ -633,6 +633,7 @@ fn run_pipeline_bench(
     use melin_engine::journal::event::JournalEvent;
     use melin_engine::journal::pipeline::{InputSlot, build_pipeline_with_replication};
     use melin_engine::journal::trace::trace_ts;
+    use melin_engine::journal::writer::wall_clock_nanos;
 
     let nz = |v: u64| NonZeroU64::new(v).expect("non-zero");
 
@@ -703,6 +704,7 @@ fn run_pipeline_bench(
 
     // Publisher thread: continuously feeds events into the disruptor.
     let producer = out.input_producer;
+    let sequencer = out.sequencer;
     let inflight_pub = Arc::clone(&inflight);
     let publish_handle = std::thread::Builder::new()
         .name("pipeline-pub".into())
@@ -721,6 +723,8 @@ fn run_pipeline_bench(
                     connection_id: 0,
                     key_hash: 0,
                     request_seq: 0,
+                    sequence: sequencer.next(),
+                    timestamp_ns: wall_clock_nanos(),
                     event: JournalEvent::SubmitOrder {
                         symbol: Symbol(1),
                         order: Order {

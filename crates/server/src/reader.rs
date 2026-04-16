@@ -27,8 +27,10 @@ use tracing::{debug, error};
 
 use crate::server::ControlEvent;
 use melin_disruptor::ring;
-use melin_engine::journal::pipeline::InputSlot;
+use melin_engine::journal::event::JournalEvent;
+use melin_engine::journal::pipeline::{InputSlot, Sequencer};
 use melin_engine::journal::trace::trace_ts;
+use melin_engine::journal::writer::wall_clock_nanos;
 use melin_protocol::auth::Permission;
 use melin_protocol::codec;
 
@@ -148,6 +150,7 @@ pub fn spawn_reader_pool<R: AsRawFd + Send + 'static>(
     core_start: usize,
     connection_timeout: Option<Duration>,
     shutdown: Arc<AtomicBool>,
+    sequencer: Arc<Sequencer>,
 ) -> UringReaderHandle<R> {
     let (tx, rx) = mpsc::channel();
 
@@ -164,7 +167,7 @@ pub fn spawn_reader_pool<R: AsRawFd + Send + 'static>(
                 Ok(c) => tracing::info!(thread = "uring-reader", core = c, "pinned to core"),
                 Err(e) => tracing::warn!(thread = "uring-reader", core = core_start, error = %e, "failed to pin"),
             }
-            reader_loop(rx, wakeup_fd, producer, &control_tx, connection_timeout, &shutdown_clone);
+            reader_loop(rx, wakeup_fd, producer, &control_tx, connection_timeout, &shutdown_clone, &sequencer);
         })
         .expect("failed to spawn uring reader thread");
 
@@ -263,6 +266,7 @@ fn reader_loop<R: AsRawFd>(
     control_tx: &mpsc::Sender<ControlEvent>,
     connection_timeout: Option<Duration>,
     shutdown: &AtomicBool,
+    sequencer: &Sequencer,
 ) {
     let mut ring = IoUring::new(RING_SIZE).expect("failed to create io_uring instance");
 
@@ -444,6 +448,7 @@ fn reader_loop<R: AsRawFd>(
                     entry,
                     &producer,
                     &server_busy_frame,
+                    sequencer,
                     #[cfg(feature = "latency-trace")]
                     &mut publish_hist,
                 );
@@ -622,6 +627,7 @@ fn process_frames<R>(
     conn: &mut ConnectionEntry<R>,
     producer: &ring::MultiProducer<InputSlot>,
     server_busy_frame: &[u8; 5],
+    sequencer: &Sequencer,
     #[cfg(feature = "latency-trace")]
     publish_hist: &mut melin_engine::journal::trace::StageHistogram,
 ) -> bool {
@@ -682,6 +688,15 @@ fn process_frames<R>(
 
         let event = crate::request::to_event(&request);
 
+        let (seq_num, ts) = if matches!(
+            event,
+            JournalEvent::QueryStats | JournalEvent::QueryPosition { .. }
+        ) {
+            (0, 0)
+        } else {
+            (sequencer.next(), wall_clock_nanos())
+        };
+
         #[cfg(feature = "latency-trace")]
         let pre_publish = trace_ts();
 
@@ -690,6 +705,8 @@ fn process_frames<R>(
                 connection_id: conn.connection_id,
                 key_hash: conn.key_hash,
                 request_seq: seq,
+                sequence: seq_num,
+                timestamp_ns: ts,
                 event,
                 publish_ts: trace_ts(),
                 recv_ts,

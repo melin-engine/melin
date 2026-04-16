@@ -38,8 +38,10 @@ use std::time::{Duration, Instant};
 use ed25519_dalek::{Verifier, VerifyingKey};
 use melin_disruptor::ring;
 use melin_dpdk::transport::DpdkTransport;
-use melin_engine::journal::pipeline::InputSlot;
+use melin_engine::journal::event::JournalEvent;
+use melin_engine::journal::pipeline::{InputSlot, Sequencer};
 use melin_engine::journal::trace::trace_ts;
+use melin_engine::journal::writer::wall_clock_nanos;
 use melin_protocol::auth::{AuthorizedKeys, Permission};
 use melin_protocol::codec;
 use melin_protocol::message::{ConnectionId, Request, ResponseKind};
@@ -108,6 +110,7 @@ pub fn run_dpdk_poll(
     max_connections: u64,
     active_connections: Arc<std::sync::atomic::AtomicU64>,
     thread_id: u8,
+    sequencer: Arc<Sequencer>,
 ) {
     // Map from smoltcp SocketHandle → connection state.
     let mut connections: HashMap<SocketHandle, ConnectionState> = HashMap::with_capacity(256);
@@ -348,6 +351,7 @@ pub fn run_dpdk_poll(
                         &mut publish_batch,
                         &control_tx,
                         &mut id_to_handle,
+                        &sequencer,
                     );
                 }
             }
@@ -541,6 +545,7 @@ fn process_trading_frames(
     batch: &mut Vec<InputSlot>,
     control_tx: &mpsc::Sender<ControlEvent>,
     id_to_handle: &mut HashMap<u64, SocketHandle>,
+    sequencer: &Sequencer,
 ) {
     let mut cursor = 0;
 
@@ -573,10 +578,20 @@ fn process_trading_frames(
                     #[allow(clippy::let_unit_value)] // trace_ts() returns () without latency-trace
                     let recv_ts = trace_ts();
                     let event = shared_request::to_event(&request);
+                    let (seq_num, ts) = if matches!(
+                        event,
+                        JournalEvent::QueryStats | JournalEvent::QueryPosition { .. }
+                    ) {
+                        (0, 0)
+                    } else {
+                        (sequencer.next(), wall_clock_nanos())
+                    };
                     batch.push(InputSlot {
                         connection_id: conn.connection_id.0,
                         key_hash: conn.key_hash,
                         request_seq: seq,
+                        sequence: seq_num,
+                        timestamp_ns: ts,
                         event,
                         #[allow(clippy::let_unit_value)]
                         publish_ts: trace_ts(),
