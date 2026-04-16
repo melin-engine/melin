@@ -1486,4 +1486,70 @@ mod tests {
         assert_eq!(count, CHECKPOINT_INTERVAL + 5);
         assert_eq!(reader.chain_hash().unwrap(), writer_hash);
     }
+
+    /// Verify that encoding a GenesisHash via `encode_event` does NOT
+    /// increment `events_since_checkpoint`, matching the behavior of
+    /// `create_with_genesis` (which initializes the counter to 0).
+    /// This prevents checkpoint timing drift between primary and replica
+    /// after journal rotation.
+    #[cfg(feature = "hash-chain")]
+    #[test]
+    fn genesis_hash_does_not_increment_checkpoint_counter() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("genesis_counter.journal");
+        let mut writer = JournalWriter::create(&path).unwrap();
+
+        assert_eq!(writer.events_since_checkpoint(), 0);
+
+        // A regular event should increment the counter.
+        let seq = writer.allocate_sequence();
+        writer
+            .encode_event(
+                seq,
+                1_000_000_000,
+                &JournalEvent::Deposit {
+                    account: AccountId(1),
+                    currency: CurrencyId(0),
+                    amount: 100,
+                },
+                0,
+                0,
+            )
+            .unwrap();
+        assert_eq!(writer.events_since_checkpoint(), 1);
+
+        // A GenesisHash event should NOT increment the counter.
+        let seq = writer.allocate_sequence();
+        writer
+            .encode_event(
+                seq,
+                1_000_000_001,
+                &JournalEvent::GenesisHash { hash: [0xAB; 32] },
+                0,
+                0,
+            )
+            .unwrap();
+        assert_eq!(
+            writer.events_since_checkpoint(),
+            1,
+            "GenesisHash must not increment events_since_checkpoint"
+        );
+
+        // Another regular event should increment normally.
+        let seq = writer.allocate_sequence();
+        writer
+            .encode_event(
+                seq,
+                1_000_000_002,
+                &JournalEvent::Deposit {
+                    account: AccountId(2),
+                    currency: CurrencyId(0),
+                    amount: 200,
+                },
+                0,
+                0,
+            )
+            .unwrap();
+        assert_eq!(writer.events_since_checkpoint(), 2);
+    }
 }

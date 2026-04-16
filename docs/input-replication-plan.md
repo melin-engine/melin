@@ -1,14 +1,14 @@
-# Input Replication Plan
+# Input Replication — Complete
 
-Migrate from output replication (primary streams encoded journal entries to replicas) to input replication (primary sequences commands and streams them to all nodes, each processes independently). This aligns with the LMAX architecture where every node runs the same deterministic computation over the same ordered input stream.
+Migrated from output replication to input replication. Every node (primary and replicas) independently encodes and journals events, with the primary's Sequencer assigning sequence numbers and timestamps at publish time. This aligns with the LMAX architecture where every node runs the same deterministic computation over the same ordered input stream.
 
 ## Motivation
 
-The current architecture replicates the primary's journal output. Replicas write those bytes verbatim and replay them, but never run the input-to-output business logic themselves. This has three problems:
+The previous architecture replicated the primary's journal output. Replicas wrote those bytes verbatim and replayed them, but never ran the input-to-output business logic themselves. This had three problems:
 
-1. **No independent verification.** A bug in journal encoding/decoding can silently corrupt replica state. With input replication, each node processes independently and divergence is detectable.
-2. **Promotion gap.** On failover, the promoted replica has never validated its own output against the primary's. It has warm state, but that state was built by trusting the primary unconditionally.
-3. **Not LMAX-canonical.** The LMAX architecture replicates inputs so that any node can become primary with zero ambiguity. Output replication is closer to traditional primary-backup.
+1. **No independent verification.** A bug in journal encoding/decoding could silently corrupt replica state. Now each node processes independently and divergence is detected at every checkpoint (100K events).
+2. **Promotion gap.** On failover, the promoted replica had never validated its own output. Now every replica runs the full pipeline — promotion is "start accepting clients."
+3. **Not LMAX-canonical.** Now the Sequencer assigns sequences at publish time (pre-disruptor), matching the LMAX architecture.
 
 ## Target Architecture
 

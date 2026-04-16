@@ -167,14 +167,14 @@ pub struct InputSlot {
     /// Per-key monotonic request sequence number from the wire protocol.
     /// Used with `key_hash` for idempotency dedup. 0 for seed/internal events.
     pub request_seq: u64,
-    /// Pre-assigned journal sequence number. Non-zero when the event was
-    /// received from a primary via replication (the sequence is the
-    /// primary's journal sequence). Zero when published by a local reader
-    /// thread (the JournalStage allocates the sequence during encoding).
+    /// Journal sequence number, assigned at publish time by the
+    /// [`Sequencer`] (primary) or decoded from the primary's
+    /// replication stream (replica). Zero only for non-journaled events
+    /// (QueryStats, QueryPosition) which are skipped by the JournalStage.
     pub sequence: u64,
-    /// Pre-assigned wall-clock timestamp (nanoseconds since epoch). Non-zero
-    /// when received from a primary via replication. Zero when published by
-    /// a local reader thread (the JournalStage assigns a batch timestamp).
+    /// Wall-clock timestamp (nanoseconds since epoch), assigned at
+    /// publish time alongside the sequence. Zero only for non-journaled
+    /// events (QueryStats, QueryPosition).
     pub timestamp_ns: u64,
     /// The journaled event (order submit, cancel, etc.).
     pub event: JournalEvent,
@@ -1987,6 +1987,17 @@ mod tests {
             stp: SelfTradeProtection::Allow,
             expiry_ns: 0,
         }
+    }
+
+    #[test]
+    fn sequencer_returns_consecutive_values() {
+        let seq = Sequencer::new(42);
+        assert_eq!(seq.peek(), 42);
+        assert_eq!(seq.next(), 42);
+        assert_eq!(seq.next(), 43);
+        assert_eq!(seq.next(), 44);
+        assert_eq!(seq.peek(), 45); // peek doesn't advance
+        assert_eq!(seq.next(), 45);
     }
 
     #[test]
