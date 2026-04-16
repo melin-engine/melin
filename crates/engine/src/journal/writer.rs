@@ -586,7 +586,6 @@ impl JournalWriter {
         self.spare_buf = Some(batch.buf);
     }
 
-    /// Prepare a raw byte buffer for async writing via io_uring.
     /// Flush the journal to disk (fdatasync).
     ///
     /// Legacy sync path — only used during shutdown drain. Production

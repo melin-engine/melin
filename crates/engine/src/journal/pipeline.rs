@@ -2091,6 +2091,80 @@ mod tests {
         }
     }
 
+    /// Verify that the JournalStage detects divergence when a primary
+    /// checkpoint carries a chain hash that doesn't match the replica's.
+    /// The stage must return a fatal error, not silently continue.
+    #[cfg(feature = "hash-chain")]
+    #[test]
+    fn divergence_detected_on_checkpoint_hash_mismatch() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("divergence.journal");
+
+        let writer = JournalWriter::create(&path).unwrap();
+
+        let (mut producer, mut consumers) = ring::DisruptorBuilder::<InputSlot>::new(64)
+            .add_consumer()
+            .build();
+
+        let consumer = consumers.pop().unwrap();
+        let stage = JournalStage::new(writer, consumer, Duration::ZERO, MAX_JOURNAL_BATCH, false);
+
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let shutdown2 = Arc::clone(&shutdown);
+
+        // Publish a normal event with a pre-assigned sequence.
+        producer.publish(InputSlot {
+            connection_id: 0,
+            key_hash: 0,
+            request_seq: 0,
+            sequence: 100,
+            timestamp_ns: 1_000_000_000,
+            event: JournalEvent::Deposit {
+                account: AccountId(1),
+                currency: CurrencyId(0),
+                amount: 500,
+            },
+            publish_ts: trace_ts(),
+            recv_ts: trace_ts(),
+        });
+
+        // Publish a checkpoint with a deliberately wrong chain hash.
+        // This simulates the primary's checkpoint arriving after the
+        // replica encoded the preceding events differently.
+        producer.publish(InputSlot {
+            connection_id: 0,
+            key_hash: 0,
+            request_seq: 0,
+            sequence: 101,
+            timestamp_ns: 1_000_000_001,
+            event: JournalEvent::Checkpoint {
+                chain_hash: [0xFF; 32], // bogus hash — will not match
+                events_since_checkpoint: 1,
+            },
+            publish_ts: trace_ts(),
+            recv_ts: trace_ts(),
+        });
+
+        let handle = std::thread::spawn(move || stage.run(&shutdown2));
+
+        // Give the stage time to process both events.
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        shutdown.store(true, Ordering::Relaxed);
+        let result = handle.join().unwrap();
+
+        // The stage must return an error due to the hash mismatch.
+        match result {
+            Err(e) => {
+                let msg = e.to_string();
+                assert!(
+                    msg.contains("divergence detected"),
+                    "error should mention divergence: {msg}"
+                );
+            }
+            Ok(_) => panic!("expected divergence error, got Ok"),
+        }
+    }
+
     #[test]
     fn matching_stage_processes_events() {
         let mut exchange = Exchange::new();
