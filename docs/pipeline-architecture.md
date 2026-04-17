@@ -4,12 +4,12 @@ This document describes the LMAX-style disruptor pipeline that forms the core of
 
 ## Overview
 
-The server uses a 3-stage pipeline plus a reader pool, modeled after the LMAX Disruptor architecture:
+The server uses a 3-stage pipeline plus a single reader thread, modeled after the LMAX Disruptor architecture:
 
 ```
-  Reader Pool ----+
-  (N io_uring     |    +-------------------+
-   threads)       +--->| Input Disruptor   |--+--> Journal Stage
+  Reader     -----+
+  (1 io_uring     |    +-------------------+
+   thread)        +--->| Input Disruptor   |--+--> Journal Stage
                   |    | (1M-slot ring,    |  |
   Tick Generator -+--->|  lock-free CAS)   |  +--> Matching Stage
   (1 thread,      |    +-------------------+  |         |
@@ -24,8 +24,8 @@ The server uses a 3-stage pipeline plus a reader pool, modeled after the LMAX Di
                                                      (optional, gated on journal)
 ```
 
-1. **Reader pool** -- N io_uring-based threads (default 2) multiplex all client connections using multishot RECV and publish decoded requests into the input disruptor via lock-free CAS (`MultiProducer`).
-2. **Tick generator** -- dedicated thread that publishes `JournalEvent::Tick { now_ns }` at a fixed cadence (default 10 ms). Drives the engine's internal scheduler (GTD expiry today, volatility halts and session transitions later) from a single journaled time source.
+1. **Reader** -- a single io_uring thread multiplexes every TCP client connection via multishot RECV and publishes decoded requests into the input disruptor. The matching stage is the throughput limit, so adding reader threads would only re-introduce the multi-producer ordering race on the input ring without raising throughput.
+2. **Tick generator** -- dedicated thread that publishes `JournalEvent::Tick { now_ns }` at a fixed cadence (**default 250 ms**). The matching stage advances its scheduler clock from `slot.timestamp_ns` on every event, so under load each order/cancel implicitly fires due tasks at microsecond precision. Tick is the safety net that keeps time moving forward during quiet periods (no client traffic) — it is no longer the only thing that drives the scheduler.
 3. **Journal stage** -- batch-encodes events and writes them durably to disk via `pwritev2` + `RWF_DSYNC` (FUA). Advances its cursor only after the durable write completes.
 4. **Matching stage** -- executes commands against the `Exchange` engine and publishes execution reports to an output disruptor ring. Runs in parallel with the journal stage (does not wait for fsync).
 5. **Response stage** -- consumes from the output ring but gates on the journal cursor before sending responses to clients, enforcing the persist-before-ack invariant.
@@ -147,7 +147,7 @@ The simplified diagram above shows the primary-side request path. The picture be
 
 | Thread / stage              | Ingress                                 | Egress                                                |
 |----------------------------|-----------------------------------------|-------------------------------------------------------|
-| Reader pool (primary)      | Client TCP sockets (io_uring / DPDK)    | `InputSlot` into input ring                           |
+| Reader (primary)           | Client TCP sockets (io_uring / DPDK)    | `InputSlot` into input ring                           |
 | Tick generator (primary)   | Wall clock (monotonic-clamped)          | `JournalEvent::Tick` into input ring                  |
 | Seed loop (primary, boot)  | Config (`--accounts`, `--instruments`)  | `AddInstrument` / `ProvisionAccount` into input ring  |
 | Journal stage              | Input ring                              | Journal file; batch bytes into each replication ring  |
@@ -166,14 +166,20 @@ The simplified diagram above shows the primary-side request path. The picture be
 - **Hash chain**: computed by the primary's journal writer over each batch's bytes (sequence + payload + checkpoint metadata). Replicas recompute the chain over the received bytes and should arrive at the same hash.
 - **Replica journals** are *logically* identical to the primary's for the event stream (same sequences, same events). They are not byte-identical: each node stamps its own batch-header wall clock and may emit checkpoints at different rotation boundaries.
 
+### Scheduler clock
+
+The matching stage maintains a per-instance `last_drain_ns` watermark. At the head of every event it processes, if `slot.timestamp_ns > last_drain_ns` it drains all due scheduled tasks up to `slot.timestamp_ns` and updates the watermark. Under load this means each order/cancel event implicitly fires due tasks (GTD expiry, etc.) at microsecond precision, with no extra latency hop for a separate `Tick` event. The tick generator's role narrows to "make sure the clock advances during quiet periods" — at the default 250 ms cadence it costs ~4 events/sec of journal traffic.
+
+`replay_event` and the shadow stage's `dispatch_event` mirror the same drain at the same point so live, replay, and shadow exchanges stay byte-identical.
+
 ### Known limitations of the current sequence scheme
 
-Two latent issues live in the current producer-side sequence allocation and are worth documenting pending a rework:
+Two latent issues live in the producer-side sequence allocation and are worth documenting pending a rework:
 
-1. **Sequence leak on ring-full publish failure.** `sequencer.next()` is called before `producer.try_publish()`. If `try_publish` fails (input ring saturated), the claimed sequence never reaches a slot and is effectively lost. The next successful publish uses `seq + 1`, leaving a gap in the journal. Recovery detects that gap with `SequenceGap` and aborts. The input ring is 1M slots, so saturation is only reachable when the matching stage is fully stalled; the same pattern is used by every other primary-side producer (reader pool, seeding, tick).
-2. **Sequence / ring-slot ordering race under multi-producer contention.** `sequencer.next()` and the disruptor's slot-claim CAS are independent atomics. Two reader threads can interleave such that thread A claims sequence `N`, thread B claims sequence `N+1`, B acquires ring slot `k`, A acquires ring slot `k+1`. The journal stage then writes the entries in ring-cursor order (i.e. with sequences `N+1, N, …`), producing a non-monotonic journal that also aborts recovery.
+1. **Sequence leak on ring-full publish failure.** `sequencer.next()` is called before `producer.try_publish()`. If `try_publish` fails (input ring saturated), the claimed sequence never reaches a slot and is effectively lost. The next successful publish uses `seq + 1`, leaving a gap in the journal. Recovery detects that gap with `SequenceGap` and aborts. The input ring is 1M slots, so saturation is only reachable when the matching stage is fully stalled; the same pattern is used by every other primary-side producer (reader, seeding, tick).
+2. **Sequence / ring-slot ordering race under multi-producer contention.** `sequencer.next()` and the disruptor's slot-claim CAS are independent atomics. Two producers (today: the reader thread and the tick thread) can interleave such that producer A claims sequence `N`, producer B claims sequence `N+1`, B acquires ring slot `k`, A acquires ring slot `k+1`. The journal stage then writes the entries in ring-cursor order (i.e. with sequences `N+1, N, …`), producing a non-monotonic journal that also aborts recovery. With only the reader and tick as producers (~one tick every 250 ms vs. millions of orders) this is extraordinarily rare, but it remains theoretically possible.
 
-Both go away by moving sequence assignment into the journal stage (producers publish `sequence: 0`, the journal stage assigns from `writer.next_sequence()` at encode time), so the authoritative order is the disruptor's ring-cursor order. That refactor also removes the `Sequencer` type entirely.
+The architecturally clean fix is to move sequence assignment into the journal stage (producers publish `sequence: 0`, the journal stage assigns from `writer.next_sequence()` at encode time), so the authoritative order is the disruptor's ring-cursor order. That refactor also removes the `Sequencer` type entirely.
 
 ## Input Disruptor
 
@@ -337,15 +343,14 @@ The SPSC uses two cache-line-padded atomic counters (`head` and `tail`) for coor
 
 ## Threading Model
 
-The server spawns 3-6 dedicated OS threads for the pipeline plus N reader threads:
+The server spawns 3-6 dedicated OS threads for the pipeline plus one reader thread:
 
 | Thread | Default Core | Role | Optional? |
 |--------|-------------|------|-----------|
 | Journal | 1 | Durable write-ahead log | No |
 | Matching | 2 | Order execution (single-writer) | No |
 | Response | 3 | Client socket writes | No |
-| Reader 0 | 4 | io_uring-based connection multiplexing | No |
-| Reader 1 | 5 | io_uring-based connection multiplexing | No |
+| Reader | 4 | io_uring-based connection multiplexing | No |
 | Repl Sender | 6 | Stream journal batches to replicas | Yes (`--replication-bind`) |
 | Event Publisher | 7 | Broadcast execution events to subscribers | Yes (`--event-bind`) |
 | Shadow Exchange | 8 | Periodic snapshots without pausing matching | Yes (`--snapshot-interval-secs`) |
@@ -356,13 +361,13 @@ Core 0 is reserved for OS/IRQ handling.
 
 Each pipeline thread calls `sched_setaffinity` (via `crate::affinity::pin_to_core`) immediately after spawning, before entering its main loop. Pinning eliminates involuntary context switches and keeps hot data in L1/L2 cache, reducing p99/p99.9 latency jitter from approximately 5-20 us per core migration to near zero.
 
-In **kernel TCP mode**, reader threads are pinned to cores starting at `--reader-cores` (default 4). Reader thread `i` is pinned to core `reader_cores + i`.
+In **kernel TCP mode**, the reader thread is pinned to `--reader-cores` (default 4). io_uring with multishot RECV multiplexes every client connection on this single thread.
 
-In **DPDK mode**, a single poll thread handles all client connections (one NIC queue, no RSS). It is pinned to the `--reader-cores` core (default 4). The `--readers` flag is ignored.
+In **DPDK mode**, a single poll thread handles all client connections (one NIC queue, no RSS). It is also pinned to the `--reader-cores` core.
 
 ### Why not async
 
-The server is fully synchronous -- no async runtime. Eliminating tokio removes async scheduling jitter from the response path and simplifies reasoning about thread ownership. The reader threads use io_uring with multishot RECV for connection multiplexing, and the pipeline threads use spin-wait loops with adaptive yielding.
+The server is fully synchronous -- no async runtime. Eliminating tokio removes async scheduling jitter from the response path and simplifies reasoning about thread ownership. The reader thread uses io_uring with multishot RECV for connection multiplexing, and the pipeline threads use spin-wait loops with adaptive yielding.
 
 ## Persist-Before-Ack Invariant
 
@@ -389,8 +394,7 @@ Because the journal and matching consumers run in parallel (not chained), the ma
 | Flag | Default | Description |
 |------|---------|-------------|
 | `--cores` | `1,2,3,6,7,8` | Pipeline core IDs: journal, matching, response, repl-sender, event-publisher, shadow (comma-separated) |
-| `--readers` | `2` | Number of io_uring reader threads (kernel TCP only; ignored in DPDK mode) |
-| `--reader-cores` | `4` | First CPU core for reader/poll thread pinning. TCP: reader i -> core reader_cores + i. DPDK: single poll thread on this core. |
+| `--reader-cores` | `4` | CPU core for the reader thread (TCP) or first poll thread (DPDK). |
 | `--group-commit-us` | `0` | Group commit coalescing delay in microseconds. Keep at 0 for TCP. |
 | `--heartbeat-interval-secs` | `10` | Heartbeat interval for idle connections (0 to disable) |
 | `--connection-timeout-secs` | `30` | Disconnect clients silent for this long (0 to disable) |

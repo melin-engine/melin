@@ -236,8 +236,6 @@ fn spawn_primary(
             // Reduce core count to avoid conflicts in CI.
             "--cores",
             "0,0,0,0,0,0,0,0",
-            "--readers",
-            "1",
             "--reader-cores",
             "0",
         ])
@@ -339,8 +337,6 @@ fn spawn_replica_named_with_extra(
         "--yield-idle".into(),
         "--cores".into(),
         "0,0,0,0,0,0,0,0".into(),
-        "--readers".into(),
-        "1".into(),
         "--reader-cores".into(),
         "0".into(),
     ];
@@ -740,8 +736,6 @@ fn crashed_primary_recovers_from_journal() {
                 "--yield-idle",
                 "--cores",
                 "0,0,0,0,0,0,0,0",
-                "--readers",
-                "1",
                 "--reader-cores",
                 "0",
             ])
@@ -1357,8 +1351,6 @@ fn replacement_replica_catches_up_from_journal() {
                 "--yield-idle",
                 "--cores",
                 "0,0,0,0,0,0,0,0",
-                "--readers",
-                "1",
                 "--reader-cores",
                 "0",
             ])
@@ -1499,8 +1491,6 @@ fn catchup_with_fills_during_gap() {
                 "--yield-idle",
                 "--cores",
                 "0,0,0,0,0,0,0,0",
-                "--readers",
-                "1",
                 "--reader-cores",
                 "0",
             ])
@@ -1625,8 +1615,6 @@ fn catchup_then_immediate_failover() {
                 "--yield-idle",
                 "--cores",
                 "0,0,0,0,0,0,0,0",
-                "--readers",
-                "1",
                 "--reader-cores",
                 "0",
             ])
@@ -1753,8 +1741,6 @@ fn fresh_replica_full_catchup() {
                 "--yield-idle",
                 "--cores",
                 "0,0,0,0,0,0,0,0",
-                "--readers",
-                "1",
                 "--reader-cores",
                 "0",
             ])
@@ -1878,8 +1864,6 @@ fn snapshot_transfer_when_archives_purged() {
                 "--yield-idle",
                 "--cores",
                 "0,0,0,0,0,0,0,0",
-                "--readers",
-                "1",
                 "--reader-cores",
                 "0",
                 "--standalone",
@@ -1968,8 +1952,6 @@ fn snapshot_transfer_when_archives_purged() {
                 "--yield-idle",
                 "--cores",
                 "0,0,0,0,0,0,0,0",
-                "--readers",
-                "1",
                 "--reader-cores",
                 "0",
                 "--snapshot-interval-secs",

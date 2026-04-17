@@ -572,7 +572,7 @@ The server sets a **5-second read timeout** on the socket during the auth handsh
 
 ### Auth frame reading
 
-During the handshake, the server reads the `ChallengeResponse` frame using raw `read_exact` (not `BufReader`) to avoid over-reading bytes that belong to the first post-auth request. Those bytes would be lost when the fd moves to the io_uring reader pool.
+During the handshake, the server reads the `ChallengeResponse` frame using raw `read_exact` (not `BufReader`) to avoid over-reading bytes that belong to the first post-auth request. Those bytes would be lost when the fd moves to the io_uring reader thread.
 
 The maximum accepted auth frame size is 256 bytes. The expected `ChallengeResponse` frame is 97 bytes (1 tag + 64 signature + 32 public key).
 

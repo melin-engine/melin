@@ -140,7 +140,7 @@ A server started with `--replica-of <primary_addr>` runs in replica mode:
 - Authenticates with the primary via Ed25519 challenge-response (`--replication-key`).
 - Connects to the primary and sends a `Handshake`.
 - Receives `DataBatch` frames, decodes entries, publishes them to a local disruptor pipeline.
-- Uses the same pipeline architecture as the primary (journal stage → matching stage → shadow stage), with the replication receiver feeding the input disruptor instead of reader threads.
+- Uses the same pipeline architecture as the primary (journal stage → matching stage → shadow stage), with the replication receiver feeding the input disruptor instead of the reader thread.
 - The journal stage encodes events independently using the primary's pre-assigned sequences and timestamps (carried in each `InputSlot`). Each node produces its own journal — logically identical to the primary's but independently encoded.
 - The matching stage processes events through its own `Exchange` independently, maintaining warm state for promotion.
 - Sends `Ack` frames after the journal stage confirms durable write (cursor advance). Acks are pipelined: up to 8 batches can be submitted to the journal stage before the first ack is sent, overlapping NVMe writes with TCP receives. With `--async-replica-ack`, acks are sent the moment a batch is queued for the journal stage rather than after fsync — see the durability tradeoff section above.

@@ -1122,6 +1122,13 @@ pub struct MatchingStage {
     busy_spin: bool,
     /// Shared busy/idle counters for health endpoint monitoring.
     utilization: Arc<StageUtilization>,
+    /// Highest event timestamp the scheduler has drained against. Each event
+    /// (including non-Tick events) advances this whenever its `slot.timestamp_ns`
+    /// is newer, so the scheduler fires due tasks at every-event resolution under
+    /// load. Tick events become a quiet-period safety net rather than the only
+    /// thing that moves time forward. Derived state — not snapshotted; recovery
+    /// catches up at the first replayed event with a non-zero timestamp.
+    last_drain_ns: u64,
 }
 
 impl MatchingStage {
@@ -1146,6 +1153,7 @@ impl MatchingStage {
             replicas_connected,
             busy_spin,
             utilization: Arc::new(StageUtilization::new()),
+            last_drain_ns: 0,
         }
     }
 
@@ -1494,6 +1502,18 @@ impl MatchingStage {
 
     /// Execute a single event against the exchange.
     fn process_event(&mut self, slot: &InputSlot, reports: &mut Vec<ExecutionReport>) {
+        // Hybrid scheduler clock: every event with a non-zero, monotonic
+        // timestamp drives the scheduler forward. Under load this fires due
+        // tasks at every-event resolution (microseconds) without waiting for
+        // the next Tick. The non-monotonic guard tolerates the rare
+        // multi-producer ordering race in which a slot arrives with an
+        // earlier timestamp than its predecessor.
+        if slot.timestamp_ns > self.last_drain_ns {
+            self.last_drain_ns = slot.timestamp_ns;
+            self.exchange
+                .drain_due_scheduled_tasks(slot.timestamp_ns, reports);
+        }
+
         match slot.event {
             JournalEvent::AddInstrument { spec } => {
                 self.exchange.add_instrument(spec);
@@ -1571,6 +1591,12 @@ impl MatchingStage {
                 self.exchange.remove_instrument(symbol, reports);
             }
             JournalEvent::Tick { now_ns } => {
+                // Defensive: the head-of-event drain has already advanced the
+                // clock to `slot.timestamp_ns`, which equals `now_ns` for
+                // tick-generator-published slots — so this call is typically
+                // a no-op. We keep it for paths where slot.timestamp_ns is 0
+                // (tests, manually constructed Ticks), so the tick still
+                // drives time forward as documented on `JournalEvent::Tick`.
                 self.exchange.drain_due_scheduled_tasks(now_ns, reports);
             }
             JournalEvent::QueryStats | JournalEvent::QueryPosition { .. } => {
@@ -1689,11 +1715,12 @@ pub fn build_pipeline_with_replication(
     enable_event_publisher: bool,
     enable_shadow: bool,
 ) -> Pipeline {
-    // Input disruptor: N producers (reader threads), 2+ parallel consumers.
-    // MultiProducer allows lock-free concurrent publishing from all reader
-    // threads, eliminating the Mutex that previously serialized access.
-    // When shadow snapshots are enabled, a third consumer is chained after
-    // journal (consumer 0) — it only sees events that have been durably fsynced.
+    // Input disruptor: a small set of producers (reader thread, tick thread,
+    // seed loop) and 2+ parallel consumers.
+    // MultiProducer is used so the tick thread can publish concurrently with
+    // the reader without a mutex. When shadow snapshots are enabled, a third
+    // consumer is chained after journal (consumer 0) — it only sees events
+    // that have been durably fsynced.
     let mut builder = ring::DisruptorBuilder::<InputSlot>::new(INPUT_RING_CAPACITY)
         .add_consumer() // consumer 0: journal, gated on producer
         .add_consumer(); // consumer 1: matching, gated on producer (parallel)
@@ -1703,7 +1730,7 @@ pub fn build_pipeline_with_replication(
     let (input_producer, mut consumers) = builder.build_multi_producer();
 
     // Type-erased cursor reader for queue depth monitoring.
-    // Extracted before the producer is cloned to reader threads.
+    // Extracted before the producer is cloned to producer threads.
     let input_cursor = input_producer.cursor_reader();
 
     // Pop consumers in reverse order of addition. With shadow enabled the

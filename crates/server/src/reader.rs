@@ -139,15 +139,15 @@ impl<R> UringReaderHandle<R> {
 /// Spawn the io_uring reader thread. Returns a handle for registering
 /// connections.
 ///
-/// Uses a single thread since io_uring efficiently batches I/O for
-/// hundreds of connections.
-/// The `num_threads` parameter is accepted for future scaling but
-/// only one thread is spawned.
-pub fn spawn_reader_pool<R: AsRawFd + Send + 'static>(
-    _num_threads: usize,
+/// One reader thread serves every TCP connection on the server. io_uring
+/// with multishot RECV multiplexes thousands of sockets efficiently and the
+/// matching stage is the throughput limit, so adding more reader threads
+/// would not raise throughput — it would only re-introduce the
+/// multi-producer ordering race in `Sequencer::next`/`MultiProducer::try_publish`.
+pub fn spawn_reader<R: AsRawFd + Send + 'static>(
     producer: ring::MultiProducer<InputSlot>,
     control_tx: mpsc::Sender<ControlEvent>,
-    core_start: usize,
+    core: usize,
     connection_timeout: Option<Duration>,
     shutdown: Arc<AtomicBool>,
     sequencer: Arc<Sequencer>,
@@ -163,9 +163,9 @@ pub fn spawn_reader_pool<R: AsRawFd + Send + 'static>(
     let handle = std::thread::Builder::new()
         .name("uring-reader".into())
         .spawn(move || {
-            match crate::affinity::pin_to_core(core_start) {
+            match crate::affinity::pin_to_core(core) {
                 Ok(c) => tracing::info!(thread = "uring-reader", core = c, "pinned to core"),
-                Err(e) => tracing::warn!(thread = "uring-reader", core = core_start, error = %e, "failed to pin"),
+                Err(e) => tracing::warn!(thread = "uring-reader", core = core, error = %e, "failed to pin"),
             }
             reader_loop(rx, wakeup_fd, producer, &control_tx, connection_timeout, &shutdown_clone, &sequencer);
         })

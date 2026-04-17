@@ -63,6 +63,9 @@ pub fn run(
     // Track whether any events have been consumed. Prevents snapshotting
     // empty state before the first event arrives.
     let mut has_events = false;
+    // Highest event timestamp the shadow's scheduler has drained against.
+    // See `dispatch_event` for the per-event drain rationale.
+    let mut last_drain_ns: u64 = 0;
 
     loop {
         if shutdown.load(Ordering::Relaxed) {
@@ -86,9 +89,17 @@ pub fn run(
         idle_spins = 0;
         has_events = true;
 
-        // Replay each event on the shadow exchange.
+        // Replay each event on the shadow exchange. last_drain_ns lives
+        // outside the loop so the per-event drain stays monotonic across
+        // batches.
         for slot in &batch[..count] {
-            dispatch_event(&mut exchange, &slot.event, &mut reports);
+            dispatch_event(
+                &mut exchange,
+                &slot.event,
+                slot.timestamp_ns,
+                &mut last_drain_ns,
+                &mut reports,
+            );
         }
 
         // Check if a snapshot is due.
@@ -129,14 +140,25 @@ fn save_snapshot(
 
 /// Dispatch a single journal event to the shadow exchange.
 ///
-/// Same event handling as the matching stage's `process_event`, but without
-/// output publishing — all execution reports are discarded.
+/// Same event handling as the matching stage's `process_event`, including
+/// the per-event scheduler drain — without that the shadow's snapshot would
+/// hold scheduled-task state that's stale relative to the live engine.
+/// `last_drain_ns` is caller-tracked across the consume loop so the drain
+/// stays monotonic.
 fn dispatch_event(
     exchange: &mut Exchange,
     event: &JournalEvent,
+    timestamp_ns: u64,
+    last_drain_ns: &mut u64,
     reports: &mut Vec<ExecutionReport>,
 ) {
     reports.clear();
+
+    if timestamp_ns > *last_drain_ns {
+        *last_drain_ns = timestamp_ns;
+        exchange.drain_due_scheduled_tasks(timestamp_ns, reports);
+    }
+
     match *event {
         JournalEvent::AddInstrument { spec } => {
             exchange.add_instrument(spec);
@@ -205,6 +227,10 @@ fn dispatch_event(
             exchange.remove_instrument(symbol, reports);
         }
         JournalEvent::Tick { now_ns } => {
+            // Defensive: the head-of-event drain typically already advanced
+            // the clock to this point. Re-draining via `now_ns` keeps the
+            // contract consistent for callers that pass `timestamp_ns = 0`
+            // (tests, manually constructed events).
             exchange.drain_due_scheduled_tasks(now_ns, reports);
         }
         JournalEvent::QueryStats | JournalEvent::QueryPosition { .. } => {
@@ -454,9 +480,12 @@ mod tests {
             JournalEvent::EndOfDay,
         ];
 
-        // Shadow path: dispatch_event.
+        // Shadow path: dispatch_event. Pass timestamp 0 throughout — this
+        // test isn't exercising the per-event scheduler drain, so the
+        // timestamp/last_drain_ns plumbing stays inert.
+        let mut last_drain_ns: u64 = 0;
         for event in &events {
-            dispatch_event(&mut shadow, event, &mut reports);
+            dispatch_event(&mut shadow, event, 0, &mut last_drain_ns, &mut reports);
         }
 
         // Primary path: direct method calls (mirrors dispatch_event logic).

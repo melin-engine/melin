@@ -34,7 +34,7 @@ The response stage writes to client sockets on a **single thread** serving all c
 
 The accept loop has no limit on concurrent connections, no per-IP rate limiting, and no backoff on repeated connection attempts. Authentication runs on the accept thread with a 5-second timeout per connection.
 
-**Impact**: An attacker can exhaust file descriptors (EMFILE), saturate the accept thread with slow auth handshakes, or overwhelm the reader pool with thousands of idle connections.
+**Impact**: An attacker can exhaust file descriptors (EMFILE), saturate the accept thread with slow auth handshakes, or overwhelm the reader thread with thousands of idle connections.
 **Exploitable remotely**: Yes — open many connections slowly.
 **Status**: **PARTIALLY FIXED** — added `--max-connections` flag (default 1024). Connections beyond the limit are rejected before auth. Remaining: per-IP connection cap and exponential backoff on auth failures.
 
@@ -85,7 +85,7 @@ When the journal disk fills, `posix_fallocate` returns ENOSPC. The error propaga
 
 **File**: `crates/disruptor/src/ring.rs:216-223`
 
-When the input ring buffer is full, `publish()` spins in a tight loop calling `std::hint::spin_loop()`. If the matching stage falls behind (e.g., processing a large stop cascade), reader threads burn 100% CPU spinning.
+When the input ring buffer is full, `publish()` spins in a tight loop calling `std::hint::spin_loop()`. If the matching stage falls behind (e.g., processing a large stop cascade), the reader thread burns 100% CPU spinning.
 
 **Impact**: CPU waste, increased power consumption, reduced responsiveness.
 **Exploitable remotely**: Partially — crafted order sequences that cause slow matching.

@@ -52,13 +52,11 @@ pub struct ServerConfig {
     /// repl-handler-0/1 are for the per-replica TCP handler threads (0 = unpinned).
     #[arg(long, default_value = "1,2,3,6,7,8,9,10", value_parser = parse_cores)]
     pub cores: PipelineCores,
-    /// Number of io_uring reader threads (kernel TCP only). Ignored in
-    /// DPDK mode, which uses a single poll thread on core `reader-cores`.
-    #[arg(long, default_value_t = 2)]
-    pub readers: usize,
-    /// First CPU core for reader/poll thread pinning. In TCP mode, reader
-    /// thread i is pinned to core reader_cores + i. In DPDK mode, the
-    /// single poll thread is pinned to this core.
+    /// CPU core for the reader thread. In kernel TCP mode this pins the
+    /// io_uring reader; in DPDK mode it pins the (first) poll thread.
+    /// The matching stage is the throughput bottleneck — a single
+    /// io_uring reader with multishot RECV easily multiplexes thousands
+    /// of connections without becoming the limit.
     #[arg(long, default_value_t = 4)]
     pub reader_cores: usize,
     /// Group commit coalescing delay in microseconds. Keep at 0 for TCP.
@@ -247,7 +245,14 @@ pub struct ServerConfig {
     /// session transitions) fire in deterministic, journaled lockstep.
     /// Set to 0 to disable the tick thread (useful for benchmarks that
     /// don't exercise time-driven features).
-    #[arg(long, default_value_t = 10)]
+    ///
+    /// Defaults to 250 ms. Under load the matching stage advances its
+    /// scheduler clock at every-event resolution from `slot.timestamp_ns`
+    /// (microsecond precision), so the tick is only the safety net for
+    /// quiet periods. 250 ms keeps quiet-market scheduler firings within
+    /// a quarter-second of their deadline at a cost of ~4 events/sec of
+    /// journal traffic.
+    #[arg(long, default_value_t = 250)]
     pub tick_interval_ms: u64,
 }
 
@@ -274,7 +279,6 @@ impl Default for ServerConfig {
                 repl_handler_0: 9,
                 repl_handler_1: 10,
             },
-            readers: 2,
             reader_cores: 4,
             group_commit_us: 0,
             heartbeat_interval_secs: 10,
@@ -307,7 +311,7 @@ impl Default for ServerConfig {
             promote_bind: None,
             snapshot_interval_secs: 3000,
             snapshot_path: None,
-            tick_interval_ms: 10,
+            tick_interval_ms: 250,
         }
     }
 }
@@ -737,11 +741,11 @@ fn run_as_primary<L: BlockingTransportListener>(
     // Control channel for connect/disconnect events → response stage.
     let (control_tx, control_rx) = std::sync::mpsc::channel();
 
-    // Spawn the io_uring reader thread pool. Connections are distributed
-    // round-robin across reader threads. Each thread uses io_uring with
-    // multishot RECV to multiplex its connections and MultiProducer to
-    // publish to the disruptor. With 2 readers (cores 4-5) + 3 pipeline
-    // (cores 1-3) = 5 pinned OS threads, no oversubscription.
+    // Spawn the io_uring reader thread. A single reader uses multishot RECV
+    // to multiplex every TCP connection on the server. Pinned to
+    // `--reader-cores`. The matching stage is the throughput limit, so a
+    // second reader would not raise throughput — only re-introduce the
+    // multi-producer ordering race on the input ring.
     let connection_timeout = config.connection_timeout();
     let heartbeat_interval = config.heartbeat_interval();
 
@@ -757,7 +761,7 @@ fn run_as_primary<L: BlockingTransportListener>(
     // Spawn the tick generator thread, if enabled. Publishes JournalEvent::Tick
     // at the configured cadence so the engine's scheduler advances time
     // independently of client traffic. Clones the input producer and sequencer
-    // so the reader pool below can still take ownership of the originals.
+    // so the reader thread below can still take ownership of the originals.
     let tick_handle = if let Some(cadence) = config.tick_interval() {
         let producer = input_producer.clone();
         let sequencer = Arc::clone(&sequencer);
@@ -773,8 +777,7 @@ fn run_as_primary<L: BlockingTransportListener>(
     };
 
     let reader_shutdown = Arc::new(AtomicBool::new(false));
-    let mut reader_handle = crate::reader::spawn_reader_pool(
-        config.readers,
+    let mut reader_handle = crate::reader::spawn_reader(
         input_producer,
         control_tx.clone(),
         config.reader_cores,
@@ -1348,7 +1351,7 @@ fn run_as_primary<L: BlockingTransportListener>(
 
     // --- Ordered shutdown sequence ---
     // 1. Stop readers first so no new events enter the disruptor.
-    info!("shutdown: stopping reader threads");
+    info!("shutdown: stopping reader thread");
     reader_handle.shutdown();
     reader_handle.join();
 

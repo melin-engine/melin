@@ -218,6 +218,7 @@ impl JournaledExchange {
         let mut reader = JournalReader::open(journal_path)?;
         let mut exchange = Exchange::with_capacity();
         let mut reports = Vec::new();
+        let mut last_drain_ns: u64 = 0;
 
         loop {
             match reader.next_entry() {
@@ -225,8 +226,10 @@ impl JournaledExchange {
                     replay_event(
                         &mut exchange,
                         &entry.event,
+                        entry.timestamp_ns,
                         entry.key_hash,
                         entry.request_seq,
+                        &mut last_drain_ns,
                         &mut reports,
                     );
                     reports.clear();
@@ -281,6 +284,7 @@ impl JournaledExchange {
         reader.seed_chain_hash(snap_chain_hash, snap_sequence);
 
         let mut reports = Vec::new();
+        let mut last_drain_ns: u64 = 0;
 
         // Skip entries already captured by the snapshot.
         loop {
@@ -290,8 +294,10 @@ impl JournaledExchange {
                         replay_event(
                             &mut exchange,
                             &entry.event,
+                            entry.timestamp_ns,
                             entry.key_hash,
                             entry.request_seq,
+                            &mut last_drain_ns,
                             &mut reports,
                         );
                         reports.clear();
@@ -440,16 +446,32 @@ fn rotate_file(path: &Path) -> Result<(), JournalError> {
 /// on every event. Since the journal contains no duplicates (they were
 /// rejected at write time), this always returns true — the purpose is
 /// to reconstruct the HWM state for live dedup after recovery.
+///
+/// `timestamp_ns` is the journaled wall-clock stamp from this entry; it
+/// drives the same per-event scheduler drain that the live matching stage
+/// performs, keeping replay state byte-identical to the live system.
+/// `last_drain_ns` is caller-tracked across the replay loop so the drain
+/// stays monotonic.
 fn replay_event(
     exchange: &mut Exchange,
     event: &JournalEvent,
+    timestamp_ns: u64,
     key_hash: u64,
     request_seq: u64,
+    last_drain_ns: &mut u64,
     reports: &mut Vec<ExecutionReport>,
 ) {
     // Rebuild per-key HWM state (always succeeds on journal replay — no
     // duplicates in the journal).
     exchange.check_request_seq(key_hash, request_seq);
+
+    // Mirror the matching stage's per-event scheduler drain — without this,
+    // replay would not fire scheduled tasks at the same points the live
+    // system did, and the recovered Exchange would diverge.
+    if timestamp_ns > *last_drain_ns {
+        *last_drain_ns = timestamp_ns;
+        exchange.drain_due_scheduled_tasks(timestamp_ns, reports);
+    }
 
     match *event {
         JournalEvent::AddInstrument { spec } => {
@@ -519,6 +541,10 @@ fn replay_event(
             exchange.remove_instrument(symbol, reports);
         }
         JournalEvent::Tick { now_ns } => {
+            // Defensive: head-of-event drain typically already advanced to
+            // this point. Re-draining via the explicit `now_ns` payload
+            // keeps the contract consistent for callers that pass
+            // `timestamp_ns = 0` (tests, manually replayed entries).
             exchange.drain_due_scheduled_tasks(now_ns, reports);
         }
         JournalEvent::QueryStats | JournalEvent::QueryPosition { .. } => {
@@ -705,13 +731,16 @@ mod tests {
         let mut reader = super::super::reader::JournalReader::open(&path).unwrap();
         let mut replay_exchange = Exchange::new();
         let mut replay_reports = Vec::new();
+        let mut last_drain_ns: u64 = 0;
 
         while let Some(entry) = reader.next_entry().unwrap() {
             replay_event(
                 &mut replay_exchange,
                 &entry.event,
+                entry.timestamp_ns,
                 entry.key_hash,
                 entry.request_seq,
+                &mut last_drain_ns,
                 &mut replay_reports,
             );
         }
@@ -721,18 +750,27 @@ mod tests {
 
     #[test]
     fn ticks_drive_gtd_expiry_through_replay() {
+        use crate::journal::writer::wall_clock_nanos;
+
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("gtd_ticks.journal");
 
-        // Build state: instrument + funds + two GTD orders at distinct
-        // expiries, then a Tick that should expire the earlier one only.
+        // The matching/replay stage drains the scheduler at every event
+        // using the journal entry's `timestamp_ns` (wall-clock at write
+        // time). GTD `expiry_ns` therefore has to be in the same wall-clock
+        // domain, comfortably in the future of every entry's timestamp,
+        // for the test to control which Tick fires which order.
+        let now = wall_clock_nanos();
+        let expiry_one = now + 60 * 1_000_000_000; // +60s
+        let expiry_two = now + 120 * 1_000_000_000; // +120s
+
         let mut reports = Vec::new();
         {
             let mut je = JournaledExchange::create(&path).unwrap();
             je.add_instrument(btc_usd_spec()).unwrap();
             je.deposit(ACCT_A, USD, 1_000_000).unwrap();
 
-            for (id, expiry) in [(1u64, 5_500u64), (2, 7_000)] {
+            for (id, expiry) in [(1u64, expiry_one), (2, expiry_two)] {
                 je.execute(
                     Symbol(1),
                     Order {
@@ -755,7 +793,7 @@ mod tests {
             reports.clear();
 
             // Tick past order 1's expiry but not order 2's.
-            je.tick(6_000, &mut reports).unwrap();
+            je.tick(expiry_one, &mut reports).unwrap();
             assert_eq!(reports.len(), 1, "tick should expire order 1");
             assert!(matches!(
                 reports[0],
@@ -780,7 +818,7 @@ mod tests {
         // Drive recovery to the point where order 2 should also expire.
         let mut recovered = recovered;
         let mut replay_reports = Vec::new();
-        recovered.tick(7_000, &mut replay_reports).unwrap();
+        recovered.tick(expiry_two, &mut replay_reports).unwrap();
         assert_eq!(replay_reports.len(), 1);
         assert!(matches!(
             replay_reports[0],

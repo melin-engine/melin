@@ -10,7 +10,7 @@ The suite offers three modes that progressively strip away layers of the stack, 
 
 Full end-to-end benchmark through the entire server. By default, an embedded server is spawned in-process and clients connect via TCP loopback. With `--addr=<ip:port>`, clients connect to a remote engine instead (LAN benchmark mode). With `--uds`, clients use Unix domain sockets.
 
-What it measures: client-perceived round-trip latency including transport, reader pool, disruptor publication, journal fsync, matching engine execution, response stage, and the return trip through the socket.
+What it measures: client-perceived round-trip latency including transport, reader thread, disruptor publication, journal fsync, matching engine execution, response stage, and the return trip through the socket.
 
 Each bench thread runs its own io_uring ring (RECV/SEND) and manages a subset of connections.
 
@@ -39,7 +39,7 @@ Why numbers differ from pipeline: there is no journal fsync, no ring buffer sync
 | Journal (fsync) | -- | yes | yes |
 | Response stage | -- | -- | yes |
 | TCP/UDS transport | -- | -- | yes |
-| Reader pool (io_uring) | -- | -- | yes |
+| Reader thread (io_uring) | -- | -- | yes |
 | Ed25519 auth handshake | -- | -- | yes |
 
 ## Order Generation
@@ -168,7 +168,7 @@ All threads are pinned to specific CPU cores via `sched_setaffinity`. The layout
 |-------|---------|
 | 0 | OS, IRQ handling, RCU callbacks |
 | 1-3 | Pipeline (journal, matching, response) — set by server's `--cores` flag |
-| 4-5 | Reader pool threads |
+| 4 | Reader thread |
 | 6 | Replication sender — set by server's `--cores` flag (4th value) |
 | 7+ | Bench client threads (when `--bench-cores 7` is passed) |
 
