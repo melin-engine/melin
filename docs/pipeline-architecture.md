@@ -7,27 +7,173 @@ This document describes the LMAX-style disruptor pipeline that forms the core of
 The server uses a 3-stage pipeline plus a reader pool, modeled after the LMAX Disruptor architecture:
 
 ```
-                        +-------------------+
-  Reader Pool --------->| Input Disruptor   |-----+----> Journal Stage
-  (N io_uring threads,  | (1M-slot ring,    |     |
-   MultiProducer CAS)   |  lock-free CAS)   |     +----> Matching Stage
-                        +-------------------+              |
-                                                           | Output Disruptor Ring
-                                                           | (multi-consumer)
-                                                           v
-                                              +----> Response Stage ----> Clients
-                                              |
-                                              +----> Event Publisher ----> Subscribers
-                                                     (optional, --event-bind)
+  Reader Pool ----+
+  (N io_uring     |    +-------------------+
+   threads)       +--->| Input Disruptor   |--+--> Journal Stage
+                  |    | (1M-slot ring,    |  |
+  Tick Generator -+--->|  lock-free CAS)   |  +--> Matching Stage
+  (1 thread,      |    +-------------------+  |         |
+   wall clock)    |                           |         | Output Disruptor
+                  |                           |         | (multi-consumer)
+  Seeding --------+                           |         v
+  (startup only)                              |  +--> Response Stage --> Clients
+                                              |  |
+                                              |  +--> Event Publisher --> Subscribers
+                                              |       (optional, --event-bind)
+                                              +----> Shadow Stage --> Snapshots
+                                                     (optional, gated on journal)
 ```
 
 1. **Reader pool** -- N io_uring-based threads (default 2) multiplex all client connections using multishot RECV and publish decoded requests into the input disruptor via lock-free CAS (`MultiProducer`).
-2. **Journal stage** -- batch-encodes events and writes them durably to disk via `pwritev2` + `RWF_DSYNC` (FUA). Advances its cursor only after the durable write completes.
-3. **Matching stage** -- executes commands against the `Exchange` engine and publishes execution reports to an output disruptor ring. Runs in parallel with the journal stage (does not wait for fsync).
-4. **Response stage** -- consumes from the output ring but gates on the journal cursor before sending responses to clients, enforcing the persist-before-ack invariant.
-5. **Event publisher** (optional) -- second consumer on the output ring, enabled by `--event-bind`. Broadcasts all execution events to TCP subscribers for market data gateways, analytics, and audit loggers. Ed25519 auth required.
+2. **Tick generator** -- dedicated thread that publishes `JournalEvent::Tick { now_ns }` at a fixed cadence (default 10 ms). Drives the engine's internal scheduler (GTD expiry today, volatility halts and session transitions later) from a single journaled time source.
+3. **Journal stage** -- batch-encodes events and writes them durably to disk via `pwritev2` + `RWF_DSYNC` (FUA). Advances its cursor only after the durable write completes.
+4. **Matching stage** -- executes commands against the `Exchange` engine and publishes execution reports to an output disruptor ring. Runs in parallel with the journal stage (does not wait for fsync).
+5. **Response stage** -- consumes from the output ring but gates on the journal cursor before sending responses to clients, enforcing the persist-before-ack invariant.
+6. **Event publisher** (optional) -- second consumer on the output ring, enabled by `--event-bind`. Broadcasts all execution events to TCP subscribers for market data gateways, analytics, and audit loggers. Ed25519 auth required.
+7. **Shadow stage** (optional) -- third consumer on the input ring, gated on the journal cursor. Periodically saves an exchange snapshot on a dedicated thread without pausing the matching engine.
 
 **Why this design**: Single-threaded business logic (the matching stage) eliminates locks on the hot path. Parallelizing journal I/O with matching hides fsync latency. The persist-before-ack boundary is enforced at the response stage, not in the matching stage, so the engine never stalls waiting for disk.
+
+## Full data flow (primary + replica)
+
+The simplified diagram above shows the primary-side request path. The picture below is the full topology — including the tick generator, the shadow stage, and the replication transport to replicas — as it exists today.
+
+```
++===============================================================+
+|                           PRIMARY                              |
++===============================================================+
+
+ CLIENT TCP        WALL CLOCK        SEED LOOP
+ (N conns)                           (startup only)
+      |                 |                |
+      v                 v                v
+ +----------+      +----------+     +----------+
+ | READER   |      |   TICK   |     |   SEED   |
+ | POOL     |      |   GEN    |     | (one-    |
+ | (R thr.) |      | (1 thr.) |     |   shot)  |
+ +----+-----+      +----+-----+     +----+-----+
+      |                 |                |
+      | client requests |  Tick{now_ns}  |  AddInstrument /
+      |                 |  cadence 10ms  |  ProvisionAccount
+      v                 v                v
+ +---------------------------------------------+
+ |  INPUT RING -- disruptor, 1M InputSlot      |
+ +---+-------------+----------------+----------+
+     |             |                |
+     v             v                v (gated on journal)
+ +-------+    +---------+     +-----------+
+ |JOURNAL|    |MATCHING |     |  SHADOW   | (optional)
+ | STAGE |    |  STAGE  |     |  STAGE    |
+ +-+--+--+    +---+-----+     +-----+-----+
+   |  |           |                 |
+   |  |           v                 v
+   |  |     +-------------+    periodic
+   |  |     | OUTPUT RING |    .snapshot
+   |  |     | disruptor   |
+   |  |     +--+-------+--+
+   |  |        |       |
+   |  |        v       v
+   |  |   +--------+ +-----------+
+   |  |   |RESPONSE| |EVENT PUB  | (opt, --event-bind)
+   |  |   | STAGE  | |           |
+   |  |   +---+----+ +----+------+
+   |  |       |           |
+   |  |       v           v
+   |  |   CLIENT TCP   MARKET-DATA
+   |  |   (reports)    SUBSCRIBERS
+   |  |
+   |  |  pwritev2 (RWF_DSYNC) -> JOURNAL FILE
+   |  |  journal bytes carry (sequence, timestamp, event, key_hash, request_seq)
+   |  |
+   |  |  post-fsync: push encoded batch bytes
+   |  v
+   |  +------------------+
+   |  | REPLICATION RING |  per-replica (up to 2)
+   |  |  slot 0 | slot 1 |  ring-of-batches (not per-event)
+   |  +----+---------+---+
+   |       |         |
+   |       v         v
+   |   +--------+ +--------+
+   |   | REPL   | | REPL   |
+   |   | SENDER | | SENDER |
+   |   |   0    | |   1    |
+   |   +----+---+ +---+----+
+   |        |         |
+   |        | TCP     | TCP
+   |        v         v
+   v      replica 0  replica 1
+ (local journal on disk; used on primary's own recovery path)
+
+
++===============================================================+
+|                          REPLICA                               |
++===============================================================+
+
+     TCP from primary
+          |
+          | journal-batch bytes (pre-sequenced, pre-hashed)
+          v
+ +----------------+
+ | REPL RECEIVER  |   parses batches, emits one InputSlot per
+ |     THREAD     |   journal entry with the primary's sequence
+ +-------+--------+   and timestamp embedded verbatim
+         |
+         v
+ +---------------------------------------------+
+ |  INPUT RING -- disruptor, 1M InputSlot      |
+ +---+--------------+---------------+----------+
+     |              |               |
+     v              v               v (gated on journal)
+ +-------+    +---------+     +-----------+
+ |JOURNAL|    |MATCHING |     |  SHADOW   | (optional)
+ | STAGE |    |  STAGE  |     |  STAGE    |
+ +---+---+    +----+----+     +-----+-----+
+     |             |                |
+     v             v                v
+   LOCAL     +-------------+   .snapshot
+  JOURNAL    | OUTPUT RING |
+   FILE      | disruptor   |
+             +------+------+
+                    |
+                    v
+              +---------+
+              |  DRAIN  |  reports are discarded — replica
+              | (only   |  does not serve clients until
+              | consumer|  promotion. See docs/replication.md.
+              +---------+
+```
+
+### Responsibilities, at a glance
+
+| Thread / stage              | Ingress                                 | Egress                                                |
+|----------------------------|-----------------------------------------|-------------------------------------------------------|
+| Reader pool (primary)      | Client TCP sockets (io_uring / DPDK)    | `InputSlot` into input ring                           |
+| Tick generator (primary)   | Wall clock (monotonic-clamped)          | `JournalEvent::Tick` into input ring                  |
+| Seed loop (primary, boot)  | Config (`--accounts`, `--instruments`)  | `AddInstrument` / `ProvisionAccount` into input ring  |
+| Journal stage              | Input ring                              | Journal file; batch bytes into each replication ring  |
+| Matching stage             | Input ring                              | Execution reports into output ring                    |
+| Shadow stage (opt)         | Input ring (gated on journal)           | Periodic `.snapshot` files                            |
+| Response stage (primary)   | Output ring (gated on journal cursor)   | Client TCP                                            |
+| Event publisher (opt)      | Output ring                             | Subscriber TCP (market data feed)                     |
+| Replication sender         | Replication ring                        | Replica TCP                                           |
+| Replication receiver (rep) | Primary TCP                             | `InputSlot` into replica input ring (sequence != 0)   |
+
+### Authoritative state, and how it flows
+
+- **Event payload**: produced at the ingress edge (client, tick thread, seed loop). Flows unchanged through every stage and across the TCP boundary to replicas.
+- **Sequence number**: allocated on the primary via a shared `Sequencer` (atomic `u64` initialised to `writer.next_sequence()` at startup). Each producer calls `sequencer.next()` before `try_publish` and stamps the claimed value onto its `InputSlot`. The journal stage uses that value verbatim as the on-disk journal sequence. Replicas read the sequence out of the incoming journal bytes and never assign their own.
+- **Wall-clock timestamp**: stamped at ingress by each producer (e.g. `wall_clock_nanos()` in the reader). Embedded into the journal entry and shipped to replicas.
+- **Hash chain**: computed by the primary's journal writer over each batch's bytes (sequence + payload + checkpoint metadata). Replicas recompute the chain over the received bytes and should arrive at the same hash.
+- **Replica journals** are *logically* identical to the primary's for the event stream (same sequences, same events). They are not byte-identical: each node stamps its own batch-header wall clock and may emit checkpoints at different rotation boundaries.
+
+### Known limitations of the current sequence scheme
+
+Two latent issues live in the current producer-side sequence allocation and are worth documenting pending a rework:
+
+1. **Sequence leak on ring-full publish failure.** `sequencer.next()` is called before `producer.try_publish()`. If `try_publish` fails (input ring saturated), the claimed sequence never reaches a slot and is effectively lost. The next successful publish uses `seq + 1`, leaving a gap in the journal. Recovery detects that gap with `SequenceGap` and aborts. The input ring is 1M slots, so saturation is only reachable when the matching stage is fully stalled; the same pattern is used by every other primary-side producer (reader pool, seeding, tick).
+2. **Sequence / ring-slot ordering race under multi-producer contention.** `sequencer.next()` and the disruptor's slot-claim CAS are independent atomics. Two reader threads can interleave such that thread A claims sequence `N`, thread B claims sequence `N+1`, B acquires ring slot `k`, A acquires ring slot `k+1`. The journal stage then writes the entries in ring-cursor order (i.e. with sequences `N+1, N, …`), producing a non-monotonic journal that also aborts recovery.
+
+Both go away by moving sequence assignment into the journal stage (producers publish `sequence: 0`, the journal stage assigns from `writer.next_sequence()` at encode time), so the authoritative order is the disruptor's ring-cursor order. That refactor also removes the `Sequencer` type entirely.
 
 ## Input Disruptor
 
