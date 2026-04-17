@@ -354,12 +354,36 @@ fn reader_loop<R: AsRawFd>(
     // monotonicity on the wall-clock timestamps published in those events
     // (NTP can step the wall clock backwards). `tick_armed` tracks whether
     // an `IORING_OP_TIMEOUT` SQE is currently pending; we keep at most one.
+    //
+    // `tick_ts` lives across loop iterations because the kernel reads its
+    // bytes via the SQE's addr field at submit time, not at push time. If
+    // we declared it inside the `if !tick_armed` arm-timeout block, the
+    // value would be dropped before the `submit_and_wait` below — the
+    // kernel would then read freed stack memory. (See `md-gateway` for the
+    // same pattern: it stores Timespec as a long-lived struct field.)
     let tick_enabled = tick_cadence.is_some();
     let cadence = tick_cadence.unwrap_or(Duration::ZERO);
     let mut next_tick_deadline = Instant::now() + cadence;
     let mut last_tick_ns: u64 = 0;
     let mut tick_armed = false;
+    // Arm the very first timeout here, before entering the loop. This both
+    // (a) makes the initial `tick_ts` value actually read by the kernel
+    // (silencing the unused-assignment lint, since rustc cannot see kernel
+    // pointer reads) and (b) ensures the first `submit_and_wait` returns at
+    // the cadence even if no client traffic ever arrives.
+    let mut tick_ts = types::Timespec::new()
+        .sec(cadence.as_secs())
+        .nsec(cadence.subsec_nanos());
     if tick_enabled {
+        let sqe = opcode::Timeout::new(&tick_ts)
+            .build()
+            .user_data(TICK_TIMEOUT_TOKEN);
+        unsafe {
+            ring.submission()
+                .push(&sqe)
+                .expect("io_uring SQ full while arming initial tick timeout");
+        }
+        tick_armed = true;
         tracing::info!(
             cadence_ms = cadence.as_millis() as u64,
             "tick generator integrated into reader thread"
@@ -395,10 +419,13 @@ fn reader_loop<R: AsRawFd>(
 
             if !tick_armed {
                 let remaining = next_tick_deadline.saturating_duration_since(Instant::now());
-                let ts = types::Timespec::new()
+                // Update the loop-scoped Timespec in place. The kernel reads
+                // it via the SQE's addr pointer on submit_and_wait below, so
+                // the binding must outlive that call (it does — outer scope).
+                tick_ts = types::Timespec::new()
                     .sec(remaining.as_secs())
                     .nsec(remaining.subsec_nanos());
-                let sqe = opcode::Timeout::new(&ts)
+                let sqe = opcode::Timeout::new(&tick_ts)
                     .build()
                     .user_data(TICK_TIMEOUT_TOKEN);
                 unsafe {
@@ -406,8 +433,6 @@ fn reader_loop<R: AsRawFd>(
                         .push(&sqe)
                         .expect("io_uring SQ full while arming tick timeout");
                 }
-                // The Timespec is read by the kernel on submit_and_wait below;
-                // it must outlive that call, which it does (this scope).
                 tick_armed = true;
             }
         }

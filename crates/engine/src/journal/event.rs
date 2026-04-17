@@ -101,7 +101,8 @@ pub enum JournalEvent {
         chain_hash: [u8; 32],
         events_since_checkpoint: u64,
     },
-    /// Internal clock tick. Published by the tick generator thread and
+    /// Internal clock tick. Published by the ingress thread (io_uring
+    /// reader or DPDK poll thread) at the configured cadence, and
     /// journaled like any other input event. Carries the wall-clock time
     /// that the engine's scheduler uses to fire due tasks (GTD expiry,
     /// volatility halts, session transitions). Replay feeds the recorded

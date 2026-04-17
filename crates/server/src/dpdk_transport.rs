@@ -1,10 +1,13 @@
 //! DPDK transport integration — single poll thread for NIC I/O + TCP.
 //!
-//! Replaces both the io_uring reader pool and the response stage's socket
+//! Replaces both the io_uring reader and the response stage's socket
 //! writes. A single DPDK poll thread owns all NIC I/O:
 //!
 //! - **Inbound**: `rx_burst` → smoltcp → frame decode → disruptor publish
 //! - **Outbound**: response SPSC → per-connection TX queue → smoltcp → `tx_burst`
+//! - **Tick**: cadence comparison between bursts → `JournalEvent::Tick { now_ns }`
+//!   onto the same input ring (see `run_dpdk_poll` for the single-poll-thread
+//!   invariant assumed here).
 //!
 //! The response stage still runs on its own pinned thread for cursor
 //! gating and encoding, but instead of calling `write_all` on kernel
@@ -94,11 +97,22 @@ struct ConnectionState {
 
 /// Run the DPDK poll loop.
 ///
-/// This replaces the io_uring reader pool. It accepts connections, drives
+/// This replaces the io_uring reader. It accepts connections, drives
 /// auth handshakes, parses frames, publishes events to the disruptor,
 /// and drains the TX channel from the response stage into smoltcp sockets.
+/// When `tick_cadence` is `Some`, this thread also generates the engine's
+/// scheduler ticks via a wall-clock comparison between NIC bursts.
 ///
 /// Called from a dedicated OS thread pinned to its own core.
+///
+/// **Single-poll-thread invariant.** Today `dpdk_num_queues` returns at
+/// most 2 (one client queue + one replication-sender queue), so there is
+/// always exactly one client poll thread. If we ever add multi-queue RSS
+/// (multiple client poll threads), every poll thread would emit ticks
+/// concurrently — re-introducing the multi-producer ordering race that
+/// embedding tick into the poll thread was designed to eliminate. Gate
+/// tick emission to a single thread (e.g. `thread_id == 0`) before
+/// scaling out client queues.
 pub fn run_dpdk_poll(
     mut transport: DpdkTransport,
     producer: ring::MultiProducer<InputSlot>,

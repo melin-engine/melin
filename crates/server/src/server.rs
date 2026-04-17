@@ -240,11 +240,13 @@ pub struct ServerConfig {
     pub snapshot_path: Option<PathBuf>,
 
     /// Cadence in milliseconds for the engine-internal scheduler tick.
-    /// A dedicated thread publishes a `JournalEvent::Tick { now_ns }` at
-    /// this interval so time-driven tasks (GTD expiry, volatility halts,
-    /// session transitions) fire in deterministic, journaled lockstep.
-    /// Set to 0 to disable the tick thread (useful for benchmarks that
-    /// don't exercise time-driven features).
+    /// The ingress thread (io_uring reader or DPDK poll thread) publishes
+    /// a `JournalEvent::Tick { now_ns }` at this interval so time-driven
+    /// tasks (GTD expiry, volatility halts, session transitions) fire in
+    /// deterministic, journaled lockstep. There is no separate tick
+    /// thread on either transport. Set to 0 to disable tick generation
+    /// entirely (useful for benchmarks that don't exercise time-driven
+    /// features).
     ///
     /// Defaults to 250 ms. Under load the matching stage advances its
     /// scheduler clock at every-event resolution from `slot.timestamp_ns`
