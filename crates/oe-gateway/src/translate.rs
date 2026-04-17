@@ -204,8 +204,7 @@ pub fn new_order_single(
     };
 
     // GTD expiry: FIX tag 126 (ExpireTime) as nanoseconds since epoch.
-    // For v1, we pass 0 — GTD expiry is managed by the operator via
-    // ExpireOrders commands, not per-order timestamps from FIX.
+    // For v1, we pass 0 — per-order GTD is not yet parsed from FIX.
     let expiry_ns = 0;
 
     // Assign OrderId from ClOrdID.

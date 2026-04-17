@@ -73,9 +73,6 @@ pub enum JournalEvent {
     /// Cancel all resting orders and pending stops with `TimeInForce::Day`
     /// across all instruments. Triggered by an operator at end-of-session.
     EndOfDay,
-    /// Expire all resting orders and pending stops with `TimeInForce::GTD`
-    /// whose `expiry_ns` <= `timestamp_ns`. Triggered by an operator.
-    ExpireOrders { timestamp_ns: u64 },
     /// Disable an instrument: reject new orders and cancel all resting
     /// orders and pending stops. Re-enable is possible.
     DisableInstrument { symbol: Symbol },

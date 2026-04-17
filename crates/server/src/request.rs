@@ -98,7 +98,6 @@ pub fn to_event(request: &Request) -> JournalEvent {
         Request::QueryStats => JournalEvent::QueryStats,
         Request::QueryPosition { account } => JournalEvent::QueryPosition { account },
         Request::EndOfDay => JournalEvent::EndOfDay,
-        Request::ExpireOrders { timestamp_ns } => JournalEvent::ExpireOrders { timestamp_ns },
         Request::DisableInstrument { symbol } => JournalEvent::DisableInstrument { symbol },
         Request::EnableInstrument { symbol } => JournalEvent::EnableInstrument { symbol },
         Request::RemoveInstrument { symbol } => JournalEvent::RemoveInstrument { symbol },

@@ -1524,9 +1524,6 @@ impl MatchingStage {
             JournalEvent::EndOfDay => {
                 self.exchange.end_of_day(reports);
             }
-            JournalEvent::ExpireOrders { timestamp_ns } => {
-                self.exchange.expire_orders(timestamp_ns, reports);
-            }
             JournalEvent::SetCircuitBreaker { symbol, config } => {
                 self.exchange.set_circuit_breaker(symbol, config);
             }

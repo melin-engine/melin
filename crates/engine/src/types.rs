@@ -31,7 +31,7 @@ pub type HashMap4<K, V> = astenn::HashMap<K, V, rustc_hash::FxBuildHasher, 4>;
 /// Uses a `u32` rather than a string to avoid heap allocation and enable
 /// fast hashing/comparison on the hot path. The mapping from human-readable
 /// symbol names to numeric IDs is managed outside the matching engine.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Symbol(pub u32);
 
 /// Client-assigned order identifier.
@@ -45,14 +45,14 @@ pub struct Symbol(pub u32);
 ///
 /// Used as a HashMap key throughout the engine (order_sides, order_index,
 /// reservations), so cheap hashing matters.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct OrderId(pub u64);
 
 /// Account/trader identifier.
 ///
 /// Uses `u32` — same rationale as `Symbol`: no heap allocation, fast
 /// hashing. Supports ~4 billion accounts, sufficient for any single exchange.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct AccountId(pub u32);
 
 /// Currency identifier (e.g., USD, BTC, ETH).
@@ -218,8 +218,8 @@ pub enum TimeInForce {
     /// an `EndOfDay` event is processed.
     Day,
     /// Good-Till-Date: rests on the book until the specified expiry time,
-    /// then automatically cancelled when an `ExpireOrders` event is
-    /// processed with a timestamp >= the order's `expiry_ns`.
+    /// then automatically cancelled by the engine's scheduler when a `Tick`
+    /// event arrives with `now_ns >= expiry_ns`.
     GTD,
 }
 
@@ -255,7 +255,8 @@ pub struct Order {
     pub stp: SelfTradeProtection,
     /// Expiry time in nanoseconds since Unix epoch. Only meaningful when
     /// `time_in_force` is `GTD`. Zero for all other TIF variants.
-    /// Compared against the timestamp in `ExpireOrders` events.
+    /// Compared against the `now_ns` of `Tick` events to drive scheduler
+    /// cancellation.
     pub expiry_ns: u64,
 }
 

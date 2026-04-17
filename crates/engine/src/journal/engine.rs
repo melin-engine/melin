@@ -481,9 +481,6 @@ fn replay_event(
         JournalEvent::EndOfDay => {
             exchange.end_of_day(reports);
         }
-        JournalEvent::ExpireOrders { timestamp_ns } => {
-            exchange.expire_orders(timestamp_ns, reports);
-        }
         JournalEvent::SetCircuitBreaker { symbol, config } => {
             exchange.set_circuit_breaker(symbol, config);
         }
@@ -723,49 +720,75 @@ mod tests {
     }
 
     #[test]
-    fn ticks_journal_and_drain_due_tasks_on_replay() {
-        use crate::scheduler::{ScheduledTask, ScheduledTaskKind};
-
+    fn ticks_drive_gtd_expiry_through_replay() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("ticks.journal");
+        let path = dir.path().join("gtd_ticks.journal");
 
-        // Write two ticks at distinct deadlines into the journal.
+        // Build state: instrument + funds + two GTD orders at distinct
+        // expiries, then a Tick that should expire the earlier one only.
         let mut reports = Vec::new();
         {
             let mut je = JournaledExchange::create(&path).unwrap();
-            je.tick(5_000, &mut reports).unwrap();
+            je.add_instrument(btc_usd_spec()).unwrap();
+            je.deposit(ACCT_A, USD, 1_000_000).unwrap();
+
+            for (id, expiry) in [(1u64, 5_500u64), (2, 7_000)] {
+                je.execute(
+                    Symbol(1),
+                    Order {
+                        id: OrderId(id),
+                        account: ACCT_A,
+                        side: Side::Buy,
+                        order_type: OrderType::Limit {
+                            price: price(100 + id),
+                            post_only: false,
+                        },
+                        time_in_force: TimeInForce::GTD,
+                        quantity: qty(1),
+                        stp: SelfTradeProtection::Allow,
+                        expiry_ns: expiry,
+                    },
+                    &mut reports,
+                )
+                .unwrap();
+            }
+            reports.clear();
+
+            // Tick past order 1's expiry but not order 2's.
             je.tick(6_000, &mut reports).unwrap();
+            assert_eq!(reports.len(), 1, "tick should expire order 1");
+            assert!(matches!(
+                reports[0],
+                ExecutionReport::Cancelled {
+                    order_id: OrderId(1),
+                    ..
+                }
+            ));
+            reports.clear();
         }
 
-        // Build an exchange with two pending tasks: one due during replay,
-        // one still in the future. Replay must drain only the due one.
-        let mut exchange = Exchange::new();
-        exchange.push_scheduled_task(ScheduledTask {
-            fire_ns: 5_500,
-            kind: ScheduledTaskKind::Reserved,
-        });
-        exchange.push_scheduled_task(ScheduledTask {
-            fire_ns: 7_000,
-            kind: ScheduledTaskKind::Reserved,
-        });
+        // Recover via full journal replay (no snapshot yet).
+        let recovered = JournaledExchange::recover(&path).unwrap();
+        // Order 1 was cancelled before recovery; only order 2 should remain.
+        let book_two = recovered
+            .exchange()
+            .accounts()
+            .balance(ACCT_A, USD)
+            .reserved;
+        assert!(book_two > 0, "order 2 should still be on the book");
 
-        let mut reader = super::super::reader::JournalReader::open(&path).unwrap();
+        // Drive recovery to the point where order 2 should also expire.
+        let mut recovered = recovered;
         let mut replay_reports = Vec::new();
-        while let Some(entry) = reader.next_entry().unwrap() {
-            replay_event(
-                &mut exchange,
-                &entry.event,
-                entry.key_hash,
-                entry.request_seq,
-                &mut replay_reports,
-            );
-        }
-
-        // After replaying ticks at 5_000 and 6_000, the 5_500 task should
-        // have fired (drained) on the second tick; the 7_000 task remains.
-        let snap = exchange.snapshot_state();
-        assert_eq!(snap.scheduled_tasks.len(), 1);
-        assert_eq!(snap.scheduled_tasks[0].fire_ns, 7_000);
+        recovered.tick(7_000, &mut replay_reports).unwrap();
+        assert_eq!(replay_reports.len(), 1);
+        assert!(matches!(
+            replay_reports[0],
+            ExecutionReport::Cancelled {
+                order_id: OrderId(2),
+                ..
+            }
+        ));
     }
 
     #[test]

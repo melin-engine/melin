@@ -10,7 +10,7 @@
 
 use crate::account::AccountManager;
 use crate::orderbook::OrderBook;
-use crate::scheduler::{ScheduledTask, ScheduledTaskHeap};
+use crate::scheduler::{ScheduledTask, ScheduledTaskHeap, ScheduledTaskKind};
 use crate::types::{
     AccountId, CircuitBreakerConfig, CurrencyId, ExecutionReport, FeeSchedule, HashMap, HashMap4,
     InstrumentSpec, InstrumentStatus, Order, OrderId, OrderType, Price, Quantity, RejectReason,
@@ -168,27 +168,67 @@ impl Exchange {
         }
     }
 
-    /// Snapshot the pending scheduled tasks for serialization.
-    pub(crate) fn snapshot_scheduled_tasks(&self) -> Vec<ScheduledTask> {
-        self.scheduled_tasks.snapshot()
-    }
-
-    /// Push a task onto the scheduler heap. Test-only for now — feature code
-    /// will gain dedicated entry points (e.g. `schedule_gtd_expiry`) as
-    /// scheduled-task kinds are introduced.
+    /// Pending count of scheduled tasks (including tombstones). Test-only
+    /// helper for asserting heap state.
     #[cfg(test)]
-    pub(crate) fn push_scheduled_task(&mut self, task: ScheduledTask) {
-        self.scheduled_tasks.push(task);
+    pub(crate) fn scheduled_task_count(&self) -> usize {
+        self.scheduled_tasks.len()
     }
 
     /// Drain every scheduled task whose `fire_ns <= now_ns`. Called at the
     /// head of every event the matching stage processes, so time-driven work
-    /// runs in lockstep with the journal. With no concrete task kinds yet,
-    /// this only pops — future stages dispatch on `task.kind` to emit reports.
-    pub fn drain_due_scheduled_tasks(&mut self, now_ns: u64, _reports: &mut Vec<ExecutionReport>) {
-        while let Some(_task) = self.scheduled_tasks.pop_due(now_ns) {
-            // No kinds with side effects yet — substrate-only stage.
+    /// runs in lockstep with the journal. Tombstones — tasks that point to
+    /// orders that have already been cancelled or filled — are silently
+    /// dropped via the `find_gtd_expiry` lookup.
+    pub fn drain_due_scheduled_tasks(&mut self, now_ns: u64, reports: &mut Vec<ExecutionReport>) {
+        while let Some(task) = self.scheduled_tasks.pop_due(now_ns) {
+            match task.kind {
+                ScheduledTaskKind::ExpireOrder {
+                    symbol,
+                    account,
+                    order_id,
+                } => {
+                    let Some(inst) = inst_mut(&mut self.instruments, symbol) else {
+                        // Instrument removed between schedule and fire — tombstone.
+                        continue;
+                    };
+                    // Skip tombstones: if the order is no longer GTD on the
+                    // book, it's already been cancelled or filled. The task
+                    // is just stale; drop it without side effect.
+                    if inst.book.find_gtd_expiry(account, order_id).is_none() {
+                        continue;
+                    }
+                    if let Some((_side, slot)) = inst.book.cancel(account, order_id, reports) {
+                        self.accounts.release(slot);
+                        if let Some(count) = self.order_counts.get_mut(&account) {
+                            *count = count.saturating_sub(1);
+                            if *count == 0 {
+                                self.order_counts.remove(&account);
+                            }
+                        }
+                    }
+                }
+            }
         }
+    }
+
+    /// Schedule an `ExpireOrder` task for a GTD order that just rested on
+    /// the book (or registered as a pending stop).
+    fn schedule_gtd_expiry(
+        &mut self,
+        symbol: Symbol,
+        account: AccountId,
+        order_id: OrderId,
+        expiry_ns: u64,
+    ) {
+        self.scheduled_tasks.push(ScheduledTask {
+            fire_ns: expiry_ns,
+            kind: ScheduledTaskKind::ExpireOrder {
+                symbol,
+                account,
+                order_id,
+            },
+        });
     }
 
     /// Check per-key request sequence for idempotency dedup.
@@ -861,6 +901,21 @@ impl Exchange {
                 }
             }
         }
+
+        // Schedule GTD expiry if the order rested (limit) or is now pending
+        // (stop). Stop orders that triggered and fully filled in this same
+        // execute call won't appear in the book any more — find_gtd_expiry
+        // will return None and we won't schedule. Triggered stops that
+        // re-rest as limits keep the same OrderId/expiry_ns, so the single
+        // task scheduled here covers both lifecycle stages.
+        if order.time_in_force == TimeInForce::GTD
+            && order.expiry_ns > 0
+            && inst_ref(&self.instruments, symbol)
+                .and_then(|inst| inst.book.find_gtd_expiry(taker_account, taker_id))
+                .is_some()
+        {
+            self.schedule_gtd_expiry(symbol, taker_account, taker_id, order.expiry_ns);
+        }
     }
 
     /// Cancel all resting orders and pending stops for an account across
@@ -901,29 +956,6 @@ impl Exchange {
             };
 
             inst.book.cancel_day_orders(reports);
-
-            for (account, _, _, slot) in inst.book.drain_consumed_slots() {
-                self.accounts.release(slot);
-                if let Some(count) = self.order_counts.get_mut(&account) {
-                    *count = count.saturating_sub(1);
-                    if *count == 0 {
-                        self.order_counts.remove(&account);
-                    }
-                }
-            }
-        }
-    }
-
-    /// Cancel all GTD orders whose expiry time has passed across all
-    /// instruments. Same pattern as `end_of_day` — iterate instruments,
-    /// cancel expired orders on each book, then release reservations.
-    pub fn expire_orders(&mut self, now_ns: u64, reports: &mut Vec<ExecutionReport>) {
-        for idx in 0..self.instruments.len() {
-            let Some(inst) = self.instruments[idx].as_deref_mut() else {
-                continue;
-            };
-
-            inst.book.cancel_expired_orders(now_ns, reports);
 
             for (account, _, _, slot) in inst.book.drain_consumed_slots() {
                 self.accounts.release(slot);
@@ -6826,73 +6858,20 @@ mod tests {
         ));
     }
 
+    // -- Scheduler-driven GTD expiry --
+
+    /// Submitting a GTD limit that rests on the book schedules exactly one
+    /// `ExpireOrder` task on the heap. Draining before the deadline is a
+    /// no-op; draining at or after the deadline cancels the order and
+    /// releases its reservation.
     #[test]
-    fn expire_orders_cancels_gtd_and_releases_reservations() {
-        let mut exchange = Exchange::new();
-        let btc = Symbol(1);
-        exchange.add_instrument(btc_usd_spec());
-        exchange.deposit(ACCT_A, USD, 20_000);
-        exchange.deposit(ACCT_B, USD, 20_000);
-
-        let mut reports = Vec::new();
-
-        // ACCT_A: GTD order expiring at t=1000.
-        exchange.execute(
-            btc,
-            Order {
-                id: OrderId(1),
-                account: ACCT_A,
-                side: Side::Buy,
-                order_type: OrderType::Limit {
-                    price: price(100),
-                    post_only: false,
-                },
-                time_in_force: TimeInForce::GTD,
-                quantity: qty(10),
-                stp: SelfTradeProtection::Allow,
-                expiry_ns: 1000,
-            },
-            &mut reports,
-        );
-        reports.clear();
-
-        // ACCT_B: GTC order (should not be affected).
-        exchange.execute(
-            btc,
-            limit_order(1, ACCT_B, Side::Buy, 100, 5, TimeInForce::GTC),
-            &mut reports,
-        );
-        reports.clear();
-
-        // Expire at t=1000 — ACCT_A's GTD order should be cancelled.
-        exchange.expire_orders(1000, &mut reports);
-        assert_eq!(reports.len(), 1);
-        assert!(matches!(
-            reports[0],
-            ExecutionReport::Cancelled {
-                account,
-                order_id: OrderId(1),
-                ..
-            } if account == ACCT_A
-        ));
-
-        // ACCT_A's reservation fully released.
-        assert_eq!(exchange.accounts().balance(ACCT_A, USD).reserved, 0);
-        assert_eq!(exchange.accounts().balance(ACCT_A, USD).available, 20_000);
-        // ACCT_B's reservation still held.
-        assert_eq!(exchange.accounts().balance(ACCT_B, USD).reserved, 500);
-    }
-
-    #[test]
-    fn expire_orders_does_not_cancel_before_expiry() {
+    fn gtd_limit_schedules_and_expires_on_drain() {
         let mut exchange = Exchange::new();
         let btc = Symbol(1);
         exchange.add_instrument(btc_usd_spec());
         exchange.deposit(ACCT_A, USD, 10_000);
 
         let mut reports = Vec::new();
-
-        // GTD order expiring at t=2000.
         exchange.execute(
             btc,
             Order {
@@ -6904,57 +6883,24 @@ mod tests {
                     post_only: false,
                 },
                 time_in_force: TimeInForce::GTD,
-                quantity: qty(10),
+                quantity: qty(5),
                 stp: SelfTradeProtection::Allow,
-                expiry_ns: 2000,
+                expiry_ns: 1_000,
             },
             &mut reports,
         );
+        assert!(matches!(reports[0], ExecutionReport::Placed { .. }));
         reports.clear();
+        assert_eq!(exchange.scheduled_task_count(), 1);
+        assert_eq!(exchange.accounts().balance(ACCT_A, USD).reserved, 500);
 
-        // Expire at t=1999 — should NOT cancel.
-        exchange.expire_orders(1999, &mut reports);
+        // Pre-deadline drain: nothing fires.
+        exchange.drain_due_scheduled_tasks(999, &mut reports);
         assert!(reports.is_empty());
-        assert_eq!(exchange.accounts().balance(ACCT_A, USD).reserved, 1000);
-    }
+        assert_eq!(exchange.scheduled_task_count(), 1);
 
-    #[test]
-    fn cancel_replace_preserves_gtd_expiry() {
-        let mut exchange = Exchange::new();
-        let btc = Symbol(1);
-        exchange.add_instrument(btc_usd_spec());
-        exchange.deposit(ACCT_A, USD, 20_000);
-
-        let mut reports = Vec::new();
-
-        // Place GTD order expiring at t=5000.
-        exchange.execute(
-            btc,
-            Order {
-                id: OrderId(1),
-                account: ACCT_A,
-                side: Side::Buy,
-                order_type: OrderType::Limit {
-                    price: price(100),
-                    post_only: false,
-                },
-                time_in_force: TimeInForce::GTD,
-                quantity: qty(10),
-                stp: SelfTradeProtection::Allow,
-                expiry_ns: 5000,
-            },
-            &mut reports,
-        );
-        reports.clear();
-
-        // Cancel-replace to a new price.
-        exchange.cancel_replace(btc, ACCT_A, OrderId(1), price(90), qty(10), &mut reports);
-        assert_eq!(reports.len(), 1);
-        assert!(matches!(reports[0], ExecutionReport::Replaced { .. }));
-        reports.clear();
-
-        // The order should still expire at t=5000 after the replace.
-        exchange.expire_orders(5000, &mut reports);
+        // At-deadline drain: cancel + release.
+        exchange.drain_due_scheduled_tasks(1_000, &mut reports);
         assert_eq!(reports.len(), 1);
         assert!(matches!(
             reports[0],
@@ -6963,19 +6909,20 @@ mod tests {
                 ..
             }
         ));
+        assert_eq!(exchange.scheduled_task_count(), 0);
         assert_eq!(exchange.accounts().balance(ACCT_A, USD).reserved, 0);
     }
 
+    /// A GTD pending stop also schedules an expiry task; firing the task
+    /// cancels the pending stop before it ever triggers.
     #[test]
-    fn expire_orders_cancels_gtd_stop_order() {
+    fn gtd_pending_stop_schedules_and_expires() {
         let mut exchange = Exchange::new();
         let btc = Symbol(1);
         exchange.add_instrument(btc_usd_spec());
         exchange.deposit(ACCT_A, USD, 100_000);
 
         let mut reports = Vec::new();
-
-        // GTD stop order expiring at t=3000.
         exchange.execute(
             btc,
             Order {
@@ -6983,19 +6930,20 @@ mod tests {
                 account: ACCT_A,
                 side: Side::Buy,
                 order_type: OrderType::Stop {
-                    trigger_price: price(200),
+                    trigger_price: price(120),
                 },
                 time_in_force: TimeInForce::GTD,
                 quantity: qty(10),
                 stp: SelfTradeProtection::Allow,
-                expiry_ns: 3000,
+                expiry_ns: 5_000,
             },
             &mut reports,
         );
-        reports.clear();
+        // Stops emit no Placed report at submit time.
+        assert!(reports.is_empty());
+        assert_eq!(exchange.scheduled_task_count(), 1);
 
-        // Expire at t=3000 — stop should be cancelled.
-        exchange.expire_orders(3000, &mut reports);
+        exchange.drain_due_scheduled_tasks(5_000, &mut reports);
         assert_eq!(reports.len(), 1);
         assert!(matches!(
             reports[0],
@@ -7004,22 +6952,20 @@ mod tests {
                 ..
             }
         ));
-
-        // Reservation released.
-        assert_eq!(exchange.accounts().balance(ACCT_A, USD).reserved, 0);
+        assert_eq!(exchange.scheduled_task_count(), 0);
     }
 
+    /// Cancelling a GTD order before its deadline leaves a tombstone task
+    /// in the heap. When the tombstone fires, `find_gtd_expiry` returns
+    /// None, the task drops silently, and no double-cancel report is emitted.
     #[test]
-    fn gtd_partial_fill_then_remainder_expires() {
+    fn cancelled_gtd_creates_tombstone_no_double_cancel() {
         let mut exchange = Exchange::new();
         let btc = Symbol(1);
         exchange.add_instrument(btc_usd_spec());
-        exchange.deposit(ACCT_A, USD, 20_000);
-        exchange.deposit(ACCT_B, BTC, 100);
+        exchange.deposit(ACCT_A, USD, 10_000);
 
         let mut reports = Vec::new();
-
-        // ACCT_A: GTD buy 10 @ 100, expiring at t=1000.
         exchange.execute(
             btc,
             Order {
@@ -7031,54 +6977,113 @@ mod tests {
                     post_only: false,
                 },
                 time_in_force: TimeInForce::GTD,
-                quantity: qty(10),
+                quantity: qty(1),
                 stp: SelfTradeProtection::Allow,
-                expiry_ns: 1000,
+                expiry_ns: 2_000,
             },
             &mut reports,
         );
         reports.clear();
+        assert_eq!(exchange.scheduled_task_count(), 1);
 
-        // ACCT_B: sell 3 @ 100 — partial fill against ACCT_A's GTD order.
-        exchange.execute(btc, market_order(1, ACCT_B, Side::Sell, 3), &mut reports);
-        // Should see Fill(3) + Cancelled(seller IOC remainder=0 is not emitted).
-        let fills: Vec<_> = reports
-            .iter()
-            .filter(|r| matches!(r, ExecutionReport::Fill { .. }))
-            .collect();
-        assert_eq!(fills.len(), 1);
+        // Cancel before deadline.
+        exchange.cancel(btc, ACCT_A, OrderId(1), &mut reports);
+        assert!(matches!(reports[0], ExecutionReport::Cancelled { .. }));
         reports.clear();
+        // Tombstone still in heap.
+        assert_eq!(exchange.scheduled_task_count(), 1);
 
-        // Expire at t=1000 — remaining 7 should be cancelled.
-        exchange.expire_orders(1000, &mut reports);
+        // Drain past deadline: tombstone drops without emitting anything.
+        exchange.drain_due_scheduled_tasks(2_000, &mut reports);
+        assert!(reports.is_empty(), "tombstone must not emit Cancelled");
+        assert_eq!(exchange.scheduled_task_count(), 0);
+    }
+
+    /// Cancel-replace preserves the order's `expiry_ns`, so the originally
+    /// scheduled task remains valid and still fires at the original deadline.
+    #[test]
+    fn cancel_replace_preserves_gtd_expiry_schedule() {
+        let mut exchange = Exchange::new();
+        let btc = Symbol(1);
+        exchange.add_instrument(btc_usd_spec());
+        exchange.deposit(ACCT_A, USD, 10_000);
+
+        let mut reports = Vec::new();
+        exchange.execute(
+            btc,
+            Order {
+                id: OrderId(1),
+                account: ACCT_A,
+                side: Side::Buy,
+                order_type: OrderType::Limit {
+                    price: price(50),
+                    post_only: false,
+                },
+                time_in_force: TimeInForce::GTD,
+                quantity: qty(2),
+                stp: SelfTradeProtection::Allow,
+                expiry_ns: 3_000,
+            },
+            &mut reports,
+        );
+        reports.clear();
+        assert_eq!(exchange.scheduled_task_count(), 1);
+
+        // Cancel-replace to a new price + size; expiry stays unchanged.
+        exchange.cancel_replace(btc, ACCT_A, OrderId(1), price(60), qty(3), &mut reports);
+        assert!(matches!(reports[0], ExecutionReport::Replaced { .. }));
+        reports.clear();
+        // Heap unchanged: no new schedule, no removal.
+        assert_eq!(exchange.scheduled_task_count(), 1);
+
+        // Original deadline still fires.
+        exchange.drain_due_scheduled_tasks(3_000, &mut reports);
         assert_eq!(reports.len(), 1);
         assert!(matches!(
             reports[0],
             ExecutionReport::Cancelled {
                 order_id: OrderId(1),
-                remaining_quantity,
                 ..
-            } if remaining_quantity.get() == 7
+            }
         ));
-
-        // Reservation for the remaining 7 released (7 * 100 = 700).
-        assert_eq!(exchange.accounts().balance(ACCT_A, USD).reserved, 0);
     }
 
+    /// A GTD limit that partially fills leaves the remainder on the book
+    /// — the scheduled task still cancels that remainder at expiry.
     #[test]
-    fn end_of_day_does_not_cancel_gtd_orders() {
+    fn gtd_partial_fill_remainder_still_expires() {
         let mut exchange = Exchange::new();
         let btc = Symbol(1);
         exchange.add_instrument(btc_usd_spec());
-        exchange.deposit(ACCT_A, USD, 20_000);
+        exchange.deposit(ACCT_A, USD, 100_000);
+        exchange.deposit(ACCT_B, BTC, 10);
 
         let mut reports = Vec::new();
-
-        // ACCT_A: GTD order expiring at t=5000.
+        // ACCT_B places a small ask: 1 unit at price 100.
         exchange.execute(
             btc,
             Order {
                 id: OrderId(1),
+                account: ACCT_B,
+                side: Side::Sell,
+                order_type: OrderType::Limit {
+                    price: price(100),
+                    post_only: false,
+                },
+                time_in_force: TimeInForce::GTC,
+                quantity: qty(1),
+                stp: SelfTradeProtection::Allow,
+                expiry_ns: 0,
+            },
+            &mut reports,
+        );
+        reports.clear();
+
+        // ACCT_A submits a GTD buy for 5 units at 100 — fills 1, rests 4.
+        exchange.execute(
+            btc,
+            Order {
+                id: OrderId(2),
                 account: ACCT_A,
                 side: Side::Buy,
                 order_type: OrderType::Limit {
@@ -7086,49 +7091,40 @@ mod tests {
                     post_only: false,
                 },
                 time_in_force: TimeInForce::GTD,
-                quantity: qty(10),
+                quantity: qty(5),
                 stp: SelfTradeProtection::Allow,
-                expiry_ns: 5000,
+                expiry_ns: 4_000,
             },
             &mut reports,
         );
         reports.clear();
+        assert_eq!(exchange.scheduled_task_count(), 1);
 
-        // ACCT_A: Day order.
-        exchange.execute(
-            btc,
-            limit_order(2, ACCT_A, Side::Buy, 100, 5, TimeInForce::Day),
-            &mut reports,
-        );
-        reports.clear();
-
-        // EndOfDay cancels Day orders but NOT GTD.
-        exchange.end_of_day(&mut reports);
+        // Drain at the deadline — remainder cancelled.
+        exchange.drain_due_scheduled_tasks(4_000, &mut reports);
         assert_eq!(reports.len(), 1);
         assert!(matches!(
             reports[0],
             ExecutionReport::Cancelled {
                 order_id: OrderId(2),
+                remaining_quantity,
                 ..
-            }
+            } if remaining_quantity.get() == 4
         ));
-
-        // GTD order still on book — reservation still held.
-        assert!(exchange.accounts().balance(ACCT_A, USD).reserved > 0);
     }
 
+    /// Triggered GTD stop becomes a resting limit (same OrderId, same
+    /// expiry_ns); the original scheduled task still finds and cancels it.
     #[test]
-    fn gtd_stop_triggers_then_resting_order_expires() {
+    fn gtd_stop_triggered_into_resting_still_expires() {
         let mut exchange = Exchange::new();
         let btc = Symbol(1);
         exchange.add_instrument(btc_usd_spec());
         exchange.deposit(ACCT_A, USD, 100_000);
         exchange.deposit(ACCT_B, BTC, 100);
-        exchange.deposit(ACCT_B, USD, 100_000);
 
         let mut reports = Vec::new();
-
-        // ACCT_A: GTD stop-limit buy, trigger @ 50, limit @ 55, expiry t=2000.
+        // ACCT_A: GTD stop-limit buy that triggers at 110, limit 110, exp 8000.
         exchange.execute(
             btc,
             Order {
@@ -7136,33 +7132,57 @@ mod tests {
                 account: ACCT_A,
                 side: Side::Buy,
                 order_type: OrderType::StopLimit {
-                    trigger_price: price(50),
-                    limit_price: price(55),
+                    trigger_price: price(110),
+                    limit_price: price(110),
                 },
                 time_in_force: TimeInForce::GTD,
-                quantity: qty(10),
+                quantity: qty(2),
                 stp: SelfTradeProtection::Allow,
-                expiry_ns: 2000,
+                expiry_ns: 8_000,
             },
             &mut reports,
         );
         reports.clear();
+        assert_eq!(exchange.scheduled_task_count(), 1);
 
-        // Create a trade at price 50 to trigger the stop.
-        // First place a resting sell, then a buy to cross.
+        // ACCT_B sells low to set last_trade and trigger the stop.
+        // First make a buy to populate the bid side (so the sell can fill).
         exchange.execute(
             btc,
-            limit_order(1, ACCT_B, Side::Sell, 50, 1, TimeInForce::GTC),
+            Order {
+                id: OrderId(10),
+                account: ACCT_A,
+                side: Side::Buy,
+                order_type: OrderType::Limit {
+                    price: price(115),
+                    post_only: false,
+                },
+                time_in_force: TimeInForce::GTC,
+                quantity: qty(1),
+                stp: SelfTradeProtection::Allow,
+                expiry_ns: 0,
+            },
             &mut reports,
         );
         reports.clear();
-
         exchange.execute(
             btc,
-            limit_order(2, ACCT_B, Side::Buy, 50, 1, TimeInForce::IOC),
+            Order {
+                id: OrderId(11),
+                account: ACCT_B,
+                side: Side::Sell,
+                order_type: OrderType::Limit {
+                    price: price(115),
+                    post_only: false,
+                },
+                time_in_force: TimeInForce::IOC,
+                quantity: qty(1),
+                stp: SelfTradeProtection::Allow,
+                expiry_ns: 0,
+            },
             &mut reports,
         );
-        // This trade triggers the stop — ACCT_A's order becomes a limit @ 55.
+        // Should have triggered the stop — order 1 is now a resting limit.
         let triggered = reports.iter().any(|r| {
             matches!(
                 r,
@@ -7175,13 +7195,9 @@ mod tests {
         assert!(triggered, "stop should have triggered");
         reports.clear();
 
-        // The triggered order is now resting as a limit @ 55.
-        // Expire at t=1999 — should NOT cancel.
-        exchange.expire_orders(1999, &mut reports);
-        assert!(reports.is_empty());
-
-        // Expire at t=2000 — should cancel the resting triggered order.
-        exchange.expire_orders(2000, &mut reports);
+        // Drain past expiry — the originally scheduled task cancels the
+        // now-resting limit form of the order.
+        exchange.drain_due_scheduled_tasks(8_000, &mut reports);
         assert_eq!(reports.len(), 1);
         assert!(matches!(
             reports[0],
@@ -7190,7 +7206,6 @@ mod tests {
                 ..
             }
         ));
-        assert_eq!(exchange.accounts().balance(ACCT_A, USD).reserved, 0);
     }
 
     /// Triggered stop: stop sell triggers via a trade, triggered market

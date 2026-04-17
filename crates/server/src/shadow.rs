@@ -167,9 +167,6 @@ fn dispatch_event(
         JournalEvent::EndOfDay => {
             exchange.end_of_day(reports);
         }
-        JournalEvent::ExpireOrders { timestamp_ns } => {
-            exchange.expire_orders(timestamp_ns, reports);
-        }
         JournalEvent::SetCircuitBreaker { symbol, config } => {
             exchange.set_circuit_breaker(symbol, config);
         }
@@ -372,7 +369,8 @@ mod tests {
                 currency: CurrencyId(1),
                 amount: 5_000,
             },
-            // --- Place an order with expiry for ExpireOrders ---
+            // --- Place a GTD order, then drive a Tick past its expiry to
+            //     trigger the scheduler-driven cancel ---
             JournalEvent::SubmitOrder {
                 symbol: Symbol(1),
                 order: Order {
@@ -389,10 +387,7 @@ mod tests {
                     expiry_ns: 1_000_000,
                 },
             },
-            // --- Expire orders older than timestamp ---
-            JournalEvent::ExpireOrders {
-                timestamp_ns: 2_000_000,
-            },
+            JournalEvent::Tick { now_ns: 2_000_000 },
             // --- Place an order then cancel all for that account ---
             JournalEvent::SubmitOrder {
                 symbol: Symbol(1),
@@ -493,9 +488,6 @@ mod tests {
                 }
                 JournalEvent::EndOfDay => {
                     primary.end_of_day(&mut primary_reports);
-                }
-                JournalEvent::ExpireOrders { timestamp_ns } => {
-                    primary.expire_orders(timestamp_ns, &mut primary_reports);
                 }
                 JournalEvent::SetCircuitBreaker { symbol, config } => {
                     primary.set_circuit_breaker(symbol, config);

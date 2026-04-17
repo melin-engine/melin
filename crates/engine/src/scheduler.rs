@@ -7,15 +7,29 @@
 //!
 //! Tasks are stored in a min-heap keyed on `fire_ns`. A binary heap is the
 //! natural fit: peek-min and pop-min are both O(log n), and the heap never
-//! needs ordered iteration outside of snapshot serialization.
+//! needs ordered iteration outside of (re)building from order state.
 //!
-//! This stage of the substrate carries no concrete task variants — those are
-//! added incrementally by features that need scheduling (GTD expiry,
-//! volatility halt evaluation, session transitions). Until then the heap
-//! is permanently empty and `drain_due` is effectively a no-op.
+//! ## Tombstones
+//!
+//! `BinaryHeap` does not support arbitrary removal, so cancelling or filling
+//! a GTD order does *not* remove its scheduled task. The task lingers as a
+//! tombstone until its deadline, at which point the drain logic looks up
+//! the order, finds it absent, and silently drops the entry. With per-account
+//! `OrderId` HWM enforcement, an order id is unique forever, so a tombstone
+//! can never accidentally match a different order.
+//!
+//! ## Persistence
+//!
+//! The heap is *derived state* — every current task variant is reconstructible
+//! by walking the order books. Snapshots therefore omit the heap; recovery
+//! rebuilds it by scanning resting GTD orders and pending GTD stops. When
+//! task kinds that don't map to order state are added (e.g. session
+//! transitions), the snapshot will need explicit storage for them.
 
 use std::cmp::Reverse;
 use std::collections::BinaryHeap;
+
+use crate::types::{AccountId, OrderId, Symbol};
 
 /// A single scheduled task waiting in the engine's min-heap.
 ///
@@ -29,40 +43,24 @@ pub struct ScheduledTask {
     /// Wall-clock deadline in nanoseconds since epoch. The task fires when
     /// the engine processes any event whose `now_ns >= fire_ns`.
     pub fire_ns: u64,
-    /// Task kind discriminant. Future variants attach payloads (order ref,
-    /// symbol, etc.); for now the substrate carries a single `Reserved`
-    /// placeholder so the type compiles and round-trips through snapshots.
+    /// What to do at `fire_ns`.
     pub kind: ScheduledTaskKind,
 }
 
 /// Discriminator for what kind of work fires at `ScheduledTask::fire_ns`.
-///
-/// Reserved-only until feature-specific variants land. The variant exists
-/// so the enum is constructible (an empty enum is uninhabited, which would
-/// prevent tests from exercising the heap and snapshot round-trip).
+// Field order matters for `Ord`: `ExpireOrder` sorts by (symbol, account,
+// order_id), giving deterministic ordering for tasks that share a deadline.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum ScheduledTaskKind {
-    /// Placeholder until concrete kinds are introduced. Drained on tick
-    /// like any other task; no side effect.
-    Reserved,
-}
-
-/// On-disk tag for `ScheduledTaskKind::Reserved`. Stable across versions.
-const KIND_TAG_RESERVED: u8 = 0;
-
-/// Encode a single task kind into its on-disk tag byte.
-pub(crate) fn encode_kind(kind: ScheduledTaskKind) -> u8 {
-    match kind {
-        ScheduledTaskKind::Reserved => KIND_TAG_RESERVED,
-    }
-}
-
-/// Decode a task kind tag byte. Returns `None` if the tag is unknown.
-pub(crate) fn decode_kind(tag: u8) -> Option<ScheduledTaskKind> {
-    match tag {
-        KIND_TAG_RESERVED => Some(ScheduledTaskKind::Reserved),
-        _ => None,
-    }
+    /// Cancel a GTD order whose `expiry_ns` has been reached. Looks the
+    /// order up by `(symbol, account, order_id)` and only cancels if the
+    /// order is still present and still GTD — otherwise the task is a
+    /// tombstone and is silently dropped.
+    ExpireOrder {
+        symbol: Symbol,
+        account: AccountId,
+        order_id: OrderId,
+    },
 }
 
 /// Min-heap of pending scheduled tasks.
@@ -70,8 +68,7 @@ pub(crate) fn decode_kind(tag: u8) -> Option<ScheduledTaskKind> {
 /// Wraps `BinaryHeap<Reverse<ScheduledTask>>` to keep the `Reverse` plumbing
 /// out of every caller. `BinaryHeap` is preferred over `BTreeSet` here
 /// because the only operations on the hot path are `peek-min`, `pop-min`,
-/// and `push` — all O(log n) — and we never need ordered iteration outside
-/// snapshot serialization, which sorts explicitly.
+/// and `push` — all O(log n) — and we never need ordered iteration.
 #[derive(Debug, Default)]
 pub struct ScheduledTaskHeap {
     inner: BinaryHeap<Reverse<ScheduledTask>>,
@@ -85,7 +82,14 @@ impl ScheduledTaskHeap {
         }
     }
 
-    /// Total number of pending tasks.
+    /// Pre-allocate capacity. Useful when rebuilding from a snapshot.
+    pub fn with_capacity(cap: usize) -> Self {
+        Self {
+            inner: BinaryHeap::with_capacity(cap),
+        }
+    }
+
+    /// Total number of pending tasks (including tombstones).
     pub fn len(&self) -> usize {
         self.inner.len()
     }
@@ -108,25 +112,6 @@ impl ScheduledTaskHeap {
             _ => None,
         }
     }
-
-    /// Snapshot the heap as a sorted Vec for deterministic on-disk layout.
-    /// Order is by `fire_ns` ascending, then by `kind`.
-    pub fn snapshot(&self) -> Vec<ScheduledTask> {
-        let mut out: Vec<ScheduledTask> = self.inner.iter().map(|Reverse(t)| *t).collect();
-        // Sort by the ScheduledTask Ord (fire_ns, then kind) so two heaps
-        // built from the same set of tasks produce byte-identical snapshots.
-        out.sort();
-        out
-    }
-
-    /// Restore a heap from its snapshot representation.
-    pub fn restore(tasks: Vec<ScheduledTask>) -> Self {
-        let mut inner = BinaryHeap::with_capacity(tasks.len());
-        for task in tasks {
-            inner.push(Reverse(task));
-        }
-        Self { inner }
-    }
 }
 
 #[cfg(test)]
@@ -136,7 +121,11 @@ mod tests {
     fn task(fire_ns: u64) -> ScheduledTask {
         ScheduledTask {
             fire_ns,
-            kind: ScheduledTaskKind::Reserved,
+            kind: ScheduledTaskKind::ExpireOrder {
+                symbol: Symbol(1),
+                account: AccountId(1),
+                order_id: OrderId(fire_ns),
+            },
         }
     }
 
@@ -167,46 +156,16 @@ mod tests {
     }
 
     #[test]
-    fn snapshot_round_trip_preserves_set() {
+    fn pop_due_orders_by_fire_ns() {
         let mut heap = ScheduledTaskHeap::new();
-        heap.push(task(300));
-        heap.push(task(100));
-        heap.push(task(200));
-
-        let snap = heap.snapshot();
-        assert_eq!(
-            snap.iter().map(|t| t.fire_ns).collect::<Vec<_>>(),
-            vec![100, 200, 300]
-        );
-
-        let restored = ScheduledTaskHeap::restore(snap);
-        let mut popped = Vec::new();
-        let mut h = restored;
-        while let Some(t) = h.pop_due(u64::MAX) {
-            popped.push(t.fire_ns);
-        }
-        assert_eq!(popped, vec![100, 200, 300]);
-    }
-
-    #[test]
-    fn snapshot_is_deterministic_for_same_set() {
-        let mut a = ScheduledTaskHeap::new();
-        let mut b = ScheduledTaskHeap::new();
-        // Push in different orders — snapshots must still match.
-        for f in [200, 100, 300] {
-            a.push(task(f));
-        }
+        // Push out of order; pop must still come back in fire_ns order.
         for f in [300, 100, 200] {
-            b.push(task(f));
+            heap.push(task(f));
         }
-        assert_eq!(a.snapshot(), b.snapshot());
-    }
-
-    #[test]
-    fn kind_round_trip() {
-        // Only one variant today — the assertion grows when more land.
-        let reserved = ScheduledTaskKind::Reserved;
-        assert_eq!(decode_kind(encode_kind(reserved)), Some(reserved));
-        assert!(decode_kind(0xFF).is_none());
+        let mut order = Vec::new();
+        while let Some(t) = heap.pop_due(u64::MAX) {
+            order.push(t.fire_ns);
+        }
+        assert_eq!(order, vec![100, 200, 300]);
     }
 }

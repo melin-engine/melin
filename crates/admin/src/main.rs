@@ -50,8 +50,7 @@ const ACTIONS: &[&str] = &[
     "Set Circuit Breaker",
     "Set Fee Schedule",
     "End of Day",
-    "Expire Orders (GTD)",
-    // Lifecycle (18-20)
+    // Lifecycle (17-19)
     "Disable Instrument",
     "Enable Instrument",
     "Remove Instrument",
@@ -229,8 +228,6 @@ enum NextStep {
     /// Fee schedule: entered maker bps, enter taker fee bps.
     /// `i16` to support negative values (rebates).
     FeeScheduleTakerBps { symbol: u32, maker_bps: i16 },
-    /// Expire orders: enter timestamp_ns.
-    ExpireOrdersTimestamp,
     /// Disable instrument: enter symbol ID.
     DisableInstrumentSymbol,
     /// Enable instrument: enter symbol ID.
@@ -510,7 +507,6 @@ impl App {
                         buf: String::new(),
                         next: NextStep::FeeScheduleMakerBps { symbol: *symbol },
                     },
-                    NextStep::ExpireOrdersTimestamp => Screen::ActionMenu,
                     NextStep::DisableInstrumentSymbol => Screen::ActionMenu,
                     NextStep::EnableInstrumentSymbol => Screen::ActionMenu,
                     NextStep::RemoveInstrumentSymbol => Screen::ActionMenu,
@@ -607,14 +603,6 @@ impl App {
                         self.log.push("Sent EndOfDay".into());
                     }
                     17 => {
-                        // Expire Orders (GTD) — ask for timestamp_ns.
-                        self.screen = Screen::NumberInput {
-                            label: "Timestamp (ns since Unix epoch)",
-                            buf: String::new(),
-                            next: NextStep::ExpireOrdersTimestamp,
-                        };
-                    }
-                    18 => {
                         // Disable Instrument — ask for symbol.
                         self.screen = Screen::NumberInput {
                             label: "Symbol ID",
@@ -622,7 +610,7 @@ impl App {
                             next: NextStep::DisableInstrumentSymbol,
                         };
                     }
-                    19 => {
+                    18 => {
                         // Enable Instrument — ask for symbol.
                         self.screen = Screen::NumberInput {
                             label: "Symbol ID",
@@ -630,7 +618,7 @@ impl App {
                             next: NextStep::EnableInstrumentSymbol,
                         };
                     }
-                    20 => {
+                    19 => {
                         // Remove Instrument — ask for symbol.
                         self.screen = Screen::NumberInput {
                             label: "Symbol ID",
@@ -1074,16 +1062,6 @@ impl App {
                             "→ FEE SCHEDULE sym:{} maker:{}bps taker:{}bps",
                             symbol, maker_bps, taker_bps
                         ));
-                        let _ = self.request_tx.send(request);
-                        self.screen = Screen::ActionMenu;
-                        self.cursor = 0;
-                    }
-
-                    // --- Expire orders flow ---
-                    NextStep::ExpireOrdersTimestamp => {
-                        let request = Request::ExpireOrders { timestamp_ns: val };
-                        self.log
-                            .push(format!("→ EXPIRE ORDERS at timestamp_ns={val}"));
                         let _ = self.request_tx.send(request);
                         self.screen = Screen::ActionMenu;
                         self.cursor = 0;

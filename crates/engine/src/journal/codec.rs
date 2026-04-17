@@ -8,7 +8,7 @@
 //! | Field          | Type | Bytes | Purpose                                |
 //! |----------------|------|-------|----------------------------------------|
 //! | file_magic     | u32  | 4     | `0x4A4F5552` ("JOUR")                  |
-//! | format_version | u16  | 2     | Current version = 10                   |
+//! | format_version | u16  | 2     | Current version = 11                   |
 //! | reserved       | u16  | 2     | Padding for alignment, zeroed          |
 //!
 //! ## Entry layout (little-endian, repeats after file header)
@@ -52,7 +52,8 @@ pub const FILE_MAGIC: u32 = 0x4A4F_5552;
 /// v7 → v8: added per-entry key_hash(8) + request_seq(8) for admin idempotency.
 /// v8 → v9: added ExpireOrders event + conditional expiry_ns in order encoding (GTD only).
 /// v9 → v10: added Tick event for the internal scheduler clock.
-pub const FORMAT_VERSION: u16 = 10;
+/// v10 → v11: removed ExpireOrders event (GTD expiry is scheduler-driven).
+pub const FORMAT_VERSION: u16 = 11;
 
 /// File header size in bytes.
 pub const FILE_HEADER_SIZE: usize = 8;
@@ -81,7 +82,6 @@ const TAG_SET_FEE_SCHEDULE: u8 = 11;
 const TAG_PROVISION_ACCOUNT: u8 = 12;
 const TAG_WITHDRAW: u8 = 13;
 const TAG_END_OF_DAY: u8 = 14;
-const TAG_EXPIRE_ORDERS: u8 = 15;
 const TAG_DISABLE_INSTRUMENT: u8 = 16;
 const TAG_ENABLE_INSTRUMENT: u8 = 17;
 const TAG_REMOVE_INSTRUMENT: u8 = 18;
@@ -270,11 +270,6 @@ pub fn encode(
         JournalEvent::EndOfDay => {
             // No payload — tag only.
             TAG_END_OF_DAY
-        }
-        JournalEvent::ExpireOrders { timestamp_ns } => {
-            le::put_u64(&mut buf[pos..], *timestamp_ns);
-            pos += 8;
-            TAG_EXPIRE_ORDERS
         }
         JournalEvent::DisableInstrument { symbol } => {
             le::put_u32(&mut buf[pos..], symbol.0);
@@ -778,17 +773,6 @@ pub fn decode(
             }
         }
         TAG_END_OF_DAY => JournalEvent::EndOfDay,
-        TAG_EXPIRE_ORDERS => {
-            if payload.len() < 8 {
-                return Err(JournalError::CorruptEntry {
-                    sequence,
-                    reason: "ExpireOrders payload too short",
-                });
-            }
-            JournalEvent::ExpireOrders {
-                timestamp_ns: le::get_u64(&payload[0..]),
-            }
-        }
         TAG_DISABLE_INSTRUMENT => {
             if payload.len() < 4 {
                 return Err(JournalError::CorruptEntry {
@@ -1168,9 +1152,6 @@ mod tests {
                 amount: 500_000,
             },
             JournalEvent::EndOfDay,
-            JournalEvent::ExpireOrders {
-                timestamp_ns: 1_700_000_000_000_000_000,
-            },
             // GTD order — exercises conditional expiry_ns encoding.
             JournalEvent::SubmitOrder {
                 symbol: Symbol(1),

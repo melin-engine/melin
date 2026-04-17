@@ -8,12 +8,12 @@
 //! Uses manual binary serialization (same approach as the journal codec)
 //! to avoid serde dependency.
 //!
-//! ## File format (v13)
+//! ## File format (v14)
 //!
 //! | Field          | Type    | Bytes | Purpose                            |
 //! |----------------|---------|-------|------------------------------------|
 //! | file_magic     | u32     | 4     | `0x534E4150` ("SNAP")              |
-//! | format_version | u16     | 2     | Current version = 13               |
+//! | format_version | u16     | 2     | Current version = 14               |
 //! | reserved       | u16     | 2     | Padding, zeroed                    |
 //! | sequence       | u64     | 8     | Journal sequence at snapshot       |
 //! | chain_hash     | [u8;32] | 32    | BLAKE3 hash chain state            |
@@ -29,7 +29,7 @@ use std::path::Path;
 use crate::account::{AccountManager, Balance};
 use crate::exchange::Exchange;
 use crate::orderbook::OrderBook;
-use crate::scheduler::{self, ScheduledTask, ScheduledTaskHeap};
+use crate::scheduler::{ScheduledTask, ScheduledTaskHeap, ScheduledTaskKind};
 use crate::types::{
     AccountId, CircuitBreakerConfig, CurrencyId, FeeSchedule, InstrumentSpec, OrderId, Price,
     Quantity, ReservationSlot, RiskLimits, Side, Symbol, TimeInForce,
@@ -59,7 +59,9 @@ const SNAP_MAGIC: u32 = 0x534E_4150;
 /// v10 → v11: added expiry_ns to resting orders and pending stops (GTD support).
 /// v11 → v12: added per-instrument disabled flag for instrument lifecycle management.
 /// v12 → v13: added scheduled_tasks heap for the engine-internal scheduler.
-const SNAP_VERSION: u16 = 13;
+/// v13 → v14: scheduler heap removed from snapshot — rebuilt on restore from
+///            GTD orders + pending stops (derived state).
+const SNAP_VERSION: u16 = 14;
 
 /// Snapshot header size: magic(4) + version(2) + reserved(2) + sequence(8) + chain_hash(32) = 48.
 const SNAP_HEADER_SIZE: usize = 48;
@@ -218,8 +220,6 @@ pub(crate) struct ExchangeSnapshot {
     pub(crate) key_hwm: Vec<(u64, u64)>,
     /// Set of disabled instrument symbols (v12+).
     pub(crate) disabled_instruments: Vec<Symbol>,
-    /// Pending scheduler tasks, sorted by `fire_ns` ascending (v13+).
-    pub(crate) scheduled_tasks: Vec<ScheduledTask>,
 }
 
 /// Serialized order book state for a single instrument.
@@ -374,13 +374,6 @@ fn encode_exchange_state(state: &ExchangeSnapshot, buf: &mut Vec<u8>) {
     le::push_u32(buf, state.disabled_instruments.len() as u32);
     for symbol in &state.disabled_instruments {
         le::push_u32(buf, symbol.0);
-    }
-
-    // Scheduled tasks (v13+). Each entry: fire_ns(8) + kind_tag(1).
-    le::push_u32(buf, state.scheduled_tasks.len() as u32);
-    for task in &state.scheduled_tasks {
-        le::push_u64(buf, task.fire_ns);
-        buf.push(scheduler::encode_kind(task.kind));
     }
 }
 
@@ -795,21 +788,6 @@ fn decode_exchange_state(
         Vec::new()
     };
 
-    // Scheduled tasks (v13+). Each entry: fire_ns(8) + kind_tag(1) = 9 bytes.
-    check(pos, 4)?;
-    let n_tasks = le::get_u32(&buf[pos..]) as usize;
-    pos += 4;
-    validate_count(buf.len() - pos, n_tasks, 9)?;
-    let mut scheduled_tasks = Vec::with_capacity(n_tasks);
-    for _ in 0..n_tasks {
-        check(pos, 9)?;
-        let fire_ns = le::get_u64(&buf[pos..]);
-        let kind = scheduler::decode_kind(buf[pos + 8])
-            .ok_or(corrupt("invalid scheduled task kind tag"))?;
-        scheduled_tasks.push(ScheduledTask { fire_ns, kind });
-        pos += 9;
-    }
-
     Ok((
         pos,
         ExchangeSnapshot {
@@ -824,7 +802,6 @@ fn decode_exchange_state(
             fee_schedules,
             key_hwm,
             disabled_instruments,
-            scheduled_tasks,
         },
     ))
 }
@@ -1151,6 +1128,30 @@ fn decode_stop_side_levels(buf: &[u8], version: u16) -> Result<(usize, StopLevel
 
 // --- Conversion: ExchangeSnapshot <-> actual types ---
 
+/// Rebuild the engine's scheduler heap by walking every restored instrument
+/// for GTD orders. The heap is derived state — not stored in the snapshot —
+/// so a fresh restore must re-emit one `ExpireOrder` task per live GTD
+/// resting order or pending stop.
+fn rebuild_scheduler_heap(
+    instruments: &[Option<Box<crate::exchange::InstrumentState>>],
+) -> ScheduledTaskHeap {
+    let mut heap = ScheduledTaskHeap::new();
+    for inst in instruments.iter().flatten() {
+        let symbol = inst.spec.symbol;
+        for (account, order_id, expiry_ns) in inst.book.iter_gtd_orders() {
+            heap.push(ScheduledTask {
+                fire_ns: expiry_ns,
+                kind: ScheduledTaskKind::ExpireOrder {
+                    symbol,
+                    account,
+                    order_id,
+                },
+            });
+        }
+    }
+    heap
+}
+
 impl Exchange {
     /// Create a snapshot of all internal state for serialization.
     pub(crate) fn snapshot_state(&self) -> ExchangeSnapshot {
@@ -1170,7 +1171,6 @@ impl Exchange {
         let fee_schedules = self.snapshot_fee_schedules();
         let key_hwm = self.snapshot_key_hwm();
         let disabled_instruments = self.snapshot_disabled_instruments();
-        let scheduled_tasks = self.snapshot_scheduled_tasks();
 
         ExchangeSnapshot {
             instruments,
@@ -1184,7 +1184,6 @@ impl Exchange {
             fee_schedules,
             key_hwm,
             disabled_instruments,
-            scheduled_tasks,
         }
     }
 
@@ -1259,7 +1258,10 @@ impl Exchange {
             key_hwm.insert(key_hash, hwm);
         }
 
-        let scheduled_tasks = ScheduledTaskHeap::restore(state.scheduled_tasks);
+        // Rebuild the scheduler heap from order state. Every GTD order that
+        // is currently resting (or pending as a stop) needs an ExpireOrder
+        // task — the heap is derived state, never stored in the snapshot.
+        let scheduled_tasks = rebuild_scheduler_heap(&instruments);
 
         Self::from_parts(
             instruments,
@@ -1427,7 +1429,6 @@ mod tests {
 
     use super::*;
     use crate::exchange::Exchange;
-    use crate::scheduler::ScheduledTaskKind;
     use crate::types::*;
 
     const ACCT_A: AccountId = AccountId(1);
@@ -1660,12 +1661,13 @@ mod tests {
         save(&exchange, 20, [0u8; 32], &path).unwrap();
         let (mut restored, _, _) = load(&path).unwrap();
 
-        // The GTD order should still be on the book and should expire
-        // at the original timestamp after restore.
-        restored.expire_orders(4_999_999, &mut reports);
+        // The GTD order should still be on the book and the scheduler heap
+        // must have been rebuilt from order state. A pre-expiry tick is a
+        // no-op; an at-expiry tick fires the rebuilt task and cancels.
+        restored.drain_due_scheduled_tasks(4_999_999, &mut reports);
         assert!(reports.is_empty(), "should not expire before timestamp");
 
-        restored.expire_orders(5_000_000, &mut reports);
+        restored.drain_due_scheduled_tasks(5_000_000, &mut reports);
         assert_eq!(reports.len(), 1);
         assert!(matches!(
             reports[0],
@@ -1734,45 +1736,67 @@ mod tests {
     }
 
     #[test]
-    fn snapshot_round_trips_scheduler_heap() {
+    fn snapshot_rebuilds_scheduler_heap_from_gtd_orders() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("sched.snapshot");
+        let path = dir.path().join("rebuild.snapshot");
 
         let mut exchange = Exchange::new();
-        // Push tasks out of fire-order to exercise the deterministic sort
-        // on encode and the heap restore on decode.
-        for fire_ns in [3_000, 1_000, 2_000, 5_000, 4_000] {
-            exchange.push_scheduled_task(ScheduledTask {
-                fire_ns,
-                kind: ScheduledTaskKind::Reserved,
-            });
+        exchange.add_instrument(btc_usd_spec());
+        exchange.deposit(ACCT_A, USD, 10_000_000);
+
+        // Two GTD orders with different expiries so we can verify per-task
+        // ordering after rebuild.
+        let mut reports = Vec::new();
+        for (id, expiry) in [(1u64, 5_000u64), (2, 8_000)] {
+            exchange.execute(
+                Symbol(1),
+                Order {
+                    id: OrderId(id),
+                    account: ACCT_A,
+                    side: Side::Buy,
+                    order_type: OrderType::Limit {
+                        price: price_val(100 + id),
+                        post_only: false,
+                    },
+                    time_in_force: TimeInForce::GTD,
+                    quantity: qty(1),
+                    stp: SelfTradeProtection::Allow,
+                    expiry_ns: expiry,
+                },
+                &mut reports,
+            );
         }
+        reports.clear();
 
-        save(&exchange, 99, [0u8; 32], &path).unwrap();
-
+        save(&exchange, 7, [0u8; 32], &path).unwrap();
         let (mut restored, _, _) = load(&path).unwrap();
 
-        // Drain in fire_ns order — restored heap must hold all tasks.
-        let mut popped = Vec::new();
-        let mut reports = Vec::new();
-        // Drain everything in one shot via the engine entry point used in
-        // production; this also exercises drain_due_scheduled_tasks.
-        restored.drain_due_scheduled_tasks(u64::MAX, &mut reports);
-        // After drain the heap is empty; verify by re-snapshotting.
-        let after = restored.snapshot_state();
-        assert!(
-            after.scheduled_tasks.is_empty(),
-            "heap should be empty after drain"
-        );
+        // Pre-expiry tick: nothing fires.
+        restored.drain_due_scheduled_tasks(4_999, &mut reports);
+        assert!(reports.is_empty());
 
-        // Independently inspect the on-disk ordering by re-reading the
-        // snapshot bytes via load and inspecting the snapshot vector.
-        let (fresh, _, _) = load(&path).unwrap();
-        let snap = fresh.snapshot_state();
-        for task in &snap.scheduled_tasks {
-            popped.push(task.fire_ns);
-        }
-        assert_eq!(popped, vec![1_000, 2_000, 3_000, 4_000, 5_000]);
+        // After tick at 5_000, the first GTD order is cancelled by the
+        // rebuilt scheduler heap; the second one waits until its own expiry.
+        restored.drain_due_scheduled_tasks(5_000, &mut reports);
+        assert_eq!(reports.len(), 1);
+        assert!(matches!(
+            reports[0],
+            ExecutionReport::Cancelled {
+                order_id: OrderId(1),
+                ..
+            }
+        ));
+        reports.clear();
+
+        restored.drain_due_scheduled_tasks(8_000, &mut reports);
+        assert_eq!(reports.len(), 1);
+        assert!(matches!(
+            reports[0],
+            ExecutionReport::Cancelled {
+                order_id: OrderId(2),
+                ..
+            }
+        ));
     }
 
     #[test]

@@ -60,7 +60,7 @@ fn arb_tif() -> impl Strategy<Value = (TimeInForce, u64)> {
         Just((TimeInForce::FOK, 0)),
         Just((TimeInForce::Day, 0)),
         // GTD with random expiry in a reasonable range (1..=10_000 ns).
-        // Small values so ExpireOrders actions with similar range can trigger cancellation.
+        // Small values so Tick actions with similar range can trigger cancellation.
         (1u64..=10_000).prop_map(|exp| (TimeInForce::GTD, exp)),
     ]
 }
@@ -212,9 +212,9 @@ enum ExchangeAction {
         maker_fee_bps: i16,
         taker_fee_bps: i16,
     },
-    /// Expire GTD orders at or before the given timestamp.
-    ExpireOrders {
-        timestamp_ns: u64,
+    /// Advance the engine clock; drains any due scheduled tasks (GTD expiry).
+    Tick {
+        now_ns: u64,
     },
 }
 
@@ -257,9 +257,9 @@ fn arb_exchange_action() -> impl Strategy<Value = ExchangeAction> {
         1 => (0i16..=100, 0i16..=100).prop_map(|(maker_fee_bps, taker_fee_bps)| {
             ExchangeAction::SetFeeSchedule { maker_fee_bps, taker_fee_bps }
         }),
-        // Occasional ExpireOrders to exercise GTD cancellation.
+        // Occasional Tick to exercise scheduler-driven GTD cancellation.
         // Timestamp range matches GTD expiry range (1..=10_000).
-        1 => (1u64..=10_000).prop_map(|timestamp_ns| ExchangeAction::ExpireOrders { timestamp_ns }),
+        1 => (1u64..=10_000).prop_map(|now_ns| ExchangeAction::Tick { now_ns }),
     ]
 }
 
@@ -736,9 +736,9 @@ fn run_exchange_actions(actions: &[ExchangeAction]) -> ExchangeActionResult {
                 );
                 reports.clear();
             }
-            ExchangeAction::ExpireOrders { timestamp_ns } => {
+            ExchangeAction::Tick { now_ns } => {
                 action_order_ids.push(None);
-                exchange.expire_orders(*timestamp_ns, &mut reports);
+                exchange.drain_due_scheduled_tasks(*now_ns, &mut reports);
                 all_reports.extend_from_slice(&reports);
                 reports.clear();
             }

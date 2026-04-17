@@ -845,65 +845,6 @@ impl OrderBook {
         }
     }
 
-    /// Cancel all GTD orders whose expiry time has passed.
-    ///
-    /// Scans resting orders (bids + asks) and pending stops, cancelling any
-    /// with `time_in_force == GTD && expiry_ns > 0 && expiry_ns <= now_ns`.
-    /// Same pattern as `cancel_day_orders` — collect IDs first, then cancel
-    /// to avoid borrowing conflicts.
-    pub fn cancel_expired_orders(&mut self, now_ns: u64, reports: &mut Vec<ExecutionReport>) {
-        self.consumed_slots.clear();
-        let mut to_cancel: Vec<(AccountId, OrderId)> = Vec::new();
-
-        for (_, queue) in &self.bids.levels {
-            for order in queue {
-                if order.time_in_force == TimeInForce::GTD
-                    && order.expiry_ns > 0
-                    && order.expiry_ns <= now_ns
-                {
-                    to_cancel.push((order.account, order.id));
-                }
-            }
-        }
-        for (_, queue) in &self.asks.levels {
-            for order in queue {
-                if order.time_in_force == TimeInForce::GTD
-                    && order.expiry_ns > 0
-                    && order.expiry_ns <= now_ns
-                {
-                    to_cancel.push((order.account, order.id));
-                }
-            }
-        }
-
-        for stops in self.stop_buys.values() {
-            for stop in stops {
-                if stop.time_in_force == TimeInForce::GTD
-                    && stop.expiry_ns > 0
-                    && stop.expiry_ns <= now_ns
-                {
-                    to_cancel.push((stop.account, stop.id));
-                }
-            }
-        }
-        for stops in self.stop_sells.values() {
-            for stop in stops {
-                if stop.time_in_force == TimeInForce::GTD
-                    && stop.expiry_ns > 0
-                    && stop.expiry_ns <= now_ns
-                {
-                    to_cancel.push((stop.account, stop.id));
-                }
-            }
-        }
-
-        for (account, id) in to_cancel {
-            if let Some((side, slot)) = self.cancel(account, id, reports) {
-                self.consumed_slots.push((account, id, side, slot));
-            }
-        }
-    }
-
     fn execute_limit(
         &mut self,
         order: Order,
@@ -979,7 +920,7 @@ impl OrderBook {
                     match order.time_in_force {
                         // GTC, Day, and GTD all rest on the book. Day orders
                         // are bulk-cancelled by EndOfDay; GTD orders are
-                        // bulk-cancelled by ExpireOrders.
+                        // cancelled by the scheduler when their expiry fires.
                         TimeInForce::GTC | TimeInForce::Day | TimeInForce::GTD => {
                             self.place_on_book(
                                 order.id,
@@ -1627,6 +1568,66 @@ impl OrderBook {
                 .map(|s| ((s.account, s.id), (s.side, s.reservation)))
         });
         buys.chain(sells)
+    }
+
+    /// Iterate every GTD order on the book, resting or pending stop, yielding
+    /// `(account, order_id, expiry_ns)`. Used after snapshot restore to
+    /// rebuild the scheduler heap from order state.
+    pub(crate) fn iter_gtd_orders(&self) -> impl Iterator<Item = (AccountId, OrderId, u64)> + '_ {
+        let resting = self
+            .bids
+            .levels
+            .iter()
+            .chain(self.asks.levels.iter())
+            .flat_map(|(_, queue)| queue.iter())
+            .filter(|o| o.time_in_force == TimeInForce::GTD)
+            .map(|o| (o.account, o.id, o.expiry_ns));
+        let stops = self
+            .stop_buys
+            .values()
+            .chain(self.stop_sells.values())
+            .flat_map(|stops| stops.iter())
+            .filter(|s| s.time_in_force == TimeInForce::GTD)
+            .map(|s| (s.account, s.id, s.expiry_ns));
+        resting.chain(stops)
+    }
+
+    /// Look up a resting limit or pending stop by `(account, order_id)` and
+    /// return its `expiry_ns` *only if* it is GTD. `None` covers four cases:
+    /// the order is not on the book, it isn't GTD, the lookup index points
+    /// to a stale entry, or the order_id collides with a removed entry —
+    /// the scheduler treats all four as silent tombstones.
+    pub(crate) fn find_gtd_expiry(&self, account: AccountId, order_id: OrderId) -> Option<u64> {
+        if let Some(&(side, price, _slot)) = self.order_index.get(&(account, order_id)) {
+            let book_side = match side {
+                Side::Buy => &self.bids,
+                Side::Sell => &self.asks,
+            };
+            for (lvl_price, queue) in book_side.levels.iter() {
+                if *lvl_price != price {
+                    continue;
+                }
+                for o in queue {
+                    if o.id == order_id && o.account == account {
+                        return (o.time_in_force == TimeInForce::GTD).then_some(o.expiry_ns);
+                    }
+                }
+            }
+        }
+        if let Some(&(side, trigger_price)) = self.stop_index.get(&(account, order_id)) {
+            let stops = match side {
+                Side::Buy => &self.stop_buys,
+                Side::Sell => &self.stop_sells,
+            };
+            if let Some(level) = stops.get(&trigger_price) {
+                for s in level {
+                    if s.id == order_id && s.account == account {
+                        return (s.time_in_force == TimeInForce::GTD).then_some(s.expiry_ns);
+                    }
+                }
+            }
+        }
+        None
     }
 }
 
@@ -2922,143 +2923,5 @@ mod tests {
         assert_eq!(reports.len(), 1);
         assert!(matches!(reports[0], ExecutionReport::Fill { .. }));
         assert!(book.is_empty());
-    }
-
-    // -- GTD expiration tests --
-
-    /// Helper: create a GTD limit order with an expiry timestamp.
-    fn gtd_limit_order(id: u64, side: Side, p: u64, q: u64, expiry_ns: u64) -> Order {
-        Order {
-            id: OrderId(id),
-            account: TEST_ACCOUNT,
-            side,
-            order_type: OrderType::Limit {
-                price: price(p),
-                post_only: false,
-            },
-            time_in_force: TimeInForce::GTD,
-            quantity: qty(q),
-            stp: SelfTradeProtection::Allow,
-            expiry_ns,
-        }
-    }
-
-    /// Helper: create a GTD stop order with an expiry timestamp.
-    fn gtd_stop_order(id: u64, side: Side, trigger: u64, q: u64, expiry_ns: u64) -> Order {
-        Order {
-            id: OrderId(id),
-            account: TEST_ACCOUNT,
-            side,
-            order_type: OrderType::Stop {
-                trigger_price: price(trigger),
-            },
-            time_in_force: TimeInForce::GTD,
-            quantity: qty(q),
-            stp: SelfTradeProtection::Allow,
-            expiry_ns,
-        }
-    }
-
-    #[test]
-    fn gtd_order_expires_when_timestamp_reached() {
-        let mut book = OrderBook::new(TEST_SYMBOL);
-        let mut reports = Vec::new();
-
-        // Place a GTD buy order expiring at t=1000.
-        book.execute(
-            gtd_limit_order(1, Side::Buy, 100, 10, 1000),
-            None,
-            ReservationSlot::DUMMY,
-            &mut reports,
-        );
-        assert_eq!(reports.len(), 1);
-        assert!(matches!(reports[0], ExecutionReport::Placed { .. }));
-        reports.clear();
-
-        // Expire at t=1000 (exactly at expiry) — should cancel.
-        book.cancel_expired_orders(1000, &mut reports);
-        assert_eq!(reports.len(), 1);
-        assert!(matches!(
-            reports[0],
-            ExecutionReport::Cancelled {
-                order_id: OrderId(1),
-                remaining_quantity,
-                ..
-            } if remaining_quantity.get() == 10
-        ));
-        assert!(book.is_empty());
-    }
-
-    #[test]
-    fn gtd_order_does_not_expire_before_timestamp() {
-        let mut book = OrderBook::new(TEST_SYMBOL);
-        let mut reports = Vec::new();
-
-        // Place a GTD buy order expiring at t=1000.
-        book.execute(
-            gtd_limit_order(1, Side::Buy, 100, 10, 1000),
-            None,
-            ReservationSlot::DUMMY,
-            &mut reports,
-        );
-        reports.clear();
-
-        // Expire at t=999 — should NOT cancel.
-        book.cancel_expired_orders(999, &mut reports);
-        assert!(reports.is_empty());
-        assert!(!book.is_empty());
-    }
-
-    #[test]
-    fn non_gtd_orders_not_affected_by_cancel_expired() {
-        let mut book = OrderBook::new(TEST_SYMBOL);
-        let mut reports = Vec::new();
-
-        // GTC order.
-        book.execute(
-            limit_order(1, Side::Buy, 100, 10, TimeInForce::GTC),
-            None,
-            ReservationSlot::DUMMY,
-            &mut reports,
-        );
-        // Day order.
-        book.execute(
-            limit_order(2, Side::Sell, 200, 5, TimeInForce::Day),
-            None,
-            ReservationSlot::DUMMY,
-            &mut reports,
-        );
-        reports.clear();
-
-        // cancel_expired_orders should not touch GTC or Day orders.
-        book.cancel_expired_orders(u64::MAX, &mut reports);
-        assert!(reports.is_empty());
-    }
-
-    #[test]
-    fn gtd_pending_stop_expires() {
-        let mut book = OrderBook::new(TEST_SYMBOL);
-        let mut reports = Vec::new();
-
-        // Place a GTD stop buy expiring at t=5000.
-        // At the orderbook level, stops are silently stored (no Placed report).
-        book.execute(
-            gtd_stop_order(1, Side::Buy, 200, 10, 5000),
-            None,
-            ReservationSlot::DUMMY,
-            &mut reports,
-        );
-        assert!(reports.is_empty());
-
-        // Expire at t=5000 — stop should be cancelled.
-        book.cancel_expired_orders(5000, &mut reports);
-        assert_eq!(reports.len(), 1);
-        assert!(matches!(
-            reports[0],
-            ExecutionReport::Cancelled {
-                order_id: OrderId(1),
-                ..
-            }
-        ));
     }
 }
