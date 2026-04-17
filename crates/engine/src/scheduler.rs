@@ -18,6 +18,14 @@
 //! `OrderId` HWM enforcement, an order id is unique forever, so a tombstone
 //! can never accidentally match a different order.
 //!
+//! Memory cost: under sustained high-cancel-rate GTD traffic the heap can
+//! grow to roughly `concurrent_gtd_orders + cancel_rate × avg_lifetime`.
+//! Heap operations stay `O(log n)` so latency is bounded; only memory is
+//! sensitive. If this becomes a constraint, a parallel `(account, order_id)
+//! → handle` index plus heap-with-removal would let cancel paths reap their
+//! tasks immediately. We accept the simpler design until profiling justifies
+//! the extra bookkeeping.
+//!
 //! ## Persistence
 //!
 //! The heap is *derived state* — every current task variant is reconstructible
@@ -79,13 +87,6 @@ impl ScheduledTaskHeap {
     pub fn new() -> Self {
         Self {
             inner: BinaryHeap::new(),
-        }
-    }
-
-    /// Pre-allocate capacity. Useful when rebuilding from a snapshot.
-    pub fn with_capacity(cap: usize) -> Self {
-        Self {
-            inner: BinaryHeap::with_capacity(cap),
         }
     }
 
@@ -167,5 +168,44 @@ mod tests {
             order.push(t.fire_ns);
         }
         assert_eq!(order, vec![100, 200, 300]);
+    }
+
+    /// Co-firing tasks must order deterministically — the field order on
+    /// `ScheduledTaskKind::ExpireOrder` (symbol, account, order_id) is
+    /// load-bearing for reproducible drain output, and a future refactor
+    /// reordering those fields would silently break replay determinism.
+    #[test]
+    fn co_firing_tasks_order_deterministically() {
+        let make = |sym: u32, acct: u32, ord: u64| ScheduledTask {
+            fire_ns: 100,
+            kind: ScheduledTaskKind::ExpireOrder {
+                symbol: Symbol(sym),
+                account: AccountId(acct),
+                order_id: OrderId(ord),
+            },
+        };
+
+        // Same fire_ns → ordered by symbol, then account, then order_id.
+        assert!(make(1, 1, 1) < make(2, 1, 1), "symbol differentiates first");
+        assert!(
+            make(1, 1, 1) < make(1, 2, 1),
+            "account differentiates second"
+        );
+        assert!(
+            make(1, 1, 1) < make(1, 1, 2),
+            "order_id differentiates last"
+        );
+
+        // fire_ns dominates regardless of kind ordering.
+        let early_high = ScheduledTask {
+            fire_ns: 50,
+            kind: ScheduledTaskKind::ExpireOrder {
+                symbol: Symbol(99),
+                account: AccountId(99),
+                order_id: OrderId(99),
+            },
+        };
+        let late_low = make(0, 0, 0);
+        assert!(early_high < late_low, "fire_ns wins over kind ordering");
     }
 }

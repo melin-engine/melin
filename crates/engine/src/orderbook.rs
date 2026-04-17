@@ -1597,17 +1597,19 @@ impl OrderBook {
     /// the order is not on the book, it isn't GTD, the lookup index points
     /// to a stale entry, or the order_id collides with a removed entry —
     /// the scheduler treats all four as silent tombstones.
+    ///
+    /// Hot path: called once per scheduled task drain. The level lookup is
+    /// `O(log levels)` via `BookSide::search`; the in-level scan is `O(L)`
+    /// in the queue length at that price (which cancel/cancel-replace pay
+    /// too).
     pub(crate) fn find_gtd_expiry(&self, account: AccountId, order_id: OrderId) -> Option<u64> {
         if let Some(&(side, price, _slot)) = self.order_index.get(&(account, order_id)) {
             let book_side = match side {
                 Side::Buy => &self.bids,
                 Side::Sell => &self.asks,
             };
-            for (lvl_price, queue) in book_side.levels.iter() {
-                if *lvl_price != price {
-                    continue;
-                }
-                for o in queue {
+            if let Ok(idx) = book_side.search(price) {
+                for o in &book_side.levels[idx].1 {
                     if o.id == order_id && o.account == account {
                         return (o.time_in_force == TimeInForce::GTD).then_some(o.expiry_ns);
                     }

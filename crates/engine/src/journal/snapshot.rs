@@ -1744,39 +1744,81 @@ mod tests {
         exchange.add_instrument(btc_usd_spec());
         exchange.deposit(ACCT_A, USD, 10_000_000);
 
-        // Two GTD orders with different expiries so we can verify per-task
-        // ordering after rebuild.
+        // Mix resting GTD limits with a GTD pending stop so the rebuild
+        // path covers both `iter_gtd_orders` branches (book + stop_index).
         let mut reports = Vec::new();
-        for (id, expiry) in [(1u64, 5_000u64), (2, 8_000)] {
-            exchange.execute(
-                Symbol(1),
-                Order {
-                    id: OrderId(id),
-                    account: ACCT_A,
-                    side: Side::Buy,
-                    order_type: OrderType::Limit {
-                        price: price_val(100 + id),
-                        post_only: false,
-                    },
-                    time_in_force: TimeInForce::GTD,
-                    quantity: qty(1),
-                    stp: SelfTradeProtection::Allow,
-                    expiry_ns: expiry,
+        // Resting GTD limit at expiry 5_000.
+        exchange.execute(
+            Symbol(1),
+            Order {
+                id: OrderId(1),
+                account: ACCT_A,
+                side: Side::Buy,
+                order_type: OrderType::Limit {
+                    price: price_val(100),
+                    post_only: false,
                 },
-                &mut reports,
-            );
-        }
+                time_in_force: TimeInForce::GTD,
+                quantity: qty(1),
+                stp: SelfTradeProtection::Allow,
+                expiry_ns: 5_000,
+            },
+            &mut reports,
+        );
+        // Pending GTD stop-limit at expiry 6_000. Stop-limit (rather than
+        // bare Stop) keeps the reservation bounded to trigger_price × qty
+        // so the third order below can also reserve.
+        exchange.execute(
+            Symbol(1),
+            Order {
+                id: OrderId(2),
+                account: ACCT_A,
+                side: Side::Buy,
+                order_type: OrderType::StopLimit {
+                    trigger_price: price_val(200),
+                    limit_price: price_val(200),
+                },
+                time_in_force: TimeInForce::GTD,
+                quantity: qty(1),
+                stp: SelfTradeProtection::Allow,
+                expiry_ns: 6_000,
+            },
+            &mut reports,
+        );
+        // Second resting GTD limit at expiry 8_000.
+        exchange.execute(
+            Symbol(1),
+            Order {
+                id: OrderId(3),
+                account: ACCT_A,
+                side: Side::Buy,
+                order_type: OrderType::Limit {
+                    price: price_val(101),
+                    post_only: false,
+                },
+                time_in_force: TimeInForce::GTD,
+                quantity: qty(1),
+                stp: SelfTradeProtection::Allow,
+                expiry_ns: 8_000,
+            },
+            &mut reports,
+        );
         reports.clear();
+
+        // Sanity: all 3 orders should have scheduled tasks before the snapshot.
+        assert_eq!(exchange.scheduled_task_count(), 3, "pre-snapshot heap");
 
         save(&exchange, 7, [0u8; 32], &path).unwrap();
         let (mut restored, _, _) = load(&path).unwrap();
+
+        // Sanity: rebuild restored all 3 tasks from the order books.
+        assert_eq!(restored.scheduled_task_count(), 3, "post-restore heap");
 
         // Pre-expiry tick: nothing fires.
         restored.drain_due_scheduled_tasks(4_999, &mut reports);
         assert!(reports.is_empty());
 
-        // After tick at 5_000, the first GTD order is cancelled by the
-        // rebuilt scheduler heap; the second one waits until its own expiry.
+        // Drain at 5_000: only the first limit fires.
         restored.drain_due_scheduled_tasks(5_000, &mut reports);
         assert_eq!(reports.len(), 1);
         assert!(matches!(
@@ -1788,12 +1830,25 @@ mod tests {
         ));
         reports.clear();
 
-        restored.drain_due_scheduled_tasks(8_000, &mut reports);
+        // Drain at 6_000: the pending stop fires (rebuilt from stop_index).
+        restored.drain_due_scheduled_tasks(6_000, &mut reports);
         assert_eq!(reports.len(), 1);
         assert!(matches!(
             reports[0],
             ExecutionReport::Cancelled {
                 order_id: OrderId(2),
+                ..
+            }
+        ));
+        reports.clear();
+
+        // Drain at 8_000: the second resting limit fires.
+        restored.drain_due_scheduled_tasks(8_000, &mut reports);
+        assert_eq!(reports.len(), 1);
+        assert!(matches!(
+            reports[0],
+            ExecutionReport::Cancelled {
+                order_id: OrderId(3),
                 ..
             }
         ));

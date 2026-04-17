@@ -42,8 +42,17 @@ const SHUTDOWN_POLL_INTERVAL: Duration = Duration::from_millis(50);
 ///
 /// If the input ring is full at publish time, the tick is *dropped* — the
 /// next successful tick still carries the latest wall-clock time, so a
-/// missed tick only delays the scheduler by one cadence and never breaks
-/// determinism.
+/// missed tick only delays scheduler firings by one cadence at worst.
+///
+/// Caveat: the dropped tick still consumed a journal sequence number from
+/// the [`Sequencer`] (this matches the existing pattern in `crates/server/
+/// src/reader.rs`). On a clean shutdown the gap is harmless, but a *crash*
+/// while the input ring was saturated could leave the journal with a
+/// missing sequence — recovery would error with `SequenceGap`. The input
+/// ring is sized at 1M slots, so saturation is reachable only when the
+/// matching stage is fully stalled, in which case the sequence-gap risk
+/// is the smaller problem. Sequence reclamation on publish-fail is a
+/// project-wide architectural concern and not addressed here.
 pub fn run(
     producer: ring::MultiProducer<InputSlot>,
     sequencer: Arc<Sequencer>,
