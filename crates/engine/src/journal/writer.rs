@@ -419,9 +419,10 @@ impl JournalWriter {
     ///
     /// Does NOT allocate or advance the internal sequence counter — the
     /// caller is responsible for obtaining the sequence via
-    /// [`allocate_sequence`] or an external sequencer. This separation
-    /// enables moving sequence assignment to an earlier pipeline stage
-    /// without changing the encoding logic.
+    /// [`allocate_sequence`] (primary) or by syncing the writer's counter
+    /// to a wire-decoded value via [`set_next_sequence`] (replica). This
+    /// separation lets the journal stage make the sequencing decision in
+    /// disruptor cursor order without coupling encoding to allocation.
     ///
     /// Also handles hash-chain bookkeeping and auto-emits checkpoint
     /// entries when the checkpoint interval is reached.

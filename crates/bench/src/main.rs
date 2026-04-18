@@ -703,8 +703,9 @@ fn run_pipeline_bench(
     let (mut ts_tx, mut ts_rx) = melin_disruptor::spsc::channel::<u64>(window.next_power_of_two());
 
     // Publisher thread: continuously feeds events into the disruptor.
+    // `sequence: 0` — the journal stage allocates sequences in disruptor
+    // cursor order at encode time.
     let producer = out.input_producer;
-    let sequencer = out.sequencer;
     let inflight_pub = Arc::clone(&inflight);
     let publish_handle = std::thread::Builder::new()
         .name("pipeline-pub".into())
@@ -723,7 +724,7 @@ fn run_pipeline_bench(
                     connection_id: 0,
                     key_hash: 0,
                     request_seq: 0,
-                    sequence: sequencer.next(),
+                    sequence: 0,
                     timestamp_ns: wall_clock_nanos(),
                     event: JournalEvent::SubmitOrder {
                         symbol: Symbol(1),

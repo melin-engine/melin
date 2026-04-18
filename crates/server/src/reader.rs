@@ -28,7 +28,7 @@ use tracing::{debug, error};
 use crate::server::ControlEvent;
 use melin_disruptor::ring;
 use melin_engine::journal::event::JournalEvent;
-use melin_engine::journal::pipeline::{InputSlot, Sequencer};
+use melin_engine::journal::pipeline::InputSlot;
 use melin_engine::journal::trace::trace_ts;
 use melin_engine::journal::writer::wall_clock_nanos;
 use melin_protocol::auth::Permission;
@@ -149,18 +149,15 @@ impl<R> UringReaderHandle<R> {
 /// One reader thread serves every TCP connection on the server. io_uring
 /// with multishot RECV multiplexes thousands of sockets efficiently and the
 /// matching stage is the throughput limit, so adding more reader threads
-/// would not raise throughput — it would only re-introduce the
-/// multi-producer ordering race in `Sequencer::next`/`MultiProducer::try_publish`.
+/// would not raise throughput — it would only re-introduce contention on
+/// the input ring's multi-producer cursor.
 ///
 /// `tick_cadence: Some(d)` makes the reader the engine's tick generator: it
 /// arms an `IORING_OP_TIMEOUT` so `submit_and_wait` returns at the tick
 /// deadline even when no client traffic is flowing, then publishes a
 /// `JournalEvent::Tick { now_ns }` onto the same input ring it uses for
-/// client requests. With this, the input ring is single-producer for
-/// io_uring transports, eliminating the multi-producer ordering race
-/// between the reader and a separate tick thread. Pass `None` to disable
-/// the tick (useful for benchmarks that don't exercise time-driven
-/// features).
+/// client requests. Pass `None` to disable the tick (useful for benchmarks
+/// that don't exercise time-driven features).
 pub fn spawn_reader<R: AsRawFd + Send + 'static>(
     producer: ring::MultiProducer<InputSlot>,
     control_tx: mpsc::Sender<ControlEvent>,
@@ -168,7 +165,6 @@ pub fn spawn_reader<R: AsRawFd + Send + 'static>(
     connection_timeout: Option<Duration>,
     tick_cadence: Option<Duration>,
     shutdown: Arc<AtomicBool>,
-    sequencer: Arc<Sequencer>,
 ) -> UringReaderHandle<R> {
     let (tx, rx) = mpsc::channel();
 
@@ -193,7 +189,6 @@ pub fn spawn_reader<R: AsRawFd + Send + 'static>(
                 connection_timeout,
                 tick_cadence,
                 &shutdown_clone,
-                &sequencer,
             );
         })
         .expect("failed to spawn uring reader thread");
@@ -297,7 +292,6 @@ fn reader_loop<R: AsRawFd>(
     connection_timeout: Option<Duration>,
     tick_cadence: Option<Duration>,
     shutdown: &AtomicBool,
-    sequencer: &Sequencer,
 ) {
     let mut ring = IoUring::new(RING_SIZE).expect("failed to create io_uring instance");
 
@@ -404,7 +398,7 @@ fn reader_loop<R: AsRawFd>(
                 let raw_now_ns = wall_clock_nanos();
                 let now_ns = crate::tick::clamp_monotonic(raw_now_ns, last_tick_ns);
                 last_tick_ns = now_ns;
-                crate::tick::publish_tick(&producer, sequencer, now_ns);
+                crate::tick::publish_tick(&producer, now_ns);
                 // Catch up rather than burst-emit if we fell badly behind.
                 let elapsed = Instant::now().saturating_duration_since(next_tick_deadline);
                 next_tick_deadline = if elapsed > cadence {
@@ -572,7 +566,6 @@ fn reader_loop<R: AsRawFd>(
                     entry,
                     &producer,
                     &server_busy_frame,
-                    sequencer,
                     #[cfg(feature = "latency-trace")]
                     &mut publish_hist,
                 );
@@ -751,7 +744,6 @@ fn process_frames<R>(
     conn: &mut ConnectionEntry<R>,
     producer: &ring::MultiProducer<InputSlot>,
     server_busy_frame: &[u8; 5],
-    sequencer: &Sequencer,
     #[cfg(feature = "latency-trace")]
     publish_hist: &mut melin_engine::journal::trace::StageHistogram,
 ) -> bool {
@@ -812,13 +804,16 @@ fn process_frames<R>(
 
         let event = crate::request::to_event(&request);
 
-        let (seq_num, ts) = if matches!(
+        // Sequence is allocated by the journal stage in disruptor cursor
+        // order — see `InputSlot::sequence`. QueryStats/QueryPosition are
+        // not journaled and skip even the timestamp.
+        let ts = if matches!(
             event,
             JournalEvent::QueryStats | JournalEvent::QueryPosition { .. }
         ) {
-            (0, 0)
+            0
         } else {
-            (sequencer.next(), wall_clock_nanos())
+            wall_clock_nanos()
         };
 
         #[cfg(feature = "latency-trace")]
@@ -829,7 +824,7 @@ fn process_frames<R>(
                 connection_id: conn.connection_id,
                 key_hash: conn.key_hash,
                 request_seq: seq,
-                sequence: seq_num,
+                sequence: 0,
                 timestamp_ns: ts,
                 event,
                 publish_ts: trace_ts(),

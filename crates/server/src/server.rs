@@ -696,7 +696,6 @@ fn run_as_primary<L: BlockingTransportListener>(
     let enable_event_publisher = config.event_bind.is_some();
     let Pipeline {
         input_producer,
-        sequencer,
         journal_stage,
         matching_stage,
         mut output_consumers,
@@ -1019,12 +1018,14 @@ fn run_as_primary<L: BlockingTransportListener>(
 
         let seed_start = std::time::Instant::now();
 
+        // `sequence: 0` — the journal stage allocates sequences in
+        // disruptor cursor order at encode time.
         for i in 0..config.instruments {
             producer.publish(InputSlot {
                 connection_id: 0,
                 key_hash: 0,
                 request_seq: 0,
-                sequence: sequencer.next(),
+                sequence: 0,
                 timestamp_ns: wall_clock_nanos(),
                 event: JournalEvent::AddInstrument {
                     spec: InstrumentSpec {
@@ -1047,7 +1048,7 @@ fn run_as_primary<L: BlockingTransportListener>(
                 connection_id: 0,
                 key_hash: 0,
                 request_seq: 0,
-                sequence: sequencer.next(),
+                sequence: 0,
                 timestamp_ns: wall_clock_nanos(),
                 event: JournalEvent::ProvisionAccount {
                     account: AccountId(acct),
@@ -1150,7 +1151,6 @@ fn run_as_primary<L: BlockingTransportListener>(
         connection_timeout,
         config.tick_interval(),
         Arc::clone(&reader_shutdown),
-        Arc::clone(&sequencer),
     );
 
     // Pipeline health flag: true while all pipeline threads are alive.
@@ -1547,7 +1547,6 @@ pub fn run_dpdk(
     let enable_shadow = config.snapshot_interval_secs > 0;
     let Pipeline {
         input_producer,
-        sequencer,
         journal_stage,
         matching_stage,
         mut output_consumers,
@@ -1819,12 +1818,14 @@ pub fn run_dpdk(
         use melin_engine::journal::writer::wall_clock_nanos;
         use melin_engine::types::{AccountId, CurrencyId, InstrumentSpec, Symbol};
 
+        // `sequence: 0` — the journal stage allocates sequences in
+        // disruptor cursor order at encode time.
         for i in 0..config.instruments {
             producer.publish(InputSlot {
                 connection_id: 0,
                 key_hash: 0,
                 request_seq: 0,
-                sequence: sequencer.next(),
+                sequence: 0,
                 timestamp_ns: wall_clock_nanos(),
                 event: JournalEvent::AddInstrument {
                     spec: InstrumentSpec {
@@ -1844,7 +1845,7 @@ pub fn run_dpdk(
                 connection_id: 0,
                 key_hash: 0,
                 request_seq: 0,
-                sequence: sequencer.next(),
+                sequence: 0,
                 timestamp_ns: wall_clock_nanos(),
                 event: JournalEvent::ProvisionAccount {
                     account: AccountId(acct),
@@ -1950,7 +1951,6 @@ pub fn run_dpdk(
         let active_i = Arc::clone(&active_connections);
         let keys_i = Arc::clone(&authorized_keys);
 
-        let sequencer_i = Arc::clone(&sequencer);
         let handle = std::thread::Builder::new()
             .name(format!("dpdk-poll-{i}"))
             .spawn(move || {
@@ -1967,7 +1967,6 @@ pub fn run_dpdk(
                     max_conns,
                     active_i,
                     i as u8,
-                    sequencer_i,
                 );
             })
             .map_err(|e| format!("spawn DPDK poll thread: {e}"))?;
@@ -1991,7 +1990,6 @@ pub fn run_dpdk(
             max_conns,
             Arc::clone(&active_connections),
             0,
-            sequencer,
         );
     } else {
         // No client queues (e.g., single-queue NIC with replication taking

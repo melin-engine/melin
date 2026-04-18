@@ -23,7 +23,7 @@
 
 use melin_disruptor::ring;
 use melin_engine::journal::event::JournalEvent;
-use melin_engine::journal::pipeline::{InputSlot, Sequencer};
+use melin_engine::journal::pipeline::InputSlot;
 use melin_engine::journal::trace::trace_ts;
 
 /// Strict-monotonic clamp on the wall-clock timestamp emitted by each tick.
@@ -45,20 +45,20 @@ pub(crate) fn clamp_monotonic(raw_now_ns: u64, last_now_ns: u64) -> u64 {
 /// Internal/server-originated: no client connection, no auth key.
 /// `key_hash = 0` is exempt from idempotency dedup in the engine.
 ///
+/// `sequence: 0` because the journal stage is the authoritative sequence
+/// allocator on the primary — see `InputSlot::sequence`.
+///
 /// On a full ring the publish drops; the next successful tick still
 /// carries the latest wall-clock time, so a missed tick only delays
 /// scheduler firings by one cadence at worst.
-pub(crate) fn publish_tick(
-    producer: &ring::MultiProducer<InputSlot>,
-    sequencer: &Sequencer,
-    now_ns: u64,
-) {
-    let seq = sequencer.next();
+pub(crate) fn publish_tick(producer: &ring::MultiProducer<InputSlot>, now_ns: u64) {
+    // try_publish drop is intentional: on a full ring we'd rather skip a
+    // tick than block the ingress thread (see fn doc).
     let _ = producer.try_publish(InputSlot {
         connection_id: 0,
         key_hash: 0,
         request_seq: 0,
-        sequence: seq,
+        sequence: 0,
         timestamp_ns: now_ns,
         event: JournalEvent::Tick { now_ns },
         publish_ts: trace_ts(),

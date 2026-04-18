@@ -158,12 +158,12 @@ The simplified diagram above shows the primary-side request path. The picture be
 | Response stage (primary)   | Output ring (gated on journal cursor)   | Client TCP                                            |
 | Event publisher (opt)      | Output ring                             | Subscriber TCP (market data feed)                     |
 | Replication sender         | Replication ring                        | Replica TCP                                           |
-| Replication receiver (rep) | Primary TCP                             | `InputSlot` into replica input ring (sequence != 0)   |
+| Replication receiver (rep) | Primary TCP                             | `InputSlot` into replica input ring (sequence stamped from primary's bytes) |
 
 ### Authoritative state, and how it flows
 
-- **Event payload**: produced at the ingress edge (client, tick thread, seed loop). Flows unchanged through every stage and across the TCP boundary to replicas.
-- **Sequence number**: allocated on the primary via a shared `Sequencer` (atomic `u64` initialised to `writer.next_sequence()` at startup). Each producer calls `sequencer.next()` before `try_publish` and stamps the claimed value onto its `InputSlot`. The journal stage uses that value verbatim as the on-disk journal sequence. Replicas read the sequence out of the incoming journal bytes and never assign their own.
+- **Event payload**: produced at the ingress edge (client requests, the ingress thread's tick generator, seed loop). Flows unchanged through every stage and across the TCP boundary to replicas.
+- **Sequence number**: on the primary, allocated by the journal stage at encode time, in disruptor ring-cursor order. Producers publish `InputSlot { sequence: 0, … }` and never coordinate across an external counter — eliminating the prior "claim then publish" leak window. On replicas the replication receiver decodes the primary's sequence from the wire bytes and stamps it onto `InputSlot.sequence` before publishing; the journal stage uses that value verbatim. Either way the on-disk journal sequence and the disruptor cursor advance in lock-step.
 - **Wall-clock timestamp**: stamped at ingress by each producer (e.g. `wall_clock_nanos()` in the reader). Embedded into the journal entry and shipped to replicas.
 - **Hash chain**: computed by the primary's journal writer over each batch's bytes (sequence + payload + checkpoint metadata). Replicas recompute the chain over the received bytes and should arrive at the same hash.
 - **Replica journals** are *logically* identical to the primary's for the event stream (same sequences, same events). They are not byte-identical: each node stamps its own batch-header wall clock and may emit checkpoints at different rotation boundaries.
@@ -173,16 +173,6 @@ The simplified diagram above shows the primary-side request path. The picture be
 The matching stage maintains a per-instance `last_drain_ns` watermark. At the head of every event it processes, if `slot.timestamp_ns > last_drain_ns` it drains all due scheduled tasks up to `slot.timestamp_ns` and updates the watermark. Under load this means each order/cancel event implicitly fires due tasks (GTD expiry, etc.) at microsecond precision, with no extra latency hop for a separate `Tick` event. The tick generator's role narrows to "make sure the clock advances during quiet periods" — at the default 250 ms cadence it costs ~4 events/sec of journal traffic.
 
 `replay_event` and the shadow stage's `dispatch_event` mirror the same drain at the same point so live, replay, and shadow exchanges stay byte-identical.
-
-### Known limitations of the current sequence scheme
-
-One latent issue lives in the producer-side sequence allocation and is worth documenting pending a rework:
-
-- **Sequence leak on ring-full publish failure.** `sequencer.next()` is called before `producer.try_publish()`. If `try_publish` fails (input ring saturated), the claimed sequence never reaches a slot and is effectively lost. The next successful publish uses `seq + 1`, leaving a gap in the journal. Recovery detects that gap with `SequenceGap` and aborts. The input ring is 1M slots, so saturation is only reachable when the matching stage is fully stalled; the same pattern is used by every other primary-side producer.
-
-The previously-documented multi-producer ordering race is no longer reachable: startup is now serialized so the seed loop fully drains through the pipeline before the reader (TCP) or DPDK poll threads are spawned. With both transports the ingress thread is the sole hot-path producer (it also emits ticks — see "Reader" above), so the input ring is genuinely single-producer at every moment of the server's lifetime, and `sequencer.next()` plus the slot-claim CAS observe the same total order.
-
-The architecturally clean fix for the remaining leak is to move sequence assignment into the journal stage (producers publish `sequence: 0`, the journal stage assigns from `writer.next_sequence()` at encode time), so the authoritative order is the disruptor's ring-cursor order. That refactor also removes the `Sequencer` type entirely.
 
 ## Input Disruptor
 

@@ -1,6 +1,6 @@
 # Input Replication — Complete
 
-Migrated from output replication to input replication. Every node (primary and replicas) independently encodes and journals events, with the primary's Sequencer assigning sequence numbers and timestamps at publish time. This aligns with the LMAX architecture where every node runs the same deterministic computation over the same ordered input stream.
+Migrated from output replication to input replication. Every node (primary and replicas) independently encodes and journals events. The primary stamps each input command with a wall-clock timestamp at ingress and assigns its journal sequence number in the journal stage at encode time, in disruptor cursor order. This aligns with the LMAX architecture where every node runs the same deterministic computation over the same ordered input stream.
 
 ## Motivation
 
@@ -8,14 +8,15 @@ The previous architecture replicated the primary's journal output. Replicas wrot
 
 1. **No independent verification.** A bug in journal encoding/decoding could silently corrupt replica state. Now each node processes independently and divergence is detected at every checkpoint (100K events).
 2. **Promotion gap.** On failover, the promoted replica had never validated its own output. Now every replica runs the full pipeline — promotion is "start accepting clients."
-3. **Not LMAX-canonical.** Now the Sequencer assigns sequences at publish time (pre-disruptor), matching the LMAX architecture.
+3. **Not LMAX-canonical.** Sequences are now assigned by the journal stage in disruptor cursor order, matching the LMAX architecture.
 
 ## Target Architecture
 
 ```
-Client → Primary (sequencer)
-           ├─ assigns sequence number + wall-clock timestamp
-           ├─ replicates sequenced input to replicas (before processing)
+Client → Primary
+           ├─ stamps wall-clock timestamp at ingress
+           ├─ assigns sequence number in the journal stage (cursor order)
+           ├─ replicates sequenced input to replicas (post-journal)
            └─ processes through own Exchange (same as replicas)
 
 Replica:
@@ -29,9 +30,11 @@ Every node — primary and replica — runs the full pipeline: encoding, matchin
 
 ## Migration Steps
 
-### ~~Step 1: Extract an Explicit Sequencer Stage~~ (DONE)
+### ~~Step 1: Extract an Explicit Sequencer Stage~~ (DONE, then redesigned)
 
-Separated `allocate_sequence()` from `encode_event()` on `JournalWriter`. Added `sequence` and `timestamp_ns` fields to `InputSlot`. JournalStage batch loops use the explicit two-step pattern. No behavioral change — pure refactor.
+Separated `allocate_sequence()` from `encode_event()` on `JournalWriter`. Added `sequence` and `timestamp_ns` fields to `InputSlot`. JournalStage batch loops use the explicit two-step pattern.
+
+Followup: the original implementation introduced a `Sequencer` type that producers called pre-publish. That created a window where a claimed sequence could fail to reach a slot (`try_publish` failure → journal gap on recovery). The `Sequencer` has since been retired; sequence allocation now happens inside the journal stage in disruptor cursor order. Producers publish `sequence: 0`; the journal stage either allocates from the writer (primary) or uses the wire-decoded value (replica).
 
 ### ~~Steps 2+3: Replicas Encode Independently~~ (DONE)
 
@@ -71,13 +74,13 @@ No code changes needed. The journal already contains only input commands (`Journ
 
 ### Primary-as-sequencer (not consensus)
 
-The primary assigns sequence numbers and timestamps, then replicates. This is the simplest approach and matches the current topology. The tradeoff is that the sequencer is a single point of failure — but promotion is fast since replicas are already running full pipelines.
+The primary assigns sequence numbers (in the journal stage, in disruptor cursor order) and ingress timestamps, then replicates. This is the simplest approach and matches the current topology. The tradeoff is that the primary is a single point of failure — but promotion is fast since replicas are already running full pipelines.
 
 Consensus (Raft/Paxos) can be layered on later if customers demand automated leader election. The input replication infrastructure is a prerequisite for consensus regardless.
 
-### Timestamps assigned at sequencing time
+### Timestamps assigned at ingress
 
-Wall-clock time is the primary source of non-determinism. The sequencer stamps each input command with a canonical timestamp before replication. All nodes use this timestamp, never their local clock, for any time-dependent logic (order expiry, throttling, etc.).
+Wall-clock time is the primary source of non-determinism. The primary stamps each input command with a canonical timestamp at ingress (the reader / DPDK poll thread) before publishing into the input ring. That timestamp is journaled and shipped to replicas; all nodes use this timestamp, never their local clock, for any time-dependent logic (order expiry, throttling, etc.).
 
 ### Journals are no longer byte-identical
 
