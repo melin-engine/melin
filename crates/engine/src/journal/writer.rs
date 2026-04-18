@@ -94,6 +94,14 @@ pub struct JournalWriter {
     /// form a tamper-evident chain.
     #[cfg(feature = "hash-chain")]
     hash_chain: Option<HashChain>,
+    /// Highest sequence ever passed through `encode_event` or
+    /// `emit_checkpoint`. Debug-only monotonicity guard: every fresh seq
+    /// must strictly exceed this, otherwise we're about to emit a
+    /// duplicate — which would surface as a `SequenceGap` at the reader
+    /// side. Zero means "nothing encoded yet." Excluded from release
+    /// builds to keep the hot path cost at exactly zero.
+    #[cfg(debug_assertions)]
+    last_encoded_seq: u64,
 }
 
 /// Running BLAKE3 hash chain state for tamper evidence.
@@ -255,6 +263,8 @@ impl JournalWriter {
             allocated_end,
             #[cfg(feature = "hash-chain")]
             hash_chain: None,
+            #[cfg(debug_assertions)]
+            last_encoded_seq: 0,
         })
     }
 
@@ -324,6 +334,8 @@ impl JournalWriter {
                 batch_hasher: blake3::Hasher::new(),
                 events_since_checkpoint: 0,
             }),
+            #[cfg(debug_assertions)]
+            last_encoded_seq: last_seq,
         };
 
         // When resuming mid-segment (events since last checkpoint > 0),
@@ -434,6 +446,17 @@ impl JournalWriter {
         key_hash: u64,
         request_seq: u64,
     ) -> Result<(), JournalError> {
+        #[cfg(debug_assertions)]
+        {
+            debug_assert!(
+                seq > self.last_encoded_seq,
+                "encode_event: seq {seq} <= last_encoded_seq {} — \
+                 this would emit a duplicate/backward sequence",
+                self.last_encoded_seq
+            );
+            self.last_encoded_seq = seq;
+        }
+
         let written = codec::encode(
             seq,
             timestamp_ns,
@@ -490,6 +513,16 @@ impl JournalWriter {
             events_since_checkpoint,
         };
         let seq = self.next_sequence;
+        #[cfg(debug_assertions)]
+        {
+            debug_assert!(
+                seq > self.last_encoded_seq,
+                "emit_checkpoint: seq {seq} <= last_encoded_seq {} — \
+                 auto-emit would duplicate/clash with a prior sequence",
+                self.last_encoded_seq
+            );
+            self.last_encoded_seq = seq;
+        }
         let ts = wall_clock_nanos();
         let written = codec::encode(seq, ts, 0, 0, &checkpoint, &mut self.buffer)?;
 
@@ -612,6 +645,16 @@ impl JournalWriter {
     /// with the primary's pre-assigned sequences. This ensures that
     /// auto-emitted checkpoint entries get the correct sequence numbers.
     pub fn set_next_sequence(&mut self, seq: u64) {
+        // Debug-only: catch the footgun where a pre-assigned slot
+        // sequence would walk the writer's counter backward. This is
+        // the only path that can introduce a duplicate seq, so it's
+        // the most load-bearing of the three monotonicity guards.
+        debug_assert!(
+            seq >= self.next_sequence,
+            "set_next_sequence({seq}) moves counter backward from {} — \
+             the next allocation/auto-emit would duplicate a prior seq",
+            self.next_sequence
+        );
         self.next_sequence = seq;
     }
 
