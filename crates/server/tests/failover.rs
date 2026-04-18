@@ -868,6 +868,131 @@ fn journals_contiguous_across_checkpoint_boundary() {
     );
 }
 
+/// Same invariant as above (`journals_contiguous_across_checkpoint_boundary`),
+/// but drives load through the real `melin-bench` binary instead of a
+/// synchronous in-test client. This matches the LAN bench's publisher
+/// shape: multiple concurrent clients, deep in-flight window, real
+/// io_uring on both sides. If the checkpoint-boundary duplicate is
+/// timing-sensitive to concurrency (and the single-client test above
+/// can't trigger it), this is the version that should.
+#[test]
+#[serial]
+fn bench_binary_journals_contiguous_across_checkpoint_boundary() {
+    use melin_engine::journal::JournalReader;
+
+    // Locate (or build) the `melin-bench` binary using the same target
+    // profile Cargo picked for `melin-server` — `CARGO_BIN_EXE_melin-server`
+    // gives us the profile directory to infer from.
+    let server_bin_path = PathBuf::from(env!("CARGO_BIN_EXE_melin-server"));
+    let profile_dir = server_bin_path
+        .parent()
+        .and_then(|p| p.file_name())
+        .and_then(|s| s.to_str())
+        .expect("server binary path has profile component");
+    let target_dir = server_bin_path
+        .parent()
+        .and_then(|p| p.parent())
+        .expect("server binary path has target dir");
+    let bench_bin = target_dir.join(profile_dir).join("melin-bench");
+
+    let mut build = Command::new(env!("CARGO"));
+    build.args(["build", "-p", "melin-bench"]);
+    if profile_dir == "release" {
+        build.arg("--release");
+    }
+    let build_status = build.status().expect("spawn cargo build melin-bench");
+    assert!(
+        build_status.success(),
+        "cargo build melin-bench failed (status {build_status})"
+    );
+    assert!(
+        bench_bin.exists(),
+        "melin-bench binary missing at {}",
+        bench_bin.display()
+    );
+
+    let cluster = TestCluster::start();
+
+    // The bench needs the trader key on disk (32 raw Ed25519 bytes).
+    let key_path = cluster._tmp.path().join("bench.key");
+    std::fs::write(&key_path, cluster.key.to_bytes()).expect("write bench key");
+
+    // Run the bench against the primary. Clients × window × 2 (pairs →
+    // individual orders) must comfortably cross CHECKPOINT_INTERVAL
+    // (10_000 on this branch). 4 clients × window 128, 15_000 pairs =
+    // 30_000 journaled orders — crosses three boundaries.
+    //
+    // --warmup 0: the default 100_000 warmup orders would dominate runtime.
+    // --accounts 10 / --instruments 2: match the server defaults used in
+    // `spawn_primary` so the generator doesn't send orders for symbols
+    // the server never created.
+    let bench_status = Command::new(&bench_bin)
+        .args([
+            "--mode=roundtrip",
+            "--addr",
+            &cluster.primary.client_addr.to_string(),
+            "--health-addr",
+            &cluster.primary.health_addr.to_string(),
+            "--key",
+            key_path.to_str().expect("key path utf-8"),
+            "--clients",
+            "4",
+            "--window",
+            "128",
+            "--warmup",
+            "0",
+            "--accounts",
+            "10",
+            "--instruments",
+            "2",
+            "15000",
+        ])
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .status()
+        .expect("spawn melin-bench");
+    assert!(
+        bench_status.success(),
+        "melin-bench exited with {bench_status}"
+    );
+
+    cluster.wait_replicated();
+    // Extra slack for the journal stages to finalize their current batch.
+    std::thread::sleep(Duration::from_millis(500));
+
+    let walk = |label: &str, path: &Path| -> u64 {
+        let mut reader = JournalReader::open(path)
+            .unwrap_or_else(|e| panic!("{label}: open {}: {e}", path.display()));
+        let mut count = 0u64;
+        loop {
+            match reader.next_entry() {
+                Ok(Some(_)) => count += 1,
+                Ok(None) => break,
+                Err(e) => panic!(
+                    "{label}: read error after {count} entries \
+                     (last_sequence = {:?}): {e}",
+                    reader.last_sequence()
+                ),
+            }
+        }
+        count
+    };
+
+    let primary_count = walk("primary", &cluster._tmp.path().join("primary.journal"));
+    let replica_count = walk("replica", &cluster._tmp.path().join("replica.journal"));
+
+    // Lower bound: 30_000 orders from the bench. The server may add
+    // internal events (ticks, seed) — so use >= rather than equality.
+    assert!(
+        primary_count >= 30_000,
+        "primary journal only has {primary_count} entries"
+    );
+    assert!(
+        replica_count >= 30_000,
+        "replica journal only has {replica_count} entries"
+    );
+}
+
 /// Reconnect with the SAME key after failover and retry the last request.
 /// The per-key request sequence HWM must reject it as DuplicateRequest
 /// (not re-execute it). This tests that the per-key dedup state survives
