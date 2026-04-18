@@ -488,15 +488,14 @@ impl RawJournalScanner {
     }
 
     /// Read raw entry bytes into `out`, up to `max_bytes` total.
-    /// Returns `Some((entry_count, end_sequence))` with the number of
-    /// entries and the last sequence in the batch. Returns `None` at EOF
-    /// or when no complete entry fits within `max_bytes`.
+    /// Returns the last sequence in the batch, or `None` at EOF or when
+    /// no complete entry fits within `max_bytes`.
     pub fn read_raw_batch(
         &mut self,
         out: &mut Vec<u8>,
         max_bytes: usize,
-    ) -> Result<Option<(u32, u64)>, JournalError> {
-        let mut count = 0u32;
+    ) -> Result<Option<u64>, JournalError> {
+        let mut any = false;
         let mut end_seq = 0u64;
         let batch_start = out.len();
 
@@ -514,7 +513,7 @@ impl RawJournalScanner {
             let total = ENTRY_HEADER_SIZE + payload_len + CRC_SIZE;
 
             // Don't exceed max_bytes (but always include at least one entry).
-            if count > 0 && (out.len() - batch_start) + total > max_bytes {
+            if any && (out.len() - batch_start) + total > max_bytes {
                 break;
             }
 
@@ -526,14 +525,10 @@ impl RawJournalScanner {
             end_seq = le::get_u64(&self.buf[self.pos + 4..]);
             out.extend_from_slice(&self.buf[self.pos..self.pos + total]);
             self.pos += total;
-            count += 1;
+            any = true;
         }
 
-        if count == 0 {
-            Ok(None)
-        } else {
-            Ok(Some((count, end_seq)))
-        }
+        if any { Ok(Some(end_seq)) } else { Ok(None) }
     }
 
     /// Ensure at least `needed` bytes are available in the buffer.

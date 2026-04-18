@@ -559,8 +559,6 @@ impl JournalStage {
                                     &self.repl.active,
                                     bytes,
                                     end_seq,
-                                    [0u8; 32],
-                                    pending as u32,
                                 );
                             }
                         }
@@ -612,8 +610,6 @@ impl JournalStage {
         active_flags: &[Arc<AtomicBool>; 2],
         bytes: &[u8],
         end_seq: u64,
-        chain_hash: [u8; 32],
-        entry_count: u32,
     ) {
         for i in 0..2 {
             if let Some(ref mut producer) = producers[i] {
@@ -623,10 +619,7 @@ impl JournalStage {
                 if evict_flags[i].load(Ordering::Relaxed) {
                     continue;
                 }
-                if producer
-                    .try_publish(bytes, end_seq, chain_hash, entry_count)
-                    .is_err()
-                {
+                if producer.try_publish(bytes, end_seq).is_err() {
                     // Ring full — evict immediately. A skipped batch creates
                     // a sequence gap in the replica's journal that can only
                     // be repaired by reconnection + catch-up from journal
@@ -736,15 +729,12 @@ impl JournalStage {
                     let bytes = self.writer.pending_batch_bytes();
                     if !bytes.is_empty() {
                         let end_seq = self.writer.next_sequence() - 1;
-                        let chain = self.writer.chain_hash().unwrap_or([0u8; 32]);
                         Self::publish_to_replication_rings(
                             &mut self.repl.producers,
                             &self.repl.evict,
                             &self.repl.active,
                             bytes,
                             end_seq,
-                            chain,
-                            count as u32,
                         );
                     }
                 }
@@ -990,15 +980,12 @@ impl JournalStage {
                         let bytes = self.writer.pending_batch_bytes();
                         if !bytes.is_empty() {
                             let end_seq = self.writer.next_sequence() - 1;
-                            let chain = self.writer.chain_hash().unwrap_or([0u8; 32]);
                             Self::publish_to_replication_rings(
                                 &mut self.repl.producers,
                                 &self.repl.evict,
                                 &self.repl.active,
                                 bytes,
                                 end_seq,
-                                chain,
-                                pending as u32,
                             );
                         }
                     }
@@ -2530,11 +2517,6 @@ mod tests {
             "replication batch should have events"
         );
         assert!(!repl_data.is_empty(), "replication batch should have data");
-        #[cfg(feature = "hash-chain")]
-        assert_ne!(
-            repl_meta.chain_hash, [0u8; 32],
-            "chain hash should be initialized"
-        );
 
         // Verify the replication batch contains valid journal entries with
         // the same sequence numbers as the on-disk journal.

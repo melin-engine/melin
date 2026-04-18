@@ -536,13 +536,7 @@ fn handle_replica_connection(
             if meta.end_sequence > catchup_end {
                 // This batch has new data beyond catch-up. Send it now
                 // and commit so the live loop starts clean.
-                encode_data_batch(
-                    meta.end_sequence,
-                    &meta.chain_hash,
-                    meta.entry_count,
-                    _data,
-                    &mut send_buf,
-                );
+                encode_data_batch(meta.end_sequence, _data, &mut send_buf);
                 repl_consumer.commit();
                 writer.write_all(&send_buf)?;
                 writer.flush()?;
@@ -583,7 +577,6 @@ fn handle_replica_connection(
     let heartbeat_interval = std::time::Duration::from_secs(heartbeat_secs);
     let mut last_send = std::time::Instant::now();
     let mut last_sequence = handshake.last_sequence;
-    let mut last_chain_hash = handshake.chain_hash;
 
     live_stream_uring(
         writer,
@@ -593,7 +586,6 @@ fn handle_replica_connection(
         &mut send_buf,
         &mut last_send,
         &mut last_sequence,
-        &mut last_chain_hash,
     )
 }
 
@@ -611,7 +603,6 @@ fn live_stream_uring(
     send_buf: &mut Vec<u8>,
     last_send: &mut std::time::Instant,
     last_sequence: &mut u64,
-    last_chain_hash: &mut [u8; 32],
 ) -> io::Result<()> {
     let SlotContext {
         replication_cursor,
@@ -696,16 +687,9 @@ fn live_stream_uring(
             let mut coalesced = 0;
             while coalesced < batch_size {
                 if let Some((meta, data)) = repl_consumer.try_read() {
-                    encode_data_batch(
-                        meta.end_sequence,
-                        &meta.chain_hash,
-                        meta.entry_count,
-                        data,
-                        send_buf,
-                    );
+                    encode_data_batch(meta.end_sequence, data, send_buf);
                     repl_consumer.commit();
                     *last_sequence = meta.end_sequence;
-                    *last_chain_hash = meta.chain_hash;
                     coalesced += 1;
                 } else {
                     break;
@@ -725,7 +709,7 @@ fn live_stream_uring(
                 idle_spins = 0;
             } else if last_send.elapsed() >= heartbeat_interval {
                 // No data — send heartbeat if idle.
-                encode_heartbeat(*last_sequence, last_chain_hash, send_buf);
+                encode_heartbeat(*last_sequence, send_buf);
                 let sqe =
                     opcode::Send::new(types::Fixed(0), send_buf.as_ptr(), send_buf.len() as u32)
                         .build()

@@ -67,6 +67,11 @@ fn compact_recv_buf(buf: &mut Vec<u8>, consumed: usize) {
 ///
 /// The protocol is identical to `run_sender` — same wire format, same
 /// handshake, same streaming logic. Only the I/O primitives differ.
+///
+/// Top-level thread entry point — the wide arg list mirrors what the
+/// shared replication state owns and would re-export through any wrapper
+/// struct, so a config struct adds indirection without simplifying.
+#[allow(clippy::too_many_arguments)]
 pub fn run_sender_dpdk(
     mut transport: melin_dpdk::DpdkTransport,
     repl_consumers: [ReplicationConsumer; 2],
@@ -106,7 +111,6 @@ pub fn run_sender_dpdk(
         send_buf: Vec<u8>,
         last_send: std::time::Instant,
         last_sequence: u64,
-        last_chain_hash: [u8; 32],
         /// Per-slot acked cursor. `u64::MAX` when not streaming —
         /// doesn't block the replication cursor (min of both slots).
         acked_cursor: u64,
@@ -126,7 +130,6 @@ pub fn run_sender_dpdk(
             send_buf: Vec::with_capacity(512 * 1024),
             last_send: now,
             last_sequence: 0,
-            last_chain_hash: [0u8; 32],
             acked_cursor: u64::MAX,
         },
         DpdkReplicaSlot {
@@ -138,7 +141,6 @@ pub fn run_sender_dpdk(
             send_buf: Vec::with_capacity(512 * 1024),
             last_send: now,
             last_sequence: 0,
-            last_chain_hash: [0u8; 32],
             acked_cursor: u64::MAX,
         },
     ];
@@ -341,7 +343,6 @@ pub fn run_sender_dpdk(
                                     // Set cursor to this replica's acked position.
                                     slot.acked_cursor = h.last_sequence + 1;
                                     slot.last_sequence = h.last_sequence;
-                                    slot.last_chain_hash = h.chain_hash;
                                     slot.last_send = std::time::Instant::now();
 
                                     // Drain overlapping ring entries from catch-up.
@@ -353,8 +354,6 @@ pub fn run_sender_dpdk(
                                             slot.send_buf.clear();
                                             encode_data_batch(
                                                 meta.end_sequence,
-                                                &meta.chain_hash,
-                                                meta.entry_count,
                                                 _data,
                                                 &mut slot.send_buf,
                                             );
@@ -362,7 +361,6 @@ pub fn run_sender_dpdk(
                                             transport.queue_send(handle, &slot.send_buf);
                                             slot.send_buf.clear();
                                             slot.last_sequence = meta.end_sequence;
-                                            slot.last_chain_hash = meta.chain_hash;
                                             break;
                                         }
                                         slot.consumer.commit();
@@ -484,31 +482,17 @@ pub fn run_sender_dpdk(
                     slot.send_buf.clear();
                     let mut batches_sent = 0;
                     if let Some((meta, data)) = slot.consumer.try_read() {
-                        encode_data_batch(
-                            meta.end_sequence,
-                            &meta.chain_hash,
-                            meta.entry_count,
-                            data,
-                            &mut slot.send_buf,
-                        );
+                        encode_data_batch(meta.end_sequence, data, &mut slot.send_buf);
                         slot.consumer.commit();
                         slot.last_sequence = meta.end_sequence;
-                        slot.last_chain_hash = meta.chain_hash;
                         batches_sent += 1;
 
                         // Coalesce more batches.
                         for _ in 1..batch_size {
                             if let Some((meta, data)) = slot.consumer.try_read() {
-                                encode_data_batch(
-                                    meta.end_sequence,
-                                    &meta.chain_hash,
-                                    meta.entry_count,
-                                    data,
-                                    &mut slot.send_buf,
-                                );
+                                encode_data_batch(meta.end_sequence, data, &mut slot.send_buf);
                                 slot.consumer.commit();
                                 slot.last_sequence = meta.end_sequence;
-                                slot.last_chain_hash = meta.chain_hash;
                                 batches_sent += 1;
                             } else {
                                 break;
@@ -524,11 +508,7 @@ pub fn run_sender_dpdk(
                     // 3. Heartbeat if idle.
                     if batches_sent == 0 && slot.last_send.elapsed() >= heartbeat_interval {
                         slot.send_buf.clear();
-                        encode_heartbeat(
-                            slot.last_sequence,
-                            &slot.last_chain_hash,
-                            &mut slot.send_buf,
-                        );
+                        encode_heartbeat(slot.last_sequence, &mut slot.send_buf);
                         transport.queue_send(handle, &slot.send_buf);
                         slot.last_send = std::time::Instant::now();
                     }
@@ -644,12 +624,12 @@ fn catch_up_from_journal_dpdk(
                 .read_raw_batch(&mut batch_buf, 64 * 1024)
                 .map_err(|e| io::Error::other(format!("read {}: {e}", path.display())))?;
 
-            let Some((entry_count, batch_end_seq)) = batch else {
+            let Some(batch_end_seq) = batch else {
                 break;
             };
 
             send_buf.clear();
-            encode_data_batch(batch_end_seq, &[0u8; 32], entry_count, &batch_buf, send_buf);
+            encode_data_batch(batch_end_seq, &batch_buf, send_buf);
             transport.queue_send(handle, send_buf);
             // Flush TX periodically to keep smoltcp and the NIC flowing.
             transport.poll();
@@ -1118,7 +1098,6 @@ pub fn run_receiver_dpdk(
         let mut received_data = false;
         let mut journal_accum: Vec<u8> = Vec::with_capacity(128 * 1024);
         let mut accum_end_sequence: u64 = 0;
-        let mut accum_chain_hash: [u8; 32] = [0u8; 32];
 
         // Encode an ack into send_buf and queue it on the DPDK transport.
         macro_rules! send_ack_dpdk {
@@ -1170,16 +1149,11 @@ pub fn run_receiver_dpdk(
                                 // Fast path: borrowed decoder avoids the Vec
                                 // allocation on steady-state DataBatch frames.
                                 // Mirrors the io_uring receiver path.
-                                if let Some((
-                                    end_sequence,
-                                    batch_chain_hash,
-                                    _entry_count,
-                                    journal_bytes,
-                                )) = try_decode_data_batch(&remaining[ps..fe])
+                                if let Some((end_sequence, journal_bytes)) =
+                                    try_decode_data_batch(&remaining[ps..fe])
                                 {
                                     journal_accum.extend_from_slice(journal_bytes);
                                     accum_end_sequence = end_sequence;
-                                    accum_chain_hash = batch_chain_hash;
                                 }
                                 consumed += fe;
                             }
@@ -1246,20 +1220,15 @@ pub fn run_receiver_dpdk(
                         // Fast path: borrowed DataBatch decoder avoids the
                         // per-batch Vec allocation that used to dominate the
                         // DPDK replica's CPU profile under load.
-                        if let Some((end_sequence, batch_chain_hash, _entry_count, journal_bytes)) =
-                            try_decode_data_batch(payload)
+                        if let Some((end_sequence, journal_bytes)) = try_decode_data_batch(payload)
                         {
                             journal_accum.extend_from_slice(journal_bytes);
                             accum_end_sequence = end_sequence;
-                            accum_chain_hash = batch_chain_hash;
                             got_data = true;
                             received_data = true;
                         } else {
                             match decode_primary_message(payload) {
-                                Ok(PrimaryMessage::Heartbeat {
-                                    sequence,
-                                    chain_hash: _,
-                                }) => {
+                                Ok(PrimaryMessage::Heartbeat { sequence }) => {
                                     debug!(sequence, "heartbeat from primary (DPDK)");
                                 }
                                 Ok(PrimaryMessage::DataBatch { .. }) => {

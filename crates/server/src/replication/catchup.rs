@@ -164,19 +164,12 @@ pub(super) fn catch_up_from_journal(
                 .read_raw_batch(&mut batch_buf, 64 * 1024)
                 .map_err(|e| io::Error::other(format!("read {}: {e}", path.display())))?;
 
-            let Some((entry_count, batch_end_seq)) = batch else {
+            let Some(batch_end_seq) = batch else {
                 break; // EOF on this file.
             };
 
             // Encode and send DataBatch frame.
-            // Chain hash is zeroed — chain verification is a documented v1 limitation.
-            encode_data_batch(
-                batch_end_seq,
-                &[0u8; 32],
-                entry_count,
-                &batch_buf,
-                &mut send_buf,
-            );
+            encode_data_batch(batch_end_seq, &batch_buf, &mut send_buf);
             writer
                 .write_all(&send_buf)
                 .map_err(|e| io::Error::other(format!("write catch-up batch: {e}")))?;

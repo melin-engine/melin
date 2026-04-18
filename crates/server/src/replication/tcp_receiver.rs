@@ -83,7 +83,6 @@ fn replica_stream_uring(
     received_data: &mut bool,
     journal_accum: &mut Vec<u8>,
     accum_end_sequence: &mut u64,
-    accum_chain_hash: &mut [u8; 32],
     shutdown: &AtomicBool,
     promote: &AtomicBool,
     async_ack: bool,
@@ -219,12 +218,9 @@ fn replica_stream_uring(
                 // only matters if there's a large pre-promotion backlog
                 // in parse_buf. Consistency with the main loop keeps
                 // the two code paths in sync.
-                if let Some((end_sequence, batch_chain_hash, _entry_count, journal_bytes)) =
-                    try_decode_data_batch(payload)
-                {
+                if let Some((end_sequence, journal_bytes)) = try_decode_data_batch(payload) {
                     journal_accum.extend_from_slice(journal_bytes);
                     *accum_end_sequence = end_sequence;
-                    *accum_chain_hash = batch_chain_hash;
                 }
                 cursor += 4 + frame_len;
             }
@@ -516,20 +512,18 @@ fn replica_stream_uring(
                         // borrowed directly from `parse_buf`, avoiding the
                         // ~40 KB Vec allocation that the general decoder
                         // would perform on every batch.
-                        if let Some((end_sequence, batch_chain_hash, _entry_count, journal_bytes)) =
-                            try_decode_data_batch(payload)
+                        if let Some((end_sequence, journal_bytes)) = try_decode_data_batch(payload)
                         {
                             *received_data = true;
                             journal_accum.extend_from_slice(journal_bytes);
                             *accum_end_sequence = end_sequence;
-                            *accum_chain_hash = batch_chain_hash;
                         } else {
                             // Control messages (heartbeat, need-snapshot,
                             // hash-mismatch) fall through to the general
                             // decoder. Rare compared to DataBatch, so the
                             // allocation cost here is irrelevant.
                             match decode_primary_message(payload) {
-                                Ok(PrimaryMessage::Heartbeat { sequence, .. }) => {
+                                Ok(PrimaryMessage::Heartbeat { sequence }) => {
                                     debug!(sequence, "heartbeat from primary");
                                 }
                                 Ok(PrimaryMessage::NeedSnapshot) => {
@@ -727,7 +721,6 @@ pub fn run_receiver(
     let mut send_buf = Vec::with_capacity(64);
     let mut journal_accum: Vec<u8> = Vec::with_capacity(128 * 1024);
     let mut accum_end_sequence: u64 = 0;
-    let mut accum_chain_hash: [u8; 32] = [0u8; 32];
 
     // --- Outer reconnect loop ---
     //
@@ -1097,7 +1090,6 @@ pub fn run_receiver(
             &mut received_data,
             &mut journal_accum,
             &mut accum_end_sequence,
-            &mut accum_chain_hash,
             shutdown,
             promote,
             async_ack,

@@ -125,8 +125,8 @@ Length-prefixed frames, little-endian. Runs over a dedicated TCP connection sepa
 | SnapshotChunk | `[len:u32][type=0x14][data...]` | Chunk of snapshot data (up to 64 KiB) |
 | SnapshotEnd | `[len:u32][type=0x15][crc32c:u32]` | End of snapshot transfer with CRC32C for integrity |
 | HashMismatch | `[len:u32][type=0x12]` | Chain hash doesn't match at the replica's reported sequence (not yet validated) |
-| DataBatch | `[len:u32][type=0x20][end_sequence:u64][chain_hash:[u8;32]][journal_bytes...]` | Batch of encoded journal entries with trailing chain hash |
-| Heartbeat | `[len:u32][type=0x30][sequence:u64][chain_hash:[u8;32]]` | Periodic idle keepalive (5-second interval) with current state |
+| DataBatch | `[len:u32][type=0x20][end_sequence:u64][journal_bytes...]` | Batch of encoded journal entries; divergence is verified at Checkpoint events inside the entry stream |
+| Heartbeat | `[len:u32][type=0x30][sequence:u64]` | Periodic idle keepalive (5-second interval) advertising the primary's last published sequence |
 
 ### Design rationale
 
@@ -256,16 +256,6 @@ These are known limitations of the current implementation. Each is documented he
 When a replica connects, the primary reads its journal archive files and streams historical entries as DataBatch frames before switching to live ring data. The `RawJournalScanner` reads entry boundaries without full decoding (no CRC validation, no event parsing) for efficient streaming. The replication ring is NOT consumed during catch-up — live data accumulates in the ring and overlapping entries are drained after catch-up completes.
 
 This works for both reconnecting replicas (`last_sequence > 0`, catches up the gap) and fresh replicas (`last_sequence = 0`, streams the entire journal history). No operator intervention required — a new replica can join a running primary at any time.
-
-### No chain hash verification on received DataBatch
-
-**What**: The `chain_hash` field in DataBatch frames is populated by the primary but **not verified** by the replica. The replica decodes entries and checks individual CRC32C checksums but does not verify that the batch-level chain hash matches.
-
-**Impact**: Corruption that preserves individual entry CRCs but reorders or drops entries within a batch would go undetected. In practice, TCP ordering guarantees make this extremely unlikely.
-
-**Why deferred**: Verifying the chain hash requires the replica to maintain its own running hash state and compare after each batch. The journal's per-entry CRC32C provides entry-level integrity, and TCP provides ordering. Adding chain verification is a defense-in-depth measure, not a correctness requirement for the common case.
-
-**Resolution**: After decoding all entries in a DataBatch, compute the BLAKE3 chain hash over the raw bytes and compare against `batch_chain_hash`. Reject the batch and disconnect on mismatch.
 
 ### No handshake chain hash validation
 

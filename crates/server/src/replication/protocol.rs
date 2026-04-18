@@ -31,7 +31,7 @@ pub(super) const MSG_HEARTBEAT: u8 = 0x30;
 pub(super) const MAX_CONTROL_FRAME: usize = 256;
 
 /// Maximum data batch frame size. Must be >= CHUNK_SIZE (512 KiB) in the
-/// replication ring, plus header overhead (45 bytes). Ring batches can use
+/// replication ring, plus header overhead (9 bytes). Ring batches can use
 /// the full 512 KiB chunk, so the frame limit must accommodate that.
 pub(super) const MAX_DATA_FRAME: usize = 768 * 1024;
 
@@ -78,13 +78,10 @@ pub enum PrimaryMessage {
     },
     DataBatch {
         end_sequence: u64,
-        chain_hash: [u8; 32],
-        entry_count: u32,
         journal_bytes: Vec<u8>,
     },
     Heartbeat {
         sequence: u64,
-        chain_hash: [u8; 32],
     },
 }
 
@@ -219,30 +216,28 @@ pub(super) fn encode_hash_mismatch(buf: &mut Vec<u8>) {
 }
 
 /// Encode a DataBatch message.
-pub(super) fn encode_data_batch(
-    end_sequence: u64,
-    chain_hash: &[u8; 32],
-    entry_count: u32,
-    journal_bytes: &[u8],
-    buf: &mut Vec<u8>,
-) {
-    // type(1) + end_sequence(8) + chain_hash(32) + entry_count(4) + journal_bytes
-    let payload_len: u32 = (1 + 8 + 32 + 4 + journal_bytes.len()) as u32;
+///
+/// Carries only the end sequence and the encoded journal bytes. Per-batch
+/// chain hashes are not transmitted: with input replication each replica
+/// re-encodes its own journal, so the primary's per-batch hash would not
+/// match the replica's. Divergence detection runs inside the replica's
+/// JournalStage at Checkpoint events instead.
+pub(super) fn encode_data_batch(end_sequence: u64, journal_bytes: &[u8], buf: &mut Vec<u8>) {
+    // type(1) + end_sequence(8) + journal_bytes
+    let payload_len: u32 = (1 + 8 + journal_bytes.len()) as u32;
     buf.extend_from_slice(&payload_len.to_le_bytes());
     buf.push(MSG_DATA_BATCH);
     buf.extend_from_slice(&end_sequence.to_le_bytes());
-    buf.extend_from_slice(chain_hash);
-    buf.extend_from_slice(&entry_count.to_le_bytes());
     buf.extend_from_slice(journal_bytes);
 }
 
-/// Encode a Heartbeat message.
-pub(super) fn encode_heartbeat(sequence: u64, chain_hash: &[u8; 32], buf: &mut Vec<u8>) {
-    let payload_len: u32 = 1 + 8 + 32;
+/// Encode a Heartbeat message. Carries only the last-acked sequence;
+/// the chain hash is verified at Checkpoint events, not on every heartbeat.
+pub(super) fn encode_heartbeat(sequence: u64, buf: &mut Vec<u8>) {
+    let payload_len: u32 = 1 + 8;
     buf.extend_from_slice(&payload_len.to_le_bytes());
     buf.push(MSG_HEARTBEAT);
     buf.extend_from_slice(&sequence.to_le_bytes());
-    buf.extend_from_slice(chain_hash);
 }
 
 // --- Decoders / framing ---
@@ -357,21 +352,15 @@ pub(super) fn decode_replica_message(payload: &[u8]) -> io::Result<ReplicaMessag
 ///   fixed header — indistinguishable from the non-data case here, so the
 ///   caller's general-decoder fallback will surface the truncation as a
 ///   protocol error.
-pub(super) fn try_decode_data_batch(payload: &[u8]) -> Option<(u64, [u8; 32], u32, &[u8])> {
-    // Layout: type(1) + end_sequence(8) + chain_hash(32) + entry_count(4) + journal_bytes
-    const HEADER: usize = 1 + 8 + 32 + 4;
+pub(super) fn try_decode_data_batch(payload: &[u8]) -> Option<(u64, &[u8])> {
+    // Layout: type(1) + end_sequence(8) + journal_bytes
+    const HEADER: usize = 1 + 8;
     if payload.len() < HEADER || payload[0] != MSG_DATA_BATCH {
         return None;
     }
     let end_sequence = u64::from_le_bytes(payload[1..9].try_into().ok()?);
-    // Fixed-size array copy — explicit so the borrow checker can reason
-    // about `chain_hash` independently from the returned `journal_bytes`
-    // slice, which still borrows from `payload`.
-    let mut chain_hash = [0u8; 32];
-    chain_hash.copy_from_slice(&payload[9..41]);
-    let entry_count = u32::from_le_bytes(payload[41..45].try_into().ok()?);
     let journal_bytes = &payload[HEADER..];
-    Some((end_sequence, chain_hash, entry_count, journal_bytes))
+    Some((end_sequence, journal_bytes))
 }
 
 /// Decode a primary message from a frame payload.
@@ -423,32 +412,22 @@ pub(super) fn decode_primary_message(payload: &[u8]) -> io::Result<PrimaryMessag
             Ok(PrimaryMessage::SnapshotEnd { crc32c })
         }
         MSG_DATA_BATCH => {
-            if payload.len() < 1 + 8 + 32 + 4 {
+            if payload.len() < 1 + 8 {
                 return Err(io::Error::other("DataBatch too short"));
             }
             let end_sequence = u64::from_le_bytes(payload[1..9].try_into().unwrap());
-            let mut chain_hash = [0u8; 32];
-            chain_hash.copy_from_slice(&payload[9..41]);
-            let entry_count = u32::from_le_bytes(payload[41..45].try_into().unwrap());
-            let journal_bytes = payload[45..].to_vec();
+            let journal_bytes = payload[9..].to_vec();
             Ok(PrimaryMessage::DataBatch {
                 end_sequence,
-                chain_hash,
-                entry_count,
                 journal_bytes,
             })
         }
         MSG_HEARTBEAT => {
-            if payload.len() < 1 + 8 + 32 {
+            if payload.len() < 1 + 8 {
                 return Err(io::Error::other("Heartbeat too short"));
             }
             let sequence = u64::from_le_bytes(payload[1..9].try_into().unwrap());
-            let mut chain_hash = [0u8; 32];
-            chain_hash.copy_from_slice(&payload[9..41]);
-            Ok(PrimaryMessage::Heartbeat {
-                sequence,
-                chain_hash,
-            })
+            Ok(PrimaryMessage::Heartbeat { sequence })
         }
         other => Err(io::Error::other(format!(
             "unknown primary message type: 0x{other:02x}"

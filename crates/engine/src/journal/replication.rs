@@ -33,12 +33,8 @@ pub const REPLICATION_RING_CAPACITY: usize = 1 << 8;
 pub struct ReplicationMeta {
     /// Number of valid bytes in the corresponding buffer chunk.
     pub len: u32,
-    /// Number of journal entries in this batch.
-    pub entry_count: u32,
     /// Sequence number of the last journal entry in this batch.
     pub end_sequence: u64,
-    /// BLAKE3 chain hash after all entries in this batch.
-    pub chain_hash: [u8; 32],
 }
 
 /// Shared pre-allocated byte buffers, one per ring slot.
@@ -83,13 +79,7 @@ impl ReplicationProducer {
     ///
     /// # Panics
     /// Panics if `data.len() > CHUNK_SIZE` (128 KiB).
-    pub fn publish(
-        &mut self,
-        data: &[u8],
-        end_sequence: u64,
-        chain_hash: [u8; 32],
-        entry_count: u32,
-    ) {
+    pub fn publish(&mut self, data: &[u8], end_sequence: u64) {
         assert!(
             data.len() <= CHUNK_SIZE,
             "replication batch too large: {} > {CHUNK_SIZE}",
@@ -138,9 +128,7 @@ impl ReplicationProducer {
                         seq,
                         ReplicationMeta {
                             len: data.len() as u32,
-                            entry_count,
                             end_sequence,
-                            chain_hash,
                         },
                     );
                     return;
@@ -156,8 +144,6 @@ impl ReplicationProducer {
         &mut self,
         data: &[u8],
         end_sequence: u64,
-        chain_hash: [u8; 32],
-        entry_count: u32,
     ) -> Result<(), BackpressureTimeout> {
         assert!(
             data.len() <= CHUNK_SIZE,
@@ -166,7 +152,7 @@ impl ReplicationProducer {
         );
         match self.inner.try_claim() {
             Ok(seq) => {
-                self.write_and_publish(seq, data, end_sequence, chain_hash, entry_count);
+                self.write_and_publish(seq, data, end_sequence);
                 Ok(())
             }
             Err(_) => Err(BackpressureTimeout),
@@ -182,8 +168,6 @@ impl ReplicationProducer {
         &mut self,
         data: &[u8],
         end_sequence: u64,
-        chain_hash: [u8; 32],
-        entry_count: u32,
         timeout: std::time::Duration,
     ) -> Result<(), BackpressureTimeout> {
         assert!(
@@ -194,7 +178,7 @@ impl ReplicationProducer {
 
         // Fast path: try once before touching the clock.
         if let Ok(seq) = self.inner.try_claim() {
-            self.write_and_publish(seq, data, end_sequence, chain_hash, entry_count);
+            self.write_and_publish(seq, data, end_sequence);
             return Ok(());
         }
 
@@ -203,7 +187,7 @@ impl ReplicationProducer {
         loop {
             match self.inner.try_claim() {
                 Ok(seq) => {
-                    self.write_and_publish(seq, data, end_sequence, chain_hash, entry_count);
+                    self.write_and_publish(seq, data, end_sequence);
                     return Ok(());
                 }
                 Err(_) => {
@@ -217,14 +201,7 @@ impl ReplicationProducer {
     }
 
     /// Write byte data and publish metadata for a claimed slot.
-    fn write_and_publish(
-        &mut self,
-        seq: u64,
-        data: &[u8],
-        end_sequence: u64,
-        chain_hash: [u8; 32],
-        entry_count: u32,
-    ) {
+    fn write_and_publish(&mut self, seq: u64, data: &[u8], end_sequence: u64) {
         let idx = (seq & self.buffers.mask) as usize;
         unsafe {
             let chunk = &mut *self.buffers.chunks[idx].get();
@@ -234,9 +211,7 @@ impl ReplicationProducer {
             seq,
             ReplicationMeta {
                 len: data.len() as u32,
-                entry_count,
                 end_sequence,
-                chain_hash,
             },
         );
     }
@@ -368,12 +343,10 @@ mod tests {
         let consumer = &mut consumers[0];
 
         let data = b"hello replication ring";
-        let chain = [0xAB; 32];
-        producer.publish(data, 42, chain, 1);
+        producer.publish(data, 42);
 
         let (meta, received) = consumer.try_read().unwrap();
         assert_eq!(meta.end_sequence, 42);
-        assert_eq!(meta.chain_hash, chain);
         assert_eq!(received, data);
         consumer.commit();
     }
@@ -385,7 +358,7 @@ mod tests {
 
         for i in 0..10u64 {
             let data = format!("batch {i}");
-            producer.publish(data.as_bytes(), i, [i as u8; 32], 1);
+            producer.publish(data.as_bytes(), i);
         }
 
         for i in 0..10u64 {
@@ -405,8 +378,8 @@ mod tests {
         let mut c1 = consumers.pop().unwrap();
         let mut c0 = consumers.pop().unwrap();
 
-        producer.publish(b"first", 1, [0; 32], 1);
-        producer.publish(b"second", 2, [0; 32], 1);
+        producer.publish(b"first", 1);
+        producer.publish(b"second", 2);
 
         // c0 reads both.
         let (m, d) = c0.try_read().unwrap();
@@ -436,7 +409,7 @@ mod tests {
         let consumer = &mut consumers[0];
 
         let data = vec![0xFFu8; CHUNK_SIZE];
-        producer.publish(&data, 99, [0x11; 32], 1);
+        producer.publish(&data, 99);
 
         let (meta, received) = consumer.try_read().unwrap();
         assert_eq!(meta.len as usize, CHUNK_SIZE);
@@ -453,7 +426,7 @@ mod tests {
 
         for i in 0..REPLICATION_RING_CAPACITY as u64 * 3 {
             let data = i.to_le_bytes();
-            producer.publish(&data, i, [0; 32], 1);
+            producer.publish(&data, i);
             let (meta, received) = consumer.try_read().unwrap();
             assert_eq!(meta.end_sequence, i);
             assert_eq!(received, &data);
@@ -487,7 +460,7 @@ mod tests {
         });
 
         for i in 0..count {
-            producer.publish(&i.to_le_bytes(), i, [0; 32], 1);
+            producer.publish(&i.to_le_bytes(), i);
         }
 
         let received = consumer_thread.join().unwrap();
@@ -502,13 +475,7 @@ mod tests {
         let (mut producer, mut consumers) = build_replication_ring(1, REPLICATION_RING_CAPACITY);
         let consumer = &mut consumers[0];
 
-        let result = producer.try_publish_timeout(
-            b"data",
-            1,
-            [0; 32],
-            1,
-            std::time::Duration::from_millis(10),
-        );
+        let result = producer.try_publish_timeout(b"data", 1, std::time::Duration::from_millis(10));
         assert!(result.is_ok());
 
         let (meta, data) = consumer.try_read().unwrap();
@@ -522,13 +489,12 @@ mod tests {
         // Capacity 2: fill both slots without consuming → ring is full.
         let (mut producer, _consumers) = build_replication_ring(1, 2);
 
-        producer.publish(b"a", 1, [0; 32], 1);
-        producer.publish(b"b", 2, [0; 32], 1);
+        producer.publish(b"a", 1);
+        producer.publish(b"b", 2);
 
         // Ring is full — timeout should fire quickly.
         let start = std::time::Instant::now();
-        let result =
-            producer.try_publish_timeout(b"c", 3, [0; 32], 1, std::time::Duration::from_millis(50));
+        let result = producer.try_publish_timeout(b"c", 3, std::time::Duration::from_millis(50));
         let elapsed = start.elapsed();
 
         assert!(result.is_err());

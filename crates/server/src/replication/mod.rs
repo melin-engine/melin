@@ -445,21 +445,17 @@ mod tests {
     #[test]
     fn data_batch_encode_decode_round_trip() {
         let journal_bytes = vec![1, 2, 3, 4, 5, 6, 7, 8];
-        let chain_hash = [0xCD; 32];
         let mut buf = Vec::new();
-        encode_data_batch(500, &chain_hash, 1, &journal_bytes, &mut buf);
+        encode_data_batch(500, &journal_bytes, &mut buf);
 
         let payload = &buf[4..];
         let msg = decode_primary_message(payload).unwrap();
         match msg {
             PrimaryMessage::DataBatch {
-                entry_count: _,
                 end_sequence,
-                chain_hash: h,
                 journal_bytes: data,
             } => {
                 assert_eq!(end_sequence, 500);
-                assert_eq!(h, chain_hash);
                 assert_eq!(data, journal_bytes);
             }
             _ => panic!("expected DataBatch"),
@@ -470,19 +466,14 @@ mod tests {
     fn try_decode_data_batch_fast_path_matches_general_decoder() {
         // The fast path is only correct if it returns the exact same
         // header fields as the general decoder and a slice whose contents
-        // equal the original journal bytes. Verify on a representative
-        // payload: non-trivial length, non-zero chain hash, non-zero
-        // entry count.
+        // equal the original journal bytes.
         let journal_bytes: Vec<u8> = (0..256u16).map(|i| (i & 0xFF) as u8).collect();
-        let chain_hash = [0x5Au8; 32];
         let mut buf = Vec::new();
-        encode_data_batch(4242, &chain_hash, 17, &journal_bytes, &mut buf);
+        encode_data_batch(4242, &journal_bytes, &mut buf);
         let payload = &buf[4..];
 
-        let (end_seq, hash, count, slice) = try_decode_data_batch(payload).expect("fast path");
+        let (end_seq, slice) = try_decode_data_batch(payload).expect("fast path");
         assert_eq!(end_seq, 4242);
-        assert_eq!(hash, chain_hash);
-        assert_eq!(count, 17);
         assert_eq!(slice, journal_bytes.as_slice());
         // The fast-path slice must borrow from `payload`, not own a copy.
         assert!(slice.as_ptr() >= payload.as_ptr());
@@ -494,7 +485,7 @@ mod tests {
         // Heartbeat frame: different type tag → fast path must return None
         // so the caller falls through to the general decoder.
         let mut buf = Vec::new();
-        encode_heartbeat(42, &[0; 32], &mut buf);
+        encode_heartbeat(42, &mut buf);
         assert!(try_decode_data_batch(&buf[4..]).is_none());
 
         // Ack frame: replica-to-primary, same check.
@@ -507,39 +498,33 @@ mod tests {
         // truncation as a protocol error (tested separately via the
         // general decoder).
         let mut short = vec![super::protocol::MSG_DATA_BATCH];
-        short.extend_from_slice(&[0u8; 10]); // Well short of 45-byte header.
+        short.extend_from_slice(&[0u8; 4]); // Well short of 9-byte header.
         assert!(try_decode_data_batch(&short).is_none());
     }
 
     #[test]
     fn try_decode_data_batch_empty_journal_bytes() {
-        // Minimum-size DataBatch: 45-byte header and zero-length journal
+        // Minimum-size DataBatch: 9-byte header and zero-length journal
         // bytes. Should decode cleanly and return an empty slice (not
         // error out).
         let mut buf = Vec::new();
-        encode_data_batch(1, &[0u8; 32], 0, &[], &mut buf);
+        encode_data_batch(1, &[], &mut buf);
         let payload = &buf[4..];
-        let (end_seq, _hash, count, slice) = try_decode_data_batch(payload).expect("empty-ok");
+        let (end_seq, slice) = try_decode_data_batch(payload).expect("empty-ok");
         assert_eq!(end_seq, 1);
-        assert_eq!(count, 0);
         assert!(slice.is_empty());
     }
 
     #[test]
     fn heartbeat_encode_decode_round_trip() {
-        let chain_hash = [0xEF; 32];
         let mut buf = Vec::new();
-        encode_heartbeat(123, &chain_hash, &mut buf);
+        encode_heartbeat(123, &mut buf);
 
         let payload = &buf[4..];
         let msg = decode_primary_message(payload).unwrap();
         match msg {
-            PrimaryMessage::Heartbeat {
-                sequence,
-                chain_hash: h,
-            } => {
+            PrimaryMessage::Heartbeat { sequence } => {
                 assert_eq!(sequence, 123);
-                assert_eq!(h, chain_hash);
             }
             _ => panic!("expected Heartbeat"),
         }
@@ -901,8 +886,7 @@ mod tests {
 
         // Send a DataBatch with some fake journal bytes.
         let journal_bytes = vec![0xDE, 0xAD, 0xBE, 0xEF];
-        let chain_hash = [0x11; 32];
-        encode_data_batch(42, &chain_hash, 1, &journal_bytes, &mut buf);
+        encode_data_batch(42, &journal_bytes, &mut buf);
         p_writer.write_all(&buf).unwrap();
         p_writer.flush().unwrap();
         buf.clear();
@@ -1044,7 +1028,7 @@ mod tests {
 
         // Send 3 DataBatches with increasing sequence numbers.
         for seq in [10u64, 20, 30] {
-            encode_data_batch(seq, &[0x11; 32], 1, &[0xAA; 8], &mut buf);
+            encode_data_batch(seq, &[0xAA; 8], &mut buf);
             p_writer.write_all(&buf).unwrap();
             p_writer.flush().unwrap();
             buf.clear();
@@ -1065,21 +1049,16 @@ mod tests {
     }
 
     #[test]
-    fn heartbeat_encode_contains_sequence_and_hash() {
-        // Heartbeat messages carry the last known sequence and chain hash
-        // so the replica can verify it hasn't missed any data.
-        let chain_hash = [0x42; 32];
+    fn heartbeat_encode_contains_sequence() {
+        // Heartbeat messages carry the last known sequence so the replica
+        // can verify it hasn't missed any data.
         let mut buf = Vec::new();
-        encode_heartbeat(999, &chain_hash, &mut buf);
+        encode_heartbeat(999, &mut buf);
 
         let payload = &buf[4..];
         match decode_primary_message(payload).unwrap() {
-            PrimaryMessage::Heartbeat {
-                sequence,
-                chain_hash: h,
-            } => {
+            PrimaryMessage::Heartbeat { sequence } => {
                 assert_eq!(sequence, 999);
-                assert_eq!(h, chain_hash);
             }
             other => panic!("expected Heartbeat, got {other:?}"),
         }
@@ -1158,7 +1137,7 @@ mod tests {
         buf.clear();
 
         // Send DataBatch with sequence 150 (after replica's 100).
-        encode_data_batch(150, &[0x11; 32], 1, &[0xAA; 8], &mut buf);
+        encode_data_batch(150, &[0xAA; 8], &mut buf);
         p_writer.write_all(&buf).unwrap();
         p_writer.flush().unwrap();
 
