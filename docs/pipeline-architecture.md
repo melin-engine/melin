@@ -176,12 +176,13 @@ The matching stage maintains a per-instance `last_drain_ns` watermark. At the he
 
 ### Known limitations of the current sequence scheme
 
-Two latent issues live in the producer-side sequence allocation and are worth documenting pending a rework:
+One latent issue lives in the producer-side sequence allocation and is worth documenting pending a rework:
 
-1. **Sequence leak on ring-full publish failure.** `sequencer.next()` is called before `producer.try_publish()`. If `try_publish` fails (input ring saturated), the claimed sequence never reaches a slot and is effectively lost. The next successful publish uses `seq + 1`, leaving a gap in the journal. Recovery detects that gap with `SequenceGap` and aborts. The input ring is 1M slots, so saturation is only reachable when the matching stage is fully stalled; the same pattern is used by every other primary-side producer (reader, seeding, tick).
-2. **Sequence / ring-slot ordering race under multi-producer contention.** `sequencer.next()` and the disruptor's slot-claim CAS are independent atomics. Two concurrent producers can interleave such that producer A claims sequence `N`, producer B claims sequence `N+1`, B acquires ring slot `k`, A acquires ring slot `k+1`. The journal stage then writes the entries in ring-cursor order (i.e. with sequences `N+1, N, …`), producing a non-monotonic journal that also aborts recovery. With both io_uring and DPDK transports the ingress thread is the sole hot-path producer (it now emits ticks too — see "Reader" above), so this race is *eliminated* in steady state. The seed loop publishes once at startup before clients connect; theoretically it could race with the very first ticks, but the seed loop uses blocking `publish` on a quiet ring.
+- **Sequence leak on ring-full publish failure.** `sequencer.next()` is called before `producer.try_publish()`. If `try_publish` fails (input ring saturated), the claimed sequence never reaches a slot and is effectively lost. The next successful publish uses `seq + 1`, leaving a gap in the journal. Recovery detects that gap with `SequenceGap` and aborts. The input ring is 1M slots, so saturation is only reachable when the matching stage is fully stalled; the same pattern is used by every other primary-side producer.
 
-The architecturally clean fix is to move sequence assignment into the journal stage (producers publish `sequence: 0`, the journal stage assigns from `writer.next_sequence()` at encode time), so the authoritative order is the disruptor's ring-cursor order. That refactor also removes the `Sequencer` type entirely.
+The previously-documented multi-producer ordering race is no longer reachable: startup is now serialized so the seed loop fully drains through the pipeline before the reader (TCP) or DPDK poll threads are spawned. With both transports the ingress thread is the sole hot-path producer (it also emits ticks — see "Reader" above), so the input ring is genuinely single-producer at every moment of the server's lifetime, and `sequencer.next()` plus the slot-claim CAS observe the same total order.
+
+The architecturally clean fix for the remaining leak is to move sequence assignment into the journal stage (producers publish `sequence: 0`, the journal stage assigns from `writer.next_sequence()` at encode time), so the authoritative order is the disruptor's ring-cursor order. That refactor also removes the `Sequencer` type entirely.
 
 ## Input Disruptor
 

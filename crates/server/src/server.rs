@@ -759,21 +759,13 @@ fn run_as_primary<L: BlockingTransportListener>(
         None
     };
 
-    // The reader thread also generates the engine's scheduler ticks via
-    // an io_uring `IORING_OP_TIMEOUT` armed at the configured cadence. This
-    // keeps the input ring single-producer (alongside the one-shot seed
-    // loop), eliminating the multi-producer ordering race that would exist
-    // if tick lived on its own thread. See `reader::spawn_reader`.
+    // The reader thread is spawned LATER, after the seed loop has finished
+    // draining through the pipeline. Until then `input_producer` is held by
+    // this scope and only the seed loop publishes to the input ring. This
+    // serial-startup ordering eliminates the multi-producer ring-cursor
+    // ordering race that would otherwise exist between the seed loop and
+    // the reader's tick emission.
     let reader_shutdown = Arc::new(AtomicBool::new(false));
-    let mut reader_handle = crate::reader::spawn_reader(
-        input_producer,
-        control_tx.clone(),
-        config.reader_cores,
-        connection_timeout,
-        config.tick_interval(),
-        Arc::clone(&reader_shutdown),
-        Arc::clone(&sequencer),
-    );
 
     // Spawn pipeline OS threads.
     let cores = config.cores;
@@ -1093,14 +1085,15 @@ fn run_as_primary<L: BlockingTransportListener>(
             "seed drain: waiting for pipeline cursors"
         );
 
-        while journal_cursor
-            .get()
-            .load(std::sync::atomic::Ordering::Acquire)
-            < last_seed_seq
-            || matching_cursor
+        while !shutdown.load(std::sync::atomic::Ordering::Relaxed)
+            && (journal_cursor
                 .get()
                 .load(std::sync::atomic::Ordering::Acquire)
                 < last_seed_seq
+                || matching_cursor
+                    .get()
+                    .load(std::sync::atomic::Ordering::Acquire)
+                    < last_seed_seq)
         {
             std::hint::spin_loop();
         }
@@ -1117,10 +1110,11 @@ fn run_as_primary<L: BlockingTransportListener>(
                     continue;
                 }
                 let target = ring_progress.producer_cursors[i].load();
-                while ring_progress.consumer_cursors[i]
-                    .get()
-                    .load(std::sync::atomic::Ordering::Acquire)
-                    < target
+                while !shutdown.load(std::sync::atomic::Ordering::Relaxed)
+                    && ring_progress.consumer_cursors[i]
+                        .get()
+                        .load(std::sync::atomic::Ordering::Acquire)
+                        < target
                 {
                     std::hint::spin_loop();
                 }
@@ -1140,6 +1134,25 @@ fn run_as_primary<L: BlockingTransportListener>(
             "seeded test data through pipeline"
         );
     }
+
+    // Now that seeding is fully drained, spawn the reader thread. From here
+    // on the reader is the sole producer on the input ring (the seed loop
+    // has finished and its clone of `input_producer` was dropped at the end
+    // of the block above). Any subsequent ticks the reader emits cannot
+    // race with seed events: there are none in flight.
+    if shutdown.load(Ordering::Relaxed) {
+        info!("shutdown requested before reader spawn — exiting startup");
+        return Ok(());
+    }
+    let mut reader_handle = crate::reader::spawn_reader(
+        input_producer,
+        control_tx.clone(),
+        config.reader_cores,
+        connection_timeout,
+        config.tick_interval(),
+        Arc::clone(&reader_shutdown),
+        Arc::clone(&sequencer),
+    );
 
     // Pipeline health flag: true while all pipeline threads are alive.
     // Flipped to false when a thread dies or on shutdown. Read by the
@@ -1846,14 +1859,15 @@ pub fn run_dpdk(
         // Wait for seeding to complete through journal + matching stages,
         // then wait for the replication ring to drain. See TCP path comment.
         let last_seed_seq = last_published_seq + 1;
-        while journal_cursor
-            .get()
-            .load(std::sync::atomic::Ordering::Acquire)
-            < last_seed_seq
-            || matching_cursor
+        while !shutdown.load(std::sync::atomic::Ordering::Relaxed)
+            && (journal_cursor
                 .get()
                 .load(std::sync::atomic::Ordering::Acquire)
                 < last_seed_seq
+                || matching_cursor
+                    .get()
+                    .load(std::sync::atomic::Ordering::Acquire)
+                    < last_seed_seq)
         {
             std::hint::spin_loop();
         }
@@ -1863,10 +1877,11 @@ pub fn run_dpdk(
                     continue;
                 }
                 let target = ring_progress.producer_cursors[i].load();
-                while ring_progress.consumer_cursors[i]
-                    .get()
-                    .load(std::sync::atomic::Ordering::Acquire)
-                    < target
+                while !shutdown.load(std::sync::atomic::Ordering::Relaxed)
+                    && ring_progress.consumer_cursors[i]
+                        .get()
+                        .load(std::sync::atomic::Ordering::Acquire)
+                        < target
                 {
                     std::hint::spin_loop();
                 }
@@ -1879,6 +1894,11 @@ pub fn run_dpdk(
             "seeded test data through pipeline"
         );
     }
+
+    // Note: the DPDK poll threads are spawned BELOW, after this seed-drain
+    // block. That ordering is what keeps the input ring single-producer
+    // during seeding — the same property the TCP path achieves by deferring
+    // its `spawn_reader` call to after seed-drain.
 
     // Pipeline health flag: true while all pipeline threads are alive.
     let pipeline_healthy = Arc::new(AtomicBool::new(true));
