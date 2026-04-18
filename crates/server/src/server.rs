@@ -765,7 +765,6 @@ fn run_as_primary<L: BlockingTransportListener>(
     // serial-startup ordering eliminates the multi-producer ring-cursor
     // ordering race that would otherwise exist between the seed loop and
     // the reader's tick emission.
-    let reader_shutdown = Arc::new(AtomicBool::new(false));
 
     // Spawn pipeline OS threads.
     let cores = config.cores;
@@ -1140,10 +1139,10 @@ fn run_as_primary<L: BlockingTransportListener>(
     // has finished and its clone of `input_producer` was dropped at the end
     // of the block above). Any subsequent ticks the reader emits cannot
     // race with seed events: there are none in flight.
-    if shutdown.load(Ordering::Relaxed) {
-        info!("shutdown requested before reader spawn — exiting startup");
-        return Ok(());
-    }
+    //
+    // If shutdown was requested while seed was draining we still spawn the
+    // reader so the unified shutdown sequence below joins every thread.
+    let reader_shutdown = Arc::new(AtomicBool::new(false));
     let mut reader_handle = crate::reader::spawn_reader(
         input_producer,
         control_tx.clone(),
