@@ -460,7 +460,7 @@ pub fn run_dpdk_roundtrip(
 
         let mut all_done = true;
 
-        for i in 0..connections.len() {
+        for (i, conn) in connections.iter_mut().enumerate() {
             // Mid-iteration poll to flush TX and receive new data.
             if i > 0 && i % POLL_EVERY_N_CONNS == 0 {
                 poll(
@@ -472,7 +472,6 @@ pub fn run_dpdk_roundtrip(
                 );
             }
 
-            let conn = &mut connections[i];
             if conn.done {
                 continue;
             }

@@ -744,7 +744,7 @@ mod tests {
     use super::*;
 
     /// Collect frame slices from an `RxBatch` into a `Vec` for test assertions.
-    fn collect_slices<'a>(batch: &'a RxBatch) -> Vec<&'a [u8]> {
+    fn collect_slices(batch: &RxBatch) -> Vec<&[u8]> {
         let n = batch.len();
         let mut buf = vec![std::mem::MaybeUninit::uninit(); n];
         let written = batch.write_slices(&mut buf);

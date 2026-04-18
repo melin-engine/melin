@@ -84,6 +84,11 @@ pub enum ControlEvent {
 /// - No socket writers — encoded frames are sent via `tx_out` channel
 /// - No flush syscalls — the DPDK poll thread handles transmission
 /// - Heartbeats are sent via the same `tx_out` channel
+///
+/// Top-level thread entry point — the wide arg list mirrors stage state
+/// owned elsewhere; bundling into a config struct adds indirection
+/// without simplifying.
+#[allow(clippy::too_many_arguments)]
 pub fn run(
     mut consumer: ring::Consumer<OutputSlot>,
     control_rx: mpsc::Receiver<ControlEvent>,
@@ -145,9 +150,11 @@ pub fn run(
                     let mut failed: Vec<u64> = Vec::new();
                     for (&conn_id, state) in connections.iter_mut() {
                         if now.duration_since(state.last_send) >= interval {
-                            let mut frame = TxFrame::default();
-                            frame.connection_id = conn_id;
-                            frame.len = heartbeat_len as u16;
+                            let mut frame = TxFrame {
+                                connection_id: conn_id,
+                                len: heartbeat_len as u16,
+                                ..Default::default()
+                            };
                             frame.data[..heartbeat_len]
                                 .copy_from_slice(&heartbeat_frame[..heartbeat_len]);
                             let tid = (conn_id >> 56) as usize % tx_producers.len();
@@ -262,9 +269,11 @@ pub fn run(
 
             // Send the complete wire frame (with length prefix) to the
             // DPDK poll thread for transmission via lock-free SPSC.
-            let mut frame = TxFrame::default();
-            frame.connection_id = slot.connection_id;
-            frame.len = written as u16;
+            let mut frame = TxFrame {
+                connection_id: slot.connection_id,
+                len: written as u16,
+                ..Default::default()
+            };
             frame.data[..written].copy_from_slice(&encode_buf[..written]);
             let tid = (slot.connection_id >> 56) as usize % tx_producers.len();
             tx_producers[tid].publish(frame);

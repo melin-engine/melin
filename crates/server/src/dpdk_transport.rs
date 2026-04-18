@@ -113,6 +113,11 @@ struct ConnectionState {
 /// embedding tick into the poll thread was designed to eliminate. Gate
 /// tick emission to a single thread (e.g. `thread_id == 0`) before
 /// scaling out client queues.
+///
+/// Top-level thread entry point — the wide arg list mirrors transport
+/// state owned elsewhere; bundling into a config struct adds indirection
+/// without simplifying.
+#[allow(clippy::too_many_arguments)]
 pub fn run_dpdk_poll(
     mut transport: DpdkTransport,
     producer: ring::MultiProducer<InputSlot>,
