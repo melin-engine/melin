@@ -509,6 +509,23 @@ impl<T: Copy + Default> Consumer<T> {
         self.processed.get().store(seq, Ordering::Release);
     }
 
+    /// Fast-forward this consumer past any unread entries so it is
+    /// positioned at the producer's current cursor.
+    ///
+    /// Used when a consumer has been disconnected from its external
+    /// work queue (e.g., a replica was evicted) and unread ring entries
+    /// are no longer semantically valid — replaying them would deliver
+    /// stale data to whatever the consumer is rewired to next.
+    /// `next_read` and the published `processed` counter are set in
+    /// lock-step so downstream gates (and the producer's backpressure
+    /// check) see a consistent up-to-date cursor.
+    pub fn skip_to_dependency(&mut self) {
+        let dep = self.dependency.load(self.next_read);
+        self.next_read = dep;
+        self.cached_dep = dep;
+        self.processed.get().store(dep, Ordering::Release);
+    }
+
     /// Returns a shared reference to this consumer's progress counter.
     ///
     /// External code (e.g., the response stage) can read this to determine

@@ -163,7 +163,21 @@ pub fn run_sender(
             {
                 let handle = slot.handle.take().expect("just checked is_some");
                 match handle.join() {
-                    Ok(consumer) => {
+                    Ok(mut consumer) => {
+                        // Drop any unread entries before the consumer is
+                        // stashed back in the slot. The journal stage may
+                        // have published batches into the ring that the
+                        // evicted handler never got to forward — if we
+                        // left them in place, the NEXT handler on this
+                        // slot would drain them to its replica and
+                        // acknowledge with pre-eviction sequences. Those
+                        // acks would stall `replication_cursor` at the
+                        // old position and gate the primary's response
+                        // stage at the slow-replica rate.
+                        //
+                        // Fast-forward to the producer cursor so the
+                        // live-streaming loop starts with a clean ring.
+                        consumer.skip_to_producer();
                         slot.consumer = Some(consumer);
                         replicas_connected.fetch_sub(1, Ordering::Release);
                         // Clear active flag — journal stage stops publishing

@@ -284,6 +284,25 @@ impl ReplicationConsumer {
     pub fn progress_counter(&self) -> Arc<Sequence> {
         self.inner.progress_counter()
     }
+
+    /// Fast-forward this consumer past any unread entries so it sits at
+    /// the producer's current cursor.
+    ///
+    /// Called by the replication sender when a replica is evicted so
+    /// the stranded ring entries (published before eviction but never
+    /// drained to the wire) don't get replayed to a future replica on
+    /// the same slot. Without this, a replica that reconnects and
+    /// completes catch-up via on-disk journal files can re-receive the
+    /// pre-eviction ring contents once live streaming resumes,
+    /// acknowledging them with sequences that lag the primary's
+    /// journal by however many events were in the ring at eviction.
+    /// That in turn stalls the primary's `replication_cursor` at the
+    /// evicted-position slot value and gates the response stage.
+    pub fn skip_to_producer(&mut self) {
+        self.inner.skip_to_dependency();
+        self.pending_meta = None;
+        self.pending_seq = 0;
+    }
 }
 
 /// Build a replication ring with one producer and `num_consumers` consumers.

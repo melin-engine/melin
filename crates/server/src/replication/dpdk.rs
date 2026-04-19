@@ -188,6 +188,11 @@ pub fn run_sender_dpdk(
                 metrics.catching_up[i].store(false, Ordering::Relaxed);
                 slot.acked_cursor = u64::MAX;
                 slot.recv_buf.clear();
+                // Drop any unread ring entries so a reconnecting replica
+                // on this slot doesn't replay pre-eviction data and stall
+                // the primary's replication cursor. See kernel-TCP path
+                // in tcp_sender.rs for the detailed rationale.
+                slot.consumer.skip_to_producer();
                 slot.state = SlotState::Idle;
                 replicas_connected.fetch_sub(1, Ordering::Release);
                 if replicas_connected.load(Ordering::Relaxed) == 0 {
