@@ -48,7 +48,7 @@ const PREALLOC_CHUNK: u64 = 256 * 1024 * 1024;
 /// Number of events between automatic hash chain checkpoints.
 /// 100K events × ~80 bytes = ~8 MB of journal data between checkpoints.
 /// The checkpoint itself is ~77 bytes — negligible overhead.
-pub const CHECKPOINT_INTERVAL: u64 = 10_000;
+pub const CHECKPOINT_INTERVAL: u64 = 100_000;
 
 /// A batch of encoded journal data ready for async write via io_uring.
 /// Owns the buffer to prevent aliasing while io_uring holds a pointer to it.
