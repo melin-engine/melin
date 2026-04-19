@@ -30,8 +30,16 @@ pub enum JournalError {
         expected: u32,
         actual: u32,
     },
-    /// Sequence numbers are not contiguous.
+    /// Sequence numbers skipped forward — entries between `expected`
+    /// and `actual` are missing. Typical causes: file truncation,
+    /// corrupted entry skipped by the caller, bug dropping a batch.
     SequenceGap { expected: u64, actual: u64 },
+    /// Sequence number already seen — the decoded entry re-uses a
+    /// sequence that was observed earlier in this read pass, usually
+    /// as a transparently-skipped `Checkpoint` or `GenesisHash`.
+    /// Distinct from `SequenceGap`: a gap means *missing* entries, a
+    /// duplicate means the writer emitted the same seq twice.
+    SequenceDuplicate { sequence: u64, previous_seq: u64 },
     /// Entry is incomplete (likely a crash during write).
     TruncatedEntry,
     /// BLAKE3 hash chain verification failed at a checkpoint.
@@ -69,6 +77,14 @@ impl fmt::Display for JournalError {
             Self::SequenceGap { expected, actual } => {
                 write!(f, "sequence gap: expected {expected}, got {actual}")
             }
+            Self::SequenceDuplicate {
+                sequence,
+                previous_seq,
+            } => write!(
+                f,
+                "sequence duplicate: {sequence} already seen \
+                 (immediately after seq {previous_seq})"
+            ),
             Self::TruncatedEntry => write!(f, "truncated entry at end of journal"),
             Self::HashChainMismatch {
                 sequence,

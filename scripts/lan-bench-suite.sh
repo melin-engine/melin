@@ -53,6 +53,9 @@
 #   BENCH_BRANCH=<ref>  Checkout a specific branch on all machines
 #   BENCH_COMMIT=<hash> Checkout a specific commit (mutually exclusive with BENCH_BRANCH)
 #   CLEAN_BUILD=1       Run cargo clean before building (forces full recompile)
+#   RUSTFLAGS=<flags>   Forwarded to every remote `cargo build` via ssh.
+#                       Useful to enable debug assertions in release
+#                       builds: RUSTFLAGS="-C debug-assertions=y"
 #
 # Special values:
 #   TRANSPORTS=all      All transports valid for the available infrastructure
@@ -83,7 +86,12 @@ REPLICA_VLAN="${6:-}"
 REPLICA2_PUB="${7:-}"
 REPLICA2_VLAN="${8:-}"
 
+SSH_CONTROL_DIR="$(mktemp -d -t melin-bench-ssh.XXXXXX)"
 SSH_OPTS="-A -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR"
+# ControlMaster multiplexes every subsequent ssh over the first
+# connection per host — amortizes the handshake from dozens of calls
+# per workload down to one per host.
+SSH_OPTS="${SSH_OPTS} -o ControlMaster=auto -o ControlPath=${SSH_CONTROL_DIR}/%r@%h:%p -o ControlPersist=5m"
 SERVER="${SSH_USER}@${SERVER_PUB}"
 BENCH="${SSH_USER}@${BENCH_PUB}"
 REPLICA="${REPLICA_PUB:+${SSH_USER}@${REPLICA_PUB}}"
@@ -138,6 +146,11 @@ cleanup() {
     for host in "$SERVER" ${REPLICA:+"$REPLICA"} ${REPLICA2:+"$REPLICA2"}; do
         ssh $SSH_OPTS "$host" "pkill -INT -x melin-server 2>/dev/null; true" 2>/dev/null || true
     done
+    # Close ssh master connections and remove their control sockets.
+    for host in "$SERVER" "$BENCH" ${REPLICA:+"$REPLICA"} ${REPLICA2:+"$REPLICA2"}; do
+        ssh -O exit $SSH_OPTS "$host" 2>/dev/null || true
+    done
+    rm -rf "$SSH_CONTROL_DIR" 2>/dev/null || true
 }
 trap cleanup EXIT
 
@@ -297,11 +310,25 @@ if [[ "${CLEAN_BUILD:-0}" == "1" ]]; then
     echo "  (CLEAN_BUILD=1 — full recompile)"
 fi
 
+echo "  Building on ${#BUILD_HOSTS[@]} host(s) in parallel..."
+build_pids=()
 for HOST in "${BUILD_HOSTS[@]}"; do
-    echo "  Building on ${HOST}..."
-    ssh $SSH_OPTS "$HOST" "cd ${REPO_DIR} && ${GIT_CMD} && source ~/.cargo/env && \
-        ${CLEAN_CMD} cargo build --release ${EXTRA_BUILD}" 2>&1 | tail -3
+    (
+        ssh $SSH_OPTS "$HOST" "cd ${REPO_DIR} && ${GIT_CMD} && source ~/.cargo/env && \
+            export RUSTFLAGS=\"${RUSTFLAGS:-}\" && \
+            ${CLEAN_CMD} cargo build --release ${EXTRA_BUILD}" 2>&1 \
+            | tail -3 | sed "s/^/  [${HOST}] /"
+    ) &
+    build_pids+=($!)
 done
+build_failed=0
+for pid in "${build_pids[@]}"; do
+    wait "$pid" || build_failed=1
+done
+if [[ "$build_failed" == "1" ]]; then
+    echo "  Build failed on at least one host."
+    exit 1
+fi
 
 # Optional instrumented melin-server build on the primary only. Used to
 # enable diagnostic features (pipeline-stats, latency-trace) for one-off
@@ -310,6 +337,7 @@ done
 if [[ -n "${SERVER_FEATURES:-}" ]]; then
     echo "  Rebuilding melin-server on primary with --features ${SERVER_FEATURES}..."
     ssh $SSH_OPTS "$SERVER" "cd ${REPO_DIR} && source ~/.cargo/env && \
+        export RUSTFLAGS=\"${RUSTFLAGS:-}\" && \
         cargo build --release -p melin-server --features ${SERVER_FEATURES}" 2>&1 | tail -3
 fi
 
@@ -322,20 +350,44 @@ if [[ "$NEED_DPDK" == "1" ]]; then
     if [[ "$HAVE_DPDK_BIN" == "yes" ]]; then
         echo "  DPDK binary already built (melin-server.dpdk)."
     else
-        echo "  Building DPDK server..."
-        ssh $SSH_OPTS "$SERVER" "cd ${REPO_DIR} && source ~/.cargo/env && \
-            cargo build --release -p melin-server --features dpdk --no-default-features" 2>&1 | tail -3
-        echo "  Building DPDK bench..."
-        ssh $SSH_OPTS "$BENCH" "cd ${REPO_DIR} && source ~/.cargo/env && \
-            cargo build --release -p melin-bench --features dpdk" 2>&1 | tail -3
+        # Each DPDK build is independent — run them concurrently and
+        # fail the suite if any one returns non-zero.
+        echo "  Building DPDK server, bench, (and replica if dpdk-repl) in parallel..."
+        dpdk_pids=()
+        (
+            ssh $SSH_OPTS "$SERVER" "cd ${REPO_DIR} && source ~/.cargo/env && \
+                export RUSTFLAGS=\"${RUSTFLAGS:-}\" && \
+                cargo build --release -p melin-server --features dpdk --no-default-features" 2>&1 \
+                | tail -3 | sed "s/^/  [${SERVER} dpdk-server] /"
+        ) &
+        dpdk_pids+=($!)
+        (
+            ssh $SSH_OPTS "$BENCH" "cd ${REPO_DIR} && source ~/.cargo/env && \
+                export RUSTFLAGS=\"${RUSTFLAGS:-}\" && \
+                cargo build --release -p melin-bench --features dpdk" 2>&1 \
+                | tail -3 | sed "s/^/  [${BENCH} dpdk-bench] /"
+        ) &
+        dpdk_pids+=($!)
         for item in "${MATRIX[@]}"; do
             if [[ "${item%%:*}" == "dpdk-repl" && -n "$REPLICA" ]]; then
-                echo "  Building DPDK server on replica..."
-                ssh $SSH_OPTS "$REPLICA" "cd ${REPO_DIR} && source ~/.cargo/env && \
-                    cargo build --release -p melin-server --features dpdk --no-default-features" 2>&1 | tail -3
+                (
+                    ssh $SSH_OPTS "$REPLICA" "cd ${REPO_DIR} && source ~/.cargo/env && \
+                        export RUSTFLAGS=\"${RUSTFLAGS:-}\" && \
+                        cargo build --release -p melin-server --features dpdk --no-default-features" 2>&1 \
+                        | tail -3 | sed "s/^/  [${REPLICA} dpdk-server] /"
+                ) &
+                dpdk_pids+=($!)
                 break
             fi
         done
+        dpdk_failed=0
+        for pid in "${dpdk_pids[@]}"; do
+            wait "$pid" || dpdk_failed=1
+        done
+        if [[ "$dpdk_failed" == "1" ]]; then
+            echo "  DPDK build failed on at least one host."
+            exit 1
+        fi
     fi
 fi
 echo "  Builds complete."
@@ -964,6 +1016,7 @@ workload_no_persist() {
     ssh $SSH_OPTS "$SERVER" "cd ${REPO_DIR} && \
         cp target/release/melin-server target/release/melin-server.persist && \
         source ~/.cargo/env && \
+        export RUSTFLAGS=\"${RUSTFLAGS:-}\" && \
         cargo build --release --features no-persist 2>&1 | tail -1 && \
         cp target/release/melin-server target/release/melin-server.nopersist && \
         cp target/release/melin-server.nopersist target/release/melin-server"

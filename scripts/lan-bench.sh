@@ -25,6 +25,14 @@
 # Server always gets: --bind, --journal, --authorized-keys.
 # Bench always gets: --addr, --key, --json.
 #
+# Environment variables:
+#   CARGO_BUILD_FLAGS=<flags>   Passed to `cargo build` on both hosts
+#                               (default: --release).
+#   RUSTFLAGS=<flags>           Forwarded to every remote `cargo build`
+#                               via ssh. For example, enable debug
+#                               assertions in release builds with
+#                               RUSTFLAGS="-C debug-assertions=y".
+#
 # Prerequisites:
 #   - SSH access to both machines (as root by default, or as [user])
 #   - Both machines have been set up via cherry-deploy.sh (or cherry-setup.sh)
@@ -85,9 +93,24 @@ BENCH_PUB="${POSITIONAL[1]}"
 SERVER_VLAN="${POSITIONAL[2]}"
 SSH_USER="${POSITIONAL[3]:-root}"
 
+SSH_CONTROL_DIR="$(mktemp -d -t melin-bench-ssh.XXXXXX)"
 SSH_OPTS="-A -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR"
+# ControlMaster multiplexes every subsequent ssh over the first
+# connection per host — amortizes the handshake from ~50 calls down
+# to 2 (one per host).
+SSH_OPTS="${SSH_OPTS} -o ControlMaster=auto -o ControlPath=${SSH_CONTROL_DIR}/%r@%h:%p -o ControlPersist=5m"
 SERVER="${SSH_USER}@${SERVER_PUB}"
 BENCH="${SSH_USER}@${BENCH_PUB}"
+
+# Close master sockets and remove the control dir on exit.
+cleanup_ssh_sockets() {
+    for host in "${SERVER:-}" "${BENCH:-}"; do
+        [[ -n "$host" ]] || continue
+        ssh -O exit $SSH_OPTS "$host" 2>/dev/null || true
+    done
+    rm -rf "$SSH_CONTROL_DIR" 2>/dev/null || true
+}
+trap cleanup_ssh_sockets EXIT
 
 REPO_DIR="~/workspace/melin"
 JOURNAL_PATH="${JOURNAL_PATH:-/mnt/journal/bench.journal}"
@@ -109,7 +132,6 @@ echo ""
 build_remote() {
     local host="$1"
     local label="$2"
-    echo "=== Building on ${label} (${host}) ==="
     # BENCH_BRANCH or BENCH_COMMIT: checkout a specific ref on all machines.
     local git_cmd="git pull --ff-only"
     if [[ -n "${BENCH_BRANCH:-}" ]]; then
@@ -117,13 +139,27 @@ build_remote() {
     elif [[ -n "${BENCH_COMMIT:-}" ]]; then
         git_cmd="git fetch origin && git checkout ${BENCH_COMMIT}"
     fi
-    ssh $SSH_OPTS "$host" "cd ${REPO_DIR} && ${git_cmd} && source ~/.cargo/env && cargo build ${CARGO_BUILD_FLAGS}" 2>&1 | tail -3
-    echo "  ${label} build: OK"
-    echo ""
+    # `tail -3` keeps output tight (final cargo summary only). Each
+    # host's line is prefixed with its label so parallel output is
+    # readable even when it interleaves.
+    ssh $SSH_OPTS "$host" "cd ${REPO_DIR} && ${git_cmd} && source ~/.cargo/env && RUSTFLAGS=\"${RUSTFLAGS:-}\" cargo build ${CARGO_BUILD_FLAGS}" 2>&1 \
+        | tail -3 | sed "s/^/  [${label}] /"
 }
 
-build_remote "$SERVER" "server"
-build_remote "$BENCH" "bench"
+echo "=== Building on both hosts in parallel ==="
+build_remote "$SERVER" "server" &
+pid_server=$!
+build_remote "$BENCH" "bench" &
+pid_bench=$!
+build_failed=0
+wait "$pid_server" || build_failed=1
+wait "$pid_bench" || build_failed=1
+if [[ "$build_failed" == "1" ]]; then
+    echo "=== Build failed on at least one host ==="
+    exit 1
+fi
+echo "=== Builds complete ==="
+echo ""
 
 # ---------------------------------------------------------------------------
 # 2. Generate auth keys on the bench machine (if not already present)

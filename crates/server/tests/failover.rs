@@ -778,6 +778,211 @@ fn crashed_primary_recovers_from_journal() {
     );
 }
 
+/// End-to-end repro attempt for the checkpoint-boundary sequence
+/// corruption seen by `journal_verify` after LAN benches:
+///
+///     error at entry 10001: sequence gap: expected 10003, got 10002
+///
+/// Spins up a real primary + replica pair (`melin-server` binary, TCP
+/// loopback), submits enough orders to cross the first auto-emitted
+/// checkpoint boundary, waits for replication to catch up, then walks
+/// both journal files end-to-end with `JournalReader`. Any
+/// `SequenceGap` surfaced by the strict-continuity check is the same
+/// corruption mode reported by the external verifier.
+///
+/// `CHECKPOINT_INTERVAL` is 10_000 on this branch (lowered from the
+/// 100_000 default to keep the repro cheap); the test submits 15_000
+/// orders so we land ~5_000 events past the boundary.
+#[test]
+#[serial]
+fn journals_contiguous_across_checkpoint_boundary() {
+    use melin_engine::journal::JournalReader;
+
+    let cluster = TestCluster::start();
+    let mut client = cluster.connect_primary();
+
+    // Server seeds 10 accounts + 2 instruments → 12 seed events before
+    // the first order. `CHECKPOINT_INTERVAL` (10_000 on this branch)
+    // fires after encoding 10_000 non-genesis events, so ~9988 orders
+    // crosses the first boundary. 15_000 lands comfortably past it.
+    const ORDERS: u64 = 15_000;
+    for i in 1..=ORDERS {
+        let side = if i % 2 == 0 { Side::Buy } else { Side::Sell };
+        let r = submit_order(&mut client, i, 1, 1, side, 100, 1);
+        assert!(!r.is_empty(), "order {i}: no response");
+    }
+
+    // Drain every ack so the journal and the replica have caught up.
+    cluster.wait_replicated();
+    drop(client);
+
+    // Give the journal stages one last moment to fsync their current
+    // batch (acks are sent after the persist-before-ack boundary, so
+    // this is belt-and-suspenders).
+    std::thread::sleep(Duration::from_millis(250));
+
+    let primary_journal = cluster._tmp.path().join("primary.journal");
+    let replica_journal = cluster._tmp.path().join("replica.journal");
+
+    let walk = |label: &str, path: &Path| -> u64 {
+        let mut reader = JournalReader::open(path)
+            .unwrap_or_else(|e| panic!("{label}: open {}: {e}", path.display()));
+        let mut count = 0u64;
+        loop {
+            match reader.next_entry() {
+                Ok(Some(_)) => count += 1,
+                Ok(None) => break,
+                Err(e) => panic!(
+                    "{label}: read error after {count} user entries \
+                     (last_sequence = {:?}): {e}",
+                    reader.last_sequence()
+                ),
+            }
+        }
+        count
+    };
+
+    let primary_count = walk("primary", &primary_journal);
+    let replica_count = walk("replica", &replica_journal);
+
+    // Counts must cover at least the submitted orders. Seed events (12)
+    // plus orders (ORDERS) — equality would be too strict if the server
+    // emits additional internal events (ticks), so use a lower bound.
+    assert!(
+        primary_count >= ORDERS,
+        "primary journal recovered {primary_count} entries, expected >= {ORDERS}"
+    );
+    assert!(
+        replica_count >= ORDERS,
+        "replica journal recovered {replica_count} entries, expected >= {ORDERS}"
+    );
+}
+
+/// Same invariant as above (`journals_contiguous_across_checkpoint_boundary`),
+/// but drives load through the real `melin-bench` binary instead of a
+/// synchronous in-test client. This matches the LAN bench's publisher
+/// shape: multiple concurrent clients, deep in-flight window, real
+/// io_uring on both sides. If the checkpoint-boundary duplicate is
+/// timing-sensitive to concurrency (and the single-client test above
+/// can't trigger it), this is the version that should.
+#[test]
+#[serial]
+fn bench_binary_journals_contiguous_across_checkpoint_boundary() {
+    use melin_engine::journal::JournalReader;
+
+    // Locate (or build) the `melin-bench` binary using the same target
+    // profile Cargo picked for `melin-server` — `CARGO_BIN_EXE_melin-server`
+    // gives us the profile directory to infer from.
+    let server_bin_path = PathBuf::from(env!("CARGO_BIN_EXE_melin-server"));
+    let profile_dir = server_bin_path
+        .parent()
+        .and_then(|p| p.file_name())
+        .and_then(|s| s.to_str())
+        .expect("server binary path has profile component");
+    let target_dir = server_bin_path
+        .parent()
+        .and_then(|p| p.parent())
+        .expect("server binary path has target dir");
+    let bench_bin = target_dir.join(profile_dir).join("melin-bench");
+
+    let mut build = Command::new(env!("CARGO"));
+    build.args(["build", "-p", "melin-bench"]);
+    if profile_dir == "release" {
+        build.arg("--release");
+    }
+    let build_status = build.status().expect("spawn cargo build melin-bench");
+    assert!(
+        build_status.success(),
+        "cargo build melin-bench failed (status {build_status})"
+    );
+    assert!(
+        bench_bin.exists(),
+        "melin-bench binary missing at {}",
+        bench_bin.display()
+    );
+
+    let cluster = TestCluster::start();
+
+    // The bench needs the trader key on disk (32 raw Ed25519 bytes).
+    let key_path = cluster._tmp.path().join("bench.key");
+    std::fs::write(&key_path, cluster.key.to_bytes()).expect("write bench key");
+
+    // Run the bench against the primary. Clients × window × 2 (pairs →
+    // individual orders) must comfortably cross CHECKPOINT_INTERVAL
+    // (10_000 on this branch). 4 clients × window 128, 15_000 pairs =
+    // 30_000 journaled orders — crosses three boundaries.
+    //
+    // --warmup 0: the default 100_000 warmup orders would dominate runtime.
+    // --accounts 10 / --instruments 2: match the server defaults used in
+    // `spawn_primary` so the generator doesn't send orders for symbols
+    // the server never created.
+    let bench_status = Command::new(&bench_bin)
+        .args([
+            "--mode=roundtrip",
+            "--addr",
+            &cluster.primary.client_addr.to_string(),
+            "--health-addr",
+            &cluster.primary.health_addr.to_string(),
+            "--key",
+            key_path.to_str().expect("key path utf-8"),
+            "--clients",
+            "4",
+            "--window",
+            "128",
+            "--warmup",
+            "0",
+            "--accounts",
+            "10",
+            "--instruments",
+            "2",
+            "15000",
+        ])
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .status()
+        .expect("spawn melin-bench");
+    assert!(
+        bench_status.success(),
+        "melin-bench exited with {bench_status}"
+    );
+
+    cluster.wait_replicated();
+    // Extra slack for the journal stages to finalize their current batch.
+    std::thread::sleep(Duration::from_millis(500));
+
+    let walk = |label: &str, path: &Path| -> u64 {
+        let mut reader = JournalReader::open(path)
+            .unwrap_or_else(|e| panic!("{label}: open {}: {e}", path.display()));
+        let mut count = 0u64;
+        loop {
+            match reader.next_entry() {
+                Ok(Some(_)) => count += 1,
+                Ok(None) => break,
+                Err(e) => panic!(
+                    "{label}: read error after {count} entries \
+                     (last_sequence = {:?}): {e}",
+                    reader.last_sequence()
+                ),
+            }
+        }
+        count
+    };
+
+    let primary_count = walk("primary", &cluster._tmp.path().join("primary.journal"));
+    let replica_count = walk("replica", &cluster._tmp.path().join("replica.journal"));
+
+    // Lower bound: 30_000 orders from the bench. The server may add
+    // internal events (ticks, seed) — so use >= rather than equality.
+    assert!(
+        primary_count >= 30_000,
+        "primary journal only has {primary_count} entries"
+    );
+    assert!(
+        replica_count >= 30_000,
+        "replica journal only has {replica_count} entries"
+    );
+}
+
 /// Reconnect with the SAME key after failover and retry the last request.
 /// The per-key request sequence HWM must reject it as DuplicateRequest
 /// (not re-execute it). This tests that the per-key dedup state survives

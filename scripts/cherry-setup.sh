@@ -39,28 +39,47 @@ echo ""
 # 1. System packages
 # ---------------------------------------------------------------------------
 echo "=== Installing system packages ==="
-apt-get update -qq
+# Skip `apt-get update` if the index was refreshed within the last hour.
+# `-qq` forces a refresh otherwise; on a freshly-provisioned box this
+# dominates the setup boot time. Threshold is conservative: 1h is short
+# enough that security updates land same-day in practice.
+APT_INDEX_MAX_AGE=3600
+if [[ -f /var/cache/apt/pkgcache.bin ]]; then
+    INDEX_AGE=$(( $(date +%s) - $(stat -c %Y /var/cache/apt/pkgcache.bin) ))
+    if [[ "$INDEX_AGE" -lt "$APT_INDEX_MAX_AGE" ]]; then
+        echo "  apt index ${INDEX_AGE}s old (< ${APT_INDEX_MAX_AGE}s) — skipping refresh"
+    else
+        apt-get update -qq
+    fi
+else
+    apt-get update -qq
+fi
 
+# Required toolchain: build + clang/llvm for bindgen (DPDK FFI). A single
+# `apt-get install` lets apt batch dpkg triggers and avoid the global
+# lock handoff between calls.
 apt-get install -y --no-install-recommends \
     build-essential \
     pkg-config \
     git \
     curl \
-    ca-certificates
-
-# Compiler toolchain for bindgen (DPDK FFI generation).
-apt-get install -y --no-install-recommends \
+    ca-certificates \
     clang \
     llvm \
     libelf-dev
 
-# DPDK kernel-bypass networking (optional — only needed with --features dpdk).
-# libdpdk-dev provides headers + pkg-config for bindgen FFI generation.
-# dpdk-dev provides dpdk-devbind.py for NIC binding.
+# Optional packages: DPDK kernel-bypass (only with --features dpdk) plus
+# benchmarking/diagnostics tools. `|| true` because some of these may
+# not be available on every distro/version — keep going with what is.
 apt-get install -y --no-install-recommends \
     libdpdk-dev \
     dpdk-dev \
-    || true  # may not be available on all distros/versions
+    ethtool \
+    numactl \
+    irqbalance \
+    perf-tools-unstable \
+    htop \
+    || true
 
 # SR-IOV check for Intel NICs (E810, X710, etc.).
 sriov_check() {
@@ -81,15 +100,6 @@ sriov_check() {
 }
 
 sriov_check
-
-# Benchmarking / diagnostics
-apt-get install -y --no-install-recommends \
-    ethtool \
-    numactl \
-    irqbalance \
-    perf-tools-unstable \
-    htop \
-    || true  # some packages may not exist on all distros
 
 echo ""
 
@@ -485,9 +495,9 @@ echo ""
 echo ""
 
 # ---------------------------------------------------------------------------
-# 5. Clone and build
+# 5. Clone the repo
 # ---------------------------------------------------------------------------
-echo "=== Cloning and building ==="
+echo "=== Cloning the repo ==="
 
 REPO_DIR="$USER_HOME/workspace/melin"
 
@@ -502,21 +512,6 @@ else
     run_as_user "cd $REPO_DIR && git checkout main"
 fi
 
-echo "  Building default (TCP + io_uring)..."
-run_as_user "source $USER_HOME/.cargo/env && cd $REPO_DIR && cargo build --release" 2>&1 | tail -3
-echo "  Default build: OK"
-
-echo "  Building with --features no-persist,pipeline-stats..."
-run_as_user "source $USER_HOME/.cargo/env && cd $REPO_DIR && cargo build --release -p melin-server --features no-persist,pipeline-stats" 2>&1 | tail -3
-echo "  Bench build: OK"
-
-echo ""
-
-# ---------------------------------------------------------------------------
-# 6. Quick self-test
-# ---------------------------------------------------------------------------
-echo "=== Quick self-test ==="
-run_as_user "source $USER_HOME/.cargo/env && cd $REPO_DIR && cargo test --release" 2>&1 | grep "test result:" || true
 echo ""
 
 # ---------------------------------------------------------------------------

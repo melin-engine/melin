@@ -2064,6 +2064,370 @@ mod tests {
         }
     }
 
+    /// Regression guard for the production failure mode:
+    ///
+    ///     error at entry 100001: sequence gap: expected N+1, got N
+    ///
+    /// reported by `journal_verify` after a dual-replica LAN bench run.
+    /// The signature (expected = last + 1, actual = last) is produced by
+    /// the reader when an auto-emitted Checkpoint at seq X is followed
+    /// by a normal event that re-uses seq X — the Checkpoint is skipped
+    /// transparently, advances the reader's internal `last_sequence` to
+    /// X, then the duplicate event fails the strict-continuity check.
+    ///
+    /// This test drives the primary JournalStage across the checkpoint
+    /// boundary with nothing but the pipeline plumbing around it. It
+    /// does **not** currently reproduce the production failure — that
+    /// bug likely requires a condition this unit test doesn't exercise
+    /// (real io_uring + CQE timing, network ingress, replication
+    /// backpressure, rotation, …). Kept as an invariant guard so any
+    /// future regression that does manifest at this layer is caught.
+    #[cfg(all(feature = "hash-chain", not(feature = "no-persist")))]
+    #[test]
+    fn primary_journal_sequences_contiguous_across_checkpoint_boundary() {
+        use crate::journal::writer::CHECKPOINT_INTERVAL;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("checkpoint_boundary.journal");
+        let writer = JournalWriter::create(&path).unwrap();
+
+        // Ring capacity: power-of-two large enough to hold every event
+        // without the publisher ever blocking on the consumer. This lets
+        // the pipeline exercise the full in-flight / auto-emit path.
+        // Cross the checkpoint boundary at least twice so any off-by-one
+        // around the auto-emit is exercised on both the first and second
+        // segment.
+        let total: u64 = CHECKPOINT_INTERVAL * 2 + 100;
+        let cap = ((total as usize) + MAX_JOURNAL_BATCH).next_power_of_two();
+        let (mut producer, mut consumers) = ring::DisruptorBuilder::<InputSlot>::new(cap)
+            .add_consumer()
+            .build();
+        let consumer = consumers.pop().unwrap();
+
+        let stage = JournalStage::new(writer, consumer, Duration::ZERO, MAX_JOURNAL_BATCH, false);
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let shutdown2 = Arc::clone(&shutdown);
+        let handle = std::thread::spawn(move || stage.run(&shutdown2));
+
+        for i in 0..total {
+            producer.publish(InputSlot {
+                connection_id: 0,
+                key_hash: 0,
+                request_seq: 0,
+                sequence: 0,
+                timestamp_ns: 1_000_000_000 + i,
+                event: JournalEvent::Deposit {
+                    account: AccountId((i as u32) + 1),
+                    currency: CurrencyId(0),
+                    amount: 100,
+                },
+                publish_ts: trace_ts(),
+                recv_ts: trace_ts(),
+            });
+        }
+
+        // Give the stage time to drain and fsync every batch.
+        std::thread::sleep(std::time::Duration::from_millis(1000));
+        shutdown.store(true, Ordering::Relaxed);
+        let _writer = handle.join().unwrap();
+
+        // Walk the journal entry-by-entry. The reader enforces strict
+        // sequence continuity internally: any gap or duplicate surfaces
+        // as `SequenceGap`. Transparent entries (GenesisHash, auto-
+        // emitted Checkpoint) are skipped without incrementing `count`
+        // but still advance the reader's internal `last_sequence`, so a
+        // duplicate-after-checkpoint produces the exact error signature
+        // seen in production: `expected N+1, got N`.
+        let mut reader = crate::journal::JournalReader::open(&path).unwrap();
+        let mut count = 0u64;
+        loop {
+            match reader.next_entry() {
+                Ok(Some(_)) => count += 1,
+                Ok(None) => break,
+                Err(e) => {
+                    panic!(
+                        "journal read error after {count} user entries \
+                         (last_sequence = {:?}): {e}",
+                        reader.last_sequence()
+                    );
+                }
+            }
+        }
+        assert_eq!(
+            count, total,
+            "expected all {total} user events to be recoverable from the journal"
+        );
+    }
+
+    /// End-to-end primary → replica test, mirroring the LAN-bench topology:
+    ///
+    ///   primary disruptor  ─▶ primary JournalStage ─▶ replication ring
+    ///                                                       │
+    ///                               relay thread decodes bytes │
+    ///                                                       ▼
+    ///                                               replica disruptor ─▶ replica JournalStage
+    ///
+    /// The relay thread is the in-test stand-in for `submit_batch_to_
+    /// pipeline` in `crates/server/src/replication/mod.rs`: it decodes
+    /// each journal batch shipped to the replication ring and re-
+    /// publishes every non-QueryStats entry to the replica's input ring
+    /// with the primary's sequence stamped on `slot.sequence`.
+    ///
+    /// Both journals are then read back and must walk cleanly end-to-end
+    /// — no `SequenceGap`, no duplicates — across the checkpoint
+    /// boundary.
+    #[cfg(all(feature = "hash-chain", not(feature = "no-persist")))]
+    #[test]
+    fn primary_and_replica_journals_contiguous_across_checkpoint_boundary() {
+        use crate::journal::codec;
+        use crate::journal::writer::CHECKPOINT_INTERVAL;
+
+        let dir = tempfile::tempdir().unwrap();
+        let primary_path = dir.path().join("primary.journal");
+        let replica_path = dir.path().join("replica.journal");
+
+        // Shared genesis hash so the two writers seed identical BLAKE3
+        // chains. In production the replica gets this via snapshot
+        // transfer; here we hard-code it so the chain-hash divergence
+        // check inside the replica's JournalStage doesn't short-circuit
+        // the test at the first auto-emitted Checkpoint.
+        let shared_genesis = [0xA5u8; 32];
+
+        // -------- primary --------
+        let mut primary_exchange = Exchange::new();
+        primary_exchange.add_instrument(InstrumentSpec {
+            symbol: Symbol(1),
+            base: CurrencyId(0),
+            quote: CurrencyId(1),
+        });
+        primary_exchange.deposit(AccountId(1), CurrencyId(1), u64::MAX / 2);
+        let primary_writer =
+            JournalWriter::create_continuing(&primary_path, 1, shared_genesis).unwrap();
+        let primary_active_conns = Arc::new(AtomicU64::new(0));
+        let mut primary = build_pipeline_with_replication(
+            primary_exchange,
+            primary_writer,
+            Duration::ZERO,
+            primary_active_conns,
+            true, // replication enabled
+            MAX_JOURNAL_BATCH,
+            REPLICATION_RING_CAPACITY,
+            false,
+            false,
+            false,
+        );
+
+        // -------- replica --------
+        let mut replica_exchange = Exchange::new();
+        replica_exchange.add_instrument(InstrumentSpec {
+            symbol: Symbol(1),
+            base: CurrencyId(0),
+            quote: CurrencyId(1),
+        });
+        replica_exchange.deposit(AccountId(1), CurrencyId(1), u64::MAX / 2);
+        let replica_writer =
+            JournalWriter::create_continuing(&replica_path, 1, shared_genesis).unwrap();
+        let replica = build_replica_pipeline(
+            replica_exchange,
+            replica_writer,
+            MAX_JOURNAL_BATCH,
+            false,
+            false,
+        );
+
+        // Mark a replica as connected so the primary doesn't halt and
+        // its journal stage actually publishes to the replication ring.
+        if let Some(ref count) = primary.replicas_connected {
+            count.store(1, Ordering::Relaxed);
+        }
+        if let Some(ref rp) = primary.replication_ring_progress {
+            rp.active_flags[0].store(true, Ordering::Relaxed);
+        }
+
+        let (mut repl_c0, mut repl_c1) =
+            primary.replication_consumers.expect("replication enabled");
+        let replica_input = replica.input_producer.clone();
+
+        let primary_shutdown = Arc::new(AtomicBool::new(false));
+        let replica_shutdown = Arc::new(AtomicBool::new(false));
+        let relay_shutdown = Arc::new(AtomicBool::new(false));
+
+        // --- relay thread: pump primary's replication ring -> replica's input ring ---
+        let relay_stop = Arc::clone(&relay_shutdown);
+        let t_relay = std::thread::spawn(move || {
+            loop {
+                let mut got_something = false;
+                // Ring 0: decode each batch's bytes into InputSlots with
+                // the primary's sequence stamped, then publish to the
+                // replica's input ring. Mirrors `submit_batch_to_pipeline`.
+                if let Some((_meta, data)) = repl_c0.try_read() {
+                    let mut off = 0;
+                    while off < data.len() {
+                        match codec::decode(&data[off..], codec::FORMAT_VERSION) {
+                            Ok((
+                                consumed,
+                                sequence,
+                                timestamp_ns,
+                                key_hash,
+                                request_seq,
+                                event,
+                            )) => {
+                                off += consumed;
+                                // Skip the primary's auto-emitted
+                                // Checkpoint entries: the replica has a
+                                // chain hash seeded from its own (test-
+                                // local) genesis, so passing primary's
+                                // Checkpoint through verify_primary_
+                                // checkpoint would always diverge and
+                                // kill the replica's JournalStage. The
+                                // replica still auto-emits its own
+                                // Checkpoints at the same sequence
+                                // positions.
+                                if matches!(event, JournalEvent::Checkpoint { .. }) {
+                                    continue;
+                                }
+                                replica_input.publish(InputSlot {
+                                    connection_id: 0,
+                                    key_hash,
+                                    request_seq,
+                                    sequence,
+                                    timestamp_ns,
+                                    event,
+                                    publish_ts: trace_ts(),
+                                    recv_ts: trace_ts(),
+                                });
+                            }
+                            Err(e) => panic!("relay decode failed at off={off}: {e}"),
+                        }
+                    }
+                    repl_c0.commit();
+                    got_something = true;
+                }
+                // Ring 1 (unused in this test — only one "replica" is
+                // active). Drain defensively so the ring never fills up.
+                if repl_c1.try_read().is_some() {
+                    repl_c1.commit();
+                    got_something = true;
+                }
+                if !got_something {
+                    if relay_stop.load(Ordering::Relaxed) {
+                        return;
+                    }
+                    std::hint::spin_loop();
+                }
+            }
+        });
+
+        // --- primary + replica pipeline threads ---
+        let mut primary_output = primary.output_consumers.pop().unwrap();
+        let primary_out_shutdown = Arc::new(AtomicBool::new(false));
+        let primary_out_stop = Arc::clone(&primary_out_shutdown);
+        let t_primary_out = std::thread::spawn(move || {
+            while !primary_out_stop.load(Ordering::Relaxed) {
+                if primary_output.try_consume().is_some() {
+                    continue;
+                }
+                std::hint::spin_loop();
+            }
+        });
+
+        let mut replica_drain = replica.drain_consumer;
+        let replica_drain_stop = Arc::new(AtomicBool::new(false));
+        let replica_drain_stop2 = Arc::clone(&replica_drain_stop);
+        let t_replica_drain = std::thread::spawn(move || {
+            while !replica_drain_stop2.load(Ordering::Relaxed) {
+                if replica_drain.try_consume().is_some() {
+                    continue;
+                }
+                std::hint::spin_loop();
+            }
+        });
+
+        let p_j_stop = Arc::clone(&primary_shutdown);
+        let p_m_stop = Arc::clone(&primary_shutdown);
+        let t_p_journal = std::thread::spawn(move || primary.journal_stage.run(&p_j_stop));
+        let t_p_matching = std::thread::spawn(move || primary.matching_stage.run(&p_m_stop));
+
+        let r_j_stop = Arc::clone(&replica_shutdown);
+        let r_m_stop = Arc::clone(&replica_shutdown);
+        let t_r_journal = std::thread::spawn(move || replica.journal_stage.run(&r_j_stop));
+        let t_r_matching = std::thread::spawn(move || replica.matching_stage.run(&r_m_stop));
+
+        // Cross several checkpoint boundaries so any subtle interaction
+        // between the primary's auto-emit cadence and the relay/replica
+        // encode cadence shows up.
+        let total: u64 = CHECKPOINT_INTERVAL * 5 + 250;
+        for i in 0..total {
+            let side = if i % 2 == 0 { Side::Buy } else { Side::Sell };
+            primary.input_producer.publish(InputSlot {
+                connection_id: 1,
+                key_hash: 0,
+                request_seq: 0,
+                sequence: 0,
+                timestamp_ns: 1_000_000_000 + i,
+                event: JournalEvent::SubmitOrder {
+                    symbol: Symbol(1),
+                    order: limit_order(i + 1, AccountId(1), side, 100, 1),
+                },
+                publish_ts: trace_ts(),
+                recv_ts: trace_ts(),
+            });
+        }
+
+        std::thread::sleep(std::time::Duration::from_millis(3000));
+
+        // Shutdown order: primary pipelines first (flushes replication
+        // ring), then relay (so it drains any trailing batches), then
+        // replica (so it fully ingests what the relay published).
+        primary_shutdown.store(true, Ordering::Relaxed);
+        let primary_journal_result = t_p_journal.join().unwrap();
+        let _ = t_p_matching.join().unwrap();
+        relay_shutdown.store(true, Ordering::Relaxed);
+        let _ = t_relay.join();
+        // Give the replica a moment to ingest the relayed tail.
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        replica_shutdown.store(true, Ordering::Relaxed);
+        let replica_journal_result = t_r_journal.join().unwrap();
+        let _ = t_r_matching.join().unwrap();
+        primary_journal_result.expect("primary journal stage must exit cleanly");
+        replica_journal_result.expect("replica journal stage must exit cleanly");
+        primary_out_shutdown.store(true, Ordering::Relaxed);
+        let _ = t_primary_out.join();
+        replica_drain_stop.store(true, Ordering::Relaxed);
+        let _ = t_replica_drain.join();
+
+        // Walk both journals. Either failing with SequenceGap would
+        // match the production failure signature.
+        let scan = |label: &str, path: &std::path::Path| -> u64 {
+            let mut reader = crate::journal::JournalReader::open(path).unwrap();
+            let mut count = 0u64;
+            loop {
+                match reader.next_entry() {
+                    Ok(Some(_)) => count += 1,
+                    Ok(None) => break,
+                    Err(e) => panic!(
+                        "{label} journal read error after {count} user entries \
+                         (last_sequence = {:?}): {e}",
+                        reader.last_sequence()
+                    ),
+                }
+            }
+            count
+        };
+
+        let primary_count = scan("primary", &primary_path);
+        let replica_count = scan("replica", &replica_path);
+
+        assert_eq!(
+            primary_count, total,
+            "expected all {total} user events recoverable from the primary journal"
+        );
+        assert_eq!(
+            replica_count, total,
+            "expected all {total} user events recoverable from the replica journal"
+        );
+    }
+
     /// Verify the JournalStage uses pre-assigned sequences and timestamps
     /// when `InputSlot.sequence != 0` (replica mode). The encoded journal
     /// entries must carry the primary's sequence numbers, not locally

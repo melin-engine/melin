@@ -183,7 +183,19 @@ impl JournalReader {
         // subsequent entries, enforce strict continuity.
         if let Some(last) = self.last_sequence {
             let expected = last + 1;
-            if sequence != expected {
+            // `last` is the reader's internal cursor, which advances
+            // through transparent entries (GenesisHash, Checkpoint) as
+            // well as visible events. A duplicate-of-a-skipped-seq
+            // therefore produces `sequence == last`, not `sequence ==
+            // expected`. Split the two cases so operators can tell
+            // "data missing" from "writer emitted the same seq twice".
+            if sequence < expected {
+                return Err(JournalError::SequenceDuplicate {
+                    sequence,
+                    previous_seq: last,
+                });
+            }
+            if sequence > expected {
                 return Err(JournalError::SequenceGap {
                     expected,
                     actual: sequence,
@@ -748,6 +760,65 @@ mod tests {
             }
         }
         assert!(found_error, "expected corruption to be detected");
+    }
+
+    #[test]
+    fn duplicate_sequence_is_distinguished_from_gap() {
+        use crate::journal::codec;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("dup.journal");
+
+        let events = sample_events();
+        let (last_seq, valid_end) = {
+            let mut writer = JournalWriter::create(&path).unwrap();
+            for event in &events {
+                writer.append(event).unwrap();
+            }
+            // `next_sequence - 1` is the seq just written.
+            (writer.next_sequence() - 1, writer.write_pos())
+        };
+
+        // Craft a second entry that re-uses `last_seq` and append it at
+        // `valid_end`. This is exactly the on-disk shape the production
+        // `journal_verify` saw: a normal entry sharing a sequence with
+        // the one immediately before it.
+        // Oversized scratch buffer — `MAX_ENTRY_SIZE` (144) isn't
+        // re-exported from writer, and 256 is comfortable headroom.
+        let mut buf = [0u8; 256];
+        let written = codec::encode(
+            last_seq,
+            1, // arbitrary timestamp
+            0,
+            0,
+            events.last().unwrap(),
+            &mut buf,
+        )
+        .unwrap();
+        use std::os::unix::fs::FileExt;
+        let file = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+        file.write_all_at(&buf[..written], valid_end).unwrap();
+        drop(file);
+
+        // Walk until we hit the crafted duplicate.
+        let mut reader = JournalReader::open(&path).unwrap();
+        let err = loop {
+            match reader.next_entry() {
+                Ok(Some(_)) => continue,
+                Ok(None) => panic!("expected SequenceDuplicate, got clean EOF"),
+                Err(e) => break e,
+            }
+        };
+        match err {
+            JournalError::SequenceDuplicate {
+                sequence,
+                previous_seq,
+            } => {
+                assert_eq!(sequence, last_seq);
+                assert_eq!(previous_seq, last_seq);
+            }
+            other => panic!("expected SequenceDuplicate, got {other}"),
+        }
     }
 
     #[test]
