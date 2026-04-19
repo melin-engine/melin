@@ -31,21 +31,14 @@ use melin_protocol::types::{
 // Helpers
 // ---------------------------------------------------------------------------
 
-/// Find the melin-server binary. In integration tests for the server crate,
-/// Cargo sets `CARGO_BIN_EXE_melin-server` automatically.
+/// Find the melin-server binary. Resolved at compile time via `env!` so the
+/// path is baked into the test binary — this works under any runner (cargo
+/// test, cargo nextest, or direct invocation), not just cargo test which
+/// happens to also set this variable at runtime. Using `std::env::var` here
+/// would silently fall back to a stale release binary whose protocol may not
+/// match the current test, producing `Protocol(Truncated)` failures.
 fn server_bin() -> PathBuf {
-    // Use CARGO_BIN_EXE (debug binary, same compilation as the test).
-    // This ensures the test binary and server binary use the same codec.
-    if let Ok(p) = std::env::var("CARGO_BIN_EXE_melin-server") {
-        return PathBuf::from(p);
-    }
-    // Fallback: release binary.
-    let release =
-        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/release/melin-server");
-    if release.exists() {
-        return release;
-    }
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/debug/melin-server")
+    PathBuf::from(env!("CARGO_BIN_EXE_melin-server"))
 }
 
 /// Find a free TCP port by binding to port 0.
