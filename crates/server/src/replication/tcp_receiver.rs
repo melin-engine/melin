@@ -48,9 +48,11 @@ use super::protocol::{
     Ack, Handshake, MAX_CONTROL_FRAME, MAX_DATA_FRAME, PrimaryMessage, decode_primary_message,
     encode_ack, encode_handshake, read_frame, try_decode_data_batch,
 };
+use crate::amortized_timer::AmortizedTimer;
+
 use super::{
-    AmortizedTimer, PendingAckQueue, log_tcp_info, pin_replica_thread, shutdown_pipeline,
-    sleep_checking_flags, submit_batch_to_pipeline,
+    PendingAckQueue, log_tcp_info, pin_replica_thread, shutdown_pipeline, sleep_checking_flags,
+    submit_batch_to_pipeline,
 };
 
 /// io_uring streaming receive loop for the replica.

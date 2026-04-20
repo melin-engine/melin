@@ -8,7 +8,7 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use tracing::{error, info};
 
@@ -19,6 +19,8 @@ use melin_engine::journal::event::JournalEvent;
 use melin_engine::journal::pipeline::InputSlot;
 use melin_engine::journal::snapshot;
 use melin_engine::types::ExecutionReport;
+
+use crate::amortized_timer::AmortizedTimer;
 
 /// Maximum events consumed per batch. Matches the journal stage batch size
 /// for consistent throughput characteristics.
@@ -58,7 +60,15 @@ pub fn run(
     let mut batch: Vec<InputSlot> = Vec::with_capacity(SHADOW_BATCH_SIZE);
     batch.resize_with(SHADOW_BATCH_SIZE, InputSlot::default);
 
-    let mut last_snapshot = Instant::now();
+    // Snapshot-interval check on the busy-spin hot loop. A naive
+    // `last_snapshot.elapsed() >= snapshot_interval` per iteration ran
+    // `__vdso_clock_gettime` at loop frequency, which showed up in
+    // perf profiles as ~10 % of this process's total cycles landing on
+    // `clock_gettime` — for a check that fires at most once every
+    // 50 min (default `snapshot_interval_secs=3000`). `AmortizedTimer`
+    // defers the clock read to roughly 1 Hz, collapsing the overhead
+    // to a single `AND` + predictable branch per iteration.
+    let mut snapshot_timer = AmortizedTimer::new();
     let mut idle_spins: u32 = 0;
     // Track whether any events have been consumed. Prevents snapshotting
     // empty state before the first event arrives.
@@ -78,10 +88,9 @@ pub fn run(
             // Check snapshot timer even when idle — events may have been
             // consumed before the interval elapsed, and no more events
             // will arrive to trigger the post-consume check.
-            if has_events && last_snapshot.elapsed() >= snapshot_interval {
+            if has_events && snapshot_timer.tick(snapshot_interval).is_some() {
                 let last_seq = consumer.next_read().saturating_sub(1);
                 save_snapshot(&exchange, last_seq, &chain_hash_lock, &snapshot_path);
-                last_snapshot = Instant::now();
             }
             idle_wait(&mut idle_spins, busy_spin);
             continue;
@@ -103,10 +112,9 @@ pub fn run(
         }
 
         // Check if a snapshot is due.
-        if last_snapshot.elapsed() >= snapshot_interval {
+        if snapshot_timer.tick(snapshot_interval).is_some() {
             let last_seq = consumer.next_read() - 1;
             save_snapshot(&exchange, last_seq, &chain_hash_lock, &snapshot_path);
-            last_snapshot = Instant::now();
         }
     }
 }
@@ -248,6 +256,7 @@ mod tests {
     use melin_engine::journal::event::JournalEvent;
     use melin_engine::types::*;
     use std::num::NonZeroU64;
+    use std::time::Instant;
 
     fn nz(v: u64) -> NonZeroU64 {
         NonZeroU64::new(v).unwrap()

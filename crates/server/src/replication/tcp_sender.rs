@@ -680,7 +680,7 @@ fn live_stream_uring(
     // second, slow-SEND detection (CQE elapsed >= threshold), and a
     // TCP_INFO capture at the evict-exit point. Amortized so the
     // per-iteration cost is a single `AND` + predictable branch.
-    let mut info_log_timer = super::AmortizedTimer::new();
+    let mut info_log_timer = crate::amortized_timer::AmortizedTimer::new();
     let mut send_submit_ts: Option<std::time::Instant> = None;
     const SLOW_SEND_THRESHOLD_MS: u128 = 5;
 
