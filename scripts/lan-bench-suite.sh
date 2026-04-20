@@ -116,6 +116,14 @@ RUN_PLOTS="${RUN_PLOTS:-0}"
 # Override with REPLICA_EXTRA_ARGS="" to restore strict sync acks.
 REPLICA_EXTRA_ARGS="${REPLICA_EXTRA_ARGS---async-replica-ack}"
 
+# RUST_LOG override for every remote server launch below (primary +
+# replicas, TCP + DPDK). Leave at `info` for normal runs; bump to
+# `debug` (or a scoped directive like
+# `melin_server::replication=debug,info`) when diagnosing replication
+# stalls. Debug logs include per-second TCP_INFO snapshots per replica
+# socket, slow-SEND completions, and replica-side queue depths.
+BENCH_RUST_LOG="${RUST_LOG:-info}"
+
 # Order counts — override for quick smoke tests.
 THROUGHPUT_ORDERS="${THROUGHPUT_ORDERS:-100000000}"
 THROUGHPUT_CLIENTS="${THROUGHPUT_CLIENTS:-16}"
@@ -563,7 +571,7 @@ transport_start_tcp() {
 
     ssh $SSH_OPTS "$SERVER" "pkill -x melin-server 2>/dev/null; true"
     sleep 1
-    ssh $SSH_OPTS "$SERVER" "NO_COLOR=1 RUST_LOG=info nohup ${REPO_DIR}/target/release/melin-server \
+    ssh $SSH_OPTS "$SERVER" "NO_COLOR=1 RUST_LOG=${BENCH_RUST_LOG} nohup ${REPO_DIR}/target/release/melin-server \
             --bind ${SERVER_VLAN}:9876 \
             --health-bind ${SERVER_VLAN}:9878 \
             --journal ${JOURNAL_PATH} \
@@ -590,7 +598,7 @@ transport_start_tcp_repl() {
 
     ssh $SSH_OPTS "$SERVER" "pkill -x melin-server 2>/dev/null; true"
     sleep 1
-    ssh $SSH_OPTS "$SERVER" "NO_COLOR=1 RUST_LOG=info nohup ${REPO_DIR}/target/release/melin-server \
+    ssh $SSH_OPTS "$SERVER" "NO_COLOR=1 RUST_LOG=${BENCH_RUST_LOG} nohup ${REPO_DIR}/target/release/melin-server \
             --bind ${SERVER_VLAN}:9876 \
             --health-bind ${SERVER_VLAN}:9878 \
             --journal ${JOURNAL_PATH} \
@@ -603,7 +611,7 @@ transport_start_tcp_repl() {
 
     ssh $SSH_OPTS "$REPLICA" "pkill -x melin-server 2>/dev/null; true"
     sleep 1
-    ssh $SSH_OPTS "$REPLICA" "NO_COLOR=1 RUST_LOG=info nohup ${REPO_DIR}/target/release/melin-server \
+    ssh $SSH_OPTS "$REPLICA" "NO_COLOR=1 RUST_LOG=${BENCH_RUST_LOG} nohup ${REPO_DIR}/target/release/melin-server \
             --replica-of ${SERVER_VLAN}:${REPL_PORT} \
             --replication-key ${REPO_DIR}/repl.key \
             --journal ${replica_journal} \
@@ -639,7 +647,7 @@ transport_start_tcp_dual_repl() {
 
     ssh $SSH_OPTS "$SERVER" "pkill -x melin-server 2>/dev/null; true"
     sleep 1
-    ssh $SSH_OPTS "$SERVER" "NO_COLOR=1 RUST_LOG=info nohup ${REPO_DIR}/target/release/melin-server \
+    ssh $SSH_OPTS "$SERVER" "NO_COLOR=1 RUST_LOG=${BENCH_RUST_LOG} nohup ${REPO_DIR}/target/release/melin-server \
             --bind ${SERVER_VLAN}:9876 \
             --health-bind ${SERVER_VLAN}:9878 \
             --journal ${JOURNAL_PATH} \
@@ -652,7 +660,7 @@ transport_start_tcp_dual_repl() {
 
     ssh $SSH_OPTS "$REPLICA" "pkill -x melin-server 2>/dev/null; true"
     sleep 1
-    ssh $SSH_OPTS "$REPLICA" "NO_COLOR=1 RUST_LOG=info nohup ${REPO_DIR}/target/release/melin-server \
+    ssh $SSH_OPTS "$REPLICA" "NO_COLOR=1 RUST_LOG=${BENCH_RUST_LOG} nohup ${REPO_DIR}/target/release/melin-server \
             --replica-of ${SERVER_VLAN}:${REPL_PORT} \
             --replication-key ${REPO_DIR}/repl.key \
             --journal ${replica_journal} \
@@ -662,7 +670,7 @@ transport_start_tcp_dual_repl() {
 
     ssh $SSH_OPTS "$REPLICA2" "pkill -x melin-server 2>/dev/null; true"
     sleep 1
-    ssh $SSH_OPTS "$REPLICA2" "NO_COLOR=1 RUST_LOG=info nohup ${REPO_DIR}/target/release/melin-server \
+    ssh $SSH_OPTS "$REPLICA2" "NO_COLOR=1 RUST_LOG=${BENCH_RUST_LOG} nohup ${REPO_DIR}/target/release/melin-server \
             --replica-of ${SERVER_VLAN}:${REPL_PORT} \
             --replication-key ${REPO_DIR}/repl.key \
             --journal ${replica2_journal} \
@@ -830,7 +838,7 @@ transport_start_dpdk() {
 
     ssh $SSH_OPTS "$SERVER" "pkill -x melin-server 2>/dev/null; pkill -x melin-server.dpdk 2>/dev/null; true"
     sleep 1
-    ssh $SSH_OPTS "$SERVER" "NO_COLOR=1 RUST_LOG=info nohup ${DPDK_SERVER_BIN} \
+    ssh $SSH_OPTS "$SERVER" "NO_COLOR=1 RUST_LOG=${BENCH_RUST_LOG} nohup ${DPDK_SERVER_BIN} \
             --bind 0.0.0.0:9876 \
             --journal ${JOURNAL_PATH} \
             --authorized-keys ${REPO_DIR}/authorized_keys \
@@ -907,7 +915,7 @@ transport_start_dpdk_repl() {
 
     ssh $SSH_OPTS "$SERVER" "pkill -x melin-server 2>/dev/null; pkill -x melin-server.dpdk 2>/dev/null; true"
     sleep 1
-    ssh $SSH_OPTS "$SERVER" "NO_COLOR=1 RUST_LOG=info nohup ${DPDK_SERVER_BIN} \
+    ssh $SSH_OPTS "$SERVER" "NO_COLOR=1 RUST_LOG=${BENCH_RUST_LOG} nohup ${DPDK_SERVER_BIN} \
             --bind 0.0.0.0:9876 \
             --journal ${JOURNAL_PATH} \
             --authorized-keys ${REPO_DIR}/authorized_keys \
@@ -922,7 +930,7 @@ transport_start_dpdk_repl() {
 
     ssh $SSH_OPTS "$REPLICA" "pkill -x melin-server 2>/dev/null; pkill -x melin-server.dpdk 2>/dev/null; true"
     sleep 1
-    ssh $SSH_OPTS "$REPLICA" "NO_COLOR=1 RUST_LOG=info nohup ${DPDK_SERVER_BIN} \
+    ssh $SSH_OPTS "$REPLICA" "NO_COLOR=1 RUST_LOG=${BENCH_RUST_LOG} nohup ${DPDK_SERVER_BIN} \
             --replica-of ${SERVER_DPDK_IP}:${REPL_PORT} \
             --replication-key ${REPO_DIR}/repl.key \
             --journal ${replica_journal} \

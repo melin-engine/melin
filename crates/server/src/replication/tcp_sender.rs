@@ -676,6 +676,14 @@ fn live_stream_uring(
     let mut send_offset: usize = 0;
     let mut idle_spins: u32 = 0;
 
+    // Diagnostic (RUST_LOG=debug): per-slot TCP_INFO snapshot once a
+    // second, slow-SEND detection (CQE elapsed >= threshold), and a
+    // TCP_INFO capture at the evict-exit point. Amortized so the
+    // per-iteration cost is a single `AND` + predictable branch.
+    let mut info_log_timer = super::AmortizedTimer::new();
+    let mut send_submit_ts: Option<std::time::Instant> = None;
+    const SLOW_SEND_THRESHOLD_MS: u128 = 5;
+
     // Submit initial RECV.
     let sqe = opcode::Recv::new(
         types::Fixed(0),
@@ -692,6 +700,11 @@ fn live_stream_uring(
             return Ok(());
         }
         if evict_flag.load(Ordering::Relaxed) {
+            // Capture the TCP state at the moment of eviction — the
+            // critical frame for comparing an evicted slot's teardown
+            // against the still-live slot's socket state when
+            // diagnosing post-eviction regressions.
+            super::log_tcp_info(tcp_fd, "evict_exit", slot_idx);
             info!(slot = slot_idx, "handler exiting: evicted by journal stage");
             return Ok(());
         }
@@ -720,6 +733,7 @@ fn live_stream_uring(
                 send_in_flight = true;
                 send_offset = 0;
                 *last_send = std::time::Instant::now();
+                send_submit_ts = Some(*last_send);
                 idle_spins = 0;
             } else if last_send.elapsed() >= heartbeat_interval {
                 // No data — send heartbeat if idle.
@@ -732,7 +746,17 @@ fn live_stream_uring(
                 send_in_flight = true;
                 send_offset = 0;
                 *last_send = std::time::Instant::now();
+                send_submit_ts = Some(*last_send);
             }
+        }
+
+        // Periodic TCP_INFO dump — debug level. Amortized so the
+        // per-iteration cost is a single `AND` + predictable branch.
+        if info_log_timer
+            .tick(std::time::Duration::from_secs(1))
+            .is_some()
+        {
+            super::log_tcp_info(tcp_fd, "live_stream", slot_idx);
         }
 
         // --- Submit SQEs to kernel (non-blocking) ---
@@ -821,7 +845,22 @@ fn live_stream_uring(
                     let sent = result as usize;
                     send_offset += sent;
                     if send_offset >= send_buf.len() {
-                        // Fully sent.
+                        // Fully sent. Measure end-to-end SEND latency: a
+                        // healthy io_uring TCP SEND completes in
+                        // microseconds; > threshold implies the kernel
+                        // waited on cwnd / peer window / retransmit.
+                        if let Some(ts) = send_submit_ts.take() {
+                            let elapsed = ts.elapsed();
+                            if elapsed.as_millis() >= SLOW_SEND_THRESHOLD_MS {
+                                tracing::debug!(
+                                    slot = slot_idx,
+                                    elapsed_us = elapsed.as_micros() as u64,
+                                    bytes = send_buf.len(),
+                                    "slow SEND completion"
+                                );
+                                super::log_tcp_info(tcp_fd, "slow_send", slot_idx);
+                            }
+                        }
                         metrics.bytes_sent[slot_idx]
                             .fetch_add(send_buf.len() as u64, Ordering::Relaxed);
                         send_buf.clear();

@@ -49,8 +49,8 @@ use super::protocol::{
     encode_ack, encode_handshake, read_frame, try_decode_data_batch,
 };
 use super::{
-    PendingAckQueue, pin_replica_thread, shutdown_pipeline, sleep_checking_flags,
-    submit_batch_to_pipeline,
+    AmortizedTimer, PendingAckQueue, log_tcp_info, pin_replica_thread, shutdown_pipeline,
+    sleep_checking_flags, submit_batch_to_pipeline,
 };
 
 /// io_uring streaming receive loop for the replica.
@@ -192,6 +192,16 @@ fn replica_stream_uring(
     unsafe { ring.submission().push(&sqe).expect("SQ full") };
     let mut multishot_active = true;
 
+    // Diagnostic: once a second dump userspace queue depths and the
+    // kernel's view of the socket (RUST_LOG=debug). Under healthy
+    // streaming parse_buf stays near-empty, pending_acks holds ~1
+    // entry, ack_send_in_flight is 0–1. Deviations tell us where data
+    // is piling up during a slowdown. `AmortizedTimer` keeps the
+    // per-iteration cost to a single `AND` + predictable branch.
+    let mut info_log_timer = AmortizedTimer::new();
+    let mut bytes_received_since_log: u64 = 0;
+    let mut acks_sent_since_log: u64 = 0;
+
     loop {
         // --- Check flags ---
         if shutdown.load(Ordering::Relaxed) {
@@ -272,6 +282,7 @@ fn replica_stream_uring(
             unsafe { ring.submission().push(&sqe).expect("SQ full") };
             ack_send_in_flight = true;
             ack_send_offset = 0;
+            acks_sent_since_log += 1;
         }
 
         // --- Backpressure: if pending_acks full, drain in-flight SEND
@@ -410,6 +421,28 @@ fn replica_stream_uring(
             unsafe { ring.submission().push(&sqe).expect("SQ full") };
             ack_send_in_flight = true;
             ack_send_offset = 0;
+            acks_sent_since_log += 1;
+        }
+
+        // Periodic userspace + TCP summary (debug level). Amortized to
+        // ~1 Hz with negligible per-iteration cost — gives a
+        // time-aligned view of bytes/sec RECV rate, ack submission
+        // rate, parse_buf accumulation (user-space queue from RECV to
+        // push), pending_acks depth (journal fsync wait queue,
+        // typically ~1), and in-flight SEND state.
+        if let Some(elapsed) = info_log_timer.tick(std::time::Duration::from_secs(1)) {
+            let secs = elapsed.as_secs_f64();
+            tracing::debug!(
+                bytes_per_sec = (bytes_received_since_log as f64 / secs) as u64,
+                acks_per_sec = (acks_sent_since_log as f64 / secs) as u64,
+                parse_buf_len = parse_buf.len(),
+                pending_acks_len = pending_acks.len(),
+                ack_send_in_flight,
+                "replica userspace"
+            );
+            log_tcp_info(tcp_fd, "replica_recv", 0);
+            bytes_received_since_log = 0;
+            acks_sent_since_log = 0;
         }
 
         // --- Submit SQEs and drain CQEs ---
@@ -473,6 +506,7 @@ fn replica_stream_uring(
                     // delayed-ACK timer.
                     arm_tcp_quickack(tcp_fd);
                     let n = result as usize;
+                    bytes_received_since_log += n as u64;
                     let buf_id = (flags >> IORING_CQE_BUFFER_SHIFT) as usize;
                     let buf_ptr = unsafe { pool_ptr.add(buf_id * RECV_BUF_SIZE) };
                     // SAFETY: kernel wrote `n` bytes (n = result) into
