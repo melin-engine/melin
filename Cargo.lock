@@ -1574,6 +1574,7 @@ dependencies = [
  "libc",
  "melin-app",
  "melin-disruptor",
+ "melin-journal",
  "proptest",
  "rustc-hash",
  "tempfile",
@@ -1586,6 +1587,22 @@ version = "0.3.0"
 dependencies = [
  "ed25519-dalek",
  "proptest",
+]
+
+[[package]]
+name = "melin-journal"
+version = "0.1.0"
+dependencies = [
+ "blake3",
+ "crc32c",
+ "getrandom 0.3.4",
+ "hdrhistogram",
+ "io-uring",
+ "libc",
+ "melin-app",
+ "melin-disruptor",
+ "tempfile",
+ "tracing",
 ]
 
 [[package]]

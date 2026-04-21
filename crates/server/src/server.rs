@@ -22,10 +22,10 @@ use std::hash::{Hash, Hasher};
 use tracing::{debug, error, info, warn};
 
 use melin_engine::exchange::Exchange;
+use melin_engine::journal::JournalError;
+use melin_engine::journal::JournalWriter;
 use melin_engine::journal::JournaledExchange;
-use melin_engine::journal::error::JournalError;
 use melin_engine::journal::pipeline::{Pipeline, build_pipeline_with_replication};
-use melin_engine::journal::writer::JournalWriter;
 
 use melin_protocol::auth::{AuthorizedKeys, Permission};
 use melin_protocol::blocking::BlockingFrameWriter;
@@ -1010,10 +1010,10 @@ fn run_as_primary<L: BlockingTransportListener>(
         }
     }
     if let Some(producer) = seed_producer {
-        use melin_engine::journal::event::JournalEvent;
+        use melin_engine::journal::JournalEvent;
         use melin_engine::journal::pipeline::InputSlot;
         use melin_engine::journal::trace::trace_ts;
-        use melin_engine::journal::writer::wall_clock_nanos;
+        use melin_engine::journal::wall_clock_nanos;
         use melin_engine::types::{AccountId, CurrencyId, InstrumentSpec, Symbol};
 
         let seed_start = std::time::Instant::now();
@@ -1027,13 +1027,15 @@ fn run_as_primary<L: BlockingTransportListener>(
                 request_seq: 0,
                 sequence: 0,
                 timestamp_ns: wall_clock_nanos(),
-                event: JournalEvent::AddInstrument {
-                    spec: InstrumentSpec {
-                        symbol: Symbol(i),
-                        base: CurrencyId(i * 2),
-                        quote: CurrencyId(i * 2 + 1),
+                event: JournalEvent::App(
+                    melin_engine::trading_event::TradingEvent::AddInstrument {
+                        spec: InstrumentSpec {
+                            symbol: Symbol(i),
+                            base: CurrencyId(i * 2),
+                            quote: CurrencyId(i * 2 + 1),
+                        },
                     },
-                },
+                ),
                 publish_ts: trace_ts(),
                 recv_ts: trace_ts(),
             });
@@ -1050,10 +1052,12 @@ fn run_as_primary<L: BlockingTransportListener>(
                 request_seq: 0,
                 sequence: 0,
                 timestamp_ns: wall_clock_nanos(),
-                event: JournalEvent::ProvisionAccount {
-                    account: AccountId(acct),
-                    amount: u64::MAX / 4,
-                },
+                event: JournalEvent::App(
+                    melin_engine::trading_event::TradingEvent::ProvisionAccount {
+                        account: AccountId(acct),
+                        amount: u64::MAX / 4,
+                    },
+                ),
                 publish_ts: trace_ts(),
                 recv_ts: trace_ts(),
             });
@@ -1836,10 +1840,10 @@ pub fn run_dpdk(
         }
     }
     if let Some(producer) = seed_producer {
-        use melin_engine::journal::event::JournalEvent;
+        use melin_engine::journal::JournalEvent;
         use melin_engine::journal::pipeline::InputSlot;
         use melin_engine::journal::trace::trace_ts;
-        use melin_engine::journal::writer::wall_clock_nanos;
+        use melin_engine::journal::wall_clock_nanos;
         use melin_engine::types::{AccountId, CurrencyId, InstrumentSpec, Symbol};
 
         // `sequence: 0` — the journal stage allocates sequences in
@@ -1851,13 +1855,15 @@ pub fn run_dpdk(
                 request_seq: 0,
                 sequence: 0,
                 timestamp_ns: wall_clock_nanos(),
-                event: JournalEvent::AddInstrument {
-                    spec: InstrumentSpec {
-                        symbol: Symbol(i),
-                        base: CurrencyId(i * 2),
-                        quote: CurrencyId(i * 2 + 1),
+                event: JournalEvent::App(
+                    melin_engine::trading_event::TradingEvent::AddInstrument {
+                        spec: InstrumentSpec {
+                            symbol: Symbol(i),
+                            base: CurrencyId(i * 2),
+                            quote: CurrencyId(i * 2 + 1),
+                        },
                     },
-                },
+                ),
                 publish_ts: trace_ts(),
                 recv_ts: trace_ts(),
             });
@@ -1871,10 +1877,12 @@ pub fn run_dpdk(
                 request_seq: 0,
                 sequence: 0,
                 timestamp_ns: wall_clock_nanos(),
-                event: JournalEvent::ProvisionAccount {
-                    account: AccountId(acct),
-                    amount: u64::MAX / 4,
-                },
+                event: JournalEvent::App(
+                    melin_engine::trading_event::TradingEvent::ProvisionAccount {
+                        account: AccountId(acct),
+                        amount: u64::MAX / 4,
+                    },
+                ),
                 publish_ts: trace_ts(),
                 recv_ts: trace_ts(),
             });

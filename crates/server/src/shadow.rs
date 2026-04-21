@@ -15,7 +15,7 @@ use tracing::{error, info};
 use melin_disruptor::ring;
 use melin_disruptor::seqlock::SeqLock;
 use melin_engine::exchange::Exchange;
-use melin_engine::journal::event::JournalEvent;
+use melin_engine::journal::JournalEvent;
 use melin_engine::journal::pipeline::InputSlot;
 use melin_engine::journal::snapshot;
 use melin_engine::types::ExecutionReport;
@@ -168,70 +168,91 @@ fn dispatch_event(
     }
 
     match *event {
-        JournalEvent::AddInstrument { spec } => {
+        JournalEvent::App(melin_engine::trading_event::TradingEvent::AddInstrument { spec }) => {
             exchange.add_instrument(spec);
         }
-        JournalEvent::Deposit {
+        JournalEvent::App(melin_engine::trading_event::TradingEvent::Deposit {
             account,
             currency,
             amount,
-        } => {
+        }) => {
             exchange.deposit(account, currency, amount);
         }
-        JournalEvent::SubmitOrder { symbol, order } => {
+        JournalEvent::App(melin_engine::trading_event::TradingEvent::SubmitOrder {
+            symbol,
+            order,
+        }) => {
             exchange.execute(symbol, order, reports);
         }
-        JournalEvent::CancelOrder {
+        JournalEvent::App(melin_engine::trading_event::TradingEvent::CancelOrder {
             account,
             order_id,
             symbol,
-        } => {
+        }) => {
             exchange.cancel(symbol, account, order_id, reports);
         }
-        JournalEvent::SetRiskLimits { symbol, limits } => {
+        JournalEvent::App(melin_engine::trading_event::TradingEvent::SetRiskLimits {
+            symbol,
+            limits,
+        }) => {
             exchange.set_risk_limits(symbol, limits);
         }
-        JournalEvent::CancelAll { account } => {
+        JournalEvent::App(melin_engine::trading_event::TradingEvent::CancelAll { account }) => {
             exchange.cancel_all(account, reports);
         }
-        JournalEvent::EndOfDay => {
+        JournalEvent::App(melin_engine::trading_event::TradingEvent::EndOfDay) => {
             exchange.end_of_day(reports);
         }
-        JournalEvent::SetCircuitBreaker { symbol, config } => {
+        JournalEvent::App(melin_engine::trading_event::TradingEvent::SetCircuitBreaker {
+            symbol,
+            config,
+        }) => {
             exchange.set_circuit_breaker(symbol, config);
         }
-        JournalEvent::CancelReplace {
+        JournalEvent::App(melin_engine::trading_event::TradingEvent::CancelReplace {
             symbol,
             account,
             order_id,
             new_price,
             new_quantity,
-        } => {
+        }) => {
             exchange.cancel_replace(symbol, account, order_id, new_price, new_quantity, reports);
         }
-        JournalEvent::SetFeeSchedule { symbol, schedule } => {
+        JournalEvent::App(melin_engine::trading_event::TradingEvent::SetFeeSchedule {
+            symbol,
+            schedule,
+        }) => {
             exchange.set_fee_schedule(symbol, schedule, reports);
         }
-        JournalEvent::ProvisionAccount { account, amount } => {
+        JournalEvent::App(melin_engine::trading_event::TradingEvent::ProvisionAccount {
+            account,
+            amount,
+        }) => {
             exchange.provision_account(account, amount);
         }
-        JournalEvent::Withdraw {
+        JournalEvent::App(melin_engine::trading_event::TradingEvent::Withdraw {
             account,
             currency,
             amount,
-        } => {
+        }) => {
             // Replay path: deterministic — rejections reproduce the
             // original live outcome and were already surfaced to the
             // client. Discarding here is intentional and safe.
             let _ = exchange.withdraw(account, currency, amount);
         }
-        JournalEvent::DisableInstrument { symbol } => {
+        JournalEvent::App(melin_engine::trading_event::TradingEvent::DisableInstrument {
+            symbol,
+        }) => {
             exchange.disable_instrument(symbol, reports);
         }
-        JournalEvent::EnableInstrument { symbol } => {
+        JournalEvent::App(melin_engine::trading_event::TradingEvent::EnableInstrument {
+            symbol,
+        }) => {
             exchange.enable_instrument(symbol, reports);
         }
-        JournalEvent::RemoveInstrument { symbol } => {
+        JournalEvent::App(melin_engine::trading_event::TradingEvent::RemoveInstrument {
+            symbol,
+        }) => {
             exchange.remove_instrument(symbol, reports);
         }
         JournalEvent::Tick { now_ns } => {
@@ -241,7 +262,8 @@ fn dispatch_event(
             // (tests, manually constructed events).
             exchange.drain_due_scheduled_tasks(now_ns, reports);
         }
-        JournalEvent::QueryStats | JournalEvent::QueryPosition { .. } => {
+        JournalEvent::App(melin_engine::trading_event::TradingEvent::QueryStats)
+        | JournalEvent::App(melin_engine::trading_event::TradingEvent::QueryPosition { .. }) => {
             // Read-only — no state change.
         }
         JournalEvent::GenesisHash { .. } | JournalEvent::Checkpoint { .. } => {
@@ -253,7 +275,7 @@ fn dispatch_event(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use melin_engine::journal::event::JournalEvent;
+    use melin_engine::journal::JournalEvent;
     use melin_engine::types::*;
     use std::num::NonZeroU64;
     use std::time::Instant;
@@ -281,60 +303,64 @@ mod tests {
 
         let events = vec![
             // --- Instrument setup ---
-            JournalEvent::AddInstrument {
+            JournalEvent::App(melin_engine::trading_event::TradingEvent::AddInstrument {
                 spec: InstrumentSpec {
                     symbol: Symbol(1),
                     base: CurrencyId(0),
                     quote: CurrencyId(1),
                 },
-            },
+            }),
             // --- Account provisioning and deposits ---
-            JournalEvent::ProvisionAccount {
-                account: AccountId(1),
-                amount: 200_000,
-            },
-            JournalEvent::Deposit {
+            JournalEvent::App(
+                melin_engine::trading_event::TradingEvent::ProvisionAccount {
+                    account: AccountId(1),
+                    amount: 200_000,
+                },
+            ),
+            JournalEvent::App(melin_engine::trading_event::TradingEvent::Deposit {
                 account: AccountId(1),
                 currency: CurrencyId(1),
                 amount: 100_000,
-            },
-            JournalEvent::Deposit {
+            }),
+            JournalEvent::App(melin_engine::trading_event::TradingEvent::Deposit {
                 account: AccountId(2),
                 currency: CurrencyId(0),
                 amount: 500,
-            },
-            JournalEvent::Deposit {
+            }),
+            JournalEvent::App(melin_engine::trading_event::TradingEvent::Deposit {
                 account: AccountId(2),
                 currency: CurrencyId(1),
                 amount: 50_000,
-            },
+            }),
             // --- Risk limits ---
-            JournalEvent::SetRiskLimits {
+            JournalEvent::App(melin_engine::trading_event::TradingEvent::SetRiskLimits {
                 symbol: Symbol(1),
                 limits: RiskLimits {
                     max_order_qty: Some(qty(1000)),
                     max_order_notional: None,
                 },
-            },
+            }),
             // --- Circuit breaker ---
-            JournalEvent::SetCircuitBreaker {
-                symbol: Symbol(1),
-                config: CircuitBreakerConfig {
-                    price_band_lower: Some(price(50)),
-                    price_band_upper: Some(price(200)),
-                    halted: false,
+            JournalEvent::App(
+                melin_engine::trading_event::TradingEvent::SetCircuitBreaker {
+                    symbol: Symbol(1),
+                    config: CircuitBreakerConfig {
+                        price_band_lower: Some(price(50)),
+                        price_band_upper: Some(price(200)),
+                        halted: false,
+                    },
                 },
-            },
+            ),
             // --- Fee schedule ---
-            JournalEvent::SetFeeSchedule {
+            JournalEvent::App(melin_engine::trading_event::TradingEvent::SetFeeSchedule {
                 symbol: Symbol(1),
                 schedule: FeeSchedule {
                     maker_fee_bps: -5,
                     taker_fee_bps: 10,
                 },
-            },
+            }),
             // --- Place a sell order (rests on book) ---
-            JournalEvent::SubmitOrder {
+            JournalEvent::App(melin_engine::trading_event::TradingEvent::SubmitOrder {
                 symbol: Symbol(1),
                 order: Order {
                     id: OrderId(1),
@@ -349,9 +375,9 @@ mod tests {
                     stp: SelfTradeProtection::Allow,
                     expiry_ns: 0,
                 },
-            },
+            }),
             // --- Place a second sell order to cancel later ---
-            JournalEvent::SubmitOrder {
+            JournalEvent::App(melin_engine::trading_event::TradingEvent::SubmitOrder {
                 symbol: Symbol(1),
                 order: Order {
                     id: OrderId(2),
@@ -366,23 +392,23 @@ mod tests {
                     stp: SelfTradeProtection::Allow,
                     expiry_ns: 0,
                 },
-            },
+            }),
             // --- Cancel-replace: move order 2 to price 105, qty 25 ---
-            JournalEvent::CancelReplace {
+            JournalEvent::App(melin_engine::trading_event::TradingEvent::CancelReplace {
                 symbol: Symbol(1),
                 account: AccountId(2),
                 order_id: OrderId(2),
                 new_price: price(105),
                 new_quantity: qty(25),
-            },
+            }),
             // --- Cancel order 2 ---
-            JournalEvent::CancelOrder {
+            JournalEvent::App(melin_engine::trading_event::TradingEvent::CancelOrder {
                 account: AccountId(2),
                 order_id: OrderId(2),
                 symbol: Symbol(1),
-            },
+            }),
             // --- Partial fill: buy 20 of the 50-lot sell ---
-            JournalEvent::SubmitOrder {
+            JournalEvent::App(melin_engine::trading_event::TradingEvent::SubmitOrder {
                 symbol: Symbol(1),
                 order: Order {
                     id: OrderId(1),
@@ -397,16 +423,16 @@ mod tests {
                     stp: SelfTradeProtection::Allow,
                     expiry_ns: 0,
                 },
-            },
+            }),
             // --- Withdraw some funds ---
-            JournalEvent::Withdraw {
+            JournalEvent::App(melin_engine::trading_event::TradingEvent::Withdraw {
                 account: AccountId(1),
                 currency: CurrencyId(1),
                 amount: 5_000,
-            },
+            }),
             // --- Place a GTD order, then drive a Tick past its expiry to
             //     trigger the scheduler-driven cancel ---
-            JournalEvent::SubmitOrder {
+            JournalEvent::App(melin_engine::trading_event::TradingEvent::SubmitOrder {
                 symbol: Symbol(1),
                 order: Order {
                     id: OrderId(3),
@@ -421,10 +447,10 @@ mod tests {
                     stp: SelfTradeProtection::Allow,
                     expiry_ns: 1_000_000,
                 },
-            },
+            }),
             JournalEvent::Tick { now_ns: 2_000_000 },
             // --- Place an order then cancel all for that account ---
-            JournalEvent::SubmitOrder {
+            JournalEvent::App(melin_engine::trading_event::TradingEvent::SubmitOrder {
                 symbol: Symbol(1),
                 order: Order {
                     id: OrderId(4),
@@ -439,12 +465,12 @@ mod tests {
                     stp: SelfTradeProtection::Allow,
                     expiry_ns: 0,
                 },
-            },
-            JournalEvent::CancelAll {
+            }),
+            JournalEvent::App(melin_engine::trading_event::TradingEvent::CancelAll {
                 account: AccountId(1),
-            },
+            }),
             // --- No-ops that should not affect state ---
-            JournalEvent::QueryStats,
+            JournalEvent::App(melin_engine::trading_event::TradingEvent::QueryStats),
             JournalEvent::GenesisHash { hash: [0xAA; 32] },
             JournalEvent::Checkpoint {
                 chain_hash: [0xBB; 32],
@@ -453,19 +479,19 @@ mod tests {
             // --- Instrument lifecycle ---
             // Add a second instrument, place an order, then disable (cancels order),
             // enable, and disable+remove.
-            JournalEvent::AddInstrument {
+            JournalEvent::App(melin_engine::trading_event::TradingEvent::AddInstrument {
                 spec: InstrumentSpec {
                     symbol: Symbol(2),
                     base: CurrencyId(2),
                     quote: CurrencyId(1),
                 },
-            },
-            JournalEvent::Deposit {
+            }),
+            JournalEvent::App(melin_engine::trading_event::TradingEvent::Deposit {
                 account: AccountId(1),
                 currency: CurrencyId(2),
                 amount: 10_000,
-            },
-            JournalEvent::SubmitOrder {
+            }),
+            JournalEvent::App(melin_engine::trading_event::TradingEvent::SubmitOrder {
                 symbol: Symbol(2),
                 order: Order {
                     id: OrderId(10),
@@ -480,13 +506,21 @@ mod tests {
                     stp: SelfTradeProtection::Allow,
                     expiry_ns: 0,
                 },
-            },
-            JournalEvent::DisableInstrument { symbol: Symbol(2) },
-            JournalEvent::EnableInstrument { symbol: Symbol(2) },
-            JournalEvent::DisableInstrument { symbol: Symbol(2) },
-            JournalEvent::RemoveInstrument { symbol: Symbol(2) },
+            }),
+            JournalEvent::App(
+                melin_engine::trading_event::TradingEvent::DisableInstrument { symbol: Symbol(2) },
+            ),
+            JournalEvent::App(
+                melin_engine::trading_event::TradingEvent::EnableInstrument { symbol: Symbol(2) },
+            ),
+            JournalEvent::App(
+                melin_engine::trading_event::TradingEvent::DisableInstrument { symbol: Symbol(2) },
+            ),
+            JournalEvent::App(
+                melin_engine::trading_event::TradingEvent::RemoveInstrument { symbol: Symbol(2) },
+            ),
             // --- End of day ---
-            JournalEvent::EndOfDay,
+            JournalEvent::App(melin_engine::trading_event::TradingEvent::EndOfDay),
         ];
 
         // Shadow path: dispatch_event. Pass timestamp 0 throughout — this
@@ -502,41 +536,53 @@ mod tests {
         for event in &events {
             primary_reports.clear();
             match *event {
-                JournalEvent::AddInstrument { spec } => primary.add_instrument(spec),
-                JournalEvent::Deposit {
+                JournalEvent::App(melin_engine::trading_event::TradingEvent::AddInstrument {
+                    spec,
+                }) => primary.add_instrument(spec),
+                JournalEvent::App(melin_engine::trading_event::TradingEvent::Deposit {
                     account,
                     currency,
                     amount,
-                } => primary.deposit(account, currency, amount),
-                JournalEvent::SubmitOrder { symbol, order } => {
+                }) => primary.deposit(account, currency, amount),
+                JournalEvent::App(melin_engine::trading_event::TradingEvent::SubmitOrder {
+                    symbol,
+                    order,
+                }) => {
                     primary.execute(symbol, order, &mut primary_reports);
                 }
-                JournalEvent::CancelOrder {
+                JournalEvent::App(melin_engine::trading_event::TradingEvent::CancelOrder {
                     account,
                     order_id,
                     symbol,
-                } => {
+                }) => {
                     primary.cancel(symbol, account, order_id, &mut primary_reports);
                 }
-                JournalEvent::SetRiskLimits { symbol, limits } => {
+                JournalEvent::App(melin_engine::trading_event::TradingEvent::SetRiskLimits {
+                    symbol,
+                    limits,
+                }) => {
                     primary.set_risk_limits(symbol, limits);
                 }
-                JournalEvent::CancelAll { account } => {
+                JournalEvent::App(melin_engine::trading_event::TradingEvent::CancelAll {
+                    account,
+                }) => {
                     primary.cancel_all(account, &mut primary_reports);
                 }
-                JournalEvent::EndOfDay => {
+                JournalEvent::App(melin_engine::trading_event::TradingEvent::EndOfDay) => {
                     primary.end_of_day(&mut primary_reports);
                 }
-                JournalEvent::SetCircuitBreaker { symbol, config } => {
+                JournalEvent::App(
+                    melin_engine::trading_event::TradingEvent::SetCircuitBreaker { symbol, config },
+                ) => {
                     primary.set_circuit_breaker(symbol, config);
                 }
-                JournalEvent::CancelReplace {
+                JournalEvent::App(melin_engine::trading_event::TradingEvent::CancelReplace {
                     symbol,
                     account,
                     order_id,
                     new_price,
                     new_quantity,
-                } => {
+                }) => {
                     primary.cancel_replace(
                         symbol,
                         account,
@@ -546,34 +592,47 @@ mod tests {
                         &mut primary_reports,
                     );
                 }
-                JournalEvent::SetFeeSchedule { symbol, schedule } => {
+                JournalEvent::App(melin_engine::trading_event::TradingEvent::SetFeeSchedule {
+                    symbol,
+                    schedule,
+                }) => {
                     primary.set_fee_schedule(symbol, schedule, &mut primary_reports);
                 }
-                JournalEvent::ProvisionAccount { account, amount } => {
+                JournalEvent::App(
+                    melin_engine::trading_event::TradingEvent::ProvisionAccount { account, amount },
+                ) => {
                     primary.provision_account(account, amount);
                 }
-                JournalEvent::Withdraw {
+                JournalEvent::App(melin_engine::trading_event::TradingEvent::Withdraw {
                     account,
                     currency,
                     amount,
-                } => {
+                }) => {
                     // Replay path: deterministic — see note in apply_event.
                     let _ = primary.withdraw(account, currency, amount);
                 }
-                JournalEvent::DisableInstrument { symbol } => {
+                JournalEvent::App(
+                    melin_engine::trading_event::TradingEvent::DisableInstrument { symbol },
+                ) => {
                     primary.disable_instrument(symbol, &mut primary_reports);
                 }
-                JournalEvent::EnableInstrument { symbol } => {
+                JournalEvent::App(
+                    melin_engine::trading_event::TradingEvent::EnableInstrument { symbol },
+                ) => {
                     primary.enable_instrument(symbol, &mut primary_reports);
                 }
-                JournalEvent::RemoveInstrument { symbol } => {
+                JournalEvent::App(
+                    melin_engine::trading_event::TradingEvent::RemoveInstrument { symbol },
+                ) => {
                     primary.remove_instrument(symbol, &mut primary_reports);
                 }
                 JournalEvent::Tick { now_ns } => {
                     primary.drain_due_scheduled_tasks(now_ns, &mut primary_reports);
                 }
-                JournalEvent::QueryStats
-                | JournalEvent::QueryPosition { .. }
+                JournalEvent::App(melin_engine::trading_event::TradingEvent::QueryStats)
+                | JournalEvent::App(melin_engine::trading_event::TradingEvent::QueryPosition {
+                    ..
+                })
                 | JournalEvent::GenesisHash { .. }
                 | JournalEvent::Checkpoint { .. } => {}
             }
@@ -683,11 +742,11 @@ mod tests {
             request_seq: 0,
             sequence: 0,
             timestamp_ns: 0,
-            event: JournalEvent::Deposit {
+            event: JournalEvent::App(melin_engine::trading_event::TradingEvent::Deposit {
                 account: AccountId(1),
                 currency: CurrencyId(1),
                 amount: 1000,
-            },
+            }),
             publish_ts: Default::default(),
             recv_ts: Default::default(),
         });
@@ -697,11 +756,11 @@ mod tests {
             request_seq: 0,
             sequence: 0,
             timestamp_ns: 0,
-            event: JournalEvent::Deposit {
+            event: JournalEvent::App(melin_engine::trading_event::TradingEvent::Deposit {
                 account: AccountId(1),
                 currency: CurrencyId(1),
                 amount: 500,
-            },
+            }),
             publish_ts: Default::default(),
             recv_ts: Default::default(),
         });

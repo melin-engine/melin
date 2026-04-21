@@ -629,11 +629,11 @@ fn run_pipeline_bench(
     json_path: Option<&std::path::Path>,
     max_journal_batch: usize,
 ) {
+    use melin_engine::journal::JournalEvent;
     use melin_engine::journal::JournalWriter;
-    use melin_engine::journal::event::JournalEvent;
     use melin_engine::journal::pipeline::{InputSlot, build_pipeline_with_replication};
     use melin_engine::journal::trace::trace_ts;
-    use melin_engine::journal::writer::wall_clock_nanos;
+    use melin_engine::journal::wall_clock_nanos;
 
     let nz = |v: u64| NonZeroU64::new(v).expect("non-zero");
 
@@ -726,22 +726,24 @@ fn run_pipeline_bench(
                     request_seq: 0,
                     sequence: 0,
                     timestamp_ns: wall_clock_nanos(),
-                    event: JournalEvent::SubmitOrder {
-                        symbol: Symbol(1),
-                        order: Order {
-                            id: order_id,
-                            account: AccountId(1),
-                            side,
-                            order_type: OrderType::Limit {
-                                price: Price(nz(100)),
-                                post_only: false,
+                    event: JournalEvent::App(
+                        melin_engine::trading_event::TradingEvent::SubmitOrder {
+                            symbol: Symbol(1),
+                            order: Order {
+                                id: order_id,
+                                account: AccountId(1),
+                                side,
+                                order_type: OrderType::Limit {
+                                    price: Price(nz(100)),
+                                    post_only: false,
+                                },
+                                time_in_force: TimeInForce::GTC,
+                                quantity: Quantity(nz(1)),
+                                stp: SelfTradeProtection::Allow,
+                                expiry_ns: 0,
                             },
-                            time_in_force: TimeInForce::GTC,
-                            quantity: Quantity(nz(1)),
-                            stp: SelfTradeProtection::Allow,
-                            expiry_ns: 0,
                         },
-                    },
+                    ),
                     publish_ts: trace_ts(),
                     recv_ts: trace_ts(),
                 });

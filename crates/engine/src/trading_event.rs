@@ -659,6 +659,17 @@ const _: fn() = || {
     let _ = core::mem::size_of::<Side>();
 };
 
+// Compile-time size bound: the disruptor ring slot embeds `JournalEvent`
+// by value, so keeping it cache-line-friendly matters. One cache line
+// (64 B) is the target; niche optimisation on `Price`/`Quantity`
+// (`NonZeroU64`) packs the outer discriminant into otherwise-wasted bits
+// so the generic wrapper costs no extra bytes. Any variant that grows
+// past this trips the assert at compile time.
+const _: () = {
+    let n = core::mem::size_of::<melin_journal::JournalEvent<TradingEvent>>();
+    assert!(n <= 64, "JournalEvent<TradingEvent> must stay <= 64 bytes");
+};
+
 #[cfg(test)]
 mod tests {
     use super::*;

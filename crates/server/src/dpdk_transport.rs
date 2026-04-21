@@ -41,10 +41,10 @@ use std::time::{Duration, Instant};
 use ed25519_dalek::{Verifier, VerifyingKey};
 use melin_disruptor::ring;
 use melin_dpdk::transport::DpdkTransport;
-use melin_engine::journal::event::JournalEvent;
+use melin_engine::journal::JournalEvent;
 use melin_engine::journal::pipeline::InputSlot;
 use melin_engine::journal::trace::trace_ts;
-use melin_engine::journal::writer::wall_clock_nanos;
+use melin_engine::journal::wall_clock_nanos;
 use melin_protocol::auth::{AuthorizedKeys, Permission};
 use melin_protocol::codec;
 use melin_protocol::message::{ConnectionId, Request, ResponseKind};
@@ -655,7 +655,10 @@ fn process_trading_frames(
                     // disruptor cursor order — see `InputSlot::sequence`.
                     let ts = if matches!(
                         event,
-                        JournalEvent::QueryStats | JournalEvent::QueryPosition { .. }
+                        JournalEvent::App(melin_engine::trading_event::TradingEvent::QueryStats)
+                            | JournalEvent::App(
+                                melin_engine::trading_event::TradingEvent::QueryPosition { .. }
+                            )
                     ) {
                         0
                     } else {
@@ -733,7 +736,7 @@ mod tests {
     use super::*;
     use std::num::NonZeroU64;
 
-    use melin_engine::journal::event::JournalEvent;
+    use melin_engine::journal::JournalEvent;
     use melin_engine::types::*;
 
     // --- try_extract_frame tests ---
@@ -838,7 +841,9 @@ mod tests {
             order,
         };
         let event = shared_request::to_event(&req);
-        assert!(matches!(event, JournalEvent::SubmitOrder { symbol, .. } if symbol == Symbol(1)));
+        assert!(
+            matches!(event, JournalEvent::App(melin_engine::trading_event::TradingEvent::SubmitOrder { symbol, .. }) if symbol == Symbol(1))
+        );
     }
 
     #[test]
@@ -850,7 +855,7 @@ mod tests {
         };
         let event = shared_request::to_event(&req);
         assert!(
-            matches!(event, JournalEvent::CancelOrder { symbol, account, order_id }
+            matches!(event, JournalEvent::App(melin_engine::trading_event::TradingEvent::CancelOrder { symbol, account, order_id })
                 if symbol == Symbol(2) && account == AccountId(5) && order_id == OrderId(42))
         );
     }
@@ -861,7 +866,9 @@ mod tests {
             account: AccountId(7),
         };
         let event = shared_request::to_event(&req);
-        assert!(matches!(event, JournalEvent::CancelAll { account } if account == AccountId(7)));
+        assert!(
+            matches!(event, JournalEvent::App(melin_engine::trading_event::TradingEvent::CancelAll { account }) if account == AccountId(7))
+        );
     }
 
     #[test]
@@ -873,7 +880,7 @@ mod tests {
         };
         let event = shared_request::to_event(&req);
         assert!(
-            matches!(event, JournalEvent::Deposit { account, currency, amount }
+            matches!(event, JournalEvent::App(melin_engine::trading_event::TradingEvent::Deposit { account, currency, amount })
                 if account == AccountId(1) && currency == CurrencyId(2) && amount == 1000)
         );
     }
@@ -887,7 +894,9 @@ mod tests {
         };
         let req = Request::AddInstrument { spec };
         let event = shared_request::to_event(&req);
-        assert!(matches!(event, JournalEvent::AddInstrument { spec: s } if s.symbol == Symbol(10)));
+        assert!(
+            matches!(event, JournalEvent::App(melin_engine::trading_event::TradingEvent::AddInstrument { spec: s }) if s.symbol == Symbol(10))
+        );
     }
 
     #[test]
@@ -901,7 +910,7 @@ mod tests {
         };
         let event = shared_request::to_event(&req);
         assert!(
-            matches!(event, JournalEvent::CancelReplace { order_id, .. } if order_id == OrderId(5))
+            matches!(event, JournalEvent::App(melin_engine::trading_event::TradingEvent::CancelReplace { order_id, .. }) if order_id == OrderId(5))
         );
     }
 
@@ -912,7 +921,9 @@ mod tests {
             limits: RiskLimits::default(),
         };
         let event = shared_request::to_event(&req);
-        assert!(matches!(event, JournalEvent::SetRiskLimits { symbol, .. } if symbol == Symbol(1)));
+        assert!(
+            matches!(event, JournalEvent::App(melin_engine::trading_event::TradingEvent::SetRiskLimits { symbol, .. }) if symbol == Symbol(1))
+        );
     }
 
     #[test]
@@ -923,7 +934,7 @@ mod tests {
         };
         let event = shared_request::to_event(&req);
         assert!(
-            matches!(event, JournalEvent::SetCircuitBreaker { symbol, .. } if symbol == Symbol(1))
+            matches!(event, JournalEvent::App(melin_engine::trading_event::TradingEvent::SetCircuitBreaker { symbol, .. }) if symbol == Symbol(1))
         );
     }
 
@@ -935,7 +946,7 @@ mod tests {
         };
         let event = shared_request::to_event(&req);
         assert!(
-            matches!(event, JournalEvent::SetFeeSchedule { symbol, .. } if symbol == Symbol(3))
+            matches!(event, JournalEvent::App(melin_engine::trading_event::TradingEvent::SetFeeSchedule { symbol, .. }) if symbol == Symbol(3))
         );
     }
 
@@ -943,7 +954,10 @@ mod tests {
     fn request_to_event_query_stats() {
         let req = Request::QueryStats;
         let event = shared_request::to_event(&req);
-        assert!(matches!(event, JournalEvent::QueryStats));
+        assert!(matches!(
+            event,
+            JournalEvent::App(melin_engine::trading_event::TradingEvent::QueryStats)
+        ));
     }
 
     #[test]

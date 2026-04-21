@@ -22,7 +22,7 @@
 //! periods rather than the sole source of clock progress.
 
 use melin_disruptor::ring;
-use melin_engine::journal::event::JournalEvent;
+use melin_engine::journal::JournalEvent;
 use melin_engine::journal::pipeline::InputSlot;
 use melin_engine::journal::trace::trace_ts;
 

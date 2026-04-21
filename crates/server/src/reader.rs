@@ -27,10 +27,10 @@ use tracing::{debug, error};
 
 use crate::server::ControlEvent;
 use melin_disruptor::ring;
-use melin_engine::journal::event::JournalEvent;
+use melin_engine::journal::JournalEvent;
 use melin_engine::journal::pipeline::InputSlot;
 use melin_engine::journal::trace::trace_ts;
-use melin_engine::journal::writer::wall_clock_nanos;
+use melin_engine::journal::wall_clock_nanos;
 use melin_protocol::auth::Permission;
 use melin_protocol::codec;
 
@@ -826,7 +826,10 @@ fn process_frames<R>(
         // not journaled and skip even the timestamp.
         let ts = if matches!(
             event,
-            JournalEvent::QueryStats | JournalEvent::QueryPosition { .. }
+            JournalEvent::App(melin_engine::trading_event::TradingEvent::QueryStats)
+                | JournalEvent::App(
+                    melin_engine::trading_event::TradingEvent::QueryPosition { .. }
+                )
         ) {
             0
         } else {

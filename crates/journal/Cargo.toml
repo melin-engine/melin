@@ -1,0 +1,31 @@
+[package]
+name = "melin-journal"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+name = "melin_journal"
+path = "src/lib.rs"
+
+[features]
+## BLAKE3 tamper-evident hash chain. Hashes every journal entry into a
+## cryptographic chain verified at checkpoints. Catches deliberate
+## tampering (CRC32C only catches corruption). Adds ~15-30 ns per event.
+hash-chain = ["dep:blake3"]
+## Record per-stage latency histograms. Adds ~20 ns of clock overhead
+## per event; not for production. Consumed by pipeline stages downstream.
+latency-trace = ["dep:hdrhistogram"]
+
+[dependencies]
+blake3 = { version = "1", optional = true }
+crc32c = "0.6"
+getrandom = "0.3"
+hdrhistogram = { version = "7", optional = true }
+io-uring = "0.7"
+libc = { workspace = true }
+tracing = { workspace = true }
+melin-app = { path = "../app" }
+melin-disruptor = { path = "../disruptor" }
+
+[dev-dependencies]
+tempfile = "3"

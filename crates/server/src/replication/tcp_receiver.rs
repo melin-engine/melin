@@ -705,7 +705,7 @@ enum SessionExit {
 pub type ReceiverResult = Result<
     Option<(
         melin_engine::exchange::Exchange,
-        melin_engine::journal::writer::JournalWriter,
+        melin_engine::journal::JournalWriter,
     )>,
     Box<dyn std::error::Error>,
 >;
@@ -723,7 +723,7 @@ pub fn run_receiver(
     async_ack: bool,
 ) -> ReceiverResult {
     use melin_engine::exchange::Exchange;
-    use melin_engine::journal::writer::JournalWriter;
+    use melin_engine::journal::JournalWriter;
 
     // Recover local state from journal (if any). On first call this may
     // be (None, None) for a fresh replica. After a reconnect, the pipeline

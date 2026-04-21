@@ -10,7 +10,7 @@ edition = "2024"
 no-persist = []
 ## Record per-stage latency histograms and print a summary on shutdown.
 ## Adds ~20ns of clock overhead per event. Not for production.
-latency-trace = ["dep:hdrhistogram"]
+latency-trace = ["dep:hdrhistogram", "melin-journal/latency-trace"]
 ## Kept for backward compatibility — io_uring is now always used.
 io-uring = []
 ## Print per-stage busy/idle utilization on shutdown. Identifies the pipeline
@@ -20,7 +20,7 @@ pipeline-stats = []
 ## cryptographic chain verified at checkpoints. Catches deliberate tampering
 ## (not just corruption — CRC32C handles that). Adds ~15-30ns per event.
 ## Disable for maximum throughput when audit tamper-evidence is not required.
-hash-chain = ["dep:blake3"]
+hash-chain = ["dep:blake3", "melin-journal/hash-chain"]
 
 default = []
 
@@ -35,6 +35,7 @@ libc = { workspace = true }
 tracing = { workspace = true }
 melin-app = { path = "../app" }
 melin-disruptor = { path = "../disruptor" }
+melin-journal = { path = "../journal" }
 astenn = { git = "ssh://git@github.com/pierre-l/astenn.git" }
 
 [dev-dependencies]

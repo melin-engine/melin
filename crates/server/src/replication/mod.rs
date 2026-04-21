@@ -318,17 +318,14 @@ pub(super) fn sleep_checking_flags(
 pub(super) fn shutdown_pipeline(
     shutdown_flag: &AtomicBool,
     journal_handle: std::thread::JoinHandle<
-        Result<
-            melin_engine::journal::writer::JournalWriter,
-            melin_engine::journal::error::JournalError,
-        >,
+        Result<melin_engine::journal::JournalWriter, melin_engine::journal::JournalError>,
     >,
     matching_handle: std::thread::JoinHandle<melin_engine::exchange::Exchange>,
     drain_handle: std::thread::JoinHandle<()>,
     shadow_handle: Option<std::thread::JoinHandle<()>>,
 ) -> Option<(
     melin_engine::exchange::Exchange,
-    melin_engine::journal::writer::JournalWriter,
+    melin_engine::journal::JournalWriter,
 )> {
     shutdown_flag.store(true, Ordering::Relaxed);
     let writer = match journal_handle.join() {

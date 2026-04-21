@@ -23,12 +23,12 @@ use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::time::Duration;
 
 use crate::exchange::Exchange;
-use crate::journal::error::JournalError;
-use crate::journal::event::JournalEvent;
+use crate::journal::JournalEvent;
+use crate::journal::JournalWriter;
 use crate::journal::replication::{ReplicationConsumer, ReplicationProducer};
-use crate::journal::trace::{TraceTimestamp, trace_ts};
-use crate::journal::writer::JournalWriter;
 use crate::types::{AccountId, CurrencyId, ExecutionReport, OrderId, RejectReason, Symbol};
+use melin_journal::JournalError;
+use melin_journal::trace::{TraceTimestamp, trace_ts};
 
 use melin_disruptor::padding::Sequence;
 use melin_disruptor::ring;
@@ -167,11 +167,11 @@ impl Default for InputSlot {
             request_seq: 0,
             sequence: 0,
             timestamp_ns: 0,
-            event: JournalEvent::Deposit {
+            event: JournalEvent::App(crate::trading_event::TradingEvent::Deposit {
                 account: crate::types::AccountId(0),
                 currency: crate::types::CurrencyId(0),
                 amount: 0,
-            },
+            }),
             publish_ts: trace_ts(),
             recv_ts: trace_ts(),
         }
@@ -411,12 +411,12 @@ impl JournalStage {
         let mut idle_count: u64 = 0;
 
         #[cfg(feature = "latency-trace")]
-        let mut wakeup_hist = crate::journal::trace::StageHistogram::new(
+        let mut wakeup_hist = melin_journal::trace::StageHistogram::new(
             "journal: disruptor wakeup (publish → journal consume)",
         );
         #[cfg(feature = "latency-trace")]
         let mut batch_hist =
-            crate::journal::trace::StageHistogram::new("journal: batch processing (write + sync)");
+            melin_journal::trace::StageHistogram::new("journal: batch processing (write + sync)");
 
         loop {
             if shutdown.load(std::sync::atomic::Ordering::Relaxed) {
@@ -458,7 +458,7 @@ impl JournalStage {
 
                 #[cfg(feature = "latency-trace")]
                 for slot in &batch[..count] {
-                    wakeup_hist.record_ns(crate::journal::trace::trace_elapsed_ns(
+                    wakeup_hist.record_ns(melin_journal::trace::trace_elapsed_ns(
                         slot.publish_ts,
                         batch_start,
                     ));
@@ -484,7 +484,10 @@ impl JournalStage {
                     for slot in &batch[..count] {
                         if matches!(
                             slot.event,
-                            JournalEvent::QueryStats | JournalEvent::QueryPosition { .. }
+                            JournalEvent::App(crate::trading_event::TradingEvent::QueryStats)
+                                | JournalEvent::App(
+                                    crate::trading_event::TradingEvent::QueryPosition { .. }
+                                )
                         ) {
                             continue;
                         }
@@ -527,7 +530,7 @@ impl JournalStage {
                 }
 
                 #[cfg(feature = "latency-trace")]
-                batch_hist.record_ns(crate::journal::trace::trace_elapsed_ns(
+                batch_hist.record_ns(melin_journal::trace::trace_elapsed_ns(
                     batch_start,
                     trace_ts(),
                 ));
@@ -688,7 +691,10 @@ impl JournalStage {
                 for slot in &batch[..count] {
                     if matches!(
                         slot.event,
-                        JournalEvent::QueryStats | JournalEvent::QueryPosition { .. }
+                        JournalEvent::App(crate::trading_event::TradingEvent::QueryStats)
+                            | JournalEvent::App(
+                                crate::trading_event::TradingEvent::QueryPosition { .. }
+                            )
                     ) {
                         continue;
                     }
@@ -811,7 +817,7 @@ impl JournalStage {
         // when the CQE arrives. `inflight_seq` is the consumer's `next_read`
         // at the time of submission — committing it advances the cursor to
         // exactly the events covered by the durable write.
-        let mut inflight: Option<(super::writer::AsyncWriteBatch, u64)> = None;
+        let mut inflight: Option<(melin_journal::AsyncWriteBatch, u64)> = None;
 
         let mut busy_count: u64 = 0;
         let mut idle_count: u64 = 0;
@@ -880,7 +886,10 @@ impl JournalStage {
                 for slot in &batch[..count] {
                     if matches!(
                         slot.event,
-                        JournalEvent::QueryStats | JournalEvent::QueryPosition { .. }
+                        JournalEvent::App(crate::trading_event::TradingEvent::QueryStats)
+                            | JournalEvent::App(
+                                crate::trading_event::TradingEvent::QueryPosition { .. }
+                            )
                     ) {
                         continue;
                     }
@@ -1148,9 +1157,16 @@ impl MatchingStage {
     /// Extract the order ID from the event for reject reports, or OrderId(0) if N/A.
     fn extract_order_id(event: &JournalEvent) -> OrderId {
         match event {
-            JournalEvent::SubmitOrder { order, .. } => order.id,
-            JournalEvent::CancelOrder { order_id, .. }
-            | JournalEvent::CancelReplace { order_id, .. } => *order_id,
+            JournalEvent::App(crate::trading_event::TradingEvent::SubmitOrder {
+                order, ..
+            }) => order.id,
+            JournalEvent::App(crate::trading_event::TradingEvent::CancelOrder {
+                order_id, ..
+            })
+            | JournalEvent::App(crate::trading_event::TradingEvent::CancelReplace {
+                order_id,
+                ..
+            }) => *order_id,
             _ => OrderId(0),
         }
     }
@@ -1158,13 +1174,23 @@ impl MatchingStage {
     /// Extract the account ID from the event for reject reports, or AccountId(0) if N/A.
     fn extract_account_id(event: &JournalEvent) -> AccountId {
         match event {
-            JournalEvent::SubmitOrder { order, .. } => order.account,
-            JournalEvent::CancelOrder { account, .. }
-            | JournalEvent::CancelAll { account }
-            | JournalEvent::CancelReplace { account, .. }
-            | JournalEvent::Deposit { account, .. }
-            | JournalEvent::Withdraw { account, .. }
-            | JournalEvent::ProvisionAccount { account, .. } => *account,
+            JournalEvent::App(crate::trading_event::TradingEvent::SubmitOrder {
+                order, ..
+            }) => order.account,
+            JournalEvent::App(crate::trading_event::TradingEvent::CancelOrder {
+                account, ..
+            })
+            | JournalEvent::App(crate::trading_event::TradingEvent::CancelAll { account })
+            | JournalEvent::App(crate::trading_event::TradingEvent::CancelReplace {
+                account,
+                ..
+            })
+            | JournalEvent::App(crate::trading_event::TradingEvent::Deposit { account, .. })
+            | JournalEvent::App(crate::trading_event::TradingEvent::Withdraw { account, .. })
+            | JournalEvent::App(crate::trading_event::TradingEvent::ProvisionAccount {
+                account,
+                ..
+            }) => *account,
             _ => AccountId(0),
         }
     }
@@ -1172,12 +1198,26 @@ impl MatchingStage {
     /// Extract the symbol from the event for reject reports, or Symbol(0) if N/A.
     fn extract_symbol(event: &JournalEvent) -> Symbol {
         match event {
-            JournalEvent::SubmitOrder { symbol, .. }
-            | JournalEvent::CancelOrder { symbol, .. }
-            | JournalEvent::CancelReplace { symbol, .. }
-            | JournalEvent::SetRiskLimits { symbol, .. }
-            | JournalEvent::SetCircuitBreaker { symbol, .. }
-            | JournalEvent::SetFeeSchedule { symbol, .. } => *symbol,
+            JournalEvent::App(crate::trading_event::TradingEvent::SubmitOrder {
+                symbol, ..
+            })
+            | JournalEvent::App(crate::trading_event::TradingEvent::CancelOrder {
+                symbol, ..
+            })
+            | JournalEvent::App(crate::trading_event::TradingEvent::CancelReplace {
+                symbol, ..
+            })
+            | JournalEvent::App(crate::trading_event::TradingEvent::SetRiskLimits {
+                symbol, ..
+            })
+            | JournalEvent::App(crate::trading_event::TradingEvent::SetCircuitBreaker {
+                symbol,
+                ..
+            })
+            | JournalEvent::App(crate::trading_event::TradingEvent::SetFeeSchedule {
+                symbol,
+                ..
+            }) => *symbol,
             _ => Symbol(0),
         }
     }
@@ -1212,12 +1252,12 @@ impl MatchingStage {
         let mut idle_count: u64 = 0;
 
         #[cfg(feature = "latency-trace")]
-        let mut wakeup_hist = crate::journal::trace::StageHistogram::new(
+        let mut wakeup_hist = melin_journal::trace::StageHistogram::new(
             "matching: disruptor wakeup (publish → matching consume)",
         );
         #[cfg(feature = "latency-trace")]
         let mut execute_hist =
-            crate::journal::trace::StageHistogram::new("matching: execute (process_event)");
+            melin_journal::trace::StageHistogram::new("matching: execute (process_event)");
 
         loop {
             if shutdown.load(std::sync::atomic::Ordering::Relaxed) {
@@ -1257,10 +1297,8 @@ impl MatchingStage {
                 #[cfg(feature = "latency-trace")]
                 {
                     let now = trace_ts();
-                    wakeup_hist.record_ns(crate::journal::trace::trace_elapsed_ns(
-                        slot.publish_ts,
-                        now,
-                    ));
+                    wakeup_hist
+                        .record_ns(melin_journal::trace::trace_elapsed_ns(slot.publish_ts, now));
                 }
 
                 reports.clear();
@@ -1271,13 +1309,15 @@ impl MatchingStage {
                 // QueryStats and QueryPosition are handled inline — they read
                 // matching-stage-owned state and publish directly without
                 // touching the Exchange. Not counted in events_processed.
-                if matches!(slot.event, JournalEvent::QueryStats) {
+                if matches!(
+                    slot.event,
+                    JournalEvent::App(crate::trading_event::TradingEvent::QueryStats)
+                ) {
                     #[cfg(feature = "latency-trace")]
                     let exec_end = trace_ts();
                     #[cfg(feature = "latency-trace")]
-                    execute_hist.record_ns(crate::journal::trace::trace_elapsed_ns(
-                        exec_start, exec_end,
-                    ));
+                    execute_hist
+                        .record_ns(melin_journal::trace::trace_elapsed_ns(exec_start, exec_end));
 
                     #[allow(clippy::let_unit_value)]
                     let match_complete_ts = trace_ts();
@@ -1310,13 +1350,15 @@ impl MatchingStage {
                     continue;
                 }
 
-                if let JournalEvent::QueryPosition { account } = slot.event {
+                if let JournalEvent::App(crate::trading_event::TradingEvent::QueryPosition {
+                    account,
+                }) = slot.event
+                {
                     #[cfg(feature = "latency-trace")]
                     let exec_end = trace_ts();
                     #[cfg(feature = "latency-trace")]
-                    execute_hist.record_ns(crate::journal::trace::trace_elapsed_ns(
-                        exec_start, exec_end,
-                    ));
+                    execute_hist
+                        .record_ns(melin_journal::trace::trace_elapsed_ns(exec_start, exec_end));
 
                     #[allow(clippy::let_unit_value)]
                     let match_complete_ts = trace_ts();
@@ -1375,9 +1417,8 @@ impl MatchingStage {
                 let exec_end = trace_ts();
 
                 #[cfg(feature = "latency-trace")]
-                execute_hist.record_ns(crate::journal::trace::trace_elapsed_ns(
-                    exec_start, exec_end,
-                ));
+                execute_hist
+                    .record_ns(melin_journal::trace::trace_elapsed_ns(exec_start, exec_end));
 
                 #[allow(clippy::let_unit_value)] // ZST when latency-trace is disabled
                 let match_complete_ts = trace_ts();
@@ -1425,7 +1466,8 @@ impl MatchingStage {
             // emitting a bare BatchEnd without a preceding response.
             if matches!(
                 slot.event,
-                JournalEvent::QueryStats | JournalEvent::QueryPosition { .. }
+                JournalEvent::App(crate::trading_event::TradingEvent::QueryStats)
+                    | JournalEvent::App(crate::trading_event::TradingEvent::QueryPosition { .. })
             ) {
                 continue;
             }
@@ -1490,45 +1532,54 @@ impl MatchingStage {
         }
 
         match slot.event {
-            JournalEvent::AddInstrument { spec } => {
+            JournalEvent::App(crate::trading_event::TradingEvent::AddInstrument { spec }) => {
                 self.exchange.add_instrument(spec);
             }
-            JournalEvent::Deposit {
+            JournalEvent::App(crate::trading_event::TradingEvent::Deposit {
                 account,
                 currency,
                 amount,
-            } => {
+            }) => {
                 self.exchange.deposit(account, currency, amount);
             }
-            JournalEvent::SubmitOrder { symbol, order } => {
+            JournalEvent::App(crate::trading_event::TradingEvent::SubmitOrder {
+                symbol,
+                order,
+            }) => {
                 self.exchange.execute(symbol, order, reports);
             }
-            JournalEvent::CancelOrder {
+            JournalEvent::App(crate::trading_event::TradingEvent::CancelOrder {
                 symbol,
                 account,
                 order_id,
-            } => {
+            }) => {
                 self.exchange.cancel(symbol, account, order_id, reports);
             }
-            JournalEvent::SetRiskLimits { symbol, limits } => {
+            JournalEvent::App(crate::trading_event::TradingEvent::SetRiskLimits {
+                symbol,
+                limits,
+            }) => {
                 self.exchange.set_risk_limits(symbol, limits);
             }
-            JournalEvent::CancelAll { account } => {
+            JournalEvent::App(crate::trading_event::TradingEvent::CancelAll { account }) => {
                 self.exchange.cancel_all(account, reports);
             }
-            JournalEvent::EndOfDay => {
+            JournalEvent::App(crate::trading_event::TradingEvent::EndOfDay) => {
                 self.exchange.end_of_day(reports);
             }
-            JournalEvent::SetCircuitBreaker { symbol, config } => {
+            JournalEvent::App(crate::trading_event::TradingEvent::SetCircuitBreaker {
+                symbol,
+                config,
+            }) => {
                 self.exchange.set_circuit_breaker(symbol, config);
             }
-            JournalEvent::CancelReplace {
+            JournalEvent::App(crate::trading_event::TradingEvent::CancelReplace {
                 symbol,
                 account,
                 order_id,
                 new_price,
                 new_quantity,
-            } => {
+            }) => {
                 self.exchange.cancel_replace(
                     symbol,
                     account,
@@ -1538,17 +1589,23 @@ impl MatchingStage {
                     reports,
                 );
             }
-            JournalEvent::SetFeeSchedule { symbol, schedule } => {
+            JournalEvent::App(crate::trading_event::TradingEvent::SetFeeSchedule {
+                symbol,
+                schedule,
+            }) => {
                 self.exchange.set_fee_schedule(symbol, schedule, reports);
             }
-            JournalEvent::ProvisionAccount { account, amount } => {
+            JournalEvent::App(crate::trading_event::TradingEvent::ProvisionAccount {
+                account,
+                amount,
+            }) => {
                 self.exchange.provision_account(account, amount);
             }
-            JournalEvent::Withdraw {
+            JournalEvent::App(crate::trading_event::TradingEvent::Withdraw {
                 account,
                 currency,
                 amount,
-            } => {
+            }) => {
                 // Replay path: rejections (insufficient balance, resting
                 // orders, unknown account) are deterministic — they
                 // reproduce the original live outcome and were already
@@ -1556,13 +1613,13 @@ impl MatchingStage {
                 // intentional and safe.
                 let _ = self.exchange.withdraw(account, currency, amount);
             }
-            JournalEvent::DisableInstrument { symbol } => {
+            JournalEvent::App(crate::trading_event::TradingEvent::DisableInstrument { symbol }) => {
                 self.exchange.disable_instrument(symbol, reports);
             }
-            JournalEvent::EnableInstrument { symbol } => {
+            JournalEvent::App(crate::trading_event::TradingEvent::EnableInstrument { symbol }) => {
                 self.exchange.enable_instrument(symbol, reports);
             }
-            JournalEvent::RemoveInstrument { symbol } => {
+            JournalEvent::App(crate::trading_event::TradingEvent::RemoveInstrument { symbol }) => {
                 self.exchange.remove_instrument(symbol, reports);
             }
             JournalEvent::Tick { now_ns } => {
@@ -1574,7 +1631,8 @@ impl MatchingStage {
                 // drives time forward as documented on `JournalEvent::Tick`.
                 self.exchange.drain_due_scheduled_tasks(now_ns, reports);
             }
-            JournalEvent::QueryStats | JournalEvent::QueryPosition { .. } => {
+            JournalEvent::App(crate::trading_event::TradingEvent::QueryStats)
+            | JournalEvent::App(crate::trading_event::TradingEvent::QueryPosition { .. }) => {
                 // Handled inline in the run loop before process_event is called.
                 // This arm exists only for exhaustiveness.
             }
@@ -2023,13 +2081,13 @@ mod tests {
             request_seq: 0,
             sequence: 0,
             timestamp_ns: 1_000_000_000,
-            event: JournalEvent::AddInstrument {
+            event: JournalEvent::App(crate::trading_event::TradingEvent::AddInstrument {
                 spec: InstrumentSpec {
                     symbol: Symbol(1),
                     base: CurrencyId(0),
                     quote: CurrencyId(1),
                 },
-            },
+            }),
             publish_ts: trace_ts(),
             recv_ts: trace_ts(),
         });
@@ -2039,11 +2097,11 @@ mod tests {
             request_seq: 0,
             sequence: 0,
             timestamp_ns: 1_000_000_001,
-            event: JournalEvent::Deposit {
+            event: JournalEvent::App(crate::trading_event::TradingEvent::Deposit {
                 account: AccountId(1),
                 currency: CurrencyId(1),
                 amount: 100_000,
-            },
+            }),
             publish_ts: trace_ts(),
             recv_ts: trace_ts(),
         });
@@ -2062,10 +2120,16 @@ mod tests {
             let mut reader = crate::journal::JournalReader::open(&path).unwrap();
             let entry1 = reader.next_entry().unwrap().unwrap();
             assert_eq!(entry1.sequence, FIRST_SEQ);
-            assert!(matches!(entry1.event, JournalEvent::AddInstrument { .. }));
+            assert!(matches!(
+                entry1.event,
+                JournalEvent::App(crate::trading_event::TradingEvent::AddInstrument { .. })
+            ));
             let entry2 = reader.next_entry().unwrap().unwrap();
             assert_eq!(entry2.sequence, FIRST_SEQ + 1);
-            assert!(matches!(entry2.event, JournalEvent::Deposit { .. }));
+            assert!(matches!(
+                entry2.event,
+                JournalEvent::App(crate::trading_event::TradingEvent::Deposit { .. })
+            ));
             assert!(reader.next_entry().unwrap().is_none());
         }
     }
@@ -2091,7 +2155,7 @@ mod tests {
     #[cfg(all(feature = "hash-chain", not(feature = "no-persist")))]
     #[test]
     fn primary_journal_sequences_contiguous_across_checkpoint_boundary() {
-        use crate::journal::writer::CHECKPOINT_INTERVAL;
+        use crate::journal::CHECKPOINT_INTERVAL;
 
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("checkpoint_boundary.journal");
@@ -2122,11 +2186,11 @@ mod tests {
                 request_seq: 0,
                 sequence: 0,
                 timestamp_ns: 1_000_000_000 + i,
-                event: JournalEvent::Deposit {
+                event: JournalEvent::App(crate::trading_event::TradingEvent::Deposit {
                     account: AccountId((i as u32) + 1),
                     currency: CurrencyId(0),
                     amount: 100,
-                },
+                }),
                 publish_ts: trace_ts(),
                 recv_ts: trace_ts(),
             });
@@ -2185,8 +2249,8 @@ mod tests {
     #[cfg(all(feature = "hash-chain", not(feature = "no-persist")))]
     #[test]
     fn primary_and_replica_journals_contiguous_across_checkpoint_boundary() {
+        use crate::journal::CHECKPOINT_INTERVAL;
         use crate::journal::codec;
-        use crate::journal::writer::CHECKPOINT_INTERVAL;
 
         let dir = tempfile::tempdir().unwrap();
         let primary_path = dir.path().join("primary.journal");
@@ -2371,10 +2435,10 @@ mod tests {
                 request_seq: 0,
                 sequence: 0,
                 timestamp_ns: 1_000_000_000 + i,
-                event: JournalEvent::SubmitOrder {
+                event: JournalEvent::App(crate::trading_event::TradingEvent::SubmitOrder {
                     symbol: Symbol(1),
                     order: limit_order(i + 1, AccountId(1), side, 100, 1),
-                },
+                }),
                 publish_ts: trace_ts(),
                 recv_ts: trace_ts(),
             });
@@ -2465,13 +2529,13 @@ mod tests {
             request_seq: 0,
             sequence: 2,
             timestamp_ns: 1_700_000_000_000_000_000, // fixed timestamp
-            event: JournalEvent::AddInstrument {
+            event: JournalEvent::App(crate::trading_event::TradingEvent::AddInstrument {
                 spec: InstrumentSpec {
                     symbol: Symbol(1),
                     base: CurrencyId(0),
                     quote: CurrencyId(1),
                 },
-            },
+            }),
             publish_ts: trace_ts(),
             recv_ts: trace_ts(),
         });
@@ -2481,11 +2545,11 @@ mod tests {
             request_seq: 0,
             sequence: 3,
             timestamp_ns: 1_700_000_000_000_000_001,
-            event: JournalEvent::Deposit {
+            event: JournalEvent::App(crate::trading_event::TradingEvent::Deposit {
                 account: AccountId(1),
                 currency: CurrencyId(0),
                 amount: 500,
-            },
+            }),
             publish_ts: trace_ts(),
             recv_ts: trace_ts(),
         });
@@ -2508,12 +2572,18 @@ mod tests {
             let entry1 = reader.next_entry().unwrap().unwrap();
             assert_eq!(entry1.sequence, 2);
             assert_eq!(entry1.timestamp_ns, 1_700_000_000_000_000_000);
-            assert!(matches!(entry1.event, JournalEvent::AddInstrument { .. }));
+            assert!(matches!(
+                entry1.event,
+                JournalEvent::App(crate::trading_event::TradingEvent::AddInstrument { .. })
+            ));
 
             let entry2 = reader.next_entry().unwrap().unwrap();
             assert_eq!(entry2.sequence, 3);
             assert_eq!(entry2.timestamp_ns, 1_700_000_000_000_000_001);
-            assert!(matches!(entry2.event, JournalEvent::Deposit { .. }));
+            assert!(matches!(
+                entry2.event,
+                JournalEvent::App(crate::trading_event::TradingEvent::Deposit { .. })
+            ));
 
             assert!(reader.next_entry().unwrap().is_none());
         }
@@ -2547,11 +2617,11 @@ mod tests {
             request_seq: 0,
             sequence: 100,
             timestamp_ns: 1_000_000_000,
-            event: JournalEvent::Deposit {
+            event: JournalEvent::App(crate::trading_event::TradingEvent::Deposit {
                 account: AccountId(1),
                 currency: CurrencyId(0),
                 amount: 500,
-            },
+            }),
             publish_ts: trace_ts(),
             recv_ts: trace_ts(),
         });
@@ -2638,10 +2708,10 @@ mod tests {
             request_seq: 0,
             sequence: 0,
             timestamp_ns: 0,
-            event: JournalEvent::SubmitOrder {
+            event: JournalEvent::App(crate::trading_event::TradingEvent::SubmitOrder {
                 symbol: Symbol(1),
                 order: limit_order(1, AccountId(2), Side::Sell, 100, 50),
-            },
+            }),
             publish_ts: trace_ts(),
             recv_ts: trace_ts(),
         });
@@ -2730,10 +2800,10 @@ mod tests {
             request_seq: 0,
             sequence: 0,
             timestamp_ns: 1_000_000_000,
-            event: JournalEvent::SubmitOrder {
+            event: JournalEvent::App(crate::trading_event::TradingEvent::SubmitOrder {
                 symbol: Symbol(1),
                 order: limit_order(1, AccountId(2), Side::Sell, 100, 50),
-            },
+            }),
             publish_ts: trace_ts(),
             recv_ts: trace_ts(),
         });
@@ -2772,7 +2842,10 @@ mod tests {
         {
             let mut reader = crate::journal::JournalReader::open(&path).unwrap();
             let entry = reader.next_entry().unwrap().unwrap();
-            assert!(matches!(entry.event, JournalEvent::SubmitOrder { .. }));
+            assert!(matches!(
+                entry.event,
+                JournalEvent::App(crate::trading_event::TradingEvent::SubmitOrder { .. })
+            ));
         }
     }
 
@@ -2842,10 +2915,10 @@ mod tests {
             request_seq: 0,
             sequence: 0,
             timestamp_ns: 1_000_000_000,
-            event: JournalEvent::SubmitOrder {
+            event: JournalEvent::App(crate::trading_event::TradingEvent::SubmitOrder {
                 symbol: Symbol(1),
                 order: limit_order(1, AccountId(2), Side::Sell, 100, 50),
-            },
+            }),
             publish_ts: trace_ts(),
             recv_ts: trace_ts(),
         });
@@ -2891,19 +2964,21 @@ mod tests {
         // Verify the replication batch contains valid journal entries with
         // the same sequence numbers as the on-disk journal.
         let (consumed, seq, _ts, _kh, _rs, event) =
-            crate::journal::codec::decode(&repl_data, crate::journal::codec::FORMAT_VERSION)
-                .unwrap();
+            melin_journal::codec::decode(&repl_data, melin_journal::codec::FORMAT_VERSION).unwrap();
         assert!(consumed > 0);
         assert_eq!(
             seq, FIRST_SEQ,
             "replication sequence should match journal first user event"
         );
-        assert!(matches!(event, JournalEvent::SubmitOrder { .. }));
+        assert!(matches!(
+            event,
+            JournalEvent::App(crate::trading_event::TradingEvent::SubmitOrder { .. })
+        ));
 
         // Verify the replicated bytes are byte-identical to what's on disk.
         #[cfg(not(feature = "no-persist"))]
         {
-            use crate::journal::codec::FILE_HEADER_SIZE;
+            use melin_journal::codec::FILE_HEADER_SIZE;
             let file_bytes = std::fs::read(&path).unwrap();
 
             // Find the start of user entries (after file header and genesis if present).
@@ -3079,10 +3154,10 @@ mod tests {
             request_seq: 1,
             sequence: 0,
             timestamp_ns: 0,
-            event: JournalEvent::SubmitOrder {
+            event: JournalEvent::App(crate::trading_event::TradingEvent::SubmitOrder {
                 symbol: Symbol(1),
                 order: limit_order(100, AccountId(1), Side::Buy, 50, 10),
-            },
+            }),
             publish_ts: trace_ts(),
             recv_ts: trace_ts(),
         });
@@ -3113,11 +3188,11 @@ mod tests {
             request_seq: 0,
             sequence: 0,
             timestamp_ns: 0,
-            event: JournalEvent::Deposit {
+            event: JournalEvent::App(crate::trading_event::TradingEvent::Deposit {
                 account: AccountId(1),
                 currency: CurrencyId(1),
                 amount: 100,
-            },
+            }),
             publish_ts: trace_ts(),
             recv_ts: trace_ts(),
         });
@@ -3146,7 +3221,7 @@ mod tests {
             request_seq: 0,
             sequence: 0,
             timestamp_ns: 0,
-            event: JournalEvent::QueryStats,
+            event: JournalEvent::App(crate::trading_event::TradingEvent::QueryStats),
             publish_ts: trace_ts(),
             recv_ts: trace_ts(),
         });
@@ -3188,10 +3263,10 @@ mod tests {
             request_seq: 1,
             sequence: 0,
             timestamp_ns: 0,
-            event: JournalEvent::SubmitOrder {
+            event: JournalEvent::App(crate::trading_event::TradingEvent::SubmitOrder {
                 symbol: Symbol(1),
                 order: limit_order(200, AccountId(1), Side::Buy, 50, 10),
-            },
+            }),
             publish_ts: trace_ts(),
             recv_ts: trace_ts(),
         });
@@ -3215,10 +3290,10 @@ mod tests {
             request_seq: 1,
             sequence: 0,
             timestamp_ns: 0,
-            event: JournalEvent::SubmitOrder {
+            event: JournalEvent::App(crate::trading_event::TradingEvent::SubmitOrder {
                 symbol: Symbol(1),
                 order: limit_order(200, AccountId(1), Side::Buy, 50, 10),
-            },
+            }),
             publish_ts: trace_ts(),
             recv_ts: trace_ts(),
         });
@@ -3276,10 +3351,10 @@ mod tests {
             request_seq: 0,
             sequence: 0,
             timestamp_ns: 0,
-            event: JournalEvent::SubmitOrder {
+            event: JournalEvent::App(crate::trading_event::TradingEvent::SubmitOrder {
                 symbol: Symbol(1),
                 order: limit_order(1, AccountId(1), Side::Buy, 50, 10),
-            },
+            }),
             publish_ts: trace_ts(),
             recv_ts: trace_ts(),
         });

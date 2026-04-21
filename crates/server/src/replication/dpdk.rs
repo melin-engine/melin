@@ -564,7 +564,7 @@ fn catch_up_from_journal_dpdk(
     send_buf: &mut Vec<u8>,
     shutdown: &AtomicBool,
 ) -> std::io::Result<()> {
-    use melin_engine::journal::reader::RawJournalScanner;
+    use melin_engine::journal::RawJournalScanner;
 
     let files = discover_journal_files(journal_path);
     if files.is_empty() {
@@ -773,7 +773,7 @@ pub fn run_receiver_dpdk(
     snapshot_path: std::path::PathBuf,
 ) -> ReceiverResult {
     use melin_engine::exchange::Exchange;
-    use melin_engine::journal::writer::JournalWriter;
+    use melin_engine::journal::JournalWriter;
 
     // Recover local state from journal (if any). On first call this may
     // be (None, None) for a fresh replica. After a reconnect, the pipeline

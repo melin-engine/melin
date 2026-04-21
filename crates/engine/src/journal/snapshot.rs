@@ -35,8 +35,8 @@ use crate::types::{
     Quantity, ReservationSlot, RiskLimits, Side, Symbol, TimeInForce,
 };
 
-use super::error::JournalError;
 use crate::le;
+use melin_journal::JournalError;
 
 /// Decoded book-side levels: Vec of (price, orders-at-that-level).
 type RestingLevels = Vec<(Price, Vec<RestingOrderSnapshot>)>;
