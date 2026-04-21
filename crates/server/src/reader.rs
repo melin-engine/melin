@@ -451,6 +451,15 @@ fn reader_loop<R: AsRawFd>(
         );
 
         let batch_now = Instant::now();
+        // One wall-clock read per CQE batch instead of per request. The
+        // reader can see 4–6 M requests/s at peak; a per-request
+        // `wall_clock_nanos()` was ~2.8 % of the primary's cycles
+        // (vDSO `clock_gettime(CLOCK_REALTIME)`). All requests in the
+        // same batch share the timestamp — precision loss is bounded
+        // by the CQE-drain cadence (tens of µs under load) and order
+        // timestamps are used for reporting, not matching (the engine
+        // orders by sequence, not time).
+        let batch_wall_ns = wall_clock_nanos();
 
         for &(token, result, flags) in &cqes {
             // ── Tick timeout ──
@@ -566,6 +575,7 @@ fn reader_loop<R: AsRawFd>(
                     entry,
                     &producer,
                     &server_busy_frame,
+                    batch_wall_ns,
                     #[cfg(feature = "latency-trace")]
                     &mut publish_hist,
                 );
@@ -740,10 +750,17 @@ fn push_eventfd_read(ring: &mut IoUring, wakeup_fd: RawFd, buf: *mut u8) {
 /// Extract complete frames from the connection's parse buffer, decode them,
 /// and publish to the disruptor. Returns `true` if the connection should be
 /// dropped (e.g., oversized frame).
+/// Extract complete frames from `conn.parse_buf` and publish them as
+/// `InputSlot`s. `batch_wall_ns` is the wall-clock timestamp captured
+/// once per CQE batch by the caller (see `reader_loop`); all non-query
+/// requests published in this call share it, sparing the reader a
+/// per-request `clock_gettime(CLOCK_REALTIME)` on the hot path. Returns
+/// `true` if the connection should be dropped.
 fn process_frames<R>(
     conn: &mut ConnectionEntry<R>,
     producer: &ring::MultiProducer<InputSlot>,
     server_busy_frame: &[u8; 5],
+    batch_wall_ns: u64,
     #[cfg(feature = "latency-trace")]
     publish_hist: &mut melin_engine::journal::trace::StageHistogram,
 ) -> bool {
@@ -813,7 +830,7 @@ fn process_frames<R>(
         ) {
             0
         } else {
-            wall_clock_nanos()
+            batch_wall_ns
         };
 
         #[cfg(feature = "latency-trace")]

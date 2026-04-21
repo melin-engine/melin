@@ -297,6 +297,12 @@ pub fn run_dpdk_poll(
         handle_buf.clear();
         handle_buf.extend(connections.keys().copied());
 
+        // One wall-clock read per outer poll iteration, reused for
+        // every request stamped in this pass. Sub-microsecond precision
+        // loss at DPDK poll rates; order timestamps are for reporting,
+        // not matching (the engine orders by sequence).
+        let batch_wall_ns = wall_clock_nanos();
+
         for (conn_idx, &handle) in handle_buf.iter().enumerate() {
             if conn_idx > 0 && conn_idx % POLL_EVERY_N_CONNS == 0 {
                 transport.poll();
@@ -413,6 +419,7 @@ pub fn run_dpdk_poll(
                         &mut publish_batch,
                         &control_tx,
                         &mut id_to_handle,
+                        batch_wall_ns,
                     );
                 }
             }
@@ -600,12 +607,18 @@ fn send_auth_failed(conn: &ConnectionState, transport: &mut DpdkTransport) {
 ///
 /// Uses a cursor to avoid O(n) drain/memmove on every frame. The buffer
 /// is compacted once after all frames in this batch are processed.
+/// Extract trading frames from `conn.parse_buf` and append decoded
+/// `InputSlot`s to `batch` for bulk publish. `batch_wall_ns` is
+/// captured once per outer poll iteration by the caller; all
+/// non-query requests stamped in this call share it, sparing a
+/// per-request `clock_gettime(CLOCK_REALTIME)` on the hot path.
 fn process_trading_frames(
     conn: &mut ConnectionState,
     transport: &mut DpdkTransport,
     batch: &mut Vec<InputSlot>,
     control_tx: &mpsc::Sender<ControlEvent>,
     id_to_handle: &mut HashMap<u64, SocketHandle>,
+    batch_wall_ns: u64,
 ) {
     let mut cursor = 0;
 
@@ -646,7 +659,7 @@ fn process_trading_frames(
                     ) {
                         0
                     } else {
-                        wall_clock_nanos()
+                        batch_wall_ns
                     };
                     batch.push(InputSlot {
                         connection_id: conn.connection_id.0,
