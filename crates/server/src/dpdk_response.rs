@@ -21,6 +21,7 @@ use melin_disruptor::ring;
 use melin_disruptor::spsc;
 
 use melin_engine::journal::pipeline::{OutputPayload, OutputSlot, StageUtilization};
+use melin_engine::types::ExecutionReport;
 
 use melin_protocol::codec;
 use melin_protocol::message::ResponseKind;
@@ -227,28 +228,32 @@ pub fn run(
 
         // Encode and queue responses.
         for slot in &batch[..count] {
+            // `ExecutionReport::Stats` / `::Position` are internal
+            // variants the app emits from `apply`; translated here to
+            // the public wire responses so client-visible framing is
+            // identical to the pre-split server.
             let kind = match slot.payload {
+                OutputPayload::Report(ExecutionReport::Stats {
+                    active_connections,
+                    events_processed,
+                    journal_sequence,
+                }) => ResponseKind::StatsHeader {
+                    active_connections,
+                    events_processed,
+                    journal_sequence,
+                },
+                OutputPayload::Report(ExecutionReport::Position {
+                    account,
+                    balances,
+                    count,
+                }) => ResponseKind::PositionSnapshot {
+                    account,
+                    balances,
+                    count,
+                },
                 OutputPayload::Report(report) => ResponseKind::Report(report),
                 OutputPayload::BatchEnd => ResponseKind::BatchEnd,
                 OutputPayload::EngineError => ResponseKind::EngineError,
-                OutputPayload::StatsHeader {
-                    active_connections,
-                    events_processed,
-                    journal_sequence,
-                } => ResponseKind::StatsHeader {
-                    active_connections,
-                    events_processed,
-                    journal_sequence,
-                },
-                OutputPayload::PositionSnapshot {
-                    account,
-                    balances,
-                    count,
-                } => ResponseKind::PositionSnapshot {
-                    account,
-                    balances,
-                    count,
-                },
             };
 
             if !connections.contains_key(&slot.connection_id) {

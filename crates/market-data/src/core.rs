@@ -193,7 +193,11 @@ fn run_session(
     }
 }
 
-/// Extract the symbol from an ExecutionReport.
+/// Extract the symbol from an `ExecutionReport`.
+///
+/// Returns `Symbol(0)` for the query-response variants (`Stats`,
+/// `Position`) which carry no instrument context — market-data never
+/// sees these over the wire, but the match has to be exhaustive.
 fn report_symbol(report: &ExecutionReport) -> Symbol {
     match *report {
         ExecutionReport::Placed { symbol, .. }
@@ -203,6 +207,7 @@ fn report_symbol(report: &ExecutionReport) -> Symbol {
         | ExecutionReport::Rejected { symbol, .. }
         | ExecutionReport::Replaced { symbol, .. }
         | ExecutionReport::InstrumentStatusChanged { symbol, .. } => symbol,
+        ExecutionReport::Stats { .. } | ExecutionReport::Position { .. } => Symbol(0),
     }
 }
 

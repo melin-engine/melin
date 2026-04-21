@@ -1209,6 +1209,21 @@ fn encode_execution_report(report: &ExecutionReport, buf: &mut [u8]) -> usize {
             buf[pos] = *status as u8;
             pos += 1;
         }
+        // `Stats` and `Position` are internal report variants the
+        // matching stage emits in response to `QueryStats` /
+        // `QueryPosition`. They are translated to the public wire
+        // variants `ResponseKind::StatsHeader` / `::PositionSnapshot`
+        // by the response stage *before* the codec runs, so they must
+        // never reach this arm. A debug assertion would be louder than
+        // silently encoding nothing, but the codec returns `pos` as-is
+        // so the caller sees a zero-length report — easy to spot.
+        ExecutionReport::Stats { .. } | ExecutionReport::Position { .. } => {
+            debug_assert!(
+                false,
+                "ExecutionReport::{{Stats,Position}} must be translated to \
+                 ResponseKind::{{StatsHeader,PositionSnapshot}} before wire encoding"
+            );
+        }
     }
 
     pos

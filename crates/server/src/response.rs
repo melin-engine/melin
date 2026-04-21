@@ -24,6 +24,7 @@ use melin_disruptor::ring;
 use melin_engine::journal::pipeline::{OutputPayload, OutputSlot, StageUtilization};
 #[cfg(feature = "latency-trace")]
 use melin_engine::journal::trace;
+use melin_engine::types::ExecutionReport;
 
 use melin_protocol::codec;
 use melin_protocol::message::ResponseKind;
@@ -336,28 +337,32 @@ pub fn run(
             #[cfg(feature = "latency-trace")]
             spsc_hist.record_ns(trace::trace_elapsed_ns(slot.match_complete_ts, consume_ts));
 
+            // Query responses (`ExecutionReport::Stats`/`::Position`)
+            // are internal variants the app emits from `apply`; the
+            // response stage translates them back to the public wire
+            // variants so client-visible framing stays unchanged.
             let kind = match slot.payload {
+                OutputPayload::Report(ExecutionReport::Stats {
+                    active_connections,
+                    events_processed,
+                    journal_sequence,
+                }) => ResponseKind::StatsHeader {
+                    active_connections,
+                    events_processed,
+                    journal_sequence,
+                },
+                OutputPayload::Report(ExecutionReport::Position {
+                    account,
+                    balances,
+                    count,
+                }) => ResponseKind::PositionSnapshot {
+                    account,
+                    balances,
+                    count,
+                },
                 OutputPayload::Report(report) => ResponseKind::Report(report),
                 OutputPayload::BatchEnd => ResponseKind::BatchEnd,
                 OutputPayload::EngineError => ResponseKind::EngineError,
-                OutputPayload::StatsHeader {
-                    active_connections,
-                    events_processed,
-                    journal_sequence,
-                } => ResponseKind::StatsHeader {
-                    active_connections,
-                    events_processed,
-                    journal_sequence,
-                },
-                OutputPayload::PositionSnapshot {
-                    account,
-                    balances,
-                    count,
-                } => ResponseKind::PositionSnapshot {
-                    account,
-                    balances,
-                    count,
-                },
             };
 
             if let Some(entry) = connections.get_mut(&slot.connection_id) {

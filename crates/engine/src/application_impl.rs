@@ -36,7 +36,7 @@ impl Application for Exchange {
     /// concrete `Exchange` method: the inner methods (`execute`, `cancel`,
     /// …) own the real work and keep their own inlining attrs.
     #[inline]
-    fn apply(&mut self, event: Self::Event, _ctx: &ApplyCtx, out: &mut Vec<Self::Report>) {
+    fn apply(&mut self, event: Self::Event, ctx: &ApplyCtx, out: &mut Vec<Self::Report>) {
         match event {
             TradingEvent::AddInstrument { spec } => self.add_instrument(spec),
             TradingEvent::Deposit {
@@ -84,13 +84,24 @@ impl Application for Exchange {
             TradingEvent::DisableInstrument { symbol } => self.disable_instrument(symbol, out),
             TradingEvent::EnableInstrument { symbol } => self.enable_instrument(symbol, out),
             TradingEvent::RemoveInstrument { symbol } => self.remove_instrument(symbol, out),
-            // Phase 1 placeholders: `QueryStats`/`QueryPosition` still flow
-            // through the existing pipeline inline path. Phase 3 rewires
-            // the matching stage to call `apply` for queries — the app
-            // will then synthesise a report variant from `_ctx` /
-            // `self.accounts()`. Leaving these as no-ops keeps the trait
-            // total without inventing a wire format we don't yet need.
-            TradingEvent::QueryStats | TradingEvent::QueryPosition { .. } => {}
+            TradingEvent::QueryStats => {
+                // Read-only query: the transport owns the counters, so
+                // the app synthesises the report directly from the
+                // `ApplyCtx` it was handed. No `Exchange` state touched.
+                out.push(ExecutionReport::Stats {
+                    active_connections: ctx.active_connections,
+                    events_processed: ctx.events_processed,
+                    journal_sequence: ctx.journal_sequence,
+                });
+            }
+            TradingEvent::QueryPosition { account } => {
+                let (balances, count) = self.accounts().balances_for(account);
+                out.push(ExecutionReport::Position {
+                    account,
+                    balances,
+                    count,
+                });
+            }
         }
     }
 

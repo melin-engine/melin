@@ -261,7 +261,14 @@ pub struct Order {
 }
 
 /// Events emitted by the matching engine.
+///
+/// `Position` is considerably larger than the other variants (it carries
+/// a fixed 16-slot balance array), but `ExecutionReport` must be `Copy`
+/// for zero-allocation ring transport — boxing would add hot-path heap
+/// indirection. `Position` is produced only on rare `QueryPosition`
+/// events, so the per-slot memory overhead is acceptable.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(clippy::large_enum_variant)]
 pub enum ExecutionReport {
     /// Order was placed on the book (resting).
     Placed {
@@ -324,6 +331,25 @@ pub enum ExecutionReport {
     InstrumentStatusChanged {
         symbol: Symbol,
         status: InstrumentStatus,
+    },
+    /// Transport stats snapshot emitted in response to a `QueryStats`
+    /// event. Internal report — never journaled, never sent on the wire
+    /// as an `ExecutionReport`. The response stage translates this to
+    /// `ResponseKind::StatsHeader` for the client, preserving the public
+    /// wire format.
+    Stats {
+        active_connections: u64,
+        events_processed: u64,
+        journal_sequence: u64,
+    },
+    /// Account balance snapshot emitted in response to `QueryPosition`.
+    /// Internal — translated to `ResponseKind::PositionSnapshot` on the
+    /// wire. Fixed array sized for the maximum number of currencies per
+    /// account; `count` reports how many entries are populated.
+    Position {
+        account: AccountId,
+        balances: [(CurrencyId, u64, u64); 16],
+        count: u8,
     },
 }
 

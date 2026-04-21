@@ -70,33 +70,39 @@ fn report_symbol(report: &ExecutionReport) -> Symbol {
         | ExecutionReport::Rejected { symbol, .. }
         | ExecutionReport::Replaced { symbol, .. }
         | ExecutionReport::InstrumentStatusChanged { symbol, .. } => symbol,
+        // Query-response variants — the firehose publisher isn't a
+        // subscriber target for these, but keep the match exhaustive.
+        ExecutionReport::Stats { .. } | ExecutionReport::Position { .. } => Symbol(0),
     }
 }
 
-/// Convert an `OutputPayload` to the wire `ResponseKind`.
+/// Convert an `OutputPayload` to the wire `ResponseKind`. Translates
+/// the internal query-response variants (`ExecutionReport::Stats` /
+/// `::Position`) back to the public `StatsHeader` / `PositionSnapshot`
+/// response messages so wire framing stays unchanged.
 fn payload_to_response(payload: OutputPayload) -> ResponseKind {
     match payload {
+        OutputPayload::Report(ExecutionReport::Stats {
+            active_connections,
+            events_processed,
+            journal_sequence,
+        }) => ResponseKind::StatsHeader {
+            active_connections,
+            events_processed,
+            journal_sequence,
+        },
+        OutputPayload::Report(ExecutionReport::Position {
+            account,
+            balances,
+            count,
+        }) => ResponseKind::PositionSnapshot {
+            account,
+            balances,
+            count,
+        },
         OutputPayload::Report(report) => ResponseKind::Report(report),
         OutputPayload::BatchEnd => ResponseKind::BatchEnd,
         OutputPayload::EngineError => ResponseKind::EngineError,
-        OutputPayload::StatsHeader {
-            active_connections,
-            events_processed,
-            journal_sequence,
-        } => ResponseKind::StatsHeader {
-            active_connections,
-            events_processed,
-            journal_sequence,
-        },
-        OutputPayload::PositionSnapshot {
-            account,
-            balances,
-            count,
-        } => ResponseKind::PositionSnapshot {
-            account,
-            balances,
-            count,
-        },
     }
 }
 
@@ -616,11 +622,11 @@ mod tests {
         let r = payload_to_response(OutputPayload::EngineError);
         assert!(matches!(r, ResponseKind::EngineError));
 
-        let r = payload_to_response(OutputPayload::StatsHeader {
+        let r = payload_to_response(OutputPayload::Report(ExecutionReport::Stats {
             active_connections: 5,
             events_processed: 1000,
             journal_sequence: 500,
-        });
+        }));
         assert!(matches!(r, ResponseKind::StatsHeader { .. }));
     }
 

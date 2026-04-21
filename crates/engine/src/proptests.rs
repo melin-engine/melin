@@ -792,7 +792,9 @@ proptest! {
                 ExecutionReport::Placed { .. }
                 | ExecutionReport::Triggered { .. }
                 | ExecutionReport::Replaced { .. }
-                | ExecutionReport::InstrumentStatusChanged { .. } => {}
+                | ExecutionReport::InstrumentStatusChanged { .. }
+                | ExecutionReport::Stats { .. }
+                | ExecutionReport::Position { .. } => {}
             }
         }
 

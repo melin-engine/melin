@@ -554,8 +554,13 @@ pub fn execution_report_to_fix(
                 .str_tag(tags::AVG_PX, "0")
                 .build(sender, target, seq)
         }
-        ExecutionReport::InstrumentStatusChanged { .. } => {
-            // No FIX equivalent in order entry — skip.
+        ExecutionReport::InstrumentStatusChanged { .. }
+        | ExecutionReport::Stats { .. }
+        | ExecutionReport::Position { .. } => {
+            // No FIX equivalent in order entry — skip. `Stats` /
+            // `Position` are also internal variants that the server
+            // translates to dedicated wire messages before the gateway
+            // ever sees them.
             Vec::new()
         }
     }

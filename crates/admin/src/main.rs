@@ -1384,6 +1384,9 @@ fn format_report(report: &ExecutionReport) -> String {
             };
             format!("INSTRUMENT {} → {}", symbol.0, status_str)
         }
+        // Server-internal variants; translated to `StatsHeader` /
+        // `PositionSnapshot` by the response stage before the wire.
+        ExecutionReport::Stats { .. } | ExecutionReport::Position { .. } => String::new(),
     }
 }
 

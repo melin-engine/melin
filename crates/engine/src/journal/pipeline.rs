@@ -26,7 +26,7 @@ use crate::exchange::Exchange;
 use crate::journal::JournalEvent;
 use crate::journal::JournalWriter;
 use crate::journal::replication::{ReplicationConsumer, ReplicationProducer};
-use crate::types::{AccountId, CurrencyId, ExecutionReport, OrderId, RejectReason, Symbol};
+use crate::types::{AccountId, ExecutionReport, OrderId, RejectReason, Symbol};
 use melin_app::{Application, ApplyCtx};
 use melin_journal::JournalError;
 use melin_journal::trace::{TraceTimestamp, trace_ts};
@@ -205,10 +205,17 @@ pub struct OutputSlot {
 
 /// Payload within an output slot.
 ///
-/// PositionSnapshot (389 bytes) dominates the enum size, but OutputPayload must
-/// be `Copy` for zero-allocation ring buffer transport. Boxing would add heap
-/// indirection on the hot path. Position queries are infrequent (operator/trader
-/// initiated), so the per-slot overhead is acceptable.
+/// `ExecutionReport::Position` (≈320 bytes) dominates the enum size, but
+/// `OutputPayload` must be `Copy` for zero-allocation ring buffer
+/// transport. Boxing would add heap indirection on the hot path; position
+/// queries are infrequent (operator/trader initiated), so the per-slot
+/// overhead is acceptable.
+///
+/// Prior versions of this enum carried `StatsHeader` and `PositionSnapshot`
+/// variants directly. After the transport/app split those live inside
+/// [`ExecutionReport`] (the app emits them via `Application::apply`) and
+/// the response stage translates them back to the public wire variants
+/// `ResponseKind::StatsHeader` / `ResponseKind::PositionSnapshot`.
 #[derive(Debug, Clone, Copy)]
 #[allow(clippy::large_enum_variant)]
 pub enum OutputPayload {
@@ -218,20 +225,6 @@ pub enum OutputPayload {
     BatchEnd,
     /// Internal error during matching.
     EngineError,
-    /// Server stats snapshot in response to `QueryStats`.
-    StatsHeader {
-        active_connections: u64,
-        events_processed: u64,
-        journal_sequence: u64,
-    },
-    /// Account balance snapshot in response to `QueryPosition`.
-    PositionSnapshot {
-        account: AccountId,
-        /// (currency_id, free_balance, reserved_balance) tuples.
-        /// Fixed-size array avoids heap allocation. Max 16 currencies.
-        balances: [(CurrencyId, u64, u64); 16],
-        count: u8,
-    },
 }
 
 impl Default for OutputSlot {
@@ -1307,103 +1300,37 @@ impl MatchingStage {
                 #[cfg(feature = "latency-trace")]
                 let exec_start = trace_ts();
 
-                // QueryStats and QueryPosition are handled inline — they read
-                // matching-stage-owned state and publish directly without
-                // touching the Exchange. Not counted in events_processed.
-                if matches!(
-                    slot.event,
-                    JournalEvent::App(crate::trading_event::TradingEvent::QueryStats)
-                ) {
-                    #[cfg(feature = "latency-trace")]
-                    let exec_end = trace_ts();
-                    #[cfg(feature = "latency-trace")]
-                    execute_hist
-                        .record_ns(melin_journal::trace::trace_elapsed_ns(exec_start, exec_end));
-
-                    #[allow(clippy::let_unit_value)]
-                    let match_complete_ts = trace_ts();
-
-                    // Flush thread-local counters so the snapshot is current.
-                    self.events_processed.store(local_events, Ordering::Relaxed);
-                    self.utilization.busy.store(busy_count, Ordering::Relaxed);
-                    self.utilization.idle.store(idle_count, Ordering::Relaxed);
-
-                    let journal_sequence = self.journal_cursor.get().load(Ordering::Relaxed);
-                    let active_connections = self.active_connections.load(Ordering::Relaxed);
-                    self.output.publish(OutputSlot {
-                        connection_id: slot.connection_id,
-                        input_seq,
-                        payload: OutputPayload::StatsHeader {
-                            active_connections,
-                            events_processed: local_events,
-                            journal_sequence,
-                        },
-                        match_complete_ts,
-                        recv_ts: slot.recv_ts,
-                    });
-                    self.output.publish(OutputSlot {
-                        connection_id: slot.connection_id,
-                        input_seq,
-                        payload: OutputPayload::BatchEnd,
-                        match_complete_ts,
-                        recv_ts: slot.recv_ts,
-                    });
-                    continue;
-                }
-
-                if let JournalEvent::App(crate::trading_event::TradingEvent::QueryPosition {
-                    account,
-                }) = slot.event
-                {
-                    #[cfg(feature = "latency-trace")]
-                    let exec_end = trace_ts();
-                    #[cfg(feature = "latency-trace")]
-                    execute_hist
-                        .record_ns(melin_journal::trace::trace_elapsed_ns(exec_start, exec_end));
-
-                    #[allow(clippy::let_unit_value)]
-                    let match_complete_ts = trace_ts();
-
-                    let (balances, count) = self.exchange.accounts().balances_for(account);
-                    self.output.publish(OutputSlot {
-                        connection_id: slot.connection_id,
-                        input_seq,
-                        payload: OutputPayload::PositionSnapshot {
-                            account,
-                            balances,
-                            count,
-                        },
-                        match_complete_ts,
-                        recv_ts: slot.recv_ts,
-                    });
-                    self.output.publish(OutputSlot {
-                        connection_id: slot.connection_id,
-                        input_seq,
-                        payload: OutputPayload::BatchEnd,
-                        match_complete_ts,
-                        recv_ts: slot.recv_ts,
-                    });
-                    continue;
-                }
+                // Flush thread-local counters so `ApplyCtx` hands the
+                // app current values — the app reads these when
+                // synthesising query responses (stats snapshots, etc.).
+                // Cheap Relaxed store per event (~1 ns).
+                self.events_processed.store(local_events, Ordering::Relaxed);
 
                 local_events += 1;
 
-                // Halt check first: reject before advancing any HWMs so the
-                // client can safely retry the same seq after reconnect.
-                if self.is_halted() {
+                // Halt check first: reject before advancing any HWMs so
+                // the client can safely retry the same seq after
+                // reconnect. Read-only queries bypass both halt and
+                // dedup — they never mutate durable state, so returning
+                // the current snapshot during a halt is safe (and
+                // actually useful for operators monitoring the outage).
+                let is_query = slot.event.is_query();
+                if !is_query && self.is_halted() {
                     reports.push(ExecutionReport::Rejected {
                         order_id: Self::extract_order_id(&slot.event),
                         symbol: Self::extract_symbol(&slot.event),
                         account: Self::extract_account_id(&slot.event),
                         reason: RejectReason::ReplicaDisconnected,
                     });
-                } else if !self
-                    .exchange
-                    .check_request_seq(slot.key_hash, slot.request_seq)
+                } else if !is_query
+                    && !self
+                        .exchange
+                        .check_request_seq(slot.key_hash, slot.request_seq)
                 {
                     // Duplicate request — produce Rejected response.
-                    // Use OrderId(0) and AccountId(0) as placeholders since
-                    // we don't parse the specific order/account from the slot.
+                    // Use OrderId(0) and AccountId(0) as placeholders
+                    // since we don't parse the specific order/account
+                    // from the slot.
                     reports.push(ExecutionReport::Rejected {
                         order_id: OrderId(0),
                         symbol: Symbol(0),
@@ -3160,7 +3087,7 @@ mod tests {
         for _ in 0..1_000_000 {
             if let Some((_, slot)) = output.try_consume() {
                 match slot.payload {
-                    OutputPayload::StatsHeader { .. } => got_stats = true,
+                    OutputPayload::Report(ExecutionReport::Stats { .. }) => got_stats = true,
                     OutputPayload::BatchEnd => {
                         got_batch_end = true;
                         break;
