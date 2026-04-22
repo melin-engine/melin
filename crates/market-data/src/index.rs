@@ -1,7 +1,7 @@
 //! Order index: tracks resting orders so fills and cancels can resolve
 //! back to the correct price level without scanning the book.
 
-use melin_engine::types::{AccountId, OrderId, Price, Quantity, Side, Symbol};
+use melin_trading::types::{AccountId, OrderId, Price, Quantity, Side, Symbol};
 
 /// Metadata for a single resting order, stored in the index.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

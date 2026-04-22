@@ -8,14 +8,51 @@ use std::path::Path;
 use crate::exchange::Exchange;
 use crate::types::{
     AccountId, CircuitBreakerConfig, CurrencyId, ExecutionReport, FeeSchedule, InstrumentSpec,
-    Order, OrderId, RiskLimits, Symbol,
+    Order, OrderId, RejectReason, RiskLimits, Symbol,
 };
 
-use super::error::JournalError;
-use super::event::JournalEvent;
-use super::reader::JournalReader;
-use super::snapshot;
-use crate::journal::writer::JournalWriter;
+use crate::journal::JournalEvent;
+use crate::journal::JournalReader;
+use crate::journal::JournalWriter;
+use crate::journal::snapshot;
+use melin_journal::JournalError;
+
+/// Error surfaced by [`JournaledExchange::withdraw`]: either a journal
+/// I/O failure or a business-level rejection (insufficient balance,
+/// resting orders, unknown account). Kept engine-local so the
+/// `melin-journal` crate stays free of trading types.
+#[derive(Debug)]
+pub enum JournaledExchangeError {
+    /// Transport-level journal failure (I/O, CRC, version, …).
+    Journal(JournalError),
+    /// Exchange rejected the operation (business logic). The journal
+    /// entry is still durable so replay reproduces this deterministically.
+    Rejected(RejectReason),
+}
+
+impl std::fmt::Display for JournaledExchangeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Journal(e) => write!(f, "journal error: {e}"),
+            Self::Rejected(r) => write!(f, "command rejected: {r:?}"),
+        }
+    }
+}
+
+impl std::error::Error for JournaledExchangeError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Journal(e) => Some(e),
+            Self::Rejected(_) => None,
+        }
+    }
+}
+
+impl From<JournalError> for JournaledExchangeError {
+    fn from(e: JournalError) -> Self {
+        Self::Journal(e)
+    }
+}
 
 /// Exchange wrapper that journals all input commands to a write-ahead log
 /// before executing them. Provides crash recovery via journal replay.
@@ -36,7 +73,9 @@ impl JournaledExchange {
 
     /// Register a new instrument. Journals before executing.
     pub fn add_instrument(&mut self, spec: InstrumentSpec) -> Result<(), JournalError> {
-        self.writer.append(&JournalEvent::AddInstrument { spec })?;
+        self.writer.append(&JournalEvent::App(
+            crate::trading_event::TradingEvent::AddInstrument { spec },
+        ))?;
         self.exchange.add_instrument(spec);
         Ok(())
     }
@@ -48,11 +87,13 @@ impl JournaledExchange {
         currency: CurrencyId,
         amount: u64,
     ) -> Result<(), JournalError> {
-        self.writer.append(&JournalEvent::Deposit {
-            account,
-            currency,
-            amount,
-        })?;
+        self.writer.append(&JournalEvent::App(
+            crate::trading_event::TradingEvent::Deposit {
+                account,
+                currency,
+                amount,
+            },
+        ))?;
         self.exchange.deposit(account, currency, amount);
         Ok(())
     }
@@ -63,7 +104,9 @@ impl JournaledExchange {
         account: AccountId,
         reports: &mut Vec<ExecutionReport>,
     ) -> Result<(), JournalError> {
-        self.writer.append(&JournalEvent::CancelAll { account })?;
+        self.writer.append(&JournalEvent::App(
+            crate::trading_event::TradingEvent::CancelAll { account },
+        ))?;
         self.exchange.cancel_all(account, reports);
         Ok(())
     }
@@ -74,21 +117,23 @@ impl JournaledExchange {
     /// The journal entry is appended unconditionally so that replay
     /// reproduces the same rejection deterministically. Business-level
     /// rejections (insufficient balance, unknown account, resting orders)
-    /// are surfaced to the caller as `JournalError::Rejected`.
+    /// are surfaced to the caller as `JournaledExchangeError::Rejected`.
     pub fn withdraw(
         &mut self,
         account: AccountId,
         currency: CurrencyId,
         amount: u64,
-    ) -> Result<(), JournalError> {
-        self.writer.append(&JournalEvent::Withdraw {
-            account,
-            currency,
-            amount,
-        })?;
+    ) -> Result<(), JournaledExchangeError> {
+        self.writer.append(&JournalEvent::App(
+            crate::trading_event::TradingEvent::Withdraw {
+                account,
+                currency,
+                amount,
+            },
+        ))?;
         self.exchange
             .withdraw(account, currency, amount)
-            .map_err(JournalError::Rejected)
+            .map_err(JournaledExchangeError::Rejected)
     }
 
     /// Set risk limits for an instrument. Journals before executing.
@@ -97,8 +142,9 @@ impl JournaledExchange {
         symbol: Symbol,
         limits: RiskLimits,
     ) -> Result<(), JournalError> {
-        self.writer
-            .append(&JournalEvent::SetRiskLimits { symbol, limits })?;
+        self.writer.append(&JournalEvent::App(
+            crate::trading_event::TradingEvent::SetRiskLimits { symbol, limits },
+        ))?;
         self.exchange.set_risk_limits(symbol, limits);
         Ok(())
     }
@@ -109,8 +155,9 @@ impl JournaledExchange {
         symbol: Symbol,
         config: CircuitBreakerConfig,
     ) -> Result<(), JournalError> {
-        self.writer
-            .append(&JournalEvent::SetCircuitBreaker { symbol, config })?;
+        self.writer.append(&JournalEvent::App(
+            crate::trading_event::TradingEvent::SetCircuitBreaker { symbol, config },
+        ))?;
         self.exchange.set_circuit_breaker(symbol, config);
         Ok(())
     }
@@ -123,8 +170,9 @@ impl JournaledExchange {
         schedule: FeeSchedule,
         reports: &mut Vec<ExecutionReport>,
     ) -> Result<(), JournalError> {
-        self.writer
-            .append(&JournalEvent::SetFeeSchedule { symbol, schedule })?;
+        self.writer.append(&JournalEvent::App(
+            crate::trading_event::TradingEvent::SetFeeSchedule { symbol, schedule },
+        ))?;
         self.exchange.set_fee_schedule(symbol, schedule, reports);
         Ok(())
     }
@@ -136,8 +184,9 @@ impl JournaledExchange {
         order: Order,
         reports: &mut Vec<ExecutionReport>,
     ) -> Result<(), JournalError> {
-        self.writer
-            .append(&JournalEvent::SubmitOrder { symbol, order })?;
+        self.writer.append(&JournalEvent::App(
+            crate::trading_event::TradingEvent::SubmitOrder { symbol, order },
+        ))?;
         self.exchange.execute(symbol, order, reports);
         Ok(())
     }
@@ -150,11 +199,13 @@ impl JournaledExchange {
         order_id: OrderId,
         reports: &mut Vec<ExecutionReport>,
     ) -> Result<(), JournalError> {
-        self.writer.append(&JournalEvent::CancelOrder {
-            symbol,
-            account,
-            order_id,
-        })?;
+        self.writer.append(&JournalEvent::App(
+            crate::trading_event::TradingEvent::CancelOrder {
+                symbol,
+                account,
+                order_id,
+            },
+        ))?;
         self.exchange.cancel(symbol, account, order_id, reports);
         Ok(())
     }
@@ -165,8 +216,9 @@ impl JournaledExchange {
         symbol: Symbol,
         reports: &mut Vec<ExecutionReport>,
     ) -> Result<(), JournalError> {
-        self.writer
-            .append(&JournalEvent::DisableInstrument { symbol })?;
+        self.writer.append(&JournalEvent::App(
+            crate::trading_event::TradingEvent::DisableInstrument { symbol },
+        ))?;
         self.exchange.disable_instrument(symbol, reports);
         Ok(())
     }
@@ -177,8 +229,9 @@ impl JournaledExchange {
         symbol: Symbol,
         reports: &mut Vec<ExecutionReport>,
     ) -> Result<(), JournalError> {
-        self.writer
-            .append(&JournalEvent::EnableInstrument { symbol })?;
+        self.writer.append(&JournalEvent::App(
+            crate::trading_event::TradingEvent::EnableInstrument { symbol },
+        ))?;
         self.exchange.enable_instrument(symbol, reports);
         Ok(())
     }
@@ -189,8 +242,9 @@ impl JournaledExchange {
         symbol: Symbol,
         reports: &mut Vec<ExecutionReport>,
     ) -> Result<(), JournalError> {
-        self.writer
-            .append(&JournalEvent::RemoveInstrument { symbol })?;
+        self.writer.append(&JournalEvent::App(
+            crate::trading_event::TradingEvent::RemoveInstrument { symbol },
+        ))?;
         self.exchange.remove_instrument(symbol, reports);
         Ok(())
     }
@@ -474,70 +528,79 @@ fn replay_event(
     }
 
     match *event {
-        JournalEvent::AddInstrument { spec } => {
+        JournalEvent::App(crate::trading_event::TradingEvent::AddInstrument { spec }) => {
             exchange.add_instrument(spec);
         }
-        JournalEvent::Deposit {
+        JournalEvent::App(crate::trading_event::TradingEvent::Deposit {
             account,
             currency,
             amount,
-        } => {
+        }) => {
             exchange.deposit(account, currency, amount);
         }
-        JournalEvent::SubmitOrder { symbol, order } => {
+        JournalEvent::App(crate::trading_event::TradingEvent::SubmitOrder { symbol, order }) => {
             exchange.execute(symbol, order, reports);
         }
-        JournalEvent::CancelOrder {
+        JournalEvent::App(crate::trading_event::TradingEvent::CancelOrder {
             symbol,
             account,
             order_id,
-        } => {
+        }) => {
             exchange.cancel(symbol, account, order_id, reports);
         }
-        JournalEvent::SetRiskLimits { symbol, limits } => {
+        JournalEvent::App(crate::trading_event::TradingEvent::SetRiskLimits { symbol, limits }) => {
             exchange.set_risk_limits(symbol, limits);
         }
-        JournalEvent::CancelAll { account } => {
+        JournalEvent::App(crate::trading_event::TradingEvent::CancelAll { account }) => {
             exchange.cancel_all(account, reports);
         }
-        JournalEvent::EndOfDay => {
+        JournalEvent::App(crate::trading_event::TradingEvent::EndOfDay) => {
             exchange.end_of_day(reports);
         }
-        JournalEvent::SetCircuitBreaker { symbol, config } => {
+        JournalEvent::App(crate::trading_event::TradingEvent::SetCircuitBreaker {
+            symbol,
+            config,
+        }) => {
             exchange.set_circuit_breaker(symbol, config);
         }
-        JournalEvent::CancelReplace {
+        JournalEvent::App(crate::trading_event::TradingEvent::CancelReplace {
             symbol,
             account,
             order_id,
             new_price,
             new_quantity,
-        } => {
+        }) => {
             exchange.cancel_replace(symbol, account, order_id, new_price, new_quantity, reports);
         }
-        JournalEvent::SetFeeSchedule { symbol, schedule } => {
+        JournalEvent::App(crate::trading_event::TradingEvent::SetFeeSchedule {
+            symbol,
+            schedule,
+        }) => {
             exchange.set_fee_schedule(symbol, schedule, reports);
         }
-        JournalEvent::ProvisionAccount { account, amount } => {
+        JournalEvent::App(crate::trading_event::TradingEvent::ProvisionAccount {
+            account,
+            amount,
+        }) => {
             exchange.provision_account(account, amount);
         }
-        JournalEvent::Withdraw {
+        JournalEvent::App(crate::trading_event::TradingEvent::Withdraw {
             account,
             currency,
             amount,
-        } => {
+        }) => {
             // Withdraw errors (insufficient balance, resting orders) are
             // non-fatal on replay — the journal recorded the attempt, and
             // the original error was already returned to the client.
             let _ = exchange.withdraw(account, currency, amount);
         }
-        JournalEvent::DisableInstrument { symbol } => {
+        JournalEvent::App(crate::trading_event::TradingEvent::DisableInstrument { symbol }) => {
             exchange.disable_instrument(symbol, reports);
         }
-        JournalEvent::EnableInstrument { symbol } => {
+        JournalEvent::App(crate::trading_event::TradingEvent::EnableInstrument { symbol }) => {
             exchange.enable_instrument(symbol, reports);
         }
-        JournalEvent::RemoveInstrument { symbol } => {
+        JournalEvent::App(crate::trading_event::TradingEvent::RemoveInstrument { symbol }) => {
             exchange.remove_instrument(symbol, reports);
         }
         JournalEvent::Tick { now_ns } => {
@@ -547,7 +610,8 @@ fn replay_event(
             // `timestamp_ns = 0` (tests, manually replayed entries).
             exchange.drain_due_scheduled_tasks(now_ns, reports);
         }
-        JournalEvent::QueryStats | JournalEvent::QueryPosition { .. } => {
+        JournalEvent::App(crate::trading_event::TradingEvent::QueryStats)
+        | JournalEvent::App(crate::trading_event::TradingEvent::QueryPosition { .. }) => {
             // Read-only queries are never journaled, so they should never
             // appear during replay. No-op if they somehow do.
         }
@@ -728,7 +792,7 @@ mod tests {
         }
 
         // Replay should produce identical reports.
-        let mut reader = super::super::reader::JournalReader::open(&path).unwrap();
+        let mut reader = crate::journal::JournalReader::open(&path).unwrap();
         let mut replay_exchange = Exchange::new();
         let mut replay_reports = Vec::new();
         let mut last_drain_ns: u64 = 0;
@@ -750,7 +814,7 @@ mod tests {
 
     #[test]
     fn ticks_drive_gtd_expiry_through_replay() {
-        use crate::journal::writer::wall_clock_nanos;
+        use crate::journal::wall_clock_nanos;
 
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("gtd_ticks.journal");
@@ -889,7 +953,7 @@ mod tests {
 
         // Find valid data end (file is larger due to pre-allocation).
         let valid_data_end = {
-            let mut reader = crate::journal::reader::JournalReader::open(&path).unwrap();
+            let mut reader = crate::journal::JournalReader::open(&path).unwrap();
             while reader.next_entry().unwrap().is_some() {}
             reader.valid_file_end()
         };
@@ -922,7 +986,7 @@ mod tests {
         // Find valid data end, then simulate crash by truncating within valid data.
         {
             let valid_data_end = {
-                let mut reader = crate::journal::reader::JournalReader::open(&path).unwrap();
+                let mut reader = crate::journal::JournalReader::open(&path).unwrap();
                 while reader.next_entry().unwrap().is_some() {}
                 reader.valid_file_end()
             };
@@ -1220,17 +1284,17 @@ mod tests {
         let expected_first = 42u64;
         assert_eq!(writer.next_sequence(), expected_first);
 
-        let event = JournalEvent::Deposit {
+        let event = JournalEvent::App(crate::trading_event::TradingEvent::Deposit {
             account: ACCT_A,
             currency: USD,
             amount: 100,
-        };
+        });
         let seq = writer.append(&event).unwrap();
         assert_eq!(seq, expected_first);
         assert_eq!(writer.next_sequence(), expected_first + 1);
 
         // Read it back. Genesis is transparent, first user entry starts at expected_first.
-        let mut reader = crate::journal::reader::JournalReader::open(&path).unwrap();
+        let mut reader = crate::journal::JournalReader::open(&path).unwrap();
         let entry = reader.next_entry().unwrap().unwrap();
         assert_eq!(entry.sequence, expected_first);
     }
@@ -1360,7 +1424,7 @@ mod tests {
 
         // Simulate crash by truncating last entry.
         {
-            let mut reader = crate::journal::reader::JournalReader::open(&path).unwrap();
+            let mut reader = crate::journal::JournalReader::open(&path).unwrap();
             while reader.next_entry().unwrap().is_some() {}
             let valid_end = reader.valid_file_end();
             let file = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
@@ -1463,7 +1527,7 @@ mod tests {
         assert!(
             matches!(
                 err,
-                JournalError::Rejected(RejectReason::InsufficientBalance)
+                JournaledExchangeError::Rejected(RejectReason::InsufficientBalance)
             ),
             "expected Rejected(InsufficientBalance), got {err:?}"
         );
@@ -1494,7 +1558,10 @@ mod tests {
 
         let err = je.withdraw(ACCT_A, USD, 1).unwrap_err();
         assert!(
-            matches!(err, JournalError::Rejected(RejectReason::HasRestingOrders)),
+            matches!(
+                err,
+                JournaledExchangeError::Rejected(RejectReason::HasRestingOrders)
+            ),
             "expected Rejected(HasRestingOrders), got {err:?}"
         );
     }
@@ -1506,7 +1573,10 @@ mod tests {
         let mut je = JournaledExchange::create(&path).unwrap();
         let err = je.withdraw(ACCT_A, USD, 1).unwrap_err();
         assert!(
-            matches!(err, JournalError::Rejected(RejectReason::UnknownAccount)),
+            matches!(
+                err,
+                JournaledExchangeError::Rejected(RejectReason::UnknownAccount)
+            ),
             "expected Rejected(UnknownAccount), got {err:?}"
         );
     }
@@ -1534,7 +1604,10 @@ mod tests {
             // the account has a resting order. The error must be surfaced.
             let err = je.withdraw(ACCT_A, USD, 1_000).unwrap_err();
             assert!(
-                matches!(err, JournalError::Rejected(RejectReason::HasRestingOrders)),
+                matches!(
+                    err,
+                    JournaledExchangeError::Rejected(RejectReason::HasRestingOrders)
+                ),
                 "expected Rejected(HasRestingOrders), got {err:?}"
             );
         }
@@ -1617,14 +1690,14 @@ mod tests {
 
         // Write journal entries with key_hash + request_seq.
         {
-            let mut writer = crate::journal::writer::JournalWriter::create(&path).unwrap();
-            let ts = crate::journal::writer::wall_clock_nanos();
+            let mut writer = crate::journal::JournalWriter::create(&path).unwrap();
+            let ts = crate::journal::wall_clock_nanos();
             // Deposit with seq=1
             writer
                 .batch_append_with_ts(
-                    &JournalEvent::AddInstrument {
+                    &JournalEvent::App(crate::trading_event::TradingEvent::AddInstrument {
                         spec: btc_usd_spec(),
-                    },
+                    }),
                     ts,
                     key_hash,
                     1,
@@ -1633,11 +1706,11 @@ mod tests {
             // Deposit with seq=2
             writer
                 .batch_append_with_ts(
-                    &JournalEvent::Deposit {
+                    &JournalEvent::App(crate::trading_event::TradingEvent::Deposit {
                         account: ACCT_A,
                         currency: USD,
                         amount: 1000,
-                    },
+                    }),
                     ts,
                     key_hash,
                     2,
@@ -1672,13 +1745,13 @@ mod tests {
 
         // Create journaled exchange, write events with key_hash.
         {
-            let mut writer = crate::journal::writer::JournalWriter::create(&journal_path).unwrap();
-            let ts = crate::journal::writer::wall_clock_nanos();
+            let mut writer = crate::journal::JournalWriter::create(&journal_path).unwrap();
+            let ts = crate::journal::wall_clock_nanos();
             writer
                 .batch_append_with_ts(
-                    &JournalEvent::AddInstrument {
+                    &JournalEvent::App(crate::trading_event::TradingEvent::AddInstrument {
                         spec: btc_usd_spec(),
-                    },
+                    }),
                     ts,
                     key_hash,
                     1,
@@ -1686,11 +1759,11 @@ mod tests {
                 .unwrap();
             writer
                 .batch_append_with_ts(
-                    &JournalEvent::Deposit {
+                    &JournalEvent::App(crate::trading_event::TradingEvent::Deposit {
                         account: ACCT_A,
                         currency: USD,
                         amount: 5000,
-                    },
+                    }),
                     ts,
                     key_hash,
                     5,
@@ -1722,7 +1795,7 @@ mod tests {
     /// Helper: find the byte offset where valid journal data ends
     /// (after the last fully-written entry, before pre-allocated space).
     fn valid_data_end(path: &Path) -> u64 {
-        let mut reader = crate::journal::reader::JournalReader::open(path).unwrap();
+        let mut reader = crate::journal::JournalReader::open(path).unwrap();
         while reader.next_entry().unwrap().is_some() {}
         reader.valid_file_end()
     }
@@ -1847,7 +1920,7 @@ mod tests {
         }
 
         let end = valid_data_end(&original);
-        let header_end = crate::journal::codec::FILE_HEADER_SIZE as u64;
+        let header_end = melin_journal::codec::FILE_HEADER_SIZE as u64;
         assert!(end > header_end, "journal should have data beyond header");
 
         let work = dir.path().join("work.journal");
@@ -1922,7 +1995,7 @@ mod tests {
         let snap_bal_a_usd = snap_exchange.accounts().balance(ACCT_A, USD).available;
 
         let end = valid_data_end(&journal_path);
-        let header_end = crate::journal::codec::FILE_HEADER_SIZE as u64;
+        let header_end = melin_journal::codec::FILE_HEADER_SIZE as u64;
 
         let work_journal = dir.path().join("work.journal");
 
@@ -1968,12 +2041,9 @@ mod tests {
         // The server's init_engine handles this case by loading the snapshot
         // and creating a fresh journal. Simulate that path here.
         let (exchange, seq, chain_hash) = super::snapshot::load(&snap_path).unwrap();
-        let writer = crate::journal::writer::JournalWriter::create_continuing(
-            &journal_path,
-            seq + 1,
-            chain_hash,
-        )
-        .unwrap();
+        let writer =
+            crate::journal::JournalWriter::create_continuing(&journal_path, seq + 1, chain_hash)
+                .unwrap();
         let je = JournaledExchange::from_parts(exchange, writer);
         assert_eq!(
             je.exchange().accounts().balance(ACCT_A, USD).available,
@@ -2262,7 +2332,7 @@ mod tests {
         drop(engine);
 
         let end = valid_data_end(&journal_path);
-        let header_end = crate::journal::codec::FILE_HEADER_SIZE as u64;
+        let header_end = melin_journal::codec::FILE_HEADER_SIZE as u64;
 
         let work = dir.path().join("work_multi.journal");
 
@@ -2423,7 +2493,7 @@ mod tests {
                 // (insufficient balance, resting orders); replay must
                 // still reproduce them deterministically.
                 match je.withdraw(*acct, *cur, *amt) {
-                    Ok(()) | Err(JournalError::Rejected(_)) => {}
+                    Ok(()) | Err(JournaledExchangeError::Rejected(_)) => {}
                     Err(e) => panic!("unexpected journal error: {e:?}"),
                 }
             }

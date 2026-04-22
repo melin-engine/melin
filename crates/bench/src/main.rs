@@ -50,7 +50,6 @@ use std::time::{Duration, Instant};
 
 use hdrhistogram::Histogram;
 
-use melin_engine::types::*;
 #[cfg(not(feature = "dpdk"))]
 use melin_protocol::codec;
 #[cfg(not(feature = "dpdk"))]
@@ -59,6 +58,7 @@ use melin_protocol::message::ResponseKind;
 use melin_protocol::transport::BlockingTransportListener;
 #[cfg(not(feature = "dpdk"))]
 use melin_server::server::ServerConfig;
+use melin_trading::types::*;
 
 /// Number of completed orders between latency time-series samples.
 /// Each sample captures interval p99/p99.9 (reset after each sample),
@@ -629,11 +629,12 @@ fn run_pipeline_bench(
     json_path: Option<&std::path::Path>,
     max_journal_batch: usize,
 ) {
+    use melin_engine::journal::InputSlot;
+    use melin_engine::journal::JournalEvent;
     use melin_engine::journal::JournalWriter;
-    use melin_engine::journal::event::JournalEvent;
-    use melin_engine::journal::pipeline::{InputSlot, build_pipeline_with_replication};
+    use melin_engine::journal::pipeline::build_pipeline_with_replication;
     use melin_engine::journal::trace::trace_ts;
-    use melin_engine::journal::writer::wall_clock_nanos;
+    use melin_engine::journal::wall_clock_nanos;
 
     let nz = |v: u64| NonZeroU64::new(v).expect("non-zero");
 
@@ -726,22 +727,24 @@ fn run_pipeline_bench(
                     request_seq: 0,
                     sequence: 0,
                     timestamp_ns: wall_clock_nanos(),
-                    event: JournalEvent::SubmitOrder {
-                        symbol: Symbol(1),
-                        order: Order {
-                            id: order_id,
-                            account: AccountId(1),
-                            side,
-                            order_type: OrderType::Limit {
-                                price: Price(nz(100)),
-                                post_only: false,
+                    event: JournalEvent::App(
+                        melin_trading::trading_event::TradingEvent::SubmitOrder {
+                            symbol: Symbol(1),
+                            order: Order {
+                                id: order_id,
+                                account: AccountId(1),
+                                side,
+                                order_type: OrderType::Limit {
+                                    price: Price(nz(100)),
+                                    post_only: false,
+                                },
+                                time_in_force: TimeInForce::GTC,
+                                quantity: Quantity(nz(1)),
+                                stp: SelfTradeProtection::Allow,
+                                expiry_ns: 0,
                             },
-                            time_in_force: TimeInForce::GTC,
-                            quantity: Quantity(nz(1)),
-                            stp: SelfTradeProtection::Allow,
-                            expiry_ns: 0,
                         },
-                    },
+                    ),
                     publish_ts: trace_ts(),
                     recv_ts: trace_ts(),
                 });
@@ -763,10 +766,7 @@ fn run_pipeline_bench(
             std::hint::spin_loop();
             continue;
         };
-        if matches!(
-            slot.payload,
-            melin_engine::journal::pipeline::OutputPayload::BatchEnd
-        ) {
+        if matches!(slot.payload, melin_engine::journal::OutputPayload::BatchEnd) {
             let (_, sent_at) = loop {
                 if let Some(v) = ts_rx.try_consume() {
                     break v;

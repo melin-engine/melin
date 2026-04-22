@@ -29,7 +29,7 @@ use std::time::Duration;
 
 use melin_disruptor::padding::Sequence;
 use melin_disruptor::ring::QueueCursor;
-use melin_engine::journal::pipeline::StageUtilization;
+use melin_transport_core::pipeline::StageUtilization;
 use tracing::{debug, error, info};
 
 /// Input disruptor capacity. Duplicated here to avoid depending on the engine
@@ -176,6 +176,7 @@ impl HealthSnapshot {
             .as_ref()
             .map_or(0, |c| c.load(Ordering::Relaxed));
 
+        type ReplMetricsTuple = ([u64; 2], [u64; 2], [u64; 2], [u64; 2], [bool; 2], u64);
         let (
             per_replica_acked_sequence,
             per_replica_lag,
@@ -183,7 +184,7 @@ impl HealthSnapshot {
             per_replica_ack_latency_us,
             per_replica_catching_up,
             evictions_total,
-        ) = if let Some(ref rm) = state.replication_metrics {
+        ): ReplMetricsTuple = if let Some(ref rm) = state.replication_metrics {
             let acked = [
                 rm.acked_sequence[0].load(Ordering::Relaxed),
                 rm.acked_sequence[1].load(Ordering::Relaxed),

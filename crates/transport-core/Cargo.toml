@@ -1,0 +1,35 @@
+[package]
+name = "melin-transport-core"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+name = "melin_transport_core"
+path = "src/lib.rs"
+
+[features]
+## Record per-stage latency histograms on shutdown. Adds ~20 ns of clock
+## overhead per event. Not for production.
+latency-trace = ["melin-journal/latency-trace"]
+## Print per-stage busy/idle utilization on shutdown.
+pipeline-stats = []
+## Skip all journal I/O (no writes, no fsync). Unsafe for production —
+## nothing is persisted — but useful for benchmarking.
+no-persist = []
+## BLAKE3 tamper-evident hash chain — the chain state itself lives in
+## melin-journal, but the pipeline forwards chain hash publishes through
+## a SeqLock gated on this feature so downstream snapshot consumers see
+## the same value.
+hash-chain = ["melin-journal/hash-chain"]
+
+[dependencies]
+crc32c = "0.6"
+io-uring = "0.7"
+libc = { workspace = true }
+tracing = { workspace = true }
+melin-app = { path = "../app" }
+melin-disruptor = { path = "../disruptor" }
+melin-journal = { path = "../journal" }
+
+[dev-dependencies]
+tempfile = "3"

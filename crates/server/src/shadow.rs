@@ -1,4 +1,4 @@
-//! Shadow snapshot stage — replays journal events on a cloned Exchange to
+//! Shadow snapshot stage — replays journal events on a cloned App to
 //! produce periodic snapshots without blocking the hot path.
 //!
 //! The shadow consumer is gated on the journal stage (sees only fsynced events),
@@ -12,13 +12,16 @@ use std::time::Duration;
 
 use tracing::{error, info};
 
+use crate::App;
+use crate::InputSlot;
+use crate::JournalEvent;
+use melin_app::{Application, ApplyCtx};
 use melin_disruptor::ring;
 use melin_disruptor::seqlock::SeqLock;
-use melin_engine::exchange::Exchange;
-use melin_engine::journal::event::JournalEvent;
-use melin_engine::journal::pipeline::InputSlot;
-use melin_engine::journal::snapshot;
-use melin_engine::types::ExecutionReport;
+use melin_journal::JournalEvent as RawJournalEvent;
+use melin_transport_core::snapshot;
+
+type Report = <App as Application>::Report;
 
 use crate::amortized_timer::AmortizedTimer;
 
@@ -40,20 +43,20 @@ fn idle_wait(idle_spins: &mut u32, busy_spin: bool) {
 /// Run the shadow snapshot stage.
 ///
 /// Consumes events from the input ring (gated on journal fsync), replays them
-/// on a cloned Exchange, and saves periodic snapshots with the BLAKE3 chain
+/// on a cloned App, and saves periodic snapshots with the BLAKE3 chain
 /// hash read from the journal stage's SeqLock.
 pub fn run(
     mut consumer: ring::Consumer<InputSlot>,
-    mut exchange: Exchange,
+    mut exchange: App,
     snapshot_path: PathBuf,
     snapshot_interval: Duration,
     chain_hash_lock: Arc<SeqLock<[u8; 32]>>,
     shutdown: &AtomicBool,
     busy_spin: bool,
 ) {
-    // Scratch buffer for exchange methods that require a reports Vec.
-    // Cleared after each call — shadow discards all execution reports.
-    let mut reports: Vec<ExecutionReport> = Vec::with_capacity(64);
+    // Scratch buffer for app methods that require a reports Vec.
+    // Cleared after each call — shadow discards all reports.
+    let mut reports: Vec<Report> = Vec::with_capacity(64);
 
     // Batch buffer for consume_batch — stack-allocated InputSlot array would
     // be too large, so use a Vec that's allocated once and reused.
@@ -106,6 +109,8 @@ pub fn run(
                 &mut exchange,
                 &slot.event,
                 slot.timestamp_ns,
+                slot.key_hash,
+                slot.request_seq,
                 &mut last_drain_ns,
                 &mut reports,
             );
@@ -121,13 +126,13 @@ pub fn run(
 
 /// Save a shadow snapshot, logging success or failure.
 fn save_snapshot(
-    exchange: &Exchange,
+    app: &App,
     sequence: u64,
     chain_hash_lock: &Arc<SeqLock<[u8; 32]>>,
     path: &std::path::Path,
 ) {
     let chain_hash = chain_hash_lock.load();
-    match snapshot::save(exchange, sequence, chain_hash, path) {
+    match snapshot::save::<App>(app, sequence, chain_hash, path) {
         Ok(()) => {
             info!(
                 sequence,
@@ -146,115 +151,83 @@ fn save_snapshot(
     }
 }
 
-/// Dispatch a single journal event to the shadow exchange.
+/// Dispatch a single journal event to the shadow app.
 ///
-/// Same event handling as the matching stage's `process_event`, including
-/// the per-event scheduler drain — without that the shadow's snapshot would
-/// hold scheduled-task state that's stale relative to the live engine.
-/// `last_drain_ns` is caller-tracked across the consume loop so the drain
-/// stays monotonic.
+/// Mirrors `JournaledApp::replay_entry`: rebuild per-key HWM via
+/// `check_request_seq`, drain the scheduler clock if `timestamp_ns`
+/// advanced, then hand the event to `apply` or `tick`. Without the
+/// `check_request_seq` call, the shadow snapshot's `key_hwm` would be
+/// empty and a restore would let previously-rejected duplicate
+/// `request_seq` values through. `last_drain_ns` is caller-tracked
+/// across the consume loop so the drain stays monotonic.
 fn dispatch_event(
-    exchange: &mut Exchange,
+    app: &mut App,
     event: &JournalEvent,
     timestamp_ns: u64,
+    key_hash: u64,
+    request_seq: u64,
     last_drain_ns: &mut u64,
-    reports: &mut Vec<ExecutionReport>,
+    reports: &mut Vec<Report>,
 ) {
     reports.clear();
 
+    // Gate on `!is_query` to match the matching stage (`pipeline.rs`
+    // `check_request_seq` call site). The shadow reads from the pre-journal
+    // input ring — unlike `JournaledApp::replay_entry`, which sees only
+    // non-queries because the journal stage drops queries — so advancing
+    // HWM on queries here would push shadow's `key_hwm` above primary's and
+    // cause post-restore to reject legitimate non-duplicate requests.
+    // Return discarded: shadow applies the event regardless of the dedup
+    // decision (matches `replay_entry` for non-queries).
+    if !event.is_query() {
+        let _ = app.check_request_seq(key_hash, request_seq);
+    }
+
     if timestamp_ns > *last_drain_ns {
         *last_drain_ns = timestamp_ns;
-        exchange.drain_due_scheduled_tasks(timestamp_ns, reports);
+        app.tick(timestamp_ns, reports);
     }
 
     match *event {
-        JournalEvent::AddInstrument { spec } => {
-            exchange.add_instrument(spec);
+        RawJournalEvent::App(e) => {
+            // The shadow is strictly a secondary observer — the canonical
+            // answer (and journal sequence number) is produced by the
+            // matching stage. `ApplyCtx` is supplied with the fields the
+            // shadow can cheaply compute; `journal_sequence` / connection
+            // counts are live-pipeline-only.
+            let ctx = ApplyCtx {
+                now_ns: timestamp_ns,
+                journal_sequence: 0,
+                active_connections: 0,
+                events_processed: 0,
+            };
+            // Query response discarded — shadow is a secondary observer,
+            // it does not produce client-facing output.
+            let _ = app.apply(e, &ctx, reports);
         }
-        JournalEvent::Deposit {
-            account,
-            currency,
-            amount,
-        } => {
-            exchange.deposit(account, currency, amount);
-        }
-        JournalEvent::SubmitOrder { symbol, order } => {
-            exchange.execute(symbol, order, reports);
-        }
-        JournalEvent::CancelOrder {
-            account,
-            order_id,
-            symbol,
-        } => {
-            exchange.cancel(symbol, account, order_id, reports);
-        }
-        JournalEvent::SetRiskLimits { symbol, limits } => {
-            exchange.set_risk_limits(symbol, limits);
-        }
-        JournalEvent::CancelAll { account } => {
-            exchange.cancel_all(account, reports);
-        }
-        JournalEvent::EndOfDay => {
-            exchange.end_of_day(reports);
-        }
-        JournalEvent::SetCircuitBreaker { symbol, config } => {
-            exchange.set_circuit_breaker(symbol, config);
-        }
-        JournalEvent::CancelReplace {
-            symbol,
-            account,
-            order_id,
-            new_price,
-            new_quantity,
-        } => {
-            exchange.cancel_replace(symbol, account, order_id, new_price, new_quantity, reports);
-        }
-        JournalEvent::SetFeeSchedule { symbol, schedule } => {
-            exchange.set_fee_schedule(symbol, schedule, reports);
-        }
-        JournalEvent::ProvisionAccount { account, amount } => {
-            exchange.provision_account(account, amount);
-        }
-        JournalEvent::Withdraw {
-            account,
-            currency,
-            amount,
-        } => {
-            // Replay path: deterministic — rejections reproduce the
-            // original live outcome and were already surfaced to the
-            // client. Discarding here is intentional and safe.
-            let _ = exchange.withdraw(account, currency, amount);
-        }
-        JournalEvent::DisableInstrument { symbol } => {
-            exchange.disable_instrument(symbol, reports);
-        }
-        JournalEvent::EnableInstrument { symbol } => {
-            exchange.enable_instrument(symbol, reports);
-        }
-        JournalEvent::RemoveInstrument { symbol } => {
-            exchange.remove_instrument(symbol, reports);
-        }
-        JournalEvent::Tick { now_ns } => {
+        RawJournalEvent::Tick { now_ns } => {
             // Defensive: the head-of-event drain typically already advanced
             // the clock to this point. Re-draining via `now_ns` keeps the
             // contract consistent for callers that pass `timestamp_ns = 0`
             // (tests, manually constructed events).
-            exchange.drain_due_scheduled_tasks(now_ns, reports);
+            app.tick(now_ns, reports);
         }
-        JournalEvent::QueryStats | JournalEvent::QueryPosition { .. } => {
-            // Read-only — no state change.
-        }
-        JournalEvent::GenesisHash { .. } | JournalEvent::Checkpoint { .. } => {
-            // Hash chain metadata — no exchange state change.
+        RawJournalEvent::GenesisHash { .. } | RawJournalEvent::Checkpoint { .. } => {
+            // Hash chain metadata — no application state change.
         }
     }
 }
 
-#[cfg(test)]
+// The shadow module's test suite exercises every trading-event branch
+// against a real `Exchange`. Under the noop build the equivalent
+// assertions would be trivial (every event produces the same rejection
+// report), so the suite is gated to the trading build rather than
+// rewritten.
+#[cfg(all(test, feature = "trading", not(feature = "noop")))]
 mod tests {
     use super::*;
-    use melin_engine::journal::event::JournalEvent;
-    use melin_engine::types::*;
+    use crate::JournalEvent;
+    use melin_trading::types::*;
     use std::num::NonZeroU64;
     use std::time::Instant;
 
@@ -273,68 +246,72 @@ mod tests {
     #[test]
     fn dispatch_event_produces_identical_state_to_direct_calls() {
         // Process the same events two ways: dispatch_event (shadow path)
-        // and direct Exchange method calls (matching path). Exercises
+        // and direct App method calls (matching path). Exercises
         // every JournalEvent variant that mutates exchange state.
-        let mut shadow = Exchange::new();
-        let mut primary = Exchange::new();
+        let mut shadow = App::new();
+        let mut primary = App::new();
         let mut reports = Vec::new();
 
         let events = vec![
             // --- Instrument setup ---
-            JournalEvent::AddInstrument {
+            JournalEvent::App(melin_trading::trading_event::TradingEvent::AddInstrument {
                 spec: InstrumentSpec {
                     symbol: Symbol(1),
                     base: CurrencyId(0),
                     quote: CurrencyId(1),
                 },
-            },
+            }),
             // --- Account provisioning and deposits ---
-            JournalEvent::ProvisionAccount {
-                account: AccountId(1),
-                amount: 200_000,
-            },
-            JournalEvent::Deposit {
+            JournalEvent::App(
+                melin_trading::trading_event::TradingEvent::ProvisionAccount {
+                    account: AccountId(1),
+                    amount: 200_000,
+                },
+            ),
+            JournalEvent::App(melin_trading::trading_event::TradingEvent::Deposit {
                 account: AccountId(1),
                 currency: CurrencyId(1),
                 amount: 100_000,
-            },
-            JournalEvent::Deposit {
+            }),
+            JournalEvent::App(melin_trading::trading_event::TradingEvent::Deposit {
                 account: AccountId(2),
                 currency: CurrencyId(0),
                 amount: 500,
-            },
-            JournalEvent::Deposit {
+            }),
+            JournalEvent::App(melin_trading::trading_event::TradingEvent::Deposit {
                 account: AccountId(2),
                 currency: CurrencyId(1),
                 amount: 50_000,
-            },
+            }),
             // --- Risk limits ---
-            JournalEvent::SetRiskLimits {
+            JournalEvent::App(melin_trading::trading_event::TradingEvent::SetRiskLimits {
                 symbol: Symbol(1),
                 limits: RiskLimits {
                     max_order_qty: Some(qty(1000)),
                     max_order_notional: None,
                 },
-            },
+            }),
             // --- Circuit breaker ---
-            JournalEvent::SetCircuitBreaker {
-                symbol: Symbol(1),
-                config: CircuitBreakerConfig {
-                    price_band_lower: Some(price(50)),
-                    price_band_upper: Some(price(200)),
-                    halted: false,
+            JournalEvent::App(
+                melin_trading::trading_event::TradingEvent::SetCircuitBreaker {
+                    symbol: Symbol(1),
+                    config: CircuitBreakerConfig {
+                        price_band_lower: Some(price(50)),
+                        price_band_upper: Some(price(200)),
+                        halted: false,
+                    },
                 },
-            },
+            ),
             // --- Fee schedule ---
-            JournalEvent::SetFeeSchedule {
+            JournalEvent::App(melin_trading::trading_event::TradingEvent::SetFeeSchedule {
                 symbol: Symbol(1),
                 schedule: FeeSchedule {
                     maker_fee_bps: -5,
                     taker_fee_bps: 10,
                 },
-            },
+            }),
             // --- Place a sell order (rests on book) ---
-            JournalEvent::SubmitOrder {
+            JournalEvent::App(melin_trading::trading_event::TradingEvent::SubmitOrder {
                 symbol: Symbol(1),
                 order: Order {
                     id: OrderId(1),
@@ -349,9 +326,9 @@ mod tests {
                     stp: SelfTradeProtection::Allow,
                     expiry_ns: 0,
                 },
-            },
+            }),
             // --- Place a second sell order to cancel later ---
-            JournalEvent::SubmitOrder {
+            JournalEvent::App(melin_trading::trading_event::TradingEvent::SubmitOrder {
                 symbol: Symbol(1),
                 order: Order {
                     id: OrderId(2),
@@ -366,23 +343,23 @@ mod tests {
                     stp: SelfTradeProtection::Allow,
                     expiry_ns: 0,
                 },
-            },
+            }),
             // --- Cancel-replace: move order 2 to price 105, qty 25 ---
-            JournalEvent::CancelReplace {
+            JournalEvent::App(melin_trading::trading_event::TradingEvent::CancelReplace {
                 symbol: Symbol(1),
                 account: AccountId(2),
                 order_id: OrderId(2),
                 new_price: price(105),
                 new_quantity: qty(25),
-            },
+            }),
             // --- Cancel order 2 ---
-            JournalEvent::CancelOrder {
+            JournalEvent::App(melin_trading::trading_event::TradingEvent::CancelOrder {
                 account: AccountId(2),
                 order_id: OrderId(2),
                 symbol: Symbol(1),
-            },
+            }),
             // --- Partial fill: buy 20 of the 50-lot sell ---
-            JournalEvent::SubmitOrder {
+            JournalEvent::App(melin_trading::trading_event::TradingEvent::SubmitOrder {
                 symbol: Symbol(1),
                 order: Order {
                     id: OrderId(1),
@@ -397,16 +374,16 @@ mod tests {
                     stp: SelfTradeProtection::Allow,
                     expiry_ns: 0,
                 },
-            },
+            }),
             // --- Withdraw some funds ---
-            JournalEvent::Withdraw {
+            JournalEvent::App(melin_trading::trading_event::TradingEvent::Withdraw {
                 account: AccountId(1),
                 currency: CurrencyId(1),
                 amount: 5_000,
-            },
+            }),
             // --- Place a GTD order, then drive a Tick past its expiry to
             //     trigger the scheduler-driven cancel ---
-            JournalEvent::SubmitOrder {
+            JournalEvent::App(melin_trading::trading_event::TradingEvent::SubmitOrder {
                 symbol: Symbol(1),
                 order: Order {
                     id: OrderId(3),
@@ -421,10 +398,10 @@ mod tests {
                     stp: SelfTradeProtection::Allow,
                     expiry_ns: 1_000_000,
                 },
-            },
+            }),
             JournalEvent::Tick { now_ns: 2_000_000 },
             // --- Place an order then cancel all for that account ---
-            JournalEvent::SubmitOrder {
+            JournalEvent::App(melin_trading::trading_event::TradingEvent::SubmitOrder {
                 symbol: Symbol(1),
                 order: Order {
                     id: OrderId(4),
@@ -439,12 +416,12 @@ mod tests {
                     stp: SelfTradeProtection::Allow,
                     expiry_ns: 0,
                 },
-            },
-            JournalEvent::CancelAll {
+            }),
+            JournalEvent::App(melin_trading::trading_event::TradingEvent::CancelAll {
                 account: AccountId(1),
-            },
+            }),
             // --- No-ops that should not affect state ---
-            JournalEvent::QueryStats,
+            JournalEvent::App(melin_trading::trading_event::TradingEvent::QueryStats),
             JournalEvent::GenesisHash { hash: [0xAA; 32] },
             JournalEvent::Checkpoint {
                 chain_hash: [0xBB; 32],
@@ -453,19 +430,19 @@ mod tests {
             // --- Instrument lifecycle ---
             // Add a second instrument, place an order, then disable (cancels order),
             // enable, and disable+remove.
-            JournalEvent::AddInstrument {
+            JournalEvent::App(melin_trading::trading_event::TradingEvent::AddInstrument {
                 spec: InstrumentSpec {
                     symbol: Symbol(2),
                     base: CurrencyId(2),
                     quote: CurrencyId(1),
                 },
-            },
-            JournalEvent::Deposit {
+            }),
+            JournalEvent::App(melin_trading::trading_event::TradingEvent::Deposit {
                 account: AccountId(1),
                 currency: CurrencyId(2),
                 amount: 10_000,
-            },
-            JournalEvent::SubmitOrder {
+            }),
+            JournalEvent::App(melin_trading::trading_event::TradingEvent::SubmitOrder {
                 symbol: Symbol(2),
                 order: Order {
                     id: OrderId(10),
@@ -480,63 +457,107 @@ mod tests {
                     stp: SelfTradeProtection::Allow,
                     expiry_ns: 0,
                 },
-            },
-            JournalEvent::DisableInstrument { symbol: Symbol(2) },
-            JournalEvent::EnableInstrument { symbol: Symbol(2) },
-            JournalEvent::DisableInstrument { symbol: Symbol(2) },
-            JournalEvent::RemoveInstrument { symbol: Symbol(2) },
+            }),
+            JournalEvent::App(
+                melin_trading::trading_event::TradingEvent::DisableInstrument { symbol: Symbol(2) },
+            ),
+            JournalEvent::App(
+                melin_trading::trading_event::TradingEvent::EnableInstrument { symbol: Symbol(2) },
+            ),
+            JournalEvent::App(
+                melin_trading::trading_event::TradingEvent::DisableInstrument { symbol: Symbol(2) },
+            ),
+            JournalEvent::App(
+                melin_trading::trading_event::TradingEvent::RemoveInstrument { symbol: Symbol(2) },
+            ),
             // --- End of day ---
-            JournalEvent::EndOfDay,
+            JournalEvent::App(melin_trading::trading_event::TradingEvent::EndOfDay),
         ];
 
         // Shadow path: dispatch_event. Pass timestamp 0 throughout — this
         // test isn't exercising the per-event scheduler drain, so the
-        // timestamp/last_drain_ns plumbing stays inert.
+        // timestamp/last_drain_ns plumbing stays inert. Use non-zero
+        // key_hash / increasing request_seq so HWM state gets populated;
+        // this is what would diverge if dispatch_event skipped
+        // check_request_seq.
+        const KEY_HASH: u64 = 0xDEAD_BEEF;
         let mut last_drain_ns: u64 = 0;
-        for event in &events {
-            dispatch_event(&mut shadow, event, 0, &mut last_drain_ns, &mut reports);
+        for (i, event) in events.iter().enumerate() {
+            let request_seq = (i as u64) + 1;
+            dispatch_event(
+                &mut shadow,
+                event,
+                0,
+                KEY_HASH,
+                request_seq,
+                &mut last_drain_ns,
+                &mut reports,
+            );
         }
 
         // Primary path: direct method calls (mirrors dispatch_event logic).
+        // Apply check_request_seq in lockstep with the shadow — skipping
+        // queries, matching the matching stage's `!is_query` gate — so HWM
+        // state matches; the final snapshot-byte comparison catches
+        // divergence.
         let mut primary_reports = Vec::new();
-        for event in &events {
+        for (i, event) in events.iter().enumerate() {
+            let request_seq = (i as u64) + 1;
+            if !event.is_query() {
+                assert!(primary.check_request_seq(KEY_HASH, request_seq));
+            }
             primary_reports.clear();
             match *event {
-                JournalEvent::AddInstrument { spec } => primary.add_instrument(spec),
-                JournalEvent::Deposit {
+                JournalEvent::App(melin_trading::trading_event::TradingEvent::AddInstrument {
+                    spec,
+                }) => primary.add_instrument(spec),
+                JournalEvent::App(melin_trading::trading_event::TradingEvent::Deposit {
                     account,
                     currency,
                     amount,
-                } => primary.deposit(account, currency, amount),
-                JournalEvent::SubmitOrder { symbol, order } => {
+                }) => primary.deposit(account, currency, amount),
+                JournalEvent::App(melin_trading::trading_event::TradingEvent::SubmitOrder {
+                    symbol,
+                    order,
+                }) => {
                     primary.execute(symbol, order, &mut primary_reports);
                 }
-                JournalEvent::CancelOrder {
+                JournalEvent::App(melin_trading::trading_event::TradingEvent::CancelOrder {
                     account,
                     order_id,
                     symbol,
-                } => {
+                }) => {
                     primary.cancel(symbol, account, order_id, &mut primary_reports);
                 }
-                JournalEvent::SetRiskLimits { symbol, limits } => {
+                JournalEvent::App(melin_trading::trading_event::TradingEvent::SetRiskLimits {
+                    symbol,
+                    limits,
+                }) => {
                     primary.set_risk_limits(symbol, limits);
                 }
-                JournalEvent::CancelAll { account } => {
+                JournalEvent::App(melin_trading::trading_event::TradingEvent::CancelAll {
+                    account,
+                }) => {
                     primary.cancel_all(account, &mut primary_reports);
                 }
-                JournalEvent::EndOfDay => {
+                JournalEvent::App(melin_trading::trading_event::TradingEvent::EndOfDay) => {
                     primary.end_of_day(&mut primary_reports);
                 }
-                JournalEvent::SetCircuitBreaker { symbol, config } => {
+                JournalEvent::App(
+                    melin_trading::trading_event::TradingEvent::SetCircuitBreaker {
+                        symbol,
+                        config,
+                    },
+                ) => {
                     primary.set_circuit_breaker(symbol, config);
                 }
-                JournalEvent::CancelReplace {
+                JournalEvent::App(melin_trading::trading_event::TradingEvent::CancelReplace {
                     symbol,
                     account,
                     order_id,
                     new_price,
                     new_quantity,
-                } => {
+                }) => {
                     primary.cancel_replace(
                         symbol,
                         account,
@@ -546,34 +567,50 @@ mod tests {
                         &mut primary_reports,
                     );
                 }
-                JournalEvent::SetFeeSchedule { symbol, schedule } => {
+                JournalEvent::App(melin_trading::trading_event::TradingEvent::SetFeeSchedule {
+                    symbol,
+                    schedule,
+                }) => {
                     primary.set_fee_schedule(symbol, schedule, &mut primary_reports);
                 }
-                JournalEvent::ProvisionAccount { account, amount } => {
+                JournalEvent::App(
+                    melin_trading::trading_event::TradingEvent::ProvisionAccount {
+                        account,
+                        amount,
+                    },
+                ) => {
                     primary.provision_account(account, amount);
                 }
-                JournalEvent::Withdraw {
+                JournalEvent::App(melin_trading::trading_event::TradingEvent::Withdraw {
                     account,
                     currency,
                     amount,
-                } => {
+                }) => {
                     // Replay path: deterministic — see note in apply_event.
                     let _ = primary.withdraw(account, currency, amount);
                 }
-                JournalEvent::DisableInstrument { symbol } => {
+                JournalEvent::App(
+                    melin_trading::trading_event::TradingEvent::DisableInstrument { symbol },
+                ) => {
                     primary.disable_instrument(symbol, &mut primary_reports);
                 }
-                JournalEvent::EnableInstrument { symbol } => {
+                JournalEvent::App(
+                    melin_trading::trading_event::TradingEvent::EnableInstrument { symbol },
+                ) => {
                     primary.enable_instrument(symbol, &mut primary_reports);
                 }
-                JournalEvent::RemoveInstrument { symbol } => {
+                JournalEvent::App(
+                    melin_trading::trading_event::TradingEvent::RemoveInstrument { symbol },
+                ) => {
                     primary.remove_instrument(symbol, &mut primary_reports);
                 }
                 JournalEvent::Tick { now_ns } => {
                     primary.drain_due_scheduled_tasks(now_ns, &mut primary_reports);
                 }
-                JournalEvent::QueryStats
-                | JournalEvent::QueryPosition { .. }
+                JournalEvent::App(melin_trading::trading_event::TradingEvent::QueryStats)
+                | JournalEvent::App(melin_trading::trading_event::TradingEvent::QueryPosition {
+                    ..
+                })
                 | JournalEvent::GenesisHash { .. }
                 | JournalEvent::Checkpoint { .. } => {}
             }
@@ -588,12 +625,48 @@ mod tests {
         let primary_path = dir.path().join("primary.snapshot");
         let hash = [0u8; 32];
 
-        snapshot::save(&shadow, 1, hash, &shadow_path).unwrap();
-        snapshot::save(&primary, 1, hash, &primary_path).unwrap();
+        snapshot::save::<App>(&shadow, 1, hash, &shadow_path).unwrap();
+        snapshot::save::<App>(&primary, 1, hash, &primary_path).unwrap();
 
         let shadow_bytes = std::fs::read(&shadow_path).unwrap();
         let primary_bytes = std::fs::read(&primary_path).unwrap();
         assert_eq!(shadow_bytes, primary_bytes, "snapshot state diverged");
+    }
+
+    #[test]
+    fn query_does_not_advance_shadow_hwm() {
+        // The shadow reads from the pre-journal input ring, so it sees
+        // queries. The matching stage skips `check_request_seq` for
+        // queries (pipeline.rs `!is_query` gate), so the shadow must
+        // skip too — otherwise shadow's `key_hwm` would overshoot
+        // primary's and a restore would reject legitimate requests
+        // whose seq falls between primary's HWM and shadow's HWM.
+        //
+        // Regression test: dispatch a query with a high seq, then
+        // verify the app still accepts a same-seq non-query — which
+        // it would not if the query had advanced the HWM.
+        let mut shadow = App::new();
+        let mut reports = Vec::new();
+        let mut last_drain_ns: u64 = 0;
+        const KEY_HASH: u64 = 0xFEED_FACE;
+
+        let query = JournalEvent::App(melin_trading::trading_event::TradingEvent::QueryStats);
+        dispatch_event(
+            &mut shadow,
+            &query,
+            0,
+            KEY_HASH,
+            100,
+            &mut last_drain_ns,
+            &mut reports,
+        );
+
+        // A non-query request with the same seq must still be accepted —
+        // proves the query didn't advance HWM above 100.
+        assert!(
+            shadow.check_request_seq(KEY_HASH, 100),
+            "query at seq=100 must not advance HWM; seq=100 should still pass"
+        );
     }
 
     #[test]
@@ -603,7 +676,7 @@ mod tests {
             .build();
         let consumer = consumers.pop().unwrap();
 
-        let exchange = Exchange::new();
+        let exchange = App::new();
         let chain_hash = Arc::new(SeqLock::new([0u8; 32]));
         let shutdown = Arc::new(AtomicBool::new(false));
         let shutdown2 = Arc::clone(&shutdown);
@@ -642,7 +715,7 @@ mod tests {
                 .build();
         let consumer = consumers.pop().unwrap();
 
-        let mut exchange = Exchange::new();
+        let mut exchange = App::new();
         exchange.add_instrument(InstrumentSpec {
             symbol: Symbol(1),
             base: CurrencyId(0),
@@ -683,11 +756,11 @@ mod tests {
             request_seq: 0,
             sequence: 0,
             timestamp_ns: 0,
-            event: JournalEvent::Deposit {
+            event: JournalEvent::App(melin_trading::trading_event::TradingEvent::Deposit {
                 account: AccountId(1),
                 currency: CurrencyId(1),
                 amount: 1000,
-            },
+            }),
             publish_ts: Default::default(),
             recv_ts: Default::default(),
         });
@@ -697,11 +770,11 @@ mod tests {
             request_seq: 0,
             sequence: 0,
             timestamp_ns: 0,
-            event: JournalEvent::Deposit {
+            event: JournalEvent::App(melin_trading::trading_event::TradingEvent::Deposit {
                 account: AccountId(1),
                 currency: CurrencyId(1),
                 amount: 500,
-            },
+            }),
             publish_ts: Default::default(),
             recv_ts: Default::default(),
         });
@@ -718,7 +791,7 @@ mod tests {
 
         // Verify the snapshot file was created and is loadable.
         assert!(snap_path.exists(), "snapshot file should exist");
-        let (restored, _seq, chain) = snapshot::load(&snap_path).unwrap();
+        let (restored, _seq, chain) = snapshot::load::<App>(&snap_path).unwrap();
         assert_eq!(chain, [0xAB; 32]); // chain hash from SeqLock
         // Both deposits should be reflected: 100K initial + 1K + 500.
         assert_eq!(

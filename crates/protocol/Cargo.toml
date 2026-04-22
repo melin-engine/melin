@@ -4,12 +4,12 @@ version = "0.3.0"
 edition = "2024"
 
 [features]
-latency-trace = ["melin-engine/latency-trace"]
+latency-trace = []
 
 [dependencies]
 base64 = { workspace = true }
 ed25519-dalek = { workspace = true }
-melin-engine = { path = "../engine" }
+melin-trading = { path = "../trading" }
 
 [dev-dependencies]
 bolero = "0.13"

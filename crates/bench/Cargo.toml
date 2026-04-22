@@ -24,6 +24,7 @@ required-features = ["plot"]
 
 [dependencies]
 melin-engine = { path = "../engine" }
+melin-trading = { path = "../trading" }
 melin-disruptor = { path = "../disruptor" }
 melin-protocol = { path = "../protocol" }
 melin-server = { path = "../server" }

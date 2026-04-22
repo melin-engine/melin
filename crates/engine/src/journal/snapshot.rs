@@ -35,8 +35,8 @@ use crate::types::{
     Quantity, ReservationSlot, RiskLimits, Side, Symbol, TimeInForce,
 };
 
-use super::error::JournalError;
 use crate::le;
+use melin_journal::JournalError;
 
 /// Decoded book-side levels: Vec of (price, orders-at-that-level).
 type RestingLevels = Vec<(Price, Vec<RestingOrderSnapshot>)>;
@@ -62,6 +62,32 @@ const SNAP_MAGIC: u32 = 0x534E_4150;
 /// v13 → v14: scheduler heap removed from snapshot — rebuilt on restore from
 ///            GTD orders + pending stops (derived state).
 const SNAP_VERSION: u16 = 14;
+
+/// Re-exports for callers that serialize the Exchange payload without the
+/// full on-disk framing — e.g. the `melin-app::Application` impl which
+/// hands its snapshot stream to the transport for wrapping.
+pub(crate) const PAYLOAD_VERSION: u16 = SNAP_VERSION;
+
+/// Encode the Exchange's full state (the "payload" portion of a snapshot —
+/// everything between the header and the CRC) into a freshly allocated
+/// `Vec<u8>`. The caller owns framing and checksum.
+pub(crate) fn encode_exchange_payload(exchange: &Exchange) -> Vec<u8> {
+    let state = exchange.snapshot_state();
+    // Exchange snapshots grow with account/order count; start with a
+    // generously sized buffer to minimise reallocations but avoid
+    // pre-reserving the 256 MiB cap.
+    let mut buf = Vec::with_capacity(64 * 1024);
+    encode_exchange_state(&state, &mut buf);
+    buf
+}
+
+/// Decode an Exchange from the payload bytes produced by
+/// [`encode_exchange_payload`]. The caller is responsible for verifying
+/// framing and CRC before handing bytes to this function.
+pub(crate) fn decode_exchange_payload(buf: &[u8], version: u16) -> Result<Exchange, JournalError> {
+    let (_consumed, state) = decode_exchange_state(buf, version)?;
+    Ok(Exchange::restore_state(state))
+}
 
 /// Snapshot header size: magic(4) + version(2) + reserved(2) + sequence(8) + chain_hash(32) = 48.
 const SNAP_HEADER_SIZE: usize = 48;

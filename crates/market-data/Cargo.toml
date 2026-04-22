@@ -5,6 +5,7 @@ edition = "2024"
 
 [dependencies]
 melin-engine = { path = "../engine" }
+melin-trading = { path = "../trading" }
 melin-protocol = { path = "../protocol" }
 ed25519-dalek = { workspace = true }
 tracing = { workspace = true }

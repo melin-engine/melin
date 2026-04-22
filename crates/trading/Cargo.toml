@@ -1,0 +1,11 @@
+[package]
+name = "melin-trading"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+name = "melin_trading"
+path = "src/lib.rs"
+
+[dependencies]
+melin-app = { path = "../app" }

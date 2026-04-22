@@ -45,12 +45,12 @@ fn fast_powf(base: f64, exp: f64) -> f64 {
     }
 }
 
-use melin_engine::types::{
+use melin_protocol::codec;
+use melin_protocol::message::Request;
+use melin_trading::types::{
     AccountId, Order, OrderId, OrderType, Price, Quantity, SelfTradeProtection, Side, Symbol,
     TimeInForce,
 };
-use melin_protocol::codec;
-use melin_protocol::message::Request;
 
 /// Configuration for the realistic order flow generator.
 #[derive(Debug, Clone)]
@@ -716,7 +716,7 @@ mod tests {
     #[test]
     fn aggressive_orders_produce_fills() {
         use melin_engine::exchange::Exchange;
-        use melin_engine::types::{CurrencyId, ExecutionReport, InstrumentSpec};
+        use melin_trading::types::{CurrencyId, ExecutionReport, InstrumentSpec};
 
         let config = GeneratorConfig {
             num_accounts: 2,

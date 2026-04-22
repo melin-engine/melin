@@ -69,10 +69,10 @@ fn main() {
     let md_state = Arc::new(RwLock::new(melin_market_data::core::MdState::new()));
 
     // Collect symbol IDs for the Subscribe request.
-    let symbol_ids: Vec<melin_engine::types::Symbol> = config
+    let symbol_ids: Vec<melin_trading::types::Symbol> = config
         .symbols
         .values()
-        .map(|s| melin_engine::types::Symbol(s.id))
+        .map(|s| melin_trading::types::Symbol(s.id))
         .collect();
 
     // Spawn the MarketDataCore thread — connects to the event publisher,

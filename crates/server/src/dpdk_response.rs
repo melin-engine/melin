@@ -20,7 +20,9 @@ use melin_disruptor::padding::Sequence;
 use melin_disruptor::ring;
 use melin_disruptor::spsc;
 
-use melin_engine::journal::pipeline::{OutputPayload, OutputSlot, StageUtilization};
+use crate::{OutputPayload, OutputSlot};
+use melin_trading::types::QueryResponse;
+use melin_transport_core::pipeline::StageUtilization;
 
 use melin_protocol::codec;
 use melin_protocol::message::ResponseKind;
@@ -228,27 +230,27 @@ pub fn run(
         // Encode and queue responses.
         for slot in &batch[..count] {
             let kind = match slot.payload {
+                OutputPayload::QueryResponse(QueryResponse::Stats {
+                    active_connections,
+                    events_processed,
+                    journal_sequence,
+                }) => ResponseKind::StatsHeader {
+                    active_connections,
+                    events_processed,
+                    journal_sequence,
+                },
+                OutputPayload::QueryResponse(QueryResponse::Position {
+                    account,
+                    balances,
+                    count,
+                }) => ResponseKind::PositionSnapshot {
+                    account,
+                    balances,
+                    count,
+                },
                 OutputPayload::Report(report) => ResponseKind::Report(report),
                 OutputPayload::BatchEnd => ResponseKind::BatchEnd,
                 OutputPayload::EngineError => ResponseKind::EngineError,
-                OutputPayload::StatsHeader {
-                    active_connections,
-                    events_processed,
-                    journal_sequence,
-                } => ResponseKind::StatsHeader {
-                    active_connections,
-                    events_processed,
-                    journal_sequence,
-                },
-                OutputPayload::PositionSnapshot {
-                    account,
-                    balances,
-                    count,
-                } => ResponseKind::PositionSnapshot {
-                    account,
-                    balances,
-                    count,
-                },
             };
 
             if !connections.contains_key(&slot.connection_id) {

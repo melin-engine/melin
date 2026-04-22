@@ -12,9 +12,9 @@ use std::time::{Duration, Instant};
 use ed25519_dalek::{Signer, SigningKey};
 use tracing::{debug, error, info, warn};
 
-use melin_engine::types::{AccountId, OrderId, Side};
 use melin_protocol::codec;
 use melin_protocol::message::{Request, ResponseKind};
+use melin_trading::types::{AccountId, OrderId, Side};
 
 use crate::config::{GatewayConfig, SymbolConfig};
 use crate::event_loop::SessionAction;
@@ -1064,8 +1064,8 @@ impl Session {
     fn update_fill_ledger(
         &mut self,
         order_id: OrderId,
-        fill_price: melin_engine::types::Price,
-        fill_quantity: melin_engine::types::Quantity,
+        fill_price: melin_trading::types::Price,
+        fill_quantity: melin_trading::types::Quantity,
         lot_inverse: u64,
         side: Side,
     ) {
@@ -1612,7 +1612,7 @@ impl Drop for Session {
 // Helpers
 // ---------------------------------------------------------------------------
 
-use melin_engine::types::ExecutionReport;
+use melin_trading::types::ExecutionReport;
 
 /// Extract symbol info from an OrderSymbolInfo, or return defaults.
 fn sym_info_or_default(info: Option<&OrderSymbolInfo>) -> (&str, u64, u64, Side) {
@@ -1717,11 +1717,11 @@ fn load_signing_key(path: &std::path::Path) -> Result<SigningKey, Box<dyn std::e
 #[cfg(test)]
 mod tests {
     use super::*;
-    use melin_engine::types::{
-        ExecutionReport, InstrumentStatus, Price, Quantity, RejectReason, Side, Symbol,
-    };
     use melin_gateway_core::fix::serialize::FixMessageBuilder;
     use melin_protocol::message::ResponseKind;
+    use melin_trading::types::{
+        ExecutionReport, InstrumentStatus, Price, Quantity, RejectReason, Side, Symbol,
+    };
     use std::num::NonZeroU64;
     use std::sync::atomic::{AtomicU64, Ordering};
 

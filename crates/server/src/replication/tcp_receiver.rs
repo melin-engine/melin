@@ -77,9 +77,7 @@ use super::{
 #[allow(clippy::too_many_arguments)]
 fn replica_stream_uring(
     tcp_stream: &TcpStream,
-    input_producer: &melin_disruptor::ring::MultiProducer<
-        melin_engine::journal::pipeline::InputSlot,
-    >,
+    input_producer: &melin_disruptor::ring::MultiProducer<crate::InputSlot>,
     journal_cursor: &melin_disruptor::padding::Sequence,
     pending_acks: &mut PendingAckQueue,
     received_data: &mut bool,
@@ -697,18 +695,13 @@ enum SessionExit {
 }
 
 /// Run the replication receiver. Connects to a primary, receives journal
-/// entries, persists them locally, replays into the Exchange, and sends acks.
+/// entries, persists them locally, replays into the App, and sends acks.
 ///
 /// Blocks until the connection drops or shutdown is signaled.
 /// Result of `run_receiver`: `None` = clean shutdown, `Some` = promotion
-/// triggered with the fully-replayed Exchange and positioned JournalWriter.
-pub type ReceiverResult = Result<
-    Option<(
-        melin_engine::exchange::Exchange,
-        melin_engine::journal::writer::JournalWriter,
-    )>,
-    Box<dyn std::error::Error>,
->;
+/// triggered with the fully-replayed App and positioned JournalWriter.
+pub type ReceiverResult =
+    Result<Option<(crate::App, crate::JournalWriter)>, Box<dyn std::error::Error>>;
 
 #[allow(clippy::too_many_arguments)]
 pub fn run_receiver(
@@ -722,26 +715,29 @@ pub fn run_receiver(
     cores: crate::server::PipelineCores,
     async_ack: bool,
 ) -> ReceiverResult {
-    use melin_engine::exchange::Exchange;
-    use melin_engine::journal::writer::JournalWriter;
+    use crate::App;
+    use crate::JournalWriter;
 
     // Recover local state from journal (if any). On first call this may
     // be (None, None) for a fresh replica. After a reconnect, the pipeline
-    // shutdown returns the Exchange + JournalWriter directly.
+    // shutdown returns the App + JournalWriter directly.
     let (mut exchange, mut journal_writer, mut last_sequence, mut chain_hash) =
         if journal_path.exists() {
             let engine = if snapshot_path.exists() {
                 info!("recovering replica from snapshot + journal");
-                melin_engine::journal::JournaledExchange::recover_from_snapshot(
+                melin_transport_core::JournaledApp::<App>::recover_from_snapshot(
                     &snapshot_path,
                     journal_path,
                 )?
             } else {
-                melin_engine::journal::JournaledExchange::recover(journal_path)?
+                melin_transport_core::JournaledApp::<App>::recover(
+                    crate::server::empty_app(),
+                    journal_path,
+                )?
             };
             let next = engine.next_sequence();
             let last = next.saturating_sub(1);
-            let hash = engine.writer_chain_hash().unwrap_or([0u8; 32]);
+            let hash = engine.chain_hash().unwrap_or([0u8; 32]);
             let (exchange, writer) = engine.into_parts();
             (Some(exchange), Some(writer), last, hash)
         } else {
@@ -762,7 +758,7 @@ pub fn run_receiver(
     //
     // Each iteration: connect → auth → handshake → pipeline → stream.
     // On disconnect (eviction or crash): shut down pipeline, recover
-    // Exchange + JournalWriter, backoff, reconnect.
+    // App + JournalWriter, backoff, reconnect.
     loop {
         // Check shutdown/promote before attempting to connect.
         if shutdown.load(Ordering::Relaxed) {
@@ -942,7 +938,7 @@ pub fn run_receiver(
                 }
 
                 let (snap_exchange, snap_seq, snap_hash) =
-                    melin_engine::journal::snapshot::load(&snapshot_path)?;
+                    melin_transport_core::snapshot::load::<App>(&snapshot_path)?;
                 if snap_hash != snap_chain_hash {
                     return Err(format!(
                         "snapshot chain hash mismatch: primary sent {snap_chain_hash:02x?}, \
@@ -983,7 +979,7 @@ pub fn run_receiver(
         // --- Create journal for fresh replica (first connection only) ---
 
         if journal_writer.is_none() {
-            use melin_engine::journal::codec::{self as journal_codec, FILE_HEADER_SIZE};
+            use melin_journal::codec::{self as journal_codec, FILE_HEADER_SIZE};
             use std::fs::OpenOptions;
             use std::os::unix::fs::FileExt;
 
@@ -1012,7 +1008,7 @@ pub fn run_receiver(
                 Some(genesis_chain_hash),
                 0, // events_since_checkpoint
             )?;
-            exchange = Some(Exchange::new());
+            exchange = Some(crate::server::empty_app());
             journal_writer = Some(writer);
         }
 
@@ -1021,10 +1017,10 @@ pub fn run_receiver(
 
         // --- Build pipeline and spawn threads ---
 
-        let shadow_exchange = cur_exchange.clone_via_snapshot();
+        let shadow_exchange = <App as melin_app::Application>::clone_via_snapshot(&cur_exchange)?;
 
         let enable_shadow = snapshot_interval_secs > 0;
-        let pipeline = melin_engine::journal::pipeline::build_replica_pipeline(
+        let pipeline = melin_transport_core::pipeline::build_replica_pipeline(
             cur_exchange,
             cur_writer,
             4096,  // max_journal_batch
@@ -1070,7 +1066,7 @@ pub fn run_receiver(
             .spawn(move || {
                 pin_replica_thread("drain", drain_core);
                 let mut consumer = drain_consumer;
-                let mut batch = vec![melin_engine::journal::pipeline::OutputSlot::default(); 256];
+                let mut batch = vec![crate::OutputSlot::default(); 256];
                 loop {
                     if ps.load(Ordering::Relaxed) {
                         return;
@@ -1167,7 +1163,7 @@ pub fn run_receiver(
             SessionExit::Fatal(e) => return Err(e),
 
             SessionExit::Disconnected => {
-                // Recover Exchange + JournalWriter for the next iteration.
+                // Recover App + JournalWriter for the next iteration.
                 match pipeline_state {
                     Some((e, w)) => {
                         last_sequence = w.next_sequence().saturating_sub(1);
@@ -1178,10 +1174,13 @@ pub fn run_receiver(
                     None => {
                         error!("pipeline thread panicked during disconnect recovery");
                         if journal_path.exists() {
-                            match melin_engine::journal::JournaledExchange::recover(journal_path) {
+                            match melin_transport_core::JournaledApp::<App>::recover(
+                                crate::server::empty_app(),
+                                journal_path,
+                            ) {
                                 Ok(engine) => {
                                     last_sequence = engine.next_sequence().saturating_sub(1);
-                                    chain_hash = engine.writer_chain_hash().unwrap_or([0u8; 32]);
+                                    chain_hash = engine.chain_hash().unwrap_or([0u8; 32]);
                                     let (e, w) = engine.into_parts();
                                     exchange = Some(e);
                                     journal_writer = Some(w);

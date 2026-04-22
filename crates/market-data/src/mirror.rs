@@ -8,7 +8,7 @@
 use std::collections::BTreeMap;
 use std::num::NonZeroU64;
 
-use melin_engine::types::{
+use melin_trading::types::{
     ExecutionReport, InstrumentStatus, OrderId, Price, Quantity, Side, Symbol,
 };
 
@@ -312,7 +312,7 @@ impl BookMirror {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use melin_engine::types::{AccountId, OrderId, RejectReason};
+    use melin_trading::types::{AccountId, OrderId, RejectReason};
 
     const SYM: Symbol = Symbol(1);
     const ACCT: AccountId = AccountId(1);

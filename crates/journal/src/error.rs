@@ -2,8 +2,6 @@
 
 use std::fmt;
 
-use crate::types::RejectReason;
-
 /// Format a 32-byte hash as a hex string (first 8 bytes for readability).
 fn hex(hash: &[u8; 32]) -> String {
     hash.iter()
@@ -14,6 +12,13 @@ fn hex(hash: &[u8; 32]) -> String {
 }
 
 /// Errors that can occur during journal operations.
+///
+/// Every variant describes a transport-level failure: I/O, framing,
+/// CRC/chain integrity, or version/format mismatch. App-level rejections
+/// (insufficient balance, risk limits, unknown account) are the app's
+/// concern and propagate through the app's own error type alongside
+/// this one — kept trading-agnostic so the journal crate stays usable
+/// by any application.
 #[derive(Debug)]
 pub enum JournalError {
     /// Underlying I/O error.
@@ -48,11 +53,6 @@ pub enum JournalError {
         expected: [u8; 32],
         actual: [u8; 32],
     },
-    /// The journaled command was durably recorded but the underlying
-    /// exchange operation rejected it (e.g., insufficient balance,
-    /// unknown account). The journal entry is still appended so that
-    /// replay reproduces the same outcome deterministically.
-    Rejected(RejectReason),
 }
 
 impl fmt::Display for JournalError {
@@ -96,7 +96,6 @@ impl fmt::Display for JournalError {
                 hex(expected),
                 hex(actual)
             ),
-            Self::Rejected(reason) => write!(f, "command rejected: {reason:?}"),
         }
     }
 }

@@ -235,6 +235,7 @@ impl Exchange {
     /// Returns true if this is a new request (should be processed).
     /// Returns false if duplicate (caller should reject with DuplicateRequest).
     /// Exempt when key_hash == 0 (internal/seed events with no authenticated key).
+    #[inline]
     pub fn check_request_seq(&mut self, key_hash: u64, request_seq: u64) -> bool {
         if key_hash == 0 {
             return true; // exempt: internal/seed events
@@ -541,6 +542,7 @@ impl Exchange {
     ///
     /// Validates the instrument exists, reserves funds, then executes.
     /// On fill, balances are updated. On reject/cancel, reserves are released.
+    #[inline]
     pub fn execute(&mut self, symbol: Symbol, order: Order, reports: &mut Vec<ExecutionReport>) {
         let Some(inst) = inst_ref(&self.instruments, symbol) else {
             reports.push(ExecutionReport::Rejected {
@@ -1049,6 +1051,7 @@ impl Exchange {
     }
 
     /// Cancel a resting order on the given instrument.
+    #[inline]
     pub fn cancel(
         &mut self,
         symbol: Symbol,

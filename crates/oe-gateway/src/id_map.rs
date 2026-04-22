@@ -6,7 +6,7 @@
 
 use std::collections::HashMap;
 
-use melin_engine::types::OrderId;
+use melin_trading::types::OrderId;
 
 /// Per-session ClOrdID ↔ OrderId map.
 pub struct ClOrdIdMap {

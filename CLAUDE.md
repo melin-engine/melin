@@ -10,6 +10,32 @@
 
 See [README.md](README.md#features) for implemented features and [docs/roadmap.md](docs/roadmap.md) for planned features.
 
+## Crate Layout
+
+The repo splits into a reusable transport and pluggable applications. This split lets the matching engine (the primary revenue-bearing app) share transport code with the noop benchmark app, and keeps the abstraction layer shippable to future applications (bespoke matchers, non-trading workloads).
+
+**Transport core (application-agnostic):**
+- `melin-app` — `Application` / `AppEvent` traits, `ApplyCtx`, `RejectReason`. Small crate, trait definitions only — apps depend on this without pulling transport internals.
+- `melin-journal` — write-ahead log framing, BLAKE3 hash chain, CRC32C, reader/writer. Generic over `AppEvent`.
+- `melin-disruptor` — lock-free ring buffer primitives (multi-producer, multi-consumer, SeqLock).
+- `melin-transport-core` — disruptor wiring, `InputSlot<E>` / `OutputSlot<R, Q>` ring slot types, `Pipeline<A>` / `ReplicaPipeline<A>` builders, `JournaledApp<A>` lifecycle wrapper (create / recover / recover_from_snapshot / rotate), application-generic snapshot framing.
+
+**Applications (plug into the transport):**
+- `melin-trading` — shared trading types (`TradingEvent`, `ExecutionReport`, `QueryResponse`, price/qty primitives). Both `melin-engine` and `melin-noop` depend on this.
+- `melin-engine` — matching engine, order book, accounts, risk, fees, circuit breakers; `Application` impl on `Exchange`.
+- `melin-market-data` — book mirrors for the event publisher (trading-only).
+- `melin-noop` — no-op `Application` impl, same wire types as trading, used to isolate transport throughput from matching cost.
+
+**Server, gateways, tooling:**
+- `melin-server` — binary; composes transport + selected app (`--features trading` vs `--features noop`, mutually exclusive) into a running exchange.
+- `melin-protocol`, `melin-client` — custom binary wire protocol + Rust client.
+- `melin-oe-gateway`, `melin-md-gateway`, `melin-gateway-core` — FIX 4.4 order-entry and market-data gateways.
+- `melin-admin`, `melin-tui`, `melin-tui-fix-client` — operator tooling.
+- `melin-bench` — benchmarking harness.
+- `melin-dpdk` — DPDK kernel-bypass transport, feature-gated.
+
+`cargo build -p melin-server --features noop --no-default-features` drops `melin-engine` and `melin-market-data` from the dep graph entirely. Useful for transport-only benchmarks and as a regression surface proving the `Application` abstraction holds.
+
 ## Conventions
 
 - Follow Rust best practices (idiomatic patterns, clippy clean, formatted with `cargo fmt`).

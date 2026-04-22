@@ -12,7 +12,7 @@ use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
 use tracing::{debug, error, info, warn};
 
-use melin_engine::journal::replication::ReplicationConsumer;
+use melin_journal::replication::ReplicationConsumer;
 
 use super::catchup::{can_catch_up_from_journal, discover_journal_files};
 use super::protocol::{
@@ -564,7 +564,7 @@ fn catch_up_from_journal_dpdk(
     send_buf: &mut Vec<u8>,
     shutdown: &AtomicBool,
 ) -> std::io::Result<()> {
-    use melin_engine::journal::reader::RawJournalScanner;
+    use melin_journal::RawJournalScanner;
 
     let files = discover_journal_files(journal_path);
     if files.is_empty() {
@@ -772,26 +772,29 @@ pub fn run_receiver_dpdk(
     snapshot_interval_secs: u64,
     snapshot_path: std::path::PathBuf,
 ) -> ReceiverResult {
-    use melin_engine::exchange::Exchange;
-    use melin_engine::journal::writer::JournalWriter;
+    use crate::App;
+    use crate::JournalWriter;
 
     // Recover local state from journal (if any). On first call this may
     // be (None, None) for a fresh replica. After a reconnect, the pipeline
-    // shutdown returns the Exchange + JournalWriter directly.
+    // shutdown returns the App + JournalWriter directly.
     let (mut exchange, mut journal_writer, mut last_sequence, mut chain_hash) =
         if journal_path.exists() {
             let engine = if snapshot_path.exists() {
                 info!("recovering replica from snapshot + journal (DPDK)");
-                melin_engine::journal::JournaledExchange::recover_from_snapshot(
+                melin_transport_core::JournaledApp::<App>::recover_from_snapshot(
                     &snapshot_path,
                     journal_path,
                 )?
             } else {
-                melin_engine::journal::JournaledExchange::recover(journal_path)?
+                melin_transport_core::JournaledApp::<App>::recover(
+                    crate::server::empty_app(),
+                    journal_path,
+                )?
             };
             let next = engine.next_sequence();
             let last = next.saturating_sub(1);
-            let hash = engine.writer_chain_hash().unwrap_or([0u8; 32]);
+            let hash = engine.chain_hash().unwrap_or([0u8; 32]);
             let (exchange, writer) = engine.into_parts();
             (Some(exchange), Some(writer), last, hash)
         } else {
@@ -908,7 +911,7 @@ pub fn run_receiver_dpdk(
                             info!("primary requires snapshot transfer — receiving snapshot (DPDK)");
 
                             // Remove stale local state. Invalidate the in-memory
-                            // Exchange and JournalWriter — their underlying files
+                            // App and JournalWriter — their underlying files
                             // are about to be deleted. Without this, a failed
                             // snapshot transfer would leave stale state that
                             // the reconnect loop mistakes for valid.
@@ -982,7 +985,7 @@ pub fn run_receiver_dpdk(
 
         // Create journal for fresh replica using the primary's raw genesis entry.
         if journal_writer.is_none() && !primary_genesis_entry.is_empty() {
-            use melin_engine::journal::codec::{self as journal_codec, FILE_HEADER_SIZE};
+            use melin_journal::codec::{self as journal_codec, FILE_HEADER_SIZE};
             use std::fs::OpenOptions;
             use std::os::unix::fs::FileExt;
 
@@ -1011,7 +1014,7 @@ pub fn run_receiver_dpdk(
                 Some(genesis_chain_hash),
                 0,
             )?;
-            exchange = Some(Exchange::new());
+            exchange = Some(crate::server::empty_app());
             journal_writer = Some(writer);
         }
 
@@ -1024,11 +1027,11 @@ pub fn run_receiver_dpdk(
         let cur_writer = journal_writer.take().expect("journal_writer initialized");
 
         // Clone exchange for shadow stage before moving into pipeline.
-        let shadow_exchange = cur_exchange.clone_via_snapshot();
+        let shadow_exchange = <App as melin_app::Application>::clone_via_snapshot(&cur_exchange)?;
 
         // Build the replica pipeline — same as the TCP receiver.
         let enable_shadow = snapshot_interval_secs > 0;
-        let pipeline = melin_engine::journal::pipeline::build_replica_pipeline(
+        let pipeline = melin_transport_core::pipeline::build_replica_pipeline(
             cur_exchange,
             cur_writer,
             4096,
@@ -1062,7 +1065,7 @@ pub fn run_receiver_dpdk(
             .name("drain".into())
             .spawn(move || {
                 let mut consumer = drain_consumer;
-                let mut batch = vec![melin_engine::journal::pipeline::OutputSlot::default(); 256];
+                let mut batch = vec![crate::OutputSlot::default(); 256];
                 loop {
                     if ps.load(Ordering::Relaxed) {
                         return;
@@ -1315,10 +1318,13 @@ pub fn run_receiver_dpdk(
             None => {
                 error!("pipeline thread panicked during disconnect recovery (DPDK)");
                 if journal_path.exists() {
-                    match melin_engine::journal::JournaledExchange::recover(journal_path) {
+                    match melin_transport_core::JournaledApp::<App>::recover(
+                        crate::server::empty_app(),
+                        journal_path,
+                    ) {
                         Ok(engine) => {
                             last_sequence = engine.next_sequence().saturating_sub(1);
-                            chain_hash = engine.writer_chain_hash().unwrap_or([0u8; 32]);
+                            chain_hash = engine.chain_hash().unwrap_or([0u8; 32]);
                             let (e, w) = engine.into_parts();
                             exchange = Some(e);
                             journal_writer = Some(w);
@@ -1352,17 +1358,14 @@ pub fn run_receiver_dpdk(
 
 /// Receive a snapshot from the primary via DPDK transport.
 /// Expects: SnapshotBegin → SnapshotChunk* → SnapshotEnd.
-/// Returns the loaded Exchange, snapshot sequence, and chain hash.
+/// Returns the loaded App, snapshot sequence, and chain hash.
 fn receive_snapshot_dpdk(
     handle: melin_dpdk::SocketHandle,
     transport: &mut melin_dpdk::DpdkTransport,
     recv_buf: &mut Vec<u8>,
     snapshot_path: &std::path::Path,
     shutdown: &AtomicBool,
-) -> Result<
-    (melin_engine::exchange::Exchange, u64, [u8; 32]),
-    Box<dyn std::error::Error + Send + Sync>,
-> {
+) -> Result<(crate::App, u64, [u8; 32]), Box<dyn std::error::Error + Send + Sync>> {
     // Read SnapshotBegin.
     let (snap_len, snap_sequence, snap_chain_hash) = loop {
         if shutdown.load(Ordering::Relaxed) {
@@ -1485,7 +1488,7 @@ fn receive_snapshot_dpdk(
 
     // Load and verify the snapshot.
     let (snap_exchange, _snap_seq, snap_hash) =
-        melin_engine::journal::snapshot::load(snapshot_path)?;
+        melin_transport_core::snapshot::load::<crate::App>(snapshot_path)?;
     if snap_hash != snap_chain_hash {
         return Err(format!(
             "snapshot chain hash mismatch: primary sent {snap_chain_hash:02x?}, \

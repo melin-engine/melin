@@ -7,20 +7,28 @@ edition = "2024"
 ## Skip all journal I/O (no writes, no fsync). Unsafe for production —
 ## nothing is persisted — but useful for benchmarking to measure pure
 ## pipeline + matching latency without any disk I/O.
-no-persist = []
+no-persist = ["melin-transport-core/no-persist"]
 ## Record per-stage latency histograms and print a summary on shutdown.
 ## Adds ~20ns of clock overhead per event. Not for production.
-latency-trace = ["dep:hdrhistogram"]
+latency-trace = [
+    "dep:hdrhistogram",
+    "melin-journal/latency-trace",
+    "melin-transport-core/latency-trace",
+]
 ## Kept for backward compatibility — io_uring is now always used.
 io-uring = []
 ## Print per-stage busy/idle utilization on shutdown. Identifies the pipeline
 ## bottleneck: the stage closest to 100% busy is the constraint.
-pipeline-stats = []
+pipeline-stats = ["melin-transport-core/pipeline-stats"]
 ## BLAKE3 tamper-evident hash chain. Hashes every journal entry into a
 ## cryptographic chain verified at checkpoints. Catches deliberate tampering
 ## (not just corruption — CRC32C handles that). Adds ~15-30ns per event.
 ## Disable for maximum throughput when audit tamper-evidence is not required.
-hash-chain = ["dep:blake3"]
+hash-chain = [
+    "dep:blake3",
+    "melin-journal/hash-chain",
+    "melin-transport-core/hash-chain",
+]
 
 default = []
 
@@ -33,7 +41,11 @@ hdrhistogram = { version = "7", optional = true }
 io-uring = "0.7"
 libc = { workspace = true }
 tracing = { workspace = true }
+melin-app = { path = "../app" }
 melin-disruptor = { path = "../disruptor" }
+melin-journal = { path = "../journal" }
+melin-trading = { path = "../trading" }
+melin-transport-core = { path = "../transport-core" }
 astenn = { git = "ssh://git@github.com/pierre-l/astenn.git" }
 
 [dev-dependencies]

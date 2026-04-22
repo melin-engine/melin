@@ -11,7 +11,7 @@ use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
 use tracing::{debug, error, info, warn};
 
-use melin_engine::journal::replication::ReplicationConsumer;
+use melin_journal::replication::ReplicationConsumer;
 
 use super::auth::authenticate_replica;
 use super::catchup::{CatchUpResult, can_catch_up_from_journal, catch_up_from_journal};

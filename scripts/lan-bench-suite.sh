@@ -56,6 +56,17 @@
 #   RUSTFLAGS=<flags>   Forwarded to every remote `cargo build` via ssh.
 #                       Useful to enable debug assertions in release
 #                       builds: RUSTFLAGS="-C debug-assertions=y"
+#   NOOP=1              Build `melin-server` with the no-op matching engine
+#                       (--no-default-features --features noop) so the run
+#                       isolates durable-transport cost from matching cost.
+#                       The bench client + wire protocol are unchanged, so
+#                       the server journals every request, NoopApp emits a
+#                       trivial rejection, and the full disruptor +
+#                       replication + shadow pipeline runs just like
+#                       trading. The LOCAL workloads `engine-only` and
+#                       `pipeline-only` are trading-only (they run a real
+#                       Exchange in-process) and are skipped under NOOP=1.
+#                       DPDK transports aren't wired for NOOP yet.
 #
 # Special values:
 #   TRANSPORTS=all      All transports valid for the available infrastructure
@@ -203,12 +214,23 @@ LOCAL_MATRIX=()
 for workload in "${WORKLOAD_LIST[@]}"; do
     workload="$(echo "$workload" | xargs)" # trim whitespace
     if [[ " ${LOCAL_WORKLOADS} " == *" ${workload} "* ]]; then
+        if [[ "${NOOP:-0}" == "1" ]]; then
+            echo "  SKIP local:${workload} — NOOP=1 (runs Exchange in-process; trading-only)"
+            continue
+        fi
         LOCAL_MATRIX+=("$workload")
         continue
     fi
 
     for transport in "${TRANSPORT_LIST[@]}"; do
         transport="$(echo "$transport" | xargs)"
+
+        # NOOP gate: DPDK server binaries aren't built with the noop feature
+        # today, so just skip those combos cleanly.
+        if [[ "${NOOP:-0}" == "1" && "$transport" == dpdk* ]]; then
+            echo "  SKIP ${transport}:${workload} — NOOP=1 has no DPDK variant yet"
+            continue
+        fi
 
         # Check infrastructure.
         case "$transport" in
@@ -265,6 +287,9 @@ fi
 if [[ -n "$REPLICA2_PUB" ]]; then
     echo "  Replica2: ${REPLICA2_PUB} (VLAN: ${REPLICA2_VLAN})"
 fi
+if [[ "${NOOP:-0}" == "1" ]]; then
+    echo "  Server feature: NOOP (noop matching engine, trading wire)"
+fi
 echo "  Results: ${RESULTS_DIR}"
 echo ""
 echo "  Plan:"
@@ -307,9 +332,25 @@ BUILD_HOSTS=("$SERVER" "$BENCH")
 if [[ -n "$REPLICA" ]]; then BUILD_HOSTS+=("$REPLICA"); fi
 if [[ -n "$REPLICA2" ]]; then BUILD_HOSTS+=("$REPLICA2"); fi
 
+# Cargo invocation for the server + bench release binaries. NOOP=1 swaps
+# the server build to the noop flavor (`--no-default-features --features
+# noop`), which drops melin-engine from the server's dep tree. The bench
+# client remains default-featured — it talks the trading wire protocol
+# either way.
+if [[ "${NOOP:-0}" == "1" ]]; then
+    MAIN_BUILD="cargo build --release -p melin-bench && \
+        cargo build --release -p melin-server --no-default-features --features noop"
+else
+    MAIN_BUILD="cargo build --release"
+fi
+
 EXTRA_BUILD=""
 if [[ "$NEED_NOPERSIST" == "1" ]]; then
-    EXTRA_BUILD="&& cargo build --release --features no-persist"
+    if [[ "${NOOP:-0}" == "1" ]]; then
+        EXTRA_BUILD="&& cargo build --release -p melin-server --no-default-features --features noop,no-persist"
+    else
+        EXTRA_BUILD="&& cargo build --release --features no-persist"
+    fi
 fi
 
 CLEAN_CMD=""
@@ -324,7 +365,7 @@ for HOST in "${BUILD_HOSTS[@]}"; do
     (
         ssh $SSH_OPTS "$HOST" "cd ${REPO_DIR} && ${GIT_CMD} && source ~/.cargo/env && \
             export RUSTFLAGS=\"${RUSTFLAGS:-}\" && \
-            ${CLEAN_CMD} cargo build --release ${EXTRA_BUILD}" 2>&1 \
+            ${CLEAN_CMD} ${MAIN_BUILD} ${EXTRA_BUILD}" 2>&1 \
             | tail -3 | sed "s/^/  [${HOST}] /"
     ) &
     build_pids+=($!)
@@ -1019,13 +1060,20 @@ workload_no_persist() {
     echo "============================================================"
     echo ""
 
-    # Swap to no-persist binary.
-    echo "  Swapping in no-persist server binary..."
+    # Swap to no-persist binary. Matches the feature selection of the
+    # initial build so a NOOP=1 run stays noop across the swap.
+    local np_features="no-persist"
+    local np_flags=""
+    if [[ "${NOOP:-0}" == "1" ]]; then
+        np_features="noop,no-persist"
+        np_flags="--no-default-features"
+    fi
+    echo "  Swapping in no-persist server binary (features=${np_features})..."
     ssh $SSH_OPTS "$SERVER" "cd ${REPO_DIR} && \
         cp target/release/melin-server target/release/melin-server.persist && \
         source ~/.cargo/env && \
         export RUSTFLAGS=\"${RUSTFLAGS:-}\" && \
-        cargo build --release --features no-persist 2>&1 | tail -1 && \
+        cargo build --release -p melin-server ${np_flags} --features ${np_features} 2>&1 | tail -1 && \
         cp target/release/melin-server target/release/melin-server.nopersist && \
         cp target/release/melin-server.nopersist target/release/melin-server"
     NOPERSIST_SWAPPED=1

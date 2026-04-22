@@ -3,10 +3,10 @@
 //! Translates internal `MdOutput` types into FIX MarketDataSnapshotFullRefresh (W)
 //! and MarketDataRequestReject (Y) messages.
 
-use melin_engine::types::Price;
 use melin_gateway_core::fix::serialize::FixMessageBuilder;
 use melin_gateway_core::fix::tags;
 use melin_market_data::mirror::Level;
+use melin_trading::types::Price;
 
 /// Build a `MarketDataSnapshotFullRefresh` (35=W) message for a single symbol.
 ///

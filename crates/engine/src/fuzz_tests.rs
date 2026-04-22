@@ -11,7 +11,7 @@ use crate::journal::codec;
 #[test]
 fn fuzz_journal_decode() {
     bolero::check!().for_each(|data: &[u8]| {
-        let _ = codec::decode(data, codec::FORMAT_VERSION);
+        let _ = codec::decode::<crate::trading_event::TradingEvent>(data, codec::FORMAT_VERSION);
     });
 }
 
@@ -74,7 +74,7 @@ fn fuzz_snapshot_decode() {
 // Helpers: construct valid types from raw bytes
 // ---------------------------------------------------------------------------
 
-use crate::journal::event::JournalEvent;
+use crate::journal::JournalEvent;
 use crate::types::*;
 use std::num::NonZeroU64;
 
@@ -116,21 +116,25 @@ fn journal_event_from_bytes(data: &[u8]) -> Option<JournalEvent> {
     match data[0] % 11 {
         0 => {
             // AddInstrument.
-            Some(JournalEvent::AddInstrument {
-                spec: InstrumentSpec {
-                    symbol: Symbol(u32_at(data, 1)?),
-                    base: CurrencyId(u32_at(data, 5)?),
-                    quote: CurrencyId(u32_at(data, 9)?),
+            Some(JournalEvent::App(
+                crate::trading_event::TradingEvent::AddInstrument {
+                    spec: InstrumentSpec {
+                        symbol: Symbol(u32_at(data, 1)?),
+                        base: CurrencyId(u32_at(data, 5)?),
+                        quote: CurrencyId(u32_at(data, 9)?),
+                    },
                 },
-            })
+            ))
         }
         1 => {
             // Deposit.
-            Some(JournalEvent::Deposit {
-                account: AccountId(u32_at(data, 1)?),
-                currency: CurrencyId(u32_at(data, 5)?),
-                amount: u64_at(data, 9)?,
-            })
+            Some(JournalEvent::App(
+                crate::trading_event::TradingEvent::Deposit {
+                    account: AccountId(u32_at(data, 1)?),
+                    currency: CurrencyId(u32_at(data, 5)?),
+                    amount: u64_at(data, 9)?,
+                },
+            ))
         }
         2 => {
             // SubmitOrder.
@@ -174,27 +178,31 @@ fn journal_event_from_bytes(data: &[u8]) -> Option<JournalEvent> {
                     limit_price: Price(nz64(data, 37)?),
                 },
             };
-            Some(JournalEvent::SubmitOrder {
-                symbol,
-                order: Order {
-                    id,
-                    account,
-                    side,
-                    order_type,
-                    time_in_force: tif,
-                    quantity: qty,
-                    stp,
-                    expiry_ns: 0,
+            Some(JournalEvent::App(
+                crate::trading_event::TradingEvent::SubmitOrder {
+                    symbol,
+                    order: Order {
+                        id,
+                        account,
+                        side,
+                        order_type,
+                        time_in_force: tif,
+                        quantity: qty,
+                        stp,
+                        expiry_ns: 0,
+                    },
                 },
-            })
+            ))
         }
         3 => {
             // CancelOrder.
-            Some(JournalEvent::CancelOrder {
-                symbol: Symbol(u32_at(data, 1)?),
-                account: AccountId(u32_at(data, 5)?),
-                order_id: OrderId(u64_at(data, 9)?),
-            })
+            Some(JournalEvent::App(
+                crate::trading_event::TradingEvent::CancelOrder {
+                    symbol: Symbol(u32_at(data, 1)?),
+                    account: AccountId(u32_at(data, 5)?),
+                    order_id: OrderId(u64_at(data, 9)?),
+                },
+            ))
         }
         4 => {
             // SetRiskLimits.
@@ -218,37 +226,47 @@ fn journal_event_from_bytes(data: &[u8]) -> Option<JournalEvent> {
             } else {
                 None
             };
-            Some(JournalEvent::SetRiskLimits {
-                symbol,
-                limits: RiskLimits {
-                    max_order_qty,
-                    max_order_notional,
+            Some(JournalEvent::App(
+                crate::trading_event::TradingEvent::SetRiskLimits {
+                    symbol,
+                    limits: RiskLimits {
+                        max_order_qty,
+                        max_order_notional,
+                    },
                 },
-            })
+            ))
         }
         5 => {
             // CancelAll.
-            Some(JournalEvent::CancelAll {
-                account: AccountId(u32_at(data, 1)?),
-            })
+            Some(JournalEvent::App(
+                crate::trading_event::TradingEvent::CancelAll {
+                    account: AccountId(u32_at(data, 1)?),
+                },
+            ))
         }
         7 => {
             // DisableInstrument.
-            Some(JournalEvent::DisableInstrument {
-                symbol: Symbol(u32_at(data, 1)?),
-            })
+            Some(JournalEvent::App(
+                crate::trading_event::TradingEvent::DisableInstrument {
+                    symbol: Symbol(u32_at(data, 1)?),
+                },
+            ))
         }
         8 => {
             // EnableInstrument.
-            Some(JournalEvent::EnableInstrument {
-                symbol: Symbol(u32_at(data, 1)?),
-            })
+            Some(JournalEvent::App(
+                crate::trading_event::TradingEvent::EnableInstrument {
+                    symbol: Symbol(u32_at(data, 1)?),
+                },
+            ))
         }
         9 => {
             // RemoveInstrument.
-            Some(JournalEvent::RemoveInstrument {
-                symbol: Symbol(u32_at(data, 1)?),
-            })
+            Some(JournalEvent::App(
+                crate::trading_event::TradingEvent::RemoveInstrument {
+                    symbol: Symbol(u32_at(data, 1)?),
+                },
+            ))
         }
         _ => {
             // SetCircuitBreaker.
@@ -276,14 +294,16 @@ fn journal_event_from_bytes(data: &[u8]) -> Option<JournalEvent> {
                 None
             };
             let halted = data.len() > p && data[p] & 1 == 1;
-            Some(JournalEvent::SetCircuitBreaker {
-                symbol,
-                config: CircuitBreakerConfig {
-                    price_band_lower: lower,
-                    price_band_upper: upper,
-                    halted,
+            Some(JournalEvent::App(
+                crate::trading_event::TradingEvent::SetCircuitBreaker {
+                    symbol,
+                    config: CircuitBreakerConfig {
+                        price_band_lower: lower,
+                        price_band_upper: upper,
+                        halted,
+                    },
                 },
-            })
+            ))
         }
     }
 }

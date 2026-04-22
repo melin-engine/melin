@@ -5,7 +5,7 @@
 //! to serve trade history in `MarketDataSnapshotFullRefresh` and
 //! incremental `MDEntryType=Trade` updates.
 
-use melin_engine::types::{OrderId, Price, Quantity};
+use melin_trading::types::{OrderId, Price, Quantity};
 
 /// A single trade.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

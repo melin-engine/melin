@@ -70,7 +70,7 @@ fn fuzz_wire_response_roundtrip() {
 // ---------------------------------------------------------------------------
 
 use crate::message::{Request, ResponseKind};
-use melin_engine::types::*;
+use melin_trading::types::*;
 use std::num::NonZeroU64;
 
 fn nz64(data: &[u8], offset: usize) -> Option<NonZeroU64> {

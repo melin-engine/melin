@@ -318,18 +318,12 @@ pub(super) fn sleep_checking_flags(
 pub(super) fn shutdown_pipeline(
     shutdown_flag: &AtomicBool,
     journal_handle: std::thread::JoinHandle<
-        Result<
-            melin_engine::journal::writer::JournalWriter,
-            melin_engine::journal::error::JournalError,
-        >,
+        Result<crate::JournalWriter, melin_journal::JournalError>,
     >,
-    matching_handle: std::thread::JoinHandle<melin_engine::exchange::Exchange>,
+    matching_handle: std::thread::JoinHandle<crate::App>,
     drain_handle: std::thread::JoinHandle<()>,
     shadow_handle: Option<std::thread::JoinHandle<()>>,
-) -> Option<(
-    melin_engine::exchange::Exchange,
-    melin_engine::journal::writer::JournalWriter,
-)> {
+) -> Option<(crate::App, crate::JournalWriter)> {
     shutdown_flag.store(true, Ordering::Relaxed);
     let writer = match journal_handle.join() {
         Ok(Ok(w)) => w,
@@ -359,18 +353,15 @@ pub(super) fn shutdown_pipeline(
 /// independently encoded journal has diverged from the primary's.
 pub(super) fn submit_batch_to_pipeline(
     journal_bytes: &[u8],
-    producer: &melin_disruptor::ring::MultiProducer<melin_engine::journal::pipeline::InputSlot>,
+    producer: &melin_disruptor::ring::MultiProducer<crate::InputSlot>,
 ) -> Result<u64, Box<dyn std::error::Error>> {
-    use melin_engine::journal::pipeline::InputSlot;
+    use crate::InputSlot;
 
     let mut offset = 0;
     let mut last_published_seq = 0u64;
     while offset < journal_bytes.len() {
         let remaining = &journal_bytes[offset..];
-        match melin_engine::journal::codec::decode(
-            remaining,
-            melin_engine::journal::codec::FORMAT_VERSION,
-        ) {
+        match melin_journal::codec::decode(remaining, melin_journal::codec::FORMAT_VERSION) {
             Ok((consumed, sequence, timestamp_ns, key_hash, request_seq, event)) => {
                 offset += consumed;
                 last_published_seq = producer.publish(InputSlot {

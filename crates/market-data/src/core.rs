@@ -13,9 +13,9 @@ use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use ed25519_dalek::{Signer, SigningKey};
-use melin_engine::types::{ExecutionReport, Symbol};
 use melin_protocol::codec;
 use melin_protocol::message::{Request, ResponseKind};
+use melin_trading::types::{ExecutionReport, Symbol};
 
 use crate::mirror::BookMirror;
 
@@ -193,7 +193,11 @@ fn run_session(
     }
 }
 
-/// Extract the symbol from an ExecutionReport.
+/// Extract the symbol from an `ExecutionReport`.
+///
+/// Returns `Symbol(0)` for the query-response variants (`Stats`,
+/// `Position`) which carry no instrument context — market-data never
+/// sees these over the wire, but the match has to be exhaustive.
 fn report_symbol(report: &ExecutionReport) -> Symbol {
     match *report {
         ExecutionReport::Placed { symbol, .. }

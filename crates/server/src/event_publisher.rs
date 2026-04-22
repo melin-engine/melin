@@ -30,13 +30,13 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use tracing::{debug, error, info, warn};
 
+use crate::{OutputPayload, OutputSlot};
 use melin_disruptor::ring;
-use melin_engine::journal::pipeline::{OutputPayload, OutputSlot};
-use melin_engine::types::{ExecutionReport, Symbol};
 use melin_market_data::mirror::BookMirror;
 use melin_protocol::auth::AuthorizedKeys;
 use melin_protocol::codec;
 use melin_protocol::message::{Request, ResponseKind};
+use melin_trading::types::{ExecutionReport, QueryResponse, Symbol};
 
 /// Maximum number of output slots consumed per batch.
 const MAX_BATCH: usize = 1024;
@@ -73,30 +73,32 @@ fn report_symbol(report: &ExecutionReport) -> Symbol {
     }
 }
 
-/// Convert an `OutputPayload` to the wire `ResponseKind`.
+/// Convert an `OutputPayload` to the wire `ResponseKind`. Translates
+/// query responses (`QueryResponse::Stats` / `::Position`) to the
+/// public `StatsHeader` / `PositionSnapshot` wire variants.
 fn payload_to_response(payload: OutputPayload) -> ResponseKind {
     match payload {
+        OutputPayload::QueryResponse(QueryResponse::Stats {
+            active_connections,
+            events_processed,
+            journal_sequence,
+        }) => ResponseKind::StatsHeader {
+            active_connections,
+            events_processed,
+            journal_sequence,
+        },
+        OutputPayload::QueryResponse(QueryResponse::Position {
+            account,
+            balances,
+            count,
+        }) => ResponseKind::PositionSnapshot {
+            account,
+            balances,
+            count,
+        },
         OutputPayload::Report(report) => ResponseKind::Report(report),
         OutputPayload::BatchEnd => ResponseKind::BatchEnd,
         OutputPayload::EngineError => ResponseKind::EngineError,
-        OutputPayload::StatsHeader {
-            active_connections,
-            events_processed,
-            journal_sequence,
-        } => ResponseKind::StatsHeader {
-            active_connections,
-            events_processed,
-            journal_sequence,
-        },
-        OutputPayload::PositionSnapshot {
-            account,
-            balances,
-            count,
-        } => ResponseKind::PositionSnapshot {
-            account,
-            balances,
-            count,
-        },
     }
 }
 
@@ -356,7 +358,7 @@ fn send_snapshot(
     mirrors: &rustc_hash::FxHashMap<Symbol, BookMirror>,
     last_seq: u64,
 ) -> io::Result<()> {
-    use melin_engine::types::Side;
+    use melin_trading::types::Side;
 
     let mut buf = [0u8; MAX_FRAME_BUF];
 
@@ -548,8 +550,8 @@ fn send_auth_failed(writer: &mut dyn Write) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use melin_engine::journal::pipeline::OutputSlot;
-    use melin_engine::types::*;
+    use crate::OutputSlot;
+    use melin_trading::types::*;
 
     /// Helper to create a Streaming subscriber for tests that bypass
     /// the auth + subscribe handshake.
@@ -616,11 +618,11 @@ mod tests {
         let r = payload_to_response(OutputPayload::EngineError);
         assert!(matches!(r, ResponseKind::EngineError));
 
-        let r = payload_to_response(OutputPayload::StatsHeader {
+        let r = payload_to_response(OutputPayload::QueryResponse(QueryResponse::Stats {
             active_connections: 5,
             events_processed: 1000,
             journal_sequence: 500,
-        });
+        }));
         assert!(matches!(r, ResponseKind::StatsHeader { .. }));
     }
 
@@ -1018,7 +1020,7 @@ mod tests {
                 order_id: OrderId(1),
                 symbol: sym,
                 account: AccountId(1),
-                reason: melin_engine::types::RejectReason::NoLiquidity,
+                reason: melin_trading::types::RejectReason::NoLiquidity,
             }),
             sym
         );

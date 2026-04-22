@@ -461,7 +461,7 @@ impl MdSession {
         for sym_str in &requested_symbols {
             // Look up symbol ID from config.
             let sym_cfg = config.symbols.get(*sym_str);
-            let sym_id = sym_cfg.map(|c| melin_engine::types::Symbol(c.id));
+            let sym_id = sym_cfg.map(|c| melin_trading::types::Symbol(c.id));
             let tick_inverse = sym_cfg.map_or(1, |c| c.tick_inverse);
 
             let (bids, asks) = if let Some(id) = sym_id
@@ -1255,10 +1255,10 @@ mod tests {
 
     #[test]
     fn market_data_request_returns_snapshot() {
-        use melin_engine::types::{
+        use melin_market_data::mirror::BookMirror;
+        use melin_trading::types::{
             AccountId, ExecutionReport, OrderId, Price, Quantity, Side, Symbol,
         };
-        use melin_market_data::mirror::BookMirror;
         use std::num::NonZeroU64;
 
         let config = make_config_with_btcusd();

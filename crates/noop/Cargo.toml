@@ -1,0 +1,18 @@
+[package]
+name = "melin-noop"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+name = "melin_noop"
+path = "src/lib.rs"
+
+[dependencies]
+melin-app = { path = "../app" }
+melin-trading = { path = "../trading" }
+
+[dev-dependencies]
+melin-disruptor = { path = "../disruptor" }
+melin-journal = { path = "../journal" }
+melin-transport-core = { path = "../transport-core" }
+tempfile = "3"

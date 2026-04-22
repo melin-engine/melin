@@ -21,9 +21,11 @@ use tracing::{debug, error};
 use melin_disruptor::padding::Sequence;
 use melin_disruptor::ring;
 
-use melin_engine::journal::pipeline::{OutputPayload, OutputSlot, StageUtilization};
+use crate::{OutputPayload, OutputSlot};
 #[cfg(feature = "latency-trace")]
-use melin_engine::journal::trace;
+use melin_journal::trace;
+use melin_trading::types::QueryResponse;
+use melin_transport_core::pipeline::StageUtilization;
 
 use melin_protocol::codec;
 use melin_protocol::message::ResponseKind;
@@ -47,7 +49,7 @@ const RING_SIZE: u32 = 4096;
 /// 64 KiB holds ~500 response frames — well beyond any reasonable lag.
 const MAX_SEND_BUF: usize = 64 * 1024;
 
-pub use crate::server::ControlEvent;
+pub use crate::ControlEvent;
 
 /// Configuration and shared state for the response stage.
 pub struct Response {
@@ -336,28 +338,31 @@ pub fn run(
             #[cfg(feature = "latency-trace")]
             spsc_hist.record_ns(trace::trace_elapsed_ns(slot.match_complete_ts, consume_ts));
 
+            // Query responses arrive as `OutputPayload::QueryResponse`;
+            // the response stage translates them to the public wire
+            // variants so client-visible framing stays unchanged.
             let kind = match slot.payload {
+                OutputPayload::QueryResponse(QueryResponse::Stats {
+                    active_connections,
+                    events_processed,
+                    journal_sequence,
+                }) => ResponseKind::StatsHeader {
+                    active_connections,
+                    events_processed,
+                    journal_sequence,
+                },
+                OutputPayload::QueryResponse(QueryResponse::Position {
+                    account,
+                    balances,
+                    count,
+                }) => ResponseKind::PositionSnapshot {
+                    account,
+                    balances,
+                    count,
+                },
                 OutputPayload::Report(report) => ResponseKind::Report(report),
                 OutputPayload::BatchEnd => ResponseKind::BatchEnd,
                 OutputPayload::EngineError => ResponseKind::EngineError,
-                OutputPayload::StatsHeader {
-                    active_connections,
-                    events_processed,
-                    journal_sequence,
-                } => ResponseKind::StatsHeader {
-                    active_connections,
-                    events_processed,
-                    journal_sequence,
-                },
-                OutputPayload::PositionSnapshot {
-                    account,
-                    balances,
-                    count,
-                } => ResponseKind::PositionSnapshot {
-                    account,
-                    balances,
-                    count,
-                },
             };
 
             if let Some(entry) = connections.get_mut(&slot.connection_id) {
@@ -701,7 +706,7 @@ mod tests {
     // at the moment the gate opens, and gate_replication otherwise. These
     // tests verify the attribution logic matches the durable_pos formula.
 
-    use melin_engine::journal::pipeline::StageUtilization;
+    use melin_transport_core::pipeline::StageUtilization;
     use std::sync::Arc;
 
     /// Simulate the attribution logic at the moment the gate opens.
