@@ -514,11 +514,6 @@ pub fn run_with_shutdown<L: BlockingTransportListener>(
             }
         }
     }
-    #[cfg(all(feature = "noop", not(feature = "trading")))]
-    if config.replica_of.is_some() {
-        return Err("replica mode is only available in the trading build".into());
-    }
-
     // Load authorized keys for challenge-response authentication.
     let authorized_keys = Arc::new(AuthorizedKeys::load(&config.authorized_keys)?);
     info!(
@@ -528,8 +523,7 @@ pub fn run_with_shutdown<L: BlockingTransportListener>(
     );
 
     // Initialize or recover the app. `needs_seeding` is true on first
-    // startup — seed events will flow through the pipeline later. For
-    // `noop` this is always a fresh start (no state to recover).
+    // startup — seed events will flow through the pipeline later.
     let (mut exchange, writer, needs_seeding) = init_engine(&config)?;
 
     // Pre-fault any application-owned memory (slabs, indices) so page
@@ -695,11 +689,11 @@ fn run_as_primary<L: BlockingTransportListener>(
     };
 
     // Build the disruptor pipeline with optional replication consumer.
-    // Event publisher is trading-only (market-data book mirrors).
-    #[cfg(all(feature = "trading", not(feature = "noop")))]
-    let enable_event_publisher = config.event_bind.is_some();
-    #[cfg(all(feature = "noop", not(feature = "trading")))]
-    let enable_event_publisher = false;
+    // Event publisher is trading-only (market-data book mirrors); the
+    // noop build silently ignores `--event-bind` so the same invocation
+    // works against either binary.
+    let enable_event_publisher =
+        cfg!(all(feature = "trading", not(feature = "noop"))) && config.event_bind.is_some();
     let Pipeline {
         input_producer,
         journal_stage,
@@ -934,39 +928,16 @@ fn run_as_primary<L: BlockingTransportListener>(
     // Spawn event publisher thread if enabled. Consumes from output ring
     // consumer 1 and broadcasts all execution events to TCP subscribers.
     // Trading-only — the publisher depends on `melin-market-data` for
-    // book-mirror snapshots.
-    #[cfg(all(feature = "noop", not(feature = "trading")))]
-    let event_publisher_handle: Option<std::thread::JoinHandle<()>> = {
-        let _ = event_publisher_consumer;
-        None
-    };
-
-    #[cfg(all(feature = "trading", not(feature = "noop")))]
-    let event_publisher_handle = if let Some(event_consumer) = event_publisher_consumer {
-        let event_bind = config
-            .event_bind
-            .ok_or("event_bind must be set when event publisher is enabled")?;
-        let s_event = Arc::clone(&shutdown);
-        let event_keys = Arc::clone(&authorized_keys);
-        let event_handle = std::thread::Builder::new()
-            .name("event-publisher".into())
-            .spawn(move || {
-                apply_affinity("event-publisher", cores.event_publisher);
-                crate::event_publisher::run(
-                    event_consumer,
-                    event_bind,
-                    event_keys,
-                    &s_event,
-                    busy_spin,
-                );
-            })
-            .map_err(|e| format!("spawn event publisher thread: {e}"))?;
-
-        info!(addr = %event_bind, "event publisher started");
-        Some(event_handle)
-    } else {
-        None
-    };
+    // book-mirror snapshots; `spawn_event_publisher` is a no-op under
+    // the noop feature.
+    let event_publisher_handle = spawn_event_publisher(
+        event_publisher_consumer,
+        config,
+        &cores,
+        &authorized_keys,
+        &shutdown,
+        busy_spin,
+    )?;
 
     // Spawn shadow snapshot thread if enabled. Works for any
     // `A: Application` — the noop app just snapshots its trivial counter.
@@ -2187,6 +2158,60 @@ fn init_engine(
 
     let (app, writer) = engine.into_parts();
     Ok((app, writer, needs_seeding))
+}
+
+/// Spawn the event-publisher thread if the consumer was wired. The
+/// publisher is trading-only (it depends on `melin-market-data` for book
+/// mirrors); under the noop build this is a no-op and `consumer` is
+/// always `None`.
+#[cfg(all(feature = "trading", not(feature = "noop")))]
+fn spawn_event_publisher(
+    consumer: Option<melin_disruptor::ring::Consumer<crate::OutputSlot>>,
+    config: &ServerConfig,
+    cores: &PipelineCores,
+    authorized_keys: &Arc<AuthorizedKeys>,
+    shutdown: &Arc<AtomicBool>,
+    busy_spin: bool,
+) -> Result<Option<std::thread::JoinHandle<()>>, Box<dyn std::error::Error>> {
+    let Some(event_consumer) = consumer else {
+        return Ok(None);
+    };
+    let event_bind = config
+        .event_bind
+        .ok_or("event_bind must be set when event publisher is enabled")?;
+    let s_event = Arc::clone(shutdown);
+    let event_keys = Arc::clone(authorized_keys);
+    let event_core = cores.event_publisher;
+    let event_handle = std::thread::Builder::new()
+        .name("event-publisher".into())
+        .spawn(move || {
+            apply_affinity("event-publisher", event_core);
+            crate::event_publisher::run(
+                event_consumer,
+                event_bind,
+                event_keys,
+                &s_event,
+                busy_spin,
+            );
+        })
+        .map_err(|e| format!("spawn event publisher thread: {e}"))?;
+    info!(addr = %event_bind, "event publisher started");
+    Ok(Some(event_handle))
+}
+
+#[cfg(all(feature = "noop", not(feature = "trading")))]
+fn spawn_event_publisher(
+    consumer: Option<melin_disruptor::ring::Consumer<crate::OutputSlot>>,
+    _config: &ServerConfig,
+    _cores: &PipelineCores,
+    _authorized_keys: &Arc<AuthorizedKeys>,
+    _shutdown: &Arc<AtomicBool>,
+    _busy_spin: bool,
+) -> Result<Option<std::thread::JoinHandle<()>>, Box<dyn std::error::Error>> {
+    // Caller suppresses event-publisher wiring via `enable_event_publisher`
+    // under the noop feature, so the consumer is always None.
+    debug_assert!(consumer.is_none());
+    Ok(None)
 }
 
 /// Apply CPU core affinity for a pipeline thread, logging the result.
