@@ -54,7 +54,7 @@ pub(super) fn can_catch_up_from_journal(
     journal_path: &std::path::Path,
     last_sequence: u64,
 ) -> io::Result<bool> {
-    use melin_engine::journal::RawJournalScanner;
+    use melin_journal::RawJournalScanner;
 
     let files = discover_journal_files(journal_path);
     if files.is_empty() || last_sequence == 0 {
@@ -87,7 +87,7 @@ pub(super) fn catch_up_from_journal(
     writer: &mut TcpStream,
     shutdown: &AtomicBool,
 ) -> io::Result<CatchUpResult> {
-    use melin_engine::journal::RawJournalScanner;
+    use melin_journal::RawJournalScanner;
 
     let files = discover_journal_files(journal_path);
     if files.is_empty() {

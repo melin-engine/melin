@@ -29,7 +29,7 @@ use std::time::Duration;
 
 use melin_disruptor::padding::Sequence;
 use melin_disruptor::ring::QueueCursor;
-use melin_engine::journal::pipeline::StageUtilization;
+use melin_transport_core::pipeline::StageUtilization;
 use tracing::{debug, error, info};
 
 /// Input disruptor capacity. Duplicated here to avoid depending on the engine
@@ -47,7 +47,10 @@ pub struct HealthState {
     pub replication_cursor: Arc<AtomicU64>,
     pub pipeline_healthy: Arc<AtomicBool>,
     pub replicas_connected: Option<Arc<AtomicU32>>,
-    /// Per-replica replication metrics. None in standalone mode.
+    /// Per-replica replication metrics. None in standalone mode. Only
+    /// populated when the `trading` feature is enabled — the no-op
+    /// server doesn't ship replication.
+    #[cfg(all(feature = "trading", not(feature = "noop")))]
     pub replication_metrics: Option<Arc<crate::replication::ReplicationMetrics>>,
     /// Per-slot replication-ring producer cursors. Paired index-wise with
     /// `replication_ring_consumer_cursors` to compute per-slot ring depth
@@ -176,6 +179,7 @@ impl HealthSnapshot {
             .as_ref()
             .map_or(0, |c| c.load(Ordering::Relaxed));
 
+        type ReplMetricsTuple = ([u64; 2], [u64; 2], [u64; 2], [u64; 2], [bool; 2], u64);
         let (
             per_replica_acked_sequence,
             per_replica_lag,
@@ -183,39 +187,49 @@ impl HealthSnapshot {
             per_replica_ack_latency_us,
             per_replica_catching_up,
             evictions_total,
-        ) = if let Some(ref rm) = state.replication_metrics {
-            let acked = [
-                rm.acked_sequence[0].load(Ordering::Relaxed),
-                rm.acked_sequence[1].load(Ordering::Relaxed),
-            ];
-            let lag = [
-                if acked[0] == 0 {
-                    0
+        ): ReplMetricsTuple = {
+            #[cfg(all(feature = "trading", not(feature = "noop")))]
+            {
+                if let Some(ref rm) = state.replication_metrics {
+                    let acked = [
+                        rm.acked_sequence[0].load(Ordering::Relaxed),
+                        rm.acked_sequence[1].load(Ordering::Relaxed),
+                    ];
+                    let lag = [
+                        if acked[0] == 0 {
+                            0
+                        } else {
+                            journal_seq.saturating_sub(acked[0])
+                        },
+                        if acked[1] == 0 {
+                            0
+                        } else {
+                            journal_seq.saturating_sub(acked[1])
+                        },
+                    ];
+                    let bytes = [
+                        rm.bytes_sent[0].load(Ordering::Relaxed),
+                        rm.bytes_sent[1].load(Ordering::Relaxed),
+                    ];
+                    let latency = [
+                        rm.ack_latency_us[0].load(Ordering::Relaxed),
+                        rm.ack_latency_us[1].load(Ordering::Relaxed),
+                    ];
+                    let catching = [
+                        rm.catching_up[0].load(Ordering::Relaxed),
+                        rm.catching_up[1].load(Ordering::Relaxed),
+                    ];
+                    let evictions = rm.evictions_total.load(Ordering::Relaxed);
+                    (acked, lag, bytes, latency, catching, evictions)
                 } else {
-                    journal_seq.saturating_sub(acked[0])
-                },
-                if acked[1] == 0 {
-                    0
-                } else {
-                    journal_seq.saturating_sub(acked[1])
-                },
-            ];
-            let bytes = [
-                rm.bytes_sent[0].load(Ordering::Relaxed),
-                rm.bytes_sent[1].load(Ordering::Relaxed),
-            ];
-            let latency = [
-                rm.ack_latency_us[0].load(Ordering::Relaxed),
-                rm.ack_latency_us[1].load(Ordering::Relaxed),
-            ];
-            let catching = [
-                rm.catching_up[0].load(Ordering::Relaxed),
-                rm.catching_up[1].load(Ordering::Relaxed),
-            ];
-            let evictions = rm.evictions_total.load(Ordering::Relaxed);
-            (acked, lag, bytes, latency, catching, evictions)
-        } else {
-            ([0, 0], [0, 0], [0, 0], [0, 0], [false, false], 0)
+                    ([0, 0], [0, 0], [0, 0], [0, 0], [false, false], 0)
+                }
+            }
+            #[cfg(all(feature = "noop", not(feature = "trading")))]
+            {
+                let _ = journal_seq;
+                ([0, 0], [0, 0], [0, 0], [0, 0], [false, false], 0)
+            }
         };
 
         // Per-slot replication ring depth: producer_cursor - consumer.processed.

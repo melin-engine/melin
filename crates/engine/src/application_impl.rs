@@ -115,6 +115,22 @@ impl Application for Exchange {
         Exchange::check_request_seq(self, key_hash, seq)
     }
 
+    /// Route through `Exchange::prefault`, which walks the pre-allocated
+    /// slabs and indices so the first hot-path access after startup
+    /// doesn't soft-fault. Avoids the default snapshot-round-trip
+    /// implementation on a cold allocator.
+    fn prefault(&mut self) {
+        Exchange::prefault(self);
+    }
+
+    /// `Exchange` exposes an in-memory `clone_via_snapshot` that skips
+    /// the byte serialisation — faster than the default
+    /// serialise-then-deserialise path. Keep the optimisation for the
+    /// shadow-snapshot stage.
+    fn clone_via_snapshot(&self) -> std::io::Result<Self> {
+        Ok(Exchange::clone_via_snapshot(self))
+    }
+
     fn build_reject(event: &Self::Event, reason: TransportRejectReason) -> Self::Report {
         let engine_reason = match reason {
             TransportRejectReason::DuplicateRequest => EngineRejectReason::DuplicateRequest,

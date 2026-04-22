@@ -20,9 +20,9 @@ use melin_disruptor::padding::Sequence;
 use melin_disruptor::ring;
 use melin_disruptor::spsc;
 
-use melin_engine::journal::pipeline::StageUtilization;
-use melin_engine::journal::{OutputPayload, OutputSlot};
+use crate::{OutputPayload, OutputSlot};
 use melin_trading::types::ExecutionReport;
+use melin_transport_core::pipeline::StageUtilization;
 
 use melin_protocol::codec;
 use melin_protocol::message::ResponseKind;

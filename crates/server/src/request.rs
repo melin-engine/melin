@@ -4,7 +4,7 @@
 //! Extracting these functions avoids duplicating critical permission
 //! enforcement and request→event conversion across transport impls.
 
-use melin_engine::journal::JournalEvent;
+use crate::JournalEvent;
 use melin_protocol::auth::Permission;
 use melin_protocol::message::Request;
 

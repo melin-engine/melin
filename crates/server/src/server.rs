@@ -2,7 +2,7 @@
 //!
 //! On startup:
 //! 1. Recovers or creates the `JournaledExchange`.
-//! 2. Decomposes it into `(Exchange, JournalWriter)` via `into_parts()`.
+//! 2. Decomposes it into `(App, JournalWriter)` via `into_parts()`.
 //! 3. Builds the disruptor pipeline (input ring + output ring).
 //! 4. Spawns 3-5 OS threads: journal, matching, response, [repl-sender], [event-publisher].
 //! 5. Runs the accept loop, registering connections with the io_uring reader.
@@ -21,12 +21,16 @@ use std::hash::{Hash, Hasher};
 
 use tracing::{debug, error, info, warn};
 
-use melin_engine::exchange::Exchange;
-use melin_engine::journal::JournalError;
-use melin_engine::journal::JournalWriter;
+use crate::App;
+use crate::JournalWriter;
+use melin_journal::JournalError;
+use melin_transport_core::pipeline::{
+    Pipeline as GenericPipeline, build_pipeline_with_replication,
+};
+pub type Pipeline = GenericPipeline<App>;
+
+#[cfg(all(feature = "trading", not(feature = "noop")))]
 use melin_engine::journal::JournaledExchange;
-use melin_engine::journal::Pipeline;
-use melin_engine::journal::pipeline::build_pipeline_with_replication;
 
 use melin_protocol::auth::{AuthorizedKeys, Permission};
 use melin_protocol::blocking::BlockingFrameWriter;
@@ -229,7 +233,7 @@ pub struct ServerConfig {
     pub promote_bind: Option<SocketAddr>,
 
     /// Interval in seconds between automatic shadow snapshots. The shadow
-    /// stage replays journaled events on a cloned Exchange and saves a
+    /// stage replays journaled events on a cloned App and saves a
     /// consistent snapshot at this cadence — no hot-path stall. Set to 0
     /// to disable shadow snapshots entirely.
     #[arg(long, default_value_t = 3000)]
@@ -410,7 +414,7 @@ fn parse_cores(s: &str) -> Result<PipelineCores, String> {
 /// Run the trading server.
 ///
 /// 1. Initializes (or recovers) the `JournaledExchange`, then decomposes
-///    it into `Exchange` and `JournalWriter` for the pipeline.
+///    it into `App` and `JournalWriter` for the pipeline.
 /// 2. Builds the disruptor pipeline (input ring + output ring + stages).
 /// 3. Spawns 3 OS threads: journal, matching, response.
 /// 4. Runs the accept loop, spawning a reader OS thread per connection.
@@ -521,15 +525,15 @@ pub fn run_with_shutdown<L: BlockingTransportListener>(
         "loaded authorized keys"
     );
 
-    // Initialize or recover the exchange. `needs_seeding` is true on
-    // first startup — seed events will flow through the pipeline later.
-    let (engine, needs_seeding) = init_engine(&config)?;
+    // Initialize or recover the app. `needs_seeding` is true on first
+    // startup — seed events will flow through the pipeline later. For
+    // `noop` this is always a fresh start (no state to recover).
+    let (mut exchange, writer, needs_seeding) = init_engine(&config)?;
 
-    // Decompose into parts for the pipeline.
-    let (mut exchange, writer) = engine.into_parts();
-
-    // Pre-fault all HashMap pages so page faults happen now, not on the hot path.
-    exchange.prefault();
+    // Pre-fault any application-owned memory (slabs, indices) so page
+    // faults happen now, not on the hot path. Default trait impl is a
+    // no-op; `Exchange` overrides.
+    <App as melin_app::Application>::prefault(&mut exchange);
 
     run_as_primary(
         exchange,
@@ -548,16 +552,7 @@ pub fn run_with_shutdown<L: BlockingTransportListener>(
 ///
 /// Control event for the response stage. The io_uring response path reads
 /// `fd` for I/O; the `writer` keeps the fd alive via ownership.
-pub enum ControlEvent {
-    Connected {
-        connection_id: u64,
-        fd: std::os::unix::io::RawFd,
-        writer: BlockingFrameWriter<Box<dyn std::io::Write + Send>>,
-    },
-    Disconnected {
-        connection_id: u64,
-    },
-}
+pub use crate::ControlEvent;
 
 /// Joinable handles for every long-lived thread spawned by a primary.
 /// Optional handles are `None` when their feature is disabled (e.g.,
@@ -565,7 +560,7 @@ pub enum ControlEvent {
 /// (e.g., DPDK runs without an event publisher or shadow snapshotter).
 struct PipelineHandles {
     journal: std::thread::JoinHandle<Result<JournalWriter, JournalError>>,
-    matching: std::thread::JoinHandle<Exchange>,
+    matching: std::thread::JoinHandle<App>,
     response: std::thread::JoinHandle<()>,
     replication: Option<std::thread::JoinHandle<()>>,
     event_publisher: Option<std::thread::JoinHandle<()>>,
@@ -640,7 +635,7 @@ fn shutdown_pipeline_stages(
 /// Used by both the normal primary startup path and the promotion path
 /// (replica → primary transition).
 fn run_as_primary<L: BlockingTransportListener>(
-    exchange: Exchange,
+    exchange: App,
     writer: JournalWriter,
     mut listener: L,
     config: &ServerConfig,
@@ -664,7 +659,7 @@ fn run_as_primary<L: BlockingTransportListener>(
     // handshake so it can write a byte-identical genesis, ensuring the
     // BLAKE3 hash chain starts from the exact same encoded bytes.
     let genesis_entry = if enable_replication {
-        use melin_engine::journal::codec::FILE_HEADER_SIZE;
+        use melin_journal::codec::FILE_HEADER_SIZE;
         let file_bytes = std::fs::read(writer.path())?;
         // Genesis entry starts right after the 8-byte file header.
         // Read entry length from bytes [offset+2..offset+4].
@@ -685,10 +680,12 @@ fn run_as_primary<L: BlockingTransportListener>(
 
     // Clone the exchange for the shadow snapshot stage before the pipeline
     // consumes it. Uses snapshot_state() + restore_state() round-trip since
-    // Exchange doesn't implement Clone (internal data structures are complex).
+    // App doesn't implement Clone (internal data structures are complex).
     let enable_shadow = config.snapshot_interval_secs > 0;
     let shadow_exchange = if enable_shadow {
-        Some(exchange.clone_via_snapshot())
+        Some(<App as melin_app::Application>::clone_via_snapshot(
+            &exchange,
+        )?)
     } else {
         None
     };
@@ -772,7 +769,7 @@ fn run_as_primary<L: BlockingTransportListener>(
     // Extract utilization handles before stages are moved into threads.
     let journal_utilization = journal_stage.utilization();
     let matching_utilization = matching_stage.utilization();
-    let response_utilization = Arc::new(melin_engine::journal::pipeline::StageUtilization::new());
+    let response_utilization = Arc::new(melin_transport_core::pipeline::StageUtilization::new());
 
     let s1 = Arc::clone(&shutdown);
     let journal_handle = std::thread::Builder::new()
@@ -955,7 +952,7 @@ fn run_as_primary<L: BlockingTransportListener>(
     };
 
     // Spawn shadow snapshot thread if enabled. The shadow stage replays
-    // journal-fsynced events on a cloned Exchange and saves periodic
+    // journal-fsynced events on a cloned App and saves periodic
     // snapshots — fully off the hot path.
     let shadow_handle = if let Some(shadow_cons) = shadow_consumer {
         let snap_path = config.shadow_snapshot_path();
@@ -1011,10 +1008,10 @@ fn run_as_primary<L: BlockingTransportListener>(
         }
     }
     if let Some(producer) = seed_producer {
-        use melin_engine::journal::InputSlot;
-        use melin_engine::journal::JournalEvent;
-        use melin_engine::journal::trace::trace_ts;
-        use melin_engine::journal::wall_clock_nanos;
+        use crate::InputSlot;
+        use crate::JournalEvent;
+        use melin_journal::trace::trace_ts;
+        use melin_journal::wall_clock_nanos;
         use melin_trading::types::{AccountId, CurrencyId, InstrumentSpec, Symbol};
 
         let seed_start = std::time::Instant::now();
@@ -1540,7 +1537,9 @@ pub fn run_dpdk(
     // exchange into the pipeline (same as the kernel TCP path).
     let enable_shadow = config.snapshot_interval_secs > 0;
     let shadow_exchange = if enable_shadow {
-        Some(exchange.clone_via_snapshot())
+        Some(<App as melin_app::Application>::clone_via_snapshot(
+            &exchange,
+        )?)
     } else {
         None
     };
@@ -1554,7 +1553,7 @@ pub fn run_dpdk(
     }
 
     let genesis_entry = if enable_replication {
-        use melin_engine::journal::codec::FILE_HEADER_SIZE;
+        use melin_journal::codec::FILE_HEADER_SIZE;
         let file_bytes = std::fs::read(writer.path())?;
         let offset = FILE_HEADER_SIZE;
         if file_bytes.len() < offset + 4 {
@@ -1644,7 +1643,7 @@ pub fn run_dpdk(
     // Extract utilization handles before stages are moved into threads.
     let journal_utilization = journal_stage.utilization();
     let matching_utilization = matching_stage.utilization();
-    let response_utilization = Arc::new(melin_engine::journal::pipeline::StageUtilization::new());
+    let response_utilization = Arc::new(melin_transport_core::pipeline::StageUtilization::new());
 
     let s1 = Arc::clone(&shutdown);
     let journal_handle = std::thread::Builder::new()
@@ -1841,10 +1840,10 @@ pub fn run_dpdk(
         }
     }
     if let Some(producer) = seed_producer {
-        use melin_engine::journal::InputSlot;
-        use melin_engine::journal::JournalEvent;
-        use melin_engine::journal::trace::trace_ts;
-        use melin_engine::journal::wall_clock_nanos;
+        use crate::InputSlot;
+        use crate::JournalEvent;
+        use melin_journal::trace::trace_ts;
+        use melin_journal::wall_clock_nanos;
         use melin_trading::types::{AccountId, CurrencyId, InstrumentSpec, Symbol};
 
         // `sequence: 0` — the journal stage allocates sequences in
@@ -2080,12 +2079,18 @@ pub fn run_dpdk(
     )
 }
 
-/// Initialize or recover the JournaledExchange from disk.
-/// Returns (engine, needs_seeding). `needs_seeding` is true on first startup
-/// (fresh journal) — the caller must publish seed events through the pipeline.
+/// Initialize or recover the `JournaledExchange` from disk.
+///
+/// Returns `(app, writer, needs_seeding)`. `needs_seeding` is true on
+/// first startup (fresh journal) — the caller must publish seed events
+/// through the pipeline. Feature-gated because recovery paths are
+/// application-specific: trading goes through `JournaledExchange`
+/// (snapshot + journal replay); the no-op app has no state so it just
+/// opens a fresh journal.
+#[cfg(all(feature = "trading", not(feature = "noop")))]
 fn init_engine(
     config: &ServerConfig,
-) -> Result<(JournaledExchange, bool), Box<dyn std::error::Error>> {
+) -> Result<(App, JournalWriter, bool), Box<dyn std::error::Error>> {
     // Check for a snapshot: either the explicit --snapshot path, or the
     // default derived path (used by auto-rotation when --snapshot is not set).
     let derived_snap = config.journal.with_extension("snapshot");
@@ -2152,7 +2157,27 @@ fn init_engine(
         }
     }
 
-    Ok((engine, needs_seeding))
+    let (app, writer) = engine.into_parts();
+    Ok((app, writer, needs_seeding))
+}
+
+/// No-op variant: there's no state to recover, so we always open a fresh
+/// journal at the configured path. The `needs_seeding` flag is always
+/// true — seed events flow through the pipeline like any other input
+/// and `NoopApp::apply` quietly rejects them.
+#[cfg(all(feature = "noop", not(feature = "trading")))]
+fn init_engine(
+    config: &ServerConfig,
+) -> Result<(App, JournalWriter, bool), Box<dyn std::error::Error>> {
+    if config.journal.exists() {
+        info!(
+            path = %config.journal.display(),
+            "noop server: ignoring existing journal and opening fresh"
+        );
+        std::fs::remove_file(&config.journal)?;
+    }
+    let writer = JournalWriter::create(&config.journal)?;
+    Ok((melin_noop::NoopApp::new(), writer, true))
 }
 
 /// Apply CPU core affinity for a pipeline thread, logging the result.

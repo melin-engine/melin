@@ -1,4 +1,4 @@
-//! Shadow snapshot stage — replays journal events on a cloned Exchange to
+//! Shadow snapshot stage — replays journal events on a cloned App to
 //! produce periodic snapshots without blocking the hot path.
 //!
 //! The shadow consumer is gated on the journal stage (sees only fsynced events),
@@ -12,11 +12,11 @@ use std::time::Duration;
 
 use tracing::{error, info};
 
+use crate::App;
+use crate::InputSlot;
+use crate::JournalEvent;
 use melin_disruptor::ring;
 use melin_disruptor::seqlock::SeqLock;
-use melin_engine::exchange::Exchange;
-use melin_engine::journal::InputSlot;
-use melin_engine::journal::JournalEvent;
 use melin_engine::journal::snapshot;
 use melin_trading::types::ExecutionReport;
 
@@ -40,11 +40,11 @@ fn idle_wait(idle_spins: &mut u32, busy_spin: bool) {
 /// Run the shadow snapshot stage.
 ///
 /// Consumes events from the input ring (gated on journal fsync), replays them
-/// on a cloned Exchange, and saves periodic snapshots with the BLAKE3 chain
+/// on a cloned App, and saves periodic snapshots with the BLAKE3 chain
 /// hash read from the journal stage's SeqLock.
 pub fn run(
     mut consumer: ring::Consumer<InputSlot>,
-    mut exchange: Exchange,
+    mut exchange: App,
     snapshot_path: PathBuf,
     snapshot_interval: Duration,
     chain_hash_lock: Arc<SeqLock<[u8; 32]>>,
@@ -121,7 +121,7 @@ pub fn run(
 
 /// Save a shadow snapshot, logging success or failure.
 fn save_snapshot(
-    exchange: &Exchange,
+    exchange: &App,
     sequence: u64,
     chain_hash_lock: &Arc<SeqLock<[u8; 32]>>,
     path: &std::path::Path,
@@ -154,7 +154,7 @@ fn save_snapshot(
 /// `last_drain_ns` is caller-tracked across the consume loop so the drain
 /// stays monotonic.
 fn dispatch_event(
-    exchange: &mut Exchange,
+    exchange: &mut App,
     event: &JournalEvent,
     timestamp_ns: u64,
     last_drain_ns: &mut u64,
@@ -275,7 +275,7 @@ fn dispatch_event(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use melin_engine::journal::JournalEvent;
+    use crate::JournalEvent;
     use melin_trading::types::*;
     use std::num::NonZeroU64;
     use std::time::Instant;
@@ -295,10 +295,10 @@ mod tests {
     #[test]
     fn dispatch_event_produces_identical_state_to_direct_calls() {
         // Process the same events two ways: dispatch_event (shadow path)
-        // and direct Exchange method calls (matching path). Exercises
+        // and direct App method calls (matching path). Exercises
         // every JournalEvent variant that mutates exchange state.
-        let mut shadow = Exchange::new();
-        let mut primary = Exchange::new();
+        let mut shadow = App::new();
+        let mut primary = App::new();
         let mut reports = Vec::new();
 
         let events = vec![
@@ -668,7 +668,7 @@ mod tests {
             .build();
         let consumer = consumers.pop().unwrap();
 
-        let exchange = Exchange::new();
+        let exchange = App::new();
         let chain_hash = Arc::new(SeqLock::new([0u8; 32]));
         let shutdown = Arc::new(AtomicBool::new(false));
         let shutdown2 = Arc::clone(&shutdown);
@@ -707,7 +707,7 @@ mod tests {
                 .build();
         let consumer = consumers.pop().unwrap();
 
-        let mut exchange = Exchange::new();
+        let mut exchange = App::new();
         exchange.add_instrument(InstrumentSpec {
             symbol: Symbol(1),
             base: CurrencyId(0),

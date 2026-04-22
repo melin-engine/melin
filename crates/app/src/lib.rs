@@ -199,4 +199,25 @@ pub trait Application: Sized {
     /// changes. The transport stores this alongside its own framing
     /// version so operators can detect incompatible upgrades.
     const APP_VERSION: u16;
+
+    /// Pre-fault any application memory that would otherwise soft-fault
+    /// on the first hot-path access. Called once on startup before the
+    /// matching stage takes the input ring. Default: no-op — apps that
+    /// pre-allocate large indices / slab backing stores (`Exchange`
+    /// does) should override to touch every page.
+    fn prefault(&mut self) {}
+
+    /// Return a byte-identical clone of the application by round-trip
+    /// through [`snapshot`](Application::snapshot) +
+    /// [`restore`](Application::restore). Used by the shadow-snapshot
+    /// stage when an application is not `Clone`. The default
+    /// implementation is correct for any app with a working snapshot
+    /// codec; override only if a cheaper same-process clone is
+    /// possible.
+    fn clone_via_snapshot(&self) -> io::Result<Self> {
+        let mut buf = Vec::new();
+        self.snapshot(&mut buf)?;
+        let mut cursor = std::io::Cursor::new(buf);
+        Self::restore(&mut cursor)
+    }
 }

@@ -38,13 +38,13 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
+use crate::InputSlot;
+use crate::JournalEvent;
 use ed25519_dalek::{Verifier, VerifyingKey};
 use melin_disruptor::ring;
 use melin_dpdk::transport::DpdkTransport;
-use melin_engine::journal::InputSlot;
-use melin_engine::journal::JournalEvent;
-use melin_engine::journal::trace::trace_ts;
-use melin_engine::journal::wall_clock_nanos;
+use melin_journal::trace::trace_ts;
+use melin_journal::wall_clock_nanos;
 use melin_protocol::auth::{AuthorizedKeys, Permission};
 use melin_protocol::codec;
 use melin_protocol::message::{ConnectionId, Request, ResponseKind};
@@ -736,7 +736,7 @@ mod tests {
     use super::*;
     use std::num::NonZeroU64;
 
-    use melin_engine::journal::JournalEvent;
+    use crate::JournalEvent;
     use melin_trading::types::*;
 
     // --- try_extract_frame tests ---
