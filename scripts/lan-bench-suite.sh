@@ -12,7 +12,6 @@
 #
 #   Workloads (what the bench runs):
 #     throughput      Peak throughput — 100M pairs, 16 clients, window 256
-#     no-persist      Peak throughput without journal fsync (tcp only)
 #     single          Single-order latency — 500K pairs, 1 client, window 1
 #     engine-only     Matching engine only — no journal, no network (local)
 #     pipeline-only   Journal + matching — no network (local)
@@ -58,6 +57,12 @@
 #   RUSTFLAGS=<flags>   Forwarded to every remote `cargo build` via ssh.
 #                       Useful to enable debug assertions in release
 #                       builds: RUSTFLAGS="-C debug-assertions=y"
+#   NO_PERSIST=1        Build server + bench with the `no-persist` feature
+#                       so journal I/O is skipped (unsafe for production;
+#                       measures the transport floor without fsync cost).
+#                       Composes with any transport × workload combination;
+#                       result filenames get a `-no-persist` suffix so runs
+#                       can coexist with durable-mode results.
 #   NOOP=1              Build `melin-server` with the no-op matching engine
 #                       (--no-default-features --features noop) so the run
 #                       isolates durable-transport cost from matching cost.
@@ -156,19 +161,11 @@ mkdir -p "${RESULTS_DIR}"
 
 # Track whether DPDK was used (need reboot at end).
 DPDK_RAN=0
-# Track no-persist binary swap for cleanup.
-NOPERSIST_SWAPPED=0
 
 # ---------------------------------------------------------------------------
-# Cleanup trap — kill servers and restore binary on exit/interrupt
+# Cleanup trap — kill servers on exit/interrupt
 # ---------------------------------------------------------------------------
 cleanup() {
-    if [[ "${NOPERSIST_SWAPPED}" == "1" ]]; then
-        echo "  Restoring durable server binary..."
-        ssh $SSH_OPTS "$SERVER" "cd ${REPO_DIR} && \
-            cp target/release/melin-server.persist target/release/melin-server 2>/dev/null || true && \
-            rm -f target/release/melin-server.persist target/release/melin-server.nopersist" 2>/dev/null || true
-    fi
     for host in "$SERVER" ${REPLICA:+"$REPLICA"} ${REPLICA2:+"$REPLICA2"}; do
         ssh $SSH_OPTS "$host" "pkill -INT -x melin-server 2>/dev/null; true" 2>/dev/null || true
     done
@@ -186,13 +183,13 @@ trap cleanup EXIT
 
 # Valid combos. Each transport lists its supported workloads.
 # "local" workloads (engine-only, pipeline-only) run independently of transport.
-VALID_TCP="throughput no-persist single sweep-window sweep-clients sweep-instruments sweep-accounts"
+VALID_TCP="throughput single sweep-window sweep-clients sweep-instruments sweep-accounts"
 VALID_TCP_REPL="throughput single"
 VALID_TCP_DUAL_REPL="throughput single"
 VALID_DPDK="throughput single"
 VALID_DPDK_REPL="throughput"
 LOCAL_WORKLOADS="engine-only pipeline-only"
-ALL_WORKLOADS="throughput no-persist single engine-only pipeline-only sweep-window sweep-clients sweep-instruments sweep-accounts"
+ALL_WORKLOADS="throughput single engine-only pipeline-only sweep-window sweep-clients sweep-instruments sweep-accounts"
 
 # Defaults.
 TRANSPORTS="${TRANSPORTS:-tcp-dual-repl}"
@@ -297,6 +294,9 @@ fi
 if [[ "${NOOP:-0}" == "1" ]]; then
     echo "  Server feature: NOOP (noop matching engine, trading wire)"
 fi
+if [[ "${NO_PERSIST:-0}" == "1" ]]; then
+    echo "  Server feature: NO_PERSIST (journal I/O skipped — results tagged -no-persist)"
+fi
 echo "  Results: ${RESULTS_DIR}"
 echo ""
 echo "  Plan:"
@@ -327,10 +327,8 @@ elif [[ -n "${BENCH_COMMIT:-}" ]]; then
 fi
 
 # Determine what to build.
-NEED_NOPERSIST=0
 NEED_DPDK=0
 for item in "${MATRIX[@]}"; do
-    case "${item#*:}" in no-persist) NEED_NOPERSIST=1 ;; esac
     case "${item%%:*}" in dpdk|dpdk-repl) NEED_DPDK=1 ;; esac
 done
 
@@ -339,24 +337,27 @@ BUILD_HOSTS=("$SERVER" "$BENCH")
 if [[ -n "$REPLICA" ]]; then BUILD_HOSTS+=("$REPLICA"); fi
 if [[ -n "$REPLICA2" ]]; then BUILD_HOSTS+=("$REPLICA2"); fi
 
-# Cargo invocation for the server + bench release binaries. NOOP=1 swaps
-# the server build to the noop flavor (`--no-default-features --features
-# noop`), which drops melin-engine from the server's dep tree. The bench
-# client remains default-featured — it talks the trading wire protocol
-# either way.
+# Cargo invocation for the server + bench release binaries. Feature
+# selection composes NOOP (server only, swaps to the noop matching
+# engine) and NO_PERSIST (skips journal I/O on every crate that exposes
+# the feature — unsafe for production but useful for benchmarking).
+# The bench client remains default-featured — it talks the trading wire
+# protocol regardless of the server flavor.
+# Internal feature-list variable for the noop build; deliberately
+# distinct from the user-facing `SERVER_FEATURES` env var below (the
+# latter drives a separate diagnostic-rebuild step).
 if [[ "${NOOP:-0}" == "1" ]]; then
+    NOOP_MAIN_FEATURES="noop"
+    if [[ "${NO_PERSIST:-0}" == "1" ]]; then
+        NOOP_MAIN_FEATURES="noop,no-persist"
+    fi
     MAIN_BUILD="cargo build --release -p melin-bench && \
-        cargo build --release -p melin-server --no-default-features --features noop"
+        cargo build --release -p melin-server --no-default-features --features ${NOOP_MAIN_FEATURES}"
 else
-    MAIN_BUILD="cargo build --release"
-fi
-
-EXTRA_BUILD=""
-if [[ "$NEED_NOPERSIST" == "1" ]]; then
-    if [[ "${NOOP:-0}" == "1" ]]; then
-        EXTRA_BUILD="&& cargo build --release -p melin-server --no-default-features --features noop,no-persist"
+    if [[ "${NO_PERSIST:-0}" == "1" ]]; then
+        MAIN_BUILD="cargo build --release --features no-persist"
     else
-        EXTRA_BUILD="&& cargo build --release --features no-persist"
+        MAIN_BUILD="cargo build --release"
     fi
 fi
 
@@ -372,7 +373,7 @@ for HOST in "${BUILD_HOSTS[@]}"; do
     (
         ssh $SSH_OPTS "$HOST" "cd ${REPO_DIR} && ${GIT_CMD} && source ~/.cargo/env && \
             export RUSTFLAGS=\"${RUSTFLAGS:-}\" && \
-            ${CLEAN_CMD} ${MAIN_BUILD} ${EXTRA_BUILD}" 2>&1 \
+            ${CLEAN_CMD} ${MAIN_BUILD}" 2>&1 \
             | tail -3 | sed "s/^/  [${HOST}] /"
     ) &
     build_pids+=($!)
@@ -597,6 +598,11 @@ run_bench() {
 
 collect_result() {
     local name="$1"
+    # Tag NO_PERSIST runs so persist and no-persist JSONs can coexist
+    # in the same directory and appear side-by-side in the CDF plot.
+    if [[ "${NO_PERSIST:-0}" == "1" ]]; then
+        name="${name}-no-persist"
+    fi
     scp $SSH_OPTS -q "${SSH_USER}@${BENCH_PUB}:/tmp/bench-results.json" "${RESULTS_DIR}/${name}.json" 2>/dev/null || true
 }
 
@@ -1058,50 +1064,6 @@ workload_throughput() {
     collect_result "${transport}-throughput"
 }
 
-workload_no_persist() {
-    local transport="$1"
-    echo ""
-    echo "============================================================"
-    echo "  [${transport}] Peak throughput — no persistence"
-    echo "  ${THROUGHPUT_ORDERS} pairs, ${THROUGHPUT_CLIENTS} clients, window ${THROUGHPUT_WINDOW}"
-    echo "============================================================"
-    echo ""
-
-    # Swap to no-persist binary. Matches the feature selection of the
-    # initial build so a NOOP=1 run stays noop across the swap.
-    local np_features="no-persist"
-    local np_flags=""
-    if [[ "${NOOP:-0}" == "1" ]]; then
-        np_features="noop,no-persist"
-        np_flags="--no-default-features"
-    fi
-    echo "  Swapping in no-persist server binary (features=${np_features})..."
-    ssh $SSH_OPTS "$SERVER" "cd ${REPO_DIR} && \
-        cp target/release/melin-server target/release/melin-server.persist && \
-        source ~/.cargo/env && \
-        export RUSTFLAGS=\"${RUSTFLAGS:-}\" && \
-        cargo build --release -p melin-server ${np_flags} --features ${np_features} 2>&1 | tail -1 && \
-        cp target/release/melin-server target/release/melin-server.nopersist && \
-        cp target/release/melin-server.nopersist target/release/melin-server"
-    NOPERSIST_SWAPPED=1
-
-    # Need to restart with the swapped binary. Stop current, restart.
-    transport_stop_tcp
-    transport_start_tcp
-
-    run_bench "$CURRENT_BIND" "$CURRENT_HEALTH" "${THROUGHPUT_ORDERS}" --clients 16 --window 256
-    collect_result "${transport}-no-persist"
-
-    # Restore.
-    echo "  Restoring durable server binary..."
-    transport_stop_tcp
-    ssh $SSH_OPTS "$SERVER" "cd ${REPO_DIR} && \
-        cp target/release/melin-server.persist target/release/melin-server 2>/dev/null || true && \
-        rm -f target/release/melin-server.persist target/release/melin-server.nopersist"
-    NOPERSIST_SWAPPED=0
-    transport_start_tcp
-}
-
 workload_single() {
     local transport="$1"
     echo ""
@@ -1296,8 +1258,6 @@ for transport in "${ORDERED_TRANSPORTS[@]}"; do
     for w in "${TRANSPORT_WORKLOADS[@]}"; do
         case "$w" in
             sweep-*) SWEEP_WORKLOADS+=("$w") ;;
-            # no-persist handles its own restart cycle.
-            no-persist) SWEEP_WORKLOADS+=("$w") ;;
             *) REGULAR_WORKLOADS+=("$w") ;;
         esac
     done
@@ -1316,7 +1276,7 @@ for transport in "${ORDERED_TRANSPORTS[@]}"; do
         "$stop_fn"
     fi
 
-    # Run sweep and no-persist workloads (each manages its own server lifecycle).
+    # Run sweep workloads (each manages its own server lifecycle).
     for workload in "${SWEEP_WORKLOADS[@]}"; do
         fn="workload_${workload//-/_}"
         "$fn" "$transport"
@@ -1366,9 +1326,10 @@ if [[ "$RUN_PLOTS" == "1" ]]; then
         (cd "$LOCAL_REPO" && cargo build --release -p melin-bench --features plot --bin melin-plot 2>&1 | tail -1)
         PLOT_TOOL="${LOCAL_REPO}/target/release/melin-plot"
 
-        # Latency CDF — all throughput and no-persist results.
+        # Latency CDF — throughput-style results (both durable and
+        # `-no-persist` variants so the two can be overlaid).
         CDF_FILES=()
-        for f in "${RESULTS_DIR}"/*-throughput.json "${RESULTS_DIR}"/*-no-persist.json; do
+        for f in "${RESULTS_DIR}"/*-throughput.json "${RESULTS_DIR}"/*-throughput-no-persist.json; do
             [[ -f "$f" ]] && CDF_FILES+=("$f")
         done
         if [[ ${#CDF_FILES[@]} -gt 0 ]]; then
