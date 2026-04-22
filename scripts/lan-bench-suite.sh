@@ -1347,8 +1347,14 @@ if [[ "$RUN_PLOTS" == "1" ]]; then
 
     if command -v cargo &>/dev/null && [[ -f "${SCRIPT_DIR}/../crates/bench/src/plot.rs" ]]; then
         LOCAL_REPO="$(cd "${SCRIPT_DIR}/.." && pwd)"
-        PLOT_DIR="${LOCAL_REPO}/docs/plots"
-        mkdir -p "${PLOT_DIR}"
+        # Plots land alongside the run's JSON files first so each results
+        # directory is self-contained — two runs kept in /tmp can be
+        # compared visually without the in-tree copies overwriting each
+        # other. After generation we mirror to the repo's docs/plots/
+        # so the in-tree copy reflects the latest run (for README / PR use).
+        RUN_PLOT_DIR="${RESULTS_DIR}/plots"
+        REPO_PLOT_DIR="${LOCAL_REPO}/docs/plots"
+        mkdir -p "${RUN_PLOT_DIR}" "${REPO_PLOT_DIR}"
 
         echo "  Building plot tool..."
         (cd "$LOCAL_REPO" && cargo build --release -p melin-bench --features plot --bin melin-plot 2>&1 | tail -1)
@@ -1361,7 +1367,7 @@ if [[ "$RUN_PLOTS" == "1" ]]; then
         done
         if [[ ${#CDF_FILES[@]} -gt 0 ]]; then
             echo "  Generating latency CDF..."
-            "${PLOT_TOOL}" latency-cdf -o "${PLOT_DIR}/latency-cdf.svg" "${CDF_FILES[@]}" 2>&1
+            "${PLOT_TOOL}" latency-cdf -o "${RUN_PLOT_DIR}/latency-cdf.svg" "${CDF_FILES[@]}" 2>&1
         fi
 
         # Sweep plots.
@@ -1369,7 +1375,7 @@ if [[ "$RUN_PLOTS" == "1" ]]; then
             dir="${RESULTS_DIR}/sweep-${sweep}"
             if [[ -d "$dir" ]] && ls "${dir}"/*.json &>/dev/null; then
                 echo "  Generating sweep plot: ${sweep}..."
-                "${PLOT_TOOL}" sweep -o "${PLOT_DIR}/saturation-${sweep}.svg" "${dir}"/*.json 2>&1
+                "${PLOT_TOOL}" sweep -o "${RUN_PLOT_DIR}/saturation-${sweep}.svg" "${dir}"/*.json 2>&1
             fi
         done
 
@@ -1378,13 +1384,24 @@ if [[ "$RUN_PLOTS" == "1" ]]; then
             [[ -f "$f" ]] || continue
             label="$(basename "$f" .json)"
             echo "  Generating stability: ${label}..."
-            "${PLOT_TOOL}" stability -o "${PLOT_DIR}/latency-stability-${label}.svg" "$f" 2>&1 || true
+            "${PLOT_TOOL}" stability -o "${RUN_PLOT_DIR}/latency-stability-${label}.svg" "$f" 2>&1 || true
             echo "  Generating health: ${label}..."
-            "${PLOT_TOOL}" health -o "${PLOT_DIR}/health-${label}" "$f" 2>&1 || true
+            "${PLOT_TOOL}" health -o "${RUN_PLOT_DIR}/health-${label}" "$f" 2>&1 || true
         done
 
+        # Mirror the per-run plots into the repo's docs/plots/. Existing
+        # files in the repo copy are overwritten but not pruned — matching
+        # prior behavior of writing there directly.
+        shopt -s nullglob
+        mirror_files=("${RUN_PLOT_DIR}"/*)
+        shopt -u nullglob
+        if [[ ${#mirror_files[@]} -gt 0 ]]; then
+            cp "${mirror_files[@]}" "${REPO_PLOT_DIR}/"
+        fi
+
         echo ""
-        echo "  Plots written to docs/plots/"
+        echo "  Plots written to ${RUN_PLOT_DIR}/"
+        echo "  Mirrored to ${REPO_PLOT_DIR}/"
     fi
 fi
 
