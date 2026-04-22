@@ -109,6 +109,8 @@ pub fn run(
                 &mut exchange,
                 &slot.event,
                 slot.timestamp_ns,
+                slot.key_hash,
+                slot.request_seq,
                 &mut last_drain_ns,
                 &mut reports,
             );
@@ -151,19 +153,35 @@ fn save_snapshot(
 
 /// Dispatch a single journal event to the shadow app.
 ///
-/// Same event handling as the matching stage's `process_event`, including
-/// the per-event scheduler drain — without that the shadow's snapshot would
-/// hold scheduled-task state that's stale relative to the live engine.
-/// `last_drain_ns` is caller-tracked across the consume loop so the drain
-/// stays monotonic.
+/// Mirrors `JournaledApp::replay_entry`: rebuild per-key HWM via
+/// `check_request_seq`, drain the scheduler clock if `timestamp_ns`
+/// advanced, then hand the event to `apply` or `tick`. Without the
+/// `check_request_seq` call, the shadow snapshot's `key_hwm` would be
+/// empty and a restore would let previously-rejected duplicate
+/// `request_seq` values through. `last_drain_ns` is caller-tracked
+/// across the consume loop so the drain stays monotonic.
 fn dispatch_event(
     app: &mut App,
     event: &JournalEvent,
     timestamp_ns: u64,
+    key_hash: u64,
+    request_seq: u64,
     last_drain_ns: &mut u64,
     reports: &mut Vec<Report>,
 ) {
     reports.clear();
+
+    // Gate on `!is_query` to match the matching stage (`pipeline.rs`
+    // `check_request_seq` call site). The shadow reads from the pre-journal
+    // input ring — unlike `JournaledApp::replay_entry`, which sees only
+    // non-queries because the journal stage drops queries — so advancing
+    // HWM on queries here would push shadow's `key_hwm` above primary's and
+    // cause post-restore to reject legitimate non-duplicate requests.
+    // Return discarded: shadow applies the event regardless of the dedup
+    // decision (matches `replay_entry` for non-queries).
+    if !event.is_query() {
+        let _ = app.check_request_seq(key_hash, request_seq);
+    }
 
     if timestamp_ns > *last_drain_ns {
         *last_drain_ns = timestamp_ns;
@@ -458,15 +476,36 @@ mod tests {
 
         // Shadow path: dispatch_event. Pass timestamp 0 throughout — this
         // test isn't exercising the per-event scheduler drain, so the
-        // timestamp/last_drain_ns plumbing stays inert.
+        // timestamp/last_drain_ns plumbing stays inert. Use non-zero
+        // key_hash / increasing request_seq so HWM state gets populated;
+        // this is what would diverge if dispatch_event skipped
+        // check_request_seq.
+        const KEY_HASH: u64 = 0xDEAD_BEEF;
         let mut last_drain_ns: u64 = 0;
-        for event in &events {
-            dispatch_event(&mut shadow, event, 0, &mut last_drain_ns, &mut reports);
+        for (i, event) in events.iter().enumerate() {
+            let request_seq = (i as u64) + 1;
+            dispatch_event(
+                &mut shadow,
+                event,
+                0,
+                KEY_HASH,
+                request_seq,
+                &mut last_drain_ns,
+                &mut reports,
+            );
         }
 
         // Primary path: direct method calls (mirrors dispatch_event logic).
+        // Apply check_request_seq in lockstep with the shadow — skipping
+        // queries, matching the matching stage's `!is_query` gate — so HWM
+        // state matches; the final snapshot-byte comparison catches
+        // divergence.
         let mut primary_reports = Vec::new();
-        for event in &events {
+        for (i, event) in events.iter().enumerate() {
+            let request_seq = (i as u64) + 1;
+            if !event.is_query() {
+                assert!(primary.check_request_seq(KEY_HASH, request_seq));
+            }
             primary_reports.clear();
             match *event {
                 JournalEvent::App(melin_trading::trading_event::TradingEvent::AddInstrument {
@@ -592,6 +631,42 @@ mod tests {
         let shadow_bytes = std::fs::read(&shadow_path).unwrap();
         let primary_bytes = std::fs::read(&primary_path).unwrap();
         assert_eq!(shadow_bytes, primary_bytes, "snapshot state diverged");
+    }
+
+    #[test]
+    fn query_does_not_advance_shadow_hwm() {
+        // The shadow reads from the pre-journal input ring, so it sees
+        // queries. The matching stage skips `check_request_seq` for
+        // queries (pipeline.rs `!is_query` gate), so the shadow must
+        // skip too — otherwise shadow's `key_hwm` would overshoot
+        // primary's and a restore would reject legitimate requests
+        // whose seq falls between primary's HWM and shadow's HWM.
+        //
+        // Regression test: dispatch a query with a high seq, then
+        // verify the app still accepts a same-seq non-query — which
+        // it would not if the query had advanced the HWM.
+        let mut shadow = App::new();
+        let mut reports = Vec::new();
+        let mut last_drain_ns: u64 = 0;
+        const KEY_HASH: u64 = 0xFEED_FACE;
+
+        let query = JournalEvent::App(melin_trading::trading_event::TradingEvent::QueryStats);
+        dispatch_event(
+            &mut shadow,
+            &query,
+            0,
+            KEY_HASH,
+            100,
+            &mut last_drain_ns,
+            &mut reports,
+        );
+
+        // A non-query request with the same seq must still be accepted —
+        // proves the query didn't advance HWM above 100.
+        assert!(
+            shadow.check_request_seq(KEY_HASH, 100),
+            "query at seq=100 must not advance HWM; seq=100 should still pass"
+        );
     }
 
     #[test]
