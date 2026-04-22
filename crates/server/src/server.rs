@@ -1516,8 +1516,7 @@ pub fn run_dpdk(
     );
 
     // Initialize or recover the exchange.
-    let (engine, needs_seeding) = init_engine(&config)?;
-    let (mut exchange, writer) = engine.into_parts();
+    let (mut exchange, writer, needs_seeding) = init_engine(&config)?;
     exchange.prefault();
 
     // Clone exchange state for the shadow snapshot stage before moving
