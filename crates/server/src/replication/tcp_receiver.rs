@@ -725,16 +725,19 @@ pub fn run_receiver(
         if journal_path.exists() {
             let engine = if snapshot_path.exists() {
                 info!("recovering replica from snapshot + journal");
-                melin_engine::journal::JournaledExchange::recover_from_snapshot(
+                melin_transport_core::JournaledApp::<App>::recover_from_snapshot(
                     &snapshot_path,
                     journal_path,
                 )?
             } else {
-                melin_engine::journal::JournaledExchange::recover(journal_path)?
+                melin_transport_core::JournaledApp::<App>::recover(
+                    crate::server::empty_app(),
+                    journal_path,
+                )?
             };
             let next = engine.next_sequence();
             let last = next.saturating_sub(1);
-            let hash = engine.writer_chain_hash().unwrap_or([0u8; 32]);
+            let hash = engine.chain_hash().unwrap_or([0u8; 32]);
             let (exchange, writer) = engine.into_parts();
             (Some(exchange), Some(writer), last, hash)
         } else {
@@ -935,7 +938,7 @@ pub fn run_receiver(
                 }
 
                 let (snap_exchange, snap_seq, snap_hash) =
-                    melin_engine::journal::snapshot::load(&snapshot_path)?;
+                    melin_transport_core::snapshot::load::<App>(&snapshot_path)?;
                 if snap_hash != snap_chain_hash {
                     return Err(format!(
                         "snapshot chain hash mismatch: primary sent {snap_chain_hash:02x?}, \
@@ -1005,7 +1008,7 @@ pub fn run_receiver(
                 Some(genesis_chain_hash),
                 0, // events_since_checkpoint
             )?;
-            exchange = Some(App::new());
+            exchange = Some(crate::server::empty_app());
             journal_writer = Some(writer);
         }
 
@@ -1014,7 +1017,7 @@ pub fn run_receiver(
 
         // --- Build pipeline and spawn threads ---
 
-        let shadow_exchange = cur_exchange.clone_via_snapshot();
+        let shadow_exchange = <App as melin_app::Application>::clone_via_snapshot(&cur_exchange)?;
 
         let enable_shadow = snapshot_interval_secs > 0;
         let pipeline = melin_transport_core::pipeline::build_replica_pipeline(
@@ -1171,10 +1174,13 @@ pub fn run_receiver(
                     None => {
                         error!("pipeline thread panicked during disconnect recovery");
                         if journal_path.exists() {
-                            match melin_engine::journal::JournaledExchange::recover(journal_path) {
+                            match melin_transport_core::JournaledApp::<App>::recover(
+                                crate::server::empty_app(),
+                                journal_path,
+                            ) {
                                 Ok(engine) => {
                                     last_sequence = engine.next_sequence().saturating_sub(1);
-                                    chain_hash = engine.writer_chain_hash().unwrap_or([0u8; 32]);
+                                    chain_hash = engine.chain_hash().unwrap_or([0u8; 32]);
                                     let (e, w) = engine.into_parts();
                                     exchange = Some(e);
                                     journal_writer = Some(w);

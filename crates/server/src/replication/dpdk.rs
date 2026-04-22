@@ -782,16 +782,19 @@ pub fn run_receiver_dpdk(
         if journal_path.exists() {
             let engine = if snapshot_path.exists() {
                 info!("recovering replica from snapshot + journal (DPDK)");
-                melin_engine::journal::JournaledExchange::recover_from_snapshot(
+                melin_transport_core::JournaledApp::<App>::recover_from_snapshot(
                     &snapshot_path,
                     journal_path,
                 )?
             } else {
-                melin_engine::journal::JournaledExchange::recover(journal_path)?
+                melin_transport_core::JournaledApp::<App>::recover(
+                    crate::server::empty_app(),
+                    journal_path,
+                )?
             };
             let next = engine.next_sequence();
             let last = next.saturating_sub(1);
-            let hash = engine.writer_chain_hash().unwrap_or([0u8; 32]);
+            let hash = engine.chain_hash().unwrap_or([0u8; 32]);
             let (exchange, writer) = engine.into_parts();
             (Some(exchange), Some(writer), last, hash)
         } else {
@@ -1011,7 +1014,7 @@ pub fn run_receiver_dpdk(
                 Some(genesis_chain_hash),
                 0,
             )?;
-            exchange = Some(App::new());
+            exchange = Some(crate::server::empty_app());
             journal_writer = Some(writer);
         }
 
@@ -1024,7 +1027,7 @@ pub fn run_receiver_dpdk(
         let cur_writer = journal_writer.take().expect("journal_writer initialized");
 
         // Clone exchange for shadow stage before moving into pipeline.
-        let shadow_exchange = cur_exchange.clone_via_snapshot();
+        let shadow_exchange = <App as melin_app::Application>::clone_via_snapshot(&cur_exchange)?;
 
         // Build the replica pipeline — same as the TCP receiver.
         let enable_shadow = snapshot_interval_secs > 0;
@@ -1315,10 +1318,13 @@ pub fn run_receiver_dpdk(
             None => {
                 error!("pipeline thread panicked during disconnect recovery (DPDK)");
                 if journal_path.exists() {
-                    match melin_engine::journal::JournaledExchange::recover(journal_path) {
+                    match melin_transport_core::JournaledApp::<App>::recover(
+                        crate::server::empty_app(),
+                        journal_path,
+                    ) {
                         Ok(engine) => {
                             last_sequence = engine.next_sequence().saturating_sub(1);
-                            chain_hash = engine.writer_chain_hash().unwrap_or([0u8; 32]);
+                            chain_hash = engine.chain_hash().unwrap_or([0u8; 32]);
                             let (e, w) = engine.into_parts();
                             exchange = Some(e);
                             journal_writer = Some(w);
@@ -1482,7 +1488,7 @@ fn receive_snapshot_dpdk(
 
     // Load and verify the snapshot.
     let (snap_exchange, _snap_seq, snap_hash) =
-        melin_engine::journal::snapshot::load(snapshot_path)?;
+        melin_transport_core::snapshot::load::<crate::App>(snapshot_path)?;
     if snap_hash != snap_chain_hash {
         return Err(format!(
             "snapshot chain hash mismatch: primary sent {snap_chain_hash:02x?}, \

@@ -23,6 +23,7 @@ no-persist = []
 hash-chain = ["melin-journal/hash-chain"]
 
 [dependencies]
+crc32c = "0.6"
 io-uring = "0.7"
 libc = { workspace = true }
 tracing = { workspace = true }

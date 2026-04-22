@@ -15,4 +15,8 @@
 
 #![cfg_attr(not(test), deny(clippy::unwrap_used))]
 
+pub mod journaled_app;
 pub mod pipeline;
+pub mod snapshot;
+
+pub use journaled_app::{JournaledApp, JournaledAppError};

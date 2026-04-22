@@ -15,10 +15,13 @@ use tracing::{error, info};
 use crate::App;
 use crate::InputSlot;
 use crate::JournalEvent;
+use melin_app::{Application, ApplyCtx};
 use melin_disruptor::ring;
 use melin_disruptor::seqlock::SeqLock;
-use melin_engine::journal::snapshot;
-use melin_trading::types::ExecutionReport;
+use melin_journal::JournalEvent as RawJournalEvent;
+use melin_transport_core::snapshot;
+
+type Report = <App as Application>::Report;
 
 use crate::amortized_timer::AmortizedTimer;
 
@@ -51,9 +54,9 @@ pub fn run(
     shutdown: &AtomicBool,
     busy_spin: bool,
 ) {
-    // Scratch buffer for exchange methods that require a reports Vec.
-    // Cleared after each call — shadow discards all execution reports.
-    let mut reports: Vec<ExecutionReport> = Vec::with_capacity(64);
+    // Scratch buffer for app methods that require a reports Vec.
+    // Cleared after each call — shadow discards all reports.
+    let mut reports: Vec<Report> = Vec::with_capacity(64);
 
     // Batch buffer for consume_batch — stack-allocated InputSlot array would
     // be too large, so use a Vec that's allocated once and reused.
@@ -121,13 +124,13 @@ pub fn run(
 
 /// Save a shadow snapshot, logging success or failure.
 fn save_snapshot(
-    exchange: &App,
+    app: &App,
     sequence: u64,
     chain_hash_lock: &Arc<SeqLock<[u8; 32]>>,
     path: &std::path::Path,
 ) {
     let chain_hash = chain_hash_lock.load();
-    match snapshot::save(exchange, sequence, chain_hash, path) {
+    match snapshot::save::<App>(app, sequence, chain_hash, path) {
         Ok(()) => {
             info!(
                 sequence,
@@ -146,7 +149,7 @@ fn save_snapshot(
     }
 }
 
-/// Dispatch a single journal event to the shadow exchange.
+/// Dispatch a single journal event to the shadow app.
 ///
 /// Same event handling as the matching stage's `process_event`, including
 /// the per-event scheduler drain — without that the shadow's snapshot would
@@ -154,125 +157,53 @@ fn save_snapshot(
 /// `last_drain_ns` is caller-tracked across the consume loop so the drain
 /// stays monotonic.
 fn dispatch_event(
-    exchange: &mut App,
+    app: &mut App,
     event: &JournalEvent,
     timestamp_ns: u64,
     last_drain_ns: &mut u64,
-    reports: &mut Vec<ExecutionReport>,
+    reports: &mut Vec<Report>,
 ) {
     reports.clear();
 
     if timestamp_ns > *last_drain_ns {
         *last_drain_ns = timestamp_ns;
-        exchange.drain_due_scheduled_tasks(timestamp_ns, reports);
+        app.tick(timestamp_ns, reports);
     }
 
     match *event {
-        JournalEvent::App(melin_trading::trading_event::TradingEvent::AddInstrument { spec }) => {
-            exchange.add_instrument(spec);
+        RawJournalEvent::App(e) => {
+            // The shadow is strictly a secondary observer — the canonical
+            // answer (and journal sequence number) is produced by the
+            // matching stage. `ApplyCtx` is supplied with the fields the
+            // shadow can cheaply compute; `journal_sequence` / connection
+            // counts are live-pipeline-only.
+            let ctx = ApplyCtx {
+                now_ns: timestamp_ns,
+                journal_sequence: 0,
+                active_connections: 0,
+                events_processed: 0,
+            };
+            app.apply(e, &ctx, reports);
         }
-        JournalEvent::App(melin_trading::trading_event::TradingEvent::Deposit {
-            account,
-            currency,
-            amount,
-        }) => {
-            exchange.deposit(account, currency, amount);
-        }
-        JournalEvent::App(melin_trading::trading_event::TradingEvent::SubmitOrder {
-            symbol,
-            order,
-        }) => {
-            exchange.execute(symbol, order, reports);
-        }
-        JournalEvent::App(melin_trading::trading_event::TradingEvent::CancelOrder {
-            account,
-            order_id,
-            symbol,
-        }) => {
-            exchange.cancel(symbol, account, order_id, reports);
-        }
-        JournalEvent::App(melin_trading::trading_event::TradingEvent::SetRiskLimits {
-            symbol,
-            limits,
-        }) => {
-            exchange.set_risk_limits(symbol, limits);
-        }
-        JournalEvent::App(melin_trading::trading_event::TradingEvent::CancelAll { account }) => {
-            exchange.cancel_all(account, reports);
-        }
-        JournalEvent::App(melin_trading::trading_event::TradingEvent::EndOfDay) => {
-            exchange.end_of_day(reports);
-        }
-        JournalEvent::App(melin_trading::trading_event::TradingEvent::SetCircuitBreaker {
-            symbol,
-            config,
-        }) => {
-            exchange.set_circuit_breaker(symbol, config);
-        }
-        JournalEvent::App(melin_trading::trading_event::TradingEvent::CancelReplace {
-            symbol,
-            account,
-            order_id,
-            new_price,
-            new_quantity,
-        }) => {
-            exchange.cancel_replace(symbol, account, order_id, new_price, new_quantity, reports);
-        }
-        JournalEvent::App(melin_trading::trading_event::TradingEvent::SetFeeSchedule {
-            symbol,
-            schedule,
-        }) => {
-            exchange.set_fee_schedule(symbol, schedule, reports);
-        }
-        JournalEvent::App(melin_trading::trading_event::TradingEvent::ProvisionAccount {
-            account,
-            amount,
-        }) => {
-            exchange.provision_account(account, amount);
-        }
-        JournalEvent::App(melin_trading::trading_event::TradingEvent::Withdraw {
-            account,
-            currency,
-            amount,
-        }) => {
-            // Replay path: deterministic — rejections reproduce the
-            // original live outcome and were already surfaced to the
-            // client. Discarding here is intentional and safe.
-            let _ = exchange.withdraw(account, currency, amount);
-        }
-        JournalEvent::App(melin_trading::trading_event::TradingEvent::DisableInstrument {
-            symbol,
-        }) => {
-            exchange.disable_instrument(symbol, reports);
-        }
-        JournalEvent::App(melin_trading::trading_event::TradingEvent::EnableInstrument {
-            symbol,
-        }) => {
-            exchange.enable_instrument(symbol, reports);
-        }
-        JournalEvent::App(melin_trading::trading_event::TradingEvent::RemoveInstrument {
-            symbol,
-        }) => {
-            exchange.remove_instrument(symbol, reports);
-        }
-        JournalEvent::Tick { now_ns } => {
+        RawJournalEvent::Tick { now_ns } => {
             // Defensive: the head-of-event drain typically already advanced
             // the clock to this point. Re-draining via `now_ns` keeps the
             // contract consistent for callers that pass `timestamp_ns = 0`
             // (tests, manually constructed events).
-            exchange.drain_due_scheduled_tasks(now_ns, reports);
+            app.tick(now_ns, reports);
         }
-        JournalEvent::App(melin_trading::trading_event::TradingEvent::QueryStats)
-        | JournalEvent::App(melin_trading::trading_event::TradingEvent::QueryPosition { .. }) => {
-            // Read-only — no state change.
-        }
-        JournalEvent::GenesisHash { .. } | JournalEvent::Checkpoint { .. } => {
-            // Hash chain metadata — no exchange state change.
+        RawJournalEvent::GenesisHash { .. } | RawJournalEvent::Checkpoint { .. } => {
+            // Hash chain metadata — no application state change.
         }
     }
 }
 
-#[cfg(test)]
+// The shadow module's test suite exercises every trading-event branch
+// against a real `Exchange`. Under the noop build the equivalent
+// assertions would be trivial (every event produces the same rejection
+// report), so the suite is gated to the trading build rather than
+// rewritten.
+#[cfg(all(test, feature = "trading", not(feature = "noop")))]
 mod tests {
     use super::*;
     use crate::JournalEvent;
@@ -653,8 +584,8 @@ mod tests {
         let primary_path = dir.path().join("primary.snapshot");
         let hash = [0u8; 32];
 
-        snapshot::save(&shadow, 1, hash, &shadow_path).unwrap();
-        snapshot::save(&primary, 1, hash, &primary_path).unwrap();
+        snapshot::save::<App>(&shadow, 1, hash, &shadow_path).unwrap();
+        snapshot::save::<App>(&primary, 1, hash, &primary_path).unwrap();
 
         let shadow_bytes = std::fs::read(&shadow_path).unwrap();
         let primary_bytes = std::fs::read(&primary_path).unwrap();
@@ -783,7 +714,7 @@ mod tests {
 
         // Verify the snapshot file was created and is loadable.
         assert!(snap_path.exists(), "snapshot file should exist");
-        let (restored, _seq, chain) = snapshot::load(&snap_path).unwrap();
+        let (restored, _seq, chain) = snapshot::load::<App>(&snap_path).unwrap();
         assert_eq!(chain, [0xAB; 32]); // chain hash from SeqLock
         // Both deposits should be reflected: 100K initial + 1K + 500.
         assert_eq!(

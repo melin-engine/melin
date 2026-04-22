@@ -11,6 +11,14 @@
 //!
 //! Uses actual child processes (`melin-server` binary) and TCP so the test
 //! exercises the real replication and promotion code paths.
+//!
+//! Trading-only — the scenarios under test (order submit / balance /
+//! matching invariants) are meaningful only against the real engine. The
+//! noop build's promoted replica would trivially pass because every order
+//! is rejected with `NoLiquidity`. When running `cargo test` against the
+//! noop build this file is compiled as an empty test crate.
+
+#![cfg(all(feature = "trading", not(feature = "noop")))]
 
 use ed25519_dalek::Signer;
 use serial_test::serial;
@@ -796,7 +804,7 @@ fn crashed_primary_recovers_from_journal() {
 #[test]
 #[serial]
 fn journals_contiguous_across_checkpoint_boundary() {
-    use melin_engine::journal::JournalReader;
+    use melin_journal::JournalReader;
 
     let cluster = TestCluster::start();
     let mut client = cluster.connect_primary();
@@ -825,7 +833,7 @@ fn journals_contiguous_across_checkpoint_boundary() {
     let replica_journal = cluster._tmp.path().join("replica.journal");
 
     let walk = |label: &str, path: &Path| -> u64 {
-        let mut reader = JournalReader::open(path)
+        let mut reader = JournalReader::<melin_trading::trading_event::TradingEvent>::open(path)
             .unwrap_or_else(|e| panic!("{label}: open {}: {e}", path.display()));
         let mut count = 0u64;
         loop {
@@ -868,7 +876,7 @@ fn journals_contiguous_across_checkpoint_boundary() {
 #[test]
 #[serial]
 fn bench_binary_journals_contiguous_across_checkpoint_boundary() {
-    use melin_engine::journal::JournalReader;
+    use melin_journal::JournalReader;
 
     // Locate (or build) the `melin-bench` binary using the same target
     // profile Cargo picked for `melin-server` — `CARGO_BIN_EXE_melin-server`
@@ -951,7 +959,7 @@ fn bench_binary_journals_contiguous_across_checkpoint_boundary() {
     std::thread::sleep(Duration::from_millis(500));
 
     let walk = |label: &str, path: &Path| -> u64 {
-        let mut reader = JournalReader::open(path)
+        let mut reader = JournalReader::<melin_trading::trading_event::TradingEvent>::open(path)
             .unwrap_or_else(|e| panic!("{label}: open {}: {e}", path.display()));
         let mut count = 0u64;
         loop {

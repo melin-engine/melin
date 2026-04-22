@@ -53,6 +53,8 @@ pub enum ControlEvent {
 }
 
 pub mod affinity;
+/// AmortizedTimer is used by the shadow stage's clock-check amortization
+/// and by the replication sender. Always compiled.
 pub(crate) mod amortized_timer;
 /// Firehose event publisher — trading-only because it depends on
 /// `melin-market-data` for book-mirror snapshots.
@@ -65,26 +67,18 @@ pub mod request;
 mod response;
 pub mod tick;
 
-// --- Trading-only modules ---
-// The full matching-engine server assumes `Exchange`-based recovery,
-// shadow snapshotting, and replica failover — all currently coupled to
-// `JournaledExchange` / `Exchange` internals. When building the noop
-// binary for transport-only benchmarks, a much smaller server entry
-// point ships instead.
-#[cfg(all(feature = "trading", not(feature = "noop")))]
+/// Replica failover and shadow snapshotting. Both are transport-level
+/// concerns and work for any `A: Application`, so they compile into the
+/// noop build too — that is precisely the point of the noop binary
+/// (stress the full durable transport without the matching engine).
 pub mod replication;
-#[cfg(all(feature = "trading", not(feature = "noop")))]
-pub mod server;
-#[cfg(all(feature = "trading", not(feature = "noop")))]
 pub mod shadow;
 
-// --- No-op server ---
-// Minimal primary-only server (no replication, no shadow, no snapshot
-// rotation) used for transport-level benchmarking against the lan-bench
-// suite. Exposes the same `run` / `run_with_shutdown` surface as
-// `server::*` so `main.rs` doesn't branch on the feature.
-#[cfg(all(feature = "noop", not(feature = "trading")))]
-#[path = "server_noop.rs"]
+/// Server runtime (TCP accept loop, pipeline bootstrap, auth handshake).
+/// Both the trading and no-op builds share the same entry points — the
+/// feature-gated `App` alias plus the optional `replication` / `shadow`
+/// modules are what actually differ. Cfg branches inside `server.rs`
+/// select the right recovery/seed/shadow path per feature.
 pub mod server;
 
 #[cfg(feature = "dpdk")]

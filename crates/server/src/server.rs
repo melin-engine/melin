@@ -1,7 +1,7 @@
 //! Server orchestrator — binds the accept loop, pipeline threads, and reader.
 //!
 //! On startup:
-//! 1. Recovers or creates the `JournaledExchange`.
+//! 1. Recovers or creates the `JournaledApp<A>`.
 //! 2. Decomposes it into `(App, JournalWriter)` via `into_parts()`.
 //! 3. Builds the disruptor pipeline (input ring + output ring).
 //! 4. Spawns 3-5 OS threads: journal, matching, response, [repl-sender], [event-publisher].
@@ -24,13 +24,11 @@ use tracing::{debug, error, info, warn};
 use crate::App;
 use crate::JournalWriter;
 use melin_journal::JournalError;
+use melin_transport_core::journaled_app::JournaledApp;
 use melin_transport_core::pipeline::{
     Pipeline as GenericPipeline, build_pipeline_with_replication,
 };
 pub type Pipeline = GenericPipeline<App>;
-
-#[cfg(all(feature = "trading", not(feature = "noop")))]
-use melin_engine::journal::JournaledExchange;
 
 use melin_protocol::auth::{AuthorizedKeys, Permission};
 use melin_protocol::blocking::BlockingFrameWriter;
@@ -413,7 +411,7 @@ fn parse_cores(s: &str) -> Result<PipelineCores, String> {
 
 /// Run the trading server.
 ///
-/// 1. Initializes (or recovers) the `JournaledExchange`, then decomposes
+/// 1. Initializes (or recovers) the `JournaledApp<A>`, then decomposes
 ///    it into `App` and `JournalWriter` for the pipeline.
 /// 2. Builds the disruptor pipeline (input ring + output ring + stages).
 /// 3. Spawns 3 OS threads: journal, matching, response.
@@ -502,7 +500,7 @@ pub fn run_with_shutdown<L: BlockingTransportListener>(
             Some((mut exchange, writer)) => {
                 // Promotion! Transition to primary mode.
                 info!("replica promoted — transitioning to primary");
-                exchange.prefault();
+                <App as melin_app::Application>::prefault(&mut exchange);
 
                 return run_as_primary(
                     exchange,
@@ -515,6 +513,10 @@ pub fn run_with_shutdown<L: BlockingTransportListener>(
                 );
             }
         }
+    }
+    #[cfg(all(feature = "noop", not(feature = "trading")))]
+    if config.replica_of.is_some() {
+        return Err("replica mode is only available in the trading build".into());
     }
 
     // Load authorized keys for challenge-response authentication.
@@ -649,7 +651,9 @@ fn run_as_primary<L: BlockingTransportListener>(
     // Used to enforce max_connections (SEC-02).
     let active_connections = Arc::new(AtomicU64::new(0));
 
-    // Determine replication mode.
+    // Determine replication mode. Both trading and noop builds ship the
+    // full durable transport (journal + replication + shadow), so the
+    // same config knob drives either binary.
     let enable_replication = config.replication_bind.is_some();
     if enable_replication && config.standalone {
         return Err("--replication-bind and --standalone are mutually exclusive".into());
@@ -691,7 +695,11 @@ fn run_as_primary<L: BlockingTransportListener>(
     };
 
     // Build the disruptor pipeline with optional replication consumer.
+    // Event publisher is trading-only (market-data book mirrors).
+    #[cfg(all(feature = "trading", not(feature = "noop")))]
     let enable_event_publisher = config.event_bind.is_some();
+    #[cfg(all(feature = "noop", not(feature = "trading")))]
+    let enable_event_publisher = false;
     let Pipeline {
         input_producer,
         journal_stage,
@@ -925,6 +933,15 @@ fn run_as_primary<L: BlockingTransportListener>(
 
     // Spawn event publisher thread if enabled. Consumes from output ring
     // consumer 1 and broadcasts all execution events to TCP subscribers.
+    // Trading-only — the publisher depends on `melin-market-data` for
+    // book-mirror snapshots.
+    #[cfg(all(feature = "noop", not(feature = "trading")))]
+    let event_publisher_handle: Option<std::thread::JoinHandle<()>> = {
+        let _ = event_publisher_consumer;
+        None
+    };
+
+    #[cfg(all(feature = "trading", not(feature = "noop")))]
     let event_publisher_handle = if let Some(event_consumer) = event_publisher_consumer {
         let event_bind = config
             .event_bind
@@ -951,9 +968,8 @@ fn run_as_primary<L: BlockingTransportListener>(
         None
     };
 
-    // Spawn shadow snapshot thread if enabled. The shadow stage replays
-    // journal-fsynced events on a cloned App and saves periodic
-    // snapshots — fully off the hot path.
+    // Spawn shadow snapshot thread if enabled. Works for any
+    // `A: Application` — the noop app just snapshots its trivial counter.
     let shadow_handle = if let Some(shadow_cons) = shadow_consumer {
         let snap_path = config.shadow_snapshot_path();
         let interval = std::time::Duration::from_secs(config.snapshot_interval_secs);
@@ -2079,15 +2095,27 @@ pub fn run_dpdk(
     )
 }
 
-/// Initialize or recover the `JournaledExchange` from disk.
+/// Build a fresh, empty application. The concrete constructor is
+/// feature-gated: trading uses the production pre-sized `Exchange`; noop
+/// uses the trivial `NoopApp`. Everything downstream of this call is
+/// application-agnostic via the `Application` trait.
+#[cfg(all(feature = "trading", not(feature = "noop")))]
+pub(crate) fn empty_app() -> App {
+    melin_engine::exchange::Exchange::with_capacity()
+}
+
+#[cfg(all(feature = "noop", not(feature = "trading")))]
+pub(crate) fn empty_app() -> App {
+    melin_noop::NoopApp::new()
+}
+
+/// Initialize or recover the journaled application from disk.
 ///
 /// Returns `(app, writer, needs_seeding)`. `needs_seeding` is true on
 /// first startup (fresh journal) — the caller must publish seed events
-/// through the pipeline. Feature-gated because recovery paths are
-/// application-specific: trading goes through `JournaledExchange`
-/// (snapshot + journal replay); the no-op app has no state so it just
-/// opens a fresh journal.
-#[cfg(all(feature = "trading", not(feature = "noop")))]
+/// through the pipeline. The recovery paths (snapshot+journal, snapshot
+/// only, journal only, fresh) are transport-level concerns and work
+/// uniformly for any `A: Application` via `JournaledApp<A>`.
 fn init_engine(
     config: &ServerConfig,
 ) -> Result<(App, JournalWriter, bool), Box<dyn std::error::Error>> {
@@ -2103,12 +2131,12 @@ fn init_engine(
     });
 
     let journal_exists = config.journal.exists();
-    let mut engine = if let Some(snap_path) = snap_path
+    let mut engine: JournaledApp<App> = if let Some(snap_path) = snap_path
         && snap_path.exists()
         && journal_exists
     {
         info!(snapshot = %snap_path.display(), "recovering from snapshot + journal");
-        JournaledExchange::recover_from_snapshot(snap_path, &config.journal)?
+        JournaledApp::<App>::recover_from_snapshot(snap_path, &config.journal)?
     } else if let Some(snap_path) = snap_path
         && snap_path.exists()
         && !journal_exists
@@ -2120,17 +2148,17 @@ fn init_engine(
             snapshot = %snap_path.display(),
             "recovering from snapshot only (journal missing, post-rotation crash?)"
         );
-        let (exchange, snap_sequence, snap_chain_hash) =
-            melin_engine::journal::snapshot::load(snap_path)?;
+        let (app, snap_sequence, snap_chain_hash) =
+            melin_transport_core::snapshot::load::<App>(snap_path)?;
         let writer =
             JournalWriter::create_continuing(&config.journal, snap_sequence + 1, snap_chain_hash)?;
-        JournaledExchange::from_parts(exchange, writer)
+        JournaledApp::<App>::from_parts(app, writer)
     } else if journal_exists {
         info!("recovering from journal");
-        JournaledExchange::recover(&config.journal)?
+        JournaledApp::<App>::recover(empty_app(), &config.journal)?
     } else {
         info!("creating new journal");
-        JournaledExchange::create(&config.journal)?
+        JournaledApp::<App>::create(empty_app(), &config.journal)?
     };
 
     let needs_seeding = !journal_exists;
@@ -2159,25 +2187,6 @@ fn init_engine(
 
     let (app, writer) = engine.into_parts();
     Ok((app, writer, needs_seeding))
-}
-
-/// No-op variant: there's no state to recover, so we always open a fresh
-/// journal at the configured path. The `needs_seeding` flag is always
-/// true — seed events flow through the pipeline like any other input
-/// and `NoopApp::apply` quietly rejects them.
-#[cfg(all(feature = "noop", not(feature = "trading")))]
-fn init_engine(
-    config: &ServerConfig,
-) -> Result<(App, JournalWriter, bool), Box<dyn std::error::Error>> {
-    if config.journal.exists() {
-        info!(
-            path = %config.journal.display(),
-            "noop server: ignoring existing journal and opening fresh"
-        );
-        std::fs::remove_file(&config.journal)?;
-    }
-    let writer = JournalWriter::create(&config.journal)?;
-    Ok((melin_noop::NoopApp::new(), writer, true))
 }
 
 /// Apply CPU core affinity for a pipeline thread, logging the result.
