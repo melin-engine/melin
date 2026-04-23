@@ -9,6 +9,7 @@
 #     tcp-dual-repl   Kernel TCP + 2 synchronous replicas
 #     dpdk            DPDK kernel bypass, standalone
 #     dpdk-repl       DPDK + 1 synchronous replica (e2e DPDK)
+#     dpdk-dual-repl  DPDK + 2 synchronous replicas (e2e DPDK)
 #
 #   Workloads (what the bench runs):
 #     throughput      Peak throughput — 100M pairs, 16 clients, window 256
@@ -199,6 +200,7 @@ VALID_TCP_REPL="throughput single"
 VALID_TCP_DUAL_REPL="throughput single"
 VALID_DPDK="throughput single"
 VALID_DPDK_REPL="throughput"
+VALID_DPDK_DUAL_REPL="throughput"
 LOCAL_WORKLOADS="engine-only pipeline-only"
 ALL_WORKLOADS="throughput single engine-only pipeline-only sweep-window sweep-clients sweep-instruments sweep-accounts"
 
@@ -213,6 +215,7 @@ if [[ "$TRANSPORTS" == "all" ]]; then
     if [[ -n "$REPLICA2_PUB" ]]; then TRANSPORTS="${TRANSPORTS},tcp-dual-repl"; fi
     TRANSPORTS="${TRANSPORTS},dpdk"
     if [[ -n "$REPLICA_PUB" ]]; then TRANSPORTS="${TRANSPORTS},dpdk-repl"; fi
+    if [[ -n "$REPLICA2_PUB" ]]; then TRANSPORTS="${TRANSPORTS},dpdk-dual-repl"; fi
 fi
 if [[ "$WORKLOADS" == "all" ]]; then
     WORKLOADS="${ALL_WORKLOADS// /,}"
@@ -247,7 +250,7 @@ for workload in "${WORKLOAD_LIST[@]}"; do
                     echo "  SKIP ${transport}:${workload} — no replica server specified"
                     continue
                 fi ;;
-            tcp-dual-repl)
+            tcp-dual-repl|dpdk-dual-repl)
                 if [[ -z "$REPLICA_PUB" || -z "$REPLICA2_PUB" ]]; then
                     echo "  SKIP ${transport}:${workload} — need two replica servers"
                     continue
@@ -262,6 +265,7 @@ for workload in "${WORKLOAD_LIST[@]}"; do
             tcp-dual-repl)  valid_list="$VALID_TCP_DUAL_REPL" ;;
             dpdk)           valid_list="$VALID_DPDK" ;;
             dpdk-repl)      valid_list="$VALID_DPDK_REPL" ;;
+            dpdk-dual-repl) valid_list="$VALID_DPDK_DUAL_REPL" ;;
             *)
                 echo "  SKIP unknown transport: ${transport}"
                 continue ;;
@@ -333,7 +337,7 @@ fi
 # Determine what to build.
 NEED_DPDK=0
 for item in "${MATRIX[@]}"; do
-    case "${item%%:*}" in dpdk|dpdk-repl) NEED_DPDK=1 ;; esac
+    case "${item%%:*}" in dpdk|dpdk-repl|dpdk-dual-repl) NEED_DPDK=1 ;; esac
 done
 
 echo "=== Building release binaries ==="
@@ -442,18 +446,34 @@ if [[ "$NEED_DPDK" == "1" ]]; then
                 | tail -3 | sed "s/^/  [${BENCH} dpdk-bench] /"
         ) &
         dpdk_pids+=($!)
+        # Build DPDK server on replicas when any dpdk-*repl variant is in
+        # the matrix. dpdk-dual-repl also needs REPLICA2.
+        _need_dpdk_repl=0
+        _need_dpdk_dual_repl=0
         for item in "${MATRIX[@]}"; do
-            if [[ "${item%%:*}" == "dpdk-repl" && -n "$REPLICA" ]]; then
-                (
-                    ssh $SSH_OPTS "$REPLICA" "cd ${REPO_DIR} && source ~/.cargo/env && \
-                        export RUSTFLAGS=\"${RUSTFLAGS:-}\" && \
-                        cargo build --release -p melin-server --features ${DPDK_SERVER_FEATURES} --no-default-features" 2>&1 \
-                        | tail -3 | sed "s/^/  [${REPLICA} dpdk-server] /"
-                ) &
-                dpdk_pids+=($!)
-                break
-            fi
+            case "${item%%:*}" in
+                dpdk-repl)      _need_dpdk_repl=1 ;;
+                dpdk-dual-repl) _need_dpdk_dual_repl=1 ;;
+            esac
         done
+        if (( _need_dpdk_repl || _need_dpdk_dual_repl )) && [[ -n "$REPLICA" ]]; then
+            (
+                ssh $SSH_OPTS "$REPLICA" "cd ${REPO_DIR} && source ~/.cargo/env && \
+                    export RUSTFLAGS=\"${RUSTFLAGS:-}\" && \
+                    cargo build --release -p melin-server --features ${DPDK_SERVER_FEATURES} --no-default-features" 2>&1 \
+                    | tail -3 | sed "s/^/  [${REPLICA} dpdk-server] /"
+            ) &
+            dpdk_pids+=($!)
+        fi
+        if (( _need_dpdk_dual_repl )) && [[ -n "$REPLICA2" ]]; then
+            (
+                ssh $SSH_OPTS "$REPLICA2" "cd ${REPO_DIR} && source ~/.cargo/env && \
+                    export RUSTFLAGS=\"${RUSTFLAGS:-}\" && \
+                    cargo build --release -p melin-server --features ${DPDK_SERVER_FEATURES} --no-default-features" 2>&1 \
+                    | tail -3 | sed "s/^/  [${REPLICA2} dpdk-server] /"
+            ) &
+            dpdk_pids+=($!)
+        fi
         dpdk_failed=0
         for pid in "${dpdk_pids[@]}"; do
             wait "$pid" || dpdk_failed=1
@@ -827,11 +847,15 @@ dpdk_sriov_setup() {
         echo ""
         echo "=== Setting up DPDK SR-IOV ==="
         local hosts=("$SERVER" "$BENCH")
-        if [[ -n "$REPLICA" ]]; then
-            for item in "${MATRIX[@]}"; do
-                if [[ "${item%%:*}" == "dpdk-repl" ]]; then hosts+=("$REPLICA"); break; fi
-            done
-        fi
+        local _need_repl=0 _need_repl2=0
+        for item in "${MATRIX[@]}"; do
+            case "${item%%:*}" in
+                dpdk-repl)      _need_repl=1 ;;
+                dpdk-dual-repl) _need_repl=1; _need_repl2=1 ;;
+            esac
+        done
+        if (( _need_repl )) && [[ -n "$REPLICA" ]]; then hosts+=("$REPLICA"); fi
+        if (( _need_repl2 )) && [[ -n "$REPLICA2" ]]; then hosts+=("$REPLICA2"); fi
         for HOST in "${hosts[@]}"; do
             echo "  Setting up DPDK on ${HOST}..."
             ssh $SSH_OPTS "$HOST" "cd ${REPO_DIR} && sudo ./scripts/dpdk/dpdk-setup-sriov.sh" 2>&1 | tail -5
@@ -1146,6 +1170,135 @@ transport_stop_dpdk_repl() {
     fi
     echo "  Verifying DPDK replication journal consistency..."
     "${SCRIPT_DIR}/journal-verify.sh" "$SERVER" "$JOURNAL_PATH" "$REPLICA" "${REPLICA_JOURNAL}"
+}
+
+transport_start_dpdk_dual_repl() {
+    dpdk_sriov_setup
+    local replica_journal="${REPLICA_JOURNAL}"
+    local replica2_journal="${REPLICA2_JOURNAL}"
+    clean_journal "$SERVER" "$JOURNAL_PATH"
+    clean_journal "$REPLICA" "$replica_journal"
+    clean_journal "$REPLICA2" "$replica2_journal"
+    pin_irqs "$SERVER" "server"
+    pin_irqs "$BENCH" "bench"
+    pin_irqs "$REPLICA" "replica1"
+    pin_irqs "$REPLICA2" "replica2"
+
+    load_dpdk_config "$REPLICA" "REPLICA"
+    REPLICA_DPDK_IP="${REPLICA_DPDK_IP:-${REPLICA_VLAN}}"
+    REPLICA_DPDK_PREFIX="${REPLICA_DPDK_PREFIX:-24}"
+    local replica_vf_count
+    replica_vf_count=$(ssh $SSH_OPTS "$REPLICA" "ls -d /sys/bus/pci/drivers/vfio-pci/0000:* 2>/dev/null | wc -l" || echo 0)
+    if [[ "$replica_vf_count" -ge 2 ]]; then
+        REPLICA_DPDK_PORT="0,1"
+    else
+        REPLICA_DPDK_PORT="${REPLICA_DPDK_PORT:-0}"
+    fi
+
+    load_dpdk_config "$REPLICA2" "REPLICA2"
+    REPLICA2_DPDK_IP="${REPLICA2_DPDK_IP:-${REPLICA2_VLAN}}"
+    REPLICA2_DPDK_PREFIX="${REPLICA2_DPDK_PREFIX:-24}"
+    local replica2_vf_count
+    replica2_vf_count=$(ssh $SSH_OPTS "$REPLICA2" "ls -d /sys/bus/pci/drivers/vfio-pci/0000:* 2>/dev/null | wc -l" || echo 0)
+    if [[ "$replica2_vf_count" -ge 2 ]]; then
+        REPLICA2_DPDK_PORT="0,1"
+    else
+        REPLICA2_DPDK_PORT="${REPLICA2_DPDK_PORT:-0}"
+    fi
+
+    local server_eal replica_eal replica2_eal
+    if [[ "$DPDK_MODE" == "tap" ]]; then
+        server_eal="${SERVER_DPDK_EAL_ARGS}"
+        replica_eal="${REPLICA_DPDK_EAL_ARGS:-${SERVER_DPDK_EAL_ARGS}}"
+        replica2_eal="${REPLICA2_DPDK_EAL_ARGS:-${SERVER_DPDK_EAL_ARGS}}"
+    else
+        server_eal="--huge-dir=${HUGE_DIR}"
+        replica_eal="--huge-dir=${HUGE_DIR}"
+        replica2_eal="--huge-dir=${HUGE_DIR}"
+    fi
+
+    ssh $SSH_OPTS "$SERVER" "pkill -x melin-server 2>/dev/null; pkill -x melin-server.dpdk 2>/dev/null; true"
+    sleep 1
+    ssh $SSH_OPTS "$SERVER" "NO_COLOR=1 RUST_LOG=${BENCH_RUST_LOG} nohup ${DPDK_SERVER_BIN} \
+            --bind 0.0.0.0:9876 \
+            --journal ${JOURNAL_PATH} \
+            --authorized-keys ${REPO_DIR}/authorized_keys \
+            --replication-bind ${SERVER_DPDK_IP}:${REPL_PORT} \
+            --dpdk-eal-args='${server_eal}' \
+            --dpdk-ip ${SERVER_DPDK_IP} \
+            --dpdk-prefix-len ${SERVER_DPDK_PREFIX} \
+            --dpdk-ports ${SERVER_DPDK_PORT} \
+        >/tmp/melin-server.log 2>&1 </dev/null &" </dev/null
+
+    wait_for_log "$SERVER" "/tmp/melin-server.log" "DPDK replication sender started" 30 "DPDK replication listener"
+
+    ssh $SSH_OPTS "$REPLICA" "pkill -x melin-server 2>/dev/null; pkill -x melin-server.dpdk 2>/dev/null; true"
+    sleep 1
+    ssh $SSH_OPTS "$REPLICA" "NO_COLOR=1 RUST_LOG=${BENCH_RUST_LOG} nohup ${DPDK_SERVER_BIN} \
+            --replica-of ${SERVER_DPDK_IP}:${REPL_PORT} \
+            --replication-key ${REPO_DIR}/repl.key \
+            --journal ${replica_journal} \
+            --authorized-keys ${REPO_DIR}/authorized_keys \
+            --dpdk-eal-args='${replica_eal}' \
+            --dpdk-ip ${REPLICA_DPDK_IP} \
+            --dpdk-prefix-len ${REPLICA_DPDK_PREFIX} \
+            --dpdk-ports ${REPLICA_DPDK_PORT} \
+            ${REPLICA_EXTRA_ARGS:-} \
+        >/tmp/melin-server.log 2>&1 </dev/null &" </dev/null
+
+    ssh $SSH_OPTS "$REPLICA2" "pkill -x melin-server 2>/dev/null; pkill -x melin-server.dpdk 2>/dev/null; true"
+    sleep 1
+    ssh $SSH_OPTS "$REPLICA2" "NO_COLOR=1 RUST_LOG=${BENCH_RUST_LOG} nohup ${DPDK_SERVER_BIN} \
+            --replica-of ${SERVER_DPDK_IP}:${REPL_PORT} \
+            --replication-key ${REPO_DIR}/repl.key \
+            --journal ${replica2_journal} \
+            --authorized-keys ${REPO_DIR}/authorized_keys \
+            --dpdk-eal-args='${replica2_eal}' \
+            --dpdk-ip ${REPLICA2_DPDK_IP} \
+            --dpdk-prefix-len ${REPLICA2_DPDK_PREFIX} \
+            --dpdk-ports ${REPLICA2_DPDK_PORT} \
+            ${REPLICA_EXTRA_ARGS:-} \
+        >/tmp/melin-server.log 2>&1 </dev/null &" </dev/null
+
+    wait_for_log "$SERVER" "/tmp/melin-server.log" "listening" 120 "DPDK primary"
+
+    # TAP mode: routing for bench client.
+    if [[ "$DPDK_MODE" == "tap" ]]; then
+        setup_tap_routing "$SERVER" "${SERVER_DPDK_IP}"
+        add_tap_route "$BENCH" "${SERVER_DPDK_IP}" "${SERVER_PUB}"
+        BENCH_DPDK_ARGS=""
+    else
+        local bench_eal="--huge-dir=${HUGE_DIR}"
+        if [[ -n "${BENCH_DPDK_EAL_ARGS:-}" ]]; then
+            bench_eal="${BENCH_DPDK_EAL_ARGS} ${bench_eal}"
+        fi
+        BENCH_DPDK_ARGS="--dpdk-eal-args='${bench_eal}' --dpdk-ports ${BENCH_DPDK_PORT} --dpdk-core ${BENCH_DPDK_CORE}"
+        if [[ -n "${BENCH_DPDK_IP:-}" ]]; then
+            BENCH_DPDK_ARGS="${BENCH_DPDK_ARGS} --dpdk-ip ${BENCH_DPDK_IP} --dpdk-prefix-len ${BENCH_DPDK_PREFIX}"
+        fi
+    fi
+
+    CURRENT_BIND="${SERVER_DPDK_IP}:9876"
+    CURRENT_HEALTH=""
+    DPDK_RAN=1
+
+    perf_capture_start "dpdk-dual-repl"
+}
+
+transport_stop_dpdk_dual_repl() {
+    perf_capture_stop
+    stop_servers "$SERVER" "$REPLICA" "$REPLICA2"
+    for host in "$SERVER" "$REPLICA" "$REPLICA2"; do
+        ssh $SSH_OPTS "$host" "pkill -INT -x melin-server.dpdk 2>/dev/null; true"
+    done
+    if [[ "${SKIP_JOURNAL_VERIFY:-0}" == "1" ]]; then
+        echo "  Skipping journal verification (SKIP_JOURNAL_VERIFY=1)"
+        return
+    fi
+    echo "  Verifying DPDK replication journal consistency (replica1)..."
+    "${SCRIPT_DIR}/journal-verify.sh" "$SERVER" "$JOURNAL_PATH" "$REPLICA" "${REPLICA_JOURNAL}"
+    echo "  Verifying DPDK replication journal consistency (replica2)..."
+    "${SCRIPT_DIR}/journal-verify.sh" "$SERVER" "$JOURNAL_PATH" "$REPLICA2" "${REPLICA2_JOURNAL}"
 }
 
 # ---------------------------------------------------------------------------
