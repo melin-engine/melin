@@ -847,6 +847,12 @@ pub fn run_receiver_dpdk(
             primary_ip.octets()[3],
         ];
         transport.seed_neighbor(primary_ip, primary_mac);
+        // Drain the injected ARP reply through smoltcp so the neighbor
+        // cache is populated BEFORE connect_to() runs. Without this poll
+        // smoltcp's connect tries to resolve ARP from an empty cache,
+        // queues a broadcast request that the PF drops, and the SYN
+        // never ships.
+        transport.poll();
 
         // Connect to primary via smoltcp.
         let handle = transport.connect_to(primary_ip, primary_port, local_port);
