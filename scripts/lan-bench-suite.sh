@@ -80,6 +80,11 @@
 #                       perf.data are copied to ${RESULTS_DIR}. Defaults:
 #                       core 4, settle 15s after server start, record 30s.
 #                       Override with PERF_CORE, PERF_SETTLE, PERF_SECS.
+#   PERF_TARGET=...     Which side(s) to capture: `server` (default), `bench`,
+#                       or `both`. Bench-side capture targets the DPDK poll
+#                       core (default ${BENCH_DPDK_CORE:-7}); override with
+#                       PERF_BENCH_CORE. Useful for profiling the bench
+#                       client's DPDK poll loop.
 #
 # Special values:
 #   TRANSPORTS=all      All transports valid for the available infrastructure
@@ -891,56 +896,88 @@ add_tap_route() {
     "
 }
 
-# Start a background perf record on the server's ingress core (DPDK poll
-# thread or io_uring reader — both default to core 4 via `reader_cores`).
-# Returns immediately; data lands at /root/melin-perf-${label}.{data,
-# report.txt} on the server after ${settle}+${secs} seconds.
-# perf_capture_stop() waits for it, fetches both files to RESULTS_DIR,
-# and clears the pending flag. Safe to call whether PERF is set or not.
-perf_capture_start() {
-    [[ "${PERF:-0}" != "1" ]] && return
-    local label="$1"
-    local core="${PERF_CORE:-4}"
+# Start a background perf record on a remote host's ingress core. Role is
+# `server` or `bench`; each role tracks state in its own set of env vars so
+# both can run in parallel. Returns immediately; data lands at
+# /root/melin-perf-${role}-${label}.{data,report.txt} on the host after
+# ${settle}+${secs} seconds. _perf_stop_on() waits, fetches both files to
+# RESULTS_DIR, and clears the pending flag.
+_perf_start_on() {
+    local role="$1" host="$2" label="$3" core="$4"
     local secs="${PERF_SECS:-30}"
     local settle="${PERF_SETTLE:-15}"
-    PERF_ACTIVE_LABEL="${label}"
-    PERF_DATA_PATH="/root/melin-perf-${label}.data"
-    PERF_REPORT_PATH="/root/melin-perf-${label}.report.txt"
+    local data_path="/root/melin-perf-${role}-${label}.data"
+    local report_path="/root/melin-perf-${role}-${label}.report.txt"
 
-    echo "  perf: core=${core} settle=${settle}s record=${secs}s label=${label}"
-    ssh $SSH_OPTS "$SERVER" "rm -f ${PERF_DATA_PATH} ${PERF_REPORT_PATH} /tmp/melin-perf.log; \
+    # Store per-role state so the matching _perf_stop_on can find it.
+    eval "PERF_${role^^}_LABEL='${label}'"
+    eval "PERF_${role^^}_HOST='${host}'"
+    eval "PERF_${role^^}_DATA='${data_path}'"
+    eval "PERF_${role^^}_REPORT='${report_path}'"
+
+    echo "  perf(${role}): core=${core} settle=${settle}s record=${secs}s label=${label}"
+    ssh $SSH_OPTS "$host" "rm -f ${data_path} ${report_path} /tmp/melin-perf-${role}.log; \
         nohup bash -c 'sleep ${settle} && \
-            perf record -C ${core} -g -F 997 -o ${PERF_DATA_PATH} -- sleep ${secs} 2>>/tmp/melin-perf.log && \
-            perf report -i ${PERF_DATA_PATH} --stdio --no-children -F overhead,sample,symbol 2>/dev/null \
-                | head -200 > ${PERF_REPORT_PATH}; \
-            touch ${PERF_REPORT_PATH}.done' \
-        >/tmp/melin-perf.log 2>&1 </dev/null &" </dev/null
+            perf record -C ${core} -g -F 997 -o ${data_path} -- sleep ${secs} 2>>/tmp/melin-perf-${role}.log && \
+            perf report -i ${data_path} --stdio --no-children -F overhead,sample,symbol 2>/dev/null \
+                | head -200 > ${report_path}; \
+            touch ${report_path}.done' \
+        >/tmp/melin-perf-${role}.log 2>&1 </dev/null &" </dev/null
 }
 
-perf_capture_stop() {
-    [[ "${PERF:-0}" != "1" ]] && return
-    [[ -z "${PERF_ACTIVE_LABEL:-}" ]] && return
+_perf_stop_on() {
+    local role="$1"
+    local label_var="PERF_${role^^}_LABEL"
+    local host_var="PERF_${role^^}_HOST"
+    local data_var="PERF_${role^^}_DATA"
+    local report_var="PERF_${role^^}_REPORT"
+    local label="${!label_var:-}"
+    [[ -z "$label" ]] && return
+    local host="${!host_var}"
+    local data_path="${!data_var}"
+    local report_path="${!report_var}"
 
-    echo "  perf: waiting for capture to finish..."
+    echo "  perf(${role}): waiting for capture to finish..."
     local max_wait=120 waited=0
     while (( waited < max_wait )); do
-        if ssh $SSH_OPTS "$SERVER" "test -f ${PERF_REPORT_PATH}.done" 2>/dev/null; then
+        if ssh $SSH_OPTS "$host" "test -f ${report_path}.done" 2>/dev/null; then
             break
         fi
         sleep 2
         waited=$((waited + 2))
     done
     if (( waited >= max_wait )); then
-        echo "  perf: report not produced within ${max_wait}s — skipping fetch"
-        ssh $SSH_OPTS "$SERVER" "cat /tmp/melin-perf.log 2>/dev/null | tail -20" || true
-        PERF_ACTIVE_LABEL=""
+        echo "  perf(${role}): report not produced within ${max_wait}s — skipping fetch"
+        ssh $SSH_OPTS "$host" "cat /tmp/melin-perf-${role}.log 2>/dev/null | tail -20" || true
+        eval "PERF_${role^^}_LABEL=''"
         return
     fi
 
-    echo "  perf: fetching data + report to ${RESULTS_DIR}"
-    scp $SSH_OPTS "$SERVER:${PERF_DATA_PATH}" "${RESULTS_DIR}/perf-${PERF_ACTIVE_LABEL}.data" 2>/dev/null || true
-    scp $SSH_OPTS "$SERVER:${PERF_REPORT_PATH}" "${RESULTS_DIR}/perf-${PERF_ACTIVE_LABEL}.report.txt" 2>/dev/null || true
-    PERF_ACTIVE_LABEL=""
+    echo "  perf(${role}): fetching data + report to ${RESULTS_DIR}"
+    scp $SSH_OPTS "${host}:${data_path}" "${RESULTS_DIR}/perf-${role}-${label}.data" 2>/dev/null || true
+    scp $SSH_OPTS "${host}:${report_path}" "${RESULTS_DIR}/perf-${role}-${label}.report.txt" 2>/dev/null || true
+    eval "PERF_${role^^}_LABEL=''"
+}
+
+# Public entry points. PERF_TARGET selects which side(s) to capture:
+#   server (default), bench, both.
+perf_capture_start() {
+    [[ "${PERF:-0}" != "1" ]] && return
+    local label="$1"
+    local target="${PERF_TARGET:-server}"
+
+    if [[ "$target" == "server" || "$target" == "both" ]]; then
+        _perf_start_on "server" "$SERVER" "$label" "${PERF_CORE:-4}"
+    fi
+    if [[ "$target" == "bench" || "$target" == "both" ]]; then
+        _perf_start_on "bench" "$BENCH" "$label" "${PERF_BENCH_CORE:-${BENCH_DPDK_CORE:-7}}"
+    fi
+}
+
+perf_capture_stop() {
+    [[ "${PERF:-0}" != "1" ]] && return
+    _perf_stop_on "server"
+    _perf_stop_on "bench"
 }
 
 transport_start_dpdk() {
