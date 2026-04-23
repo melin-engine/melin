@@ -240,6 +240,21 @@ The max latency in engine-only mode is caused by System Management Interrupts (S
 
 On AMD CPUs, SMI counts cannot be measured (MSR 0x34 is Intel-specific). The `bench-isolate.sh` script attempts to read it and reports results on Intel hardware.
 
+### NVMe tail in standalone / single-replication modes
+
+When the response stage waits on a local journal fsync for every order (standalone, or single-replication where the primary needs both local disk and the replica), the tail latency floor is set by the NVMe drive, not the engine. Enterprise NVMe drives occasionally pause command processing for ~1-2 ms to run internal garbage collection or wear-leveling. The bursts are short (tens to hundreds of ms) and rare — on a Micron 7450, roughly 1 in 10,000 commands takes >800 µs while the rest complete in ~25 µs. Pauses are triggered by the drive's internal free-list state under sustained writes, not by a wall-clock timer, so the observed cadence varies run to run.
+
+Symptoms you will see at this floor:
+
+- p99.9 is clean (<100 µs), p99.99 may creep above 1 ms.
+- A small number of round-trips sit in the 0.5-2 ms range under persist mode but disappear entirely under `--features no-persist` (which skips journal I/O — unsafe for production, useful for confirming the hardware floor).
+
+**Mitigations when a tighter tail matters:**
+
+- **Run with dual replication and quorum durability** (default when 2 replicas are connected). The response stage then releases on any two of `{local fsync, replica 1 ack, replica 2 ack}` — the local NVMe is off the critical path whenever at least one replica has acked. This is the configuration the published peak-load numbers use. See [replication.md](replication.md).
+- **Raise drive over-provisioning.** Create a smaller NVMe namespace that reserves more unallocated capacity (e.g., 28% instead of the default ~7%). Fewer valid pages per block means less GC copy-on-write and a shorter pause when GC does fire — typically cuts spike frequency 3-5×.
+- **Use higher-endurance media.** Low-DWPD enterprise drives and pseudo-SLC-cache designs hold their tail better than general-purpose TLC parts.
+
 ## Reproducing Published Benchmarks
 
 See the [README](../README.md#benchmarks) for the current hardware setup, benchmark parameters, and performance numbers. All LAN benchmarks are reproducible via `scripts/lan-bench-suite.sh`.
