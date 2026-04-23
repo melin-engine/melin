@@ -73,12 +73,13 @@
 #                       trading. The LOCAL workloads `engine-only` and
 #                       `pipeline-only` are trading-only (they run a real
 #                       Exchange in-process) and are skipped under NOOP=1.
-#   PERF_DPDK=1         Capture `perf record` on the server's DPDK poll core
-#                       during the first DPDK workload of the run. Report +
-#                       raw perf.data are copied to ${RESULTS_DIR}. Defaults:
+#   PERF=1              Capture `perf record` on the server's ingress core
+#                       (io_uring reader for kernel TCP, DPDK poll thread
+#                       for DPDK — both default to core 4 via reader_cores)
+#                       during the first workload of the run. Report + raw
+#                       perf.data are copied to ${RESULTS_DIR}. Defaults:
 #                       core 4, settle 15s after server start, record 30s.
-#                       Override with PERF_DPDK_CORE, PERF_DPDK_SETTLE,
-#                       PERF_DPDK_SECS.
+#                       Override with PERF_CORE, PERF_SETTLE, PERF_SECS.
 #
 # Special values:
 #   TRANSPORTS=all      All transports valid for the available infrastructure
@@ -647,9 +648,12 @@ transport_start_tcp() {
     wait_for_log "$SERVER" "/tmp/melin-server.log" "listening addr=${SERVER_VLAN}:9876" 120 "Server"
     CURRENT_BIND="${SERVER_VLAN}:9876"
     CURRENT_HEALTH="${SERVER_VLAN}:9878"
+
+    perf_capture_start "tcp"
 }
 
 transport_stop_tcp() {
+    perf_capture_stop
     stop_servers "$SERVER"
 }
 
@@ -687,9 +691,12 @@ transport_start_tcp_repl() {
     wait_for_log "$SERVER" "/tmp/melin-server.log" "listening addr=${SERVER_VLAN}:9876" 120 "Primary"
     CURRENT_BIND="${SERVER_VLAN}:9876"
     CURRENT_HEALTH="${SERVER_VLAN}:9878"
+
+    perf_capture_start "tcp-repl"
 }
 
 transport_stop_tcp_repl() {
+    perf_capture_stop
     stop_servers "$SERVER" "$REPLICA"
     if [[ "${SKIP_JOURNAL_VERIFY:-0}" == "1" ]]; then
         echo "  Skipping journal verification (SKIP_JOURNAL_VERIFY=1)"
@@ -746,9 +753,12 @@ transport_start_tcp_dual_repl() {
     wait_for_log "$SERVER" "/tmp/melin-server.log" "listening addr=${SERVER_VLAN}:9876" 120 "Primary"
     CURRENT_BIND="${SERVER_VLAN}:9876"
     CURRENT_HEALTH="${SERVER_VLAN}:9878"
+
+    perf_capture_start "tcp-dual-repl"
 }
 
 transport_stop_tcp_dual_repl() {
+    perf_capture_stop
     stop_servers "$SERVER" "$REPLICA" "$REPLICA2"
     if [[ "${SKIP_JOURNAL_VERIFY:-0}" == "1" ]]; then
         echo "  Skipping journal verification (SKIP_JOURNAL_VERIFY=1)"
@@ -881,17 +891,18 @@ add_tap_route() {
     "
 }
 
-# Start a background perf record on the server's DPDK poll core. Returns
-# immediately; data lands at /root/melin-perf-${label}.{data,report.txt}
-# on the server after ${settle}+${secs} seconds. perf_capture_stop() waits
-# for it, fetches both files to RESULTS_DIR, and clears the pending flag.
-# Safe to call whether PERF_DPDK is set or not.
+# Start a background perf record on the server's ingress core (DPDK poll
+# thread or io_uring reader — both default to core 4 via `reader_cores`).
+# Returns immediately; data lands at /root/melin-perf-${label}.{data,
+# report.txt} on the server after ${settle}+${secs} seconds.
+# perf_capture_stop() waits for it, fetches both files to RESULTS_DIR,
+# and clears the pending flag. Safe to call whether PERF is set or not.
 perf_capture_start() {
-    [[ "${PERF_DPDK:-0}" != "1" ]] && return
+    [[ "${PERF:-0}" != "1" ]] && return
     local label="$1"
-    local core="${PERF_DPDK_CORE:-4}"
-    local secs="${PERF_DPDK_SECS:-30}"
-    local settle="${PERF_DPDK_SETTLE:-15}"
+    local core="${PERF_CORE:-4}"
+    local secs="${PERF_SECS:-30}"
+    local settle="${PERF_SETTLE:-15}"
     PERF_ACTIVE_LABEL="${label}"
     PERF_DATA_PATH="/root/melin-perf-${label}.data"
     PERF_REPORT_PATH="/root/melin-perf-${label}.report.txt"
@@ -907,7 +918,7 @@ perf_capture_start() {
 }
 
 perf_capture_stop() {
-    [[ "${PERF_DPDK:-0}" != "1" ]] && return
+    [[ "${PERF:-0}" != "1" ]] && return
     [[ -z "${PERF_ACTIVE_LABEL:-}" ]] && return
 
     echo "  perf: waiting for capture to finish..."
@@ -1082,9 +1093,12 @@ transport_start_dpdk_repl() {
     CURRENT_BIND="${SERVER_DPDK_IP}:9876"
     CURRENT_HEALTH=""
     DPDK_RAN=1
+
+    perf_capture_start "dpdk-repl"
 }
 
 transport_stop_dpdk_repl() {
+    perf_capture_stop
     stop_servers "$SERVER" "$REPLICA"
     for host in "$SERVER" "$REPLICA"; do
         ssh $SSH_OPTS "$host" "pkill -INT -x melin-server.dpdk 2>/dev/null; true"
