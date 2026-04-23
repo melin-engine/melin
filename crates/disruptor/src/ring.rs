@@ -74,6 +74,19 @@ impl<T: Copy + Default> RingBuffer<T> {
         let idx = (sequence & self.mask) as usize;
         unsafe { *self.slots[idx].get() }
     }
+
+    /// Mutable slot reference for in-place construction.
+    ///
+    /// # Safety
+    /// The caller must guarantee no other thread is reading or writing this slot.
+    // Standard UnsafeCell interior-mutability pattern — the &mut T is
+    // minted from &self through the UnsafeCell. Producer/consumer
+    // coordination via the atomic sequences keeps this sound.
+    #[allow(clippy::mut_from_ref)]
+    unsafe fn slot_mut(&self, sequence: u64) -> &mut T {
+        let idx = (sequence & self.mask) as usize;
+        unsafe { &mut *self.slots[idx].get() }
+    }
 }
 
 /// Shared state between the producer and all consumers.
@@ -170,6 +183,48 @@ impl<T: Copy + Default> Producer<T> {
             match self.try_publish(value) {
                 Ok(seq) => return seq,
                 Err(Full) => std::hint::spin_loop(),
+            }
+        }
+    }
+
+    /// Publish by filling the next slot in place. Spins until space is
+    /// available, then runs `f(&mut slot)` directly on the ring entry —
+    /// avoiding the byte-copy `publish`/`try_publish` perform when given
+    /// a `T` by value.
+    ///
+    /// Hot paths publishing large `InputSlot`-sized entries should prefer
+    /// this API: at 10M orders/sec a ~100-byte per-publish memcpy shows up
+    /// as ~30% of the ingest core in `perf annotate` (SSE `movdqu`/`movdqa`
+    /// pairs). Writing fields directly into the slot removes the copy.
+    ///
+    /// The Release store on the cursor orders all writes performed by `f`
+    /// before consumers observe the advanced cursor.
+    pub fn publish_with<F: FnOnce(&mut T)>(&mut self, f: F) -> u64 {
+        let capacity = self.shared.buffer.mask + 1;
+        // Spin until space is available (single-producer: seq doesn't move
+        // underneath us).
+        loop {
+            let seq = self.shared.cursor.get().load(Ordering::Relaxed);
+            if seq - self.cached_gate_min < capacity {
+                // Safety: backpressure check confirmed no consumer is reading
+                // this slot; single-producer → no concurrent writer.
+                let slot = unsafe { self.shared.buffer.slot_mut(seq) };
+                f(slot);
+                // Release: consumers see the slot writes before the cursor.
+                self.shared.cursor.get().store(seq + 1, Ordering::Release);
+                return seq;
+            }
+            // Re-read gate sequences before spinning.
+            let mut min = u64::MAX;
+            for gate in &self.gates {
+                let g = gate.get().load(Ordering::Acquire);
+                if g < min {
+                    min = g;
+                }
+            }
+            self.cached_gate_min = min;
+            if seq - min >= capacity {
+                std::hint::spin_loop();
             }
         }
     }
@@ -708,5 +763,48 @@ mod tests {
         assert_eq!(producer.publish(1), 0);
         assert_eq!(producer.publish(2), 1);
         assert_eq!(producer.publish(3), 2);
+    }
+
+    #[test]
+    fn publish_with_fills_in_place() {
+        let (mut producer, mut consumers) = DisruptorBuilder::<u64>::new(4).add_consumer().build();
+
+        assert_eq!(producer.publish_with(|slot| *slot = 111), 0);
+        assert_eq!(producer.publish_with(|slot| *slot = 222), 1);
+        assert_eq!(producer.publish_with(|slot| *slot = 333), 2);
+
+        assert_eq!(consumers[0].try_consume(), Some((0, 111)));
+        assert_eq!(consumers[0].try_consume(), Some((1, 222)));
+        assert_eq!(consumers[0].try_consume(), Some((2, 333)));
+    }
+
+    #[test]
+    fn publish_with_blocks_and_resumes_after_consume() {
+        // 4-slot ring with one consumer — producer is gated on that consumer.
+        let (mut producer, mut consumers) = DisruptorBuilder::<u64>::new(4).add_consumer().build();
+
+        for i in 0..4u64 {
+            producer.publish_with(|slot| *slot = i);
+        }
+
+        // Ring is full. Drain one slot on a helper thread so the producer
+        // can resume. Use a thread because publish_with spins.
+        let mut consumer = consumers.pop().unwrap();
+        let t = std::thread::spawn(move || {
+            // Give the producer a moment to enter its spin.
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            consumer.try_consume().unwrap();
+            consumer
+        });
+
+        let seq = producer.publish_with(|slot| *slot = 99);
+        assert_eq!(seq, 4);
+        let mut consumer = t.join().unwrap();
+
+        // Consumer already popped seq=0 (10) above.
+        assert_eq!(consumer.try_consume(), Some((1, 1)));
+        assert_eq!(consumer.try_consume(), Some((2, 2)));
+        assert_eq!(consumer.try_consume(), Some((3, 3)));
+        assert_eq!(consumer.try_consume(), Some((4, 99)));
     }
 }
