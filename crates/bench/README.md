@@ -16,7 +16,7 @@ cargo run --release -p melin-bench -- --mode=engine 1000000
 
 ### `--mode=pipeline`
 
-Builds the full disruptor pipeline (journal + matching stages on separate OS threads) but bypasses network transport. The bench thread publishes `InputSlot`s directly to the `MultiProducer` and drains `OutputSlot`s from the output SPSC queue. Isolates pipeline latency from TCP/UDS overhead.
+Builds the full disruptor pipeline (journal + matching stages on separate OS threads) but bypasses network transport. The bench thread publishes `InputSlot`s directly to the input `Producer` and drains `OutputSlot`s from the output SPSC queue. Isolates pipeline latency from TCP/UDS overhead.
 
 ```sh
 cargo run --release -p melin-bench -- --mode=pipeline 1000000

@@ -1962,9 +1962,6 @@ pub fn run_dpdk(
         "DPDK transport listening"
     );
 
-    // Spawn N-1 DPDK poll threads (queues 1..N). Queue 0 runs on the
-    // main thread below. Each thread gets its own transport, SPSC
-    // consumer, and a clone of the MultiProducer.
     let connection_timeout = config.connection_timeout();
     let max_conns = config.max_connections;
     let reader_cores = config.reader_cores;

@@ -618,7 +618,7 @@ fn run_engine_bench(
 
 /// Pipeline benchmark. Builds the full disruptor pipeline (journal stage +
 /// matching stage) but bypasses TCP/UDS transport. The bench thread publishes
-/// InputSlots directly to the MultiProducer and drains OutputSlots from the
+/// InputSlots directly to the input Producer and drains OutputSlots from the
 /// SPSC consumer. Measures pipeline latency without network overhead.
 fn run_pipeline_bench(
     total_pairs: usize,

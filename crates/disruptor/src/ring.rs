@@ -1,15 +1,10 @@
-//! Multi-consumer disruptor ring buffer.
+//! Single-producer multi-consumer disruptor ring buffer.
 //!
-//! Supports both single-producer and multi-producer modes:
-//!
-//! - **Single-producer** (`Producer`): one writer, simple store-based publishing.
-//! - **Multi-producer** (`MultiProducer`): N writers, CAS-based slot claiming
-//!   with per-slot generation flags for consumer visibility (LMAX pattern).
-//!
-//! N consumers read from the ring buffer, each gated on a dependency (the
-//! producer cursor or another consumer's cursor). This enables pipeline
-//! topologies where consumer B only processes entries after consumer A
-//! has finished with them.
+//! One writer (`Producer`), N consumers. The producer publishes entries
+//! with a plain release store on the cursor. Consumers read gated on a
+//! dependency — either the producer's cursor or another consumer's
+//! progress — enabling pipeline topologies where consumer B only
+//! processes entries after consumer A has finished with them.
 //!
 //! Counting model: the producer cursor and each consumer cursor track the
 //! *next* sequence to publish/read. Both start at 0. Slot index = seq & mask.
@@ -17,7 +12,7 @@
 
 use std::cell::UnsafeCell;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicI32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::padding::{CachePadded, Sequence};
 
@@ -84,20 +79,8 @@ impl<T: Copy + Default> RingBuffer<T> {
 /// Shared state between the producer and all consumers.
 struct Shared<T> {
     buffer: RingBuffer<T>,
-    /// Producer cursor: total items published (single-producer) or total items
-    /// claimed (multi-producer). Starts at 0.
+    /// Producer cursor: total items published. Starts at 0.
     cursor: Sequence,
-    /// Per-slot generation flags for multi-producer mode. Each slot stores
-    /// `(seq >> shift) as i32` after the producer writes to it. Consumers scan
-    /// this array to find the highest contiguous published sequence.
-    /// `None` in single-producer mode (cursor is the published counter).
-    /// Initialized to -1 (never published). Using `AtomicI32` without cache
-    /// padding — false sharing on adjacent slots is acceptable since producers
-    /// write to different slots concurrently.
-    available: Option<Box<[AtomicI32]>>,
-    /// log2(capacity) — used to compute generation: `seq >> shift`.
-    /// Only meaningful when `available` is `Some`.
-    shift: u32,
 }
 
 /// Producer end of the disruptor. Publishes entries to the ring buffer.
@@ -135,48 +118,17 @@ pub struct Consumer<T> {
 /// A consumer's dependency is either the producer (reads the cursor)
 /// or another consumer (reads that consumer's `processed`).
 enum DependencyKind<T> {
-    /// Gated on a single-producer's cursor (directly readable as published count).
+    /// Gated on the producer's cursor (directly readable as published count).
     Producer(Arc<Shared<T>>),
-    /// Gated on a multi-producer. Must scan the available flags to find the
-    /// highest contiguous published sequence.
-    MultiProducer(Arc<Shared<T>>),
     /// Gated on another consumer's processed count.
     Consumer(Arc<Sequence>),
 }
 
 impl<T> DependencyKind<T> {
     /// Load the highest sequence this consumer is allowed to read up to.
-    ///
-    /// `from` is the consumer's current read position — used by multi-producer
-    /// to scan the available flags from the consumer's position. Ignored in
-    /// single-producer and consumer-dependency modes.
-    fn load(&self, from: u64) -> u64 {
+    fn load(&self) -> u64 {
         match self {
             DependencyKind::Producer(shared) => shared.cursor.get().load(Ordering::Acquire),
-            DependencyKind::MultiProducer(shared) => {
-                // Scan the available flags to find the highest contiguous
-                // published sequence starting from `from`. The cursor is the
-                // upper bound (highest claimed), but some claimed slots may
-                // not be published yet.
-                let cursor = shared.cursor.get().load(Ordering::Acquire);
-                let available = shared
-                    .available
-                    .as_ref()
-                    .expect("MultiProducer requires available buffer");
-                let shift = shared.shift;
-                let mask = shared.buffer.mask;
-
-                let mut seq = from;
-                while seq < cursor {
-                    let idx = (seq & mask) as usize;
-                    let expected = (seq >> shift) as i32;
-                    if available[idx].load(Ordering::Acquire) != expected {
-                        break;
-                    }
-                    seq += 1;
-                }
-                seq
-            }
             DependencyKind::Consumer(seq) => seq.get().load(Ordering::Acquire),
         }
     }
@@ -282,7 +234,6 @@ impl<T: Copy + Default> Producer<T> {
     }
 
     /// Returns a type-erased handle for reading the producer cursor.
-    /// Same API as [`MultiProducer::cursor_reader`].
     pub fn cursor_reader(&self) -> Box<dyn QueueCursor>
     where
         T: Send + 'static,
@@ -291,41 +242,10 @@ impl<T: Copy + Default> Producer<T> {
     }
 }
 
-/// Multi-producer end of the disruptor. Multiple threads can publish
-/// concurrently without external synchronization.
-///
-/// Uses CAS-based slot claiming (LMAX multi-producer pattern):
-/// 1. `fetch_add` on the cursor to claim a unique sequence
-/// 2. Write the value to the claimed slot
-/// 3. Set a per-slot generation flag so consumers know the slot is ready
-///
-/// `Clone + Send + Sync` — each reader thread gets its own clone.
-pub struct MultiProducer<T> {
-    shared: Arc<Shared<T>>,
-    /// Sequences of all "gate" consumers (terminal consumers whose progress
-    /// limits the producer). Read on every publish for backpressure.
-    gates: Arc<[Arc<Sequence>]>,
-}
-
-impl<T> Clone for MultiProducer<T> {
-    fn clone(&self) -> Self {
-        Self {
-            shared: Arc::clone(&self.shared),
-            gates: Arc::clone(&self.gates),
-        }
-    }
-}
-
-// Safety: MultiProducer uses only atomic operations for concurrent publishing.
-// Slot writes are safe because each producer claims a unique sequence via CAS,
-// and backpressure ensures consumers have moved past the claimed slot.
-unsafe impl<T: Send> Send for MultiProducer<T> {}
-unsafe impl<T: Send> Sync for MultiProducer<T> {}
-
 /// Read-only handle to a disruptor producer cursor for monitoring.
 /// Type-erased so monitoring code doesn't depend on pipeline slot types.
 pub trait QueueCursor: Send + Sync {
-    /// Load the current cursor value (total items published/claimed).
+    /// Load the current cursor value (total items published).
     fn load(&self) -> u64;
 }
 
@@ -341,92 +261,6 @@ unsafe impl<T: Send> Sync for SharedCursor<T> {}
 impl<T: Send> QueueCursor for SharedCursor<T> {
     fn load(&self) -> u64 {
         self.0.cursor.get().load(Ordering::Relaxed)
-    }
-}
-
-impl<T: Copy + Default + Send + 'static> MultiProducer<T> {
-    /// Returns a type-erased handle for reading the producer cursor.
-    /// Zero impact on the publish hot path — `Shared` internals are unchanged.
-    pub fn cursor_reader(&self) -> Box<dyn QueueCursor> {
-        Box::new(SharedCursor(Arc::clone(&self.shared)))
-    }
-}
-
-impl<T: Copy + Default> MultiProducer<T> {
-    /// Try to publish a value. Returns `Err(Full)` if all slots are occupied
-    /// (consumers haven't caught up).
-    ///
-    /// Uses CAS to claim a unique sequence. Multiple threads can call this
-    /// concurrently. On contention, the CAS retries until it succeeds or
-    /// the ring is full.
-    pub fn try_publish(&self, value: T) -> Result<u64, Full> {
-        let capacity = self.shared.buffer.mask + 1;
-        let available = self
-            .shared
-            .available
-            .as_ref()
-            .expect("MultiProducer requires available buffer");
-
-        loop {
-            let current = self.shared.cursor.get().load(Ordering::Relaxed);
-
-            // Backpressure: can't write if we'd overwrite a slot consumers
-            // haven't read. No caching — reads gates fresh each attempt.
-            // With 2 gates, this is 2 atomic loads (cheap vs CAS cost).
-            let min_gate = self
-                .gates
-                .iter()
-                .map(|g| g.get().load(Ordering::Acquire))
-                .min()
-                .unwrap_or(0);
-
-            // saturating_sub: `current` may be stale (another producer advanced
-            // the cursor since our read), so `min_gate > current` is possible.
-            // In that case, the ring is definitely not full.
-            if current.saturating_sub(min_gate) >= capacity {
-                return Err(Full);
-            }
-
-            // CAS to claim the slot. On failure (another producer claimed it
-            // first), retry with the updated cursor value.
-            match self.shared.cursor.get().compare_exchange_weak(
-                current,
-                current + 1,
-                Ordering::Relaxed,
-                Ordering::Relaxed,
-            ) {
-                Ok(_) => {
-                    // Claimed sequence `current`. Write the slot data.
-                    // Safety: backpressure ensures consumers have moved past this
-                    // slot, and no other producer claims the same sequence.
-                    unsafe { self.shared.buffer.write(current, value) };
-
-                    // Publish: set the generation flag so consumers know this slot
-                    // is ready. Release ordering ensures consumers see the written
-                    // data before the flag.
-                    let idx = (current & self.shared.buffer.mask) as usize;
-                    let generation = (current >> self.shared.shift) as i32;
-                    available[idx].store(generation, Ordering::Release);
-
-                    return Ok(current);
-                }
-                Err(_) => {
-                    // CAS failed — another producer got there first.
-                    // Hint to the CPU before retrying to reduce contention.
-                    std::hint::spin_loop();
-                }
-            }
-        }
-    }
-
-    /// Publish a value, spinning until space is available.
-    pub fn publish(&self, value: T) -> u64 {
-        loop {
-            match self.try_publish(value) {
-                Ok(seq) => return seq,
-                Err(Full) => std::hint::spin_loop(),
-            }
-        }
     }
 }
 
@@ -470,7 +304,7 @@ impl<T: Copy + Default> Consumer<T> {
     /// Returns the number of entries read (up to `max` and `buf.len()`).
     pub fn read_batch(&mut self, buf: &mut [T], max: usize) -> usize {
         // Always re-read dependency for batch operations.
-        self.cached_dep = self.dependency.load(self.next_read);
+        self.cached_dep = self.dependency.load();
         let available = self.cached_dep.saturating_sub(self.next_read);
         if available == 0 {
             return 0;
@@ -520,7 +354,7 @@ impl<T: Copy + Default> Consumer<T> {
     /// lock-step so downstream gates (and the producer's backpressure
     /// check) see a consistent up-to-date cursor.
     pub fn skip_to_dependency(&mut self) {
-        let dep = self.dependency.load(self.next_read);
+        let dep = self.dependency.load();
         self.next_read = dep;
         self.cached_dep = dep;
         self.processed.get().store(dep, Ordering::Release);
@@ -552,7 +386,7 @@ impl<T: Copy + Default> Consumer<T> {
         }
 
         // Slow path: re-read dependency.
-        self.cached_dep = self.dependency.load(self.next_read);
+        self.cached_dep = self.dependency.load();
 
         self.cached_dep.saturating_sub(self.next_read)
     }
@@ -573,8 +407,6 @@ impl<T: Copy + Default> DisruptorBuilder<T> {
         let shared = Arc::new(Shared {
             buffer: RingBuffer::new(capacity),
             cursor: CachePadded::new(AtomicU64::new(0)),
-            available: None,
-            shift: 0,
         });
 
         Self {
@@ -645,49 +477,6 @@ impl<T: Copy + Default> DisruptorBuilder<T> {
             shared: Arc::clone(&self.shared),
             gates,
             cached_gate_min: 0,
-        };
-
-        (producer, consumers)
-    }
-
-    /// Build a multi-producer disruptor. Returns `(MultiProducer, Vec<Consumer>)`.
-    ///
-    /// The `MultiProducer` is `Clone + Send + Sync` — each writer thread gets
-    /// its own clone. No external synchronization (mutex) is needed.
-    ///
-    /// Internally allocates a per-slot generation flag array for consumer
-    /// visibility tracking. With 1M slots at 4 bytes each, this is ~4 MiB.
-    pub fn build_multi_producer(self) -> (MultiProducer<T>, Vec<Consumer<T>>) {
-        // Rebuild shared with available buffer.
-        let capacity = (self.shared.buffer.mask + 1) as usize;
-        let shift = capacity.trailing_zeros();
-
-        // Initialize all flags to -1 (never published).
-        let available: Box<[AtomicI32]> = (0..capacity)
-            .map(|_| AtomicI32::new(-1))
-            .collect::<Vec<_>>()
-            .into_boxed_slice();
-
-        let shared = Arc::new(Shared {
-            buffer: RingBuffer::new(capacity),
-            cursor: CachePadded::new(AtomicU64::new(0)),
-            available: Some(available),
-            shift,
-        });
-
-        // Re-create builder state with the new shared.
-        let builder = Self {
-            shared: Arc::clone(&shared),
-            consumers: self.consumers,
-        };
-
-        let gates = builder.collect_gates();
-        let consumers =
-            builder.build_consumers(|| DependencyKind::MultiProducer(Arc::clone(&shared)));
-
-        let producer = MultiProducer {
-            shared,
-            gates: gates.into(),
         };
 
         (producer, consumers)
@@ -919,247 +708,5 @@ mod tests {
         assert_eq!(producer.publish(1), 0);
         assert_eq!(producer.publish(2), 1);
         assert_eq!(producer.publish(3), 2);
-    }
-
-    // --- Multi-producer tests ---
-
-    #[test]
-    fn multi_producer_basic_publish_consume() {
-        let (producer, mut consumers) = DisruptorBuilder::<u64>::new(8)
-            .add_consumer()
-            .build_multi_producer();
-
-        assert_eq!(producer.try_publish(10).unwrap(), 0);
-        assert_eq!(producer.try_publish(20).unwrap(), 1);
-        assert_eq!(producer.try_publish(30).unwrap(), 2);
-
-        let c = &mut consumers[0];
-        assert_eq!(c.try_consume(), Some((0, 10)));
-        assert_eq!(c.try_consume(), Some((1, 20)));
-        assert_eq!(c.try_consume(), Some((2, 30)));
-        assert_eq!(c.try_consume(), None);
-    }
-
-    #[test]
-    fn multi_producer_cursor_reader() {
-        let (producer, _consumers) = DisruptorBuilder::<u64>::new(8)
-            .add_consumer()
-            .build_multi_producer();
-
-        let cursor = producer.cursor_reader();
-        assert_eq!(cursor.load(), 0);
-
-        producer.try_publish(10).unwrap();
-        producer.try_publish(20).unwrap();
-        producer.try_publish(30).unwrap();
-        assert_eq!(cursor.load(), 3);
-    }
-
-    #[test]
-    fn multi_producer_full_buffer() {
-        let (producer, mut consumers) = DisruptorBuilder::<u64>::new(4)
-            .add_consumer()
-            .build_multi_producer();
-
-        for i in 0..4 {
-            assert!(producer.try_publish(i).is_ok());
-        }
-        assert_eq!(producer.try_publish(99), Err(Full));
-
-        consumers[0].try_consume();
-        assert!(producer.try_publish(99).is_ok());
-    }
-
-    #[test]
-    fn multi_producer_wrap_around() {
-        let (producer, mut consumers) = DisruptorBuilder::<u64>::new(4)
-            .add_consumer()
-            .build_multi_producer();
-
-        for i in 0..20u64 {
-            producer.publish(i);
-            let (seq, val) = consumers[0].try_consume().unwrap();
-            assert_eq!(seq, i);
-            assert_eq!(val, i);
-        }
-    }
-
-    #[test]
-    fn multi_producer_batch_consume() {
-        let (producer, mut consumers) = DisruptorBuilder::<u64>::new(16)
-            .add_consumer()
-            .build_multi_producer();
-
-        for i in 0..10u64 {
-            producer.publish(i * 100);
-        }
-
-        let mut buf = [0u64; 32];
-        let count = consumers[0].consume_batch(&mut buf, 32);
-        assert_eq!(count, 10);
-        for (i, item) in buf.iter().enumerate().take(10) {
-            assert_eq!(*item, i as u64 * 100);
-        }
-    }
-
-    #[test]
-    fn multi_producer_concurrent_two_producers() {
-        let (producer, mut consumers) = DisruptorBuilder::<u64>::new(1024)
-            .add_consumer()
-            .build_multi_producer();
-
-        let count_per_producer = 5_000u64;
-        let total = count_per_producer * 2;
-
-        let mut consumer = consumers.pop().unwrap();
-
-        let p1 = producer.clone();
-        let p2 = producer;
-
-        // Producer 1: publishes odd values (1, 3, 5, ...)
-        let t1 = std::thread::spawn(move || {
-            for i in 0..count_per_producer {
-                p1.publish(i * 2 + 1);
-            }
-        });
-
-        // Producer 2: publishes even values (0, 2, 4, ...)
-        let t2 = std::thread::spawn(move || {
-            for i in 0..count_per_producer {
-                p2.publish(i * 2);
-            }
-        });
-
-        // Consumer: collect all values.
-        let mut received = Vec::with_capacity(total as usize);
-        loop {
-            if let Some((_, val)) = consumer.try_consume() {
-                received.push(val);
-                if received.len() == total as usize {
-                    break;
-                }
-            } else {
-                std::hint::spin_loop();
-            }
-        }
-
-        t1.join().unwrap();
-        t2.join().unwrap();
-
-        // All values should be present (order may vary due to concurrent publishing).
-        assert_eq!(received.len(), total as usize);
-        received.sort();
-        for (i, val) in received.iter().enumerate() {
-            assert_eq!(*val, i as u64);
-        }
-    }
-
-    #[test]
-    fn multi_producer_concurrent_many_producers() {
-        let num_producers = 8;
-        let count_per_producer = 1_000u64;
-        let total = count_per_producer * num_producers as u64;
-
-        let (producer, mut consumers) = DisruptorBuilder::<u64>::new(4096)
-            .add_consumer()
-            .build_multi_producer();
-
-        let mut consumer = consumers.pop().unwrap();
-
-        let handles: Vec<_> = (0..num_producers)
-            .map(|p| {
-                let prod = producer.clone();
-                let offset = p as u64 * count_per_producer;
-                std::thread::spawn(move || {
-                    for i in 0..count_per_producer {
-                        prod.publish(offset + i);
-                    }
-                })
-            })
-            .collect();
-
-        let mut received = Vec::with_capacity(total as usize);
-        loop {
-            if let Some((_, val)) = consumer.try_consume() {
-                received.push(val);
-                if received.len() == total as usize {
-                    break;
-                }
-            } else {
-                std::hint::spin_loop();
-            }
-        }
-
-        for h in handles {
-            h.join().unwrap();
-        }
-
-        assert_eq!(received.len(), total as usize);
-        received.sort();
-        for (i, val) in received.iter().enumerate() {
-            assert_eq!(*val, i as u64);
-        }
-    }
-
-    #[test]
-    fn multi_producer_two_parallel_consumers() {
-        let (producer, mut consumers) = DisruptorBuilder::<u64>::new(1024)
-            .add_consumer()
-            .add_consumer()
-            .build_multi_producer();
-
-        let count = 5_000u64;
-
-        let mut c1 = consumers.pop().unwrap();
-        let mut c0 = consumers.pop().unwrap();
-
-        let t0 = std::thread::spawn(move || {
-            let mut sum = 0u64;
-            for _ in 0..count {
-                loop {
-                    if let Some((_, val)) = c0.try_consume() {
-                        sum += val;
-                        break;
-                    }
-                    std::hint::spin_loop();
-                }
-            }
-            sum
-        });
-
-        let t1 = std::thread::spawn(move || {
-            let mut sum = 0u64;
-            for _ in 0..count {
-                loop {
-                    if let Some((_, val)) = c1.try_consume() {
-                        sum += val;
-                        break;
-                    }
-                    std::hint::spin_loop();
-                }
-            }
-            sum
-        });
-
-        // Two producers publish concurrently.
-        let p1 = producer.clone();
-        let p2 = producer;
-        let pt1 = std::thread::spawn(move || {
-            for i in 0..count / 2 {
-                p1.publish(i);
-            }
-        });
-        let pt2 = std::thread::spawn(move || {
-            for i in count / 2..count {
-                p2.publish(i);
-            }
-        });
-
-        pt1.join().unwrap();
-        pt2.join().unwrap();
-
-        let expected: u64 = (0..count).sum();
-        assert_eq!(t0.join().unwrap(), expected);
-        assert_eq!(t1.join().unwrap(), expected);
     }
 }
