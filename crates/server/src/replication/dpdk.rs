@@ -832,6 +832,22 @@ pub fn run_receiver_dpdk(
             "connecting to primary as replica (DPDK)"
         );
 
+        // Seed the primary's MAC into smoltcp's neighbor cache. Without
+        // this, smoltcp emits a broadcast ARP on connect which the SR-IOV
+        // PF silently drops, and the SYN never goes out — the replica
+        // spins on "failed to connect (DPDK)" forever. VF MACs follow the
+        // 02:00:<IP-bytes> convention set by dpdk-setup-sriov.sh, matching
+        // what the bench client does on its outbound connect.
+        let primary_mac = [
+            0x02,
+            0x00,
+            primary_ip.octets()[0],
+            primary_ip.octets()[1],
+            primary_ip.octets()[2],
+            primary_ip.octets()[3],
+        ];
+        transport.seed_neighbor(primary_ip, primary_mac);
+
         // Connect to primary via smoltcp.
         let handle = transport.connect_to(primary_ip, primary_port, local_port);
         local_port = local_port.wrapping_add(1).max(40000);
