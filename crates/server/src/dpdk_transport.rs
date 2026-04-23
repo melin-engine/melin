@@ -155,11 +155,6 @@ pub fn run_dpdk_poll(
     // state watermark and stays there.
     let mut conn_range_end: usize = 0;
 
-    // Batch buffer for disruptor publish — accumulate decoded events from
-    // all connections, then publish in a tight loop. Reduces interleaving
-    // between smoltcp/parsing and ring buffer operations.
-    let mut publish_batch: Vec<InputSlot> = Vec::with_capacity(256);
-
     // Pre-allocated parse buffer pool. Avoids heap allocation on accept
     // by recycling buffers from disconnected connections.
     let mut parse_buf_pool: Vec<Vec<u8>> = (0..256)
@@ -466,7 +461,7 @@ pub fn run_dpdk_poll(
                     process_trading_frames(
                         conn,
                         &mut transport,
-                        &mut publish_batch,
+                        &mut producer,
                         &control_tx,
                         &mut id_to_handle,
                         *batch_wall_ns.get_or_insert_with(wall_clock_nanos),
@@ -478,14 +473,6 @@ pub fn run_dpdk_poll(
             if was_waiting && matches!(conn.auth, AuthState::Authenticated { .. }) {
                 active_connections.fetch_add(1, Ordering::Relaxed);
             }
-        }
-
-        // 5. Flush accumulated events to the disruptor in a tight loop.
-        // Publishing separately from parsing improves cache locality —
-        // all ring buffer writes happen together without interleaving
-        // with smoltcp/codec operations.
-        for slot in publish_batch.drain(..) {
-            producer.publish(slot);
         }
     }
 }
@@ -657,15 +644,19 @@ fn send_auth_failed(conn: &ConnectionState, transport: &mut DpdkTransport) {
 ///
 /// Uses a cursor to avoid O(n) drain/memmove on every frame. The buffer
 /// is compacted once after all frames in this batch are processed.
-/// Extract trading frames from `conn.parse_buf` and append decoded
-/// `InputSlot`s to `batch` for bulk publish. `batch_wall_ns` is
+/// Extract trading frames from `conn.parse_buf` and publish decoded
+/// `InputSlot`s directly into the disruptor. `batch_wall_ns` is
 /// captured once per outer poll iteration by the caller; all
 /// non-query requests stamped in this call share it, sparing a
 /// per-request `clock_gettime(CLOCK_REALTIME)` on the hot path.
+///
+/// Uses `Producer::publish_with` to construct each slot in place —
+/// perf showed the prior stack→Vec→ring double-copy of ~112-byte
+/// InputSlots dominated ingest-core cycles (~35% SSE moves).
 fn process_trading_frames(
     conn: &mut ConnectionState,
     transport: &mut DpdkTransport,
-    batch: &mut Vec<InputSlot>,
+    producer: &mut ring::Producer<InputSlot>,
     control_tx: &mpsc::Sender<ControlEvent>,
     id_to_handle: &mut FxHashMap<u64, SocketHandle>,
     batch_wall_ns: u64,
@@ -714,16 +705,19 @@ fn process_trading_frames(
                     } else {
                         batch_wall_ns
                     };
-                    batch.push(InputSlot {
-                        connection_id: conn.connection_id.0,
-                        key_hash: conn.key_hash,
-                        request_seq: seq,
-                        sequence: 0,
-                        timestamp_ns: ts,
-                        event,
-                        #[allow(clippy::let_unit_value)]
-                        publish_ts: trace_ts(),
-                        recv_ts,
+                    let connection_id = conn.connection_id.0;
+                    let key_hash = conn.key_hash;
+                    #[allow(clippy::let_unit_value)]
+                    let publish_ts = trace_ts();
+                    producer.publish_with(|slot| {
+                        slot.connection_id = connection_id;
+                        slot.key_hash = key_hash;
+                        slot.request_seq = seq;
+                        slot.sequence = 0;
+                        slot.timestamp_ns = ts;
+                        slot.event = event;
+                        slot.publish_ts = publish_ts;
+                        slot.recv_ts = recv_ts;
                     });
                 }
             }
