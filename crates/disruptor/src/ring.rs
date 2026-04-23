@@ -187,6 +187,38 @@ impl<T: Copy + Default> Producer<T> {
         }
     }
 
+    /// Try to publish by filling the next slot in place. Returns `Err(Full)`
+    /// if backpressured — the closure is **not** called in that case.
+    ///
+    /// Zero-copy equivalent of `try_publish`. See [`publish_with`] for the
+    /// blocking variant's rationale on eliminating per-publish memcpy.
+    pub fn try_publish_with<F: FnOnce(&mut T)>(&mut self, f: F) -> Result<u64, Full> {
+        let seq = self.shared.cursor.get().load(Ordering::Relaxed);
+        let capacity = self.shared.buffer.mask + 1;
+
+        if seq - self.cached_gate_min >= capacity {
+            let mut min = u64::MAX;
+            for gate in &self.gates {
+                let g = gate.get().load(Ordering::Acquire);
+                if g < min {
+                    min = g;
+                }
+            }
+            self.cached_gate_min = min;
+            if seq - min >= capacity {
+                return Err(Full);
+            }
+        }
+
+        // Safety: backpressure check confirmed no consumer is reading this
+        // slot; single-producer → no concurrent writer.
+        let slot = unsafe { self.shared.buffer.slot_mut(seq) };
+        f(slot);
+        // Release: consumers see the slot writes before the cursor.
+        self.shared.cursor.get().store(seq + 1, Ordering::Release);
+        Ok(seq)
+    }
+
     /// Publish by filling the next slot in place. Spins until space is
     /// available, then runs `f(&mut slot)` directly on the ring entry —
     /// avoiding the byte-copy `publish`/`try_publish` perform when given
