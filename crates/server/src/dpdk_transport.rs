@@ -300,8 +300,10 @@ pub fn run_dpdk_poll(
         // One wall-clock read per outer poll iteration, reused for
         // every request stamped in this pass. Sub-microsecond precision
         // loss at DPDK poll rates; order timestamps are for reporting,
-        // not matching (the engine orders by sequence).
-        let batch_wall_ns = wall_clock_nanos();
+        // not matching (the engine orders by sequence). Deferred until
+        // we actually stamp a frame — `clock_gettime` dominates the
+        // profile on idle polls with no traffic.
+        let mut batch_wall_ns: Option<u64> = None;
 
         for (conn_idx, &handle) in handle_buf.iter().enumerate() {
             if conn_idx > 0 && conn_idx % POLL_EVERY_N_CONNS == 0 {
@@ -419,7 +421,7 @@ pub fn run_dpdk_poll(
                         &mut publish_batch,
                         &control_tx,
                         &mut id_to_handle,
-                        batch_wall_ns,
+                        *batch_wall_ns.get_or_insert_with(wall_clock_nanos),
                     );
                 }
             }

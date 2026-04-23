@@ -231,7 +231,10 @@ impl DpdkDevice {
         let mut mbufs = std::mem::take(&mut self.batch_mbufs);
         mbufs.clear();
 
-        let now = std::time::Instant::now();
+        // Clock read for MAC-learning throttle, deferred until we actually
+        // see an IPv4 frame. Idle polls (no RX) skip the read entirely —
+        // `clock_gettime` otherwise dominates the poll core under low load.
+        let mut now: Option<std::time::Instant> = None;
 
         for port in &mut self.rx_ports {
             // SAFETY: port is started, rx_buf is correctly sized.
@@ -267,6 +270,7 @@ impl DpdkDevice {
                         // neighbor cache expiry (~60s) but long enough to
                         // avoid injecting ARP replies on every packet.
                         const RESEED_SECS: u64 = 30;
+                        let now = *now.get_or_insert_with(std::time::Instant::now);
                         let needs_seed = match self.known_neighbors.get_mut(&src_ip) {
                             Some(last) => {
                                 if now.duration_since(*last).as_secs() >= RESEED_SECS {
