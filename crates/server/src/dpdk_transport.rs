@@ -142,8 +142,13 @@ pub fn run_dpdk_poll(
     // between smoltcp/parsing and ring buffer operations.
     let mut publish_batch: Vec<InputSlot> = Vec::with_capacity(256);
 
-    // Reusable handle buffer to avoid per-poll allocation.
+    // Reusable handle buffer. Rebuilt from `connections.keys()` only when
+    // the connection set changes; steady-state polls just iterate the
+    // cached copy. Iterating a 256-capacity HashMap's keys per poll (via
+    // SIMD group scan) showed up as a chunk of run_dpdk_poll self-time
+    // once the clock reads were out of the way.
     let mut handle_buf: Vec<SocketHandle> = Vec::with_capacity(256);
+    let mut handle_buf_dirty = true;
 
     // Pre-allocated parse buffer pool. Avoids heap allocation on accept
     // by recycling buffers from disconnected connections.
@@ -269,6 +274,7 @@ pub fn run_dpdk_poll(
                     last_activity: Instant::now(),
                 },
             );
+            handle_buf_dirty = true;
         }
 
         // 3. Drain TX frames from the response stage into smoltcp sockets.
@@ -291,6 +297,7 @@ pub fn run_dpdk_poll(
                 if let Some(mut removed) = connections.remove(&handle) {
                     removed.parse_buf.clear();
                     parse_buf_pool.push(removed.parse_buf);
+                    handle_buf_dirty = true;
                 }
             }
         }
@@ -301,8 +308,15 @@ pub fn run_dpdk_poll(
         // the full connection iteration to complete.
         const POLL_EVERY_N_CONNS: usize = 4;
 
-        handle_buf.clear();
-        handle_buf.extend(connections.keys().copied());
+        // Rebuild only when the connection set changed. Stale entries
+        // are harmless — the per-connection `connections.get_mut` lookup
+        // short-circuits with `continue` if the handle is gone, so we
+        // just pay for an extra hash lookup until the next real change.
+        if handle_buf_dirty {
+            handle_buf.clear();
+            handle_buf.extend(connections.keys().copied());
+            handle_buf_dirty = false;
+        }
 
         // One wall-clock read per outer poll iteration, reused for
         // every request stamped in this pass. Sub-microsecond precision
@@ -339,6 +353,7 @@ pub fn run_dpdk_poll(
                 if let Some(mut removed) = connections.remove(&handle) {
                     removed.parse_buf.clear();
                     parse_buf_pool.push(removed.parse_buf);
+                    handle_buf_dirty = true;
                 }
                 continue;
             }
@@ -359,6 +374,7 @@ pub fn run_dpdk_poll(
                 if let Some(mut removed) = connections.remove(&handle) {
                     removed.parse_buf.clear();
                     parse_buf_pool.push(removed.parse_buf);
+                    handle_buf_dirty = true;
                 }
                 continue;
             }
@@ -386,6 +402,7 @@ pub fn run_dpdk_poll(
                     if let Some(mut removed) = connections.remove(&handle) {
                         removed.parse_buf.clear();
                         parse_buf_pool.push(removed.parse_buf);
+                        handle_buf_dirty = true;
                     }
                 }
                 // Check idle timeout when no data was received. Throttled
@@ -408,6 +425,7 @@ pub fn run_dpdk_poll(
                     if let Some(mut removed) = connections.remove(&handle) {
                         removed.parse_buf.clear();
                         parse_buf_pool.push(removed.parse_buf);
+                        handle_buf_dirty = true;
                     }
                 }
                 continue;
