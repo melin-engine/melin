@@ -295,6 +295,147 @@ impl<T: Copy + Default> Producer<T> {
     {
         Box::new(SharedCursor(Arc::clone(&self.shared)))
     }
+
+    /// Start a batch of in-place publishes. The returned [`Batch`] lets you
+    /// fill N ring slots and commit them with a single release store on the
+    /// cursor — amortising the per-publish cursor write that perf annotate
+    /// showed at ~9% of the DPDK ingress core's cycles.
+    ///
+    /// Consumers do not see any of the batched writes until [`Batch::commit`].
+    /// Dropping a batch without committing rolls back: the slots were written
+    /// but the cursor never advanced, so consumers gated on the cursor never
+    /// observe them. The next publish reuses the same slot indices.
+    pub fn batch(&mut self) -> Batch<'_, T> {
+        let start_seq = self.shared.cursor.get().load(Ordering::Relaxed);
+        Batch {
+            producer: self,
+            start_seq,
+            count: 0,
+        }
+    }
+}
+
+/// Handle for accumulating in-place publishes that commit with a single
+/// release store on the cursor. See [`Producer::batch`].
+///
+/// Drop without [`commit`] rolls back — no slots are published.
+pub struct Batch<'a, T: Copy + Default> {
+    producer: &'a mut Producer<T>,
+    start_seq: u64,
+    count: u64,
+}
+
+impl<'a, T: Copy + Default> Batch<'a, T> {
+    /// Try to write the next entry into the batch by filling the slot in
+    /// place. Returns `Err(Full)` without invoking the closure if the ring
+    /// cannot accommodate one more entry.
+    pub fn try_push_with<F: FnOnce(&mut T)>(&mut self, f: F) -> Result<u64, Full> {
+        let seq = self.start_seq + self.count;
+        let capacity = self.producer.shared.buffer.mask + 1;
+
+        if seq - self.producer.cached_gate_min >= capacity {
+            let mut min = u64::MAX;
+            for gate in &self.producer.gates {
+                let g = gate.get().load(Ordering::Acquire);
+                if g < min {
+                    min = g;
+                }
+            }
+            self.producer.cached_gate_min = min;
+            if seq - min >= capacity {
+                return Err(Full);
+            }
+        }
+
+        // Safety: backpressure check confirmed no consumer is reading this
+        // slot; single-producer → no concurrent writer.
+        let slot = unsafe { self.producer.shared.buffer.slot_mut(seq) };
+        f(slot);
+        self.count += 1;
+        Ok(seq)
+    }
+
+    /// Write the next entry, spinning if the ring is full. When the batch
+    /// fills the ring, commits the accumulated entries (single release
+    /// store), starts a fresh batch at the new cursor, then retries.
+    ///
+    /// Blocking equivalent of [`try_push_with`]. Matches [`Producer::publish_with`]
+    /// semantics — the caller never observes backpressure.
+    pub fn push_with<F: FnOnce(&mut T)>(&mut self, f: F) -> u64 {
+        let capacity = self.producer.shared.buffer.mask + 1;
+        loop {
+            let seq = self.start_seq + self.count;
+
+            if seq - self.producer.cached_gate_min < capacity {
+                // Space available — fill the slot in place.
+                // Safety: backpressure confirmed; single-producer → no concurrent writer.
+                let slot = unsafe { self.producer.shared.buffer.slot_mut(seq) };
+                f(slot);
+                self.count += 1;
+                return seq;
+            }
+
+            // Refresh gate sequences.
+            let mut min = u64::MAX;
+            for gate in &self.producer.gates {
+                let g = gate.get().load(Ordering::Acquire);
+                if g < min {
+                    min = g;
+                }
+            }
+            self.producer.cached_gate_min = min;
+            if seq - min < capacity {
+                continue;
+            }
+
+            // Commit accumulated writes so consumers can advance, then
+            // spin for space.
+            if self.count > 0 {
+                self.producer
+                    .shared
+                    .cursor
+                    .get()
+                    .store(self.start_seq + self.count, Ordering::Release);
+                self.start_seq += self.count;
+                self.count = 0;
+            }
+            std::hint::spin_loop();
+        }
+    }
+
+    /// Number of entries written into the batch so far.
+    pub fn len(&self) -> u64 {
+        self.count
+    }
+
+    /// True when no entries have been written yet.
+    pub fn is_empty(&self) -> bool {
+        self.count == 0
+    }
+
+    /// Commit the batch: advance the producer cursor by `len()` with a
+    /// single release store. All batched slot writes become visible to
+    /// consumers at this point.
+    pub fn commit(self) {
+        if self.count > 0 {
+            // Release: consumers see all batched slot writes before the cursor.
+            self.producer
+                .shared
+                .cursor
+                .get()
+                .store(self.start_seq + self.count, Ordering::Release);
+        }
+        // Skip Drop's rollback path — we just committed.
+        std::mem::forget(self);
+    }
+}
+
+impl<'a, T: Copy + Default> Drop for Batch<'a, T> {
+    fn drop(&mut self) {
+        // Rollback: cursor stays at start_seq. The slots we wrote contain
+        // stale data but consumers gated on the cursor cannot observe them.
+        // The next publish reuses those slot indices and overwrites.
+    }
 }
 
 /// Read-only handle to a disruptor producer cursor for monitoring.
@@ -776,6 +917,103 @@ mod tests {
         assert_eq!(consumers[0].try_consume(), Some((0, 111)));
         assert_eq!(consumers[0].try_consume(), Some((1, 222)));
         assert_eq!(consumers[0].try_consume(), Some((2, 333)));
+    }
+
+    #[test]
+    fn batch_commit_advances_cursor_once() {
+        let (mut producer, mut consumers) = DisruptorBuilder::<u64>::new(8).add_consumer().build();
+
+        // Consumer sees nothing before commit.
+        {
+            let mut batch = producer.batch();
+            for i in 0..4u64 {
+                batch.try_push_with(|slot| *slot = i * 10).unwrap();
+            }
+            assert_eq!(batch.len(), 4);
+            assert_eq!(consumers[0].try_consume(), None);
+            batch.commit();
+        }
+
+        // All four visible after commit.
+        for i in 0..4u64 {
+            assert_eq!(consumers[0].try_consume(), Some((i, i * 10)));
+        }
+        assert_eq!(consumers[0].try_consume(), None);
+    }
+
+    #[test]
+    fn batch_drop_without_commit_rolls_back() {
+        let (mut producer, mut consumers) = DisruptorBuilder::<u64>::new(8).add_consumer().build();
+
+        // Drop without commit: cursor should not advance.
+        {
+            let mut batch = producer.batch();
+            batch.try_push_with(|slot| *slot = 999).unwrap();
+            batch.try_push_with(|slot| *slot = 888).unwrap();
+            // implicit drop
+        }
+        assert_eq!(consumers[0].try_consume(), None);
+
+        // Next publish starts from seq 0 — reuses the rolled-back slots.
+        producer.publish_with(|slot| *slot = 42);
+        assert_eq!(consumers[0].try_consume(), Some((0, 42)));
+    }
+
+    #[test]
+    fn batch_push_with_blocks_then_auto_commits_on_full() {
+        let (mut producer, mut consumers) = DisruptorBuilder::<u64>::new(4).add_consumer().build();
+
+        // Fill the ring within a single batch (capacity = 4).
+        let mut batch = producer.batch();
+        for i in 0..4u64 {
+            batch.push_with(|slot| *slot = i);
+        }
+        // Consumer sees nothing yet — batch hasn't committed.
+        assert_eq!(consumers[0].try_consume(), None);
+
+        // A 5th push must auto-commit the batch + spin for space. Drain on a
+        // helper thread so the producer can resume.
+        let mut consumer = consumers.pop().unwrap();
+        let t = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            // Consumer drains four slots — now the batch's auto-commit has
+            // fired, and after draining the fifth push has space.
+            let mut drained = Vec::new();
+            while drained.len() < 4 {
+                if let Some((seq, val)) = consumer.try_consume() {
+                    drained.push((seq, val));
+                } else {
+                    std::hint::spin_loop();
+                }
+            }
+            (consumer, drained)
+        });
+
+        let seq = batch.push_with(|slot| *slot = 99);
+        assert_eq!(seq, 4);
+        batch.commit();
+
+        let (mut consumer, drained) = t.join().unwrap();
+        assert_eq!(drained, vec![(0, 0), (1, 1), (2, 2), (3, 3)]);
+        assert_eq!(consumer.try_consume(), Some((4, 99)));
+    }
+
+    #[test]
+    fn batch_respects_backpressure() {
+        let (mut producer, mut consumers) = DisruptorBuilder::<u64>::new(4).add_consumer().build();
+
+        // Pre-fill the ring to capacity without consuming.
+        for i in 0..4u64 {
+            producer.publish(i);
+        }
+
+        // Batch cannot claim any more slots — consumer is fully behind.
+        let mut batch = producer.batch();
+        assert_eq!(batch.try_push_with(|slot| *slot = 99), Err(Full));
+
+        // After consumer drains one slot, batch can claim one.
+        consumers[0].try_consume();
+        assert!(batch.try_push_with(|slot| *slot = 99).is_ok());
     }
 
     #[test]

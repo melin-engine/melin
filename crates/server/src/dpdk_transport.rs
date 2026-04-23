@@ -325,6 +325,13 @@ pub fn run_dpdk_poll(
         slow_check_counter = slow_check_counter.wrapping_add(1);
         let do_slow_checks = slow_check_counter.is_multiple_of(SLOW_CHECK_INTERVAL);
 
+        // Batch all trading-frame publishes from this outer poll iteration
+        // into a single disruptor cursor release. Perf annotate showed the
+        // per-publish release store at ~9% of this core's cycles; one
+        // store per outer iteration (covering all decoded events across
+        // all connections) amortises that cost.
+        let mut batch = producer.batch();
+
         // Counts occupied slots we actually process, to drive the
         // mid-iteration `transport.poll()` cadence.
         let mut active_idx: usize = 0;
@@ -461,7 +468,7 @@ pub fn run_dpdk_poll(
                     process_trading_frames(
                         conn,
                         &mut transport,
-                        &mut producer,
+                        &mut batch,
                         &control_tx,
                         &mut id_to_handle,
                         *batch_wall_ns.get_or_insert_with(wall_clock_nanos),
@@ -474,6 +481,10 @@ pub fn run_dpdk_poll(
                 active_connections.fetch_add(1, Ordering::Relaxed);
             }
         }
+
+        // Single release store advances the producer cursor by all events
+        // batched across this outer poll iteration.
+        batch.commit();
     }
 }
 
@@ -645,18 +656,19 @@ fn send_auth_failed(conn: &ConnectionState, transport: &mut DpdkTransport) {
 /// Uses a cursor to avoid O(n) drain/memmove on every frame. The buffer
 /// is compacted once after all frames in this batch are processed.
 /// Extract trading frames from `conn.parse_buf` and publish decoded
-/// `InputSlot`s directly into the disruptor. `batch_wall_ns` is
+/// `InputSlot`s directly into the disruptor batch. `batch_wall_ns` is
 /// captured once per outer poll iteration by the caller; all
 /// non-query requests stamped in this call share it, sparing a
 /// per-request `clock_gettime(CLOCK_REALTIME)` on the hot path.
 ///
-/// Uses `Producer::publish_with` to construct each slot in place —
-/// perf showed the prior stack→Vec→ring double-copy of ~112-byte
-/// InputSlots dominated ingest-core cycles (~35% SSE moves).
+/// Uses `Batch::push_with` so all events from all connections committed
+/// in this outer iteration advance the producer cursor with a single
+/// release store — amortising the ~9% ingress-core cost perf annotate
+/// pinned on the per-publish cursor write.
 fn process_trading_frames(
     conn: &mut ConnectionState,
     transport: &mut DpdkTransport,
-    producer: &mut ring::Producer<InputSlot>,
+    batch: &mut ring::Batch<'_, InputSlot>,
     control_tx: &mpsc::Sender<ControlEvent>,
     id_to_handle: &mut FxHashMap<u64, SocketHandle>,
     batch_wall_ns: u64,
@@ -709,7 +721,7 @@ fn process_trading_frames(
                     let key_hash = conn.key_hash;
                     #[allow(clippy::let_unit_value)]
                     let publish_ts = trace_ts();
-                    producer.publish_with(|slot| {
+                    batch.push_with(|slot| {
                         slot.connection_id = connection_id;
                         slot.key_hash = key_hash;
                         slot.request_seq = seq;
