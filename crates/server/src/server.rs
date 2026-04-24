@@ -495,6 +495,7 @@ pub fn run_with_shutdown<L: BlockingTransportListener>(
             config.shadow_snapshot_path(),
             config.cores,
             config.async_replica_ack,
+            !config.yield_idle,
         )? {
             None => return Ok(()), // clean shutdown
             Some((mut exchange, writer)) => {

@@ -86,6 +86,7 @@ fn replica_stream_uring(
     shutdown: &AtomicBool,
     promote: &AtomicBool,
     async_ack: bool,
+    busy_spin: bool,
 ) -> SessionExit {
     use io_uring::{IoUring, opcode, types};
     use std::os::unix::io::AsRawFd;
@@ -663,8 +664,12 @@ fn replica_stream_uring(
         }
 
         // --- Idle wait ---
+        // With busy_spin, never yield: every ack round-trip to the primary
+        // sits in the critical path for that primary's response gate, so
+        // even one scheduler tick of wake-up latency (~1ms on stock Linux)
+        // shows up directly as extra p99/p99.9 on client responses.
         if !any_cqe {
-            if idle_spins < 1000 {
+            if busy_spin || idle_spins < 1000 {
                 idle_spins = idle_spins.wrapping_add(1);
                 std::hint::spin_loop();
             } else {
@@ -714,6 +719,7 @@ pub fn run_receiver(
     snapshot_path: std::path::PathBuf,
     cores: crate::server::PipelineCores,
     async_ack: bool,
+    busy_spin: bool,
 ) -> ReceiverResult {
     use crate::App;
     use crate::JournalWriter;
@@ -1023,8 +1029,8 @@ pub fn run_receiver(
         let pipeline = melin_transport_core::pipeline::build_replica_pipeline(
             cur_exchange,
             cur_writer,
-            4096,  // max_journal_batch
-            false, // don't busy-spin on replica
+            4096, // max_journal_batch
+            busy_spin,
             enable_shadow,
         );
         let mut input_producer = pipeline.input_producer;
@@ -1073,7 +1079,11 @@ pub fn run_receiver(
                     }
                     let count = consumer.consume_batch(&mut batch, 256);
                     if count == 0 {
-                        std::thread::yield_now();
+                        if busy_spin {
+                            std::hint::spin_loop();
+                        } else {
+                            std::thread::yield_now();
+                        }
                     }
                 }
             })
@@ -1125,6 +1135,7 @@ pub fn run_receiver(
             shutdown,
             promote,
             async_ack,
+            busy_spin,
         );
 
         // --- Common teardown (all exit paths) ---
