@@ -12,7 +12,7 @@
 #     dpdk-dual-repl  DPDK + 2 synchronous replicas (e2e DPDK)
 #
 #   Workloads (what the bench runs):
-#     throughput      Peak throughput — 100M pairs, 16 clients, window 256
+#     throughput      Peak throughput — 100M pairs, 16 clients, window 128
 #     single          Single-order latency — 500K pairs, 1 client, window 1
 #     engine-only     Matching engine only — no journal, no network (local)
 #     pipeline-only   Journal + matching — no network (local)
@@ -42,7 +42,7 @@
 #   RUN_PLOTS=0|1       Generate plots from results (default: 0)
 #   THROUGHPUT_ORDERS=N     Orders for throughput workload (default: 100000000)
 #   THROUGHPUT_CLIENTS=N   Clients for throughput workload (default: 16)
-#   THROUGHPUT_WINDOW=N    Window for throughput workload (default: 256)
+#   THROUGHPUT_WINDOW=N    Window for throughput workload (default: 128)
 #   BENCH_THREADS=N        Number of bench client io_uring threads (default: bench default)
 #   SKIP_JOURNAL_VERIFY=1  Skip post-run journal consistency check (default: 0)
 #   SINGLE_ORDERS=N        Orders for single-order workload (default: 500000)
@@ -161,7 +161,7 @@ BENCH_RUST_LOG="${RUST_LOG:-info}"
 # Order counts — override for quick smoke tests.
 THROUGHPUT_ORDERS="${THROUGHPUT_ORDERS:-100000000}"
 THROUGHPUT_CLIENTS="${THROUGHPUT_CLIENTS:-16}"
-THROUGHPUT_WINDOW="${THROUGHPUT_WINDOW:-256}"
+THROUGHPUT_WINDOW="${THROUGHPUT_WINDOW:-128}"
 SINGLE_ORDERS="${SINGLE_ORDERS:-500000}"
 WARMUP_ORDERS="${WARMUP_ORDERS:-}"  # empty = bench default (100000)
 ORDERS_PER_SWEEP="${ORDERS_PER_SWEEP:-10000000}"
