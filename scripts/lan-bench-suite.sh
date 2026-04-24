@@ -81,11 +81,14 @@
 #                       perf.data are copied to ${RESULTS_DIR}. Defaults:
 #                       core 4, settle 15s after server start, record 30s.
 #                       Override with PERF_CORE, PERF_SETTLE, PERF_SECS.
-#   PERF_TARGET=...     Which side(s) to capture: `server` (default), `bench`,
-#                       or `both`. Bench-side capture targets the DPDK poll
-#                       core (default ${BENCH_DPDK_CORE:-7}); override with
-#                       PERF_BENCH_CORE. Useful for profiling the bench
-#                       client's DPDK poll loop.
+#   PERF_TARGET=...     Which side(s) to capture: comma-separated list
+#                       from `server` (default), `bench`, `replica`,
+#                       `replica2`, or `both` (= server + bench).
+#                       Bench-side capture targets the DPDK poll core
+#                       (default ${BENCH_DPDK_CORE:-7}); override with
+#                       PERF_BENCH_CORE. Replica captures the reader
+#                       core (default 4); override with PERF_REPLICA_CORE
+#                       / PERF_REPLICA2_CORE.
 #
 # Special values:
 #   TRANSPORTS=all      All transports valid for the available infrastructure
@@ -939,10 +942,20 @@ _perf_start_on() {
     eval "PERF_${role^^}_DATA='${data_path}'"
     eval "PERF_${role^^}_REPORT='${report_path}'"
 
+    # core="all" → system-wide capture (perf record -a) instead of -C <n>.
+    # Useful when the interesting thread is unpinned or we don't know
+    # which core holds the hot path.
+    local perf_scope
+    if [[ "$core" == "all" ]]; then
+        perf_scope="-a"
+    else
+        perf_scope="-C ${core}"
+    fi
+
     echo "  perf(${role}): core=${core} settle=${settle}s record=${secs}s label=${label}"
     ssh $SSH_OPTS "$host" "rm -f ${data_path} ${report_path} /tmp/melin-perf-${role}.log; \
         nohup bash -c 'sleep ${settle} && \
-            perf record -C ${core} -g -F 997 -o ${data_path} -- sleep ${secs} 2>>/tmp/melin-perf-${role}.log && \
+            perf record ${perf_scope} -g -F 997 -o ${data_path} -- sleep ${secs} 2>>/tmp/melin-perf-${role}.log && \
             perf report -i ${data_path} --stdio --no-children -F overhead,sample,symbol 2>/dev/null \
                 | head -200 > ${report_path}; \
             touch ${report_path}.done' \
@@ -983,18 +996,35 @@ _perf_stop_on() {
     eval "PERF_${role^^}_LABEL=''"
 }
 
-# Public entry points. PERF_TARGET selects which side(s) to capture:
-#   server (default), bench, both.
+# Public entry points. PERF_TARGET selects which side(s) to capture
+# — a comma-separated list chosen from:
+#   server (default), bench, replica, replica2, both (= server + bench).
+# `replica` / `replica2` require the corresponding host args to have
+# been passed; otherwise they're silently skipped.
 perf_capture_start() {
     [[ "${PERF:-0}" != "1" ]] && return
     local label="$1"
     local target="${PERF_TARGET:-server}"
 
-    if [[ "$target" == "server" || "$target" == "both" ]]; then
+    _want_role() {
+        local role="$1"
+        [[ "$target" == "$role" ]] && return 0
+        [[ "$target" == "both" && ("$role" == "server" || "$role" == "bench") ]] && return 0
+        [[ ",${target}," == *,"$role",* ]] && return 0
+        return 1
+    }
+
+    if _want_role "server"; then
         _perf_start_on "server" "$SERVER" "$label" "${PERF_CORE:-4}"
     fi
-    if [[ "$target" == "bench" || "$target" == "both" ]]; then
+    if _want_role "bench"; then
         _perf_start_on "bench" "$BENCH" "$label" "${PERF_BENCH_CORE:-${BENCH_DPDK_CORE:-7}}"
+    fi
+    if _want_role "replica" && [[ -n "${REPLICA:-}" ]]; then
+        _perf_start_on "replica" "$REPLICA" "$label" "${PERF_REPLICA_CORE:-4}"
+    fi
+    if _want_role "replica2" && [[ -n "${REPLICA2:-}" ]]; then
+        _perf_start_on "replica2" "$REPLICA2" "$label" "${PERF_REPLICA2_CORE:-4}"
     fi
 }
 
@@ -1002,6 +1032,8 @@ perf_capture_stop() {
     [[ "${PERF:-0}" != "1" ]] && return
     _perf_stop_on "server"
     _perf_stop_on "bench"
+    _perf_stop_on "replica"
+    _perf_stop_on "replica2"
 }
 
 transport_start_dpdk() {
