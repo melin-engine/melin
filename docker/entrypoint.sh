@@ -78,10 +78,12 @@ lot_size_inverse = 1
 TOML
 echo "  oe-gateway.toml written (TRADER + BOT sessions)"
 
-# --- Write md-gateway config if not present ---
+# --- Write md-gateway config (always overwritten) ---
+# Same rationale as oe-gateway.toml above: regenerated every start so
+# schema/symbol changes from the image apply without the user having to
+# wipe $DATA_DIR.
 
-if [ ! -f "$DATA_DIR/md-gateway.toml" ]; then
-    cat > "$DATA_DIR/md-gateway.toml" <<TOML
+cat > "$DATA_DIR/md-gateway.toml" <<TOML
 listen = "0.0.0.0:9001"
 event_publisher = "127.0.0.1:9877"
 authorized_keys = "$DATA_DIR/authorized_keys"
@@ -102,8 +104,7 @@ lot_inverse = 1
 base_ccy = "ETH"
 quote_ccy = "USD"
 TOML
-    echo "  md-gateway.toml created"
-fi
+echo "  md-gateway.toml written"
 
 # --- Start processes ---
 
