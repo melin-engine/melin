@@ -591,21 +591,65 @@ fn panel<'a>(title: &'a str, items: &'a [String], empty: &'a str) -> Paragraph<'
     )
 }
 
+// --- Reconnect helpers --------------------------------------------------------
+
+/// Capped exponential backoff with jitter. Used by all three sessions when
+/// the gateway connection drops so they don't tight-loop reconnecting and
+/// don't all hammer the gateway in lockstep on a shared outage.
+///
+/// Schedule: 100 ms · 2^attempt, capped at 5 s, ±100 ms jitter. The cap is
+/// reached at attempt 6 (6 400 ms → clamped to 5 000 ms).
+fn backoff_delay(attempt: u32) -> Duration {
+    let base_ms = 100u64.saturating_mul(1u64 << attempt.min(6)).min(5_000);
+    // Sub-millisecond wall-clock noise → cheap jitter source. Avoids a
+    // PRNG dependency for what is purely tie-breaking between threads.
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.subsec_nanos() as u64)
+        .unwrap_or(0);
+    let jitter = (now % 200) as i64 - 100; // -100..=+99 ms
+    let total = (base_ms as i64 + jitter).max(50) as u64;
+    Duration::from_millis(total)
+}
+
 // --- MD session ---------------------------------------------------------------
 
+/// MD session entry point. Wraps `run_md_session_once` in a reconnect loop
+/// so a transient gateway disconnect (or a startup-time race) recovers
+/// without restarting the TUI.
 fn run_md_session(addr: &str, sender: &str, target: &str, tx: &Sender<UiMsg>) {
-    let send_err = |e: &dyn std::fmt::Display| {
-        let _ = tx.send(UiMsg::MdStatus(false, format!("MD: {e}")));
-    };
-    let _ = tx.send(UiMsg::Log(format!("[MD] connecting to {addr}…")));
-    let mut c = match FixClient::connect(addr, sender, target, 30) {
-        Ok(c) => c,
-        Err(e) => {
-            send_err(&e);
-            return;
+    let mut attempt: u32 = 0;
+    loop {
+        match run_md_session_once(addr, sender, target, tx) {
+            Ok(()) => return, // graceful shutdown — channel closed
+            Err(e) => {
+                let _ = tx.send(UiMsg::MdStatus(false, format!("MD: {e}")));
+                let _ = tx.send(UiMsg::Book(vec![], vec![]));
+                let delay = backoff_delay(attempt);
+                let _ = tx.send(UiMsg::Log(format!(
+                    "[MD] disconnected ({e}); reconnecting in {} ms (attempt {})",
+                    delay.as_millis(),
+                    attempt + 1,
+                )));
+                thread::sleep(delay);
+                attempt = attempt.saturating_add(1);
+            }
         }
-    };
-    let _ = tx.send(UiMsg::MdStatus(true, String::new()));
+    }
+}
+
+/// One MD session lifetime: connect, list securities, subscribe, snapshot loop.
+/// Returns `Ok(())` only on graceful shutdown (UI channel closed); any I/O
+/// error bubbles up to the reconnect loop.
+fn run_md_session_once(
+    addr: &str,
+    sender: &str,
+    target: &str,
+    tx: &Sender<UiMsg>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let _ = tx.send(UiMsg::Log(format!("[MD] connecting to {addr}…")));
+    let mut c = FixClient::connect(addr, sender, target, 30)?;
+    let _ = tx.send(UiMsg::MdStatus(true, "MD: connected".into()));
     let _ = tx.send(UiMsg::Log(
         "[MD] connected, sending SecurityListRequest".into(),
     ));
@@ -614,13 +658,10 @@ fn run_md_session(addr: &str, sender: &str, target: &str, tx: &Sender<UiMsg>) {
     let slr = FixMessageBuilder::new(tags::MSG_SECURITY_LIST_REQUEST)
         .str_tag(tags::SECURITY_REQ_ID, "SLR1")
         .str_tag(tags::SECURITY_LIST_REQUEST_TYPE, "0");
-    if let Err(e) = c.send_builder(slr) {
-        send_err(&e);
-        return;
-    }
+    c.send_builder(slr)?;
 
-    let symbols: Vec<String> = match c.recv() {
-        Ok(msg) if msg.msg_type() == tags::MSG_SECURITY_LIST => {
+    let symbols: Vec<String> = match c.recv()? {
+        msg if msg.msg_type() == tags::MSG_SECURITY_LIST => {
             let syms: Vec<String> = msg
                 .fields_iter()
                 .filter(|f| f.tag == tags::SYMBOL)
@@ -630,23 +671,16 @@ fn run_md_session(addr: &str, sender: &str, target: &str, tx: &Sender<UiMsg>) {
             let _ = tx.send(UiMsg::Log(format!("[MD] symbols: {}", syms.join(", "))));
             syms
         }
-        Ok(msg) => {
+        msg => {
             let mt = std::str::from_utf8(msg.msg_type()).unwrap_or("?");
             let _ = tx.send(UiMsg::Log(format!(
                 "[MD] unexpected response to SLR: 35={mt}"
             )));
             vec![]
         }
-        Err(e) => {
-            send_err(&e);
-            return;
-        }
     };
 
-    if let Err(e) = c.set_read_timeout(Some(Duration::from_millis(100))) {
-        send_err(&e);
-        return;
-    }
+    c.set_read_timeout(Some(Duration::from_millis(100)))?;
 
     // Periodically re-request snapshots (every 1s) since incremental
     // updates (X) aren't wired yet. This ensures the book display
@@ -664,32 +698,22 @@ fn run_md_session(addr: &str, sender: &str, target: &str, tx: &Sender<UiMsg>) {
                     .str_tag(tags::MARKET_DEPTH, "0")
                     .u64_tag(tags::NO_RELATED_SYM, 1)
                     .str_tag(tags::SYMBOL, sym);
-                if let Err(e) = c.send_builder(mdr) {
-                    send_err(&e);
-                    return;
-                }
+                c.send_builder(mdr)?;
             }
             last_request = Instant::now();
         }
-        match c.try_recv() {
-            Ok(Some(msg)) => {
-                let mt_str = std::str::from_utf8(msg.msg_type()).unwrap_or("?");
-                let _ = tx.send(UiMsg::Log(format!(
-                    "[MD<] 35={mt_str} 262={} entries={}",
-                    msg.get_str(tags::MD_REQ_ID).unwrap_or("-"),
-                    msg.get_str(tags::NO_MD_ENTRIES).unwrap_or("-"),
-                )));
-                if msg.msg_type() == tags::MSG_MD_SNAPSHOT {
-                    let (b, a) = parse_snapshot(&msg);
-                    if tx.send(UiMsg::Book(b, a)).is_err() {
-                        return;
-                    }
+        if let Some(msg) = c.try_recv()? {
+            let mt_str = std::str::from_utf8(msg.msg_type()).unwrap_or("?");
+            let _ = tx.send(UiMsg::Log(format!(
+                "[MD<] 35={mt_str} 262={} entries={}",
+                msg.get_str(tags::MD_REQ_ID).unwrap_or("-"),
+                msg.get_str(tags::NO_MD_ENTRIES).unwrap_or("-"),
+            )));
+            if msg.msg_type() == tags::MSG_MD_SNAPSHOT {
+                let (b, a) = parse_snapshot(&msg);
+                if tx.send(UiMsg::Book(b, a)).is_err() {
+                    return Ok(()); // UI thread gone — graceful exit
                 }
-            }
-            Ok(_) => {}
-            Err(e) => {
-                send_err(&e);
-                return;
             }
         }
     }
@@ -766,6 +790,9 @@ fn send_order_table(table: &OrderTable, tx: &Sender<UiMsg>) {
     let _ = tx.send(UiMsg::ActiveOrders(lines));
 }
 
+/// OE session entry point. Wraps `run_oe_session_once` in a reconnect loop
+/// and, while disconnected, drains pending `OrderCmd`s with a "disconnected
+/// — order dropped" ack so they don't fire all at once on reconnect.
 fn run_oe_session(
     addr: &str,
     sender: &str,
@@ -773,18 +800,55 @@ fn run_oe_session(
     tx: &Sender<UiMsg>,
     order_rx: &Receiver<OrderCmd>,
 ) {
-    let send_err = |e: &dyn std::fmt::Display| {
-        let _ = tx.send(UiMsg::OeStatus(false, format!("OE: {e}")));
-    };
-    let _ = tx.send(UiMsg::Log(format!("[OE] connecting to {addr}…")));
-    let mut c = match FixClient::connect(addr, sender, target, 30) {
-        Ok(c) => c,
-        Err(e) => {
-            send_err(&e);
-            return;
+    let mut attempt: u32 = 0;
+    loop {
+        match run_oe_session_once(addr, sender, target, tx, order_rx) {
+            Ok(()) => return, // graceful — UI gone
+            Err(e) => {
+                let _ = tx.send(UiMsg::OeStatus(false, format!("OE: {e}")));
+                let _ = tx.send(UiMsg::Balances(vec![]));
+                let _ = tx.send(UiMsg::ActiveOrders(vec![]));
+                let delay = backoff_delay(attempt);
+                let _ = tx.send(UiMsg::Log(format!(
+                    "[OE] disconnected ({e}); reconnecting in {} ms (attempt {})",
+                    delay.as_millis(),
+                    attempt + 1,
+                )));
+                drain_orders_with_reject(order_rx, tx, delay);
+                attempt = attempt.saturating_add(1);
+            }
         }
-    };
-    let _ = tx.send(UiMsg::OeStatus(true, String::new()));
+    }
+}
+
+/// While the OE is reconnecting, reject queued user orders rather than
+/// letting them pile up. Without this they would all fire at once when the
+/// new session is established, surprising the trader.
+fn drain_orders_with_reject(order_rx: &Receiver<OrderCmd>, tx: &Sender<UiMsg>, total: Duration) {
+    let deadline = Instant::now() + total;
+    while Instant::now() < deadline {
+        while let Ok(OrderCmd::NewOrder { clord_id, .. }) = order_rx.try_recv() {
+            let _ = tx.send(UiMsg::OrderAck(format!(
+                "{clord_id}: REJECTED — OE disconnected"
+            )));
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        thread::sleep(remaining.min(Duration::from_millis(50)));
+    }
+}
+
+/// One OE session lifetime: connect, mass-status + positions sync, then
+/// the request/response main loop.
+fn run_oe_session_once(
+    addr: &str,
+    sender: &str,
+    target: &str,
+    tx: &Sender<UiMsg>,
+    order_rx: &Receiver<OrderCmd>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let _ = tx.send(UiMsg::Log(format!("[OE] connecting to {addr}…")));
+    let mut c = FixClient::connect(addr, sender, target, 30)?;
+    let _ = tx.send(UiMsg::OeStatus(true, "OE: connected".into()));
     let _ = tx.send(UiMsg::Log("[OE] connected".into()));
 
     // --- One-time sync: mass status + positions ---
@@ -792,23 +856,14 @@ fn run_oe_session(
     let msr = FixMessageBuilder::new(tags::MSG_ORDER_MASS_STATUS_REQUEST)
         .str_tag(tags::MASS_STATUS_REQ_ID, "INIT")
         .str_tag(tags::MASS_STATUS_REQ_TYPE, "1");
-    if let Err(e) = c.send_builder(msr) {
-        send_err(&e);
-        return;
-    }
+    c.send_builder(msr)?;
     let pr = FixMessageBuilder::new(tags::MSG_REQUEST_FOR_POSITIONS)
         .str_tag(tags::POS_REQ_ID, "INIT")
         .str_tag(tags::POS_REQ_TYPE, "0")
         .str_tag(tags::ACCOUNT, "1");
-    if let Err(e) = c.send_builder(pr) {
-        send_err(&e);
-        return;
-    }
+    c.send_builder(pr)?;
 
-    if let Err(e) = c.set_read_timeout(Some(Duration::from_millis(100))) {
-        send_err(&e);
-        return;
-    }
+    c.set_read_timeout(Some(Duration::from_millis(100)))?;
 
     // Drain the initial mass status + position responses.
     let mut orders = OrderTable::new();
@@ -816,28 +871,21 @@ fn run_oe_session(
     let init_deadline = Instant::now() + Duration::from_secs(5);
     let mut got_positions = false;
     while Instant::now() < init_deadline && !(init_done && got_positions) {
-        match c.try_recv() {
-            Ok(Some(msg)) => {
-                if msg.msg_type() == tags::MSG_EXECUTION_REPORT
-                    && msg.get_str(tags::MASS_STATUS_REQ_ID).is_some()
+        if let Some(msg) = c.try_recv()? {
+            if msg.msg_type() == tags::MSG_EXECUTION_REPORT
+                && msg.get_str(tags::MASS_STATUS_REQ_ID).is_some()
+            {
+                if msg.get_str(tags::TOT_NUM_REPORTS) != Some("0")
+                    && let Some(o) = er_to_local_order(&msg)
                 {
-                    if msg.get_str(tags::TOT_NUM_REPORTS) != Some("0")
-                        && let Some(o) = er_to_local_order(&msg)
-                    {
-                        orders.insert(o.order_id.clone(), o);
-                    }
-                    if msg.get_str(tags::LAST_RPT_REQUESTED) == Some("Y") {
-                        init_done = true;
-                    }
-                } else if msg.msg_type() == tags::MSG_POSITION_REPORT {
-                    let _ = tx.send(UiMsg::Balances(parse_positions(&msg)));
-                    got_positions = true;
+                    orders.insert(o.order_id.clone(), o);
                 }
-            }
-            Ok(None) => {}
-            Err(e) => {
-                send_err(&e);
-                return;
+                if msg.get_str(tags::LAST_RPT_REQUESTED) == Some("Y") {
+                    init_done = true;
+                }
+            } else if msg.msg_type() == tags::MSG_POSITION_REPORT {
+                let _ = tx.send(UiMsg::Balances(parse_positions(&msg)));
+                got_positions = true;
             }
         }
     }
@@ -869,41 +917,31 @@ fn run_oe_session(
                         .str_tag(tags::ORDER_QTY, &qty)
                         .str_tag(tags::TIME_IN_FORCE, "1") // GTC
                         .str_tag(tags::ACCOUNT, "1");
-                    match c.send_builder(nos) {
-                        Ok(()) => {
-                            let side_str = if side == "1" { "BUY" } else { "SELL" };
-                            let _ = tx.send(UiMsg::Log(format!(
-                                "[OE] {clord_id}: {side_str} {qty}@{price} {symbol}"
-                            )));
-                        }
-                        Err(e) => {
-                            let _ = tx.send(UiMsg::OrderAck(format!("Send failed: {e}")));
-                        }
-                    }
+                    // Send errors here are fatal for this session — bubble
+                    // up so the reconnect loop reopens the connection
+                    // rather than silently dropping subsequent orders.
+                    c.send_builder(nos)?;
+                    let side_str = if side == "1" { "BUY" } else { "SELL" };
+                    let _ = tx.send(UiMsg::Log(format!(
+                        "[OE] {clord_id}: {side_str} {qty}@{price} {symbol}"
+                    )));
                 }
             }
         }
 
         // Read responses.
-        match c.try_recv() {
-            Ok(Some(msg)) => {
-                let mt = msg.msg_type();
-                if mt == tags::MSG_EXECUTION_REPORT {
-                    handle_exec_report(&msg, &mut orders, tx);
-                } else if mt == tags::MSG_POSITION_REPORT {
-                    let _ = tx.send(UiMsg::Balances(parse_positions(&msg)));
-                } else if mt == tags::MSG_ORDER_CANCEL_REJECT {
-                    let text = msg.get_str(tags::TEXT).unwrap_or("unknown");
-                    let clord = msg.get_str(tags::CL_ORD_ID).unwrap_or("?");
-                    let _ = tx.send(UiMsg::OrderAck(format!(
-                        "{clord}: CANCEL REJECTED ({text})"
-                    )));
-                }
-            }
-            Ok(None) => {}
-            Err(e) => {
-                send_err(&e);
-                return;
+        if let Some(msg) = c.try_recv()? {
+            let mt = msg.msg_type();
+            if mt == tags::MSG_EXECUTION_REPORT {
+                handle_exec_report(&msg, &mut orders, tx);
+            } else if mt == tags::MSG_POSITION_REPORT {
+                let _ = tx.send(UiMsg::Balances(parse_positions(&msg)));
+            } else if mt == tags::MSG_ORDER_CANCEL_REJECT {
+                let text = msg.get_str(tags::TEXT).unwrap_or("unknown");
+                let clord = msg.get_str(tags::CL_ORD_ID).unwrap_or("?");
+                let _ = tx.send(UiMsg::OrderAck(format!(
+                    "{clord}: CANCEL REJECTED ({text})"
+                )));
             }
         }
     }
@@ -1022,27 +1060,42 @@ fn parse_positions(msg: &FixMessage<'_>) -> Vec<String> {
 /// from the bot session are drained and discarded — the bot keeps no
 /// local order state.
 fn run_bot_session(addr: &str, sender: &str, target: &str, tx: &Sender<UiMsg>) {
-    let log_err = |e: &dyn std::fmt::Display| {
-        // Best-effort diagnostic — render thread may have exited.
-        let _ = tx.send(UiMsg::Log(format!("[BOT] error: {e}")));
-    };
+    let mut attempt: u32 = 0;
+    loop {
+        match run_bot_session_once(addr, sender, target, tx) {
+            Ok(()) => return, // graceful — UI gone
+            Err(e) => {
+                let delay = backoff_delay(attempt);
+                let _ = tx.send(UiMsg::Log(format!(
+                    "[BOT] disconnected ({e}); reconnecting in {} ms (attempt {})",
+                    delay.as_millis(),
+                    attempt + 1,
+                )));
+                thread::sleep(delay);
+                attempt = attempt.saturating_add(1);
+            }
+        }
+    }
+}
+
+/// One bot session lifetime: connect, then submit orders forever at the
+/// sine-wave rate. State (RNG, ClOrdID counter) resets on reconnect — the
+/// bot has no engine-side state to preserve, and the gateway hands out
+/// fresh OrderIDs regardless of ClOrdID reuse across sessions.
+fn run_bot_session_once(
+    addr: &str,
+    sender: &str,
+    target: &str,
+    tx: &Sender<UiMsg>,
+) -> Result<(), Box<dyn std::error::Error>> {
     let _ = tx.send(UiMsg::Log(format!(
         "[BOT] connecting to {addr} as {sender}…"
     )));
 
-    let mut c = match FixClient::connect(addr, sender, target, 30) {
-        Ok(c) => c,
-        Err(e) => {
-            log_err(&*e);
-            return;
-        }
-    };
+    let mut c = FixClient::connect(addr, sender, target, 30)?;
     // Short poll timeout: the bot only drains ERs opportunistically
     // between bursts, so it should not block reading when no data is in.
-    if let Err(e) = c.set_read_timeout(Some(Duration::from_millis(1))) {
-        log_err(&e);
-        return;
-    }
+    c.set_read_timeout(Some(Duration::from_millis(1)))?;
     let _ = tx.send(UiMsg::Log("[BOT] connected".into()));
 
     // rate(t) = MID + AMP · sin(2π · t / PERIOD). Peak 75 ord/s is well
@@ -1070,18 +1123,14 @@ fn run_bot_session(addr: &str, sender: &str, target: &str, tx: &Sender<UiMsg>) {
         next_clord_id += 1;
         let nos = bot::build_bot_nos(&clord, &order);
 
-        if let Err(e) = c.send_builder(nos) {
-            log_err(&e);
-            return;
-        }
+        c.send_builder(nos)?;
         sent_since_report += 1;
 
         if last_report.elapsed() >= Duration::from_secs(2) {
             // Drain queued ERs before reporting so the TCP buffer doesn't
-            // grow unbounded over long runs. Any Err here is treated as
-            // end-of-stream for this tick — the next send will surface a
-            // real disconnect.
-            while matches!(c.try_recv(), Ok(Some(_))) {}
+            // grow unbounded over long runs. A read error here is a real
+            // disconnect — bubble it up to trigger reconnect.
+            while c.try_recv()?.is_some() {}
 
             let actual = sent_since_report as f64 / last_report.elapsed().as_secs_f64();
             let _ = tx.send(UiMsg::Log(format!(
@@ -1098,6 +1147,46 @@ fn run_bot_session(addr: &str, sender: &str, target: &str, tx: &Sender<UiMsg>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // -- backoff_delay --
+
+    #[test]
+    fn backoff_delay_floors_at_50ms() {
+        // Floor matters: a zero/negative computation would burn CPU in the
+        // reconnect loop. Sample multiple times so jitter can't hide it.
+        for attempt in 0..20 {
+            for _ in 0..50 {
+                assert!(backoff_delay(attempt) >= Duration::from_millis(50));
+            }
+        }
+    }
+
+    #[test]
+    fn backoff_delay_caps_at_about_5s() {
+        // Cap = 5000 ms + up to +99 ms jitter. Anything above that means
+        // the saturating shift overflowed or the cap regressed.
+        for attempt in 6..32 {
+            for _ in 0..50 {
+                assert!(backoff_delay(attempt) <= Duration::from_millis(5_100));
+            }
+        }
+    }
+
+    #[test]
+    fn backoff_delay_grows_with_attempt_pre_cap() {
+        // Coarse monotonicity: average of many samples should grow with
+        // attempt up to the cap. Jitter prevents a per-call assertion.
+        let avg = |attempt: u32| {
+            let n = 200u64;
+            let total: u64 = (0..n)
+                .map(|_| backoff_delay(attempt).as_millis() as u64)
+                .sum();
+            total / n
+        };
+        // Compare neighbouring attempts where doubling clearly dominates
+        // ±100 ms jitter. attempt=2 → ~400 ms, attempt=4 → ~1600 ms.
+        assert!(avg(4) > avg(2));
+    }
 
     /// Build a FIX message from a builder, parse it back.
     fn build_and_parse(builder: FixMessageBuilder) -> Vec<u8> {
