@@ -44,7 +44,11 @@ mkdir -p "$DATA_DIR"
 docker rm -f "$CONTAINER_NAME" 2>/dev/null || true
 
 echo "Starting melin exchange stack..."
-docker run --rm --privileged \
+# No --rm: keep the container around after exit so `docker logs` can still
+# read its output during cleanup. Without this, an early crash inside the
+# entrypoint disappears before the TUI quits and the logs are unrecoverable.
+# Removed explicitly in cleanup() below.
+docker run --privileged \
     --name "$CONTAINER_NAME" \
     -p 9000:9000 \
     -p 9001:9001 \
@@ -64,14 +68,16 @@ done
 echo "Stack ready. Starting TUI..."
 echo ""
 
-# Stop container on exit regardless of how TUI exits
+# Stop container on exit regardless of how TUI exits.
+# Order matters: read logs first (works even if the container has already
+# exited, as long as it hasn't been removed), THEN remove the container.
 cleanup() {
     echo ""
     echo "=== Container logs ==="
     docker logs "$CONTAINER_NAME" 2>/dev/null || true
     echo ""
-    echo "Stopping container..."
-    docker stop "$CONTAINER_NAME" 2>/dev/null || true
+    echo "Removing container..."
+    docker rm -f "$CONTAINER_NAME" 2>/dev/null || true
     if [ -s "$TUI_LOG" ]; then
         echo ""
         echo "=== TUI log ==="
