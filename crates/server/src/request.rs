@@ -118,6 +118,9 @@ pub fn to_event(request: &Request) -> JournalEvent {
         Request::QueryPosition { account } => {
             JournalEvent::App(melin_trading::trading_event::TradingEvent::QueryPosition { account })
         }
+        Request::QueryRequestSeq => {
+            JournalEvent::App(melin_trading::trading_event::TradingEvent::QueryRequestSeq)
+        }
         Request::EndOfDay => {
             JournalEvent::App(melin_trading::trading_event::TradingEvent::EndOfDay)
         }

@@ -614,6 +614,7 @@ mod tests {
                 | JournalEvent::App(melin_trading::trading_event::TradingEvent::QueryPosition {
                     ..
                 })
+                | JournalEvent::App(melin_trading::trading_event::TradingEvent::QueryRequestSeq)
                 | JournalEvent::GenesisHash { .. }
                 | JournalEvent::Checkpoint { .. } => {}
             }

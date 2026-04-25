@@ -342,6 +342,13 @@ pub enum QueryResponse {
         balances: [(CurrencyId, u64, u64); 16],
         count: u8,
     },
+    /// Per-key request_seq HWM snapshot emitted in response to
+    /// `QueryRequestSeq`. The engine returns the value its dedup gate
+    /// has currently advanced to for the calling connection's key;
+    /// reconnecting clients should set their next outbound seq to
+    /// `hwm + 1` so subsequent requests bypass dedup. `0` for a key
+    /// that has never authenticated before.
+    RequestSeqHwm { hwm: u64 },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

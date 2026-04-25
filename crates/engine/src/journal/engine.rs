@@ -611,7 +611,8 @@ fn replay_event(
             exchange.drain_due_scheduled_tasks(now_ns, reports);
         }
         JournalEvent::App(crate::trading_event::TradingEvent::QueryStats)
-        | JournalEvent::App(crate::trading_event::TradingEvent::QueryPosition { .. }) => {
+        | JournalEvent::App(crate::trading_event::TradingEvent::QueryPosition { .. })
+        | JournalEvent::App(crate::trading_event::TradingEvent::QueryRequestSeq) => {
             // Read-only queries are never journaled, so they should never
             // appear during replay. No-op if they somehow do.
         }

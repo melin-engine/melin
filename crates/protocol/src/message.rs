@@ -118,6 +118,19 @@ pub enum Request {
     /// Query balances for an account. Flows through the pipeline like QueryStats
     /// so the matching stage can read Exchange state without concurrency issues.
     QueryPosition { account: AccountId },
+
+    /// Query the engine's current request_seq HWM for *this connection's*
+    /// authenticated key. Tag-only: the engine reads the calling key's
+    /// hash from its connection registration, so a client cannot ask
+    /// about other keys' state.
+    ///
+    /// Reconnecting clients should call this immediately after
+    /// `ServerReady` and seed their next outbound seq to `hwm + 1` so
+    /// subsequent requests bypass the engine's idempotency dedup —
+    /// without it a fresh client process would re-use seqs the engine
+    /// has already accepted across an earlier connection lifetime and
+    /// every request would be rejected as `DuplicateRequest`.
+    QueryRequestSeq,
 }
 
 impl Request {
@@ -226,4 +239,11 @@ pub enum ResponseKind {
         /// Number of valid entries in `balances`. Remaining slots are zeroed.
         count: u8,
     },
+
+    /// Per-key request_seq HWM snapshot in response to
+    /// `QueryRequestSeq`. The engine has accepted requests up to and
+    /// including this seq for the calling key; the client should set
+    /// its next outbound seq to `hwm + 1` to bypass dedup. `0` for a
+    /// key with no prior accepted activity.
+    RequestSeqHwm { hwm: u64 },
 }

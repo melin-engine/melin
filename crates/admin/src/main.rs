@@ -1429,7 +1429,8 @@ fn client_thread(
                         | ResponseKind::BookSnapshotLevel { .. }
                         | ResponseKind::BookSnapshotEnd { .. }
                         | ResponseKind::SnapshotComplete { .. }
-                        | ResponseKind::PositionSnapshot { .. } => continue,
+                        | ResponseKind::PositionSnapshot { .. }
+                        | ResponseKind::RequestSeqHwm { .. } => continue,
                         ResponseKind::StatsHeader {
                             active_connections,
                             events_processed,

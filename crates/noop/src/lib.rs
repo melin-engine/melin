@@ -146,7 +146,9 @@ fn rejected_from_event(event: &TradingEvent, reason: EngineRejectReason) -> Exec
         | TradingEvent::AddInstrument {
             spec: melin_trading::types::InstrumentSpec { symbol, .. },
         } => (OrderId(0), *symbol, AccountId(0)),
-        TradingEvent::EndOfDay | TradingEvent::QueryStats => (OrderId(0), Symbol(0), AccountId(0)),
+        TradingEvent::EndOfDay | TradingEvent::QueryStats | TradingEvent::QueryRequestSeq => {
+            (OrderId(0), Symbol(0), AccountId(0))
+        }
     };
     ExecutionReport::Rejected {
         order_id,

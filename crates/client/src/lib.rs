@@ -165,6 +165,36 @@ impl Client {
         Ok(responses)
     }
 
+    /// Query and adopt the engine's current request_seq HWM for this
+    /// connection's authenticated key, then return the value.
+    ///
+    /// Reconnecting clients should call this immediately after
+    /// [`Client::connect`] so subsequent requests skip past the dedup
+    /// HWM the engine accumulated under any prior connection lifetime.
+    /// Without it, a fresh client process re-uses seqs starting at 1
+    /// and every request gets `RejectReason::DuplicateRequest`.
+    ///
+    /// On return, `self.next_seq == hwm`; the next [`Client::send_request`]
+    /// will increment to `hwm + 1` before sending. Safe to call against
+    /// a freshly-authenticated key — the engine returns `0` and the
+    /// counter stays at its initial value.
+    ///
+    /// `QueryRequestSeq` itself is a read-only query, so the engine
+    /// bypasses dedup for it — the query goes through even though our
+    /// local seq is stale.
+    pub fn synchronize_request_seq(&mut self) -> Result<u64, ClientError> {
+        let responses = self.send_request(&Request::QueryRequestSeq)?;
+        for resp in &responses {
+            if let ResponseKind::RequestSeqHwm { hwm } = resp {
+                self.next_seq = *hwm;
+                return Ok(*hwm);
+            }
+        }
+        Err(ClientError::Protocol(ProtocolError::InvalidField(
+            "no RequestSeqHwm in response",
+        )))
+    }
+
     /// Query server stats. Returns `(active_connections, events_processed, journal_sequence)`.
     ///
     /// Sends `QueryStats` and extracts the `StatsHeader` from the response batch.
@@ -282,6 +312,71 @@ mod tests {
 
         // No reports before BatchEnd — just an empty batch.
         assert!(responses.is_empty());
+    }
+
+    #[test]
+    fn synchronize_request_seq_adopts_engine_hwm() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        // Server: complete auth, accept QueryRequestSeq, reply with HWM.
+        let server_hwm: u64 = 8423;
+        std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let mut reader = BlockingFrameReader::new(stream.try_clone().unwrap());
+            let mut writer = BlockingFrameWriter::new(stream);
+            mock_auth_handshake(&mut reader, &mut writer);
+
+            // Read the request and verify it's QueryRequestSeq.
+            let frame = reader.read_frame().unwrap().unwrap();
+            let (_seq, req) = codec::decode_request(frame).unwrap();
+            assert!(matches!(req, Request::QueryRequestSeq));
+
+            // Reply: RequestSeqHwm + BatchEnd, mirroring the live pipeline.
+            let mut buf = [0u8; 64];
+            let written =
+                codec::encode_response(&ResponseKind::RequestSeqHwm { hwm: server_hwm }, &mut buf)
+                    .unwrap();
+            writer.write_frame(&buf[4..written]).unwrap();
+            let written = codec::encode_response(&ResponseKind::BatchEnd, &mut buf).unwrap();
+            writer.write_frame(&buf[4..written]).unwrap();
+            writer.flush().unwrap();
+        });
+
+        let key = test_key();
+        let mut client = Client::connect(addr, &key).unwrap();
+        // Pre-call: next_seq advances to 1 on the next send. Post-call:
+        // it sits at server_hwm, so the next send increments to hwm+1.
+        let returned = client.synchronize_request_seq().unwrap();
+        assert_eq!(returned, server_hwm);
+        assert_eq!(client.next_seq, server_hwm);
+    }
+
+    #[test]
+    fn synchronize_request_seq_handles_fresh_key() {
+        // A never-before-seen key reads back hwm=0; next_seq stays at 0
+        // and the next send increments normally to 1.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let mut reader = BlockingFrameReader::new(stream.try_clone().unwrap());
+            let mut writer = BlockingFrameWriter::new(stream);
+            mock_auth_handshake(&mut reader, &mut writer);
+            let _ = reader.read_frame().unwrap().unwrap();
+            let mut buf = [0u8; 64];
+            let written =
+                codec::encode_response(&ResponseKind::RequestSeqHwm { hwm: 0 }, &mut buf).unwrap();
+            writer.write_frame(&buf[4..written]).unwrap();
+            let written = codec::encode_response(&ResponseKind::BatchEnd, &mut buf).unwrap();
+            writer.write_frame(&buf[4..written]).unwrap();
+            writer.flush().unwrap();
+        });
+
+        let key = test_key();
+        let mut client = Client::connect(addr, &key).unwrap();
+        assert_eq!(client.synchronize_request_seq().unwrap(), 0);
+        assert_eq!(client.next_seq, 0);
     }
 
     #[test]

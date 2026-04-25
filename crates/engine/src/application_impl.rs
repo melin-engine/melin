@@ -159,6 +159,15 @@ impl Application for Exchange {
                     count,
                 })
             }
+            TradingEvent::QueryRequestSeq => {
+                // Self-introspection: read the dedup HWM for the
+                // calling connection's key (transport-supplied via
+                // `ApplyCtx`). The event itself carries no identity,
+                // so a client cannot ask about other keys.
+                Some(QueryResponse::RequestSeqHwm {
+                    hwm: self.request_seq_hwm(ctx.key_hash),
+                })
+            }
         }
     }
 
@@ -346,6 +355,66 @@ mod tests {
         let mut reports = Vec::new();
         <Exchange as Application>::tick(&mut ex, 1_000_000_000, &mut reports);
         assert!(reports.is_empty());
+    }
+
+    #[test]
+    fn apply_query_request_seq_returns_per_key_hwm() {
+        let mut ex = seeded_exchange();
+
+        // Advance two distinct keys to different HWMs via the dedup gate.
+        // Same key+seq combinations the live pipeline would emit.
+        let key_a: u64 = 0xAAAA_AAAA_AAAA_AAAA;
+        let key_b: u64 = 0xBBBB_BBBB_BBBB_BBBB;
+        for seq in 1..=7 {
+            assert!(<Exchange as Application>::check_request_seq(
+                &mut ex, key_a, seq
+            ));
+        }
+        for seq in 1..=3 {
+            assert!(<Exchange as Application>::check_request_seq(
+                &mut ex, key_b, seq
+            ));
+        }
+
+        let mut reports = Vec::new();
+        let mk_ctx = |kh| ApplyCtx {
+            now_ns: 0,
+            journal_sequence: 0,
+            active_connections: 0,
+            events_processed: 0,
+            key_hash: kh,
+        };
+
+        // Each key sees only its own HWM — the engine reads ctx.key_hash,
+        // not anything from the (payloadless) event itself.
+        let resp_a = <Exchange as Application>::apply(
+            &mut ex,
+            TradingEvent::QueryRequestSeq,
+            &mk_ctx(key_a),
+            &mut reports,
+        );
+        assert_eq!(resp_a, Some(QueryResponse::RequestSeqHwm { hwm: 7 }));
+
+        let resp_b = <Exchange as Application>::apply(
+            &mut ex,
+            TradingEvent::QueryRequestSeq,
+            &mk_ctx(key_b),
+            &mut reports,
+        );
+        assert_eq!(resp_b, Some(QueryResponse::RequestSeqHwm { hwm: 3 }));
+
+        // A key with no prior activity reads back as zero.
+        let resp_unknown = <Exchange as Application>::apply(
+            &mut ex,
+            TradingEvent::QueryRequestSeq,
+            &mk_ctx(0xDEAD_BEEF),
+            &mut reports,
+        );
+        assert_eq!(resp_unknown, Some(QueryResponse::RequestSeqHwm { hwm: 0 }));
+
+        // Query is read-only: HWMs are unchanged after the queries above.
+        assert_eq!(ex.request_seq_hwm(key_a), 7);
+        assert_eq!(ex.request_seq_hwm(key_b), 3);
     }
 
     #[test]

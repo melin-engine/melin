@@ -265,6 +265,15 @@ impl Exchange {
         true
     }
 
+    /// Current request_seq HWM for `key_hash`, or `0` if no event has
+    /// ever been accepted from that key. Read-only; safe to call from
+    /// the matching stage at any point. Used by the `QueryRequestSeq`
+    /// query handler so reconnecting clients can resume their outbound
+    /// seq past whatever the engine has already seen.
+    pub fn request_seq_hwm(&self, key_hash: u64) -> u64 {
+        self.key_hwm.get(&key_hash).copied().unwrap_or(0)
+    }
+
     /// Snapshot per-key request sequence HWMs for serialization.
     pub(crate) fn snapshot_key_hwm(&self) -> Vec<(u64, u64)> {
         self.key_hwm

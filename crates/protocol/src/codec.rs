@@ -58,6 +58,7 @@ const TAG_ENABLE_INSTRUMENT: u8 = 36;
 const TAG_REMOVE_INSTRUMENT: u8 = 37;
 const TAG_SUBSCRIBE: u8 = 38;
 const TAG_QUERY_POSITION: u8 = 39;
+const TAG_QUERY_REQUEST_SEQ: u8 = 45;
 
 // --- Response tags ---
 const TAG_PLACED: u8 = 11;
@@ -81,6 +82,7 @@ const TAG_BOOK_SNAPSHOT_LEVEL: u8 = 41;
 const TAG_BOOK_SNAPSHOT_END: u8 = 42;
 const TAG_SNAPSHOT_COMPLETE: u8 = 43;
 const TAG_POSITION_SNAPSHOT: u8 = 44;
+const TAG_REQUEST_SEQ_HWM: u8 = 46;
 
 // --- OrderType tags (wire-specific, not shared with journal) ---
 const ORDER_TYPE_MARKET: u8 = 0;
@@ -312,6 +314,10 @@ pub fn encode_request(request: &Request, seq: u64, buf: &mut [u8]) -> Result<usi
             pos += 1;
             le::put_u32(&mut buf[pos..], account.0);
             pos += 4;
+        }
+        Request::QueryRequestSeq => {
+            buf[pos] = TAG_QUERY_REQUEST_SEQ;
+            pos += 1;
         }
     }
 
@@ -624,6 +630,7 @@ pub fn decode_request(buf: &[u8]) -> Result<(u64, Request), ProtocolError> {
                 },
             ))
         }
+        TAG_QUERY_REQUEST_SEQ => Ok((seq, Request::QueryRequestSeq)),
         _ => Err(ProtocolError::UnknownTag(tag)),
     }
 }
@@ -754,6 +761,12 @@ pub fn encode_response(response: &ResponseKind, buf: &mut [u8]) -> Result<usize,
                 pos += 8;
             }
         }
+        ResponseKind::RequestSeqHwm { hwm } => {
+            buf[pos] = TAG_REQUEST_SEQ_HWM;
+            pos += 1;
+            le::put_u64(&mut buf[pos..], *hwm);
+            pos += 8;
+        }
     }
 
     let payload_len = pos - 4;
@@ -882,6 +895,14 @@ pub fn decode_response(buf: &[u8]) -> Result<ResponseKind, ProtocolError> {
                 account,
                 balances,
                 count,
+            })
+        }
+        TAG_REQUEST_SEQ_HWM => {
+            if payload.len() < 8 {
+                return Err(ProtocolError::Truncated);
+            }
+            Ok(ResponseKind::RequestSeqHwm {
+                hwm: le::get_u64(&payload[0..]),
             })
         }
         _ => Err(ProtocolError::UnknownTag(tag)),
@@ -1576,6 +1597,7 @@ mod tests {
                 },
             },
             Request::QueryStats,
+            Request::QueryRequestSeq,
             Request::EndOfDay,
             // GTD order — exercises conditional expiry_ns encoding.
             Request::SubmitOrder {
@@ -1824,6 +1846,10 @@ mod tests {
                     b
                 },
                 count: 2,
+            },
+            ResponseKind::RequestSeqHwm { hwm: 0 },
+            ResponseKind::RequestSeqHwm {
+                hwm: 12_345_678_900,
             },
         ]
     }

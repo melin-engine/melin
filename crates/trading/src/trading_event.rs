@@ -46,6 +46,7 @@ const TAG_ENABLE_INSTRUMENT: u8 = 14;
 const TAG_REMOVE_INSTRUMENT: u8 = 15;
 const TAG_QUERY_STATS: u8 = 16;
 const TAG_QUERY_POSITION: u8 = 17;
+const TAG_QUERY_REQUEST_SEQ: u8 = 18;
 
 // Per-OrderType nested tag space inside SubmitOrder's payload.
 const ORDER_TYPE_MARKET: u8 = 0;
@@ -123,6 +124,14 @@ pub enum TradingEvent {
     QueryStats,
     /// Read-only query for an account's balances (not journaled).
     QueryPosition { account: AccountId },
+    /// Read-only query: "what is the request_seq HWM for *my* key?".
+    /// Tag-only: the engine reads the connection's authenticated
+    /// `key_hash` from `ApplyCtx`, so the wire payload stays empty
+    /// and clients can't ask about other keys' state. Used by
+    /// reconnecting clients to seed their next outbound seq past the
+    /// engine's dedup HWM and avoid spurious `DuplicateRequest`
+    /// rejections of legitimate post-reconnect orders.
+    QueryRequestSeq,
 }
 
 impl AppEvent for TradingEvent {
@@ -153,6 +162,7 @@ impl AppEvent for TradingEvent {
             TradingEvent::RemoveInstrument { .. } => 4,
             TradingEvent::QueryStats => 0,
             TradingEvent::QueryPosition { .. } => 4,
+            TradingEvent::QueryRequestSeq => 0,
         }
     }
 
@@ -263,6 +273,7 @@ impl AppEvent for TradingEvent {
                 le::put_u32(&mut buf[1..], account.0);
                 (TAG_QUERY_POSITION, 4)
             }
+            TradingEvent::QueryRequestSeq => (TAG_QUERY_REQUEST_SEQ, 0),
         };
         buf[0] = tag;
         1 + payload_len
@@ -434,6 +445,7 @@ impl AppEvent for TradingEvent {
                     account: AccountId(le::get_u32(&payload[0..])),
                 })
             }
+            TAG_QUERY_REQUEST_SEQ => Ok(TradingEvent::QueryRequestSeq),
             other => Err(CodecError::UnknownTag(other)),
         }
     }
@@ -442,7 +454,9 @@ impl AppEvent for TradingEvent {
     fn is_query(&self) -> bool {
         matches!(
             self,
-            TradingEvent::QueryStats | TradingEvent::QueryPosition { .. }
+            TradingEvent::QueryStats
+                | TradingEvent::QueryPosition { .. }
+                | TradingEvent::QueryRequestSeq
         )
     }
 }

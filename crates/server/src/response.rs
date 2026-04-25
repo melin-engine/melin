@@ -360,6 +360,9 @@ pub fn run(
                     balances,
                     count,
                 },
+                OutputPayload::QueryResponse(QueryResponse::RequestSeqHwm { hwm }) => {
+                    ResponseKind::RequestSeqHwm { hwm }
+                }
                 OutputPayload::Report(report) => ResponseKind::Report(report),
                 OutputPayload::BatchEnd => ResponseKind::BatchEnd,
                 OutputPayload::EngineError => ResponseKind::EngineError,

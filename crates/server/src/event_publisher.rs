@@ -74,8 +74,8 @@ fn report_symbol(report: &ExecutionReport) -> Symbol {
 }
 
 /// Convert an `OutputPayload` to the wire `ResponseKind`. Translates
-/// query responses (`QueryResponse::Stats` / `::Position`) to the
-/// public `StatsHeader` / `PositionSnapshot` wire variants.
+/// query responses (`QueryResponse::Stats` / `::Position` /
+/// `::RequestSeqHwm`) to the public wire variants.
 fn payload_to_response(payload: OutputPayload) -> ResponseKind {
     match payload {
         OutputPayload::QueryResponse(QueryResponse::Stats {
@@ -96,6 +96,9 @@ fn payload_to_response(payload: OutputPayload) -> ResponseKind {
             balances,
             count,
         },
+        OutputPayload::QueryResponse(QueryResponse::RequestSeqHwm { hwm }) => {
+            ResponseKind::RequestSeqHwm { hwm }
+        }
         OutputPayload::Report(report) => ResponseKind::Report(report),
         OutputPayload::BatchEnd => ResponseKind::BatchEnd,
         OutputPayload::EngineError => ResponseKind::EngineError,
