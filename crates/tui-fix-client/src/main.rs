@@ -620,7 +620,7 @@ fn backoff_delay(attempt: u32) -> Duration {
 fn run_md_session(addr: &str, sender: &str, target: &str, tx: &Sender<UiMsg>) {
     let mut attempt: u32 = 0;
     loop {
-        match run_md_session_once(addr, sender, target, tx) {
+        match run_md_session_once(addr, sender, target, tx, &mut attempt) {
             Ok(()) => return, // graceful shutdown — channel closed
             Err(e) => {
                 let _ = tx.send(UiMsg::MdStatus(false, format!("MD: {e}")));
@@ -640,12 +640,15 @@ fn run_md_session(addr: &str, sender: &str, target: &str, tx: &Sender<UiMsg>) {
 
 /// One MD session lifetime: connect, list securities, subscribe, snapshot loop.
 /// Returns `Ok(())` only on graceful shutdown (UI channel closed); any I/O
-/// error bubbles up to the reconnect loop.
+/// error bubbles up to the reconnect loop. `attempt` is reset to 0 once
+/// init has completed, so a long-stable session that drops once doesn't
+/// inherit a high backoff from earlier startup retries.
 fn run_md_session_once(
     addr: &str,
     sender: &str,
     target: &str,
     tx: &Sender<UiMsg>,
+    attempt: &mut u32,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let _ = tx.send(UiMsg::Log(format!("[MD] connecting to {addr}…")));
     let mut c = FixClient::connect(addr, sender, target, 30)?;
@@ -681,6 +684,10 @@ fn run_md_session_once(
     };
 
     c.set_read_timeout(Some(Duration::from_millis(100)))?;
+    // Init complete — clear the backoff so the next disconnect (likely
+    // hours from now) starts at the 100 ms floor, not at the cap reached
+    // during initial startup retries.
+    *attempt = 0;
 
     // Periodically re-request snapshots (every 1s) since incremental
     // updates (X) aren't wired yet. This ensures the book display
@@ -803,7 +810,7 @@ fn run_oe_session(
 ) {
     let mut attempt: u32 = 0;
     loop {
-        match run_oe_session_once(addr, sender, target, tx, order_rx) {
+        match run_oe_session_once(addr, sender, target, tx, order_rx, &mut attempt) {
             Ok(()) => return, // graceful — UI gone
             Err(e) => {
                 let _ = tx.send(UiMsg::OeStatus(false, format!("OE: {e}")));
@@ -839,13 +846,16 @@ fn drain_orders_with_reject(order_rx: &Receiver<OrderCmd>, tx: &Sender<UiMsg>, t
 }
 
 /// One OE session lifetime: connect, mass-status + positions sync, then
-/// the request/response main loop.
+/// the request/response main loop. `attempt` is reset to 0 once init
+/// has completed, so a long-stable session that drops once doesn't
+/// inherit a high backoff from earlier startup retries.
 fn run_oe_session_once(
     addr: &str,
     sender: &str,
     target: &str,
     tx: &Sender<UiMsg>,
     order_rx: &Receiver<OrderCmd>,
+    attempt: &mut u32,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let _ = tx.send(UiMsg::Log(format!("[OE] connecting to {addr}…")));
     let mut c = FixClient::connect(addr, sender, target, 30)?;
@@ -895,6 +905,8 @@ fn run_oe_session_once(
         "[OE] synced: {} active orders",
         orders.len()
     )));
+    // Init complete — clear the backoff (see run_md_session_once).
+    *attempt = 0;
 
     // --- Main loop: send orders, process unsolicited ERs ---
 
@@ -1065,7 +1077,7 @@ fn parse_positions(msg: &FixMessage<'_>) -> Vec<String> {
 fn run_bot_session(addr: &str, sender: &str, target: &str, tx: &Sender<UiMsg>) {
     let mut attempt: u32 = 0;
     loop {
-        match run_bot_session_once(addr, sender, target, tx) {
+        match run_bot_session_once(addr, sender, target, tx, &mut attempt) {
             Ok(()) => return, // graceful — UI gone
             Err(e) => {
                 let delay = backoff_delay(attempt);
@@ -1084,18 +1096,21 @@ fn run_bot_session(addr: &str, sender: &str, target: &str, tx: &Sender<UiMsg>) {
 /// One bot session lifetime: connect, then submit orders forever at the
 /// sine-wave rate. State (RNG, ClOrdID counter) resets on reconnect — the
 /// bot has no engine-side state to preserve, and the gateway hands out
-/// fresh OrderIDs regardless of ClOrdID reuse across sessions.
+/// fresh OrderIDs regardless of ClOrdID reuse across sessions. `attempt`
+/// is reset to 0 once Logon completes (see `run_md_session_once`).
 fn run_bot_session_once(
     addr: &str,
     sender: &str,
     target: &str,
     tx: &Sender<UiMsg>,
+    attempt: &mut u32,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let _ = tx.send(UiMsg::Log(format!(
         "[BOT] connecting to {addr} as {sender}…"
     )));
 
     let mut c = FixClient::connect(addr, sender, target, 30)?;
+    *attempt = 0;
     // Short poll timeout: the bot only drains ERs opportunistically
     // between bursts, so it should not block reading when no data is in.
     c.set_read_timeout(Some(Duration::from_millis(1)))?;
