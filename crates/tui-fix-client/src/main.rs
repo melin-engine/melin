@@ -133,7 +133,16 @@ struct App {
     asks: Vec<BookLevel>,
     active_orders: Vec<String>,
     balances: Vec<String>,
-    status: String,
+    /// Static keybind/connection banner shown when no session is in error.
+    /// The displayed status bar prefers an active error over this banner —
+    /// see `App::status_line`.
+    banner: String,
+    /// Last MD-side error message, cleared when the MD session reports
+    /// healthy again. `Option` so a recovered session reverts to the
+    /// banner without the caller having to re-send an empty string.
+    md_err: Option<String>,
+    /// Last OE-side error message, same semantics as `md_err`.
+    oe_err: Option<String>,
     md_ok: bool,
     oe_ok: bool,
     form: OrderForm,
@@ -144,13 +153,15 @@ struct App {
 }
 
 impl App {
-    fn new(status: String) -> Self {
+    fn new(banner: String) -> Self {
         Self {
             bids: vec![],
             asks: vec![],
             active_orders: vec![],
             balances: vec![],
-            status,
+            banner,
+            md_err: None,
+            oe_err: None,
             md_ok: false,
             oe_ok: false,
             form: OrderForm::new(),
@@ -168,14 +179,25 @@ impl App {
             self.logs.remove(0);
         }
     }
+    /// Compose the status-bar line from current error state, falling back
+    /// to the banner. OE errors are shown ahead of MD errors when both
+    /// are active because order entry blocks user action — losing market
+    /// data is informational; losing OE means the user can't trade.
+    fn status_line(&self) -> &str {
+        if let Some(e) = self.oe_err.as_deref() {
+            return e;
+        }
+        if let Some(e) = self.md_err.as_deref() {
+            return e;
+        }
+        &self.banner
+    }
     fn drain(&mut self, rx: &Receiver<UiMsg>) {
         while let Ok(m) = rx.try_recv() {
             match m {
                 UiMsg::MdStatus(ok, s) => {
                     self.md_ok = ok;
-                    if !s.is_empty() {
-                        self.status = s;
-                    }
+                    self.md_err = if ok { None } else { Some(s) };
                 }
                 UiMsg::Book(b, a) => {
                     self.bids = b;
@@ -183,9 +205,7 @@ impl App {
                 }
                 UiMsg::OeStatus(ok, s) => {
                     self.oe_ok = ok;
-                    if !s.is_empty() {
-                        self.status = s;
-                    }
+                    self.oe_err = if ok { None } else { Some(s) };
                 }
                 UiMsg::ActiveOrders(o) => self.active_orders = o,
                 UiMsg::Balances(b) => self.balances = b,
@@ -418,7 +438,7 @@ fn render(app: &App, f: &mut ratatui::Frame<'_>) {
     );
 
     f.render_widget(
-        Paragraph::new(Line::from(app.status.as_str()))
+        Paragraph::new(Line::from(app.status_line()))
             .style(Style::default().fg(Color::Cyan))
             .block(Block::default().borders(Borders::TOP)),
         v[3],
@@ -652,7 +672,7 @@ fn run_md_session_once(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let _ = tx.send(UiMsg::Log(format!("[MD] connecting to {addr}…")));
     let mut c = FixClient::connect(addr, sender, target, 30)?;
-    let _ = tx.send(UiMsg::MdStatus(true, "MD: connected".into()));
+    let _ = tx.send(UiMsg::MdStatus(true, String::new()));
     let _ = tx.send(UiMsg::Log(
         "[MD] connected, sending SecurityListRequest".into(),
     ));
@@ -859,7 +879,7 @@ fn run_oe_session_once(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let _ = tx.send(UiMsg::Log(format!("[OE] connecting to {addr}…")));
     let mut c = FixClient::connect(addr, sender, target, 30)?;
-    let _ = tx.send(UiMsg::OeStatus(true, "OE: connected".into()));
+    let _ = tx.send(UiMsg::OeStatus(true, String::new()));
     let _ = tx.send(UiMsg::Log("[OE] connected".into()));
 
     // --- One-time sync: mass status + positions ---
