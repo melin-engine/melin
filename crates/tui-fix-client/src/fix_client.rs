@@ -434,6 +434,53 @@ mod tests {
     }
 
     #[test]
+    fn fresh_connect_after_dropped_session_succeeds() {
+        // Reconnect coverage at the FixClient level: the wrapper loop
+        // builds a new FixClient on every reconnect, so what matters is
+        // that a fresh connect after a server-side drop completes the
+        // Logon handshake cleanly. Drives a single listener through two
+        // connections to exercise the same path used in production.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            for seq in 1..=2u64 {
+                let (mut stream, _) = listener.accept().unwrap();
+                let _logon =
+                    read_one_fix_message(&mut stream, Instant::now() + Duration::from_secs(2));
+                let logon_resp = FixMessageBuilder::new(tags::MSG_LOGON)
+                    .str_tag(tags::ENCRYPT_METHOD, "0")
+                    .u64_tag(tags::HEART_BT_INT, 30)
+                    .build("SERVER", "CLIENT", seq);
+                stream.write_all(&logon_resp).unwrap();
+                // Drop the stream — this is what the wrapper observes as
+                // "connection closed" and triggers the reconnect loop.
+            }
+        });
+
+        // Connection 1: completes Logon, then the server drops us.
+        let mut c1 = FixClient::connect(&addr.to_string(), "CLIENT", "SERVER", 30).unwrap();
+        c1.set_read_timeout(Some(Duration::from_millis(500)))
+            .unwrap();
+        // Drain the EOF — try_recv surfaces it as Err once the kernel
+        // delivers the FIN. May take a couple of reads to materialise.
+        let mut saw_close = false;
+        for _ in 0..6 {
+            if c1.try_recv().is_err() {
+                saw_close = true;
+                break;
+            }
+        }
+        assert!(saw_close, "expected try_recv to surface the server drop");
+        drop(c1);
+
+        // Connection 2: simulates the wrapper's reconnect — fresh client,
+        // same address. Must complete Logon without leaning on any state
+        // from c1.
+        let _c2 = FixClient::connect(&addr.to_string(), "CLIENT", "SERVER", 30).unwrap();
+        server.join().unwrap();
+    }
+
+    #[test]
     fn maintain_heartbeat_does_not_send_when_recently_sent() {
         // Bind a peer that just accepts + completes Logon, then waits.
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
