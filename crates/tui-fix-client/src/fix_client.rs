@@ -398,6 +398,42 @@ mod tests {
     }
 
     #[test]
+    fn maintain_heartbeat_sends_when_idle_past_skew() {
+        // 1-second HeartBtInt → 800 ms skew. Sleep 1 s (well past),
+        // call maintain_heartbeat once, expect one Heartbeat on the wire.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            // Drain client's Logon.
+            let _ = read_one_fix_message(&mut stream, Instant::now() + Duration::from_secs(2));
+            // Echo a Logon back so connect() returns.
+            let logon_resp = FixMessageBuilder::new(tags::MSG_LOGON)
+                .str_tag(tags::ENCRYPT_METHOD, "0")
+                .u64_tag(tags::HEART_BT_INT, 1)
+                .build("SERVER", "CLIENT", 1);
+            stream.write_all(&logon_resp).unwrap();
+            // Whatever the client sends next is what we want to inspect.
+            read_one_fix_message(&mut stream, Instant::now() + Duration::from_secs(3))
+        });
+        let mut client = FixClient::connect(&addr.to_string(), "CLIENT", "SERVER", 1).unwrap();
+        // Sleep past the 80% skew so the next maintain_heartbeat fires.
+        thread::sleep(Duration::from_millis(1_000));
+        let seq_before = client.next_outbound_seq();
+        client.maintain_heartbeat().unwrap();
+        assert_eq!(
+            client.next_outbound_seq(),
+            seq_before + 1,
+            "outbound_seq should have advanced, indicating a Heartbeat was sent"
+        );
+        let raw = server.join().unwrap();
+        let msg = FixMessage::parse(&raw).unwrap();
+        assert_eq!(msg.msg_type(), tags::MSG_HEARTBEAT);
+        // Proactive heartbeat carries no TestReqID (only TestRequest replies do).
+        assert_eq!(msg.get_str(tags::TEST_REQ_ID), None);
+    }
+
+    #[test]
     fn maintain_heartbeat_does_not_send_when_recently_sent() {
         // Bind a peer that just accepts + completes Logon, then waits.
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
