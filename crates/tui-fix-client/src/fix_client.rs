@@ -195,14 +195,27 @@ impl FixClient {
     }
 
     /// Send a Heartbeat (35=0) if our outbound has been silent for at
-    /// least the negotiated interval, so the gateway doesn't TestRequest
-    /// us into a reset. Cheap to call from a tight polling loop — the
-    /// idle check is just an `Instant::elapsed` compare.
+    /// least 80% of the negotiated interval, so the gateway doesn't
+    /// TestRequest us into a reset. Cheap to call from a tight polling
+    /// loop — the idle check is just an `Instant::elapsed` compare.
+    ///
+    /// The 80% skew matters because the gateway's heartbeat scan runs
+    /// once a second and uses a strict `since_recv > HeartBtInt` check.
+    /// Firing exactly at the interval leaves a ~50–100 ms window where
+    /// the scan can race ahead of our heartbeat and emit a spurious
+    /// TestRequest. At 80%, we're comfortably ahead of the threshold.
     pub fn maintain_heartbeat(&mut self) -> io::Result<()> {
-        if self.last_sent.elapsed() >= self.heart_bt_int {
+        if self.last_sent.elapsed() >= self.heartbeat_skew() {
             self.send_builder(FixMessageBuilder::new(tags::MSG_HEARTBEAT))?;
         }
         Ok(())
+    }
+
+    /// 80% of `heart_bt_int`. Fractional-multiply on `Duration` is
+    /// nightly-only, so do the integer arithmetic in nanoseconds.
+    fn heartbeat_skew(&self) -> Duration {
+        let nanos = self.heart_bt_int.as_nanos() as u64;
+        Duration::from_nanos(nanos.saturating_mul(4) / 5)
     }
 
     /// Send a Logout and close the connection.
