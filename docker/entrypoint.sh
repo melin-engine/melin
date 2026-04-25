@@ -109,7 +109,9 @@ echo "  md-gateway.toml written"
 
 cleanup() {
     echo "Shutting down..."
-    kill "$SERVER_PID" "$OE_PID" "$MD_PID" 2>/dev/null || true
+    # ${VAR:-} so a signal in the brief window between trap registration
+    # and PID assignment doesn't trip `set -u` here.
+    kill "${SERVER_PID:-}" "${OE_PID:-}" "${MD_PID:-}" 2>/dev/null || true
     wait 2>/dev/null
 }
 trap cleanup EXIT INT TERM
