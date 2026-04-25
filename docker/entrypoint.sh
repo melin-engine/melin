@@ -42,7 +42,6 @@ cat > authorized_keys <<EOF
 trader $TRADER_PUB trader
 trader $BOT_PUB bot
 EOF
-echo "$TRADER_PUB" > trader.pub.b64
 echo "  authorized_keys updated (trader + bot)"
 
 # --- Write oe-gateway config (always overwritten) ---
