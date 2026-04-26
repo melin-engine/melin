@@ -262,16 +262,23 @@ fn promote(addr: SocketAddr, operator_key: &SigningKey) {
     stream
         .read_exact(&mut frame_buf)
         .expect("read challenge payload");
-    let nonce = match codec::decode_response(&frame_buf).expect("decode challenge") {
-        ResponseKind::Challenge { nonce } => nonce,
+    let (nonce, server_eph) = match codec::decode_response(&frame_buf).expect("decode challenge") {
+        ResponseKind::Challenge {
+            nonce,
+            server_x25519_eph,
+        } => (nonce, server_x25519_eph),
         other => panic!("expected Challenge, got {other:?}"),
     };
 
-    // Step 2: Sign nonce and send ChallengeResponse.
-    let signature = operator_key.sign(&nonce);
+    // Step 2: Sign nonce + ephemerals (TCP path uses zero ephs).
+    let client_x25519_eph = [0u8; 32];
+    let signing_payload =
+        melin_protocol::auth::auth_signing_payload(&nonce, &server_eph, &client_x25519_eph);
+    let signature = operator_key.sign(&signing_payload);
     let request = Request::ChallengeResponse {
         signature: signature.to_bytes(),
         public_key: operator_key.verifying_key().to_bytes(),
+        client_x25519_eph,
     };
     let mut encode_buf = [0u8; 256];
     let written = codec::encode_request(&request, 0, &mut encode_buf).expect("encode");

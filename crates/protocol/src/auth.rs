@@ -169,6 +169,33 @@ impl AuthorizedKeys {
     }
 }
 
+/// Build the byte payload that the client signs (and the server
+/// verifies) during the Ed25519 challenge-response handshake.
+///
+/// The signature covers the nonce **and** the two X25519 ephemeral
+/// public keys. Binding the ephemerals into the signature blocks an
+/// active downgrade where an MITM substitutes its own X25519 keys to
+/// reveal the derived session token.
+///
+/// On the TCP path the ephemerals are typically zero (the rumcast
+/// session-token MAC is not used over a TCP byte stream — TCP gives
+/// stream-level integrity directly), so the effective payload is
+/// `nonce ‖ [0u8; 64]`. On the rumcast path both ephemerals are
+/// fresh per-handshake values. Either way both sides compute the
+/// same buffer and the signature verifies.
+#[inline]
+pub fn auth_signing_payload(
+    nonce: &[u8; 32],
+    server_x25519_eph: &[u8; 32],
+    client_x25519_eph: &[u8; 32],
+) -> [u8; 96] {
+    let mut buf = [0u8; 96];
+    buf[..32].copy_from_slice(nonce);
+    buf[32..64].copy_from_slice(server_x25519_eph);
+    buf[64..96].copy_from_slice(client_x25519_eph);
+    buf
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -348,5 +375,69 @@ readonly AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA= second
         .unwrap();
         let keys = AuthorizedKeys::load(&path).unwrap();
         assert_eq!(keys.len(), 1);
+    }
+
+    // --- auth_signing_payload ---
+
+    #[test]
+    fn auth_signing_payload_layout_is_nonce_then_server_eph_then_client_eph() {
+        let nonce = [0xA1u8; 32];
+        let server_eph = [0xB2u8; 32];
+        let client_eph = [0xC3u8; 32];
+        let payload = auth_signing_payload(&nonce, &server_eph, &client_eph);
+        // Lock down the byte layout — sign and verify sides on
+        // different transports must produce identical buffers, so
+        // any future refactor that reorders or truncates this layout
+        // would silently break the handshake. This test fails fast.
+        assert_eq!(&payload[..32], &nonce);
+        assert_eq!(&payload[32..64], &server_eph);
+        assert_eq!(&payload[64..96], &client_eph);
+    }
+
+    #[test]
+    fn auth_signing_payload_distinguishes_each_field() {
+        // Changing the nonce, server eph, or client eph each
+        // produces a different output buffer — i.e. none of the
+        // three inputs is silently dropped.
+        let base = auth_signing_payload(&[0; 32], &[0; 32], &[0; 32]);
+        assert_ne!(base, auth_signing_payload(&[1; 32], &[0; 32], &[0; 32]));
+        assert_ne!(base, auth_signing_payload(&[0; 32], &[1; 32], &[0; 32]));
+        assert_ne!(base, auth_signing_payload(&[0; 32], &[0; 32], &[1; 32]));
+    }
+
+    #[test]
+    fn auth_signing_payload_round_trip_with_ed25519() {
+        // End-to-end: sign with one party's key, verify on the
+        // other side using the same helper. This is the property
+        // that makes the cross-transport (TCP / DPDK / rumcast)
+        // signing scheme actually work.
+        use ed25519_dalek::{Signer, SigningKey, Verifier, VerifyingKey};
+
+        // Deterministic key from a fixed seed — the rest of the
+        // codebase uses the same `from_bytes` pattern (e.g., the
+        // failover tests in melin-server). Avoids the rand_core
+        // version skew between rand 0.9 and ed25519-dalek 2.2.
+        let key = SigningKey::from_bytes(&[0x42u8; 32]);
+        let vk: VerifyingKey = key.verifying_key();
+
+        let nonce = [0x11u8; 32];
+        let server_eph = [0x22u8; 32];
+        let client_eph = [0x33u8; 32];
+
+        let payload = auth_signing_payload(&nonce, &server_eph, &client_eph);
+        let sig = key.sign(&payload);
+
+        // Same inputs verify.
+        assert!(vk.verify(&payload, &sig).is_ok());
+
+        // Tampering with any of the three fields fails verification.
+        let tampered_nonce = auth_signing_payload(&[0xFF; 32], &server_eph, &client_eph);
+        assert!(vk.verify(&tampered_nonce, &sig).is_err());
+
+        let tampered_server = auth_signing_payload(&nonce, &[0xFF; 32], &client_eph);
+        assert!(vk.verify(&tampered_server, &sig).is_err());
+
+        let tampered_client = auth_signing_payload(&nonce, &server_eph, &[0xFF; 32]);
+        assert!(vk.verify(&tampered_client, &sig).is_err());
     }
 }

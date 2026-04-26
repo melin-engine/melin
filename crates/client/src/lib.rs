@@ -63,9 +63,13 @@ impl From<ProtocolError> for ClientError {
 pub struct Client {
     reader: BlockingFrameReader<std::net::TcpStream>,
     writer: BlockingFrameWriter<std::net::TcpStream>,
-    /// Pre-allocated encode buffer. 136 bytes is sufficient for all
-    /// request types (seq(8) + tag(1) + largest payload ~60 bytes).
-    encode_buf: [u8; 136],
+    /// Pre-allocated encode buffer. 168 bytes is the upper bound,
+    /// set by ChallengeResponse (4 prefix + 8 seq + 1 tag + 64 sig +
+    /// 32 pubkey + 32 X25519 eph + slack). The auth handshake uses
+    /// its own 256-byte stack buffer in `connect()` so this buffer
+    /// only sees post-auth requests in practice — but keep it sized
+    /// for the worst-case variant.
+    encode_buf: [u8; 168],
     /// Per-connection monotonically increasing request sequence number.
     /// Used with the server-side per-key idempotency dedup. Starts at 0
     /// and increments before each send. Heartbeats use seq=0 (exempt).
@@ -88,8 +92,11 @@ impl Client {
         // Step 1: Receive Challenge from server.
         let frame = reader.read_frame()?.ok_or(ClientError::Disconnected)?;
         let response = codec::decode_response(frame)?;
-        let nonce = match response {
-            ResponseKind::Challenge { nonce } => nonce,
+        let (nonce, server_eph) = match response {
+            ResponseKind::Challenge {
+                nonce,
+                server_x25519_eph,
+            } => (nonce, server_x25519_eph),
             _ => {
                 return Err(ClientError::Protocol(ProtocolError::InvalidField(
                     "expected Challenge",
@@ -97,12 +104,21 @@ impl Client {
             }
         };
 
-        // Step 2: Sign the nonce and send ChallengeResponse.
-        let signature = key.sign(&nonce);
+        // Step 2: Sign the nonce + ephemerals and send
+        // ChallengeResponse. X25519 ephemerals are zero on the TCP
+        // path (the session-token MAC isn't used on a byte stream),
+        // but the signing payload still covers them so server +
+        // client share a single verification scheme — see
+        // [`melin_protocol::auth::auth_signing_payload`].
+        let client_x25519_eph = [0u8; 32];
+        let signing_payload =
+            melin_protocol::auth::auth_signing_payload(&nonce, &server_eph, &client_x25519_eph);
+        let signature = key.sign(&signing_payload);
         let public_key = key.verifying_key().to_bytes();
         let request = Request::ChallengeResponse {
             signature: signature.to_bytes(),
             public_key,
+            client_x25519_eph,
         };
         let mut encode_buf = [0u8; 256];
         let written = codec::encode_request(&request, 0, &mut encode_buf)?;
@@ -127,7 +143,7 @@ impl Client {
         Ok(Self {
             reader,
             writer,
-            encode_buf: [0u8; 136],
+            encode_buf: [0u8; 168],
             next_seq: 0,
         })
     }
@@ -248,26 +264,36 @@ mod tests {
 
         // Send Challenge.
         let nonce = [0xBB; 32];
-        let mut buf = [0u8; 64];
-        let written = codec::encode_response(&ResponseKind::Challenge { nonce }, &mut buf).unwrap();
+        let mut buf = [0u8; 128];
+        let written = codec::encode_response(
+            &ResponseKind::Challenge {
+                nonce,
+                server_x25519_eph: [0u8; 32],
+            },
+            &mut buf,
+        )
+        .unwrap();
         writer.write_frame(&buf[4..written]).unwrap();
         writer.flush().unwrap();
 
         // Read ChallengeResponse.
         let frame = reader.read_frame().unwrap().unwrap();
         let (_seq, request) = codec::decode_request(frame).unwrap();
-        let (sig_bytes, pk_bytes) = match request {
+        let (sig_bytes, pk_bytes, client_eph) = match request {
             Request::ChallengeResponse {
                 signature,
                 public_key,
-            } => (signature, public_key),
+                client_x25519_eph,
+            } => (signature, public_key, client_x25519_eph),
             _ => panic!("expected ChallengeResponse"),
         };
 
-        // Verify signature.
+        // Verify signature over `nonce ‖ server_eph ‖ client_eph`.
         let vk = VerifyingKey::from_bytes(&pk_bytes).unwrap();
         let sig = ed25519_dalek::Signature::from_bytes(&sig_bytes);
-        vk.verify(&nonce, &sig).unwrap();
+        let signing_payload =
+            melin_protocol::auth::auth_signing_payload(&nonce, &[0u8; 32], &client_eph);
+        vk.verify(&signing_payload, &sig).unwrap();
 
         // Send ServerReady.
         let written = codec::encode_response(&ResponseKind::ServerReady, &mut buf).unwrap();
@@ -392,9 +418,15 @@ mod tests {
 
             // Send Challenge.
             let nonce = [0xBB; 32];
-            let mut buf = [0u8; 64];
-            let written =
-                codec::encode_response(&ResponseKind::Challenge { nonce }, &mut buf).unwrap();
+            let mut buf = [0u8; 128];
+            let written = codec::encode_response(
+                &ResponseKind::Challenge {
+                    nonce,
+                    server_x25519_eph: [0u8; 32],
+                },
+                &mut buf,
+            )
+            .unwrap();
             writer.write_frame(&buf[4..written]).unwrap();
             writer.flush().unwrap();
 
@@ -425,9 +457,15 @@ mod tests {
             let mut writer = BlockingFrameWriter::new(stream);
 
             let nonce = [0xBB; 32];
-            let mut buf = [0u8; 64];
-            let written =
-                codec::encode_response(&ResponseKind::Challenge { nonce }, &mut buf).unwrap();
+            let mut buf = [0u8; 128];
+            let written = codec::encode_response(
+                &ResponseKind::Challenge {
+                    nonce,
+                    server_x25519_eph: [0u8; 32],
+                },
+                &mut buf,
+            )
+            .unwrap();
             writer.write_frame(&buf[4..written]).unwrap();
             writer.flush().unwrap();
 
@@ -475,9 +513,15 @@ mod tests {
 
             // Send Challenge.
             let nonce = [0xBB; 32];
-            let mut buf = [0u8; 64];
-            let written =
-                codec::encode_response(&ResponseKind::Challenge { nonce }, &mut buf).unwrap();
+            let mut buf = [0u8; 128];
+            let written = codec::encode_response(
+                &ResponseKind::Challenge {
+                    nonce,
+                    server_x25519_eph: [0u8; 32],
+                },
+                &mut buf,
+            )
+            .unwrap();
             writer.write_frame(&buf[4..written]).unwrap();
             writer.flush().unwrap();
 

@@ -170,16 +170,19 @@ fn request_from_bytes(data: &[u8]) -> Option<Request> {
         3 => Some(Request::Heartbeat),
         4 => {
             // ChallengeResponse.
-            if data.len() < 97 {
+            if data.len() < 129 {
                 return None;
             }
             let mut signature = [0u8; 64];
             signature.copy_from_slice(&data[1..65]);
             let mut public_key = [0u8; 32];
             public_key.copy_from_slice(&data[65..97]);
+            let mut client_x25519_eph = [0u8; 32];
+            client_x25519_eph.copy_from_slice(&data[97..129]);
             Some(Request::ChallengeResponse {
                 signature,
                 public_key,
+                client_x25519_eph,
             })
         }
         5 => {

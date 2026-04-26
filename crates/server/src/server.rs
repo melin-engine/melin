@@ -2216,10 +2216,21 @@ fn authenticate_connection<R: std::io::Read, W: std::io::Write>(
     let mut nonce = [0u8; 32];
     getrandom::fill(&mut nonce).map_err(|e| io::Error::other(format!("getrandom failed: {e}")))?;
 
-    // Send Challenge.
-    let mut buf = [0u8; 64];
-    let written = codec::encode_response(&ResponseKind::Challenge { nonce }, &mut buf)
-        .map_err(|e| io::Error::other(format!("encode Challenge: {e}")))?;
+    // Send Challenge. X25519 ephemerals are only meaningful on the
+    // rumcast path (where they seed the per-session MAC token). TCP
+    // sends zeros for the ephemerals; the signature payload still
+    // covers them so server + client share a single signing scheme
+    // — see [`melin_protocol::auth::auth_signing_payload`].
+    let server_x25519_eph = [0u8; 32];
+    let mut buf = [0u8; 128];
+    let written = codec::encode_response(
+        &ResponseKind::Challenge {
+            nonce,
+            server_x25519_eph,
+        },
+        &mut buf,
+    )
+    .map_err(|e| io::Error::other(format!("encode Challenge: {e}")))?;
     writer.write_all(&buf[..written])?;
     writer.flush()?;
 
@@ -2250,11 +2261,12 @@ fn authenticate_connection<R: std::io::Read, W: std::io::Write>(
         }
     };
 
-    let (signature_bytes, public_key_bytes) = match request {
+    let (signature_bytes, public_key_bytes, client_x25519_eph) = match request {
         Request::ChallengeResponse {
             signature,
             public_key,
-        } => (signature, public_key),
+            client_x25519_eph,
+        } => (signature, public_key, client_x25519_eph),
         other => {
             send_auth_failed(writer);
             return Err(format!(
@@ -2274,16 +2286,21 @@ fn authenticate_connection<R: std::io::Read, W: std::io::Write>(
         }
     };
 
-    // Verify the Ed25519 signature over the nonce.
+    // Verify the Ed25519 signature over `nonce ‖ server_eph ‖
+    // client_eph`. TCP path's ephs are zeros — see Challenge above.
     let verifying_key = VerifyingKey::from_bytes(&public_key_bytes).map_err(|e| {
         send_auth_failed(writer);
         io::Error::other(format!("invalid public key: {e}"))
     })?;
     let signature = ed25519_dalek::Signature::from_bytes(&signature_bytes);
-    verifying_key.verify(&nonce, &signature).map_err(|e| {
-        send_auth_failed(writer);
-        io::Error::other(format!("signature verification failed: {e}"))
-    })?;
+    let signing_payload =
+        melin_protocol::auth::auth_signing_payload(&nonce, &server_x25519_eph, &client_x25519_eph);
+    verifying_key
+        .verify(&signing_payload, &signature)
+        .map_err(|e| {
+            send_auth_failed(writer);
+            io::Error::other(format!("signature verification failed: {e}"))
+        })?;
 
     // Auth succeeded — send ServerReady.
     let written = codec::encode_response(&ResponseKind::ServerReady, &mut buf)
@@ -2500,21 +2517,28 @@ mod tests {
     /// a ChallengeResponse back.
     fn client_sign_challenge(stream: &mut UnixStream, key: &SigningKey) {
         let mut len_buf = [0u8; 4];
-        let mut payload = [0u8; 64];
+        let mut payload = [0u8; 128];
         stream.read_exact(&mut len_buf).unwrap();
         let len = u32::from_le_bytes(len_buf) as usize;
         stream.read_exact(&mut payload[..len]).unwrap();
 
         let resp = codec::decode_response(&payload[..len]).unwrap();
-        let nonce = match resp {
-            ResponseKind::Challenge { nonce } => nonce,
+        let (nonce, server_eph) = match resp {
+            ResponseKind::Challenge {
+                nonce,
+                server_x25519_eph,
+            } => (nonce, server_x25519_eph),
             other => panic!("expected Challenge, got {other:?}"),
         };
 
-        let sig = key.sign(&nonce);
+        let client_x25519_eph = [0u8; 32];
+        let signing_payload =
+            melin_protocol::auth::auth_signing_payload(&nonce, &server_eph, &client_x25519_eph);
+        let sig = key.sign(&signing_payload);
         let request = Request::ChallengeResponse {
             signature: sig.to_bytes(),
             public_key: key.verifying_key().to_bytes(),
+            client_x25519_eph,
         };
         let mut buf = [0u8; 256];
         let written = codec::encode_request(&request, 0, &mut buf).unwrap();
@@ -2525,23 +2549,30 @@ mod tests {
     /// Like `client_sign_challenge` but corrupts the signature.
     fn client_sign_challenge_bad(stream: &mut UnixStream, key: &SigningKey) {
         let mut len_buf = [0u8; 4];
-        let mut payload = [0u8; 64];
+        let mut payload = [0u8; 128];
         stream.read_exact(&mut len_buf).unwrap();
         let len = u32::from_le_bytes(len_buf) as usize;
         stream.read_exact(&mut payload[..len]).unwrap();
 
         let resp = codec::decode_response(&payload[..len]).unwrap();
-        let nonce = match resp {
-            ResponseKind::Challenge { nonce } => nonce,
+        let (nonce, server_eph) = match resp {
+            ResponseKind::Challenge {
+                nonce,
+                server_x25519_eph,
+            } => (nonce, server_x25519_eph),
             other => panic!("expected Challenge, got {other:?}"),
         };
 
-        let mut sig_bytes = key.sign(&nonce).to_bytes();
+        let client_x25519_eph = [0u8; 32];
+        let signing_payload =
+            melin_protocol::auth::auth_signing_payload(&nonce, &server_eph, &client_x25519_eph);
+        let mut sig_bytes = key.sign(&signing_payload).to_bytes();
         sig_bytes[0] ^= 0xFF;
 
         let request = Request::ChallengeResponse {
             signature: sig_bytes,
             public_key: key.verifying_key().to_bytes(),
+            client_x25519_eph,
         };
         let mut buf = [0u8; 256];
         let written = codec::encode_request(&request, 0, &mut buf).unwrap();
@@ -2629,7 +2660,7 @@ mod tests {
 
         // Read and discard the Challenge.
         let mut len_buf = [0u8; 4];
-        let mut payload = [0u8; 64];
+        let mut payload = [0u8; 128];
         s2.read_exact(&mut len_buf).unwrap();
         let len = u32::from_le_bytes(len_buf) as usize;
         s2.read_exact(&mut payload[..len]).unwrap();
@@ -2684,7 +2715,7 @@ mod tests {
 
         // Read and discard Challenge.
         let mut len_buf = [0u8; 4];
-        let mut payload = [0u8; 64];
+        let mut payload = [0u8; 128];
         s2.read_exact(&mut len_buf).unwrap();
         let len = u32::from_le_bytes(len_buf) as usize;
         s2.read_exact(&mut payload[..len]).unwrap();
@@ -2710,7 +2741,7 @@ mod tests {
 
         // Read and discard Challenge.
         let mut len_buf = [0u8; 4];
-        let mut payload = [0u8; 64];
+        let mut payload = [0u8; 128];
         s2.read_exact(&mut len_buf).unwrap();
         let len = u32::from_le_bytes(len_buf) as usize;
         s2.read_exact(&mut payload[..len]).unwrap();
