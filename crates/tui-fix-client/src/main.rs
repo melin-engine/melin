@@ -1151,6 +1151,14 @@ fn run_bot_session_once(
     let mut next_clord_id: u64 = 1;
     let mut last_report = start;
     let mut sent_since_report: u64 = 0;
+    // Diagnostic counters. The bot's expected steady state is ~zero
+    // rejections; sustained non-zero values usually mean the gateway
+    // assigned an OrderId the engine has already seen (e.g. after a
+    // server restart with a persisted journal — the engine's per-account
+    // OrderId HWM survives but the gateway's id_map starts fresh).
+    let mut rejections_total: u64 = 0;
+    let mut rejections_logged: u32 = 0;
+    const MAX_REJECTION_LOGS: u32 = 5;
 
     loop {
         let t = start.elapsed().as_secs_f64();
@@ -1164,14 +1172,29 @@ fn run_bot_session_once(
 
         if last_report.elapsed() >= Duration::from_secs(2) {
             // Drain queued ERs before reporting so the TCP buffer doesn't
-            // grow unbounded over long runs. A read error here is a real
-            // disconnect — bubble it up to trigger reconnect.
-            while c.try_recv()?.is_some() {}
+            // grow unbounded over long runs. Tally rejections (35=8 with
+            // 150=8) and log the first few with reason text so the cause
+            // is observable instead of silent. A read error here is a
+            // real disconnect — bubble it up to trigger reconnect.
+            while let Some(msg) = c.try_recv()? {
+                if msg.get_str(tags::EXEC_TYPE) != Some("8") {
+                    continue;
+                }
+                rejections_total += 1;
+                if rejections_logged < MAX_REJECTION_LOGS {
+                    let reason = msg.get_str(tags::TEXT).unwrap_or("?");
+                    let clord_id = msg.get_str(tags::CL_ORD_ID).unwrap_or("?");
+                    let _ = tx.send(UiMsg::Log(format!(
+                        "[BOT] rejected clord={clord_id} reason={reason}"
+                    )));
+                    rejections_logged += 1;
+                }
+            }
 
             let actual = sent_since_report as f64 / last_report.elapsed().as_secs_f64();
             let mid = bot::bot_mid_price(t);
             let _ = tx.send(UiMsg::Log(format!(
-                "[BOT] t={t:5.1}s mid={mid:>7.2} sent={actual:>5.1}/s"
+                "[BOT] t={t:5.1}s mid={mid:>7.2} sent={actual:>5.1}/s rej={rejections_total}"
             )));
             last_report = Instant::now();
             sent_since_report = 0;
