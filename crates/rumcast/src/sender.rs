@@ -20,17 +20,18 @@
 //!
 //! # Flow control
 //!
-//! v1 implements a simple min-of-receivers flow control inline:
-//! `publisher_limit = min(receiver.consumption_position) +
-//! min(receiver.receiver_window)`. Task #8 lifts this into a pluggable
-//! [`crate::pub_log::PublicationLog::set_publisher_limit`] strategy
-//! (min for replication, max for market data).
+//! Configurable via [`SenderConfig::flow_control`] — see
+//! [`crate::flow_control::FlowControl`] for the available strategies
+//! (min for replication, max for market-data fan-out). The sender
+//! recomputes the publisher limit on every Status Message and (for
+//! Max) evicts slow consumers that have fallen too far behind.
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use crate::flow_control::{FlowControl, ReceiverState};
 use crate::pub_log::{FRAGMENT_ALIGNMENT, PublicationLog};
 use crate::storage::{AlignedBuf, align_up};
 use crate::transport::UdpTransport;
@@ -59,11 +60,16 @@ pub struct SenderConfig {
     /// Maximum incoming control frames to process per tick. Same
     /// bounding rationale.
     pub max_control_per_tick: u32,
+    /// Strategy for translating receivers' Status Messages into the
+    /// publisher's `publisher_limit`. See [`FlowControl`].
+    pub flow_control: FlowControl,
 }
 
 impl SenderConfig {
     /// Reasonable defaults for unit tests / loopback runs. Production
-    /// callers should pick these explicitly.
+    /// callers should pick these explicitly. Defaults to `Min` flow
+    /// control — the conservative choice; replication needs it and
+    /// it's a reasonable starting point for unicast in general.
     pub fn defaults(dst: SocketAddr) -> Self {
         Self {
             dst,
@@ -71,6 +77,7 @@ impl SenderConfig {
             heartbeat_interval: Duration::from_millis(50),
             max_drain_per_tick: 64 * 1024,
             max_control_per_tick: 32,
+            flow_control: FlowControl::Min,
         }
     }
 }
@@ -93,14 +100,6 @@ pub struct TickStats {
     /// network or destination configuration problem; spikes correlate
     /// with kernel send-buffer pressure.
     pub send_errors: u32,
-}
-
-#[derive(Debug, Clone, Copy)]
-struct ReceiverState {
-    consumption_position: u64,
-    receiver_window: u32,
-    #[allow(dead_code)] // future v2: stale-receiver eviction
-    last_seen_at: Instant,
 }
 
 /// Sender loop. See module docs.
@@ -248,32 +247,33 @@ impl<T: UdpTransport> SenderLoop<T> {
                     r.consumption_position = consumption_pos;
                 }
                 r.receiver_window = sm.receiver_window;
-                r.last_seen_at = Instant::now();
             })
             .or_insert(ReceiverState {
                 consumption_position: consumption_pos,
                 receiver_window: sm.receiver_window,
-                last_seen_at: Instant::now(),
             });
 
-        // Min flow control: publisher_limit is gated by the slowest
-        // receiver. With no receivers, leave the limit at its current
-        // value (the log's startup default lets the producer fill the
-        // first term standalone, useful for tests).
-        if !self.receivers.is_empty() {
-            let min_consumption = self
-                .receivers
-                .values()
-                .map(|r| r.consumption_position)
-                .min()
-                .expect("non-empty");
-            let min_window = self
-                .receivers
-                .values()
-                .map(|r| r.receiver_window)
-                .min()
-                .expect("non-empty");
-            let new_limit = min_consumption + min_window as u64;
+        // Evict slow consumers BEFORE recomputing the limit so the
+        // limit reflects only kept receivers. (Min strategy never
+        // evicts; the call is a no-op for it.)
+        for slow_id in self
+            .config
+            .flow_control
+            .find_slow_consumers(&self.receivers)
+        {
+            self.receivers.remove(&slow_id);
+        }
+
+        // Recompute publisher_limit. With no receivers (everyone
+        // evicted, or none ever connected), leave the limit at its
+        // current value — the log's startup default lets the producer
+        // fill the first term standalone, useful for tests and for
+        // the "publish before any subscriber connects" case.
+        if let Some(new_limit) = self
+            .config
+            .flow_control
+            .compute_publisher_limit(&self.receivers)
+        {
             self.log.set_publisher_limit(new_limit);
         }
     }
@@ -864,6 +864,7 @@ mod tests {
             heartbeat_interval: Duration::from_secs(3600),
             max_drain_per_tick: 64 * 1024,
             max_control_per_tick: 32,
+            flow_control: FlowControl::Min,
         };
         let mut sender = SenderLoop::new(Arc::clone(&log), transport, config);
 
@@ -878,6 +879,131 @@ mod tests {
             }
             other => panic!("expected Setup, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn max_flow_control_paces_to_fastest_receiver() {
+        let recv = KernelUdp::bind(loopback(0)).unwrap();
+        let log = Arc::new(PublicationLog::new(pub_cfg()).unwrap());
+        log.set_publisher_limit(u64::MAX);
+        let transport = KernelUdp::bind(loopback(0)).unwrap();
+        let mut config = SenderConfig::defaults(recv.local_addr().unwrap());
+        config.setup_interval = Duration::from_secs(3600);
+        config.heartbeat_interval = Duration::from_secs(3600);
+        config.flow_control = FlowControl::Max {
+            slow_consumer_threshold: u64::MAX, // disable eviction for this test
+        };
+        let mut sender = SenderLoop::new(Arc::clone(&log), transport, config);
+
+        let bits = log.term_length_bits();
+        let nak_socket = KernelUdp::bind(loopback(0)).unwrap();
+        let sender_addr = sender.transport.local_addr().unwrap();
+
+        // Receiver 1: lagging.
+        let sm1 = StatusMessage::new(
+            pub_cfg().session_id,
+            pub_cfg().stream_id,
+            100,
+            4096,
+            16 * 1024,
+            1,
+        );
+        nak_socket
+            .send_to(sender_addr, bytemuck::bytes_of(&sm1))
+            .unwrap();
+        // Receiver 2: ahead.
+        let sm2 = StatusMessage::new(
+            pub_cfg().session_id,
+            pub_cfg().stream_id,
+            100,
+            16 * 1024,
+            32 * 1024,
+            2,
+        );
+        nak_socket
+            .send_to(sender_addr, bytemuck::bytes_of(&sm2))
+            .unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            let _ = sender.tick();
+            if sender.receiver_count() >= 2 {
+                break;
+            }
+            if Instant::now() > deadline {
+                panic!("both SMs not processed");
+            }
+        }
+
+        // Max strategy: pub_limit = max_pos + max_window
+        // = position(100, 16384) + 32 KiB.
+        let expected = position(100, 16 * 1024, bits) + 32 * 1024;
+        assert_eq!(log.publisher_limit(), expected);
+    }
+
+    #[test]
+    fn max_flow_control_evicts_slow_consumer() {
+        let recv = KernelUdp::bind(loopback(0)).unwrap();
+        let log = Arc::new(PublicationLog::new(pub_cfg()).unwrap());
+        log.set_publisher_limit(u64::MAX);
+        let transport = KernelUdp::bind(loopback(0)).unwrap();
+        let mut config = SenderConfig::defaults(recv.local_addr().unwrap());
+        config.setup_interval = Duration::from_secs(3600);
+        config.heartbeat_interval = Duration::from_secs(3600);
+        // Anything lagging by more than 8 KiB is dropped.
+        config.flow_control = FlowControl::Max {
+            slow_consumer_threshold: 8 * 1024,
+        };
+        let mut sender = SenderLoop::new(Arc::clone(&log), transport, config);
+
+        let bits = log.term_length_bits();
+        let nak_socket = KernelUdp::bind(loopback(0)).unwrap();
+        let sender_addr = sender.transport.local_addr().unwrap();
+
+        // Slow receiver (id=1): position 1 KiB, will be evicted.
+        let sm_slow = StatusMessage::new(
+            pub_cfg().session_id,
+            pub_cfg().stream_id,
+            100,
+            1024,
+            16 * 1024,
+            1,
+        );
+        // Fast receiver (id=2): position 32 KiB, sets the bar.
+        let sm_fast = StatusMessage::new(
+            pub_cfg().session_id,
+            pub_cfg().stream_id,
+            100,
+            32 * 1024,
+            16 * 1024,
+            2,
+        );
+        nak_socket
+            .send_to(sender_addr, bytemuck::bytes_of(&sm_slow))
+            .unwrap();
+        nak_socket
+            .send_to(sender_addr, bytemuck::bytes_of(&sm_fast))
+            .unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            let _ = sender.tick();
+            // After both SMs processed, the slow one (lag = 31 KiB > 8 KiB)
+            // should be evicted, leaving exactly one tracked receiver.
+            if sender.receiver_count() == 1 {
+                break;
+            }
+            if Instant::now() > deadline {
+                panic!(
+                    "expected slow consumer eviction (count={})",
+                    sender.receiver_count()
+                );
+            }
+        }
+
+        // Limit reflects the fast (and only remaining) receiver.
+        let expected = position(100, 32 * 1024, bits) + 16 * 1024;
+        assert_eq!(log.publisher_limit(), expected);
     }
 
     #[test]
