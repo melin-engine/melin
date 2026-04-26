@@ -7971,6 +7971,78 @@ mod tests {
     }
 
     #[test]
+    fn snapshot_roundtrip_multi_instrument_fill() {
+        // Reproduce the shadow-stage panic at runtime: many resting orders
+        // across multiple instruments, then a clone, then a taker that
+        // matches against a recovered maker. If any maker's reservation
+        // slot wasn't injected by `inject_reservation_slots`, the fill
+        // path indexes the slab with `ReservationSlot::DUMMY` (u32::MAX)
+        // and the engine panics. The bot's demo hits this scenario the
+        // moment a bot order matches against a journal-recovered maker.
+        let mut exchange = Exchange::new();
+        exchange.add_instrument(btc_usd_spec());
+        exchange.add_instrument(eth_usd_spec());
+
+        // Seed lots of accounts with both currencies so we can place
+        // many makers across both instruments — same shape the bot
+        // produces (31 accounts touching 2 symbols). Plus two extra
+        // accounts (50, 51) used by the post-restore takers below.
+        for acct in 2..=32u32 {
+            exchange.deposit(AccountId(acct), USD, 1_000_000);
+            exchange.deposit(AccountId(acct), BTC, 1_000);
+            exchange.deposit(AccountId(acct), ETH, 1_000);
+        }
+        for acct in [50u32, 51] {
+            exchange.deposit(AccountId(acct), USD, 1_000_000);
+            exchange.deposit(AccountId(acct), BTC, 1_000);
+            exchange.deposit(AccountId(acct), ETH, 1_000);
+        }
+
+        // Place 200 resting orders, many sharing price levels (the bot's
+        // shape — narrow spread, many orders clustered around the mid).
+        let mut reports = Vec::new();
+        for i in 0..200u64 {
+            let acct = AccountId(2 + (i as u32 % 31));
+            let symbol = if i % 2 == 0 { Symbol(1) } else { Symbol(2) };
+            let side = if i % 3 == 0 { Side::Buy } else { Side::Sell };
+            let id = 1000 + i;
+            // Cluster prices: only ~10 distinct price points → many
+            // orders per level → exercises the level-queue + index pair.
+            let p = match side {
+                Side::Buy => 95 - (i % 5),
+                Side::Sell => 105 + (i % 5),
+            };
+            exchange.execute(
+                symbol,
+                limit_order(id, acct, side, p, 5, TimeInForce::GTC),
+                &mut reports,
+            );
+        }
+        reports.clear();
+
+        let mut restored = exchange.clone_via_snapshot();
+
+        // Drive a taker into the restored exchange that should match an
+        // existing resting bid (any of the Side::Buy orders above).
+        // If any maker slot is DUMMY, fill() panics here.
+        restored.execute(
+            Symbol(1),
+            limit_order(9999, AccountId(50), Side::Sell, 50, 1, TimeInForce::GTC),
+            &mut reports,
+        );
+
+        // Symmetric: a buy that crosses an existing ask.
+        restored.execute(
+            Symbol(2),
+            limit_order(9998, AccountId(51), Side::Buy, 200, 1, TimeInForce::GTC),
+            &mut reports,
+        );
+
+        // Survival is the assertion. If we got here without panicking,
+        // every recovered maker had a real reservation slot.
+    }
+
+    #[test]
     fn snapshot_roundtrip_preserves_live_dedup() {
         // The v15 snapshot format drops the explicit OrderId map and
         // rebuilds the live `(account, order_id)` set from `order_index`
