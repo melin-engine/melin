@@ -41,4 +41,5 @@ compile_error!(
      bytemuck-based zero-copy header decode is unsafe on big-endian"
 );
 
+pub mod pub_log;
 pub mod wire;

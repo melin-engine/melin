@@ -64,6 +64,12 @@ pub mod data_flags {
     pub const END_FRAGMENT: u8 = 0x40;
     /// An unfragmented message has both `BEGIN_FRAGMENT` and `END_FRAGMENT`.
     pub const UNFRAGMENTED: u8 = BEGIN_FRAGMENT | END_FRAGMENT;
+    /// Term-end padding fragment. The publisher emits this when the active
+    /// term cannot fit the next message and a rotation is required; the
+    /// payload bytes are not part of the message stream and the receiver
+    /// MUST skip them, advancing its position to `term_offset + payload_len`
+    /// without delivering anything to the application.
+    pub const PADDING: u8 = 0x10;
 }
 
 /// Common 8-byte prefix shared by every frame. Lets the receiver dispatch
