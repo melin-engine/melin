@@ -53,8 +53,14 @@ use crate::wire::{FrameView, NakFrame, ParseError, StatusMessage, parse_frame, p
 /// Configuration for [`ReceiverLoop`].
 #[derive(Debug, Clone, Copy)]
 pub struct ReceiverConfig {
-    /// Where to send NAK and Status Message frames (the publisher's
-    /// address — unicast back to the originator).
+    /// Initial publisher address for NAK and Status Message frames.
+    /// Acts as a seed only — once the receiver observes the source
+    /// addr of a valid Data/Setup/Heartbeat frame from the matching
+    /// session/stream, it learns the real publisher endpoint and
+    /// retargets all SMs/NAKs there. This avoids cross-wired control
+    /// traffic when the publisher binds an ephemeral port (the common
+    /// case) and the configured address only happens to land on
+    /// *some* socket of the peer rather than the publisher's socket.
     pub dst: SocketAddr,
     /// Unique identifier for this subscriber within the stream. Sent
     /// in every Status Message so the publisher can disambiguate
@@ -147,6 +153,11 @@ pub struct ReceiverLoop<T: UdpTransport> {
     log: Arc<SubscriptionLog>,
     transport: T,
     config: ReceiverConfig,
+    /// Address SMs/NAKs are actually sent to. Seeded from `config.dst`
+    /// and overwritten with the source addr of the first valid
+    /// Data/Setup/Heartbeat frame from the matching session/stream.
+    /// See [`ReceiverConfig::dst`].
+    effective_dst: SocketAddr,
     last_sm_at: Instant,
     last_publisher_seen_at: Option<Instant>,
     pending_naks: HashMap<(u32, u32, u32), PendingNak>,
@@ -163,11 +174,13 @@ pub struct ReceiverLoop<T: UdpTransport> {
 impl<T: UdpTransport> ReceiverLoop<T> {
     pub fn new(log: Arc<SubscriptionLog>, transport: T, config: ReceiverConfig) -> Self {
         let now = Instant::now();
+        let effective_dst = config.dst;
         Self {
             rng: Rng::new(config.receiver_id),
             log,
             transport,
             config,
+            effective_dst,
             last_sm_at: now,
             last_publisher_seen_at: None,
             pending_naks: HashMap::new(),
@@ -175,6 +188,13 @@ impl<T: UdpTransport> ReceiverLoop<T> {
             counters: None,
             loss_callback: None,
         }
+    }
+
+    /// Address SMs/NAKs are currently sent to. Equals `config.dst`
+    /// until the first valid frame from the publisher arrives, then
+    /// the source addr of that frame thereafter.
+    pub fn effective_dst(&self) -> SocketAddr {
+        self.effective_dst
     }
 
     /// Install (or remove) shared cumulative counters. Pass `None` to
@@ -223,10 +243,10 @@ impl<T: UdpTransport> ReceiverLoop<T> {
 
     fn drain_recv(&mut self, stats: &mut TickStats) {
         for _ in 0..self.config.max_recv_per_tick {
-            let len = {
+            let (from, len) = {
                 let buf = self.recv_buf.slice_mut();
                 match self.transport.recv_from(buf) {
-                    Ok(Some((_from, len))) => len,
+                    Ok(Some((from, len))) => (from, len),
                     Ok(None) => return,
                     Err(_) => {
                         stats.recv_errors += 1;
@@ -240,10 +260,11 @@ impl<T: UdpTransport> ReceiverLoop<T> {
 
             // Multicast hygiene: drop frames not addressed to our
             // session/stream. `parse_frame` doesn't enforce this
-            // (it's a generic dispatcher). last_publisher_seen_at is
-            // updated only for frames that pass the session check —
-            // a misaddressed frame should not look like liveness from
-            // our intended publisher.
+            // (it's a generic dispatcher). last_publisher_seen_at and
+            // effective_dst are updated only for frames that pass the
+            // session check — a misaddressed frame should not look
+            // like liveness from our intended publisher, nor steer
+            // our SMs/NAKs to the wrong endpoint.
             let cfg_session = self.log.config().session_id;
             let cfg_stream = self.log.config().stream_id;
             let now = Instant::now();
@@ -254,6 +275,7 @@ impl<T: UdpTransport> ReceiverLoop<T> {
                         continue;
                     }
                     self.last_publisher_seen_at = Some(now);
+                    self.effective_dst = from;
                     let term_id = header.term_id;
                     let term_offset = header.term_offset;
                     match self.log.on_fragment(term_id, term_offset, bytes) {
@@ -266,6 +288,7 @@ impl<T: UdpTransport> ReceiverLoop<T> {
                         stats.control_drops += 1;
                     } else {
                         self.last_publisher_seen_at = Some(now);
+                        self.effective_dst = from;
                         stats.setups_received += 1;
                     }
                 }
@@ -274,6 +297,7 @@ impl<T: UdpTransport> ReceiverLoop<T> {
                         stats.control_drops += 1;
                     } else {
                         self.last_publisher_seen_at = Some(now);
+                        self.effective_dst = from;
                         stats.heartbeats_received += 1;
                     }
                 }
@@ -386,7 +410,7 @@ impl<T: UdpTransport> ReceiverLoop<T> {
             );
             match self
                 .transport
-                .send_to(self.config.dst, bytemuck::bytes_of(&nak))
+                .send_to(self.effective_dst, bytemuck::bytes_of(&nak))
             {
                 Ok(_) => stats.naks_sent += 1,
                 Err(_) => stats.send_errors += 1,
@@ -474,7 +498,7 @@ impl<T: UdpTransport> ReceiverLoop<T> {
         );
         match self
             .transport
-            .send_to(self.config.dst, bytemuck::bytes_of(&sm))
+            .send_to(self.effective_dst, bytemuck::bytes_of(&sm))
         {
             Ok(_) => {
                 stats.sms_sent += 1;
@@ -735,6 +759,78 @@ mod tests {
             }
             other => panic!("expected SM, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn sm_retargets_to_publisher_source_addr_after_first_data_frame() {
+        // Regression: in melin's bench wire-up, the receiver's
+        // statically-configured `dst` ends up pointing at a *different*
+        // socket on the peer (the response receiver port, not the
+        // order publisher port). Without auto-discovery, SMs went to
+        // the wrong socket and were dropped, so the publisher never
+        // learned the consumption position. Verify that after the
+        // first valid data frame arrives, subsequent SMs go to the
+        // packet's source addr instead of `config.dst`.
+        let log = Arc::new(SubscriptionLog::new(sub_cfg()).unwrap());
+        let publisher = KernelUdp::bind(loopback(0)).unwrap();
+        let publisher_addr = publisher.local_addr().unwrap();
+        // A second, unrelated socket — represents the wrong endpoint
+        // the receiver was configured with.
+        let wrong_dst_socket = KernelUdp::bind(loopback(0)).unwrap();
+        let wrong_dst = wrong_dst_socket.local_addr().unwrap();
+        let recv_socket = KernelUdp::bind(loopback(0)).unwrap();
+        let recv_addr = recv_socket.local_addr().unwrap();
+        let mut config = ReceiverConfig::defaults(wrong_dst, 42);
+        // Long SM interval so the constructor's first SM doesn't fire
+        // before we feed in a data frame.
+        config.sm_interval = Duration::from_millis(50);
+        let mut receiver = ReceiverLoop::new(Arc::clone(&log), recv_socket, config);
+        assert_eq!(receiver.effective_dst(), wrong_dst);
+
+        // Publisher sends a data frame from its real (ephemeral) addr.
+        let frag = build_fragment(100, 0, data_flags::UNFRAGMENTED, &[0xAB; 32]);
+        publisher.send_to(recv_addr, &frag).unwrap();
+
+        // Tick until the receiver accepts the fragment AND the SM
+        // interval elapses. Drain via poll() each round so the
+        // subscriber position advances — otherwise unread fragments
+        // look like a gap and the receiver fires a NAK before the SM.
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let mut accepted = false;
+        let mut sm_emitted = false;
+        while Instant::now() < deadline && !sm_emitted {
+            let stats = receiver.tick();
+            if stats.fragments_accepted >= 1 {
+                accepted = true;
+            }
+            log.poll(64 * 1024, |_| {});
+            if stats.sms_sent >= 1 {
+                sm_emitted = true;
+            }
+        }
+        assert!(accepted, "data frame not accepted within deadline");
+        assert!(sm_emitted, "no SM emitted within deadline");
+
+        // SM must arrive at the actual publisher socket — not at the
+        // wrong-dst socket the receiver was originally configured
+        // with.
+        let dgrams = drain_n(&publisher, 1);
+        match parse_frame(&dgrams[0]).unwrap() {
+            FrameView::StatusMessage(sm) => assert_eq!(sm.receiver_id, 42),
+            other => panic!("expected SM at publisher addr, got {other:?}"),
+        }
+        // And the wrong-dst socket must see nothing — SMs should NOT
+        // have been mistargeted.
+        let mut buf = [0u8; 2048];
+        match wrong_dst_socket.recv_from(&mut buf).unwrap() {
+            None => {} // expected
+            Some((_, len)) => {
+                // Whatever it is, it must not be an SM addressed at us
+                // — but we expect nothing at all here.
+                panic!("wrong-dst socket received {len} bytes; SM was mistargeted");
+            }
+        }
+        assert_eq!(receiver.effective_dst(), publisher_addr);
     }
 
     #[test]
