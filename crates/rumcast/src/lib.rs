@@ -42,6 +42,7 @@ compile_error!(
 );
 
 pub mod pub_log;
+pub mod sender;
 mod storage;
 pub mod sub_log;
 pub mod transport;

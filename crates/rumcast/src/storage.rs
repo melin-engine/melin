@@ -76,6 +76,33 @@ pub(crate) fn align_up(n: u32, alignment: u32) -> u32 {
     (n + alignment - 1) & !(alignment - 1)
 }
 
+/// Stack-allocated, 8-byte-aligned scratch buffer suitable for UDP
+/// `recv_from` followed by `parse_frame`. The strictest header
+/// alignment in the wire format is `DataFrame` at 8 bytes; this ensures
+/// the start of every received datagram satisfies that.
+#[repr(C, align(8))]
+pub(crate) struct AlignedBuf<const N: usize>(pub(crate) [u8; N]);
+
+impl<const N: usize> AlignedBuf<N> {
+    #[inline]
+    pub(crate) fn new() -> Self {
+        Self([0u8; N])
+    }
+    /// Mutable slice over the buffer. Named `slice_mut` (not `as_mut`)
+    /// to avoid ambiguity when the buffer is held in a `Box`, which
+    /// also exposes `as_mut`.
+    #[inline]
+    pub(crate) fn slice_mut(&mut self) -> &mut [u8] {
+        &mut self.0
+    }
+    /// Immutable slice over the buffer. Named `slice` (not `as_ref`)
+    /// for the same reason as `slice_mut`.
+    #[inline]
+    pub(crate) fn slice(&self) -> &[u8] {
+        &self.0
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

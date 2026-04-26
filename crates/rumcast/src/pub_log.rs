@@ -328,6 +328,66 @@ impl PublicationLog {
         None
     }
 
+    /// Return the bytes of the single fragment starting at
+    /// `start_position`, or `None` if no fragment is yet published
+    /// there (or it has been overwritten by a later term).
+    ///
+    /// Sender drain loop: walk forward by `align_up(fragment.len(),
+    /// FRAGMENT_ALIGNMENT)` to find the next fragment.
+    ///
+    /// Single `Acquire` load on `publisher_position` plus the partition
+    /// scan; no extra atomic on the slot's `frame_length` is needed
+    /// because the publisher's `Release`-store on `publisher_position`
+    /// happens-after the header memcpy.
+    pub fn published_fragment(&self, start_position: u64) -> Option<&[u8]> {
+        let pub_pos = self.publisher_position();
+        if start_position >= pub_pos {
+            return None;
+        }
+        let term_length = self.config.term_length as u64;
+        let term_id = (start_position / term_length) as u32;
+        let term_offset = (start_position % term_length) as u32;
+
+        let partition =
+            (0..3).find(|&i| self.term_ids[i].get().load(Ordering::Acquire) == term_id)?;
+
+        let slot_start = self.partition_base(partition as u32) + term_offset as usize;
+        // SAFETY: slot_start is within [0, 3*term_length); partition_base
+        // is a multiple of term_length, term_offset is a valid in-term
+        // offset (< term_length per the position-decoding math). slot_ptr
+        // is 32-byte aligned (partition_base 64-aligned, term_offset is
+        // a multiple of 32 because positions advance by aligned totals).
+        let slot_ptr = unsafe { self.storage.as_ptr().add(slot_start) };
+
+        // SAFETY: pub_pos > start_position means the publisher's
+        // Release-store on publisher_position has already taken effect,
+        // so its preceding non-atomic header memcpy is visible to us
+        // via the Acquire pair on `publisher_position()`. Plain reads
+        // are safe.
+        let frame_length_bytes = unsafe { core::slice::from_raw_parts(slot_ptr, 4) };
+        let frame_length = u32::from_le_bytes(frame_length_bytes.try_into().expect("4 bytes"));
+        if frame_length == 0 {
+            // Shouldn't happen given pub_pos > start_position, but bail
+            // out rather than UB if the buffer is in an unexpected state.
+            return None;
+        }
+        // Sanity: fragment must fit within the term.
+        if (term_offset as u64) + (frame_length as u64) > term_length {
+            return None;
+        }
+        // The fragment's last byte must also be within the published
+        // window. The publisher always advances pub_pos by the aligned
+        // total (>= frame_length), so this is normally true.
+        if start_position + (frame_length as u64) > pub_pos {
+            return None;
+        }
+        // SAFETY: bounds confirmed above; the slice borrows from the
+        // resident partition for as long as it remains assigned to
+        // this term_id (see retransmit_window's race-condition note).
+        let slice = unsafe { core::slice::from_raw_parts(slot_ptr, frame_length as usize) };
+        Some(slice)
+    }
+
     /// Read the published bytes in `[start_position, end_position)` from
     /// the contiguous publish stream. Used by the sender to drain newly
     /// published bytes into outgoing UDP packets. Returns `None` if any
@@ -910,6 +970,41 @@ mod tests {
         assert_eq!(log.retransmit_window(100, 0, 32), None);
         // Term 103 IS resident (in partition 0).
         assert!(log.retransmit_window(103, 0, 32).is_some());
+    }
+
+    #[test]
+    fn published_fragment_walks_log_one_fragment_at_a_time() {
+        let log = PublicationLog::new(cfg()).unwrap();
+        log.set_publisher_limit(u64::MAX);
+        // Publish three fragments of different sizes.
+        let sizes = [32u32, 64, 96];
+        for &size in &sizes {
+            let mut c = log.try_claim(size).unwrap();
+            c.payload_mut().fill(size as u8);
+            c.publish(data_flags::UNFRAGMENTED);
+        }
+        // Walk via published_fragment.
+        let mut pos = pos(100, 0);
+        let mut seen: Vec<u32> = Vec::new();
+        while let Some(frag) = log.published_fragment(pos) {
+            let frame_length = u32::from_le_bytes(frag[0..4].try_into().unwrap());
+            seen.push(frame_length - DataFrame::HEADER_LEN as u32);
+            pos += align_up(frame_length, FRAGMENT_ALIGNMENT) as u64;
+        }
+        assert_eq!(seen, vec![32, 64, 96]);
+    }
+
+    #[test]
+    fn published_fragment_returns_none_past_published_position() {
+        let log = PublicationLog::new(cfg()).unwrap();
+        // Nothing published — any position returns None.
+        assert!(log.published_fragment(pos(100, 0)).is_none());
+        // Publish one fragment; queries past it return None.
+        let c = log.try_claim(64).unwrap();
+        c.publish(data_flags::UNFRAGMENTED);
+        assert!(log.published_fragment(pos(100, 96)).is_none());
+        // But the query at 0 succeeds.
+        assert!(log.published_fragment(pos(100, 0)).is_some());
     }
 
     #[test]
