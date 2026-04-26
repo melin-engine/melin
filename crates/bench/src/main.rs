@@ -304,6 +304,14 @@ struct BenchArgs {
     /// `--rumcast-client-addr`).
     #[arg(long)]
     rumcast_bind: Option<std::net::SocketAddr>,
+
+    /// Busy-spin between rumcast tick iterations instead of the default
+    /// 10µs sleep. Lower latency on isolated cores; burns a CPU. Use
+    /// for apples-to-apples comparison against the busy-spin server
+    /// (`melin-server` runs busy-spin by default; turn it off there
+    /// with `--yield-idle`).
+    #[arg(long, default_value_t = false)]
+    rumcast_busy_spin: bool,
 }
 
 fn main() {
@@ -360,6 +368,7 @@ fn main() {
                     accounts: args.accounts,
                     instruments: args.instruments,
                     json_path: json_path.map(|p| p.to_path_buf()),
+                    busy_spin: args.rumcast_busy_spin,
                 });
             }
 

@@ -50,6 +50,10 @@ pub struct RumcastBenchConfig {
     pub accounts: u32,
     pub instruments: u32,
     pub json_path: Option<PathBuf>,
+    /// Busy-spin between tick iterations instead of the default 10µs
+    /// sleep. Lower latency on isolated cores; burns a CPU. Match the
+    /// server's idle strategy for apples-to-apples comparison.
+    pub busy_spin: bool,
 }
 
 pub fn run_rumcast_roundtrip(cfg: RumcastBenchConfig) {
@@ -120,18 +124,14 @@ pub fn run_rumcast_roundtrip(cfg: RumcastBenchConfig) {
     let shutdown = Arc::new(AtomicBool::new(false));
     let mut handles: Vec<thread::JoinHandle<()>> = Vec::new();
 
+    let busy_spin = cfg.busy_spin;
     {
         let shutdown = Arc::clone(&shutdown);
         let mut sender = orders_sender;
         handles.push(
             thread::Builder::new()
                 .name("rumcast-bench-orders-send".into())
-                .spawn(move || {
-                    while !shutdown.load(Ordering::Acquire) {
-                        let _ = sender.tick();
-                        thread::sleep(Duration::from_micros(10));
-                    }
-                })
+                .spawn(move || tick_loop(&shutdown, busy_spin, || sender.tick()))
                 .expect("spawn orders-send"),
         );
     }
@@ -141,12 +141,7 @@ pub fn run_rumcast_roundtrip(cfg: RumcastBenchConfig) {
         handles.push(
             thread::Builder::new()
                 .name("rumcast-bench-resp-recv".into())
-                .spawn(move || {
-                    while !shutdown.load(Ordering::Acquire) {
-                        let _ = receiver.tick();
-                        thread::sleep(Duration::from_micros(10));
-                    }
-                })
+                .spawn(move || tick_loop(&shutdown, busy_spin, || receiver.tick()))
                 .expect("spawn resp-recv"),
         );
     }
@@ -215,10 +210,15 @@ pub fn run_rumcast_roundtrip(cfg: RumcastBenchConfig) {
             }
         });
 
-        // No progress? Yield briefly to avoid pegging a core on the
-        // bench thread while the network round-trips are in flight.
+        // No progress? Either yield (default, friendly to the OS) or
+        // busy-spin (matches `--rumcast-busy-spin`, lowest latency on
+        // an isolated core).
         if drained_now == 0 {
-            thread::sleep(Duration::from_micros(10));
+            if busy_spin {
+                std::hint::spin_loop();
+            } else {
+                thread::sleep(Duration::from_micros(10));
+            }
         }
     }
 
@@ -263,5 +263,21 @@ pub fn run_rumcast_roundtrip(cfg: RumcastBenchConfig) {
     shutdown.store(true, Ordering::Release);
     for h in handles {
         let _ = h.join();
+    }
+}
+
+/// Generic tick loop body shared by the bench's sender / receiver
+/// threads. Mirrors `melin_server::rumcast_transport::tick_loop`.
+/// `busy_spin = true` → `spin_loop` hint between ticks (lowest
+/// latency, burns a CPU). `busy_spin = false` → 10µs sleep.
+#[inline]
+fn tick_loop<F: FnMut() -> R, R>(shutdown: &AtomicBool, busy_spin: bool, mut tick: F) {
+    while !shutdown.load(Ordering::Acquire) {
+        let _ = tick();
+        if busy_spin {
+            std::hint::spin_loop();
+        } else {
+            thread::sleep(Duration::from_micros(10));
+        }
     }
 }

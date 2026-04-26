@@ -239,6 +239,13 @@ pub fn run_rumcast(
         );
     }
 
+    // Idle strategy: default (no flag) = busy-spin (lowest latency on
+    // isolated cores). `--yield-idle` switches all rumcast tick loops
+    // and translators to sleep-tick (saves CPU on shared machines).
+    // Matches the existing pipeline convention used by JournalStage /
+    // MatchingStage (which take the same flag inverted as `busy_spin`).
+    let yield_idle = config.yield_idle;
+
     // Rumcast receiver (orders) tick loop.
     {
         let shutdown = Arc::clone(&shutdown);
@@ -248,14 +255,7 @@ pub fn run_rumcast(
         handles.push(
             thread::Builder::new()
                 .name("rumcast-orders-recv".into())
-                .spawn(move || {
-                    while !shutdown.load(Ordering::Acquire) {
-                        let _ = receiver.tick();
-                        if config_yield(&shutdown) {
-                            thread::sleep(Duration::from_micros(10));
-                        }
-                    }
-                })?,
+                .spawn(move || tick_loop(&shutdown, yield_idle, || receiver.tick()))?,
         );
     }
 
@@ -268,14 +268,7 @@ pub fn run_rumcast(
         handles.push(
             thread::Builder::new()
                 .name("rumcast-resp-send".into())
-                .spawn(move || {
-                    while !shutdown.load(Ordering::Acquire) {
-                        let _ = sender.tick();
-                        if config_yield(&shutdown) {
-                            thread::sleep(Duration::from_micros(10));
-                        }
-                    }
-                })?,
+                .spawn(move || tick_loop(&shutdown, yield_idle, || sender.tick()))?,
         );
     }
 
@@ -286,7 +279,7 @@ pub fn run_rumcast(
         handles.push(
             thread::Builder::new()
                 .name("rumcast-in-xlate".into())
-                .spawn(move || in_translator(log, &mut input_producer, &shutdown))?,
+                .spawn(move || in_translator(log, &mut input_producer, &shutdown, yield_idle))?,
         );
     }
 
@@ -299,7 +292,7 @@ pub fn run_rumcast(
             thread::Builder::new()
                 .name("rumcast-out-xlate".into())
                 .spawn(move || {
-                    out_translator(log, response_consumer, cursor, &shutdown);
+                    out_translator(log, response_consumer, cursor, &shutdown, yield_idle);
                 })?,
         );
     }
@@ -321,11 +314,22 @@ pub fn run_rumcast(
     Ok(())
 }
 
+/// Generic tick loop body shared by the rumcast sender / receiver
+/// threads. With `yield_idle = false` (default), busy-spins between
+/// ticks — `spin_loop` hint, no syscall, lowest latency on an isolated
+/// core. With `yield_idle = true`, sleeps for 10µs between ticks —
+/// gives ~100k ticks/sec while remaining friendly to the OS scheduler
+/// on shared machines.
 #[inline]
-fn config_yield(_shutdown: &AtomicBool) -> bool {
-    // Phase 1: always yield (we don't have access to ServerConfig here
-    // without plumbing). Cheap; matches the bench's sleep-based ticking.
-    true
+fn tick_loop<F: FnMut() -> R, R>(shutdown: &AtomicBool, yield_idle: bool, mut tick: F) {
+    while !shutdown.load(Ordering::Acquire) {
+        let _ = tick();
+        if yield_idle {
+            thread::sleep(Duration::from_micros(10));
+        } else {
+            std::hint::spin_loop();
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -350,6 +354,7 @@ fn in_translator(
     log: Arc<SubscriptionLog>,
     input_producer: &mut melin_disruptor::ring::Producer<InputSlot>,
     shutdown: &AtomicBool,
+    yield_idle: bool,
 ) {
     while !shutdown.load(Ordering::Acquire) {
         log.poll(64 * 1024, |view| {
@@ -381,7 +386,11 @@ fn in_translator(
             };
             input_producer.publish(slot);
         });
-        thread::sleep(Duration::from_micros(10));
+        if yield_idle {
+            thread::sleep(Duration::from_micros(10));
+        } else {
+            std::hint::spin_loop();
+        }
     }
 }
 
@@ -397,6 +406,7 @@ fn out_translator(
     mut consumer: melin_disruptor::ring::Consumer<OutputSlot>,
     journal_cursor: Arc<melin_disruptor::padding::Sequence>,
     shutdown: &AtomicBool,
+    yield_idle: bool,
 ) {
     use melin_protocol::message::ResponseKind;
 
@@ -404,7 +414,11 @@ fn out_translator(
 
     while !shutdown.load(Ordering::Acquire) {
         let Some((_seq, slot)) = consumer.try_consume() else {
-            thread::sleep(Duration::from_micros(10));
+            if yield_idle {
+                thread::sleep(Duration::from_micros(10));
+            } else {
+                std::hint::spin_loop();
+            }
             continue;
         };
 
