@@ -276,7 +276,7 @@ Rejection reasons:
 - `UnknownAccount` -- account not registered.
 - `UnknownSymbol` -- instrument not registered.
 - `SelfTradePrevented` -- (reserved; STP currently uses `Cancelled` rather than `Rejected`).
-- `DuplicateOrderId` -- `order.id <= max_order_id[account]`.
+- `DuplicateOrderId` -- `(account, order.id)` already names a currently-live order. Reuse after the original closes is permitted.
 - `ExceedsMaxOrderQty` -- quantity exceeds `RiskLimits::max_order_qty`.
 - `ExceedsMaxNotional` -- price * quantity exceeds `RiskLimits::max_order_notional`.
 - `TradingHalted` -- instrument's circuit breaker `halted` flag is set.
@@ -348,7 +348,7 @@ Circuit breaker price bands (`price_band_lower`, `price_band_upper`) apply only 
 
 ### Duplicate order ID detection
 
-The Exchange tracks a per-account high-water mark (`max_order_id: HashMap<AccountId, u64>`). Any order with `id <= hwm` is rejected with `DuplicateOrderId`. The HWM advances unconditionally on every submission (even rejected ones), so clients must use a new, higher `OrderId` for every order, including retries after rejection.
+The Exchange tracks the set of currently-live `(account, order_id)` pairs and rejects a submission with `DuplicateOrderId` whenever the pair is already in the set. Entries are added when an order is accepted by the matching engine and removed when it closes (full fill, cancel, expiry, instrument disable, end-of-session). Reuse of an `OrderId` after the original closes is permitted -- the dedup defends the cancel/replace lookup invariant ("no two simultaneously-live orders share `(account, order_id)`") rather than burning IDs forever. Replay-side idempotency is handled separately by `(key_hash, request_seq)` at the transport layer.
 
 ### Triggered stop cascade
 

@@ -7,20 +7,22 @@ This document describes the risk checks and safety mechanisms enforced by the tr
 Every order submitted via `Exchange::execute()` passes through a strict validation chain. Checks run in order; the first failure rejects the order immediately and no subsequent checks execute.
 
 1. **Instrument lookup** -- reject with `UnknownSymbol` if the symbol is not registered.
-2. **Client deduplication** -- reject with `DuplicateOrderId` if the order ID is not strictly greater than the account's high-water mark.
+2. **Live-order dedup** -- reject with `DuplicateOrderId` if `(account, order_id)` already names a currently-live order.
 3. **Circuit breaker** -- reject with `TradingHalted` if the instrument is halted; reject with `OutsidePriceBand` if the limit price falls outside configured bands.
 4. **Fat finger checks** -- reject with `ExceedsMaxOrderQty` or `ExceedsMaxNotional` if the order exceeds per-instrument risk limits.
 5. **Balance reservation** -- reject with `InsufficientBalance` if the account cannot cover the required reserve amount.
 
 Only after all five checks pass does the order reach the matching engine.
 
-## Client Deduplication
+## Order ID Identity
 
-The exchange tracks a per-account **high-water mark** (HWM) of the highest `OrderId` seen. An incoming order is rejected with `DuplicateOrderId` if `order.id <= hwm[account]`.
+Cancel and replace operations look up resting orders by `(account, order_id)`. To keep that lookup unambiguous, the engine rejects a submission with `DuplicateOrderId` whenever the `(account, order_id)` pair already names a live order.
 
-The HWM advances unconditionally on every submission, regardless of whether the order is later rejected by a downstream check (e.g., insufficient balance). This is intentional: the journal records every `SubmitOrder` event, so on crash-recovery replay, a rejected order must not be re-executed. Clients must use a new (higher) `OrderId` for every submission, even if the previous one was rejected.
+A submission with a previously-used ID is **accepted** as long as the prior order is no longer live -- i.e., it was filled, cancelled, expired, rejected at submit time, or removed by an instrument disable / end-of-day. The dedup invariant is "no two simultaneously-live orders share `(account, order_id)`," not "an `OrderId` is consumed forever." This lets clients and gateways reuse IDs after reconnects without coordinating with the engine.
 
-`OrderId` is a client-assigned `u64`. The monotonic-increase requirement is the only constraint -- clients may use any scheme (sequential counter, timestamp-based, etc.) as long as each new order for the same account has a strictly higher ID than all previous submissions.
+Replay duplicates (the same `SubmitOrder` arriving twice on a journal recovery) are filtered one layer up by transport-level idempotency on `(key_hash, request_seq)`; they never reach this check.
+
+`OrderId` is a `u64` chosen by the client (or by the gateway on the client's behalf). The matching engine imposes no monotonicity requirement -- any scheme that avoids reusing an ID while the prior order is still live is acceptable.
 
 ## Circuit Breakers
 
@@ -124,7 +126,7 @@ If any check fails, the original order remains untouched on the book with its or
 
 | Variant | Meaning |
 |---|---|
-| `DuplicateOrderId` | Order ID is not strictly greater than the account's high-water mark. Prevents double-execution on crash-recovery retry. |
+| `DuplicateOrderId` | `(account, order_id)` already names a currently-live order. Reuse after the original closes is permitted. |
 | `TradingHalted` | Circuit breaker: the instrument is halted. |
 | `OutsidePriceBand` | Circuit breaker: the limit price is outside the configured `[lower, upper]` bounds. |
 | `ExceedsMaxOrderQty` | Fat finger: order quantity exceeds the instrument's `max_order_qty`. |
