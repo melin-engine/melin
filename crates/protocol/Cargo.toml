@@ -15,6 +15,7 @@ ed25519-dalek = { workspace = true }
 # `FromBytes` / `IntoBytes`.
 zerocopy = { version = "0.8", features = ["derive"] }
 melin-trading = { path = "../trading" }
+subtle = { workspace = true }
 x25519-dalek = { workspace = true }
 
 [dev-dependencies]

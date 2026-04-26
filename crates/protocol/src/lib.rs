@@ -8,6 +8,7 @@ pub mod blocking;
 pub mod codec;
 pub mod error;
 pub mod message;
+pub mod session;
 pub mod tcp;
 pub mod transport;
 pub mod uds;

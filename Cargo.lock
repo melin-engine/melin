@@ -1699,6 +1699,7 @@ dependencies = [
  "bolero",
  "ed25519-dalek",
  "melin-trading",
+ "subtle",
  "tempfile",
  "x25519-dalek",
  "zerocopy",

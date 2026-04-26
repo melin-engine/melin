@@ -9,6 +9,10 @@ clap = { version = "4", features = ["derive"] }
 ed25519-dalek = { version = "2", features = ["rand_core"] }
 libc = "0.2"
 rand = "0.9"
+# Constant-time byte comparison for MAC verification — guards
+# against timing side channels when comparing the received MAC
+# against the locally computed one.
+subtle = "2"
 tikv-jemallocator = "0.6"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
