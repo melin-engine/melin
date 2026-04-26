@@ -1,30 +1,38 @@
 //! Pure helpers for the synthetic order-flow bot.
 //!
-//! Isolated from `run_bot_session` so the rate curve, RNG, order
+//! Isolated from `run_bot_session` so the price curve, RNG, order
 //! parameter sampling, and FIX message construction can be unit tested
 //! without opening a real gateway connection.
 
 use melin_gateway_core::fix::serialize::FixMessageBuilder;
 use melin_gateway_core::fix::tags;
 
-// --- Rate model ---
+// --- Price model ---
 
-/// Sine wave period. 30 s makes the cycle visible in a short demo.
+/// Sine-wave period for the midprice walk. 30 s is short enough that a
+/// full cycle is visible during a casual demo.
 pub(crate) const PERIOD_SECS: f64 = 30.0;
-/// Mean submission rate (orders/sec).
-pub(crate) const RATE_MID: f64 = 40.0;
-/// Peak-to-mean amplitude (orders/sec). Peak = MID + AMP = 75 ord/s.
-pub(crate) const RATE_AMP: f64 = 35.0;
+/// Midprice base (FIX decimal). The sinusoid oscillates around this.
+pub(crate) const MID_BASE: f64 = 100.0;
+/// Peak-to-mean amplitude of the midprice in FIX decimal units. With
+/// `MID_BASE = 100` and `MID_AMP = 5` the mid walks 95 → 105 over one
+/// cycle. The amplitude is deliberately ~10× the buy/sell spread
+/// (`MAX_OFFSET_TICKS = 0.50`) so the wave is clearly visible in the
+/// book panel and isn't swamped by per-order noise.
+pub(crate) const MID_AMP: f64 = 5.0;
+/// Constant submission rate (orders/sec). The book's *visual* sine
+/// comes from the mid moving, not the rate, so a flat rate is the
+/// right shape here. ~30/s is leisurely enough to keep the engine
+/// idle and frequent enough to populate the moving cluster densely.
+pub(crate) const BOT_RATE: f64 = 30.0;
 
-/// Target submission rate (orders/sec) `t` seconds after bot start.
-///
-/// Traces `MID + AMP · sin(2π · t / PERIOD)`, floored at 1.0 so that
-/// the trough (t = 3·PERIOD/4, raw value 5.0) stays positive and the
-/// bot never stalls. The floor never binds with the default constants
-/// but guards against future tuning that pushes `AMP` above `MID`.
-pub(crate) fn bot_rate(t: f64) -> f64 {
-    let raw = RATE_MID + RATE_AMP * (std::f64::consts::TAU * t / PERIOD_SECS).sin();
-    raw.max(1.0)
+/// Midprice (FIX decimal) `t` seconds after bot start, snapped to the
+/// 0.01 tick grid the gateway uses (`tick_size_inverse = 100`). Snapping
+/// at this layer keeps `next_bot_order`'s integer-tick offsets producing
+/// grid-aligned final prices regardless of where on the sine we are.
+pub(crate) fn bot_mid_price(t: f64) -> f64 {
+    let raw = MID_BASE + MID_AMP * (std::f64::consts::TAU * t / PERIOD_SECS).sin();
+    (raw * 100.0).round() / 100.0
 }
 
 // --- RNG ---
@@ -55,9 +63,6 @@ pub(crate) const BOT_ACCOUNTS: [u32; 31] = {
 };
 /// Matches the FIX symbols configured in the OE gateway.
 pub(crate) const BOT_SYMBOLS: [&str; 2] = ["BTC/USD", "ETH/USD"];
-/// FIX decimal mid-price; the gateway maps this to engine ticks via
-/// tick_size_inverse (100 in the default config → 10,000 ticks).
-pub(crate) const MID_PRICE: f64 = 100.0;
 /// One FIX price tick is 1/tick_size_inverse = 0.01 at the default
 /// config. Offsets are drawn uniformly in [1, 50] ticks.
 pub(crate) const MAX_OFFSET_TICKS: u64 = 50;
@@ -74,20 +79,20 @@ pub(crate) struct BotOrder {
     pub qty: u64,
 }
 
-/// Draw the next order's parameters from the RNG state.
-///
-/// Buys sit below mid, sells above — the bot never self-crosses. Prices
-/// are aligned to the 0.01 tick grid (one decimal place of precision,
-/// rounded via the `.2` formatter at send time).
-pub(crate) fn next_bot_order(rng: &mut u64) -> BotOrder {
+/// Draw the next order's parameters from the RNG state at wall-time
+/// `t` (seconds since bot start). Buys sit below the *current* mid,
+/// sells above — the bot never self-crosses, even as the mid moves.
+/// Prices stay on the 0.01 tick grid because `bot_mid_price` snaps.
+pub(crate) fn next_bot_order(rng: &mut u64, t: f64) -> BotOrder {
     let account_id = BOT_ACCOUNTS[(xs64(rng) as usize) % BOT_ACCOUNTS.len()];
     let symbol = BOT_SYMBOLS[(xs64(rng) as usize) % BOT_SYMBOLS.len()];
     let side_code = if xs64(rng) & 1 == 0 { "1" } else { "2" };
     let offset_ticks = (xs64(rng) % MAX_OFFSET_TICKS) + 1;
+    let mid = bot_mid_price(t);
     let price = if side_code == "1" {
-        MID_PRICE - (offset_ticks as f64) / 100.0
+        mid - (offset_ticks as f64) / 100.0
     } else {
-        MID_PRICE + (offset_ticks as f64) / 100.0
+        mid + (offset_ticks as f64) / 100.0
     };
     let qty = (xs64(rng) % MAX_QTY) + 1;
     BotOrder {
@@ -119,45 +124,60 @@ mod tests {
     use super::*;
     use melin_gateway_core::fix::parse::FixMessage;
 
-    // --- bot_rate ---
+    // --- bot_mid_price ---
 
     #[test]
-    fn bot_rate_at_zero_equals_mid() {
-        assert!((bot_rate(0.0) - RATE_MID).abs() < 1e-9);
+    fn bot_mid_price_at_zero_equals_base() {
+        assert!((bot_mid_price(0.0) - MID_BASE).abs() < 1e-9);
     }
 
     #[test]
-    fn bot_rate_at_quarter_period_is_peak() {
-        let peak = bot_rate(PERIOD_SECS / 4.0);
-        assert!((peak - (RATE_MID + RATE_AMP)).abs() < 1e-6);
+    fn bot_mid_price_at_quarter_period_is_peak() {
+        let peak = bot_mid_price(PERIOD_SECS / 4.0);
+        assert!((peak - (MID_BASE + MID_AMP)).abs() < 1e-6);
     }
 
     #[test]
-    fn bot_rate_at_three_quarter_period_is_trough() {
-        let trough = bot_rate(PERIOD_SECS * 3.0 / 4.0);
-        // With default constants the raw trough is RATE_MID - RATE_AMP = 5.
-        assert!((trough - (RATE_MID - RATE_AMP)).abs() < 1e-6);
+    fn bot_mid_price_at_three_quarter_period_is_trough() {
+        let trough = bot_mid_price(PERIOD_SECS * 3.0 / 4.0);
+        assert!((trough - (MID_BASE - MID_AMP)).abs() < 1e-6);
     }
 
     #[test]
-    fn bot_rate_is_floored_at_one() {
-        // The floor only engages with non-default constants, but must
-        // keep the guarantee so `1.0 / rate` is always finite.
-        // Synthesize a guaranteed-negative raw value by evaluating with a
-        // hypothetical parameterization: we can't tweak constants from
-        // here, so just assert the property across the whole cycle.
+    fn bot_mid_price_is_periodic() {
+        // Periodicity is what makes the wave repeat cleanly across runs.
+        // A drift here would indicate a unit-conversion bug.
+        let t = 3.7;
+        assert!((bot_mid_price(t) - bot_mid_price(t + PERIOD_SECS)).abs() < 1e-9);
+    }
+
+    #[test]
+    fn bot_mid_price_lands_on_tick_grid() {
+        // Engine ticks are 0.01 with the default tick_size_inverse=100.
+        // Any mid we feed into next_bot_order must already be on the
+        // grid, otherwise (mid ± offset/100) drifts off it and the
+        // gateway rejects the order on rounding mismatch.
         for i in 0..=300 {
             let t = i as f64 * 0.1;
-            assert!(bot_rate(t) >= 1.0, "rate at t={t} was {}", bot_rate(t));
+            let mid = bot_mid_price(t);
+            let in_ticks = (mid * 100.0).round();
+            let on_grid = (mid * 100.0 - in_ticks).abs() < 1e-9;
+            assert!(on_grid, "mid {mid} at t={t} is not on the 0.01 grid");
         }
     }
 
     #[test]
-    fn bot_rate_is_periodic() {
-        // Periodicity is the basis of the "visible in a short demo"
-        // claim. A drift here would indicate a unit-conversion bug.
-        let t = 3.7;
-        assert!((bot_rate(t) - bot_rate(t + PERIOD_SECS)).abs() < 1e-9);
+    fn bot_mid_price_stays_within_amplitude_band() {
+        for i in 0..=300 {
+            let t = i as f64 * 0.1;
+            let mid = bot_mid_price(t);
+            assert!(
+                (MID_BASE - MID_AMP - 0.01..=MID_BASE + MID_AMP + 0.01).contains(&mid),
+                "mid {mid} at t={t} escaped the [{}..{}] band",
+                MID_BASE - MID_AMP,
+                MID_BASE + MID_AMP,
+            );
+        }
     }
 
     // --- xs64 ---
@@ -185,7 +205,7 @@ mod tests {
     fn next_bot_order_stays_in_account_pool() {
         let mut rng = 0xC0FF_EE00_DEAD_BEEF;
         for _ in 0..1000 {
-            let o = next_bot_order(&mut rng);
+            let o = next_bot_order(&mut rng, 0.0);
             assert!(
                 (2..=32).contains(&o.account_id),
                 "account {} out of range",
@@ -198,7 +218,7 @@ mod tests {
     fn next_bot_order_uses_configured_symbols() {
         let mut rng = 1;
         for _ in 0..1000 {
-            let o = next_bot_order(&mut rng);
+            let o = next_bot_order(&mut rng, 0.0);
             assert!(o.symbol == "BTC/USD" || o.symbol == "ETH/USD");
         }
     }
@@ -207,29 +227,30 @@ mod tests {
     fn next_bot_order_side_is_buy_or_sell() {
         let mut rng = 1;
         for _ in 0..1000 {
-            let o = next_bot_order(&mut rng);
+            let o = next_bot_order(&mut rng, 0.0);
             assert!(o.side_code == "1" || o.side_code == "2");
         }
     }
 
     #[test]
-    fn next_bot_order_price_does_not_cross_mid() {
-        // Buys strictly below mid, sells strictly above — guarantees the
-        // bot doesn't self-cross.
+    fn next_bot_order_does_not_cross_current_mid() {
+        // Buys strictly below the *current* mid, sells strictly above —
+        // even as the mid walks the sine, the bot doesn't cross itself.
         let mut rng = 1;
-        for _ in 0..1000 {
-            let o = next_bot_order(&mut rng);
+        for i in 0..1000 {
+            let t = (i as f64) * 0.05; // sweep the wave
+            let mid = bot_mid_price(t);
+            let o = next_bot_order(&mut rng, t);
             match o.side_code {
-                "1" => assert!(o.price < MID_PRICE, "buy at {}", o.price),
-                "2" => assert!(o.price > MID_PRICE, "sell at {}", o.price),
+                "1" => assert!(o.price < mid, "buy at {} vs mid {}", o.price, mid),
+                "2" => assert!(o.price > mid, "sell at {} vs mid {}", o.price, mid),
                 other => panic!("unexpected side {other}"),
             }
             // Offset bounded to [1, 50] ticks = [0.01, 0.50].
-            let abs_offset = (o.price - MID_PRICE).abs();
+            let abs_offset = (o.price - mid).abs();
             assert!(
                 (0.01 - 1e-9..=0.50 + 1e-9).contains(&abs_offset),
-                "offset {} out of range",
-                abs_offset
+                "offset {abs_offset} out of range",
             );
         }
     }
@@ -238,9 +259,34 @@ mod tests {
     fn next_bot_order_qty_in_range() {
         let mut rng = 1;
         for _ in 0..1000 {
-            let o = next_bot_order(&mut rng);
+            let o = next_bot_order(&mut rng, 0.0);
             assert!((1..=MAX_QTY).contains(&o.qty), "qty {} out of range", o.qty);
         }
+    }
+
+    #[test]
+    fn next_bot_order_price_tracks_moving_mid() {
+        // The whole point of the rework: at distinct moments the *mid*
+        // the orders cluster around must be different. Compare the mean
+        // price of orders sampled at t=0 vs t=PERIOD/4 (peak); they
+        // should differ by approximately MID_AMP.
+        fn mean_price(rng_seed: u64, t: f64, n: u32) -> f64 {
+            let mut rng = rng_seed;
+            let mut sum = 0.0;
+            for _ in 0..n {
+                sum += next_bot_order(&mut rng, t).price;
+            }
+            sum / n as f64
+        }
+        let at_zero = mean_price(7, 0.0, 1000);
+        let at_peak = mean_price(7, PERIOD_SECS / 4.0, 1000);
+        let delta = at_peak - at_zero;
+        // Allow generous tolerance: the per-order ±0.50 spread averages
+        // out across 1000 samples but doesn't vanish.
+        assert!(
+            (MID_AMP - 0.5..=MID_AMP + 0.5).contains(&delta),
+            "expected ~{MID_AMP} drift between t=0 and peak, got {delta}",
+        );
     }
 
     // --- build_bot_nos ---

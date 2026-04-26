@@ -1113,10 +1113,11 @@ fn run_bot_session(addr: &str, sender: &str, target: &str, tx: &Sender<UiMsg>) {
     }
 }
 
-/// One bot session lifetime: connect, then submit orders forever at the
-/// sine-wave rate. State (RNG, ClOrdID counter) resets on reconnect — the
-/// bot has no engine-side state to preserve, and the gateway hands out
-/// fresh OrderIDs regardless of ClOrdID reuse across sessions. `attempt`
+/// One bot session lifetime: connect, then submit orders forever at a
+/// constant rate, with per-order prices that track a sinusoidal mid.
+/// State (RNG, ClOrdID counter) resets on reconnect — the bot has no
+/// engine-side state to preserve, and the gateway hands out fresh
+/// OrderIds regardless of ClOrdID reuse across sessions. `attempt`
 /// is reset to 0 once Logon completes (see `run_md_session_once`).
 fn run_bot_session_once(
     addr: &str,
@@ -1136,10 +1137,12 @@ fn run_bot_session_once(
     c.set_read_timeout(Some(Duration::from_millis(1)))?;
     let _ = tx.send(UiMsg::Log("[BOT] connected".into()));
 
-    // rate(t) = MID + AMP · sin(2π · t / PERIOD). Peak 75 ord/s is well
-    // below engine capacity on localhost, so the bot never creates
-    // back-pressure in the gateway. See `bot::bot_rate` for the curve.
+    // mid(t) = MID_BASE + MID_AMP · sin(2π · t / PERIOD). Submission
+    // rate is flat at BOT_RATE — the visible sinusoid lives in the
+    // *price* now, so the book cluster walks up and down over each
+    // PERIOD_SECS cycle. See `bot::bot_mid_price` for the curve.
     let mut rng_state: u64 = 0xC0FF_EE00_DEAD_BEEF;
+    let sleep_dur = Duration::from_secs_f64(1.0 / bot::BOT_RATE);
 
     let start = Instant::now();
     // u64 ClOrdID suffix. The gateway assigns fresh Melin OrderIds from
@@ -1151,12 +1154,7 @@ fn run_bot_session_once(
 
     loop {
         let t = start.elapsed().as_secs_f64();
-        let rate = bot::bot_rate(t);
-        // Per-order sleep (not per-batch) so the sine wave is traced
-        // smoothly rather than as a staircase.
-        let sleep_dur = Duration::from_secs_f64(1.0 / rate);
-
-        let order = bot::next_bot_order(&mut rng_state);
+        let order = bot::next_bot_order(&mut rng_state, t);
         let clord = format!("BOT{next_clord_id}");
         next_clord_id += 1;
         let nos = bot::build_bot_nos(&clord, &order);
@@ -1171,8 +1169,9 @@ fn run_bot_session_once(
             while c.try_recv()?.is_some() {}
 
             let actual = sent_since_report as f64 / last_report.elapsed().as_secs_f64();
+            let mid = bot::bot_mid_price(t);
             let _ = tx.send(UiMsg::Log(format!(
-                "[BOT] t={t:5.1}s target={rate:>5.1}/s sent={actual:>5.1}/s"
+                "[BOT] t={t:5.1}s mid={mid:>7.2} sent={actual:>5.1}/s"
             )));
             last_report = Instant::now();
             sent_since_report = 0;
