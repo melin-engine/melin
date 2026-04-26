@@ -7,7 +7,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use clap::Parser;
-#[cfg(not(feature = "dpdk"))]
+#[cfg(all(not(feature = "dpdk"), not(feature = "rumcast")))]
 use melin_protocol::tcp::BlockingTcpListener;
 use melin_server::server::ServerConfig;
 
@@ -54,7 +54,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         melin_server::server::run_dpdk(config, dpdk_config, shutdown)
     }
 
-    #[cfg(not(feature = "dpdk"))]
+    #[cfg(all(not(feature = "dpdk"), feature = "rumcast"))]
+    {
+        let rumcast_config = rumcast_config_from(&config);
+        melin_server::rumcast_transport::run_rumcast(config, rumcast_config, shutdown)
+    }
+
+    #[cfg(all(not(feature = "dpdk"), not(feature = "rumcast")))]
     {
         let listener = BlockingTcpListener::bind(config.bind)?;
         melin_server::server::run_with_shutdown(listener, config, shutdown)
@@ -140,4 +146,19 @@ fn dpdk_config_from(cfg: &ServerConfig) -> melin_dpdk::DpdkConfig {
 #[cfg(feature = "dpdk")]
 fn dpdk_num_queues(_cfg: &ServerConfig) -> u16 {
     1
+}
+
+// ---------------------------------------------------------------------------
+// Rumcast config
+// ---------------------------------------------------------------------------
+
+#[cfg(feature = "rumcast")]
+fn rumcast_config_from(cfg: &ServerConfig) -> melin_server::rumcast_transport::RumcastConfig {
+    melin_server::rumcast_transport::RumcastConfig {
+        // Server's order-entry bind reuses the existing --bind flag —
+        // clients send orders to this address. Responses go back to
+        // the address each client publishes from (learned from
+        // incoming SetupFrames).
+        bind: cfg.bind,
+    }
 }

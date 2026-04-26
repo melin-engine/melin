@@ -31,6 +31,12 @@ latency-trace = [
 ## Kept for backward compatibility — io_uring is now always used.
 io-uring = []
 dpdk = ["dep:melin-dpdk", "melin-dpdk/dpdk-sys"]
+## Standalone server with rumcast (reliable UDP) as the order-entry
+## transport. Mutually exclusive with `dpdk` at build time. Used by
+## the LAN bench suite to compare TCP vs rumcast end-to-end.
+## Replication over rumcast is a separate Phase-2 effort and is NOT
+## included here.
+rumcast = ["dep:melin-rumcast"]
 pipeline-stats = ["melin-engine?/pipeline-stats", "melin-transport-core/pipeline-stats"]
 hash-chain = [
     "melin-engine?/hash-chain",
@@ -79,6 +85,7 @@ io-uring = "0.7"
 # feature for `FromBytes` / `IntoBytes`.
 zerocopy = { version = "0.8", features = ["derive"] }
 melin-dpdk = { path = "../dpdk", optional = true }
+melin-rumcast = { path = "../rumcast", optional = true }
 
 [dev-dependencies]
 tempfile = "3"
