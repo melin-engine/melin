@@ -1285,6 +1285,10 @@ impl Exchange {
         // scan). This returns (old_price, old_remaining).
         // Cannot fail since we verified the order exists above and matching is
         // single-threaded (no concurrent removal possible).
+        // Note: `live_order_ids` is intentionally not touched. The order keeps
+        // the same `(account, order_id)` identity through the replacement, so
+        // its entry stays valid; it'll be removed by the same cancel/fill
+        // path as any other resting order when the order eventually closes.
         let inst =
             inst_mut(&mut self.instruments, symbol).expect("instrument verified to exist above");
         let (old_price, old_remaining) = inst
@@ -3229,6 +3233,94 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn cancel_replace_preserves_live_entry() {
+        // cancel_replace amends the resting order in-place keeping the
+        // same `(account, order_id)` identity, so the live set must
+        // not be touched. A duplicate submission during/after the
+        // replace must still hit DuplicateOrderId.
+        let mut exchange = Exchange::new();
+        exchange.add_instrument(btc_usd_spec());
+        exchange.deposit(ACCT_A, USD, 100_000);
+
+        let mut reports = Vec::new();
+        exchange.execute(
+            Symbol(1),
+            limit_order(11, ACCT_A, Side::Buy, 100, 10, TimeInForce::GTC),
+            &mut reports,
+        );
+
+        reports.clear();
+        exchange.cancel_replace(
+            Symbol(1),
+            ACCT_A,
+            OrderId(11),
+            price(95),
+            qty(8),
+            &mut reports,
+        );
+        assert!(
+            reports
+                .iter()
+                .any(|r| matches!(r, ExecutionReport::Replaced { .. })),
+            "expected Replaced, got {reports:?}"
+        );
+
+        reports.clear();
+        exchange.execute(
+            Symbol(1),
+            limit_order(11, ACCT_A, Side::Buy, 90, 5, TimeInForce::GTC),
+            &mut reports,
+        );
+        assert!(
+            matches!(
+                reports[0],
+                ExecutionReport::Rejected {
+                    reason: RejectReason::DuplicateOrderId,
+                    ..
+                }
+            ),
+            "duplicate after cancel_replace should reject, got {:?}",
+            reports[0]
+        );
+    }
+
+    #[test]
+    fn order_id_reusable_after_disable_instrument() {
+        // disable_instrument cancels every resting order on the symbol.
+        // Each cancellation must remove its `(account, order_id)` from
+        // the live set so the same id can be reused (typically on a
+        // different instrument).
+        let mut exchange = Exchange::new();
+        exchange.add_instrument(btc_usd_spec());
+        exchange.add_instrument(eth_usd_spec());
+        exchange.deposit(ACCT_A, USD, 100_000);
+
+        let mut reports = Vec::new();
+        exchange.execute(
+            Symbol(1),
+            limit_order(13, ACCT_A, Side::Buy, 100, 10, TimeInForce::GTC),
+            &mut reports,
+        );
+
+        reports.clear();
+        exchange.disable_instrument(Symbol(1), &mut reports);
+
+        // Reuse OrderId 13 on a different live instrument. Disable
+        // freed the live-set entry, so this must place.
+        reports.clear();
+        exchange.execute(
+            Symbol(2),
+            limit_order(13, ACCT_A, Side::Buy, 50, 5, TimeInForce::GTC),
+            &mut reports,
+        );
+        assert!(
+            matches!(reports[0], ExecutionReport::Placed { .. }),
+            "reuse on live instrument after disable should place, got {:?}",
+            reports[0]
+        );
     }
 
     #[test]
@@ -6420,7 +6512,9 @@ mod tests {
 
     #[test]
     fn dedup_interleaved_with_orders() {
-        // Verify that per-key dedup and per-account max_order_id are independent.
+        // Verify that per-key request-seq dedup and the live `(account,
+        // order_id)` set are independent: a fresh request_seq doesn't
+        // bypass live-order dedup, and vice versa.
         let mut exchange = Exchange::new();
         exchange.add_instrument(btc_usd_spec());
         exchange.deposit(ACCT_A, USD, 1_000_000);
@@ -6456,7 +6550,8 @@ mod tests {
         // Duplicate per-key seq should be caught before execute.
         assert!(!exchange.check_request_seq(key, 1));
 
-        // But a new key seq with a duplicate order ID is caught by max_order_id.
+        // A new request_seq doesn't help if the OrderId is still live
+        // — the live-order dedup catches it.
         reports.clear();
         assert!(exchange.check_request_seq(key, 2));
         exchange.execute(
@@ -7863,6 +7958,74 @@ mod tests {
             restored.accounts().balance(ACCT_B, BTC).reserved,
             0,
             "post-restore cancel: reservation not released"
+        );
+    }
+
+    #[test]
+    fn snapshot_roundtrip_preserves_live_dedup() {
+        // The v15 snapshot format drops the explicit OrderId map and
+        // rebuilds the live `(account, order_id)` set from `order_index`
+        // + `stop_index` on restore. Verify the rebuild: a duplicate of
+        // a still-resting order must reject post-restore, while a
+        // duplicate of an order that *closed* before the snapshot must
+        // succeed (the entry should not have made it into the live set).
+        let mut exchange = Exchange::new();
+        let spec = btc_usd_spec();
+        exchange.add_instrument(spec);
+        exchange.deposit(ACCT_A, USD, 100_000);
+        exchange.deposit(ACCT_B, BTC, 100);
+
+        let mut reports = Vec::new();
+
+        // OrderId 7 fills (closes), OrderId 9 rests.
+        exchange.execute(
+            spec.symbol,
+            limit_order(7, ACCT_B, Side::Sell, 100, 5, TimeInForce::GTC),
+            &mut reports,
+        );
+        exchange.execute(
+            spec.symbol,
+            limit_order(7, ACCT_A, Side::Buy, 100, 5, TimeInForce::GTC),
+            &mut reports,
+        );
+        exchange.execute(
+            spec.symbol,
+            limit_order(9, ACCT_A, Side::Buy, 90, 5, TimeInForce::GTC),
+            &mut reports,
+        );
+        reports.clear();
+
+        let mut restored = exchange.clone_via_snapshot();
+
+        // Reusing OrderId 7 (closed before snapshot) must succeed.
+        restored.execute(
+            spec.symbol,
+            limit_order(7, ACCT_A, Side::Buy, 89, 5, TimeInForce::GTC),
+            &mut reports,
+        );
+        assert!(
+            matches!(reports[0], ExecutionReport::Placed { .. }),
+            "reuse of closed-before-snapshot id should place, got {:?}",
+            reports[0]
+        );
+
+        // Duplicating OrderId 9 (resting at snapshot time) must reject.
+        reports.clear();
+        restored.execute(
+            spec.symbol,
+            limit_order(9, ACCT_A, Side::Buy, 88, 5, TimeInForce::GTC),
+            &mut reports,
+        );
+        assert!(
+            matches!(
+                reports[0],
+                ExecutionReport::Rejected {
+                    reason: RejectReason::DuplicateOrderId,
+                    ..
+                }
+            ),
+            "duplicate of live-at-snapshot id should reject, got {:?}",
+            reports[0]
         );
     }
 
