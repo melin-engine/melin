@@ -31,6 +31,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use crate::counters::Counters;
 use crate::flow_control::{FlowControl, ReceiverState};
 use crate::pub_log::{FRAGMENT_ALIGNMENT, PublicationLog};
 use crate::storage::{AlignedBuf, align_up};
@@ -119,6 +120,9 @@ pub struct SenderLoop<T: UdpTransport> {
     receivers: HashMap<u64, ReceiverState>,
     /// Aligned recv buffer for incoming control frames.
     recv_buf: Box<AlignedBuf<2048>>,
+    /// Optional cumulative counters for monitoring. When `Some`,
+    /// every tick folds its [`TickStats`] into the shared totals.
+    counters: Option<Arc<Counters>>,
 }
 
 impl<T: UdpTransport> SenderLoop<T> {
@@ -132,14 +136,21 @@ impl<T: UdpTransport> SenderLoop<T> {
             config,
             last_sent_position,
             // First Setup fires after `setup_interval` elapses. Production
-            // callers wanting an immediate Setup on startup should call a
-            // future `send_setup_now()` helper or set a short interval —
-            // late-joining subscribers tolerate a wait of one interval.
+            // callers wanting an immediate Setup on startup should call
+            // [`send_setup_now`] or set a short interval — late-joining
+            // subscribers tolerate a wait of one interval.
             last_setup_at: now,
             last_send_at: now,
             receivers: HashMap::new(),
             recv_buf: Box::new(AlignedBuf::new()),
+            counters: None,
         }
+    }
+
+    /// Install (or remove) shared cumulative counters. Pass `None` to
+    /// disable counter updates entirely (no per-tick fold cost).
+    pub fn set_counters(&mut self, counters: Option<Arc<Counters>>) {
+        self.counters = counters;
     }
 
     /// Run one tick. Returns the work performed in this tick.
@@ -148,6 +159,9 @@ impl<T: UdpTransport> SenderLoop<T> {
         self.drain_control(&mut stats);
         self.drain_data(&mut stats);
         self.maybe_send_periodic(&mut stats);
+        if let Some(c) = &self.counters {
+            fold_into_counters(c, &stats);
+        }
         stats
     }
 
@@ -371,7 +385,48 @@ impl<T: UdpTransport> SenderLoop<T> {
     pub fn send_setup_now(&mut self) -> TickStats {
         let mut stats = TickStats::default();
         self.send_setup(&mut stats, Instant::now());
+        if let Some(c) = &self.counters {
+            fold_into_counters(c, &stats);
+        }
         stats
+    }
+}
+
+/// Fold a per-tick [`TickStats`] delta into the cumulative
+/// [`Counters`]. `Relaxed` ordering throughout — see counters module
+/// docs for the consistency contract.
+fn fold_into_counters(c: &Counters, s: &TickStats) {
+    use std::sync::atomic::Ordering::Relaxed;
+    if s.bytes_sent != 0 {
+        c.bytes_sent.fetch_add(s.bytes_sent, Relaxed);
+    }
+    if s.fragments_sent != 0 {
+        c.fragments_sent.fetch_add(s.fragments_sent as u64, Relaxed);
+    }
+    if s.retransmits_sent != 0 {
+        c.retransmits_sent
+            .fetch_add(s.retransmits_sent as u64, Relaxed);
+    }
+    if s.setup_sent != 0 {
+        c.setups_sent.fetch_add(s.setup_sent as u64, Relaxed);
+    }
+    if s.heartbeats_sent != 0 {
+        c.heartbeats_sent
+            .fetch_add(s.heartbeats_sent as u64, Relaxed);
+    }
+    if s.naks_received != 0 {
+        c.naks_received.fetch_add(s.naks_received as u64, Relaxed);
+    }
+    if s.sms_received != 0 {
+        c.sms_received.fetch_add(s.sms_received as u64, Relaxed);
+    }
+    if s.send_errors != 0 {
+        c.send_errors_sender
+            .fetch_add(s.send_errors as u64, Relaxed);
+    }
+    if s.control_drops != 0 {
+        c.control_drops_sender
+            .fetch_add(s.control_drops as u64, Relaxed);
     }
 }
 
@@ -1004,6 +1059,48 @@ mod tests {
         // Limit reflects the fast (and only remaining) receiver.
         let expected = position(100, 32 * 1024, bits) + 16 * 1024;
         assert_eq!(log.publisher_limit(), expected);
+    }
+
+    #[test]
+    fn counters_accumulate_across_ticks_when_installed() {
+        use crate::counters::Counters;
+        let recv = KernelUdp::bind(loopback(0)).unwrap();
+        let (log, mut sender) = build_sender(recv.local_addr().unwrap());
+        let counters = Arc::new(Counters::new());
+        sender.set_counters(Some(Arc::clone(&counters)));
+
+        for fill in [0xA0u8, 0xA1, 0xA2] {
+            let mut c = log.try_claim(64).unwrap();
+            c.payload_mut().fill(fill);
+            c.publish(data_flags::UNFRAGMENTED);
+        }
+        let stats = sender.tick();
+        assert_eq!(stats.fragments_sent, 3);
+
+        let snap = counters.snapshot();
+        assert_eq!(snap.fragments_sent, 3);
+        assert_eq!(snap.bytes_sent, 3 * 96);
+        // Untouched counters stay zero.
+        assert_eq!(snap.naks_received, 0);
+        assert_eq!(snap.bytes_received, 0);
+    }
+
+    #[test]
+    fn counters_not_bumped_when_none() {
+        use crate::counters::Counters;
+        // Verifies that absence of installed counters has zero effect
+        // on observable state — sanity check that set_counters(None)
+        // truly disables.
+        let recv = KernelUdp::bind(loopback(0)).unwrap();
+        let (log, mut sender) = build_sender(recv.local_addr().unwrap());
+        let counters = Arc::new(Counters::new());
+        // Don't install on sender. Publish + tick.
+        let c = log.try_claim(64).unwrap();
+        c.publish(data_flags::UNFRAGMENTED);
+        let _ = sender.tick();
+        let snap = counters.snapshot();
+        // Counters are still all zero.
+        assert_eq!(snap, crate::counters::CountersSnapshot::default());
     }
 
     #[test]

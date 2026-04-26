@@ -44,6 +44,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use crate::counters::{Counters, LossCallback, LossEvent};
 use crate::storage::AlignedBuf;
 use crate::sub_log::{AcceptResult, SubscriptionLog};
 use crate::transport::UdpTransport;
@@ -151,6 +152,12 @@ pub struct ReceiverLoop<T: UdpTransport> {
     pending_naks: HashMap<(u32, u32, u32), PendingNak>,
     rng: Rng,
     recv_buf: Box<AlignedBuf<2048>>,
+    /// Optional cumulative counters folded from each tick's stats.
+    counters: Option<Arc<Counters>>,
+    /// Optional callback invoked once per detected gap (i.e. when a
+    /// NAK is FIRST scheduled — duplicates of an already-pending gap
+    /// don't re-fire).
+    loss_callback: Option<LossCallback>,
 }
 
 impl<T: UdpTransport> ReceiverLoop<T> {
@@ -165,7 +172,28 @@ impl<T: UdpTransport> ReceiverLoop<T> {
             last_publisher_seen_at: None,
             pending_naks: HashMap::new(),
             recv_buf: Box::new(AlignedBuf::new()),
+            counters: None,
+            loss_callback: None,
         }
+    }
+
+    /// Install (or remove) shared cumulative counters. Pass `None` to
+    /// disable counter updates entirely.
+    pub fn set_counters(&mut self, counters: Option<Arc<Counters>>) {
+        self.counters = counters;
+    }
+
+    /// Install a callback that fires once per detected gap. Pass
+    /// `None` to remove. The callback runs on the receiver thread —
+    /// keep it cheap.
+    ///
+    /// Semantics: fires once per *NAK round*, not once per loss
+    /// episode. If a gap persists across NAK rounds (publisher
+    /// retransmit didn't arrive, gap re-detected on a later tick) the
+    /// callback fires again — useful for tracking recovery attempts
+    /// rather than just first-detected losses.
+    pub fn set_loss_callback(&mut self, cb: Option<LossCallback>) {
+        self.loss_callback = cb;
     }
 
     /// Run one tick. Returns the work performed.
@@ -175,6 +203,9 @@ impl<T: UdpTransport> ReceiverLoop<T> {
         self.detect_and_schedule_gap(&mut stats);
         self.fire_due_naks(&mut stats);
         self.maybe_send_sm(&mut stats);
+        if let Some(c) = &self.counters {
+            fold_into_counters(c, &stats);
+        }
         stats
     }
 
@@ -273,6 +304,28 @@ impl<T: UdpTransport> ReceiverLoop<T> {
         let key = (sub_term_id, sub_offset, gap_length);
         if self.pending_naks.contains_key(&key) {
             return; // already scheduled
+        }
+
+        // First detection of this gap: fire the optional loss
+        // callback and bump the counters. Repeat detections of the
+        // same (term_id, offset, gap_length) tuple are deduped above
+        // so the callback is invoked at most once per distinct gap.
+        let now_for_event = Instant::now();
+        if let Some(c) = &self.counters {
+            c.gaps_detected
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            c.bytes_in_gaps
+                .fetch_add(gap_length as u64, std::sync::atomic::Ordering::Relaxed);
+        }
+        if let Some(cb) = &self.loss_callback {
+            cb(&LossEvent {
+                session_id: self.log.config().session_id,
+                stream_id: self.log.config().stream_id,
+                term_id: sub_term_id,
+                term_offset: sub_offset,
+                gap_length,
+                detected_at: now_for_event,
+            });
         }
 
         // Pick a random backoff in [min, min + jitter].
@@ -398,6 +451,9 @@ impl<T: UdpTransport> ReceiverLoop<T> {
     pub fn send_sm_now(&mut self) -> TickStats {
         let mut stats = TickStats::default();
         self.send_sm(&mut stats, Instant::now());
+        if let Some(c) = &self.counters {
+            fold_into_counters(c, &stats);
+        }
         stats
     }
 
@@ -436,6 +492,55 @@ impl<T: UdpTransport> ReceiverLoop<T> {
         // 3 * term_length fits in u32 since term_length <= 1 GiB.
         3u32.saturating_mul(term_length)
             .saturating_sub(in_term_offset)
+    }
+}
+
+/// Fold a per-tick [`TickStats`] delta into the cumulative
+/// [`Counters`]. `Relaxed` ordering throughout — see counters module
+/// docs for the consistency contract. `gaps_detected` and
+/// `bytes_in_gaps` are bumped at detection time inside
+/// [`ReceiverLoop::detect_and_schedule_gap`], not here.
+fn fold_into_counters(c: &Counters, s: &TickStats) {
+    use std::sync::atomic::Ordering::Relaxed;
+    if s.bytes_received != 0 {
+        c.bytes_received.fetch_add(s.bytes_received, Relaxed);
+    }
+    if s.fragments_accepted != 0 {
+        c.fragments_accepted
+            .fetch_add(s.fragments_accepted as u64, Relaxed);
+    }
+    if s.fragments_dropped != 0 {
+        c.fragments_dropped
+            .fetch_add(s.fragments_dropped as u64, Relaxed);
+    }
+    if s.setups_received != 0 {
+        c.setups_received
+            .fetch_add(s.setups_received as u64, Relaxed);
+    }
+    if s.heartbeats_received != 0 {
+        c.heartbeats_received
+            .fetch_add(s.heartbeats_received as u64, Relaxed);
+    }
+    if s.naks_sent != 0 {
+        c.naks_sent.fetch_add(s.naks_sent as u64, Relaxed);
+    }
+    if s.naks_suppressed != 0 {
+        c.naks_suppressed
+            .fetch_add(s.naks_suppressed as u64, Relaxed);
+    }
+    if s.sms_sent != 0 {
+        c.sms_sent.fetch_add(s.sms_sent as u64, Relaxed);
+    }
+    if s.send_errors != 0 {
+        c.send_errors_receiver
+            .fetch_add(s.send_errors as u64, Relaxed);
+    }
+    if s.recv_errors != 0 {
+        c.recv_errors.fetch_add(s.recv_errors as u64, Relaxed);
+    }
+    if s.control_drops != 0 {
+        c.control_drops_receiver
+            .fetch_add(s.control_drops as u64, Relaxed);
     }
 }
 
@@ -857,6 +962,126 @@ mod tests {
                 assert_eq!(sm.receiver_window, 3 * sub_cfg().term_length);
             }
             other => panic!("expected SM, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn counters_track_received_bytes_and_fragments() {
+        let (_log, mut receiver, publisher, recv_addr) = build_receiver(
+            Duration::from_secs(3600),
+            Duration::from_micros(50),
+            Duration::from_micros(150),
+        );
+        let counters = Arc::new(Counters::new());
+        receiver.set_counters(Some(Arc::clone(&counters)));
+
+        let frag = build_fragment(100, 0, data_flags::UNFRAGMENTED, &[0xAAu8; 64]);
+        publisher.send_to(recv_addr, &frag).unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            let stats = receiver.tick();
+            if stats.fragments_accepted >= 1 {
+                break;
+            }
+            if Instant::now() > deadline {
+                panic!("fragment not accepted");
+            }
+        }
+        let snap = counters.snapshot();
+        assert!(snap.bytes_received >= 96);
+        assert_eq!(snap.fragments_accepted, 1);
+    }
+
+    #[test]
+    fn loss_callback_fires_once_per_distinct_gap() {
+        use std::sync::Mutex;
+        let (_log, mut receiver, publisher, recv_addr) = build_receiver(
+            Duration::from_secs(3600),
+            Duration::from_secs(3600), // long backoff so we observe pending-state
+            Duration::from_micros(0),
+        );
+        let counters = Arc::new(Counters::new());
+        receiver.set_counters(Some(Arc::clone(&counters)));
+
+        let collected: Arc<Mutex<Vec<LossEvent>>> = Arc::new(Mutex::new(Vec::new()));
+        let collected_for_cb = Arc::clone(&collected);
+        receiver.set_loss_callback(Some(Box::new(move |ev: &LossEvent| {
+            collected_for_cb.lock().unwrap().push(*ev);
+        })));
+
+        // Send fragment #2 at offset 96, leaving a gap at offset 0.
+        let frag = build_fragment(100, 96, data_flags::UNFRAGMENTED, &[0xCCu8; 64]);
+        publisher.send_to(recv_addr, &frag).unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            receiver.tick();
+            if receiver.pending_nak_count() >= 1 {
+                break;
+            }
+            if Instant::now() > deadline {
+                panic!("gap not detected");
+            }
+        }
+        // Tick a few more times — same gap, callback must NOT re-fire.
+        for _ in 0..5 {
+            receiver.tick();
+        }
+        let events = collected.lock().unwrap().clone();
+        assert_eq!(
+            events.len(),
+            1,
+            "callback fired multiple times for same gap"
+        );
+        let ev = events[0];
+        assert_eq!(ev.session_id, sub_cfg().session_id);
+        assert_eq!(ev.term_id, 100);
+        assert_eq!(ev.term_offset, 0);
+        assert_eq!(ev.gap_length, 192);
+
+        let snap = counters.snapshot();
+        assert_eq!(snap.gaps_detected, 1);
+        assert_eq!(snap.bytes_in_gaps, 192);
+    }
+
+    #[test]
+    fn loss_callback_re_fires_after_nak_round_completes() {
+        // After a pending NAK fires, the gap may still be present
+        // (publisher's retransmit hasn't arrived). On the next
+        // detect tick, a new pending NAK is scheduled and the
+        // callback fires again. This verifies the "per NAK round"
+        // semantics documented on set_loss_callback.
+        use std::sync::Mutex;
+        let (_log, mut receiver, publisher, recv_addr) = build_receiver(
+            Duration::from_secs(3600),
+            Duration::from_micros(500), // short backoff so the NAK fires fast
+            Duration::from_micros(0),
+        );
+        let collected: Arc<Mutex<u32>> = Arc::new(Mutex::new(0));
+        let collected_for_cb = Arc::clone(&collected);
+        receiver.set_loss_callback(Some(Box::new(move |_ev: &LossEvent| {
+            *collected_for_cb.lock().unwrap() += 1;
+        })));
+
+        // Send fragment #2; gap stays present (no fragment #1 ever
+        // arrives). Two NAK rounds should produce two callback fires.
+        let frag = build_fragment(100, 96, data_flags::UNFRAGMENTED, &[0x77u8; 64]);
+        publisher.send_to(recv_addr, &frag).unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            receiver.tick();
+            if *collected.lock().unwrap() >= 2 {
+                break;
+            }
+            if Instant::now() > deadline {
+                panic!(
+                    "expected callback to re-fire after NAK round (count={})",
+                    *collected.lock().unwrap()
+                );
+            }
+            std::thread::sleep(Duration::from_micros(100));
         }
     }
 
