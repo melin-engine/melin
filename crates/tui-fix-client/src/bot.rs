@@ -9,16 +9,16 @@ use melin_gateway_core::fix::tags;
 
 // --- Price model ---
 
-/// Sine-wave period for the midprice walk. 30 s is short enough that a
+/// Sine-wave period for the midprice walk. 10 s is short enough that a
 /// full cycle is visible during a casual demo.
-pub(crate) const PERIOD_SECS: f64 = 30.0;
+pub(crate) const PERIOD_SECS: f64 = 10.0;
 /// Midprice base (FIX decimal). The sinusoid oscillates around this.
 pub(crate) const MID_BASE: f64 = 100.0;
 /// Peak-to-mean amplitude of the midprice in FIX decimal units. With
 /// `MID_BASE = 100` and `MID_AMP = 5` the mid walks 95 → 105 over one
-/// cycle. The amplitude is deliberately ~10× the buy/sell spread
-/// (`MAX_OFFSET_TICKS = 0.50`) so the wave is clearly visible in the
-/// book panel and isn't swamped by per-order noise.
+/// cycle. The amplitude is deliberately ~17× the per-side spread
+/// (`MAX_OFFSET_TICKS = 3` × 0.1 = 0.3) so the wave is clearly visible
+/// in the book panel and isn't swamped by per-order noise.
 pub(crate) const MID_AMP: f64 = 5.0;
 /// Constant submission rate (orders/sec). The book's *visual* sine
 /// comes from the mid moving, not the rate, so a flat rate is the
@@ -26,13 +26,16 @@ pub(crate) const MID_AMP: f64 = 5.0;
 /// idle and frequent enough to populate the moving cluster densely.
 pub(crate) const BOT_RATE: f64 = 30.0;
 
-/// Midprice (FIX decimal) `t` seconds after bot start, snapped to the
-/// 0.01 tick grid the gateway uses (`tick_size_inverse = 100`). Snapping
-/// at this layer keeps `next_bot_order`'s integer-tick offsets producing
-/// grid-aligned final prices regardless of where on the sine we are.
+/// Midprice (FIX decimal) `t` seconds after bot start, snapped to a
+/// 0.1 grid for visually clean prices in the book panel. The engine's
+/// underlying tick is 0.01 (`tick_size_inverse = 100`), so 0.1-aligned
+/// values are still on-grid; we just expose a coarser visible
+/// resolution. Snapping here keeps `next_bot_order`'s integer-tick
+/// offsets producing grid-aligned final prices regardless of where on
+/// the sine we are.
 pub(crate) fn bot_mid_price(t: f64) -> f64 {
     let raw = MID_BASE + MID_AMP * (std::f64::consts::TAU * t / PERIOD_SECS).sin();
-    (raw * 100.0).round() / 100.0
+    (raw * 10.0).round() / 10.0
 }
 
 // --- RNG ---
@@ -63,9 +66,12 @@ pub(crate) const BOT_ACCOUNTS: [u32; 31] = {
 };
 /// Matches the FIX symbols configured in the OE gateway.
 pub(crate) const BOT_SYMBOLS: [&str; 2] = ["BTC/USD", "ETH/USD"];
-/// One FIX price tick is 1/tick_size_inverse = 0.01 at the default
-/// config. Offsets are drawn uniformly in [1, 50] ticks.
-pub(crate) const MAX_OFFSET_TICKS: u64 = 50;
+/// Bot offset granularity is 0.1 (one decimal). Offsets are drawn
+/// uniformly in [1, 3] of these 0.1-units, giving a [0.1, 0.3] spread
+/// each side of the mid (max book-wide spread = 0.6). Tight enough to
+/// keep the cluster around the moving mid dense, wide enough to leave
+/// room for the user's manual orders to sit between.
+pub(crate) const MAX_OFFSET_TICKS: u64 = 3;
 /// Max order quantity in lots. Quantities are drawn uniformly in [1, 50].
 pub(crate) const MAX_QTY: u64 = 50;
 
@@ -82,7 +88,8 @@ pub(crate) struct BotOrder {
 /// Draw the next order's parameters from the RNG state at wall-time
 /// `t` (seconds since bot start). Buys sit below the *current* mid,
 /// sells above — the bot never self-crosses, even as the mid moves.
-/// Prices stay on the 0.01 tick grid because `bot_mid_price` snaps.
+/// Prices stay on the 0.1 grid because `bot_mid_price` snaps and the
+/// offset is in 0.1-units.
 pub(crate) fn next_bot_order(rng: &mut u64, t: f64) -> BotOrder {
     let account_id = BOT_ACCOUNTS[(xs64(rng) as usize) % BOT_ACCOUNTS.len()];
     let symbol = BOT_SYMBOLS[(xs64(rng) as usize) % BOT_SYMBOLS.len()];
@@ -90,9 +97,9 @@ pub(crate) fn next_bot_order(rng: &mut u64, t: f64) -> BotOrder {
     let offset_ticks = (xs64(rng) % MAX_OFFSET_TICKS) + 1;
     let mid = bot_mid_price(t);
     let price = if side_code == "1" {
-        mid - (offset_ticks as f64) / 100.0
+        mid - (offset_ticks as f64) / 10.0
     } else {
-        mid + (offset_ticks as f64) / 100.0
+        mid + (offset_ticks as f64) / 10.0
     };
     let qty = (xs64(rng) % MAX_QTY) + 1;
     BotOrder {
@@ -113,7 +120,7 @@ pub(crate) fn build_bot_nos(clord: &str, order: &BotOrder) -> FixMessageBuilder 
         .str_tag(tags::SYMBOL, order.symbol)
         .str_tag(tags::SIDE, order.side_code)
         .str_tag(tags::ORD_TYPE, "2") // Limit
-        .str_tag(tags::PRICE, &format!("{:.2}", order.price))
+        .str_tag(tags::PRICE, &format!("{:.1}", order.price))
         .str_tag(tags::ORDER_QTY, &format!("{}", order.qty))
         .str_tag(tags::TIME_IN_FORCE, "1") // GTC
         .str_tag(tags::ACCOUNT, &format!("{}", order.account_id))
@@ -153,16 +160,16 @@ mod tests {
 
     #[test]
     fn bot_mid_price_lands_on_tick_grid() {
-        // Engine ticks are 0.01 with the default tick_size_inverse=100.
-        // Any mid we feed into next_bot_order must already be on the
-        // grid, otherwise (mid ± offset/100) drifts off it and the
-        // gateway rejects the order on rounding mismatch.
+        // The bot snaps the mid to a 0.1 grid (coarser than the engine's
+        // 0.01 tick) for visual cleanliness. Any mid we feed into
+        // next_bot_order must already be on that grid, otherwise
+        // (mid ± offset/10) drifts off it.
         for i in 0..=300 {
             let t = i as f64 * 0.1;
             let mid = bot_mid_price(t);
-            let in_ticks = (mid * 100.0).round();
-            let on_grid = (mid * 100.0 - in_ticks).abs() < 1e-9;
-            assert!(on_grid, "mid {mid} at t={t} is not on the 0.01 grid");
+            let in_ticks = (mid * 10.0).round();
+            let on_grid = (mid * 10.0 - in_ticks).abs() < 1e-9;
+            assert!(on_grid, "mid {mid} at t={t} is not on the 0.1 grid");
         }
     }
 
@@ -246,11 +253,12 @@ mod tests {
                 "2" => assert!(o.price > mid, "sell at {} vs mid {}", o.price, mid),
                 other => panic!("unexpected side {other}"),
             }
-            // Offset bounded to [1, 50] ticks = [0.01, 0.50].
+            // Offset bounded to [1, MAX_OFFSET_TICKS] units of 0.1.
+            let max = MAX_OFFSET_TICKS as f64 / 10.0;
             let abs_offset = (o.price - mid).abs();
             assert!(
-                (0.01 - 1e-9..=0.50 + 1e-9).contains(&abs_offset),
-                "offset {abs_offset} out of range",
+                (0.1 - 1e-9..=max + 1e-9).contains(&abs_offset),
+                "offset {abs_offset} out of range [0.1..={max}]",
             );
         }
     }
@@ -297,7 +305,7 @@ mod tests {
             account_id: 7,
             symbol: "BTC/USD",
             side_code: "1",
-            price: 99.37,
+            price: 99.3,
             qty: 12,
         };
         let raw = build_bot_nos("BOT42", &order).build("BOT", "MELIN-OE", 1);
@@ -307,26 +315,26 @@ mod tests {
         assert_eq!(msg.get_str(tags::SYMBOL), Some("BTC/USD"));
         assert_eq!(msg.get_str(tags::SIDE), Some("1"));
         assert_eq!(msg.get_str(tags::ORD_TYPE), Some("2"));
-        assert_eq!(msg.get_str(tags::PRICE), Some("99.37"));
+        assert_eq!(msg.get_str(tags::PRICE), Some("99.3"));
         assert_eq!(msg.get_str(tags::ORDER_QTY), Some("12"));
         assert_eq!(msg.get_str(tags::TIME_IN_FORCE), Some("1"));
         assert_eq!(msg.get_str(tags::ACCOUNT), Some("7"));
     }
 
     #[test]
-    fn build_bot_nos_rounds_price_to_two_decimals() {
-        // Formatter rounds to 2 decimals. Values drawn by next_bot_order
-        // already land on the 0.01 grid, but this guards against future
+    fn build_bot_nos_rounds_price_to_one_decimal() {
+        // Formatter rounds to 1 decimal. Values drawn by next_bot_order
+        // already land on the 0.1 grid, but this guards against future
         // drift in the sampling logic producing non-grid prices.
         let order = BotOrder {
             account_id: 2,
             symbol: "ETH/USD",
             side_code: "2",
-            price: 100.005_6,
+            price: 100.056,
             qty: 1,
         };
         let raw = build_bot_nos("X", &order).build("BOT", "MELIN-OE", 1);
         let msg = FixMessage::parse(&raw).unwrap();
-        assert_eq!(msg.get_str(tags::PRICE), Some("100.01"));
+        assert_eq!(msg.get_str(tags::PRICE), Some("100.1"));
     }
 }
