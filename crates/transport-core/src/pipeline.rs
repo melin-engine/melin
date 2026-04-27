@@ -265,6 +265,12 @@ pub struct JournalStage<E: AppEvent> {
     /// snapshot stage. Updated once per fsync batch (cold path). `None` when
     /// shadow snapshots are disabled — no allocation or write overhead.
     chain_hash: Option<Arc<SeqLock<[u8; 32]>>>,
+    /// Optional atomic for publishing the writer's `next_sequence - 1`
+    /// (the highest journal sequence durably persisted) to readers outside
+    /// the pipeline thread. Replicas use this so the orchestrator can read
+    /// last-journal-seq for reconnect handshakes without owning the writer.
+    /// Updated once per fsync batch alongside `chain_hash`.
+    last_seq: Option<Arc<AtomicU64>>,
     /// When true, never yield to the OS scheduler — spin indefinitely with
     /// PAUSE. Requires isolated cores (`isolcpus`). See [`idle_wait`].
     busy_spin: bool,
@@ -321,6 +327,7 @@ impl<E: AppEvent> JournalStage<E> {
             max_batch: max_batch.min(MAX_JOURNAL_BATCH),
             repl: Box::default(),
             chain_hash: None,
+            last_seq: None,
             busy_spin,
             utilization: Arc::new(StageUtilization::new()),
         }
@@ -352,6 +359,14 @@ impl<E: AppEvent> JournalStage<E> {
     /// snapshots are enabled.
     pub fn set_chain_hash_lock(&mut self, lock: Arc<SeqLock<[u8; 32]>>) {
         self.chain_hash = Some(lock);
+    }
+
+    /// Set the atomic for publishing the highest journal sequence durably
+    /// persisted. Called once during pipeline construction when readers
+    /// outside the pipeline thread (e.g., the replication-receive
+    /// orchestrator) need to read the writer's progress without owning it.
+    pub fn set_last_seq_publisher(&mut self, last_seq: Arc<AtomicU64>) {
+        self.last_seq = Some(last_seq);
     }
 
     /// Run the journal stage loop.
@@ -632,12 +647,28 @@ impl<E: AppEvent> JournalStage<E> {
     /// Publish the current BLAKE3 chain hash to the shadow snapshot stage
     /// via the SeqLock. Called once per fsync batch (cold path). No-op when
     /// shadow snapshots are disabled or hash-chain is not active.
+    /// Publish the post-fsync writer state to optional readers:
+    /// `chain_hash` (for shadow snapshots and replica handshakes) and
+    /// `last_seq` (highest journal sequence durably persisted, used by the
+    /// replica orchestrator on reconnect handshakes). Both `Option`s are
+    /// independent; either can be set or unset. Called once per fsync
+    /// batch (cold path); each `if let Some` is a single branch on a small
+    /// struct field.
     #[inline]
     fn publish_chain_hash(&self) {
         if let Some(ref lock) = self.chain_hash
             && let Some(hash) = self.writer.chain_hash()
         {
             lock.store(hash);
+        }
+        if let Some(ref atom) = self.last_seq {
+            // `next_sequence` is the sequence about to be allocated; the
+            // highest written is one less. Saturating prevents underflow for
+            // a fresh writer at sequence 0.
+            atom.store(
+                self.writer.next_sequence().saturating_sub(1),
+                Ordering::Release,
+            );
         }
     }
 
@@ -1491,6 +1522,10 @@ pub struct ReplicaPipeline<A: Application> {
     pub journal_cursor: Arc<Sequence>,
     pub matching_cursor: Arc<Sequence>,
     pub shadow_consumer: Option<ring::Consumer<InputSlot<A::Event>>>,
+    /// Always populated for replicas — the orchestrator reads it for
+    /// reconnect handshakes (last journal sequence the replica has durably
+    /// persisted). Updated by `JournalStage` after each fsync batch.
+    pub last_seq: Arc<AtomicU64>,
     pub chain_hash_lock: Option<Arc<SeqLock<[u8; 32]>>>,
 }
 
@@ -1791,6 +1826,13 @@ where
         None
     };
 
+    // Last-journaled-sequence atomic — always populated for replicas. The
+    // orchestrator reads it for reconnect handshakes without owning the
+    // writer (the writer lives inside `journal_stage` for the lifetime of
+    // the pipeline).
+    let last_seq = Arc::new(AtomicU64::new(0));
+    journal_stage.set_last_seq_publisher(Arc::clone(&last_seq));
+
     // Matching stage: same as primary but with no replicas_connected check
     // (None = standalone mode, never halts on replica disconnect).
     let active_connections = Arc::new(AtomicU64::new(0));
@@ -1813,6 +1855,7 @@ where
         journal_cursor,
         matching_cursor,
         shadow_consumer,
+        last_seq,
         chain_hash_lock,
     }
 }
