@@ -524,7 +524,7 @@ impl<T: UdpTransport> ReceiverLoop<T> {
 /// docs for the consistency contract. `gaps_detected` and
 /// `bytes_in_gaps` are bumped at detection time inside
 /// [`ReceiverLoop::detect_and_schedule_gap`], not here.
-fn fold_into_counters(c: &Counters, s: &TickStats) {
+pub(crate) fn fold_into_counters(c: &Counters, s: &TickStats) {
     use std::sync::atomic::Ordering::Relaxed;
     if s.bytes_received != 0 {
         c.bytes_received.fetch_add(s.bytes_received, Relaxed);

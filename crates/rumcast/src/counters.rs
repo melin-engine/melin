@@ -67,6 +67,17 @@ pub struct Counters {
     /// out-of-order arrival means many of these bytes were never
     /// actually retransmitted on the wire.
     pub bytes_in_gaps: AtomicU64,
+
+    // ---- Multi-session bookkeeping (set only by MuxedReceiver /
+    // MuxedSender; left at zero by the single-session loops). ----
+    /// Number of new sessions allocated by a muxed receiver/sender
+    /// since startup. Increments once per first-contact frame from a
+    /// previously-unseen session_id.
+    pub sessions_created: AtomicU64,
+    /// Number of new sessions refused because the muxer was at its
+    /// `max_sessions` cap. Sustained non-zero growth indicates a
+    /// misconfigured cap or a peer abusing session_id rotation.
+    pub sessions_rejected: AtomicU64,
 }
 
 /// Eventually-consistent snapshot of [`Counters`] — each field loaded
@@ -98,6 +109,9 @@ pub struct CountersSnapshot {
 
     pub gaps_detected: u64,
     pub bytes_in_gaps: u64,
+
+    pub sessions_created: u64,
+    pub sessions_rejected: u64,
 }
 
 impl Counters {
@@ -134,6 +148,9 @@ impl Counters {
 
             gaps_detected: self.gaps_detected.load(r),
             bytes_in_gaps: self.bytes_in_gaps.load(r),
+
+            sessions_created: self.sessions_created.load(r),
+            sessions_rejected: self.sessions_rejected.load(r),
         }
     }
 }
