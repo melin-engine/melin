@@ -44,6 +44,7 @@ compile_error!(
 pub mod counters;
 pub mod flow_control;
 pub mod muxed_receiver;
+pub mod muxed_sender;
 pub mod pub_log;
 pub mod receiver;
 pub mod sender;

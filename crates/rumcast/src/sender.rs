@@ -395,7 +395,7 @@ impl<T: UdpTransport> SenderLoop<T> {
 /// Fold a per-tick [`TickStats`] delta into the cumulative
 /// [`Counters`]. `Relaxed` ordering throughout — see counters module
 /// docs for the consistency contract.
-fn fold_into_counters(c: &Counters, s: &TickStats) {
+pub(crate) fn fold_into_counters(c: &Counters, s: &TickStats) {
     use std::sync::atomic::Ordering::Relaxed;
     if s.bytes_sent != 0 {
         c.bytes_sent.fetch_add(s.bytes_sent, Relaxed);
