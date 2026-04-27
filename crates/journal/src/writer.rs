@@ -488,6 +488,7 @@ impl<E: AppEvent> JournalWriter<E> {
             }
         }
 
+        self.warn_if_batch_overflow(written);
         self.batch_buf.extend_from_slice(&self.buffer[..written]);
 
         // Auto-emit a checkpoint if we've hit the interval.
@@ -542,9 +543,32 @@ impl<E: AppEvent> JournalWriter<E> {
             chain.events_since_checkpoint = 0;
         }
 
+        self.warn_if_batch_overflow(written);
         self.batch_buf.extend_from_slice(&self.buffer[..written]);
         self.next_sequence += 1;
         Ok(())
+    }
+
+    /// Warn whenever `batch_buf` is about to grow past its current
+    /// capacity. The buffer is sized for the pipeline's flush cadence; an
+    /// overflow means the caller is batching more than `batch_buf.capacity()`
+    /// bytes between flushes and triggering a `Vec` realloc on the hot path.
+    /// `Vec` doubles on grow and `flush_batch` only `clear()`s (capacity
+    /// is preserved), so the warns naturally rate-limit themselves to one
+    /// per actual realloc.
+    #[inline]
+    fn warn_if_batch_overflow(&mut self, adding: usize) {
+        if self.batch_buf.len() + adding > self.batch_buf.capacity() {
+            tracing::warn!(
+                current_len = self.batch_buf.len(),
+                adding,
+                capacity = self.batch_buf.capacity(),
+                "journal batch buffer exceeded preallocated capacity — \
+                 caller is batching more than capacity between flushes, \
+                 forcing a Vec realloc on the hot path; reduce flush \
+                 cadence or raise BATCH_BUF_CAPACITY"
+            );
+        }
     }
 
     /// Write the accumulated batch buffer to disk in a single `pwrite` syscall.
