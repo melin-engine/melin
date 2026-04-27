@@ -257,6 +257,153 @@ fn compute_mac(token: &[u8; 32], session_id: u32, seq: u64, inner: &[u8]) -> [u8
     mac
 }
 
+// ---------------------------------------------------------------------------
+// Handshake helpers
+//
+// Pure-crypto pieces of the rumcast handshake, factored out so the
+// bench client, the smoke test, and the server's session_translator
+// all use the same byte assembly. The transport-level I/O (publish
+// bytes, poll for reply) stays at the caller — keeps this module
+// transport-agnostic.
+// ---------------------------------------------------------------------------
+
+/// Errors returned by [`verify_client_handshake`]. The session
+/// translator turns these into a counter bump + an `AuthFailed`
+/// reply on the wire — clients never see the structured variant.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HandshakeError {
+    /// Client's `public_key` bytes don't decode as a valid Ed25519
+    /// VerifyingKey (e.g. low-order point, malformed encoding).
+    BadClientPublicKey,
+    /// Ed25519 signature didn't verify against the expected payload
+    /// (`nonce ‖ server_eph ‖ client_eph`). Either tampering, key
+    /// mismatch, or a signing-payload drift between peers.
+    SignatureInvalid,
+}
+
+impl std::fmt::Display for HandshakeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::BadClientPublicKey => write!(f, "client Ed25519 public key is malformed"),
+            Self::SignatureInvalid => write!(f, "client Ed25519 signature did not verify"),
+        }
+    }
+}
+
+impl std::error::Error for HandshakeError {}
+
+/// Output of a successful [`ClientHandshake::finish`]. Carries the
+/// `Request::ChallengeResponse` the caller should send and the
+/// per-session MAC token both sides have now derived (independently —
+/// the token never crosses the wire).
+pub struct CompletedHandshake {
+    pub challenge_response: crate::message::Request,
+    pub session_token: [u8; 32],
+}
+
+/// Client-side handshake helper. Wraps the long-term Ed25519
+/// identity + a fresh ephemeral X25519 keypair, then completes the
+/// handshake when the server's Challenge arrives.
+///
+/// Holds the ephemeral X25519 secret in a `StaticSecret` (which
+/// `zeroize-on-drop`s when the helper is consumed by `finish`),
+/// so the secret bytes are wiped from RAM as soon as the shared
+/// secret has been derived.
+pub struct ClientHandshake<'a> {
+    signing_key: &'a ed25519_dalek::SigningKey,
+    x25519_secret: x25519_dalek::StaticSecret,
+    x25519_public: [u8; 32],
+}
+
+impl<'a> ClientHandshake<'a> {
+    /// Construct a handshake bound to `signing_key` (the client's
+    /// long-term Ed25519 identity) using `x25519_secret_bytes` as
+    /// the X25519 ephemeral secret.
+    ///
+    /// The caller is responsible for sourcing
+    /// `x25519_secret_bytes` from a cryptographic RNG (e.g.
+    /// `getrandom::fill`). Keeping the source explicit lets the
+    /// helper stay free of an `OsRng` dep and keeps tests
+    /// deterministic.
+    pub fn new(signing_key: &'a ed25519_dalek::SigningKey, x25519_secret_bytes: [u8; 32]) -> Self {
+        let secret = x25519_dalek::StaticSecret::from(x25519_secret_bytes);
+        let public = x25519_dalek::PublicKey::from(&secret).to_bytes();
+        Self {
+            signing_key,
+            x25519_secret: secret,
+            x25519_public: public,
+        }
+    }
+
+    /// Client's long-term Ed25519 public key. Useful when the
+    /// caller needs to write it into an `authorized_keys` file
+    /// before connecting (e.g. test setup).
+    pub fn ed25519_public_key(&self) -> [u8; 32] {
+        self.signing_key.verifying_key().to_bytes()
+    }
+
+    /// Process the server's Challenge frame contents. Consumes
+    /// `self` so the ephemeral X25519 secret is dropped (and
+    /// zeroed) immediately after the shared secret has been
+    /// computed.
+    pub fn finish(
+        self,
+        server_nonce: &[u8; 32],
+        server_x25519_eph: &[u8; 32],
+    ) -> CompletedHandshake {
+        use ed25519_dalek::Signer;
+
+        let signing_payload =
+            crate::auth::auth_signing_payload(server_nonce, server_x25519_eph, &self.x25519_public);
+        let signature = self.signing_key.sign(&signing_payload);
+        let public_key = self.signing_key.verifying_key().to_bytes();
+
+        let server_pub = x25519_dalek::PublicKey::from(*server_x25519_eph);
+        let shared = self.x25519_secret.diffie_hellman(&server_pub);
+        let token = derive_session_token(shared.as_bytes(), server_nonce);
+
+        CompletedHandshake {
+            challenge_response: crate::message::Request::ChallengeResponse {
+                signature: signature.to_bytes(),
+                public_key,
+                client_x25519_eph: self.x25519_public,
+            },
+            session_token: token,
+        }
+    }
+}
+
+/// Server-side handshake completion. Verifies the client's Ed25519
+/// signature over `nonce ‖ server_eph ‖ client_eph` and derives the
+/// same session token the client computed.
+///
+/// The caller is responsible for `authorized_keys` lookup BEFORE
+/// invoking this — `client_pubkey` is treated as already-trusted
+/// here. The split keeps key-source policy (file lookup, ACL,
+/// future RBAC) out of the crypto layer.
+pub fn verify_client_handshake(
+    nonce: &[u8; 32],
+    server_x25519_eph: &[u8; 32],
+    server_x25519_secret: &x25519_dalek::StaticSecret,
+    client_pubkey: &[u8; 32],
+    client_x25519_eph: &[u8; 32],
+    signature: &[u8; 64],
+) -> Result<[u8; 32], HandshakeError> {
+    use ed25519_dalek::{Signature, Verifier, VerifyingKey};
+
+    let signing_payload =
+        crate::auth::auth_signing_payload(nonce, server_x25519_eph, client_x25519_eph);
+    let vk =
+        VerifyingKey::from_bytes(client_pubkey).map_err(|_| HandshakeError::BadClientPublicKey)?;
+    let sig = Signature::from_bytes(signature);
+    vk.verify(&signing_payload, &sig)
+        .map_err(|_| HandshakeError::SignatureInvalid)?;
+
+    let client_pub = x25519_dalek::PublicKey::from(*client_x25519_eph);
+    let shared = server_x25519_secret.diffie_hellman(&client_pub);
+    Ok(derive_session_token(shared.as_bytes(), nonce))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -625,5 +772,183 @@ mod tests {
             verify_and_decode_envelope(&server_token, session_id, 0, &wire).unwrap();
         assert_eq!(seq, 1);
         assert_eq!(decoded, inner);
+    }
+
+    // --- Handshake helpers ---
+
+    #[test]
+    fn handshake_helpers_round_trip_to_matching_token() {
+        // Walk the four-message handshake with both helpers and
+        // confirm both sides arrive at the same session token —
+        // this is the property the rumcast smoke test and the bench
+        // both rely on for envelope verification to succeed.
+        use ed25519_dalek::SigningKey;
+
+        let client_signing_key = SigningKey::from_bytes(&[0x42u8; 32]);
+        let client_pubkey = client_signing_key.verifying_key().to_bytes();
+
+        // Server side: pick a nonce + ephemeral X25519 keypair (in
+        // production this comes from `getrandom::fill`).
+        let server_nonce = [0xA1u8; 32];
+        let server_x25519_secret = x25519_dalek::StaticSecret::from([0xB2u8; 32]);
+        let server_x25519_public = x25519_dalek::PublicKey::from(&server_x25519_secret).to_bytes();
+
+        // Client side: process the Challenge → produce
+        // ChallengeResponse + token.
+        let client_x25519_secret_bytes = [0xC3u8; 32];
+        let client_handshake =
+            ClientHandshake::new(&client_signing_key, client_x25519_secret_bytes);
+        assert_eq!(client_handshake.ed25519_public_key(), client_pubkey);
+        let completed = client_handshake.finish(&server_nonce, &server_x25519_public);
+
+        // The Request the client would send.
+        let crate::message::Request::ChallengeResponse {
+            signature,
+            public_key,
+            client_x25519_eph,
+        } = completed.challenge_response
+        else {
+            panic!("expected ChallengeResponse");
+        };
+        assert_eq!(public_key, client_pubkey);
+
+        // Server side: verify + derive token.
+        let server_token = verify_client_handshake(
+            &server_nonce,
+            &server_x25519_public,
+            &server_x25519_secret,
+            &public_key,
+            &client_x25519_eph,
+            &signature,
+        )
+        .unwrap();
+
+        assert_eq!(
+            server_token, completed.session_token,
+            "client and server must derive the same session token",
+        );
+    }
+
+    #[test]
+    fn verify_client_handshake_rejects_tampered_signature() {
+        // If a man-in-the-middle flips a bit in the signature
+        // bytes, the server-side verifier must reject. This is
+        // the essential property of the auth handshake.
+        use ed25519_dalek::SigningKey;
+
+        let key = SigningKey::from_bytes(&[0x42u8; 32]);
+        let nonce = [0xA1u8; 32];
+        let server_secret = x25519_dalek::StaticSecret::from([0xB2u8; 32]);
+        let server_public = x25519_dalek::PublicKey::from(&server_secret).to_bytes();
+        let handshake = ClientHandshake::new(&key, [0xC3u8; 32]);
+        let completed = handshake.finish(&nonce, &server_public);
+
+        let crate::message::Request::ChallengeResponse {
+            mut signature,
+            public_key,
+            client_x25519_eph,
+        } = completed.challenge_response
+        else {
+            unreachable!();
+        };
+        signature[0] ^= 0x01;
+
+        assert_eq!(
+            verify_client_handshake(
+                &nonce,
+                &server_public,
+                &server_secret,
+                &public_key,
+                &client_x25519_eph,
+                &signature,
+            ),
+            Err(HandshakeError::SignatureInvalid),
+        );
+    }
+
+    #[test]
+    fn verify_client_handshake_rejects_eph_substitution() {
+        // Active downgrade: an MITM substitutes its own X25519
+        // ephemeral hoping the server won't notice — but the
+        // signature payload covers `nonce ‖ server_eph ‖
+        // client_eph`, so swapping the client_eph field invalidates
+        // the signature. Locks down the property that motivated
+        // option B (binding the ephemerals into the signature).
+        use ed25519_dalek::SigningKey;
+
+        let key = SigningKey::from_bytes(&[0x42u8; 32]);
+        let nonce = [0xA1u8; 32];
+        let server_secret = x25519_dalek::StaticSecret::from([0xB2u8; 32]);
+        let server_public = x25519_dalek::PublicKey::from(&server_secret).to_bytes();
+        let handshake = ClientHandshake::new(&key, [0xC3u8; 32]);
+        let completed = handshake.finish(&nonce, &server_public);
+
+        let crate::message::Request::ChallengeResponse {
+            signature,
+            public_key,
+            ..
+        } = completed.challenge_response
+        else {
+            unreachable!();
+        };
+
+        // Substitute a different client_x25519_eph (an MITM's own
+        // pubkey); the signature was made over the original.
+        let mitm_eph = [0xFFu8; 32];
+        assert_eq!(
+            verify_client_handshake(
+                &nonce,
+                &server_public,
+                &server_secret,
+                &public_key,
+                &mitm_eph,
+                &signature,
+            ),
+            Err(HandshakeError::SignatureInvalid),
+        );
+    }
+
+    #[test]
+    fn verify_client_handshake_rejects_malformed_pubkey() {
+        // Ed25519 rejects low-order points and other malformed
+        // encodings at parse time. Locks down the dedicated
+        // BadClientPublicKey variant.
+        use ed25519_dalek::SigningKey;
+
+        let key = SigningKey::from_bytes(&[0x42u8; 32]);
+        let nonce = [0xA1u8; 32];
+        let server_secret = x25519_dalek::StaticSecret::from([0xB2u8; 32]);
+        let server_public = x25519_dalek::PublicKey::from(&server_secret).to_bytes();
+        let handshake = ClientHandshake::new(&key, [0xC3u8; 32]);
+        let completed = handshake.finish(&nonce, &server_public);
+
+        let crate::message::Request::ChallengeResponse {
+            signature,
+            client_x25519_eph,
+            ..
+        } = completed.challenge_response
+        else {
+            unreachable!();
+        };
+
+        // 32 bytes of 0x02: encoded y-coordinate corresponds to a
+        // non-square value of `y² - 1` mod p, so curve25519-dalek's
+        // CompressedEdwardsY::decompress returns None and
+        // VerifyingKey::from_bytes errors before any signature math
+        // runs. (Most random 32-byte values DO decode — about half.
+        // We hand-pick a known-bad one rather than fuzz-search at
+        // test time.)
+        let bad_pubkey = [0x02u8; 32];
+        assert_eq!(
+            verify_client_handshake(
+                &nonce,
+                &server_public,
+                &server_secret,
+                &bad_pubkey,
+                &client_x25519_eph,
+                &signature,
+            ),
+            Err(HandshakeError::BadClientPublicKey),
+        );
     }
 }

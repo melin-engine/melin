@@ -4,13 +4,16 @@
 //! # What this is for
 //!
 //! Lets the LAN bench suite (`melin-bench`) compare TCP versus rumcast
-//! on the same engine pipeline. Phase 1 deliberately keeps scope tight:
+//! on the same engine pipeline. Phase 2 scope:
 //!
 //! - Standalone primary only (no replica, no promotion).
-//! - **No authentication.** Bench/server are on a trusted LAN. Auth is
-//!   the Phase 2 effort (option-2 session-token MAC over fragments).
+//! - **Pure-UDP authentication** via Ed25519 challenge-response +
+//!   X25519 ECDH, with per-message BLAKE3 keyed-MAC envelopes on the
+//!   data plane. Same Ed25519 identities as the TCP path
+//!   (`authorized_keys`).
 //! - Single client / single bench thread. Multi-client routing is
-//!   Phase 3.
+//!   Phase 3 (the per-session state table is keyed by `session_id`
+//!   from day one, so the wiring will be local).
 //! - Kernel UDP only (rumcast's `KernelUdp`). DPDK rumcast backend is
 //!   a separate effort tracked under the rumcast crate's deferred list.
 //!
@@ -18,26 +21,44 @@
 //!
 //! ```text
 //! [bench client]                                   [melin-server (this)]
-//!   PublicationLog ──orders (UDP)──▶ SubscriptionLog ─▶ in-translator
-//!                                                        │
-//!                                                  input disruptor
-//!                                                        │
-//!                                                  engine pipeline
-//!                                                        │
-//!                                                  output ring
-//!                                                        │
-//!   SubscriptionLog ◀──responses (UDP)── PublicationLog ◀ out-translator
+//!   PublicationLog ──orders (UDP)──▶ SubscriptionLog ─┐
+//!                                                     │
+//!                                                     ▼
+//!                                              session-translator
+//!                                              (auth state machine,
+//!                                               envelope verify/wrap)
+//!                                                     │
+//!                                          input ring ▲▼ output ring
+//!                                                     │
+//!                                              engine pipeline
+//!                                                     │
+//!   SubscriptionLog ◀──responses (UDP)── PublicationLog ◀┘
 //! ```
+//!
+//! The session-translator is a single thread that owns the per-session
+//! auth + replay state. Combining the inbound (UDP → engine) and
+//! outbound (engine → UDP) translators into one thread keeps the
+//! response PublicationLog single-producer and avoids any locking on
+//! the per-session state table.
 
+use std::collections::HashMap;
+use std::collections::hash_map::Entry;
+use std::hash::{Hash, Hasher};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
+use x25519_dalek::{PublicKey as X25519Public, StaticSecret as X25519Secret};
 
+use melin_protocol::auth::{AuthorizedKeys, Permission};
 use melin_protocol::codec;
+use melin_protocol::message::{Request, ResponseKind};
+use melin_protocol::session::{
+    EnvelopeError, encode_envelope, verify_and_decode_envelope, verify_client_handshake,
+};
 use melin_rumcast::counters::Counters;
 use melin_rumcast::pub_log::{PublicationConfig, PublicationLog};
 use melin_rumcast::receiver::{ReceiverConfig, ReceiverLoop};
@@ -50,6 +71,73 @@ use melin_transport_core::pipeline::{OutputPayload, Pipeline, build_pipeline_wit
 
 use crate::server::{ServerConfig, init_engine};
 use crate::{InputSlot, JournalEvent, OutputSlot};
+
+// ---------------------------------------------------------------------------
+// Per-session auth state
+// ---------------------------------------------------------------------------
+
+/// State per rumcast session, keyed by the wire `session_id`.
+///
+/// Pre-handshake there's no entry — the first inbound `Heartbeat`
+/// from a fresh `session_id` creates a `Challenged` entry. Receipt
+/// of a valid `ChallengeResponse` advances it to `Authenticated`.
+/// Any other inbound state transition (wrong message in wrong stage,
+/// unknown key, bad signature) drops the entry and silently rejects
+/// further traffic from that session_id until the client retries.
+///
+/// **Client restart**: a client that restarts MUST pick a fresh
+/// `session_id`. Reusing the previous one finds either a stale
+/// `Challenged` entry (which expects a `ChallengeResponse`, not a
+/// new `Heartbeat`) or a stale `Authenticated` entry (which expects
+/// envelope-wrapped traffic, not an unwrapped `Heartbeat`). Either
+/// way the new client's first message is dropped and the client
+/// hangs until [`HANDSHAKE_TIMEOUT`] expires (Challenged) or
+/// indefinitely (Authenticated). Clients should generate a random
+/// 32-bit `session_id` per fresh connect — same convention Aeron
+/// uses for publication identity.
+enum AuthStage {
+    /// Server has sent a Challenge frame and is awaiting the client's
+    /// ChallengeResponse. The nonce + ephemeral keypair are kept here
+    /// so the verify side can rebuild the signing payload and
+    /// complete the X25519 ECDH.
+    Challenged {
+        nonce: [u8; 32],
+        server_x25519_secret: X25519Secret,
+        server_x25519_public: [u8; 32],
+        accepted_at: Instant,
+    },
+    /// Handshake complete. All subsequent inbound payloads must be
+    /// envelope-wrapped under `token`. Outbound responses are wrapped
+    /// using the same token with a separately-tracked `outbound_seq`.
+    Authenticated {
+        token: [u8; 32],
+        key_hash: u64,
+        permission: Permission,
+        last_inbound_seq: u64,
+        outbound_seq: u64,
+    },
+}
+
+/// Drop a Challenged entry if the client takes longer than this to
+/// reply with a ChallengeResponse. Bounds the memory an unauthenticated
+/// peer can pin by spamming Heartbeats from new session_ids.
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Minimum gap between handshake-timeout sweeps. The sweep itself
+/// is `O(n)` over the session table, so on a busy-spinning idle loop
+/// we'd otherwise burn cycles iterating it millions of times per
+/// second for no useful work. 1s is well below `HANDSHAKE_TIMEOUT`,
+/// so a stale Challenged entry lives at most `HANDSHAKE_TIMEOUT +
+/// SWEEP_INTERVAL` ≈ 6s before getting reaped.
+const SWEEP_INTERVAL: Duration = Duration::from_secs(1);
+
+/// Reusable buffers for the session translator. Sized for the
+/// largest auth control frame (Challenge: ~70B encoded) and the
+/// largest data-plane request (~100B order + 24B envelope). 1 KiB
+/// gives generous headroom on both, fits in a single cache page,
+/// and gets allocated once at thread startup.
+const RESPONSE_ENCODE_BUF_SIZE: usize = 1024;
+const ENVELOPE_BUF_SIZE: usize = 2048;
 
 // ---------------------------------------------------------------------------
 // Configuration
@@ -106,6 +194,19 @@ pub fn run_rumcast(
         bind = %rumcast_config.bind,
         client = %rumcast_config.client_addr,
         "starting rumcast standalone server"
+    );
+
+    // ---- Authorized keys ----
+    //
+    // Same on-disk format and Permission model as the TCP path —
+    // there's exactly one source of identity in the system. The
+    // session translator looks clients up here when verifying
+    // ChallengeResponse frames.
+    let authorized_keys = Arc::new(AuthorizedKeys::load(&config.authorized_keys)?);
+    info!(
+        keys = authorized_keys.len(),
+        path = %config.authorized_keys.display(),
+        "loaded authorized_keys for rumcast auth"
     );
 
     // ---- Engine pipeline ----
@@ -272,27 +373,31 @@ pub fn run_rumcast(
         );
     }
 
-    // In-translator: rumcast SubscriptionLog → input disruptor.
+    // Session translator: combines what used to be in_translator
+    // and out_translator into a single thread. Runs the auth state
+    // machine, verifies inbound envelopes, wraps outbound responses,
+    // and is the sole producer of the response PublicationLog (which
+    // requires single-producer access).
     {
         let shutdown = Arc::clone(&shutdown);
-        let log = Arc::clone(&orders_sub_log);
-        handles.push(
-            thread::Builder::new()
-                .name("rumcast-in-xlate".into())
-                .spawn(move || in_translator(log, &mut input_producer, &shutdown, yield_idle))?,
-        );
-    }
-
-    // Out-translator: output ring → rumcast PublicationLog.
-    {
-        let shutdown = Arc::clone(&shutdown);
-        let log = Arc::clone(&resp_pub_log);
+        let sub_log = Arc::clone(&orders_sub_log);
+        let pub_log = Arc::clone(&resp_pub_log);
         let cursor = Arc::clone(&journal_cursor);
+        let authorized_keys = Arc::clone(&authorized_keys);
         handles.push(
             thread::Builder::new()
-                .name("rumcast-out-xlate".into())
+                .name("rumcast-session".into())
                 .spawn(move || {
-                    out_translator(log, response_consumer, cursor, &shutdown, yield_idle);
+                    session_translator(
+                        sub_log,
+                        pub_log,
+                        &mut input_producer,
+                        response_consumer,
+                        cursor,
+                        authorized_keys,
+                        &shutdown,
+                        yield_idle,
+                    );
                 })?,
         );
     }
@@ -333,170 +438,518 @@ fn tick_loop<F: FnMut() -> R, R>(shutdown: &AtomicBool, yield_idle: bool, mut ti
 }
 
 // ---------------------------------------------------------------------------
-// Translators
+// Session translator
 // ---------------------------------------------------------------------------
 
-/// Drains incoming order frames from the rumcast subscription log,
-/// decodes them via `melin-protocol::codec`, converts to `InputSlot`
-/// via the existing `crate::request::to_event` helper, and pushes to
-/// the input disruptor.
+/// Combined inbound/outbound translator for the rumcast path.
 ///
-/// Phase 1 simplifications (each documented as a Phase-N TODO):
-/// - Hard-coded `connection_id = 1`. Multi-client (Phase 3) will
-///   allocate one per client and route responses back accordingly.
-/// - `key_hash = 1` (non-zero — non-zero values participate in the
-///   engine's idempotency dedup). Phase 2 (auth) will derive this
-///   from the authenticated public key.
-/// - Skips `should_filter` checks (no Heartbeat / Subscribe in the
-///   bench-only request stream).
-/// - No permission check — Phase 2 with auth.
-fn in_translator(
-    log: Arc<SubscriptionLog>,
+/// Owns all per-session auth state in a single-threaded HashMap
+/// (no locking on the hot path), runs the Heartbeat → Challenge →
+/// ChallengeResponse → ServerReady handshake against the inbound
+/// SubscriptionLog, verifies post-auth envelopes (replay + MAC),
+/// publishes valid requests to the engine input ring, and wraps
+/// engine responses in fresh envelopes addressed back to the
+/// originating session.
+///
+/// Why combined: the response PublicationLog requires single-producer
+/// access. If inbound (handshake control replies) and outbound
+/// (engine responses) lived on separate threads they'd both want to
+/// `try_claim` on it. One thread sidesteps the race and keeps the
+/// per-session state lock-free.
+///
+/// **Single-pending outbound design**: at most one OutputSlot is
+/// held while we wait for the journal cursor to catch up
+/// (persist-before-ack). Inbound traffic continues to drain during
+/// that wait, which prevents the SubscriptionLog from filling up
+/// during a long fsync.
+#[allow(clippy::too_many_arguments)]
+fn session_translator(
+    sub_log: Arc<SubscriptionLog>,
+    pub_log: Arc<PublicationLog>,
     input_producer: &mut melin_disruptor::ring::Producer<InputSlot>,
+    mut output_consumer: melin_disruptor::ring::Consumer<OutputSlot>,
+    journal_cursor: Arc<melin_disruptor::padding::Sequence>,
+    authorized_keys: Arc<AuthorizedKeys>,
     shutdown: &AtomicBool,
     yield_idle: bool,
 ) {
+    let mut sessions: HashMap<u32, AuthStage> = HashMap::new();
+    let mut pending_outbound: Option<OutputSlot> = None;
+    let mut response_buf = vec![0u8; RESPONSE_ENCODE_BUF_SIZE];
+    let mut envelope_buf = vec![0u8; ENVELOPE_BUF_SIZE];
+    // Wall-clock checkpoint for handshake-timeout sweeps. Throttled
+    // because the sweep is O(n) over `sessions` and would otherwise
+    // run millions of times per second under busy-spin idle.
+    let mut last_sweep_at = Instant::now();
+
     while !shutdown.load(Ordering::Acquire) {
-        log.poll(64 * 1024, |view| {
+        let mut did_work = false;
+
+        // ---- Inbound: SubscriptionLog → handshake / engine input ----
+        let drained = sub_log.poll(64 * 1024, |view| {
             let FrameView::Data { header, payload } = view else {
                 return;
             };
             if header.common.flags & data_flags::PADDING != 0 {
                 return;
             }
-            let (request_seq, request) = match codec::decode_request(payload) {
-                Ok(r) => r,
-                Err(e) => {
-                    error!(error = ?e, "failed to decode rumcast order frame");
-                    return;
-                }
-            };
-            // Phase 2 (auth): replace with `crate::request::should_filter`
-            // + `check_permission` once authenticated peers are wired in.
-            let event: JournalEvent = crate::request::to_event(&request);
-            let timestamp_ns = wall_clock_nanos();
-            let slot = InputSlot {
-                connection_id: 1,
-                key_hash: 1,
-                request_seq,
-                sequence: 0, // assigned by journal stage
-                timestamp_ns,
-                event,
-                ..Default::default()
-            };
-            input_producer.publish(slot);
+            handle_inbound(
+                header.session_id,
+                payload,
+                &mut sessions,
+                &authorized_keys,
+                input_producer,
+                &pub_log,
+                &mut response_buf,
+                shutdown,
+            );
         });
-        if yield_idle {
-            thread::sleep(Duration::from_micros(10));
-        } else {
-            std::hint::spin_loop();
+        if drained > 0 {
+            did_work = true;
         }
-    }
-}
 
-/// Drains output slots from the matching pipeline, gates on journal
-/// durability, encodes them via `melin-protocol::codec`, and publishes
-/// to the rumcast response log.
-///
-/// Phase 1 simplification: ignores `slot.connection_id` and routes
-/// every response to the single rumcast publication. Multi-client
-/// (Phase 3) will look up the right publication per connection_id.
-fn out_translator(
-    log: Arc<PublicationLog>,
-    mut consumer: melin_disruptor::ring::Consumer<OutputSlot>,
-    journal_cursor: Arc<melin_disruptor::padding::Sequence>,
-    shutdown: &AtomicBool,
-    yield_idle: bool,
-) {
-    use melin_protocol::message::ResponseKind;
+        // ---- Drop stale Challenged sessions ----
+        //
+        // Throttled to once per `SWEEP_INTERVAL` so a busy-spinning
+        // idle loop doesn't iterate the table millions of times per
+        // second. Cheapest fast-path is the `Instant::now()` +
+        // `duration_since` compare when there's no work to do.
+        let now = Instant::now();
+        if now.duration_since(last_sweep_at) >= SWEEP_INTERVAL {
+            sessions.retain(|session_id, stage| match stage {
+                AuthStage::Challenged { accepted_at, .. } => {
+                    if now.duration_since(*accepted_at) >= HANDSHAKE_TIMEOUT {
+                        debug!(%session_id, "handshake timed out; dropping session");
+                        false
+                    } else {
+                        true
+                    }
+                }
+                AuthStage::Authenticated { .. } => true,
+            });
+            last_sweep_at = now;
+        }
 
-    let mut encode_buf = vec![0u8; 1024];
+        // ---- Outbound: engine output ring → envelope → PublicationLog ----
+        //
+        // Single-pending design: try to consume one slot, hold it
+        // until the journal cursor catches up. This is the
+        // persist-before-ack boundary — we never publish a response
+        // for an event that hasn't been durably journaled.
+        if pending_outbound.is_none()
+            && let Some((_, slot)) = output_consumer.try_consume()
+        {
+            pending_outbound = Some(slot);
+            did_work = true;
+        }
+        if let Some(slot) = pending_outbound.as_ref() {
+            // Seed events (connection_id=0) come from `seed_and_drain`.
+            // No client to route them to — drop. Same rationale as the
+            // pre-auth out_translator: publishing seed responses to the
+            // rumcast response log would advance publisher_position
+            // before any client is on the line, blowing out their
+            // subscriber position with a gap they can't NAK.
+            if slot.connection_id == 0 {
+                pending_outbound = None;
+                // Mark progress so the loop immediately tries to
+                // consume the next slot — otherwise yield-idle mode
+                // would sleep 10µs per dropped seed event, turning
+                // ~hundred-event seed_and_drain into ~ms latency.
+                did_work = true;
+            } else if journal_cursor.get().load(Ordering::Acquire) > slot.input_seq {
+                let slot = pending_outbound.take().expect("checked is_some above");
+                handle_outbound(
+                    &slot,
+                    &mut sessions,
+                    &pub_log,
+                    &mut response_buf,
+                    &mut envelope_buf,
+                    shutdown,
+                );
+                did_work = true;
+            }
+            // else: not durable yet, leave pending and re-check next loop.
+        }
 
-    while !shutdown.load(Ordering::Acquire) {
-        let Some((_seq, slot)) = consumer.try_consume() else {
+        // ---- Idle ----
+        if !did_work {
             if yield_idle {
                 thread::sleep(Duration::from_micros(10));
             } else {
                 std::hint::spin_loop();
             }
-            continue;
-        };
-
-        // Filter out seed events: they have connection_id = 0 (set
-        // by `seed_and_drain`) and aren't addressed to any client.
-        // Publishing them to the rumcast response log would advance
-        // publisher_position before the bench's subscription socket
-        // is bound, and the bench would then see an irrecoverable
-        // gap at positions 0..N (it can't NAK because it doesn't
-        // know the server resp_socket's ephemeral source addr).
-        if slot.connection_id == 0 {
-            continue;
         }
+    }
+}
 
-        // Wait for journal cursor to reach this slot's input_seq —
-        // persist-before-ack semantics, same as the TCP response path.
-        while journal_cursor.get().load(Ordering::Acquire) <= slot.input_seq
-            && !shutdown.load(Ordering::Acquire)
-        {
-            std::hint::spin_loop();
-        }
-
-        let kind = match slot.payload {
-            OutputPayload::Report(report) => ResponseKind::Report(report),
-            OutputPayload::QueryResponse(QueryResponse::Position {
-                account,
-                balances,
-                count,
-            }) => ResponseKind::PositionSnapshot {
-                account,
-                balances,
-                count,
-            },
-            OutputPayload::QueryResponse(QueryResponse::Stats {
-                active_connections,
-                events_processed,
-                journal_sequence,
-            }) => ResponseKind::StatsHeader {
-                active_connections,
-                events_processed,
-                journal_sequence,
-            },
-            OutputPayload::BatchEnd => ResponseKind::BatchEnd,
-            OutputPayload::EngineError => ResponseKind::EngineError,
-        };
-
-        let written = match codec::encode_response(&kind, &mut encode_buf) {
-            Ok(n) => n,
-            Err(e) => {
-                error!(error = ?e, "failed to encode response");
-                continue;
+/// Process one inbound payload for a given `session_id`. Drives the
+/// handshake state machine pre-auth and verifies envelopes post-auth.
+///
+/// All failure paths drop silently with a debug log — there's no
+/// authenticated channel to send an error back on for an
+/// unauthenticated client, and post-auth a malformed/replayed
+/// envelope is indistinguishable from network noise. Counters live
+/// on the rumcast layer (control_drops_receiver etc.) and pick up
+/// most cases that matter.
+#[allow(clippy::too_many_arguments)]
+fn handle_inbound(
+    session_id: u32,
+    payload: &[u8],
+    sessions: &mut HashMap<u32, AuthStage>,
+    authorized_keys: &AuthorizedKeys,
+    input_producer: &mut melin_disruptor::ring::Producer<InputSlot>,
+    pub_log: &PublicationLog,
+    response_buf: &mut [u8],
+    shutdown: &AtomicBool,
+) {
+    match sessions.entry(session_id) {
+        Entry::Vacant(slot) => {
+            // Pre-handshake. The protocol says the client kicks off
+            // with a Heartbeat (UDP has no `accept` event for the
+            // server to react to, so the client has to speak first).
+            let request = match codec::decode_request(payload) {
+                Ok((_, r)) => r,
+                Err(_) => return,
+            };
+            if !matches!(request, Request::Heartbeat) {
+                debug!(%session_id, "pre-auth: expected Heartbeat, dropping");
+                return;
             }
-        };
 
-        // `encode_response` writes the 4-byte length prefix needed by
-        // TCP's byte-stream framing. Rumcast already provides per-
-        // message framing, so we strip the prefix and publish only the
-        // codec payload (`tag + body`). The bench's rumcast receiver
-        // calls `decode_response` on this directly.
-        let payload = &encode_buf[4..written];
-        // Spin-claim — single response producer per connection means
-        // BackPressure is rare and short.
-        loop {
-            match log.try_claim(payload.len() as u32) {
-                Ok(mut claim) => {
-                    claim.payload_mut().copy_from_slice(payload);
-                    claim.publish(data_flags::UNFRAGMENTED);
-                    break;
+            let (nonce, server_secret, server_public) = match generate_challenge_material() {
+                Some(t) => t,
+                None => {
+                    error!("getrandom failed during Challenge generation; dropping session");
+                    return;
                 }
-                Err(_) => {
-                    if shutdown.load(Ordering::Acquire) {
+            };
+
+            if encode_and_publish_unwrapped(
+                &ResponseKind::Challenge {
+                    nonce,
+                    server_x25519_eph: server_public,
+                },
+                pub_log,
+                response_buf,
+                shutdown,
+            )
+            .is_none()
+            {
+                // shutdown — drop without inserting; clean exit on next loop.
+                return;
+            }
+
+            slot.insert(AuthStage::Challenged {
+                nonce,
+                server_x25519_secret: server_secret,
+                server_x25519_public: server_public,
+                accepted_at: Instant::now(),
+            });
+        }
+        Entry::Occupied(mut entry) => {
+            // Borrow once; branch by stage.
+            let stage = entry.get_mut();
+            match stage {
+                AuthStage::Challenged {
+                    nonce,
+                    server_x25519_secret,
+                    server_x25519_public,
+                    ..
+                } => {
+                    let request = match codec::decode_request(payload) {
+                        Ok((_, r)) => r,
+                        Err(_) => return,
+                    };
+                    let (signature, public_key, client_eph) = match request {
+                        Request::ChallengeResponse {
+                            signature,
+                            public_key,
+                            client_x25519_eph,
+                        } => (signature, public_key, client_x25519_eph),
+                        _ => {
+                            debug!(
+                                %session_id,
+                                "challenged: expected ChallengeResponse, dropping"
+                            );
+                            return;
+                        }
+                    };
+
+                    // Look up the client's identity. Unknown key →
+                    // AuthFailed + drop the session.
+                    let permission = match authorized_keys.lookup(&public_key) {
+                        Some(p) => p,
+                        None => {
+                            debug!(%session_id, "auth: unknown public key");
+                            let _ = encode_and_publish_unwrapped(
+                                &ResponseKind::AuthFailed,
+                                pub_log,
+                                response_buf,
+                                shutdown,
+                            );
+                            entry.remove();
+                            return;
+                        }
+                    };
+
+                    // Verify Ed25519 signature + derive the session
+                    // token via X25519 ECDH + BLAKE3 KDF. Single
+                    // helper shared with the bench-side
+                    // `ClientHandshake::finish` so the byte assembly
+                    // can't drift between peers.
+                    let token = match verify_client_handshake(
+                        nonce,
+                        server_x25519_public,
+                        server_x25519_secret,
+                        &public_key,
+                        &client_eph,
+                        &signature,
+                    ) {
+                        Ok(t) => t,
+                        Err(e) => {
+                            debug!(%session_id, ?e, "auth: handshake verify failed");
+                            let _ = encode_and_publish_unwrapped(
+                                &ResponseKind::AuthFailed,
+                                pub_log,
+                                response_buf,
+                                shutdown,
+                            );
+                            entry.remove();
+                            return;
+                        }
+                    };
+                    let key_hash = compute_key_hash(&public_key);
+
+                    if encode_and_publish_unwrapped(
+                        &ResponseKind::ServerReady,
+                        pub_log,
+                        response_buf,
+                        shutdown,
+                    )
+                    .is_none()
+                    {
+                        // shutdown — drop the entry rather than leave
+                        // a partially-completed handshake.
+                        entry.remove();
                         return;
                     }
-                    std::hint::spin_loop();
+
+                    debug!(%session_id, ?permission, "rumcast auth complete");
+
+                    *stage = AuthStage::Authenticated {
+                        token,
+                        key_hash,
+                        permission,
+                        last_inbound_seq: 0,
+                        outbound_seq: 0,
+                    };
+                }
+                AuthStage::Authenticated {
+                    token,
+                    key_hash,
+                    permission,
+                    last_inbound_seq,
+                    ..
+                } => {
+                    // Verify the envelope. Replay first (cheap), then
+                    // MAC. Any failure: drop silently.
+                    let (seq, inner) = match verify_and_decode_envelope(
+                        token,
+                        session_id,
+                        *last_inbound_seq,
+                        payload,
+                    ) {
+                        Ok(x) => x,
+                        Err(EnvelopeError::Replay { .. }) => {
+                            debug!(%session_id, "envelope replay");
+                            return;
+                        }
+                        Err(e) => {
+                            debug!(%session_id, ?e, "envelope verify failed");
+                            return;
+                        }
+                    };
+                    *last_inbound_seq = seq;
+
+                    let (request_seq, request) = match codec::decode_request(inner) {
+                        Ok(x) => x,
+                        Err(e) => {
+                            debug!(?e, "post-auth inner decode failed");
+                            return;
+                        }
+                    };
+
+                    // Heartbeats / Subscribes / control messages are
+                    // filtered before the engine sees them. Same
+                    // filter the TCP path uses.
+                    if crate::request::should_filter(&request) {
+                        return;
+                    }
+
+                    if let Err(reason) = crate::request::check_permission(&request, *permission) {
+                        debug!(%session_id, reason, "permission denied");
+                        return;
+                    }
+
+                    let event = crate::request::to_event(&request);
+                    let timestamp_ns = wall_clock_nanos();
+                    let slot = InputSlot {
+                        connection_id: session_id as u64,
+                        key_hash: *key_hash,
+                        request_seq,
+                        sequence: 0, // assigned by journal stage
+                        timestamp_ns,
+                        event,
+                        ..Default::default()
+                    };
+                    input_producer.publish(slot);
                 }
             }
         }
     }
+}
+
+/// Wrap an engine response in an envelope and publish it to the
+/// session's PublicationLog. No-op if the session disappeared
+/// between request and response (handshake timed out, client
+/// disconnected, etc.).
+fn handle_outbound(
+    slot: &OutputSlot,
+    sessions: &mut HashMap<u32, AuthStage>,
+    pub_log: &PublicationLog,
+    response_buf: &mut [u8],
+    envelope_buf: &mut [u8],
+    shutdown: &AtomicBool,
+) {
+    let session_id = slot.connection_id as u32;
+
+    let Some(AuthStage::Authenticated {
+        token,
+        outbound_seq,
+        ..
+    }) = sessions.get_mut(&session_id)
+    else {
+        // Session unknown or still in handshake — drop the response.
+        // Should be rare: the engine doesn't produce responses for
+        // pre-auth traffic, since pre-auth requests never reach the
+        // engine in the first place.
+        debug!(%session_id, "outbound: no authenticated session, dropping");
+        return;
+    };
+
+    let kind = match slot.payload {
+        OutputPayload::Report(report) => ResponseKind::Report(report),
+        OutputPayload::QueryResponse(QueryResponse::Position {
+            account,
+            balances,
+            count,
+        }) => ResponseKind::PositionSnapshot {
+            account,
+            balances,
+            count,
+        },
+        OutputPayload::QueryResponse(QueryResponse::Stats {
+            active_connections,
+            events_processed,
+            journal_sequence,
+        }) => ResponseKind::StatsHeader {
+            active_connections,
+            events_processed,
+            journal_sequence,
+        },
+        OutputPayload::BatchEnd => ResponseKind::BatchEnd,
+        OutputPayload::EngineError => ResponseKind::EngineError,
+    };
+
+    let written = match codec::encode_response(&kind, response_buf) {
+        Ok(n) => n,
+        Err(e) => {
+            error!(error = ?e, "failed to encode response");
+            return;
+        }
+    };
+    // Strip the 4-byte length prefix the codec writes for TCP
+    // byte-stream framing — rumcast frames per-message and the
+    // envelope wraps the codec body directly.
+    let inner = &response_buf[4..written];
+
+    *outbound_seq += 1;
+    let env_len = match encode_envelope(token, session_id, *outbound_seq, inner, envelope_buf) {
+        Ok(n) => n,
+        Err(e) => {
+            error!(error = ?e, "failed to encode envelope");
+            return;
+        }
+    };
+    let envelope = &envelope_buf[..env_len];
+
+    spin_publish(pub_log, envelope, shutdown);
+}
+
+/// Encode + publish a handshake-stage response (Challenge,
+/// ServerReady, AuthFailed) **without** envelope wrapping — the
+/// client hasn't yet completed the handshake when these arrive, so
+/// no shared token exists to MAC them with.
+///
+/// Returns `Some(())` on success, `None` if shutdown was signalled
+/// while spinning on `try_claim`.
+fn encode_and_publish_unwrapped(
+    response: &ResponseKind,
+    pub_log: &PublicationLog,
+    encode_buf: &mut [u8],
+    shutdown: &AtomicBool,
+) -> Option<()> {
+    let written = codec::encode_response(response, encode_buf)
+        .map_err(|e| error!(?e, "encode handshake response"))
+        .ok()?;
+    // Strip the 4-byte length prefix — rumcast frames per-message.
+    let payload = &encode_buf[4..written];
+    spin_publish(pub_log, payload, shutdown)
+}
+
+/// Spin on `try_claim` until the publisher accepts the fragment or
+/// shutdown is signalled. Single-producer log so backpressure is
+/// rare; when it does happen it's brief.
+fn spin_publish(pub_log: &PublicationLog, payload: &[u8], shutdown: &AtomicBool) -> Option<()> {
+    loop {
+        match pub_log.try_claim(payload.len() as u32) {
+            Ok(mut claim) => {
+                claim.payload_mut().copy_from_slice(payload);
+                claim.publish(data_flags::UNFRAGMENTED);
+                return Some(());
+            }
+            Err(_) => {
+                if shutdown.load(Ordering::Acquire) {
+                    return None;
+                }
+                std::hint::spin_loop();
+            }
+        }
+    }
+}
+
+/// Generate a fresh nonce + ephemeral X25519 keypair for a
+/// Challenge frame. Returns `None` if the OS RNG (`getrandom`) is
+/// unavailable — should never happen on Linux but we surface it
+/// rather than panic.
+fn generate_challenge_material() -> Option<([u8; 32], X25519Secret, [u8; 32])> {
+    let mut nonce = [0u8; 32];
+    getrandom::fill(&mut nonce).ok()?;
+    let mut secret_bytes = [0u8; 32];
+    getrandom::fill(&mut secret_bytes).ok()?;
+    let secret = X25519Secret::from(secret_bytes);
+    let public = X25519Public::from(&secret).to_bytes();
+    Some((nonce, secret, public))
+}
+
+/// FxHash of the client's Ed25519 public key — non-cryptographic but
+/// fast, used for the engine's per-key idempotency dedup table.
+/// Same scheme as the TCP path so a key authenticated over either
+/// transport hashes to the same bucket.
+fn compute_key_hash(public_key: &[u8; 32]) -> u64 {
+    let mut hasher = rustc_hash::FxHasher::default();
+    public_key.hash(&mut hasher);
+    hasher.finish()
 }
 
 // ---------------------------------------------------------------------------

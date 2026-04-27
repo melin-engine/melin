@@ -359,6 +359,16 @@ fn main() {
                     );
                     std::process::exit(1);
                 });
+                let key_path = args.key.as_deref().unwrap_or_else(|| {
+                    eprintln!(
+                        "error: --key is required for rumcast mode (the rumcast \
+                         transport authenticates every message — pre-handshake \
+                         the server requires a known Ed25519 identity from the \
+                         server's authorized_keys file)"
+                    );
+                    std::process::exit(1);
+                });
+                let key = load_signing_key(key_path);
                 rumcast::run_rumcast_roundtrip(rumcast::RumcastBenchConfig {
                     server_addr: addr,
                     bind,
@@ -369,6 +379,7 @@ fn main() {
                     instruments: args.instruments,
                     json_path: json_path.map(|p| p.to_path_buf()),
                     busy_spin: args.rumcast_busy_spin,
+                    signing_key: key,
                 });
             }
 

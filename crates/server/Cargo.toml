@@ -86,6 +86,10 @@ io-uring = "0.7"
 zerocopy = { version = "0.8", features = ["derive"] }
 melin-dpdk = { path = "../dpdk", optional = true }
 melin-rumcast = { path = "../rumcast", optional = true }
+# Used directly by the rumcast session translator for ephemeral
+# X25519 keypairs and ECDH. The handshake derives the per-session
+# MAC token from the resulting shared secret via melin_protocol::session.
+x25519-dalek = { workspace = true }
 
 [dev-dependencies]
 tempfile = "3"
