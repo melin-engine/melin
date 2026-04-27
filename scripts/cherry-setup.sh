@@ -301,6 +301,15 @@ kernel.numa_balancing = 0
 # that can't reboot right now. The soft-lockup watchdog's 2s hrtimer on
 # core 0 ripples into persist-path tail latency.
 kernel.watchdog = 0
+# Cap dirty-page accumulation in absolute bytes so the values don't scale
+# with RAM size. Defaults (10%/20% of RAM) on big-RAM boxes let many GiB
+# of dirty pages build up before the kernel forces writeback, which can
+# trigger 10-100ms `balance_dirty_pages` stalls when it does. The journal
+# path itself bypasses this (RWF_DSYNC syncs immediately) but co-tenants
+# — log rotation, snapshot writes, replica catch-up — share the same
+# global accounting and can stall the whole machine.
+vm.dirty_background_bytes = 33554432
+vm.dirty_bytes = 67108864
 EOF
 # Raise the system-wide max file descriptor limit. The default (1024) is
 # too low for client-sweep benchmarks: 512 clients × 2 fds (stream +
