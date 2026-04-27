@@ -137,21 +137,53 @@ Removes `decode_journal_to_input_slots` from the live + catch-up paths.
 ### Phase 4 — `refactor(transport-core): build_pipeline accepts a Role enum`
 
 Collapse `build_primary_pipeline` and `build_replica_pipeline` into one
-`build_pipeline(role: PipelineRole)`. Mostly cosmetic but enables phase 5.
+`build_pipeline(role: PipelineRole)`. Mostly cosmetic; deferred — the
+two builders share most of their body, but they have meaningfully
+different signatures and their callers are well-isolated, so the
+collapse can happen any time.
 
-### Phase 5 — `feat(server): replica uses unified pipeline + spawns health endpoint`
+### Phase 5a — `feat(replication): pin replica receiver to its own thread`
 
-`run_receiver` in `server.rs`:
+**Status: ✅ committed as `a8dcf2c` on `feat/unified-pipeline`.**
 
-- Builds `Pipeline { role: Replica }` once at startup, holds across
-  reconnects (Arc'd cursors stay live)
-- Reconnect just re-establishes the TCP connection; the local pipeline
-  keeps running
-- Health endpoint spawns now (because `HealthState` is buildable from the
-  unified pipeline state)
+The replica's streaming-receive loop used to run on the orchestrator
+(main) thread alongside connect/auth/handshake/snapshot logic and the
+reconnect outer loop — unpinned, contending with whatever else main
+was doing. The primary's reader (reader.rs) runs on a dedicated pinned
+thread (reader_cores, default core 4); this commit gives the replica
+the same treatment via `std::thread::scope` + `pin_replica_thread`,
+plumbing `config.reader_cores` through `run_receiver`.
 
-This is also where the prior `feat/replica-health-endpoint` work lands for
-free.
+### Phase 5b — `feat(replication): replica pipeline lives across reconnects`
+
+**Status: ✅ committed as `08feffd` (transport-core prep) and `862078a`
+(server-side refactor) on `feat/unified-pipeline`.**
+
+The replica pipeline (input ring + journal/matching/drain/shadow
+stages) is now built once and persists across `Disconnected`
+reconnects, mirroring how the primary's pipeline outlives individual
+client connections. Only `Snapshot` transfer (rare), `Promote`,
+`Shutdown`, and `Fatal` exits tear it down.
+
+Structural pieces:
+- `JournalStage` gained an `Option<Arc<AtomicU64>>` last-seq publisher
+  (set on replicas, ignored on primaries) updated post-fsync alongside
+  the existing `chain_hash` SeqLock
+- `ReplicaPipelineHandles` bundles input_producer, journal_cursor, the
+  two atomics, shutdown flag, and the four thread handles
+- `build_replica_pipeline_with_threads` / `teardown_replica_pipeline`
+  factor the pipeline-build + thread-spawn / join-and-recover code
+  that used to live inline
+- `run_receiver` hoists `pipeline: Option<...>` above the outer loop;
+  top of each iteration refreshes last_sequence / chain_hash from the
+  atomics (when Some); `NeedSnapshot` path tears down before wiping
+  the journal; pipeline build fires on `pipeline.is_none()` only
+
+This phase eliminates the per-reconnect cost of journal-recovery +
+thread-spawn + warm-up. Health endpoint integration (the original
+phase 5 motivation) becomes trivial from here — `HealthState` can
+read directly from the long-lived `ReplicaPipelineHandles` atomics
+without needing the receiver to surrender state.
 
 ### Phase 6 — `feat(replication): DPDK uses InputBatch; remove DataBatch`
 
@@ -204,14 +236,17 @@ Final cleanup: remove `MSG_DATA_BATCH`, `encode_data_batch`,
 ## Where we left off
 
 - On `feat/unified-pipeline` branched from `main`
-- Phases 1 and 2 committed (`f0b8e54`, `209840b`)
+- Phases 1, 2, 5a, 5b committed (`f0b8e54`, `209840b`, `a8dcf2c`,
+  `08feffd`, `862078a`)
 - 163 server tests passing, clippy clean
-- Next action: phase 3 — make the replication ring carry InputBatch bytes
-  (or InputSlots directly) so the sender doesn't decode-and-re-encode
+- Outstanding phases: 3 (ring carries InputSlots directly — eliminates
+  the sender-side journal-codec round-trip), 4 (collapse build_pipeline
+  /build_replica_pipeline), 6 (DPDK migrates to InputBatch + cleanup)
 
-End-to-end bench validation deferred until phase 3 lands (the round-trip
-on the sender from phase 2 is intentional and would muddy the perf
-signal).
+End-to-end bench validation can run now — phases 5a and 5b should both
+move tcp-repl numbers (5a removes contention with orchestrator on main;
+5b removes per-reconnect cost). Phase 2's sender-side journal round-trip
+will be eliminated by phase 3.
 
 ## Related branches (not part of this work but referenced)
 
