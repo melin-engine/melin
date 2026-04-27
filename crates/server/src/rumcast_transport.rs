@@ -4,42 +4,65 @@
 //! # What this is for
 //!
 //! Lets the LAN bench suite (`melin-bench`) compare TCP versus rumcast
-//! on the same engine pipeline. Phase 2 scope:
+//! on the same engine pipeline. Phase 3 (in-progress) scope:
 //!
 //! - Standalone primary only (no replica, no promotion).
 //! - **Pure-UDP authentication** via Ed25519 challenge-response +
 //!   X25519 ECDH, with per-message BLAKE3 keyed-MAC envelopes on the
 //!   data plane. Same Ed25519 identities as the TCP path
 //!   (`authorized_keys`).
-//! - Single client / single bench thread. Multi-client routing is
-//!   Phase 3 (the per-session state table is keyed by `session_id`
-//!   from day one, so the wiring will be local).
+//! - **Per-session inbound state via `MuxedReceiver` / `MuxedSender`.**
+//!   Each client picks its own random `session_id`; the muxed receiver
+//!   allocates a per-session `SubscriptionLog` lazily on first contact,
+//!   the muxed sender allocates a per-session `PublicationLog` at the
+//!   handshake-completion event. Bounded by `MAX_SESSIONS`.
 //! - Kernel UDP only (rumcast's `KernelUdp`). DPDK rumcast backend is
 //!   a separate effort tracked under the rumcast crate's deferred list.
+//!
+//! # Known limitation — second client silently fails
+//!
+//! All per-session response publications use the same static
+//! `RumcastConfig::client_addr` as their dst. With one client this
+//! works. With two:
+//!
+//! - Client 1 connects → session 1 publog.dst = client_addr (client 1's
+//!   resp port).
+//! - Client 2 connects → session 2 publog.dst = client_addr (same!).
+//! - Session 2's response frames arrive at client 1's resp socket;
+//!   `SubscriptionLog`'s session-id check drops them (`session_id` 2
+//!   != client 1's expected 1). Client 2 sees nothing — forever.
+//!
+//! Fixing this requires either (a) a rumcast-level shared-transport
+//! API so each peer can use one socket for both publication and
+//! subscription (the receiver's `effective_dst` would then route
+//! correctly), or (b) a protocol-level resp-port advertisement in
+//! the handshake. Both are larger pieces of work — tracked as a
+//! follow-up to Phase 3, NOT closed out by this commit.
 //!
 //! # Wiring (at a glance)
 //!
 //! ```text
-//! [bench client]                                   [melin-server (this)]
-//!   PublicationLog ──orders (UDP)──▶ SubscriptionLog ─┐
-//!                                                     │
-//!                                                     ▼
-//!                                              session-translator
-//!                                              (auth state machine,
-//!                                               envelope verify/wrap)
-//!                                                     │
-//!                                          input ring ▲▼ output ring
-//!                                                     │
-//!                                              engine pipeline
-//!                                                     │
-//!   SubscriptionLog ◀──responses (UDP)── PublicationLog ◀┘
+//! [bench client A]            [melin-server (this)]            [bench client B]
+//!   PublicationLog A ──orders (UDP)──▶ MuxedReceiver ◀── orders (UDP)── PublicationLog B
+//!                                              │
+//!                                              ▼
+//!                                       session-translator
+//!                                       (auth state machine,
+//!                                        envelope verify/wrap,
+//!                                        drives muxed ticks)
+//!                                              │
+//!                                  input ring ▲▼ output ring
+//!                                              │
+//!                                       engine pipeline
+//!                                              │
+//!   SubscriptionLog A ◀── responses (UDP)── MuxedSender ── responses (UDP)──▶ SubscriptionLog B
 //! ```
 //!
 //! The session-translator is a single thread that owns the per-session
-//! auth + replay state. Combining the inbound (UDP → engine) and
-//! outbound (engine → UDP) translators into one thread keeps the
-//! response PublicationLog single-producer and avoids any locking on
-//! the per-session state table.
+//! auth + replay state AND drives the muxed receiver/sender ticks
+//! inline. Combining everything into one thread keeps each muxed
+//! primitive's session table lock-free and preserves the single-
+//! producer contract on every per-session PublicationLog.
 
 use std::collections::HashMap;
 use std::collections::hash_map::Entry;
@@ -60,10 +83,9 @@ use melin_protocol::session::{
     EnvelopeError, encode_envelope, verify_and_decode_envelope, verify_client_handshake,
 };
 use melin_rumcast::counters::Counters;
-use melin_rumcast::pub_log::{PublicationConfig, PublicationLog};
-use melin_rumcast::receiver::{ReceiverConfig, ReceiverLoop};
-use melin_rumcast::sender::{SenderConfig, SenderLoop};
-use melin_rumcast::sub_log::{SubscriptionConfig, SubscriptionLog};
+use melin_rumcast::muxed_receiver::{MuxedReceiver, MuxedReceiverConfig};
+use melin_rumcast::muxed_sender::{MuxedSender, MuxedSenderConfig};
+use melin_rumcast::pub_log::PublicationLog;
 use melin_rumcast::transport::KernelUdp;
 use melin_rumcast::wire::{FrameView, data_flags};
 use melin_trading::types::QueryResponse;
@@ -99,22 +121,28 @@ enum AuthStage {
     /// Server has sent a Challenge frame and is awaiting the client's
     /// ChallengeResponse. The nonce + ephemeral keypair are kept here
     /// so the verify side can rebuild the signing payload and
-    /// complete the X25519 ECDH.
+    /// complete the X25519 ECDH. The per-session `pub_log` was
+    /// allocated by `MuxedSender::create_session` at first-contact
+    /// time and is used to send Challenge / ServerReady / AuthFailed
+    /// (all unwrapped, since the client doesn't have the token yet).
     Challenged {
         nonce: [u8; 32],
         server_x25519_secret: X25519Secret,
         server_x25519_public: [u8; 32],
         accepted_at: Instant,
+        pub_log: Arc<PublicationLog>,
     },
     /// Handshake complete. All subsequent inbound payloads must be
     /// envelope-wrapped under `token`. Outbound responses are wrapped
     /// using the same token with a separately-tracked `outbound_seq`.
+    /// The same `pub_log` Arc is carried over from `Challenged`.
     Authenticated {
         token: [u8; 32],
         key_hash: u64,
         permission: Permission,
         last_inbound_seq: u64,
         outbound_seq: u64,
+        pub_log: Arc<PublicationLog>,
     },
 }
 
@@ -151,9 +179,11 @@ pub struct RumcastConfig {
     /// Reuses the existing `--bind` ServerConfig flag so users don't
     /// have to learn a new knob.
     pub bind: SocketAddr,
-    /// Client address responses are unicast to. From `--rumcast-client-addr`.
-    /// Required because Phase 1 doesn't yet learn the client address
-    /// from incoming frames.
+    /// Where to send response Data frames. Used as the dst for
+    /// EVERY per-session response publication — see the "Known
+    /// limitation" section in the module doc. With more than one
+    /// client, all responses go here; the second client and beyond
+    /// silently get nothing.
     pub client_addr: SocketAddr,
 }
 
@@ -161,15 +191,19 @@ pub struct RumcastConfig {
 // Wire-format constants
 // ---------------------------------------------------------------------------
 
-/// Logical session and stream IDs for the order-entry channels. Phase 1
-/// uses a single fixed pair; Phase 3 (multi-client) will allocate them
-/// per client.
-const RUMCAST_SESSION_ID: u32 = 0xCAFEBABE;
+/// Stream IDs for the order-entry channels. session_id is now per-
+/// client (random 32-bit, picked by the client at connect time —
+/// see Aeron's publication-identity convention).
 const RUMCAST_ORDERS_STREAM: u32 = 1; // client → server
 const RUMCAST_RESP_STREAM: u32 = 2; // server → client
 
-/// 16 MiB term length. Same as the rumcast bench example. Plenty of
-/// headroom; keeps rotation rare during bursts.
+/// Per-session term length. Each session allocates `3 * term_length`
+/// for its receive sublog plus the same for its send publog. This
+/// stays at 16 MiB for #29 because the bench/smoke clients are
+/// hardcoded to that value — reducing it would require a coordinated
+/// wire-format-compatible change on both sides. Phase 3 task #31
+/// drops it (likely to 1 MiB or 256 KiB) once bench/smoke get
+/// updated together.
 const TERM_LENGTH: u32 = 16 * 1024 * 1024;
 /// Conservative MTU for kernel UDP — leaves ~92 bytes of headroom
 /// below the typical 1500-byte Ethernet payload to absorb any IP+UDP
@@ -177,8 +211,19 @@ const TERM_LENGTH: u32 = 16 * 1024 * 1024;
 const MTU: u32 = 1408;
 /// Both sides start at term_id = 1 by convention.
 const INITIAL_TERM_ID: u32 = 1;
-/// Single fixed receiver_id for Phase 1 (one bench client).
+/// Per-server receiver_id stamped into every Status Message. With
+/// the muxed receiver each session has its own `subscriber_position`
+/// but the receiver_id itself is a server-wide constant — every
+/// response publog the server sends to is from this same logical
+/// "subscriber" identity.
 const SERVER_RECEIVER_ID: u64 = 1;
+/// Cap on concurrent clients. With `TERM_LENGTH = 16 MiB` and 3
+/// partitions per sublog + 3 per publog, the worst case is
+/// `MAX_SESSIONS × 6 × 16 MiB`. At the current 16 — chosen
+/// deliberately small until #31 reduces `TERM_LENGTH` — that's
+/// 1.5 GiB. Phase 3 task #31 raises this to ~1024 once term_length
+/// drops.
+const MAX_SESSIONS: u32 = 16;
 
 // ---------------------------------------------------------------------------
 // Entry point
@@ -240,59 +285,50 @@ pub fn run_rumcast(
         .pop()
         .expect("response consumer (output_consumers must have at least one)");
 
-    // ---- Rumcast endpoints ----
-
-    // server-side INBOUND: SubscriptionLog (subscriber to client's PublicationLog).
-    let orders_sub_log = Arc::new(
-        SubscriptionLog::new(SubscriptionConfig {
-            session_id: RUMCAST_SESSION_ID,
-            stream_id: RUMCAST_ORDERS_STREAM,
-            initial_term_id: INITIAL_TERM_ID,
-            term_length: TERM_LENGTH,
-        })
-        .map_err(|e| format!("rumcast SubscriptionLog config: {e:?}"))?,
-    );
+    // ---- Rumcast endpoints (multi-session muxed) ----
+    //
+    // Each client is identified by a random 32-bit `session_id`
+    // it picks at connect time. The server owns one socket per
+    // direction and a per-session SubscriptionLog / PublicationLog
+    // map; sessions are allocated lazily on first contact (inbound)
+    // or when authentication completes (outbound).
     let orders_socket = KernelUdp::bind(rumcast_config.bind)?;
-    // Receiver dst = client's address (where SMs and NAKs flow back).
-    let orders_recv_config = {
-        let mut c = ReceiverConfig::defaults(rumcast_config.client_addr, SERVER_RECEIVER_ID);
-        c.sm_interval = Duration::from_millis(2);
-        c.nak_backoff_min = Duration::from_micros(50);
-        c.nak_backoff_jitter = Duration::from_micros(50);
-        c.max_recv_per_tick = 1024;
-        c
+    let muxed_receiver_config = MuxedReceiverConfig {
+        stream_id: RUMCAST_ORDERS_STREAM,
+        receiver_id: SERVER_RECEIVER_ID,
+        initial_term_id: INITIAL_TERM_ID,
+        term_length: TERM_LENGTH,
+        sm_interval: Duration::from_millis(2),
+        nak_backoff_min: Duration::from_micros(50),
+        nak_backoff_jitter: Duration::from_micros(50),
+        max_recv_per_tick: 1024,
+        max_sessions: MAX_SESSIONS,
     };
-    let orders_receiver = ReceiverLoop::new(
-        Arc::clone(&orders_sub_log),
-        orders_socket,
-        orders_recv_config,
-    );
+    let muxed_receiver = MuxedReceiver::new(orders_socket, muxed_receiver_config);
 
-    // server-side OUTBOUND: PublicationLog → client's SubscriptionLog.
-    let resp_pub_log = Arc::new(
-        PublicationLog::new(PublicationConfig {
-            session_id: RUMCAST_SESSION_ID,
-            stream_id: RUMCAST_RESP_STREAM,
-            initial_term_id: INITIAL_TERM_ID,
-            term_length: TERM_LENGTH,
-            mtu: MTU,
-        })
-        .map_err(|e| format!("rumcast PublicationLog config: {e:?}"))?,
-    );
-    // Phase 1: no SM-driven flow control yet (single client we trust).
-    // Set the limit wide-open; the bench publishes orders at a rate
-    // the server processes at, so backpressure here would only stem
-    // from a slow subscriber — out of scope for Phase 1.
-    resp_pub_log.set_publisher_limit(u64::MAX);
     let resp_socket = KernelUdp::bind("127.0.0.1:0".parse::<SocketAddr>().unwrap())?;
-    let resp_send_config = {
-        let mut c = SenderConfig::defaults(rumcast_config.client_addr);
-        c.setup_interval = Duration::from_millis(100);
-        c.heartbeat_interval = Duration::from_millis(50);
-        c.max_drain_per_tick = 1024 * 1024;
-        c
+    let muxed_sender_config = MuxedSenderConfig {
+        stream_id: RUMCAST_RESP_STREAM,
+        initial_term_id: INITIAL_TERM_ID,
+        term_length: TERM_LENGTH,
+        mtu: MTU,
+        setup_interval: Duration::from_millis(100),
+        heartbeat_interval: Duration::from_millis(50),
+        max_drain_per_tick: 1024 * 1024,
+        max_control_per_tick: 32,
+        // Phase 3: leave flow control as `Min` (the rumcast default).
+        // We don't expect to be flow-control-bound on a healthy LAN
+        // — backpressure here would stem from a slow subscriber, and
+        // we'd rather the client see backpressure than the server
+        // accumulate unbounded buffers.
+        flow_control: melin_rumcast::flow_control::FlowControl::Min,
+        max_sessions: MAX_SESSIONS,
     };
-    let resp_sender = SenderLoop::new(Arc::clone(&resp_pub_log), resp_socket, resp_send_config);
+    let muxed_sender = MuxedSender::new(resp_socket, muxed_sender_config);
+    // Outbound dst seed for every per-session response publication.
+    // See `RumcastConfig::client_addr` for why this isn't yet
+    // discovered per-session.
+    let response_dst = rumcast_config.client_addr;
 
     // Shared counters (helpful for bench observability; cheap when nobody reads).
     let counters = Arc::new(Counters::new());
@@ -341,56 +377,34 @@ pub fn run_rumcast(
     }
 
     // Idle strategy: default (no flag) = busy-spin (lowest latency on
-    // isolated cores). `--yield-idle` switches all rumcast tick loops
-    // and translators to sleep-tick (saves CPU on shared machines).
-    // Matches the existing pipeline convention used by JournalStage /
+    // isolated cores). `--yield-idle` switches the session translator
+    // (which now drives the muxed receiver / sender ticks inline) to
+    // sleep-tick. Matches the convention used by JournalStage /
     // MatchingStage (which take the same flag inverted as `busy_spin`).
     let yield_idle = config.yield_idle;
 
-    // Rumcast receiver (orders) tick loop.
+    // Session translator: drives the muxed receiver + sender ticks
+    // inline AND runs the auth state machine + envelope wrap/verify.
+    // One thread for everything keeps the per-session state lock-free
+    // and preserves the single-producer contract on every per-session
+    // PublicationLog (the sender's tick is the sole reader of each
+    // log's publisher_position).
     {
         let shutdown = Arc::clone(&shutdown);
-        let counters = Arc::clone(&counters);
-        let mut receiver = orders_receiver;
-        receiver.set_counters(Some(Arc::clone(&counters)));
-        handles.push(
-            thread::Builder::new()
-                .name("rumcast-orders-recv".into())
-                .spawn(move || tick_loop(&shutdown, yield_idle, || receiver.tick()))?,
-        );
-    }
-
-    // Rumcast sender (responses) tick loop.
-    {
-        let shutdown = Arc::clone(&shutdown);
-        let counters = Arc::clone(&counters);
-        let mut sender = resp_sender;
-        sender.set_counters(Some(Arc::clone(&counters)));
-        handles.push(
-            thread::Builder::new()
-                .name("rumcast-resp-send".into())
-                .spawn(move || tick_loop(&shutdown, yield_idle, || sender.tick()))?,
-        );
-    }
-
-    // Session translator: combines what used to be in_translator
-    // and out_translator into a single thread. Runs the auth state
-    // machine, verifies inbound envelopes, wraps outbound responses,
-    // and is the sole producer of the response PublicationLog (which
-    // requires single-producer access).
-    {
-        let shutdown = Arc::clone(&shutdown);
-        let sub_log = Arc::clone(&orders_sub_log);
-        let pub_log = Arc::clone(&resp_pub_log);
         let cursor = Arc::clone(&journal_cursor);
         let authorized_keys = Arc::clone(&authorized_keys);
+        let mut muxed_receiver = muxed_receiver;
+        let mut muxed_sender = muxed_sender;
+        muxed_receiver.set_counters(Some(Arc::clone(&counters)));
+        muxed_sender.set_counters(Some(Arc::clone(&counters)));
         handles.push(
             thread::Builder::new()
                 .name("rumcast-session".into())
                 .spawn(move || {
                     session_translator(
-                        sub_log,
-                        pub_log,
+                        muxed_receiver,
+                        muxed_sender,
+                        response_dst,
                         &mut input_producer,
                         response_consumer,
                         cursor,
@@ -419,53 +433,41 @@ pub fn run_rumcast(
     Ok(())
 }
 
-/// Generic tick loop body shared by the rumcast sender / receiver
-/// threads. With `yield_idle = false` (default), busy-spins between
-/// ticks — `spin_loop` hint, no syscall, lowest latency on an isolated
-/// core. With `yield_idle = true`, sleeps for 10µs between ticks —
-/// gives ~100k ticks/sec while remaining friendly to the OS scheduler
-/// on shared machines.
-#[inline]
-fn tick_loop<F: FnMut() -> R, R>(shutdown: &AtomicBool, yield_idle: bool, mut tick: F) {
-    while !shutdown.load(Ordering::Acquire) {
-        let _ = tick();
-        if yield_idle {
-            thread::sleep(Duration::from_micros(10));
-        } else {
-            std::hint::spin_loop();
-        }
-    }
-}
-
 // ---------------------------------------------------------------------------
 // Session translator
 // ---------------------------------------------------------------------------
 
-/// Combined inbound/outbound translator for the rumcast path.
+/// Combined translator + rumcast tick driver for the multi-session
+/// path.
 ///
-/// Owns all per-session auth state in a single-threaded HashMap
-/// (no locking on the hot path), runs the Heartbeat → Challenge →
-/// ChallengeResponse → ServerReady handshake against the inbound
-/// SubscriptionLog, verifies post-auth envelopes (replay + MAC),
-/// publishes valid requests to the engine input ring, and wraps
-/// engine responses in fresh envelopes addressed back to the
-/// originating session.
+/// One thread:
+/// 1. Drives `MuxedReceiver::tick` (drain UDP into per-session
+///    sublogs, run NAK/SM bookkeeping per session).
+/// 2. Polls every per-session SubscriptionLog and feeds frames into
+///    the auth state machine.
+/// 3. Drives `MuxedSender::tick` (drain each per-session
+///    PublicationLog → UDP, route incoming NAK/SM by session_id,
+///    fire periodic Setup/Heartbeat per session).
+/// 4. Wraps engine responses in envelopes addressed to the right
+///    per-session PublicationLog.
 ///
-/// Why combined: the response PublicationLog requires single-producer
-/// access. If inbound (handshake control replies) and outbound
-/// (engine responses) lived on separate threads they'd both want to
-/// `try_claim` on it. One thread sidesteps the race and keeps the
-/// per-session state lock-free.
+/// Why combined: each `MuxedSender` per-session PublicationLog
+/// requires single-producer access. If inbound (handshake control
+/// replies) and outbound (engine responses) lived on separate
+/// threads, two threads could `try_claim` the same publog. One
+/// thread sidesteps the race and keeps every per-session
+/// HashMap entry lock-free.
 ///
 /// **Single-pending outbound design**: at most one OutputSlot is
 /// held while we wait for the journal cursor to catch up
 /// (persist-before-ack). Inbound traffic continues to drain during
-/// that wait, which prevents the SubscriptionLog from filling up
-/// during a long fsync.
+/// that wait, which prevents per-session SubscriptionLogs from
+/// filling during a long fsync.
 #[allow(clippy::too_many_arguments)]
 fn session_translator(
-    sub_log: Arc<SubscriptionLog>,
-    pub_log: Arc<PublicationLog>,
+    mut muxed_receiver: MuxedReceiver<KernelUdp>,
+    mut muxed_sender: MuxedSender<KernelUdp>,
+    response_dst: SocketAddr,
     input_producer: &mut melin_disruptor::ring::Producer<InputSlot>,
     mut output_consumer: melin_disruptor::ring::Consumer<OutputSlot>,
     journal_cursor: Arc<melin_disruptor::padding::Sequence>,
@@ -485,8 +487,29 @@ fn session_translator(
     while !shutdown.load(Ordering::Acquire) {
         let mut did_work = false;
 
-        // ---- Inbound: SubscriptionLog → handshake / engine input ----
-        let drained = sub_log.poll(64 * 1024, |view| {
+        // ---- Drive the rumcast wire-layer ticks ----
+        //
+        // These run inline (no separate threads). `tick()` drains
+        // UDP into per-session sublogs / out of per-session publogs
+        // and processes NAK/SM control frames. They're cheap when
+        // idle and proportional to per-session work otherwise.
+        let recv_stats = muxed_receiver.tick();
+        let send_stats = muxed_sender.tick();
+        if recv_stats.fragments_accepted > 0
+            || recv_stats.bytes_received > 0
+            || send_stats.fragments_sent > 0
+        {
+            did_work = true;
+        }
+
+        // ---- Inbound: per-session sublogs → handshake / engine input ----
+        //
+        // `to_evict` collects session_ids that the auth machine
+        // wants to drop (auth failure, unrecoverable error). We
+        // can't evict from `muxed_receiver` while inside its `poll`
+        // (would need &mut while holding &), so apply post-poll.
+        let mut to_evict: Vec<u32> = Vec::new();
+        let drained = muxed_receiver.poll(64 * 1024, |session_id, _src_addr, view| {
             let FrameView::Data { header, payload } = view else {
                 return;
             };
@@ -494,32 +517,42 @@ fn session_translator(
                 return;
             }
             handle_inbound(
-                header.session_id,
+                session_id,
+                response_dst,
                 payload,
                 &mut sessions,
                 &authorized_keys,
                 input_producer,
-                &pub_log,
+                &mut muxed_sender,
                 &mut response_buf,
+                &mut to_evict,
                 shutdown,
             );
         });
         if drained > 0 {
             did_work = true;
         }
+        for sid in to_evict.drain(..) {
+            sessions.remove(&sid);
+            muxed_receiver.evict(sid);
+            muxed_sender.evict(sid);
+        }
 
         // ---- Drop stale Challenged sessions ----
         //
-        // Throttled to once per `SWEEP_INTERVAL` so a busy-spinning
-        // idle loop doesn't iterate the table millions of times per
-        // second. Cheapest fast-path is the `Instant::now()` +
-        // `duration_since` compare when there's no work to do.
+        // Throttled to once per `SWEEP_INTERVAL`. When a
+        // Challenged entry expires we evict from the auth table AND
+        // both muxers — otherwise a half-handshaked client would
+        // pin per-session sublog/publog memory until process
+        // restart.
         let now = Instant::now();
         if now.duration_since(last_sweep_at) >= SWEEP_INTERVAL {
+            let mut expired: Vec<u32> = Vec::new();
             sessions.retain(|session_id, stage| match stage {
                 AuthStage::Challenged { accepted_at, .. } => {
                     if now.duration_since(*accepted_at) >= HANDSHAKE_TIMEOUT {
                         debug!(%session_id, "handshake timed out; dropping session");
+                        expired.push(*session_id);
                         false
                     } else {
                         true
@@ -527,6 +560,10 @@ fn session_translator(
                 }
                 AuthStage::Authenticated { .. } => true,
             });
+            for sid in expired {
+                muxed_receiver.evict(sid);
+                muxed_sender.evict(sid);
+            }
             last_sweep_at = now;
         }
 
@@ -544,11 +581,7 @@ fn session_translator(
         }
         if let Some(slot) = pending_outbound.as_ref() {
             // Seed events (connection_id=0) come from `seed_and_drain`.
-            // No client to route them to — drop. Same rationale as the
-            // pre-auth out_translator: publishing seed responses to the
-            // rumcast response log would advance publisher_position
-            // before any client is on the line, blowing out their
-            // subscriber position with a gap they can't NAK.
+            // No client to route them to — drop.
             if slot.connection_id == 0 {
                 pending_outbound = None;
                 // Mark progress so the loop immediately tries to
@@ -561,7 +594,6 @@ fn session_translator(
                 handle_outbound(
                     &slot,
                     &mut sessions,
-                    &pub_log,
                     &mut response_buf,
                     &mut envelope_buf,
                     shutdown,
@@ -588,18 +620,24 @@ fn session_translator(
 /// All failure paths drop silently with a debug log — there's no
 /// authenticated channel to send an error back on for an
 /// unauthenticated client, and post-auth a malformed/replayed
-/// envelope is indistinguishable from network noise. Counters live
-/// on the rumcast layer (control_drops_receiver etc.) and pick up
-/// most cases that matter.
+/// envelope is indistinguishable from network noise.
+///
+/// On unrecoverable auth failure (unknown key, bad signature) the
+/// caller wants to evict from BOTH the auth table AND the muxed
+/// receiver / sender. Since we can't evict the receiver while
+/// iterating its `poll`, we append the session_id to `to_evict`
+/// and let the caller apply it after the poll returns.
 #[allow(clippy::too_many_arguments)]
 fn handle_inbound(
     session_id: u32,
+    response_dst: SocketAddr,
     payload: &[u8],
     sessions: &mut HashMap<u32, AuthStage>,
     authorized_keys: &AuthorizedKeys,
     input_producer: &mut melin_disruptor::ring::Producer<InputSlot>,
-    pub_log: &PublicationLog,
+    muxed_sender: &mut MuxedSender<KernelUdp>,
     response_buf: &mut [u8],
+    to_evict: &mut Vec<u32>,
     shutdown: &AtomicBool,
 ) {
     match sessions.entry(session_id) {
@@ -624,18 +662,44 @@ fn handle_inbound(
                 }
             };
 
+            // Allocate the per-session response PublicationLog now —
+            // we need it to send Challenge. If `MuxedSender` refuses
+            // (max_sessions hit), drop the kickoff and bail.
+            //
+            // `response_dst` is the static dst from `RumcastConfig`
+            // (single-client only on the outbound side — see the
+            // doc on `RumcastConfig::client_addr` for context).
+            let pub_log = match muxed_sender.create_session(session_id, response_dst) {
+                Ok(log) => log,
+                Err(e) => {
+                    debug!(
+                        %session_id,
+                        ?e,
+                        "pre-auth: MuxedSender refused session, dropping kickoff"
+                    );
+                    // The MuxedReceiver already allocated a sublog
+                    // for this session_id. Mark it for eviction so we
+                    // don't pin its memory.
+                    to_evict.push(session_id);
+                    return;
+                }
+            };
+
             if encode_and_publish_unwrapped(
                 &ResponseKind::Challenge {
                     nonce,
                     server_x25519_eph: server_public,
                 },
-                pub_log,
+                &pub_log,
                 response_buf,
                 shutdown,
             )
             .is_none()
             {
-                // shutdown — drop without inserting; clean exit on next loop.
+                // Shutdown — drop without inserting; clean exit on
+                // next loop. Caller will evict via the muxers when
+                // shutdown propagates.
+                muxed_sender.evict(session_id);
                 return;
             }
 
@@ -644,6 +708,7 @@ fn handle_inbound(
                 server_x25519_secret: server_secret,
                 server_x25519_public: server_public,
                 accepted_at: Instant::now(),
+                pub_log,
             });
         }
         Entry::Occupied(mut entry) => {
@@ -654,6 +719,7 @@ fn handle_inbound(
                     nonce,
                     server_x25519_secret,
                     server_x25519_public,
+                    pub_log,
                     ..
                 } => {
                     let request = match codec::decode_request(payload) {
@@ -687,7 +753,7 @@ fn handle_inbound(
                                 response_buf,
                                 shutdown,
                             );
-                            entry.remove();
+                            to_evict.push(session_id);
                             return;
                         }
                     };
@@ -714,7 +780,7 @@ fn handle_inbound(
                                 response_buf,
                                 shutdown,
                             );
-                            entry.remove();
+                            to_evict.push(session_id);
                             return;
                         }
                     };
@@ -728,20 +794,25 @@ fn handle_inbound(
                     )
                     .is_none()
                     {
-                        // shutdown — drop the entry rather than leave
+                        // Shutdown — drop the entry rather than leave
                         // a partially-completed handshake.
-                        entry.remove();
+                        to_evict.push(session_id);
                         return;
                     }
 
                     debug!(%session_id, ?permission, "rumcast auth complete");
 
+                    // Carry the existing pub_log Arc through to
+                    // Authenticated — it points at the same per-
+                    // session PublicationLog the MuxedSender owns.
+                    let pub_log_clone = Arc::clone(pub_log);
                     *stage = AuthStage::Authenticated {
                         token,
                         key_hash,
                         permission,
                         last_inbound_seq: 0,
                         outbound_seq: 0,
+                        pub_log: pub_log_clone,
                     };
                 }
                 AuthStage::Authenticated {
@@ -810,13 +881,12 @@ fn handle_inbound(
 }
 
 /// Wrap an engine response in an envelope and publish it to the
-/// session's PublicationLog. No-op if the session disappeared
-/// between request and response (handshake timed out, client
-/// disconnected, etc.).
+/// session's per-session PublicationLog. No-op if the session
+/// disappeared between request and response (handshake timed out,
+/// client disconnected, etc.).
 fn handle_outbound(
     slot: &OutputSlot,
     sessions: &mut HashMap<u32, AuthStage>,
-    pub_log: &PublicationLog,
     response_buf: &mut [u8],
     envelope_buf: &mut [u8],
     shutdown: &AtomicBool,
@@ -826,6 +896,7 @@ fn handle_outbound(
     let Some(AuthStage::Authenticated {
         token,
         outbound_seq,
+        pub_log,
         ..
     }) = sessions.get_mut(&session_id)
     else {
