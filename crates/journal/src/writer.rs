@@ -612,6 +612,16 @@ impl<E: AppEvent> JournalWriter<E> {
         Ok(())
     }
 
+    /// Drop the current batch buffer without writing it to disk.
+    ///
+    /// Used by the `no-persist` path of the journal stage so the buffer
+    /// stays bounded after replication has snapshotted the bytes.
+    /// Equivalent to `flush_batch_sync` minus the `pwritev2_dsync` and
+    /// the `write_pos` advance.
+    pub fn discard_batch_buf(&mut self) {
+        self.batch_buf.clear();
+    }
+
     /// Take the current batch buffer for async writing via io_uring.
     ///
     /// Returns `None` if the batch buffer is empty (nothing to write).

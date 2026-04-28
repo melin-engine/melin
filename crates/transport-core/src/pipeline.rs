@@ -467,44 +467,47 @@ impl<E: AppEvent> JournalStage<E> {
                 // primary's sequence onto `slot.sequence` before publish, and
                 // we use it verbatim (also syncing the writer's counter so
                 // its own checkpoint auto-emission stays aligned).
-                #[cfg(not(feature = "no-persist"))]
-                {
-                    for slot in &batch[..count] {
-                        if slot.event.is_query() {
-                            continue;
-                        }
-                        if let melin_journal::JournalEvent::Checkpoint {
-                            #[cfg(feature = "hash-chain")]
-                            chain_hash,
-                            ..
-                        } = &slot.event
-                        {
-                            #[cfg(feature = "hash-chain")]
-                            if slot.sequence != 0 {
-                                self.verify_primary_checkpoint(chain_hash, slot.sequence)?;
-                            }
-                            continue;
-                        }
-                        let seq = if slot.sequence != 0 {
-                            self.writer.set_next_sequence(slot.sequence + 1);
-                            slot.sequence
-                        } else {
-                            self.writer.allocate_sequence()
-                        };
-                        self.writer
-                            .encode_event(
-                                seq,
-                                slot.timestamp_ns,
-                                &slot.event,
-                                slot.key_hash,
-                                slot.request_seq,
-                            )
-                            .map_err(|e| {
-                                JournalError::Io(std::io::Error::other(format!(
-                                    "journal encode (run_sync, seq {seq}): {e}"
-                                )))
-                            })?;
+                // Encoding always runs — under no-persist the bytes still
+                // populate `batch_buf` so replication can publish them, and
+                // sequence allocation must happen so downstream stages see
+                // the same numbering they would in durable mode. The
+                // discard happens at the sync point below in place of the
+                // fsync, keeping `batch_buf` bounded.
+                for slot in &batch[..count] {
+                    if slot.event.is_query() {
+                        continue;
                     }
+                    if let melin_journal::JournalEvent::Checkpoint {
+                        #[cfg(feature = "hash-chain")]
+                        chain_hash,
+                        ..
+                    } = &slot.event
+                    {
+                        #[cfg(feature = "hash-chain")]
+                        if slot.sequence != 0 {
+                            self.verify_primary_checkpoint(chain_hash, slot.sequence)?;
+                        }
+                        continue;
+                    }
+                    let seq = if slot.sequence != 0 {
+                        self.writer.set_next_sequence(slot.sequence + 1);
+                        slot.sequence
+                    } else {
+                        self.writer.allocate_sequence()
+                    };
+                    self.writer
+                        .encode_event(
+                            seq,
+                            slot.timestamp_ns,
+                            &slot.event,
+                            slot.key_hash,
+                            slot.request_seq,
+                        )
+                        .map_err(|e| {
+                            JournalError::Io(std::io::Error::other(format!(
+                                "journal encode (run_sync, seq {seq}): {e}"
+                            )))
+                        })?;
                 }
                 pending += count;
                 if first_write_ts.is_none() {
@@ -525,29 +528,32 @@ impl<E: AppEvent> JournalStage<E> {
                     || first_write_ts.is_some_and(|ts| ts.elapsed() >= delay);
 
                 if should_sync {
+                    // Snapshot batch bytes for replication BEFORE the flush
+                    // or discard below clears the buffer. Copies into a
+                    // pre-allocated ring slot — no heap allocation.
+                    // Guard: skip entirely in standalone mode (both producers None).
+                    // One field read — no atomics, no function call on the hot path.
+                    if self.repl.producers[0].is_some() || self.repl.producers[1].is_some() {
+                        let bytes = self.writer.pending_batch_bytes();
+                        if !bytes.is_empty() {
+                            let end_seq = self.writer.next_sequence() - 1;
+                            Self::publish_to_replication_rings(
+                                &mut self.repl.producers,
+                                &self.repl.evict,
+                                &self.repl.active,
+                                bytes,
+                                end_seq,
+                            );
+                        }
+                    }
+
+                    // Persist mode: pwritev2+RWF_DSYNC; no-persist mode:
+                    // drop the buffer. `no-persist` means "skip the fsync
+                    // syscall," not "skip everything that follows" — the
+                    // replication path above must still run, otherwise the
+                    // response stage's replication-cursor gate deadlocks.
                     #[cfg(not(feature = "no-persist"))]
                     {
-                        // Snapshot batch bytes for replication BEFORE flush
-                        // (flush clears the buffer). Copies into a pre-allocated
-                        // ring slot — no heap allocation.
-                        // Only when persistence is enabled — with no-persist,
-                        // batch_buf is never cleared and would grow unbounded.
-                        // Guard: skip entirely in standalone mode (both producers None).
-                        // One field read — no atomics, no function call on the hot path.
-                        if self.repl.producers[0].is_some() || self.repl.producers[1].is_some() {
-                            let bytes = self.writer.pending_batch_bytes();
-                            if !bytes.is_empty() {
-                                let end_seq = self.writer.next_sequence() - 1;
-                                Self::publish_to_replication_rings(
-                                    &mut self.repl.producers,
-                                    &self.repl.evict,
-                                    &self.repl.active,
-                                    bytes,
-                                    end_seq,
-                                );
-                            }
-                        }
-
                         // Fatal: journal I/O failure means we can't
                         // guarantee durability. Surface the error so the
                         // pipeline shuts down rather than spinning forever
@@ -558,6 +564,8 @@ impl<E: AppEvent> JournalStage<E> {
                             )))
                         })?;
                     }
+                    #[cfg(feature = "no-persist")]
+                    self.writer.discard_batch_buf();
 
                     self.consumer.commit(pending);
                     self.publish_chain_hash();
