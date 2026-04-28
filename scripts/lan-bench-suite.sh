@@ -202,8 +202,8 @@ VALID_TCP="throughput single sweep-window sweep-clients sweep-instruments sweep-
 VALID_TCP_REPL="throughput single"
 VALID_TCP_DUAL_REPL="throughput single"
 VALID_DPDK="throughput single"
-VALID_DPDK_REPL="throughput"
-VALID_DPDK_DUAL_REPL="throughput"
+VALID_DPDK_REPL="throughput single"
+VALID_DPDK_DUAL_REPL="throughput single"
 LOCAL_WORKLOADS="engine-only pipeline-only"
 ALL_WORKLOADS="throughput single engine-only pipeline-only sweep-window sweep-clients sweep-instruments sweep-accounts"
 
