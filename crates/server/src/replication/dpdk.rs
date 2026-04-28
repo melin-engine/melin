@@ -206,34 +206,51 @@ impl DpdkReplicationDriver {
         let heartbeat_interval = self.heartbeat_interval;
 
         // Check eviction flags from the journal stage.
-        for (i, slot) in slots.iter_mut().enumerate() {
-            if slot.evict_flag.load(Ordering::Acquire) && !matches!(slot.state, SlotState::Idle) {
-                metrics.evictions_total.fetch_add(1, Ordering::Relaxed);
-                warn!(
-                    slot = i,
-                    "evicting slow replica (ring backpressure timeout, DPDK)"
-                );
-                if let SlotState::Streaming(h) | SlotState::Handshaking(h) = slot.state {
-                    transport.close(h);
-                }
-                slot.active_flag.store(false, Ordering::Release);
-                slot.evict_flag.store(false, Ordering::Release);
-                metrics.acked_sequence[i].store(0, Ordering::Relaxed);
-                metrics.catching_up[i].store(false, Ordering::Relaxed);
-                slot.acked_cursor = u64::MAX;
-                slot.recv_buf.clear();
-                // Drop any unread ring entries so a reconnecting replica
-                // on this slot doesn't replay pre-eviction data and stall
-                // the primary's replication cursor. See kernel-TCP path
-                // in tcp_sender.rs for the detailed rationale.
-                slot.consumer.skip_to_producer();
-                slot.state = SlotState::Idle;
-                replicas_connected.fetch_sub(1, Ordering::Release);
-                if replicas_connected.load(Ordering::Relaxed) == 0 {
-                    replication_cursor.store(u64::MAX, Ordering::Release);
-                    fastest_replica_cursor.store(u64::MAX, Ordering::Release);
-                    warn!("all replicas disconnected — trading halted");
-                }
+        for i in 0..2 {
+            let evicting = slots[i].evict_flag.load(Ordering::Acquire)
+                && !matches!(slots[i].state, SlotState::Idle);
+            if !evicting {
+                continue;
+            }
+            metrics.evictions_total.fetch_add(1, Ordering::Relaxed);
+            warn!(
+                slot = i,
+                "evicting slow replica (ring backpressure timeout, DPDK)"
+            );
+            let slot = &mut slots[i];
+            if let SlotState::Streaming(h) | SlotState::Handshaking(h) = slot.state {
+                transport.close(h);
+            }
+            slot.active_flag.store(false, Ordering::Release);
+            slot.evict_flag.store(false, Ordering::Release);
+            metrics.acked_sequence[i].store(0, Ordering::Relaxed);
+            metrics.catching_up[i].store(false, Ordering::Relaxed);
+            slot.acked_cursor = u64::MAX;
+            slot.recv_buf.clear();
+            // Drop any unread ring entries so a reconnecting replica
+            // on this slot doesn't replay pre-eviction data and stall
+            // the primary's replication cursor. See kernel-TCP path
+            // in tcp_sender.rs for the detailed rationale.
+            slot.consumer.skip_to_producer();
+            slot.state = SlotState::Idle;
+            replicas_connected.fetch_sub(1, Ordering::Release);
+
+            // Recompute the shared replication cursor from the *surviving*
+            // slot's progress so the response stage's gate can advance.
+            // Without this, `replication_cursor` stays frozen at its pre-
+            // eviction value (the min that included this slot's last
+            // ack), and the primary stops acking client requests even
+            // though the surviving replica is healthy. The kernel-TCP
+            // path does the equivalent in tcp_sender.rs.
+            let other_acked = slots[1 - i].acked_cursor;
+            update_dual_replication_cursor(
+                u64::MAX,
+                other_acked,
+                replication_cursor,
+                fastest_replica_cursor,
+            );
+            if replicas_connected.load(Ordering::Relaxed) == 0 {
+                warn!("all replicas disconnected — trading halted");
             }
         }
 
