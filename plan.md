@@ -169,13 +169,35 @@ Removed entirely: `MSG_DATA_BATCH`, `encode_data_batch`,
 `try_decode_data_batch`, `submit_batch_to_pipeline`,
 `PrimaryMessage::DataBatch`. Phase 6's cleanup landed here.
 
-### Phase 4 — `refactor(transport-core): build_pipeline accepts a Role enum`
+### Phase 4 — `refactor(transport-core): factor shared input-disruptor + chain-hash setup`
 
-Collapse `build_primary_pipeline` and `build_replica_pipeline` into one
-`build_pipeline(role: PipelineRole)`. Mostly cosmetic; deferred — the
-two builders share most of their body, but they have meaningfully
-different signatures and their callers are well-isolated, so the
-collapse can happen any time.
+**Status: ✅ committed on `feat/unified-pipeline`.**
+
+The literal "collapse into one `build_pipeline(role: PipelineRole)`"
+forces the unified return type into a soup of `Option`s (drain_consumer
+for replica only, output_consumers for primary only, last_seq for
+replica only, replication_consumers for primary only, …) — every caller
+then unwraps the role-specific fields. Trades duplication for
+awkwardness; not obviously a win, which is probably why the plan tagged
+it "cosmetic; deferred".
+
+What landed instead: a focused DRY refactor that extracts the
+genuinely-shared bits without changing the public API.
+
+- `build_input_disruptor<E>(enable_shadow) -> InputDisruptorParts<E>`:
+  one place owns the input ring topology (journal + matching gated on
+  producer in parallel + optional shadow chained after journal),
+  consumer-pop order, and progress-cursor extraction
+- `setup_chain_hash_publisher(&mut journal_stage, enable_shadow)`:
+  one place owns the BLAKE3 chain-hash SeqLock allocation + wiring
+- `build_pipeline_with_replication` and `build_replica_pipeline` keep
+  their existing public signatures and return types; their bodies just
+  destructure the helper outputs and add the role-specific bits
+
+Net diff: ~+25 lines. Each builder now reads as the role-specific delta
+(replication rings + replicas_connected halt + response/event-publisher
+output ring on the primary; drain consumer + last_seq publisher on the
+replica) on top of a shared skeleton.
 
 ### Phase 5a — `feat(replication): pin replica receiver to its own thread`
 
@@ -296,14 +318,11 @@ required. See phase 3 above for the exact changes.
   `91b6cbb perf(server): pin replica receive loop` — superseded by our
   phase 5a `thread::scope` approach; the conflict resolved cleanly to
   ours)
-- Phases 1, 2, 5a, 5b, 3 (incl. phase 6) all committed
-- 906 workspace tests pass (DPDK port of 5b adds no new tests but
-  exercises the same shared `ReplicaPipelineHandles` machinery as
-  TCP); clippy clean on default, `--features dpdk`, and
-  `--features "dpdk noop" --no-default-features`
-- Outstanding: phase 4 (cosmetic — collapse
-  `build_pipeline_with_replication` and `build_replica_pipeline` into one
-  `build_pipeline(role)`)
+- Phases 1, 2, 3 (incl. phase 6), 4 (DRY refactor), 5a, 5b (TCP + DPDK)
+  all committed
+- 906 workspace tests pass; clippy clean on default, `--features dpdk`,
+  and `--features "dpdk noop" --no-default-features`
+- No outstanding work items on the plan
 
 End-to-end bench validation is now meaningful for phase 3 — the live
 TCP path lost an entire decode + re-encode pass per ring chunk. Combined
