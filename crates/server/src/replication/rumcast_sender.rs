@@ -599,10 +599,10 @@ fn sweep_auth_states(
     // Drop Challenged sessions that never sent a valid response.
     let mut to_drop: Vec<u32> = Vec::new();
     for (session_id, state) in auth_states.iter() {
-        if let AuthState::Challenged { accepted_at, .. } = state {
-            if now.duration_since(*accepted_at) >= HANDSHAKE_TIMEOUT {
-                to_drop.push(*session_id);
-            }
+        if let AuthState::Challenged { accepted_at, .. } = state
+            && now.duration_since(*accepted_at) >= HANDSHAKE_TIMEOUT
+        {
+            to_drop.push(*session_id);
         }
     }
     for session_id in to_drop {
