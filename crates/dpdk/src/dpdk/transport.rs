@@ -143,6 +143,13 @@ impl Default for DpdkConfig {
 pub struct AcceptedConnection {
     pub handle: SocketHandle,
     pub peer: std::net::SocketAddr,
+    /// The local TCP port the connection was accepted on. With a single
+    /// listener this is always the same value (config.listen_port); with
+    /// multiple listeners (added via `DpdkTransport::add_listener`) the
+    /// caller uses this to dispatch the connection to the right handler
+    /// (e.g. trading port → client logic, replication port → replication
+    /// state machine).
+    pub listen_port: u16,
 }
 
 /// Shared DPDK resources created once and shared across all poll threads.
@@ -183,8 +190,14 @@ pub struct DpdkTransport {
     device: DpdkDevice,
     iface: Interface,
     sockets: SocketSet<'static>,
-    listen_handle: SocketHandle,
-    listen_port: u16,
+    /// (port, handle) for every TCP listening socket the transport
+    /// currently maintains. Initialised with one entry from
+    /// `config.listen_port`; callers can add more via `add_listener`.
+    /// `check_listener` iterates this list, accepts any socket that
+    /// transitioned to Established, and replaces it with a fresh
+    /// listener on the same port — so the slot for that port stays
+    /// receptive while the accepted connection moves into `accepted`.
+    listeners: Vec<(u16, SocketHandle)>,
     accepted: Vec<AcceptedConnection>,
     /// Per-connection TX buffers, indexed by `SocketHandle::index()`.
     /// Dense `Vec<Option<_>>` instead of a HashMap — HashMap hashing
@@ -388,8 +401,7 @@ impl DpdkTransport {
             device,
             iface,
             sockets,
-            listen_handle,
-            listen_port: config.listen_port,
+            listeners: vec![(config.listen_port, listen_handle)],
             accepted: Vec::new(),
             // Pre-allocate all MAX_CONNECTIONS slots so index lookup is
             // always in-bounds. Each empty slot is a single discriminant
@@ -547,16 +559,22 @@ impl DpdkTransport {
     }
 
     fn check_listener(&mut self) {
-        // Loop to accept all pending connections, not just one per poll.
-        // Multiple SYNs can complete in a single iface.poll() cycle.
-        loop {
-            let socket = self.sockets.get_mut::<tcp::Socket>(self.listen_handle);
+        // Iterate every (port, handle) pair: accept any whose listen
+        // socket has progressed to Established, replace it with a fresh
+        // listener on the same port. Each port is independent — the
+        // trading port and the replication port (when both are used by
+        // the same transport) keep their own listener slots.
+        let mut i = 0;
+        while i < self.listeners.len() {
+            let (port, handle) = self.listeners[i];
+            let socket = self.sockets.get_mut::<tcp::Socket>(handle);
             if socket.state() != State::Established {
-                return;
+                i += 1;
+                continue;
             }
 
-            let peer = if let Some(remote) = socket.remote_endpoint() {
-                match remote.addr {
+            let peer = match socket.remote_endpoint() {
+                Some(remote) => match remote.addr {
                     IpAddress::Ipv4(ip) => {
                         let octets = ip.octets();
                         std::net::SocketAddr::new(
@@ -566,40 +584,63 @@ impl DpdkTransport {
                             remote.port,
                         )
                     }
+                },
+                None => {
+                    i += 1;
+                    continue;
                 }
-            } else {
-                return;
             };
 
-            let accepted_handle = self.listen_handle;
-
             // Register zero-copy callbacks on the accepted socket before
-            // it processes any data segments. Retain bumps the mbuf
-            // refcount when a segment is stored; release frees it when
-            // the application consumes it via recv_zero_copy.
-            let accepted_socket = self.sockets.get_mut::<tcp::Socket>(accepted_handle);
+            // it processes any data segments.
+            let accepted_socket = self.sockets.get_mut::<tcp::Socket>(handle);
             accepted_socket.set_zero_copy_retain_fn(retain_mbuf);
             accepted_socket.set_zero_copy_release_fn(release_mbuf);
 
+            // Replace the listener slot in-place so the port stays
+            // receptive while the just-accepted handle is moved out
+            // into `accepted`.
             let new_listener = {
                 let rx_buf = tcp::SocketBuffer::new(vec![0u8; SOCKET_RX_BUF_SIZE]);
                 let tx_buf = tcp::SocketBuffer::new(vec![0u8; SOCKET_TX_BUF_SIZE]);
                 let mut socket = tcp::Socket::new(rx_buf, tx_buf);
                 tune_socket(&mut socket);
-                socket
-                    .listen(self.listen_port)
-                    .expect("re-listen after accept");
+                socket.listen(port).expect("re-listen after accept");
                 socket
             };
-            self.listen_handle = self.sockets.add(new_listener);
+            let new_handle = self.sockets.add(new_listener);
+            self.listeners[i] = (port, new_handle);
 
             self.accepted.push(AcceptedConnection {
-                handle: accepted_handle,
+                handle,
                 peer,
+                listen_port: port,
             });
 
-            tracing::debug!(peer = %peer, "DPDK: TCP connection accepted");
+            tracing::debug!(peer = %peer, listen_port = port, "DPDK: TCP connection accepted");
+            // Don't advance `i` — re-check this slot in case a fresh SYN
+            // already completed the handshake on the new listener within
+            // the same poll cycle.
         }
+    }
+
+    /// Add another TCP port to listen on, sharing the same DPDK NIC and
+    /// smoltcp interface. Returns immediately; the new listener is
+    /// active on the next `poll()`. Used when a single transport handles
+    /// multiple distinct services (e.g. trading on 9876 and replication
+    /// on 9877) without needing separate queues / threads.
+    pub fn add_listener(&mut self, port: u16) -> Result<(), Box<dyn std::error::Error>> {
+        let rx_buf = tcp::SocketBuffer::new(vec![0u8; SOCKET_RX_BUF_SIZE]);
+        let tx_buf = tcp::SocketBuffer::new(vec![0u8; SOCKET_TX_BUF_SIZE]);
+        let mut socket = tcp::Socket::new(rx_buf, tx_buf);
+        tune_socket(&mut socket);
+        socket
+            .listen(port)
+            .map_err(|e| format!("TCP listen on port {port} failed: {e}"))?;
+        let handle = self.sockets.add(socket);
+        self.listeners.push((port, handle));
+        tracing::info!(port, "DPDK transport: added listener");
+        Ok(())
     }
 
     fn flush_tx_queues(&mut self) {
@@ -680,6 +721,22 @@ impl DpdkTransport {
         queue.push(data);
         self.pending_tx_bytes += data.len();
         true
+    }
+
+    /// Currently queued TX bytes for the given socket. Used by replication
+    /// to back-pressure ring reads when the wire can't keep up — reading a
+    /// batch we can't actually queue would advance the ring cursor without
+    /// the data ever reaching the replica.
+    pub fn tx_queue_bytes(&self, handle: SocketHandle) -> usize {
+        self.tx_queues[handle.index()]
+            .as_ref()
+            .map_or(0, |q| q.queued_bytes())
+    }
+
+    /// Maximum bytes that `queue_send` will accept per connection before
+    /// returning `false`. Exposed so callers can size their batches.
+    pub const fn max_tx_queue_size() -> usize {
+        MAX_TX_QUEUE_SIZE
     }
 
     /// Check if a connection is still open.

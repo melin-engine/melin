@@ -1508,13 +1508,11 @@ pub fn run_dpdk(
     }
 
     // Create per-thread transports (each gets its own queue pair + smoltcp stack).
-    // In primary mode with replication, the last queue is reserved for the
-    // replication sender — only create client transports for queues 0..N-1.
-    let num_client_queues = if config.replication_bind.is_some() {
-        num_dpdk_threads.saturating_sub(1)
-    } else {
-        num_dpdk_threads
-    };
+    // The single-queue refactor (`feat/dpdk-single-queue`) collapsed
+    // replication onto the same queue/thread as client traffic — no
+    // separate queue is reserved any more, so `num_client_queues`
+    // simply tracks `num_dpdk_threads`.
+    let num_client_queues = num_dpdk_threads;
     let mut transports = Vec::with_capacity(num_client_queues);
     for q in 0..num_client_queues {
         let mut transport =
@@ -1743,31 +1741,23 @@ pub fn run_dpdk(
         } else {
             None
         };
-    let replication_handle = if let Some((repl_consumer_1, repl_consumer_2)) = replication_consumers
+    // Replication, if enabled: build a `DpdkReplicationDriver` for the
+    // single client poll thread to drive. The driver's accept dispatch
+    // hangs off the second listener we added on the client transport
+    // earlier (port == repl_bind.port()).
+    let (repl_driver, repl_listen_port) = if let Some((repl_consumer_1, repl_consumer_2)) =
+        replication_consumers
     {
         let repl_bind = config
             .replication_bind
             .ok_or("replication_bind must be set when replication is enabled")?;
         let repl_port = repl_bind.port();
 
-        // Create a DpdkTransport for the replication sender with its own
-        // queue pair. Client transports use queues 0..num_client_queues-1;
-        // the replication sender gets the next one (num_client_queues).
-        let repl_transport = melin_dpdk::DpdkTransport::from_shared_with_port(
-            &shared,
-            &dpdk_config,
-            num_client_queues as u16,
-            repl_port,
-        )
-        .map_err(|e| format!("create DPDK transport for replication: {e}"))?;
-
-        let s_repl = Arc::clone(&shutdown);
         let repl_cursor = Arc::clone(&replication_cursor);
         let fastest_repl_cursor = Arc::clone(&fastest_replica_cursor);
         let ready_flag = Arc::clone(&replica_ready);
         let batch_size = config.replication_batch_size;
         let heartbeat_secs = config.replication_heartbeat_secs;
-        let busy_spin = !config.yield_idle;
         let repl_metrics = replication_metrics
             .clone()
             .ok_or("replication_metrics must be Some when replication is enabled")?;
@@ -1803,48 +1793,62 @@ pub fn run_dpdk(
                 ]
             });
         let journal_path = config.journal.clone();
-        let repl_sender_handle = std::thread::Builder::new()
-            .name("repl-sender".into())
-            .spawn(move || {
-                apply_affinity("repl-sender", cores.repl_sender);
-                crate::replication::run_sender_dpdk(
-                    repl_transport,
-                    [repl_consumer_1, repl_consumer_2],
-                    repl_cursor,
-                    fastest_repl_cursor,
-                    genesis_entry,
-                    journal_path,
-                    &s_repl,
-                    &ready_flag,
-                    &connected_counter,
-                    dpdk_evict_flags,
-                    dpdk_active_flags,
-                    repl_metrics,
-                    batch_size,
-                    heartbeat_secs,
-                    busy_spin,
-                );
-            })
-            .map_err(|e| format!("spawn replication sender thread: {e}"))?;
-        info!(addr = %repl_bind, "DPDK replication sender started (dual-replica)");
-        Some(repl_sender_handle)
+
+        // Add the replication listener to the client transport so the
+        // poll thread accepts both trading and replication connections
+        // off the same queue.
+        transports[0]
+            .add_listener(repl_port)
+            .map_err(|e| format!("add replication listener: {e}"))?;
+
+        let driver = crate::replication::DpdkReplicationDriver::new(
+            [repl_consumer_1, repl_consumer_2],
+            repl_cursor,
+            fastest_repl_cursor,
+            genesis_entry,
+            journal_path,
+            ready_flag,
+            connected_counter,
+            dpdk_evict_flags,
+            dpdk_active_flags,
+            repl_metrics,
+            batch_size,
+            heartbeat_secs,
+        );
+        // Legacy text match — `lan-bench-suite.sh` `wait_for_log` keys
+        // off "DPDK replication sender started" to know the primary
+        // is ready to accept replicas. Kept verbatim for backward
+        // compatibility with existing bench tooling.
+        info!(addr = %repl_bind, "DPDK replication sender started (single-queue, in client poll thread)");
+        (Some(driver), repl_port)
     } else {
         if !config.standalone && config.replica_of.is_none() {
             info!("running in standalone mode (no replication)");
         }
-        None
+        (None, 0)
     };
+    // The DPDK replication-sender thread used to be spawned here; with
+    // the single-queue / single-thread refactor the driver lives inside
+    // the client poll thread instead. Nothing to join.
+    let replication_handle: Option<std::thread::JoinHandle<()>> = None;
 
     // Seed through the pipeline if needed.
-    if enable_replication && needs_seeding {
-        info!("waiting for replica to connect before seeding...");
-        while !replica_ready.load(Ordering::Acquire) {
-            if shutdown.load(Ordering::Relaxed) {
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(100));
-        }
-    }
+    //
+    // The previous DPDK path waited here for at least one replica to
+    // connect before seeding so the replica picked up the seed events
+    // live (skipping a journal-catch-up step). That gate is incompatible
+    // with the single-queue / single-thread design: the main thread IS
+    // the poll thread that accepts replica connections, and main is
+    // currently blocked here pre-seed → replicas have nowhere to land →
+    // deadlock until shutdown.
+    //
+    // Drop the gate. Seeding proceeds unconditionally; replicas that
+    // connect after seeding catch up via the journal protocol (a few
+    // hundred batches at startup — measured in tens of milliseconds, not
+    // a meaningful operational cost). The kernel-TCP path still has its
+    // own gate via the spawned `repl-sender` thread which can accept
+    // replicas independently of seeding; this only changes DPDK behavior.
+    let _ = (&enable_replication, &replica_ready); // suppress unused warnings on non-DPDK paths
     if needs_seeding {
         use crate::InputSlot;
         use crate::JournalEvent;
@@ -2020,6 +2024,8 @@ pub fn run_dpdk(
         max_conns,
         Arc::clone(&active_connections),
         0,
+        repl_driver,
+        repl_listen_port,
     );
 
     // The client poll runs on the main thread, so no extra DPDK threads

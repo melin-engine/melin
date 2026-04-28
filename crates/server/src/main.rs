@@ -128,14 +128,16 @@ fn dpdk_config_from(cfg: &ServerConfig) -> melin_dpdk::DpdkConfig {
     }
 }
 
-/// Single I/O queue for trading connections (LMAX model: one poll thread
-/// owns all client sockets). Extra queue pair only for the replication
-/// sender when replication is enabled.
+/// Always one I/O queue. The primary handles both trading and
+/// replication connections from the same poll thread (the replication
+/// state machine lives inside `run_dpdk_poll`'s main loop, dispatched
+/// off `AcceptedConnection::listen_port`). The replica likewise has
+/// only one DPDK consumer. Multi-queue + RSS was previously used to
+/// split client and replication onto separate queues, but DPDK's
+/// per-driver flow-steering quirks (iavf in particular) made the
+/// queue assignment non-deterministic — see the
+/// `feat/dpdk-per-port-egress` branch for the failed attempts.
 #[cfg(feature = "dpdk")]
-fn dpdk_num_queues(cfg: &ServerConfig) -> u16 {
-    if cfg.replication_bind.is_some() || cfg.replica_of.is_some() {
-        2
-    } else {
-        1
-    }
+fn dpdk_num_queues(_cfg: &ServerConfig) -> u16 {
+    1
 }

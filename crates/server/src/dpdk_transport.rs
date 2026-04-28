@@ -131,7 +131,23 @@ pub fn run_dpdk_poll(
     max_connections: u64,
     active_connections: Arc<std::sync::atomic::AtomicU64>,
     thread_id: u8,
+    // Optional replication driver. When `Some`, this thread owns BOTH
+    // client traffic on the trading port and replication traffic on the
+    // configured replication listen port. Connections accepted on the
+    // replication port are handed to the driver; per-iteration the
+    // driver's `tick()` advances each replica slot's state machine
+    // (handshake, journal catch-up, snapshot transfer, live streaming,
+    // ack processing). Replaces the separate replication-sender thread —
+    // see `feat/dpdk-single-queue` for the rationale (RSS routing on
+    // iavf made the previous multi-queue split unworkable).
+    repl_driver: Option<crate::replication::DpdkReplicationDriver>,
+    // TCP port the replication driver listens on. Used to filter
+    // `AcceptedConnection::listen_port` so client connections go to the
+    // client handler and replication connections to the driver. Ignored
+    // when `repl_driver` is None.
+    repl_listen_port: u16,
 ) {
+    let mut repl_driver = repl_driver;
     // Per-connection state indexed by `SocketHandle::index()`. Dense
     // `Vec<Option<_>>` beats a HashMap on the DPDK hot path: the HashMap
     // hashing + probe cost was the top remaining hotspot after the
@@ -225,8 +241,17 @@ pub fn run_dpdk_poll(
         // 1. Poll NIC + smoltcp.
         transport.poll();
 
-        // 2. Accept new connections and start auth handshake.
+        // 2. Accept new connections — dispatch by listen port so the
+        //    replication driver gets its own connections, client logic
+        //    only sees trading-port connections.
         for accepted in transport.take_accepted() {
+            if let Some(ref mut driver) = repl_driver
+                && accepted.listen_port == repl_listen_port
+            {
+                driver.accept_connection(accepted.peer, accepted.handle, &mut transport);
+                continue;
+            }
+
             // Enforce max_connections limit.
             if max_connections > 0 && connection_count as u64 >= max_connections {
                 warn!(
@@ -346,6 +371,15 @@ pub fn run_dpdk_poll(
             }
             if active_idx > 0 && active_idx.is_multiple_of(POLL_EVERY_N_CONNS) {
                 transport.poll();
+                // Drive the replication driver at the same cadence as the
+                // mid-loop NIC poll. Without this, `tick()` only fires once
+                // per outer iteration; under heavy client load the journal
+                // stage produces replication batches faster than the driver
+                // drains the ring, and the journal evicts both replicas with
+                // "ring backpressure timeout".
+                if let Some(ref mut driver) = repl_driver {
+                    driver.tick(&mut transport, shutdown);
+                }
             }
             active_idx += 1;
             let conn = match connections[idx].as_mut() {
@@ -485,6 +519,16 @@ pub fn run_dpdk_poll(
         // Single release store advances the producer cursor by all events
         // batched across this outer poll iteration.
         batch.commit();
+
+        // Drive the replication driver's per-iteration work — handshake
+        // progression, journal catch-up (blocking on first connect),
+        // ack processing, and live data-batch sends. With a single
+        // queue + single thread, this is what replaces the previous
+        // dedicated repl-sender thread; transport.poll() above flushed
+        // any TX the driver queued on the prior iteration.
+        if let Some(ref mut driver) = repl_driver {
+            driver.tick(&mut transport, shutdown);
+        }
     }
 }
 

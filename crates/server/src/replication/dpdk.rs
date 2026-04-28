@@ -57,119 +57,153 @@ fn compact_recv_buf(buf: &mut Vec<u8>, consumed: usize) {
     }
 }
 
-/// DPDK variant of the replication sender. Uses a `DpdkTransport` (smoltcp)
-/// instead of kernel TCP. The replication sender thread gets its own DPDK
-/// queue pair for independent NIC access.
-///
-/// Supports dual replicas: each slot has its own `ReplicationConsumer` and
-/// independent state machine. Both are polled in a single-threaded loop
-/// (no per-replica threads — DPDK is single-threaded).
-///
-/// The protocol is identical to `run_sender` — same wire format, same
-/// handshake, same streaming logic. Only the I/O primitives differ.
-///
-/// Top-level thread entry point — the wide arg list mirrors what the
-/// shared replication state owns and would re-export through any wrapper
-/// struct, so a config struct adds indirection without simplifying.
-#[allow(clippy::too_many_arguments)]
-pub fn run_sender_dpdk(
-    mut transport: melin_dpdk::DpdkTransport,
-    repl_consumers: [ReplicationConsumer; 2],
+/// Per-slot state for the DPDK replication sender.
+enum SlotState {
+    /// No replica connected on this slot.
+    Idle,
+    /// Replica connected, performing handshake.
+    Handshaking(melin_dpdk::SocketHandle),
+    /// Streaming journal data to replica.
+    Streaming(melin_dpdk::SocketHandle),
+}
+
+/// Per-replica slot — owns its ring consumer and state machine.
+struct DpdkReplicaSlot {
+    state: SlotState,
+    consumer: ReplicationConsumer,
+    active_flag: Arc<AtomicBool>,
+    evict_flag: Arc<AtomicBool>,
+    recv_buf: Vec<u8>,
+    send_buf: Vec<u8>,
+    last_send: std::time::Instant,
+    last_sequence: u64,
+    /// Per-slot acked cursor. `u64::MAX` when not streaming —
+    /// doesn't block the replication cursor (min of both slots).
+    acked_cursor: u64,
+}
+
+/// Step-able DPDK replication state. Owns both slot state machines and the
+/// shared cursors / metrics, but does NOT own the `DpdkTransport` — it
+/// reaches into one supplied by the caller per call. This shape lets the
+/// primary's single DPDK poll thread drive replication alongside client
+/// traffic by calling `tick()` once per poll iteration and dispatching
+/// `accept_connection()` for any `AcceptedConnection` that arrives on the
+/// replication listen port.
+pub struct DpdkReplicationDriver {
+    slots: [DpdkReplicaSlot; 2],
     replication_cursor: Arc<AtomicU64>,
     fastest_replica_cursor: Arc<AtomicU64>,
     genesis_entry: Vec<u8>,
     journal_path: std::path::PathBuf,
-    shutdown: &AtomicBool,
-    replica_ready: &AtomicBool,
-    replicas_connected: &AtomicU32,
-    evict_flags: [Arc<AtomicBool>; 2],
-    active_flags: [Arc<AtomicBool>; 2],
+    replica_ready: Arc<AtomicBool>,
+    replicas_connected: Arc<AtomicU32>,
     metrics: Arc<ReplicationMetrics>,
     batch_size: usize,
-    heartbeat_secs: u64,
-    busy_spin: bool,
-) {
-    info!("DPDK replication sender started (dual-replica)");
+    heartbeat_interval: std::time::Duration,
+}
 
-    /// Per-slot state machine.
-    enum SlotState {
-        /// No replica connected on this slot.
-        Idle,
-        /// Replica connected, performing handshake.
-        Handshaking(melin_dpdk::SocketHandle),
-        /// Streaming journal data to replica.
-        Streaming(melin_dpdk::SocketHandle),
+impl DpdkReplicationDriver {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        repl_consumers: [ReplicationConsumer; 2],
+        replication_cursor: Arc<AtomicU64>,
+        fastest_replica_cursor: Arc<AtomicU64>,
+        genesis_entry: Vec<u8>,
+        journal_path: std::path::PathBuf,
+        replica_ready: Arc<AtomicBool>,
+        replicas_connected: Arc<AtomicU32>,
+        evict_flags: [Arc<AtomicBool>; 2],
+        active_flags: [Arc<AtomicBool>; 2],
+        metrics: Arc<ReplicationMetrics>,
+        batch_size: usize,
+        heartbeat_secs: u64,
+    ) -> Self {
+        let [consumer_0, consumer_1] = repl_consumers;
+        let now = std::time::Instant::now();
+        DpdkReplicationDriver {
+            slots: [
+                DpdkReplicaSlot {
+                    state: SlotState::Idle,
+                    consumer: consumer_0,
+                    active_flag: Arc::clone(&active_flags[0]),
+                    evict_flag: Arc::clone(&evict_flags[0]),
+                    recv_buf: Vec::with_capacity(4096),
+                    send_buf: Vec::with_capacity(512 * 1024),
+                    last_send: now,
+                    last_sequence: 0,
+                    acked_cursor: u64::MAX,
+                },
+                DpdkReplicaSlot {
+                    state: SlotState::Idle,
+                    consumer: consumer_1,
+                    active_flag: Arc::clone(&active_flags[1]),
+                    evict_flag: Arc::clone(&evict_flags[1]),
+                    recv_buf: Vec::with_capacity(4096),
+                    send_buf: Vec::with_capacity(512 * 1024),
+                    last_send: now,
+                    last_sequence: 0,
+                    acked_cursor: u64::MAX,
+                },
+            ],
+            replication_cursor,
+            fastest_replica_cursor,
+            genesis_entry,
+            journal_path,
+            replica_ready,
+            replicas_connected,
+            metrics,
+            batch_size,
+            heartbeat_interval: std::time::Duration::from_secs(heartbeat_secs),
+        }
     }
 
-    /// Per-replica slot. Each has its own ring consumer and state.
-    struct DpdkReplicaSlot {
-        state: SlotState,
-        consumer: ReplicationConsumer,
-        active_flag: Arc<AtomicBool>,
-        evict_flag: Arc<AtomicBool>,
-        recv_buf: Vec<u8>,
-        send_buf: Vec<u8>,
-        last_send: std::time::Instant,
-        last_sequence: u64,
-        /// Per-slot acked cursor. `u64::MAX` when not streaming —
-        /// doesn't block the replication cursor (min of both slots).
-        acked_cursor: u64,
+    /// Take ownership of a freshly-accepted connection on the replication
+    /// port. Assigns it to the first idle slot, or closes it if both slots
+    /// are occupied (dual-repl cap). Caller is responsible for filtering by
+    /// `AcceptedConnection::listen_port`.
+    pub fn accept_connection(
+        &mut self,
+        peer: std::net::SocketAddr,
+        handle: melin_dpdk::SocketHandle,
+        transport: &mut melin_dpdk::DpdkTransport,
+    ) {
+        let idle_slot = self
+            .slots
+            .iter()
+            .position(|s| matches!(s.state, SlotState::Idle));
+        if let Some(idx) = idle_slot {
+            info!(peer = ?peer, slot = idx, "replica connected via DPDK");
+            self.replicas_connected.fetch_add(1, Ordering::Release);
+            self.slots[idx].recv_buf.clear();
+            self.slots[idx].state = SlotState::Handshaking(handle);
+        } else {
+            debug!(peer = ?peer, "replica rejected — both slots occupied");
+            transport.close(handle);
+        }
     }
 
-    let [consumer_0, consumer_1] = repl_consumers;
-    let heartbeat_interval = std::time::Duration::from_secs(heartbeat_secs);
-    let now = std::time::Instant::now();
-
-    let mut slots = [
-        DpdkReplicaSlot {
-            state: SlotState::Idle,
-            consumer: consumer_0,
-            active_flag: Arc::clone(&active_flags[0]),
-            evict_flag: Arc::clone(&evict_flags[0]),
-            recv_buf: Vec::with_capacity(4096),
-            send_buf: Vec::with_capacity(512 * 1024),
-            last_send: now,
-            last_sequence: 0,
-            acked_cursor: u64::MAX,
-        },
-        DpdkReplicaSlot {
-            state: SlotState::Idle,
-            consumer: consumer_1,
-            active_flag: Arc::clone(&active_flags[1]),
-            evict_flag: Arc::clone(&evict_flags[1]),
-            recv_buf: Vec::with_capacity(4096),
-            send_buf: Vec::with_capacity(512 * 1024),
-            last_send: now,
-            last_sequence: 0,
-            acked_cursor: u64::MAX,
-        },
-    ];
-
-    loop {
-        if shutdown.load(Ordering::Relaxed) {
-            info!("DPDK replication sender shutting down");
-            return;
-        }
-
-        // Drive smoltcp (rx/tx, timers, retransmit).
-        transport.poll();
-
-        // Accept new connections into the first idle slot.
-        let accepted = transport.take_accepted();
-        for conn in accepted {
-            let idle_slot = slots
-                .iter()
-                .position(|s| matches!(s.state, SlotState::Idle));
-            if let Some(idx) = idle_slot {
-                info!(peer = ?conn.peer, slot = idx, "replica connected via DPDK");
-                replicas_connected.fetch_add(1, Ordering::Release);
-                slots[idx].recv_buf.clear();
-                slots[idx].state = SlotState::Handshaking(conn.handle);
-            } else {
-                debug!(peer = ?conn.peer, "replica rejected — both slots occupied");
-                transport.close(conn.handle);
-            }
-        }
+    /// Drive both slots' state machines for one poll iteration. Returns
+    /// `true` if at least one slot is currently active (Handshaking or
+    /// Streaming) — caller can use this to decide whether to busy-spin
+    /// on idle.
+    pub fn tick(
+        &mut self,
+        transport: &mut melin_dpdk::DpdkTransport,
+        shutdown: &AtomicBool,
+    ) -> bool {
+        // Local rebinds for readability — the body below was lifted from
+        // the previous run_sender_dpdk thread, mostly verbatim, so keep
+        // the variable names matching.
+        let slots = &mut self.slots;
+        let replication_cursor = &self.replication_cursor;
+        let fastest_replica_cursor = &self.fastest_replica_cursor;
+        let genesis_entry = &self.genesis_entry;
+        let journal_path = &self.journal_path;
+        let replica_ready = &self.replica_ready;
+        let replicas_connected = &self.replicas_connected;
+        let metrics = &self.metrics;
+        let batch_size = self.batch_size;
+        let heartbeat_interval = self.heartbeat_interval;
 
         // Check eviction flags from the journal stage.
         for (i, slot) in slots.iter_mut().enumerate() {
@@ -266,7 +300,7 @@ pub fn run_sender_dpdk(
 
                                     // Probe whether journal catch-up is possible.
                                     let can_catch_up = match can_catch_up_from_journal(
-                                        &journal_path,
+                                        journal_path,
                                         h.last_sequence,
                                     ) {
                                         Ok(v) => v,
@@ -291,7 +325,7 @@ pub fn run_sender_dpdk(
                                         slot.send_buf.clear();
                                         encode_stream_start(
                                             h.last_sequence,
-                                            &genesis_entry,
+                                            genesis_entry,
                                             &mut slot.send_buf,
                                         );
                                         transport.queue_send(handle, &slot.send_buf);
@@ -299,10 +333,10 @@ pub fn run_sender_dpdk(
 
                                         // Journal catch-up via DPDK transport.
                                         if let Err(e) = catch_up_from_journal_dpdk(
-                                            &journal_path,
+                                            journal_path,
                                             h.last_sequence,
                                             handle,
-                                            &mut transport,
+                                            transport,
                                             &mut slot.send_buf,
                                             shutdown,
                                         ) {
@@ -323,10 +357,10 @@ pub fn run_sender_dpdk(
                                         // Replica's state predates all journal archives.
                                         // Transfer a snapshot, then catch up.
                                         if let Err(e) = snapshot_transfer_dpdk(
-                                            &journal_path,
-                                            &genesis_entry,
+                                            journal_path,
+                                            genesis_entry,
                                             handle,
-                                            &mut transport,
+                                            transport,
                                             &mut slot.send_buf,
                                             shutdown,
                                         ) {
@@ -379,8 +413,8 @@ pub fn run_sender_dpdk(
                                     update_dual_replication_cursor(
                                         slot.acked_cursor,
                                         other_acked,
-                                        &replication_cursor,
-                                        &fastest_replica_cursor,
+                                        replication_cursor,
+                                        fastest_replica_cursor,
                                     );
 
                                     metrics.catching_up[slot_idx].store(false, Ordering::Relaxed);
@@ -449,8 +483,8 @@ pub fn run_sender_dpdk(
                                     update_dual_replication_cursor(
                                         slot.acked_cursor,
                                         other_acked,
-                                        &replication_cursor,
-                                        &fastest_replica_cursor,
+                                        replication_cursor,
+                                        fastest_replica_cursor,
                                     );
                                 }
                                 consumed += frame_end;
@@ -483,30 +517,71 @@ pub fn run_sender_dpdk(
                         continue;
                     }
 
-                    // 2. Send data batches.
+                    // 2. Send data batches. Pre-check the per-socket TX
+                    //    queue: if we encode and commit a batch but
+                    //    queue_send rejects it (TX full), the data is gone
+                    //    from the ring without ever reaching the replica
+                    //    — replica never acks, replication_cursor stalls,
+                    //    and the response gate freezes the whole exchange.
+                    //    We saw this exact symptom on dpdk-dual-repl.
+                    let max_tx = melin_dpdk::DpdkTransport::max_tx_queue_size();
+                    let used = transport.tx_queue_bytes(handle);
+                    let mut available = max_tx.saturating_sub(used);
+                    // DataBatch frame overhead: 4-byte length prefix +
+                    // 1-byte tag + 8-byte sequence. Bound oversizing so
+                    // a single oversized batch can't blow past available.
+                    const FRAME_OVERHEAD: usize = 32;
+
                     slot.send_buf.clear();
                     let mut batches_sent = 0;
-                    if let Some((meta, data)) = slot.consumer.try_read() {
+                    // Read-and-peek loop: only commit a batch once we've
+                    // confirmed it fits. If it doesn't fit, leave the
+                    // ring cursor in place so the next iteration retries
+                    // after transport.poll() drains the wire.
+                    while batches_sent < batch_size {
+                        let Some((meta, data)) = slot.consumer.try_read() else {
+                            break;
+                        };
+                        let need = data.len() + FRAME_OVERHEAD;
+                        if need > available {
+                            // Don't commit; retry next iteration.
+                            break;
+                        }
                         encode_data_batch(meta.end_sequence, data, &mut slot.send_buf);
                         slot.consumer.commit();
                         slot.last_sequence = meta.end_sequence;
                         batches_sent += 1;
+                        available = available.saturating_sub(need);
+                    }
 
-                        // Coalesce more batches.
-                        for _ in 1..batch_size {
-                            if let Some((meta, data)) = slot.consumer.try_read() {
-                                encode_data_batch(meta.end_sequence, data, &mut slot.send_buf);
-                                slot.consumer.commit();
-                                slot.last_sequence = meta.end_sequence;
-                                batches_sent += 1;
-                            } else {
-                                break;
-                            }
-                        }
-
+                    if !slot.send_buf.is_empty() {
                         metrics.bytes_sent[slot_idx]
                             .fetch_add(slot.send_buf.len() as u64, Ordering::Relaxed);
-                        transport.queue_send(handle, &slot.send_buf);
+                        if !transport.queue_send(handle, &slot.send_buf) {
+                            // Pre-check should have prevented this; this
+                            // branch is defense-in-depth. Replica catches
+                            // up via journal on reconnect, so committed
+                            // (now-unsent) batches aren't lost.
+                            warn!(
+                                slot = slot_idx,
+                                used,
+                                send_len = slot.send_buf.len(),
+                                "TX overflow on replica socket — disconnecting"
+                            );
+                            transport.close(handle);
+                            slot.active_flag.store(false, Ordering::Release);
+                            slot.acked_cursor = u64::MAX;
+                            metrics.acked_sequence[slot_idx].store(0, Ordering::Relaxed);
+                            slot.recv_buf.clear();
+                            slot.state = SlotState::Idle;
+                            replicas_connected.fetch_sub(1, Ordering::Release);
+                            if replicas_connected.load(Ordering::Relaxed) == 0 {
+                                replication_cursor.store(u64::MAX, Ordering::Release);
+                                fastest_replica_cursor.store(u64::MAX, Ordering::Release);
+                                warn!("all replicas disconnected — trading halted");
+                            }
+                            continue;
+                        }
                         slot.last_send = std::time::Instant::now();
                     }
 
@@ -543,13 +618,7 @@ pub fn run_sender_dpdk(
             }
         }
 
-        if !any_active {
-            if busy_spin {
-                std::hint::spin_loop();
-            } else {
-                std::thread::yield_now();
-            }
-        }
+        any_active
     }
 }
 
@@ -635,7 +704,24 @@ fn catch_up_from_journal_dpdk(
 
             send_buf.clear();
             encode_data_batch(batch_end_seq, &batch_buf, send_buf);
-            transport.queue_send(handle, send_buf);
+            // Retry-with-poll: a 64 KiB batch can fill the TX queue even
+            // after a previous poll. Spin-poll until queue_send accepts
+            // the batch (or the replica drops). This is bounded — TX
+            // drains as fast as smoltcp can dispatch segments.
+            loop {
+                if shutdown.load(Ordering::Relaxed) {
+                    return Ok(());
+                }
+                if transport.queue_send(handle, send_buf) {
+                    break;
+                }
+                transport.poll();
+                if !transport.is_active(handle) {
+                    return Err(io::Error::other(
+                        "replica disconnected during journal catch-up (TX backpressure)",
+                    ));
+                }
+            }
             // Flush TX periodically to keep smoltcp and the NIC flowing.
             transport.poll();
 

@@ -56,7 +56,7 @@ mod tcp_sender;
 pub use protocol::{Ack, Handshake, PrimaryMessage, ReplicaMessage};
 
 #[cfg(feature = "dpdk")]
-pub use dpdk::{run_receiver_dpdk, run_sender_dpdk};
+pub use dpdk::{DpdkReplicationDriver, run_receiver_dpdk};
 pub use tcp_receiver::{ReceiverResult, run_receiver};
 pub use tcp_sender::{Sender, run_sender};
 
