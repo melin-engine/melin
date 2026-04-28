@@ -27,6 +27,15 @@ use melin_protocol::message::{Request, ResponseKind};
 /// authenticates via Ed25519 challenge-response (operator keys only),
 /// checks for the "PROMOTE" command, and sets the flag. The thread exits
 /// when `shutdown` is set or after a successful promotion.
+///
+/// Both call sites (TCP `run_with_shutdown`, rumcast `run_rumcast_replica`)
+/// drop the returned handle without joining — the listener runs for the
+/// lifetime of the process and exits when `shutdown` flips. Without
+/// special handling a panic inside `run` would be silently swallowed by
+/// the never-joined handle. We wrap `run` in `catch_unwind` here so the
+/// panic surfaces as a `tracing::error!` line; the rest of the process
+/// keeps running (a panicking listener doesn't compromise replica
+/// correctness, just blocks future promotion attempts until restart).
 pub fn spawn(
     bind_addr: SocketAddr,
     promote: Arc<AtomicBool>,
@@ -35,8 +44,29 @@ pub fn spawn(
 ) -> JoinHandle<()> {
     std::thread::Builder::new()
         .name("promote-listener".into())
-        .spawn(move || run(bind_addr, &promote, &shutdown, &authorized_keys))
+        .spawn(move || {
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                run(bind_addr, &promote, &shutdown, &authorized_keys)
+            }));
+            if let Err(panic) = result {
+                let msg = panic_message(&panic);
+                error!(addr = %bind_addr, panic = %msg, "promote listener thread panicked");
+            }
+        })
         .expect("failed to spawn promote listener thread")
+}
+
+/// Best-effort extraction of a panic payload's display message. Most
+/// panics carry a `&'static str` or `String`; anything else falls back
+/// to a placeholder so we still get a log line.
+fn panic_message(payload: &Box<dyn std::any::Any + Send>) -> String {
+    if let Some(s) = payload.downcast_ref::<&'static str>() {
+        (*s).to_string()
+    } else if let Some(s) = payload.downcast_ref::<String>() {
+        s.clone()
+    } else {
+        "<non-string panic payload>".to_string()
+    }
 }
 
 fn run(

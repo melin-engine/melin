@@ -297,6 +297,32 @@ fn run_rumcast_primary(
     // ---- Engine pipeline ----
     let (app, writer, needs_seeding) = init_engine(&config)?;
 
+    run_rumcast_primary_with_state(
+        config,
+        rumcast_config,
+        shutdown,
+        authorized_keys,
+        app,
+        writer,
+        needs_seeding,
+    )
+}
+
+/// Same as [`run_rumcast_primary`] but takes an existing
+/// `(App, JournalWriter)` instead of calling `init_engine`. Used by the
+/// promotion path: when `run_receiver_rumcast` returns `Some(state)` on
+/// promote, the replica calls into this with its already-replayed
+/// state rather than re-recovering from the journal.
+#[allow(clippy::too_many_arguments)]
+fn run_rumcast_primary_with_state(
+    config: ServerConfig,
+    rumcast_config: RumcastConfig,
+    shutdown: Arc<AtomicBool>,
+    authorized_keys: Arc<AuthorizedKeys>,
+    app: crate::App,
+    writer: crate::JournalWriter,
+    needs_seeding: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
     let enable_replication = config.replication_bind.is_some();
     if enable_replication && config.standalone {
         return Err("--replication-bind and --standalone are mutually exclusive".into());
@@ -1320,12 +1346,31 @@ fn run_rumcast_replica(
         ed25519_dalek::SigningKey::from_bytes(&bytes)
     };
 
-    // Promotion path: not yet implemented for the rumcast transport.
-    // The TCP path spawns a TCP promote listener on `--promote-bind`;
-    // mirroring it on rumcast is out of scope for Phase 4 (the bench
-    // suite drives manual promotion via process restart, not a live
-    // promote signal).
+    // Authorized keys are needed both by the receiver-side promotion
+    // listener (TCP path uses these for operator-key challenge-
+    // response) and by the post-promotion primary mode. We load once
+    // and pass through.
+    let authorized_keys = Arc::new(AuthorizedKeys::load(&config.authorized_keys)?);
+    info!(
+        keys = authorized_keys.len(),
+        path = %config.authorized_keys.display(),
+        "loaded authorized_keys (replica mode)"
+    );
+
+    // Promotion listener — same TCP-based operator interface the TCP
+    // replica path uses (`crate::promote::spawn`). The replication
+    // data plane runs over UDP, but operator promotion stays on TCP
+    // so existing tooling (admin CLI, dashboards) doesn't need to
+    // learn the rumcast wire format.
     let promote_flag = Arc::new(AtomicBool::new(false));
+    let _promote_handle = config.promote_bind.map(|addr| {
+        crate::promote::spawn(
+            addr,
+            Arc::clone(&promote_flag),
+            Arc::clone(&shutdown),
+            Arc::clone(&authorized_keys),
+        )
+    });
 
     // The replica's local UDP bind for rumcast. We reuse the `--bind`
     // flag (= `rumcast_config.bind`) — operators get one knob to
@@ -1344,15 +1389,21 @@ fn run_rumcast_replica(
         !config.yield_idle,
     )? {
         None => Ok(()), // clean shutdown
-        Some((mut _exchange, _writer)) => {
-            // Promotion was triggered. Phase 4 doesn't wire the rumcast
-            // promotion handoff into the primary path yet — surface a
-            // clear error so an operator who triggered promotion knows
-            // the process must be restarted as a primary instead.
-            Err(
-                "rumcast replica was promoted but rumcast promotion handoff is not yet \
-                 implemented; restart the process with --replication-bind to run as primary"
-                    .into(),
+        Some((mut exchange, writer)) => {
+            // Promotion! Transition to primary mode using the already-
+            // replayed `(exchange, writer)` rather than calling
+            // `init_engine`. Mirrors the TCP path's
+            // `run_with_shutdown` → `run_as_primary` handoff.
+            info!("rumcast replica promoted — transitioning to primary");
+            <crate::App as melin_app::Application>::prefault(&mut exchange);
+            run_rumcast_primary_with_state(
+                config,
+                rumcast_config,
+                shutdown,
+                authorized_keys,
+                exchange,
+                writer,
+                false, // no seeding — state already replayed from primary
             )
         }
     }
