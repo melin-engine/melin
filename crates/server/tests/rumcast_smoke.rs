@@ -30,8 +30,8 @@ use melin_protocol::session::{
 use melin_rumcast::pub_log::{PublicationConfig, PublicationLog};
 use melin_rumcast::receiver::{ReceiverConfig, ReceiverLoop};
 use melin_rumcast::sender::{SenderConfig, SenderLoop};
+use melin_rumcast::shared_udp::SharedUdp;
 use melin_rumcast::sub_log::{SubscriptionConfig, SubscriptionLog};
-use melin_rumcast::transport::KernelUdp;
 use melin_rumcast::wire::{FrameView, data_flags};
 use melin_server::rumcast_transport::{RumcastConfig, run_rumcast};
 use melin_server::server::ServerConfig;
@@ -61,11 +61,15 @@ fn loopback(port: u16) -> SocketAddr {
 }
 
 /// Write an `authorized_keys` file granting trader permission to
-/// the given Ed25519 verifying key. Returns the file path.
-fn write_authorized_keys(dir: &std::path::Path, key: &SigningKey) -> PathBuf {
-    let pub_b64 = base64::engine::general_purpose::STANDARD.encode(key.verifying_key().to_bytes());
+/// each of the given Ed25519 verifying keys. Returns the file path.
+fn write_authorized_keys(dir: &std::path::Path, keys: &[&SigningKey]) -> PathBuf {
     let path = dir.join("authorized_keys");
-    let content = format!("trader {pub_b64} rumcast-smoke-test\n");
+    let mut content = String::new();
+    for (i, key) in keys.iter().enumerate() {
+        let pub_b64 =
+            base64::engine::general_purpose::STANDARD.encode(key.verifying_key().to_bytes());
+        content.push_str(&format!("trader {pub_b64} rumcast-smoke-test-{i}\n"));
+    }
     let mut f = std::fs::File::create(&path).expect("create authorized_keys");
     f.write_all(content.as_bytes()).expect("write keys");
     path
@@ -127,9 +131,7 @@ fn rumcast_order_round_trip() {
         .try_init();
 
     let server_port = free_udp_port();
-    let bench_resp_port = free_udp_port();
     let server_addr = loopback(server_port);
-    let bench_addr = loopback(bench_resp_port);
 
     // Temp directory for the journal + authorized_keys — destroyed
     // when `_tmp` drops.
@@ -139,7 +141,7 @@ fn rumcast_order_round_trip() {
     // Client identity: deterministic key from a fixed seed makes the
     // test reproducible and avoids needing a CSPRNG dep here.
     let client_key = SigningKey::from_bytes(&[0xAB; 32]);
-    let authorized_keys_path = write_authorized_keys(_tmp.path(), &client_key);
+    let authorized_keys_path = write_authorized_keys(_tmp.path(), &[&client_key]);
 
     // ---- Server config ----
     let server_config = ServerConfig {
@@ -147,7 +149,6 @@ fn rumcast_order_round_trip() {
         journal: journal_path.clone(),
         accounts: 4,
         instruments: 4,
-        rumcast_client_addr: Some(bench_addr),
         authorized_keys: authorized_keys_path,
         ..ServerConfig::default()
     };
@@ -160,10 +161,7 @@ fn rumcast_order_round_trip() {
         .spawn(move || {
             run_rumcast(
                 server_config,
-                RumcastConfig {
-                    bind: server_addr,
-                    client_addr: bench_addr,
-                },
+                RumcastConfig { bind: server_addr },
                 server_shutdown,
             )
             .map_err(|e| e.to_string())
@@ -175,7 +173,18 @@ fn rumcast_order_round_trip() {
     // of ms on some filesystems.
     thread::sleep(Duration::from_millis(500));
 
-    // ---- Client-side rumcast endpoints ----
+    // ---- Client-side rumcast endpoints (single shared socket) ----
+    //
+    // SharedUdp gives us one bound port with two `UdpTransport`
+    // halves. The orders Sender uses the send half (its outbound
+    // packets carry this socket's port as the source addr — which
+    // becomes the server's auto-discovered `effective_dst`, so
+    // responses land back here). The resp Receiver uses the recv
+    // half. Internal demux routes Data/Setup/Heartbeat to the recv
+    // half, NAK/StatusMessage to the send half.
+    let shared = SharedUdp::bind(loopback(0)).unwrap();
+    let (send_half, recv_half) = shared.split();
+
     let orders_pub = Arc::new(
         PublicationLog::new(PublicationConfig {
             session_id: RUMCAST_SESSION_ID,
@@ -187,12 +196,10 @@ fn rumcast_order_round_trip() {
         .unwrap(),
     );
     orders_pub.set_publisher_limit(u64::MAX);
-    let orders_socket = KernelUdp::bind(loopback(0)).unwrap();
     let mut orders_send_config = SenderConfig::defaults(server_addr);
     orders_send_config.setup_interval = Duration::from_millis(50);
     orders_send_config.heartbeat_interval = Duration::from_millis(25);
-    let mut orders_sender =
-        SenderLoop::new(Arc::clone(&orders_pub), orders_socket, orders_send_config);
+    let mut orders_sender = SenderLoop::new(Arc::clone(&orders_pub), send_half, orders_send_config);
 
     let resp_sub = Arc::new(
         SubscriptionLog::new(SubscriptionConfig {
@@ -203,10 +210,9 @@ fn rumcast_order_round_trip() {
         })
         .unwrap(),
     );
-    let resp_socket = KernelUdp::bind(bench_addr).unwrap();
     let mut resp_recv_config = ReceiverConfig::defaults(server_addr, BENCH_RECEIVER_ID);
     resp_recv_config.sm_interval = Duration::from_millis(50);
-    let mut resp_receiver = ReceiverLoop::new(Arc::clone(&resp_sub), resp_socket, resp_recv_config);
+    let mut resp_receiver = ReceiverLoop::new(Arc::clone(&resp_sub), recv_half, resp_recv_config);
 
     // ---- Tick threads ----
     let tick_shutdown = Arc::new(AtomicBool::new(false));
@@ -369,5 +375,289 @@ fn rumcast_order_round_trip() {
         got_batch_end,
         "did not receive envelope-wrapped BatchEnd within 5s — \
          server didn't roundtrip the order through the rumcast auth path"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Multi-client end-to-end
+// ---------------------------------------------------------------------------
+
+/// Run one client's full auth + order + BatchEnd-wait flow against
+/// an already-running server. Returns `true` iff the client received
+/// its own envelope-wrapped `BatchEnd` within the deadline.
+///
+/// Each call sets up its own `SharedUdp` (single bound socket per
+/// client — required for the server's auto-discovered per-session
+/// dst to land back at this client's subscriber), its own
+/// `PublicationLog` keyed by `session_id`, and its own tick
+/// threads. Multiple `run_one_client` invocations on different
+/// session_ids run independently.
+#[allow(clippy::too_many_arguments)]
+fn run_one_client(
+    server_addr: SocketAddr,
+    signing_key: SigningKey,
+    session_id: u32,
+    x25519_seed: [u8; 32],
+    order_id: u64,
+    account_id: u32,
+) -> bool {
+    let shared = SharedUdp::bind(loopback(0)).unwrap();
+    let (send_half, recv_half) = shared.split();
+
+    let orders_pub = Arc::new(
+        PublicationLog::new(PublicationConfig {
+            session_id,
+            stream_id: RUMCAST_ORDERS_STREAM,
+            initial_term_id: INITIAL_TERM_ID,
+            term_length: TERM_LENGTH,
+            mtu: MTU,
+        })
+        .unwrap(),
+    );
+    orders_pub.set_publisher_limit(u64::MAX);
+    let mut orders_send_config = SenderConfig::defaults(server_addr);
+    orders_send_config.setup_interval = Duration::from_millis(50);
+    orders_send_config.heartbeat_interval = Duration::from_millis(25);
+    let mut orders_sender = SenderLoop::new(Arc::clone(&orders_pub), send_half, orders_send_config);
+
+    let resp_sub = Arc::new(
+        SubscriptionLog::new(SubscriptionConfig {
+            session_id,
+            stream_id: RUMCAST_RESP_STREAM,
+            initial_term_id: INITIAL_TERM_ID,
+            term_length: TERM_LENGTH,
+        })
+        .unwrap(),
+    );
+    let mut resp_recv_config = ReceiverConfig::defaults(server_addr, BENCH_RECEIVER_ID);
+    resp_recv_config.sm_interval = Duration::from_millis(50);
+    let mut resp_receiver = ReceiverLoop::new(Arc::clone(&resp_sub), recv_half, resp_recv_config);
+
+    let tick_shutdown = Arc::new(AtomicBool::new(false));
+    let send_tick = {
+        let s = Arc::clone(&tick_shutdown);
+        thread::spawn(move || {
+            while !s.load(Ordering::Acquire) {
+                let _ = orders_sender.tick();
+                thread::sleep(Duration::from_micros(50));
+            }
+        })
+    };
+    let recv_tick = {
+        let s = Arc::clone(&tick_shutdown);
+        thread::spawn(move || {
+            while !s.load(Ordering::Acquire) {
+                let _ = resp_receiver.tick();
+                thread::sleep(Duration::from_micros(50));
+            }
+        })
+    };
+
+    // Handshake.
+    let mut buf = vec![0u8; 256];
+    let written = codec::encode_request(&Request::Heartbeat, 0, &mut buf).unwrap();
+    rumcast_publish(&orders_pub, &buf[4..written]);
+
+    let challenge_bytes = rumcast_recv_match(
+        &resp_sub,
+        Instant::now() + Duration::from_secs(5),
+        |payload| {
+            matches!(
+                codec::decode_response(payload),
+                Ok(ResponseKind::Challenge { .. })
+            )
+        },
+    )
+    .expect("Challenge from server");
+    let (server_nonce, server_eph) = match codec::decode_response(&challenge_bytes).unwrap() {
+        ResponseKind::Challenge {
+            nonce,
+            server_x25519_eph,
+        } => (nonce, server_x25519_eph),
+        other => panic!("expected Challenge, got {other:?}"),
+    };
+
+    let handshake = ClientHandshake::new(&signing_key, x25519_seed);
+    let completed = handshake.finish(&server_nonce, &server_eph);
+    let session_token = completed.session_token;
+
+    let written = codec::encode_request(&completed.challenge_response, 0, &mut buf).unwrap();
+    rumcast_publish(&orders_pub, &buf[4..written]);
+
+    rumcast_recv_match(
+        &resp_sub,
+        Instant::now() + Duration::from_secs(5),
+        |payload| {
+            matches!(
+                codec::decode_response(payload),
+                Ok(ResponseKind::ServerReady)
+            )
+        },
+    )
+    .expect("ServerReady from server");
+
+    // Submit one envelope-wrapped order.
+    let order = Order {
+        id: OrderId(order_id),
+        account: AccountId(account_id),
+        side: Side::Buy,
+        order_type: OrderType::Limit {
+            price: Price(NonZeroU64::new(100).unwrap()),
+            post_only: false,
+        },
+        time_in_force: TimeInForce::GTC,
+        quantity: Quantity(NonZeroU64::new(10).unwrap()),
+        stp: SelfTradeProtection::Allow,
+        expiry_ns: 0,
+    };
+    let request = Request::SubmitOrder {
+        symbol: Symbol(0),
+        order,
+    };
+    let written = codec::encode_request(&request, /*seq*/ 1, &mut buf).unwrap();
+    let inner = &buf[4..written];
+    let mut envelope = vec![0u8; ENVELOPE_OVERHEAD + inner.len()];
+    encode_envelope(
+        &session_token,
+        session_id,
+        /*seq*/ 1,
+        inner,
+        &mut envelope,
+    )
+    .unwrap();
+    rumcast_publish(&orders_pub, &envelope);
+
+    // Wait for envelope-wrapped BatchEnd.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut last_inbound_seq: u64 = 0;
+    let mut got_batch_end = false;
+    while Instant::now() < deadline && !got_batch_end {
+        resp_sub.poll(64 * 1024, |view| {
+            if let FrameView::Data { header, payload } = view
+                && header.common.flags & data_flags::PADDING == 0
+                && let Ok((seq, decoded_inner)) = verify_and_decode_envelope(
+                    &session_token,
+                    session_id,
+                    last_inbound_seq,
+                    payload,
+                )
+            {
+                last_inbound_seq = seq;
+                if let Ok(ResponseKind::BatchEnd) = codec::decode_response(decoded_inner) {
+                    got_batch_end = true;
+                }
+            }
+        });
+        thread::sleep(Duration::from_millis(5));
+    }
+
+    tick_shutdown.store(true, Ordering::Release);
+    let _ = send_tick.join();
+    let _ = recv_tick.join();
+
+    got_batch_end
+}
+
+#[test]
+fn rumcast_two_clients_concurrent() {
+    // Two clients connect concurrently with distinct session_ids
+    // and distinct Ed25519 identities. Each completes its own
+    // handshake, submits an order, and must receive its own
+    // envelope-wrapped BatchEnd. If the server's per-session
+    // routing leaks (e.g. responses going to the wrong client),
+    // one of them silently fails.
+    //
+    // Pre-#33 (single static `client_addr`) this test would silently
+    // fail for the second client. With #32 (SharedUdp) and #33
+    // (auto-discovered per-session dst), it should pass.
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+        )
+        .with_test_writer()
+        .try_init();
+
+    let server_port = free_udp_port();
+    let server_addr = loopback(server_port);
+
+    let _tmp = tempfile::tempdir().unwrap();
+    let journal_path = _tmp.path().join("test.journal");
+
+    // Two distinct deterministic keys.
+    let key_a = SigningKey::from_bytes(&[0xA1; 32]);
+    let key_b = SigningKey::from_bytes(&[0xB2; 32]);
+    let authorized_keys_path = write_authorized_keys(_tmp.path(), &[&key_a, &key_b]);
+
+    let server_config = ServerConfig {
+        bind: server_addr,
+        journal: journal_path.clone(),
+        accounts: 4,
+        instruments: 4,
+        authorized_keys: authorized_keys_path,
+        ..ServerConfig::default()
+    };
+
+    let shutdown = Arc::new(AtomicBool::new(false));
+    let server_shutdown = Arc::clone(&shutdown);
+    let server_handle = thread::Builder::new()
+        .name("test-rumcast-server-multi".into())
+        .spawn(move || {
+            run_rumcast(
+                server_config,
+                RumcastConfig { bind: server_addr },
+                server_shutdown,
+            )
+            .map_err(|e| e.to_string())
+        })
+        .unwrap();
+
+    thread::sleep(Duration::from_millis(500));
+
+    // Spawn one thread per client. Each uses a distinct session_id,
+    // signing key, X25519 seed, order_id, and account_id so cross-
+    // routing leakage manifests as a wrong-client BatchEnd or no
+    // BatchEnd at all.
+    let client_a = thread::spawn(move || {
+        run_one_client(
+            server_addr,
+            key_a,
+            /*session_id*/ 0xAAAA_AAAA,
+            [0xC1; 32],
+            /*order_id*/ 1,
+            /*account_id*/ 1,
+        )
+    });
+    let client_b = thread::spawn(move || {
+        run_one_client(
+            server_addr,
+            key_b,
+            /*session_id*/ 0xBBBB_BBBB,
+            [0xC2; 32],
+            /*order_id*/ 2,
+            /*account_id*/ 2,
+        )
+    });
+
+    let got_a = client_a.join().expect("client A panicked");
+    let got_b = client_b.join().expect("client B panicked");
+
+    // Cleanup.
+    shutdown.store(true, Ordering::Release);
+    let server_join_deadline = Instant::now() + Duration::from_secs(2);
+    while !server_handle.is_finished() && Instant::now() < server_join_deadline {
+        thread::sleep(Duration::from_millis(50));
+    }
+    if server_handle.is_finished() {
+        let _ = server_handle.join();
+    }
+
+    assert!(
+        got_a,
+        "client A did not receive its BatchEnd — multi-client routing broken on the A side"
+    );
+    assert!(
+        got_b,
+        "client B did not receive its BatchEnd — multi-client routing broken on the B side"
     );
 }

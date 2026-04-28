@@ -4,40 +4,24 @@
 //! # What this is for
 //!
 //! Lets the LAN bench suite (`melin-bench`) compare TCP versus rumcast
-//! on the same engine pipeline. Phase 3 (in-progress) scope:
+//! on the same engine pipeline. Phase 3 scope:
 //!
 //! - Standalone primary only (no replica, no promotion).
 //! - **Pure-UDP authentication** via Ed25519 challenge-response +
 //!   X25519 ECDH, with per-message BLAKE3 keyed-MAC envelopes on the
 //!   data plane. Same Ed25519 identities as the TCP path
 //!   (`authorized_keys`).
-//! - **Per-session inbound state via `MuxedReceiver` / `MuxedSender`.**
-//!   Each client picks its own random `session_id`; the muxed receiver
-//!   allocates a per-session `SubscriptionLog` lazily on first contact,
-//!   the muxed sender allocates a per-session `PublicationLog` at the
-//!   handshake-completion event. Bounded by `MAX_SESSIONS`.
+//! - **Multi-client demux.** Each client picks its own random
+//!   `session_id`; the muxed receiver allocates a per-session
+//!   `SubscriptionLog` lazily on first contact, the muxed sender
+//!   allocates a per-session `PublicationLog` at the handshake-
+//!   completion event. Bounded by `MAX_SESSIONS`. Each session's
+//!   response dst is auto-discovered from the source addr of the
+//!   client's first inbound frame — this requires the client to use
+//!   `melin_rumcast::shared_udp::SharedUdp` so its publisher source
+//!   addr equals its subscriber addr (single socket per peer).
 //! - Kernel UDP only (rumcast's `KernelUdp`). DPDK rumcast backend is
 //!   a separate effort tracked under the rumcast crate's deferred list.
-//!
-//! # Known limitation — second client silently fails
-//!
-//! All per-session response publications use the same static
-//! `RumcastConfig::client_addr` as their dst. With one client this
-//! works. With two:
-//!
-//! - Client 1 connects → session 1 publog.dst = client_addr (client 1's
-//!   resp port).
-//! - Client 2 connects → session 2 publog.dst = client_addr (same!).
-//! - Session 2's response frames arrive at client 1's resp socket;
-//!   `SubscriptionLog`'s session-id check drops them (`session_id` 2
-//!   != client 1's expected 1). Client 2 sees nothing — forever.
-//!
-//! Fixing this requires either (a) a rumcast-level shared-transport
-//! API so each peer can use one socket for both publication and
-//! subscription (the receiver's `effective_dst` would then route
-//! correctly), or (b) a protocol-level resp-port advertisement in
-//! the handshake. Both are larger pieces of work — tracked as a
-//! follow-up to Phase 3, NOT closed out by this commit.
 //!
 //! # Wiring (at a glance)
 //!
@@ -179,12 +163,6 @@ pub struct RumcastConfig {
     /// Reuses the existing `--bind` ServerConfig flag so users don't
     /// have to learn a new knob.
     pub bind: SocketAddr,
-    /// Where to send response Data frames. Used as the dst for
-    /// EVERY per-session response publication — see the "Known
-    /// limitation" section in the module doc. With more than one
-    /// client, all responses go here; the second client and beyond
-    /// silently get nothing.
-    pub client_addr: SocketAddr,
 }
 
 // ---------------------------------------------------------------------------
@@ -237,7 +215,6 @@ pub fn run_rumcast(
 ) -> Result<(), Box<dyn std::error::Error>> {
     info!(
         bind = %rumcast_config.bind,
-        client = %rumcast_config.client_addr,
         "starting rumcast standalone server"
     );
 
@@ -325,10 +302,6 @@ pub fn run_rumcast(
         max_sessions: MAX_SESSIONS,
     };
     let muxed_sender = MuxedSender::new(resp_socket, muxed_sender_config);
-    // Outbound dst seed for every per-session response publication.
-    // See `RumcastConfig::client_addr` for why this isn't yet
-    // discovered per-session.
-    let response_dst = rumcast_config.client_addr;
 
     // Shared counters (helpful for bench observability; cheap when nobody reads).
     let counters = Arc::new(Counters::new());
@@ -404,7 +377,6 @@ pub fn run_rumcast(
                     session_translator(
                         muxed_receiver,
                         muxed_sender,
-                        response_dst,
                         &mut input_producer,
                         response_consumer,
                         cursor,
@@ -467,7 +439,6 @@ pub fn run_rumcast(
 fn session_translator(
     mut muxed_receiver: MuxedReceiver<KernelUdp>,
     mut muxed_sender: MuxedSender<KernelUdp>,
-    response_dst: SocketAddr,
     input_producer: &mut melin_disruptor::ring::Producer<InputSlot>,
     mut output_consumer: melin_disruptor::ring::Consumer<OutputSlot>,
     journal_cursor: Arc<melin_disruptor::padding::Sequence>,
@@ -509,7 +480,7 @@ fn session_translator(
         // can't evict from `muxed_receiver` while inside its `poll`
         // (would need &mut while holding &), so apply post-poll.
         let mut to_evict: Vec<u32> = Vec::new();
-        let drained = muxed_receiver.poll(64 * 1024, |session_id, _src_addr, view| {
+        let drained = muxed_receiver.poll(64 * 1024, |session_id, src_addr, view| {
             let FrameView::Data { header, payload } = view else {
                 return;
             };
@@ -518,7 +489,7 @@ fn session_translator(
             }
             handle_inbound(
                 session_id,
-                response_dst,
+                src_addr,
                 payload,
                 &mut sessions,
                 &authorized_keys,
@@ -630,7 +601,7 @@ fn session_translator(
 #[allow(clippy::too_many_arguments)]
 fn handle_inbound(
     session_id: u32,
-    response_dst: SocketAddr,
+    src_addr: SocketAddr,
     payload: &[u8],
     sessions: &mut HashMap<u32, AuthStage>,
     authorized_keys: &AuthorizedKeys,
@@ -666,10 +637,14 @@ fn handle_inbound(
             // we need it to send Challenge. If `MuxedSender` refuses
             // (max_sessions hit), drop the kickoff and bail.
             //
-            // `response_dst` is the static dst from `RumcastConfig`
-            // (single-client only on the outbound side — see the
-            // doc on `RumcastConfig::client_addr` for context).
-            let pub_log = match muxed_sender.create_session(session_id, response_dst) {
+            // `src_addr` is the auto-discovered source addr from the
+            // client's first inbound frame. With a `SharedUdp`-based
+            // client, that's also the client's subscriber address —
+            // so responses route correctly back to the same socket.
+            // Two-socket clients would land here with the publisher
+            // port, NOT the subscriber port; #30 / docs require
+            // SharedUdp on the client side.
+            let pub_log = match muxed_sender.create_session(session_id, src_addr) {
                 Ok(log) => log,
                 Err(e) => {
                     debug!(

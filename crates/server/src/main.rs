@@ -154,16 +154,18 @@ fn dpdk_num_queues(_cfg: &ServerConfig) -> u16 {
 
 #[cfg(feature = "rumcast")]
 fn rumcast_config_from(cfg: &ServerConfig) -> melin_server::rumcast_transport::RumcastConfig {
-    melin_server::rumcast_transport::RumcastConfig {
-        // Server's order-entry bind reuses the existing --bind flag —
-        // clients send orders to this address.
-        bind: cfg.bind,
-        // Client address responses are unicast to. Hard-required for
-        // Phase 1 (single-client). Multi-client routing comes in
-        // Phase 3, at which point the address will be learned from
-        // incoming Setup frames.
-        client_addr: cfg
-            .rumcast_client_addr
-            .expect("--rumcast-client-addr is required with --features rumcast in Phase 1"),
+    // Phase 3: each client's response dst is auto-discovered from the
+    // source addr of its first inbound frame (works correctly when the
+    // client uses `melin_rumcast::shared_udp::SharedUdp`). The
+    // `--rumcast-client-addr` CLI flag still parses for backwards
+    // compat but is silently ignored — log a warn if it was set so
+    // operators know they can drop it.
+    if let Some(addr) = cfg.rumcast_client_addr {
+        tracing::warn!(
+            ignored_client_addr = %addr,
+            "--rumcast-client-addr is no longer used (per-session dst is auto-discovered); \
+             you can drop the flag"
+        );
     }
+    melin_server::rumcast_transport::RumcastConfig { bind: cfg.bind }
 }

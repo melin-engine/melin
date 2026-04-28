@@ -27,8 +27,8 @@ use melin_protocol::session::{ClientHandshake, encode_envelope, verify_and_decod
 use melin_rumcast::pub_log::{PublicationConfig, PublicationLog};
 use melin_rumcast::receiver::{ReceiverConfig, ReceiverLoop};
 use melin_rumcast::sender::{SenderConfig, SenderLoop};
+use melin_rumcast::shared_udp::SharedUdp;
 use melin_rumcast::sub_log::{SubscriptionConfig, SubscriptionLog};
-use melin_rumcast::transport::KernelUdp;
 use melin_rumcast::wire::{FrameView, data_flags};
 
 use crate::generator::{GeneratorConfig, OrderFlowGenerator};
@@ -102,7 +102,18 @@ pub fn run_rumcast_roundtrip(cfg: RumcastBenchConfig) {
     let frames = generator.generate_frames(total_msgs);
     eprintln!("pre-generated {} order frames", frames.len());
 
-    // ---- Rumcast endpoints ----
+    // ---- Rumcast endpoints (single shared socket) ----
+    //
+    // SharedUdp gives us one bound port with two `UdpTransport`
+    // halves. The orders Sender uses the send half; the resp
+    // Receiver uses the recv half. Internal demux routes
+    // Data/Setup/Heartbeat to the recv half, NAK/StatusMessage to
+    // the send half. Shared socket means the bench's orders
+    // publisher source addr equals its resp subscriber addr — so
+    // the server's auto-discovered per-session response dst lands
+    // back here correctly.
+    let shared = SharedUdp::bind(cfg.bind).expect("shared socket bind");
+    let (send_half, recv_half) = shared.split();
 
     // Outbound: orders publication → server.
     let orders_pub = Arc::new(
@@ -116,13 +127,11 @@ pub fn run_rumcast_roundtrip(cfg: RumcastBenchConfig) {
         .expect("orders publication config"),
     );
     orders_pub.set_publisher_limit(u64::MAX); // single client; we trust ourselves
-    let orders_socket =
-        KernelUdp::bind("0.0.0.0:0".parse::<SocketAddr>().unwrap()).expect("orders socket bind");
     let mut orders_send_config = SenderConfig::defaults(cfg.server_addr);
     orders_send_config.setup_interval = Duration::from_millis(100);
     orders_send_config.heartbeat_interval = Duration::from_millis(50);
     orders_send_config.max_drain_per_tick = 1024 * 1024;
-    let orders_sender = SenderLoop::new(Arc::clone(&orders_pub), orders_socket, orders_send_config);
+    let orders_sender = SenderLoop::new(Arc::clone(&orders_pub), send_half, orders_send_config);
 
     // Inbound: responses subscription ← server.
     let resp_sub = Arc::new(
@@ -134,13 +143,12 @@ pub fn run_rumcast_roundtrip(cfg: RumcastBenchConfig) {
         })
         .expect("responses subscription config"),
     );
-    let resp_socket = KernelUdp::bind(cfg.bind).expect("responses socket bind");
     let mut resp_recv_config = ReceiverConfig::defaults(cfg.server_addr, BENCH_RECEIVER_ID);
     resp_recv_config.sm_interval = Duration::from_millis(2);
     resp_recv_config.nak_backoff_min = Duration::from_micros(50);
     resp_recv_config.nak_backoff_jitter = Duration::from_micros(50);
     resp_recv_config.max_recv_per_tick = 1024;
-    let resp_receiver = ReceiverLoop::new(Arc::clone(&resp_sub), resp_socket, resp_recv_config);
+    let resp_receiver = ReceiverLoop::new(Arc::clone(&resp_sub), recv_half, resp_recv_config);
 
     // ---- Background tick threads ----
     let shutdown = Arc::new(AtomicBool::new(false));
