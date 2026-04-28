@@ -1,21 +1,22 @@
-//! Single-client rumcast roundtrip bench. Mirrors the TCP/DPDK
-//! roundtrip pattern but uses a rumcast publication for orders out and
-//! a rumcast subscription for responses in. Reuses
-//! [`crate::generator::OrderFlowGenerator`] and `melin-protocol`'s
-//! codec — only the I/O substrate differs from the TCP path.
+//! Multi-client rumcast roundtrip bench. Mirrors the TCP/DPDK
+//! roundtrip pattern but uses a [`MuxedSender`] for outbound orders
+//! and a [`MuxedReceiver`] for inbound responses. Each client gets its
+//! own `session_id`, [`PublicationLog`], envelope token, and inflight
+//! deque — same primitives the server already uses on its side, so
+//! one bench process can drive N concurrent authenticated sessions
+//! through one shared UDP socket.
 //!
-//! Phase 2 wire-up: full pure-UDP authentication (Ed25519 plus
-//! X25519 plus per-message BLAKE3 keyed-MAC envelopes) before the
-//! measured roundtrip phase begins. The handshake itself runs once
-//! at startup and is amortized over the entire run, so the
-//! steady-state numbers the bench reports reflect data-plane MAC
-//! verify cost only.
+//! Threading: a single main thread drives both muxer ticks and the
+//! bench logic. The ticks are cheap when nothing is pending, and
+//! co-locating them with the order-generation loop avoids the
+//! scheduler-jitter window between bg-tick and main-bench threads
+//! that the original Phase-1 single-client design tolerated.
 
+use std::collections::VecDeque;
+use std::collections::hash_map::HashMap;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::thread;
 use std::time::{Duration, Instant};
 
 use ed25519_dalek::SigningKey;
@@ -24,39 +25,35 @@ use hdrhistogram::Histogram;
 use melin_protocol::codec;
 use melin_protocol::message::{Request, ResponseKind};
 use melin_protocol::session::{ClientHandshake, encode_envelope, verify_and_decode_envelope};
-use melin_rumcast::pub_log::{PublicationConfig, PublicationLog};
-use melin_rumcast::receiver::{ReceiverConfig, ReceiverLoop};
-use melin_rumcast::sender::{SenderConfig, SenderLoop};
+use melin_rumcast::flow_control::FlowControl;
+use melin_rumcast::muxed_receiver::{MuxedReceiver, MuxedReceiverConfig};
+use melin_rumcast::muxed_sender::{MuxedSender, MuxedSenderConfig};
+use melin_rumcast::pub_log::PublicationLog;
 use melin_rumcast::shared_udp::SharedUdp;
-use melin_rumcast::sub_log::{SubscriptionConfig, SubscriptionLog};
 use melin_rumcast::wire::{FrameView, data_flags};
 
 use crate::generator::{GeneratorConfig, OrderFlowGenerator};
 
 // MUST match the constants in `melin-server/src/rumcast_transport.rs`.
-// The two ends share the wire format; if these drift, the bench gets
-// nothing back. `session_id` is NOT a constant — each bench run picks
-// a fresh random 32-bit value (Aeron convention) so concurrent bench
-// instances against one server don't collide.
 const RUMCAST_ORDERS_STREAM: u32 = 1;
 const RUMCAST_RESP_STREAM: u32 = 2;
 const TERM_LENGTH: u32 = 1024 * 1024;
 const MTU: u32 = 1408;
 const INITIAL_TERM_ID: u32 = 1;
 
-/// Per-receiver id used in our SMs back to the server. Phase 1 single
-/// client; Phase 3 will allocate per-client.
+/// Per-receiver id used in our SMs back to the server. Multi-client
+/// uses a single MuxedReceiver, so we still send a single
+/// `receiver_id` — the server side disambiguates per-session via
+/// `session_id`, not `receiver_id`, and `flow_control = Min` doesn't
+/// care about receiver count.
 const BENCH_RECEIVER_ID: u64 = 1;
 
-/// Reusable envelope buffer size. The largest inner frame is a
-/// codec::encode_request output (≤168B per the codec doc) plus the
-/// 24-byte envelope header — 2 KiB gives generous headroom and one
-/// allocation per bench run.
+/// Reusable envelope buffer size. Largest inner frame is
+/// codec::encode_request output (≤168B) plus 24-byte envelope header.
 const ENVELOPE_BUF_SIZE: usize = 2048;
 
-/// Upper bound on the wait between handshake send and receipt of
-/// each control reply. Far longer than any realistic LAN RTT — bails
-/// out if the server isn't responding rather than hanging the bench.
+/// Upper bound on a single handshake step. Far longer than any
+/// realistic LAN RTT — bails out if the server isn't responding.
 const HANDSHAKE_DEADLINE: Duration = Duration::from_secs(10);
 
 pub struct RumcastBenchConfig {
@@ -65,256 +62,310 @@ pub struct RumcastBenchConfig {
     pub pairs: usize,
     pub window: usize,
     pub warmup: usize,
+    /// Number of concurrent rumcast sessions. Each gets its own random
+    /// `session_id`, handshake, envelope token, and per-session
+    /// inflight deque. Comparable to the TCP path's `--clients`.
+    pub clients: usize,
     pub accounts: u32,
     pub instruments: u32,
     pub json_path: Option<PathBuf>,
-    /// Busy-spin between tick iterations instead of the default 10µs
-    /// sleep. Lower latency on isolated cores; burns a CPU. Match the
+    /// Busy-spin between iterations instead of the default 10µs sleep.
+    /// Lower latency on isolated cores; burns a CPU. Match the
     /// server's idle strategy for apples-to-apples comparison.
     pub busy_spin: bool,
     /// Client's long-term Ed25519 identity. The server's
     /// `authorized_keys` file must list this key under a permission
-    /// that allows order submission (e.g. `trader`). Loaded from
-    /// `--key` at the CLI.
+    /// that allows order submission (e.g. `trader`). All N concurrent
+    /// sessions reuse the same identity — same as the TCP multi-client
+    /// path, where every client connection authenticates as the same
+    /// trader pubkey.
     pub signing_key: SigningKey,
 }
 
 pub fn run_rumcast_roundtrip(cfg: RumcastBenchConfig) {
-    // Per-connect random session_id. Each bench instance picks
-    // independently; the 32-bit space makes collisions across
-    // concurrent benches against the same server astronomically
-    // unlikely. Same convention Aeron uses for publication identity.
-    let session_id = generate_session_id();
+    assert!(cfg.clients >= 1, "clients must be >= 1");
+
+    // Each session gets a distinct session_id. Picking a random base
+    // and incrementing keeps inter-bench collisions astronomically
+    // unlikely while guaranteeing intra-bench uniqueness without
+    // collision-retry logic.
+    let base_session_id = generate_session_id();
+    let session_ids: Vec<u32> = (0..cfg.clients)
+        .map(|i| base_session_id.wrapping_add(i as u32))
+        .collect();
+    let session_idx: HashMap<u32, usize> = session_ids
+        .iter()
+        .enumerate()
+        .map(|(i, sid)| (*sid, i))
+        .collect();
     eprintln!(
-        "rumcast roundtrip: server={} bind={} session_id={:#010x} pairs={} window={} warmup={}",
-        cfg.server_addr, cfg.bind, session_id, cfg.pairs, cfg.window, cfg.warmup
+        "rumcast roundtrip: server={} bind={} clients={} session_id_base={:#010x} pairs={} window={} warmup={}",
+        cfg.server_addr, cfg.bind, cfg.clients, base_session_id, cfg.pairs, cfg.window, cfg.warmup
     );
 
-    // ---- Pre-generate frames (same as TCP/DPDK paths) ----
+    // ---- Pre-generate frames per client (disjoint order_id ranges) ----
     //
-    // OrderFlowGenerator returns Vec<Vec<u8>> where each inner vec is
-    // the codec output WITHOUT the 4-byte length prefix (see
-    // generator.rs:295-297). The TCP path then prepends the prefix
-    // before sending; rumcast doesn't, because the rumcast DataFrame
-    // already provides per-message framing. So we publish each inner
-    // vec directly into the rumcast publication.
-    let total_msgs = cfg.warmup + cfg.pairs * 2;
-    let mut generator = OrderFlowGenerator::new(GeneratorConfig {
-        num_accounts: cfg.accounts.max(1),
-        num_instruments: cfg.instruments.max(1),
-        start_order_id: 1,
-        ..Default::default()
-    });
-    let frames = generator.generate_frames(total_msgs);
-    eprintln!("pre-generated {} order frames", frames.len());
+    // Each client gets `(warmup + pairs_per_client * 2)` frames, with
+    // `start_order_id` offset so concurrent clients can't submit the
+    // same order_id (the engine would reject duplicates as
+    // self-trades or ignore them). Mirrors the TCP roundtrip path's
+    // partitioning logic in `run_uring_roundtrip`.
+    let pairs_per_client = cfg.pairs / cfg.clients;
+    let remainder = cfg.pairs % cfg.clients;
+    let mut per_client_frames: Vec<Vec<Vec<u8>>> = Vec::with_capacity(cfg.clients);
+    let mut order_id_offset: u64 = 0;
+    for client_id in 0..cfg.clients {
+        let client_pairs = if client_id == cfg.clients - 1 {
+            pairs_per_client + remainder
+        } else {
+            pairs_per_client
+        };
+        let total_orders = cfg.warmup + client_pairs * 2;
+        let mut flow = OrderFlowGenerator::new(GeneratorConfig {
+            num_accounts: cfg.accounts.max(1),
+            num_instruments: cfg.instruments.max(1),
+            start_order_id: order_id_offset + 1,
+            ..Default::default()
+        });
+        per_client_frames.push(flow.generate_frames(total_orders));
+        order_id_offset += total_orders as u64;
+    }
+    let total_msgs: usize = per_client_frames.iter().map(|v| v.len()).sum();
+    eprintln!(
+        "pre-generated {total_msgs} order frames across {} clients",
+        cfg.clients
+    );
 
-    // ---- Rumcast endpoints (single shared socket) ----
+    // ---- Rumcast endpoints (single shared socket, multiplexed) ----
     //
-    // SharedUdp gives us one bound port with two `UdpTransport`
-    // halves. The orders Sender uses the send half; the resp
-    // Receiver uses the recv half. Internal demux routes
-    // Data/Setup/Heartbeat to the recv half, NAK/StatusMessage to
-    // the send half. Shared socket means the bench's orders
-    // publisher source addr equals its resp subscriber addr — so
-    // the server's auto-discovered per-session response dst lands
-    // back here correctly.
+    // SharedUdp gives one bound port with two `UdpTransport` halves.
+    // MuxedSender owns the send half + N PublicationLogs; MuxedReceiver
+    // owns the recv half + lazy SubscriptionLogs. Internal demux on the
+    // shared socket routes Data/Setup/Heartbeat → recv half,
+    // NAK/StatusMessage → send half.
     let shared = SharedUdp::bind(cfg.bind).expect("shared socket bind");
     let (send_half, recv_half) = shared.split();
 
-    // Outbound: orders publication → server.
-    let orders_pub = Arc::new(
-        PublicationLog::new(PublicationConfig {
-            session_id,
+    let max_sessions = (cfg.clients as u32).saturating_add(4);
+    let mut muxed_sender = MuxedSender::new(
+        send_half,
+        MuxedSenderConfig {
             stream_id: RUMCAST_ORDERS_STREAM,
             initial_term_id: INITIAL_TERM_ID,
             term_length: TERM_LENGTH,
             mtu: MTU,
-        })
-        .expect("orders publication config"),
+            setup_interval: Duration::from_millis(100),
+            heartbeat_interval: Duration::from_millis(50),
+            max_drain_per_tick: 1024 * 1024,
+            max_control_per_tick: 32,
+            // Min flow control: pace publisher to slowest receiver.
+            // For the single-server setup we have one receiver per
+            // session, so `Min` and `Max` are equivalent.
+            flow_control: FlowControl::Min,
+            max_sessions,
+        },
     );
-    orders_pub.set_publisher_limit(u64::MAX); // single client; we trust ourselves
-    let mut orders_send_config = SenderConfig::defaults(cfg.server_addr);
-    orders_send_config.setup_interval = Duration::from_millis(100);
-    orders_send_config.heartbeat_interval = Duration::from_millis(50);
-    orders_send_config.max_drain_per_tick = 1024 * 1024;
-    let orders_sender = SenderLoop::new(Arc::clone(&orders_pub), send_half, orders_send_config);
 
-    // Inbound: responses subscription ← server.
-    let resp_sub = Arc::new(
-        SubscriptionLog::new(SubscriptionConfig {
-            session_id,
+    let mut muxed_receiver = MuxedReceiver::new(
+        recv_half,
+        MuxedReceiverConfig {
             stream_id: RUMCAST_RESP_STREAM,
+            receiver_id: BENCH_RECEIVER_ID,
             initial_term_id: INITIAL_TERM_ID,
             term_length: TERM_LENGTH,
-        })
-        .expect("responses subscription config"),
+            sm_interval: Duration::from_millis(2),
+            nak_backoff_min: Duration::from_micros(50),
+            nak_backoff_jitter: Duration::from_micros(50),
+            max_recv_per_tick: 1024,
+            max_sessions,
+        },
     );
-    let mut resp_recv_config = ReceiverConfig::defaults(cfg.server_addr, BENCH_RECEIVER_ID);
-    resp_recv_config.sm_interval = Duration::from_millis(2);
-    resp_recv_config.nak_backoff_min = Duration::from_micros(50);
-    resp_recv_config.nak_backoff_jitter = Duration::from_micros(50);
-    resp_recv_config.max_recv_per_tick = 1024;
-    let resp_receiver = ReceiverLoop::new(Arc::clone(&resp_sub), recv_half, resp_recv_config);
 
-    // ---- Background tick threads ----
-    let shutdown = Arc::new(AtomicBool::new(false));
-    let mut handles: Vec<thread::JoinHandle<()>> = Vec::new();
+    // Allocate per-session outbound publogs upfront (the muxer holds
+    // its own clone; we keep ours for try_claim on the hot path).
+    // SubscriptionLogs on the receive side are auto-allocated lazily
+    // on first inbound frame — no upfront call needed.
+    let pub_logs: Vec<Arc<PublicationLog>> = session_ids
+        .iter()
+        .map(|sid| {
+            let log = muxed_sender
+                .create_session(*sid, cfg.server_addr)
+                .expect("create_session");
+            // Single-client per session; we trust ourselves to keep
+            // the producer ahead of the receiver. Removes the wait-
+            // for-first-SM stall during handshake.
+            log.set_publisher_limit(u64::MAX);
+            log
+        })
+        .collect();
 
+    // Force initial Setup frames out so the server allocates per-
+    // session state ASAP rather than waiting one full setup_interval.
+    for sid in &session_ids {
+        muxed_sender.send_setup_now(*sid);
+    }
+
+    // ---- Per-session handshakes (sequential) ----
+    //
+    // Each session does the four-message handshake independently. On
+    // loopback this takes a few ms per session; sequential keeps the
+    // code simple and the muxer's single-thread contract intact.
     let busy_spin = cfg.busy_spin;
-    {
-        let shutdown = Arc::clone(&shutdown);
-        let mut sender = orders_sender;
-        handles.push(
-            thread::Builder::new()
-                .name("rumcast-bench-orders-send".into())
-                .spawn(move || tick_loop(&shutdown, busy_spin, || sender.tick()))
-                .expect("spawn orders-send"),
+    let mut session_tokens: Vec<[u8; 32]> = Vec::with_capacity(cfg.clients);
+    let handshake_start = Instant::now();
+    for (i, sid) in session_ids.iter().enumerate() {
+        let token = perform_handshake(
+            &cfg.signing_key,
+            *sid,
+            &pub_logs[i],
+            &mut muxed_sender,
+            &mut muxed_receiver,
         );
+        session_tokens.push(token);
     }
-    {
-        let shutdown = Arc::clone(&shutdown);
-        let mut receiver = resp_receiver;
-        handles.push(
-            thread::Builder::new()
-                .name("rumcast-bench-resp-recv".into())
-                .spawn(move || tick_loop(&shutdown, busy_spin, || receiver.tick()))
-                .expect("spawn resp-recv"),
-        );
-    }
+    eprintln!(
+        "handshakes complete ({} sessions, {:.1}ms); entering measured phase",
+        cfg.clients,
+        handshake_start.elapsed().as_secs_f64() * 1000.0
+    );
 
-    // ---- Handshake (Heartbeat → Challenge → ChallengeResponse → ServerReady) ----
-    //
-    // Runs once before the measured phase. The `session_token`
-    // returned here is the BLAKE3 keyed-MAC key both sides use for
-    // the rest of the run; loss of the key zeroizes via x25519-dalek's
-    // ZeroizeOnDrop when the ClientHandshake helper is consumed.
-    let session_token = perform_handshake(&cfg.signing_key, &orders_pub, &resp_sub);
-    eprintln!("handshake complete; entering measured phase");
+    // ---- Per-session bench state ----
+    let mut inflight: Vec<VecDeque<Instant>> = (0..cfg.clients)
+        .map(|_| VecDeque::with_capacity(cfg.window))
+        .collect();
+    let mut outbound_seq: Vec<u64> = vec![0; cfg.clients];
+    let mut last_inbound_seq: Vec<u64> = vec![0; cfg.clients];
+    let mut total_sent: Vec<usize> = vec![0; cfg.clients];
+    let mut total_received: Vec<usize> = vec![0; cfg.clients];
+    let mut warmup_record: Vec<usize> = vec![0; cfg.clients];
+    let per_client_total: Vec<usize> = per_client_frames.iter().map(|v| v.len()).collect();
 
-    // ---- Bench loop (windowed pipelining) ----
-    //
-    // Mirror the TCP path: maintain `window` orders in flight at all
-    // times. Push `inflight_send_ts.push_back(now)` on send, pop on
-    // BatchEnd recv, record latency. Skip the first `warmup` samples.
-    let mut inflight: std::collections::VecDeque<Instant> =
-        std::collections::VecDeque::with_capacity(cfg.window);
     let mut hist =
         Histogram::<u64>::new_with_bounds(1, 10_000_000_000, 3).expect("histogram bounds");
-    let mut total_sent = 0usize;
-    let mut total_received = 0usize;
-    let mut bench_start = Instant::now();
-
-    // Per-session counters tracked locally — sender increments
-    // outbound_seq before each publish; receiver advances
-    // last_inbound_seq on each accepted envelope.
-    let mut outbound_seq: u64 = 0;
-    let mut last_inbound_seq: u64 = 0;
-
-    // Reusable envelope buffer. Sized for any inner payload + the
-    // 24-byte envelope header. The pre-generated frames are all
-    // codec::encode_request output — at most ~140B per the codec
-    // doc, well under MTU. 2 KiB is generous and one allocation.
     let mut envelope_buf = vec![0u8; ENVELOPE_BUF_SIZE];
+    let mut bench_start = Instant::now();
+    let mut warmup_done = cfg.warmup == 0;
 
-    while total_received < total_msgs {
-        // Push orders up to the window cap.
-        while inflight.len() < cfg.window && total_sent < total_msgs {
-            let inner = &frames[total_sent];
-            outbound_seq += 1;
-            let env_len = encode_envelope(
-                &session_token,
-                session_id,
-                outbound_seq,
-                inner,
-                &mut envelope_buf,
-            )
-            .expect("envelope buf large enough");
-            // Spin-claim — single producer; backpressure rare.
-            loop {
-                match orders_pub.try_claim(env_len as u32) {
-                    Ok(mut claim) => {
-                        claim
-                            .payload_mut()
-                            .copy_from_slice(&envelope_buf[..env_len]);
-                        claim.publish(data_flags::UNFRAGMENTED);
-                        break;
+    // ---- Hot loop ----
+    //
+    // Per iteration: tick muxers, top up each session's outbound
+    // window, drain any inbound responses across all sessions. Single
+    // thread keeps muxer access lock-free (`MuxedSender::tick` /
+    // `MuxedReceiver::tick` need `&mut self`).
+    let mut total_received_overall = 0usize;
+    while total_received_overall < total_msgs {
+        muxed_sender.tick();
+        muxed_receiver.tick();
+
+        // Top up each session's outbound window.
+        for s in 0..cfg.clients {
+            let target = per_client_total[s];
+            while inflight[s].len() < cfg.window && total_sent[s] < target {
+                let inner = &per_client_frames[s][total_sent[s]];
+                outbound_seq[s] += 1;
+                let env_len = encode_envelope(
+                    &session_tokens[s],
+                    session_ids[s],
+                    outbound_seq[s],
+                    inner,
+                    &mut envelope_buf,
+                )
+                .expect("envelope buf large enough");
+                // Spin-claim. publisher_limit is u64::MAX so the only
+                // way claim fails is PayloadTooLarge — programmer
+                // error, not runtime.
+                loop {
+                    match pub_logs[s].try_claim(env_len as u32) {
+                        Ok(mut claim) => {
+                            claim
+                                .payload_mut()
+                                .copy_from_slice(&envelope_buf[..env_len]);
+                            claim.publish(data_flags::UNFRAGMENTED);
+                            break;
+                        }
+                        Err(_) => std::hint::spin_loop(),
                     }
-                    Err(_) => std::hint::spin_loop(),
                 }
-            }
-            inflight.push_back(Instant::now());
-            total_sent += 1;
-            if total_sent == cfg.warmup {
-                // Reset the bench start so throughput excludes warmup.
-                bench_start = Instant::now();
-                hist.reset();
-                eprintln!("warmup complete, starting measured phase");
+                inflight[s].push_back(Instant::now());
+                total_sent[s] += 1;
             }
         }
 
-        // Drain responses up to window's worth.
+        // Drain responses for all sessions in one poll pass. The poll
+        // callback routes by `session_id` and updates per-session
+        // inflight state.
         let mut drained_now = 0usize;
-        resp_sub.poll(64 * 1024, |view| {
+        muxed_receiver.poll(64 * 1024, |sid, _src, view| {
             if let FrameView::Data { header, payload } = view
                 && header.common.flags & data_flags::PADDING == 0
             {
-                // Envelope verify first — drops anything tampered
-                // with, replayed, or addressed to a different
-                // session. Replay-state tracker advances on success.
+                let s = match session_idx.get(&sid) {
+                    Some(i) => *i,
+                    None => return, // stray frame from a foreign session
+                };
                 let (seq, decoded_inner) = match verify_and_decode_envelope(
-                    &session_token,
-                    session_id,
-                    last_inbound_seq,
+                    &session_tokens[s],
+                    sid,
+                    last_inbound_seq[s],
                     payload,
                 ) {
                     Ok(x) => x,
                     Err(e) => {
-                        // At steady state every server response is
-                        // a valid envelope. A failure here means
-                        // either a stray pre-handshake frame or a
-                        // real bug — surface it loud.
-                        eprintln!("envelope verify failed: {e:?}");
+                        eprintln!("envelope verify failed (session {sid:#010x}): {e:?}");
                         return;
                     }
                 };
-                last_inbound_seq = seq;
+                last_inbound_seq[s] = seq;
 
                 let kind = match codec::decode_response(decoded_inner) {
                     Ok(k) => k,
                     Err(e) => {
-                        eprintln!("decode_response: {e:?}");
+                        eprintln!("decode_response (session {sid:#010x}): {e:?}");
                         return;
                     }
                 };
                 if matches!(kind, ResponseKind::BatchEnd)
-                    && let Some(sent_ts) = inflight.pop_front()
+                    && let Some(sent_ts) = inflight[s].pop_front()
                 {
                     let latency_ns = sent_ts.elapsed().as_nanos() as u64;
-                    if total_received >= cfg.warmup {
+                    if total_received[s] >= cfg.warmup {
                         let _ = hist.record(latency_ns);
+                    } else {
+                        warmup_record[s] += 1;
                     }
-                    total_received += 1;
+                    total_received[s] += 1;
                     drained_now += 1;
                 }
             }
         });
+        total_received_overall += drained_now;
 
-        // No progress? Either yield (default, friendly to the OS) or
-        // busy-spin (matches `--rumcast-busy-spin`, lowest latency on
-        // an isolated core).
+        // Reset bench_start once every session has drained its warmup
+        // quota. Until then we record into a holding histogram that
+        // gets discarded.
+        if !warmup_done && warmup_record.iter().all(|&n| n >= cfg.warmup) {
+            bench_start = Instant::now();
+            hist.reset();
+            warmup_done = true;
+            eprintln!("warmup complete, starting measured phase");
+        }
+
         if drained_now == 0 {
             if busy_spin {
                 std::hint::spin_loop();
             } else {
-                thread::sleep(Duration::from_micros(10));
+                std::thread::sleep(Duration::from_micros(10));
             }
         }
     }
 
     let elapsed = bench_start.elapsed();
-    let measured = total_msgs - cfg.warmup;
+    let measured = total_msgs - cfg.warmup * cfg.clients;
     println!();
-    println!("=== rumcast roundtrip ({} measured msgs) ===", measured);
+    println!(
+        "=== rumcast roundtrip (clients={}, {} measured msgs) ===",
+        cfg.clients, measured
+    );
     println!("  elapsed:    {:?}", elapsed);
     println!(
         "  throughput: {:.2} K msgs/sec",
@@ -331,6 +382,7 @@ pub fn run_rumcast_roundtrip(cfg: RumcastBenchConfig) {
     if let Some(path) = cfg.json_path.as_ref() {
         let json = serde_json::json!({
             "transport": "rumcast",
+            "clients": cfg.clients,
             "measured_msgs": measured,
             "elapsed_ns": elapsed.as_nanos(),
             "throughput_msgs_per_sec": (measured as f64 / elapsed.as_secs_f64()),
@@ -348,64 +400,32 @@ pub fn run_rumcast_roundtrip(cfg: RumcastBenchConfig) {
             eprintln!("failed to write JSON results to {}: {e}", path.display());
         }
     }
-
-    shutdown.store(true, Ordering::Release);
-    for h in handles {
-        let _ = h.join();
-    }
 }
 
-/// Pick a fresh 32-bit `session_id` for this bench run via the OS
-/// CSPRNG. Two bench instances against the same server pick
-/// independently — the 32-bit space makes accidental collisions
-/// astronomically unlikely (~10^-10 at 65k concurrent peers).
+/// Pick a fresh 32-bit `session_id` via the OS CSPRNG. The bench
+/// allocates `clients` IDs by incrementing from this base.
 fn generate_session_id() -> u32 {
     let mut bytes = [0u8; 4];
     getrandom::fill(&mut bytes).expect("getrandom for session_id");
     u32::from_le_bytes(bytes)
 }
 
-/// Generic tick loop body shared by the bench's sender / receiver
-/// threads. Mirrors `melin_server::rumcast_transport::tick_loop`.
-/// `busy_spin = true` → `spin_loop` hint between ticks (lowest
-/// latency, burns a CPU). `busy_spin = false` → 10µs sleep.
-#[inline]
-fn tick_loop<F: FnMut() -> R, R>(shutdown: &AtomicBool, busy_spin: bool, mut tick: F) {
-    while !shutdown.load(Ordering::Acquire) {
-        let _ = tick();
-        if busy_spin {
-            std::hint::spin_loop();
-        } else {
-            thread::sleep(Duration::from_micros(10));
-        }
-    }
-}
-
-/// Run the four-message rumcast handshake:
+/// Run the four-message handshake for one session over the muxer.
 ///
-/// 1. Bench → server: `Request::Heartbeat` (kickoff — UDP has no
-///    `accept` event for the server to react to, so the client has
-///    to speak first).
-/// 2. Server → bench: `ResponseKind::Challenge { nonce, server_eph }`.
-/// 3. Bench → server: `Request::ChallengeResponse { sig, pubkey,
-///    client_eph }` signed via [`ClientHandshake::finish`].
-/// 4. Server → bench: `ResponseKind::ServerReady`.
-///
-/// Returns the per-session BLAKE3 keyed-MAC token both sides have
-/// derived from the X25519 ECDH + KDF.
+/// Mirrors the single-session helper but operates through the muxed
+/// primitives so we don't have to expose per-session
+/// `SubscriptionLog` Arcs from the receiver. Drives ticks inline.
 ///
 /// Panics on protocol error or timeout — the bench is a benchmark
-/// tool, not a production client; if the handshake doesn't complete
-/// cleanly there's nothing useful to measure.
+/// tool, not a production client; if any single session can't
+/// authenticate there's nothing useful to measure.
 fn perform_handshake(
     signing_key: &SigningKey,
-    orders_pub: &PublicationLog,
-    resp_sub: &SubscriptionLog,
+    session_id: u32,
+    pub_log: &PublicationLog,
+    muxed_sender: &mut MuxedSender<melin_rumcast::shared_udp::SharedUdpSend>,
+    muxed_receiver: &mut MuxedReceiver<melin_rumcast::shared_udp::SharedUdpRecv>,
 ) -> [u8; 32] {
-    // Source 32 bytes of CSPRNG-grade randomness for the X25519
-    // ephemeral. getrandom blocks on a freshly-booted Linux kernel
-    // until enough entropy is available — fine for our use case
-    // (one-shot at startup).
     let mut x25519_secret_bytes = [0u8; 32];
     getrandom::fill(&mut x25519_secret_bytes).expect("getrandom for X25519 ephemeral");
 
@@ -415,15 +435,21 @@ fn perform_handshake(
     let mut buf = vec![0u8; 256];
     let written =
         codec::encode_request(&Request::Heartbeat, 0, &mut buf).expect("encode Heartbeat");
-    publish_blocking(orders_pub, &buf[4..written]);
+    publish_blocking(pub_log, &buf[4..written]);
 
-    // Step 2: receive Challenge.
-    let challenge_payload = recv_match(resp_sub, Instant::now() + HANDSHAKE_DEADLINE, |bytes| {
-        matches!(
-            codec::decode_response(bytes),
-            Ok(ResponseKind::Challenge { .. })
-        )
-    })
+    // Step 2: receive Challenge for this session.
+    let challenge_payload = recv_match(
+        muxed_receiver,
+        muxed_sender,
+        session_id,
+        Instant::now() + HANDSHAKE_DEADLINE,
+        |bytes| {
+            matches!(
+                codec::decode_response(bytes),
+                Ok(ResponseKind::Challenge { .. })
+            )
+        },
+    )
     .expect("Challenge from server");
     let (nonce, server_eph) = match codec::decode_response(&challenge_payload).unwrap() {
         ResponseKind::Challenge {
@@ -437,17 +463,22 @@ fn perform_handshake(
     let completed = handshake.finish(&nonce, &server_eph);
     let written = codec::encode_request(&completed.challenge_response, 0, &mut buf)
         .expect("encode ChallengeResponse");
-    publish_blocking(orders_pub, &buf[4..written]);
+    publish_blocking(pub_log, &buf[4..written]);
 
     // Step 4: wait for ServerReady (or AuthFailed).
-    let server_ready_or_failed =
-        recv_match(resp_sub, Instant::now() + HANDSHAKE_DEADLINE, |bytes| {
+    let server_ready_or_failed = recv_match(
+        muxed_receiver,
+        muxed_sender,
+        session_id,
+        Instant::now() + HANDSHAKE_DEADLINE,
+        |bytes| {
             matches!(
                 codec::decode_response(bytes),
                 Ok(ResponseKind::ServerReady) | Ok(ResponseKind::AuthFailed)
             )
-        })
-        .expect("ServerReady or AuthFailed from server");
+        },
+    )
+    .expect("ServerReady or AuthFailed from server");
     match codec::decode_response(&server_ready_or_failed).unwrap() {
         ResponseKind::ServerReady => {}
         ResponseKind::AuthFailed => {
@@ -463,9 +494,10 @@ fn perform_handshake(
     completed.session_token
 }
 
-/// Spin-claim and publish a payload. Used during the handshake
-/// where backpressure is rare (one-shot small frames) and on the
-/// hot path (orders).
+/// Spin-claim and publish a single-fragment payload via a per-session
+/// publog. Used for the four handshake frames where backpressure is
+/// rare. The hot path uses inline `try_claim` to avoid the function-
+/// call indirection.
 fn publish_blocking(pub_log: &PublicationLog, payload: &[u8]) {
     loop {
         match pub_log.try_claim(payload.len() as u32) {
@@ -479,19 +511,23 @@ fn publish_blocking(pub_log: &PublicationLog, payload: &[u8]) {
     }
 }
 
-/// Poll the subscription log until a Data fragment passes the
-/// supplied predicate or the deadline expires. Returns the matched
-/// payload bytes. Used for the four handshake replies — once we
-/// switch to envelope-wrapped traffic the bench loop polls inline.
+/// Drive the muxers and poll the per-session subscription log until a
+/// Data fragment for `target_sid` passes the supplied predicate or
+/// `deadline` expires. Used for the four handshake replies — once we
+/// switch to envelope-wrapped traffic, the bench loop polls inline.
 fn recv_match(
-    sub: &SubscriptionLog,
+    muxed_receiver: &mut MuxedReceiver<melin_rumcast::shared_udp::SharedUdpRecv>,
+    muxed_sender: &mut MuxedSender<melin_rumcast::shared_udp::SharedUdpSend>,
+    target_sid: u32,
     deadline: Instant,
     predicate: impl Fn(&[u8]) -> bool,
 ) -> Option<Vec<u8>> {
     while Instant::now() < deadline {
+        muxed_sender.tick();
+        muxed_receiver.tick();
         let mut found: Option<Vec<u8>> = None;
-        sub.poll(64 * 1024, |view| {
-            if found.is_some() {
+        muxed_receiver.poll(64 * 1024, |sid, _src, view| {
+            if found.is_some() || sid != target_sid {
                 return;
             }
             if let FrameView::Data { header, payload } = view
@@ -504,7 +540,7 @@ fn recv_match(
         if let Some(bytes) = found {
             return Some(bytes);
         }
-        thread::sleep(Duration::from_millis(2));
+        std::thread::sleep(Duration::from_millis(2));
     }
     None
 }

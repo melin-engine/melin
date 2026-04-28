@@ -375,6 +375,7 @@ fn main() {
                     pairs: args.pairs,
                     window: args.window,
                     warmup: args.warmup,
+                    clients: args.clients,
                     accounts: args.accounts,
                     instruments: args.instruments,
                     json_path: json_path.map(|p| p.to_path_buf()),
