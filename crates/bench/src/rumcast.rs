@@ -40,7 +40,7 @@ use crate::generator::{GeneratorConfig, OrderFlowGenerator};
 // instances against one server don't collide.
 const RUMCAST_ORDERS_STREAM: u32 = 1;
 const RUMCAST_RESP_STREAM: u32 = 2;
-const TERM_LENGTH: u32 = 16 * 1024 * 1024;
+const TERM_LENGTH: u32 = 1024 * 1024;
 const MTU: u32 = 1408;
 const INITIAL_TERM_ID: u32 = 1;
 

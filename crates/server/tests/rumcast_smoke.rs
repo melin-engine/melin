@@ -45,7 +45,7 @@ use melin_trading::types::{
 // a fresh random 32-bit value (Aeron convention).
 const RUMCAST_ORDERS_STREAM: u32 = 1;
 const RUMCAST_RESP_STREAM: u32 = 2;
-const TERM_LENGTH: u32 = 16 * 1024 * 1024;
+const TERM_LENGTH: u32 = 1024 * 1024;
 const MTU: u32 = 1408;
 const INITIAL_TERM_ID: u32 = 1;
 const BENCH_RECEIVER_ID: u64 = 1;

@@ -120,6 +120,11 @@ enum AuthStage {
     /// envelope-wrapped under `token`. Outbound responses are wrapped
     /// using the same token with a separately-tracked `outbound_seq`.
     /// The same `pub_log` Arc is carried over from `Challenged`.
+    /// `last_activity_at` is refreshed on every successful envelope
+    /// verify (whether or not the inner request reaches the engine —
+    /// post-auth Heartbeats count as activity); the idle-GC sweep
+    /// reaps entries whose `last_activity_at` is older than
+    /// [`IDLE_TIMEOUT`].
     Authenticated {
         token: [u8; 32],
         key_hash: u64,
@@ -127,6 +132,7 @@ enum AuthStage {
         last_inbound_seq: u64,
         outbound_seq: u64,
         pub_log: Arc<PublicationLog>,
+        last_activity_at: Instant,
     },
 }
 
@@ -134,6 +140,20 @@ enum AuthStage {
 /// reply with a ChallengeResponse. Bounds the memory an unauthenticated
 /// peer can pin by spamming Heartbeats from new session_ids.
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Drop an Authenticated entry if no valid envelope has been
+/// received in this long. Bounds memory for clients that
+/// silently disappear (process killed, network partition,
+/// laptop closed) without going through any clean shutdown.
+/// Long enough that a heartbeat-only client (no order traffic)
+/// keeps the session alive — post-auth Heartbeats refresh the
+/// timer because envelope-verification happens before
+/// `should_filter`.
+///
+/// TODO(config): trading deployments may want longer (clients
+/// quietly tracking market state during off-hours); embedded
+/// deployments may want shorter. Promote to `ServerConfig`.
+const IDLE_TIMEOUT: Duration = Duration::from_secs(300);
 
 /// Minimum gap between handshake-timeout sweeps. The sweep itself
 /// is `O(n)` over the session table, so on a busy-spinning idle loop
@@ -176,13 +196,22 @@ const RUMCAST_ORDERS_STREAM: u32 = 1; // client → server
 const RUMCAST_RESP_STREAM: u32 = 2; // server → client
 
 /// Per-session term length. Each session allocates `3 * term_length`
-/// for its receive sublog plus the same for its send publog. This
-/// stays at 16 MiB for #29 because the bench/smoke clients are
-/// hardcoded to that value — reducing it would require a coordinated
-/// wire-format-compatible change on both sides. Phase 3 task #31
-/// drops it (likely to 1 MiB or 256 KiB) once bench/smoke get
-/// updated together.
-const TERM_LENGTH: u32 = 16 * 1024 * 1024;
+/// for its receive sublog plus the same for its send publog, so this
+/// directly controls the per-session memory budget.
+///
+/// 1 MiB is comfortable for the bench's typical workloads (a few
+/// hundred KiB in flight). At fully-saturated 10 Gbps with 1ms NAK
+/// reaction (`bandwidth × delay = 1.25 GB/s × 1ms = 1.25 MiB`), it's
+/// borderline — a fully-saturating workload would benefit from 4 MiB.
+/// At `MAX_SESSIONS = 1024`, the worst-case fully-allocated memory
+/// is `1 MiB × 3 × 2 × 1024 = 6 GiB`; lazy allocation keeps real-
+/// world usage at hundreds of MiB.
+///
+/// Wire-format constraint: must match every client's
+/// `PublicationConfig::term_length` exactly. If you change this,
+/// update bench/src/rumcast.rs and tests/rumcast_smoke.rs in the
+/// same commit.
+const TERM_LENGTH: u32 = 1024 * 1024;
 /// Conservative MTU for kernel UDP — leaves ~92 bytes of headroom
 /// below the typical 1500-byte Ethernet payload to absorb any IP+UDP
 /// header growth (no VLAN/IPv6 surprises).
@@ -195,13 +224,18 @@ const INITIAL_TERM_ID: u32 = 1;
 /// response publog the server sends to is from this same logical
 /// "subscriber" identity.
 const SERVER_RECEIVER_ID: u64 = 1;
-/// Cap on concurrent clients. With `TERM_LENGTH = 16 MiB` and 3
+/// Cap on concurrent clients. With `TERM_LENGTH = 1 MiB` and 3
 /// partitions per sublog + 3 per publog, the worst case is
-/// `MAX_SESSIONS × 6 × 16 MiB`. At the current 16 — chosen
-/// deliberately small until #31 reduces `TERM_LENGTH` — that's
-/// 1.5 GiB. Phase 3 task #31 raises this to ~1024 once term_length
-/// drops.
-const MAX_SESSIONS: u32 = 16;
+/// `MAX_SESSIONS × 6 × 1 MiB = 6 GiB` at full saturation. Sessions
+/// are allocated lazily, so a server with a few dozen real clients
+/// uses a few hundred MiB in practice. Past this cap, a fresh
+/// inbound `session_id` is rejected at the muxer level
+/// (`MuxedReceiver` bumps `sessions_rejected` and drops the frame;
+/// `MuxedSender::create_session` returns `SessionsExhausted`).
+///
+/// TODO(config): production deployments may want this lower (small
+/// boxes) or higher (busy gateways). Promote to `ServerConfig`.
+const MAX_SESSIONS: u32 = 1024;
 
 // ---------------------------------------------------------------------------
 // Entry point
@@ -509,13 +543,22 @@ fn session_translator(
             muxed_sender.evict(sid);
         }
 
-        // ---- Drop stale Challenged sessions ----
+        // ---- Drop stale sessions (Challenged + idle Authenticated) ----
         //
-        // Throttled to once per `SWEEP_INTERVAL`. When a
-        // Challenged entry expires we evict from the auth table AND
-        // both muxers — otherwise a half-handshaked client would
-        // pin per-session sublog/publog memory until process
-        // restart.
+        // Throttled to once per `SWEEP_INTERVAL`. Two cases:
+        // 1. `Challenged` entries older than `HANDSHAKE_TIMEOUT`:
+        //    a half-handshaked client failed to complete auth; reap
+        //    so spamming Heartbeats from random session_ids can't
+        //    pin per-session memory.
+        // 2. `Authenticated` entries idle longer than `IDLE_TIMEOUT`:
+        //    a client silently disappeared (process killed, network
+        //    partition, laptop closed) without clean shutdown.
+        //    Heartbeat traffic refreshes the timer, so a passive
+        //    client only sending keepalives stays alive.
+        //
+        // Both cases evict from the auth table AND both muxers
+        // — otherwise the session's sublog/publog memory would pin
+        // until process restart.
         let now = Instant::now();
         if now.duration_since(last_sweep_at) >= SWEEP_INTERVAL {
             let mut expired: Vec<u32> = Vec::new();
@@ -529,7 +572,21 @@ fn session_translator(
                         true
                     }
                 }
-                AuthStage::Authenticated { .. } => true,
+                AuthStage::Authenticated {
+                    last_activity_at, ..
+                } => {
+                    if now.duration_since(*last_activity_at) >= IDLE_TIMEOUT {
+                        debug!(
+                            %session_id,
+                            idle_for = ?now.duration_since(*last_activity_at),
+                            "session idle past IDLE_TIMEOUT; dropping"
+                        );
+                        expired.push(*session_id);
+                        false
+                    } else {
+                        true
+                    }
+                }
             });
             for sid in expired {
                 muxed_receiver.evict(sid);
@@ -788,6 +845,7 @@ fn handle_inbound(
                         last_inbound_seq: 0,
                         outbound_seq: 0,
                         pub_log: pub_log_clone,
+                        last_activity_at: Instant::now(),
                     };
                 }
                 AuthStage::Authenticated {
@@ -795,6 +853,7 @@ fn handle_inbound(
                     key_hash,
                     permission,
                     last_inbound_seq,
+                    last_activity_at,
                     ..
                 } => {
                     // Verify the envelope. Replay first (cheap), then
@@ -816,6 +875,12 @@ fn handle_inbound(
                         }
                     };
                     *last_inbound_seq = seq;
+                    // Refresh idle-GC timer on every successful
+                    // verify, before the should_filter / engine-
+                    // dispatch path. Heartbeats and other filtered
+                    // requests count as activity — a heartbeat-only
+                    // client keeps its session alive.
+                    *last_activity_at = Instant::now();
 
                     let (request_seq, request) = match codec::decode_request(inner) {
                         Ok(x) => x,
