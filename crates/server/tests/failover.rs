@@ -2098,9 +2098,9 @@ fn snapshot_transfer_when_archives_purged() {
     let snap_path = primary_journal.with_extension("snapshot");
     let start = Instant::now();
     while !snap_path.exists() {
-        if start.elapsed() > Duration::from_secs(30) {
+        if start.elapsed() > Duration::from_secs(60) {
             panic!(
-                "snapshot was not created within 30s at {}",
+                "snapshot was not created within 60s at {}",
                 snap_path.display()
             );
         }

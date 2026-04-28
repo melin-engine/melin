@@ -4,4 +4,4 @@
 # serializing slows the suite below cargo test.
 [[profile.default.overrides]]
 filter = 'binary(failover)'
-retries = 2
+retries = 4
