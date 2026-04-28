@@ -40,15 +40,25 @@ use melin_trading::types::{
     TimeInForce,
 };
 
-// MUST match the constants in melin-server's rumcast_transport.rs and
-// melin-bench's rumcast.rs. Mismatch = silent no-traffic.
-const RUMCAST_SESSION_ID: u32 = 0xCAFEBABE;
+// MUST match the wire-format constants in melin-server and
+// melin-bench. `session_id` is NOT a constant — each test run picks
+// a fresh random 32-bit value (Aeron convention).
 const RUMCAST_ORDERS_STREAM: u32 = 1;
 const RUMCAST_RESP_STREAM: u32 = 2;
 const TERM_LENGTH: u32 = 16 * 1024 * 1024;
 const MTU: u32 = 1408;
 const INITIAL_TERM_ID: u32 = 1;
 const BENCH_RECEIVER_ID: u64 = 1;
+
+/// Pick a fresh 32-bit `session_id` for this test client. Tests use
+/// random IDs both to exercise the per-session demux path and to
+/// avoid the `0xCAFEBABE` collision when running tests in parallel
+/// against the same loopback range.
+fn generate_session_id() -> u32 {
+    let mut bytes = [0u8; 4];
+    getrandom::fill(&mut bytes).expect("getrandom");
+    u32::from_le_bytes(bytes)
+}
 
 /// Find an unused UDP port by binding ephemeral and dropping.
 fn free_udp_port() -> u16 {
@@ -138,10 +148,14 @@ fn rumcast_order_round_trip() {
     let _tmp = tempfile::tempdir().unwrap();
     let journal_path = _tmp.path().join("test.journal");
 
-    // Client identity: deterministic key from a fixed seed makes the
-    // test reproducible and avoids needing a CSPRNG dep here.
+    // Client identity: deterministic key from a fixed seed keeps
+    // the test's auth path reproducible. Session_id is random per
+    // run — the protocol uses it as a connection identifier, not
+    // an auth-bound value, so randomness here doesn't affect
+    // determinism of the path under test.
     let client_key = SigningKey::from_bytes(&[0xAB; 32]);
     let authorized_keys_path = write_authorized_keys(_tmp.path(), &[&client_key]);
+    let session_id = generate_session_id();
 
     // ---- Server config ----
     let server_config = ServerConfig {
@@ -187,7 +201,7 @@ fn rumcast_order_round_trip() {
 
     let orders_pub = Arc::new(
         PublicationLog::new(PublicationConfig {
-            session_id: RUMCAST_SESSION_ID,
+            session_id,
             stream_id: RUMCAST_ORDERS_STREAM,
             initial_term_id: INITIAL_TERM_ID,
             term_length: TERM_LENGTH,
@@ -203,7 +217,7 @@ fn rumcast_order_round_trip() {
 
     let resp_sub = Arc::new(
         SubscriptionLog::new(SubscriptionConfig {
-            session_id: RUMCAST_SESSION_ID,
+            session_id,
             stream_id: RUMCAST_RESP_STREAM,
             initial_term_id: INITIAL_TERM_ID,
             term_length: TERM_LENGTH,
@@ -311,7 +325,7 @@ fn rumcast_order_round_trip() {
     let mut envelope = vec![0u8; ENVELOPE_OVERHEAD + inner.len()];
     encode_envelope(
         &session_token,
-        RUMCAST_SESSION_ID,
+        session_id,
         /* seq */ 1,
         inner,
         &mut envelope,
@@ -335,7 +349,7 @@ fn rumcast_order_round_trip() {
             {
                 match verify_and_decode_envelope(
                     &session_token,
-                    RUMCAST_SESSION_ID,
+                    session_id,
                     last_inbound_seq,
                     payload,
                 ) {
@@ -614,15 +628,26 @@ fn rumcast_two_clients_concurrent() {
 
     thread::sleep(Duration::from_millis(500));
 
-    // Spawn one thread per client. Each uses a distinct session_id,
-    // signing key, X25519 seed, order_id, and account_id so cross-
-    // routing leakage manifests as a wrong-client BatchEnd or no
-    // BatchEnd at all.
+    // Each client picks its own random session_id (32-bit, OS
+    // CSPRNG). We assert they're distinct after generation —
+    // collision probability is ~1/2^32 per pair, but if it
+    // happens the test would silently succeed with one client
+    // rather than fail loud, so we re-roll.
+    let session_a = generate_session_id();
+    let mut session_b = generate_session_id();
+    while session_a == session_b {
+        session_b = generate_session_id();
+    }
+
+    // Spawn one thread per client. Each uses a distinct random
+    // session_id, signing key, X25519 seed, order_id, and
+    // account_id so cross-routing leakage manifests as a
+    // wrong-client BatchEnd or no BatchEnd at all.
     let client_a = thread::spawn(move || {
         run_one_client(
             server_addr,
             key_a,
-            /*session_id*/ 0xAAAA_AAAA,
+            session_a,
             [0xC1; 32],
             /*order_id*/ 1,
             /*account_id*/ 1,
@@ -632,7 +657,7 @@ fn rumcast_two_clients_concurrent() {
         run_one_client(
             server_addr,
             key_b,
-            /*session_id*/ 0xBBBB_BBBB,
+            session_b,
             [0xC2; 32],
             /*order_id*/ 2,
             /*account_id*/ 2,

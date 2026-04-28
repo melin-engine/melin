@@ -35,8 +35,9 @@ use crate::generator::{GeneratorConfig, OrderFlowGenerator};
 
 // MUST match the constants in `melin-server/src/rumcast_transport.rs`.
 // The two ends share the wire format; if these drift, the bench gets
-// nothing back.
-const RUMCAST_SESSION_ID: u32 = 0xCAFEBABE;
+// nothing back. `session_id` is NOT a constant — each bench run picks
+// a fresh random 32-bit value (Aeron convention) so concurrent bench
+// instances against one server don't collide.
 const RUMCAST_ORDERS_STREAM: u32 = 1;
 const RUMCAST_RESP_STREAM: u32 = 2;
 const TERM_LENGTH: u32 = 16 * 1024 * 1024;
@@ -79,9 +80,14 @@ pub struct RumcastBenchConfig {
 }
 
 pub fn run_rumcast_roundtrip(cfg: RumcastBenchConfig) {
+    // Per-connect random session_id. Each bench instance picks
+    // independently; the 32-bit space makes collisions across
+    // concurrent benches against the same server astronomically
+    // unlikely. Same convention Aeron uses for publication identity.
+    let session_id = generate_session_id();
     eprintln!(
-        "rumcast roundtrip: server={} bind={} pairs={} window={} warmup={}",
-        cfg.server_addr, cfg.bind, cfg.pairs, cfg.window, cfg.warmup
+        "rumcast roundtrip: server={} bind={} session_id={:#010x} pairs={} window={} warmup={}",
+        cfg.server_addr, cfg.bind, session_id, cfg.pairs, cfg.window, cfg.warmup
     );
 
     // ---- Pre-generate frames (same as TCP/DPDK paths) ----
@@ -118,7 +124,7 @@ pub fn run_rumcast_roundtrip(cfg: RumcastBenchConfig) {
     // Outbound: orders publication → server.
     let orders_pub = Arc::new(
         PublicationLog::new(PublicationConfig {
-            session_id: RUMCAST_SESSION_ID,
+            session_id,
             stream_id: RUMCAST_ORDERS_STREAM,
             initial_term_id: INITIAL_TERM_ID,
             term_length: TERM_LENGTH,
@@ -136,7 +142,7 @@ pub fn run_rumcast_roundtrip(cfg: RumcastBenchConfig) {
     // Inbound: responses subscription ← server.
     let resp_sub = Arc::new(
         SubscriptionLog::new(SubscriptionConfig {
-            session_id: RUMCAST_SESSION_ID,
+            session_id,
             stream_id: RUMCAST_RESP_STREAM,
             initial_term_id: INITIAL_TERM_ID,
             term_length: TERM_LENGTH,
@@ -217,7 +223,7 @@ pub fn run_rumcast_roundtrip(cfg: RumcastBenchConfig) {
             outbound_seq += 1;
             let env_len = encode_envelope(
                 &session_token,
-                RUMCAST_SESSION_ID,
+                session_id,
                 outbound_seq,
                 inner,
                 &mut envelope_buf,
@@ -257,7 +263,7 @@ pub fn run_rumcast_roundtrip(cfg: RumcastBenchConfig) {
                 // session. Replay-state tracker advances on success.
                 let (seq, decoded_inner) = match verify_and_decode_envelope(
                     &session_token,
-                    RUMCAST_SESSION_ID,
+                    session_id,
                     last_inbound_seq,
                     payload,
                 ) {
@@ -347,6 +353,16 @@ pub fn run_rumcast_roundtrip(cfg: RumcastBenchConfig) {
     for h in handles {
         let _ = h.join();
     }
+}
+
+/// Pick a fresh 32-bit `session_id` for this bench run via the OS
+/// CSPRNG. Two bench instances against the same server pick
+/// independently — the 32-bit space makes accidental collisions
+/// astronomically unlikely (~10^-10 at 65k concurrent peers).
+fn generate_session_id() -> u32 {
+    let mut bytes = [0u8; 4];
+    getrandom::fill(&mut bytes).expect("getrandom for session_id");
+    u32::from_le_bytes(bytes)
 }
 
 /// Generic tick loop body shared by the bench's sender / receiver
