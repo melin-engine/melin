@@ -746,9 +746,10 @@ run_bench() {
 }
 
 # Run the rumcast bench client (built with --features rumcast, so it's
-# a separate binary at melin-bench.rumcast). Single-client today —
-# Phase 4 doesn't extend the bench's rumcast path to multi-client, so
-# any --clients argument is silently ignored by the bench runtime.
+# a separate binary at melin-bench.rumcast). Multi-client capable: the
+# bench process drives N concurrent authenticated rumcast sessions
+# through one shared UDP socket via the muxed primitives. Pass
+# --clients via the trailing args same as the TCP path.
 # Usage: run_bench_rumcast <server_addr> <orders> <extra_bench_args...>
 run_bench_rumcast() {
     local server_addr="$1" orders="$2"
@@ -1647,7 +1648,7 @@ workload_throughput() {
                 ${BENCH_DPDK_ARGS} ${warmup_arg} ${threads_arg} \
                 ${THROUGHPUT_ORDERS} --clients ${THROUGHPUT_CLIENTS} --window ${THROUGHPUT_WINDOW}"
     elif [[ "$transport" == udp* ]]; then
-        run_bench_rumcast "$CURRENT_BIND" "${THROUGHPUT_ORDERS}" --window "${THROUGHPUT_WINDOW}"
+        run_bench_rumcast "$CURRENT_BIND" "${THROUGHPUT_ORDERS}" --clients "${THROUGHPUT_CLIENTS}" --window "${THROUGHPUT_WINDOW}"
     else
         run_bench "$CURRENT_BIND" "$CURRENT_HEALTH" "${THROUGHPUT_ORDERS}" --clients "${THROUGHPUT_CLIENTS}" --window "${THROUGHPUT_WINDOW}"
     fi
@@ -1675,7 +1676,7 @@ workload_single() {
                 ${BENCH_DPDK_ARGS} ${warmup_arg} \
                 ${SINGLE_ORDERS} --clients 1 --window 1"
     elif [[ "$transport" == udp* ]]; then
-        run_bench_rumcast "$CURRENT_BIND" "${SINGLE_ORDERS}" --window 1
+        run_bench_rumcast "$CURRENT_BIND" "${SINGLE_ORDERS}" --clients 1 --window 1
     else
         run_bench "$CURRENT_BIND" "$CURRENT_HEALTH" "${SINGLE_ORDERS}" --clients 1 --window 1
     fi
