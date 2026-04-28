@@ -533,15 +533,15 @@ impl SessionState {
     }
 
     /// Send an Ack frame to the primary. Used by the streaming loop on
-    /// every durable batch.
+    /// every durable batch. Wire format: `protocol::encode_ack` already
+    /// emits the `[len:u32][type][payload]` framing — we publish the
+    /// whole encoded buffer so the primary's `strip_length_prefix`
+    /// finds what it expects.
     fn send_ack(&self, acked_sequence: u64) -> io::Result<()> {
         let mut buf = Vec::with_capacity(16);
         encode_ack(&Ack { acked_sequence }, &mut buf);
-        // Strip the 4-byte length prefix because rumcast already
-        // bounds the message.
-        let inner = strip_length_prefix_owned(&buf)?;
         let dummy_shutdown = AtomicBool::new(false);
-        self.publish(&inner, &dummy_shutdown)
+        self.publish(&buf, &dummy_shutdown)
     }
 
     /// Same as `send_ack` but observes the supplied shutdown flag —
@@ -550,8 +550,7 @@ impl SessionState {
     fn send_ack_with(&self, acked_sequence: u64, shutdown: &AtomicBool) -> io::Result<()> {
         let mut buf = Vec::with_capacity(16);
         encode_ack(&Ack { acked_sequence }, &mut buf);
-        let inner = strip_length_prefix_owned(&buf)?;
-        self.publish(&inner, shutdown)
+        self.publish(&buf, shutdown)
     }
 }
 
@@ -611,8 +610,7 @@ fn auth_and_handshake(
     let pubkey = signing_key.verifying_key();
     let mut buf = Vec::with_capacity(128);
     encode_challenge_response(&signature.to_bytes(), pubkey.as_bytes(), &mut buf);
-    let inner = strip_length_prefix_owned(&buf)?;
-    session.publish(&inner, shutdown)?;
+    session.publish(&buf, shutdown)?;
 
     // ---- 3. Receive AuthOk / AuthFailed ----
     let auth_payload = match wait_for_message(
@@ -643,8 +641,7 @@ fn auth_and_handshake(
     };
     buf.clear();
     encode_handshake(&handshake, &mut buf);
-    let inner = strip_length_prefix_owned(&buf)?;
-    session.publish(&inner, shutdown)?;
+    session.publish(&buf, shutdown)?;
 
     // ---- 5. Receive StreamStart / NeedSnapshot ----
     let response_payload = match wait_for_message(
@@ -1061,12 +1058,6 @@ fn strip_length_prefix(payload: &[u8]) -> Option<&[u8]> {
         return None;
     }
     Some(inner)
-}
-
-fn strip_length_prefix_owned(buf: &[u8]) -> io::Result<Vec<u8>> {
-    strip_length_prefix(buf)
-        .map(|s| s.to_vec())
-        .ok_or_else(|| io::Error::other("malformed length prefix on locally-encoded frame"))
 }
 
 /// Pick a fresh 32-bit `session_id`. Each connection attempt picks a

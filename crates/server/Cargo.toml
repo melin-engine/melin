@@ -31,12 +31,13 @@ latency-trace = [
 ## Kept for backward compatibility — io_uring is now always used.
 io-uring = []
 dpdk = ["dep:melin-dpdk", "melin-dpdk/dpdk-sys"]
-## Standalone server with rumcast (reliable UDP) as the order-entry
-## transport. Mutually exclusive with `dpdk` at build time. Used by
-## the LAN bench suite to compare TCP vs rumcast end-to-end.
-## Replication over rumcast is a separate Phase-2 effort and is NOT
-## included here.
-rumcast = ["dep:melin-rumcast"]
+## Server with rumcast (reliable UDP) as the order-entry and replication
+## transport. Mutually exclusive with `dpdk` at build time. Used by the
+## LAN bench suite to run an end-to-end UDP cluster (primary, replica,
+## bench all over rumcast). Implies `hash-chain` because rumcast
+## replication needs the chain hash for divergence detection — same
+## reason `noop` pulls it in.
+rumcast = ["dep:melin-rumcast", "hash-chain"]
 pipeline-stats = ["melin-engine?/pipeline-stats", "melin-transport-core/pipeline-stats"]
 hash-chain = [
     "melin-engine?/hash-chain",
