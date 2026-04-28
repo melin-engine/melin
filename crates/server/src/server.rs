@@ -1482,7 +1482,9 @@ pub fn run_dpdk(
             &promote_flag,
             config.snapshot_interval_secs,
             config.shadow_snapshot_path(),
+            config.cores,
             config.reader_cores,
+            !config.yield_idle,
         )? {
             None => return Ok(()), // clean shutdown
             Some((mut exchange, writer)) => {

@@ -10,7 +10,7 @@ use std::io;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
-use tracing::{debug, error, info, warn};
+use tracing::{debug, info, warn};
 
 use melin_journal::replication::ReplicationConsumer;
 
@@ -22,7 +22,8 @@ use super::protocol::{
     encode_stream_start, try_decode_input_batch,
 };
 use super::{
-    PendingAckQueue, ReceiverResult, ReplicationMetrics, shutdown_pipeline, sleep_checking_flags,
+    PendingAckQueue, ReceiverResult, ReplicaPipelineHandles, ReplicationMetrics,
+    build_replica_pipeline_with_threads, sleep_checking_flags, teardown_replica_pipeline,
     update_dual_replication_cursor,
 };
 
@@ -893,7 +894,9 @@ pub fn run_receiver_dpdk(
     promote: &AtomicBool,
     snapshot_interval_secs: u64,
     snapshot_path: std::path::PathBuf,
+    cores: crate::server::PipelineCores,
     receiver_core: usize,
+    busy_spin: bool,
 ) -> ReceiverResult {
     use crate::App;
     use crate::JournalWriter;
@@ -936,13 +939,44 @@ pub fn run_receiver_dpdk(
     // a different local port to avoid smoltcp TIME_WAIT conflicts.
     let mut local_port: u16 = 40000;
 
+    // Live pipeline state — built once on first connect (or after a snapshot
+    // transfer), persists across `Disconnected` reconnects so we don't pay
+    // the journal-recover + thread-spawn + warm-up cost on every drop.
+    // None = no pipeline yet (first iteration, or just torn down for
+    // snapshot transfer); Some = running pipeline with threads + atomics
+    // we can read for the next reconnect handshake.
+    let mut pipeline: Option<ReplicaPipelineHandles> = None;
+
     // --- Outer reconnect loop ---
+    //
+    // Each iteration: connect → handshake → (snapshot rebuild?) →
+    // (build pipeline if absent) → stream. On disconnect the pipeline
+    // stays live — we just refresh handshake state from its atomics and
+    // reconnect. Only `Promote` / `Shutdown` / snapshot-transfer / fatal
+    // error tear it down.
     loop {
+        // Refresh handshake state from the running pipeline, if any.
+        if let Some(p) = pipeline.as_ref() {
+            last_sequence = p.last_seq.load(Ordering::Acquire);
+            if let Some(ref lock) = p.chain_hash_lock {
+                chain_hash = lock.load();
+            }
+        }
+
         if shutdown.load(Ordering::Relaxed) {
+            if let Some(p) = pipeline.take() {
+                let _ = teardown_replica_pipeline(p);
+            }
             return Ok(None);
         }
         if promote.load(Ordering::Acquire) {
             info!("promotion triggered while disconnected (DPDK)");
+            if let Some(p) = pipeline.take()
+                && let Some((e, w)) = teardown_replica_pipeline(p)
+            {
+                exchange = Some(e);
+                journal_writer = Some(w);
+            }
             return match (exchange, journal_writer) {
                 (Some(e), Some(w)) => Ok(Some((e, w))),
                 _ => Err("promotion requested but no local state available".into()),
@@ -1006,10 +1040,19 @@ pub fn run_receiver_dpdk(
             transport.close(handle);
             sleep_checking_flags(backoff, shutdown, promote);
             if shutdown.load(Ordering::Relaxed) {
+                if let Some(p) = pipeline.take() {
+                    let _ = teardown_replica_pipeline(p);
+                }
                 return Ok(None);
             }
             if promote.load(Ordering::Acquire) {
                 info!("promotion triggered during reconnect backoff (DPDK)");
+                if let Some(p) = pipeline.take()
+                    && let Some((e, w)) = teardown_replica_pipeline(p)
+                {
+                    exchange = Some(e);
+                    journal_writer = Some(w);
+                }
                 return match (exchange, journal_writer) {
                     (Some(e), Some(w)) => Ok(Some((e, w))),
                     _ => Err("promotion requested but no local state available".into()),
@@ -1031,9 +1074,23 @@ pub fn run_receiver_dpdk(
         send_buf.clear();
 
         // Read protocol response (StreamStart / NeedSnapshot / HashMismatch).
+        // Helper macro: shut the pipeline down before bubbling up a fatal
+        // error from the handshake. Borrows `pipeline` directly so we don't
+        // leak the threads on the way out.
+        macro_rules! fatal_err_dpdk {
+            ($msg:expr) => {{
+                if let Some(p) = pipeline.take() {
+                    let _ = teardown_replica_pipeline(p);
+                }
+                return Err($msg);
+            }};
+        }
         recv_buf.clear();
         let primary_genesis_entry = 'handshake: loop {
             if shutdown.load(Ordering::Relaxed) {
+                if let Some(p) = pipeline.take() {
+                    let _ = teardown_replica_pipeline(p);
+                }
                 return Ok(None);
             }
             transport.poll();
@@ -1054,6 +1111,14 @@ pub fn run_receiver_dpdk(
                         }
                         PrimaryMessage::NeedSnapshot => {
                             info!("primary requires snapshot transfer — receiving snapshot (DPDK)");
+
+                            // Tear down the live pipeline before wiping its
+                            // backing journal — the journal stage holds the
+                            // file open and the App lives on the matching
+                            // thread; both must exit cleanly first.
+                            if let Some(p) = pipeline.take() {
+                                let _ = teardown_replica_pipeline(p);
+                            }
 
                             // Remove stale local state. Invalidate the in-memory
                             // App and JournalWriter — their underlying files
@@ -1097,17 +1162,17 @@ pub fn run_receiver_dpdk(
                             }
                         }
                         PrimaryMessage::HashMismatch => {
-                            return Err(
+                            fatal_err_dpdk!(
                                 "chain hash mismatch — replica has divergent history".into()
                             );
                         }
                         other => {
-                            return Err(format!("unexpected response: {other:?}").into());
+                            fatal_err_dpdk!(format!("unexpected response: {other:?}").into());
                         }
                     }
                 }
                 FrameResult::Oversized => {
-                    return Err("oversized frame from primary during handshake".into());
+                    fatal_err_dpdk!("oversized frame from primary during handshake".into());
                 }
                 FrameResult::Incomplete => {}
             }
@@ -1163,102 +1228,44 @@ pub fn run_receiver_dpdk(
             journal_writer = Some(writer);
         }
 
-        // If we still have no state after all the handshake logic, reconnect.
-        if exchange.is_none() || journal_writer.is_none() {
-            continue;
+        // --- Build pipeline if absent ---
+        //
+        // Built once on first connect, or after a snapshot transfer tore
+        // the previous one down. On disconnect the pipeline lives, so
+        // this branch is skipped.
+        if pipeline.is_none() {
+            // If we still have no state after all the handshake logic, reconnect.
+            if exchange.is_none() || journal_writer.is_none() {
+                continue;
+            }
+            let cur_exchange = exchange.take().expect("exchange initialized");
+            let cur_writer = journal_writer.take().expect("journal_writer initialized");
+
+            // Unpin before spawning the pipeline. Same rationale as the
+            // kernel-TCP receiver: `pin_to_core` sets `SCHED_FIFO` and on
+            // post-snapshot rebuilds this thread is already pinned —
+            // children would inherit `{receiver_core}` + FIFO and never
+            // preempt the busy-spinning receiver to reach their own
+            // self-pin.
+            if let Err(e) = crate::affinity::clear_affinity() {
+                tracing::warn!(error = e, "failed to clear receiver affinity before spawn");
+            }
+
+            pipeline = Some(build_replica_pipeline_with_threads(
+                cur_exchange,
+                cur_writer,
+                cores,
+                snapshot_interval_secs,
+                snapshot_path.clone(),
+                busy_spin,
+            )?);
+
+            // Pipeline children are spawned and self-pinned. Now safe to
+            // pin the receive thread — mirrors the primary's reader pin
+            // so the thread producing input-ring entries from the network
+            // isn't migrated across L3s mid-batch.
+            super::pin_replica_thread("receiver", receiver_core);
         }
-
-        let cur_exchange = exchange.take().expect("exchange initialized");
-        let cur_writer = journal_writer.take().expect("journal_writer initialized");
-
-        // Clone exchange for shadow stage before moving into pipeline.
-        let shadow_exchange = <App as melin_app::Application>::clone_via_snapshot(&cur_exchange)?;
-
-        // Unpin before spawning the pipeline. Same rationale as the
-        // kernel-TCP receiver: see `clear_affinity` docs and the comment
-        // at the matching site in `tcp_receiver.rs`.
-        if let Err(e) = crate::affinity::clear_affinity() {
-            tracing::warn!(error = e, "failed to clear receiver affinity before spawn");
-        }
-
-        // Build the replica pipeline — same as the TCP receiver.
-        let enable_shadow = snapshot_interval_secs > 0;
-        let pipeline = melin_transport_core::pipeline::build_replica_pipeline(
-            cur_exchange,
-            cur_writer,
-            4096,
-            false,
-            enable_shadow,
-        );
-        let mut input_producer = pipeline.input_producer;
-        let journal_stage = pipeline.journal_stage;
-        let matching_stage = pipeline.matching_stage;
-        let drain_consumer = pipeline.drain_consumer;
-        let journal_cursor = pipeline.journal_cursor;
-        let shadow_consumer = pipeline.shadow_consumer;
-        let chain_hash_lock = pipeline.chain_hash_lock;
-
-        let pipeline_shutdown = Arc::new(AtomicBool::new(false));
-
-        let ps = Arc::clone(&pipeline_shutdown);
-        let journal_handle = std::thread::Builder::new()
-            .name("journal".into())
-            .spawn(move || journal_stage.run(&ps))
-            .expect("spawn journal thread");
-
-        let ps = Arc::clone(&pipeline_shutdown);
-        let matching_handle = std::thread::Builder::new()
-            .name("matching".into())
-            .spawn(move || matching_stage.run(&ps))
-            .expect("spawn matching thread");
-
-        let ps = Arc::clone(&pipeline_shutdown);
-        let drain_handle = std::thread::Builder::new()
-            .name("drain".into())
-            .spawn(move || {
-                let mut consumer = drain_consumer;
-                let mut batch = vec![crate::OutputSlot::default(); 256];
-                loop {
-                    if ps.load(Ordering::Relaxed) {
-                        return;
-                    }
-                    let count = consumer.consume_batch(&mut batch, 256);
-                    if count == 0 {
-                        std::thread::yield_now();
-                    }
-                }
-            })
-            .expect("spawn drain thread");
-
-        let shadow_handle = if let Some(shadow_cons) = shadow_consumer {
-            let snap_path = snapshot_path.clone();
-            let chain_lock = chain_hash_lock.expect("chain hash lock with shadow");
-            let ps = Arc::clone(&pipeline_shutdown);
-            Some(
-                std::thread::Builder::new()
-                    .name("replica-shadow".into())
-                    .spawn(move || {
-                        crate::shadow::run(
-                            shadow_cons,
-                            shadow_exchange,
-                            snap_path,
-                            std::time::Duration::from_secs(snapshot_interval_secs),
-                            chain_lock,
-                            &ps,
-                            false,
-                        );
-                    })
-                    .expect("spawn shadow thread"),
-            )
-        } else {
-            None
-        };
-
-        // Pipeline children are spawned. Now safe to pin the receive
-        // thread — mirrors the primary's reader pin so the thread
-        // producing input-ring entries from the network isn't migrated
-        // across L3s mid-batch.
-        super::pin_replica_thread("receiver", receiver_core);
 
         let mut pending_acks = PendingAckQueue::new();
         let mut received_data = false;
@@ -1297,22 +1304,32 @@ pub fn run_receiver_dpdk(
             }};
         }
 
+        // Borrow input_producer + journal_cursor from the live pipeline
+        // for the streaming session. On disconnect we drop these locals
+        // and retake them next iteration.
+        let p = pipeline.as_mut().expect("pipeline must exist by here");
+        let input_producer = &mut p.input_producer;
+        let journal_cursor = p.journal_cursor.as_ref();
+
         // --- Inner streaming loop ---
+        //
+        // Returns one of: Disconnected → reconnect with pipeline alive;
+        // Shutdown → tear down + Ok(None); Promote → tear down + Ok(Some);
+        // Fatal(err) → tear down + Err.
+        enum SessionExit {
+            Disconnected,
+            Shutdown,
+            Promote,
+            Fatal(Box<dyn std::error::Error>),
+        }
         let session_exit = 'streaming: loop {
             if shutdown.load(Ordering::Relaxed) {
                 info!("replica shutting down (DPDK)");
-                if let Some(seq) = pending_acks.pop_all_blocking(&journal_cursor) {
+                if let Some(seq) = pending_acks.pop_all_blocking(journal_cursor) {
                     send_ack_dpdk!(seq);
                     transport.poll();
                 }
-                shutdown_pipeline(
-                    &pipeline_shutdown,
-                    journal_handle,
-                    matching_handle,
-                    drain_handle,
-                    shadow_handle,
-                );
-                return Ok(None);
+                break 'streaming SessionExit::Shutdown;
             }
 
             if promote.load(Ordering::Acquire) {
@@ -1351,31 +1368,22 @@ pub fn run_receiver_dpdk(
                         pending_acks.push(drain_last_target, accum_end_sequence);
                     }
                 }
-                if let Some(seq) = pending_acks.pop_all_blocking(&journal_cursor) {
+                if let Some(seq) = pending_acks.pop_all_blocking(journal_cursor) {
                     send_ack_dpdk!(seq);
                     transport.poll();
                 }
-                return match shutdown_pipeline(
-                    &pipeline_shutdown,
-                    journal_handle,
-                    matching_handle,
-                    drain_handle,
-                    shadow_handle,
-                ) {
-                    Some((ex, wr)) => Ok(Some((ex, wr))),
-                    None => Err("pipeline thread panicked during promotion (DPDK)".into()),
-                };
+                break 'streaming SessionExit::Promote;
             }
 
             // Flush any acks that have become durable since last iteration.
-            if let Some(seq) = pending_acks.pop_ready(&journal_cursor) {
+            if let Some(seq) = pending_acks.pop_ready(journal_cursor) {
                 send_ack_dpdk!(seq);
             }
 
             // Backpressure: if pipeline is saturated, block until the oldest
             // batch is durable.
             if pending_acks.is_full() {
-                let seq = pending_acks.pop_oldest_blocking(&journal_cursor);
+                let seq = pending_acks.pop_oldest_blocking(journal_cursor);
                 send_ack_dpdk!(seq);
             }
 
@@ -1385,11 +1393,11 @@ pub fn run_receiver_dpdk(
 
             // Check for disconnect.
             if !transport.is_active(handle) && recv_buf.is_empty() {
-                if let Some(seq) = pending_acks.pop_all_blocking(&journal_cursor) {
+                if let Some(seq) = pending_acks.pop_all_blocking(journal_cursor) {
                     send_ack_dpdk!(seq);
                     transport.poll();
                 }
-                break 'streaming false; // disconnected
+                break 'streaming SessionExit::Disconnected;
             }
 
             // Parse frames from the receive buffer and publish slots
@@ -1398,6 +1406,7 @@ pub fn run_receiver_dpdk(
             let mut consumed = 0;
             let mut burst_last_target = 0u64;
             let mut burst_any_published = false;
+            let mut frame_err: Option<Box<dyn std::error::Error>> = None;
             loop {
                 let remaining = &recv_buf[consumed..];
                 match try_extract_frame(remaining, MAX_DATA_FRAME) {
@@ -1423,35 +1432,26 @@ pub fn run_receiver_dpdk(
                                     debug!("unexpected message during streaming: {other:?}");
                                 }
                                 Err(e) => {
-                                    shutdown_pipeline(
-                                        &pipeline_shutdown,
-                                        journal_handle,
-                                        matching_handle,
-                                        drain_handle,
-                                        shadow_handle,
+                                    frame_err = Some(
+                                        format!("failed to decode primary message: {e}").into(),
                                     );
-                                    return Err(
-                                        format!("failed to decode primary message: {e}").into()
-                                    );
+                                    break;
                                 }
                             },
                         }
                         consumed += frame_end;
                     }
                     FrameResult::Oversized => {
-                        shutdown_pipeline(
-                            &pipeline_shutdown,
-                            journal_handle,
-                            matching_handle,
-                            drain_handle,
-                            shadow_handle,
-                        );
-                        return Err("oversized frame from primary during streaming".into());
+                        frame_err = Some("oversized frame from primary during streaming".into());
+                        break;
                     }
                     FrameResult::Incomplete => break,
                 }
             }
             compact_recv_buf(&mut recv_buf, consumed);
+            if let Some(e) = frame_err {
+                break 'streaming SessionExit::Fatal(e);
+            }
 
             // One pending_acks entry per recv burst — covers all slots
             // published from this RECV's buffer.
@@ -1462,46 +1462,31 @@ pub fn run_receiver_dpdk(
             }
         };
 
-        // --- Disconnect handling: recover state and reconnect ---
-        let _disconnected = session_exit; // false = disconnected
-
-        match shutdown_pipeline(
-            &pipeline_shutdown,
-            journal_handle,
-            matching_handle,
-            drain_handle,
-            shadow_handle,
-        ) {
-            Some((e, w)) => {
-                last_sequence = w.next_sequence().saturating_sub(1);
-                chain_hash = w.chain_hash().unwrap_or([0u8; 32]);
-                exchange = Some(e);
-                journal_writer = Some(w);
-            }
-            None => {
-                error!("pipeline thread panicked during disconnect recovery (DPDK)");
-                if journal_path.exists() {
-                    match melin_transport_core::JournaledApp::<App>::recover(
-                        crate::server::empty_app(),
-                        journal_path,
-                    ) {
-                        Ok(engine) => {
-                            last_sequence = engine.next_sequence().saturating_sub(1);
-                            chain_hash = engine.chain_hash().unwrap_or([0u8; 32]);
-                            let (e, w) = engine.into_parts();
-                            exchange = Some(e);
-                            journal_writer = Some(w);
-                        }
-                        Err(e) => {
-                            return Err(format!(
-                                "pipeline panicked and journal recovery failed: {e}"
-                            )
-                            .into());
-                        }
-                    }
-                } else {
-                    return Err("pipeline panicked and no journal to recover from (DPDK)".into());
+        match session_exit {
+            SessionExit::Shutdown => {
+                if let Some(p) = pipeline.take() {
+                    let _ = teardown_replica_pipeline(p);
                 }
+                return Ok(None);
+            }
+            SessionExit::Promote => {
+                return match pipeline.take() {
+                    Some(p) => match teardown_replica_pipeline(p) {
+                        Some((ex, wr)) => Ok(Some((ex, wr))),
+                        None => Err("pipeline thread panicked during promotion (DPDK)".into()),
+                    },
+                    None => Err("pipeline missing on promote (DPDK)".into()),
+                };
+            }
+            SessionExit::Fatal(e) => {
+                if let Some(p) = pipeline.take() {
+                    let _ = teardown_replica_pipeline(p);
+                }
+                return Err(e);
+            }
+            SessionExit::Disconnected => {
+                // Pipeline stays live — `last_sequence` and `chain_hash`
+                // refresh from its atomics at the top of the next iteration.
             }
         }
 
