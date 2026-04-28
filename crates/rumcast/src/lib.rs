@@ -48,6 +48,7 @@ pub mod muxed_sender;
 pub mod pub_log;
 pub mod receiver;
 pub mod sender;
+pub mod shared_udp;
 mod storage;
 pub mod sub_log;
 pub mod transport;
