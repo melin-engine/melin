@@ -292,10 +292,12 @@ impl DpdkReplicationDriver {
                         slot.acked_cursor = u64::MAX;
                         slot.recv_buf.clear();
                         replicas_connected.fetch_sub(1, Ordering::Release);
-                        if replicas_connected.load(Ordering::Relaxed) == 0 {
-                            replication_cursor.store(u64::MAX, Ordering::Release);
-                            fastest_replica_cursor.store(u64::MAX, Ordering::Release);
-                        }
+                        update_dual_replication_cursor(
+                            u64::MAX,
+                            other_acked,
+                            replication_cursor,
+                            fastest_replica_cursor,
+                        );
                         continue;
                     }
 
@@ -526,9 +528,13 @@ impl DpdkReplicationDriver {
                         slot.recv_buf.clear();
                         slot.state = SlotState::Idle;
                         replicas_connected.fetch_sub(1, Ordering::Release);
+                        update_dual_replication_cursor(
+                            u64::MAX,
+                            other_acked,
+                            replication_cursor,
+                            fastest_replica_cursor,
+                        );
                         if replicas_connected.load(Ordering::Relaxed) == 0 {
-                            replication_cursor.store(u64::MAX, Ordering::Release);
-                            fastest_replica_cursor.store(u64::MAX, Ordering::Release);
                             warn!("all replicas disconnected — trading halted");
                         }
                         continue;
@@ -592,9 +598,13 @@ impl DpdkReplicationDriver {
                             slot.recv_buf.clear();
                             slot.state = SlotState::Idle;
                             replicas_connected.fetch_sub(1, Ordering::Release);
+                            update_dual_replication_cursor(
+                                u64::MAX,
+                                other_acked,
+                                replication_cursor,
+                                fastest_replica_cursor,
+                            );
                             if replicas_connected.load(Ordering::Relaxed) == 0 {
-                                replication_cursor.store(u64::MAX, Ordering::Release);
-                                fastest_replica_cursor.store(u64::MAX, Ordering::Release);
                                 warn!("all replicas disconnected — trading halted");
                             }
                             continue;
@@ -619,9 +629,13 @@ impl DpdkReplicationDriver {
                         slot.recv_buf.clear();
                         slot.state = SlotState::Idle;
                         replicas_connected.fetch_sub(1, Ordering::Release);
+                        update_dual_replication_cursor(
+                            u64::MAX,
+                            other_acked,
+                            replication_cursor,
+                            fastest_replica_cursor,
+                        );
                         if replicas_connected.load(Ordering::Relaxed) == 0 {
-                            replication_cursor.store(u64::MAX, Ordering::Release);
-                            fastest_replica_cursor.store(u64::MAX, Ordering::Release);
                             warn!("all replicas disconnected — trading halted");
                         }
                         continue;
@@ -1248,6 +1262,14 @@ pub fn run_receiver_dpdk(
         let mut accum_end_sequence: u64 = 0;
 
         // Encode an ack into send_buf and queue it on the DPDK transport.
+        //
+        // Retry-with-poll: under sustained load (e.g. NO_PERSIST hot
+        // pipeline) the DPDK TX queue can fill up before this ack
+        // is queued. Silently dropping it would freeze the primary's
+        // `replication_cursor` — the response stage's gate then
+        // stalls every subsequent client ack. Spin-poll until the
+        // queue accepts the frame, or the session shuts down, or
+        // the transport disconnects.
         macro_rules! send_ack_dpdk {
             ($seq:expr) => {{
                 send_buf.clear();
@@ -1257,7 +1279,18 @@ pub fn run_receiver_dpdk(
                     },
                     &mut send_buf,
                 );
-                transport.queue_send(handle, &send_buf);
+                loop {
+                    if transport.queue_send(handle, &send_buf) {
+                        break;
+                    }
+                    transport.poll();
+                    if shutdown.load(Ordering::Relaxed) {
+                        break;
+                    }
+                    if !transport.is_active(handle) {
+                        break;
+                    }
+                }
             }};
         }
 
