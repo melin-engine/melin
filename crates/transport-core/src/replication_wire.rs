@@ -1,22 +1,23 @@
 //! Wire format for input replication (`InputBatch` frames).
 //!
 //! Replicas accept `InputSlot` records directly — no journal-codec
-//! round-trip on the wire. The journal stage encodes each slot into both
-//! the local journal-codec buffer (for disk) and a parallel
-//! `InputBatch` buffer (for the replication ring + sender), so the sender
-//! becomes a passthrough: ring chunk bytes are already wire-ready frames.
+//! round-trip on the wire. The per-slot length-field semantics match
+//! the journal codec's `length` (covers `ENTRY_META_SIZE + payload`),
+//! so the journal stage can ship the just-encoded journal bytes
+//! verbatim — the slice from after the journal entry's magic to before
+//! its CRC trailer is the replication slot, byte-for-byte.
 //!
 //! Wire layout (after a `[length:u32]` frame prefix):
 //! ```text
 //! [type:0x21] [count:u16]
 //! for each slot:
-//!   [event_size:u16]   ← bytes of event_payload only (after tag byte)
+//!   [length:u16]   ← ENTRY_META_SIZE + payload bytes (matches journal)
 //!   [sequence:u64]
 //!   [timestamp_ns:u64]
 //!   [key_hash:u64]
 //!   [request_seq:u64]
 //!   [event_tag:u8]
-//!   [event_payload: event_size bytes]
+//!   [event_payload: length - ENTRY_META_SIZE bytes]
 //! ```
 //!
 //! No per-entry magic or CRC32C — TCP/DPDK handle framing and integrity.
@@ -28,6 +29,7 @@ use std::io;
 
 use melin_app::AppEvent;
 use melin_journal::JournalEvent;
+use melin_journal::codec::ENTRY_META_SIZE;
 use zerocopy::little_endian::{U16, U32, U64};
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout, Unaligned};
 
@@ -68,12 +70,16 @@ struct BatchPreamble {
     count: U16,
 }
 
-/// Per-slot fixed prefix; variable-length event payload follows. `event_size`
-/// counts only the payload bytes (after this struct), not the header itself.
+/// Per-slot fixed prefix; variable-length event payload follows.
+/// `length` matches the journal's `length` field (covers
+/// `ENTRY_META_SIZE + payload_len`); the payload size is therefore
+/// `length - ENTRY_META_SIZE`. The shared semantics let the journal
+/// stage hand a slice of the just-encoded journal entry directly to
+/// replication, without re-encoding.
 #[derive(FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned)]
 #[repr(C)]
 struct SlotHeader {
-    event_size: U16,
+    length: U16,
     sequence: U64,
     timestamp_ns: U64,
     key_hash: U64,
@@ -118,9 +124,9 @@ pub fn append_input_slot<E: AppEvent>(buf: &mut Vec<u8>, slot: &InputSlot<E>, se
     );
 
     // Reserve a zeroed slot header; back-fill the typed view in one block
-    // once the payload is written and event_size is known. The payload
-    // writes may grow the Vec and reallocate, so we cannot hold a borrow
-    // into `buf` across them — the typed view is taken at the end.
+    // once the payload is written and length is known. The payload writes
+    // may grow the Vec and reallocate, so we cannot hold a borrow into
+    // `buf` across them — the typed view is taken at the end.
     let header_start = buf.len();
     buf.resize(header_start + SLOT_HEADER_LEN, 0);
 
@@ -152,11 +158,12 @@ pub fn append_input_slot<E: AppEvent>(buf: &mut Vec<u8>, slot: &InputSlot<E>, se
     };
 
     let payload_bytes = buf.len() - (header_start + SLOT_HEADER_LEN);
-    let event_size = u16::try_from(payload_bytes).expect("event payload exceeds u16 max");
+    let length =
+        u16::try_from(ENTRY_META_SIZE + payload_bytes).expect("event payload exceeds u16 max");
 
     let header = SlotHeader::mut_from_bytes(&mut buf[header_start..header_start + SLOT_HEADER_LEN])
         .expect("SLOT_HEADER_LEN slice matches struct size");
-    header.event_size = U16::new(event_size);
+    header.length = U16::new(length);
     header.sequence = U64::new(seq);
     header.timestamp_ns = U64::new(slot.timestamp_ns);
     header.key_hash = U64::new(slot.key_hash);
@@ -215,12 +222,18 @@ pub fn try_decode_input_batch<E: AppEvent>(payload: &[u8]) -> io::Result<Vec<Inp
         let (header, after_header) = SlotHeader::ref_from_prefix(rest)
             .map_err(|_| io::Error::other("InputBatch slot header truncated"))?;
 
-        let event_size = header.event_size.get() as usize;
-        if after_header.len() < event_size {
+        let length = header.length.get() as usize;
+        if length < ENTRY_META_SIZE {
+            return Err(io::Error::other(
+                "InputBatch slot length below ENTRY_META_SIZE",
+            ));
+        }
+        let payload_size = length - ENTRY_META_SIZE;
+        if after_header.len() < payload_size {
             return Err(io::Error::other("InputBatch slot payload truncated"));
         }
-        let event_payload = &after_header[..event_size];
-        rest = &after_header[event_size..];
+        let event_payload = &after_header[..payload_size];
+        rest = &after_header[payload_size..];
 
         let event = match header.event_tag {
             SLOT_TAG_GENESIS_HASH => {
@@ -472,15 +485,16 @@ mod tests {
         encode_input_batch(&[slot], &mut buf);
 
         // Total = FrameHeader(7) + SlotHeader(35) + Tick payload(8) = 50.
-        // length field = total - 4 (the length field itself) = 46 = 0x2E.
+        // FrameHeader.length = total - 4 (the length field itself) = 46 = 0x2E.
+        // SlotHeader.length = ENTRY_META_SIZE(17) + payload(8) = 25 = 0x19.
         let expected: &[u8] = &[
             // FrameHeader: length(u32) + type(u8) + count(u16)
             0x2E, 0x00, 0x00, 0x00, // length = 46
             0x21, // MSG_INPUT_BATCH
             0x01, 0x00, // count = 1
-            // SlotHeader: event_size(u16) + sequence(u64) + timestamp_ns(u64)
+            // SlotHeader: length(u16) + sequence(u64) + timestamp_ns(u64)
             //           + key_hash(u64) + request_seq(u64) + event_tag(u8)
-            0x08, 0x00, // event_size = 8 (Tick payload)
+            0x19, 0x00, // length = 25 (matches journal's length: 17 + 8)
             0x21, 0x22, 0x23, 0x24, 0x25, 0x26, 0x27, 0x28, // sequence
             0x31, 0x32, 0x33, 0x34, 0x35, 0x36, 0x37, 0x38, // timestamp_ns
             0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, // key_hash

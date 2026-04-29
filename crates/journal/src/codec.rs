@@ -112,7 +112,10 @@ pub const FILE_HEADER_SIZE: usize = core::mem::size_of::<FileHeader>();
 pub(crate) const ENTRY_HEADER_SIZE: usize = core::mem::size_of::<EntryHeader>();
 
 /// Entry metadata size: key_hash(8) + request_seq(8) + tag(1) = 17.
-const ENTRY_META_SIZE: usize = core::mem::size_of::<EntryMetadata>();
+/// The journal's `length` field covers `ENTRY_META_SIZE + payload_len`,
+/// so consumers that derive payload size from `length` (replication
+/// wire) need this constant.
+pub const ENTRY_META_SIZE: usize = core::mem::size_of::<EntryMetadata>();
 
 /// CRC32C checksum size in bytes.
 pub(crate) const CRC_SIZE: usize = 4;
