@@ -115,6 +115,12 @@ pub struct JournalWriter<E: AppEvent> {
     /// in the same call. `(0, 0)` means no user entry encoded yet.
     last_user_entry_offset: usize,
     last_user_entry_len: usize,
+    /// When true, `flush_batch_sync` uses a plain `pwrite` instead of
+    /// `pwritev2+RWF_DSYNC`. Safe only on drives with Power Loss Protection
+    /// (PLP) capacitors — data in the controller's battery-backed DRAM is
+    /// crash-durable without waiting for NAND programming. Eliminates the
+    /// ~10–100µs FUA round-trip latency on every batch flush.
+    no_fua: bool,
 }
 
 /// Running BLAKE3 hash chain state for tamper evidence.
@@ -281,6 +287,7 @@ impl<E: AppEvent> JournalWriter<E> {
             last_encoded_seq: 0,
             last_user_entry_offset: 0,
             last_user_entry_len: 0,
+            no_fua: false,
         })
     }
 
@@ -355,6 +362,7 @@ impl<E: AppEvent> JournalWriter<E> {
             last_encoded_seq: last_seq,
             last_user_entry_offset: 0,
             last_user_entry_len: 0,
+            no_fua: false,
         };
 
         // When resuming mid-segment (events since last checkpoint > 0),
@@ -604,21 +612,29 @@ impl<E: AppEvent> JournalWriter<E> {
         Ok(())
     }
 
-    /// Write the batch buffer to disk with guaranteed durability (FUA).
+    /// Write the batch buffer to disk with guaranteed durability.
     ///
-    /// Uses `pwritev2` with `RWF_DSYNC` to combine the data write and
-    /// durability guarantee into a single syscall. On NVMe drives with
-    /// FUA (Force Unit Access) support, the kernel issues a single FUA
-    /// write instead of write + full cache flush (`fdatasync`). This
-    /// reduces sync latency from ~1-7 ms to ~10-100 µs for small writes.
+    /// Default path: uses `pwritev2` with `RWF_DSYNC` to combine the data
+    /// write and durability guarantee into a single syscall. On NVMe drives
+    /// with FUA (Force Unit Access) support, the kernel issues a single FUA
+    /// write instead of write + full cache flush (`fdatasync`). This reduces
+    /// sync latency from ~1-7 ms to ~10-100 µs for small writes.
     ///
+    /// With `--journal-no-fua` (`no_fua = true`): uses a plain `pwrite`
+    /// without waiting for NAND programming. Relies on the drive's Power Loss
+    /// Protection (PLP) capacitors for crash durability. Latency drops to
+    /// ~1-5 µs (controller DRAM write), eliminating GC-induced spikes entirely.
     pub fn flush_batch_sync(&mut self) -> Result<(), JournalError> {
         if self.batch_buf.is_empty() {
             return Ok(());
         }
         self.ensure_allocated(self.batch_buf.len() as u64)?;
 
-        pwritev2_dsync(self.file.as_raw_fd(), &self.batch_buf, self.write_pos)?;
+        if self.no_fua {
+            self.file.write_all_at(&self.batch_buf, self.write_pos)?;
+        } else {
+            pwritev2_dsync(self.file.as_raw_fd(), &self.batch_buf, self.write_pos)?;
+        }
 
         // Hash chain is NOT finalized per-flush — only at checkpoint
         // boundaries. This ensures the chain is deterministic regardless of
@@ -733,6 +749,13 @@ impl<E: AppEvent> JournalWriter<E> {
     /// Raw file descriptor for the journal file.
     pub fn fd(&self) -> std::os::unix::io::RawFd {
         self.file.as_raw_fd()
+    }
+
+    /// Enable or disable FUA on batch flushes. When disabled, `flush_batch_sync`
+    /// issues a plain `pwrite` instead of `pwritev2+RWF_DSYNC`. Only safe on
+    /// drives with Power Loss Protection (PLP) — see `--journal-no-fua`.
+    pub fn set_no_fua(&mut self, no_fua: bool) {
+        self.no_fua = no_fua;
     }
 
     /// Current BLAKE3 chain hash, if hash chain is active.

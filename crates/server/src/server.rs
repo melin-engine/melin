@@ -97,6 +97,21 @@ pub struct ServerConfig {
     #[arg(long, default_value_t = 256)]
     pub max_journal_mib: u64,
 
+    /// Skip FUA (Force Unit Access) on journal writes. Uses a plain pwrite
+    /// instead of pwritev2+RWF_DSYNC, dropping flush latency from ~10-100µs
+    /// to ~1-5µs by not waiting for NAND programming.
+    ///
+    /// REQUIRES Power Loss Protection (PLP) hardware — enterprise NVMe SSDs
+    /// with onboard capacitors that flush the controller's DRAM write cache
+    /// to NAND on power failure (e.g. Samsung PM9A3, Micron 7450, WD
+    /// Ultrastar SN640). Without PLP, a power loss between the pwrite
+    /// returning and the data reaching NAND will corrupt the journal.
+    ///
+    /// Do NOT enable on consumer SSDs, SATA drives, or any drive without
+    /// confirmed PLP support.
+    #[arg(long, default_value_t = false)]
+    pub journal_no_fua: bool,
+
     /// Address to listen for replica connections (enables synchronous replication).
     /// Mutually exclusive with `--standalone` and `--replica-of`.
     #[arg(long)]
@@ -293,6 +308,7 @@ impl Default for ServerConfig {
             instruments: 2,
             authorized_keys: PathBuf::from("authorized_keys"),
             max_journal_mib: 256,
+            journal_no_fua: false,
             replication_bind: None,
             standalone: false,
             replica_of: None,
@@ -2140,7 +2156,8 @@ fn init_engine(
         }
     }
 
-    let (app, writer) = engine.into_parts();
+    let (app, mut writer) = engine.into_parts();
+    writer.set_no_fua(config.journal_no_fua);
     Ok((app, writer, needs_seeding))
 }
 
