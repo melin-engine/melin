@@ -23,6 +23,7 @@ use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use base64::Engine as _;
+use clap::Parser;
 use ed25519_dalek::SigningKey;
 
 use melin_journal::trace::trace_ts;
@@ -36,6 +37,16 @@ use melin_trading::types::{AccountId, CurrencyId};
 use melin_transport_core::JournaledApp;
 use melin_transport_core::pipeline::build_pipeline_with_replication;
 
+#[derive(Parser)]
+struct Args {
+    /// Yield instead of busy-spinning when pipeline stages are idle.
+    /// On machines without isolated CPUs, this frees cores for the journal
+    /// and sender stages. Use to compare throughput vs the default
+    /// busy-spin mode.
+    #[arg(long)]
+    no_busy_spin: bool,
+}
+
 const PRIMARY_REPL_ADDR: &str = "127.0.0.1:39877";
 const RUN_SECS: u64 = 10;
 const MAX_JOURNAL_BATCH: usize = 4096;
@@ -48,6 +59,9 @@ const BATCH_SIZE: usize = 32;
 const HEARTBEAT_SECS: u64 = 5;
 
 fn main() {
+    let args = Args::parse();
+    let busy_spin = !args.no_busy_spin;
+
     let _ = tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -55,7 +69,7 @@ fn main() {
         )
         .try_init();
 
-    eprintln!("replication-bench: setting up");
+    eprintln!("replication-bench: setting up (busy_spin={})", busy_spin);
 
     // --- Auth keys ---
     // Replica signs its handshake with `replica_key`; primary's
@@ -91,7 +105,7 @@ fn main() {
         true, // enable_replication
         MAX_JOURNAL_BATCH,
         REPLICATION_RING_SIZE,
-        true,  // busy_spin
+        busy_spin,
         false, // enable_event_publisher
         false, // enable_shadow
     );
@@ -143,7 +157,11 @@ fn main() {
                 }
                 let n = consumer.consume_batch(&mut batch, 256);
                 if n == 0 {
-                    std::hint::spin_loop();
+                    if busy_spin {
+                        std::hint::spin_loop();
+                    } else {
+                        std::thread::yield_now();
+                    }
                 }
             }
         })
@@ -176,7 +194,7 @@ fn main() {
         handler_cores: [0, 0], // 0 = unpinned
         batch_size: BATCH_SIZE,
         heartbeat_secs: HEARTBEAT_SECS,
-        busy_spin: true,
+        busy_spin,
     };
 
     let s = Arc::clone(&shutdown);
@@ -219,7 +237,7 @@ fn main() {
                 cores,
                 receiver_core,
                 true, // async_ack
-                true, // busy_spin
+                busy_spin,
             );
         })
         .expect("spawn run_receiver");
