@@ -141,14 +141,18 @@ REPLICA2_JOURNAL="${JOURNAL_DIR}/replica2.journal"
 REPL_PORT=9877
 RUN_PLOTS="${RUN_PLOTS:-0}"
 
-# Replica args. Default enables --async-replica-ack: replicas ack as soon as
-# the batch is queued for their local journal, before fsync completes. This
-# removes one NVMe write from the replication round-trip (~50–80µs on
-# enterprise NVMe) while keeping the primary's local fsync synchronous, so
-# committed data is still durable on the primary's disk + in the replicas'
-# RAM at ack time. See docs/replication.md for the full durability model.
-# Override with REPLICA_EXTRA_ARGS="" to restore strict sync acks.
-REPLICA_EXTRA_ARGS="${REPLICA_EXTRA_ARGS---async-replica-ack}"
+# Primary server args. Default enables --journal-no-fua: skips FUA on journal
+# writes, relying on the NVMe drive's Power Loss Protection (PLP) capacitors
+# for crash durability. Drops flush latency from ~10-100µs to ~1-5µs.
+# Override with SERVER_EXTRA_ARGS="" on drives without confirmed PLP support.
+SERVER_EXTRA_ARGS="${SERVER_EXTRA_ARGS---journal-no-fua}"
+
+# Replica args. Default enables --async-replica-ack (replicas ack as soon as
+# the batch is queued for their local journal, before fsync completes — removes
+# ~50-80µs of NVMe latency from the replication round-trip) and --journal-no-fua
+# (same PLP-based flush optimization as the primary).
+# Override with REPLICA_EXTRA_ARGS="" to restore strict sync acks with FUA.
+REPLICA_EXTRA_ARGS="${REPLICA_EXTRA_ARGS---async-replica-ack --journal-no-fua}"
 
 # RUST_LOG override for every remote server launch below (primary +
 # replicas, TCP + DPDK). Leave at `info` for normal runs; bump to
@@ -1062,12 +1066,12 @@ transport_start_dpdk() {
             --bind 0.0.0.0:9876 \
             --journal ${JOURNAL_PATH} \
             --authorized-keys ${REPO_DIR}/authorized_keys \
-            ${SERVER_EXTRA_ARGS:-} \
             --dpdk-eal-args='${server_eal}' \
             --dpdk-ip ${SERVER_DPDK_IP} \
             --dpdk-prefix-len ${SERVER_DPDK_PREFIX} \
             --dpdk-ports ${SERVER_DPDK_PORT} \
             ${vlan_arg} \
+            ${SERVER_EXTRA_ARGS:-} \
         >/tmp/melin-server.log 2>&1 </dev/null &" </dev/null
 
     wait_for_log "$SERVER" "/tmp/melin-server.log" "listening" 120 "DPDK server"
@@ -1147,6 +1151,7 @@ transport_start_dpdk_repl() {
             --dpdk-ip ${SERVER_DPDK_IP} \
             --dpdk-prefix-len ${SERVER_DPDK_PREFIX} \
             --dpdk-ports ${SERVER_DPDK_PORT} \
+            ${SERVER_EXTRA_ARGS:-} \
         >/tmp/melin-server.log 2>&1 </dev/null &" </dev/null
 
     wait_for_log "$SERVER" "/tmp/melin-server.log" "DPDK replication sender started" 30 "DPDK replication listener"
@@ -1260,6 +1265,7 @@ transport_start_dpdk_dual_repl() {
             --dpdk-ip ${SERVER_DPDK_IP} \
             --dpdk-prefix-len ${SERVER_DPDK_PREFIX} \
             --dpdk-ports ${SERVER_DPDK_PORT} \
+            ${SERVER_EXTRA_ARGS:-} \
         >/tmp/melin-server.log 2>&1 </dev/null &" </dev/null
 
     wait_for_log "$SERVER" "/tmp/melin-server.log" "DPDK replication sender started" 30 "DPDK replication listener"
