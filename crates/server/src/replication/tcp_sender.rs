@@ -672,6 +672,8 @@ fn live_stream_uring(
     let mut send_in_flight = false;
     let mut send_offset: usize = 0;
     let mut idle_spins: u32 = 0;
+    // Separate spin counter for the heartbeat check so sending data resets it.
+    let mut heartbeat_idle_spins: u64 = 0;
 
     // Diagnostic (RUST_LOG=debug): per-slot TCP_INFO snapshot once a
     // second, slow-SEND detection (CQE elapsed >= threshold), and a
@@ -736,18 +738,34 @@ fn live_stream_uring(
                 *last_send = std::time::Instant::now();
                 send_submit_ts = Some(*last_send);
                 idle_spins = 0;
-            } else if last_send.elapsed() >= heartbeat_interval {
-                // No data — send heartbeat if idle.
-                encode_heartbeat(*last_sequence, send_buf);
-                let sqe =
-                    opcode::Send::new(types::Fixed(0), send_buf.as_ptr(), send_buf.len() as u32)
-                        .build()
-                        .user_data(TOKEN_SEND);
-                unsafe { ring.submission().push(&sqe).expect("SQ full") };
-                send_in_flight = true;
-                send_offset = 0;
-                *last_send = std::time::Instant::now();
-                send_submit_ts = Some(*last_send);
+                heartbeat_idle_spins = 0;
+            } else {
+                // Heartbeat check: amortized to avoid a per-iteration vDSO
+                // clock_gettime call. Each call is ~25 ns; the idle loop runs
+                // at millions of iterations/sec, so an unconditional
+                // `elapsed()` check showed up as ~2.5 % of total CPU in
+                // profiles. CHECK_MASK = 2^20 - 1 bounds the check rate to
+                // ~10/s at 10 M iter/s — well within a 5 s heartbeat interval.
+                heartbeat_idle_spins = heartbeat_idle_spins.wrapping_add(1);
+                let needs_heartbeat = heartbeat_idle_spins & ((1u64 << 20) - 1) == 0
+                    && last_send.elapsed() >= heartbeat_interval;
+                if needs_heartbeat {
+                    // No data — send heartbeat if idle.
+                    heartbeat_idle_spins = 0;
+                    encode_heartbeat(*last_sequence, send_buf);
+                    let sqe = opcode::Send::new(
+                        types::Fixed(0),
+                        send_buf.as_ptr(),
+                        send_buf.len() as u32,
+                    )
+                    .build()
+                    .user_data(TOKEN_SEND);
+                    unsafe { ring.submission().push(&sqe).expect("SQ full") };
+                    send_in_flight = true;
+                    send_offset = 0;
+                    *last_send = std::time::Instant::now();
+                    send_submit_ts = Some(*last_send);
+                }
             }
         }
 
@@ -761,8 +779,14 @@ fn live_stream_uring(
         }
 
         // --- Submit SQEs to kernel (non-blocking) ---
-        ring.submit()
-            .map_err(|e| io::Error::other(format!("io_uring submit: {e}")))?;
+        // Skip the syscall when no new SQEs were pushed — an empty
+        // io_uring_enter still costs ~200 ns of mode-switch overhead and
+        // showed up as 6 % of total CPU in profiles of the sender loop.
+        let pending = ring.submission().len();
+        if pending > 0 {
+            ring.submit()
+                .map_err(|e| io::Error::other(format!("io_uring submit: {e}")))?;
+        }
 
         // --- Collect CQEs (must drain before pushing new SQEs) ---
         // Collecting into a small stack array avoids the CQ borrow
