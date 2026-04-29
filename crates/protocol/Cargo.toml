@@ -9,6 +9,10 @@ latency-trace = []
 [dependencies]
 base64 = { workspace = true }
 ed25519-dalek = { workspace = true }
+# Typed views over raw byte buffers for the wire frame header —
+# replaces hand-rolled le::put / le::get pairs. derive feature for
+# `FromBytes` / `IntoBytes`.
+zerocopy = { version = "0.8", features = ["derive"] }
 melin-trading = { path = "../trading" }
 
 [dev-dependencies]

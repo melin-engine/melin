@@ -34,9 +34,46 @@ use melin_trading::types::{
     InstrumentStatus, Order, OrderId, OrderType, Price, Quantity, RejectReason, RiskLimits, Symbol,
     TimeInForce,
 };
+use zerocopy::little_endian::{U32, U64};
+use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout, Unaligned};
 
 use crate::error::ProtocolError;
 use crate::message::{Request, ResponseKind};
+
+// --- Wire header structs ---
+//
+// Variant payloads are NOT typed: they're tagged unions with variable-
+// length fields (Order has Market/Limit/Stop/StopLimit variants of
+// 0/8/8/16 extra bytes, plus an optional 8-byte expiry for GTD).
+// Per-variant zerocopy structs would multiply the type surface without
+// matching gain. The frame headers are universal and fixed-shape, so
+// they're typed; payloads keep the explicit le::put / le::get chain.
+
+/// Length-prefixed frame header for requests:
+/// `[length:u32] [seq:u64] [tag:u8] [payload]`. The 4-byte length value
+/// covers `seq + tag + payload`. Encoders back-fill this at the end.
+#[derive(FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned)]
+#[repr(C)]
+struct RequestFrameHeader {
+    length: U32,
+    seq: U64,
+}
+
+const REQUEST_FRAME_HEADER_LEN: usize = core::mem::size_of::<RequestFrameHeader>();
+const _: () = assert!(REQUEST_FRAME_HEADER_LEN == 12);
+
+/// Post-length-prefix view of a request received from the wire:
+/// `[seq:u64] [tag:u8]` (the 4-byte length prefix has been stripped
+/// by the framing layer). The decoder peels this 8-byte typed prefix
+/// and reads `tag` from the byte that follows.
+#[derive(FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned)]
+#[repr(C)]
+struct RequestSeqHeader {
+    seq: U64,
+}
+
+const REQUEST_SEQ_HEADER_LEN: usize = core::mem::size_of::<RequestSeqHeader>();
+const _: () = assert!(REQUEST_SEQ_HEADER_LEN == 8);
 
 // --- Request tags ---
 const TAG_SUBMIT_ORDER: u8 = 1;
@@ -118,10 +155,8 @@ const REJECT_INSTRUMENT_DISABLED: u8 = 18;
 /// `seq` is the per-key monotonic request sequence for idempotency dedup.
 /// Heartbeat and ChallengeResponse use `seq = 0` (exempt from dedup).
 pub fn encode_request(request: &Request, seq: u64, buf: &mut [u8]) -> Result<usize, ProtocolError> {
-    // Reserve 4 bytes for the length prefix, write seq + tag + payload after it.
-    let mut pos = 4;
-    le::put_u64(&mut buf[pos..], seq);
-    pos += 8;
+    // Reserve the request frame header (length + seq); back-filled below.
+    let mut pos = REQUEST_FRAME_HEADER_LEN;
 
     match request {
         Request::SubmitOrder { symbol, order } => {
@@ -323,7 +358,10 @@ pub fn encode_request(request: &Request, seq: u64, buf: &mut [u8]) -> Result<usi
 
     // Write the length prefix (excludes the 4-byte length field itself).
     let payload_len = pos - 4;
-    le::put_u32(&mut buf[0..], payload_len as u32);
+    let header = RequestFrameHeader::mut_from_bytes(&mut buf[..REQUEST_FRAME_HEADER_LEN])
+        .expect("REQUEST_FRAME_HEADER_LEN slice matches struct size");
+    header.length = U32::new(payload_len as u32);
+    header.seq = U64::new(seq);
 
     Ok(pos)
 }
@@ -334,13 +372,15 @@ pub fn encode_request(request: &Request, seq: u64, buf: &mut [u8]) -> Result<usi
 /// Returns `(seq, Request)` where `seq` is the per-key idempotency sequence.
 pub fn decode_request(buf: &[u8]) -> Result<(u64, Request), ProtocolError> {
     // Need at least seq(8) + tag(1) = 9 bytes.
-    if buf.len() < 9 {
+    let (header, after_header) =
+        RequestSeqHeader::ref_from_prefix(buf).map_err(|_| ProtocolError::Truncated)?;
+    if after_header.is_empty() {
         return Err(ProtocolError::Truncated);
     }
 
-    let seq = le::get_u64(&buf[0..]);
-    let tag = buf[8];
-    let payload = &buf[9..];
+    let seq = header.seq.get();
+    let tag = after_header[0];
+    let payload = &after_header[1..];
 
     match tag {
         TAG_SUBMIT_ORDER => {
