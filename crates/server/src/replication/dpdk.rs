@@ -1273,13 +1273,22 @@ pub fn run_receiver_dpdk(
 
         // Encode an ack into send_buf and queue it on the DPDK transport.
         //
-        // Retry-with-poll: under sustained load (e.g. NO_PERSIST hot
-        // pipeline) the DPDK TX queue can fill up before this ack
-        // is queued. Silently dropping it would freeze the primary's
-        // `replication_cursor` — the response stage's gate then
-        // stalls every subsequent client ack. Spin-poll until the
-        // queue accepts the frame, or the session shuts down, or
-        // the transport disconnects.
+        // Bounded retry-with-poll: under sustained load the DPDK TX
+        // queue can fill up before this ack is queued. Silently
+        // dropping it permanently would freeze the primary's
+        // `replication_cursor`. But blocking forever while waiting
+        // for TX to drain deadlocks against the primary, which is
+        // also waiting on its own TX (single-queue path shares one
+        // TX between client traffic, replication data, and acks).
+        //
+        // Cap the retry at `ACK_RETRY_CAP` poll cycles. If we still
+        // can't queue the ack, drop it: acks carry the cumulative
+        // sequence, so the next ack we send (with a higher sequence)
+        // subsumes anything dropped here. The streaming loop's
+        // outer `transport.poll()` will continue draining TX, and
+        // the next data-batch processing pass will retry the ack
+        // with an updated cursor.
+        const ACK_RETRY_CAP: u32 = 32;
         macro_rules! send_ack_dpdk {
             ($seq:expr) => {{
                 send_buf.clear();
@@ -1289,8 +1298,13 @@ pub fn run_receiver_dpdk(
                     },
                     &mut send_buf,
                 );
+                let mut attempts: u32 = 0;
                 loop {
                     if transport.queue_send(handle, &send_buf) {
+                        break;
+                    }
+                    attempts += 1;
+                    if attempts >= ACK_RETRY_CAP {
                         break;
                     }
                     transport.poll();
