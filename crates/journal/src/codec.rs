@@ -83,14 +83,16 @@ struct FileHeader {
 }
 
 /// Per-entry fixed prefix (20 bytes). `length` covers everything after
-/// this header up to (but not including) the CRC trailer.
+/// this header up to (but not including) the CRC trailer. `pub(crate)`
+/// because `reader.rs` peeks at `length` and `sequence` to advance past
+/// entries without doing a full decode.
 #[derive(FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned)]
 #[repr(C)]
-struct EntryHeader {
-    magic: U16,
-    length: U16,
-    sequence: U64,
-    timestamp_ns: U64,
+pub(crate) struct EntryHeader {
+    pub(crate) magic: U16,
+    pub(crate) length: U16,
+    pub(crate) sequence: U64,
+    pub(crate) timestamp_ns: U64,
 }
 
 /// Per-entry metadata (17 bytes) sitting inside the length-protected

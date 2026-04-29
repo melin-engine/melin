@@ -12,10 +12,6 @@ pub fn put_u64(buf: &mut [u8], v: u64) {
     buf[..8].copy_from_slice(&v.to_le_bytes());
 }
 
-pub fn get_u16(buf: &[u8]) -> u16 {
-    u16::from_le_bytes([buf[0], buf[1]])
-}
-
 pub fn get_u32(buf: &[u8]) -> u32 {
     u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]])
 }

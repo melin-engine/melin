@@ -11,10 +11,11 @@ use std::path::Path;
 
 use melin_app::AppEvent;
 
-use super::codec::{self, CRC_SIZE, ENTRY_HEADER_SIZE, FILE_HEADER_SIZE};
+use zerocopy::FromBytes;
+
+use super::codec::{self, CRC_SIZE, ENTRY_HEADER_SIZE, EntryHeader, FILE_HEADER_SIZE};
 use super::error::JournalError;
 use super::event::JournalEvent;
-use crate::le;
 
 /// Initial read buffer size. Grows if needed, but entries are typically <100 bytes.
 /// Uses a Vec (growable) rather than a fixed array because the reader may need
@@ -470,8 +471,10 @@ impl RawJournalScanner {
         if self.buf[self.pos] == 0 && self.buf[self.pos + 1] == 0 {
             return Ok(None);
         }
-        // Sequence is at offset 4 within the entry (after magic + length).
-        Ok(Some(le::get_u64(&self.buf[self.pos + 4..])))
+        let header = EntryHeader::ref_from_prefix(&self.buf[self.pos..])
+            .expect("ensure_available guarantees at least ENTRY_HEADER_SIZE bytes")
+            .0;
+        Ok(Some(header.sequence.get()))
     }
 
     /// Skip forward past all entries with sequence ≤ `target_seq`.
@@ -488,13 +491,14 @@ impl RawJournalScanner {
             if self.buf[self.pos] == 0 && self.buf[self.pos + 1] == 0 {
                 return Ok(());
             }
-            let entry_seq = le::get_u64(&self.buf[self.pos + 4..]);
-            if entry_seq > target_seq {
+            let header = EntryHeader::ref_from_prefix(&self.buf[self.pos..])
+                .expect("ensure_available guarantees at least ENTRY_HEADER_SIZE bytes")
+                .0;
+            if header.sequence.get() > target_seq {
                 return Ok(()); // Found the first entry past target.
             }
             // Skip this entry.
-            let payload_len = le::get_u16(&self.buf[self.pos + 2..]) as usize;
-            let total = ENTRY_HEADER_SIZE + payload_len + CRC_SIZE;
+            let total = ENTRY_HEADER_SIZE + header.length.get() as usize + CRC_SIZE;
             self.ensure_available(total)?;
             if self.valid - self.pos < total {
                 return Ok(()); // Truncated entry at EOF.
@@ -525,8 +529,17 @@ impl RawJournalScanner {
                 break; // Pre-allocated space.
             }
 
-            let payload_len = le::get_u16(&self.buf[self.pos + 2..]) as usize;
-            let total = ENTRY_HEADER_SIZE + payload_len + CRC_SIZE;
+            // Copy scalars out of the header view before any mutating call
+            // on `self` (ensure_available below) invalidates the borrow.
+            let (entry_seq, total) = {
+                let header = EntryHeader::ref_from_prefix(&self.buf[self.pos..])
+                    .expect("ensure_available guarantees at least ENTRY_HEADER_SIZE bytes")
+                    .0;
+                (
+                    header.sequence.get(),
+                    ENTRY_HEADER_SIZE + header.length.get() as usize + CRC_SIZE,
+                )
+            };
 
             // Don't exceed max_bytes (but always include at least one entry).
             if any && (out.len() - batch_start) + total > max_bytes {
@@ -538,7 +551,7 @@ impl RawJournalScanner {
                 break; // Truncated entry at EOF.
             }
 
-            end_seq = le::get_u64(&self.buf[self.pos + 4..]);
+            end_seq = entry_seq;
             out.extend_from_slice(&self.buf[self.pos..self.pos + total]);
             self.pos += total;
             any = true;
