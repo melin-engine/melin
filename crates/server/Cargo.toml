@@ -68,6 +68,10 @@ tracing = { workspace = true }
 tikv-jemallocator = { workspace = true }
 tracing-subscriber = { workspace = true }
 io-uring = "0.7"
+# Typed views over raw byte buffers for replication control frames —
+# replaces hand-rolled extend_from_slice / try_into chains. derive
+# feature for `FromBytes` / `IntoBytes`.
+zerocopy = { version = "0.8", features = ["derive"] }
 melin-dpdk = { path = "../dpdk", optional = true }
 
 [dev-dependencies]

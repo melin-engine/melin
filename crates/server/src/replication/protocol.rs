@@ -9,6 +9,8 @@
 use std::io::{self, Read};
 
 use melin_trading::trading_event::TradingEvent;
+use zerocopy::little_endian::{U32, U64};
+use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout, Unaligned};
 
 use crate::InputSlot;
 
@@ -104,31 +106,132 @@ pub enum ReplicaMessage {
     Ack(Ack),
 }
 
+// --- Wire structs ---
+//
+// Post-length form (the byte stripped by `read_frame` is the 4-byte
+// length prefix; what remains starts with the tag). Each frame type
+// has its own struct so encoders write all fields in one block and
+// decoders peel a typed prefix instead of computing offsets.
+//
+// `little_endian::U{32,64}` are 1-byte-aligned LE wrappers, so a
+// `repr(C)` struct of them is byte-packed (no padding) and serialises
+// bit-for-bit identically to the previous hand-rolled `to_le_bytes`
+// chains. Wire layout is authoritative — assertions below pin it.
+
+#[derive(FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned)]
+#[repr(C)]
+struct HandshakeFrame {
+    tag: u8,
+    last_sequence: U64,
+    chain_hash: [u8; 32],
+}
+
+#[derive(FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned)]
+#[repr(C)]
+struct AckFrame {
+    tag: u8,
+    acked_sequence: U64,
+}
+
+#[derive(FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned)]
+#[repr(C)]
+struct ChallengeFrame {
+    tag: u8,
+    nonce: [u8; 32],
+}
+
+#[derive(FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned)]
+#[repr(C)]
+struct ChallengeResponseFrame {
+    tag: u8,
+    signature: [u8; 64],
+    pubkey: [u8; 32],
+}
+
+#[derive(FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned)]
+#[repr(C)]
+struct SnapshotBeginFrame {
+    tag: u8,
+    snapshot_len: U64,
+    snap_sequence: U64,
+    snap_chain_hash: [u8; 32],
+}
+
+#[derive(FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned)]
+#[repr(C)]
+struct SnapshotEndFrame {
+    tag: u8,
+    crc32c: U32,
+}
+
+#[derive(FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned)]
+#[repr(C)]
+struct HeartbeatFrame {
+    tag: u8,
+    sequence: U64,
+}
+
+/// Variable-tail frame: `tag(1) + start_sequence(8) + genesis_len(4)`
+/// followed by `genesis_len` raw bytes. Decoder peels this 13-byte
+/// prefix typed; the genesis bytes are read as a slice.
+#[derive(FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned)]
+#[repr(C)]
+struct StreamStartHeader {
+    tag: u8,
+    start_sequence: U64,
+    genesis_len: U32,
+}
+
+const _: () = assert!(core::mem::size_of::<HandshakeFrame>() == 41);
+const _: () = assert!(core::mem::size_of::<AckFrame>() == 9);
+const _: () = assert!(core::mem::size_of::<ChallengeFrame>() == 33);
+const _: () = assert!(core::mem::size_of::<ChallengeResponseFrame>() == 97);
+const _: () = assert!(core::mem::size_of::<SnapshotBeginFrame>() == 49);
+const _: () = assert!(core::mem::size_of::<SnapshotEndFrame>() == 5);
+const _: () = assert!(core::mem::size_of::<HeartbeatFrame>() == 9);
+const _: () = assert!(core::mem::size_of::<StreamStartHeader>() == 13);
+
+/// Helper: `length_prefix(buf, payload_len)` writes the 4-byte LE
+/// frame length prefix for a payload of `payload_len` bytes.
+#[inline]
+fn write_length_prefix(buf: &mut Vec<u8>, payload_len: u32) {
+    buf.extend_from_slice(&payload_len.to_le_bytes());
+}
+
 // --- Encoders ---
 
 /// Encode a handshake message into a frame (length-prefixed).
 pub(super) fn encode_handshake(h: &Handshake, buf: &mut Vec<u8>) {
-    let payload_len: u32 = 1 + 8 + 32; // type + sequence + hash
-    buf.extend_from_slice(&payload_len.to_le_bytes());
-    buf.push(MSG_HANDSHAKE);
-    buf.extend_from_slice(&h.last_sequence.to_le_bytes());
-    buf.extend_from_slice(&h.chain_hash);
+    let frame = HandshakeFrame {
+        tag: MSG_HANDSHAKE,
+        last_sequence: U64::new(h.last_sequence),
+        chain_hash: h.chain_hash,
+    };
+    let payload = frame.as_bytes();
+    write_length_prefix(buf, payload.len() as u32);
+    buf.extend_from_slice(payload);
 }
 
 /// Encode an ack message into a frame.
 pub(super) fn encode_ack(ack: &Ack, buf: &mut Vec<u8>) {
-    let payload_len: u32 = 1 + 8; // type + sequence
-    buf.extend_from_slice(&payload_len.to_le_bytes());
-    buf.push(MSG_ACK);
-    buf.extend_from_slice(&ack.acked_sequence.to_le_bytes());
+    let frame = AckFrame {
+        tag: MSG_ACK,
+        acked_sequence: U64::new(ack.acked_sequence),
+    };
+    let payload = frame.as_bytes();
+    write_length_prefix(buf, payload.len() as u32);
+    buf.extend_from_slice(payload);
 }
 
 /// Encode a Challenge message (primary → replica).
 pub(super) fn encode_challenge(nonce: &[u8; 32], buf: &mut Vec<u8>) {
-    let payload_len: u32 = 1 + 32; // type + nonce
-    buf.extend_from_slice(&payload_len.to_le_bytes());
-    buf.push(MSG_CHALLENGE);
-    buf.extend_from_slice(nonce);
+    let frame = ChallengeFrame {
+        tag: MSG_CHALLENGE,
+        nonce: *nonce,
+    };
+    let payload = frame.as_bytes();
+    write_length_prefix(buf, payload.len() as u32);
+    buf.extend_from_slice(payload);
 }
 
 /// Encode a ChallengeResponse message (replica → primary).
@@ -137,11 +240,14 @@ pub(super) fn encode_challenge_response(
     pubkey: &[u8; 32],
     buf: &mut Vec<u8>,
 ) {
-    let payload_len: u32 = 1 + 64 + 32; // type + signature + pubkey
-    buf.extend_from_slice(&payload_len.to_le_bytes());
-    buf.push(MSG_CHALLENGE_RESPONSE);
-    buf.extend_from_slice(signature);
-    buf.extend_from_slice(pubkey);
+    let frame = ChallengeResponseFrame {
+        tag: MSG_CHALLENGE_RESPONSE,
+        signature: *signature,
+        pubkey: *pubkey,
+    };
+    let payload = frame.as_bytes();
+    write_length_prefix(buf, payload.len() as u32);
+    buf.extend_from_slice(payload);
 }
 
 /// Encode an AuthOk message (primary → replica).
@@ -169,12 +275,14 @@ pub(super) fn encode_stream_start(
     genesis_entry_bytes: &[u8],
     buf: &mut Vec<u8>,
 ) {
-    // type(1) + sequence(8) + genesis_len(4) + genesis_bytes
-    let payload_len: u32 = (1 + 8 + 4 + genesis_entry_bytes.len()) as u32;
-    buf.extend_from_slice(&payload_len.to_le_bytes());
-    buf.push(MSG_STREAM_START);
-    buf.extend_from_slice(&start_sequence.to_le_bytes());
-    buf.extend_from_slice(&(genesis_entry_bytes.len() as u32).to_le_bytes());
+    let header = StreamStartHeader {
+        tag: MSG_STREAM_START,
+        start_sequence: U64::new(start_sequence),
+        genesis_len: U32::new(genesis_entry_bytes.len() as u32),
+    };
+    let header_bytes = header.as_bytes();
+    write_length_prefix(buf, (header_bytes.len() + genesis_entry_bytes.len()) as u32);
+    buf.extend_from_slice(header_bytes);
     buf.extend_from_slice(genesis_entry_bytes);
 }
 
@@ -192,13 +300,15 @@ pub(super) fn encode_snapshot_begin(
     snap_chain_hash: &[u8; 32],
     buf: &mut Vec<u8>,
 ) {
-    // type(1) + snapshot_len(8) + snap_sequence(8) + snap_chain_hash(32)
-    let payload_len: u32 = 1 + 8 + 8 + 32;
-    buf.extend_from_slice(&payload_len.to_le_bytes());
-    buf.push(MSG_SNAPSHOT_BEGIN);
-    buf.extend_from_slice(&snapshot_len.to_le_bytes());
-    buf.extend_from_slice(&snap_sequence.to_le_bytes());
-    buf.extend_from_slice(snap_chain_hash);
+    let frame = SnapshotBeginFrame {
+        tag: MSG_SNAPSHOT_BEGIN,
+        snapshot_len: U64::new(snapshot_len),
+        snap_sequence: U64::new(snap_sequence),
+        snap_chain_hash: *snap_chain_hash,
+    };
+    let payload = frame.as_bytes();
+    write_length_prefix(buf, payload.len() as u32);
+    buf.extend_from_slice(payload);
 }
 
 /// Encode a SnapshotChunk message.
@@ -212,11 +322,13 @@ pub(super) fn encode_snapshot_chunk(data: &[u8], buf: &mut Vec<u8>) {
 
 /// Encode a SnapshotEnd message.
 pub(super) fn encode_snapshot_end(crc32c: u32, buf: &mut Vec<u8>) {
-    // type(1) + crc32c(4)
-    let payload_len: u32 = 1 + 4;
-    buf.extend_from_slice(&payload_len.to_le_bytes());
-    buf.push(MSG_SNAPSHOT_END);
-    buf.extend_from_slice(&crc32c.to_le_bytes());
+    let frame = SnapshotEndFrame {
+        tag: MSG_SNAPSHOT_END,
+        crc32c: U32::new(crc32c),
+    };
+    let payload = frame.as_bytes();
+    write_length_prefix(buf, payload.len() as u32);
+    buf.extend_from_slice(payload);
 }
 
 /// Encode a HashMismatch message.
@@ -230,10 +342,13 @@ pub(super) fn encode_hash_mismatch(buf: &mut Vec<u8>) {
 /// Encode a Heartbeat message. Carries only the last-acked sequence;
 /// the chain hash is verified at Checkpoint events, not on every heartbeat.
 pub(super) fn encode_heartbeat(sequence: u64, buf: &mut Vec<u8>) {
-    let payload_len: u32 = 1 + 8;
-    buf.extend_from_slice(&payload_len.to_le_bytes());
-    buf.push(MSG_HEARTBEAT);
-    buf.extend_from_slice(&sequence.to_le_bytes());
+    let frame = HeartbeatFrame {
+        tag: MSG_HEARTBEAT,
+        sequence: U64::new(sequence),
+    };
+    let payload = frame.as_bytes();
+    write_length_prefix(buf, payload.len() as u32);
+    buf.extend_from_slice(payload);
 }
 
 // --- Decoders / framing ---
@@ -258,36 +373,28 @@ pub(super) fn read_frame(reader: &mut impl Read, max_size: usize) -> io::Result<
 
 /// Decode a Challenge payload → 32-byte nonce.
 pub(super) fn decode_challenge(payload: &[u8]) -> io::Result<[u8; 32]> {
-    if payload.len() < 1 + 32 {
-        return Err(io::Error::other("challenge too short"));
-    }
-    if payload[0] != MSG_CHALLENGE {
+    let (frame, _) = ChallengeFrame::ref_from_prefix(payload)
+        .map_err(|_| io::Error::other("challenge too short"))?;
+    if frame.tag != MSG_CHALLENGE {
         return Err(io::Error::other(format!(
             "expected Challenge (0x{:02x}), got 0x{:02x}",
-            MSG_CHALLENGE, payload[0]
+            MSG_CHALLENGE, frame.tag
         )));
     }
-    let mut nonce = [0u8; 32];
-    nonce.copy_from_slice(&payload[1..33]);
-    Ok(nonce)
+    Ok(frame.nonce)
 }
 
 /// Decode a ChallengeResponse payload → (signature, pubkey).
 pub(super) fn decode_challenge_response(payload: &[u8]) -> io::Result<([u8; 64], [u8; 32])> {
-    if payload.len() < 1 + 64 + 32 {
-        return Err(io::Error::other("challenge response too short"));
-    }
-    if payload[0] != MSG_CHALLENGE_RESPONSE {
+    let (frame, _) = ChallengeResponseFrame::ref_from_prefix(payload)
+        .map_err(|_| io::Error::other("challenge response too short"))?;
+    if frame.tag != MSG_CHALLENGE_RESPONSE {
         return Err(io::Error::other(format!(
             "expected ChallengeResponse (0x{:02x}), got 0x{:02x}",
-            MSG_CHALLENGE_RESPONSE, payload[0]
+            MSG_CHALLENGE_RESPONSE, frame.tag
         )));
     }
-    let mut signature = [0u8; 64];
-    signature.copy_from_slice(&payload[1..65]);
-    let mut pubkey = [0u8; 32];
-    pubkey.copy_from_slice(&payload[65..97]);
-    Ok((signature, pubkey))
+    Ok((frame.signature, frame.pubkey))
 }
 
 /// Decode an auth result payload → true if AuthOk, false if AuthFailed.
@@ -311,23 +418,19 @@ pub(super) fn decode_replica_message(payload: &[u8]) -> io::Result<ReplicaMessag
     }
     match payload[0] {
         MSG_HANDSHAKE => {
-            if payload.len() < 1 + 8 + 32 {
-                return Err(io::Error::other("handshake too short"));
-            }
-            let last_sequence = u64::from_le_bytes(payload[1..9].try_into().unwrap());
-            let mut chain_hash = [0u8; 32];
-            chain_hash.copy_from_slice(&payload[9..41]);
+            let (frame, _) = HandshakeFrame::ref_from_prefix(payload)
+                .map_err(|_| io::Error::other("handshake too short"))?;
             Ok(ReplicaMessage::Handshake(Handshake {
-                last_sequence,
-                chain_hash,
+                last_sequence: frame.last_sequence.get(),
+                chain_hash: frame.chain_hash,
             }))
         }
         MSG_ACK => {
-            if payload.len() < 1 + 8 {
-                return Err(io::Error::other("ack too short"));
-            }
-            let acked_sequence = u64::from_le_bytes(payload[1..9].try_into().unwrap());
-            Ok(ReplicaMessage::Ack(Ack { acked_sequence }))
+            let (frame, _) = AckFrame::ref_from_prefix(payload)
+                .map_err(|_| io::Error::other("ack too short"))?;
+            Ok(ReplicaMessage::Ack(Ack {
+                acked_sequence: frame.acked_sequence.get(),
+            }))
         }
         other => Err(io::Error::other(format!(
             "unknown replica message type: 0x{other:02x}"
@@ -342,53 +445,42 @@ pub(super) fn decode_primary_message(payload: &[u8]) -> io::Result<PrimaryMessag
     }
     match payload[0] {
         MSG_STREAM_START => {
-            if payload.len() < 1 + 8 + 4 {
-                return Err(io::Error::other("StreamStart too short"));
-            }
-            let start_sequence = u64::from_le_bytes(payload[1..9].try_into().unwrap());
-            let genesis_len = u32::from_le_bytes(payload[9..13].try_into().unwrap()) as usize;
-            if payload.len() < 13 + genesis_len {
+            let (header, tail) = StreamStartHeader::ref_from_prefix(payload)
+                .map_err(|_| io::Error::other("StreamStart too short"))?;
+            let genesis_len = header.genesis_len.get() as usize;
+            if tail.len() < genesis_len {
                 return Err(io::Error::other("StreamStart genesis truncated"));
             }
-            let genesis_entry = payload[13..13 + genesis_len].to_vec();
             Ok(PrimaryMessage::StreamStart {
-                start_sequence,
-                genesis_entry,
+                start_sequence: header.start_sequence.get(),
+                genesis_entry: tail[..genesis_len].to_vec(),
             })
         }
         MSG_NEED_SNAPSHOT => Ok(PrimaryMessage::NeedSnapshot),
         MSG_HASH_MISMATCH => Ok(PrimaryMessage::HashMismatch),
         MSG_SNAPSHOT_BEGIN => {
-            if payload.len() < 1 + 8 + 8 + 32 {
-                return Err(io::Error::other("SnapshotBegin too short"));
-            }
-            let snapshot_len = u64::from_le_bytes(payload[1..9].try_into().unwrap());
-            let snap_sequence = u64::from_le_bytes(payload[9..17].try_into().unwrap());
-            let mut snap_chain_hash = [0u8; 32];
-            snap_chain_hash.copy_from_slice(&payload[17..49]);
+            let (frame, _) = SnapshotBeginFrame::ref_from_prefix(payload)
+                .map_err(|_| io::Error::other("SnapshotBegin too short"))?;
             Ok(PrimaryMessage::SnapshotBegin {
-                snapshot_len,
-                snap_sequence,
-                snap_chain_hash,
+                snapshot_len: frame.snapshot_len.get(),
+                snap_sequence: frame.snap_sequence.get(),
+                snap_chain_hash: frame.snap_chain_hash,
             })
         }
-        MSG_SNAPSHOT_CHUNK => {
-            let data = payload[1..].to_vec();
-            Ok(PrimaryMessage::SnapshotChunk(data))
-        }
+        MSG_SNAPSHOT_CHUNK => Ok(PrimaryMessage::SnapshotChunk(payload[1..].to_vec())),
         MSG_SNAPSHOT_END => {
-            if payload.len() < 1 + 4 {
-                return Err(io::Error::other("SnapshotEnd too short"));
-            }
-            let crc32c = u32::from_le_bytes(payload[1..5].try_into().unwrap());
-            Ok(PrimaryMessage::SnapshotEnd { crc32c })
+            let (frame, _) = SnapshotEndFrame::ref_from_prefix(payload)
+                .map_err(|_| io::Error::other("SnapshotEnd too short"))?;
+            Ok(PrimaryMessage::SnapshotEnd {
+                crc32c: frame.crc32c.get(),
+            })
         }
         MSG_HEARTBEAT => {
-            if payload.len() < 1 + 8 {
-                return Err(io::Error::other("Heartbeat too short"));
-            }
-            let sequence = u64::from_le_bytes(payload[1..9].try_into().unwrap());
-            Ok(PrimaryMessage::Heartbeat { sequence })
+            let (frame, _) = HeartbeatFrame::ref_from_prefix(payload)
+                .map_err(|_| io::Error::other("Heartbeat too short"))?;
+            Ok(PrimaryMessage::Heartbeat {
+                sequence: frame.sequence.get(),
+            })
         }
         other => Err(io::Error::other(format!(
             "unknown primary message type: 0x{other:02x}"

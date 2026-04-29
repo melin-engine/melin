@@ -1711,6 +1711,7 @@ dependencies = [
  "tikv-jemallocator",
  "tracing",
  "tracing-subscriber",
+ "zerocopy",
 ]
 
 [[package]]
