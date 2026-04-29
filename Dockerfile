@@ -19,8 +19,11 @@
 FROM rust:1.88-bookworm AS builder
 
 # Install git + openssh for private GitHub dependencies (astenn, fastcp).
+# nasm is required for blake3 to compile its AVX-512 compress_in_place
+# assembly stubs (blake3_avx512_ffi); without it blake3 falls back to the
+# SSE4.1 path even on AVX-512-capable CPUs (e.g., EPYC 9255 / Zen 4).
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    git openssh-client \
+    git openssh-client nasm \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /build
