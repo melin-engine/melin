@@ -1865,6 +1865,7 @@ where
 /// events) but not byte-identical (each node stamps its own wall-clock
 /// on the batch when `slot.sequence == 0`, and checkpoint timing may
 /// vary after journal rotation).
+// TODO Only used in tests, this should probably be removed.
 pub fn build_replica_pipeline<A>(
     app: A,
     writer: melin_journal::JournalWriter<A::Event>,

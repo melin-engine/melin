@@ -22,12 +22,18 @@ name = "melin-plot"
 path = "src/plot.rs"
 required-features = ["plot"]
 
+[[bin]]
+name = "journal_writer_bench"
+path = "src/journal_writer_bench.rs"
+
 [dependencies]
 melin-engine = { path = "../engine" }
 melin-trading = { path = "../trading" }
 melin-disruptor = { path = "../disruptor" }
 melin-protocol = { path = "../protocol" }
 melin-server = { path = "../server" }
+melin-app = { path = "../app" }
+melin-transport-core = { path = "../transport-core" }
 base64 = { workspace = true }
 clap = { workspace = true }
 ed25519-dalek = { workspace = true }
@@ -45,3 +51,4 @@ plotters = { version = "0.3", optional = true, default-features = false, feature
 rayon = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+tempfile = "3"

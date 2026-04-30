@@ -8,34 +8,6 @@
 
 **Commercial product** — the goal is to sell licenses to exchanges or sell the project to an acquirer. Every feature decision should be evaluated through the lens of "does this make the product more appealing to an exchange operator or investor?"
 
-See [README.md](README.md#features) for implemented features and [docs/roadmap.md](docs/roadmap.md) for planned features.
-
-## Crate Layout
-
-The repo splits into a reusable transport and pluggable applications. This split lets the matching engine (the primary revenue-bearing app) share transport code with the noop benchmark app, and keeps the abstraction layer shippable to future applications (bespoke matchers, non-trading workloads).
-
-**Transport core (application-agnostic):**
-- `melin-app` — `Application` / `AppEvent` traits, `ApplyCtx`, `RejectReason`. Small crate, trait definitions only — apps depend on this without pulling transport internals.
-- `melin-journal` — write-ahead log framing, BLAKE3 hash chain, CRC32C, reader/writer. Generic over `AppEvent`.
-- `melin-disruptor` — lock-free ring buffer primitives (multi-producer, multi-consumer, SeqLock).
-- `melin-transport-core` — disruptor wiring, `InputSlot<E>` / `OutputSlot<R, Q>` ring slot types, `Pipeline<A>` / `ReplicaPipeline<A>` builders, `JournaledApp<A>` lifecycle wrapper (create / recover / recover_from_snapshot / rotate), application-generic snapshot framing.
-
-**Applications (plug into the transport):**
-- `melin-trading` — shared trading types (`TradingEvent`, `ExecutionReport`, `QueryResponse`, price/qty primitives). Both `melin-engine` and `melin-noop` depend on this.
-- `melin-engine` — matching engine, order book, accounts, risk, fees, circuit breakers; `Application` impl on `Exchange`.
-- `melin-market-data` — book mirrors for the event publisher (trading-only).
-- `melin-noop` — no-op `Application` impl, same wire types as trading, used to isolate transport throughput from matching cost.
-
-**Server, gateways, tooling:**
-- `melin-server` — binary; composes transport + selected app (`--features trading` vs `--features noop`, mutually exclusive) into a running exchange.
-- `melin-protocol`, `melin-client` — custom binary wire protocol + Rust client.
-- `melin-oe-gateway`, `melin-md-gateway`, `melin-gateway-core` — FIX 4.4 order-entry and market-data gateways.
-- `melin-admin`, `melin-tui`, `melin-tui-fix-client` — operator tooling.
-- `melin-bench` — benchmarking harness.
-- `melin-dpdk` — DPDK kernel-bypass transport, feature-gated.
-
-`cargo build -p melin-server --features noop --no-default-features` drops `melin-engine` and `melin-market-data` from the dep graph entirely. Useful for transport-only benchmarks and as a regression surface proving the `Application` abstraction holds.
-
 ## Conventions
 
 - Follow Rust best practices (idiomatic patterns, clippy clean, formatted with `cargo fmt`).
@@ -63,7 +35,6 @@ The repo splits into a reusable transport and pluggable applications. This split
 ## Key Design Constraints
 
 - **~100ns per order budget** — at 10M orders/sec, every allocation, cache miss, and branch misprediction counts
-- **Single-threaded business logic** (LMAX core) — no locks on the hot path; I/O and journaling happen on separate threads via ring buffers
 - **Deterministic replay** — given the same input events, output must be identical; this is the foundation of event sourcing and crash recovery
 - **Strict price-time priority** — no order may jump the queue; correctness here is non-negotiable
 - **Durable journaling** — every event is persisted before acknowledgement; snapshots prevent full replay from genesis on recovery
@@ -71,10 +42,6 @@ The repo splits into a reusable transport and pluggable applications. This split
 - **Hot-path scope** — risk checks, self-trade prevention, and order throttling all run on the critical path and must be zero/low-cost
 - **Tail latency matters** — measure p99/p99.9, not averages
 - **Extensive testing** — property-based and fuzz testing for edge cases (partial fills at price boundaries, cancel-replace races, empty book scenarios)
-
-## Roadmap
-
-See [README.md](README.md#features) for implemented features and [docs/roadmap.md](docs/roadmap.md) for planned features.
 
 ## Working Style
 - **Propose the best fix, not the simplest** — when there are multiple approaches, present the options with trade-offs and recommend the best one. Don't default to the quick hack.
