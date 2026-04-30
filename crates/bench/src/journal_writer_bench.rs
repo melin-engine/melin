@@ -79,7 +79,9 @@ fn run_journal_writer_bench(num_events: usize, batch_size: usize, _warmup: usize
 
     // Write in batches.
     let mut events_written = 0;
-    for batch_start in 0..num_events {
+    let num_batches = num_events.div_ceil(batch_size);
+    for batch_idx in 0..num_batches {
+        let batch_start = batch_idx * batch_size;
         let batch_end = std::cmp::min(batch_start + batch_size, num_events);
         for i in batch_start..batch_end {
             let order_id = melin_trading::OrderId((i as u64) + 1);
