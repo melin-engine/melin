@@ -67,6 +67,8 @@ pub const CHECKPOINT_INTERVAL: u64 = 100_000;
 pub struct AsyncWriteBatch {
     /// The buffer containing encoded journal entries.
     pub buf: Box<[u8; BATCH_BUF_CAPACITY]>,
+    /// Number of valid bytes in `buf`. Only `buf[..len]` should be written.
+    pub len: usize,
     /// File offset where this batch should be written.
     pub offset: u64,
 }
@@ -117,6 +119,11 @@ pub struct JournalWriter<E: AppEvent> {
     /// builds to keep the hot path cost at exactly zero.
     #[cfg(debug_assertions)]
     last_encoded_seq: u64,
+    /// Number of valid bytes currently written into `batch_buf`. Acts as the
+    /// write cursor: new entries are appended at `batch_buf[batch_len..]`.
+    /// Reset to 0 on every flush or discard. Separate from `last_user_entry_len`
+    /// which tracks only the most-recent user entry's size.
+    batch_len: usize,
     /// Byte range of the most-recent user entry within `batch_buf`.
     /// Captured by `encode_event` BEFORE any auto-checkpoint emission,
     /// so `last_user_entry_replication_slice` returns the user entry
@@ -222,6 +229,8 @@ impl<E: AppEvent> JournalWriter<E> {
         });
 
         writer.batch_buf[0..written].copy_from_slice(&writer.buffer[..written]);
+        writer.last_user_entry_len = written; // FIX: Update last_user_entry_len
+        writer.batch_len += written; // FIX: Track total batch length
         writer.next_sequence += 1;
         writer.flush_batch_sync()?;
 
@@ -287,6 +296,13 @@ impl<E: AppEvent> JournalWriter<E> {
 
         // Convert aligned raw pointers to Box.
         // Use Box<[u8; BATCH_BUF_CAPACITY]> which expects a pointer to an array.
+        // Zero-initialize to avoid writing uninitialized garbage to disk.
+        let batch_buf_slice =
+            unsafe { std::slice::from_raw_parts_mut(batch_buf_ptr, BATCH_BUF_CAPACITY) };
+        let spare_buf_slice =
+            unsafe { std::slice::from_raw_parts_mut(spare_buf_ptr, BATCH_BUF_CAPACITY) };
+        batch_buf_slice.fill(0);
+        spare_buf_slice.fill(0);
         let batch_buf: Box<[u8; BATCH_BUF_CAPACITY]> =
             unsafe { std::mem::transmute(batch_buf_ptr) };
         let spare_buf: Box<[u8; BATCH_BUF_CAPACITY]> =
@@ -333,6 +349,7 @@ impl<E: AppEvent> JournalWriter<E> {
             hash_chain: None,
             #[cfg(debug_assertions)]
             last_encoded_seq: 0,
+            batch_len: 0,
             last_user_entry_offset: 0,
             last_user_entry_len: 0,
             no_fua: false,
@@ -402,8 +419,17 @@ impl<E: AppEvent> JournalWriter<E> {
         Self::lock_buffer(batch_buf_ptr, BATCH_BUF_CAPACITY)?;
         Self::lock_buffer(spare_buf_ptr, BATCH_BUF_CAPACITY)?;
 
-        let batch_buf = unsafe { Box::from_raw(batch_buf_ptr as *mut [u8; BATCH_BUF_CAPACITY]) };
-        let spare_buf = unsafe { Box::from_raw(spare_buf_ptr as *mut [u8; BATCH_BUF_CAPACITY]) };
+        // Zero-initialize to avoid writing uninitialized garbage to disk.
+        let batch_buf_slice =
+            unsafe { std::slice::from_raw_parts_mut(batch_buf_ptr, BATCH_BUF_CAPACITY) };
+        let spare_buf_slice =
+            unsafe { std::slice::from_raw_parts_mut(spare_buf_ptr, BATCH_BUF_CAPACITY) };
+        batch_buf_slice.fill(0);
+        spare_buf_slice.fill(0);
+        let batch_buf: Box<[u8; BATCH_BUF_CAPACITY]> =
+            unsafe { std::mem::transmute(batch_buf_ptr) };
+        let spare_buf: Box<[u8; BATCH_BUF_CAPACITY]> =
+            unsafe { std::mem::transmute(spare_buf_ptr) };
 
         #[allow(unused_mut)] // mut needed only with hash-chain for emit_checkpoint
         let mut writer = Self {
@@ -424,6 +450,7 @@ impl<E: AppEvent> JournalWriter<E> {
             }),
             #[cfg(debug_assertions)]
             last_encoded_seq: last_seq,
+            batch_len: 0,
             last_user_entry_offset: 0,
             last_user_entry_len: 0,
             no_fua: false,
@@ -575,10 +602,11 @@ impl<E: AppEvent> JournalWriter<E> {
         // Record the user entry's position in batch_buf BEFORE the
         // auto-checkpoint append below, so `last_user_entry_replication_slice`
         // returns the user entry only — not a trailing checkpoint.
-        let offset = self.last_user_entry_len;
+        let offset = self.batch_len;
         self.last_user_entry_offset = offset;
         self.batch_buf[offset..offset + written].copy_from_slice(&self.buffer[..written]);
-        self.last_user_entry_len += written;
+        self.last_user_entry_len = written;
+        self.batch_len += written;
 
         // Auto-emit a checkpoint if we've hit the interval.
         // Finalize the batch hasher to get the current hash (including all
@@ -633,9 +661,9 @@ impl<E: AppEvent> JournalWriter<E> {
         }
 
         self.warn_if_batch_overflow(written);
-        self.batch_buf[self.last_user_entry_len..self.last_user_entry_len + written]
+        self.batch_buf[self.batch_len..self.batch_len + written]
             .copy_from_slice(&self.buffer[..written]);
-        self.last_user_entry_len += written;
+        self.batch_len += written;
         self.next_sequence += 1;
         Ok(())
     }
@@ -649,9 +677,9 @@ impl<E: AppEvent> JournalWriter<E> {
     /// per actual realloc.
     #[inline]
     fn warn_if_batch_overflow(&mut self, adding: usize) {
-        if self.last_user_entry_len + adding > BATCH_BUF_CAPACITY {
+        if self.batch_len + adding > BATCH_BUF_CAPACITY {
             tracing::warn!(
-                current_len = self.last_user_entry_len,
+                current_len = self.batch_len,
                 adding,
                 capacity = BATCH_BUF_CAPACITY,
                 "journal batch buffer exceeded preallocated capacity — \
@@ -672,13 +700,17 @@ impl<E: AppEvent> JournalWriter<E> {
     /// (pwritev2 + RWF_DSYNC) instead, which provides stronger durability guarantees with
     /// FUA writes on NVMe drives.
     pub fn flush_batch(&mut self) -> Result<(), JournalError> {
-        if self.last_user_entry_len == 0 {
+        if self.batch_len == 0 {
             return Ok(());
         }
-        self.ensure_allocated(self.last_user_entry_len as u64)?;
-        pwritev2_dsync(self.file.as_raw_fd(), &*self.batch_buf, self.write_pos)?;
-        self.write_pos += self.last_user_entry_len as u64;
-        *self.batch_buf = [0; BATCH_BUF_CAPACITY];
+        self.ensure_allocated(self.batch_len as u64)?;
+        pwritev2_dsync(
+            self.file.as_raw_fd(),
+            &self.batch_buf[..self.batch_len],
+            self.write_pos,
+        )?;
+        self.write_pos += self.batch_len as u64;
+        self.batch_len = 0;
         self.last_user_entry_len = 0;
         Ok(())
     }
@@ -696,23 +728,28 @@ impl<E: AppEvent> JournalWriter<E> {
     /// Protection (PLP) capacitors for crash durability. Latency drops to
     /// ~1-5 µs (controller DRAM write), eliminating GC-induced spikes entirely.
     pub fn flush_batch_sync(&mut self) -> Result<(), JournalError> {
-        if self.last_user_entry_len == 0 {
+        if self.batch_len == 0 {
             return Ok(());
         }
-        self.ensure_allocated(self.last_user_entry_len as u64)?;
+        self.ensure_allocated(self.batch_len as u64)?;
 
         if self.no_fua {
-            self.file.write_all_at(&*self.batch_buf, self.write_pos)?;
+            self.file
+                .write_all_at(&self.batch_buf[..self.batch_len], self.write_pos)?;
         } else {
-            pwritev2_dsync(self.file.as_raw_fd(), &*self.batch_buf, self.write_pos)?;
+            pwritev2_dsync(
+                self.file.as_raw_fd(),
+                &self.batch_buf[..self.batch_len],
+                self.write_pos,
+            )?;
         }
 
         // Hash chain is NOT finalized per-flush — only at checkpoint
         // boundaries. This ensures the chain is deterministic regardless of
         // write batching strategy. chain_hash() computes on-demand.
 
-        self.write_pos += self.last_user_entry_len as u64;
-        *self.batch_buf = [0; BATCH_BUF_CAPACITY];
+        self.write_pos += self.batch_len as u64;
+        self.batch_len = 0;
         self.last_user_entry_len = 0;
         Ok(())
     }
@@ -724,7 +761,7 @@ impl<E: AppEvent> JournalWriter<E> {
     /// Equivalent to `flush_batch_sync` minus the `pwritev2_dsync` and
     /// the `write_pos` advance.
     pub fn discard_batch_buf(&mut self) {
-        *self.batch_buf = [0; BATCH_BUF_CAPACITY];
+        self.batch_len = 0;
         self.last_user_entry_len = 0;
     }
 
@@ -742,16 +779,17 @@ impl<E: AppEvent> JournalWriter<E> {
     /// cursor must NOT advance until `confirm_async_write()` — the data
     /// is not yet durable.
     pub fn take_batch_for_async_write(&mut self) -> Result<Option<AsyncWriteBatch>, JournalError> {
-        if self.last_user_entry_len == 0 {
+        if self.batch_len == 0 {
             return Ok(None);
         }
-        self.ensure_allocated(self.last_user_entry_len as u64)?;
+        self.ensure_allocated(self.batch_len as u64)?;
 
         // Hash chain is NOT finalized per-flush — only at checkpoint
         // boundaries. chain_hash() computes on-demand.
 
+        let len = self.batch_len;
         let offset = self.write_pos;
-        self.write_pos += self.last_user_entry_len as u64;
+        self.write_pos += self.batch_len as u64;
 
         // Swap in the spare buffer (or allocate a new one if spare is in-flight).
         let spare = self
@@ -759,10 +797,12 @@ impl<E: AppEvent> JournalWriter<E> {
             .take()
             .unwrap_or_else(|| Box::new([0; BATCH_BUF_CAPACITY]));
         let full_buf = std::mem::replace(&mut self.batch_buf, spare);
+        self.batch_len = 0;
         self.last_user_entry_len = 0;
 
         Ok(Some(AsyncWriteBatch {
             buf: full_buf,
+            len,
             offset,
         }))
     }
@@ -771,8 +811,7 @@ impl<E: AppEvent> JournalWriter<E> {
     /// Call this after the io_uring CQE confirms the write completed.
     /// With O_DIRECT, this guarantees the write is durably stored on disk
     /// (requires PLP for true power-loss safety).
-    pub fn confirm_async_write(&mut self, mut batch: AsyncWriteBatch) {
-        *batch.buf = [0; BATCH_BUF_CAPACITY];
+    pub fn confirm_async_write(&mut self, batch: AsyncWriteBatch) {
         self.spare_buf = Some(batch.buf);
     }
 
@@ -876,7 +915,7 @@ impl<E: AppEvent> JournalWriter<E> {
     ///
     /// Returns an empty slice if no data is pending.
     pub fn pending_batch_bytes(&self) -> &[u8] {
-        &*self.batch_buf
+        &self.batch_buf[..self.batch_len]
     }
 
     /// Slice of the most-recent user entry in `batch_buf`, with the

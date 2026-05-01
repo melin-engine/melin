@@ -903,7 +903,7 @@ impl<E: AppEvent> JournalStage<E> {
             if shutdown.load(std::sync::atomic::Ordering::Relaxed) {
                 // Wait for in-flight write to complete.
                 if let Some((batch_data, seq)) = inflight.take() {
-                    self.wait_for_cqe(&mut ring, batch_data.buf.len())?;
+                    self.wait_for_cqe(&mut ring, batch_data.len)?;
                     self.consumer.set_progress(seq);
                     self.publish_chain_hash();
                     self.writer.confirm_async_write(batch_data);
@@ -933,11 +933,10 @@ impl<E: AppEvent> JournalStage<E> {
                         "io_uring journal write failed (errno {})",
                         -result
                     ))));
-                } else if (result as usize) != batch_data.buf.len() {
+                } else if (result as usize) != batch_data.len {
                     return Err(JournalError::Io(std::io::Error::other(format!(
                         "io_uring journal short write ({} of {} bytes)",
-                        result,
-                        batch_data.buf.len()
+                        result, batch_data.len
                     ))));
                 }
                 // Advance cursor: these events are now durable.
@@ -1017,11 +1016,10 @@ impl<E: AppEvent> JournalStage<E> {
                         "io_uring journal write failed (errno {})",
                         -result
                     ))));
-                } else if (result as usize) != batch_data.buf.len() {
+                } else if (result as usize) != batch_data.len {
                     return Err(JournalError::Io(std::io::Error::other(format!(
                         "io_uring journal short write ({} of {} bytes)",
-                        result,
-                        batch_data.buf.len()
+                        result, batch_data.len
                     ))));
                 }
                 self.consumer.set_progress(seq);
@@ -1049,7 +1047,7 @@ impl<E: AppEvent> JournalStage<E> {
                     // If a write is still in-flight, block until it completes
                     // (backpressure — both buffers full).
                     if let Some((batch_data, seq)) = inflight.take() {
-                        self.wait_for_cqe(&mut ring, batch_data.buf.len())?;
+                        self.wait_for_cqe(&mut ring, batch_data.len)?;
                         self.consumer.set_progress(seq);
                         self.publish_chain_hash();
                         self.writer.confirm_async_write(batch_data);
@@ -1073,7 +1071,7 @@ impl<E: AppEvent> JournalStage<E> {
                             let sqe = opcode::Write::new(
                                 types::Fixed(0),
                                 async_batch.buf.as_ptr(),
-                                async_batch.buf.len() as u32,
+                                async_batch.len as u32,
                             )
                             .offset(async_batch.offset)
                             .rw_flags(libc::RWF_DSYNC)

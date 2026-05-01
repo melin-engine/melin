@@ -309,6 +309,7 @@ impl JournaledExchange {
         let valid_end = reader.valid_file_end();
         let chain_hash = reader.chain_hash();
         let events_since_checkpoint = reader.events_since_checkpoint();
+        tracing::debug!(last_seq, valid_end, "recover: opening append");
         let writer = JournalWriter::open_append(
             journal_path,
             last_seq,
