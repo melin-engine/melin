@@ -2157,7 +2157,7 @@ fn init_engine(
     }
 
     let (app, mut writer) = engine.into_parts();
-    writer.set_no_fua(config.journal_no_fua);
+    writer.set_no_fua(config.journal_no_fua)?;
     Ok((app, writer, needs_seeding))
 }
 
