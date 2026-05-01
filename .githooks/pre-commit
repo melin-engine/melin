@@ -29,14 +29,8 @@ if ! cargo clippy --all-targets -- -D warnings 2>/dev/null; then
     exit 1
 fi
 
-# 4. Tests. Uses cargo-nextest (~2x faster than cargo test); falls back to
-# cargo test if nextest is not installed.
-if command -v cargo-nextest >/dev/null 2>&1; then
-    if ! cargo nextest run 2>/dev/null; then
-        echo "error: tests failed. Fix them and try again."
-        exit 1
-    fi
-elif ! cargo test 2>/dev/null; then
-    echo "error: tests failed. Fix them and try again. (Install cargo-nextest for ~2x faster runs.)"
+# 4. Tests.
+if ! cargo test 2>/dev/null; then
+    echo "error: tests failed. Fix them and try again."
     exit 1
 fi

@@ -4,8 +4,16 @@
 //! without any pipeline or matching engine overhead.
 //!
 //! Usage:
-//!     cargo run --release -p melin-bench --bin journal_writer_bench --mode <primary|replica>
+//!     cargo run --release -p melin-bench --bin journal_writer_bench -- [OPTIONS]
+//!
+//! Options:
+//!     --mode <primary|replica>   Write path to benchmark (default: primary)
+//!     --events <N>               Events to write (default: 1_000_000)
+//!     --batch-size <N>           Events per fsync batch (default: 1_024)
+//!     --warmup <N>               Warmup events, not measured (default: 100_000)
+//!     --journal-no-fua           Use plain pwrite + O_DIRECT (PLP drives only)
 
+use clap::Parser;
 use io_uring::IoUring;
 use std::num::NonZero;
 use std::time::Instant;
@@ -14,46 +22,59 @@ use melin_engine::journal::JournalEvent;
 use melin_engine::journal::JournalWriter;
 use melin_trading::trading_event::TradingEvent;
 
-/// Number of events to write per benchmark run.
-const DEFAULT_EVENTS: usize = 1_000_000;
+#[derive(Parser)]
+struct Args {
+    /// Write path to benchmark: "primary" (flush_batch_sync) or "replica" (io_uring).
+    #[arg(long, default_value = "primary")]
+    mode: String,
 
-/// Maximum events per journal fsync batch.
-const DEFAULT_BATCH: usize = 1_024;
+    /// Total events to write.
+    #[arg(long, default_value_t = 1_000_000)]
+    events: usize,
 
-/// Warmup events (not measured).
-const WARMUP_EVENTS: usize = 100_000;
+    /// Events per fsync batch.
+    #[arg(long, default_value_t = 1_024)]
+    batch_size: usize,
+
+    /// Warmup events (not included in measurements).
+    #[arg(long, default_value_t = 100_000)]
+    warmup: usize,
+
+    /// Use plain pwrite + O_DIRECT instead of pwritev2+RWF_DSYNC.
+    /// Only safe on drives with Power Loss Protection (PLP) capacitors.
+    #[arg(long, default_value_t = false)]
+    journal_no_fua: bool,
+}
 
 fn main() {
-    let args: Vec<String> = std::env::args().collect();
-    let mode = args.get(1).map(|s| s.as_str()).unwrap_or("primary");
-    let num_events = args
-        .get(2)
-        .and_then(|a| a.parse().ok())
-        .unwrap_or(DEFAULT_EVENTS);
-    let batch_size = args
-        .get(3)
-        .and_then(|a| a.parse().ok())
-        .unwrap_or(DEFAULT_BATCH);
-    let warmup = args
-        .get(4)
-        .and_then(|a| a.parse().ok())
-        .unwrap_or(WARMUP_EVENTS);
+    let args = Args::parse();
 
     println!("=== Journal Writer Benchmark ===");
-    println!("Mode: {}", mode);
-    println!("Events: {}", num_events);
-    println!("Batch size: {}", batch_size);
-    println!("Warmup: {}", warmup);
+    println!("Mode: {}", args.mode);
+    println!("Events: {}", args.events);
+    println!("Batch size: {}", args.batch_size);
+    println!("Warmup: {}", args.warmup);
+    println!("No-FUA (PLP): {}", args.journal_no_fua);
     println!();
 
-    if mode == "replica" {
-        run_replica_mode(num_events, batch_size, warmup);
+    if args.mode == "replica" {
+        run_replica_mode(
+            args.events,
+            args.batch_size,
+            args.warmup,
+            args.journal_no_fua,
+        );
     } else {
-        run_journal_writer_bench(num_events, batch_size, warmup);
+        run_journal_writer_bench(
+            args.events,
+            args.batch_size,
+            args.warmup,
+            args.journal_no_fua,
+        );
     }
 }
 
-fn run_journal_writer_bench(num_events: usize, batch_size: usize, _warmup: usize) {
+fn run_journal_writer_bench(num_events: usize, batch_size: usize, _warmup: usize, no_fua: bool) {
     let nz = |v: u64| NonZero::new(v).expect("non-zero");
 
     // Set up minimal exchange state (needed for journal events).
@@ -79,6 +100,7 @@ fn run_journal_writer_bench(num_events: usize, batch_size: usize, _warmup: usize
     // Remove existing file if it exists.
     let _ = std::fs::remove_file(&journal_path);
     let mut writer = JournalWriter::create(&journal_path).expect("create journal");
+    writer.set_no_fua(no_fua).expect("set_no_fua");
 
     // Measurement phase.
     println!("Measurement phase...");
@@ -151,7 +173,7 @@ fn run_journal_writer_bench(num_events: usize, batch_size: usize, _warmup: usize
     }
 }
 
-fn run_replica_mode(num_events: usize, batch_size: usize, _warmup: usize) {
+fn run_replica_mode(num_events: usize, batch_size: usize, _warmup: usize, no_fua: bool) {
     let nz = |v: u64| NonZero::new(v).expect("non-zero");
 
     // Set up minimal exchange state.
@@ -176,6 +198,7 @@ fn run_replica_mode(num_events: usize, batch_size: usize, _warmup: usize) {
     let journal_path = std::path::PathBuf::from("/tmp/journal_writer_bench_replica.journal");
     let _ = std::fs::remove_file(&journal_path);
     let mut writer = JournalWriter::create(&journal_path).expect("create journal");
+    writer.set_no_fua(no_fua).expect("set_no_fua");
 
     // Set up io_uring for async writes.
     let mut io_uring = IoUring::new(256).expect("create io_uring ring");
