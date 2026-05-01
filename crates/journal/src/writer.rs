@@ -20,13 +20,11 @@
 //! kernel-managed append mode, because the file size includes pre-allocated
 //! (zero-filled) space beyond the valid data boundary.
 
-// TODO: O_DIRECT support needs further debugging (tests fail with "Invalid argument")
-// use libc::O_DIRECT;
 use libc::mlock;
 use std::alloc::Layout;
 use std::fs::{File, OpenOptions};
 use std::marker::PhantomData;
-use std::os::unix::fs::FileExt; // OpenOptionsExt not used without O_DIRECT
+use std::os::unix::fs::FileExt;
 use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -250,7 +248,6 @@ impl<E: AppEvent> JournalWriter<E> {
             .read(true)
             .write(true)
             .create_new(true)
-            // .custom_flags(O_DIRECT)
             .open(path)?;
 
         let header_layout =
@@ -380,7 +377,6 @@ impl<E: AppEvent> JournalWriter<E> {
         let file = OpenOptions::new()
             .read(true)
             .write(true)
-            // .custom_flags(O_DIRECT)
             .open(path)?;
 
         // Reuse the existing file and its pre-allocated extents instead of
