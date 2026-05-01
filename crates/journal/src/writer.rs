@@ -16,6 +16,9 @@
 //! Without PLP, power loss can still lose data even with O_DIRECT + RWF_DSYNC,
 //! but with PLP these writes survive any power interruption.
 //!
+//! Note: O_DIRECT support currently under debugging - tests fail with "Invalid argument"
+//! when enabled.
+//!
 //! Writes use positioned I/O with an explicit write position rather than
 //! kernel-managed append mode, because the file size includes pre-allocated
 //! (zero-filled) space beyond the valid data boundary.
@@ -364,7 +367,7 @@ impl<E: AppEvent> JournalWriter<E> {
     ///
     /// `chain_hash` resumes the BLAKE3 hash chain from the reader's final
     /// state. `None` for v5 journals (no hash chain).
-    pub fn open_append(
+pub fn open_append(
         path: &Path,
         last_seq: u64,
         valid_end: u64,
