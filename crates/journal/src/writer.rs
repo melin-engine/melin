@@ -282,6 +282,16 @@ impl<E: AppEvent> JournalWriter<E> {
         let allocated_end = preallocate(&file, FILE_HEADER_SIZE as u64)?;
         zero_range_extents(&file, FILE_HEADER_SIZE as u64, allocated_end);
 
+        // Pre-fault all pages in the preallocated region so the first write
+        // to each 4 KB page doesn't trigger a page cache miss during an
+        // io_uring write. Without this, each miss is handled by an io-wq
+        // worker on core 0 (IRQ core), which competes with TCP interrupt
+        // handlers and can stall for hundreds of milliseconds under load.
+        // MADV_POPULATE_WRITE forces the kernel to fault all pages now
+        // (startup cost ~10-30ms for 256 MiB) rather than lazily during
+        // hot-path writes.
+        prefault_pages(&file, allocated_end);
+
         // Allocate batch buffers with 512-byte alignment so they remain valid
         // for O_DIRECT if set_no_fua(true) is called later. Allocated once at
         // startup; reused for the entire journal lifetime.
@@ -356,6 +366,12 @@ impl<E: AppEvent> JournalWriter<E> {
                 valid_end,
             )?;
         }
+
+        // Pre-fault pages near valid_end. The journal may have grown beyond
+        // what's in the OS page cache (e.g. after a long run with page
+        // eviction). Faulting the region around the write cursor at startup
+        // prevents io_uring page-cache misses on the hot path.
+        prefault_pages(&file, allocated_end);
 
         let (batch_buf, spare_buf) = Self::alloc_batch_bufs();
         let tail_sector = Self::alloc_tail_sector();
@@ -1169,6 +1185,40 @@ impl<E: AppEvent> JournalWriter<E> {
         unsafe { std::mem::transmute(ptr) }
     }
 }
+
+/// Pre-fault all pages in a file region into the page cache using
+/// `mmap` + `MADV_POPULATE_WRITE`. This prevents page-cache misses during
+/// io_uring writes, which would otherwise be handled by io-wq workers on the
+/// IRQ core and can stall for hundreds of milliseconds under TCP load.
+///
+/// Best-effort: silently skips if `mmap` fails (e.g. insufficient VA space).
+/// Not called on the O_DIRECT path — O_DIRECT bypasses the page cache.
+#[cfg(target_os = "linux")]
+fn prefault_pages(file: &File, file_size: u64) {
+    if file_size == 0 {
+        return;
+    }
+    let ptr = unsafe {
+        libc::mmap(
+            std::ptr::null_mut(),
+            file_size as libc::size_t,
+            libc::PROT_WRITE,
+            libc::MAP_SHARED,
+            file.as_raw_fd(),
+            0,
+        )
+    };
+    if ptr == libc::MAP_FAILED {
+        return;
+    }
+    // MADV_POPULATE_WRITE (23): pre-fault pages for write access now,
+    // paying the cost once at startup rather than on the io_uring hot path.
+    unsafe { libc::madvise(ptr, file_size as libc::size_t, 23) };
+    unsafe { libc::munmap(ptr, file_size as libc::size_t) };
+}
+
+#[cfg(not(target_os = "linux"))]
+fn prefault_pages(_file: &File, _file_size: u64) {}
 
 /// Pre-allocate disk blocks from the current position forward by one chunk.
 ///
