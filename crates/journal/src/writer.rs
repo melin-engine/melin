@@ -956,36 +956,83 @@ impl<E: AppEvent> JournalWriter<E> {
     /// Copies batch data into the tail sector, writes complete sectors,
     /// and rewrites the partial tail sector in-place. This avoids padding
     /// to 512 bytes per write, preventing premature journal exhaustion.
+    /// Flush the batch to disk in a single O_DIRECT `pwrite`.
+    ///
+    /// Writes one contiguous, sector-aligned buffer covering the existing
+    /// partial tail sector and all new batch data. This costs exactly one
+    /// syscall per flush regardless of how many sectors the batch spans —
+    /// compared to one pwrite per sector in the naive approach.
+    ///
+    /// Layout of the write buffer (built in-place in `batch_buf`):
+    ///   [tail_sector[0..tail_sector_len]] [batch data] [zero padding]
+    ///   ↑ write_pos (sector-aligned)                    ↑ padded to SECTOR_SIZE
+    ///
+    /// After the write, `write_pos` advances past all newly-completed sectors.
+    /// The last partial sector (if any) becomes the new tail.
     fn flush_to_sectors(&mut self) -> Result<(), JournalError> {
         if self.batch_len == 0 {
             return Ok(());
         }
 
-        // Drain batch_buf into tail_sector, writing full sectors as they fill.
-        let mut data_cursor = 0usize;
-        while data_cursor < self.batch_len {
-            let space = SECTOR_SIZE - self.tail_sector_len;
-            let remaining = self.batch_len - data_cursor;
-            let to_copy = remaining.min(space);
-            self.tail_sector[self.tail_sector_len..self.tail_sector_len + to_copy]
-                .copy_from_slice(&self.batch_buf[data_cursor..data_cursor + to_copy]);
-            self.tail_sector_len += to_copy;
-            data_cursor += to_copy;
+        let total = self.tail_sector_len + self.batch_len;
+        let new_tail_len = total & (SECTOR_SIZE - 1); // total % SECTOR_SIZE
+        // Round up to sector boundary.
+        let padded = if new_tail_len > 0 {
+            total + (SECTOR_SIZE - new_tail_len)
+        } else {
+            total
+        };
 
-            if self.tail_sector_len == SECTOR_SIZE {
-                self.pwrite_sector(self.write_pos)?;
-                self.write_pos += SECTOR_SIZE as u64;
-                self.tail_sector.fill(0);
-                self.tail_sector_len = 0;
-            }
+        // Shift batch data right by tail_sector_len bytes to make room for the
+        // existing tail prefix. Relies on batch_buf being large enough:
+        // padded = total + padding < tail_sector_len + batch_len + SECTOR_SIZE
+        //        < SECTOR_SIZE + BATCH_BUF_CAPACITY (since tail_sector_len < SECTOR_SIZE)
+        // The pipeline limits batch_len to well under BATCH_BUF_CAPACITY - SECTOR_SIZE.
+        self.batch_buf
+            .copy_within(0..self.batch_len, self.tail_sector_len);
+        self.batch_buf[..self.tail_sector_len]
+            .copy_from_slice(&self.tail_sector[..self.tail_sector_len]);
+        if padded > total {
+            self.batch_buf[total..padded].fill(0);
         }
 
-        // Rewrite the partial tail sector in-place (same write_pos until the
-        // sector fills). O_DIRECT requires a full SECTOR_SIZE write even for
-        // partial data — trailing zeros in tail_sector are already correct.
-        if self.tail_sector_len > 0 {
-            self.pwrite_sector(self.write_pos)?;
+        // Single pwrite for everything — one NVMe command instead of N.
+        let fd = self.file.as_raw_fd();
+        let ptr = self.batch_buf.as_ptr() as *const libc::c_void;
+        let ret = if self.no_fua {
+            unsafe { libc::pwrite(fd, ptr, padded, self.write_pos as libc::off_t) }
+        } else {
+            let iov = libc::iovec {
+                iov_base: ptr as *mut libc::c_void,
+                iov_len: padded,
+            };
+            unsafe { libc::pwritev2(fd, &iov, 1, self.write_pos as libc::off_t, libc::RWF_DSYNC) }
+        };
+        if ret < 0 {
+            return Err(JournalError::Io(std::io::Error::last_os_error()));
         }
+        if (ret as usize) != padded {
+            return Err(JournalError::Io(std::io::Error::new(
+                std::io::ErrorKind::WriteZero,
+                "short O_DIRECT write",
+            )));
+        }
+
+        // Update tail state. The new partial tail is the last sector of the write.
+        if new_tail_len > 0 {
+            let last_sector_base = padded - SECTOR_SIZE;
+            self.tail_sector[..new_tail_len].copy_from_slice(
+                &self.batch_buf[last_sector_base..last_sector_base + new_tail_len],
+            );
+            self.tail_sector[new_tail_len..].fill(0);
+            // write_pos advances past all complete sectors (the last sector is partial).
+            self.write_pos += last_sector_base as u64;
+        } else {
+            // All sectors were complete — no partial tail.
+            self.tail_sector.fill(0);
+            self.write_pos += padded as u64;
+        }
+        self.tail_sector_len = new_tail_len;
 
         self.batch_len = 0;
         self.last_user_entry_len = 0;
