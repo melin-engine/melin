@@ -450,7 +450,7 @@ impl JournaledExchange {
 
     /// Size of the current journal file in bytes.
     pub fn journal_size(&self) -> u64 {
-        self.writer.write_pos()
+        self.writer.valid_end()
     }
 
     /// Construct from pre-built parts. Used by the server for snapshot-only

@@ -16,8 +16,13 @@
 //! Without PLP, power loss can still lose data even with O_DIRECT + RWF_DSYNC,
 //! but with PLP these writes survive any power interruption.
 //!
-//! Note: O_DIRECT support currently under debugging - tests fail with "Invalid argument"
-//! when enabled.
+//! **Sector Tail Buffer**: O_DIRECT requires 512-byte sector alignment. Instead of
+//! padding every batch to 512 bytes (which would exhaust pre-allocated space),
+//! the writer maintains a single in-memory sector (tail_sector) representing the
+//! current partially-filled sector on disk. New batch data is appended to tail_sector;
+//! complete sectors are written forward; the partial tail sector is rewritten in-place
+//! on every flush. `write_pos` advances only when a sector fills, so disk space
+//! consumed ≈ actual data size.
 //!
 //! Writes use positioned I/O with an explicit write position rather than
 //! kernel-managed append mode, because the file size includes pre-allocated
@@ -27,7 +32,7 @@ use libc::mlock;
 use std::alloc::Layout;
 use std::fs::{File, OpenOptions};
 use std::marker::PhantomData;
-use std::os::unix::fs::FileExt;
+use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -50,6 +55,9 @@ const MAX_ENTRY_SIZE: usize = 144;
 /// to 512 KiB for headroom (checkpoint entries, variable-size events).
 /// Pre-allocated once, reused across batches.
 const BATCH_BUF_CAPACITY: usize = 512 * 1024;
+
+/// O_DIRECT sector size. All O_DIRECT writes must be sector-aligned (512 bytes).
+const SECTOR_SIZE: usize = 512;
 
 /// Pre-allocation chunk size (256 MiB). Matches the default journal rotation
 /// threshold so that a freshly created journal never needs mid-run extension.
@@ -132,6 +140,12 @@ pub struct JournalWriter<E: AppEvent> {
     /// in the same call. `(0, 0)` means no user entry encoded yet.
     last_user_entry_offset: usize,
     last_user_entry_len: usize,
+    /// One-sector tail buffer for O_DIRECT. Holds the current partially-filled
+    /// sector in memory. Written (and rewritten in-place) on every flush;
+    /// `write_pos` advances only when this sector is full and a new one begins.
+    tail_sector: Box<[u8; SECTOR_SIZE]>,
+    /// Bytes of real data in `tail_sector`. Always < SECTOR_SIZE.
+    tail_sector_len: usize,
     /// When true, `flush_batch_sync` uses a plain `pwrite` instead of
     /// `pwritev2+RWF_DSYNC`. Safe only on drives with Power Loss Protection
     /// (PLP) capacitors — data in the controller's battery-backed DRAM is
@@ -248,41 +262,51 @@ impl<E: AppEvent> JournalWriter<E> {
     /// Shared file setup: header, pre-allocation, sync.
     fn create_bare(path: &Path, starting_sequence: u64) -> Result<Self, JournalError> {
         let file = OpenOptions::new()
-            .read(true)
             .write(true)
             .create_new(true)
+            .custom_flags(libc::O_DIRECT)
             .open(path)?;
 
-        let header_layout =
-            Layout::from_size_align(FILE_HEADER_SIZE, 512).expect("header layout alignment failed");
-        let header = unsafe { std::alloc::alloc(header_layout) };
+        let header_layout = Layout::from_size_align(SECTOR_SIZE, SECTOR_SIZE)
+            .expect("header layout alignment failed");
+        let header = unsafe { std::alloc::alloc_zeroed(header_layout) };
         if header == std::ptr::NonNull::dangling().as_ptr() {
             return Err(JournalError::Io(std::io::Error::other(
                 "header allocation failed",
             )));
         }
 
-        let header_slice = unsafe { std::slice::from_raw_parts_mut(header, FILE_HEADER_SIZE) };
-        codec::encode_file_header(header_slice);
+        let header_slice = unsafe { std::slice::from_raw_parts_mut(header, SECTOR_SIZE) };
+        let header_write_slice = &mut header_slice[..FILE_HEADER_SIZE];
+        codec::encode_file_header(header_write_slice);
+        // Pad remaining bytes with zeros for O_DIRECT.
+        header_slice[FILE_HEADER_SIZE..SECTOR_SIZE].fill(0);
         let iov_ptr = header_slice.as_ptr() as *const libc::c_void;
-        let ret = unsafe { libc::pwrite(file.as_raw_fd(), iov_ptr, FILE_HEADER_SIZE, 0) };
+        let ret = unsafe { libc::pwrite(file.as_raw_fd(), iov_ptr, SECTOR_SIZE, 0) };
         if ret < 0 {
             let err = std::io::Error::last_os_error();
             unsafe { std::alloc::dealloc(header, header_layout) };
             return Err(JournalError::Io(err));
         }
-        if (ret as usize) != FILE_HEADER_SIZE {
+        if (ret as usize) != SECTOR_SIZE {
             unsafe { std::alloc::dealloc(header, header_layout) };
             return Err(JournalError::Io(std::io::Error::new(
                 std::io::ErrorKind::WriteZero,
                 "short pwrite write",
             )));
         }
+
+        // Keep a copy of the 8-byte header before freeing the aligned buffer.
+        // The tail sector will be initialized with these bytes so events can
+        // be packed into the same first sector as the header, preserving the
+        // original file layout (header at 0, events at FILE_HEADER_SIZE).
+        let mut header_bytes = [0u8; FILE_HEADER_SIZE];
+        header_bytes.copy_from_slice(&header_slice[..FILE_HEADER_SIZE]);
         unsafe { std::alloc::dealloc(header, header_layout) };
 
-        let write_pos = FILE_HEADER_SIZE as u64;
-        let allocated_end = preallocate(&file, write_pos)?;
-        zero_range_extents(&file, write_pos, allocated_end);
+        // Pre-allocate from sector 1 onward; sector 0 is already written.
+        let allocated_end = preallocate(&file, SECTOR_SIZE as u64)?;
+        zero_range_extents(&file, SECTOR_SIZE as u64, allocated_end);
 
         // Allocate and lock batch buffers for O_DIRECT.
         // Use std::alloc::alloc with 512-byte alignment for O_DIRECT.
@@ -307,6 +331,18 @@ impl<E: AppEvent> JournalWriter<E> {
             unsafe { std::mem::transmute(batch_buf_ptr) };
         let spare_buf: Box<[u8; BATCH_BUF_CAPACITY]> =
             unsafe { std::mem::transmute(spare_buf_ptr) };
+
+        // Allocate and lock tail sector buffer for O_DIRECT.
+        // Use std::alloc::alloc with 512-byte alignment for O_DIRECT.
+        let tail_sector_layout = Layout::from_size_align(SECTOR_SIZE, SECTOR_SIZE)
+            .expect("tail sector layout alignment failed");
+        let tail_sector_ptr = unsafe { std::alloc::alloc_zeroed(tail_sector_layout) };
+        Self::lock_buffer(tail_sector_ptr, SECTOR_SIZE)?;
+        let mut tail_sector: Box<[u8; SECTOR_SIZE]> =
+            unsafe { std::mem::transmute(tail_sector_ptr) };
+        // Pack the 8-byte file header into the tail sector so the first events
+        // land at byte 8 of sector 0, matching what the reader expects.
+        tail_sector[..FILE_HEADER_SIZE].copy_from_slice(&header_bytes);
 
         // Pre-fault all pages in the preallocated region so the first write
         // to each 4 KB page doesn't trigger a page fault on the hot path.
@@ -343,7 +379,11 @@ impl<E: AppEvent> JournalWriter<E> {
             spare_buf: Some(spare_buf),
             next_sequence: starting_sequence,
             path: path.to_path_buf(),
-            write_pos,
+            // write_pos = 0: the tail sector starts at offset 0, containing
+            // the file header in bytes 0..FILE_HEADER_SIZE. Events are packed
+            // into the same sector at FILE_HEADER_SIZE..SECTOR_SIZE, matching
+            // the reader's expectation that events begin at FILE_HEADER_SIZE.
+            write_pos: 0,
             allocated_end,
             #[cfg(feature = "hash-chain")]
             hash_chain: None,
@@ -352,6 +392,9 @@ impl<E: AppEvent> JournalWriter<E> {
             batch_len: 0,
             last_user_entry_offset: 0,
             last_user_entry_len: 0,
+            tail_sector,
+            // Header occupies the first FILE_HEADER_SIZE bytes of the tail sector.
+            tail_sector_len: FILE_HEADER_SIZE,
             no_fua: false,
         })
     }
@@ -367,7 +410,7 @@ impl<E: AppEvent> JournalWriter<E> {
     ///
     /// `chain_hash` resumes the BLAKE3 hash chain from the reader's final
     /// state. `None` for v5 journals (no hash chain).
-pub fn open_append(
+    pub fn open_append(
         path: &Path,
         last_seq: u64,
         valid_end: u64,
@@ -380,21 +423,12 @@ pub fn open_append(
         let file = OpenOptions::new()
             .read(true)
             .write(true)
+            .custom_flags(libc::O_DIRECT)
             .open(path)?;
 
         // Reuse the existing file and its pre-allocated extents instead of
         // truncating + re-preallocating + sync_all (which cost 2-6ms).
-        //
-        // The writer starts at `valid_end`, overwriting any trailing garbage
-        // from a crash. To prevent a double-crash scenario where partial
-        // garbage survives past new entries, zero out one MAX_ENTRY_SIZE
-        // block at `valid_end`. This is a single small write (128 bytes)
-        // with no metadata overhead.
         let file_len = file.metadata()?.len();
-        if valid_end + MAX_ENTRY_SIZE as u64 <= file_len {
-            let zeros = [0u8; BATCH_BUF_CAPACITY];
-            file.write_all_at(&zeros[0..MAX_ENTRY_SIZE], valid_end)?;
-        }
 
         let allocated_end = if file_len >= valid_end {
             // File already covers valid data (common case). Use the full
@@ -430,6 +464,43 @@ pub fn open_append(
         let spare_buf: Box<[u8; BATCH_BUF_CAPACITY]> =
             unsafe { std::mem::transmute(spare_buf_ptr) };
 
+        // Reconstruct tail sector state from disk for O_DIRECT.
+        // Calculate sector base position and read the partial sector.
+        let sector_base_pos = valid_end & !(SECTOR_SIZE as u64 - 1);
+        let tail_sector_len = (valid_end - sector_base_pos) as usize;
+
+        // Allocate and lock tail sector buffer for O_DIRECT.
+        let tail_sector_layout = Layout::from_size_align(SECTOR_SIZE, SECTOR_SIZE)
+            .expect("tail sector layout alignment failed");
+        let tail_sector_ptr = unsafe { std::alloc::alloc_zeroed(tail_sector_layout) };
+        Self::lock_buffer(tail_sector_ptr, SECTOR_SIZE)?;
+        let mut tail_sector: Box<[u8; SECTOR_SIZE]> =
+            unsafe { std::mem::transmute(tail_sector_ptr) };
+
+        // Read the sector from disk into tail_sector using plain pread
+        // (not O_DIRECT, since we're reading existing data).
+        let ret = unsafe {
+            libc::pread(
+                file.as_raw_fd(),
+                tail_sector.as_mut_ptr() as *mut libc::c_void,
+                SECTOR_SIZE,
+                sector_base_pos as libc::off_t,
+            )
+        };
+        if ret < 0 {
+            return Err(JournalError::Io(std::io::Error::last_os_error()));
+        }
+        let partial_len = if (ret as usize) < tail_sector_len {
+            // Short read: less data than expected. Use what we got.
+            ret as usize
+        } else {
+            tail_sector_len
+        };
+        // Zero bytes past valid data — replaces the old `write_all_at` zeroing
+        // call that couldn't be done with O_DIRECT. The next flush rewrites
+        // the sector, clearing any crash garbage at sector_base_pos+tail_sector_len.
+        tail_sector[partial_len..].fill(0);
+
         #[allow(unused_mut)] // mut needed only with hash-chain for emit_checkpoint
         let mut writer = Self {
             _marker: PhantomData,
@@ -439,7 +510,7 @@ pub fn open_append(
             spare_buf: Some(spare_buf),
             next_sequence: last_seq + 1,
             path: path.to_path_buf(),
-            write_pos: valid_end,
+            write_pos: sector_base_pos,
             allocated_end,
             #[cfg(feature = "hash-chain")]
             hash_chain: chain_hash.map(|h| HashChain {
@@ -452,6 +523,8 @@ pub fn open_append(
             batch_len: 0,
             last_user_entry_offset: 0,
             last_user_entry_len: 0,
+            tail_sector,
+            tail_sector_len: partial_len,
             no_fua: false,
         };
 
@@ -689,76 +762,32 @@ pub fn open_append(
         }
     }
 
-    /// Write the accumulated batch buffer to disk in a single `pwrite` syscall.
-    ///
-    /// Reduces syscalls from N (one per event) to 1 per batch. Must be called
-    /// after one or more `batch_append` / `batch_append_with_ts` calls and
-    /// before `sync()`.
-    ///
-    /// Note: This is the legacy sync path. Production hot path uses `flush_batch_sync()`
-    /// (pwritev2 + RWF_DSYNC) instead, which provides stronger durability guarantees with
-    /// FUA writes on NVMe drives.
+    /// Write the accumulated batch buffer to disk using the O_DIRECT sector tail buffer.
     pub fn flush_batch(&mut self) -> Result<(), JournalError> {
         if self.batch_len == 0 {
             return Ok(());
         }
-        self.ensure_allocated(self.batch_len as u64)?;
-        pwritev2_dsync(
-            self.file.as_raw_fd(),
-            &self.batch_buf[..self.batch_len],
-            self.write_pos,
-        )?;
-        self.write_pos += self.batch_len as u64;
-        self.batch_len = 0;
-        self.last_user_entry_len = 0;
-        Ok(())
+        self.ensure_allocated(SECTOR_SIZE as u64)?;
+        self.flush_to_sectors()
     }
 
     /// Write the batch buffer to disk with guaranteed durability.
     ///
-    /// Default path: uses `pwritev2` with `RWF_DSYNC` to combine the data
-    /// write and durability guarantee into a single syscall. On NVMe drives
-    /// with FUA (Force Unit Access) support, the kernel issues a single FUA
-    /// write instead of write + full cache flush (`fdatasync`). This reduces
-    /// sync latency from ~1-7 ms to ~10-100 µs for small writes.
-    ///
-    /// With `--journal-no-fua` (`no_fua = true`): uses a plain `pwrite`
-    /// without waiting for NAND programming. Relies on the drive's Power Loss
-    /// Protection (PLP) capacitors for crash durability. Latency drops to
-    /// ~1-5 µs (controller DRAM write), eliminating GC-induced spikes entirely.
+    /// Uses `pwritev2+RWF_DSYNC` (FUA) for each sector by default, or plain
+    /// `pwrite` with `--journal-no-fua` (PLP drives). The sector tail buffer
+    /// ensures O_DIRECT alignment while amortizing disk space across flushes.
     pub fn flush_batch_sync(&mut self) -> Result<(), JournalError> {
         if self.batch_len == 0 {
             return Ok(());
         }
-        self.ensure_allocated(self.batch_len as u64)?;
-
-        if self.no_fua {
-            self.file
-                .write_all_at(&self.batch_buf[..self.batch_len], self.write_pos)?;
-        } else {
-            pwritev2_dsync(
-                self.file.as_raw_fd(),
-                &self.batch_buf[..self.batch_len],
-                self.write_pos,
-            )?;
-        }
-
-        // Hash chain is NOT finalized per-flush — only at checkpoint
-        // boundaries. This ensures the chain is deterministic regardless of
-        // write batching strategy. chain_hash() computes on-demand.
-
-        self.write_pos += self.batch_len as u64;
-        self.batch_len = 0;
-        self.last_user_entry_len = 0;
-        Ok(())
+        self.ensure_allocated(SECTOR_SIZE as u64)?;
+        self.flush_to_sectors()
     }
 
     /// Drop the current batch buffer without writing it to disk.
     ///
     /// Used by the `no-persist` path of the journal stage so the buffer
     /// stays bounded after replication has snapshotted the bytes.
-    /// Equivalent to `flush_batch_sync` minus the `pwritev2_dsync` and
-    /// the `write_pos` advance.
     pub fn discard_batch_buf(&mut self) {
         self.batch_len = 0;
         self.last_user_entry_len = 0;
@@ -773,43 +802,96 @@ pub fn open_append(
     /// The caller must call `confirm_async_write()` after the io_uring
     /// CQE confirms durability, to return the buffer to the pool.
     ///
-    /// `write_pos` is advanced immediately (not on confirm) so subsequent
+    /// `write_pos` is NOT advanced here (not on confirm) so subsequent
     /// `batch_append()` calls encode at the correct offset. The journal
-    /// cursor must NOT advance until `confirm_async_write()` — the data
-    /// is not yet durable.
+    /// cursor only advances when `confirm_async_write()` is called and
+    /// the write is durably stored on disk. The sector tail buffer handles
+    /// the O_DIRECT sector alignment internally.
     pub fn take_batch_for_async_write(&mut self) -> Result<Option<AsyncWriteBatch>, JournalError> {
         if self.batch_len == 0 {
             return Ok(None);
         }
-        self.ensure_allocated(self.batch_len as u64)?;
+        self.ensure_allocated(SECTOR_SIZE as u64)?;
 
         // Hash chain is NOT finalized per-flush — only at checkpoint
         // boundaries. chain_hash() computes on-demand.
 
-        let len = self.batch_len;
-        let offset = self.write_pos;
-        self.write_pos += self.batch_len as u64;
+        let old_write_pos = self.write_pos;
+        let batch_len = self.batch_len;
 
-        // Swap in the spare buffer (or allocate a new one if spare is in-flight).
+        // Swap in the spare: full_buf = source (batch data), self.batch_buf =
+        // destination (complete sectors). Using separate allocations avoids
+        // aliasing between the source read and sector output writes.
         let spare = self
             .spare_buf
             .take()
             .unwrap_or_else(|| Box::new([0; BATCH_BUF_CAPACITY]));
         let full_buf = std::mem::replace(&mut self.batch_buf, spare);
+
+        // Drain full_buf into tail_sector, collecting complete sectors into
+        // self.batch_buf (the spare). write_pos advances per complete sector.
+        let mut data_cursor = 0usize;
+        let mut output_cursor = 0usize;
+        while data_cursor < batch_len {
+            let space = SECTOR_SIZE - self.tail_sector_len;
+            let remaining = batch_len - data_cursor;
+            let to_copy = remaining.min(space);
+            self.tail_sector[self.tail_sector_len..self.tail_sector_len + to_copy]
+                .copy_from_slice(&full_buf[data_cursor..data_cursor + to_copy]);
+            self.tail_sector_len += to_copy;
+            data_cursor += to_copy;
+
+            if self.tail_sector_len == SECTOR_SIZE {
+                self.batch_buf[output_cursor..output_cursor + SECTOR_SIZE]
+                    .copy_from_slice(self.tail_sector.as_ref());
+                output_cursor += SECTOR_SIZE;
+                self.write_pos += SECTOR_SIZE as u64;
+                self.tail_sector.fill(0);
+                self.tail_sector_len = 0;
+            }
+        }
+
+        // Sync-write the partial tail sector at write_pos so that all encoded
+        // events are durable: complete sectors go to output_buf (async io_uring),
+        // partial tail is written here via pwrite. The pipeline can safely commit
+        // all events after the async CQE arrives.
+        //
+        // write_pos is NOT advanced past the tail sector. The next batch will
+        // continue filling the same sector and overwrite this position with more
+        // data, preserving the "rewrite in place" semantics. No zeros appear
+        // between valid events in the file, so the reader is not confused by
+        // trailing zero bytes in an intermediate partial sector.
+        if self.tail_sector_len > 0 {
+            self.pwrite_sector(self.write_pos)?;
+        }
+
+        let write_len = output_cursor;
+
+        // Put the sector buffer in output_buf; restore full_buf as batch_buf
+        // (safe to overwrite — batch_len = 0, new events start from offset 0).
+        let output_buf = std::mem::replace(&mut self.batch_buf, full_buf);
+
         self.batch_len = 0;
         self.last_user_entry_len = 0;
 
+        if write_len == 0 {
+            // Nothing to write (batch had only queries or was empty after encode).
+            self.spare_buf = Some(output_buf);
+            return Ok(None);
+        }
+
         Ok(Some(AsyncWriteBatch {
-            buf: full_buf,
-            len,
-            offset,
+            buf: output_buf,
+            len: write_len,
+            offset: old_write_pos,
         }))
     }
 
-    /// Return a completed async write batch's buffer to the spare pool.
-    /// Call this after the io_uring CQE confirms the write completed.
-    /// With O_DIRECT, this guarantees the write is durably stored on disk
-    /// (requires PLP for true power-loss safety).
+    /// Return the completed async write buffer to the spare pool.
+    ///
+    /// Called after the io_uring CQE confirms the write completed. `write_pos`
+    /// was already advanced in `take_batch_for_async_write` as each complete
+    /// sector was processed — no further advance is needed here.
     pub fn confirm_async_write(&mut self, batch: AsyncWriteBatch) {
         self.spare_buf = Some(batch.buf);
     }
@@ -850,6 +932,15 @@ pub fn open_append(
     /// Current byte offset in the journal file (size of valid data).
     pub fn write_pos(&self) -> u64 {
         self.write_pos
+    }
+
+    /// Current byte offset of the end of valid data (including partial tail sector).
+    ///
+    /// This is the "true end" of valid data that should be handed off to the
+    /// reader or snapshot coordinator. It accounts for the partial tail sector
+    /// that may be currently in memory but not yet written to disk.
+    pub fn valid_end(&self) -> u64 {
+        self.write_pos + self.tail_sector_len as u64
     }
 
     /// Path to the journal file.
@@ -917,6 +1008,85 @@ pub fn open_append(
         &self.batch_buf[..self.batch_len]
     }
 
+    /// Flush batch data to disk using O_DIRECT sector tail buffer.
+    ///
+    /// Copies batch data into the tail sector, writes complete sectors,
+    /// and rewrites the partial tail sector in-place. This avoids padding
+    /// to 512 bytes per write, preventing premature journal exhaustion.
+    fn flush_to_sectors(&mut self) -> Result<(), JournalError> {
+        if self.batch_len == 0 {
+            return Ok(());
+        }
+
+        // Drain batch_buf into tail_sector, writing full sectors as they fill.
+        let mut data_cursor = 0usize;
+        while data_cursor < self.batch_len {
+            let space = SECTOR_SIZE - self.tail_sector_len;
+            let remaining = self.batch_len - data_cursor;
+            let to_copy = remaining.min(space);
+            self.tail_sector[self.tail_sector_len..self.tail_sector_len + to_copy]
+                .copy_from_slice(&self.batch_buf[data_cursor..data_cursor + to_copy]);
+            self.tail_sector_len += to_copy;
+            data_cursor += to_copy;
+
+            if self.tail_sector_len == SECTOR_SIZE {
+                self.pwrite_sector(self.write_pos)?;
+                self.write_pos += SECTOR_SIZE as u64;
+                self.tail_sector.fill(0);
+                self.tail_sector_len = 0;
+            }
+        }
+
+        // Rewrite the partial tail sector in-place (same write_pos until the
+        // sector fills). O_DIRECT requires a full SECTOR_SIZE write even for
+        // partial data — trailing zeros in tail_sector are already correct.
+        if self.tail_sector_len > 0 {
+            self.pwrite_sector(self.write_pos)?;
+        }
+
+        self.batch_len = 0;
+        self.last_user_entry_len = 0;
+        Ok(())
+    }
+
+    /// Write `self.tail_sector` (always exactly SECTOR_SIZE bytes) at `offset`.
+    ///
+    /// Uses `pwritev2+RWF_DSYNC` (FUA) for durability, or plain `pwrite` when
+    /// `no_fua` is set (PLP drives only). O_DIRECT requires the write length,
+    /// buffer address, and file offset all be sector-aligned — all three hold
+    /// here: tail_sector is 512-byte aligned (alloc layout), SECTOR_SIZE = 512,
+    /// and offset is always a multiple of SECTOR_SIZE.
+    fn pwrite_sector(&self, offset: u64) -> Result<(), JournalError> {
+        let fd = self.file.as_raw_fd();
+        let ptr = self.tail_sector.as_ptr() as *const libc::c_void;
+        let ret = if self.no_fua {
+            unsafe { libc::pwrite(fd, ptr, SECTOR_SIZE, offset as libc::off_t) }
+        } else {
+            unsafe {
+                libc::pwritev2(
+                    fd,
+                    &libc::iovec {
+                        iov_base: ptr as *mut libc::c_void,
+                        iov_len: SECTOR_SIZE,
+                    } as *const libc::iovec,
+                    1,
+                    offset as libc::off_t,
+                    libc::RWF_DSYNC,
+                )
+            }
+        };
+        if ret < 0 {
+            return Err(JournalError::Io(std::io::Error::last_os_error()));
+        }
+        if (ret as usize) != SECTOR_SIZE {
+            return Err(JournalError::Io(std::io::Error::new(
+                std::io::ErrorKind::WriteZero,
+                "short sector write",
+            )));
+        }
+        Ok(())
+    }
+
     /// Slice of the most-recent user entry in `batch_buf`, with the
     /// 2-byte journal magic stripped from the front and the 4-byte CRC
     /// stripped from the back. Layout matches the replication wire's
@@ -976,7 +1146,11 @@ pub fn open_append(
     /// data (POSIX synchronized I/O data integrity completion). A separate
     /// `sync_all` would flush ALL metadata (timestamps, full extent tree)
     /// and costs 2-6ms — unacceptable on the hot path.
-    fn ensure_allocated(&mut self, bytes_needed: u64) -> Result<(), JournalError> {
+    ///
+    /// In O_DIRECT mode with sector tail buffer, we always write one full
+    /// sector (SECTOR_SIZE) at a time, so bytes_needed is always SECTOR_SIZE.
+    fn ensure_allocated(&mut self, _bytes_needed: u64) -> Result<(), JournalError> {
+        let bytes_needed = SECTOR_SIZE as u64;
         if self.write_pos + bytes_needed <= self.allocated_end {
             return Ok(());
         }
@@ -985,39 +1159,6 @@ pub fn open_append(
         zero_range_extents(&self.file, old_end, self.allocated_end);
         Ok(())
     }
-}
-
-/// Write data with `RWF_DSYNC` via `pwritev2` — combines write + durability
-/// in a single syscall.
-///
-/// `RWF_DSYNC` provides per-write data integrity: the kernel ensures the data
-/// is on persistent storage before returning. On NVMe drives with FUA (Force
-/// Unit Access) support, this translates to a single FUA write command instead
-/// of write + full cache flush. Much faster than write + fdatasync for small
-/// writes because FUA only persists the written sectors, while fdatasync
-/// drains the entire NVMe write queue.
-fn pwritev2_dsync(
-    fd: std::os::unix::io::RawFd,
-    buf: &[u8],
-    offset: u64,
-) -> Result<(), JournalError> {
-    let iov = libc::iovec {
-        iov_base: buf.as_ptr() as *mut libc::c_void,
-        iov_len: buf.len(),
-    };
-    // Safety: fd is a valid file descriptor, iov points to valid memory
-    // that outlives the syscall.
-    let ret = unsafe { libc::pwritev2(fd, &iov, 1, offset as libc::off_t, libc::RWF_DSYNC) };
-    if ret < 0 {
-        return Err(JournalError::Io(std::io::Error::last_os_error()));
-    }
-    if (ret as usize) != buf.len() {
-        return Err(JournalError::Io(std::io::Error::new(
-            std::io::ErrorKind::WriteZero,
-            "short pwritev2 write",
-        )));
-    }
-    Ok(())
 }
 
 /// Pre-allocate disk blocks from the current position forward by one chunk.
@@ -1272,11 +1413,13 @@ mod tests {
         let path = dir.path().join("test.journal");
 
         let mut writer = JournalWriter::<TestEvent>::create(&path).unwrap();
-        let pos_before = writer.write_pos();
+        // valid_end() includes tail_sector data; write_pos is sector-aligned base.
+        let pos_before = writer.valid_end();
         writer.batch_append(&sample_event()).unwrap();
-        assert_eq!(writer.write_pos(), pos_before);
+        // batch_append only writes to the in-memory batch buffer, not tail_sector.
+        assert_eq!(writer.valid_end(), pos_before);
         writer.flush_batch_sync().unwrap();
-        assert!(writer.write_pos() > pos_before);
+        assert!(writer.valid_end() > pos_before);
     }
 
     #[test]
@@ -1290,7 +1433,7 @@ mod tests {
             writer.append(&sample_event()).unwrap();
             (
                 writer.next_sequence() - 1,
-                writer.write_pos(),
+                writer.valid_end(),
                 writer.events_since_checkpoint(),
             )
         };
@@ -1318,7 +1461,7 @@ mod tests {
         let (last_seq, valid_end) = {
             let mut writer = JournalWriter::<TestEvent>::create(&path).unwrap();
             writer.append(&sample_event()).unwrap();
-            (writer.next_sequence() - 1, writer.write_pos())
+            (writer.next_sequence() - 1, writer.valid_end())
         };
 
         {
@@ -1379,7 +1522,7 @@ mod tests {
             writer.append(&sample_event()).unwrap();
             (
                 writer.next_sequence() - 1,
-                writer.write_pos(),
+                writer.valid_end(),
                 writer.chain_hash(),
                 writer.events_since_checkpoint(),
             )
@@ -1405,7 +1548,7 @@ mod tests {
         let (last_seq, valid_end) = {
             let mut writer = JournalWriter::<TestEvent>::create(&path).unwrap();
             writer.append(&sample_event()).unwrap();
-            (writer.next_sequence() - 1, writer.write_pos())
+            (writer.next_sequence() - 1, writer.valid_end())
         };
 
         let writer =

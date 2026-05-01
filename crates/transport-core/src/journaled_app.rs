@@ -228,7 +228,7 @@ impl<A: Application> JournaledApp<A> {
 
     /// Size of the current journal file in bytes.
     pub fn journal_size(&self) -> u64 {
-        self.writer.write_pos()
+        self.writer.valid_end()
     }
 
     /// Current journal sequence number (next to be assigned).
