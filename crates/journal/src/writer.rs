@@ -85,10 +85,27 @@ fn prealloc_chunk_bytes() -> u64 {
         .unwrap_or(DEFAULT_PREALLOC_CHUNK)
 }
 
-/// Number of events between automatic hash chain checkpoints.
+/// Default number of events between automatic hash chain checkpoints.
 /// 100K events × ~80 bytes = ~8 MB of journal data between checkpoints.
 /// The checkpoint itself is ~77 bytes — negligible overhead.
-pub const CHECKPOINT_INTERVAL: u64 = 100_000;
+const DEFAULT_CHECKPOINT_INTERVAL: u64 = 100_000;
+
+/// Active checkpoint interval, overridable via
+/// `MELIN_JOURNAL_CHECKPOINT_INTERVAL`. Used by integration tests to lower
+/// the boundary so checkpoint-crossing tests can hit it after a few hundred
+/// orders instead of 100K. Cached on first read — env vars don't change at
+/// runtime, and reading on every event would add cost on the hot path.
+/// Floored at 1 (0 would suppress checkpoints entirely).
+pub fn checkpoint_interval() -> u64 {
+    static CACHED: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *CACHED.get_or_init(|| {
+        std::env::var("MELIN_JOURNAL_CHECKPOINT_INTERVAL")
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            .map(|v| v.max(1))
+            .unwrap_or(DEFAULT_CHECKPOINT_INTERVAL)
+    })
+}
 
 /// A batch of encoded journal data ready for async write via io_uring.
 /// Owns the buffer to prevent aliasing while io_uring holds a pointer to it.
@@ -596,7 +613,7 @@ impl<E: AppEvent> JournalWriter<E> {
         // entries accumulated since the last flush/checkpoint).
         #[cfg(feature = "hash-chain")]
         if let Some(chain) = &mut self.hash_chain
-            && chain.events_since_checkpoint >= CHECKPOINT_INTERVAL
+            && chain.events_since_checkpoint >= checkpoint_interval()
         {
             // Finalize accumulated entries + previous chain hash.
             chain.batch_hasher.update(&chain.current_hash);

@@ -261,6 +261,7 @@ fn spawn_primary(
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit())
         .env("MELIN_JOURNAL_PREALLOC_MIB", "4")
+        .env("MELIN_JOURNAL_CHECKPOINT_INTERVAL", "100")
         .spawn()
         .expect("spawn primary server");
 
@@ -368,6 +369,7 @@ fn spawn_replica_named_with_extra(
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit())
         .env("MELIN_JOURNAL_PREALLOC_MIB", "4")
+        .env("MELIN_JOURNAL_CHECKPOINT_INTERVAL", "100")
         .spawn()
         .expect("spawn replica server");
 
@@ -760,6 +762,7 @@ fn crashed_primary_recovers_from_journal() {
             .stdout(Stdio::inherit())
             .stderr(Stdio::inherit())
             .env("MELIN_JOURNAL_PREALLOC_MIB", "4")
+            .env("MELIN_JOURNAL_CHECKPOINT_INTERVAL", "100")
             .spawn()
             .expect("spawn recovered primary");
         ServerProcess {
@@ -818,9 +821,10 @@ fn crashed_primary_recovers_from_journal() {
 /// `SequenceGap` surfaced by the strict-continuity check is the same
 /// corruption mode reported by the external verifier.
 ///
-/// `CHECKPOINT_INTERVAL` is 10_000 on this branch (lowered from the
-/// 100_000 default to keep the repro cheap); the test submits 15_000
-/// orders so we land ~5_000 events past the boundary.
+/// Spawned servers are launched with `MELIN_JOURNAL_CHECKPOINT_INTERVAL=100`
+/// (see the test setup — env vars below `Command::new`), so the test only
+/// has to push a few hundred orders to cross multiple checkpoint boundaries
+/// instead of 100_000+ at the production default.
 #[test]
 #[serial]
 fn journals_contiguous_across_checkpoint_boundary() {
@@ -829,11 +833,11 @@ fn journals_contiguous_across_checkpoint_boundary() {
     let cluster = TestCluster::start();
     let mut client = cluster.connect_primary();
 
-    // Server seeds 10 accounts + 2 instruments → 12 seed events before
-    // the first order. `CHECKPOINT_INTERVAL` (10_000 on this branch)
-    // fires after encoding 10_000 non-genesis events, so ~9988 orders
-    // crosses the first boundary. 15_000 lands comfortably past it.
-    const ORDERS: u64 = 15_000;
+    // Server seeds 10 accounts + 2 instruments → 12 seed events before the
+    // first order. With CHECKPOINT_INTERVAL=100 (set via env on the spawned
+    // server), 250 orders cross the boundary at least twice — exercising
+    // first-segment and post-checkpoint-segment both.
+    const ORDERS: u64 = 250;
     for i in 1..=ORDERS {
         let side = if i % 2 == 0 { Side::Buy } else { Side::Sell };
         let r = submit_order(&mut client, i, 1, 1, side, 100, 1);
@@ -935,10 +939,10 @@ fn bench_binary_journals_contiguous_across_checkpoint_boundary() {
     let key_path = cluster._tmp.path().join("bench.key");
     std::fs::write(&key_path, cluster.key.to_bytes()).expect("write bench key");
 
-    // Run the bench against the primary. Clients × window × 2 (pairs →
-    // individual orders) must comfortably cross CHECKPOINT_INTERVAL
-    // (10_000 on this branch). 4 clients × window 128, 15_000 pairs =
-    // 30_000 journaled orders — crosses three boundaries.
+    // Run the bench against the primary. The spawned server uses
+    // CHECKPOINT_INTERVAL=100 (env var below), so a few hundred journaled
+    // orders is enough to cross several boundaries. 4 clients × window
+    // 128, 250 pairs = 500 journaled orders — crosses ~5 boundaries.
     //
     // --warmup 0: the default 100_000 warmup orders would dominate runtime.
     // --accounts 10 / --instruments 2: match the server defaults used in
@@ -963,11 +967,12 @@ fn bench_binary_journals_contiguous_across_checkpoint_boundary() {
             "10",
             "--instruments",
             "2",
-            "15000",
+            "250",
         ])
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit())
         .env("MELIN_JOURNAL_PREALLOC_MIB", "4")
+        .env("MELIN_JOURNAL_CHECKPOINT_INTERVAL", "100")
         .status()
         .expect("spawn melin-bench");
     assert!(
@@ -1000,14 +1005,14 @@ fn bench_binary_journals_contiguous_across_checkpoint_boundary() {
     let primary_count = walk("primary", &cluster._tmp.path().join("primary.journal"));
     let replica_count = walk("replica", &cluster._tmp.path().join("replica.journal"));
 
-    // Lower bound: 30_000 orders from the bench. The server may add
-    // internal events (ticks, seed) — so use >= rather than equality.
+    // Lower bound: 500 orders from the bench (250 pairs × 2). The server
+    // may add internal events (ticks, seed) — so use >= rather than equality.
     assert!(
-        primary_count >= 30_000,
+        primary_count >= 500,
         "primary journal only has {primary_count} entries"
     );
     assert!(
-        replica_count >= 30_000,
+        replica_count >= 500,
         "replica journal only has {replica_count} entries"
     );
 }
@@ -1578,6 +1583,7 @@ fn replacement_replica_catches_up_from_journal() {
             .stdout(Stdio::inherit())
             .stderr(Stdio::inherit())
             .env("MELIN_JOURNAL_PREALLOC_MIB", "4")
+            .env("MELIN_JOURNAL_CHECKPOINT_INTERVAL", "100")
             .spawn()
             .expect("spawn replacement replica");
         ServerProcess {
@@ -1718,6 +1724,7 @@ fn catchup_with_fills_during_gap() {
             .stdout(Stdio::inherit())
             .stderr(Stdio::inherit())
             .env("MELIN_JOURNAL_PREALLOC_MIB", "4")
+            .env("MELIN_JOURNAL_CHECKPOINT_INTERVAL", "100")
             .spawn()
             .expect("spawn replacement");
         ServerProcess {
@@ -1842,6 +1849,7 @@ fn catchup_then_immediate_failover() {
             .stdout(Stdio::inherit())
             .stderr(Stdio::inherit())
             .env("MELIN_JOURNAL_PREALLOC_MIB", "4")
+            .env("MELIN_JOURNAL_CHECKPOINT_INTERVAL", "100")
             .spawn()
             .expect("spawn replacement");
         ServerProcess {
@@ -1968,6 +1976,7 @@ fn fresh_replica_full_catchup() {
             .stdout(Stdio::inherit())
             .stderr(Stdio::inherit())
             .env("MELIN_JOURNAL_PREALLOC_MIB", "4")
+            .env("MELIN_JOURNAL_CHECKPOINT_INTERVAL", "100")
             .spawn()
             .expect("spawn fresh replacement");
         ServerProcess {
@@ -2094,6 +2103,7 @@ fn snapshot_transfer_when_archives_purged() {
             .stdout(Stdio::inherit())
             .stderr(Stdio::inherit())
             .env("MELIN_JOURNAL_PREALLOC_MIB", "4")
+            .env("MELIN_JOURNAL_CHECKPOINT_INTERVAL", "100")
             .spawn()
             .expect("spawn primary");
         ServerProcess {
@@ -2182,6 +2192,7 @@ fn snapshot_transfer_when_archives_purged() {
             .stdout(Stdio::inherit())
             .stderr(Stdio::inherit())
             .env("MELIN_JOURNAL_PREALLOC_MIB", "4")
+            .env("MELIN_JOURNAL_CHECKPOINT_INTERVAL", "100")
             .spawn()
             .expect("spawn primary2");
         ServerProcess {

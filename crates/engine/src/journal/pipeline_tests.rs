@@ -169,7 +169,7 @@ mod tests {
     #[cfg(all(feature = "hash-chain", not(feature = "no-persist")))]
     #[test]
     fn primary_journal_sequences_contiguous_across_checkpoint_boundary() {
-        use crate::journal::CHECKPOINT_INTERVAL;
+        use crate::journal::checkpoint_interval;
 
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("checkpoint_boundary.journal");
@@ -181,7 +181,7 @@ mod tests {
         // Cross the checkpoint boundary at least twice so any off-by-one
         // around the auto-emit is exercised on both the first and second
         // segment.
-        let total: u64 = CHECKPOINT_INTERVAL * 2 + 100;
+        let total: u64 = checkpoint_interval() * 2 + 100;
         let cap = ((total as usize) + MAX_JOURNAL_BATCH).next_power_of_two();
         let (mut producer, mut consumers) = ring::DisruptorBuilder::<InputSlot>::new(cap)
             .add_consumer()
@@ -263,7 +263,7 @@ mod tests {
     #[cfg(all(feature = "hash-chain", not(feature = "no-persist")))]
     #[test]
     fn primary_and_replica_journals_contiguous_across_checkpoint_boundary() {
-        use crate::journal::CHECKPOINT_INTERVAL;
+        use crate::journal::checkpoint_interval;
 
         let dir = tempfile::tempdir().unwrap();
         let primary_path = dir.path().join("primary.journal");
@@ -434,7 +434,7 @@ mod tests {
         // Cross several checkpoint boundaries so any subtle interaction
         // between the primary's auto-emit cadence and the relay/replica
         // encode cadence shows up.
-        let total: u64 = CHECKPOINT_INTERVAL * 5 + 250;
+        let total: u64 = checkpoint_interval() * 5 + 250;
         for i in 0..total {
             let side = if i % 2 == 0 { Side::Buy } else { Side::Sell };
             primary.input_producer.publish(InputSlot {
