@@ -421,6 +421,20 @@ fn run_rumcast_primary_with_state(
     // could pick a source IP the client doesn't expect.
     let resp_bind = SocketAddr::new(rumcast_config.bind.ip(), 0);
     let resp_socket = KernelUdp::bind(resp_bind)?;
+    // Bump the response socket's kernel recv buffer to absorb bursts
+    // of SMs/NAKs from many concurrent subscribers. With 16 clients
+    // sending 1 SM per 2 ms, baseline is ~8 k SMs/sec; under load
+    // this can spike much higher. The default 200 KB recv buffer
+    // overflows in <400 ms during any tick gap, kernel-drops NAKs,
+    // and stalls rumcast's flow control. 64 MB gives headroom for
+    // multi-second drain hiccups. Kernel caps at `net.core.rmem_max`
+    // — operators must raise that sysctl for the full request to
+    // take effect; we log a warning if the kernel returns a smaller
+    // effective size than requested.
+    const RESP_RCVBUF_BYTES: usize = 64 * 1024 * 1024;
+    if let Err(e) = resp_socket.set_recv_buffer_bytes(RESP_RCVBUF_BYTES) {
+        warn!(error = ?e, requested = RESP_RCVBUF_BYTES, "failed to bump response socket SO_RCVBUF");
+    }
     let muxed_sender_config = MuxedSenderConfig {
         stream_id: RUMCAST_RESP_STREAM,
         initial_term_id: INITIAL_TERM_ID,

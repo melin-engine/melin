@@ -1711,6 +1711,7 @@ name = "melin-rumcast"
 version = "0.4.0"
 dependencies = [
  "bytemuck",
+ "libc",
 ]
 
 [[package]]

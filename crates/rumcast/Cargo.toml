@@ -14,3 +14,8 @@ path = "src/lib.rs"
 # us the alignment + no-padding guarantees safely. Tiny dep, no transitive
 # deps, well-maintained.
 bytemuck = { version = "1", features = ["derive"] }
+# SO_RCVBUF tuning via setsockopt — std::net::UdpSocket exposes no
+# direct API, so we go through libc for the few callers (resp socket
+# on the server) that need a larger kernel recv buffer to absorb SM
+# bursts without dropping NAKs.
+libc = { workspace = true }

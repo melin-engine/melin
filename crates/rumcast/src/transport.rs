@@ -80,6 +80,34 @@ impl KernelUdp {
     pub fn set_multicast_loop_v4(&self, on: bool) -> io::Result<()> {
         self.socket.set_multicast_loop_v4(on)
     }
+
+    /// Request a larger SO_RCVBUF on this socket. The kernel may cap
+    /// the effective size at `net.core.rmem_max`; the caller should
+    /// verify via `getsockopt` if the exact size matters. Used on the
+    /// server's response socket to absorb bursts of SMs/NAKs from
+    /// many concurrent subscribers without kernel-dropping them
+    /// (which would stall rumcast's flow control).
+    pub fn set_recv_buffer_bytes(&self, bytes: usize) -> io::Result<()> {
+        use std::os::unix::io::AsRawFd;
+        // i32 size matches the SO_RCVBUF socket option ABI on Linux;
+        // value is doubled by the kernel internally and capped by
+        // rmem_max, so we don't try to be precise about the cap here.
+        let val: libc::c_int = bytes.min(i32::MAX as usize) as libc::c_int;
+        let ret = unsafe {
+            libc::setsockopt(
+                self.socket.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_RCVBUF,
+                &val as *const _ as *const libc::c_void,
+                std::mem::size_of_val(&val) as libc::socklen_t,
+            )
+        };
+        if ret == 0 {
+            Ok(())
+        } else {
+            Err(io::Error::last_os_error())
+        }
+    }
 }
 
 impl UdpTransport for KernelUdp {
