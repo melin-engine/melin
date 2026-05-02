@@ -294,6 +294,16 @@ fn run_rumcast_primary(
         "loaded authorized_keys for rumcast auth"
     );
 
+    // ---- Bind order-entry socket BEFORE engine init ----
+    //
+    // `init_engine` can take hundreds of ms (journal create + first
+    // fsync). Binding the kernel UDP socket first lets the kernel
+    // queue any client packets that arrive during init instead of
+    // dropping them with ICMP Port Unreachable. Without this, a
+    // client connecting at server startup loses its first Hello/
+    // Heartbeat to the unbound-port race.
+    let orders_socket = KernelUdp::bind(rumcast_config.bind)?;
+
     // ---- Engine pipeline ----
     let (app, writer, needs_seeding) = init_engine(&config)?;
 
@@ -305,6 +315,7 @@ fn run_rumcast_primary(
         app,
         writer,
         needs_seeding,
+        Some(orders_socket),
     )
 }
 
@@ -322,6 +333,12 @@ fn run_rumcast_primary_with_state(
     app: crate::App,
     writer: crate::JournalWriter,
     needs_seeding: bool,
+    // Pre-bound order-entry socket. The startup path binds before
+    // `init_engine` so clients connecting during journal creation
+    // don't lose packets to an unbound port. The promotion path
+    // (replica → primary) passes `None` and binds here — promotion
+    // happens after a failover where clients are already retrying.
+    pre_bound_orders_socket: Option<KernelUdp>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let enable_replication = config.replication_bind.is_some();
     if enable_replication && config.standalone {
@@ -376,7 +393,10 @@ fn run_rumcast_primary_with_state(
     // direction and a per-session SubscriptionLog / PublicationLog
     // map; sessions are allocated lazily on first contact (inbound)
     // or when authentication completes (outbound).
-    let orders_socket = KernelUdp::bind(rumcast_config.bind)?;
+    let orders_socket = match pre_bound_orders_socket {
+        Some(s) => s,
+        None => KernelUdp::bind(rumcast_config.bind)?,
+    };
     let muxed_receiver_config = MuxedReceiverConfig {
         stream_id: RUMCAST_ORDERS_STREAM,
         receiver_id: SERVER_RECEIVER_ID,
@@ -1407,6 +1427,7 @@ fn run_rumcast_replica(
                 exchange,
                 writer,
                 false, // no seeding — state already replayed from primary
+                None,  // bind inside — promotion has no startup-race risk
             )
         }
     }
