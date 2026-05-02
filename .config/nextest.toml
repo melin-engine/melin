@@ -1,7 +1,0 @@
-# Failover tests spawn child melin-server processes and talk to them over
-# TCP. Under concurrent CPU pressure from engine proptests they occasionally
-# flake with TCP truncation; retry rather than serialize them, since
-# serializing slows the suite below cargo test.
-[[profile.default.overrides]]
-filter = 'binary(failover)'
-retries = 4
