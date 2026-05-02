@@ -1092,7 +1092,6 @@ impl<E: AppEvent> JournalWriter<E> {
 ///
 /// Best-effort: silently skips if `mmap` fails (e.g. insufficient VA space).
 /// Not called on the O_DIRECT path — O_DIRECT bypasses the page cache.
-#[cfg(target_os = "linux")]
 fn prefault_pages(file: &File, start: u64, end: u64) {
     if end <= start {
         return;
@@ -1120,16 +1119,12 @@ fn prefault_pages(file: &File, start: u64, end: u64) {
     unsafe { libc::munmap(ptr, size as libc::size_t) };
 }
 
-#[cfg(not(target_os = "linux"))]
-fn prefault_pages(_file: &File, _start: u64, _end: u64) {}
-
 /// Pre-allocate disk blocks from the current position forward by one chunk.
 ///
-/// Uses `posix_fallocate` which allocates extents without writing zeros
-/// (the filesystem guarantees zero-fill on read for unwritten blocks).
-/// Falls back to `set_len` if `posix_fallocate` fails (e.g., on macOS
-/// where it may not be fully supported). The fallback may create a sparse
-/// file without the full fsync benefit, but maintains correctness.
+/// Uses `posix_fallocate` to allocate extents without writing zeros — the
+/// filesystem guarantees zero-fill on read for unwritten blocks. On the
+/// supported deployment targets (ext4, xfs, btrfs) this always succeeds;
+/// failure means an unsupported filesystem and is surfaced as an error.
 fn preallocate(file: &File, current_end: u64) -> Result<u64, JournalError> {
     let target = current_end + PREALLOC_CHUNK;
 
@@ -1146,14 +1141,9 @@ fn preallocate(file: &File, current_end: u64) -> Result<u64, JournalError> {
         )
     };
 
-    if ret == 0 {
-        return Ok(target);
+    if ret != 0 {
+        return Err(JournalError::Io(std::io::Error::from_raw_os_error(ret)));
     }
-
-    // Fallback for platforms where posix_fallocate isn't supported.
-    // ftruncate extends the file but may create a sparse file — still
-    // correct, just without the full metadata-skip benefit on fsync.
-    file.set_len(target)?;
     Ok(target)
 }
 
