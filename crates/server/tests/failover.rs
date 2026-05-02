@@ -239,6 +239,7 @@ fn spawn_primary(
         ])
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit())
+        .env("MELIN_JOURNAL_PREALLOC_MIB", "4")
         .spawn()
         .expect("spawn primary server");
 
@@ -345,6 +346,7 @@ fn spawn_replica_named_with_extra(
         .args(&args)
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit())
+        .env("MELIN_JOURNAL_PREALLOC_MIB", "4")
         .spawn()
         .expect("spawn replica server");
 
@@ -739,6 +741,7 @@ fn crashed_primary_recovers_from_journal() {
             ])
             .stdout(Stdio::inherit())
             .stderr(Stdio::inherit())
+            .env("MELIN_JOURNAL_PREALLOC_MIB", "4")
             .spawn()
             .expect("spawn recovered primary");
         ServerProcess {
@@ -947,6 +950,7 @@ fn bench_binary_journals_contiguous_across_checkpoint_boundary() {
         ])
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit())
+        .env("MELIN_JOURNAL_PREALLOC_MIB", "4")
         .status()
         .expect("spawn melin-bench");
     assert!(
@@ -1559,6 +1563,7 @@ fn replacement_replica_catches_up_from_journal() {
             ])
             .stdout(Stdio::inherit())
             .stderr(Stdio::inherit())
+            .env("MELIN_JOURNAL_PREALLOC_MIB", "4")
             .spawn()
             .expect("spawn replacement replica");
         ServerProcess {
@@ -1699,6 +1704,7 @@ fn catchup_with_fills_during_gap() {
             ])
             .stdout(Stdio::inherit())
             .stderr(Stdio::inherit())
+            .env("MELIN_JOURNAL_PREALLOC_MIB", "4")
             .spawn()
             .expect("spawn replacement");
         ServerProcess {
@@ -1823,6 +1829,7 @@ fn catchup_then_immediate_failover() {
             ])
             .stdout(Stdio::inherit())
             .stderr(Stdio::inherit())
+            .env("MELIN_JOURNAL_PREALLOC_MIB", "4")
             .spawn()
             .expect("spawn replacement");
         ServerProcess {
@@ -1949,6 +1956,7 @@ fn fresh_replica_full_catchup() {
             ])
             .stdout(Stdio::inherit())
             .stderr(Stdio::inherit())
+            .env("MELIN_JOURNAL_PREALLOC_MIB", "4")
             .spawn()
             .expect("spawn fresh replacement");
         ServerProcess {
@@ -2075,6 +2083,7 @@ fn snapshot_transfer_when_archives_purged() {
             ])
             .stdout(Stdio::inherit())
             .stderr(Stdio::inherit())
+            .env("MELIN_JOURNAL_PREALLOC_MIB", "4")
             .spawn()
             .expect("spawn primary");
         ServerProcess {
@@ -2162,6 +2171,7 @@ fn snapshot_transfer_when_archives_purged() {
             ])
             .stdout(Stdio::inherit())
             .stderr(Stdio::inherit())
+            .env("MELIN_JOURNAL_PREALLOC_MIB", "4")
             .spawn()
             .expect("spawn primary2");
         ServerProcess {

@@ -65,12 +65,25 @@ const BATCH_BUF_CAPACITY: usize = 512 * 1024;
 /// O_DIRECT sector size. All O_DIRECT writes must be sector-aligned (512 bytes).
 const SECTOR_SIZE: usize = 512;
 
-/// Pre-allocation chunk size (256 MiB). Matches the default journal rotation
-/// threshold so that a freshly created journal never needs mid-run extension.
-/// At ~80 bytes per entry, one chunk covers ~3.2M entries. If the journal
-/// does exceed this (large rotation threshold or disabled rotation), it
-/// extends by one more chunk — but this is exceedingly rare.
-const PREALLOC_CHUNK: u64 = 256 * 1024 * 1024;
+/// Default pre-allocation chunk size (256 MiB). Matches the default journal
+/// rotation threshold so that a freshly created journal never needs mid-run
+/// extension. At ~80 bytes per entry, one chunk covers ~3.2M entries. If the
+/// journal does exceed this (large rotation threshold or disabled rotation),
+/// it extends by one more chunk — but this is exceedingly rare.
+const DEFAULT_PREALLOC_CHUNK: u64 = 256 * 1024 * 1024;
+
+/// Pre-allocation chunk size, overridable via `MELIN_JOURNAL_PREALLOC_MIB`.
+/// Used by integration tests that spawn the server binary to shrink the
+/// per-startup `posix_fallocate` + prefault cost from 256 MiB to a few MiB,
+/// shaving seconds off suite wall-time. Floored at 1 MiB. Read once per
+/// extension, off the hot path.
+fn prealloc_chunk_bytes() -> u64 {
+    std::env::var("MELIN_JOURNAL_PREALLOC_MIB")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .map(|m| m.max(1) * 1024 * 1024)
+        .unwrap_or(DEFAULT_PREALLOC_CHUNK)
+}
 
 /// Number of events between automatic hash chain checkpoints.
 /// 100K events × ~80 bytes = ~8 MB of journal data between checkpoints.
@@ -1156,7 +1169,8 @@ fn prefault_pages(file: &File, start: u64, end: u64) {
 /// supported deployment targets (ext4, xfs, btrfs) this always succeeds;
 /// failure means an unsupported filesystem and is surfaced as an error.
 fn preallocate(file: &File, current_end: u64) -> Result<u64, JournalError> {
-    let target = current_end + PREALLOC_CHUNK;
+    let chunk = prealloc_chunk_bytes();
+    let target = current_end + chunk;
 
     // Allocate only the new chunk [current_end, target), not [0, target).
     // fallocate(fd, 0, target) walks the entire extent tree from offset 0
@@ -1167,7 +1181,7 @@ fn preallocate(file: &File, current_end: u64) -> Result<u64, JournalError> {
         file.as_fd(),
         rustix::fs::FallocateFlags::empty(),
         current_end,
-        PREALLOC_CHUNK,
+        chunk,
     )
     .map_err(rustix_to_io)?;
     Ok(target)
@@ -1334,7 +1348,7 @@ mod tests {
 
         let file_len = std::fs::metadata(&path).unwrap().len();
         assert!(
-            file_len >= PREALLOC_CHUNK,
+            file_len >= prealloc_chunk_bytes(),
             "expected pre-allocated file, got {file_len} bytes"
         );
     }
