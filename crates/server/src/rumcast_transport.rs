@@ -680,6 +680,17 @@ fn session_translator(
     let mut pending_outbound: Option<OutputSlot> = None;
     let mut response_buf = vec![0u8; RESPONSE_ENCODE_BUF_SIZE];
     let mut envelope_buf = vec![0u8; ENVELOPE_BUF_SIZE];
+    // Encoded envelope awaiting publish on its session's PublicationLog.
+    // Set when an outbound slot has been encoded but the rumcast pub_log
+    // can't accept it yet (publisher_limit not advanced — typically the
+    // subscriber hasn't drained recent fragments). Stored as
+    // (session_id, envelope_len_in_envelope_buf) so we don't have to
+    // hold an Arc<PublicationLog> across iterations and re-look-up the
+    // session each retry. The rumcast-session loop must not block on
+    // try_claim — if it did, drain_control on the response socket
+    // wouldn't run, SMs would never be processed, publisher_limit would
+    // never advance, and the loop would deadlock.
+    let mut pending_publish: Option<(u32, usize)> = None;
     // Wall-clock checkpoint for handshake-timeout sweeps. Throttled
     // because the sweep is O(n) over `sessions` and would otherwise
     // run millions of times per second under busy-spin idle.
@@ -793,38 +804,91 @@ fn session_translator(
 
         // ---- Outbound: engine output ring → envelope → PublicationLog ----
         //
-        // Single-pending design: try to consume one slot, hold it
-        // until the journal cursor catches up. This is the
-        // persist-before-ack boundary — we never publish a response
-        // for an event that hasn't been durably journaled.
-        if pending_outbound.is_none()
-            && let Some((_, slot)) = output_consumer.try_consume()
-        {
-            pending_outbound = Some(slot);
-            did_work = true;
+        // Two-stage pending: first wait for the journal cursor to catch
+        // up to the slot (persist-before-ack), then encode the envelope
+        // and try to publish it. If the rumcast pub_log can't accept it
+        // (publisher_limit not advanced because the subscriber hasn't
+        // drained yet), keep the encoded envelope in `pending_publish`
+        // and retry next iteration — never block, since this thread
+        // also drains the SMs that advance publisher_limit.
+
+        // Stage 2: drain a previously-encoded envelope first.
+        if let Some((session_id, env_len)) = pending_publish {
+            match sessions.get(&session_id) {
+                Some(AuthStage::Authenticated { pub_log, .. }) => {
+                    match pub_log.try_claim(env_len as u32) {
+                        Ok(mut claim) => {
+                            claim
+                                .payload_mut()
+                                .copy_from_slice(&envelope_buf[..env_len]);
+                            claim.publish(data_flags::UNFRAGMENTED);
+                            pending_publish = None;
+                            did_work = true;
+                        }
+                        Err(_) => {
+                            // Backpressure: leave pending, try next loop.
+                        }
+                    }
+                }
+                _ => {
+                    // Session evicted (auth timeout or peer disconnect)
+                    // between encode and publish. Drop the response.
+                    pending_publish = None;
+                }
+            }
         }
-        if let Some(slot) = pending_outbound.as_ref() {
-            // Seed events (connection_id=0) come from `seed_and_drain`.
-            // No client to route them to — drop.
-            if slot.connection_id == 0 {
-                pending_outbound = None;
-                // Mark progress so the loop immediately tries to
-                // consume the next slot — otherwise yield-idle mode
-                // would sleep 10µs per dropped seed event, turning
-                // ~hundred-event seed_and_drain into ~ms latency.
-                did_work = true;
-            } else if journal_cursor.get().load(Ordering::Acquire) > slot.input_seq {
-                let slot = pending_outbound.take().expect("checked is_some above");
-                handle_outbound(
-                    &slot,
-                    &mut sessions,
-                    &mut response_buf,
-                    &mut envelope_buf,
-                    shutdown,
-                );
+
+        // Stage 1: only encode a new outbound slot when no publish
+        // is pending — otherwise we'd clobber the envelope buffer.
+        if pending_publish.is_none() {
+            if pending_outbound.is_none()
+                && let Some((_, slot)) = output_consumer.try_consume()
+            {
+                pending_outbound = Some(slot);
                 did_work = true;
             }
-            // else: not durable yet, leave pending and re-check next loop.
+            if let Some(slot) = pending_outbound.as_ref() {
+                // Seed events (connection_id=0) come from `seed_and_drain`.
+                // No client to route them to — drop.
+                if slot.connection_id == 0 {
+                    pending_outbound = None;
+                    // Mark progress so the loop immediately tries to
+                    // consume the next slot — otherwise yield-idle mode
+                    // would sleep 10µs per dropped seed event, turning
+                    // ~hundred-event seed_and_drain into ~ms latency.
+                    did_work = true;
+                } else if journal_cursor.get().load(Ordering::Acquire) > slot.input_seq {
+                    let slot = pending_outbound.take().expect("checked is_some above");
+                    if let Some(env_len) =
+                        encode_outbound(&slot, &mut sessions, &mut response_buf, &mut envelope_buf)
+                    {
+                        // Try the first publish inline so the common
+                        // (uncongested) case avoids a loop iteration.
+                        let session_id = slot.connection_id as u32;
+                        match sessions.get(&session_id) {
+                            Some(AuthStage::Authenticated { pub_log, .. }) => {
+                                match pub_log.try_claim(env_len as u32) {
+                                    Ok(mut claim) => {
+                                        claim
+                                            .payload_mut()
+                                            .copy_from_slice(&envelope_buf[..env_len]);
+                                        claim.publish(data_flags::UNFRAGMENTED);
+                                    }
+                                    Err(_) => {
+                                        // Pub_log full — defer.
+                                        pending_publish = Some((session_id, env_len));
+                                    }
+                                }
+                            }
+                            _ => {
+                                // Race: session evicted between encode and publish.
+                            }
+                        }
+                    }
+                    did_work = true;
+                }
+                // else: not durable yet, leave pending and re-check next loop.
+            }
         }
 
         // ---- Idle ----
@@ -1120,19 +1184,24 @@ fn handle_inbound(
 /// session's per-session PublicationLog. No-op if the session
 /// disappeared between request and response (handshake timed out,
 /// client disconnected, etc.).
-fn handle_outbound(
+/// Encode an outbound slot into an envelope inside `envelope_buf`.
+/// Returns the envelope length on success, or `None` if the session
+/// isn't authenticated or encoding fails. The caller is responsible
+/// for publishing the bytes to the session's PublicationLog — kept
+/// separate from encoding so the publish can be retried across loop
+/// iterations without re-encoding (which would re-bump `outbound_seq`
+/// and create a sequence gap on the receiver).
+fn encode_outbound(
     slot: &OutputSlot,
     sessions: &mut HashMap<u32, AuthStage>,
     response_buf: &mut [u8],
     envelope_buf: &mut [u8],
-    shutdown: &AtomicBool,
-) {
+) -> Option<usize> {
     let session_id = slot.connection_id as u32;
 
     let Some(AuthStage::Authenticated {
         token,
         outbound_seq,
-        pub_log,
         ..
     }) = sessions.get_mut(&session_id)
     else {
@@ -1141,7 +1210,7 @@ fn handle_outbound(
         // pre-auth traffic, since pre-auth requests never reach the
         // engine in the first place.
         debug!(%session_id, "outbound: no authenticated session, dropping");
-        return;
+        return None;
     };
 
     let kind = match slot.payload {
@@ -1175,7 +1244,7 @@ fn handle_outbound(
         Ok(n) => n,
         Err(e) => {
             error!(error = ?e, "failed to encode response");
-            return;
+            return None;
         }
     };
     // Strip the 4-byte length prefix the codec writes for TCP
@@ -1188,12 +1257,10 @@ fn handle_outbound(
         Ok(n) => n,
         Err(e) => {
             error!(error = ?e, "failed to encode envelope");
-            return;
+            return None;
         }
     };
-    let envelope = &envelope_buf[..env_len];
-
-    spin_publish(pub_log, envelope, shutdown);
+    Some(env_len)
 }
 
 /// Encode + publish a handshake-stage response (Challenge,
