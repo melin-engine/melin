@@ -486,6 +486,15 @@ impl<E: AppEvent> JournalStage<E> {
                 0
             };
 
+            // Sentinel observed in the inner loop. Set to true the moment
+            // we see a `JournalEvent::Shutdown` slot; checked after the
+            // batch is sync'd so we exit on the same persist-before-ack
+            // boundary as steady-state writes.
+            let mut saw_shutdown = false;
+            // Number of slots actually consumed from this batch — equals
+            // `count` unless we broke out early on the sentinel.
+            let mut consumed = 0usize;
+
             if count > 0 {
                 idle_spins = 0;
                 busy_count += 1;
@@ -523,6 +532,11 @@ impl<E: AppEvent> JournalStage<E> {
                 // discard happens at the sync point below in place of the
                 // fsync, keeping `batch_buf` bounded.
                 for slot in &batch[..count] {
+                    if slot.event.is_shutdown() {
+                        saw_shutdown = true;
+                        break;
+                    }
+                    consumed += 1;
                     if slot.event.is_query() {
                         continue;
                     }
@@ -560,8 +574,8 @@ impl<E: AppEvent> JournalStage<E> {
                     let journal_slice = self.writer.last_user_entry_replication_slice();
                     Self::record_slot_for_replication(&mut self.repl, journal_slice);
                 }
-                pending += count;
-                if first_write_ts.is_none() {
+                pending += consumed;
+                if first_write_ts.is_none() && consumed > 0 {
                     first_write_ts = Some(Instant::now());
                 }
 
@@ -632,6 +646,32 @@ impl<E: AppEvent> JournalStage<E> {
                     self.utilization.idle.store(idle_count, Ordering::Relaxed);
                 }
                 idle_wait(&mut idle_spins, self.busy_spin);
+            }
+
+            if saw_shutdown {
+                // Sentinel — by FIFO, every slot the receiver published
+                // before it has now been consumed. Sync any encoded-but-
+                // not-yet-flushed events so the persist-before-ack
+                // boundary holds for the final batch, then exit.
+                if pending > 0 {
+                    if self.repl.any_producer() {
+                        let end_seq = self.writer.next_sequence() - 1;
+                        Self::publish_input_batch_to_rings(&mut self.repl, end_seq);
+                    }
+                    #[cfg(not(feature = "no-persist"))]
+                    if let Err(e) = self.writer.flush_batch_sync() {
+                        tracing::error!(error = %e, "journal sync error on sentinel exit");
+                    }
+                    #[cfg(feature = "no-persist")]
+                    self.writer.discard_batch_buf();
+                    self.consumer.commit(pending);
+                    self.publish_chain_hash();
+                }
+                self.utilization.busy.store(busy_count, Ordering::Relaxed);
+                self.utilization.idle.store(idle_count, Ordering::Relaxed);
+                #[cfg(feature = "pipeline-stats")]
+                print_utilization("journal", busy_count, idle_count);
+                return Ok(self.writer);
             }
         }
     }
@@ -791,7 +831,10 @@ impl<E: AppEvent> JournalStage<E> {
             #[cfg(not(feature = "no-persist"))]
             {
                 for slot in &batch[..count] {
-                    if slot.event.is_query() {
+                    if slot.event.is_query() || slot.event.is_shutdown() {
+                        // Sentinel is never persisted (codec rejects it).
+                        // Reaching this path means the shutdown flag fired
+                        // before the sentinel was consumed — skip it.
                         continue;
                     }
                     if let melin_journal::JournalEvent::Checkpoint {

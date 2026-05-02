@@ -333,6 +333,14 @@ pub(super) fn shutdown_pipeline(
     drain_handle: std::thread::JoinHandle<()>,
     shadow_handle: Option<std::thread::JoinHandle<()>>,
 ) -> Option<(crate::App, crate::JournalWriter)> {
+    // Defense-in-depth: set the flag before joining. The sentinel was
+    // already published by `tcp_receiver` before this call, so no further
+    // events can arrive in the input ring — setting the flag here cannot
+    // race with new publishes. The flag is the fallback exit signal for
+    // paths that don't observe the sentinel: `run_sync` in `no-persist`
+    // builds, the drain consumer, the shadow stage, and any case where
+    // the receiver thread panicked before publishing the sentinel.
+    shutdown_flag.store(true, Ordering::Release);
     let writer = match journal_handle.join() {
         Ok(Ok(w)) => w,
         Ok(Err(e)) => {
@@ -342,9 +350,6 @@ pub(super) fn shutdown_pipeline(
         Err(_) => return None,
     };
     let exchange = matching_handle.join().ok()?;
-    // Drain + shadow exit via the shutdown flag — they don't process
-    // input-ring events so the sentinel doesn't reach them.
-    shutdown_flag.store(true, Ordering::Release);
     let _ = drain_handle.join();
     if let Some(h) = shadow_handle {
         let _ = h.join();
