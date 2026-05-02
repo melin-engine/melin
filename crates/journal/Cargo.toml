@@ -23,6 +23,10 @@ getrandom = "0.3"
 hdrhistogram = { version = "7", optional = true }
 io-uring = "0.7"
 libc = { workspace = true }
+# Safe wrappers for `pwrite`, `pwritev2`, `fallocate` so the journal hot
+# path can drop the corresponding `unsafe { libc::… }` blocks. Already
+# transitively in the workspace dep tree.
+rustix = { version = "1", features = ["fs"] }
 tracing = { workspace = true }
 # Typed views over raw byte buffers for the on-disk frame layout —
 # replaces field-by-field le::put / le::get chains with single struct

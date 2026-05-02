@@ -37,6 +37,7 @@
 use libc::mlock;
 use std::fs::{File, OpenOptions};
 use std::marker::PhantomData;
+use std::os::fd::AsFd;
 use std::os::unix::fs::FileExt;
 use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::io::AsRawFd;
@@ -296,12 +297,7 @@ impl<E: AppEvent> JournalWriter<E> {
         // buffer and write it as one O_DIRECT pwrite. Reset the buffer
         // afterwards — at construction the partial tail is empty.
         codec::encode_file_header(&mut tail_sector[..]);
-        pwrite_aligned_sector(
-            file.as_raw_fd(),
-            &tail_sector[..],
-            0,
-            /*no_fua=*/ false,
-        )?;
+        pwrite_aligned_sector(file.as_fd(), &tail_sector[..], 0, /*no_fua=*/ false)?;
         tail_sector.fill(0);
 
         Self::lock_buffer(batch_buf.as_ptr(), BATCH_BUF_CAPACITY);
@@ -403,7 +399,7 @@ impl<E: AppEvent> JournalWriter<E> {
             }
             tail_sector[tail_len..].fill(0);
             pwrite_aligned_sector(
-                file.as_raw_fd(),
+                file.as_fd(),
                 &tail_sector[..],
                 sector_base,
                 /*no_fua=*/ false,
@@ -939,21 +935,20 @@ impl<E: AppEvent> JournalWriter<E> {
         }
 
         // Single pwrite for everything — one NVMe command instead of N.
-        let fd = self.file.as_raw_fd();
-        let ptr = self.batch_buf.as_ptr() as *const libc::c_void;
-        let ret = if self.no_fua {
-            unsafe { libc::pwrite(fd, ptr, padded, self.write_pos as libc::off_t) }
+        let fd = self.file.as_fd();
+        let buf = &self.batch_buf[..padded];
+        let written = if self.no_fua {
+            rustix::io::pwrite(fd, buf, self.write_pos).map_err(rustix_to_io)?
         } else {
-            let iov = libc::iovec {
-                iov_base: ptr as *mut libc::c_void,
-                iov_len: padded,
-            };
-            unsafe { libc::pwritev2(fd, &iov, 1, self.write_pos as libc::off_t, libc::RWF_DSYNC) }
+            rustix::io::pwritev2(
+                fd,
+                &[std::io::IoSlice::new(buf)],
+                self.write_pos,
+                rustix::io::ReadWriteFlags::DSYNC,
+            )
+            .map_err(rustix_to_io)?
         };
-        if ret < 0 {
-            return Err(JournalError::Io(std::io::Error::last_os_error()));
-        }
-        if (ret as usize) != padded {
+        if written != padded {
             return Err(JournalError::Io(std::io::Error::new(
                 std::io::ErrorKind::WriteZero,
                 "short O_DIRECT write",
@@ -990,7 +985,7 @@ impl<E: AppEvent> JournalWriter<E> {
     /// and offset is always a multiple of SECTOR_SIZE.
     fn pwrite_sector(&self, offset: u64) -> Result<(), JournalError> {
         pwrite_aligned_sector(
-            self.file.as_raw_fd(),
+            self.file.as_fd(),
             &self.tail_sector[..],
             offset,
             self.no_fua,
@@ -1159,21 +1154,17 @@ fn preallocate(file: &File, current_end: u64) -> Result<u64, JournalError> {
     let target = current_end + PREALLOC_CHUNK;
 
     // Allocate only the new chunk [current_end, target), not [0, target).
-    // posix_fallocate(fd, 0, target) walks the entire extent tree from
-    // offset 0 on every call to verify already-allocated extents, which
-    // takes O(file_size) as the file grows — causing linearly growing
-    // latency spikes under sustained write load.
-    let ret = unsafe {
-        libc::posix_fallocate(
-            file.as_raw_fd(),
-            current_end as libc::off_t,
-            PREALLOC_CHUNK as libc::off_t,
-        )
-    };
-
-    if ret != 0 {
-        return Err(JournalError::Io(std::io::Error::from_raw_os_error(ret)));
-    }
+    // fallocate(fd, 0, target) walks the entire extent tree from offset 0
+    // on every call to verify already-allocated extents, which takes
+    // O(file_size) as the file grows — causing linearly growing latency
+    // spikes under sustained write load.
+    rustix::fs::fallocate(
+        file.as_fd(),
+        rustix::fs::FallocateFlags::empty(),
+        current_end,
+        PREALLOC_CHUNK,
+    )
+    .map_err(rustix_to_io)?;
     Ok(target)
 }
 
@@ -1195,18 +1186,14 @@ fn zero_range_extents(file: &File, start: u64, end: u64) {
     if start >= end {
         return;
     }
-    // FALLOC_FL_ZERO_RANGE = 0x10
-    let ret = unsafe {
-        libc::fallocate(
-            file.as_raw_fd(),
-            0x10,
-            start as libc::off_t,
-            (end - start) as libc::off_t,
-        )
-    };
-    if ret < 0 {
+    if let Err(err) = rustix::fs::fallocate(
+        file.as_fd(),
+        rustix::fs::FallocateFlags::ZERO_RANGE,
+        start,
+        end - start,
+    ) {
         tracing::warn!(
-            error = %std::io::Error::last_os_error(),
+            errno = err.raw_os_error(),
             start,
             end,
             "FALLOC_FL_ZERO_RANGE failed — expect periodic 1-2ms tail latency spikes"
@@ -1227,7 +1214,7 @@ fn zero_range_extents(file: &File, start: u64, end: u64) {
 /// for crash durability of the controller DRAM cache. Safe only on
 /// PLP-equipped drives.
 fn pwrite_aligned_sector(
-    fd: std::os::unix::io::RawFd,
+    fd: std::os::fd::BorrowedFd<'_>,
     data: &[u8],
     offset: u64,
     no_fua: bool,
@@ -1238,26 +1225,29 @@ fn pwrite_aligned_sector(
         0,
         "offset must be sector-aligned"
     );
-    let ptr = data.as_ptr() as *const libc::c_void;
-    let ret = if no_fua {
-        unsafe { libc::pwrite(fd, ptr, SECTOR_SIZE, offset as libc::off_t) }
+    let written = if no_fua {
+        rustix::io::pwrite(fd, data, offset).map_err(rustix_to_io)?
     } else {
-        let iov = libc::iovec {
-            iov_base: ptr as *mut libc::c_void,
-            iov_len: SECTOR_SIZE,
-        };
-        unsafe { libc::pwritev2(fd, &iov, 1, offset as libc::off_t, libc::RWF_DSYNC) }
+        rustix::io::pwritev2(
+            fd,
+            &[std::io::IoSlice::new(data)],
+            offset,
+            rustix::io::ReadWriteFlags::DSYNC,
+        )
+        .map_err(rustix_to_io)?
     };
-    if ret < 0 {
-        return Err(JournalError::Io(std::io::Error::last_os_error()));
-    }
-    if (ret as usize) != SECTOR_SIZE {
+    if written != SECTOR_SIZE {
         return Err(JournalError::Io(std::io::Error::new(
             std::io::ErrorKind::WriteZero,
             "short sector write",
         )));
     }
     Ok(())
+}
+
+/// Convert a `rustix::io::Errno` into the `JournalError::Io` variant.
+fn rustix_to_io(err: rustix::io::Errno) -> JournalError {
+    JournalError::Io(std::io::Error::from_raw_os_error(err.raw_os_error()))
 }
 
 /// Wall-clock nanoseconds since Unix epoch. Used for informational timestamps

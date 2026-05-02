@@ -1608,6 +1608,7 @@ dependencies = [
  "libc",
  "melin-app",
  "melin-disruptor",
+ "rustix 1.1.4",
  "tempfile",
  "tracing",
  "zerocopy",
