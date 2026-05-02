@@ -216,6 +216,33 @@ fn query_health(addr: SocketAddr) -> Result<(u64, u64, u64, bool), Box<dyn std::
     ))
 }
 
+/// Wait for a freshly-spawned replacement replica to fully catch up via
+/// the primary's lag metric. The primary's `replication_lag` is
+/// `journal_seq - min(slot0, slot1)`, with disconnected slots pinned to
+/// `u64::MAX` (and thus excluded from the min). After a replica is killed
+/// its slot is excluded, so lag can read 0 from the surviving replica
+/// alone — even before the new replacement has connected. To avoid
+/// promoting a not-yet-caught-up replica, wait for lag to first transition
+/// to a nonzero value (replacement connected with a behind handshake) and
+/// then back to zero (caught up).
+fn wait_for_replacement_catchup(primary_health: SocketAddr) {
+    let start = Instant::now();
+    let mut saw_nonzero = false;
+    loop {
+        if let Ok((_, _, lag, _)) = query_health(primary_health) {
+            if lag > 0 {
+                saw_nonzero = true;
+            } else if saw_nonzero {
+                return;
+            }
+        }
+        if start.elapsed() > Duration::from_secs(30) {
+            panic!("replacement catch-up timeout (saw_nonzero={saw_nonzero})");
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
 /// Authenticate and send PROMOTE to the promotion endpoint.
 fn promote(addr: SocketAddr, operator_key: &SigningKey) {
     use melin_protocol::codec;
@@ -1804,18 +1831,11 @@ fn catchup_with_fills_during_gap() {
         }
     };
 
-    // Wait for catch-up.
-    let start = Instant::now();
-    loop {
-        let (_, _, lag, _) = query_health(cluster.primary.health_addr).expect("health");
-        if lag == 0 {
-            break;
-        }
-        if start.elapsed() > Duration::from_secs(30) {
-            panic!("catch-up timeout (lag={lag})");
-        }
-        std::thread::sleep(Duration::from_millis(100));
-    }
+    // Wait for replacement to actually catch up. See
+    // `wait_for_replacement_catchup` for why polling primary lag once is
+    // insufficient (disconnected slot pinned to u64::MAX excludes it from
+    // the min cursor).
+    wait_for_replacement_catchup(cluster.primary.health_addr);
 
     // Kill primary, promote replacement.
     drop(client);
@@ -1929,18 +1949,16 @@ fn catchup_then_immediate_failover() {
         }
     };
 
-    // Wait for catch-up.
-    let start = Instant::now();
-    loop {
-        let (_, _, lag, _) = query_health(cluster.primary.health_addr).expect("health");
-        if lag == 0 {
-            break;
-        }
-        if start.elapsed() > Duration::from_secs(30) {
-            panic!("catch-up timeout (lag={lag})");
-        }
-        std::thread::sleep(Duration::from_millis(100));
-    }
+    // Wait for replacement_imm to actually catch up.
+    //
+    // Polling the primary's lag is insufficient on its own: replica1's slot
+    // is pinned to u64::MAX after disconnect (excluded from the min cursor),
+    // so the primary reports lag==0 from replica2 alone — even before
+    // replacement_imm has connected. Wait for lag to first transition to
+    // nonzero (replacement_imm connected and behind), then back to zero
+    // (caught up). The replica doesn't spawn a health endpoint of its own,
+    // so primary's view is the only signal available.
+    wait_for_replacement_catchup(cluster.primary.health_addr);
 
     // Kill primary IMMEDIATELY — no more orders after catch-up.
     drop(client);
