@@ -246,6 +246,25 @@ pub fn run_rumcast_roundtrip(cfg: RumcastBenchConfig) {
     let mut bench_start = Instant::now();
     let mut warmup_done = cfg.warmup == 0;
 
+    // Diagnostic counters (env-gated, dumped to stderr every ~1s).
+    // Mirror of the server-side `RUMCAST_DIAG` instrumentation:
+    // tells us whether the bench is spinning on `try_claim` (pub_log
+    // backpressure → publisher_limit not advancing → server SMs not
+    // arriving) vs. starved on inbound (server not responding).
+    let diag_enabled = std::env::var("RUMCAST_DIAG")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+    let mut diag_iters: u64 = 0;
+    let mut diag_claim_ok: u64 = 0;
+    let mut diag_claim_bp: u64 = 0;
+    let mut diag_responses: u64 = 0;
+    let mut diag_recv_frags: u64 = 0;
+    let mut diag_send_frags: u64 = 0;
+    let mut diag_sms_received: u64 = 0;
+    let mut diag_naks_received: u64 = 0;
+    let mut diag_topup_skipped_sessions: u64 = 0;
+    let mut diag_last_dump = Instant::now();
+
     // ---- Hot loop ----
     //
     // Per iteration: tick muxers, top up each session's outbound
@@ -254,10 +273,25 @@ pub fn run_rumcast_roundtrip(cfg: RumcastBenchConfig) {
     // `MuxedReceiver::tick` need `&mut self`).
     let mut total_received_overall = 0usize;
     while total_received_overall < total_msgs {
-        muxed_sender.tick();
-        muxed_receiver.tick();
+        diag_iters += 1;
+        let send_stats = muxed_sender.tick();
+        let recv_stats = muxed_receiver.tick();
+        diag_send_frags += send_stats.fragments_sent as u64;
+        diag_naks_received += send_stats.naks_received as u64;
+        diag_sms_received += send_stats.sms_received as u64;
+        diag_recv_frags += recv_stats.fragments_accepted as u64;
 
         // Top up each session's outbound window.
+        //
+        // CRITICAL: try_claim is non-blocking — on backpressure
+        // (publisher_limit not advanced because the server hasn't
+        // sent SMs yet, or our last SM got dropped), `break` out
+        // and let the outer loop re-tick the muxers. The previous
+        // version spun forever on Err here, never returning to
+        // tick(), so SMs would never be processed and the bench
+        // would deadlock the moment a single session's pub_log
+        // filled. Same shape as the server-side spin_publish bug
+        // we already fixed.
         for s in 0..cfg.clients {
             let target = per_client_total[s];
             while inflight[s].len() < cfg.window && total_sent[s] < target {
@@ -271,23 +305,28 @@ pub fn run_rumcast_roundtrip(cfg: RumcastBenchConfig) {
                     &mut envelope_buf,
                 )
                 .expect("envelope buf large enough");
-                // Spin-claim. publisher_limit is u64::MAX so the only
-                // way claim fails is PayloadTooLarge — programmer
-                // error, not runtime.
-                loop {
-                    match pub_logs[s].try_claim(env_len as u32) {
-                        Ok(mut claim) => {
-                            claim
-                                .payload_mut()
-                                .copy_from_slice(&envelope_buf[..env_len]);
-                            claim.publish(data_flags::UNFRAGMENTED);
-                            break;
-                        }
-                        Err(_) => std::hint::spin_loop(),
+                match pub_logs[s].try_claim(env_len as u32) {
+                    Ok(mut claim) => {
+                        claim
+                            .payload_mut()
+                            .copy_from_slice(&envelope_buf[..env_len]);
+                        claim.publish(data_flags::UNFRAGMENTED);
+                        diag_claim_ok += 1;
+                        // We bumped outbound_seq above. Since the
+                        // publish succeeded, keep the new seq —
+                        // sequence integrity preserved.
+                        inflight[s].push_back(Instant::now());
+                        total_sent[s] += 1;
+                    }
+                    Err(_) => {
+                        // Roll back the seq bump so we don't gap
+                        // the receiver when we retry next iter.
+                        outbound_seq[s] -= 1;
+                        diag_claim_bp += 1;
+                        diag_topup_skipped_sessions += 1;
+                        break;
                     }
                 }
-                inflight[s].push_back(Instant::now());
-                total_sent[s] += 1;
             }
         }
 
@@ -339,6 +378,45 @@ pub fn run_rumcast_roundtrip(cfg: RumcastBenchConfig) {
             }
         });
         total_received_overall += drained_now;
+        diag_responses += drained_now as u64;
+
+        if diag_enabled {
+            let now = Instant::now();
+            if now.duration_since(diag_last_dump) >= Duration::from_secs(1) {
+                let inflight_max = inflight.iter().map(|q| q.len()).max().unwrap_or(0);
+                let inflight_sum: usize = inflight.iter().map(|q| q.len()).sum();
+                let sent_sum: usize = total_sent.iter().sum();
+                let recv_sum: usize = total_received.iter().sum();
+                eprintln!(
+                    "[bench-diag] iters={} claim_ok={} claim_bp={} topup_skipped={} \
+                     responses={} recv_frags={} send_frags={} sms_recv={} naks_recv={} \
+                     inflight_max={} inflight_sum={} sent={} recv={}",
+                    diag_iters,
+                    diag_claim_ok,
+                    diag_claim_bp,
+                    diag_topup_skipped_sessions,
+                    diag_responses,
+                    diag_recv_frags,
+                    diag_send_frags,
+                    diag_sms_received,
+                    diag_naks_received,
+                    inflight_max,
+                    inflight_sum,
+                    sent_sum,
+                    recv_sum,
+                );
+                diag_iters = 0;
+                diag_claim_ok = 0;
+                diag_claim_bp = 0;
+                diag_responses = 0;
+                diag_recv_frags = 0;
+                diag_send_frags = 0;
+                diag_sms_received = 0;
+                diag_naks_received = 0;
+                diag_topup_skipped_sessions = 0;
+                diag_last_dump = now;
+            }
+        }
 
         // Reset bench_start once every session has drained its warmup
         // quota. Until then we record into a holding histogram that

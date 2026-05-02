@@ -788,7 +788,7 @@ run_bench_rumcast() {
     # the server auto-discovers the response dst from the bench's
     # first inbound frame.
     ssh $SSH_OPTS "$BENCH" "cd ${REPO_DIR} && source ~/.cargo/env && \
-        ./target/release/melin-bench.rumcast \
+        ${RUMCAST_DIAG_ENV}./target/release/melin-bench.rumcast \
             --addr ${server_addr} \
             --rumcast-bind 0.0.0.0:0 \
             --key bench.key \
