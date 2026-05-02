@@ -312,6 +312,18 @@ pub(super) fn sleep_checking_flags(
 
 /// Shut down the replica pipeline and extract Exchange + JournalWriter from
 /// the stage threads. Returns None if a thread panicked.
+///
+/// Relies on the caller having published a `JournalEvent::Shutdown`
+/// sentinel to the input ring before invoking this — the journal and
+/// matching stages exit when they consume the sentinel via the normal
+/// event-processing path. We deliberately don't flip `shutdown_flag`
+/// here: doing so could cause a stage to take its emergency-abort
+/// branch *before* consuming the sentinel, hitting the
+/// drain-vs-cursor race that the sentinel design exists to avoid.
+///
+/// `drain_handle` and `shadow_handle` still observe `shutdown_flag`
+/// because they don't process the input ring (no sentinel reaches
+/// them); set the flag for them only.
 pub(super) fn shutdown_pipeline(
     shutdown_flag: &AtomicBool,
     journal_handle: std::thread::JoinHandle<
@@ -321,7 +333,6 @@ pub(super) fn shutdown_pipeline(
     drain_handle: std::thread::JoinHandle<()>,
     shadow_handle: Option<std::thread::JoinHandle<()>>,
 ) -> Option<(crate::App, crate::JournalWriter)> {
-    shutdown_flag.store(true, Ordering::Relaxed);
     let writer = match journal_handle.join() {
         Ok(Ok(w)) => w,
         Ok(Err(e)) => {
@@ -331,6 +342,9 @@ pub(super) fn shutdown_pipeline(
         Err(_) => return None,
     };
     let exchange = matching_handle.join().ok()?;
+    // Drain + shadow exit via the shutdown flag — they don't process
+    // input-ring events so the sentinel doesn't reach them.
+    shutdown_flag.store(true, Ordering::Release);
     let _ = drain_handle.join();
     if let Some(h) = shadow_handle {
         let _ = h.join();

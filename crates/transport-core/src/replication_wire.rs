@@ -155,6 +155,15 @@ pub fn append_input_slot<E: AppEvent>(buf: &mut Vec<u8>, slot: &InputSlot<E>, se
             debug_assert_eq!(written, n, "AppEvent::encode disagrees with encoded_size");
             SLOT_TAG_APP
         }
+        JournalEvent::Shutdown => {
+            // Pipeline-only sentinel — never written to the wire. The
+            // journal stage filters it before reaching this encoder; if
+            // it arrives here, that's a logic bug. Truncate the buffer
+            // back to the pre-header position so the partially-written
+            // header isn't appended to the wire batch.
+            buf.truncate(header_start);
+            return;
+        }
     };
 
     let payload_bytes = buf.len() - (header_start + SLOT_HEADER_LEN);

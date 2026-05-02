@@ -327,6 +327,12 @@ fn replay_entry<A: Application>(
             // Chain metadata — handled by the reader itself during
             // `next_entry`; no application action.
         }
+        JournalEvent::Shutdown => {
+            // Pipeline-only sentinel; never written to disk and so
+            // unreachable on the replay path. Treat defensively rather
+            // than panic — recovery can't recover from a corrupt journal
+            // with a shutdown entry, but it shouldn't crash the process.
+        }
     }
 }
 

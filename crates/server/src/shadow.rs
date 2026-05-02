@@ -218,6 +218,10 @@ fn dispatch_event(
         RawJournalEvent::GenesisHash { .. } | RawJournalEvent::Checkpoint { .. } => {
             // Hash chain metadata — no application state change.
         }
+        RawJournalEvent::Shutdown => {
+            // Pipeline-only sentinel — handled at the run-loop level by
+            // exiting; should never reach this dispatch.
+        }
     }
 }
 
@@ -616,7 +620,8 @@ mod tests {
                 })
                 | JournalEvent::App(melin_trading::trading_event::TradingEvent::QueryRequestSeq)
                 | JournalEvent::GenesisHash { .. }
-                | JournalEvent::Checkpoint { .. } => {}
+                | JournalEvent::Checkpoint { .. }
+                | JournalEvent::Shutdown => {}
             }
         }
 

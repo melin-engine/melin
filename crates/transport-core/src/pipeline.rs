@@ -173,6 +173,21 @@ impl<E: AppEvent> Default for InputSlot<E> {
     }
 }
 
+impl<E: AppEvent> InputSlot<E> {
+    /// Build the pipeline-shutdown sentinel slot. The producer (receiver
+    /// or reader thread) publishes this as its last action before exit;
+    /// each downstream stage stops at this slot, completing any pending
+    /// work and then returning. The `event` is `JournalEvent::Shutdown`,
+    /// which the journal stage drops without writing — it's a transient
+    /// pipeline signal, never persisted.
+    pub fn shutdown_sentinel() -> Self {
+        Self {
+            event: melin_journal::JournalEvent::Shutdown,
+            ..Self::default()
+        }
+    }
+}
+
 /// Slot in the output SPSC queue (matching → response).
 ///
 /// Each slot carries either an execution report or a batch-end marker
@@ -981,11 +996,23 @@ impl<E: AppEvent> JournalStage<E> {
                 0
             };
 
+            // `saw_shutdown` becomes true the moment we observe a sentinel
+            // slot in the input ring. Set on the inner loop, checked on the
+            // outer loop to break out into the shutdown-flush path. We
+            // process every slot up to (and excluding) the sentinel — the
+            // disruptor's FIFO order guarantees we've consumed everything
+            // the receiver published before the sentinel.
+            let mut saw_shutdown = false;
+
             if count > 0 {
                 idle_spins = 0;
                 busy_count += 1;
 
                 for slot in &batch[..count] {
+                    if slot.event.is_shutdown() {
+                        saw_shutdown = true;
+                        break;
+                    }
                     if slot.event.is_query() {
                         continue;
                     }
@@ -1027,6 +1054,28 @@ impl<E: AppEvent> JournalStage<E> {
                 if first_write_ts.is_none() {
                     first_write_ts = Some(Instant::now());
                 }
+            }
+
+            if saw_shutdown {
+                // Drain anything in flight + any pending batch, then exit.
+                // Same shape as the existing shutdown-flag path below — we
+                // just got here via the sentinel rather than the flag.
+                if let Some((batch_data, seq)) = inflight.take() {
+                    self.wait_for_cqe(&mut ring, batch_data.len)?;
+                    self.consumer.set_progress(seq);
+                    self.publish_chain_hash();
+                    self.writer.confirm_async_write(batch_data);
+                }
+                if pending > 0 {
+                    self.writer.flush_batch_sync()?;
+                    self.consumer.commit(pending);
+                }
+                self.drain_remaining(&mut batch);
+                self.utilization.busy.store(busy_count, Ordering::Relaxed);
+                self.utilization.idle.store(idle_count, Ordering::Relaxed);
+                #[cfg(feature = "pipeline-stats")]
+                print_utilization("journal", busy_count, idle_count);
+                return Ok(self.writer);
             }
 
             // --- Eagerly reap CQE after encoding ---
@@ -1329,7 +1378,16 @@ impl<A: Application> MatchingStage<A> {
                 key_hash: 0,
             };
 
+            let mut saw_shutdown = false;
+
             for (i, slot) in batch[..count].iter().enumerate() {
+                if slot.event.is_shutdown() {
+                    // Sentinel — every event the producer published before
+                    // this slot has already been consumed (FIFO). Exit
+                    // cleanly without applying the sentinel itself.
+                    saw_shutdown = true;
+                    break;
+                }
                 let input_seq = batch_start + i as u64;
                 busy_count += 1;
 
@@ -1428,6 +1486,20 @@ impl<A: Application> MatchingStage<A> {
             // endpoint can observe progress. One Relaxed store per batch
             // (~1ns) is negligible compared to per-event atomic increment.
             self.events_processed.store(local_events, Ordering::Relaxed);
+
+            if saw_shutdown {
+                self.events_processed.store(local_events, Ordering::Relaxed);
+                self.utilization.busy.store(busy_count, Ordering::Relaxed);
+                self.utilization.idle.store(idle_count, Ordering::Relaxed);
+                #[cfg(feature = "latency-trace")]
+                {
+                    wakeup_hist.print_report();
+                    execute_hist.print_report();
+                }
+                #[cfg(feature = "pipeline-stats")]
+                print_utilization("matching", busy_count, idle_count);
+                return self.app;
+            }
         }
     }
 
@@ -1545,6 +1617,11 @@ impl<A: Application> MatchingStage<A> {
             | melin_journal::JournalEvent::Checkpoint { .. } => {
                 // Hash chain metadata — journal internal, never reaches
                 // the application.
+            }
+            melin_journal::JournalEvent::Shutdown => {
+                // Pipeline sentinel — handled at the run-loop level
+                // (stage exits on observing it). Never reaches process_event
+                // in practice; this arm is a safety net.
             }
         }
         None

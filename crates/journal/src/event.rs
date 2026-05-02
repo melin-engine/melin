@@ -44,6 +44,17 @@ pub enum JournalEvent<E: AppEvent> {
     /// scheduled tasks. Replay feeds the recorded `now_ns` back,
     /// preserving determinism.
     Tick { now_ns: u64 },
+    /// Pipeline-shutdown sentinel. Published by the receiver/reader as
+    /// the last slot before exit; downstream stages stop at this slot
+    /// (after completing any pending work) and exit.
+    ///
+    /// Unlike the other variants, this is **never** journaled — the
+    /// journal stage's encoder skips it. It's a transient in-memory
+    /// signal that piggy-backs on the input ring's existing FIFO order
+    /// to guarantee every event published before shutdown is processed
+    /// by every stage before that stage exits. No drain-loop heuristics,
+    /// no shutdown-flag synchronization with the producer cursor.
+    Shutdown,
     /// Application-level event. Opaque to the journal; serialised via
     /// [`AppEvent::encode`] / [`AppEvent::decode`].
     App(E),
@@ -59,5 +70,12 @@ impl<E: AppEvent> JournalEvent<E> {
             JournalEvent::App(e) => e.is_query(),
             _ => false,
         }
+    }
+
+    /// Returns `true` for the pipeline-shutdown sentinel. Each stage
+    /// stops at this slot (after completing any pending work) and exits.
+    #[inline]
+    pub fn is_shutdown(&self) -> bool {
+        matches!(self, JournalEvent::Shutdown)
     }
 }

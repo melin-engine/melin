@@ -240,6 +240,16 @@ pub fn encode<E: AppEvent>(
             pos += written;
             TAG_APP
         }
+        JournalEvent::Shutdown => {
+            // Shutdown is a transient pipeline sentinel — never persisted.
+            // The journal stage must filter it before reaching the codec;
+            // this arm is a safety net that surfaces a clear error if
+            // anyone bypasses that filter.
+            return Err(JournalError::CorruptEntry {
+                sequence,
+                reason: "JournalEvent::Shutdown must not reach the codec",
+            });
+        }
     };
 
     // `length` covers key_hash(8) + request_seq(8) + event_tag(1) + payload.

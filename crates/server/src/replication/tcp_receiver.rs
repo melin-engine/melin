@@ -792,18 +792,22 @@ pub fn run_receiver(
 
         // Check shutdown/promote before attempting to connect.
         if shutdown.load(Ordering::Relaxed) {
-            if let Some(p) = pipeline.take() {
+            if let Some(mut p) = pipeline.take() {
+                p.input_producer
+                    .publish(crate::InputSlot::shutdown_sentinel());
                 let _ = teardown_replica_pipeline(p);
             }
             return Ok(None);
         }
         if promote.load(Ordering::Acquire) {
             info!("promotion triggered while disconnected");
-            if let Some(p) = pipeline.take()
-                && let Some((e, w)) = teardown_replica_pipeline(p)
-            {
-                exchange = Some(e);
-                journal_writer = Some(w);
+            if let Some(mut p) = pipeline.take() {
+                p.input_producer
+                    .publish(crate::InputSlot::shutdown_sentinel());
+                if let Some((e, w)) = teardown_replica_pipeline(p) {
+                    exchange = Some(e);
+                    journal_writer = Some(w);
+                }
             }
             return match (exchange, journal_writer) {
                 (Some(e), Some(w)) => Ok(Some((e, w))),
@@ -829,11 +833,13 @@ pub fn run_receiver(
                 }
                 if promote.load(Ordering::Acquire) {
                     info!("promotion triggered during reconnect backoff");
-                    if let Some(p) = pipeline.take()
-                        && let Some((e, w)) = teardown_replica_pipeline(p)
-                    {
-                        exchange = Some(e);
-                        journal_writer = Some(w);
+                    if let Some(mut p) = pipeline.take() {
+                        p.input_producer
+                            .publish(crate::InputSlot::shutdown_sentinel());
+                        if let Some((e, w)) = teardown_replica_pipeline(p) {
+                            exchange = Some(e);
+                            journal_writer = Some(w);
+                        }
                     }
                     return match (exchange, journal_writer) {
                         (Some(e), Some(w)) => Ok(Some((e, w))),
@@ -919,7 +925,9 @@ pub fn run_receiver(
                 // file from under it. The recovered (App, JournalWriter) is
                 // discarded — snapshot loading reconstructs both fresh below
                 // and reassigns `exchange` / `journal_writer`.
-                if let Some(p) = pipeline.take() {
+                if let Some(mut p) = pipeline.take() {
+                    p.input_producer
+                        .publish(crate::InputSlot::shutdown_sentinel());
                     let _ = teardown_replica_pipeline(p);
                 }
 
@@ -1126,6 +1134,20 @@ pub fn run_receiver(
             && let Some(seq) = pending_acks.pop_all_blocking(p.journal_cursor.as_ref())
         {
             let _ = send_ack_tcp(seq, &mut tcp_writer, &mut send_buf);
+        }
+
+        // For terminal session exits (Shutdown / Promote / Fatal) the
+        // pipeline will be torn down. Publish a sentinel slot so the
+        // journal and matching stages can drain everything we've already
+        // published and exit cleanly via the normal consume path — no
+        // shutdown-flag/cursor-race dance. Disconnected exits are
+        // transient (pipeline persists across reconnects) and must not
+        // emit a sentinel.
+        if !matches!(exit_reason, SessionExit::Disconnected)
+            && let Some(p) = pipeline.as_mut()
+        {
+            p.input_producer
+                .publish(crate::InputSlot::shutdown_sentinel());
         }
 
         match exit_reason {

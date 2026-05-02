@@ -620,6 +620,10 @@ fn replay_event(
         JournalEvent::GenesisHash { .. } | JournalEvent::Checkpoint { .. } => {
             // Hash chain metadata — no exchange state change.
         }
+        JournalEvent::Shutdown => {
+            // Pipeline-only sentinel — never journaled, so unreachable on
+            // the replay path. Defensive no-op.
+        }
     }
 }
 
