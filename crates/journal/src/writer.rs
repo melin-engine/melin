@@ -474,22 +474,11 @@ impl<E: AppEvent> JournalWriter<E> {
         Ok(seq)
     }
 
-    /// Append an event to the journal **without** syncing to disk.
-    ///
-    /// Used by the pipeline journal stage to batch multiple events into
-    /// a single write before calling `flush_batch_sync()` once for the batch.
-    /// This amortizes the sync cost across many events under load.
-    pub fn append_no_sync(&mut self, event: &JournalEvent<E>) -> Result<u64, JournalError> {
-        let seq = self.batch_append(event)?;
-        self.flush_batch()?;
-        Ok(seq)
-    }
-
     /// Encode an event into the batch buffer without writing to disk.
     ///
-    /// Much faster than `append_no_sync` — no syscall per event, just
-    /// memory copies into the pre-allocated batch buffer. Call `flush_batch`
-    /// after encoding the entire batch to issue a single `pwrite`.
+    /// Much faster than `append` — no syscall per event, just memory copies
+    /// into the pre-allocated batch buffer. Call `flush_batch_sync` after
+    /// encoding the entire batch to issue a single `pwrite`.
     ///
     /// Uses one `wall_clock_nanos()` call per event for the journal timestamp.
     /// For batches sharing a timestamp, use `batch_append_with_ts`.
@@ -679,23 +668,18 @@ impl<E: AppEvent> JournalWriter<E> {
 
     /// Write the accumulated batch buffer to disk durably.
     ///
-    /// O_DIRECT is always on, so this routes through `flush_to_sectors`,
-    /// which merges the in-memory partial tail with the new batch and issues
-    /// one sector-aligned pwrite — `pwritev2 + RWF_DSYNC` (FUA, ~10–100 µs)
-    /// in the default path, plain `pwrite` in PLP mode (~1–5 µs).
-    pub fn flush_batch(&mut self) -> Result<(), JournalError> {
+    /// Synchronous counterpart of [`take_batch_for_async_write`]. Routes
+    /// through `flush_to_sectors`, which merges the in-memory partial tail
+    /// with the new batch and issues one sector-aligned pwrite —
+    /// `pwritev2 + RWF_DSYNC` (FUA, ~10–100 µs) in the default path, plain
+    /// `pwrite` in PLP mode (~1–5 µs). The hot path uses the async variant;
+    /// this one is for shutdown drains and one-shot callers.
+    pub fn flush_batch_sync(&mut self) -> Result<(), JournalError> {
         if self.batch_len == 0 {
             return Ok(());
         }
         self.ensure_allocated()?;
         self.flush_to_sectors()
-    }
-
-    /// Alias for [`flush_batch`] retained for callers that still spell it out.
-    /// All flushes are sync now that O_DIRECT is always on; the two methods
-    /// do the same thing.
-    pub fn flush_batch_sync(&mut self) -> Result<(), JournalError> {
-        self.flush_batch()
     }
 
     /// Drop the current batch buffer without writing it to disk.
@@ -1386,23 +1370,6 @@ mod tests {
         assert_eq!(entries[0].sequence, FIRST_SEQ);
         assert_eq!(entries[0].event, event);
         assert!(entries[0].timestamp_ns > 0);
-    }
-
-    #[test]
-    fn append_no_sync_is_readable() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("test.journal");
-
-        let event = sample_event();
-        {
-            let mut writer = JournalWriter::<TestEvent>::create(&path).unwrap();
-            let seq = writer.append_no_sync(&event).unwrap();
-            assert_eq!(seq, FIRST_SEQ);
-        }
-
-        let entries = read_all(&path);
-        assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0].event, event);
     }
 
     #[test]

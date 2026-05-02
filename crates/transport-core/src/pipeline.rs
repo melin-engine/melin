@@ -902,17 +902,43 @@ impl<E: AppEvent> JournalStage<E> {
         loop {
             // --- Check shutdown ---
             if shutdown.load(std::sync::atomic::Ordering::Relaxed) {
-                // Wait for in-flight write to complete.
+                // Wait for any in-flight write to complete.
                 if let Some((batch_data, seq)) = inflight.take() {
                     self.wait_for_cqe(&mut ring, batch_data.len)?;
                     self.consumer.set_progress(seq);
                     self.publish_chain_hash();
                     self.writer.confirm_async_write(batch_data);
                 }
-                // Flush any pending buffered data synchronously.
+                // Flush any pending buffered data through the same async path
+                // as steady-state — submit + reap one CQE — instead of falling
+                // back to a synchronous pwritev2. Keeps the production write
+                // path symmetric and removes the last sync-flush call from the
+                // hot/critical lifecycle.
                 if pending > 0 {
-                    self.writer.flush_batch_sync()?;
-                    self.consumer.commit(pending);
+                    let seq = self.consumer.next_read();
+                    if let Some(async_batch) = self.writer.take_batch_for_async_write()? {
+                        let len = async_batch.len;
+                        let sqe = opcode::Write::new(
+                            types::Fixed(0),
+                            async_batch.buf.as_ptr(),
+                            len as u32,
+                        )
+                        .offset(async_batch.offset)
+                        .rw_flags(rw_flags)
+                        .build()
+                        .user_data(1);
+                        unsafe {
+                            ring.submission().push(&sqe).expect("SQ full");
+                        }
+                        ring.submit().expect("io_uring submit failed");
+                        self.wait_for_cqe(&mut ring, len)?;
+                        self.consumer.set_progress(seq);
+                        self.publish_chain_hash();
+                        self.writer.confirm_async_write(async_batch);
+                    } else {
+                        // Buffer was empty (read-only queries only) — just commit.
+                        self.consumer.commit(pending);
+                    }
                 }
                 self.drain_remaining(&mut batch);
                 self.utilization.busy.store(busy_count, Ordering::Relaxed);
