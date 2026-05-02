@@ -1690,20 +1690,7 @@ fn replacement_replica_catches_up_from_journal() {
         }
     };
 
-    // Wait for the primary's replication lag to reach 0 — the replacement
-    // replica must catch up and start acking.
-    let start = Instant::now();
-    loop {
-        let (_, _, lag, _) =
-            query_health(cluster.primary.health_addr).expect("query primary health");
-        if lag == 0 {
-            break;
-        }
-        if start.elapsed() > Duration::from_secs(30) {
-            panic!("replacement replica did not catch up within 30s (lag={lag})");
-        }
-        std::thread::sleep(Duration::from_millis(100));
-    }
+    wait_for_replacement_catchup(cluster.primary.health_addr);
     eprintln!("Replacement replica caught up.");
 
     // Phase 3: submit orders after catch-up to verify live streaming works.
@@ -2074,18 +2061,7 @@ fn fresh_replica_full_catchup() {
         }
     };
 
-    // Wait for replication lag to reach 0 — the fresh replica must catch up.
-    let start = Instant::now();
-    loop {
-        let (_, _, lag, _) = query_health(cluster.primary.health_addr).expect("health");
-        if lag == 0 {
-            break;
-        }
-        if start.elapsed() > Duration::from_secs(30) {
-            panic!("fresh replica did not catch up within 30s (lag={lag})");
-        }
-        std::thread::sleep(Duration::from_millis(100));
-    }
+    wait_for_replacement_catchup(cluster.primary.health_addr);
     eprintln!("Fresh replica caught up.");
 
     // Submit more orders after catch-up (proves live streaming works).
@@ -2328,18 +2304,7 @@ fn snapshot_transfer_when_archives_purged() {
     wait_healthy(primary2.health_addr, Duration::from_secs(30));
     eprintln!("Primary healthy with replica connected");
 
-    // Wait for replication lag to reach 0.
-    let start = Instant::now();
-    loop {
-        let (_, _, lag, _) = query_health(primary2.health_addr).expect("health");
-        if lag == 0 {
-            break;
-        }
-        if start.elapsed() > Duration::from_secs(30) {
-            panic!("replica did not catch up via snapshot transfer within 30s (lag={lag})");
-        }
-        std::thread::sleep(Duration::from_millis(100));
-    }
+    wait_for_replacement_catchup(primary2.health_addr);
     eprintln!("Replica caught up via snapshot transfer.");
 
     // Submit a new order to verify the primary is functional.
