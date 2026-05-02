@@ -186,9 +186,15 @@ DPDK_RAN=0
 cleanup() {
     for host in "$SERVER" ${REPLICA:+"$REPLICA"} ${REPLICA2:+"$REPLICA2"}; do
         ssh $SSH_OPTS "$host" "pkill -INT -x melin-server 2>/dev/null; \
-                               pkill -INT -f melin-server.rumcast 2>/dev/null; \
-                               pkill -INT -f melin-server.dpdk 2>/dev/null; true" 2>/dev/null || true
+                               pkill -INT -f '[m]elin-server.rumcast' 2>/dev/null; \
+                               pkill -INT -f '[m]elin-server.dpdk' 2>/dev/null; true" 2>/dev/null || true
     done
+    # Kill any orphaned bench client too — a hung run leaves the bench
+    # binary executing on $BENCH and the next build trips "Text file
+    # busy" on the cp into the .rumcast / .dpdk suffixed path.
+    ssh $SSH_OPTS "$BENCH" "pkill -INT -x melin-bench 2>/dev/null; \
+                            pkill -INT -f '[m]elin-bench.rumcast' 2>/dev/null; \
+                            pkill -INT -f '[m]elin-bench.dpdk' 2>/dev/null; true" 2>/dev/null || true
     # Close ssh master connections and remove their control sockets.
     for host in "$SERVER" "$BENCH" ${REPLICA:+"$REPLICA"} ${REPLICA2:+"$REPLICA2"}; do
         ssh -O exit $SSH_OPTS "$host" 2>/dev/null || true
@@ -451,6 +457,18 @@ if [[ "$NEED_RUMCAST" == "1" ]]; then
     fi
 
     echo "  Building rumcast server (--features ${RUMCAST_SERVER_FEATURES}) and bench in parallel..."
+    # Stop any previously-running .rumcast binaries first — Linux refuses
+    # to overwrite a running ELF ("Text file busy"). Use pkill -f because
+    # the comm field is truncated to 15 chars (TASK_COMM_LEN-1) and -x
+    # silently doesn't match the .rumcast / .dpdk suffixed names.
+    ssh $SSH_OPTS "$SERVER" "pkill -f '[m]elin-server.rumcast' 2>/dev/null; true"
+    ssh $SSH_OPTS "$BENCH"  "pkill -f '[m]elin-bench.rumcast' 2>/dev/null; true"
+    if (( _need_udp_repl )) && [[ -n "$REPLICA" ]]; then
+        ssh $SSH_OPTS "$REPLICA" "pkill -f '[m]elin-server.rumcast' 2>/dev/null; true"
+    fi
+    if (( _need_udp_dual_repl )) && [[ -n "$REPLICA2" ]]; then
+        ssh $SSH_OPTS "$REPLICA2" "pkill -f '[m]elin-server.rumcast' 2>/dev/null; true"
+    fi
     rumcast_pids=()
     (
         ssh $SSH_OPTS "$SERVER" "cd ${REPO_DIR} && source ~/.cargo/env && \
@@ -715,8 +733,8 @@ stop_servers() {
         # `pkill -x` is exact-match; the rumcast and dpdk binaries have
         # suffixes so we must list them explicitly.
         ssh $SSH_OPTS "$host" "pkill -INT -x melin-server 2>/dev/null; \
-                               pkill -INT -f melin-server.rumcast 2>/dev/null; \
-                               pkill -INT -f melin-server.dpdk 2>/dev/null; true"
+                               pkill -INT -f '[m]elin-server.rumcast' 2>/dev/null; \
+                               pkill -INT -f '[m]elin-server.dpdk' 2>/dev/null; true"
     done
     sleep 2
 }
@@ -946,7 +964,7 @@ transport_start_udp() {
     pin_irqs "$SERVER" "server"
     pin_irqs "$BENCH" "bench"
 
-    ssh $SSH_OPTS "$SERVER" "pkill -f melin-server.rumcast 2>/dev/null; pkill -x melin-server 2>/dev/null; true"
+    ssh $SSH_OPTS "$SERVER" "pkill -f '[m]elin-server.rumcast' 2>/dev/null; pkill -x melin-server 2>/dev/null; true"
     sleep 1
     ssh $SSH_OPTS "$SERVER" "NO_COLOR=1 RUST_LOG=${BENCH_RUST_LOG} nohup ${REPO_DIR}/target/release/melin-server.rumcast \
             --bind ${SERVER_VLAN}:9876 \
@@ -976,7 +994,7 @@ transport_start_udp_repl() {
     pin_irqs "$BENCH" "bench"
     pin_irqs "$REPLICA" "replica"
 
-    ssh $SSH_OPTS "$SERVER" "pkill -f melin-server.rumcast 2>/dev/null; pkill -x melin-server 2>/dev/null; true"
+    ssh $SSH_OPTS "$SERVER" "pkill -f '[m]elin-server.rumcast' 2>/dev/null; pkill -x melin-server 2>/dev/null; true"
     sleep 1
     ssh $SSH_OPTS "$SERVER" "NO_COLOR=1 RUST_LOG=${BENCH_RUST_LOG} nohup ${REPO_DIR}/target/release/melin-server.rumcast \
             --bind ${SERVER_VLAN}:9876 \
@@ -989,7 +1007,7 @@ transport_start_udp_repl() {
 
     wait_for_log "$SERVER" "/tmp/melin-server.log" "rumcast replication sender listening" 30 "Rumcast replication listener"
 
-    ssh $SSH_OPTS "$REPLICA" "pkill -f melin-server.rumcast 2>/dev/null; pkill -x melin-server 2>/dev/null; true"
+    ssh $SSH_OPTS "$REPLICA" "pkill -f '[m]elin-server.rumcast' 2>/dev/null; pkill -x melin-server 2>/dev/null; true"
     sleep 1
     ssh $SSH_OPTS "$REPLICA" "NO_COLOR=1 RUST_LOG=${BENCH_RUST_LOG} nohup ${REPO_DIR}/target/release/melin-server.rumcast \
             --bind ${REPLICA_VLAN}:9876 \
@@ -1029,7 +1047,7 @@ transport_start_udp_dual_repl() {
     pin_irqs "$REPLICA" "replica1"
     pin_irqs "$REPLICA2" "replica2"
 
-    ssh $SSH_OPTS "$SERVER" "pkill -f melin-server.rumcast 2>/dev/null; pkill -x melin-server 2>/dev/null; true"
+    ssh $SSH_OPTS "$SERVER" "pkill -f '[m]elin-server.rumcast' 2>/dev/null; pkill -x melin-server 2>/dev/null; true"
     sleep 1
     ssh $SSH_OPTS "$SERVER" "NO_COLOR=1 RUST_LOG=${BENCH_RUST_LOG} nohup ${REPO_DIR}/target/release/melin-server.rumcast \
             --bind ${SERVER_VLAN}:9876 \
@@ -1042,7 +1060,7 @@ transport_start_udp_dual_repl() {
 
     wait_for_log "$SERVER" "/tmp/melin-server.log" "rumcast replication sender listening" 30 "Rumcast replication listener"
 
-    ssh $SSH_OPTS "$REPLICA" "pkill -f melin-server.rumcast 2>/dev/null; pkill -x melin-server 2>/dev/null; true"
+    ssh $SSH_OPTS "$REPLICA" "pkill -f '[m]elin-server.rumcast' 2>/dev/null; pkill -x melin-server 2>/dev/null; true"
     sleep 1
     ssh $SSH_OPTS "$REPLICA" "NO_COLOR=1 RUST_LOG=${BENCH_RUST_LOG} nohup ${REPO_DIR}/target/release/melin-server.rumcast \
             --bind ${REPLICA_VLAN}:9876 \
@@ -1053,7 +1071,7 @@ transport_start_udp_dual_repl() {
             ${REPLICA_EXTRA_ARGS:-} \
         >/tmp/melin-server.log 2>&1 </dev/null &" </dev/null
 
-    ssh $SSH_OPTS "$REPLICA2" "pkill -f melin-server.rumcast 2>/dev/null; pkill -x melin-server 2>/dev/null; true"
+    ssh $SSH_OPTS "$REPLICA2" "pkill -f '[m]elin-server.rumcast' 2>/dev/null; pkill -x melin-server 2>/dev/null; true"
     sleep 1
     ssh $SSH_OPTS "$REPLICA2" "NO_COLOR=1 RUST_LOG=${BENCH_RUST_LOG} nohup ${REPO_DIR}/target/release/melin-server.rumcast \
             --bind ${REPLICA2_VLAN}:9876 \
@@ -1342,7 +1360,7 @@ transport_start_dpdk() {
         vlan_arg="--dpdk-vlan ${SERVER_DPDK_VLAN}"
     fi
 
-    ssh $SSH_OPTS "$SERVER" "pkill -x melin-server 2>/dev/null; pkill -f melin-server.dpdk 2>/dev/null; true"
+    ssh $SSH_OPTS "$SERVER" "pkill -x melin-server 2>/dev/null; pkill -f '[m]elin-server.dpdk' 2>/dev/null; true"
     sleep 1
     ssh $SSH_OPTS "$SERVER" "NO_COLOR=1 RUST_LOG=${BENCH_RUST_LOG} nohup ${DPDK_SERVER_BIN} \
             --bind 0.0.0.0:9876 \
@@ -1390,7 +1408,7 @@ transport_stop_dpdk() {
     perf_capture_stop
     stop_servers "$SERVER"
     # TAP mode uses melin-server.dpdk — kill that too.
-    ssh $SSH_OPTS "$SERVER" "pkill -INT -f melin-server.dpdk 2>/dev/null; true"
+    ssh $SSH_OPTS "$SERVER" "pkill -INT -f '[m]elin-server.dpdk' 2>/dev/null; true"
 }
 
 transport_start_dpdk_repl() {
@@ -1422,7 +1440,7 @@ transport_start_dpdk_repl() {
         replica_eal="--huge-dir=${HUGE_DIR}"
     fi
 
-    ssh $SSH_OPTS "$SERVER" "pkill -x melin-server 2>/dev/null; pkill -f melin-server.dpdk 2>/dev/null; true"
+    ssh $SSH_OPTS "$SERVER" "pkill -x melin-server 2>/dev/null; pkill -f '[m]elin-server.dpdk' 2>/dev/null; true"
     sleep 1
     ssh $SSH_OPTS "$SERVER" "NO_COLOR=1 RUST_LOG=${BENCH_RUST_LOG} nohup ${DPDK_SERVER_BIN} \
             --bind 0.0.0.0:9876 \
@@ -1438,7 +1456,7 @@ transport_start_dpdk_repl() {
 
     wait_for_log "$SERVER" "/tmp/melin-server.log" "DPDK replication sender started" 30 "DPDK replication listener"
 
-    ssh $SSH_OPTS "$REPLICA" "pkill -x melin-server 2>/dev/null; pkill -f melin-server.dpdk 2>/dev/null; true"
+    ssh $SSH_OPTS "$REPLICA" "pkill -x melin-server 2>/dev/null; pkill -f '[m]elin-server.dpdk' 2>/dev/null; true"
     sleep 1
     ssh $SSH_OPTS "$REPLICA" "NO_COLOR=1 RUST_LOG=${BENCH_RUST_LOG} nohup ${DPDK_SERVER_BIN} \
             --replica-of ${SERVER_DPDK_IP}:${REPL_PORT} \
@@ -1481,7 +1499,7 @@ transport_stop_dpdk_repl() {
     perf_capture_stop
     stop_servers "$SERVER" "$REPLICA"
     for host in "$SERVER" "$REPLICA"; do
-        ssh $SSH_OPTS "$host" "pkill -INT -f melin-server.dpdk 2>/dev/null; true"
+        ssh $SSH_OPTS "$host" "pkill -INT -f '[m]elin-server.dpdk' 2>/dev/null; true"
     done
     if [[ "${SKIP_JOURNAL_VERIFY:-0}" == "1" ]]; then
         echo "  Skipping journal verification (SKIP_JOURNAL_VERIFY=1)"
@@ -1536,7 +1554,7 @@ transport_start_dpdk_dual_repl() {
         replica2_eal="--huge-dir=${HUGE_DIR}"
     fi
 
-    ssh $SSH_OPTS "$SERVER" "pkill -x melin-server 2>/dev/null; pkill -f melin-server.dpdk 2>/dev/null; true"
+    ssh $SSH_OPTS "$SERVER" "pkill -x melin-server 2>/dev/null; pkill -f '[m]elin-server.dpdk' 2>/dev/null; true"
     sleep 1
     ssh $SSH_OPTS "$SERVER" "NO_COLOR=1 RUST_LOG=${BENCH_RUST_LOG} nohup ${DPDK_SERVER_BIN} \
             --bind 0.0.0.0:9876 \
@@ -1552,7 +1570,7 @@ transport_start_dpdk_dual_repl() {
 
     wait_for_log "$SERVER" "/tmp/melin-server.log" "DPDK replication sender started" 30 "DPDK replication listener"
 
-    ssh $SSH_OPTS "$REPLICA" "pkill -x melin-server 2>/dev/null; pkill -f melin-server.dpdk 2>/dev/null; true"
+    ssh $SSH_OPTS "$REPLICA" "pkill -x melin-server 2>/dev/null; pkill -f '[m]elin-server.dpdk' 2>/dev/null; true"
     sleep 1
     ssh $SSH_OPTS "$REPLICA" "NO_COLOR=1 RUST_LOG=${BENCH_RUST_LOG} nohup ${DPDK_SERVER_BIN} \
             --replica-of ${SERVER_DPDK_IP}:${REPL_PORT} \
@@ -1566,7 +1584,7 @@ transport_start_dpdk_dual_repl() {
             ${REPLICA_EXTRA_ARGS:-} \
         >/tmp/melin-server.log 2>&1 </dev/null &" </dev/null
 
-    ssh $SSH_OPTS "$REPLICA2" "pkill -x melin-server 2>/dev/null; pkill -f melin-server.dpdk 2>/dev/null; true"
+    ssh $SSH_OPTS "$REPLICA2" "pkill -x melin-server 2>/dev/null; pkill -f '[m]elin-server.dpdk' 2>/dev/null; true"
     sleep 1
     ssh $SSH_OPTS "$REPLICA2" "NO_COLOR=1 RUST_LOG=${BENCH_RUST_LOG} nohup ${DPDK_SERVER_BIN} \
             --replica-of ${SERVER_DPDK_IP}:${REPL_PORT} \
@@ -1609,7 +1627,7 @@ transport_stop_dpdk_dual_repl() {
     perf_capture_stop
     stop_servers "$SERVER" "$REPLICA" "$REPLICA2"
     for host in "$SERVER" "$REPLICA" "$REPLICA2"; do
-        ssh $SSH_OPTS "$host" "pkill -INT -f melin-server.dpdk 2>/dev/null; true"
+        ssh $SSH_OPTS "$host" "pkill -INT -f '[m]elin-server.dpdk' 2>/dev/null; true"
     done
     if [[ "${SKIP_JOURNAL_VERIFY:-0}" == "1" ]]; then
         echo "  Skipping journal verification (SKIP_JOURNAL_VERIFY=1)"
