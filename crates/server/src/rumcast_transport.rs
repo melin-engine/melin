@@ -410,7 +410,17 @@ fn run_rumcast_primary_with_state(
     };
     let muxed_receiver = MuxedReceiver::new(orders_socket, muxed_receiver_config);
 
-    let resp_socket = KernelUdp::bind("127.0.0.1:0".parse::<SocketAddr>().unwrap())?;
+    // Bind the response socket to the same IP as the order-entry
+    // socket (with an ephemeral port). Responses then carry a source
+    // IP the client recognises — the same one it connected to —
+    // matching the TCP/DPDK paths where replies naturally come from
+    // the listener's bound IP. The previous `127.0.0.1:0` worked
+    // for in-process tests but broke on a LAN: responses carried a
+    // loopback source addr that couldn't reach a remote client.
+    // `0.0.0.0:0` would also work but on multi-NIC hosts the kernel
+    // could pick a source IP the client doesn't expect.
+    let resp_bind = SocketAddr::new(rumcast_config.bind.ip(), 0);
+    let resp_socket = KernelUdp::bind(resp_bind)?;
     let muxed_sender_config = MuxedSenderConfig {
         stream_id: RUMCAST_RESP_STREAM,
         initial_term_id: INITIAL_TERM_ID,
