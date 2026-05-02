@@ -105,8 +105,19 @@ struct EntryMetadata {
     event_tag: u8,
 }
 
-/// File header size in bytes.
-pub const FILE_HEADER_SIZE: usize = core::mem::size_of::<FileHeader>();
+/// On-disk reservation for the file header — one full O_DIRECT sector.
+///
+/// The meaningful header fields (`FileHeader`) only occupy 8 bytes, but the
+/// writer always opens the journal with `O_DIRECT`, which requires
+/// sector-aligned writes. Reserving a full 512-byte sector keeps the first
+/// entry at a sector boundary (offset `FILE_HEADER_SIZE`) and gives the
+/// header room to grow (versioning, journal UUID, genesis chain hash slot,
+/// flags) without re-aligning the rest of the file.
+pub const FILE_HEADER_SIZE: usize = 512;
+
+/// Size of the meaningful `FileHeader` fields (the rest of the on-disk
+/// reservation is zero-padded).
+const FILE_HEADER_FIELDS_SIZE: usize = core::mem::size_of::<FileHeader>();
 
 /// Entry header size: magic(2) + length(2) + sequence(8) + timestamp(8) = 20.
 pub(crate) const ENTRY_HEADER_SIZE: usize = core::mem::size_of::<EntryHeader>();
@@ -120,7 +131,8 @@ pub const ENTRY_META_SIZE: usize = core::mem::size_of::<EntryMetadata>();
 /// CRC32C checksum size in bytes.
 pub(crate) const CRC_SIZE: usize = 4;
 
-const _: () = assert!(FILE_HEADER_SIZE == 8);
+const _: () = assert!(FILE_HEADER_FIELDS_SIZE == 8);
+const _: () = assert!(FILE_HEADER_SIZE >= FILE_HEADER_FIELDS_SIZE);
 const _: () = assert!(ENTRY_HEADER_SIZE == 20);
 const _: () = assert!(ENTRY_META_SIZE == 17);
 
@@ -139,12 +151,18 @@ const TAG_APP: u8 = 0x80;
 pub const MAX_PAYLOAD_SIZE: usize = u16::MAX as usize - 17;
 
 /// Encode the file header into `buf`.
+///
+/// Writes the meaningful fields into the first `FILE_HEADER_FIELDS_SIZE`
+/// bytes and zero-fills the remainder of the on-disk reservation
+/// (`FILE_HEADER_SIZE` total bytes), so the buffer can be written directly
+/// as one sector-aligned O_DIRECT pwrite.
 pub fn encode_file_header(buf: &mut [u8]) {
-    let header = FileHeader::mut_from_bytes(&mut buf[..FILE_HEADER_SIZE])
-        .expect("FILE_HEADER_SIZE slice matches struct size");
+    let header = FileHeader::mut_from_bytes(&mut buf[..FILE_HEADER_FIELDS_SIZE])
+        .expect("FILE_HEADER_FIELDS_SIZE slice matches struct size");
     header.file_magic = U32::new(FILE_MAGIC);
     header.format_version = U16::new(FORMAT_VERSION);
     header.reserved = U16::new(0);
+    buf[FILE_HEADER_FIELDS_SIZE..FILE_HEADER_SIZE].fill(0);
 }
 
 /// Validate a file header. Returns `Ok(version)` on success.

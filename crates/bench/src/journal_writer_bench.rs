@@ -100,7 +100,7 @@ fn run_journal_writer_bench(num_events: usize, batch_size: usize, _warmup: usize
     // Remove existing file if it exists.
     let _ = std::fs::remove_file(&journal_path);
     let mut writer = JournalWriter::create(&journal_path).expect("create journal");
-    writer.set_no_fua(no_fua).expect("set_no_fua");
+    writer.set_no_fua(no_fua);
 
     // Measurement phase.
     println!("Measurement phase...");
@@ -198,7 +198,7 @@ fn run_replica_mode(num_events: usize, batch_size: usize, _warmup: usize, no_fua
     let journal_path = std::path::PathBuf::from("/tmp/journal_writer_bench_replica.journal");
     let _ = std::fs::remove_file(&journal_path);
     let mut writer = JournalWriter::create(&journal_path).expect("create journal");
-    writer.set_no_fua(no_fua).expect("set_no_fua");
+    writer.set_no_fua(no_fua);
 
     // Set up io_uring for async writes.
     let mut io_uring = IoUring::new(256).expect("create io_uring ring");
