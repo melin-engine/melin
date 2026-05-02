@@ -1101,47 +1101,46 @@ fn alloc_aligned<const N: usize>() -> Box<AlignedBuf<N>> {
     AlignedBuf::<N>::new_box_zeroed().expect("aligned heap allocation for journal buffer")
 }
 
-/// Pre-fault pages in `[start, end)` into the page cache using
-/// `mmap` + `MADV_POPULATE_READ`. This prevents page-cache misses during
-/// io_uring writes, which would otherwise be handled by io-wq workers on the
-/// IRQ core and can stall for hundreds of milliseconds under TCP load.
+/// Pre-fault pages in `[start, end)` into the page cache via a read-only
+/// shared `mmap` + `Advice::PopulateRead` (= `MADV_POPULATE_READ`).
+///
+/// Without this, the first write to each 4 KiB page triggers a page-cache
+/// miss handled by io-wq workers on core 0 (IRQ core), which can stall
+/// for hundreds of milliseconds under TCP load.
 ///
 /// `start` is aligned down to a 4 KiB page boundary (mmap offset requirement).
 /// `end` is typically `allocated_end` — the pre-allocated chunk boundary.
 ///
-/// Uses `PROT_READ` (not `PROT_WRITE`) so pages land in the page cache as clean.
-/// Clean pages don't appear in the sync_all() writeback after `create_bare` —
-/// only data that io_uring actually writes (and thereby dirties) needs flushing.
-/// `MADV_POPULATE_WRITE` would dirty all 256 MiB preallocated pages immediately,
-/// forcing `sync_all()` to flush them even though nothing was written yet.
+/// `Advice::PopulateRead` (kernel 5.14+) faults the pages as *clean*, so
+/// `sync_all()` after `create_bare` doesn't have to write them back.
+/// `PopulateWrite` would dirty 256 MiB of preallocated pages and force a
+/// full writeback even though nothing has been written yet.
 ///
-/// Best-effort: silently skips if `mmap` fails (e.g. insufficient VA space).
+/// Best-effort: silently skips on failure (e.g. insufficient VA space).
 /// Not called on the O_DIRECT path — O_DIRECT bypasses the page cache.
 fn prefault_pages(file: &File, start: u64, end: u64) {
     if end <= start {
         return;
     }
-    // mmap requires page-aligned offsets.
     let aligned_start = start & !4095;
-    let size = end - aligned_start;
-    let ptr = unsafe {
-        libc::mmap(
-            std::ptr::null_mut(),
-            size as libc::size_t,
-            libc::PROT_READ,
-            libc::MAP_SHARED,
-            file.as_raw_fd(),
-            aligned_start as libc::off_t,
-        )
+    let size = (end - aligned_start) as usize;
+
+    // SAFETY: A read-only shared mapping of an owned `File`. The `Mmap`
+    // guard ties the mapping lifetime to the value below and calls
+    // `munmap` on drop; we drop it before this function returns. The
+    // pages are read-only and never exposed to callers, so there is no
+    // way for the rest of the program to observe stale or aliased memory
+    // through this mapping.
+    let mmap = unsafe {
+        memmap2::MmapOptions::new()
+            .offset(aligned_start)
+            .len(size)
+            .map(file)
     };
-    if ptr == libc::MAP_FAILED {
+    let Ok(mmap) = mmap else {
         return;
-    }
-    // MADV_POPULATE_READ (22): fault all pages as clean reads now.
-    // Pages land in the page cache; subsequent io_uring writes find them
-    // in cache without triggering a fault → no io-wq involvement on core 0.
-    unsafe { libc::madvise(ptr, size as libc::size_t, 22) };
-    unsafe { libc::munmap(ptr, size as libc::size_t) };
+    };
+    let _ = mmap.advise(memmap2::Advice::PopulateRead);
 }
 
 /// Pre-allocate disk blocks from the current position forward by one chunk.
