@@ -960,13 +960,7 @@ impl<E: AppEvent> JournalStage<E> {
         loop {
             // --- Check shutdown ---
             if shutdown.load(std::sync::atomic::Ordering::Relaxed) {
-                // Wait for any in-flight write to complete.
-                if let Some((batch_data, seq)) = inflight.take() {
-                    self.wait_for_cqe(&mut ring, batch_data.len)?;
-                    self.consumer.set_progress(seq);
-                    self.publish_chain_hash();
-                    self.writer.confirm_async_write(batch_data);
-                }
+                self.reap_inflight_on_shutdown(&mut ring, &mut inflight)?;
                 // Flush any pending buffered data through the same async path
                 // as steady-state — submit + reap one CQE — instead of falling
                 // back to a synchronous pwritev2. Keeps the production write
@@ -1101,14 +1095,9 @@ impl<E: AppEvent> JournalStage<E> {
 
             if saw_shutdown {
                 // Drain anything in flight + any pending batch, then exit.
-                // Same shape as the existing shutdown-flag path below — we
-                // just got here via the sentinel rather than the flag.
-                if let Some((batch_data, seq)) = inflight.take() {
-                    self.wait_for_cqe(&mut ring, batch_data.len)?;
-                    self.consumer.set_progress(seq);
-                    self.publish_chain_hash();
-                    self.writer.confirm_async_write(batch_data);
-                }
+                // Same shape as the shutdown-flag path above — we just got
+                // here via the sentinel rather than the flag.
+                self.reap_inflight_on_shutdown(&mut ring, &mut inflight)?;
                 if pending > 0 {
                     self.writer.flush_batch_sync()?;
                     self.consumer.commit(pending);
@@ -1235,6 +1224,26 @@ impl<E: AppEvent> JournalStage<E> {
     /// IRQ affinity) and become visible here via the shared memory mapping.
     /// The journal thread is pinned to a dedicated core, so busy-polling
     /// is appropriate and avoids kernel sleep/wake jitter entirely.
+    /// Drain a single in-flight async write at shutdown: wait for its
+    /// CQE, advance the consumer cursor past those events, publish the
+    /// chain hash, and hand the buffer back to the writer. No-op if no
+    /// write is in flight. Used by both shutdown paths in `run_uring`
+    /// (the shutdown-flag check at the loop top, and the sentinel
+    /// observed mid-batch).
+    fn reap_inflight_on_shutdown(
+        &mut self,
+        ring: &mut io_uring::IoUring,
+        inflight: &mut Option<(melin_journal::AsyncWriteBatch, u64)>,
+    ) -> Result<(), JournalError> {
+        if let Some((batch_data, seq)) = inflight.take() {
+            self.wait_for_cqe(ring, batch_data.len)?;
+            self.consumer.set_progress(seq);
+            self.publish_chain_hash();
+            self.writer.confirm_async_write(batch_data);
+        }
+        Ok(())
+    }
+
     fn wait_for_cqe(
         &self,
         ring: &mut io_uring::IoUring,
@@ -1531,7 +1540,8 @@ impl<A: Application> MatchingStage<A> {
             self.events_processed.store(local_events, Ordering::Relaxed);
 
             if saw_shutdown {
-                self.events_processed.store(local_events, Ordering::Relaxed);
+                // events_processed already flushed above. Flush the
+                // utilization counters and exit.
                 self.utilization.busy.store(busy_count, Ordering::Relaxed);
                 self.utilization.idle.store(idle_count, Ordering::Relaxed);
                 #[cfg(feature = "latency-trace")]
