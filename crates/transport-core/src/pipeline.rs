@@ -915,8 +915,8 @@ impl<E: AppEvent> JournalStage<E> {
                 // path symmetric and removes the last sync-flush call from the
                 // hot/critical lifecycle.
                 if pending > 0 {
-                    let seq = self.consumer.next_read();
                     if let Some(async_batch) = self.writer.take_batch_for_async_write()? {
+                        let seq = self.consumer.next_read();
                         let len = async_batch.len;
                         let sqe = opcode::Write::new(
                             types::Fixed(0),

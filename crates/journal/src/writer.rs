@@ -8,27 +8,26 @@
 //!
 //! ## Durability modes
 //!
-//! **Default (`no_fua = false`)**: `pwritev2 + RWF_DSYNC` (FUA). The kernel issues
-//! a single FUA write instead of write + cache flush, reducing sync latency from
-//! ~1–7 ms to ~10–100 µs on NVMe. File is opened without `O_DIRECT`; batch data
-//! is written directly without sector-alignment overhead.
+//! The file is always opened with `O_DIRECT` — every write is sector-aligned
+//! and bypasses the page cache. The `no_fua` flag selects how durability is
+//! achieved:
 //!
-//! **PLP mode (`no_fua = true`)**: plain `pwrite` with `O_DIRECT`. Enabled via
-//! `set_no_fua(true)` on drives with battery-backed controller DRAM (Power Loss
-//! Protection). `O_DIRECT` ensures the write bypasses the page cache and lands in
-//! the device's DRAM, where PLP capacitors guarantee survival across power loss.
-//! Eliminates the ~10–100 µs FUA round-trip entirely (~1–5 µs controller DRAM write).
+//! **Default (`no_fua = false`)**: `pwritev2 + RWF_DSYNC` (FUA). The kernel
+//! issues a single FUA write that doesn't acknowledge until the sector is
+//! durable on the medium. Works on any NVMe drive; ~10–100 µs per flush.
 //!
-//! `O_DIRECT` is only activated in PLP mode because `RWF_DSYNC` already guarantees
-//! persistence without it; enabling `O_DIRECT` on the FUA path adds DMA-setup
-//! overhead on every write with no durability benefit.
+//! **PLP mode (`no_fua = true`)**: plain `pwrite`. Relies on the drive's
+//! Power Loss Protection capacitors to flush controller DRAM on power loss.
+//! Skips the FUA round-trip entirely (~1–5 µs controller DRAM write). Safe
+//! only on PLP-equipped drives — see `set_no_fua`.
 //!
-//! **Sector Tail Buffer (PLP path only)**: `O_DIRECT` requires 512-byte sector
-//! alignment for write lengths, buffer addresses, and file offsets. The writer
-//! maintains one in-memory sector (tail_sector) representing the current partially-
-//! filled on-disk sector. New data is appended to tail_sector; complete sectors are
+//! **Sector Tail Buffer**: `O_DIRECT` requires 512-byte alignment for write
+//! lengths, buffer addresses, and file offsets. The writer maintains one
+//! in-memory sector (`tail_sector`) representing the current partially-
+//! filled on-disk sector. New data is appended to it; complete sectors are
 //! written forward; the partial tail is rewritten in-place on every flush.
-//! `write_pos` advances only when a sector fills, so disk space ≈ actual data size.
+//! `write_pos` advances only when a sector fills, so disk space ≈ actual
+//! data size.
 //!
 //! Writes use positioned I/O with an explicit write position rather than
 //! kernel-managed append mode, because the file size includes pre-allocated
@@ -1096,9 +1095,16 @@ impl<const N: usize> std::ops::DerefMut for AlignedBuf<N> {
 /// `FromZeros::new_box_zeroed` performs the allocation in-place — no 512 KB
 /// stack copy that `Box::new(AlignedBuf([0; N]))` would otherwise produce
 /// in debug builds.
+///
+/// On allocation failure (OOM), routes through `handle_alloc_error`, which
+/// invokes the global allocator's error handler (typically `abort`). This
+/// matches `Box::new`'s behavior and avoids unwinding through the journal
+/// hot path on a condition we cannot meaningfully recover from.
 fn alloc_aligned<const N: usize>() -> Box<AlignedBuf<N>> {
     use zerocopy::FromZeros;
-    AlignedBuf::<N>::new_box_zeroed().expect("aligned heap allocation for journal buffer")
+    AlignedBuf::<N>::new_box_zeroed().unwrap_or_else(|_| {
+        std::alloc::handle_alloc_error(std::alloc::Layout::new::<AlignedBuf<N>>())
+    })
 }
 
 /// Pre-fault pages in `[start, end)` into the page cache via a read-only
