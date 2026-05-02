@@ -546,6 +546,20 @@ mod tests {
     }
 
     #[test]
+    fn shutdown_sentinel_rejected_by_codec() {
+        // The Shutdown variant is a pipeline-only sentinel; the journal
+        // stage must filter it before encode. If anyone bypasses that
+        // filter, encode must surface a clear error rather than silently
+        // writing a corrupt entry.
+        let mut buf = [0u8; 256];
+        let err = encode(42, 0, 0, 0, &JournalEvent::Shutdown::<TestEvent>, &mut buf).unwrap_err();
+        assert!(
+            matches!(err, JournalError::CorruptEntry { sequence: 42, .. }),
+            "expected CorruptEntry, got {err:?}"
+        );
+    }
+
+    #[test]
     fn unknown_tag_rejected() {
         let ev = JournalEvent::App::<TestEvent>(TestEvent::Ping);
         let mut buf = [0u8; 256];

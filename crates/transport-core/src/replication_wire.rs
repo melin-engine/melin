@@ -449,6 +449,44 @@ mod tests {
     }
 
     #[test]
+    fn shutdown_sentinel_is_truncated_from_wire() {
+        // The Shutdown variant is a pipeline-only sentinel. If it ever
+        // reaches the wire encoder, the partially-written slot header
+        // must be truncated so the wire batch contains only valid slots.
+        let mut buf = Vec::new();
+        init_input_batch(&mut buf);
+        let pre_len = buf.len();
+        let sentinel = sample_slot(99, JournalEvent::Shutdown);
+        append_input_slot(&mut buf, &sentinel, sentinel.sequence);
+        // Buffer must be back at the pre-header position — no slot bytes,
+        // no half-written slot header.
+        assert_eq!(buf.len(), pre_len);
+    }
+
+    #[test]
+    fn shutdown_sentinel_does_not_break_surrounding_slots() {
+        // Real-world bug case: a sentinel slot interleaved with valid
+        // slots in the same batch. The valid slots before and after must
+        // round-trip, and the sentinel must be silently dropped.
+        let mut buf = Vec::new();
+        init_input_batch(&mut buf);
+        let s1 = sample_slot(1, JournalEvent::Tick { now_ns: 111 });
+        append_input_slot(&mut buf, &s1, s1.sequence);
+        let sentinel = sample_slot(2, JournalEvent::Shutdown);
+        append_input_slot(&mut buf, &sentinel, sentinel.sequence);
+        let s3 = sample_slot(3, JournalEvent::App(TestEvent(0xcafe)));
+        append_input_slot(&mut buf, &s3, s3.sequence);
+        finalize_input_batch(&mut buf, 2); // only 2 valid slots written
+
+        let payload = &buf[4..];
+        let decoded: Vec<InputSlot<TestEvent>> =
+            try_decode_input_batch(payload).expect("decode succeeds");
+        assert_eq!(decoded.len(), 2);
+        assert_eq!(decoded[0].sequence, 1);
+        assert_eq!(decoded[1].sequence, 3);
+    }
+
+    #[test]
     fn rejects_wrong_type_tag() {
         let payload = [0xFF, 0x00, 0x00];
         assert!(try_decode_input_batch::<TestEvent>(&payload).is_err());
