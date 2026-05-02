@@ -2089,7 +2089,7 @@ fn snapshot_transfer_when_archives_purged() {
     let primary_client_port = free_port();
     let primary_health_port = free_port();
 
-    // Start primary with --snapshot-interval-secs 1 to trigger periodic
+    // Start primary with --snapshot-interval-ms 100 to trigger periodic
     // shadow snapshots, so a .snapshot file exists for transfer.
     let primary_journal = tmp.path().join("primary.journal");
     let mut primary = {
@@ -2115,8 +2115,8 @@ fn snapshot_transfer_when_archives_purged() {
                 "--reader-cores",
                 "0",
                 "--standalone",
-                "--snapshot-interval-secs",
-                "1",
+                "--snapshot-interval-ms",
+                "100",
             ])
             .stdout(Stdio::inherit())
             .stderr(Stdio::inherit())
@@ -2208,8 +2208,8 @@ fn snapshot_transfer_when_archives_purged() {
                 "0,0,0,0,0,0,0,0",
                 "--reader-cores",
                 "0",
-                "--snapshot-interval-secs",
-                "1",
+                "--snapshot-interval-ms",
+                "100",
             ])
             .stdout(Stdio::inherit())
             .stderr(Stdio::inherit())

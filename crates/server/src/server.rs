@@ -245,12 +245,12 @@ pub struct ServerConfig {
     #[arg(long)]
     pub promote_bind: Option<SocketAddr>,
 
-    /// Interval in seconds between automatic shadow snapshots. The shadow
-    /// stage replays journaled events on a cloned App and saves a
+    /// Interval in milliseconds between automatic shadow snapshots. The
+    /// shadow stage replays journaled events on a cloned App and saves a
     /// consistent snapshot at this cadence — no hot-path stall. Set to 0
-    /// to disable shadow snapshots entirely.
-    #[arg(long, default_value_t = 3000)]
-    pub snapshot_interval_secs: u64,
+    /// to disable shadow snapshots entirely. Default: 3 000 000 ms (50 min).
+    #[arg(long, default_value_t = 3_000_000)]
+    pub snapshot_interval_ms: u64,
 
     /// Path for shadow snapshots. Defaults to the journal path with a
     /// `.snapshot` extension (same as the startup snapshot path).
@@ -330,7 +330,7 @@ impl Default for ServerConfig {
             event_bind: None,
             health_bind: Some(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 9878)),
             promote_bind: None,
-            snapshot_interval_secs: 3000,
+            snapshot_interval_ms: 3_000_000,
             snapshot_path: None,
             tick_interval_ms: 250,
         }
@@ -507,7 +507,7 @@ pub fn run_with_shutdown<L: BlockingTransportListener>(
             &signing_key,
             &shutdown,
             &promote_flag,
-            config.snapshot_interval_secs,
+            config.snapshot_interval_ms,
             config.shadow_snapshot_path(),
             config.cores,
             config.reader_cores,
@@ -697,7 +697,7 @@ fn run_as_primary<L: BlockingTransportListener>(
     // Clone the exchange for the shadow snapshot stage before the pipeline
     // consumes it. Uses snapshot_state() + restore_state() round-trip since
     // App doesn't implement Clone (internal data structures are complex).
-    let enable_shadow = config.snapshot_interval_secs > 0;
+    let enable_shadow = config.snapshot_interval_ms > 0;
     let shadow_exchange = if enable_shadow {
         Some(<App as melin_app::Application>::clone_via_snapshot(
             &exchange,
@@ -980,7 +980,7 @@ fn run_as_primary<L: BlockingTransportListener>(
     // `A: Application` — the noop app just snapshots its trivial counter.
     let shadow_handle = if let Some(shadow_cons) = shadow_consumer {
         let snap_path = config.shadow_snapshot_path();
-        let interval = std::time::Duration::from_secs(config.snapshot_interval_secs);
+        let interval = std::time::Duration::from_millis(config.snapshot_interval_ms);
         let chain_hash =
             chain_hash_lock.ok_or("chain hash lock must be Some when shadow is enabled")?;
         let shadow_ex =
@@ -1003,7 +1003,7 @@ fn run_as_primary<L: BlockingTransportListener>(
             .map_err(|e| format!("spawn shadow thread: {e}"))?;
 
         info!(
-            interval_secs = config.snapshot_interval_secs,
+            interval_ms = config.snapshot_interval_ms,
             path = %config.shadow_snapshot_path().display(),
             "shadow snapshot stage started"
         );
@@ -1496,7 +1496,7 @@ pub fn run_dpdk(
             &config.journal,
             &shutdown,
             &promote_flag,
-            config.snapshot_interval_secs,
+            config.snapshot_interval_ms,
             config.shadow_snapshot_path(),
             config.cores,
             config.reader_cores,
@@ -1559,7 +1559,7 @@ pub fn run_dpdk(
 
     // Clone exchange state for the shadow snapshot stage before moving
     // exchange into the pipeline (same as the kernel TCP path).
-    let enable_shadow = config.snapshot_interval_secs > 0;
+    let enable_shadow = config.snapshot_interval_ms > 0;
     let shadow_exchange = if enable_shadow {
         Some(<App as melin_app::Application>::clone_via_snapshot(
             &exchange,
@@ -1596,7 +1596,7 @@ pub fn run_dpdk(
 
     // Build disruptor pipeline (same flags as the kernel TCP path).
     let enable_event_publisher = config.event_bind.is_some();
-    let enable_shadow = config.snapshot_interval_secs > 0;
+    let enable_shadow = config.snapshot_interval_ms > 0;
     let Pipeline {
         input_producer,
         journal_stage,
@@ -1718,7 +1718,7 @@ pub fn run_dpdk(
     let busy_spin = !config.yield_idle;
     let shadow_handle = if let Some(shadow_cons) = shadow_consumer {
         let snap_path = config.shadow_snapshot_path();
-        let interval = std::time::Duration::from_secs(config.snapshot_interval_secs);
+        let interval = std::time::Duration::from_millis(config.snapshot_interval_ms);
         let chain_hash =
             chain_hash_lock.ok_or("chain hash lock must be Some when shadow is enabled")?;
         let shadow_ex =
@@ -1741,7 +1741,7 @@ pub fn run_dpdk(
             .map_err(|e| format!("spawn shadow thread: {e}"))?;
 
         info!(
-            interval_secs = config.snapshot_interval_secs,
+            interval_ms = config.snapshot_interval_ms,
             path = %config.shadow_snapshot_path().display(),
             "shadow snapshot stage started"
         );

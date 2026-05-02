@@ -68,7 +68,7 @@ pub fn run(
     // `__vdso_clock_gettime` at loop frequency, which showed up in
     // perf profiles as ~10 % of this process's total cycles landing on
     // `clock_gettime` — for a check that fires at most once every
-    // 50 min (default `snapshot_interval_secs=3000`). `AmortizedTimer`
+    // 50 min (default `snapshot_interval_ms=3_000_000`). `AmortizedTimer`
     // defers the clock read to roughly 1 Hz, collapsing the overhead
     // to a single `AND` + predictable branch per iteration.
     let mut snapshot_timer = AmortizedTimer::new();

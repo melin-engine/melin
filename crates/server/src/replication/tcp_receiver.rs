@@ -714,7 +714,7 @@ pub fn run_receiver(
     signing_key: &ed25519_dalek::SigningKey,
     shutdown: &AtomicBool,
     promote: &AtomicBool,
-    snapshot_interval_secs: u64,
+    snapshot_interval_ms: u64,
     snapshot_path: std::path::PathBuf,
     cores: crate::server::PipelineCores,
     receiver_core: usize,
@@ -1077,7 +1077,7 @@ pub fn run_receiver(
                 cur_exchange,
                 cur_writer,
                 cores,
-                snapshot_interval_secs,
+                snapshot_interval_ms,
                 snapshot_path.clone(),
                 busy_spin,
             )?);

@@ -373,13 +373,13 @@ pub(super) fn build_replica_pipeline_with_threads(
     exchange: crate::App,
     writer: crate::JournalWriter,
     cores: crate::server::PipelineCores,
-    snapshot_interval_secs: u64,
+    snapshot_interval_ms: u64,
     snapshot_path: std::path::PathBuf,
     busy_spin: bool,
 ) -> Result<ReplicaPipelineHandles, Box<dyn std::error::Error>> {
     let shadow_exchange = <crate::App as melin_app::Application>::clone_via_snapshot(&exchange)?;
 
-    let enable_shadow = snapshot_interval_secs > 0;
+    let enable_shadow = snapshot_interval_ms > 0;
     let pipeline = melin_transport_core::pipeline::build_replica_pipeline(
         exchange,
         writer,
@@ -457,7 +457,7 @@ pub(super) fn build_replica_pipeline_with_threads(
                         shadow_cons,
                         shadow_exchange,
                         snap_path,
-                        std::time::Duration::from_secs(snapshot_interval_secs),
+                        std::time::Duration::from_millis(snapshot_interval_ms),
                         chain_lock,
                         &ps,
                         false,

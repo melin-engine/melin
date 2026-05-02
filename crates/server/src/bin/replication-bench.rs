@@ -232,7 +232,7 @@ fn main() {
                 &replica_key,
                 &s,
                 &p,
-                3000, // snapshot_interval_secs (effectively never)
+                3_000_000, // snapshot_interval_ms (effectively never)
                 replica_snapshot,
                 cores,
                 receiver_core,

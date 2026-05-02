@@ -892,7 +892,7 @@ pub fn run_receiver_dpdk(
     journal_path: &std::path::Path,
     shutdown: &AtomicBool,
     promote: &AtomicBool,
-    snapshot_interval_secs: u64,
+    snapshot_interval_ms: u64,
     snapshot_path: std::path::PathBuf,
     cores: crate::server::PipelineCores,
     receiver_core: usize,
@@ -1255,7 +1255,7 @@ pub fn run_receiver_dpdk(
                 cur_exchange,
                 cur_writer,
                 cores,
-                snapshot_interval_secs,
+                snapshot_interval_ms,
                 snapshot_path.clone(),
                 busy_spin,
             )?);
