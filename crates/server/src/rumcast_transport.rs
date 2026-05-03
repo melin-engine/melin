@@ -354,6 +354,24 @@ fn run_rumcast_primary_with_state(
         Vec::new()
     };
 
+    // Shadow snapshot stage: enabled when --snapshot-interval-ms > 0.
+    // Mirrors the TCP path in `server::run_as_primary`. Required so a
+    // long-running primary periodically snapshots its state to disk;
+    // a fresh replica that connects after journal archives are purged
+    // can recover via snapshot transfer.
+    //
+    // Clones the App via snapshot round-trip BEFORE the pipeline
+    // consumes it — App doesn't implement Clone (per-symbol books +
+    // dedup table are too complex to derive).
+    let enable_shadow = config.snapshot_interval_ms > 0;
+    let shadow_exchange = if enable_shadow {
+        Some(<crate::App as melin_app::Application>::clone_via_snapshot(
+            &app,
+        )?)
+    } else {
+        None
+    };
+
     let active_connections = Arc::new(AtomicU64::new(1));
     let pipeline: Pipeline<crate::App> = build_pipeline_with_replication(
         app,
@@ -365,7 +383,7 @@ fn run_rumcast_primary_with_state(
         config.replication_ring_size,
         !config.yield_idle, // busy_spin
         false,              // enable_event_publisher
-        false,              // enable_shadow
+        enable_shadow,
     );
 
     let Pipeline {
@@ -380,9 +398,20 @@ fn run_rumcast_primary_with_state(
         replication_consumers,
         replication_cursor,
         replicas_connected,
+        shadow_consumer,
+        chain_hash_lock,
         replication_ring_progress,
         ..
     } = pipeline;
+
+    // Fastest-replica cursor: max(slot0_acked, slot1_acked). Mirrors the
+    // TCP path's allocation in `server::run_as_primary`. Read by the
+    // response-gate `durable_pos` call in `session_translator`; written
+    // by the rumcast replication sender when present (None in the
+    // standalone case keeps it at u64::MAX so the gate degrades to the
+    // journal-only path).
+    let fastest_replica_cursor = Arc::new(AtomicU64::new(u64::MAX));
+    let quorum_durability = !config.no_quorum_durability;
 
     // Snapshot per-stage utilization handles before the stages move into
     // their threads. The TCP path threads response_utilization through
@@ -509,6 +538,44 @@ fn run_rumcast_primary_with_state(
             })?,
     );
 
+    // Pipeline: shadow snapshot stage. Mirrors the TCP path's wiring
+    // in `server.rs::run_as_primary`. Periodically writes a snapshot
+    // of the matching engine's state to disk so a fresh replica can
+    // recover via snapshot transfer when journal archives have been
+    // purged.
+    if let Some(shadow_cons) = shadow_consumer {
+        let snap_path = config.shadow_snapshot_path();
+        let interval = Duration::from_millis(config.snapshot_interval_ms);
+        let chain_hash =
+            chain_hash_lock.ok_or("chain hash lock must be Some when shadow is enabled")?;
+        let shadow_ex =
+            shadow_exchange.ok_or("shadow exchange must be Some when shadow is enabled")?;
+        let shadow_shutdown = Arc::clone(&shutdown);
+        let shadow_core = config.cores.shadow;
+        let busy_spin = !config.yield_idle;
+        handles.push(
+            thread::Builder::new()
+                .name("shadow".into())
+                .spawn(move || {
+                    crate::affinity::pin_thread("shadow", shadow_core);
+                    crate::shadow::run(
+                        shadow_cons,
+                        shadow_ex,
+                        snap_path,
+                        interval,
+                        chain_hash,
+                        &shadow_shutdown,
+                        busy_spin,
+                    );
+                })?,
+        );
+        info!(
+            interval_ms = config.snapshot_interval_ms,
+            path = %config.shadow_snapshot_path().display(),
+            "shadow snapshot stage started"
+        );
+    }
+
     // ---- Replication sender (rumcast) ----
     //
     // Spawned before seeding because the journal stage starts
@@ -566,13 +633,13 @@ fn run_rumcast_primary_with_state(
             Arc::clone(&progress.active_flags[1]),
         ];
         let cursor = Arc::clone(&replication_cursor);
-        // The TCP/DPDK paths track a separate fastest_replica_cursor for
-        // dual-replication tail-cuts. For Phase 4 the rumcast standalone
-        // path has no response stage that would consume it (responses
-        // gate on the journal cursor only), so we hand the sender a
-        // fresh AtomicU64 it writes to but nothing reads from. This
-        // keeps the sender API uniform across transports.
-        let fastest_for_sender = Arc::new(AtomicU64::new(0));
+        // Fastest-replica cursor: max(slot0_acked, slot1_acked). Used by
+        // the response-gate path in `session_translator` for quorum
+        // durability — an event is durable when both replicas acked OR
+        // when journal fsync + the fastest replica acked. Init to
+        // u64::MAX so `min(journal, u64::MAX) = journal` when no
+        // replicas are connected.
+        let fastest_for_sender = Arc::clone(&fastest_replica_cursor);
         fastest_replica_cursor_for_health = Some(Arc::clone(&fastest_for_sender));
         let connected_for_thread = Arc::clone(&connected);
         let ready_for_thread = Arc::clone(&ready_flag);
@@ -679,6 +746,8 @@ fn run_rumcast_primary_with_state(
     {
         let shutdown = Arc::clone(&shutdown);
         let cursor = Arc::clone(&journal_cursor);
+        let repl_cursor = Arc::clone(&replication_cursor);
+        let fastest_cursor = Arc::clone(&fastest_replica_cursor);
         let authorized_keys = Arc::clone(&authorized_keys);
         let mut muxed_receiver = muxed_receiver;
         let mut muxed_sender = muxed_sender;
@@ -694,6 +763,9 @@ fn run_rumcast_primary_with_state(
                         &mut input_producer,
                         response_consumer,
                         cursor,
+                        repl_cursor,
+                        fastest_cursor,
+                        quorum_durability,
                         authorized_keys,
                         &shutdown,
                         yield_idle,
@@ -787,12 +859,22 @@ struct DiagCounters {
     pending_outbound_held: u64,
 }
 
+#[allow(clippy::too_many_arguments)]
 fn session_translator(
     mut muxed_receiver: MuxedReceiver<KernelUdp>,
     mut muxed_sender: MuxedSender<KernelUdp>,
     input_producer: &mut melin_disruptor::ring::Producer<InputSlot>,
     mut output_consumer: melin_disruptor::ring::Consumer<OutputSlot>,
     journal_cursor: Arc<melin_disruptor::padding::Sequence>,
+    // Replication-cursor inputs for the response gate. `replication_cursor`
+    // = min(slot0_acked, slot1_acked) — both replicas have confirmed up to
+    // here. `fastest_replica_cursor` = max(slot0, slot1). Both stay at
+    // u64::MAX in standalone mode, which makes `durable_pos` collapse to
+    // the journal-only path. See `crate::response::durable_pos` for the
+    // formula.
+    replication_cursor: Arc<AtomicU64>,
+    fastest_replica_cursor: Arc<AtomicU64>,
+    quorum_durability: bool,
     authorized_keys: Arc<AuthorizedKeys>,
     shutdown: &AtomicBool,
     yield_idle: bool,
@@ -1000,7 +1082,13 @@ fn session_translator(
                     // would sleep 10µs per dropped seed event, turning
                     // ~hundred-event seed_and_drain into ~ms latency.
                     did_work = true;
-                } else if journal_cursor.get().load(Ordering::Acquire) > slot.input_seq {
+                } else if crate::response::durable_pos(
+                    journal_cursor.get().load(Ordering::Acquire),
+                    replication_cursor.load(Ordering::Acquire),
+                    fastest_replica_cursor.load(Ordering::Acquire),
+                    quorum_durability,
+                ) > slot.input_seq
+                {
                     let slot = pending_outbound.take().expect("checked is_some above");
                     diag.encode_attempts += 1;
                     if let Some(env_len) =

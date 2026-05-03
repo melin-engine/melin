@@ -7,6 +7,7 @@
 //! spawn only after handshake completes and tear down on every
 //! disconnect.
 
+use std::collections::VecDeque;
 use std::io::{self, Write};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
@@ -408,6 +409,21 @@ struct SessionState {
     receiver: std::cell::RefCell<ReceiverLoop<SharedUdpRecv>>,
     pub_log: Arc<PublicationLog>,
     sub_log: Arc<SubscriptionLog>,
+    /// Frames that arrived in the same poll pass as the target of a
+    /// `wait_for_message` call, AFTER the target was found. Because
+    /// `sub_log.poll()` advances the cursor for every frame it visits
+    /// — including frames the callback skips — dropping them would
+    /// lose events that must reach the pipeline (e.g. the initial
+    /// catch-up data that arrives right after `StreamStart`).
+    /// `streaming_loop` drains this queue before each `sub_log.poll`.
+    stashed: std::cell::RefCell<VecDeque<Vec<u8>>>,
+    /// Accumulation buffer for multi-fragment messages. `sub_log.poll()`
+    /// delivers raw rumcast fragments (BEGIN/middle/END) individually;
+    /// large replication frames (e.g. catch-up InputBatch > MTU) are
+    /// split across multiple fragments and must be reassembled before
+    /// decoding. Persists across poll calls because a BEGIN_FRAGMENT may
+    /// arrive in one tick and the END_FRAGMENT in the next.
+    reassembly_buf: std::cell::RefCell<Option<Vec<u8>>>,
 }
 
 impl SessionState {
@@ -460,6 +476,8 @@ impl SessionState {
             receiver: std::cell::RefCell::new(receiver),
             pub_log,
             sub_log,
+            stashed: std::cell::RefCell::new(VecDeque::new()),
+            reassembly_buf: std::cell::RefCell::new(None),
         }
     }
 
@@ -738,18 +756,14 @@ fn recv_snapshot(
         let mut done = false;
         let mut error_msg: Option<String> = None;
         session.tick();
-        session.sub_log.poll(MAX_DATA_FRAME as u32, |view| {
-            if done || error_msg.is_some() {
-                return;
-            }
-            if let FrameView::Data {
-                header: _, payload, ..
-            } = view
-            {
-                let inner = match strip_length_prefix(payload) {
-                    Some(i) => i,
-                    None => return,
-                };
+        poll_reassembled(
+            &session.sub_log,
+            &session.reassembly_buf,
+            MAX_DATA_FRAME as u32,
+            |inner| {
+                if done || error_msg.is_some() {
+                    return;
+                }
                 match decode_primary_message(inner) {
                     Ok(PrimaryMessage::SnapshotChunk(data)) => {
                         snap_buf.extend_from_slice(&data);
@@ -778,8 +792,8 @@ fn recv_snapshot(
                         error_msg = Some(format!("decode error during snapshot: {e}"));
                     }
                 }
-            }
-        });
+            },
+        );
         if let Some(msg) = error_msg {
             return Err(io::Error::other(msg));
         }
@@ -863,6 +877,13 @@ fn streaming_loop(
     busy_spin: bool,
 ) -> SessionExit {
     let mut last_publisher_seen = Instant::now();
+    // Keepalive: periodically re-send the last acked sequence so the
+    // primary's ack-timeout can distinguish a healthy-but-idle replica
+    // from a dead one. Without this, a quiescent stream produces no acks
+    // and the primary would incorrectly evict the slot.
+    let mut last_sent_ack_seq: u64 = 0;
+    let mut last_keepalive = Instant::now();
+    const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(1);
 
     loop {
         if shutdown.load(Ordering::Relaxed) {
@@ -886,28 +907,19 @@ fn streaming_loop(
 
         // ---- Drain inbound InputBatch / Heartbeat / control ----
         //
-        // For each rumcast Data frame we receive, decode the wire frame
-        // and (for InputBatch) publish slots directly into the local
-        // input ring. We track the burst's max producer-publish target
-        // so a single pending_acks entry covers everything from this
-        // poll pass — matches the tcp_receiver pattern where one
-        // `pending_acks.push` covers a whole CQE burst.
+        // Two sources: (1) frames stashed by wait_for_message when they
+        // arrived in the same poll pass as the handshake target, and
+        // (2) freshly polled frames. Both are decoded identically.
+        // Processing stashed frames first ensures catch-up data that
+        // arrived alongside StreamStart isn't dropped.
         let mut fatal: Option<Box<dyn std::error::Error>> = None;
         let mut burst_any_published = false;
         let mut burst_last_target: u64 = 0;
-        session.sub_log.poll(MAX_DATA_FRAME as u32, |view| {
-            if fatal.is_some() {
-                return;
-            }
-            if let FrameView::Data {
-                header: _, payload, ..
-            } = view
-            {
-                let inner = match strip_length_prefix(payload) {
-                    Some(i) => i,
-                    None => return,
-                };
-                if let Ok(slots) = try_decode_input_batch(inner) {
+
+        // Inline frame handler shared by the stash-drain and poll paths.
+        macro_rules! handle_inner {
+            ($inner:expr) => {{
+                if let Ok(slots) = try_decode_input_batch($inner) {
                     *received_data = true;
                     for slot in slots {
                         let primary_seq = slot.sequence;
@@ -916,13 +928,14 @@ fn streaming_loop(
                         burst_any_published = true;
                     }
                 } else {
-                    match decode_primary_message(inner) {
+                    match decode_primary_message($inner) {
                         Ok(PrimaryMessage::Heartbeat { sequence }) => {
                             debug!(sequence, "rumcast replica: heartbeat from primary");
                         }
                         Ok(PrimaryMessage::NeedSnapshot) => {
                             fatal = Some(
-                                "primary requested snapshot mid-stream; reconnect required".into(),
+                                "primary requested snapshot mid-stream; reconnect required"
+                                    .into(),
                             );
                         }
                         Ok(PrimaryMessage::HashMismatch) => {
@@ -936,8 +949,32 @@ fn streaming_loop(
                         }
                     }
                 }
+            }};
+        }
+
+        // Drain stashed frames before polling for new ones.
+        {
+            let mut stash = session.stashed.borrow_mut();
+            while let Some(inner) = stash.pop_front() {
+                if fatal.is_none() {
+                    handle_inner!(&inner);
+                }
             }
-        });
+        }
+
+        if fatal.is_none() {
+            poll_reassembled(
+                &session.sub_log,
+                &session.reassembly_buf,
+                MAX_DATA_FRAME as u32,
+                |inner| {
+                    if fatal.is_none() {
+                        handle_inner!(inner);
+                    }
+                },
+            );
+        }
+
         if let Some(e) = fatal {
             return SessionExit::Fatal(e);
         }
@@ -953,14 +990,16 @@ fn streaming_loop(
         } else {
             pending_acks.pop_ready(journal_cursor)
         };
-        if let Some(seq) = ready_seq
-            && let Err(e) = session.send_ack_with(seq, shutdown)
-        {
-            if shutdown.load(Ordering::Relaxed) {
-                return SessionExit::Shutdown;
+        if let Some(seq) = ready_seq {
+            if let Err(e) = session.send_ack_with(seq, shutdown) {
+                if shutdown.load(Ordering::Relaxed) {
+                    return SessionExit::Shutdown;
+                }
+                warn!(error = %e, "ack send failed");
+                return SessionExit::Disconnected;
             }
-            warn!(error = %e, "ack send failed");
-            return SessionExit::Disconnected;
+            last_sent_ack_seq = seq;
+            last_keepalive = Instant::now();
         }
 
         // ---- Backpressure: drain blocking acks if pending is full ----
@@ -979,6 +1018,25 @@ fn streaming_loop(
                 warn!(error = %e, "ack send failed during backpressure drain");
                 return SessionExit::Disconnected;
             }
+            last_sent_ack_seq = seq;
+            last_keepalive = Instant::now();
+        }
+
+        // ---- Keepalive ack (idle liveness signal) ----
+        //
+        // Re-send the last acked sequence on a fixed interval so the
+        // primary can distinguish a healthy-but-idle replica from a dead
+        // one. Without this, no new orders → no new acks → the primary's
+        // ack-timeout evicts a perfectly healthy replica.
+        if last_sent_ack_seq > 0 && last_keepalive.elapsed() >= KEEPALIVE_INTERVAL {
+            if let Err(e) = session.send_ack_with(last_sent_ack_seq, shutdown) {
+                if shutdown.load(Ordering::Relaxed) {
+                    return SessionExit::Shutdown;
+                }
+                warn!(error = %e, "keepalive ack send failed");
+                return SessionExit::Disconnected;
+            }
+            last_keepalive = Instant::now();
         }
 
         // ---- Idle wait ----
@@ -1019,19 +1077,34 @@ fn wait_for_message(
         }
         session.tick();
         let mut found: Option<Vec<u8>> = None;
-        session.sub_log.poll(MAX_DATA_FRAME as u32, |view| {
-            if found.is_some() {
-                return;
-            }
-            if let FrameView::Data {
-                header: _, payload, ..
-            } = view
-                && let Some(inner) = strip_length_prefix(payload)
-                && predicate(inner)
-            {
-                found = Some(inner.to_vec());
-            }
-        });
+        poll_reassembled(
+            &session.sub_log,
+            &session.reassembly_buf,
+            MAX_DATA_FRAME as u32,
+            |inner| {
+                if found.is_none() && predicate(inner) {
+                    found = Some(inner.to_vec());
+                } else if found.is_some() {
+                    // A frame arrived in the same poll pass as the
+                    // target. sub_log.poll advances the cursor for
+                    // every visited frame, so we must stash it rather
+                    // than drop it — otherwise catch-up data that
+                    // arrives immediately after StreamStart is lost.
+                    session.stashed.borrow_mut().push_back(inner.to_vec());
+                }
+                // Note: a frame that arrives BEFORE the target and
+                // doesn't satisfy the predicate is silently dropped.
+                // Safe because rumcast preserves publication order from
+                // a single publisher: every handshake-step predicate
+                // (Challenge → AuthOk → StreamStart) is the next thing
+                // the primary sends, so an earlier non-matching frame
+                // can only be a stale message from a prior handshake
+                // step we already consumed (and would re-decode here as
+                // a no-op). If a future protocol change interleaves
+                // unrelated control frames during handshake, this
+                // branch must stash them too.
+            },
+        );
         if let Some(p) = found {
             return Ok(Some(p));
         }
@@ -1041,6 +1114,78 @@ fn wait_for_message(
             std::thread::sleep(Duration::from_millis(2));
         }
     }
+}
+
+/// Poll the subscription log with multi-fragment reassembly.
+///
+/// `sub_log.poll()` delivers raw rumcast data frames — one per callback
+/// invocation — including fragments of messages that span multiple MTU-
+/// sized UDP datagrams. Large replication frames (e.g. a catch-up
+/// `InputBatch` with 30+ events) exceed `MAX_FRAGMENT_PAYLOAD` and are
+/// split by the sender's `spin_publish` into BEGIN_FRAGMENT / middle /
+/// END_FRAGMENT pieces. This helper reassembles them transparently.
+///
+/// `on_complete` is called with the complete inner payload (4-byte
+/// length prefix already stripped) for each fully reassembled message.
+/// Fragments are accumulated in `reassembly_buf` across calls so a
+/// BEGIN_FRAGMENT received in one tick and an END_FRAGMENT in the next
+/// are correctly stitched together.
+fn poll_reassembled<F>(
+    sub_log: &SubscriptionLog,
+    reassembly_buf: &std::cell::RefCell<Option<Vec<u8>>>,
+    max_bytes: u32,
+    mut on_complete: F,
+) where
+    F: FnMut(&[u8]),
+{
+    sub_log.poll(max_bytes, |view| {
+        let FrameView::Data {
+            header, payload, ..
+        } = view
+        else {
+            return;
+        };
+        let flags = header.common.flags;
+        let is_begin = flags & data_flags::BEGIN_FRAGMENT != 0;
+        let is_end = flags & data_flags::END_FRAGMENT != 0;
+
+        if is_begin && is_end {
+            // Unfragmented: process directly.
+            if let Some(inner) = strip_length_prefix(payload) {
+                on_complete(inner);
+            }
+            return;
+        }
+
+        if is_begin {
+            // First fragment: start a new reassembly buffer.
+            *reassembly_buf.borrow_mut() = Some(payload.to_vec());
+            return;
+        }
+
+        // Middle or final fragment: append to the in-progress buffer.
+        let complete = {
+            let mut guard = reassembly_buf.borrow_mut();
+            if let Some(ref mut buf) = *guard {
+                buf.extend_from_slice(payload);
+                if is_end {
+                    guard.take() // clears *guard = None, returns the Vec
+                } else {
+                    None
+                }
+            } else {
+                // No BEGIN_FRAGMENT seen — orphaned fragment; discard.
+                warn!("reassembly: orphaned fragment (no BEGIN_FRAGMENT), discarding");
+                None
+            }
+        };
+
+        if let Some(complete) = complete {
+            if let Some(inner) = strip_length_prefix(&complete) {
+                on_complete(inner);
+            }
+        }
+    });
 }
 
 /// Strip the 4-byte little-endian length prefix that `protocol.rs`

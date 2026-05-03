@@ -86,6 +86,15 @@ const REPL_MAX_SESSIONS: u32 = 4;
 /// but never sends a valid `ChallengeResponse`.
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// Release a Live slot if no Ack has been received within this window.
+/// Under TCP the OS signals a dead peer immediately; rumcast has no
+/// equivalent, so we infer death from silence. The replica sends a
+/// keepalive ack every ~1s even on an idle stream, so this window need
+/// only exceed that interval by a comfortable margin. 3s gives a ×3
+/// buffer while still freeing dead slots quickly enough for tests and
+/// for replacement replicas to connect.
+const LIVE_ACK_TIMEOUT: Duration = Duration::from_secs(3);
+
 /// Minimum gap between auth-state sweeps. Mirrors the order-entry
 /// session translator's amortization.
 const SWEEP_INTERVAL: Duration = Duration::from_secs(1);
@@ -651,6 +660,12 @@ enum SlotPhase {
         pub_log: Arc<PublicationLog>,
         last_sequence: u64,
         last_send: Instant,
+        /// Timestamp of the most recent Ack received from this replica.
+        /// Reset to `Instant::now()` on transition to Live and on every
+        /// inbound Ack. Used by `tick()` to detect dead replicas via
+        /// `LIVE_ACK_TIMEOUT`; under TCP the OS signals death immediately
+        /// but rumcast has no equivalent.
+        last_ack: Instant,
     },
 }
 
@@ -778,6 +793,27 @@ impl SlotState {
                 replicas_connected,
             );
             self.evict_flag.store(false, Ordering::Release);
+            return false;
+        }
+
+        // Ack timeout: release a live slot that has gone silent. Under
+        // TCP the OS delivers a RST/EOF when the peer dies; rumcast has
+        // no equivalent, so we detect dead replicas by the absence of
+        // acks. A live, healthy replica acks every durable batch — the
+        // window is sized well above any realistic ack latency.
+        if matches!(&self.phase, SlotPhase::Live { last_ack, .. }
+            if last_ack.elapsed() >= LIVE_ACK_TIMEOUT)
+        {
+            self.release(
+                "ack timeout (replica silent)",
+                muxed_sender,
+                muxed_receiver,
+                auth_states,
+                slot_acked,
+                replication_cursor,
+                fastest_replica_cursor,
+                replicas_connected,
+            );
             return false;
         }
 
@@ -923,6 +959,7 @@ impl SlotState {
                             pub_log: pub_log_clone,
                             last_sequence: h.last_sequence,
                             last_send: Instant::now(),
+                            last_ack: Instant::now(),
                         };
                     }
                     Ok(ReplicaMessage::Ack(_)) => {
@@ -938,9 +975,12 @@ impl SlotState {
                 }
             }
             SlotPhase::Live {
-                last_sequence: _, ..
+                last_sequence: _,
+                last_ack,
+                ..
             } => match decode_replica_message(payload) {
                 Ok(ReplicaMessage::Ack(ack)) => {
+                    *last_ack = Instant::now();
                     let new_val = ack.acked_sequence + 1;
                     slot_acked[self.slot_idx].store(new_val, Ordering::Release);
                     let other = slot_acked[1 - self.slot_idx].load(Ordering::Acquire);
