@@ -3,13 +3,17 @@
 //! Manual serialization (no serde) for zero allocation, predictable
 //! layout, and no format-stability concerns across dependency versions.
 //!
-//! ## File header (8 bytes, written once at creation)
+//! ## File header (one sector, written once at creation)
+//!
+//! The header occupies exactly one sector on disk (512 or 4096 bytes depending
+//! on the device's physical sector size). The meaningful fields fit in the
+//! first 8 bytes; the remainder of the sector is zero-padded.
 //!
 //! | Field          | Type | Bytes | Purpose                                |
 //! |----------------|------|-------|----------------------------------------|
 //! | file_magic     | u32  | 4     | `0x4A4F5552` ("JOUR")                  |
 //! | format_version | u16  | 2     | Current version = 12                   |
-//! | reserved       | u16  | 2     | Padding for alignment, zeroed          |
+//! | sector_size    | u16  | 2     | Physical sector size in bytes (0 = legacy 512) |
 //!
 //! ## Entry layout (little-endian, repeats after file header)
 //!
@@ -73,13 +77,16 @@ const ENTRY_MAGIC: u16 = 0x4A45;
 // break compatibility with journals on disk written by older builds, so
 // we fail the compile instead.
 
-/// File header (8 bytes, written once at file creation).
+/// File header (8 bytes of meaningful fields; on disk, padded to one sector).
 #[derive(FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned)]
 #[repr(C)]
 struct FileHeader {
     file_magic: U32,
     format_version: U16,
-    reserved: U16,
+    /// Physical sector size used when the journal was created, in bytes.
+    /// 0 in journals written before dynamic sector detection was added —
+    /// readers treat 0 as 512 for backward compatibility.
+    sector_size: U16,
 }
 
 /// Per-entry fixed prefix (20 bytes). `length` covers everything after
@@ -105,15 +112,20 @@ struct EntryMetadata {
     event_tag: u8,
 }
 
-/// On-disk reservation for the file header — one full O_DIRECT sector.
+/// Minimum on-disk reservation for the file header — the size of the
+/// meaningful `FileHeader` fields rounded up to the minimum sector size.
 ///
-/// The meaningful header fields (`FileHeader`) only occupy 8 bytes, but the
-/// writer always opens the journal with `O_DIRECT`, which requires
-/// sector-aligned writes. Reserving a full 512-byte sector keeps the first
-/// entry at a sector boundary (offset `FILE_HEADER_SIZE`) and gives the
-/// header room to grow (versioning, journal UUID, genesis chain hash slot,
-/// flags) without re-aligning the rest of the file.
+/// The actual on-disk reservation is one full sector (512 or 4096 bytes
+/// depending on the device). `FILE_HEADER_SIZE` is a floor used for
+/// backward-compatible header reads — always reading at least this many
+/// bytes is sufficient to decode all header fields regardless of the
+/// device sector size when the journal was created.
 pub const FILE_HEADER_SIZE: usize = 512;
+
+/// Maximum physical sector size supported. Journal buffers are aligned to
+/// this value so O_DIRECT writes are valid on both 512-byte and 4096-byte
+/// (4Kn) NVMe drives without re-opening the file.
+pub const MAX_SECTOR_SIZE: usize = 4096;
 
 /// Size of the meaningful `FileHeader` fields (the rest of the on-disk
 /// reservation is zero-padded).
@@ -152,21 +164,34 @@ pub const MAX_PAYLOAD_SIZE: usize = u16::MAX as usize - 17;
 
 /// Encode the file header into `buf`.
 ///
-/// Writes the meaningful fields into the first `FILE_HEADER_FIELDS_SIZE`
-/// bytes and zero-fills the remainder of the on-disk reservation
-/// (`FILE_HEADER_SIZE` total bytes), so the buffer can be written directly
-/// as one sector-aligned O_DIRECT pwrite.
-pub fn encode_file_header(buf: &mut [u8]) {
+/// `buf` must be exactly `sector_size` bytes long. Writes the meaningful
+/// fields into the first `FILE_HEADER_FIELDS_SIZE` bytes and zero-fills
+/// the rest, so the buffer can be written directly as one sector-aligned
+/// O_DIRECT pwrite. `sector_size` must be 512 or 4096.
+pub fn encode_file_header(buf: &mut [u8], sector_size: usize) {
+    debug_assert!(
+        sector_size == 512 || sector_size == 4096,
+        "sector_size must be 512 or 4096, got {sector_size}"
+    );
+    debug_assert_eq!(
+        buf.len(),
+        sector_size,
+        "buf must be exactly sector_size bytes"
+    );
     let header = FileHeader::mut_from_bytes(&mut buf[..FILE_HEADER_FIELDS_SIZE])
         .expect("FILE_HEADER_FIELDS_SIZE slice matches struct size");
     header.file_magic = U32::new(FILE_MAGIC);
     header.format_version = U16::new(FORMAT_VERSION);
-    header.reserved = U16::new(0);
-    buf[FILE_HEADER_FIELDS_SIZE..FILE_HEADER_SIZE].fill(0);
+    header.sector_size = U16::new(sector_size as u16);
+    buf[FILE_HEADER_FIELDS_SIZE..].fill(0);
 }
 
-/// Validate a file header. Returns `Ok(version)` on success.
-pub fn decode_file_header(buf: &[u8]) -> Result<u16, JournalError> {
+/// Validate a file header. Returns `Ok((version, sector_size))` on success.
+///
+/// `sector_size` is the physical sector size used when the journal was
+/// created. Legacy journals with the field zeroed return 512 for backward
+/// compatibility.
+pub fn decode_file_header(buf: &[u8]) -> Result<(u16, usize), JournalError> {
     let header = FileHeader::ref_from_prefix(buf)
         .map_err(|_| JournalError::TruncatedEntry)?
         .0;
@@ -179,7 +204,16 @@ pub fn decode_file_header(buf: &[u8]) -> Result<u16, JournalError> {
     if version != FORMAT_VERSION {
         return Err(JournalError::UnsupportedVersion { version });
     }
-    Ok(version)
+    let sector_size = match header.sector_size.get() {
+        // Legacy journals written before dynamic sector detection: assume 512.
+        0 => 512,
+        512 | 4096 => header.sector_size.get() as usize,
+        // Unknown sector size: reject rather than silently falling back to 512,
+        // which would cause EINVAL on the first O_DIRECT write to a 4Kn journal
+        // that the caller incorrectly decoded as 512-byte.
+        _ => return Err(JournalError::InvalidFile),
+    };
+    Ok((version, sector_size))
 }
 
 /// Encode a journal entry into `buf`.
@@ -578,14 +612,46 @@ mod tests {
     #[test]
     fn file_header_round_trip() {
         let mut buf = [0u8; FILE_HEADER_SIZE];
-        encode_file_header(&mut buf);
-        assert_eq!(decode_file_header(&buf).unwrap(), FORMAT_VERSION);
+        encode_file_header(&mut buf, 512);
+        assert_eq!(decode_file_header(&buf).unwrap(), (FORMAT_VERSION, 512));
+    }
+
+    #[test]
+    fn file_header_round_trip_4096() {
+        let mut buf = [0u8; MAX_SECTOR_SIZE];
+        encode_file_header(&mut buf, 4096);
+        assert_eq!(decode_file_header(&buf).unwrap(), (FORMAT_VERSION, 4096));
+    }
+
+    #[test]
+    fn file_header_legacy_sector_size_zero() {
+        // Journals written before the sector_size field defaulted to 0 in
+        // the reserved bytes. Decode must treat 0 as 512.
+        let mut buf = [0u8; FILE_HEADER_SIZE];
+        encode_file_header(&mut buf, 512);
+        // Force sector_size field to 0 (legacy layout).
+        buf[6] = 0;
+        buf[7] = 0;
+        assert_eq!(decode_file_header(&buf).unwrap(), (FORMAT_VERSION, 512));
+    }
+
+    #[test]
+    fn file_header_rejects_unknown_sector_size() {
+        let mut buf = [0u8; FILE_HEADER_SIZE];
+        encode_file_header(&mut buf, 512);
+        // Write an unrecognised sector_size value.
+        buf[6] = 0x01; // 256 — not 512 or 4096
+        buf[7] = 0x00;
+        assert!(matches!(
+            decode_file_header(&buf),
+            Err(JournalError::InvalidFile)
+        ));
     }
 
     #[test]
     fn file_header_rejects_wrong_version() {
         let mut buf = [0u8; FILE_HEADER_SIZE];
-        encode_file_header(&mut buf);
+        encode_file_header(&mut buf, 512);
         // Bump version.
         buf[4] = buf[4].wrapping_add(1);
         assert!(matches!(

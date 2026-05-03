@@ -53,6 +53,10 @@ pub enum JournalError {
         expected: [u8; 32],
         actual: [u8; 32],
     },
+    /// The journal's recorded sector size is smaller than the device's physical
+    /// sector size. O_DIRECT writes would fail with EINVAL. The journal must be
+    /// re-created on the target device or moved back to the original device.
+    SectorSizeMismatch { journal: usize, device: usize },
 }
 
 impl fmt::Display for JournalError {
@@ -95,6 +99,11 @@ impl fmt::Display for JournalError {
                 "hash chain mismatch at sequence {sequence}: expected {}, got {}",
                 hex(expected),
                 hex(actual)
+            ),
+            Self::SectorSizeMismatch { journal, device } => write!(
+                f,
+                "journal sector size ({journal}) is smaller than the device's physical \
+                 sector size ({device}); re-create the journal or move it to the original device"
             ),
         }
     }

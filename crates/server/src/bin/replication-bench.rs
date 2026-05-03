@@ -95,6 +95,10 @@ fn main() {
     let engine = JournaledApp::create(melin_noop::NoopApp::new(), &primary_journal)
         .expect("create primary journal");
     let (exchange, writer) = engine.into_parts();
+
+    // Read genesis before moving writer into the pipeline.
+    let genesis_entry = writer.read_genesis_entry().expect("read genesis");
+
     let active_connections = Arc::new(AtomicU64::new(0));
 
     let pipeline = build_pipeline_with_replication(
@@ -172,12 +176,6 @@ fn main() {
     let metrics = Arc::new(ReplicationMetrics::default());
     let ready_flag = Arc::new(AtomicBool::new(false));
     let connected_counter = Arc::new(AtomicU32::new(0));
-
-    // The genesis entry on disk is the first journal entry written by
-    // `JournaledApp::create`. The sender includes it in the StreamStart
-    // frame so the replica writes a byte-identical genesis. We read it
-    // back from the journal file.
-    let genesis_entry = read_genesis_entry(&primary_journal).expect("read genesis");
 
     let sender_config = Sender {
         bind_addr,
@@ -360,21 +358,4 @@ fn main() {
     let _ = drain_handle.join();
     let _ = sender_handle.join();
     let _ = receiver_handle.join();
-}
-
-/// Read the genesis (first) journal entry as raw bytes. Mirrors the
-/// production read in `server::run_with_shutdown`.
-fn read_genesis_entry(path: &std::path::Path) -> std::io::Result<Vec<u8>> {
-    use melin_journal::codec::FILE_HEADER_SIZE;
-    let file_bytes = std::fs::read(path)?;
-    let offset = FILE_HEADER_SIZE;
-    if file_bytes.len() < offset + 4 {
-        return Err(std::io::Error::other("journal too short for genesis"));
-    }
-    let entry_len = u16::from_le_bytes([file_bytes[offset + 2], file_bytes[offset + 3]]) as usize;
-    let total = 20 + entry_len + 4;
-    if file_bytes.len() < offset + total {
-        return Err(std::io::Error::other("journal truncated at genesis"));
-    }
-    Ok(file_bytes[offset..offset + total].to_vec())
 }

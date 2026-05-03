@@ -55,6 +55,10 @@ pub struct JournalReader<E: AppEvent> {
     /// Journal format version from the file header. Used to determine entry
     /// layout during decoding (v8+ has key_hash/request_seq fields).
     version: u16,
+    /// Physical sector size used when the journal was created (512 or 4096).
+    /// Determines the byte offset where entries begin (one sector after the
+    /// file header). Decoded from the file header at open time.
+    sector_size: usize,
     /// BLAKE3 hash chain verification state. Initialized when a GenesisHash
     /// entry is read, updated on each normal entry, verified at Checkpoints.
     /// `None` when `hash-chain` feature is disabled or for v5 journals.
@@ -78,12 +82,21 @@ struct ReaderHashChain {
 impl<E: AppEvent> JournalReader<E> {
     /// Open a journal file for reading. Validates the file header.
     pub fn open(path: &Path) -> Result<Self, JournalError> {
+        use std::io::Seek;
         let mut file = File::open(path)?;
 
-        // Read and validate the file header.
+        // Read and validate the file header. We use pread so the file cursor
+        // stays at zero; we then seek to sector_size to position the reader
+        // at the first entry. FILE_HEADER_SIZE bytes is always enough to
+        // decode all header fields (the meaningful content is 8 bytes).
         let mut header = [0u8; FILE_HEADER_SIZE];
         file.read_exact(&mut header)?;
-        let version = codec::decode_file_header(&header)?;
+        let (version, sector_size) = codec::decode_file_header(&header)?;
+
+        // Skip any padding between FILE_HEADER_SIZE and sector_size (zero on
+        // 512-byte devices; up to 3.5 KiB on 4Kn devices). Entries start at
+        // exactly one sector offset.
+        file.seek(std::io::SeekFrom::Start(sector_size as u64))?;
 
         Ok(Self {
             _marker: PhantomData,
@@ -92,8 +105,9 @@ impl<E: AppEvent> JournalReader<E> {
             pos: 0,
             valid: 0,
             last_sequence: None,
-            valid_file_end: FILE_HEADER_SIZE as u64,
+            valid_file_end: sector_size as u64,
             version,
+            sector_size,
             #[cfg(feature = "hash-chain")]
             hash_chain: None,
         })
@@ -312,6 +326,12 @@ impl<E: AppEvent> JournalReader<E> {
         self.valid_file_end
     }
 
+    /// Physical sector size used when the journal was created (512 or 4096).
+    /// Entries start at this byte offset in the file.
+    pub fn sector_size(&self) -> usize {
+        self.sector_size
+    }
+
     /// Current BLAKE3 chain hash after all entries read so far.
     /// Returns `None` when `hash-chain` is disabled, for v5 journals, or
     /// if no events have been read.
@@ -444,12 +464,12 @@ pub struct RawJournalScanner {
 impl RawJournalScanner {
     /// Open a journal file for raw scanning. Validates the file header.
     pub fn open(path: &Path) -> Result<Self, JournalError> {
+        use std::io::Seek;
         let mut file = File::open(path)?;
         let mut header = [0u8; FILE_HEADER_SIZE];
         file.read_exact(&mut header)?;
-        // Validate header (version check) but don't store version —
-        // the scanner only reads entry boundaries, not event payloads.
-        let _version = codec::decode_file_header(&header)?;
+        let (_, sector_size) = codec::decode_file_header(&header)?;
+        file.seek(std::io::SeekFrom::Start(sector_size as u64))?;
 
         Ok(Self {
             file,

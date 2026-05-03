@@ -675,21 +675,9 @@ fn run_as_primary<L: BlockingTransportListener>(
     // handshake so it can write a byte-identical genesis, ensuring the
     // BLAKE3 hash chain starts from the exact same encoded bytes.
     let genesis_entry = if enable_replication {
-        use melin_journal::codec::FILE_HEADER_SIZE;
-        let file_bytes = std::fs::read(writer.path())?;
-        // Genesis entry starts right after the 8-byte file header.
-        // Read entry length from bytes [offset+2..offset+4].
-        let offset = FILE_HEADER_SIZE;
-        if file_bytes.len() < offset + 4 {
-            return Err("journal file too short to contain genesis entry".into());
-        }
-        let entry_len =
-            u16::from_le_bytes([file_bytes[offset + 2], file_bytes[offset + 3]]) as usize;
-        let total = 20 + entry_len + 4; // header(20) + payload + crc(4)
-        if file_bytes.len() < offset + total {
-            return Err("journal file truncated at genesis entry".into());
-        }
-        file_bytes[offset..offset + total].to_vec()
+        writer
+            .read_genesis_entry()
+            .map_err(|e| format!("failed to read genesis entry: {e}"))?
     } else {
         Vec::new()
     };
@@ -1577,19 +1565,9 @@ pub fn run_dpdk(
     }
 
     let genesis_entry = if enable_replication {
-        use melin_journal::codec::FILE_HEADER_SIZE;
-        let file_bytes = std::fs::read(writer.path())?;
-        let offset = FILE_HEADER_SIZE;
-        if file_bytes.len() < offset + 4 {
-            return Err("journal file too short to contain genesis entry".into());
-        }
-        let entry_len =
-            u16::from_le_bytes([file_bytes[offset + 2], file_bytes[offset + 3]]) as usize;
-        let total = 20 + entry_len + 4;
-        if file_bytes.len() < offset + total {
-            return Err("journal file truncated at genesis entry".into());
-        }
-        file_bytes[offset..offset + total].to_vec()
+        writer
+            .read_genesis_entry()
+            .map_err(|e| format!("failed to read genesis entry: {e}"))?
     } else {
         Vec::new()
     };

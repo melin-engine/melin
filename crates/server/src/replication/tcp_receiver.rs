@@ -1040,8 +1040,10 @@ pub fn run_receiver(
         // --- Create journal for fresh replica (first connection only) ---
 
         if journal_writer.is_none() {
-            use melin_journal::codec::{self as journal_codec, FILE_HEADER_SIZE};
+            use melin_journal::codec as journal_codec;
+            use melin_journal::detect_sector_size;
             use std::fs::OpenOptions;
+            use std::os::fd::AsFd;
             use std::os::unix::fs::FileExt;
 
             let file = OpenOptions::new()
@@ -1049,10 +1051,11 @@ pub fn run_receiver(
                 .write(true)
                 .create_new(true)
                 .open(journal_path)?;
-            let mut header = [0u8; FILE_HEADER_SIZE];
-            journal_codec::encode_file_header(&mut header);
+            let sector_size = detect_sector_size(file.as_fd());
+            let mut header = vec![0u8; sector_size];
+            journal_codec::encode_file_header(&mut header, sector_size);
             file.write_all_at(&header, 0)?;
-            file.write_all_at(&primary_genesis_entry, FILE_HEADER_SIZE as u64)?;
+            file.write_all_at(&primary_genesis_entry, sector_size as u64)?;
             file.sync_all()?;
 
             let genesis_chain_hash = {
@@ -1061,7 +1064,7 @@ pub fn run_receiver(
                 *hash.as_bytes()
             };
 
-            let valid_end = FILE_HEADER_SIZE as u64 + primary_genesis_entry.len() as u64;
+            let valid_end = sector_size as u64 + primary_genesis_entry.len() as u64;
             let writer = JournalWriter::open_append(
                 journal_path,
                 1, // genesis consumed sequence 1
