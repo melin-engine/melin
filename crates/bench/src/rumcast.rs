@@ -17,6 +17,7 @@ use std::collections::hash_map::HashMap;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use ed25519_dalek::SigningKey;
@@ -273,6 +274,14 @@ pub fn run_rumcast_roundtrip(cfg: RumcastBenchConfig) {
     // window, drain any inbound responses across all sessions. Single
     // thread keeps muxer access lock-free (`MuxedSender::tick` /
     // `MuxedReceiver::tick` need `&mut self`).
+    let measured_total = (total_msgs - cfg.warmup * cfg.clients) as u64;
+    let progress = Arc::new(AtomicU64::new(0));
+    let progress_shutdown = Arc::new(AtomicBool::new(false));
+    let progress_handle = crate::spawn_progress_reporter(
+        Arc::clone(&progress),
+        measured_total,
+        Arc::clone(&progress_shutdown),
+    );
     let mut total_received_overall = 0usize;
     while total_received_overall < total_msgs {
         diag_iters += 1;
@@ -373,6 +382,7 @@ pub fn run_rumcast_roundtrip(cfg: RumcastBenchConfig) {
                     let latency_ns = sent_ts.elapsed().as_nanos() as u64;
                     if total_received[s] >= cfg.warmup {
                         let _ = hist.record(latency_ns);
+                        progress.fetch_add(1, Ordering::Relaxed);
                     } else {
                         warmup_record[s] += 1;
                     }
@@ -445,6 +455,9 @@ pub fn run_rumcast_roundtrip(cfg: RumcastBenchConfig) {
             }
         }
     }
+
+    progress_shutdown.store(true, Ordering::Relaxed);
+    let _ = progress_handle.join();
 
     let elapsed = bench_start.elapsed();
     let measured = total_msgs - cfg.warmup * cfg.clients;
