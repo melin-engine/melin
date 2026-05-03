@@ -1561,7 +1561,9 @@ name = "melin-client"
 version = "0.5.0"
 dependencies = [
  "ed25519-dalek",
+ "getrandom 0.3.4",
  "melin-protocol",
+ "melin-rumcast",
 ]
 
 [[package]]
