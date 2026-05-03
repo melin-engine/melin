@@ -348,30 +348,36 @@ fn main() {
         "roundtrip" => {
             #[cfg(all(not(feature = "dpdk"), feature = "rumcast"))]
             {
-                let addr = args.addr.unwrap_or_else(|| {
-                    eprintln!("error: --addr is required for rumcast mode (no embedded server)");
-                    std::process::exit(1);
-                });
-                let bind = args.rumcast_bind.unwrap_or_else(|| {
-                    eprintln!(
-                        "error: --rumcast-bind is required for rumcast mode \
-                         (server publishes responses to this address)"
-                    );
-                    std::process::exit(1);
-                });
-                let key_path = args.key.as_deref().unwrap_or_else(|| {
-                    eprintln!(
-                        "error: --key is required for rumcast mode (the rumcast \
-                         transport authenticates every message — pre-handshake \
-                         the server requires a known Ed25519 identity from the \
-                         server's authorized_keys file)"
-                    );
-                    std::process::exit(1);
-                });
-                let key = load_signing_key(key_path);
+                let (server_addr, bench_bind, signing_key) = match args.addr {
+                    Some(addr) => {
+                        // Remote mode — operator must supply bind + key.
+                        let bind = args.rumcast_bind.unwrap_or_else(|| {
+                            eprintln!(
+                                "error: --rumcast-bind is required for remote rumcast \
+                                 mode (server publishes responses to this address)"
+                            );
+                            std::process::exit(1);
+                        });
+                        let key_path = args.key.as_deref().unwrap_or_else(|| {
+                            eprintln!(
+                                "error: --key is required for remote rumcast mode \
+                                 (the rumcast transport authenticates every message)"
+                            );
+                            std::process::exit(1);
+                        });
+                        (addr, bind, load_signing_key(key_path))
+                    }
+                    None => spawn_embedded_rumcast_server(
+                        args.rumcast_bind,
+                        args.accounts,
+                        args.instruments,
+                        args.group_commit_us,
+                        args.journal.clone(),
+                    ),
+                };
                 rumcast::run_rumcast_roundtrip(rumcast::RumcastBenchConfig {
-                    server_addr: addr,
-                    bind,
+                    server_addr,
+                    bind: bench_bind,
                     pairs: args.pairs,
                     window: args.window,
                     warmup: args.warmup,
@@ -380,7 +386,7 @@ fn main() {
                     instruments: args.instruments,
                     json_path: json_path.map(|p| p.to_path_buf()),
                     busy_spin: args.rumcast_busy_spin,
-                    signing_key: key,
+                    signing_key,
                 });
             }
 
@@ -1102,6 +1108,91 @@ fn start_server<L: BlockingTransportListener>(
             }
         })
         .expect("spawn server thread");
+}
+
+/// Bring up an in-process rumcast server on loopback with a generated
+/// bench identity, mirroring the embedded TCP path. Returns
+/// `(server_addr, bench_bind, signing_key)` ready to feed into
+/// `run_rumcast_roundtrip`. The temp dir holding the journal +
+/// authorized_keys file is intentionally leaked for the process lifetime
+/// — the bench is short-lived and the OS reaps `/tmp` on next boot.
+#[cfg(all(not(feature = "dpdk"), feature = "rumcast"))]
+fn spawn_embedded_rumcast_server(
+    bench_bind_override: Option<std::net::SocketAddr>,
+    accounts: u32,
+    instruments: u32,
+    group_commit_us: u64,
+    journal_path: Option<std::path::PathBuf>,
+) -> (
+    std::net::SocketAddr,
+    std::net::SocketAddr,
+    ed25519_dalek::SigningKey,
+) {
+    use melin_server::server::ServerConfig;
+    use std::net::{IpAddr, Ipv4Addr, SocketAddr, UdpSocket};
+
+    // Deterministic key — same trick as the TCP embedded path.
+    let bench_key = ed25519_dalek::SigningKey::from_bytes(&[0xBE; 32]);
+    let tmp_dir = tempdir();
+    let keys_path = tmp_dir.join("authorized_keys");
+    let pub_key_b64 = base64::Engine::encode(
+        &base64::engine::general_purpose::STANDARD,
+        bench_key.verifying_key().to_bytes(),
+    );
+    std::fs::write(&keys_path, format!("trader {pub_key_b64} bench\n"))
+        .expect("write authorized_keys");
+
+    // Pick free loopback UDP ports by binding ephemeral and dropping
+    // immediately — the kernel won't immediately reassign them, which
+    // is good enough for a single-process bench.
+    let pick_port = || -> u16 {
+        UdpSocket::bind("127.0.0.1:0")
+            .expect("bind ephemeral UDP")
+            .local_addr()
+            .expect("local addr")
+            .port()
+    };
+    let server_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), pick_port());
+    let bench_bind = bench_bind_override.unwrap_or(SocketAddr::new(
+        IpAddr::V4(Ipv4Addr::LOCALHOST),
+        pick_port(),
+    ));
+
+    let effective_journal = journal_path.unwrap_or_else(|| tmp_dir.join("rumcast-bench.journal"));
+
+    let config = ServerConfig {
+        bind: server_addr,
+        journal: effective_journal,
+        snapshot: None,
+        group_commit_us,
+        accounts,
+        instruments,
+        connection_timeout_secs: 0,
+        authorized_keys: keys_path,
+        // Disable the health endpoint so back-to-back bench runs don't
+        // collide on the default port; the bench doesn't poll it in
+        // rumcast mode anyway.
+        health_bind: None,
+        ..ServerConfig::default()
+    };
+    let rumcast_config = melin_server::rumcast_transport::RumcastConfig { bind: server_addr };
+
+    let shutdown = Arc::new(AtomicBool::new(false));
+    let shutdown_srv = Arc::clone(&shutdown);
+    std::thread::Builder::new()
+        .name("rumcast-server".into())
+        .spawn(move || {
+            if let Err(e) =
+                melin_server::rumcast_transport::run_rumcast(config, rumcast_config, shutdown_srv)
+            {
+                eprintln!("embedded rumcast server error: {e}");
+            }
+        })
+        .expect("spawn rumcast server thread");
+
+    eprintln!("embedded rumcast server: server_addr={server_addr} bench_bind={bench_bind}");
+
+    (server_addr, bench_bind, bench_key)
 }
 
 /// Connect to TCP server with retry (up to 50 attempts, 10ms apart).
