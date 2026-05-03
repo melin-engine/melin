@@ -27,6 +27,7 @@ use melin_protocol::codec;
 use melin_protocol::message::{Request, ResponseKind};
 use melin_protocol::session::{ClientHandshake, encode_envelope, verify_and_decode_envelope};
 use melin_rumcast::flow_control::FlowControl;
+use melin_rumcast::io_uring_udp::IoUringUdp;
 use melin_rumcast::muxed_receiver::{MuxedReceiver, MuxedReceiverConfig};
 use melin_rumcast::muxed_sender::{MuxedSender, MuxedSenderConfig};
 use melin_rumcast::pub_log::PublicationLog;
@@ -144,7 +145,7 @@ pub fn run_rumcast_roundtrip(cfg: RumcastBenchConfig) {
     // owns the recv half + lazy SubscriptionLogs. Internal demux on the
     // shared socket routes Data/Setup/Heartbeat → recv half,
     // NAK/StatusMessage → send half.
-    let shared = SharedUdp::bind(cfg.bind).expect("shared socket bind");
+    let shared = SharedUdp::new(IoUringUdp::bind(cfg.bind).expect("io_uring UDP bind"));
     let (send_half, recv_half) = shared.split();
 
     let max_sessions = (cfg.clients as u32).saturating_add(4);
@@ -519,12 +520,15 @@ fn generate_session_id() -> u32 {
 /// Panics on protocol error or timeout — the bench is a benchmark
 /// tool, not a production client; if any single session can't
 /// authenticate there's nothing useful to measure.
-fn perform_handshake(
+fn perform_handshake<
+    S: melin_rumcast::transport::UdpTransport,
+    R: melin_rumcast::transport::UdpTransport,
+>(
     signing_key: &SigningKey,
     session_id: u32,
     pub_log: &PublicationLog,
-    muxed_sender: &mut MuxedSender<melin_rumcast::shared_udp::SharedUdpSend>,
-    muxed_receiver: &mut MuxedReceiver<melin_rumcast::shared_udp::SharedUdpRecv>,
+    muxed_sender: &mut MuxedSender<melin_rumcast::shared_udp::SharedUdpSend<S>>,
+    muxed_receiver: &mut MuxedReceiver<melin_rumcast::shared_udp::SharedUdpRecv<R>>,
 ) -> [u8; 32] {
     let mut x25519_secret_bytes = [0u8; 32];
     getrandom::fill(&mut x25519_secret_bytes).expect("getrandom for X25519 ephemeral");
@@ -615,9 +619,12 @@ fn publish_blocking(pub_log: &PublicationLog, payload: &[u8]) {
 /// Data fragment for `target_sid` passes the supplied predicate or
 /// `deadline` expires. Used for the four handshake replies — once we
 /// switch to envelope-wrapped traffic, the bench loop polls inline.
-fn recv_match(
-    muxed_receiver: &mut MuxedReceiver<melin_rumcast::shared_udp::SharedUdpRecv>,
-    muxed_sender: &mut MuxedSender<melin_rumcast::shared_udp::SharedUdpSend>,
+fn recv_match<
+    S: melin_rumcast::transport::UdpTransport,
+    R: melin_rumcast::transport::UdpTransport,
+>(
+    muxed_receiver: &mut MuxedReceiver<melin_rumcast::shared_udp::SharedUdpRecv<R>>,
+    muxed_sender: &mut MuxedSender<melin_rumcast::shared_udp::SharedUdpSend<S>>,
     target_sid: u32,
     deadline: Instant,
     predicate: impl Fn(&[u8]) -> bool,

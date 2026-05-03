@@ -19,3 +19,13 @@ bytemuck = { version = "1", features = ["derive"] }
 # on the server) that need a larger kernel recv buffer to absorb SM
 # bursts without dropping NAKs.
 libc = { workspace = true }
+# Structured logging for the rare error paths (e.g. io_uring submit
+# failures in `park`). Workspace pin — keeps the crate's dep
+# footprint minimal while letting the embedder's subscriber capture.
+tracing = { workspace = true }
+# io_uring backend for event-driven recv without per-packet recvfrom
+# syscalls — enables IoUringUdp and SharedUdp<IoUringUdp>.
+io-uring = { version = "0.7", optional = true }
+
+[features]
+io-uring = ["dep:io-uring"]

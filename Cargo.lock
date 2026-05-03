@@ -1713,7 +1713,9 @@ name = "melin-rumcast"
 version = "0.4.0"
 dependencies = [
  "bytemuck",
+ "io-uring",
  "libc",
+ "tracing",
 ]
 
 [[package]]

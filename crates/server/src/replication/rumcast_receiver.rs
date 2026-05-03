@@ -23,6 +23,7 @@ use melin_rumcast::receiver::{ReceiverConfig, ReceiverLoop};
 use melin_rumcast::sender::{SenderConfig, SenderLoop};
 use melin_rumcast::shared_udp::{SharedUdp, SharedUdpRecv, SharedUdpSend};
 use melin_rumcast::sub_log::{SubscriptionConfig, SubscriptionLog};
+use melin_rumcast::transport::KernelUdp;
 use melin_rumcast::wire::{FrameView, data_flags};
 
 use super::protocol::{
@@ -405,8 +406,8 @@ pub fn run_receiver_rumcast(
 /// helpers can borrow them mutably from the same call site.
 struct SessionState {
     session_id: u32,
-    sender: std::cell::RefCell<SenderLoop<SharedUdpSend>>,
-    receiver: std::cell::RefCell<ReceiverLoop<SharedUdpRecv>>,
+    sender: std::cell::RefCell<SenderLoop<SharedUdpSend<KernelUdp>>>,
+    receiver: std::cell::RefCell<ReceiverLoop<SharedUdpRecv<KernelUdp>>>,
     pub_log: Arc<PublicationLog>,
     sub_log: Arc<SubscriptionLog>,
     /// Frames that arrived in the same poll pass as the target of a
@@ -430,8 +431,8 @@ impl SessionState {
     fn new(
         session_id: u32,
         primary_addr: SocketAddr,
-        send_half: SharedUdpSend,
-        recv_half: SharedUdpRecv,
+        send_half: SharedUdpSend<KernelUdp>,
+        recv_half: SharedUdpRecv<KernelUdp>,
     ) -> Self {
         let pub_log = Arc::new(
             PublicationLog::new(PublicationConfig {

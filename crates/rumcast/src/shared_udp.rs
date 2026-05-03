@@ -71,18 +71,20 @@ const RECV_BUF_SIZE: usize = 2048;
 /// One bound UDP socket whose incoming frames are demultiplexed
 /// between a publisher half and a subscriber half. See module docs.
 ///
-/// Construct via [`bind`], then call [`split`] to obtain the two
-/// halves. `SharedUdp` itself can't be used as a transport — it's
-/// purely the factory.
+/// Construct via [`bind`] (for a fresh `KernelUdp` socket) or
+/// [`new`] (to wrap any [`UdpTransport`]), then call [`split`] to
+/// obtain the two halves. `SharedUdp` itself can't be used as a
+/// transport — it's purely the factory.
 ///
 /// [`bind`]: SharedUdp::bind
+/// [`new`]: SharedUdp::new
 /// [`split`]: SharedUdp::split
-pub struct SharedUdp {
-    inner: Arc<SharedInner>,
+pub struct SharedUdp<T: UdpTransport = KernelUdp> {
+    inner: Arc<SharedInner<T>>,
 }
 
-struct SharedInner {
-    socket: KernelUdp,
+struct SharedInner<T: UdpTransport> {
+    socket: T,
     queues: Mutex<Queues>,
 }
 
@@ -108,12 +110,19 @@ struct QueuedFrame {
     bytes: Vec<u8>,
 }
 
-impl SharedUdp {
+impl SharedUdp<KernelUdp> {
     /// Bind a fresh `KernelUdp` to `local` (non-blocking) and wrap
     /// it for shared use.
     pub fn bind(local: SocketAddr) -> io::Result<Self> {
         let socket = KernelUdp::bind(local)?;
-        Ok(Self {
+        Ok(Self::new(socket))
+    }
+}
+
+impl<T: UdpTransport> SharedUdp<T> {
+    /// Wrap an already-constructed transport for shared use.
+    pub fn new(socket: T) -> Self {
+        Self {
             inner: Arc::new(SharedInner {
                 socket,
                 queues: Mutex::new(Queues {
@@ -124,7 +133,7 @@ impl SharedUdp {
                     parse_dropped: 0,
                 }),
             }),
-        })
+        }
     }
 
     /// Bound local address — useful for tests and for embedders
@@ -136,7 +145,7 @@ impl SharedUdp {
     /// Drain into the two halves. The `SharedUdp` is consumed —
     /// once split, the underlying socket is referenced only via
     /// the halves' `Arc` clones.
-    pub fn split(self) -> (SharedUdpSend, SharedUdpRecv) {
+    pub fn split(self) -> (SharedUdpSend<T>, SharedUdpRecv<T>) {
         let send = SharedUdpSend {
             inner: Arc::clone(&self.inner),
         };
@@ -148,15 +157,15 @@ impl SharedUdp {
 /// Publisher-side half. Implements [`UdpTransport`]: `send_to`
 /// passes through to the underlying socket; `recv_from` returns
 /// only NAK / StatusMessage frames (publisher's flow-control inbox).
-pub struct SharedUdpSend {
-    inner: Arc<SharedInner>,
+pub struct SharedUdpSend<T: UdpTransport = KernelUdp> {
+    inner: Arc<SharedInner<T>>,
 }
 
 /// Subscriber-side half. Implements [`UdpTransport`]: `send_to`
 /// passes through (used for SMs/NAKs going OUT to the publisher);
 /// `recv_from` returns only Data / Setup / Heartbeat frames.
-pub struct SharedUdpRecv {
-    inner: Arc<SharedInner>,
+pub struct SharedUdpRecv<T: UdpTransport = KernelUdp> {
+    inner: Arc<SharedInner<T>>,
 }
 
 /// Direction a parsed frame is bound for.
@@ -187,7 +196,10 @@ fn classify(bytes: &[u8]) -> Direction {
 ///
 /// Caller must NOT be holding `inner.queues` lock — we acquire it
 /// per dispatch to keep the lock-hold window short.
-fn drain_until(inner: &SharedInner, want: Direction) -> io::Result<Option<QueuedFrame>> {
+fn drain_until<T: UdpTransport>(
+    inner: &SharedInner<T>,
+    want: Direction,
+) -> io::Result<Option<QueuedFrame>> {
     let mut tmp = [0u8; RECV_BUF_SIZE];
     loop {
         match inner.socket.recv_from(&mut tmp) {
@@ -236,8 +248,8 @@ fn drain_until(inner: &SharedInner, want: Direction) -> io::Result<Option<Queued
 /// Try the local queue first; if empty, drain the socket dispatching
 /// non-matching frames to the other half. Common body for both
 /// halves' `recv_from`.
-fn try_recv(
-    inner: &SharedInner,
+fn try_recv<T: UdpTransport>(
+    inner: &SharedInner<T>,
     direction: Direction,
     buf: &mut [u8],
 ) -> io::Result<Option<(SocketAddr, usize)>> {
@@ -266,7 +278,7 @@ fn try_recv(
     }
 }
 
-impl UdpTransport for SharedUdpSend {
+impl<T: UdpTransport> UdpTransport for SharedUdpSend<T> {
     #[inline]
     fn send_to(&self, dst: SocketAddr, bytes: &[u8]) -> io::Result<usize> {
         // Send needs no synchronization — kernel handles concurrent
@@ -295,7 +307,7 @@ impl UdpTransport for SharedUdpSend {
     }
 }
 
-impl UdpTransport for SharedUdpRecv {
+impl<T: UdpTransport> UdpTransport for SharedUdpRecv<T> {
     #[inline]
     fn send_to(&self, dst: SocketAddr, bytes: &[u8]) -> io::Result<usize> {
         self.inner.socket.send_to(dst, bytes)
@@ -326,14 +338,14 @@ impl UdpTransport for SharedUdpRecv {
 /// pressure or unparseable bytes. Useful for tests and for an
 /// embedder's health endpoint. Returns `(recv_dropped,
 /// send_dropped, parse_dropped)`.
-impl SharedUdpSend {
+impl<T: UdpTransport> SharedUdpSend<T> {
     pub fn dropped_counts(&self) -> (u64, u64, u64) {
         let q = self.inner.queues.lock().expect("queues mutex poisoned");
         (q.recv_dropped, q.send_dropped, q.parse_dropped)
     }
 }
 
-impl SharedUdpRecv {
+impl<T: UdpTransport> SharedUdpRecv<T> {
     pub fn dropped_counts(&self) -> (u64, u64, u64) {
         let q = self.inner.queues.lock().expect("queues mutex poisoned");
         (q.recv_dropped, q.send_dropped, q.parse_dropped)

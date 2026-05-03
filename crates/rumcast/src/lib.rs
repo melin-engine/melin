@@ -41,6 +41,9 @@ compile_error!(
      bytemuck-based zero-copy header decode is unsafe on big-endian"
 );
 
+#[cfg(feature = "io-uring")]
+pub mod io_uring_udp;
+
 pub mod counters;
 pub mod flow_control;
 pub mod muxed_receiver;
