@@ -53,6 +53,14 @@ pub trait UdpTransport: Send + Sync {
 
     /// Leave a previously-joined multicast group.
     fn leave_multicast_v4(&self, group: Ipv4Addr, iface: Ipv4Addr) -> io::Result<()>;
+
+    /// Block until a datagram is available or `timeout` elapses. Used
+    /// by the bench idle path to replace `sleep(10µs)` with an
+    /// event-driven wakeup, eliminating the scheduling gap between
+    /// response arrival and poll. Default: sleep for the full timeout.
+    fn park(&self, timeout: std::time::Duration) {
+        std::thread::sleep(timeout);
+    }
 }
 
 /// Kernel UDP socket backend (`std::net::UdpSocket`, non-blocking).
@@ -114,6 +122,19 @@ impl UdpTransport for KernelUdp {
     #[inline]
     fn send_to(&self, dst: SocketAddr, bytes: &[u8]) -> io::Result<usize> {
         self.socket.send_to(bytes, dst)
+    }
+
+    fn park(&self, timeout: std::time::Duration) {
+        use std::os::unix::io::AsRawFd;
+        let timeout_ms = timeout.as_millis().min(i32::MAX as u128) as libc::c_int;
+        let mut pfd = libc::pollfd {
+            fd: self.socket.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        // Errors (EINTR, ENOMEM) are ignored — the caller will retry
+        // recv_from on the next iteration and detect the real issue there.
+        unsafe { libc::poll(&mut pfd, 1, timeout_ms) };
     }
 
     #[inline]

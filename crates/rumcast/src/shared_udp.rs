@@ -289,6 +289,10 @@ impl UdpTransport for SharedUdpSend {
     fn leave_multicast_v4(&self, group: Ipv4Addr, iface: Ipv4Addr) -> io::Result<()> {
         self.inner.socket.leave_multicast_v4(group, iface)
     }
+
+    fn park(&self, timeout: std::time::Duration) {
+        self.inner.socket.park(timeout);
+    }
 }
 
 impl UdpTransport for SharedUdpRecv {
@@ -311,6 +315,10 @@ impl UdpTransport for SharedUdpRecv {
 
     fn leave_multicast_v4(&self, group: Ipv4Addr, iface: Ipv4Addr) -> io::Result<()> {
         self.inner.socket.leave_multicast_v4(group, iface)
+    }
+
+    fn park(&self, timeout: std::time::Duration) {
+        self.inner.socket.park(timeout);
     }
 }
 

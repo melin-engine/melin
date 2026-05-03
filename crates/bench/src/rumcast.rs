@@ -451,7 +451,7 @@ pub fn run_rumcast_roundtrip(cfg: RumcastBenchConfig) {
             if busy_spin {
                 std::hint::spin_loop();
             } else {
-                std::thread::sleep(Duration::from_micros(10));
+                muxed_receiver.park(Duration::from_millis(2));
             }
         }
     }

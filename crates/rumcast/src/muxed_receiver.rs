@@ -195,6 +195,12 @@ impl<T: UdpTransport> MuxedReceiver<T> {
         }
     }
 
+    /// Block until a datagram is available on the underlying transport
+    /// or `timeout` elapses. Delegates to [`UdpTransport::park`].
+    pub fn park(&self, timeout: std::time::Duration) {
+        self.transport.park(timeout);
+    }
+
     pub fn set_counters(&mut self, counters: Option<Arc<Counters>>) {
         self.counters = counters;
     }
