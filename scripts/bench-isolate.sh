@@ -234,7 +234,7 @@ echo ""
 # cores 1-3 pipeline, 4=DPDK poll (or 4-5 TCP readers), 6=repl-sender, 7=event-publisher, 8=shadow, 9+ bench threads.
 CARGO_BIN="$(sudo -u "${SUDO_USER}" bash -lc 'which cargo')"
 sudo -u "${SUDO_USER}" \
-    "$CARGO_BIN" run --release -p melin-bench "$@"
+    "$CARGO_BIN" run --release --bin melin-bench "$@"
 
 # --- Stop perf and show summary ---
 if [[ -n "$PERF_PID" ]]; then
