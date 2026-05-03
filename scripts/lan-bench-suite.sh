@@ -141,18 +141,14 @@ REPLICA2_JOURNAL="${JOURNAL_DIR}/replica2.journal"
 REPL_PORT=9877
 RUN_PLOTS="${RUN_PLOTS:-0}"
 
-# Primary server args. Default enables --journal-no-fua: skips FUA on journal
-# writes, relying on the NVMe drive's Power Loss Protection (PLP) capacitors
-# for crash durability. Drops flush latency from ~10-100µs to ~1-5µs.
-# Override with SERVER_EXTRA_ARGS="" on drives without confirmed PLP support.
-SERVER_EXTRA_ARGS="${SERVER_EXTRA_ARGS---journal-no-fua}"
+# Primary server args.
+SERVER_EXTRA_ARGS="${SERVER_EXTRA_ARGS-}"
 
 # Replica args. Default enables --async-replica-ack (replicas ack as soon as
 # the batch is queued for their local journal, before fsync completes — removes
-# ~50-80µs of NVMe latency from the replication round-trip) and --journal-no-fua
-# (same PLP-based flush optimization as the primary).
-# Override with REPLICA_EXTRA_ARGS="" to restore strict sync acks with FUA.
-REPLICA_EXTRA_ARGS="${REPLICA_EXTRA_ARGS---async-replica-ack --journal-no-fua}"
+# ~50-80µs of NVMe latency from the replication round-trip).
+# Override with REPLICA_EXTRA_ARGS="" to restore strict sync acks.
+REPLICA_EXTRA_ARGS="${REPLICA_EXTRA_ARGS---async-replica-ack}"
 
 # RUST_LOG override for every remote server launch below (primary +
 # replicas, TCP + DPDK). Leave at `info` for normal runs; bump to

@@ -200,7 +200,7 @@ Expires all GTD orders with `expiry_ns <= timestamp_ns`.
 
 ### Write Path
 
-The journal uses `pwritev2` with the `RWF_DSYNC` flag (Force Unit Access). On NVMe drives that support FUA, this persists the written sectors directly to non-volatile media in a single syscall, without flushing the entire drive write cache. Latency: ~10-100 us per write (vs ~1-7 ms for `write` + `fdatasync`).
+The journal uses `pwrite` with `O_DIRECT`, bypassing the page cache. Durability relies on the drive's Power Loss Protection (PLP) capacitors, which flush the controller's DRAM write cache to NAND on power loss. Latency: ~1–5 µs per write. PLP-equipped NVMe drives are a hard requirement for production deployments.
 
 ### Pre-allocation
 
@@ -208,7 +208,7 @@ On creation and when space runs low, the writer calls `posix_fallocate` to exten
 
 ### Batch Amortization
 
-In the pipeline architecture, the journal stage reads a batch of events from the disruptor, encodes them all into a contiguous buffer, and issues a single `pwritev2 + RWF_DSYNC` for the batch. Under load, one sync covers many events. The disruptor naturally accumulates events while the previous sync is in flight, providing implicit batching without any artificial delay.
+In the pipeline architecture, the journal stage reads a batch of events from the disruptor, encodes them all into a contiguous buffer, and issues a single `pwrite` for the batch. Under load, one write covers many events. The disruptor naturally accumulates events while the previous write is in flight, providing implicit batching without any artificial delay.
 
 An explicit group commit delay (`group_commit_delay`) can be configured but is set to zero for TCP. Testing showed that any delay hurts TCP throughput because it holds the journal cursor longer, stalling the response stage. It only helps with UDS transport where response sends are near-free.
 
@@ -218,7 +218,7 @@ An explicit group commit delay (`group_commit_delay`) can be configured but is s
 
 1. **Clean shutdown** — all entries are complete and synced. No recovery needed.
 2. **Crash mid-write** — the last entry may be partially written (truncated). The entry magic, length, or CRC will be invalid.
-3. **Crash after write, before sync** — the kernel or drive may have reordered writes. With FUA, this should not happen for the written data, but pre-allocated zero-filled space beyond the last write is always present.
+3. **Crash after write** — pre-allocated zero-filled space beyond the last write is always present; PLP ensures the written data itself is durable.
 4. **Bit rot / storage corruption** — a previously valid entry has flipped bits. CRC32C detects this.
 
 ### Recovery Algorithm

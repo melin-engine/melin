@@ -793,8 +793,8 @@ The pipeline does **not** crash on journal I/O errors. The journal stage logs th
 
 For best journal performance, use an NVMe drive with:
 
-- **Power Loss Protection (PLP)**: Ensures FUA writes are truly durable. Without PLP, the drive's write cache may lie about durability.
-- **Dedicated journal disk**: Avoids contention with OS I/O. The journal writer uses io_uring (default) or `pwritev2` with `RWF_DSYNC` (FUA) which bypasses the page cache, but sharing the disk with other workloads increases p99 latency.
+- **Power Loss Protection (PLP)**: Required. The journal relies on PLP capacitors to flush controller DRAM to NAND on power loss. Consumer SSDs and drives without confirmed PLP support are not safe for production use.
+- **Dedicated journal disk**: Avoids contention with OS I/O. The journal writer uses `O_DIRECT` writes which bypass the page cache, but sharing the disk with other workloads increases p99 latency.
 - **Mount with `noatime`**: Prevents inode mtime/atime updates on every write. Without `noatime`, these metadata changes accumulate in ext4's jbd2 transaction buffer and trigger periodic full cache flushes (~1-2ms stalls every few seconds).
 
 ---
@@ -872,6 +872,6 @@ Note: when a replica **disconnects**, the replication cursor resets to `u64::MAX
 
 ### Throughput vs. Disk Bandwidth
 
-At 5M orders/sec with ~80 bytes/event, the journal writes **~400 MB/s** sustained. Ensure the journal disk can sustain this write rate with FUA/dsync. Modern NVMe drives typically support 1-3 GB/s sequential write with FUA.
+At 5M orders/sec with ~80 bytes/event, the journal writes **~400 MB/s** sustained. Ensure the journal disk can sustain this write rate. Modern PLP NVMe drives typically support 1–3 GB/s sequential write throughput.
 
 At 10M orders/sec (engine-only rate), you would need ~800 MB/s sustained write bandwidth. In practice, the TCP network stack is the bottleneck before journal bandwidth becomes limiting.

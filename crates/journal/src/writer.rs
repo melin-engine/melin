@@ -6,20 +6,13 @@
 //! newly allocated extents. This significantly reduces sync latency under
 //! sustained write load.
 //!
-//! ## Durability modes
+//! ## Durability
 //!
 //! The file is always opened with `O_DIRECT` — every write is sector-aligned
-//! and bypasses the page cache. The `no_fua` flag selects how durability is
-//! achieved:
-//!
-//! **Default (`no_fua = false`)**: `pwritev2 + RWF_DSYNC` (FUA). The kernel
-//! issues a single FUA write that doesn't acknowledge until the sector is
-//! durable on the medium. Works on any NVMe drive; ~10–100 µs per flush.
-//!
-//! **PLP mode (`no_fua = true`)**: plain `pwrite`. Relies on the drive's
-//! Power Loss Protection capacitors to flush controller DRAM on power loss.
-//! Skips the FUA round-trip entirely (~1–5 µs controller DRAM write). Safe
-//! only on PLP-equipped drives — see `set_no_fua`.
+//! and bypasses the page cache. Writes use plain `pwrite` (no `RWF_DSYNC`),
+//! relying on the drive's Power Loss Protection (PLP) capacitors to flush
+//! controller DRAM on power loss (~1–5 µs per flush). PLP drives are a hard
+//! requirement for production deployments.
 //!
 //! **Sector Tail Buffer**: `O_DIRECT` requires 512-byte alignment for write
 //! lengths, buffer addresses, and file offsets. The writer maintains one
@@ -185,10 +178,6 @@ pub struct JournalWriter<E: AppEvent> {
     tail_sector: Box<AlignedBuf<MAX_SECTOR_SIZE>>,
     /// Bytes of real data in `tail_sector`. Always < sector_size.
     tail_sector_len: usize,
-    /// When true, flushes use plain `pwrite` instead of `pwritev2+RWF_DSYNC`.
-    /// Safe only on drives with Power Loss Protection (PLP) capacitors —
-    /// eliminates the ~10–100 µs FUA round-trip per write.
-    no_fua: bool,
 }
 
 /// Running BLAKE3 hash chain state for tamper evidence.
@@ -352,12 +341,7 @@ impl<E: AppEvent> JournalWriter<E> {
         // buffer and write it as one O_DIRECT pwrite. Reset the buffer
         // afterwards — at construction the partial tail is empty.
         codec::encode_file_header(&mut tail_sector[..sector_size], sector_size);
-        pwrite_aligned_sector(
-            file.as_fd(),
-            &tail_sector[..sector_size],
-            0,
-            /*no_fua=*/ false,
-        )?;
+        pwrite_aligned_sector(file.as_fd(), &tail_sector[..sector_size], 0)?;
         tail_sector.fill(0);
 
         Self::lock_buffer(batch_buf.as_ptr(), BATCH_BUF_CAPACITY);
@@ -386,7 +370,6 @@ impl<E: AppEvent> JournalWriter<E> {
             sector_size,
             tail_sector,
             tail_sector_len: 0,
-            no_fua: false,
         })
     }
 
@@ -485,12 +468,7 @@ impl<E: AppEvent> JournalWriter<E> {
                 )));
             }
             tail_sector[tail_len..sector_size].fill(0);
-            pwrite_aligned_sector(
-                file.as_fd(),
-                &tail_sector[..sector_size],
-                sector_base,
-                /*no_fua=*/ false,
-            )?;
+            pwrite_aligned_sector(file.as_fd(), &tail_sector[..sector_size], sector_base)?;
         }
         let write_pos = sector_base;
 
@@ -523,7 +501,6 @@ impl<E: AppEvent> JournalWriter<E> {
             sector_size,
             tail_sector,
             tail_sector_len: tail_len,
-            no_fua: false,
         };
 
         // When resuming mid-segment (events since last checkpoint > 0),
@@ -550,7 +527,7 @@ impl<E: AppEvent> JournalWriter<E> {
     /// Append an event to the journal and flush to disk.
     ///
     /// Returns the assigned sequence number. The event is durable after this
-    /// returns (written with `RWF_DSYNC` / FUA).
+    /// returns (written via O_DIRECT; PLP capacitors ensure persistence).
     pub fn append(&mut self, event: &JournalEvent<E>) -> Result<u64, JournalError> {
         let seq = self.batch_append(event)?;
         self.flush_batch_sync()?;
@@ -753,10 +730,9 @@ impl<E: AppEvent> JournalWriter<E> {
     ///
     /// Synchronous counterpart of [`take_batch_for_async_write`]. Routes
     /// through `flush_to_sectors`, which merges the in-memory partial tail
-    /// with the new batch and issues one sector-aligned pwrite —
-    /// `pwritev2 + RWF_DSYNC` (FUA, ~10–100 µs) in the default path, plain
-    /// `pwrite` in PLP mode (~1–5 µs). The hot path uses the async variant;
-    /// this one is for shutdown drains and one-shot callers.
+    /// with the new batch and issues one sector-aligned `pwrite` (~1–5 µs).
+    /// The hot path uses the async variant; this one is for shutdown drains
+    /// and one-shot callers.
     pub fn flush_batch_sync(&mut self) -> Result<(), JournalError> {
         if self.batch_len == 0 {
             return Ok(());
@@ -856,7 +832,7 @@ impl<E: AppEvent> JournalWriter<E> {
     /// Flush the journal to disk (fdatasync).
     ///
     /// Legacy sync path — only used during shutdown drain. Production
-    /// hot path uses `flush_batch_sync()` (pwritev2 + RWF_DSYNC) instead.
+    /// hot path uses `flush_batch_sync()` instead.
     pub fn sync(&mut self) -> Result<(), JournalError> {
         self.file.sync_data()?;
         Ok(())
@@ -952,24 +928,12 @@ impl<E: AppEvent> JournalWriter<E> {
         Ok(entry)
     }
 
-    /// `rw_flags` value to use for io_uring `Write` operations on this journal.
+    /// `rw_flags` value for io_uring `Write` operations on this journal.
     ///
-    /// Returns `RWF_DSYNC` on the default FUA path, or `0` on the PLP path
-    /// where O_DIRECT already guarantees the write reaches device DRAM and
-    /// the PLP capacitors handle crash durability — no FUA round-trip needed.
+    /// Always `0`: O_DIRECT delivers writes to device DRAM and PLP capacitors
+    /// guarantee persistence on power loss — no `RWF_DSYNC` round-trip needed.
     pub fn io_uring_rw_flags(&self) -> i32 {
-        if self.no_fua { 0 } else { libc::RWF_DSYNC }
-    }
-
-    /// Enable PLP mode. When `true`, flushes use plain `pwrite` instead of
-    /// `pwritev2+RWF_DSYNC` — relies on the drive's Power Loss Protection
-    /// capacitors for crash durability of the controller DRAM cache. Only
-    /// safe on drives with PLP — see `--journal-no-fua`.
-    ///
-    /// O_DIRECT is always enabled at construction (independent of this flag),
-    /// so toggling `no_fua` is a one-line state change with no file reopen.
-    pub fn set_no_fua(&mut self, no_fua: bool) {
-        self.no_fua = no_fua;
+        0
     }
 
     /// Current BLAKE3 chain hash, if hash chain is active.
@@ -1069,17 +1033,7 @@ impl<E: AppEvent> JournalWriter<E> {
         // Single pwrite for everything — one NVMe command instead of N.
         let fd = self.file.as_fd();
         let buf = &self.batch_buf[..padded];
-        let written = if self.no_fua {
-            rustix::io::pwrite(fd, buf, self.write_pos).map_err(rustix_to_io)?
-        } else {
-            rustix::io::pwritev2(
-                fd,
-                &[std::io::IoSlice::new(buf)],
-                self.write_pos,
-                rustix::io::ReadWriteFlags::DSYNC,
-            )
-            .map_err(rustix_to_io)?
-        };
+        let written = rustix::io::pwrite(fd, buf, self.write_pos).map_err(rustix_to_io)?;
         if written != padded {
             return Err(JournalError::Io(std::io::Error::new(
                 std::io::ErrorKind::WriteZero,
@@ -1110,18 +1064,12 @@ impl<E: AppEvent> JournalWriter<E> {
 
     /// Write `self.tail_sector[..sector_size]` at `offset`.
     ///
-    /// Uses `pwritev2+RWF_DSYNC` (FUA) for durability, or plain `pwrite` when
-    /// `no_fua` is set (PLP drives only). O_DIRECT requires the write length,
-    /// buffer address, and file offset all be sector-aligned — all three hold
-    /// here: tail_sector is 4096-byte aligned (alloc layout), sector_size is
-    /// 512 or 4096, and offset is always a multiple of sector_size.
+    /// O_DIRECT requires the write length, buffer address, and file offset all
+    /// be sector-aligned — all three hold here: tail_sector is 4096-byte aligned
+    /// (alloc layout), sector_size is 512 or 4096, and offset is always a
+    /// multiple of sector_size.
     fn pwrite_sector(&self, offset: u64) -> Result<(), JournalError> {
-        pwrite_aligned_sector(
-            self.file.as_fd(),
-            &self.tail_sector[..self.sector_size],
-            offset,
-            self.no_fua,
-        )
+        pwrite_aligned_sector(self.file.as_fd(), &self.tail_sector[..self.sector_size], offset)
     }
 
     /// Slice of the most-recent user entry in `batch_buf`, with the
@@ -1317,7 +1265,7 @@ fn preallocate(file: &File, current_end: u64) -> Result<u64, JournalError> {
 /// to an unwritten block triggers a metadata status change (unwritten →
 /// written) that goes into the ext4 jbd2 transaction buffer. Every ~5s
 /// (default `commit` interval), jbd2 commits these transactions with a full
-/// NVMe cache flush (`REQ_PREFLUSH`), stalling concurrent `pwritev2+RWF_DSYNC`
+/// NVMe cache flush (`REQ_PREFLUSH`), stalling concurrent `pwrite+O_DIRECT`
 /// writes for 1-2ms.
 ///
 /// `FALLOC_FL_ZERO_RANGE` pre-converts extents to "written + zeroed",
@@ -1383,18 +1331,10 @@ pub fn detect_sector_size(fd: std::os::unix::io::BorrowedFd<'_>) -> usize {
 /// 4096), the buffer is 4096-byte aligned (all buffers here come from
 /// `alloc_aligned`), and `offset` is a multiple of `data.len()` — required
 /// by O_DIRECT.
-///
-/// `no_fua = false`: `pwritev2 + RWF_DSYNC` — kernel issues one FUA write,
-/// guaranteed durable on commodity NVMe.
-///
-/// `no_fua = true`: plain `pwrite` — relies on the drive's PLP capacitors
-/// for crash durability of the controller DRAM cache. Safe only on
-/// PLP-equipped drives.
 fn pwrite_aligned_sector(
     fd: std::os::fd::BorrowedFd<'_>,
     data: &[u8],
     offset: u64,
-    no_fua: bool,
 ) -> Result<(), JournalError> {
     debug_assert!(
         data.len() == 512 || data.len() == 4096,
@@ -1406,19 +1346,8 @@ fn pwrite_aligned_sector(
         0,
         "offset must be sector-aligned"
     );
-    let sector_size = data.len();
-    let written = if no_fua {
-        rustix::io::pwrite(fd, data, offset).map_err(rustix_to_io)?
-    } else {
-        rustix::io::pwritev2(
-            fd,
-            &[std::io::IoSlice::new(data)],
-            offset,
-            rustix::io::ReadWriteFlags::DSYNC,
-        )
-        .map_err(rustix_to_io)?
-    };
-    if written != sector_size {
+    let written = rustix::io::pwrite(fd, data, offset).map_err(rustix_to_io)?;
+    if written != data.len() {
         return Err(JournalError::Io(std::io::Error::new(
             std::io::ErrorKind::WriteZero,
             "short sector write",

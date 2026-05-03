@@ -1,11 +1,10 @@
 //! Pipeline stages for the LMAX disruptor architecture.
 //!
 //! Two hot-path stages consume from an input disruptor in **parallel**:
-//! 1. **Journal stage**: batch-encodes events, then writes + syncs in a single
-//!    `pwritev2` with `RWF_DSYNC` (FUA). Advances its cursor only after the
-//!    durable write completes. When replication is enabled, sends a copy of
-//!    each encoded batch to the replication sender thread via a bounded channel.
-//!    The bytes are identical to what was written to disk — same sequences,
+//! 1. **Journal stage**: batch-encodes events, then writes in a single `pwrite` + `O_DIRECT`.
+//!    Advances its cursor only after the write completes. When replication is enabled,
+//!    sends a copy of each encoded batch to the replication sender thread via a bounded
+//!    channel. The bytes are identical to what was written to disk — same sequences,
 //!    timestamps, CRC checksums, and checkpoint entries.
 //! 2. **Matching stage**: executes commands on the `Exchange`, publishes responses
 //!    to the output SPSC. Runs concurrently with the journal — no waiting for sync.
@@ -86,11 +85,11 @@ pub const INPUT_RING_CAPACITY: usize = 1 << 20;
 pub const OUTPUT_RING_CAPACITY: usize = 1 << 20;
 
 /// Maximum number of events processed in one journal batch.
-/// Larger batches amortize the fixed cost of each NVMe FUA write over more
-/// events. FUA cost is roughly constant up to ~128 KiB (one NVMe command),
-/// so 4096 events × ~104 bytes ≈ 416 KiB still fits in a single write.
-/// Under low load, batches are naturally small (drain what's available);
-/// the cap only matters at sustained high throughput.
+/// Larger batches amortize the fixed cost of each NVMe write over more
+/// events. A single NVMe command covers up to ~128 KiB, so 4096 events ×
+/// ~104 bytes ≈ 416 KiB still fits in one write. Under low load, batches are
+/// naturally small (drain what's available); the cap only matters at
+/// sustained high throughput.
 pub const MAX_JOURNAL_BATCH: usize = 4096;
 
 /// Spin-wait idle hint. When `busy_spin` is false (default), falls back to
@@ -251,7 +250,7 @@ impl<R: Copy, Q: Copy> Default for OutputSlot<R, Q> {
 }
 
 /// Journal stage: consumes from the input disruptor, batch-encodes events,
-/// and writes + syncs in a single `pwritev2` with `RWF_DSYNC` (FUA).
+/// and writes in a single `pwrite` + `O_DIRECT`.
 ///
 /// Runs on a dedicated OS thread. Uses `read_batch` + `commit` so its
 /// cursor only advances **after** the durable write. The response stage
@@ -423,7 +422,7 @@ impl<E: AppEvent> JournalStage<E> {
         }
     }
 
-    /// Synchronous journal loop: `pwritev2+RWF_DSYNC` blocks until durable.
+    /// Synchronous journal loop: `pwrite` + `O_DIRECT` blocks until the write completes.
     ///
     /// Uses `read_batch` + `commit` (not `consume_batch`) to ensure the
     /// journal cursor is only advanced **after** the write is durable.
@@ -511,8 +510,8 @@ impl<E: AppEvent> JournalStage<E> {
                 }
 
                 // Batch-encode all events into the writer's internal buffer.
-                // Data stays in the buffer until the sync point — one
-                // pwritev2+RWF_DSYNC replaces multiple pwrites + fdatasync.
+                // Data stays in the buffer until the write point — one
+                // O_DIRECT pwrite covers the entire batch.
                 // QueryStats/QueryPosition are not journaled (no state change).
                 // Checkpoint events are not encoded (each node auto-emits
                 // its own), but their chain hash is verified for divergence
@@ -612,8 +611,8 @@ impl<E: AppEvent> JournalStage<E> {
                         Self::publish_input_batch_to_rings(&mut self.repl, end_seq);
                     }
 
-                    // Persist mode: pwritev2+RWF_DSYNC; no-persist mode:
-                    // drop the buffer. `no-persist` means "skip the fsync
+                    // Persist mode: pwrite+O_DIRECT; no-persist mode:
+                    // drop the buffer. `no-persist` means "skip the write
                     // syscall," not "skip everything that follows."
                     #[cfg(not(feature = "no-persist"))]
                     {
@@ -887,10 +886,9 @@ impl<E: AppEvent> JournalStage<E> {
         }
     }
 
-    /// Overlapped io_uring journal loop: submits Write+RWF_DSYNC asynchronously
-    /// and accumulates the next batch in a second buffer while the NVMe FUA
-    /// write is in flight. Doubles effective throughput when journal I/O is
-    /// the bottleneck.
+    /// Overlapped io_uring journal loop: submits `Write` asynchronously and
+    /// accumulates the next batch in a second buffer while the NVMe write is
+    /// in flight. Doubles effective throughput when journal I/O is the bottleneck.
     ///
     /// Cursor only advances after the CQE confirms durability — the
     /// persist-before-ack guarantee is preserved.
@@ -963,8 +961,8 @@ impl<E: AppEvent> JournalStage<E> {
                 self.reap_inflight_on_shutdown(&mut ring, &mut inflight)?;
                 // Flush any pending buffered data through the same async path
                 // as steady-state — submit + reap one CQE — instead of falling
-                // back to a synchronous pwritev2. Keeps the production write
-                // path symmetric and removes the last sync-flush call from the
+                // back to a synchronous pwrite. Keeps the production write path
+                // symmetric and removes the last sync-flush call from the
                 // hot/critical lifecycle.
                 if pending > 0 {
                     if let Some(async_batch) = self.writer.take_batch_for_async_write()? {
