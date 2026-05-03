@@ -373,6 +373,8 @@ fn run_rumcast_primary_with_state(
         journal_stage,
         matching_stage,
         mut output_consumers,
+        events_processed,
+        input_cursor,
         journal_cursor,
         matching_cursor,
         replication_consumers,
@@ -381,6 +383,18 @@ fn run_rumcast_primary_with_state(
         replication_ring_progress,
         ..
     } = pipeline;
+
+    // Snapshot per-stage utilization handles before the stages move into
+    // their threads. The TCP path threads response_utilization through
+    // its dedicated response stage; rumcast has no equivalent (the
+    // session translator handles inbound + outbound on one thread), so
+    // we hand the health endpoint a fresh `StageUtilization` for it —
+    // it stays at zero, which is honest: there is no separate response
+    // stage to measure.
+    let journal_utilization = journal_stage.utilization();
+    let matching_utilization = matching_stage.utilization();
+    let response_utilization = Arc::new(melin_transport_core::pipeline::StageUtilization::new());
+    let pipeline_healthy = Arc::new(AtomicBool::new(true));
 
     let response_consumer = output_consumers
         .pop()
@@ -503,6 +517,19 @@ fn run_rumcast_primary_with_state(
     // a replica that connects after seeding still catches up via
     // journal-file scan on its handshake — same model as TCP.
     let replica_ready = Arc::new(AtomicBool::new(false));
+    // Health-snapshot handles populated below when replication is
+    // enabled; left None in standalone. Mirrors the TCP path's
+    // shape so the `/healthz` endpoint reports the same fields
+    // regardless of transport.
+    let mut replication_metrics_for_health: Option<Arc<crate::replication::ReplicationMetrics>> =
+        None;
+    let mut replication_ring_producer_cursors: Option<
+        [Arc<dyn melin_disruptor::ring::QueueCursor>; 2],
+    > = None;
+    let mut replication_ring_consumer_cursors: Option<
+        [Arc<melin_disruptor::padding::Sequence>; 2],
+    > = None;
+    let mut fastest_replica_cursor_for_health: Option<Arc<AtomicU64>> = None;
     if let Some((repl_consumer_1, repl_consumer_2)) = replication_consumers {
         let repl_bind = config
             .replication_bind
@@ -513,6 +540,15 @@ fn run_rumcast_primary_with_state(
             .clone()
             .ok_or("replicas_connected must be Some when replication is enabled")?;
         let metrics = Arc::new(crate::replication::ReplicationMetrics::default());
+        replication_metrics_for_health = Some(Arc::clone(&metrics));
+        replication_ring_producer_cursors = Some([
+            Arc::clone(&progress.producer_cursors[0]),
+            Arc::clone(&progress.producer_cursors[1]),
+        ]);
+        replication_ring_consumer_cursors = Some([
+            Arc::clone(&progress.consumer_cursors[0]),
+            Arc::clone(&progress.consumer_cursors[1]),
+        ]);
 
         let s_repl = Arc::clone(&shutdown);
         let ready_flag = Arc::clone(&replica_ready);
@@ -537,6 +573,7 @@ fn run_rumcast_primary_with_state(
         // fresh AtomicU64 it writes to but nothing reads from. This
         // keeps the sender API uniform across transports.
         let fastest_for_sender = Arc::new(AtomicU64::new(0));
+        fastest_replica_cursor_for_health = Some(Arc::clone(&fastest_for_sender));
         let connected_for_thread = Arc::clone(&connected);
         let ready_for_thread = Arc::clone(&ready_flag);
         let s_for_thread = Arc::clone(&s_repl);
@@ -575,6 +612,39 @@ fn run_rumcast_primary_with_state(
             info!("running rumcast in standalone mode (no replication)");
         }
     }
+
+    // ---- Health endpoint ----
+    //
+    // Spawned before seeding so operators (and the failover test
+    // harness) can probe `/healthz` to confirm the server has bound
+    // its sockets and is past replication setup. Mirrors the TCP
+    // path's behaviour — `--health-bind` is no longer silently
+    // ignored under `--features rumcast`.
+    let health_handle = if let Some(health_addr) = config.health_bind {
+        Some(crate::health::spawn(
+            health_addr,
+            crate::health::HealthState {
+                active_connections: Arc::clone(&active_connections),
+                events_processed: Arc::clone(&events_processed),
+                journal_cursor: Arc::clone(&journal_cursor),
+                matching_cursor: Arc::clone(&matching_cursor),
+                input_cursor,
+                replication_cursor: Arc::clone(&replication_cursor),
+                pipeline_healthy: Arc::clone(&pipeline_healthy),
+                replicas_connected: replicas_connected.clone(),
+                replication_metrics: replication_metrics_for_health,
+                replication_ring_producer_cursors,
+                replication_ring_consumer_cursors,
+                fastest_replica_cursor: fastest_replica_cursor_for_health,
+                journal_utilization: Arc::clone(&journal_utilization),
+                matching_utilization: Arc::clone(&matching_utilization),
+                response_utilization: Arc::clone(&response_utilization),
+            },
+            Arc::clone(&shutdown),
+        )?)
+    } else {
+        None
+    };
 
     // ---- Seed accounts and instruments on first startup ----
     //
@@ -644,6 +714,11 @@ fn run_rumcast_primary_with_state(
         if let Err(e) = h.join() {
             warn!(?e, "thread join error");
         }
+    }
+    if let Some(h) = health_handle
+        && let Err(e) = h.join()
+    {
+        warn!(?e, "health thread join error");
     }
     info!("rumcast standalone server stopped");
     Ok(())

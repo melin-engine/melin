@@ -196,6 +196,30 @@ fn wait_halted(addr: SocketAddr, timeout: Duration) {
     }
 }
 
+/// Wait for the primary's replication endpoint to be ready to accept
+/// inbound connections from replicas. Polls the *health* endpoint
+/// rather than the replication port directly so the same helper works
+/// regardless of replication transport — TCP (default features) and
+/// rumcast (UDP) both bind their replication socket during the same
+/// startup phase as the health endpoint, so a responsive `/healthz`
+/// is a reliable proxy for "replica may now connect".
+///
+/// Replaces older per-call `TcpStream::connect_timeout` probes that
+/// silently failed under `--features rumcast` because rumcast
+/// replication binds UDP, not TCP.
+fn wait_for_primary_repl_ready(health_addr: SocketAddr, timeout: Duration) {
+    let start = Instant::now();
+    loop {
+        if start.elapsed() > timeout {
+            panic!("primary {health_addr} never became ready for replica connections");
+        }
+        if query_health(health_addr).is_ok() {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
 /// Query the health endpoint once. Returns (conns, journal_seq, repl_lag, trading).
 fn query_health(addr: SocketAddr) -> Result<(u64, u64, u64, bool), Box<dyn std::error::Error>> {
     let mut stream = TcpStream::connect_timeout(&addr, Duration::from_secs(1))?;
@@ -542,18 +566,8 @@ impl TestCluster {
             primary_repl_port,
         );
 
-        // Wait for the primary's replication port before starting replica.
-        let repl_addr: SocketAddr = format!("127.0.0.1:{primary_repl_port}").parse().unwrap();
-        let start = Instant::now();
-        loop {
-            if TcpStream::connect_timeout(&repl_addr, Duration::from_millis(100)).is_ok() {
-                break;
-            }
-            if start.elapsed() > Duration::from_secs(10) {
-                panic!("primary replication port never became available");
-            }
-            std::thread::sleep(Duration::from_millis(50));
-        }
+        // Wait for the primary to be ready to accept replica connections.
+        wait_for_primary_repl_ready(primary.health_addr, Duration::from_secs(10));
 
         let replica = spawn_replica(
             &bin,
@@ -1224,18 +1238,8 @@ impl DualCluster {
             primary_repl_port,
         );
 
-        // Wait for replication port.
-        let repl_addr: SocketAddr = format!("127.0.0.1:{primary_repl_port}").parse().unwrap();
-        let start = Instant::now();
-        loop {
-            if TcpStream::connect_timeout(&repl_addr, Duration::from_millis(100)).is_ok() {
-                break;
-            }
-            if start.elapsed() > Duration::from_secs(10) {
-                panic!("primary replication port never became available");
-            }
-            std::thread::sleep(Duration::from_millis(50));
-        }
+        // Wait for the primary to be ready to accept replica connections.
+        wait_for_primary_repl_ready(primary.health_addr, Duration::from_secs(10));
 
         let replica1 = spawn_replica_named_with_extra(
             &bin,
@@ -2272,18 +2276,8 @@ fn snapshot_transfer_when_archives_purged() {
         }
     };
 
-    // Wait for the replication port before starting replica.
-    let repl_addr: SocketAddr = format!("127.0.0.1:{primary_repl_port2}").parse().unwrap();
-    let start = Instant::now();
-    loop {
-        if TcpStream::connect_timeout(&repl_addr, Duration::from_millis(100)).is_ok() {
-            break;
-        }
-        if start.elapsed() > Duration::from_secs(10) {
-            panic!("primary replication port never became available");
-        }
-        std::thread::sleep(Duration::from_millis(50));
-    }
+    // Wait for the primary to be ready to accept replica connections.
+    wait_for_primary_repl_ready(primary2.health_addr, Duration::from_secs(10));
 
     // Start a fresh replica. It has last_sequence=0, but the primary
     // recovered from snapshot (journal starts after snapshot sequence).

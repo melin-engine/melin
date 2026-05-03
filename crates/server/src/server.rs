@@ -1003,6 +1003,63 @@ fn run_as_primary<L: BlockingTransportListener>(
     // thread after catch-up completes and it enters the live streaming
     // loop — this ensures the ring consumer is actively draining before
     // seeds start flowing.
+    // Spawn the health endpoint BEFORE the wait-for-replica gate so
+    // operators (and the failover test harness) can probe `/healthz`
+    // to confirm the server has bound its sockets and is ready to
+    // accept replica connections — even though seeding hasn't started
+    // yet. The health snapshot legitimately reports `halted` while
+    // waiting for the first replica; that's accurate, not a
+    // misreport. Replicas connect to the *replication* endpoint, not
+    // the client port, so spawning health here doesn't change accept
+    // semantics.
+    let pipeline_healthy = Arc::new(AtomicBool::new(true));
+    let health_handle = if let Some(health_addr) = config.health_bind {
+        // Clone the replication ring cursors so the health snapshot can
+        // report per-slot ring depth (producer_cursor - consumer.processed).
+        // Both cursor types are `Arc`-backed, so cloning is cheap.
+        let (repl_ring_producers, repl_ring_consumers) = replication_ring_progress
+            .as_ref()
+            .map(|rp| {
+                (
+                    Some([
+                        Arc::clone(&rp.producer_cursors[0]),
+                        Arc::clone(&rp.producer_cursors[1]),
+                    ]),
+                    Some([
+                        Arc::clone(&rp.consumer_cursors[0]),
+                        Arc::clone(&rp.consumer_cursors[1]),
+                    ]),
+                )
+            })
+            .unwrap_or((None, None));
+        let fastest_repl_cursor_health = replication_metrics
+            .as_ref()
+            .map(|_| Arc::clone(&fastest_replica_cursor));
+        Some(crate::health::spawn(
+            health_addr,
+            crate::health::HealthState {
+                active_connections: Arc::clone(&active_connections),
+                events_processed: Arc::clone(&events_processed),
+                journal_cursor: Arc::clone(&journal_cursor),
+                matching_cursor: Arc::clone(&matching_cursor),
+                input_cursor,
+                replication_cursor: Arc::clone(&replication_cursor),
+                pipeline_healthy: Arc::clone(&pipeline_healthy),
+                replicas_connected: replicas_connected.clone(),
+                replication_metrics: replication_metrics.clone(),
+                replication_ring_producer_cursors: repl_ring_producers,
+                replication_ring_consumer_cursors: repl_ring_consumers,
+                fastest_replica_cursor: fastest_repl_cursor_health,
+                journal_utilization: Arc::clone(&journal_utilization),
+                matching_utilization: Arc::clone(&matching_utilization),
+                response_utilization: Arc::clone(&response_utilization),
+            },
+            Arc::clone(&shutdown),
+        )?)
+    } else {
+        None
+    };
+
     if enable_replication && needs_seeding {
         info!("waiting for replica to connect before seeding...");
         while !replica_ready.load(Ordering::Acquire) {
@@ -1160,59 +1217,9 @@ fn run_as_primary<L: BlockingTransportListener>(
         Arc::clone(&reader_shutdown),
     );
 
-    // Pipeline health flag: true while all pipeline threads are alive.
-    // Flipped to false when a thread dies or on shutdown. Read by the
-    // health endpoint to distinguish OK from ERR.
-    let pipeline_healthy = Arc::new(AtomicBool::new(true));
-
-    // Spawn health/liveness endpoint before the accept loop so it's
-    // reachable as soon as the server is ready to accept connections.
-    let health_handle = if let Some(health_addr) = config.health_bind {
-        // Clone the replication ring cursors so the health snapshot can
-        // report per-slot ring depth (producer_cursor - consumer.processed).
-        // Both cursor types are `Arc`-backed, so cloning is cheap.
-        let (repl_ring_producers, repl_ring_consumers) = replication_ring_progress
-            .as_ref()
-            .map(|rp| {
-                (
-                    Some([
-                        Arc::clone(&rp.producer_cursors[0]),
-                        Arc::clone(&rp.producer_cursors[1]),
-                    ]),
-                    Some([
-                        Arc::clone(&rp.consumer_cursors[0]),
-                        Arc::clone(&rp.consumer_cursors[1]),
-                    ]),
-                )
-            })
-            .unwrap_or((None, None));
-        let fastest_repl_cursor_health = replication_metrics
-            .as_ref()
-            .map(|_| Arc::clone(&fastest_replica_cursor));
-        Some(crate::health::spawn(
-            health_addr,
-            crate::health::HealthState {
-                active_connections: Arc::clone(&active_connections),
-                events_processed: Arc::clone(&events_processed),
-                journal_cursor: Arc::clone(&journal_cursor),
-                matching_cursor: Arc::clone(&matching_cursor),
-                input_cursor,
-                replication_cursor: Arc::clone(&replication_cursor),
-                pipeline_healthy: Arc::clone(&pipeline_healthy),
-                replicas_connected: replicas_connected.clone(),
-                replication_metrics: replication_metrics.clone(),
-                replication_ring_producer_cursors: repl_ring_producers,
-                replication_ring_consumer_cursors: repl_ring_consumers,
-                fastest_replica_cursor: fastest_repl_cursor_health,
-                journal_utilization: Arc::clone(&journal_utilization),
-                matching_utilization: Arc::clone(&matching_utilization),
-                response_utilization: Arc::clone(&response_utilization),
-            },
-            Arc::clone(&shutdown),
-        )?)
-    } else {
-        None
-    };
+    // Health endpoint and `pipeline_healthy` were already spawned/created
+    // earlier (before the wait-for-replica gate) so probes can succeed
+    // before seeding completes.
 
     // Set the listener to non-blocking so accept() returns immediately
     // with WouldBlock when no connection is pending. This lets the accept
