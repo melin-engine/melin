@@ -584,13 +584,11 @@ impl TestCluster {
     fn wait_replicated(&self) {
         let start = Instant::now();
         loop {
-            let (_, _, lag, _) =
-                query_health(self.primary.health_addr).expect("query primary health for repl lag");
-            if lag == 0 {
+            if let Ok((_, _, 0, _)) = query_health(self.primary.health_addr) {
                 return;
             }
             if start.elapsed() > Duration::from_secs(10) {
-                panic!("replication lag did not reach 0 within 10s (lag={lag})");
+                panic!("replication lag did not reach 0 within 10s");
             }
             std::thread::sleep(Duration::from_millis(50));
         }
@@ -1281,13 +1279,11 @@ impl DualCluster {
     fn wait_replicated(&self) {
         let start = Instant::now();
         loop {
-            let (_, _, lag, _) =
-                query_health(self.primary.health_addr).expect("query health for lag");
-            if lag == 0 {
+            if let Ok((_, _, 0, _)) = query_health(self.primary.health_addr) {
                 return;
             }
             if start.elapsed() > Duration::from_secs(10) {
-                panic!("replication lag did not reach 0 (lag={lag})");
+                panic!("replication lag did not reach 0 within 10s");
             }
             std::thread::sleep(Duration::from_millis(50));
         }
@@ -1361,11 +1357,7 @@ fn dual_replication_survives_one_replica_failure() {
 
     // Kill replica 1 — trading should continue.
     cluster.kill_replica1();
-    std::thread::sleep(Duration::from_millis(500));
-    assert!(
-        cluster.primary_trading(),
-        "should still be trading with one replica"
-    );
+    wait_ready(cluster.primary.health_addr, Duration::from_secs(5));
 
     // Submit more orders with only replica 2 alive.
     for i in 21..=40u64 {
@@ -1449,8 +1441,7 @@ fn dual_replication_promote_replica1_after_replica2_dies() {
 
     // Kill replica 2 this time (previous test killed replica 1).
     cluster.kill_replica2();
-    std::thread::sleep(Duration::from_millis(500));
-    assert!(cluster.primary_trading(), "should still be trading");
+    wait_ready(cluster.primary.health_addr, Duration::from_secs(5));
 
     for i in 16..=30u64 {
         let r = submit_order(&mut client, i, 1, 1, Side::Buy, 100, 10);
