@@ -54,7 +54,7 @@
 use std::io;
 use std::mem::MaybeUninit;
 use std::net::{Ipv4Addr, SocketAddr, UdpSocket};
-use std::os::unix::io::AsRawFd;
+use std::os::unix::io::{AsRawFd, RawFd};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
@@ -242,11 +242,21 @@ struct PollerHandle {
     shutdown: Arc<AtomicBool>,
     join: Mutex<Option<JoinHandle<()>>>,
     counters: Arc<EndpointCounters>,
+    /// `eventfd(2)` used to wake a consumer half blocked in
+    /// [`UdpTransport::park`]. The poller writes to it after pushing
+    /// frames into the SPSC; halves poll it during park. This bridges
+    /// the userspace SPSC handoff that io_uring's CQ-readiness signal
+    /// alone doesn't cover (io_uring's submit_with_args wakes the
+    /// poller, not the consumer thread).
+    wake_fd: RawFd,
 }
 
 impl Drop for PollerHandle {
     fn drop(&mut self) {
         self.shutdown.store(true, Ordering::Release);
+        // Wake the poller in case it's parked in submit_with_args, so
+        // it observes the shutdown flag promptly. (No-op if it's busy.)
+        wake_eventfd(self.wake_fd);
         if let Some(handle) = self.join.lock().expect("join mutex poisoned").take() {
             // Best-effort: if the poller panicked we just log. Park
             // / shutdown semantics don't depend on join success.
@@ -254,6 +264,37 @@ impl Drop for PollerHandle {
                 tracing::warn!(?e, "io_uring poller thread panicked");
             }
         }
+        // Close the eventfd. Best-effort — process exit would close
+        // it anyway.
+        unsafe {
+            libc::close(self.wake_fd);
+        }
+    }
+}
+
+/// Write `1` to a non-blocking eventfd. Errors (EAGAIN if the counter
+/// is at u64::MAX, which never happens in practice) are swallowed —
+/// the only consequence is one missed wakeup, which is bounded by the
+/// half's park_timeout.
+#[inline]
+fn wake_eventfd(fd: RawFd) {
+    let val: u64 = 1;
+    // Safety: writing 8 bytes to an eventfd is the documented API.
+    unsafe {
+        let _ = libc::write(fd, &val as *const _ as *const libc::c_void, 8);
+    }
+}
+
+/// Drain pending wakeups from the eventfd by reading its accumulated
+/// counter (single 8-byte read resets to 0). Non-blocking: returns
+/// silently if the counter is already 0.
+#[inline]
+fn drain_eventfd(fd: RawFd) {
+    let mut val: u64 = 0;
+    // Safety: reading 8 bytes from an eventfd is the documented API.
+    // EAGAIN (counter == 0) is the expected idle case.
+    unsafe {
+        let _ = libc::read(fd, &mut val as *mut _ as *mut libc::c_void, 8);
     }
 }
 
@@ -281,6 +322,15 @@ impl IoUringEndpoint {
         // stall, and any misuse outside io_uring fails loudly rather
         // than silently blocking.
         socket.set_nonblocking(true)?;
+
+        // Eventfd used by the poller to wake any consumer half that's
+        // currently parked. NONBLOCK so the drain path never blocks;
+        // CLOEXEC for hygiene.
+        // Safety: eventfd(2) returns a fresh fd or -1 on error.
+        let wake_fd: RawFd = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK) };
+        if wake_fd < 0 {
+            return Err(io::Error::last_os_error());
+        }
 
         // Build the ring on this thread so init failures surface as
         // a normal `io::Result` to the caller.
@@ -323,6 +373,7 @@ impl IoUringEndpoint {
             shutdown: Arc::clone(&shutdown),
             counters: Arc::clone(&counters),
             cfg: cfg.clone(),
+            wake_fd,
         };
 
         let join = std::thread::Builder::new()
@@ -331,6 +382,7 @@ impl IoUringEndpoint {
 
         let poller = Arc::new(PollerHandle {
             shutdown,
+            wake_fd,
             join: Mutex::new(Some(join)),
             counters,
         });
@@ -377,6 +429,7 @@ struct PollerState {
     shutdown: Arc<AtomicBool>,
     counters: Arc<EndpointCounters>,
     cfg: EndpointConfig,
+    wake_fd: RawFd,
 }
 
 fn run_poller(state: PollerState) {
@@ -389,6 +442,7 @@ fn run_poller(state: PollerState) {
         shutdown,
         counters,
         cfg,
+        wake_fd,
     } = state;
 
     if let Some(core) = cfg.poller_core
@@ -408,6 +462,7 @@ fn run_poller(state: PollerState) {
         let mut work_done = false;
 
         // Harvest CQEs.
+        let mut frames_pushed_this_iter = 0u32;
         {
             let cq: io_uring::cqueue::CompletionQueue<'_, Cqe> = ring.completion();
             for cqe in cq {
@@ -423,15 +478,26 @@ fn run_poller(state: PollerState) {
                 let slot = &slots[slot_idx];
                 let from = sockaddr_to_socket_addr(&slot.name);
                 let bytes = &slot.buf[..len];
-                dispatch_frame(
+                let pushed = dispatch_frame(
                     &mut send_producer,
                     &mut recv_producer,
                     &counters,
                     from,
                     bytes,
                 );
+                if pushed {
+                    frames_pushed_this_iter += 1;
+                }
                 pending_resubmit.push(slot_idx);
             }
+        }
+        // Wake any consumer parked in `EndpointSend::park` /
+        // `EndpointRecv::park`. One eventfd write per harvest pass
+        // (not per frame) — eventfd accumulates, a single read drains.
+        // This is the userspace bridge io_uring's submit_with_args
+        // doesn't provide on its own.
+        if frames_pushed_this_iter > 0 {
+            wake_eventfd(wake_fd);
         }
 
         // Stage resubmits.
@@ -491,10 +557,9 @@ fn run_poller(state: PollerState) {
 }
 
 /// Classify a frame and push to the matching SPSC, or count the drop.
-/// Uses the SPSC `try_claim` / `commit` in-place pattern so the
-/// payload is copied straight from the kernel's `RecvSlot` buffer
-/// into the ring slot — no intermediate stack-resident `Frame`,
-/// no zeroing of the unused tail.
+/// Returns `true` if the frame was successfully published to a
+/// consumer ring (so the caller can issue one eventfd wake per
+/// harvest batch instead of per frame).
 #[inline]
 fn dispatch_frame(
     send_producer: &mut Producer<Frame>,
@@ -502,19 +567,20 @@ fn dispatch_frame(
     counters: &EndpointCounters,
     from: SocketAddr,
     bytes: &[u8],
-) {
+) -> bool {
     let (producer, pushed_counter, dropped_counter) = match classify(bytes) {
         Direction::Recv => (recv_producer, &counters.recv_pushed, &counters.recv_dropped),
         Direction::Send => (send_producer, &counters.send_pushed, &counters.send_dropped),
         Direction::Drop => {
             counters.parse_dropped.fetch_add(1, Ordering::Relaxed);
-            return;
+            return false;
         }
     };
 
     match producer.try_claim() {
         None => {
             dropped_counter.fetch_add(1, Ordering::Relaxed);
+            false
         }
         Some(claim) => {
             // Safety: claim hands us writable, properly-aligned memory
@@ -525,6 +591,7 @@ fn dispatch_frame(
                 claim.commit();
             }
             pushed_counter.fetch_add(1, Ordering::Relaxed);
+            true
         }
     }
 }
@@ -606,6 +673,10 @@ impl UdpTransport for EndpointSend {
     fn leave_multicast_v4(&self, group: Ipv4Addr, iface: Ipv4Addr) -> io::Result<()> {
         self.socket.leave_multicast_v4(&group, &iface)
     }
+
+    fn park(&self, timeout: Duration) {
+        park_on_eventfd(&self.consumer, self.poller.wake_fd, timeout);
+    }
 }
 
 impl UdpTransport for EndpointRecv {
@@ -638,6 +709,50 @@ impl UdpTransport for EndpointRecv {
     fn leave_multicast_v4(&self, group: Ipv4Addr, iface: Ipv4Addr) -> io::Result<()> {
         self.socket.leave_multicast_v4(&group, &iface)
     }
+
+    fn park(&self, timeout: Duration) {
+        park_on_eventfd(&self.consumer, self.poller.wake_fd, timeout);
+    }
+}
+
+/// Event-driven park: returns immediately if the SPSC consumer
+/// already has frames; otherwise waits on the poller's eventfd
+/// up to `timeout`. The poller writes one byte to the eventfd
+/// per harvest pass that pushed at least one frame, so the
+/// caller wakes within microseconds of frame arrival rather
+/// than sleeping the full timeout.
+///
+/// io_uring already wakes its own poller via `submit_with_args`,
+/// but that's the kernel→poller signal. The poller→consumer
+/// handoff is a userspace SPSC ring, which io_uring doesn't see;
+/// the eventfd plugs that gap.
+fn park_on_eventfd(consumer: &Mutex<Consumer<Frame>>, wake_fd: RawFd, timeout: Duration) {
+    // Fast path: SPSC already non-empty (poller pushed before we
+    // got here, or another caller's wakeup is still pending).
+    {
+        let g = consumer.lock().expect("consumer mutex poisoned");
+        if !g.is_empty() {
+            return;
+        }
+    }
+    // Slow path: poll(2) on the eventfd. Capped at i32::MAX ms
+    // (~25 days) to fit poll's signed-int timeout.
+    let timeout_ms = timeout.as_millis().min(i32::MAX as u128) as libc::c_int;
+    let mut pfd = libc::pollfd {
+        fd: wake_fd,
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    // Safety: pfd is a valid pointer to one initialized pollfd.
+    // Errors (EINTR, EFAULT) are ignored — the caller will recheck
+    // the SPSC on the next iteration regardless.
+    unsafe {
+        libc::poll(&mut pfd, 1, timeout_ms);
+    }
+    // Drain whatever the poller wrote so the next park doesn't
+    // wake immediately on a stale signal. Non-blocking; EAGAIN is
+    // the expected idle case.
+    drain_eventfd(wake_fd);
 }
 
 /// Counters for diagnostics: `(recv_pushed, send_pushed, recv_dropped,
