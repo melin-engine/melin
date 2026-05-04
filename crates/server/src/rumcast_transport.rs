@@ -869,6 +869,15 @@ struct DiagCounters {
     publish_pending_session_evicted: u64,
     pending_publish_held: u64,
     pending_outbound_held: u64,
+    // Per-stage cumulative wall time, ns. Lets us see which of the
+    // four serialised stages owns the rumcast-session thread. Each
+    // measurement adds two `Instant::now()` calls (~20ns on x86 vDSO),
+    // tolerable while RUMCAST_DIAG=1 is set.
+    recv_tick_ns: u64,
+    send_tick_ns: u64,
+    poll_ns: u64,
+    outbound_ns: u64,
+    idle_ns: u64,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -927,8 +936,16 @@ fn session_translator(
         // UDP into per-session sublogs / out of per-session publogs
         // and processes NAK/SM control frames. They're cheap when
         // idle and proportional to per-session work otherwise.
+        // Rolling clock for per-stage attribution. One `Instant::now()`
+        // per stage boundary — cheap on x86 vDSO but not free, so we
+        // keep the call count to the minimum needed (5 per iter total).
+        let stage_start = Instant::now();
         let recv_stats = muxed_receiver.tick();
+        let after_recv = Instant::now();
         let send_stats = muxed_sender.tick();
+        let after_send = Instant::now();
+        diag.recv_tick_ns += after_recv.duration_since(stage_start).as_nanos() as u64;
+        diag.send_tick_ns += after_send.duration_since(after_recv).as_nanos() as u64;
         diag.recv_frags += recv_stats.fragments_accepted as u64;
         diag.recv_bytes += recv_stats.bytes_received;
         diag.recv_dropped += recv_stats.fragments_dropped as u64;
@@ -997,7 +1014,12 @@ fn session_translator(
         // Both cases evict from the auth table AND both muxers
         // — otherwise the session's sublog/publog memory would pin
         // until process restart.
-        let now = Instant::now();
+        // `after_poll` doubles as the post-poll timing boundary AND
+        // the wall-clock reference for the sweep below — a single
+        // `Instant::now()` covers both purposes.
+        let after_poll = Instant::now();
+        diag.poll_ns += after_poll.duration_since(after_send).as_nanos() as u64;
+        let now = after_poll;
         if now.duration_since(last_sweep_at) >= SWEEP_INTERVAL {
             let mut expired: Vec<u32> = Vec::new();
             sessions.retain(|session_id, stage| match stage {
@@ -1043,9 +1065,93 @@ fn session_translator(
         // and retry next iteration — never block, since this thread
         // also drains the SMs that advance publisher_limit.
 
-        // Stage 2: drain a previously-encoded envelope first.
-        if let Some((session_id, env_len)) = pending_publish {
-            diag.pending_publish_held += 1;
+        // Outbound coalescing: drain up to OUTBOUND_BATCH OutputSlots
+        // into per-session publogs in one iter so the next `tick` ships
+        // them in a single sendmmsg. Without this, each iter publishes
+        // one fragment and the subsequent tick sends a 1-packet
+        // sendmmsg (wasted batching capacity, ~91K syscalls/sec at
+        // saturation). The batch is bounded so a stream of responses
+        // can't starve `tick`/`poll`/idle bookkeeping.
+        const OUTBOUND_BATCH: u32 = 32;
+        for _ in 0..OUTBOUND_BATCH {
+            // Stage 2: drain a previously-encoded envelope first.
+            if let Some((session_id, env_len)) = pending_publish {
+                diag.pending_publish_held += 1;
+                match sessions.get(&session_id) {
+                    Some(AuthStage::Authenticated { pub_log, .. }) => {
+                        match pub_log.try_claim(env_len as u32) {
+                            Ok(mut claim) => {
+                                claim
+                                    .payload_mut()
+                                    .copy_from_slice(&envelope_buf[..env_len]);
+                                claim.publish(data_flags::UNFRAGMENTED);
+                                pending_publish = None;
+                                diag.publish_pending_ok += 1;
+                                did_work = true;
+                            }
+                            Err(_) => {
+                                // Publog still full — `tick` needs to drain
+                                // it before we can publish anything else.
+                                diag.publish_pending_backpressured += 1;
+                                break;
+                            }
+                        }
+                    }
+                    _ => {
+                        pending_publish = None;
+                        diag.publish_pending_session_evicted += 1;
+                    }
+                }
+            }
+
+            // Stage 1: encode + publish a new outbound slot. Skipped
+            // when a pending envelope still occupies envelope_buf.
+            if pending_publish.is_some() {
+                break;
+            }
+            if pending_outbound.is_none()
+                && let Some((_, slot)) = output_consumer.try_consume()
+            {
+                pending_outbound = Some(slot);
+                diag.outputs_consumed += 1;
+                did_work = true;
+            }
+            let Some(slot) = pending_outbound.as_ref() else {
+                // Nothing to consume — coalescing is done for this iter.
+                break;
+            };
+            // Seed events (connection_id=0) come from `seed_and_drain`.
+            // No client to route them to — drop.
+            if slot.connection_id == 0 {
+                pending_outbound = None;
+                diag.outputs_seed_dropped += 1;
+                did_work = true;
+                continue;
+            }
+            if crate::response::durable_pos(
+                journal_cursor.get().load(Ordering::Acquire),
+                replication_cursor.load(Ordering::Acquire),
+                fastest_replica_cursor.load(Ordering::Acquire),
+                quorum_durability,
+            ) <= slot.input_seq
+            {
+                // Not durable yet; leave pending, retry next outer iter.
+                diag.outputs_journal_blocked += 1;
+                diag.pending_outbound_held += 1;
+                break;
+            }
+            let slot = pending_outbound.take().expect("checked is_some above");
+            diag.encode_attempts += 1;
+            let Some(env_len) =
+                encode_outbound(&slot, &mut sessions, &mut response_buf, &mut envelope_buf)
+            else {
+                diag.encode_returned_none += 1;
+                did_work = true;
+                continue;
+            };
+            // Try the first publish inline so the common (uncongested)
+            // case avoids a loop iteration.
+            let session_id = slot.connection_id as u32;
             match sessions.get(&session_id) {
                 Some(AuthStage::Authenticated { pub_log, .. }) => {
                     match pub_log.try_claim(env_len as u32) {
@@ -1054,94 +1160,26 @@ fn session_translator(
                                 .payload_mut()
                                 .copy_from_slice(&envelope_buf[..env_len]);
                             claim.publish(data_flags::UNFRAGMENTED);
-                            pending_publish = None;
-                            diag.publish_pending_ok += 1;
-                            did_work = true;
+                            diag.publish_inline_ok += 1;
                         }
                         Err(_) => {
-                            // Backpressure: leave pending, try next loop.
-                            diag.publish_pending_backpressured += 1;
+                            // Pub_log full — defer; outer loop will
+                            // retry stage 2 next iter once tick drains.
+                            pending_publish = Some((session_id, env_len));
+                            diag.publish_inline_backpressured += 1;
                         }
                     }
                 }
                 _ => {
-                    // Session evicted (auth timeout or peer disconnect)
-                    // between encode and publish. Drop the response.
-                    pending_publish = None;
-                    diag.publish_pending_session_evicted += 1;
+                    // Race: session evicted between encode and publish.
+                    diag.publish_inline_no_session += 1;
                 }
             }
+            did_work = true;
         }
 
-        // Stage 1: only encode a new outbound slot when no publish
-        // is pending — otherwise we'd clobber the envelope buffer.
-        if pending_publish.is_none() {
-            if pending_outbound.is_none()
-                && let Some((_, slot)) = output_consumer.try_consume()
-            {
-                pending_outbound = Some(slot);
-                diag.outputs_consumed += 1;
-                did_work = true;
-            }
-            if let Some(slot) = pending_outbound.as_ref() {
-                // Seed events (connection_id=0) come from `seed_and_drain`.
-                // No client to route them to — drop.
-                if slot.connection_id == 0 {
-                    pending_outbound = None;
-                    diag.outputs_seed_dropped += 1;
-                    // Mark progress so the loop immediately tries to
-                    // consume the next slot — otherwise yield-idle mode
-                    // would sleep 10µs per dropped seed event, turning
-                    // ~hundred-event seed_and_drain into ~ms latency.
-                    did_work = true;
-                } else if crate::response::durable_pos(
-                    journal_cursor.get().load(Ordering::Acquire),
-                    replication_cursor.load(Ordering::Acquire),
-                    fastest_replica_cursor.load(Ordering::Acquire),
-                    quorum_durability,
-                ) > slot.input_seq
-                {
-                    let slot = pending_outbound.take().expect("checked is_some above");
-                    diag.encode_attempts += 1;
-                    if let Some(env_len) =
-                        encode_outbound(&slot, &mut sessions, &mut response_buf, &mut envelope_buf)
-                    {
-                        // Try the first publish inline so the common
-                        // (uncongested) case avoids a loop iteration.
-                        let session_id = slot.connection_id as u32;
-                        match sessions.get(&session_id) {
-                            Some(AuthStage::Authenticated { pub_log, .. }) => {
-                                match pub_log.try_claim(env_len as u32) {
-                                    Ok(mut claim) => {
-                                        claim
-                                            .payload_mut()
-                                            .copy_from_slice(&envelope_buf[..env_len]);
-                                        claim.publish(data_flags::UNFRAGMENTED);
-                                        diag.publish_inline_ok += 1;
-                                    }
-                                    Err(_) => {
-                                        // Pub_log full — defer.
-                                        pending_publish = Some((session_id, env_len));
-                                        diag.publish_inline_backpressured += 1;
-                                    }
-                                }
-                            }
-                            _ => {
-                                // Race: session evicted between encode and publish.
-                                diag.publish_inline_no_session += 1;
-                            }
-                        }
-                    } else {
-                        diag.encode_returned_none += 1;
-                    }
-                    did_work = true;
-                } else {
-                    diag.outputs_journal_blocked += 1;
-                    diag.pending_outbound_held += 1;
-                }
-                // else: not durable yet, leave pending and re-check next loop.
-            }
-        }
+        let after_outbound = Instant::now();
+        diag.outbound_ns += after_outbound.duration_since(after_poll).as_nanos() as u64;
 
         // ---- Idle ----
         if !did_work {
@@ -1151,14 +1189,25 @@ fn session_translator(
             } else {
                 std::hint::spin_loop();
             }
+            // One more `Instant::now()` to attribute idle time. Only
+            // taken on the idle path so the busy hot-loop stays at 5
+            // calls per iter; idle iters get 6.
+            diag.idle_ns += after_outbound.elapsed().as_nanos() as u64;
         }
 
         // ---- Diagnostic dump ----
         if diag_enabled {
             let now = Instant::now();
             if now.duration_since(diag_last_dump) >= Duration::from_secs(1) {
+                // ms per stage = ns / 1_000_000. Sum across stages
+                // approximates per-second wall time on this thread; gap
+                // vs 1000ms is `Instant::now()` overhead + uninstrumented
+                // bookkeeping (counter accumulation, did_work, sweep).
+                let to_ms = |ns: u64| ns as f64 / 1_000_000.0;
                 eprintln!(
-                    "[rumcast-diag] iters={} idle={} recv_frags={} recv_bytes={} \
+                    "[rumcast-diag] iters={} idle={} \
+                     recv_ms={:.1} send_ms={:.1} poll_ms={:.1} out_ms={:.1} idle_ms={:.1} \
+                     recv_frags={} recv_bytes={} \
                      recv_dropped={} recv_errors={} setups_recv={} naks_sent={} \
                      sms_sent={} send_frags={} inbound_drained={} outputs_consumed={} \
                      seed_dropped={} journal_blocked={} encode_attempts={} encode_none={} \
@@ -1167,6 +1216,11 @@ fn session_translator(
                      pending_publish_held={} pending_outbound_held={} sessions={}",
                     diag.iters,
                     diag.idle_iters,
+                    to_ms(diag.recv_tick_ns),
+                    to_ms(diag.send_tick_ns),
+                    to_ms(diag.poll_ns),
+                    to_ms(diag.outbound_ns),
+                    to_ms(diag.idle_ns),
                     diag.recv_frags,
                     diag.recv_bytes,
                     diag.recv_dropped,
