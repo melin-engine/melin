@@ -55,7 +55,7 @@ use std::io;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::{Arc, Mutex};
 
-use crate::transport::{KernelUdp, UdpTransport};
+use crate::transport::{DatagramBuf, KernelUdp, UdpTransport};
 use crate::wire::{FrameView, parse_frame};
 
 /// Maximum frames queued for the OTHER half before we start dropping.
@@ -252,6 +252,16 @@ fn drain_until<T: UdpTransport>(
     }
 }
 
+/// Copy a `QueuedFrame` into a pre-allocated `DatagramBuf` slot.
+#[inline]
+fn fill_slot(slot: &mut DatagramBuf, frame: QueuedFrame) {
+    let buf = slot.as_mut_slice();
+    let n = frame.bytes.len().min(buf.len());
+    buf[..n].copy_from_slice(&frame.bytes[..n]);
+    slot.from = frame.from;
+    slot.len = n;
+}
+
 /// Try the local queue first; if empty, drain the socket dispatching
 /// non-matching frames to the other half. Common body for both
 /// halves' `recv_from`.
@@ -285,6 +295,49 @@ fn try_recv<T: UdpTransport>(
     }
 }
 
+/// Drain up to `slots.len()` frames into pre-allocated `DatagramBuf`
+/// slots for the given `direction`. Acquires `inner.queues` ONCE to
+/// drain the own-direction queue, then calls `drain_until` for any
+/// remaining capacity. Reduces lock acquisitions from N (default
+/// `recv_batch` loop) to at most 1 + remaining_slots.
+fn recv_batch_for<T: UdpTransport>(
+    inner: &SharedInner<T>,
+    direction: Direction,
+    slots: &mut [DatagramBuf],
+) -> io::Result<usize> {
+    // Phase 1: drain our own queue under one lock acquire.
+    let mut filled = {
+        let mut q = inner.queues.lock().expect("queues mutex poisoned");
+        let queue = match direction {
+            Direction::Recv => &mut q.recv,
+            Direction::Send => &mut q.send,
+            Direction::Drop => unreachable!(),
+        };
+        let mut count = 0;
+        while count < slots.len() {
+            match queue.pop_front() {
+                None => break,
+                Some(frame) => {
+                    fill_slot(&mut slots[count], frame);
+                    count += 1;
+                }
+            }
+        }
+        count
+    };
+    // Phase 2: drain the socket for any remaining slots.
+    while filled < slots.len() {
+        match drain_until(inner, direction)? {
+            None => break,
+            Some(frame) => {
+                fill_slot(&mut slots[filled], frame);
+                filled += 1;
+            }
+        }
+    }
+    Ok(filled)
+}
+
 impl<T: UdpTransport> UdpTransport for SharedUdpSend<T> {
     #[inline]
     fn send_to(&self, dst: SocketAddr, bytes: &[u8]) -> io::Result<usize> {
@@ -311,6 +364,10 @@ impl<T: UdpTransport> UdpTransport for SharedUdpSend<T> {
 
     fn recv_from(&self, buf: &mut [u8]) -> io::Result<Option<(SocketAddr, usize)>> {
         try_recv(&self.inner, Direction::Send, buf)
+    }
+
+    fn recv_batch(&self, slots: &mut [DatagramBuf]) -> io::Result<usize> {
+        recv_batch_for(&self.inner, Direction::Send, slots)
     }
 
     fn local_addr(&self) -> io::Result<SocketAddr> {
@@ -354,6 +411,10 @@ impl<T: UdpTransport> UdpTransport for SharedUdpRecv<T> {
 
     fn recv_from(&self, buf: &mut [u8]) -> io::Result<Option<(SocketAddr, usize)>> {
         try_recv(&self.inner, Direction::Recv, buf)
+    }
+
+    fn recv_batch(&self, slots: &mut [DatagramBuf]) -> io::Result<usize> {
+        recv_batch_for(&self.inner, Direction::Recv, slots)
     }
 
     fn local_addr(&self) -> io::Result<SocketAddr> {
