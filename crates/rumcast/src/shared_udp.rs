@@ -293,6 +293,14 @@ impl<T: UdpTransport> UdpTransport for SharedUdpSend<T> {
         self.inner.socket.send_to(dst, bytes)
     }
 
+    fn send_batch_to(&self, dst: SocketAddr, payloads: &[&[u8]]) -> io::Result<usize> {
+        self.inner.socket.send_batch_to(dst, payloads)
+    }
+
+    fn send_multi_to(&self, entries: &[(SocketAddr, &[u8])]) -> io::Result<usize> {
+        self.inner.socket.send_multi_to(entries)
+    }
+
     fn recv_from(&self, buf: &mut [u8]) -> io::Result<Option<(SocketAddr, usize)>> {
         try_recv(&self.inner, Direction::Send, buf)
     }
@@ -318,6 +326,14 @@ impl<T: UdpTransport> UdpTransport for SharedUdpRecv<T> {
     #[inline]
     fn send_to(&self, dst: SocketAddr, bytes: &[u8]) -> io::Result<usize> {
         self.inner.socket.send_to(dst, bytes)
+    }
+
+    fn send_batch_to(&self, dst: SocketAddr, payloads: &[&[u8]]) -> io::Result<usize> {
+        self.inner.socket.send_batch_to(dst, payloads)
+    }
+
+    fn send_multi_to(&self, entries: &[(SocketAddr, &[u8])]) -> io::Result<usize> {
+        self.inner.socket.send_multi_to(entries)
     }
 
     fn recv_from(&self, buf: &mut [u8]) -> io::Result<Option<(SocketAddr, usize)>> {

@@ -771,6 +771,10 @@ impl UdpTransport for EndpointSend {
         crate::transport::sendmmsg_to(self.socket.as_raw_fd(), dst, payloads)
     }
 
+    fn send_multi_to(&self, entries: &[(SocketAddr, &[u8])]) -> io::Result<usize> {
+        crate::transport::sendmmsg_multi_to(self.socket.as_raw_fd(), entries)
+    }
+
     #[inline]
     fn recv_from(&self, buf: &mut [u8]) -> io::Result<Option<(SocketAddr, usize)>> {
         consume_one(&self.consumer, buf)
@@ -809,6 +813,10 @@ impl UdpTransport for EndpointRecv {
 
     fn send_batch_to(&self, dst: SocketAddr, payloads: &[&[u8]]) -> io::Result<usize> {
         crate::transport::sendmmsg_to(self.socket.as_raw_fd(), dst, payloads)
+    }
+
+    fn send_multi_to(&self, entries: &[(SocketAddr, &[u8])]) -> io::Result<usize> {
+        crate::transport::sendmmsg_multi_to(self.socket.as_raw_fd(), entries)
     }
 
     #[inline]

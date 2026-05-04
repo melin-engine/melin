@@ -42,6 +42,32 @@ use crate::wire::{
 // observability tooling doesn't need to learn two shapes.
 pub use crate::sender::TickStats;
 
+/// Fragments to drain per session per sendmmsg round. Matches the
+/// single-session sender's BATCH; kept consistent so per-session
+/// max_drain_per_tick budgets work the same way.
+const DRAIN_BATCH: usize = 32;
+
+/// One fragment staged for the cross-session sendmmsg call in
+/// [`MuxedSender::tick`]. Data is copied into the flat
+/// `staging_data` buffer so no lifetime ties back to the pub_log.
+struct StagedFrag {
+    dst: SocketAddr,
+    /// Byte offset into `MuxedSender::staging_data`.
+    data_start: usize,
+    /// Payload length (wire bytes, not aligned).
+    len: usize,
+    /// Position advance: aligned frame size in the pub_log.
+    aligned: u32,
+}
+
+/// Per-session slice of `MuxedSender::send_staging` for the
+/// current tick, used in phase 3 to distribute the sent count.
+struct SessionSendRange {
+    session_id: u32,
+    start: usize,
+    count: usize,
+}
+
 /// Configuration for [`MuxedSender`]. Differs from the single-
 /// session [`crate::sender::SenderConfig`] in two ways:
 ///
@@ -164,6 +190,15 @@ pub struct MuxedSender<T: UdpTransport> {
     /// path. Sized to `max_control_per_tick`.
     batch_slots: Vec<DatagramBuf>,
     counters: Option<Arc<Counters>>,
+    /// Flat byte buffer for staged fragment data. Pre-allocated; grows
+    /// to steady state after the first tick, then `clear()` reuses
+    /// capacity. Avoids lifetime ties back to the pub_log term buffers.
+    staging_data: Vec<u8>,
+    /// Metadata for each staged fragment. Pre-allocated to
+    /// `max_sessions × DRAIN_BATCH` to eliminate hot-path allocation.
+    send_staging: Vec<StagedFrag>,
+    /// Per-session range within `send_staging` for the current tick.
+    session_ranges: Vec<SessionSendRange>,
 }
 
 impl<T: UdpTransport> MuxedSender<T> {
@@ -171,12 +206,19 @@ impl<T: UdpTransport> MuxedSender<T> {
         let batch_slots = (0..config.max_control_per_tick)
             .map(|_| DatagramBuf::new(2048))
             .collect();
+        let max_s = config.max_sessions as usize;
         Self {
             transport,
             config,
             sessions: HashMap::new(),
             batch_slots,
             counters: None,
+            // staging_data grows to steady state on the first tick;
+            // Vec::clear() preserves capacity so no re-alloc on
+            // subsequent ticks.
+            staging_data: Vec::new(),
+            send_staging: Vec::with_capacity(max_s * DRAIN_BATCH),
+            session_ranges: Vec::with_capacity(max_s),
         }
     }
 
@@ -252,6 +294,12 @@ impl<T: UdpTransport> MuxedSender<T> {
     /// socket and route by session_id, drain each session's
     /// PublicationLog, send periodic Setup/Heartbeat per session.
     /// Returns aggregated [`TickStats`] across sessions.
+    ///
+    /// Outbound data is sent in three phases:
+    /// 1. Stage fragments from all sessions into flat buffers (no send yet).
+    /// 2. One cross-session `send_multi_to` call — one `sendmmsg(2)`
+    ///    syscall for all sessions instead of one per session.
+    /// 3. Advance per-session `last_sent_position` based on sent count.
     pub fn tick(&mut self) -> TickStats {
         let mut stats = TickStats::default();
         self.drain_control(&mut stats);
@@ -262,8 +310,107 @@ impl<T: UdpTransport> MuxedSender<T> {
         let heartbeat_interval = self.config.heartbeat_interval;
         let stream_id = self.config.stream_id;
 
-        for (_session_id, session) in self.sessions.iter_mut() {
-            session.drain_data(&self.transport, &mut stats, max_drain);
+        // Phase 1: stage outbound fragments from every session.
+        self.staging_data.clear();
+        self.send_staging.clear();
+        self.session_ranges.clear();
+
+        for (session_id, session) in &self.sessions {
+            let stage_start = self.send_staging.len();
+            let mut probe_pos = session.last_sent_position;
+            let mut total_staged_aligned = 0u32;
+
+            'outer: loop {
+                let mut count = 0;
+                let mut aligned_this_round = 0u32;
+
+                while count < DRAIN_BATCH {
+                    let Some(fragment) = session.log.published_fragment(probe_pos) else {
+                        break;
+                    };
+                    let aligned = align_up(fragment.len() as u32, FRAGMENT_ALIGNMENT);
+                    if total_staged_aligned + aligned_this_round + aligned > max_drain {
+                        break;
+                    }
+                    let data_start = self.staging_data.len();
+                    self.staging_data.extend_from_slice(fragment);
+                    self.send_staging.push(StagedFrag {
+                        dst: session.dst,
+                        data_start,
+                        len: fragment.len(),
+                        aligned,
+                    });
+                    probe_pos += aligned as u64;
+                    aligned_this_round += aligned;
+                    count += 1;
+                }
+
+                if count == 0 {
+                    if probe_pos < session.log.publisher_position() {
+                        stats.partition_misses += 1;
+                    }
+                    break 'outer;
+                }
+
+                total_staged_aligned += aligned_this_round;
+                if total_staged_aligned >= max_drain {
+                    break;
+                }
+            }
+
+            let count = self.send_staging.len() - stage_start;
+            if count > 0 {
+                self.session_ranges.push(SessionSendRange {
+                    session_id: *session_id,
+                    start: stage_start,
+                    count,
+                });
+            }
+        }
+
+        // Phase 2: one cross-session sendmmsg call.
+        let total_sent = if !self.send_staging.is_empty() {
+            let staging_data = &self.staging_data;
+            let entries: Vec<(SocketAddr, &[u8])> = self
+                .send_staging
+                .iter()
+                .map(|f| (f.dst, &staging_data[f.data_start..f.data_start + f.len]))
+                .collect();
+            match self.transport.send_multi_to(&entries) {
+                Ok(n) => n,
+                Err(_) => {
+                    stats.send_errors += 1;
+                    0
+                }
+            }
+        } else {
+            0
+        };
+
+        // Phase 3: advance per-session positions based on sent count.
+        let mut remaining = total_sent;
+        let now_after_send = Instant::now();
+        for range in &self.session_ranges {
+            if remaining == 0 {
+                break;
+            }
+            let Some(session) = self.sessions.get_mut(&range.session_id) else {
+                continue;
+            };
+            let sent_this = remaining.min(range.count);
+            for f in &self.send_staging[range.start..range.start + sent_this] {
+                session.last_sent_position += f.aligned as u64;
+                stats.bytes_sent += f.len as u64;
+                stats.fragments_sent += 1;
+            }
+            if sent_this > 0 {
+                session.last_send_at = now_after_send;
+            }
+            remaining -= sent_this;
+        }
+
+        // Phase 4: periodic Setup/Heartbeat per session.
+        for session in self.sessions.values_mut() {
             session.maybe_send_periodic(
                 &self.transport,
                 &mut stats,
@@ -361,68 +508,6 @@ impl<T: UdpTransport> MuxedSender<T> {
 }
 
 impl SessionOutbound {
-    fn drain_data<T: UdpTransport>(
-        &mut self,
-        transport: &T,
-        stats: &mut TickStats,
-        max_drain_per_tick: u32,
-    ) {
-        // Stage up to BATCH fragments and ship via `send_batch_to`
-        // (one sendmmsg syscall on the kernel transport). See
-        // sender.rs::drain_data for the rationale; this is the
-        // muxed-session equivalent.
-        const BATCH: usize = 32;
-        let mut frags: [&[u8]; BATCH] = [&[]; BATCH];
-        let mut aligned_sizes: [u32; BATCH] = [0; BATCH];
-
-        let mut drained = 0u32;
-        while drained < max_drain_per_tick {
-            let mut count = 0usize;
-            let mut probe_pos = self.last_sent_position;
-            let mut staged_aligned: u32 = 0;
-            while count < BATCH && drained + staged_aligned < max_drain_per_tick {
-                let Some(fragment) = self.log.published_fragment(probe_pos) else {
-                    break;
-                };
-                let aligned = align_up(fragment.len() as u32, FRAGMENT_ALIGNMENT);
-                frags[count] = fragment;
-                aligned_sizes[count] = aligned;
-                probe_pos += aligned as u64;
-                staged_aligned += aligned;
-                count += 1;
-            }
-            if count == 0 {
-                // Discriminate "nothing new to send" from "we got
-                // rotated past our cursor".
-                if self.last_sent_position < self.log.publisher_position() {
-                    stats.partition_misses += 1;
-                }
-                break;
-            }
-
-            let sent = match transport.send_batch_to(self.dst, &frags[..count]) {
-                Ok(n) => n,
-                Err(_) => {
-                    stats.send_errors += 1;
-                    break;
-                }
-            };
-            if sent == 0 {
-                break;
-            }
-            for i in 0..sent {
-                self.last_sent_position += aligned_sizes[i] as u64;
-                stats.bytes_sent += frags[i].len() as u64;
-                stats.fragments_sent += 1;
-                drained += aligned_sizes[i];
-            }
-            self.last_send_at = Instant::now();
-            if sent < count {
-                break;
-            }
-        }
-    }
-
     fn handle_nak<T: UdpTransport>(
         &mut self,
         transport: &T,

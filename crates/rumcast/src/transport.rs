@@ -143,6 +143,62 @@ pub(crate) fn sendmmsg_to(fd: RawFd, dst: SocketAddr, payloads: &[&[u8]]) -> io:
     Ok(total)
 }
 
+/// Issue `sendmmsg(2)` against `fd` with per-message destinations.
+/// Each entry is `(dst, payload)`; messages may go to different
+/// addresses in one syscall. Returns the count accepted; on partial
+/// success the trailing error is swallowed so the caller retries.
+///
+/// Used by [`MuxedSender::tick`] to batch all sessions' outbound
+/// fragments in a single syscall rather than one per session.
+pub(crate) fn sendmmsg_multi_to(fd: RawFd, entries: &[(SocketAddr, &[u8])]) -> io::Result<usize> {
+    if entries.is_empty() {
+        return Ok(0);
+    }
+    let mut total = 0usize;
+    let mut start = 0;
+    while start < entries.len() {
+        let chunk_end = entries.len().min(start + SENDMMSG_BATCH_CAP);
+        let chunk = &entries[start..chunk_end];
+        let chunk_len = chunk.len();
+
+        // Per-message sockaddr storage — each message has its own dst.
+        let mut addrs: [libc::sockaddr_storage; SENDMMSG_BATCH_CAP] = unsafe { std::mem::zeroed() };
+        let mut iovs: [libc::iovec; SENDMMSG_BATCH_CAP] = unsafe { std::mem::zeroed() };
+        let mut msgs: [libc::mmsghdr; SENDMMSG_BATCH_CAP] = unsafe { std::mem::zeroed() };
+
+        for i in 0..chunk_len {
+            let (dst, payload) = chunk[i];
+            let (sa, sa_len) = sockaddr_from_socket_addr(dst);
+            addrs[i] = sa;
+            iovs[i].iov_base = payload.as_ptr() as *mut libc::c_void;
+            iovs[i].iov_len = payload.len();
+            let hdr = &mut msgs[i].msg_hdr;
+            hdr.msg_name = &addrs[i] as *const _ as *mut libc::c_void;
+            hdr.msg_namelen = sa_len;
+            hdr.msg_iov = &mut iovs[i];
+            hdr.msg_iovlen = 1;
+        }
+
+        // Safety: msgs[..chunk_len] is fully initialised; addrs and iovs
+        // outlive the syscall; socket is non-blocking.
+        let ret = unsafe { libc::sendmmsg(fd, msgs.as_mut_ptr(), chunk_len as libc::c_uint, 0) };
+        if ret < 0 {
+            let err = io::Error::last_os_error();
+            if total > 0 {
+                return Ok(total);
+            }
+            return Err(err);
+        }
+        let sent = ret as usize;
+        total += sent;
+        if sent < chunk_len {
+            return Ok(total);
+        }
+        start = chunk_end;
+    }
+    Ok(total)
+}
+
 /// Issue `recvmmsg(2)` against `fd`, filling up to `slots.len()`
 /// `DatagramBuf`s. Returns the number written. Non-blocking: returns
 /// `Ok(0)` when nothing is ready (matching the `recv_batch` contract).
@@ -299,6 +355,26 @@ pub trait UdpTransport: Send + Sync {
         Ok(payloads.len())
     }
 
+    /// Send multiple datagrams each to a distinct destination in one
+    /// batched syscall. Each entry is `(dst, payload)`. Used by
+    /// [`MuxedSender::tick`] to collapse all sessions' outbound
+    /// fragments into one `sendmmsg(2)` call instead of one per session.
+    ///
+    /// Default impl loops over [`send_to`]. [`KernelUdp`] and the
+    /// io_uring endpoints override with [`sendmmsg_multi_to`].
+    ///
+    /// [`send_to`]: Self::send_to
+    fn send_multi_to(&self, entries: &[(SocketAddr, &[u8])]) -> io::Result<usize> {
+        for (i, (dst, payload)) in entries.iter().enumerate() {
+            match self.send_to(*dst, payload) {
+                Ok(_) => {}
+                Err(e) if i == 0 => return Err(e),
+                Err(_) => return Ok(i),
+            }
+        }
+        Ok(entries.len())
+    }
+
     /// Try to receive one datagram into `buf`. Returns `Ok(None)` when
     /// no datagram is ready. On `Ok(Some((addr, len)))`, the first
     /// `len` bytes of `buf` are valid and `addr` is the sender.
@@ -414,6 +490,11 @@ impl UdpTransport for KernelUdp {
     fn send_batch_to(&self, dst: SocketAddr, payloads: &[&[u8]]) -> io::Result<usize> {
         use std::os::unix::io::AsRawFd;
         sendmmsg_to(self.socket.as_raw_fd(), dst, payloads)
+    }
+
+    fn send_multi_to(&self, entries: &[(SocketAddr, &[u8])]) -> io::Result<usize> {
+        use std::os::unix::io::AsRawFd;
+        sendmmsg_multi_to(self.socket.as_raw_fd(), entries)
     }
 
     fn recv_batch(&self, slots: &mut [DatagramBuf]) -> io::Result<usize> {
