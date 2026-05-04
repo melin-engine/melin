@@ -1069,7 +1069,11 @@ impl<E: AppEvent> JournalWriter<E> {
     /// (alloc layout), sector_size is 512 or 4096, and offset is always a
     /// multiple of sector_size.
     fn pwrite_sector(&self, offset: u64) -> Result<(), JournalError> {
-        pwrite_aligned_sector(self.file.as_fd(), &self.tail_sector[..self.sector_size], offset)
+        pwrite_aligned_sector(
+            self.file.as_fd(),
+            &self.tail_sector[..self.sector_size],
+            offset,
+        )
     }
 
     /// Slice of the most-recent user entry in `batch_buf`, with the

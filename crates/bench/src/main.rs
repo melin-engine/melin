@@ -676,14 +676,24 @@ fn run_pipeline_bench(
     let journal_stage = out.journal_stage;
     let journal_handle = std::thread::Builder::new()
         .name("journal".into())
-        .spawn(move || journal_stage.run(&shutdown_j))
+        .spawn(move || {
+            if let Err(e) = melin_server::affinity::pin_to_core(1) {
+                eprintln!("warning: could not pin journal to core 1: {e}");
+            }
+            journal_stage.run(&shutdown_j)
+        })
         .expect("spawn journal thread");
 
     let shutdown_m = Arc::clone(&shutdown);
     let matching_stage = out.matching_stage;
     let matching_handle = std::thread::Builder::new()
         .name("matching".into())
-        .spawn(move || matching_stage.run(&shutdown_m))
+        .spawn(move || {
+            if let Err(e) = melin_server::affinity::pin_to_core(2) {
+                eprintln!("warning: could not pin matching to core 2: {e}");
+            }
+            matching_stage.run(&shutdown_m)
+        })
         .expect("spawn matching thread");
 
     let total_orders = warmup + total_pairs * 2;
@@ -711,6 +721,9 @@ fn run_pipeline_bench(
     let publish_handle = std::thread::Builder::new()
         .name("pipeline-pub".into())
         .spawn(move || {
+            if let Err(e) = melin_server::affinity::pin_to_core(3) {
+                eprintln!("warning: could not pin pipeline-pub to core 3: {e}");
+            }
             for i in 0..total_orders {
                 let order_id = OrderId((i as u64) + 1);
                 let side = if i % 2 == 0 { Side::Buy } else { Side::Sell };
