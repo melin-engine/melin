@@ -113,30 +113,109 @@ pub struct Consumer<T> {
 unsafe impl<T: Send> Send for Producer<T> {}
 unsafe impl<T: Send> Send for Consumer<T> {}
 
+/// Reserved slot in the producer's ring. Hold the claim while
+/// initializing the slot in place; call [`commit`] to make it
+/// visible to the consumer.
+///
+/// Borrows the producer mutably — at most one outstanding claim at
+/// a time. Dropping a claim without committing leaves the slot
+/// reserved-but-unpublished; the next `try_claim` from the same
+/// producer reuses the same slot, so no leak occurs.
+///
+/// [`commit`]: Claim::commit
+pub struct Claim<'a, T> {
+    slot: &'a UnsafeCell<MaybeUninit<T>>,
+    tail: usize,
+    tail_atomic: &'a AtomicUsize,
+}
+
+impl<'a, T> Claim<'a, T> {
+    /// Raw pointer to the uninitialized slot. The caller must fully
+    /// initialize the `T` (every field, no partial writes) before
+    /// calling [`commit`].
+    #[inline]
+    pub fn as_mut_ptr(&self) -> *mut T {
+        self.slot.get() as *mut T
+    }
+
+    /// Convenience: write `item` into the slot, then commit.
+    ///
+    /// # Safety
+    ///
+    /// Equivalent to writing `item` to the slot pointer and committing.
+    /// Marked unsafe purely because it's the path used by the in-place
+    /// constructor below; callers using this directly should prefer
+    /// `Producer::try_push`.
+    #[inline]
+    unsafe fn write(self, item: T) {
+        // Safety: `as_mut_ptr` returns a pointer to uninitialized
+        // memory we've reserved exclusively; writing `item` initializes
+        // the slot before publication.
+        unsafe { self.as_mut_ptr().write(item) };
+        // Safety: post-write the slot is fully initialized; commit
+        // publishes it.
+        unsafe { self.commit() };
+    }
+
+    /// Publish the slot to the consumer.
+    ///
+    /// # Safety
+    ///
+    /// The memory at [`as_mut_ptr`] must be a fully-initialized `T`.
+    /// The release-store on `tail` synchronizes with the consumer's
+    /// acquire-load.
+    #[inline]
+    pub unsafe fn commit(self) {
+        self.tail_atomic
+            .store(self.tail.wrapping_add(1), Ordering::Release);
+    }
+}
+
 impl<T> Producer<T> {
     /// Push one item. Returns `Err(item)` if the ring is full.
+    /// Convenience wrapper over `try_claim` for callers who already
+    /// have a fully-formed `T`; LMAX-style hot paths should prefer
+    /// `try_claim` to avoid a stack→ring memcpy of large items.
+    #[allow(dead_code)]
     #[inline]
     pub fn try_push(&mut self, item: T) -> Result<(), T> {
+        match self.try_claim() {
+            None => Err(item),
+            Some(claim) => {
+                // Safety: claim's slot is uninitialized; we initialize
+                // by writing `item` into it, then publish.
+                unsafe {
+                    claim.write(item);
+                }
+                Ok(())
+            }
+        }
+    }
+
+    /// Reserve the next ring slot without writing to it. The slot
+    /// returned by [`Claim::as_mut_ptr`] is uninitialized; the caller
+    /// is responsible for fully initializing the `T` before invoking
+    /// [`Claim::commit`]. The slot is not visible to the consumer
+    /// until commit.
+    ///
+    /// This is the LMAX in-place construction path used to avoid a
+    /// stack→ring memcpy of large `T`s on the hot path.
+    #[inline]
+    pub fn try_claim(&mut self) -> Option<Claim<'_, T>> {
         let ring = &*self.ring;
-        // Producer owns `tail`, so a relaxed read sees its own last
-        // store.
+        // Producer owns `tail`.
         let tail = ring.tail.load(Ordering::Relaxed);
-        // Acquire on `head` synchronizes with the consumer's release
-        // when it advanced `head` — guarantees we won't overwrite a
-        // slot the consumer is still reading.
+        // Acquire on `head` to observe consumer progress.
         let head = ring.head.load(Ordering::Acquire);
         if tail.wrapping_sub(head) == ring.slots.len() {
-            return Err(item);
+            return None;
         }
         let idx = tail & ring.mask;
-        // Safety: position `tail` is outside `[head, tail_old)` and
-        // therefore uninitialized; we have exclusive write access by
-        // virtue of being the sole producer.
-        unsafe { (*ring.slots[idx].get()).write(item) };
-        // Release: makes the slot write visible to the consumer
-        // before it observes the new tail.
-        ring.tail.store(tail.wrapping_add(1), Ordering::Release);
-        Ok(())
+        Some(Claim {
+            slot: &ring.slots[idx],
+            tail,
+            tail_atomic: &ring.tail,
+        })
     }
 
     /// Approximate count of in-flight items. Producer-side estimate;
@@ -302,5 +381,36 @@ mod tests {
     #[should_panic(expected = "power of two")]
     fn rejects_non_power_of_two_capacity() {
         let _ = channel::<u8>(3);
+    }
+
+    #[test]
+    fn claim_then_commit_publishes_slot() {
+        let (mut p, mut c) = channel::<u32>(4);
+        let claim = p.try_claim().expect("claim");
+        // Write directly into the slot without going through try_push.
+        unsafe {
+            claim.as_mut_ptr().write(0xDEAD_BEEF);
+            claim.commit();
+        }
+        assert_eq!(c.try_pop(), Some(0xDEAD_BEEF));
+    }
+
+    #[test]
+    fn claim_returns_none_when_full() {
+        let (mut p, _c) = channel::<u32>(2);
+        let _claim_a = p.try_claim().expect("first claim");
+        // Holding a claim reserves a slot, but until commit() the
+        // tail isn't advanced — so a second try_claim sees the same
+        // slot. We need to commit first to fill the ring, not just
+        // claim.
+        unsafe {
+            _claim_a.write(1);
+        }
+        let claim_b = p.try_claim().expect("second claim");
+        unsafe {
+            claim_b.write(2);
+        }
+        // Ring now full.
+        assert!(p.try_claim().is_none());
     }
 }

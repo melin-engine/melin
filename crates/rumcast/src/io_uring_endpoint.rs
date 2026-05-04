@@ -52,6 +52,7 @@
 //! [`split`]: IoUringEndpoint::split
 
 use std::io;
+use std::mem::MaybeUninit;
 use std::net::{Ipv4Addr, SocketAddr, UdpSocket};
 use std::os::unix::io::AsRawFd;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -104,6 +105,12 @@ struct RecvSlot {
     msg: libc::msghdr,
 }
 
+// RecvSlot's `iov` and `msg` fields hold raw pointers to other
+// fields of the same `Box<RecvSlot>` — sending the box across threads
+// keeps those pointers valid (the Box payload doesn't move). The
+// poller thread is the sole accessor after construction.
+unsafe impl Send for RecvSlot {}
+
 impl RecvSlot {
     fn new() -> Box<Self> {
         let mut s = Box::new(Self {
@@ -124,24 +131,60 @@ impl RecvSlot {
 
 /// One frame as it travels through the SPSC fan-out: payload bytes,
 /// length, and origin address. Fixed-size so SPSC slots stay
-/// allocation-free on the hot path.
-pub struct Frame {
+/// allocation-free on the hot path. `buf` is `MaybeUninit` so the
+/// in-place initializer skips zeroing the unused tail — at typical
+/// frame sizes (~1 KB on a 2 KB cap), that's a 1 KB memset saved per
+/// packet.
+pub(crate) struct Frame {
     /// Sender's socket address.
-    pub from: SocketAddr,
-    /// Valid bytes in `buf`.
-    pub len: u16,
-    /// Frame payload. Bytes past `len` are stale.
-    pub buf: [u8; BUF_SIZE],
+    from: SocketAddr,
+    /// Valid bytes in `buf`. Reads past this are forbidden — the
+    /// underlying memory is `MaybeUninit`.
+    len: u16,
+    /// Frame payload. Only `buf[..len]` is initialized.
+    buf: [MaybeUninit<u8>; BUF_SIZE],
 }
 
 impl Frame {
-    fn empty() -> Self {
-        Self {
-            // Placeholder; never read before being overwritten.
-            from: SocketAddr::new(std::net::IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0),
-            len: 0,
-            buf: [0u8; BUF_SIZE],
+    /// Initialize a Frame at `slot` from header fields and a payload
+    /// slice. Writes `from`, `len`, and `buf[..bytes.len()]`; leaves
+    /// `buf[bytes.len()..]` uninitialized (and unreadable through the
+    /// public API, which always bounds reads by `len`).
+    ///
+    /// # Safety
+    ///
+    /// - `slot` must point to writable memory sized and aligned for
+    ///   `Frame` (i.e. produced by `Producer::try_claim`).
+    /// - `bytes.len()` must be `<= BUF_SIZE`.
+    /// - After this call the slot is fully valid (reads through
+    ///   `payload()` only touch initialized bytes).
+    #[inline]
+    unsafe fn init_in_place(slot: *mut Frame, from: SocketAddr, bytes: &[u8]) {
+        debug_assert!(bytes.len() <= BUF_SIZE);
+        // `addr_of_mut!` avoids creating a `&mut Frame` to a
+        // half-initialized struct (which would be UB).
+        unsafe {
+            std::ptr::addr_of_mut!((*slot).from).write(from);
+            std::ptr::addr_of_mut!((*slot).len).write(bytes.len() as u16);
+            let buf_ptr = std::ptr::addr_of_mut!((*slot).buf) as *mut u8;
+            std::ptr::copy_nonoverlapping(bytes.as_ptr(), buf_ptr, bytes.len());
         }
+    }
+
+    /// Initialized payload bytes. Bounded by `len`, so never reads
+    /// the uninitialized tail of `buf`.
+    #[inline]
+    fn payload(&self) -> &[u8] {
+        // Safety: producer's `init_in_place` initialized exactly the
+        // first `len` bytes; `MaybeUninit<u8>` and `u8` have identical
+        // layout so the cast is sound.
+        unsafe { std::slice::from_raw_parts(self.buf.as_ptr() as *const u8, self.len as usize) }
+    }
+
+    /// Sender address recorded by the kernel.
+    #[inline]
+    fn from(&self) -> SocketAddr {
+        self.from
     }
 }
 
@@ -227,14 +270,43 @@ pub struct IoUringEndpoint {
 }
 
 impl IoUringEndpoint {
-    /// Bind a fresh `UdpSocket` to `local`, pre-submit `RECV_POOL`
-    /// RecvMsg SQEs, and spawn the poller thread.
+    /// Bind a fresh `UdpSocket` to `local`, build the `IoUring` and
+    /// pre-submit `RECV_POOL` RecvMsg SQEs, then spawn the poller
+    /// thread. Any failure in socket binding, ring construction, or
+    /// initial submit surfaces as `io::Error` here — the endpoint
+    /// is never returned with a dead poller.
     pub fn bind(local: SocketAddr, cfg: EndpointConfig) -> io::Result<Self> {
         let socket = Arc::new(UdpSocket::bind(local)?);
-        // Non-blocking so the poller's send_to from the halves
-        // doesn't stall and so that a misuse of the socket
-        // outside io_uring fails loudly.
+        // Non-blocking so the halves' direct `send_to` paths never
+        // stall, and any misuse outside io_uring fails loudly rather
+        // than silently blocking.
         socket.set_nonblocking(true)?;
+
+        // Build the ring on this thread so init failures surface as
+        // a normal `io::Result` to the caller.
+        let mut ring: IoUring = IoUring::builder().build(RING_ENTRIES)?;
+        let fd = Fd(socket.as_raw_fd());
+
+        // Pre-allocate slots and pre-submit RecvMsg SQEs.
+        let mut slots: Vec<Box<RecvSlot>> = (0..RECV_POOL).map(|_| RecvSlot::new()).collect();
+        {
+            let mut sq = ring.submission();
+            for (idx, slot) in slots.iter_mut().enumerate() {
+                // Safety: msghdr points into the Box's heap allocation,
+                // stable for the lifetime of `slots` (slots is moved
+                // into the poller closure below, so it outlives the
+                // ring's view of the SQEs).
+                let msg_ptr = &mut slot.msg as *mut libc::msghdr;
+                let entry = opcode::RecvMsg::new(fd, msg_ptr)
+                    .build()
+                    .user_data(idx as u64);
+                unsafe {
+                    sq.push(&entry)
+                        .expect("SQ full on init — RING_ENTRIES too small for RECV_POOL")
+                };
+            }
+        }
+        ring.submitter().submit()?;
 
         let (send_producer, send_consumer) = spsc::channel::<Frame>(cfg.spsc_capacity);
         let (recv_producer, recv_consumer) = spsc::channel::<Frame>(cfg.spsc_capacity);
@@ -243,7 +315,9 @@ impl IoUringEndpoint {
         let counters = Arc::new(EndpointCounters::default());
 
         let poller_state = PollerState {
-            socket_fd: Fd(socket.as_raw_fd()),
+            ring,
+            slots,
+            socket_fd: fd,
             send_producer,
             recv_producer,
             shutdown: Arc::clone(&shutdown),
@@ -291,8 +365,12 @@ impl IoUringEndpoint {
     }
 }
 
-/// State owned exclusively by the poller thread.
+/// State owned exclusively by the poller thread. Built (and the
+/// initial RecvMsg SQEs submitted) on the calling thread inside
+/// `bind` so I/O errors surface synchronously.
 struct PollerState {
+    ring: IoUring,
+    slots: Vec<Box<RecvSlot>>,
     socket_fd: Fd,
     send_producer: Producer<Frame>,
     recv_producer: Producer<Frame>,
@@ -301,49 +379,32 @@ struct PollerState {
     cfg: EndpointConfig,
 }
 
-fn run_poller(mut state: PollerState) {
-    if let Some(core) = state.cfg.poller_core
+fn run_poller(state: PollerState) {
+    let PollerState {
+        mut ring,
+        mut slots,
+        socket_fd: fd,
+        mut send_producer,
+        mut recv_producer,
+        shutdown,
+        counters,
+        cfg,
+    } = state;
+
+    if let Some(core) = cfg.poller_core
         && let Err(e) = pin_current_thread_to_core(core)
     {
         tracing::warn!(core, %e, "io_uring poller failed to pin to core");
-    }
-
-    let mut ring = match IoUring::builder().build(RING_ENTRIES) {
-        Ok(r) => r,
-        Err(e) => {
-            tracing::error!(%e, "io_uring init failed; poller exiting");
-            return;
-        }
-    };
-    let fd = state.socket_fd;
-
-    let mut slots: Vec<Box<RecvSlot>> = (0..RECV_POOL).map(|_| RecvSlot::new()).collect();
-    {
-        let mut sq = ring.submission();
-        for (idx, slot) in slots.iter_mut().enumerate() {
-            // Safety: msghdr points into the Box allocation, stable
-            // for the lifetime of `slots`. Index-as-user-data lets
-            // CQE handling find the slot in O(1).
-            let msg_ptr = &mut slot.msg as *mut libc::msghdr;
-            let entry = opcode::RecvMsg::new(fd, msg_ptr)
-                .build()
-                .user_data(idx as u64);
-            unsafe {
-                sq.push(&entry)
-                    .expect("SQ full on init — RING_ENTRIES too small")
-            };
-        }
-    }
-    if let Err(e) = ring.submitter().submit() {
-        tracing::error!(%e, "io_uring initial submit failed; poller exiting");
-        return;
     }
 
     let mut pending_resubmit: Vec<usize> = Vec::with_capacity(RECV_POOL);
     let mut unsubmitted: usize = 0;
     let mut idle_iterations: u32 = 0;
 
-    while !state.shutdown.load(Ordering::Acquire) {
+    // Relaxed is sufficient: shutdown is a one-way flag with no
+    // associated data being published — we only need eventual
+    // visibility of the store.
+    while !shutdown.load(Ordering::Relaxed) {
         let mut work_done = false;
 
         // Harvest CQEs.
@@ -354,7 +415,7 @@ fn run_poller(mut state: PollerState) {
                 let slot_idx = cqe.user_data() as usize;
                 let res = cqe.result();
                 if res < 0 {
-                    state.counters.cqe_errors.fetch_add(1, Ordering::Relaxed);
+                    counters.cqe_errors.fetch_add(1, Ordering::Relaxed);
                     pending_resubmit.push(slot_idx);
                     continue;
                 }
@@ -362,7 +423,13 @@ fn run_poller(mut state: PollerState) {
                 let slot = &slots[slot_idx];
                 let from = sockaddr_to_socket_addr(&slot.name);
                 let bytes = &slot.buf[..len];
-                dispatch_frame(&mut state, from, len, bytes);
+                dispatch_frame(
+                    &mut send_producer,
+                    &mut recv_producer,
+                    &counters,
+                    from,
+                    bytes,
+                );
                 pending_resubmit.push(slot_idx);
             }
         }
@@ -408,11 +475,14 @@ fn run_poller(mut state: PollerState) {
         }
 
         idle_iterations = idle_iterations.saturating_add(1);
-        let park_threshold = state.cfg.idle_iterations_before_park;
+        let park_threshold = cfg.idle_iterations_before_park;
         if park_threshold != 0 && idle_iterations >= park_threshold {
             // Soft-park: submit any staged SQEs and wait for one
-            // CQE or the timeout, whichever first.
-            soft_park(&mut ring, &mut unsubmitted, state.cfg.park_timeout);
+            // CQE or the timeout, whichever first. Note: shutdown
+            // observation is bounded by `park_timeout` — the poller
+            // may sleep for up to that long before noticing the
+            // shutdown flag was set.
+            soft_park(&mut ring, &mut unsubmitted, cfg.park_timeout);
             idle_iterations = 0;
         } else {
             std::hint::spin_loop();
@@ -421,33 +491,40 @@ fn run_poller(mut state: PollerState) {
 }
 
 /// Classify a frame and push to the matching SPSC, or count the drop.
+/// Uses the SPSC `try_claim` / `commit` in-place pattern so the
+/// payload is copied straight from the kernel's `RecvSlot` buffer
+/// into the ring slot — no intermediate stack-resident `Frame`,
+/// no zeroing of the unused tail.
 #[inline]
-fn dispatch_frame(state: &mut PollerState, from: SocketAddr, len: usize, bytes: &[u8]) {
-    match classify(bytes) {
-        Direction::Recv => {
-            let mut frame = Frame::empty();
-            frame.from = from;
-            frame.len = len as u16;
-            frame.buf[..len].copy_from_slice(bytes);
-            if state.recv_producer.try_push(frame).is_err() {
-                state.counters.recv_dropped.fetch_add(1, Ordering::Relaxed);
-            } else {
-                state.counters.recv_pushed.fetch_add(1, Ordering::Relaxed);
-            }
-        }
-        Direction::Send => {
-            let mut frame = Frame::empty();
-            frame.from = from;
-            frame.len = len as u16;
-            frame.buf[..len].copy_from_slice(bytes);
-            if state.send_producer.try_push(frame).is_err() {
-                state.counters.send_dropped.fetch_add(1, Ordering::Relaxed);
-            } else {
-                state.counters.send_pushed.fetch_add(1, Ordering::Relaxed);
-            }
-        }
+fn dispatch_frame(
+    send_producer: &mut Producer<Frame>,
+    recv_producer: &mut Producer<Frame>,
+    counters: &EndpointCounters,
+    from: SocketAddr,
+    bytes: &[u8],
+) {
+    let (producer, pushed_counter, dropped_counter) = match classify(bytes) {
+        Direction::Recv => (recv_producer, &counters.recv_pushed, &counters.recv_dropped),
+        Direction::Send => (send_producer, &counters.send_pushed, &counters.send_dropped),
         Direction::Drop => {
-            state.counters.parse_dropped.fetch_add(1, Ordering::Relaxed);
+            counters.parse_dropped.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+    };
+
+    match producer.try_claim() {
+        None => {
+            dropped_counter.fetch_add(1, Ordering::Relaxed);
+        }
+        Some(claim) => {
+            // Safety: claim hands us writable, properly-aligned memory
+            // for a `Frame`; init_in_place fully initializes it; commit
+            // publishes after init.
+            unsafe {
+                Frame::init_in_place(claim.as_mut_ptr(), from, bytes);
+                claim.commit();
+            }
+            pushed_counter.fetch_add(1, Ordering::Relaxed);
         }
     }
 }
@@ -574,9 +651,10 @@ fn consume_one(
     match guard.try_pop() {
         None => Ok(None),
         Some(frame) => {
-            let len = (frame.len as usize).min(buf.len());
-            buf[..len].copy_from_slice(&frame.buf[..len]);
-            Ok(Some((frame.from, len)))
+            let payload = frame.payload();
+            let len = payload.len().min(buf.len());
+            buf[..len].copy_from_slice(&payload[..len]);
+            Ok(Some((frame.from(), len)))
         }
     }
 }
@@ -834,5 +912,153 @@ mod tests {
         let (send_half, recv_half) = endpoint.split();
         assert_eq!(send_half.local_addr().unwrap(), bound);
         assert_eq!(recv_half.local_addr().unwrap(), bound);
+    }
+
+    /// Build a Data frame whose payload encodes `seq` as little-endian
+    /// u32 — used by the ordering test to verify FIFO across the SPSC.
+    fn data_frame_with_seq(seq: u32) -> Vec<u8> {
+        let payload = seq.to_le_bytes();
+        data_frame(&payload)
+    }
+
+    #[test]
+    fn frames_arrive_in_fifo_order_through_spsc() {
+        // SPSC promises FIFO. A peer fires N data frames; the recv
+        // half must observe them in the same order. Loopback UDP is
+        // already in-order at the kernel; this test pins down the
+        // guarantee that the endpoint adds nothing that could
+        // reorder.
+        const N: u32 = 64;
+        let endpoint = IoUringEndpoint::bind(loopback(0), test_cfg()).expect("bind");
+        let bound = endpoint.local_addr().unwrap();
+        let (_send_half, recv_half) = endpoint.split();
+
+        let peer = UdpSocket::bind(loopback(0)).unwrap();
+        for seq in 0..N {
+            peer.send_to(&data_frame_with_seq(seq), bound).unwrap();
+        }
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        for expected in 0..N {
+            let bytes = recv_one(&recv_half, deadline);
+            // Payload starts at DataFrame::HEADER_LEN.
+            let payload = &bytes[DataFrame::HEADER_LEN..];
+            assert_eq!(payload.len(), 4, "unexpected payload length");
+            let got = u32::from_le_bytes(payload.try_into().unwrap());
+            assert_eq!(got, expected, "frames out of order");
+        }
+    }
+
+    #[test]
+    fn slow_consumer_overflow_increments_recv_dropped() {
+        // SPSC has finite capacity. If the consumer never pops while
+        // the producer fans out frames, the ring fills and subsequent
+        // frames are counted as dropped.
+        let cfg = EndpointConfig {
+            // Tiny ring so we don't have to fire many frames.
+            spsc_capacity: 4,
+            idle_iterations_before_park: 4,
+            park_timeout: Duration::from_millis(1),
+            ..Default::default()
+        };
+        let endpoint = IoUringEndpoint::bind(loopback(0), cfg).expect("bind");
+        let bound = endpoint.local_addr().unwrap();
+        let (send_half, _recv_half) = endpoint.split();
+
+        let peer = UdpSocket::bind(loopback(0)).unwrap();
+        // Fire well more than spsc_capacity so the ring backs up.
+        const FIRE: u32 = 64;
+        for seq in 0..FIRE {
+            peer.send_to(&data_frame_with_seq(seq), bound).unwrap();
+        }
+
+        // Wait for recv_dropped to be non-zero (poller has caught up
+        // and observed the ring-full condition).
+        let deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            let (recv_pushed, _, recv_dropped, _, _, _) = send_half.counters();
+            // Once the poller has classified all frames, pushed +
+            // dropped should equal FIRE; recv_dropped must be > 0
+            // because spsc_capacity=4 < FIRE=64.
+            if recv_dropped > 0 && recv_pushed + recv_dropped >= FIRE as u64 {
+                assert!(
+                    recv_dropped >= (FIRE as u64) - 4,
+                    "expected ~{} drops, got recv_pushed={}, recv_dropped={}",
+                    FIRE - 4,
+                    recv_pushed,
+                    recv_dropped,
+                );
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "drop counter never accumulated: pushed={}, dropped={}",
+                recv_pushed,
+                recv_dropped,
+            );
+            std::thread::sleep(Duration::from_micros(200));
+        }
+    }
+
+    #[test]
+    fn concurrent_recv_from_serializes_safely() {
+        // The recv_from path on a half is `&self`-safe because the
+        // Consumer<Frame> sits behind a Mutex. Two threads racing on
+        // the same half must collectively observe each frame exactly
+        // once: no double-delivery, no panic, no deadlock.
+        //
+        // N must fit within the SPSC ring (default 128) since we
+        // fire all frames synchronously before the consumers start
+        // draining — otherwise the ring fills and frames are
+        // dropped, which is correct backpressure but not what this
+        // test is checking.
+        const N: u32 = 100;
+        let endpoint = IoUringEndpoint::bind(loopback(0), test_cfg()).expect("bind");
+        let bound = endpoint.local_addr().unwrap();
+        let (_send_half, recv_half) = endpoint.split();
+        let recv_half = Arc::new(recv_half);
+
+        let peer = UdpSocket::bind(loopback(0)).unwrap();
+        for seq in 0..N {
+            peer.send_to(&data_frame_with_seq(seq), bound).unwrap();
+        }
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let collected: Arc<Mutex<Vec<u32>>> = Arc::new(Mutex::new(Vec::with_capacity(N as usize)));
+        // Shared exit flag so once one thread observes the Nth frame,
+        // the other thread doesn't keep spinning to its own deadline.
+        let done = Arc::new(AtomicBool::new(false));
+
+        let mut threads = Vec::new();
+        for _ in 0..2 {
+            let half = Arc::clone(&recv_half);
+            let collected = Arc::clone(&collected);
+            let done = Arc::clone(&done);
+            threads.push(std::thread::spawn(move || {
+                let mut buf = [0u8; BUF_SIZE];
+                while !done.load(Ordering::Relaxed) && Instant::now() < deadline {
+                    if let Some((_, n)) = half.recv_from(&mut buf).expect("recv_from") {
+                        let payload = &buf[DataFrame::HEADER_LEN..n];
+                        let seq = u32::from_le_bytes(payload.try_into().unwrap());
+                        let mut g = collected.lock().unwrap();
+                        g.push(seq);
+                        if g.len() == N as usize {
+                            done.store(true, Ordering::Relaxed);
+                            return;
+                        }
+                    } else {
+                        std::thread::sleep(Duration::from_micros(50));
+                    }
+                }
+            }));
+        }
+        for t in threads {
+            t.join().expect("recv thread panicked");
+        }
+
+        let mut got = collected.lock().unwrap().clone();
+        got.sort_unstable();
+        let expected: Vec<u32> = (0..N).collect();
+        assert_eq!(got, expected, "every frame seen exactly once");
     }
 }
