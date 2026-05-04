@@ -899,6 +899,7 @@ pub fn run_receiver_dpdk(
     group_commit_delay: std::time::Duration,
     pipeline_depth: usize,
     busy_spin: bool,
+    async_ack: bool,
 ) -> ReceiverResult {
     use crate::App;
     use crate::JournalWriter;
@@ -1396,14 +1397,25 @@ pub fn run_receiver_dpdk(
             }
 
             // Flush any acks that have become durable since last iteration.
-            if let Some(seq) = pending_acks.pop_ready(journal_cursor) {
+            let ready_seq = if async_ack {
+                pending_acks.pop_all_async()
+            } else {
+                pending_acks.pop_ready(journal_cursor)
+            };
+            if let Some(seq) = ready_seq {
                 send_ack_dpdk!(seq);
             }
 
             // Backpressure: if pipeline is saturated, block until the oldest
             // batch is durable.
             if pending_acks.is_full() {
-                let seq = pending_acks.pop_oldest_blocking(journal_cursor);
+                let seq = if async_ack {
+                    pending_acks
+                        .pop_all_async()
+                        .expect("non-empty queue after full check")
+                } else {
+                    pending_acks.pop_oldest_blocking(journal_cursor)
+                };
                 send_ack_dpdk!(seq);
             }
 

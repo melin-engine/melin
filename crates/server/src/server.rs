@@ -1566,6 +1566,7 @@ pub fn run_dpdk(
             config.group_commit_delay(),
             config.replication_pipeline_depth,
             !config.yield_idle,
+            config.async_replica_ack,
         )? {
             None => return Ok(()), // clean shutdown
             Some((mut exchange, writer)) => {
