@@ -236,7 +236,8 @@ pub fn run_rumcast_roundtrip(cfg: RumcastBenchConfig) {
     );
 
     // ---- Per-session bench state ----
-    let mut inflight: Vec<VecDeque<Instant>> = (0..cfg.clients)
+    // TSC ticks recorded at publish time; popped on matching BatchEnd.
+    let mut inflight: Vec<VecDeque<u64>> = (0..cfg.clients)
         .map(|_| VecDeque::with_capacity(cfg.window))
         .collect();
     let mut outbound_seq: Vec<u64> = vec![0; cfg.clients];
@@ -260,6 +261,9 @@ pub fn run_rumcast_roundtrip(cfg: RumcastBenchConfig) {
     let diag_enabled = std::env::var("RUMCAST_DIAG")
         .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
         .unwrap_or(false);
+    // TSC calibration for sub-nanosecond-overhead latency timestamps.
+    // Same approach as the TCP bench — avoids clock_gettime on the hot path.
+    let ticks_per_ns = crate::calibrate_tsc();
     let mut diag_iters: u64 = 0;
     let mut diag_claim_ok: u64 = 0;
     let mut diag_claim_bp: u64 = 0;
@@ -272,9 +276,8 @@ pub fn run_rumcast_roundtrip(cfg: RumcastBenchConfig) {
     let mut diag_send_errors: u64 = 0;
     let mut diag_partition_misses: u64 = 0;
     let mut diag_last_dump = Instant::now();
-    // Per-stage cumulative wall time, ns. 5 `Instant::now()` calls
-    // per iter when diag is on — same shape as the server's
-    // session_translator instrumentation.
+    // Per-stage cumulative wall time, ns. Gated on diag_enabled — same
+    // shape as the server's session_translator instrumentation.
     let mut diag_recv_tick_ns: u64 = 0;
     let mut diag_topup_ns: u64 = 0;
     let mut diag_send_tick_ns: u64 = 0;
@@ -305,10 +308,20 @@ pub fn run_rumcast_roundtrip(cfg: RumcastBenchConfig) {
         // here and the actual datagram wouldn't leave until the
         // next iter (a 2 ms park sat in between, dominating
         // single-msg round-trip latency).
-        let stage_start = Instant::now();
+        let t_recv_start = if diag_enabled {
+            Some(Instant::now())
+        } else {
+            None
+        };
         let recv_stats = muxed_receiver.tick();
-        let after_recv = Instant::now();
-        diag_recv_tick_ns += after_recv.duration_since(stage_start).as_nanos() as u64;
+        let t_recv_end = if diag_enabled {
+            Some(Instant::now())
+        } else {
+            None
+        };
+        if let (Some(a), Some(b)) = (t_recv_start, t_recv_end) {
+            diag_recv_tick_ns += b.duration_since(a).as_nanos() as u64;
+        }
         diag_recv_frags += recv_stats.fragments_accepted as u64;
 
         // Top up each session's outbound window.
@@ -345,7 +358,7 @@ pub fn run_rumcast_roundtrip(cfg: RumcastBenchConfig) {
                         // We bumped outbound_seq above. Since the
                         // publish succeeded, keep the new seq —
                         // sequence integrity preserved.
-                        inflight[s].push_back(Instant::now());
+                        inflight[s].push_back(crate::rdtscp());
                         total_sent[s] += 1;
                     }
                     Err(_) => {
@@ -364,11 +377,23 @@ pub fn run_rumcast_roundtrip(cfg: RumcastBenchConfig) {
         // (NAKs / SMs) immediately. Was at the top of the loop body;
         // moved after top-up so a publish→wire round-trip happens in
         // a single iteration.
-        let after_topup = Instant::now();
-        diag_topup_ns += after_topup.duration_since(after_recv).as_nanos() as u64;
+        let t_topup_end = if diag_enabled {
+            Some(Instant::now())
+        } else {
+            None
+        };
+        if let (Some(a), Some(b)) = (t_recv_end, t_topup_end) {
+            diag_topup_ns += b.duration_since(a).as_nanos() as u64;
+        }
         let send_stats = muxed_sender.tick();
-        let after_send = Instant::now();
-        diag_send_tick_ns += after_send.duration_since(after_topup).as_nanos() as u64;
+        let t_send_end = if diag_enabled {
+            Some(Instant::now())
+        } else {
+            None
+        };
+        if let (Some(a), Some(b)) = (t_topup_end, t_send_end) {
+            diag_send_tick_ns += b.duration_since(a).as_nanos() as u64;
+        }
         diag_send_frags += send_stats.fragments_sent as u64;
         diag_naks_received += send_stats.naks_received as u64;
         diag_sms_received += send_stats.sms_received as u64;
@@ -409,9 +434,9 @@ pub fn run_rumcast_roundtrip(cfg: RumcastBenchConfig) {
                     }
                 };
                 if matches!(kind, ResponseKind::BatchEnd)
-                    && let Some(sent_ts) = inflight[s].pop_front()
+                    && let Some(sent_tsc) = inflight[s].pop_front()
                 {
-                    let latency_ns = sent_ts.elapsed().as_nanos() as u64;
+                    let latency_ns = crate::tsc_to_ns(crate::rdtscp() - sent_tsc, ticks_per_ns);
                     if total_received[s] >= cfg.warmup {
                         let _ = hist.record(latency_ns);
                         progress.fetch_add(1, Ordering::Relaxed);
@@ -423,13 +448,19 @@ pub fn run_rumcast_roundtrip(cfg: RumcastBenchConfig) {
                 }
             }
         });
-        let after_poll = Instant::now();
-        diag_poll_ns += after_poll.duration_since(after_send).as_nanos() as u64;
+        let t_poll_end = if diag_enabled {
+            Some(Instant::now())
+        } else {
+            None
+        };
+        if let (Some(a), Some(b)) = (t_send_end, t_poll_end) {
+            diag_poll_ns += b.duration_since(a).as_nanos() as u64;
+        }
         total_received_overall += drained_now;
         diag_responses += drained_now as u64;
 
         if diag_enabled {
-            let now = after_poll;
+            let now = t_poll_end.unwrap();
             if now.duration_since(diag_last_dump) >= Duration::from_secs(1) {
                 let inflight_max = inflight.iter().map(|q| q.len()).max().unwrap_or(0);
                 let inflight_sum: usize = inflight.iter().map(|q| q.len()).sum();
