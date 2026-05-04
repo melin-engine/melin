@@ -42,7 +42,7 @@ compile_error!(
 );
 
 #[cfg(feature = "io-uring")]
-pub mod io_uring_udp;
+pub mod io_uring_endpoint;
 
 pub mod counters;
 pub mod flow_control;
@@ -52,6 +52,11 @@ pub mod pub_log;
 pub mod receiver;
 pub mod sender;
 pub mod shared_udp;
+// SPSC ring is only consumed by the io_uring endpoint today; gating
+// it behind the same feature keeps clippy from flagging the module
+// as dead code in the default build.
+#[cfg(feature = "io-uring")]
+mod spsc;
 mod storage;
 pub mod sub_log;
 pub mod transport;

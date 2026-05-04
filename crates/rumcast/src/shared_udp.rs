@@ -170,7 +170,7 @@ pub struct SharedUdpRecv<T: UdpTransport = KernelUdp> {
 
 /// Direction a parsed frame is bound for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Direction {
+pub(crate) enum Direction {
     /// Subscriber-bound: Data, Setup, Heartbeat.
     Recv,
     /// Publisher-bound: NAK, StatusMessage.
@@ -179,7 +179,7 @@ enum Direction {
     Drop,
 }
 
-fn classify(bytes: &[u8]) -> Direction {
+pub(crate) fn classify(bytes: &[u8]) -> Direction {
     match parse_frame(bytes) {
         Ok(FrameView::Data { .. }) | Ok(FrameView::Setup(_)) | Ok(FrameView::Heartbeat(_)) => {
             Direction::Recv

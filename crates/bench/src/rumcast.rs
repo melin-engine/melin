@@ -27,11 +27,12 @@ use melin_protocol::codec;
 use melin_protocol::message::{Request, ResponseKind};
 use melin_protocol::session::{ClientHandshake, encode_envelope, verify_and_decode_envelope};
 use melin_rumcast::flow_control::FlowControl;
-use melin_rumcast::io_uring_udp::IoUringUdp;
+use melin_rumcast::io_uring_endpoint::{
+    EndpointConfig, EndpointRecv, EndpointSend, IoUringEndpoint,
+};
 use melin_rumcast::muxed_receiver::{MuxedReceiver, MuxedReceiverConfig};
 use melin_rumcast::muxed_sender::{MuxedSender, MuxedSenderConfig};
 use melin_rumcast::pub_log::PublicationLog;
-use melin_rumcast::shared_udp::SharedUdp;
 use melin_rumcast::wire::{FrameView, data_flags};
 
 use crate::generator::{GeneratorConfig, OrderFlowGenerator};
@@ -138,15 +139,18 @@ pub fn run_rumcast_roundtrip(cfg: RumcastBenchConfig) {
         cfg.clients
     );
 
-    // ---- Rumcast endpoints (single shared socket, multiplexed) ----
+    // ---- Rumcast endpoints (io_uring single-owner poller + SPSC) ----
     //
-    // SharedUdp gives one bound port with two `UdpTransport` halves.
-    // MuxedSender owns the send half + N PublicationLogs; MuxedReceiver
-    // owns the recv half + lazy SubscriptionLogs. Internal demux on the
-    // shared socket routes Data/Setup/Heartbeat → recv half,
-    // NAK/StatusMessage → send half.
-    let shared = SharedUdp::new(IoUringUdp::bind(cfg.bind).expect("io_uring UDP bind"));
-    let (send_half, recv_half) = shared.split();
+    // IoUringEndpoint owns one bound socket and a single poller thread
+    // that harvests CQEs, classifies each frame, and fans out to two
+    // SPSC rings. EndpointSend / EndpointRecv consume from those rings
+    // lock-free. Production layout for the bench: poller stays
+    // unpinned by default; if you want to pin it, set
+    // EndpointConfig::poller_core. Idle fallback (park_timeout) is on
+    // so an idle bench doesn't burn a core.
+    let endpoint =
+        IoUringEndpoint::bind(cfg.bind, EndpointConfig::default()).expect("io_uring endpoint bind");
+    let (send_half, recv_half) = endpoint.split();
 
     let max_sessions = (cfg.clients as u32).saturating_add(4);
     let mut muxed_sender = MuxedSender::new(
@@ -520,15 +524,12 @@ fn generate_session_id() -> u32 {
 /// Panics on protocol error or timeout — the bench is a benchmark
 /// tool, not a production client; if any single session can't
 /// authenticate there's nothing useful to measure.
-fn perform_handshake<
-    S: melin_rumcast::transport::UdpTransport,
-    R: melin_rumcast::transport::UdpTransport,
->(
+fn perform_handshake(
     signing_key: &SigningKey,
     session_id: u32,
     pub_log: &PublicationLog,
-    muxed_sender: &mut MuxedSender<melin_rumcast::shared_udp::SharedUdpSend<S>>,
-    muxed_receiver: &mut MuxedReceiver<melin_rumcast::shared_udp::SharedUdpRecv<R>>,
+    muxed_sender: &mut MuxedSender<EndpointSend>,
+    muxed_receiver: &mut MuxedReceiver<EndpointRecv>,
 ) -> [u8; 32] {
     let mut x25519_secret_bytes = [0u8; 32];
     getrandom::fill(&mut x25519_secret_bytes).expect("getrandom for X25519 ephemeral");
@@ -619,12 +620,9 @@ fn publish_blocking(pub_log: &PublicationLog, payload: &[u8]) {
 /// Data fragment for `target_sid` passes the supplied predicate or
 /// `deadline` expires. Used for the four handshake replies — once we
 /// switch to envelope-wrapped traffic, the bench loop polls inline.
-fn recv_match<
-    S: melin_rumcast::transport::UdpTransport,
-    R: melin_rumcast::transport::UdpTransport,
->(
-    muxed_receiver: &mut MuxedReceiver<melin_rumcast::shared_udp::SharedUdpRecv<R>>,
-    muxed_sender: &mut MuxedSender<melin_rumcast::shared_udp::SharedUdpSend<S>>,
+fn recv_match(
+    muxed_receiver: &mut MuxedReceiver<EndpointRecv>,
+    muxed_sender: &mut MuxedSender<EndpointSend>,
     target_sid: u32,
     deadline: Instant,
     predicate: impl Fn(&[u8]) -> bool,
