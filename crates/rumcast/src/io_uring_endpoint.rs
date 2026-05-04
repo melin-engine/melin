@@ -317,6 +317,19 @@ impl IoUringEndpoint {
     /// initial submit surfaces as `io::Error` here — the endpoint
     /// is never returned with a dead poller.
     pub fn bind(local: SocketAddr, cfg: EndpointConfig) -> io::Result<Self> {
+        Self::bind_paused(local, cfg)?.start()
+    }
+
+    /// Two-phase construction: build the socket, ring, and SPSC rings
+    /// without spawning the poller. Useful when the caller needs to
+    /// configure the socket (e.g. `set_recv_buffer_bytes`) and finish
+    /// other init (e.g. seeding an engine pipeline) before traffic
+    /// starts being harvested into the SPSC ring. Without the pause,
+    /// the kernel's rcvbuf can fill faster than the consumer drains
+    /// and the SPSC ring overflows during slow init.
+    ///
+    /// Call [`PausedEndpoint::start`] when ready to begin harvesting.
+    pub fn bind_paused(local: SocketAddr, cfg: EndpointConfig) -> io::Result<PausedEndpoint> {
         let socket = Arc::new(UdpSocket::bind(local)?);
         // Non-blocking so the halves' direct `send_to` paths never
         // stall, and any misuse outside io_uring fails loudly rather
@@ -337,7 +350,10 @@ impl IoUringEndpoint {
         let mut ring: IoUring = IoUring::builder().build(RING_ENTRIES)?;
         let fd = Fd(socket.as_raw_fd());
 
-        // Pre-allocate slots and pre-submit RecvMsg SQEs.
+        // Pre-allocate slots and pre-submit RecvMsg SQEs. The kernel
+        // will start completing these as packets arrive even though
+        // the poller hasn't yet been spawned — completions accumulate
+        // in the CQ until `start()` runs and begins harvesting.
         let mut slots: Vec<Box<RecvSlot>> = (0..RECV_POOL).map(|_| RecvSlot::new()).collect();
         {
             let mut sq = ring.submission();
@@ -361,43 +377,48 @@ impl IoUringEndpoint {
         let (send_producer, send_consumer) = spsc::channel::<Frame>(cfg.spsc_capacity);
         let (recv_producer, recv_consumer) = spsc::channel::<Frame>(cfg.spsc_capacity);
 
-        let shutdown = Arc::new(AtomicBool::new(false));
-        let counters = Arc::new(EndpointCounters::default());
-
-        let poller_state = PollerState {
+        Ok(PausedEndpoint {
+            socket,
             ring,
             slots,
             socket_fd: fd,
             send_producer,
             recv_producer,
-            shutdown: Arc::clone(&shutdown),
-            counters: Arc::clone(&counters),
-            cfg: cfg.clone(),
-            wake_fd,
-        };
-
-        let join = std::thread::Builder::new()
-            .name("rumcast-io-uring-poller".to_string())
-            .spawn(move || run_poller(poller_state))?;
-
-        let poller = Arc::new(PollerHandle {
-            shutdown,
-            wake_fd,
-            join: Mutex::new(Some(join)),
-            counters,
-        });
-
-        Ok(Self {
-            socket,
-            poller,
             send_consumer,
             recv_consumer,
+            cfg,
+            wake_fd,
         })
     }
 
     /// Bound local address — useful when `local.port() == 0`.
     pub fn local_addr(&self) -> io::Result<SocketAddr> {
         self.socket.local_addr()
+    }
+
+    /// Request a larger SO_RCVBUF on the underlying socket. Mirrors
+    /// `KernelUdp::set_recv_buffer_bytes`; the kernel may cap the
+    /// effective size at `net.core.rmem_max`. Useful on the server's
+    /// orders socket to absorb client bursts during init.
+    pub fn set_recv_buffer_bytes(&self, bytes: usize) -> io::Result<()> {
+        let val: libc::c_int = bytes.min(i32::MAX as usize) as libc::c_int;
+        // Safety: setsockopt with a valid fd, level, name, and a
+        // pointer + length to a stack `c_int` matches the SO_RCVBUF
+        // ABI on Linux.
+        let ret = unsafe {
+            libc::setsockopt(
+                self.socket.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_RCVBUF,
+                &val as *const _ as *const libc::c_void,
+                std::mem::size_of_val(&val) as libc::socklen_t,
+            )
+        };
+        if ret == 0 {
+            Ok(())
+        } else {
+            Err(io::Error::last_os_error())
+        }
     }
 
     /// Split into the two halves. The endpoint is consumed; the
@@ -414,6 +435,107 @@ impl IoUringEndpoint {
             consumer: Mutex::new(self.recv_consumer),
         };
         (send, recv)
+    }
+}
+
+/// Paused endpoint returned by [`IoUringEndpoint::bind_paused`]. The
+/// socket is bound, the io_uring ring is built, RecvMsg SQEs are
+/// submitted, and SPSC rings are allocated — but no poller thread
+/// has been spawned yet. Inbound traffic accumulates in the kernel's
+/// rcvbuf until [`PausedEndpoint::start`] is called.
+pub struct PausedEndpoint {
+    socket: Arc<UdpSocket>,
+    ring: IoUring,
+    slots: Vec<Box<RecvSlot>>,
+    socket_fd: Fd,
+    send_producer: Producer<Frame>,
+    recv_producer: Producer<Frame>,
+    send_consumer: Consumer<Frame>,
+    recv_consumer: Consumer<Frame>,
+    cfg: EndpointConfig,
+    wake_fd: RawFd,
+}
+
+impl PausedEndpoint {
+    /// Bound local address — useful when `local.port() == 0`.
+    pub fn local_addr(&self) -> io::Result<SocketAddr> {
+        self.socket.local_addr()
+    }
+
+    /// Configure SO_RCVBUF on the underlying socket. Mirrors
+    /// [`IoUringEndpoint::set_recv_buffer_bytes`]; called pre-start so
+    /// the kernel's rcvbuf is sized to absorb traffic during the
+    /// pause window.
+    pub fn set_recv_buffer_bytes(&self, bytes: usize) -> io::Result<()> {
+        let val: libc::c_int = bytes.min(i32::MAX as usize) as libc::c_int;
+        // Safety: setsockopt on a valid socket fd with the SO_RCVBUF
+        // ABI shape. Same as `IoUringEndpoint::set_recv_buffer_bytes`.
+        let ret = unsafe {
+            libc::setsockopt(
+                self.socket.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_RCVBUF,
+                &val as *const _ as *const libc::c_void,
+                std::mem::size_of_val(&val) as libc::socklen_t,
+            )
+        };
+        if ret == 0 {
+            Ok(())
+        } else {
+            Err(io::Error::last_os_error())
+        }
+    }
+
+    /// Spawn the poller thread and transition into a live
+    /// [`IoUringEndpoint`]. Frames already queued in the kernel
+    /// rcvbuf and CQEs already completed start being harvested
+    /// immediately.
+    pub fn start(self) -> io::Result<IoUringEndpoint> {
+        let PausedEndpoint {
+            socket,
+            ring,
+            slots,
+            socket_fd,
+            send_producer,
+            recv_producer,
+            send_consumer,
+            recv_consumer,
+            cfg,
+            wake_fd,
+        } = self;
+
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let counters = Arc::new(EndpointCounters::default());
+
+        let poller_state = PollerState {
+            ring,
+            slots,
+            socket_fd,
+            send_producer,
+            recv_producer,
+            shutdown: Arc::clone(&shutdown),
+            counters: Arc::clone(&counters),
+            cfg,
+            wake_fd,
+        };
+
+        let join = std::thread::Builder::new()
+            .name("rumcast-io-uring-poller".to_string())
+            .spawn(move || run_poller(poller_state))?;
+
+        let poller = Arc::new(PollerHandle {
+            shutdown,
+            wake_fd,
+            join: Mutex::new(Some(join)),
+            counters,
+        });
+
+        Ok(IoUringEndpoint {
+            socket,
+            poller,
+            send_consumer,
+            recv_consumer,
+        })
     }
 }
 
