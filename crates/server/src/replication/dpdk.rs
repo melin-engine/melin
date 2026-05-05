@@ -896,6 +896,7 @@ pub fn run_receiver_dpdk(
     snapshot_path: std::path::PathBuf,
     cores: crate::server::PipelineCores,
     receiver_core: usize,
+    group_commit_delay: std::time::Duration,
     busy_spin: bool,
 ) -> ReceiverResult {
     use crate::App;
@@ -1260,6 +1261,7 @@ pub fn run_receiver_dpdk(
                 cores,
                 snapshot_interval_ms,
                 snapshot_path.clone(),
+                group_commit_delay,
                 busy_spin,
             )?);
 

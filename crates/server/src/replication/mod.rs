@@ -394,6 +394,7 @@ pub(super) fn build_replica_pipeline_with_threads(
     cores: crate::server::PipelineCores,
     snapshot_interval_ms: u64,
     snapshot_path: std::path::PathBuf,
+    group_commit_delay: std::time::Duration,
     busy_spin: bool,
 ) -> Result<ReplicaPipelineHandles, Box<dyn std::error::Error>> {
     let shadow_exchange = <crate::App as melin_app::Application>::clone_via_snapshot(&exchange)?;
@@ -403,6 +404,7 @@ pub(super) fn build_replica_pipeline_with_threads(
         exchange,
         writer,
         4096, // max_journal_batch
+        group_commit_delay,
         busy_spin,
         enable_shadow,
     );

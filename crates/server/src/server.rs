@@ -497,6 +497,7 @@ pub fn run_with_shutdown<L: BlockingTransportListener>(
             config.cores,
             config.reader_cores,
             config.async_replica_ack,
+            config.group_commit_delay(),
             !config.yield_idle,
         )? {
             None => return Ok(()), // clean shutdown
@@ -1473,6 +1474,7 @@ pub fn run_dpdk(
             config.shadow_snapshot_path(),
             config.cores,
             config.reader_cores,
+            config.group_commit_delay(),
             !config.yield_idle,
         )? {
             None => return Ok(()), // clean shutdown

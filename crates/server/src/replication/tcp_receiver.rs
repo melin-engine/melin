@@ -719,6 +719,7 @@ pub fn run_receiver(
     cores: crate::server::PipelineCores,
     receiver_core: usize,
     async_ack: bool,
+    group_commit_delay: std::time::Duration,
     busy_spin: bool,
 ) -> ReceiverResult {
     use crate::App;
@@ -1090,6 +1091,7 @@ pub fn run_receiver(
                 cores,
                 snapshot_interval_ms,
                 snapshot_path.clone(),
+                group_commit_delay,
                 busy_spin,
             )?);
         }
