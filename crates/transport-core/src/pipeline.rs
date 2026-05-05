@@ -2022,6 +2022,7 @@ pub fn build_replica_pipeline<A>(
     app: A,
     writer: melin_journal::JournalWriter<A::Event>,
     max_journal_batch: usize,
+    group_commit_delay: Duration,
     busy_spin: bool,
     enable_shadow: bool,
 ) -> ReplicaPipeline<A>
@@ -2055,7 +2056,7 @@ where
     let mut journal_stage = JournalStage::new(
         writer,
         journal_consumer,
-        Duration::ZERO, // no group commit delay in replica mode
+        group_commit_delay,
         max_journal_batch,
         busy_spin,
     );

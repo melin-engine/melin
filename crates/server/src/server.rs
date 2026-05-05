@@ -35,6 +35,9 @@ use melin_protocol::blocking::BlockingFrameWriter;
 use melin_protocol::message::ConnectionId;
 use melin_protocol::transport::BlockingTransportListener;
 
+/// Default replica pipeline depth (pending ack queue capacity).
+const DEFAULT_REPLICATION_PIPELINE_DEPTH: usize = 8;
+
 /// Server configuration, parsed from CLI arguments via clap.
 #[derive(clap::Parser)]
 #[command(name = "melin-server", about = "Low-latency matching engine server")]
@@ -123,8 +126,8 @@ pub struct ServerConfig {
 
     /// Maximum number of replication ring batches to coalesce into a
     /// single TCP write+flush. Higher values reduce syscall overhead
-    /// but increase per-write latency. Default: 32.
-    #[arg(long, default_value_t = 32)]
+    /// but increase per-write latency. Default: 128.
+    #[arg(long, default_value_t = 128)]
     pub replication_batch_size: usize,
 
     /// Maximum events per journal fsync batch. Smaller values reduce
@@ -153,6 +156,14 @@ pub struct ServerConfig {
     /// (RAID, three-way replication, off-site journaling).
     #[arg(long, default_value_t = false)]
     pub async_replica_ack: bool,
+
+    /// Number of receive batches the replica can have awaiting local
+    /// journal fsync before the receiver applies backpressure. Must be a
+    /// power of two. Higher values allow the primary to stay further ahead
+    /// of the replica's fsync, which helps when group-commit delay is
+    /// non-zero. Default: 8.
+    #[arg(long, default_value_t = DEFAULT_REPLICATION_PIPELINE_DEPTH)]
+    pub replication_pipeline_depth: usize,
 
     /// Number of slots in each replication ring buffer. Must be a power
     /// of two. Each slot holds up to 512 KiB. More slots = more buffering
@@ -298,10 +309,11 @@ impl Default for ServerConfig {
             standalone: false,
             replica_of: None,
             replication_key: None,
-            replication_batch_size: 32,
+            replication_batch_size: 128,
             max_journal_batch: 1024,
             replication_heartbeat_secs: 5,
             async_replica_ack: false,
+            replication_pipeline_depth: DEFAULT_REPLICATION_PIPELINE_DEPTH,
             replication_ring_size: 256,
             no_quorum_durability: false,
             yield_idle: false,
@@ -497,6 +509,8 @@ pub fn run_with_shutdown<L: BlockingTransportListener>(
             config.cores,
             config.reader_cores,
             config.async_replica_ack,
+            config.group_commit_delay(),
+            config.replication_pipeline_depth,
             !config.yield_idle,
         )? {
             None => return Ok(()), // clean shutdown
@@ -1473,6 +1487,8 @@ pub fn run_dpdk(
             config.shadow_snapshot_path(),
             config.cores,
             config.reader_cores,
+            config.group_commit_delay(),
+            config.replication_pipeline_depth,
             !config.yield_idle,
         )? {
             None => return Ok(()), // clean shutdown

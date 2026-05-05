@@ -101,6 +101,7 @@ impl Default for ReplicationMetrics {
 }
 
 /// Pending ack waiting for journal durability confirmation.
+#[derive(Clone)]
 pub(super) struct PendingAck {
     /// Disruptor sequence target — ack is safe to send once the journal
     /// cursor reaches this value.
@@ -110,15 +111,14 @@ pub(super) struct PendingAck {
 }
 
 /// Fixed-capacity circular buffer of pending acks. Decouples TCP receives
-/// from journal fsync by allowing up to `CAP` batches to be submitted to
+/// from journal fsync by allowing up to `cap` batches to be submitted to
 /// the journal stage before any ack is sent. Acks are flushed in FIFO
 /// order as the journal cursor advances.
-///
-/// Capacity 8 provides enough headroom to pipeline ~8 batches ahead of
-/// the journal stage's NVMe writes without stalling the receiver.
 pub(super) struct PendingAckQueue {
-    /// Circular buffer of pending acks. Indices wrap via `& MASK`.
-    buf: [PendingAck; Self::CAP],
+    /// Heap-allocated circular buffer. Length equals `cap`.
+    buf: Box<[PendingAck]>,
+    /// Capacity; must be a power of two.
+    cap: usize,
     /// Index of the oldest pending ack (next to flush).
     head: usize,
     /// Number of pending acks in the queue.
@@ -126,26 +126,29 @@ pub(super) struct PendingAckQueue {
 }
 
 impl PendingAckQueue {
-    // Capacity 8 provides enough headroom to pipeline ~8 batches ahead
-    // of the journal stage's NVMe writes. With io_uring, the deadlock
-    // that forced CAP=1 is eliminated (RECV CQEs arrive asynchronously
-    // while pop_ready checks the cursor each iteration).
-    const CAP: usize = 8;
-    const MASK: usize = Self::CAP - 1;
-
-    pub(super) fn new() -> Self {
+    /// `cap` must be a power of two and ≥ 1.
+    pub(super) fn new(cap: usize) -> Self {
+        assert!(
+            cap.is_power_of_two(),
+            "PendingAckQueue cap must be a power of two"
+        );
         Self {
-            buf: std::array::from_fn(|_| PendingAck {
-                journal_target: 0,
-                acked_sequence: 0,
-            }),
+            buf: vec![
+                PendingAck {
+                    journal_target: 0,
+                    acked_sequence: 0,
+                };
+                cap
+            ]
+            .into_boxed_slice(),
+            cap,
             head: 0,
             len: 0,
         }
     }
 
     pub(super) fn is_full(&self) -> bool {
-        self.len >= Self::CAP
+        self.len >= self.cap
     }
 
     pub(super) fn is_empty(&self) -> bool {
@@ -159,7 +162,7 @@ impl PendingAckQueue {
     /// Record a pending ack. Caller must ensure `!is_full()`.
     pub(super) fn push(&mut self, journal_target: u64, acked_sequence: u64) {
         debug_assert!(!self.is_full());
-        let idx = (self.head + self.len) & Self::MASK;
+        let idx = (self.head + self.len) & (self.cap - 1);
         self.buf[idx] = PendingAck {
             journal_target,
             acked_sequence,
@@ -186,7 +189,7 @@ impl PendingAckQueue {
                 break; // Not durable yet.
             }
             last_acked = Some(entry.acked_sequence);
-            self.head = (self.head + 1) & Self::MASK;
+            self.head = (self.head + 1) & (self.cap - 1);
             self.len -= 1;
         }
         last_acked
@@ -203,7 +206,7 @@ impl PendingAckQueue {
         let mut last_acked = None;
         while self.len > 0 {
             last_acked = Some(self.buf[self.head].acked_sequence);
-            self.head = (self.head + 1) & Self::MASK;
+            self.head = (self.head + 1) & (self.cap - 1);
             self.len -= 1;
         }
         last_acked
@@ -394,6 +397,7 @@ pub(super) fn build_replica_pipeline_with_threads(
     cores: crate::server::PipelineCores,
     snapshot_interval_ms: u64,
     snapshot_path: std::path::PathBuf,
+    group_commit_delay: std::time::Duration,
     busy_spin: bool,
 ) -> Result<ReplicaPipelineHandles, Box<dyn std::error::Error>> {
     let shadow_exchange = <crate::App as melin_app::Application>::clone_via_snapshot(&exchange)?;
@@ -403,6 +407,7 @@ pub(super) fn build_replica_pipeline_with_threads(
         exchange,
         writer,
         4096, // max_journal_batch
+        group_commit_delay,
         busy_spin,
         enable_shadow,
     );
@@ -1673,7 +1678,7 @@ mod tests {
 
     #[test]
     fn pending_ack_queue_push_and_pop_ready() {
-        let mut q = PendingAckQueue::new();
+        let mut q = PendingAckQueue::new(8);
         assert!(q.is_empty());
         assert!(!q.is_full());
 
@@ -1702,7 +1707,7 @@ mod tests {
         // When multiple acks become ready simultaneously, pop_ready
         // returns the highest acked_sequence (ack semantics are
         // cumulative — "everything up to this sequence is durable").
-        let mut q = PendingAckQueue::new();
+        let mut q = PendingAckQueue::new(8);
         q.push(10, 100);
         q.push(20, 200);
         q.push(30, 300);
@@ -1716,7 +1721,7 @@ mod tests {
     fn pending_ack_queue_pop_all_async_returns_highest_and_drains() {
         // Async mode: cursor is irrelevant; everything pops at once and the
         // highest sequence wins (cumulative ack semantics).
-        let mut q = PendingAckQueue::new();
+        let mut q = PendingAckQueue::new(8);
         assert!(q.pop_all_async().is_none(), "empty queue returns None");
 
         q.push(10, 100);
@@ -1733,7 +1738,7 @@ mod tests {
         // async mode acks every pending entry — that's the whole point of
         // the flag, durability is shifted from per-entry fsync to the
         // primary's response gate.
-        let mut q = PendingAckQueue::new();
+        let mut q = PendingAckQueue::new(8);
         q.push(u64::MAX, 100);
         q.push(u64::MAX, 200);
         assert_eq!(q.pop_all_async(), Some(200));
@@ -1742,8 +1747,8 @@ mod tests {
 
     #[test]
     fn pending_ack_queue_capacity_and_full() {
-        let mut q = PendingAckQueue::new();
-        for i in 0..PendingAckQueue::CAP {
+        let mut q = PendingAckQueue::new(8);
+        for i in 0..8 {
             assert!(!q.is_full());
             q.push(i as u64 + 1, (i + 1) as u64 * 100);
         }
@@ -1752,7 +1757,7 @@ mod tests {
 
     #[test]
     fn pending_ack_queue_pop_oldest_blocking() {
-        let mut q = PendingAckQueue::new();
+        let mut q = PendingAckQueue::new(8);
         q.push(10, 100);
         q.push(20, 200);
 
@@ -1767,28 +1772,25 @@ mod tests {
 
     #[test]
     fn pending_ack_queue_wraps_around() {
-        let mut q = PendingAckQueue::new();
+        let mut q = PendingAckQueue::new(8);
         let cursor = make_journal_cursor(100);
 
         // Fill and drain multiple times to exercise circular buffer wrap.
         for round in 0..3 {
-            for i in 0..PendingAckQueue::CAP {
-                let target = (round * PendingAckQueue::CAP + i) as u64 + 1;
+            for i in 0..8 {
+                let target = (round * 8 + i) as u64 + 1;
                 q.push(target, target * 10);
             }
             assert!(q.is_full());
             let seq = q.pop_ready(&cursor).expect("should be ready");
-            assert_eq!(
-                seq,
-                (round * PendingAckQueue::CAP + PendingAckQueue::CAP) as u64 * 10
-            );
+            assert_eq!(seq, (round * 8 + 8) as u64 * 10);
             assert!(q.is_empty());
         }
     }
 
     #[test]
     fn pending_ack_queue_pop_all_blocking_empty() {
-        let mut q = PendingAckQueue::new();
+        let mut q = PendingAckQueue::new(8);
         let cursor = make_journal_cursor(0);
         assert!(q.pop_all_blocking(&cursor).is_none());
     }

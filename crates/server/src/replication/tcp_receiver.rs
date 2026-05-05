@@ -719,6 +719,8 @@ pub fn run_receiver(
     cores: crate::server::PipelineCores,
     receiver_core: usize,
     async_ack: bool,
+    group_commit_delay: std::time::Duration,
+    pipeline_depth: usize,
     busy_spin: bool,
 ) -> ReceiverResult {
     use crate::App;
@@ -1090,6 +1092,7 @@ pub fn run_receiver(
                 cores,
                 snapshot_interval_ms,
                 snapshot_path.clone(),
+                group_commit_delay,
                 busy_spin,
             )?);
         }
@@ -1101,7 +1104,7 @@ pub fn run_receiver(
         // cursor from the live pipeline; on `Disconnected` we just retake
         // them next iteration.
 
-        let mut pending_acks = PendingAckQueue::new();
+        let mut pending_acks = PendingAckQueue::new(pipeline_depth);
         let mut received_data = false;
 
         let exit_reason: SessionExit = {

@@ -314,6 +314,7 @@ mod tests {
             replica_exchange,
             replica_writer,
             MAX_JOURNAL_BATCH,
+            std::time::Duration::ZERO,
             false,
             false,
         );
