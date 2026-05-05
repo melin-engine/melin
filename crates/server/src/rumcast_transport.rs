@@ -1099,15 +1099,15 @@ fn session_translator<S, R>(
         // and retry next iteration — never block, since this thread
         // also drains the SMs that advance publisher_limit.
 
-        // Outbound coalescing: drain up to OUTBOUND_BATCH OutputSlots
-        // into per-session publogs in one iter so the next `tick` ships
-        // them in a single sendmmsg. Without this, each iter publishes
-        // one fragment and the subsequent tick sends a 1-packet
-        // sendmmsg (wasted batching capacity, ~91K syscalls/sec at
-        // saturation). The batch is bounded so a stream of responses
-        // can't starve `tick`/`poll`/idle bookkeeping.
-        const OUTBOUND_BATCH: u32 = 32;
-        for _ in 0..OUTBOUND_BATCH {
+        // Outbound coalescing: drain all available OutputSlots into
+        // per-session publogs in one iter so the next `tick` ships them
+        // in a single sendmmsg. The loop exits naturally when the output
+        // ring is empty (try_consume returns None) or publisher_limit is
+        // exhausted (try_claim returns Err). No artificial cap — a fixed
+        // batch size throttles throughput proportionally to RTT (e.g. a
+        // cap of 32 at 1.7K iters/sec yields only 55K responses/sec ÷ 2
+        // responses/order = ~28K orders/sec regardless of window size).
+        loop {
             // Stage 2: drain a previously-encoded envelope first.
             if let Some((session_id, env_len)) = pending_publish {
                 diag.pending_publish_held += 1;
