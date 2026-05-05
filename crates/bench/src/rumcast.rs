@@ -542,10 +542,13 @@ pub fn run_rumcast_roundtrip(cfg: RumcastBenchConfig) {
         }
     }
 
+    // Snapshot elapsed BEFORE joining the progress thread: that thread sleeps
+    // in 5-second increments and only checks shutdown after each sleep, so
+    // join() can block up to ~5s and would otherwise pollute `elapsed` —
+    // turning a 200ms bench into a 5s "elapsed" reading.
+    let elapsed = bench_start.elapsed();
     progress_shutdown.store(true, Ordering::Relaxed);
     let _ = progress_handle.join();
-
-    let elapsed = bench_start.elapsed();
     let measured = total_msgs - cfg.warmup * cfg.clients;
     println!();
     println!(

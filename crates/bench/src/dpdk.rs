@@ -600,11 +600,16 @@ pub fn run_dpdk_roundtrip(
         }
     }
 
+    // Snapshot end time BEFORE joining the progress thread: that thread
+    // sleeps in 5-second increments and only checks shutdown after each
+    // sleep, so progress_handle.join() can block up to ~5s and would
+    // otherwise inflate `measured_wall` for short benches.
+    let end = Instant::now();
+
     // Stop progress reporter.
     progress_shutdown.store(true, Ordering::Relaxed);
     let _ = progress_handle.join();
 
-    let end = Instant::now();
     let measured_wall = measured_start
         .map(|s| end.duration_since(s))
         .unwrap_or_else(|| start.elapsed());

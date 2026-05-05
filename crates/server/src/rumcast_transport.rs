@@ -532,10 +532,12 @@ fn run_rumcast_primary_with_state(
 
     // Pipeline: journal stage.
     let journal_shutdown = Arc::clone(&shutdown);
+    let journal_core = config.cores.journal;
     handles.push(
         thread::Builder::new()
             .name("journal".into())
             .spawn(move || {
+                crate::affinity::pin_thread("journal", journal_core);
                 if let Err(e) = journal_stage.run(&journal_shutdown) {
                     error!(error = ?e, "journal stage exited with error");
                 }
@@ -544,10 +546,12 @@ fn run_rumcast_primary_with_state(
 
     // Pipeline: matching stage.
     let matching_shutdown = Arc::clone(&shutdown);
+    let matching_core = config.cores.matching;
     handles.push(
         thread::Builder::new()
             .name("matching".into())
             .spawn(move || {
+                crate::affinity::pin_thread("matching", matching_core);
                 let _final_app = matching_stage.run(&matching_shutdown);
             })?,
     );
@@ -658,11 +662,13 @@ fn run_rumcast_primary_with_state(
         let connected_for_thread = Arc::clone(&connected);
         let ready_for_thread = Arc::clone(&ready_flag);
         let s_for_thread = Arc::clone(&s_repl);
+        let repl_sender_core = config.cores.repl_sender;
 
         handles.push(
             thread::Builder::new()
                 .name("repl-rumcast-sender".into())
                 .spawn(move || {
+                    crate::affinity::pin_thread("repl-rumcast-sender", repl_sender_core);
                     crate::replication::run_sender_rumcast(
                         crate::replication::RumcastSender {
                             bind_addr: repl_bind,
@@ -777,10 +783,16 @@ fn run_rumcast_primary_with_state(
         let mut muxed_sender = muxed_sender;
         muxed_receiver.set_counters(Some(Arc::clone(&counters)));
         muxed_sender.set_counters(Some(Arc::clone(&counters)));
+        // Pin to the response core: the session_translator does the
+        // response-equivalent work in the rumcast path (TCP/DPDK
+        // builds run a separate `response` stage on this core; rumcast
+        // collapses recv+match-output+send into one thread).
+        let session_core = config.cores.response;
         handles.push(
             thread::Builder::new()
                 .name("rumcast-session".into())
                 .spawn(move || {
+                    crate::affinity::pin_thread("rumcast-session", session_core);
                     session_translator(
                         muxed_receiver,
                         muxed_sender,

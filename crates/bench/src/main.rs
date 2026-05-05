@@ -1174,6 +1174,13 @@ fn spawn_embedded_rumcast_server(
         // collide on the default port; the bench doesn't poll it in
         // rumcast mode anyway.
         health_bind: None,
+        // Embedded mode runs on a shared developer machine without
+        // isolcpus. Busy-spin in every server thread + busy-spin in the
+        // bench client on the same cores starves the session_translator
+        // (we measured <1% CPU). Yield-idle gives the scheduler a chance
+        // to multiplex. Production (LAN) keeps yield_idle=false because
+        // server cores are isolated.
+        yield_idle: true,
         ..ServerConfig::default()
     };
     let rumcast_config = melin_server::rumcast_transport::RumcastConfig { bind: server_addr };
@@ -1383,11 +1390,19 @@ pub(crate) fn spawn_progress_reporter(
             let start = Instant::now();
             let mut last_completed: u64 = 0;
             let mut last_time = start;
+            // Print interval is 5s, but poll the shutdown flag every 100ms so
+            // bench cleanup doesn't have to wait the full interval to exit.
+            const PRINT_INTERVAL: Duration = Duration::from_secs(5);
+            const POLL_INTERVAL: Duration = Duration::from_millis(100);
 
-            loop {
-                std::thread::sleep(Duration::from_secs(5));
-                if shutdown.load(Ordering::Relaxed) {
-                    break;
+            'outer: loop {
+                let mut waited = Duration::ZERO;
+                while waited < PRINT_INTERVAL {
+                    if shutdown.load(Ordering::Relaxed) {
+                        break 'outer;
+                    }
+                    std::thread::sleep(POLL_INTERVAL);
+                    waited += POLL_INTERVAL;
                 }
 
                 let now = Instant::now();
@@ -1585,6 +1600,12 @@ fn run_uring_roundtrip<R, W, F>(
         all_series.extend(s);
     }
 
+    // Snapshot end time BEFORE joining the progress thread: that thread
+    // sleeps in 5-second increments and only checks shutdown after each
+    // sleep, so progress_handle.join() can block up to ~5s and would
+    // otherwise inflate `measured_wall` for short benches.
+    let end = Instant::now();
+
     // Stop progress reporter.
     progress_shutdown.store(true, Ordering::Relaxed);
     let _ = progress_handle.join();
@@ -1593,9 +1614,8 @@ fn run_uring_roundtrip<R, W, F>(
     let health_samples = health_poller.map(|p| p.stop()).unwrap_or_default();
 
     // Measure throughput over the measured phase only — from when the first
-    // thread finished warmup until now. This covers all measured orders
-    // from all threads without undercounting.
-    let end = Instant::now();
+    // thread finished warmup until `end` (captured above, pre-join). This
+    // covers all measured orders from all threads without undercounting.
     let measured_wall = earliest_measured_start
         .map(|s| end.duration_since(s))
         .unwrap_or_else(|| start.elapsed());
