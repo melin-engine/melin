@@ -126,8 +126,8 @@ pub struct ServerConfig {
 
     /// Maximum number of replication ring batches to coalesce into a
     /// single TCP write+flush. Higher values reduce syscall overhead
-    /// but increase per-write latency. Default: 32.
-    #[arg(long, default_value_t = 32)]
+    /// but increase per-write latency. Default: 128.
+    #[arg(long, default_value_t = 128)]
     pub replication_batch_size: usize,
 
     /// Maximum events per journal fsync batch. Smaller values reduce
@@ -309,7 +309,7 @@ impl Default for ServerConfig {
             standalone: false,
             replica_of: None,
             replication_key: None,
-            replication_batch_size: 32,
+            replication_batch_size: 128,
             max_journal_batch: 1024,
             replication_heartbeat_secs: 5,
             async_replica_ack: false,
