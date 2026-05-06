@@ -169,6 +169,12 @@ else
     RUMCAST_DIAG_ENV=""
 fi
 
+# Diagnostic only — opt-in disable of UDP-GSO on rumcast send paths.
+# A/B helper for "is GSO actually helping or hurting on this NIC?".
+if [[ "${RUMCAST_DISABLE_GSO:-}" == "1" ]]; then
+    RUMCAST_DIAG_ENV="${RUMCAST_DIAG_ENV}RUMCAST_DISABLE_GSO=1 "
+fi
+
 # Order counts — override for quick smoke tests.
 THROUGHPUT_ORDERS="${THROUGHPUT_ORDERS:-100000000}"
 THROUGHPUT_CLIENTS="${THROUGHPUT_CLIENTS:-16}"
