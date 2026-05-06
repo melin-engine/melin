@@ -322,9 +322,8 @@ impl<T: UdpTransport> MuxedSender<T> {
     /// 3. Advance per-session `last_sent_position` based on sent count.
     pub fn tick(&mut self) -> TickStats {
         let mut stats = TickStats::default();
-        self.drain_control(&mut stats);
-
         let now = Instant::now();
+        self.drain_control(&mut stats, now);
         let max_drain = self.config.max_drain_per_tick;
         let setup_interval = self.config.setup_interval;
         let heartbeat_interval = self.config.heartbeat_interval;
@@ -457,8 +456,10 @@ impl<T: UdpTransport> MuxedSender<T> {
         let total_sent = staging_sent;
 
         // Phase 3: advance per-session positions based on sent count.
+        // Reuse the tick-start `now` for `last_send_at`. The few µs
+        // drift across the sendmmsg call doesn't matter — heartbeat
+        // gating uses ~100ms intervals.
         let mut remaining = total_sent;
-        let now_after_send = Instant::now();
         for range in &self.session_ranges {
             if remaining == 0 {
                 break;
@@ -473,7 +474,7 @@ impl<T: UdpTransport> MuxedSender<T> {
                 stats.fragments_sent += 1;
             }
             if sent_this > 0 {
-                session.last_send_at = now_after_send;
+                session.last_send_at = now;
             }
             remaining -= sent_this;
         }
@@ -530,7 +531,7 @@ impl<T: UdpTransport> MuxedSender<T> {
         }
     }
 
-    fn drain_control(&mut self, stats: &mut TickStats) {
+    fn drain_control(&mut self, stats: &mut TickStats, now: Instant) {
         // One batched recv per tick — sender-side control traffic
         // (NAK/SM) is lower volume than data, but the same N→1
         // syscall amortization applies.
@@ -572,7 +573,7 @@ impl<T: UdpTransport> MuxedSender<T> {
                 Routed::Nak { session_id, nak } => {
                     stats.naks_received += 1;
                     if let Some(session) = self.sessions.get_mut(&session_id) {
-                        session.handle_nak(&self.transport, &nak, stats);
+                        session.handle_nak(&self.transport, &nak, stats, now);
                     } else {
                         stats.control_drops += 1;
                     }
@@ -599,6 +600,7 @@ impl SessionOutbound {
         transport: &T,
         nak: &NakFrame,
         stats: &mut TickStats,
+        now: Instant,
     ) {
         let Some(window) = self
             .log
@@ -623,7 +625,7 @@ impl SessionOutbound {
                 Ok(_) => {
                     stats.retransmits_sent += 1;
                     stats.bytes_sent += fragment.len() as u64;
-                    self.last_send_at = Instant::now();
+                    self.last_send_at = now;
                 }
                 Err(_) => stats.send_errors += 1,
             }

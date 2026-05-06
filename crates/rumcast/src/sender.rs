@@ -168,9 +168,14 @@ impl<T: UdpTransport> SenderLoop<T> {
     /// Run one tick. Returns the work performed in this tick.
     pub fn tick(&mut self) -> TickStats {
         let mut stats = TickStats::default();
-        self.drain_control(&mut stats);
-        self.drain_data(&mut stats);
-        self.maybe_send_periodic(&mut stats);
+        // One clock read per tick. Reused for last_send_at stamps and
+        // for the periodic Setup/HB gating below — the few-µs drift
+        // across the syscalls that follow is well below the smallest
+        // interval we check against.
+        let now = Instant::now();
+        self.drain_control(&mut stats, now);
+        self.drain_data(&mut stats, now);
+        self.maybe_send_periodic(&mut stats, now);
         if let Some(c) = &self.counters {
             fold_into_counters(c, &stats);
         }
@@ -187,7 +192,7 @@ impl<T: UdpTransport> SenderLoop<T> {
         self.receivers.len()
     }
 
-    fn drain_control(&mut self, stats: &mut TickStats) {
+    fn drain_control(&mut self, stats: &mut TickStats, now: Instant) {
         // One batched recv per tick — sender control traffic
         // (NAK/SM) amortizes its per-frame syscall the same way the
         // receiver's data path does.
@@ -225,7 +230,7 @@ impl<T: UdpTransport> SenderLoop<T> {
             match routed {
                 Routed::Nak(nak) => {
                     stats.naks_received += 1;
-                    self.handle_nak(&nak, stats);
+                    self.handle_nak(&nak, stats, now);
                 }
                 Routed::Sm(sm) => {
                     stats.sms_received += 1;
@@ -236,7 +241,7 @@ impl<T: UdpTransport> SenderLoop<T> {
         }
     }
 
-    fn handle_nak(&mut self, nak: &NakFrame, stats: &mut TickStats) {
+    fn handle_nak(&mut self, nak: &NakFrame, stats: &mut TickStats, now: Instant) {
         // Find the requested bytes in the log; retransmit each fragment
         // covered by the NAK as its own UDP packet.
         let Some(window) = self
@@ -267,7 +272,7 @@ impl<T: UdpTransport> SenderLoop<T> {
                 Ok(_) => {
                     stats.retransmits_sent += 1;
                     stats.bytes_sent += fragment.len() as u64;
-                    self.last_send_at = Instant::now();
+                    self.last_send_at = now;
                 }
                 Err(_) => stats.send_errors += 1,
             }
@@ -319,7 +324,7 @@ impl<T: UdpTransport> SenderLoop<T> {
         }
     }
 
-    fn drain_data(&mut self, stats: &mut TickStats) {
+    fn drain_data(&mut self, stats: &mut TickStats, now: Instant) {
         // Collect up to BATCH fragments at once and ship them via
         // `send_batch_to` (one `sendmmsg` syscall on the kernel
         // backend). At sustained rate this turns one syscall per
@@ -377,7 +382,7 @@ impl<T: UdpTransport> SenderLoop<T> {
                 stats.fragments_sent += 1;
                 drained += aligned_sizes[i];
             }
-            self.last_send_at = Instant::now();
+            self.last_send_at = now;
             // If the kernel accepted fewer than we staged, the rest
             // were a partial tail — break and let the next tick
             // re-stage from the new last_sent_position.
@@ -387,8 +392,7 @@ impl<T: UdpTransport> SenderLoop<T> {
         }
     }
 
-    fn maybe_send_periodic(&mut self, stats: &mut TickStats) {
-        let now = Instant::now();
+    fn maybe_send_periodic(&mut self, stats: &mut TickStats, now: Instant) {
         if now.duration_since(self.last_setup_at) >= self.config.setup_interval {
             self.send_setup(stats, now);
         }

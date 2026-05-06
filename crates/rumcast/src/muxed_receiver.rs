@@ -245,10 +245,12 @@ impl<T: UdpTransport> MuxedReceiver<T> {
     /// `Counters`).
     pub fn tick(&mut self) -> TickStats {
         let mut stats = TickStats::default();
-        self.drain_recv(&mut stats);
-        // Per-session bookkeeping. Two passes (gap detect then
-        // fire/SM) so we don't read-while-write on pending_naks.
+        // One clock read per tick — passed into drain_recv for
+        // last_publisher_seen_at stamping and reused below for
+        // NAK/SM scheduling. The few-µs drift between drain and
+        // schedule is below every interval we check against.
         let now = Instant::now();
+        self.drain_recv(&mut stats, now);
         let nak_min = self.config.nak_backoff_min;
         let nak_jitter = self.config.nak_backoff_jitter;
         let sm_interval = self.config.sm_interval;
@@ -306,7 +308,7 @@ impl<T: UdpTransport> MuxedReceiver<T> {
         total
     }
 
-    fn drain_recv(&mut self, stats: &mut TickStats) {
+    fn drain_recv(&mut self, stats: &mut TickStats, now: Instant) {
         // One batched recv per tick (sendmmsg-equivalent on KernelUdp,
         // single SPSC drain on the io_uring endpoint). Each filled
         // slot is parsed and dispatched to its session.
@@ -344,7 +346,6 @@ impl<T: UdpTransport> MuxedReceiver<T> {
         }
 
         let cfg_stream = self.config.stream_id;
-        let now = Instant::now();
 
         for slot_idx in 0..n {
             let slot = &self.batch_slots[slot_idx];

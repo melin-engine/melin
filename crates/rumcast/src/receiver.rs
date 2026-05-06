@@ -225,10 +225,14 @@ impl<T: UdpTransport> ReceiverLoop<T> {
     /// Run one tick. Returns the work performed.
     pub fn tick(&mut self) -> TickStats {
         let mut stats = TickStats::default();
-        self.drain_recv(&mut stats);
-        self.detect_and_schedule_gap(&mut stats);
-        self.fire_due_naks(&mut stats);
-        self.maybe_send_sm(&mut stats);
+        // One clock read per tick, threaded through every stage.
+        // The few-µs drift across stages is far below the smallest
+        // interval we check against (NAK backoff_min ~50µs).
+        let now = Instant::now();
+        self.drain_recv(&mut stats, now);
+        self.detect_and_schedule_gap(&mut stats, now);
+        self.fire_due_naks(&mut stats, now);
+        self.maybe_send_sm(&mut stats, now);
         if let Some(c) = &self.counters {
             fold_into_counters(c, &stats);
         }
@@ -247,7 +251,7 @@ impl<T: UdpTransport> ReceiverLoop<T> {
         self.pending_naks.len()
     }
 
-    fn drain_recv(&mut self, stats: &mut TickStats) {
+    fn drain_recv(&mut self, stats: &mut TickStats, now: Instant) {
         // One batched recv per tick: on KernelUdp this is one
         // `recvmmsg(2)` syscall for up to `max_recv_per_tick` frames;
         // on the io_uring endpoint it's one `Mutex` acquire on the
@@ -267,7 +271,6 @@ impl<T: UdpTransport> ReceiverLoop<T> {
 
         let cfg_session = self.log.config().session_id;
         let cfg_stream = self.log.config().stream_id;
-        let now = Instant::now();
 
         for slot in &self.batch_slots[..n] {
             let bytes = slot.payload();
@@ -323,7 +326,7 @@ impl<T: UdpTransport> ReceiverLoop<T> {
         }
     }
 
-    fn detect_and_schedule_gap(&mut self, _stats: &mut TickStats) {
+    fn detect_and_schedule_gap(&mut self, _stats: &mut TickStats, now: Instant) {
         let bits = self.log.term_length_bits();
         let sub_pos = self.log.subscriber_position();
         let sub_term_id = (sub_pos >> bits) as u32;
@@ -349,7 +352,6 @@ impl<T: UdpTransport> ReceiverLoop<T> {
         // callback and bump the counters. Repeat detections of the
         // same (term_id, offset, gap_length) tuple are deduped above
         // so the callback is invoked at most once per distinct gap.
-        let now_for_event = Instant::now();
         if let Some(c) = &self.counters {
             c.gaps_detected
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -363,7 +365,7 @@ impl<T: UdpTransport> ReceiverLoop<T> {
                 term_id: sub_term_id,
                 term_offset: sub_offset,
                 gap_length,
-                detected_at: now_for_event,
+                detected_at: now,
             });
         }
 
@@ -371,8 +373,7 @@ impl<T: UdpTransport> ReceiverLoop<T> {
         let jitter_us = self
             .rng
             .in_range(self.config.nak_backoff_jitter.as_micros().max(1) as u64);
-        let fire_at =
-            Instant::now() + self.config.nak_backoff_min + Duration::from_micros(jitter_us);
+        let fire_at = now + self.config.nak_backoff_min + Duration::from_micros(jitter_us);
         self.pending_naks.insert(
             key,
             PendingNak {
@@ -384,8 +385,7 @@ impl<T: UdpTransport> ReceiverLoop<T> {
         );
     }
 
-    fn fire_due_naks(&mut self, stats: &mut TickStats) {
-        let now = Instant::now();
+    fn fire_due_naks(&mut self, stats: &mut TickStats, now: Instant) {
         let bits = self.log.term_length_bits();
         let sub_pos = self.log.subscriber_position();
         let session_id = self.log.config().session_id;
@@ -433,8 +433,7 @@ impl<T: UdpTransport> ReceiverLoop<T> {
         });
     }
 
-    fn maybe_send_sm(&mut self, stats: &mut TickStats) {
-        let now = Instant::now();
+    fn maybe_send_sm(&mut self, stats: &mut TickStats, now: Instant) {
         if now.duration_since(self.last_sm_at) < self.config.sm_interval {
             return;
         }
