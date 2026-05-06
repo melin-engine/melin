@@ -292,6 +292,57 @@ done
 echo ""
 
 # ---------------------------------------------------------------------------
+# 3b'. Pin device IRQs to core 0
+# ---------------------------------------------------------------------------
+# `isolcpus` keeps the scheduler off the engine cores, but it does NOT
+# steer hardware IRQs. Boot-time defaults spread NIC/NVMe/etc. interrupts
+# across cores including the ones we use for journal/matching/response
+# /DPDK-poll, so each interrupt delivery stalls a hot-path thread.
+# We disabled `irqbalance` above, so a one-shot pin at boot is enough.
+echo "=== Pinning device IRQs to core 0 ==="
+cat > /usr/local/sbin/melin-irq-pin << 'EOF'
+#!/usr/bin/env bash
+# Pin all retargetable device IRQs to core 0. EIOs on un-retargetable
+# IRQs (per-CPU IPIs, IOMMU remap) are expected and ignored.
+set -u
+applied=0
+skipped=0
+for irq in /proc/irq/[0-9]*; do
+    if printf '1' > "$irq/smp_affinity" 2>/dev/null; then
+        applied=$((applied + 1))
+    else
+        skipped=$((skipped + 1))
+    fi
+done
+logger -t melin-irq-pin "applied=${applied} skipped=${skipped}"
+EOF
+chmod +x /usr/local/sbin/melin-irq-pin
+
+cat > /etc/systemd/system/melin-irq-pin.service << 'EOF'
+[Unit]
+Description=Pin device IRQs to core 0 (Melin bench tuning)
+After=multi-user.target
+# irqbalance is disabled, but order this after it just in case it ever
+# gets re-enabled — we want to be the last writer.
+After=irqbalance.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/melin-irq-pin
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
+EOF
+systemctl daemon-reload
+systemctl enable melin-irq-pin.service
+# Apply now too so we don't need to wait for a reboot.
+/usr/local/sbin/melin-irq-pin
+echo "  IRQ pin service installed and applied"
+
+echo ""
+
+# ---------------------------------------------------------------------------
 # 3c. Sysctl tuning (persistent via /etc/sysctl.d/)
 # ---------------------------------------------------------------------------
 echo "=== Configuring sysctl ==="
