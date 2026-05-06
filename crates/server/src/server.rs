@@ -393,6 +393,44 @@ pub struct PipelineCores {
     pub repl_handler_1: usize,
 }
 
+impl PipelineCores {
+    /// Compact pipeline layout that fits on `num_cpus` physical+logical
+    /// cores while reserving one core for an external client (bench or
+    /// reader). Used by the embedded bench so it doesn't HT-collide with
+    /// the pipeline cores.
+    ///
+    /// On the default workstation `Default` layout the journal (core 1),
+    /// matching (core 2), and shadow/repl_handler cores (8/9/10) are HT
+    /// siblings of each other on an 8-core (16-thread) Ryzen — a layout
+    /// designed for a 16-physical-core box. This packs everything into
+    /// the lower physical cores and leaves the last one free.
+    ///
+    /// Returns the chosen layout and the recommended bench/client core.
+    /// Errors if `num_cpus` is too small to host the pipeline.
+    pub fn compact(num_cpus: usize) -> Result<(Self, usize), String> {
+        // Need: journal, matching, response, event_publisher, shadow,
+        // repl_sender (one each) + 1 reserved for bench = 7 cores. Plus
+        // core 0 for the OS / IRQs. So minimum 8 logical cores.
+        if num_cpus < 8 {
+            return Err(format!(
+                "compact layout needs >= 8 logical cores; have {num_cpus}"
+            ));
+        }
+        let cores = PipelineCores {
+            journal: 1,
+            matching: 2,
+            response: 3,
+            repl_sender: 4,
+            event_publisher: 5,
+            shadow: 6,
+            // repl handlers don't run in embedded bench; 0 = unpinned.
+            repl_handler_0: 0,
+            repl_handler_1: 0,
+        };
+        Ok((cores, 7))
+    }
+}
+
 /// Parse "j,m,r,s,e,sh,h0,h1" into `PipelineCores` for pipeline core affinity.
 fn parse_cores(s: &str) -> Result<PipelineCores, String> {
     let parts: Vec<&str> = s.split(',').collect();

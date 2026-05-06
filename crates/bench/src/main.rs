@@ -348,7 +348,8 @@ fn main() {
         "roundtrip" => {
             #[cfg(all(not(feature = "dpdk"), feature = "rumcast"))]
             {
-                let (server_addr, bench_bind, signing_key) = match args.addr {
+                let (server_addr, bench_bind, signing_key, recommended_bench_core) = match args.addr
+                {
                     Some(addr) => {
                         // Remote mode — operator must supply bind + key.
                         let bind = args.rumcast_bind.unwrap_or_else(|| {
@@ -365,7 +366,9 @@ fn main() {
                             );
                             std::process::exit(1);
                         });
-                        (addr, bind, load_signing_key(key_path))
+                        // Remote mode: no embedded layout to advise on.
+                        // Trust whatever --bench-cores the operator set.
+                        (addr, bind, load_signing_key(key_path), 0)
                     }
                     None => spawn_embedded_rumcast_server(
                         args.rumcast_bind,
@@ -375,6 +378,14 @@ fn main() {
                         args.journal.clone(),
                     ),
                 };
+                // Embedded-mode default: use the core the embedded
+                // server reserved for the client. Explicit --bench-cores
+                // still wins so operators can override.
+                let bench_core_start = args.bench_cores.or(if args.addr.is_none() {
+                    Some(recommended_bench_core)
+                } else {
+                    None
+                });
                 rumcast::run_rumcast_roundtrip(rumcast::RumcastBenchConfig {
                     server_addr,
                     bind: bench_bind,
@@ -387,7 +398,7 @@ fn main() {
                     json_path: json_path.map(|p| p.to_path_buf()),
                     busy_spin: args.rumcast_busy_spin,
                     signing_key,
-                    bench_core_start: args.bench_cores,
+                    bench_core_start,
                 });
             }
 
@@ -1128,8 +1139,9 @@ fn spawn_embedded_rumcast_server(
     std::net::SocketAddr,
     std::net::SocketAddr,
     ed25519_dalek::SigningKey,
+    usize,
 ) {
-    use melin_server::server::ServerConfig;
+    use melin_server::server::{PipelineCores, ServerConfig};
     use std::net::{IpAddr, Ipv4Addr, SocketAddr, UdpSocket};
 
     // Deterministic key — same trick as the TCP embedded path.
@@ -1161,6 +1173,29 @@ fn spawn_embedded_rumcast_server(
 
     let effective_journal = journal_path.unwrap_or_else(|| tmp_dir.join("rumcast-bench.journal"));
 
+    // Detect available CPUs and pick a compact layout that doesn't
+    // HT-collide on this box. Falls back to the workstation default
+    // when there's enough room (>= 12 logical cores), preserving
+    // existing behavior on bigger machines.
+    let num_cpus = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(8);
+    let (pipeline_cores, recommended_bench_core) = if num_cpus < 12 {
+        match PipelineCores::compact(num_cpus) {
+            Ok((c, b)) => (c, b),
+            Err(e) => {
+                eprintln!("error: cannot lay out embedded rumcast server: {e}");
+                std::process::exit(1);
+            }
+        }
+    } else {
+        // Workstation/server default. repl_handler cores 9/10 are HT
+        // siblings of journal/matching only on 8-core boxes; on >= 12
+        // logical cores those are real physical cores. Keep the bench
+        // off any pinned core (11 is the first unused).
+        (ServerConfig::default().cores, 11)
+    };
+
     let config = ServerConfig {
         bind: server_addr,
         journal: effective_journal,
@@ -1174,13 +1209,18 @@ fn spawn_embedded_rumcast_server(
         // collide on the default port; the bench doesn't poll it in
         // rumcast mode anyway.
         health_bind: None,
-        // Embedded mode runs on a shared developer machine without
-        // isolcpus. Busy-spin in every server thread + busy-spin in the
-        // bench client on the same cores starves the session_translator
-        // (we measured <1% CPU). Yield-idle gives the scheduler a chance
-        // to multiplex. Production (LAN) keeps yield_idle=false because
-        // server cores are isolated.
-        yield_idle: true,
+        // Match production (LAN) idle strategy: busy-spin. The compact
+        // core layout below keeps the pipeline threads off each other's
+        // HT siblings, so busy-spin doesn't starve any peer.
+        yield_idle: false,
+        // Compact layout that fits the dev box (8-core Ryzen) without
+        // HT-pairing pipeline threads against each other. The default
+        // `PipelineCores` is sized for a 16-physical-core workstation:
+        // shadow=8, repl_handler_0=9, repl_handler_1=10 are HT siblings
+        // of cores 0/1/2 (journal, matching) on an 8-core/16-thread
+        // CPU, which murders busy-spin throughput. Reserve the last
+        // core for the bench client.
+        cores: pipeline_cores,
         ..ServerConfig::default()
     };
     let rumcast_config = melin_server::rumcast_transport::RumcastConfig { bind: server_addr };
@@ -1198,9 +1238,17 @@ fn spawn_embedded_rumcast_server(
         })
         .expect("spawn rumcast server thread");
 
-    eprintln!("embedded rumcast server: server_addr={server_addr} bench_bind={bench_bind}");
+    eprintln!(
+        "embedded rumcast server: server_addr={server_addr} bench_bind={bench_bind} \
+         cores=j{}/m{}/r{}/e{}/s{} bench_core={recommended_bench_core}",
+        pipeline_cores.journal,
+        pipeline_cores.matching,
+        pipeline_cores.response,
+        pipeline_cores.event_publisher,
+        pipeline_cores.shadow,
+    );
 
-    (server_addr, bench_bind, bench_key)
+    (server_addr, bench_bind, bench_key, recommended_bench_core)
 }
 
 /// Connect to TCP server with retry (up to 50 attempts, 10ms apart).
