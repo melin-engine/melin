@@ -200,6 +200,21 @@ pub struct MuxedSender<T: UdpTransport> {
     send_entries: Vec<(SocketAddr, usize, usize)>,
     /// Per-session range within `send_staging` for the current tick.
     session_ranges: Vec<SessionSendRange>,
+    /// `(dst, offset, total_len, segment_size)` entries collapsing
+    /// runs of consecutive same-size fragments per session into a
+    /// single GSO mmsghdr. Used by Phase 2 when the kernel supports
+    /// `UDP_SEGMENT`. Worst case (all distinct sizes) is one entry
+    /// per `send_staging` entry, so we share the same capacity.
+    segmented_entries: Vec<(SocketAddr, usize, usize, u16)>,
+    /// Parallel to `segmented_entries`: number of `send_staging`
+    /// entries each segmented entry covers. Phase 3 sums prefix
+    /// values to recover the staging-entry-equivalent of an accepted
+    /// mmsghdr count.
+    segmented_runs: Vec<u32>,
+    /// Set after the first `EINVAL` from `send_segmented_staged`.
+    /// Older kernels and some virt environments reject `UDP_SEGMENT`;
+    /// detect once and fall back to plain `send_staged` permanently.
+    gso_unsupported: bool,
 }
 
 impl<T: UdpTransport> MuxedSender<T> {
@@ -221,6 +236,9 @@ impl<T: UdpTransport> MuxedSender<T> {
             send_staging: Vec::with_capacity(max_s * DRAIN_BATCH),
             send_entries: Vec::with_capacity(max_s * DRAIN_BATCH),
             session_ranges: Vec::with_capacity(max_s),
+            segmented_entries: Vec::with_capacity(max_s * DRAIN_BATCH),
+            segmented_runs: Vec::with_capacity(max_s * DRAIN_BATCH),
+            gso_unsupported: false,
         }
     }
 
@@ -371,21 +389,72 @@ impl<T: UdpTransport> MuxedSender<T> {
             }
         }
 
-        // Phase 2: one cross-session sendmmsg call — no allocation.
-        let total_sent = if !self.send_entries.is_empty() {
+        // Phase 1.5: coalesce same-size consecutive runs per session
+        // into GSO entries. Each segmented entry collapses N adjacent
+        // mmsghdrs whose `len`s match into one mmsghdr that the kernel
+        // splits at egress (or in hardware on real NICs). Skip the
+        // build entirely when GSO is known unsupported — saves the
+        // walk on every tick.
+        if !self.gso_unsupported {
+            self.segmented_entries.clear();
+            self.segmented_runs.clear();
+            for range in &self.session_ranges {
+                let mut i = range.start;
+                let end = range.start + range.count;
+                while i < end {
+                    let frag_len = self.send_staging[i].len;
+                    let run_offset = self.send_entries[i].1;
+                    let run_dst = self.send_entries[i].0;
+                    let mut run = 1usize;
+                    while i + run < end && self.send_staging[i + run].len == frag_len {
+                        run += 1;
+                    }
+                    self.segmented_entries.push((
+                        run_dst,
+                        run_offset,
+                        frag_len * run,
+                        frag_len as u16,
+                    ));
+                    self.segmented_runs.push(run as u32);
+                    i += run;
+                }
+            }
+        }
+
+        // Phase 2: one cross-session sendmmsg call. GSO path uses
+        // segmented_entries (one mmsghdr per same-size run); fallback
+        // uses send_entries (one mmsghdr per fragment). On the first
+        // EINVAL the GSO path is disabled permanently and we re-issue
+        // the send via the fallback path so this tick's data isn't
+        // lost.
+        let staging_sent = if self.send_entries.is_empty() {
+            0
+        } else if self.gso_unsupported {
+            self.send_via_staged(&mut stats)
+        } else {
             match self
                 .transport
-                .send_staged(&self.staging_data, &self.send_entries)
+                .send_segmented_staged(&self.staging_data, &self.segmented_entries)
             {
-                Ok(n) => n,
+                Ok(mmsghdrs_sent) => self.segmented_runs[..mmsghdrs_sent]
+                    .iter()
+                    .map(|&n| n as usize)
+                    .sum(),
+                Err(e) if e.raw_os_error() == Some(libc::EINVAL) => {
+                    // First time we observe EINVAL: kernel has no
+                    // UDP_SEGMENT support. Fall back this tick and
+                    // for all future ticks. No data lost: nothing
+                    // was sent on the failing call.
+                    self.gso_unsupported = true;
+                    self.send_via_staged(&mut stats)
+                }
                 Err(_) => {
                     stats.send_errors += 1;
                     0
                 }
             }
-        } else {
-            0
         };
+        let total_sent = staging_sent;
 
         // Phase 3: advance per-session positions based on sent count.
         let mut remaining = total_sent;
@@ -442,6 +511,23 @@ impl<T: UdpTransport> MuxedSender<T> {
             crate::sender::fold_into_counters(c, &stats);
         }
         stats
+    }
+
+    /// Fallback send path used when the kernel rejects `UDP_SEGMENT`
+    /// or after the first such rejection. Returns the count of
+    /// `send_staging` entries the kernel accepted (i.e. fragments
+    /// sent), which the caller feeds into Phase 3 bookkeeping.
+    fn send_via_staged(&self, stats: &mut TickStats) -> usize {
+        match self
+            .transport
+            .send_staged(&self.staging_data, &self.send_entries)
+        {
+            Ok(n) => n,
+            Err(_) => {
+                stats.send_errors += 1;
+                0
+            }
+        }
     }
 
     fn drain_control(&mut self, stats: &mut TickStats) {
