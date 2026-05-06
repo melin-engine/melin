@@ -232,7 +232,6 @@ fn sendmmsg_staged_impl(
 /// not exposed by the glibc variant of the `libc` crate (only the
 /// uclibc fork). Hardcoded here; the value is part of the kernel ABI.
 #[cfg(target_os = "linux")]
-#[allow(dead_code)] // wired up in a follow-up commit
 const UDP_SEGMENT_CMSG: libc::c_int = 103;
 
 /// Issue `sendmmsg(2)` with per-message `UDP_SEGMENT` cmsg (UDP-GSO).
@@ -253,7 +252,6 @@ const UDP_SEGMENT_CMSG: libc::c_int = 103;
 /// is expected to detect this once at startup and fall back to plain
 /// `sendmmsg_staged`.
 #[cfg(target_os = "linux")]
-#[allow(dead_code)] // wired up in a follow-up commit
 pub(crate) fn sendmmsg_staged_segmented(
     fd: RawFd,
     data: &[u8],
@@ -542,6 +540,52 @@ pub trait UdpTransport: Send + Sync {
         Ok(entries.len())
     }
 
+    /// Send batched UDP datagrams using kernel UDP-GSO (`UDP_SEGMENT`
+    /// cmsg). Each entry is `(dst, offset, total_len, segment_size)`:
+    /// the kernel splits the contiguous `total_len` bytes starting at
+    /// `data[offset..]` into `ceil(total_len / segment_size)` UDP
+    /// datagrams of `segment_size` bytes each (the last may be
+    /// shorter). Returns the number of *mmsghdrs* (not segments)
+    /// accepted; the caller knows segments-per-msghdr from its own
+    /// bookkeeping.
+    ///
+    /// All segments within a single msghdr share one dst and one
+    /// segment_size — the caller must group same-size runs per dst.
+    /// Mixed-size sends should fall back to [`send_staged`].
+    ///
+    /// Default impl loops over [`send_to`] one segment at a time so
+    /// transports without GSO support stay correct, just slow. The
+    /// `KernelUdp` override calls [`sendmmsg_staged_segmented`].
+    ///
+    /// On kernels that reject `UDP_SEGMENT` (pre-4.18 or some virt
+    /// environments) the syscall returns `EINVAL`; callers should
+    /// detect this once at startup and fall back permanently.
+    ///
+    /// [`send_to`]: Self::send_to
+    /// [`send_staged`]: Self::send_staged
+    /// [`sendmmsg_staged_segmented`]: crate::transport::sendmmsg_staged_segmented
+    fn send_segmented_staged(
+        &self,
+        data: &[u8],
+        entries: &[(SocketAddr, usize, usize, u16)],
+    ) -> io::Result<usize> {
+        // Default: per-segment send_to, preserving the partial-success
+        // contract at *msghdr* granularity (caller's unit of work).
+        for (i, &(dst, offset, total_len, seg_size)) in entries.iter().enumerate() {
+            let seg = seg_size as usize;
+            let mut sent_in_msg = 0usize;
+            while sent_in_msg < total_len {
+                let end = (sent_in_msg + seg).min(total_len);
+                match self.send_to(dst, &data[offset + sent_in_msg..offset + end]) {
+                    Ok(_) => sent_in_msg = end,
+                    Err(e) if i == 0 && sent_in_msg == 0 => return Err(e),
+                    Err(_) => return Ok(i),
+                }
+            }
+        }
+        Ok(entries.len())
+    }
+
     /// Try to receive one datagram into `buf`. Returns `Ok(None)` when
     /// no datagram is ready. On `Ok(Some((addr, len)))`, the first
     /// `len` bytes of `buf` are valid and `addr` is the sender.
@@ -671,6 +715,15 @@ impl UdpTransport for KernelUdp {
     ) -> io::Result<usize> {
         use std::os::unix::io::AsRawFd;
         sendmmsg_staged(self.socket.as_raw_fd(), data, entries)
+    }
+
+    fn send_segmented_staged(
+        &self,
+        data: &[u8],
+        entries: &[(SocketAddr, usize, usize, u16)],
+    ) -> io::Result<usize> {
+        use std::os::unix::io::AsRawFd;
+        sendmmsg_staged_segmented(self.socket.as_raw_fd(), data, entries)
     }
 
     fn recv_batch(&self, slots: &mut [DatagramBuf]) -> io::Result<usize> {
