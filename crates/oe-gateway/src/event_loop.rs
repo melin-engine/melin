@@ -1755,9 +1755,12 @@ lot_size_inverse = 1
         let stub_thread = std::thread::spawn(move || {
             let (mut stream, _) = listener.accept().unwrap();
             // Send Challenge.
-            let mut buf = [0u8; 64];
+            let mut buf = [0u8; 128];
             let n = melin_protocol::codec::encode_response(
-                &melin_protocol::message::ResponseKind::Challenge { nonce: [0u8; 32] },
+                &melin_protocol::message::ResponseKind::Challenge {
+                    nonce: [0u8; 32],
+                    server_x25519_eph: [0u8; 32],
+                },
                 &mut buf,
             )
             .unwrap();

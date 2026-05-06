@@ -52,6 +52,10 @@ mod catchup;
 #[cfg(feature = "dpdk")]
 mod dpdk;
 mod protocol;
+#[cfg(feature = "rumcast")]
+mod rumcast_receiver;
+#[cfg(feature = "rumcast")]
+mod rumcast_sender;
 mod tcp_receiver;
 mod tcp_sender;
 
@@ -63,6 +67,10 @@ pub use protocol::{Ack, Handshake, PrimaryMessage, ReplicaMessage};
 
 #[cfg(feature = "dpdk")]
 pub use dpdk::{DpdkReplicationDriver, run_receiver_dpdk};
+#[cfg(feature = "rumcast")]
+pub use rumcast_receiver::run_receiver_rumcast;
+#[cfg(feature = "rumcast")]
+pub use rumcast_sender::{Sender as RumcastSender, run_sender_rumcast};
 pub use tcp_receiver::{ReceiverResult, run_receiver};
 pub use tcp_sender::{Sender, run_sender};
 

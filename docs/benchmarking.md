@@ -218,6 +218,22 @@ cat /sys/devices/system/cpu/isolated      # should print: 1-5
 cat /sys/devices/system/cpu/nohz_full     # should print: 1-5
 ```
 
+### Kernel UDP buffers (rumcast benchmarks only)
+
+The `--features rumcast` build uses UDP for the wire protocol. The Linux default `net.core.rmem_max` is 208 KB — too small for the bench's burst pattern; the kernel drops frames on arrival and the bench reports throughput an order of magnitude below the true server capacity, with multi-hundred-millisecond p99 latencies caused by NAK retransmits.
+
+Apply before running rumcast benchmarks:
+
+```sh
+sudo sysctl -w \
+    net.core.rmem_max=33554432 \
+    net.core.wmem_max=33554432 \
+    net.core.rmem_default=33554432 \
+    net.core.wmem_default=33554432
+```
+
+See `docs/operations.md` for the persistent configuration and tail-latency signatures that confirm the cap was lifted.
+
 ## Interpreting Results
 
 ### Throughput

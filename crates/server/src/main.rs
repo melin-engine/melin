@@ -7,7 +7,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use clap::Parser;
-#[cfg(not(feature = "dpdk"))]
+#[cfg(all(not(feature = "dpdk"), not(feature = "rumcast")))]
 use melin_protocol::tcp::BlockingTcpListener;
 use melin_server::server::ServerConfig;
 
@@ -54,7 +54,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         melin_server::server::run_dpdk(config, dpdk_config, shutdown)
     }
 
-    #[cfg(not(feature = "dpdk"))]
+    #[cfg(all(not(feature = "dpdk"), feature = "rumcast"))]
+    {
+        let rumcast_config = rumcast_config_from(&config);
+        melin_server::rumcast_transport::run_rumcast(config, rumcast_config, shutdown)
+    }
+
+    #[cfg(all(not(feature = "dpdk"), not(feature = "rumcast")))]
     {
         let listener = BlockingTcpListener::bind(config.bind)?;
         melin_server::server::run_with_shutdown(listener, config, shutdown)
@@ -140,4 +146,26 @@ fn dpdk_config_from(cfg: &ServerConfig) -> melin_dpdk::DpdkConfig {
 #[cfg(feature = "dpdk")]
 fn dpdk_num_queues(_cfg: &ServerConfig) -> u16 {
     1
+}
+
+// ---------------------------------------------------------------------------
+// Rumcast config
+// ---------------------------------------------------------------------------
+
+#[cfg(feature = "rumcast")]
+fn rumcast_config_from(cfg: &ServerConfig) -> melin_server::rumcast_transport::RumcastConfig {
+    // Phase 3: each client's response dst is auto-discovered from the
+    // source addr of its first inbound frame (works correctly when the
+    // client uses `melin_rumcast::shared_udp::SharedUdp`). The
+    // `--rumcast-client-addr` CLI flag still parses for backwards
+    // compat but is silently ignored — log a warn if it was set so
+    // operators know they can drop it.
+    if let Some(addr) = cfg.rumcast_client_addr {
+        tracing::warn!(
+            ignored_client_addr = %addr,
+            "--rumcast-client-addr is no longer used (per-session dst is auto-discovered); \
+             you can drop the flag"
+        );
+    }
+    melin_server::rumcast_transport::RumcastConfig { bind: cfg.bind }
 }

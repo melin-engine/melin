@@ -4,13 +4,21 @@ resolver = "3"
 
 [workspace.dependencies]
 base64 = "0.22"
+blake3 = "1"
 clap = { version = "4", features = ["derive"] }
 ed25519-dalek = { version = "2", features = ["rand_core"] }
 libc = "0.2"
 rand = "0.9"
+# Constant-time byte comparison for MAC verification — guards
+# against timing side channels when comparing the received MAC
+# against the locally computed one.
+subtle = "2"
 tikv-jemallocator = "0.6"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
+# `static_secrets` exposes EphemeralSecret + StaticSecret APIs for X25519.
+# Both sides of a rumcast handshake generate an ephemeral keypair.
+x25519-dalek = { version = "2", features = ["static_secrets"] }
 
 [profile.release]
 # Full cross-crate LTO: allows LLVM to inline across crate boundaries

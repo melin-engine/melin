@@ -6,6 +6,7 @@ proptest-regressions/
 authorized_keys
 *.key
 *.pub
+.claude/scheduled_tasks.lock
 
 # QEMU VM images for DPDK virtio testing.
 scripts/dpdk/.cache/

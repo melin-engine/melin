@@ -16,6 +16,13 @@ use tracing::{info, warn};
 
 use super::protocol::{decode_journal_to_input_slots, encode_input_batch};
 
+/// Closure-based publisher passed to [`catch_up_from_journal_with`].
+/// Receives the fully encoded `InputBatch` frame (length prefix included)
+/// and is responsible for actually shipping the bytes to the replica. The
+/// closure returns `io::Error` on transport failure so the caller can
+/// abandon the catch-up and surface a clean disconnect.
+pub(super) type CatchUpPublisher<'a> = &'a mut dyn FnMut(&[u8]) -> io::Result<()>;
+
 /// Result of a journal catch-up attempt.
 pub(super) enum CatchUpResult {
     /// Catch-up succeeded. Contains the last sequence sent (or the input
@@ -78,14 +85,17 @@ pub(super) fn can_catch_up_from_journal(
     Ok(false)
 }
 
-/// Stream historical journal entries to a catching-up replica.
+/// Stream historical journal entries to a catching-up replica via a
+/// caller-supplied [`CatchUpPublisher`] closure.
 ///
 /// Returns the last sequence sent, or the input `last_sequence` if no
-/// entries were sent.
-pub(super) fn catch_up_from_journal(
+/// entries were sent. The closure is called once per encoded `InputBatch`
+/// frame; it receives the bytes to ship and is responsible for the
+/// actual transport write (TCP `write_all`+`flush`, rumcast publish, …).
+pub(super) fn catch_up_from_journal_with(
     journal_path: &std::path::Path,
     last_sequence: u64,
-    writer: &mut TcpStream,
+    publisher: CatchUpPublisher<'_>,
     shutdown: &AtomicBool,
 ) -> io::Result<CatchUpResult> {
     use melin_journal::RawJournalScanner;
@@ -179,12 +189,8 @@ pub(super) fn catch_up_from_journal(
                 ))
             })?;
             encode_input_batch(&slots, &mut send_buf);
-            writer
-                .write_all(&send_buf)
-                .map_err(|e| io::Error::other(format!("write catch-up batch: {e}")))?;
-            writer
-                .flush()
-                .map_err(|e| io::Error::other(format!("flush catch-up batch: {e}")))?;
+            publisher(&send_buf)
+                .map_err(|e| io::Error::other(format!("publish catch-up batch: {e}")))?;
             send_buf.clear();
 
             end_sequence = batch_end_seq;
@@ -195,4 +201,21 @@ pub(super) fn catch_up_from_journal(
     info!(end_sequence, batches_sent, "journal catch-up complete");
 
     Ok(CatchUpResult::Ok(end_sequence))
+}
+
+/// Backwards-compatible wrapper around [`catch_up_from_journal_with`]
+/// that ships frames over a TCP stream. Kept so the TCP sender path
+/// stays untouched while the rumcast sender (which doesn't have a
+/// `TcpStream`) calls the generic closure-based variant directly.
+pub(super) fn catch_up_from_journal(
+    journal_path: &std::path::Path,
+    last_sequence: u64,
+    writer: &mut TcpStream,
+    shutdown: &AtomicBool,
+) -> io::Result<CatchUpResult> {
+    let mut publish = |buf: &[u8]| -> io::Result<()> {
+        writer.write_all(buf)?;
+        writer.flush()
+    };
+    catch_up_from_journal_with(journal_path, last_sequence, &mut publish, shutdown)
 }

@@ -156,6 +156,7 @@ mod tests {
         assert!(should_filter(&Request::ChallengeResponse {
             signature: [0u8; 64],
             public_key: [0u8; 32],
+            client_x25519_eph: [0u8; 32],
         }));
     }
 

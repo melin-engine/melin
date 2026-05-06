@@ -216,9 +216,15 @@ PERF_DATA=""
 PERF_PID=""
 if [[ "${BENCH_PERF:-0}" == "1" ]] && command -v perf &>/dev/null; then
     PERF_DATA=$(mktemp /tmp/bench-perf.XXXXXX.data)
-    # Sample kernel stacks on cores 1+ at 997 Hz (prime to avoid aliasing).
-    # --call-graph=fp for frame pointer-based stack traces.
-    perf record -a -g --call-graph=fp -F 997 -C 1-15 -o "$PERF_DATA" &
+    # Sample kernel + userspace stacks on cores 1+ at 997 Hz (prime to
+    # avoid aliasing). --call-graph=dwarf walks unwind info, so it
+    # produces correct Rust userspace stacks even under release LTO
+    # (frame pointers aren't emitted there). Pairs with the
+    # CARGO_PROFILE_RELEASE_DEBUG=line-tables-only build flag below to
+    # get function + line resolution. dwarf stacks are larger; bump
+    # --mmap-pages so the kernel ring buffer doesn't drop samples
+    # under load.
+    perf record -a -g --call-graph=dwarf,16384 --mmap-pages=512 -F 997 -C 1-15 -o "$PERF_DATA" &
     PERF_PID=$!
     echo "=== Perf profiling ==="
     echo "  Recording kernel activity on cores 1-15 (PID ${PERF_PID})"
@@ -232,18 +238,31 @@ echo ""
 # Run as the invoking user (SUDO_USER), not root.
 # No taskset — all threads self-pin via sched_setaffinity:
 # cores 1-3 pipeline, 4=DPDK poll (or 4-5 TCP readers), 6=repl-sender, 7=event-publisher, 8=shadow, 9+ bench threads.
+#
+# CARGO_PROFILE_RELEASE_DEBUG=line-tables-only emits .debug_line so
+# perf can map sample addresses back to function + source line under
+# release LTO. Cheap on binary size (~2 MB), no perf cost. Pairs with
+# `perf record --call-graph=dwarf` above.
 CARGO_BIN="$(sudo -u "${SUDO_USER}" bash -lc 'which cargo')"
 sudo -u "${SUDO_USER}" \
-    "$CARGO_BIN" run --release -p melin-bench "$@"
+    CARGO_PROFILE_RELEASE_DEBUG=line-tables-only \
+    "$CARGO_BIN" run --release --bin melin-bench "$@"
 
 # --- Stop perf and show summary ---
 if [[ -n "$PERF_PID" ]]; then
     kill -INT "$PERF_PID" 2>/dev/null || true
     wait "$PERF_PID" 2>/dev/null || true
+    # `perf record` writes the data file as root; chown to the
+    # invoking user so follow-up `perf report` calls don't need sudo.
+    chown "${SUDO_UID:-0}:${SUDO_GID:-0}" "$PERF_DATA" 2>/dev/null || true
     echo ""
-    echo "=== Perf summary (kernel activity on cores 1-15) ==="
-    # Show top functions by overhead — kernel functions causing interruptions.
-    perf report -i "$PERF_DATA" --stdio --no-children --percent-limit=0.5 2>/dev/null \
+    echo "=== Perf summary (cores 1-15, kernel + userspace) ==="
+    # Show top functions by overhead. `--no-children` flattens to leaf
+    # samples (better for spotting userspace hotspots than the
+    # accumulated-children view). `--inline` resolves inlined frames
+    # using DWARF — important under release LTO where most small
+    # functions vanish into their callers without it.
+    perf report -i "$PERF_DATA" --stdio --no-children --inline --percent-limit=0.5 2>/dev/null \
         | head -40 || echo "  (perf report failed)"
     echo ""
     echo "  Full report: perf report -i ${PERF_DATA}"

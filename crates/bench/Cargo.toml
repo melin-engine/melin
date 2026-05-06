@@ -10,6 +10,13 @@ latency-trace = ["melin-server/latency-trace"]
 ## Kept for backward compatibility — io_uring is now always used.
 io-uring = []
 dpdk = ["dep:melin-dpdk", "melin-dpdk/dpdk-sys", "dep:smoltcp"]
+## Single-client rumcast roundtrip mode for the LAN bench suite.
+## Mutually exclusive with `dpdk` at build time. Mirrors the server's
+## `--features rumcast` path.
+## Pulls in `melin-server/rumcast` so the bench can spawn an embedded
+## rumcast server on loopback when `--addr` is omitted, mirroring how
+## the TCP path embeds a server.
+rumcast = ["dep:melin-rumcast", "melin-server/rumcast"]
 pipeline-stats = ["melin-server/pipeline-stats"]
 plot = ["dep:plotters"]
 
@@ -37,6 +44,7 @@ melin-transport-core = { path = "../transport-core" }
 base64 = { workspace = true }
 clap = { workspace = true }
 ed25519-dalek = { workspace = true }
+getrandom = "0.3"
 hdrhistogram = "7"
 rand = "0.9"
 libc = { workspace = true }
@@ -44,6 +52,7 @@ tikv-jemallocator = { workspace = true }
 tracing-subscriber = { workspace = true }
 io-uring = "0.7"
 melin-dpdk = { path = "../dpdk", optional = true }
+melin-rumcast = { path = "../rumcast", optional = true, features = ["io-uring"] }
 smoltcp = { version = "0.13", default-features = false, features = ["std", "medium-ethernet", "proto-ipv4", "socket-tcp"], optional = true }
 ratatui = { version = "0.29", optional = true }
 crossterm = { version = "0.28", optional = true }

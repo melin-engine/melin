@@ -600,11 +600,16 @@ pub fn run_dpdk_roundtrip(
         }
     }
 
+    // Snapshot end time BEFORE joining the progress thread: that thread
+    // sleeps in 5-second increments and only checks shutdown after each
+    // sleep, so progress_handle.join() can block up to ~5s and would
+    // otherwise inflate `measured_wall` for short benches.
+    let end = Instant::now();
+
     // Stop progress reporter.
     progress_shutdown.store(true, Ordering::Relaxed);
     let _ = progress_handle.join();
 
-    let end = Instant::now();
     let measured_wall = measured_start
         .map(|s| end.duration_since(s))
         .unwrap_or_else(|| start.elapsed());
@@ -713,16 +718,27 @@ fn dpdk_auth_all(
                 AuthPhase::WaitChallenge => {
                     let response = codec::decode_response(&conn.parse_buf[4..consumed])
                         .expect("decode Challenge");
-                    let nonce = match response {
-                        ResponseKind::Challenge { nonce } => nonce,
+                    let (nonce, server_eph) = match response {
+                        ResponseKind::Challenge {
+                            nonce,
+                            server_x25519_eph,
+                        } => (nonce, server_x25519_eph),
                         other => panic!("client {i}: expected Challenge, got {other:?}"),
                     };
 
-                    // Sign and send ChallengeResponse.
-                    let signature = key.sign(&nonce);
+                    // Sign nonce + ephemerals (DPDK TCP uses zero ephs)
+                    // — see `melin_protocol::auth::auth_signing_payload`.
+                    let client_x25519_eph = [0u8; 32];
+                    let signing_payload = melin_protocol::auth::auth_signing_payload(
+                        &nonce,
+                        &server_eph,
+                        &client_x25519_eph,
+                    );
+                    let signature = key.sign(&signing_payload);
                     let request = Request::ChallengeResponse {
                         signature: signature.to_bytes(),
                         public_key: key.verifying_key().to_bytes(),
+                        client_x25519_eph,
                     };
                     let mut buf = [0u8; 256];
                     let written = codec::encode_request(&request, 0, &mut buf)

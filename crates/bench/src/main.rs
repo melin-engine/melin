@@ -24,11 +24,21 @@
 //!
 //! Default: roundtrip mode, TCP transport, 1 client, 1,000,000 order pairs.
 
+// Under `--features rumcast` (and similarly `dpdk`), the entire TCP-
+// path code in this file is unreachable from the dispatch in `main`.
+// Suppress the resulting dead-code warnings rather than cfg-gating
+// every TCP helper individually — same trade-off the existing DPDK
+// build implicitly relies on.
+#![cfg_attr(any(feature = "rumcast", feature = "dpdk"), allow(dead_code))]
+
 mod generator;
 mod health_poller;
 
 #[cfg(feature = "dpdk")]
 mod dpdk;
+
+#[cfg(all(not(feature = "dpdk"), feature = "rumcast"))]
+mod rumcast;
 
 /// jemalloc: thread-local caches eliminate allocator lock contention,
 /// giving more predictable latency than glibc malloc under high throughput.
@@ -286,6 +296,41 @@ struct BenchArgs {
     /// real fsync. Default 4096. Try 256 for low-latency no-persist runs.
     #[arg(long, default_value_t = 4096)]
     max_journal_batch: usize,
+
+    /// Local UDP bind address for receiving rumcast responses. Required
+    /// when the bench is built with `--features rumcast`. Phase 1 of the
+    /// rumcast wire-up is single-client; this is the address the server
+    /// publishes responses back to (matched by the server's
+    /// `--rumcast-client-addr`).
+    #[arg(long)]
+    rumcast_bind: Option<std::net::SocketAddr>,
+
+    /// Yield to the OS scheduler when the rumcast bench loop has no
+    /// work, instead of the default busy-spin. With this flag the
+    /// idle path parks for ~100 µs (`ppoll` on the response socket)
+    /// — lower CPU at the cost of an upper-bound on idle wake
+    /// latency. Default (no flag) is busy-spin: lowest latency on
+    /// isolated cores, burns a CPU.
+    #[arg(long, default_value_t = false)]
+    rumcast_yield_idle: bool,
+
+    /// NAPI busy-poll budget in microseconds for the bench's response
+    /// socket. `0` (default) leaves the kernel on its normal
+    /// interrupt-driven recv path. Non-zero enables `SO_BUSY_POLL` +
+    /// `SO_PREFER_BUSY_POLL`. Same flag shape as the server's
+    /// `--rumcast-busy-poll-us`. Typical real-NIC values are 50–100
+    /// µs; no-op on loopback. See operations.md for the sysctl
+    /// requirements.
+    #[arg(long, default_value_t = 0)]
+    rumcast_busy_poll_us: u32,
+
+    /// Enable kernel `UDP_GRO` on the bench's rumcast response
+    /// socket. Pairs with `UDP_SEGMENT` (UDP-GSO) on the server-side
+    /// sender so the kernel can re-coalesce incoming response
+    /// datagrams and the bench's recv path fans them out via the
+    /// `seg_size` cmsg. Off by default. No-op on loopback.
+    #[arg(long, default_value_t = false)]
+    rumcast_udp_gro: bool,
 }
 
 fn main() {
@@ -320,6 +365,66 @@ fn main() {
             );
         }
         "roundtrip" => {
+            #[cfg(all(not(feature = "dpdk"), feature = "rumcast"))]
+            {
+                let (server_addr, bench_bind, signing_key, recommended_bench_core) = match args.addr
+                {
+                    Some(addr) => {
+                        // Remote mode — operator must supply bind + key.
+                        let bind = args.rumcast_bind.unwrap_or_else(|| {
+                            eprintln!(
+                                "error: --rumcast-bind is required for remote rumcast \
+                                 mode (server publishes responses to this address)"
+                            );
+                            std::process::exit(1);
+                        });
+                        let key_path = args.key.as_deref().unwrap_or_else(|| {
+                            eprintln!(
+                                "error: --key is required for remote rumcast mode \
+                                 (the rumcast transport authenticates every message)"
+                            );
+                            std::process::exit(1);
+                        });
+                        // Remote mode: no embedded layout to advise on.
+                        // Trust whatever --bench-cores the operator set.
+                        (addr, bind, load_signing_key(key_path), 0)
+                    }
+                    None => spawn_embedded_rumcast_server(
+                        args.rumcast_bind,
+                        args.accounts,
+                        args.instruments,
+                        args.group_commit_us,
+                        args.journal.clone(),
+                        args.rumcast_busy_poll_us,
+                        args.rumcast_udp_gro,
+                    ),
+                };
+                // Embedded-mode default: use the core the embedded
+                // server reserved for the client. Explicit --bench-cores
+                // still wins so operators can override.
+                let bench_core_start = args.bench_cores.or(if args.addr.is_none() {
+                    Some(recommended_bench_core)
+                } else {
+                    None
+                });
+                rumcast::run_rumcast_roundtrip(rumcast::RumcastBenchConfig {
+                    server_addr,
+                    bind: bench_bind,
+                    pairs: args.pairs,
+                    window: args.window,
+                    warmup: args.warmup,
+                    clients: args.clients,
+                    accounts: args.accounts,
+                    instruments: args.instruments,
+                    json_path: json_path.map(|p| p.to_path_buf()),
+                    yield_idle: args.rumcast_yield_idle,
+                    busy_poll_us: args.rumcast_busy_poll_us,
+                    udp_gro: args.rumcast_udp_gro,
+                    signing_key,
+                    bench_core_start,
+                });
+            }
+
             #[cfg(feature = "dpdk")]
             {
                 let addr = args.addr.unwrap_or_else(|| {
@@ -363,7 +468,7 @@ fn main() {
                 );
             }
 
-            #[cfg(not(feature = "dpdk"))]
+            #[cfg(all(not(feature = "dpdk"), not(feature = "rumcast")))]
             {
                 run_roundtrip_bench(
                     args.uds,
@@ -1040,6 +1145,139 @@ fn start_server<L: BlockingTransportListener>(
         .expect("spawn server thread");
 }
 
+/// Bring up an in-process rumcast server on loopback with a generated
+/// bench identity, mirroring the embedded TCP path. Returns
+/// `(server_addr, bench_bind, signing_key)` ready to feed into
+/// `run_rumcast_roundtrip`. The temp dir holding the journal +
+/// authorized_keys file is intentionally leaked for the process lifetime
+/// — the bench is short-lived and the OS reaps `/tmp` on next boot.
+#[cfg(all(not(feature = "dpdk"), feature = "rumcast"))]
+fn spawn_embedded_rumcast_server(
+    bench_bind_override: Option<std::net::SocketAddr>,
+    accounts: u32,
+    instruments: u32,
+    group_commit_us: u64,
+    journal_path: Option<std::path::PathBuf>,
+    rumcast_busy_poll_us: u32,
+    rumcast_udp_gro: bool,
+) -> (
+    std::net::SocketAddr,
+    std::net::SocketAddr,
+    ed25519_dalek::SigningKey,
+    usize,
+) {
+    use melin_server::server::{PipelineCores, ServerConfig};
+    use std::net::{IpAddr, Ipv4Addr, SocketAddr, UdpSocket};
+
+    // Deterministic key — same trick as the TCP embedded path.
+    let bench_key = ed25519_dalek::SigningKey::from_bytes(&[0xBE; 32]);
+    let tmp_dir = tempdir();
+    let keys_path = tmp_dir.join("authorized_keys");
+    let pub_key_b64 = base64::Engine::encode(
+        &base64::engine::general_purpose::STANDARD,
+        bench_key.verifying_key().to_bytes(),
+    );
+    std::fs::write(&keys_path, format!("trader {pub_key_b64} bench\n"))
+        .expect("write authorized_keys");
+
+    // Pick free loopback UDP ports by binding ephemeral and dropping
+    // immediately — the kernel won't immediately reassign them, which
+    // is good enough for a single-process bench.
+    let pick_port = || -> u16 {
+        UdpSocket::bind("127.0.0.1:0")
+            .expect("bind ephemeral UDP")
+            .local_addr()
+            .expect("local addr")
+            .port()
+    };
+    let server_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), pick_port());
+    let bench_bind = bench_bind_override.unwrap_or(SocketAddr::new(
+        IpAddr::V4(Ipv4Addr::LOCALHOST),
+        pick_port(),
+    ));
+
+    let effective_journal = journal_path.unwrap_or_else(|| tmp_dir.join("rumcast-bench.journal"));
+
+    // Detect available CPUs and pick a compact layout that doesn't
+    // HT-collide on this box. Falls back to the workstation default
+    // when there's enough room (>= 12 logical cores), preserving
+    // existing behavior on bigger machines.
+    let num_cpus = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(8);
+    let (pipeline_cores, recommended_bench_core) = if num_cpus < 12 {
+        match PipelineCores::compact(num_cpus) {
+            Ok((c, b)) => (c, b),
+            Err(e) => {
+                eprintln!("error: cannot lay out embedded rumcast server: {e}");
+                std::process::exit(1);
+            }
+        }
+    } else {
+        // Workstation/server default. repl_handler cores 9/10 are HT
+        // siblings of journal/matching only on 8-core boxes; on >= 12
+        // logical cores those are real physical cores. Keep the bench
+        // off any pinned core (11 is the first unused).
+        (ServerConfig::default().cores, 11)
+    };
+
+    let config = ServerConfig {
+        bind: server_addr,
+        journal: effective_journal,
+        snapshot: None,
+        group_commit_us,
+        accounts,
+        instruments,
+        connection_timeout_secs: 0,
+        authorized_keys: keys_path,
+        // Disable the health endpoint so back-to-back bench runs don't
+        // collide on the default port; the bench doesn't poll it in
+        // rumcast mode anyway.
+        health_bind: None,
+        // Match production (LAN) idle strategy: busy-spin. The compact
+        // core layout below keeps the pipeline threads off each other's
+        // HT siblings, so busy-spin doesn't starve any peer.
+        yield_idle: false,
+        // Compact layout that fits the dev box (8-core Ryzen) without
+        // HT-pairing pipeline threads against each other. The default
+        // `PipelineCores` is sized for a 16-physical-core workstation:
+        // shadow=8, repl_handler_0=9, repl_handler_1=10 are HT siblings
+        // of cores 0/1/2 (journal, matching) on an 8-core/16-thread
+        // CPU, which murders busy-spin throughput. Reserve the last
+        // core for the bench client.
+        cores: pipeline_cores,
+        rumcast_busy_poll_us,
+        rumcast_udp_gro,
+        ..ServerConfig::default()
+    };
+    let rumcast_config = melin_server::rumcast_transport::RumcastConfig { bind: server_addr };
+
+    let shutdown = Arc::new(AtomicBool::new(false));
+    let shutdown_srv = Arc::clone(&shutdown);
+    std::thread::Builder::new()
+        .name("rumcast-server".into())
+        .spawn(move || {
+            if let Err(e) =
+                melin_server::rumcast_transport::run_rumcast(config, rumcast_config, shutdown_srv)
+            {
+                eprintln!("embedded rumcast server error: {e}");
+            }
+        })
+        .expect("spawn rumcast server thread");
+
+    eprintln!(
+        "embedded rumcast server: server_addr={server_addr} bench_bind={bench_bind} \
+         cores=j{}/m{}/r{}/e{}/s{} bench_core={recommended_bench_core}",
+        pipeline_cores.journal,
+        pipeline_cores.matching,
+        pipeline_cores.response,
+        pipeline_cores.event_publisher,
+        pipeline_cores.shadow,
+    );
+
+    (server_addr, bench_bind, bench_key, recommended_bench_core)
+}
+
 /// Connect to TCP server with retry (up to 50 attempts, 10ms apart).
 ///
 /// Also enables `SO_BUSY_POLL` on the connected socket. The bench's
@@ -1101,19 +1339,27 @@ fn auth_handshake(
     std::io::Read::read_exact(stream, &mut len_buf).expect("read Challenge length");
     let len = u32::from_le_bytes(len_buf) as usize;
     assert!(len <= MAX_FRAME_SIZE, "Challenge frame too large: {len}");
-    let mut payload = [0u8; 64];
+    let mut payload = [0u8; 128];
     std::io::Read::read_exact(stream, &mut payload[..len]).expect("read Challenge payload");
     let response = codec::decode_response(&payload[..len]).expect("decode Challenge");
-    let nonce = match response {
-        ResponseKind::Challenge { nonce } => nonce,
+    let (nonce, server_eph) = match response {
+        ResponseKind::Challenge {
+            nonce,
+            server_x25519_eph,
+        } => (nonce, server_x25519_eph),
         other => panic!("expected Challenge, got {other:?}"),
     };
 
-    // Sign and send ChallengeResponse.
-    let signature = key.sign(&nonce);
+    // Sign nonce + ephemerals (TCP bench uses zero ephs) — see
+    // `melin_protocol::auth::auth_signing_payload`.
+    let client_x25519_eph = [0u8; 32];
+    let signing_payload =
+        melin_protocol::auth::auth_signing_payload(&nonce, &server_eph, &client_x25519_eph);
+    let signature = key.sign(&signing_payload);
     let request = Request::ChallengeResponse {
         signature: signature.to_bytes(),
         public_key: key.verifying_key().to_bytes(),
+        client_x25519_eph,
     };
     let mut buf = [0u8; 256];
     let written = codec::encode_request(&request, 0, &mut buf).expect("encode ChallengeResponse");
@@ -1219,11 +1465,19 @@ pub(crate) fn spawn_progress_reporter(
             let start = Instant::now();
             let mut last_completed: u64 = 0;
             let mut last_time = start;
+            // Print interval is 5s, but poll the shutdown flag every 100ms so
+            // bench cleanup doesn't have to wait the full interval to exit.
+            const PRINT_INTERVAL: Duration = Duration::from_secs(5);
+            const POLL_INTERVAL: Duration = Duration::from_millis(100);
 
-            loop {
-                std::thread::sleep(Duration::from_secs(5));
-                if shutdown.load(Ordering::Relaxed) {
-                    break;
+            'outer: loop {
+                let mut waited = Duration::ZERO;
+                while waited < PRINT_INTERVAL {
+                    if shutdown.load(Ordering::Relaxed) {
+                        break 'outer;
+                    }
+                    std::thread::sleep(POLL_INTERVAL);
+                    waited += POLL_INTERVAL;
                 }
 
                 let now = Instant::now();
@@ -1421,6 +1675,12 @@ fn run_uring_roundtrip<R, W, F>(
         all_series.extend(s);
     }
 
+    // Snapshot end time BEFORE joining the progress thread: that thread
+    // sleeps in 5-second increments and only checks shutdown after each
+    // sleep, so progress_handle.join() can block up to ~5s and would
+    // otherwise inflate `measured_wall` for short benches.
+    let end = Instant::now();
+
     // Stop progress reporter.
     progress_shutdown.store(true, Ordering::Relaxed);
     let _ = progress_handle.join();
@@ -1429,9 +1689,8 @@ fn run_uring_roundtrip<R, W, F>(
     let health_samples = health_poller.map(|p| p.stop()).unwrap_or_default();
 
     // Measure throughput over the measured phase only — from when the first
-    // thread finished warmup until now. This covers all measured orders
-    // from all threads without undercounting.
-    let end = Instant::now();
+    // thread finished warmup until `end` (captured above, pre-join). This
+    // covers all measured orders from all threads without undercounting.
     let measured_wall = earliest_measured_start
         .map(|s| end.duration_since(s))
         .unwrap_or_else(|| start.elapsed());
@@ -1733,6 +1992,36 @@ fn uring_fill_windows(
 // Shared reporting
 // ===========================================================================
 
+/// Print a latency histogram in µs. Adaptive nines: only prints p99.9, p99.99,
+/// etc. when `sample_count` is large enough (10×  per extra nine).
+pub(crate) fn print_latency_histogram(hist: &Histogram<u64>, sample_count: usize) {
+    println!("    min:     {:>8.2} µs", hist.min() as f64 / 1_000.0);
+    println!(
+        "    p50:     {:>8.2} µs",
+        hist.value_at_quantile(0.50) as f64 / 1_000.0
+    );
+    println!(
+        "    p90:     {:>8.2} µs",
+        hist.value_at_quantile(0.90) as f64 / 1_000.0
+    );
+    let mut nines = 2;
+    let mut threshold = 1_000usize;
+    while threshold <= sample_count {
+        let quantile = 1.0 - 10.0f64.powi(-(nines as i32));
+        let label = if nines <= 2 {
+            "p99".to_string()
+        } else {
+            format!("p99.{}", "9".repeat(nines - 2))
+        };
+        let value = hist.value_at_quantile(quantile) as f64 / 1_000.0;
+        let padded = format!("{label}:");
+        println!("    {padded:<9}{value:>8.2} µs");
+        nines += 1;
+        threshold *= 10;
+    }
+    println!("    max:     {:>8.2} µs", hist.max() as f64 / 1_000.0);
+}
+
 /// Print benchmark results: header, throughput, latency histogram.
 /// Optionally writes results to a JSON file for post-processing.
 #[allow(clippy::too_many_arguments)]
@@ -1763,35 +2052,7 @@ pub(crate) fn print_results(
     );
     println!();
     println!("  Per-Order Latency");
-    println!("    min:     {:>8.2} µs", histogram.min() as f64 / 1000.0);
-    println!(
-        "    p50:     {:>8.2} µs",
-        histogram.value_at_quantile(0.50) as f64 / 1000.0
-    );
-    println!(
-        "    p90:     {:>8.2} µs",
-        histogram.value_at_quantile(0.90) as f64 / 1000.0
-    );
-    // Print the highest meaningful p9X percentiles based on sample size.
-    // Each additional 9 requires 10x more samples for statistical support.
-    // p99 needs >=1K, p99.9 needs >=10K, p99.99 needs >=100K, etc.
-    let mut nines = 2; // start at p99
-    let mut threshold = 1_000usize;
-    while threshold <= measured_orders {
-        let quantile = 1.0 - 10.0f64.powi(-(nines as i32));
-        // Format: p99, p99.9, p99.99, p99.999, ...
-        let label = if nines <= 2 {
-            "p99".to_string()
-        } else {
-            format!("p99.{}", "9".repeat(nines - 2))
-        };
-        let value = histogram.value_at_quantile(quantile) as f64 / 1000.0;
-        let padded = format!("{label}:");
-        println!("    {padded:<9}{value:>8.2} µs");
-        nines += 1;
-        threshold *= 10;
-    }
-    println!("    max:     {:>8.2} µs", histogram.max() as f64 / 1000.0);
+    print_latency_histogram(histogram, measured_orders);
 
     // Print health summary if we have samples.
     if !health_samples.is_empty() {

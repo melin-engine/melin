@@ -188,6 +188,34 @@ pub struct ServerConfig {
     #[arg(long, default_value_t = false)]
     pub yield_idle: bool,
 
+    /// Client address that rumcast responses are unicast to. Required
+    /// when the server is built with `--features rumcast`. Phase 1 of
+    /// the rumcast wire-up is single-client only; this is the bench
+    /// client's bind address.
+    #[arg(long)]
+    pub rumcast_client_addr: Option<std::net::SocketAddr>,
+
+    /// NAPI busy-poll budget in microseconds for rumcast orders +
+    /// response sockets. `0` (default) leaves the kernel on its
+    /// normal interrupt-driven recv path. Non-zero enables
+    /// `SO_BUSY_POLL` + `SO_PREFER_BUSY_POLL` so the kernel polls the
+    /// NIC ring inside `recvmsg` instead of waiting for an interrupt
+    /// — trades CPU for tighter recv tail latency. Typical real-NIC
+    /// values are 50–100 µs. No-op on loopback (no NAPI ring).
+    /// Requires `CAP_NET_ADMIN` or a non-zero `net.core.busy_read`
+    /// sysctl floor; the call falls back to a `warn!` and continues
+    /// on `EPERM`.
+    #[arg(long, default_value_t = 0)]
+    pub rumcast_busy_poll_us: u32,
+
+    /// Enable kernel `UDP_GRO` on the rumcast orders socket. Pairs
+    /// with `UDP_SEGMENT` (UDP-GSO) on the sender side so the
+    /// kernel can re-coalesce incoming wire packets and the rumcast
+    /// recv path can fan out segments via the cmsg `seg_size` hint.
+    /// Off by default. No-op on loopback (no NAPI/GRO path).
+    #[arg(long, default_value_t = false)]
+    pub rumcast_udp_gro: bool,
+
     // --- DPDK configuration (only used with --features dpdk) ---
     /// DPDK EAL arguments (space-separated). Example: "-l 0-7 --huge-dir /dev/hugepages".
     /// Passed directly to rte_eal_init. Only used when compiled with --features dpdk.
@@ -317,6 +345,9 @@ impl Default for ServerConfig {
             replication_ring_size: 256,
             no_quorum_durability: false,
             yield_idle: false,
+            rumcast_client_addr: None,
+            rumcast_busy_poll_us: 0,
+            rumcast_udp_gro: false,
             dpdk_eal_args: String::new(),
             dpdk_ports: vec![0],
             dpdk_ip: "10.0.0.1".into(),
@@ -395,6 +426,44 @@ pub struct PipelineCores {
     pub repl_handler_0: usize,
     /// Core for replication handler thread 1. 0 = unpinned (OS scheduled).
     pub repl_handler_1: usize,
+}
+
+impl PipelineCores {
+    /// Compact pipeline layout that fits on `num_cpus` physical+logical
+    /// cores while reserving one core for an external client (bench or
+    /// reader). Used by the embedded bench so it doesn't HT-collide with
+    /// the pipeline cores.
+    ///
+    /// On the default workstation `Default` layout the journal (core 1),
+    /// matching (core 2), and shadow/repl_handler cores (8/9/10) are HT
+    /// siblings of each other on an 8-core (16-thread) Ryzen — a layout
+    /// designed for a 16-physical-core box. This packs everything into
+    /// the lower physical cores and leaves the last one free.
+    ///
+    /// Returns the chosen layout and the recommended bench/client core.
+    /// Errors if `num_cpus` is too small to host the pipeline.
+    pub fn compact(num_cpus: usize) -> Result<(Self, usize), String> {
+        // Need: journal, matching, response, event_publisher, shadow,
+        // repl_sender (one each) + 1 reserved for bench = 7 cores. Plus
+        // core 0 for the OS / IRQs. So minimum 8 logical cores.
+        if num_cpus < 8 {
+            return Err(format!(
+                "compact layout needs >= 8 logical cores; have {num_cpus}"
+            ));
+        }
+        let cores = PipelineCores {
+            journal: 1,
+            matching: 2,
+            response: 3,
+            repl_sender: 4,
+            event_publisher: 5,
+            shadow: 6,
+            // repl handlers don't run in embedded bench; 0 = unpinned.
+            repl_handler_0: 0,
+            repl_handler_1: 0,
+        };
+        Ok((cores, 7))
+    }
 }
 
 /// Parse "j,m,r,s,e,sh,h0,h1" into `PipelineCores` for pipeline core affinity.
@@ -1009,6 +1078,63 @@ fn run_as_primary<L: BlockingTransportListener>(
     // thread after catch-up completes and it enters the live streaming
     // loop — this ensures the ring consumer is actively draining before
     // seeds start flowing.
+    // Spawn the health endpoint BEFORE the wait-for-replica gate so
+    // operators (and the failover test harness) can probe `/healthz`
+    // to confirm the server has bound its sockets and is ready to
+    // accept replica connections — even though seeding hasn't started
+    // yet. The health snapshot legitimately reports `halted` while
+    // waiting for the first replica; that's accurate, not a
+    // misreport. Replicas connect to the *replication* endpoint, not
+    // the client port, so spawning health here doesn't change accept
+    // semantics.
+    let pipeline_healthy = Arc::new(AtomicBool::new(true));
+    let health_handle = if let Some(health_addr) = config.health_bind {
+        // Clone the replication ring cursors so the health snapshot can
+        // report per-slot ring depth (producer_cursor - consumer.processed).
+        // Both cursor types are `Arc`-backed, so cloning is cheap.
+        let (repl_ring_producers, repl_ring_consumers) = replication_ring_progress
+            .as_ref()
+            .map(|rp| {
+                (
+                    Some([
+                        Arc::clone(&rp.producer_cursors[0]),
+                        Arc::clone(&rp.producer_cursors[1]),
+                    ]),
+                    Some([
+                        Arc::clone(&rp.consumer_cursors[0]),
+                        Arc::clone(&rp.consumer_cursors[1]),
+                    ]),
+                )
+            })
+            .unwrap_or((None, None));
+        let fastest_repl_cursor_health = replication_metrics
+            .as_ref()
+            .map(|_| Arc::clone(&fastest_replica_cursor));
+        Some(crate::health::spawn(
+            health_addr,
+            crate::health::HealthState {
+                active_connections: Arc::clone(&active_connections),
+                events_processed: Arc::clone(&events_processed),
+                journal_cursor: Arc::clone(&journal_cursor),
+                matching_cursor: Arc::clone(&matching_cursor),
+                input_cursor,
+                replication_cursor: Arc::clone(&replication_cursor),
+                pipeline_healthy: Arc::clone(&pipeline_healthy),
+                replicas_connected: replicas_connected.clone(),
+                replication_metrics: replication_metrics.clone(),
+                replication_ring_producer_cursors: repl_ring_producers,
+                replication_ring_consumer_cursors: repl_ring_consumers,
+                fastest_replica_cursor: fastest_repl_cursor_health,
+                journal_utilization: Arc::clone(&journal_utilization),
+                matching_utilization: Arc::clone(&matching_utilization),
+                response_utilization: Arc::clone(&response_utilization),
+            },
+            Arc::clone(&shutdown),
+        )?)
+    } else {
+        None
+    };
+
     if enable_replication && needs_seeding {
         info!("waiting for replica to connect before seeding...");
         while !replica_ready.load(Ordering::Acquire) {
@@ -1166,59 +1292,9 @@ fn run_as_primary<L: BlockingTransportListener>(
         Arc::clone(&reader_shutdown),
     );
 
-    // Pipeline health flag: true while all pipeline threads are alive.
-    // Flipped to false when a thread dies or on shutdown. Read by the
-    // health endpoint to distinguish OK from ERR.
-    let pipeline_healthy = Arc::new(AtomicBool::new(true));
-
-    // Spawn health/liveness endpoint before the accept loop so it's
-    // reachable as soon as the server is ready to accept connections.
-    let health_handle = if let Some(health_addr) = config.health_bind {
-        // Clone the replication ring cursors so the health snapshot can
-        // report per-slot ring depth (producer_cursor - consumer.processed).
-        // Both cursor types are `Arc`-backed, so cloning is cheap.
-        let (repl_ring_producers, repl_ring_consumers) = replication_ring_progress
-            .as_ref()
-            .map(|rp| {
-                (
-                    Some([
-                        Arc::clone(&rp.producer_cursors[0]),
-                        Arc::clone(&rp.producer_cursors[1]),
-                    ]),
-                    Some([
-                        Arc::clone(&rp.consumer_cursors[0]),
-                        Arc::clone(&rp.consumer_cursors[1]),
-                    ]),
-                )
-            })
-            .unwrap_or((None, None));
-        let fastest_repl_cursor_health = replication_metrics
-            .as_ref()
-            .map(|_| Arc::clone(&fastest_replica_cursor));
-        Some(crate::health::spawn(
-            health_addr,
-            crate::health::HealthState {
-                active_connections: Arc::clone(&active_connections),
-                events_processed: Arc::clone(&events_processed),
-                journal_cursor: Arc::clone(&journal_cursor),
-                matching_cursor: Arc::clone(&matching_cursor),
-                input_cursor,
-                replication_cursor: Arc::clone(&replication_cursor),
-                pipeline_healthy: Arc::clone(&pipeline_healthy),
-                replicas_connected: replicas_connected.clone(),
-                replication_metrics: replication_metrics.clone(),
-                replication_ring_producer_cursors: repl_ring_producers,
-                replication_ring_consumer_cursors: repl_ring_consumers,
-                fastest_replica_cursor: fastest_repl_cursor_health,
-                journal_utilization: Arc::clone(&journal_utilization),
-                matching_utilization: Arc::clone(&matching_utilization),
-                response_utilization: Arc::clone(&response_utilization),
-            },
-            Arc::clone(&shutdown),
-        )?)
-    } else {
-        None
-    };
+    // Health endpoint and `pipeline_healthy` were already spawned/created
+    // earlier (before the wait-for-replica gate) so probes can succeed
+    // before seeding completes.
 
     // Set the listener to non-blocking so accept() returns immediately
     // with WouldBlock when no connection is pending. This lets the accept
@@ -2066,7 +2142,10 @@ pub(crate) fn empty_app() -> App {
 /// through the pipeline. The recovery paths (snapshot+journal, snapshot
 /// only, journal only, fresh) are transport-level concerns and work
 /// uniformly for any `A: Application` via `JournaledApp<A>`.
-fn init_engine(
+/// Same engine initialization the TCP / DPDK paths use; exposed at
+/// `pub(crate)` so the rumcast transport (Phase 1) can call it without
+/// duplicating the recovery / snapshot / rotation logic.
+pub(crate) fn init_engine(
     config: &ServerConfig,
 ) -> Result<(App, JournalWriter, bool), Box<dyn std::error::Error>> {
     // Check for a snapshot: either the explicit --snapshot path, or the
@@ -2221,10 +2300,21 @@ fn authenticate_connection<R: std::io::Read, W: std::io::Write>(
     let mut nonce = [0u8; 32];
     getrandom::fill(&mut nonce).map_err(|e| io::Error::other(format!("getrandom failed: {e}")))?;
 
-    // Send Challenge.
-    let mut buf = [0u8; 64];
-    let written = codec::encode_response(&ResponseKind::Challenge { nonce }, &mut buf)
-        .map_err(|e| io::Error::other(format!("encode Challenge: {e}")))?;
+    // Send Challenge. X25519 ephemerals are only meaningful on the
+    // rumcast path (where they seed the per-session MAC token). TCP
+    // sends zeros for the ephemerals; the signature payload still
+    // covers them so server + client share a single signing scheme
+    // — see [`melin_protocol::auth::auth_signing_payload`].
+    let server_x25519_eph = [0u8; 32];
+    let mut buf = [0u8; 128];
+    let written = codec::encode_response(
+        &ResponseKind::Challenge {
+            nonce,
+            server_x25519_eph,
+        },
+        &mut buf,
+    )
+    .map_err(|e| io::Error::other(format!("encode Challenge: {e}")))?;
     writer.write_all(&buf[..written])?;
     writer.flush()?;
 
@@ -2255,11 +2345,12 @@ fn authenticate_connection<R: std::io::Read, W: std::io::Write>(
         }
     };
 
-    let (signature_bytes, public_key_bytes) = match request {
+    let (signature_bytes, public_key_bytes, client_x25519_eph) = match request {
         Request::ChallengeResponse {
             signature,
             public_key,
-        } => (signature, public_key),
+            client_x25519_eph,
+        } => (signature, public_key, client_x25519_eph),
         other => {
             send_auth_failed(writer);
             return Err(format!(
@@ -2279,16 +2370,21 @@ fn authenticate_connection<R: std::io::Read, W: std::io::Write>(
         }
     };
 
-    // Verify the Ed25519 signature over the nonce.
+    // Verify the Ed25519 signature over `nonce ‖ server_eph ‖
+    // client_eph`. TCP path's ephs are zeros — see Challenge above.
     let verifying_key = VerifyingKey::from_bytes(&public_key_bytes).map_err(|e| {
         send_auth_failed(writer);
         io::Error::other(format!("invalid public key: {e}"))
     })?;
     let signature = ed25519_dalek::Signature::from_bytes(&signature_bytes);
-    verifying_key.verify(&nonce, &signature).map_err(|e| {
-        send_auth_failed(writer);
-        io::Error::other(format!("signature verification failed: {e}"))
-    })?;
+    let signing_payload =
+        melin_protocol::auth::auth_signing_payload(&nonce, &server_x25519_eph, &client_x25519_eph);
+    verifying_key
+        .verify(&signing_payload, &signature)
+        .map_err(|e| {
+            send_auth_failed(writer);
+            io::Error::other(format!("signature verification failed: {e}"))
+        })?;
 
     // Auth succeeded — send ServerReady.
     let written = codec::encode_response(&ResponseKind::ServerReady, &mut buf)
@@ -2505,21 +2601,28 @@ mod tests {
     /// a ChallengeResponse back.
     fn client_sign_challenge(stream: &mut UnixStream, key: &SigningKey) {
         let mut len_buf = [0u8; 4];
-        let mut payload = [0u8; 64];
+        let mut payload = [0u8; 128];
         stream.read_exact(&mut len_buf).unwrap();
         let len = u32::from_le_bytes(len_buf) as usize;
         stream.read_exact(&mut payload[..len]).unwrap();
 
         let resp = codec::decode_response(&payload[..len]).unwrap();
-        let nonce = match resp {
-            ResponseKind::Challenge { nonce } => nonce,
+        let (nonce, server_eph) = match resp {
+            ResponseKind::Challenge {
+                nonce,
+                server_x25519_eph,
+            } => (nonce, server_x25519_eph),
             other => panic!("expected Challenge, got {other:?}"),
         };
 
-        let sig = key.sign(&nonce);
+        let client_x25519_eph = [0u8; 32];
+        let signing_payload =
+            melin_protocol::auth::auth_signing_payload(&nonce, &server_eph, &client_x25519_eph);
+        let sig = key.sign(&signing_payload);
         let request = Request::ChallengeResponse {
             signature: sig.to_bytes(),
             public_key: key.verifying_key().to_bytes(),
+            client_x25519_eph,
         };
         let mut buf = [0u8; 256];
         let written = codec::encode_request(&request, 0, &mut buf).unwrap();
@@ -2530,23 +2633,30 @@ mod tests {
     /// Like `client_sign_challenge` but corrupts the signature.
     fn client_sign_challenge_bad(stream: &mut UnixStream, key: &SigningKey) {
         let mut len_buf = [0u8; 4];
-        let mut payload = [0u8; 64];
+        let mut payload = [0u8; 128];
         stream.read_exact(&mut len_buf).unwrap();
         let len = u32::from_le_bytes(len_buf) as usize;
         stream.read_exact(&mut payload[..len]).unwrap();
 
         let resp = codec::decode_response(&payload[..len]).unwrap();
-        let nonce = match resp {
-            ResponseKind::Challenge { nonce } => nonce,
+        let (nonce, server_eph) = match resp {
+            ResponseKind::Challenge {
+                nonce,
+                server_x25519_eph,
+            } => (nonce, server_x25519_eph),
             other => panic!("expected Challenge, got {other:?}"),
         };
 
-        let mut sig_bytes = key.sign(&nonce).to_bytes();
+        let client_x25519_eph = [0u8; 32];
+        let signing_payload =
+            melin_protocol::auth::auth_signing_payload(&nonce, &server_eph, &client_x25519_eph);
+        let mut sig_bytes = key.sign(&signing_payload).to_bytes();
         sig_bytes[0] ^= 0xFF;
 
         let request = Request::ChallengeResponse {
             signature: sig_bytes,
             public_key: key.verifying_key().to_bytes(),
+            client_x25519_eph,
         };
         let mut buf = [0u8; 256];
         let written = codec::encode_request(&request, 0, &mut buf).unwrap();
@@ -2634,7 +2744,7 @@ mod tests {
 
         // Read and discard the Challenge.
         let mut len_buf = [0u8; 4];
-        let mut payload = [0u8; 64];
+        let mut payload = [0u8; 128];
         s2.read_exact(&mut len_buf).unwrap();
         let len = u32::from_le_bytes(len_buf) as usize;
         s2.read_exact(&mut payload[..len]).unwrap();
@@ -2689,7 +2799,7 @@ mod tests {
 
         // Read and discard Challenge.
         let mut len_buf = [0u8; 4];
-        let mut payload = [0u8; 64];
+        let mut payload = [0u8; 128];
         s2.read_exact(&mut len_buf).unwrap();
         let len = u32::from_le_bytes(len_buf) as usize;
         s2.read_exact(&mut payload[..len]).unwrap();
@@ -2715,7 +2825,7 @@ mod tests {
 
         // Read and discard Challenge.
         let mut len_buf = [0u8; 4];
-        let mut payload = [0u8; 64];
+        let mut payload = [0u8; 128];
         s2.read_exact(&mut len_buf).unwrap();
         let len = u32::from_le_bytes(len_buf) as usize;
         s2.read_exact(&mut payload[..len]).unwrap();

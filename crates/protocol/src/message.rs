@@ -102,12 +102,25 @@ pub enum Request {
     Heartbeat,
     /// Challenge-response authentication. Sent after receiving a
     /// `Challenge` from the server. Contains the Ed25519 signature
-    /// over the nonce and the client's public key.
+    /// covering `nonce ‖ server_x25519_eph ‖ client_x25519_eph` (so
+    /// the auth binds to the ECDH inputs), the client's Ed25519 public
+    /// key, and the client's ephemeral X25519 public key for the
+    /// session-token ECDH. Both sides combine their long-term identity
+    /// (Ed25519, for authn) with per-session ephemerals (X25519, for
+    /// forward-secret session-token derivation).
     ChallengeResponse {
-        /// Ed25519 signature of the server-provided nonce (64 bytes).
+        /// Ed25519 signature over `nonce ‖ server_x25519_eph ‖
+        /// client_x25519_eph` (64 bytes).
         signature: [u8; 64],
-        /// Client's Ed25519 public key (32 bytes).
+        /// Client's long-term Ed25519 public key (32 bytes).
         public_key: [u8; 32],
+        /// Client's per-handshake ephemeral X25519 public key (32
+        /// bytes). Combined with the server's ephemeral via ECDH to
+        /// derive the per-session MAC token. TCP path may set this to
+        /// zeros when symmetric integrity isn't needed (TCP gives
+        /// stream-level integrity for free); the rumcast path always
+        /// uses it.
+        client_x25519_eph: [u8; 32],
     },
 
     /// Subscribe to the event firehose for specific symbols.
@@ -184,12 +197,21 @@ pub enum ResponseKind {
     ServerReady,
     /// Keepalive heartbeat sent during idle periods. Tag-only, no payload.
     Heartbeat,
-    /// Challenge sent by the server after accepting a connection.
-    /// Contains a 32-byte random nonce for the client to sign.
+    /// Challenge sent by the server after accepting a connection
+    /// (TCP) or after seeing a `Heartbeat` from a new (src_addr,
+    /// session_id) pair (rumcast). Carries a fresh nonce for the
+    /// client to sign and the server's ephemeral X25519 public key
+    /// for forward-secret session-token derivation.
     Challenge {
         /// Random nonce (32 bytes) that the client must sign with its
-        /// Ed25519 private key.
+        /// Ed25519 private key. Sign payload: `nonce ‖
+        /// server_x25519_eph ‖ client_x25519_eph`.
         nonce: [u8; 32],
+        /// Server's per-handshake ephemeral X25519 public key (32
+        /// bytes). Combined with the client's ephemeral via ECDH to
+        /// derive the per-session MAC token. TCP path may set this to
+        /// zeros — see [`Request::ChallengeResponse`].
+        server_x25519_eph: [u8; 32],
     },
     /// Authentication failed — invalid signature, unknown key, or
     /// other auth error. Server drops the connection after sending this.

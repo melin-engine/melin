@@ -469,10 +469,18 @@ fn authenticate_subscriber(
     let mut nonce = [0u8; 32];
     getrandom::fill(&mut nonce).map_err(|e| io::Error::other(format!("getrandom failed: {e}")))?;
 
-    // Send Challenge.
-    let mut buf = [0u8; 64];
-    let written = codec::encode_response(&ResponseKind::Challenge { nonce }, &mut buf)
-        .map_err(|e| io::Error::other(format!("encode Challenge: {e}")))?;
+    // Send Challenge. X25519 ephemerals are rumcast-only; TCP event
+    // publisher uses zeros — see [`melin_protocol::auth::auth_signing_payload`].
+    let server_x25519_eph = [0u8; 32];
+    let mut buf = [0u8; 128];
+    let written = codec::encode_response(
+        &ResponseKind::Challenge {
+            nonce,
+            server_x25519_eph,
+        },
+        &mut buf,
+    )
+    .map_err(|e| io::Error::other(format!("encode Challenge: {e}")))?;
     write_stream.write_all(&buf[..written])?;
     write_stream.flush()?;
 
@@ -495,11 +503,12 @@ fn authenticate_subscriber(
         }
     };
 
-    let (signature_bytes, public_key_bytes) = match request {
+    let (signature_bytes, public_key_bytes, client_x25519_eph) = match request {
         Request::ChallengeResponse {
             signature,
             public_key,
-        } => (signature, public_key),
+            client_x25519_eph,
+        } => (signature, public_key, client_x25519_eph),
         other => {
             send_auth_failed(&mut write_stream);
             return Err(format!(
@@ -519,16 +528,21 @@ fn authenticate_subscriber(
         }
     };
 
-    // Verify the Ed25519 signature over the nonce.
+    // Verify the Ed25519 signature over `nonce ‖ server_eph ‖
+    // client_eph` (TCP path's ephs are zeros — see Challenge above).
     let verifying_key = VerifyingKey::from_bytes(&public_key_bytes).map_err(|e| {
         send_auth_failed(&mut write_stream);
         io::Error::other(format!("invalid public key: {e}"))
     })?;
     let signature = ed25519_dalek::Signature::from_bytes(&signature_bytes);
-    verifying_key.verify(&nonce, &signature).map_err(|e| {
-        send_auth_failed(&mut write_stream);
-        io::Error::other(format!("signature verification failed: {e}"))
-    })?;
+    let signing_payload =
+        melin_protocol::auth::auth_signing_payload(&nonce, &server_x25519_eph, &client_x25519_eph);
+    verifying_key
+        .verify(&signing_payload, &signature)
+        .map_err(|e| {
+            send_auth_failed(&mut write_stream);
+            io::Error::other(format!("signature verification failed: {e}"))
+        })?;
 
     // Auth succeeded — send ServerReady.
     let written = codec::encode_response(&ResponseKind::ServerReady, &mut buf)

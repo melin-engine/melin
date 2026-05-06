@@ -509,6 +509,63 @@ done
 systemctl disable --now irqbalance
 ```
 
+### Compact Layout for Smaller Hosts
+
+The default core layout above assumes 12+ logical CPUs — i.e., a box where cores 1-10 are real physical cores and core 0 is reserved for OS work. On 8-core / 16-thread workstations and entry-level servers, cores 8-10 are hyperthread siblings of cores 0-2, so pinning the shadow / replication-handler threads there forces them to share execution units with the hot pipeline cores (journal, matching). Throughput on rumcast collapses by 5-10x in that situation because the busy-spinning pipeline threads starve their own HT siblings.
+
+For embedded benchmark mode (`melin-bench --mode roundtrip`), the bench auto-detects host size and switches to a compact layout that fits inside 8 logical cores: journal=1, matching=2, response=3, repl-sender=4, event-publisher=5, shadow=6, bench client=7. Replication-handler cores are left unpinned (they don't run in standalone mode anyway).
+
+For production deployments on smaller hosts, pass an equivalent `--cores 1,2,3,4,5,6,0,0` and accept that any non-pipeline work (replication, monitoring) competes with OS work on core 0. **An exchange operator should not run production matching on an 8-core host** — this layout exists for development and proof-of-concept deployments only.
+
+---
+
+## Kernel UDP Tuning
+
+The rumcast wire protocol uses UDP datagrams with reliable delivery (NAK + retransmit) on top. The kernel's default UDP socket buffer size is much smaller than rumcast's burst patterns require; without tuning, the kernel drops frames on arrival, the protocol issues a NAK, the retransmit arrives a few milliseconds later, and steady-state throughput collapses by an order of magnitude under load. **This tuning is mandatory for any rumcast-transport deployment.**
+
+### Socket Buffers (`net.core.rmem_max`, `net.core.wmem_max`)
+
+The Linux default is 208 KB — small enough that a single 16-client x 128-window order burst overflows it. Melin requests 32 MB on every rumcast socket via `setsockopt(SO_RCVBUF)`, but the kernel silently caps the effective size at `net.core.rmem_max`. The `setsockopt` call appears to succeed; only the symptom (NAK storms, latency spikes from microseconds to hundreds of milliseconds) reveals the cap.
+
+Apply the following sysctls at runtime:
+
+```sh
+sudo sysctl -w \
+    net.core.rmem_max=33554432 \
+    net.core.wmem_max=33554432 \
+    net.core.rmem_default=33554432 \
+    net.core.wmem_default=33554432
+```
+
+Persist across reboots with `/etc/sysctl.d/99-melin.conf`:
+
+```
+net.core.rmem_max=33554432
+net.core.wmem_max=33554432
+net.core.rmem_default=33554432
+net.core.wmem_default=33554432
+```
+
+Then `sudo sysctl --system` to load.
+
+**Verifying**: Healthy operation shows `naks_sent` and `recv_dropped` near zero in the rumcast diagnostics (`RUMCAST_DIAG=1`). A tail-latency p99 within ~2x of p50 is another good signal; large gaps between p50 and p99 indicate retransmits.
+
+**Sizing**: 32 MB is sufficient for tens of clients at ~1 Gbps order-entry. For hundreds of clients or 10 Gbps+ aggregate traffic, scale up proportionally — there's no penalty to oversizing beyond a small kernel-memory footprint.
+
+### UDP Segmentation Offload (UDP-GSO)
+
+The rumcast send path uses `UDP_SEGMENT` (kernel UDP-GSO, available since Linux 4.18) to hand the kernel one large skb that gets split into multiple UDP datagrams at egress. On NICs that support hardware UDP segmentation offload, the splitting happens on the wire — the kernel's per-packet IP/UDP processing cost is paid once per skb rather than once per datagram. On hosts where the kernel rejects the cmsg (older kernels, some virtualization layers), rumcast detects this on the first send and falls back to per-datagram `sendmmsg(2)` permanently.
+
+**Operator-visible behavior**: This is automatic. There is no flag to enable or disable it. Successful operation is invisible; on the rare host where it can't be used, you may see slightly higher CPU on the response thread under heavy fan-out.
+
+**Hardware verification**: Most modern server NICs (Intel X710/E810, Mellanox ConnectX-5/6/7, and any NIC with `tx-udp-segmentation` listed in `ethtool -k <nic>`) accelerate this in silicon. Without hardware offload the kernel still applies GSO via software segmentation; performance is improved but not by the same multiple. Check with:
+
+```sh
+ethtool -k <interface> | grep tx-udp-segmentation
+```
+
+A response of `tx-udp-segmentation: on` confirms hardware acceleration is active.
+
 ---
 
 ## Monitoring

@@ -317,6 +317,24 @@ kernel.watchdog = 0
 # global accounting and can stall the whole machine.
 vm.dirty_background_bytes = 33554432
 vm.dirty_bytes = 67108864
+# Network buffer tuning.
+# rmem_max / wmem_max: system-wide cap on SO_RCVBUF / SO_SNDBUF for any
+# socket. The kernel default (208 KiB) is far too small for a high-throughput
+# UDP server (rumcast) with many concurrent sessions — the receive queue
+# overflows and forces retransmits. 32 MiB gives the rumcast server room to
+# request a large buffer via setsockopt without hitting the cap.
+net.core.rmem_max = 33554432
+net.core.wmem_max = 33554432
+# TCP receive/send buffer autotuning bounds. The max column is the ceiling
+# the kernel can grow a TCP socket's buffer to under load. 16 MiB send max
+# (vs the 4 MiB default) reduces write-stalls when the journal replication
+# sender is bursting large batches to the replica over the VLAN.
+net.ipv4.tcp_rmem = 4096 131072 16777216
+net.ipv4.tcp_wmem = 4096 65536 16777216
+# NIC → kernel packet queue depth. The default (1000) can back up and drop
+# packets during bursts at high throughput. 10000 adds headroom with no
+# latency cost in the common case.
+net.core.netdev_max_backlog = 10000
 EOF
 # Raise the system-wide max file descriptor limit. The default (1024) is
 # too low for client-sweep benchmarks: 512 clients × 2 fds (stream +
@@ -331,7 +349,7 @@ root hard nofile 65536
 EOF
 echo "  Written $LIMITS_FILE (nofile=65536)"
 sysctl --system --quiet
-echo "  Written $SYSCTL_FILE (vm.swappiness=0, kernel.numa_balancing=0, kernel.watchdog=0)"
+echo "  Written $SYSCTL_FILE (vm.swappiness=0, kernel.numa_balancing=0, kernel.watchdog=0, net.core.rmem_max=32MiB, net.core.netdev_max_backlog=10000)"
 
 echo ""
 

@@ -27,6 +27,15 @@ use melin_protocol::message::{Request, ResponseKind};
 /// authenticates via Ed25519 challenge-response (operator keys only),
 /// checks for the "PROMOTE" command, and sets the flag. The thread exits
 /// when `shutdown` is set or after a successful promotion.
+///
+/// Both call sites (TCP `run_with_shutdown`, rumcast `run_rumcast_replica`)
+/// drop the returned handle without joining — the listener runs for the
+/// lifetime of the process and exits when `shutdown` flips. Without
+/// special handling a panic inside `run` would be silently swallowed by
+/// the never-joined handle. We wrap `run` in `catch_unwind` here so the
+/// panic surfaces as a `tracing::error!` line; the rest of the process
+/// keeps running (a panicking listener doesn't compromise replica
+/// correctness, just blocks future promotion attempts until restart).
 pub fn spawn(
     bind_addr: SocketAddr,
     promote: Arc<AtomicBool>,
@@ -35,8 +44,29 @@ pub fn spawn(
 ) -> JoinHandle<()> {
     std::thread::Builder::new()
         .name("promote-listener".into())
-        .spawn(move || run(bind_addr, &promote, &shutdown, &authorized_keys))
+        .spawn(move || {
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                run(bind_addr, &promote, &shutdown, &authorized_keys)
+            }));
+            if let Err(panic) = result {
+                let msg = panic_message(&panic);
+                error!(addr = %bind_addr, panic = %msg, "promote listener thread panicked");
+            }
+        })
         .expect("failed to spawn promote listener thread")
+}
+
+/// Best-effort extraction of a panic payload's display message. Most
+/// panics carry a `&'static str` or `String`; anything else falls back
+/// to a placeholder so we still get a log line.
+fn panic_message(payload: &Box<dyn std::any::Any + Send>) -> String {
+    if let Some(s) = payload.downcast_ref::<&'static str>() {
+        (*s).to_string()
+    } else if let Some(s) = payload.downcast_ref::<String>() {
+        s.clone()
+    } else {
+        "<non-string panic payload>".to_string()
+    }
 }
 
 fn run(
@@ -92,10 +122,18 @@ fn authenticate(stream: &mut TcpStream, authorized_keys: &AuthorizedKeys) -> Res
     let mut nonce = [0u8; 32];
     getrandom::fill(&mut nonce).map_err(|e| format!("getrandom failed: {e}"))?;
 
-    // Send Challenge.
-    let mut buf = [0u8; 64];
-    let written = codec::encode_response(&ResponseKind::Challenge { nonce }, &mut buf)
-        .map_err(|e| format!("encode Challenge: {e}"))?;
+    // Send Challenge. X25519 ephemerals are rumcast-only; promote
+    // (TCP) uses zeros — see [`melin_protocol::auth::auth_signing_payload`].
+    let server_x25519_eph = [0u8; 32];
+    let mut buf = [0u8; 128];
+    let written = codec::encode_response(
+        &ResponseKind::Challenge {
+            nonce,
+            server_x25519_eph,
+        },
+        &mut buf,
+    )
+    .map_err(|e| format!("encode Challenge: {e}"))?;
     stream
         .write_all(&buf[..written])
         .map_err(|e| format!("send Challenge: {e}"))?;
@@ -125,11 +163,12 @@ fn authenticate(stream: &mut TcpStream, authorized_keys: &AuthorizedKeys) -> Res
         }
     };
 
-    let (signature_bytes, public_key_bytes) = match request {
+    let (signature_bytes, public_key_bytes, client_x25519_eph) = match request {
         Request::ChallengeResponse {
             signature,
             public_key,
-        } => (signature, public_key),
+            client_x25519_eph,
+        } => (signature, public_key, client_x25519_eph),
         _ => {
             send_auth_failed(stream);
             return Err("expected ChallengeResponse".into());
@@ -151,16 +190,21 @@ fn authenticate(stream: &mut TcpStream, authorized_keys: &AuthorizedKeys) -> Res
         ));
     }
 
-    // Verify the Ed25519 signature over the nonce.
+    // Verify the Ed25519 signature over `nonce ‖ server_eph ‖
+    // client_eph` (TCP path's ephs are zeros — see Challenge above).
     let verifying_key = VerifyingKey::from_bytes(&public_key_bytes).map_err(|e| {
         send_auth_failed(stream);
         format!("invalid public key: {e}")
     })?;
     let signature = ed25519_dalek::Signature::from_bytes(&signature_bytes);
-    verifying_key.verify(&nonce, &signature).map_err(|e| {
-        send_auth_failed(stream);
-        format!("signature verification failed: {e}")
-    })?;
+    let signing_payload =
+        melin_protocol::auth::auth_signing_payload(&nonce, &server_x25519_eph, &client_x25519_eph);
+    verifying_key
+        .verify(&signing_payload, &signature)
+        .map_err(|e| {
+            send_auth_failed(stream);
+            format!("signature verification failed: {e}")
+        })?;
 
     // Auth succeeded — send ServerReady.
     let written = codec::encode_response(&ResponseKind::ServerReady, &mut buf)
@@ -273,16 +317,23 @@ mod tests {
             .read_exact(&mut frame_buf)
             .expect("read challenge payload");
         let response = codec::decode_response(&frame_buf).expect("decode challenge");
-        let nonce = match response {
-            ResponseKind::Challenge { nonce } => nonce,
+        let (nonce, server_eph) = match response {
+            ResponseKind::Challenge {
+                nonce,
+                server_x25519_eph,
+            } => (nonce, server_x25519_eph),
             other => panic!("expected Challenge, got {other:?}"),
         };
 
-        // Sign nonce and send ChallengeResponse.
-        let signature = key.sign(&nonce);
+        // Sign nonce + ephemerals (zeros for TCP).
+        let client_x25519_eph = [0u8; 32];
+        let signing_payload =
+            melin_protocol::auth::auth_signing_payload(&nonce, &server_eph, &client_x25519_eph);
+        let signature = key.sign(&signing_payload);
         let request = melin_protocol::message::Request::ChallengeResponse {
             signature: signature.to_bytes(),
             public_key: key.verifying_key().to_bytes(),
+            client_x25519_eph,
         };
         let mut encode_buf = [0u8; 256];
         let written = codec::encode_request(&request, 0, &mut encode_buf).expect("encode");
@@ -466,7 +517,7 @@ mod tests {
         let mut frame_buf = vec![0u8; frame_len];
         stream.read_exact(&mut frame_buf).unwrap();
         let _nonce = match codec::decode_response(&frame_buf).unwrap() {
-            ResponseKind::Challenge { nonce } => nonce,
+            ResponseKind::Challenge { nonce, .. } => nonce,
             other => panic!("expected Challenge, got {other:?}"),
         };
 
@@ -477,6 +528,7 @@ mod tests {
         let request = melin_protocol::message::Request::ChallengeResponse {
             signature: bad_sig.to_bytes(),
             public_key: operator_key.verifying_key().to_bytes(),
+            client_x25519_eph: [0u8; 32],
         };
         let mut encode_buf = [0u8; 256];
         let written = codec::encode_request(&request, 0, &mut encode_buf).unwrap();

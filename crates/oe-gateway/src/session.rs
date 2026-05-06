@@ -123,8 +123,10 @@ pub struct Session {
     pub melin_inflight: Vec<u8>,
     /// Melin request sequence number (per-key monotonic).
     melin_seq: u64,
-    /// Reusable encode buffer for Melin requests.
-    melin_encode_buf: [u8; 136],
+    /// Reusable encode buffer for Melin requests. 168 bytes is the
+    /// upper bound (set by ChallengeResponse: 4 prefix + 8 seq + 1
+    /// tag + 64 sig + 32 pubkey + 32 X25519 eph + slack).
+    melin_encode_buf: [u8; 168],
     pub melin_multishot_active: bool,
 
     // ── Outbound message store (FIX 4.4 §4.6/4.7 ResendRequest) ──
@@ -216,7 +218,7 @@ impl Session {
             melin_send_buf: Vec::with_capacity(256),
             melin_inflight: Vec::with_capacity(256),
             melin_seq: 0,
-            melin_encode_buf: [0u8; 136],
+            melin_encode_buf: [0u8; 168],
             melin_multishot_active: false,
 
             outbound_store: VecDeque::with_capacity(64),
@@ -430,8 +432,11 @@ impl Session {
             }
         };
 
-        let nonce = match response {
-            ResponseKind::Challenge { nonce } => nonce,
+        let (nonce, server_eph) = match response {
+            ResponseKind::Challenge {
+                nonce,
+                server_x25519_eph,
+            } => (nonce, server_x25519_eph),
             other => {
                 error!(response = ?other, "expected Challenge from Melin server");
                 self.queue_fix_logout(config, "internal error");
@@ -448,10 +453,16 @@ impl Session {
             }
         };
 
-        let signature = signing_key.sign(&nonce);
+        // Sign nonce + ephemerals (TCP uses zero ephs) — see
+        // [`melin_protocol::auth::auth_signing_payload`].
+        let client_x25519_eph = [0u8; 32];
+        let signing_payload =
+            melin_protocol::auth::auth_signing_payload(&nonce, &server_eph, &client_x25519_eph);
+        let signature = signing_key.sign(&signing_payload);
         let request = Request::ChallengeResponse {
             signature: signature.to_bytes(),
             public_key: signing_key.verifying_key().to_bytes(),
+            client_x25519_eph,
         };
 
         // Encode ChallengeResponse into Melin send buffer.

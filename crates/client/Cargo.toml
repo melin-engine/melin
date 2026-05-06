@@ -3,6 +3,18 @@ name = "melin-client"
 version = "0.5.0"
 edition = "2024"
 
+[features]
+default = []
+## Build the client to speak rumcast (reliable UDP) instead of TCP.
+## Mirrors the server's `--features rumcast` build. Same public API
+## (`Client::connect`, `send_request`, `synchronize_request_seq`,
+## `query_stats`); only the transport differs. Used by integration
+## tests built against a rumcast-only server (e.g. failover.rs under
+## `--features rumcast,trading --no-default-features`).
+rumcast = ["dep:melin-rumcast", "dep:getrandom"]
+
 [dependencies]
 ed25519-dalek = { workspace = true }
 melin-protocol = { path = "../protocol" }
+melin-rumcast = { path = "../rumcast", optional = true }
+getrandom = { version = "0.3", optional = true }

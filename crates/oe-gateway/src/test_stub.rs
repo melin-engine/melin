@@ -176,7 +176,13 @@ fn run_stub(
     // signature the gateway returns — tests only care that the state
     // machine progresses.
     let nonce = [0u8; 32];
-    write_response(&mut stream, &ResponseKind::Challenge { nonce })?;
+    write_response(
+        &mut stream,
+        &ResponseKind::Challenge {
+            nonce,
+            server_x25519_eph: [0u8; 32],
+        },
+    )?;
 
     let (_seq, req) = read_request_blocking(&mut stream, &shutdown)?;
     match req {
