@@ -388,34 +388,36 @@ impl<T: UdpTransport> ReceiverLoop<T> {
         let now = Instant::now();
         let bits = self.log.term_length_bits();
         let sub_pos = self.log.subscriber_position();
+        let session_id = self.log.config().session_id;
+        let stream_id = self.log.config().stream_id;
+        // Captured before the retain closure mutably borrows
+        // pending_naks — keeps the closure body free of &self.
+        let log = &self.log;
+        let transport = &self.transport;
+        let effective_dst = self.effective_dst;
 
-        // Drain entries whose backoff has expired. We check inline
-        // whether the gap is still present (fragment may have arrived
-        // suppressing the NAK).
-        let mut to_remove: Vec<(u32, u32, u32)> = Vec::new();
-        for (&key, pending) in &self.pending_naks {
+        // retain folds the "fire or suppress, then drop" pattern into
+        // one pass with no temp Vec — the previous two-pass version
+        // allocated a key buffer per call.
+        self.pending_naks.retain(|_key, pending| {
             if pending.fire_at > now {
-                continue;
+                return true;
             }
-            // Re-check the gap. `subscriber_position` may have advanced
-            // (gap filled and consumed) or the partition's term_id may
-            // have rotated (gap moved into the past). Either way:
-            // suppress.
-            let still_valid = self.gap_still_present(
+            // Re-check the gap. `subscriber_position` may have
+            // advanced (gap filled and consumed) or the partition's
+            // term_id may have rotated (gap moved into the past).
+            // Either way: suppress.
+            if !gap_still_present(
+                log,
                 sub_pos,
                 bits,
                 pending.term_id,
                 pending.term_offset,
                 pending.gap_length,
-            );
-            if !still_valid {
+            ) {
                 stats.naks_suppressed += 1;
-                to_remove.push(key);
-                continue;
+                return false;
             }
-
-            let session_id = self.log.config().session_id;
-            let stream_id = self.log.config().stream_id;
             let nak = NakFrame::new(
                 session_id,
                 stream_id,
@@ -423,57 +425,12 @@ impl<T: UdpTransport> ReceiverLoop<T> {
                 pending.term_offset,
                 pending.gap_length,
             );
-            match self
-                .transport
-                .send_to(self.effective_dst, bytemuck::bytes_of(&nak))
-            {
+            match transport.send_to(effective_dst, bytemuck::bytes_of(&nak)) {
                 Ok(_) => stats.naks_sent += 1,
                 Err(_) => stats.send_errors += 1,
             }
-            to_remove.push(key);
-        }
-        for k in to_remove {
-            self.pending_naks.remove(&k);
-        }
-    }
-
-    /// Re-check whether a gap is still missing. The gap [t, o, l) is
-    /// still relevant iff:
-    ///   - subscriber_position has not advanced past it (it would have
-    ///     been consumed otherwise), AND
-    ///   - the partition still holds term `t`, AND
-    ///   - HWM in that partition is still beyond the gap start.
-    fn gap_still_present(
-        &self,
-        sub_pos: u64,
-        bits: u32,
-        term_id: u32,
-        term_offset: u32,
-        gap_length: u32,
-    ) -> bool {
-        let gap_start = position(term_id, term_offset, bits);
-        // If subscriber consumed past the gap entirely, no need.
-        if sub_pos >= gap_start + gap_length as u64 {
-            return false;
-        }
-        // Find the partition still holding term_id.
-        let Some(partition) = (0..3).find(|&p| self.log.partition_term_id(p) == term_id) else {
-            return false;
-        };
-        // If subscriber has consumed PAST the gap's start (but not its
-        // end), the trailing portion may still be missing — but we
-        // schedule NAKs from sub_pos forward on each tick, so this
-        // partial case is handled by the NEW NAK we schedule later.
-        // Conservatively suppress this old NAK (it covers some bytes
-        // we already have). Use strict `>` — when `sub_pos == gap_start`
-        // there has been NO consumption and the gap is still entirely
-        // relevant.
-        if sub_pos > gap_start {
-            return false;
-        }
-        let hwm = self.log.partition_high_water_mark(partition);
-        // Gap is meaningful only if HWM is still beyond its start.
-        hwm > term_offset
+            false
+        });
     }
 
     fn maybe_send_sm(&mut self, stats: &mut TickStats) {
@@ -532,6 +489,42 @@ impl<T: UdpTransport> ReceiverLoop<T> {
         3u32.saturating_mul(term_length)
             .saturating_sub(in_term_offset)
     }
+}
+
+/// Re-check whether a scheduled NAK's gap is still missing. The gap
+/// `[term_id, term_offset, gap_length)` is still relevant iff:
+///   - subscriber_position has not advanced past it (it would have
+///     been consumed otherwise), AND
+///   - the partition still holds term `term_id`, AND
+///   - HWM in that partition is still beyond the gap start.
+///
+/// Free function (not a method) so `fire_due_naks` can call it inside
+/// a `HashMap::retain` closure without re-borrowing `self`.
+fn gap_still_present(
+    log: &SubscriptionLog,
+    sub_pos: u64,
+    bits: u32,
+    term_id: u32,
+    term_offset: u32,
+    gap_length: u32,
+) -> bool {
+    let gap_start = position(term_id, term_offset, bits);
+    if sub_pos >= gap_start + gap_length as u64 {
+        return false;
+    }
+    let Some(partition) = (0..3).find(|&p| log.partition_term_id(p) == term_id) else {
+        return false;
+    };
+    // If the subscriber consumed past the gap's start (but not its
+    // end), the trailing portion may still be missing — but a fresh
+    // NAK will be scheduled from sub_pos forward on the next tick,
+    // so suppress this old one. Strict `>`: `sub_pos == gap_start`
+    // means no consumption yet and the gap is still entirely relevant.
+    if sub_pos > gap_start {
+        return false;
+    }
+    let hwm = log.partition_high_water_mark(partition);
+    hwm > term_offset
 }
 
 /// Fold a per-tick [`TickStats`] delta into the cumulative

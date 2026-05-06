@@ -254,10 +254,14 @@ impl<T: UdpTransport> MuxedReceiver<T> {
         let sm_interval = self.config.sm_interval;
         let receiver_id = self.config.receiver_id;
         let stream_id = self.config.stream_id;
-        let counters = self.counters.as_ref().cloned();
+        // Borrow Option<&Counters> directly instead of cloning the Arc
+        // — that's two atomic refcount ops every tick on the hot path.
+        // Split-borrow over disjoint fields (counters / sessions /
+        // transport) lets the loop body see all three concurrently.
+        let counters_ref = self.counters.as_deref();
 
         for (session_id, session) in self.sessions.iter_mut() {
-            session.detect_and_schedule_gap(now, nak_min, nak_jitter, counters.as_deref());
+            session.detect_and_schedule_gap(now, nak_min, nak_jitter, counters_ref);
             session.fire_due_naks(&self.transport, &mut stats, now, *session_id, stream_id);
             session.maybe_send_sm(
                 &self.transport,
@@ -558,25 +562,30 @@ impl SessionInbound {
     ) {
         let bits = self.log.term_length_bits();
         let sub_pos = self.log.subscriber_position();
+        // Capture before the retain closure mutably borrows
+        // pending_naks, so the closure body sees only the data it
+        // needs (no &self).
+        let log = &self.log;
+        let effective_dst = self.effective_dst;
 
-        let mut to_remove: Vec<(u32, u32, u32)> = Vec::new();
-        for (&key, pending) in &self.pending_naks {
+        // retain folds the "fire or suppress, then drop" pattern into
+        // one pass with no temp Vec — the previous two-pass version
+        // allocated a key buffer per call.
+        self.pending_naks.retain(|_key, pending| {
             if pending.fire_at > now {
-                continue;
+                return true;
             }
-            let still_valid = self.gap_still_present(
+            if !gap_still_present(
+                log,
                 sub_pos,
                 bits,
                 pending.term_id,
                 pending.term_offset,
                 pending.gap_length,
-            );
-            if !still_valid {
+            ) {
                 stats.naks_suppressed += 1;
-                to_remove.push(key);
-                continue;
+                return false;
             }
-
             let nak = NakFrame::new(
                 session_id,
                 stream_id,
@@ -584,37 +593,12 @@ impl SessionInbound {
                 pending.term_offset,
                 pending.gap_length,
             );
-            match transport.send_to(self.effective_dst, bytemuck::bytes_of(&nak)) {
+            match transport.send_to(effective_dst, bytemuck::bytes_of(&nak)) {
                 Ok(_) => stats.naks_sent += 1,
                 Err(_) => stats.send_errors += 1,
             }
-            to_remove.push(key);
-        }
-        for k in to_remove {
-            self.pending_naks.remove(&k);
-        }
-    }
-
-    fn gap_still_present(
-        &self,
-        sub_pos: u64,
-        bits: u32,
-        term_id: u32,
-        term_offset: u32,
-        gap_length: u32,
-    ) -> bool {
-        let gap_start = position(term_id, term_offset, bits);
-        if sub_pos >= gap_start + gap_length as u64 {
-            return false;
-        }
-        let Some(partition) = (0..3).find(|&p| self.log.partition_term_id(p) == term_id) else {
-            return false;
-        };
-        if sub_pos > gap_start {
-            return false;
-        }
-        let hwm = self.log.partition_high_water_mark(partition);
-        hwm > term_offset
+            false
+        });
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -646,6 +630,31 @@ impl SessionInbound {
             Err(_) => stats.send_errors += 1,
         }
     }
+}
+
+/// Re-check whether a scheduled NAK's gap is still missing. Free
+/// function (not a method) so `fire_due_naks` can call it inside a
+/// `HashMap::retain` closure without re-borrowing `self`.
+fn gap_still_present(
+    log: &SubscriptionLog,
+    sub_pos: u64,
+    bits: u32,
+    term_id: u32,
+    term_offset: u32,
+    gap_length: u32,
+) -> bool {
+    let gap_start = position(term_id, term_offset, bits);
+    if sub_pos >= gap_start + gap_length as u64 {
+        return false;
+    }
+    let Some(partition) = (0..3).find(|&p| log.partition_term_id(p) == term_id) else {
+        return false;
+    };
+    if sub_pos > gap_start {
+        return false;
+    }
+    let hwm = log.partition_high_water_mark(partition);
+    hwm > term_offset
 }
 
 #[cfg(test)]
