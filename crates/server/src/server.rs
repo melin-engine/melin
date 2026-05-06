@@ -1749,6 +1749,7 @@ pub fn run_dpdk(
     let active_connections_response = Arc::clone(&active_connections);
     let s3 = Arc::clone(&shutdown);
     let response_utilization_thread = Arc::clone(&response_utilization);
+    let busy_spin = !config.yield_idle;
     let response_handle = std::thread::Builder::new()
         .name("response".into())
         .spawn(move || {
@@ -1765,12 +1766,12 @@ pub fn run_dpdk(
                 active_connections_response,
                 tx_producers,
                 response_utilization_thread,
+                busy_spin,
             );
         })
         .map_err(|e| format!("spawn response thread: {e}"))?;
 
     // Spawn shadow snapshot thread if enabled (same as kernel TCP path).
-    let busy_spin = !config.yield_idle;
     let shadow_handle = if let Some(shadow_cons) = shadow_consumer {
         let snap_path = config.shadow_snapshot_path();
         let interval = std::time::Duration::from_millis(config.snapshot_interval_ms);

@@ -103,6 +103,7 @@ pub fn run(
     active_connections: Arc<AtomicU64>,
     mut tx_producers: Vec<spsc::Producer<TxFrame>>,
     utilization: Arc<StageUtilization>,
+    busy_spin: bool,
 ) {
     // Track known connections (for heartbeat scheduling).
     let mut connections: HashMap<u64, ConnectionHeartbeat> = HashMap::with_capacity(256);
@@ -180,8 +181,8 @@ pub fn run(
                 utilization.busy.store(busy_count, Ordering::Relaxed);
                 utilization.idle.store(idle_count, Ordering::Relaxed);
             }
-            if idle_spins < 1000 {
-                idle_spins += 1;
+            if busy_spin || idle_spins < 1000 {
+                idle_spins = idle_spins.wrapping_add(1);
                 std::hint::spin_loop();
             } else {
                 std::thread::yield_now();
