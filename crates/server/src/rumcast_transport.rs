@@ -468,6 +468,17 @@ fn run_rumcast_primary_with_state(
             "failed to enable SO_BUSY_POLL on orders socket; continuing without busy poll"
         );
     }
+    // UDP_GRO on the orders socket enables receive-side segment fan-out
+    // when peers send via UDP_SEGMENT. ENOPROTOOPT on pre-5.0 kernels
+    // is non-fatal — fall back to per-datagram recv with a warning.
+    if config.rumcast_udp_gro
+        && let Err(e) = orders.set_udp_gro(true)
+    {
+        warn!(
+            error = ?e,
+            "failed to enable UDP_GRO on orders socket; continuing without GRO fan-out"
+        );
+    }
     let muxed_receiver_config = MuxedReceiverConfig {
         stream_id: RUMCAST_ORDERS_STREAM,
         receiver_id: SERVER_RECEIVER_ID,

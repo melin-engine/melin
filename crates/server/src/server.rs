@@ -197,6 +197,14 @@ pub struct ServerConfig {
     #[arg(long, default_value_t = 0)]
     pub rumcast_busy_poll_us: u32,
 
+    /// Enable kernel `UDP_GRO` on the rumcast orders socket. Pairs
+    /// with `UDP_SEGMENT` (UDP-GSO) on the sender side so the
+    /// kernel can re-coalesce incoming wire packets and the rumcast
+    /// recv path can fan out segments via the cmsg `seg_size` hint.
+    /// Off by default. No-op on loopback (no NAPI/GRO path).
+    #[arg(long, default_value_t = false)]
+    pub rumcast_udp_gro: bool,
+
     // --- DPDK configuration (only used with --features dpdk) ---
     /// DPDK EAL arguments (space-separated). Example: "-l 0-7 --huge-dir /dev/hugepages".
     /// Passed directly to rte_eal_init. Only used when compiled with --features dpdk.
@@ -327,6 +335,7 @@ impl Default for ServerConfig {
             yield_idle: false,
             rumcast_client_addr: None,
             rumcast_busy_poll_us: 0,
+            rumcast_udp_gro: false,
             dpdk_eal_args: String::new(),
             dpdk_ports: vec![0],
             dpdk_ip: "10.0.0.1".into(),

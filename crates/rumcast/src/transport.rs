@@ -401,6 +401,175 @@ pub(crate) fn recvmmsg_into(fd: RawFd, slots: &mut [DatagramBuf]) -> io::Result<
     Ok(n)
 }
 
+/// Linux `UDP_MAX_SEGMENTS` — the kernel-imposed cap on segments the
+/// receive-side GRO path will coalesce into a single skb. We use it
+/// to bound the recvmmsg msghdr count so a single coalesced msghdr
+/// can never overflow the caller's slot array (which would silently
+/// drop the unfanned tail). Mirrors the kernel constant in
+/// `include/net/udp.h`; conservative — newer kernels haven't raised it.
+#[cfg(target_os = "linux")]
+const GRO_MAX_SEGS_PER_MSGHDR: usize = 64;
+
+/// `recvmmsg(2)` variant for `UDP_GRO`-enabled sockets.
+///
+/// The kernel may have coalesced multiple consecutive UDP datagrams
+/// (each originally sent via `UDP_SEGMENT`) into one large skb. Per
+/// msghdr we receive:
+/// * a `payload_len` that may exceed one wire MTU,
+/// * a `UDP_GRO` cmsg whose `u16` payload is the original `seg_size`.
+///
+/// We recvmmsg into the caller's input pool (large buffers + per-
+/// msghdr cmsg storage), then walk each filled msghdr and fan out
+/// segments — one segment per output `slot` — copying `seg_size`
+/// bytes per segment. The final segment of each msghdr may be
+/// shorter (kernel preserves the unsegmented tail). `from` and `len`
+/// are written on each output slot.
+///
+/// Returns the number of output slots filled. The msghdr count is
+/// capped to `slots.len() / GRO_MAX_SEGS_PER_MSGHDR` so a single
+/// coalesced msghdr can never overflow the caller's slot array.
+/// Callers with `slots.len() < GRO_MAX_SEGS_PER_MSGHDR` fall through
+/// to the non-GRO recv path automatically.
+///
+/// `MSG_DONTWAIT` semantics match `recvmmsg_into` — `Ok(0)` on no
+/// data, `Err(WouldBlock)` mapped to `Ok(0)`.
+#[cfg(target_os = "linux")]
+fn recvmmsg_into_gro(
+    fd: RawFd,
+    pool: &mut GroInputPool,
+    slots: &mut [DatagramBuf],
+) -> io::Result<usize> {
+    if slots.is_empty() || pool.buffers.is_empty() {
+        return Ok(0);
+    }
+    // Cap msghdr count so the worst-case fan-out (every msghdr maxed
+    // at GRO_MAX_SEGS_PER_MSGHDR) still fits in `slots`. With slots
+    // smaller than one msghdr's worst case, fall back to the non-GRO
+    // recv path (one wire packet per slot) — that's correct, just
+    // doesn't get the GRO syscall amortization.
+    let max_chunk_for_slots = slots.len() / GRO_MAX_SEGS_PER_MSGHDR;
+    if max_chunk_for_slots == 0 {
+        return recvmmsg_into(fd, slots);
+    }
+    let chunk_len = pool
+        .buffers
+        .len()
+        .min(SENDMMSG_BATCH_CAP)
+        .min(max_chunk_for_slots);
+
+    let mut iovs: [libc::iovec; SENDMMSG_BATCH_CAP] = unsafe { std::mem::zeroed() };
+    let mut names: [libc::sockaddr_storage; SENDMMSG_BATCH_CAP] = unsafe { std::mem::zeroed() };
+    let mut msgs: [libc::mmsghdr; SENDMMSG_BATCH_CAP] = unsafe { std::mem::zeroed() };
+
+    for i in 0..chunk_len {
+        let buf = &mut pool.buffers[i];
+        iovs[i].iov_base = buf.as_mut_ptr() as *mut libc::c_void;
+        iovs[i].iov_len = buf.len();
+
+        let hdr = &mut msgs[i].msg_hdr;
+        hdr.msg_name = &mut names[i] as *mut _ as *mut libc::c_void;
+        hdr.msg_namelen = std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
+        hdr.msg_iov = &mut iovs[i] as *mut _;
+        hdr.msg_iovlen = 1;
+        hdr.msg_control = pool.cmsg_bufs[i].as_mut_ptr() as *mut libc::c_void;
+        hdr.msg_controllen = std::mem::size_of::<[u64; 4]>();
+    }
+
+    let ret = unsafe {
+        libc::recvmmsg(
+            fd,
+            msgs.as_mut_ptr(),
+            chunk_len as libc::c_uint,
+            libc::MSG_DONTWAIT,
+            std::ptr::null_mut(),
+        )
+    };
+    if ret < 0 {
+        let err = io::Error::last_os_error();
+        if err.kind() == io::ErrorKind::WouldBlock {
+            return Ok(0);
+        }
+        return Err(err);
+    }
+    let n_msgs = ret as usize;
+
+    // Fan out via the pure-logic helper so the segment-splitting can
+    // be unit-tested without a real recvmmsg.
+    let mut out = 0usize;
+    for i in 0..n_msgs {
+        if out >= slots.len() {
+            break;
+        }
+        let payload_len = msgs[i].msg_len as usize;
+        let from = sockaddr_storage_to_socket_addr(&names[i]);
+        let buf = &pool.buffers[i][..payload_len];
+        let seg_size = parse_udp_gro_cmsg(&msgs[i].msg_hdr);
+        out += fan_out_msghdr(buf, seg_size, from, &mut slots[out..]);
+    }
+    Ok(out)
+}
+
+/// Pure fan-out helper — split one recvmmsg msghdr's payload into
+/// segments and write each into the next output slot. Extracted out
+/// of [`recvmmsg_into_gro`] so it can be unit-tested without
+/// fabricating a kernel `msghdr`. Returns the number of slots written.
+///
+/// `seg_size` is `None` when the kernel returned no `UDP_GRO` cmsg
+/// (no coalescing happened) — in that case we treat the whole
+/// payload as one segment. When `seg_size` is `Some(s)` with `0 < s <
+/// payload_len`, we stride through the payload in chunks of `s`; the
+/// final segment may be shorter.
+fn fan_out_msghdr(
+    payload: &[u8],
+    seg_size: Option<u16>,
+    from: SocketAddr,
+    slots: &mut [DatagramBuf],
+) -> usize {
+    if payload.is_empty() || slots.is_empty() {
+        return 0;
+    }
+    let stride = match seg_size {
+        // Coalesced: seg_size from the cmsg dictates segment length.
+        Some(s) if (s as usize) > 0 && (s as usize) < payload.len() => s as usize,
+        // Either no cmsg or seg_size >= payload_len — one segment.
+        _ => payload.len(),
+    };
+    let mut out = 0;
+    let mut offset = 0;
+    while offset < payload.len() && out < slots.len() {
+        let end = (offset + stride).min(payload.len());
+        let seg = &payload[offset..end];
+        let dst = slots[out].as_mut_slice();
+        let n = seg.len().min(dst.len());
+        dst[..n].copy_from_slice(&seg[..n]);
+        slots[out].len = n;
+        slots[out].from = from;
+        out += 1;
+        offset = end;
+    }
+    out
+}
+
+/// Walk the `msg_control` block on a kernel-filled `msghdr` and
+/// return the `UDP_GRO` segment size if present, else `None`.
+#[cfg(target_os = "linux")]
+fn parse_udp_gro_cmsg(hdr: &libc::msghdr) -> Option<u16> {
+    if hdr.msg_control.is_null() || hdr.msg_controllen == 0 {
+        return None;
+    }
+    unsafe {
+        let mut cmsg = libc::CMSG_FIRSTHDR(hdr);
+        while !cmsg.is_null() {
+            if (*cmsg).cmsg_level == libc::SOL_UDP && (*cmsg).cmsg_type == UDP_GRO_CMSG {
+                let data = libc::CMSG_DATA(cmsg) as *const u16;
+                return Some(*data);
+            }
+            cmsg = libc::CMSG_NXTHDR(hdr, cmsg);
+        }
+    }
+    None
+}
+
 /// Decode a kernel-filled `sockaddr_storage` back into a
 /// `SocketAddr`. Anything that isn't AF_INET / AF_INET6 falls back to
 /// `0.0.0.0:0` — the protocol parser drops it later.
@@ -646,14 +815,54 @@ pub trait UdpTransport: Send + Sync {
 /// Kernel UDP socket backend (`std::net::UdpSocket`, non-blocking).
 pub struct KernelUdp {
     socket: UdpSocket,
+    /// Whether the receive path should request `UDP_GRO` cmsg fan-out.
+    /// Set via [`KernelUdp::set_udp_gro`]; checked once per recv_batch.
+    /// `AtomicBool` so callers don't need `&mut self` to enable.
+    gro_enabled: std::sync::atomic::AtomicBool,
+    /// Lazily-allocated pool of large input buffers used only on the
+    /// GRO recv path. Sized for the worst-case coalesced UDP packet
+    /// (~64 KiB). `Mutex` covers pool creation + per-call borrow; the
+    /// uncontested cost is ~30 cycles, negligible vs the syscall.
+    /// `None` until first GRO recv.
+    gro_input_pool: std::sync::Mutex<Option<GroInputPool>>,
 }
+
+/// Input buffers used by the `UDP_GRO` recv path. Pre-allocated once
+/// the first time `recv_batch` runs with GRO enabled. Each buffer
+/// holds one coalesced GRO skb; userspace then fans out the segments
+/// into the caller's small `DatagramBuf` slots.
+struct GroInputPool {
+    /// One large buffer per mmsghdr.
+    buffers: Vec<Box<[u8]>>,
+    /// Per-mmsghdr msg_control storage. Sized for one `UDP_GRO` cmsg
+    /// (`CMSG_SPACE(sizeof(u16))` = 24 bytes on x86_64; round up to
+    /// `[u64; 4]` = 32 bytes for 8-byte alignment with headroom).
+    cmsg_bufs: Vec<[u64; 4]>,
+}
+
+/// Per-mmsghdr slot count. With GRO active, one msghdr can yield
+/// many segments; we fan out into the caller's slots, so the input
+/// pool only needs enough buffers to absorb a syscall's worth at the
+/// cap below. Larger than `SENDMMSG_BATCH_CAP / 2` is wasteful since
+/// recvmmsg returns N msghdrs ≤ pool size in one call.
+const GRO_INPUT_BUF_BYTES: usize = 65536;
+const GRO_INPUT_POOL_CAP: usize = 32;
+
+/// `UDP_GRO` cmsg type — Linux `<linux/udp.h>` defines this as `104`.
+/// `libc` doesn't currently re-export it.
+#[cfg(target_os = "linux")]
+const UDP_GRO_CMSG: libc::c_int = 104;
 
 impl KernelUdp {
     /// Bind to `local`. The socket is set to non-blocking mode.
     pub fn bind(local: SocketAddr) -> io::Result<Self> {
         let socket = UdpSocket::bind(local)?;
         socket.set_nonblocking(true)?;
-        Ok(Self { socket })
+        Ok(Self {
+            socket,
+            gro_enabled: std::sync::atomic::AtomicBool::new(false),
+            gro_input_pool: std::sync::Mutex::new(None),
+        })
     }
 
     /// Set the multicast TTL for outbound packets.
@@ -759,6 +968,49 @@ impl KernelUdp {
         }
         Ok(())
     }
+
+    /// Enable kernel `UDP_GRO` on this socket. With GRO active the
+    /// kernel coalesces consecutive datagrams from the same flow into
+    /// one large skb on receive, and `recv_batch` fans the segments
+    /// out into the caller's slots based on the `seg_size` carried in
+    /// the per-msghdr `UDP_GRO` cmsg.
+    ///
+    /// The peer must be sending with `UDP_SEGMENT` (UDP-GSO) for this
+    /// to fire — that's how the kernel knows the original segment
+    /// boundaries. Without UDP-GSO on the wire, GRO is a no-op and
+    /// `recv_batch` returns one segment per recvmsg as before.
+    ///
+    /// Pass `false` to disable. `setsockopt` returns `ENOPROTOOPT` on
+    /// pre-5.0 kernels — the caller can treat that as "GRO not
+    /// available" and continue without it.
+    #[cfg(target_os = "linux")]
+    pub fn set_udp_gro(&self, on: bool) -> io::Result<()> {
+        use std::os::unix::io::AsRawFd;
+        let val: libc::c_int = if on { 1 } else { 0 };
+        let ret = unsafe {
+            libc::setsockopt(
+                self.socket.as_raw_fd(),
+                libc::SOL_UDP,
+                UDP_GRO_CMSG,
+                &val as *const _ as *const libc::c_void,
+                std::mem::size_of_val(&val) as libc::socklen_t,
+            )
+        };
+        if ret != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        self.gro_enabled
+            .store(on, std::sync::atomic::Ordering::Release);
+        Ok(())
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    pub fn set_udp_gro(&self, _on: bool) -> io::Result<()> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "UDP_GRO is Linux-only",
+        ))
+    }
 }
 
 impl UdpTransport for KernelUdp {
@@ -797,7 +1049,36 @@ impl UdpTransport for KernelUdp {
 
     fn recv_batch(&self, slots: &mut [DatagramBuf]) -> io::Result<usize> {
         use std::os::unix::io::AsRawFd;
-        recvmmsg_into(self.socket.as_raw_fd(), slots)
+        let fd = self.socket.as_raw_fd();
+        // Fast path: GRO disabled — straight-line recvmmsg, no
+        // per-msghdr cmsg parsing and no input pool.
+        if !self.gro_enabled.load(std::sync::atomic::Ordering::Acquire) {
+            return recvmmsg_into(fd, slots);
+        }
+        // GRO path: lazily allocate the input pool on first call,
+        // then recvmmsg into it and fan out segments.
+        #[cfg(target_os = "linux")]
+        {
+            let mut guard = self
+                .gro_input_pool
+                .lock()
+                .expect("gro_input_pool mutex poisoned");
+            if guard.is_none() {
+                let mut buffers: Vec<Box<[u8]>> = Vec::with_capacity(GRO_INPUT_POOL_CAP);
+                let mut cmsg_bufs: Vec<[u64; 4]> = Vec::with_capacity(GRO_INPUT_POOL_CAP);
+                for _ in 0..GRO_INPUT_POOL_CAP {
+                    buffers.push(vec![0u8; GRO_INPUT_BUF_BYTES].into_boxed_slice());
+                    cmsg_bufs.push([0u64; 4]);
+                }
+                *guard = Some(GroInputPool { buffers, cmsg_bufs });
+            }
+            let pool = guard.as_mut().expect("just initialized");
+            recvmmsg_into_gro(fd, pool, slots)
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            recvmmsg_into(fd, slots)
+        }
     }
 
     fn park(&self, timeout: std::time::Duration) {
@@ -857,6 +1138,163 @@ mod tests {
                 panic!("no datagram within deadline");
             }
             std::thread::sleep(Duration::from_micros(100));
+        }
+    }
+
+    #[test]
+    fn set_udp_gro_off_succeeds() {
+        // Disabling UDP_GRO is harmless on every kernel and never
+        // requires privileges — exercises the setsockopt ABI.
+        let t = KernelUdp::bind(loopback(0)).unwrap();
+        t.set_udp_gro(false).expect("disabling UDP_GRO");
+    }
+
+    #[test]
+    fn set_udp_gro_on_succeeds_or_unsupported() {
+        // Enabling UDP_GRO requires Linux >= 5.0. Accept Ok or
+        // ENOPROTOOPT so the test runs on older kernels too.
+        let t = KernelUdp::bind(loopback(0)).unwrap();
+        match t.set_udp_gro(true) {
+            Ok(()) => {}
+            Err(e) if e.raw_os_error() == Some(libc::ENOPROTOOPT) => {}
+            Err(e) => panic!("unexpected set_udp_gro error: {e}"),
+        }
+    }
+
+    #[test]
+    fn fan_out_msghdr_no_cmsg_emits_one_slot() {
+        // No UDP_GRO cmsg → kernel didn't coalesce → emit the whole
+        // payload as one segment.
+        let payload = vec![0xABu8; 96];
+        let from = loopback(1234);
+        let mut slots: Vec<DatagramBuf> = (0..4).map(|_| DatagramBuf::new(2048)).collect();
+        let n = fan_out_msghdr(&payload, None, from, &mut slots);
+        assert_eq!(n, 1);
+        assert_eq!(slots[0].len, 96);
+        assert_eq!(slots[0].from, from);
+        assert!(slots[0].payload().iter().all(|&b| b == 0xAB));
+        assert_eq!(slots[1].len, 0);
+    }
+
+    #[test]
+    fn fan_out_msghdr_coalesced_splits_by_seg_size() {
+        // Kernel coalesced 5×64 = 320 bytes into one msghdr with a
+        // UDP_GRO cmsg seg_size=64. Fan out should emit 5 slots of
+        // 64 bytes each.
+        let mut payload = Vec::with_capacity(320);
+        for i in 0..5u8 {
+            payload.extend(std::iter::repeat_n(i, 64));
+        }
+        let from = loopback(5678);
+        let mut slots: Vec<DatagramBuf> = (0..8).map(|_| DatagramBuf::new(2048)).collect();
+        let n = fan_out_msghdr(&payload, Some(64), from, &mut slots);
+        assert_eq!(n, 5);
+        for (i, slot) in slots.iter().enumerate().take(5) {
+            assert_eq!(slot.len, 64);
+            assert_eq!(slot.from, from);
+            assert!(slot.payload().iter().all(|&b| b == i as u8));
+        }
+        assert_eq!(slots[5].len, 0);
+    }
+
+    #[test]
+    fn fan_out_msghdr_short_trailing_segment() {
+        // 47 segments of 64B + one trailing 32B short segment = 3040
+        // bytes. seg_size in the cmsg is the FULL segment size; the
+        // tail is shorter (kernel preserves it). Verify the last slot
+        // gets 32 bytes, not 64.
+        let mut payload = Vec::with_capacity(64 * 47 + 32);
+        for i in 0..47u8 {
+            payload.extend(std::iter::repeat_n(i, 64));
+        }
+        payload.extend(std::iter::repeat_n(0xFFu8, 32));
+        let from = loopback(7777);
+        let mut slots: Vec<DatagramBuf> = (0..64).map(|_| DatagramBuf::new(2048)).collect();
+        let n = fan_out_msghdr(&payload, Some(64), from, &mut slots);
+        assert_eq!(n, 48);
+        assert_eq!(slots[47].len, 32);
+        assert!(slots[47].payload().iter().all(|&b| b == 0xFF));
+    }
+
+    #[test]
+    fn fan_out_msghdr_caps_at_slot_count() {
+        // 10 segments of 64B but caller has only 4 slots — emit 4,
+        // drop the rest. The caller must size `slots` appropriately;
+        // recvmmsg_into_gro caps msghdr count to prevent this in
+        // practice.
+        let payload = vec![0xCDu8; 640];
+        let from = loopback(9999);
+        let mut slots: Vec<DatagramBuf> = (0..4).map(|_| DatagramBuf::new(2048)).collect();
+        let n = fan_out_msghdr(&payload, Some(64), from, &mut slots);
+        assert_eq!(n, 4);
+        for slot in &slots {
+            assert_eq!(slot.len, 64);
+        }
+    }
+
+    #[test]
+    fn fan_out_msghdr_seg_size_ge_payload_treated_as_single() {
+        // seg_size=128 but payload is only 64 bytes → no actual
+        // coalescing happened (or only one segment fit). Emit one
+        // slot with the full 64 bytes.
+        let payload = vec![0x77u8; 64];
+        let from = loopback(2222);
+        let mut slots: Vec<DatagramBuf> = (0..2).map(|_| DatagramBuf::new(2048)).collect();
+        let n = fan_out_msghdr(&payload, Some(128), from, &mut slots);
+        assert_eq!(n, 1);
+        assert_eq!(slots[0].len, 64);
+    }
+
+    #[test]
+    fn fan_out_msghdr_empty_payload_noop() {
+        let mut slots: Vec<DatagramBuf> = (0..2).map(|_| DatagramBuf::new(2048)).collect();
+        let n = fan_out_msghdr(&[], Some(64), loopback(1), &mut slots);
+        assert_eq!(n, 0);
+        assert_eq!(slots[0].len, 0);
+    }
+
+    #[test]
+    fn fan_out_msghdr_no_slots_noop() {
+        let payload = vec![0u8; 64];
+        let mut slots: Vec<DatagramBuf> = Vec::new();
+        let n = fan_out_msghdr(&payload, Some(64), loopback(1), &mut slots);
+        assert_eq!(n, 0);
+    }
+
+    #[test]
+    fn recv_batch_with_gro_falls_back_to_single_segment_on_loopback() {
+        // Loopback never triggers GRO coalescing — every datagram
+        // arrives separately. Verify that with GRO enabled, the recv
+        // path still delivers each datagram as one slot (the
+        // single-segment fallback inside `recvmmsg_into_gro`).
+        let recv = KernelUdp::bind(loopback(0)).unwrap();
+        let send = KernelUdp::bind(loopback(0)).unwrap();
+        let recv_addr = recv.local_addr().unwrap();
+        // Skip the test on hosts without UDP_GRO support.
+        if let Err(e) = recv.set_udp_gro(true) {
+            if e.raw_os_error() == Some(libc::ENOPROTOOPT) {
+                return;
+            }
+            panic!("set_udp_gro failed: {e}");
+        }
+
+        for i in 0..4u8 {
+            send.send_to(recv_addr, &[i; 32]).unwrap();
+        }
+
+        let mut slots: Vec<DatagramBuf> = (0..8).map(|_| DatagramBuf::new(2048)).collect();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let mut total = 0;
+        while total < 4 && Instant::now() < deadline {
+            match recv.recv_batch(&mut slots[total..]).unwrap() {
+                0 => std::thread::sleep(Duration::from_micros(100)),
+                n => total += n,
+            }
+        }
+        assert_eq!(total, 4, "expected 4 datagrams, got {total}");
+        for (i, slot) in slots.iter().enumerate().take(4) {
+            assert_eq!(slot.len, 32);
+            assert!(slot.payload().iter().all(|&b| b == i as u8));
         }
     }
 

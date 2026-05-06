@@ -322,6 +322,14 @@ struct BenchArgs {
     /// requirements.
     #[arg(long, default_value_t = 0)]
     rumcast_busy_poll_us: u32,
+
+    /// Enable kernel `UDP_GRO` on the bench's rumcast response
+    /// socket. Pairs with `UDP_SEGMENT` (UDP-GSO) on the server-side
+    /// sender so the kernel can re-coalesce incoming response
+    /// datagrams and the bench's recv path fans them out via the
+    /// `seg_size` cmsg. Off by default. No-op on loopback.
+    #[arg(long, default_value_t = false)]
+    rumcast_udp_gro: bool,
 }
 
 fn main() {
@@ -387,6 +395,7 @@ fn main() {
                         args.group_commit_us,
                         args.journal.clone(),
                         args.rumcast_busy_poll_us,
+                        args.rumcast_udp_gro,
                     ),
                 };
                 // Embedded-mode default: use the core the embedded
@@ -409,6 +418,7 @@ fn main() {
                     json_path: json_path.map(|p| p.to_path_buf()),
                     busy_spin: args.rumcast_busy_spin,
                     busy_poll_us: args.rumcast_busy_poll_us,
+                    udp_gro: args.rumcast_udp_gro,
                     signing_key,
                     bench_core_start,
                 });
@@ -1148,6 +1158,7 @@ fn spawn_embedded_rumcast_server(
     group_commit_us: u64,
     journal_path: Option<std::path::PathBuf>,
     rumcast_busy_poll_us: u32,
+    rumcast_udp_gro: bool,
 ) -> (
     std::net::SocketAddr,
     std::net::SocketAddr,
@@ -1235,6 +1246,7 @@ fn spawn_embedded_rumcast_server(
         // core for the bench client.
         cores: pipeline_cores,
         rumcast_busy_poll_us,
+        rumcast_udp_gro,
         ..ServerConfig::default()
     };
     let rumcast_config = melin_server::rumcast_transport::RumcastConfig { bind: server_addr };

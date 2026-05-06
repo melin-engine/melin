@@ -78,6 +78,10 @@ pub struct RumcastBenchConfig {
     /// `0` disables. See `KernelUdp::set_busy_poll` for the sysctl /
     /// privilege requirements.
     pub busy_poll_us: u32,
+    /// Enable `UDP_GRO` on the bench response socket so coalesced
+    /// incoming datagrams (from a server using UDP-GSO) get fanned
+    /// out as separate logical frames by `recv_batch`.
+    pub udp_gro: bool,
     /// Client's long-term Ed25519 identity. The server's
     /// `authorized_keys` file must list this key under a permission
     /// that allows order submission (e.g. `trader`). All N concurrent
@@ -172,6 +176,14 @@ pub fn run_rumcast_roundtrip(cfg: RumcastBenchConfig) {
         eprintln!(
             "warning: could not enable SO_BUSY_POLL on bench socket ({} us): {e}",
             cfg.busy_poll_us
+        );
+    }
+    // UDP_GRO: ENOPROTOOPT on pre-5.0 kernels; non-fatal.
+    if cfg.udp_gro
+        && let Err(e) = endpoint.set_udp_gro(true)
+    {
+        eprintln!(
+            "warning: could not enable UDP_GRO on bench socket: {e}; continuing without GRO fan-out"
         );
     }
     let (send_half, recv_half) = endpoint.split();

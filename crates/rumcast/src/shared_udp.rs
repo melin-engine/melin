@@ -211,6 +211,16 @@ impl SharedUdp<KernelUdp> {
     }
 }
 
+#[cfg(target_os = "linux")]
+impl SharedUdp<KernelUdp> {
+    /// Enable kernel `UDP_GRO` on the underlying socket. See
+    /// [`KernelUdp::set_udp_gro`]. Idempotent; takes effect for both
+    /// halves since they share the same `KernelUdp`.
+    pub fn set_udp_gro(&self, on: bool) -> io::Result<()> {
+        self.inner.socket.set_udp_gro(on)
+    }
+}
+
 impl<T: UdpTransport> SharedUdp<T> {
     /// Wrap an already-constructed transport for shared use.
     pub fn new(socket: T) -> Self {
