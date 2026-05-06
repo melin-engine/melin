@@ -228,6 +228,118 @@ fn sendmmsg_staged_impl(
     Ok(total)
 }
 
+/// `UDP_SEGMENT` cmsg type — present in `linux/udp.h` since 4.18 but
+/// not exposed by the glibc variant of the `libc` crate (only the
+/// uclibc fork). Hardcoded here; the value is part of the kernel ABI.
+#[cfg(target_os = "linux")]
+#[allow(dead_code)] // wired up in a follow-up commit
+const UDP_SEGMENT_CMSG: libc::c_int = 103;
+
+/// Issue `sendmmsg(2)` with per-message `UDP_SEGMENT` cmsg (UDP-GSO).
+/// Each entry `(dst, offset, total_len, segment_size)` describes one
+/// contiguous run in `data` that the kernel will split into
+/// `ceil(total_len / segment_size)` UDP datagrams of `segment_size`
+/// bytes each (the last may be shorter). Reduces per-packet kernel
+/// UDP-send cost: N logical packets traverse the IP/UDP stack as one
+/// skb. On NICs with hardware UDP segmentation offload the splitting
+/// happens on the wire, not in the kernel.
+///
+/// Returns the number of mmsghdrs the kernel accepted (= number of
+/// session-runs sent, NOT total UDP datagrams). Caller knows
+/// segments-per-msghdr from its own bookkeeping.
+///
+/// On systems where the kernel rejects `UDP_SEGMENT` (pre-4.18, or
+/// some virt environments), the syscall returns `EINVAL`. The caller
+/// is expected to detect this once at startup and fall back to plain
+/// `sendmmsg_staged`.
+#[cfg(target_os = "linux")]
+#[allow(dead_code)] // wired up in a follow-up commit
+pub(crate) fn sendmmsg_staged_segmented(
+    fd: RawFd,
+    data: &[u8],
+    entries: &[(SocketAddr, usize, usize, u16)],
+) -> io::Result<usize> {
+    if entries.is_empty() {
+        return Ok(0);
+    }
+
+    // CMSG_SPACE(sizeof(u16)) — alignment-padded cmsg buffer per
+    // mmsghdr. Using the libc macro keeps us correct across libc/arch
+    // combos (it returns 24 on x86_64 glibc).
+    // Safety: CMSG_SPACE is a pure arithmetic macro.
+    let cmsg_space = unsafe { libc::CMSG_SPACE(std::mem::size_of::<u16>() as u32) } as usize;
+
+    let mut total = 0usize;
+    let mut start = 0;
+    while start < entries.len() {
+        let chunk_end = entries.len().min(start + SENDMMSG_BATCH_CAP);
+        let chunk_len = chunk_end - start;
+
+        // Stack-resident parallel arrays sized to the cap. cmsg_bufs
+        // is dimensioned for the worst-case CMSG_SPACE on any libc/arch
+        // (32 bytes is plenty for cmsghdr + u16 + alignment everywhere).
+        const CMSG_BUF_LEN: usize = 32;
+        let mut addrs: [libc::sockaddr_storage; SENDMMSG_BATCH_CAP] = unsafe { std::mem::zeroed() };
+        let mut iovs: [libc::iovec; SENDMMSG_BATCH_CAP] = unsafe { std::mem::zeroed() };
+        let mut msgs: [libc::mmsghdr; SENDMMSG_BATCH_CAP] = unsafe { std::mem::zeroed() };
+        let mut cmsg_bufs: [[u8; CMSG_BUF_LEN]; SENDMMSG_BATCH_CAP] =
+            [[0u8; CMSG_BUF_LEN]; SENDMMSG_BATCH_CAP];
+        debug_assert!(cmsg_space <= CMSG_BUF_LEN);
+
+        for i in 0..chunk_len {
+            let (dst, offset, total_len, seg_size) = entries[start + i];
+            let (sa, sa_len) = sockaddr_from_socket_addr(dst);
+            addrs[i] = sa;
+
+            iovs[i].iov_base = data[offset..].as_ptr() as *mut libc::c_void;
+            iovs[i].iov_len = total_len;
+
+            // Build the cmsg in cmsg_bufs[i]. Manual layout: write
+            // cmsghdr fields then the u16 segment size at CMSG_DATA.
+            // Safety: cmsg_bufs[i] is at least cmsg_space bytes; the
+            // pointer arithmetic via CMSG_DATA is the kernel-blessed
+            // way to locate the cmsg payload regardless of arch
+            // alignment rules.
+            unsafe {
+                let hdr_ptr = cmsg_bufs[i].as_mut_ptr() as *mut libc::cmsghdr;
+                (*hdr_ptr).cmsg_len =
+                    libc::CMSG_LEN(std::mem::size_of::<u16>() as u32) as libc::size_t;
+                (*hdr_ptr).cmsg_level = libc::SOL_UDP;
+                (*hdr_ptr).cmsg_type = UDP_SEGMENT_CMSG;
+                let data_ptr = libc::CMSG_DATA(hdr_ptr) as *mut u16;
+                std::ptr::write_unaligned(data_ptr, seg_size);
+            }
+
+            let hdr = &mut msgs[i].msg_hdr;
+            hdr.msg_name = &addrs[i] as *const _ as *mut libc::c_void;
+            hdr.msg_namelen = sa_len;
+            hdr.msg_iov = &mut iovs[i] as *mut _;
+            hdr.msg_iovlen = 1;
+            hdr.msg_control = cmsg_bufs[i].as_mut_ptr() as *mut libc::c_void;
+            hdr.msg_controllen = cmsg_space as _;
+        }
+
+        // Safety: msgs[..chunk_len] is fully initialized; addrs, iovs,
+        // and cmsg_bufs all live for this loop body which contains the
+        // syscall; data outlives the call.
+        let ret = unsafe { libc::sendmmsg(fd, msgs.as_mut_ptr(), chunk_len as libc::c_uint, 0) };
+        if ret < 0 {
+            let err = io::Error::last_os_error();
+            if total > 0 {
+                return Ok(total);
+            }
+            return Err(err);
+        }
+        let sent = ret as usize;
+        total += sent;
+        if sent < chunk_len {
+            return Ok(total);
+        }
+        start = chunk_end;
+    }
+    Ok(total)
+}
+
 /// Issue `recvmmsg(2)` against `fd`, filling up to `slots.len()`
 /// `DatagramBuf`s. Returns the number written. Non-blocking: returns
 /// `Ok(0)` when nothing is ready (matching the `recv_batch` contract).
@@ -802,6 +914,52 @@ mod tests {
         // pressure kicks in mid-batch; we only require >= 1 chunk
         // round-trip plus some, proving the chunk loop runs.
         assert!(sent > SENDMMSG_BATCH_CAP, "sent={}", sent);
+    }
+
+    #[test]
+    fn sendmmsg_staged_segmented_splits_one_buffer_into_n_datagrams() {
+        // GSO smoke test: hand the kernel one contiguous buffer with a
+        // segment-size cmsg, expect to receive N separate datagrams of
+        // segment_size bytes each.
+        use std::os::unix::io::AsRawFd;
+        let recv = KernelUdp::bind(loopback(0)).unwrap();
+        let recv_addr = recv.local_addr().unwrap();
+        let _ = recv.set_recv_buffer_bytes(4 * 1024 * 1024);
+        let send = KernelUdp::bind(loopback(0)).unwrap();
+
+        // 4 segments of 32 bytes each, distinct payloads so we can
+        // verify split alignment.
+        const SEG: usize = 32;
+        const N: usize = 4;
+        let mut data = Vec::with_capacity(SEG * N);
+        for i in 0..N {
+            data.extend(std::iter::repeat_n(i as u8, SEG));
+        }
+        let entries = [(recv_addr, 0usize, data.len(), SEG as u16)];
+
+        let result = sendmmsg_staged_segmented(send.socket.as_raw_fd(), &data, &entries);
+        // Some virt environments (older qemu, container runtimes with
+        // restricted netfilter) reject UDP_SEGMENT with EINVAL — skip
+        // rather than fail the test in those cases.
+        let sent = match result {
+            Ok(n) => n,
+            Err(e) if e.raw_os_error() == Some(libc::EINVAL) => {
+                eprintln!("skipping: kernel rejected UDP_SEGMENT (EINVAL)");
+                return;
+            }
+            Err(e) => panic!("sendmmsg_staged_segmented failed: {e}"),
+        };
+        assert_eq!(sent, 1, "kernel accepted exactly one mmsghdr");
+
+        let mut buf = [0u8; 64];
+        for i in 0..N {
+            let (_, len) = recv_one(&recv, &mut buf);
+            assert_eq!(len, SEG, "segment {i} arrived as full size");
+            assert!(
+                buf[..len].iter().all(|&b| b == i as u8),
+                "segment {i} payload mismatch"
+            );
+        }
     }
 
     #[test]
