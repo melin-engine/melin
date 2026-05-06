@@ -800,6 +800,7 @@ run_bench_rumcast() {
             --key bench.key \
             --json /tmp/bench-results.json \
             ${warmup_arg} \
+            ${BENCH_EXTRA_ARGS:-} \
             ${orders} $*"
 }
 
