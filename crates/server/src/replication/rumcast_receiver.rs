@@ -1181,10 +1181,10 @@ fn poll_reassembled<F>(
             }
         };
 
-        if let Some(complete) = complete {
-            if let Some(inner) = strip_length_prefix(&complete) {
-                on_complete(inner);
-            }
+        if let Some(complete) = complete
+            && let Some(inner) = strip_length_prefix(&complete)
+        {
+            on_complete(inner);
         }
     });
 }

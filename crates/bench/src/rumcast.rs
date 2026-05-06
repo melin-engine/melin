@@ -97,10 +97,10 @@ pub struct RumcastBenchConfig {
 pub fn run_rumcast_roundtrip(cfg: RumcastBenchConfig) {
     assert!(cfg.clients >= 1, "clients must be >= 1");
 
-    if let Some(core) = cfg.bench_core_start {
-        if let Err(e) = melin_server::affinity::pin_to_core(core) {
-            eprintln!("warning: could not pin rumcast bench loop to core {core}: {e}");
-        }
+    if let Some(core) = cfg.bench_core_start
+        && let Err(e) = melin_server::affinity::pin_to_core(core)
+    {
+        eprintln!("warning: could not pin rumcast bench loop to core {core}: {e}");
     }
 
     // Each session gets a distinct session_id. Picking a random base

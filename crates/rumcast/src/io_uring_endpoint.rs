@@ -446,6 +446,11 @@ impl IoUringEndpoint {
 pub struct PausedEndpoint {
     socket: Arc<UdpSocket>,
     ring: IoUring,
+    // Box is load-bearing: RecvSlot has self-referential pointers
+    // (iov / msg → buf) that would dangle if a Vec growth moved the
+    // slot. clippy::vec_box's general "Vec<T> is on the heap" advice
+    // doesn't apply here.
+    #[allow(clippy::vec_box)]
     slots: Vec<Box<RecvSlot>>,
     socket_fd: Fd,
     send_producer: Producer<Frame>,
@@ -544,6 +549,9 @@ impl PausedEndpoint {
 /// `bind` so I/O errors surface synchronously.
 struct PollerState {
     ring: IoUring,
+    // See `PausedEndpoint::slots` — Box pins the self-referential
+    // RecvSlot allocation so iov/msg pointers stay valid.
+    #[allow(clippy::vec_box)]
     slots: Vec<Box<RecvSlot>>,
     socket_fd: Fd,
     send_producer: Producer<Frame>,

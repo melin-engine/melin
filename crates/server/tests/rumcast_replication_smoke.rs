@@ -184,11 +184,11 @@ fn rumcast_replica_handshakes_and_creates_journal() {
     let deadline = Instant::now() + Duration::from_secs(15);
     let mut handshake_done = false;
     while Instant::now() < deadline {
-        if let Ok(meta) = std::fs::metadata(&replica_journal) {
-            if (meta.len() as usize) >= primary_genesis_min {
-                handshake_done = true;
-                break;
-            }
+        if let Ok(meta) = std::fs::metadata(&replica_journal)
+            && (meta.len() as usize) >= primary_genesis_min
+        {
+            handshake_done = true;
+            break;
         }
         thread::sleep(Duration::from_millis(50));
     }
