@@ -74,6 +74,10 @@ pub struct RumcastBenchConfig {
     /// Lower latency on isolated cores; burns a CPU. Match the
     /// server's idle strategy for apples-to-apples comparison.
     pub busy_spin: bool,
+    /// NAPI busy-poll budget in microseconds for the response socket.
+    /// `0` disables. See `KernelUdp::set_busy_poll` for the sysctl /
+    /// privilege requirements.
+    pub busy_poll_us: u32,
     /// Client's long-term Ed25519 identity. The server's
     /// `authorized_keys` file must list this key under a permission
     /// that allows order submission (e.g. `trader`). All N concurrent
@@ -159,6 +163,16 @@ pub fn run_rumcast_roundtrip(cfg: RumcastBenchConfig) {
     // without this, the kernel drops frames immediately and NAK storms ensue.
     if let Err(e) = endpoint.set_recv_buffer_bytes(32 * 1024 * 1024) {
         eprintln!("warning: could not bump bench socket SO_RCVBUF: {e}");
+    }
+    // EPERM is the common case (no CAP_NET_ADMIN, sysctl floor too
+    // low); fall back rather than refuse to bench.
+    if cfg.busy_poll_us > 0
+        && let Err(e) = endpoint.set_busy_poll(cfg.busy_poll_us)
+    {
+        eprintln!(
+            "warning: could not enable SO_BUSY_POLL on bench socket ({} us): {e}",
+            cfg.busy_poll_us
+        );
     }
     let (send_half, recv_half) = endpoint.split();
 

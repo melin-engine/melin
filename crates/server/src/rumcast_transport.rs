@@ -455,6 +455,19 @@ fn run_rumcast_primary_with_state(
     if let Err(e) = orders.set_recv_buffer_bytes(ORDERS_RCVBUF_BYTES) {
         warn!(error = ?e, requested = ORDERS_RCVBUF_BYTES, "failed to bump orders socket SO_RCVBUF");
     }
+    // EPERM means CAP_NET_ADMIN missing or net.core.busy_read floor
+    // too low — fall back to the regular recv path with a warning
+    // rather than refusing to start. Anything else is an ABI bug we
+    // want to see immediately.
+    if config.rumcast_busy_poll_us > 0
+        && let Err(e) = orders.set_busy_poll(config.rumcast_busy_poll_us)
+    {
+        warn!(
+            error = ?e,
+            requested_us = config.rumcast_busy_poll_us,
+            "failed to enable SO_BUSY_POLL on orders socket; continuing without busy poll"
+        );
+    }
     let muxed_receiver_config = MuxedReceiverConfig {
         stream_id: RUMCAST_ORDERS_STREAM,
         receiver_id: SERVER_RECEIVER_ID,
@@ -491,6 +504,15 @@ fn run_rumcast_primary_with_state(
     const RESP_RCVBUF_BYTES: usize = 64 * 1024 * 1024;
     if let Err(e) = resp.set_recv_buffer_bytes(RESP_RCVBUF_BYTES) {
         warn!(error = ?e, requested = RESP_RCVBUF_BYTES, "failed to bump response socket SO_RCVBUF");
+    }
+    if config.rumcast_busy_poll_us > 0
+        && let Err(e) = resp.set_busy_poll(config.rumcast_busy_poll_us)
+    {
+        warn!(
+            error = ?e,
+            requested_us = config.rumcast_busy_poll_us,
+            "failed to enable SO_BUSY_POLL on response socket; continuing without busy poll"
+        );
     }
 
     let muxed_sender_config = MuxedSenderConfig {

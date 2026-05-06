@@ -312,6 +312,16 @@ struct BenchArgs {
     /// with `--yield-idle`).
     #[arg(long, default_value_t = false)]
     rumcast_busy_spin: bool,
+
+    /// NAPI busy-poll budget in microseconds for the bench's response
+    /// socket. `0` (default) leaves the kernel on its normal
+    /// interrupt-driven recv path. Non-zero enables `SO_BUSY_POLL` +
+    /// `SO_PREFER_BUSY_POLL`. Same flag shape as the server's
+    /// `--rumcast-busy-poll-us`. Typical real-NIC values are 50–100
+    /// µs; no-op on loopback. See operations.md for the sysctl
+    /// requirements.
+    #[arg(long, default_value_t = 0)]
+    rumcast_busy_poll_us: u32,
 }
 
 fn main() {
@@ -376,6 +386,7 @@ fn main() {
                         args.instruments,
                         args.group_commit_us,
                         args.journal.clone(),
+                        args.rumcast_busy_poll_us,
                     ),
                 };
                 // Embedded-mode default: use the core the embedded
@@ -397,6 +408,7 @@ fn main() {
                     instruments: args.instruments,
                     json_path: json_path.map(|p| p.to_path_buf()),
                     busy_spin: args.rumcast_busy_spin,
+                    busy_poll_us: args.rumcast_busy_poll_us,
                     signing_key,
                     bench_core_start,
                 });
@@ -1135,6 +1147,7 @@ fn spawn_embedded_rumcast_server(
     instruments: u32,
     group_commit_us: u64,
     journal_path: Option<std::path::PathBuf>,
+    rumcast_busy_poll_us: u32,
 ) -> (
     std::net::SocketAddr,
     std::net::SocketAddr,
@@ -1221,6 +1234,7 @@ fn spawn_embedded_rumcast_server(
         // CPU, which murders busy-spin throughput. Reserve the last
         // core for the bench client.
         cores: pipeline_cores,
+        rumcast_busy_poll_us,
         ..ServerConfig::default()
     };
     let rumcast_config = melin_server::rumcast_transport::RumcastConfig { bind: server_addr };

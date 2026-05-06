@@ -184,6 +184,19 @@ pub struct ServerConfig {
     #[arg(long)]
     pub rumcast_client_addr: Option<std::net::SocketAddr>,
 
+    /// NAPI busy-poll budget in microseconds for rumcast orders +
+    /// response sockets. `0` (default) leaves the kernel on its
+    /// normal interrupt-driven recv path. Non-zero enables
+    /// `SO_BUSY_POLL` + `SO_PREFER_BUSY_POLL` so the kernel polls the
+    /// NIC ring inside `recvmsg` instead of waiting for an interrupt
+    /// — trades CPU for tighter recv tail latency. Typical real-NIC
+    /// values are 50–100 µs. No-op on loopback (no NAPI ring).
+    /// Requires `CAP_NET_ADMIN` or a non-zero `net.core.busy_read`
+    /// sysctl floor; the call falls back to a `warn!` and continues
+    /// on `EPERM`.
+    #[arg(long, default_value_t = 0)]
+    pub rumcast_busy_poll_us: u32,
+
     // --- DPDK configuration (only used with --features dpdk) ---
     /// DPDK EAL arguments (space-separated). Example: "-l 0-7 --huge-dir /dev/hugepages".
     /// Passed directly to rte_eal_init. Only used when compiled with --features dpdk.
@@ -313,6 +326,7 @@ impl Default for ServerConfig {
             no_quorum_durability: false,
             yield_idle: false,
             rumcast_client_addr: None,
+            rumcast_busy_poll_us: 0,
             dpdk_eal_args: String::new(),
             dpdk_ports: vec![0],
             dpdk_ip: "10.0.0.1".into(),
