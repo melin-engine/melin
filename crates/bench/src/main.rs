@@ -305,13 +305,14 @@ struct BenchArgs {
     #[arg(long)]
     rumcast_bind: Option<std::net::SocketAddr>,
 
-    /// Busy-spin between rumcast tick iterations instead of the default
-    /// 10µs sleep. Lower latency on isolated cores; burns a CPU. Use
-    /// for apples-to-apples comparison against the busy-spin server
-    /// (`melin-server` runs busy-spin by default; turn it off there
-    /// with `--yield-idle`).
+    /// Yield to the OS scheduler when the rumcast bench loop has no
+    /// work, instead of the default busy-spin. With this flag the
+    /// idle path parks for ~100 µs (`ppoll` on the response socket)
+    /// — lower CPU at the cost of an upper-bound on idle wake
+    /// latency. Default (no flag) is busy-spin: lowest latency on
+    /// isolated cores, burns a CPU.
     #[arg(long, default_value_t = false)]
-    rumcast_busy_spin: bool,
+    rumcast_yield_idle: bool,
 
     /// NAPI busy-poll budget in microseconds for the bench's response
     /// socket. `0` (default) leaves the kernel on its normal
@@ -416,7 +417,7 @@ fn main() {
                     accounts: args.accounts,
                     instruments: args.instruments,
                     json_path: json_path.map(|p| p.to_path_buf()),
-                    busy_spin: args.rumcast_busy_spin,
+                    yield_idle: args.rumcast_yield_idle,
                     busy_poll_us: args.rumcast_busy_poll_us,
                     udp_gro: args.rumcast_udp_gro,
                     signing_key,

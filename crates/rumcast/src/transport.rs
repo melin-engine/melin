@@ -1083,15 +1083,21 @@ impl UdpTransport for KernelUdp {
 
     fn park(&self, timeout: std::time::Duration) {
         use std::os::unix::io::AsRawFd;
-        let timeout_ms = timeout.as_millis().min(i32::MAX as u128) as libc::c_int;
         let mut pfd = libc::pollfd {
             fd: self.socket.as_raw_fd(),
             events: libc::POLLIN,
             revents: 0,
         };
-        // Errors (EINTR, ENOMEM) are ignored — the caller will retry
-        // recv_from on the next iteration and detect the real issue there.
-        unsafe { libc::poll(&mut pfd, 1, timeout_ms) };
+        // `ppoll` rather than `poll` so sub-millisecond timeouts work:
+        // `poll` truncates to whole ms, which would silently turn a
+        // 100 µs yield into a 0 ms (non-blocking) check. Errors
+        // (EINTR, ENOMEM) are ignored — the caller will retry
+        // recv_from on the next iteration and detect the real issue.
+        let ts = libc::timespec {
+            tv_sec: timeout.as_secs() as libc::time_t,
+            tv_nsec: timeout.subsec_nanos() as libc::c_long,
+        };
+        unsafe { libc::ppoll(&mut pfd, 1, &ts, std::ptr::null()) };
     }
 
     #[inline]

@@ -70,10 +70,12 @@ pub struct RumcastBenchConfig {
     pub accounts: u32,
     pub instruments: u32,
     pub json_path: Option<PathBuf>,
-    /// Busy-spin between iterations instead of the default 10µs sleep.
-    /// Lower latency on isolated cores; burns a CPU. Match the
-    /// server's idle strategy for apples-to-apples comparison.
-    pub busy_spin: bool,
+    /// When `true`, the idle path of the bench loop parks on the
+    /// response socket for ~100 µs (`ppoll`) instead of busy-spinning.
+    /// Default is `false` (busy-spin) which gives lowest latency on
+    /// isolated cores; flip to `true` on shared cores to free CPU at
+    /// the cost of an idle-wake upper bound.
+    pub yield_idle: bool,
     /// NAPI busy-poll budget in microseconds for the response socket.
     /// `0` disables. See `KernelUdp::set_busy_poll` for the sysctl /
     /// privilege requirements.
@@ -252,7 +254,7 @@ pub fn run_rumcast_roundtrip(cfg: RumcastBenchConfig) {
     // Each session does the four-message handshake independently. On
     // loopback this takes a few ms per session; sequential keeps the
     // code simple and the muxer's single-thread contract intact.
-    let busy_spin = cfg.busy_spin;
+    let yield_idle = cfg.yield_idle;
     let mut session_tokens: Vec<[u8; 32]> = Vec::with_capacity(cfg.clients);
     let handshake_start = Instant::now();
     for (i, sid) in session_ids.iter().enumerate() {
@@ -560,10 +562,15 @@ pub fn run_rumcast_roundtrip(cfg: RumcastBenchConfig) {
         }
 
         if drained_now == 0 {
-            if busy_spin {
-                std::hint::spin_loop();
+            if yield_idle {
+                // 100 µs (ppoll) cap: small enough not to dominate
+                // single-message tail latency, large enough to free
+                // the CPU between iterations on a shared host. The
+                // socket wakes on POLLIN before the timeout so
+                // typical RTT is unaffected.
+                muxed_receiver.park(Duration::from_micros(100));
             } else {
-                muxed_receiver.park(Duration::from_millis(2));
+                std::hint::spin_loop();
             }
         }
     }
