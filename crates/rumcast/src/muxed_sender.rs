@@ -238,7 +238,12 @@ impl<T: UdpTransport> MuxedSender<T> {
             session_ranges: Vec::with_capacity(max_s),
             segmented_entries: Vec::with_capacity(max_s * DRAIN_BATCH),
             segmented_runs: Vec::with_capacity(max_s * DRAIN_BATCH),
-            gso_unsupported: false,
+            // RUMCAST_DISABLE_GSO=1 forces the per-fragment fallback
+            // path. Diagnostic only — used to A/B whether UDP-GSO
+            // offload helps or hurts on a given NIC/path.
+            gso_unsupported: std::env::var("RUMCAST_DISABLE_GSO")
+                .map(|v| !v.is_empty() && v != "0")
+                .unwrap_or(false),
         }
     }
 
