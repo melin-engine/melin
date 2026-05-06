@@ -696,6 +696,69 @@ impl KernelUdp {
             Err(io::Error::last_os_error())
         }
     }
+
+    /// Enable NAPI busy polling on the receive path.
+    ///
+    /// `microseconds` bounds the time the kernel will busy-poll the
+    /// driver's NIC ring on each blocking recv. With
+    /// `SO_PREFER_BUSY_POLL` set the kernel skips the interrupt+wakeup
+    /// path entirely while busy-polling — at the cost of CPU spent
+    /// looping inside the syscall instead of sleeping. Pays off on
+    /// real NICs at low-jitter, low-latency rumcast workloads;
+    /// no-op on the loopback device (no NAPI ring).
+    ///
+    /// Requires either `CAP_NET_ADMIN` on the calling process or a
+    /// non-zero `sysctl net.core.busy_read` floor — the kernel
+    /// rejects values above the sysctl floor for unprivileged
+    /// callers. Operators bench-running this should typically:
+    ///
+    /// ```text
+    /// sudo sysctl -w net.core.busy_read=50
+    /// ```
+    ///
+    /// then pass `microseconds = 50` here. Larger values trade more
+    /// CPU for tighter recv latency.
+    ///
+    /// Pass `0` to disable.
+    pub fn set_busy_poll(&self, microseconds: u32) -> io::Result<()> {
+        use std::os::unix::io::AsRawFd;
+        let fd = self.socket.as_raw_fd();
+        // SO_BUSY_POLL takes microseconds as i32 — the kernel ABI
+        // matches the same layout as SO_RCVBUF.
+        let us: libc::c_int = microseconds.min(i32::MAX as u32) as libc::c_int;
+        let ret = unsafe {
+            libc::setsockopt(
+                fd,
+                libc::SOL_SOCKET,
+                libc::SO_BUSY_POLL,
+                &us as *const _ as *const libc::c_void,
+                std::mem::size_of_val(&us) as libc::socklen_t,
+            )
+        };
+        if ret != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SO_PREFER_BUSY_POLL is the boolean toggle that tells the
+        // kernel to prefer busy poll over the regular interrupt path
+        // when both are available. Only meaningful when SO_BUSY_POLL
+        // is non-zero, so we skip the toggle when disabling.
+        if microseconds > 0 {
+            let prefer: libc::c_int = 1;
+            let ret = unsafe {
+                libc::setsockopt(
+                    fd,
+                    libc::SOL_SOCKET,
+                    libc::SO_PREFER_BUSY_POLL,
+                    &prefer as *const _ as *const libc::c_void,
+                    std::mem::size_of_val(&prefer) as libc::socklen_t,
+                )
+            };
+            if ret != 0 {
+                return Err(io::Error::last_os_error());
+            }
+        }
+        Ok(())
+    }
 }
 
 impl UdpTransport for KernelUdp {
@@ -794,6 +857,32 @@ mod tests {
                 panic!("no datagram within deadline");
             }
             std::thread::sleep(Duration::from_micros(100));
+        }
+    }
+
+    #[test]
+    fn set_busy_poll_zero_succeeds_unprivileged() {
+        // Disabling busy poll is always allowed regardless of
+        // CAP_NET_ADMIN or sysctl floors — exercises the setsockopt
+        // ABI plumbing (correct level/option/payload) without
+        // depending on test-host privileges.
+        let t = KernelUdp::bind(loopback(0)).unwrap();
+        t.set_busy_poll(0)
+            .expect("disabling busy poll should always succeed");
+    }
+
+    #[test]
+    fn set_busy_poll_nonzero_succeeds_or_eperm() {
+        // Enabling busy poll requires CAP_NET_ADMIN or a non-zero
+        // `net.core.busy_read` sysctl floor. Accept either outcome
+        // so the test is portable across operator environments;
+        // the goal is to verify we don't pass garbage to the kernel
+        // (EINVAL would be a real bug).
+        let t = KernelUdp::bind(loopback(0)).unwrap();
+        match t.set_busy_poll(50) {
+            Ok(()) => {}
+            Err(e) if e.raw_os_error() == Some(libc::EPERM) => {}
+            Err(e) => panic!("unexpected error from set_busy_poll(50): {e}"),
         }
     }
 

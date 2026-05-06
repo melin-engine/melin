@@ -200,6 +200,15 @@ impl SharedUdp<KernelUdp> {
     pub fn set_recv_buffer_bytes(&self, bytes: usize) -> io::Result<()> {
         self.inner.socket.set_recv_buffer_bytes(bytes)
     }
+
+    /// Enable NAPI busy poll on the underlying socket. Call before
+    /// splitting; the setting persists for both halves since they
+    /// share the underlying transport. See
+    /// [`KernelUdp::set_busy_poll`] for the privileges/sysctl
+    /// requirement.
+    pub fn set_busy_poll(&self, microseconds: u32) -> io::Result<()> {
+        self.inner.socket.set_busy_poll(microseconds)
+    }
 }
 
 impl<T: UdpTransport> SharedUdp<T> {
