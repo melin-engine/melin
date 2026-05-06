@@ -274,18 +274,23 @@ pub(crate) fn sendmmsg_staged_segmented(
         let chunk_len = chunk_end - start;
 
         // Stack-resident parallel arrays sized to the cap. cmsg_bufs
-        // is dimensioned for the worst-case CMSG_SPACE on any libc/arch
-        // (32 bytes is plenty for cmsghdr + u16 + alignment everywhere).
-        const CMSG_BUF_LEN: usize = 32;
+        // is backed by `u64` so the storage is 8-byte aligned — the
+        // alignment cmsghdr requires on every Linux arch (it contains
+        // a size_t). 4 × u64 = 32 bytes, ample for CMSG_SPACE(u16) on
+        // every libc we care about.
+        const CMSG_BUF_U64S: usize = 4;
+        const CMSG_BUF_LEN: usize = CMSG_BUF_U64S * std::mem::size_of::<u64>();
         let mut addrs: [libc::sockaddr_storage; SENDMMSG_BATCH_CAP] = unsafe { std::mem::zeroed() };
         let mut iovs: [libc::iovec; SENDMMSG_BATCH_CAP] = unsafe { std::mem::zeroed() };
         let mut msgs: [libc::mmsghdr; SENDMMSG_BATCH_CAP] = unsafe { std::mem::zeroed() };
-        let mut cmsg_bufs: [[u8; CMSG_BUF_LEN]; SENDMMSG_BATCH_CAP] =
-            [[0u8; CMSG_BUF_LEN]; SENDMMSG_BATCH_CAP];
+        let mut cmsg_bufs: [[u64; CMSG_BUF_U64S]; SENDMMSG_BATCH_CAP] =
+            [[0u64; CMSG_BUF_U64S]; SENDMMSG_BATCH_CAP];
         debug_assert!(cmsg_space <= CMSG_BUF_LEN);
 
         for i in 0..chunk_len {
             let (dst, offset, total_len, seg_size) = entries[start + i];
+            debug_assert!(seg_size > 0, "segment_size must be > 0");
+            debug_assert!(total_len > 0, "total_len must be > 0");
             let (sa, sa_len) = sockaddr_from_socket_addr(dst);
             addrs[i] = sa;
 
@@ -294,10 +299,10 @@ pub(crate) fn sendmmsg_staged_segmented(
 
             // Build the cmsg in cmsg_bufs[i]. Manual layout: write
             // cmsghdr fields then the u16 segment size at CMSG_DATA.
-            // Safety: cmsg_bufs[i] is at least cmsg_space bytes; the
-            // pointer arithmetic via CMSG_DATA is the kernel-blessed
-            // way to locate the cmsg payload regardless of arch
-            // alignment rules.
+            // Safety: cmsg_bufs[i] is 8-byte aligned (u64-backed) and
+            // at least cmsg_space bytes long; the pointer arithmetic
+            // via CMSG_DATA is the kernel-blessed way to locate the
+            // cmsg payload regardless of arch alignment rules.
             unsafe {
                 let hdr_ptr = cmsg_bufs[i].as_mut_ptr() as *mut libc::cmsghdr;
                 (*hdr_ptr).cmsg_len =
@@ -572,6 +577,7 @@ pub trait UdpTransport: Send + Sync {
         // Default: per-segment send_to, preserving the partial-success
         // contract at *msghdr* granularity (caller's unit of work).
         for (i, &(dst, offset, total_len, seg_size)) in entries.iter().enumerate() {
+            debug_assert!(seg_size > 0, "segment_size must be > 0");
             let seg = seg_size as usize;
             let mut sent_in_msg = 0usize;
             while sent_in_msg < total_len {
@@ -969,6 +975,37 @@ mod tests {
         assert!(sent > SENDMMSG_BATCH_CAP, "sent={}", sent);
     }
 
+    /// Helper: drain up to `n` datagrams off `recv` into a Vec of
+    /// `(len, payload)` tuples. Spins briefly to absorb loopback delay.
+    fn drain_n<T: UdpTransport>(recv: &T, n: usize) -> Vec<Vec<u8>> {
+        let mut out = Vec::with_capacity(n);
+        let mut buf = [0u8; 4096];
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while out.len() < n && Instant::now() < deadline {
+            match recv.recv_from(&mut buf).expect("recv_from") {
+                Some((_, len)) => out.push(buf[..len].to_vec()),
+                None => std::thread::sleep(Duration::from_micros(100)),
+            }
+        }
+        out
+    }
+
+    /// Returns true if the kernel rejects UDP_SEGMENT (e.g. some virt
+    /// environments). Tests skip rather than fail in that case.
+    fn segmented_send_supported(send: &KernelUdp, dst: SocketAddr) -> bool {
+        use std::os::unix::io::AsRawFd;
+        let data = [0u8; 16];
+        let entries = [(dst, 0usize, data.len(), 8u16)];
+        match sendmmsg_staged_segmented(send.socket.as_raw_fd(), &data, &entries) {
+            Ok(_) => true,
+            Err(e) if e.raw_os_error() == Some(libc::EINVAL) => {
+                eprintln!("kernel rejects UDP_SEGMENT — skipping segmented test");
+                false
+            }
+            Err(e) => panic!("unexpected error probing UDP_SEGMENT: {e}"),
+        }
+    }
+
     #[test]
     fn sendmmsg_staged_segmented_splits_one_buffer_into_n_datagrams() {
         // GSO smoke test: hand the kernel one contiguous buffer with a
@@ -979,6 +1016,11 @@ mod tests {
         let recv_addr = recv.local_addr().unwrap();
         let _ = recv.set_recv_buffer_bytes(4 * 1024 * 1024);
         let send = KernelUdp::bind(loopback(0)).unwrap();
+        if !segmented_send_supported(&send, recv_addr) {
+            return;
+        }
+        // Drain the probe datagrams the support check just sent.
+        let _ = drain_n(&recv, 2);
 
         // 4 segments of 32 bytes each, distinct payloads so we can
         // verify split alignment.
@@ -990,29 +1032,140 @@ mod tests {
         }
         let entries = [(recv_addr, 0usize, data.len(), SEG as u16)];
 
-        let result = sendmmsg_staged_segmented(send.socket.as_raw_fd(), &data, &entries);
-        // Some virt environments (older qemu, container runtimes with
-        // restricted netfilter) reject UDP_SEGMENT with EINVAL — skip
-        // rather than fail the test in those cases.
-        let sent = match result {
-            Ok(n) => n,
-            Err(e) if e.raw_os_error() == Some(libc::EINVAL) => {
-                eprintln!("skipping: kernel rejected UDP_SEGMENT (EINVAL)");
-                return;
-            }
-            Err(e) => panic!("sendmmsg_staged_segmented failed: {e}"),
-        };
+        let sent = sendmmsg_staged_segmented(send.socket.as_raw_fd(), &data, &entries)
+            .expect("segmented send");
         assert_eq!(sent, 1, "kernel accepted exactly one mmsghdr");
 
-        let mut buf = [0u8; 64];
-        for i in 0..N {
-            let (_, len) = recv_one(&recv, &mut buf);
-            assert_eq!(len, SEG, "segment {i} arrived as full size");
+        let dgrams = drain_n(&recv, N);
+        assert_eq!(dgrams.len(), N, "all {N} segments arrived");
+        for (i, payload) in dgrams.iter().enumerate() {
+            assert_eq!(payload.len(), SEG, "segment {i} full size");
             assert!(
-                buf[..len].iter().all(|&b| b == i as u8),
+                payload.iter().all(|&b| b == i as u8),
                 "segment {i} payload mismatch"
             );
         }
+    }
+
+    #[test]
+    fn sendmmsg_staged_segmented_short_trailing_segment_arrives_smaller() {
+        // GSO contract: every segment except the last must equal
+        // segment_size; the last may be shorter. Prove it works.
+        use std::os::unix::io::AsRawFd;
+        let recv = KernelUdp::bind(loopback(0)).unwrap();
+        let recv_addr = recv.local_addr().unwrap();
+        let _ = recv.set_recv_buffer_bytes(4 * 1024 * 1024);
+        let send = KernelUdp::bind(loopback(0)).unwrap();
+        if !segmented_send_supported(&send, recv_addr) {
+            return;
+        }
+        let _ = drain_n(&recv, 2);
+
+        const SEG: usize = 16;
+        // 2 full segments + a 5-byte tail = 37 bytes total.
+        let data: Vec<u8> = (0..37u8).collect();
+        let entries = [(recv_addr, 0usize, data.len(), SEG as u16)];
+
+        let sent = sendmmsg_staged_segmented(send.socket.as_raw_fd(), &data, &entries)
+            .expect("segmented send");
+        assert_eq!(sent, 1);
+
+        let dgrams = drain_n(&recv, 3);
+        assert_eq!(dgrams.len(), 3, "two full + one short segment");
+        assert_eq!(dgrams[0], (0..16u8).collect::<Vec<_>>());
+        assert_eq!(dgrams[1], (16..32u8).collect::<Vec<_>>());
+        assert_eq!(dgrams[2], (32..37u8).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn sendmmsg_staged_segmented_multi_entry_routes_to_distinct_dsts() {
+        // Two destinations, two msghdrs, in one sendmmsg call.
+        use std::os::unix::io::AsRawFd;
+        let recv_a = KernelUdp::bind(loopback(0)).unwrap();
+        let recv_b = KernelUdp::bind(loopback(0)).unwrap();
+        let _ = recv_a.set_recv_buffer_bytes(4 * 1024 * 1024);
+        let _ = recv_b.set_recv_buffer_bytes(4 * 1024 * 1024);
+        let addr_a = recv_a.local_addr().unwrap();
+        let addr_b = recv_b.local_addr().unwrap();
+        let send = KernelUdp::bind(loopback(0)).unwrap();
+        if !segmented_send_supported(&send, addr_a) {
+            return;
+        }
+        let _ = drain_n(&recv_a, 2);
+
+        const SEG: usize = 8;
+        // Lay out: 3×SEG of 0xAA for dst A, then 2×SEG of 0xBB for dst B.
+        let mut data = Vec::new();
+        data.extend(std::iter::repeat_n(0xAAu8, 3 * SEG));
+        data.extend(std::iter::repeat_n(0xBBu8, 2 * SEG));
+        let entries = [
+            (addr_a, 0usize, 3 * SEG, SEG as u16),
+            (addr_b, 3 * SEG, 2 * SEG, SEG as u16),
+        ];
+
+        let sent = sendmmsg_staged_segmented(send.socket.as_raw_fd(), &data, &entries)
+            .expect("segmented send");
+        assert_eq!(sent, 2);
+
+        let on_a = drain_n(&recv_a, 3);
+        assert_eq!(on_a.len(), 3);
+        assert!(on_a.iter().all(|p| p.iter().all(|&b| b == 0xAA)));
+        let on_b = drain_n(&recv_b, 2);
+        assert_eq!(on_b.len(), 2);
+        assert!(on_b.iter().all(|p| p.iter().all(|&b| b == 0xBB)));
+    }
+
+    #[test]
+    fn sendmmsg_staged_segmented_empty_entries_noop() {
+        use std::os::unix::io::AsRawFd;
+        let send = KernelUdp::bind(loopback(0)).unwrap();
+        let n = sendmmsg_staged_segmented(send.socket.as_raw_fd(), &[], &[]).unwrap();
+        assert_eq!(n, 0);
+    }
+
+    /// Default trait impl correctness: drives the per-segment fallback
+    /// path that runs on transports without a kernel override.
+    struct LoopbackTransport(KernelUdp);
+    impl UdpTransport for LoopbackTransport {
+        fn send_to(&self, dst: SocketAddr, bytes: &[u8]) -> io::Result<usize> {
+            self.0.send_to(dst, bytes)
+        }
+        fn recv_from(&self, buf: &mut [u8]) -> io::Result<Option<(SocketAddr, usize)>> {
+            self.0.recv_from(buf)
+        }
+        fn local_addr(&self) -> io::Result<SocketAddr> {
+            self.0.local_addr()
+        }
+        fn join_multicast_v4(&self, group: Ipv4Addr, iface: Ipv4Addr) -> io::Result<()> {
+            self.0.join_multicast_v4(group, iface)
+        }
+        fn leave_multicast_v4(&self, group: Ipv4Addr, iface: Ipv4Addr) -> io::Result<()> {
+            self.0.leave_multicast_v4(group, iface)
+        }
+        // send_segmented_staged left as the default impl on purpose —
+        // this is what we're testing.
+    }
+
+    #[test]
+    fn send_segmented_staged_default_impl_emits_per_segment_send_to() {
+        let recv = KernelUdp::bind(loopback(0)).unwrap();
+        let recv_addr = recv.local_addr().unwrap();
+        let _ = recv.set_recv_buffer_bytes(4 * 1024 * 1024);
+        let send = LoopbackTransport(KernelUdp::bind(loopback(0)).unwrap());
+
+        const SEG: usize = 16;
+        // 2 full + 1 short.
+        let data: Vec<u8> = (0..37u8).collect();
+        let entries = [(recv_addr, 0usize, data.len(), SEG as u16)];
+
+        let sent = send.send_segmented_staged(&data, &entries).unwrap();
+        assert_eq!(sent, 1, "one msghdr fully sent");
+
+        let dgrams = drain_n(&recv, 3);
+        assert_eq!(dgrams.len(), 3);
+        assert_eq!(dgrams[0], (0..16u8).collect::<Vec<_>>());
+        assert_eq!(dgrams[1], (16..32u8).collect::<Vec<_>>());
+        assert_eq!(dgrams[2], (32..37u8).collect::<Vec<_>>());
     }
 
     #[test]
