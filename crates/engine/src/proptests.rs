@@ -429,16 +429,12 @@ fn book_total_quantity(book: &OrderBook) -> u64 {
             total += order.remaining().get();
         }
     }
-    for stops in book.stop_buys().values() {
-        for stop in stops {
-            total += stop.quantity().get();
-        }
-    }
-    for stops in book.stop_sells().values() {
-        for stop in stops {
-            total += stop.quantity().get();
-        }
-    }
+    book.stop_buys().for_each_stop(|stop| {
+        total += stop.quantity().get();
+    });
+    book.stop_sells().for_each_stop(|stop| {
+        total += stop.quantity().get();
+    });
     total
 }
 
@@ -472,16 +468,12 @@ fn assert_exchange_consistent(exchange: &Exchange, action_idx: usize, action_des
                 book_ids.insert((order.account(), order.id()));
             }
         }
-        for stops in book.stop_buys().values() {
-            for stop in stops {
-                book_ids.insert((stop.account(), stop.id()));
-            }
-        }
-        for stops in book.stop_sells().values() {
-            for stop in stops {
-                book_ids.insert((stop.account(), stop.id()));
-            }
-        }
+        book.stop_buys().for_each_stop(|stop| {
+            book_ids.insert((stop.account(), stop.id()));
+        });
+        book.stop_sells().for_each_stop(|stop| {
+            book_ids.insert((stop.account(), stop.id()));
+        });
     }
 
     // Stale order_sides entries (in order_sides but not on book).
@@ -866,16 +858,12 @@ proptest! {
         let stop_idx = book.snapshot_stop_index();
         let mut stop_ids_from_book = std::collections::HashSet::new();
 
-        for stops in book.stop_buys().values() {
-            for stop in stops {
+        book.stop_buys().for_each_stop(|stop| {
                 stop_ids_from_book.insert((stop.account(), stop.id()));
-            }
-        }
-        for stops in book.stop_sells().values() {
-            for stop in stops {
+        });
+        book.stop_sells().for_each_stop(|stop| {
                 stop_ids_from_book.insert((stop.account(), stop.id()));
-            }
-        }
+        });
 
         let stop_ids_from_index: std::collections::HashSet<(AccountId, OrderId)> =
             stop_idx.iter().map(|&(id, acct, _, _)| (acct, id)).collect();
@@ -1362,16 +1350,12 @@ proptest! {
                     book_order_ids.insert((order.account(), order.id()));
                 }
             }
-            for stops in book.stop_buys().values() {
-                for stop in stops {
+            book.stop_buys().for_each_stop(|stop| {
                     book_order_ids.insert((stop.account(), stop.id()));
-                }
-            }
-            for stops in book.stop_sells().values() {
-                for stop in stops {
+        });
+            book.stop_sells().for_each_stop(|stop| {
                     book_order_ids.insert((stop.account(), stop.id()));
-                }
-            }
+        });
         }
 
         // Every book order must have a reservation.
@@ -1426,16 +1410,12 @@ proptest! {
                     book_order_ids.insert((order.account(), order.id()));
                 }
             }
-            for stops in book.stop_buys().values() {
-                for stop in stops {
+            book.stop_buys().for_each_stop(|stop| {
                     book_order_ids.insert((stop.account(), stop.id()));
-                }
-            }
-            for stops in book.stop_sells().values() {
-                for stop in stops {
+        });
+            book.stop_sells().for_each_stop(|stop| {
                     book_order_ids.insert((stop.account(), stop.id()));
-                }
-            }
+        });
         }
 
         prop_assert_eq!(

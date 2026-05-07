@@ -20,7 +20,7 @@
 //! | data           | ...     | var   | Serialized Exchange state          |
 //! | crc32c         | u32     | 4     | CRC32C of everything above         |
 
-use std::collections::{BTreeMap, HashMap as StdHashMap};
+use std::collections::HashMap as StdHashMap;
 use std::fs::{self, File};
 use std::io::{Read, Write};
 use std::num::NonZeroU64;
@@ -1295,12 +1295,13 @@ impl OrderBook {
                     .collect()
             };
 
-        let snapshot_stops = |stops: &BTreeMap<Price, Vec<crate::orderbook::PendingStop>>| {
+        let snapshot_stops = |stops: &crate::orderbook::StopSide| {
             stops
-                .iter()
-                .map(|(&trigger_price, pending)| {
+                .levels_snapshot()
+                .into_iter()
+                .map(|(trigger_price, pending)| {
                     let snaps = pending
-                        .iter()
+                        .into_iter()
                         .map(|s| PendingStopSnapshot {
                             id: s.id(),
                             account: s.account(),
@@ -1359,29 +1360,31 @@ impl OrderBook {
         };
 
         let restore_stops = |levels: Vec<(Price, Vec<PendingStopSnapshot>)>| {
-            let mut btree = BTreeMap::new();
-            for (trigger_price, stops) in levels {
-                let pending: Vec<crate::orderbook::PendingStop> = stops
-                    .into_iter()
-                    .map(|s| {
-                        crate::orderbook::PendingStop::new(
-                            s.id,
-                            s.account,
-                            s.side,
-                            s.trigger_price,
-                            s.quantity,
-                            s.time_in_force,
-                            s.limit_price,
-                            s.quote_budget,
-                            s.stp,
-                            s.expiry_ns,
-                            ReservationSlot::DUMMY,
-                        )
-                    })
-                    .collect();
-                btree.insert(trigger_price, pending);
-            }
-            btree
+            let materialized: Vec<(Price, Vec<crate::orderbook::PendingStop>)> = levels
+                .into_iter()
+                .map(|(trigger_price, stops)| {
+                    let pending = stops
+                        .into_iter()
+                        .map(|s| {
+                            crate::orderbook::PendingStop::new(
+                                s.id,
+                                s.account,
+                                s.side,
+                                s.trigger_price,
+                                s.quantity,
+                                s.time_in_force,
+                                s.limit_price,
+                                s.quote_budget,
+                                s.stp,
+                                s.expiry_ns,
+                                ReservationSlot::DUMMY,
+                            )
+                        })
+                        .collect();
+                    (trigger_price, pending)
+                })
+                .collect();
+            crate::orderbook::StopSide::from_levels_snapshot(materialized)
         };
 
         // Build sides first; they tell us each order's slab index, which
@@ -1420,10 +1423,27 @@ impl OrderBook {
             })
             .collect();
 
-        let stop_index: crate::types::HashMap4<(AccountId, OrderId), (Side, Price)> = snap
+        // Build stop sides; collect the slab-index mapping the same way
+        // as for resting orders so we can populate `stop_index` with
+        // valid handles. Buy and sell stops live in disjoint slabs but
+        // share the (account, order_id) namespace via the snapshot.
+        let (stop_buys, buy_stop_idx) = restore_stops(snap.stop_buys);
+        let (stop_sells, sell_stop_idx) = restore_stops(snap.stop_sells);
+        let mut stop_node_for: std::collections::HashMap<(AccountId, OrderId), u32> =
+            std::collections::HashMap::with_capacity(buy_stop_idx.len() + sell_stop_idx.len());
+        stop_node_for.extend(buy_stop_idx);
+        stop_node_for.extend(sell_stop_idx);
+
+        let stop_index: crate::types::HashMap4<(AccountId, OrderId), (Side, Price, u32)> = snap
             .stop_index
             .into_iter()
-            .map(|(id, account, side, price)| ((account, id), (side, price)))
+            .map(|(id, account, side, price)| {
+                let node_idx = stop_node_for
+                    .get(&(account, id))
+                    .copied()
+                    .expect("snapshot stop_index references missing stop entry");
+                ((account, id), (side, price, node_idx))
+            })
             .collect();
 
         Self::from_parts(
@@ -1431,8 +1451,8 @@ impl OrderBook {
             bids,
             asks,
             order_index,
-            restore_stops(snap.stop_buys),
-            restore_stops(snap.stop_sells),
+            stop_buys,
+            stop_sells,
             stop_index,
             snap.last_trade_price,
         )

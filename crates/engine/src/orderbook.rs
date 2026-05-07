@@ -3,8 +3,6 @@
 //! Bids are stored in descending price order, asks in ascending.
 //! Within a price level, orders are matched FIFO.
 
-use std::collections::BTreeMap;
-
 use std::num::NonZeroU64;
 
 /// Sentinel for "no node" in the intrusive doubly-linked lists used by
@@ -629,6 +627,298 @@ impl BookSide {
     }
 }
 
+/// One side of the pending-stop book (either all buy stops or all sell
+/// stops). Same slab + intrusive-FIFO design as `BookSide` but storing
+/// `PendingStop`s, so cancelling an individual stop is O(1) regardless
+/// of how many other stops share its trigger price.
+///
+/// **Why mirror `BookSide`:** the access patterns are nearly identical
+/// (per-trigger-price FIFO, range queries during `check_triggers`, bulk
+/// drain when a level fires). A second sorted `Vec<(Price, LevelHead)>`
+/// keeps the level-walk cache-friendly — important because
+/// `check_triggers` runs after every match.
+#[derive(Debug)]
+pub(crate) struct StopSide {
+    /// Sorted ascending by trigger Price. Binary search for all lookups.
+    levels: Vec<(Price, LevelHead)>,
+    /// Slab of stop nodes. Same lifecycle rules as `BookSide::nodes`:
+    /// indices stable for the lifetime of the stop, freed slots recycled
+    /// LIFO via `free_head` chain through `next`.
+    nodes: Vec<StopNode>,
+    /// Head of the free list, or `INVALID_NODE` if empty.
+    free_head: u32,
+}
+
+impl Default for StopSide {
+    fn default() -> Self {
+        Self {
+            levels: Vec::new(),
+            nodes: Vec::new(),
+            free_head: INVALID_NODE,
+        }
+    }
+}
+
+/// A node in the per-trigger-price intrusive doubly-linked list of
+/// pending stops. Mirrors `OrderNode`.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct StopNode {
+    pub(crate) stop: PendingStop,
+    /// Previous node at this trigger price, or `INVALID_NODE` at head.
+    /// On free, set to `INVALID_NODE` (free list is singly linked).
+    prev: u32,
+    /// Next node at this trigger price, or `INVALID_NODE` at tail. While
+    /// freed, points at the next free slot.
+    next: u32,
+}
+
+impl StopSide {
+    fn with_capacity(node_capacity: usize) -> Self {
+        Self {
+            levels: Vec::with_capacity(64),
+            nodes: Vec::with_capacity(node_capacity),
+            free_head: INVALID_NODE,
+        }
+    }
+
+    #[inline]
+    fn search(&self, price: Price) -> Result<usize, usize> {
+        self.levels.binary_search_by_key(&price, |(p, _)| *p)
+    }
+
+    #[inline]
+    fn alloc_node(&mut self, stop: PendingStop) -> u32 {
+        if self.free_head != INVALID_NODE {
+            let idx = self.free_head;
+            let node = &mut self.nodes[idx as usize];
+            self.free_head = node.next;
+            node.stop = stop;
+            node.prev = INVALID_NODE;
+            node.next = INVALID_NODE;
+            idx
+        } else {
+            let idx = self.nodes.len() as u32;
+            self.nodes.push(StopNode {
+                stop,
+                prev: INVALID_NODE,
+                next: INVALID_NODE,
+            });
+            idx
+        }
+    }
+
+    #[inline]
+    fn free_node(&mut self, idx: u32) {
+        let node = &mut self.nodes[idx as usize];
+        node.prev = INVALID_NODE;
+        node.next = self.free_head;
+        self.free_head = idx;
+    }
+
+    /// Push `stop` onto the back of its trigger-price level. Returns the
+    /// stable slab index that the caller stores in `OrderBook::stop_index`
+    /// for O(1) cancel.
+    pub(crate) fn add(&mut self, price: Price, stop: PendingStop) -> u32 {
+        let new_idx = self.alloc_node(stop);
+        match self.search(price) {
+            Ok(level_idx) => {
+                let old_tail = self.levels[level_idx].1.tail;
+                self.levels[level_idx].1.tail = new_idx;
+                self.levels[level_idx].1.len += 1;
+                self.nodes[new_idx as usize].prev = old_tail;
+                self.nodes[old_tail as usize].next = new_idx;
+            }
+            Err(level_idx) => {
+                self.levels.insert(
+                    level_idx,
+                    (
+                        price,
+                        LevelHead {
+                            head: new_idx,
+                            tail: new_idx,
+                            len: 1,
+                        },
+                    ),
+                );
+            }
+        }
+        new_idx
+    }
+
+    /// Splice `node_idx` out of `level_idx`, free the slab slot, and
+    /// remove the level if it became empty. Mirrors
+    /// `BookSide::unlink_node_at_level`.
+    fn unlink_node_at_level(&mut self, level_idx: usize, node_idx: u32) -> PendingStop {
+        let prev = self.nodes[node_idx as usize].prev;
+        let next = self.nodes[node_idx as usize].next;
+
+        if prev != INVALID_NODE {
+            self.nodes[prev as usize].next = next;
+        }
+        if next != INVALID_NODE {
+            self.nodes[next as usize].prev = prev;
+        }
+
+        let head = &mut self.levels[level_idx].1;
+        if head.head == node_idx {
+            head.head = next;
+        }
+        if head.tail == node_idx {
+            head.tail = prev;
+        }
+        head.len -= 1;
+        let became_empty = head.len == 0;
+
+        let stop = self.nodes[node_idx as usize].stop;
+        self.free_node(node_idx);
+        if became_empty {
+            self.levels.remove(level_idx);
+        }
+        stop
+    }
+
+    /// O(1) removal given the slab index from `stop_index`.
+    pub(crate) fn remove_node(&mut self, price: Price, node_idx: u32) -> Option<PendingStop> {
+        let level_idx = self.search(price).ok()?;
+        Some(self.unlink_node_at_level(level_idx, node_idx))
+    }
+
+    /// Borrow a stop by slab index. Used by `find_gtd_expiry` to read
+    /// the pending stop directly from `stop_index`'s handle.
+    #[inline]
+    pub(crate) fn node(&self, idx: u32) -> &StopNode {
+        &self.nodes[idx as usize]
+    }
+
+    /// Drain every stop at `price` into `out` (preserving FIFO) and
+    /// remove the level. Used by `check_triggers` to fire all stops at
+    /// a given trigger price. Caller is responsible for clearing
+    /// `stop_index` entries.
+    pub(crate) fn drain_level(&mut self, price: Price, out: &mut Vec<PendingStop>) {
+        let Ok(level_idx) = self.search(price) else {
+            return;
+        };
+        let head = self.levels[level_idx].1;
+        let mut cur = head.head;
+        while cur != INVALID_NODE {
+            let node = self.nodes[cur as usize];
+            out.push(node.stop);
+            let next = node.next;
+            self.free_node(cur);
+            cur = next;
+        }
+        self.levels.remove(level_idx);
+    }
+
+    /// Iterate every pending stop on this side in (trigger price asc,
+    /// FIFO within a level) order. Used by snapshot, kill switch, GTD
+    /// scan, etc. Not on the hot path.
+    pub(crate) fn for_each_stop<F: FnMut(&PendingStop)>(&self, mut f: F) {
+        for (_, head) in &self.levels {
+            let mut cur = head.head;
+            while cur != INVALID_NODE {
+                let n = &self.nodes[cur as usize];
+                f(&n.stop);
+                cur = n.next;
+            }
+        }
+    }
+
+    /// Mutable variant. Used by `inject_reservation_slots` on restore
+    /// and by `adjust_stop_buy_budgets` after a fee schedule change.
+    pub(crate) fn for_each_stop_mut<F: FnMut(&mut PendingStop)>(&mut self, mut f: F) {
+        for (_, head) in &self.levels {
+            let mut cur = head.head;
+            while cur != INVALID_NODE {
+                let next = self.nodes[cur as usize].next;
+                f(&mut self.nodes[cur as usize].stop);
+                cur = next;
+            }
+        }
+    }
+
+    /// Iterate trigger prices in ascending order. Used by
+    /// `check_triggers` to collect prices ≤ trade (buys) and ≥ trade
+    /// (sells, via `.rev()`).
+    pub(crate) fn prices_ascending(&self) -> impl DoubleEndedIterator<Item = Price> + '_ {
+        self.levels.iter().map(|(p, _)| *p)
+    }
+
+    /// True if no pending stops remain on this side.
+    pub(crate) fn is_empty(&self) -> bool {
+        self.levels.is_empty()
+    }
+
+    /// Snapshot: walk levels in ascending trigger-price order, yielding
+    /// `(price, ordered_stops)` with FIFO preserved within a level.
+    /// Allocates per level — only used by the snapshot codec.
+    pub(crate) fn levels_snapshot(&self) -> Vec<(Price, Vec<PendingStop>)> {
+        self.levels
+            .iter()
+            .map(|(price, head)| {
+                let mut v = Vec::with_capacity(head.len as usize);
+                let mut cur = head.head;
+                while cur != INVALID_NODE {
+                    let n = &self.nodes[cur as usize];
+                    v.push(n.stop);
+                    cur = n.next;
+                }
+                (*price, v)
+            })
+            .collect()
+    }
+
+    /// Reconstruct from snapshot levels and return the
+    /// `(account, order_id) -> node_idx` mapping so the caller can
+    /// populate `stop_index` with valid handles.
+    pub(crate) fn from_levels_snapshot(
+        levels: Vec<(Price, Vec<PendingStop>)>,
+    ) -> (Self, SnapshotNodeMapping) {
+        let total: usize = levels.iter().map(|(_, v)| v.len()).sum();
+        let mut side = Self::with_capacity(total.max(64));
+        let mut mapping = Vec::with_capacity(total);
+        for (price, stops) in levels {
+            for stop in stops {
+                let key = (stop.account, stop.id);
+                let idx = side.add(price, stop);
+                mapping.push((key, idx));
+            }
+        }
+        (side, mapping)
+    }
+
+    /// Touch every slab page so first-use page faults happen at startup.
+    /// No-op when populated — same contract as `BookSide::prefault`.
+    fn prefault(&mut self) {
+        if !self.nodes.is_empty() {
+            return;
+        }
+        let dummy = StopNode {
+            stop: PendingStop {
+                id: OrderId(0),
+                account: AccountId(0),
+                side: Side::Buy,
+                trigger_price: Price(NonZeroU64::new(1).expect("non-zero literal")),
+                quantity: Quantity(NonZeroU64::new(1).expect("non-zero literal")),
+                time_in_force: TimeInForce::GTC,
+                limit_price: None,
+                quote_budget: None,
+                stp: SelfTradeProtection::Allow,
+                expiry_ns: 0,
+                reservation: ReservationSlot::DUMMY,
+            },
+            prev: INVALID_NODE,
+            next: INVALID_NODE,
+        };
+        let cap = self.nodes.capacity();
+        for _ in 0..cap {
+            self.nodes.push(dummy);
+        }
+        self.nodes.clear();
+        self.free_head = INVALID_NODE;
+    }
+}
+
 /// Central limit order book for a single instrument.
 #[derive(Debug)]
 pub struct OrderBook {
@@ -655,12 +945,17 @@ pub struct OrderBook {
     /// that should fire at a given trade price. Stop buys trigger when price
     /// rises (iterate from lowest trigger up), stop sells when price falls
     /// (iterate from highest trigger down).
-    stop_buys: BTreeMap<Price, Vec<PendingStop>>,
-    stop_sells: BTreeMap<Price, Vec<PendingStop>>,
+    /// Pending stop orders keyed by trigger price, mirroring the
+    /// limit-side `BookSide`: a slab + intrusive FIFO per trigger so
+    /// individual cancel is O(1) regardless of level depth.
+    stop_buys: StopSide,
+    stop_sells: StopSide,
     /// Tracks which order IDs are pending stops, for cancel support.
     /// Keyed by (AccountId, OrderId) to match order_index and eliminate
-    /// cross-account collisions.
-    stop_index: HashMap4<(AccountId, OrderId), (Side, Price)>,
+    /// cross-account collisions. Value tuple carries the slab index so
+    /// cancel can splice the stop out without scanning its trigger
+    /// level.
+    stop_index: HashMap4<(AccountId, OrderId), (Side, Price, u32)>,
     /// Last trade price, used to determine which stops to trigger.
     last_trade_price: Option<Price>,
     /// Reusable buffers to avoid per-order allocations on the hot path.
@@ -686,8 +981,8 @@ impl OrderBook {
             bids: BookSide::default(),
             asks: BookSide::default(),
             order_index: HashMap4::default(),
-            stop_buys: BTreeMap::new(),
-            stop_sells: BTreeMap::new(),
+            stop_buys: StopSide::default(),
+            stop_sells: StopSide::default(),
             stop_index: HashMap4::default(),
             last_trade_price: None,
             trigger_price_buf: Vec::new(),
@@ -718,9 +1013,10 @@ impl OrderBook {
             // slot) — fits in L2 cache for fast probes. Typical book depth
             // is 100-2000 orders; resize cost at 4K is ~5 µs.
             order_index: HashMap4::with_capacity_and_hasher(4_096, Default::default()),
-            // BTreeMap is node-allocated — no resize spikes.
-            stop_buys: BTreeMap::new(),
-            stop_sells: BTreeMap::new(),
+            // Stops are ~3% of order flow so a 1K slab covers a hot
+            // book without wasted space.
+            stop_buys: StopSide::with_capacity(1_024),
+            stop_sells: StopSide::with_capacity(1_024),
             stop_index: HashMap4::with_capacity_and_hasher(1_024, Default::default()),
             last_trade_price: None,
             trigger_price_buf: Vec::with_capacity(64),
@@ -755,6 +1051,7 @@ impl OrderBook {
                 (
                     Side::Buy,
                     Price(std::num::NonZeroU64::new(1).expect("non-zero literal")),
+                    INVALID_NODE,
                 ),
             );
         }
@@ -764,6 +1061,8 @@ impl OrderBook {
         // pop / cancel after warmup doesn't pay a page-fault stall.
         self.bids.prefault();
         self.asks.prefault();
+        self.stop_buys.prefault();
+        self.stop_sells.prefault();
     }
 
     /// Reconstruct an OrderBook from pre-built parts (used by snapshot restore).
@@ -776,9 +1075,9 @@ impl OrderBook {
         bids: BookSide,
         asks: BookSide,
         order_index: HashMap4<(AccountId, OrderId), (Side, Price, ReservationSlot, u32)>,
-        stop_buys: BTreeMap<Price, Vec<PendingStop>>,
-        stop_sells: BTreeMap<Price, Vec<PendingStop>>,
-        stop_index: HashMap4<(AccountId, OrderId), (Side, Price)>,
+        stop_buys: StopSide,
+        stop_sells: StopSide,
+        stop_index: HashMap4<(AccountId, OrderId), (Side, Price, u32)>,
         last_trade_price: Option<Price>,
     ) -> Self {
         Self {
@@ -807,11 +1106,11 @@ impl OrderBook {
         &self.asks
     }
 
-    pub(crate) fn stop_buys(&self) -> &BTreeMap<Price, Vec<PendingStop>> {
+    pub(crate) fn stop_buys(&self) -> &StopSide {
         &self.stop_buys
     }
 
-    pub(crate) fn stop_sells(&self) -> &BTreeMap<Price, Vec<PendingStop>> {
+    pub(crate) fn stop_sells(&self) -> &StopSide {
         &self.stop_sells
     }
 
@@ -835,7 +1134,7 @@ impl OrderBook {
     pub(crate) fn snapshot_stop_index(&self) -> Vec<(OrderId, AccountId, Side, Price)> {
         self.stop_index
             .iter()
-            .map(|(&(account, id), &(side, price))| (id, account, side, price))
+            .map(|(&(account, id), &(side, price, _node))| (id, account, side, price))
             .collect()
     }
 
@@ -1030,21 +1329,16 @@ impl OrderBook {
             return Some((side, slot));
         }
 
-        // Try pending stops.
-        if let Some((side, trigger_price)) = self.stop_index.remove(&(account, order_id)) {
+        // Try pending stops. O(1): the slab index from `stop_index`
+        // pinpoints the node, so removal is a constant-time linked-list
+        // splice — no scan over other stops sharing the trigger price.
+        if let Some((side, trigger_price, node_idx)) = self.stop_index.remove(&(account, order_id))
+        {
             let stops = match side {
                 Side::Buy => &mut self.stop_buys,
                 Side::Sell => &mut self.stop_sells,
             };
-            if let Some(level) = stops.get_mut(&trigger_price)
-                && let Some(pos) = level
-                    .iter()
-                    .position(|s| s.id == order_id && s.account == account)
-            {
-                let stop = level.remove(pos);
-                if level.is_empty() {
-                    stops.remove(&trigger_price);
-                }
+            if let Some(stop) = stops.remove_node(trigger_price, node_idx) {
                 let slot = stop.reservation;
                 reports.push(ExecutionReport::Cancelled {
                     order_id,
@@ -1087,20 +1381,16 @@ impl OrderBook {
         });
 
         // Scan pending stops.
-        for stops in self.stop_buys.values() {
-            for stop in stops {
-                if stop.account == account {
-                    to_cancel.push(stop.id);
-                }
+        self.stop_buys.for_each_stop(|stop| {
+            if stop.account == account {
+                to_cancel.push(stop.id);
             }
-        }
-        for stops in self.stop_sells.values() {
-            for stop in stops {
-                if stop.account == account {
-                    to_cancel.push(stop.id);
-                }
+        });
+        self.stop_sells.for_each_stop(|stop| {
+            if stop.account == account {
+                to_cancel.push(stop.id);
             }
-        }
+        });
 
         // Cancel each collected order. cancel() handles removal from
         // order_index/stop_index, BookSide levels, and report generation.
@@ -1129,20 +1419,16 @@ impl OrderBook {
             }
         });
 
-        for stops in self.stop_buys.values() {
-            for stop in stops {
-                if stop.time_in_force == TimeInForce::Day {
-                    to_cancel.push((stop.account, stop.id));
-                }
+        self.stop_buys.for_each_stop(|stop| {
+            if stop.time_in_force == TimeInForce::Day {
+                to_cancel.push((stop.account, stop.id));
             }
-        }
-        for stops in self.stop_sells.values() {
-            for stop in stops {
-                if stop.time_in_force == TimeInForce::Day {
-                    to_cancel.push((stop.account, stop.id));
-                }
+        });
+        self.stop_sells.for_each_stop(|stop| {
+            if stop.time_in_force == TimeInForce::Day {
+                to_cancel.push((stop.account, stop.id));
             }
-        }
+        });
 
         for (account, id) in to_cancel {
             if let Some((side, slot)) = self.cancel(account, id, reports) {
@@ -1545,9 +1831,12 @@ impl OrderBook {
             Side::Buy => &mut self.stop_buys,
             Side::Sell => &mut self.stop_sells,
         };
-        stops.entry(trigger_price).or_default().push(stop);
-        self.stop_index
-            .insert((order.account, order.id), (order.side, trigger_price));
+        let node_idx = stops.add(trigger_price, stop);
+        // Record the slab index so cancel of this stop is O(1).
+        self.stop_index.insert(
+            (order.account, order.id),
+            (order.side, trigger_price, node_idx),
+        );
     }
 
     /// Check if the last trade price triggers any pending stop orders.
@@ -1572,18 +1861,16 @@ impl OrderBook {
         self.trigger_price_buf.clear();
         self.trigger_price_buf.extend(
             self.stop_buys
-                .keys()
-                .take_while(|&&p| p <= trade_price)
-                .copied(),
+                .prices_ascending()
+                .take_while(|&p| p <= trade_price),
         );
 
         self.triggered_buf.clear();
         for &price in &self.trigger_price_buf {
-            if let Some(stops) = self.stop_buys.remove(&price) {
-                for stop in &stops {
-                    self.stop_index.remove(&(stop.account, stop.id));
-                }
-                self.triggered_buf.extend(stops);
+            let before = self.triggered_buf.len();
+            self.stop_buys.drain_level(price, &mut self.triggered_buf);
+            for stop in &self.triggered_buf[before..] {
+                self.stop_index.remove(&(stop.account, stop.id));
             }
         }
 
@@ -1592,18 +1879,16 @@ impl OrderBook {
         self.trigger_price_buf.clear();
         self.trigger_price_buf.extend(
             self.stop_sells
-                .keys()
+                .prices_ascending()
                 .rev()
-                .take_while(|&&p| p >= trade_price)
-                .copied(),
+                .take_while(|&p| p >= trade_price),
         );
 
         for &price in &self.trigger_price_buf {
-            if let Some(stops) = self.stop_sells.remove(&price) {
-                for stop in &stops {
-                    self.stop_index.remove(&(stop.account, stop.id));
-                }
-                self.triggered_buf.extend(stops);
+            let before = self.triggered_buf.len();
+            self.stop_sells.drain_level(price, &mut self.triggered_buf);
+            for stop in &self.triggered_buf[before..] {
+                self.stop_index.remove(&(stop.account, stop.id));
             }
         }
 
@@ -1727,16 +2012,10 @@ impl OrderBook {
         self.asks
             .for_each_order(|_, order| to_cancel.push((order.account, order.id)));
 
-        for stops in self.stop_buys.values() {
-            for stop in stops {
-                to_cancel.push((stop.account, stop.id));
-            }
-        }
-        for stops in self.stop_sells.values() {
-            for stop in stops {
-                to_cancel.push((stop.account, stop.id));
-            }
-        }
+        self.stop_buys
+            .for_each_stop(|stop| to_cancel.push((stop.account, stop.id)));
+        self.stop_sells
+            .for_each_stop(|stop| to_cancel.push((stop.account, stop.id)));
 
         for (account, id) in to_cancel {
             if let Some((side, slot)) = self.cancel(account, id, reports) {
@@ -1754,21 +2033,19 @@ impl OrderBook {
         new_max_fee_bps: u16,
         remaining_fn: impl Fn(ReservationSlot) -> u64,
     ) {
-        for stops in self.stop_buys.values_mut() {
-            for stop in stops.iter_mut() {
-                // Only stop-market buys have a quote_budget.
-                // Stop-limit buys have quote_budget == None.
-                if let Some(ref mut budget) = stop.quote_budget {
-                    let reserved = remaining_fn(stop.reservation);
-                    if new_max_fee_bps > 0 {
-                        *budget =
-                            (reserved as u128 * 10_000 / (10_000 + new_max_fee_bps as u128)) as u64;
-                    } else {
-                        *budget = reserved;
-                    }
+        self.stop_buys.for_each_stop_mut(|stop| {
+            // Only stop-market buys have a quote_budget.
+            // Stop-limit buys have quote_budget == None.
+            if let Some(ref mut budget) = stop.quote_budget {
+                let reserved = remaining_fn(stop.reservation);
+                if new_max_fee_bps > 0 {
+                    *budget =
+                        (reserved as u128 * 10_000 / (10_000 + new_max_fee_bps as u128)) as u64;
+                } else {
+                    *budget = reserved;
                 }
             }
-        }
+        });
     }
 
     fn opposite_side(&self, side: Side) -> &BookSide {
@@ -1816,20 +2093,16 @@ impl OrderBook {
         });
 
         // Patch pending stops.
-        for stops in self.stop_buys.values_mut() {
-            for stop in stops.iter_mut() {
-                if let Some(&slot) = slot_map.get(&(stop.account, stop.id)) {
-                    stop.reservation = slot;
-                }
+        self.stop_buys.for_each_stop_mut(|stop| {
+            if let Some(&slot) = slot_map.get(&(stop.account, stop.id)) {
+                stop.reservation = slot;
             }
-        }
-        for stops in self.stop_sells.values_mut() {
-            for stop in stops.iter_mut() {
-                if let Some(&slot) = slot_map.get(&(stop.account, stop.id)) {
-                    stop.reservation = slot;
-                }
+        });
+        self.stop_sells.for_each_stop_mut(|stop| {
+            if let Some(&slot) = slot_map.get(&(stop.account, stop.id)) {
+                stop.reservation = slot;
             }
-        }
+        });
     }
 
     /// Collect (account, order_id) → (side, slot) for all resting orders.
@@ -1844,20 +2117,16 @@ impl OrderBook {
     }
 
     /// Collect (account, order_id) → (side, slot) for all pending stops.
-    pub(crate) fn active_stop_slots(
-        &self,
-    ) -> impl Iterator<Item = ((AccountId, OrderId), (Side, ReservationSlot))> + '_ {
-        let buys = self.stop_buys.values().flat_map(|stops| {
-            stops
-                .iter()
-                .map(|s| ((s.account, s.id), (s.side, s.reservation)))
-        });
-        let sells = self.stop_sells.values().flat_map(|stops| {
-            stops
-                .iter()
-                .map(|s| ((s.account, s.id), (s.side, s.reservation)))
-        });
-        buys.chain(sells)
+    /// Called once at snapshot encode time, not on the hot path — the Vec
+    /// allocation is fine.
+    pub(crate) fn active_stop_slots(&self) -> Vec<((AccountId, OrderId), (Side, ReservationSlot))> {
+        let mut out = Vec::new();
+        let mut push = |s: &PendingStop| {
+            out.push(((s.account, s.id), (s.side, s.reservation)));
+        };
+        self.stop_buys.for_each_stop(&mut push);
+        self.stop_sells.for_each_stop(&mut push);
+        out
     }
 
     /// Iterate every GTD order on the book, resting or pending stop, yielding
@@ -1875,13 +2144,13 @@ impl OrderBook {
         };
         self.bids.for_each_order(|_, o| push_if_gtd(o));
         self.asks.for_each_order(|_, o| push_if_gtd(o));
-        for stops in self.stop_buys.values().chain(self.stop_sells.values()) {
-            for s in stops {
-                if s.time_in_force == TimeInForce::GTD {
-                    out.push((s.account, s.id, s.expiry_ns));
-                }
+        let mut push_stop_if_gtd = |s: &PendingStop| {
+            if s.time_in_force == TimeInForce::GTD {
+                out.push((s.account, s.id, s.expiry_ns));
             }
-        }
+        };
+        self.stop_buys.for_each_stop(&mut push_stop_if_gtd);
+        self.stop_sells.for_each_stop(&mut push_stop_if_gtd);
         out
     }
 
@@ -1907,17 +2176,15 @@ impl OrderBook {
                 return (order.time_in_force == TimeInForce::GTD).then_some(order.expiry_ns);
             }
         }
-        if let Some(&(side, trigger_price)) = self.stop_index.get(&(account, order_id)) {
+        if let Some(&(side, _trigger, node_idx)) = self.stop_index.get(&(account, order_id)) {
+            // O(1): stop_index already gave us the slab handle.
             let stops = match side {
                 Side::Buy => &self.stop_buys,
                 Side::Sell => &self.stop_sells,
             };
-            if let Some(level) = stops.get(&trigger_price) {
-                for s in level {
-                    if s.id == order_id && s.account == account {
-                        return (s.time_in_force == TimeInForce::GTD).then_some(s.expiry_ns);
-                    }
-                }
+            let stop = &stops.node(node_idx).stop;
+            if stop.id == order_id && stop.account == account {
+                return (stop.time_in_force == TimeInForce::GTD).then_some(stop.expiry_ns);
             }
         }
         None
@@ -3589,6 +3856,162 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    /// Cancelling a stop in the middle of a multi-stop trigger level
+    /// must splice cleanly. Mirrors `cancel_middle_of_level_preserves_fifo`
+    /// for the stop side.
+    fn stop_cancel_middle_of_level_preserves_fifo() {
+        let mut book = OrderBook::new(TEST_SYMBOL);
+        let mut reports = Vec::new();
+
+        // Three buy stops at the same trigger price — head=1, mid=2, tail=3.
+        for id in 1..=3 {
+            book.execute(
+                stop_order(id, Side::Buy, 100, 5, TimeInForce::GTC),
+                None,
+                ReservationSlot::DUMMY,
+                &mut reports,
+            );
+        }
+        reports.clear();
+
+        // Cancel the middle stop. Subsequent trigger must fire 1 then 3.
+        book.cancel(TEST_ACCOUNT, OrderId(2), &mut reports);
+        assert!(matches!(
+            reports[0],
+            ExecutionReport::Cancelled {
+                order_id: OrderId(2),
+                ..
+            }
+        ));
+        reports.clear();
+
+        // Place a sell at 100 then a buy that crosses it to drive a trade
+        // at 100, which triggers both buy stops. They convert to market
+        // orders but the book is empty post-trade, so they reject.
+        // What matters here is the *Triggered* report order: 1 then 3.
+        book.execute(
+            limit_order(10, Side::Sell, 100, 1, TimeInForce::GTC),
+            None,
+            ReservationSlot::DUMMY,
+            &mut reports,
+        );
+        book.execute(
+            limit_order(11, Side::Buy, 100, 1, TimeInForce::IOC),
+            None,
+            ReservationSlot::DUMMY,
+            &mut reports,
+        );
+        let triggered: Vec<OrderId> = reports
+            .iter()
+            .filter_map(|r| match r {
+                ExecutionReport::Triggered { order_id, .. } => Some(*order_id),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(triggered, vec![OrderId(1), OrderId(3)]);
+    }
+
+    /// Stops at the same trigger price must fire FIFO. After 5 stops
+    /// are placed and a trade hits the trigger, the Triggered reports
+    /// must come out in placement order.
+    #[test]
+    fn stops_fire_in_fifo_order_at_same_trigger() {
+        let mut book = OrderBook::new(TEST_SYMBOL);
+        let mut reports = Vec::new();
+
+        for id in 1..=5 {
+            book.execute(
+                stop_order(id, Side::Buy, 100, 1, TimeInForce::GTC),
+                None,
+                ReservationSlot::DUMMY,
+                &mut reports,
+            );
+        }
+        reports.clear();
+
+        // Drive a trade at 100 to fire all five.
+        book.execute(
+            limit_order(10, Side::Sell, 100, 1, TimeInForce::GTC),
+            None,
+            ReservationSlot::DUMMY,
+            &mut reports,
+        );
+        book.execute(
+            limit_order(11, Side::Buy, 100, 1, TimeInForce::IOC),
+            None,
+            ReservationSlot::DUMMY,
+            &mut reports,
+        );
+        let triggered: Vec<OrderId> = reports
+            .iter()
+            .filter_map(|r| match r {
+                ExecutionReport::Triggered { order_id, .. } => Some(*order_id),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            triggered,
+            vec![OrderId(1), OrderId(2), OrderId(3), OrderId(4), OrderId(5)]
+        );
+    }
+
+    /// Stress slab reuse on the stop side. 200 cycles of place+cancel
+    /// followed by a final batch that must trigger in correct FIFO order.
+    /// Catches stale `prev`/`next` on reused stop slots.
+    #[test]
+    fn stop_repeated_alloc_free_preserves_fifo() {
+        let mut book = OrderBook::new(TEST_SYMBOL);
+        let mut reports = Vec::new();
+
+        for id in 1..=200 {
+            book.execute(
+                stop_order(id, Side::Buy, 100, 1, TimeInForce::GTC),
+                None,
+                ReservationSlot::DUMMY,
+                &mut reports,
+            );
+            book.cancel(TEST_ACCOUNT, OrderId(id), &mut reports);
+        }
+        reports.clear();
+
+        // Final batch.
+        for id in 1000..=1003 {
+            book.execute(
+                stop_order(id, Side::Buy, 100, 1, TimeInForce::GTC),
+                None,
+                ReservationSlot::DUMMY,
+                &mut reports,
+            );
+        }
+        reports.clear();
+
+        // Drive a trade to fire them.
+        book.execute(
+            limit_order(10, Side::Sell, 100, 1, TimeInForce::GTC),
+            None,
+            ReservationSlot::DUMMY,
+            &mut reports,
+        );
+        book.execute(
+            limit_order(11, Side::Buy, 100, 1, TimeInForce::IOC),
+            None,
+            ReservationSlot::DUMMY,
+            &mut reports,
+        );
+        let triggered: Vec<OrderId> = reports
+            .iter()
+            .filter_map(|r| match r {
+                ExecutionReport::Triggered { order_id, .. } => Some(*order_id),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            triggered,
+            vec![OrderId(1000), OrderId(1001), OrderId(1002), OrderId(1003)]
+        );
     }
 
     #[test]
