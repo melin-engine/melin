@@ -96,6 +96,13 @@
 #                       Saves time when chaining DPDK runs back-to-back;
 #                       remember to reboot manually before switching to
 #                       a kernel transport.
+#   DPDK_SERVER_EXTRA_FEATURES=<list>
+#                       Comma-separated cargo features to append to the
+#                       DPDK server build (e.g. `latency-trace`). Use
+#                       this to enable diagnostic instrumentation on the
+#                       DPDK transport without editing the script. Server
+#                       prints histograms to stderr at shutdown
+#                       (/tmp/melin-server.log on the remote).
 #
 # Special values:
 #   TRANSPORTS=all      All transports valid for the available infrastructure
@@ -565,6 +572,12 @@ if [[ "$NEED_DPDK" == "1" ]]; then
     fi
     if [[ "${NO_PERSIST:-0}" == "1" ]]; then
         DPDK_SERVER_FEATURES="${DPDK_SERVER_FEATURES},no-persist"
+    fi
+    # Append diagnostic features (e.g. latency-trace) without touching
+    # the base feature set. Comma-separated list, no leading/trailing
+    # comma. Bench runs that don't need extras leave it unset.
+    if [[ -n "${DPDK_SERVER_EXTRA_FEATURES:-}" ]]; then
+        DPDK_SERVER_FEATURES="${DPDK_SERVER_FEATURES},${DPDK_SERVER_EXTRA_FEATURES}"
     fi
 
     # Check if TAP mode .dpdk binary already exists (container setup).
