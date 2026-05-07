@@ -1430,6 +1430,23 @@ impl<A: Application> MatchingStage<A> {
 
             let mut saw_shutdown = false;
 
+            // Halt status is constant for the duration of one disruptor
+            // batch (replica counts only change between batches in
+            // practice). One Relaxed load per batch, hoisted out of the
+            // per-event branch.
+            let halted = self
+                .replicas_connected
+                .as_ref()
+                .is_some_and(|count| count.load(Ordering::Relaxed) == 0);
+
+            // Open a single output batch for the entire disruptor batch:
+            // all OutputSlots produced below share one Release store on
+            // the output cursor at `out_batch.commit()`, instead of one
+            // Release per slot. This is the LMAX disruptor batching
+            // pattern — at saturation it cuts cache-line bouncing on the
+            // matching → response cursor by up to MAX_MATCHING_BATCH×.
+            let mut out_batch = self.output.batch();
+
             for (i, slot) in batch[..count].iter().enumerate() {
                 if slot.event.is_shutdown() {
                     // Sentinel — every event the producer published before
@@ -1465,7 +1482,7 @@ impl<A: Application> MatchingStage<A> {
                 // the current snapshot during a halt is safe (and
                 // actually useful for operators monitoring the outage).
                 let is_query = slot.event.is_query();
-                if !is_query && self.is_halted() {
+                if !is_query && halted {
                     // Only app events produce client-facing rejections;
                     // transport variants (Tick, GenesisHash, Checkpoint)
                     // have no client to reject to, so they silently
@@ -1483,7 +1500,28 @@ impl<A: Application> MatchingStage<A> {
                         reports.push(A::build_reject(e, RejectReason::DuplicateRequest));
                     }
                 } else {
-                    query_report = self.process_event(slot, &ctx, &mut reports);
+                    // Inlined `process_event` so the run loop only borrows
+                    // disjoint fields (`self.app`, `self.last_drain_ns`),
+                    // freeing `self.output` for the in-flight `out_batch`.
+                    if slot.timestamp_ns > self.last_drain_ns {
+                        self.last_drain_ns = slot.timestamp_ns;
+                        self.app.tick(slot.timestamp_ns, &mut reports);
+                    }
+                    match slot.event {
+                        melin_journal::JournalEvent::App(event) => {
+                            let event_ctx = ApplyCtx {
+                                now_ns: slot.timestamp_ns,
+                                ..ctx
+                            };
+                            query_report = self.app.apply(event, &event_ctx, &mut reports);
+                        }
+                        melin_journal::JournalEvent::Tick { now_ns } => {
+                            self.app.tick(now_ns, &mut reports);
+                        }
+                        melin_journal::JournalEvent::GenesisHash { .. }
+                        | melin_journal::JournalEvent::Checkpoint { .. } => {}
+                        melin_journal::JournalEvent::Shutdown => {}
+                    }
                 }
 
                 #[cfg(feature = "latency-trace")]
@@ -1496,41 +1534,52 @@ impl<A: Application> MatchingStage<A> {
                 #[allow(clippy::let_unit_value)] // ZST when latency-trace is disabled
                 let match_complete_ts = trace_ts();
 
-                // Publish execution reports to the output SPSC.
-                // All output slots for this request carry the same input_seq
-                // so the response stage can gate on journal completion.
-                // Fan-out reports (fills, acks) come from the scratch vec;
-                // query responses (stats, position) are returned directly
-                // by `process_event` and published here without ever
-                // entering the vec — keeping the per-element size small.
+                // Push execution reports into the output batch.
+                // All output slots for this request carry the same
+                // input_seq so the response stage can gate on journal
+                // completion. Fan-out reports (fills, acks) come from
+                // the scratch vec; query responses (stats, position)
+                // are returned directly by the app and pushed here
+                // without ever entering the vec.
                 for report in &reports {
-                    self.output.publish(OutputSlot {
-                        connection_id: slot.connection_id,
-                        input_seq,
-                        payload: OutputPayload::Report(*report),
-                        match_complete_ts,
-                        recv_ts: slot.recv_ts,
+                    out_batch.push_with(|s| {
+                        *s = OutputSlot {
+                            connection_id: slot.connection_id,
+                            input_seq,
+                            payload: OutputPayload::Report(*report),
+                            match_complete_ts,
+                            recv_ts: slot.recv_ts,
+                        };
                     });
                 }
                 if let Some(qr) = query_report {
-                    self.output.publish(OutputSlot {
-                        connection_id: slot.connection_id,
-                        input_seq,
-                        payload: OutputPayload::QueryResponse(qr),
-                        match_complete_ts,
-                        recv_ts: slot.recv_ts,
+                    out_batch.push_with(|s| {
+                        *s = OutputSlot {
+                            connection_id: slot.connection_id,
+                            input_seq,
+                            payload: OutputPayload::QueryResponse(qr),
+                            match_complete_ts,
+                            recv_ts: slot.recv_ts,
+                        };
                     });
                 }
 
                 // Signal end of batch for this request.
-                self.output.publish(OutputSlot {
-                    connection_id: slot.connection_id,
-                    input_seq,
-                    payload: OutputPayload::BatchEnd,
-                    match_complete_ts,
-                    recv_ts: slot.recv_ts,
+                out_batch.push_with(|s| {
+                    *s = OutputSlot {
+                        connection_id: slot.connection_id,
+                        input_seq,
+                        payload: OutputPayload::BatchEnd,
+                        match_complete_ts,
+                        recv_ts: slot.recv_ts,
+                    };
                 });
             }
+
+            // Single Release store on the output cursor for everything
+            // pushed during this disruptor batch. The response stage
+            // sees all the slots become visible at once.
+            out_batch.commit();
 
             // Flush the thread-local counter once per batch so the health
             // endpoint can observe progress. One Relaxed store per batch
