@@ -517,6 +517,73 @@ impl<T: Copy + Default> Consumer<T> {
         count
     }
 
+    /// Borrow up to `max` ready entries as up to two contiguous slices
+    /// into the ring buffer, **without** copying or advancing the
+    /// consumer cursor. Returns `(first, second)` where the logical
+    /// batch is `first` followed by `second` — the second slice is
+    /// non-empty only when the batch crosses the ring's wrap point.
+    ///
+    /// The slices borrow from the ring; the producer cannot overwrite
+    /// any of these slots until [`commit_consumed`] has been called
+    /// with a count covering them, because the producer's backpressure
+    /// gate is the consumer's published `processed` cursor — which
+    /// `peek_batch` does not advance.
+    ///
+    /// Pairs with [`commit_consumed`]: the caller iterates the slices,
+    /// then calls `commit_consumed(first.len() + second.len())` once
+    /// the borrowed view is dropped, which advances both `next_read`
+    /// and the published progress counter.
+    ///
+    /// Use this instead of [`consume_batch`] / [`read_batch`] when the
+    /// caller would otherwise copy the batch into a stack array just
+    /// to iterate it — the matching stage does this on every disruptor
+    /// batch and the copy is pure overhead.
+    pub fn peek_batch(&mut self, max: usize) -> (&[T], &[T]) {
+        // Always re-read dependency for batch operations.
+        self.cached_dep = self.dependency.load();
+        let available = self.cached_dep.saturating_sub(self.next_read);
+        if available == 0 {
+            return (&[], &[]);
+        }
+        let count = available.min(max as u64) as usize;
+        let cap = self.shared.buffer.slots.len();
+        let start_idx = (self.next_read & self.shared.buffer.mask) as usize;
+        let first_len = (cap - start_idx).min(count);
+        let second_len = count - first_len;
+
+        // Safety: the slots in [next_read, next_read+count) have been
+        // written by the producer (dependency.load() returned a value
+        // >= next_read+count) and the producer cannot overwrite them
+        // until `processed` advances — which `peek_batch` does not do.
+        // `UnsafeCell<T>::get()` on a `Box<[UnsafeCell<T>]>` yields a
+        // contiguous run of `*mut T`, so a `std::slice::from_raw_parts`
+        // over [start_idx, start_idx+first_len) is sound. The two
+        // slices never overlap (the second always starts at index 0).
+        let first = unsafe {
+            std::slice::from_raw_parts(self.shared.buffer.slots[start_idx].get(), first_len)
+        };
+        let second = if second_len > 0 {
+            unsafe { std::slice::from_raw_parts(self.shared.buffer.slots[0].get(), second_len) }
+        } else {
+            &[]
+        };
+        (first, second)
+    }
+
+    /// Advance both `next_read` and the published progress counter by
+    /// `count`. Pairs with [`peek_batch`]: call after the borrowed
+    /// slices have been processed and dropped.
+    ///
+    /// Must not be called with a count larger than the most recent
+    /// `peek_batch` returned.
+    pub fn commit_consumed(&mut self, count: usize) {
+        self.next_read += count as u64;
+        // Release: producer/downstream consumers see our progress.
+        self.processed
+            .get()
+            .store(self.next_read, Ordering::Release);
+    }
+
     /// Advance the progress counter by `count` entries, making them visible
     /// to downstream consumers and the producer (for backpressure).
     ///
@@ -1044,5 +1111,91 @@ mod tests {
         assert_eq!(consumer.try_consume(), Some((2, 2)));
         assert_eq!(consumer.try_consume(), Some((3, 3)));
         assert_eq!(consumer.try_consume(), Some((4, 99)));
+    }
+
+    #[test]
+    fn peek_batch_returns_contiguous_slice_when_no_wrap() {
+        let (mut producer, mut consumers) = DisruptorBuilder::<u64>::new(8).add_consumer().build();
+        for i in 0..5u64 {
+            producer.publish(i * 10);
+        }
+        let consumer = &mut consumers[0];
+
+        let (first, second) = consumer.peek_batch(8);
+        assert_eq!(first, &[0, 10, 20, 30, 40]);
+        assert!(second.is_empty());
+
+        // Consumer hasn't advanced — re-peeking yields the same slots.
+        let (first2, _) = consumer.peek_batch(8);
+        assert_eq!(first2, &[0, 10, 20, 30, 40]);
+
+        consumer.commit_consumed(5);
+        let (first, second) = consumer.peek_batch(8);
+        assert!(first.is_empty());
+        assert!(second.is_empty());
+    }
+
+    #[test]
+    fn peek_batch_splits_across_wrap() {
+        let (mut producer, mut consumers) = DisruptorBuilder::<u64>::new(4).add_consumer().build();
+        // Fill, drain 3, then publish 3 more so the live window crosses
+        // the wrap boundary [3, 6) -> indices [3, 0, 1].
+        for i in 0..4u64 {
+            producer.publish(i);
+        }
+        let consumer = &mut consumers[0];
+        // Drain the first 3 so backpressure allows more publishes.
+        for _ in 0..3 {
+            consumer.try_consume();
+        }
+        for i in 4..7u64 {
+            producer.publish(i);
+        }
+
+        let (first, second) = consumer.peek_batch(4);
+        assert_eq!(first, &[3]); // index 3 only
+        assert_eq!(second, &[4, 5, 6]); // indices 0, 1, 2
+
+        consumer.commit_consumed(4);
+        let (first, second) = consumer.peek_batch(4);
+        assert!(first.is_empty());
+        assert!(second.is_empty());
+    }
+
+    #[test]
+    fn peek_batch_respects_max() {
+        let (mut producer, mut consumers) = DisruptorBuilder::<u64>::new(16).add_consumer().build();
+        for i in 0..10u64 {
+            producer.publish(i);
+        }
+        let consumer = &mut consumers[0];
+        let (first, second) = consumer.peek_batch(3);
+        assert_eq!(first.len() + second.len(), 3);
+        assert_eq!(first, &[0, 1, 2]);
+        consumer.commit_consumed(3);
+
+        let (first, _second) = consumer.peek_batch(100);
+        assert_eq!(first, &[3, 4, 5, 6, 7, 8, 9]);
+    }
+
+    #[test]
+    fn peek_batch_advances_processed_only_on_commit() {
+        let (mut producer, mut consumers) = DisruptorBuilder::<u64>::new(4).add_consumer().build();
+        for i in 0..4u64 {
+            producer.publish(i);
+        }
+        // Producer is now at the gate (4 unconsumed slots, capacity=4).
+        assert_eq!(producer.try_publish(99), Err(Full));
+
+        // Peeking does not advance progress, so the producer is still gated.
+        let consumer = &mut consumers[0];
+        let _ = consumer.peek_batch(4);
+        assert_eq!(producer.try_publish(99), Err(Full));
+
+        // Committing 2 lets the producer publish 2 more.
+        consumer.commit_consumed(2);
+        assert!(producer.try_publish(99).is_ok());
+        assert!(producer.try_publish(100).is_ok());
+        assert_eq!(producer.try_publish(101), Err(Full));
     }
 }

@@ -1384,9 +1384,6 @@ impl<A: Application> MatchingStage<A> {
         // once per batch and on shutdown.
         let mut local_events: u64 = 0;
 
-        let mut batch: [InputSlot<A::Event>; MAX_MATCHING_BATCH] =
-            [InputSlot::default(); MAX_MATCHING_BATCH];
-
         let mut busy_count: u64 = 0;
         let mut idle_count: u64 = 0;
 
@@ -1417,7 +1414,16 @@ impl<A: Application> MatchingStage<A> {
             }
 
             let batch_start = self.consumer.next_read();
-            let count = self.consumer.consume_batch(&mut batch, MAX_MATCHING_BATCH);
+            // Borrow up to MAX_MATCHING_BATCH ready slots in place from
+            // the input ring instead of copying them into a 64×104 B
+            // stack buffer first. The two slices together form the
+            // logical batch (the second is non-empty only when the
+            // batch crosses the ring's wrap point). `commit_consumed`
+            // is called below once iteration finishes, advancing the
+            // consumer cursor and releasing those slots back to the
+            // producer for backpressure.
+            let (slots_a, slots_b) = self.consumer.peek_batch(MAX_MATCHING_BATCH);
+            let count = slots_a.len() + slots_b.len();
             if count == 0 {
                 idle_count += 1;
                 if idle_count.is_multiple_of(1024) {
@@ -1462,7 +1468,7 @@ impl<A: Application> MatchingStage<A> {
             // matching → response cursor by up to MAX_MATCHING_BATCH×.
             let mut out_batch = self.output.batch();
 
-            for (i, slot) in batch[..count].iter().enumerate() {
+            for (i, slot) in slots_a.iter().chain(slots_b.iter()).enumerate() {
                 if slot.event.is_shutdown() {
                     // Sentinel — every event the producer published before
                     // this slot has already been consumed (FIFO). Exit
@@ -1609,6 +1615,12 @@ impl<A: Application> MatchingStage<A> {
             // pushed during this disruptor batch. The response stage
             // sees all the slots become visible at once.
             out_batch.commit();
+
+            // Release the input slots back to the producer for
+            // backpressure. The borrowed slices `slots_a` / `slots_b`
+            // dropped at the end of the for loop above, so this
+            // re-borrow on `self.consumer` is unconflicted.
+            self.consumer.commit_consumed(count);
 
             // Flush the thread-local counter once per batch so the health
             // endpoint can observe progress. One Relaxed store per batch
