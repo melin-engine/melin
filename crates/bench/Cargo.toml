@@ -4,7 +4,22 @@ version = "0.5.0"
 edition = "2024"
 
 [features]
-default = []
+## Default mirrors `melin-server`'s default set so plain `cargo run -p
+## melin-bench` behaves like a stock server build. Disable individual
+## features with `--no-default-features --features=...` to benchmark
+## without trading, hash-chain, or release-tracing.
+default = ["trading", "hash-chain", "release-tracing"]
+## Forward to `melin-server/trading` (real matching engine).
+trading = ["melin-server/trading"]
+## Forward to `melin-server/hash-chain` (BLAKE3 tamper-evident journal
+## chain — adds ~15-30 ns per event).
+hash-chain = ["melin-server/hash-chain"]
+## Forward to `melin-server/release-tracing` (compile out debug!/trace!).
+release-tracing = ["melin-server/release-tracing"]
+## Transport-only noop app — mutually exclusive with `trading` at the
+## server level. Use `--no-default-features --features=noop` to bench
+## the pipeline without the matching engine.
+noop = ["melin-server/noop"]
 no-persist = ["melin-server/no-persist"]
 latency-trace = ["melin-server/latency-trace"]
 ## Kept for backward compatibility — io_uring is now always used.
@@ -38,7 +53,7 @@ melin-engine = { path = "../engine" }
 melin-trading = { path = "../trading" }
 melin-disruptor = { path = "../disruptor" }
 melin-protocol = { path = "../protocol" }
-melin-server = { path = "../server" }
+melin-server = { path = "../server", default-features = false }
 melin-app = { path = "../app" }
 melin-transport-core = { path = "../transport-core" }
 base64 = { workspace = true }
