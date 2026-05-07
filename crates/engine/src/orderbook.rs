@@ -2527,6 +2527,369 @@ mod tests {
         ));
     }
 
+    // -- Intrusive-list edge cases --
+    //
+    // These tests cover the slab + doubly-linked list under operations that
+    // exercise the prev/next splicing logic directly — middle-of-FIFO
+    // cancellation, slab reuse cycles, and `replace_order` paths. The
+    // higher-level matching tests above all hit head/tail patterns; without
+    // these, a bug that left dangling `prev`/`next` links on cancel (or
+    // failed to refresh `LevelHead.head`/`tail`/`len`) could go undetected.
+
+    /// Cancelling a node with both prev and next neighbors must splice it
+    /// cleanly so the remaining FIFO order is preserved. A bug that forgot
+    /// to update either `prev.next` or `next.prev` would surface here as
+    /// a wrong fill order or a panic.
+    #[test]
+    fn cancel_middle_of_level_preserves_fifo() {
+        let mut book = OrderBook::new(TEST_SYMBOL);
+        let mut reports = Vec::new();
+
+        // Three asks at the same price — head=1, middle=2, tail=3.
+        for id in 1..=3 {
+            book.execute(
+                limit_order(id, Side::Sell, 100, 5, TimeInForce::GTC),
+                None,
+                ReservationSlot::DUMMY,
+                &mut reports,
+            );
+        }
+        reports.clear();
+
+        // Cancel the middle order. List must become 1 <-> 3 with no
+        // dangling links to the freed slot.
+        book.cancel(TEST_ACCOUNT, OrderId(2), &mut reports);
+        assert_eq!(reports.len(), 1);
+        assert!(matches!(
+            reports[0],
+            ExecutionReport::Cancelled {
+                order_id: OrderId(2),
+                ..
+            }
+        ));
+        reports.clear();
+
+        // A buy that exhausts both remaining makers must fill 1 first, 3 second.
+        book.execute(
+            limit_order(4, Side::Buy, 100, 10, TimeInForce::GTC),
+            None,
+            ReservationSlot::DUMMY,
+            &mut reports,
+        );
+        let fill_makers: Vec<OrderId> = reports
+            .iter()
+            .filter_map(|r| match r {
+                ExecutionReport::Fill { maker_order_id, .. } => Some(*maker_order_id),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(fill_makers, vec![OrderId(1), OrderId(3)]);
+        assert!(
+            book.is_empty(),
+            "book should be empty after exhausting both makers"
+        );
+    }
+
+    /// Cancelling the head of a multi-order level promotes the next order
+    /// to head and leaves prev=INVALID — verified by feeding a market buy
+    /// and checking the new head fills first.
+    #[test]
+    fn cancel_head_promotes_next_to_head() {
+        let mut book = OrderBook::new(TEST_SYMBOL);
+        let mut reports = Vec::new();
+
+        for id in 1..=3 {
+            book.execute(
+                limit_order(id, Side::Sell, 100, 5, TimeInForce::GTC),
+                None,
+                ReservationSlot::DUMMY,
+                &mut reports,
+            );
+        }
+        reports.clear();
+
+        book.cancel(TEST_ACCOUNT, OrderId(1), &mut reports);
+        reports.clear();
+
+        // 2 should now be the head.
+        book.execute(
+            limit_order(4, Side::Buy, 100, 5, TimeInForce::IOC),
+            None,
+            ReservationSlot::DUMMY,
+            &mut reports,
+        );
+        assert!(matches!(
+            reports[0],
+            ExecutionReport::Fill {
+                maker_order_id: OrderId(2),
+                ..
+            }
+        ));
+    }
+
+    /// Cancelling the tail of a multi-order level reduces tail to its
+    /// predecessor; a subsequent newly-placed order at the same price
+    /// must splice onto the (new) tail correctly.
+    #[test]
+    fn cancel_tail_then_add_keeps_fifo() {
+        let mut book = OrderBook::new(TEST_SYMBOL);
+        let mut reports = Vec::new();
+
+        for id in 1..=3 {
+            book.execute(
+                limit_order(id, Side::Sell, 100, 5, TimeInForce::GTC),
+                None,
+                ReservationSlot::DUMMY,
+                &mut reports,
+            );
+        }
+        reports.clear();
+
+        // Cancel tail (3). List is now 1 <-> 2.
+        book.cancel(TEST_ACCOUNT, OrderId(3), &mut reports);
+        reports.clear();
+
+        // Place a fresh order; it should reuse the freed slab slot but
+        // splice onto the new tail (2) — list becomes 1 <-> 2 <-> 4.
+        book.execute(
+            limit_order(4, Side::Sell, 100, 5, TimeInForce::GTC),
+            None,
+            ReservationSlot::DUMMY,
+            &mut reports,
+        );
+        reports.clear();
+
+        // Sweep all three: order must be 1, 2, 4.
+        book.execute(
+            limit_order(5, Side::Buy, 100, 15, TimeInForce::GTC),
+            None,
+            ReservationSlot::DUMMY,
+            &mut reports,
+        );
+        let makers: Vec<OrderId> = reports
+            .iter()
+            .filter_map(|r| match r {
+                ExecutionReport::Fill { maker_order_id, .. } => Some(*maker_order_id),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(makers, vec![OrderId(1), OrderId(2), OrderId(4)]);
+    }
+
+    /// Cancelling the only order at a price must remove the whole level,
+    /// not leave a zero-length entry. Verified by re-placing at that
+    /// price and checking it's the new top of book.
+    #[test]
+    fn cancel_only_order_removes_level() {
+        let mut book = OrderBook::new(TEST_SYMBOL);
+        let mut reports = Vec::new();
+
+        book.execute(
+            limit_order(1, Side::Sell, 100, 5, TimeInForce::GTC),
+            None,
+            ReservationSlot::DUMMY,
+            &mut reports,
+        );
+        book.cancel(TEST_ACCOUNT, OrderId(1), &mut reports);
+        assert!(
+            book.is_empty(),
+            "single-order level must be removed on cancel"
+        );
+        assert_eq!(book.best_ask(), None);
+
+        // Re-place at the same price; level is recreated.
+        reports.clear();
+        book.execute(
+            limit_order(2, Side::Sell, 100, 5, TimeInForce::GTC),
+            None,
+            ReservationSlot::DUMMY,
+            &mut reports,
+        );
+        assert_eq!(book.best_ask(), Some(price(100)));
+    }
+
+    /// Stress slab reuse: many cycles of place+cancel followed by a final
+    /// batch that must still match in correct FIFO order. Catches free-list
+    /// cycles, stale `prev`/`next` on reused slots, and `len` drift.
+    #[test]
+    fn repeated_alloc_free_preserves_book_invariants() {
+        let mut book = OrderBook::new(TEST_SYMBOL);
+        let mut reports = Vec::new();
+
+        // 200 cycles of place-then-cancel at the same price churn the
+        // slab through many alloc/free transitions.
+        for id in 1..=200 {
+            book.execute(
+                limit_order(id, Side::Sell, 100, 1, TimeInForce::GTC),
+                None,
+                ReservationSlot::DUMMY,
+                &mut reports,
+            );
+            book.cancel(TEST_ACCOUNT, OrderId(id), &mut reports);
+        }
+        assert!(
+            book.is_empty(),
+            "book should be empty after symmetric place/cancel"
+        );
+        reports.clear();
+
+        // Final batch: 5 orders at the same price. After all the slab
+        // churn, FIFO must still be respected.
+        for id in 1000..=1004 {
+            book.execute(
+                limit_order(id, Side::Sell, 100, 1, TimeInForce::GTC),
+                None,
+                ReservationSlot::DUMMY,
+                &mut reports,
+            );
+        }
+        reports.clear();
+
+        book.execute(
+            limit_order(2000, Side::Buy, 100, 5, TimeInForce::GTC),
+            None,
+            ReservationSlot::DUMMY,
+            &mut reports,
+        );
+        let makers: Vec<OrderId> = reports
+            .iter()
+            .filter_map(|r| match r {
+                ExecutionReport::Fill { maker_order_id, .. } => Some(*maker_order_id),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            makers,
+            vec![
+                OrderId(1000),
+                OrderId(1001),
+                OrderId(1002),
+                OrderId(1003),
+                OrderId(1004),
+            ]
+        );
+        assert!(book.is_empty());
+    }
+
+    /// `replace_order` qty-increase at the same price must move the order
+    /// to the back of the FIFO. Direct `OrderBook` test (the Exchange-level
+    /// `cancel_replace_qty_increase_loses_priority` exercises the same
+    /// behavior through more layers).
+    #[test]
+    fn replace_order_same_price_qty_increase_loses_priority() {
+        let mut book = OrderBook::new(TEST_SYMBOL);
+        let mut reports = Vec::new();
+
+        for id in 1..=3 {
+            book.execute(
+                limit_order(id, Side::Sell, 100, 5, TimeInForce::GTC),
+                None,
+                ReservationSlot::DUMMY,
+                &mut reports,
+            );
+        }
+        reports.clear();
+
+        // Increase order 1's qty — must drop to back of queue.
+        let result = book.replace_order(TEST_ACCOUNT, OrderId(1), price(100), qty(7));
+        assert!(result.is_some());
+
+        // A buy of 5 should hit order 2 first (the new head), not order 1.
+        book.execute(
+            limit_order(99, Side::Buy, 100, 5, TimeInForce::IOC),
+            None,
+            ReservationSlot::DUMMY,
+            &mut reports,
+        );
+        assert!(matches!(
+            reports[0],
+            ExecutionReport::Fill {
+                maker_order_id: OrderId(2),
+                ..
+            }
+        ));
+    }
+
+    /// `replace_order` qty-decrease keeps priority — front-of-queue order
+    /// stays at the front after shrinking.
+    #[test]
+    fn replace_order_same_price_qty_decrease_keeps_priority() {
+        let mut book = OrderBook::new(TEST_SYMBOL);
+        let mut reports = Vec::new();
+
+        for id in 1..=3 {
+            book.execute(
+                limit_order(id, Side::Sell, 100, 5, TimeInForce::GTC),
+                None,
+                ReservationSlot::DUMMY,
+                &mut reports,
+            );
+        }
+        reports.clear();
+
+        // Decrease order 1's qty — keeps head position.
+        book.replace_order(TEST_ACCOUNT, OrderId(1), price(100), qty(3));
+
+        book.execute(
+            limit_order(99, Side::Buy, 100, 3, TimeInForce::IOC),
+            None,
+            ReservationSlot::DUMMY,
+            &mut reports,
+        );
+        assert!(matches!(
+            reports[0],
+            ExecutionReport::Fill { maker_order_id: OrderId(1), quantity, .. } if quantity == qty(3)
+        ));
+    }
+
+    /// `replace_order` to a different price unlinks from the old level
+    /// (removing it if empty) and splices onto the new level's tail.
+    #[test]
+    fn replace_order_to_different_price_relocates() {
+        let mut book = OrderBook::new(TEST_SYMBOL);
+        let mut reports = Vec::new();
+
+        // One order at 100 (sole occupant), one at 110 (sole occupant).
+        book.execute(
+            limit_order(1, Side::Sell, 100, 5, TimeInForce::GTC),
+            None,
+            ReservationSlot::DUMMY,
+            &mut reports,
+        );
+        book.execute(
+            limit_order(2, Side::Sell, 110, 5, TimeInForce::GTC),
+            None,
+            ReservationSlot::DUMMY,
+            &mut reports,
+        );
+        reports.clear();
+
+        // Move order 1 from 100 → 110. The 100 level must be removed
+        // (was its sole occupant); 110 must now have [2, 1] in FIFO.
+        book.replace_order(TEST_ACCOUNT, OrderId(1), price(110), qty(5));
+        assert_eq!(
+            book.best_ask(),
+            Some(price(110)),
+            "after relocate, best ask must be the new price (no orphan empty level at 100)"
+        );
+
+        // Sweep both: maker order must be 2 (older at 110), then 1.
+        book.execute(
+            limit_order(3, Side::Buy, 110, 10, TimeInForce::GTC),
+            None,
+            ReservationSlot::DUMMY,
+            &mut reports,
+        );
+        let makers: Vec<OrderId> = reports
+            .iter()
+            .filter_map(|r| match r {
+                ExecutionReport::Fill { maker_order_id, .. } => Some(*maker_order_id),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(makers, vec![OrderId(2), OrderId(1)]);
+    }
+
     // -- Multi-level matching --
 
     #[test]
