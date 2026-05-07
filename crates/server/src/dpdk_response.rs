@@ -27,6 +27,9 @@ use melin_transport_core::pipeline::StageUtilization;
 use melin_protocol::codec;
 use melin_protocol::message::ResponseKind;
 
+#[cfg(feature = "latency-trace")]
+use melin_journal::trace;
+
 /// Maximum number of output slots consumed per batch.
 const MAX_BATCH: usize = 1024;
 
@@ -124,10 +127,26 @@ pub fn run(
     let mut busy_count: u64 = 0;
     let mut idle_count: u64 = 0;
 
+    #[cfg(feature = "latency-trace")]
+    let mut spsc_hist = trace::StageHistogram::new(
+        "dpdk response: SPSC wakeup (matching publish → response consume)",
+    );
+    #[cfg(feature = "latency-trace")]
+    let mut dispatch_hist =
+        trace::StageHistogram::new("dpdk response: dispatch (consume → tx_rx push)");
+    #[cfg(feature = "latency-trace")]
+    let mut server_e2e_hist = trace::StageHistogram::new("dpdk server e2e (recv_ts → tx_rx push)");
+
     loop {
         if shutdown.load(Ordering::Relaxed) {
             utilization.busy.store(busy_count, Ordering::Relaxed);
             utilization.idle.store(idle_count, Ordering::Relaxed);
+            #[cfg(feature = "latency-trace")]
+            {
+                spsc_hist.print_report();
+                dispatch_hist.print_report();
+                server_e2e_hist.print_report();
+            }
             return;
         }
 
@@ -192,6 +211,9 @@ pub fn run(
         idle_spins = 0;
         busy_count += 1;
 
+        #[cfg(feature = "latency-trace")]
+        let consume_ts = trace::trace_ts();
+
         // Wait for durability (see response.rs for full explanation).
         {
             let max_seq = batch[..count]
@@ -234,6 +256,9 @@ pub fn run(
         // is set. `OutputPayload::BatchEnd` carries no payload of its
         // own — the wire BatchEnd is emitted purely from the flag.
         for slot in &batch[..count] {
+            #[cfg(feature = "latency-trace")]
+            spsc_hist.record_ns(trace::trace_elapsed_ns(slot.match_complete_ts, consume_ts));
+
             let mut kinds: [ResponseKind; 2] = [ResponseKind::BatchEnd; 2];
             let mut kinds_len: usize = 0;
             match slot.payload {
@@ -312,10 +337,23 @@ pub fn run(
                 tx_producers[tid].publish(frame);
             }
 
+            // Server-side end-to-end: NIC arrival (recv_ts on InputSlot,
+            // copied through to OutputSlot) → response handed to the DPDK
+            // poll thread for transmission. Gated on the request terminator
+            // so we record one sample per logical request, matching the
+            // kernel response stage.
+            #[cfg(feature = "latency-trace")]
+            if slot.is_last_in_request {
+                server_e2e_hist.record_ns(trace::trace_elapsed_ns(slot.recv_ts, trace::trace_ts()));
+            }
+
             if let Some(state) = connections.get_mut(&slot.connection_id) {
                 state.last_send = batch_now;
             }
         }
+
+        #[cfg(feature = "latency-trace")]
+        dispatch_hist.record_ns(trace::trace_elapsed_ns(consume_ts, trace::trace_ts()));
     }
 }
 

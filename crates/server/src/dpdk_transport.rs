@@ -217,10 +217,29 @@ pub fn run_dpdk_poll(
         );
     }
 
+    // Outer-loop wall-time histogram, gated on at least one byte received
+    // this iteration. Idle iterations would otherwise drown the percentiles
+    // in ~100ns samples; what we want is "how long does a poll cycle take
+    // when there's actual work to do" — which is the cycle an in-flight
+    // order experiences.
+    #[cfg(feature = "latency-trace")]
+    let mut poll_iter_hist = melin_journal::trace::StageHistogram::new(
+        "dpdk poll: outer iteration (work-iterations only)",
+    );
+    #[cfg(feature = "latency-trace")]
+    let mut poll_iter_start = melin_journal::trace::trace_ts();
+
     loop {
         if shutdown.load(Ordering::Relaxed) {
+            #[cfg(feature = "latency-trace")]
+            poll_iter_hist.print_report();
             break;
         }
+
+        // Set on any bytes received this iteration; gates poll_iter_hist
+        // recording so idle iterations don't drown the percentiles.
+        #[cfg(feature = "latency-trace")]
+        let mut work_done_this_iter = false;
 
         // Tick generator: compare wall clock to deadline once every
         // TICK_CHECK_INTERVAL poll iterations, emit if due.
@@ -451,6 +470,10 @@ pub fn run_dpdk_poll(
             let n = transport.recv_into_vec(conn.handle, &mut conn.parse_buf);
             if n > 0 {
                 conn.last_activity = Instant::now();
+                #[cfg(feature = "latency-trace")]
+                {
+                    work_done_this_iter = true;
+                }
             }
             if n == 0 {
                 if !transport.is_active(conn.handle) {
@@ -543,6 +566,16 @@ pub fn run_dpdk_poll(
         // any TX the driver queued on the prior iteration.
         if let Some(ref mut driver) = repl_driver {
             driver.tick(&mut transport, shutdown);
+        }
+
+        #[cfg(feature = "latency-trace")]
+        {
+            let now = melin_journal::trace::trace_ts();
+            if work_done_this_iter {
+                poll_iter_hist
+                    .record_ns(melin_journal::trace::trace_elapsed_ns(poll_iter_start, now));
+            }
+            poll_iter_start = now;
         }
     }
 }
