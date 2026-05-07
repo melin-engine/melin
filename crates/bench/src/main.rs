@@ -816,7 +816,10 @@ fn run_pipeline_bench(
     // TSC ticks instead of Instant::now() — ~4ns vs ~15-25ns per timestamp,
     // reducing measurement overhead from ~15% to ~1% of total CPU.
     let ticks_per_ns = calibrate_tsc();
-    let (mut ts_tx, mut ts_rx) = melin_disruptor::spsc::channel::<u64>(window.next_power_of_two());
+    // SPSC channel requires capacity >= 2; clamp so `--window=1` (useful
+    // for isolating pure pipeline latency without queueing) doesn't panic.
+    let ts_capacity = window.next_power_of_two().max(2);
+    let (mut ts_tx, mut ts_rx) = melin_disruptor::spsc::channel::<u64>(ts_capacity);
 
     // Publisher thread: continuously feeds events into the disruptor.
     // `sequence: 0` — the journal stage allocates sequences in disruptor
