@@ -177,6 +177,14 @@ echo ""
 #   transparent_hugepage=never: disable THP (khugepaged compaction causes 1-4ms stalls)
 #   cpufreq.default_governor=performance: lock max CPU frequency (no scaling transitions)
 #   processor.max_cstate=1: prevent deep C-states (C2+ wakeup costs 10-100µs)
+#   idle=poll: don't even let isolated cores enter C1 — instead of HLT'ing
+#     when the busy-spin loop has nothing to do, the kernel's idle loop
+#     polls. With max_cstate=1 the wakeup is already short, but C1 still
+#     adds a few-µs wake-up window on the rare path where a Melin thread
+#     genuinely yields. Cost: 100% CPU usage on every isolated core (the
+#     hot threads already busy-spin so the only change is the kernel's
+#     own idle path on cores that aren't busy yet). Higher power + heat,
+#     acceptable on an exchange host.
 #   skew_tick=1: offset timer ticks across cores to reduce kernel lock contention
 #   nosmt: disable hyperthreading — prevents HT siblings from polluting L1/L2 on pipeline cores
 GRUB_FILE="/etc/default/grub"
@@ -193,7 +201,7 @@ LAST_ISOLATED=$((PHYSICAL_CORES - 1))
 ISOLATED_RANGE="1-${LAST_ISOLATED}"
 echo "  detected $PHYSICAL_CORES physical cores → isolating ${ISOLATED_RANGE}"
 
-BENCH_PARAMS="isolcpus=nohz,domain,${ISOLATED_RANGE} nohz_full=${ISOLATED_RANGE} rcu_nocbs=${ISOLATED_RANGE} nowatchdog transparent_hugepage=never cpufreq.default_governor=performance processor.max_cstate=1 skew_tick=1 nosmt"
+BENCH_PARAMS="isolcpus=nohz,domain,${ISOLATED_RANGE} nohz_full=${ISOLATED_RANGE} rcu_nocbs=${ISOLATED_RANGE} nowatchdog transparent_hugepage=never cpufreq.default_governor=performance processor.max_cstate=1 idle=poll skew_tick=1 nosmt"
 # IOMMU for DPDK/vfio-pci. iommu=pt sets passthrough mode so DMA
 # bypasses IOMMU translation for performance. intel_iommu=on is
 # Intel-specific; on AMD (EPYC, Ryzen) the kernel uses AMD-Vi
@@ -230,6 +238,11 @@ if [[ -f "$GRUB_FILE" ]]; then
         NEEDS_UPDATE=1
     fi
 
+    if ! grep -q "idle=poll" "$GRUB_FILE" 2>/dev/null; then
+        echo "  Adding idle=poll (no C1 on isolated cores)"
+        NEEDS_UPDATE=1
+    fi
+
     if [[ "$NEEDS_UPDATE" -eq 1 || "$NEEDS_RANGE_REWRITE" -eq 1 ]]; then
         cp "$GRUB_FILE" "${GRUB_FILE}.bak"
 
@@ -250,6 +263,9 @@ if [[ -f "$GRUB_FILE" ]]; then
             fi
             if ! grep -q "iommu=pt" "$GRUB_FILE" 2>/dev/null; then
                 ADD_PARAMS="$ADD_PARAMS $IOMMU_PARAMS"
+            fi
+            if ! grep -q "idle=poll" "$GRUB_FILE" 2>/dev/null; then
+                ADD_PARAMS="$ADD_PARAMS idle=poll"
             fi
             if [[ -n "$ADD_PARAMS" ]]; then
                 sed -i "s/^GRUB_CMDLINE_LINUX_DEFAULT=\"\(.*\)\"/GRUB_CMDLINE_LINUX_DEFAULT=\"\1 $ADD_PARAMS\"/" "$GRUB_FILE"

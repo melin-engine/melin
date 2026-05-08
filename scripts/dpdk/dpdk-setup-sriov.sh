@@ -276,6 +276,22 @@ create_vf() {
     ip link set "${iface}" mtu "${MTU}"
     echo "  ${label}: MTU set to ${MTU}"
 
+    # Disable Ethernet flow control (PAUSE frames). With pause enabled,
+    # an upstream switch port that briefly fills its buffer can send
+    # PAUSE to us and stall our TX for a few hundred µs to ms — which
+    # would land directly in the bench-RTT max for any order unlucky
+    # enough to hit it. At our load (low-rate single-order or 5 M/s
+    # throughput) PAUSE shouldn't fire, but disabling it removes the
+    # whole class of event from the tail. Best-effort: not all PF
+    # drivers expose autoneg; ignore failures.
+    if ethtool -A "${iface}" rx off tx off autoneg off 2>/dev/null; then
+        echo "  ${label}: flow control (PAUSE frames) disabled"
+    elif ethtool -A "${iface}" rx off tx off 2>/dev/null; then
+        echo "  ${label}: flow control (PAUSE frames) disabled (autoneg keyword unsupported)"
+    else
+        echo "  ${label}: warning: could not disable flow control (driver may not support it)"
+    fi
+
     # On ixgbe, the VF driver must be reloaded for MAC changes to take
     # effect. Unbind and rebind the VF from its kernel driver.
     if [[ "$PF_DRIVER" == "ixgbe" ]]; then
