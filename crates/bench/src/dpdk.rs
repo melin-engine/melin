@@ -456,15 +456,28 @@ pub fn run_dpdk_roundtrip(
 
     // Outer-loop wall-time histogram, gated on at least one BatchEnd
     // received this iteration AND on being past warmup so we measure
-    // steady-state. With single-order workloads the hypothesis under
-    // test is that the bench's poll-cycle width directly bounds the
-    // p99 RTT spread we observe (~30 µs on 48 µs p50): a packet that
-    // arrives at the bench NIC waits 0–(one outer iter time) for the
-    // next poll() to read it, which is symmetric to the same gap on
-    // the send side. p99 of this hist confirms or rules that out.
+    // steady-state.
     #[cfg(feature = "latency-trace")]
     let mut poll_iter_hist =
         Histogram::<u64>::new_with_bounds(1, 1_000_000_000, 3).expect("poll iter histogram bounds");
+
+    // Per-component histograms for the poll closure's three sub-calls.
+    // The outer poll iter is ~1 µs typical (p99 ~1.5 µs) — nowhere near
+    // the 30 µs we want to attribute. Splitting into `poll_rx`,
+    // `iface.poll`, `flush_tx` tells us if any one of them occasionally
+    // takes ~30 µs. Most likely candidate: `iface.poll` when smoltcp's
+    // TCP state machine fires a timer-driven action (delayed ACK,
+    // window update, retransmit). Recorded only on calls invoked from
+    // the main measurement loop, never on connect-phase calls.
+    #[cfg(feature = "latency-trace")]
+    let mut poll_rx_hist =
+        Histogram::<u64>::new_with_bounds(1, 1_000_000_000, 3).expect("poll_rx hist bounds");
+    #[cfg(feature = "latency-trace")]
+    let mut iface_poll_hist =
+        Histogram::<u64>::new_with_bounds(1, 1_000_000_000, 3).expect("iface.poll hist bounds");
+    #[cfg(feature = "latency-trace")]
+    let mut flush_tx_hist =
+        Histogram::<u64>::new_with_bounds(1, 1_000_000_000, 3).expect("flush_tx hist bounds");
 
     // Poll every N connections to keep the NIC busy during the
     // connection iteration. Without this, smoltcp's TX buffer fills
@@ -481,13 +494,43 @@ pub fn run_dpdk_roundtrip(
         #[cfg(feature = "latency-trace")]
         let mut work_done_this_iter = false;
 
-        poll(
-            &mut device,
-            &mut iface,
-            &mut sockets,
-            &mut poll_count,
-            &mut cached_ts,
-        );
+        // Inlined poll with per-component timing. Mirrors the `poll`
+        // closure at the top of the function, except with rdtscp stamps
+        // around `poll_rx`, `iface.poll`, and `flush_tx`. Only the main
+        // loop's poll call is instrumented; connect-phase calls go
+        // through the original closure unchanged.
+        poll_count = poll_count.wrapping_add(1);
+        if poll_count.is_multiple_of(TIMESTAMP_REFRESH_INTERVAL) {
+            cached_ts = SmolInstant::from_millis(
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_millis() as i64,
+            );
+        }
+        #[cfg(feature = "latency-trace")]
+        let t0 = crate::rdtscp();
+        device.poll_rx();
+        #[cfg(feature = "latency-trace")]
+        let t1 = crate::rdtscp();
+        iface.poll(cached_ts, &mut device, &mut sockets);
+        #[cfg(feature = "latency-trace")]
+        let t2 = crate::rdtscp();
+        device.flush_tx();
+        #[cfg(feature = "latency-trace")]
+        let t3 = crate::rdtscp();
+        #[cfg(feature = "latency-trace")]
+        {
+            poll_rx_hist
+                .record(crate::tsc_to_ns(t1 - t0, ticks_per_ns))
+                .ok();
+            iface_poll_hist
+                .record(crate::tsc_to_ns(t2 - t1, ticks_per_ns))
+                .ok();
+            flush_tx_hist
+                .record(crate::tsc_to_ns(t3 - t2, ticks_per_ns))
+                .ok();
+        }
 
         let mut all_done = true;
 
@@ -656,25 +699,39 @@ pub fn run_dpdk_roundtrip(
     ];
 
     #[cfg(feature = "latency-trace")]
-    if !poll_iter_hist.is_empty() {
+    {
         let us = |ns: u64| ns as f64 / 1000.0;
-        eprintln!(
-            "  bench poll: outer iteration (work-iters only)\n\
-             \x20   samples: {samples}\n\
-             \x20   min:    {min:>8.2} µs\n\
-             \x20   p50:    {p50:>8.2} µs\n\
-             \x20   p90:    {p90:>8.2} µs\n\
-             \x20   p99:    {p99:>8.2} µs\n\
-             \x20   p99.9:  {p999:>8.2} µs\n\
-             \x20   max:    {max:>8.2} µs",
-            samples = poll_iter_hist.len(),
-            min = us(poll_iter_hist.min()),
-            p50 = us(poll_iter_hist.value_at_quantile(0.50)),
-            p90 = us(poll_iter_hist.value_at_quantile(0.90)),
-            p99 = us(poll_iter_hist.value_at_quantile(0.99)),
-            p999 = us(poll_iter_hist.value_at_quantile(0.999)),
-            max = us(poll_iter_hist.max()),
+        let report = |name: &str, h: &Histogram<u64>| {
+            if h.is_empty() {
+                return;
+            }
+            eprintln!(
+                "  {name}\n\
+                 \x20   samples: {samples}\n\
+                 \x20   min:    {min:>8.2} µs\n\
+                 \x20   p50:    {p50:>8.2} µs\n\
+                 \x20   p90:    {p90:>8.2} µs\n\
+                 \x20   p99:    {p99:>8.2} µs\n\
+                 \x20   p99.9:  {p999:>8.2} µs\n\
+                 \x20   p99.99: {p9999:>8.2} µs\n\
+                 \x20   max:    {max:>8.2} µs",
+                samples = h.len(),
+                min = us(h.min()),
+                p50 = us(h.value_at_quantile(0.50)),
+                p90 = us(h.value_at_quantile(0.90)),
+                p99 = us(h.value_at_quantile(0.99)),
+                p999 = us(h.value_at_quantile(0.999)),
+                p9999 = us(h.value_at_quantile(0.9999)),
+                max = us(h.max()),
+            );
+        };
+        report(
+            "bench poll: outer iteration (work-iters only)",
+            &poll_iter_hist,
         );
+        report("bench poll: device.poll_rx()", &poll_rx_hist);
+        report("bench poll: iface.poll() (smoltcp)", &iface_poll_hist);
+        report("bench poll: device.flush_tx()", &flush_tx_hist);
     }
 
     print_results(
