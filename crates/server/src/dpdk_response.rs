@@ -127,26 +127,32 @@ pub fn run(
     let mut busy_count: u64 = 0;
     let mut idle_count: u64 = 0;
 
+    // Stage histograms — mirror the TCP response stage but without
+    // an `egress` histogram. DPDK egress lives in the poll thread
+    // (`dpdk_transport.rs`), which is where the actual TX happens;
+    // sampling here would only capture SPSC-publish time and
+    // mislead the bench's tick-to-trade breakdown.
     #[cfg(feature = "latency-trace")]
-    let mut spsc_hist = trace::StageHistogram::new(
-        "dpdk response: SPSC wakeup (matching publish → response consume)",
+    let spsc_rec =
+        trace::register_stage("response: SPSC wakeup (matching publish → response consume)");
+    #[cfg(feature = "latency-trace")]
+    let dispatch_rec = trace::register_stage("response: dispatch (consume → SPSC publish)");
+    #[cfg(feature = "latency-trace")]
+    let server_e2e_rec = trace::register_stage("server e2e (reader recv → response SPSC publish)");
+    #[cfg(feature = "tick-to-trade")]
+    let journal_wait_rec =
+        trace::register_stage("response: journal-wait (match_complete → journal cursor crossed)");
+    #[cfg(feature = "tick-to-trade")]
+    let replica_wait_rec = trace::register_stage(
+        "response: replica-wait (match_complete → replication cursor crossed)",
     );
-    #[cfg(feature = "latency-trace")]
-    let mut dispatch_hist =
-        trace::StageHistogram::new("dpdk response: dispatch (consume → tx_rx push)");
-    #[cfg(feature = "latency-trace")]
-    let mut server_e2e_hist = trace::StageHistogram::new("dpdk server e2e (recv_ts → tx_rx push)");
+    #[cfg(feature = "tick-to-trade")]
+    let encode_rec = trace::register_stage("response: encode (per-kind wire encoding)");
 
     loop {
         if shutdown.load(Ordering::Relaxed) {
             utilization.busy.store(busy_count, Ordering::Relaxed);
             utilization.idle.store(idle_count, Ordering::Relaxed);
-            #[cfg(feature = "latency-trace")]
-            {
-                spsc_hist.print_report();
-                dispatch_hist.print_report();
-                server_e2e_hist.print_report();
-            }
             return;
         }
 
@@ -213,13 +219,12 @@ pub fn run(
 
         #[cfg(feature = "latency-trace")]
         let consume_ts = trace::trace_ts();
-        // Skip records on the shutdown drain — same intent as the
-        // journal/matching gates in pipeline.rs. No sentinel scan
-        // here: the response stage consumes `OutputSlot`s, which have
-        // no `Shutdown` variant — only the input ring carries the
-        // sentinel. The atomic alone is sufficient.
-        #[cfg(feature = "latency-trace")]
-        let record_this_batch = !shutdown.load(Ordering::Relaxed);
+
+        // Per-slot journal-wait / replica-wait tracker. Same shape as
+        // the TCP response — see `crate::response::GateCrossTracker`
+        // for the rationale and edge cases.
+        #[cfg(feature = "tick-to-trade")]
+        let mut gate_tracker;
 
         // Wait for durability (see response.rs for full explanation).
         {
@@ -229,10 +234,18 @@ pub fn run(
                 .max()
                 .expect("non-empty batch");
             let needed = max_seq + 1;
+            #[cfg(feature = "tick-to-trade")]
+            {
+                gate_tracker = crate::response::GateCrossTracker::new(needed);
+            }
             if cached_durable_pos < needed {
                 loop {
                     let journal_pos = journal_cursor.get().load(Ordering::Acquire);
                     let repl_min = replication_cursor.load(Ordering::Acquire);
+
+                    #[cfg(feature = "tick-to-trade")]
+                    gate_tracker.observe(journal_pos, repl_min, trace::trace_ts());
+
                     cached_durable_pos = crate::response::durable_pos(
                         journal_pos,
                         repl_min,
@@ -264,8 +277,15 @@ pub fn run(
         // own — the wire BatchEnd is emitted purely from the flag.
         for slot in &batch[..count] {
             #[cfg(feature = "latency-trace")]
-            if record_this_batch {
-                spsc_hist.record_ns(trace::trace_elapsed_ns(slot.match_complete_ts, consume_ts));
+            spsc_rec.record_elapsed(slot.match_complete_ts, consume_ts);
+
+            #[cfg(feature = "tick-to-trade")]
+            if let Some(ts) = gate_tracker.journal_crossed() {
+                journal_wait_rec.record_elapsed(slot.match_complete_ts, ts);
+            }
+            #[cfg(feature = "tick-to-trade")]
+            if let Some(ts) = gate_tracker.replica_crossed() {
+                replica_wait_rec.record_elapsed(slot.match_complete_ts, ts);
             }
 
             let mut kinds: [ResponseKind; 2] = [ResponseKind::BatchEnd; 2];
@@ -321,6 +341,8 @@ pub fn run(
             }
 
             for kind in &kinds[..kinds_len] {
+                #[cfg(feature = "tick-to-trade")]
+                let encode_start = trace::trace_ts();
                 let written = match codec::encode_response(kind, &mut encode_buf) {
                     Ok(n) => n,
                     Err(e) => {
@@ -332,6 +354,8 @@ pub fn run(
                         continue;
                     }
                 };
+                #[cfg(feature = "tick-to-trade")]
+                encode_rec.record_elapsed(encode_start, trace::trace_ts());
 
                 // Send the complete wire frame (with length prefix) to
                 // the DPDK poll thread for transmission via lock-free
@@ -344,16 +368,14 @@ pub fn run(
                 frame.data[..written].copy_from_slice(&encode_buf[..written]);
                 let tid = (slot.connection_id >> 56) as usize % tx_producers.len();
                 tx_producers[tid].publish(frame);
-            }
 
-            // Server-side end-to-end: NIC arrival (recv_ts on InputSlot,
-            // copied through to OutputSlot) → response handed to the DPDK
-            // poll thread for transmission. Gated on the request terminator
-            // so we record one sample per logical request, matching the
-            // kernel response stage.
-            #[cfg(feature = "latency-trace")]
-            if record_this_batch && slot.is_last_in_request {
-                server_e2e_hist.record_ns(trace::trace_elapsed_ns(slot.recv_ts, trace::trace_ts()));
+                // Server-side end-to-end (DPDK): reader recv → SPSC publish.
+                // The actual NIC TX happens in the DPDK poll thread —
+                // see `dpdk_transport.rs` for a follow-up egress histogram.
+                #[cfg(feature = "latency-trace")]
+                if matches!(kind, ResponseKind::BatchEnd) {
+                    server_e2e_rec.record_elapsed(slot.recv_ts, trace::trace_ts());
+                }
             }
 
             if let Some(state) = connections.get_mut(&slot.connection_id) {
@@ -362,9 +384,7 @@ pub fn run(
         }
 
         #[cfg(feature = "latency-trace")]
-        if record_this_batch {
-            dispatch_hist.record_ns(trace::trace_elapsed_ns(consume_ts, trace::trace_ts()));
-        }
+        dispatch_rec.record_elapsed(consume_ts, trace::trace_ts());
     }
 }
 

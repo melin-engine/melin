@@ -177,6 +177,16 @@ pub fn run_dpdk_poll(
     // state watermark and stays there.
     let mut conn_range_end: usize = 0;
 
+    // Reader-stage histogram. Single sample per published frame
+    // covering recv_ts → batch.push_with completion (decode + auth
+    // dispatch + slot construction + push). DPDK has no separate
+    // publish-call histogram because `batch.push_with` is a slot
+    // assignment in a pre-allocated batch — the work is dominated by
+    // the surrounding decode + dedup, which is what `ingest` measures.
+    #[cfg(feature = "tick-to-trade")]
+    let ingest_rec =
+        melin_journal::trace::register_stage("reader: ingest (recv_ts → publish complete)");
+
     // Pre-allocated parse buffer pool. Avoids heap allocation on accept
     // by recycling buffers from disconnected connections.
     let mut parse_buf_pool: Vec<Vec<u8>> = (0..256)
@@ -544,6 +554,8 @@ pub fn run_dpdk_poll(
                         &control_tx,
                         &mut id_to_handle,
                         *batch_wall_ns.get_or_insert_with(wall_clock_nanos),
+                        #[cfg(feature = "tick-to-trade")]
+                        &ingest_rec,
                     );
                 }
             }
@@ -777,6 +789,7 @@ fn process_trading_frames(
     control_tx: &mpsc::Sender<ControlEvent>,
     id_to_handle: &mut FxHashMap<u64, SocketHandle>,
     batch_wall_ns: u64,
+    #[cfg(feature = "tick-to-trade")] ingest_rec: &melin_journal::trace::StageRecorder,
 ) {
     let mut cursor = 0;
 
@@ -836,6 +849,8 @@ fn process_trading_frames(
                         slot.publish_ts = publish_ts;
                         slot.recv_ts = recv_ts;
                     });
+                    #[cfg(feature = "tick-to-trade")]
+                    ingest_rec.record_elapsed(recv_ts, trace_ts());
                 }
             }
             Err(e) => {

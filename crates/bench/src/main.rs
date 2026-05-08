@@ -33,6 +33,7 @@
 
 mod generator;
 mod health_poller;
+mod stats_client;
 
 #[cfg(feature = "dpdk")]
 mod dpdk;
@@ -703,6 +704,9 @@ fn run_engine_bench(
         json_path,
         &series,
         &[],
+        // Engine mode runs the matching engine in-process with no
+        // server / health endpoint, so there's nothing to fetch.
+        &stats_client::Body::Empty,
     );
 
     // Print the slowest orders for tail latency diagnosis.
@@ -937,6 +941,9 @@ fn run_pipeline_bench(
         json_path,
         &Vec::new(),
         &[],
+        // Pipeline mode runs the disruptor stages in-process with no
+        // server / health endpoint, so there's nothing to fetch.
+        &stats_client::Body::Empty,
     );
 
     println!();
@@ -1721,6 +1728,15 @@ fn run_uring_roundtrip<R, W, F>(
     // Sort time-series by elapsed time for stable plot output.
     all_series.sort_by(|a, b| a.elapsed_secs.partial_cmp(&b.elapsed_secs).unwrap());
 
+    // Fetch the server-side per-stage histogram dump before the
+    // server (or its embedded form) shuts down. Best-effort — a
+    // missing dump never aborts the run; print_results renders an
+    // appropriate "feature off" / "no data" line instead.
+    let server_stages = match health_addr {
+        Some(addr) => stats_client::fetch(addr),
+        None => stats_client::Body::Empty,
+    };
+
     print_results(
         "Roundtrip",
         total_pairs * 2,
@@ -1731,6 +1747,7 @@ fn run_uring_roundtrip<R, W, F>(
         json_path,
         &all_series,
         &health_samples,
+        &server_stages,
     );
 
     println!();
@@ -2043,6 +2060,7 @@ pub(crate) fn print_results(
     json_path: Option<&std::path::Path>,
     series: &[LatencySample],
     health_samples: &[health_poller::HealthSample],
+    server_stages: &stats_client::Body,
 ) {
     let throughput = (measured_orders as f64) / wall.as_secs_f64();
     let wall_ms = wall.as_micros() as f64 / 1000.0;
@@ -2090,6 +2108,12 @@ pub(crate) fn print_results(
         }
         println!("    events processed: {final_events}");
     }
+
+    // Server-side per-stage decomposition (tick-to-trade). Fetched
+    // from the server's /stats-dump endpoint at end of run; only
+    // populated for the roundtrip mode against a server built with
+    // --features latency-trace.
+    stats_client::render_console(server_stages);
 
     // Write JSON results if requested.
     if let Some(path) = json_path {
@@ -2192,8 +2216,10 @@ pub(crate) fn print_results(
             format!("[{}]", entries.join(","))
         };
 
+        let stages_json = stats_client::render_json(server_stages);
+
         let json = format!(
-            "{{\"label\":\"{label}\",\"measured_orders\":{measured_orders},\"warmup_orders\":{warmup_orders},\"wall_ms\":{:.2},\"throughput_ops\":{:.0},\"latency\":{percentiles},\"time_series\":{ts_json},\"health\":{health_json}}}",
+            "{{\"label\":\"{label}\",\"measured_orders\":{measured_orders},\"warmup_orders\":{warmup_orders},\"wall_ms\":{:.2},\"throughput_ops\":{:.0},\"latency\":{percentiles},\"time_series\":{ts_json},\"health\":{health_json},\"server_stages\":{stages_json}}}",
             wall.as_secs_f64() * 1000.0,
             throughput,
         );

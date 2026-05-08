@@ -1408,6 +1408,7 @@ transport_start_dpdk() {
     sleep 1
     ssh $SSH_OPTS "$SERVER" "NO_COLOR=1 RUST_LOG=${BENCH_RUST_LOG} nohup ${DPDK_SERVER_BIN} \
             --bind 0.0.0.0:9876 \
+            --health-bind ${SERVER_VLAN}:9878 \
             --journal ${JOURNAL_PATH} \
             --authorized-keys ${REPO_DIR}/authorized_keys \
             --dpdk-eal-args='${server_eal}' \
@@ -1442,7 +1443,10 @@ transport_start_dpdk() {
     fi
 
     CURRENT_BIND="${SERVER_DPDK_IP}:9876"
-    CURRENT_HEALTH=""  # No health endpoint with DPDK (smoltcp).
+    # Health endpoint uses kernel TCP (separate from DPDK trading port),
+    # so it's reachable from the bench host's kernel side. Required for
+    # the bench's tick-to-trade /stats-dump fetch.
+    CURRENT_HEALTH="${SERVER_VLAN}:9878"
     DPDK_RAN=1
 
     perf_capture_start "dpdk"
@@ -1705,6 +1709,7 @@ workload_throughput() {
         ssh $SSH_OPTS "$BENCH" "cd ${REPO_DIR} && source ~/.cargo/env && \
             ./target/release/melin-bench \
                 --addr ${CURRENT_BIND} \
+                --health-addr ${CURRENT_HEALTH} \
                 --key bench.key \
                 --json /tmp/bench-results.json \
                 ${BENCH_DPDK_ARGS} ${warmup_arg} ${threads_arg} \
@@ -1733,6 +1738,7 @@ workload_single() {
         ssh $SSH_OPTS "$BENCH" "cd ${REPO_DIR} && source ~/.cargo/env && \
             ./target/release/melin-bench \
                 --addr ${CURRENT_BIND} \
+                --health-addr ${CURRENT_HEALTH} \
                 --key bench.key \
                 --json /tmp/bench-results.json \
                 ${BENCH_DPDK_ARGS} ${warmup_arg} \

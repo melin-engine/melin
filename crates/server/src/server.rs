@@ -721,6 +721,10 @@ fn shutdown_pipeline_stages(
         check_join("health", h.join());
     }
 
+    // After every stage thread has joined, dump the per-stage latency
+    // histograms to stderr. No-op when `latency-trace` is disabled.
+    melin_journal::trace::print_report_all();
+
     if thread_panicked || journal_failed {
         error!("shutdown complete (with pipeline failure)");
         return Err("pipeline failure".into());

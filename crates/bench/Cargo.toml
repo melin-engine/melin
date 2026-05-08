@@ -21,7 +21,13 @@ release-tracing = ["melin-server/release-tracing"]
 ## the pipeline without the matching engine.
 noop = ["melin-server/noop"]
 no-persist = ["melin-server/no-persist"]
+## Forward to `melin-server/latency-trace` — lightweight 4-stage
+## histograms only.
 latency-trace = ["melin-server/latency-trace"]
+## Forward to `melin-server/tick-to-trade` — full per-stage
+## decomposition (9+ stages). Implies latency-trace via the server
+## crate's feature graph.
+tick-to-trade = ["melin-server/tick-to-trade"]
 ## Kept for backward compatibility — io_uring is now always used.
 io-uring = []
 ## DPDK userspace TCP transport. Implies `trading` + `release-tracing`

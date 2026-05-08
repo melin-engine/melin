@@ -577,11 +577,12 @@ A response of `tx-udp-segmentation: on` confirms hardware acceleration is active
 
 ### Health/Liveness Endpoint
 
-Dedicated health port (default `127.0.0.1:9878`). Supports three modes:
+Dedicated health port (default `127.0.0.1:9878`). Supports four modes:
 
 1. **Plain TCP** (no data sent): writes a one-line status and closes — backward-compatible with `nc` and Kubernetes TCP probes.
 2. **HTTP `GET /`**: wraps the one-line status in an HTTP 200 response.
 3. **HTTP `GET /metrics`**: returns Prometheus text exposition format with all engine counters.
+4. **HTTP `GET /stats-dump`**: returns the per-stage latency-histogram snapshot used by the bench's tick-to-trade decomposition. Tab-separated values, one record per stage. Body returns `# latency-trace disabled` when the server was built without `--features latency-trace`; servers with `latency-trace` only return the lighter 4-stage set, while `--features tick-to-trade` returns the full 9+ stage decomposition.
 
 No authentication required.
 
@@ -598,6 +599,9 @@ curl http://127.0.0.1:9878/
 
 # Prometheus metrics
 curl http://127.0.0.1:9878/metrics
+
+# Tick-to-trade per-stage histograms (bench-only, requires --features latency-trace)
+curl http://127.0.0.1:9878/stats-dump
 ```
 
 **Plain-text response format**: `OK|ERR <active_connections> <journal_seq> <replication_lag> trading|halted\n`

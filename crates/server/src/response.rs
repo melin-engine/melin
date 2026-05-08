@@ -117,15 +117,38 @@ pub fn run(
     // sources (journal + replication, or replication-only in quorum mode).
     let mut cached_durable_pos: u64 = 0;
 
+    // Stage histograms registered with the global registry — see
+    // `melin_journal::trace`. The four breakdown stages
+    // (journal-wait, replica-wait, encode, egress) feed the bench's
+    // tick-to-trade decomposition; spsc/dispatch/server-e2e are kept
+    // alongside as overall sanity checks.
     #[cfg(feature = "latency-trace")]
-    let mut spsc_hist =
-        trace::StageHistogram::new("response: SPSC wakeup (matching publish → response consume)");
+    let spsc_rec =
+        trace::register_stage("response: SPSC wakeup (matching publish → response consume)");
     #[cfg(feature = "latency-trace")]
-    let mut dispatch_hist =
-        trace::StageHistogram::new("response: dispatch (consume → socket write)");
+    let dispatch_rec = trace::register_stage("response: dispatch (consume → socket write)");
     #[cfg(feature = "latency-trace")]
-    let mut server_e2e_hist =
-        trace::StageHistogram::new("server e2e (reader recv → response flush)");
+    let server_e2e_rec = trace::register_stage("server e2e (reader recv → response flush)");
+    // Tick-to-trade breakdown: per-slot wait observed for each
+    // durability path (recorded only when the gate actually held us
+    // up — cache-hit paths skip to avoid inflating the metric with
+    // crossings that happened before we noticed). Encode is wall-time
+    // around `codec::encode_response`. Egress wraps a `flush_sends`
+    // call (one sample per io_uring flush, batching many slots).
+    // Gated on `tick-to-trade`, not `latency-trace`, because these
+    // stages roughly double the hot-path mutex traffic vs the lighter
+    // 4-stage mode.
+    #[cfg(feature = "tick-to-trade")]
+    let journal_wait_rec =
+        trace::register_stage("response: journal-wait (match_complete → journal cursor crossed)");
+    #[cfg(feature = "tick-to-trade")]
+    let replica_wait_rec = trace::register_stage(
+        "response: replica-wait (match_complete → replication cursor crossed)",
+    );
+    #[cfg(feature = "tick-to-trade")]
+    let encode_rec = trace::register_stage("response: encode (per-kind wire encoding)");
+    #[cfg(feature = "tick-to-trade")]
+    let egress_rec = trace::register_stage("response: egress (flush_sends elapsed)");
 
     // Track connections with buffered (unflushed) writes across batches.
     let mut dirty_connections: HashSet<u64> = HashSet::new();
@@ -169,12 +192,6 @@ pub fn run(
                 );
                 dirty_connections.clear();
             }
-            #[cfg(feature = "latency-trace")]
-            {
-                spsc_hist.print_report();
-                dispatch_hist.print_report();
-                server_e2e_hist.print_report();
-            }
             utilization.busy.store(busy_count, Ordering::Relaxed);
             utilization.idle.store(idle_count, Ordering::Relaxed);
             #[cfg(feature = "pipeline-stats")]
@@ -213,7 +230,12 @@ pub fn run(
         let count = consumer.consume_batch(&mut batch, MAX_BATCH);
         if count == 0 {
             // SPSC is empty — flush all dirty connections via io_uring.
+            // This is the response-data egress path; heartbeat flushes
+            // below aren't sampled because they're admin traffic, not
+            // on the client RTT path.
             if !dirty_connections.is_empty() {
+                #[cfg(feature = "tick-to-trade")]
+                let egress_start = trace::trace_ts();
                 flush_sends(
                     &mut ring,
                     &mut connections,
@@ -221,6 +243,8 @@ pub fn run(
                     &mut to_remove,
                     &mut cqes,
                 );
+                #[cfg(feature = "tick-to-trade")]
+                egress_rec.record_elapsed(egress_start, trace::trace_ts());
                 for conn_id in to_remove.drain(..) {
                     connections.remove(&conn_id);
                 }
@@ -294,6 +318,11 @@ pub fn run(
         //
         // Without quorum (--no-quorum-durability): gate on
         // min(journal_cursor, replication_cursor) as before.
+        // Per-slot journal-wait / replica-wait tracker. See
+        // `GateCrossTracker` for the rationale (only records cursors
+        // that were actually on the critical path).
+        #[cfg(feature = "tick-to-trade")]
+        let mut gate_tracker;
         {
             let max_seq = batch[..count]
                 .iter()
@@ -301,10 +330,17 @@ pub fn run(
                 .max()
                 .expect("non-empty batch");
             let needed = max_seq + 1;
+            #[cfg(feature = "tick-to-trade")]
+            {
+                gate_tracker = GateCrossTracker::new(needed);
+            }
             if cached_durable_pos < needed {
                 loop {
                     let journal_pos = journal_cursor.get().load(Ordering::Acquire);
                     let repl_min = replication_cursor.load(Ordering::Acquire);
+
+                    #[cfg(feature = "tick-to-trade")]
+                    gate_tracker.observe(journal_pos, repl_min, trace::trace_ts());
 
                     cached_durable_pos = durable_pos(
                         journal_pos,
@@ -336,7 +372,25 @@ pub fn run(
 
         for slot in &batch[..count] {
             #[cfg(feature = "latency-trace")]
-            spsc_hist.record_ns(trace::trace_elapsed_ns(slot.match_complete_ts, consume_ts));
+            spsc_rec.record_elapsed(slot.match_complete_ts, consume_ts);
+
+            // Per-slot durability-gate breakdown. Recorded only when
+            // the gate actually held us up (the tracker captured a
+            // cross). Note: the cross timestamp is for the *batch's*
+            // `needed` — for slots earlier in the batch, the cursor
+            // may have crossed their individual `input_seq+1` earlier,
+            // so this systematically overestimates wait for non-last
+            // slots by up to the batch's matching span. Acceptable
+            // noise for the operator-facing breakdown; documented in
+            // `docs/benchmarking.md`.
+            #[cfg(feature = "tick-to-trade")]
+            if let Some(ts) = gate_tracker.journal_crossed() {
+                journal_wait_rec.record_elapsed(slot.match_complete_ts, ts);
+            }
+            #[cfg(feature = "tick-to-trade")]
+            if let Some(ts) = gate_tracker.replica_crossed() {
+                replica_wait_rec.record_elapsed(slot.match_complete_ts, ts);
+            }
 
             // Each slot expands to at most two wire frames: the payload
             // (Report / QueryResponse / EngineError) and an optional
@@ -395,6 +449,8 @@ pub fn run(
             if let Some(entry) = connections.get_mut(&slot.connection_id) {
                 for kind in &kinds[..kinds_len] {
                     // Encode the response (includes 4-byte length prefix).
+                    #[cfg(feature = "tick-to-trade")]
+                    let encode_start = trace::trace_ts();
                     let written = match codec::encode_response(kind, &mut encode_buf) {
                         Ok(n) => n,
                         Err(e) => {
@@ -406,6 +462,8 @@ pub fn run(
                             continue;
                         }
                     };
+                    #[cfg(feature = "tick-to-trade")]
+                    encode_rec.record_elapsed(encode_start, trace::trace_ts());
 
                     // Drop slow clients whose send buffer has grown too large.
                     // This prevents unbounded memory growth from a single laggy
@@ -430,8 +488,7 @@ pub fn run(
                     // Record server-side end-to-end: reader recv → response flush.
                     #[cfg(feature = "latency-trace")]
                     if matches!(kind, ResponseKind::BatchEnd) {
-                        server_e2e_hist
-                            .record_ns(trace::trace_elapsed_ns(slot.recv_ts, trace::trace_ts()));
+                        server_e2e_rec.record_elapsed(slot.recv_ts, trace::trace_ts());
                     }
                 }
             }
@@ -444,7 +501,7 @@ pub fn run(
         }
 
         #[cfg(feature = "latency-trace")]
-        dispatch_hist.record_ns(trace::trace_elapsed_ns(consume_ts, trace::trace_ts()));
+        dispatch_rec.record_elapsed(consume_ts, trace::trace_ts());
     }
 }
 
@@ -605,6 +662,72 @@ pub(crate) fn durable_pos(
     }
 }
 
+/// Tracks per-cursor "first observed transition from below to >= needed"
+/// inside the durability gate loop, to drive the journal-wait /
+/// replica-wait histograms in the bench's tick-to-trade decomposition.
+///
+/// A sample is recorded only for cursors that were strictly below
+/// `needed` at the loop's first observation. Cursors already past at
+/// entry were not on the critical path for this batch, so attributing
+/// "wait time" to them would inflate the metric with cursor-poll
+/// observation timestamps that have nothing to do with how long the
+/// stage actually held us up.
+///
+/// `now_ns` is taken as a parameter rather than read internally so
+/// tests can supply deterministic timestamps. The caller's hot path
+/// reads `trace::trace_ts()` once per gate iteration and feeds it in.
+#[cfg(feature = "tick-to-trade")]
+pub(crate) struct GateCrossTracker {
+    needed: u64,
+    journal_crossed_ts: Option<trace::TraceTimestamp>,
+    replica_crossed_ts: Option<trace::TraceTimestamp>,
+    journal_was_below: bool,
+    replica_was_below: bool,
+    first: bool,
+}
+
+#[cfg(feature = "tick-to-trade")]
+impl GateCrossTracker {
+    pub(crate) fn new(needed: u64) -> Self {
+        Self {
+            needed,
+            journal_crossed_ts: None,
+            replica_crossed_ts: None,
+            journal_was_below: false,
+            replica_was_below: false,
+            first: true,
+        }
+    }
+
+    pub(crate) fn observe(
+        &mut self,
+        journal_pos: u64,
+        repl_min: u64,
+        now_ns: trace::TraceTimestamp,
+    ) {
+        if self.first {
+            self.journal_was_below = journal_pos < self.needed;
+            self.replica_was_below = repl_min < self.needed;
+            self.first = false;
+        }
+        if self.journal_was_below && self.journal_crossed_ts.is_none() && journal_pos >= self.needed
+        {
+            self.journal_crossed_ts = Some(now_ns);
+        }
+        if self.replica_was_below && self.replica_crossed_ts.is_none() && repl_min >= self.needed {
+            self.replica_crossed_ts = Some(now_ns);
+        }
+    }
+
+    pub(crate) fn journal_crossed(&self) -> Option<trace::TraceTimestamp> {
+        self.journal_crossed_ts
+    }
+
+    pub(crate) fn replica_crossed(&self) -> Option<trace::TraceTimestamp> {
+        self.replica_crossed_ts
+    }
+}
+
 /// Print busy/idle utilization for a pipeline stage on shutdown.
 #[cfg(feature = "pipeline-stats")]
 fn print_utilization(stage: &str, busy: u64, idle: u64) {
@@ -626,6 +749,8 @@ fn print_utilization(stage: &str, busy: u64, idle: u64) {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(feature = "tick-to-trade")]
+    use super::GateCrossTracker;
     use super::durable_pos;
 
     // --- Standalone (no replicas) ---
@@ -825,5 +950,89 @@ mod tests {
         // journal_pos (200) > repl_min (50) → replication.
         let (label, _) = simulate_gate(200, 50, 80, true, 80);
         assert_eq!(label, "replication");
+    }
+
+    // ------------------------------------------------------------------
+    // GateCrossTracker — per-cursor "first transition from below to
+    // crossed" inside the gate loop, used by the journal-wait /
+    // replica-wait histograms.
+    // ------------------------------------------------------------------
+
+    #[cfg(feature = "tick-to-trade")]
+    #[test]
+    fn gate_cross_tracker_records_journal_when_strictly_below() {
+        // Journal starts at 5 (< 10), repl_min already at 100.
+        // Journal crosses on the second observation. Replica was already
+        // past at entry, so no replica sample.
+        let mut t = GateCrossTracker::new(10);
+        t.observe(5, 100, 1_000);
+        t.observe(15, 100, 2_000);
+        assert_eq!(t.journal_crossed(), Some(2_000));
+        assert_eq!(t.replica_crossed(), None);
+    }
+
+    #[cfg(feature = "tick-to-trade")]
+    #[test]
+    fn gate_cross_tracker_records_replica_when_strictly_below() {
+        // Mirror image: journal already past, replica below at entry.
+        let mut t = GateCrossTracker::new(10);
+        t.observe(50, 5, 1_000);
+        t.observe(50, 12, 2_000);
+        assert_eq!(t.journal_crossed(), None);
+        assert_eq!(t.replica_crossed(), Some(2_000));
+    }
+
+    #[cfg(feature = "tick-to-trade")]
+    #[test]
+    fn gate_cross_tracker_records_both_when_both_below() {
+        // Both below at entry, both cross independently.
+        let mut t = GateCrossTracker::new(100);
+        t.observe(50, 60, 1_000); // both below
+        t.observe(105, 60, 2_000); // journal crosses
+        t.observe(105, 110, 3_000); // replica crosses
+        assert_eq!(t.journal_crossed(), Some(2_000));
+        assert_eq!(t.replica_crossed(), Some(3_000));
+    }
+
+    #[cfg(feature = "tick-to-trade")]
+    #[test]
+    fn gate_cross_tracker_skips_cursor_already_past_at_entry() {
+        // Both cursors already >= needed at first observation —
+        // neither was on the critical path. No samples.
+        let mut t = GateCrossTracker::new(10);
+        t.observe(50, 100, 1_000);
+        // Even later observations don't backfill: was_below is sticky.
+        t.observe(60, 110, 2_000);
+        assert_eq!(t.journal_crossed(), None);
+        assert_eq!(t.replica_crossed(), None);
+    }
+
+    #[cfg(feature = "tick-to-trade")]
+    #[test]
+    fn gate_cross_tracker_first_observation_only_for_cross_decision() {
+        // A cursor that goes back below `needed` after first iteration
+        // (impossible in practice — cursors are monotonic — but we
+        // verify the first-iteration snapshot is what gates the
+        // sample). Journal: 50 < 10 false → was_below=false → no sample.
+        let mut t = GateCrossTracker::new(10);
+        t.observe(50, 5, 1_000); // journal already past, replica below
+        t.observe(20, 12, 2_000); // both >= needed now
+        // Journal: was_below=false at entry → still no sample.
+        assert_eq!(t.journal_crossed(), None);
+        // Replica: was_below=true at entry, crosses on iter 2 → sample.
+        assert_eq!(t.replica_crossed(), Some(2_000));
+    }
+
+    #[cfg(feature = "tick-to-trade")]
+    #[test]
+    fn gate_cross_tracker_holds_first_cross_only() {
+        // Once a cross is recorded, later observations don't
+        // overwrite — the metric is "when did it first cross", not
+        // "when was it last below".
+        let mut t = GateCrossTracker::new(10);
+        t.observe(5, 100, 1_000);
+        t.observe(15, 100, 2_000); // first cross
+        t.observe(25, 100, 3_000); // would otherwise re-record
+        assert_eq!(t.journal_crossed(), Some(2_000));
     }
 }

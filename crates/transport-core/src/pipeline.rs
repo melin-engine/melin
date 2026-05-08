@@ -461,13 +461,19 @@ impl<E: AppEvent> JournalStage<E> {
         let mut busy_count: u64 = 0;
         let mut idle_count: u64 = 0;
 
+        // Stage histograms registered with the process-global stats
+        // registry. Lock cost is irrelevant — `latency-trace` builds
+        // are dev/bench only. The registry owns the histogram via Arc;
+        // the server's shutdown path calls `trace::print_report_all`
+        // after all stage threads join, so dev runs still see the
+        // stderr breakdown.
         #[cfg(feature = "latency-trace")]
-        let mut wakeup_hist = melin_journal::trace::StageHistogram::new(
+        let wakeup_rec = melin_journal::trace::register_stage(
             "journal: disruptor wakeup (publish → journal consume)",
         );
         #[cfg(feature = "latency-trace")]
-        let mut batch_hist =
-            melin_journal::trace::StageHistogram::new("journal: batch processing (write + sync)");
+        let batch_rec =
+            melin_journal::trace::register_stage("journal: batch processing (write + sync)");
 
         loop {
             if shutdown.load(std::sync::atomic::Ordering::Relaxed) {
@@ -480,11 +486,6 @@ impl<E: AppEvent> JournalStage<E> {
                     self.consumer.commit(pending);
                 }
                 self.drain_remaining(&mut batch);
-                #[cfg(feature = "latency-trace")]
-                {
-                    wakeup_hist.print_report();
-                    batch_hist.print_report();
-                }
                 self.utilization.busy.store(busy_count, Ordering::Relaxed);
                 self.utilization.idle.store(idle_count, Ordering::Relaxed);
                 #[cfg(feature = "pipeline-stats")]
@@ -516,23 +517,9 @@ impl<E: AppEvent> JournalStage<E> {
                 #[cfg(feature = "latency-trace")]
                 let batch_start = trace_ts();
 
-                // Skip latency-trace records on the final batch (shutdown
-                // observed externally OR sentinel present): the producer
-                // may have queued slots over a quiet period that ends at
-                // shutdown, inflating wakeup samples for percentiles
-                // without saying anything about steady-state behaviour.
                 #[cfg(feature = "latency-trace")]
-                let record_this_batch = !shutdown.load(std::sync::atomic::Ordering::Relaxed)
-                    && !batch[..count].iter().any(|s| s.event.is_shutdown());
-
-                #[cfg(feature = "latency-trace")]
-                if record_this_batch {
-                    for slot in &batch[..count] {
-                        wakeup_hist.record_ns(melin_journal::trace::trace_elapsed_ns(
-                            slot.publish_ts,
-                            batch_start,
-                        ));
-                    }
+                for slot in &batch[..count] {
+                    wakeup_rec.record_elapsed(slot.publish_ts, batch_start);
                 }
 
                 // Batch-encode all events into the writer's internal buffer.
@@ -605,12 +592,7 @@ impl<E: AppEvent> JournalStage<E> {
                 }
 
                 #[cfg(feature = "latency-trace")]
-                if record_this_batch {
-                    batch_hist.record_ns(melin_journal::trace::trace_elapsed_ns(
-                        batch_start,
-                        trace_ts(),
-                    ));
-                }
+                batch_rec.record_elapsed(batch_start, trace_ts());
             }
 
             // Sync when: we have data AND (batch full OR delay expired OR no delay).
@@ -1400,13 +1382,16 @@ impl<A: Application> MatchingStage<A> {
         let mut busy_count: u64 = 0;
         let mut idle_count: u64 = 0;
 
+        // Histograms via the global stats registry — see the journal
+        // stage for the rationale. The registry owns the histograms;
+        // the server prints them via `trace::print_report_all` once
+        // all stage threads have joined.
         #[cfg(feature = "latency-trace")]
-        let mut wakeup_hist = melin_journal::trace::StageHistogram::new(
+        let wakeup_rec = melin_journal::trace::register_stage(
             "matching: disruptor wakeup (publish → matching consume)",
         );
         #[cfg(feature = "latency-trace")]
-        let mut execute_hist =
-            melin_journal::trace::StageHistogram::new("matching: execute (process_event)");
+        let execute_rec = melin_journal::trace::register_stage("matching: execute (process_event)");
 
         loop {
             if shutdown.load(std::sync::atomic::Ordering::Relaxed) {
@@ -1416,11 +1401,6 @@ impl<A: Application> MatchingStage<A> {
                 self.events_processed.store(local_events, Ordering::Relaxed);
                 self.utilization.busy.store(busy_count, Ordering::Relaxed);
                 self.utilization.idle.store(idle_count, Ordering::Relaxed);
-                #[cfg(feature = "latency-trace")]
-                {
-                    wakeup_hist.print_report();
-                    execute_hist.print_report();
-                }
                 #[cfg(feature = "pipeline-stats")]
                 print_utilization("matching", busy_count, idle_count);
                 return self.app;
@@ -1481,15 +1461,6 @@ impl<A: Application> MatchingStage<A> {
             // matching → response cursor by up to MAX_MATCHING_BATCH×.
             let mut out_batch = self.output.batch();
 
-            // Skip latency-trace records on the final batch — see the
-            // gate in the journal stage above for the rationale.
-            #[cfg(feature = "latency-trace")]
-            let record_this_batch = !shutdown.load(std::sync::atomic::Ordering::Relaxed)
-                && !slots_a
-                    .iter()
-                    .chain(slots_b.iter())
-                    .any(|s| s.event.is_shutdown());
-
             for (i, slot) in slots_a.iter().chain(slots_b.iter()).enumerate() {
                 if slot.event.is_shutdown() {
                     // Sentinel — every event the producer published before
@@ -1502,11 +1473,7 @@ impl<A: Application> MatchingStage<A> {
                 busy_count += 1;
 
                 #[cfg(feature = "latency-trace")]
-                if record_this_batch {
-                    let now = trace_ts();
-                    wakeup_hist
-                        .record_ns(melin_journal::trace::trace_elapsed_ns(slot.publish_ts, now));
-                }
+                wakeup_rec.record_elapsed(slot.publish_ts, trace_ts());
 
                 reports.clear();
                 let mut query_report: Option<A::QueryResponse> = None;
@@ -1568,10 +1535,8 @@ impl<A: Application> MatchingStage<A> {
                 }
 
                 #[cfg(feature = "latency-trace")]
-                let exec_end = trace_ts();
-
-                #[cfg(feature = "latency-trace")]
                 {
+                    let exec_end = trace_ts();
                     let elapsed_ns = melin_journal::trace::trace_elapsed_ns(exec_start, exec_end);
                     // Outlier log: any execute > 1 ms is well into pathological
                     // territory for a path whose p50 is ~200 ns. Capture the
@@ -1596,9 +1561,7 @@ impl<A: Application> MatchingStage<A> {
                             "matching execute outlier"
                         );
                     }
-                    if record_this_batch {
-                        execute_hist.record_ns(elapsed_ns);
-                    }
+                    execute_rec.record_ns(elapsed_ns);
                 }
 
                 #[allow(clippy::let_unit_value)] // ZST when latency-trace is disabled
@@ -1681,11 +1644,6 @@ impl<A: Application> MatchingStage<A> {
                 // utilization counters and exit.
                 self.utilization.busy.store(busy_count, Ordering::Relaxed);
                 self.utilization.idle.store(idle_count, Ordering::Relaxed);
-                #[cfg(feature = "latency-trace")]
-                {
-                    wakeup_hist.print_report();
-                    execute_hist.print_report();
-                }
                 #[cfg(feature = "pipeline-stats")]
                 print_utilization("matching", busy_count, idle_count);
                 return self.app;

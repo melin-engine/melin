@@ -140,6 +140,85 @@ With large enough sample sizes, percentiles are reported to p99.99999 and beyond
 
 With `--json <path>`, results are written as a JSON object with throughput, order counts, and all computed percentiles. Designed for building saturation curves by sweeping `--clients` and `--window` across multiple runs.
 
+The JSON also includes `server_stages` populated by the tick-to-trade decomposition (next section). When the server is built without `--features latency-trace`, the field renders as `{"state": "disabled", "entries": []}` so downstream tooling can detect the unsupported configuration without a separate request.
+
+## Tick-to-Trade Decomposition
+
+The bench's full client-to-client round-trip percentiles answer "how long did one order take, end to end?" but not "where did that time go?". Exchange RFPs and serious diligence conversations typically ask for the latency profile decomposed into per-stage components: NIC ingress → parse → match → durability gate → encode → NIC egress.
+
+Roundtrip mode collects this decomposition automatically when both ends are built with the `tick-to-trade` Cargo feature, by:
+
+1. Server-side: each pipeline stage records nanosecond samples into a global `StatsRegistry` (one HDR histogram per stage). Production builds compile the entire path to ZSTs and inlined no-ops, so this is dev/bench only.
+2. Bench-side: at end of run, the bench fetches `GET /stats-dump` from the server's health endpoint, parses the tab-separated body, and prints a `Server-side Per-Stage Latency` section under the per-order RTT histogram. The same data appears in the `--json` output as `server_stages.entries[]`.
+
+### Two feature flags, two cost levels
+
+The instrumentation is split across two opt-in flags, both off by default:
+
+| Feature | Stages recorded | Per-event cost |
+|---|---|---|
+| `latency-trace` | 4 stages — journal/matching wakeup + execute, journal batch, plus reader publish, response SPSC wakeup, response dispatch, server e2e | ~3–5 mutex acquisitions (~100 ns / event at 4 M ops/s) |
+| `tick-to-trade` (implies `latency-trace`) | adds 5 commercial-grade stages — reader: ingest, response: journal-wait, replica-wait, encode, egress | ~5 more mutex acquisitions on top (~200 ns / event total) |
+
+`latency-trace` is the lighter mode for narrow stage-level debugging. `tick-to-trade` is the full decomposition for headline-quality bench artifacts, at roughly double the hot-path mutex traffic. Production builds (default features) carry zero overhead either way.
+
+### Stages reported
+
+| Stage | What it measures |
+|---|---|
+| `reader: ingest (recv_ts → publish complete)` | Full reader cost per frame: parse + auth/dedup + slot construction + ring publish |
+| `reader: publish (decode → disruptor publish)` | Just the ring publish call, isolated as a sub-measurement of ingest |
+| `journal: disruptor wakeup (publish → journal consume)` | Time between the reader publishing a slot and the journal stage consuming it |
+| `journal: batch processing (write + sync)` | One sample per fsync batch — write encoding + io_uring submission + completion |
+| `matching: disruptor wakeup (publish → matching consume)` | Reader-publish-to-matching-consume on the parallel matching consumer |
+| `matching: execute (process_event)` | Matching engine cost for one event |
+| `response: SPSC wakeup (matching publish → response consume)` | Matching-to-response output ring delivery time |
+| `response: journal-wait (match_complete → journal cursor crossed)` | How long the journal cursor held up the response gate. Only sampled when the journal was actually on the critical path for that batch |
+| `response: replica-wait (match_complete → replication cursor crossed)` | Same, for the replication cursor |
+| `response: encode (per-kind wire encoding)` | One sample per outbound `ResponseKind` |
+| `response: egress (flush_sends elapsed)` | One sample per io_uring SEND batch (TCP only — the DPDK egress lives in the poll thread and is a follow-up) |
+| `response: dispatch (consume → socket write)` | Whole-batch dispatch time, kept as an overall sanity check |
+| `server e2e (reader recv → response flush)` | Reader-to-egress server-side full path, kept as a sanity check |
+
+Per-cursor wait samples (journal-wait / replica-wait) are recorded only when the cursor was strictly below `needed` at the gate loop's first iteration — so a cursor already past at entry doesn't get attributed wait time it didn't cause. See the `GateCrossTracker` doc-comment in `crates/server/src/response.rs` for the rationale and the per-slot caveat (cross timestamp is captured for the *batch's* `needed`, slightly overestimating wait for non-last slots).
+
+### Measurement window
+
+Server-side stage histograms accumulate from server start, including the seed-data drain (~10k bootstrap events) and the bench's warmup phase. The bench-side per-order RTT histogram, by contrast, only includes the measured period after warmup.
+
+For long bench runs (millions of orders, multi-second measured period) the warmup phase is a negligible fraction of the totals and the percentiles are dominated by steady-state samples. For short runs (a few thousand measured orders, sub-second measured period) the warmup spike on stages like `matching: disruptor wakeup` can dominate the p99 and above — the seed-drain queues many events at once, producing wakeup samples in the hundreds of milliseconds.
+
+Two ways to interpret the numbers:
+
+- **For "where is the bottleneck?"** — read p50 of the lightweight stages (`reader: ingest`, `response: encode`, `response: egress`). These are dominated by per-event work, so warmup tail noise has minimal effect on the median.
+- **For "p99/p99.9 of each stage in the measured period"** — use long bench runs. The warmup samples become a vanishing fraction of the percentile mass.
+
+A future enhancement would expose a `/stats-reset` endpoint so the bench can clear histograms at the warmup→measured boundary; tracked separately.
+
+### Software vs hardware NIC timestamps
+
+`recv_ts` is captured in the reader thread *after* the kernel returns the bytes — a software approximation of NIC ingress, not a hardware timestamp. True NIC HW timestamping needs `SO_TIMESTAMPING` (kernel) or rte_mbuf timestamps with PHC support (DPDK), and is queued as a follow-up. For the typical use case (comparing transport options, identifying the bottleneck stage), the software approximation is within sub-µs of the true HW arrival time on loopback or LAN with a quiet NIC, and well below the metric resolution.
+
+### Building and running
+
+```sh
+# Both server and bench built with `tick-to-trade` for the full
+# decomposition. The flag implies `latency-trace`, so this also
+# enables the lighter 4-stage histograms.
+cargo build --release -p melin-server --features tick-to-trade
+cargo build --release -p melin-bench  --features tick-to-trade
+
+# Roundtrip benchmark — decomposition appears under the latency table.
+# Use 1M+ orders so warmup phase doesn't dominate the percentiles
+# (see "Measurement window" below).
+./target/release/melin-bench --mode=roundtrip --clients=8 --window=64 1000000
+
+# Or fetch the dump directly without running the bench.
+curl http://127.0.0.1:9878/stats-dump
+```
+
+When the server is built without `tick-to-trade`, the bench prints a one-line note pointing at the feature flag rather than failing — `latency-trace`-only servers still return the lighter 4-stage dump but won't include the journal-wait / replica-wait / encode / egress / reader-ingest stages.
+
 ## Pipelining
 
 The `--window` flag controls how many requests each client keeps in flight simultaneously without waiting for responses. This is the key parameter for saturating the server pipeline.

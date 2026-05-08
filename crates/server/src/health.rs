@@ -427,6 +427,10 @@ enum RequestKind {
     HttpHealth,
     /// HTTP GET /metrics — serve Prometheus text exposition format.
     Metrics,
+    /// HTTP GET /stats-dump — serve the bench's tick-to-trade per-stage
+    /// histogram dump from the latency-trace registry. Empty body when
+    /// the server was built without `--features latency-trace`.
+    StatsDump,
 }
 
 /// Peek at the first bytes to detect HTTP vs plain TCP.
@@ -461,8 +465,15 @@ fn detect_request(stream: &mut TcpStream) -> RequestKind {
     };
 
     let data = &buf[..n];
+    // Prefix matches use 6 bytes (`GET /` + 1 path byte) so that a
+    // short non-blocking read still classifies correctly. `/m` and
+    // `/s` are the only documented two paths beyond `/`; an
+    // undocumented path beginning with `m` or `s` would be
+    // misclassified, but no other paths are exposed.
     let kind = if data.starts_with(b"GET /m") {
         RequestKind::Metrics
+    } else if data.starts_with(b"GET /s") {
+        RequestKind::StatsDump
     } else if data.starts_with(b"GET /") {
         RequestKind::HttpHealth
     } else {
@@ -483,6 +494,55 @@ fn detect_request(stream: &mut TcpStream) -> RequestKind {
     }
 
     kind
+}
+
+/// Write the latency-trace stage histograms into `buf` as one
+/// tab-separated record per non-empty stage. Returns bytes written.
+///
+/// Format (one line per stage, '\n'-terminated):
+///
+///   stage\t<name>\t<samples>\t<min_ns>\t<p50_ns>\t<p90_ns>\t<p99_ns>\t<p99_9_ns>\t<max_ns>
+///
+/// Tab as the field delimiter so stage names containing spaces / colons
+/// / parens parse unambiguously. The bench (phase 3) parses this and
+/// merges with its own RTT histograms for the tick-to-trade table.
+///
+/// When `latency-trace` is disabled the body is a single comment line
+/// so the bench can detect the unsupported state without a different
+/// HTTP status code.
+fn write_stats_dump(buf: &mut [u8]) -> usize {
+    let mut c = Cursor::new(buf);
+
+    #[cfg(feature = "latency-trace")]
+    {
+        let snaps = melin_journal::trace::global_registry().snapshot_all();
+        if snaps.is_empty() {
+            // Feature on but no samples yet — explicit empty marker so
+            // the bench doesn't confuse it with a feature-off server.
+            let _ = writeln!(c, "# no samples");
+        } else {
+            for s in snaps {
+                let _ = writeln!(
+                    c,
+                    "stage\t{name}\t{samples}\t{min}\t{p50}\t{p90}\t{p99}\t{p99_9}\t{max}",
+                    name = s.name,
+                    samples = s.samples,
+                    min = s.min_ns,
+                    p50 = s.p50_ns,
+                    p90 = s.p90_ns,
+                    p99 = s.p99_ns,
+                    p99_9 = s.p99_9_ns,
+                    max = s.max_ns,
+                );
+            }
+        }
+    }
+    #[cfg(not(feature = "latency-trace"))]
+    {
+        let _ = writeln!(c, "# latency-trace disabled");
+    }
+
+    c.position() as usize
 }
 
 /// Write HTTP header + body into `buf`. Returns total bytes written.
@@ -533,13 +593,16 @@ fn handle_health_connection(mut stream: TcpStream, state: &HealthState) {
 
     let kind = detect_request(&mut stream);
 
-    // Stack buffers — sized for worst case (all u64::MAX values).
-    // Body: Prometheus body is ~3.5 KiB with max-length u64 values
-    // (includes per-replica replication metrics, ring depth, and the
-    // fastest-replica cursor).
-    // Response: body + HTTP headers (~200 bytes).
-    let mut body_buf = [0u8; 5120];
-    let mut resp_buf = [0u8; 5376];
+    // Stack buffers — sized for the largest body we serve.
+    // - Prometheus body is ~3.5 KiB with max-length u64 values
+    //   (includes per-replica replication metrics, ring depth, and
+    //   the fastest-replica cursor).
+    // - StatsDump body is ~260 bytes per registered stage; current
+    //   set is 9–13 stages (transport-dependent) for ~3.5 KiB tops.
+    //   8 KiB gives headroom for future stages without resizing.
+    // Response = body + HTTP headers (~200 bytes).
+    let mut body_buf = [0u8; 8192];
+    let mut resp_buf = [0u8; 8448];
 
     let resp_len = match kind {
         RequestKind::Metrics => {
@@ -555,6 +618,14 @@ fn handle_health_connection(mut stream: TcpStream, state: &HealthState) {
             write_http(
                 &mut resp_buf,
                 "text/plain; charset=utf-8",
+                &body_buf[..body_len],
+            )
+        }
+        RequestKind::StatsDump => {
+            let body_len = write_stats_dump(&mut body_buf);
+            write_http(
+                &mut resp_buf,
+                "text/tab-separated-values; charset=utf-8",
                 &body_buf[..body_len],
             )
         }
@@ -1161,6 +1232,136 @@ mod tests {
         assert!(
             response.contains("melin_fastest_replica_cursor 0\n"),
             "expected sentinel mapped to 0, got: {response}"
+        );
+
+        shutdown.store(true, Ordering::Relaxed);
+        handle.join().unwrap();
+    }
+
+    // ------------------------------------------------------------------
+    // STATS-DUMP — bench tick-to-trade per-stage histogram dump.
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn stats_dump_returns_http_with_tsv_content_type() {
+        let (addr, _events, _healthy, shutdown, handle) = start_health(0, 0, u64::MAX);
+
+        let response = http_request(addr, "GET /stats-dump HTTP/1.1\r\n\r\n");
+
+        assert!(
+            response.starts_with("HTTP/1.1 200 OK\r\n"),
+            "expected HTTP 200, got: {response}"
+        );
+        assert!(
+            response.contains("Content-Type: text/tab-separated-values"),
+            "expected tab-separated-values content type, got: {response}"
+        );
+
+        shutdown.store(true, Ordering::Relaxed);
+        handle.join().unwrap();
+    }
+
+    #[cfg(not(feature = "latency-trace"))]
+    #[test]
+    fn stats_dump_body_when_latency_trace_disabled() {
+        // Without the feature, the body is a single comment line so
+        // the bench can detect the unsupported state.
+        let (addr, _events, _healthy, shutdown, handle) = start_health(0, 0, u64::MAX);
+
+        let response = http_request(addr, "GET /stats-dump HTTP/1.1\r\n\r\n");
+
+        assert!(
+            response.contains("# latency-trace disabled"),
+            "expected feature-disabled marker, got: {response}"
+        );
+
+        shutdown.store(true, Ordering::Relaxed);
+        handle.join().unwrap();
+    }
+
+    #[cfg(feature = "latency-trace")]
+    #[test]
+    fn stats_dump_body_emits_registered_stages() {
+        // Register a stage with deterministic samples and verify the
+        // dump contains a tab-separated record for it.
+        // The global registry is shared across tests; we use a unique
+        // stage name to avoid collisions with concurrent test runs.
+        let rec = melin_journal::trace::register_stage("test::stats_dump_emit_marker");
+        rec.record_ns(1_500);
+        rec.record_ns(2_500);
+        rec.record_ns(3_500);
+
+        let (addr, _events, _healthy, shutdown, handle) = start_health(0, 0, u64::MAX);
+        let response = http_request(addr, "GET /stats-dump HTTP/1.1\r\n\r\n");
+
+        // Body lines look like:
+        //   stage\t<name>\t<samples>\t<min>\t<p50>\t<p90>\t<p99>\t<p99_9>\t<max>
+        assert!(
+            response.contains("stage\ttest::stats_dump_emit_marker\t3\t"),
+            "expected stage record with 3 samples, got: {response}"
+        );
+
+        shutdown.store(true, Ordering::Relaxed);
+        handle.join().unwrap();
+    }
+
+    #[cfg(feature = "latency-trace")]
+    #[test]
+    fn stats_dump_body_line_format() {
+        // Pin the wire contract that phase 3's bench parser will rely
+        // on: every non-comment body line is exactly 9 tab-separated
+        // fields — `stage`, name, then 7 numeric percentile fields.
+        let rec = melin_journal::trace::register_stage("test::stats_dump_line_format_marker");
+        rec.record_ns(1_000);
+        rec.record_ns(2_000);
+        rec.record_ns(3_000);
+
+        let (addr, _events, _healthy, shutdown, handle) = start_health(0, 0, u64::MAX);
+        let response = http_request(addr, "GET /stats-dump HTTP/1.1\r\n\r\n");
+
+        // Strip HTTP head, find our marker line.
+        let body = response
+            .split("\r\n\r\n")
+            .nth(1)
+            .expect("body separated by blank line");
+        let line = body
+            .lines()
+            .find(|l| l.contains("test::stats_dump_line_format_marker"))
+            .unwrap_or_else(|| panic!("marker line missing in body: {body}"));
+
+        let fields: Vec<&str> = line.split('\t').collect();
+        assert_eq!(
+            fields.len(),
+            9,
+            "expected 9 tab-separated fields, got {}: {fields:?}",
+            fields.len(),
+        );
+        assert_eq!(fields[0], "stage");
+        assert_eq!(fields[1], "test::stats_dump_line_format_marker");
+        assert_eq!(fields[2], "3");
+        // Fields 3..9 are min/p50/p90/p99/p99_9/max — must parse as u64.
+        for (i, f) in fields.iter().enumerate().skip(2) {
+            f.parse::<u64>()
+                .unwrap_or_else(|_| panic!("field {i} not a u64: {f:?}"));
+        }
+
+        shutdown.store(true, Ordering::Relaxed);
+        handle.join().unwrap();
+    }
+
+    #[cfg(feature = "latency-trace")]
+    #[test]
+    fn stats_dump_body_skips_empty_stages() {
+        // A stage with no samples must not appear in the dump.
+        let _empty = melin_journal::trace::register_stage("test::stats_dump_empty_stage_marker");
+        // No record_ns calls.
+
+        let (addr, _events, _healthy, shutdown, handle) = start_health(0, 0, u64::MAX);
+        let response = http_request(addr, "GET /stats-dump HTTP/1.1\r\n\r\n");
+
+        assert!(
+            !response.contains("test::stats_dump_empty_stage_marker"),
+            "empty stage leaked into dump: {response}"
         );
 
         shutdown.store(true, Ordering::Relaxed);

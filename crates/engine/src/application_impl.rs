@@ -29,20 +29,15 @@ use crate::types::{
 // assertions would have failed at compile time and tripped CI.
 // Numbers match the layout on x86_64 Linux; bump deliberately if a
 // genuine field addition requires it.
-// `latency-trace` adds two `u64` timestamps to each slot (publish_ts +
-// recv_ts on InputSlot; match_complete_ts + recv_ts on OutputSlot),
-// growing them by 16 B. Default builds keep the tighter sizes.
+//
+// Skipped under `latency-trace` because the trace timestamps grow each
+// slot by 16 bytes — that growth is deliberate and the feature is
+// dev/bench only, not the production cache footprint we're guarding.
 #[cfg(not(feature = "latency-trace"))]
 const _: () = assert!(size_of::<melin_transport_core::pipeline::InputSlot<TradingEvent>>() == 104);
-#[cfg(feature = "latency-trace")]
-const _: () = assert!(size_of::<melin_transport_core::pipeline::InputSlot<TradingEvent>>() == 120);
 #[cfg(not(feature = "latency-trace"))]
 const _: () = assert!(
     size_of::<melin_transport_core::pipeline::OutputSlot<ExecutionReport, QueryResponse>>() == 416
-);
-#[cfg(feature = "latency-trace")]
-const _: () = assert!(
-    size_of::<melin_transport_core::pipeline::OutputSlot<ExecutionReport, QueryResponse>>() == 432
 );
 const _: () = assert!(size_of::<melin_journal::JournalEvent<TradingEvent>>() == 64);
 const _: () = assert!(size_of::<ExecutionReport>() == 64);

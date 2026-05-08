@@ -734,6 +734,14 @@ pub fn run_dpdk_roundtrip(
         report("bench poll: device.flush_tx()", &flush_tx_hist);
     }
 
+    // Fetch the server-side per-stage histogram dump before the
+    // server shuts down. Best-effort; missing data is rendered as a
+    // one-line note in print_results.
+    let server_stages = match health_addr {
+        Some(addr) => crate::stats_client::fetch(addr),
+        None => crate::stats_client::Body::Empty,
+    };
+
     print_results(
         "Roundtrip",
         total_pairs * 2,
@@ -744,6 +752,7 @@ pub fn run_dpdk_roundtrip(
         json_path,
         &series,
         &health_poller.map(|p| p.stop()).unwrap_or_default(),
+        &server_stages,
     );
 }
 

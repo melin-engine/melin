@@ -23,11 +23,24 @@ release-tracing = ["tracing/max_level_info"]
 trading = ["dep:melin-engine", "dep:melin-market-data"]
 noop = ["dep:melin-noop", "hash-chain", "release-tracing"]
 no-persist = ["melin-engine?/no-persist", "melin-transport-core/no-persist"]
+## Lightweight per-stage histograms for the original 4 stages
+## (journal/matching wakeup + execute, journal batch). Adds ~3-5 mutex
+## locks per event on the hot path; appropriate for narrow debugging
+## ("is the journal stage slow?"). Production builds must leave this
+## off — slot sizes grow by 16 bytes per InputSlot/OutputSlot to carry
+## the trace timestamps.
 latency-trace = [
     "melin-engine?/latency-trace",
     "melin-transport-core/latency-trace",
     "melin-protocol/latency-trace",
 ]
+## Full tick-to-trade decomposition: adds 5 commercial-grade stages
+## on top of latency-trace (reader: ingest, response: journal-wait,
+## replica-wait, encode, egress) plus the GateCrossTracker. Roughly
+## doubles the hot-path mutex traffic vs latency-trace alone, so opt
+## into it explicitly when you want the breakdown — bench-side runs
+## that produce the README-style decomposition table need this flag.
+tick-to-trade = ["latency-trace"]
 ## Kept for backward compatibility — io_uring is now always used.
 io-uring = []
 dpdk = ["dep:melin-dpdk", "melin-dpdk/dpdk-sys"]
