@@ -148,6 +148,37 @@ impl Exchange {
         }
     }
 
+    /// Create an Exchange pre-sized for a known bulk-seed workload.
+    ///
+    /// `num_accounts` and `num_instruments` are the seed counts. Each
+    /// `ProvisionAccount` event creates 2 balance entries per instrument
+    /// (base + quote), so the AccountManager's balance HashMap is sized
+    /// to `num_accounts × num_instruments × 2`. Without this, seeding
+    /// 100K accounts × 100 instruments hits multi-hundred-ms rehash
+    /// stalls as the map grows — visible in T1's seed-phase outlier
+    /// log as `matching execute outlier elapsed_us=1146403` near the
+    /// end of the seed phase.
+    ///
+    /// Falls back to [`Self::with_capacity`]'s production defaults for
+    /// the other collections (instruments, live_order_ids, order_counts).
+    pub fn with_seed_capacity(num_accounts: usize, num_instruments: usize) -> Self {
+        let balance_capacity = num_accounts
+            .saturating_mul(num_instruments)
+            .saturating_mul(2);
+        Self {
+            instruments: Vec::with_capacity(num_instruments.max(64)),
+            accounts: AccountManager::with_balance_capacity(balance_capacity),
+            live_order_ids: HashMap4::with_capacity_and_hasher(1_000_000, Default::default()),
+            order_counts: HashMap4::with_capacity_and_hasher(
+                num_accounts.max(1_000_000),
+                Default::default(),
+            ),
+            key_hwm: HashMap::default(),
+            scheduled_tasks: ScheduledTaskHeap::new(),
+            presized: true,
+        }
+    }
+
     /// Reconstruct from pre-built parts (used by snapshot restore).
     pub(crate) fn from_parts(
         instruments: Vec<Option<Box<InstrumentState>>>,

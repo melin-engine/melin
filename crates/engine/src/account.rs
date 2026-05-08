@@ -134,6 +134,21 @@ impl AccountManager {
         }
     }
 
+    /// Create an AccountManager with the balances HashMap pre-sized for a
+    /// known bulk-seed workload. `balance_capacity` should be the expected
+    /// total number of `(account, currency)` pairs after seeding completes
+    /// — typically `num_accounts × num_instruments × 2` for the bench
+    /// `ProvisionAccount` flow which deposits both base and quote per
+    /// instrument. Pre-sizing eliminates the multi-hundred-ms rehash
+    /// stalls that otherwise show up in seed-phase outliers.
+    pub fn with_balance_capacity(balance_capacity: usize) -> Self {
+        Self {
+            balances: HashMap4::with_capacity_and_hasher(balance_capacity, Default::default()),
+            reservation_slab: Vec::with_capacity(2_000_000),
+            free_slots: Vec::with_capacity(2_000_000),
+        }
+    }
+
     /// Touch all pre-allocated pages so page faults happen at startup,
     /// not on the hot path. Pre-fills the slab with dummy reservations and
     /// builds the free list in reverse order (so slot 0 is allocated first).
@@ -149,10 +164,14 @@ impl AccountManager {
                 self.free_slots.push(i as u32);
             }
         }
-        // Balances HashMap: pages are faulted on deposit (admin path).
-        // No prefault needed — the HashMap grows organically and never
-        // causes a hot-path resize spike (only deposits/withdrawals
-        // insert/remove entries).
+        // Balances HashMap: pre-sizing via `with_balance_capacity`
+        // eliminates the directory-doubling rehash spikes during bulk
+        // seed (T1's >1 s outliers near the end of a 100K-account seed).
+        // Page faults still happen lazily on first-touch — that cost is
+        // spread per-insert rather than concentrated in rehash bursts,
+        // so it no longer shows up as a discrete tail event. A future
+        // change could prefault the balance pages too if we want to
+        // shave seed wall time further.
     }
 
     /// Reconstruct from snapshot data. Returns `(manager, slot_assignments)`
