@@ -15,9 +15,13 @@ use crate::ffi;
 use crate::port::ChecksumOffloads;
 
 /// Maximum burst size for rx_burst / tx_burst.
-/// 32 is the typical sweet spot: amortizes per-call overhead without
-/// adding excessive latency from batch processing.
-const BURST_SIZE: usize = 32;
+/// 64 is a throughput-tuned setting: amortizes per-call DPDK overhead
+/// across more packets per RX syscall. The classic 32 is the
+/// latency-tuned default, but on this workload the poll thread is RX
+/// limited (perf-annotate showed ~30 % on `eth_rx_burst` + recycle +
+/// recv_into_vec), so larger bursts reclaim cycles for real work.
+/// RX/TX descriptor rings are 1024 each — comfortably above 64.
+const BURST_SIZE: usize = 64;
 
 /// Default MTU for standard Ethernet. Override with `DpdkDevice::set_mtu()`
 /// for jumbo frames (9000) which reduce TCP segment count ~6x.
