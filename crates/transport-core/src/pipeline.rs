@@ -1571,9 +1571,34 @@ impl<A: Application> MatchingStage<A> {
                 let exec_end = trace_ts();
 
                 #[cfg(feature = "latency-trace")]
-                if record_this_batch {
-                    execute_hist
-                        .record_ns(melin_journal::trace::trace_elapsed_ns(exec_start, exec_end));
+                {
+                    let elapsed_ns = melin_journal::trace::trace_elapsed_ns(exec_start, exec_end);
+                    // Outlier log: any execute > 1 ms is well into pathological
+                    // territory for a path whose p50 is ~200 ns. Capture the
+                    // event variant + correlation IDs so we can pin down what
+                    // class of work triggered the stall. `AppEvent` doesn't
+                    // require `Debug`, so we discriminate the variant only —
+                    // enough to tell tick from app event.
+                    if elapsed_ns > 1_000_000 {
+                        let event_kind: &'static str = match &slot.event {
+                            melin_journal::JournalEvent::App(_) => "app",
+                            melin_journal::JournalEvent::Tick { .. } => "tick",
+                            melin_journal::JournalEvent::GenesisHash { .. } => "genesis_hash",
+                            melin_journal::JournalEvent::Checkpoint { .. } => "checkpoint",
+                            melin_journal::JournalEvent::Shutdown => "shutdown",
+                        };
+                        tracing::warn!(
+                            elapsed_us = elapsed_ns / 1000,
+                            event_kind,
+                            connection_id = slot.connection_id,
+                            request_seq = slot.request_seq,
+                            input_seq,
+                            "matching execute outlier"
+                        );
+                    }
+                    if record_this_batch {
+                        execute_hist.record_ns(elapsed_ns);
+                    }
                 }
 
                 #[allow(clippy::let_unit_value)] // ZST when latency-trace is disabled

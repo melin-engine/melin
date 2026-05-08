@@ -298,6 +298,21 @@ pub struct ServerConfig {
     /// journal traffic.
     #[arg(long, default_value_t = 250)]
     pub tick_interval_ms: u64,
+
+    /// Disable `mlockall(MCL_CURRENT | MCL_FUTURE)` at startup.
+    ///
+    /// By default the server locks all current and future pages into
+    /// RAM to prevent rare multi-millisecond stalls from page faults
+    /// or swap activity on the matching hot path. Locking requires
+    /// `CAP_IPC_LOCK` (or running as root) and `RLIMIT_MEMLOCK` raised
+    /// to a value larger than the process's RSS — the server raises
+    /// the rlimit itself, but only succeeds with the capability.
+    ///
+    /// Use `--no-mlock` for development / containerised runs where
+    /// the privilege isn't available; on a bare-metal exchange host
+    /// leave it on.
+    #[arg(long, default_value_t = false)]
+    pub no_mlock: bool,
 }
 
 /// Delegates to clap so `#[arg(default_value...)]` is the single source of
@@ -361,6 +376,7 @@ impl Default for ServerConfig {
             snapshot_interval_ms: 3_000_000,
             snapshot_path: None,
             tick_interval_ms: 250,
+            no_mlock: false,
         }
     }
 }
