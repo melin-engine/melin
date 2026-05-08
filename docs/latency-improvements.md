@@ -22,10 +22,12 @@ workload, EPYC 7443P):
 | **Server e2e (recv → tx_rx push)** | **1.42 µs** | **2.09 µs** | **2.50 µs** | **23 µs** |
 | **Bench-measured RTT** | **48 µs** | **78 µs** | **78 µs** | **183 µs** |
 
-The 46 µs gap between server e2e and bench RTT lives outside the server
-(wire + bench-side polling). The 113 ms matching-execute outliers we
-once chased turned out to be **seed-phase only** (`connection_id=0`).
-The trading hot path has no >1 ms outliers across 200M+ events.
+The 46 µs gap between server e2e and bench RTT lives **on the wire / NIC
+path** — N2's investigation ruled out both the bench's poll loop and
+smoltcp's TCP processing as sources of the variance. The 113 ms
+matching-execute outliers we once chased turned out to be **seed-phase
+only** (`connection_id=0`). The trading hot path has no >1 ms outliers
+across 200M+ events.
 
 ## Done
 
@@ -34,6 +36,7 @@ The trading hot path has no >1 ms outliers across 200M+ events.
 | T1 | Outlier logging on matching execute >1 ms | Identified 113 ms spikes as **seed-phase only**, not trading hot path |
 | T5 | jemalloc `background_thread:true` + decay tuning | **+2.8 % throughput, −6 % p99, −17 % throughput max** |
 | T7 | `mlockall(MCL_CURRENT \| MCL_FUTURE)` at startup | Bundled with T5 in the same merged branch |
+| N2 | Investigate the 30 µs single-order RTT spread | **Characterized as wire/NIC-bounded, not software-actionable on this hardware.** Bench `iface.poll()` p99 = 0.17 µs, server e2e p99 = 2.1 µs — both ends are clean. The 30 µs lives in NIC silicon + PCIe DMA + switch hop + TCP framing, each contributing a few µs that sum to the observed spread. Meaningful cuts would require lower-latency NIC (Mellanox CX-6/7), cut-through switch, or UDP framing — none software-tunable. |
 
 ## Still on the table — floor latency
 
@@ -56,7 +59,6 @@ The trading hot path has no >1 ms outliers across 200M+ events.
 | ID | Idea | Win | Effort | Notes |
 |---|---|---|---|---|
 | N1 | **Seed-phase bulk insert optimization** | Faster startup + replica catch-up | Medium-High | T1 showed seed-phase spikes scaling with progress (11 ms → 1146 ms over 100K accounts). Likely cumulative HashMap rehash + allocation. Fix: pre-size collections, batch insert, or seed via snapshot restore. Customer-visible impact: failover RTO. |
-| N2 | **Investigate the 30 µs single-order RTT spread** | up to 30 µs off bench p99 | Medium | Established to live on the wire / bench-side polling, not the server. To attack without changing protocols would require instrumenting the bench client's poll loop and / or NIC tuning that affects per-packet jitter. Note: bench-only number; production clients won't see the same pattern. |
 
 ## Deprioritized after T1's findings
 
@@ -78,4 +80,4 @@ The trading hot path has no >1 ms outliers across 200M+ events.
 1. **N1** — measurable customer-visible win for failover; concrete signal from T1 telling us where the work is.
 2. **F2 + T10** — both are config changes on the rig, very cheap to test. Pair in one bench run.
 3. **T6** — if N1 doesn't fully attack the page-fault axis.
-4. **F3** — chases the bench-RTT number specifically.
+4. **F3** — bench-RTT specifically. Note that N2 ruled out smoltcp processing as the source of the body of the bench-RTT spread, so F3's gain is now bounded to the consumer-side delay component (a few µs at most). Pursue only if it's cheap and we want to chase the bench number for marketing purposes.
