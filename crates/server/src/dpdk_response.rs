@@ -20,6 +20,7 @@ use melin_disruptor::padding::Sequence;
 use melin_disruptor::ring;
 use melin_disruptor::spsc;
 
+use crate::amortized_timer::AmortizedTimer;
 use crate::{OutputPayload, OutputSlot};
 use melin_trading::types::QueryResponse;
 use melin_transport_core::pipeline::StageUtilization;
@@ -123,6 +124,11 @@ pub fn run(
         .expect("heartbeat encodes");
 
     let mut last_heartbeat_scan = Instant::now();
+    // Gate the heartbeat scan's clock read so the count==0 spin doesn't
+    // spend the response thread's CPU on `__vdso_clock_gettime`. Reads
+    // the clock every ~1 M idle iterations under busy_spin; heartbeat
+    // interval is seconds, so this is plenty.
+    let mut heartbeat_timer = AmortizedTimer::new(busy_spin);
     let mut idle_spins: u32 = 0;
     let mut busy_count: u64 = 0;
     let mut idle_count: u64 = 0;
@@ -171,41 +177,43 @@ pub fn run(
         // Consume output slots from matching stage.
         let count = consumer.consume_batch(&mut batch, MAX_BATCH);
         if count == 0 {
-            // Send heartbeats to idle connections during idle periods.
-            if let Some(interval) = heartbeat_interval {
-                let now = Instant::now();
-                if now.duration_since(last_heartbeat_scan) >= Duration::from_secs(1) {
-                    last_heartbeat_scan = now;
-                    let mut failed: Vec<u64> = Vec::new();
-                    for (&conn_id, state) in connections.iter_mut() {
-                        if now.duration_since(state.last_send) >= interval {
-                            let mut frame = TxFrame {
-                                connection_id: conn_id,
-                                len: heartbeat_len as u16,
-                                ..Default::default()
-                            };
-                            frame.data[..heartbeat_len]
-                                .copy_from_slice(&heartbeat_frame[..heartbeat_len]);
-                            let tid = (conn_id >> 56) as usize % tx_producers.len();
-                            if tx_producers[tid].try_publish(frame).is_err() {
-                                // SPSC full — DPDK poll thread fell behind.
-                                failed.push(conn_id);
-                                continue;
-                            }
-                            state.last_send = now;
-                        }
-                    }
-                    for conn_id in failed {
-                        connections.remove(&conn_id);
-                        active_connections.fetch_sub(1, Ordering::Relaxed);
-                    }
-                }
-            }
-
             idle_count += 1;
             if idle_count.is_multiple_of(1024) {
                 utilization.busy.store(busy_count, Ordering::Relaxed);
                 utilization.idle.store(idle_count, Ordering::Relaxed);
+            }
+
+            // Heartbeat scan, gated by AmortizedTimer to keep the busy-
+            // spin path off `clock_gettime`. Without this, perf-annotate
+            // showed ~22 % of the response thread's CPU on the vDSO.
+            if let Some(interval) = heartbeat_interval
+                && heartbeat_timer.tick(Duration::from_secs(1)).is_some()
+            {
+                let now = Instant::now();
+                last_heartbeat_scan = now;
+                let mut failed: Vec<u64> = Vec::new();
+                for (&conn_id, state) in connections.iter_mut() {
+                    if now.duration_since(state.last_send) >= interval {
+                        let mut frame = TxFrame {
+                            connection_id: conn_id,
+                            len: heartbeat_len as u16,
+                            ..Default::default()
+                        };
+                        frame.data[..heartbeat_len]
+                            .copy_from_slice(&heartbeat_frame[..heartbeat_len]);
+                        let tid = (conn_id >> 56) as usize % tx_producers.len();
+                        if tx_producers[tid].try_publish(frame).is_err() {
+                            // SPSC full — DPDK poll thread fell behind.
+                            failed.push(conn_id);
+                            continue;
+                        }
+                        state.last_send = now;
+                    }
+                }
+                for conn_id in failed {
+                    connections.remove(&conn_id);
+                    active_connections.fetch_sub(1, Ordering::Relaxed);
+                }
             }
             if busy_spin || idle_spins < 1000 {
                 idle_spins = idle_spins.wrapping_add(1);
