@@ -227,7 +227,7 @@ pub fn run_dpdk_poll(
         "dpdk poll: outer iteration (work-iterations only)",
     );
     #[cfg(feature = "latency-trace")]
-    let mut poll_iter_start = melin_journal::trace::trace_ts();
+    let mut poll_iter_start = trace_ts();
 
     loop {
         if shutdown.load(Ordering::Relaxed) {
@@ -570,7 +570,7 @@ pub fn run_dpdk_poll(
 
         #[cfg(feature = "latency-trace")]
         {
-            let now = melin_journal::trace::trace_ts();
+            let now = trace_ts();
             // Skip records once shutdown has been observed: matches the
             // gate on the journal / matching / response stages and keeps
             // diagnostic numbers comparable across runs.

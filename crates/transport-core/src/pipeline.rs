@@ -1481,8 +1481,8 @@ impl<A: Application> MatchingStage<A> {
             // matching → response cursor by up to MAX_MATCHING_BATCH×.
             let mut out_batch = self.output.batch();
 
-            // Skip latency-trace records on the final batch: see the
-            // matching twin of this comment in the journal stage above.
+            // Skip latency-trace records on the final batch — see the
+            // gate in the journal stage above for the rationale.
             #[cfg(feature = "latency-trace")]
             let record_this_batch = !shutdown.load(std::sync::atomic::Ordering::Relaxed)
                 && !slots_a

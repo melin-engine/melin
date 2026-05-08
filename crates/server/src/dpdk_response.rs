@@ -213,8 +213,11 @@ pub fn run(
 
         #[cfg(feature = "latency-trace")]
         let consume_ts = trace::trace_ts();
-        // Skip records on the shutdown drain (see pipeline.rs for the
-        // same gate on the journal/matching stages).
+        // Skip records on the shutdown drain — same intent as the
+        // journal/matching gates in pipeline.rs. No sentinel scan
+        // here: the response stage consumes `OutputSlot`s, which have
+        // no `Shutdown` variant — only the input ring carries the
+        // sentinel. The atomic alone is sufficient.
         #[cfg(feature = "latency-trace")]
         let record_this_batch = !shutdown.load(Ordering::Relaxed);
 
