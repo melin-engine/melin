@@ -184,7 +184,7 @@ pub fn run_dpdk_poll(
     // assignment in a pre-allocated batch — the work is dominated by
     // the surrounding decode + dedup, which is what `ingest` measures.
     #[cfg(feature = "tick-to-trade")]
-    let ingest_rec =
+    let mut ingest_rec =
         melin_journal::trace::register_stage("reader: ingest (recv_ts → publish complete)");
 
     // Pre-allocated parse buffer pool. Avoids heap allocation on accept

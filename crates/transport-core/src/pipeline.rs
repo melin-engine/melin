@@ -468,11 +468,11 @@ impl<E: AppEvent> JournalStage<E> {
         // after all stage threads join, so dev runs still see the
         // stderr breakdown.
         #[cfg(feature = "latency-trace")]
-        let wakeup_rec = melin_journal::trace::register_stage(
+        let mut wakeup_rec = melin_journal::trace::register_stage(
             "journal: disruptor wakeup (publish → journal consume)",
         );
         #[cfg(feature = "latency-trace")]
-        let batch_rec =
+        let mut batch_rec =
             melin_journal::trace::register_stage("journal: batch processing (write + sync)");
 
         loop {
@@ -1387,11 +1387,12 @@ impl<A: Application> MatchingStage<A> {
         // the server prints them via `trace::print_report_all` once
         // all stage threads have joined.
         #[cfg(feature = "latency-trace")]
-        let wakeup_rec = melin_journal::trace::register_stage(
+        let mut wakeup_rec = melin_journal::trace::register_stage(
             "matching: disruptor wakeup (publish → matching consume)",
         );
         #[cfg(feature = "latency-trace")]
-        let execute_rec = melin_journal::trace::register_stage("matching: execute (process_event)");
+        let mut execute_rec =
+            melin_journal::trace::register_stage("matching: execute (process_event)");
 
         loop {
             if shutdown.load(std::sync::atomic::Ordering::Relaxed) {

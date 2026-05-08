@@ -1286,10 +1286,14 @@ mod tests {
         // dump contains a tab-separated record for it.
         // The global registry is shared across tests; we use a unique
         // stage name to avoid collisions with concurrent test runs.
-        let rec = melin_journal::trace::register_stage("test::stats_dump_emit_marker");
-        rec.record_ns(1_500);
-        rec.record_ns(2_500);
-        rec.record_ns(3_500);
+        // Recorder dropped before the snapshot fetch — see the
+        // SyncHistogram caveat in `crates/journal/src/trace.rs` tests.
+        {
+            let mut rec = melin_journal::trace::register_stage("test::stats_dump_emit_marker");
+            rec.record_ns(1_500);
+            rec.record_ns(2_500);
+            rec.record_ns(3_500);
+        }
 
         let (addr, _events, _healthy, shutdown, handle) = start_health(0, 0, u64::MAX);
         let response = http_request(addr, "GET /stats-dump HTTP/1.1\r\n\r\n");
@@ -1311,10 +1315,15 @@ mod tests {
         // Pin the wire contract that phase 3's bench parser will rely
         // on: every non-comment body line is exactly 9 tab-separated
         // fields — `stage`, name, then 7 numeric percentile fields.
-        let rec = melin_journal::trace::register_stage("test::stats_dump_line_format_marker");
-        rec.record_ns(1_000);
-        rec.record_ns(2_000);
-        rec.record_ns(3_000);
+        // Recorder dropped before the snapshot fetch — see the
+        // SyncHistogram caveat in `crates/journal/src/trace.rs` tests.
+        {
+            let mut rec =
+                melin_journal::trace::register_stage("test::stats_dump_line_format_marker");
+            rec.record_ns(1_000);
+            rec.record_ns(2_000);
+            rec.record_ns(3_000);
+        }
 
         let (addr, _events, _healthy, shutdown, handle) = start_health(0, 0, u64::MAX);
         let response = http_request(addr, "GET /stats-dump HTTP/1.1\r\n\r\n");

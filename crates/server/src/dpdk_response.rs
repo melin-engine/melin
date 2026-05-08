@@ -133,21 +133,21 @@ pub fn run(
     // sampling here would only capture SPSC-publish time and
     // mislead the bench's tick-to-trade breakdown.
     #[cfg(feature = "latency-trace")]
-    let spsc_rec =
+    let mut spsc_rec =
         trace::register_stage("response: SPSC wakeup (matching publish → response consume)");
     #[cfg(feature = "latency-trace")]
-    let dispatch_rec = trace::register_stage("response: dispatch (consume → SPSC publish)");
+    let mut dispatch_rec = trace::register_stage("response: dispatch (consume → SPSC publish)");
     #[cfg(feature = "latency-trace")]
     let server_e2e_rec = trace::register_stage("server e2e (reader recv → response SPSC publish)");
     #[cfg(feature = "tick-to-trade")]
-    let journal_wait_rec =
+    let mut journal_wait_rec =
         trace::register_stage("response: journal-wait (match_complete → journal cursor crossed)");
     #[cfg(feature = "tick-to-trade")]
-    let replica_wait_rec = trace::register_stage(
+    let mut replica_wait_rec = trace::register_stage(
         "response: replica-wait (match_complete → replication cursor crossed)",
     );
     #[cfg(feature = "tick-to-trade")]
-    let encode_rec = trace::register_stage("response: encode (per-kind wire encoding)");
+    let mut encode_rec = trace::register_stage("response: encode (per-kind wire encoding)");
 
     loop {
         if shutdown.load(Ordering::Relaxed) {

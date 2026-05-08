@@ -6,12 +6,32 @@
 //! ## Stats registry
 //!
 //! Stages register their per-stage histograms with a process-global
-//! `StatsRegistry` (single server per process). Recorders are
-//! `Arc<Mutex<StageHistogram>>` clones — stage threads record into them
-//! lock-only-when-tracing-is-on; the health endpoint snapshots all of
+//! `StatsRegistry` (single server per process). Each registered stage
+//! is backed by a [`hdrhistogram::sync::SyncHistogram`]: every recording
+//! thread holds its own [`hdrhistogram::sync::Recorder`] (a per-thread
+//! lock-free local buffer), and the health endpoint snapshots all of
 //! them via `global_registry().snapshot_all()` for the bench's
-//! tick-to-trade dump. Mutex cost is irrelevant in production builds
-//! because the entire path collapses to ZSTs and inlined no-ops.
+//! tick-to-trade dump.
+//!
+//! Why SyncHistogram (vs `Mutex<Histogram>`): under saturation the
+//! mutex variant cost ~50 % of throughput when `tick-to-trade` was on
+//! (5.6 M ops/s → 2.5 M). SyncHistogram's record path is wait-free
+//! against other recorders — the only synchronization is a per-record
+//! atomic load of the phase counter (one atomic per record at steady
+//! state, zero contention with other writers). Reads pay a phase-shift
+//! cost on `refresh`, but reads happen once per `/stats-dump` request.
+//!
+//! Production builds collapse the entire path to ZSTs and inlined
+//! no-ops, so this is dev/bench only.
+//!
+//! ## Recorder ownership
+//!
+//! `StageRecorder` owns a `Recorder` (not shared via Arc). Each call
+//! to `register_stage(name)` returns a fresh `Recorder` clone that
+//! feeds the same `SyncHistogram`; multiple threads recording for the
+//! same stage simply each hold their own recorder. The API takes
+//! `&mut self` on `record_ns` because `Recorder::record` does — the
+//! local buffer is mutated without synchronization.
 
 /// Timestamp carried through pipeline slots.
 ///
@@ -54,108 +74,6 @@ pub fn trace_elapsed_ns(start: TraceTimestamp, end: TraceTimestamp) -> u64 {
     end.saturating_sub(start)
 }
 
-/// Per-stage latency histogram. Collects nanosecond samples and prints
-/// a summary when `print_report` is called.
-#[cfg(feature = "latency-trace")]
-pub struct StageHistogram {
-    name: &'static str,
-    hist: hdrhistogram::Histogram<u64>,
-    /// Whether a report has already been printed (prevents double-print from
-    /// both explicit `print_report` and `Drop`).
-    printed: bool,
-}
-
-#[cfg(feature = "latency-trace")]
-impl StageHistogram {
-    /// Create a new histogram for the named stage.
-    /// Range: 1 ns to 100 ms, 3 significant digits.
-    pub fn new(name: &'static str) -> Self {
-        Self {
-            name,
-            hist: hdrhistogram::Histogram::new_with_bounds(1, 100_000_000, 3)
-                .expect("valid histogram bounds"),
-            printed: false,
-        }
-    }
-
-    /// Record a latency sample in nanoseconds.
-    #[inline]
-    pub fn record_ns(&mut self, ns: u64) {
-        // Best-effort: record() only fails if ns exceeds the histogram's
-        // configured max, which is non-critical for diagnostics.
-        let _ = self.hist.record(ns);
-    }
-
-    /// Snapshot the current state as a `StageSnapshot`. Returns `None`
-    /// when no samples have been recorded.
-    pub fn snapshot(&self) -> Option<StageSnapshot> {
-        if self.hist.is_empty() {
-            return None;
-        }
-        Some(StageSnapshot {
-            name: self.name,
-            samples: self.hist.len(),
-            min_ns: self.hist.min(),
-            p50_ns: self.hist.value_at_quantile(0.50),
-            p90_ns: self.hist.value_at_quantile(0.90),
-            p99_ns: self.hist.value_at_quantile(0.99),
-            p99_9_ns: self.hist.value_at_quantile(0.999),
-            max_ns: self.hist.max(),
-        })
-    }
-}
-
-#[cfg(feature = "latency-trace")]
-impl Drop for StageHistogram {
-    fn drop(&mut self) {
-        if !self.printed {
-            self.print_report_inner();
-        }
-    }
-}
-
-#[cfg(feature = "latency-trace")]
-impl StageHistogram {
-    /// Print a formatted latency summary to stderr.
-    pub fn print_report(&mut self) {
-        self.print_report_inner();
-        self.printed = true;
-    }
-
-    fn print_report_inner(&self) {
-        use std::io::Write as _;
-
-        if self.hist.is_empty() {
-            return;
-        }
-        let us = |ns: u64| ns as f64 / 1000.0;
-
-        // Build the full report in memory, then write atomically to stderr
-        // so concurrent threads don't interleave output.
-        let buf = format!(
-            "  {name}\n\
-             \x20   samples: {samples}\n\
-             \x20   min:    {min:>8.2} µs\n\
-             \x20   p50:    {p50:>8.2} µs\n\
-             \x20   p90:    {p90:>8.2} µs\n\
-             \x20   p99:    {p99:>8.2} µs\n\
-             \x20   p99.9:  {p999:>8.2} µs\n\
-             \x20   max:    {max:>8.2} µs\n",
-            name = self.name,
-            samples = self.hist.len(),
-            min = us(self.hist.min()),
-            p50 = us(self.hist.value_at_quantile(0.50)),
-            p90 = us(self.hist.value_at_quantile(0.90)),
-            p99 = us(self.hist.value_at_quantile(0.99)),
-            p999 = us(self.hist.value_at_quantile(0.999)),
-            max = us(self.hist.max()),
-        );
-
-        // Best-effort diagnostic output on shutdown.
-        let _ = std::io::stderr().lock().write_all(buf.as_bytes());
-    }
-}
-
 // ---------------------------------------------------------------------------
 // StageRecorder + StatsRegistry
 // ---------------------------------------------------------------------------
@@ -178,32 +96,44 @@ pub struct StageSnapshot {
 
 /// A handle for recording samples into a registered stage histogram.
 ///
-/// Cheap to clone — wraps an `Arc<Mutex<StageHistogram>>` when
-/// `latency-trace` is on, ZST when off. Each `record_ns` call locks
-/// the mutex briefly; lock cost is irrelevant because it only exists
-/// in dev/bench builds with `--features latency-trace`.
+/// Owns a per-thread `Recorder` (no Arc, no Mutex on the record path).
+/// Each `record_ns` call writes to the recorder's local buffer; samples
+/// are merged into the underlying `SyncHistogram` lazily on the next
+/// `refresh` call from the reader (the health endpoint).
+///
+/// `record_ns` takes `&mut self` because the underlying
+/// [`hdrhistogram::sync::Recorder`] mutates its local buffer. Stage
+/// threads therefore declare `let mut rec = register_stage(...)`.
 #[cfg(feature = "latency-trace")]
-#[derive(Clone)]
 pub struct StageRecorder {
-    hist: std::sync::Arc<std::sync::Mutex<StageHistogram>>,
+    rec: hdrhistogram::sync::Recorder<u64>,
+}
+
+#[cfg(feature = "latency-trace")]
+impl Clone for StageRecorder {
+    fn clone(&self) -> Self {
+        Self {
+            rec: self.rec.clone(),
+        }
+    }
 }
 
 #[cfg(feature = "latency-trace")]
 impl StageRecorder {
     /// Record a single sample in nanoseconds.
+    ///
+    /// Saturates instead of returning an error when `ns` exceeds the
+    /// histogram's max bound — diagnostic samples are best-effort, and
+    /// dropping a single very-out-of-range sample is preferable to
+    /// crashing the trading thread.
     #[inline]
-    pub fn record_ns(&self, ns: u64) {
-        // Mutex poisoning ignored: a poisoned histogram is still
-        // valid for recording; the panic that poisoned it is the
-        // operator's primary signal, not a missing percentile.
-        if let Ok(mut h) = self.hist.lock() {
-            h.record_ns(ns);
-        }
+    pub fn record_ns(&mut self, ns: u64) {
+        self.rec.saturating_record(ns);
     }
 
     /// Record the elapsed nanoseconds between two trace timestamps.
     #[inline]
-    pub fn record_elapsed(&self, start: TraceTimestamp, end: TraceTimestamp) {
+    pub fn record_elapsed(&mut self, start: TraceTimestamp, end: TraceTimestamp) {
         self.record_ns(trace_elapsed_ns(start, end));
     }
 }
@@ -215,10 +145,22 @@ pub struct StageRecorder;
 #[cfg(not(feature = "latency-trace"))]
 impl StageRecorder {
     #[inline]
-    pub fn record_ns(&self, _ns: u64) {}
+    pub fn record_ns(&mut self, _ns: u64) {}
 
     #[inline]
-    pub fn record_elapsed(&self, _start: TraceTimestamp, _end: TraceTimestamp) {}
+    pub fn record_elapsed(&mut self, _start: TraceTimestamp, _end: TraceTimestamp) {}
+}
+
+/// One stage's storage in the registry: a stable name + the
+/// `SyncHistogram` that all `Recorder`s for this stage feed into.
+///
+/// The Mutex is held only during `refresh` + percentile reads from
+/// the snapshot path (rare — once per `/stats-dump` call), never on
+/// the record-side hot path.
+#[cfg(feature = "latency-trace")]
+struct StageEntry {
+    name: &'static str,
+    sync: std::sync::Mutex<hdrhistogram::sync::SyncHistogram<u64>>,
 }
 
 /// Process-wide registry of stage histograms.
@@ -228,12 +170,11 @@ impl StageRecorder {
 /// demand for the bench's tick-to-trade decomposition.
 #[cfg(feature = "latency-trace")]
 pub struct StatsRegistry {
-    // Vec, not HashMap, because: (a) tens of entries at most, (b) we
-    // want stable insertion order in dumps, (c) lookup-by-name is
-    // never on the hot path. Mutex protects the Vec only during
-    // register / iterate; the per-stage histograms are independently
-    // locked for recording.
-    entries: std::sync::Mutex<Vec<std::sync::Arc<std::sync::Mutex<StageHistogram>>>>,
+    // Vec, not HashMap: tens of entries at most, stable insertion
+    // order in dumps, lookup-by-name only at register time. Mutex
+    // protects the Vec only during register / snapshot iteration —
+    // never on the per-event record path.
+    entries: std::sync::Mutex<Vec<std::sync::Arc<StageEntry>>>,
 }
 
 #[cfg(feature = "latency-trace")]
@@ -244,45 +185,77 @@ impl StatsRegistry {
         }
     }
 
-    /// Register a new stage and return a recorder for it.
-    ///
-    /// If a stage with the same name was already registered, the
-    /// existing recorder is returned (re-registration is a no-op).
-    /// This makes the API safe to call from a stage thread that
-    /// might be restarted within the same process (tests, in-process
-    /// failover).
+    /// Register a stage and return a `Recorder` for it. Idempotent —
+    /// calling twice with the same name returns sibling recorders that
+    /// feed the same underlying `SyncHistogram`.
     pub fn register(&self, name: &'static str) -> StageRecorder {
         let mut entries = match self.entries.lock() {
             Ok(g) => g,
             Err(poisoned) => poisoned.into_inner(),
         };
         for existing in entries.iter() {
-            // Lock briefly to read the name; if poisoned, fall through
-            // and create a new entry — the old one is unrecoverable.
-            if let Ok(h) = existing.lock()
-                && h.name == name
-            {
+            if existing.name == name {
+                let sync = match existing.sync.lock() {
+                    Ok(g) => g,
+                    Err(poisoned) => poisoned.into_inner(),
+                };
                 return StageRecorder {
-                    hist: existing.clone(),
+                    rec: sync.recorder(),
                 };
             }
         }
-        let h = std::sync::Arc::new(std::sync::Mutex::new(StageHistogram::new(name)));
-        entries.push(h.clone());
-        StageRecorder { hist: h }
+        // Range: 1 ns to 100 ms, 3 significant digits — same as the
+        // pre-SyncHistogram design; matches the expected per-stage
+        // percentile shape.
+        let hist = hdrhistogram::Histogram::<u64>::new_with_bounds(1, 100_000_000, 3)
+            .expect("valid histogram bounds");
+        let sync: hdrhistogram::sync::SyncHistogram<u64> = hist.into();
+        let recorder = sync.recorder();
+        entries.push(std::sync::Arc::new(StageEntry {
+            name,
+            sync: std::sync::Mutex::new(sync),
+        }));
+        StageRecorder { rec: recorder }
     }
 
     /// Snapshot every registered stage. Stages with zero samples are
     /// omitted from the result.
+    ///
+    /// Refresh waits up to 10 ms for each recorder to acknowledge the
+    /// phase shift; idle recorders that don't ack within that window
+    /// are skipped (their pending samples roll over to the next
+    /// snapshot). At bench rates every stage thread is recording
+    /// continuously, so refresh completes well below the timeout.
     pub fn snapshot_all(&self) -> Vec<StageSnapshot> {
         let entries = match self.entries.lock() {
             Ok(g) => g,
             Err(poisoned) => poisoned.into_inner(),
         };
-        entries
-            .iter()
-            .filter_map(|h| h.lock().ok().and_then(|h| h.snapshot()))
-            .collect()
+        let mut out = Vec::with_capacity(entries.len());
+        for entry in entries.iter() {
+            let mut sync = match entry.sync.lock() {
+                Ok(g) => g,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            // Pull pending samples from all recorders into the main
+            // histogram. Bounded wait so an idle recorder can't hang
+            // a /stats-dump request.
+            sync.refresh_timeout(std::time::Duration::from_millis(10));
+            if sync.is_empty() {
+                continue;
+            }
+            out.push(StageSnapshot {
+                name: entry.name,
+                samples: sync.len(),
+                min_ns: sync.min(),
+                p50_ns: sync.value_at_quantile(0.50),
+                p90_ns: sync.value_at_quantile(0.90),
+                p99_ns: sync.value_at_quantile(0.99),
+                p99_9_ns: sync.value_at_quantile(0.999),
+                max_ns: sync.max(),
+            });
+        }
+        out
     }
 
     /// Print every registered stage's percentile report to stderr.
@@ -290,14 +263,30 @@ impl StatsRegistry {
     /// bench still see the per-stage breakdown — the bench fetches the
     /// same data via the health endpoint instead.
     pub fn print_report_all(&self) {
-        let entries = match self.entries.lock() {
-            Ok(g) => g,
-            Err(poisoned) => poisoned.into_inner(),
-        };
-        for h in entries.iter() {
-            if let Ok(mut h) = h.lock() {
-                h.print_report();
-            }
+        use std::io::Write as _;
+
+        for snap in self.snapshot_all() {
+            let us = |ns: u64| ns as f64 / 1000.0;
+            let buf = format!(
+                "  {name}\n\
+                 \x20   samples: {samples}\n\
+                 \x20   min:    {min:>8.2} µs\n\
+                 \x20   p50:    {p50:>8.2} µs\n\
+                 \x20   p90:    {p90:>8.2} µs\n\
+                 \x20   p99:    {p99:>8.2} µs\n\
+                 \x20   p99.9:  {p999:>8.2} µs\n\
+                 \x20   max:    {max:>8.2} µs\n",
+                name = snap.name,
+                samples = snap.samples,
+                min = us(snap.min_ns),
+                p50 = us(snap.p50_ns),
+                p90 = us(snap.p90_ns),
+                p99 = us(snap.p99_ns),
+                p999 = us(snap.p99_9_ns),
+                max = us(snap.max_ns),
+            );
+            // Best-effort diagnostic output on shutdown.
+            let _ = std::io::stderr().lock().write_all(buf.as_bytes());
         }
     }
 }
@@ -324,9 +313,9 @@ pub fn global_registry() -> &'static StatsRegistry {
 
 /// Register a stage with the global registry and return a recorder.
 ///
-/// Convenience for the common case `let h = register_stage("…");`.
-/// Idempotent — calling twice with the same name returns recorders
-/// pointing at the same underlying histogram.
+/// Convenience for the common case `let mut h = register_stage("…");`.
+/// Idempotent — calling twice with the same name returns sibling
+/// recorders that feed the same underlying `SyncHistogram`.
 #[cfg(feature = "latency-trace")]
 pub fn register_stage(name: &'static str) -> StageRecorder {
     global_registry().register(name)
@@ -342,13 +331,29 @@ pub fn register_stage(_name: &'static str) -> StageRecorder {
 mod tests {
     use super::*;
 
+    // SyncHistogram caveat for tests: `refresh` waits for active
+    // recorders to acknowledge the phase shift via their next
+    // `record` call. A dormant recorder (one that recorded but
+    // hasn't recorded since refresh started) holds up the refresh
+    // until it times out, at which point its pending samples are
+    // still in its local buffer — invisible to the snapshot.
+    //
+    // Production stage threads record continuously, so refresh
+    // completes well below the timeout. Tests work around this by
+    // dropping recorders before snapshot: the Recorder Drop impl
+    // ships pending samples to the SyncHistogram via an unbounded
+    // channel, which the next refresh picks up.
+
     #[test]
     fn registry_register_returns_recorder_that_records() {
         let reg = StatsRegistry::new();
-        let rec = reg.register("test::stage_one");
-        rec.record_ns(1_000);
-        rec.record_ns(2_000);
-        rec.record_ns(3_000);
+        {
+            let mut rec = reg.register("test::stage_one");
+            rec.record_ns(1_000);
+            rec.record_ns(2_000);
+            rec.record_ns(3_000);
+            // `rec` dropped at end of scope → samples shipped via channel.
+        }
 
         let snaps = reg.snapshot_all();
         assert_eq!(snaps.len(), 1);
@@ -361,12 +366,15 @@ mod tests {
     #[test]
     fn registry_register_is_idempotent() {
         let reg = StatsRegistry::new();
-        let a = reg.register("test::dup");
-        let b = reg.register("test::dup");
-        a.record_ns(100);
-        b.record_ns(200);
+        {
+            let mut a = reg.register("test::dup");
+            let mut b = reg.register("test::dup");
+            a.record_ns(100);
+            b.record_ns(200);
+            // Both recorders dropped at end of scope.
+        }
         let snaps = reg.snapshot_all();
-        // Both recorders point at the same histogram.
+        // Both recorders point at the same SyncHistogram.
         assert_eq!(snaps.len(), 1);
         assert_eq!(snaps[0].samples, 2);
     }
@@ -375,11 +383,51 @@ mod tests {
     fn snapshot_omits_empty_stages() {
         let reg = StatsRegistry::new();
         let _empty = reg.register("test::empty");
-        let used = reg.register("test::used");
-        used.record_ns(500);
+        {
+            let mut used = reg.register("test::used");
+            used.record_ns(500);
+        }
 
         let snaps = reg.snapshot_all();
         assert_eq!(snaps.len(), 1);
         assert_eq!(snaps[0].name, "test::used");
+    }
+
+    #[test]
+    fn refresh_during_active_recording() {
+        // Production-shape test: a recorder is alive and recording
+        // when refresh fires. Refresh waits for the recorder to ack
+        // the phase shift via its next record call. Verifies the
+        // steady-state path works (no drop required).
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::thread;
+
+        let reg = Arc::new(StatsRegistry::new());
+        let stop = Arc::new(AtomicBool::new(false));
+
+        let writer_reg = Arc::clone(&reg);
+        let writer_stop = Arc::clone(&stop);
+        let writer = thread::spawn(move || {
+            let mut rec = writer_reg.register("test::active");
+            while !writer_stop.load(Ordering::Relaxed) {
+                rec.record_ns(42);
+                std::thread::sleep(std::time::Duration::from_micros(100));
+            }
+        });
+
+        // Give the writer a moment to record some samples + pick up
+        // the phase shift on the next record after refresh starts.
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        let snaps = reg.snapshot_all();
+
+        stop.store(true, Ordering::Relaxed);
+        writer.join().unwrap();
+
+        let stage = snaps
+            .iter()
+            .find(|s| s.name == "test::active")
+            .expect("active stage missing from snapshot");
+        assert!(stage.samples > 0);
     }
 }

@@ -337,10 +337,10 @@ fn reader_loop<R: AsRawFd>(
     // and feeds the bench's tick-to-trade decomposition (heavier,
     // gated on `tick-to-trade`).
     #[cfg(feature = "latency-trace")]
-    let publish_rec =
+    let mut publish_rec =
         melin_journal::trace::register_stage("reader: publish (decode → disruptor publish)");
     #[cfg(feature = "tick-to-trade")]
-    let ingest_rec =
+    let mut ingest_rec =
         melin_journal::trace::register_stage("reader: ingest (recv_ts → publish complete)");
 
     // Coarse gate for timeout scanning — avoids scanning on every
@@ -584,9 +584,9 @@ fn reader_loop<R: AsRawFd>(
                     &server_busy_frame,
                     batch_wall_ns,
                     #[cfg(feature = "latency-trace")]
-                    &publish_rec,
+                    &mut publish_rec,
                     #[cfg(feature = "tick-to-trade")]
-                    &ingest_rec,
+                    &mut ingest_rec,
                 );
                 if drop_conn {
                     Action::Remove {
@@ -767,8 +767,8 @@ fn process_frames<R>(
     producer: &mut ring::Producer<InputSlot>,
     server_busy_frame: &[u8; 5],
     batch_wall_ns: u64,
-    #[cfg(feature = "latency-trace")] publish_rec: &melin_journal::trace::StageRecorder,
-    #[cfg(feature = "tick-to-trade")] ingest_rec: &melin_journal::trace::StageRecorder,
+    #[cfg(feature = "latency-trace")] publish_rec: &mut melin_journal::trace::StageRecorder,
+    #[cfg(feature = "tick-to-trade")] ingest_rec: &mut melin_journal::trace::StageRecorder,
 ) -> bool {
     let mut cursor = 0;
 

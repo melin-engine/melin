@@ -123,12 +123,12 @@ pub fn run(
     // tick-to-trade decomposition; spsc/dispatch/server-e2e are kept
     // alongside as overall sanity checks.
     #[cfg(feature = "latency-trace")]
-    let spsc_rec =
+    let mut spsc_rec =
         trace::register_stage("response: SPSC wakeup (matching publish → response consume)");
     #[cfg(feature = "latency-trace")]
-    let dispatch_rec = trace::register_stage("response: dispatch (consume → socket write)");
+    let mut dispatch_rec = trace::register_stage("response: dispatch (consume → socket write)");
     #[cfg(feature = "latency-trace")]
-    let server_e2e_rec = trace::register_stage("server e2e (reader recv → response flush)");
+    let mut server_e2e_rec = trace::register_stage("server e2e (reader recv → response flush)");
     // Tick-to-trade breakdown: per-slot wait observed for each
     // durability path (recorded only when the gate actually held us
     // up — cache-hit paths skip to avoid inflating the metric with
@@ -139,16 +139,16 @@ pub fn run(
     // stages roughly double the hot-path mutex traffic vs the lighter
     // 4-stage mode.
     #[cfg(feature = "tick-to-trade")]
-    let journal_wait_rec =
+    let mut journal_wait_rec =
         trace::register_stage("response: journal-wait (match_complete → journal cursor crossed)");
     #[cfg(feature = "tick-to-trade")]
-    let replica_wait_rec = trace::register_stage(
+    let mut replica_wait_rec = trace::register_stage(
         "response: replica-wait (match_complete → replication cursor crossed)",
     );
     #[cfg(feature = "tick-to-trade")]
-    let encode_rec = trace::register_stage("response: encode (per-kind wire encoding)");
+    let mut encode_rec = trace::register_stage("response: encode (per-kind wire encoding)");
     #[cfg(feature = "tick-to-trade")]
-    let egress_rec = trace::register_stage("response: egress (flush_sends elapsed)");
+    let mut egress_rec = trace::register_stage("response: egress (flush_sends elapsed)");
 
     // Track connections with buffered (unflushed) writes across batches.
     let mut dirty_connections: HashSet<u64> = HashSet::new();
