@@ -56,6 +56,7 @@ pub enum ControlEvent {
     },
 }
 
+pub mod admin;
 pub mod affinity;
 /// AmortizedTimer is used by the shadow stage's clock-check amortization
 /// and by the replication sender. Always compiled.
@@ -65,11 +66,9 @@ pub(crate) mod amortized_timer;
 #[cfg(all(feature = "trading", not(feature = "noop")))]
 pub mod event_publisher;
 pub mod health;
-pub mod promote;
 mod reader;
 pub mod request;
 mod response;
-pub mod rotate;
 pub mod tick;
 
 /// Replica failover and shadow snapshotting. Both are transport-level

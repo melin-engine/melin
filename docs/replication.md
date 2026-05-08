@@ -185,7 +185,7 @@ The pipelined ack queue (8 entries) decouples the receiver's TCP loop from NVMe 
 | `--standalone` | No | `false` | Explicitly disable replication (dev/test) |
 | `--replica-of <addr>` | No | — | Run as a replica connected to the given primary |
 | `--replication-key <path>` | Replica | — | Ed25519 private key for replication auth. Required when `--replica-of` is set. The corresponding public key must be in the primary's `authorized_keys` with `replication` permission. |
-| `--promote-bind <addr>` | Replica | — | Address to listen for promotion commands. An operator sends `PROMOTE\n` to trigger in-process transition from replica to primary. |
+| `--admin-bind <addr>` | Any | — | Address for the operator admin endpoint. Accepts `PROMOTE\n` (replica → primary, replica only) and `ROTATE\n` (archive the live journal segment). |
 | `--async-replica-ack` | Replica | `false` | Ack incoming batches as soon as they are queued for the local journal stage instead of waiting for fsync. Removes ~50–80µs from the replication round-trip; documented durability tradeoff above. |
 
 `--replication-bind` and `--standalone` are mutually exclusive. `--replica-of` is mutually exclusive with both. If none are specified, the server runs in standalone mode.
@@ -204,7 +204,7 @@ The CRC32C is computed incrementally on the primary as chunks are read from disk
 
 ## Manual Promotion
 
-A replica can be promoted to primary via the `--promote-bind` endpoint. The operator connects to the promotion port and sends `PROMOTE\n`. The replica:
+A replica can be promoted to primary via the `--admin-bind` endpoint. The operator connects to the admin port, authenticates with an operator key, and sends `PROMOTE\n`. The replica:
 
 1. Sets the `promote` flag, which causes the replication receiver to exit its main loop.
 2. Transitions in-process from replica to primary: the warm Exchange state is reused directly — no journal re-replay, no snapshot reload.
@@ -293,6 +293,6 @@ Dual replication is now supported — the primary accepts up to 2 concurrent rep
 ## Future Work
 
 - **Chain hash verification** — see limitation above
-- **Automatic failover**: Leader election / consensus for automatic promotion. Requires fencing to prevent split-brain. Manual promotion via `--promote-bind` is implemented.
+- **Automatic failover**: Leader election / consensus for automatic promotion. Requires fencing to prevent split-brain. Manual promotion via the `--admin-bind` endpoint (`PROMOTE\n`) is implemented.
 - **Fully async replication**: Optional mode where the primary's response stage does not gate on the replication cursor at all — only on local fsync. Larger data-loss window than `--async-replica-ack` (which still gates on the replica having the data in RAM). Useful for venues that treat replication purely as a hot standby and accept any post-crash divergence.
 - **Split-brain fencing**: After manual promotion, the old primary must be stopped manually. Automatic fencing (STONITH, epoch-based fencing) is not yet implemented.

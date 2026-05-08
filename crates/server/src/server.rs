@@ -263,20 +263,20 @@ pub struct ServerConfig {
     #[arg(long, default_value = "127.0.0.1:9878")]
     pub health_bind: Option<SocketAddr>,
 
-    /// TCP address for the promotion trigger endpoint (replica only).
-    /// An operator connects and sends `PROMOTE\n` to promote the replica
-    /// to primary. Ignored in primary mode.
+    /// TCP address for the operator admin endpoint. Authenticated with
+    /// operator keys (Ed25519 challenge-response, same as all other
+    /// admin handshakes). Accepts:
+    ///
+    /// - `PROMOTE\n` — replica → primary leadership transition (replica
+    ///   nodes only; rejected with ERR on a primary).
+    /// - `ROTATE\n` — archive the current journal segment at the next
+    ///   fsync boundary (any node where runtime rotation is enabled).
+    ///
+    /// Unset means no admin endpoint is listening; operators can still
+    /// rely on the size-driven rotation trigger (`--max-journal-mib`)
+    /// without exposing a port.
     #[arg(long)]
-    pub promote_bind: Option<SocketAddr>,
-
-    /// TCP address for the runtime journal-rotation endpoint. An operator
-    /// connects, authenticates with an operator key, and sends `ROTATE\n`
-    /// to force the journal stage to archive the live segment at the next
-    /// fsync boundary. When unset, runtime rotation only fires from the
-    /// `max_journal_mib` size threshold (or not at all if that is zero).
-    /// Active on both primary and replica nodes.
-    #[arg(long)]
-    pub rotate_bind: Option<SocketAddr>,
+    pub admin_bind: Option<SocketAddr>,
 
     /// Interval in milliseconds between automatic shadow snapshots. The
     /// shadow stage replays journaled events on a cloned App and saves a
@@ -381,8 +381,7 @@ impl Default for ServerConfig {
             dpdk_vlan: None,
             event_bind: None,
             health_bind: Some(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 9878)),
-            promote_bind: None,
-            rotate_bind: None,
+            admin_bind: None,
             snapshot_interval_ms: 3_000_000,
             snapshot_path: None,
             tick_interval_ms: 250,
@@ -573,31 +572,34 @@ pub fn run_with_shutdown<L: BlockingTransportListener>(
             ed25519_dalek::SigningKey::from_bytes(&bytes)
         };
 
-        // Load authorized keys early — the promotion listener needs them
-        // for Ed25519 challenge-response auth (operator keys only).
+        // Load authorized keys early — the admin listener needs them for
+        // Ed25519 challenge-response auth (operator keys only).
         let authorized_keys = Arc::new(AuthorizedKeys::load(&config.authorized_keys)?);
         info!(
             keys = authorized_keys.len(),
             path = %config.authorized_keys.display(),
-            "loaded authorized keys (replica mode, for promotion auth)"
+            "loaded authorized keys (replica mode)"
         );
 
-        // Spawn promotion listener if configured.
+        // Shared admin flags: constructed before mode-detection so they
+        // survive a replica → primary transition. The promote flag is
+        // consumed by the replica's receive loop and becomes a stale
+        // pointer post-promotion (harmless); the rotate flag is re-wired
+        // into the new primary's journal stage by `run_as_primary`.
         let promote_flag = Arc::new(AtomicBool::new(false));
-        let _promote_handle = config.promote_bind.map(|addr| {
-            crate::promote::spawn(
+        let rotate_flag = config.admin_bind.map(|_| Arc::new(AtomicBool::new(false)));
+        let _admin_handle = config.admin_bind.map(|addr| {
+            crate::admin::spawn(
                 addr,
-                Arc::clone(&promote_flag),
+                Some(Arc::clone(&promote_flag)),
+                rotate_flag.clone(),
                 Arc::clone(&shutdown),
                 Arc::clone(&authorized_keys),
             )
         });
 
-        // Runtime rotation on the replica side: the size threshold and
-        // the operator-driven flag are independent of the primary's, so
-        // each side rotates whenever its own live segment crosses the
-        // limit (or the operator on this node sends ROTATE).
-        let rotate_flag = config.rotate_bind.map(|_| Arc::new(AtomicBool::new(false)));
+        // Runtime rotation on the replica side. Each node rotates its
+        // own segments independently of the primary.
         let max_journal_bytes = config.max_journal_mib.saturating_mul(1024 * 1024);
         let rotation = match (max_journal_bytes, rotate_flag.as_ref()) {
             (0, None) => None,
@@ -606,15 +608,6 @@ pub fn run_with_shutdown<L: BlockingTransportListener>(
                 f.cloned()
                     .unwrap_or_else(|| Arc::new(AtomicBool::new(false))),
             )),
-        };
-        let _rotate_handle = match (config.rotate_bind, rotate_flag.as_ref()) {
-            (Some(addr), Some(flag)) => Some(crate::rotate::spawn(
-                addr,
-                Arc::clone(flag),
-                Arc::clone(&shutdown),
-                Arc::clone(&authorized_keys),
-            )),
-            _ => None,
         };
 
         match crate::replication::run_receiver(
@@ -647,6 +640,7 @@ pub fn run_with_shutdown<L: BlockingTransportListener>(
                     shutdown,
                     authorized_keys,
                     false, // no seeding needed — state comes from replication
+                    rotate_flag,
                 );
             }
         }
@@ -658,6 +652,21 @@ pub fn run_with_shutdown<L: BlockingTransportListener>(
         path = %config.authorized_keys.display(),
         "loaded authorized keys"
     );
+
+    // Spawn the admin listener once if configured. PROMOTE is rejected
+    // (with ERR) on a primary because no promote flag is wired here —
+    // promotion is meaningful only on a replica. ROTATE is wired
+    // whenever the admin endpoint is configured.
+    let rotate_flag = config.admin_bind.map(|_| Arc::new(AtomicBool::new(false)));
+    let _admin_handle = config.admin_bind.map(|addr| {
+        crate::admin::spawn(
+            addr,
+            None,
+            rotate_flag.clone(),
+            Arc::clone(&shutdown),
+            Arc::clone(&authorized_keys),
+        )
+    });
 
     // Initialize or recover the app. `needs_seeding` is true on first
     // startup — seed events will flow through the pipeline later.
@@ -676,6 +685,7 @@ pub fn run_with_shutdown<L: BlockingTransportListener>(
         shutdown,
         authorized_keys,
         needs_seeding,
+        rotate_flag,
     )
 }
 
@@ -771,6 +781,13 @@ fn shutdown_pipeline_stages(
 
 /// Used by both the normal primary startup path and the promotion path
 /// (replica → primary transition).
+///
+/// `rotate_flag` is the shared `AtomicBool` toggled by the admin
+/// endpoint (or `None` if no admin endpoint was configured). On the
+/// promotion path the replica's journal stage is torn down and a new
+/// primary stage is built here; passing the flag through means the
+/// admin endpoint, which was spawned once at process start, keeps
+/// driving the new stage's rotation.
 fn run_as_primary<L: BlockingTransportListener>(
     exchange: App,
     writer: JournalWriter,
@@ -779,6 +796,7 @@ fn run_as_primary<L: BlockingTransportListener>(
     shutdown: Arc<AtomicBool>,
     authorized_keys: Arc<AuthorizedKeys>,
     needs_seeding: bool,
+    rotate_flag: Option<Arc<AtomicBool>>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // Active connection counter shared between accept loop, response
     // stage, and matching stage (for stats queries).
@@ -889,25 +907,14 @@ fn run_as_primary<L: BlockingTransportListener>(
     let cores = config.cores;
 
     // Wire runtime journal rotation into the journal stage. The flag is
-    // shared with an optional admin endpoint (`rotate_bind`) below; the
-    // size threshold uses the same `max_journal_mib` knob that drives
-    // startup rotation.
+    // shared with the admin endpoint (spawned once at process start in
+    // `run_with_shutdown`) — passing it through here means PROMOTE-then-
+    // ROTATE on a freshly-promoted node still drives rotation against
+    // the new primary's stage. The size threshold uses the same
+    // `max_journal_mib` knob that drives startup rotation.
     let mut journal_stage = journal_stage;
-    let rotate_flag = config.rotate_bind.map(|_| Arc::new(AtomicBool::new(false)));
     let max_journal_bytes = config.max_journal_mib.saturating_mul(1024 * 1024);
     journal_stage.set_rotation(max_journal_bytes, rotate_flag.clone());
-    // Spawn the rotation listener if the operator opted into the admin
-    // endpoint. Active on both primary and replica nodes; on the
-    // replica path it gets wired in `replication::run_receiver` etc.
-    let _rotate_handle = match (config.rotate_bind, rotate_flag.as_ref()) {
-        (Some(addr), Some(flag)) => Some(crate::rotate::spawn(
-            addr,
-            Arc::clone(flag),
-            Arc::clone(&shutdown),
-            Arc::clone(&authorized_keys),
-        )),
-        _ => None,
-    };
     if config.max_journal_mib > 0 {
         info!(
             max_journal_mib = config.max_journal_mib,
@@ -1597,28 +1604,29 @@ pub fn run_dpdk(
     if let Some(primary_addr) = config.replica_of {
         info!(primary = %primary_addr, "starting in replica mode (DPDK)");
 
-        // Load authorized keys early — the promotion listener needs them
-        // for Ed25519 challenge-response auth (operator keys only).
+        // Load authorized keys early — the admin listener needs them for
+        // Ed25519 challenge-response auth (operator keys only).
         let authorized_keys = Arc::new(AuthorizedKeys::load(&config.authorized_keys)?);
         info!(
             keys = authorized_keys.len(),
             path = %config.authorized_keys.display(),
-            "loaded authorized keys (DPDK replica mode, for promotion auth)"
+            "loaded authorized keys (DPDK replica mode)"
         );
 
+        // Shared admin flags, same shape as the kernel TCP replica path
+        // — see `run_with_shutdown` for the rationale on lifetime.
         let promote_flag = Arc::new(AtomicBool::new(false));
-        let _promote_handle = config.promote_bind.map(|addr| {
-            crate::promote::spawn(
+        let rotate_flag = config.admin_bind.map(|_| Arc::new(AtomicBool::new(false)));
+        let _admin_handle = config.admin_bind.map(|addr| {
+            crate::admin::spawn(
                 addr,
-                Arc::clone(&promote_flag),
+                Some(Arc::clone(&promote_flag)),
+                rotate_flag.clone(),
                 Arc::clone(&shutdown),
                 Arc::clone(&authorized_keys),
             )
         });
 
-        // Runtime rotation on the DPDK replica (mirrors the kernel TCP
-        // path's wiring).
-        let rotate_flag = config.rotate_bind.map(|_| Arc::new(AtomicBool::new(false)));
         let max_journal_bytes = config.max_journal_mib.saturating_mul(1024 * 1024);
         let rotation = match (max_journal_bytes, rotate_flag.as_ref()) {
             (0, None) => None,
@@ -1627,15 +1635,6 @@ pub fn run_dpdk(
                 f.cloned()
                     .unwrap_or_else(|| Arc::new(AtomicBool::new(false))),
             )),
-        };
-        let _rotate_handle = match (config.rotate_bind, rotate_flag.as_ref()) {
-            (Some(addr), Some(flag)) => Some(crate::rotate::spawn(
-                addr,
-                Arc::clone(flag),
-                Arc::clone(&shutdown),
-                Arc::clone(&authorized_keys),
-            )),
-            _ => None,
         };
 
         // Use queue 0 for the replication receiver's smoltcp connection.
@@ -1691,6 +1690,7 @@ pub fn run_dpdk(
                     shutdown,
                     authorized_keys,
                     false,
+                    rotate_flag,
                 );
             }
         }
@@ -1824,19 +1824,21 @@ pub fn run_dpdk(
     let cores = config.cores;
 
     // Wire runtime rotation into the journal stage (DPDK primary path).
+    // PROMOTE is rejected on a primary (no flag wired); ROTATE shares the
+    // same flag the journal stage observes.
     let mut journal_stage = journal_stage;
-    let rotate_flag = config.rotate_bind.map(|_| Arc::new(AtomicBool::new(false)));
-    let max_journal_bytes = config.max_journal_mib.saturating_mul(1024 * 1024);
-    journal_stage.set_rotation(max_journal_bytes, rotate_flag.clone());
-    let _rotate_handle = match (config.rotate_bind, rotate_flag.as_ref()) {
-        (Some(addr), Some(flag)) => Some(crate::rotate::spawn(
+    let rotate_flag = config.admin_bind.map(|_| Arc::new(AtomicBool::new(false)));
+    let _admin_handle = config.admin_bind.map(|addr| {
+        crate::admin::spawn(
             addr,
-            Arc::clone(flag),
+            None,
+            rotate_flag.clone(),
             Arc::clone(&shutdown),
             Arc::clone(&authorized_keys),
-        )),
-        _ => None,
-    };
+        )
+    });
+    let max_journal_bytes = config.max_journal_mib.saturating_mul(1024 * 1024);
+    journal_stage.set_rotation(max_journal_bytes, rotate_flag.clone());
     if config.max_journal_mib > 0 {
         info!(
             max_journal_mib = config.max_journal_mib,

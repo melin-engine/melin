@@ -72,7 +72,7 @@ With quorum durability (default), when 2 replicas are connected the response sta
 | `--replication-heartbeat-secs` | `5` | Seconds between primary-to-replica heartbeats. Used for disconnect detection. |
 | `--replication-ring-size` | `256` | Slots in the replication ring buffer (must be power of two). Each slot holds up to 512 KiB. More slots = more buffering before the journal stage backpressures. Default: 256 (128 MiB). See [Replication Ring Sizing](#replication-ring-sizing). |
 | `--no-quorum-durability` | `false` | Force fsync-gated mode even when 2 replicas are connected. Useful for debugging. |
-| `--promote-bind` | (none) | Address to listen for promotion commands (replica mode only). An operator sends `PROMOTE\n` to trigger in-process transition from replica to primary. |
+| `--admin-bind` | (none) | Address for the operator admin endpoint. Authenticated with operator keys; accepts `PROMOTE\n` (replica → primary, replica nodes only) and `ROTATE\n` (archive the live journal segment, any node). |
 | `--async-replica-ack` | `false` | Replica mode only. Ack incoming batches as soon as they are queued for the local journal stage instead of waiting for fsync. Removes ~50–80µs from the replication round-trip. **Read the durability tradeoff in [docs/replication.md](replication.md#async-replica-ack---async-replica-ack) before enabling** — appropriate only when the primary has hardware-redundant durable storage. |
 
 ### Startup Sequence

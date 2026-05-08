@@ -33,11 +33,11 @@ Two independent triggers fire rotation, both observed at the journal stage's fsy
 
 When `--max-journal-mib` is non-zero (default: 256 MiB) and the live segment crosses that size after an fsync batch, the journal stage rotates immediately. Tune this larger to reduce rotation frequency (and the brief stall described below) at the cost of more bytes per archive segment.
 
-### Operator-driven (`ROTATE` admin endpoint)
+### Operator-driven (`ROTATE` admin command)
 
-When `--rotate-bind <addr>` is set, the server listens on that TCP address for rotation commands. An operator authenticates with an Ed25519 operator key (challenge-response, same scheme as all other admin endpoints) and sends `ROTATE\n`. The journal stage performs one rotation at the next fsync boundary. Concurrent or repeated `ROTATE` commands collapse into a single rotation rather than queueing.
+When `--admin-bind <addr>` is set, the server listens on that TCP address for operator commands (the same endpoint that accepts `PROMOTE` for replica → primary failover). An operator authenticates with an Ed25519 operator key (challenge-response, same scheme as all other admin handshakes) and sends `ROTATE\n`. The journal stage performs one rotation at the next fsync boundary. Concurrent or repeated `ROTATE` commands collapse into a single rotation rather than queueing.
 
-This endpoint is available on both primary and replica nodes; each side rotates its own local segments independently.
+This command is accepted on both primary and replica nodes; each side rotates its own local segments independently.
 
 ## Recovery: Multi-Segment Walk
 
@@ -144,13 +144,13 @@ Each node — primary or replica — manages its own journal segments independen
 | `--journal <path>` | `melin.journal` | Path to the live journal segment. Archives use the same prefix with a `.NNNNNN` suffix. |
 | `--snapshot <path>` | (derived: `<journal>.snapshot`) | Explicit snapshot path. If unset, the server uses `<journal-path-with-.snapshot-extension>`. |
 | `--max-journal-mib <N>` | `256` | Rotate when the live segment exceeds N MiB at the next fsync boundary. Set to `0` to disable size-driven rotation. |
-| `--rotate-bind <addr>` | (unset) | TCP address for the operator-driven rotation endpoint. Authenticated with operator keys; sends `ROTATE\n`. |
+| `--admin-bind <addr>` | (unset) | TCP address for the operator admin endpoint. Authenticated with operator keys; accepts `ROTATE\n` (any node) and `PROMOTE\n` (replica nodes). |
 | `--snapshot-interval-ms <ms>` | `3_000_000` | Cadence of background shadow snapshots. Snapshots are independent of rotation but recovery uses the most recent one. |
 
 ## Operational Notes
 
 - **Archived segments are kept indefinitely.** Set up retention separately if disk usage matters.
 - **`ROTATE` does not block on the snapshot stage.** The admin command sets a flag and returns; the actual rotation happens at the next fsync boundary (typically within a few milliseconds under load).
-- **Both primary and replica honour `--rotate-bind`.** Each node rotates locally. To rotate both ends of a 1+1 deployment, send `ROTATE` to each address.
+- **Both primary and replica honour `--admin-bind`.** Each node rotates locally. To rotate both ends of a 1+1 deployment, send `ROTATE` to each address.
 - **Snapshot + segments must be on the same filesystem** for the atomic rename to work. Cross-filesystem `--snapshot` paths fall back to a copy that is not crash-safe.
 - **Legacy `.1`, `.2` archives** from pre-monotonic builds are still discoverable by recovery — they are visible in the archive listing for forensic replay, though new rotations always use the monotonic naming scheme.

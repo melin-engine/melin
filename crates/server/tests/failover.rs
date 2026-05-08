@@ -408,7 +408,7 @@ fn spawn_replica(
     primary_repl_port: u16,
     client_port: u16,
     health_port: u16,
-    promote_port: u16,
+    admin_port: u16,
 ) -> ServerProcess {
     spawn_replica_named(
         bin,
@@ -418,7 +418,7 @@ fn spawn_replica(
         primary_repl_port,
         client_port,
         health_port,
-        promote_port,
+        admin_port,
         "replica",
     )
 }
@@ -432,7 +432,7 @@ fn spawn_replica_named(
     primary_repl_port: u16,
     client_port: u16,
     health_port: u16,
-    promote_port: u16,
+    admin_port: u16,
     name: &str,
 ) -> ServerProcess {
     spawn_replica_named_with_extra(
@@ -443,7 +443,7 @@ fn spawn_replica_named(
         primary_repl_port,
         client_port,
         health_port,
-        promote_port,
+        admin_port,
         name,
         &[],
     )
@@ -458,7 +458,7 @@ fn spawn_replica_named_with_extra(
     primary_repl_port: u16,
     client_port: u16,
     health_port: u16,
-    promote_port: u16,
+    admin_port: u16,
     name: &str,
     extra_args: &[&str],
 ) -> ServerProcess {
@@ -474,8 +474,8 @@ fn spawn_replica_named_with_extra(
         format!("127.0.0.1:{primary_repl_port}"),
         "--replication-key".into(),
         repl_key_path.to_str().expect("valid path").into(),
-        "--promote-bind".into(),
-        format!("127.0.0.1:{promote_port}"),
+        "--admin-bind".into(),
+        format!("127.0.0.1:{admin_port}"),
         "--journal".into(),
         journal.to_str().expect("valid path").into(),
         "--authorized-keys".into(),
@@ -522,7 +522,7 @@ fn price(n: u64) -> Price {
 struct TestCluster {
     primary: ServerProcess,
     replica: ServerProcess,
-    promote_port: u16,
+    admin_port: u16,
     key: SigningKey,
     key2: SigningKey,
     operator_key: SigningKey,
@@ -555,7 +555,7 @@ impl TestCluster {
         let primary_repl_port = free_port();
         let replica_client_port = free_port();
         let replica_health_port = free_port();
-        let replica_promote_port = free_port();
+        let replica_admin_port = free_port();
 
         let primary = spawn_primary(
             &bin,
@@ -577,7 +577,7 @@ impl TestCluster {
             primary_repl_port,
             replica_client_port,
             replica_health_port,
-            replica_promote_port,
+            replica_admin_port,
         );
 
         wait_healthy(primary.health_addr, Duration::from_secs(30));
@@ -585,7 +585,7 @@ impl TestCluster {
         Self {
             primary,
             replica,
-            promote_port: replica_promote_port,
+            admin_port: replica_admin_port,
             key,
             key2,
             operator_key,
@@ -623,7 +623,7 @@ impl TestCluster {
         }
         let _ = self.primary.child.wait();
 
-        let promote_addr: SocketAddr = format!("127.0.0.1:{}", self.promote_port).parse().unwrap();
+        let promote_addr: SocketAddr = format!("127.0.0.1:{}", self.admin_port).parse().unwrap();
         promote(promote_addr, &self.operator_key);
 
         wait_ready(self.replica.health_addr, Duration::from_secs(30));
@@ -1167,9 +1167,7 @@ fn same_key_retry_after_failover_is_rejected() {
     drop(client);
 
     // Kill + promote.
-    let promote_addr: SocketAddr = format!("127.0.0.1:{}", cluster.promote_port)
-        .parse()
-        .unwrap();
+    let promote_addr: SocketAddr = format!("127.0.0.1:{}", cluster.admin_port).parse().unwrap();
     unsafe {
         libc::kill(cluster.primary.child.id() as i32, libc::SIGKILL);
     }
@@ -1205,8 +1203,8 @@ struct DualCluster {
     primary_repl_port: u16,
     replica1: ServerProcess,
     replica2: ServerProcess,
-    replica1_promote_port: u16,
-    replica2_promote_port: u16,
+    replica1_admin_port: u16,
+    replica2_admin_port: u16,
     key: SigningKey,
     key2: SigningKey,
     operator_key: SigningKey,
@@ -1285,8 +1283,8 @@ impl DualCluster {
             primary_repl_port,
             replica1,
             replica2,
-            replica1_promote_port: r1_promote,
-            replica2_promote_port: r2_promote,
+            replica1_admin_port: r1_promote,
+            replica2_admin_port: r2_promote,
             key,
             key2,
             operator_key,
@@ -1334,7 +1332,7 @@ impl DualCluster {
     }
 
     fn promote_replica1(&self) -> Client {
-        let addr: SocketAddr = format!("127.0.0.1:{}", self.replica1_promote_port)
+        let addr: SocketAddr = format!("127.0.0.1:{}", self.replica1_admin_port)
             .parse()
             .unwrap();
         promote(addr, &self.operator_key);
@@ -1344,7 +1342,7 @@ impl DualCluster {
     }
 
     fn promote_replica2(&self) -> Client {
-        let addr: SocketAddr = format!("127.0.0.1:{}", self.replica2_promote_port)
+        let addr: SocketAddr = format!("127.0.0.1:{}", self.replica2_admin_port)
             .parse()
             .unwrap();
         promote(addr, &self.operator_key);
@@ -1672,7 +1670,7 @@ fn replacement_replica_catches_up_from_journal() {
                 &format!("127.0.0.1:{}", cluster.primary_repl_port),
                 "--replication-key",
                 cluster.repl_key_path.to_str().unwrap(),
-                "--promote-bind",
+                "--admin-bind",
                 &format!("127.0.0.1:{r3_promote}"),
                 "--journal",
                 replacement_journal.to_str().expect("valid path"),
@@ -1800,7 +1798,7 @@ fn catchup_with_fills_during_gap() {
                 &format!("127.0.0.1:{}", cluster.primary_repl_port),
                 "--replication-key",
                 cluster.repl_key_path.to_str().unwrap(),
-                "--promote-bind",
+                "--admin-bind",
                 &format!("127.0.0.1:{r3_promote}"),
                 "--journal",
                 replacement_journal.to_str().unwrap(),
@@ -1918,7 +1916,7 @@ fn catchup_then_immediate_failover() {
                 &format!("127.0.0.1:{}", cluster.primary_repl_port),
                 "--replication-key",
                 cluster.repl_key_path.to_str().unwrap(),
-                "--promote-bind",
+                "--admin-bind",
                 &format!("127.0.0.1:{r3_promote}"),
                 "--journal",
                 replacement_journal.to_str().unwrap(),
@@ -2043,7 +2041,7 @@ fn fresh_replica_full_catchup() {
                 &format!("127.0.0.1:{}", cluster.primary_repl_port),
                 "--replication-key",
                 cluster.repl_key_path.to_str().unwrap(),
-                "--promote-bind",
+                "--admin-bind",
                 &format!("127.0.0.1:{r3_promote}"),
                 "--journal",
                 fresh_journal.to_str().unwrap(),
@@ -2296,7 +2294,7 @@ fn snapshot_transfer_when_archives_purged() {
     // Catch-up will fail → snapshot transfer kicks in.
     let replica_client_port = free_port();
     let replica_health_port = free_port();
-    let replica_promote_port = free_port();
+    let replica_admin_port = free_port();
     let _replica = spawn_replica(
         &bin,
         tmp.path(),
@@ -2305,7 +2303,7 @@ fn snapshot_transfer_when_archives_purged() {
         primary_repl_port2,
         replica_client_port,
         replica_health_port,
-        replica_promote_port,
+        replica_admin_port,
     );
 
     // Wait for the primary to become healthy (seeding done, replica connected).

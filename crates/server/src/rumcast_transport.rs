@@ -319,6 +319,20 @@ fn run_rumcast_primary(
     // ---- Engine pipeline ----
     let (app, writer, needs_seeding) = init_engine(&config)?;
 
+    // Spawn the admin listener once if configured. PROMOTE is rejected
+    // on a primary (no flag wired); ROTATE shares the flag the journal
+    // stage will observe inside `run_rumcast_primary_with_state`.
+    let rotate_flag = config.admin_bind.map(|_| Arc::new(AtomicBool::new(false)));
+    let _admin_handle = config.admin_bind.map(|addr| {
+        crate::admin::spawn(
+            addr,
+            None,
+            rotate_flag.clone(),
+            Arc::clone(&shutdown),
+            Arc::clone(&authorized_keys),
+        )
+    });
+
     run_rumcast_primary_with_state(
         config,
         rumcast_config,
@@ -328,6 +342,7 @@ fn run_rumcast_primary(
         writer,
         needs_seeding,
         Some(orders),
+        rotate_flag,
     )
 }
 
@@ -351,6 +366,11 @@ fn run_rumcast_primary_with_state(
     // (replica → primary) passes `None` and binds here — promotion
     // happens after a failover where clients are already retrying.
     pre_bound_orders_socket: Option<SharedUdp<KernelUdp>>,
+    // Shared admin rotation flag (None when no admin endpoint is
+    // configured). On the promotion path this is the same Arc the
+    // replica's journal stage observed; the new primary's stage picks
+    // up where it left off.
+    rotate_flag: Option<Arc<AtomicBool>>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let enable_replication = config.replication_bind.is_some();
     if enable_replication && config.standalone {
@@ -400,7 +420,7 @@ fn run_rumcast_primary_with_state(
 
     let Pipeline {
         mut input_producer,
-        journal_stage,
+        mut journal_stage,
         matching_stage,
         mut output_consumers,
         events_processed,
@@ -424,6 +444,18 @@ fn run_rumcast_primary_with_state(
     // journal-only path).
     let fastest_replica_cursor = Arc::new(AtomicU64::new(u64::MAX));
     let quorum_durability = !config.no_quorum_durability;
+
+    // Wire runtime journal rotation: size threshold + the shared
+    // admin flag so `ROTATE` keeps working across a replica → primary
+    // transition.
+    let max_journal_bytes = config.max_journal_mib.saturating_mul(1024 * 1024);
+    journal_stage.set_rotation(max_journal_bytes, rotate_flag);
+    if config.max_journal_mib > 0 {
+        info!(
+            max_journal_mib = config.max_journal_mib,
+            "runtime journal rotation enabled (size threshold, rumcast)"
+        );
+    }
 
     // Snapshot per-stage utilization handles before the stages move into
     // their threads. The TCP path threads response_utilization through
@@ -2062,24 +2094,22 @@ fn run_rumcast_replica(
         "loaded authorized_keys (replica mode)"
     );
 
-    // Promotion listener — same TCP-based operator interface the TCP
-    // replica path uses (`crate::promote::spawn`). The replication
-    // data plane runs over UDP, but operator promotion stays on TCP
-    // so existing tooling (admin CLI, dashboards) doesn't need to
+    // Admin listener — same TCP-based operator interface the kernel TCP
+    // replica path uses. The replication data plane runs over UDP, but
+    // PROMOTE/ROTATE stay on TCP so existing tooling doesn't need to
     // learn the rumcast wire format.
     let promote_flag = Arc::new(AtomicBool::new(false));
-    let _promote_handle = config.promote_bind.map(|addr| {
-        crate::promote::spawn(
+    let rotate_flag = config.admin_bind.map(|_| Arc::new(AtomicBool::new(false)));
+    let _admin_handle = config.admin_bind.map(|addr| {
+        crate::admin::spawn(
             addr,
-            Arc::clone(&promote_flag),
+            Some(Arc::clone(&promote_flag)),
+            rotate_flag.clone(),
             Arc::clone(&shutdown),
             Arc::clone(&authorized_keys),
         )
     });
 
-    // Runtime journal rotation on the rumcast replica path. Same shape
-    // as the kernel TCP replica wiring.
-    let rotate_flag = config.rotate_bind.map(|_| Arc::new(AtomicBool::new(false)));
     let max_journal_bytes = config.max_journal_mib.saturating_mul(1024 * 1024);
     let rotation = match (max_journal_bytes, rotate_flag.as_ref()) {
         (0, None) => None,
@@ -2088,15 +2118,6 @@ fn run_rumcast_replica(
             f.cloned()
                 .unwrap_or_else(|| Arc::new(AtomicBool::new(false))),
         )),
-    };
-    let _rotate_handle = match (config.rotate_bind, rotate_flag.as_ref()) {
-        (Some(addr), Some(flag)) => Some(crate::rotate::spawn(
-            addr,
-            Arc::clone(flag),
-            Arc::clone(&shutdown),
-            Arc::clone(&authorized_keys),
-        )),
-        _ => None,
     };
 
     // The replica's local UDP bind for rumcast. We reuse the `--bind`
@@ -2133,6 +2154,7 @@ fn run_rumcast_replica(
                 writer,
                 false, // no seeding — state already replayed from primary
                 None,  // bind inside — promotion has no startup-race risk
+                rotate_flag,
             )
         }
     }
