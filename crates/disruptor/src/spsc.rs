@@ -41,6 +41,12 @@ pub struct Producer<T> {
     shared: Arc<Shared<T>>,
     /// Cached tail value to reduce atomic reads.
     cached_tail: u64,
+    /// Slot index of the next write. Equals `shared.head + pending` where
+    /// `pending` is the number of in-place writes accumulated since the
+    /// last [`Self::flush`]. Tracked locally so producer-side advance is
+    /// a relaxed register, not an atomic store.
+    // u64 — sequence counter, never wraps in any realistic uptime.
+    local_head: u64,
 }
 
 /// Consumer end of the SPSC queue.
@@ -74,6 +80,7 @@ pub fn channel<T: Copy + Default>(capacity: usize) -> (Producer<T>, Consumer<T>)
     let producer = Producer {
         shared: Arc::clone(&shared),
         cached_tail: 0,
+        local_head: 0,
     };
 
     let consumer = Consumer {
@@ -85,94 +92,90 @@ pub fn channel<T: Copy + Default>(capacity: usize) -> (Producer<T>, Consumer<T>)
 }
 
 impl<T: Copy + Default> Producer<T> {
-    /// Try to publish a value. Returns the sequence number, or `Err(Full)`.
-    pub fn try_publish(&mut self, value: T) -> Result<u64, Full> {
-        let head = self.shared.head.get().load(Ordering::Relaxed);
+    /// Try to fill the next slot in place. Returns the sequence number on
+    /// success. The write is **not** visible to the consumer until
+    /// [`Self::flush`] (or [`Self::try_publish`]) executes the Release.
+    ///
+    /// Returns `Err(Full)` without invoking the closure if the ring cannot
+    /// accommodate one more entry.
+    ///
+    /// This is the building block for batch publishes: the caller can
+    /// accumulate many in-place writes — each just touches a slot, with
+    /// no atomic store — and pay the Release cost once at the end.
+    pub fn try_push_with<F: FnOnce(&mut T)>(&mut self, f: F) -> Result<u64, Full> {
+        let seq = self.local_head;
         let capacity = self.shared.mask + 1;
 
-        // Check if buffer is full.
-        if head - self.cached_tail >= capacity {
-            // Re-read tail in case consumer has advanced.
+        if seq - self.cached_tail >= capacity {
             self.cached_tail = self.shared.tail.get().load(Ordering::Acquire);
-            if head - self.cached_tail >= capacity {
+            if seq - self.cached_tail >= capacity {
                 return Err(Full);
             }
         }
 
-        let idx = (head & self.shared.mask) as usize;
-        // Safety: consumer won't read this slot until we advance head.
-        unsafe { *self.shared.slots[idx].get() = value };
-        // Release store so consumer sees the written data.
-        self.shared.head.get().store(head + 1, Ordering::Release);
-        Ok(head)
+        let idx = (seq & self.shared.mask) as usize;
+        // Safety: backpressure check above confirms the consumer is not
+        // reading this slot, and the SPSC contract gives us the only writer.
+        unsafe { f(&mut *self.shared.slots[idx].get()) };
+        self.local_head = seq + 1;
+        Ok(seq)
+    }
+
+    /// Blocking variant of [`Self::try_push_with`]. Spins until space is
+    /// available, flushing pending writes mid-spin so the consumer can drain
+    /// when the ring is saturated.
+    pub fn push_with<F: FnOnce(&mut T)>(&mut self, f: F) -> u64 {
+        let capacity = self.shared.mask + 1;
+        loop {
+            let seq = self.local_head;
+            if seq - self.cached_tail < capacity {
+                let idx = (seq & self.shared.mask) as usize;
+                // Safety: as in `try_push_with`.
+                unsafe { f(&mut *self.shared.slots[idx].get()) };
+                self.local_head = seq + 1;
+                return seq;
+            }
+            self.cached_tail = self.shared.tail.get().load(Ordering::Acquire);
+            if seq - self.cached_tail < capacity {
+                continue;
+            }
+            // No space: flush whatever is pending so the consumer can
+            // advance the tail. Without this we'd deadlock against a
+            // consumer that has already drained everything we've Released.
+            self.flush();
+            std::hint::spin_loop();
+        }
+    }
+
+    /// Make all in-place writes accumulated since the last flush visible
+    /// to the consumer with a single Release store on the head cursor.
+    /// No-op when no writes are pending.
+    #[inline]
+    pub fn flush(&mut self) {
+        let committed = self.shared.head.get().load(Ordering::Relaxed);
+        if self.local_head > committed {
+            // Release: consumer sees all in-place slot writes before the
+            // updated head.
+            self.shared
+                .head
+                .get()
+                .store(self.local_head, Ordering::Release);
+        }
+    }
+
+    /// Try to publish a value (write + immediate flush). Returns the
+    /// sequence number, or `Err(Full)`.
+    pub fn try_publish(&mut self, value: T) -> Result<u64, Full> {
+        let seq = self.try_push_with(|slot| *slot = value)?;
+        self.flush();
+        Ok(seq)
     }
 
     /// Publish a value, spinning until space is available.
     pub fn publish(&mut self, value: T) -> u64 {
-        loop {
-            match self.try_publish(value) {
-                Ok(seq) => return seq,
-                Err(Full) => std::hint::spin_loop(),
-            }
-        }
-    }
-
-    /// Publish a batch of values atomically with a single Release store.
-    ///
-    /// Writes up to `values.len()` slots and advances the head cursor
-    /// once at the end. Returns the number actually written, capped by
-    /// available ring capacity. Returning 0 means the ring is full —
-    /// the caller should retry after the consumer makes progress.
-    ///
-    /// Compared to calling [`Self::try_publish`] per element, this
-    /// amortizes the cursor Release store across the batch:
-    /// per-element work is just a `*slot = value` write, with one
-    /// Release at the end. That removes most of the ~300 ns/slot
-    /// dispatch cost the response stage was paying under saturation.
-    pub fn try_publish_batch(&mut self, values: &[T]) -> usize {
-        if values.is_empty() {
-            return 0;
-        }
-        let head = self.shared.head.get().load(Ordering::Relaxed);
-        let capacity = self.shared.mask + 1;
-
-        // Re-read tail if the cached view says we're full.
-        let mut available = capacity.saturating_sub(head - self.cached_tail);
-        if available == 0 {
-            self.cached_tail = self.shared.tail.get().load(Ordering::Acquire);
-            available = capacity.saturating_sub(head - self.cached_tail);
-            if available == 0 {
-                return 0;
-            }
-        }
-
-        let count = (values.len() as u64).min(available) as usize;
-        for (i, value) in values.iter().take(count).enumerate() {
-            let idx = ((head + i as u64) & self.shared.mask) as usize;
-            // Safety: consumer won't read these slots until we advance head.
-            unsafe { *self.shared.slots[idx].get() = *value };
-        }
-        // Single Release store covers all `count` slots.
-        self.shared
-            .head
-            .get()
-            .store(head + count as u64, Ordering::Release);
-        count
-    }
-
-    /// Publish all `values`, spinning until each fits. Equivalent to
-    /// looping [`Self::publish`] per value, but amortizes the cursor
-    /// Release store via [`Self::try_publish_batch`].
-    pub fn publish_batch_blocking(&mut self, values: &[T]) {
-        let mut written = 0;
-        while written < values.len() {
-            let n = self.try_publish_batch(&values[written..]);
-            if n == 0 {
-                std::hint::spin_loop();
-            } else {
-                written += n;
-            }
-        }
+        let seq = self.push_with(|slot| *slot = value);
+        self.flush();
+        seq
     }
 }
 
@@ -320,53 +323,56 @@ mod tests {
     }
 
     #[test]
-    fn try_publish_batch_writes_all_when_capacity_available() {
-        let (mut producer, mut consumer) = channel::<u64>(16);
-        let values = [10, 20, 30, 40, 50];
-        let n = producer.try_publish_batch(&values);
-        assert_eq!(n, 5);
-        let mut buf = [0u64; 5];
-        let read = consumer.consume_batch(&mut buf, 5);
-        assert_eq!(read, 5);
-        assert_eq!(buf, values);
-    }
-
-    #[test]
-    fn try_publish_batch_caps_at_available_capacity() {
-        // Ring of capacity 8. Fill 6 slots, then try to publish 5 — only
-        // 2 should land; caller is responsible for retrying the rest.
-        let (mut producer, _consumer) = channel::<u64>(8);
-        for i in 0..6 {
-            producer.try_publish(i).unwrap();
-        }
-        let n = producer.try_publish_batch(&[100, 101, 102, 103, 104]);
-        assert_eq!(n, 2);
-    }
-
-    #[test]
-    fn try_publish_batch_returns_zero_when_full() {
-        let (mut producer, _consumer) = channel::<u64>(4);
-        for i in 0..4 {
-            producer.try_publish(i).unwrap();
-        }
-        assert_eq!(producer.try_publish_batch(&[99, 100]), 0);
-    }
-
-    #[test]
-    fn try_publish_batch_empty_input_returns_zero() {
-        let (mut producer, _consumer) = channel::<u64>(8);
-        let empty: [u64; 0] = [];
-        assert_eq!(producer.try_publish_batch(&empty), 0);
-    }
-
-    #[test]
-    fn publish_batch_blocking_handles_capacity_pressure() {
-        // Ring of 8, batch of 20. Producer must block multiple times
-        // while consumer drains. End result: all 20 values delivered
-        // in order.
+    fn in_place_batch_invisible_until_flush() {
+        // Pending writes must not leak to the consumer before flush.
         let (mut producer, mut consumer) = channel::<u64>(8);
-        let values: Vec<u64> = (0..20).collect();
+        producer.try_push_with(|s| *s = 1).unwrap();
+        producer.try_push_with(|s| *s = 2).unwrap();
+        producer.try_push_with(|s| *s = 3).unwrap();
+        assert!(consumer.try_consume().is_none(), "no flush — no visibility");
 
+        producer.flush();
+        assert_eq!(consumer.try_consume(), Some((0, 1)));
+        assert_eq!(consumer.try_consume(), Some((1, 2)));
+        assert_eq!(consumer.try_consume(), Some((2, 3)));
+        assert_eq!(consumer.try_consume(), None);
+    }
+
+    #[test]
+    fn try_push_with_full_does_not_invoke_closure() {
+        let (mut producer, _consumer) = channel::<u64>(4);
+        for _ in 0..4 {
+            producer.try_push_with(|s| *s = 7).unwrap();
+        }
+        producer.flush();
+        let mut called = false;
+        let r = producer.try_push_with(|s| {
+            called = true;
+            *s = 99;
+        });
+        assert_eq!(r, Err(Full));
+        assert!(!called, "closure must not run on Full");
+    }
+
+    #[test]
+    fn flush_is_idempotent_and_zero_pending_is_noop() {
+        let (mut producer, mut consumer) = channel::<u64>(4);
+        producer.flush(); // no-op, no writes pending
+        producer.try_push_with(|s| *s = 42).unwrap();
+        producer.flush();
+        producer.flush(); // second flush — also a no-op
+        assert_eq!(consumer.try_consume(), Some((0, 42)));
+    }
+
+    #[test]
+    fn push_with_internal_flush_breaks_full_deadlock() {
+        // Ring of 8 — caller never explicitly flushes. The only way the
+        // consumer ever sees a write is `push_with`'s own mid-spin flush
+        // when it observes a full ring. This proves that path is wired
+        // correctly: without it, the producer would write 8 slots, find
+        // the ring full on the 9th, and spin forever because nothing
+        // was Released for the consumer to drain.
+        let (mut producer, mut consumer) = channel::<u64>(8);
         let consumer_thread = std::thread::spawn(move || {
             let mut received = Vec::with_capacity(20);
             loop {
@@ -382,8 +388,44 @@ mod tests {
             received
         });
 
-        producer.publish_batch_blocking(&values);
+        for i in 0..20u64 {
+            producer.push_with(|s| *s = i);
+        }
+        // Final flush for whatever the internal mid-spin flushes left
+        // pending after the last write.
+        producer.flush();
         let received = consumer_thread.join().unwrap();
-        assert_eq!(received, values);
+        assert_eq!(received, (0..20u64).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn try_push_with_panicking_closure_does_not_advance_cursor() {
+        // If the caller's closure panics partway through filling a slot,
+        // `local_head` must NOT advance — otherwise the next push would
+        // skip the partial slot and the consumer would observe stale data.
+        // The slot itself contains junk after a panic; correctness relies
+        // on the next write reusing the same index and overwriting it.
+        let (mut producer, mut consumer) = channel::<u64>(8);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = producer.try_push_with(|_| panic!("synthetic"));
+        }));
+        assert!(result.is_err());
+        // Cursor unchanged: the next try_publish should land at seq 0.
+        assert_eq!(producer.try_publish(42).unwrap(), 0);
+        assert_eq!(consumer.try_consume(), Some((0, 42)));
+    }
+
+    #[test]
+    fn try_publish_after_pending_writes_flushes_all() {
+        // try_publish does write + flush. If there are pending in-place
+        // writes from earlier try_push_with calls, they must be flushed
+        // along with the new value.
+        let (mut producer, mut consumer) = channel::<u64>(8);
+        producer.try_push_with(|s| *s = 10).unwrap();
+        producer.try_push_with(|s| *s = 20).unwrap();
+        producer.try_publish(30).unwrap();
+        assert_eq!(consumer.try_consume(), Some((0, 10)));
+        assert_eq!(consumer.try_consume(), Some((1, 20)));
+        assert_eq!(consumer.try_consume(), Some((2, 30)));
     }
 }

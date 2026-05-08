@@ -150,23 +150,13 @@ pub fn run(
     #[cfg(feature = "tick-to-trade")]
     let mut encode_rec = trace::register_stage("response: encode (per-kind wire encoding)");
 
-    // Per-tid TX accumulation buffers. Filled during the slot loop and
-    // flushed in one batched SPSC publish at end of batch. Each
-    // OutputSlot expands to at most 2 frames (payload + optional
-    // BatchEnd terminator), so 2× MAX_BATCH is the upper bound. The
-    // SPSC ring is 4096-deep so a single flush never blocks at this
-    // saturation level.
-    let num_tids = tx_producers.len();
-    let mut tx_buffers: Vec<Vec<TxFrame>> = (0..num_tids)
-        .map(|_| Vec::with_capacity(MAX_BATCH * 2))
-        .collect();
-    // Per-tid recv_ts list for the BatchEnd frames in each pending TX
-    // buffer. After the batch flushes, we walk this list and record one
-    // server-e2e sample per request — capturing the full path from NIC
-    // ingress to the moment the response is visible to the DPDK poll
-    // thread (i.e. after the SPSC Release store fires).
+    // Per-tid recv_ts list for the BatchEnd frames written this batch.
+    // After the slot loop flushes the SPSC producers, we walk this list
+    // and record one server-e2e sample per request — capturing the full
+    // path from NIC ingress to the moment the response is visible to the
+    // DPDK poll thread (i.e. after the SPSC Release store fires).
     #[cfg(feature = "latency-trace")]
-    let mut e2e_pending: Vec<Vec<melin_journal::trace::TraceTimestamp>> = (0..num_tids)
+    let mut e2e_pending: Vec<Vec<melin_journal::trace::TraceTimestamp>> = (0..tx_producers.len())
         .map(|_| Vec::with_capacity(MAX_BATCH))
         .collect();
 
@@ -378,21 +368,23 @@ pub fn run(
                 #[cfg(feature = "tick-to-trade")]
                 encode_rec.record_elapsed(encode_start, trace::trace_ts());
 
-                // Build the wire frame and queue it for the DPDK poll
-                // thread. We accumulate per-tid here and publish the
-                // whole batch with a single SPSC Release store at end
-                // of the slot loop (see flush below). That amortizes
-                // the per-frame Release cost — at saturation it was
-                // ~340 ns/frame in the dispatch stage, dominating
-                // encode (~40 ns) by 8×.
-                let mut frame = TxFrame {
-                    connection_id: slot.connection_id,
-                    len: written as u16,
-                    ..Default::default()
-                };
-                frame.data[..written].copy_from_slice(&encode_buf[..written]);
+                // Write the wire frame straight into the SPSC ring slot
+                // — no intermediate buffer, no extra memcpy of the
+                // 134-byte TxFrame. The cursor is not Released here:
+                // we accumulate every frame for this batch and Release
+                // once per dirty tid at the end of the slot loop. That
+                // amortizes the per-frame Release (~10–20 ns) and, more
+                // importantly, lets the DPDK poll thread drain a whole
+                // batch's worth of frames in a single consume cycle
+                // instead of one wire round-trip per frame.
                 let tid = (slot.connection_id >> 56) as usize % tx_producers.len();
-                tx_buffers[tid].push(frame);
+                let conn_id = slot.connection_id;
+                let len = written as u16;
+                tx_producers[tid].push_with(|frame| {
+                    frame.connection_id = conn_id;
+                    frame.len = len;
+                    frame.data[..written].copy_from_slice(&encode_buf[..written]);
+                });
 
                 // Stash the recv_ts for the per-request e2e sample —
                 // the BatchEnd frame is the request terminator. We
@@ -410,16 +402,16 @@ pub fn run(
             }
         }
 
-        // Flush each per-tid accumulation buffer to its SPSC producer
-        // in a single batched publish (one Release store per tid),
-        // then record the per-request server-e2e samples relative to
-        // the post-flush wall-clock time so the metric reflects "the
-        // moment the DPDK poll thread can see this response".
-        for tid in 0..tx_buffers.len() {
-            if !tx_buffers[tid].is_empty() {
-                tx_producers[tid].publish_batch_blocking(&tx_buffers[tid]);
-                tx_buffers[tid].clear();
-            }
+        // Flush every producer: one Release store per tid that received
+        // at least one in-place write this batch (no-op for tids with
+        // nothing pending — `flush` short-circuits on `local_head ==
+        // committed`). Frames accumulated across the slot loop become
+        // visible to the DPDK poll thread atomically here. We then
+        // record server-e2e samples relative to the post-flush wall
+        // clock so the metric reflects "the moment the DPDK poll thread
+        // can see this response".
+        for prod in tx_producers.iter_mut() {
+            prod.flush();
         }
         #[cfg(feature = "latency-trace")]
         {
