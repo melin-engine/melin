@@ -72,7 +72,6 @@ pub enum Body {
     Empty,
 }
 
-
 /// Fetch and parse `/stats-dump` from the given health-endpoint
 /// address. Always returns a `Body` — failures degrade to
 /// `Body::Empty` rather than propagating, so a missing dump never
@@ -88,9 +87,8 @@ fn fetch_inner(addr: SocketAddr) -> std::io::Result<String> {
     let mut stream = std::net::TcpStream::connect_timeout(&addr, CONNECT_TIMEOUT)?;
     stream.set_read_timeout(Some(READ_TIMEOUT))?;
     stream.set_nodelay(true)?;
-    stream.write_all(
-        b"GET /stats-dump HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
-    )?;
+    stream
+        .write_all(b"GET /stats-dump HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")?;
 
     let mut buf = vec![0u8; RECV_BUF];
     let mut total = 0;
@@ -431,7 +429,10 @@ stage\tgood\t10\t1\t2\t3\t4\t5\t6
 
     #[test]
     fn render_json_empty_state() {
-        assert_eq!(render_json(&Body::Empty), r#"{"state":"empty","entries":[]}"#);
+        assert_eq!(
+            render_json(&Body::Empty),
+            r#"{"state":"empty","entries":[]}"#
+        );
     }
 
     #[test]

@@ -123,15 +123,12 @@ pub fn run(
     // tick-to-trade decomposition; spsc/dispatch/server-e2e are kept
     // alongside as overall sanity checks.
     #[cfg(feature = "latency-trace")]
-    let spsc_rec = trace::register_stage(
-        "response: SPSC wakeup (matching publish → response consume)",
-    );
+    let spsc_rec =
+        trace::register_stage("response: SPSC wakeup (matching publish → response consume)");
     #[cfg(feature = "latency-trace")]
-    let dispatch_rec =
-        trace::register_stage("response: dispatch (consume → socket write)");
+    let dispatch_rec = trace::register_stage("response: dispatch (consume → socket write)");
     #[cfg(feature = "latency-trace")]
-    let server_e2e_rec =
-        trace::register_stage("server e2e (reader recv → response flush)");
+    let server_e2e_rec = trace::register_stage("server e2e (reader recv → response flush)");
     // Tick-to-trade breakdown: per-slot wait observed for each
     // durability path (recorded only when the gate actually held us
     // up — cache-hit paths skip to avoid inflating the metric with
@@ -142,9 +139,8 @@ pub fn run(
     // stages roughly double the hot-path mutex traffic vs the lighter
     // 4-stage mode.
     #[cfg(feature = "tick-to-trade")]
-    let journal_wait_rec = trace::register_stage(
-        "response: journal-wait (match_complete → journal cursor crossed)",
-    );
+    let journal_wait_rec =
+        trace::register_stage("response: journal-wait (match_complete → journal cursor crossed)");
     #[cfg(feature = "tick-to-trade")]
     let replica_wait_rec = trace::register_stage(
         "response: replica-wait (match_complete → replication cursor crossed)",
@@ -714,16 +710,11 @@ impl GateCrossTracker {
             self.replica_was_below = repl_min < self.needed;
             self.first = false;
         }
-        if self.journal_was_below
-            && self.journal_crossed_ts.is_none()
-            && journal_pos >= self.needed
+        if self.journal_was_below && self.journal_crossed_ts.is_none() && journal_pos >= self.needed
         {
             self.journal_crossed_ts = Some(now_ns);
         }
-        if self.replica_was_below
-            && self.replica_crossed_ts.is_none()
-            && repl_min >= self.needed
-        {
+        if self.replica_was_below && self.replica_crossed_ts.is_none() && repl_min >= self.needed {
             self.replica_crossed_ts = Some(now_ns);
         }
     }
@@ -758,9 +749,9 @@ fn print_utilization(stage: &str, busy: u64, idle: u64) {
 
 #[cfg(test)]
 mod tests {
-    use super::durable_pos;
     #[cfg(feature = "tick-to-trade")]
     use super::GateCrossTracker;
+    use super::durable_pos;
 
     // --- Standalone (no replicas) ---
 

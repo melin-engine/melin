@@ -337,13 +337,11 @@ fn reader_loop<R: AsRawFd>(
     // and feeds the bench's tick-to-trade decomposition (heavier,
     // gated on `tick-to-trade`).
     #[cfg(feature = "latency-trace")]
-    let publish_rec = melin_journal::trace::register_stage(
-        "reader: publish (decode → disruptor publish)",
-    );
+    let publish_rec =
+        melin_journal::trace::register_stage("reader: publish (decode → disruptor publish)");
     #[cfg(feature = "tick-to-trade")]
-    let ingest_rec = melin_journal::trace::register_stage(
-        "reader: ingest (recv_ts → publish complete)",
-    );
+    let ingest_rec =
+        melin_journal::trace::register_stage("reader: ingest (recv_ts → publish complete)");
 
     // Coarse gate for timeout scanning — avoids scanning on every
     // submit_and_wait return during high throughput.
