@@ -936,6 +936,54 @@ impl<E: AppEvent> JournalWriter<E> {
         0
     }
 
+    /// Rotate the live journal segment in place.
+    ///
+    /// Flushes any pending batch durably, renames the current live file to
+    /// the next monotonic archive slot (`<path>.NNNNNN`), and opens a
+    /// fresh live segment at the original path seeded with
+    /// `GenesisHash(prev_chain_hash)`. The new segment continues the
+    /// sequence counter — the next event written gets `prev_next_seq + 1`
+    /// (the GenesisHash itself takes `prev_next_seq`).
+    ///
+    /// Multi-segment recovery (see [`crate::segment`]) walks archives in
+    /// order before opening the live segment, so events written before
+    /// the rotation remain replayable.
+    ///
+    /// On error after the rename, this method best-effort restores the
+    /// live segment so the next recovery sees a usable live file. If both
+    /// the recreate and the restore fail, the operator is left with the
+    /// archive on disk and no live file — recovery treats this as the
+    /// "snapshot-only post-rotation crash" case (see
+    /// [`crate::segment::list_archives`]).
+    pub fn rotate_segment(&mut self) -> Result<std::path::PathBuf, JournalError> {
+        self.flush_batch_sync()?;
+
+        let path = self.path.clone();
+        let next_seq = self.next_sequence;
+        // GenesisHash carries the chain state at the rotation boundary so
+        // the new segment's chain anchors to the previous one. Falls back
+        // to zeros only when hash-chain is feature-disabled.
+        let genesis = self.chain_hash().unwrap_or([0u8; 32]);
+
+        let archived = crate::segment::archive_live(&path).map_err(JournalError::Io)?;
+
+        match Self::create_continuing(&path, next_seq, genesis) {
+            Ok(new_writer) => {
+                *self = new_writer;
+                Ok(archived)
+            }
+            Err(e) => {
+                // Best-effort: undo the rename so the next recovery still
+                // sees a live file at the canonical path. The error from
+                // the rename-back is swallowed because `e` is what the
+                // caller needs to see, and operators can resolve the
+                // residual layout from the on-disk files.
+                let _ = std::fs::rename(&archived, &path);
+                Err(e)
+            }
+        }
+    }
+
     /// Current BLAKE3 chain hash, if hash chain is active.
     /// Returns `None` when the `hash-chain` feature is disabled, for v5
     /// journals, or if no events have been written.

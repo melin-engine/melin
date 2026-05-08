@@ -307,6 +307,18 @@ pub struct JournalStage<E: AppEvent> {
     busy_spin: bool,
     /// Shared busy/idle counters for health endpoint monitoring.
     utilization: Arc<StageUtilization>,
+    /// Live-segment size threshold (bytes). When > 0, the journal stage
+    /// rotates immediately after the fsync batch that pushes the live
+    /// file past this threshold. `0` disables size-driven rotation —
+    /// runtime rotation can still be requested manually via
+    /// `rotate_requested`.
+    max_journal_bytes: u64,
+    /// Operator-driven rotation flag. When this flips to `true` (e.g.
+    /// from a `ROTATE` admin command), the journal stage performs one
+    /// rotation at the next fsync boundary and clears the flag. Cleared
+    /// via `compare_exchange(true → false)` so concurrent triggers
+    /// degrade to a single rotation rather than queueing.
+    rotate_requested: Option<Arc<AtomicBool>>,
 }
 
 /// Replication state for the journal stage. Boxed in JournalStage to
@@ -378,7 +390,22 @@ impl<E: AppEvent> JournalStage<E> {
             last_seq: None,
             busy_spin,
             utilization: Arc::new(StageUtilization::new()),
+            max_journal_bytes: 0,
+            rotate_requested: None,
         }
+    }
+
+    /// Enable runtime rotation.
+    ///
+    /// `max_journal_bytes`: live-segment size threshold in bytes; `0`
+    /// disables size-driven rotation. `rotate_flag`: optional shared
+    /// AtomicBool flipped by the admin endpoint to force a rotation at
+    /// the next fsync boundary. Either or both may be supplied — both
+    /// disabled means rotation only happens at startup (legacy
+    /// behaviour).
+    pub fn set_rotation(&mut self, max_journal_bytes: u64, rotate_flag: Option<Arc<AtomicBool>>) {
+        self.max_journal_bytes = max_journal_bytes;
+        self.rotate_requested = rotate_flag;
     }
 
     /// Shared utilization counters for health endpoint monitoring.
@@ -641,6 +668,7 @@ impl<E: AppEvent> JournalStage<E> {
 
                     self.consumer.commit(pending);
                     self.publish_chain_hash();
+                    self.maybe_rotate();
 
                     pending = 0;
                     first_write_ts = None;
@@ -799,6 +827,56 @@ impl<E: AppEvent> JournalStage<E> {
                 self.writer.next_sequence().saturating_sub(1),
                 Ordering::Release,
             );
+        }
+    }
+
+    /// Rotate the live journal segment if a trigger has fired.
+    ///
+    /// Called at fsync boundaries from both the sync and uring paths.
+    /// Two triggers: a manual `rotate_requested` flag (consumed via
+    /// CAS so duplicate signals collapse into one rotation) and a
+    /// size threshold against the live segment's on-disk size. After
+    /// a successful rotation, re-publishes the chain hash so shadow
+    /// observers pick up the new genesis-anchored value.
+    ///
+    /// Errors are logged but do not abort the pipeline: the live
+    /// segment is restored by `JournalWriter::rotate_segment` on
+    /// failure, so the next batch can continue writing to it.
+    #[inline]
+    fn maybe_rotate(&mut self) {
+        let manual = self
+            .rotate_requested
+            .as_ref()
+            .map(|f| {
+                f.compare_exchange(true, false, Ordering::AcqRel, Ordering::Relaxed)
+                    .is_ok()
+            })
+            .unwrap_or(false);
+        let size_triggered =
+            self.max_journal_bytes > 0 && self.writer.valid_end() >= self.max_journal_bytes;
+        if !(manual || size_triggered) {
+            return;
+        }
+        let pre_size = self.writer.valid_end();
+        match self.writer.rotate_segment() {
+            Ok(archived) => {
+                tracing::info!(
+                    archive = %archived.display(),
+                    pre_rotate_bytes = pre_size,
+                    next_sequence = self.writer.next_sequence(),
+                    trigger = if manual { "manual" } else { "size" },
+                    "journal segment rotated"
+                );
+                // The new segment's GenesisHash advanced the chain;
+                // republish so shadow + cursor observers see it.
+                self.publish_chain_hash();
+            }
+            Err(e) => {
+                tracing::error!(
+                    error = %e,
+                    "journal segment rotation failed; continuing with current segment"
+                );
+            }
         }
     }
 
@@ -1031,6 +1109,7 @@ impl<E: AppEvent> JournalStage<E> {
                 self.publish_chain_hash();
                 let completed = inflight.take().expect("checked above");
                 self.writer.confirm_async_write(completed.0);
+                self.maybe_rotate();
             }
 
             // --- Read events from disruptor ---
@@ -1142,6 +1221,7 @@ impl<E: AppEvent> JournalStage<E> {
                 self.publish_chain_hash();
                 let completed = inflight.take().expect("checked above");
                 self.writer.confirm_async_write(completed.0);
+                self.maybe_rotate();
             }
 
             // --- Decide whether to submit ---
@@ -1167,6 +1247,7 @@ impl<E: AppEvent> JournalStage<E> {
                         self.consumer.set_progress(seq);
                         self.publish_chain_hash();
                         self.writer.confirm_async_write(batch_data);
+                        self.maybe_rotate();
                     }
 
                     // Publish the accumulated InputBatch frame to
@@ -1202,8 +1283,16 @@ impl<E: AppEvent> JournalStage<E> {
                             inflight = Some((async_batch, seq));
                         }
                         Ok(None) => {
-                            // Buffer was empty (all read-only queries), just commit.
+                            // No async write was needed — either the batch
+                            // contained only read-only queries, or the
+                            // bytes fit entirely in the partial-tail sector
+                            // and were written synchronously by
+                            // `take_batch_for_async_write`. In both cases
+                            // the data is durable, so commit, publish chain
+                            // state, and check for rotation triggers.
                             self.consumer.commit(pending);
+                            self.publish_chain_hash();
+                            self.maybe_rotate();
                         }
                         Err(e) => {
                             return Err(JournalError::Io(std::io::Error::other(format!(

@@ -1356,4 +1356,185 @@ mod tests {
         shutdown.store(true, Ordering::Relaxed);
         handle.join().unwrap();
     }
+
+    /// Manual rotation: flipping `rotate_requested` causes the journal
+    /// stage to archive the live segment at the next fsync boundary.
+    /// Verifies (1) an archive at `.000001` is created, (2) the live
+    /// journal continues taking new events, and (3) full recovery walks
+    /// archive + live and reproduces the cumulative state.
+    #[cfg(not(feature = "no-persist"))]
+    #[test]
+    fn journal_stage_rotates_on_manual_request() {
+        use std::time::Duration as StdDuration;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rotate_manual.journal");
+        let writer = JournalWriter::create(&path).unwrap();
+
+        let (mut producer, mut consumers) = ring::DisruptorBuilder::<InputSlot>::new(64)
+            .add_consumer()
+            .build();
+        let consumer = consumers.pop().unwrap();
+
+        let mut stage = JournalStage::new(
+            writer,
+            consumer,
+            StdDuration::ZERO,
+            MAX_JOURNAL_BATCH,
+            false,
+        );
+        let rotate_flag = Arc::new(AtomicBool::new(false));
+        stage.set_rotation(
+            /* max_journal_bytes */ 0,
+            Some(Arc::clone(&rotate_flag)),
+        );
+
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let s = Arc::clone(&shutdown);
+        let handle = std::thread::spawn(move || stage.run(&s));
+
+        // Helper: publish a deposit event with a unique request_seq so
+        // every event survives dedup at recovery time.
+        let mut req_seq: u64 = 0;
+        let mut publish_deposit = |amount: u64| {
+            req_seq += 1;
+            producer.publish(InputSlot {
+                connection_id: 1,
+                key_hash: 1,
+                request_seq: req_seq,
+                sequence: 0,
+                timestamp_ns: 1_000_000_000 + req_seq,
+                event: JournalEvent::App(crate::trading_event::TradingEvent::Deposit {
+                    account: AccountId(1),
+                    currency: CurrencyId(1),
+                    amount,
+                }),
+                publish_ts: trace_ts(),
+                recv_ts: trace_ts(),
+            });
+        };
+
+        // Phase 1 — pre-rotation events.
+        publish_deposit(100);
+        publish_deposit(200);
+
+        // Wait for both events to be fsynced into the live segment so
+        // the archive captures them. Polled rather than fixed-sleep so
+        // a slow CI machine doesn't intermittently rotate before phase-1
+        // events have made it to disk.
+        let archive_path = std::path::PathBuf::from(format!("{}.000001", path.display()));
+        let pre_size_path = path.clone();
+        let deadline = std::time::Instant::now() + StdDuration::from_secs(5);
+        while std::time::Instant::now() < deadline
+            && (!pre_size_path.exists()
+                || std::fs::metadata(&pre_size_path)
+                    .map(|m| m.len())
+                    .unwrap_or(0)
+                    < 4096)
+        {
+            std::thread::sleep(StdDuration::from_millis(20));
+        }
+
+        rotate_flag.store(true, Ordering::Release);
+
+        // Drive a third event after the flag — fsyncing it forces the
+        // journal stage past a `maybe_rotate` boundary.
+        publish_deposit(50);
+
+        // Wait for the archive to appear.
+        let deadline = std::time::Instant::now() + StdDuration::from_secs(5);
+        while !archive_path.exists() && std::time::Instant::now() < deadline {
+            std::thread::sleep(StdDuration::from_millis(20));
+        }
+        assert!(
+            archive_path.exists(),
+            "archive {} should exist after manual rotation",
+            archive_path.display()
+        );
+
+        // Phase 2 — events after the rotation must land in the live
+        // (post-rotation) segment.
+        publish_deposit(1000);
+
+        // Allow the post-rotation event to fsync.
+        std::thread::sleep(StdDuration::from_millis(150));
+
+        shutdown.store(true, Ordering::Relaxed);
+        let _writer = handle.join().unwrap();
+
+        // Recovery via the multi-segment walker should produce a single
+        // exchange with deposits totalling 100 + 200 + 50 + 1000 = 1350.
+        let exchange = crate::journal::JournaledExchange::recover(&path).unwrap();
+        let bal = exchange
+            .exchange()
+            .accounts()
+            .balance(AccountId(1), CurrencyId(1))
+            .available;
+        assert_eq!(bal, 1350, "all deposits across the rotation must replay");
+    }
+
+    /// Size-threshold rotation: setting a small `max_journal_bytes`
+    /// causes the stage to rotate without operator intervention. The
+    /// threshold is engaged after the first batch crosses the limit.
+    #[cfg(not(feature = "no-persist"))]
+    #[test]
+    fn journal_stage_rotates_on_size_threshold() {
+        use std::time::Duration as StdDuration;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rotate_size.journal");
+        let writer = JournalWriter::create(&path).unwrap();
+
+        let (mut producer, mut consumers) = ring::DisruptorBuilder::<InputSlot>::new(64)
+            .add_consumer()
+            .build();
+        let consumer = consumers.pop().unwrap();
+
+        let mut stage = JournalStage::new(
+            writer,
+            consumer,
+            StdDuration::ZERO,
+            MAX_JOURNAL_BATCH,
+            false,
+        );
+        // Tiny threshold — any non-empty fsync will cross it. The
+        // pre-allocation tail in the journal file means `valid_end`
+        // grows in sector-size increments; using 1 byte ensures the
+        // first batch fsync trips the trigger reliably.
+        stage.set_rotation(/* max_journal_bytes */ 1, None);
+
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let s = Arc::clone(&shutdown);
+        let handle = std::thread::spawn(move || stage.run(&s));
+
+        producer.publish(InputSlot {
+            connection_id: 1,
+            key_hash: 1,
+            request_seq: 1,
+            sequence: 0,
+            timestamp_ns: 1_000_000_000,
+            event: JournalEvent::App(crate::trading_event::TradingEvent::Deposit {
+                account: AccountId(1),
+                currency: CurrencyId(1),
+                amount: 42,
+            }),
+            publish_ts: trace_ts(),
+            recv_ts: trace_ts(),
+        });
+
+        let archive_path = std::path::PathBuf::from(format!("{}.000001", path.display()));
+        let deadline = std::time::Instant::now() + StdDuration::from_secs(5);
+        while !archive_path.exists() && std::time::Instant::now() < deadline {
+            std::thread::sleep(StdDuration::from_millis(20));
+        }
+
+        shutdown.store(true, Ordering::Relaxed);
+        let _ = handle.join().unwrap();
+
+        assert!(
+            archive_path.exists(),
+            "size-threshold rotation should have produced {}",
+            archive_path.display()
+        );
+    }
 }

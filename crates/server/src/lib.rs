@@ -69,6 +69,7 @@ pub mod promote;
 mod reader;
 pub mod request;
 mod response;
+pub mod rotate;
 pub mod tick;
 
 /// Replica failover and shadow snapshotting. Both are transport-level

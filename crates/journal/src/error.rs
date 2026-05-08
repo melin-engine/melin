@@ -57,6 +57,18 @@ pub enum JournalError {
     /// sector size. O_DIRECT writes would fail with EINVAL. The journal must be
     /// re-created on the target device or moved back to the original device.
     SectorSizeMismatch { journal: usize, device: usize },
+    /// A successor segment's `GenesisHash` payload does not equal the
+    /// preceding segment's final chain hash. Indicates either tampering
+    /// with archived segments or a missing segment between two surviving
+    /// archives. Reported with the boundary segment's archive index.
+    SegmentChainBreak {
+        /// Archive index of the segment whose GenesisHash was found to
+        /// disagree with the previous segment's tail. The bare live
+        /// segment uses `index = 0` for diagnostics only.
+        index: u32,
+        expected: [u8; 32],
+        actual: [u8; 32],
+    },
 }
 
 impl fmt::Display for JournalError {
@@ -104,6 +116,17 @@ impl fmt::Display for JournalError {
                 f,
                 "journal sector size ({journal}) is smaller than the device's physical \
                  sector size ({device}); re-create the journal or move it to the original device"
+            ),
+            Self::SegmentChainBreak {
+                index,
+                expected,
+                actual,
+            } => write!(
+                f,
+                "segment chain break at archive {index}: GenesisHash {} does not match \
+                 previous segment's final chain hash {}",
+                hex(actual),
+                hex(expected)
             ),
         }
     }

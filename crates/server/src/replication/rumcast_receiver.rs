@@ -87,6 +87,7 @@ pub fn run_receiver_rumcast(
     cores: crate::server::PipelineCores,
     async_ack: bool,
     busy_spin: bool,
+    rotation: Option<(u64, Arc<AtomicBool>)>,
 ) -> super::ReceiverResult {
     use crate::App;
     use crate::JournalWriter;
@@ -237,7 +238,10 @@ pub fn run_receiver_rumcast(
             enable_shadow,
         );
         let mut input_producer = pipeline.input_producer;
-        let journal_stage = pipeline.journal_stage;
+        let mut journal_stage = pipeline.journal_stage;
+        if let Some((max_bytes, ref flag)) = rotation {
+            journal_stage.set_rotation(max_bytes, Some(Arc::clone(flag)));
+        }
         let matching_stage = pipeline.matching_stage;
         let drain_consumer = pipeline.drain_consumer;
         let journal_cursor = pipeline.journal_cursor;

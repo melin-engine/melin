@@ -269,56 +269,7 @@ impl JournaledExchange {
     /// Truncates any trailing garbage from a partial write (crash recovery),
     /// then reopens the writer for appending new events.
     pub fn recover(journal_path: &Path) -> Result<Self, JournalError> {
-        let mut reader = JournalReader::open(journal_path)?;
-        let mut exchange = Exchange::with_capacity();
-        let mut reports = Vec::new();
-        let mut last_drain_ns: u64 = 0;
-
-        loop {
-            match reader.next_entry() {
-                Ok(Some(entry)) => {
-                    replay_event(
-                        &mut exchange,
-                        &entry.event,
-                        entry.timestamp_ns,
-                        entry.key_hash,
-                        entry.request_seq,
-                        &mut last_drain_ns,
-                        &mut reports,
-                    );
-                    reports.clear();
-                }
-                Ok(None) => break, // EOF or truncated entry.
-                Err(JournalError::SequenceGap { expected, actual }) => {
-                    // Sequence gap — likely from a SIGKILL during a batched
-                    // write. Treat as end-of-valid-data: the entries before
-                    // the gap are consistent, the rest is discarded.
-                    // The writer will truncate at this point on open_append.
-                    tracing::warn!(
-                        expected,
-                        actual,
-                        "sequence gap during recovery — truncating at gap"
-                    );
-                    break;
-                }
-                Err(e) => return Err(e),
-            }
-        }
-
-        let last_seq = reader.last_sequence().unwrap_or(0);
-        let valid_end = reader.valid_file_end();
-        let chain_hash = reader.chain_hash();
-        let events_since_checkpoint = reader.events_since_checkpoint();
-        tracing::debug!(last_seq, valid_end, "recover: opening append");
-        let writer = JournalWriter::open_append(
-            journal_path,
-            last_seq,
-            valid_end,
-            chain_hash,
-            events_since_checkpoint,
-        )?;
-
-        Ok(Self { exchange, writer })
+        Self::recover_inner(journal_path, None)
     }
 
     /// Recover from a snapshot plus a journal file.
@@ -330,51 +281,69 @@ impl JournaledExchange {
         snapshot_path: &Path,
         journal_path: &Path,
     ) -> Result<Self, JournalError> {
-        let (mut exchange, snap_sequence, snap_chain_hash) = snapshot::load(snapshot_path)?;
-        let mut reader = JournalReader::open(journal_path)?;
+        let (exchange, snap_sequence, snap_chain_hash) = snapshot::load(snapshot_path)?;
+        Self::recover_inner_with_state(
+            exchange,
+            journal_path,
+            Some((snap_sequence, snap_chain_hash)),
+        )
+    }
 
-        // Seed the reader's hash chain from the snapshot so verification
-        // continues from the snapshot boundary rather than requiring replay
-        // from genesis.
-        reader.seed_chain_hash(snap_chain_hash, snap_sequence);
+    /// Multi-segment recovery driver. Walks every archived segment in
+    /// order, then the live segment, replaying app events on top of a
+    /// fresh `Exchange`. See [`Self::recover_inner_with_state`] for the
+    /// snapshot-aware path that mirrors this for the snapshot case.
+    fn recover_inner(
+        journal_path: &Path,
+        snapshot: Option<(u64, [u8; 32])>,
+    ) -> Result<Self, JournalError> {
+        Self::recover_inner_with_state(Exchange::with_capacity(), journal_path, snapshot)
+    }
 
+    fn recover_inner_with_state(
+        mut exchange: Exchange,
+        journal_path: &Path,
+        snapshot: Option<(u64, [u8; 32])>,
+    ) -> Result<Self, JournalError> {
+        let archives =
+            melin_journal::segment::list_archives(journal_path).map_err(JournalError::Io)?;
+        let snap_sequence = snapshot.map(|(s, _)| s).unwrap_or(0);
         let mut reports = Vec::new();
         let mut last_drain_ns: u64 = 0;
+        let mut prev_tail_hash: Option<[u8; 32]> = None;
 
-        // Skip entries already captured by the snapshot.
-        loop {
-            match reader.next_entry() {
-                Ok(Some(entry)) => {
-                    if entry.sequence > snap_sequence {
-                        replay_event(
-                            &mut exchange,
-                            &entry.event,
-                            entry.timestamp_ns,
-                            entry.key_hash,
-                            entry.request_seq,
-                            &mut last_drain_ns,
-                            &mut reports,
-                        );
-                        reports.clear();
-                    }
-                }
-                Ok(None) => break,
-                Err(JournalError::SequenceGap { expected, actual }) => {
-                    tracing::warn!(
-                        expected,
-                        actual,
-                        "sequence gap during snapshot recovery — truncating at gap"
-                    );
-                    break;
-                }
-                Err(e) => return Err(e),
+        for (idx, archive_path) in &archives {
+            let mut reader = JournalReader::open(archive_path)?;
+            replay_segment_into_exchange(
+                &mut reader,
+                &mut exchange,
+                snap_sequence,
+                &mut last_drain_ns,
+                &mut reports,
+                /* allow_partial_tail = */ false,
+            )?;
+            verify_segment_boundary(*idx, prev_tail_hash, reader.genesis_payload())?;
+            if let Some(h) = reader.chain_hash() {
+                prev_tail_hash = Some(h);
             }
         }
+
+        let mut reader = JournalReader::open(journal_path)?;
+        replay_segment_into_exchange(
+            &mut reader,
+            &mut exchange,
+            snap_sequence,
+            &mut last_drain_ns,
+            &mut reports,
+            /* allow_partial_tail = */ true,
+        )?;
+        verify_segment_boundary(0, prev_tail_hash, reader.genesis_payload())?;
 
         let last_seq = reader.last_sequence().unwrap_or(snap_sequence);
         let valid_end = reader.valid_file_end();
         let chain_hash = reader.chain_hash();
         let events_since_checkpoint = reader.events_since_checkpoint();
+        tracing::debug!(last_seq, valid_end, "recover: opening append");
         let writer = JournalWriter::open_append(
             journal_path,
             last_seq,
@@ -424,27 +393,18 @@ impl JournaledExchange {
     /// The new journal continues the sequence numbering from the old one,
     /// so recovery from the snapshot + new journal produces the same state.
     ///
-    /// The old journal is renamed to `<path>.1` (bumping any existing
-    /// archives: `.1` → `.2`, `.2` → `.3`, etc.). The snapshot is written
-    /// to `snapshot_path` atomically (via `.tmp` + rename).
+    /// The old journal is renamed to its next monotonic archive slot
+    /// (`<path>.NNNNNN`). The snapshot is written to `snapshot_path`
+    /// atomically (via `.tmp` + rename).
     ///
     /// Call this before `into_parts()` — rotation requires both the
     /// exchange (for snapshot) and the writer (for sequence continuity).
     pub fn rotate(&mut self, snapshot_path: &Path) -> Result<(), JournalError> {
-        // 1. Save snapshot at the current sequence boundary.
         self.save_snapshot(snapshot_path)?;
-
-        // 2. Archive the old journal by rotating file names.
-        let journal_path = self.writer.path().to_path_buf();
-        rotate_file(&journal_path)?;
-
-        // 3. Create a new journal continuing from the same sequence.
-        // Use the current chain hash as the genesis for the new journal,
-        // providing cryptographic continuity across rotation boundaries.
-        let next_seq = self.writer.next_sequence();
-        let genesis = self.writer.chain_hash().unwrap_or([0u8; 32]);
-        self.writer = JournalWriter::create_continuing(&journal_path, next_seq, genesis)?;
-
+        // The writer's `rotate_segment` archives the live file and opens
+        // a fresh continuing live in one step — sequence and chain
+        // continuity are both writer-internal concerns.
+        self.writer.rotate_segment()?;
         Ok(())
     }
 
@@ -469,32 +429,6 @@ impl JournaledExchange {
     }
 }
 
-/// Rotate a file by renaming it to `<path>.1`, bumping existing archives.
-///
-/// `foo.journal` → `foo.journal.1` (and `.1` → `.2`, `.2` → `.3`, etc.)
-fn rotate_file(path: &Path) -> Result<(), JournalError> {
-    // Find the highest existing archive number.
-    let mut max_n = 0u32;
-    loop {
-        let archive = format!("{}.{}", path.display(), max_n + 1);
-        if !std::path::Path::new(&archive).exists() {
-            break;
-        }
-        max_n += 1;
-    }
-
-    // Rename in reverse order to avoid overwriting: .2→.3, .1→.2, base→.1
-    for n in (1..=max_n).rev() {
-        let from = format!("{}.{n}", path.display());
-        let to = format!("{}.{}", path.display(), n + 1);
-        std::fs::rename(&from, &to)?;
-    }
-    let archive_1 = format!("{}.1", path.display());
-    std::fs::rename(path, &archive_1)?;
-
-    Ok(())
-}
-
 /// Replay a single journal event into an exchange. Used during recovery.
 ///
 /// Rebuilds the per-key request sequence HWM by calling `check_request_seq`
@@ -502,6 +436,72 @@ fn rotate_file(path: &Path) -> Result<(), JournalError> {
 /// rejected at write time), this always returns true — the purpose is
 /// to reconstruct the HWM state for live dedup after recovery.
 ///
+/// Replay a single segment into an `Exchange`, skipping events whose
+/// sequence is `<= snap_sequence`. `allow_partial_tail` controls how
+/// `SequenceGap` is handled — an archived segment is sealed (any gap is
+/// corruption), while the live segment may have a torn tail from a crash.
+fn replay_segment_into_exchange(
+    reader: &mut JournalReader,
+    exchange: &mut Exchange,
+    snap_sequence: u64,
+    last_drain_ns: &mut u64,
+    reports: &mut Vec<ExecutionReport>,
+    allow_partial_tail: bool,
+) -> Result<(), JournalError> {
+    loop {
+        match reader.next_entry() {
+            Ok(Some(entry)) => {
+                if entry.sequence > snap_sequence {
+                    replay_event(
+                        exchange,
+                        &entry.event,
+                        entry.timestamp_ns,
+                        entry.key_hash,
+                        entry.request_seq,
+                        last_drain_ns,
+                        reports,
+                    );
+                    reports.clear();
+                }
+            }
+            Ok(None) => break,
+            Err(JournalError::SequenceGap { expected, actual }) => {
+                if allow_partial_tail {
+                    tracing::warn!(
+                        expected,
+                        actual,
+                        "sequence gap during recovery — truncating at gap"
+                    );
+                    break;
+                }
+                return Err(JournalError::SequenceGap { expected, actual });
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(())
+}
+
+/// Verify that this segment's `GenesisHash` payload equals the previous
+/// segment's tail chain hash. `index = 0` denotes the live segment.
+/// No-op when either side is `None`.
+fn verify_segment_boundary(
+    index: u32,
+    prev_tail: Option<[u8; 32]>,
+    genesis_payload: Option<[u8; 32]>,
+) -> Result<(), JournalError> {
+    if let (Some(expected), Some(actual)) = (prev_tail, genesis_payload)
+        && expected != actual
+    {
+        return Err(JournalError::SegmentChainBreak {
+            index,
+            expected,
+            actual,
+        });
+    }
+    Ok(())
+}
+
 /// `timestamp_ns` is the journaled wall-clock stamp from this entry; it
 /// drives the same per-event scheduler drain that the live matching stage
 /// performs, keeping replay state byte-identical to the live system.
@@ -1180,7 +1180,7 @@ mod tests {
         // Snapshot exists.
         assert!(snap_path.exists());
         // Old journal archived.
-        let archived = format!("{}.1", journal_path.display());
+        let archived = format!("{}.000001", journal_path.display());
         assert!(std::path::Path::new(&archived).exists());
         // New journal exists and is smaller.
         assert!(journal_path.exists());
@@ -1265,14 +1265,15 @@ mod tests {
         engine.add_instrument(btc_usd_spec()).unwrap();
         engine.deposit(ACCT_A, USD, 1_000_000).unwrap();
 
-        // Rotate twice.
+        // Rotate twice — monotonic naming preserves both archives without
+        // shifting (no cascade).
         engine.rotate(&snap_path).unwrap();
-        assert!(std::path::Path::new(&format!("{}.1", journal_path.display())).exists());
+        assert!(std::path::Path::new(&format!("{}.000001", journal_path.display())).exists());
 
         engine.deposit(ACCT_A, BTC, 500).unwrap();
         engine.rotate(&snap_path).unwrap();
-        assert!(std::path::Path::new(&format!("{}.2", journal_path.display())).exists());
-        assert!(std::path::Path::new(&format!("{}.1", journal_path.display())).exists());
+        assert!(std::path::Path::new(&format!("{}.000001", journal_path.display())).exists());
+        assert!(std::path::Path::new(&format!("{}.000002", journal_path.display())).exists());
         assert!(journal_path.exists());
     }
 

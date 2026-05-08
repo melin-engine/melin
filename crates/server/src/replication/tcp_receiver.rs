@@ -733,6 +733,11 @@ pub fn run_receiver(
     group_commit_delay: std::time::Duration,
     pipeline_depth: usize,
     busy_spin: bool,
+    // Runtime rotation knobs: (max_journal_bytes, rotate_flag). The flag
+    // is a shared AtomicBool flipped by the `rotate` admin endpoint;
+    // max_journal_bytes == 0 disables size-driven rotation. None means
+    // runtime rotation is off entirely on this replica.
+    rotation: Option<(u64, std::sync::Arc<AtomicBool>)>,
 ) -> ReceiverResult {
     use crate::App;
     use crate::JournalWriter;
@@ -1105,6 +1110,7 @@ pub fn run_receiver(
                 snapshot_path.clone(),
                 group_commit_delay,
                 busy_spin,
+                rotation.clone(),
             )?);
         }
 

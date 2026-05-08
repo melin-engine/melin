@@ -21,6 +21,7 @@ pub mod event;
 pub(crate) mod le;
 pub mod reader;
 pub mod replication;
+pub mod segment;
 pub mod trace;
 pub mod writer;
 

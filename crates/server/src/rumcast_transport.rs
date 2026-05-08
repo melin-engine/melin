@@ -2077,6 +2077,28 @@ fn run_rumcast_replica(
         )
     });
 
+    // Runtime journal rotation on the rumcast replica path. Same shape
+    // as the kernel TCP replica wiring.
+    let rotate_flag = config.rotate_bind.map(|_| Arc::new(AtomicBool::new(false)));
+    let max_journal_bytes = config.max_journal_mib.saturating_mul(1024 * 1024);
+    let rotation = match (max_journal_bytes, rotate_flag.as_ref()) {
+        (0, None) => None,
+        (b, f) => Some((
+            b,
+            f.cloned()
+                .unwrap_or_else(|| Arc::new(AtomicBool::new(false))),
+        )),
+    };
+    let _rotate_handle = match (config.rotate_bind, rotate_flag.as_ref()) {
+        (Some(addr), Some(flag)) => Some(crate::rotate::spawn(
+            addr,
+            Arc::clone(flag),
+            Arc::clone(&shutdown),
+            Arc::clone(&authorized_keys),
+        )),
+        _ => None,
+    };
+
     // The replica's local UDP bind for rumcast. We reuse the `--bind`
     // flag (= `rumcast_config.bind`) — operators get one knob to
     // configure the replica's local UDP address rather than two.
@@ -2092,6 +2114,7 @@ fn run_rumcast_replica(
         config.cores,
         config.async_replica_ack,
         !config.yield_idle,
+        rotation,
     )? {
         None => Ok(()), // clean shutdown
         Some((mut exchange, writer)) => {

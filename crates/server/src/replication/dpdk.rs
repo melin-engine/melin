@@ -900,6 +900,7 @@ pub fn run_receiver_dpdk(
     pipeline_depth: usize,
     busy_spin: bool,
     async_ack: bool,
+    rotation: Option<(u64, std::sync::Arc<AtomicBool>)>,
 ) -> ReceiverResult {
     use crate::App;
     use crate::JournalWriter;
@@ -1265,6 +1266,7 @@ pub fn run_receiver_dpdk(
                 snapshot_path.clone(),
                 group_commit_delay,
                 busy_spin,
+                rotation.clone(),
             )?);
 
             // Pipeline children are spawned and self-pinned. Now safe to

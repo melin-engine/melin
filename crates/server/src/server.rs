@@ -269,6 +269,15 @@ pub struct ServerConfig {
     #[arg(long)]
     pub promote_bind: Option<SocketAddr>,
 
+    /// TCP address for the runtime journal-rotation endpoint. An operator
+    /// connects, authenticates with an operator key, and sends `ROTATE\n`
+    /// to force the journal stage to archive the live segment at the next
+    /// fsync boundary. When unset, runtime rotation only fires from the
+    /// `max_journal_mib` size threshold (or not at all if that is zero).
+    /// Active on both primary and replica nodes.
+    #[arg(long)]
+    pub rotate_bind: Option<SocketAddr>,
+
     /// Interval in milliseconds between automatic shadow snapshots. The
     /// shadow stage replays journaled events on a cloned App and saves a
     /// consistent snapshot at this cadence — no hot-path stall. Set to 0
@@ -373,6 +382,7 @@ impl Default for ServerConfig {
             event_bind: None,
             health_bind: Some(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 9878)),
             promote_bind: None,
+            rotate_bind: None,
             snapshot_interval_ms: 3_000_000,
             snapshot_path: None,
             tick_interval_ms: 250,
@@ -583,6 +593,30 @@ pub fn run_with_shutdown<L: BlockingTransportListener>(
             )
         });
 
+        // Runtime rotation on the replica side: the size threshold and
+        // the operator-driven flag are independent of the primary's, so
+        // each side rotates whenever its own live segment crosses the
+        // limit (or the operator on this node sends ROTATE).
+        let rotate_flag = config.rotate_bind.map(|_| Arc::new(AtomicBool::new(false)));
+        let max_journal_bytes = config.max_journal_mib.saturating_mul(1024 * 1024);
+        let rotation = match (max_journal_bytes, rotate_flag.as_ref()) {
+            (0, None) => None,
+            (b, f) => Some((
+                b,
+                f.cloned()
+                    .unwrap_or_else(|| Arc::new(AtomicBool::new(false))),
+            )),
+        };
+        let _rotate_handle = match (config.rotate_bind, rotate_flag.as_ref()) {
+            (Some(addr), Some(flag)) => Some(crate::rotate::spawn(
+                addr,
+                Arc::clone(flag),
+                Arc::clone(&shutdown),
+                Arc::clone(&authorized_keys),
+            )),
+            _ => None,
+        };
+
         match crate::replication::run_receiver(
             primary_addr,
             &config.journal,
@@ -597,6 +631,7 @@ pub fn run_with_shutdown<L: BlockingTransportListener>(
             config.group_commit_delay(),
             config.replication_pipeline_depth,
             !config.yield_idle,
+            rotation,
         )? {
             None => return Ok(()), // clean shutdown
             Some((mut exchange, writer)) => {
@@ -852,6 +887,33 @@ fn run_as_primary<L: BlockingTransportListener>(
 
     // Spawn pipeline OS threads.
     let cores = config.cores;
+
+    // Wire runtime journal rotation into the journal stage. The flag is
+    // shared with an optional admin endpoint (`rotate_bind`) below; the
+    // size threshold uses the same `max_journal_mib` knob that drives
+    // startup rotation.
+    let mut journal_stage = journal_stage;
+    let rotate_flag = config.rotate_bind.map(|_| Arc::new(AtomicBool::new(false)));
+    let max_journal_bytes = config.max_journal_mib.saturating_mul(1024 * 1024);
+    journal_stage.set_rotation(max_journal_bytes, rotate_flag.clone());
+    // Spawn the rotation listener if the operator opted into the admin
+    // endpoint. Active on both primary and replica nodes; on the
+    // replica path it gets wired in `replication::run_receiver` etc.
+    let _rotate_handle = match (config.rotate_bind, rotate_flag.as_ref()) {
+        (Some(addr), Some(flag)) => Some(crate::rotate::spawn(
+            addr,
+            Arc::clone(flag),
+            Arc::clone(&shutdown),
+            Arc::clone(&authorized_keys),
+        )),
+        _ => None,
+    };
+    if config.max_journal_mib > 0 {
+        info!(
+            max_journal_mib = config.max_journal_mib,
+            "runtime journal rotation enabled (size threshold)"
+        );
+    }
 
     // Extract utilization handles before stages are moved into threads.
     let journal_utilization = journal_stage.utilization();
@@ -1554,6 +1616,28 @@ pub fn run_dpdk(
             )
         });
 
+        // Runtime rotation on the DPDK replica (mirrors the kernel TCP
+        // path's wiring).
+        let rotate_flag = config.rotate_bind.map(|_| Arc::new(AtomicBool::new(false)));
+        let max_journal_bytes = config.max_journal_mib.saturating_mul(1024 * 1024);
+        let rotation = match (max_journal_bytes, rotate_flag.as_ref()) {
+            (0, None) => None,
+            (b, f) => Some((
+                b,
+                f.cloned()
+                    .unwrap_or_else(|| Arc::new(AtomicBool::new(false))),
+            )),
+        };
+        let _rotate_handle = match (config.rotate_bind, rotate_flag.as_ref()) {
+            (Some(addr), Some(flag)) => Some(crate::rotate::spawn(
+                addr,
+                Arc::clone(flag),
+                Arc::clone(&shutdown),
+                Arc::clone(&authorized_keys),
+            )),
+            _ => None,
+        };
+
         // Use queue 0 for the replication receiver's smoltcp connection.
         // Listen port is unused (receiver connects outbound, doesn't listen),
         // but DpdkTransport requires one — use an ephemeral port.
@@ -1587,6 +1671,7 @@ pub fn run_dpdk(
             config.replication_pipeline_depth,
             !config.yield_idle,
             config.async_replica_ack,
+            rotation,
         )? {
             None => return Ok(()), // clean shutdown
             Some((mut exchange, writer)) => {
@@ -1737,6 +1822,27 @@ pub fn run_dpdk(
 
     // Spawn pipeline threads (journal, matching — identical to TCP path).
     let cores = config.cores;
+
+    // Wire runtime rotation into the journal stage (DPDK primary path).
+    let mut journal_stage = journal_stage;
+    let rotate_flag = config.rotate_bind.map(|_| Arc::new(AtomicBool::new(false)));
+    let max_journal_bytes = config.max_journal_mib.saturating_mul(1024 * 1024);
+    journal_stage.set_rotation(max_journal_bytes, rotate_flag.clone());
+    let _rotate_handle = match (config.rotate_bind, rotate_flag.as_ref()) {
+        (Some(addr), Some(flag)) => Some(crate::rotate::spawn(
+            addr,
+            Arc::clone(flag),
+            Arc::clone(&shutdown),
+            Arc::clone(&authorized_keys),
+        )),
+        _ => None,
+    };
+    if config.max_journal_mib > 0 {
+        info!(
+            max_journal_mib = config.max_journal_mib,
+            "runtime journal rotation enabled (size threshold, DPDK)"
+        );
+    }
 
     // Extract utilization handles before stages are moved into threads.
     let journal_utilization = journal_stage.utilization();

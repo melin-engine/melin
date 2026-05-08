@@ -238,6 +238,7 @@ fn main() {
                 std::time::Duration::ZERO,
                 8, // pipeline_depth
                 busy_spin,
+                None, // rotation: bench replica doesn't rotate
             );
         })
         .expect("spawn run_receiver");

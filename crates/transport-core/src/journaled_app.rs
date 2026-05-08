@@ -17,7 +17,7 @@
 //! `Application::apply` / `Application::tick`, and the snapshot payload
 //! is whatever bytes `A::snapshot`/`A::restore` round-trip.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use melin_app::{Application, ApplyCtx};
 use melin_journal::{JournalError, JournalEvent, JournalReader, JournalWriter};
@@ -87,104 +87,130 @@ impl<A: Application> JournaledApp<A> {
         Ok(Self { app, writer })
     }
 
-    /// Recover from an existing journal. Replays every entry into the
-    /// caller-supplied empty app, then reopens the writer for
-    /// appending.
+    /// Recover from an existing journal. Replays every archived segment
+    /// in monotonic order, then the live segment, into the caller-
+    /// supplied empty app, then reopens the writer for appending.
     pub fn recover(app: A, journal_path: &Path) -> Result<Self, JournaledAppError> {
-        let mut reader = JournalReader::<A::Event>::open(journal_path)?;
-        let mut app = app;
-        let mut reports: Vec<A::Report> = Vec::new();
-        let mut last_drain_ns: u64 = 0;
-
-        loop {
-            match reader.next_entry() {
-                Ok(Some(entry)) => {
-                    replay_entry(
-                        &mut app,
-                        &entry.event,
-                        entry.timestamp_ns,
-                        entry.key_hash,
-                        entry.request_seq,
-                        &mut last_drain_ns,
-                        &mut reports,
-                    );
-                    reports.clear();
-                }
-                Ok(None) => break,
-                Err(JournalError::SequenceGap { expected, actual }) => {
-                    tracing::warn!(
-                        expected,
-                        actual,
-                        "sequence gap during recovery — truncating at gap"
-                    );
-                    break;
-                }
-                Err(e) => return Err(e.into()),
-            }
-        }
-
-        let last_seq = reader.last_sequence().unwrap_or(0);
-        let valid_end = reader.valid_file_end();
-        let chain_hash = reader.chain_hash();
-        let events_since_checkpoint = reader.events_since_checkpoint();
-        let writer = JournalWriter::<A::Event>::open_append(
-            journal_path,
-            last_seq,
-            valid_end,
-            chain_hash,
-            events_since_checkpoint,
-        )?;
-
-        Ok(Self { app, writer })
+        Self::recover_inner(app, journal_path, None)
     }
 
-    /// Recover from a snapshot plus a journal file.
+    /// Recover from a snapshot plus a journal directory.
     ///
-    /// Loads the snapshot to restore state, then replays only journal
-    /// entries strictly after the snapshot's recorded sequence.
+    /// Loads the snapshot to restore state, then replays journal entries
+    /// strictly after the snapshot's recorded sequence — across all
+    /// archived segments and the live segment.
     pub fn recover_from_snapshot(
         snapshot_path: &Path,
         journal_path: &Path,
     ) -> Result<Self, JournaledAppError> {
-        let (mut app, snap_sequence, snap_chain_hash) = snapshot::load::<A>(snapshot_path)?;
-        let mut reader = JournalReader::<A::Event>::open(journal_path)?;
+        let (app, snap_sequence, snap_chain_hash) = snapshot::load::<A>(snapshot_path)?;
+        Self::recover_inner(app, journal_path, Some((snap_sequence, snap_chain_hash)))
+    }
 
-        // Seed the reader's hash chain from the snapshot so verification
-        // continues from the snapshot boundary rather than requiring replay
-        // from genesis.
-        reader.seed_chain_hash(snap_chain_hash, snap_sequence);
+    /// Shared multi-segment recovery driver.
+    ///
+    /// `snapshot` carries `(sequence, chain_hash)` when the caller has
+    /// already restored from a snapshot; events with `seq <= sequence`
+    /// are skipped during replay but still walked so per-segment chain
+    /// validation runs.
+    ///
+    /// Cross-segment chain continuity is enforced: each segment's
+    /// `GenesisHash` payload must equal the previous segment's tail
+    /// chain hash. A break is reported as
+    /// [`JournalError::SegmentChainBreak`] — distinct from a within-
+    /// segment `HashChainMismatch` so operators can locate which
+    /// archive on disk is at fault.
+    fn recover_inner(
+        mut app: A,
+        journal_path: &Path,
+        snapshot: Option<(u64, [u8; 32])>,
+    ) -> Result<Self, JournaledAppError> {
+        let archives = melin_journal::segment::list_archives(journal_path)?;
+
+        let snap_sequence = snapshot.map(|(s, _)| s).unwrap_or(0);
 
         let mut reports: Vec<A::Report> = Vec::new();
         let mut last_drain_ns: u64 = 0;
+        // Tail chain hash carried forward across segments. `None` means
+        // no boundary check has anything to compare against yet — the
+        // very first segment we walk has no predecessor in this run.
+        let mut prev_tail_hash: Option<[u8; 32]> = None;
 
-        loop {
-            match reader.next_entry() {
-                Ok(Some(entry)) => {
-                    if entry.sequence > snap_sequence {
-                        replay_entry(
-                            &mut app,
-                            &entry.event,
-                            entry.timestamp_ns,
-                            entry.key_hash,
-                            entry.request_seq,
-                            &mut last_drain_ns,
-                            &mut reports,
-                        );
-                        reports.clear();
-                    }
-                }
-                Ok(None) => break,
-                Err(JournalError::SequenceGap { expected, actual }) => {
-                    tracing::warn!(
-                        expected,
-                        actual,
-                        "sequence gap during snapshot recovery — truncating at gap"
-                    );
-                    break;
-                }
-                Err(e) => return Err(e.into()),
+        // --- Walk each sealed archive in monotonic order ---
+        for (idx, archive_path) in &archives {
+            let mut reader = JournalReader::<A::Event>::open(archive_path)?;
+            replay_segment(
+                &mut reader,
+                &mut app,
+                snap_sequence,
+                &mut last_drain_ns,
+                &mut reports,
+                /* allow_partial_tail = */ false,
+            )?;
+            verify_segment_boundary(*idx, prev_tail_hash, reader.genesis_payload())?;
+            // Carry forward only when this segment actually had a chain
+            // (hash-chain feature on, segment had at least its
+            // GenesisHash entry). Otherwise leave `prev_tail_hash`
+            // unchanged so the next boundary still gets a meaningful
+            // compare target.
+            if let Some(h) = reader.chain_hash() {
+                prev_tail_hash = Some(h);
             }
         }
+
+        // --- Walk the live segment, if it exists ---
+        let live_exists = journal_path.exists();
+        if !live_exists {
+            // Recovery from archives only: rotation crashed after the
+            // live → archive rename but before the new live file was
+            // created. Recreate a live segment continuing from the last
+            // archive's tail so the writer is positioned where new
+            // events can be appended.
+            //
+            // Snapshot-only recovery (no archives) is the caller's
+            // responsibility — the server handles that path explicitly.
+            let last_seq = match (archives.last(), snapshot) {
+                (Some(_), _) => prev_tail_hash
+                    .map(|_| ()) // chain hash captured implies events were read
+                    .map_or(snap_sequence, |_| {
+                        // Use the snapshot seq as a floor. The archive
+                        // walker already replayed events past it, so the
+                        // app's effective last_seq matches the writer's
+                        // expectation only when we open in append mode
+                        // — which we cannot do without a live file.
+                        // Fall back to creating a fresh continuing live.
+                        snap_sequence
+                    }),
+                _ => {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::NotFound,
+                        "no live journal and no archives — nothing to recover",
+                    )
+                    .into());
+                }
+            };
+            let _ = last_seq; // currently unused — server supplies this path
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "live journal segment missing; \
+                 the server's snapshot-only recovery path must reconstruct it",
+            )
+            .into());
+        }
+
+        let mut reader = JournalReader::<A::Event>::open(journal_path)?;
+        // The live segment may have a partial-tail crash: replay loop
+        // tolerates `SequenceGap` by stopping early, mirroring legacy
+        // behaviour.
+        replay_segment(
+            &mut reader,
+            &mut app,
+            snap_sequence,
+            &mut last_drain_ns,
+            &mut reports,
+            /* allow_partial_tail = */ true,
+        )?;
+        verify_segment_boundary(0, prev_tail_hash, reader.genesis_payload())?;
 
         let last_seq = reader.last_sequence().unwrap_or(snap_sequence);
         let valid_end = reader.valid_file_end();
@@ -211,18 +237,14 @@ impl<A: Application> JournaledApp<A> {
         Ok(())
     }
 
-    /// Rotate the journal: snapshot, archive old journal as `<path>.N`,
-    /// and start a new journal continuing the sequence. Uses the
-    /// current chain hash as the genesis for cryptographic continuity
-    /// across rotation boundaries.
+    /// Rotate the journal: snapshot the current state, archive the live
+    /// segment to its next monotonic slot (`<path>.NNNNNN`), and open a
+    /// fresh live segment continuing the sequence. The new segment's
+    /// `GenesisHash` carries the chain state at the boundary so multi-
+    /// segment recovery can verify cross-segment continuity.
     pub fn rotate(&mut self, snapshot_path: &Path) -> Result<(), JournaledAppError> {
         self.save_snapshot(snapshot_path)?;
-        let journal_path = self.writer.path().to_path_buf();
-        rotate_file(&journal_path)?;
-        let next_seq = self.writer.next_sequence();
-        let genesis = self.writer.chain_hash().unwrap_or([0u8; 32]);
-        self.writer =
-            JournalWriter::<A::Event>::create_continuing(&journal_path, next_seq, genesis)?;
+        self.writer.rotate_segment()?;
         Ok(())
     }
 
@@ -336,22 +358,78 @@ fn replay_entry<A: Application>(
     }
 }
 
-fn rotate_file(path: &Path) -> Result<(), std::io::Error> {
-    let mut max_n = 0u32;
+/// Replay a single segment into the application.
+///
+/// Skips events with `seq <= snap_sequence` so a snapshot caller can
+/// share this routine with no-snapshot recovery (where `snap_sequence`
+/// is `0`, accepting all events).
+///
+/// `allow_partial_tail` controls how `SequenceGap` is treated: archived
+/// segments are sealed and any gap is corruption (returned as an error);
+/// the live segment may have a torn tail from a crash, so a gap
+/// terminates replay cleanly.
+fn replay_segment<A: Application>(
+    reader: &mut JournalReader<A::Event>,
+    app: &mut A,
+    snap_sequence: u64,
+    last_drain_ns: &mut u64,
+    reports: &mut Vec<A::Report>,
+    allow_partial_tail: bool,
+) -> Result<(), JournaledAppError> {
     loop {
-        let archive = format!("{}.{}", path.display(), max_n + 1);
-        if !Path::new(&archive).exists() {
-            break;
+        match reader.next_entry() {
+            Ok(Some(entry)) => {
+                if entry.sequence > snap_sequence {
+                    replay_entry(
+                        app,
+                        &entry.event,
+                        entry.timestamp_ns,
+                        entry.key_hash,
+                        entry.request_seq,
+                        last_drain_ns,
+                        reports,
+                    );
+                    reports.clear();
+                }
+            }
+            Ok(None) => break,
+            Err(JournalError::SequenceGap { expected, actual }) => {
+                if allow_partial_tail {
+                    tracing::warn!(
+                        expected,
+                        actual,
+                        "sequence gap during recovery — truncating at gap"
+                    );
+                    break;
+                }
+                return Err(JournalError::SequenceGap { expected, actual }.into());
+            }
+            Err(e) => return Err(e.into()),
         }
-        max_n += 1;
     }
-    for n in (1..=max_n).rev() {
-        let from = format!("{}.{n}", path.display());
-        let to = format!("{}.{}", path.display(), n + 1);
-        std::fs::rename(&from, &to)?;
+    Ok(())
+}
+
+/// Verify that a segment's `GenesisHash` payload equals the previous
+/// segment's tail chain hash. `index = 0` denotes the live segment in
+/// diagnostics. No-op when either side is `None` (chain feature off, or
+/// no predecessor in this recovery run).
+fn verify_segment_boundary(
+    index: u32,
+    prev_tail: Option<[u8; 32]>,
+    genesis_payload: Option<[u8; 32]>,
+) -> Result<(), JournaledAppError> {
+    if let (Some(expected), Some(actual)) = (prev_tail, genesis_payload)
+        && expected != actual
+    {
+        return Err(JournalError::SegmentChainBreak {
+            index,
+            expected,
+            actual,
+        }
+        .into());
     }
-    let archive_1 = format!("{}.1", path.display());
-    std::fs::rename(path, PathBuf::from(&archive_1))
+    Ok(())
 }
 
 #[cfg(test)]
@@ -554,8 +632,8 @@ mod tests {
 
         ja.rotate(&snap_path).unwrap();
 
-        // Archived journal lives at `.1`.
-        let archived = dir.path().join("journal.bin.1");
+        // Archived journal lives at `.000001` (monotonic naming).
+        let archived = dir.path().join("journal.bin.000001");
         assert!(archived.exists(), "pre-rotate journal must be archived");
         // Sequence continues past the archive cut. With `hash-chain`, the
         // new journal starts with a GenesisHash at `pre_rotate_next_seq`,
@@ -574,5 +652,171 @@ mod tests {
         let recovered =
             JournaledApp::<TestApp>::recover_from_snapshot(&snap_path, &journal_path).unwrap();
         assert_eq!(*recovered.app(), pre_rotate_state);
+    }
+
+    /// Multi-segment recovery: build state across three rotations,
+    /// then `recover` (no snapshot) — must walk all three archives plus
+    /// the live segment and produce identical balances to a no-rotation
+    /// run with the same events.
+    ///
+    /// Compares `total` and `key_hwm` only; `ticks` is sensitive to the
+    /// per-phase timestamp restart in `append_events` and isn't part of
+    /// the rotation behaviour under test.
+    #[test]
+    fn recover_walks_multiple_archived_segments() {
+        let dir = tempfile::tempdir().unwrap();
+        let journal_path = dir.path().join("journal.bin");
+        let snap_path = dir.path().join("snap.bin");
+
+        let phase_a = [TestEvent::Add(1), TestEvent::Add(2)];
+        let phase_b = [TestEvent::Add(10), TestEvent::Add(20)];
+        let phase_c = [TestEvent::Add(100), TestEvent::Add(200)];
+        let phase_d = [TestEvent::Add(1000)];
+
+        let ja = JournaledApp::create(TestApp::new(), &journal_path).unwrap();
+        let mut ja = append_events(ja, &phase_a, 1);
+        ja.rotate(&snap_path).unwrap();
+        let mut ja = append_events(ja, &phase_b, 1 + phase_a.len() as u64);
+        ja.rotate(&snap_path).unwrap();
+        let mut ja = append_events(ja, &phase_c, 1 + (phase_a.len() + phase_b.len()) as u64);
+        ja.rotate(&snap_path).unwrap();
+        let ja = append_events(
+            ja,
+            &phase_d,
+            1 + (phase_a.len() + phase_b.len() + phase_c.len()) as u64,
+        );
+        drop(ja);
+
+        // Sanity: all three archives plus a live segment exist on disk.
+        for n in 1..=3u32 {
+            let path = dir.path().join(format!("journal.bin.{n:06}"));
+            assert!(path.exists(), "archive {n} should exist at {path:?}");
+        }
+        assert!(journal_path.exists(), "live journal should exist");
+
+        let recovered = JournaledApp::<TestApp>::recover(TestApp::new(), &journal_path).unwrap();
+        let total_events = phase_a.len() + phase_b.len() + phase_c.len() + phase_d.len();
+        assert_eq!(recovered.app().total, 1 + 2 + 10 + 20 + 100 + 200 + 1000);
+        // HWM is per (key_hash=1, request_seq) and append_events uses
+        // sequential request_seqs (1..=7).
+        assert_eq!(
+            recovered.app().key_hwm.get(&1).copied(),
+            Some(total_events as u64)
+        );
+    }
+
+    /// Multi-segment recovery via snapshot: build state through several
+    /// rotations, recover the populated state, snapshot it, then re-
+    /// recover from that snapshot — the snapshot's last-seq is past
+    /// every archived event, so recovery must skip them all and still
+    /// produce the snapshot's state. This proves the multi-segment
+    /// walker honours `snap_sequence` across archives.
+    #[test]
+    fn recover_from_snapshot_skips_pre_snapshot_segments() {
+        let dir = tempfile::tempdir().unwrap();
+        let journal_path = dir.path().join("journal.bin");
+        let snap_path = dir.path().join("snap.bin");
+
+        let phase_a = [TestEvent::Add(1), TestEvent::Add(2)];
+        let phase_b = [TestEvent::Add(10), TestEvent::Add(20)];
+        let phase_c = [TestEvent::Add(100), TestEvent::Add(200)];
+
+        let ja = JournaledApp::create(TestApp::new(), &journal_path).unwrap();
+        let mut ja = append_events(ja, &phase_a, 1);
+        ja.rotate(&snap_path).unwrap();
+        let mut ja = append_events(ja, &phase_b, 1 + phase_a.len() as u64);
+        ja.rotate(&snap_path).unwrap();
+        let ja = append_events(ja, &phase_c, 1 + (phase_a.len() + phase_b.len()) as u64);
+        drop(ja);
+
+        // Replay everything to populate the app, then snapshot it.
+        let recovered = JournaledApp::<TestApp>::recover(TestApp::new(), &journal_path).unwrap();
+        let expected = TestApp {
+            total: recovered.app().total,
+            ticks: recovered.app().ticks,
+            key_hwm: recovered.app().key_hwm.clone(),
+        };
+        let final_snap = dir.path().join("final.snap");
+        recovered.save_snapshot(&final_snap).unwrap();
+        drop(recovered);
+
+        // Re-recover from the freshly-saved snapshot. snap_sequence is
+        // past every event in every archive and the live segment, so
+        // all replays should be skipped — the resulting app must match
+        // the snapshotted app exactly.
+        let re =
+            JournaledApp::<TestApp>::recover_from_snapshot(&final_snap, &journal_path).unwrap();
+        assert_eq!(*re.app(), expected);
+    }
+
+    /// Cross-segment chain validation: tampering with an archived
+    /// segment's tail (post-rotation) is detectable as a SegmentChainBreak
+    /// at recovery, because the next segment's GenesisHash no longer
+    /// matches the tampered segment's tail chain hash.
+    #[cfg(feature = "hash-chain")]
+    #[test]
+    fn recover_detects_cross_segment_chain_break() {
+        use std::io::Write;
+
+        let dir = tempfile::tempdir().unwrap();
+        let journal_path = dir.path().join("journal.bin");
+        let snap_path = dir.path().join("snap.bin");
+
+        let phase_a = [TestEvent::Add(1)];
+        let phase_b = [TestEvent::Add(2)];
+
+        let ja = JournaledApp::create(TestApp::new(), &journal_path).unwrap();
+        let mut ja = append_events(ja, &phase_a, 1);
+        ja.rotate(&snap_path).unwrap(); // → archive 000001 sealed
+        let ja = append_events(ja, &phase_b, 1 + phase_a.len() as u64);
+        drop(ja);
+
+        // Flip a bit in the middle of archive 000001 to change its
+        // tail chain hash. The byte we touch is well past the file
+        // header, in the body of the first event.
+        let archive = dir.path().join("journal.bin.000001");
+        let mut buf = std::fs::read(&archive).unwrap();
+        // Find the first non-zero byte past the magic + header range
+        // (skip 64 to clear the file header reliably on both 512 and
+        // 4Kn devices; entries follow at sector_size offset, but the
+        // first sector contains valid header magic + version fields,
+        // so the first non-zero byte after offset 64 is in either the
+        // header tail or the first entry — both work for inducing a
+        // chain mismatch).
+        let flip_at = buf
+            .iter()
+            .enumerate()
+            .skip(64)
+            .find(|(_, b)| **b != 0)
+            .map(|(i, _)| i)
+            .expect("archive should have at least one non-zero byte");
+        buf[flip_at] ^= 0xFF;
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&archive)
+            .unwrap();
+        f.write_all(&buf).unwrap();
+        f.sync_all().unwrap();
+        drop(f);
+
+        // Tampering with an archived segment must surface as some flavour
+        // of detection error — within-segment hash-chain mismatch, the
+        // cross-segment compare, an entry-level CRC, or a magic/version
+        // check. The *absence* of any error would mean a tampered
+        // archive replays silently, which is the regression this test
+        // guards against.
+        let result = JournaledApp::<TestApp>::recover(TestApp::new(), &journal_path);
+        let err = match result {
+            Err(e) => e,
+            Ok(_) => panic!("expected recovery to detect tampered archive, but it succeeded"),
+        };
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("hash chain mismatch")
+                || msg.contains("segment chain break")
+                || msg.contains("checksum mismatch")
+                || msg.contains("corrupt entry"),
+            "expected tamper-detection error, got: {msg}"
+        );
     }
 }

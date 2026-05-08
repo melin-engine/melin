@@ -1,6 +1,6 @@
 # Journal Rotation & Recovery
 
-This document describes the journaling policy, rotation mechanism, and every recovery scenario the server handles at startup.
+This document describes the journaling policy, rotation mechanism, and every recovery scenario the server handles.
 
 ## Overview
 
@@ -8,125 +8,149 @@ The trading engine uses a write-ahead journal for event sourcing and crash recov
 
 Snapshots capture the full exchange state at a known journal sequence boundary. Recovery from a snapshot skips replaying all events before that boundary, reducing startup time from O(total events) to O(events since snapshot).
 
-Journal rotation prevents unbounded disk growth by periodically snapshotting and starting a fresh journal file.
+Journal rotation prevents unbounded disk growth by archiving the active journal as a sealed segment and starting a fresh one. **Rotation runs while the engine is live** — no restart required.
 
 ## File Layout
 
+The journal is a sequence of segments. The currently-written segment lives at the bare path; archived segments — produced by previous rotations — are named with a six-digit zero-padded monotonic suffix.
+
 ```
-melin.journal          Current journal (active writes)
-melin.snapshot         Latest snapshot (from most recent rotation)
-melin.journal.1        Previous journal (archived by last rotation)
-melin.journal.2        Journal before that (archived by rotation before last)
+melin.journal              Live segment (active writes)
+melin.snapshot             Latest shadow snapshot
+melin.snapshot.prev        Penultimate snapshot (rollback target)
+melin.journal.000001       First archived segment
+melin.journal.000002       Second archived segment
 ...
 ```
 
-## Rotation Trigger
+Archive numbers are assigned in rotation order: `000001` is the oldest archive, the highest-numbered file is the most recent. Rotation never renames an existing archive — each rotation is a single rename of the live file to the next free number.
 
-Rotation happens **at server startup**, not during live operation. When `--max-journal-mib` is set (default: 256 MiB) and the journal exceeds that threshold after recovery, the server:
+## Rotation Triggers
 
-1. Saves a snapshot at the current sequence boundary
-2. Renames `melin.journal` to `melin.journal.1` (bumping existing archives: `.1` -> `.2`, `.2` -> `.3`, etc.)
-3. Creates a new `melin.journal` continuing from the next sequence number
+Two independent triggers fire rotation, both observed at the journal stage's fsync boundary so the live segment is durably committed before the rename:
 
-The server then proceeds to start the pipeline with the fresh journal.
+### Size threshold
+
+When `--max-journal-mib` is non-zero (default: 256 MiB) and the live segment crosses that size after an fsync batch, the journal stage rotates immediately. Tune this larger to reduce rotation frequency (and the brief stall described below) at the cost of more bytes per archive segment.
+
+### Operator-driven (`ROTATE` admin endpoint)
+
+When `--rotate-bind <addr>` is set, the server listens on that TCP address for rotation commands. An operator authenticates with an Ed25519 operator key (challenge-response, same scheme as all other admin endpoints) and sends `ROTATE\n`. The journal stage performs one rotation at the next fsync boundary. Concurrent or repeated `ROTATE` commands collapse into a single rotation rather than queueing.
+
+This endpoint is available on both primary and replica nodes; each side rotates its own local segments independently.
+
+## Recovery: Multi-Segment Walk
+
+Recovery walks every archived segment in monotonic order, then the live segment, replaying events on top of the recovered state.
+
+```
+┌─────────────────┐   ┌─────────────────┐   ┌─────────────────┐   ┌──────────────┐
+│ .journal.000001 │ → │ .journal.000002 │ → │ .journal.000003 │ → │ .journal     │
+│ (sealed)        │   │ (sealed)        │   │ (sealed)        │   │ (live, may   │
+│                 │   │                 │   │                 │   │  have torn   │
+│                 │   │                 │   │                 │   │  tail)       │
+└─────────────────┘   └─────────────────┘   └─────────────────┘   └──────────────┘
+```
+
+When a snapshot is available, recovery loads the snapshot first, then walks segments — skipping events with sequences less than or equal to the snapshot's recorded sequence. Segments fully covered by the snapshot are walked but not replayed; their per-segment hash chain is still verified for tamper-evidence.
+
+### Sequence continuity
+
+Each segment's first entry is a `GenesisHash` whose payload is the previous segment's final chain hash, anchoring the new segment to the chain it continues. Sequence numbers are monotonic across segment boundaries — no gaps.
+
+### Cross-segment tamper-evidence
+
+Recovery verifies that each segment's `GenesisHash` payload equals the previous segment's tail chain hash. A mismatch indicates either deliberate tampering with an archived segment or a missing segment between two surviving archives, and aborts recovery with an error identifying the boundary.
 
 ## Sequence Numbering
 
-Journal entries carry monotonically increasing sequence numbers. After rotation, the new journal continues from where the old one left off. A snapshot records the sequence of the last event it captured.
+Journal entries carry monotonically increasing sequence numbers. After rotation, the new segment continues from where the old one left off:
 
 ```
-Old journal:  seq 1, 2, 3, ..., 1000
-Snapshot:     captured at seq 1000
-New journal:  seq 1001, 1002, ...
+Segment 000001:   seq 1, 2, 3, ..., 1000
+                  (chain hash at end: H1)
+Segment 000002:   seq 1001 = GenesisHash(H1), then 1002, 1003, ..., 2500
+                  (chain hash at end: H2)
+Live segment:     seq 2501 = GenesisHash(H2), then 2502, 2503, ...
 ```
 
-Recovery from snapshot + new journal skips all entries with sequence <= the snapshot sequence.
+A snapshot records both the sequence of the last event it captured and the chain hash at that point. Recovery from snapshot + segments skips events with `sequence <= snap_sequence`.
 
 ## Recovery Scenarios
 
-The server evaluates recovery mode at startup in this priority order:
-
-### 1. Snapshot + journal both exist
-
-**Files present:** `melin.snapshot`, `melin.journal`
+### 1. Snapshot + segments + live segment all exist
 
 **Recovery flow:**
 1. Load snapshot (restores state as of sequence N)
-2. Open journal, read all entries
-3. Skip entries where `sequence <= N`
-4. Replay entries where `sequence > N`
-5. Truncate journal to last valid entry (crash recovery)
-6. Open journal for append, continuing from last sequence + 1
+2. Walk archived segments in order; skip events with `sequence <= N`, replay the rest
+3. Verify each segment-boundary `GenesisHash` matches the previous tail
+4. Walk the live segment; truncate at the last valid entry on torn tails
+5. Open the live segment for append
 
-**When this happens:** Normal restart after rotation. The snapshot captures pre-rotation state, the journal has post-rotation events.
+**When:** Steady state on any restart.
 
-### 2. Snapshot exists, journal missing
+### 2. Snapshot exists, live segment missing, archives may exist
 
-**Files present:** `melin.snapshot` (no `melin.journal`)
+**Recovery flow:** The server's bootstrap detects the missing live file and recreates it from the snapshot's chain hash, continuing from the snapshot's sequence + 1. Any archived segments past the snapshot would have been walked first.
 
-**Recovery flow:**
-1. Load snapshot (restores state as of sequence N)
-2. Create a new journal starting at sequence N + 1
+**When:** Crash between the live → archive rename and the new live file's creation. The snapshot was written and synced before the rename, so no committed event is lost.
 
-**When this happens:** Crash between `rotate_file()` (old journal renamed to `.1`) and `create_continuing()` (new journal not yet created). The snapshot is complete since it was written and synced before the rename. No data loss — the snapshot captures all events from the old journal.
+### 3. Live segment exists, no snapshot, may have archives
 
-### 3. Journal exists, no snapshot
+**Recovery flow:** Walk archives (from segment 000001 onward), then the live segment. Replay everything from genesis.
 
-**Files present:** `melin.journal` (no `melin.snapshot`)
+**When:** First startup after the initial run, or the snapshot file was manually deleted.
 
-**Recovery flow:**
-1. Open journal, replay all entries from sequence 1
-2. Truncate to last valid entry
-3. Open for append
+### 4. Neither snapshot nor any journal file exists
 
-**When this happens:** First startup after the initial run (no rotation has occurred yet), or if the snapshot file was manually deleted.
+**Recovery flow:** Create a fresh live journal at sequence 1; seed test instruments and accounts (configurable via `--accounts` / `--instruments`).
 
-### 4. Neither exists
-
-**Files present:** (none)
-
-**Recovery flow:**
-1. Create a new journal starting at sequence 1
-2. Seed test instruments and accounts (configurable via `--accounts` / `--instruments`)
-
-**When this happens:** First-ever startup.
+**When:** First-ever startup.
 
 ### 5. Crash during snapshot write
 
-The snapshot is written atomically: data goes to `melin.snapshot.tmp`, is synced to disk, then renamed to `melin.snapshot`. If the server crashes during the write, the `.tmp` file contains partial data but the rename never happens. On restart:
+The snapshot is written atomically: data goes to `melin.snapshot.tmp`, is synced to disk, then renamed to `melin.snapshot`. If the server crashes during the write, the `.tmp` file contains partial data but the rename never happens. On restart, the previous `melin.snapshot` is still valid (or `.snapshot.prev` if the rename happened but the next save failed).
 
-- If a previous `melin.snapshot` exists, it is used (still valid from the prior rotation)
-- If no previous snapshot exists, falls through to journal-only recovery (#3)
+### 6. Crash during normal operation
 
-No data loss in either case.
+The live segment may have a partially written final entry (torn write). The reader validates each entry's CRC32C checksum and treats a truncated or corrupt final entry as end-of-data; the writer truncates to the last valid entry on `open_append`. At most the in-flight event is lost — and since the response stage waits for journal durability before acknowledging to the client, the client never received confirmation for that event.
 
-### 6. Crash during normal operation (no rotation in progress)
+### 7. Crash mid-rotation
 
-The journal may have a partially written final entry (torn write). On recovery:
+If the crash occurs after the live → archive rename but before the new live file is created, recovery follows scenario #2 above. If the crash occurs during the new file's open, the just-archived segment is intact and recovery walks it as the most recent archive; the live file is then created from scratch using the latest snapshot.
 
-- The journal reader validates each entry's CRC32C checksum
-- A truncated or corrupt final entry is silently discarded
-- `valid_file_end` points to the last complete entry
-- `open_append` truncates the file to `valid_file_end` and continues
+## Operational Impact
 
-At most one event is lost (the one being written at crash time). Since the response stage waits for journal durability before acknowledging to the client, the client never received confirmation for that event. From the client's perspective, the event was never processed.
+### Stall duration
 
-### 7. Crash with pre-allocated space
+Rotation pauses the journal stage for a single rename + open + sync operation — typically tens of microseconds on NVMe. Upstream stages briefly backpressure on the input ring during that window. The shadow snapshot stage is **not** synchronously involved: snapshot capture runs on its own cadence (`--snapshot-interval-ms`), and recovery's multi-segment walk means events written between the last snapshot and the rotation remain replayable from the just-archived segment.
 
-The journal pre-allocates 64 MiB chunks via `posix_fallocate()` to avoid extent allocation on the write path. Pre-allocated space is zero-filled. The reader detects zero magic bytes (`0x0000` where the entry magic `0x4A45` is expected) and treats them as end-of-data, not corruption.
+This is materially different from the legacy startup-only rotation, where the snapshot and rename were coupled. Operators with strict tail-latency SLOs should still prefer larger `--max-journal-mib` so rotations are infrequent.
+
+### Audit trail
+
+Archived segments are append-only history and **not deleted automatically**. The full sequence of events from genesis is preserved across all archive files plus the live segment. Operators who need long-term retention should set up a separate workflow (e.g., copy `melin.journal.NNNNNN` to cold storage when their numeric suffix is sufficiently old).
+
+Replays for forensic purposes can use the standalone reader against any archived segment in isolation: the chain hash is self-contained per segment, with cross-segment continuity validated against neighboring segments' GenesisHash payloads.
+
+### Replication
+
+Each node — primary or replica — manages its own journal segments independently. The replica's archive numbering is local and need not match the primary's; only the per-event sequence numbers (assigned by the primary) are common across nodes. Triggering `ROTATE` on the primary does not cause the replica to rotate, and vice versa.
 
 ## Configuration
 
 | Flag | Default | Description |
 |---|---|---|
-| `--journal <path>` | `melin.journal` | Path to the active journal file |
-| `--snapshot <path>` | (derived: `<journal>.snapshot`) | Explicit snapshot path. If not set, the server checks `<journal-path-with-.snapshot-extension>` |
-| `--max-journal-mib <N>` | `256` | Rotate when journal exceeds N MiB at startup. Set to 0 to disable |
+| `--journal <path>` | `melin.journal` | Path to the live journal segment. Archives use the same prefix with a `.NNNNNN` suffix. |
+| `--snapshot <path>` | (derived: `<journal>.snapshot`) | Explicit snapshot path. If unset, the server uses `<journal-path-with-.snapshot-extension>`. |
+| `--max-journal-mib <N>` | `256` | Rotate when the live segment exceeds N MiB at the next fsync boundary. Set to `0` to disable size-driven rotation. |
+| `--rotate-bind <addr>` | (unset) | TCP address for the operator-driven rotation endpoint. Authenticated with operator keys; sends `ROTATE\n`. |
+| `--snapshot-interval-ms <ms>` | `3_000_000` | Cadence of background shadow snapshots. Snapshots are independent of rotation but recovery uses the most recent one. |
 
 ## Operational Notes
 
-- **Archived journals are not automatically deleted.** The `.1`, `.2`, etc. files are kept for audit trail purposes. Operators should set up a retention policy (e.g., cron job to delete archives older than 30 days).
-- **Rotation only happens at startup.** During a long-running session, the journal grows without bound. Restart the server to trigger rotation. Live rotation during operation is not yet supported (requires pausing the pipeline to take a consistent snapshot).
-- **The snapshot file can be large.** It captures all account balances, resting orders, reservations, risk limits, and circuit breaker state. For a busy exchange, this can be tens of MiB.
-- **Manual rotation** is possible by stopping the server, running a tool that calls `JournaledExchange::rotate()`, and restarting. The server will detect the snapshot and use it.
-- **Snapshot + journal must be on the same filesystem** for the atomic rename to work. If `--snapshot` points to a different filesystem, the atomic write falls back to a copy (which is not crash-safe).
+- **Archived segments are kept indefinitely.** Set up retention separately if disk usage matters.
+- **`ROTATE` does not block on the snapshot stage.** The admin command sets a flag and returns; the actual rotation happens at the next fsync boundary (typically within a few milliseconds under load).
+- **Both primary and replica honour `--rotate-bind`.** Each node rotates locally. To rotate both ends of a 1+1 deployment, send `ROTATE` to each address.
+- **Snapshot + segments must be on the same filesystem** for the atomic rename to work. Cross-filesystem `--snapshot` paths fall back to a copy that is not crash-safe.
+- **Legacy `.1`, `.2` archives** from pre-monotonic builds are still discoverable by recovery — they are visible in the archive listing for forensic replay, though new rotations always use the monotonic naming scheme.

@@ -64,6 +64,14 @@ pub struct JournalReader<E: AppEvent> {
     /// `None` when `hash-chain` feature is disabled or for v5 journals.
     #[cfg(feature = "hash-chain")]
     hash_chain: Option<ReaderHashChain>,
+    /// Payload of the most recently observed `GenesisHash` entry (i.e. the
+    /// chain hash this segment was anchored to at creation time). Used by
+    /// multi-segment recovery to verify that segment N+1's genesis matches
+    /// segment N's final chain hash, closing the cross-segment tamper-
+    /// evidence gap that within-segment chain validation alone cannot
+    /// catch.
+    #[cfg(feature = "hash-chain")]
+    genesis_payload: Option<[u8; 32]>,
 }
 
 /// Hash chain state maintained by the reader for verification.
@@ -110,6 +118,8 @@ impl<E: AppEvent> JournalReader<E> {
             sector_size,
             #[cfg(feature = "hash-chain")]
             hash_chain: None,
+            #[cfg(feature = "hash-chain")]
+            genesis_payload: None,
         })
     }
 
@@ -228,8 +238,12 @@ impl<E: AppEvent> JournalReader<E> {
             // Raw entry bytes excluding CRC (for hash chain computation).
             let entry_bytes_end = self.pos + consumed - 4;
 
-            // Handle GenesisHash: (re)initialize the chain.
-            if let JournalEvent::GenesisHash { .. } = &event {
+            // Handle GenesisHash: (re)initialize the chain. Capture the
+            // payload (the previous-segment chain hash) so multi-segment
+            // recovery can verify the boundary against the tail of the
+            // prior segment.
+            if let JournalEvent::GenesisHash { hash } = &event {
+                self.genesis_payload = Some(*hash);
                 let genesis_hash = blake3::hash(&self.buffer[self.pos..entry_bytes_end]);
                 self.hash_chain = Some(ReaderHashChain {
                     current_hash: *genesis_hash.as_bytes(),
@@ -367,6 +381,20 @@ impl<E: AppEvent> JournalReader<E> {
         }
         #[cfg(not(feature = "hash-chain"))]
         0
+    }
+
+    /// Payload of the `GenesisHash` entry seen for the current segment,
+    /// if any. Returns `None` when no GenesisHash has been observed yet
+    /// or when the `hash-chain` feature is disabled.
+    pub fn genesis_payload(&self) -> Option<[u8; 32]> {
+        #[cfg(feature = "hash-chain")]
+        {
+            self.genesis_payload
+        }
+        #[cfg(not(feature = "hash-chain"))]
+        {
+            None
+        }
     }
 
     /// Seed the hash chain from a snapshot's chain hash.

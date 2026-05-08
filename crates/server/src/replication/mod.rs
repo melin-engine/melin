@@ -407,6 +407,7 @@ pub(super) fn build_replica_pipeline_with_threads(
     snapshot_path: std::path::PathBuf,
     group_commit_delay: std::time::Duration,
     busy_spin: bool,
+    rotation: Option<(u64, Arc<AtomicBool>)>,
 ) -> Result<ReplicaPipelineHandles, Box<dyn std::error::Error>> {
     let shadow_exchange = <crate::App as melin_app::Application>::clone_via_snapshot(&exchange)?;
 
@@ -424,7 +425,10 @@ pub(super) fn build_replica_pipeline_with_threads(
 
     let ps = Arc::clone(&pipeline_shutdown);
     let journal_core = cores.journal;
-    let journal_stage = pipeline.journal_stage;
+    let mut journal_stage = pipeline.journal_stage;
+    if let Some((max_bytes, flag)) = rotation {
+        journal_stage.set_rotation(max_bytes, Some(flag));
+    }
     let journal_handle = std::thread::Builder::new()
         .name("journal".into())
         .spawn(move || {
