@@ -37,6 +37,7 @@ across 200M+ events.
 | T5 | jemalloc `background_thread:true` + decay tuning | **+2.8 % throughput, −6 % p99, −17 % throughput max** |
 | T7 | `mlockall(MCL_CURRENT \| MCL_FUTURE)` at startup | Bundled with T5 in the same merged branch |
 | N2 | Investigate the 30 µs single-order RTT spread | **Characterized as wire/NIC-bounded, not software-actionable on this hardware.** Bench `iface.poll()` p99 = 0.17 µs, server e2e p99 = 2.1 µs — both ends are clean. The 30 µs lives in NIC silicon + PCIe DMA + switch hop + TCP framing, each contributing a few µs that sum to the observed spread. Meaningful cuts would require lower-latency NIC (Mellanox CX-6/7), cut-through switch, or UDP framing — none software-tunable. |
+| N1 | Pre-size `AccountManager.balances` HashMap for bulk seed | **Eliminated the multi-hundred-ms seed spikes.** Before: 14 outliers >1 ms during seed, biggest 1146 ms near the end of 100K accounts; matching-execute histogram max 113 ms (saturated). After: 6 outliers, biggest 11 ms (a one-shot AddInstrument allocation, not the rehash phenomenon). Steady-state trading unchanged. Customer impact: failover RTO + replica catch-up no longer blocked by engine stalls during seed. |
 
 ## Still on the table — floor latency
 
@@ -56,7 +57,7 @@ across 200M+ events.
 
 | ID | Idea | Win | Effort | Notes |
 |---|---|---|---|---|
-| N1 | **Seed-phase bulk insert optimization** | Faster startup + replica catch-up | Medium-High | T1 showed seed-phase spikes scaling with progress (11 ms → 1146 ms over 100K accounts). Likely cumulative HashMap rehash + allocation. Fix: pre-size collections, batch insert, or seed via snapshot restore. Customer-visible impact: failover RTO. |
+| N3 | Pre-size InstrumentState allocations | Eliminates the residual 5–11 ms instrument-creation spikes seen in N1's after-fix run | Low | Each AddInstrument allocates an order book + slabs + indices. Could be addressed similarly to N1: a `with_seed_capacity`-style constructor that uses pre-allocated Vec/HashMap sizing for the typical exchange shape. Lower priority — only matters at first-instrument creation, not at trading time. |
 
 ## Deprioritized after T1's findings
 
