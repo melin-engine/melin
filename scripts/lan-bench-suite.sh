@@ -103,6 +103,12 @@
 #                       DPDK transport without editing the script. Server
 #                       prints histograms to stderr at shutdown
 #                       (/tmp/melin-server.log on the remote).
+#   DPDK_BENCH_EXTRA_FEATURES=<list>
+#                       Comma-separated cargo features to append to the
+#                       DPDK bench build (e.g. `latency-trace`). Mirrors
+#                       DPDK_SERVER_EXTRA_FEATURES for the client side.
+#                       Bench prints histograms to stderr at end of run
+#                       (interleaved with the standard summary).
 #
 # Special values:
 #   TRANSPORTS=all      All transports valid for the available infrastructure
@@ -596,10 +602,16 @@ if [[ "$NEED_DPDK" == "1" ]]; then
                 | tail -3 | sed "s/^/  [${SERVER} dpdk-server] /"
         ) &
         dpdk_pids+=($!)
+        # Bench feature set: append DPDK_BENCH_EXTRA_FEATURES if set so
+        # diagnostic features (latency-trace) can be enabled per-run.
+        DPDK_BENCH_FEATURES="dpdk"
+        if [[ -n "${DPDK_BENCH_EXTRA_FEATURES:-}" ]]; then
+            DPDK_BENCH_FEATURES="${DPDK_BENCH_FEATURES},${DPDK_BENCH_EXTRA_FEATURES}"
+        fi
         (
             ssh $SSH_OPTS "$BENCH" "cd ${REPO_DIR} && source ~/.cargo/env && \
                 export RUSTFLAGS=\"${RUSTFLAGS:-}\" && \
-                cargo build --release -p melin-bench --features dpdk" 2>&1 \
+                cargo build --release -p melin-bench --features ${DPDK_BENCH_FEATURES}" 2>&1 \
                 | tail -3 | sed "s/^/  [${BENCH} dpdk-bench] /"
         ) &
         dpdk_pids+=($!)

@@ -109,6 +109,17 @@ pub struct Exchange {
     /// stage processes — see `drain_due_scheduled_tasks`. Empty until a
     /// feature pushes a task; the substrate alone never schedules anything.
     scheduled_tasks: ScheduledTaskHeap,
+    /// Pre-allocated empty `OrderBook`s, populated by
+    /// [`Self::with_seed_capacity`] and indexed by symbol. When
+    /// `add_instrument` runs on the matching thread, it takes the book
+    /// from this pool instead of allocating a fresh one — avoiding the
+    /// 5–11 ms first-touch + mlock spike that would otherwise show up
+    /// during seed (matching thread is mlock-MCL_FUTURE so any new
+    /// allocation triggers a per-page lock, faulting thousands of pages
+    /// at once). Empty slot in the pool means the book has been taken
+    /// or was never pre-allocated for that symbol; `add_instrument`
+    /// falls back to a fresh allocation in that case.
+    instrument_pool: Vec<Option<OrderBook>>,
     /// When true, new order books are created with generous pre-allocation
     /// to avoid HashMap resize spikes on the hot path.
     presized: bool,
@@ -123,6 +134,7 @@ impl Exchange {
             order_counts: HashMap4::default(),
             key_hwm: HashMap::default(),
             scheduled_tasks: ScheduledTaskHeap::new(),
+            instrument_pool: Vec::new(),
             presized: false,
         }
     }
@@ -144,6 +156,48 @@ impl Exchange {
             order_counts: HashMap4::with_capacity_and_hasher(1_000_000, Default::default()),
             key_hwm: HashMap::default(),
             scheduled_tasks: ScheduledTaskHeap::new(),
+            instrument_pool: Vec::new(),
+            presized: true,
+        }
+    }
+
+    /// Create an Exchange pre-sized for a known bulk-seed workload.
+    ///
+    /// `num_accounts` and `num_instruments` are the seed counts. Each
+    /// `ProvisionAccount` event creates 2 balance entries per instrument
+    /// (base + quote), so the AccountManager's balance HashMap is sized
+    /// to `num_accounts × num_instruments × 2`. Without this, seeding
+    /// 100K accounts × 100 instruments hits multi-hundred-ms rehash
+    /// stalls as the map grows — visible in T1's seed-phase outlier
+    /// log as `matching execute outlier elapsed_us=1146403` near the
+    /// end of the seed phase.
+    ///
+    /// Falls back to [`Self::with_capacity`]'s production defaults for
+    /// the other collections (instruments, live_order_ids, order_counts).
+    pub fn with_seed_capacity(num_accounts: usize, num_instruments: usize) -> Self {
+        let balance_capacity = num_accounts
+            .saturating_mul(num_instruments)
+            .saturating_mul(2);
+        // Pre-allocate one OrderBook per expected instrument, indexed by
+        // symbol. AddInstrument on the matching thread pulls from this
+        // pool instead of allocating fresh — see the field doc on
+        // `instrument_pool`. Symbol convention is `Symbol(0)..Symbol(N-1)`
+        // (matches the bench seed); off-pattern symbols fall back to fresh
+        // allocation in `add_instrument`.
+        let instrument_pool: Vec<Option<OrderBook>> = (0..num_instruments)
+            .map(|i| Some(OrderBook::with_capacity(Symbol(i as u32))))
+            .collect();
+        Self {
+            instruments: Vec::with_capacity(num_instruments.max(64)),
+            accounts: AccountManager::with_balance_capacity(balance_capacity),
+            live_order_ids: HashMap4::with_capacity_and_hasher(1_000_000, Default::default()),
+            order_counts: HashMap4::with_capacity_and_hasher(
+                num_accounts.max(1_000_000),
+                Default::default(),
+            ),
+            key_hwm: HashMap::default(),
+            scheduled_tasks: ScheduledTaskHeap::new(),
+            instrument_pool,
             presized: true,
         }
     }
@@ -180,6 +234,7 @@ impl Exchange {
             order_counts,
             key_hwm,
             scheduled_tasks,
+            instrument_pool: Vec::new(),
             presized: false,
         }
     }
@@ -516,11 +571,23 @@ impl Exchange {
         }
         // Only insert if slot is empty (don't overwrite existing instrument).
         if self.instruments[idx].is_none() {
-            let book = if self.presized {
-                OrderBook::with_capacity(spec.symbol)
-            } else {
-                OrderBook::new(spec.symbol)
-            };
+            // Take a pre-allocated book from the pool if one is waiting at
+            // this symbol's index — see `instrument_pool` field doc. Falls
+            // back to fresh allocation otherwise; the matching thread is
+            // mlock-MCL_FUTURE so the fresh path can stall for a few ms
+            // while pages are locked. The pool path keeps that cost on
+            // the main thread at startup.
+            let book = self
+                .instrument_pool
+                .get_mut(idx)
+                .and_then(|slot| slot.take())
+                .unwrap_or_else(|| {
+                    if self.presized {
+                        OrderBook::with_capacity(spec.symbol)
+                    } else {
+                        OrderBook::new(spec.symbol)
+                    }
+                });
             self.instruments[idx] = Some(Box::new(InstrumentState {
                 spec,
                 book,

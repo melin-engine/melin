@@ -2153,6 +2153,29 @@ pub(crate) fn empty_app() -> App {
     melin_noop::NoopApp::new()
 }
 
+/// Build a fresh, empty application sized for a known bulk-seed workload.
+///
+/// Same as [`empty_app`] but pre-sizes the trading variant's
+/// AccountManager balances HashMap to `accounts × instruments × 2` so the
+/// bulk `ProvisionAccount` flow doesn't hit per-rehash hundred-millisecond
+/// stalls (see T1's outlier log on the seed phase). Used by `init_engine`
+/// when starting from an empty journal (the only path where the server
+/// itself does bulk seeding). Replica receivers and other paths use
+/// [`empty_app`] because they reconstruct state from snapshots / replicated
+/// frames, both of which already size their HashMap from a known count.
+#[cfg(all(feature = "trading", not(feature = "noop")))]
+pub(crate) fn empty_app_for_seed(config: &ServerConfig) -> App {
+    melin_engine::exchange::Exchange::with_seed_capacity(
+        config.accounts as usize,
+        config.instruments as usize,
+    )
+}
+
+#[cfg(all(feature = "noop", not(feature = "trading")))]
+pub(crate) fn empty_app_for_seed(_config: &ServerConfig) -> App {
+    melin_noop::NoopApp::new()
+}
+
 /// Initialize or recover the journaled application from disk.
 ///
 /// Returns `(app, writer, needs_seeding)`. `needs_seeding` is true on
@@ -2202,10 +2225,10 @@ pub(crate) fn init_engine(
         JournaledApp::<App>::from_parts(app, writer)
     } else if journal_exists {
         info!("recovering from journal");
-        JournaledApp::<App>::recover(empty_app(), &config.journal)?
+        JournaledApp::<App>::recover(empty_app_for_seed(config), &config.journal)?
     } else {
         info!("creating new journal");
-        JournaledApp::<App>::create(empty_app(), &config.journal)?
+        JournaledApp::<App>::create(empty_app_for_seed(config), &config.journal)?
     };
 
     let needs_seeding = !journal_exists;
