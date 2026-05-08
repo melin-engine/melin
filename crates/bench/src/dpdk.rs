@@ -454,6 +454,18 @@ pub fn run_dpdk_roundtrip(
     let mut interval_count: usize = 0;
     let mut series: TimeSeries = Vec::new();
 
+    // Outer-loop wall-time histogram, gated on at least one BatchEnd
+    // received this iteration AND on being past warmup so we measure
+    // steady-state. With single-order workloads the hypothesis under
+    // test is that the bench's poll-cycle width directly bounds the
+    // p99 RTT spread we observe (~30 µs on 48 µs p50): a packet that
+    // arrives at the bench NIC waits 0–(one outer iter time) for the
+    // next poll() to read it, which is symmetric to the same gap on
+    // the send side. p99 of this hist confirms or rules that out.
+    #[cfg(feature = "latency-trace")]
+    let mut poll_iter_hist =
+        Histogram::<u64>::new_with_bounds(1, 1_000_000_000, 3).expect("poll iter histogram bounds");
+
     // Poll every N connections to keep the NIC busy during the
     // connection iteration. Without this, smoltcp's TX buffer fills
     // up with 16 connections at window 256, and the NIC sits idle
@@ -461,6 +473,14 @@ pub fn run_dpdk_roundtrip(
     const POLL_EVERY_N_CONNS: usize = 4;
 
     loop {
+        // Stamp the start of each outer iter for the poll_iter histogram.
+        // Cheap: rdtsc is a few cycles. The compiler elides this when the
+        // feature is off (TraceTimestamp = ()).
+        #[cfg(feature = "latency-trace")]
+        let iter_start_tsc = crate::rdtscp();
+        #[cfg(feature = "latency-trace")]
+        let mut work_done_this_iter = false;
+
         poll(
             &mut device,
             &mut iface,
@@ -574,6 +594,10 @@ pub fn run_dpdk_roundtrip(
                                 &mut series,
                                 start,
                             );
+                            #[cfg(feature = "latency-trace")]
+                            {
+                                work_done_this_iter = true;
+                            }
                         }
                     } else {
                         conn.inflight_ts.pop_front();
@@ -593,6 +617,15 @@ pub fn run_dpdk_roundtrip(
                 conn.parse_buf.copy_within(cursor.., 0);
                 conn.parse_buf.truncate(remaining);
             }
+        }
+
+        // Record this iteration's wall-time if it produced any measured
+        // latency samples. Skip warmup/idle iters so the percentiles
+        // describe steady-state poll behaviour, not connection setup.
+        #[cfg(feature = "latency-trace")]
+        if work_done_this_iter {
+            let elapsed_ns = crate::tsc_to_ns(crate::rdtscp() - iter_start_tsc, ticks_per_ns);
+            poll_iter_hist.record(elapsed_ns).ok();
         }
 
         if all_done {
@@ -621,6 +654,28 @@ pub fn run_dpdk_roundtrip(
         format!("  DPDK core: {core_id}"),
         format!("  Window: {window}, Clients: {num_clients}"),
     ];
+
+    #[cfg(feature = "latency-trace")]
+    if !poll_iter_hist.is_empty() {
+        let us = |ns: u64| ns as f64 / 1000.0;
+        eprintln!(
+            "  bench poll: outer iteration (work-iters only)\n\
+             \x20   samples: {samples}\n\
+             \x20   min:    {min:>8.2} µs\n\
+             \x20   p50:    {p50:>8.2} µs\n\
+             \x20   p90:    {p90:>8.2} µs\n\
+             \x20   p99:    {p99:>8.2} µs\n\
+             \x20   p99.9:  {p999:>8.2} µs\n\
+             \x20   max:    {max:>8.2} µs",
+            samples = poll_iter_hist.len(),
+            min = us(poll_iter_hist.min()),
+            p50 = us(poll_iter_hist.value_at_quantile(0.50)),
+            p90 = us(poll_iter_hist.value_at_quantile(0.90)),
+            p99 = us(poll_iter_hist.value_at_quantile(0.99)),
+            p999 = us(poll_iter_hist.value_at_quantile(0.999)),
+            max = us(poll_iter_hist.max()),
+        );
+    }
 
     print_results(
         "Roundtrip",
