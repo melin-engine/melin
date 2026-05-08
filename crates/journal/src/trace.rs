@@ -221,11 +221,20 @@ impl StatsRegistry {
     /// Snapshot every registered stage. Stages with zero samples are
     /// omitted from the result.
     ///
-    /// Refresh waits up to 10 ms for each recorder to acknowledge the
-    /// phase shift; idle recorders that don't ack within that window
-    /// are skipped (their pending samples roll over to the next
-    /// snapshot). At bench rates every stage thread is recording
-    /// continuously, so refresh completes well below the timeout.
+    /// Refresh waits up to 500 ms for each recorder to acknowledge the
+    /// phase shift via its next `record` call. The bench's `/stats-dump`
+    /// fetch typically happens immediately after the workload completes
+    /// — at which point the stage threads have just gone idle and may
+    /// not record again for hundreds of milliseconds (busy-spin, no
+    /// inbound traffic). A short 10 ms timeout missed those tail
+    /// records; 500 ms is generous enough to catch stragglers from
+    /// heartbeats, scheduler ticks, or one-off control messages while
+    /// still bounding the dump's worst-case wall time.
+    ///
+    /// Recorders that stay fully dormant past the timeout have their
+    /// last samples skipped (rolled over to the next snapshot when the
+    /// recorder records again). Worst case the bench gets slightly
+    /// stale data; never wrong, never hung.
     pub fn snapshot_all(&self) -> Vec<StageSnapshot> {
         let entries = match self.entries.lock() {
             Ok(g) => g,
@@ -239,8 +248,9 @@ impl StatsRegistry {
             };
             // Pull pending samples from all recorders into the main
             // histogram. Bounded wait so an idle recorder can't hang
-            // a /stats-dump request.
-            sync.refresh_timeout(std::time::Duration::from_millis(10));
+            // a /stats-dump request — see the doc on `snapshot_all`
+            // for why 500 ms (vs e.g. 10 ms).
+            sync.refresh_timeout(std::time::Duration::from_millis(500));
             if sync.is_empty() {
                 continue;
             }
