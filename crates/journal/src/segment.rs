@@ -50,6 +50,12 @@ fn parse_archive_index(live: &Path, candidate: &Path) -> Option<u32> {
 /// List archived segments for a live journal path, sorted ascending by
 /// index. Each entry is `(index, path)`. Missing parent directory is
 /// treated as "no archives yet".
+///
+/// Errors with `InvalidData` if two entries map to the same index — this
+/// happens only if a legacy `.N` archive coexists with the canonical
+/// zero-padded `.NNNNNN` form for the same N. Recovery cannot
+/// disambiguate which segment's hash anchors the next, so we refuse to
+/// proceed rather than risk a non-deterministic walk order.
 pub fn list_archives(live: &Path) -> std::io::Result<Vec<(u32, PathBuf)>> {
     let dir = match live.parent() {
         Some(p) if !p.as_os_str().is_empty() => p.to_path_buf(),
@@ -71,6 +77,20 @@ pub fn list_archives(live: &Path) -> std::io::Result<Vec<(u32, PathBuf)>> {
         }
     }
     out.sort_by_key(|(n, _)| *n);
+    for w in out.windows(2) {
+        if w[0].0 == w[1].0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "duplicate archive index {} for live journal {}: {} and {}",
+                    w[0].0,
+                    live.display(),
+                    w[0].1.display(),
+                    w[1].1.display()
+                ),
+            ));
+        }
+    }
     Ok(out)
 }
 
@@ -159,6 +179,19 @@ mod tests {
         std::fs::write(&live, b"second").unwrap();
         let archived2 = archive_live(&live).unwrap();
         assert_eq!(archived2, archive_path(&live, 2));
+    }
+
+    #[test]
+    fn duplicate_archive_indices_are_rejected() {
+        // Coexisting `.1` (legacy) and `.000001` (canonical) collide on
+        // index 1 — recovery would walk both non-deterministically and
+        // the cross-segment hash chain would fail on the second copy.
+        let dir = tempfile::tempdir().unwrap();
+        let live = dir.path().join("j.bin");
+        std::fs::write(PathBuf::from(format!("{}.1", live.display())), b"").unwrap();
+        std::fs::write(archive_path(&live, 1), b"").unwrap();
+        let err = list_archives(&live).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
     }
 
     #[test]
