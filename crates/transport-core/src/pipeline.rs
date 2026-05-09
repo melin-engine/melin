@@ -19,7 +19,7 @@
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use melin_app::{AppEvent, Application, ApplyCtx, RejectReason};
 use melin_journal::JournalError;
@@ -319,7 +319,19 @@ pub struct JournalStage<E: AppEvent> {
     /// via `compare_exchange(true → false)` so concurrent triggers
     /// degrade to a single rotation rather than queueing.
     rotate_requested: Option<Arc<AtomicBool>>,
+    /// Suppression window for size-driven rotation after a failure. Set
+    /// to `now + ROTATION_FAILURE_BACKOFF` whenever `rotate_segment`
+    /// returns Err so a permanent failure (ENOSPC, RO-FS) doesn't
+    /// re-arm on every batch and flood the logs. Manual `ROTATE`
+    /// requests bypass this window — operators get a fresh attempt and
+    /// a fresh error log on each command.
+    rotation_backoff_until: Option<Instant>,
 }
+
+/// How long to suppress size-driven rotation attempts after a failure.
+/// Picked to balance log-flood prevention against responsiveness once
+/// the environmental issue (disk space, fs read-only) is resolved.
+const ROTATION_FAILURE_BACKOFF: Duration = Duration::from_secs(30);
 
 /// Replication state for the journal stage. Boxed in JournalStage to
 /// avoid inflating the struct size on the hot path (standalone mode has
@@ -392,6 +404,7 @@ impl<E: AppEvent> JournalStage<E> {
             utilization: Arc::new(StageUtilization::new()),
             max_journal_bytes: 0,
             rotate_requested: None,
+            rotation_backoff_until: None,
         }
     }
 
@@ -861,6 +874,17 @@ impl<E: AppEvent> JournalStage<E> {
         if !(manual || size_triggered) {
             return false;
         }
+        // Suppress size-driven retries during the backoff window so a
+        // permanent failure (ENOSPC, RO-FS) doesn't re-arm every batch
+        // and flood the error log. Manual triggers always proceed —
+        // operators expect a fresh attempt and a fresh error per
+        // command.
+        if !manual
+            && let Some(until) = self.rotation_backoff_until
+            && Instant::now() < until
+        {
+            return false;
+        }
         let pre_size = self.writer.valid_end();
         match self.writer.rotate_segment() {
             Ok(archived) => {
@@ -871,6 +895,7 @@ impl<E: AppEvent> JournalStage<E> {
                     trigger = if manual { "manual" } else { "size" },
                     "journal segment rotated"
                 );
+                self.rotation_backoff_until = None;
                 // The new segment's GenesisHash advanced the chain;
                 // republish so shadow + cursor observers see it.
                 self.publish_chain_hash();
@@ -879,8 +904,11 @@ impl<E: AppEvent> JournalStage<E> {
             Err(e) => {
                 tracing::error!(
                     error = %e,
+                    trigger = if manual { "manual" } else { "size" },
+                    backoff_secs = ROTATION_FAILURE_BACKOFF.as_secs(),
                     "journal segment rotation failed; continuing with current segment"
                 );
+                self.rotation_backoff_until = Some(Instant::now() + ROTATION_FAILURE_BACKOFF);
                 false
             }
         }
