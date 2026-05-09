@@ -229,8 +229,25 @@ fn authenticate(stream: &mut TcpStream, authorized_keys: &AuthorizedKeys) -> Res
 fn send_auth_failed(stream: &mut TcpStream) {
     let mut buf = [0u8; 8];
     if let Ok(written) = codec::encode_response(&ResponseKind::AuthFailed, &mut buf) {
-        let _ = stream.write_all(&buf[..written]);
-        let _ = stream.flush();
+        // Best-effort: an unauthenticated peer may already be gone, and
+        // we're about to drop the stream regardless. Write errors here
+        // carry no actionable signal.
+        send_best_effort(stream, &buf[..written]);
+    }
+}
+
+/// Write `payload` to `stream` and flush, ignoring errors. Used for
+/// terminal admin responses where the connection is about to close: the
+/// client may already have disconnected, and there's nothing the server
+/// can usefully do with a write error after the in-process side effect
+/// (flag CAS, auth rejection) has already happened.
+fn send_best_effort(stream: &mut TcpStream, payload: &[u8]) {
+    if let Err(e) = stream.write_all(payload) {
+        debug!(error = %e, "admin write failed");
+        return;
+    }
+    if let Err(e) = stream.flush() {
+        debug!(error = %e, "admin flush failed");
     }
 }
 
@@ -269,33 +286,28 @@ fn handle_connection(
         "PROMOTE" => match promote {
             Some(flag) => {
                 flag.store(true, Ordering::Release);
-                let _ = stream.write_all(b"OK\n");
-                let _ = stream.flush();
+                send_best_effort(&mut stream, b"OK\n");
                 info!("promotion triggered by operator");
             }
             None => {
-                let _ = stream.write_all(b"ERR PROMOTE not available on this node\n");
-                let _ = stream.flush();
+                send_best_effort(&mut stream, b"ERR PROMOTE not available on this node\n");
                 debug!("rejected PROMOTE — flag not wired (primary node?)");
             }
         },
         "ROTATE" => match rotate_requested {
             Some(flag) => {
                 flag.store(true, Ordering::Release);
-                let _ = stream.write_all(b"OK\n");
-                let _ = stream.flush();
+                send_best_effort(&mut stream, b"OK\n");
                 info!("rotation requested by operator");
             }
             None => {
-                let _ = stream.write_all(b"ERR ROTATE not available on this node\n");
-                let _ = stream.flush();
+                send_best_effort(&mut stream, b"ERR ROTATE not available on this node\n");
                 debug!("rejected ROTATE — flag not wired");
             }
         },
         other => {
             debug!(received = %other, "unknown admin command");
-            let _ = stream.write_all(b"ERR unknown command\n");
-            let _ = stream.flush();
+            send_best_effort(&mut stream, b"ERR unknown command\n");
         }
     }
 }
