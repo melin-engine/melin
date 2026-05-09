@@ -1537,4 +1537,258 @@ mod tests {
             archive_path.display()
         );
     }
+
+    /// ROTATE storm: many rapid sets of the flag between fsync
+    /// boundaries collapse to a single rotation, not one rotation per
+    /// store. Validates the `compare_exchange(true → false)` consume in
+    /// `maybe_rotate`.
+    ///
+    /// The storm has to land between two fsyncs — that's the only
+    /// window in which the journal stage can observe-and-collapse
+    /// without rotating in between. The test sequences:
+    ///   publish → fsync (no rotation flag) → storm 100× set →
+    ///   publish → fsync (one rotation) → publish → fsync (no flag).
+    /// Final archive count should be exactly 1.
+    #[cfg(not(feature = "no-persist"))]
+    #[test]
+    fn rotate_storm_collapses_to_single_rotation() {
+        use std::time::Duration as StdDuration;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("storm.journal");
+        let writer = JournalWriter::create(&path).unwrap();
+
+        let (mut producer, mut consumers) = ring::DisruptorBuilder::<InputSlot>::new(64)
+            .add_consumer()
+            .build();
+        let consumer = consumers.pop().unwrap();
+
+        let mut stage = JournalStage::new(
+            writer,
+            consumer,
+            StdDuration::ZERO,
+            MAX_JOURNAL_BATCH,
+            false,
+        );
+        let rotate_flag = Arc::new(AtomicBool::new(false));
+        stage.set_rotation(
+            /* max_journal_bytes */ 0,
+            Some(Arc::clone(&rotate_flag)),
+        );
+
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let s = Arc::clone(&shutdown);
+        let handle = std::thread::spawn(move || stage.run(&s));
+
+        let mut req_seq: u64 = 0;
+        let mut publish = |amount: u64| {
+            req_seq += 1;
+            producer.publish(InputSlot {
+                connection_id: 1,
+                key_hash: 1,
+                request_seq: req_seq,
+                sequence: 0,
+                timestamp_ns: 1_000_000 + req_seq,
+                event: JournalEvent::App(crate::trading_event::TradingEvent::Deposit {
+                    account: AccountId(1),
+                    currency: CurrencyId(1),
+                    amount,
+                }),
+                publish_ts: trace_ts(),
+                recv_ts: trace_ts(),
+            });
+        };
+
+        // Initial event so the stage has something to fsync against.
+        publish(1);
+        std::thread::sleep(StdDuration::from_millis(100));
+
+        // Storm: 100 rapid sets. The journal stage is currently idle
+        // (waiting for new events), so none of these stores can be
+        // observed-and-cleared until the next fsync — which is what
+        // we want.
+        for _ in 0..100 {
+            rotate_flag.store(true, Ordering::Release);
+        }
+
+        // Trigger an fsync. The journal stage observes the flag once,
+        // CAS-clears it, rotates, and the remaining 99 stores were
+        // collapsed onto the same rotation.
+        publish(2);
+
+        // Wait for the rotation + a follow-up fsync to confirm no
+        // second rotation fires (the flag is already false).
+        let archive_001 = std::path::PathBuf::from(format!("{}.000001", path.display()));
+        let deadline = std::time::Instant::now() + StdDuration::from_secs(5);
+        while !archive_001.exists() && std::time::Instant::now() < deadline {
+            std::thread::sleep(StdDuration::from_millis(20));
+        }
+        publish(3);
+        std::thread::sleep(StdDuration::from_millis(200));
+
+        shutdown.store(true, Ordering::Relaxed);
+        let _ = handle.join().unwrap();
+
+        assert!(archive_001.exists(), ".000001 must exist");
+        let archive_002 = std::path::PathBuf::from(format!("{}.000002", path.display()));
+        assert!(
+            !archive_002.exists(),
+            "storm must collapse to a single rotation, but .000002 exists"
+        );
+    }
+
+    /// Post-rotation events must land in the *live* segment, not in the
+    /// just-archived one. This is a regression test for the io_uring
+    /// fixed-file-registration bug: rotation closes the old live fd
+    /// (now pointing at the archived inode) and opens a new one for
+    /// the new live segment, but io_uring's `register_files` table
+    /// still references the old fd. Without an explicit
+    /// `register_files_update`, every subsequent SQE submitted with
+    /// `types::Fixed(0)` writes into the archived inode rather than
+    /// the new live file — overwriting pre-rotation events at the
+    /// post-rotation write offset and silently losing data.
+    ///
+    /// To exercise the io_uring async-write path (rather than the
+    /// sync partial-tail path that bypasses the registered fd), the
+    /// test bursts enough deposits that each batch exceeds one
+    /// sector and therefore goes through `take_batch_for_async_write`.
+    ///
+    /// The test reads each on-disk segment directly (rather than
+    /// going through `JournaledExchange::recover`, which would mask
+    /// the bug by summing balances across both segments) and asserts:
+    ///   * the archive contains only pre-rotation sequences,
+    ///   * the live segment contains only post-rotation sequences,
+    ///   * no sequence appears in both.
+    #[cfg(not(feature = "no-persist"))]
+    #[test]
+    fn post_rotation_events_land_in_live_not_archive() {
+        use melin_journal::JournalReader;
+        use std::time::Duration as StdDuration;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("post_rot.journal");
+        let writer = JournalWriter::create(&path).unwrap();
+
+        let (mut producer, mut consumers) = ring::DisruptorBuilder::<InputSlot>::new(1024)
+            .add_consumer()
+            .build();
+        let consumer = consumers.pop().unwrap();
+
+        let mut stage = JournalStage::new(
+            writer,
+            consumer,
+            StdDuration::ZERO,
+            MAX_JOURNAL_BATCH,
+            false,
+        );
+        let rotate_flag = Arc::new(AtomicBool::new(false));
+        stage.set_rotation(
+            /* max_journal_bytes */ 0,
+            Some(Arc::clone(&rotate_flag)),
+        );
+
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let s = Arc::clone(&shutdown);
+        let handle = std::thread::spawn(move || stage.run(&s));
+
+        let mut req_seq: u64 = 0;
+        let mut publish = |producer: &mut ring::Producer<InputSlot>, amount: u64| {
+            req_seq += 1;
+            producer.publish(InputSlot {
+                connection_id: 1,
+                key_hash: 1,
+                request_seq: req_seq,
+                sequence: 0,
+                timestamp_ns: 1_000_000 + req_seq,
+                event: JournalEvent::App(crate::trading_event::TradingEvent::Deposit {
+                    account: AccountId(1),
+                    currency: CurrencyId(1),
+                    amount,
+                }),
+                publish_ts: trace_ts(),
+                recv_ts: trace_ts(),
+            });
+        };
+
+        // Phase 1 (pre-rotation): enough events to cross one sector
+        // (~50 deposits × ~50 bytes each ≈ 2.5 KB > one 512-byte sector
+        // → io_uring async-write path engages, not the partial-tail
+        // sync fallback that bypasses the registered fd).
+        const PRE: u64 = 50;
+        for i in 1..=PRE {
+            publish(&mut producer, i);
+        }
+
+        // Set the rotate flag, then publish a tiny batch to drive the
+        // fsync at which the flag is observed. Both phase-1 and this
+        // marker batch end up in the archive; the rotation happens
+        // *after* they are durable, when `maybe_rotate` fires at the
+        // post-fsync boundary.
+        rotate_flag.store(true, Ordering::Release);
+        let archive_001 = std::path::PathBuf::from(format!("{}.000001", path.display()));
+        publish(&mut producer, 9_999);
+        let deadline = std::time::Instant::now() + StdDuration::from_secs(5);
+        while !archive_001.exists() && std::time::Instant::now() < deadline {
+            std::thread::sleep(StdDuration::from_millis(20));
+        }
+        assert!(archive_001.exists(), "archive must be created by rotation");
+
+        // Phase 2 (post-rotation): a fresh burst submitted *after* the
+        // archive file has appeared, so these events land in the new
+        // live segment. This is the path that exercises the post-
+        // rotation io_uring SQE — Fixed(0) must point to the new fd
+        // for the writes to land in the live file rather than the
+        // archived inode.
+        const POST: u64 = 50;
+        for i in 1..=POST {
+            publish(&mut producer, 10_000 + i);
+        }
+        std::thread::sleep(StdDuration::from_millis(300));
+
+        shutdown.store(true, Ordering::Relaxed);
+        let _ = handle.join().unwrap();
+
+        // Read each segment directly. Collect every entry's sequence,
+        // skipping the GenesisHash anchors that segment recovery uses
+        // for chain continuity.
+        fn collect_app_seqs(p: &std::path::Path) -> Vec<u64> {
+            let mut reader = JournalReader::<crate::trading_event::TradingEvent>::open(p).unwrap();
+            let mut out = Vec::new();
+            while let Some(entry) = reader.next_entry().unwrap() {
+                if matches!(entry.event, JournalEvent::App(_)) {
+                    out.push(entry.sequence);
+                }
+            }
+            out
+        }
+        let archive_seqs = collect_app_seqs(&archive_001);
+        let live_seqs = collect_app_seqs(&path);
+
+        assert!(
+            !archive_seqs.is_empty(),
+            "archive must contain the pre-rotation events"
+        );
+        assert!(
+            !live_seqs.is_empty(),
+            "live segment must contain post-rotation events"
+        );
+        // Every archive seq must be < every live seq — i.e. the two
+        // ranges must be cleanly disjoint and ordered.
+        let archive_max = *archive_seqs.iter().max().unwrap();
+        let live_min = *live_seqs.iter().min().unwrap();
+        assert!(
+            archive_max < live_min,
+            "post-rotation events leaked into the archive: archive max={archive_max} \
+             live min={live_min} archive_seqs={archive_seqs:?} live_seqs={live_seqs:?}"
+        );
+        // No overlap.
+        let archive_set: std::collections::HashSet<u64> = archive_seqs.iter().copied().collect();
+        for s in &live_seqs {
+            assert!(
+                !archive_set.contains(s),
+                "seq {s} present in both archive and live — io_uring fd \
+                 reregistration regression?"
+            );
+        }
+    }
 }

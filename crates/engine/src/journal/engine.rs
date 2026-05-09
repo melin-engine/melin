@@ -311,6 +311,11 @@ impl JournaledExchange {
         let mut reports = Vec::new();
         let mut last_drain_ns: u64 = 0;
         let mut prev_tail_hash: Option<[u8; 32]> = None;
+        // Highest sequence observed across walked archives. Used to
+        // synthesize a new live when rotation crashed mid-rename — see
+        // [`JournaledApp::recover_inner`] for the full Phase B
+        // rationale.
+        let mut last_seq_seen: u64 = snap_sequence;
 
         for (idx, archive_path) in &archives {
             let mut reader = JournalReader::open(archive_path)?;
@@ -326,6 +331,26 @@ impl JournaledExchange {
             if let Some(h) = reader.chain_hash() {
                 prev_tail_hash = Some(h);
             }
+            if let Some(seq) = reader.last_sequence() {
+                last_seq_seen = last_seq_seen.max(seq);
+            }
+        }
+
+        if !journal_path.exists() {
+            // Phase B: live missing but archives present — rotation
+            // crashed between the rename and the new live's creation.
+            // Synthesize a fresh live segment continuing from the last
+            // archive's tail so the pipeline has somewhere to append.
+            if archives.is_empty() {
+                return Err(JournalError::Io(std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    "no live journal and no archives — nothing to recover",
+                )));
+            }
+            let genesis = prev_tail_hash.unwrap_or([0u8; 32]);
+            let writer =
+                JournalWriter::create_continuing(journal_path, last_seq_seen + 1, genesis)?;
+            return Ok(Self { exchange, writer });
         }
 
         let mut reader = JournalReader::open(journal_path)?;

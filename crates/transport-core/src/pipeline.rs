@@ -668,7 +668,7 @@ impl<E: AppEvent> JournalStage<E> {
 
                     self.consumer.commit(pending);
                     self.publish_chain_hash();
-                    self.maybe_rotate();
+                    let _ = self.maybe_rotate();
 
                     pending = 0;
                     first_write_ts = None;
@@ -842,8 +842,12 @@ impl<E: AppEvent> JournalStage<E> {
     /// Errors are logged but do not abort the pipeline: the live
     /// segment is restored by `JournalWriter::rotate_segment` on
     /// failure, so the next batch can continue writing to it.
+    ///
+    /// Returns `true` when a rotation actually happened — the caller
+    /// in the io_uring path uses this to refresh the registered file
+    /// slot, since the writer's fd has changed.
     #[inline]
-    fn maybe_rotate(&mut self) {
+    fn maybe_rotate(&mut self) -> bool {
         let manual = self
             .rotate_requested
             .as_ref()
@@ -855,7 +859,7 @@ impl<E: AppEvent> JournalStage<E> {
         let size_triggered =
             self.max_journal_bytes > 0 && self.writer.valid_end() >= self.max_journal_bytes;
         if !(manual || size_triggered) {
-            return;
+            return false;
         }
         let pre_size = self.writer.valid_end();
         match self.writer.rotate_segment() {
@@ -870,14 +874,38 @@ impl<E: AppEvent> JournalStage<E> {
                 // The new segment's GenesisHash advanced the chain;
                 // republish so shadow + cursor observers see it.
                 self.publish_chain_hash();
+                true
             }
             Err(e) => {
                 tracing::error!(
                     error = %e,
                     "journal segment rotation failed; continuing with current segment"
                 );
+                false
             }
         }
+    }
+
+    /// Update the io_uring fixed-file slot 0 to point at `new_fd`.
+    ///
+    /// Called after rotation: rotation closes the old live fd and opens
+    /// a new one for the new live segment, but io_uring's registered
+    /// file table still references the old fd. Subsequent SQEs that use
+    /// `types::Fixed(0)` would write to the now-archived inode (rename
+    /// moves the directory entry, not the kernel's file reference).
+    /// `register_files_update` swaps slot 0 atomically.
+    fn reregister_journal_fd(
+        ring: &io_uring::IoUring,
+        new_fd: std::os::unix::io::RawFd,
+    ) -> Result<(), JournalError> {
+        ring.submitter()
+            .register_files_update(0, &[new_fd])
+            .map_err(|e| {
+                JournalError::Io(std::io::Error::other(format!(
+                    "io_uring register_files_update after rotation: {e}"
+                )))
+            })?;
+        Ok(())
     }
 
     /// Verify the replica's chain hash against a checkpoint from the
@@ -1089,6 +1117,7 @@ impl<E: AppEvent> JournalStage<E> {
             // --- Reap CQE from previous in-flight write (non-blocking) ---
             // CQEs are posted directly to the shared CQ ring in interrupt
             // context — no syscall needed to make them visible.
+            let mut rotated_top = false;
             if let Some((ref batch_data, seq)) = inflight
                 && let Some(cqe) = ring.completion().next()
             {
@@ -1109,7 +1138,10 @@ impl<E: AppEvent> JournalStage<E> {
                 self.publish_chain_hash();
                 let completed = inflight.take().expect("checked above");
                 self.writer.confirm_async_write(completed.0);
-                self.maybe_rotate();
+                rotated_top = self.maybe_rotate();
+            }
+            if rotated_top {
+                Self::reregister_journal_fd(&ring, self.writer.fd())?;
             }
 
             // --- Read events from disruptor ---
@@ -1202,6 +1234,7 @@ impl<E: AppEvent> JournalStage<E> {
             // a CQE that arrived while we were encoding events. Reap it now
             // so the cursor advances sooner and the slot frees up for
             // immediate submission.
+            let mut rotated_eager = false;
             if let Some((ref batch_data, seq)) = inflight
                 && let Some(cqe) = ring.completion().next()
             {
@@ -1221,7 +1254,10 @@ impl<E: AppEvent> JournalStage<E> {
                 self.publish_chain_hash();
                 let completed = inflight.take().expect("checked above");
                 self.writer.confirm_async_write(completed.0);
-                self.maybe_rotate();
+                rotated_eager = self.maybe_rotate();
+            }
+            if rotated_eager {
+                Self::reregister_journal_fd(&ring, self.writer.fd())?;
             }
 
             // --- Decide whether to submit ---
@@ -1247,7 +1283,9 @@ impl<E: AppEvent> JournalStage<E> {
                         self.consumer.set_progress(seq);
                         self.publish_chain_hash();
                         self.writer.confirm_async_write(batch_data);
-                        self.maybe_rotate();
+                        if self.maybe_rotate() {
+                            Self::reregister_journal_fd(&ring, self.writer.fd())?;
+                        }
                     }
 
                     // Publish the accumulated InputBatch frame to
@@ -1292,7 +1330,9 @@ impl<E: AppEvent> JournalStage<E> {
                             // state, and check for rotation triggers.
                             self.consumer.commit(pending);
                             self.publish_chain_hash();
-                            self.maybe_rotate();
+                            if self.maybe_rotate() {
+                                Self::reregister_journal_fd(&ring, self.writer.fd())?;
+                            }
                         }
                         Err(e) => {
                             return Err(JournalError::Io(std::io::Error::other(format!(

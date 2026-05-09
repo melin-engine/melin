@@ -268,12 +268,15 @@ fn wait_for_replacement_catchup(primary_health: SocketAddr) {
 }
 
 /// Authenticate and send PROMOTE to the promotion endpoint.
-fn promote(addr: SocketAddr, operator_key: &SigningKey) {
+/// Authenticate as an operator and send a single admin command line
+/// (e.g. `PROMOTE`, `ROTATE`). Returns the server's first response line
+/// trimmed of whitespace.
+fn admin_command(addr: SocketAddr, operator_key: &SigningKey, command: &str) -> String {
     use melin_protocol::codec;
     use melin_protocol::message::{Request, ResponseKind};
 
     let mut stream = TcpStream::connect_timeout(&addr, Duration::from_secs(5))
-        .expect("connect to promotion endpoint");
+        .expect("connect to admin endpoint");
     stream
         .set_read_timeout(Some(Duration::from_secs(5)))
         .expect("set read timeout");
@@ -322,18 +325,25 @@ fn promote(addr: SocketAddr, operator_key: &SigningKey) {
         .expect("read auth result payload");
     match codec::decode_response(&result_buf).expect("decode auth result") {
         ResponseKind::ServerReady => {}
-        ResponseKind::AuthFailed => panic!("promotion auth failed"),
+        ResponseKind::AuthFailed => panic!("admin auth failed"),
         other => panic!("unexpected auth response: {other:?}"),
     }
 
-    // Step 4: Send PROMOTE command.
-    stream.write_all(b"PROMOTE\n").expect("send PROMOTE");
+    // Step 4: Send command + read response line.
+    stream
+        .write_all(format!("{command}\n").as_bytes())
+        .expect("send admin command");
     let mut reader = BufReader::new(&stream);
     let mut response = String::new();
     reader
         .read_line(&mut response)
-        .expect("read promotion response");
-    assert!(response.trim() == "OK", "promotion failed: {response}");
+        .expect("read admin response");
+    response.trim().to_string()
+}
+
+fn promote(addr: SocketAddr, operator_key: &SigningKey) {
+    let response = admin_command(addr, operator_key, "PROMOTE");
+    assert!(response == "OK", "promotion failed: {response}");
 }
 
 struct ServerProcess {
@@ -359,38 +369,91 @@ fn spawn_primary(
     health_port: u16,
     replication_port: u16,
 ) -> ServerProcess {
+    spawn_primary_with_extra(
+        bin,
+        tmp_dir,
+        keys_path,
+        client_port,
+        health_port,
+        replication_port,
+        &[],
+    )
+}
+
+/// Spawn a primary server process with caller-supplied extra CLI flags
+/// (e.g. `--admin-bind`, `--max-journal-mib`). The base flag set is the
+/// same as [`spawn_primary`].
+fn spawn_primary_with_extra(
+    bin: &Path,
+    tmp_dir: &Path,
+    keys_path: &Path,
+    client_port: u16,
+    health_port: u16,
+    replication_port: u16,
+    extra_args: &[&str],
+) -> ServerProcess {
+    spawn_primary_with_extra_env(
+        bin,
+        tmp_dir,
+        keys_path,
+        client_port,
+        health_port,
+        replication_port,
+        extra_args,
+        &[],
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn spawn_primary_with_extra_env(
+    bin: &Path,
+    tmp_dir: &Path,
+    keys_path: &Path,
+    client_port: u16,
+    health_port: u16,
+    replication_port: u16,
+    extra_args: &[&str],
+    extra_env: &[(&str, &str)],
+) -> ServerProcess {
     let journal = tmp_dir.join("primary.journal");
-    let child = Command::new(bin)
-        .args([
-            "--bind",
-            &format!("127.0.0.1:{client_port}"),
-            "--health-bind",
-            &format!("127.0.0.1:{health_port}"),
-            "--replication-bind",
-            &format!("127.0.0.1:{replication_port}"),
-            "--journal",
-            journal.to_str().expect("valid path"),
-            "--authorized-keys",
-            keys_path.to_str().expect("valid path"),
-            "--accounts",
-            "10",
-            "--instruments",
-            "2",
-            "--connection-timeout-secs",
-            "0",
-            "--yield-idle",
-            // Reduce core count to avoid conflicts in CI.
-            "--cores",
-            "0,0,0,0,0,0,0,0",
-            "--reader-cores",
-            "0",
-        ])
+    let mut args: Vec<String> = vec![
+        "--bind".into(),
+        format!("127.0.0.1:{client_port}"),
+        "--health-bind".into(),
+        format!("127.0.0.1:{health_port}"),
+        "--replication-bind".into(),
+        format!("127.0.0.1:{replication_port}"),
+        "--journal".into(),
+        journal.to_str().expect("valid path").into(),
+        "--authorized-keys".into(),
+        keys_path.to_str().expect("valid path").into(),
+        "--accounts".into(),
+        "10".into(),
+        "--instruments".into(),
+        "2".into(),
+        "--connection-timeout-secs".into(),
+        "0".into(),
+        "--yield-idle".into(),
+        // Reduce core count to avoid conflicts in CI.
+        "--cores".into(),
+        "0,0,0,0,0,0,0,0".into(),
+        "--reader-cores".into(),
+        "0".into(),
+    ];
+    for a in extra_args {
+        args.push((*a).into());
+    }
+    let mut command = Command::new(bin);
+    command
+        .args(&args)
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit())
         .env("MELIN_JOURNAL_PREALLOC_MIB", "4")
-        .env("MELIN_JOURNAL_CHECKPOINT_INTERVAL", "100")
-        .spawn()
-        .expect("spawn primary server");
+        .env("MELIN_JOURNAL_CHECKPOINT_INTERVAL", "100");
+    for (k, v) in extra_env {
+        command.env(k, v);
+    }
+    let child = command.spawn().expect("spawn primary server");
 
     ServerProcess {
         child,
@@ -462,9 +525,36 @@ fn spawn_replica_named_with_extra(
     name: &str,
     extra_args: &[&str],
 ) -> ServerProcess {
+    spawn_replica_named_with_extra_env(
+        bin,
+        tmp_dir,
+        keys_path,
+        repl_key_path,
+        primary_repl_port,
+        client_port,
+        health_port,
+        admin_port,
+        name,
+        extra_args,
+        &[],
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn spawn_replica_named_with_extra_env(
+    bin: &Path,
+    tmp_dir: &Path,
+    keys_path: &Path,
+    repl_key_path: &Path,
+    primary_repl_port: u16,
+    client_port: u16,
+    health_port: u16,
+    admin_port: u16,
+    name: &str,
+    extra_args: &[&str],
+    extra_env: &[(&str, &str)],
+) -> ServerProcess {
     let journal = tmp_dir.join(format!("{name}.journal"));
-    // Vec<String> chosen so we can grow with extra_args at runtime; the
-    // base args are pushed first, then any test-supplied flags.
     let mut args: Vec<String> = vec![
         "--bind".into(),
         format!("127.0.0.1:{client_port}"),
@@ -491,14 +581,17 @@ fn spawn_replica_named_with_extra(
     for a in extra_args {
         args.push((*a).into());
     }
-    let child = Command::new(bin)
+    let mut command = Command::new(bin);
+    command
         .args(&args)
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit())
         .env("MELIN_JOURNAL_PREALLOC_MIB", "4")
-        .env("MELIN_JOURNAL_CHECKPOINT_INTERVAL", "100")
-        .spawn()
-        .expect("spawn replica server");
+        .env("MELIN_JOURNAL_CHECKPOINT_INTERVAL", "100");
+    for (k, v) in extra_env {
+        command.env(k, v);
+    }
+    let child = command.spawn().expect("spawn replica server");
 
     ServerProcess {
         child,
@@ -2346,4 +2439,262 @@ fn snapshot_transfer_when_archives_purged() {
     let _ = primary2.child.wait();
 
     eprintln!("PASS: snapshot transfer — replica caught up after archive purge.");
+}
+
+// ---------------------------------------------------------------------------
+// Journal rotation soak
+// ---------------------------------------------------------------------------
+//
+// Drives sustained traffic against a primary+replica pair while rotation
+// fires repeatedly (size threshold + manual `ROTATE` admin command).
+// Stops both nodes cleanly, restarts them, and asserts the recovered
+// journal sequences and on-disk segment layout match expectations.
+//
+// Co-located with the failover suite because it shares the multi-process
+// harness (`spawn_primary_with_extra`, `spawn_replica`, `admin_command`).
+// A dedicated `tests/journal_rotation.rs` file would duplicate ~200 lines
+// of scaffolding — extract one if a third multi-process test category
+// shows up.
+
+/// Submit N resting limit orders, each with a unique id starting at
+/// `first_id`. Returning Ok from `send_request` means the event was
+/// durably journaled before reply (persist-before-ack), which is what
+/// the soak relies on. Trader key works because SubmitOrder is a
+/// trading op — Deposit would require a custodian key.
+fn submit_resting_burst(client: &mut Client, first_id: u64, n: u64) {
+    for i in 0..n {
+        client
+            .send_request(&Request::SubmitOrder {
+                symbol: Symbol(1),
+                order: Order {
+                    id: OrderId(first_id + i),
+                    account: AccountId(1),
+                    side: Side::Buy,
+                    order_type: OrderType::Limit {
+                        price: price(50),
+                        post_only: false,
+                    },
+                    time_in_force: TimeInForce::GTC,
+                    quantity: qty(1),
+                    stp: melin_protocol::types::SelfTradeProtection::Allow,
+                    expiry_ns: 0,
+                },
+            })
+            .expect("submit order");
+    }
+}
+
+/// Count archived segments next to a journal path.
+fn count_archives(journal_path: &Path) -> usize {
+    melin_journal::segment::list_archives(journal_path)
+        .map(|v| v.len())
+        .unwrap_or(0)
+}
+
+#[test]
+#[serial]
+fn rotation_soak_under_load() {
+    let bin = server_bin();
+    assert!(bin.exists(), "melin-server binary not found at {bin:?}");
+    let tmp = tempfile::Builder::new()
+        .prefix("melin-soak-")
+        .tempdir()
+        .expect("create temp dir");
+
+    let key = SigningKey::from_bytes(&[0xCA; 32]);
+    let operator_key = SigningKey::from_bytes(&[0xCD; 32]);
+    let repl_key = SigningKey::from_bytes(&[0xCE; 32]);
+    let (keys_path, repl_key_path) =
+        write_auth_keys_multi(tmp.path(), &[&key], &operator_key, &repl_key);
+
+    let primary_client_port = free_port();
+    let primary_health_port = free_port();
+    let primary_repl_port = free_port();
+    let primary_admin_port = free_port();
+    let replica_client_port = free_port();
+    let replica_health_port = free_port();
+    let replica_admin_port = free_port();
+
+    // Both nodes get a very high checkpoint interval so the soak's
+    // ~200 events do not cross a checkpoint boundary. The interaction
+    // between auto-emitted checkpoints and rotation is a known race
+    // (see `pipeline_tests.rs::primary_journal_sequences_contiguous_
+    // across_checkpoint_boundary`) tracked separately — this test
+    // focuses on rotation correctness in isolation.
+    let primary_admin_addr = format!("127.0.0.1:{primary_admin_port}");
+    let primary_extra: &[&str] = &[
+        "--admin-bind",
+        &primary_admin_addr,
+        "--max-journal-mib",
+        "0", // disable size trigger; rely on ROTATE for determinism
+    ];
+    let extra_env: &[(&str, &str)] = &[("MELIN_JOURNAL_CHECKPOINT_INTERVAL", "1000000")];
+    let mut primary = spawn_primary_with_extra_env(
+        &bin,
+        tmp.path(),
+        &keys_path,
+        primary_client_port,
+        primary_health_port,
+        primary_repl_port,
+        primary_extra,
+        extra_env,
+    );
+    wait_for_primary_repl_ready(primary.health_addr, Duration::from_secs(10));
+
+    let mut replica = spawn_replica_named_with_extra_env(
+        &bin,
+        tmp.path(),
+        &keys_path,
+        &repl_key_path,
+        primary_repl_port,
+        replica_client_port,
+        replica_health_port,
+        replica_admin_port,
+        "replica",
+        &[],
+        extra_env,
+    );
+    wait_healthy(primary.health_addr, Duration::from_secs(30));
+
+    // ----- Drive load with interleaved ROTATEs -----
+    let mut client = Client::connect(primary.client_addr, &key).expect("connect to primary");
+    let admin_addr: SocketAddr = primary_admin_addr.parse().unwrap();
+    let replica_admin_addr: SocketAddr = format!("127.0.0.1:{replica_admin_port}").parse().unwrap();
+
+    // 5 rounds × 15 orders = 75 orders total — kept under the
+    // checkpoint interval (1M, set above). ROTATE *before* each
+    // burst (rather than after) so the burst's first event flushes
+    // the rotate flag through the journal stage; rotating after
+    // bursts would leave the final ROTATE's flag set with no event
+    // to drive observation, producing rounds-1 archives instead of
+    // rounds. Two of the rounds also rotate the replica to validate
+    // independent replica-side rotation.
+    let per_round: u64 = 15;
+    let rounds: u64 = 5;
+    let total_orders: u64 = per_round * rounds;
+    let mut next_id: u64 = 1;
+    for round in 0..rounds {
+        let resp = admin_command(admin_addr, &operator_key, "ROTATE");
+        assert!(resp == "OK", "primary ROTATE #{round} failed: {resp}");
+        if round == 1 || round == 3 {
+            let resp = admin_command(replica_admin_addr, &operator_key, "ROTATE");
+            assert!(resp == "OK", "replica ROTATE #{round} failed: {resp}");
+        }
+        submit_resting_burst(&mut client, next_id, per_round);
+        next_id += per_round;
+    }
+
+    // Wait for replication lag = 0 so all events are durable on both nodes.
+    let start = Instant::now();
+    loop {
+        let h = query_health(primary.health_addr);
+        if let Ok((_, _, 0, _)) = h {
+            break;
+        }
+        assert!(
+            start.elapsed() < Duration::from_secs(30),
+            "replication lag did not reach 0; last health = {h:?}"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+
+    // QueryStats requires operator perm; this client is a trader, so the
+    // unauthenticated health endpoint is the way to read journal_seq.
+    let (_, pre_seq, _, _) = query_health(primary.health_addr).expect("primary health");
+
+    // Clean shutdown via SIGINT.
+    drop(client);
+    unsafe {
+        libc::kill(primary.child.id() as i32, libc::SIGINT);
+        libc::kill(replica.child.id() as i32, libc::SIGINT);
+    }
+    let _ = primary
+        .child
+        .wait_timeout_with_kill(Duration::from_secs(10));
+    let _ = replica
+        .child
+        .wait_timeout_with_kill(Duration::from_secs(10));
+
+    let primary_journal = tmp.path().join("primary.journal");
+    let replica_journal = tmp.path().join("replica.journal");
+
+    // Primary should have exactly 5 archives (one per ROTATE).
+    assert_eq!(count_archives(&primary_journal), 5, "primary archive count");
+    // Replica should have exactly 2 (the two ROTATEs we sent there).
+    assert_eq!(count_archives(&replica_journal), 2, "replica archive count");
+
+    // ----- Restart and verify recovered state matches -----
+    let mut primary2 = spawn_primary_with_extra_env(
+        &bin,
+        tmp.path(),
+        &keys_path,
+        free_port(),
+        free_port(),
+        free_port(),
+        primary_extra,
+        extra_env,
+    );
+    wait_for_primary_repl_ready(primary2.health_addr, Duration::from_secs(30));
+    wait_healthy(primary2.health_addr, Duration::from_secs(30));
+
+    // The health endpoint exposes the pipeline's `journal_cursor`, which
+    // is a since-startup counter — not the absolute on-disk sequence. To
+    // validate that recovery picked up every archived segment, submit one
+    // order on the recovered primary and then read the live segment from
+    // disk after shutdown: its last sequence must be strictly greater
+    // than the pre-shutdown high-water mark, which is only possible if
+    // the writer's `next_sequence` was correctly seeded from the
+    // multi-segment archive walk on startup.
+    let mut client2 = Client::connect(primary2.client_addr, &key).expect("connect to primary2");
+    submit_resting_burst(&mut client2, total_orders + 1, 1);
+    // Allow the order to fsync before shutdown.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline {
+        if let Ok((_, _, 0, _)) = query_health(primary2.health_addr) {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    drop(client2);
+    unsafe { libc::kill(primary2.child.id() as i32, libc::SIGINT) };
+    let _ = primary2
+        .child
+        .wait_timeout_with_kill(Duration::from_secs(10));
+
+    // Read the live segment back and check its tail sequence.
+    use melin_journal::JournalReader;
+    let mut reader =
+        JournalReader::<melin_trading::trading_event::TradingEvent>::open(&primary_journal)
+            .expect("reopen primary live segment");
+    while reader.next_entry().expect("scan live").is_some() {}
+    let post_disk_seq = reader.last_sequence().unwrap_or(0);
+    assert!(
+        post_disk_seq > pre_seq,
+        "post-restart live tail seq ({post_disk_seq}) must exceed pre-shutdown ({pre_seq}) — \
+         indicates multi-segment recovery reseeded the writer at the right place"
+    );
+}
+
+/// Helper extension: wait up to `timeout` for the child, then SIGKILL.
+trait ChildExt {
+    fn wait_timeout_with_kill(&mut self, timeout: Duration) -> std::io::Result<()>;
+}
+
+impl ChildExt for std::process::Child {
+    fn wait_timeout_with_kill(&mut self, timeout: Duration) -> std::io::Result<()> {
+        let start = Instant::now();
+        loop {
+            match self.try_wait()? {
+                Some(_) => return Ok(()),
+                None => {
+                    if start.elapsed() > timeout {
+                        let _ = self.kill();
+                        let _ = self.wait();
+                        return Ok(());
+                    }
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+            }
+        }
+    }
 }

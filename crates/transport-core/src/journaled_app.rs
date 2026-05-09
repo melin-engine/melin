@@ -135,6 +135,11 @@ impl<A: Application> JournaledApp<A> {
         // no boundary check has anything to compare against yet — the
         // very first segment we walk has no predecessor in this run.
         let mut prev_tail_hash: Option<[u8; 32]> = None;
+        // Highest sequence observed across walked archives. Used to seed
+        // a synthesized live segment when a crash interrupted rotation
+        // between the live → archive rename and the new live file's
+        // creation.
+        let mut last_seq_seen: u64 = snap_sequence;
 
         // --- Walk each sealed archive in monotonic order ---
         for (idx, archive_path) in &archives {
@@ -156,46 +161,42 @@ impl<A: Application> JournaledApp<A> {
             if let Some(h) = reader.chain_hash() {
                 prev_tail_hash = Some(h);
             }
+            if let Some(seq) = reader.last_sequence() {
+                last_seq_seen = last_seq_seen.max(seq);
+            }
         }
 
         // --- Walk the live segment, if it exists ---
         let live_exists = journal_path.exists();
         if !live_exists {
-            // Recovery from archives only: rotation crashed after the
-            // live → archive rename but before the new live file was
-            // created. Recreate a live segment continuing from the last
-            // archive's tail so the writer is positioned where new
-            // events can be appended.
+            // Phase B recovery: rotation crashed between
+            // [`crate::segment::archive_live`] (the live → archive
+            // rename) and `JournalWriter::create_continuing` (opening a
+            // fresh live). The just-archived segment is intact and was
+            // replayed above, so the application state is consistent up
+            // through `last_seq_seen`. Synthesize a new live segment
+            // continuing from there so the pipeline has somewhere to
+            // append.
             //
-            // Snapshot-only recovery (no archives) is the caller's
-            // responsibility — the server handles that path explicitly.
-            let last_seq = match (archives.last(), snapshot) {
-                (Some(_), _) => prev_tail_hash
-                    .map(|_| ()) // chain hash captured implies events were read
-                    .map_or(snap_sequence, |_| {
-                        // Use the snapshot seq as a floor. The archive
-                        // walker already replayed events past it, so the
-                        // app's effective last_seq matches the writer's
-                        // expectation only when we open in append mode
-                        // — which we cannot do without a live file.
-                        // Fall back to creating a fresh continuing live.
-                        snap_sequence
-                    }),
-                _ => {
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::NotFound,
-                        "no live journal and no archives — nothing to recover",
-                    )
-                    .into());
-                }
-            };
-            let _ = last_seq; // currently unused — server supplies this path
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::NotFound,
-                "live journal segment missing; \
-                 the server's snapshot-only recovery path must reconstruct it",
-            )
-            .into());
+            // When there are no archives at all, the caller (the server's
+            // bootstrap) is responsible for handling the snapshot-only
+            // case — that path needs more context (the snapshot's
+            // chain hash, choice of starting sequence) than this
+            // application-agnostic recovery driver can supply.
+            if archives.is_empty() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    "no live journal and no archives — nothing to recover",
+                )
+                .into());
+            }
+            let genesis = prev_tail_hash.unwrap_or([0u8; 32]);
+            let writer = JournalWriter::<A::Event>::create_continuing(
+                journal_path,
+                last_seq_seen + 1,
+                genesis,
+            )?;
+            return Ok(Self { app, writer });
         }
 
         let mut reader = JournalReader::<A::Event>::open(journal_path)?;
@@ -818,5 +819,167 @@ mod tests {
                 || msg.contains("corrupt entry"),
             "expected tamper-detection error, got: {msg}"
         );
+    }
+
+    /// Phase B crash: rotation interrupted between the live → archive
+    /// rename and the new live file's creation. On disk the just-
+    /// archived segment is intact and the bare path is missing.
+    /// Recovery must replay the archive's events and synthesize a
+    /// fresh live segment seeded with the previous tail's chain hash
+    /// so subsequent appends continue the chain.
+    #[test]
+    fn recover_synthesizes_live_after_phase_b_crash() {
+        let dir = tempfile::tempdir().unwrap();
+        let journal_path = dir.path().join("journal.bin");
+
+        // Build state in the live segment, flush, then rename the live
+        // file out from under the writer to simulate the post-rename /
+        // pre-create-continuing crash window.
+        let events = [TestEvent::Add(7), TestEvent::Add(11), TestEvent::Add(13)];
+        let expected_total: u64 = events
+            .iter()
+            .map(|e| match e {
+                TestEvent::Add(n) => *n,
+                _ => 0,
+            })
+            .sum();
+        let ja = JournaledApp::create(TestApp::new(), &journal_path).unwrap();
+        let ja = append_events(ja, &events, 1);
+        let pre_crash_seq = ja.next_sequence();
+        // Drop the writer (closes the fd) before the rename so this is
+        // a clean simulation of "live archived, no successor file."
+        drop(ja);
+        let archived = melin_journal::segment::archive_live(&journal_path).unwrap();
+        assert!(archived.exists(), "archive must exist after rename");
+        assert!(
+            !journal_path.exists(),
+            "live must be gone — that's the Phase B state"
+        );
+
+        // Recovery must replay the archive AND synthesize a new live.
+        // `append_events` writes to the journal without applying to the
+        // app (test fixture limitation), so the only path that can
+        // produce a populated app is the recovery replay — which is
+        // exactly what this test validates.
+        let recovered = JournaledApp::<TestApp>::recover(TestApp::new(), &journal_path).unwrap();
+        assert_eq!(
+            recovered.app().total,
+            expected_total,
+            "archive events must replay despite the missing live"
+        );
+        assert!(
+            journal_path.exists(),
+            "recovery should have synthesized a fresh live segment"
+        );
+        // The new live starts with a GenesisHash at pre_crash_seq, so
+        // next_sequence advances by one beyond the archive's tail.
+        let genesis_overhead: u64 = if cfg!(feature = "hash-chain") { 1 } else { 0 };
+        assert_eq!(recovered.next_sequence(), pre_crash_seq + genesis_overhead);
+
+        // Append more events through the synthesized live and re-recover
+        // — proves the new live is fully usable, not just a placeholder.
+        let post = [TestEvent::Add(100)];
+        let ja = append_events(recovered, &post, 1 + events.len() as u64);
+        drop(ja);
+        let re = JournaledApp::<TestApp>::recover(TestApp::new(), &journal_path).unwrap();
+        assert_eq!(re.app().total, expected_total + 100);
+    }
+
+    /// Phase B with no archives at all should still error — the caller
+    /// (server bootstrap) is responsible for snapshot-only recovery in
+    /// that case, since the snapshot supplies the chain hash and
+    /// starting sequence we'd need.
+    #[test]
+    fn recover_errors_when_no_live_and_no_archives() {
+        let dir = tempfile::tempdir().unwrap();
+        let journal_path = dir.path().join("journal.bin");
+        // Path doesn't exist, no archives.
+        let result = JournaledApp::<TestApp>::recover(TestApp::new(), &journal_path);
+        assert!(result.is_err(), "expected error, got Ok");
+    }
+
+    /// Phase C crash: rotation completed (live → archive renamed, new
+    /// live opened with `GenesisHash`), but no application events
+    /// landed in the new live before the crash. On disk: archive(s) +
+    /// live containing only the GenesisHash entry. Recovery walks both
+    /// and reproduces the pre-rotation state exactly.
+    #[test]
+    fn recover_after_phase_c_crash_yields_pre_rotation_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let journal_path = dir.path().join("journal.bin");
+
+        let events = [TestEvent::Add(2), TestEvent::Add(4), TestEvent::Add(6)];
+        let expected: u64 = events
+            .iter()
+            .map(|e| match e {
+                TestEvent::Add(n) => *n,
+                _ => 0,
+            })
+            .sum();
+
+        // Append events and run a full rotation, then drop without
+        // writing anything else — Phase C state is "rotation finished,
+        // no fresh events yet."
+        let ja = JournaledApp::create(TestApp::new(), &journal_path).unwrap();
+        let ja = append_events(ja, &events, 1);
+        let (app, mut writer) = ja.into_parts();
+        writer.rotate_segment().unwrap();
+        drop(writer);
+        drop(app);
+
+        // Both the archive and the new live exist on disk.
+        let archive = dir.path().join("journal.bin.000001");
+        assert!(archive.exists(), "archive must exist post-rotation");
+        assert!(journal_path.exists(), "live must exist post-rotation");
+
+        let recovered = JournaledApp::<TestApp>::recover(TestApp::new(), &journal_path).unwrap();
+        assert_eq!(recovered.app().total, expected);
+    }
+
+    /// Phase D crash: rotation completed and the new live has begun
+    /// accepting events, but the in-memory batch was not yet fsynced
+    /// when the process died. Per the persist-before-ack contract, those
+    /// in-flight events were never acknowledged to the client and must
+    /// be discarded — recovery sees only what the durable storage has,
+    /// which is the archive's contents plus the new live's GenesisHash.
+    #[test]
+    fn recover_after_phase_d_crash_drops_unflushed_events() {
+        let dir = tempfile::tempdir().unwrap();
+        let journal_path = dir.path().join("journal.bin");
+
+        let archived_events = [TestEvent::Add(10), TestEvent::Add(20)];
+        let expected_durable: u64 = archived_events
+            .iter()
+            .map(|e| match e {
+                TestEvent::Add(n) => *n,
+                _ => 0,
+            })
+            .sum();
+
+        let ja = JournaledApp::create(TestApp::new(), &journal_path).unwrap();
+        let ja = append_events(ja, &archived_events, 1);
+        let (app, mut writer) = ja.into_parts();
+        writer.rotate_segment().unwrap();
+        // Encode an event into the new live's in-memory batch but DON'T
+        // flush. The bytes live in `batch_buf` only; the on-disk live
+        // has just its GenesisHash entry.
+        let unflushed_seq = writer.allocate_sequence();
+        writer
+            .encode_event(
+                unflushed_seq,
+                /* timestamp_ns */ 999_000,
+                &JournalEvent::App(TestEvent::Add(99_999)),
+                /* key_hash */ 1,
+                /* request_seq */ 1 + archived_events.len() as u64,
+            )
+            .unwrap();
+        // Drop without flushing — that's the simulated crash.
+        drop(writer);
+        drop(app);
+
+        let recovered = JournaledApp::<TestApp>::recover(TestApp::new(), &journal_path).unwrap();
+        // The 99_999 event was never durable; only the archived ones
+        // count toward the recovered total.
+        assert_eq!(recovered.app().total, expected_durable);
     }
 }
