@@ -65,7 +65,11 @@ const SNAP_MAGIC: u32 = 0x534E_4150;
 ///            `(AccountId, OrderId)` set rebuilt on restore from `order_index`.
 ///            Dedup semantics changed to allow OrderId reuse after the original
 ///            closes (previously forbidden for the lifetime of the account).
-const SNAP_VERSION: u16 = 15;
+/// v15 → v16: added per-currency fee-account deficits. The fee account is
+///            now a signed ledger (`available - deficit`); rebates that
+///            exceed `available` accumulate on `deficit` rather than
+///            silently shortchanging the trader.
+const SNAP_VERSION: u16 = 16;
 
 /// Re-exports for callers that serialize the Exchange payload without the
 /// full on-disk framing — e.g. the `melin-app::Application` impl which
@@ -248,6 +252,11 @@ pub(crate) struct ExchangeSnapshot {
     pub(crate) key_hwm: Vec<(u64, u64)>,
     /// Set of disabled instrument symbols (v12+).
     pub(crate) disabled_instruments: Vec<Symbol>,
+    /// Per-currency fee-account deficits (v16+). Records how much the
+    /// fee account owes for rebates paid in excess of accumulated fee
+    /// revenue. The logical fee balance is `available - deficit`. Sparse:
+    /// only currencies with a non-zero deficit are present.
+    pub(crate) fee_account_deficits: Vec<(CurrencyId, u64)>,
 }
 
 /// Serialized order book state for a single instrument.
@@ -395,6 +404,13 @@ fn encode_exchange_state(state: &ExchangeSnapshot, buf: &mut Vec<u8>) {
     le::push_u32(buf, state.disabled_instruments.len() as u32);
     for symbol in &state.disabled_instruments {
         le::push_u32(buf, symbol.0);
+    }
+
+    // Fee-account deficits (v16+).
+    le::push_u32(buf, state.fee_account_deficits.len() as u32);
+    for (currency, amount) in &state.fee_account_deficits {
+        le::push_u32(buf, currency.0);
+        le::push_u64(buf, *amount);
     }
 }
 
@@ -794,6 +810,27 @@ fn decode_exchange_state(
         Vec::new()
     };
 
+    // Fee-account deficits (v16+). Per-currency u64 amounts the fee
+    // account owes for rebates paid in excess of accumulated revenue.
+    let fee_account_deficits = if version >= 16 && pos < buf.len() {
+        check(pos, 4)?;
+        let n = le::get_u32(&buf[pos..]) as usize;
+        pos += 4;
+        // Each entry: currency(4) + amount(8) = 12 bytes.
+        validate_count(buf.len() - pos, n, 12)?;
+        let mut deficits = Vec::with_capacity(n);
+        for _ in 0..n {
+            check(pos, 12)?;
+            let currency = CurrencyId(le::get_u32(&buf[pos..]));
+            let amount = le::get_u64(&buf[pos + 4..]);
+            deficits.push((currency, amount));
+            pos += 12;
+        }
+        deficits
+    } else {
+        Vec::new()
+    };
+
     Ok((
         pos,
         ExchangeSnapshot {
@@ -807,6 +844,7 @@ fn decode_exchange_state(
             fee_schedules,
             key_hwm,
             disabled_instruments,
+            fee_account_deficits,
         },
     ))
 }
@@ -1175,6 +1213,7 @@ impl Exchange {
         let fee_schedules = self.snapshot_fee_schedules();
         let key_hwm = self.snapshot_key_hwm();
         let disabled_instruments = self.snapshot_disabled_instruments();
+        let fee_account_deficits = self.accounts().snapshot_fee_deficits();
 
         ExchangeSnapshot {
             instruments,
@@ -1187,6 +1226,7 @@ impl Exchange {
             fee_schedules,
             key_hwm,
             disabled_instruments,
+            fee_account_deficits,
         }
     }
 
@@ -1230,8 +1270,11 @@ impl Exchange {
             }));
         }
 
-        let (accounts, slot_assignments) =
-            AccountManager::from_parts(state.balances, state.reservations);
+        let (accounts, slot_assignments) = AccountManager::from_parts(
+            state.balances,
+            state.reservations,
+            state.fee_account_deficits,
+        );
 
         // Inject reservation slots into each instrument's order book.
         // The books were restored with DUMMY slots; now patch them with

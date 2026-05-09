@@ -74,6 +74,17 @@ fn log_overflow(
 /// Reserved account for collected trading fees. Fees deducted from traders
 /// are credited here so they remain in the system (balance conservation).
 /// The exchange operator can withdraw from this account via the admin API.
+///
+/// **Signed ledger.** Unlike trader accounts, the fee account is allowed to
+/// go negative. Its logical balance is `available - deficit` (per currency).
+/// Maker rebates that exceed `available` accumulate on the per-currency
+/// `fee_account_deficits` map; subsequent fee revenue pays the deficit
+/// down before crediting `available`. This matches industry accounting
+/// (fees are operator P&L, not a user-facing balance) and prevents the
+/// previous failure mode where `saturating_sub` silently shortchanged a
+/// trader when the rebate exceeded the fee account balance. Operators
+/// monitor `fee_signed_balance(currency)` to know whether the account is
+/// in the red and needs funding.
 pub const FEE_ACCOUNT: AccountId = AccountId(0);
 
 /// Per-currency balance for an account.
@@ -159,6 +170,18 @@ pub struct AccountManager {
     /// Stack of recycled slot indices. Pop to allocate, push to free.
     /// LIFO reuse keeps recently-freed (cache-hot) slots in rotation.
     free_slots: Vec<u32>,
+    /// Per-currency deficit on the fee account, tracking how far it has
+    /// gone "into the red" funding rebates. Logical fee-account balance
+    /// for a currency is `balances[FEE_ACCOUNT, ccy].available - deficit`
+    /// (signed, i128). Fee revenue pays down deficit before crediting
+    /// `available`; rebates that exceed `available` drain it to zero and
+    /// push the overage onto deficit.
+    ///
+    /// HashMap4 (4-entry buckets, fast non-cryptographic hash): consistent
+    /// with `balances`. Entries are removed when deficit returns to zero
+    /// to keep the map small. Sparse: only currencies that have ever been
+    /// in deficit have entries.
+    fee_account_deficits: HashMap4<CurrencyId, u64>,
 }
 
 impl AccountManager {
@@ -167,6 +190,7 @@ impl AccountManager {
             balances: HashMap4::default(),
             reservation_slab: Vec::new(),
             free_slots: Vec::new(),
+            fee_account_deficits: HashMap4::default(),
         }
     }
 
@@ -181,6 +205,7 @@ impl AccountManager {
             balances: HashMap4::default(),
             reservation_slab: Vec::with_capacity(2_000_000),
             free_slots: Vec::with_capacity(2_000_000),
+            fee_account_deficits: HashMap4::default(),
         }
     }
 
@@ -196,6 +221,7 @@ impl AccountManager {
             balances: HashMap4::with_capacity_and_hasher(balance_capacity, Default::default()),
             reservation_slab: Vec::with_capacity(2_000_000),
             free_slots: Vec::with_capacity(2_000_000),
+            fee_account_deficits: HashMap4::default(),
         }
     }
 
@@ -231,6 +257,7 @@ impl AccountManager {
     pub(crate) fn from_parts(
         balance_entries: Vec<((AccountId, CurrencyId), Balance)>,
         reservations: Vec<(OrderId, AccountId, CurrencyId, u64)>,
+        fee_deficits: Vec<(CurrencyId, u64)>,
     ) -> (Self, Vec<((AccountId, OrderId), ReservationSlot)>) {
         // Build balance HashMap4 directly from sparse entries (4-entry buckets for hot path).
         let mut balances =
@@ -250,10 +277,19 @@ impl AccountManager {
             slot_assignments.push(((account, order_id), slot));
         }
 
+        let mut fee_account_deficits =
+            HashMap4::with_capacity_and_hasher(fee_deficits.len(), Default::default());
+        for (ccy, amt) in fee_deficits {
+            if amt != 0 {
+                fee_account_deficits.insert(ccy, amt);
+            }
+        }
+
         let mgr = Self {
             balances,
             reservation_slab: slab,
             free_slots: Vec::new(),
+            fee_account_deficits,
         };
         (mgr, slot_assignments)
     }
@@ -267,6 +303,41 @@ impl AccountManager {
             .filter(|(_, v)| !v.is_zero())
             .map(|(&k, &v)| (k, v))
             .collect()
+    }
+
+    /// Snapshot non-zero fee-account deficits for serialization.
+    pub(crate) fn snapshot_fee_deficits(&self) -> Vec<(CurrencyId, u64)> {
+        self.fee_account_deficits
+            .iter()
+            .filter(|&(_, &v)| v != 0)
+            .map(|(&k, &v)| (k, v))
+            .collect()
+    }
+
+    /// Signed fee-account balance for a currency: `available - deficit`.
+    /// Operators monitor this to know whether the fee account is in the
+    /// red (negative) and needs funding. Returns 0 when no entry exists.
+    pub fn fee_signed_balance(&self, currency: CurrencyId) -> i128 {
+        let avail = self
+            .balances
+            .get(&(FEE_ACCOUNT, currency))
+            .map(|b| b.available)
+            .unwrap_or(0) as i128;
+        let deficit = self
+            .fee_account_deficits
+            .get(&currency)
+            .copied()
+            .unwrap_or(0) as i128;
+        avail - deficit
+    }
+
+    /// Current fee-account deficit for a currency (0 if not in deficit).
+    /// Exposed for snapshot validation and operator monitoring.
+    pub fn fee_account_deficit(&self, currency: CurrencyId) -> u64 {
+        self.fee_account_deficits
+            .get(&currency)
+            .copied()
+            .unwrap_or(0)
     }
 
     /// Snapshot all active reservations for serialization. The caller
@@ -379,6 +450,20 @@ impl AccountManager {
             .unwrap_or(0)
     }
 
+    /// Signed contribution of an `(account, currency)` pair to system
+    /// totals. For trader accounts this is just `available + reserved`
+    /// (always ≥ 0). For `FEE_ACCOUNT` it is `total - deficit` and may go
+    /// negative. The fill conservation check sums these across the three
+    /// accounts touched per fill.
+    fn account_signed_total(&self, account: AccountId, currency: CurrencyId) -> i128 {
+        let unsigned = self.balance_total(account, currency) as i128;
+        if account == FEE_ACCOUNT {
+            unsigned - self.fee_account_deficit(currency) as i128
+        } else {
+            unsigned
+        }
+    }
+
     /// Update balances after a fill. Called once per `ExecutionReport::Fill`.
     ///
     /// The buyer's reserved quote decreases by `cost + buyer_fee`, available
@@ -442,22 +527,25 @@ impl AccountManager {
         let seller_distinct = seller_account != buyer_account;
         let fee_distinct = FEE_ACCOUNT != buyer_account && FEE_ACCOUNT != seller_account;
 
-        // Pre-fill conservation snapshot. u128 sums to avoid overflow when
-        // adding three u64 totals (max ≈ 3 × 1.8e19, well under 2^128).
+        // Pre-fill conservation snapshot. Signed (i128) because the fee
+        // account is a signed ledger (`available - deficit`); a rebate
+        // that drains it pushes the contribution negative.
         let pre_total_quote = {
-            let mut t = self.balance_total(buyer_account, spec.quote) as u128;
+            let mut t = self.account_signed_total(buyer_account, spec.quote);
             if seller_distinct {
-                t += self.balance_total(seller_account, spec.quote) as u128;
+                t += self.account_signed_total(seller_account, spec.quote);
             }
             if fee_distinct {
-                t += self.balance_total(FEE_ACCOUNT, spec.quote) as u128;
+                t += self.account_signed_total(FEE_ACCOUNT, spec.quote);
             }
             t
         };
         let pre_total_base = {
-            let mut t = self.balance_total(buyer_account, spec.base) as u128;
+            // Base never touches the fee account, so unsigned totals are
+            // sufficient — but we use i128 for consistency with quote.
+            let mut t = self.balance_total(buyer_account, spec.base) as i128;
             if seller_distinct {
-                t += self.balance_total(seller_account, spec.base) as u128;
+                t += self.balance_total(seller_account, spec.base) as i128;
             }
             t
         };
@@ -587,38 +675,70 @@ impl AccountManager {
         // This equals buyer_fee + seller_fee when reservations have
         // sufficient cushion, but is naturally capped when checked_* clamps
         // (e.g., fee schedule changed after order placement).
+        //
+        // The fee account is a signed ledger: its logical balance is
+        // `available - deficit`. Fee revenue pays down any outstanding
+        // deficit first; rebates that exceed `available` drain it to zero
+        // and push the overage onto deficit (so the rebate is paid in
+        // full and the operator's debt is recorded). This matches how
+        // every other venue treats fee accounting (operator P&L, not a
+        // user-facing balance) and prevents the previous failure mode
+        // where saturating_sub silently shortchanged the trader.
         let fee_credit = buyer_actual_deducted as i128 - seller_actual_proceeds as i128;
         if fee_credit > 0 {
-            let amount = u64::try_from(fee_credit).unwrap_or(u64::MAX);
-            let fee_bal = self.balances.entry((FEE_ACCOUNT, spec.quote)).or_default();
-            fee_bal.available = fee_bal.available.checked_add(amount).unwrap_or_else(|| {
-                log_overflow(
-                    "fee.quote.available",
-                    FEE_ACCOUNT,
-                    spec.quote,
-                    fee_bal.available,
-                    amount,
-                )
-            });
+            let mut amount = u64::try_from(fee_credit).unwrap_or(u64::MAX);
+            // Pay down deficit first.
+            if let Some(deficit) = self.fee_account_deficits.get_mut(&spec.quote) {
+                let pay = (*deficit).min(amount);
+                *deficit -= pay;
+                amount -= pay;
+                if *deficit == 0 {
+                    self.fee_account_deficits.remove(&spec.quote);
+                }
+            }
+            // Remainder credits available.
+            if amount > 0 {
+                let fee_bal = self.balances.entry((FEE_ACCOUNT, spec.quote)).or_default();
+                fee_bal.available = fee_bal.available.checked_add(amount).unwrap_or_else(|| {
+                    log_overflow(
+                        "fee.quote.available",
+                        FEE_ACCOUNT,
+                        spec.quote,
+                        fee_bal.available,
+                        amount,
+                    )
+                });
+            }
         } else if fee_credit < 0 {
-            // Net rebate: funded from fee account.
-            let rebate = u64::try_from(-fee_credit).unwrap_or(u64::MAX);
+            // Net rebate: drain available, push overage onto deficit.
+            let mut rebate = u64::try_from(-fee_credit).unwrap_or(u64::MAX);
             let fee_bal = self.balances.entry((FEE_ACCOUNT, spec.quote)).or_default();
-            fee_bal.available = fee_bal.available.checked_sub(rebate).unwrap_or_else(|| {
-                log_underflow(
-                    "fee.quote.available",
-                    FEE_ACCOUNT,
-                    spec.quote,
-                    fee_bal.available,
-                    rebate,
-                )
-            });
+            let from_avail = fee_bal.available.min(rebate);
+            fee_bal.available -= from_avail;
+            rebate -= from_avail;
+            if rebate > 0 {
+                let deficit = self.fee_account_deficits.entry(spec.quote).or_insert(0);
+                *deficit = deficit.checked_add(rebate).unwrap_or_else(|| {
+                    log_overflow(
+                        "fee.quote.deficit",
+                        FEE_ACCOUNT,
+                        spec.quote,
+                        *deficit,
+                        rebate,
+                    )
+                });
+            }
         }
 
-        // Post-fill conservation check. Total quote across {buyer, seller,
-        // fee} and total base across {buyer, seller} must be unchanged. A
-        // violation means the saturating fallback in one of the checked_*
-        // calls above fired (or a future bug introduced a balance leak).
+        // Post-fill conservation check. Signed total quote across
+        // {buyer, seller, fee} and total base across {buyer, seller} must
+        // be unchanged. A violation means a saturating fallback in one of
+        // the checked_* calls above fired (e.g., reservation underflow
+        // from a fee schedule change), or the cost_u64 clamp lost
+        // precision, or a future bug introduced a balance leak. The
+        // rebate path no longer violates conservation — it pushes the
+        // overage onto the fee deficit (signed ledger, accounted for in
+        // `account_signed_total`).
         //
         // Cost: up to 5 HashMap reads (fewer when accounts collide), all
         // cache-warm because `entry()` just mutated the same buckets. At
@@ -628,19 +748,19 @@ impl AccountManager {
         // block behind `cfg(debug_assertions)` or a feature flag — the
         // checked_* calls above already log on individual saturations.
         let post_total_quote = {
-            let mut t = self.balance_total(buyer_account, spec.quote) as u128;
+            let mut t = self.account_signed_total(buyer_account, spec.quote);
             if seller_distinct {
-                t += self.balance_total(seller_account, spec.quote) as u128;
+                t += self.account_signed_total(seller_account, spec.quote);
             }
             if fee_distinct {
-                t += self.balance_total(FEE_ACCOUNT, spec.quote) as u128;
+                t += self.account_signed_total(FEE_ACCOUNT, spec.quote);
             }
             t
         };
         let post_total_base = {
-            let mut t = self.balance_total(buyer_account, spec.base) as u128;
+            let mut t = self.balance_total(buyer_account, spec.base) as i128;
             if seller_distinct {
-                t += self.balance_total(seller_account, spec.base) as u128;
+                t += self.balance_total(seller_account, spec.base) as i128;
             }
             t
         };
@@ -1293,7 +1413,7 @@ mod tests {
         mgr.deposit(ACCT_B, BTC, 500);
 
         let snap = mgr.snapshot_balances();
-        let (restored, _) = AccountManager::from_parts(snap, Vec::new());
+        let (restored, _) = AccountManager::from_parts(snap, Vec::new(), Vec::new());
 
         assert_eq!(restored.balance(ACCT_A, USD).available, 1_000);
         assert_eq!(restored.balance(ACCT_B, BTC).available, 500);
@@ -1345,19 +1465,21 @@ mod tests {
     // buyer == seller and trader == FEE_ACCOUNT collisions. If the check
     // fails, `debug_assert_eq!` in `fill()` will panic in test builds.
 
-    /// Helper: returns (total quote across {buyer, seller, fee}, total base
-    /// across {buyer, seller}) — matching what `fill()` snapshots.
-    fn conserved_totals(mgr: &AccountManager, buyer: AccountId, seller: AccountId) -> (u128, u128) {
-        let mut q = mgr.balance(buyer, USD).total() as u128;
+    /// Helper: returns (signed total quote across {buyer, seller, fee},
+    /// total base across {buyer, seller}) — matching what `fill()` snapshots.
+    /// Quote is signed because the fee account contribution is
+    /// `available - deficit` and may go negative.
+    fn conserved_totals(mgr: &AccountManager, buyer: AccountId, seller: AccountId) -> (i128, i128) {
+        let mut q = mgr.account_signed_total(buyer, USD);
         if seller != buyer {
-            q += mgr.balance(seller, USD).total() as u128;
+            q += mgr.account_signed_total(seller, USD);
         }
         if FEE_ACCOUNT != buyer && FEE_ACCOUNT != seller {
-            q += mgr.balance(FEE_ACCOUNT, USD).total() as u128;
+            q += mgr.account_signed_total(FEE_ACCOUNT, USD);
         }
-        let mut b = mgr.balance(buyer, BTC).total() as u128;
+        let mut b = mgr.balance(buyer, BTC).total() as i128;
         if seller != buyer {
-            b += mgr.balance(seller, BTC).total() as u128;
+            b += mgr.balance(seller, BTC).total() as i128;
         }
         (q, b)
     }
@@ -1459,6 +1581,319 @@ mod tests {
         assert_eq!(
             post_b, pre_b,
             "base conservation under FEE_ACCOUNT collision"
+        );
+    }
+
+    // -- Fee-account signed ledger (D) --
+    //
+    // Rebates that exceed the fee account's `available` push the overage
+    // onto a per-currency deficit. Subsequent fee revenue (and direct
+    // pay-down) reduces the deficit before crediting `available`. The
+    // logical balance reported to operators is the signed `available -
+    // deficit`. Conservation must hold across the signed ledger.
+
+    #[test]
+    fn rebate_exceeding_available_accumulates_deficit() {
+        // Fee account starts at 5; a 10-USD net rebate drains it to 0
+        // and pushes 5 onto deficit. Trader receives the full rebate.
+        let mut mgr = AccountManager::new();
+        mgr.deposit(ACCT_A, USD, 10_000);
+        mgr.deposit(ACCT_B, BTC, 100);
+        mgr.deposit(FEE_ACCOUNT, USD, 5);
+
+        let buy = limit_buy(1, ACCT_A, 100, 10);
+        let sell = limit_sell(2, ACCT_B, 100, 10);
+        let (_, bs) = mgr.try_reserve(&buy, &spec(), 0).unwrap();
+        let (_, ss) = mgr.try_reserve(&sell, &spec(), 0).unwrap();
+
+        let (pre_q, pre_b) = conserved_totals(&mgr, ACCT_A, ACCT_B);
+        // -7 / -3 → buyer rebated 7, seller rebated 3, net rebate 10.
+        mgr.fill(bs, ss, price(100), qty(10), -7, -3, &spec());
+        let (post_q, post_b) = conserved_totals(&mgr, ACCT_A, ACCT_B);
+
+        assert_eq!(
+            mgr.balance(FEE_ACCOUNT, USD).available,
+            0,
+            "fee available drained"
+        );
+        assert_eq!(mgr.fee_account_deficit(USD), 5, "deficit absorbs overage");
+        assert_eq!(
+            mgr.fee_signed_balance(USD),
+            -5,
+            "signed ledger reads negative"
+        );
+        // Trader-side (reservation cleanup is the Exchange's job, so the
+        // buyer's reservation slot retains the 7-USD rebate amount that
+        // wasn't deducted): ACCT_A USD = 9_000 available + 7 reserved =
+        // 10_007 total. ACCT_B received 1000 cost + 3 rebate = 1003.
+        assert_eq!(mgr.balance(ACCT_A, USD).available, 9_000);
+        assert_eq!(mgr.balance(ACCT_A, USD).reserved, 7);
+        assert_eq!(mgr.balance(ACCT_B, USD).available, 1_003);
+        // Signed conservation: pre 10_000 + 0 + 5 = 10_005;
+        //                     post (9_000+7) + 1_003 + (0 − 5) = 10_005.
+        assert_eq!(post_q, pre_q, "signed conservation under rebate underflow");
+        assert_eq!(post_b, pre_b);
+    }
+
+    #[test]
+    fn fee_credit_pays_down_deficit_first() {
+        // After a rebate underflow leaves a 5-USD deficit, a subsequent
+        // fee-paying fill must reduce the deficit before crediting
+        // `available`.
+        let mut mgr = AccountManager::new();
+        mgr.deposit(ACCT_A, USD, 100_000);
+        mgr.deposit(ACCT_B, BTC, 100);
+        mgr.deposit(FEE_ACCOUNT, USD, 5);
+
+        // Rebate fill: leaves deficit=5, available=0.
+        let buy1 = limit_buy(1, ACCT_A, 100, 10);
+        let sell1 = limit_sell(2, ACCT_B, 100, 10);
+        let (_, bs1) = mgr.try_reserve(&buy1, &spec(), 0).unwrap();
+        let (_, ss1) = mgr.try_reserve(&sell1, &spec(), 0).unwrap();
+        mgr.fill(bs1, ss1, price(100), qty(10), -7, -3, &spec());
+        assert_eq!(mgr.fee_account_deficit(USD), 5);
+
+        // Fee-paying fill: net fee of 12 should pay down the 5 deficit
+        // first, then credit 7 to available. max_fee_bps=100 (1%) gives
+        // a 10-USD cushion on the 1000-USD notional, comfortably above
+        // the 7-USD buyer fee at fill time.
+        let buy2 = limit_buy(3, ACCT_A, 100, 10);
+        let sell2 = limit_sell(4, ACCT_B, 100, 10);
+        let (_, bs2) = mgr.try_reserve(&buy2, &spec(), 100).unwrap();
+        let (_, ss2) = mgr.try_reserve(&sell2, &spec(), 100).unwrap();
+
+        let (pre_q, pre_b) = conserved_totals(&mgr, ACCT_A, ACCT_B);
+        mgr.fill(bs2, ss2, price(100), qty(10), 7, 5, &spec());
+        let (post_q, post_b) = conserved_totals(&mgr, ACCT_A, ACCT_B);
+
+        assert_eq!(mgr.fee_account_deficit(USD), 0, "deficit cleared");
+        assert_eq!(
+            mgr.balance(FEE_ACCOUNT, USD).available,
+            7,
+            "remainder credits available"
+        );
+        assert_eq!(mgr.fee_signed_balance(USD), 7);
+        assert_eq!(post_q, pre_q);
+        assert_eq!(post_b, pre_b);
+    }
+
+    #[test]
+    fn rebate_with_empty_fee_account_records_full_deficit() {
+        // Edge case: fee account is completely empty (no entry) when a
+        // rebate fill arrives. The full rebate accumulates as deficit.
+        let mut mgr = AccountManager::new();
+        mgr.deposit(ACCT_A, USD, 10_000);
+        mgr.deposit(ACCT_B, BTC, 100);
+
+        let buy = limit_buy(1, ACCT_A, 100, 10);
+        let sell = limit_sell(2, ACCT_B, 100, 10);
+        let (_, bs) = mgr.try_reserve(&buy, &spec(), 0).unwrap();
+        let (_, ss) = mgr.try_reserve(&sell, &spec(), 0).unwrap();
+
+        let (pre_q, pre_b) = conserved_totals(&mgr, ACCT_A, ACCT_B);
+        mgr.fill(bs, ss, price(100), qty(10), -3, -2, &spec());
+        let (post_q, post_b) = conserved_totals(&mgr, ACCT_A, ACCT_B);
+
+        assert_eq!(mgr.fee_account_deficit(USD), 5);
+        assert_eq!(mgr.fee_signed_balance(USD), -5);
+        assert_eq!(post_q, pre_q);
+        assert_eq!(post_b, pre_b);
+    }
+
+    #[test]
+    fn fee_signed_balance_zero_when_no_activity() {
+        let mgr = AccountManager::new();
+        assert_eq!(mgr.fee_signed_balance(USD), 0);
+        assert_eq!(mgr.fee_account_deficit(USD), 0);
+    }
+
+    #[test]
+    fn fee_deficits_round_trip_via_snapshot() {
+        // Build a manager with a non-zero deficit, snapshot it, restore,
+        // and confirm the deficit survived.
+        let mut mgr = AccountManager::new();
+        mgr.deposit(ACCT_A, USD, 10_000);
+        mgr.deposit(ACCT_B, BTC, 100);
+
+        let buy = limit_buy(1, ACCT_A, 100, 10);
+        let sell = limit_sell(2, ACCT_B, 100, 10);
+        let (_, bs) = mgr.try_reserve(&buy, &spec(), 0).unwrap();
+        let (_, ss) = mgr.try_reserve(&sell, &spec(), 0).unwrap();
+        mgr.fill(bs, ss, price(100), qty(10), -3, -2, &spec());
+        assert_eq!(mgr.fee_account_deficit(USD), 5);
+
+        let balances = mgr.snapshot_balances();
+        let deficits = mgr.snapshot_fee_deficits();
+        assert_eq!(deficits, vec![(USD, 5)]);
+        let (restored, _) = AccountManager::from_parts(balances, Vec::new(), deficits);
+        assert_eq!(restored.fee_account_deficit(USD), 5);
+        assert_eq!(restored.fee_signed_balance(USD), -5);
+    }
+
+    // Property-based test: across any sequence of fills with random fees
+    // (positive, zero, or negative), conservation holds and the fee
+    // ledger's signed balance equals the cumulative `fee_credit` per fill.
+    use proptest::prelude::*;
+
+    #[derive(Debug, Clone, Copy)]
+    struct FillEvent {
+        price: u64,
+        quantity: u64,
+        buyer_fee: i32,
+        seller_fee: i32,
+    }
+
+    fn arb_fill_event() -> impl Strategy<Value = FillEvent> {
+        // Cost ∈ [price × qty] ≥ 100 × 10 = 1_000. With max_fee_bps=500
+        // (5%) the cushion is `cost × 500 / 10_000 ≥ 50`, which absorbs
+        // every fee in [-50, 50]. This keeps the proptest focused on
+        // fee-ledger semantics, not the SEC-07 saturation paths
+        // (covered by unit tests with deliberate underflow).
+        (100u64..=1_000, 10u64..=100, -50i32..=50, -50i32..=50).prop_map(
+            |(price, quantity, buyer_fee, seller_fee)| FillEvent {
+                price,
+                quantity,
+                buyer_fee,
+                seller_fee,
+            },
+        )
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(200))]
+
+        /// For any sequence of fills with random fees:
+        /// 1. Conservation: `Σ ACCT_A.total + Σ ACCT_B.total + signed_fee` is
+        ///    unchanged from initial deposits (debug_assert in `fill()` also
+        ///    catches per-fill violations).
+        /// 2. The fee account's signed balance equals the cumulative
+        ///    `buyer_fee + seller_fee` across all fills (since the fee
+        ///    cushion is generous enough that no saturation occurs).
+        /// 3. Deficit and available are both u64 (never negative); only the
+        ///    *signed* balance can be negative.
+        #[test]
+        fn fee_ledger_conserves_under_random_fees(events in proptest::collection::vec(arb_fill_event(), 1..=30)) {
+            let mut mgr = AccountManager::new();
+            // Pre-fund both traders generously so reservations always succeed.
+            // ACCT_A as recurring buyer needs quote (USD); ACCT_B as recurring
+            // seller needs base (BTC).
+            mgr.deposit(ACCT_A, USD, 10_000_000);
+            mgr.deposit(ACCT_B, BTC, 100_000);
+            // Pre-deposit some quote on ACCT_B so it can accumulate proceeds
+            // (already happens via fill, but seed the entry for consistency).
+            mgr.deposit(ACCT_B, USD, 0);
+
+            let initial_signed_quote = mgr.account_signed_total(ACCT_A, USD)
+                + mgr.account_signed_total(ACCT_B, USD)
+                + mgr.account_signed_total(FEE_ACCOUNT, USD);
+            let initial_total_base = mgr.balance(ACCT_A, BTC).total() as i128
+                + mgr.balance(ACCT_B, BTC).total() as i128;
+
+            let mut order_id = 1u64;
+            let mut expected_fee_credit: i128 = 0;
+
+            for ev in &events {
+                let buy = limit_buy(order_id, ACCT_A, ev.price, ev.quantity);
+                order_id += 1;
+                let sell = limit_sell(order_id, ACCT_B, ev.price, ev.quantity);
+                order_id += 1;
+
+                // max_fee_bps=500 (5%) gives a generous cushion: at qty=100
+                // price=1_000 cost=100_000, cushion = 5_000, larger than any
+                // |fee| in [-50, 50]. So no checked_* saturation fires and
+                // the cumulative fee_credit equals Σ(buyer_fee + seller_fee).
+                let (_, bs) = match mgr.try_reserve(&buy, &spec(), 500) {
+                    Ok(v) => v,
+                    Err(_) => continue,
+                };
+                let (_, ss) = match mgr.try_reserve(&sell, &spec(), 500) {
+                    Ok(v) => v,
+                    Err(_) => { mgr.release(bs); continue; }
+                };
+
+                mgr.fill(
+                    bs,
+                    ss,
+                    price(ev.price),
+                    qty(ev.quantity),
+                    ev.buyer_fee as i64,
+                    ev.seller_fee as i64,
+                    &spec(),
+                );
+                // Free leftover reservations (rebate leaves residue; fees
+                // ≥0 may also leave residue from the cushion).
+                mgr.release(bs);
+                mgr.release(ss);
+
+                expected_fee_credit += ev.buyer_fee as i128 + ev.seller_fee as i128;
+            }
+
+            // (1) Signed quote conservation across the system.
+            let final_signed_quote = mgr.account_signed_total(ACCT_A, USD)
+                + mgr.account_signed_total(ACCT_B, USD)
+                + mgr.account_signed_total(FEE_ACCOUNT, USD);
+            prop_assert_eq!(
+                final_signed_quote, initial_signed_quote,
+                "signed quote conservation violated"
+            );
+
+            // Base conservation.
+            let final_total_base = mgr.balance(ACCT_A, BTC).total() as i128
+                + mgr.balance(ACCT_B, BTC).total() as i128;
+            prop_assert_eq!(
+                final_total_base, initial_total_base,
+                "base conservation violated"
+            );
+
+            // (2) Fee signed balance matches cumulative fee_credit. The
+            // fee account had no initial deposit, so its starting signed
+            // balance was 0.
+            prop_assert_eq!(
+                mgr.fee_signed_balance(USD), expected_fee_credit,
+                "fee signed balance != Σ(fee_credit)"
+            );
+
+            // (3) Component invariants: available and deficit are u64,
+            // and not both nonzero simultaneously *for this proptest*
+            // because we never deposit to FEE_ACCOUNT mid-sequence (a
+            // fill either drains available toward deficit or pays
+            // deficit toward available, never both nonzero at exit).
+            let avail = mgr.balance(FEE_ACCOUNT, USD).available;
+            let deficit = mgr.fee_account_deficit(USD);
+            prop_assert!(
+                !(avail > 0 && deficit > 0),
+                "fee account has both available={} and deficit={} simultaneously",
+                avail, deficit
+            );
+        }
+    }
+
+    #[test]
+    fn zero_deficits_omitted_from_snapshot() {
+        // A deficit that gets fully paid down should not appear in the
+        // snapshot — the entry is removed when it hits zero.
+        let mut mgr = AccountManager::new();
+        mgr.deposit(ACCT_A, USD, 100_000);
+        mgr.deposit(ACCT_B, BTC, 100);
+
+        // Accumulate then fully pay down.
+        let buy1 = limit_buy(1, ACCT_A, 100, 10);
+        let sell1 = limit_sell(2, ACCT_B, 100, 10);
+        let (_, bs1) = mgr.try_reserve(&buy1, &spec(), 0).unwrap();
+        let (_, ss1) = mgr.try_reserve(&sell1, &spec(), 0).unwrap();
+        mgr.fill(bs1, ss1, price(100), qty(10), -3, -2, &spec());
+        assert_eq!(mgr.fee_account_deficit(USD), 5);
+
+        let buy2 = limit_buy(3, ACCT_A, 100, 10);
+        let sell2 = limit_sell(4, ACCT_B, 100, 10);
+        let (_, bs2) = mgr.try_reserve(&buy2, &spec(), 50).unwrap();
+        let (_, ss2) = mgr.try_reserve(&sell2, &spec(), 50).unwrap();
+        mgr.fill(bs2, ss2, price(100), qty(10), 3, 2, &spec());
+
+        assert_eq!(mgr.fee_account_deficit(USD), 0);
+        assert!(
+            mgr.snapshot_fee_deficits().is_empty(),
+            "zero entries removed"
         );
     }
 }
