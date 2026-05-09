@@ -1537,7 +1537,9 @@ transport_start_dpdk_repl() {
     fi
 
     CURRENT_BIND="${SERVER_DPDK_IP}:9876"
-    CURRENT_HEALTH=""
+    # Health endpoint stays on kernel TCP via SERVER_VLAN even in DPDK mode
+    # — same as transport_start_dpdk. Empty would break --health-addr arg.
+    CURRENT_HEALTH="${SERVER_VLAN}:9878"
     DPDK_RAN=1
 
     perf_capture_start "dpdk-repl"
@@ -1665,7 +1667,9 @@ transport_start_dpdk_dual_repl() {
     fi
 
     CURRENT_BIND="${SERVER_DPDK_IP}:9876"
-    CURRENT_HEALTH=""
+    # Health endpoint stays on kernel TCP via SERVER_VLAN even in DPDK mode
+    # — same as transport_start_dpdk. Empty would break --health-addr arg.
+    CURRENT_HEALTH="${SERVER_VLAN}:9878"
     DPDK_RAN=1
 
     perf_capture_start "dpdk-dual-repl"
