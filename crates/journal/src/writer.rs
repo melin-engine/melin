@@ -961,9 +961,31 @@ impl<E: AppEvent> JournalWriter<E> {
         let path = self.path.clone();
         let next_seq = self.next_sequence;
         // GenesisHash carries the chain state at the rotation boundary so
-        // the new segment's chain anchors to the previous one. Falls back
-        // to zeros only when hash-chain is feature-disabled.
-        let genesis = self.chain_hash().unwrap_or([0u8; 32]);
+        // the new segment's chain anchors to the previous one.
+        //
+        // When the `hash-chain` feature is enabled, `chain_hash()` must
+        // return Some after a successful flush (genesis is written at
+        // construction). A None here indicates a logic bug that would
+        // silently break tamper-evidence — the new segment would anchor
+        // to zeros and `verify_segment_boundary` would still pass on
+        // recovery. Refuse to rotate.
+        let genesis = match self.chain_hash() {
+            Some(h) => h,
+            None => {
+                #[cfg(feature = "hash-chain")]
+                {
+                    return Err(JournalError::Io(std::io::Error::other(
+                        "rotate_segment: hash-chain enabled but chain_hash() is None — \
+                         refusing to rotate with zero genesis",
+                    )));
+                }
+                // Hash-chain disabled: zeros are meaningless anyway.
+                #[cfg(not(feature = "hash-chain"))]
+                {
+                    [0u8; 32]
+                }
+            }
+        };
 
         let archived = crate::segment::archive_live(&path).map_err(JournalError::Io)?;
 
@@ -984,11 +1006,18 @@ impl<E: AppEvent> JournalWriter<E> {
             }
             Err(e) => {
                 // Best-effort: undo the rename so the next recovery still
-                // sees a live file at the canonical path. The error from
-                // the rename-back is swallowed because `e` is what the
-                // caller needs to see, and operators can resolve the
-                // residual layout from the on-disk files.
-                let _ = std::fs::rename(&archived, &path);
+                // sees a live file at the canonical path. If the
+                // rename-back also fails the on-disk layout is "archive
+                // present, no live"; recovery's Phase B handles this
+                // (synthesizes a new live), but the in-process writer
+                // would have nothing usable so we surface the original
+                // error and let the caller bring the engine down.
+                if let Err(restore_err) = std::fs::rename(&archived, &path) {
+                    tracing::warn!(
+                        "rotate_segment: rename-back failed after create_continuing error: \
+                         original={e}, restore={restore_err}"
+                    );
+                }
                 Err(e)
             }
         }
