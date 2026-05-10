@@ -39,87 +39,42 @@ single-node).
 
 ## P2 — Polish before public release
 
-### Flap-log spam under rapid disconnect/reconnect
-
-`crates/server/src/response.rs:389-407` re-emits the warn on every
-transition into `degraded=true` with no rate limit. A flapping replica
-(connect/disconnect every few seconds) will produce paired
-warn/info entries on every flap.
-
-Fix: gate transition logs on a sustained-state requirement (e.g. the
-state must hold for ≥1 s before logging), or add a flap-counter and
-escalate the message wording rather than spam.
-
-### Reject impossible policies at parse time
-
-The current parser accepts `persisted>=10` even though
-`ReplicationMetrics` and `replica_active` are hard-coded to 2 slots
-(supporting at most a 1+2 cluster, view length ≤ 3). Strict policies
-above the cluster cap silently produce a permanently-stalled gate;
-degrade-friendly policies above the cap silently clamp.
-
-Fix: parse-time check `count <= MAX_CLUSTER_SIZE` (currently 3) and
-return a `PolicyError::CountExceedsClusterCap`. Document the cap
-prominently in `--help` and `docs/replication.md`.
-
 ### Degrade floor
 
-`persisted>=3 best_effort` on a 1-node cluster silently clamps to 1. An operator
-who configured `>=3` for a regulatory or commercial reason almost
-certainly does not want the gate to open at the primary alone in a
-2-node-down scenario.
+`persisted>=3 best_effort` on a 1-node cluster silently clamps to 1.
+An operator who configured `>=3` for a regulatory or commercial
+reason almost certainly does not want the gate to open at the
+primary alone in a 2-node-down scenario.
 
-Fix: add a floor syntax — e.g. `persisted>=3 best_effort2` ("degrade no further
-than 2 nodes"), or a separate `--min-durability` CLI flag with a
-default that prevents single-node fallback. Pair with parse-time
-validation that `floor <= count`.
+Fix: add a floor syntax — e.g. `persisted>=3 best_effort_floor=2`
+("degrade no further than 2 nodes"), or a separate
+`--min-durability` CLI flag with a default that prevents single-
+node fallback. Pair with parse-time validation that `floor <=
+count`.
 
-### Stale prose comment
+### Test coverage gaps (remaining)
 
-`crates/server/src/replication/protocol.rs:27` still describes the old
-9-byte Ack frame layout. Cosmetic but misleading for protocol-level
-debugging.
-
-### Overflow risk in `needed`
-
-`crates/server/src/response.rs:436` computes `let needed = max_seq + 1`.
-Astronomically improbable for `max_seq` to reach `u64::MAX` in
-practice, but `checked_add` is free on the cold path and saves a
-post-mortem the day someone breaks the assumption.
-
-### Test coverage gaps
-
-- No integration test for the **degrade transition itself**: fail a
-  replica mid-test, assert `/healthz`'s `melin_durability_policy_degraded`
-  flips to 1, restore, assert it flips back to 0.
-- No regression test for the **just-connected race** (P0 above).
-- No regression test for the **disconnect race** (P0 above).
-- No test for a **standalone server with `persisted>=2 best_effort`** asserting
-  `policy_degraded=1` from startup (P1 idle-staleness above).
-- No **flapping** test for the warn-rate-limit fix above.
+- No regression test for the **just-connected race** (P0 above —
+  fixed in `a84540a`; the existing failover suite covers the broad
+  scenario but a focused unit test in `response.rs` that simulates
+  active=true with cursors=0 would harden against future
+  regressions).
+- No regression test for the **disconnect race** (P0 above — fixed
+  in `8888732`; same comment).
 - Consider adding a **fuzz / proptest** target on the policy parser
   since this is operator-facing input.
+
+The other original P2 items (flap-log spam, parser cap rejection,
+stale prose comment, overflow check, degrade-transition integration
+test) landed in commit `821b6e6`.
 
 ---
 
 ## P3 — Commercial polish
 
-### Replace `!` syntax with named modes
-
-Industry comparables (Postgres `synchronous_standby_names`, Cassandra
-consistency levels, Kafka `min.insync.replicas`) all use named modes
-or word-form qualifiers. The `persisted>=2 best_effort` syntax is unique to Melin
-and an exchange operator reading the deploy config will not parse it
-on first contact.
-
-Recommendation: spell it out. Options:
-
-- `persisted>=2 best_effort` / `persisted>=2 strict`
-- Named modes: `quorum_or_survivor` / `quorum_strict` / `journal_only`
-- Both, with the named modes desugaring to clauses.
-
-8 bytes of CLI saved by the punctuation suffix is not worth the
-operator-comprehension friction at the deployment-review stage.
+The original "replace `!` syntax with named modes" entry landed in
+commit `821b6e6` — the modifier is now spelled `best_effort` and the
+parser rejects misspellings explicitly.
 
 ### Compound named levels
 
@@ -161,10 +116,13 @@ extended.
 
 ## Sequencing
 
-1. ~~P0 (B1, B2, wire byte-pattern test)~~ — landed in `a84540a`,
-   `8888732`, `40f9c76`.
-2. ~~P1~~ — idle staleness, doc updates, bench script, doc claim
+1. ~~P0~~ — landed in `a84540a`, `8888732`, `40f9c76`.
+2. ~~P1~~ (idle staleness, doc updates, bench script, doc claim) —
    landed in `6fb806a`, `8f28bf1`. Ack-on-receive + three-tier
    default graduated to roadmap item #5 in `docs/roadmap.md`.
-3. P2 on a follow-up branch.
+3. ~~P2~~ (flap-log, parser cap, stale comment, overflow,
+   degrade-transition test) and the `!`→`best_effort` rename from
+   P3 — landed in `821b6e6`. Remaining P2 items (degrade floor,
+   focused regression tests for the P0 races, parser fuzz target)
+   on a follow-up branch.
 4. P3 driven by buyer feedback / commercial roadmap.
