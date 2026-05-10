@@ -52,7 +52,7 @@ No per-account or per-connection rate limiting on order submissions. A single cl
 
 **Impact**: One client monopolizes matching throughput.
 **Exploitable remotely**: Yes.
-**Status**: **PARTIALLY FIXED** — added `--max-orders-per-second` (default 1000) and `--max-orders-burst` (default 5000). Per-account token bucket runs inside the matching engine using the journaled event timestamp, so primary and replicas see identical accept/reject decisions in steady state. Submissions beyond the bucket reject with `ExceedsOrderRate` before reservation. `0` for either knob disables the limiter. Both values are operator policy and must match across the cluster (same shape as `--max-orders-per-account`). Remaining: serialise per-account bucket state in the snapshot. Without it, a replica that restores from a snapshot while the primary had partially-depleted buckets re-initialises lazily and may diverge on rate-limit decisions for the bounded window `burst/rate` (5 s with default knobs). Divergence is detected by the chain-hash check (replica forces re-sync rather than silently corrupting), but the snapshot-format addition removes the failure mode entirely.
+**Status**: **FIXED** — added `--max-orders-per-second` (default 1000) and `--max-orders-burst` (default 5000). Per-account token bucket runs inside the matching engine using the journaled event timestamp, so primary and replicas see identical accept/reject decisions. Submissions beyond the bucket reject with `ExceedsOrderRate` before reservation. `0` for either knob disables the limiter. Both values are operator policy and must match across the cluster (same shape as `--max-orders-per-account`). Snapshot format v18 carries per-account bucket state (`tokens` + `last_refill_ns`), so a replica restoring from a snapshot taken mid-throttle converges bit-for-bit on the very next event — closing the divergence window the initial landing left open.
 
 ---
 
@@ -125,7 +125,7 @@ The OOM-via-large-count vector was closed (counts are now bounded against remain
 |----|-------|----------|--------|
 | SEC-02 | No connection limits / rate limiting (PARTIAL) | HIGH | Yes |
 | SEC-03 | Unbounded order book growth (PARTIAL) | HIGH | Yes |
-| SEC-04 | No order throttling (PARTIAL) | MEDIUM | Yes |
+| SEC-04 | No order throttling (FIXED) | MEDIUM | Yes |
 | SEC-05 | Journal disk exhaustion hangs server | MEDIUM | Indirect |
 | SEC-06 | Disruptor backpressure spins CPU | MEDIUM | Partial |
 | SEC-07 | Saturating arithmetic masks errors | MEDIUM | No |
@@ -136,8 +136,7 @@ The OOM-via-large-count vector was closed (counts are now bounded against remain
 
 1. **SEC-02** — per-IP connection cap + auth-failure backoff (`--max-connections` already landed)
 2. **SEC-03** — per-instrument max price levels (per-account cap already landed)
-3. **SEC-04** — serialise per-account rate-limit bucket state in snapshots
-4. **SEC-08** — TLS support
-5. **SEC-05** — disk usage monitoring (rotation already landed)
-6. **SEC-07** — checked arithmetic in financial paths
-7. **SEC-09** — snapshot invariant validation on load
+3. **SEC-08** — TLS support
+4. **SEC-05** — disk usage monitoring (rotation already landed)
+5. **SEC-07** — checked arithmetic in financial paths
+6. **SEC-09** — snapshot invariant validation on load

@@ -76,7 +76,15 @@ const SNAP_MAGIC: u32 = 0x534E_4150;
 ///            include a fee cushion and would over-reserve when read
 ///            under v17 semantics — bumping the version so old snapshots
 ///            are explicitly rejected.
-const SNAP_VERSION: u16 = 17;
+/// v17 → v18: SEC-04 per-account rate-limiter bucket state. Without it, a
+///            replica that restored from a snapshot taken while the
+///            primary had partially-depleted buckets would re-initialise
+///            buckets lazily as full and diverge on accept/reject
+///            decisions for the bounded `burst/rate` window after
+///            restore. v18 carries the bucket map (`account`, `tokens`,
+///            `last_refill_ns`) so primary and replica converge bit-for-
+///            bit on the very next event after restore.
+const SNAP_VERSION: u16 = 18;
 
 /// Re-exports for callers that serialize the Exchange payload without the
 /// full on-disk framing — e.g. the `melin-app::Application` impl which
@@ -264,6 +272,13 @@ pub(crate) struct ExchangeSnapshot {
     /// revenue. The logical fee balance is `available - deficit`. Sparse:
     /// only currencies with a non-zero deficit are present.
     pub(crate) fee_account_deficits: Vec<(CurrencyId, u64)>,
+    /// Per-account rate-limiter bucket state (v18+, SEC-04). Each entry
+    /// is `(account, tokens, last_refill_ns)`. Empty when the limiter
+    /// is disabled or no account has yet submitted an order. Carrying
+    /// this in the snapshot is what closes the SEC-04
+    /// divergence window — see the version-history comment on
+    /// `SNAP_VERSION` for the v17 → v18 motivation.
+    pub(crate) order_buckets: Vec<(AccountId, u64, u64)>,
 }
 
 /// Serialized order book state for a single instrument.
@@ -418,6 +433,15 @@ fn encode_exchange_state(state: &ExchangeSnapshot, buf: &mut Vec<u8>) {
     for (currency, amount) in &state.fee_account_deficits {
         le::push_u32(buf, currency.0);
         le::push_u64(buf, *amount);
+    }
+
+    // Per-account rate-limiter bucket state (v18+, SEC-04). Each entry
+    // is account(4) + tokens(8) + last_refill_ns(8) = 20 bytes.
+    le::push_u32(buf, state.order_buckets.len() as u32);
+    for (account, tokens, last_refill_ns) in &state.order_buckets {
+        le::push_u32(buf, account.0);
+        le::push_u64(buf, *tokens);
+        le::push_u64(buf, *last_refill_ns);
     }
 }
 
@@ -838,6 +862,27 @@ fn decode_exchange_state(
         Vec::new()
     };
 
+    // Per-account rate-limiter bucket state (v18+, SEC-04). Each entry
+    // is account(4) + tokens(8) + last_refill_ns(8) = 20 bytes.
+    let order_buckets = if version >= 18 && pos < buf.len() {
+        check(pos, 4)?;
+        let n = le::get_u32(&buf[pos..]) as usize;
+        pos += 4;
+        validate_count(buf.len() - pos, n, 20)?;
+        let mut buckets = Vec::with_capacity(n);
+        for _ in 0..n {
+            check(pos, 20)?;
+            let account = AccountId(le::get_u32(&buf[pos..]));
+            let tokens = le::get_u64(&buf[pos + 4..]);
+            let last_refill_ns = le::get_u64(&buf[pos + 12..]);
+            buckets.push((account, tokens, last_refill_ns));
+            pos += 20;
+        }
+        buckets
+    } else {
+        Vec::new()
+    };
+
     Ok((
         pos,
         ExchangeSnapshot {
@@ -852,6 +897,7 @@ fn decode_exchange_state(
             key_hwm,
             disabled_instruments,
             fee_account_deficits,
+            order_buckets,
         },
     ))
 }
@@ -1221,6 +1267,7 @@ impl Exchange {
         let key_hwm = self.snapshot_key_hwm();
         let disabled_instruments = self.snapshot_disabled_instruments();
         let fee_account_deficits = self.accounts().snapshot_fee_deficits();
+        let order_buckets = self.snapshot_order_buckets();
 
         ExchangeSnapshot {
             instruments,
@@ -1234,6 +1281,7 @@ impl Exchange {
             key_hwm,
             disabled_instruments,
             fee_account_deficits,
+            order_buckets,
         }
     }
 
@@ -1309,7 +1357,16 @@ impl Exchange {
         // straight from the per-instrument order_index.
         let scheduled_tasks = rebuild_scheduler_heap(&instruments);
 
-        Self::from_parts(instruments, accounts, key_hwm, scheduled_tasks)
+        let mut exchange = Self::from_parts(instruments, accounts, key_hwm, scheduled_tasks);
+        // Restore per-account rate-limiter bucket state (v18+). Empty
+        // for older snapshots, in which case the limiter starts with
+        // every account at full burst — same shape as a fresh start.
+        // The operator-config knobs (`max_orders_per_second`,
+        // `max_orders_burst`) are reapplied separately by the receiver
+        // wiring; the bucket state restored here will only be observed
+        // by the limiter once those knobs are non-zero.
+        exchange.restore_order_buckets(state.order_buckets);
+        exchange
     }
 
     /// Create a deep copy of this Exchange by round-tripping through the
@@ -1326,9 +1383,13 @@ impl Exchange {
         // on the shadow, and shadow validation would diverge.
         cloned.set_max_open_orders_per_account(self.max_open_orders_per_account());
         // Same reasoning as above for the SEC-04 rate-limit config: not
-        // journaled (operator config), but Rejected reports differ if the
-        // shadow clone runs unthrottled — carry it over so the shadow
-        // makes identical accept/reject decisions.
+        // journaled (operator config), but Rejected reports differ if
+        // the shadow clone runs unthrottled — carry it over so the
+        // shadow makes identical accept/reject decisions. The cloned
+        // engine starts at default `(0, 0)`; transitioning from
+        // disabled-to-active does NOT clear buckets (see the rule on
+        // `set_max_orders_per_second`), so the snapshot-restored bucket
+        // state is preserved through this call.
         let (rate, burst) = self.max_orders_per_second();
         cloned.set_max_orders_per_second(rate, burst);
         cloned
@@ -2014,5 +2075,134 @@ mod tests {
         let (_, seq, loaded_hash) = load(&path).unwrap();
         assert_eq!(seq, 10);
         assert_eq!(loaded_hash, [0u8; 32]);
+    }
+
+    /// SEC-04 v18+ regression: per-account rate-limiter bucket state must
+    /// survive a snapshot round-trip so a replica restoring from a
+    /// snapshot taken mid-throttle sees the same `tokens` /
+    /// `last_refill_ns` the primary had — and therefore makes identical
+    /// accept/reject decisions on the very next event. Without this,
+    /// the replica would re-initialise buckets lazily as full and
+    /// diverge for the bounded `burst/rate` window.
+    #[test]
+    fn snapshot_round_trip_preserves_rate_limit_buckets() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rate_limit.snapshot");
+
+        let mut exchange = Exchange::new();
+        exchange.set_max_orders_per_second(1_000, 5);
+        exchange.add_instrument(btc_usd_spec());
+        exchange.deposit(ACCT_A, USD, 1_000_000);
+        exchange.deposit(ACCT_B, USD, 1_000_000);
+
+        // Drive the limiter so both accounts have non-trivial bucket
+        // state. ACCT_A burns 3/5 of its burst at t=1s; ACCT_B burns
+        // 1/5 at t=2s. Distinct `last_refill_ns` per bucket so a wrong
+        // restore (e.g. snapping to 0) would be caught by the equality
+        // assertion below.
+        let mut reports = Vec::new();
+        for i in 0..3u64 {
+            exchange.set_current_event_ts_ns(1_000_000_000);
+            exchange.execute(
+                Symbol(1),
+                limit_order(i + 1, ACCT_A, Side::Buy, 100, 1),
+                &mut reports,
+            );
+        }
+        exchange.set_current_event_ts_ns(2_000_000_000);
+        exchange.execute(
+            Symbol(1),
+            limit_order(100, ACCT_B, Side::Buy, 101, 1),
+            &mut reports,
+        );
+
+        let pre = exchange.snapshot_order_buckets();
+        assert_eq!(pre.len(), 2, "two buckets should be populated");
+
+        save(&exchange, 1, [0u8; 32], &path).unwrap();
+        let (mut restored, _seq, _hash) = load(&path).unwrap();
+        // The receiver wiring re-applies the operator config after
+        // load. Use the same values to exercise the no-clear path.
+        restored.set_max_orders_per_second(1_000, 5);
+
+        let post = restored.snapshot_order_buckets();
+        // Bucket maps must be equal as sets (HashMap iteration order is
+        // unspecified); compare via sorted Vecs.
+        let mut pre_sorted = pre.clone();
+        let mut post_sorted = post;
+        pre_sorted.sort_by_key(|(a, _, _)| a.0);
+        post_sorted.sort_by_key(|(a, _, _)| a.0);
+        assert_eq!(pre_sorted, post_sorted);
+
+        // Functional check: an immediate next event on the restored
+        // engine must see the same accept/reject decision the primary
+        // would. ACCT_A burned 3 of 5 tokens at t=1s, so at t=1s+1ns it
+        // has 2 tokens left — exactly two more accepts before rejection.
+        let mut after = Vec::new();
+        for i in 0..2u64 {
+            restored.set_current_event_ts_ns(1_000_000_000 + 1 + i);
+            restored.execute(
+                Symbol(1),
+                limit_order(200 + i, ACCT_A, Side::Buy, 102 + i, 1),
+                &mut after,
+            );
+        }
+        assert!(
+            !after
+                .iter()
+                .any(|r| matches!(r, ExecutionReport::Rejected { .. })),
+            "two more orders should fit in the restored bucket: {after:?}",
+        );
+        after.clear();
+        // Third post-restore order with negligible elapsed time must
+        // reject — proves the bucket really was at 2 tokens, not 5.
+        restored.set_current_event_ts_ns(1_000_000_000 + 10);
+        restored.execute(
+            Symbol(1),
+            limit_order(999, ACCT_A, Side::Buy, 200, 1),
+            &mut after,
+        );
+        assert!(
+            matches!(
+                after[0],
+                ExecutionReport::Rejected {
+                    reason: RejectReason::ExceedsOrderRate,
+                    ..
+                }
+            ),
+            "restored bucket lost throttle state: {after:?}",
+        );
+    }
+
+    /// SEC-04 v18+: `set_max_orders_per_second` must NOT clear bucket
+    /// state when called with the same `(rate, burst)` already in
+    /// effect. This is what allows the receiver wiring to re-apply
+    /// operator config after a snapshot restore without wiping the
+    /// state we just restored.
+    #[test]
+    fn rate_limit_set_idempotent_preserves_buckets() {
+        let mut exchange = Exchange::new();
+        exchange.set_max_orders_per_second(500, 3);
+        exchange.add_instrument(btc_usd_spec());
+        exchange.deposit(ACCT_A, USD, 1_000_000);
+        let mut reports = Vec::new();
+        exchange.set_current_event_ts_ns(1_000);
+        exchange.execute(
+            Symbol(1),
+            limit_order(1, ACCT_A, Side::Buy, 100, 1),
+            &mut reports,
+        );
+        let before = exchange.snapshot_order_buckets();
+        assert_eq!(before.len(), 1);
+        // Same values — must be a no-op for buckets.
+        exchange.set_max_orders_per_second(500, 3);
+        let after = exchange.snapshot_order_buckets();
+        assert_eq!(before, after, "same-config call must not clear");
+        // Different values — must clear.
+        exchange.set_max_orders_per_second(500, 4);
+        assert!(
+            exchange.snapshot_order_buckets().is_empty(),
+            "changed-config call must clear",
+        );
     }
 }

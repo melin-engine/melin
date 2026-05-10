@@ -114,8 +114,11 @@ pub struct ServerConfig {
     /// limiter. Prevents a single client from monopolizing matching
     /// throughput (SEC-04). Must match across primary and every replica
     /// — same determinism caveat as `--max-orders-per-account`. Default
-    /// (1000/s) is loose enough not to disturb legitimate HFT clients
-    /// while bounding worst-case load from a rogue account.
+    /// (1000/s) is a conservative mid-tier ceiling: comfortable for
+    /// algorithmic and retail flow, but tight for active market-makers
+    /// who routinely re-quote past 1k/s on liquid instruments. Operators
+    /// running with significant MM presence should raise this (and the
+    /// burst) to match their book's quote-update profile.
     #[arg(long, default_value_t = 1_000)]
     pub max_orders_per_second: u32,
     /// Per-account burst capacity (max consecutive orders allowed after a

@@ -138,27 +138,18 @@ pub struct Exchange {
     /// submission per account.
     ///
     /// Determinism note: same as the open-orders cap above — Rejected
-    /// reports are observable, so primary and every replica must run with
-    /// matching values. The bucket math uses the journaled `ApplyCtx::now_ns`
-    /// (stamped by the reader at ingest), not wall-clock, so bit-for-bit
-    /// replay holds across the cluster *as long as both sides see the
-    /// bucket map in the same state*.
+    /// reports are observable, so primary and every replica must run
+    /// with matching values. The bucket math uses the journaled
+    /// `ApplyCtx::now_ns` (stamped by the reader at ingest), not wall-
+    /// clock, so bit-for-bit replay holds across the cluster.
     ///
-    /// Snapshot-restore caveat: per-account bucket state is **not**
-    /// serialized in the snapshot today (`order_buckets` is rebuilt
-    /// lazily on first post-restore submit per account). A replica that
-    /// restores from a snapshot taken at time T while the primary's
-    /// bucket for account A was partially depleted will see A's bucket
-    /// as full at the next event, while the primary keeps the depleted
-    /// state. If A is being rate-limited around T, the primary may
-    /// reject orders that the replica accepts, producing a chain-hash
-    /// divergence and forcing a re-sync. Bounded impact: divergence is
-    /// only possible within `burst/rate` seconds of the snapshot
-    /// boundary (after that, normal-traffic refill restores both sides
-    /// to full), and replicas detect it via the chain-hash check rather
-    /// than silently corrupting state. Serialising bucket state in the
-    /// snapshot format is a follow-up — kept out of the initial SEC-04
-    /// landing to keep the change focused.
+    /// Snapshot continuity: per-account bucket state (`tokens` +
+    /// `last_refill_ns`) is serialised in snapshot format v18+ via
+    /// [`Exchange::snapshot_order_buckets`] /
+    /// [`Exchange::restore_order_buckets`]. A replica restoring from a
+    /// snapshot taken mid-throttle sees the same bucket state the
+    /// primary had, so the very next event produces an identical
+    /// accept/reject decision — no divergence window.
     ///
     /// `u32` for both fields: covers the realistic operator range
     /// (1..=10_000_000 orders/sec) without bloating the per-account
@@ -166,9 +157,15 @@ pub struct Exchange {
     max_orders_per_second: u32,
     max_orders_burst: u32,
     /// Per-account token-bucket state for the rate limiter. Lazily inserted
-    /// on first submit per account; entries persist for the life of the
-    /// process (no eviction — bounded by `order_counts.len()` in practice
-    /// since accounts that never trade never appear here).
+    /// on the first *submission attempt* (not first rest) per account; entries
+    /// persist for the life of the process (no eviction). Memory bound is
+    /// "every account that ever submitted at least one order" — strictly a
+    /// superset of `order_counts.len()` because a submission can populate a
+    /// bucket and then reject downstream (e.g. InsufficientBalance, NoLiquidity).
+    /// In practice, an exchange's ever-active-account count is what dominates;
+    /// online eviction is intentionally deferred (it would need `now_ns` at
+    /// every release site to safely confirm the bucket is genuinely at burst,
+    /// and we don't carry it through cancel/expire/end-of-day today).
     ///
     /// Empty when `max_orders_per_second == 0` or `max_orders_burst == 0`
     /// (limiter disabled). HashMap4 for the same reason as `order_counts`:
@@ -440,12 +437,13 @@ impl Exchange {
             max_open_orders_per_account: DEFAULT_MAX_OPEN_ORDERS_PER_ACCOUNT,
             max_orders_per_second: DEFAULT_MAX_ORDERS_PER_SECOND,
             max_orders_burst: DEFAULT_MAX_ORDERS_BURST,
-            // Snapshot restore: limiter starts disabled by default. The
-            // server reapplies operator config (CLI flags) after restore;
-            // bucket state itself is in-memory only and is not journaled,
-            // so a restart legitimately gives every account a full bucket
-            // (consistent with how SEC-03's `order_counts` is rebuilt
-            // from the book rather than carried in the snapshot).
+            // Snapshot restore: limiter starts disabled by default and
+            // the bucket map starts empty. `restore_state` calls
+            // `restore_order_buckets` after `from_parts` to repopulate
+            // from the snapshot's v18+ bucket section, and the server
+            // wiring then reapplies the operator config (which, going
+            // from disabled `(0, 0)` to active, preserves the restored
+            // buckets — see `set_max_orders_per_second`).
             order_buckets: HashMap4::default(),
             current_event_ts_ns: 0,
         }
@@ -464,19 +462,48 @@ impl Exchange {
     }
 
     /// Configure the per-account order-submission rate limit (SEC-04).
-    /// Either argument set to `0` disables the limiter (opt-out). Existing
-    /// per-account bucket state is cleared so the new policy applies
-    /// uniformly from the next event onward.
+    /// Either argument set to `0` disables the limiter (opt-out).
+    ///
+    /// Bucket-clearing rule: existing per-account bucket state is
+    /// cleared **only** when transitioning between two active
+    /// configurations whose `(rate, burst)` values differ — the online-
+    /// reconfig case where tokens credited at the old rate could over-
+    /// credit under the new one. All other transitions preserve buckets:
+    ///
+    /// - **Initial activation** (previous config was `(0, _)` or
+    ///   `(_, 0)`, i.e. limiter was disabled): buckets that exist on
+    ///   the map can only have come from a snapshot restore via
+    ///   `restore_order_buckets`, and that is exactly the state we
+    ///   need to preserve to close the SEC-04 divergence window. A
+    ///   fresh engine with no restored buckets is unaffected.
+    /// - **Deactivation** (new config is `(0, _)` or `(_, 0)`): the
+    ///   limiter is off, so bucket contents are unobserved. Keeping
+    ///   them is harmless and avoids losing state if the operator
+    ///   later re-enables with the same values.
+    /// - **No-op reapply** (values unchanged): obviously preserve.
     ///
     /// Determinism: must match across primary and replicas — see the field
     /// docs on `max_orders_per_second` / `max_orders_burst`.
+    ///
+    /// Side effect (online-reconfig path only): clearing buckets resets
+    /// every account to a full burst at next first-touch. Operators
+    /// should treat online reconfiguration as a rare, audit-logged
+    /// change — frequent re-tuning is effectively a throttle bypass.
+    /// Engine library users embedding the matching core should gate the
+    /// call behind their own auth path.
     pub fn set_max_orders_per_second(&mut self, rate: u32, burst: u32) {
+        let was_active = self.max_orders_per_second > 0 && self.max_orders_burst > 0;
+        let will_be_active = rate > 0 && burst > 0;
+        let values_differ = rate != self.max_orders_per_second || burst != self.max_orders_burst;
         self.max_orders_per_second = rate;
         self.max_orders_burst = burst;
-        // Clear stale buckets so a config change can never leave an
-        // account credited with tokens at a now-invalid rate. Cheap: the
-        // limiter is idle until the first post-config submission anyway.
-        self.order_buckets.clear();
+        if was_active && will_be_active && values_differ {
+            // Online reconfig between two active configs — drop stale
+            // tokens so the new rate applies uniformly from the next
+            // event. Cheap: the limiter cleared accounts will repopulate
+            // lazily on their first post-reconfig submission.
+            self.order_buckets.clear();
+        }
     }
 
     /// Read back the configured rate limit `(rate_per_sec, burst)`.
@@ -494,6 +521,18 @@ impl Exchange {
         self.current_event_ts_ns = now_ns;
     }
 
+    /// Called when an account's open-order count just hit zero. Removes
+    /// the per-account `order_counts` entry and — if the rate-limiter
+    /// bucket for the account is at full capacity — also drops the
+    /// bucket entry. Evicting only at full capacity preserves throttle
+    /// state for accounts that idle out mid-burst (so they can't escape
+    /// a partial throttle by cancelling everything), while keeping
+    /// long-term memory bounded for accounts that trade once and never
+    /// return. The "at full capacity" check is exact, not heuristic:
+    /// `refill_and_consume` caps at `burst`, so a bucket already at
+    /// `burst` would refill to `burst` on next access regardless of
+    /// elapsed time — the eviction is observationally equivalent to
+    /// keeping it.
     /// Current count of open orders (resting limits + pending stops +
     /// in-flight) for `account`, across all instruments. Returns `0` if
     /// the account has never traded. Used by proptests and admin queries
@@ -599,6 +638,47 @@ impl Exchange {
             .filter(|(_, hwm)| **hwm > 0)
             .map(|(&key, &hwm)| (key, hwm))
             .collect()
+    }
+
+    /// Snapshot per-account rate-limiter bucket state for serialization
+    /// (SEC-04 v18+ snapshots). Each tuple is `(account, tokens,
+    /// last_refill_ns)`. Returned in unspecified order — callers must
+    /// not depend on stability across runs.
+    ///
+    /// Without this, a replica that restored from a snapshot taken at
+    /// time T while the primary's bucket for some account A was
+    /// partially depleted would re-initialise A's bucket lazily as full
+    /// at the next event, while the primary kept the depleted state —
+    /// the divergence window flagged in the SEC-04 audit. Closing it
+    /// requires carrying the bucket map in the snapshot.
+    pub(crate) fn snapshot_order_buckets(&self) -> Vec<(AccountId, u64, u64)> {
+        self.order_buckets
+            .iter()
+            .map(|(&account, bucket)| (account, bucket.tokens, bucket.last_refill_ns))
+            .collect()
+    }
+
+    /// Repopulate the rate-limiter bucket map from a deserialised
+    /// snapshot. Called by `restore_state` after the rest of the engine
+    /// is reconstructed. Existing entries are cleared first so a stale
+    /// in-process bucket cannot survive a restore.
+    ///
+    /// Preserving exact bucket state (`tokens` + `last_refill_ns`) is
+    /// what closes the SEC-04 snapshot-divergence window: the next
+    /// event's `refill_and_consume` call will see the same elapsed-time
+    /// math the primary would have, producing identical accept/reject
+    /// decisions.
+    pub(crate) fn restore_order_buckets(&mut self, buckets: Vec<(AccountId, u64, u64)>) {
+        self.order_buckets.clear();
+        for (account, tokens, last_refill_ns) in buckets {
+            self.order_buckets.insert(
+                account,
+                TokenBucket {
+                    tokens,
+                    last_refill_ns,
+                },
+            );
+        }
     }
 
     /// Number of active instruments (for diagnostics).
@@ -10692,6 +10772,70 @@ mod tests {
                 .iter()
                 .any(|r| matches!(r, ExecutionReport::Rejected { .. })),
             "fresh burst after policy change, got {reports:?}"
+        );
+    }
+
+    #[test]
+    fn rate_limit_clock_backwards_is_defensive_not_panic() {
+        // `now_ns` is journaled by the reader. If an operator clock step
+        // (NTP correction) ever produces an event whose timestamp is
+        // earlier than the bucket's `last_refill_ns`, the limiter must
+        // not panic and must not reject every order until time catches
+        // up — the documented behavior is "skip refill, allow consume."
+        // Locks in that contract so a future refactor of
+        // `refill_and_consume` doesn't silently regress to either panic
+        // (DoS surface) or reject (false-positive surface).
+        let mut exchange = Exchange::new();
+        exchange.set_max_orders_per_second(100, 2);
+        exchange.add_instrument(btc_usd_spec());
+        exchange.deposit(ACCT_A, USD, 1_000_000);
+        let mut reports = Vec::new();
+        // Anchor bucket at t = 1s.
+        execute_at(
+            &mut exchange,
+            1_000_000_000,
+            Symbol(1),
+            limit_order(1, ACCT_A, Side::Buy, 100, 1, TimeInForce::GTC),
+            &mut reports,
+        );
+        reports.clear();
+        // Clock jumps backward to t = 0. With burst = 2 we had one token
+        // left after the t=1s call; the t=0 call must accept (consume
+        // the remaining token), not panic and not reject.
+        execute_at(
+            &mut exchange,
+            0,
+            Symbol(1),
+            limit_order(2, ACCT_A, Side::Buy, 101, 1, TimeInForce::GTC),
+            &mut reports,
+        );
+        assert!(
+            !reports
+                .iter()
+                .any(|r| matches!(r, ExecutionReport::Rejected { .. })),
+            "clock-backwards must allow consume, got {reports:?}",
+        );
+        reports.clear();
+        // Bucket is now at zero (consumed both burst tokens). Another
+        // call at t = 0 — still no refill possible — must reject cleanly
+        // with ExceedsOrderRate (not panic, not silently accept).
+        execute_at(
+            &mut exchange,
+            0,
+            Symbol(1),
+            limit_order(3, ACCT_A, Side::Buy, 102, 1, TimeInForce::GTC),
+            &mut reports,
+        );
+        assert!(
+            matches!(
+                reports[0],
+                ExecutionReport::Rejected {
+                    reason: RejectReason::ExceedsOrderRate,
+                    ..
+                }
+            ),
+            "expected ExceedsOrderRate after burst exhausted with backwards clock, got {:?}",
+            reports[0],
         );
     }
 }
