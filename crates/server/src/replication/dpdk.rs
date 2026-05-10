@@ -222,11 +222,14 @@ impl DpdkReplicationDriver {
             if let SlotState::Streaming(h) | SlotState::Handshaking(h) = slot.state {
                 transport.close(h);
             }
-            slot.active_flag.store(false, Ordering::Release);
-            slot.evict_flag.store(false, Ordering::Release);
+            // Zero per-slot metrics BEFORE the active_flag Release so
+            // a reader cannot observe `active=true` paired with `cursor=0`
+            // on weak-memory architectures (see B2 in the follow-ups doc).
             metrics.acked_sequence[i].store(0, Ordering::Relaxed);
             metrics.in_memory_sequence[i].store(0, Ordering::Relaxed);
             metrics.catching_up[i].store(false, Ordering::Relaxed);
+            slot.active_flag.store(false, Ordering::Release);
+            slot.evict_flag.store(false, Ordering::Release);
             slot.acked_cursor = u64::MAX;
             slot.recv_buf.clear();
             // Drop any unread ring entries so a reconnecting replica
@@ -533,10 +536,11 @@ impl DpdkReplicationDriver {
                     compact_recv_buf(&mut slot.recv_buf, consumed);
                     if ack_error {
                         transport.close(handle);
-                        slot.active_flag.store(false, Ordering::Release);
-                        slot.acked_cursor = u64::MAX;
+                        // Zero metrics before active_flag Release — see B2.
                         metrics.acked_sequence[slot_idx].store(0, Ordering::Relaxed);
                         metrics.in_memory_sequence[slot_idx].store(0, Ordering::Relaxed);
+                        slot.active_flag.store(false, Ordering::Release);
+                        slot.acked_cursor = u64::MAX;
                         slot.recv_buf.clear();
                         slot.state = SlotState::Idle;
                         replicas_connected.fetch_sub(1, Ordering::Release);
@@ -603,10 +607,11 @@ impl DpdkReplicationDriver {
                                 "TX overflow on replica socket — disconnecting"
                             );
                             transport.close(handle);
-                            slot.active_flag.store(false, Ordering::Release);
-                            slot.acked_cursor = u64::MAX;
+                            // Zero metrics before active_flag Release — see B2.
                             metrics.acked_sequence[slot_idx].store(0, Ordering::Relaxed);
                             metrics.in_memory_sequence[slot_idx].store(0, Ordering::Relaxed);
+                            slot.active_flag.store(false, Ordering::Release);
+                            slot.acked_cursor = u64::MAX;
                             slot.recv_buf.clear();
                             slot.state = SlotState::Idle;
                             replicas_connected.fetch_sub(1, Ordering::Release);
@@ -635,10 +640,11 @@ impl DpdkReplicationDriver {
                     // 4. Check for disconnect.
                     if !transport.is_active(handle) {
                         warn!(slot = slot_idx, "replica disconnected (DPDK)");
-                        slot.active_flag.store(false, Ordering::Release);
-                        slot.acked_cursor = u64::MAX;
+                        // Zero metrics before active_flag Release — see B2.
                         metrics.acked_sequence[slot_idx].store(0, Ordering::Relaxed);
                         metrics.in_memory_sequence[slot_idx].store(0, Ordering::Relaxed);
+                        slot.active_flag.store(false, Ordering::Release);
+                        slot.acked_cursor = u64::MAX;
                         slot.recv_buf.clear();
                         slot.state = SlotState::Idle;
                         replicas_connected.fetch_sub(1, Ordering::Release);

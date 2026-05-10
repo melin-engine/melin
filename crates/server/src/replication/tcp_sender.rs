@@ -180,13 +180,20 @@ pub fn run_sender(
                         consumer.skip_to_producer();
                         slot.consumer = Some(consumer);
                         replicas_connected.fetch_sub(1, Ordering::Release);
-                        // Clear active flag — journal stage stops publishing
-                        // to this ring. Must happen before clearing evict.
-                        active_flags[i].store(false, Ordering::Release);
-                        // Reset per-slot metrics for the disconnected replica.
+                        // Reset per-slot metrics BEFORE clearing the active
+                        // flag so a reader that observes active=false also
+                        // observes the zeroed cursors via the Release pair.
+                        // Reversing this order would leave a window on weak-
+                        // memory architectures (ARM/AArch64) where a reader
+                        // sees active=true (stale) paired with cursor=0
+                        // (fresh) — see `evaluate_durability` and the B2
+                        // notes in `docs/durability-policy-followups.md`.
                         metrics.acked_sequence[i].store(0, Ordering::Relaxed);
                         metrics.in_memory_sequence[i].store(0, Ordering::Relaxed);
                         metrics.catching_up[i].store(false, Ordering::Relaxed);
+                        // Clear active flag — journal stage stops publishing
+                        // to this ring. Must happen before clearing evict.
+                        active_flags[i].store(false, Ordering::Release);
                         // Clear eviction flag after reclaiming the consumer.
                         if evict_flags[i].load(Ordering::Relaxed) {
                             evict_flags[i].store(false, Ordering::Release);

@@ -427,6 +427,7 @@ pub fn run_sender_rumcast(
                         &replication_cursor,
                         &fastest_replica_cursor,
                         replicas_connected,
+                        &metrics,
                     );
                 }
             }
@@ -735,6 +736,7 @@ impl SlotState {
         replication_cursor: &Arc<AtomicU64>,
         fastest_replica_cursor: &Arc<AtomicU64>,
         replicas_connected: &AtomicU32,
+        metrics: &ReplicationMetrics,
     ) {
         let (sid_opt, was_live) = match &self.phase {
             SlotPhase::Empty => (None, false),
@@ -752,6 +754,13 @@ impl SlotState {
             muxed_receiver.evict(sid);
             auth_states.remove(&sid);
         }
+        // Zero per-slot metrics BEFORE clearing the active flag. The
+        // active_flag Release publishes these Relaxed stores together
+        // — without this ordering a reader could observe `active=true`
+        // (stale) paired with a freshly-zeroed cursor on weak-memory
+        // architectures. See B2 in the follow-ups doc.
+        metrics.acked_sequence[self.slot_idx].store(0, Ordering::Relaxed);
+        metrics.in_memory_sequence[self.slot_idx].store(0, Ordering::Relaxed);
         // Clear the active flag so the journal stage stops publishing
         // into this slot's ring before we fast-forward the consumer.
         self.active_flag.store(false, Ordering::Release);
@@ -791,7 +800,6 @@ impl SlotState {
         heartbeat_interval: Duration,
         shutdown: &AtomicBool,
     ) -> bool {
-        let _ = metrics;
         let mut did_work = false;
 
         // Eviction: journal stage couldn't publish to this slot's ring
@@ -806,6 +814,7 @@ impl SlotState {
                 replication_cursor,
                 fastest_replica_cursor,
                 replicas_connected,
+                metrics,
             );
             self.evict_flag.store(false, Ordering::Release);
             return false;
@@ -828,6 +837,7 @@ impl SlotState {
                 replication_cursor,
                 fastest_replica_cursor,
                 replicas_connected,
+                metrics,
             );
             return false;
         }
@@ -931,6 +941,7 @@ impl SlotState {
                                 replication_cursor,
                                 fastest_replica_cursor,
                                 replicas_connected,
+                                metrics,
                             );
                             return;
                         }
