@@ -157,15 +157,16 @@ pub struct Exchange {
     max_orders_per_second: u32,
     max_orders_burst: u32,
     /// Per-account token-bucket state for the rate limiter. Lazily inserted
-    /// on the first *submission attempt* (not first rest) per account; entries
-    /// persist for the life of the process (no eviction). Memory bound is
-    /// "every account that ever submitted at least one order" — strictly a
-    /// superset of `order_counts.len()` because a submission can populate a
-    /// bucket and then reject downstream (e.g. InsufficientBalance, NoLiquidity).
-    /// In practice, an exchange's ever-active-account count is what dominates;
-    /// online eviction is intentionally deferred (it would need `now_ns` at
-    /// every release site to safely confirm the bucket is genuinely at burst,
-    /// and we don't carry it through cancel/expire/end-of-day today).
+    /// on the first *submission attempt* (not first rest) per account, and
+    /// evicted on the close path (`release_open_order`) once the account's
+    /// open-order count reaches zero AND the bucket has refilled to full
+    /// capacity at the current event time. See [`Exchange::try_evict_bucket`]
+    /// for the policy and why "at full capacity" makes the eviction
+    /// observationally equivalent to keeping the entry.
+    ///
+    /// Steady-state size therefore tracks accounts currently inside a
+    /// throttle window (or holding open orders), not the cumulative ever-
+    /// active account count.
     ///
     /// Empty when `max_orders_per_second == 0` or `max_orders_burst == 0`
     /// (limiter disabled). HashMap4 for the same reason as `order_counts`:
@@ -220,8 +221,12 @@ impl TokenBucket {
         }
     }
 
-    /// Refill the bucket based on elapsed time, then attempt to consume
-    /// one token. Returns `true` if the order is allowed.
+    /// Refill the bucket based on elapsed time, but do not consume.
+    /// Used both by [`Self::refill_and_consume`] (the order-submission
+    /// path) and by the bucket-eviction probe in
+    /// [`Exchange::try_evict_bucket`], which needs to know whether a
+    /// quiet account has converged back to full capacity without
+    /// charging a token for the privilege.
     ///
     /// Integer math only — no floats — for cross-platform determinism.
     /// The refill formula is `earned = elapsed_ns * rate / 1e9`. Two cases:
@@ -240,13 +245,14 @@ impl TokenBucket {
     ///    accumulates across calls — a 1000 ord/s bucket polled twice
     ///    600 µs apart correctly issues exactly one token, not zero.
     #[inline]
-    fn refill_and_consume(&mut self, now_ns: u64, rate: u32, burst: u32) -> bool {
+    fn refill(&mut self, now_ns: u64, rate: u32, burst: u32) {
         // Clock can only go forward in our timeline (event ts_ns is
         // assigned by the reader at ingest and journaled). If we ever
         // see now_ns < last_refill_ns it means the operator changed the
         // clock or there is a bug upstream — be defensive: don't panic,
-        // skip the refill, but still allow consume so we don't reject
-        // every order until time catches up.
+        // skip the refill (`refill_and_consume` will still allow consume
+        // so we don't reject every order until time catches up). Locked
+        // in by `rate_limit_clock_backwards_is_defensive_not_panic`.
         if now_ns > self.last_refill_ns {
             let elapsed = now_ns - self.last_refill_ns;
             // u128 intermediate to avoid overflow at extreme rates: at
@@ -272,6 +278,13 @@ impl TokenBucket {
             // time accumulates into the next call.
             self.tokens = new_tokens;
         }
+    }
+
+    /// Refill the bucket based on elapsed time, then attempt to consume
+    /// one token. Returns `true` if the order is allowed.
+    #[inline]
+    fn refill_and_consume(&mut self, now_ns: u64, rate: u32, burst: u32) -> bool {
+        self.refill(now_ns, rate, burst);
         if self.tokens > 0 {
             self.tokens -= 1;
             true
@@ -521,18 +534,76 @@ impl Exchange {
         self.current_event_ts_ns = now_ns;
     }
 
-    /// Called when an account's open-order count just hit zero. Removes
-    /// the per-account `order_counts` entry and — if the rate-limiter
-    /// bucket for the account is at full capacity — also drops the
-    /// bucket entry. Evicting only at full capacity preserves throttle
-    /// state for accounts that idle out mid-burst (so they can't escape
-    /// a partial throttle by cancelling everything), while keeping
-    /// long-term memory bounded for accounts that trade once and never
-    /// return. The "at full capacity" check is exact, not heuristic:
-    /// `refill_and_consume` caps at `burst`, so a bucket already at
-    /// `burst` would refill to `burst` on next access regardless of
-    /// elapsed time — the eviction is observationally equivalent to
-    /// keeping it.
+    /// Decrement `account`'s open-order count by one and, if it just
+    /// reached zero, drop the `order_counts` entry and try to evict the
+    /// rate-limiter bucket. Single chokepoint for the per-event close
+    /// paths (cancel, end-of-day, disable, GTD expiry, taker/maker
+    /// completion) so the bucket-eviction policy lives in one place.
+    /// Bulk close paths (`cancel_all`) decrement by N and call
+    /// [`Self::try_evict_bucket`] directly.
+    #[inline]
+    fn release_open_order(&mut self, account: AccountId) {
+        let Some(count) = self.order_counts.get_mut(&account) else {
+            return;
+        };
+        *count = count.saturating_sub(1);
+        if *count == 0 {
+            self.order_counts.remove(&account);
+            self.try_evict_bucket(account);
+        }
+    }
+
+    /// Drop the rate-limiter bucket for `account` if (and only if) it
+    /// has refilled back to full capacity at the current event time.
+    ///
+    /// Eviction is observationally equivalent to keeping a full bucket:
+    /// a fresh bucket created on the next submission is initialised at
+    /// burst (`TokenBucket::new`), and `refill` caps at burst, so an
+    /// existing bucket at capacity would itself refill to burst on
+    /// next access regardless of elapsed time. Buckets below capacity
+    /// are *not* evicted — that would let an account escape a partial
+    /// throttle by cancelling all its orders and trigger a free fresh
+    /// burst on its next submission.
+    ///
+    /// Memory-bound rationale: without this hook, `order_buckets`
+    /// would grow with every account that ever submitted an order
+    /// (`order_counts` releases its entry, `order_buckets` does not),
+    /// turning the limiter into a slow memory leak proportional to
+    /// total ever-active accounts. With it, the steady-state size
+    /// tracks accounts currently inside a throttle window, which is
+    /// what an operator would expect to pay for.
+    ///
+    /// Determinism: uses `current_event_ts_ns` (stamped by `apply` and
+    /// also by `drain_due_scheduled_tasks`), so the eviction decision
+    /// reproduces bit-for-bit on every replica replaying the same
+    /// journal — the snapshot's bucket-map shape is part of the
+    /// replicated state.
+    #[inline]
+    fn try_evict_bucket(&mut self, account: AccountId) {
+        let burst = self.max_orders_burst;
+        let rate = self.max_orders_per_second;
+        // Limiter disabled (either knob is zero). Two reasons to skip:
+        //   (a) The hot path never inserts into the bucket map when
+        //       disabled, so the common case is "map is empty, lookup
+        //       wasted."
+        //   (b) Deactivation transitions in `set_max_orders_per_second`
+        //       *preserve* buckets so the operator can re-enable with
+        //       the same values without losing per-account throttle
+        //       state. Cleaning up on close-zero would silently erode
+        //       that preserved state.
+        if rate == 0 || burst == 0 {
+            return;
+        }
+        let now_ns = self.current_event_ts_ns;
+        let Some(bucket) = self.order_buckets.get_mut(&account) else {
+            return;
+        };
+        bucket.refill(now_ns, rate, burst);
+        if bucket.tokens >= burst as u64 {
+            self.order_buckets.remove(&account);
+        }
+    }
+
     /// Current count of open orders (resting limits + pending stops +
     /// in-flight) for `account`, across all instruments. Returns `0` if
     /// the account has never traded. Used by proptests and admin queries
@@ -548,12 +619,24 @@ impl Exchange {
         self.scheduled_tasks.len()
     }
 
+    /// Live rate-limiter bucket count. Test-only helper for asserting
+    /// bucket-eviction behaviour (B1).
+    #[cfg(test)]
+    pub(crate) fn order_bucket_count(&self) -> usize {
+        self.order_buckets.len()
+    }
+
     /// Drain every scheduled task whose `fire_ns <= now_ns`. Called at the
     /// head of every event the matching stage processes, so time-driven work
     /// runs in lockstep with the journal. Tombstones — tasks that point to
     /// orders that have already been cancelled or filled — are silently
     /// dropped via the `find_gtd_expiry` lookup.
     pub fn drain_due_scheduled_tasks(&mut self, now_ns: u64, reports: &mut Vec<ExecutionReport>) {
+        // `tick` reaches us without going through `Application::apply`,
+        // so stamp the event clock here too — the bucket-eviction probe
+        // in `release_open_order` reads `current_event_ts_ns` and would
+        // otherwise see a stale stamp from the previous `apply` call.
+        self.current_event_ts_ns = now_ns;
         while let Some(task) = self.scheduled_tasks.pop_due(now_ns) {
             match task.kind {
                 ScheduledTaskKind::ExpireOrder {
@@ -574,12 +657,7 @@ impl Exchange {
                     if let Some((_side, slot)) = inst.book.cancel(account, order_id, reports) {
                         self.accounts.release(slot);
                         self.live_order_ids.remove(&(account, order_id));
-                        if let Some(count) = self.order_counts.get_mut(&account) {
-                            *count = count.saturating_sub(1);
-                            if *count == 0 {
-                                self.order_counts.remove(&account);
-                            }
-                        }
+                        self.release_open_order(account);
                     }
                 }
             }
@@ -1359,13 +1437,8 @@ impl Exchange {
         // plus the taker if it didn't rest). Both maps are kept in
         // lockstep — they have to agree on "which orders are live."
         for &(account, order_id) in &freed {
-            if let Some(count) = self.order_counts.get_mut(&account) {
-                *count = count.saturating_sub(1);
-                if *count == 0 {
-                    self.order_counts.remove(&account);
-                }
-            }
             self.live_order_ids.remove(&(account, order_id));
+            self.release_open_order(account);
         }
 
         // Schedule GTD expiry if the order rested (limit) or is now pending
@@ -1409,6 +1482,7 @@ impl Exchange {
                 *count = count.saturating_sub(n_cancelled as u32);
                 if *count == 0 {
                     self.order_counts.remove(&account);
+                    self.try_evict_bucket(account);
                 }
             }
         }
@@ -1424,15 +1498,14 @@ impl Exchange {
 
             inst.book.cancel_day_orders(reports);
 
-            for (account, order_id, _, slot) in inst.book.drain_consumed_slots() {
+            // Collect before iterating so the `inst` mutable borrow is
+            // released before we re-borrow `self` via `release_open_order`.
+            let consumed: Vec<(AccountId, OrderId, Side, ReservationSlot)> =
+                inst.book.drain_consumed_slots().collect();
+            for (account, order_id, _, slot) in consumed {
                 self.accounts.release(slot);
                 self.live_order_ids.remove(&(account, order_id));
-                if let Some(count) = self.order_counts.get_mut(&account) {
-                    *count = count.saturating_sub(1);
-                    if *count == 0 {
-                        self.order_counts.remove(&account);
-                    }
-                }
+                self.release_open_order(account);
             }
         }
     }
@@ -1451,16 +1524,15 @@ impl Exchange {
 
         inst.book.cancel_all_orders(reports);
 
-        // Release reservations — same pattern as end_of_day.
-        for (account, order_id, _, slot) in inst.book.drain_consumed_slots() {
+        // Release reservations — same pattern as end_of_day. Collect
+        // before iterating so the `inst` borrow is released before
+        // re-borrowing `self` via `release_open_order`.
+        let consumed: Vec<(AccountId, OrderId, Side, ReservationSlot)> =
+            inst.book.drain_consumed_slots().collect();
+        for (account, order_id, _, slot) in consumed {
             self.accounts.release(slot);
             self.live_order_ids.remove(&(account, order_id));
-            if let Some(count) = self.order_counts.get_mut(&account) {
-                *count = count.saturating_sub(1);
-                if *count == 0 {
-                    self.order_counts.remove(&account);
-                }
-            }
+            self.release_open_order(account);
         }
 
         reports.push(ExecutionReport::InstrumentStatusChanged {
@@ -1533,12 +1605,7 @@ impl Exchange {
         if let Some((_side, slot)) = inst.book.cancel(account, order_id, reports) {
             self.accounts.release(slot);
             self.live_order_ids.remove(&(account, order_id));
-            if let Some(count) = self.order_counts.get_mut(&account) {
-                *count = count.saturating_sub(1);
-                if *count == 0 {
-                    self.order_counts.remove(&account);
-                }
-            }
+            self.release_open_order(account);
         }
     }
 
@@ -10836,6 +10903,204 @@ mod tests {
             ),
             "expected ExceedsOrderRate after burst exhausted with backwards clock, got {:?}",
             reports[0],
+        );
+    }
+
+    /// Place a far-from-market GTD limit order that will rest (never match)
+    /// and expire at `expiry_ns`. Used by the eviction tests to control
+    /// when the close-path runs (via `drain_due_scheduled_tasks`).
+    fn submit_resting_gtd(
+        exchange: &mut Exchange,
+        now_ns: u64,
+        account: AccountId,
+        order_id: u64,
+        expiry_ns: u64,
+        reports: &mut Vec<ExecutionReport>,
+    ) {
+        execute_at(
+            exchange,
+            now_ns,
+            Symbol(1),
+            Order {
+                id: OrderId(order_id),
+                account,
+                side: Side::Buy,
+                order_type: OrderType::Limit {
+                    price: price(50),
+                    post_only: false,
+                },
+                quantity: qty(1),
+                time_in_force: TimeInForce::GTD,
+                stp: SelfTradeProtection::Allow,
+                expiry_ns,
+            },
+            reports,
+        );
+    }
+
+    #[test]
+    fn rate_limit_bucket_evicted_when_idle_account_refills_to_full() {
+        // Memory bound: the bucket map must drain entries for accounts
+        // whose buckets have refilled to capacity AND have no open
+        // orders left. Otherwise `order_buckets` grows monotonically
+        // with every ever-active account.
+        //
+        // Driving the close path via GTD expiry lets us advance the
+        // event clock past the refill window in a single step:
+        // `drain_due_scheduled_tasks` stamps `current_event_ts_ns`
+        // before invoking the eviction probe.
+        let mut exchange = Exchange::new();
+        exchange.set_max_orders_per_second(100, 2);
+        exchange.add_instrument(btc_usd_spec());
+        exchange.deposit(ACCT_A, USD, 1_000_000);
+        let mut reports = Vec::new();
+        submit_resting_gtd(
+            &mut exchange,
+            1_000_000_000,
+            ACCT_A,
+            1,
+            1_100_000_000,
+            &mut reports,
+        );
+        assert_eq!(exchange.order_bucket_count(), 1);
+        // Drain past expiry + well past the 20ms refill window for burst=2
+        // at 100/s. Eviction probe sees an at-capacity bucket and removes it.
+        exchange.drain_due_scheduled_tasks(10_000_000_000, &mut reports);
+        assert_eq!(exchange.open_order_count(ACCT_A), 0);
+        assert_eq!(
+            exchange.order_bucket_count(),
+            0,
+            "at-capacity bucket on a closed account should be evicted",
+        );
+    }
+
+    #[test]
+    fn rate_limit_bucket_not_evicted_when_below_capacity() {
+        // The eviction policy is "at full capacity" — partial buckets
+        // must stay so an account can't escape an in-progress throttle
+        // by cancelling all its orders. Without this guard, a hot
+        // account could cycle submit → cancel → fresh-burst-on-next.
+        let mut exchange = Exchange::new();
+        exchange.set_max_orders_per_second(100, 2);
+        exchange.add_instrument(btc_usd_spec());
+        exchange.deposit(ACCT_A, USD, 1_000_000);
+        let mut reports = Vec::new();
+        // Submit consumes one token (bucket: 2→1). Cancel runs the
+        // eviction probe at the same timestamp — refill earns 0 tokens,
+        // bucket stays at 1, NOT evicted.
+        execute_at(
+            &mut exchange,
+            1_000_000_000,
+            Symbol(1),
+            limit_order(1, ACCT_A, Side::Buy, 100, 1, TimeInForce::GTC),
+            &mut reports,
+        );
+        exchange.set_current_event_ts_ns(1_000_000_000);
+        exchange.cancel(Symbol(1), ACCT_A, OrderId(1), &mut reports);
+        assert_eq!(exchange.open_order_count(ACCT_A), 0);
+        assert_eq!(
+            exchange.order_bucket_count(),
+            1,
+            "partial bucket must survive close-to-zero so the throttle holds",
+        );
+    }
+
+    #[test]
+    fn rate_limit_eviction_is_observationally_equivalent_to_full_bucket() {
+        // The "evict only at capacity" rule is justified by saying a
+        // fresh post-eviction bucket is observationally identical to a
+        // kept full bucket. Lock in that contract: after eviction, an
+        // account must see exactly the same accept/reject sequence as
+        // it would if its bucket had been preserved.
+        let mut exchange = Exchange::new();
+        exchange.set_max_orders_per_second(100, 2);
+        exchange.add_instrument(btc_usd_spec());
+        exchange.deposit(ACCT_A, USD, 1_000_000);
+        let mut reports = Vec::new();
+        submit_resting_gtd(
+            &mut exchange,
+            1_000_000_000,
+            ACCT_A,
+            1,
+            1_100_000_000,
+            &mut reports,
+        );
+        exchange.drain_due_scheduled_tasks(10_000_000_000, &mut reports);
+        assert_eq!(exchange.order_bucket_count(), 0, "precondition: evicted");
+
+        // First two submits at a fresh timestamp must accept (full burst);
+        // the third at the same timestamp must reject — same as if a
+        // kept-but-refilled bucket had been at capacity.
+        reports.clear();
+        for i in 0..2u64 {
+            execute_at(
+                &mut exchange,
+                10_000_000_000,
+                Symbol(1),
+                limit_order(2 + i, ACCT_A, Side::Buy, 100 + i, 1, TimeInForce::GTC),
+                &mut reports,
+            );
+        }
+        assert!(
+            !reports
+                .iter()
+                .any(|r| matches!(r, ExecutionReport::Rejected { .. })),
+            "post-eviction first-touch should see full burst, got {reports:?}",
+        );
+        reports.clear();
+        execute_at(
+            &mut exchange,
+            10_000_000_000,
+            Symbol(1),
+            limit_order(99, ACCT_A, Side::Buy, 200, 1, TimeInForce::GTC),
+            &mut reports,
+        );
+        assert!(
+            matches!(
+                reports[0],
+                ExecutionReport::Rejected {
+                    reason: RejectReason::ExceedsOrderRate,
+                    ..
+                }
+            ),
+            "third order must throttle: got {:?}",
+            reports[0],
+        );
+    }
+
+    #[test]
+    fn rate_limit_bucket_preserved_across_disable_reenable() {
+        // `set_max_orders_per_second(0, _)` is a "deactivation" transition
+        // that intentionally preserves bucket state for re-activation.
+        // The eviction probe must respect that — otherwise an account
+        // that closes its last order during the disabled window silently
+        // loses its preserved throttle state, defeating the documented
+        // contract.
+        let mut exchange = Exchange::new();
+        exchange.set_max_orders_per_second(100, 2);
+        exchange.add_instrument(btc_usd_spec());
+        exchange.deposit(ACCT_A, USD, 1_000_000);
+        let mut reports = Vec::new();
+        // Drive bucket below capacity so we can detect erosion.
+        execute_at(
+            &mut exchange,
+            1_000_000_000,
+            Symbol(1),
+            limit_order(1, ACCT_A, Side::Buy, 100, 1, TimeInForce::GTC),
+            &mut reports,
+        );
+        let buckets_before = exchange.order_bucket_count();
+        assert_eq!(buckets_before, 1);
+        // Deactivate. Per `set_max_orders_per_second` doc: buckets preserved.
+        exchange.set_max_orders_per_second(0, 0);
+        // Now run a close path that would otherwise evict. The probe
+        // must short-circuit on `rate == 0` and leave the bucket alone.
+        exchange.set_current_event_ts_ns(2_000_000_000);
+        exchange.cancel(Symbol(1), ACCT_A, OrderId(1), &mut reports);
+        assert_eq!(
+            exchange.order_bucket_count(),
+            1,
+            "deactivation preserves buckets — close path must not erode them",
         );
     }
 }
