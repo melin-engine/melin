@@ -108,4 +108,5 @@ fi
 
 echo ""
 echo "=== Deployment complete. Connecting... ==="
-exec command ssh "${SSH_OPTS[@]}" -t "$REMOTE" "cd ~/workspace/melin && exec bash --login"
+unset -f ssh scp
+exec ssh "${SSH_OPTS[@]}" -t "$REMOTE" "cd ~/workspace/melin && exec bash --login"
