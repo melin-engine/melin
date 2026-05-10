@@ -62,10 +62,19 @@ pub struct Handshake {
     pub chain_hash: [u8; 32],
 }
 
-/// Ack message sent by the replica after durable write.
+/// Ack message sent by the replica.
+///
+/// Carries two cursors so the primary's response gate can evaluate
+/// multi-level durability policies (see `crate::durability_policy`):
+///
+/// - `acked_sequence` — highest sequence persisted on the replica
+///   (`O_DIRECT` `pwrite` returned, durable behind PLP).
+/// - `in_memory_sequence` — highest sequence the replica has accepted
+///   into its pipeline pre-journal. Always `>= acked_sequence`.
 #[derive(Debug, Clone, Copy)]
 pub struct Ack {
     pub acked_sequence: u64,
+    pub in_memory_sequence: u64,
 }
 
 /// Messages from primary to replica.
@@ -131,6 +140,7 @@ struct HandshakeFrame {
 struct AckFrame {
     tag: u8,
     acked_sequence: U64,
+    in_memory_sequence: U64,
 }
 
 #[derive(FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned)]
@@ -183,7 +193,7 @@ struct StreamStartHeader {
 }
 
 const _: () = assert!(core::mem::size_of::<HandshakeFrame>() == 41);
-const _: () = assert!(core::mem::size_of::<AckFrame>() == 9);
+const _: () = assert!(core::mem::size_of::<AckFrame>() == 17);
 const _: () = assert!(core::mem::size_of::<ChallengeFrame>() == 33);
 const _: () = assert!(core::mem::size_of::<ChallengeResponseFrame>() == 97);
 const _: () = assert!(core::mem::size_of::<SnapshotBeginFrame>() == 49);
@@ -217,6 +227,7 @@ pub(super) fn encode_ack(ack: &Ack, buf: &mut Vec<u8>) {
     let frame = AckFrame {
         tag: MSG_ACK,
         acked_sequence: U64::new(ack.acked_sequence),
+        in_memory_sequence: U64::new(ack.in_memory_sequence),
     };
     let payload = frame.as_bytes();
     write_length_prefix(buf, payload.len() as u32);
@@ -430,6 +441,7 @@ pub(super) fn decode_replica_message(payload: &[u8]) -> io::Result<ReplicaMessag
                 .map_err(|_| io::Error::other("ack too short"))?;
             Ok(ReplicaMessage::Ack(Ack {
                 acked_sequence: frame.acked_sequence.get(),
+                in_memory_sequence: frame.in_memory_sequence.get(),
             }))
         }
         other => Err(io::Error::other(format!(

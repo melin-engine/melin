@@ -82,6 +82,11 @@ pub struct ReplicationMetrics {
     /// Per-slot acked sequence (last sequence the replica confirmed
     /// as durable). Used to compute per-replica replication lag.
     pub acked_sequence: [AtomicU64; 2],
+    /// Per-slot in-memory sequence (last sequence the replica has
+    /// accepted into its pipeline pre-journal). Always
+    /// `>= acked_sequence`. Used by the multi-level durability gate
+    /// (see `crate::durability_policy`).
+    pub in_memory_sequence: [AtomicU64; 2],
     /// Per-slot bytes sent to the replica (cumulative). Includes
     /// catch-up and live streaming.
     pub bytes_sent: [AtomicU64; 2],
@@ -100,6 +105,7 @@ impl Default for ReplicationMetrics {
     fn default() -> Self {
         Self {
             acked_sequence: [AtomicU64::new(0), AtomicU64::new(0)],
+            in_memory_sequence: [AtomicU64::new(0), AtomicU64::new(0)],
             bytes_sent: [AtomicU64::new(0), AtomicU64::new(0)],
             ack_latency_us: [AtomicU64::new(0), AtomicU64::new(0)],
             catching_up: [AtomicBool::new(false), AtomicBool::new(false)],
@@ -622,6 +628,7 @@ mod tests {
     fn ack_encode_decode_round_trip() {
         let ack = Ack {
             acked_sequence: 1000,
+            in_memory_sequence: 1024,
         };
         let mut buf = Vec::new();
         encode_ack(&ack, &mut buf);
@@ -631,6 +638,7 @@ mod tests {
         match msg {
             ReplicaMessage::Ack(a) => {
                 assert_eq!(a.acked_sequence, 1000);
+                assert_eq!(a.in_memory_sequence, 1024);
             }
             _ => panic!("expected Ack"),
         }
@@ -998,6 +1006,7 @@ mod tests {
             // Send ack.
             let ack = Ack {
                 acked_sequence: end_seq,
+                in_memory_sequence: end_seq,
             };
             encode_ack(&ack, &mut buf);
             writer.write_all(&buf).unwrap();
@@ -1139,6 +1148,7 @@ mod tests {
                 encode_ack(
                     &Ack {
                         acked_sequence: end_seq,
+                        in_memory_sequence: end_seq,
                     },
                     &mut buf,
                 );
