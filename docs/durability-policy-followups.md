@@ -29,23 +29,6 @@ Fix: add a floor syntax — e.g. `persisted>=3 best_effort_floor=2`
 CLI flag with a default that prevents single-node fallback. Pair with
 parse-time validation that `floor <= count`.
 
-### Focused regression tests for the P0 races
-
-The failover suite covers the broad disconnect/reconnect scenarios
-that exposed B1 (just-connected gate freeze) and B2 (disconnect-side
-memory-model race), but neither has a focused unit test in
-`response.rs` that simulates the exact race conditions (active=true
-with cursors=0, the disconnect-window pairing). Adding those would
-harden the bugfixes against future refactors that might re-introduce
-the underlying ordering issues.
-
-### Parser fuzz target
-
-`--durability-policy` is operator-facing input. Worth adding a
-`cargo fuzz` or `proptest` target on `durability_policy::parse` to
-catch any future panics, integer overflows, or unbounded allocations
-from malformed input.
-
 ---
 
 ## P3 — Commercial polish
