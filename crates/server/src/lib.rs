@@ -61,6 +61,10 @@ pub mod affinity;
 /// AmortizedTimer is used by the shadow stage's clock-check amortization
 /// and by the replication sender. Always compiled.
 pub(crate) mod amortized_timer;
+/// Configurable durability ack policy. Pure logic — defines the
+/// `Level` / `Clause` / `Policy` types and a string parser used by
+/// the response stage's gate. No threading or I/O concerns.
+pub mod durability_policy;
 /// Firehose event publisher — trading-only because it depends on
 /// `melin-market-data` for book-mirror snapshots.
 #[cfg(all(feature = "trading", not(feature = "noop")))]
