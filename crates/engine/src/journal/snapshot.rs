@@ -823,8 +823,17 @@ fn decode_exchange_state(
         Vec::new()
     };
 
+    // For each `if version >= N` section below, the encoder always
+    // writes at least a 4-byte length (zero entries is a length-0
+    // section, not an absent section). A missing section therefore
+    // means physical truncation — surface that as `TruncatedEntry`
+    // via `check`, never silently substitute an empty vec. Only the
+    // current `SNAP_VERSION` is reachable through `load()` today; the
+    // `version >=` gates are kept here so a future cross-version load
+    // path can opt into older shapes without re-deriving the layout.
+
     // Disabled instruments (v12+).
-    let disabled_instruments = if version >= 12 && pos < buf.len() {
+    let disabled_instruments = if version >= 12 {
         check(pos, 4)?;
         let n = le::get_u32(&buf[pos..]) as usize;
         pos += 4;
@@ -843,7 +852,7 @@ fn decode_exchange_state(
 
     // Fee-account deficits (v16+). Per-currency u64 amounts the fee
     // account owes for rebates paid in excess of accumulated revenue.
-    let fee_account_deficits = if version >= 16 && pos < buf.len() {
+    let fee_account_deficits = if version >= 16 {
         check(pos, 4)?;
         let n = le::get_u32(&buf[pos..]) as usize;
         pos += 4;
@@ -864,7 +873,7 @@ fn decode_exchange_state(
 
     // Per-account rate-limiter bucket state (v18+, SEC-04). Each entry
     // is account(4) + tokens(8) + last_refill_ns(8) = 20 bytes.
-    let order_buckets = if version >= 18 && pos < buf.len() {
+    let order_buckets = if version >= 18 {
         check(pos, 4)?;
         let n = le::get_u32(&buf[pos..]) as usize;
         pos += 4;
@@ -2172,6 +2181,39 @@ mod tests {
             ),
             "restored bucket lost throttle state: {after:?}",
         );
+    }
+
+    /// A v18 snapshot whose bucket section is missing — physically
+    /// truncated mid-stream — must fail decode rather than silently
+    /// returning empty buckets. The pre-SF2 guard
+    /// `if version >= 18 && pos < buf.len()` swallowed truncation as
+    /// "no entries", which would let a corrupt snapshot restore an
+    /// exchange that diverges from the primary on the very next event.
+    #[test]
+    fn truncated_v18_snapshot_payload_errors_instead_of_emptying_buckets() {
+        let mut exchange = Exchange::new();
+        exchange.set_max_orders_per_second(1_000, 5);
+        exchange.add_instrument(btc_usd_spec());
+        exchange.deposit(ACCT_A, USD, 1_000_000);
+        let mut reports = Vec::new();
+        exchange.set_current_event_ts_ns(1_000_000_000);
+        exchange.execute(
+            Symbol(1),
+            limit_order(1, ACCT_A, Side::Buy, 100, 1),
+            &mut reports,
+        );
+
+        // Encode, then strip the trailing rate-limiter bucket section
+        // (length u32 + 1 entry of 20 bytes = 24 bytes). The truncated
+        // payload looks valid up to the bucket boundary, mirroring a
+        // real on-disk truncation.
+        let full = encode_exchange_payload(&exchange);
+        let truncated = &full[..full.len() - 24];
+        match decode_exchange_payload(truncated, SNAP_VERSION) {
+            Err(JournalError::TruncatedEntry) => {}
+            Err(other) => panic!("expected TruncatedEntry, got {other:?}"),
+            Ok(_) => panic!("truncated v18 payload must not decode silently as empty"),
+        }
     }
 
     /// SEC-04 v18+: `set_max_orders_per_second` must NOT clear bucket
