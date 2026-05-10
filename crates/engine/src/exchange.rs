@@ -39,24 +39,15 @@ fn inst_mut(
         .and_then(|o| o.as_deref_mut())
 }
 
-/// Compute the effective max fee rate from a fee schedule. Takes the
-/// maximum of (0, maker_fee_bps, taker_fee_bps), clamping negatives
-/// (rebates) to 0. Used to size the reservation fee cushion.
+/// Compute the required reservation for a buy-side order at a known
+/// price: `price * qty` in quote currency. Pure notional — fees are
+/// settled from the fill's received asset (industry-standard model),
+/// not from the reservation. Uses u128 to avoid overflow.
 #[inline]
-fn max_fee_bps(fees: &FeeSchedule) -> u16 {
-    0i16.max(fees.maker_fee_bps)
-        .max(0i16.max(fees.taker_fee_bps)) as u16
-}
-
-/// Compute the required reservation for a buy-side order at a known price,
-/// including fee cushion: `price * qty * (10_000 + max_fee_bps) / 10_000`.
-/// Uses u128 to avoid overflow.
-#[inline]
-fn required_with_fee(price: u64, qty: u64, max_fee_bps: u16) -> u64 {
+fn required_notional(price: u64, qty: u64) -> u64 {
     let cost = price as u128 * qty as u128;
-    let fee_cushion = cost * max_fee_bps as u128 / 10_000;
     // Saturate to u64::MAX — identical to try_reserve behavior.
-    (cost + fee_cushion).min(u64::MAX as u128) as u64
+    cost.min(u64::MAX as u128) as u64
 }
 
 /// All per-instrument state in one struct for cache-friendly single-lookup
@@ -445,69 +436,14 @@ impl Exchange {
             return;
         };
 
-        let old_max = max_fee_bps(&inst.fee_schedule);
-        let new_max = max_fee_bps(&schedule);
+        // Under the received-asset fee model, reservations are pure
+        // notional and don't depend on the schedule — a fee change
+        // simply takes effect on subsequent fills, with no need to
+        // re-reserve resting orders or recompute stop-market budgets.
+        // `reports` is unused here but kept in the signature so callers
+        // (and journal replay) don't need to branch on the return shape.
+        let _ = reports;
         inst.fee_schedule = schedule;
-
-        if old_max == new_max {
-            return;
-        }
-
-        // Collect buy-side orders that need re-reservation, with their
-        // reservation slot captured directly during the walk.
-        // (account, order_id, reservation_slot, new_required_amount)
-        let mut to_adjust: Vec<(AccountId, OrderId, ReservationSlot, u64)> = Vec::new();
-
-        // Resting limit buys (bids).
-        inst.book.bids().for_each_order(|price, order| {
-            let new_required = required_with_fee(price.get(), order.remaining().get(), new_max);
-            to_adjust.push((
-                order.account(),
-                order.id(),
-                order.reservation(),
-                new_required,
-            ));
-        });
-
-        // Pending stop-limit buys (have a known limit_price).
-        inst.book.stop_buys().for_each_stop(|stop| {
-            if let Some(limit_price) = stop.limit_price() {
-                let new_required =
-                    required_with_fee(limit_price.get(), stop.quantity().get(), new_max);
-                to_adjust.push((stop.account(), stop.id(), stop.reservation(), new_required));
-            }
-        });
-
-        // Adjust reservations. Cancel orders that can't afford the new fee.
-        let mut to_cancel: Vec<(AccountId, OrderId)> = Vec::new();
-        for &(account, order_id, slot, new_required) in &to_adjust {
-            if self
-                .accounts
-                .try_adjust_reservation(slot, new_required)
-                .is_err()
-            {
-                to_cancel.push((account, order_id));
-            }
-        }
-
-        // Cancel underfunded orders.
-        for (account, order_id) in to_cancel {
-            if let Some((_side, slot)) = inst.book.cancel(account, order_id, reports) {
-                self.accounts.release(slot);
-                self.live_order_ids.remove(&(account, order_id));
-                if let Some(count) = self.order_counts.get_mut(&account) {
-                    *count = count.saturating_sub(1);
-                    if *count == 0 {
-                        self.order_counts.remove(&account);
-                    }
-                }
-            }
-        }
-
-        // Adjust quote_budget on pending buy stop-market orders.
-        let accounts = &self.accounts;
-        inst.book
-            .adjust_stop_buy_budgets(new_max, |slot| accounts.reservation_remaining(slot));
     }
 
     /// Snapshot the fee schedules for serialization.
@@ -775,13 +711,11 @@ impl Exchange {
             return;
         }
 
-        // Reserve funds before submitting to the matching engine.
-        // Include a fee cushion for buy-side limit orders so fees can be
-        // charged from the reservation even at the exact limit price.
-        // Only positive fees need a reservation cushion — rebates (negative)
-        // don't require upfront funds.
-        let max_fee_bps = max_fee_bps(&inst.fee_schedule);
-        let (reserved, slot) = match self.accounts.try_reserve(&order, &spec, max_fee_bps) {
+        // Reserve pure notional (no fee cushion). Fees are settled from
+        // the fill's received asset, not from this reservation, so a
+        // schedule change after placement can never make the reservation
+        // insufficient — by construction.
+        let (reserved, slot) = match self.accounts.try_reserve(&order, &spec) {
             Ok(result) => result,
             Err(reason) => {
                 reports.push(ExecutionReport::Rejected {
@@ -794,24 +728,13 @@ impl Exchange {
             }
         };
 
-        // For buy-side market/stop-market orders, pass a cost budget so the
-        // matching engine stops before exceeding what the reservation can
-        // cover (cost + fees). Limit and stop-limit buys don't need this —
-        // their cost is bounded by price × quantity and the reservation
-        // already includes the fee cushion.
-        //
-        // When fees are active, the budget must leave room for the fee:
-        //   cost + floor(cost × fee_bps / 10_000) ≤ reserved
-        // ⟹ cost ≤ floor(reserved × 10_000 / (10_000 + fee_bps))
+        // For buy-side market/stop-market orders, pass a cost budget so
+        // the matching engine stops before exceeding the reservation. The
+        // budget is exactly the reservation amount — no fee carve-out
+        // needed since fees come out of the buyer's base credit, not the
+        // quote reservation.
         let quote_budget = match (order.side, order.order_type) {
-            (Side::Buy, OrderType::Market) | (Side::Buy, OrderType::Stop { .. }) => {
-                if max_fee_bps > 0 {
-                    let effective = reserved as u128 * 10_000 / (10_000 + max_fee_bps as u128);
-                    Some(effective as u64)
-                } else {
-                    Some(reserved)
-                }
-            }
+            (Side::Buy, OrderType::Market) | (Side::Buy, OrderType::Stop { .. }) => Some(reserved),
             _ => None,
         };
 
@@ -831,8 +754,11 @@ impl Exchange {
             inst_mut(&mut self.instruments, symbol).expect("instrument verified to exist above");
         let taker_rested = inst.book.execute(order, quote_budget, slot, reports);
 
-        // Compute fees on fills before balance updates.
-        apply_fees(&mut reports[report_start..], &inst.fee_schedule);
+        // Capture the fee schedule for use inside the loop (we need
+        // `maker_side` to attribute maker_fee/taker_fee to base vs quote
+        // legs, so fees must be computed alongside the maker/taker slot
+        // lookup rather than in a separate pre-pass).
+        let fee_schedule = inst.fee_schedule;
 
         // Process reports to update balances. Mirrors the old process_reports
         // logic but resolves slots from the book instead of a separate HashMap.
@@ -846,8 +772,8 @@ impl Exchange {
         // Used to avoid double-free and to decrement order_counts.
         let mut freed: Vec<(AccountId, OrderId)> = Vec::new();
 
-        for report in &reports[report_start..] {
-            match *report {
+        for report in &mut reports[report_start..] {
+            match report {
                 ExecutionReport::Fill {
                     maker_order_id,
                     taker_order_id,
@@ -859,6 +785,14 @@ impl Exchange {
                     maker_fee,
                     taker_fee,
                 } => {
+                    // Dereference for clarity; the `&mut` references are
+                    // used only to write maker_fee/taker_fee below.
+                    let maker_order_id = *maker_order_id;
+                    let taker_order_id = *taker_order_id;
+                    let maker_account = *maker_account;
+                    let fill_taker_account = *fill_taker_account;
+                    let price = *price;
+                    let quantity = *quantity;
                     // Resolve maker slot: consumed list (fully filled) or
                     // order_index (partially filled, still on book).
                     let maker_info = consumed
@@ -900,17 +834,52 @@ impl Exchange {
                         }
                     };
 
-                    let (buyer_slot, seller_slot, buyer_fee, seller_fee) = match maker_side {
-                        Side::Buy => (maker_slot, taker_slot, maker_fee, taker_fee),
-                        Side::Sell => (taker_slot, maker_slot, taker_fee, maker_fee),
+                    // Compute fees from the schedule. The wire-format
+                    // report carries fees in **quote currency** (cost-based)
+                    // for both legs — that's the economic value of the
+                    // fee, stable across A's received-asset settlement.
+                    // Internally, fill() takes the buyer fee in base
+                    // units and the seller fee in quote units (each
+                    // deducted from that side's received asset).
+                    let cost_i128 = price.get() as i128 * quantity.get() as i128;
+                    let qty_i128 = quantity.get() as i128;
+                    let (buyer_slot, seller_slot, buyer_fee_bps, seller_fee_bps) = match maker_side
+                    {
+                        Side::Buy => (
+                            maker_slot,
+                            taker_slot,
+                            fee_schedule.maker_fee_bps,
+                            fee_schedule.taker_fee_bps,
+                        ),
+                        Side::Sell => (
+                            taker_slot,
+                            maker_slot,
+                            fee_schedule.taker_fee_bps,
+                            fee_schedule.maker_fee_bps,
+                        ),
                     };
+                    let buyer_quote_fee_report =
+                        (cost_i128 * buyer_fee_bps as i128 / 10_000) as i64;
+                    let seller_quote_fee = (cost_i128 * seller_fee_bps as i128 / 10_000) as i64;
+                    let buyer_base_fee = (qty_i128 * buyer_fee_bps as i128 / 10_000) as i64;
+                    // Update the report fields (quote-denominated).
+                    match maker_side {
+                        Side::Buy => {
+                            *maker_fee = buyer_quote_fee_report;
+                            *taker_fee = seller_quote_fee;
+                        }
+                        Side::Sell => {
+                            *maker_fee = seller_quote_fee;
+                            *taker_fee = buyer_quote_fee_report;
+                        }
+                    }
                     self.accounts.fill(
                         buyer_slot,
                         seller_slot,
                         price,
                         quantity,
-                        buyer_fee,
-                        seller_fee,
+                        buyer_base_fee,
+                        seller_quote_fee,
                         &spec,
                     );
 
@@ -927,6 +896,8 @@ impl Exchange {
                 ExecutionReport::Cancelled {
                     order_id, account, ..
                 } => {
+                    let order_id = *order_id;
+                    let account = *account;
                     let key = (account, order_id);
                     if freed.contains(&key) {
                         continue;
@@ -945,6 +916,8 @@ impl Exchange {
                 ExecutionReport::Rejected {
                     order_id, account, ..
                 } => {
+                    let order_id = *order_id;
+                    let account = *account;
                     let key = (account, order_id);
                     if freed.contains(&key) {
                         continue;
@@ -1328,17 +1301,11 @@ impl Exchange {
             return;
         }
 
-        // 5. Adjust reservation atomically. Compute the new required amount
-        // based on the new price/quantity, including fee cushion for buys.
-        // If insufficient balance, the original reservation stays intact.
-        // Only positive fees need a reservation cushion — rebates (negative)
-        // don't require upfront funds.
+        // 5. Adjust reservation atomically. Compute the new required
+        // amount as pure notional. If insufficient balance, the original
+        // reservation stays intact.
         let new_required = match side {
-            Side::Buy => required_with_fee(
-                new_price.get(),
-                new_quantity.get(),
-                max_fee_bps(&inst.fee_schedule),
-            ),
+            Side::Buy => required_notional(new_price.get(), new_quantity.get()),
             Side::Sell => new_quantity.get(),
         };
 
@@ -1378,39 +1345,6 @@ impl Exchange {
             old_remaining,
             new_remaining: new_quantity,
         });
-    }
-}
-
-/// Compute and set maker/taker fees on Fill reports.
-///
-/// Both maker and taker fees are in quote currency (cost-based):
-///   `fee = cost * fee_bps / 10_000` where `cost = price * quantity`.
-///
-/// The buyer's fee is deducted from their reservation (which includes
-/// a fee cushion). The seller's fee is deducted from their proceeds.
-///
-/// Uses u128 intermediate to avoid overflow on `value * bps`.
-fn apply_fees(reports: &mut [ExecutionReport], fees: &FeeSchedule) {
-    if fees.maker_fee_bps == 0 && fees.taker_fee_bps == 0 {
-        return;
-    }
-
-    for report in reports.iter_mut() {
-        if let ExecutionReport::Fill {
-            price,
-            quantity,
-            maker_fee,
-            taker_fee,
-            ..
-        } = report
-        {
-            // Both fees are in quote currency (cost-based). This is the
-            // standard model used by most centralized exchanges.
-            // Signed arithmetic: negative bps = rebate (exchange pays trader).
-            let cost = price.get() as i128 * quantity.get() as i128;
-            *maker_fee = (cost * fees.maker_fee_bps as i128 / 10_000) as i64;
-            *taker_fee = (cost * fees.taker_fee_bps as i128 / 10_000) as i64;
-        }
     }
 }
 
@@ -5648,13 +5582,14 @@ mod tests {
             panic!("expected Fill");
         }
 
-        // Buyer (maker): reserved 10_020 (cost 10_000 + max fee cushion 20).
-        // Fill deducts cost (10_000) + maker_fee (10) = 10_010 from reservation.
-        // Leftover cushion (10) released: available = 50_000 - 10_020 + 10 = 39_990.
-        assert_eq!(exchange.accounts().balance(ACCT_A, USD).available, 39_990);
+        // Buyer (maker): reserved exactly cost (10_000), no fee cushion
+        // under A. Fee paid in **base** out of the 10 BTC credit:
+        // buyer_base_fee = qty × 10 bps / 10_000 = 10 × 10 / 10_000 = 0
+        // (integer truncation). So the buyer receives the full 10 BTC.
+        assert_eq!(exchange.accounts().balance(ACCT_A, USD).available, 40_000);
         assert_eq!(exchange.accounts().balance(ACCT_A, BTC).available, 10);
 
-        // Seller (taker): received cost (10_000) - taker_fee (20) = 9_980 in quote.
+        // Seller (taker): received cost - seller_quote_fee (20) = 9_980.
         assert_eq!(exchange.accounts().balance(ACCT_B, USD).available, 9_980);
         assert_eq!(exchange.accounts().balance(ACCT_B, BTC).available, 90);
     }
@@ -5764,95 +5699,37 @@ mod tests {
     }
 
     #[test]
-    fn fee_cushion_covers_actual_fee_at_rounding_boundary() {
-        // Regression test: cost=15_000, bps=3 → actual fee = 15_000*3/10_000 = 4.
-        // Old formula (cost/10_000*bps) = 1*3 = 3, which was insufficient.
-        let mut exchange = Exchange::new();
-        let btc = Symbol(1);
-        exchange.add_instrument(btc_usd_spec());
-        // Deposit just enough for cost (15_000) + correct fee cushion (4) = 15_004.
-        exchange.deposit(ACCT_A, USD, 15_004);
-        exchange.deposit(ACCT_B, BTC, 100);
-
-        let mut reports = Vec::new();
-        exchange.set_fee_schedule(
-            btc,
-            FeeSchedule {
-                maker_fee_bps: 3,
-                taker_fee_bps: 3,
-            },
-            &mut reports,
-        );
-
-        // price=150, qty=100 → cost=15_000. fee=15_000*3/10_000=4.
-        // Reservation must be 15_004 to cover cost+fee.
-        exchange.execute(
-            btc,
-            limit_order(1, ACCT_A, Side::Buy, 150, 100, TimeInForce::GTC),
-            &mut reports,
-        );
-        // Should be placed, not rejected for insufficient balance.
-        assert!(
-            matches!(reports[0], ExecutionReport::Placed { .. }),
-            "expected Placed, got {:?}",
-            reports[0]
-        );
-        reports.clear();
-
-        // Fill it.
-        exchange.execute(
-            btc,
-            limit_order(2, ACCT_B, Side::Sell, 150, 100, TimeInForce::GTC),
-            &mut reports,
-        );
-
-        let fill = reports
-            .iter()
-            .find(|r| matches!(r, ExecutionReport::Fill { .. }))
-            .unwrap();
-        if let ExecutionReport::Fill {
-            maker_fee,
-            taker_fee,
-            ..
-        } = fill
-        {
-            assert_eq!(*maker_fee, 4);
-            assert_eq!(*taker_fee, 4);
-        }
-
-        // Buyer: deposited 15_004, reserved 15_004, cost=15_000 + fee=4 = 15_004.
-        // No leftover — balance should be 0 available, 0 reserved.
-        assert_eq!(exchange.accounts().balance(ACCT_A, USD).available, 0);
-        assert_eq!(exchange.accounts().balance(ACCT_A, BTC).available, 100);
-    }
-
-    #[test]
     fn maker_rebate_negative_fee() {
-        // Negative maker fee = rebate. The maker should pay less (or receive more)
-        // than the raw cost, and the fee field should be negative.
+        use crate::account::FEE_ACCOUNT;
+
+        // Negative maker fee = rebate. Under A, the buyer (here the
+        // maker) is rebated in **base** out of their base credit.
         let mut exchange = Exchange::new();
         let btc = Symbol(1);
         exchange.add_instrument(btc_usd_spec());
-        exchange.deposit(ACCT_A, USD, 50_000);
-        exchange.deposit(ACCT_B, BTC, 100);
+        exchange.deposit(ACCT_A, USD, 200_000);
+        exchange.deposit(ACCT_B, BTC, 1_000);
+        // Pre-fund FEE_ACCOUNT in base so it can pay the rebate from
+        // available (otherwise it accumulates as deficit — also valid,
+        // but this test focuses on trader-visible balances).
+        exchange.deposit(FEE_ACCOUNT, BTC, 100);
 
-        // -10 bps maker (rebate), 20 bps taker.
+        // -1000 bps maker (10% rebate), 100 bps taker (1%). Large bps so
+        // the integer-divided fees round to non-zero values at low qty.
         let mut reports = Vec::new();
         exchange.set_fee_schedule(
             btc,
             FeeSchedule {
-                maker_fee_bps: -10,
-                taker_fee_bps: 20,
+                maker_fee_bps: -1_000,
+                taker_fee_bps: 100,
             },
             &mut reports,
         );
 
-        // Resting buy (maker) at 1000 for 10. cost = 10_000.
-        // max_fee_bps = max(0, -10).max(max(0, 20)) = 20.
-        // Reservation = 10_000 + 10_000 * 20 / 10_000 = 10_020.
+        // Resting buy (maker) at 1000 for 100. cost = 100_000.
         exchange.execute(
             btc,
-            limit_order(1, ACCT_A, Side::Buy, 1000, 10, TimeInForce::GTC),
+            limit_order(1, ACCT_A, Side::Buy, 1000, 100, TimeInForce::GTC),
             &mut reports,
         );
         reports.clear();
@@ -5860,7 +5737,7 @@ mod tests {
         // Incoming sell (taker) hits the resting buy.
         exchange.execute(
             btc,
-            limit_order(2, ACCT_B, Side::Sell, 1000, 10, TimeInForce::GTC),
+            limit_order(2, ACCT_B, Side::Sell, 1000, 100, TimeInForce::GTC),
             &mut reports,
         );
 
@@ -5874,24 +5751,33 @@ mod tests {
             ..
         } = fill
         {
-            // cost = 10_000. maker_fee = 10_000 * (-10) / 10_000 = -10 (rebate).
-            // taker_fee = 10_000 * 20 / 10_000 = 20.
-            assert_eq!(*maker_fee, -10);
-            assert_eq!(*taker_fee, 20);
+            // Wire-format report: quote-denominated fees.
+            // maker_fee = cost × -1000 / 10_000 = -10_000.
+            // taker_fee = cost × 100 / 10_000 = 1_000.
+            assert_eq!(*maker_fee, -10_000);
+            assert_eq!(*taker_fee, 1_000);
         } else {
             panic!("expected Fill");
         }
 
-        // Buyer (maker): reserved 10_020, cost=10_000, maker_fee=-10.
-        // Buyer deduction = cost + fee = 10_000 + (-10) = 9_990 from reservation.
-        // Leftover = 10_020 - 9_990 = 30 released back.
-        // available = 50_000 - 10_020 + 30 = 40_010.
-        assert_eq!(exchange.accounts().balance(ACCT_A, USD).available, 40_010);
-        assert_eq!(exchange.accounts().balance(ACCT_A, BTC).available, 10);
+        // Buyer (maker): reservation was pure cost (100_000), all
+        // consumed. Base credit = qty - buyer_base_fee where
+        // buyer_base_fee = qty × -1000 / 10_000 = -10 (rebate).
+        // So buyer receives 100 + 10 = 110 BTC.
+        assert_eq!(exchange.accounts().balance(ACCT_A, USD).available, 100_000);
+        assert_eq!(exchange.accounts().balance(ACCT_A, BTC).available, 110);
 
-        // Seller (taker): received cost - taker_fee = 10_000 - 20 = 9_980.
-        assert_eq!(exchange.accounts().balance(ACCT_B, USD).available, 9_980);
-        assert_eq!(exchange.accounts().balance(ACCT_B, BTC).available, 90);
+        // Seller (taker): received cost - seller_quote_fee = 99_000.
+        assert_eq!(exchange.accounts().balance(ACCT_B, USD).available, 99_000);
+        assert_eq!(exchange.accounts().balance(ACCT_B, BTC).available, 900);
+
+        // Fee account: paid 10 BTC rebate (100 - 10 = 90 left), gained
+        // 1_000 USD fee.
+        assert_eq!(exchange.accounts().balance(FEE_ACCOUNT, BTC).available, 90);
+        assert_eq!(
+            exchange.accounts().balance(FEE_ACCOUNT, USD).available,
+            1_000
+        );
     }
 
     // -- Post-only tests --
@@ -8522,29 +8408,37 @@ mod tests {
             ..
         } = fill
         {
+            // Wire-format report: quote-denominated.
+            // maker_fee = cost × 10 bps = 1, taker_fee = cost × 20 bps = 2.
             assert_eq!(*maker_fee, 1);
             assert_eq!(*taker_fee, 2);
         }
 
-        // Fee account should have maker_fee + taker_fee = 3 USD.
-        let fee_bal = exchange.accounts().balance(FEE_ACCOUNT, USD);
+        // Under A, fees go to FEE_ACCOUNT in the **received asset** of
+        // each leg: buyer (taker) is rebated/charged in BASE, seller
+        // (maker) is rebated/charged in QUOTE.
+        // buyer_base_fee = qty × 20 bps = 10×20/10_000 = 0 (truncates).
+        // seller_quote_fee = cost × 10 bps = 1_000×10/10_000 = 1.
+        let fee_usd = exchange.accounts().balance(FEE_ACCOUNT, USD);
+        let fee_btc = exchange.accounts().balance(FEE_ACCOUNT, BTC);
+        assert_eq!(fee_usd.available, 1, "seller fee credited in quote");
         assert_eq!(
-            fee_bal.available, 3,
-            "fee account should hold collected fees"
+            fee_btc.available, 0,
+            "buyer fee truncated to zero at this qty"
         );
 
-        // System conservation: deposited 100_000 USD, no withdrawals.
-        // system = ACCT_A(available+reserved) + ACCT_B(available) + FEE_ACCOUNT(available)
+        // System conservation: deposited 100_000 USD + 100 BTC.
         let a_bal = exchange.accounts().balance(ACCT_A, USD);
         let b_bal = exchange.accounts().balance(ACCT_B, USD);
-        let total = a_bal.available as u128
+        let total_usd = a_bal.available as u128
             + a_bal.reserved as u128
             + b_bal.available as u128
-            + fee_bal.available as u128;
-        assert_eq!(
-            total, 100_000,
-            "USD conservation: total must equal deposited"
-        );
+            + fee_usd.available as u128;
+        assert_eq!(total_usd, 100_000, "USD conservation");
+        let total_btc = exchange.accounts().balance(ACCT_A, BTC).total() as u128
+            + exchange.accounts().balance(ACCT_B, BTC).total() as u128
+            + fee_btc.available as u128;
+        assert_eq!(total_btc, 100, "BTC conservation");
     }
 
     #[test]
@@ -9362,19 +9256,16 @@ mod tests {
             &mut reports,
         );
 
-        // cost=1000, maker_fee=1, taker_fee=2 → FEE_ACCOUNT has 3 USD.
-        let fee_bal = exchange.accounts().balance(FEE_ACCOUNT, USD);
-        assert_eq!(fee_bal.available, 3);
-
-        // Withdraw 2 of the 3.
-        let result = exchange.withdraw(FEE_ACCOUNT, USD, 2);
-        assert!(result.is_ok(), "fee account withdrawal should succeed");
+        // Under A: maker is seller (quote fee), taker is buyer (base fee).
+        // seller_quote_fee = cost × 10 bps = 1, credited to FEE_ACCOUNT.USD.
+        // buyer_base_fee = qty × 20 bps = 10×20/10_000 = 0 (truncates), so
+        // FEE_ACCOUNT.BTC stays 0. Operator withdraws the USD revenue.
         let fee_bal = exchange.accounts().balance(FEE_ACCOUNT, USD);
         assert_eq!(fee_bal.available, 1);
 
-        // Withdraw the remaining 1.
+        // Withdraw the 1 USD.
         let result = exchange.withdraw(FEE_ACCOUNT, USD, 1);
-        assert!(result.is_ok());
+        assert!(result.is_ok(), "fee account withdrawal should succeed");
         let fee_bal = exchange.accounts().balance(FEE_ACCOUNT, USD);
         assert_eq!(fee_bal.available, 0);
 
@@ -9474,9 +9365,16 @@ mod tests {
             assert_eq!(*taker_fee, 100, "ETH taker fee");
         }
 
-        // Total fees: BTC(10+20) + ETH(50+100) = 180.
-        let fee_bal = exchange.accounts().balance(FEE_ACCOUNT, USD);
-        assert_eq!(fee_bal.available, 180, "aggregated fee account");
+        // Under A, fees split by currency:
+        //  BTC/USD:  seller_quote_fee (maker, 10 bps × 10_000 cost)  =   10 USD
+        //            buyer_base_fee (taker, 20 bps × 10 qty / 10_000) =   0 BTC (truncates)
+        //  ETH/USD:  seller_quote_fee (maker, 50 bps × 10_000)        =   50 USD
+        //            buyer_base_fee (taker, 100 bps × 10 / 10_000)     =   0 ETH (truncates)
+        //  Total USD = 10 + 50 = 60. ETH/BTC at FEE_ACCOUNT = 0 each.
+        let fee_usd = exchange.accounts().balance(FEE_ACCOUNT, USD);
+        assert_eq!(fee_usd.available, 60, "aggregated quote-side fees");
+        assert_eq!(exchange.accounts().balance(FEE_ACCOUNT, BTC).available, 0);
+        assert_eq!(exchange.accounts().balance(FEE_ACCOUNT, ETH).available, 0);
     }
 
     /// Post-only buy that would cross a resting sell from the SAME account
@@ -9649,9 +9547,11 @@ mod tests {
             &mut reports,
         );
 
-        // cost=10_000, maker_fee=10, taker_fee=20, fee_credit=30.
+        // Under A: seller (maker) fee in quote = cost × 10 bps = 10 USD.
+        // buyer (taker) fee in base = qty × 20 bps = 10×20/10_000 = 0
+        // (truncates). So FEE_ACCOUNT.USD = 10, FEE_ACCOUNT.BTC = 0.
         let fee_after_first = exchange.accounts().balance(FEE_ACCOUNT, USD).available;
-        assert_eq!(fee_after_first, 30);
+        assert_eq!(fee_after_first, 10);
         reports.clear();
 
         // Now switch to rebate schedule: -50 bps maker, 10 bps taker.
@@ -9677,373 +9577,46 @@ mod tests {
             &mut reports,
         );
 
-        // cost=5000, maker_fee=5000*(-50)/10_000=-25, taker_fee=5000*10/10_000=5.
-        // Net fee_credit = buyer_deducted - seller_proceeds.
-        // buyer_deducted = cost + taker_fee = 5000 + 5 = 5005.
-        // seller_proceeds = cost - maker_fee = 5000 - (-25) = 5025.
-        // fee_credit = 5005 - 5025 = -20 → FEE_ACCOUNT debited by 20.
-        let fee_after_second = exchange.accounts().balance(FEE_ACCOUNT, USD).available;
+        // cost=5000, qty=5. maker (seller) rebate: -25 USD (5000×-50/10000).
+        // taker (buyer) base fee: 5×10/10_000 = 0 BTC (truncates).
+        // FEE_ACCOUNT.USD: was 10, drained to 0, signed = -15 (deficit).
+        let fee_avail = exchange.accounts().balance(FEE_ACCOUNT, USD).available;
+        let fee_deficit = exchange.accounts().fee_account_deficit(USD);
+        assert_eq!(fee_avail, 0, "rebate drained available");
+        assert_eq!(fee_deficit, 15, "remaining 15 USD on deficit");
         assert_eq!(
-            fee_after_second,
-            fee_after_first - 20,
-            "rebate should debit fee account: had {fee_after_first}, expected {} after rebate",
-            fee_after_first - 20
+            exchange.accounts().fee_signed_balance(USD),
+            -15,
+            "signed fee balance reflects net rebate"
         );
     }
 
     // -----------------------------------------------------------------------
-    // Fee schedule re-reservation
+    // Fee schedule changes do not affect reservations (A: pure-notional)
     // -----------------------------------------------------------------------
 
     #[test]
-    fn fee_increase_adjusts_resting_buy_reservations() {
+    fn fee_schedule_change_does_not_touch_resting_reservations() {
+        // Under A, reservations are pure notional. A schedule change
+        // takes effect on subsequent fills only — no re-reservation of
+        // resting orders, no cancellations.
         let mut exchange = Exchange::new();
         let btc = Symbol(1);
         exchange.add_instrument(btc_usd_spec());
-        exchange.deposit(ACCT_A, USD, 100_000);
+        exchange.deposit(ACCT_A, USD, 1_000); // exactly cost, no cushion
 
         let mut reports = Vec::new();
-
-        // Place buy limit at price=100, qty=10. No fees → reservation = 1000.
         exchange.execute(
             btc,
             limit_order(1, ACCT_A, Side::Buy, 100, 10, TimeInForce::GTC),
             &mut reports,
         );
         assert_eq!(exchange.accounts().balance(ACCT_A, USD).reserved, 1_000);
-        assert_eq!(exchange.accounts().balance(ACCT_A, USD).available, 99_000);
-        reports.clear();
-
-        // Increase fees to 100bps (1%). Reservation should grow to 1010.
-        exchange.set_fee_schedule(
-            btc,
-            FeeSchedule {
-                maker_fee_bps: 100,
-                taker_fee_bps: 0,
-            },
-            &mut reports,
-        );
-        assert!(reports.is_empty(), "no orders cancelled");
-        assert_eq!(exchange.accounts().balance(ACCT_A, USD).reserved, 1_010);
-        assert_eq!(exchange.accounts().balance(ACCT_A, USD).available, 98_990);
-    }
-
-    #[test]
-    fn fee_increase_cancels_underfunded_orders() {
-        let mut exchange = Exchange::new();
-        let btc = Symbol(1);
-        exchange.add_instrument(btc_usd_spec());
-        // Deposit just enough for the order with no fees.
-        exchange.deposit(ACCT_A, USD, 1_000);
-
-        let mut reports = Vec::new();
-
-        // Place buy limit at price=100, qty=10. Reservation = 1000 (all funds).
-        exchange.execute(
-            btc,
-            limit_order(1, ACCT_A, Side::Buy, 100, 10, TimeInForce::GTC),
-            &mut reports,
-        );
         assert_eq!(exchange.accounts().balance(ACCT_A, USD).available, 0);
         reports.clear();
 
-        // Increase fees to 100bps. New required = 1010 > 1000 available+reserved.
-        // Order should be cancelled.
-        exchange.set_fee_schedule(
-            btc,
-            FeeSchedule {
-                maker_fee_bps: 100,
-                taker_fee_bps: 0,
-            },
-            &mut reports,
-        );
-        assert_eq!(reports.len(), 1);
-        assert!(matches!(
-            reports[0],
-            ExecutionReport::Cancelled {
-                order_id: OrderId(1),
-                ..
-            }
-        ));
-        // Balance fully released.
-        assert_eq!(exchange.accounts().balance(ACCT_A, USD).reserved, 0);
-        assert_eq!(exchange.accounts().balance(ACCT_A, USD).available, 1_000);
-    }
-
-    #[test]
-    fn fee_decrease_releases_excess_reservation() {
-        let mut exchange = Exchange::new();
-        let btc = Symbol(1);
-        exchange.add_instrument(btc_usd_spec());
-        exchange.deposit(ACCT_A, USD, 100_000);
-
-        let mut reports = Vec::new();
-
-        // Set fees to 100bps, place order. Reservation = 1010.
-        exchange.set_fee_schedule(
-            btc,
-            FeeSchedule {
-                maker_fee_bps: 100,
-                taker_fee_bps: 0,
-            },
-            &mut reports,
-        );
-        exchange.execute(
-            btc,
-            limit_order(1, ACCT_A, Side::Buy, 100, 10, TimeInForce::GTC),
-            &mut reports,
-        );
-        assert_eq!(exchange.accounts().balance(ACCT_A, USD).reserved, 1_010);
-        reports.clear();
-
-        // Decrease fees to 0. Reservation should shrink to 1000.
-        exchange.set_fee_schedule(
-            btc,
-            FeeSchedule {
-                maker_fee_bps: 0,
-                taker_fee_bps: 0,
-            },
-            &mut reports,
-        );
-        assert_eq!(exchange.accounts().balance(ACCT_A, USD).reserved, 1_000);
-        assert_eq!(exchange.accounts().balance(ACCT_A, USD).available, 99_000);
-    }
-
-    #[test]
-    fn fee_change_ignores_sell_orders() {
-        let mut exchange = Exchange::new();
-        let btc = Symbol(1);
-        exchange.add_instrument(btc_usd_spec());
-        exchange.deposit(ACCT_A, BTC, 100);
-
-        let mut reports = Vec::new();
-
-        // Place sell limit. Reservation = 10 BTC.
-        exchange.execute(
-            btc,
-            limit_order(1, ACCT_A, Side::Sell, 100, 10, TimeInForce::GTC),
-            &mut reports,
-        );
-        let reserved_before = exchange.accounts().balance(ACCT_A, BTC).reserved;
-        reports.clear();
-
-        // Change fees. Sell reservation should not change.
-        exchange.set_fee_schedule(
-            btc,
-            FeeSchedule {
-                maker_fee_bps: 500,
-                taker_fee_bps: 500,
-            },
-            &mut reports,
-        );
-        assert!(reports.is_empty());
-        assert_eq!(
-            exchange.accounts().balance(ACCT_A, BTC).reserved,
-            reserved_before
-        );
-    }
-
-    #[test]
-    fn fee_change_adjusts_stop_limit_buys() {
-        let mut exchange = Exchange::new();
-        let btc = Symbol(1);
-        exchange.add_instrument(btc_usd_spec());
-        exchange.deposit(ACCT_A, USD, 100_000);
-
-        let mut reports = Vec::new();
-
-        // Place buy stop-limit: trigger=200, limit=150, qty=10.
-        // Reservation = 150 * 10 = 1500 (no fees).
-        exchange.execute(
-            btc,
-            Order {
-                id: OrderId(1),
-                account: ACCT_A,
-                side: Side::Buy,
-                order_type: OrderType::StopLimit {
-                    trigger_price: price(200),
-                    limit_price: price(150),
-                },
-                time_in_force: TimeInForce::GTC,
-                quantity: qty(10),
-                stp: SelfTradeProtection::Allow,
-                expiry_ns: 0,
-            },
-            &mut reports,
-        );
-        assert_eq!(exchange.accounts().balance(ACCT_A, USD).reserved, 1_500);
-        reports.clear();
-
-        // Increase fees to 200bps. New reservation = 1500 + 1500*200/10000 = 1530.
-        exchange.set_fee_schedule(
-            btc,
-            FeeSchedule {
-                maker_fee_bps: 200,
-                taker_fee_bps: 0,
-            },
-            &mut reports,
-        );
-        assert!(reports.is_empty());
-        assert_eq!(exchange.accounts().balance(ACCT_A, USD).reserved, 1_530);
-    }
-
-    #[test]
-    fn fee_increase_cancels_underfunded_stop_limit_buy() {
-        let mut exchange = Exchange::new();
-        let btc = Symbol(1);
-        exchange.add_instrument(btc_usd_spec());
-        // Deposit just enough to cover the stop-limit's cost with no fees.
-        exchange.deposit(ACCT_A, USD, 1_500);
-
-        let mut reports = Vec::new();
-
-        // Place buy stop-limit: trigger=200, limit=150, qty=10.
-        // Reservation = 150 * 10 = 1_500 (no fees) — consumes all available.
-        exchange.execute(
-            btc,
-            Order {
-                id: OrderId(1),
-                account: ACCT_A,
-                side: Side::Buy,
-                order_type: OrderType::StopLimit {
-                    trigger_price: price(200),
-                    limit_price: price(150),
-                },
-                time_in_force: TimeInForce::GTC,
-                quantity: qty(10),
-                stp: SelfTradeProtection::Allow,
-                expiry_ns: 0,
-            },
-            &mut reports,
-        );
-        assert_eq!(exchange.accounts().balance(ACCT_A, USD).reserved, 1_500);
-        assert_eq!(exchange.accounts().balance(ACCT_A, USD).available, 0);
-        reports.clear();
-
-        // Increase fees to 100bps. New required = 1_515 > 1_500 and
-        // available = 0, so the top-up fails and the stop must be cancelled.
-        exchange.set_fee_schedule(
-            btc,
-            FeeSchedule {
-                maker_fee_bps: 100,
-                taker_fee_bps: 0,
-            },
-            &mut reports,
-        );
-        assert_eq!(reports.len(), 1);
-        assert!(matches!(
-            reports[0],
-            ExecutionReport::Cancelled {
-                order_id: OrderId(1),
-                ..
-            }
-        ));
-        // Reservation fully released.
-        assert_eq!(exchange.accounts().balance(ACCT_A, USD).reserved, 0);
-        assert_eq!(exchange.accounts().balance(ACCT_A, USD).available, 1_500);
-        // Order count dropped to zero — withdrawal allowed.
-        exchange.withdraw(ACCT_A, USD, 1_500).unwrap();
-    }
-
-    #[test]
-    fn fee_change_adjusts_stop_market_buy_budget() {
-        let mut exchange = Exchange::new();
-        let btc = Symbol(1);
-        exchange.add_instrument(btc_usd_spec());
-        exchange.deposit(ACCT_A, USD, 10_000);
-        exchange.deposit(ACCT_B, BTC, 100);
-
-        let mut reports = Vec::new();
-
-        // Place a sell limit to provide liquidity for the stop trigger.
-        exchange.execute(
-            btc,
-            limit_order(1, ACCT_B, Side::Sell, 100, 50, TimeInForce::GTC),
-            &mut reports,
-        );
-        reports.clear();
-
-        // Place buy stop (market): trigger=100, qty=50.
-        // Reserves entire available balance (10_000). No fees → budget = 10_000.
-        exchange.execute(
-            btc,
-            Order {
-                id: OrderId(1),
-                account: ACCT_A,
-                side: Side::Buy,
-                order_type: OrderType::Stop {
-                    trigger_price: price(100),
-                },
-                time_in_force: TimeInForce::GTC,
-                quantity: qty(50),
-                stp: SelfTradeProtection::Allow,
-                expiry_ns: 0,
-            },
-            &mut reports,
-        );
-        assert_eq!(exchange.accounts().balance(ACCT_A, USD).reserved, 10_000);
-        reports.clear();
-
-        // Increase fees to 500bps (5%). Budget should shrink to leave room:
-        // budget = 10_000 * 10_000 / (10_000 + 500) = 9523.
-        exchange.set_fee_schedule(
-            btc,
-            FeeSchedule {
-                maker_fee_bps: 0,
-                taker_fee_bps: 500,
-            },
-            &mut reports,
-        );
-        // Reservation unchanged — still 10_000.
-        assert_eq!(exchange.accounts().balance(ACCT_A, USD).reserved, 10_000);
-
-        // Trigger the stop: ACCT_B buys against the resting sell at 100,
-        // producing a trade at price=100 which triggers ACCT_A's buy stop.
-        exchange.deposit(ACCT_B, USD, 100_000);
-        exchange.execute(
-            btc,
-            limit_order(2, ACCT_B, Side::Buy, 100, 1, TimeInForce::IOC),
-            &mut reports,
-        );
-        // The stop triggers and fills against the remaining resting sell.
-        // With budget=9523 at price=100, cost=50*100=5000,
-        // fee=5000*500/10000=250. Total=5250 < 9523. Should fill fine.
-        let fills: Vec<_> = reports
-            .iter()
-            .filter(|r| matches!(r, ExecutionReport::Fill { .. }))
-            .collect();
-        assert!(fills.len() >= 2, "triggering trade + stop fill expected");
-    }
-
-    #[test]
-    fn fee_change_no_op_when_max_fee_unchanged() {
-        let mut exchange = Exchange::new();
-        let btc = Symbol(1);
-        exchange.add_instrument(btc_usd_spec());
-        exchange.deposit(ACCT_A, USD, 100_000);
-
-        let mut reports = Vec::new();
-
-        // Set fees: maker=100, taker=50. max_fee = 100.
-        exchange.set_fee_schedule(
-            btc,
-            FeeSchedule {
-                maker_fee_bps: 100,
-                taker_fee_bps: 50,
-            },
-            &mut reports,
-        );
-
-        // Place order with reservation including 100bps cushion.
-        exchange.execute(
-            btc,
-            limit_order(1, ACCT_A, Side::Buy, 100, 10, TimeInForce::GTC),
-            &mut reports,
-        );
-        let reserved_before = exchange.accounts().balance(ACCT_A, USD).reserved;
-        reports.clear();
-
-        // Change taker fee to 100 (same max). Should be a no-op for reservations.
+        // Raise fees from 0 to 100 bps. Reservations untouched, no
+        // reports emitted.
         exchange.set_fee_schedule(
             btc,
             FeeSchedule {
@@ -10052,164 +9625,8 @@ mod tests {
             },
             &mut reports,
         );
-        assert!(reports.is_empty());
-        assert_eq!(
-            exchange.accounts().balance(ACCT_A, USD).reserved,
-            reserved_before
-        );
-    }
-
-    #[test]
-    fn fee_change_then_fill_conserves_balance() {
-        // Reproduces the exact proptest scenario: place buy at 0 fees,
-        // increase fees, fill, verify no panic and balance conservation.
-        let mut exchange = Exchange::new();
-        let btc = Symbol(1);
-        exchange.add_instrument(btc_usd_spec());
-        exchange.deposit(ACCT_A, USD, 10_000);
-        exchange.deposit(ACCT_A, BTC, 100);
-
-        let mut reports = Vec::new();
-
-        // Place buy limit at price=100, qty=10 with no fees.
-        exchange.execute(
-            btc,
-            limit_order(1, ACCT_A, Side::Buy, 100, 10, TimeInForce::GTC),
-            &mut reports,
-        );
-        reports.clear();
-
-        // Increase fees to 33bps.
-        exchange.set_fee_schedule(
-            btc,
-            FeeSchedule {
-                maker_fee_bps: 33,
-                taker_fee_bps: 0,
-            },
-            &mut reports,
-        );
-        // Order should still be on book (reservation topped up).
-        assert!(reports.is_empty());
-        reports.clear();
-
-        // Fill the order with a market sell.
-        exchange.execute(
-            btc,
-            limit_order(2, ACCT_A, Side::Sell, 100, 10, TimeInForce::IOC),
-            &mut reports,
-        );
-        // Should produce fills without panicking (no debug_assert failure).
-        let fills: Vec<_> = reports
-            .iter()
-            .filter(|r| matches!(r, ExecutionReport::Fill { .. }))
-            .collect();
-        assert_eq!(fills.len(), 1);
-
-        // All reservations released.
-        assert_eq!(exchange.accounts().balance(ACCT_A, USD).reserved, 0);
-    }
-
-    #[test]
-    fn fee_increase_after_partial_fill_adjusts_remaining() {
-        let mut exchange = Exchange::new();
-        let btc = Symbol(1);
-        exchange.add_instrument(btc_usd_spec());
-        exchange.deposit(ACCT_A, USD, 10_000);
-        exchange.deposit(ACCT_B, BTC, 100);
-
-        let mut reports = Vec::new();
-
-        // Place buy limit: price=100, qty=10. Reservation = 1000 (no fees).
-        exchange.execute(
-            btc,
-            limit_order(1, ACCT_A, Side::Buy, 100, 10, TimeInForce::GTC),
-            &mut reports,
-        );
+        assert!(reports.is_empty(), "no orders cancelled or replaced");
         assert_eq!(exchange.accounts().balance(ACCT_A, USD).reserved, 1_000);
-        reports.clear();
-
-        // Partial fill: sell 3. Cost = 300. Reservation remaining = 700.
-        exchange.execute(
-            btc,
-            limit_order(1, ACCT_B, Side::Sell, 100, 3, TimeInForce::IOC),
-            &mut reports,
-        );
-        reports.clear();
-
-        // Increase fees to 100bps. Remaining qty=7, price=100.
-        // New required = 100 * 7 + 100 * 7 * 100 / 10_000 = 700 + 7 = 707.
-        // Current slot remaining = 700. Need delta = 7 from available.
-        exchange.set_fee_schedule(
-            btc,
-            FeeSchedule {
-                maker_fee_bps: 100,
-                taker_fee_bps: 0,
-            },
-            &mut reports,
-        );
-        assert!(reports.is_empty(), "order should not be cancelled");
-        assert_eq!(exchange.accounts().balance(ACCT_A, USD).reserved, 707);
-
-        // Fill the remaining 7. Should not panic (fee covered by cushion).
-        exchange.execute(
-            btc,
-            limit_order(2, ACCT_B, Side::Sell, 100, 7, TimeInForce::IOC),
-            &mut reports,
-        );
-        let fills: Vec<_> = reports
-            .iter()
-            .filter(|r| matches!(r, ExecutionReport::Fill { .. }))
-            .collect();
-        assert_eq!(fills.len(), 1);
-        assert_eq!(exchange.accounts().balance(ACCT_A, USD).reserved, 0);
-    }
-
-    #[test]
-    fn fee_increase_cancels_second_order_when_first_consumes_balance() {
-        let mut exchange = Exchange::new();
-        let btc = Symbol(1);
-        exchange.add_instrument(btc_usd_spec());
-        // Just enough for two orders with no fees, but not enough
-        // cushion for both when fees increase.
-        exchange.deposit(ACCT_A, USD, 2_000);
-
-        let mut reports = Vec::new();
-
-        // Two buy limits: 100 * 10 = 1000 each. Total reserved = 2000.
-        exchange.execute(
-            btc,
-            limit_order(1, ACCT_A, Side::Buy, 100, 10, TimeInForce::GTC),
-            &mut reports,
-        );
-        exchange.execute(
-            btc,
-            limit_order(2, ACCT_A, Side::Buy, 100, 10, TimeInForce::GTC),
-            &mut reports,
-        );
-        assert_eq!(exchange.accounts().balance(ACCT_A, USD).reserved, 2_000);
         assert_eq!(exchange.accounts().balance(ACCT_A, USD).available, 0);
-        reports.clear();
-
-        // Increase fees to 100bps. Each order now needs 1010.
-        // First order tops up (1000 → 1010, delta=10 from available — but
-        // available=0 initially). The first order's top-up fails too.
-        // Both should be cancelled.
-        exchange.set_fee_schedule(
-            btc,
-            FeeSchedule {
-                maker_fee_bps: 100,
-                taker_fee_bps: 0,
-            },
-            &mut reports,
-        );
-        // Both orders cancelled (no available balance for any cushion).
-        assert_eq!(reports.len(), 2);
-        assert!(
-            reports
-                .iter()
-                .all(|r| matches!(r, ExecutionReport::Cancelled { .. }))
-        );
-        assert_eq!(exchange.accounts().balance(ACCT_A, USD).reserved, 0);
-        assert_eq!(exchange.accounts().balance(ACCT_A, USD).available, 2_000);
     }
 }

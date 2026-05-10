@@ -13,7 +13,7 @@
 //! | Field          | Type    | Bytes | Purpose                            |
 //! |----------------|---------|-------|------------------------------------|
 //! | file_magic     | u32     | 4     | `0x534E4150` ("SNAP")              |
-//! | format_version | u16     | 2     | Current version = 15               |
+//! | format_version | u16     | 2     | Current version = 17               |
 //! | reserved       | u16     | 2     | Padding, zeroed                    |
 //! | sequence       | u64     | 8     | Journal sequence at snapshot       |
 //! | chain_hash     | [u8;32] | 32    | BLAKE3 hash chain state            |
@@ -69,7 +69,14 @@ const SNAP_MAGIC: u32 = 0x534E_4150;
 ///            now a signed ledger (`available - deficit`); rebates that
 ///            exceed `available` accumulate on `deficit` rather than
 ///            silently shortchanging the trader.
-const SNAP_VERSION: u16 = 16;
+/// v16 → v17: reservation semantics changed. Reservations now lock pure
+///            notional (no fee cushion); fees are settled from the fill's
+///            received asset (buyer pays in base out of base credit;
+///            seller pays in quote out of proceeds). v16 reservations
+///            include a fee cushion and would over-reserve when read
+///            under v17 semantics — bumping the version so old snapshots
+///            are explicitly rejected.
+const SNAP_VERSION: u16 = 17;
 
 /// Re-exports for callers that serialize the Exchange payload without the
 /// full on-disk framing — e.g. the `melin-app::Application` impl which
