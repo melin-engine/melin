@@ -240,6 +240,8 @@ fn main() {
                 busy_spin,
                 None,   // rotation: bench replica doesn't rotate
                 10_000, // max_orders_per_account: bench uses default
+                0,      // max_orders_per_second: rate limit disabled in bench
+                0,      // max_orders_burst: rate limit disabled in bench
             );
         })
         .expect("spawn run_receiver");

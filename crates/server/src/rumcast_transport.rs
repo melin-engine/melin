@@ -2137,6 +2137,8 @@ fn run_rumcast_replica(
         !config.yield_idle,
         rotation,
         config.max_orders_per_account,
+        config.max_orders_per_second,
+        config.max_orders_burst,
     )? {
         None => Ok(()), // clean shutdown
         Some((mut exchange, writer)) => {

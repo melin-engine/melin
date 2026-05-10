@@ -149,6 +149,7 @@ const REJECT_REPLICA_DISCONNECTED: u8 = 16;
 const REJECT_INVALID_EXPIRY: u8 = 17;
 const REJECT_INSTRUMENT_DISABLED: u8 = 18;
 const REJECT_EXCEEDS_MAX_OPEN_ORDERS: u8 = 19;
+const REJECT_EXCEEDS_ORDER_RATE: u8 = 20;
 
 /// Encode a request into `buf`. Returns total bytes written (length prefix + seq + tag + payload).
 ///
@@ -1469,6 +1470,7 @@ fn encode_reject_reason(reason: RejectReason) -> u8 {
         RejectReason::InvalidExpiry => REJECT_INVALID_EXPIRY,
         RejectReason::InstrumentDisabled => REJECT_INSTRUMENT_DISABLED,
         RejectReason::ExceedsMaxOpenOrders => REJECT_EXCEEDS_MAX_OPEN_ORDERS,
+        RejectReason::ExceedsOrderRate => REJECT_EXCEEDS_ORDER_RATE,
     }
 }
 
@@ -1494,6 +1496,7 @@ fn decode_reject_reason(b: u8) -> Result<RejectReason, ProtocolError> {
         REJECT_INVALID_EXPIRY => Ok(RejectReason::InvalidExpiry),
         REJECT_INSTRUMENT_DISABLED => Ok(RejectReason::InstrumentDisabled),
         REJECT_EXCEEDS_MAX_OPEN_ORDERS => Ok(RejectReason::ExceedsMaxOpenOrders),
+        REJECT_EXCEEDS_ORDER_RATE => Ok(RejectReason::ExceedsOrderRate),
         _ => Err(ProtocolError::InvalidField("reject reason")),
     }
 }

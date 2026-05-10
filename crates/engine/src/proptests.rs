@@ -1695,4 +1695,145 @@ proptest! {
             }
         }
     }
+
+    /// SEC-04: For any timed sequence of submissions on a single account,
+    /// total accepts over the spanned interval cannot exceed
+    /// `burst + ceil(elapsed_ns * rate / 1e9)` — the token-bucket capacity
+    /// theorem. Proves the limiter never silently leaks credit and never
+    /// allows more accepts than tokens issued.
+    #[test]
+    fn rate_limit_accepts_bounded_by_token_supply(
+        // Wide delta range mixes quiet periods (long gaps) with close-
+        // spaced bursts. Long gaps are what surface bookkeeping bugs
+        // (phantom credit on `last_refill_ns` after the bucket caps)
+        // because the next event's elapsed-time math uses the lag.
+        deltas in proptest::collection::vec(0u64..1_000_000_000u64, 1..=200),
+    ) {
+        // Tight burst makes the bound sensitive — every accepted token
+        // must show up against `burst + elapsed*rate/1e9`. Loose burst
+        // dilutes the signal.
+        let rate: u32 = 1_000;
+        let burst: u32 = 5;
+        let mut exchange = Exchange::new();
+        // Disable other gates so they don't shadow the rate limiter and
+        // make the count meaningful in isolation.
+        exchange.set_max_open_orders_per_account(0);
+        exchange.set_max_orders_per_second(rate, burst);
+        exchange.add_instrument(btc_usd_spec());
+        // Massive balance so InsufficientBalance never fires.
+        exchange.deposit(ACCT_A, USD, u64::MAX / 2);
+
+        let mut reports = Vec::new();
+        let mut now_ns: u64 = 0;
+        let mut accepts: u64 = 0;
+        let mut next_id: u64 = 0;
+        let start_ns = now_ns;
+
+        // IOC-only orders so each consumes exactly one rate-limit token
+        // and never rests (decoupling the test from book state).
+        for &delta in &deltas {
+            now_ns = now_ns.saturating_add(delta);
+            next_id += 1;
+            exchange.set_current_event_ts_ns(now_ns);
+            exchange.execute(
+                Symbol(1),
+                Order {
+                    id: OrderId(next_id),
+                    account: ACCT_A,
+                    side: Side::Buy,
+                    order_type: OrderType::Market,
+                    time_in_force: TimeInForce::IOC,
+                    quantity: Quantity(NonZeroU64::new(1).unwrap()),
+                    stp: SelfTradeProtection::Allow,
+                    expiry_ns: 0,
+                },
+                &mut reports,
+            );
+            // An accept here means the rate limiter let the order through —
+            // even if it then rejected for NoLiquidity (empty book), the
+            // *rate* gate let it pass, which is what the bound governs.
+            let rate_rejected = reports.iter().any(|r| matches!(
+                r,
+                ExecutionReport::Rejected { reason: RejectReason::ExceedsOrderRate, .. }
+            ));
+            if !rate_rejected {
+                accepts += 1;
+            }
+            reports.clear();
+        }
+
+        // Token-supply bound: initial burst + tokens accumulated over
+        // elapsed time. ceil-div used because `refill_and_consume`
+        // truncates fractional tokens but still consumes one token if any
+        // are available — so the supply ceiling is the floor PLUS one
+        // token of slack from the initial bucket. We use ceil to be
+        // robustly above the implementation's accumulator.
+        let elapsed = now_ns - start_ns;
+        let refill_tokens =
+            ((elapsed as u128 * rate as u128) / 1_000_000_000u128) as u64;
+        let bound = burst as u64 + refill_tokens;
+        prop_assert!(
+            accepts <= bound,
+            "rate-limit overcommit: accepts={} bound={} elapsed_ns={}",
+            accepts, bound, elapsed,
+        );
+    }
+
+    /// SEC-04: Replay determinism. Two independent `Exchange` instances
+    /// fed the same `(now_ns, event)` sequence must produce bit-identical
+    /// accept/reject outcomes. Critical for primary↔replica consistency:
+    /// the operator-config nature of the rate limiter means a divergence
+    /// here would corrupt failover.
+    #[test]
+    fn rate_limit_replay_is_deterministic(
+        deltas in proptest::collection::vec(0u64..5_000_000u64, 1..=64),
+    ) {
+        let setup = || {
+            let mut e = Exchange::new();
+            e.set_max_open_orders_per_account(0);
+            e.set_max_orders_per_second(500, 4);
+            e.add_instrument(btc_usd_spec());
+            e.deposit(ACCT_A, USD, u64::MAX / 2);
+            e
+        };
+        let mut a = setup();
+        let mut b = setup();
+        let mut reports_a = Vec::new();
+        let mut reports_b = Vec::new();
+        let mut now_ns: u64 = 0;
+
+        for (i, delta) in deltas.iter().enumerate() {
+            now_ns = now_ns.saturating_add(*delta);
+            let order = Order {
+                id: OrderId(i as u64 + 1),
+                account: ACCT_A,
+                side: Side::Buy,
+                order_type: OrderType::Market,
+                time_in_force: TimeInForce::IOC,
+                quantity: Quantity(NonZeroU64::new(1).unwrap()),
+                stp: SelfTradeProtection::Allow,
+                expiry_ns: 0,
+            };
+            a.set_current_event_ts_ns(now_ns);
+            a.execute(Symbol(1), order, &mut reports_a);
+            b.set_current_event_ts_ns(now_ns);
+            b.execute(Symbol(1), order, &mut reports_b);
+            // Compare the rate-limiter decision specifically. (Other
+            // reports — e.g. NoLiquidity for empty-book IOC — must also
+            // match, but this assertion targets the SEC-04 outcome.)
+            let rate_a = reports_a.iter().any(|r| matches!(
+                r,
+                ExecutionReport::Rejected { reason: RejectReason::ExceedsOrderRate, .. }
+            ));
+            let rate_b = reports_b.iter().any(|r| matches!(
+                r,
+                ExecutionReport::Rejected { reason: RejectReason::ExceedsOrderRate, .. }
+            ));
+            prop_assert_eq!(rate_a, rate_b);
+            // Full report parity (counts and reject reasons must agree).
+            prop_assert_eq!(reports_a.len(), reports_b.len());
+            reports_a.clear();
+            reports_b.clear();
+        }
+    }
 }

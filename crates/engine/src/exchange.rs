@@ -130,6 +130,188 @@ pub struct Exchange {
     /// journaled event, so it is the operator's responsibility to keep it
     /// consistent across the cluster (same shape as `--authorized-keys`).
     max_open_orders_per_account: u32,
+    /// Per-account order-submission rate limit (token bucket, SEC-04).
+    /// `max_orders_per_second` is the steady-state refill rate;
+    /// `max_orders_burst` is the bucket capacity (max consecutive orders
+    /// after a quiet period). `0` for either field disables the limiter
+    /// (opt-out). Buckets are populated lazily in `order_buckets` on first
+    /// submission per account.
+    ///
+    /// Determinism note: same as the open-orders cap above — Rejected
+    /// reports are observable, so primary and every replica must run
+    /// with matching values. The bucket math uses the journaled
+    /// `ApplyCtx::now_ns` (stamped by the reader at ingest), not wall-
+    /// clock, so bit-for-bit replay holds across the cluster.
+    ///
+    /// Snapshot continuity: per-account bucket state (`tokens` +
+    /// `last_refill_ns`) is serialised in snapshot format v18+ via
+    /// [`Exchange::snapshot_order_buckets`] /
+    /// [`Exchange::restore_order_buckets`]. A replica restoring from a
+    /// snapshot taken mid-throttle sees the same bucket state the
+    /// primary had, so the very next event produces an identical
+    /// accept/reject decision — no divergence window.
+    ///
+    /// `u32` for both fields: covers the realistic operator range
+    /// (1..=10_000_000 orders/sec) without bloating the per-account
+    /// `TokenBucket` row.
+    max_orders_per_second: u32,
+    max_orders_burst: u32,
+    /// Per-account token-bucket state for the rate limiter. Lazily inserted
+    /// on the first *submission attempt* (not first rest) per account, and
+    /// evicted on the close path (`release_open_order`) once the account's
+    /// open-order count reaches zero AND the bucket has refilled to full
+    /// capacity at the current event time. See [`Exchange::try_evict_bucket`]
+    /// for the policy and why "at full capacity" makes the eviction
+    /// observationally equivalent to keeping the entry.
+    ///
+    /// Steady-state size therefore tracks accounts currently inside a
+    /// throttle window (or holding open orders), not the cumulative ever-
+    /// active account count.
+    ///
+    /// Empty when `max_orders_per_second == 0` or `max_orders_burst == 0`
+    /// (limiter disabled). HashMap4 for the same reason as `order_counts`:
+    /// fxhash on a 4-byte key is cheaper than the default hasher on the
+    /// hot path.
+    order_buckets: HashMap4<AccountId, TokenBucket>,
+    /// `now_ns` of the most recently applied event. Stashed by
+    /// [`Application::apply`](crate::application_impl) before dispatching
+    /// to per-event methods (`execute`, `cancel`, etc.) so the rate limiter
+    /// can read a deterministic clock without threading a parameter through
+    /// every public method's signature. Initialised to `0` and overwritten
+    /// every time `apply` is called — never reset between events; readers
+    /// outside `apply` see whatever the last `apply` left here.
+    ///
+    /// Footgun for direct callers (tests, embedded users): if the rate
+    /// limiter is active (`max_orders_per_second > 0 &&
+    /// max_orders_burst > 0`) and a caller invokes `Exchange::execute`
+    /// without ever calling [`Self::set_current_event_ts_ns`], the
+    /// limiter operates against a frozen `now_ns = 0` clock — buckets
+    /// don't refill, so each account hits a hard ceiling at its
+    /// initial burst. Engine-library users who never activate the rate
+    /// limiter (engine-default `max_orders_per_second == 0`) bypass
+    /// the limiter entirely and can ignore this. Test code in this
+    /// crate uses the `execute_at(exchange, now_ns, …)` helper in the
+    /// test module to wrap the stamp + execute pair; embedded users
+    /// must call `set_current_event_ts_ns` themselves before each
+    /// `execute` (or call through `Application::apply`, which stamps).
+    current_event_ts_ns: u64,
+}
+
+/// Per-account token-bucket state for the order-submission rate limiter.
+///
+/// Sized to one cache line for the inevitable cache miss on first lookup
+/// (16 B = `tokens`(8) + `last_refill_ns`(8); the rest of the line is
+/// shared with the next entry in the HashMap4 bucket).
+#[derive(Debug, Clone, Copy)]
+struct TokenBucket {
+    /// Available tokens. Decremented by 1 on every accepted order. Refilled
+    /// up to `max_orders_burst` based on `now_ns - last_refill_ns`. `u64`
+    /// rather than `u32` so the bucket capacity check is a single 64-bit
+    /// compare against the configured burst (which fits in `u32` but is
+    /// widened on read).
+    tokens: u64,
+    /// Wall-clock-equivalent timestamp (event `ts_ns`) of the last refill.
+    /// Advanced by exactly the time consumed by tokens added during the
+    /// last `refill_and_consume` call so that fractional time below one
+    /// token is preserved across calls — e.g. at 1000 ord/s, two calls
+    /// 600 µs and then 600 µs apart correctly issue exactly one token
+    /// (not zero, not two).
+    last_refill_ns: u64,
+}
+
+impl TokenBucket {
+    /// Initialize a fresh bucket: full tokens, refill clock anchored at
+    /// the current event time. First-touch sees a full burst — same shape
+    /// as a real-world reservation system (you don't penalise an account
+    /// for being newly active).
+    #[inline]
+    fn new(burst: u32, now_ns: u64) -> Self {
+        Self {
+            tokens: burst as u64,
+            last_refill_ns: now_ns,
+        }
+    }
+
+    /// Refill the bucket based on elapsed time, but do not consume.
+    /// Used both by [`Self::refill_and_consume`] (the order-submission
+    /// path) and by the bucket-eviction probe in
+    /// [`Exchange::try_evict_bucket`], which needs to know whether a
+    /// quiet account has converged back to full capacity without
+    /// charging a token for the privilege.
+    ///
+    /// Integer math only — no floats — for cross-platform determinism.
+    /// The refill formula is `earned = elapsed_ns * rate / 1e9`. Two cases:
+    ///
+    /// 1. The new token count caps at `burst` (bucket overflows). Any
+    ///    elapsed time beyond the point at which the bucket reached
+    ///    `burst` is "wasted" — there's no headroom to absorb new
+    ///    tokens — so `last_refill_ns` is snapped to `now_ns` to
+    ///    discard that idle slack. Without this snap, the wasted time
+    ///    would accumulate as phantom credit on `last_refill_ns`,
+    ///    letting subsequent close-spaced events draw the burst again
+    ///    (issuing far more tokens than `rate` supports).
+    /// 2. The new token count stays below `burst`. `last_refill_ns` is
+    ///    advanced by exactly the time corresponding to tokens earned
+    ///    (`earned * 1e9 / rate`) so sub-token fractional time
+    ///    accumulates across calls — a 1000 ord/s bucket polled twice
+    ///    600 µs apart correctly issues exactly one token, not zero.
+    #[inline]
+    fn refill(&mut self, now_ns: u64, rate: u32, burst: u32) {
+        // Defensive cap: a tampered snapshot, a primary/replica `--max-orders-burst`
+        // mismatch, or any future bug that produces `tokens > burst` would otherwise
+        // grant unbounded credit on the next event (the `now_ns > last_refill_ns`
+        // branch below can leave `tokens` untouched). Clamping at the point of use
+        // keeps the bucket invariant `tokens <= burst` independent of how the state
+        // was loaded. One cmp on the hot path.
+        if self.tokens > burst as u64 {
+            self.tokens = burst as u64;
+        }
+        // Clock can only go forward in our timeline (event ts_ns is
+        // assigned by the reader at ingest and journaled). If we ever
+        // see now_ns < last_refill_ns it means the operator changed the
+        // clock or there is a bug upstream — be defensive: don't panic,
+        // skip the refill (`refill_and_consume` will still allow consume
+        // so we don't reject every order until time catches up). Locked
+        // in by `rate_limit_clock_backwards_is_defensive_not_panic`.
+        if now_ns > self.last_refill_ns {
+            let elapsed = now_ns - self.last_refill_ns;
+            // u128 intermediate to avoid overflow at extreme rates: at
+            // u32::MAX rate × ~3.4e9 elapsed ns the product overflows u64.
+            // Pre-clamp by burst so the cast back to u64 is always safe
+            // (burst fits in u32, so `min(burst)` fits in u64).
+            let earned =
+                ((elapsed as u128 * rate as u128) / 1_000_000_000u128).min(burst as u128) as u64;
+            let new_tokens = (self.tokens + earned).min(burst as u64);
+            if new_tokens >= burst as u64 {
+                // Bucket is at capacity — discard any remaining elapsed
+                // time so phantom credit can't accumulate. See doc above.
+                self.last_refill_ns = now_ns;
+            } else if earned > 0 {
+                // Below cap and we earned tokens — advance by exactly the
+                // time those tokens consumed, preserving fractional-token
+                // time below one token's worth.
+                let consumed_ns = ((earned as u128 * 1_000_000_000u128) / rate as u128) as u64;
+                self.last_refill_ns += consumed_ns;
+            }
+            // else: earned == 0 (sub-token time elapsed, bucket below
+            // cap) — leave last_refill_ns unchanged so the fractional
+            // time accumulates into the next call.
+            self.tokens = new_tokens;
+        }
+    }
+
+    /// Refill the bucket based on elapsed time, then attempt to consume
+    /// one token. Returns `true` if the order is allowed.
+    #[inline]
+    fn refill_and_consume(&mut self, now_ns: u64, rate: u32, burst: u32) -> bool {
+        self.refill(now_ns, rate, burst);
+        if self.tokens > 0 {
+            self.tokens -= 1;
+            true
+        } else {
+            false
+        }
+    }
 }
 
 /// Default per-account open-order cap when no operator override is set.
@@ -137,6 +319,21 @@ pub struct Exchange {
 /// hundreds of resting orders × dozens of instruments) while still
 /// bounding worst-case `order_index` growth from a single rogue account.
 pub const DEFAULT_MAX_OPEN_ORDERS_PER_ACCOUNT: u32 = 10_000;
+
+/// Default per-account sustained order rate (orders/sec) when no operator
+/// override is set. `0` = limiter disabled — engine library users not going
+/// through the `melin-server` CLI start unthrottled. The CLI applies its
+/// own non-zero default (see `--max-orders-per-second` in `crates/server`),
+/// keeping production deployments protected while leaving in-process tests
+/// and embedded users unaffected. Same opt-out shape as the open-orders
+/// cap (which was switched to be on-by-default in SEC-03 because it has
+/// no time dependency; the rate limiter does, and most non-server harnesses
+/// don't advance `now_ns`).
+pub const DEFAULT_MAX_ORDERS_PER_SECOND: u32 = 0;
+/// Default per-account burst capacity (max consecutive orders after a
+/// quiet period). Paired with `DEFAULT_MAX_ORDERS_PER_SECOND = 0`, this is
+/// inert at the engine default — the CLI provides the production value.
+pub const DEFAULT_MAX_ORDERS_BURST: u32 = 0;
 
 impl Exchange {
     pub fn new() -> Self {
@@ -150,6 +347,10 @@ impl Exchange {
             instrument_pool: Vec::new(),
             presized: false,
             max_open_orders_per_account: DEFAULT_MAX_OPEN_ORDERS_PER_ACCOUNT,
+            max_orders_per_second: DEFAULT_MAX_ORDERS_PER_SECOND,
+            max_orders_burst: DEFAULT_MAX_ORDERS_BURST,
+            order_buckets: HashMap4::default(),
+            current_event_ts_ns: 0,
         }
     }
 
@@ -173,6 +374,12 @@ impl Exchange {
             instrument_pool: Vec::new(),
             presized: true,
             max_open_orders_per_account: DEFAULT_MAX_OPEN_ORDERS_PER_ACCOUNT,
+            max_orders_per_second: DEFAULT_MAX_ORDERS_PER_SECOND,
+            max_orders_burst: DEFAULT_MAX_ORDERS_BURST,
+            // Same 1M sizing as `order_counts` — bucket count tracks the
+            // active-account count.
+            order_buckets: HashMap4::with_capacity_and_hasher(1_000_000, Default::default()),
+            current_event_ts_ns: 0,
         }
     }
 
@@ -215,6 +422,14 @@ impl Exchange {
             instrument_pool,
             presized: true,
             max_open_orders_per_account: DEFAULT_MAX_OPEN_ORDERS_PER_ACCOUNT,
+            max_orders_per_second: DEFAULT_MAX_ORDERS_PER_SECOND,
+            max_orders_burst: DEFAULT_MAX_ORDERS_BURST,
+            // Match `order_counts` sizing here too.
+            order_buckets: HashMap4::with_capacity_and_hasher(
+                num_accounts.max(1_000_000),
+                Default::default(),
+            ),
+            current_event_ts_ns: 0,
         }
     }
 
@@ -253,6 +468,17 @@ impl Exchange {
             instrument_pool: Vec::new(),
             presized: false,
             max_open_orders_per_account: DEFAULT_MAX_OPEN_ORDERS_PER_ACCOUNT,
+            max_orders_per_second: DEFAULT_MAX_ORDERS_PER_SECOND,
+            max_orders_burst: DEFAULT_MAX_ORDERS_BURST,
+            // Snapshot restore: limiter starts disabled by default and
+            // the bucket map starts empty. `restore_state` calls
+            // `restore_order_buckets` after `from_parts` to repopulate
+            // from the snapshot's v18+ bucket section, and the server
+            // wiring then reapplies the operator config (which, going
+            // from disabled `(0, 0)` to active, preserves the restored
+            // buckets — see `set_max_orders_per_second`).
+            order_buckets: HashMap4::default(),
+            current_event_ts_ns: 0,
         }
     }
 
@@ -266,6 +492,137 @@ impl Exchange {
     /// Read back the configured per-account open-order cap. Test/admin only.
     pub fn max_open_orders_per_account(&self) -> u32 {
         self.max_open_orders_per_account
+    }
+
+    /// Configure the per-account order-submission rate limit (SEC-04).
+    /// Argument semantics (active values, `0` = disabled, etc.) live on
+    /// the `max_orders_per_second` / `max_orders_burst` field docs above.
+    ///
+    /// Bucket-clearing rule: existing per-account bucket state is
+    /// cleared **only** when transitioning between two active
+    /// configurations whose `(rate, burst)` values differ — the online-
+    /// reconfig case where tokens credited at the old rate could over-
+    /// credit under the new one. All other transitions preserve buckets:
+    ///
+    /// - **Initial activation** (previous config was `(0, _)` or
+    ///   `(_, 0)`, i.e. limiter was disabled): buckets that exist on
+    ///   the map can only have come from a snapshot restore via
+    ///   `restore_order_buckets`, and that is exactly the state we
+    ///   need to preserve to close the SEC-04 divergence window. A
+    ///   fresh engine with no restored buckets is unaffected.
+    /// - **Deactivation** (new config is `(0, _)` or `(_, 0)`): the
+    ///   limiter is off, so bucket contents are unobserved. Keeping
+    ///   them is harmless and avoids losing state if the operator
+    ///   later re-enables with the same values.
+    /// - **No-op reapply** (values unchanged): obviously preserve.
+    ///
+    /// Determinism: must match across primary and replicas — see the field
+    /// docs on `max_orders_per_second` / `max_orders_burst`.
+    ///
+    /// Side effect (online-reconfig path only): clearing buckets resets
+    /// every account to a full burst at next first-touch. Operators
+    /// should treat online reconfiguration as a rare, audit-logged
+    /// change — frequent re-tuning is effectively a throttle bypass.
+    /// Engine library users embedding the matching core should gate the
+    /// call behind their own auth path.
+    pub fn set_max_orders_per_second(&mut self, rate: u32, burst: u32) {
+        let was_active = self.max_orders_per_second > 0 && self.max_orders_burst > 0;
+        let will_be_active = rate > 0 && burst > 0;
+        let values_differ = rate != self.max_orders_per_second || burst != self.max_orders_burst;
+        self.max_orders_per_second = rate;
+        self.max_orders_burst = burst;
+        if was_active && will_be_active && values_differ {
+            // Online reconfig between two active configs — drop stale
+            // tokens so the new rate applies uniformly from the next
+            // event. Cheap: the limiter cleared accounts will repopulate
+            // lazily on their first post-reconfig submission.
+            self.order_buckets.clear();
+        }
+    }
+
+    /// Read back the configured rate limit `(rate_per_sec, burst)`.
+    /// Test/admin only.
+    pub fn max_orders_per_second(&self) -> (u32, u32) {
+        (self.max_orders_per_second, self.max_orders_burst)
+    }
+
+    /// Stash the current event's `now_ns` so per-event methods (`execute`,
+    /// `cancel`, …) can read a deterministic clock without each method
+    /// taking a `now_ns` parameter. Called by `Application::apply` exactly
+    /// once per event before dispatch.
+    #[inline]
+    pub(crate) fn set_current_event_ts_ns(&mut self, now_ns: u64) {
+        self.current_event_ts_ns = now_ns;
+    }
+
+    /// Decrement `account`'s open-order count by one and, if it just
+    /// reached zero, drop the `order_counts` entry and try to evict the
+    /// rate-limiter bucket. Single chokepoint for the per-event close
+    /// paths (cancel, end-of-day, disable, GTD expiry, taker/maker
+    /// completion) so the bucket-eviction policy lives in one place.
+    /// Bulk close paths (`cancel_all`) decrement by N and call
+    /// [`Self::try_evict_bucket`] directly.
+    #[inline]
+    fn release_open_order(&mut self, account: AccountId) {
+        let Some(count) = self.order_counts.get_mut(&account) else {
+            return;
+        };
+        *count = count.saturating_sub(1);
+        if *count == 0 {
+            self.order_counts.remove(&account);
+            self.try_evict_bucket(account);
+        }
+    }
+
+    /// Drop the rate-limiter bucket for `account` if (and only if) it
+    /// has refilled back to full capacity at the current event time.
+    ///
+    /// Eviction is observationally equivalent to keeping a full bucket:
+    /// a fresh bucket created on the next submission is initialised at
+    /// burst (`TokenBucket::new`), and `refill` caps at burst, so an
+    /// existing bucket at capacity would itself refill to burst on
+    /// next access regardless of elapsed time. Buckets below capacity
+    /// are *not* evicted — that would let an account escape a partial
+    /// throttle by cancelling all its orders and trigger a free fresh
+    /// burst on its next submission.
+    ///
+    /// Memory-bound rationale: without this hook, `order_buckets`
+    /// would grow with every account that ever submitted an order
+    /// (`order_counts` releases its entry, `order_buckets` does not),
+    /// turning the limiter into a slow memory leak proportional to
+    /// total ever-active accounts. With it, the steady-state size
+    /// tracks accounts currently inside a throttle window, which is
+    /// what an operator would expect to pay for.
+    ///
+    /// Determinism: uses `current_event_ts_ns` (stamped by `apply` and
+    /// also by `drain_due_scheduled_tasks`), so the eviction decision
+    /// reproduces bit-for-bit on every replica replaying the same
+    /// journal — the snapshot's bucket-map shape is part of the
+    /// replicated state.
+    #[inline]
+    fn try_evict_bucket(&mut self, account: AccountId) {
+        let burst = self.max_orders_burst;
+        let rate = self.max_orders_per_second;
+        // Limiter disabled (either knob is zero). Two reasons to skip:
+        //   (a) The hot path never inserts into the bucket map when
+        //       disabled, so the common case is "map is empty, lookup
+        //       wasted."
+        //   (b) Deactivation transitions in `set_max_orders_per_second`
+        //       *preserve* buckets so the operator can re-enable with
+        //       the same values without losing per-account throttle
+        //       state. Cleaning up on close-zero would silently erode
+        //       that preserved state.
+        if rate == 0 || burst == 0 {
+            return;
+        }
+        let now_ns = self.current_event_ts_ns;
+        let Some(bucket) = self.order_buckets.get_mut(&account) else {
+            return;
+        };
+        bucket.refill(now_ns, rate, burst);
+        if bucket.tokens >= burst as u64 {
+            self.order_buckets.remove(&account);
+        }
     }
 
     /// Current count of open orders (resting limits + pending stops +
@@ -283,12 +640,26 @@ impl Exchange {
         self.scheduled_tasks.len()
     }
 
+    /// Live rate-limiter bucket count. Used by the server's startup
+    /// path to detect a primary↔replica config mismatch after snapshot
+    /// restore (non-empty buckets paired with a disabled limiter
+    /// indicates the operator forgot to wire the rate-limit config) and
+    /// by tests to assert bucket-eviction behaviour.
+    pub fn order_bucket_count(&self) -> usize {
+        self.order_buckets.len()
+    }
+
     /// Drain every scheduled task whose `fire_ns <= now_ns`. Called at the
     /// head of every event the matching stage processes, so time-driven work
     /// runs in lockstep with the journal. Tombstones — tasks that point to
     /// orders that have already been cancelled or filled — are silently
     /// dropped via the `find_gtd_expiry` lookup.
     pub fn drain_due_scheduled_tasks(&mut self, now_ns: u64, reports: &mut Vec<ExecutionReport>) {
+        // `tick` reaches us without going through `Application::apply`,
+        // so stamp the event clock here too — the bucket-eviction probe
+        // in `release_open_order` reads `current_event_ts_ns` and would
+        // otherwise see a stale stamp from the previous `apply` call.
+        self.current_event_ts_ns = now_ns;
         while let Some(task) = self.scheduled_tasks.pop_due(now_ns) {
             match task.kind {
                 ScheduledTaskKind::ExpireOrder {
@@ -309,12 +680,7 @@ impl Exchange {
                     if let Some((_side, slot)) = inst.book.cancel(account, order_id, reports) {
                         self.accounts.release(slot);
                         self.live_order_ids.remove(&(account, order_id));
-                        if let Some(count) = self.order_counts.get_mut(&account) {
-                            *count = count.saturating_sub(1);
-                            if *count == 0 {
-                                self.order_counts.remove(&account);
-                            }
-                        }
+                        self.release_open_order(account);
                     }
                 }
             }
@@ -373,6 +739,47 @@ impl Exchange {
             .filter(|(_, hwm)| **hwm > 0)
             .map(|(&key, &hwm)| (key, hwm))
             .collect()
+    }
+
+    /// Snapshot per-account rate-limiter bucket state for serialization
+    /// (SEC-04 v18+ snapshots). Each tuple is `(account, tokens,
+    /// last_refill_ns)`. Returned in unspecified order — callers must
+    /// not depend on stability across runs.
+    ///
+    /// Without this, a replica that restored from a snapshot taken at
+    /// time T while the primary's bucket for some account A was
+    /// partially depleted would re-initialise A's bucket lazily as full
+    /// at the next event, while the primary kept the depleted state —
+    /// the divergence window flagged in the SEC-04 audit. Closing it
+    /// requires carrying the bucket map in the snapshot.
+    pub(crate) fn snapshot_order_buckets(&self) -> Vec<(AccountId, u64, u64)> {
+        self.order_buckets
+            .iter()
+            .map(|(&account, bucket)| (account, bucket.tokens, bucket.last_refill_ns))
+            .collect()
+    }
+
+    /// Repopulate the rate-limiter bucket map from a deserialised
+    /// snapshot. Called by `restore_state` after the rest of the engine
+    /// is reconstructed. Existing entries are cleared first so a stale
+    /// in-process bucket cannot survive a restore.
+    ///
+    /// Preserving exact bucket state (`tokens` + `last_refill_ns`) is
+    /// what closes the SEC-04 snapshot-divergence window: the next
+    /// event's `refill_and_consume` call will see the same elapsed-time
+    /// math the primary would have, producing identical accept/reject
+    /// decisions.
+    pub(crate) fn restore_order_buckets(&mut self, buckets: Vec<(AccountId, u64, u64)>) {
+        self.order_buckets.clear();
+        for (account, tokens, last_refill_ns) in buckets {
+            self.order_buckets.insert(
+                account,
+                TokenBucket {
+                    tokens,
+                    last_refill_ns,
+                },
+            );
+        }
     }
 
     /// Number of active instruments (for diagnostics).
@@ -781,6 +1188,34 @@ impl Exchange {
             return;
         }
 
+        // Per-account order-submission rate limit (SEC-04). Token bucket
+        // refilled at `max_orders_per_second`, capped at `max_orders_burst`,
+        // metered against the journaled event timestamp
+        // (`current_event_ts_ns`) so primary and replicas see identical
+        // accept/reject decisions. Sits next to the open-orders cap above
+        // because both are per-account policy gates that take effect
+        // *before* any reservation work — a throttled order should not
+        // perturb the slab or `order_counts`. Disabled when either knob
+        // is `0`.
+        if self.max_orders_per_second > 0 && self.max_orders_burst > 0 {
+            let now_ns = self.current_event_ts_ns;
+            let rate = self.max_orders_per_second;
+            let burst = self.max_orders_burst;
+            let bucket = self
+                .order_buckets
+                .entry(order.account)
+                .or_insert_with(|| TokenBucket::new(burst, now_ns));
+            if !bucket.refill_and_consume(now_ns, rate, burst) {
+                reports.push(ExecutionReport::Rejected {
+                    order_id: order.id,
+                    symbol,
+                    account: order.account,
+                    reason: RejectReason::ExceedsOrderRate,
+                });
+                return;
+            }
+        }
+
         // Reserve pure notional (no fee cushion). Fees are settled from
         // the fill's received asset, not from this reservation, so a
         // schedule change after placement can never make the reservation
@@ -1025,13 +1460,8 @@ impl Exchange {
         // plus the taker if it didn't rest). Both maps are kept in
         // lockstep — they have to agree on "which orders are live."
         for &(account, order_id) in &freed {
-            if let Some(count) = self.order_counts.get_mut(&account) {
-                *count = count.saturating_sub(1);
-                if *count == 0 {
-                    self.order_counts.remove(&account);
-                }
-            }
             self.live_order_ids.remove(&(account, order_id));
+            self.release_open_order(account);
         }
 
         // Schedule GTD expiry if the order rested (limit) or is now pending
@@ -1075,6 +1505,7 @@ impl Exchange {
                 *count = count.saturating_sub(n_cancelled as u32);
                 if *count == 0 {
                     self.order_counts.remove(&account);
+                    self.try_evict_bucket(account);
                 }
             }
         }
@@ -1090,15 +1521,14 @@ impl Exchange {
 
             inst.book.cancel_day_orders(reports);
 
-            for (account, order_id, _, slot) in inst.book.drain_consumed_slots() {
+            // Collect before iterating so the `inst` mutable borrow is
+            // released before we re-borrow `self` via `release_open_order`.
+            let consumed: Vec<(AccountId, OrderId, Side, ReservationSlot)> =
+                inst.book.drain_consumed_slots().collect();
+            for (account, order_id, _, slot) in consumed {
                 self.accounts.release(slot);
                 self.live_order_ids.remove(&(account, order_id));
-                if let Some(count) = self.order_counts.get_mut(&account) {
-                    *count = count.saturating_sub(1);
-                    if *count == 0 {
-                        self.order_counts.remove(&account);
-                    }
-                }
+                self.release_open_order(account);
             }
         }
     }
@@ -1117,16 +1547,15 @@ impl Exchange {
 
         inst.book.cancel_all_orders(reports);
 
-        // Release reservations — same pattern as end_of_day.
-        for (account, order_id, _, slot) in inst.book.drain_consumed_slots() {
+        // Release reservations — same pattern as end_of_day. Collect
+        // before iterating so the `inst` borrow is released before
+        // re-borrowing `self` via `release_open_order`.
+        let consumed: Vec<(AccountId, OrderId, Side, ReservationSlot)> =
+            inst.book.drain_consumed_slots().collect();
+        for (account, order_id, _, slot) in consumed {
             self.accounts.release(slot);
             self.live_order_ids.remove(&(account, order_id));
-            if let Some(count) = self.order_counts.get_mut(&account) {
-                *count = count.saturating_sub(1);
-                if *count == 0 {
-                    self.order_counts.remove(&account);
-                }
-            }
+            self.release_open_order(account);
         }
 
         reports.push(ExecutionReport::InstrumentStatusChanged {
@@ -1199,12 +1628,7 @@ impl Exchange {
         if let Some((_side, slot)) = inst.book.cancel(account, order_id, reports) {
             self.accounts.release(slot);
             self.live_order_ids.remove(&(account, order_id));
-            if let Some(count) = self.order_counts.get_mut(&account) {
-                *count = count.saturating_sub(1);
-                if *count == 0 {
-                    self.order_counts.remove(&account);
-                }
-            }
+            self.release_open_order(account);
         }
     }
 
@@ -10066,6 +10490,673 @@ mod tests {
                 .iter()
                 .any(|r| matches!(r, ExecutionReport::Rejected { .. })),
             "B should still have a slot, got {reports:?}"
+        );
+    }
+
+    // --- SEC-04: per-account order-rate limiter ---------------------------
+
+    /// Helper that submits an order at a specific event timestamp, mirroring
+    /// what `Application::apply` would do (stash `now_ns`, then dispatch).
+    /// Direct `Exchange::execute` callers bypass `apply`, so any rate-limit
+    /// test must set the timestamp explicitly.
+    fn execute_at(
+        exchange: &mut Exchange,
+        now_ns: u64,
+        symbol: Symbol,
+        order: Order,
+        reports: &mut Vec<ExecutionReport>,
+    ) {
+        exchange.set_current_event_ts_ns(now_ns);
+        exchange.execute(symbol, order, reports);
+    }
+
+    #[test]
+    fn rate_limit_default_disabled_in_engine_constructor() {
+        // The engine library default is `0/0` (disabled). The CLI in
+        // `melin-server` applies its own non-zero default; this test
+        // guards against silent flips that would break in-process users.
+        let exchange = Exchange::new();
+        assert_eq!(exchange.max_orders_per_second(), (0, 0));
+    }
+
+    #[test]
+    fn rate_limit_zero_rate_or_zero_burst_disables() {
+        // Either knob set to zero must short-circuit the limiter — even if
+        // the other is huge. This is the documented opt-out.
+        let mut exchange = Exchange::new();
+        exchange.set_max_orders_per_second(0, 1_000_000);
+        exchange.add_instrument(btc_usd_spec());
+        exchange.deposit(ACCT_A, USD, 1_000_000);
+        let mut reports = Vec::new();
+        for i in 0..50u64 {
+            execute_at(
+                &mut exchange,
+                0, // zero clock — would refill 0 tokens if active
+                Symbol(1),
+                limit_order(i + 1, ACCT_A, Side::Buy, 100 + i, 1, TimeInForce::GTC),
+                &mut reports,
+            );
+        }
+        assert!(
+            !reports
+                .iter()
+                .any(|r| matches!(r, ExecutionReport::Rejected { .. })),
+            "rate=0 should disable, got {reports:?}"
+        );
+    }
+
+    #[test]
+    fn rate_limit_first_burst_passes_then_rejects() {
+        // First-touch initialises the bucket to a full burst, so the first
+        // `burst` orders at the same timestamp all succeed; the next must
+        // reject.
+        let mut exchange = Exchange::new();
+        exchange.set_max_orders_per_second(100, 5);
+        exchange.add_instrument(btc_usd_spec());
+        exchange.deposit(ACCT_A, USD, 1_000_000);
+        let mut reports = Vec::new();
+        for i in 0..5u64 {
+            execute_at(
+                &mut exchange,
+                1_000,
+                Symbol(1),
+                limit_order(i + 1, ACCT_A, Side::Buy, 100 + i, 1, TimeInForce::GTC),
+                &mut reports,
+            );
+        }
+        assert!(
+            reports
+                .iter()
+                .all(|r| !matches!(r, ExecutionReport::Rejected { .. })),
+            "first burst should all rest, got {reports:?}"
+        );
+        reports.clear();
+        // Same timestamp — bucket is empty, no refill possible.
+        execute_at(
+            &mut exchange,
+            1_000,
+            Symbol(1),
+            limit_order(6, ACCT_A, Side::Buy, 200, 1, TimeInForce::GTC),
+            &mut reports,
+        );
+        assert_eq!(reports.len(), 1);
+        assert!(
+            matches!(
+                reports[0],
+                ExecutionReport::Rejected {
+                    reason: RejectReason::ExceedsOrderRate,
+                    ..
+                }
+            ),
+            "expected ExceedsOrderRate, got {:?}",
+            reports[0],
+        );
+        // No reservation should have been charged for the rejected order.
+        let bal = exchange.accounts().balance(ACCT_A, USD);
+        // 5 reservations × (price × qty) = 100+101+102+103+104 = 510.
+        assert_eq!(bal.reserved, 510);
+    }
+
+    #[test]
+    fn rate_limit_refill_after_elapsed_time() {
+        // Burn the burst, advance the clock past the configured rate, the
+        // bucket should refill at least one token and the next order must
+        // succeed.
+        let mut exchange = Exchange::new();
+        exchange.set_max_orders_per_second(1_000, 2);
+        exchange.add_instrument(btc_usd_spec());
+        exchange.deposit(ACCT_A, USD, 1_000_000);
+        let mut reports = Vec::new();
+        // Burn burst of 2 at t=0.
+        for i in 0..2u64 {
+            execute_at(
+                &mut exchange,
+                0,
+                Symbol(1),
+                limit_order(i + 1, ACCT_A, Side::Buy, 100 + i, 1, TimeInForce::GTC),
+                &mut reports,
+            );
+        }
+        // Confirm immediate retry rejects.
+        reports.clear();
+        execute_at(
+            &mut exchange,
+            0,
+            Symbol(1),
+            limit_order(3, ACCT_A, Side::Buy, 200, 1, TimeInForce::GTC),
+            &mut reports,
+        );
+        assert!(matches!(
+            reports[0],
+            ExecutionReport::Rejected {
+                reason: RejectReason::ExceedsOrderRate,
+                ..
+            }
+        ));
+        reports.clear();
+        // Advance 1 ms — at 1000/s, that's exactly 1 token refilled.
+        execute_at(
+            &mut exchange,
+            1_000_000, // 1 ms in ns
+            Symbol(1),
+            limit_order(4, ACCT_A, Side::Buy, 201, 1, TimeInForce::GTC),
+            &mut reports,
+        );
+        assert!(
+            !reports
+                .iter()
+                .any(|r| matches!(r, ExecutionReport::Rejected { .. })),
+            "refill should permit one more order, got {reports:?}"
+        );
+    }
+
+    #[test]
+    fn rate_limit_per_account_independent() {
+        // Capping ACCT_A must not affect ACCT_B — each account has its own
+        // bucket. Mirrors how SEC-03's open-orders cap is per-account.
+        let mut exchange = Exchange::new();
+        exchange.set_max_orders_per_second(100, 1);
+        exchange.add_instrument(btc_usd_spec());
+        exchange.deposit(ACCT_A, USD, 1_000_000);
+        exchange.deposit(ACCT_B, USD, 1_000_000);
+        let mut reports = Vec::new();
+        // ACCT_A burns its single token at t=0.
+        execute_at(
+            &mut exchange,
+            0,
+            Symbol(1),
+            limit_order(1, ACCT_A, Side::Buy, 100, 1, TimeInForce::GTC),
+            &mut reports,
+        );
+        // ACCT_A retry rejects.
+        reports.clear();
+        execute_at(
+            &mut exchange,
+            0,
+            Symbol(1),
+            limit_order(2, ACCT_A, Side::Buy, 101, 1, TimeInForce::GTC),
+            &mut reports,
+        );
+        assert!(matches!(
+            reports[0],
+            ExecutionReport::Rejected {
+                reason: RejectReason::ExceedsOrderRate,
+                ..
+            }
+        ));
+        // ACCT_B still has a full bucket.
+        reports.clear();
+        execute_at(
+            &mut exchange,
+            0,
+            Symbol(1),
+            limit_order(1, ACCT_B, Side::Buy, 102, 1, TimeInForce::GTC),
+            &mut reports,
+        );
+        assert!(
+            !reports
+                .iter()
+                .any(|r| matches!(r, ExecutionReport::Rejected { .. })),
+            "ACCT_B should be unaffected, got {reports:?}"
+        );
+    }
+
+    #[test]
+    fn rate_limit_runs_after_cap_does_not_shadow_other_rejects() {
+        // A duplicate-id order must still report DuplicateOrderId, not
+        // ExceedsOrderRate, even when the bucket is empty. The limiter
+        // sits *after* dedup and the open-orders cap, so an order that
+        // would have rejected for an order-shape reason still reports
+        // that reason.
+        let mut exchange = Exchange::new();
+        exchange.set_max_orders_per_second(100, 1);
+        exchange.add_instrument(btc_usd_spec());
+        exchange.deposit(ACCT_A, USD, 1_000_000);
+        let mut reports = Vec::new();
+        // Burn the bucket.
+        execute_at(
+            &mut exchange,
+            0,
+            Symbol(1),
+            limit_order(1, ACCT_A, Side::Buy, 100, 1, TimeInForce::GTC),
+            &mut reports,
+        );
+        reports.clear();
+        // Resubmit same id — dedup fires, NOT the rate limiter.
+        execute_at(
+            &mut exchange,
+            0,
+            Symbol(1),
+            limit_order(1, ACCT_A, Side::Buy, 100, 1, TimeInForce::GTC),
+            &mut reports,
+        );
+        assert!(matches!(
+            reports[0],
+            ExecutionReport::Rejected {
+                reason: RejectReason::DuplicateOrderId,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn rate_limit_survives_clone_via_snapshot() {
+        // The shadow snapshot stage clones via `clone_via_snapshot` and
+        // must produce the same Rejected reports as the primary —
+        // otherwise shadow validation diverges. Carry the rate config.
+        let mut exchange = Exchange::new();
+        exchange.set_max_orders_per_second(123, 7);
+        let cloned = exchange.clone_via_snapshot();
+        assert_eq!(cloned.max_orders_per_second(), (123, 7));
+    }
+
+    #[test]
+    fn rate_limit_no_phantom_credit_after_quiet_period() {
+        // Regression test for a bookkeeping bug: when a bucket caps at
+        // `burst` after a long idle gap, the wasted-while-full time must
+        // not accumulate as `last_refill_ns` lag. If it did, every
+        // subsequent close-spaced event would refill to the full burst
+        // again, letting the limiter issue far more tokens than `rate`
+        // supports. We submit `burst + 1` events with negligible spacing
+        // immediately after a 1-second idle period; the (burst+1)th must
+        // reject because the bucket can hold exactly `burst` post-quiet.
+        let mut exchange = Exchange::new();
+        let burst: u32 = 5;
+        exchange.set_max_orders_per_second(1_000, burst);
+        exchange.add_instrument(btc_usd_spec());
+        exchange.deposit(ACCT_A, USD, 1_000_000);
+        let mut reports = Vec::new();
+        // Anchor the bucket at t=0 with one event (pulls the first token).
+        execute_at(
+            &mut exchange,
+            0,
+            Symbol(1),
+            limit_order(1, ACCT_A, Side::Buy, 100, 1, TimeInForce::GTC),
+            &mut reports,
+        );
+        reports.clear();
+        // 1-second quiet period. Bucket should refill to exactly `burst`
+        // — no more, even though 1s of accumulated time at 1000/s would
+        // notionally credit 1000 tokens.
+        let post_quiet_ns: u64 = 1_000_000_000;
+        // Issue exactly `burst` events at 1ns spacing — all should accept
+        // (consuming the post-quiet refill).
+        for i in 0..burst as u64 {
+            execute_at(
+                &mut exchange,
+                post_quiet_ns + i,
+                Symbol(1),
+                limit_order(2 + i, ACCT_A, Side::Buy, 100 + i, 1, TimeInForce::GTC),
+                &mut reports,
+            );
+        }
+        assert!(
+            reports
+                .iter()
+                .all(|r| !matches!(r, ExecutionReport::Rejected { .. })),
+            "first {burst} post-quiet events must all accept, got {reports:?}",
+        );
+        reports.clear();
+        // The (burst+1)th, only `burst` ns after the first, must reject.
+        // No phantom credit — the bucket was truly empty after burning
+        // `burst` tokens.
+        execute_at(
+            &mut exchange,
+            post_quiet_ns + burst as u64,
+            Symbol(1),
+            limit_order(
+                2 + burst as u64,
+                ACCT_A,
+                Side::Buy,
+                200,
+                1,
+                TimeInForce::GTC,
+            ),
+            &mut reports,
+        );
+        assert_eq!(reports.len(), 1);
+        assert!(
+            matches!(
+                reports[0],
+                ExecutionReport::Rejected {
+                    reason: RejectReason::ExceedsOrderRate,
+                    ..
+                }
+            ),
+            "phantom-credit regression: expected ExceedsOrderRate, got {:?}",
+            reports[0],
+        );
+    }
+
+    #[test]
+    fn rate_limit_set_clears_existing_buckets() {
+        // Changing the rate config must not leave a stale bucket carrying
+        // tokens credited at the old rate.
+        let mut exchange = Exchange::new();
+        exchange.set_max_orders_per_second(100, 1);
+        exchange.add_instrument(btc_usd_spec());
+        exchange.deposit(ACCT_A, USD, 1_000_000);
+        let mut reports = Vec::new();
+        execute_at(
+            &mut exchange,
+            0,
+            Symbol(1),
+            limit_order(1, ACCT_A, Side::Buy, 100, 1, TimeInForce::GTC),
+            &mut reports,
+        );
+        // Swap policy. The bucket map is cleared so the next request
+        // re-initialises with the new burst.
+        exchange.set_max_orders_per_second(100, 3);
+        reports.clear();
+        for i in 0..3u64 {
+            execute_at(
+                &mut exchange,
+                0,
+                Symbol(1),
+                limit_order(2 + i, ACCT_A, Side::Buy, 200 + i, 1, TimeInForce::GTC),
+                &mut reports,
+            );
+        }
+        assert!(
+            !reports
+                .iter()
+                .any(|r| matches!(r, ExecutionReport::Rejected { .. })),
+            "fresh burst after policy change, got {reports:?}"
+        );
+    }
+
+    #[test]
+    fn rate_limit_clock_backwards_is_defensive_not_panic() {
+        // `now_ns` is journaled by the reader. If an operator clock step
+        // (NTP correction) ever produces an event whose timestamp is
+        // earlier than the bucket's `last_refill_ns`, the limiter must
+        // not panic and must not reject every order until time catches
+        // up — the documented behavior is "skip refill, allow consume."
+        // Locks in that contract so a future refactor of
+        // `refill_and_consume` doesn't silently regress to either panic
+        // (DoS surface) or reject (false-positive surface).
+        let mut exchange = Exchange::new();
+        exchange.set_max_orders_per_second(100, 2);
+        exchange.add_instrument(btc_usd_spec());
+        exchange.deposit(ACCT_A, USD, 1_000_000);
+        let mut reports = Vec::new();
+        // Anchor bucket at t = 1s.
+        execute_at(
+            &mut exchange,
+            1_000_000_000,
+            Symbol(1),
+            limit_order(1, ACCT_A, Side::Buy, 100, 1, TimeInForce::GTC),
+            &mut reports,
+        );
+        reports.clear();
+        // Clock jumps backward to t = 0. With burst = 2 we had one token
+        // left after the t=1s call; the t=0 call must accept (consume
+        // the remaining token), not panic and not reject.
+        execute_at(
+            &mut exchange,
+            0,
+            Symbol(1),
+            limit_order(2, ACCT_A, Side::Buy, 101, 1, TimeInForce::GTC),
+            &mut reports,
+        );
+        assert!(
+            !reports
+                .iter()
+                .any(|r| matches!(r, ExecutionReport::Rejected { .. })),
+            "clock-backwards must allow consume, got {reports:?}",
+        );
+        reports.clear();
+        // Bucket is now at zero (consumed both burst tokens). Another
+        // call at t = 0 — still no refill possible — must reject cleanly
+        // with ExceedsOrderRate (not panic, not silently accept).
+        execute_at(
+            &mut exchange,
+            0,
+            Symbol(1),
+            limit_order(3, ACCT_A, Side::Buy, 102, 1, TimeInForce::GTC),
+            &mut reports,
+        );
+        assert!(
+            matches!(
+                reports[0],
+                ExecutionReport::Rejected {
+                    reason: RejectReason::ExceedsOrderRate,
+                    ..
+                }
+            ),
+            "expected ExceedsOrderRate after burst exhausted with backwards clock, got {:?}",
+            reports[0],
+        );
+    }
+
+    /// Place a far-from-market GTD limit order that will rest (never match)
+    /// and expire at `expiry_ns`. Used by the eviction tests to control
+    /// when the close-path runs (via `drain_due_scheduled_tasks`).
+    fn submit_resting_gtd(
+        exchange: &mut Exchange,
+        now_ns: u64,
+        account: AccountId,
+        order_id: u64,
+        expiry_ns: u64,
+        reports: &mut Vec<ExecutionReport>,
+    ) {
+        execute_at(
+            exchange,
+            now_ns,
+            Symbol(1),
+            Order {
+                id: OrderId(order_id),
+                account,
+                side: Side::Buy,
+                order_type: OrderType::Limit {
+                    price: price(50),
+                    post_only: false,
+                },
+                quantity: qty(1),
+                time_in_force: TimeInForce::GTD,
+                stp: SelfTradeProtection::Allow,
+                expiry_ns,
+            },
+            reports,
+        );
+    }
+
+    #[test]
+    fn rate_limit_bucket_evicted_when_idle_account_refills_to_full() {
+        // Memory bound: the bucket map must drain entries for accounts
+        // whose buckets have refilled to capacity AND have no open
+        // orders left. Otherwise `order_buckets` grows monotonically
+        // with every ever-active account.
+        //
+        // Driving the close path via GTD expiry lets us advance the
+        // event clock past the refill window in a single step:
+        // `drain_due_scheduled_tasks` stamps `current_event_ts_ns`
+        // before invoking the eviction probe.
+        let mut exchange = Exchange::new();
+        exchange.set_max_orders_per_second(100, 2);
+        exchange.add_instrument(btc_usd_spec());
+        exchange.deposit(ACCT_A, USD, 1_000_000);
+        let mut reports = Vec::new();
+        submit_resting_gtd(
+            &mut exchange,
+            1_000_000_000,
+            ACCT_A,
+            1,
+            1_100_000_000,
+            &mut reports,
+        );
+        assert_eq!(exchange.order_bucket_count(), 1);
+        // Drain past expiry + well past the 20ms refill window for burst=2
+        // at 100/s. Eviction probe sees an at-capacity bucket and removes it.
+        exchange.drain_due_scheduled_tasks(10_000_000_000, &mut reports);
+        assert_eq!(exchange.open_order_count(ACCT_A), 0);
+        assert_eq!(
+            exchange.order_bucket_count(),
+            0,
+            "at-capacity bucket on a closed account should be evicted",
+        );
+    }
+
+    #[test]
+    fn rate_limit_bucket_not_evicted_when_below_capacity() {
+        // The eviction policy is "at full capacity" — partial buckets
+        // must stay so an account can't escape an in-progress throttle
+        // by cancelling all its orders. Without this guard, a hot
+        // account could cycle submit → cancel → fresh-burst-on-next.
+        let mut exchange = Exchange::new();
+        exchange.set_max_orders_per_second(100, 2);
+        exchange.add_instrument(btc_usd_spec());
+        exchange.deposit(ACCT_A, USD, 1_000_000);
+        let mut reports = Vec::new();
+        // Submit consumes one token (bucket: 2→1). Cancel runs the
+        // eviction probe at the same timestamp — refill earns 0 tokens,
+        // bucket stays at 1, NOT evicted.
+        execute_at(
+            &mut exchange,
+            1_000_000_000,
+            Symbol(1),
+            limit_order(1, ACCT_A, Side::Buy, 100, 1, TimeInForce::GTC),
+            &mut reports,
+        );
+        exchange.set_current_event_ts_ns(1_000_000_000);
+        exchange.cancel(Symbol(1), ACCT_A, OrderId(1), &mut reports);
+        assert_eq!(exchange.open_order_count(ACCT_A), 0);
+        assert_eq!(
+            exchange.order_bucket_count(),
+            1,
+            "partial bucket must survive close-to-zero so the throttle holds",
+        );
+    }
+
+    #[test]
+    fn rate_limit_eviction_is_observationally_equivalent_to_full_bucket() {
+        // The "evict only at capacity" rule is justified by saying a
+        // fresh post-eviction bucket is observationally identical to a
+        // kept full bucket. Lock in that contract: after eviction, an
+        // account must see exactly the same accept/reject sequence as
+        // it would if its bucket had been preserved.
+        let mut exchange = Exchange::new();
+        exchange.set_max_orders_per_second(100, 2);
+        exchange.add_instrument(btc_usd_spec());
+        exchange.deposit(ACCT_A, USD, 1_000_000);
+        let mut reports = Vec::new();
+        submit_resting_gtd(
+            &mut exchange,
+            1_000_000_000,
+            ACCT_A,
+            1,
+            1_100_000_000,
+            &mut reports,
+        );
+        exchange.drain_due_scheduled_tasks(10_000_000_000, &mut reports);
+        assert_eq!(exchange.order_bucket_count(), 0, "precondition: evicted");
+
+        // First two submits at a fresh timestamp must accept (full burst);
+        // the third at the same timestamp must reject — same as if a
+        // kept-but-refilled bucket had been at capacity.
+        reports.clear();
+        for i in 0..2u64 {
+            execute_at(
+                &mut exchange,
+                10_000_000_000,
+                Symbol(1),
+                limit_order(2 + i, ACCT_A, Side::Buy, 100 + i, 1, TimeInForce::GTC),
+                &mut reports,
+            );
+        }
+        assert!(
+            !reports
+                .iter()
+                .any(|r| matches!(r, ExecutionReport::Rejected { .. })),
+            "post-eviction first-touch should see full burst, got {reports:?}",
+        );
+        reports.clear();
+        execute_at(
+            &mut exchange,
+            10_000_000_000,
+            Symbol(1),
+            limit_order(99, ACCT_A, Side::Buy, 200, 1, TimeInForce::GTC),
+            &mut reports,
+        );
+        assert!(
+            matches!(
+                reports[0],
+                ExecutionReport::Rejected {
+                    reason: RejectReason::ExceedsOrderRate,
+                    ..
+                }
+            ),
+            "third order must throttle: got {:?}",
+            reports[0],
+        );
+    }
+
+    #[test]
+    fn rate_limit_bucket_preserved_across_disable_reenable() {
+        // `set_max_orders_per_second(0, _)` is a "deactivation" transition
+        // that intentionally preserves bucket state for re-activation.
+        // The eviction probe must respect that — otherwise an account
+        // that closes its last order during the disabled window silently
+        // loses its preserved throttle state, defeating the documented
+        // contract.
+        let mut exchange = Exchange::new();
+        exchange.set_max_orders_per_second(100, 2);
+        exchange.add_instrument(btc_usd_spec());
+        exchange.deposit(ACCT_A, USD, 1_000_000);
+        let mut reports = Vec::new();
+        // Drive bucket below capacity so we can detect erosion.
+        execute_at(
+            &mut exchange,
+            1_000_000_000,
+            Symbol(1),
+            limit_order(1, ACCT_A, Side::Buy, 100, 1, TimeInForce::GTC),
+            &mut reports,
+        );
+        let buckets_before = exchange.order_bucket_count();
+        assert_eq!(buckets_before, 1);
+        // Deactivate. Per `set_max_orders_per_second` doc: buckets preserved.
+        exchange.set_max_orders_per_second(0, 0);
+        // Now run a close path that would otherwise evict. The probe
+        // must short-circuit on `rate == 0` and leave the bucket alone.
+        exchange.set_current_event_ts_ns(2_000_000_000);
+        exchange.cancel(Symbol(1), ACCT_A, OrderId(1), &mut reports);
+        assert_eq!(
+            exchange.order_bucket_count(),
+            1,
+            "deactivation preserves buckets — close path must not erode them",
+        );
+    }
+
+    #[test]
+    fn rate_limit_refill_clamps_tokens_above_burst() {
+        // A tampered snapshot, a primary/replica burst-config mismatch,
+        // or any future bug producing `tokens > burst` must NOT grant
+        // unbounded credit. Without the clamp at the top of `refill`,
+        // a bucket with `tokens = u64::MAX` and `last_refill_ns` in the
+        // future would skip the elapsed-time branch and let the caller
+        // drain ~u64::MAX orders before reaching zero.
+        let mut bucket = TokenBucket {
+            tokens: u64::MAX,
+            // In the future relative to the call — refill's elapsed-time
+            // branch is skipped, exercising ONLY the new defensive clamp.
+            last_refill_ns: 10_000_000_000,
+        };
+        let burst: u32 = 5;
+        let rate: u32 = 100;
+        let allowed = bucket.refill_and_consume(1_000_000_000, rate, burst);
+        assert!(allowed, "first call should consume one token");
+        assert_eq!(
+            bucket.tokens,
+            burst as u64 - 1,
+            "tokens must be clamped to burst before consume",
+        );
+        // Drain the rest of the burst.
+        for _ in 0..(burst - 1) {
+            assert!(bucket.refill_and_consume(1_000_000_000, rate, burst));
+        }
+        assert!(
+            !bucket.refill_and_consume(1_000_000_000, rate, burst),
+            "after burst orders the bucket must reject — no phantom credit from u64::MAX",
         );
     }
 }

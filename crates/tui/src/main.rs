@@ -502,6 +502,7 @@ fn format_report(report: &ExecutionReport) -> String {
                 RejectReason::InvalidExpiry => "invalid expiry",
                 RejectReason::InstrumentDisabled => "instrument disabled",
                 RejectReason::ExceedsMaxOpenOrders => "exceeds max open orders",
+                RejectReason::ExceedsOrderRate => "exceeds order rate limit",
             };
             format!("REJECT  #{} ({reason_str})", order_id.0)
         }

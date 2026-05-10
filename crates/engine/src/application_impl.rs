@@ -63,6 +63,12 @@ impl Application for Exchange {
         ctx: &ApplyCtx,
         out: &mut Vec<Self::Report>,
     ) -> Option<Self::QueryResponse> {
+        // Stash the journaled event timestamp so per-event methods
+        // (`execute` and friends) can read a deterministic clock for the
+        // SEC-04 rate limiter without taking a `now_ns` parameter. Set
+        // unconditionally so the value reflects exactly the event being
+        // applied — no risk of reading a stale stamp from an earlier event.
+        self.set_current_event_ts_ns(ctx.now_ns);
         match event {
             TradingEvent::AddInstrument { spec } => {
                 self.add_instrument(spec);

@@ -742,6 +742,10 @@ pub fn run_receiver(
     // replay diverges on Rejected reports. Forwarded to every
     // freshly-constructed engine in this receiver.
     max_orders_per_account: u32,
+    // Per-account order-rate limit (SEC-04). Same determinism caveat —
+    // primary and replicas must agree on rate + burst.
+    max_orders_per_second: u32,
+    max_orders_burst: u32,
 ) -> ReceiverResult {
     use crate::App;
     use crate::JournalWriter;
@@ -767,7 +771,12 @@ pub fn run_receiver(
             let last = next.saturating_sub(1);
             let hash = engine.chain_hash().unwrap_or([0u8; 32]);
             let (mut exchange, writer) = engine.into_parts();
-            crate::server::apply_max_orders(&mut exchange, max_orders_per_account);
+            crate::server::apply_max_orders(
+                &mut exchange,
+                max_orders_per_account,
+                max_orders_per_second,
+                max_orders_burst,
+            );
             (Some(exchange), Some(writer), last, hash)
         } else {
             (None, None, 0u64, [0u8; 32])
@@ -1096,7 +1105,12 @@ pub fn run_receiver(
                 0, // events_since_checkpoint
             )?;
             let mut fresh = crate::server::empty_app();
-            crate::server::apply_max_orders(&mut fresh, max_orders_per_account);
+            crate::server::apply_max_orders(
+                &mut fresh,
+                max_orders_per_account,
+                max_orders_per_second,
+                max_orders_burst,
+            );
             exchange = Some(fresh);
             journal_writer = Some(writer);
         }

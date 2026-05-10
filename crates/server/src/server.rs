@@ -108,6 +108,27 @@ pub struct ServerConfig {
     /// replay divergence.
     #[arg(long, default_value_t = 10_000)]
     pub max_orders_per_account: u32,
+    /// Per-account sustained order-submission rate (orders/sec). Token
+    /// bucket refills at this rate; clients exceeding it (after burning
+    /// the burst) are rejected with `ExceedsOrderRate`. `0` disables the
+    /// limiter. Prevents a single client from monopolizing matching
+    /// throughput (SEC-04). Must match across primary and every replica
+    /// — same determinism caveat as `--max-orders-per-account`. Default
+    /// (1000/s) is a conservative mid-tier ceiling: comfortable for
+    /// algorithmic and retail flow, but tight for active market-makers
+    /// who routinely re-quote past 1k/s on liquid instruments. Operators
+    /// running with significant MM presence should raise this (and the
+    /// burst) to match their book's quote-update profile.
+    #[arg(long, default_value_t = 1_000)]
+    pub max_orders_per_second: u32,
+    /// Per-account burst capacity (max consecutive orders allowed after a
+    /// quiet period). Paired with `--max-orders-per-second`. `0` disables
+    /// the limiter. Default (5000) lets normal trading bursts through —
+    /// e.g. a market open or a strategy initialization batch — without
+    /// false positives, while still capping the absolute spike a single
+    /// account can produce.
+    #[arg(long, default_value_t = 5_000)]
+    pub max_orders_burst: u32,
 
     /// Address to listen for replica connections (enables synchronous replication).
     /// Mutually exclusive with `--standalone` and `--replica-of`.
@@ -366,6 +387,8 @@ impl Default for ServerConfig {
             authorized_keys: PathBuf::from("authorized_keys"),
             max_journal_mib: 256,
             max_orders_per_account: 10_000,
+            max_orders_per_second: 1_000,
+            max_orders_burst: 5_000,
 
             replication_bind: None,
             standalone: false,
@@ -636,6 +659,8 @@ pub fn run_with_shutdown<L: BlockingTransportListener>(
             !config.yield_idle,
             rotation,
             config.max_orders_per_account,
+            config.max_orders_per_second,
+            config.max_orders_burst,
         )? {
             None => return Ok(()), // clean shutdown
             Some((mut exchange, writer)) => {
@@ -1683,6 +1708,8 @@ pub fn run_dpdk(
             config.async_replica_ack,
             rotation,
             config.max_orders_per_account,
+            config.max_orders_per_second,
+            config.max_orders_burst,
         )? {
             None => return Ok(()), // clean shutdown
             Some((mut exchange, writer)) => {
@@ -2269,16 +2296,61 @@ pub fn run_dpdk(
 /// application-agnostic via the `Application` trait.
 /// Apply operator-set runtime knobs that aren't carried in the journal /
 /// snapshot. Called on every fresh / recovered / restored engine — the
-/// per-account open-order cap (SEC-03) lives in `Exchange` state but is
-/// operator policy, so primary and replicas must converge on it via
-/// configuration rather than replay.
+/// per-account open-order cap (SEC-03) and the order-submission rate
+/// limit (SEC-04) live in `Exchange` state but are operator policy, so
+/// primary and replicas must converge on them via configuration rather
+/// than replay.
 #[cfg(all(feature = "trading", not(feature = "noop")))]
-pub fn apply_max_orders(app: &mut App, max_orders_per_account: u32) {
+pub fn apply_max_orders(
+    app: &mut App,
+    max_orders_per_account: u32,
+    max_orders_per_second: u32,
+    max_orders_burst: u32,
+) {
+    // SEC-04 mismatch detection (must run BEFORE we apply the new
+    // config). Non-empty bucket map paired with a disabled limiter
+    // means we just restored a snapshot whose primary had the limiter
+    // active, but the local operator forgot to wire matching
+    // `--max-orders-per-second` / `--max-orders-burst` flags. The
+    // engine will continue accepting all orders unthrottled — silent
+    // until the replica is promoted and starts diverging from the
+    // primary's accept/reject decisions. Surface the misconfig loudly
+    // so operators catch it at startup, not on incident.
+    let restored_buckets = app.order_bucket_count();
+    let limiter_disabled = max_orders_per_second == 0 || max_orders_burst == 0;
+    if limiter_disabled && restored_buckets > 0 {
+        warn!(
+            restored_buckets,
+            max_orders_per_second,
+            max_orders_burst,
+            "SEC-04 config mismatch: snapshot carries rate-limit buckets but local limiter is \
+             disabled — primary and replica must run with matching values"
+        );
+    }
+
     app.set_max_open_orders_per_account(max_orders_per_account);
+    app.set_max_orders_per_second(max_orders_per_second, max_orders_burst);
+
+    // Visibility for operators verifying primary↔replica parity at a
+    // glance. SEC-03 cap and SEC-04 rate-limit knobs are operator
+    // policy (not journaled), so logging the applied values is the
+    // only way to confirm both processes started with the same config.
+    info!(
+        max_orders_per_account,
+        max_orders_per_second,
+        max_orders_burst,
+        "applied per-account order limits (SEC-03 cap, SEC-04 rate)"
+    );
 }
 
 #[cfg(all(feature = "noop", not(feature = "trading")))]
-pub fn apply_max_orders(_app: &mut App, _max_orders_per_account: u32) {}
+pub fn apply_max_orders(
+    _app: &mut App,
+    _max_orders_per_account: u32,
+    _max_orders_per_second: u32,
+    _max_orders_burst: u32,
+) {
+}
 
 #[cfg(all(feature = "trading", not(feature = "noop")))]
 pub(crate) fn empty_app() -> App {
@@ -2306,7 +2378,12 @@ pub(crate) fn empty_app_for_seed(config: &ServerConfig) -> App {
         config.accounts as usize,
         config.instruments as usize,
     );
-    apply_max_orders(&mut ex, config.max_orders_per_account);
+    apply_max_orders(
+        &mut ex,
+        config.max_orders_per_account,
+        config.max_orders_per_second,
+        config.max_orders_burst,
+    );
     ex
 }
 
@@ -2372,10 +2449,27 @@ pub(crate) fn init_engine(
 
     let needs_seeding = !journal_exists;
 
-    // Apply runtime config that the snapshot doesn't carry. The cap is
-    // operator policy, not journaled state, so a recovered engine starts
-    // at `DEFAULT_MAX_OPEN_ORDERS_PER_ACCOUNT` and we override here.
-    apply_max_orders(engine.app_mut(), config.max_orders_per_account);
+    // Apply runtime config knobs that the snapshot doesn't carry. The
+    // SEC-03 cap and the SEC-04 rate-limit `(rate, burst)` pair are
+    // operator policy — replica and primary converge on them via
+    // `ServerConfig`, not replay. Two notes specific to SEC-04 (v18+):
+    //   * Per-account bucket *state* (`tokens` / `last_refill_ns`) IS
+    //     journaled in the snapshot and was already restored above; this
+    //     call only re-applies the *configuration*.
+    //   * `set_max_orders_per_second` clears buckets only when the new
+    //     `(rate, burst)` differs from the existing values. A snapshot
+    //     restore leaves the engine with whatever rate-limit config the
+    //     primary had at snapshot time, so reapplying the operator's
+    //     matching config here is a no-op for buckets — the freshly
+    //     restored state is preserved. An operator mis-set that differs
+    //     from the primary's config will silently clear those buckets;
+    //     primary and replica must run with matching values.
+    apply_max_orders(
+        engine.app_mut(),
+        config.max_orders_per_account,
+        config.max_orders_per_second,
+        config.max_orders_burst,
+    );
 
     // Rotate journal if it exceeds the configured size threshold.
     // This saves a snapshot, archives the old journal, and starts

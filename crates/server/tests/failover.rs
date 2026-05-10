@@ -629,6 +629,14 @@ struct TestCluster {
 impl TestCluster {
     /// Spin up a primary + replica pair, wait for both to be healthy.
     fn start() -> Self {
+        Self::start_with_extra_args(&[])
+    }
+
+    /// Same as [`start`], but pass `extra_args` to **both** the primary
+    /// and the replica. Used by determinism-sensitive tests where the
+    /// two engines must run with matching operator policy (e.g. SEC-04
+    /// rate-limit knobs).
+    fn start_with_extra_args(extra_args: &[&str]) -> Self {
         let bin = server_bin();
         assert!(
             bin.exists(),
@@ -650,19 +658,20 @@ impl TestCluster {
         let replica_health_port = free_port();
         let replica_admin_port = free_port();
 
-        let primary = spawn_primary(
+        let primary = spawn_primary_with_extra(
             &bin,
             tmp.path(),
             &keys_path,
             primary_client_port,
             primary_health_port,
             primary_repl_port,
+            extra_args,
         );
 
         // Wait for the primary to be ready to accept replica connections.
         wait_for_primary_repl_ready(primary.health_addr, Duration::from_secs(10));
 
-        let replica = spawn_replica(
+        let replica = spawn_replica_named_with_extra(
             &bin,
             tmp.path(),
             &keys_path,
@@ -671,6 +680,8 @@ impl TestCluster {
             replica_client_port,
             replica_health_port,
             replica_admin_port,
+            "replica",
+            extra_args,
         );
 
         wait_healthy(primary.health_addr, Duration::from_secs(30));
@@ -1449,6 +1460,79 @@ impl DualCluster {
             .map(|(_, _, _, t)| t)
             .unwrap_or(false)
     }
+}
+
+/// SEC-04 cross-receiver: per-account order-rate limiter must produce
+/// identical accept/reject decisions on primary and replica. Configures
+/// a tight rate limit (`burst=2`, `rate=1/s`), submits enough orders
+/// rapidly to deplete the bucket, and asserts the third order is
+/// rejected with `ExceedsOrderRate`.
+///
+/// The response gate guarantees that any response observed by the
+/// client has already been replicated and applied on the replica's
+/// engine — meaning the `Rejected{ExceedsOrderRate}` returned to the
+/// client is *also* the report the replica produced, byte-identical.
+/// If the replica's bucket state diverged from the primary's (different
+/// `tokens` or `last_refill_ns`), it would emit a different report (or
+/// no Rejected at all), the chain hash would mismatch, and replication
+/// would halt before this response was ever returned. Observing the
+/// response under the gate is therefore proof that primary and replica
+/// converged on the same SEC-04 outcome under real wiring (TCP
+/// transport + journal + receiver), not just in the in-process
+/// proptest.
+#[test]
+#[serial]
+fn sec04_rate_limit_replicates_to_replica() {
+    let cluster = TestCluster::start_with_extra_args(&[
+        "--max-orders-per-second",
+        "1", // 1 token/second refill — minimum non-disabling rate
+        "--max-orders-burst",
+        "2", // burst of 2 — third rapid submit must exceed
+    ]);
+    let mut client = cluster.connect_primary();
+
+    // Burn the burst (2 tokens) — both should accept.
+    for i in 1..=2u64 {
+        let r = submit_order(&mut client, i, 1, 1, Side::Buy, 100, 1);
+        assert!(
+            !r.is_empty(),
+            "order {i}: response gate dropped reply — replication issue?",
+        );
+        assert!(
+            !has_report(&r, |rep| matches!(
+                rep,
+                melin_protocol::types::ExecutionReport::Rejected {
+                    reason: melin_protocol::types::RejectReason::ExceedsOrderRate,
+                    ..
+                }
+            )),
+            "order {i} within burst should NOT rate-reject, got: {r:?}",
+        );
+    }
+
+    // Third submission within the same wall-clock millisecond — the
+    // bucket has at most a few microseconds' worth of refill at 1/s
+    // (effectively zero tokens), so this MUST reject.
+    let r = submit_order(&mut client, 3, 1, 1, Side::Buy, 100, 1);
+    assert!(!r.is_empty(), "rate-limited response gate timed out");
+    assert!(
+        has_report(&r, |rep| matches!(
+            rep,
+            melin_protocol::types::ExecutionReport::Rejected {
+                reason: melin_protocol::types::RejectReason::ExceedsOrderRate,
+                ..
+            }
+        )),
+        "expected ExceedsOrderRate cross-receiver, got: {r:?}",
+    );
+
+    // The response above was gated on replication: if the replica's
+    // engine diverged on the rate-limit decision (different bucket
+    // state), the chain hash would mismatch and the response would
+    // never have been sent. Reaching this point proves cross-receiver
+    // convergence. As a final liveness check, wait for lag = 0 — would
+    // only fail if replication had since halted.
+    cluster.wait_replicated();
 }
 
 // ---------------------------------------------------------------------------

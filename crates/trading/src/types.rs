@@ -407,6 +407,11 @@ pub enum RejectReason {
     /// the operator to bound order_index growth (SEC-03). Cancel an
     /// existing order before placing a new one.
     ExceedsMaxOpenOrders,
+    /// Account has exceeded its order-submission rate limit (token
+    /// bucket: sustained orders/sec + burst). Configured by the operator
+    /// to prevent a single client from monopolizing the matching stage
+    /// (SEC-04). Slow submission rate or wait for the bucket to refill.
+    ExceedsOrderRate,
 }
 
 #[cfg(test)]
