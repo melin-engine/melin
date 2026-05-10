@@ -1544,3 +1544,155 @@ proptest! {
         }
     }
 }
+
+// ===========================================================================
+// 6. SEC-03 — per-account open-order cap is never exceeded
+// ===========================================================================
+
+/// Minimal action mix targeted at the cap invariant. Restricting the set
+/// (no replace / fee-schedule / circuit-breaker / withdraw-all) keeps the
+/// reasoning local: every action either grows or shrinks `order_counts`
+/// in a way the property already understands. Larger surfaces are covered
+/// by `volume_conservation` / `reservation_matches_book` already.
+#[derive(Debug, Clone)]
+enum CapAction {
+    Limit {
+        account: AccountId,
+        side: Side,
+        price: Price,
+        quantity: Quantity,
+        tif: TimeInForce,
+    },
+    Market {
+        account: AccountId,
+        side: Side,
+        quantity: Quantity,
+    },
+    /// Cancel an existing live order — `account_pick` selects A vs B,
+    /// `idx_pick` selects within that account's placed-order list.
+    Cancel { account_pick: bool, idx_pick: usize },
+}
+
+fn arb_cap_action() -> impl Strategy<Value = CapAction> {
+    prop_oneof![
+        (arb_account(), arb_side(), arb_price(), arb_quantity()).prop_map(
+            |(account, side, price, quantity)| CapAction::Limit {
+                account,
+                side,
+                price,
+                quantity,
+                tif: TimeInForce::GTC,
+            }
+        ),
+        (arb_account(), arb_side(), arb_quantity()).prop_map(|(account, side, quantity)| {
+            CapAction::Market {
+                account,
+                side,
+                quantity,
+            }
+        }),
+        (any::<bool>(), 0usize..16).prop_map(|(account_pick, idx_pick)| CapAction::Cancel {
+            account_pick,
+            idx_pick,
+        }),
+    ]
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(300))]
+
+    /// SEC-03: For any sequence of submits / fills / cancels with cap=N,
+    /// no account ever has more than N entries in `order_counts` —
+    /// neither at submission time nor between events. The runner checks
+    /// the invariant after every action so a violation pinpoints which
+    /// action introduced it.
+    #[test]
+    fn open_order_count_never_exceeds_cap(
+        actions in proptest::collection::vec(arb_cap_action(), 1..=80),
+    ) {
+        // Cap = 3 is small enough to be hit by typical generated
+        // sequences but large enough that the engine gets to do real
+        // matching before saturating.
+        let cap: u32 = 3;
+        let mut exchange = Exchange::new();
+        exchange.set_max_open_orders_per_account(cap);
+        exchange.add_instrument(btc_usd_spec());
+        // Generous starting balances so InsufficientBalance doesn't
+        // dominate the rejection mix; we want cap rejections, not money
+        // rejections, to be the usual failure mode.
+        exchange.deposit(ACCT_A, USD, 10_000_000);
+        exchange.deposit(ACCT_A, BTC, 100_000);
+        exchange.deposit(ACCT_B, USD, 10_000_000);
+        exchange.deposit(ACCT_B, BTC, 100_000);
+
+        let mut reports = Vec::new();
+        let mut next_id_per_account: HashMap<AccountId, u64> = HashMap::new();
+        let mut placed_ids: HashMap<AccountId, Vec<OrderId>> = HashMap::new();
+        let sym = Symbol(1);
+
+        for action in &actions {
+            match action {
+                CapAction::Limit { account, side, price, quantity, tif } => {
+                    let counter = next_id_per_account.entry(*account).or_insert(0);
+                    *counter += 1;
+                    let id = OrderId(*counter);
+                    placed_ids.entry(*account).or_default().push(id);
+                    exchange.execute(
+                        sym,
+                        Order {
+                            id,
+                            account: *account,
+                            side: *side,
+                            order_type: OrderType::Limit { price: *price, post_only: false },
+                            time_in_force: *tif,
+                            quantity: *quantity,
+                            stp: SelfTradeProtection::Allow,
+                            expiry_ns: 0,
+                        },
+                        &mut reports,
+                    );
+                }
+                CapAction::Market { account, side, quantity } => {
+                    let counter = next_id_per_account.entry(*account).or_insert(0);
+                    *counter += 1;
+                    let id = OrderId(*counter);
+                    exchange.execute(
+                        sym,
+                        Order {
+                            id,
+                            account: *account,
+                            side: *side,
+                            order_type: OrderType::Market,
+                            time_in_force: TimeInForce::IOC,
+                            quantity: *quantity,
+                            stp: SelfTradeProtection::Allow,
+                            expiry_ns: 0,
+                        },
+                        &mut reports,
+                    );
+                }
+                CapAction::Cancel { account_pick, idx_pick } => {
+                    let acct = if *account_pick { ACCT_A } else { ACCT_B };
+                    if let Some(ids) = placed_ids.get(&acct)
+                        && !ids.is_empty() {
+                            let id = ids[idx_pick % ids.len()];
+                            exchange.cancel(sym, acct, id, &mut reports);
+                        }
+                }
+            }
+            reports.clear();
+
+            // Cap invariant must hold after every action.
+            for &acct in &[ACCT_A, ACCT_B] {
+                prop_assert!(
+                    exchange.open_order_count(acct) <= cap,
+                    "cap violated: account={:?} count={} cap={} after {:?}",
+                    acct,
+                    exchange.open_order_count(acct),
+                    cap,
+                    action,
+                );
+            }
+        }
+    }
+}

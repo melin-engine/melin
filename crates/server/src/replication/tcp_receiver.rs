@@ -738,6 +738,10 @@ pub fn run_receiver(
     // max_journal_bytes == 0 disables size-driven rotation. None means
     // runtime rotation is off entirely on this replica.
     rotation: Option<(u64, std::sync::Arc<AtomicBool>)>,
+    // Per-account open-order cap (SEC-03). Must match the primary or
+    // replay diverges on Rejected reports. Forwarded to every
+    // freshly-constructed engine in this receiver.
+    max_orders_per_account: u32,
 ) -> ReceiverResult {
     use crate::App;
     use crate::JournalWriter;
@@ -762,7 +766,8 @@ pub fn run_receiver(
             let next = engine.next_sequence();
             let last = next.saturating_sub(1);
             let hash = engine.chain_hash().unwrap_or([0u8; 32]);
-            let (exchange, writer) = engine.into_parts();
+            let (mut exchange, writer) = engine.into_parts();
+            crate::server::apply_max_orders(&mut exchange, max_orders_per_account);
             (Some(exchange), Some(writer), last, hash)
         } else {
             (None, None, 0u64, [0u8; 32])
@@ -1090,7 +1095,9 @@ pub fn run_receiver(
                 Some(genesis_chain_hash),
                 0, // events_since_checkpoint
             )?;
-            exchange = Some(crate::server::empty_app());
+            let mut fresh = crate::server::empty_app();
+            crate::server::apply_max_orders(&mut fresh, max_orders_per_account);
+            exchange = Some(fresh);
             journal_writer = Some(writer);
         }
 

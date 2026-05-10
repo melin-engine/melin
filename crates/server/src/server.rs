@@ -99,6 +99,15 @@ pub struct ServerConfig {
     /// and starts a fresh journal. Set to 0 to disable. Default: 256 MiB.
     #[arg(long, default_value_t = 256)]
     pub max_journal_mib: u64,
+    /// Maximum number of open orders (resting limits + pending stops, across
+    /// all instruments) per account. New submissions are rejected with
+    /// `ExceedsMaxOpenOrders` once an account hits this cap. `0` means
+    /// unlimited. Bounds the per-account contribution to engine memory
+    /// (SEC-03). Must be set to the same value on the primary and every
+    /// replica — the cap shapes Rejected reports, so a mismatch causes
+    /// replay divergence.
+    #[arg(long, default_value_t = 10_000)]
+    pub max_orders_per_account: u32,
 
     /// Address to listen for replica connections (enables synchronous replication).
     /// Mutually exclusive with `--standalone` and `--replica-of`.
@@ -356,6 +365,7 @@ impl Default for ServerConfig {
             instruments: 2,
             authorized_keys: PathBuf::from("authorized_keys"),
             max_journal_mib: 256,
+            max_orders_per_account: 10_000,
 
             replication_bind: None,
             standalone: false,
@@ -625,6 +635,7 @@ pub fn run_with_shutdown<L: BlockingTransportListener>(
             config.replication_pipeline_depth,
             !config.yield_idle,
             rotation,
+            config.max_orders_per_account,
         )? {
             None => return Ok(()), // clean shutdown
             Some((mut exchange, writer)) => {
@@ -1671,6 +1682,7 @@ pub fn run_dpdk(
             !config.yield_idle,
             config.async_replica_ack,
             rotation,
+            config.max_orders_per_account,
         )? {
             None => return Ok(()), // clean shutdown
             Some((mut exchange, writer)) => {
@@ -2255,6 +2267,19 @@ pub fn run_dpdk(
 /// feature-gated: trading uses the production pre-sized `Exchange`; noop
 /// uses the trivial `NoopApp`. Everything downstream of this call is
 /// application-agnostic via the `Application` trait.
+/// Apply operator-set runtime knobs that aren't carried in the journal /
+/// snapshot. Called on every fresh / recovered / restored engine — the
+/// per-account open-order cap (SEC-03) lives in `Exchange` state but is
+/// operator policy, so primary and replicas must converge on it via
+/// configuration rather than replay.
+#[cfg(all(feature = "trading", not(feature = "noop")))]
+pub fn apply_max_orders(app: &mut App, max_orders_per_account: u32) {
+    app.set_max_open_orders_per_account(max_orders_per_account);
+}
+
+#[cfg(all(feature = "noop", not(feature = "trading")))]
+pub fn apply_max_orders(_app: &mut App, _max_orders_per_account: u32) {}
+
 #[cfg(all(feature = "trading", not(feature = "noop")))]
 pub(crate) fn empty_app() -> App {
     melin_engine::exchange::Exchange::with_capacity()
@@ -2277,10 +2302,12 @@ pub(crate) fn empty_app() -> App {
 /// frames, both of which already size their HashMap from a known count.
 #[cfg(all(feature = "trading", not(feature = "noop")))]
 pub(crate) fn empty_app_for_seed(config: &ServerConfig) -> App {
-    melin_engine::exchange::Exchange::with_seed_capacity(
+    let mut ex = melin_engine::exchange::Exchange::with_seed_capacity(
         config.accounts as usize,
         config.instruments as usize,
-    )
+    );
+    apply_max_orders(&mut ex, config.max_orders_per_account);
+    ex
 }
 
 #[cfg(all(feature = "noop", not(feature = "trading")))]
@@ -2344,6 +2371,11 @@ pub(crate) fn init_engine(
     };
 
     let needs_seeding = !journal_exists;
+
+    // Apply runtime config that the snapshot doesn't carry. The cap is
+    // operator policy, not journaled state, so a recovered engine starts
+    // at `DEFAULT_MAX_OPEN_ORDERS_PER_ACCOUNT` and we override here.
+    apply_max_orders(engine.app_mut(), config.max_orders_per_account);
 
     // Rotate journal if it exceeds the configured size threshold.
     // This saves a snapshot, archives the old journal, and starts

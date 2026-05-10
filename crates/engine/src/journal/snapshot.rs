@@ -1318,7 +1318,14 @@ impl Exchange {
     ///
     /// Not suitable for the hot path — allocates extensively.
     pub fn clone_via_snapshot(&self) -> Self {
-        Self::restore_state(self.snapshot_state())
+        let mut cloned = Self::restore_state(self.snapshot_state());
+        // The cap is operator config, not journaled state, so it isn't in
+        // the snapshot payload. Carry it over in-process so the shadow
+        // clone applies the same Rejected reasons as the primary —
+        // otherwise a capped account on the primary would be unbounded
+        // on the shadow, and shadow validation would diverge.
+        cloned.set_max_open_orders_per_account(self.max_open_orders_per_account());
+        cloned
     }
 }
 

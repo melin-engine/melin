@@ -88,6 +88,8 @@ pub fn run_receiver_rumcast(
     async_ack: bool,
     busy_spin: bool,
     rotation: Option<(u64, Arc<AtomicBool>)>,
+    // SEC-03: must equal the primary's --max-orders-per-account.
+    max_orders_per_account: u32,
 ) -> super::ReceiverResult {
     use crate::App;
     use crate::JournalWriter;
@@ -105,7 +107,8 @@ pub fn run_receiver_rumcast(
             let next = engine.next_sequence();
             let last = next.saturating_sub(1);
             let hash = engine.chain_hash().unwrap_or([0u8; 32]);
-            let (e, w) = engine.into_parts();
+            let (mut e, w) = engine.into_parts();
+            crate::server::apply_max_orders(&mut e, max_orders_per_account);
             (Some(e), Some(w), last, hash)
         } else {
             (None, None, 0u64, [0u8; 32])
@@ -194,7 +197,9 @@ pub fn run_receiver_rumcast(
                 // ---- Create journal for fresh replica (no snapshot, no prior journal) ----
                 if journal_writer.is_none() {
                     let writer = create_fresh_replica_journal(journal_path, &primary_genesis)?;
-                    exchange = Some(crate::server::empty_app());
+                    let mut fresh = crate::server::empty_app();
+                    crate::server::apply_max_orders(&mut fresh, max_orders_per_account);
+                    exchange = Some(fresh);
                     journal_writer = Some(writer);
                 }
                 Some((primary_genesis, start_sequence))
@@ -376,7 +381,8 @@ pub fn run_receiver_rumcast(
                             )?;
                             last_sequence = engine.next_sequence().saturating_sub(1);
                             chain_hash = engine.chain_hash().unwrap_or([0u8; 32]);
-                            let (e, w) = engine.into_parts();
+                            let (mut e, w) = engine.into_parts();
+                            crate::server::apply_max_orders(&mut e, max_orders_per_account);
                             exchange = Some(e);
                             journal_writer = Some(w);
                         } else {

@@ -238,7 +238,8 @@ fn main() {
                 std::time::Duration::ZERO,
                 8, // pipeline_depth
                 busy_spin,
-                None, // rotation: bench replica doesn't rotate
+                None,   // rotation: bench replica doesn't rotate
+                10_000, // max_orders_per_account: bench uses default
             );
         })
         .expect("spawn run_receiver");
