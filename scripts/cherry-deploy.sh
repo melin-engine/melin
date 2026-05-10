@@ -23,6 +23,11 @@ SSH_KEY="$HOME/.ssh/te_test_ed"
 SSH_PUB="$HOME/.ssh/te_test_ed.pub"
 SETUP_SCRIPT="$(dirname "$0")/cherry-setup.sh"
 
+# Skip host key prompt on first connect — these are throwaway bench boxes.
+SSH_OPTS=(-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR)
+ssh()  { command ssh  "${SSH_OPTS[@]}" "$@"; }
+scp()  { command scp  "${SSH_OPTS[@]}" "$@"; }
+
 # Verify local files exist.
 for f in "$SSH_KEY" "$SSH_PUB" "$SETUP_SCRIPT"; do
     if [[ ! -f "$f" ]]; then
@@ -103,4 +108,4 @@ fi
 
 echo ""
 echo "=== Deployment complete. Connecting... ==="
-exec ssh -t "$REMOTE" "cd ~/workspace/melin && exec bash --login"
+exec command ssh "${SSH_OPTS[@]}" -t "$REMOTE" "cd ~/workspace/melin && exec bash --login"
