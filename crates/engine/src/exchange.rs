@@ -175,14 +175,16 @@ pub struct Exchange {
     /// fxhash on a 4-byte key is cheaper than the default hasher on the
     /// hot path.
     order_buckets: HashMap4<AccountId, TokenBucket>,
-    /// `now_ns` of the in-flight event being applied. Stashed by
+    /// `now_ns` of the most recently applied event. Stashed by
     /// [`Application::apply`](crate::application_impl) before dispatching
     /// to per-event methods (`execute`, `cancel`, etc.) so the rate limiter
     /// can read a deterministic clock without threading a parameter through
-    /// every public method's signature. Reset to `0` outside `apply`.
-    /// Direct `Exchange::execute` callers in tests that don't exercise the
-    /// rate limiter (the default `max_orders_per_second == 0`) leave this
-    /// at `0` — the limiter is short-circuited regardless.
+    /// every public method's signature. Initialised to `0` and overwritten
+    /// every time `apply` is called — never reset between events; readers
+    /// outside `apply` see whatever the last `apply` left here. Direct
+    /// `Exchange::execute` callers in tests that don't exercise the rate
+    /// limiter (the engine-default `max_orders_per_second == 0`) bypass
+    /// the limiter entirely, so the value is irrelevant in that path.
     current_event_ts_ns: u64,
 }
 
@@ -225,10 +227,21 @@ impl TokenBucket {
     /// one token. Returns `true` if the order is allowed.
     ///
     /// Integer math only — no floats — for cross-platform determinism.
-    /// The refill formula is `new_tokens = elapsed_ns * rate / 1e9`;
-    /// `last_refill_ns` is then advanced by the time those tokens
-    /// represent (`new_tokens * 1e9 / rate`) so sub-token fractional
-    /// time accumulates rather than being discarded.
+    /// The refill formula is `earned = elapsed_ns * rate / 1e9`. Two cases:
+    ///
+    /// 1. The new token count caps at `burst` (bucket overflows). Any
+    ///    elapsed time beyond the point at which the bucket reached
+    ///    `burst` is "wasted" — there's no headroom to absorb new
+    ///    tokens — so `last_refill_ns` is snapped to `now_ns` to
+    ///    discard that idle slack. Without this snap, the wasted time
+    ///    would accumulate as phantom credit on `last_refill_ns`,
+    ///    letting subsequent close-spaced events draw the burst again
+    ///    (issuing far more tokens than `rate` supports).
+    /// 2. The new token count stays below `burst`. `last_refill_ns` is
+    ///    advanced by exactly the time corresponding to tokens earned
+    ///    (`earned * 1e9 / rate`) so sub-token fractional time
+    ///    accumulates across calls — a 1000 ord/s bucket polled twice
+    ///    600 µs apart correctly issues exactly one token, not zero.
     #[inline]
     fn refill_and_consume(&mut self, now_ns: u64, rate: u32, burst: u32) -> bool {
         // Clock can only go forward in our timeline (event ts_ns is
@@ -241,15 +254,26 @@ impl TokenBucket {
             let elapsed = now_ns - self.last_refill_ns;
             // u128 intermediate to avoid overflow at extreme rates: at
             // u32::MAX rate × ~3.4e9 elapsed ns the product overflows u64.
-            let new_tokens =
+            // Pre-clamp by burst so the cast back to u64 is always safe
+            // (burst fits in u32, so `min(burst)` fits in u64).
+            let earned =
                 ((elapsed as u128 * rate as u128) / 1_000_000_000u128).min(burst as u128) as u64;
-            if new_tokens > 0 {
-                self.tokens = (self.tokens + new_tokens).min(burst as u64);
-                // Advance last_refill_ns by exactly the time consumed by
-                // new_tokens — preserves fractional-token time.
-                let consumed_ns = ((new_tokens as u128 * 1_000_000_000u128) / rate as u128) as u64;
+            let new_tokens = (self.tokens + earned).min(burst as u64);
+            if new_tokens >= burst as u64 {
+                // Bucket is at capacity — discard any remaining elapsed
+                // time so phantom credit can't accumulate. See doc above.
+                self.last_refill_ns = now_ns;
+            } else if earned > 0 {
+                // Below cap and we earned tokens — advance by exactly the
+                // time those tokens consumed, preserving fractional-token
+                // time below one token's worth.
+                let consumed_ns = ((earned as u128 * 1_000_000_000u128) / rate as u128) as u64;
                 self.last_refill_ns += consumed_ns;
             }
+            // else: earned == 0 (sub-token time elapsed, bucket below
+            // cap) — leave last_refill_ns unchanged so the fractional
+            // time accumulates into the next call.
+            self.tokens = new_tokens;
         }
         if self.tokens > 0 {
             self.tokens -= 1;
@@ -10554,6 +10578,84 @@ mod tests {
         exchange.set_max_orders_per_second(123, 7);
         let cloned = exchange.clone_via_snapshot();
         assert_eq!(cloned.max_orders_per_second(), (123, 7));
+    }
+
+    #[test]
+    fn rate_limit_no_phantom_credit_after_quiet_period() {
+        // Regression test for a bookkeeping bug: when a bucket caps at
+        // `burst` after a long idle gap, the wasted-while-full time must
+        // not accumulate as `last_refill_ns` lag. If it did, every
+        // subsequent close-spaced event would refill to the full burst
+        // again, letting the limiter issue far more tokens than `rate`
+        // supports. We submit `burst + 1` events with negligible spacing
+        // immediately after a 1-second idle period; the (burst+1)th must
+        // reject because the bucket can hold exactly `burst` post-quiet.
+        let mut exchange = Exchange::new();
+        let burst: u32 = 5;
+        exchange.set_max_orders_per_second(1_000, burst);
+        exchange.add_instrument(btc_usd_spec());
+        exchange.deposit(ACCT_A, USD, 1_000_000);
+        let mut reports = Vec::new();
+        // Anchor the bucket at t=0 with one event (pulls the first token).
+        execute_at(
+            &mut exchange,
+            0,
+            Symbol(1),
+            limit_order(1, ACCT_A, Side::Buy, 100, 1, TimeInForce::GTC),
+            &mut reports,
+        );
+        reports.clear();
+        // 1-second quiet period. Bucket should refill to exactly `burst`
+        // — no more, even though 1s of accumulated time at 1000/s would
+        // notionally credit 1000 tokens.
+        let post_quiet_ns: u64 = 1_000_000_000;
+        // Issue exactly `burst` events at 1ns spacing — all should accept
+        // (consuming the post-quiet refill).
+        for i in 0..burst as u64 {
+            execute_at(
+                &mut exchange,
+                post_quiet_ns + i,
+                Symbol(1),
+                limit_order(2 + i, ACCT_A, Side::Buy, 100 + i, 1, TimeInForce::GTC),
+                &mut reports,
+            );
+        }
+        assert!(
+            reports
+                .iter()
+                .all(|r| !matches!(r, ExecutionReport::Rejected { .. })),
+            "first {burst} post-quiet events must all accept, got {reports:?}",
+        );
+        reports.clear();
+        // The (burst+1)th, only `burst` ns after the first, must reject.
+        // No phantom credit — the bucket was truly empty after burning
+        // `burst` tokens.
+        execute_at(
+            &mut exchange,
+            post_quiet_ns + burst as u64,
+            Symbol(1),
+            limit_order(
+                2 + burst as u64,
+                ACCT_A,
+                Side::Buy,
+                200,
+                1,
+                TimeInForce::GTC,
+            ),
+            &mut reports,
+        );
+        assert_eq!(reports.len(), 1);
+        assert!(
+            matches!(
+                reports[0],
+                ExecutionReport::Rejected {
+                    reason: RejectReason::ExceedsOrderRate,
+                    ..
+                }
+            ),
+            "phantom-credit regression: expected ExceedsOrderRate, got {:?}",
+            reports[0],
+        );
     }
 
     #[test]

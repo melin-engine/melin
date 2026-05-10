@@ -1703,11 +1703,17 @@ proptest! {
     /// allows more accepts than tokens issued.
     #[test]
     fn rate_limit_accepts_bounded_by_token_supply(
-        deltas in proptest::collection::vec(0u64..2_000_000u64, 1..=100),
+        // Wide delta range mixes quiet periods (long gaps) with close-
+        // spaced bursts. Long gaps are what surface bookkeeping bugs
+        // (phantom credit on `last_refill_ns` after the bucket caps)
+        // because the next event's elapsed-time math uses the lag.
+        deltas in proptest::collection::vec(0u64..1_000_000_000u64, 1..=200),
     ) {
-        // Fix the policy so the bound is easy to compute.
+        // Tight burst makes the bound sensitive — every accepted token
+        // must show up against `burst + elapsed*rate/1e9`. Loose burst
+        // dilutes the signal.
         let rate: u32 = 1_000;
-        let burst: u32 = 10;
+        let burst: u32 = 5;
         let mut exchange = Exchange::new();
         // Disable other gates so they don't shadow the rate limiter and
         // make the count meaningful in isolation.
