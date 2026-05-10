@@ -421,6 +421,18 @@ impl DpdkReplicationDriver {
                                         slot.consumer.commit();
                                     }
 
+                                    // Seed the per-slot metrics cursors before flipping
+                                    // active so a reader that observes active=true also
+                                    // observes a non-zero cursor pair. Without this, a
+                                    // degraded gate freezes after a replica rejoins —
+                                    // see tcp_sender for the full rationale. Relaxed is
+                                    // fine because the active_flag Release below
+                                    // publishes these stores in program order.
+                                    metrics.acked_sequence[slot_idx]
+                                        .store(h.last_sequence, Ordering::Relaxed);
+                                    metrics.in_memory_sequence[slot_idx]
+                                        .store(h.last_sequence, Ordering::Relaxed);
+
                                     // Mark ring active before signaling readiness
                                     // so the journal stage publishes when seeds flow.
                                     slot.active_flag.store(true, Ordering::Release);

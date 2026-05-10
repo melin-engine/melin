@@ -966,6 +966,13 @@ impl SlotState {
 
                         replicas_connected.fetch_add(1, Ordering::Release);
                         metrics.catching_up[self.slot_idx].store(false, Ordering::Relaxed);
+                        // Seed metrics cursors before active_flag Release —
+                        // see tcp_sender for the rationale. The active_flag
+                        // Release below publishes these Relaxed stores.
+                        metrics.acked_sequence[self.slot_idx]
+                            .store(h.last_sequence, Ordering::Relaxed);
+                        metrics.in_memory_sequence[self.slot_idx]
+                            .store(h.last_sequence, Ordering::Relaxed);
                         self.active_flag.store(true, Ordering::Release);
                         replica_ready.store(true, Ordering::Release);
 

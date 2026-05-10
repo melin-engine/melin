@@ -574,6 +574,18 @@ fn handle_replica_connection(
     // Catch-up complete — replica is entering the live streaming loop.
     metrics.catching_up[slot_idx].store(false, Ordering::Relaxed);
 
+    // Seed the per-slot metrics cursors that the response gate's
+    // `evaluate_durability` reads. Must happen BEFORE the active_flag
+    // Release so any reader that observes `active=true` also observes
+    // a non-zero cursor pair — otherwise a 1-replica deployment running
+    // degraded freezes the gate at 0 for the first live-ack RTT after
+    // a reconnect (the disconnect-cleanup zeroed these atomics, and
+    // without seeding the gate would include a `[0, 0]` row in the
+    // policy view). The active_flag Release below publishes these
+    // Relaxed stores together.
+    metrics.acked_sequence[slot_idx].store(handshake.last_sequence, Ordering::Relaxed);
+    metrics.in_memory_sequence[slot_idx].store(handshake.last_sequence, Ordering::Relaxed);
+
     // Mark this ring as active — the journal stage will start publishing
     // to it. Must happen BEFORE replica_ready so the seed drain can wait
     // on this ring's consumer cursor.
