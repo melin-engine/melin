@@ -24,7 +24,7 @@
 //!
 //! ### Replica → Primary
 //! - **Handshake**: `[len:u32][0x01][last_sequence:u64][chain_hash:[u8;32]]`
-//! - **Ack**: `[len:u32][0x02][acked_sequence:u64]`
+//! - **Ack**: `[len:u32][0x02][acked_sequence:u64][in_memory_sequence:u64]`
 //!
 //! ### Primary → Replica
 //! - **StreamStart**: `[len:u32][0x10][start_sequence:u64][genesis_len:u32][genesis_bytes...]`

@@ -119,17 +119,16 @@ pub fn run(
     // Initialised below from the policy's startup evaluation.
     let mut cached_durable_pos: u64;
 
-    // Degradation logger state — same scheme as the TCP response
-    // stage (see `response::run`). Initialised below from an explicit
+    // Degradation logger — same scheme as the TCP response stage
+    // (see `response::run`). Initialised below from an explicit
     // policy evaluation so a degraded startup state shows up on
     // `/healthz` and in the journal even before the first batch.
-    let mut last_degraded_state: bool = false;
-    let mut last_degraded_log: Option<Instant> = None;
-    let mut last_policy_check = Instant::now();
+    let startup_now = Instant::now();
+    let mut last_policy_check = startup_now;
     const DEGRADED_LOG_INTERVAL: Duration = Duration::from_secs(5);
     const POLICY_CHECK_INTERVAL: Duration = Duration::from_secs(1);
 
-    // Initial evaluation.
+    let mut degraded_logger;
     {
         let journal_pos = journal_cursor.get().load(Ordering::Acquire);
         let metrics_ref = replication_metrics.as_deref();
@@ -140,14 +139,11 @@ pub fn run(
         utilization
             .policy_degraded
             .store(status.degraded, Ordering::Relaxed);
-        if status.degraded {
-            tracing::warn!(
-                policy = %policy,
-                "durability policy starts in degraded mode — fewer connected nodes than the target count"
-            );
-            last_degraded_state = true;
-            last_degraded_log = Some(Instant::now());
-        }
+        degraded_logger = if status.degraded {
+            crate::response::DegradationLogger::new_starting_degraded(startup_now, &policy)
+        } else {
+            crate::response::DegradationLogger::new(startup_now)
+        };
     }
 
     // Pre-encode heartbeat frame (fixed-size, no heap allocation).
@@ -265,14 +261,12 @@ pub fn run(
                         metrics_ref,
                         active_ref,
                     );
-                    crate::response::update_degraded_state(
+                    degraded_logger.tick(
                         &policy,
                         &utilization,
                         status.degraded,
                         now_ts,
                         DEGRADED_LOG_INTERVAL,
-                        &mut last_degraded_state,
-                        &mut last_degraded_log,
                     );
                     cached_durable_pos = status.durable_pos;
                 }
@@ -305,7 +299,8 @@ pub fn run(
                 .map(|s| s.input_seq)
                 .max()
                 .expect("non-empty batch");
-            let needed = max_seq + 1;
+            // Saturating add — see response.rs for the rationale.
+            let needed = max_seq.saturating_add(1);
             #[cfg(feature = "tick-to-trade")]
             {
                 gate_tracker = crate::response::GateCrossTracker::new(needed);
@@ -353,14 +348,12 @@ pub fn run(
         // Log degradation transitions / heartbeat after the gate
         // opens. Same scheme as the TCP response stage.
         let degraded_now = utilization.policy_degraded.load(Ordering::Relaxed);
-        crate::response::update_degraded_state(
+        degraded_logger.tick(
             &policy,
             &utilization,
             degraded_now,
             batch_now,
             DEGRADED_LOG_INTERVAL,
-            &mut last_degraded_state,
-            &mut last_degraded_log,
         );
         last_policy_check = batch_now;
 

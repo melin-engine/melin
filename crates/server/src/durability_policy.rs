@@ -20,8 +20,10 @@
 //! # Policy shape
 //!
 //! A [`Policy`] is an AND-combined list of [`Clause`]s. Each clause is
-//! `AtLeast { count, level }` — "at least `count` nodes (counting both
-//! the primary and any connected replicas) have reached `level`".
+//! `<level>>=<count>[ best_effort]` — "at least `count` nodes (counting
+//! both the primary and any connected replicas) have reached `level`",
+//! with an optional `best_effort` modifier that clamps the count to
+//! the connected cluster shape rather than failing closed.
 //!
 //! # Evaluation
 //!
@@ -83,16 +85,16 @@ pub struct Clause {
     /// Durability level required.
     pub level: Level,
     /// When `true`, evaluate against `min(count, connected_node_count)`
-    /// rather than `count` itself. Spelled `!` in the policy string —
-    /// e.g. `persisted>=2!` reads as "two persisted when two are
-    /// available, otherwise as many as we have". Strict-by-default
-    /// (`persisted>=2`) leaves the gate closed if fewer than two nodes
-    /// are connected.
+    /// rather than `count` itself. Spelled `best_effort` in the policy
+    /// string — e.g. `persisted>=2 best_effort` reads as "two
+    /// persisted when two are available, otherwise as many as we
+    /// have". Strict-by-default (`persisted>=2`) leaves the gate
+    /// closed if fewer than two nodes are connected.
     ///
-    /// Importantly, "degrade" preserves the *count* semantic against the
-    /// reduced cluster: a 1-replica-remaining cluster with `persisted>=2!`
-    /// still requires both surviving nodes (primary + survivor) to
-    /// persist, not just any one.
+    /// Importantly, "best_effort" preserves the *count* semantic against
+    /// the reduced cluster: a 1-replica-remaining cluster with
+    /// `persisted>=2 best_effort` still requires both surviving nodes
+    /// (primary + survivor) to persist, not just any one.
     ///
     /// Comparison to the legacy auto-degrade behaviour depends on cluster
     /// shape:
@@ -105,14 +107,14 @@ pub struct Clause {
     /// - 1+1 deployments (primary + 1 replica): when the replica dies,
     ///   the new code clamps to 1-of-1 (primary alone). The legacy
     ///   formula did the same. **Equivalent**, not stronger.
-    pub degrade: bool,
+    pub best_effort: bool,
 }
 
 impl fmt::Display for Clause {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}>={}", self.level, self.count)?;
-        if self.degrade {
-            f.write_str("!")?;
+        if self.best_effort {
+            f.write_str(" best_effort")?;
         }
         Ok(())
     }
@@ -134,13 +136,20 @@ pub struct Policy {
 
 impl Policy {
     /// Construct a policy from clauses. Returns an error if the clause
-    /// list is empty or contains a zero-count clause.
+    /// list is empty, contains a zero-count clause, or contains a
+    /// clause whose count exceeds [`MAX_CLUSTER_SIZE`].
     pub fn new(clauses: Vec<Clause>) -> Result<Self, PolicyError> {
         if clauses.is_empty() {
             return Err(PolicyError::Empty);
         }
         if let Some(c) = clauses.iter().find(|c| c.count == 0) {
             return Err(PolicyError::ZeroCount(*c));
+        }
+        if let Some(c) = clauses.iter().find(|c| c.count > MAX_CLUSTER_SIZE) {
+            return Err(PolicyError::CountExceedsClusterCap {
+                count: c.count,
+                max: MAX_CLUSTER_SIZE,
+            });
         }
         Ok(Self { clauses })
     }
@@ -156,8 +165,8 @@ impl Policy {
     ///
     /// Returns `0` if no sequence satisfies all clauses (e.g. a strict
     /// clause requires more nodes than are connected). Clauses with
-    /// `degrade = true` clamp their count against `cursors.len()` so
-    /// the gate keeps moving in degraded cluster shapes.
+    /// `best_effort = true` clamp their count against `cursors.len()`
+    /// so the gate keeps moving in degraded cluster shapes.
     #[inline]
     pub fn evaluate(&self, cursors: &CursorView<'_>) -> u64 {
         self.evaluate_with_status(cursors).durable_pos
@@ -173,7 +182,7 @@ impl Policy {
         let mut result = u64::MAX;
         let mut degraded = false;
         for clause in &self.clauses {
-            let effective_count = if clause.degrade {
+            let effective_count = if clause.best_effort {
                 let view_len = cursors.len() as u8;
                 let clamped = clause.count.min(view_len.max(1));
                 if clamped < clause.count {
@@ -317,10 +326,23 @@ pub enum PolicyError {
     /// A clause had `count == 0`, which is trivially true and almost
     /// always a misconfiguration.
     ZeroCount(Clause),
+    /// A clause requires more nodes than the deployment can have. The
+    /// server caps cluster size at 1 primary + 2 replicas = 3 nodes
+    /// (see [`MAX_CLUSTER_SIZE`]); a clause with `count > 3` is
+    /// either a typo or a copy-paste from a hypothetical future
+    /// topology and would silently produce a permanently-stalled
+    /// gate (strict) or always clamp (best-effort). Either way the
+    /// operator's intent is violated, so we reject at parse time.
+    CountExceedsClusterCap { count: u8, max: u8 },
     /// The policy string failed to tokenise / parse. The `String`
     /// holds an operator-facing diagnostic.
     Parse(String),
 }
+
+/// Maximum number of nodes the gate's cursor view can carry. Hard-
+/// coded at 1 primary + 2 replica slots = 3. Update if/when the
+/// replication topology grows past 1+2 (e.g. via Raft, roadmap #7).
+pub const MAX_CLUSTER_SIZE: u8 = 3;
 
 impl fmt::Display for PolicyError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -329,6 +351,10 @@ impl fmt::Display for PolicyError {
             PolicyError::ZeroCount(c) => {
                 write!(f, "durability policy clause `{c}` has zero count")
             }
+            PolicyError::CountExceedsClusterCap { count, max } => write!(
+                f,
+                "durability policy clause requires {count} nodes but the server caps cluster size at {max} (1 primary + 2 replicas)"
+            ),
             PolicyError::Parse(msg) => write!(f, "durability policy parse error: {msg}"),
         }
     }
@@ -337,13 +363,14 @@ impl fmt::Display for PolicyError {
 impl std::error::Error for PolicyError {}
 
 /// Parse a policy string of the form
-/// `"<level>>=<n>[!] [&& <level>>=<n>[!]]*"`.
+/// `"<level>>=<n>[ best_effort] [&& <level>>=<n>[ best_effort]]*"`.
 ///
 /// Whitespace around tokens is ignored. Level names match
-/// [`Level::as_str`] (`"in_memory"`, `"persisted"`). A trailing `!`
-/// marks the clause as best-effort: it clamps to the connected cluster
-/// shape rather than failing closed when fewer nodes than the target
-/// count are connected.
+/// [`Level::as_str`] (`"in_memory"`, `"persisted"`). The optional
+/// `best_effort` keyword (separated from the count by whitespace)
+/// marks the clause as degrade-friendly: it clamps to the connected
+/// cluster shape rather than failing closed when fewer nodes than
+/// the target count are connected.
 ///
 /// Examples:
 ///
@@ -351,9 +378,9 @@ impl std::error::Error for PolicyError {}
 ///   durability).
 /// - `"persisted>=2"` — strict two-node quorum; gate stalls if a
 ///   replica is lost.
-/// - `"persisted>=2!"` — two-node quorum when two nodes are connected,
-///   degrade to as many as remain (still requires *all* survivors to
-///   persist).
+/// - `"persisted>=2 best_effort"` — two-node quorum when two nodes
+///   are connected, clamps to as many as remain (still requires
+///   *all* survivors to persist).
 /// - `"persisted>=1 && in_memory>=2"` — one node persisted, plus a
 ///   second node with the event in memory.
 pub fn parse(input: &str) -> Result<Policy, PolicyError> {
@@ -373,7 +400,7 @@ pub fn parse(input: &str) -> Result<Policy, PolicyError> {
 fn parse_clause(token: &str) -> Result<Clause, PolicyError> {
     let (lvl_str, rhs) = token.split_once(">=").ok_or_else(|| {
         PolicyError::Parse(format!(
-            "clause `{token}` is not of the form `<level>>=<n>[!]`"
+            "clause `{token}` is not of the form `<level>>=<n>[ best_effort]`"
         ))
     })?;
     let level = match lvl_str.trim() {
@@ -385,13 +412,29 @@ fn parse_clause(token: &str) -> Result<Clause, PolicyError> {
             )));
         }
     };
-    let rhs = rhs.trim();
-    // Trailing `!` marks the clause as best-effort / degrade-friendly.
-    // Strip it before parsing the integer count.
-    let (count_str, degrade) = match rhs.strip_suffix('!') {
-        Some(stripped) => (stripped.trim_end(), true),
-        None => (rhs, false),
+    // Split the right-hand side into the integer count and an
+    // optional `best_effort` keyword separated by whitespace.
+    // Any other trailing token is rejected so a typo (e.g.
+    // `besteffort`, `best-effort`, `BestEffort`) surfaces as a
+    // parse error rather than silently giving strict semantics.
+    let mut tokens = rhs.split_whitespace();
+    let count_str = tokens
+        .next()
+        .ok_or_else(|| PolicyError::Parse(format!("clause `{token}` is missing a count")))?;
+    let best_effort = match tokens.next() {
+        None => false,
+        Some("best_effort") => true,
+        Some(other) => {
+            return Err(PolicyError::Parse(format!(
+                "unknown clause modifier `{other}` in `{token}` (expected `best_effort`)"
+            )));
+        }
     };
+    if let Some(extra) = tokens.next() {
+        return Err(PolicyError::Parse(format!(
+            "unexpected trailing token `{extra}` in clause `{token}`"
+        )));
+    }
     let count: u8 = count_str.parse().map_err(|_| {
         PolicyError::Parse(format!(
             "clause `{token}` count must be a non-negative integer ≤ 255"
@@ -400,7 +443,7 @@ fn parse_clause(token: &str) -> Result<Clause, PolicyError> {
     Ok(Clause {
         count,
         level,
-        degrade,
+        best_effort,
     })
 }
 
@@ -429,7 +472,7 @@ mod tests {
         let c = Clause {
             count: 0,
             level: Level::Persisted,
-            degrade: false,
+            best_effort: false,
         };
         assert_eq!(Policy::new(vec![c]), Err(PolicyError::ZeroCount(c)));
     }
@@ -440,24 +483,78 @@ mod tests {
         assert_eq!(p.clauses().len(), 1);
         assert_eq!(p.clauses()[0].count, 2);
         assert_eq!(p.clauses()[0].level, Level::Persisted);
-        assert!(!p.clauses()[0].degrade);
+        assert!(!p.clauses()[0].best_effort);
     }
 
     #[test]
-    fn parse_degrade_suffix() {
-        let p = parse("persisted>=2!").unwrap();
+    fn parse_best_effort_keyword() {
+        let p = parse("persisted>=2 best_effort").unwrap();
         assert_eq!(p.clauses()[0].count, 2);
-        assert!(p.clauses()[0].degrade);
+        assert!(p.clauses()[0].best_effort);
     }
 
     #[test]
-    fn parse_degrade_suffix_with_whitespace() {
-        // Parser strips trailing whitespace inside the right-hand side
-        // so `persisted>=2 !` is rejected (the `!` must hug the count)
-        // but `persisted>=2! ` (trailing space outside) is fine —
-        // outer trim covers it.
-        let p = parse("  persisted>=2!  ").unwrap();
-        assert!(p.clauses()[0].degrade);
+    fn parse_best_effort_with_extra_whitespace() {
+        // Multiple inner spaces are fine — `split_whitespace` handles
+        // them. Leading / trailing whitespace also OK via outer trim.
+        let p = parse("  persisted>=2   best_effort  ").unwrap();
+        assert!(p.clauses()[0].best_effort);
+    }
+
+    #[test]
+    fn parse_rejects_misspelled_modifier() {
+        // A typo like `besteffort` or `best-effort` must surface as a
+        // parse error, not silently fall through to strict semantics.
+        for bad in [
+            "persisted>=2 besteffort",
+            "persisted>=2 best-effort",
+            "persisted>=2 BestEffort",
+            "persisted>=2 weak",
+        ] {
+            assert!(
+                matches!(parse(bad), Err(PolicyError::Parse(_))),
+                "expected parse error for `{bad}`"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_rejects_trailing_garbage() {
+        assert!(matches!(
+            parse("persisted>=2 best_effort extra"),
+            Err(PolicyError::Parse(_))
+        ));
+    }
+
+    #[test]
+    fn count_exceeding_cluster_cap_rejected() {
+        // The deployment caps cluster size at 1 primary + 2 replicas
+        // = 3. A clause asking for more is either a typo or wishful
+        // thinking; either way the operator's intent isn't met. Fail
+        // at parse time instead of producing a permanently-stalled
+        // gate (strict) or always-clamped-to-3 (best-effort).
+        for bad in [
+            "persisted>=4",
+            "persisted>=4 best_effort",
+            "in_memory>=10",
+            "persisted>=1 && in_memory>=255",
+        ] {
+            match parse(bad) {
+                Err(PolicyError::CountExceedsClusterCap { count: _, max }) => {
+                    assert_eq!(max, MAX_CLUSTER_SIZE);
+                }
+                other => panic!("expected CountExceedsClusterCap for `{bad}`, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn count_at_cluster_cap_accepted() {
+        // The full-cluster count is valid; only > MAX_CLUSTER_SIZE
+        // is rejected. `persisted>=3` is the strict-quorum-on-full-
+        // cluster policy a paranoid venue would write.
+        assert!(parse("persisted>=3").is_ok());
+        assert!(parse("persisted>=3 best_effort").is_ok());
     }
 
     #[test]
@@ -492,9 +589,9 @@ mod tests {
         for s in [
             "persisted>=1",
             "persisted>=2",
-            "persisted>=2!",
+            "persisted>=2 best_effort",
             "persisted>=1 && in_memory>=3",
-            "persisted>=2! && in_memory>=1",
+            "persisted>=2 best_effort && in_memory>=1",
         ] {
             let p = parse(s).unwrap();
             assert_eq!(format!("{p}"), s);
@@ -559,19 +656,19 @@ mod tests {
 
     #[test]
     fn degrade_clamps_to_view_len_when_under_target() {
-        // `persisted>=2!` on a 1-node view (just the primary, all
+        // `persisted>=2 best_effort` on a 1-node view (just the primary, all
         // replicas disconnected): clamp to 1, gate opens at the primary.
-        let p = parse("persisted>=2!").unwrap();
+        let p = parse("persisted>=2 best_effort").unwrap();
         let nodes = [[u64::MAX, 50]];
         assert_eq!(p.evaluate(&view(&nodes)), 50);
     }
 
     #[test]
     fn degrade_no_op_when_view_meets_target() {
-        // `persisted>=2!` on a 3-node view behaves identically to the
+        // `persisted>=2 best_effort` on a 3-node view behaves identically to the
         // strict form when the cluster is healthy.
         let strict = parse("persisted>=2").unwrap();
-        let degrade = parse("persisted>=2!").unwrap();
+        let degrade = parse("persisted>=2 best_effort").unwrap();
         let nodes = [[u64::MAX, 100], [120, 80], [110, 70]];
         let v = view(&nodes);
         assert_eq!(strict.evaluate(&v), degrade.evaluate(&v));
@@ -579,11 +676,11 @@ mod tests {
 
     #[test]
     fn degrade_one_replica_down_requires_both_survivors() {
-        // `persisted>=2!` on 2 connected nodes (primary + 1 surviving
+        // `persisted>=2 best_effort` on 2 connected nodes (primary + 1 surviving
         // replica): clamp to 2, gate opens only when both have persisted.
         // This is the key win over legacy auto-degrade, which would have
         // dropped to 1-node durability here.
-        let p = parse("persisted>=2!").unwrap();
+        let p = parse("persisted>=2 best_effort").unwrap();
         // Primary persisted=100, survivor persisted=50.
         // 2nd-largest = 50 (both must reach this).
         let nodes = [[u64::MAX, 100], [70, 50]];
@@ -610,7 +707,7 @@ mod tests {
         // `view_len.max(1)` floor in evaluate guards against this.
         // In practice the response stage always includes the primary,
         // so view.len() >= 1.
-        let p = parse("persisted>=2!").unwrap();
+        let p = parse("persisted>=2 best_effort").unwrap();
         let nodes: [[u64; 2]; 0] = [];
         // Empty view: nth_largest_cursor returns 0 (no nodes to satisfy).
         assert_eq!(p.evaluate(&view(&nodes)), 0);

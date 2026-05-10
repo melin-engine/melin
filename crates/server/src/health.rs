@@ -140,7 +140,7 @@ struct HealthSnapshot {
     /// Whether the durability policy was last evaluated as degraded —
     /// at least one degrade-friendly clause was clamped below its
     /// target node count. Trips when a replica disconnects from a
-    /// 2-of-3 cluster running `persisted>=2!`, etc. Operator alerting
+    /// 2-of-3 cluster running `persisted>=2 best_effort`, etc. Operator alerting
     /// should fire on this transitioning to `true`.
     response_policy_degraded: bool,
 }

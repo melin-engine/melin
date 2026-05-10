@@ -187,27 +187,28 @@ pub struct ServerConfig {
     pub replication_ring_size: usize,
 
     /// Durability policy that gates client responses. Expressed as one
-    /// or more `<level>>=<n>[!]` clauses joined with `&&`. Levels are
-    /// `persisted` (event written to NVMe via `O_DIRECT`, durable behind
-    /// PLP) and `in_memory` (event accepted into the node's pipeline).
-    /// A trailing `!` marks the clause as best-effort: it clamps to the
-    /// connected cluster shape rather than failing closed.
+    /// or more `<level>>=<n>[ best_effort]` clauses joined with `&&`.
+    /// Levels are `persisted` (event written to NVMe via `O_DIRECT`,
+    /// durable behind PLP) and `in_memory` (event accepted into the
+    /// node's pipeline). The optional `best_effort` keyword marks the
+    /// clause as degrade-friendly: it clamps to the connected cluster
+    /// shape rather than failing closed.
     ///
     /// Examples:
     /// - `persisted>=1`   standalone or single-node durability
     /// - `persisted>=2`   strict 2-of-3 quorum; gate stalls if a replica
     ///   disconnects
-    /// - `persisted>=2!`  (default) 2-of-3 when healthy, falls back to
-    ///   all surviving nodes when one drops — strictly stronger than
-    ///   legacy auto-degrade-to-1-node
+    /// - `persisted>=2 best_effort`  (default) 2-of-3 when healthy, falls
+    ///   back to all surviving nodes when one drops — strictly stronger
+    ///   than legacy auto-degrade-to-1-node in 1+2 deployments
     /// - `in_memory>=2`   confirm receipt on a second node; weaker
     ///   durability, removes fsync latency from the critical path
     ///
     /// See `crate::durability_policy` for the full grammar and
-    /// evaluation semantics. Active degradation (a `!`-marked clause
-    /// clamping below its target count) surfaces on `/healthz` as
-    /// `melin_durability_policy_degraded` and emits a periodic warn.
-    #[arg(long, default_value = "persisted>=2!")]
+    /// evaluation semantics. Active degradation (a `best_effort`
+    /// clause clamping below its target count) surfaces on `/healthz`
+    /// as `melin_durability_policy_degraded` and emits a periodic warn.
+    #[arg(long, default_value = "persisted>=2 best_effort")]
     pub durability_policy: String,
 
     /// Yield to the OS scheduler when pipeline threads are idle instead
@@ -398,7 +399,7 @@ impl Default for ServerConfig {
             replication_heartbeat_secs: 5,
             replication_pipeline_depth: DEFAULT_REPLICATION_PIPELINE_DEPTH,
             replication_ring_size: 256,
-            durability_policy: "persisted>=2!".to_string(),
+            durability_policy: "persisted>=2 best_effort".to_string(),
             yield_idle: false,
             rumcast_client_addr: None,
             rumcast_busy_poll_us: 0,

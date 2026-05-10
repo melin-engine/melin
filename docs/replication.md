@@ -53,12 +53,13 @@ Two levels are tracked on each node:
   i.e. process death loses it. Useful as a "received this far"
   signal in cross-node policies.
 
-A policy is one or more `<level>>=<n>[!]` clauses joined with `&&`.
-A trailing `!` marks the clause as **best-effort**: when fewer than
-`n` nodes are connected the count clamps to the connected cluster
-shape rather than failing closed. Strict clauses (no `!`) leave the
-gate stalled when the target can't be met — appropriate for
-fail-closed compliance scenarios.
+A policy is one or more `<level>>=<n>[ best_effort]` clauses joined
+with `&&`. The optional `best_effort` keyword marks the clause as
+degrade-friendly: when fewer than `n` nodes are connected the count
+clamps to the connected cluster shape rather than failing closed.
+Strict clauses (without `best_effort`) leave the gate stalled when
+the target can't be met — appropriate for fail-closed compliance
+scenarios.
 
 #### Policy examples
 
@@ -66,7 +67,7 @@ fail-closed compliance scenarios.
 |---|---|---|
 | `persisted>=1` | At least one node persisted (effectively single-node durability). | Standalone or single-replica deployments. |
 | `persisted>=2` | Strict two-node quorum; gate stalls if a replica disconnects. | Compliance-driven venues that prefer halt-on-degrade over availability. |
-| `persisted>=2!` (default) | Two-node quorum when healthy; clamps to surviving cluster on a partial failure. | Typical exchange deployments wanting strong durability with availability through single-replica failures. |
+| `persisted>=2 best_effort` (default) | Two-node quorum when healthy; clamps to surviving cluster on a partial failure. | Typical exchange deployments wanting strong durability with availability through single-replica failures. |
 | `in_memory>=2` | Confirm receipt on a second node; weaker durability, removes fsync latency from the critical path. | Co-location latency-sensitive paths where the primary's PLP NVMe is the load-bearing durability and the replica is a hot standby for failover. |
 | `persisted>=1 && in_memory>=2` | Local commit + cross-node receipt — primary persisted plus one other node has the event in RAM. | Cheap-but-non-zero cross-node durability target. |
 
@@ -77,7 +78,7 @@ the primary trivially has them in memory.
 
 #### Strict vs degrade-friendly behaviour by cluster shape
 
-| Cluster | Health | `persisted>=2` (strict) | `persisted>=2!` (degrade) |
+| Cluster | Health | `persisted>=2` (strict) | `persisted>=2 best_effort` (degrade) |
 |---|---|---|---|
 | 1 primary + 2 replicas | All up | Need 2-of-3 persisted | Same: 2-of-3 persisted |
 | 1 primary + 2 replicas | 1 replica down | Stalls (only 2 nodes connected, clause unsatisfiable except by both) — actually still satisfiable as 2-of-2; gate runs requiring **both** survivors to persist | Same: requires both survivors to persist — strictly stronger than the legacy auto-degrade-to-1-node behaviour in the same shape |
@@ -126,7 +127,7 @@ Length-prefixed frames, little-endian. Runs over a dedicated TCP connection sepa
 | Message | Layout | Purpose |
 |---|---|---|
 | Handshake | `[len:u32][type=0x01][last_sequence:u64][chain_hash:[u8;32]]` | Initial connection: replica reports its last durable sequence and chain hash |
-| Ack | `[len:u32][type=0x02][acked_sequence:u64]` | Replica confirms durable write up to this sequence |
+| Ack | `[len:u32][type=0x02][acked_sequence:u64][in_memory_sequence:u64]` | Replica confirms persisted write up to `acked_sequence` and pre-journal receipt up to `in_memory_sequence`. Both fields populated on every ack so the primary's policy gate can evaluate any combination of durability levels. |
 
 ### Primary → Replica
 
@@ -195,7 +196,7 @@ The pipelined ack queue (8 entries) decouples the receiver's TCP loop from NVMe 
 | `--replica-of <addr>` | No | — | Run as a replica connected to the given primary |
 | `--replication-key <path>` | Replica | — | Ed25519 private key for replication auth. Required when `--replica-of` is set. The corresponding public key must be in the primary's `authorized_keys` with `replication` permission. |
 | `--admin-bind <addr>` | Any | — | Address for the operator admin endpoint. Accepts `PROMOTE\n` (replica → primary, replica only) and `ROTATE\n` (archive the live journal segment). |
-| `--durability-policy <STRING>` | Primary | `persisted>=2!` | Policy that gates client responses. See [Durability policy](#durability-policy) above. |
+| `--durability-policy <STRING>` | Primary | `persisted>=2 best_effort` | Policy that gates client responses. See [Durability policy](#durability-policy) above. |
 
 `--replication-bind` and `--standalone` are mutually exclusive. `--replica-of` is mutually exclusive with both. If none are specified, the server runs in standalone mode.
 
@@ -253,7 +254,7 @@ After a cluster-wide outage, each node restarts with its own journal. The three 
 Most failures don't require the full recovery procedure:
 
 - **Primary crashes, both replicas alive**: promote either replica (both have all acked events). The one with the longer journal avoids catch-up, but either is safe. The old primary reconnects as a replica and catches up.
-- **One replica crashes, primary + other replica alive**: under the default `persisted>=2!` policy the cluster continues in degraded mode — the gate clamps to "primary + surviving replica both persist" (still 2 nodes, just out of 2 instead of 3). The crashed replica reconnects and catches up automatically. No operator action needed. Under a strict `persisted>=2` policy the gate stalls until the replica returns; pick the policy that matches your availability/compliance preference.
+- **One replica crashes, primary + other replica alive**: under the default `persisted>=2 best_effort` policy the cluster continues in degraded mode — the gate clamps to "primary + surviving replica both persist" (still 2 nodes, just out of 2 instead of 3). The crashed replica reconnects and catches up automatically. No operator action needed. Under a strict `persisted>=2` policy the gate stalls until the replica returns; pick the policy that matches your availability/compliance preference.
 - **Middle node crashes** (regardless of role): the shortest node already has the missing entries in its replication pipeline — they are in-flight or being fsynced. The system continues with the two surviving nodes. No data loss, no operator action.
 
 ### Single-node-durability mode
@@ -300,7 +301,7 @@ Dual replication is now supported — the primary accepts up to 2 concurrent rep
 
 **Impact**: Extremely unlikely with TCP (kernel buffers ensure complete small reads), but theoretically possible under extreme memory pressure or with pathological packet fragmentation.
 
-**Mitigation**: The 1ms timeout is short enough that ack frames (9 bytes) arrive atomically in practice. If desync occurs, the decode will fail and the connection will be dropped and re-established.
+**Mitigation**: The 1ms timeout is short enough that ack frames (21 bytes — 4-byte length prefix, 1-byte tag, two `u64` cursors) arrive atomically in practice. If desync occurs, the decode will fail and the connection will be dropped and re-established.
 
 **Resolution**: Use a `BufReader` wrapper that preserves partial reads across calls, or switch to non-blocking I/O with explicit read state tracking.
 

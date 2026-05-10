@@ -64,12 +64,12 @@ prominently in `--help` and `docs/replication.md`.
 
 ### Degrade floor
 
-`persisted>=3!` on a 1-node cluster silently clamps to 1. An operator
+`persisted>=3 best_effort` on a 1-node cluster silently clamps to 1. An operator
 who configured `>=3` for a regulatory or commercial reason almost
 certainly does not want the gate to open at the primary alone in a
 2-node-down scenario.
 
-Fix: add a floor syntax — e.g. `persisted>=3!2` ("degrade no further
+Fix: add a floor syntax — e.g. `persisted>=3 best_effort2` ("degrade no further
 than 2 nodes"), or a separate `--min-durability` CLI flag with a
 default that prevents single-node fallback. Pair with parse-time
 validation that `floor <= count`.
@@ -94,7 +94,7 @@ post-mortem the day someone breaks the assumption.
   flips to 1, restore, assert it flips back to 0.
 - No regression test for the **just-connected race** (P0 above).
 - No regression test for the **disconnect race** (P0 above).
-- No test for a **standalone server with `persisted>=2!`** asserting
+- No test for a **standalone server with `persisted>=2 best_effort`** asserting
   `policy_degraded=1` from startup (P1 idle-staleness above).
 - No **flapping** test for the warn-rate-limit fix above.
 - Consider adding a **fuzz / proptest** target on the policy parser
@@ -108,7 +108,7 @@ post-mortem the day someone breaks the assumption.
 
 Industry comparables (Postgres `synchronous_standby_names`, Cassandra
 consistency levels, Kafka `min.insync.replicas`) all use named modes
-or word-form qualifiers. The `persisted>=2!` syntax is unique to Melin
+or word-form qualifiers. The `persisted>=2 best_effort` syntax is unique to Melin
 and an exchange operator reading the deploy config will not parse it
 on first contact.
 

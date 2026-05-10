@@ -220,6 +220,44 @@ fn wait_for_primary_repl_ready(health_addr: SocketAddr, timeout: Duration) {
     }
 }
 
+/// Fetch the `melin_durability_policy_degraded` gauge from the
+/// Prometheus metrics endpoint. Returns `None` if the metric is
+/// missing (older binary, parse error, etc).
+fn fetch_policy_degraded(addr: SocketAddr) -> Option<u32> {
+    let mut stream = TcpStream::connect_timeout(&addr, Duration::from_secs(1)).ok()?;
+    stream.set_read_timeout(Some(Duration::from_secs(2))).ok()?;
+    stream.write_all(b"GET /metrics HTTP/1.1\r\n\r\n").ok()?;
+    let mut body = Vec::new();
+    stream.read_to_end(&mut body).ok()?;
+    let text = std::str::from_utf8(&body).ok()?;
+    for line in text.lines() {
+        if let Some(rest) = line.strip_prefix("melin_durability_policy_degraded ") {
+            return rest.trim().parse().ok();
+        }
+    }
+    None
+}
+
+/// Poll the metrics endpoint until `melin_durability_policy_degraded`
+/// equals `expected`, or timeout. Panics on timeout. The 1-second
+/// flap-hold + 1-second idle re-eval mean transitions can take up to
+/// ~2 s to surface, so callers should pass a comfortable timeout.
+fn wait_for_policy_degraded(addr: SocketAddr, expected: u32, timeout: Duration) {
+    let start = Instant::now();
+    loop {
+        if let Some(v) = fetch_policy_degraded(addr)
+            && v == expected
+        {
+            return;
+        }
+        if start.elapsed() >= timeout {
+            let last = fetch_policy_degraded(addr);
+            panic!("timed out waiting for policy_degraded={expected}; last observed = {last:?}");
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
 /// Query the health endpoint once. Returns (conns, journal_seq, repl_lag, trading).
 fn query_health(addr: SocketAddr) -> Result<(u64, u64, u64, bool), Box<dyn std::error::Error>> {
     let mut stream = TcpStream::connect_timeout(&addr, Duration::from_secs(1))?;
@@ -2699,6 +2737,50 @@ fn rotation_soak_under_load() {
         "post-restart live tail seq ({post_disk_seq}) must exceed pre-shutdown ({pre_seq}) — \
          indicates multi-segment recovery reseeded the writer at the right place"
     );
+}
+
+/// `policy_degraded` health gauge transitions correctly across a
+/// replica failure under the default `persisted>=2 best_effort`
+/// policy. Default policy plus 2 connected replicas → 3 nodes in
+/// view → no clamp → gauge=0. Kill one replica → 2 nodes in view →
+/// clamp from 2 to 2 (no clamp, still healthy). Kill BOTH replicas
+/// → matching stage halts, but the gate's view shrinks to just the
+/// primary → clamp from 2 to 1 → gauge=1.
+///
+/// Verifies the observability path end-to-end: gauge update, the
+/// 1-second idle-poll re-eval, and the flap-hold-gated transition
+/// log (transitions held >1 s actually fire warn/info).
+#[test]
+#[serial]
+fn policy_degraded_gauge_transitions_with_cluster_shape() {
+    let mut cluster = DualCluster::start();
+    let primary_health = cluster.primary.health_addr;
+
+    // Fresh 1+2 cluster on the default policy: gauge=0 (3 nodes, no clamp).
+    wait_for_policy_degraded(primary_health, 0, Duration::from_secs(5));
+
+    // Kill replica 1: 2 nodes left, view.len()=2, clamp from 2 to 2
+    // is a no-op. Gauge should remain 0.
+    cluster.kill_replica1();
+    // Give the idle-poll a couple of ticks plus the flap-hold to
+    // settle. Should still be 0 — losing one of three nodes when
+    // the policy targets 2 doesn't trigger the clamp.
+    std::thread::sleep(Duration::from_millis(2500));
+    let after_one_kill = fetch_policy_degraded(primary_health);
+    assert_eq!(
+        after_one_kill,
+        Some(0),
+        "with 1 replica down (2 nodes connected) the default policy should not be degraded; gauge = {after_one_kill:?}"
+    );
+
+    // Kill replica 2: only the primary remains. View.len()=1, clamp
+    // from 2 to 1 → gauge=1. The matching stage's separate
+    // `replicas_connected==0` halt will reject new orders before
+    // they reach the gate, but the policy evaluator on the idle
+    // path still flips the gauge — that's exactly what alerting
+    // should fire on.
+    cluster.kill_replica2();
+    wait_for_policy_degraded(primary_health, 1, Duration::from_secs(5));
 }
 
 /// Helper extension: wait up to `timeout` for the child, then SIGKILL.

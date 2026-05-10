@@ -65,7 +65,7 @@ pub struct Response {
     pub replication_metrics: Option<Arc<ReplicationMetrics>>,
     /// Per-slot replica active flags. Only "true" slots are included in
     /// the cursor view fed to `Policy::evaluate`, so degrade-friendly
-    /// clauses (`persisted>=2!`) clamp against the *connected* count
+    /// clauses (`persisted>=2 best_effort`) clamp against the *connected* count
     /// rather than counting disconnected slots as zero-cursor nodes.
     /// Mirrors `replication_metrics` — `None` in standalone.
     pub replica_active: Option<[Arc<AtomicBool>; 2]>,
@@ -128,20 +128,15 @@ pub fn run(
     // via `evaluate_durability` on every gate iteration.
     let mut cached_durable_pos: u64;
 
-    // Degradation logger state. The gate loop and the idle path both
-    // call `update_degraded_state` to refresh the `policy_degraded`
-    // utilization flag and emit transition / heartbeat logs. Driving
-    // this from the idle path matters for two operator scenarios:
-    //
-    // 1. Standalone deployments running the default `persisted>=2!`
-    //    are degraded from t=0 — the flag must reflect that even
-    //    before any traffic flows.
-    // 2. A quiet venue that loses a replica overnight should see the
-    //    `/healthz` gauge flip and the warn re-emit promptly, not
-    //    lazily on the next batch.
-    let mut last_degraded_state: bool = false;
-    let mut last_degraded_log: Option<Instant> = None;
-    let mut last_policy_check = Instant::now();
+    // Degradation logger. Tracks transitions, suppresses sub-second
+    // flap noise, and drives the `/healthz` `policy_degraded` gauge.
+    // See `DegradationLogger` for the full state machine. Initialised
+    // below from the policy's startup evaluation so a degraded
+    // standalone deployment (default `persisted>=2 best_effort` →
+    // view.len()=1 → clamps to 1, marks `degraded=true`) is visible
+    // immediately on `/healthz` and in the journal.
+    let startup_now = Instant::now();
+    let mut last_policy_check = startup_now;
     /// Re-emit interval for the "still degraded" reminder.
     const DEGRADED_LOG_INTERVAL: Duration = Duration::from_secs(5);
     /// Cadence at which the idle path re-evaluates the policy. Bounds
@@ -150,9 +145,10 @@ pub fn run(
     /// loads + the policy evaluator) at this rate.
     const POLICY_CHECK_INTERVAL: Duration = Duration::from_secs(1);
 
-    // Initial evaluation so `policy_degraded` and the cached durable
-    // position reflect the cluster's startup shape before the first
-    // batch arrives.
+    // Initial evaluation so the cached durable position and the
+    // `/healthz` gauge reflect the cluster's startup shape before
+    // the first batch arrives.
+    let mut degraded_logger;
     {
         let journal_pos = journal_cursor.get().load(Ordering::Acquire);
         let metrics_ref = replication_metrics.as_deref();
@@ -162,14 +158,11 @@ pub fn run(
         utilization
             .policy_degraded
             .store(status.degraded, Ordering::Relaxed);
-        if status.degraded {
-            tracing::warn!(
-                policy = %policy,
-                "durability policy starts in degraded mode — fewer connected nodes than the target count"
-            );
-            last_degraded_state = true;
-            last_degraded_log = Some(Instant::now());
-        }
+        degraded_logger = if status.degraded {
+            DegradationLogger::new_starting_degraded(startup_now, &policy)
+        } else {
+            DegradationLogger::new(startup_now)
+        };
     }
 
     // Stage histograms registered with the global registry — see
@@ -351,14 +344,12 @@ pub fn run(
                     let metrics_ref = replication_metrics.as_deref();
                     let active_ref = replica_active.as_ref();
                     let status = evaluate_durability(&policy, journal_pos, metrics_ref, active_ref);
-                    update_degraded_state(
+                    degraded_logger.tick(
                         &policy,
                         &utilization,
                         status.degraded,
                         now_ts,
                         DEGRADED_LOG_INTERVAL,
-                        &mut last_degraded_state,
-                        &mut last_degraded_log,
                     );
                     // Cache the position so the next batch's gate sees a
                     // fresh value rather than spinning from a stale cache.
@@ -406,7 +397,12 @@ pub fn run(
                 .map(|s| s.input_seq)
                 .max()
                 .expect("non-empty batch");
-            let needed = max_seq + 1;
+            // `saturating_add` is free on this cold path. `u64::MAX`
+            // is astronomically out of reach (~10²² events), but if
+            // it ever happens — bug, test fixture, far-future replay
+            // — we'd rather saturate at MAX than wrap to 0 and open
+            // the gate spuriously.
+            let needed = max_seq.saturating_add(1);
             #[cfg(feature = "tick-to-trade")]
             {
                 gate_tracker = GateCrossTracker::new(needed);
@@ -445,23 +441,19 @@ pub fn run(
 
         let batch_now = Instant::now();
 
-        // Log degradation transitions and re-emit the reminder. Same
-        // logic the idle path runs on its 1-second timer; consolidated
-        // in `update_degraded_state` so transitions are reported
-        // consistently regardless of whether the response stage is
-        // busy or idle.
+        // Log degradation transitions / re-emit the reminder. Same
+        // logger the idle path uses; transitions are gated on a
+        // sustained-state hold so sub-second flap doesn't spam.
         let degraded_now = utilization.policy_degraded.load(Ordering::Relaxed);
-        update_degraded_state(
+        degraded_logger.tick(
             &policy,
             &utilization,
             degraded_now,
             batch_now,
             DEGRADED_LOG_INTERVAL,
-            &mut last_degraded_state,
-            &mut last_degraded_log,
         );
-        // Bump the idle-path's check timestamp too so we don't fire
-        // both branches in quick succession when traffic stops.
+        // Bump the idle-path's check timestamp so we don't double-
+        // tick the logger when traffic stops.
         last_policy_check = batch_now;
 
         for slot in &batch[..count] {
@@ -737,7 +729,7 @@ fn retry_send(
 ///
 /// Disconnected slots are *omitted from the view* rather than included
 /// with zero cursors. This is what gives degrade-friendly clauses
-/// (`persisted>=2!`) the correct "clamp to connected count" semantics
+/// (`persisted>=2 best_effort`) the correct "clamp to connected count" semantics
 /// — the view's `len()` reflects how many nodes are actually available.
 #[inline]
 pub(crate) fn evaluate_durability(
@@ -765,45 +757,130 @@ pub(crate) fn evaluate_durability(
     policy.evaluate_with_status(&CursorView::new(&nodes[..len]))
 }
 
-/// Update the `policy_degraded` flag and emit transition / heartbeat
-/// logs. Called from both the gate-open path (per consumed batch) and
-/// the idle path (slow timer) so observability tracks the cluster
-/// state regardless of traffic level.
+/// Hold-time before a state transition is committed to the log.
+/// Suppresses log spam when a replica flaps faster than this — only
+/// transitions that hold for at least this long emit warn/info
+/// entries. The `/healthz` gauge updates immediately regardless,
+/// so dashboards and alerts still see real-time state.
+const DEGRADED_FLAP_HOLD: Duration = Duration::from_secs(1);
+
+/// Tracks degradation state across calls and emits warn/info logs
+/// with sustained-state gating + a periodic heartbeat re-emit.
 ///
-/// Mutates `last_degraded_state` and `last_degraded_log` so callers
-/// can keep a coherent view of when the last log line fired without
-/// duplicating the transition / heartbeat decision logic.
-#[inline]
-pub(crate) fn update_degraded_state(
-    policy: &Policy,
-    utilization: &StageUtilization,
-    degraded_now: bool,
-    now: Instant,
-    log_interval: Duration,
-    last_degraded_state: &mut bool,
-    last_degraded_log: &mut Option<Instant>,
-) {
-    utilization
-        .policy_degraded
-        .store(degraded_now, Ordering::Relaxed);
-    if degraded_now {
-        let should_log = !*last_degraded_state
-            || last_degraded_log.is_none_or(|t| now.duration_since(t) >= log_interval);
-        if should_log {
+/// The hot path calls [`Self::tick`] every gate iteration / idle
+/// poll with the current `degraded` value and the wall clock. The
+/// logger handles:
+///
+/// - Updating the `policy_degraded` health gauge immediately.
+/// - Suppressing log lines for transitions that don't hold for at
+///   least [`DEGRADED_FLAP_HOLD`] — a replica flapping at sub-second
+///   cadence produces no log noise, only a quietly-updating gauge.
+/// - Emitting a warn at the moment a sustained degraded state
+///   crosses the hold threshold, plus a periodic re-emit every
+///   `heartbeat_interval` while it persists.
+/// - Emitting an info when a sustained healthy state crosses the
+///   hold threshold (the cluster is back to its target shape and
+///   stayed there long enough that we trust the recovery).
+pub(crate) struct DegradationLogger {
+    /// Last value passed to `tick`; what we'd log about if it stayed
+    /// at this value past the hold threshold.
+    pending_state: bool,
+    /// When `pending_state` first appeared. Reset on every flip.
+    pending_since: Instant,
+    /// Whether the current pending state has been logged yet. Only
+    /// the *first* log per sustained streak crosses; subsequent
+    /// re-emits while degraded are heartbeat warns.
+    pending_logged: bool,
+    /// When the last warn fired. Drives the periodic re-emit while
+    /// degraded.
+    last_log: Option<Instant>,
+}
+
+impl DegradationLogger {
+    pub(crate) fn new(now: Instant) -> Self {
+        Self {
+            pending_state: false,
+            pending_since: now,
+            pending_logged: true, // healthy is the assumed initial state; nothing to log
+            last_log: None,
+        }
+    }
+
+    /// Use when the policy is known to start in a degraded state
+    /// (e.g. standalone deployments running `persisted>=2 best_effort`
+    /// from t=0). Logs a startup warn immediately and treats the
+    /// state as already-logged so the next tick doesn't re-emit.
+    pub(crate) fn new_starting_degraded(now: Instant, policy: &Policy) -> Self {
+        tracing::warn!(
+            policy = %policy,
+            "durability policy starts in degraded mode — fewer connected nodes than the target count"
+        );
+        Self {
+            pending_state: true,
+            pending_since: now,
+            pending_logged: true,
+            last_log: Some(now),
+        }
+    }
+
+    /// Update the gauge + emit transition/heartbeat logs as needed.
+    /// Cheap on the hot path: one atomic store, a few branches, one
+    /// `Instant::duration_since`.
+    pub(crate) fn tick(
+        &mut self,
+        policy: &Policy,
+        utilization: &StageUtilization,
+        degraded_now: bool,
+        now: Instant,
+        heartbeat_interval: Duration,
+    ) {
+        utilization
+            .policy_degraded
+            .store(degraded_now, Ordering::Relaxed);
+
+        if degraded_now != self.pending_state {
+            // State changed — start a new hold window. Don't log
+            // until / unless this new state stays long enough.
+            self.pending_state = degraded_now;
+            self.pending_since = now;
+            self.pending_logged = false;
+            return;
+        }
+
+        // State held. If we haven't yet logged this streak's onset,
+        // and it's been pending for at least the flap-hold time,
+        // emit the transition message and mark logged.
+        if !self.pending_logged && now.duration_since(self.pending_since) >= DEGRADED_FLAP_HOLD {
+            if degraded_now {
+                tracing::warn!(
+                    policy = %policy,
+                    "durability policy operating in degraded mode — fewer connected nodes than the target count, gate clamped to surviving cluster"
+                );
+            } else {
+                tracing::info!(
+                    policy = %policy,
+                    "durability policy returned to target shape"
+                );
+            }
+            self.pending_logged = true;
+            self.last_log = Some(now);
+            return;
+        }
+
+        // Heartbeat re-emit while a degraded state persists.
+        if degraded_now
+            && self.pending_logged
+            && self
+                .last_log
+                .is_none_or(|t| now.duration_since(t) >= heartbeat_interval)
+        {
             tracing::warn!(
                 policy = %policy,
-                "durability policy operating in degraded mode — fewer connected nodes than the target count, gate clamped to surviving cluster"
+                "durability policy still degraded — fewer connected nodes than the target count"
             );
-            *last_degraded_log = Some(now);
+            self.last_log = Some(now);
         }
-    } else if *last_degraded_state {
-        tracing::info!(
-            policy = %policy,
-            "durability policy returned to target shape"
-        );
-        *last_degraded_log = Some(now);
     }
-    *last_degraded_state = degraded_now;
 }
 
 /// Minimum persisted cursor across currently-connected replica slots.
@@ -983,7 +1060,7 @@ mod tests {
         // Same shape with `!`: clamp to the connected count (=1) and
         // gate opens at journal_pos. The clamp from 2 → 1 is exactly
         // what `degraded` reports.
-        let p = parse("persisted>=2!").unwrap();
+        let p = parse("persisted>=2 best_effort").unwrap();
         let r = evaluate_durability(&p, 500, None, None);
         assert_eq!(r.durable_pos, 500);
         assert!(r.degraded);
@@ -1054,7 +1131,7 @@ mod tests {
     fn single_replica_degrade_persisted_two_still_requires_both_survivors() {
         // Same shape with `!`. `effective_count = min(2, view.len()=2)
         // = 2`, so the clamp is a no-op when 2 nodes are connected.
-        let p = parse("persisted>=2!").unwrap();
+        let p = parse("persisted>=2 best_effort").unwrap();
         let m = metrics((100, 100), (999, 999));
         let a = flags(true, false);
         assert_eq!(
@@ -1083,7 +1160,7 @@ mod tests {
         // halt at `replicas_connected==0` rejects new orders before
         // they reach the gate; this verifies the gate semantics in
         // isolation.
-        let p = parse("persisted>=2!").unwrap();
+        let p = parse("persisted>=2 best_effort").unwrap();
         let m = metrics((999, 999), (999, 999));
         let a = flags(false, false);
         assert_eq!(
@@ -1155,7 +1232,7 @@ mod tests {
     /// case under normal cluster lifecycles.
     #[test]
     fn fresh_cluster_zero_cursors_included_in_view() {
-        let p = parse("persisted>=2!").unwrap();
+        let p = parse("persisted>=2 best_effort").unwrap();
         // Both replicas just handshook at seq 0, primary also at 0
         // (fresh cluster, no events yet). View = 3 nodes; clamp from
         // target=2 to 2 is a no-op; 2nd-largest persisted = 0.
