@@ -40,7 +40,7 @@ No limit on resting orders, pending stops, or price levels per instrument. An at
 
 **Impact**: Memory exhaustion (OOM kill) or latency spikes from HashMap resizes.
 **Exploitable remotely**: Yes — submit many resting orders.
-**Mitigation**: Per-account max open orders limit. Per-instrument max price levels. Reject orders that would exceed limits.
+**Status**: **PARTIALLY FIXED** — added `--max-orders-per-account` flag (default 10 000). Submissions beyond the cap reject with `ExceedsMaxOpenOrders` before reservation. The cap is operator policy and must match across primary and replicas (replay determinism). Remaining: per-instrument max price levels, and a global ceiling on total resting orders so a horde of accounts can't collectively exhaust the maps.
 
 ---
 
@@ -124,7 +124,7 @@ The OOM-via-large-count vector was closed (counts are now bounded against remain
 | ID | Issue | Severity | Remote |
 |----|-------|----------|--------|
 | SEC-02 | No connection limits / rate limiting (PARTIAL) | HIGH | Yes |
-| SEC-03 | Unbounded order book growth | HIGH | Yes |
+| SEC-03 | Unbounded order book growth (PARTIAL) | HIGH | Yes |
 | SEC-04 | No order throttling | MEDIUM | Yes |
 | SEC-05 | Journal disk exhaustion hangs server | MEDIUM | Indirect |
 | SEC-06 | Disruptor backpressure spins CPU | MEDIUM | Partial |
@@ -135,7 +135,7 @@ The OOM-via-large-count vector was closed (counts are now bounded against remain
 ## Recommended Priority
 
 1. **SEC-02** — per-IP connection cap + auth-failure backoff (`--max-connections` already landed)
-2. **SEC-03** — per-account max open orders
+2. **SEC-03** — per-instrument max price levels (per-account cap already landed)
 3. **SEC-04** — per-account order rate limiter
 4. **SEC-08** — TLS support
 5. **SEC-05** — disk usage monitoring (rotation already landed)

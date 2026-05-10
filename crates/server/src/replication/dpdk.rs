@@ -901,6 +901,8 @@ pub fn run_receiver_dpdk(
     busy_spin: bool,
     async_ack: bool,
     rotation: Option<(u64, std::sync::Arc<AtomicBool>)>,
+    // SEC-03: must equal the primary's --max-orders-per-account.
+    max_orders_per_account: u32,
 ) -> ReceiverResult {
     use crate::App;
     use crate::JournalWriter;
@@ -925,7 +927,8 @@ pub fn run_receiver_dpdk(
             let next = engine.next_sequence();
             let last = next.saturating_sub(1);
             let hash = engine.chain_hash().unwrap_or([0u8; 32]);
-            let (exchange, writer) = engine.into_parts();
+            let (mut exchange, writer) = engine.into_parts();
+            crate::server::apply_max_orders(&mut exchange, max_orders_per_account);
             (Some(exchange), Some(writer), last, hash)
         } else {
             (None, None, 0u64, [0u8; 32])
@@ -1231,7 +1234,9 @@ pub fn run_receiver_dpdk(
                 Some(genesis_chain_hash),
                 0,
             )?;
-            exchange = Some(crate::server::empty_app());
+            let mut fresh = crate::server::empty_app();
+            crate::server::apply_max_orders(&mut fresh, max_orders_per_account);
+            exchange = Some(fresh);
             journal_writer = Some(writer);
         }
 

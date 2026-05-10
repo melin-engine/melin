@@ -402,6 +402,11 @@ pub enum RejectReason {
     InvalidExpiry,
     /// Instrument is disabled — no new orders or amendments accepted.
     InstrumentDisabled,
+    /// Account already has the maximum number of open orders (resting
+    /// limits plus pending stops, across all instruments). Configured by
+    /// the operator to bound order_index growth (SEC-03). Cancel an
+    /// existing order before placing a new one.
+    ExceedsMaxOpenOrders,
 }
 
 #[cfg(test)]
