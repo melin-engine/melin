@@ -619,10 +619,12 @@ impl Exchange {
         self.scheduled_tasks.len()
     }
 
-    /// Live rate-limiter bucket count. Test-only helper for asserting
-    /// bucket-eviction behaviour (B1).
-    #[cfg(test)]
-    pub(crate) fn order_bucket_count(&self) -> usize {
+    /// Live rate-limiter bucket count. Used by the server's startup
+    /// path to detect a primary↔replica config mismatch after snapshot
+    /// restore (non-empty buckets paired with a disabled limiter
+    /// indicates the operator forgot to wire the rate-limit config) and
+    /// by tests to assert bucket-eviction behaviour.
+    pub fn order_bucket_count(&self) -> usize {
         self.order_buckets.len()
     }
 

@@ -2307,8 +2307,40 @@ pub fn apply_max_orders(
     max_orders_per_second: u32,
     max_orders_burst: u32,
 ) {
+    // SEC-04 mismatch detection (must run BEFORE we apply the new
+    // config). Non-empty bucket map paired with a disabled limiter
+    // means we just restored a snapshot whose primary had the limiter
+    // active, but the local operator forgot to wire matching
+    // `--max-orders-per-second` / `--max-orders-burst` flags. The
+    // engine will continue accepting all orders unthrottled — silent
+    // until the replica is promoted and starts diverging from the
+    // primary's accept/reject decisions. Surface the misconfig loudly
+    // so operators catch it at startup, not on incident.
+    let restored_buckets = app.order_bucket_count();
+    let limiter_disabled = max_orders_per_second == 0 || max_orders_burst == 0;
+    if limiter_disabled && restored_buckets > 0 {
+        warn!(
+            restored_buckets,
+            max_orders_per_second,
+            max_orders_burst,
+            "SEC-04 config mismatch: snapshot carries rate-limit buckets but local limiter is \
+             disabled — primary and replica must run with matching values"
+        );
+    }
+
     app.set_max_open_orders_per_account(max_orders_per_account);
     app.set_max_orders_per_second(max_orders_per_second, max_orders_burst);
+
+    // Visibility for operators verifying primary↔replica parity at a
+    // glance. SEC-03 cap and SEC-04 rate-limit knobs are operator
+    // policy (not journaled), so logging the applied values is the
+    // only way to confirm both processes started with the same config.
+    info!(
+        max_orders_per_account,
+        max_orders_per_second,
+        max_orders_burst,
+        "applied per-account order limits (SEC-03 cap, SEC-04 rate)"
+    );
 }
 
 #[cfg(all(feature = "noop", not(feature = "trading")))]
