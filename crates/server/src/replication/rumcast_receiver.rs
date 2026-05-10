@@ -928,6 +928,10 @@ fn streaming_loop(
     // from a dead one. Without this, a quiescent stream produces no acks
     // and the primary would incorrectly evict the slot.
     let mut last_sent_ack_seq: u64 = 0;
+    // Last in-memory cursor sent on the wire. Together with
+    // `last_sent_ack_seq` this drives the dual-track ack coalescing
+    // — see the flush block below; mirrors `tcp_receiver`.
+    let mut last_sent_in_memory_seq: u64 = 0;
     let mut last_keepalive = Instant::now();
     const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(1);
 
@@ -1031,20 +1035,28 @@ fn streaming_loop(
         }
 
         // ---- Flush acks ----
-        let ready_seq = if async_ack {
+        //
+        // Two-track model (see `tcp_receiver` for the full rationale):
+        // pop the queue for the persisted-cursor track; sample
+        // `accum_end_sequence` for the in-memory track; fire one ack
+        // iff either has advanced past the last value sent.
+        let popped_acked = if async_ack {
             pending_acks.pop_all_async()
         } else {
             pending_acks.pop_ready(journal_cursor)
         };
-        if let Some(seq) = ready_seq {
-            if let Err(e) = session.send_ack_with(seq, *accum_end_sequence, shutdown) {
+        let acked_now = popped_acked.unwrap_or(last_sent_ack_seq);
+        let in_mem_now = *accum_end_sequence;
+        if acked_now > last_sent_ack_seq || in_mem_now > last_sent_in_memory_seq {
+            if let Err(e) = session.send_ack_with(acked_now, in_mem_now, shutdown) {
                 if shutdown.load(Ordering::Relaxed) {
                     return SessionExit::Shutdown;
                 }
                 warn!(error = %e, "ack send failed");
                 return SessionExit::Disconnected;
             }
-            last_sent_ack_seq = seq;
+            last_sent_ack_seq = acked_now;
+            last_sent_in_memory_seq = in_mem_now;
             last_keepalive = Instant::now();
         }
 

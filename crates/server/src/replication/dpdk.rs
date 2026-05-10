@@ -1321,6 +1321,11 @@ pub fn run_receiver_dpdk(
         let mut pending_acks = PendingAckQueue::new(pipeline_depth);
         let mut received_data = false;
         let mut accum_end_sequence: u64 = 0;
+        // Last cursor pair sent on the wire. Coalesces dual-track ack
+        // triggers (see the `// --- Flush acks ---` block below for the
+        // full rationale; mirrors `tcp_receiver`'s scheme).
+        let mut last_sent_acked_seq: u64 = 0;
+        let mut last_sent_in_memory_seq: u64 = 0;
 
         // Encode an ack into send_buf and queue it on the DPDK transport.
         //
@@ -1443,14 +1448,28 @@ pub fn run_receiver_dpdk(
                 break 'streaming SessionExit::Promote;
             }
 
-            // Flush any acks that have become durable since last iteration.
-            let ready_seq = if async_ack {
+            // --- Flush acks ---
+            //
+            // Two-track model (see `tcp_receiver` for the full rationale):
+            //
+            //   1. Persisted track via the queue: `pop_ready` yields the
+            //      newly-durable primary sequence when journal_cursor
+            //      catches up to a queued entry's local-ring target.
+            //   2. In-memory track: read `accum_end_sequence` directly.
+            //
+            // Fire one ack iff either track has advanced past the last
+            // value sent. Coalesces multiple advances naturally.
+            let popped_acked = if async_ack {
                 pending_acks.pop_all_async()
             } else {
                 pending_acks.pop_ready(journal_cursor)
             };
-            if let Some(seq) = ready_seq {
-                send_ack_dpdk!(seq);
+            let acked_now = popped_acked.unwrap_or(last_sent_acked_seq);
+            let in_mem_now = accum_end_sequence;
+            if acked_now > last_sent_acked_seq || in_mem_now > last_sent_in_memory_seq {
+                send_ack_dpdk!(acked_now);
+                last_sent_acked_seq = acked_now;
+                last_sent_in_memory_seq = in_mem_now;
             }
 
             // Backpressure: if pipeline is saturated, block until the oldest

@@ -183,6 +183,13 @@ fn replica_stream_uring(
     let mut ack_send_buf: Vec<u8> = Vec::with_capacity(64);
     let mut ack_send_offset: usize = 0;
     let mut ack_send_in_flight = false;
+    // Last cursor pair sent on the wire. Used to coalesce: the flush
+    // block fires an ack iff either cursor has advanced past these
+    // values since the last send. Cursors are monotonic, so multiple
+    // advances during an in-flight SEND collapse into one ack at the
+    // next iteration after SEND completes.
+    let mut last_sent_acked_seq: u64 = 0;
+    let mut last_sent_in_memory_seq: u64 = 0;
     let mut idle_spins: u32 = 0;
     // Submit initial multishot RECV. The kernel will produce CQEs
     // continuously until EOF, error, or buffer pool exhaustion.
@@ -245,50 +252,63 @@ fn replica_stream_uring(
         }
 
         // --- Flush acks ---
-        // Sync mode (default): wait for the journal cursor to advance past
-        // each pending batch's target before acking — guarantees the data
-        // is fsynced locally before the primary considers this replica
-        // durable.
         //
-        // Async mode (`--async-replica-ack`): pop the oldest pending ack
-        // ignoring the journal cursor — acks as soon as the SEND slot is
-        // free. Removes ~50–80µs of fsync latency from the critical path
-        // at the cost of weaker per-replica durability semantics; see the
-        // CLI flag docs for the failure-mode analysis.
-        let ready_seq = if !ack_send_in_flight {
-            if async_ack {
+        // Two-track ack model. Each iteration:
+        //
+        //   1. Advance the *persisted* track via the queue: if the
+        //      journal cursor has caught up to a queued entry's
+        //      target, the entry's primary-side sequence becomes the
+        //      replica's `acked_sequence`. The queue is what maps
+        //      local-ring positions to primary sequences.
+        //   2. Sample the *in-memory* track from `accum_end_sequence`
+        //      directly — that's the highest primary sequence the
+        //      receiver has published to the local ring (pre-journal).
+        //   3. If either track has advanced past the last value we
+        //      put on the wire, fire one ack carrying the latest
+        //      values of both. Coalescing falls out naturally — while
+        //      a SEND is in flight, both tracks may advance freely;
+        //      the next iteration after SEND completes fires one ack.
+        //
+        // Two trigger sources covered by this single check:
+        //
+        //   - On receive: `accum_end_sequence` advances when a batch
+        //     publishes to the input ring. The very next loop iteration
+        //     fires an ack carrying the new in-memory cursor — the
+        //     latency win for `in_memory>=N` policies.
+        //   - On journal advance: the queue's `pop_ready` returns the
+        //     newly-durable primary sequence, which becomes the
+        //     replica's `acked_sequence` on the next ack.
+        if !ack_send_in_flight {
+            let popped_acked = if async_ack {
                 pending_acks.pop_all_async()
             } else {
                 pending_acks.pop_ready(journal_cursor)
+            };
+            let acked_now = popped_acked.unwrap_or(last_sent_acked_seq);
+            let in_mem_now = *accum_end_sequence;
+            if acked_now > last_sent_acked_seq || in_mem_now > last_sent_in_memory_seq {
+                ack_send_buf.clear();
+                encode_ack(
+                    &Ack {
+                        acked_sequence: acked_now,
+                        in_memory_sequence: in_mem_now,
+                    },
+                    &mut ack_send_buf,
+                );
+                let sqe = opcode::Send::new(
+                    types::Fixed(0),
+                    ack_send_buf.as_ptr(),
+                    ack_send_buf.len() as u32,
+                )
+                .build()
+                .user_data(TOKEN_SEND);
+                unsafe { ring.submission().push(&sqe).expect("SQ full") };
+                ack_send_in_flight = true;
+                ack_send_offset = 0;
+                last_sent_acked_seq = acked_now;
+                last_sent_in_memory_seq = in_mem_now;
+                acks_sent_since_log += 1;
             }
-        } else {
-            None
-        };
-        if let Some(seq) = ready_seq {
-            ack_send_buf.clear();
-            encode_ack(
-                &Ack {
-                    acked_sequence: seq,
-                    // In-memory cursor = highest sequence published to
-                    // the input ring. `accum_end_sequence` advances each
-                    // time a slot lands in the ring (pre-journal); `seq`
-                    // is gated on the journal cursor. Always
-                    // `accum_end_sequence >= seq`.
-                    in_memory_sequence: *accum_end_sequence,
-                },
-                &mut ack_send_buf,
-            );
-            let sqe = opcode::Send::new(
-                types::Fixed(0),
-                ack_send_buf.as_ptr(),
-                ack_send_buf.len() as u32,
-            )
-            .build()
-            .user_data(TOKEN_SEND);
-            unsafe { ring.submission().push(&sqe).expect("SQ full") };
-            ack_send_in_flight = true;
-            ack_send_offset = 0;
-            acks_sent_since_log += 1;
         }
 
         // --- Backpressure: if pending_acks full, drain in-flight SEND
