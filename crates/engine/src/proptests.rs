@@ -1253,7 +1253,7 @@ proptest! {
             stp: SelfTradeProtection::Allow,
             expiry_ns: 0,
         };
-        let _ = mgr.try_reserve(&buy, &spec, 0);
+        let _ = mgr.try_reserve(&buy, &spec);
 
         // Sell limit: reserves quantity in base, no multiplication.
         let sell = Order {
@@ -1266,7 +1266,7 @@ proptest! {
             stp: SelfTradeProtection::Allow,
             expiry_ns: 0,
         };
-        let _ = mgr.try_reserve(&sell, &spec, 0);
+        let _ = mgr.try_reserve(&sell, &spec);
     }
 
     /// Fill operations with large values must not panic.
@@ -1305,8 +1305,8 @@ proptest! {
             expiry_ns: 0,
         };
 
-        let buy_res = mgr.try_reserve(&buy, &spec, 0);
-        let sell_res = mgr.try_reserve(&sell, &spec, 0);
+        let buy_res = mgr.try_reserve(&buy, &spec);
+        let sell_res = mgr.try_reserve(&sell, &spec);
 
         if let (Ok((_amt, buy_slot)), Ok((_amt2, sell_slot))) = (buy_res, sell_res) {
             // Fill must not panic regardless of price × quantity magnitude.

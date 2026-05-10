@@ -2581,8 +2581,9 @@ mod tests {
             acct_a_usd = je.exchange().accounts().balance(ACCT_A, USD);
             acct_b_usd = je.exchange().accounts().balance(ACCT_B, USD);
 
-            // cost=10_000, maker_fee=10, taker_fee=20, total=30.
-            assert_eq!(fee_account_balance, 30);
+            // Under A: seller (maker) quote fee = cost × 10 bps = 10 USD.
+            // buyer (taker) base fee = qty × 20 bps = 0 (truncates at this qty).
+            assert_eq!(fee_account_balance, 10);
         }
 
         // Recover from journal and verify fee schedule was replayed.
