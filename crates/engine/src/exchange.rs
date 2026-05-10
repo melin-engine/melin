@@ -179,10 +179,21 @@ pub struct Exchange {
     /// can read a deterministic clock without threading a parameter through
     /// every public method's signature. Initialised to `0` and overwritten
     /// every time `apply` is called — never reset between events; readers
-    /// outside `apply` see whatever the last `apply` left here. Direct
-    /// `Exchange::execute` callers in tests that don't exercise the rate
-    /// limiter (the engine-default `max_orders_per_second == 0`) bypass
-    /// the limiter entirely, so the value is irrelevant in that path.
+    /// outside `apply` see whatever the last `apply` left here.
+    ///
+    /// Footgun for direct callers (tests, embedded users): if the rate
+    /// limiter is active (`max_orders_per_second > 0 &&
+    /// max_orders_burst > 0`) and a caller invokes `Exchange::execute`
+    /// without ever calling [`Self::set_current_event_ts_ns`], the
+    /// limiter operates against a frozen `now_ns = 0` clock — buckets
+    /// don't refill, so each account hits a hard ceiling at its
+    /// initial burst. Engine-library users who never activate the rate
+    /// limiter (engine-default `max_orders_per_second == 0`) bypass
+    /// the limiter entirely and can ignore this. Test code in this
+    /// crate uses the `execute_at(exchange, now_ns, …)` helper in the
+    /// test module to wrap the stamp + execute pair; embedded users
+    /// must call `set_current_event_ts_ns` themselves before each
+    /// `execute` (or call through `Application::apply`, which stamps).
     current_event_ts_ns: u64,
 }
 
@@ -475,7 +486,8 @@ impl Exchange {
     }
 
     /// Configure the per-account order-submission rate limit (SEC-04).
-    /// Either argument set to `0` disables the limiter (opt-out).
+    /// Argument semantics (active values, `0` = disabled, etc.) live on
+    /// the `max_orders_per_second` / `max_orders_burst` field docs above.
     ///
     /// Bucket-clearing rule: existing per-account bucket state is
     /// cleared **only** when transitioning between two active
