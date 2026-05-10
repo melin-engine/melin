@@ -21,32 +21,19 @@ memory-model race, missing wire byte-pattern test) landed in commits
 
 ## P1 — Production gaps
 
-### Bench-number regression vs published latency figures
+All original P1 items landed on this branch:
 
-The legacy `--async-replica-ack` removed ~50–80 µs of fsync round-trip
-from the replication path. With the flag gone (`async_ack` hardcoded
-to `false` at the three receiver call sites), the receiver gates ack
-send on the local journal cursor — same behaviour as the pre-async-ack
-baseline.
+- Idle-stage observability for `policy_degraded` — `8f28bf1`
+- Stale operator docs (`operations.md`, `replication.md`,
+  `roadmap.md`), broken bench script, and the misleading
+  "strictly stronger" claim — `6fb806a`
 
-The new `in_memory>=N` policy clauses parse and evaluate correctly,
-but they don't yet save fsync latency in practice because the receiver
-still waits for the journal cursor before sending the ack carrying the
-in-memory cursor.
-
-Fix: re-implement the ack-on-receive optimisation in the receiver such
-that an ack fires on every received batch (carrying the current
-in-memory cursor + the journal-gated acked cursor). Done correctly,
-this lets `in_memory>=2` match or beat the legacy async-ack
-end-to-end latency without any operator-visible knob. Until this lands,
-**bench numbers under the new code will be slightly worse** than
-previously published figures using `--async-replica-ack`. Either ship
-the optimisation before re-publishing, or flag the regression in
-release notes.
-
-The other original P1 items (idle-stage staleness, stale operator
-docs, broken bench script, misleading "strictly stronger" claim)
-landed in commits `8f28bf1` and `6fb806a`.
+The remaining ack-on-receive plumbing graduated to a standalone
+roadmap item (#5 in `docs/roadmap.md`) because it's a meaningful
+product polish in its own right — paired with flipping the default
+to `persisted>=1 && in_memory>=2` and re-framing the docs around a
+three-tier durability menu (paranoid quorum / fast cross-node /
+single-node).
 
 ---
 
@@ -176,9 +163,8 @@ extended.
 
 1. ~~P0 (B1, B2, wire byte-pattern test)~~ — landed in `a84540a`,
    `8888732`, `40f9c76`.
-2. ~~P1 idle staleness, doc updates, bench script, doc claim~~ —
-   landed in `6fb806a`, `8f28bf1`. The remaining P1 item
-   (ack-on-receive plumbing) is still open; bench numbers under the
-   new code carry the documented ~50–80 µs regression until it lands.
+2. ~~P1~~ — idle staleness, doc updates, bench script, doc claim
+   landed in `6fb806a`, `8f28bf1`. Ack-on-receive + three-tier
+   default graduated to roadmap item #5 in `docs/roadmap.md`.
 3. P2 on a follow-up branch.
 4. P3 driven by buyer feedback / commercial roadmap.
