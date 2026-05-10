@@ -12,7 +12,13 @@ Two pieces of follow-up work are planned, in this order:
    legacy `--async-replica-ack` semantic correctly so a policy with
    an `in_memory` clause actually saves the ~50–80 µs of fsync
    round-trip. Until this lands, `in_memory>=N` parses correctly but
-   produces the same end-to-end latency as `persisted>=N`.
+   produces the same end-to-end latency as `persisted>=N`. Includes a
+   revisit of ack coalescing — the new design doubles the trigger
+   rate (receive + journal-advance), and while replication-wire
+   bandwidth is comfortably under-utilised (~1.6 MB/s of acks vs
+   ~1 GB/s of data the other way), the coalescing window and ack-
+   piggyback rule should be tuned to keep the send-syscall rate
+   honest and avoid packet flood under bursty journal advances.
 2. **Replace the policy DSL with a 3-variant enum** (see below) —
    collapse the operator-facing surface to a single
    `--durability-mode` flag with three named modes, each a real
@@ -104,10 +110,10 @@ the intent on first contact.
 
 ### Sequencing
 
-1. Roadmap #5 lands `Replicated`'s latency win — without
-   ack-on-receive plumbing, `Replicated` and `Synchronous` have
-   identical end-to-end latency and shipping the enum would be
-   advertising a difference that doesn't materialise.
+1. Roadmap #5 lands `Hybrid`'s latency win — without ack-on-receive
+   plumbing, `Hybrid` and `DurablyReplicated` have identical end-to-
+   end latency and shipping the enum would be advertising a
+   difference that doesn't materialise.
 2. Then a follow-up branch swaps the CLI surface to `--durability-mode`,
    removes the DSL parser, and updates `operations.md` /
    `replication.md`. Net code reduction probably ~200 LOC.
