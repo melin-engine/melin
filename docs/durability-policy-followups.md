@@ -21,68 +21,13 @@ memory-model race, missing wire byte-pattern test) landed in commits
 
 ## P1 — Production gaps
 
-### `policy_degraded` is stale during idle periods
-
-`StageUtilization::policy_degraded` and the periodic warn-level log are
-only updated inside the response stage's gate-spin loop, which only
-runs when a batch is consumed. Two consequences:
-
-1. A standalone deployment with the default `persisted>=2!` is in fact
-   running clamped (`view.len()=1`, target=2 → degrade clamps to 1).
-   `evaluate_durability` correctly reports `degraded=true` — but the
-   flag is not written until the first batch flows through the gate.
-   `/healthz` polled before any traffic shows `policy_degraded=0`.
-2. A quiet exchange overnight that loses a replica won't see the warn
-   re-emit or the `/healthz` gauge flip until traffic resumes. Operator
-   alerting can lag by minutes/hours.
-
-Fix:
-
-- Initialize the flag at server startup by evaluating the policy
-  against the initial cluster shape (primary alone if standalone,
-  primary + 0 connected replicas otherwise).
-- Move the periodic warn to a wall-clock timer that runs regardless
-  of gate activity. Either piggyback on the existing heartbeat scan
-  in the response stage's idle path, or have the health-endpoint
-  thread emit it.
-
-### Operator-facing docs reference deleted flags
-
-`docs/operations.md:74-76`, `docs/replication.md:55, 61, 65, 69-89,
-150, 189`, and `docs/roadmap.md:15` all describe `--no-quorum-durability`
-and `--async-replica-ack` as live, working flags with detailed
-durability-tradeoff prose. Both flags are gone.
-
-Fix:
-
-- Replace the flag rows in `operations.md` with a `--durability-policy`
-  row.
-- Rewrite the `docs/replication.md` durability section around the
-  policy framework. Drop the async-replica-ack section or replace it
-  with a forward-reference to the planned ack-on-receive work.
-- Update `docs/roadmap.md` item #4: either mark complete or rewrite the
-  description to reflect what landed (the description still references
-  three durability levels including the obsolete `journaled` /
-  `fsynced` framing).
-
-### Bench script breaks immediately
-
-`scripts/lan-bench-suite.sh:171` defaults
-`REPLICA_EXTRA_ARGS=--async-replica-ack`. The new server rejects this
-as an unknown CLI argument, so any LAN bench run fails before the
-first server starts.
-
-Fix: drop the default flag from the bench script. Note in the comment
-above that the previous `--async-replica-ack` optimisation is not yet
-reachable through the policy framework (see the next item).
-
 ### Bench-number regression vs published latency figures
 
 The legacy `--async-replica-ack` removed ~50–80 µs of fsync round-trip
-from the replication path (`docs/replication.md:65`). With the flag
-gone (`async_ack` hardcoded to `false` at the three receiver call
-sites), the receiver gates ack send on the local journal cursor — same
-behaviour as the pre-async-ack baseline.
+from the replication path. With the flag gone (`async_ack` hardcoded
+to `false` at the three receiver call sites), the receiver gates ack
+send on the local journal cursor — same behaviour as the pre-async-ack
+baseline.
 
 The new `in_memory>=N` policy clauses parse and evaluate correctly,
 but they don't yet save fsync latency in practice because the receiver
@@ -99,18 +44,9 @@ previously published figures using `--async-replica-ack`. Either ship
 the optimisation before re-publishing, or flag the regression in
 release notes.
 
-### Misleading "strictly stronger" claim
-
-`crates/server/src/durability_policy.rs:94-96` claims `persisted>=2!`
-is strictly stronger than legacy auto-degrade in degraded mode. This
-is true only for **1+2** clusters (where degrade clamps to 2-of-2,
-beating legacy's drop to 1). In **1+1** clusters the new and legacy
-behaviours are equivalent in both healthy and degraded states.
-
-Fix: rewrite the claim to spell out the cluster-shape dependency. The
-strictly-stronger property holds for "deployments with ≥2 connected
-replicas at policy authoring time"; in 1+1 the new code matches legacy
-exactly.
+The other original P1 items (idle-stage staleness, stale operator
+docs, broken bench script, misleading "strictly stronger" claim)
+landed in commits `8f28bf1` and `6fb806a`.
 
 ---
 
@@ -240,8 +176,9 @@ extended.
 
 1. ~~P0 (B1, B2, wire byte-pattern test)~~ — landed in `a84540a`,
    `8888732`, `40f9c76`.
-2. P1 (idle staleness, doc updates, bench script, doc claim, async-ack
-   regression note) on this branch before merge — operator-facing
-   surface needs to match what shipped.
+2. ~~P1 idle staleness, doc updates, bench script, doc claim~~ —
+   landed in `6fb806a`, `8f28bf1`. The remaining P1 item
+   (ack-on-receive plumbing) is still open; bench numbers under the
+   new code carry the documented ~50–80 µs regression until it lands.
 3. P2 on a follow-up branch.
 4. P3 driven by buyer feedback / commercial roadmap.
