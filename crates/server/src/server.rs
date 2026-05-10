@@ -172,21 +172,6 @@ pub struct ServerConfig {
     #[arg(long, default_value_t = 5)]
     pub replication_heartbeat_secs: u64,
 
-    /// Acknowledge replicated batches as soon as they are received and
-    /// queued for the local journal stage, instead of waiting for the
-    /// local fsync to complete. Removes ~50–80µs of fsync latency from
-    /// the replication round-trip, lifting steady-state throughput.
-    ///
-    /// Durability tradeoff: a replica crash before its local fsync can
-    /// lose recently-acked batches from that replica's journal. The
-    /// primary still has them on disk and re-syncs the replica via the
-    /// catch-up protocol on reconnect, so end-to-end no data is lost
-    /// unless the primary's disk also fails simultaneously. Acceptable
-    /// for venues where dual-disk-failure is mitigated by separate means
-    /// (RAID, three-way replication, off-site journaling).
-    #[arg(long, default_value_t = false)]
-    pub async_replica_ack: bool,
-
     /// Number of receive batches the replica can have awaiting local
     /// journal fsync before the receiver applies backpressure. Must be a
     /// power of two. Higher values allow the primary to stay further ahead
@@ -201,15 +186,29 @@ pub struct ServerConfig {
     #[arg(long, default_value_t = 256)]
     pub replication_ring_size: usize,
 
-    /// Disable quorum-based durability. By default, when 2 replicas have
-    /// acked an event the response stage sends without waiting for the local
-    /// journal fsync — removing NVMe tail latency from the critical path.
-    /// The journal still writes (for local crash recovery) but does not gate
-    /// client responses. Falls back to fsync-gated mode automatically when
-    /// fewer than 2 replicas are connected. This flag forces fsync-gated
-    /// mode unconditionally (useful for debugging).
-    #[arg(long, default_value_t = false)]
-    pub no_quorum_durability: bool,
+    /// Durability policy that gates client responses. Expressed as one
+    /// or more `<level>>=<n>[!]` clauses joined with `&&`. Levels are
+    /// `persisted` (event written to NVMe via `O_DIRECT`, durable behind
+    /// PLP) and `in_memory` (event accepted into the node's pipeline).
+    /// A trailing `!` marks the clause as best-effort: it clamps to the
+    /// connected cluster shape rather than failing closed.
+    ///
+    /// Examples:
+    /// - `persisted>=1`   standalone or single-node durability
+    /// - `persisted>=2`   strict 2-of-3 quorum; gate stalls if a replica
+    ///   disconnects
+    /// - `persisted>=2!`  (default) 2-of-3 when healthy, falls back to
+    ///   all surviving nodes when one drops — strictly stronger than
+    ///   legacy auto-degrade-to-1-node
+    /// - `in_memory>=2`   confirm receipt on a second node; weaker
+    ///   durability, removes fsync latency from the critical path
+    ///
+    /// See `crate::durability_policy` for the full grammar and
+    /// evaluation semantics. Active degradation (a `!`-marked clause
+    /// clamping below its target count) surfaces on `/healthz` as
+    /// `melin_durability_policy_degraded` and emits a periodic warn.
+    #[arg(long, default_value = "persisted>=2!")]
+    pub durability_policy: String,
 
     /// Yield to the OS scheduler when pipeline threads are idle instead
     /// of busy-spinning. Use on shared machines without isolated cores to
@@ -397,10 +396,9 @@ impl Default for ServerConfig {
             replication_batch_size: 128,
             max_journal_batch: 1024,
             replication_heartbeat_secs: 5,
-            async_replica_ack: false,
             replication_pipeline_depth: DEFAULT_REPLICATION_PIPELINE_DEPTH,
             replication_ring_size: 256,
-            no_quorum_durability: false,
+            durability_policy: "persisted>=2!".to_string(),
             yield_idle: false,
             rumcast_client_addr: None,
             rumcast_busy_poll_us: 0,
@@ -653,7 +651,12 @@ pub fn run_with_shutdown<L: BlockingTransportListener>(
             config.shadow_snapshot_path(),
             config.cores,
             config.reader_cores,
-            config.async_replica_ack,
+            // async_ack: hardcoded false now that `--async-replica-ack` is
+            // gone. The receiver gates acks on the local journal cursor.
+            // Equivalent fast-path semantics are reachable via an
+            // `in_memory>=N` clause in `--durability-policy` once we plumb
+            // ack-on-receive through the receiver (separate task).
+            false,
             config.group_commit_delay(),
             config.replication_pipeline_depth,
             !config.yield_idle,
@@ -1011,20 +1014,12 @@ fn run_as_primary<L: BlockingTransportListener>(
             None
         };
 
-    // Bridge the legacy `--no-quorum-durability` flag to a durability
-    // policy. The default uses the degrade-friendly form `persisted>=2!`:
-    // strict 2-node quorum when 2 replicas are connected, clamped to
-    // however many remain when one drops. Strictly stronger than the
-    // pre-policy auto-degrade (which dropped to 1-node durability) yet
-    // preserves availability through single-replica failures.
-    // Removed in task #5 once `--durability-policy` lands.
-    let policy_str = if config.no_quorum_durability {
-        "persisted>=1"
-    } else {
-        "persisted>=2!"
-    };
-    let policy = crate::durability_policy::parse(policy_str)
-        .map_err(|e| format!("internal: failed to parse default policy: {e}"))?;
+    // Parse the configured durability policy. Bad input fails the
+    // server bootstrap rather than silently falling back, so an
+    // operator typo doesn't ship a different policy than they think.
+    let policy = crate::durability_policy::parse(&config.durability_policy)
+        .map_err(|e| format!("--durability-policy: {e}"))?;
+    info!(policy = %policy, "durability policy active");
 
     // Per-slot active flags exposed by the journal stage's replication
     // ring; the response gate filters disconnected slots out of the
@@ -1733,7 +1728,8 @@ pub fn run_dpdk(
             config.group_commit_delay(),
             config.replication_pipeline_depth,
             !config.yield_idle,
-            config.async_replica_ack,
+            // async_ack: see comment in `run_as_replica` (TCP path).
+            false,
             rotation,
             config.max_orders_per_account,
             config.max_orders_per_second,
@@ -1945,16 +1941,9 @@ pub fn run_dpdk(
             None
         };
 
-    // Bridge the legacy `--no-quorum-durability` flag to a durability
-    // policy. See the TCP path for the rationale; same defaults.
-    // Removed in the follow-up task #5.
-    let policy_str = if config.no_quorum_durability {
-        "persisted>=1"
-    } else {
-        "persisted>=2!"
-    };
-    let policy = crate::durability_policy::parse(policy_str)
-        .map_err(|e| format!("internal: failed to parse default policy: {e}"))?;
+    let policy = crate::durability_policy::parse(&config.durability_policy)
+        .map_err(|e| format!("--durability-policy: {e}"))?;
+    info!(policy = %policy, "durability policy active");
 
     let replica_active: Option<[Arc<AtomicBool>; 2]> =
         replication_ring_progress.as_ref().map(|rp| {

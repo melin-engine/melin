@@ -443,16 +443,9 @@ fn run_rumcast_primary_with_state(
     // (built below) instead.
     let fastest_replica_cursor = Arc::new(AtomicU64::new(u64::MAX));
 
-    // Bridge the legacy `--no-quorum-durability` flag to a durability
-    // policy. See `server::run_as_primary` for the rationale; same
-    // defaults. Removed in the follow-up task #5.
-    let policy_str = if config.no_quorum_durability {
-        "persisted>=1"
-    } else {
-        "persisted>=2!"
-    };
-    let policy = crate::durability_policy::parse(policy_str)
-        .map_err(|e| format!("internal: failed to parse default policy: {e}"))?;
+    let policy = crate::durability_policy::parse(&config.durability_policy)
+        .map_err(|e| format!("--durability-policy: {e}"))?;
+    info!(policy = %policy, "durability policy active");
 
     let replica_active: Option<[Arc<AtomicBool>; 2]> =
         replication_ring_progress.as_ref().map(|rp| {
@@ -2156,7 +2149,9 @@ fn run_rumcast_replica(
         config.snapshot_interval_ms,
         config.shadow_snapshot_path(),
         config.cores,
-        config.async_replica_ack,
+        // async_ack: see comment in `run_as_replica` (TCP path) — flag
+        // gone, hardcoded false here pending ack-on-receive plumbing.
+        false,
         !config.yield_idle,
         rotation,
         config.max_orders_per_account,
