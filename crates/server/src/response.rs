@@ -21,7 +21,7 @@ use tracing::{debug, error};
 use melin_disruptor::padding::Sequence;
 use melin_disruptor::ring;
 
-use crate::durability_policy::{CursorView, EvalStatus, Policy};
+use crate::durability_policy::{CursorView, DurabilityMode, EvalStatus, Policy};
 use crate::replication::ReplicationMetrics;
 use crate::{OutputPayload, OutputSlot};
 #[cfg(feature = "latency-trace")]
@@ -56,9 +56,15 @@ pub use crate::ControlEvent;
 /// Configuration and shared state for the response stage.
 pub struct Response {
     pub journal_cursor: Arc<Sequence>,
-    /// Durability policy evaluated per gate iteration. See
-    /// [`crate::durability_policy`] for the policy model.
-    pub policy: Policy,
+    /// Operator-selected durability mode, published through a shared
+    /// [`AtomicU8`] so the admin `DURABILITY` command can swap it at
+    /// runtime without restarting the node. The response stage reads
+    /// this once per gate iteration with a relaxed load (cheaper than a
+    /// `Mutex` or refcounted `Arc<Policy>` snapshot) and rebuilds its
+    /// local [`Policy`] when the byte changes. See
+    /// [`crate::durability_policy::DurabilityMode::as_u8`] for the
+    /// encoding.
+    pub durability_mode: Arc<std::sync::atomic::AtomicU8>,
     /// Per-slot replica cursors. `None` for standalone deployments
     /// (no replication wiring) — the policy then evaluates against the
     /// primary alone.
@@ -107,13 +113,30 @@ pub fn run(
 ) {
     let Response {
         journal_cursor,
-        policy,
+        durability_mode,
         replication_metrics,
         replica_active,
         heartbeat_interval,
         busy_spin,
         utilization,
     } = config;
+    // Resolve the starting mode from the shared atomic and derive the
+    // local Policy. The atomic is the single source of truth across the
+    // process lifetime; the response thread keeps a thread-local copy
+    // for cheap per-iteration use and rebuilds it when an admin
+    // `DURABILITY` command swaps the atomic. Initialise as Hybrid (the
+    // default mode) if the atomic ever holds a corrupted byte — better
+    // than panicking on a degraded process and matches the default
+    // operators see at boot.
+    let mut active_mode =
+        DurabilityMode::from_u8(durability_mode.load(std::sync::atomic::Ordering::Relaxed))
+            .unwrap_or_else(|| {
+                tracing::error!(
+                    "durability_mode atomic held a corrupted byte at startup; defaulting to hybrid"
+                );
+                DurabilityMode::Hybrid
+            });
+    let mut policy = active_mode.to_policy();
     let mut ring =
         IoUring::new(RING_SIZE).expect("failed to create io_uring instance for response stage");
 
@@ -229,6 +252,44 @@ pub fn run(
     let mut idle_count: u64 = 0;
 
     loop {
+        // Observe runtime mode swaps from the admin `DURABILITY`
+        // command. Relaxed load (single writer is the admin handler,
+        // single reader is this thread). When the byte changes,
+        // rebuild the local Policy and reset the cached durable
+        // position so the next gate evaluation starts from a clean
+        // slate under the new shape; log the transition for the audit
+        // trail. An unknown byte is treated as memory corruption: we
+        // log and keep the prior mode rather than silently downgrading.
+        let observed_byte = durability_mode.load(Ordering::Relaxed);
+        if observed_byte != active_mode.as_u8() {
+            match DurabilityMode::from_u8(observed_byte) {
+                Some(next) => {
+                    tracing::info!(
+                        prev = active_mode.as_str(),
+                        next = next.as_str(),
+                        "durability mode swapped at runtime"
+                    );
+                    active_mode = next;
+                    policy = active_mode.to_policy();
+                    // The fresh policy may evaluate degraded/undegraded
+                    // differently against the same cluster shape; let
+                    // the next gate evaluation re-derive.
+                    cached_durable_pos = 0;
+                    // Re-seed the degradation logger so a transition
+                    // out of (or into) degraded under the new policy
+                    // surfaces immediately rather than waiting for the
+                    // sustained-state hold to roll over.
+                    degraded_logger = DegradationLogger::new(Instant::now());
+                }
+                None => {
+                    tracing::error!(
+                        byte = observed_byte,
+                        "durability_mode atomic held a corrupted byte; retaining prior mode"
+                    );
+                }
+            }
+        }
+
         if shutdown.load(Ordering::Relaxed) {
             // Best-effort flush before shutdown.
             if !dirty_connections.is_empty() {
@@ -424,6 +485,30 @@ pub fn run(
             let needs_gate = batch[..count].iter().any(|s| !s.durability_bypass);
             if needs_gate && cached_durable_pos < needed {
                 loop {
+                    // Inside the gate-wait spin loop, also observe a
+                    // mode swap. Without this, a batch whose gate
+                    // becomes structurally unsatisfiable (e.g. all
+                    // replicas die while a non-bypass slot is in
+                    // flight under `Hybrid`) would wedge the response
+                    // stage forever, even if an operator sends the
+                    // remediating `DURABILITY local` — the outer loop
+                    // observation never gets a chance to run. The
+                    // relaxed load is ~1 cycle on x86; cheaper than
+                    // the `spin_loop` hint below.
+                    let observed_byte = durability_mode.load(Ordering::Relaxed);
+                    if observed_byte != active_mode.as_u8()
+                        && let Some(next) = DurabilityMode::from_u8(observed_byte)
+                    {
+                        tracing::info!(
+                            prev = active_mode.as_str(),
+                            next = next.as_str(),
+                            "durability mode swapped during gate wait"
+                        );
+                        active_mode = next;
+                        policy = active_mode.to_policy();
+                        degraded_logger = DegradationLogger::new(Instant::now());
+                    }
+
                     let journal_pos = journal_cursor.get().load(Ordering::Acquire);
                     let metrics_ref = replication_metrics.as_deref();
                     let active_ref = replica_active.as_ref();

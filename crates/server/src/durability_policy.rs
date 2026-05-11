@@ -400,6 +400,50 @@ impl DurabilityMode {
             DurabilityMode::DurablyReplicated => "durably-replicated",
         }
     }
+
+    /// Parse the admin-channel / CLI wire spelling. Accepts the same
+    /// kebab-cased strings [`as_str`](Self::as_str) emits so operators
+    /// only have to learn one vocabulary across `--durability-mode`
+    /// and the admin `DURABILITY` command.
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "local" => Some(DurabilityMode::Local),
+            "hybrid" => Some(DurabilityMode::Hybrid),
+            "durably-replicated" => Some(DurabilityMode::DurablyReplicated),
+            _ => None,
+        }
+    }
+
+    /// Stable u8 discriminant. The response stage publishes the
+    /// operator-selected mode through an [`AtomicU8`] so it can detect
+    /// a runtime swap (via the admin `DURABILITY` command) with a
+    /// relaxed load on every gate iteration — cheaper than crossing a
+    /// `Mutex` or carrying a refcounted `Arc<Policy>` snapshot.
+    /// Values are part of the in-process ABI between admin and
+    /// response, not a wire format; they must remain stable so the
+    /// round-trip `from_u8(as_u8(x)) == Some(x)` always holds.
+    pub fn as_u8(self) -> u8 {
+        match self {
+            DurabilityMode::Local => 0,
+            DurabilityMode::Hybrid => 1,
+            DurabilityMode::DurablyReplicated => 2,
+        }
+    }
+
+    /// Inverse of [`as_u8`]. Returns `None` for an unknown byte —
+    /// callers initialise the atomic from a valid mode and the admin
+    /// path only writes `as_u8(parse(s)?)`, so an unknown byte
+    /// indicates memory corruption or a programmer bug. The response
+    /// stage logs and retains the prior mode in that case rather than
+    /// silently falling back.
+    pub fn from_u8(b: u8) -> Option<Self> {
+        match b {
+            0 => Some(DurabilityMode::Local),
+            1 => Some(DurabilityMode::Hybrid),
+            2 => Some(DurabilityMode::DurablyReplicated),
+            _ => None,
+        }
+    }
 }
 
 impl fmt::Display for DurabilityMode {
@@ -487,6 +531,36 @@ mod tests {
     fn display_renders_canonical_form() {
         let p = and_policy(&[(Level::Persisted, 1), (Level::InMemory, 3)]);
         assert_eq!(format!("{p}"), "persisted>=1 && in_memory>=3");
+    }
+
+    #[test]
+    fn durability_mode_u8_round_trip() {
+        for m in [
+            DurabilityMode::Local,
+            DurabilityMode::Hybrid,
+            DurabilityMode::DurablyReplicated,
+        ] {
+            assert_eq!(DurabilityMode::from_u8(m.as_u8()), Some(m));
+        }
+        // Unknown bytes surface as None — the response stage relies on
+        // this to detect a corrupted atomic and retain the prior mode.
+        for b in [3, 4, 255] {
+            assert_eq!(DurabilityMode::from_u8(b), None);
+        }
+    }
+
+    #[test]
+    fn durability_mode_parse_matches_as_str() {
+        for m in [
+            DurabilityMode::Local,
+            DurabilityMode::Hybrid,
+            DurabilityMode::DurablyReplicated,
+        ] {
+            assert_eq!(DurabilityMode::parse(m.as_str()), Some(m));
+        }
+        for bad in ["", "LOCAL", "hyb", "fast", "durably_replicated"] {
+            assert_eq!(DurabilityMode::parse(bad), None, "{bad:?} should not parse");
+        }
     }
 
     #[test]

@@ -67,7 +67,7 @@ use std::collections::hash_map::Entry;
 use std::hash::{Hash, Hasher};
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -269,10 +269,20 @@ pub fn run_rumcast(
     rumcast_config: RumcastConfig,
     shutdown: Arc<AtomicBool>,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    // One shared mode atomic per process — see the kernel-TCP
+    // `run_with_shutdown` for the rationale (pre-staging the
+    // post-promotion mode via admin `DURABILITY` before `PROMOTE`).
+    let durability_mode_atomic = Arc::new(AtomicU8::new(config.durability_mode.as_u8()));
     if let Some(primary_addr) = config.replica_of {
-        return run_rumcast_replica(config, rumcast_config, primary_addr, shutdown);
+        return run_rumcast_replica(
+            config,
+            rumcast_config,
+            primary_addr,
+            shutdown,
+            durability_mode_atomic,
+        );
     }
-    run_rumcast_primary(config, rumcast_config, shutdown)
+    run_rumcast_primary(config, rumcast_config, shutdown, durability_mode_atomic)
 }
 
 /// Primary path. With `--replication-bind` set, also spawns the
@@ -281,6 +291,7 @@ fn run_rumcast_primary(
     config: ServerConfig,
     rumcast_config: RumcastConfig,
     shutdown: Arc<AtomicBool>,
+    durability_mode_atomic: Arc<AtomicU8>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     info!(
         bind = %rumcast_config.bind,
@@ -328,6 +339,7 @@ fn run_rumcast_primary(
             addr,
             None,
             rotate_flag.clone(),
+            Some(Arc::clone(&durability_mode_atomic)),
             Arc::clone(&shutdown),
             Arc::clone(&authorized_keys),
         )
@@ -343,6 +355,7 @@ fn run_rumcast_primary(
         needs_seeding,
         Some(orders),
         rotate_flag,
+        durability_mode_atomic,
     )
 }
 
@@ -371,6 +384,9 @@ fn run_rumcast_primary_with_state(
     // replica's journal stage observed; the new primary's stage picks
     // up where it left off.
     rotate_flag: Option<Arc<AtomicBool>>,
+    // Shared durability mode atomic — see the kernel-TCP
+    // `run_with_shutdown` for the design.
+    durability_mode_atomic: Arc<AtomicU8>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let enable_replication = config.replication_bind.is_some();
     if enable_replication && config.standalone {
@@ -452,8 +468,15 @@ fn run_rumcast_primary_with_state(
     // (built below) instead.
     let fastest_replica_cursor = Arc::new(AtomicU64::new(u64::MAX));
 
-    let policy = config.durability_mode.to_policy();
-    info!(mode = %config.durability_mode, policy = %policy, "durability mode active");
+    let active_mode_at_start = crate::durability_policy::DurabilityMode::from_u8(
+        durability_mode_atomic.load(Ordering::Relaxed),
+    )
+    .unwrap_or(config.durability_mode);
+    info!(
+        mode = %active_mode_at_start,
+        policy = %active_mode_at_start.to_policy(),
+        "durability mode active"
+    );
 
     let replica_active: Option<[Arc<AtomicBool>; 2]> =
         replication_ring_progress.as_ref().map(|rp| {
@@ -862,7 +885,7 @@ fn run_rumcast_primary_with_state(
         let cursor = Arc::clone(&journal_cursor);
         let replication_metrics = replication_metrics.as_ref().map(Arc::clone);
         let replica_active = replica_active.clone();
-        let policy = policy.clone();
+        let durability_mode_session = Arc::clone(&durability_mode_atomic);
         let authorized_keys = Arc::clone(&authorized_keys);
         let mut muxed_receiver = muxed_receiver;
         let mut muxed_sender = muxed_sender;
@@ -884,7 +907,7 @@ fn run_rumcast_primary_with_state(
                         &mut input_producer,
                         response_consumer,
                         cursor,
-                        policy,
+                        durability_mode_session,
                         replication_metrics,
                         replica_active,
                         authorized_keys,
@@ -996,13 +1019,15 @@ fn session_translator<S, R>(
     input_producer: &mut melin_disruptor::ring::Producer<InputSlot>,
     mut output_consumer: melin_disruptor::ring::Consumer<OutputSlot>,
     journal_cursor: Arc<melin_disruptor::padding::Sequence>,
-    // Durability gate inputs. The policy is evaluated against a view
+    // Durability gate inputs. The mode atomic is the single source of
+    // truth — the gate derives its `Policy` from it and re-derives on
+    // change (via the admin `DURABILITY` command). The cursor view is
     // built from the primary's journal cursor + per-slot replica
     // cursors (in-memory and persisted) read from `replication_metrics`,
     // filtered to only currently-connected slots via `replica_active`.
     // Both `None` in standalone mode, in which case the view contains
     // only the primary.
-    policy: crate::durability_policy::Policy,
+    durability_mode: Arc<AtomicU8>,
     replication_metrics: Option<Arc<crate::replication::ReplicationMetrics>>,
     replica_active: Option<[Arc<AtomicBool>; 2]>,
     authorized_keys: Arc<AuthorizedKeys>,
@@ -1012,6 +1037,15 @@ fn session_translator<S, R>(
     S: UdpTransport,
     R: UdpTransport,
 {
+    use crate::durability_policy::DurabilityMode;
+    let mut active_mode =
+        DurabilityMode::from_u8(durability_mode.load(Ordering::Relaxed)).unwrap_or_else(|| {
+            tracing::error!(
+                "durability_mode atomic held a corrupted byte at startup; defaulting to hybrid (rumcast)"
+            );
+            DurabilityMode::Hybrid
+        });
+    let mut policy = active_mode.to_policy();
     let mut sessions: HashMap<u32, AuthStage> = HashMap::new();
     // In-flight per-slot progress: a slot expands to up to two wire
     // kinds (payload + trailing BatchEnd via `is_last_in_request`),
@@ -1054,6 +1088,29 @@ fn session_translator<S, R>(
     let mut last_sweep_at = Instant::now();
 
     while !shutdown.load(Ordering::Acquire) {
+        // Observe runtime mode swaps from the admin `DURABILITY`
+        // command. See `response::run` for the design rationale.
+        let observed_byte = durability_mode.load(Ordering::Relaxed);
+        if observed_byte != active_mode.as_u8() {
+            match DurabilityMode::from_u8(observed_byte) {
+                Some(next) => {
+                    tracing::info!(
+                        prev = active_mode.as_str(),
+                        next = next.as_str(),
+                        "durability mode swapped at runtime (rumcast)"
+                    );
+                    active_mode = next;
+                    policy = active_mode.to_policy();
+                }
+                None => {
+                    tracing::error!(
+                        byte = observed_byte,
+                        "durability_mode atomic held a corrupted byte; retaining prior mode (rumcast)"
+                    );
+                }
+            }
+        }
+
         let mut did_work = false;
         diag.iters += 1;
 
@@ -2075,6 +2132,7 @@ fn run_rumcast_replica(
     rumcast_config: RumcastConfig,
     primary_addr: SocketAddr,
     shutdown: Arc<AtomicBool>,
+    durability_mode_atomic: Arc<AtomicU8>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     info!(
         primary = %primary_addr,
@@ -2129,6 +2187,7 @@ fn run_rumcast_replica(
             addr,
             Some(Arc::clone(&promote_flag)),
             rotate_flag.clone(),
+            Some(Arc::clone(&durability_mode_atomic)),
             Arc::clone(&shutdown),
             Arc::clone(&authorized_keys),
         )
@@ -2181,6 +2240,7 @@ fn run_rumcast_replica(
                 false, // no seeding — state already replayed from primary
                 None,  // bind inside — promotion has no startup-race risk
                 rotate_flag,
+                durability_mode_atomic,
             )
         }
     }

@@ -15,7 +15,7 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::os::unix::io::AsRawFd;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 
 use std::hash::{Hash, Hasher};
 
@@ -570,6 +570,14 @@ pub fn run_with_shutdown<L: BlockingTransportListener>(
     config: ServerConfig,
     shutdown: Arc<AtomicBool>,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    // Shared durability-mode atomic, constructed once per process and
+    // threaded through both modes. Wiring it on the replica path
+    // (where the live node has no response stage) lets an operator
+    // pre-stage the post-promotion mode with `DURABILITY <mode>`
+    // before issuing `PROMOTE`; the same `Arc` becomes the response
+    // stage's source of truth after the replica → primary transition.
+    let durability_mode_atomic = Arc::new(AtomicU8::new(config.durability_mode.as_u8()));
+
     // Replica mode: connect to primary, receive journal stream, replay.
     // Must run before init_engine — the replica's journal is created from
     // the primary's genesis during the replication handshake.
@@ -621,6 +629,7 @@ pub fn run_with_shutdown<L: BlockingTransportListener>(
                 addr,
                 Some(Arc::clone(&promote_flag)),
                 rotate_flag.clone(),
+                Some(Arc::clone(&durability_mode_atomic)),
                 Arc::clone(&shutdown),
                 Arc::clone(&authorized_keys),
             )
@@ -671,6 +680,7 @@ pub fn run_with_shutdown<L: BlockingTransportListener>(
                     authorized_keys,
                     false, // no seeding needed — state comes from replication
                     rotate_flag,
+                    durability_mode_atomic,
                 );
             }
         }
@@ -693,6 +703,7 @@ pub fn run_with_shutdown<L: BlockingTransportListener>(
             addr,
             None,
             rotate_flag.clone(),
+            Some(Arc::clone(&durability_mode_atomic)),
             Arc::clone(&shutdown),
             Arc::clone(&authorized_keys),
         )
@@ -716,6 +727,7 @@ pub fn run_with_shutdown<L: BlockingTransportListener>(
         authorized_keys,
         needs_seeding,
         rotate_flag,
+        durability_mode_atomic,
     )
 }
 
@@ -818,6 +830,7 @@ fn shutdown_pipeline_stages(
 /// primary stage is built here; passing the flag through means the
 /// admin endpoint, which was spawned once at process start, keeps
 /// driving the new stage's rotation.
+#[allow(clippy::too_many_arguments)]
 fn run_as_primary<L: BlockingTransportListener>(
     exchange: App,
     writer: JournalWriter,
@@ -827,6 +840,7 @@ fn run_as_primary<L: BlockingTransportListener>(
     authorized_keys: Arc<AuthorizedKeys>,
     needs_seeding: bool,
     rotate_flag: Option<Arc<AtomicBool>>,
+    durability_mode_atomic: Arc<AtomicU8>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // Active connection counter shared between accept loop, response
     // stage, and matching stage (for stats queries).
@@ -1017,11 +1031,24 @@ fn run_as_primary<L: BlockingTransportListener>(
             None
         };
 
-    // Build the durability policy from the operator-facing mode. Each
-    // mode constructs its own clause set directly — no parse step
-    // means no operator-typo failure mode.
-    let policy = config.durability_mode.to_policy();
-    info!(mode = %config.durability_mode, policy = %policy, "durability mode active");
+    // The operator-selected durability mode is published through a
+    // shared `AtomicU8` constructed by the caller (so the admin
+    // listener can hold a clone before this function runs). The
+    // response stage reads it once per gate iteration and rebuilds its
+    // local `Policy` when the byte changes; the admin `DURABILITY`
+    // command writes it. Re-derive the active mode here for the
+    // startup log so what we log matches what's actually live (an
+    // operator may have stored a different mode via `DURABILITY`
+    // between `run_with_shutdown` and this point).
+    let active_mode_at_start = crate::durability_policy::DurabilityMode::from_u8(
+        durability_mode_atomic.load(Ordering::Relaxed),
+    )
+    .unwrap_or(config.durability_mode);
+    info!(
+        mode = %active_mode_at_start,
+        policy = %active_mode_at_start.to_policy(),
+        "durability mode active"
+    );
 
     // Per-slot active flags exposed by the journal stage's replication
     // ring; the response gate filters disconnected slots out of the
@@ -1039,6 +1066,7 @@ fn run_as_primary<L: BlockingTransportListener>(
     let journal_cursor_response = Arc::clone(&journal_cursor);
     let replication_metrics_response = replication_metrics.as_ref().map(Arc::clone);
     let replica_active_response = replica_active.clone();
+    let durability_mode_response = Arc::clone(&durability_mode_atomic);
     let s3 = Arc::clone(&shutdown);
     let shutdown_for_response = Arc::clone(&shutdown);
     let busy_spin = !config.yield_idle;
@@ -1052,7 +1080,7 @@ fn run_as_primary<L: BlockingTransportListener>(
                 control_rx,
                 crate::response::Response {
                     journal_cursor: journal_cursor_response,
-                    policy,
+                    durability_mode: durability_mode_response,
                     replication_metrics: replication_metrics_response,
                     replica_active: replica_active_response,
                     heartbeat_interval,
@@ -1653,6 +1681,10 @@ pub fn run_dpdk(
     dpdk_config: melin_dpdk::DpdkConfig,
     shutdown: Arc<AtomicBool>,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    // Mirrors the kernel-TCP `run_with_shutdown` path: one atomic per
+    // process, threaded into both replica (pre-staging for promotion)
+    // and primary admin listeners.
+    let durability_mode_atomic = Arc::new(AtomicU8::new(config.durability_mode.as_u8()));
     // Initialize shared DPDK resources (EAL, mempool, ports with N queues).
     let shared = melin_dpdk::DpdkShared::init(&dpdk_config)?;
     // Actual queue count may be less than requested (TAP only supports 1).
@@ -1683,6 +1715,7 @@ pub fn run_dpdk(
                 addr,
                 Some(Arc::clone(&promote_flag)),
                 rotate_flag.clone(),
+                Some(Arc::clone(&durability_mode_atomic)),
                 Arc::clone(&shutdown),
                 Arc::clone(&authorized_keys),
             )
@@ -1754,6 +1787,7 @@ pub fn run_dpdk(
                     authorized_keys,
                     false,
                     rotate_flag,
+                    durability_mode_atomic,
                 );
             }
         }
@@ -1908,6 +1942,7 @@ pub fn run_dpdk(
             addr,
             None,
             rotate_flag.clone(),
+            Some(Arc::clone(&durability_mode_atomic)),
             Arc::clone(&shutdown),
             Arc::clone(&authorized_keys),
         )
@@ -1953,8 +1988,15 @@ pub fn run_dpdk(
             None
         };
 
-    let policy = config.durability_mode.to_policy();
-    info!(mode = %config.durability_mode, policy = %policy, "durability mode active");
+    let active_mode_at_start = crate::durability_policy::DurabilityMode::from_u8(
+        durability_mode_atomic.load(Ordering::Relaxed),
+    )
+    .unwrap_or(config.durability_mode);
+    info!(
+        mode = %active_mode_at_start,
+        policy = %active_mode_at_start.to_policy(),
+        "durability mode active"
+    );
 
     let replica_active: Option<[Arc<AtomicBool>; 2]> =
         replication_ring_progress.as_ref().map(|rp| {
@@ -1969,6 +2011,7 @@ pub fn run_dpdk(
     let journal_cursor_response = Arc::clone(&journal_cursor);
     let replication_metrics_response = replication_metrics.as_ref().map(Arc::clone);
     let replica_active_response = replica_active.clone();
+    let durability_mode_response = Arc::clone(&durability_mode_atomic);
     let active_connections_response = Arc::clone(&active_connections);
     let s3 = Arc::clone(&shutdown);
     let response_utilization_thread = Arc::clone(&response_utilization);
@@ -1981,7 +2024,7 @@ pub fn run_dpdk(
                 output_consumer,
                 control_rx,
                 journal_cursor_response,
-                policy,
+                durability_mode_response,
                 replication_metrics_response,
                 replica_active_response,
                 &s3,

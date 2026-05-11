@@ -410,6 +410,20 @@ fn promote(addr: SocketAddr, operator_key: &SigningKey) {
     assert!(response == "OK", "promotion failed: {response}");
 }
 
+/// Send `DURABILITY <mode>` to a node's admin endpoint and assert it
+/// succeeds. Used by tests that drive runtime mode swaps (e.g. the
+/// promoted-replica-without-replicas case where Hybrid is structurally
+/// unsatisfiable and the operator must downgrade to Local for the gate
+/// to open).
+fn set_durability_mode(addr: SocketAddr, operator_key: &SigningKey, mode: &str) {
+    let cmd = format!("DURABILITY {mode}");
+    let response = admin_command(addr, operator_key, &cmd);
+    assert!(
+        response == "OK",
+        "set durability {mode} on {addr} failed: {response}"
+    );
+}
+
 struct ServerProcess {
     child: Child,
     client_addr: SocketAddr,
@@ -621,22 +635,6 @@ fn spawn_replica_named_with_extra_env(
         "0,0,0,0,0,0,0,0".into(),
         "--reader-cores".into(),
         "0".into(),
-        // TODO(durability-admin): Replicas are pre-configured with
-        // `local` so the post-promotion path (single standalone node)
-        // can satisfy its own durability gate. With strict Hybrid this
-        // would be structurally unsatisfiable and the promoted node
-        // would halt forever, hanging every promote-path failover
-        // test. The proper long-term coverage is to (a) leave replicas
-        // on the default Hybrid mode and (b) have the test send a
-        // signed admin `DURABILITY local` command immediately after
-        // `promote()` — exercising the runtime-mode-swap admin path
-        // that ships in the next commit. When that lands, drop this
-        // override and convert at least one promote-path test
-        // (e.g. `dual_replication_survives_one_replica_failure`) to
-        // the admin-command flow so the Hybrid-on-promoted-node case
-        // is covered end-to-end.
-        "--durability-mode".into(),
-        "local".into(),
     ];
     for a in extra_args {
         args.push((*a).into());
@@ -789,6 +787,16 @@ impl TestCluster {
 
         let promote_addr: SocketAddr = format!("127.0.0.1:{}", self.admin_port).parse().unwrap();
         promote(promote_addr, &self.operator_key);
+        // The promoted node was a replica running with the cluster
+        // default (`hybrid`); standalone it can't satisfy
+        // `in_memory>=2`, so the response gate would stall forever.
+        // Downgrade to `local` via the admin DURABILITY command — the
+        // production failover playbook for a freshly-promoted node
+        // without peers. A separate test
+        // (`dual_replication_promote_then_durability_swap`) covers the
+        // same path on the dual-cluster shape so we know the runtime
+        // swap works under both topologies.
+        set_durability_mode(promote_addr, &self.operator_key, "local");
 
         wait_ready(self.replica.health_addr, Duration::from_secs(30));
 
@@ -1339,6 +1347,7 @@ fn same_key_retry_after_failover_is_rejected() {
     }
     let _ = cluster.primary.child.wait();
     promote(promote_addr, &cluster.operator_key);
+    set_durability_mode(promote_addr, &cluster.operator_key, "local");
     wait_ready(cluster.replica.health_addr, Duration::from_secs(30));
 
     // Reconnect with the SAME key (key, not key2). The promoted replica's
@@ -1507,6 +1516,10 @@ impl DualCluster {
             .parse()
             .unwrap();
         promote(addr, &self.operator_key);
+        // Downgrade the promoted standalone to `local` so its gate can
+        // open without peers. See `TestCluster::kill_and_promote` for
+        // the full rationale.
+        set_durability_mode(addr, &self.operator_key, "local");
         wait_ready(self.replica1.health_addr, Duration::from_secs(30));
         Client::connect(self.replica1.client_addr, &self.key2)
             .expect("connect to promoted replica 1")
@@ -1517,6 +1530,7 @@ impl DualCluster {
             .parse()
             .unwrap();
         promote(addr, &self.operator_key);
+        set_durability_mode(addr, &self.operator_key, "local");
         wait_ready(self.replica2.health_addr, Duration::from_secs(30));
         Client::connect(self.replica2.client_addr, &self.key2)
             .expect("connect to promoted replica 2")
@@ -1867,15 +1881,6 @@ fn replacement_replica_catches_up_from_journal() {
                 "0,0,0,0,0,0,0,0",
                 "--reader-cores",
                 "0",
-                // TODO(durability-admin): see the matching note in
-                // `spawn_replica_named_with_extra_env`. This replacement
-                // replica spawns through a direct Command (not the
-                // helper), so it needs the same `--durability-mode local`
-                // override for the post-promotion standalone path. Drop
-                // this once the admin `DURABILITY` command lands and the
-                // test sends it after promotion.
-                "--durability-mode",
-                "local",
             ])
             .stdout(Stdio::inherit())
             .stderr(Stdio::inherit())
@@ -1906,6 +1911,7 @@ fn replacement_replica_catches_up_from_journal() {
 
     let promote_addr: SocketAddr = format!("127.0.0.1:{r3_promote}").parse().unwrap();
     promote(promote_addr, &cluster.operator_key);
+    set_durability_mode(promote_addr, &cluster.operator_key, "local");
     let r3_health_addr: SocketAddr = format!("127.0.0.1:{r3_health}").parse().unwrap();
     wait_ready(r3_health_addr, Duration::from_secs(30));
 
@@ -2004,10 +2010,6 @@ fn catchup_with_fills_during_gap() {
                 "0,0,0,0,0,0,0,0",
                 "--reader-cores",
                 "0",
-                // TODO(durability-admin): see the matching note in
-                // `spawn_replica_named_with_extra_env`.
-                "--durability-mode",
-                "local",
             ])
             .stdout(Stdio::inherit())
             .stderr(Stdio::inherit())
@@ -2031,10 +2033,9 @@ fn catchup_with_fills_during_gap() {
     // Kill primary, promote replacement.
     drop(client);
     cluster.kill_primary();
-    promote(
-        format!("127.0.0.1:{r3_promote}").parse().unwrap(),
-        &cluster.operator_key,
-    );
+    let promote_addr: SocketAddr = format!("127.0.0.1:{r3_promote}").parse().unwrap();
+    promote(promote_addr, &cluster.operator_key);
+    set_durability_mode(promote_addr, &cluster.operator_key, "local");
     wait_ready(
         format!("127.0.0.1:{r3_health}").parse().unwrap(),
         Duration::from_secs(30),
@@ -2126,10 +2127,6 @@ fn catchup_then_immediate_failover() {
                 "0,0,0,0,0,0,0,0",
                 "--reader-cores",
                 "0",
-                // TODO(durability-admin): see the matching note in
-                // `spawn_replica_named_with_extra_env`.
-                "--durability-mode",
-                "local",
             ])
             .stdout(Stdio::inherit())
             .stderr(Stdio::inherit())
@@ -2158,10 +2155,9 @@ fn catchup_then_immediate_failover() {
     // Kill primary IMMEDIATELY — no more orders after catch-up.
     drop(client);
     cluster.kill_primary();
-    promote(
-        format!("127.0.0.1:{r3_promote}").parse().unwrap(),
-        &cluster.operator_key,
-    );
+    let promote_addr: SocketAddr = format!("127.0.0.1:{r3_promote}").parse().unwrap();
+    promote(promote_addr, &cluster.operator_key);
+    set_durability_mode(promote_addr, &cluster.operator_key, "local");
     wait_ready(
         format!("127.0.0.1:{r3_health}").parse().unwrap(),
         Duration::from_secs(30),
@@ -2255,10 +2251,6 @@ fn fresh_replica_full_catchup() {
                 "0,0,0,0,0,0,0,0",
                 "--reader-cores",
                 "0",
-                // TODO(durability-admin): see the matching note in
-                // `spawn_replica_named_with_extra_env`.
-                "--durability-mode",
-                "local",
             ])
             .stdout(Stdio::inherit())
             .stderr(Stdio::inherit())
@@ -2286,10 +2278,9 @@ fn fresh_replica_full_catchup() {
     // Kill primary, promote the fresh replacement.
     drop(client);
     cluster.kill_primary();
-    promote(
-        format!("127.0.0.1:{r3_promote}").parse().unwrap(),
-        &cluster.operator_key,
-    );
+    let promote_addr: SocketAddr = format!("127.0.0.1:{r3_promote}").parse().unwrap();
+    promote(promote_addr, &cluster.operator_key);
+    set_durability_mode(promote_addr, &cluster.operator_key, "local");
     wait_ready(
         format!("127.0.0.1:{r3_health}").parse().unwrap(),
         Duration::from_secs(30),

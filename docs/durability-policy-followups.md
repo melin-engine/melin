@@ -43,26 +43,6 @@ not struct names.
 
 ---
 
-## Runtime durability mode switch via admin command
-
-The `DurabilityMode` enum swap landed strict fail-closed semantics:
-under `Hybrid`, a primary halts when no replica is connected, and a
-freshly-promoted replica running standalone can't satisfy `in_memory>=2`
-either. The failover integration tests work around this by passing
-`--durability-mode local` to replicas (with a `TODO(durability-admin)`
-marker at each override site).
-
-The production answer is a signed admin command — same channel as
-`PROMOTE` / `ROTATE` — that swaps the active mode at runtime. Drives
-the failover playbook: promoted node resumes trading at reduced
-durability in seconds without a restart, then operators restore the
-target mode once peers reattach. Every mode change is audit-logged
-through the existing admin auth path. Drop the `TODO` overrides in
-`failover.rs` and convert at least one promote-path test to exercise
-the runtime swap end-to-end when this lands.
-
----
-
 ## Commercial polish (buyer-driven)
 
 These are real features but only worth building when a specific

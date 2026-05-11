@@ -13,6 +13,13 @@
 //!   boundary and start a fresh one. Available only when the spawn
 //!   caller wired a rotation flag (any node with `--max-journal-mib >
 //!   0` or runtime rotation enabled).
+//! - `DURABILITY <local|hybrid|durably-replicated>` — atomically swap
+//!   the active durability mode on a node running a response stage
+//!   (primary, or post-promotion replica). Lets an operator resume
+//!   trading at reduced durability immediately after a promotion (no
+//!   restart, no client reconnects) and restore the target mode once
+//!   replicas reattach. Available only when the spawn caller wired the
+//!   shared mode atomic.
 //!
 //! A command for which the corresponding flag is `None` is rejected
 //! with `ERR <command> not available on this node\n` so operators get
@@ -27,9 +34,11 @@
 use std::io::{BufRead, BufReader, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::thread::JoinHandle;
 use std::time::Duration;
+
+use crate::durability_policy::DurabilityMode;
 
 use ed25519_dalek::{Verifier, VerifyingKey};
 use tracing::{debug, error, info};
@@ -40,15 +49,17 @@ use melin_protocol::message::{Request, ResponseKind};
 
 /// Spawn the admin listener on a dedicated thread.
 ///
-/// Either or both of `promote` / `rotate_requested` may be `None` to
-/// disable the corresponding command on this node. The listener still
-/// accepts connections and authenticates them — a disabled command is
-/// rejected at the command-dispatch step, not at connect time, so
-/// operators tooling sees a structured ERR rather than a TCP RST.
+/// Any of `promote` / `rotate_requested` / `durability_mode` may be
+/// `None` to disable the corresponding command on this node. The
+/// listener still accepts connections and authenticates them — a
+/// disabled command is rejected at the command-dispatch step, not at
+/// connect time, so operator tooling sees a structured ERR rather than
+/// a TCP RST.
 pub fn spawn(
     bind_addr: SocketAddr,
     promote: Option<Arc<AtomicBool>>,
     rotate_requested: Option<Arc<AtomicBool>>,
+    durability_mode: Option<Arc<AtomicU8>>,
     shutdown: Arc<AtomicBool>,
     authorized_keys: Arc<AuthorizedKeys>,
 ) -> JoinHandle<()> {
@@ -60,6 +71,7 @@ pub fn spawn(
                     bind_addr,
                     promote.as_deref(),
                     rotate_requested.as_deref(),
+                    durability_mode.as_deref(),
                     &shutdown,
                     &authorized_keys,
                 )
@@ -86,6 +98,7 @@ fn run(
     bind_addr: SocketAddr,
     promote: Option<&AtomicBool>,
     rotate_requested: Option<&AtomicBool>,
+    durability_mode: Option<&AtomicU8>,
     shutdown: &AtomicBool,
     authorized_keys: &AuthorizedKeys,
 ) {
@@ -104,6 +117,7 @@ fn run(
         addr = %bind_addr,
         promote_enabled = promote.is_some(),
         rotate_enabled = rotate_requested.is_some(),
+        durability_enabled = durability_mode.is_some(),
         "admin listener started"
     );
 
@@ -115,7 +129,13 @@ fn run(
         match listener.accept() {
             Ok((stream, peer)) => {
                 debug!(peer = %peer, "admin connection accepted");
-                handle_connection(stream, promote, rotate_requested, authorized_keys);
+                handle_connection(
+                    stream,
+                    promote,
+                    rotate_requested,
+                    durability_mode,
+                    authorized_keys,
+                );
             }
             Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                 std::thread::sleep(Duration::from_millis(100));
@@ -257,6 +277,7 @@ fn handle_connection(
     mut stream: TcpStream,
     promote: Option<&AtomicBool>,
     rotate_requested: Option<&AtomicBool>,
+    durability_mode: Option<&AtomicU8>,
     authorized_keys: &AuthorizedKeys,
 ) {
     stream.set_read_timeout(Some(Duration::from_secs(5))).ok();
@@ -282,7 +303,8 @@ fn handle_connection(
         return;
     }
 
-    match line.trim() {
+    let trimmed = line.trim();
+    match trimmed {
         "PROMOTE" => match promote {
             Some(flag) => {
                 flag.store(true, Ordering::Release);
@@ -305,11 +327,89 @@ fn handle_connection(
                 debug!("rejected ROTATE — flag not wired");
             }
         },
+        cmd if cmd.starts_with("DURABILITY") => {
+            // Parse `DURABILITY <mode>` with any positive whitespace
+            // between the verb and the argument. `splitn(2, ' ')` is
+            // intentional: future modes (e.g. multi-region variants)
+            // will pass additional whitespace-separated parameters
+            // through this same line and we don't want to lock in
+            // single-space framing now.
+            let mut parts = cmd.splitn(2, char::is_whitespace);
+            // Discard the verb token; we already matched on it.
+            let _ = parts.next();
+            let arg = parts.next().map(str::trim).unwrap_or("");
+            handle_durability(&mut stream, durability_mode, arg);
+        }
         other => {
             debug!(received = %other, "unknown admin command");
             send_best_effort(&mut stream, b"ERR unknown command\n");
         }
     }
+}
+
+/// Apply a `DURABILITY <mode>` command. Validates the argument,
+/// publishes the new mode through the shared atomic if the node has a
+/// response stage wired, and emits an INFO log carrying the prev → next
+/// transition for the audit trail. Auth is enforced upstream in
+/// [`authenticate`], so reaching this point already implies an
+/// operator-signed request.
+fn handle_durability(stream: &mut TcpStream, durability_mode: Option<&AtomicU8>, arg: &str) {
+    let Some(atomic) = durability_mode else {
+        send_best_effort(stream, b"ERR DURABILITY not available on this node\n");
+        debug!("rejected DURABILITY — atomic not wired (replica node?)");
+        return;
+    };
+    if arg.is_empty() {
+        send_best_effort(
+            stream,
+            b"ERR DURABILITY requires a mode (local|hybrid|durably-replicated)\n",
+        );
+        debug!("rejected DURABILITY — missing argument");
+        return;
+    }
+    let Some(next) = DurabilityMode::parse(arg) else {
+        // Build the diagnostic into a small stack buffer to avoid
+        // allocating on the admin path. The longest valid name is
+        // `durably-replicated` (18 chars); a 128-byte buffer covers
+        // any reasonable bad input the operator might paste.
+        let mut buf = [0u8; 128];
+        let msg = format_unknown_mode(&mut buf, arg);
+        send_best_effort(stream, msg);
+        debug!(received = %arg, "rejected DURABILITY — unknown mode");
+        return;
+    };
+    // Relaxed exchange: the only writer is the admin handler itself
+    // (the response stage only reads), and only the current mode
+    // matters — losing the ordering of prev observations relative to
+    // unrelated events on other threads is fine.
+    let prev_byte = atomic.swap(next.as_u8(), Ordering::Relaxed);
+    let prev = DurabilityMode::from_u8(prev_byte)
+        .map(|m| m.as_str())
+        .unwrap_or("<corrupted>");
+    send_best_effort(stream, b"OK\n");
+    info!(
+        prev = prev,
+        next = next.as_str(),
+        "durability mode changed by operator"
+    );
+}
+
+/// Format an "unknown mode" diagnostic into `buf` without allocating.
+/// Returns the populated subslice. The buffer is sized so the longest
+/// realistic operator input fits; truncation is acceptable here since
+/// the operator already knows what they typed.
+fn format_unknown_mode<'a>(buf: &'a mut [u8], arg: &str) -> &'a [u8] {
+    use std::io::Write as _;
+    let mut cursor = std::io::Cursor::new(&mut buf[..]);
+    // Best-effort write — if `arg` is pathologically long the write
+    // truncates and the operator gets a partial message, which is
+    // strictly better than allocating on the admin hot path.
+    let _ = writeln!(
+        cursor,
+        "ERR DURABILITY unknown mode `{arg}` (expected local|hybrid|durably-replicated)"
+    );
+    let n = cursor.position() as usize;
+    &cursor.into_inner()[..n]
 }
 
 #[cfg(test)]
@@ -417,6 +517,7 @@ mod tests {
             addr,
             Some(Arc::clone(&promote)),
             Some(Arc::clone(&rotate)),
+            None,
             Arc::clone(&shutdown),
             auth_keys,
         );
@@ -442,6 +543,7 @@ mod tests {
             addr,
             Some(Arc::clone(&promote)),
             Some(Arc::clone(&rotate)),
+            None,
             Arc::clone(&shutdown),
             auth_keys,
         );
@@ -468,6 +570,7 @@ mod tests {
             addr,
             None,
             Some(Arc::clone(&rotate)),
+            None,
             Arc::clone(&shutdown),
             auth_keys,
         );
@@ -492,6 +595,7 @@ mod tests {
         let _h = spawn(
             addr,
             Some(Arc::clone(&promote)),
+            None,
             None,
             Arc::clone(&shutdown),
             auth_keys,
@@ -521,6 +625,7 @@ mod tests {
             addr,
             Some(Arc::clone(&promote)),
             Some(Arc::clone(&rotate)),
+            None,
             Arc::clone(&shutdown),
             auth_keys,
         );
@@ -557,6 +662,7 @@ mod tests {
             addr,
             Some(Arc::clone(&promote)),
             Some(Arc::clone(&rotate)),
+            None,
             Arc::clone(&shutdown),
             auth_keys,
         );
@@ -583,6 +689,7 @@ mod tests {
             addr,
             Some(Arc::clone(&promote)),
             Some(Arc::clone(&rotate)),
+            None,
             Arc::clone(&shutdown),
             auth_keys,
         );
@@ -593,6 +700,104 @@ mod tests {
         assert!(matches!(result, ResponseKind::AuthFailed));
         assert!(!promote.load(Ordering::Acquire));
         assert!(!rotate.load(Ordering::Acquire));
+
+        shutdown.store(true, Ordering::Release);
+    }
+
+    /// Driver: spawn an admin listener with only the durability-mode
+    /// atomic wired (mirrors a primary-only node in commit 2), pre-seed
+    /// it with `initial`, send the supplied command, and return
+    /// `(response, mode_after)`.
+    fn run_durability(initial: DurabilityMode, cmd: &[u8]) -> (String, Option<DurabilityMode>) {
+        let (listener, addr) = ephemeral_listener();
+        drop(listener);
+
+        let (key, auth_keys) = operator_keys();
+        let mode = Arc::new(AtomicU8::new(initial.as_u8()));
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let _h = spawn(
+            addr,
+            None,
+            None,
+            Some(Arc::clone(&mode)),
+            Arc::clone(&shutdown),
+            auth_keys,
+        );
+        std::thread::sleep(Duration::from_millis(200));
+
+        let resp = send_command(addr, &key, cmd);
+        let after = DurabilityMode::from_u8(mode.load(Ordering::Relaxed));
+        shutdown.store(true, Ordering::Release);
+        (resp, after)
+    }
+
+    #[test]
+    fn durability_command_swaps_mode() {
+        let (resp, after) = run_durability(DurabilityMode::Hybrid, b"DURABILITY local\n");
+        assert_eq!(resp, "OK");
+        assert_eq!(after, Some(DurabilityMode::Local));
+    }
+
+    #[test]
+    fn durability_command_accepts_each_mode() {
+        for target in [
+            DurabilityMode::Local,
+            DurabilityMode::Hybrid,
+            DurabilityMode::DurablyReplicated,
+        ] {
+            let cmd = format!("DURABILITY {}\n", target.as_str());
+            let (resp, after) = run_durability(DurabilityMode::Local, cmd.as_bytes());
+            assert_eq!(resp, "OK", "mode {target}");
+            assert_eq!(after, Some(target));
+        }
+    }
+
+    #[test]
+    fn durability_command_rejects_unknown_mode() {
+        let (resp, after) = run_durability(DurabilityMode::Hybrid, b"DURABILITY fast\n");
+        assert!(
+            resp.starts_with("ERR DURABILITY unknown mode"),
+            "expected unknown-mode ERR, got {resp}"
+        );
+        // Atomic must NOT have been clobbered on a bad command.
+        assert_eq!(after, Some(DurabilityMode::Hybrid));
+    }
+
+    #[test]
+    fn durability_command_rejects_missing_argument() {
+        let (resp, after) = run_durability(DurabilityMode::Hybrid, b"DURABILITY\n");
+        assert!(
+            resp.starts_with("ERR DURABILITY requires a mode"),
+            "expected missing-arg ERR, got {resp}"
+        );
+        assert_eq!(after, Some(DurabilityMode::Hybrid));
+    }
+
+    #[test]
+    fn durability_command_rejected_when_not_wired() {
+        // On a pure-replica node (no response stage), DURABILITY must
+        // not silently no-op — operators get a structured ERR.
+        let (listener, addr) = ephemeral_listener();
+        drop(listener);
+
+        let (key, auth_keys) = operator_keys();
+        let promote = Arc::new(AtomicBool::new(false));
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let _h = spawn(
+            addr,
+            Some(Arc::clone(&promote)),
+            None,
+            None,
+            Arc::clone(&shutdown),
+            auth_keys,
+        );
+        std::thread::sleep(Duration::from_millis(200));
+
+        let resp = send_command(addr, &key, b"DURABILITY local\n");
+        assert!(
+            resp.starts_with("ERR DURABILITY not available"),
+            "expected not-available ERR, got {resp}"
+        );
 
         shutdown.store(true, Ordering::Release);
     }
