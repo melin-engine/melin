@@ -1567,13 +1567,28 @@ impl Exchange {
         // so we can't fall back to a derived total order on the full tuple.
         regenerated.sort_unstable_by_key(|(k, _)| *k);
         from_snapshot.sort_unstable_by_key(|(k, _)| *k);
-        assert!(
-            regenerated == from_snapshot,
-            "snapshot corruption: order_sides mismatch on restore — \
-             snapshot serialized {} entries, rebuilt books produced {}",
-            from_snapshot.len(),
-            regenerated.len(),
-        );
+        if regenerated != from_snapshot {
+            // Localize the divergence so an operator has something to act
+            // on. Prefer the first per-entry disagreement over the
+            // shared-prefix length, since that's the actionable signal.
+            let diff = regenerated
+                .iter()
+                .zip(from_snapshot.iter())
+                .position(|(a, b)| a != b);
+            match diff {
+                Some(i) => panic!(
+                    "snapshot corruption: order_sides mismatch at sorted index {i} — \
+                     books regenerated {:?}, snapshot had {:?}",
+                    regenerated[i], from_snapshot[i],
+                ),
+                None => panic!(
+                    "snapshot corruption: order_sides length mismatch — \
+                     books regenerated {} entries, snapshot had {}",
+                    regenerated.len(),
+                    from_snapshot.len(),
+                ),
+            }
+        }
 
         exchange
     }
