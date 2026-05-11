@@ -1,0 +1,19 @@
+# Nextest configuration.
+#
+# Failover integration tests each spawn one primary plus one or two
+# replica server processes, each preallocating its own journal and
+# (optionally) mlocking memory. Run in parallel, the resulting
+# fan-out (≈20 tests × 3 processes × ~1 GB) exhausts host memory on
+# anything short of a workstation. The tests already use
+# `#[serial]` (serial_test) to document the intent, but `#[serial]`
+# only serialises *within* one test process — nextest forks per
+# test by default, so the annotation has no effect under nextest.
+#
+# Route the failover binary into a one-at-a-time test-group; other
+# crates keep nextest's default parallelism.
+[[profile.default.overrides]]
+filter = 'binary(failover)'
+test-group = 'failover-serial'
+
+[test-groups]
+failover-serial = { max-threads = 1 }
