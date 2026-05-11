@@ -19,6 +19,7 @@ pub mod codec;
 pub mod error;
 pub mod event;
 pub(crate) mod le;
+pub mod preparer;
 pub mod reader;
 pub mod replication;
 pub mod segment;

@@ -1302,7 +1302,7 @@ fn alloc_aligned<const N: usize>() -> Box<AlignedBuf<N>> {
 ///
 /// Best-effort: silently skips on failure (e.g. insufficient VA space).
 /// Not called on the O_DIRECT path — O_DIRECT bypasses the page cache.
-fn prefault_pages(file: &File, start: u64, end: u64) {
+pub(crate) fn prefault_pages(file: &File, start: u64, end: u64) {
     if end <= start {
         return;
     }
@@ -1337,7 +1337,7 @@ fn prefault_pages(file: &File, start: u64, end: u64) {
 /// filesystem guarantees zero-fill on read for unwritten blocks. On the
 /// supported deployment targets (ext4, xfs, btrfs) this always succeeds;
 /// failure means an unsupported filesystem and is surfaced as an error.
-fn preallocate(file: &File, current_end: u64) -> Result<u64, JournalError> {
+pub(crate) fn preallocate(file: &File, current_end: u64) -> Result<u64, JournalError> {
     let chunk = prealloc_chunk_bytes();
     let target = current_end + chunk;
 
@@ -1370,7 +1370,7 @@ fn preallocate(file: &File, current_end: u64) -> Result<u64, JournalError> {
 ///
 /// Best-effort: failures are logged at warn level and ignored. The fallback
 /// is periodic 1-2ms tail latency spikes, not data loss.
-fn zero_range_extents(file: &File, start: u64, end: u64) {
+pub(crate) fn zero_range_extents(file: &File, start: u64, end: u64) {
     if start >= end {
         return;
     }
