@@ -550,53 +550,69 @@ fn validate_count(remaining: usize, n: usize, item_size: usize) -> Result<(), Jo
     }
 }
 
-fn decode_exchange_state(
-    buf: &[u8],
-    version: u16,
-) -> Result<(usize, ExchangeSnapshot), JournalError> {
-    let corrupt = |reason: &'static str| JournalError::CorruptEntry {
+// Type aliases mirroring the corresponding `ExchangeSnapshot` fields, kept
+// here only to keep the decode helper signatures legible (clippy
+// type_complexity).
+type BalanceEntry = ((AccountId, CurrencyId), Balance);
+type ReservationEntry = (OrderId, AccountId, CurrencyId, u64);
+type OrderSideEntry = ((AccountId, OrderId), Side);
+type OrderBucketEntry = (AccountId, u64, u64);
+
+// Reusable corrupt-entry helper; `sequence: 0` matches the prior
+// closure-based pattern (the caller has no sequence in scope here).
+fn corrupt(reason: &'static str) -> JournalError {
+    JournalError::CorruptEntry {
         sequence: 0,
         reason,
-    };
-    let mut pos = 0;
+    }
+}
 
-    let check = |pos: usize, need: usize| -> Result<(), JournalError> {
-        if pos + need > buf.len() {
-            Err(JournalError::TruncatedEntry)
-        } else {
-            Ok(())
-        }
-    };
+// Bounds check: returns TruncatedEntry if `pos + need` exceeds the buffer.
+fn check(buf: &[u8], pos: usize, need: usize) -> Result<(), JournalError> {
+    if pos + need > buf.len() {
+        Err(JournalError::TruncatedEntry)
+    } else {
+        Ok(())
+    }
+}
 
-    // Instruments.
-    check(pos, 4)?;
-    let n_instruments = le::get_u32(&buf[pos..]) as usize;
-    pos += 4;
-    validate_count(buf.len() - pos, n_instruments, 12)?;
-    let mut instruments = Vec::with_capacity(n_instruments);
-    for _ in 0..n_instruments {
-        check(pos, 12)?;
-        instruments.push(InstrumentSpec {
+// Read the 4-byte length prefix at `buf[0..4]` and return (length, body)
+// where body is the slice past the prefix. Caller adds the consumed bytes
+// to its own cursor.
+fn read_section_len(buf: &[u8]) -> Result<usize, JournalError> {
+    check(buf, 0, 4)?;
+    Ok(le::get_u32(buf) as usize)
+}
+
+fn decode_instruments(buf: &[u8]) -> Result<(usize, Vec<InstrumentSpec>), JournalError> {
+    let n = read_section_len(buf)?;
+    let mut pos = 4;
+    validate_count(buf.len() - pos, n, 12)?;
+    let mut out = Vec::with_capacity(n);
+    for _ in 0..n {
+        check(buf, pos, 12)?;
+        out.push(InstrumentSpec {
             symbol: Symbol(le::get_u32(&buf[pos..])),
             base: CurrencyId(le::get_u32(&buf[pos + 4..])),
             quote: CurrencyId(le::get_u32(&buf[pos + 8..])),
         });
         pos += 12;
     }
+    Ok((pos, out))
+}
 
-    // Balances.
-    check(pos, 4)?;
-    let n_balances = le::get_u32(&buf[pos..]) as usize;
-    pos += 4;
-    validate_count(buf.len() - pos, n_balances, 24)?;
-    let mut balances = Vec::with_capacity(n_balances);
-    for _ in 0..n_balances {
-        check(pos, 24)?;
+fn decode_balances(buf: &[u8]) -> Result<(usize, Vec<BalanceEntry>), JournalError> {
+    let n = read_section_len(buf)?;
+    let mut pos = 4;
+    validate_count(buf.len() - pos, n, 24)?;
+    let mut out = Vec::with_capacity(n);
+    for _ in 0..n {
+        check(buf, pos, 24)?;
         let account = AccountId(le::get_u32(&buf[pos..]));
         let currency = CurrencyId(le::get_u32(&buf[pos + 4..]));
         let available = le::get_u64(&buf[pos + 8..]);
         let reserved = le::get_u64(&buf[pos + 16..]);
-        balances.push((
+        out.push((
             (account, currency),
             Balance {
                 available,
@@ -605,101 +621,125 @@ fn decode_exchange_state(
         ));
         pos += 24;
     }
+    Ok((pos, out))
+}
 
-    // Reservations.
-    check(pos, 4)?;
-    let n_reservations = le::get_u32(&buf[pos..]) as usize;
-    pos += 4;
-    validate_count(buf.len() - pos, n_reservations, 24)?;
-    let mut reservations = Vec::with_capacity(n_reservations);
-    for _ in 0..n_reservations {
-        check(pos, 24)?;
+fn decode_reservations(buf: &[u8]) -> Result<(usize, Vec<ReservationEntry>), JournalError> {
+    let n = read_section_len(buf)?;
+    let mut pos = 4;
+    validate_count(buf.len() - pos, n, 24)?;
+    let mut out = Vec::with_capacity(n);
+    for _ in 0..n {
+        check(buf, pos, 24)?;
         let order_id = OrderId(le::get_u64(&buf[pos..]));
         let account = AccountId(le::get_u32(&buf[pos + 8..]));
         let currency = CurrencyId(le::get_u32(&buf[pos + 12..]));
         let remaining = le::get_u64(&buf[pos + 16..]);
-        reservations.push((order_id, account, currency, remaining));
+        out.push((order_id, account, currency, remaining));
         pos += 24;
     }
+    Ok((pos, out))
+}
 
-    // Order sides: v7+ stores (account_id(4) + order_id(8) + side(1)) = 13 bytes.
-    // v5/v6 stores (order_id(8) + side(1)) = 9 bytes (no account in key).
-    check(pos, 4)?;
-    let n_order_sides = le::get_u32(&buf[pos..]) as usize;
-    pos += 4;
-    let mut order_sides = Vec::with_capacity(n_order_sides);
+// Order sides: v7+ stores (account_id(4) + order_id(8) + side(1)) = 13 bytes.
+// v5/v6 stores (order_id(8) + side(1)) = 9 bytes (no account in key) — uses
+// AccountId(0) as placeholder. Lossy but allows loading old snapshots; v6
+// will be re-saved as v7 on the next rotation.
+fn decode_order_sides(
+    buf: &[u8],
+    version: u16,
+) -> Result<(usize, Vec<OrderSideEntry>), JournalError> {
+    let n = read_section_len(buf)?;
+    let mut pos = 4;
+    let mut out = Vec::with_capacity(n);
     if version >= 7 {
-        validate_count(buf.len() - pos, n_order_sides, 13)?;
-        for _ in 0..n_order_sides {
-            check(pos, 13)?;
+        validate_count(buf.len() - pos, n, 13)?;
+        for _ in 0..n {
+            check(buf, pos, 13)?;
             let account = AccountId(le::get_u32(&buf[pos..]));
             let order_id = OrderId(le::get_u64(&buf[pos + 4..]));
             let side = le::decode_side(buf[pos + 12]).ok_or(corrupt("invalid side in snapshot"))?;
-            order_sides.push(((account, order_id), side));
+            out.push(((account, order_id), side));
             pos += 13;
         }
     } else {
-        // v5/v6: order_id(8) + side(1) = 9 bytes. Account is unknown —
-        // use AccountId(0) as placeholder. This is lossy but allows loading
-        // old snapshots for migration. In practice, v6 snapshots will be
-        // re-saved as v7 on the next rotation.
-        validate_count(buf.len() - pos, n_order_sides, 9)?;
-        for _ in 0..n_order_sides {
-            check(pos, 9)?;
+        validate_count(buf.len() - pos, n, 9)?;
+        for _ in 0..n {
+            check(buf, pos, 9)?;
             let order_id = OrderId(le::get_u64(&buf[pos..]));
             let side = le::decode_side(buf[pos + 8]).ok_or(corrupt("invalid side in snapshot"))?;
-            order_sides.push(((AccountId(0), order_id), side));
+            out.push(((AccountId(0), order_id), side));
             pos += 9;
         }
     }
+    Ok((pos, out))
+}
 
-    // Books.
-    check(pos, 4)?;
-    let n_books = le::get_u32(&buf[pos..]) as usize;
-    pos += 4;
+fn decode_books(
+    buf: &[u8],
+    version: u16,
+) -> Result<(usize, Vec<(Symbol, BookSnapshot)>), JournalError> {
+    let n = read_section_len(buf)?;
+    let mut pos = 4;
     // Minimum per-book overhead: at least a few bytes for the empty-book structure.
-    validate_count(buf.len() - pos, n_books, 4)?;
-    let mut books = Vec::with_capacity(n_books);
-    for _ in 0..n_books {
-        check(pos, 4)?;
+    validate_count(buf.len() - pos, n, 4)?;
+    let mut out = Vec::with_capacity(n);
+    for _ in 0..n {
+        check(buf, pos, 4)?;
         let symbol = Symbol(le::get_u32(&buf[pos..]));
         pos += 4;
         let (consumed, book) = decode_book_snapshot(&buf[pos..], version)?;
         pos += consumed;
-        books.push((symbol, book));
+        out.push((symbol, book));
     }
+    Ok((pos, out))
+}
 
-    // Per-instrument risk limits (v4+).
-    check(pos, 4)?;
-    let n_risk_limits = le::get_u32(&buf[pos..]) as usize;
-    pos += 4;
+// Decode an optional NonZeroU64 prefixed with a 1-byte tag (0 = None, 1 = Some).
+// Returns the new position and the parsed value.
+fn decode_opt_nz_u64(
+    buf: &[u8],
+    mut pos: usize,
+    invalid_tag_reason: &'static str,
+    zero_value_reason: &'static str,
+) -> Result<(usize, Option<NonZeroU64>), JournalError> {
+    check(buf, pos, 1)?;
+    match buf[pos] {
+        1 => {
+            pos += 1;
+            check(buf, pos, 8)?;
+            let v = NonZeroU64::new(le::get_u64(&buf[pos..])).ok_or(corrupt(zero_value_reason))?;
+            pos += 8;
+            Ok((pos, Some(v)))
+        }
+        0 => Ok((pos + 1, None)),
+        _ => Err(corrupt(invalid_tag_reason)),
+    }
+}
+
+fn decode_risk_limits(buf: &[u8]) -> Result<(usize, Vec<(Symbol, RiskLimits)>), JournalError> {
+    let n = read_section_len(buf)?;
+    let mut pos = 4;
     // Each entry is at least 6 bytes: symbol(4) + two option tags(1+1).
-    validate_count(buf.len() - pos, n_risk_limits, 6)?;
-    let mut risk_limits = Vec::with_capacity(n_risk_limits);
-    for _ in 0..n_risk_limits {
-        check(pos, 6)?;
+    validate_count(buf.len() - pos, n, 6)?;
+    let mut out = Vec::with_capacity(n);
+    for _ in 0..n {
+        check(buf, pos, 6)?;
         let symbol = Symbol(le::get_u32(&buf[pos..]));
         pos += 4;
-        let max_order_qty = match buf[pos] {
-            1 => {
-                pos += 1;
-                check(pos, 8)?;
-                let v = NonZeroU64::new(le::get_u64(&buf[pos..]))
-                    .ok_or(corrupt("zero max_order_qty in risk limits"))?;
-                pos += 8;
-                Some(Quantity(v))
-            }
-            0 => {
-                pos += 1;
-                None
-            }
-            _ => return Err(corrupt("invalid max_order_qty tag in risk limits")),
-        };
-        check(pos, 1)?;
+        let (new_pos, max_order_qty) = decode_opt_nz_u64(
+            buf,
+            pos,
+            "invalid max_order_qty tag in risk limits",
+            "zero max_order_qty in risk limits",
+        )?;
+        pos = new_pos;
+        let max_order_qty = max_order_qty.map(Quantity);
+        check(buf, pos, 1)?;
         let max_order_notional = match buf[pos] {
             1 => {
                 pos += 1;
-                check(pos, 8)?;
+                check(buf, pos, 8)?;
                 let v = le::get_u64(&buf[pos..]);
                 pos += 8;
                 Some(v)
@@ -710,7 +750,7 @@ fn decode_exchange_state(
             }
             _ => return Err(corrupt("invalid max_order_notional tag in risk limits")),
         };
-        risk_limits.push((
+        out.push((
             symbol,
             RiskLimits {
                 max_order_qty,
@@ -718,187 +758,215 @@ fn decode_exchange_state(
             },
         ));
     }
+    Ok((pos, out))
+}
 
-    // Per-instrument circuit breakers (v5+).
-    check(pos, 4)?;
-    let n_circuit_breakers = le::get_u32(&buf[pos..]) as usize;
-    pos += 4;
+fn decode_circuit_breakers(
+    buf: &[u8],
+) -> Result<(usize, Vec<(Symbol, CircuitBreakerConfig)>), JournalError> {
+    let n = read_section_len(buf)?;
+    let mut pos = 4;
     // Each entry is at least 7 bytes: symbol(4) + two option tags(1+1) + halted(1).
-    validate_count(buf.len() - pos, n_circuit_breakers, 7)?;
-    let mut circuit_breakers = Vec::with_capacity(n_circuit_breakers);
-    for _ in 0..n_circuit_breakers {
-        check(pos, 7)?;
+    validate_count(buf.len() - pos, n, 7)?;
+    let mut out = Vec::with_capacity(n);
+    for _ in 0..n {
+        check(buf, pos, 7)?;
         let symbol = Symbol(le::get_u32(&buf[pos..]));
         pos += 4;
-        let price_band_lower = match buf[pos] {
-            1 => {
-                pos += 1;
-                check(pos, 8)?;
-                let v = NonZeroU64::new(le::get_u64(&buf[pos..]))
-                    .ok_or(corrupt("zero price_band_lower in circuit breaker"))?;
-                pos += 8;
-                Some(Price(v))
-            }
-            0 => {
-                pos += 1;
-                None
-            }
-            _ => return Err(corrupt("invalid price_band_lower tag in circuit breaker")),
-        };
-        check(pos, 1)?;
-        let price_band_upper = match buf[pos] {
-            1 => {
-                pos += 1;
-                check(pos, 8)?;
-                let v = NonZeroU64::new(le::get_u64(&buf[pos..]))
-                    .ok_or(corrupt("zero price_band_upper in circuit breaker"))?;
-                pos += 8;
-                Some(Price(v))
-            }
-            0 => {
-                pos += 1;
-                None
-            }
-            _ => return Err(corrupt("invalid price_band_upper tag in circuit breaker")),
-        };
-        check(pos, 1)?;
+        let (new_pos, lower) = decode_opt_nz_u64(
+            buf,
+            pos,
+            "invalid price_band_lower tag in circuit breaker",
+            "zero price_band_lower in circuit breaker",
+        )?;
+        pos = new_pos;
+        let (new_pos, upper) = decode_opt_nz_u64(
+            buf,
+            pos,
+            "invalid price_band_upper tag in circuit breaker",
+            "zero price_band_upper in circuit breaker",
+        )?;
+        pos = new_pos;
+        check(buf, pos, 1)?;
         let halted = buf[pos] != 0;
         pos += 1;
-        circuit_breakers.push((
+        out.push((
             symbol,
             CircuitBreakerConfig {
-                price_band_lower,
-                price_band_upper,
+                price_band_lower: lower.map(Price),
+                price_band_upper: upper.map(Price),
                 halted,
             },
         ));
     }
+    Ok((pos, out))
+}
 
-    // Fee schedules: only in v7+ snapshots.
+fn decode_fee_schedules(buf: &[u8]) -> Result<(usize, Vec<(Symbol, FeeSchedule)>), JournalError> {
+    let n = read_section_len(buf)?;
+    let mut pos = 4;
+    // Each fee schedule: symbol(4) + maker_bps(2) + taker_bps(2) = 8 bytes.
+    validate_count(buf.len() - pos, n, 8)?;
+    let mut out = Vec::with_capacity(n);
+    for _ in 0..n {
+        check(buf, pos, 8)?;
+        let symbol = Symbol(le::get_u32(&buf[pos..]));
+        pos += 4;
+        let maker_fee_bps = le::get_i16(&buf[pos..]);
+        pos += 2;
+        let taker_fee_bps = le::get_i16(&buf[pos..]);
+        pos += 2;
+        out.push((
+            symbol,
+            FeeSchedule {
+                maker_fee_bps,
+                taker_fee_bps,
+            },
+        ));
+    }
+    Ok((pos, out))
+}
+
+fn decode_key_hwm(buf: &[u8]) -> Result<(usize, Vec<(u64, u64)>), JournalError> {
+    let n = read_section_len(buf)?;
+    let mut pos = 4;
+    // Each entry: key_hash(8) + hwm(8) = 16 bytes.
+    validate_count(buf.len() - pos, n, 16)?;
+    let mut out = Vec::with_capacity(n);
+    for _ in 0..n {
+        check(buf, pos, 16)?;
+        let key_hash = le::get_u64(&buf[pos..]);
+        let hwm = le::get_u64(&buf[pos + 8..]);
+        out.push((key_hash, hwm));
+        pos += 16;
+    }
+    Ok((pos, out))
+}
+
+fn decode_disabled_instruments(buf: &[u8]) -> Result<(usize, Vec<Symbol>), JournalError> {
+    let n = read_section_len(buf)?;
+    let mut pos = 4;
+    // Each entry: symbol(4) = 4 bytes.
+    validate_count(buf.len() - pos, n, 4)?;
+    let mut out = Vec::with_capacity(n);
+    for _ in 0..n {
+        check(buf, pos, 4)?;
+        out.push(Symbol(le::get_u32(&buf[pos..])));
+        pos += 4;
+    }
+    Ok((pos, out))
+}
+
+fn decode_fee_account_deficits(
+    buf: &[u8],
+) -> Result<(usize, Vec<(CurrencyId, u64)>), JournalError> {
+    let n = read_section_len(buf)?;
+    let mut pos = 4;
+    // Each entry: currency(4) + amount(8) = 12 bytes.
+    validate_count(buf.len() - pos, n, 12)?;
+    let mut out = Vec::with_capacity(n);
+    for _ in 0..n {
+        check(buf, pos, 12)?;
+        let currency = CurrencyId(le::get_u32(&buf[pos..]));
+        let amount = le::get_u64(&buf[pos + 4..]);
+        out.push((currency, amount));
+        pos += 12;
+    }
+    Ok((pos, out))
+}
+
+// Per-account rate-limiter bucket state (SEC-04). Each entry is
+// account(4) + tokens(8) + last_refill_ns(8) = 20 bytes.
+fn decode_order_buckets(buf: &[u8]) -> Result<(usize, Vec<OrderBucketEntry>), JournalError> {
+    let n = read_section_len(buf)?;
+    let mut pos = 4;
+    validate_count(buf.len() - pos, n, 20)?;
+    let mut out = Vec::with_capacity(n);
+    // Track seen accounts to reject duplicate keys: the encoder writes
+    // each AccountId at most once (HashMap iteration), so a duplicate
+    // here means the snapshot is corrupt or tampered. Silent overwrite
+    // would let an attacker shadow a legitimate bucket with a synthetic
+    // full-credit one. HashSet is u32-keyed and only built during
+    // recovery — not on the hot path.
+    let mut seen: std::collections::HashSet<AccountId> =
+        std::collections::HashSet::with_capacity(n);
+    for _ in 0..n {
+        check(buf, pos, 20)?;
+        let account = AccountId(le::get_u32(&buf[pos..]));
+        let tokens = le::get_u64(&buf[pos + 4..]);
+        let last_refill_ns = le::get_u64(&buf[pos + 12..]);
+        if !seen.insert(account) {
+            return Err(corrupt("duplicate account in order_buckets section"));
+        }
+        out.push((account, tokens, last_refill_ns));
+        pos += 20;
+    }
+    Ok((pos, out))
+}
+
+fn decode_exchange_state(
+    buf: &[u8],
+    version: u16,
+) -> Result<(usize, ExchangeSnapshot), JournalError> {
+    let mut pos = 0;
+
+    let (consumed, instruments) = decode_instruments(&buf[pos..])?;
+    pos += consumed;
+    let (consumed, balances) = decode_balances(&buf[pos..])?;
+    pos += consumed;
+    let (consumed, reservations) = decode_reservations(&buf[pos..])?;
+    pos += consumed;
+    let (consumed, order_sides) = decode_order_sides(&buf[pos..], version)?;
+    pos += consumed;
+    let (consumed, books) = decode_books(&buf[pos..], version)?;
+    pos += consumed;
+    let (consumed, risk_limits) = decode_risk_limits(&buf[pos..])?;
+    pos += consumed;
+    let (consumed, circuit_breakers) = decode_circuit_breakers(&buf[pos..])?;
+    pos += consumed;
+
+    // v7+ and v9+ sections may be absent on legacy snapshots that ended
+    // before the section was introduced (encoder writes at least a 4-byte
+    // length when the section exists, so EOF here means the snapshot
+    // predates the section). Newer versioned sections below require the
+    // section to be present — physical truncation surfaces as
+    // `TruncatedEntry` rather than a silent empty vec.
     let fee_schedules = if version >= 7 && pos < buf.len() {
-        check(pos, 4)?;
-        let n_fee_schedules = le::get_u32(&buf[pos..]) as usize;
-        pos += 4;
-        // Each fee schedule: symbol(4) + maker_bps(2) + taker_bps(2) = 8 bytes.
-        validate_count(buf.len() - pos, n_fee_schedules, 8)?;
-        let mut schedules = Vec::with_capacity(n_fee_schedules);
-        for _ in 0..n_fee_schedules {
-            check(pos, 8)?;
-            let symbol = Symbol(le::get_u32(&buf[pos..]));
-            pos += 4;
-            let maker_fee_bps = le::get_i16(&buf[pos..]);
-            pos += 2;
-            let taker_fee_bps = le::get_i16(&buf[pos..]);
-            pos += 2;
-            schedules.push((
-                symbol,
-                FeeSchedule {
-                    maker_fee_bps,
-                    taker_fee_bps,
-                },
-            ));
-        }
-        schedules
+        let (consumed, v) = decode_fee_schedules(&buf[pos..])?;
+        pos += consumed;
+        v
     } else {
         Vec::new()
     };
 
-    // Per-key request sequence HWMs (v9+).
     let key_hwm = if version >= 9 && pos < buf.len() {
-        check(pos, 4)?;
-        let n = le::get_u32(&buf[pos..]) as usize;
-        pos += 4;
-        // Each entry: key_hash(8) + hwm(8) = 16 bytes.
-        validate_count(buf.len() - pos, n, 16)?;
-        let mut hwms = Vec::with_capacity(n);
-        for _ in 0..n {
-            check(pos, 16)?;
-            let key_hash = le::get_u64(&buf[pos..]);
-            let hwm = le::get_u64(&buf[pos + 8..]);
-            hwms.push((key_hash, hwm));
-            pos += 16;
-        }
-        hwms
+        let (consumed, v) = decode_key_hwm(&buf[pos..])?;
+        pos += consumed;
+        v
     } else {
         Vec::new()
     };
 
-    // For each `if version >= N` section below, the encoder always
-    // writes at least a 4-byte length (zero entries is a length-0
-    // section, not an absent section). A missing section therefore
-    // means physical truncation — surface that as `TruncatedEntry`
-    // via `check`, never silently substitute an empty vec. Only the
-    // current `SNAP_VERSION` is reachable through `load()` today; the
-    // `version >=` gates are kept here so a future cross-version load
-    // path can opt into older shapes without re-deriving the layout.
-
-    // Disabled instruments (v12+).
     let disabled_instruments = if version >= 12 {
-        check(pos, 4)?;
-        let n = le::get_u32(&buf[pos..]) as usize;
-        pos += 4;
-        // Each entry: symbol(4) = 4 bytes.
-        validate_count(buf.len() - pos, n, 4)?;
-        let mut disabled = Vec::with_capacity(n);
-        for _ in 0..n {
-            check(pos, 4)?;
-            disabled.push(Symbol(le::get_u32(&buf[pos..])));
-            pos += 4;
-        }
-        disabled
+        let (consumed, v) = decode_disabled_instruments(&buf[pos..])?;
+        pos += consumed;
+        v
     } else {
         Vec::new()
     };
 
-    // Fee-account deficits (v16+). Per-currency u64 amounts the fee
-    // account owes for rebates paid in excess of accumulated revenue.
     let fee_account_deficits = if version >= 16 {
-        check(pos, 4)?;
-        let n = le::get_u32(&buf[pos..]) as usize;
-        pos += 4;
-        // Each entry: currency(4) + amount(8) = 12 bytes.
-        validate_count(buf.len() - pos, n, 12)?;
-        let mut deficits = Vec::with_capacity(n);
-        for _ in 0..n {
-            check(pos, 12)?;
-            let currency = CurrencyId(le::get_u32(&buf[pos..]));
-            let amount = le::get_u64(&buf[pos + 4..]);
-            deficits.push((currency, amount));
-            pos += 12;
-        }
-        deficits
+        let (consumed, v) = decode_fee_account_deficits(&buf[pos..])?;
+        pos += consumed;
+        v
     } else {
         Vec::new()
     };
 
-    // Per-account rate-limiter bucket state (v18+, SEC-04). Each entry
-    // is account(4) + tokens(8) + last_refill_ns(8) = 20 bytes.
     let order_buckets = if version >= 18 {
-        check(pos, 4)?;
-        let n = le::get_u32(&buf[pos..]) as usize;
-        pos += 4;
-        validate_count(buf.len() - pos, n, 20)?;
-        let mut buckets = Vec::with_capacity(n);
-        // Track seen accounts to reject duplicate keys: the encoder writes
-        // each AccountId at most once (HashMap iteration), so a duplicate
-        // here means the snapshot is corrupt or tampered. Silent overwrite
-        // would let an attacker shadow a legitimate bucket with a synthetic
-        // full-credit one. HashSet is u32-keyed and only built during
-        // recovery — not on the hot path.
-        let mut seen: std::collections::HashSet<AccountId> =
-            std::collections::HashSet::with_capacity(n);
-        for _ in 0..n {
-            check(pos, 20)?;
-            let account = AccountId(le::get_u32(&buf[pos..]));
-            let tokens = le::get_u64(&buf[pos + 4..]);
-            let last_refill_ns = le::get_u64(&buf[pos + 12..]);
-            if !seen.insert(account) {
-                return Err(corrupt("duplicate account in order_buckets section"));
-            }
-            buckets.push((account, tokens, last_refill_ns));
-            pos += 20;
-        }
-        buckets
+        let (consumed, v) = decode_order_buckets(&buf[pos..])?;
+        pos += consumed;
+        v
     } else {
         Vec::new()
     };
