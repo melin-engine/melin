@@ -17,15 +17,15 @@ Tackle items one by one. Mark `[x]` when done and reference the commit.
   `restore_state` shrunk from 82 to ~30 lines and reads as a linear
   orchestrator. 364 engine tests pass, clippy clean.
 
-- [ ] **`engine/src/orderbook.rs:1686, 1704, 1770` — three `.expect("front existed")` in `match_against()` hot loop**
-  Safe under protocol invariants, but a corruption/index bug would panic
-  with no breadcrumb. Either (a) add a comment above each justifying the
-  invariant, or (b) convert to logged + recoverable error path. Pick (a)
-  unless the panic context is genuinely insufficient.
+- [x] **`engine/src/orderbook.rs:1686, 1704, 1770` — three `.expect("front existed")` in `match_against()` hot loop**
+  Done (option a): each site now carries a comment naming the
+  `front_node_idx(price)` guard and stating why the panic is preferable
+  (silently dropping a fill would corrupt balances/leak a reservation).
 
-- [ ] **`engine/src/exchange.rs:1059, 1259` — `.expect("instrument verified to exist above")` lacks pointer to the check**
-  Add a one-line comment referencing the prior risk-check site so future
-  readers can verify the invariant without re-reading the whole fn.
+- [x] **`engine/src/exchange.rs:1059, 1259` — `.expect("instrument verified to exist above")` lacks pointer to the check**
+  Done: both call sites now reference the `inst_ref` guard at the top of
+  `execute` (~line 1017) and note the single-threaded invariant that
+  keeps the slot occupied.
 
 ## Medium
 
