@@ -18,7 +18,7 @@ use std::num::NonZero;
 use std::time::Instant;
 
 use melin_engine::journal::JournalEvent;
-use melin_engine::journal::JournalWriter;
+use melin_engine::journal::SectorWriter;
 use melin_trading::trading_event::TradingEvent;
 
 #[derive(Parser)]
@@ -82,7 +82,7 @@ fn run_journal_writer_bench(num_events: usize, batch_size: usize, _warmup: usize
     let journal_path = std::path::PathBuf::from("/tmp/journal_writer_bench.journal");
     // Remove existing file if it exists.
     let _ = std::fs::remove_file(&journal_path);
-    let mut writer = JournalWriter::create(&journal_path).expect("create journal");
+    let mut writer = SectorWriter::create(&journal_path).expect("create journal");
 
     // Measurement phase.
     println!("Measurement phase...");
@@ -179,7 +179,7 @@ fn run_replica_mode(num_events: usize, batch_size: usize, _warmup: usize) {
     // Use a fixed journal file path.
     let journal_path = std::path::PathBuf::from("/tmp/journal_writer_bench_replica.journal");
     let _ = std::fs::remove_file(&journal_path);
-    let mut writer = JournalWriter::create(&journal_path).expect("create journal");
+    let mut writer = SectorWriter::create(&journal_path).expect("create journal");
 
     // Set up io_uring for async writes.
     let mut io_uring = IoUring::new(256).expect("create io_uring ring");

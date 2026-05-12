@@ -799,7 +799,7 @@ The journal uses CRC32C checksums on every entry. If the server crashes during a
 
 - The partially written entry will fail CRC validation on recovery.
 - The `JournalReader` detects the truncated/corrupt entry and stops replaying at the last valid entry.
-- The `JournalWriter` reopens the file for appending at the valid data boundary, effectively truncating the garbage.
+- The `SectorWriter` reopens the file for appending at the valid data boundary, effectively truncating the garbage.
 - **One event may be lost** (the one being written at crash time). All prior events are intact.
 
 This is handled automatically. No manual intervention required.

@@ -32,7 +32,7 @@ Every node — primary and replica — runs the full pipeline: encoding, matchin
 
 ### ~~Step 1: Extract an Explicit Sequencer Stage~~ (DONE, then redesigned)
 
-Separated `allocate_sequence()` from `encode_event()` on `JournalWriter`. Added `sequence` and `timestamp_ns` fields to `InputSlot`. JournalStage batch loops use the explicit two-step pattern.
+Separated `allocate_sequence()` from `encode_event()` on `SectorWriter`. Added `sequence` and `timestamp_ns` fields to `InputSlot`. JournalStage batch loops use the explicit two-step pattern.
 
 Followup: the original implementation introduced a `Sequencer` type that producers called pre-publish. That created a window where a claimed sequence could fail to reach a slot (`try_publish` failure → journal gap on recovery). The `Sequencer` has since been retired; sequence allocation now happens inside the journal stage in disruptor cursor order. Producers publish `sequence: 0`; the journal stage either allocates from the writer (primary) or uses the wire-decoded value (replica).
 

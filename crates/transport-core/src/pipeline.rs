@@ -307,7 +307,7 @@ impl<R: Copy, Q: Copy> Default for OutputSlot<R, Q> {
 /// channel. The bytes are identical to what was written to disk — same
 /// sequences, timestamps, CRC checksums, and checkpoint entries.
 pub struct JournalStage<E: AppEvent> {
-    writer: melin_journal::JournalWriter<E>,
+    writer: melin_journal::SectorWriter<E>,
     consumer: ring::Consumer<InputSlot<E>>,
     /// Group commit coalescing window. The journal stage waits up to this
     /// duration after the first unsynced write before issuing the durable
@@ -438,7 +438,7 @@ impl<E: AppEvent> JournalStage<E> {
     /// issuing the durable write. Zero means sync immediately after each
     /// batch read.
     pub fn new(
-        writer: melin_journal::JournalWriter<E>,
+        writer: melin_journal::SectorWriter<E>,
         consumer: ring::Consumer<InputSlot<E>>,
         group_commit_delay: Duration,
         max_batch: usize,
@@ -533,11 +533,11 @@ impl<E: AppEvent> JournalStage<E> {
     /// With the `no-persist` feature, falls back to synchronous writes
     /// (io_uring overlapping is only useful with actual disk I/O).
     ///
-    /// Returns the `JournalWriter` on shutdown for clean resource release.
+    /// Returns the `SectorWriter` on shutdown for clean resource release.
     pub fn run(
         self,
         shutdown: &std::sync::atomic::AtomicBool,
-    ) -> Result<melin_journal::JournalWriter<E>, JournalError> {
+    ) -> Result<melin_journal::SectorWriter<E>, JournalError> {
         let use_uring = !cfg!(feature = "no-persist");
 
         if use_uring {
@@ -556,7 +556,7 @@ impl<E: AppEvent> JournalStage<E> {
     fn run_sync(
         mut self,
         shutdown: &std::sync::atomic::AtomicBool,
-    ) -> Result<melin_journal::JournalWriter<E>, JournalError> {
+    ) -> Result<melin_journal::SectorWriter<E>, JournalError> {
         use std::time::Instant;
 
         let mut batch = [InputSlot::default(); MAX_JOURNAL_BATCH];
@@ -800,7 +800,7 @@ impl<E: AppEvent> JournalStage<E> {
     /// Lazily initializes the buffer header on the first slot of each batch.
     /// Append the just-encoded journal entry's bytes to the InputBatch
     /// buffer. `journal_slice` comes from
-    /// [`JournalWriter::last_user_entry_replication_slice`] and is laid
+    /// [`SectorWriter::last_user_entry_replication_slice`] and is laid
     /// out exactly as the on-the-wire slot — the journal codec's frame
     /// minus its 2-byte magic and 4-byte CRC. No re-encode on the
     /// hot path; the hand-off is a single `extend_from_slice`.
@@ -923,7 +923,7 @@ impl<E: AppEvent> JournalStage<E> {
     /// observers pick up the new genesis-anchored value.
     ///
     /// Errors are logged but do not abort the pipeline: the live
-    /// segment is restored by `JournalWriter::rotate_segment` on
+    /// segment is restored by `SectorWriter::rotate_segment` on
     /// failure, so the next batch can continue writing to it.
     ///
     /// Returns `true` when a rotation actually happened — the caller
@@ -1141,7 +1141,7 @@ impl<E: AppEvent> JournalStage<E> {
     fn run_uring(
         mut self,
         shutdown: &std::sync::atomic::AtomicBool,
-    ) -> Result<melin_journal::JournalWriter<E>, JournalError> {
+    ) -> Result<melin_journal::SectorWriter<E>, JournalError> {
         use io_uring::{IoUring, opcode, types};
         use std::time::Instant;
 
@@ -2273,7 +2273,7 @@ fn setup_chain_hash_publisher<E: AppEvent>(
 #[allow(clippy::too_many_arguments)]
 pub fn build_pipeline_with_replication<A>(
     app: A,
-    writer: melin_journal::JournalWriter<A::Event>,
+    writer: melin_journal::SectorWriter<A::Event>,
     group_commit_delay: Duration,
     active_connections: Arc<AtomicU64>,
     enable_replication: bool,
@@ -2432,7 +2432,7 @@ where
 /// vary after journal rotation).
 pub fn build_replica_pipeline<A>(
     app: A,
-    writer: melin_journal::JournalWriter<A::Event>,
+    writer: melin_journal::SectorWriter<A::Event>,
     max_journal_batch: usize,
     group_commit_delay: Duration,
     busy_spin: bool,

@@ -73,7 +73,7 @@ const SNAPSHOT_DEADLINE: Duration = Duration::from_secs(60);
 ///
 /// Blocks until the connection drops or shutdown is signaled.
 /// `Some` return value = promotion triggered with the fully-replayed
-/// `App` and positioned `JournalWriter`; `None` = clean shutdown.
+/// `App` and positioned `SectorWriter`; `None` = clean shutdown.
 #[allow(clippy::too_many_arguments)]
 pub fn run_receiver_rumcast(
     primary_addr: SocketAddr,
@@ -94,7 +94,7 @@ pub fn run_receiver_rumcast(
     max_orders_burst: u32,
 ) -> super::ReceiverResult {
     use crate::App;
-    use crate::JournalWriter;
+    use crate::SectorWriter;
     use melin_transport_core::JournaledApp;
 
     // ---- Recover local state from journal (if any) ----
@@ -194,7 +194,7 @@ pub fn run_receiver_rumcast(
                         melin_transport_core::snapshot::load::<App>(&snapshot_path)?;
                     exchange = Some(snap_exchange);
                     let writer =
-                        JournalWriter::create_continuing(journal_path, snap_seq + 1, snap_hash)?;
+                        SectorWriter::create_continuing(journal_path, snap_seq + 1, snap_hash)?;
                     journal_writer = Some(writer);
                     last_sequence = snap_seq;
                     chain_hash = snap_hash;
@@ -1278,7 +1278,7 @@ fn generate_session_id() -> u32 {
 fn create_fresh_replica_journal(
     journal_path: &Path,
     primary_genesis_entry: &[u8],
-) -> io::Result<crate::JournalWriter> {
+) -> io::Result<crate::SectorWriter> {
     use melin_journal::codec as journal_codec;
     use melin_journal::detect_sector_size;
     use std::fs::OpenOptions;
@@ -1304,6 +1304,6 @@ fn create_fresh_replica_journal(
     };
 
     let valid_end = sector_size as u64 + primary_genesis_entry.len() as u64;
-    crate::JournalWriter::open_append(journal_path, 1, valid_end, Some(genesis_chain_hash), 0)
+    crate::SectorWriter::open_append(journal_path, 1, valid_end, Some(genesis_chain_hash), 0)
         .map_err(|e| io::Error::other(format!("open_append: {e}")))
 }

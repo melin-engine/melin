@@ -25,12 +25,12 @@ pub mod reader;
 pub mod replication;
 pub mod segment;
 pub mod trace;
-pub mod writer;
+pub mod sector_writer;
 
-pub use buffered_writer::BufferedJournalWriter;
+pub use buffered_writer::BufferedWriter;
 pub use error::JournalError;
 pub use event::JournalEvent;
 pub use reader::{JournalEntry, JournalReader, RawJournalScanner};
-pub use writer::{
-    AsyncWriteBatch, JournalWriter, checkpoint_interval, detect_sector_size, wall_clock_nanos,
+pub use sector_writer::{
+    AsyncWriteBatch, SectorWriter, checkpoint_interval, detect_sector_size, wall_clock_nanos,
 };

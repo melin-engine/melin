@@ -1,6 +1,6 @@
 //! Buffered journal writer — page-cache writes with explicit `fdatasync`.
 //!
-//! Alternative to [`crate::writer::JournalWriter`] for deployments that
+//! Alternative to [`crate::sector_writer::SectorWriter`] for deployments that
 //! cannot rely on capacitor-backed power-loss protection on the storage
 //! device. The on-disk format is identical to the O_DIRECT writer
 //! (`crate::codec` framing), so [`crate::reader::JournalReader`] and
@@ -8,7 +8,7 @@
 //!
 //! ## Durability contract
 //!
-//! Every call to [`BufferedJournalWriter::flush_batch_sync`] issues a
+//! Every call to [`BufferedWriter::flush_batch_sync`] issues a
 //! single positioned `pwrite` followed by `fdatasync`. The call returns
 //! only once the kernel reports the data is on stable media — honest
 //! durability on any drive, PLP or not. On a drive with a volatile write
@@ -37,8 +37,8 @@ use crate::codec::{self, FILE_HEADER_SIZE};
 use crate::error::JournalError;
 use crate::event::JournalEvent;
 #[cfg(feature = "hash-chain")]
-use crate::writer::checkpoint_interval;
-use crate::writer::wall_clock_nanos;
+use crate::sector_writer::checkpoint_interval;
+use crate::sector_writer::wall_clock_nanos;
 
 /// Maximum encoded entry size. Mirrors `writer::MAX_ENTRY_SIZE` — actual
 /// entries are ~81-101 bytes; the array is sized generously so the
@@ -74,7 +74,7 @@ fn prealloc_chunk_bytes() -> u64 {
 
 /// Append-only journal writer that goes through the kernel page cache
 /// and forces durability with `fdatasync` per flush.
-pub struct BufferedJournalWriter<E: AppEvent> {
+pub struct BufferedWriter<E: AppEvent> {
     // PhantomData carries the app event type for the methods that
     // read/write `JournalEvent<E>`. Zero-size — no runtime cost.
     _marker: PhantomData<fn(E) -> E>,
@@ -122,7 +122,7 @@ struct HashChain {
     events_since_checkpoint: u64,
 }
 
-impl<E: AppEvent> BufferedJournalWriter<E> {
+impl<E: AppEvent> BufferedWriter<E> {
     /// Create a fresh journal file with a random genesis hash.
     pub fn create(path: &Path) -> Result<Self, JournalError> {
         crate::preparer::cleanup_staging_orphan(path);
@@ -790,7 +790,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("test.journal");
 
-        let writer = BufferedJournalWriter::<TestEvent>::create(&path).unwrap();
+        let writer = BufferedWriter::<TestEvent>::create(&path).unwrap();
         assert_eq!(writer.next_sequence(), FIRST_SEQ);
         assert_eq!(writer.path(), path);
         #[cfg(feature = "hash-chain")]
@@ -810,10 +810,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("test.journal");
 
-        let w = BufferedJournalWriter::<TestEvent>::create(&path).unwrap();
+        let w = BufferedWriter::<TestEvent>::create(&path).unwrap();
         drop(w);
 
-        assert!(BufferedJournalWriter::<TestEvent>::create(&path).is_err());
+        assert!(BufferedWriter::<TestEvent>::create(&path).is_err());
     }
 
     #[test]
@@ -821,7 +821,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("test.journal");
 
-        let mut writer = BufferedJournalWriter::<TestEvent>::create(&path).unwrap();
+        let mut writer = BufferedWriter::<TestEvent>::create(&path).unwrap();
         let seq1 = writer.append(&sample(1)).unwrap();
         let seq2 = writer.append(&sample(2)).unwrap();
         let seq3 = writer.append(&sample(3)).unwrap();
@@ -837,7 +837,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("test.journal");
 
-        let mut writer = BufferedJournalWriter::<TestEvent>::create(&path).unwrap();
+        let mut writer = BufferedWriter::<TestEvent>::create(&path).unwrap();
         for i in 1..=5u64 {
             writer.append(&sample(i)).unwrap();
         }
@@ -851,7 +851,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("test.journal");
 
-        let mut writer = BufferedJournalWriter::<TestEvent>::create(&path).unwrap();
+        let mut writer = BufferedWriter::<TestEvent>::create(&path).unwrap();
         for i in 1..=10u64 {
             writer.batch_append(&sample(i)).unwrap();
         }
@@ -868,7 +868,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("test.journal");
 
-        let mut writer = BufferedJournalWriter::<TestEvent>::create(&path).unwrap();
+        let mut writer = BufferedWriter::<TestEvent>::create(&path).unwrap();
         writer.batch_append(&sample(1)).unwrap();
         writer.batch_append(&sample(2)).unwrap();
         assert!(!writer.pending_batch_bytes().is_empty());
@@ -890,7 +890,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("test.journal");
 
-        let mut writer = BufferedJournalWriter::<TestEvent>::create(&path).unwrap();
+        let mut writer = BufferedWriter::<TestEvent>::create(&path).unwrap();
         writer.append(&sample(1)).unwrap();
         writer.append(&sample(2)).unwrap();
         let last_seq = writer.next_sequence() - 1;
@@ -899,7 +899,7 @@ mod tests {
         let events_since_checkpoint = writer.events_since_checkpoint();
         drop(writer);
 
-        let mut reopened = BufferedJournalWriter::<TestEvent>::open_append(
+        let mut reopened = BufferedWriter::<TestEvent>::open_append(
             &path,
             last_seq,
             valid_end,
@@ -919,7 +919,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("test.journal");
 
-        let mut writer = BufferedJournalWriter::<TestEvent>::create(&path).unwrap();
+        let mut writer = BufferedWriter::<TestEvent>::create(&path).unwrap();
         writer.append(&sample(1)).unwrap();
         writer.append(&sample(2)).unwrap();
         let seq_before_rotate = writer.next_sequence();
@@ -950,7 +950,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("test.journal");
 
-        let mut writer = BufferedJournalWriter::<TestEvent>::create(&path).unwrap();
+        let mut writer = BufferedWriter::<TestEvent>::create(&path).unwrap();
         let pos_before = writer.write_pos();
 
         // Flush twice in a row — second call has nothing pending and
@@ -966,7 +966,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("test.journal");
 
-        let mut writer = BufferedJournalWriter::<TestEvent>::create(&path).unwrap();
+        let mut writer = BufferedWriter::<TestEvent>::create(&path).unwrap();
         writer.append(&sample(1)).unwrap();
         writer.append(&sample(2)).unwrap();
         let chain_before = writer.chain_hash().unwrap();
@@ -975,7 +975,7 @@ mod tests {
         let events_since_checkpoint = writer.events_since_checkpoint();
         drop(writer);
 
-        let reopened = BufferedJournalWriter::<TestEvent>::open_append(
+        let reopened = BufferedWriter::<TestEvent>::open_append(
             &path,
             last_seq,
             valid_end,
@@ -996,7 +996,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("test.journal");
 
-        let mut writer = BufferedJournalWriter::<TestEvent>::create(&path).unwrap();
+        let mut writer = BufferedWriter::<TestEvent>::create(&path).unwrap();
         writer.batch_append(&sample(42)).unwrap();
 
         // The full encoded entry is [magic(2) | header | payload | CRC(4)].

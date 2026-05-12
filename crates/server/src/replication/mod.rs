@@ -312,7 +312,7 @@ pub(super) fn sleep_checking_flags(
     }
 }
 
-/// Shut down the replica pipeline and extract Exchange + JournalWriter from
+/// Shut down the replica pipeline and extract Exchange + SectorWriter from
 /// the stage threads. Returns None if a thread panicked.
 ///
 /// Relies on the caller having published a `JournalEvent::Shutdown`
@@ -329,12 +329,12 @@ pub(super) fn sleep_checking_flags(
 pub(super) fn shutdown_pipeline(
     shutdown_flag: &AtomicBool,
     journal_handle: std::thread::JoinHandle<
-        Result<crate::JournalWriter, melin_journal::JournalError>,
+        Result<crate::SectorWriter, melin_journal::JournalError>,
     >,
     matching_handle: std::thread::JoinHandle<crate::App>,
     drain_handle: std::thread::JoinHandle<()>,
     shadow_handle: Option<std::thread::JoinHandle<()>>,
-) -> Option<(crate::App, crate::JournalWriter)> {
+) -> Option<(crate::App, crate::SectorWriter)> {
     // Defense-in-depth: set the flag before joining. The sentinel was
     // already published by `tcp_receiver` before this call, so no further
     // events can arrive in the input ring — setting the flag here cannot
@@ -381,7 +381,7 @@ pub(super) struct ReplicaPipelineHandles {
     /// (Promote/Shutdown/Fatal/Snapshot). NOT flipped on `Disconnected`.
     pub(super) pipeline_shutdown: Arc<AtomicBool>,
     pub(super) journal_handle:
-        std::thread::JoinHandle<Result<crate::JournalWriter, melin_journal::JournalError>>,
+        std::thread::JoinHandle<Result<crate::SectorWriter, melin_journal::JournalError>>,
     pub(super) matching_handle: std::thread::JoinHandle<crate::App>,
     pub(super) drain_handle: std::thread::JoinHandle<()>,
     pub(super) shadow_handle: Option<std::thread::JoinHandle<()>>,
@@ -392,7 +392,7 @@ pub(super) struct ReplicaPipelineHandles {
 /// `Disconnected` reconnects.
 pub(super) fn build_replica_pipeline_with_threads(
     exchange: crate::App,
-    writer: crate::JournalWriter,
+    writer: crate::SectorWriter,
     cores: crate::server::PipelineCores,
     snapshot_interval_ms: u64,
     snapshot_path: std::path::PathBuf,
@@ -510,11 +510,11 @@ pub(super) fn build_replica_pipeline_with_threads(
 }
 
 /// Tear down the pipeline: signal shutdown, join all threads, return the
-/// recovered (App, JournalWriter) so the orchestrator can use them for the
+/// recovered (App, SectorWriter) so the orchestrator can use them for the
 /// next pipeline build (e.g., post-snapshot) or pass them up on promotion.
 pub(super) fn teardown_replica_pipeline(
     handles: ReplicaPipelineHandles,
-) -> Option<(crate::App, crate::JournalWriter)> {
+) -> Option<(crate::App, crate::SectorWriter)> {
     shutdown_pipeline(
         &handles.pipeline_shutdown,
         handles.journal_handle,

@@ -4,7 +4,7 @@
 //! ## Why
 //!
 //! With size-driven rotation enabled, every `max_journal_bytes` written
-//! the journal stage calls `JournalWriter::rotate_segment`, which creates
+//! the journal stage calls `SectorWriter::rotate_segment`, which creates
 //! the next segment file via `posix_fallocate(+chunk)` +
 //! `FALLOC_FL_ZERO_RANGE` + `prefault_pages` + `sync_all`. On PLP-class
 //! NVMe drives that ceremony is a ~38 ms synchronous stall — directly
@@ -37,10 +37,10 @@ use std::thread::JoinHandle;
 use std::time::Duration;
 
 use crate::error::JournalError;
-use crate::writer::{preallocate, prefault_pages, zero_range_extents};
+use crate::sector_writer::{preallocate, prefault_pages, zero_range_extents};
 
 /// A fully-prepared journal segment file ready to be adopted by a
-/// `JournalWriter` on the next rotation.
+/// `SectorWriter` on the next rotation.
 ///
 /// At this point the file already has:
 ///   - extents allocated for `[sector_size, allocated_end)` via
@@ -51,7 +51,7 @@ use crate::writer::{preallocate, prefault_pages, zero_range_extents};
 ///   - `sync_all` issued so the allocation is durable across crashes.
 ///
 /// The file header and `GenesisHash` entry are *not* yet written —
-/// `JournalWriter::adopt_prepared` writes them at adopt time so they
+/// `SectorWriter::adopt_prepared` writes them at adopt time so they
 /// reflect the rotation boundary's sequence + chain hash.
 pub struct PreparedSegment {
     /// O_DIRECT file handle. Reused by the writer after rename.
@@ -59,7 +59,7 @@ pub struct PreparedSegment {
     /// Path of the staging file (`<live>.next-staging`). The adopter
     /// renames it onto the live path.
     pub path: PathBuf,
-    /// End of pre-allocated region (matches `JournalWriter::allocated_end`).
+    /// End of pre-allocated region (matches `SectorWriter::allocated_end`).
     pub allocated_end: u64,
     /// Sector size detected at open time — must match the live file.
     pub sector_size: usize,
@@ -154,7 +154,7 @@ impl SegmentPreparer {
 
     /// Drain the prepared-segment slot. Returns `Some` only if the
     /// worker has finished a preparation that has not yet been adopted.
-    /// Called by `JournalWriter::rotate_segment` to decide between the
+    /// Called by `SectorWriter::rotate_segment` to decide between the
     /// fast adopt path and the sync fallback.
     pub fn take(&self) -> Option<PreparedSegment> {
         self.state
@@ -261,10 +261,10 @@ fn backoff_sleep(state: &State) {
 
 /// Create the staging file and run the expensive preallocation steps.
 ///
-/// Mirrors the prep done in `JournalWriter::create_bare_inner` except
+/// Mirrors the prep done in `SectorWriter::create_bare_inner` except
 /// it does *not* write a file header — the header is application data
 /// that depends on the rotation-boundary state and is written by
-/// `JournalWriter::adopt_prepared` after the rename.
+/// `SectorWriter::adopt_prepared` after the rename.
 fn prepare_one(live_path: &Path, sector_size: usize) -> Result<PreparedSegment, JournalError> {
     let staging = staging_path(live_path);
 
@@ -306,7 +306,7 @@ fn prepare_one(live_path: &Path, sector_size: usize) -> Result<PreparedSegment, 
 /// Called from two places:
 ///   - [`SegmentPreparer::spawn`] when rotation is enabled (the
 ///     preparer would otherwise fail at `create_new` on the same path).
-///   - [`crate::writer::JournalWriter::create`] and `::open_append` so
+///   - [`crate::sector_writer::SectorWriter::create`] and `::open_append` so
 ///     the orphan is reclaimed even when rotation is disabled (no
 ///     preparer ever runs).
 ///

@@ -740,9 +740,9 @@ enum SessionExit {
 ///
 /// Blocks until the connection drops or shutdown is signaled.
 /// Result of `run_receiver`: `None` = clean shutdown, `Some` = promotion
-/// triggered with the fully-replayed App and positioned JournalWriter.
+/// triggered with the fully-replayed App and positioned SectorWriter.
 pub type ReceiverResult =
-    Result<Option<(crate::App, crate::JournalWriter)>, Box<dyn std::error::Error>>;
+    Result<Option<(crate::App, crate::SectorWriter)>, Box<dyn std::error::Error>>;
 
 #[allow(clippy::too_many_arguments)]
 pub fn run_receiver(
@@ -773,11 +773,11 @@ pub fn run_receiver(
     max_orders_burst: u32,
 ) -> ReceiverResult {
     use crate::App;
-    use crate::JournalWriter;
+    use crate::SectorWriter;
 
     // Recover local state from journal (if any). On first call this may
     // be (None, None) for a fresh replica. After a reconnect, the pipeline
-    // shutdown returns the App + JournalWriter directly.
+    // shutdown returns the App + SectorWriter directly.
     let (mut exchange, mut journal_writer, mut last_sequence, mut chain_hash) =
         if journal_path.exists() {
             let engine = if snapshot_path.exists() {
@@ -979,7 +979,7 @@ pub fn run_receiver(
                 info!("primary requires snapshot transfer — receiving snapshot");
 
                 // Tear down the running pipeline before wiping its journal
-                // file from under it. The recovered (App, JournalWriter) is
+                // file from under it. The recovered (App, SectorWriter) is
                 // discarded — snapshot loading reconstructs both fresh below
                 // and reassigns `exchange` / `journal_writer`.
                 if let Some(mut p) = pipeline.take() {
@@ -1067,7 +1067,7 @@ pub fn run_receiver(
                 exchange = Some(snap_exchange);
 
                 let writer =
-                    JournalWriter::create_continuing(journal_path, snap_seq + 1, snap_hash)?;
+                    SectorWriter::create_continuing(journal_path, snap_seq + 1, snap_hash)?;
                 journal_writer = Some(writer);
 
                 let ss_frame = read_frame(&mut reader, MAX_CONTROL_FRAME)?;
@@ -1122,7 +1122,7 @@ pub fn run_receiver(
             };
 
             let valid_end = sector_size as u64 + primary_genesis_entry.len() as u64;
-            let writer = JournalWriter::open_append(
+            let writer = SectorWriter::open_append(
                 journal_path,
                 1, // genesis consumed sequence 1
                 valid_end,

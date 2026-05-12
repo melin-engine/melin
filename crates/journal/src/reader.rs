@@ -639,7 +639,7 @@ mod tests {
     use std::io::Write;
 
     use super::*;
-    use crate::writer::JournalWriter;
+    use crate::sector_writer::SectorWriter;
     use melin_app::CodecError;
 
     /// Minimal `AppEvent` for reader round-trip tests.
@@ -677,7 +677,7 @@ mod tests {
 
     fn write_sample(path: &Path) -> Vec<JournalEvent<TestEvent>> {
         let events = sample_events();
-        let mut writer = JournalWriter::<TestEvent>::create(path).unwrap();
+        let mut writer = SectorWriter::<TestEvent>::create(path).unwrap();
         for event in &events {
             writer.append(event).unwrap();
         }
@@ -688,7 +688,7 @@ mod tests {
     fn open_validates_header() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("test.journal");
-        let _writer = JournalWriter::<TestEvent>::create(&path).unwrap();
+        let _writer = SectorWriter::<TestEvent>::create(&path).unwrap();
         let _reader = JournalReader::<TestEvent>::open(&path).unwrap();
     }
 
@@ -714,7 +714,7 @@ mod tests {
     fn no_entries_empty_journal() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("test.journal");
-        let _writer = JournalWriter::<TestEvent>::create(&path).unwrap();
+        let _writer = SectorWriter::<TestEvent>::create(&path).unwrap();
 
         let mut reader = JournalReader::<TestEvent>::open(&path).unwrap();
         #[cfg(feature = "hash-chain")]
@@ -734,7 +734,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("test.journal");
         {
-            let mut writer = JournalWriter::<TestEvent>::create(&path).unwrap();
+            let mut writer = SectorWriter::<TestEvent>::create(&path).unwrap();
             writer.append(&JournalEvent::App(TestEvent(7))).unwrap();
         }
 
@@ -757,7 +757,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("test.journal");
         {
-            let mut writer = JournalWriter::<TestEvent>::create(&path).unwrap();
+            let mut writer = SectorWriter::<TestEvent>::create(&path).unwrap();
             writer.append(&JournalEvent::App(TestEvent(1))).unwrap();
         }
 
@@ -789,7 +789,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("test.journal");
         {
-            let mut writer = JournalWriter::<TestEvent>::create(&path).unwrap();
+            let mut writer = SectorWriter::<TestEvent>::create(&path).unwrap();
             writer.append(&JournalEvent::App(TestEvent(1))).unwrap();
             writer.append(&JournalEvent::App(TestEvent(2))).unwrap();
         }

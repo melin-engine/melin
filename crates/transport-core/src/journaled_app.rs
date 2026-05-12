@@ -1,6 +1,6 @@
 //! Generic journal-plus-application wrapper.
 //!
-//! Holds an `A: Application` and a [`JournalWriter<A::Event>`]; handles
+//! Holds an `A: Application` and a [`SectorWriter<A::Event>`]; handles
 //! the startup paths a server cares about:
 //!
 //! - [`create`]: fresh journal, fresh app.
@@ -20,7 +20,7 @@
 use std::path::Path;
 
 use melin_app::{Application, ApplyCtx};
-use melin_journal::{JournalError, JournalEvent, JournalReader, JournalWriter};
+use melin_journal::{JournalError, JournalEvent, JournalReader, SectorWriter};
 
 use crate::snapshot;
 
@@ -74,7 +74,7 @@ impl From<std::io::Error> for JournaledAppError {
 /// the next free sequence.
 pub struct JournaledApp<A: Application> {
     app: A,
-    writer: JournalWriter<A::Event>,
+    writer: SectorWriter<A::Event>,
 }
 
 impl<A: Application> JournaledApp<A> {
@@ -83,7 +83,7 @@ impl<A: Application> JournaledApp<A> {
     /// appropriately pre-sized constructor (e.g.
     /// `Exchange::with_capacity()`) rather than relying on `Default`.
     pub fn create(app: A, journal_path: &Path) -> Result<Self, JournaledAppError> {
-        let writer = JournalWriter::<A::Event>::create(journal_path)?;
+        let writer = SectorWriter::<A::Event>::create(journal_path)?;
         Ok(Self { app, writer })
     }
 
@@ -171,7 +171,7 @@ impl<A: Application> JournaledApp<A> {
         if !live_exists {
             // Phase B recovery: rotation crashed between
             // [`crate::segment::archive_live`] (the live → archive
-            // rename) and `JournalWriter::create_continuing` (opening a
+            // rename) and `SectorWriter::create_continuing` (opening a
             // fresh live). The just-archived segment is intact and was
             // replayed above, so the application state is consistent up
             // through `last_seq_seen`. Synthesize a new live segment
@@ -191,7 +191,7 @@ impl<A: Application> JournaledApp<A> {
                 .into());
             }
             let genesis = prev_tail_hash.unwrap_or([0u8; 32]);
-            let writer = JournalWriter::<A::Event>::create_continuing(
+            let writer = SectorWriter::<A::Event>::create_continuing(
                 journal_path,
                 last_seq_seen + 1,
                 genesis,
@@ -217,7 +217,7 @@ impl<A: Application> JournaledApp<A> {
         let valid_end = reader.valid_file_end();
         let chain_hash = reader.chain_hash();
         let events_since_checkpoint = reader.events_since_checkpoint();
-        let writer = JournalWriter::<A::Event>::open_append(
+        let writer = SectorWriter::<A::Event>::open_append(
             journal_path,
             last_seq,
             valid_end,
@@ -281,12 +281,12 @@ impl<A: Application> JournaledApp<A> {
 
     /// Construct from pre-built parts. Used by the server's
     /// "snapshot-only" recovery path (journal missing post-rotation).
-    pub fn from_parts(app: A, writer: JournalWriter<A::Event>) -> Self {
+    pub fn from_parts(app: A, writer: SectorWriter<A::Event>) -> Self {
         Self { app, writer }
     }
 
     /// Decompose into parts for the pipeline architecture.
-    pub fn into_parts(self) -> (A, JournalWriter<A::Event>) {
+    pub fn into_parts(self) -> (A, SectorWriter<A::Event>) {
         (self.app, self.writer)
     }
 }

@@ -13,7 +13,7 @@ use crate::types::{
 
 use crate::journal::JournalEvent;
 use crate::journal::JournalReader;
-use crate::journal::JournalWriter;
+use crate::journal::SectorWriter;
 use crate::journal::snapshot;
 use melin_journal::JournalError;
 
@@ -58,13 +58,13 @@ impl From<JournalError> for JournaledExchangeError {
 /// before executing them. Provides crash recovery via journal replay.
 pub struct JournaledExchange {
     exchange: Exchange,
-    writer: JournalWriter,
+    writer: SectorWriter,
 }
 
 impl JournaledExchange {
     /// Create a new journaled exchange with a fresh journal file.
     pub fn create(journal_path: &Path) -> Result<Self, JournalError> {
-        let writer = JournalWriter::create(journal_path)?;
+        let writer = SectorWriter::create(journal_path)?;
         Ok(Self {
             exchange: Exchange::with_capacity(),
             writer,
@@ -349,7 +349,7 @@ impl JournaledExchange {
             }
             let genesis = prev_tail_hash.unwrap_or([0u8; 32]);
             let writer =
-                JournalWriter::create_continuing(journal_path, last_seq_seen + 1, genesis)?;
+                SectorWriter::create_continuing(journal_path, last_seq_seen + 1, genesis)?;
             return Ok(Self { exchange, writer });
         }
 
@@ -369,7 +369,7 @@ impl JournaledExchange {
         let chain_hash = reader.chain_hash();
         let events_since_checkpoint = reader.events_since_checkpoint();
         tracing::debug!(last_seq, valid_end, "recover: opening append");
-        let writer = JournalWriter::open_append(
+        let writer = SectorWriter::open_append(
             journal_path,
             last_seq,
             valid_end,
@@ -440,7 +440,7 @@ impl JournaledExchange {
 
     /// Construct from pre-built parts. Used by the server for snapshot-only
     /// recovery (when the journal is missing after a rotation crash).
-    pub fn from_parts(exchange: Exchange, writer: JournalWriter) -> Self {
+    pub fn from_parts(exchange: Exchange, writer: SectorWriter) -> Self {
         Self { exchange, writer }
     }
 
@@ -448,8 +448,8 @@ impl JournaledExchange {
     ///
     /// After recovery, the exchange and journal writer are handed to separate
     /// pipeline stages: the matching thread owns the `Exchange`, and the
-    /// journal thread owns the `JournalWriter`.
-    pub fn into_parts(self) -> (Exchange, JournalWriter) {
+    /// journal thread owns the `SectorWriter`.
+    pub fn into_parts(self) -> (Exchange, SectorWriter) {
         (self.exchange, self.writer)
     }
 }
@@ -1307,7 +1307,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("cont.journal");
 
-        let mut writer = JournalWriter::create_continuing(&path, 42, [0xAA; 32]).unwrap();
+        let mut writer = SectorWriter::create_continuing(&path, 42, [0xAA; 32]).unwrap();
         // With hash-chain, genesis consumes seq 42, next is 43.
         // Without hash-chain, no genesis, next is 42.
         #[cfg(feature = "hash-chain")]
@@ -1722,7 +1722,7 @@ mod tests {
 
         // Write journal entries with key_hash + request_seq.
         {
-            let mut writer = crate::journal::JournalWriter::create(&path).unwrap();
+            let mut writer = crate::journal::SectorWriter::create(&path).unwrap();
             let ts = crate::journal::wall_clock_nanos();
             // Deposit with seq=1
             writer
@@ -1777,7 +1777,7 @@ mod tests {
 
         // Create journaled exchange, write events with key_hash.
         {
-            let mut writer = crate::journal::JournalWriter::create(&journal_path).unwrap();
+            let mut writer = crate::journal::SectorWriter::create(&journal_path).unwrap();
             let ts = crate::journal::wall_clock_nanos();
             writer
                 .batch_append_with_ts(
@@ -2074,7 +2074,7 @@ mod tests {
         // and creating a fresh journal. Simulate that path here.
         let (exchange, seq, chain_hash) = super::snapshot::load(&snap_path).unwrap();
         let writer =
-            crate::journal::JournalWriter::create_continuing(&journal_path, seq + 1, chain_hash)
+            crate::journal::SectorWriter::create_continuing(&journal_path, seq + 1, chain_hash)
                 .unwrap();
         let je = JournaledExchange::from_parts(exchange, writer);
         assert_eq!(

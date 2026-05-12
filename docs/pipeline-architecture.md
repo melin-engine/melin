@@ -214,7 +214,7 @@ The journal stage runs on a dedicated OS thread and is responsible for making ev
 ### Processing loop
 
 1. Call `consumer.read_batch()` to copy up to `MAX_JOURNAL_BATCH` (1,024) events from the ring buffer into a local array. This does not advance the consumer's progress cursor.
-2. Batch-encode all events into the `JournalWriter`'s internal buffer. `QueryStats` events are skipped (they cause no state change and are not journaled).
+2. Batch-encode all events into the `SectorWriter`'s internal buffer. `QueryStats` events are skipped (they cause no state change and are not journaled).
 3. When a sync trigger fires, call `flush_batch_sync()` which issues a single `pwritev2` with `RWF_DSYNC` (Force Unit Access) -- combining write + sync into one syscall. On NVMe with power-loss protection, this achieves approximately 10-100 us sync latency instead of the approximately 1-7 ms of full cache flushes via `fdatasync`.
 4. Call `consumer.commit(pending)` to advance the progress cursor, making the journal's position visible to the response stage.
 

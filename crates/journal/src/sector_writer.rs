@@ -116,7 +116,7 @@ pub struct AsyncWriteBatch {
 /// fsync latency. The file size includes pre-allocated zero-filled space
 /// beyond the valid data boundary; recovery truncates to `valid_file_end`
 /// before reopening.
-pub struct JournalWriter<E: AppEvent> {
+pub struct SectorWriter<E: AppEvent> {
     /// PhantomData carries the app event type for the methods that
     /// read/write `JournalEvent<E>`. Zero-size — no runtime cost.
     _marker: PhantomData<fn(E) -> E>,
@@ -206,7 +206,7 @@ struct HashChain {
     events_since_checkpoint: u64,
 }
 
-impl<E: AppEvent> JournalWriter<E> {
+impl<E: AppEvent> SectorWriter<E> {
     /// Create a new journal file. Writes the file header and a `GenesisHash`
     /// entry with random bytes, pre-allocates storage, and returns a writer
     /// starting at sequence 1.
@@ -360,7 +360,7 @@ impl<E: AppEvent> JournalWriter<E> {
         Ok(writer)
     }
 
-    /// Assemble a `JournalWriter` from an already-open file whose
+    /// Assemble a `SectorWriter` from an already-open file whose
     /// `[sector_size, allocated_end)` range is already prepared
     /// (allocated, zeroed, prefaulted). Writes the file header sector
     /// and locks the in-memory buffers. Does not call `sync_all` — the
@@ -1670,7 +1670,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("test.journal");
 
-        let writer = JournalWriter::<TestEvent>::create(&path).unwrap();
+        let writer = SectorWriter::<TestEvent>::create(&path).unwrap();
         assert_eq!(writer.next_sequence(), FIRST_SEQ);
         assert_eq!(writer.path(), path);
         #[cfg(feature = "hash-chain")]
@@ -1690,10 +1690,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("test.journal");
 
-        let _writer = JournalWriter::<TestEvent>::create(&path).unwrap();
+        let _writer = SectorWriter::<TestEvent>::create(&path).unwrap();
         drop(_writer);
 
-        let result = JournalWriter::<TestEvent>::create(&path);
+        let result = SectorWriter::<TestEvent>::create(&path);
         assert!(result.is_err());
     }
 
@@ -1702,7 +1702,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("test.journal");
 
-        let mut writer = JournalWriter::<TestEvent>::create(&path).unwrap();
+        let mut writer = SectorWriter::<TestEvent>::create(&path).unwrap();
         let event = sample_event();
 
         let seq1 = writer.append(&event).unwrap();
@@ -1722,7 +1722,7 @@ mod tests {
 
         let event = sample_event();
         {
-            let mut writer = JournalWriter::<TestEvent>::create(&path).unwrap();
+            let mut writer = SectorWriter::<TestEvent>::create(&path).unwrap();
             writer.append(&event).unwrap();
         }
 
@@ -1744,7 +1744,7 @@ mod tests {
             JournalEvent::App(TestEvent(3)),
         ];
         {
-            let mut writer = JournalWriter::<TestEvent>::create(&path).unwrap();
+            let mut writer = SectorWriter::<TestEvent>::create(&path).unwrap();
             for event in &events {
                 writer.batch_append(event).unwrap();
             }
@@ -1764,7 +1764,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("test.journal");
 
-        let mut writer = JournalWriter::<TestEvent>::create(&path).unwrap();
+        let mut writer = SectorWriter::<TestEvent>::create(&path).unwrap();
         // valid_end() includes tail_sector data; write_pos is sector-aligned base.
         let pos_before = writer.valid_end();
         writer.batch_append(&sample_event()).unwrap();
@@ -1780,7 +1780,7 @@ mod tests {
         let path = dir.path().join("test.journal");
 
         let (last_seq, valid_end, events_since_checkpoint) = {
-            let mut writer = JournalWriter::<TestEvent>::create(&path).unwrap();
+            let mut writer = SectorWriter::<TestEvent>::create(&path).unwrap();
             writer.append(&sample_event()).unwrap();
             writer.append(&sample_event()).unwrap();
             (
@@ -1790,7 +1790,7 @@ mod tests {
             )
         };
 
-        let mut writer = JournalWriter::<TestEvent>::open_append(
+        let mut writer = SectorWriter::<TestEvent>::open_append(
             &path,
             last_seq,
             valid_end,
@@ -1811,14 +1811,14 @@ mod tests {
         // the pre-allocation should be zeroed so the reader stops at the
         // last valid entry instead of tripping on leftover bytes.
         let (last_seq, valid_end) = {
-            let mut writer = JournalWriter::<TestEvent>::create(&path).unwrap();
+            let mut writer = SectorWriter::<TestEvent>::create(&path).unwrap();
             writer.append(&sample_event()).unwrap();
             (writer.next_sequence() - 1, writer.valid_end())
         };
 
         {
             let _writer =
-                JournalWriter::<TestEvent>::open_append(&path, last_seq, valid_end, None, 0)
+                SectorWriter::<TestEvent>::open_append(&path, last_seq, valid_end, None, 0)
                     .unwrap();
         }
 
@@ -1838,7 +1838,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("test.journal");
 
-        let writer = JournalWriter::<TestEvent>::create(&path).unwrap();
+        let writer = SectorWriter::<TestEvent>::create(&path).unwrap();
         assert!(writer.chain_hash().is_some());
         drop(writer);
 
@@ -1851,7 +1851,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("test.journal");
 
-        let mut writer = JournalWriter::<TestEvent>::create(&path).unwrap();
+        let mut writer = SectorWriter::<TestEvent>::create(&path).unwrap();
         let hash_before = writer.chain_hash();
         writer.append(&sample_event()).unwrap();
         // The chain hash only advances when batches are finalized — after a
@@ -1870,7 +1870,7 @@ mod tests {
         let path = dir.path().join("test.journal");
 
         let (last_seq, valid_end, chain_hash, events_since_checkpoint) = {
-            let mut writer = JournalWriter::<TestEvent>::create(&path).unwrap();
+            let mut writer = SectorWriter::<TestEvent>::create(&path).unwrap();
             writer.append(&sample_event()).unwrap();
             (
                 writer.next_sequence() - 1,
@@ -1880,7 +1880,7 @@ mod tests {
             )
         };
 
-        let writer = JournalWriter::<TestEvent>::open_append(
+        let writer = SectorWriter::<TestEvent>::open_append(
             &path,
             last_seq,
             valid_end,
@@ -1898,13 +1898,13 @@ mod tests {
         let path = dir.path().join("test.journal");
 
         let (last_seq, valid_end) = {
-            let mut writer = JournalWriter::<TestEvent>::create(&path).unwrap();
+            let mut writer = SectorWriter::<TestEvent>::create(&path).unwrap();
             writer.append(&sample_event()).unwrap();
             (writer.next_sequence() - 1, writer.valid_end())
         };
 
         let writer =
-            JournalWriter::<TestEvent>::open_append(&path, last_seq, valid_end, None, 0).unwrap();
+            SectorWriter::<TestEvent>::open_append(&path, last_seq, valid_end, None, 0).unwrap();
         assert!(writer.chain_hash().is_none());
     }
 
@@ -1920,7 +1920,7 @@ mod tests {
 
         {
             let mut writer =
-                JournalWriter::<TestEvent>::create_bare_with_sector_size(&path, 1, 4096).unwrap();
+                SectorWriter::<TestEvent>::create_bare_with_sector_size(&path, 1, 4096).unwrap();
             assert_eq!(writer.sector_size(), 4096);
             // write_pos starts at 4096 (one 4Kn sector for the header).
             assert_eq!(writer.write_pos(), 4096);
@@ -1950,13 +1950,13 @@ mod tests {
 
         let (last_seq, valid_end) = {
             let mut writer =
-                JournalWriter::<TestEvent>::create_bare_with_sector_size(&path, 1, 4096).unwrap();
+                SectorWriter::<TestEvent>::create_bare_with_sector_size(&path, 1, 4096).unwrap();
             writer.append(&JournalEvent::App(TestEvent(1))).unwrap();
             (writer.next_sequence() - 1, writer.valid_end())
         };
 
         let mut writer =
-            JournalWriter::<TestEvent>::open_append(&path, last_seq, valid_end, None, 0).unwrap();
+            SectorWriter::<TestEvent>::open_append(&path, last_seq, valid_end, None, 0).unwrap();
         assert_eq!(writer.sector_size(), 4096);
         let seq = writer.append(&JournalEvent::App(TestEvent(2))).unwrap();
         assert_eq!(seq, last_seq + 1);
@@ -1974,7 +1974,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("test.journal");
 
-        let mut writer = JournalWriter::<TestEvent>::create(&path).unwrap();
+        let mut writer = SectorWriter::<TestEvent>::create(&path).unwrap();
         for i in 0..3 {
             writer
                 .batch_append(&JournalEvent::App(TestEvent(i)))
@@ -2001,7 +2001,7 @@ mod tests {
         let staging = staging_path(&path);
 
         let (last_seq, valid_end, events_since_checkpoint) = {
-            let mut writer = JournalWriter::<TestEvent>::create(&path).unwrap();
+            let mut writer = SectorWriter::<TestEvent>::create(&path).unwrap();
             writer.append(&sample_event()).unwrap();
             (
                 writer.next_sequence() - 1,
@@ -2014,7 +2014,7 @@ mod tests {
         std::fs::write(&staging, b"orphan from prior crash").unwrap();
         assert!(staging.exists());
 
-        let writer = JournalWriter::<TestEvent>::open_append(
+        let writer = SectorWriter::<TestEvent>::open_append(
             &path,
             last_seq,
             valid_end,
@@ -2030,7 +2030,7 @@ mod tests {
         );
     }
 
-    /// `JournalWriter::create` reclaims an orphan `<path>.next-staging`
+    /// `SectorWriter::create` reclaims an orphan `<path>.next-staging`
     /// file left behind by a prior crash, so the SegmentPreparer (which
     /// may or may not be spawned later) doesn't trip over a stale file
     /// on `create_new`. The same cleanup runs in `open_append` — that
@@ -2046,7 +2046,7 @@ mod tests {
         std::fs::write(&staging, b"orphan from prior crash").unwrap();
         assert!(staging.exists());
 
-        let writer = JournalWriter::<TestEvent>::create(&path).unwrap();
+        let writer = SectorWriter::<TestEvent>::create(&path).unwrap();
         drop(writer);
 
         assert!(
@@ -2074,7 +2074,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("test.journal");
 
-        let mut writer = JournalWriter::<TestEvent>::create(&path).unwrap();
+        let mut writer = SectorWriter::<TestEvent>::create(&path).unwrap();
         // Two entries on the outgoing segment.
         writer.append(&JournalEvent::App(TestEvent(1))).unwrap();
         writer.append(&JournalEvent::App(TestEvent(2))).unwrap();

@@ -2,7 +2,7 @@
 //!
 //! On startup:
 //! 1. Recovers or creates the `JournaledApp<A>`.
-//! 2. Decomposes it into `(App, JournalWriter)` via `into_parts()`.
+//! 2. Decomposes it into `(App, SectorWriter)` via `into_parts()`.
 //! 3. Builds the disruptor pipeline (input ring + output ring).
 //! 4. Spawns 3-5 OS threads: journal, matching, response, [repl-sender], [event-publisher].
 //! 5. Runs the accept loop, registering connections with the io_uring reader.
@@ -22,7 +22,7 @@ use std::hash::{Hash, Hasher};
 use tracing::{debug, error, info, warn};
 
 use crate::App;
-use crate::JournalWriter;
+use crate::SectorWriter;
 use melin_journal::JournalError;
 use melin_transport_core::journaled_app::JournaledApp;
 use melin_transport_core::pipeline::{
@@ -547,7 +547,7 @@ fn parse_cores(s: &str) -> Result<PipelineCores, String> {
 /// Run the trading server.
 ///
 /// 1. Initializes (or recovers) the `JournaledApp<A>`, then decomposes
-///    it into `App` and `JournalWriter` for the pipeline.
+///    it into `App` and `SectorWriter` for the pipeline.
 /// 2. Builds the disruptor pipeline (input ring + output ring + stages).
 /// 3. Spawns 3 OS threads: journal, matching, response.
 /// 4. Runs the accept loop, spawning a reader OS thread per connection.
@@ -744,7 +744,7 @@ pub use crate::ControlEvent;
 /// no replication, no health endpoint) or unsupported on a transport
 /// (e.g., DPDK runs without an event publisher or shadow snapshotter).
 struct PipelineHandles {
-    journal: std::thread::JoinHandle<Result<JournalWriter, JournalError>>,
+    journal: std::thread::JoinHandle<Result<SectorWriter, JournalError>>,
     matching: std::thread::JoinHandle<App>,
     response: std::thread::JoinHandle<()>,
     replication: Option<std::thread::JoinHandle<()>>,
@@ -833,7 +833,7 @@ fn shutdown_pipeline_stages(
 #[allow(clippy::too_many_arguments)]
 fn run_as_primary<L: BlockingTransportListener>(
     exchange: App,
-    writer: JournalWriter,
+    writer: SectorWriter,
     mut listener: L,
     config: &ServerConfig,
     shutdown: Arc<AtomicBool>,
@@ -2498,7 +2498,7 @@ pub(crate) fn empty_app_for_seed(_config: &ServerConfig) -> App {
 /// duplicating the recovery / snapshot / rotation logic.
 pub(crate) fn init_engine(
     config: &ServerConfig,
-) -> Result<(App, JournalWriter, bool), Box<dyn std::error::Error>> {
+) -> Result<(App, SectorWriter, bool), Box<dyn std::error::Error>> {
     // Check for a snapshot: either the explicit --snapshot path, or the
     // default derived path (used by auto-rotation when --snapshot is not set).
     let derived_snap = config.journal.with_extension("snapshot");
@@ -2531,7 +2531,7 @@ pub(crate) fn init_engine(
         let (app, snap_sequence, snap_chain_hash) =
             melin_transport_core::snapshot::load::<App>(snap_path)?;
         let writer =
-            JournalWriter::create_continuing(&config.journal, snap_sequence + 1, snap_chain_hash)?;
+            SectorWriter::create_continuing(&config.journal, snap_sequence + 1, snap_chain_hash)?;
         JournaledApp::<App>::from_parts(app, writer)
     } else if journal_exists {
         info!("recovering from journal");
