@@ -74,6 +74,7 @@ use std::time::{Duration, Instant};
 use tracing::{debug, error, info, warn};
 use x25519_dalek::{PublicKey as X25519Public, StaticSecret as X25519Secret};
 
+use melin_journal::JournalWrite;
 use melin_protocol::auth::{AuthorizedKeys, Permission};
 use melin_protocol::codec;
 use melin_protocol::message::{Request, ResponseKind};

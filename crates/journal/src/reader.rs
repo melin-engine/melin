@@ -642,6 +642,7 @@ mod tests {
 
     use super::*;
     use crate::sector_writer::SectorWriter;
+    use crate::write::JournalWrite;
     use melin_app::CodecError;
 
     /// Minimal `AppEvent` for reader round-trip tests.

@@ -45,6 +45,6 @@ pub type JournalStage = pipeline::JournalStage<crate::trading_event::TradingEven
 pub use melin_transport_core::pipeline;
 
 pub use melin_journal::{
-    AsyncWriteBatch, JournalError, RawJournalScanner, checkpoint_interval, codec, replication,
-    trace, wall_clock_nanos,
+    AsyncWriteBatch, JournalError, JournalWrite, RawJournalScanner, checkpoint_interval, codec,
+    replication, trace, wall_clock_nanos,
 };

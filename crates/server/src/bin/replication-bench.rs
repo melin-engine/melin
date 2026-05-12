@@ -26,6 +26,7 @@ use base64::Engine as _;
 use clap::Parser;
 use ed25519_dalek::SigningKey;
 
+use melin_journal::JournalWrite;
 use melin_journal::trace::trace_ts;
 use melin_journal::wall_clock_nanos;
 use melin_protocol::auth::AuthorizedKeys;

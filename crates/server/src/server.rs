@@ -23,7 +23,7 @@ use tracing::{debug, error, info, warn};
 
 use crate::App;
 use crate::JournalWriter;
-use melin_journal::JournalError;
+use melin_journal::{JournalError, JournalWrite};
 use melin_transport_core::journaled_app::JournaledApp;
 use melin_transport_core::pipeline::{
     Pipeline as GenericPipeline, build_pipeline_with_replication,

@@ -21,7 +21,7 @@ use melin_app::AppEvent;
 use crate::buffered_writer::BufferedWriter;
 use crate::error::JournalError;
 use crate::event::JournalEvent;
-use crate::sector_writer::SectorWriter;
+use crate::sector_writer::{SectorWriter, wall_clock_nanos};
 
 /// Operations a journal writer must support to be drivable by the
 /// pipeline's `JournalStage`. Excludes the variant-specific surfaces
@@ -92,6 +92,45 @@ pub trait JournalWrite<E: AppEvent> {
     /// Read the first entry of the active segment (used by replication
     /// to bootstrap a fresh replica's chain anchor).
     fn read_genesis_entry(&self) -> Result<Vec<u8>, JournalError>;
+
+    // ---- default convenience wrappers ----
+    //
+    // Built on the three primitives (`allocate_sequence`, `encode_event`,
+    // `flush_batch_sync`). Used by engine lifecycle, tests, and benches —
+    // never on the pipeline's hot path, which goes through the primitives
+    // directly to avoid the extra trait dispatches on each event.
+
+    /// Encode and durably flush a single event.
+    #[inline]
+    fn append(&mut self, event: &JournalEvent<E>) -> Result<u64, JournalError> {
+        let seq = self.batch_append(event)?;
+        self.flush_batch_sync()?;
+        Ok(seq)
+    }
+
+    /// Encode an event into the batch buffer using a freshly-sampled
+    /// wall-clock timestamp. Call [`flush_batch_sync`](Self::flush_batch_sync)
+    /// to make it durable.
+    #[inline]
+    fn batch_append(&mut self, event: &JournalEvent<E>) -> Result<u64, JournalError> {
+        self.batch_append_with_ts(event, wall_clock_nanos(), 0, 0)
+    }
+
+    /// Encode an event into the batch buffer with a caller-provided
+    /// timestamp — lets the caller take one `clock_gettime` per batch
+    /// instead of per event.
+    #[inline]
+    fn batch_append_with_ts(
+        &mut self,
+        event: &JournalEvent<E>,
+        timestamp_ns: u64,
+        key_hash: u64,
+        request_seq: u64,
+    ) -> Result<u64, JournalError> {
+        let seq = self.allocate_sequence();
+        self.encode_event(seq, timestamp_ns, event, key_hash, request_seq)?;
+        Ok(seq)
+    }
 }
 
 impl<E: AppEvent> JournalWrite<E> for SectorWriter<E> {

@@ -18,6 +18,7 @@ use std::time::{Duration, Instant};
 use ed25519_dalek::Signer;
 use tracing::{debug, error, info, warn};
 
+use melin_journal::JournalWrite;
 use melin_rumcast::pub_log::{ClaimError, PublicationConfig, PublicationLog};
 use melin_rumcast::receiver::{ReceiverConfig, ReceiverLoop};
 use melin_rumcast::sender::{SenderConfig, SenderLoop};

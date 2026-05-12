@@ -637,49 +637,6 @@ impl<E: AppEvent> SectorWriter<E> {
         Ok(writer)
     }
 
-    /// Append an event to the journal and flush to disk.
-    ///
-    /// Returns the assigned sequence number. The event is durable after this
-    /// returns (written via O_DIRECT; PLP capacitors ensure persistence).
-    pub fn append(&mut self, event: &JournalEvent<E>) -> Result<u64, JournalError> {
-        let seq = self.batch_append(event)?;
-        self.flush_batch_sync()?;
-        Ok(seq)
-    }
-
-    /// Encode an event into the batch buffer without writing to disk.
-    ///
-    /// Much faster than `append` — no syscall per event, just memory copies
-    /// into the pre-allocated batch buffer. Call `flush_batch_sync` after
-    /// encoding the entire batch to issue a single `pwrite`.
-    ///
-    /// Uses one `wall_clock_nanos()` call per event for the journal timestamp.
-    /// For batches sharing a timestamp, use `batch_append_with_ts`.
-    pub fn batch_append(&mut self, event: &JournalEvent<E>) -> Result<u64, JournalError> {
-        self.batch_append_with_ts(event, wall_clock_nanos(), 0, 0)
-    }
-
-    /// Encode an event into the batch buffer with a caller-provided timestamp.
-    ///
-    /// Avoids the `clock_gettime` syscall per event when the caller can batch
-    /// a single timestamp for the entire batch. Same semantics as `batch_append`
-    /// but uses the provided timestamp instead of calling `wall_clock_nanos()`.
-    ///
-    /// Convenience wrapper: allocates a sequence number and encodes in one call.
-    /// For explicit control over sequencing (e.g., input replication), use
-    /// [`allocate_sequence`] + [`encode_event`] separately.
-    pub fn batch_append_with_ts(
-        &mut self,
-        event: &JournalEvent<E>,
-        timestamp_ns: u64,
-        key_hash: u64,
-        request_seq: u64,
-    ) -> Result<u64, JournalError> {
-        let seq = self.allocate_sequence();
-        self.encode_event(seq, timestamp_ns, event, key_hash, request_seq)?;
-        Ok(seq)
-    }
-
     /// Allocate the next journal sequence number.
     ///
     /// Returns the allocated sequence and advances the internal counter.
@@ -1623,6 +1580,7 @@ pub fn wall_clock_nanos() -> u64 {
 mod tests {
     use super::*;
     use crate::reader::JournalReader;
+    use crate::write::JournalWrite;
     use melin_app::CodecError;
 
     /// Minimal `AppEvent` for tests — carries a `u64` payload so distinct

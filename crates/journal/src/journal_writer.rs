@@ -23,6 +23,7 @@ use crate::buffered_writer::BufferedWriter;
 use crate::error::JournalError;
 use crate::event::JournalEvent;
 use crate::sector_writer::SectorWriter;
+use crate::write::JournalWrite;
 
 /// Selects which concrete writer [`JournalWriter`] wraps. Set once at
 /// startup from the `--journal-writer` CLI flag (or its config-file
@@ -202,154 +203,6 @@ impl<E: AppEvent> JournalWriter<E> {
             .expect("io_uring journal path requires Sector variant — Buffered routes to run_sync")
     }
 
-    // ---- shared API: shape and order mirror SectorWriter / BufferedWriter ----
-
-    pub fn append(&mut self, event: &JournalEvent<E>) -> Result<u64, JournalError> {
-        match self {
-            Self::Sector(w) => w.append(event),
-            Self::Buffered(w) => w.append(event),
-        }
-    }
-
-    pub fn batch_append(&mut self, event: &JournalEvent<E>) -> Result<u64, JournalError> {
-        match self {
-            Self::Sector(w) => w.batch_append(event),
-            Self::Buffered(w) => w.batch_append(event),
-        }
-    }
-
-    pub fn batch_append_with_ts(
-        &mut self,
-        event: &JournalEvent<E>,
-        timestamp_ns: u64,
-        key_hash: u64,
-        request_seq: u64,
-    ) -> Result<u64, JournalError> {
-        match self {
-            Self::Sector(w) => w.batch_append_with_ts(event, timestamp_ns, key_hash, request_seq),
-            Self::Buffered(w) => w.batch_append_with_ts(event, timestamp_ns, key_hash, request_seq),
-        }
-    }
-
-    pub fn allocate_sequence(&mut self) -> u64 {
-        match self {
-            Self::Sector(w) => w.allocate_sequence(),
-            Self::Buffered(w) => w.allocate_sequence(),
-        }
-    }
-
-    pub fn encode_event(
-        &mut self,
-        seq: u64,
-        timestamp_ns: u64,
-        event: &JournalEvent<E>,
-        key_hash: u64,
-        request_seq: u64,
-    ) -> Result<(), JournalError> {
-        match self {
-            Self::Sector(w) => w.encode_event(seq, timestamp_ns, event, key_hash, request_seq),
-            Self::Buffered(w) => w.encode_event(seq, timestamp_ns, event, key_hash, request_seq),
-        }
-    }
-
-    pub fn flush_batch_sync(&mut self) -> Result<(), JournalError> {
-        match self {
-            Self::Sector(w) => w.flush_batch_sync(),
-            Self::Buffered(w) => w.flush_batch_sync(),
-        }
-    }
-
-    pub fn discard_batch_buf(&mut self) {
-        match self {
-            Self::Sector(w) => w.discard_batch_buf(),
-            Self::Buffered(w) => w.discard_batch_buf(),
-        }
-    }
-
-    pub fn sync(&mut self) -> Result<(), JournalError> {
-        match self {
-            Self::Sector(w) => w.sync(),
-            Self::Buffered(w) => w.sync(),
-        }
-    }
-
-    pub fn next_sequence(&self) -> u64 {
-        match self {
-            Self::Sector(w) => w.next_sequence(),
-            Self::Buffered(w) => w.next_sequence(),
-        }
-    }
-
-    pub fn set_next_sequence(&mut self, seq: u64) {
-        match self {
-            Self::Sector(w) => w.set_next_sequence(seq),
-            Self::Buffered(w) => w.set_next_sequence(seq),
-        }
-    }
-
-    pub fn write_pos(&self) -> u64 {
-        match self {
-            Self::Sector(w) => w.write_pos(),
-            Self::Buffered(w) => w.write_pos(),
-        }
-    }
-
-    pub fn valid_end(&self) -> u64 {
-        match self {
-            Self::Sector(w) => w.valid_end(),
-            Self::Buffered(w) => w.valid_end(),
-        }
-    }
-
-    pub fn path(&self) -> &Path {
-        match self {
-            Self::Sector(w) => w.path(),
-            Self::Buffered(w) => w.path(),
-        }
-    }
-
-    pub fn chain_hash(&self) -> Option<[u8; 32]> {
-        match self {
-            Self::Sector(w) => w.chain_hash(),
-            Self::Buffered(w) => w.chain_hash(),
-        }
-    }
-
-    pub fn events_since_checkpoint(&self) -> u64 {
-        match self {
-            Self::Sector(w) => w.events_since_checkpoint(),
-            Self::Buffered(w) => w.events_since_checkpoint(),
-        }
-    }
-
-    pub fn pending_batch_bytes(&self) -> &[u8] {
-        match self {
-            Self::Sector(w) => w.pending_batch_bytes(),
-            Self::Buffered(w) => w.pending_batch_bytes(),
-        }
-    }
-
-    pub fn last_user_entry_replication_slice(&self) -> &[u8] {
-        match self {
-            Self::Sector(w) => w.last_user_entry_replication_slice(),
-            Self::Buffered(w) => w.last_user_entry_replication_slice(),
-        }
-    }
-
-    pub fn rotate_segment(&mut self) -> Result<PathBuf, JournalError> {
-        match self {
-            Self::Sector(w) => w.rotate_segment(),
-            Self::Buffered(w) => w.rotate_segment(),
-        }
-    }
-
-    pub fn read_genesis_entry(&self) -> Result<Vec<u8>, JournalError> {
-        match self {
-            Self::Sector(w) => w.read_genesis_entry(),
-            Self::Buffered(w) => w.read_genesis_entry(),
-        }
-    }
-
     /// Bootstrap a fresh replica journal from the primary's genesis entry.
     ///
     /// Replicas join a cluster by receiving the primary's genesis entry
@@ -410,6 +263,148 @@ impl<E: AppEvent> JournalWriter<E> {
             mode, path, 1, // genesis consumed sequence 1
             valid_end, chain_hash, 0, // events_since_checkpoint
         )
+    }
+}
+
+/// Forwarding `JournalWrite` impl. Each method match-dispatches to the
+/// active variant; the variant never changes after construction, so the
+/// branch predictor sees a single arm and the cost is effectively a
+/// direct call. Default convenience methods (`append`, `batch_append`,
+/// `batch_append_with_ts`) come for free from the trait.
+impl<E: AppEvent> JournalWrite<E> for JournalWriter<E> {
+    #[inline]
+    fn allocate_sequence(&mut self) -> u64 {
+        match self {
+            Self::Sector(w) => w.allocate_sequence(),
+            Self::Buffered(w) => w.allocate_sequence(),
+        }
+    }
+
+    #[inline]
+    fn encode_event(
+        &mut self,
+        seq: u64,
+        timestamp_ns: u64,
+        event: &JournalEvent<E>,
+        key_hash: u64,
+        request_seq: u64,
+    ) -> Result<(), JournalError> {
+        match self {
+            Self::Sector(w) => w.encode_event(seq, timestamp_ns, event, key_hash, request_seq),
+            Self::Buffered(w) => w.encode_event(seq, timestamp_ns, event, key_hash, request_seq),
+        }
+    }
+
+    #[inline]
+    fn flush_batch_sync(&mut self) -> Result<(), JournalError> {
+        match self {
+            Self::Sector(w) => w.flush_batch_sync(),
+            Self::Buffered(w) => w.flush_batch_sync(),
+        }
+    }
+
+    #[inline]
+    fn discard_batch_buf(&mut self) {
+        match self {
+            Self::Sector(w) => w.discard_batch_buf(),
+            Self::Buffered(w) => w.discard_batch_buf(),
+        }
+    }
+
+    #[inline]
+    fn sync(&mut self) -> Result<(), JournalError> {
+        match self {
+            Self::Sector(w) => w.sync(),
+            Self::Buffered(w) => w.sync(),
+        }
+    }
+
+    #[inline]
+    fn next_sequence(&self) -> u64 {
+        match self {
+            Self::Sector(w) => w.next_sequence(),
+            Self::Buffered(w) => w.next_sequence(),
+        }
+    }
+
+    #[inline]
+    fn set_next_sequence(&mut self, seq: u64) {
+        match self {
+            Self::Sector(w) => w.set_next_sequence(seq),
+            Self::Buffered(w) => w.set_next_sequence(seq),
+        }
+    }
+
+    #[inline]
+    fn write_pos(&self) -> u64 {
+        match self {
+            Self::Sector(w) => w.write_pos(),
+            Self::Buffered(w) => w.write_pos(),
+        }
+    }
+
+    #[inline]
+    fn valid_end(&self) -> u64 {
+        match self {
+            Self::Sector(w) => w.valid_end(),
+            Self::Buffered(w) => w.valid_end(),
+        }
+    }
+
+    #[inline]
+    fn path(&self) -> &Path {
+        match self {
+            Self::Sector(w) => w.path(),
+            Self::Buffered(w) => w.path(),
+        }
+    }
+
+    #[inline]
+    fn chain_hash(&self) -> Option<[u8; 32]> {
+        match self {
+            Self::Sector(w) => w.chain_hash(),
+            Self::Buffered(w) => w.chain_hash(),
+        }
+    }
+
+    #[inline]
+    fn events_since_checkpoint(&self) -> u64 {
+        match self {
+            Self::Sector(w) => w.events_since_checkpoint(),
+            Self::Buffered(w) => w.events_since_checkpoint(),
+        }
+    }
+
+    #[inline]
+    fn pending_batch_bytes(&self) -> &[u8] {
+        match self {
+            Self::Sector(w) => w.pending_batch_bytes(),
+            Self::Buffered(w) => w.pending_batch_bytes(),
+        }
+    }
+
+    #[inline]
+    fn last_user_entry_replication_slice(&self) -> &[u8] {
+        match self {
+            Self::Sector(w) => w.last_user_entry_replication_slice(),
+            Self::Buffered(w) => w.last_user_entry_replication_slice(),
+        }
+    }
+
+    #[inline]
+    fn rotate_segment(&mut self) -> Result<PathBuf, JournalError> {
+        match self {
+            Self::Sector(w) => w.rotate_segment(),
+            Self::Buffered(w) => w.rotate_segment(),
+        }
+    }
+
+    #[inline]
+    fn read_genesis_entry(&self) -> Result<Vec<u8>, JournalError> {
+        match self {
+            Self::Sector(w) => w.read_genesis_entry(),
+            Self::Buffered(w) => w.read_genesis_entry(),
+        }
     }
 }
 

@@ -37,8 +37,7 @@ use crate::codec::{self, ENTRY_OFFSET, FILE_HEADER_SIZE, MAX_SECTOR_SIZE};
 use crate::error::JournalError;
 use crate::event::JournalEvent;
 #[cfg(feature = "hash-chain")]
-use crate::sector_writer::checkpoint_interval;
-use crate::sector_writer::wall_clock_nanos;
+use crate::sector_writer::{checkpoint_interval, wall_clock_nanos};
 
 /// Maximum encoded entry size. Mirrors `writer::MAX_ENTRY_SIZE` — actual
 /// entries are ~81-101 bytes; the array is sized generously so the
@@ -339,35 +338,6 @@ impl<E: AppEvent> BufferedWriter<E> {
         }
 
         Ok(writer)
-    }
-
-    /// Encode and durably flush a single event. Equivalent to
-    /// `batch_append` + `flush_batch_sync`.
-    pub fn append(&mut self, event: &JournalEvent<E>) -> Result<u64, JournalError> {
-        let seq = self.batch_append(event)?;
-        self.flush_batch_sync()?;
-        Ok(seq)
-    }
-
-    /// Encode an event into the batch buffer using a fresh timestamp.
-    /// Call [`flush_batch_sync`](Self::flush_batch_sync) to make it durable.
-    pub fn batch_append(&mut self, event: &JournalEvent<E>) -> Result<u64, JournalError> {
-        self.batch_append_with_ts(event, wall_clock_nanos(), 0, 0)
-    }
-
-    /// Encode an event into the batch buffer with a caller-provided
-    /// timestamp — lets the pipeline take one `clock_gettime` per batch
-    /// instead of per event.
-    pub fn batch_append_with_ts(
-        &mut self,
-        event: &JournalEvent<E>,
-        timestamp_ns: u64,
-        key_hash: u64,
-        request_seq: u64,
-    ) -> Result<u64, JournalError> {
-        let seq = self.allocate_sequence();
-        self.encode_event(seq, timestamp_ns, event, key_hash, request_seq)?;
-        Ok(seq)
     }
 
     /// Allocate and return the next sequence number, advancing the
@@ -789,6 +759,7 @@ fn write_all_at(file: &File, buf: &[u8], offset: u64) -> Result<(), JournalError
 mod tests {
     use super::*;
     use crate::reader::JournalReader;
+    use crate::write::JournalWrite;
     use melin_app::CodecError;
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]

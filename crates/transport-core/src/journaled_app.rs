@@ -20,7 +20,9 @@
 use std::path::Path;
 
 use melin_app::{Application, ApplyCtx};
-use melin_journal::{JournalError, JournalEvent, JournalReader, JournalWriter, JournalWriterMode};
+use melin_journal::{
+    JournalError, JournalEvent, JournalReader, JournalWrite, JournalWriter, JournalWriterMode,
+};
 
 use crate::snapshot;
 

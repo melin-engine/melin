@@ -23,6 +23,7 @@ use std::time::{Duration, Instant};
 
 use melin_app::{AppEvent, Application, ApplyCtx, RejectReason};
 use melin_journal::JournalError;
+use melin_journal::JournalWrite;
 use melin_journal::preparer::SegmentPreparer;
 use melin_journal::replication::{ReplicationConsumer, ReplicationProducer};
 use melin_journal::trace::{TraceTimestamp, trace_ts};

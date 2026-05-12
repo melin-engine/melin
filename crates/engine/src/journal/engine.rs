@@ -17,7 +17,7 @@ use crate::journal::JournalWriter;
 #[cfg(test)]
 use crate::journal::SectorWriter;
 use crate::journal::snapshot;
-use melin_journal::{JournalError, JournalWriterMode};
+use melin_journal::{JournalError, JournalWrite, JournalWriterMode};
 
 /// Error surfaced by [`JournaledExchange::withdraw`]: either a journal
 /// I/O failure or a business-level rejection (insufficient balance,

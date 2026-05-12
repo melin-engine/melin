@@ -18,6 +18,7 @@ use std::num::NonZero;
 use std::time::Instant;
 
 use melin_engine::journal::JournalEvent;
+use melin_engine::journal::JournalWrite;
 use melin_engine::journal::SectorWriter;
 use melin_trading::trading_event::TradingEvent;
 
