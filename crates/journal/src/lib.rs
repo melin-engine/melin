@@ -15,6 +15,7 @@
 
 #![cfg_attr(not(test), deny(clippy::unwrap_used))]
 
+pub mod buffered_writer;
 pub mod codec;
 pub mod error;
 pub mod event;
@@ -26,6 +27,7 @@ pub mod segment;
 pub mod trace;
 pub mod writer;
 
+pub use buffered_writer::BufferedJournalWriter;
 pub use error::JournalError;
 pub use event::JournalEvent;
 pub use reader::{JournalEntry, JournalReader, RawJournalScanner};
