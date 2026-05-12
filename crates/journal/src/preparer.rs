@@ -36,8 +36,8 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
-use crate::error::JournalError;
 use crate::codec::ENTRY_OFFSET;
+use crate::error::JournalError;
 use crate::sector_writer::{preallocate, prefault_pages, zero_range_extents};
 
 /// A fully-prepared journal segment file ready to be adopted by a

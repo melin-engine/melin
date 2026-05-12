@@ -27,6 +27,7 @@ pub mod replication;
 pub mod sector_writer;
 pub mod segment;
 pub mod trace;
+pub mod write;
 
 pub use buffered_writer::BufferedWriter;
 pub use error::JournalError;
@@ -36,3 +37,4 @@ pub use reader::{JournalEntry, JournalReader, RawJournalScanner};
 pub use sector_writer::{
     AsyncWriteBatch, SectorWriter, checkpoint_interval, detect_sector_size, wall_clock_nanos,
 };
+pub use write::JournalWrite;

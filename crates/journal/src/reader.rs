@@ -13,9 +13,9 @@ use melin_app::AppEvent;
 
 use zerocopy::FromBytes;
 
-use super::codec::{self, CRC_SIZE, ENTRY_HEADER_SIZE, EntryHeader, FILE_HEADER_SIZE};
 #[cfg(test)]
 use super::codec::ENTRY_OFFSET;
+use super::codec::{self, CRC_SIZE, ENTRY_HEADER_SIZE, EntryHeader, FILE_HEADER_SIZE};
 use super::error::JournalError;
 use super::event::JournalEvent;
 

@@ -1089,10 +1089,7 @@ mod tests {
         garbage[1] = 0x45;
         garbage[2] = 0x10; // length low byte — fake non-zero length
         garbage[3] = 0x00;
-        let file = std::fs::OpenOptions::new()
-            .write(true)
-            .open(&path)
-            .unwrap();
+        let file = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
         file.write_all_at(&garbage, valid_end).unwrap();
         file.sync_all().unwrap();
         drop(file);

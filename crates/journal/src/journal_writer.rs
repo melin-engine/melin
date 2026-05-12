@@ -407,12 +407,8 @@ impl<E: AppEvent> JournalWriter<E> {
 
         let valid_end = crate::codec::ENTRY_OFFSET + genesis_entry.len() as u64;
         Self::open_append(
-            mode,
-            path,
-            1, // genesis consumed sequence 1
-            valid_end,
-            chain_hash,
-            0, // events_since_checkpoint
+            mode, path, 1, // genesis consumed sequence 1
+            valid_end, chain_hash, 0, // events_since_checkpoint
         )
     }
 }
@@ -447,9 +443,18 @@ mod tests {
 
     #[test]
     fn mode_parses_both_variants_case_insensitive() {
-        assert_eq!(JournalWriterMode::parse("sector"), Ok(JournalWriterMode::Sector));
-        assert_eq!(JournalWriterMode::parse("Buffered"), Ok(JournalWriterMode::Buffered));
-        assert_eq!(JournalWriterMode::parse("BUFFERED"), Ok(JournalWriterMode::Buffered));
+        assert_eq!(
+            JournalWriterMode::parse("sector"),
+            Ok(JournalWriterMode::Sector)
+        );
+        assert_eq!(
+            JournalWriterMode::parse("Buffered"),
+            Ok(JournalWriterMode::Buffered)
+        );
+        assert_eq!(
+            JournalWriterMode::parse("BUFFERED"),
+            Ok(JournalWriterMode::Buffered)
+        );
         assert!(JournalWriterMode::parse("direct").is_err());
     }
 
