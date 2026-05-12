@@ -64,15 +64,10 @@ pub struct JournaledExchange {
 }
 
 impl JournaledExchange {
-    /// Create a new journaled exchange with a fresh journal file using
-    /// the default writer mode.
-    pub fn create(journal_path: &Path) -> Result<Self, JournalError> {
-        Self::create_with_mode(journal_path, JournalWriterMode::default())
-    }
-
-    /// Create with an explicit writer mode (server bootstrap thread the
-    /// CLI flag through this entry point).
-    pub fn create_with_mode(
+    /// Create a new journaled exchange with a fresh journal file under
+    /// the requested writer mode. Tests pass
+    /// `JournalWriterMode::default()` when the choice doesn't matter.
+    pub fn create(
         journal_path: &Path,
         mode: JournalWriterMode,
     ) -> Result<Self, JournalError> {
@@ -277,37 +272,20 @@ impl JournaledExchange {
     }
 
     /// Recover from an existing journal file by replaying all events
-    /// using the default writer mode.
+    /// using the requested writer mode.
     ///
     /// Truncates any trailing garbage from a partial write (crash recovery),
     /// then reopens the writer for appending new events.
-    pub fn recover(journal_path: &Path) -> Result<Self, JournalError> {
-        Self::recover_inner(journal_path, None, JournalWriterMode::default())
-    }
-
-    /// Recover with an explicit writer mode.
-    pub fn recover_with_mode(
+    pub fn recover(
         journal_path: &Path,
         mode: JournalWriterMode,
     ) -> Result<Self, JournalError> {
         Self::recover_inner(journal_path, None, mode)
     }
 
-    /// Recover from a snapshot plus a journal file using the default
-    /// writer mode.
+    /// Recover from a snapshot plus a journal file, reopening the writer
+    /// in `mode`.
     pub fn recover_from_snapshot(
-        snapshot_path: &Path,
-        journal_path: &Path,
-    ) -> Result<Self, JournalError> {
-        Self::recover_from_snapshot_with_mode(
-            snapshot_path,
-            journal_path,
-            JournalWriterMode::default(),
-        )
-    }
-
-    /// Snapshot-based recovery with an explicit writer mode.
-    pub fn recover_from_snapshot_with_mode(
         snapshot_path: &Path,
         journal_path: &Path,
         mode: JournalWriterMode,
@@ -745,7 +723,7 @@ mod tests {
         // Build up some state. Genesis consumes seq 1; user events start at 2.
         let mut reports = Vec::new();
         {
-            let mut je = JournaledExchange::create(&path).unwrap();
+            let mut je = JournaledExchange::create(&path, JournalWriterMode::default()).unwrap();
             je.add_instrument(btc_usd_spec()).unwrap();
             je.deposit(ACCT_A, USD, 100_000).unwrap();
             je.deposit(ACCT_B, BTC, 500).unwrap();
@@ -796,7 +774,7 @@ mod tests {
         }
 
         // Recover and verify identical state.
-        let recovered = JournaledExchange::recover(&path).unwrap();
+        let recovered = JournaledExchange::recover(&path, JournalWriterMode::default()).unwrap();
         assert_eq!(
             recovered
                 .exchange()
@@ -838,7 +816,7 @@ mod tests {
 
         let mut original_reports = Vec::new();
         {
-            let mut je = JournaledExchange::create(&path).unwrap();
+            let mut je = JournaledExchange::create(&path, JournalWriterMode::default()).unwrap();
             je.add_instrument(btc_usd_spec()).unwrap();
             je.deposit(ACCT_A, USD, 100_000).unwrap();
             je.deposit(ACCT_B, BTC, 500).unwrap();
@@ -896,7 +874,7 @@ mod tests {
 
         let mut reports = Vec::new();
         {
-            let mut je = JournaledExchange::create(&path).unwrap();
+            let mut je = JournaledExchange::create(&path, JournalWriterMode::default()).unwrap();
             je.add_instrument(btc_usd_spec()).unwrap();
             je.deposit(ACCT_A, USD, 1_000_000).unwrap();
 
@@ -936,7 +914,7 @@ mod tests {
         }
 
         // Recover via full journal replay (no snapshot yet).
-        let recovered = JournaledExchange::recover(&path).unwrap();
+        let recovered = JournaledExchange::recover(&path, JournalWriterMode::default()).unwrap();
         // Order 1 was cancelled before recovery; only order 2 should remain.
         let book_two = recovered
             .exchange()
@@ -965,7 +943,7 @@ mod tests {
         let path = dir.path().join("continue.journal");
 
         {
-            let mut je = JournaledExchange::create(&path).unwrap();
+            let mut je = JournaledExchange::create(&path, JournalWriterMode::default()).unwrap();
             je.add_instrument(btc_usd_spec()).unwrap();
             je.deposit(ACCT_A, USD, 100_000).unwrap();
             // With hash-chain: Genesis(1) + AddInstrument(2) + Deposit(3) = next is 4.
@@ -975,7 +953,7 @@ mod tests {
 
         // Recover and append more.
         {
-            let mut je = JournaledExchange::recover(&path).unwrap();
+            let mut je = JournaledExchange::recover(&path, JournalWriterMode::default()).unwrap();
             assert_eq!(je.next_sequence(), FIRST_SEQ + 2);
 
             je.deposit(ACCT_B, BTC, 500).unwrap();
@@ -983,7 +961,7 @@ mod tests {
         }
 
         // Recover again — should see all 3 user events.
-        let je = JournaledExchange::recover(&path).unwrap();
+        let je = JournaledExchange::recover(&path, JournalWriterMode::default()).unwrap();
         assert_eq!(je.next_sequence(), FIRST_SEQ + 3);
         assert_eq!(
             je.exchange().accounts().balance(ACCT_A, USD).available,
@@ -998,10 +976,10 @@ mod tests {
         let path = dir.path().join("empty.journal");
 
         {
-            let _je = JournaledExchange::create(&path).unwrap();
+            let _je = JournaledExchange::create(&path, JournalWriterMode::default()).unwrap();
         }
 
-        let je = JournaledExchange::recover(&path).unwrap();
+        let je = JournaledExchange::recover(&path, JournalWriterMode::default()).unwrap();
         // With hash-chain, genesis consumed seq 1, so next is 2; without, next is 1.
         assert_eq!(je.next_sequence(), FIRST_SEQ);
     }
@@ -1012,7 +990,7 @@ mod tests {
         let path = dir.path().join("crash.journal");
 
         {
-            let mut je = JournaledExchange::create(&path).unwrap();
+            let mut je = JournaledExchange::create(&path, JournalWriterMode::default()).unwrap();
             je.add_instrument(btc_usd_spec()).unwrap();
             je.deposit(ACCT_A, USD, 100_000).unwrap();
         }
@@ -1031,7 +1009,7 @@ mod tests {
         }
 
         // Recovery should replay the first event (AddInstrument) but not the truncated Deposit.
-        let je = JournaledExchange::recover(&path).unwrap();
+        let je = JournaledExchange::recover(&path, JournalWriterMode::default()).unwrap();
         // With hash-chain: Genesis(1) + AddInstrument(2) survived, Deposit(3) truncated → next=3.
         // Without: AddInstrument(1) survived, Deposit(2) truncated → next=2.
         assert_eq!(je.next_sequence(), FIRST_SEQ + 1);
@@ -1044,7 +1022,7 @@ mod tests {
         let path = dir.path().join("no_garbage.journal");
 
         {
-            let mut je = JournaledExchange::create(&path).unwrap();
+            let mut je = JournaledExchange::create(&path, JournalWriterMode::default()).unwrap();
             je.add_instrument(btc_usd_spec()).unwrap();
             je.deposit(ACCT_A, USD, 100_000).unwrap();
         }
@@ -1062,12 +1040,12 @@ mod tests {
 
         // Recover and append a new event.
         {
-            let mut je = JournaledExchange::recover(&path).unwrap();
+            let mut je = JournaledExchange::recover(&path, JournalWriterMode::default()).unwrap();
             je.deposit(ACCT_A, USD, 50_000).unwrap();
         }
 
         // Full re-recovery should see both events cleanly (no garbage between).
-        let je = JournaledExchange::recover(&path).unwrap();
+        let je = JournaledExchange::recover(&path, JournalWriterMode::default()).unwrap();
         // With hash-chain: Genesis(1) + AddInstrument(2) + Deposit(3) → next=4
         // Without: AddInstrument(1) + Deposit(2) → next=3
         assert_eq!(je.next_sequence(), FIRST_SEQ + 2);
@@ -1084,7 +1062,7 @@ mod tests {
         let snap_path = dir.path().join("snap.snapshot");
 
         {
-            let mut je = JournaledExchange::create(&journal_path).unwrap();
+            let mut je = JournaledExchange::create(&journal_path, JournalWriterMode::default()).unwrap();
             je.add_instrument(btc_usd_spec()).unwrap();
             je.deposit(ACCT_A, USD, 100_000).unwrap();
             je.deposit(ACCT_B, BTC, 500).unwrap();
@@ -1110,7 +1088,7 @@ mod tests {
         }
 
         // Recover from snapshot + journal.
-        let je = JournaledExchange::recover_from_snapshot(&snap_path, &journal_path).unwrap();
+        let je = JournaledExchange::recover_from_snapshot(&snap_path, &journal_path, JournalWriterMode::default()).unwrap();
         // With hash-chain: Genesis(1) + 4 user events(2,3,4,5) + 1 post-snap(6) → next=7
         // Without: 4 user events(1,2,3,4) + 1 post-snap(5) → next=6
         assert_eq!(je.next_sequence(), FIRST_SEQ + 5);
@@ -1133,7 +1111,7 @@ mod tests {
 
         let expected_seq;
         {
-            let mut je = JournaledExchange::create(&journal_path).unwrap();
+            let mut je = JournaledExchange::create(&journal_path, JournalWriterMode::default()).unwrap();
             je.add_instrument(btc_usd_spec()).unwrap();
             je.deposit(ACCT_A, USD, 100_000).unwrap();
             je.deposit(ACCT_B, BTC, 500).unwrap();
@@ -1160,7 +1138,7 @@ mod tests {
         }
 
         // Recover from snapshot (zero chain hash) + journal.
-        let je = JournaledExchange::recover_from_snapshot(&snap_path, &journal_path).unwrap();
+        let je = JournaledExchange::recover_from_snapshot(&snap_path, &journal_path, JournalWriterMode::default()).unwrap();
         assert_eq!(je.next_sequence(), expected_seq);
         // Buyer got 20 BTC from fill.
         assert_eq!(je.exchange().accounts().balance(ACCT_A, BTC).available, 20);
@@ -1175,7 +1153,7 @@ mod tests {
         let path = dir.path().join("cb_replay.journal");
 
         {
-            let mut je = JournaledExchange::create(&path).unwrap();
+            let mut je = JournaledExchange::create(&path, JournalWriterMode::default()).unwrap();
             je.add_instrument(btc_usd_spec()).unwrap();
             je.deposit(ACCT_A, USD, 100_000).unwrap();
 
@@ -1191,7 +1169,7 @@ mod tests {
         }
 
         // Recover from journal — halt should be restored.
-        let mut recovered = JournaledExchange::recover(&path).unwrap();
+        let mut recovered = JournaledExchange::recover(&path, JournalWriterMode::default()).unwrap();
         let mut reports = Vec::new();
         recovered
             .execute(
@@ -1216,7 +1194,7 @@ mod tests {
         let snap_path = dir.path().join("test.snapshot");
 
         // Create engine, seed data, submit some orders.
-        let mut engine = JournaledExchange::create(&journal_path).unwrap();
+        let mut engine = JournaledExchange::create(&journal_path, JournalWriterMode::default()).unwrap();
         engine.add_instrument(btc_usd_spec()).unwrap();
         engine.deposit(ACCT_A, USD, 1_000_000).unwrap();
         engine.deposit(ACCT_A, BTC, 1_000).unwrap();
@@ -1271,7 +1249,7 @@ mod tests {
         let snap_path = dir.path().join("test.snapshot");
 
         // Build state, rotate, add more events.
-        let mut engine = JournaledExchange::create(&journal_path).unwrap();
+        let mut engine = JournaledExchange::create(&journal_path, JournalWriterMode::default()).unwrap();
         engine.add_instrument(btc_usd_spec()).unwrap();
         engine.deposit(ACCT_A, USD, 1_000_000).unwrap();
         engine.deposit(ACCT_B, BTC, 1_000).unwrap();
@@ -1304,7 +1282,7 @@ mod tests {
 
         // Recover from snapshot + new journal.
         let recovered =
-            JournaledExchange::recover_from_snapshot(&snap_path, &journal_path).unwrap();
+            JournaledExchange::recover_from_snapshot(&snap_path, &journal_path, JournalWriterMode::default()).unwrap();
         assert_eq!(
             recovered.exchange().accounts().balance(ACCT_A, USD),
             bal_a_usd
@@ -1321,7 +1299,7 @@ mod tests {
         let journal_path = dir.path().join("test.journal");
         let snap_path = dir.path().join("test.snapshot");
 
-        let mut engine = JournaledExchange::create(&journal_path).unwrap();
+        let mut engine = JournaledExchange::create(&journal_path, JournalWriterMode::default()).unwrap();
         engine.add_instrument(btc_usd_spec()).unwrap();
         engine.deposit(ACCT_A, USD, 1_000_000).unwrap();
 
@@ -1374,14 +1352,14 @@ mod tests {
 
         let original_hash;
         {
-            let mut je = JournaledExchange::create(&path).unwrap();
+            let mut je = JournaledExchange::create(&path, JournalWriterMode::default()).unwrap();
             je.add_instrument(btc_usd_spec()).unwrap();
             je.deposit(ACCT_A, USD, 100_000).unwrap();
             original_hash = je.writer_chain_hash();
         }
 
         // Recover and verify chain hash is preserved.
-        let recovered = JournaledExchange::recover(&path).unwrap();
+        let recovered = JournaledExchange::recover(&path, JournalWriterMode::default()).unwrap();
         assert_eq!(recovered.writer_chain_hash(), original_hash);
     }
 
@@ -1392,7 +1370,7 @@ mod tests {
         let journal_path = dir.path().join("rot.journal");
         let snap_path = dir.path().join("rot.snapshot");
 
-        let mut engine = JournaledExchange::create(&journal_path).unwrap();
+        let mut engine = JournaledExchange::create(&journal_path, JournalWriterMode::default()).unwrap();
         engine.add_instrument(btc_usd_spec()).unwrap();
         engine.deposit(ACCT_A, USD, 100_000).unwrap();
 
@@ -1420,7 +1398,7 @@ mod tests {
 
         let chain_hash_at_snap;
         {
-            let mut je = JournaledExchange::create(&journal_path).unwrap();
+            let mut je = JournaledExchange::create(&journal_path, JournalWriterMode::default()).unwrap();
             je.add_instrument(btc_usd_spec()).unwrap();
             je.deposit(ACCT_A, USD, 100_000).unwrap();
             je.save_snapshot(&snap_path).unwrap();
@@ -1442,7 +1420,7 @@ mod tests {
         let snap_path = dir.path().join("rot_chain.snapshot");
 
         // Build state, rotate (creates snapshot + new journal with genesis).
-        let mut engine = JournaledExchange::create(&journal_path).unwrap();
+        let mut engine = JournaledExchange::create(&journal_path, JournalWriterMode::default()).unwrap();
         engine.add_instrument(btc_usd_spec()).unwrap();
         engine.deposit(ACCT_A, USD, 1_000_000).unwrap();
         engine.rotate(&snap_path).unwrap();
@@ -1462,7 +1440,7 @@ mod tests {
 
         // Recover from snapshot + new journal.
         let recovered =
-            JournaledExchange::recover_from_snapshot(&snap_path, &journal_path).unwrap();
+            JournaledExchange::recover_from_snapshot(&snap_path, &journal_path, JournalWriterMode::default()).unwrap();
         // Chain hash must match — this would fail if the reader used the
         // snapshot seed instead of reinitializing from genesis.
         assert_eq!(recovered.writer_chain_hash(), writer_hash);
@@ -1483,7 +1461,7 @@ mod tests {
         let path = dir.path().join("crash_chain.journal");
 
         {
-            let mut je = JournaledExchange::create(&path).unwrap();
+            let mut je = JournaledExchange::create(&path, JournalWriterMode::default()).unwrap();
             je.add_instrument(btc_usd_spec()).unwrap();
             je.deposit(ACCT_A, USD, 100_000).unwrap();
             je.deposit(ACCT_B, BTC, 500).unwrap();
@@ -1499,7 +1477,7 @@ mod tests {
         }
 
         // Recover — chain should be valid for the surviving entries.
-        let mut je = JournaledExchange::recover(&path).unwrap();
+        let mut je = JournaledExchange::recover(&path, JournalWriterMode::default()).unwrap();
         let hash_after_crash = je.writer_chain_hash();
         assert!(hash_after_crash.is_some());
 
@@ -1510,7 +1488,7 @@ mod tests {
         drop(je);
 
         // Re-recover — chain should match.
-        let je2 = JournaledExchange::recover(&path).unwrap();
+        let je2 = JournaledExchange::recover(&path, JournalWriterMode::default()).unwrap();
         assert_eq!(je2.writer_chain_hash(), hash_after_append);
     }
 
@@ -1521,7 +1499,7 @@ mod tests {
         let journal_path = dir.path().join("multi_rot.journal");
         let snap_path = dir.path().join("multi_rot.snapshot");
 
-        let mut engine = JournaledExchange::create(&journal_path).unwrap();
+        let mut engine = JournaledExchange::create(&journal_path, JournalWriterMode::default()).unwrap();
         engine.add_instrument(btc_usd_spec()).unwrap();
         engine.deposit(ACCT_A, USD, 1_000_000).unwrap();
 
@@ -1546,7 +1524,7 @@ mod tests {
 
         // Recovery from latest snapshot + journal should match.
         let recovered =
-            JournaledExchange::recover_from_snapshot(&snap_path, &journal_path).unwrap();
+            JournaledExchange::recover_from_snapshot(&snap_path, &journal_path, JournalWriterMode::default()).unwrap();
         assert_eq!(recovered.writer_chain_hash(), final_hash);
         assert_eq!(
             recovered
@@ -1564,14 +1542,14 @@ mod tests {
         let path = dir.path().join("withdraw.journal");
 
         {
-            let mut je = JournaledExchange::create(&path).unwrap();
+            let mut je = JournaledExchange::create(&path, JournalWriterMode::default()).unwrap();
             je.add_instrument(btc_usd_spec()).unwrap();
             je.deposit(ACCT_A, USD, 100_000).unwrap();
             je.withdraw(ACCT_A, USD, 50_000).unwrap();
         }
 
         // Replay should produce the same state.
-        let je = JournaledExchange::recover(&path).unwrap();
+        let je = JournaledExchange::recover(&path, JournalWriterMode::default()).unwrap();
         assert_eq!(
             je.exchange().accounts().balance(ACCT_A, USD).available,
             50_000
@@ -1587,7 +1565,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("withdraw_err.journal");
 
-        let mut je = JournaledExchange::create(&path).unwrap();
+        let mut je = JournaledExchange::create(&path, JournalWriterMode::default()).unwrap();
         je.deposit(ACCT_A, USD, 100).unwrap();
 
         let err = je.withdraw(ACCT_A, USD, 200).unwrap_err();
@@ -1611,7 +1589,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("withdraw_resting.journal");
 
-        let mut je = JournaledExchange::create(&path).unwrap();
+        let mut je = JournaledExchange::create(&path, JournalWriterMode::default()).unwrap();
         je.add_instrument(btc_usd_spec()).unwrap();
         je.deposit(ACCT_A, USD, 100_000).unwrap();
 
@@ -1637,7 +1615,7 @@ mod tests {
     fn withdraw_unknown_account_returns_error() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("withdraw_unknown.journal");
-        let mut je = JournaledExchange::create(&path).unwrap();
+        let mut je = JournaledExchange::create(&path, JournalWriterMode::default()).unwrap();
         let err = je.withdraw(ACCT_A, USD, 1).unwrap_err();
         assert!(
             matches!(
@@ -1654,7 +1632,7 @@ mod tests {
         let path = dir.path().join("withdraw_rejected.journal");
 
         {
-            let mut je = JournaledExchange::create(&path).unwrap();
+            let mut je = JournaledExchange::create(&path, JournalWriterMode::default()).unwrap();
             je.add_instrument(btc_usd_spec()).unwrap();
             je.deposit(ACCT_A, USD, 100_000).unwrap();
 
@@ -1680,7 +1658,7 @@ mod tests {
         }
 
         // Replay: the rejected withdraw should be a no-op.
-        let je = JournaledExchange::recover(&path).unwrap();
+        let je = JournaledExchange::recover(&path, JournalWriterMode::default()).unwrap();
         // Balance: 100K deposited, 1000 reserved by order, withdraw rejected.
         assert_eq!(
             je.exchange().accounts().balance(ACCT_A, USD).available,
@@ -1699,7 +1677,7 @@ mod tests {
         let snap_path = dir.path().join("snap_withdraw.snapshot");
 
         {
-            let mut je = JournaledExchange::create(&journal_path).unwrap();
+            let mut je = JournaledExchange::create(&journal_path, JournalWriterMode::default()).unwrap();
             je.add_instrument(btc_usd_spec()).unwrap();
             je.deposit(ACCT_A, USD, 100_000).unwrap();
             je.deposit(ACCT_A, BTC, 500).unwrap();
@@ -1734,7 +1712,7 @@ mod tests {
         }
 
         // Recovery from snapshot + journal.
-        let je = JournaledExchange::recover_from_snapshot(&snap_path, &journal_path).unwrap();
+        let je = JournaledExchange::recover_from_snapshot(&snap_path, &journal_path, JournalWriterMode::default()).unwrap();
 
         // ACCT_A: 100K - 1000 (bought 10 @ 100) + 999 = 99_999 USD, 500 + 10 = 510 BTC
         assert_eq!(
@@ -1787,7 +1765,7 @@ mod tests {
         }
 
         // Recover should rebuild the HWM.
-        let je = JournaledExchange::recover(&path).unwrap();
+        let je = JournaledExchange::recover(&path, JournalWriterMode::default()).unwrap();
         let exchange = je.exchange();
 
         // The HWM for key_hash should be 2.
@@ -1840,7 +1818,7 @@ mod tests {
         }
 
         // Recover and snapshot.
-        let je = JournaledExchange::recover(&journal_path).unwrap();
+        let je = JournaledExchange::recover(&journal_path, JournalWriterMode::default()).unwrap();
         je.save_snapshot(&snapshot_path).unwrap();
 
         // Load snapshot into a fresh exchange.
@@ -1967,7 +1945,7 @@ mod tests {
         let original = dir.path().join("original.journal");
 
         {
-            let mut je = JournaledExchange::create(&original).unwrap();
+            let mut je = JournaledExchange::create(&original, JournalWriterMode::default()).unwrap();
             je.add_instrument(btc_usd_spec()).unwrap();
             je.deposit(ACCT_A, USD, 100_000).unwrap();
             je.deposit(ACCT_B, BTC, 500).unwrap();
@@ -2011,7 +1989,7 @@ mod tests {
             }
 
             // Recovery must not panic or error.
-            let mut je = JournaledExchange::recover(&work).unwrap();
+            let mut je = JournaledExchange::recover(&work, JournalWriterMode::default()).unwrap();
 
             // Sequence must be valid (at least 1, the starting point for an empty journal).
             assert!(je.next_sequence() >= 1, "seq underflow at byte {trunc_at}");
@@ -2021,7 +1999,7 @@ mod tests {
 
             // Double-recovery of the post-append journal must also succeed.
             drop(je);
-            let je2 = JournaledExchange::recover(&work).unwrap();
+            let je2 = JournaledExchange::recover(&work, JournalWriterMode::default()).unwrap();
             // At least 2: the deposit we appended (seq 1) + next is 2.
             assert!(
                 je2.next_sequence() >= 2,
@@ -2040,7 +2018,7 @@ mod tests {
         let snap_path = dir.path().join("rotation.snapshot");
 
         // Build state, rotate, add more events after rotation.
-        let mut engine = JournaledExchange::create(&journal_path).unwrap();
+        let mut engine = JournaledExchange::create(&journal_path, JournalWriterMode::default()).unwrap();
         build_workload(&mut engine);
         engine.rotate(&snap_path).unwrap();
 
@@ -2087,7 +2065,7 @@ mod tests {
                 f.set_len(trunc_at).unwrap();
             }
 
-            let je = JournaledExchange::recover_from_snapshot(&snap_path, &work_journal).unwrap();
+            let je = JournaledExchange::recover_from_snapshot(&snap_path, &work_journal, JournalWriterMode::default()).unwrap();
 
             // Sequence must be between snapshot seq and final seq (inclusive of snap+1
             // because the new journal's genesis consumes one seq with hash-chain).
@@ -2139,7 +2117,7 @@ mod tests {
         // Write all events, recording the valid-data-end after each one.
         let mut checkpoints: Vec<(u64, u64)> = Vec::new(); // (seq_after, file_pos_after)
         {
-            let mut je = JournaledExchange::create(&original).unwrap();
+            let mut je = JournaledExchange::create(&original, JournalWriterMode::default()).unwrap();
             let mut reports = Vec::new();
             for evt in &events {
                 apply_event(&mut je, evt, &mut reports);
@@ -2150,7 +2128,7 @@ mod tests {
         }
 
         // Reference state: recover from the full journal.
-        let reference = JournaledExchange::recover(&original).unwrap();
+        let reference = JournaledExchange::recover(&original, JournalWriterMode::default()).unwrap();
         let ref_bal_a_usd = reference
             .exchange()
             .accounts()
@@ -2194,7 +2172,7 @@ mod tests {
             }
 
             // Recover from truncated journal.
-            let mut je = JournaledExchange::recover(&work).unwrap();
+            let mut je = JournaledExchange::recover(&work, JournalWriterMode::default()).unwrap();
             let _recovered_seq = je.next_sequence();
 
             // Replay the remaining events (those after the truncation point).
@@ -2247,7 +2225,7 @@ mod tests {
 
         let mut reports = Vec::new();
         {
-            let mut je = JournaledExchange::create(&path).unwrap();
+            let mut je = JournaledExchange::create(&path, JournalWriterMode::default()).unwrap();
 
             // Instrument.
             je.add_instrument(btc_usd_spec()).unwrap();
@@ -2297,7 +2275,7 @@ mod tests {
         }
 
         // Recover and verify every state type.
-        let je = JournaledExchange::recover(&path).unwrap();
+        let je = JournaledExchange::recover(&path, JournalWriterMode::default()).unwrap();
         let ex = je.exchange();
 
         // Balances.
@@ -2348,7 +2326,7 @@ mod tests {
         let snap_path = dir.path().join("multi_rot.snapshot");
 
         let mut reports = Vec::new();
-        let mut engine = JournaledExchange::create(&journal_path).unwrap();
+        let mut engine = JournaledExchange::create(&journal_path, JournalWriterMode::default()).unwrap();
         engine.add_instrument(btc_usd_spec()).unwrap();
         engine.deposit(ACCT_A, USD, 10_000_000).unwrap();
         engine.deposit(ACCT_B, BTC, 10_000).unwrap();
@@ -2425,7 +2403,7 @@ mod tests {
                 f.set_len(trunc_at).unwrap();
             }
 
-            let je = JournaledExchange::recover_from_snapshot(&snap_path, &work).unwrap();
+            let je = JournaledExchange::recover_from_snapshot(&snap_path, &work, JournalWriterMode::default()).unwrap();
 
             // Sequence must not exceed the full reference.
             assert!(
@@ -2435,14 +2413,14 @@ mod tests {
 
             // Must be able to append after recovery.
             drop(je);
-            let mut je2 = JournaledExchange::recover_from_snapshot(&snap_path, &work).unwrap();
+            let mut je2 = JournaledExchange::recover_from_snapshot(&snap_path, &work, JournalWriterMode::default()).unwrap();
             je2.deposit(ACCT_A, USD, 1).unwrap();
 
             trunc_at += 10;
         }
 
         // Full recovery (no truncation) must match reference.
-        let full = JournaledExchange::recover_from_snapshot(&snap_path, &journal_path).unwrap();
+        let full = JournaledExchange::recover_from_snapshot(&snap_path, &journal_path, JournalWriterMode::default()).unwrap();
         assert_eq!(
             full.exchange().accounts().balance(ACCT_A, USD).available,
             ref_bal_a_usd
@@ -2584,7 +2562,7 @@ mod tests {
         let acct_a_usd;
         let acct_b_usd;
         {
-            let mut je = JournaledExchange::create(&path).unwrap();
+            let mut je = JournaledExchange::create(&path, JournalWriterMode::default()).unwrap();
             je.add_instrument(btc_usd_spec()).unwrap();
             je.deposit(ACCT_A, USD, 100_000).unwrap();
             je.deposit(ACCT_B, BTC, 100).unwrap();
@@ -2626,7 +2604,7 @@ mod tests {
         }
 
         // Recover from journal and verify fee schedule was replayed.
-        let recovered = JournaledExchange::recover(&path).unwrap();
+        let recovered = JournaledExchange::recover(&path, JournalWriterMode::default()).unwrap();
         assert_eq!(
             recovered
                 .exchange()

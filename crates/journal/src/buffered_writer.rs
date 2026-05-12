@@ -272,14 +272,22 @@ impl<E: AppEvent> BufferedWriter<E> {
         }
         codec::decode_file_header(&header_buf)?;
 
-        let file_len = file.metadata()?.len();
-        let allocated_end = if file_len >= valid_end {
-            file_len
-        } else {
-            let end = fallocate_chunk(&file, valid_end)?;
-            file.sync_all()?;
-            end
-        };
+        // Truncate down to `valid_end` so any torn-write garbage past
+        // it is gone before we resume appending. Without this, the
+        // bytes between `valid_end` and the previous file length
+        // survive on disk; subsequent readers (or offline tooling)
+        // could mistake them for entries if they happen to start with
+        // the journal magic. The CRC check would catch the lie, but
+        // SectorWriter scrubs its tail sector for the same reason and
+        // BufferedWriter should match the defensive posture. Truncate
+        // then re-fallocate to restore the chunk-ahead allocation;
+        // the kernel zero-fills the freshly extended region.
+        let pre_truncate_len = file.metadata()?.len();
+        if pre_truncate_len > valid_end {
+            file.set_len(valid_end)?;
+        }
+        let allocated_end = fallocate_chunk(&file, valid_end)?;
+        file.sync_all()?;
 
         #[allow(unused_mut)]
         let mut writer = Self {
@@ -710,6 +718,17 @@ impl<E: AppEvent> BufferedWriter<E> {
                         "rotate_segment: rename-back failed after create_continuing error: \
                          original={e}, restore={restore_err}"
                     );
+                } else if let Err(fsync_err) = crate::segment::fsync_parent_dir(&path) {
+                    // The rename succeeded but the dirent isn't durable
+                    // yet. A crash here would leave recovery seeing the
+                    // archive without the restored live, the same
+                    // Phase-B state the success-path fsync protects
+                    // against. Best-effort: log and surface the
+                    // original error.
+                    tracing::warn!(
+                        "rotate_segment: dir fsync after rename-back failed: \
+                         original={e}, fsync={fsync_err}"
+                    );
                 }
                 Err(e)
             }
@@ -1039,5 +1058,140 @@ mod tests {
         let repl = writer.last_user_entry_replication_slice();
         assert_eq!(repl.len(), full.len() - 6);
         assert_eq!(repl, &full[2..full.len() - 4]);
+    }
+
+    /// Garbage past `valid_end` from a torn pre-crash write must not
+    /// resurface as decodable entries after `open_append`. We construct
+    /// the scenario by appending one batch, capturing its `valid_end`,
+    /// appending more, then dropping without flushing — but since the
+    /// buffered writer flushes per `batch_append + sync` we instead
+    /// simulate the torn-write by pwriting raw garbage past `valid_end`
+    /// before reopening. The reopen path must scrub it.
+    #[test]
+    fn open_append_scrubs_garbage_past_valid_end() {
+        use std::os::unix::fs::FileExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.journal");
+
+        let mut writer = BufferedWriter::<TestEvent>::create(&path).unwrap();
+        let chain_before = writer.chain_hash();
+        let events_since_checkpoint = writer.events_since_checkpoint();
+        writer.append(&sample(11)).unwrap();
+        writer.append(&sample(22)).unwrap();
+        let valid_end = writer.valid_end();
+        let last_seq = writer.next_sequence() - 1;
+        drop(writer);
+
+        // Splat 4 KiB of plausibly-magic-looking garbage past valid_end.
+        // The journal magic is 0x4A 0x45 ("JE"); we fabricate a frame
+        // header that would pass a naive scan: magic + plausible length.
+        let mut garbage = vec![0xFFu8; 4096];
+        garbage[0] = 0x4A;
+        garbage[1] = 0x45;
+        garbage[2] = 0x10; // length low byte — fake non-zero length
+        garbage[3] = 0x00;
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .unwrap();
+        file.write_all_at(&garbage, valid_end).unwrap();
+        file.sync_all().unwrap();
+        drop(file);
+
+        // Reopen via `open_append`. The fix must truncate the file so
+        // the garbage is gone; otherwise a subsequent reader would
+        // either fail with a CRC error past `valid_end` or worse, treat
+        // the garbage as a valid frame.
+        let reopened = BufferedWriter::<TestEvent>::open_append(
+            &path,
+            last_seq,
+            valid_end,
+            chain_before,
+            events_since_checkpoint,
+        )
+        .unwrap();
+        drop(reopened);
+
+        // Fresh reader: must see exactly the two pre-crash entries plus
+        // any genesis (under hash-chain) — no extra frames decoded from
+        // the garbage.
+        let payloads = read_all_payloads(&path);
+        assert_eq!(payloads, vec![11, 22]);
+    }
+
+    /// Cross-segment chain continuity: after `rotate_segment`, the new
+    /// segment's GenesisHash payload must equal the live segment's
+    /// chain hash at the rotation moment. Without this, multi-segment
+    /// recovery would report `SegmentChainBreak` against a journal
+    /// that's actually intact.
+    #[cfg(feature = "hash-chain")]
+    #[test]
+    fn rotate_segment_anchors_new_genesis_to_pre_rotate_tail() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.journal");
+
+        let mut writer = BufferedWriter::<TestEvent>::create(&path).unwrap();
+        writer.append(&sample(7)).unwrap();
+        writer.append(&sample(8)).unwrap();
+        let pre_rotate_chain = writer.chain_hash().expect("hash-chain enabled");
+
+        let archived = writer.rotate_segment().unwrap();
+        assert!(archived.exists());
+
+        // The reader exposes the segment's GenesisHash payload via
+        // `genesis_payload`. Walking the new live segment is enough to
+        // populate it.
+        let mut reader = crate::reader::JournalReader::<TestEvent>::open(&path).unwrap();
+        while reader.next_entry().unwrap().is_some() {}
+        let genesis = reader
+            .genesis_payload()
+            .expect("new segment must carry a genesis hash anchor");
+        assert_eq!(
+            genesis, pre_rotate_chain,
+            "new segment's genesis must anchor to the pre-rotation tail",
+        );
+    }
+
+    /// Mid-segment `open_append` with `events_since_checkpoint > 0`
+    /// must reconstruct the running chain hash by replaying via the
+    /// reader. Asserts that the resumed writer's chain state matches
+    /// what a never-crashed writer would have produced.
+    #[cfg(feature = "hash-chain")]
+    #[test]
+    fn open_append_mid_segment_rebuilds_chain_via_reader_replay() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.journal");
+
+        let mut writer = BufferedWriter::<TestEvent>::create(&path).unwrap();
+        // Three appends mid-segment — well below `checkpoint_interval`
+        // so `events_since_checkpoint > 0` at the snapshot point.
+        writer.append(&sample(1)).unwrap();
+        writer.append(&sample(2)).unwrap();
+        writer.append(&sample(3)).unwrap();
+        let chain_no_crash = writer.chain_hash().unwrap();
+        let events_no_crash = writer.events_since_checkpoint();
+        assert!(events_no_crash > 0, "test setup: must be mid-segment");
+
+        let valid_end = writer.valid_end();
+        let last_seq = writer.next_sequence() - 1;
+        drop(writer);
+
+        // Resume — open_append must replay the segment via the reader
+        // to seed the chain state, since the running hash includes
+        // unfinalised entries that can't decompose arithmetically.
+        let reopened = BufferedWriter::<TestEvent>::open_append(
+            &path,
+            last_seq,
+            valid_end,
+            // The caller's chain_hash is the running hash including
+            // unfinalised entries — supply it; open_append replaces it
+            // with the reader-derived state.
+            Some(chain_no_crash),
+            events_no_crash,
+        )
+        .unwrap();
+        assert_eq!(reopened.chain_hash(), Some(chain_no_crash));
+        assert_eq!(reopened.events_since_checkpoint(), events_no_crash);
     }
 }

@@ -786,11 +786,13 @@ pub fn run_receiver(
                 melin_transport_core::JournaledApp::<App>::recover_from_snapshot(
                     &snapshot_path,
                     journal_path,
+                    melin_journal::JournalWriterMode::default(),
                 )?
             } else {
                 melin_transport_core::JournaledApp::<App>::recover(
                     crate::server::empty_app(),
                     journal_path,
+                    melin_journal::JournalWriterMode::default(),
                 )?
             };
             let next = engine.next_sequence();

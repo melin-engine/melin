@@ -92,8 +92,12 @@ pub fn run_receiver_rumcast(
     // SEC-04: must equal the primary's --max-orders-per-second / --max-orders-burst.
     max_orders_per_second: u32,
     max_orders_burst: u32,
+    // Bound on in-flight unacked batches before backpressure. Mirrors the
+    // TCP receiver knob (`config.replication_pipeline_depth`).
+    pipeline_depth: usize,
 ) -> super::ReceiverResult {
     use crate::App;
+    use crate::JournalWriter;
     use crate::SectorWriter;
     use melin_transport_core::JournaledApp;
 
@@ -102,9 +106,17 @@ pub fn run_receiver_rumcast(
         if journal_path.exists() {
             let engine = if snapshot_path.exists() {
                 info!("recovering replica from snapshot + journal");
-                JournaledApp::<App>::recover_from_snapshot(&snapshot_path, journal_path)?
+                JournaledApp::<App>::recover_from_snapshot(
+                    &snapshot_path,
+                    journal_path,
+                    melin_journal::JournalWriterMode::default(),
+                )?
             } else {
-                JournaledApp::<App>::recover(crate::server::empty_app(), journal_path)?
+                JournaledApp::<App>::recover(
+                    crate::server::empty_app(),
+                    journal_path,
+                    melin_journal::JournalWriterMode::default(),
+                )?
             };
             let next = engine.next_sequence();
             let last = next.saturating_sub(1);
@@ -193,9 +205,14 @@ pub fn run_receiver_rumcast(
                     let (snap_exchange, snap_seq, snap_hash) =
                         melin_transport_core::snapshot::load::<App>(&snapshot_path)?;
                     exchange = Some(snap_exchange);
+                    // Sector-only path: the fresh-replica branch below
+                    // manually writes a sector-sized header and opens via
+                    // SectorWriter::open_append, so the writer must match.
+                    // Threading a Buffered-mode flag through the replica
+                    // is future work.
                     let writer =
                         SectorWriter::create_continuing(journal_path, snap_seq + 1, snap_hash)?;
-                    journal_writer = Some(writer);
+                    journal_writer = Some(JournalWriter::Sector(writer));
                     last_sequence = snap_seq;
                     chain_hash = snap_hash;
                     info!(start_sequence, "rumcast replica: snapshot loaded");
@@ -212,7 +229,7 @@ pub fn run_receiver_rumcast(
                         max_orders_burst,
                     );
                     exchange = Some(fresh);
-                    journal_writer = Some(writer);
+                    journal_writer = Some(JournalWriter::Sector(writer));
                 }
                 Some((primary_genesis, start_sequence))
             }
@@ -251,6 +268,7 @@ pub fn run_receiver_rumcast(
             cur_exchange,
             cur_writer,
             4096,
+            Duration::ZERO,
             busy_spin,
             enable_shadow,
         );
@@ -338,7 +356,7 @@ pub fn run_receiver_rumcast(
         };
 
         // ---- Inner streaming loop ----
-        let mut pending_acks = PendingAckQueue::new();
+        let mut pending_acks = PendingAckQueue::new(pipeline_depth);
         let mut received_data = false;
 
         let exit_reason = streaming_loop(
@@ -389,6 +407,7 @@ pub fn run_receiver_rumcast(
                             let engine = JournaledApp::<App>::recover(
                                 crate::server::empty_app(),
                                 journal_path,
+                                melin_journal::JournalWriterMode::default(),
                             )?;
                             last_sequence = engine.next_sequence().saturating_sub(1);
                             chain_hash = engine.chain_hash().unwrap_or([0u8; 32]);

@@ -360,7 +360,7 @@ fn run_rumcast_primary(
 }
 
 /// Same as [`run_rumcast_primary`] but takes an existing
-/// `(App, SectorWriter)` instead of calling `init_engine`. Used by the
+/// `(App, JournalWriter)` instead of calling `init_engine`. Used by the
 /// promotion path: when `run_receiver_rumcast` returns `Some(state)` on
 /// promote, the replica calls into this with its already-replayed
 /// state rather than re-recovering from the journal.
@@ -371,7 +371,7 @@ fn run_rumcast_primary_with_state(
     shutdown: Arc<AtomicBool>,
     authorized_keys: Arc<AuthorizedKeys>,
     app: crate::App,
-    writer: crate::SectorWriter,
+    writer: crate::JournalWriter,
     needs_seeding: bool,
     // Pre-bound order-entry socket. The startup path binds before
     // `init_engine` so clients connecting during journal creation
@@ -2221,6 +2221,7 @@ fn run_rumcast_replica(
         config.max_orders_per_account,
         config.max_orders_per_second,
         config.max_orders_burst,
+        config.replication_pipeline_depth,
     )? {
         None => Ok(()), // clean shutdown
         Some((mut exchange, writer)) => {

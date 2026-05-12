@@ -2530,11 +2530,7 @@ pub(crate) fn init_engine(
         && journal_exists
     {
         info!(snapshot = %snap_path.display(), writer_mode = %writer_mode, "recovering from snapshot + journal");
-        JournaledApp::<App>::recover_from_snapshot_with_mode(
-            snap_path,
-            &config.journal,
-            writer_mode,
-        )?
+        JournaledApp::<App>::recover_from_snapshot(snap_path, &config.journal, writer_mode)?
     } else if let Some(snap_path) = snap_path
         && snap_path.exists()
         && !journal_exists
@@ -2558,18 +2554,10 @@ pub(crate) fn init_engine(
         JournaledApp::<App>::from_parts(app, writer)
     } else if journal_exists {
         info!(writer_mode = %writer_mode, "recovering from journal");
-        JournaledApp::<App>::recover_with_mode(
-            empty_app_for_seed(config),
-            &config.journal,
-            writer_mode,
-        )?
+        JournaledApp::<App>::recover(empty_app_for_seed(config), &config.journal, writer_mode)?
     } else {
         info!(writer_mode = %writer_mode, "creating new journal");
-        JournaledApp::<App>::create_with_mode(
-            empty_app_for_seed(config),
-            &config.journal,
-            writer_mode,
-        )?
+        JournaledApp::<App>::create(empty_app_for_seed(config), &config.journal, writer_mode)?
     };
 
     let needs_seeding = !journal_exists;

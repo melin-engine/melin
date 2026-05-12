@@ -92,8 +92,12 @@ fn main() {
     let replica_snapshot: PathBuf = tmp_root.join("replica.snapshot");
 
     // --- Build primary pipeline ---
-    let engine = JournaledApp::create(melin_noop::NoopApp::new(), &primary_journal)
-        .expect("create primary journal");
+    let engine = JournaledApp::create(
+        melin_noop::NoopApp::new(),
+        &primary_journal,
+        melin_journal::JournalWriterMode::default(),
+    )
+    .expect("create primary journal");
     let (exchange, writer) = engine.into_parts();
 
     // Read genesis before moving writer into the pipeline.
