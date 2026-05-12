@@ -326,15 +326,13 @@ pub(super) fn sleep_checking_flags(
 /// `drain_handle` and `shadow_handle` still observe `shutdown_flag`
 /// because they don't process the input ring (no sentinel reaches
 /// them); set the flag for them only.
-pub(super) fn shutdown_pipeline(
+pub(super) fn shutdown_pipeline<W: Send + 'static>(
     shutdown_flag: &AtomicBool,
-    journal_handle: std::thread::JoinHandle<
-        Result<crate::JournalWriter, melin_journal::JournalError>,
-    >,
+    journal_handle: std::thread::JoinHandle<Result<W, melin_journal::JournalError>>,
     matching_handle: std::thread::JoinHandle<crate::App>,
     drain_handle: std::thread::JoinHandle<()>,
     shadow_handle: Option<std::thread::JoinHandle<()>>,
-) -> Option<(crate::App, crate::JournalWriter)> {
+) -> Option<(crate::App, W)> {
     // Defense-in-depth: set the flag before joining. The sentinel was
     // already published by `tcp_receiver` before this call, so no further
     // events can arrive in the input ring — setting the flag here cannot
@@ -367,7 +365,7 @@ pub(super) fn shutdown_pipeline(
 /// with the same shape (journal / matching / drain / optional shadow), and
 /// both refresh handshake state from `last_seq` + `chain_hash_lock` at
 /// reconnect time.
-pub(super) struct ReplicaPipelineHandles {
+pub(super) struct ReplicaPipelineHandles<W: Send + 'static> {
     pub(super) input_producer: melin_disruptor::ring::Producer<crate::InputSlot>,
     pub(super) journal_cursor: Arc<melin_disruptor::padding::Sequence>,
     /// Highest journal sequence durably persisted, published by JournalStage
@@ -380,8 +378,7 @@ pub(super) struct ReplicaPipelineHandles {
     /// Per-pipeline shutdown flag — flipped only on a controlled teardown
     /// (Promote/Shutdown/Fatal/Snapshot). NOT flipped on `Disconnected`.
     pub(super) pipeline_shutdown: Arc<AtomicBool>,
-    pub(super) journal_handle:
-        std::thread::JoinHandle<Result<crate::JournalWriter, melin_journal::JournalError>>,
+    pub(super) journal_handle: std::thread::JoinHandle<Result<W, melin_journal::JournalError>>,
     pub(super) matching_handle: std::thread::JoinHandle<crate::App>,
     pub(super) drain_handle: std::thread::JoinHandle<()>,
     pub(super) shadow_handle: Option<std::thread::JoinHandle<()>>,
@@ -390,16 +387,25 @@ pub(super) struct ReplicaPipelineHandles {
 /// Build the replica pipeline and spawn its stage threads on the configured
 /// cores. Returns the bundle of state the orchestrator keeps across
 /// `Disconnected` reconnects.
-pub(super) fn build_replica_pipeline_with_threads(
+pub(super) fn build_replica_pipeline_with_threads<W>(
     exchange: crate::App,
-    writer: crate::JournalWriter,
+    writer: W,
     cores: crate::server::PipelineCores,
     snapshot_interval_ms: u64,
     snapshot_path: std::path::PathBuf,
     group_commit_delay: std::time::Duration,
     busy_spin: bool,
     rotation: Option<(u64, Arc<AtomicBool>)>,
-) -> Result<ReplicaPipelineHandles, Box<dyn std::error::Error>> {
+) -> Result<ReplicaPipelineHandles<W>, Box<dyn std::error::Error>>
+where
+    W: melin_journal::JournalWrite<melin_trading::trading_event::TradingEvent> + Send + 'static,
+    melin_transport_core::pipeline::JournalStage<melin_trading::trading_event::TradingEvent, W>:
+        melin_transport_core::pipeline::JournalStageRun<
+                melin_trading::trading_event::TradingEvent,
+                Writer = W,
+            >,
+{
+    use melin_transport_core::pipeline::JournalStageRun;
     let shadow_exchange = <crate::App as melin_app::Application>::clone_via_snapshot(&exchange)?;
 
     let enable_shadow = snapshot_interval_ms > 0;
@@ -512,9 +518,9 @@ pub(super) fn build_replica_pipeline_with_threads(
 /// Tear down the pipeline: signal shutdown, join all threads, return the
 /// recovered (App, SectorWriter) so the orchestrator can use them for the
 /// next pipeline build (e.g., post-snapshot) or pass them up on promotion.
-pub(super) fn teardown_replica_pipeline(
-    handles: ReplicaPipelineHandles,
-) -> Option<(crate::App, crate::JournalWriter)> {
+pub(super) fn teardown_replica_pipeline<W: Send + 'static>(
+    handles: ReplicaPipelineHandles<W>,
+) -> Option<(crate::App, W)> {
     shutdown_pipeline(
         &handles.pipeline_shutdown,
         handles.journal_handle,

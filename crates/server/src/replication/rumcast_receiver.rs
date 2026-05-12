@@ -77,7 +77,7 @@ const SNAPSHOT_DEADLINE: Duration = Duration::from_secs(60);
 /// `Some` return value = promotion triggered with the fully-replayed
 /// `App` and positioned `SectorWriter`; `None` = clean shutdown.
 #[allow(clippy::too_many_arguments)]
-pub fn run_receiver_rumcast(
+pub fn run_receiver_rumcast<W>(
     primary_addr: SocketAddr,
     bind_addr: SocketAddr,
     journal_path: &Path,
@@ -97,41 +97,42 @@ pub fn run_receiver_rumcast(
     // Bound on in-flight unacked batches before backpressure. Mirrors the
     // TCP receiver knob (`config.replication_pipeline_depth`).
     pipeline_depth: usize,
-    // Selected journal writer — applied uniformly to the recover,
-    // snapshot-resume, and fresh-bootstrap paths.
-    journal_writer_mode: melin_journal::JournalWriterMode,
-) -> super::ReceiverResult {
+) -> super::ReceiverResult<W>
+where
+    W: melin_journal::JournalWrite<melin_trading::trading_event::TradingEvent> + Send + 'static,
+    melin_transport_core::pipeline::JournalStage<melin_trading::trading_event::TradingEvent, W>:
+        melin_transport_core::pipeline::JournalStageRun<
+                melin_trading::trading_event::TradingEvent,
+                Writer = W,
+            >,
+{
     use crate::App;
-    use crate::JournalWriter;
     use melin_transport_core::JournaledApp;
+    use melin_transport_core::pipeline::JournalStageRun;
 
     // ---- Recover local state from journal (if any) ----
-    // Boot path monomorphised on `JournalWriter` (== `BufferedWriter`);
-    // dispatch on `journal_writer_mode` lands in a follow-up.
-    let _ = journal_writer_mode;
-    let (mut exchange, mut journal_writer, mut last_sequence, mut chain_hash) = if journal_path
-        .exists()
-    {
-        let engine = if snapshot_path.exists() {
-            info!("recovering replica from snapshot + journal");
-            JournaledApp::<App, JournalWriter>::recover_from_snapshot(&snapshot_path, journal_path)?
+    let (mut exchange, mut journal_writer, mut last_sequence, mut chain_hash) =
+        if journal_path.exists() {
+            let engine = if snapshot_path.exists() {
+                info!("recovering replica from snapshot + journal");
+                JournaledApp::<App, W>::recover_from_snapshot(&snapshot_path, journal_path)?
+            } else {
+                JournaledApp::<App, W>::recover(crate::server::empty_app(), journal_path)?
+            };
+            let next = engine.next_sequence();
+            let last = next.saturating_sub(1);
+            let hash = engine.chain_hash().unwrap_or([0u8; 32]);
+            let (mut e, w) = engine.into_parts();
+            crate::server::apply_max_orders(
+                &mut e,
+                max_orders_per_account,
+                max_orders_per_second,
+                max_orders_burst,
+            );
+            (Some(e), Some(w), last, hash)
         } else {
-            JournaledApp::<App, JournalWriter>::recover(crate::server::empty_app(), journal_path)?
+            (None, None, 0u64, [0u8; 32])
         };
-        let next = engine.next_sequence();
-        let last = next.saturating_sub(1);
-        let hash = engine.chain_hash().unwrap_or([0u8; 32]);
-        let (mut e, w) = engine.into_parts();
-        crate::server::apply_max_orders(
-            &mut e,
-            max_orders_per_account,
-            max_orders_per_second,
-            max_orders_burst,
-        );
-        (Some(e), Some(w), last, hash)
-    } else {
-        (None, None, 0u64, [0u8; 32])
-    };
 
     let mut backoff = Duration::from_secs(1);
     const MAX_BACKOFF: Duration = Duration::from_secs(30);
@@ -205,8 +206,7 @@ pub fn run_receiver_rumcast(
                     let (snap_exchange, snap_seq, snap_hash) =
                         melin_transport_core::snapshot::load::<App>(&snapshot_path)?;
                     exchange = Some(snap_exchange);
-                    let writer =
-                        JournalWriter::create_continuing(journal_path, snap_seq + 1, snap_hash)?;
+                    let writer = W::create_continuing(journal_path, snap_seq + 1, snap_hash)?;
                     journal_writer = Some(writer);
                     last_sequence = snap_seq;
                     chain_hash = snap_hash;
@@ -215,7 +215,7 @@ pub fn run_receiver_rumcast(
 
                 // ---- Create journal for fresh replica (no snapshot, no prior journal) ----
                 if journal_writer.is_none() {
-                    let writer = melin_journal::create_fresh_replica::<_, JournalWriter>(
+                    let writer = melin_journal::create_fresh_replica::<_, W>(
                         journal_path,
                         &primary_genesis,
                     )?;
@@ -402,7 +402,7 @@ pub fn run_receiver_rumcast(
                     None => {
                         error!("pipeline thread panicked during disconnect recovery");
                         if journal_path.exists() {
-                            let engine = JournaledApp::<App, JournalWriter>::recover(
+                            let engine = JournaledApp::<App, W>::recover(
                                 crate::server::empty_app(),
                                 journal_path,
                             )?;

@@ -1081,6 +1081,19 @@ impl<E: AppEvent, W: JournalWrite<E>> JournalStage<E, W> {
     }
 }
 
+/// Trait abstracting the journal stage's `run` entry point so generic
+/// code (server boot, replica receivers) can drive the stage without
+/// knowing which concrete writer was picked. Each writer specialisation
+/// provides its own implementation: `BufferedWriter` always means
+/// `run_sync`; `SectorWriter` picks `run_uring` in production and
+/// `run_sync` under the `no-persist` feature.
+pub trait JournalStageRun<E: AppEvent>: Sized {
+    /// The concrete writer the stage owns and returns on clean shutdown.
+    type Writer: JournalWrite<E>;
+    /// Drive the journal stage to completion.
+    fn run(self, shutdown: &std::sync::atomic::AtomicBool) -> Result<Self::Writer, JournalError>;
+}
+
 /// Convenience wrapper on the buffered writer specialization. The
 /// buffered path has no overlapped variant, so `run` always means
 /// `run_sync`. Lets call sites that work generically over the writer
@@ -1089,6 +1102,17 @@ impl<E: AppEvent, W: JournalWrite<E>> JournalStage<E, W> {
 impl<E: AppEvent> JournalStage<E, melin_journal::BufferedWriter<E>> {
     #[inline]
     pub fn run(
+        self,
+        shutdown: &std::sync::atomic::AtomicBool,
+    ) -> Result<melin_journal::BufferedWriter<E>, JournalError> {
+        self.run_sync(shutdown)
+    }
+}
+
+impl<E: AppEvent> JournalStageRun<E> for JournalStage<E, melin_journal::BufferedWriter<E>> {
+    type Writer = melin_journal::BufferedWriter<E>;
+    #[inline]
+    fn run(
         self,
         shutdown: &std::sync::atomic::AtomicBool,
     ) -> Result<melin_journal::BufferedWriter<E>, JournalError> {
@@ -1107,6 +1131,24 @@ impl<E: AppEvent> JournalStage<E, melin_journal::SectorWriter<E>> {
     /// submit path).
     #[inline]
     pub fn run(
+        self,
+        shutdown: &std::sync::atomic::AtomicBool,
+    ) -> Result<melin_journal::SectorWriter<E>, JournalError> {
+        #[cfg(feature = "no-persist")]
+        {
+            self.run_sync(shutdown)
+        }
+        #[cfg(not(feature = "no-persist"))]
+        {
+            self.run_uring(shutdown)
+        }
+    }
+}
+
+impl<E: AppEvent> JournalStageRun<E> for JournalStage<E, melin_journal::SectorWriter<E>> {
+    type Writer = melin_journal::SectorWriter<E>;
+    #[inline]
+    fn run(
         self,
         shutdown: &std::sync::atomic::AtomicBool,
     ) -> Result<melin_journal::SectorWriter<E>, JournalError> {

@@ -190,7 +190,7 @@ only as a cleanup pass; doesn't fix the real smell.
   3.68M).
 - Standalone buffered ≥ 3.8M ord/s (current baseline: 3.85M).
 
-## Status — what landed in step 3
+## Status — what landed
 
 - ✅ `JournalWriter` enum deleted.
 - ✅ `JournalStage`, `Pipeline`, `ReplicaPipeline`, `JournaledApp`,
@@ -206,28 +206,16 @@ only as a cleanup pass; doesn't fix the real smell.
   type without knowing which one.
 - ✅ `create_fresh_replica` is now a free helper in
   `melin_journal::fresh_replica`, parameterised by the chosen writer.
-- ⚠️ The server boot path (`init_engine`, `run_as_primary`, all three
-  replica receivers, `rumcast_transport`, `replication-bench`, `melin-bench`)
-  is **monomorphised on `BufferedWriter`** as an intermediate
-  checkpoint. The `--journal-writer` CLI flag still parses correctly and
-  is logged, but `Sector` mode logs a warning and falls back to
-  `Buffered`. The sector path remains exercised by pipeline tests
-  (which construct `SectorWriter` directly).
-
-## Follow-up — wire boot-site dispatch
-
-The remaining work, scoped as a separate commit:
-
-1. Make `init_engine`, `run_as_primary`, `run_as_replica`, and the
-   rumcast/DPDK receiver entry points generic over `W`. Each is small
-   on its own; the volume is in the call sites.
-2. At `main`, match on `config.journal_writer` and call the entry
-   point twice (once per concrete writer). Two specialisations
-   monomorphise — the cost the doc anticipated.
-3. Drop the `pub type JournalWriter = BufferedWriter;` shim in
-   `melin-engine` / `melin-server`.
-
-The boot dispatch is intentionally split off because it is mechanical
-volume against the typing system that landed in this step — gating it
-on a follow-up keeps this commit's blast radius scoped to the type
-plumbing.
+- ✅ `JournalStageRun` trait lets generic boot code drive the stage
+  through `stage.run(&shutdown)` regardless of which writer was
+  selected; both specialisations implement it.
+- ✅ Server boot path now dispatches on `--journal-writer` at the
+  three public entry points (`run_with_shutdown`, `run_dpdk`,
+  `run_rumcast`). `init_engine`, `run_as_primary`, the rumcast
+  primary/replica helpers, and all three replica receivers
+  (`run_receiver`, `run_receiver_dpdk`, `run_receiver_rumcast`) are
+  generic over `W`. The `pub type JournalWriter = BufferedWriter;`
+  shims in both `melin-engine` and `melin-server` are gone.
+- ⚠️ `melin-bench` and `replication-bench` remain monomorphised on
+  `BufferedWriter` by design — both are standalone harnesses; their
+  `--journal-writer` flag is recorded for provenance only.

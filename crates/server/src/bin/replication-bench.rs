@@ -232,7 +232,7 @@ fn main() {
     let receiver_handle = std::thread::Builder::new()
         .name("bench-repl-receiver".into())
         .spawn(move || {
-            let _ = run_receiver(
+            let _ = run_receiver::<melin_journal::BufferedWriter<_>>(
                 bind_addr,
                 &replica_journal,
                 &replica_key,
@@ -249,7 +249,6 @@ fn main() {
                 10_000, // max_orders_per_account: bench uses default
                 0,      // max_orders_per_second: rate limit disabled in bench
                 0,      // max_orders_burst: rate limit disabled in bench
-                melin_journal::JournalWriterMode::default(), // bench uses default writer
             );
         })
         .expect("spawn run_receiver");

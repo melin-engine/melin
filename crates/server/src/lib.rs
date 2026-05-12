@@ -40,11 +40,6 @@ pub type OutputPayload = melin_transport_core::pipeline::OutputPayload<
 >;
 pub type SectorWriter = melin_journal::SectorWriter<melin_trading::trading_event::TradingEvent>;
 pub type BufferedWriter = melin_journal::BufferedWriter<melin_trading::trading_event::TradingEvent>;
-/// Writer concretely instantiated by the server boot path. The
-/// `--journal-writer` CLI flag is parsed and logged but the boot path
-/// itself is currently monomorphised on `BufferedWriter` — the
-/// follow-up commit makes it dispatch.
-pub type JournalWriter = BufferedWriter;
 pub type JournalReader = melin_journal::JournalReader<melin_trading::trading_event::TradingEvent>;
 
 /// Control plane event the accept loop and response stage exchange.

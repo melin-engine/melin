@@ -24,11 +24,6 @@ pub type JournalEntry = melin_journal::JournalEntry<crate::trading_event::Tradin
 pub type JournalReader = melin_journal::JournalReader<crate::trading_event::TradingEvent>;
 pub type SectorWriter = melin_journal::SectorWriter<crate::trading_event::TradingEvent>;
 pub type BufferedWriter = melin_journal::BufferedWriter<crate::trading_event::TradingEvent>;
-/// Production-default writer alias used by server boot. The
-/// `--journal-writer` CLI flag is parsed and logged but the boot path
-/// is currently monomorphised on `BufferedWriter`; a follow-up commit
-/// will make it dispatch on the flag.
-pub type JournalWriter = BufferedWriter;
 pub use melin_journal::{JournalWriterMode, create_fresh_replica};
 
 /// Trading-bound aliases for the generic pipeline types (now living in

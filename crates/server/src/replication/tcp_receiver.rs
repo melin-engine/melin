@@ -740,12 +740,11 @@ enum SessionExit {
 ///
 /// Blocks until the connection drops or shutdown is signaled.
 /// Result of `run_receiver`: `None` = clean shutdown, `Some` = promotion
-/// triggered with the fully-replayed App and positioned SectorWriter.
-pub type ReceiverResult =
-    Result<Option<(crate::App, crate::JournalWriter)>, Box<dyn std::error::Error>>;
+/// triggered with the fully-replayed App and positioned writer.
+pub type ReceiverResult<W> = Result<Option<(crate::App, W)>, Box<dyn std::error::Error>>;
 
 #[allow(clippy::too_many_arguments)]
-pub fn run_receiver(
+pub fn run_receiver<W>(
     primary_addr: SocketAddr,
     journal_path: &std::path::Path,
     signing_key: &ed25519_dalek::SigningKey,
@@ -771,31 +770,30 @@ pub fn run_receiver(
     // primary and replicas must agree on rate + burst.
     max_orders_per_second: u32,
     max_orders_burst: u32,
-    // Selected journal writer — applied uniformly to the recover,
-    // snapshot-resume, and fresh-bootstrap paths.
-    journal_writer_mode: melin_journal::JournalWriterMode,
-) -> ReceiverResult {
+) -> ReceiverResult<W>
+where
+    W: melin_journal::JournalWrite<melin_trading::trading_event::TradingEvent> + Send + 'static,
+    melin_transport_core::pipeline::JournalStage<melin_trading::trading_event::TradingEvent, W>:
+        melin_transport_core::pipeline::JournalStageRun<
+                melin_trading::trading_event::TradingEvent,
+                Writer = W,
+            >,
+{
     use crate::App;
-    use crate::JournalWriter;
 
     // Recover local state from journal (if any). On first call this may
     // be (None, None) for a fresh replica. After a reconnect, the pipeline
     // shutdown returns the App + writer directly.
-    // Replica recovery: the boot path is monomorphised on
-    // `JournalWriter` (currently aliased to `BufferedWriter`). The
-    // operator-selected mode is logged but not yet wired through; a
-    // follow-up commit makes this dispatch.
-    let _ = journal_writer_mode;
     let (mut exchange, mut journal_writer, mut last_sequence, mut chain_hash) =
         if journal_path.exists() {
             let engine = if snapshot_path.exists() {
                 info!("recovering replica from snapshot + journal");
-                melin_transport_core::JournaledApp::<App, JournalWriter>::recover_from_snapshot(
+                melin_transport_core::JournaledApp::<App, W>::recover_from_snapshot(
                     &snapshot_path,
                     journal_path,
                 )?
             } else {
-                melin_transport_core::JournaledApp::<App, JournalWriter>::recover(
+                melin_transport_core::JournaledApp::<App, W>::recover(
                     crate::server::empty_app(),
                     journal_path,
                 )?
@@ -833,7 +831,7 @@ pub fn run_receiver(
     // None = no pipeline yet (first iteration, or just torn down for
     // snapshot transfer); Some = running pipeline with threads + atomics
     // we can read for the next reconnect handshake.
-    let mut pipeline: Option<ReplicaPipelineHandles> = None;
+    let mut pipeline: Option<ReplicaPipelineHandles<W>> = None;
 
     // --- Outer reconnect loop ---
     //
@@ -1074,8 +1072,7 @@ pub fn run_receiver(
                 }
                 exchange = Some(snap_exchange);
 
-                let writer =
-                    JournalWriter::create_continuing(journal_path, snap_seq + 1, snap_hash)?;
+                let writer = W::create_continuing(journal_path, snap_seq + 1, snap_hash)?;
                 journal_writer = Some(writer);
 
                 let ss_frame = read_frame(&mut reader, MAX_CONTROL_FRAME)?;
@@ -1105,10 +1102,8 @@ pub fn run_receiver(
         // --- Create journal for fresh replica (first connection only) ---
 
         if journal_writer.is_none() {
-            let writer = melin_journal::create_fresh_replica::<_, JournalWriter>(
-                journal_path,
-                &primary_genesis_entry,
-            )?;
+            let writer =
+                melin_journal::create_fresh_replica::<_, W>(journal_path, &primary_genesis_entry)?;
             let mut fresh = crate::server::empty_app();
             crate::server::apply_max_orders(
                 &mut fresh,

@@ -271,12 +271,38 @@ pub fn run_rumcast(
     rumcast_config: RumcastConfig,
     shutdown: Arc<AtomicBool>,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    // Dispatch on the operator-selected journal writer at the public
+    // entry point. Each branch monomorphises the whole rumcast boot
+    // path on a concrete writer type.
+    match config.journal_writer {
+        melin_journal::JournalWriterMode::Buffered => {
+            run_rumcast_impl::<crate::BufferedWriter>(config, rumcast_config, shutdown)
+        }
+        melin_journal::JournalWriterMode::Sector => {
+            run_rumcast_impl::<crate::SectorWriter>(config, rumcast_config, shutdown)
+        }
+    }
+}
+
+fn run_rumcast_impl<W>(
+    config: ServerConfig,
+    rumcast_config: RumcastConfig,
+    shutdown: Arc<AtomicBool>,
+) -> Result<(), Box<dyn std::error::Error>>
+where
+    W: melin_journal::JournalWrite<melin_trading::trading_event::TradingEvent> + Send + 'static,
+    melin_transport_core::pipeline::JournalStage<melin_trading::trading_event::TradingEvent, W>:
+        melin_transport_core::pipeline::JournalStageRun<
+                melin_trading::trading_event::TradingEvent,
+                Writer = W,
+            >,
+{
     // One shared mode atomic per process — see the kernel-TCP
     // `run_with_shutdown` for the rationale (pre-staging the
     // post-promotion mode via admin `DURABILITY` before `PROMOTE`).
     let durability_mode_atomic = Arc::new(AtomicU8::new(config.durability_mode.as_u8()));
     if let Some(primary_addr) = config.replica_of {
-        return run_rumcast_replica(
+        return run_rumcast_replica::<W>(
             config,
             rumcast_config,
             primary_addr,
@@ -284,17 +310,25 @@ pub fn run_rumcast(
             durability_mode_atomic,
         );
     }
-    run_rumcast_primary(config, rumcast_config, shutdown, durability_mode_atomic)
+    run_rumcast_primary::<W>(config, rumcast_config, shutdown, durability_mode_atomic)
 }
 
 /// Primary path. With `--replication-bind` set, also spawns the
 /// rumcast replication sender on a separate UDP port.
-fn run_rumcast_primary(
+fn run_rumcast_primary<W>(
     config: ServerConfig,
     rumcast_config: RumcastConfig,
     shutdown: Arc<AtomicBool>,
     durability_mode_atomic: Arc<AtomicU8>,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> Result<(), Box<dyn std::error::Error>>
+where
+    W: melin_journal::JournalWrite<melin_trading::trading_event::TradingEvent> + Send + 'static,
+    melin_transport_core::pipeline::JournalStage<melin_trading::trading_event::TradingEvent, W>:
+        melin_transport_core::pipeline::JournalStageRun<
+                melin_trading::trading_event::TradingEvent,
+                Writer = W,
+            >,
+{
     info!(
         bind = %rumcast_config.bind,
         replication_bind = ?config.replication_bind,
@@ -330,7 +364,7 @@ fn run_rumcast_primary(
     }
 
     // ---- Engine pipeline ----
-    let (app, writer, needs_seeding) = init_engine(&config)?;
+    let (app, writer, needs_seeding) = init_engine::<W>(&config)?;
 
     // Spawn the admin listener once if configured. PROMOTE is rejected
     // on a primary (no flag wired); ROTATE shares the flag the journal
@@ -347,7 +381,7 @@ fn run_rumcast_primary(
         )
     });
 
-    run_rumcast_primary_with_state(
+    run_rumcast_primary_with_state::<W>(
         config,
         rumcast_config,
         shutdown,
@@ -367,13 +401,13 @@ fn run_rumcast_primary(
 /// promote, the replica calls into this with its already-replayed
 /// state rather than re-recovering from the journal.
 #[allow(clippy::too_many_arguments)]
-fn run_rumcast_primary_with_state(
+fn run_rumcast_primary_with_state<W>(
     config: ServerConfig,
     rumcast_config: RumcastConfig,
     shutdown: Arc<AtomicBool>,
     authorized_keys: Arc<AuthorizedKeys>,
     app: crate::App,
-    writer: crate::JournalWriter,
+    writer: W,
     needs_seeding: bool,
     // Pre-bound order-entry socket. The startup path binds before
     // `init_engine` so clients connecting during journal creation
@@ -389,7 +423,16 @@ fn run_rumcast_primary_with_state(
     // Shared durability mode atomic — see the kernel-TCP
     // `run_with_shutdown` for the design.
     durability_mode_atomic: Arc<AtomicU8>,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> Result<(), Box<dyn std::error::Error>>
+where
+    W: melin_journal::JournalWrite<melin_trading::trading_event::TradingEvent> + Send + 'static,
+    melin_transport_core::pipeline::JournalStage<melin_trading::trading_event::TradingEvent, W>:
+        melin_transport_core::pipeline::JournalStageRun<
+                melin_trading::trading_event::TradingEvent,
+                Writer = W,
+            >,
+{
+    use melin_transport_core::pipeline::JournalStageRun;
     let enable_replication = config.replication_bind.is_some();
     if enable_replication && config.standalone {
         return Err("--replication-bind and --standalone are mutually exclusive".into());
@@ -432,7 +475,7 @@ fn run_rumcast_primary_with_state(
     };
 
     let active_connections = Arc::new(AtomicU64::new(1));
-    let pipeline: Pipeline<crate::App, crate::JournalWriter> = build_pipeline_with_replication(
+    let pipeline: Pipeline<crate::App, W> = build_pipeline_with_replication(
         app,
         writer,
         Duration::from_micros(config.group_commit_us),
@@ -2129,13 +2172,21 @@ fn wall_clock_nanos() -> u64 {
 /// `--replica-of` is set. Connects to the primary via rumcast,
 /// authenticates via Ed25519 challenge-response, and runs the streaming
 /// receive loop. On promotion, transitions back into the primary path.
-fn run_rumcast_replica(
+fn run_rumcast_replica<W>(
     config: ServerConfig,
     rumcast_config: RumcastConfig,
     primary_addr: SocketAddr,
     shutdown: Arc<AtomicBool>,
     durability_mode_atomic: Arc<AtomicU8>,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> Result<(), Box<dyn std::error::Error>>
+where
+    W: melin_journal::JournalWrite<melin_trading::trading_event::TradingEvent> + Send + 'static,
+    melin_transport_core::pipeline::JournalStage<melin_trading::trading_event::TradingEvent, W>:
+        melin_transport_core::pipeline::JournalStageRun<
+                melin_trading::trading_event::TradingEvent,
+                Writer = W,
+            >,
+{
     info!(
         primary = %primary_addr,
         bind = %rumcast_config.bind,
@@ -2208,7 +2259,7 @@ fn run_rumcast_replica(
     // The replica's local UDP bind for rumcast. We reuse the `--bind`
     // flag (= `rumcast_config.bind`) — operators get one knob to
     // configure the replica's local UDP address rather than two.
-    match crate::replication::run_receiver_rumcast(
+    match crate::replication::run_receiver_rumcast::<W>(
         primary_addr,
         rumcast_config.bind,
         &config.journal,
@@ -2224,7 +2275,6 @@ fn run_rumcast_replica(
         config.max_orders_per_second,
         config.max_orders_burst,
         config.replication_pipeline_depth,
-        config.journal_writer,
     )? {
         None => Ok(()), // clean shutdown
         Some((mut exchange, writer)) => {
@@ -2234,7 +2284,7 @@ fn run_rumcast_replica(
             // `run_with_shutdown` → `run_as_primary` handoff.
             info!("rumcast replica promoted — transitioning to primary");
             <crate::App as melin_app::Application>::prefault(&mut exchange);
-            run_rumcast_primary_with_state(
+            run_rumcast_primary_with_state::<W>(
                 config,
                 rumcast_config,
                 shutdown,

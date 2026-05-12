@@ -751,10 +751,10 @@ fn run_pipeline_bench(
 ) {
     use melin_engine::journal::InputSlot;
     use melin_engine::journal::JournalEvent;
-    use melin_engine::journal::JournalWriter;
     use melin_engine::journal::pipeline::build_pipeline_with_replication;
     use melin_engine::journal::trace::trace_ts;
     use melin_engine::journal::wall_clock_nanos;
+    type JournalWriter = melin_engine::journal::BufferedWriter;
 
     let nz = |v: u64| NonZeroU64::new(v).expect("non-zero");
 
@@ -771,14 +771,15 @@ fn run_pipeline_bench(
 
     let tmp_dir = tempdir();
     let effective_journal = journal_path.unwrap_or_else(|| tmp_dir.join("pipeline-bench.journal"));
-    // The static-dispatch refactor monomorphised the bench pipeline
-    // construction on `BufferedWriter` for the moment; the follow-up
-    // commit will dispatch on `journal_writer_mode`. Use the flag's
-    // value only for logging until then.
+    // melin-bench keeps its pipeline construction monomorphised on
+    // `BufferedWriter` — the bench is a standalone harness with its
+    // own knobs, and the production boot-time dispatch over the
+    // sector / buffered split lives in `melin-server`.
     if journal_writer_mode == melin_engine::journal::JournalWriterMode::Sector {
         eprintln!(
-            "warning: --journal-writer=sector is parsed but not yet wired \
-             into the bench pipeline; falling back to the buffered writer"
+            "warning: --journal-writer=sector is parsed but melin-bench \
+             always uses the buffered writer; the flag is recorded for \
+             provenance only"
         );
     }
     let writer = JournalWriter::create(&effective_journal).expect("create journal");
