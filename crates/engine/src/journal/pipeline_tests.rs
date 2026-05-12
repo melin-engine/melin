@@ -28,10 +28,13 @@ mod tests {
     use crate::exchange::Exchange;
     use crate::journal::replication::REPLICATION_RING_CAPACITY;
     use crate::journal::{
-        InputSlot, JournalEvent, JournalStage, JournalWriter, MatchingStage, OutputPayload,
-        OutputSlot,
+        BufferedWriter, InputSlot, JournalEvent, JournalStage, MatchingStage, OutputPayload,
+        OutputSlot, SectorWriter,
     };
-    use melin_journal::JournalWriterMode;
+    // Pipeline tests historically exercised the io_uring path under the
+    // sector writer. Keep them on that writer so the io_uring
+    // specialization stays covered.
+    type JournalWriter = SectorWriter;
     use crate::types::RejectReason;
     use crate::types::*;
 
@@ -78,7 +81,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("pipeline_journal.journal");
 
-        let writer = JournalWriter::create(JournalWriterMode::Sector, &path).unwrap();
+        let writer = JournalWriter::create(&path).unwrap();
 
         let (mut producer, mut consumers) = ring::DisruptorBuilder::<InputSlot>::new(64)
             .add_consumer()
@@ -174,7 +177,7 @@ mod tests {
 
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("checkpoint_boundary.journal");
-        let writer = JournalWriter::create(JournalWriterMode::Sector, &path).unwrap();
+        let writer = JournalWriter::create(&path).unwrap();
 
         // Ring capacity: power-of-two large enough to hold every event
         // without the publisher ever blocking on the consumer. This lets
@@ -285,13 +288,8 @@ mod tests {
             quote: CurrencyId(1),
         });
         primary_exchange.deposit(AccountId(1), CurrencyId(1), u64::MAX / 2);
-        let primary_writer = JournalWriter::create_continuing(
-            JournalWriterMode::Sector,
-            &primary_path,
-            1,
-            shared_genesis,
-        )
-        .unwrap();
+        let primary_writer =
+            JournalWriter::create_continuing(&primary_path, 1, shared_genesis).unwrap();
         let primary_active_conns = Arc::new(AtomicU64::new(0));
         let mut primary = build_pipeline_with_replication(
             primary_exchange,
@@ -314,13 +312,8 @@ mod tests {
             quote: CurrencyId(1),
         });
         replica_exchange.deposit(AccountId(1), CurrencyId(1), u64::MAX / 2);
-        let replica_writer = JournalWriter::create_continuing(
-            JournalWriterMode::Sector,
-            &replica_path,
-            1,
-            shared_genesis,
-        )
-        .unwrap();
+        let replica_writer =
+            JournalWriter::create_continuing(&replica_path, 1, shared_genesis).unwrap();
         let replica = build_replica_pipeline(
             replica_exchange,
             replica_writer,
@@ -527,7 +520,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("preseq.journal");
 
-        let writer = JournalWriter::create(JournalWriterMode::Sector, &path).unwrap();
+        let writer = JournalWriter::create(&path).unwrap();
 
         let (mut producer, mut consumers) = ring::DisruptorBuilder::<InputSlot>::new(64)
             .add_consumer()
@@ -618,7 +611,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("divergence.journal");
 
-        let writer = JournalWriter::create(JournalWriterMode::Sector, &path).unwrap();
+        let writer = JournalWriter::create(&path).unwrap();
 
         let (mut producer, mut consumers) = ring::DisruptorBuilder::<InputSlot>::new(64)
             .add_consumer()
@@ -779,7 +772,7 @@ mod tests {
         exchange.deposit(AccountId(1), CurrencyId(1), 1_000_000);
         exchange.deposit(AccountId(2), CurrencyId(0), 1_000);
 
-        let writer = JournalWriter::create(JournalWriterMode::Sector, &path).unwrap();
+        let writer = JournalWriter::create(&path).unwrap();
 
         let active_conns = Arc::new(AtomicU64::new(0));
         let mut out = build_pipeline_with_replication(
@@ -880,7 +873,7 @@ mod tests {
         exchange.deposit(AccountId(1), CurrencyId(1), 1_000_000);
         exchange.deposit(AccountId(2), CurrencyId(0), 1_000);
 
-        let writer = JournalWriter::create(JournalWriterMode::Sector, &path).unwrap();
+        let writer = JournalWriter::create(&path).unwrap();
 
         let active_conns = Arc::new(AtomicU64::new(0));
         let mut out = build_pipeline_with_replication(
@@ -1030,7 +1023,7 @@ mod tests {
         {
             let path = dir.path().join("standalone.journal");
             let exchange = Exchange::new();
-            let writer = JournalWriter::create(JournalWriterMode::Sector, &path).unwrap();
+            let writer = JournalWriter::create(&path).unwrap();
             let active_conns = Arc::new(AtomicU64::new(0));
 
             let out = build_pipeline_with_replication(
@@ -1053,7 +1046,7 @@ mod tests {
         {
             let path = dir.path().join("repl_enabled.journal");
             let exchange = Exchange::new();
-            let writer = JournalWriter::create(JournalWriterMode::Sector, &path).unwrap();
+            let writer = JournalWriter::create(&path).unwrap();
             let active_conns = Arc::new(AtomicU64::new(0));
 
             let out = build_pipeline_with_replication(
@@ -1381,7 +1374,7 @@ mod tests {
 
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("rotate_manual.journal");
-        let writer = JournalWriter::create(JournalWriterMode::Sector, &path).unwrap();
+        let writer = JournalWriter::create(&path).unwrap();
 
         let (mut producer, mut consumers) = ring::DisruptorBuilder::<InputSlot>::new(64)
             .add_consumer()
@@ -1476,8 +1469,7 @@ mod tests {
 
         // Recovery via the multi-segment walker should produce a single
         // exchange with deposits totalling 100 + 200 + 50 + 1000 = 1350.
-        let exchange =
-            crate::journal::JournaledExchange::recover(&path, JournalWriterMode::default()).unwrap();
+        let exchange = crate::journal::JournaledExchange::<BufferedWriter>::recover(&path).unwrap();
         let bal = exchange
             .exchange()
             .accounts()
@@ -1496,7 +1488,7 @@ mod tests {
 
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("rotate_size.journal");
-        let writer = JournalWriter::create(JournalWriterMode::Sector, &path).unwrap();
+        let writer = JournalWriter::create(&path).unwrap();
 
         let (mut producer, mut consumers) = ring::DisruptorBuilder::<InputSlot>::new(64)
             .add_consumer()
@@ -1569,7 +1561,7 @@ mod tests {
 
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("storm.journal");
-        let writer = JournalWriter::create(JournalWriterMode::Sector, &path).unwrap();
+        let writer = JournalWriter::create(&path).unwrap();
 
         let (mut producer, mut consumers) = ring::DisruptorBuilder::<InputSlot>::new(64)
             .add_consumer()
@@ -1680,7 +1672,7 @@ mod tests {
 
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("post_rot.journal");
-        let writer = JournalWriter::create(JournalWriterMode::Sector, &path).unwrap();
+        let writer = JournalWriter::create(&path).unwrap();
 
         let (mut producer, mut consumers) = ring::DisruptorBuilder::<InputSlot>::new(1024)
             .add_consumer()
@@ -1807,65 +1799,76 @@ mod tests {
 
     /// Cross-writer parity: the same input sequence published through
     /// the pipeline must produce the same on-disk app sequences and
-    /// event count under both [`JournalWriterMode::Sector`] and
-    /// [`JournalWriterMode::Buffered`]. Guards against either writer
-    /// silently dropping or reordering events when one is changed in
-    /// isolation. Bench numbers diverge (the two paths have different
-    /// throughput) but the journal contents must match.
+    /// event count under both writer specializations. Guards against
+    /// either writer silently dropping or reordering events when one
+    /// is changed in isolation. Bench numbers diverge (the two paths
+    /// have different throughput) but the journal contents must match.
     #[cfg(not(feature = "no-persist"))]
     #[test]
     fn pipeline_journal_contents_match_across_writer_modes() {
-        fn run(mode: JournalWriterMode) -> Vec<u64> {
-            let dir = tempfile::tempdir().unwrap();
-            let path = dir.path().join("parity.journal");
-            let writer = JournalWriter::create(mode, &path).unwrap();
+        // Helper macro: runs five deposits through a JournalStage of
+        // the requested writer type and collects the app sequences
+        // observed on read-back. Macro instead of a generic fn because
+        // each writer has its own `run` method (no common trait that
+        // doesn't drag in extra plumbing for one test).
+        macro_rules! run_for {
+            ($writer_ty:ty) => {{
+                let dir = tempfile::tempdir().unwrap();
+                let path = dir.path().join("parity.journal");
+                let writer = <$writer_ty>::create(&path).unwrap();
 
-            let (mut producer, mut consumers) = ring::DisruptorBuilder::<InputSlot>::new(64)
-                .add_consumer()
-                .build();
-            let consumer = consumers.pop().unwrap();
-            let stage =
-                JournalStage::new(writer, consumer, Duration::ZERO, MAX_JOURNAL_BATCH, false);
+                let (mut producer, mut consumers) = ring::DisruptorBuilder::<InputSlot>::new(64)
+                    .add_consumer()
+                    .build();
+                let consumer = consumers.pop().unwrap();
+                let stage = JournalStage::<$writer_ty>::new(
+                    writer,
+                    consumer,
+                    Duration::ZERO,
+                    MAX_JOURNAL_BATCH,
+                    false,
+                );
 
-            let shutdown = Arc::new(AtomicBool::new(false));
-            let shutdown2 = Arc::clone(&shutdown);
+                let shutdown = Arc::new(AtomicBool::new(false));
+                let shutdown2 = Arc::clone(&shutdown);
 
-            // Five deposits: smallest scenario that exercises sequence
-            // allocation, batching, and the persist-before-ack path.
-            for amount in [10u64, 20, 30, 40, 50] {
-                producer.publish(InputSlot {
-                    connection_id: 1,
-                    key_hash: 0,
-                    request_seq: 0,
-                    sequence: 0,
-                    timestamp_ns: 1_000_000_000 + amount,
-                    event: JournalEvent::App(crate::trading_event::TradingEvent::Deposit {
-                        account: AccountId(1),
-                        currency: CurrencyId(1),
-                        amount,
-                    }),
-                    publish_ts: trace_ts(),
-                    recv_ts: trace_ts(),
-                });
-            }
-
-            let handle = std::thread::spawn(move || stage.run(&shutdown2));
-            std::thread::sleep(std::time::Duration::from_millis(100));
-            shutdown.store(true, Ordering::Relaxed);
-            let _writer = handle.join().unwrap();
-
-            let mut reader = crate::journal::JournalReader::open(&path).unwrap();
-            let mut seqs = Vec::new();
-            while let Some(entry) = reader.next_entry().unwrap() {
-                if let JournalEvent::App(_) = entry.event {
-                    seqs.push(entry.sequence);
+                // Five deposits: smallest scenario that exercises sequence
+                // allocation, batching, and the persist-before-ack path.
+                for amount in [10u64, 20, 30, 40, 50] {
+                    producer.publish(InputSlot {
+                        connection_id: 1,
+                        key_hash: 0,
+                        request_seq: 0,
+                        sequence: 0,
+                        timestamp_ns: 1_000_000_000 + amount,
+                        event: JournalEvent::App(crate::trading_event::TradingEvent::Deposit {
+                            account: AccountId(1),
+                            currency: CurrencyId(1),
+                            amount,
+                        }),
+                        publish_ts: trace_ts(),
+                        recv_ts: trace_ts(),
+                    });
                 }
-            }
-            seqs
+
+                let handle = std::thread::spawn(move || stage.run(&shutdown2));
+                std::thread::sleep(std::time::Duration::from_millis(100));
+                shutdown.store(true, Ordering::Relaxed);
+                let _writer = handle.join().unwrap();
+
+                let mut reader = crate::journal::JournalReader::open(&path).unwrap();
+                let mut seqs = Vec::new();
+                while let Some(entry) = reader.next_entry().unwrap() {
+                    if let JournalEvent::App(_) = entry.event {
+                        seqs.push(entry.sequence);
+                    }
+                }
+                seqs
+            }};
         }
 
-        let sector = run(JournalWriterMode::Sector);
-        let buffered = run(JournalWriterMode::Buffered);
+        let sector = run_for!(SectorWriter);
+        let buffered = run_for!(BufferedWriter);
         assert_eq!(
             sector, buffered,
             "writer modes diverged on app-event sequences"

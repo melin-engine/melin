@@ -20,9 +20,7 @@
 use std::path::Path;
 
 use melin_app::{Application, ApplyCtx};
-use melin_journal::{
-    JournalError, JournalEvent, JournalReader, JournalWrite, JournalWriter, JournalWriterMode,
-};
+use melin_journal::{JournalError, JournalEvent, JournalReader, JournalWrite};
 
 use crate::snapshot;
 
@@ -73,53 +71,42 @@ impl From<std::io::Error> for JournaledAppError {
 
 /// A journaled application: the matching engine (or any other
 /// `Application`) paired with a durable journal writer positioned at
-/// the next free sequence.
-pub struct JournaledApp<A: Application> {
+/// the next free sequence. Generic over `W` — the caller picks the
+/// concrete writer type (typically by dispatching on a runtime mode
+/// flag at the boot site) and threads it through.
+pub struct JournaledApp<A: Application, W: JournalWrite<A::Event>> {
     app: A,
-    writer: JournalWriter<A::Event>,
+    writer: W,
 }
 
-impl<A: Application> JournaledApp<A> {
+impl<A: Application, W: JournalWrite<A::Event>> JournaledApp<A, W> {
     /// Create a new journaled app with a fresh journal file. The caller
     /// supplies the app so production builds can pick an appropriately
     /// pre-sized constructor (e.g. `Exchange::with_capacity()`) rather
-    /// than relying on `Default`. `mode` selects the writer
-    /// implementation — pass `JournalWriterMode::default()` from tests
-    /// when the choice doesn't matter.
-    pub fn create(
-        app: A,
-        journal_path: &Path,
-        mode: JournalWriterMode,
-    ) -> Result<Self, JournaledAppError> {
-        let writer = JournalWriter::<A::Event>::create(mode, journal_path)?;
+    /// than relying on `Default`.
+    pub fn create(app: A, journal_path: &Path) -> Result<Self, JournaledAppError> {
+        let writer = W::create(journal_path)?;
         Ok(Self { app, writer })
     }
 
     /// Recover from an existing journal. Replays every archived segment
     /// in monotonic order, then the live segment, into the caller-
-    /// supplied empty app, then reopens the writer for appending under
-    /// `mode`.
-    pub fn recover(
-        app: A,
-        journal_path: &Path,
-        mode: JournalWriterMode,
-    ) -> Result<Self, JournaledAppError> {
-        Self::recover_inner(app, journal_path, None, mode)
+    /// supplied empty app, then reopens the writer for appending.
+    pub fn recover(app: A, journal_path: &Path) -> Result<Self, JournaledAppError> {
+        Self::recover_inner(app, journal_path, None)
     }
 
     /// Recover from a snapshot plus a journal directory.
     ///
     /// Loads the snapshot to restore state, then replays journal entries
     /// strictly after the snapshot's recorded sequence — across all
-    /// archived segments and the live segment. The reopened writer uses
-    /// `mode`.
+    /// archived segments and the live segment.
     pub fn recover_from_snapshot(
         snapshot_path: &Path,
         journal_path: &Path,
-        mode: JournalWriterMode,
     ) -> Result<Self, JournaledAppError> {
         let (app, snap_sequence, snap_chain_hash) = snapshot::load::<A>(snapshot_path)?;
-        Self::recover_inner(app, journal_path, Some((snap_sequence, snap_chain_hash)), mode)
+        Self::recover_inner(app, journal_path, Some((snap_sequence, snap_chain_hash)))
     }
 
     /// Shared multi-segment recovery driver.
@@ -139,7 +126,6 @@ impl<A: Application> JournaledApp<A> {
         mut app: A,
         journal_path: &Path,
         snapshot: Option<(u64, [u8; 32])>,
-        mode: JournalWriterMode,
     ) -> Result<Self, JournaledAppError> {
         let archives = melin_journal::segment::list_archives(journal_path)?;
 
@@ -207,12 +193,7 @@ impl<A: Application> JournaledApp<A> {
                 .into());
             }
             let genesis = prev_tail_hash.unwrap_or([0u8; 32]);
-            let writer = JournalWriter::<A::Event>::create_continuing(
-                mode,
-                journal_path,
-                last_seq_seen + 1,
-                genesis,
-            )?;
+            let writer = W::create_continuing(journal_path, last_seq_seen + 1, genesis)?;
             return Ok(Self { app, writer });
         }
 
@@ -234,8 +215,7 @@ impl<A: Application> JournaledApp<A> {
         let valid_end = reader.valid_file_end();
         let chain_hash = reader.chain_hash();
         let events_since_checkpoint = reader.events_since_checkpoint();
-        let writer = JournalWriter::<A::Event>::open_append(
-            mode,
+        let writer = W::open_append(
             journal_path,
             last_seq,
             valid_end,
@@ -299,12 +279,12 @@ impl<A: Application> JournaledApp<A> {
 
     /// Construct from pre-built parts. Used by the server's
     /// "snapshot-only" recovery path (journal missing post-rotation).
-    pub fn from_parts(app: A, writer: JournalWriter<A::Event>) -> Self {
+    pub fn from_parts(app: A, writer: W) -> Self {
         Self { app, writer }
     }
 
     /// Decompose into parts for the pipeline architecture.
-    pub fn into_parts(self) -> (A, JournalWriter<A::Event>) {
+    pub fn into_parts(self) -> (A, W) {
         (self.app, self.writer)
     }
 }
@@ -455,17 +435,17 @@ fn verify_segment_boundary(
 mod tests {
     use super::*;
     use crate::test_support::{TestApp, TestEvent};
-    use melin_journal::JournalEvent;
+    use melin_journal::{BufferedWriter, JournalEvent};
+
+    // Concrete writer used by every test. The buffered path covers
+    // the same JournaledApp logic without needing PLP hardware.
+    type TestApp_ = JournaledApp<TestApp, BufferedWriter<TestEvent>>;
 
     /// Write events with auto-allocated sequences and fsync them to disk.
     /// Each event is keyed on `(key_hash = 1, request_seq = first_seq + idx)`
     /// so tests that append in multiple phases can offset `first_seq` to
     /// avoid dedup collisions across calls.
-    fn append_events(
-        ja: JournaledApp<TestApp>,
-        events: &[TestEvent],
-        first_seq: u64,
-    ) -> JournaledApp<TestApp> {
+    fn append_events(ja: TestApp_, events: &[TestEvent], first_seq: u64) -> TestApp_ {
         let (app, mut writer) = ja.into_parts();
         for (i, e) in events.iter().enumerate() {
             let seq = writer.allocate_sequence();
@@ -513,7 +493,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("journal.bin");
 
-        let ja = JournaledApp::create(TestApp::new(), &path, JournalWriterMode::default()).unwrap();
+        let ja = TestApp_::create(TestApp::new(), &path).unwrap();
         // Sequences start at 1: seq=0 is the InputSlot "not yet allocated"
         // sentinel the journal stage branches on (see pipeline.rs:488).
         // With `hash-chain`, `create` writes a GenesisHash entry first,
@@ -522,7 +502,7 @@ mod tests {
         assert_eq!(ja.next_sequence(), 1 + genesis_overhead);
         drop(ja);
 
-        let recovered = JournaledApp::recover(TestApp::new(), &path, JournalWriterMode::default()).unwrap();
+        let recovered = TestApp_::recover(TestApp::new(), &path).unwrap();
         assert_eq!(*recovered.app(), TestApp::new());
     }
 
@@ -532,11 +512,11 @@ mod tests {
         let path = dir.path().join("journal.bin");
 
         let events = [TestEvent::Add(3), TestEvent::Add(7), TestEvent::Add(100)];
-        let ja = JournaledApp::create(TestApp::new(), &path, JournalWriterMode::default()).unwrap();
+        let ja = TestApp_::create(TestApp::new(), &path).unwrap();
         let ja = append_events(ja, &events, 1);
         drop(ja);
 
-        let recovered = JournaledApp::recover(TestApp::new(), &path, JournalWriterMode::default()).unwrap();
+        let recovered = TestApp_::recover(TestApp::new(), &path).unwrap();
         assert_eq!(*recovered.app(), expected_state(&events, 1));
     }
 
@@ -547,9 +527,9 @@ mod tests {
         let snap_path = dir.path().join("snap");
 
         let events = [TestEvent::Add(10), TestEvent::Add(20)];
-        let ja = JournaledApp::create(TestApp::new(), &journal_path, JournalWriterMode::default()).unwrap();
+        let ja = TestApp_::create(TestApp::new(), &journal_path).unwrap();
         drop(append_events(ja, &events, 1)); // journal write, writer drops
-        let ja = JournaledApp::recover(TestApp::new(), &journal_path, JournalWriterMode::default()).unwrap();
+        let ja = TestApp_::recover(TestApp::new(), &journal_path).unwrap();
         ja.save_snapshot(&snap_path).unwrap();
 
         let (restored, seq, _chain) = snapshot::load::<TestApp>(&snap_path).unwrap();
@@ -571,10 +551,10 @@ mod tests {
         let post = [TestEvent::Add(40), TestEvent::Add(50)];
 
         // Phase 1: create + pre events (request_seqs 1..=2) + snapshot.
-        let ja = JournaledApp::create(TestApp::new(), &journal_path, JournalWriterMode::default()).unwrap();
+        let ja = TestApp_::create(TestApp::new(), &journal_path).unwrap();
         let ja = append_events(ja, &pre, 1);
         drop(ja);
-        let ja = JournaledApp::recover(TestApp::new(), &journal_path, JournalWriterMode::default()).unwrap();
+        let ja = TestApp_::recover(TestApp::new(), &journal_path).unwrap();
         ja.save_snapshot(&snap_path).unwrap();
 
         // Phase 2: append post events (request_seqs 3..=4 — disjoint from
@@ -585,8 +565,7 @@ mod tests {
         // Phase 3: recover_from_snapshot should load the snapshot (state
         // after `pre`) and replay only the entries strictly after the
         // snapshot's sequence (i.e. `post`).
-        let recovered =
-            JournaledApp::<TestApp>::recover_from_snapshot(&snap_path, &journal_path, JournalWriterMode::default()).unwrap();
+        let recovered = TestApp_::recover_from_snapshot(&snap_path, &journal_path).unwrap();
 
         let all: Vec<TestEvent> = pre.iter().chain(post.iter()).copied().collect();
         assert_eq!(recovered.app().total, expected_state(&all, 1).total);
@@ -602,7 +581,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("journal.bin");
 
-        let ja = JournaledApp::create(TestApp::new(), &path, JournalWriterMode::default()).unwrap();
+        let ja = TestApp_::create(TestApp::new(), &path).unwrap();
         let (_app, mut writer) = ja.into_parts();
 
         let dup = JournalEvent::App(TestEvent::Add(100));
@@ -617,7 +596,7 @@ mod tests {
         writer.flush_batch_sync().unwrap();
         drop(writer);
 
-        let recovered = JournaledApp::recover(TestApp::new(), &path, JournalWriterMode::default()).unwrap();
+        let recovered = TestApp_::recover(TestApp::new(), &path).unwrap();
         // First Add(100) applied; second is a duplicate and must be
         // skipped — total stays at 100, not 200.
         assert_eq!(recovered.app().total, 100);
@@ -640,7 +619,7 @@ mod tests {
         let snap_path = dir.path().join("snap");
 
         let events = [TestEvent::Add(11), TestEvent::Add(22)];
-        let ja = JournaledApp::create(TestApp::new(), &journal_path, JournalWriterMode::default()).unwrap();
+        let ja = TestApp_::create(TestApp::new(), &journal_path).unwrap();
         let mut ja = append_events(ja, &events, 1);
         let pre_rotate_next_seq = ja.next_sequence();
         let pre_rotate_state = TestApp {
@@ -668,8 +647,7 @@ mod tests {
         // replay). recover_from_snapshot composes snapshot + (empty)
         // delta = pre_rotate_state.
         drop(ja);
-        let recovered =
-            JournaledApp::<TestApp>::recover_from_snapshot(&snap_path, &journal_path, JournalWriterMode::default()).unwrap();
+        let recovered = TestApp_::recover_from_snapshot(&snap_path, &journal_path).unwrap();
         assert_eq!(*recovered.app(), pre_rotate_state);
     }
 
@@ -692,7 +670,7 @@ mod tests {
         let phase_c = [TestEvent::Add(100), TestEvent::Add(200)];
         let phase_d = [TestEvent::Add(1000)];
 
-        let ja = JournaledApp::create(TestApp::new(), &journal_path, JournalWriterMode::default()).unwrap();
+        let ja = TestApp_::create(TestApp::new(), &journal_path).unwrap();
         let mut ja = append_events(ja, &phase_a, 1);
         ja.rotate(&snap_path).unwrap();
         let mut ja = append_events(ja, &phase_b, 1 + phase_a.len() as u64);
@@ -713,7 +691,7 @@ mod tests {
         }
         assert!(journal_path.exists(), "live journal should exist");
 
-        let recovered = JournaledApp::<TestApp>::recover(TestApp::new(), &journal_path, JournalWriterMode::default()).unwrap();
+        let recovered = TestApp_::recover(TestApp::new(), &journal_path).unwrap();
         let total_events = phase_a.len() + phase_b.len() + phase_c.len() + phase_d.len();
         assert_eq!(recovered.app().total, 1 + 2 + 10 + 20 + 100 + 200 + 1000);
         // HWM is per (key_hash=1, request_seq) and append_events uses
@@ -740,7 +718,7 @@ mod tests {
         let phase_b = [TestEvent::Add(10), TestEvent::Add(20)];
         let phase_c = [TestEvent::Add(100), TestEvent::Add(200)];
 
-        let ja = JournaledApp::create(TestApp::new(), &journal_path, JournalWriterMode::default()).unwrap();
+        let ja = TestApp_::create(TestApp::new(), &journal_path).unwrap();
         let mut ja = append_events(ja, &phase_a, 1);
         ja.rotate(&snap_path).unwrap();
         let mut ja = append_events(ja, &phase_b, 1 + phase_a.len() as u64);
@@ -749,7 +727,7 @@ mod tests {
         drop(ja);
 
         // Replay everything to populate the app, then snapshot it.
-        let recovered = JournaledApp::<TestApp>::recover(TestApp::new(), &journal_path, JournalWriterMode::default()).unwrap();
+        let recovered = TestApp_::recover(TestApp::new(), &journal_path).unwrap();
         let expected = TestApp {
             total: recovered.app().total,
             ticks: recovered.app().ticks,
@@ -763,8 +741,7 @@ mod tests {
         // past every event in every archive and the live segment, so
         // all replays should be skipped — the resulting app must match
         // the snapshotted app exactly.
-        let re =
-            JournaledApp::<TestApp>::recover_from_snapshot(&final_snap, &journal_path, JournalWriterMode::default()).unwrap();
+        let re = TestApp_::recover_from_snapshot(&final_snap, &journal_path).unwrap();
         assert_eq!(*re.app(), expected);
     }
 
@@ -784,7 +761,7 @@ mod tests {
         let phase_a = [TestEvent::Add(1)];
         let phase_b = [TestEvent::Add(2)];
 
-        let ja = JournaledApp::create(TestApp::new(), &journal_path, JournalWriterMode::default()).unwrap();
+        let ja = TestApp_::create(TestApp::new(), &journal_path).unwrap();
         let mut ja = append_events(ja, &phase_a, 1);
         ja.rotate(&snap_path).unwrap(); // → archive 000001 sealed
         let ja = append_events(ja, &phase_b, 1 + phase_a.len() as u64);
@@ -824,7 +801,7 @@ mod tests {
         // check. The *absence* of any error would mean a tampered
         // archive replays silently, which is the regression this test
         // guards against.
-        let result = JournaledApp::<TestApp>::recover(TestApp::new(), &journal_path, JournalWriterMode::default());
+        let result = TestApp_::recover(TestApp::new(), &journal_path);
         let err = match result {
             Err(e) => e,
             Ok(_) => panic!("expected recovery to detect tampered archive, but it succeeded"),
@@ -861,7 +838,7 @@ mod tests {
                 _ => 0,
             })
             .sum();
-        let ja = JournaledApp::create(TestApp::new(), &journal_path, JournalWriterMode::default()).unwrap();
+        let ja = TestApp_::create(TestApp::new(), &journal_path).unwrap();
         let ja = append_events(ja, &events, 1);
         let pre_crash_seq = ja.next_sequence();
         // Drop the writer (closes the fd) before the rename so this is
@@ -879,7 +856,7 @@ mod tests {
         // app (test fixture limitation), so the only path that can
         // produce a populated app is the recovery replay — which is
         // exactly what this test validates.
-        let recovered = JournaledApp::<TestApp>::recover(TestApp::new(), &journal_path, JournalWriterMode::default()).unwrap();
+        let recovered = TestApp_::recover(TestApp::new(), &journal_path).unwrap();
         assert_eq!(
             recovered.app().total,
             expected_total,
@@ -899,7 +876,7 @@ mod tests {
         let post = [TestEvent::Add(100)];
         let ja = append_events(recovered, &post, 1 + events.len() as u64);
         drop(ja);
-        let re = JournaledApp::<TestApp>::recover(TestApp::new(), &journal_path, JournalWriterMode::default()).unwrap();
+        let re = TestApp_::recover(TestApp::new(), &journal_path).unwrap();
         assert_eq!(re.app().total, expected_total + 100);
     }
 
@@ -912,7 +889,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let journal_path = dir.path().join("journal.bin");
         // Path doesn't exist, no archives.
-        let result = JournaledApp::<TestApp>::recover(TestApp::new(), &journal_path, JournalWriterMode::default());
+        let result = TestApp_::recover(TestApp::new(), &journal_path);
         assert!(result.is_err(), "expected error, got Ok");
     }
 
@@ -938,7 +915,7 @@ mod tests {
         // Append events and run a full rotation, then drop without
         // writing anything else — Phase C state is "rotation finished,
         // no fresh events yet."
-        let ja = JournaledApp::create(TestApp::new(), &journal_path, JournalWriterMode::default()).unwrap();
+        let ja = TestApp_::create(TestApp::new(), &journal_path).unwrap();
         let ja = append_events(ja, &events, 1);
         let (app, mut writer) = ja.into_parts();
         writer.rotate_segment().unwrap();
@@ -950,7 +927,7 @@ mod tests {
         assert!(archive.exists(), "archive must exist post-rotation");
         assert!(journal_path.exists(), "live must exist post-rotation");
 
-        let recovered = JournaledApp::<TestApp>::recover(TestApp::new(), &journal_path, JournalWriterMode::default()).unwrap();
+        let recovered = TestApp_::recover(TestApp::new(), &journal_path).unwrap();
         assert_eq!(recovered.app().total, expected);
     }
 
@@ -974,7 +951,7 @@ mod tests {
             })
             .sum();
 
-        let ja = JournaledApp::create(TestApp::new(), &journal_path, JournalWriterMode::default()).unwrap();
+        let ja = TestApp_::create(TestApp::new(), &journal_path).unwrap();
         let ja = append_events(ja, &archived_events, 1);
         let (app, mut writer) = ja.into_parts();
         writer.rotate_segment().unwrap();
@@ -995,7 +972,7 @@ mod tests {
         drop(writer);
         drop(app);
 
-        let recovered = JournaledApp::<TestApp>::recover(TestApp::new(), &journal_path, JournalWriterMode::default()).unwrap();
+        let recovered = TestApp_::recover(TestApp::new(), &journal_path).unwrap();
         // The 99_999 event was never durable; only the archived ones
         // count toward the recovered total.
         assert_eq!(recovered.app().total, expected_durable);

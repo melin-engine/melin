@@ -74,6 +74,7 @@ use std::time::{Duration, Instant};
 use tracing::{debug, error, info, warn};
 use x25519_dalek::{PublicKey as X25519Public, StaticSecret as X25519Secret};
 
+#[allow(unused_imports)] // used by some feature combinations only
 use melin_journal::JournalWrite;
 use melin_protocol::auth::{AuthorizedKeys, Permission};
 use melin_protocol::codec;
@@ -431,7 +432,7 @@ fn run_rumcast_primary_with_state(
     };
 
     let active_connections = Arc::new(AtomicU64::new(1));
-    let pipeline: Pipeline<crate::App> = build_pipeline_with_replication(
+    let pipeline: Pipeline<crate::App, crate::JournalWriter> = build_pipeline_with_replication(
         app,
         writer,
         Duration::from_micros(config.group_commit_us),

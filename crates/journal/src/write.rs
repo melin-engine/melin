@@ -1,15 +1,15 @@
 //! Shared trait implemented by both concrete journal writers
 //! ([`SectorWriter`] and [`BufferedWriter`]).
 //!
-//! Step 1 of the static-dispatch refactor documented in
-//! `docs/internal/journal-writer-refactor.md`: introduce the trait
-//! without changing how callers obtain a writer. The `JournalWriter`
-//! enum stays in place for the moment; subsequent steps make
-//! `JournalStage` generic over this trait and delete the enum.
+//! The trait is what `JournalStage`, `Pipeline`, `JournaledApp`, and
+//! `JournaledExchange` are generic over. Each call site picks a
+//! concrete writer at construction time, so the trait is statically
+//! dispatched — no runtime `match` on a writer variant.
 //!
 //! The trait is intentionally **not** dyn-compatible-by-design: it has
-//! no consumers that need `Box<dyn JournalWrite>`. Keep it that way —
-//! the whole point of the refactor is monomorphisation.
+//! no consumers that need `Box<dyn JournalWrite>` and several methods
+//! return `Self`. Keep it that way — the whole point of the refactor
+//! is monomorphisation.
 //!
 //! [`SectorWriter`]: crate::sector_writer::SectorWriter
 //! [`BufferedWriter`]: crate::buffered_writer::BufferedWriter
@@ -29,7 +29,33 @@ use crate::sector_writer::{SectorWriter, wall_clock_nanos};
 /// `append`/`batch_append` convenience wrappers used only by tests
 /// and benches) — those stay as inherent methods on the concrete
 /// types.
-pub trait JournalWrite<E: AppEvent> {
+pub trait JournalWrite<E: AppEvent>: Sized {
+    // ---- constructors ----
+    //
+    // Trait-level constructors let generic code (e.g. `JournaledApp`)
+    // build a writer of any concrete type without knowing which one.
+    // Each implementor forwards to its inherent constructor.
+
+    /// Create a fresh journal at `path`.
+    fn create(path: &Path) -> Result<Self, JournalError>;
+
+    /// Create a fresh journal that continues a previous segment's
+    /// sequence numbers, anchored to `genesis_hash`.
+    fn create_continuing(
+        path: &Path,
+        starting_sequence: u64,
+        genesis_hash: [u8; 32],
+    ) -> Result<Self, JournalError>;
+
+    /// Open an existing journal for appending after recovery.
+    fn open_append(
+        path: &Path,
+        last_seq: u64,
+        valid_end: u64,
+        chain_hash: Option<[u8; 32]>,
+        events_since_checkpoint: u64,
+    ) -> Result<Self, JournalError>;
+
     // ---- hot-path write API ----
 
     /// Allocate and return the next sequence number, advancing the
@@ -135,6 +161,37 @@ pub trait JournalWrite<E: AppEvent> {
 
 impl<E: AppEvent> JournalWrite<E> for SectorWriter<E> {
     #[inline]
+    fn create(path: &Path) -> Result<Self, JournalError> {
+        SectorWriter::create(path)
+    }
+
+    #[inline]
+    fn create_continuing(
+        path: &Path,
+        starting_sequence: u64,
+        genesis_hash: [u8; 32],
+    ) -> Result<Self, JournalError> {
+        SectorWriter::create_continuing(path, starting_sequence, genesis_hash)
+    }
+
+    #[inline]
+    fn open_append(
+        path: &Path,
+        last_seq: u64,
+        valid_end: u64,
+        chain_hash: Option<[u8; 32]>,
+        events_since_checkpoint: u64,
+    ) -> Result<Self, JournalError> {
+        SectorWriter::open_append(
+            path,
+            last_seq,
+            valid_end,
+            chain_hash,
+            events_since_checkpoint,
+        )
+    }
+
+    #[inline]
     fn allocate_sequence(&mut self) -> u64 {
         SectorWriter::allocate_sequence(self)
     }
@@ -223,6 +280,37 @@ impl<E: AppEvent> JournalWrite<E> for SectorWriter<E> {
 }
 
 impl<E: AppEvent> JournalWrite<E> for BufferedWriter<E> {
+    #[inline]
+    fn create(path: &Path) -> Result<Self, JournalError> {
+        BufferedWriter::create(path)
+    }
+
+    #[inline]
+    fn create_continuing(
+        path: &Path,
+        starting_sequence: u64,
+        genesis_hash: [u8; 32],
+    ) -> Result<Self, JournalError> {
+        BufferedWriter::create_continuing(path, starting_sequence, genesis_hash)
+    }
+
+    #[inline]
+    fn open_append(
+        path: &Path,
+        last_seq: u64,
+        valid_end: u64,
+        chain_hash: Option<[u8; 32]>,
+        events_since_checkpoint: u64,
+    ) -> Result<Self, JournalError> {
+        BufferedWriter::open_append(
+            path,
+            last_seq,
+            valid_end,
+            chain_hash,
+            events_since_checkpoint,
+        )
+    }
+
     #[inline]
     fn allocate_sequence(&mut self) -> u64 {
         BufferedWriter::allocate_sequence(self)

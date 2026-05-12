@@ -26,6 +26,7 @@ use base64::Engine as _;
 use clap::Parser;
 use ed25519_dalek::SigningKey;
 
+#[allow(unused_imports)] // used by some feature combinations only
 use melin_journal::JournalWrite;
 use melin_journal::trace::trace_ts;
 use melin_journal::wall_clock_nanos;
@@ -93,10 +94,12 @@ fn main() {
     let replica_snapshot: PathBuf = tmp_root.join("replica.snapshot");
 
     // --- Build primary pipeline ---
-    let engine = JournaledApp::create(
+    // Bench runs the buffered writer end-to-end; the sector path is
+    // exercised separately in pipeline tests until the boot-site
+    // dispatch refactor lands.
+    let engine = JournaledApp::<melin_noop::NoopApp, melin_journal::BufferedWriter<_>>::create(
         melin_noop::NoopApp::new(),
         &primary_journal,
-        melin_journal::JournalWriterMode::default(),
     )
     .expect("create primary journal");
     let (exchange, writer) = engine.into_parts();

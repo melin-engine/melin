@@ -18,6 +18,7 @@ use std::time::{Duration, Instant};
 use ed25519_dalek::Signer;
 use tracing::{debug, error, info, warn};
 
+#[allow(unused_imports)] // used by some feature combinations only
 use melin_journal::JournalWrite;
 use melin_rumcast::pub_log::{ClaimError, PublicationConfig, PublicationLog};
 use melin_rumcast::receiver::{ReceiverConfig, ReceiverLoop};
@@ -105,36 +106,32 @@ pub fn run_receiver_rumcast(
     use melin_transport_core::JournaledApp;
 
     // ---- Recover local state from journal (if any) ----
-    let (mut exchange, mut journal_writer, mut last_sequence, mut chain_hash) =
-        if journal_path.exists() {
-            let engine = if snapshot_path.exists() {
-                info!("recovering replica from snapshot + journal");
-                JournaledApp::<App>::recover_from_snapshot(
-                    &snapshot_path,
-                    journal_path,
-                    journal_writer_mode,
-                )?
-            } else {
-                JournaledApp::<App>::recover(
-                    crate::server::empty_app(),
-                    journal_path,
-                    journal_writer_mode,
-                )?
-            };
-            let next = engine.next_sequence();
-            let last = next.saturating_sub(1);
-            let hash = engine.chain_hash().unwrap_or([0u8; 32]);
-            let (mut e, w) = engine.into_parts();
-            crate::server::apply_max_orders(
-                &mut e,
-                max_orders_per_account,
-                max_orders_per_second,
-                max_orders_burst,
-            );
-            (Some(e), Some(w), last, hash)
+    // Boot path monomorphised on `JournalWriter` (== `BufferedWriter`);
+    // dispatch on `journal_writer_mode` lands in a follow-up.
+    let _ = journal_writer_mode;
+    let (mut exchange, mut journal_writer, mut last_sequence, mut chain_hash) = if journal_path
+        .exists()
+    {
+        let engine = if snapshot_path.exists() {
+            info!("recovering replica from snapshot + journal");
+            JournaledApp::<App, JournalWriter>::recover_from_snapshot(&snapshot_path, journal_path)?
         } else {
-            (None, None, 0u64, [0u8; 32])
+            JournaledApp::<App, JournalWriter>::recover(crate::server::empty_app(), journal_path)?
         };
+        let next = engine.next_sequence();
+        let last = next.saturating_sub(1);
+        let hash = engine.chain_hash().unwrap_or([0u8; 32]);
+        let (mut e, w) = engine.into_parts();
+        crate::server::apply_max_orders(
+            &mut e,
+            max_orders_per_account,
+            max_orders_per_second,
+            max_orders_burst,
+        );
+        (Some(e), Some(w), last, hash)
+    } else {
+        (None, None, 0u64, [0u8; 32])
+    };
 
     let mut backoff = Duration::from_secs(1);
     const MAX_BACKOFF: Duration = Duration::from_secs(30);
@@ -208,12 +205,8 @@ pub fn run_receiver_rumcast(
                     let (snap_exchange, snap_seq, snap_hash) =
                         melin_transport_core::snapshot::load::<App>(&snapshot_path)?;
                     exchange = Some(snap_exchange);
-                    let writer = JournalWriter::create_continuing(
-                        journal_writer_mode,
-                        journal_path,
-                        snap_seq + 1,
-                        snap_hash,
-                    )?;
+                    let writer =
+                        JournalWriter::create_continuing(journal_path, snap_seq + 1, snap_hash)?;
                     journal_writer = Some(writer);
                     last_sequence = snap_seq;
                     chain_hash = snap_hash;
@@ -222,8 +215,7 @@ pub fn run_receiver_rumcast(
 
                 // ---- Create journal for fresh replica (no snapshot, no prior journal) ----
                 if journal_writer.is_none() {
-                    let writer = JournalWriter::create_fresh_replica(
-                        journal_writer_mode,
+                    let writer = melin_journal::create_fresh_replica::<_, JournalWriter>(
                         journal_path,
                         &primary_genesis,
                     )?;
@@ -410,10 +402,9 @@ pub fn run_receiver_rumcast(
                     None => {
                         error!("pipeline thread panicked during disconnect recovery");
                         if journal_path.exists() {
-                            let engine = JournaledApp::<App>::recover(
+                            let engine = JournaledApp::<App, JournalWriter>::recover(
                                 crate::server::empty_app(),
                                 journal_path,
-                                melin_journal::JournalWriterMode::default(),
                             )?;
                             last_sequence = engine.next_sequence().saturating_sub(1);
                             chain_hash = engine.chain_hash().unwrap_or([0u8; 32]);
@@ -1295,4 +1286,3 @@ fn generate_session_id() -> u32 {
     getrandom::fill(&mut bytes).expect("getrandom for session_id");
     u32::from_le_bytes(bytes)
 }
-

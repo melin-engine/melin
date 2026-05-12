@@ -189,3 +189,45 @@ only as a cleanup pass; doesn't fix the real smell.
 - `tcp-dual-repl throughput` ≥ 3.6M ord/s on Cherry rig (current baseline:
   3.68M).
 - Standalone buffered ≥ 3.8M ord/s (current baseline: 3.85M).
+
+## Status — what landed in step 3
+
+- ✅ `JournalWriter` enum deleted.
+- ✅ `JournalStage`, `Pipeline`, `ReplicaPipeline`, `JournaledApp`,
+  `JournaledExchange`, and the `build_*` factories are generic over
+  `W: JournalWrite<E>`.
+- ✅ `run_uring`, `enable_preparer`, and the fast-path
+  `maybe_rotate_with_prepared` live in a `SectorWriter`-specialised impl;
+  `run_sync` is on the generic impl. Each writer specialisation also
+  exposes a single-argument `run` so call sites that work generically
+  over the writer can stay terse.
+- ✅ Trait-level constructors (`W::create`, `W::create_continuing`,
+  `W::open_append`) let generic code build a writer of any concrete
+  type without knowing which one.
+- ✅ `create_fresh_replica` is now a free helper in
+  `melin_journal::fresh_replica`, parameterised by the chosen writer.
+- ⚠️ The server boot path (`init_engine`, `run_as_primary`, all three
+  replica receivers, `rumcast_transport`, `replication-bench`, `melin-bench`)
+  is **monomorphised on `BufferedWriter`** as an intermediate
+  checkpoint. The `--journal-writer` CLI flag still parses correctly and
+  is logged, but `Sector` mode logs a warning and falls back to
+  `Buffered`. The sector path remains exercised by pipeline tests
+  (which construct `SectorWriter` directly).
+
+## Follow-up — wire boot-site dispatch
+
+The remaining work, scoped as a separate commit:
+
+1. Make `init_engine`, `run_as_primary`, `run_as_replica`, and the
+   rumcast/DPDK receiver entry points generic over `W`. Each is small
+   on its own; the volume is in the call sites.
+2. At `main`, match on `config.journal_writer` and call the entry
+   point twice (once per concrete writer). Two specialisations
+   monomorphise — the cost the doc anticipated.
+3. Drop the `pub type JournalWriter = BufferedWriter;` shim in
+   `melin-engine` / `melin-server`.
+
+The boot dispatch is intentionally split off because it is mechanical
+volume against the typing system that landed in this step — gating it
+on a follow-up keeps this commit's blast radius scoped to the type
+plumbing.

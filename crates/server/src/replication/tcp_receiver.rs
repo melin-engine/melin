@@ -781,20 +781,23 @@ pub fn run_receiver(
     // Recover local state from journal (if any). On first call this may
     // be (None, None) for a fresh replica. After a reconnect, the pipeline
     // shutdown returns the App + writer directly.
+    // Replica recovery: the boot path is monomorphised on
+    // `JournalWriter` (currently aliased to `BufferedWriter`). The
+    // operator-selected mode is logged but not yet wired through; a
+    // follow-up commit makes this dispatch.
+    let _ = journal_writer_mode;
     let (mut exchange, mut journal_writer, mut last_sequence, mut chain_hash) =
         if journal_path.exists() {
             let engine = if snapshot_path.exists() {
                 info!("recovering replica from snapshot + journal");
-                melin_transport_core::JournaledApp::<App>::recover_from_snapshot(
+                melin_transport_core::JournaledApp::<App, JournalWriter>::recover_from_snapshot(
                     &snapshot_path,
                     journal_path,
-                    journal_writer_mode,
                 )?
             } else {
-                melin_transport_core::JournaledApp::<App>::recover(
+                melin_transport_core::JournaledApp::<App, JournalWriter>::recover(
                     crate::server::empty_app(),
                     journal_path,
-                    journal_writer_mode,
                 )?
             };
             let next = engine.next_sequence();
@@ -1071,12 +1074,8 @@ pub fn run_receiver(
                 }
                 exchange = Some(snap_exchange);
 
-                let writer = JournalWriter::create_continuing(
-                    journal_writer_mode,
-                    journal_path,
-                    snap_seq + 1,
-                    snap_hash,
-                )?;
+                let writer =
+                    JournalWriter::create_continuing(journal_path, snap_seq + 1, snap_hash)?;
                 journal_writer = Some(writer);
 
                 let ss_frame = read_frame(&mut reader, MAX_CONTROL_FRAME)?;
@@ -1106,8 +1105,7 @@ pub fn run_receiver(
         // --- Create journal for fresh replica (first connection only) ---
 
         if journal_writer.is_none() {
-            let writer = JournalWriter::create_fresh_replica(
-                journal_writer_mode,
+            let writer = melin_journal::create_fresh_replica::<_, JournalWriter>(
                 journal_path,
                 &primary_genesis_entry,
             )?;

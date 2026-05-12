@@ -771,8 +771,17 @@ fn run_pipeline_bench(
 
     let tmp_dir = tempdir();
     let effective_journal = journal_path.unwrap_or_else(|| tmp_dir.join("pipeline-bench.journal"));
-    let writer = JournalWriter::create(journal_writer_mode, &effective_journal)
-        .expect("create journal");
+    // The static-dispatch refactor monomorphised the bench pipeline
+    // construction on `BufferedWriter` for the moment; the follow-up
+    // commit will dispatch on `journal_writer_mode`. Use the flag's
+    // value only for logging until then.
+    if journal_writer_mode == melin_engine::journal::JournalWriterMode::Sector {
+        eprintln!(
+            "warning: --journal-writer=sector is parsed but not yet wired \
+             into the bench pipeline; falling back to the buffered writer"
+        );
+    }
+    let writer = JournalWriter::create(&effective_journal).expect("create journal");
 
     let group_commit_delay = Duration::from_micros(group_commit_us);
     let active_conns = Arc::new(AtomicU64::new(0));

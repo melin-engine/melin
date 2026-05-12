@@ -23,12 +23,14 @@ use tracing::{debug, error, info, warn};
 
 use crate::App;
 use crate::JournalWriter;
-use melin_journal::{JournalError, JournalWrite};
+use melin_journal::JournalError;
+#[allow(unused_imports)] // used by some feature combinations only
+use melin_journal::JournalWrite;
 use melin_transport_core::journaled_app::JournaledApp;
 use melin_transport_core::pipeline::{
     Pipeline as GenericPipeline, build_pipeline_with_replication,
 };
-pub type Pipeline = GenericPipeline<App>;
+pub type Pipeline = GenericPipeline<App, JournalWriter>;
 
 use melin_protocol::auth::{AuthorizedKeys, Permission};
 use melin_protocol::blocking::BlockingFrameWriter;
@@ -2529,12 +2531,23 @@ pub(crate) fn init_engine(
 
     let journal_exists = config.journal.exists();
     let writer_mode = config.journal_writer;
-    let mut engine: JournaledApp<App> = if let Some(snap_path) = snap_path
+    if writer_mode == melin_journal::JournalWriterMode::Sector {
+        // The static-dispatch refactor monomorphised the boot path on
+        // `BufferedWriter` as an intermediate checkpoint; the follow-up
+        // commit makes server boot dispatch on the flag. Until then,
+        // honour the operator's intent loudly rather than silently.
+        tracing::warn!(
+            mode = %writer_mode,
+            "--journal-writer=sector is parsed but not yet wired into server boot; \
+             falling back to the buffered writer for this process"
+        );
+    }
+    let mut engine: JournaledApp<App, JournalWriter> = if let Some(snap_path) = snap_path
         && snap_path.exists()
         && journal_exists
     {
         info!(snapshot = %snap_path.display(), writer_mode = %writer_mode, "recovering from snapshot + journal");
-        JournaledApp::<App>::recover_from_snapshot(snap_path, &config.journal, writer_mode)?
+        JournaledApp::<App, JournalWriter>::recover_from_snapshot(snap_path, &config.journal)?
     } else if let Some(snap_path) = snap_path
         && snap_path.exists()
         && !journal_exists
@@ -2549,19 +2562,15 @@ pub(crate) fn init_engine(
         );
         let (app, snap_sequence, snap_chain_hash) =
             melin_transport_core::snapshot::load::<App>(snap_path)?;
-        let writer = JournalWriter::create_continuing(
-            writer_mode,
-            &config.journal,
-            snap_sequence + 1,
-            snap_chain_hash,
-        )?;
-        JournaledApp::<App>::from_parts(app, writer)
+        let writer =
+            JournalWriter::create_continuing(&config.journal, snap_sequence + 1, snap_chain_hash)?;
+        JournaledApp::<App, JournalWriter>::from_parts(app, writer)
     } else if journal_exists {
         info!(writer_mode = %writer_mode, "recovering from journal");
-        JournaledApp::<App>::recover(empty_app_for_seed(config), &config.journal, writer_mode)?
+        JournaledApp::<App, JournalWriter>::recover(empty_app_for_seed(config), &config.journal)?
     } else {
         info!(writer_mode = %writer_mode, "creating new journal");
-        JournaledApp::<App>::create(empty_app_for_seed(config), &config.journal, writer_mode)?
+        JournaledApp::<App, JournalWriter>::create(empty_app_for_seed(config), &config.journal)?
     };
 
     let needs_seeding = !journal_exists;
