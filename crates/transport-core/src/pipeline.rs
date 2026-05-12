@@ -307,7 +307,7 @@ impl<R: Copy, Q: Copy> Default for OutputSlot<R, Q> {
 /// channel. The bytes are identical to what was written to disk — same
 /// sequences, timestamps, CRC checksums, and checkpoint entries.
 pub struct JournalStage<E: AppEvent> {
-    writer: melin_journal::SectorWriter<E>,
+    writer: melin_journal::JournalWriter<E>,
     consumer: ring::Consumer<InputSlot<E>>,
     /// Group commit coalescing window. The journal stage waits up to this
     /// duration after the first unsynced write before issuing the durable
@@ -438,7 +438,7 @@ impl<E: AppEvent> JournalStage<E> {
     /// issuing the durable write. Zero means sync immediately after each
     /// batch read.
     pub fn new(
-        writer: melin_journal::SectorWriter<E>,
+        writer: melin_journal::JournalWriter<E>,
         consumer: ring::Consumer<InputSlot<E>>,
         group_commit_delay: Duration,
         max_batch: usize,
@@ -484,9 +484,18 @@ impl<E: AppEvent> JournalStage<E> {
         // — operators that want fast manual rotation can bump
         // `max_journal_mib` to something huge to enable the preparer
         // without triggering size-driven rotation in practice.
-        if max_journal_bytes > 0 && self.preparer.is_none() {
-            let live_path = self.writer.path().to_path_buf();
-            let sector_size = self.writer.sector_size();
+        // Preparer is only useful (and only safe) for the Sector
+        // variant: it pre-allocates a sidecar segment that the
+        // `rotate_segment_with_prepared` fast path adopts, and that
+        // method lives on `SectorWriter`. The Buffered writer rotates
+        // via plain `rotate_segment()` — no fast path, but rotation is
+        // not on its hot path anyway.
+        if max_journal_bytes > 0
+            && self.preparer.is_none()
+            && let Some(sector) = self.writer.as_sector_mut()
+        {
+            let live_path = sector.path().to_path_buf();
+            let sector_size = sector.sector_size();
             self.preparer = Some(SegmentPreparer::spawn(live_path, sector_size));
         }
     }
@@ -529,16 +538,19 @@ impl<E: AppEvent> JournalStage<E> {
 
     /// Run the journal stage loop.
     ///
-    /// Dispatches to the io_uring overlapped path for journal writes.
-    /// With the `no-persist` feature, falls back to synchronous writes
-    /// (io_uring overlapping is only useful with actual disk I/O).
+    /// Dispatches by writer variant. The Sector (O_DIRECT) writer goes
+    /// through the io_uring overlapped path for journal writes (or the
+    /// synchronous path under `no-persist`). The Buffered (pwrite +
+    /// fdatasync) writer always uses the synchronous path — io_uring
+    /// overlapping buys nothing on top of fdatasync.
     ///
-    /// Returns the `SectorWriter` on shutdown for clean resource release.
+    /// Returns the `JournalWriter` on shutdown for clean resource release.
     pub fn run(
         self,
         shutdown: &std::sync::atomic::AtomicBool,
-    ) -> Result<melin_journal::SectorWriter<E>, JournalError> {
-        let use_uring = !cfg!(feature = "no-persist");
+    ) -> Result<melin_journal::JournalWriter<E>, JournalError> {
+        let use_uring = !cfg!(feature = "no-persist")
+            && matches!(self.writer.mode(), melin_journal::JournalWriterMode::Sector);
 
         if use_uring {
             self.run_uring(shutdown)
@@ -556,7 +568,7 @@ impl<E: AppEvent> JournalStage<E> {
     fn run_sync(
         mut self,
         shutdown: &std::sync::atomic::AtomicBool,
-    ) -> Result<melin_journal::SectorWriter<E>, JournalError> {
+    ) -> Result<melin_journal::JournalWriter<E>, JournalError> {
         use std::time::Instant;
 
         let mut batch = [InputSlot::default(); MAX_JOURNAL_BATCH];
@@ -964,7 +976,14 @@ impl<E: AppEvent> JournalStage<E> {
         let prepared = self.preparer.as_ref().and_then(|p| p.take());
         let used_fast_path = prepared.is_some();
         let rotate_result = match prepared {
-            Some(p) => self.writer.rotate_segment_with_prepared(p),
+            // `prepared.is_some()` implies the preparer was spawned,
+            // which only happens on the Sector variant (see
+            // `set_rotation`). The `unwrap_sector_mut` here is the
+            // same invariant the io_uring path relies on.
+            Some(p) => self
+                .writer
+                .unwrap_sector_mut()
+                .rotate_segment_with_prepared(p),
             None => self.writer.rotate_segment(),
         };
 
@@ -1141,7 +1160,7 @@ impl<E: AppEvent> JournalStage<E> {
     fn run_uring(
         mut self,
         shutdown: &std::sync::atomic::AtomicBool,
-    ) -> Result<melin_journal::SectorWriter<E>, JournalError> {
+    ) -> Result<melin_journal::JournalWriter<E>, JournalError> {
         use io_uring::{IoUring, opcode, types};
         use std::time::Instant;
 
@@ -1162,8 +1181,8 @@ impl<E: AppEvent> JournalStage<E> {
         // Register the journal fd so the kernel skips fget/fput (fd table
         // lookup + atomic refcount) on every SQE. Use types::Fixed(0) in
         // SQEs instead of types::Fd(raw_fd).
-        let raw_fd = self.writer.fd();
-        let rw_flags = self.writer.io_uring_rw_flags();
+        let raw_fd = self.writer.unwrap_sector().fd();
+        let rw_flags = self.writer.unwrap_sector().io_uring_rw_flags();
         ring.submitter().register_files(&[raw_fd]).map_err(|e| {
             JournalError::Io(std::io::Error::other(format!(
                 "io_uring register_files: {e}"
@@ -1211,7 +1230,7 @@ impl<E: AppEvent> JournalStage<E> {
                 // symmetric and removes the last sync-flush call from the
                 // hot/critical lifecycle.
                 if pending > 0 {
-                    if let Some(async_batch) = self.writer.take_batch_for_async_write()? {
+                    if let Some(async_batch) = self.writer.unwrap_sector_mut().take_batch_for_async_write()? {
                         let seq = self.consumer.next_read();
                         let len = async_batch.len;
                         let sqe = opcode::Write::new(
@@ -1230,7 +1249,7 @@ impl<E: AppEvent> JournalStage<E> {
                         self.wait_for_cqe(&mut ring, len)?;
                         self.consumer.set_progress(seq);
                         self.publish_chain_hash();
-                        self.writer.confirm_async_write(async_batch);
+                        self.writer.unwrap_sector_mut().confirm_async_write(async_batch);
                     } else {
                         // Buffer was empty (read-only queries only) — just commit.
                         self.consumer.commit(pending);
@@ -1267,11 +1286,11 @@ impl<E: AppEvent> JournalStage<E> {
                 self.consumer.set_progress(seq);
                 self.publish_chain_hash();
                 let completed = inflight.take().expect("checked above");
-                self.writer.confirm_async_write(completed.0);
+                self.writer.unwrap_sector_mut().confirm_async_write(completed.0);
                 rotated_top = self.maybe_rotate();
             }
             if rotated_top {
-                Self::reregister_journal_fd(&ring, self.writer.fd())?;
+                Self::reregister_journal_fd(&ring, self.writer.unwrap_sector().fd())?;
             }
 
             // --- Read events from disruptor ---
@@ -1383,11 +1402,11 @@ impl<E: AppEvent> JournalStage<E> {
                 self.consumer.set_progress(seq);
                 self.publish_chain_hash();
                 let completed = inflight.take().expect("checked above");
-                self.writer.confirm_async_write(completed.0);
+                self.writer.unwrap_sector_mut().confirm_async_write(completed.0);
                 rotated_eager = self.maybe_rotate();
             }
             if rotated_eager {
-                Self::reregister_journal_fd(&ring, self.writer.fd())?;
+                Self::reregister_journal_fd(&ring, self.writer.unwrap_sector().fd())?;
             }
 
             // --- Decide whether to submit ---
@@ -1412,9 +1431,9 @@ impl<E: AppEvent> JournalStage<E> {
                         self.wait_for_cqe(&mut ring, batch_data.len)?;
                         self.consumer.set_progress(seq);
                         self.publish_chain_hash();
-                        self.writer.confirm_async_write(batch_data);
+                        self.writer.unwrap_sector_mut().confirm_async_write(batch_data);
                         if self.maybe_rotate() {
-                            Self::reregister_journal_fd(&ring, self.writer.fd())?;
+                            Self::reregister_journal_fd(&ring, self.writer.unwrap_sector().fd())?;
                         }
                     }
 
@@ -1430,7 +1449,7 @@ impl<E: AppEvent> JournalStage<E> {
                     }
 
                     // Take the batch buffer and submit async write.
-                    match self.writer.take_batch_for_async_write() {
+                    match self.writer.unwrap_sector_mut().take_batch_for_async_write() {
                         Ok(Some(async_batch)) => {
                             let seq = self.consumer.next_read();
                             let sqe = opcode::Write::new(
@@ -1461,7 +1480,7 @@ impl<E: AppEvent> JournalStage<E> {
                             self.consumer.commit(pending);
                             self.publish_chain_hash();
                             if self.maybe_rotate() {
-                                Self::reregister_journal_fd(&ring, self.writer.fd())?;
+                                Self::reregister_journal_fd(&ring, self.writer.unwrap_sector().fd())?;
                             }
                         }
                         Err(e) => {
@@ -1506,7 +1525,7 @@ impl<E: AppEvent> JournalStage<E> {
             self.wait_for_cqe(ring, batch_data.len)?;
             self.consumer.set_progress(seq);
             self.publish_chain_hash();
-            self.writer.confirm_async_write(batch_data);
+            self.writer.unwrap_sector_mut().confirm_async_write(batch_data);
         }
         Ok(())
     }
@@ -2273,7 +2292,7 @@ fn setup_chain_hash_publisher<E: AppEvent>(
 #[allow(clippy::too_many_arguments)]
 pub fn build_pipeline_with_replication<A>(
     app: A,
-    writer: melin_journal::SectorWriter<A::Event>,
+    writer: melin_journal::JournalWriter<A::Event>,
     group_commit_delay: Duration,
     active_connections: Arc<AtomicU64>,
     enable_replication: bool,
@@ -2432,7 +2451,7 @@ where
 /// vary after journal rotation).
 pub fn build_replica_pipeline<A>(
     app: A,
-    writer: melin_journal::SectorWriter<A::Event>,
+    writer: melin_journal::JournalWriter<A::Event>,
     max_journal_batch: usize,
     group_commit_delay: Duration,
     busy_spin: bool,

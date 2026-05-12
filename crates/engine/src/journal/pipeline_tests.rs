@@ -28,9 +28,11 @@ mod tests {
     use crate::exchange::Exchange;
     use crate::journal::replication::REPLICATION_RING_CAPACITY;
     use crate::journal::{
-        InputSlot, JournalEvent, JournalStage, SectorWriter, MatchingStage, OutputPayload,
+        InputSlot, JournalEvent, JournalStage, JournalWriter, MatchingStage, OutputPayload,
         OutputSlot,
     };
+    #[cfg(all(feature = "hash-chain", not(feature = "no-persist")))]
+    use melin_journal::JournalWriterMode;
     use crate::types::RejectReason;
     use crate::types::*;
 
@@ -77,7 +79,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("pipeline_journal.journal");
 
-        let writer = SectorWriter::create(&path).unwrap();
+        let writer = JournalWriter::create_default(&path).unwrap();
 
         let (mut producer, mut consumers) = ring::DisruptorBuilder::<InputSlot>::new(64)
             .add_consumer()
@@ -173,7 +175,7 @@ mod tests {
 
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("checkpoint_boundary.journal");
-        let writer = SectorWriter::create(&path).unwrap();
+        let writer = JournalWriter::create_default(&path).unwrap();
 
         // Ring capacity: power-of-two large enough to hold every event
         // without the publisher ever blocking on the consumer. This lets
@@ -284,8 +286,13 @@ mod tests {
             quote: CurrencyId(1),
         });
         primary_exchange.deposit(AccountId(1), CurrencyId(1), u64::MAX / 2);
-        let primary_writer =
-            SectorWriter::create_continuing(&primary_path, 1, shared_genesis).unwrap();
+        let primary_writer = JournalWriter::create_continuing(
+            JournalWriterMode::default(),
+            &primary_path,
+            1,
+            shared_genesis,
+        )
+        .unwrap();
         let primary_active_conns = Arc::new(AtomicU64::new(0));
         let mut primary = build_pipeline_with_replication(
             primary_exchange,
@@ -308,8 +315,13 @@ mod tests {
             quote: CurrencyId(1),
         });
         replica_exchange.deposit(AccountId(1), CurrencyId(1), u64::MAX / 2);
-        let replica_writer =
-            SectorWriter::create_continuing(&replica_path, 1, shared_genesis).unwrap();
+        let replica_writer = JournalWriter::create_continuing(
+            JournalWriterMode::default(),
+            &replica_path,
+            1,
+            shared_genesis,
+        )
+        .unwrap();
         let replica = build_replica_pipeline(
             replica_exchange,
             replica_writer,
@@ -516,7 +528,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("preseq.journal");
 
-        let writer = SectorWriter::create(&path).unwrap();
+        let writer = JournalWriter::create_default(&path).unwrap();
 
         let (mut producer, mut consumers) = ring::DisruptorBuilder::<InputSlot>::new(64)
             .add_consumer()
@@ -607,7 +619,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("divergence.journal");
 
-        let writer = SectorWriter::create(&path).unwrap();
+        let writer = JournalWriter::create_default(&path).unwrap();
 
         let (mut producer, mut consumers) = ring::DisruptorBuilder::<InputSlot>::new(64)
             .add_consumer()
@@ -768,7 +780,7 @@ mod tests {
         exchange.deposit(AccountId(1), CurrencyId(1), 1_000_000);
         exchange.deposit(AccountId(2), CurrencyId(0), 1_000);
 
-        let writer = SectorWriter::create(&path).unwrap();
+        let writer = JournalWriter::create_default(&path).unwrap();
 
         let active_conns = Arc::new(AtomicU64::new(0));
         let mut out = build_pipeline_with_replication(
@@ -869,7 +881,7 @@ mod tests {
         exchange.deposit(AccountId(1), CurrencyId(1), 1_000_000);
         exchange.deposit(AccountId(2), CurrencyId(0), 1_000);
 
-        let writer = SectorWriter::create(&path).unwrap();
+        let writer = JournalWriter::create_default(&path).unwrap();
 
         let active_conns = Arc::new(AtomicU64::new(0));
         let mut out = build_pipeline_with_replication(
@@ -1019,7 +1031,7 @@ mod tests {
         {
             let path = dir.path().join("standalone.journal");
             let exchange = Exchange::new();
-            let writer = SectorWriter::create(&path).unwrap();
+            let writer = JournalWriter::create_default(&path).unwrap();
             let active_conns = Arc::new(AtomicU64::new(0));
 
             let out = build_pipeline_with_replication(
@@ -1042,7 +1054,7 @@ mod tests {
         {
             let path = dir.path().join("repl_enabled.journal");
             let exchange = Exchange::new();
-            let writer = SectorWriter::create(&path).unwrap();
+            let writer = JournalWriter::create_default(&path).unwrap();
             let active_conns = Arc::new(AtomicU64::new(0));
 
             let out = build_pipeline_with_replication(
@@ -1370,7 +1382,7 @@ mod tests {
 
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("rotate_manual.journal");
-        let writer = SectorWriter::create(&path).unwrap();
+        let writer = JournalWriter::create_default(&path).unwrap();
 
         let (mut producer, mut consumers) = ring::DisruptorBuilder::<InputSlot>::new(64)
             .add_consumer()
@@ -1484,7 +1496,7 @@ mod tests {
 
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("rotate_size.journal");
-        let writer = SectorWriter::create(&path).unwrap();
+        let writer = JournalWriter::create_default(&path).unwrap();
 
         let (mut producer, mut consumers) = ring::DisruptorBuilder::<InputSlot>::new(64)
             .add_consumer()
@@ -1557,7 +1569,7 @@ mod tests {
 
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("storm.journal");
-        let writer = SectorWriter::create(&path).unwrap();
+        let writer = JournalWriter::create_default(&path).unwrap();
 
         let (mut producer, mut consumers) = ring::DisruptorBuilder::<InputSlot>::new(64)
             .add_consumer()
@@ -1668,7 +1680,7 @@ mod tests {
 
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("post_rot.journal");
-        let writer = SectorWriter::create(&path).unwrap();
+        let writer = JournalWriter::create_default(&path).unwrap();
 
         let (mut producer, mut consumers) = ring::DisruptorBuilder::<InputSlot>::new(1024)
             .add_consumer()

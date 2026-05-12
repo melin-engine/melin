@@ -1,6 +1,6 @@
 //! Generic journal-plus-application wrapper.
 //!
-//! Holds an `A: Application` and a [`SectorWriter<A::Event>`]; handles
+//! Holds an `A: Application` and a [`JournalWriter<A::Event>`]; handles
 //! the startup paths a server cares about:
 //!
 //! - [`create`]: fresh journal, fresh app.
@@ -20,7 +20,7 @@
 use std::path::Path;
 
 use melin_app::{Application, ApplyCtx};
-use melin_journal::{JournalError, JournalEvent, JournalReader, SectorWriter};
+use melin_journal::{JournalError, JournalEvent, JournalReader, JournalWriter, JournalWriterMode};
 
 use crate::snapshot;
 
@@ -74,24 +74,45 @@ impl From<std::io::Error> for JournaledAppError {
 /// the next free sequence.
 pub struct JournaledApp<A: Application> {
     app: A,
-    writer: SectorWriter<A::Event>,
+    writer: JournalWriter<A::Event>,
 }
 
 impl<A: Application> JournaledApp<A> {
-    /// Create a new journaled app with a fresh journal file. The
-    /// caller supplies the app so production builds can pick an
-    /// appropriately pre-sized constructor (e.g.
+    /// Create a new journaled app with a fresh journal file using the
+    /// default writer mode. The caller supplies the app so production
+    /// builds can pick an appropriately pre-sized constructor (e.g.
     /// `Exchange::with_capacity()`) rather than relying on `Default`.
     pub fn create(app: A, journal_path: &Path) -> Result<Self, JournaledAppError> {
-        let writer = SectorWriter::<A::Event>::create(journal_path)?;
+        Self::create_with_mode(app, journal_path, JournalWriterMode::default())
+    }
+
+    /// Create a new journaled app with an explicit writer mode. Used by
+    /// the server's bootstrap to thread the `--journal-writer` flag down
+    /// to the writer.
+    pub fn create_with_mode(
+        app: A,
+        journal_path: &Path,
+        mode: JournalWriterMode,
+    ) -> Result<Self, JournaledAppError> {
+        let writer = JournalWriter::<A::Event>::create(mode, journal_path)?;
         Ok(Self { app, writer })
     }
 
-    /// Recover from an existing journal. Replays every archived segment
-    /// in monotonic order, then the live segment, into the caller-
-    /// supplied empty app, then reopens the writer for appending.
+    /// Recover from an existing journal using the default writer mode.
+    /// Replays every archived segment in monotonic order, then the live
+    /// segment, into the caller-supplied empty app, then reopens the
+    /// writer for appending.
     pub fn recover(app: A, journal_path: &Path) -> Result<Self, JournaledAppError> {
-        Self::recover_inner(app, journal_path, None)
+        Self::recover_inner(app, journal_path, None, JournalWriterMode::default())
+    }
+
+    /// Recover with an explicit writer mode.
+    pub fn recover_with_mode(
+        app: A,
+        journal_path: &Path,
+        mode: JournalWriterMode,
+    ) -> Result<Self, JournaledAppError> {
+        Self::recover_inner(app, journal_path, None, mode)
     }
 
     /// Recover from a snapshot plus a journal directory.
@@ -103,8 +124,21 @@ impl<A: Application> JournaledApp<A> {
         snapshot_path: &Path,
         journal_path: &Path,
     ) -> Result<Self, JournaledAppError> {
+        Self::recover_from_snapshot_with_mode(
+            snapshot_path,
+            journal_path,
+            JournalWriterMode::default(),
+        )
+    }
+
+    /// Snapshot-based recovery with an explicit writer mode.
+    pub fn recover_from_snapshot_with_mode(
+        snapshot_path: &Path,
+        journal_path: &Path,
+        mode: JournalWriterMode,
+    ) -> Result<Self, JournaledAppError> {
         let (app, snap_sequence, snap_chain_hash) = snapshot::load::<A>(snapshot_path)?;
-        Self::recover_inner(app, journal_path, Some((snap_sequence, snap_chain_hash)))
+        Self::recover_inner(app, journal_path, Some((snap_sequence, snap_chain_hash)), mode)
     }
 
     /// Shared multi-segment recovery driver.
@@ -124,6 +158,7 @@ impl<A: Application> JournaledApp<A> {
         mut app: A,
         journal_path: &Path,
         snapshot: Option<(u64, [u8; 32])>,
+        mode: JournalWriterMode,
     ) -> Result<Self, JournaledAppError> {
         let archives = melin_journal::segment::list_archives(journal_path)?;
 
@@ -171,7 +206,7 @@ impl<A: Application> JournaledApp<A> {
         if !live_exists {
             // Phase B recovery: rotation crashed between
             // [`crate::segment::archive_live`] (the live → archive
-            // rename) and `SectorWriter::create_continuing` (opening a
+            // rename) and `JournalWriter::create_continuing` (opening a
             // fresh live). The just-archived segment is intact and was
             // replayed above, so the application state is consistent up
             // through `last_seq_seen`. Synthesize a new live segment
@@ -191,7 +226,8 @@ impl<A: Application> JournaledApp<A> {
                 .into());
             }
             let genesis = prev_tail_hash.unwrap_or([0u8; 32]);
-            let writer = SectorWriter::<A::Event>::create_continuing(
+            let writer = JournalWriter::<A::Event>::create_continuing(
+                mode,
                 journal_path,
                 last_seq_seen + 1,
                 genesis,
@@ -217,7 +253,8 @@ impl<A: Application> JournaledApp<A> {
         let valid_end = reader.valid_file_end();
         let chain_hash = reader.chain_hash();
         let events_since_checkpoint = reader.events_since_checkpoint();
-        let writer = SectorWriter::<A::Event>::open_append(
+        let writer = JournalWriter::<A::Event>::open_append(
+            mode,
             journal_path,
             last_seq,
             valid_end,
@@ -281,12 +318,12 @@ impl<A: Application> JournaledApp<A> {
 
     /// Construct from pre-built parts. Used by the server's
     /// "snapshot-only" recovery path (journal missing post-rotation).
-    pub fn from_parts(app: A, writer: SectorWriter<A::Event>) -> Self {
+    pub fn from_parts(app: A, writer: JournalWriter<A::Event>) -> Self {
         Self { app, writer }
     }
 
     /// Decompose into parts for the pipeline architecture.
-    pub fn into_parts(self) -> (A, SectorWriter<A::Event>) {
+    pub fn into_parts(self) -> (A, JournalWriter<A::Event>) {
         (self.app, self.writer)
     }
 }

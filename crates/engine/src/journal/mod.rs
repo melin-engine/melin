@@ -23,6 +23,8 @@ pub type JournalEvent = melin_journal::JournalEvent<crate::trading_event::Tradin
 pub type JournalEntry = melin_journal::JournalEntry<crate::trading_event::TradingEvent>;
 pub type JournalReader = melin_journal::JournalReader<crate::trading_event::TradingEvent>;
 pub type SectorWriter = melin_journal::SectorWriter<crate::trading_event::TradingEvent>;
+pub type JournalWriter = melin_journal::JournalWriter<crate::trading_event::TradingEvent>;
+pub use melin_journal::JournalWriterMode;
 
 /// Trading-bound aliases for the generic pipeline types (now living in
 /// `melin-transport-core`). Server/bench callers use these so they

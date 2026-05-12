@@ -931,6 +931,7 @@ pub fn run_receiver_dpdk(
     max_orders_burst: u32,
 ) -> ReceiverResult {
     use crate::App;
+    use crate::JournalWriter;
     use crate::SectorWriter;
 
     // Recover local state from journal (if any). On first call this may
@@ -1183,7 +1184,7 @@ pub fn run_receiver_dpdk(
                                         snap_seq + 1,
                                         snap_hash,
                                     )?;
-                                    journal_writer = Some(writer);
+                                    journal_writer = Some(JournalWriter::Sector(writer));
                                     last_sequence = snap_seq;
                                     chain_hash = snap_hash;
 
@@ -1273,7 +1274,7 @@ pub fn run_receiver_dpdk(
                 max_orders_burst,
             );
             exchange = Some(fresh);
-            journal_writer = Some(writer);
+            journal_writer = Some(JournalWriter::Sector(writer));
         }
 
         // --- Build pipeline if absent ---

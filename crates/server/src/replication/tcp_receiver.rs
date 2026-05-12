@@ -742,7 +742,7 @@ enum SessionExit {
 /// Result of `run_receiver`: `None` = clean shutdown, `Some` = promotion
 /// triggered with the fully-replayed App and positioned SectorWriter.
 pub type ReceiverResult =
-    Result<Option<(crate::App, crate::SectorWriter)>, Box<dyn std::error::Error>>;
+    Result<Option<(crate::App, crate::JournalWriter)>, Box<dyn std::error::Error>>;
 
 #[allow(clippy::too_many_arguments)]
 pub fn run_receiver(
@@ -773,6 +773,7 @@ pub fn run_receiver(
     max_orders_burst: u32,
 ) -> ReceiverResult {
     use crate::App;
+    use crate::JournalWriter;
     use crate::SectorWriter;
 
     // Recover local state from journal (if any). On first call this may
@@ -1066,9 +1067,14 @@ pub fn run_receiver(
                 }
                 exchange = Some(snap_exchange);
 
+                // Replica's fresh-segment path manually writes a
+                // sector-sized header below (and this snapshot-transfer
+                // path mirrors that on-disk format), so the writer here
+                // is sector-mode. Threading a Buffered-mode flag through
+                // the replica is future work.
                 let writer =
                     SectorWriter::create_continuing(journal_path, snap_seq + 1, snap_hash)?;
-                journal_writer = Some(writer);
+                journal_writer = Some(JournalWriter::Sector(writer));
 
                 let ss_frame = read_frame(&mut reader, MAX_CONTROL_FRAME)?;
                 match decode_primary_message(&ss_frame)? {
@@ -1137,7 +1143,7 @@ pub fn run_receiver(
                 max_orders_burst,
             );
             exchange = Some(fresh);
-            journal_writer = Some(writer);
+            journal_writer = Some(JournalWriter::Sector(writer));
         }
 
         // --- Build pipeline if absent ---

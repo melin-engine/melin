@@ -28,7 +28,7 @@ use crate::sector_writer::SectorWriter;
 /// startup from the `--journal-writer` CLI flag (or its config-file
 /// equivalent) and threaded through every construction site that
 /// creates a journal.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum JournalWriterMode {
     /// `O_DIRECT` writes, sector-aligned, durability dependent on
     /// capacitor-backed PLP. Lowest-latency on enterprise NVMe with
@@ -37,13 +37,8 @@ pub enum JournalWriterMode {
     /// Page-cache writes with explicit `fdatasync` per batch. Honest
     /// durability on any drive at the cost of one device flush per
     /// flush boundary on `VWC=1` drives. Default.
+    #[default]
     Buffered,
-}
-
-impl Default for JournalWriterMode {
-    fn default() -> Self {
-        Self::Buffered
-    }
 }
 
 impl JournalWriterMode {
@@ -96,6 +91,14 @@ impl<E: AppEvent> JournalWriter<E> {
             JournalWriterMode::Sector => SectorWriter::create(path).map(Self::Sector),
             JournalWriterMode::Buffered => BufferedWriter::create(path).map(Self::Buffered),
         }
+    }
+
+    /// Create a fresh journal using the default mode
+    /// ([`JournalWriterMode::Buffered`]). Exists to keep test setup
+    /// free of the mode parameter — production call sites always go
+    /// through [`create`] with an explicit mode from the CLI.
+    pub fn create_default(path: &Path) -> Result<Self, JournalError> {
+        Self::create(JournalWriterMode::default(), path)
     }
 
     /// Create a fresh journal that continues a previous segment's
@@ -165,6 +168,33 @@ impl<E: AppEvent> JournalWriter<E> {
             Self::Sector(w) => Some(w),
             Self::Buffered(_) => None,
         }
+    }
+
+    /// Shared-reference counterpart to [`as_sector_mut`] for the
+    /// `&self` accessors on `SectorWriter` (`fd`, `sector_size`,
+    /// `io_uring_rw_flags`).
+    pub fn as_sector(&self) -> Option<&SectorWriter<E>> {
+        match self {
+            Self::Sector(w) => Some(w),
+            Self::Buffered(_) => None,
+        }
+    }
+
+    /// Infallible variant of [`as_sector`] used inside `run_uring`,
+    /// which is only reached on the Sector path. The panic message is
+    /// centralised here so every io_uring call site can call the
+    /// accessor without restating the invariant.
+    #[inline]
+    pub fn unwrap_sector(&self) -> &SectorWriter<E> {
+        self.as_sector()
+            .expect("io_uring journal path requires Sector variant — Buffered routes to run_sync")
+    }
+
+    /// `&mut` counterpart to [`unwrap_sector`].
+    #[inline]
+    pub fn unwrap_sector_mut(&mut self) -> &mut SectorWriter<E> {
+        self.as_sector_mut()
+            .expect("io_uring journal path requires Sector variant — Buffered routes to run_sync")
     }
 
     // ---- shared API: shape and order mirror SectorWriter / BufferedWriter ----
@@ -305,6 +335,13 @@ impl<E: AppEvent> JournalWriter<E> {
         match self {
             Self::Sector(w) => w.rotate_segment(),
             Self::Buffered(w) => w.rotate_segment(),
+        }
+    }
+
+    pub fn read_genesis_entry(&self) -> Result<Vec<u8>, JournalError> {
+        match self {
+            Self::Sector(w) => w.read_genesis_entry(),
+            Self::Buffered(w) => w.read_genesis_entry(),
         }
     }
 }

@@ -39,6 +39,7 @@ pub type OutputPayload = melin_transport_core::pipeline::OutputPayload<
     melin_trading::types::QueryResponse,
 >;
 pub type SectorWriter = melin_journal::SectorWriter<melin_trading::trading_event::TradingEvent>;
+pub type JournalWriter = melin_journal::JournalWriter<melin_trading::trading_event::TradingEvent>;
 pub type JournalReader = melin_journal::JournalReader<melin_trading::trading_event::TradingEvent>;
 
 /// Control plane event the accept loop and response stage exchange.

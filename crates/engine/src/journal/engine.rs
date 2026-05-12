@@ -13,9 +13,11 @@ use crate::types::{
 
 use crate::journal::JournalEvent;
 use crate::journal::JournalReader;
+use crate::journal::JournalWriter;
+#[cfg(test)]
 use crate::journal::SectorWriter;
 use crate::journal::snapshot;
-use melin_journal::JournalError;
+use melin_journal::{JournalError, JournalWriterMode};
 
 /// Error surfaced by [`JournaledExchange::withdraw`]: either a journal
 /// I/O failure or a business-level rejection (insufficient balance,
@@ -58,13 +60,23 @@ impl From<JournalError> for JournaledExchangeError {
 /// before executing them. Provides crash recovery via journal replay.
 pub struct JournaledExchange {
     exchange: Exchange,
-    writer: SectorWriter,
+    writer: JournalWriter,
 }
 
 impl JournaledExchange {
-    /// Create a new journaled exchange with a fresh journal file.
+    /// Create a new journaled exchange with a fresh journal file using
+    /// the default writer mode.
     pub fn create(journal_path: &Path) -> Result<Self, JournalError> {
-        let writer = SectorWriter::create(journal_path)?;
+        Self::create_with_mode(journal_path, JournalWriterMode::default())
+    }
+
+    /// Create with an explicit writer mode (server bootstrap thread the
+    /// CLI flag through this entry point).
+    pub fn create_with_mode(
+        journal_path: &Path,
+        mode: JournalWriterMode,
+    ) -> Result<Self, JournalError> {
+        let writer = JournalWriter::create(mode, journal_path)?;
         Ok(Self {
             exchange: Exchange::with_capacity(),
             writer,
@@ -264,28 +276,48 @@ impl JournaledExchange {
         Ok(())
     }
 
-    /// Recover from an existing journal file by replaying all events.
+    /// Recover from an existing journal file by replaying all events
+    /// using the default writer mode.
     ///
     /// Truncates any trailing garbage from a partial write (crash recovery),
     /// then reopens the writer for appending new events.
     pub fn recover(journal_path: &Path) -> Result<Self, JournalError> {
-        Self::recover_inner(journal_path, None)
+        Self::recover_inner(journal_path, None, JournalWriterMode::default())
     }
 
-    /// Recover from a snapshot plus a journal file.
-    ///
-    /// Loads the snapshot to restore state, then replays only the journal
-    /// entries after the snapshot's sequence number. This avoids replaying
-    /// the full journal from genesis.
+    /// Recover with an explicit writer mode.
+    pub fn recover_with_mode(
+        journal_path: &Path,
+        mode: JournalWriterMode,
+    ) -> Result<Self, JournalError> {
+        Self::recover_inner(journal_path, None, mode)
+    }
+
+    /// Recover from a snapshot plus a journal file using the default
+    /// writer mode.
     pub fn recover_from_snapshot(
         snapshot_path: &Path,
         journal_path: &Path,
+    ) -> Result<Self, JournalError> {
+        Self::recover_from_snapshot_with_mode(
+            snapshot_path,
+            journal_path,
+            JournalWriterMode::default(),
+        )
+    }
+
+    /// Snapshot-based recovery with an explicit writer mode.
+    pub fn recover_from_snapshot_with_mode(
+        snapshot_path: &Path,
+        journal_path: &Path,
+        mode: JournalWriterMode,
     ) -> Result<Self, JournalError> {
         let (exchange, snap_sequence, snap_chain_hash) = snapshot::load(snapshot_path)?;
         Self::recover_inner_with_state(
             exchange,
             journal_path,
             Some((snap_sequence, snap_chain_hash)),
+            mode,
         )
     }
 
@@ -296,14 +328,16 @@ impl JournaledExchange {
     fn recover_inner(
         journal_path: &Path,
         snapshot: Option<(u64, [u8; 32])>,
+        mode: JournalWriterMode,
     ) -> Result<Self, JournalError> {
-        Self::recover_inner_with_state(Exchange::with_capacity(), journal_path, snapshot)
+        Self::recover_inner_with_state(Exchange::with_capacity(), journal_path, snapshot, mode)
     }
 
     fn recover_inner_with_state(
         mut exchange: Exchange,
         journal_path: &Path,
         snapshot: Option<(u64, [u8; 32])>,
+        mode: JournalWriterMode,
     ) -> Result<Self, JournalError> {
         let archives =
             melin_journal::segment::list_archives(journal_path).map_err(JournalError::Io)?;
@@ -349,7 +383,7 @@ impl JournaledExchange {
             }
             let genesis = prev_tail_hash.unwrap_or([0u8; 32]);
             let writer =
-                SectorWriter::create_continuing(journal_path, last_seq_seen + 1, genesis)?;
+                JournalWriter::create_continuing(mode, journal_path, last_seq_seen + 1, genesis)?;
             return Ok(Self { exchange, writer });
         }
 
@@ -369,7 +403,8 @@ impl JournaledExchange {
         let chain_hash = reader.chain_hash();
         let events_since_checkpoint = reader.events_since_checkpoint();
         tracing::debug!(last_seq, valid_end, "recover: opening append");
-        let writer = SectorWriter::open_append(
+        let writer = JournalWriter::open_append(
+            mode,
             journal_path,
             last_seq,
             valid_end,
@@ -440,7 +475,7 @@ impl JournaledExchange {
 
     /// Construct from pre-built parts. Used by the server for snapshot-only
     /// recovery (when the journal is missing after a rotation crash).
-    pub fn from_parts(exchange: Exchange, writer: SectorWriter) -> Self {
+    pub fn from_parts(exchange: Exchange, writer: JournalWriter) -> Self {
         Self { exchange, writer }
     }
 
@@ -448,8 +483,8 @@ impl JournaledExchange {
     ///
     /// After recovery, the exchange and journal writer are handed to separate
     /// pipeline stages: the matching thread owns the `Exchange`, and the
-    /// journal thread owns the `SectorWriter`.
-    pub fn into_parts(self) -> (Exchange, SectorWriter) {
+    /// journal thread owns the `JournalWriter`.
+    pub fn into_parts(self) -> (Exchange, JournalWriter) {
         (self.exchange, self.writer)
     }
 }
@@ -2073,9 +2108,13 @@ mod tests {
         // The server's init_engine handles this case by loading the snapshot
         // and creating a fresh journal. Simulate that path here.
         let (exchange, seq, chain_hash) = super::snapshot::load(&snap_path).unwrap();
-        let writer =
-            crate::journal::SectorWriter::create_continuing(&journal_path, seq + 1, chain_hash)
-                .unwrap();
+        let writer = crate::journal::JournalWriter::create_continuing(
+            JournalWriterMode::default(),
+            &journal_path,
+            seq + 1,
+            chain_hash,
+        )
+        .unwrap();
         let je = JournaledExchange::from_parts(exchange, writer);
         assert_eq!(
             je.exchange().accounts().balance(ACCT_A, USD).available,

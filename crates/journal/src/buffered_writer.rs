@@ -570,6 +570,38 @@ impl<E: AppEvent> BufferedWriter<E> {
         &self.path
     }
 
+    /// Read the genesis entry bytes from the journal header. Mirrors
+    /// [`crate::sector_writer::SectorWriter::read_genesis_entry`]; the
+    /// fixed [`FILE_HEADER_SIZE`] offset replaces the sector-size
+    /// constant used there. Used at primary startup to forward the
+    /// genesis frame to replicas so the BLAKE3 chain seeds from the
+    /// same bytes on both nodes.
+    pub fn read_genesis_entry(&self) -> Result<Vec<u8>, JournalError> {
+        let file = std::fs::File::open(&self.path)?;
+        let offset = HEADER_OFFSET;
+        let mut hdr4 = [0u8; 4];
+        let n = file.read_at(&mut hdr4, offset)?;
+        if n < 4 {
+            return Err(JournalError::Io(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "journal too short to contain genesis entry",
+            )));
+        }
+        let entry_len = u16::from_le_bytes([hdr4[2], hdr4[3]]) as usize;
+        // EntryHeader (20) + payload + CRC (4) — same on-disk frame as
+        // SectorWriter, only the file-header prefix differs.
+        let total = 20 + entry_len + 4;
+        let mut entry = vec![0u8; total];
+        let n = file.read_at(&mut entry, offset)?;
+        if n < total {
+            return Err(JournalError::Io(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "journal truncated at genesis entry",
+            )));
+        }
+        Ok(entry)
+    }
+
     /// Current BLAKE3 chain hash if hash-chain is active. Includes any
     /// entries accumulated since the last checkpoint by cloning the
     /// batch hasher and finalising with the previous chain hash —

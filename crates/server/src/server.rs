@@ -22,7 +22,7 @@ use std::hash::{Hash, Hasher};
 use tracing::{debug, error, info, warn};
 
 use crate::App;
-use crate::SectorWriter;
+use crate::JournalWriter;
 use melin_journal::JournalError;
 use melin_transport_core::journaled_app::JournaledApp;
 use melin_transport_core::pipeline::{
@@ -99,6 +99,18 @@ pub struct ServerConfig {
     /// and starts a fresh journal. Set to 0 to disable. Default: 256 MiB.
     #[arg(long, default_value_t = 256)]
     pub max_journal_mib: u64,
+    /// Journal writer mode. `buffered` (default) writes through the page
+    /// cache and calls `fdatasync` per batch — honest durability on any
+    /// drive. `sector` uses `O_DIRECT` with sector-aligned writes —
+    /// lowest latency on enterprise NVMe with capacitor-backed PLP
+    /// (VWC=0), but NOT durable on drives with a volatile write cache.
+    /// Use `sector` only when the deployed drives advertise PLP.
+    #[arg(
+        long,
+        default_value_t = melin_journal::JournalWriterMode::default(),
+        value_parser = melin_journal::JournalWriterMode::parse,
+    )]
+    pub journal_writer: melin_journal::JournalWriterMode,
     /// Maximum number of open orders (resting limits + pending stops, across
     /// all instruments) per account. New submissions are rejected with
     /// `ExceedsMaxOpenOrders` once an account hits this cap. `0` means
@@ -382,6 +394,7 @@ impl Default for ServerConfig {
             instruments: 2,
             authorized_keys: PathBuf::from("authorized_keys"),
             max_journal_mib: 256,
+            journal_writer: melin_journal::JournalWriterMode::default(),
             max_orders_per_account: 10_000,
             max_orders_per_second: 1_000,
             max_orders_burst: 5_000,
@@ -744,7 +757,7 @@ pub use crate::ControlEvent;
 /// no replication, no health endpoint) or unsupported on a transport
 /// (e.g., DPDK runs without an event publisher or shadow snapshotter).
 struct PipelineHandles {
-    journal: std::thread::JoinHandle<Result<SectorWriter, JournalError>>,
+    journal: std::thread::JoinHandle<Result<JournalWriter, JournalError>>,
     matching: std::thread::JoinHandle<App>,
     response: std::thread::JoinHandle<()>,
     replication: Option<std::thread::JoinHandle<()>>,
@@ -833,7 +846,7 @@ fn shutdown_pipeline_stages(
 #[allow(clippy::too_many_arguments)]
 fn run_as_primary<L: BlockingTransportListener>(
     exchange: App,
-    writer: SectorWriter,
+    writer: JournalWriter,
     mut listener: L,
     config: &ServerConfig,
     shutdown: Arc<AtomicBool>,
@@ -2498,7 +2511,7 @@ pub(crate) fn empty_app_for_seed(_config: &ServerConfig) -> App {
 /// duplicating the recovery / snapshot / rotation logic.
 pub(crate) fn init_engine(
     config: &ServerConfig,
-) -> Result<(App, SectorWriter, bool), Box<dyn std::error::Error>> {
+) -> Result<(App, JournalWriter, bool), Box<dyn std::error::Error>> {
     // Check for a snapshot: either the explicit --snapshot path, or the
     // default derived path (used by auto-rotation when --snapshot is not set).
     let derived_snap = config.journal.with_extension("snapshot");
@@ -2511,12 +2524,17 @@ pub(crate) fn init_engine(
     });
 
     let journal_exists = config.journal.exists();
+    let writer_mode = config.journal_writer;
     let mut engine: JournaledApp<App> = if let Some(snap_path) = snap_path
         && snap_path.exists()
         && journal_exists
     {
-        info!(snapshot = %snap_path.display(), "recovering from snapshot + journal");
-        JournaledApp::<App>::recover_from_snapshot(snap_path, &config.journal)?
+        info!(snapshot = %snap_path.display(), writer_mode = %writer_mode, "recovering from snapshot + journal");
+        JournaledApp::<App>::recover_from_snapshot_with_mode(
+            snap_path,
+            &config.journal,
+            writer_mode,
+        )?
     } else if let Some(snap_path) = snap_path
         && snap_path.exists()
         && !journal_exists
@@ -2526,19 +2544,32 @@ pub(crate) fn init_engine(
         // alone and create a fresh journal.
         info!(
             snapshot = %snap_path.display(),
+            writer_mode = %writer_mode,
             "recovering from snapshot only (journal missing, post-rotation crash?)"
         );
         let (app, snap_sequence, snap_chain_hash) =
             melin_transport_core::snapshot::load::<App>(snap_path)?;
-        let writer =
-            SectorWriter::create_continuing(&config.journal, snap_sequence + 1, snap_chain_hash)?;
+        let writer = JournalWriter::create_continuing(
+            writer_mode,
+            &config.journal,
+            snap_sequence + 1,
+            snap_chain_hash,
+        )?;
         JournaledApp::<App>::from_parts(app, writer)
     } else if journal_exists {
-        info!("recovering from journal");
-        JournaledApp::<App>::recover(empty_app_for_seed(config), &config.journal)?
+        info!(writer_mode = %writer_mode, "recovering from journal");
+        JournaledApp::<App>::recover_with_mode(
+            empty_app_for_seed(config),
+            &config.journal,
+            writer_mode,
+        )?
     } else {
-        info!("creating new journal");
-        JournaledApp::<App>::create(empty_app_for_seed(config), &config.journal)?
+        info!(writer_mode = %writer_mode, "creating new journal");
+        JournaledApp::<App>::create_with_mode(
+            empty_app_for_seed(config),
+            &config.journal,
+            writer_mode,
+        )?
     };
 
     let needs_seeding = !journal_exists;

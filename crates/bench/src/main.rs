@@ -240,6 +240,14 @@ struct BenchArgs {
     /// Use this to place the journal on a dedicated disk for benchmarking.
     #[arg(long)]
     journal: Option<std::path::PathBuf>,
+    /// Journal writer mode (`buffered` | `sector`). Defaults to the
+    /// project-wide default (currently `buffered`).
+    #[arg(
+        long,
+        default_value_t = melin_engine::journal::JournalWriterMode::default(),
+        value_parser = melin_engine::journal::JournalWriterMode::parse,
+    )]
+    journal_writer: melin_engine::journal::JournalWriterMode,
     /// Number of trading accounts.
     #[arg(long, default_value_t = 10_000)]
     accounts: u32,
@@ -363,6 +371,7 @@ fn main() {
                 args.journal,
                 json_path,
                 args.max_journal_batch,
+                args.journal_writer,
             );
         }
         "roundtrip" => {
@@ -737,10 +746,11 @@ fn run_pipeline_bench(
     journal_path: Option<std::path::PathBuf>,
     json_path: Option<&std::path::Path>,
     max_journal_batch: usize,
+    journal_writer_mode: melin_engine::journal::JournalWriterMode,
 ) {
     use melin_engine::journal::InputSlot;
     use melin_engine::journal::JournalEvent;
-    use melin_engine::journal::SectorWriter;
+    use melin_engine::journal::JournalWriter;
     use melin_engine::journal::pipeline::build_pipeline_with_replication;
     use melin_engine::journal::trace::trace_ts;
     use melin_engine::journal::wall_clock_nanos;
@@ -760,7 +770,8 @@ fn run_pipeline_bench(
 
     let tmp_dir = tempdir();
     let effective_journal = journal_path.unwrap_or_else(|| tmp_dir.join("pipeline-bench.journal"));
-    let writer = SectorWriter::create(&effective_journal).expect("create journal");
+    let writer = JournalWriter::create(journal_writer_mode, &effective_journal)
+        .expect("create journal");
 
     let group_commit_delay = Duration::from_micros(group_commit_us);
     let active_conns = Arc::new(AtomicU64::new(0));
