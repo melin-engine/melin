@@ -79,9 +79,6 @@ pub trait JournalWrite<E: AppEvent>: Sized {
     /// Drop the pending batch without writing it.
     fn discard_batch_buf(&mut self);
 
-    /// Issue a sync without flushing any pending batch first.
-    fn sync(&mut self) -> Result<(), JournalError>;
-
     // ---- state queries ----
 
     /// Sequence number that the next `allocate_sequence` call will return.
@@ -89,8 +86,6 @@ pub trait JournalWrite<E: AppEvent>: Sized {
     /// Force the next allocated sequence number — used by replicas to
     /// adopt the primary's numbering.
     fn set_next_sequence(&mut self, seq: u64);
-    /// File offset of the next durable write (excludes the pending batch).
-    fn write_pos(&self) -> u64;
     /// File offset of the last byte known to be durable on disk.
     fn valid_end(&self) -> u64;
     /// On-disk path of the active segment.
@@ -103,10 +98,7 @@ pub trait JournalWrite<E: AppEvent>: Sized {
 
     // ---- replication framing ----
 
-    /// Raw bytes of the batch that has been encoded but not yet flushed.
-    /// The replication stage snapshots this slice to ship over the wire.
-    fn pending_batch_bytes(&self) -> &[u8];
-    /// Slice of `pending_batch_bytes` covering only the most recently
+    /// Slice of the pending batch covering only the most recently
     /// encoded user entry — what replicas need to advance their state.
     fn last_user_entry_replication_slice(&self) -> &[u8];
 
@@ -129,17 +121,9 @@ pub trait JournalWrite<E: AppEvent>: Sized {
     /// Encode and durably flush a single event.
     #[inline]
     fn append(&mut self, event: &JournalEvent<E>) -> Result<u64, JournalError> {
-        let seq = self.batch_append(event)?;
+        let seq = self.batch_append_with_ts(event, wall_clock_nanos(), 0, 0)?;
         self.flush_batch_sync()?;
         Ok(seq)
-    }
-
-    /// Encode an event into the batch buffer using a freshly-sampled
-    /// wall-clock timestamp. Call [`flush_batch_sync`](Self::flush_batch_sync)
-    /// to make it durable.
-    #[inline]
-    fn batch_append(&mut self, event: &JournalEvent<E>) -> Result<u64, JournalError> {
-        self.batch_append_with_ts(event, wall_clock_nanos(), 0, 0)
     }
 
     /// Encode an event into the batch buffer with a caller-provided
@@ -219,11 +203,6 @@ impl<E: AppEvent> JournalWrite<E> for SectorWriter<E> {
     }
 
     #[inline]
-    fn sync(&mut self) -> Result<(), JournalError> {
-        SectorWriter::sync(self)
-    }
-
-    #[inline]
     fn next_sequence(&self) -> u64 {
         SectorWriter::next_sequence(self)
     }
@@ -231,11 +210,6 @@ impl<E: AppEvent> JournalWrite<E> for SectorWriter<E> {
     #[inline]
     fn set_next_sequence(&mut self, seq: u64) {
         SectorWriter::set_next_sequence(self, seq)
-    }
-
-    #[inline]
-    fn write_pos(&self) -> u64 {
-        SectorWriter::write_pos(self)
     }
 
     #[inline]
@@ -256,11 +230,6 @@ impl<E: AppEvent> JournalWrite<E> for SectorWriter<E> {
     #[inline]
     fn events_since_checkpoint(&self) -> u64 {
         SectorWriter::events_since_checkpoint(self)
-    }
-
-    #[inline]
-    fn pending_batch_bytes(&self) -> &[u8] {
-        SectorWriter::pending_batch_bytes(self)
     }
 
     #[inline]
@@ -339,11 +308,6 @@ impl<E: AppEvent> JournalWrite<E> for BufferedWriter<E> {
     }
 
     #[inline]
-    fn sync(&mut self) -> Result<(), JournalError> {
-        BufferedWriter::sync(self)
-    }
-
-    #[inline]
     fn next_sequence(&self) -> u64 {
         BufferedWriter::next_sequence(self)
     }
@@ -351,11 +315,6 @@ impl<E: AppEvent> JournalWrite<E> for BufferedWriter<E> {
     #[inline]
     fn set_next_sequence(&mut self, seq: u64) {
         BufferedWriter::set_next_sequence(self, seq)
-    }
-
-    #[inline]
-    fn write_pos(&self) -> u64 {
-        BufferedWriter::write_pos(self)
     }
 
     #[inline]
@@ -376,11 +335,6 @@ impl<E: AppEvent> JournalWrite<E> for BufferedWriter<E> {
     #[inline]
     fn events_since_checkpoint(&self) -> u64 {
         BufferedWriter::events_since_checkpoint(self)
-    }
-
-    #[inline]
-    fn pending_batch_bytes(&self) -> &[u8] {
-        BufferedWriter::pending_batch_bytes(self)
     }
 
     #[inline]
@@ -451,19 +405,11 @@ mod tests {
             .encode_event(seq, ts, &JournalEvent::App(TestEvent(seq)), 0, 0)
             .unwrap();
 
-        // Replication framing slices should now be populated.
-        assert!(!writer.pending_batch_bytes().is_empty());
+        // Replication framing slice should now be populated.
         assert!(!writer.last_user_entry_replication_slice().is_empty());
-        assert!(
-            writer.last_user_entry_replication_slice().len() <= writer.pending_batch_bytes().len()
-        );
 
         writer.flush_batch_sync().unwrap();
         assert!(writer.valid_end() > initial_valid_end);
-        assert!(writer.valid_end() >= writer.write_pos());
-
-        // Standalone sync after a clean flush is a barrier; must succeed.
-        writer.sync().unwrap();
 
         // set_next_sequence overrides the counter — proves the setter
         // routes through the trait, not just past it.

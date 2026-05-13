@@ -503,14 +503,6 @@ impl<E: AppEvent> BufferedWriter<E> {
         self.last_user_entry_len = 0;
     }
 
-    /// Issue an `fdatasync` without flushing any pending batch first.
-    /// Useful as a standalone barrier — for example, to make a header-
-    /// only state durable before a control-plane operation.
-    pub fn sync(&mut self) -> Result<(), JournalError> {
-        self.file.sync_data()?;
-        Ok(())
-    }
-
     pub fn next_sequence(&self) -> u64 {
         self.next_sequence
     }
@@ -873,7 +865,7 @@ mod tests {
 
         let mut writer = BufferedWriter::<TestEvent>::create(&path).unwrap();
         for i in 1..=10u64 {
-            writer.batch_append(&sample(i)).unwrap();
+            writer.batch_append_with_ts(&sample(i), 0, 0, 0).unwrap();
         }
         // Before flush, no user data has reached disk past the header
         // + genesis. After flush, all ten entries land in one pwrite.
@@ -889,8 +881,8 @@ mod tests {
         let path = dir.path().join("test.journal");
 
         let mut writer = BufferedWriter::<TestEvent>::create(&path).unwrap();
-        writer.batch_append(&sample(1)).unwrap();
-        writer.batch_append(&sample(2)).unwrap();
+        writer.batch_append_with_ts(&sample(1), 0, 0, 0).unwrap();
+        writer.batch_append_with_ts(&sample(2), 0, 0, 0).unwrap();
         assert!(!writer.pending_batch_bytes().is_empty());
 
         writer.discard_batch_buf();
@@ -1017,7 +1009,7 @@ mod tests {
         let path = dir.path().join("test.journal");
 
         let mut writer = BufferedWriter::<TestEvent>::create(&path).unwrap();
-        writer.batch_append(&sample(42)).unwrap();
+        writer.batch_append_with_ts(&sample(42), 0, 0, 0).unwrap();
 
         // The full encoded entry is [magic(2) | header | payload | CRC(4)].
         // The replication slice strips the leading magic and trailing CRC.

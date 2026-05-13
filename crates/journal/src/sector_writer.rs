@@ -899,15 +899,6 @@ impl<E: AppEvent> SectorWriter<E> {
         self.spare_buf = Some(batch.buf);
     }
 
-    /// Flush the journal to disk (fdatasync).
-    ///
-    /// Legacy sync path — only used during shutdown drain. Production
-    /// hot path uses `flush_batch_sync()` instead.
-    pub fn sync(&mut self) -> Result<(), JournalError> {
-        self.file.sync_data()?;
-        Ok(())
-    }
-
     /// Current next sequence number (useful for snapshot coordination).
     pub fn next_sequence(&self) -> u64 {
         self.next_sequence
@@ -1708,7 +1699,7 @@ mod tests {
         {
             let mut writer = SectorWriter::<TestEvent>::create(&path).unwrap();
             for event in &events {
-                writer.batch_append(event).unwrap();
+                writer.batch_append_with_ts(event, 0, 0, 0).unwrap();
             }
             writer.flush_batch_sync().unwrap();
         }
@@ -1729,7 +1720,9 @@ mod tests {
         let mut writer = SectorWriter::<TestEvent>::create(&path).unwrap();
         // valid_end() includes tail_sector data; write_pos is sector-aligned base.
         let pos_before = writer.valid_end();
-        writer.batch_append(&sample_event()).unwrap();
+        writer
+            .batch_append_with_ts(&sample_event(), 0, 0, 0)
+            .unwrap();
         // batch_append only writes to the in-memory batch buffer, not tail_sector.
         assert_eq!(writer.valid_end(), pos_before);
         writer.flush_batch_sync().unwrap();
@@ -1943,7 +1936,7 @@ mod tests {
         let mut writer = SectorWriter::<TestEvent>::create(&path).unwrap();
         for i in 0..3 {
             writer
-                .batch_append(&JournalEvent::App(TestEvent(i)))
+                .batch_append_with_ts(&JournalEvent::App(TestEvent(i)), 0, 0, 0)
                 .unwrap();
             writer.flush_batch_sync().unwrap();
         }
