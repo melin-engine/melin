@@ -20,6 +20,10 @@ use tracing::{debug, error, info, warn};
 
 #[allow(unused_imports)] // used by some feature combinations only
 use melin_journal::JournalWrite;
+use melin_transport_core::pipeline::{JournalStage, JournalStageRun};
+
+use crate::TradingEvent;
+
 use melin_rumcast::pub_log::{ClaimError, PublicationConfig, PublicationLog};
 use melin_rumcast::receiver::{ReceiverConfig, ReceiverLoop};
 use melin_rumcast::sender::{SenderConfig, SenderLoop};
@@ -99,16 +103,11 @@ pub fn run_receiver_rumcast<W>(
     pipeline_depth: usize,
 ) -> super::ReceiverResult<W>
 where
-    W: melin_journal::JournalWrite<melin_trading::trading_event::TradingEvent> + Send + 'static,
-    melin_transport_core::pipeline::JournalStage<melin_trading::trading_event::TradingEvent, W>:
-        melin_transport_core::pipeline::JournalStageRun<
-                melin_trading::trading_event::TradingEvent,
-                Writer = W,
-            >,
+    W: JournalWrite<TradingEvent> + Send + 'static,
+    JournalStage<TradingEvent, W>: JournalStageRun<TradingEvent, Writer = W>,
 {
     use crate::App;
     use melin_transport_core::JournaledApp;
-    use melin_transport_core::pipeline::JournalStageRun;
 
     // ---- Recover local state from journal (if any) ----
     let (mut exchange, mut journal_writer, mut last_sequence, mut chain_hash) =

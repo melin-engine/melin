@@ -47,6 +47,11 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
+use melin_journal::JournalWrite;
+use melin_transport_core::pipeline::{JournalStage, JournalStageRun};
+
+use crate::TradingEvent;
+
 mod auth;
 mod catchup;
 #[cfg(feature = "dpdk")]
@@ -398,14 +403,9 @@ pub(super) fn build_replica_pipeline_with_threads<W>(
     rotation: Option<(u64, Arc<AtomicBool>)>,
 ) -> Result<ReplicaPipelineHandles<W>, Box<dyn std::error::Error>>
 where
-    W: melin_journal::JournalWrite<melin_trading::trading_event::TradingEvent> + Send + 'static,
-    melin_transport_core::pipeline::JournalStage<melin_trading::trading_event::TradingEvent, W>:
-        melin_transport_core::pipeline::JournalStageRun<
-                melin_trading::trading_event::TradingEvent,
-                Writer = W,
-            >,
+    W: JournalWrite<TradingEvent> + Send + 'static,
+    JournalStage<TradingEvent, W>: JournalStageRun<TradingEvent, Writer = W>,
 {
-    use melin_transport_core::pipeline::JournalStageRun;
     let shadow_exchange = <crate::App as melin_app::Application>::clone_via_snapshot(&exchange)?;
 
     let enable_shadow = snapshot_interval_ms > 0;

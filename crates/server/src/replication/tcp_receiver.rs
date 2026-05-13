@@ -12,6 +12,11 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use tracing::{debug, error, info, warn};
 
+use melin_journal::JournalWrite;
+use melin_transport_core::pipeline::{JournalStage, JournalStageRun};
+
+use crate::TradingEvent;
+
 /// Force the kernel to send a TCP ACK immediately rather than holding
 /// it in the delayed-ACK timer (~40 ms on Linux). Linux clears
 /// `TCP_QUICKACK` after each ACK it sends, so this must be re-armed
@@ -772,12 +777,8 @@ pub fn run_receiver<W>(
     max_orders_burst: u32,
 ) -> ReceiverResult<W>
 where
-    W: melin_journal::JournalWrite<melin_trading::trading_event::TradingEvent> + Send + 'static,
-    melin_transport_core::pipeline::JournalStage<melin_trading::trading_event::TradingEvent, W>:
-        melin_transport_core::pipeline::JournalStageRun<
-                melin_trading::trading_event::TradingEvent,
-                Writer = W,
-            >,
+    W: JournalWrite<TradingEvent> + Send + 'static,
+    JournalStage<TradingEvent, W>: JournalStageRun<TradingEvent, Writer = W>,
 {
     use crate::App;
 

@@ -24,18 +24,14 @@ use tracing::{debug, error, info, warn};
 use crate::App;
 use crate::BufferedWriter;
 use crate::SectorWriter;
+use crate::TradingEvent;
 use melin_journal::JournalError;
 use melin_journal::JournalWrite;
 use melin_transport_core::journaled_app::JournaledApp;
 use melin_transport_core::pipeline::{
-    JournalStageRun, Pipeline as GenericPipeline, build_pipeline_with_replication,
+    JournalStage, JournalStageRun, Pipeline as GenericPipeline, build_pipeline_with_replication,
 };
 pub type Pipeline<W> = GenericPipeline<App, W>;
-
-/// `TradingEvent`-bound shorthand used pervasively in this module to
-/// keep the `JournalStageRun` trait bound at every generic call site
-/// short. Kept private to `server.rs`.
-type TradingEvent = melin_trading::trading_event::TradingEvent;
 
 use melin_protocol::auth::{AuthorizedKeys, Permission};
 use melin_protocol::blocking::BlockingFrameWriter;
@@ -615,8 +611,7 @@ fn run_with_shutdown_impl<L, W>(
 where
     L: BlockingTransportListener,
     W: JournalWrite<TradingEvent> + Send + 'static,
-    melin_transport_core::pipeline::JournalStage<TradingEvent, W>:
-        JournalStageRun<TradingEvent, Writer = W>,
+    JournalStage<TradingEvent, W>: JournalStageRun<TradingEvent, Writer = W>,
 {
     // Shared durability-mode atomic, constructed once per process and
     // threaded through both modes. Wiring it on the replica path
@@ -893,8 +888,7 @@ fn run_as_primary<L, W>(
 where
     L: BlockingTransportListener,
     W: JournalWrite<TradingEvent> + Send + 'static,
-    melin_transport_core::pipeline::JournalStage<TradingEvent, W>:
-        JournalStageRun<TradingEvent, Writer = W>,
+    JournalStage<TradingEvent, W>: JournalStageRun<TradingEvent, Writer = W>,
 {
     // Active connection counter shared between accept loop, response
     // stage, and matching stage (for stats queries).
@@ -1754,8 +1748,7 @@ fn run_dpdk_impl<W>(
 ) -> Result<(), Box<dyn std::error::Error>>
 where
     W: JournalWrite<TradingEvent> + Send + 'static,
-    melin_transport_core::pipeline::JournalStage<TradingEvent, W>:
-        JournalStageRun<TradingEvent, Writer = W>,
+    JournalStage<TradingEvent, W>: JournalStageRun<TradingEvent, Writer = W>,
 {
     // Mirrors the kernel-TCP `run_with_shutdown` path: one atomic per
     // process, threaded into both replica (pre-staging for promotion)

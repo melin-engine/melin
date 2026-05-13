@@ -12,7 +12,11 @@ use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
 use tracing::{debug, info, warn};
 
+use melin_journal::JournalWrite;
 use melin_journal::replication::ReplicationConsumer;
+use melin_transport_core::pipeline::{JournalStage, JournalStageRun};
+
+use crate::TradingEvent;
 
 use super::catchup::{can_catch_up_from_journal, discover_journal_files};
 use super::protocol::{
@@ -931,12 +935,8 @@ pub fn run_receiver_dpdk<W>(
     max_orders_burst: u32,
 ) -> ReceiverResult<W>
 where
-    W: melin_journal::JournalWrite<melin_trading::trading_event::TradingEvent> + Send + 'static,
-    melin_transport_core::pipeline::JournalStage<melin_trading::trading_event::TradingEvent, W>:
-        melin_transport_core::pipeline::JournalStageRun<
-                melin_trading::trading_event::TradingEvent,
-                Writer = W,
-            >,
+    W: JournalWrite<TradingEvent> + Send + 'static,
+    JournalStage<TradingEvent, W>: JournalStageRun<TradingEvent, Writer = W>,
 {
     use crate::App;
 

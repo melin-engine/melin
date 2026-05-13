@@ -90,8 +90,11 @@ use melin_rumcast::shared_udp::SharedUdp;
 use melin_rumcast::transport::{KernelUdp, UdpTransport};
 use melin_rumcast::wire::{FrameView, data_flags};
 use melin_trading::types::QueryResponse;
-use melin_transport_core::pipeline::{OutputPayload, Pipeline, build_pipeline_with_replication};
+use melin_transport_core::pipeline::{
+    JournalStage, JournalStageRun, OutputPayload, Pipeline, build_pipeline_with_replication,
+};
 
+use crate::TradingEvent;
 use crate::server::{ServerConfig, init_engine};
 use crate::{InputSlot, JournalEvent, OutputSlot};
 
@@ -290,12 +293,8 @@ fn run_rumcast_impl<W>(
     shutdown: Arc<AtomicBool>,
 ) -> Result<(), Box<dyn std::error::Error>>
 where
-    W: melin_journal::JournalWrite<melin_trading::trading_event::TradingEvent> + Send + 'static,
-    melin_transport_core::pipeline::JournalStage<melin_trading::trading_event::TradingEvent, W>:
-        melin_transport_core::pipeline::JournalStageRun<
-                melin_trading::trading_event::TradingEvent,
-                Writer = W,
-            >,
+    W: JournalWrite<TradingEvent> + Send + 'static,
+    JournalStage<TradingEvent, W>: JournalStageRun<TradingEvent, Writer = W>,
 {
     // One shared mode atomic per process — see the kernel-TCP
     // `run_with_shutdown` for the rationale (pre-staging the
@@ -322,12 +321,8 @@ fn run_rumcast_primary<W>(
     durability_mode_atomic: Arc<AtomicU8>,
 ) -> Result<(), Box<dyn std::error::Error>>
 where
-    W: melin_journal::JournalWrite<melin_trading::trading_event::TradingEvent> + Send + 'static,
-    melin_transport_core::pipeline::JournalStage<melin_trading::trading_event::TradingEvent, W>:
-        melin_transport_core::pipeline::JournalStageRun<
-                melin_trading::trading_event::TradingEvent,
-                Writer = W,
-            >,
+    W: JournalWrite<TradingEvent> + Send + 'static,
+    JournalStage<TradingEvent, W>: JournalStageRun<TradingEvent, Writer = W>,
 {
     info!(
         bind = %rumcast_config.bind,
@@ -425,14 +420,9 @@ fn run_rumcast_primary_with_state<W>(
     durability_mode_atomic: Arc<AtomicU8>,
 ) -> Result<(), Box<dyn std::error::Error>>
 where
-    W: melin_journal::JournalWrite<melin_trading::trading_event::TradingEvent> + Send + 'static,
-    melin_transport_core::pipeline::JournalStage<melin_trading::trading_event::TradingEvent, W>:
-        melin_transport_core::pipeline::JournalStageRun<
-                melin_trading::trading_event::TradingEvent,
-                Writer = W,
-            >,
+    W: JournalWrite<TradingEvent> + Send + 'static,
+    JournalStage<TradingEvent, W>: JournalStageRun<TradingEvent, Writer = W>,
 {
-    use melin_transport_core::pipeline::JournalStageRun;
     let enable_replication = config.replication_bind.is_some();
     if enable_replication && config.standalone {
         return Err("--replication-bind and --standalone are mutually exclusive".into());
@@ -2099,7 +2089,6 @@ fn seed_and_drain(
 ) {
     use melin_journal::trace::trace_ts;
     use melin_journal::wall_clock_nanos as journal_wall_clock_nanos;
-    use melin_trading::trading_event::TradingEvent;
     use melin_trading::types::{AccountId, CurrencyId, InstrumentSpec, Symbol};
 
     let seed_start = std::time::Instant::now();
@@ -2180,12 +2169,8 @@ fn run_rumcast_replica<W>(
     durability_mode_atomic: Arc<AtomicU8>,
 ) -> Result<(), Box<dyn std::error::Error>>
 where
-    W: melin_journal::JournalWrite<melin_trading::trading_event::TradingEvent> + Send + 'static,
-    melin_transport_core::pipeline::JournalStage<melin_trading::trading_event::TradingEvent, W>:
-        melin_transport_core::pipeline::JournalStageRun<
-                melin_trading::trading_event::TradingEvent,
-                Writer = W,
-            >,
+    W: JournalWrite<TradingEvent> + Send + 'static,
+    JournalStage<TradingEvent, W>: JournalStageRun<TradingEvent, Writer = W>,
 {
     info!(
         primary = %primary_addr,
