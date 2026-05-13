@@ -863,8 +863,8 @@ The pipeline does **not** crash on journal I/O errors. The journal stage logs th
 For best journal performance, use an NVMe drive with:
 
 - **Power Loss Protection (PLP)**: Required. The journal relies on PLP capacitors to flush controller DRAM to NAND on power loss. Consumer SSDs and drives without confirmed PLP support are not safe for production use.
-- **Dedicated journal disk**: Avoids contention with OS I/O. The journal writer uses `O_DIRECT` writes which bypass the page cache, but sharing the disk with other workloads increases p99 latency.
-- **Mount with `noatime`**: Prevents inode mtime/atime updates on every write. Without `noatime`, these metadata changes accumulate in ext4's jbd2 transaction buffer and trigger periodic full cache flushes (~1-2ms stalls every few seconds).
+- **Dedicated journal disk**: Avoids contention with OS I/O. Sharing the disk with the OS or other workloads increases p99 latency.
+- **Use xfs, not ext4**: ext4's jbd2 batches metadata commits at internal extent-group boundaries (~256 MiB on the layouts we see), which adds a ~1–2 ms `fdatasync` stall every ~10 s of sustained writes. With hybrid durability and ≥ 2 replicas the stalls usually mask each other, but because the bench's event stream is byte-deterministic the same offset triggers the same stall on every node simultaneously — defeating the masking. xfs allocates extents through a different bookkeeping path that doesn't fire at write-time, so the periodic spike vanishes. Mount xfs with `noatime,logbsize=256k,logbufs=8`. `scripts/cherry-setup.sh` does this automatically.
 
 ---
 

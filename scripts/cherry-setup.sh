@@ -459,29 +459,42 @@ done
 if [[ -n "$JOURNAL_DISK" ]]; then
     echo "=== Journal disk: $JOURNAL_DISK → $JOURNAL_MOUNT ==="
 
-    # Format if no filesystem yet.
+    # Filesystem: xfs. We previously used ext4 with `data=writeback,
+    # journal_async_commit, commit=300` and observed periodic 1–2 ms
+    # `fdatasync` spikes at ~256 MiB write boundaries, correlated across
+    # all replicas (deterministic event stream → identical byte layout →
+    # ext4's jbd2 metadata batching fires at the same offset on every
+    # node). The hybrid durability gate masks single-node hiccups, but
+    # when all three nodes hit the spike simultaneously the bench sees a
+    # ~10 s-cadence outlier in the tail. xfs doesn't exhibit this
+    # behaviour on the same hardware: same throughput, p50/p99 unchanged,
+    # max latency cut from ~2.6 ms to ~1.5 ms and the periodic cadence
+    # vanishes entirely.
     if ! blkid "$JOURNAL_DISK" | grep -q TYPE; then
-        echo "  Formatting $JOURNAL_DISK as ext4..."
-        mkfs.ext4 -q "$JOURNAL_DISK"
+        echo "  Formatting $JOURNAL_DISK as xfs..."
+        mkfs.xfs -f -q "$JOURNAL_DISK"
+    elif ! blkid "$JOURNAL_DISK" | grep -q 'TYPE="xfs"'; then
+        # Migrating from a previous ext4 layout: wipe and reformat. Safe
+        # at setup time — nothing has opened the journal yet.
+        echo "  Migrating $JOURNAL_DISK from $(blkid -s TYPE -o value "$JOURNAL_DISK") to xfs..."
+        mountpoint -q "$JOURNAL_MOUNT" && umount "$JOURNAL_MOUNT"
+        wipefs -a "$JOURNAL_DISK" >/dev/null
+        mkfs.xfs -f -q "$JOURNAL_DISK"
+        # Drop any stale ext4 fstab entry; we re-add the xfs one below.
+        sed -i "\| $JOURNAL_MOUNT |d" /etc/fstab
     fi
 
     mkdir -p "$JOURNAL_MOUNT"
 
-    # Mount options optimized for journal I/O on dedicated NVMe:
-    #   noatime:    skip access-time metadata updates
-    #   nobarrier:  skip disk cache flush barriers — redundant with
-    #               NVMe FUA + RWF_DSYNC (per-write durability)
-    #   data=writeback: don't order data writes before metadata journal
-    #               commits — safe because RWF_DSYNC ensures data is on
-    #               persistent storage before the syscall returns
-    #   journal_async_commit: don't wait for ext4 journal commit completion
-    #               before returning from metadata operations — reduces
-    #               latency for extent conversions (unwritten → written)
-    #   commit=300: delay ext4 journal commits to every 300s instead of 5s
-    #               — our data path (RWF_DSYNC/FUA) doesn't rely on ext4
-    #               journal commits for durability, so minimize their
-    #               frequency to reduce jbd2 lock contention
-    JOURNAL_MOUNT_OPTS="noatime,nobarrier,data=writeback,journal_async_commit,commit=300"
+    # Mount options for journal I/O on dedicated NVMe + xfs:
+    #   noatime:     skip access-time metadata updates
+    #   logbsize=256k: larger in-memory log buffer reduces log-write
+    #                 frequency, letting xfs batch metadata changes
+    #                 (extent conversions, inode timestamp bumps) into
+    #                 fewer, larger journal writes
+    #   logbufs=8:   match xfs's max log buffers; trades a bit of memory
+    #                for less log-buffer contention at this write rate
+    JOURNAL_MOUNT_OPTS="noatime,logbsize=256k,logbufs=8"
 
     # Mount if not already mounted.
     if ! mountpoint -q "$JOURNAL_MOUNT"; then
@@ -489,18 +502,18 @@ if [[ -n "$JOURNAL_DISK" ]]; then
         echo "  Mounted $JOURNAL_DISK at $JOURNAL_MOUNT ($JOURNAL_MOUNT_OPTS)"
     else
         echo "  Already mounted at $JOURNAL_MOUNT"
-        # data=writeback cannot be changed via remount — must unmount first.
-        # Safe during setup: nothing is using the journal disk yet.
-        echo "  Unmounting and remounting with optimized options..."
-        umount "$JOURNAL_MOUNT"
-        mount -o "$JOURNAL_MOUNT_OPTS" "$JOURNAL_DISK" "$JOURNAL_MOUNT"
+        # Remount with the standard options. xfs accepts remount for the
+        # options we set; safe during setup since nothing is using the
+        # journal disk yet.
+        echo "  Remounting with standard options..."
+        mount -o "remount,$JOURNAL_MOUNT_OPTS" "$JOURNAL_MOUNT"
         echo "  Remounted with $JOURNAL_MOUNT_OPTS"
     fi
 
     # Add to fstab if not present.
     if ! grep -q "$JOURNAL_MOUNT" /etc/fstab; then
         UUID=$(blkid -s UUID -o value "$JOURNAL_DISK")
-        echo "UUID=$UUID $JOURNAL_MOUNT ext4 $JOURNAL_MOUNT_OPTS 0 2" >> /etc/fstab
+        echo "UUID=$UUID $JOURNAL_MOUNT xfs $JOURNAL_MOUNT_OPTS 0 2" >> /etc/fstab
         echo "  Added to /etc/fstab (UUID=$UUID)"
     fi
 

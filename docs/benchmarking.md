@@ -335,20 +335,23 @@ The max latency in engine-only mode is caused by System Management Interrupts (S
 
 On AMD CPUs, SMI counts cannot be measured (MSR 0x34 is Intel-specific). The `bench-isolate.sh` script attempts to read it and reports results on Intel hardware.
 
-### NVMe tail in standalone / single-replication modes
+### Filesystem-level tail in standalone / single-replication modes
 
-When the response stage waits on a local journal fsync for every order (standalone, or single-replication where the primary needs both local disk and the replica), the tail latency floor is set by the NVMe drive, not the engine. Enterprise NVMe drives occasionally pause command processing for ~1-2 ms to run internal garbage collection or wear-leveling. The bursts are short (tens to hundreds of ms) and rare — on a Micron 7450, roughly 1 in 10,000 commands takes >800 µs while the rest complete in ~25 µs. Pauses are triggered by the drive's internal free-list state under sustained writes, not by a wall-clock timer, so the observed cadence varies run to run.
+When the response stage waits on a local journal `fdatasync` for every order (standalone, or single-replication where the primary needs both local disk and the replica), the tail-latency floor is set by the *filesystem*, not the drive. With ext4, jbd2 batches metadata commits at internal extent-group boundaries and fires a 1–2 ms `fdatasync` every ~256 MiB of sustained writes. The drive itself doesn't pause — we verified with OCP `latency-monitor-log` (zero NVMe commands above 10 ms during a 60 s run on a Micron 7400 PRO) that no individual NVMe command exceeds the threshold. The stall is between the syscall and the device.
 
-Symptoms you will see at this floor:
+xfs doesn't exhibit this behaviour on the same hardware: same throughput, p50/p99 unchanged, max latency cut from ~2.6 ms to ~1.5 ms, and the periodic cadence vanishes. `scripts/cherry-setup.sh` formats the journal disk as xfs with `noatime,logbsize=256k,logbufs=8` for this reason.
+
+Symptoms you will see on ext4 at this floor:
 
 - p99.9 is clean (<100 µs), p99.99 may creep above 1 ms.
-- A small number of round-trips sit in the 0.5-2 ms range under persist mode but disappear entirely under `--features no-persist` (which skips journal I/O — unsafe for production, useful for confirming the hardware floor).
+- A small number of round-trips sit in the 0.5–2 ms range under persist mode but disappear entirely under `--features no-persist` (which skips `fdatasync` — unsafe for production, useful for confirming the floor).
+- Spikes show a deterministic ~10 s cadence under sustained ~95 k ord/s.
 
 **Mitigations when a tighter tail matters:**
 
-- **Run with dual replication and quorum durability** (default when 2 replicas are connected). The response stage then releases on any two of `{local fsync, replica 1 ack, replica 2 ack}` — the local NVMe is off the critical path whenever at least one replica has acked. This is the configuration the published peak-load numbers use. See [replication.md](replication.md).
-- **Raise drive over-provisioning.** Create a smaller NVMe namespace that reserves more unallocated capacity (e.g., 28% instead of the default ~7%). Fewer valid pages per block means less GC copy-on-write and a shorter pause when GC does fire — typically cuts spike frequency 3-5×.
-- **Use higher-endurance media.** Low-DWPD enterprise drives and pseudo-SLC-cache designs hold their tail better than general-purpose TLC parts.
+- **Use xfs for the journal disk.** This is the single biggest win on ext4 systems. See `cherry-setup.sh` for the formatting and mount options.
+- **Run with dual replication and the default `hybrid` durability mode.** The response stage releases as soon as any node has the event on PLP-backed NVMe AND at least one replica has acked in memory — single-node fsync stalls are usually masked. (The ~10 s ext4 spike defeats this masking specifically because deterministic event flow correlates the spike across every node; xfs eliminates the correlation.)
+- **Raise drive over-provisioning** if you stay on ext4. Smaller namespace + more unallocated capacity reduces drive-internal GC pressure that compounds with the fs-level spike.
 
 ## Reproducing Published Benchmarks
 
