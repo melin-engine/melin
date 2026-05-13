@@ -749,14 +749,7 @@ fn run_pipeline_bench(
     max_journal_batch: usize,
     journal_writer_mode: melin_engine::journal::JournalWriterMode,
 ) {
-    use melin_engine::journal::InputSlot;
-    use melin_engine::journal::JournalEvent;
-    use melin_engine::journal::pipeline::{JournalStageRun, build_pipeline_with_replication};
-    use melin_engine::journal::trace::trace_ts;
-    use melin_engine::journal::wall_clock_nanos;
-    type JournalWriter = melin_engine::journal::BufferedWriter;
-
-    let nz = |v: u64| NonZeroU64::new(v).expect("non-zero");
+    use melin_engine::journal::{BufferedWriter, JournalWriterMode, SectorWriter};
 
     // Set up exchange with one instrument and funded account.
     let mut exchange = melin_engine::exchange::Exchange::with_capacity();
@@ -771,18 +764,78 @@ fn run_pipeline_bench(
 
     let tmp_dir = tempdir();
     let effective_journal = journal_path.unwrap_or_else(|| tmp_dir.join("pipeline-bench.journal"));
-    // melin-bench keeps its pipeline construction monomorphised on
-    // `BufferedWriter` — the bench is a standalone harness with its
-    // own knobs, and the production boot-time dispatch over the
-    // sector / buffered split lives in `melin-server`.
-    if journal_writer_mode == melin_engine::journal::JournalWriterMode::Sector {
-        eprintln!(
-            "warning: --journal-writer=sector is parsed but melin-bench \
-             always uses the buffered writer; the flag is recorded for \
-             provenance only"
-        );
+
+    let cfg = PipelineInnerCfg {
+        group_commit_us,
+        max_journal_batch,
+        total_pairs,
+        warmup,
+        window,
+        json_path,
+    };
+
+    // The two arms are forced by monomorphisation — each writer has
+    // its own journal-stage loop (`run_sync` for buffered,
+    // `run_uring` for sector), so we cannot construct a single
+    // `dyn` writer and call once.
+    match journal_writer_mode {
+        JournalWriterMode::Buffered => run_pipeline_inner(
+            exchange,
+            BufferedWriter::create(&effective_journal).expect("create journal"),
+            cfg,
+        ),
+        JournalWriterMode::Sector => run_pipeline_inner(
+            exchange,
+            SectorWriter::create(&effective_journal).expect("create journal"),
+            cfg,
+        ),
     }
-    let writer = JournalWriter::create(&effective_journal).expect("create journal");
+
+    let _ = std::fs::remove_dir_all(&tmp_dir);
+}
+
+/// Non-writer args for [`run_pipeline_inner`]. Bundled so the two
+/// monomorphised call sites in [`run_pipeline_bench`] stay one-liners.
+struct PipelineInnerCfg<'a> {
+    group_commit_us: u64,
+    max_journal_batch: usize,
+    total_pairs: usize,
+    warmup: usize,
+    window: usize,
+    json_path: Option<&'a std::path::Path>,
+}
+
+/// Pipeline-mode body, generic over the journal writer so we get a
+/// statically-dispatched `run_sync` or `run_uring` per writer.
+fn run_pipeline_inner<W>(
+    exchange: melin_engine::exchange::Exchange,
+    writer: W,
+    cfg: PipelineInnerCfg<'_>,
+) where
+    W: melin_engine::journal::JournalWrite<melin_trading::trading_event::TradingEvent>
+        + Send
+        + 'static,
+    melin_engine::journal::JournalStage<W>: melin_engine::journal::pipeline::JournalStageRun<
+            melin_trading::trading_event::TradingEvent,
+            Writer = W,
+        >,
+{
+    use melin_engine::journal::InputSlot;
+    use melin_engine::journal::JournalEvent;
+    use melin_engine::journal::pipeline::{JournalStageRun, build_pipeline_with_replication};
+    use melin_engine::journal::trace::trace_ts;
+    use melin_engine::journal::wall_clock_nanos;
+
+    let PipelineInnerCfg {
+        group_commit_us,
+        max_journal_batch,
+        total_pairs,
+        warmup,
+        window,
+        json_path,
+    } = cfg;
+
+    let nz = |v: u64| NonZeroU64::new(v).expect("non-zero");
 
     let group_commit_delay = Duration::from_micros(group_commit_us);
     let active_conns = Arc::new(AtomicU64::new(0));
@@ -975,8 +1028,6 @@ fn run_pipeline_bench(
     // Wait for pipeline threads to finish and print trace reports.
     let _ = journal_handle.join();
     let _ = matching_handle.join();
-
-    let _ = std::fs::remove_dir_all(&tmp_dir);
 }
 
 // ===========================================================================
