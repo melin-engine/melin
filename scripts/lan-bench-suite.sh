@@ -50,6 +50,11 @@
 #   SKIP_JOURNAL_VERIFY=1  Skip post-run journal consistency check (default: 0)
 #   SINGLE_ORDERS=N        Orders for single-order workload (default: 500000)
 #   WARMUP_ORDERS=N        Warmup orders per client (default: bench default 100000)
+#   COOLDOWN_ORDERS=N      Cooldown orders per client excluded from the histogram
+#                          (default: 0). Useful when the bench's final small
+#                          batch flushes a non-amortised fdatasync that inflates
+#                          run-max with a drain-tail artefact rather than
+#                          steady-state behaviour.
 #   ORDERS_PER_SWEEP=N     Orders per sweep data point (default: 10000000)
 #   LOCAL_ORDERS=N         Orders for local workloads (default: 100000000)
 #   RESULTS_DIR=<path>  Reuse existing results directory (default:
@@ -207,6 +212,7 @@ THROUGHPUT_CLIENTS="${THROUGHPUT_CLIENTS:-16}"
 THROUGHPUT_WINDOW="${THROUGHPUT_WINDOW:-128}"
 SINGLE_ORDERS="${SINGLE_ORDERS:-500000}"
 WARMUP_ORDERS="${WARMUP_ORDERS:-}"  # empty = bench default (100000)
+COOLDOWN_ORDERS="${COOLDOWN_ORDERS:-}"  # empty = bench default (0, no cooldown)
 ORDERS_PER_SWEEP="${ORDERS_PER_SWEEP:-10000000}"
 LOCAL_ORDERS="${LOCAL_ORDERS:-100000000}"
 
@@ -810,6 +816,10 @@ run_bench() {
     if [[ -n "${WARMUP_ORDERS}" ]]; then
         warmup_arg="--warmup ${WARMUP_ORDERS}"
     fi
+    local cooldown_arg=""
+    if [[ -n "${COOLDOWN_ORDERS}" ]]; then
+        cooldown_arg="--cooldown ${COOLDOWN_ORDERS}"
+    fi
     local threads_arg=""
     if [[ -n "${BENCH_THREADS:-}" ]]; then
         threads_arg="--bench-threads ${BENCH_THREADS}"
@@ -821,7 +831,7 @@ run_bench() {
             --key bench.key \
             --json /tmp/bench-results.json \
             --bench-cores 1 \
-            ${warmup_arg} ${threads_arg} \
+            ${warmup_arg} ${cooldown_arg} ${threads_arg} \
             ${orders} $*"
 }
 
@@ -838,6 +848,10 @@ run_bench_rumcast() {
     if [[ -n "${WARMUP_ORDERS}" ]]; then
         warmup_arg="--warmup ${WARMUP_ORDERS}"
     fi
+    local cooldown_arg=""
+    if [[ -n "${COOLDOWN_ORDERS}" ]]; then
+        cooldown_arg="--cooldown ${COOLDOWN_ORDERS}"
+    fi
     # rumcast bench picks an ephemeral local port on all interfaces;
     # the server auto-discovers the response dst from the bench's
     # first inbound frame.
@@ -847,7 +861,7 @@ run_bench_rumcast() {
             --rumcast-bind 0.0.0.0:0 \
             --key bench.key \
             --json /tmp/bench-results.json \
-            ${warmup_arg} \
+            ${warmup_arg} ${cooldown_arg} \
             ${BENCH_EXTRA_ARGS:-} \
             ${orders} $*"
 }
@@ -1725,6 +1739,8 @@ workload_throughput() {
 
     local warmup_arg=""
     if [[ -n "${WARMUP_ORDERS}" ]]; then warmup_arg="--warmup ${WARMUP_ORDERS}"; fi
+    local cooldown_arg=""
+    if [[ -n "${COOLDOWN_ORDERS}" ]]; then cooldown_arg="--cooldown ${COOLDOWN_ORDERS}"; fi
     local threads_arg=""
     if [[ -n "${BENCH_THREADS:-}" ]]; then threads_arg="--bench-threads ${BENCH_THREADS}"; fi
 
@@ -1735,7 +1751,7 @@ workload_throughput() {
                 --health-addr ${CURRENT_HEALTH} \
                 --key bench.key \
                 --json /tmp/bench-results.json \
-                ${BENCH_DPDK_ARGS} ${warmup_arg} ${threads_arg} \
+                ${BENCH_DPDK_ARGS} ${warmup_arg} ${cooldown_arg} ${threads_arg} \
                 ${THROUGHPUT_ORDERS} --clients ${THROUGHPUT_CLIENTS} --window ${THROUGHPUT_WINDOW}"
     elif [[ "$transport" == udp* ]]; then
         run_bench_rumcast "$CURRENT_BIND" "${THROUGHPUT_ORDERS}" --clients "${THROUGHPUT_CLIENTS}" --window "${THROUGHPUT_WINDOW}"
@@ -1756,6 +1772,8 @@ workload_single() {
 
     local warmup_arg=""
     if [[ -n "${WARMUP_ORDERS}" ]]; then warmup_arg="--warmup ${WARMUP_ORDERS}"; fi
+    local cooldown_arg=""
+    if [[ -n "${COOLDOWN_ORDERS}" ]]; then cooldown_arg="--cooldown ${COOLDOWN_ORDERS}"; fi
 
     if [[ "$transport" == dpdk* ]]; then
         ssh $SSH_OPTS "$BENCH" "cd ${REPO_DIR} && source ~/.cargo/env && \
@@ -1764,7 +1782,7 @@ workload_single() {
                 --health-addr ${CURRENT_HEALTH} \
                 --key bench.key \
                 --json /tmp/bench-results.json \
-                ${BENCH_DPDK_ARGS} ${warmup_arg} \
+                ${BENCH_DPDK_ARGS} ${warmup_arg} ${cooldown_arg} \
                 ${SINGLE_ORDERS} --clients 1 --window 1"
     elif [[ "$transport" == udp* ]]; then
         run_bench_rumcast "$CURRENT_BIND" "${SINGLE_ORDERS}" --clients 1 --window 1

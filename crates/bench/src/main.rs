@@ -236,6 +236,14 @@ struct BenchArgs {
     /// branch predictors, and allocator settle before measurement starts.
     #[arg(long, default_value_t = WARMUP_ORDERS)]
     warmup: usize,
+    /// Cooldown orders per client (not measured). The bench's final batch
+    /// flushes a small number of events whose `fdatasync` cost isn't
+    /// amortised across a full batch, inflating the run-max with a
+    /// drain-tail artefact that doesn't reflect steady-state behaviour.
+    /// Set non-zero to exclude the last N orders from the histogram.
+    /// Defaults to 0 (no cooldown).
+    #[arg(long, default_value_t = 0)]
+    cooldown: usize,
     /// Path for the journal file. Defaults to a temporary directory.
     /// Use this to place the journal on a dedicated disk for benchmarking.
     #[arg(long)]
@@ -358,6 +366,7 @@ fn main() {
             run_engine_bench(
                 args.pairs,
                 args.warmup,
+                args.cooldown,
                 args.accounts,
                 args.instruments,
                 json_path,
@@ -369,6 +378,7 @@ fn main() {
                 args.window,
                 args.group_commit_us,
                 args.warmup,
+                args.cooldown,
                 args.journal,
                 json_path,
                 args.max_journal_batch,
@@ -490,6 +500,7 @@ fn main() {
                     args.group_commit_us,
                     args.addr,
                     args.warmup,
+                    args.cooldown,
                     args.journal,
                     args.accounts,
                     args.instruments,
@@ -520,6 +531,7 @@ fn main() {
 fn run_engine_bench(
     total_pairs: usize,
     warmup: usize,
+    cooldown: usize,
     num_accounts: u32,
     num_instruments: u32,
     json_path: Option<&std::path::Path>,
@@ -621,7 +633,8 @@ fn run_engine_bench(
         std::collections::BinaryHeap::with_capacity(SLOWEST_N + 1);
 
     let start = Instant::now();
-    for (i, event) in events[warmup..].iter().enumerate() {
+    let measure_end = events.len().saturating_sub(cooldown);
+    for (i, event) in events[warmup..measure_end].iter().enumerate() {
         reports.clear();
 
         #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
@@ -686,7 +699,7 @@ fn run_engine_bench(
     }
     let wall = start.elapsed();
 
-    let measured = events.len() - warmup;
+    let measured = measure_end.saturating_sub(warmup);
     let total_events = submits + cancels + amends;
     let cancel_pct = if total_events > 0 {
         cancels as f64 / total_events as f64 * 100.0
@@ -739,11 +752,13 @@ fn run_engine_bench(
 /// matching stage) but bypasses TCP/UDS transport. The bench thread publishes
 /// InputSlots directly to the input Producer and drains OutputSlots from the
 /// SPSC consumer. Measures pipeline latency without network overhead.
+#[allow(clippy::too_many_arguments)]
 fn run_pipeline_bench(
     total_pairs: usize,
     window: usize,
     group_commit_us: u64,
     warmup: usize,
+    cooldown: usize,
     journal_path: Option<std::path::PathBuf>,
     json_path: Option<&std::path::Path>,
     max_journal_batch: usize,
@@ -770,6 +785,7 @@ fn run_pipeline_bench(
         max_journal_batch,
         total_pairs,
         warmup,
+        cooldown,
         window,
         json_path,
     };
@@ -801,6 +817,7 @@ struct PipelineInnerCfg<'a> {
     max_journal_batch: usize,
     total_pairs: usize,
     warmup: usize,
+    cooldown: usize,
     window: usize,
     json_path: Option<&'a std::path::Path>,
 }
@@ -831,6 +848,7 @@ fn run_pipeline_inner<W>(
         max_journal_batch,
         total_pairs,
         warmup,
+        cooldown,
         window,
         json_path,
     } = cfg;
@@ -881,6 +899,7 @@ fn run_pipeline_inner<W>(
         .expect("spawn matching thread");
 
     let total_orders = warmup + total_pairs * 2;
+    let measure_end = total_orders.saturating_sub(cooldown);
 
     // Split publish and drain into separate threads so the publisher
     // keeps the disruptor fed while the drainer processes BatchEnds.
@@ -980,7 +999,7 @@ fn run_pipeline_inner<W>(
             };
             inflight.fetch_sub(1, Ordering::Release);
             let latency_ns = tsc_to_ns(rdtscp() - sent_at, ticks_per_ns);
-            if completed >= warmup {
+            if completed >= warmup && completed < measure_end {
                 if measured_start.is_none() {
                     measured_start = Some(Instant::now());
                 }
@@ -1050,6 +1069,7 @@ fn run_roundtrip_bench(
     group_commit_us: u64,
     remote_addr: Option<std::net::SocketAddr>,
     warmup: usize,
+    cooldown: usize,
     journal_path: Option<std::path::PathBuf>,
     num_accounts: u32,
     num_instruments: u32,
@@ -1089,6 +1109,7 @@ fn run_roundtrip_bench(
             group_commit_us,
             shutdown,
             warmup,
+            cooldown,
             json_path,
             &key,
             num_accounts,
@@ -1155,6 +1176,7 @@ fn run_roundtrip_bench(
             group_commit_us,
             shutdown,
             warmup,
+            cooldown,
             json_path,
             &bench_key,
             num_accounts,
@@ -1187,6 +1209,7 @@ fn run_roundtrip_bench(
             group_commit_us,
             shutdown,
             warmup,
+            cooldown,
             json_path,
             &bench_key,
             num_accounts,
@@ -1498,6 +1521,7 @@ fn run_roundtrip_inner<R, W, F>(
     group_commit_us: u64,
     shutdown: Arc<AtomicBool>,
     warmup: usize,
+    cooldown: usize,
     json_path: Option<&std::path::Path>,
     key: &ed25519_dalek::SigningKey,
     num_accounts: u32,
@@ -1519,6 +1543,7 @@ fn run_roundtrip_inner<R, W, F>(
         group_commit_us,
         shutdown,
         warmup,
+        cooldown,
         json_path,
         key,
         num_accounts,
@@ -1618,6 +1643,7 @@ fn run_uring_roundtrip<R, W, F>(
     group_commit_us: u64,
     shutdown: Arc<AtomicBool>,
     warmup: usize,
+    cooldown: usize,
     json_path: Option<&std::path::Path>,
     key: &ed25519_dalek::SigningKey,
     num_accounts: u32,
@@ -1739,7 +1765,14 @@ fn run_uring_roundtrip<R, W, F>(
                     {
                         eprintln!("warning: could not pin bench-{i} to core {core_id}: {e}");
                     }
-                    run_uring_loop(conns, window, bench_start, warmup, thread_progress)
+                    run_uring_loop(
+                        conns,
+                        window,
+                        bench_start,
+                        warmup,
+                        cooldown,
+                        thread_progress,
+                    )
                 })
                 .expect("spawn bench thread")
         })
@@ -1879,6 +1912,7 @@ fn run_uring_loop(
     window: usize,
     bench_start: Instant,
     warmup: usize,
+    cooldown: usize,
     progress: Arc<AtomicU64>,
 ) -> (Histogram<u64>, TimeSeries, Option<Instant>) {
     use io_uring::{IoUring, opcode, types};
@@ -1989,7 +2023,9 @@ fn run_uring_loop(
                             "inflight timestamp desync: got BatchEnd without matching send",
                         );
                         let latency_ns = tsc_to_ns(rdtscp() - sent_tsc, ticks_per_ns);
-                        if conn.batch_count >= warmup {
+                        if conn.batch_count >= warmup
+                            && conn.batch_count < conn.total_orders.saturating_sub(cooldown)
+                        {
                             if measured_start.is_none() {
                                 measured_start = Some(Instant::now());
                             }
