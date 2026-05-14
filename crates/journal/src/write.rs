@@ -16,12 +16,12 @@
 
 use std::path::{Path, PathBuf};
 
-use melin_app::AppEvent;
+use melin_app::{AppEvent, unix_epoch_nanos};
 
 use crate::buffered_writer::BufferedWriter;
 use crate::error::JournalError;
 use crate::event::JournalEvent;
-use crate::sector_writer::{SectorWriter, wall_clock_nanos};
+use crate::sector_writer::SectorWriter;
 
 /// Operations a journal writer must support to be drivable by the
 /// pipeline's `JournalStage`. Excludes the variant-specific surfaces
@@ -121,7 +121,7 @@ pub trait JournalWrite<E: AppEvent>: Sized {
     /// Encode and durably flush a single event.
     #[inline]
     fn append(&mut self, event: &JournalEvent<E>) -> Result<u64, JournalError> {
-        let seq = self.batch_append_with_ts(event, wall_clock_nanos(), 0, 0)?;
+        let seq = self.batch_append_with_ts(event, unix_epoch_nanos(), 0, 0)?;
         self.flush_batch_sync()?;
         Ok(seq)
     }
@@ -400,7 +400,7 @@ mod tests {
         // Encode + flush one event via the trait, then verify it landed.
         let seq = writer.allocate_sequence();
         assert_eq!(seq + 1, writer.next_sequence());
-        let ts = crate::sector_writer::wall_clock_nanos();
+        let ts = unix_epoch_nanos();
         writer
             .encode_event(seq, ts, &JournalEvent::App(TestEvent(seq)), 0, 0)
             .unwrap();

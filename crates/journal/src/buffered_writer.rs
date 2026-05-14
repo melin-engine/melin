@@ -37,7 +37,9 @@ use crate::codec::{self, ENTRY_OFFSET, FILE_HEADER_SIZE, MAX_SECTOR_SIZE};
 use crate::error::JournalError;
 use crate::event::JournalEvent;
 #[cfg(feature = "hash-chain")]
-use crate::sector_writer::{checkpoint_interval, wall_clock_nanos};
+use crate::sector_writer::checkpoint_interval;
+#[cfg(feature = "hash-chain")]
+use melin_app::unix_epoch_nanos;
 
 /// Maximum encoded entry size. Mirrors `writer::MAX_ENTRY_SIZE` — actual
 /// entries are ~81-101 bytes; the array is sized generously so the
@@ -216,7 +218,7 @@ impl<E: AppEvent> BufferedWriter<E> {
     fn emit_genesis_and_init_chain(&mut self, genesis: [u8; 32]) -> Result<(), JournalError> {
         let genesis_event: JournalEvent<E> = JournalEvent::GenesisHash { hash: genesis };
         let seq = self.next_sequence;
-        let ts = wall_clock_nanos();
+        let ts = unix_epoch_nanos();
         let written = codec::encode(seq, ts, 0, 0, &genesis_event, &mut self.buffer)?;
 
         // Initialize chain: hash the genesis entry bytes (excluding CRC).
@@ -435,7 +437,7 @@ impl<E: AppEvent> BufferedWriter<E> {
             );
             self.last_encoded_seq = seq;
         }
-        let ts = wall_clock_nanos();
+        let ts = unix_epoch_nanos();
         let written = codec::encode(seq, ts, 0, 0, &checkpoint, &mut self.buffer)?;
 
         if let Some(chain) = &mut self.hash_chain {

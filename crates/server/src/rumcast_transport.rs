@@ -75,6 +75,7 @@ use tracing::{debug, error, info, warn};
 use x25519_dalek::{PublicKey as X25519Public, StaticSecret as X25519Secret};
 
 #[allow(unused_imports)] // used by some feature combinations only
+use melin_app::unix_epoch_nanos;
 use melin_journal::JournalWrite;
 use melin_protocol::auth::{AuthorizedKeys, Permission};
 use melin_protocol::codec;
@@ -1853,7 +1854,7 @@ fn handle_inbound<S: UdpTransport>(
                     }
 
                     let event = crate::request::to_event(&request);
-                    let timestamp_ns = wall_clock_nanos();
+                    let timestamp_ns = unix_epoch_nanos();
                     let slot = InputSlot {
                         connection_id: session_id as u64,
                         key_hash: *key_hash,
@@ -2088,7 +2089,6 @@ fn seed_and_drain(
     shutdown: &AtomicBool,
 ) {
     use melin_journal::trace::trace_ts;
-    use melin_journal::wall_clock_nanos as journal_wall_clock_nanos;
     use melin_trading::types::{AccountId, CurrencyId, InstrumentSpec, Symbol};
 
     let seed_start = std::time::Instant::now();
@@ -2100,7 +2100,7 @@ fn seed_and_drain(
             key_hash: 0,
             request_seq: 0,
             sequence: 0,
-            timestamp_ns: journal_wall_clock_nanos(),
+            timestamp_ns: unix_epoch_nanos(),
             event: JournalEvent::App(TradingEvent::AddInstrument {
                 spec: InstrumentSpec {
                     symbol: Symbol(i),
@@ -2120,7 +2120,7 @@ fn seed_and_drain(
             key_hash: 0,
             request_seq: 0,
             sequence: 0,
-            timestamp_ns: journal_wall_clock_nanos(),
+            timestamp_ns: unix_epoch_nanos(),
             event: JournalEvent::App(TradingEvent::ProvisionAccount {
                 account: AccountId(acct),
                 amount: u64::MAX / 4,
@@ -2143,14 +2143,6 @@ fn seed_and_drain(
         std::hint::spin_loop();
     }
     info!(elapsed = ?seed_start.elapsed(), "seeding complete");
-}
-
-fn wall_clock_nanos() -> u64 {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_nanos() as u64)
-        .unwrap_or(0)
 }
 
 // ---------------------------------------------------------------------------

@@ -77,7 +77,7 @@ mod tests {
 
     #[test]
     fn first_tick_clamps_zero_to_one() {
-        // `wall_clock_nanos` returns 0 only on a pre-epoch clock — bump
+        // `unix_epoch_nanos` returns 0 only on a pre-epoch clock — bump
         // to 1 so the journal's per-tick monotonic invariant holds even
         // in that pathological case.
         assert_eq!(clamp_monotonic(0, 0), 1);

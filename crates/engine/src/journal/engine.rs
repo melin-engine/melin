@@ -854,7 +854,7 @@ mod tests {
 
     #[test]
     fn ticks_drive_gtd_expiry_through_replay() {
-        use crate::journal::wall_clock_nanos;
+        use crate::journal::unix_epoch_nanos;
 
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("gtd_ticks.journal");
@@ -864,7 +864,7 @@ mod tests {
         // time). GTD `expiry_ns` therefore has to be in the same wall-clock
         // domain, comfortably in the future of every entry's timestamp,
         // for the test to control which Tick fires which order.
-        let now = wall_clock_nanos();
+        let now = unix_epoch_nanos();
         let expiry_one = now + 60 * 1_000_000_000; // +60s
         let expiry_two = now + 120 * 1_000_000_000; // +120s
 
@@ -1729,7 +1729,7 @@ mod tests {
         // Write journal entries with key_hash + request_seq.
         {
             let mut writer = crate::journal::SectorWriter::create(&path).unwrap();
-            let ts = crate::journal::wall_clock_nanos();
+            let ts = crate::journal::unix_epoch_nanos();
             // Deposit with seq=1
             writer
                 .batch_append_with_ts(
@@ -1784,7 +1784,7 @@ mod tests {
         // Create journaled exchange, write events with key_hash.
         {
             let mut writer = crate::journal::SectorWriter::create(&journal_path).unwrap();
-            let ts = crate::journal::wall_clock_nanos();
+            let ts = crate::journal::unix_epoch_nanos();
             writer
                 .batch_append_with_ts(
                     &JournalEvent::App(crate::trading_event::TradingEvent::AddInstrument {

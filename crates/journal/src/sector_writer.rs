@@ -35,9 +35,10 @@ use std::os::unix::fs::FileExt;
 use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use melin_app::AppEvent;
+#[cfg(feature = "hash-chain")]
+use melin_app::unix_epoch_nanos;
 
 use super::codec::{self, ENTRY_OFFSET, FILE_HEADER_SIZE, MAX_SECTOR_SIZE};
 use super::error::JournalError;
@@ -277,7 +278,7 @@ impl<E: AppEvent> SectorWriter<E> {
     fn emit_genesis_and_init_chain(&mut self, genesis: [u8; 32]) -> Result<(), JournalError> {
         let genesis_event: JournalEvent<E> = JournalEvent::GenesisHash { hash: genesis };
         let seq = self.next_sequence;
-        let timestamp_ns = wall_clock_nanos();
+        let timestamp_ns = unix_epoch_nanos();
         let written = codec::encode(seq, timestamp_ns, 0, 0, &genesis_event, &mut self.buffer)?;
 
         // Initialize chain: hash the genesis entry bytes (excluding CRC).
@@ -755,7 +756,7 @@ impl<E: AppEvent> SectorWriter<E> {
             );
             self.last_encoded_seq = seq;
         }
-        let ts = wall_clock_nanos();
+        let ts = unix_epoch_nanos();
         let written = codec::encode(seq, ts, 0, 0, &checkpoint, &mut self.buffer)?;
 
         // Reset the event counter. The checkpoint entry itself is NOT fed
@@ -1553,19 +1554,6 @@ fn rustix_to_io(err: rustix::io::Errno) -> JournalError {
     JournalError::Io(std::io::Error::from_raw_os_error(err.raw_os_error()))
 }
 
-/// Wall-clock nanoseconds since Unix epoch. Used for informational timestamps
-/// in journal entries (not for ordering — sequence numbers handle that).
-///
-/// The `u128 as u64` truncation is safe: u64 nanos covers ~584 years from
-/// epoch (until 2554). Falls back to 0 if system clock is before epoch.
-///
-/// Public so the pipeline stage can call once per batch instead of per event.
-pub fn wall_clock_nanos() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_nanos() as u64)
-        .unwrap_or(0)
-}
 
 #[cfg(test)]
 mod tests {

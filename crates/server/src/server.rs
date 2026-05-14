@@ -1374,7 +1374,7 @@ where
         use crate::InputSlot;
         use crate::JournalEvent;
         use melin_journal::trace::trace_ts;
-        use melin_journal::wall_clock_nanos;
+        use melin_app::unix_epoch_nanos;
         use melin_trading::types::{AccountId, CurrencyId, InstrumentSpec, Symbol};
 
         let seed_start = std::time::Instant::now();
@@ -1387,7 +1387,7 @@ where
                 key_hash: 0,
                 request_seq: 0,
                 sequence: 0,
-                timestamp_ns: wall_clock_nanos(),
+                timestamp_ns: unix_epoch_nanos(),
                 event: JournalEvent::App(
                     melin_trading::trading_event::TradingEvent::AddInstrument {
                         spec: InstrumentSpec {
@@ -1412,7 +1412,7 @@ where
                 key_hash: 0,
                 request_seq: 0,
                 sequence: 0,
-                timestamp_ns: wall_clock_nanos(),
+                timestamp_ns: unix_epoch_nanos(),
                 event: JournalEvent::App(
                     melin_trading::trading_event::TradingEvent::ProvisionAccount {
                         account: AccountId(acct),
@@ -2258,7 +2258,7 @@ where
         use crate::InputSlot;
         use crate::JournalEvent;
         use melin_journal::trace::trace_ts;
-        use melin_journal::wall_clock_nanos;
+        use melin_app::unix_epoch_nanos;
         use melin_trading::types::{AccountId, CurrencyId, InstrumentSpec, Symbol};
 
         // `sequence: 0` — the journal stage allocates sequences in
@@ -2269,7 +2269,7 @@ where
                 key_hash: 0,
                 request_seq: 0,
                 sequence: 0,
-                timestamp_ns: wall_clock_nanos(),
+                timestamp_ns: unix_epoch_nanos(),
                 event: JournalEvent::App(
                     melin_trading::trading_event::TradingEvent::AddInstrument {
                         spec: InstrumentSpec {
@@ -2291,7 +2291,7 @@ where
                 key_hash: 0,
                 request_seq: 0,
                 sequence: 0,
-                timestamp_ns: wall_clock_nanos(),
+                timestamp_ns: unix_epoch_nanos(),
                 event: JournalEvent::App(
                     melin_trading::trading_event::TradingEvent::ProvisionAccount {
                         account: AccountId(acct),

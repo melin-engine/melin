@@ -841,7 +841,7 @@ fn run_pipeline_inner<W>(
     use melin_engine::journal::JournalEvent;
     use melin_engine::journal::pipeline::{JournalStageRun, build_pipeline_with_replication};
     use melin_engine::journal::trace::trace_ts;
-    use melin_engine::journal::wall_clock_nanos;
+    use melin_app::unix_epoch_nanos;
 
     let PipelineInnerCfg {
         group_commit_us,
@@ -945,7 +945,7 @@ fn run_pipeline_inner<W>(
                     key_hash: 0,
                     request_seq: 0,
                     sequence: 0,
-                    timestamp_ns: wall_clock_nanos(),
+                    timestamp_ns: unix_epoch_nanos(),
                     event: JournalEvent::App(
                         melin_trading::trading_event::TradingEvent::SubmitOrder {
                             symbol: Symbol(1),

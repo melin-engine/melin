@@ -29,7 +29,7 @@ use ed25519_dalek::SigningKey;
 #[allow(unused_imports)] // used by some feature combinations only
 use melin_journal::JournalWrite;
 use melin_journal::trace::trace_ts;
-use melin_journal::wall_clock_nanos;
+use melin_app::unix_epoch_nanos;
 use melin_protocol::auth::AuthorizedKeys;
 use melin_server::replication::{ReplicationMetrics, Sender, run_receiver, run_sender};
 use melin_server::server::PipelineCores;
@@ -272,7 +272,7 @@ fn main() {
         key_hash: 0,
         request_seq: 0,
         sequence: 0,
-        timestamp_ns: wall_clock_nanos(),
+        timestamp_ns: unix_epoch_nanos(),
         event: JournalEvent::App(TradingEvent::ProvisionAccount {
             account: AccountId(1),
             amount: u64::MAX / 2,
@@ -320,7 +320,7 @@ fn main() {
                     key_hash: 0,
                     request_seq: 0,
                     sequence: 0,
-                    timestamp_ns: wall_clock_nanos(),
+                    timestamp_ns: unix_epoch_nanos(),
                     event: JournalEvent::App(TradingEvent::Deposit {
                         account: AccountId(1),
                         currency: CurrencyId(1),

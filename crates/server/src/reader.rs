@@ -30,7 +30,7 @@ use crate::InputSlot;
 use crate::JournalEvent;
 use melin_disruptor::ring;
 use melin_journal::trace::trace_ts;
-use melin_journal::wall_clock_nanos;
+use melin_app::unix_epoch_nanos;
 use melin_protocol::auth::Permission;
 use melin_protocol::codec;
 
@@ -402,7 +402,7 @@ fn reader_loop<R: AsRawFd>(
         if tick_enabled {
             let now = Instant::now();
             if now >= next_tick_deadline {
-                let raw_now_ns = wall_clock_nanos();
+                let raw_now_ns = unix_epoch_nanos();
                 let now_ns = crate::tick::clamp_monotonic(raw_now_ns, last_tick_ns);
                 last_tick_ns = now_ns;
                 crate::tick::publish_tick(&mut producer, now_ns);
@@ -460,20 +460,20 @@ fn reader_loop<R: AsRawFd>(
         let batch_now = Instant::now();
         // One wall-clock read per CQE batch instead of per request. The
         // reader can see 4–6 M requests/s at peak; a per-request
-        // `wall_clock_nanos()` was ~2.8 % of the primary's cycles
+        // `unix_epoch_nanos()` was ~2.8 % of the primary's cycles
         // (vDSO `clock_gettime(CLOCK_REALTIME)`). All requests in the
         // same batch share the timestamp — precision loss is bounded
         // by the CQE-drain cadence (tens of µs under load) and order
         // timestamps are used for reporting, not matching (the engine
         // orders by sequence, not time).
-        let batch_wall_ns = wall_clock_nanos();
+        let batch_wall_ns = unix_epoch_nanos();
 
         for &(token, result, flags) in &cqes {
             // ── Tick timeout ──
             // The CQE is just a wakeup signal — the actual tick emission
             // happens at the top of the next loop iteration via the
             // deadline check, so the time the tick is stamped with reflects
-            // wall_clock_nanos at fire time, not at submit time.
+            // unix_epoch_nanos at fire time, not at submit time.
             if token == TICK_TIMEOUT_TOKEN {
                 tick_armed = false;
                 continue;

@@ -36,7 +36,5 @@ pub use event::JournalEvent;
 pub use fresh_replica::create_fresh_replica;
 pub use mode::JournalWriterMode;
 pub use reader::{JournalEntry, JournalReader, RawJournalScanner};
-pub use sector_writer::{
-    AsyncWriteBatch, SectorWriter, checkpoint_interval, detect_sector_size, wall_clock_nanos,
-};
+pub use sector_writer::{AsyncWriteBatch, SectorWriter, checkpoint_interval, detect_sector_size};
 pub use write::JournalWrite;

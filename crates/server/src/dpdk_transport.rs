@@ -45,7 +45,7 @@ use ed25519_dalek::{Verifier, VerifyingKey};
 use melin_disruptor::ring;
 use melin_dpdk::transport::DpdkTransport;
 use melin_journal::trace::trace_ts;
-use melin_journal::wall_clock_nanos;
+use melin_app::unix_epoch_nanos;
 use melin_protocol::auth::{AuthorizedKeys, Permission};
 use melin_protocol::codec;
 use melin_protocol::message::{ConnectionId, Request, ResponseKind};
@@ -257,7 +257,7 @@ pub fn run_dpdk_poll(
                 tick_check_counter = 0;
                 let now = Instant::now();
                 if now >= next_tick_deadline {
-                    let raw_now_ns = wall_clock_nanos();
+                    let raw_now_ns = unix_epoch_nanos();
                     let now_ns = crate::tick::clamp_monotonic(raw_now_ns, last_tick_ns);
                     last_tick_ns = now_ns;
                     crate::tick::publish_tick(&mut producer, now_ns);
@@ -551,7 +551,7 @@ pub fn run_dpdk_poll(
                         &mut batch,
                         &control_tx,
                         &mut id_to_handle,
-                        *batch_wall_ns.get_or_insert_with(wall_clock_nanos),
+                        *batch_wall_ns.get_or_insert_with(unix_epoch_nanos),
                         #[cfg(feature = "tick-to-trade")]
                         &mut ingest_rec,
                     );

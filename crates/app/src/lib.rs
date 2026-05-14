@@ -14,6 +14,24 @@
 #![cfg_attr(not(test), deny(clippy::unwrap_used))]
 
 use std::io::{self, Read, Write};
+use std::time::{SystemTime, UNIX_EPOCH};
+
+/// Wall-clock nanoseconds since the Unix epoch. Used for the informational
+/// `timestamp_ns` field stamped into journal records and replication frames,
+/// and for any context that needs a real-world timestamp.
+///
+/// Not monotonic — subject to NTP adjustments. Never use this for ordering;
+/// sequence numbers handle that.
+///
+/// The `u128 as u64` truncation is safe: u64 nanos covers ~584 years from
+/// epoch (until 2554). Falls back to 0 if system clock is before epoch.
+#[inline]
+pub fn unix_epoch_nanos() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0)
+}
 
 /// Codec failures surfaced by [`AppEvent::decode`]. Kept deliberately small:
 /// the transport only needs to distinguish "malformed tag", "truncated
