@@ -88,7 +88,7 @@ pub fn run_receiver_rumcast<W>(
     signing_key: &ed25519_dalek::SigningKey,
     shutdown: &AtomicBool,
     promote: &AtomicBool,
-    snapshot_interval_secs: u64,
+    snapshot_interval_ms: u64,
     snapshot_path: PathBuf,
     cores: crate::server::PipelineCores,
     busy_spin: bool,
@@ -260,7 +260,7 @@ where
         // ---- Build pipeline + spawn pipeline threads ----
         let shadow_exchange = <App as melin_app::Application>::clone_via_snapshot(&cur_exchange)?;
 
-        let enable_shadow = snapshot_interval_secs > 0;
+        let enable_shadow = snapshot_interval_ms > 0;
         let pipeline = melin_transport_core::pipeline::build_replica_pipeline(
             cur_exchange,
             cur_writer,
@@ -340,7 +340,7 @@ where
                             shadow_cons,
                             shadow_exchange,
                             snap_path,
-                            Duration::from_secs(snapshot_interval_secs),
+                            Duration::from_millis(snapshot_interval_ms),
                             chain_lock,
                             &ps,
                             false,
