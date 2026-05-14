@@ -24,12 +24,11 @@
 //!
 //! Default: roundtrip mode, TCP transport, 1 client, 1,000,000 order pairs.
 
-// Under `--features rumcast` (and similarly `dpdk`), the entire TCP-
-// path code in this file is unreachable from the dispatch in `main`.
-// Suppress the resulting dead-code warnings rather than cfg-gating
-// every TCP helper individually — same trade-off the existing DPDK
-// build implicitly relies on.
-#![cfg_attr(any(feature = "rumcast", feature = "dpdk"), allow(dead_code))]
+// Under `--features dpdk`, the entire TCP-path code in this file is
+// unreachable from the dispatch in `main`. Suppress the resulting
+// dead-code warnings rather than cfg-gating every TCP helper
+// individually.
+#![cfg_attr(feature = "dpdk", allow(dead_code))]
 
 mod generator;
 mod health_poller;
@@ -37,9 +36,6 @@ mod stats_client;
 
 #[cfg(feature = "dpdk")]
 mod dpdk;
-
-#[cfg(all(not(feature = "dpdk"), feature = "rumcast"))]
-mod rumcast;
 
 /// jemalloc: thread-local caches eliminate allocator lock contention,
 /// giving more predictable latency than glibc malloc under high throughput.
@@ -315,40 +311,6 @@ struct BenchArgs {
     #[arg(long, default_value_t = 4096)]
     max_journal_batch: usize,
 
-    /// Local UDP bind address for receiving rumcast responses. Required
-    /// when the bench is built with `--features rumcast`. Phase 1 of the
-    /// rumcast wire-up is single-client; this is the address the server
-    /// publishes responses back to (matched by the server's
-    /// `--rumcast-client-addr`).
-    #[arg(long)]
-    rumcast_bind: Option<std::net::SocketAddr>,
-
-    /// Yield to the OS scheduler when the rumcast bench loop has no
-    /// work, instead of the default busy-spin. With this flag the
-    /// idle path parks for ~100 µs (`ppoll` on the response socket)
-    /// — lower CPU at the cost of an upper-bound on idle wake
-    /// latency. Default (no flag) is busy-spin: lowest latency on
-    /// isolated cores, burns a CPU.
-    #[arg(long, default_value_t = false)]
-    rumcast_yield_idle: bool,
-
-    /// NAPI busy-poll budget in microseconds for the bench's response
-    /// socket. `0` (default) leaves the kernel on its normal
-    /// interrupt-driven recv path. Non-zero enables `SO_BUSY_POLL` +
-    /// `SO_PREFER_BUSY_POLL`. Same flag shape as the server's
-    /// `--rumcast-busy-poll-us`. Typical real-NIC values are 50–100
-    /// µs; no-op on loopback. See operations.md for the sysctl
-    /// requirements.
-    #[arg(long, default_value_t = 0)]
-    rumcast_busy_poll_us: u32,
-
-    /// Enable kernel `UDP_GRO` on the bench's rumcast response
-    /// socket. Pairs with `UDP_SEGMENT` (UDP-GSO) on the server-side
-    /// sender so the kernel can re-coalesce incoming response
-    /// datagrams and the bench's recv path fans them out via the
-    /// `seg_size` cmsg. Off by default. No-op on loopback.
-    #[arg(long, default_value_t = false)]
-    rumcast_udp_gro: bool,
 }
 
 fn main() {
@@ -386,66 +348,6 @@ fn main() {
             );
         }
         "roundtrip" => {
-            #[cfg(all(not(feature = "dpdk"), feature = "rumcast"))]
-            {
-                let (server_addr, bench_bind, signing_key, recommended_bench_core) = match args.addr
-                {
-                    Some(addr) => {
-                        // Remote mode — operator must supply bind + key.
-                        let bind = args.rumcast_bind.unwrap_or_else(|| {
-                            eprintln!(
-                                "error: --rumcast-bind is required for remote rumcast \
-                                 mode (server publishes responses to this address)"
-                            );
-                            std::process::exit(1);
-                        });
-                        let key_path = args.key.as_deref().unwrap_or_else(|| {
-                            eprintln!(
-                                "error: --key is required for remote rumcast mode \
-                                 (the rumcast transport authenticates every message)"
-                            );
-                            std::process::exit(1);
-                        });
-                        // Remote mode: no embedded layout to advise on.
-                        // Trust whatever --bench-cores the operator set.
-                        (addr, bind, load_signing_key(key_path), 0)
-                    }
-                    None => spawn_embedded_rumcast_server(
-                        args.rumcast_bind,
-                        args.accounts,
-                        args.instruments,
-                        args.group_commit_us,
-                        args.journal.clone(),
-                        args.rumcast_busy_poll_us,
-                        args.rumcast_udp_gro,
-                    ),
-                };
-                // Embedded-mode default: use the core the embedded
-                // server reserved for the client. Explicit --bench-cores
-                // still wins so operators can override.
-                let bench_core_start = args.bench_cores.or(if args.addr.is_none() {
-                    Some(recommended_bench_core)
-                } else {
-                    None
-                });
-                rumcast::run_rumcast_roundtrip(rumcast::RumcastBenchConfig {
-                    server_addr,
-                    bind: bench_bind,
-                    pairs: args.pairs,
-                    window: args.window,
-                    warmup: args.warmup,
-                    clients: args.clients,
-                    accounts: args.accounts,
-                    instruments: args.instruments,
-                    json_path: json_path.map(|p| p.to_path_buf()),
-                    yield_idle: args.rumcast_yield_idle,
-                    busy_poll_us: args.rumcast_busy_poll_us,
-                    udp_gro: args.rumcast_udp_gro,
-                    signing_key,
-                    bench_core_start,
-                });
-            }
-
             #[cfg(feature = "dpdk")]
             {
                 let addr = args.addr.unwrap_or_else(|| {
@@ -489,7 +391,7 @@ fn main() {
                 );
             }
 
-            #[cfg(all(not(feature = "dpdk"), not(feature = "rumcast")))]
+            #[cfg(not(feature = "dpdk"))]
             {
                 run_roundtrip_bench(
                     args.uds,
@@ -1254,139 +1156,6 @@ fn start_server<L: BlockingTransportListener>(
             }
         })
         .expect("spawn server thread");
-}
-
-/// Bring up an in-process rumcast server on loopback with a generated
-/// bench identity, mirroring the embedded TCP path. Returns
-/// `(server_addr, bench_bind, signing_key)` ready to feed into
-/// `run_rumcast_roundtrip`. The temp dir holding the journal +
-/// authorized_keys file is intentionally leaked for the process lifetime
-/// — the bench is short-lived and the OS reaps `/tmp` on next boot.
-#[cfg(all(not(feature = "dpdk"), feature = "rumcast"))]
-fn spawn_embedded_rumcast_server(
-    bench_bind_override: Option<std::net::SocketAddr>,
-    accounts: u32,
-    instruments: u32,
-    group_commit_us: u64,
-    journal_path: Option<std::path::PathBuf>,
-    rumcast_busy_poll_us: u32,
-    rumcast_udp_gro: bool,
-) -> (
-    std::net::SocketAddr,
-    std::net::SocketAddr,
-    ed25519_dalek::SigningKey,
-    usize,
-) {
-    use melin_server::server::{PipelineCores, ServerConfig};
-    use std::net::{IpAddr, Ipv4Addr, SocketAddr, UdpSocket};
-
-    // Deterministic key — same trick as the TCP embedded path.
-    let bench_key = ed25519_dalek::SigningKey::from_bytes(&[0xBE; 32]);
-    let tmp_dir = tempdir();
-    let keys_path = tmp_dir.join("authorized_keys");
-    let pub_key_b64 = base64::Engine::encode(
-        &base64::engine::general_purpose::STANDARD,
-        bench_key.verifying_key().to_bytes(),
-    );
-    std::fs::write(&keys_path, format!("trader {pub_key_b64} bench\n"))
-        .expect("write authorized_keys");
-
-    // Pick free loopback UDP ports by binding ephemeral and dropping
-    // immediately — the kernel won't immediately reassign them, which
-    // is good enough for a single-process bench.
-    let pick_port = || -> u16 {
-        UdpSocket::bind("127.0.0.1:0")
-            .expect("bind ephemeral UDP")
-            .local_addr()
-            .expect("local addr")
-            .port()
-    };
-    let server_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), pick_port());
-    let bench_bind = bench_bind_override.unwrap_or(SocketAddr::new(
-        IpAddr::V4(Ipv4Addr::LOCALHOST),
-        pick_port(),
-    ));
-
-    let effective_journal = journal_path.unwrap_or_else(|| tmp_dir.join("rumcast-bench.journal"));
-
-    // Detect available CPUs and pick a compact layout that doesn't
-    // HT-collide on this box. Falls back to the workstation default
-    // when there's enough room (>= 12 logical cores), preserving
-    // existing behavior on bigger machines.
-    let num_cpus = std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(8);
-    let (pipeline_cores, recommended_bench_core) = if num_cpus < 12 {
-        match PipelineCores::compact(num_cpus) {
-            Ok((c, b)) => (c, b),
-            Err(e) => {
-                eprintln!("error: cannot lay out embedded rumcast server: {e}");
-                std::process::exit(1);
-            }
-        }
-    } else {
-        // Workstation/server default. repl_handler cores 9/10 are HT
-        // siblings of journal/matching only on 8-core boxes; on >= 12
-        // logical cores those are real physical cores. Keep the bench
-        // off any pinned core (11 is the first unused).
-        (ServerConfig::default().cores, 11)
-    };
-
-    let config = ServerConfig {
-        bind: server_addr,
-        journal: effective_journal,
-        snapshot: None,
-        group_commit_us,
-        accounts,
-        instruments,
-        connection_timeout_secs: 0,
-        authorized_keys: keys_path,
-        // Disable the health endpoint so back-to-back bench runs don't
-        // collide on the default port; the bench doesn't poll it in
-        // rumcast mode anyway.
-        health_bind: None,
-        // Match production (LAN) idle strategy: busy-spin. The compact
-        // core layout below keeps the pipeline threads off each other's
-        // HT siblings, so busy-spin doesn't starve any peer.
-        yield_idle: false,
-        // Compact layout that fits the dev box (8-core Ryzen) without
-        // HT-pairing pipeline threads against each other. The default
-        // `PipelineCores` is sized for a 16-physical-core workstation:
-        // shadow=8, repl_handler_0=9, repl_handler_1=10 are HT siblings
-        // of cores 0/1/2 (journal, matching) on an 8-core/16-thread
-        // CPU, which murders busy-spin throughput. Reserve the last
-        // core for the bench client.
-        cores: pipeline_cores,
-        rumcast_busy_poll_us,
-        rumcast_udp_gro,
-        ..ServerConfig::default()
-    };
-    let rumcast_config = melin_server::rumcast_transport::RumcastConfig { bind: server_addr };
-
-    let shutdown = Arc::new(AtomicBool::new(false));
-    let shutdown_srv = Arc::clone(&shutdown);
-    std::thread::Builder::new()
-        .name("rumcast-server".into())
-        .spawn(move || {
-            if let Err(e) =
-                melin_server::rumcast_transport::run_rumcast(config, rumcast_config, shutdown_srv)
-            {
-                eprintln!("embedded rumcast server error: {e}");
-            }
-        })
-        .expect("spawn rumcast server thread");
-
-    eprintln!(
-        "embedded rumcast server: server_addr={server_addr} bench_bind={bench_bind} \
-         cores=j{}/m{}/r{}/e{}/s{} bench_core={recommended_bench_core}",
-        pipeline_cores.journal,
-        pipeline_cores.matching,
-        pipeline_cores.response,
-        pipeline_cores.event_publisher,
-        pipeline_cores.shadow,
-    );
-
-    (server_addr, bench_bind, bench_key, recommended_bench_core)
 }
 
 /// Connect to TCP server with retry (up to 50 attempts, 10ms apart).
