@@ -11,9 +11,7 @@ mod tests {
 
     use proptest::prelude::*;
 
-    use melin_types::types::{
-        AccountId, ExecutionReport, OrderId, Price, Quantity, Side, Symbol,
-    };
+    use melin_types::types::{AccountId, ExecutionReport, OrderId, Price, Quantity, Side, Symbol};
 
     use crate::mirror::{BookMirror, Level};
 

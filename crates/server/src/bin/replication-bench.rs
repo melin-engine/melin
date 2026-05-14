@@ -34,10 +34,10 @@ use melin_server::replication::{ReplicationMetrics, Sender, run_receiver, run_se
 use melin_server::server::PipelineCores;
 use melin_server::{InputSlot, JournalEvent, OutputSlot};
 use melin_trading::trading_event::TradingEvent;
-use melin_types::types::{AccountId, CurrencyId};
 use melin_transport_core::JournaledApp;
 use melin_transport_core::pipeline::{JournalStageRun, build_pipeline_with_replication};
 use melin_transport_core::trace::mono_trace_ns;
+use melin_types::types::{AccountId, CurrencyId};
 
 #[derive(Parser)]
 struct Args {

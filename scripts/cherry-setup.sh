@@ -73,7 +73,8 @@ apt-get install -y --no-install-recommends \
     llvm \
     lld \
     libelf-dev \
-    nasm
+    nasm \
+    xfsprogs
 
 # Optional packages: DPDK kernel-bypass (only with --features dpdk) plus
 # benchmarking/diagnostics tools. `|| true` because some of these may

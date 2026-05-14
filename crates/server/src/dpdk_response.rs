@@ -22,8 +22,8 @@ use melin_disruptor::spsc;
 
 use crate::amortized_timer::AmortizedTimer;
 use crate::{OutputPayload, OutputSlot};
-use melin_types::types::QueryResponse;
 use melin_transport_core::pipeline::StageUtilization;
+use melin_types::types::QueryResponse;
 
 use melin_protocol::codec;
 use melin_protocol::message::ResponseKind;
