@@ -27,7 +27,7 @@ use melin_journal::JournalError;
 use melin_journal::JournalWrite;
 use melin_journal::preparer::SegmentPreparer;
 use melin_journal::replication::{ReplicationConsumer, ReplicationProducer};
-use melin_journal::trace::{TraceTimestamp, trace_ts};
+use crate::trace::{TraceTimestamp, trace_ts};
 
 use melin_disruptor::padding::Sequence;
 use melin_disruptor::ring;
@@ -552,12 +552,12 @@ impl<E: AppEvent, W: JournalWrite<E>> JournalStage<E, W> {
         // after all stage threads join, so dev runs still see the
         // stderr breakdown.
         #[cfg(feature = "latency-trace")]
-        let mut wakeup_rec = melin_journal::trace::register_stage(
+        let mut wakeup_rec = crate::trace::register_stage(
             "journal: disruptor wakeup (publish → journal consume)",
         );
         #[cfg(feature = "latency-trace")]
         let mut batch_rec =
-            melin_journal::trace::register_stage("journal: batch processing (write + sync)");
+            crate::trace::register_stage("journal: batch processing (write + sync)");
 
         loop {
             if shutdown.load(std::sync::atomic::Ordering::Relaxed) {
@@ -1755,12 +1755,12 @@ impl<A: Application> MatchingStage<A> {
         // the server prints them via `trace::print_report_all` once
         // all stage threads have joined.
         #[cfg(feature = "latency-trace")]
-        let mut wakeup_rec = melin_journal::trace::register_stage(
+        let mut wakeup_rec = crate::trace::register_stage(
             "matching: disruptor wakeup (publish → matching consume)",
         );
         #[cfg(feature = "latency-trace")]
         let mut execute_rec =
-            melin_journal::trace::register_stage("matching: execute (process_event)");
+            crate::trace::register_stage("matching: execute (process_event)");
 
         loop {
             if shutdown.load(std::sync::atomic::Ordering::Relaxed) {
@@ -1923,7 +1923,7 @@ impl<A: Application> MatchingStage<A> {
                 #[cfg(feature = "latency-trace")]
                 {
                     let exec_end = trace_ts();
-                    let elapsed_ns = melin_journal::trace::trace_elapsed_ns(exec_start, exec_end);
+                    let elapsed_ns = crate::trace::trace_elapsed_ns(exec_start, exec_end);
                     // Outlier log: any execute > 1 ms is well into pathological
                     // territory for a path whose p50 is ~200 ns. Capture the
                     // event variant + correlation IDs so we can pin down what

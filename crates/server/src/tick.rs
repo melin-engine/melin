@@ -24,7 +24,7 @@
 use crate::InputSlot;
 use crate::JournalEvent;
 use melin_disruptor::ring;
-use melin_journal::trace::trace_ts;
+use melin_transport_core::trace::trace_ts;
 
 /// Strict-monotonic clamp on the wall-clock timestamp emitted by each tick.
 /// `last_now_ns == 0` is the initial-state sentinel — the first tick is

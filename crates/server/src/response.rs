@@ -25,7 +25,7 @@ use crate::durability_policy::{CursorView, DurabilityMode, EvalStatus, Policy};
 use crate::replication::ReplicationMetrics;
 use crate::{OutputPayload, OutputSlot};
 #[cfg(feature = "latency-trace")]
-use melin_journal::trace;
+use melin_transport_core::trace;
 use melin_trading::types::QueryResponse;
 use melin_transport_core::pipeline::StageUtilization;
 
@@ -190,7 +190,7 @@ pub fn run(
     }
 
     // Stage histograms registered with the global registry — see
-    // `melin_journal::trace`. The four breakdown stages
+    // `melin_transport_core::trace`. The four breakdown stages
     // (journal-wait, replica-wait, encode, egress) feed the bench's
     // tick-to-trade decomposition; spsc/dispatch/server-e2e are kept
     // alongside as overall sanity checks.

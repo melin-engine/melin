@@ -10,7 +10,7 @@ path = "src/lib.rs"
 [features]
 ## Record per-stage latency histograms on shutdown. Adds ~20 ns of clock
 ## overhead per event. Not for production.
-latency-trace = ["melin-journal/latency-trace"]
+latency-trace = ["dep:hdrhistogram"]
 ## Print per-stage busy/idle utilization on shutdown.
 pipeline-stats = []
 ## Skip all journal I/O (no writes, no fsync). Unsafe for production —
@@ -27,6 +27,7 @@ no-o-direct = ["melin-journal/no-o-direct"]
 
 [dependencies]
 crc32c = "0.6"
+hdrhistogram = { version = "7", optional = true }
 io-uring = "0.7"
 libc = { workspace = true }
 tracing = { workspace = true }

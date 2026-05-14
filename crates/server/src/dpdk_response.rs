@@ -29,7 +29,7 @@ use melin_protocol::codec;
 use melin_protocol::message::ResponseKind;
 
 #[cfg(feature = "latency-trace")]
-use melin_journal::trace;
+use melin_transport_core::trace;
 
 /// Maximum number of output slots consumed per batch.
 const MAX_BATCH: usize = 1024;

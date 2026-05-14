@@ -20,6 +20,7 @@ pub mod journaled_app;
 pub mod pipeline;
 pub mod replication_wire;
 pub mod snapshot;
+pub mod trace;
 
 #[cfg(test)]
 mod test_support;

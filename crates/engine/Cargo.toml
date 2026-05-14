@@ -12,7 +12,6 @@ no-persist = ["melin-transport-core/no-persist"]
 ## Adds ~20ns of clock overhead per event. Not for production.
 latency-trace = [
     "dep:hdrhistogram",
-    "melin-journal/latency-trace",
     "melin-transport-core/latency-trace",
 ]
 ## Kept for backward compatibility — io_uring is now always used.

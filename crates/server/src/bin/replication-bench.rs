@@ -28,7 +28,7 @@ use ed25519_dalek::SigningKey;
 
 #[allow(unused_imports)] // used by some feature combinations only
 use melin_journal::JournalWrite;
-use melin_journal::trace::trace_ts;
+use melin_transport_core::trace::trace_ts;
 use melin_app::unix_epoch_nanos;
 use melin_protocol::auth::AuthorizedKeys;
 use melin_server::replication::{ReplicationMetrics, Sender, run_receiver, run_sender};

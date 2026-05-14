@@ -9,7 +9,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
 use melin_journal::BufferedWriter;
-use melin_journal::trace::trace_ts;
+use melin_transport_core::trace::trace_ts;
 use melin_noop::NoopApp;
 use melin_trading::trading_event::TradingEvent;
 use melin_trading::types::{AccountId, CurrencyId};

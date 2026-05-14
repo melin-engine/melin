@@ -1621,7 +1621,6 @@ dependencies = [
  "blake3",
  "crc32c",
  "getrandom 0.3.4",
- "hdrhistogram",
  "io-uring",
  "libc",
  "melin-app",
@@ -1766,6 +1765,7 @@ name = "melin-transport-core"
 version = "0.6.0"
 dependencies = [
  "crc32c",
+ "hdrhistogram",
  "io-uring",
  "libc",
  "melin-app",

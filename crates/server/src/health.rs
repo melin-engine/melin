@@ -556,7 +556,7 @@ fn write_stats_dump(buf: &mut [u8]) -> usize {
 
     #[cfg(feature = "latency-trace")]
     {
-        let snaps = melin_journal::trace::global_registry().snapshot_all();
+        let snaps = melin_transport_core::trace::global_registry().snapshot_all();
         if snaps.is_empty() {
             // Feature on but no samples yet — explicit empty marker so
             // the bench doesn't confuse it with a feature-off server.
@@ -1330,7 +1330,7 @@ mod tests {
         // Recorder dropped before the snapshot fetch — see the
         // SyncHistogram caveat in `crates/journal/src/trace.rs` tests.
         {
-            let mut rec = melin_journal::trace::register_stage("test::stats_dump_emit_marker");
+            let mut rec = melin_transport_core::trace::register_stage("test::stats_dump_emit_marker");
             rec.record_ns(1_500);
             rec.record_ns(2_500);
             rec.record_ns(3_500);
@@ -1360,7 +1360,7 @@ mod tests {
         // SyncHistogram caveat in `crates/journal/src/trace.rs` tests.
         {
             let mut rec =
-                melin_journal::trace::register_stage("test::stats_dump_line_format_marker");
+                melin_transport_core::trace::register_stage("test::stats_dump_line_format_marker");
             rec.record_ns(1_000);
             rec.record_ns(2_000);
             rec.record_ns(3_000);
@@ -1403,7 +1403,7 @@ mod tests {
     #[test]
     fn stats_dump_body_skips_empty_stages() {
         // A stage with no samples must not appear in the dump.
-        let _empty = melin_journal::trace::register_stage("test::stats_dump_empty_stage_marker");
+        let _empty = melin_transport_core::trace::register_stage("test::stats_dump_empty_stage_marker");
         // No record_ns calls.
 
         let (addr, _events, _healthy, shutdown, handle) = start_health(0, 0, u64::MAX);

@@ -29,7 +29,7 @@ use crate::ControlEvent;
 use crate::InputSlot;
 use crate::JournalEvent;
 use melin_disruptor::ring;
-use melin_journal::trace::trace_ts;
+use melin_transport_core::trace::trace_ts;
 use melin_app::unix_epoch_nanos;
 use melin_protocol::auth::Permission;
 use melin_protocol::codec;
@@ -338,10 +338,10 @@ fn reader_loop<R: AsRawFd>(
     // gated on `tick-to-trade`).
     #[cfg(feature = "latency-trace")]
     let mut publish_rec =
-        melin_journal::trace::register_stage("reader: publish (decode → disruptor publish)");
+        melin_transport_core::trace::register_stage("reader: publish (decode → disruptor publish)");
     #[cfg(feature = "tick-to-trade")]
     let mut ingest_rec =
-        melin_journal::trace::register_stage("reader: ingest (recv_ts → publish complete)");
+        melin_transport_core::trace::register_stage("reader: ingest (recv_ts → publish complete)");
 
     // Coarse gate for timeout scanning — avoids scanning on every
     // submit_and_wait return during high throughput.
@@ -767,8 +767,8 @@ fn process_frames<R>(
     producer: &mut ring::Producer<InputSlot>,
     server_busy_frame: &[u8; 5],
     batch_wall_ns: u64,
-    #[cfg(feature = "latency-trace")] publish_rec: &mut melin_journal::trace::StageRecorder,
-    #[cfg(feature = "tick-to-trade")] ingest_rec: &mut melin_journal::trace::StageRecorder,
+    #[cfg(feature = "latency-trace")] publish_rec: &mut melin_transport_core::trace::StageRecorder,
+    #[cfg(feature = "tick-to-trade")] ingest_rec: &mut melin_transport_core::trace::StageRecorder,
 ) -> bool {
     let mut cursor = 0;
 

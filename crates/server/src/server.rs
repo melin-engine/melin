@@ -853,7 +853,7 @@ fn shutdown_pipeline_stages<W: Send + 'static>(
 
     // After every stage thread has joined, dump the per-stage latency
     // histograms to stderr. No-op when `latency-trace` is disabled.
-    melin_journal::trace::print_report_all();
+    melin_transport_core::trace::print_report_all();
 
     if thread_panicked || journal_failed {
         error!("shutdown complete (with pipeline failure)");
@@ -1373,7 +1373,7 @@ where
     if needs_seeding {
         use crate::InputSlot;
         use crate::JournalEvent;
-        use melin_journal::trace::trace_ts;
+        use melin_transport_core::trace::trace_ts;
         use melin_app::unix_epoch_nanos;
         use melin_trading::types::{AccountId, CurrencyId, InstrumentSpec, Symbol};
 
@@ -2257,7 +2257,7 @@ where
     if needs_seeding {
         use crate::InputSlot;
         use crate::JournalEvent;
-        use melin_journal::trace::trace_ts;
+        use melin_transport_core::trace::trace_ts;
         use melin_app::unix_epoch_nanos;
         use melin_trading::types::{AccountId, CurrencyId, InstrumentSpec, Symbol};
 

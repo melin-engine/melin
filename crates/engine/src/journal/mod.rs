@@ -44,10 +44,10 @@ pub type JournalStage<W> = pipeline::JournalStage<crate::trading_event::TradingE
 /// Re-export the generic pipeline module so callers reaching for raw
 /// generic types (`pipeline::build_pipeline_with_replication::<A>`,
 /// `pipeline::StageUtilization`) find them at the familiar path.
-pub use melin_transport_core::pipeline;
+pub use melin_transport_core::{pipeline, trace};
 
 pub use melin_app::unix_epoch_nanos;
 pub use melin_journal::{
     AsyncWriteBatch, JournalError, JournalWrite, RawJournalScanner, checkpoint_interval, codec,
-    replication, trace,
+    replication,
 };

@@ -44,7 +44,7 @@ use crate::JournalEvent;
 use ed25519_dalek::{Verifier, VerifyingKey};
 use melin_disruptor::ring;
 use melin_dpdk::transport::DpdkTransport;
-use melin_journal::trace::trace_ts;
+use melin_transport_core::trace::trace_ts;
 use melin_app::unix_epoch_nanos;
 use melin_protocol::auth::{AuthorizedKeys, Permission};
 use melin_protocol::codec;
@@ -185,7 +185,7 @@ pub fn run_dpdk_poll(
     // the surrounding decode + dedup, which is what `ingest` measures.
     #[cfg(feature = "tick-to-trade")]
     let mut ingest_rec =
-        melin_journal::trace::register_stage("reader: ingest (recv_ts → publish complete)");
+        melin_transport_core::trace::register_stage("reader: ingest (recv_ts → publish complete)");
 
     // Pre-allocated parse buffer pool. Avoids heap allocation on accept
     // by recycling buffers from disconnected connections.
@@ -235,7 +235,7 @@ pub fn run_dpdk_poll(
     // /stats-dump endpoint snapshots it alongside the other stages.
     #[cfg(feature = "latency-trace")]
     let mut poll_iter_rec =
-        melin_journal::trace::register_stage("dpdk poll: outer iteration (work-iterations only)");
+        melin_transport_core::trace::register_stage("dpdk poll: outer iteration (work-iterations only)");
     #[cfg(feature = "latency-trace")]
     let mut poll_iter_start = trace_ts();
 
@@ -786,7 +786,7 @@ fn process_trading_frames(
     control_tx: &mpsc::Sender<ControlEvent>,
     id_to_handle: &mut FxHashMap<u64, SocketHandle>,
     batch_wall_ns: u64,
-    #[cfg(feature = "tick-to-trade")] ingest_rec: &mut melin_journal::trace::StageRecorder,
+    #[cfg(feature = "tick-to-trade")] ingest_rec: &mut melin_transport_core::trace::StageRecorder,
 ) {
     let mut cursor = 0;
 

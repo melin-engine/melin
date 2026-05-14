@@ -2088,7 +2088,7 @@ fn seed_and_drain(
     accounts: u32,
     shutdown: &AtomicBool,
 ) {
-    use melin_journal::trace::trace_ts;
+    use melin_transport_core::trace::trace_ts;
     use melin_trading::types::{AccountId, CurrencyId, InstrumentSpec, Symbol};
 
     let seed_start = std::time::Instant::now();

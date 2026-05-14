@@ -27,7 +27,6 @@ pub mod reader;
 pub mod replication;
 pub mod sector_writer;
 pub mod segment;
-pub mod trace;
 pub mod write;
 
 pub use buffered_writer::BufferedWriter;

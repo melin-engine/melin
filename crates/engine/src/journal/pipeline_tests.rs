@@ -16,7 +16,7 @@ mod tests {
 
     use melin_disruptor::padding::Sequence;
     use melin_disruptor::ring;
-    use melin_journal::trace::trace_ts;
+    use melin_transport_core::trace::trace_ts;
 
     // Generic pipeline items the tests reach for by their raw form.
     use crate::journal::pipeline::{
