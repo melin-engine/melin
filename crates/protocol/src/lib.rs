@@ -13,9 +13,6 @@ pub mod tcp;
 pub mod transport;
 pub mod uds;
 
-#[cfg(test)]
-mod fuzz_tests;
-
 /// Re-export engine types that clients need to construct requests and
 /// interpret responses, so they don't need a direct dependency on the
 /// engine crate.
