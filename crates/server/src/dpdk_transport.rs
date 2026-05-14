@@ -313,7 +313,7 @@ pub fn run_dpdk_poll(
             let nonce: [u8; 32] = rng.random();
 
             // Send the Challenge frame immediately. X25519 ephemerals
-            // are rumcast-only; DPDK TCP path uses zeros — see
+            // are unused on the DPDK TCP path; send zeros — see
             // [`melin_protocol::auth::auth_signing_payload`].
             let server_x25519_eph = [0u8; 32];
             let mut challenge_buf = [0u8; 128];

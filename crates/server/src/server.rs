@@ -231,34 +231,6 @@ pub struct ServerConfig {
     #[arg(long, default_value_t = false)]
     pub yield_idle: bool,
 
-    /// Client address that rumcast responses are unicast to. Required
-    /// when the server is built with `--features rumcast`. Phase 1 of
-    /// the rumcast wire-up is single-client only; this is the bench
-    /// client's bind address.
-    #[arg(long)]
-    pub rumcast_client_addr: Option<std::net::SocketAddr>,
-
-    /// NAPI busy-poll budget in microseconds for rumcast orders +
-    /// response sockets. `0` (default) leaves the kernel on its
-    /// normal interrupt-driven recv path. Non-zero enables
-    /// `SO_BUSY_POLL` + `SO_PREFER_BUSY_POLL` so the kernel polls the
-    /// NIC ring inside `recvmsg` instead of waiting for an interrupt
-    /// — trades CPU for tighter recv tail latency. Typical real-NIC
-    /// values are 50–100 µs. No-op on loopback (no NAPI ring).
-    /// Requires `CAP_NET_ADMIN` or a non-zero `net.core.busy_read`
-    /// sysctl floor; the call falls back to a `warn!` and continues
-    /// on `EPERM`.
-    #[arg(long, default_value_t = 0)]
-    pub rumcast_busy_poll_us: u32,
-
-    /// Enable kernel `UDP_GRO` on the rumcast orders socket. Pairs
-    /// with `UDP_SEGMENT` (UDP-GSO) on the sender side so the
-    /// kernel can re-coalesce incoming wire packets and the rumcast
-    /// recv path can fan out segments via the cmsg `seg_size` hint.
-    /// Off by default. No-op on loopback (no NAPI/GRO path).
-    #[arg(long, default_value_t = false)]
-    pub rumcast_udp_gro: bool,
-
     // --- DPDK configuration (only used with --features dpdk) ---
     /// DPDK EAL arguments (space-separated). Example: "-l 0-7 --huge-dir /dev/hugepages".
     /// Passed directly to rte_eal_init. Only used when compiled with --features dpdk.
@@ -415,9 +387,6 @@ impl Default for ServerConfig {
             replication_ring_size: 256,
             durability_mode: crate::durability_policy::DurabilityMode::Hybrid,
             yield_idle: false,
-            rumcast_client_addr: None,
-            rumcast_busy_poll_us: 0,
-            rumcast_udp_gro: false,
             dpdk_eal_args: String::new(),
             dpdk_ports: vec![0],
             dpdk_ip: "10.0.0.1".into(),
@@ -2562,9 +2531,7 @@ pub(crate) fn empty_app_for_seed(_config: &ServerConfig) -> App {
 /// through the pipeline. The recovery paths (snapshot+journal, snapshot
 /// only, journal only, fresh) are transport-level concerns and work
 /// uniformly for any `A: Application` via `JournaledApp<A>`.
-/// Same engine initialization the TCP / DPDK paths use; exposed at
-/// `pub(crate)` so the rumcast transport (Phase 1) can call it without
-/// duplicating the recovery / snapshot / rotation logic.
+/// Same engine initialization the TCP / DPDK paths use.
 pub(crate) fn init_engine<W>(
     config: &ServerConfig,
 ) -> Result<(App, W, bool), Box<dyn std::error::Error>>
@@ -2743,11 +2710,10 @@ fn authenticate_connection<R: std::io::Read, W: std::io::Write>(
     let mut nonce = [0u8; 32];
     getrandom::fill(&mut nonce).map_err(|e| io::Error::other(format!("getrandom failed: {e}")))?;
 
-    // Send Challenge. X25519 ephemerals are only meaningful on the
-    // rumcast path (where they seed the per-session MAC token). TCP
-    // sends zeros for the ephemerals; the signature payload still
-    // covers them so server + client share a single signing scheme
-    // — see [`melin_protocol::auth::auth_signing_payload`].
+    // Send Challenge. The X25519 ephemeral is unused on the TCP path
+    // but kept in the wire layout for forward compatibility — the
+    // signature payload still covers it so server + client share a
+    // single signing scheme. See `melin_protocol::auth::auth_signing_payload`.
     let server_x25519_eph = [0u8; 32];
     let mut buf = [0u8; 128];
     let written = codec::encode_response(

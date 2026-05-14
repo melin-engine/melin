@@ -155,8 +155,8 @@ fn authenticate(stream: &mut TcpStream, authorized_keys: &AuthorizedKeys) -> Res
     let mut nonce = [0u8; 32];
     getrandom::fill(&mut nonce).map_err(|e| format!("getrandom failed: {e}"))?;
 
-    // X25519 ephemerals are rumcast-only; admin uses TCP and sends zeros
-    // here — see [`melin_protocol::auth::auth_signing_payload`].
+    // X25519 ephemerals are unused on the admin TCP path; send zeros
+    // — see [`melin_protocol::auth::auth_signing_payload`].
     let server_x25519_eph = [0u8; 32];
     let mut buf = [0u8; 128];
     let written = codec::encode_response(

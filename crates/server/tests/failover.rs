@@ -1211,11 +1211,6 @@ fn bench_binary_journals_contiguous_across_checkpoint_boundary() {
     if profile_dir == "release" {
         build.arg("--release");
     }
-    // Mirror the server's transport feature so bench speaks the same
-    // wire protocol. Under `--features rumcast` the server binds UDP;
-    // the bench must also be built with rumcast to connect.
-    #[cfg(feature = "rumcast")]
-    build.args(["--features", "rumcast", "--no-default-features"]);
     let build_status = build.status().expect("spawn cargo build melin-bench");
     assert!(
         build_status.success(),
@@ -1263,12 +1258,6 @@ fn bench_binary_journals_contiguous_across_checkpoint_boundary() {
         "2",
         "250",
     ]);
-    // Under rumcast the bench must bind a local UDP socket so the server
-    // can send response frames back. Port 0 lets the OS assign an
-    // ephemeral port; the server learns the real address from the Setup
-    // packet source.
-    #[cfg(feature = "rumcast")]
-    bench_cmd.args(["--rumcast-bind", "127.0.0.1:0"]);
     let bench_status = bench_cmd
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit())

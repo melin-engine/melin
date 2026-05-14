@@ -57,10 +57,6 @@ mod catchup;
 #[cfg(feature = "dpdk")]
 mod dpdk;
 mod protocol;
-#[cfg(feature = "rumcast")]
-mod rumcast_receiver;
-#[cfg(feature = "rumcast")]
-mod rumcast_sender;
 mod tcp_receiver;
 mod tcp_sender;
 
@@ -72,10 +68,6 @@ pub use protocol::{Ack, Handshake, PrimaryMessage, ReplicaMessage};
 
 #[cfg(feature = "dpdk")]
 pub use dpdk::{DpdkReplicationDriver, run_receiver_dpdk};
-#[cfg(feature = "rumcast")]
-pub use rumcast_receiver::run_receiver_rumcast;
-#[cfg(feature = "rumcast")]
-pub use rumcast_sender::{Sender as RumcastSender, run_sender_rumcast};
 pub use tcp_receiver::{ReceiverResult, run_receiver};
 pub use tcp_sender::{Sender, run_sender};
 
@@ -601,8 +593,8 @@ pub(super) fn update_dual_replication_cursor(
 /// **Callers MUST update `*last_sent_acked` / `*last_sent_in_memory`
 /// to the returned ack's fields AFTER the wire SEND succeeds, not
 /// before.** Marking a value as sent before the actual send completes
-/// would silently skip resending after a transient send failure (DPDK
-/// `ACK_RETRY_CAP` drop, rumcast SEND error). Cursors are monotonic,
+/// would silently skip resending after a transient send failure
+/// (e.g. DPDK `ACK_RETRY_CAP` drop). Cursors are monotonic,
 /// so a subsequent successful pop subsumes any lost value — but only
 /// if the trackers haven't been advanced past it.
 #[inline]

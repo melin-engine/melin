@@ -98,9 +98,3 @@ pub mod server;
 pub mod dpdk_response;
 #[cfg(feature = "dpdk")]
 pub mod dpdk_transport;
-
-/// Standalone server with rumcast (reliable UDP) as the order-entry
-/// transport. Mutually exclusive with `dpdk` at build time. Phase 1
-/// scope is bench-comparison only — see the module docs.
-#[cfg(feature = "rumcast")]
-pub mod rumcast_transport;

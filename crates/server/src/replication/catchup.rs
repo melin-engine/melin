@@ -91,7 +91,7 @@ pub(super) fn can_catch_up_from_journal(
 /// Returns the last sequence sent, or the input `last_sequence` if no
 /// entries were sent. The closure is called once per encoded `InputBatch`
 /// frame; it receives the bytes to ship and is responsible for the
-/// actual transport write (TCP `write_all`+`flush`, rumcast publish, …).
+/// actual transport write (TCP `write_all`+`flush`).
 pub(super) fn catch_up_from_journal_with(
     journal_path: &std::path::Path,
     last_sequence: u64,
@@ -203,10 +203,8 @@ pub(super) fn catch_up_from_journal_with(
     Ok(CatchUpResult::Ok(end_sequence))
 }
 
-/// Backwards-compatible wrapper around [`catch_up_from_journal_with`]
-/// that ships frames over a TCP stream. Kept so the TCP sender path
-/// stays untouched while the rumcast sender (which doesn't have a
-/// `TcpStream`) calls the generic closure-based variant directly.
+/// Thin wrapper around [`catch_up_from_journal_with`] that ships
+/// frames over a TCP stream.
 pub(super) fn catch_up_from_journal(
     journal_path: &std::path::Path,
     last_sequence: u64,

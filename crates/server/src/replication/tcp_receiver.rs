@@ -257,8 +257,8 @@ fn replica_stream_uring(
         // persisted-vs-in-memory model. The helper centralises the
         // namespace translation between local-ring positions
         // (`journal_cursor` space) and primary sequences (wire space)
-        // so this receiver and the DPDK / rumcast siblings can't
-        // drift on that translation.
+        // so this receiver and the DPDK sibling can't drift on that
+        // translation.
         if !ack_send_in_flight
             && let Some(ack) = try_flush_dual_track(
                 pending_acks,
