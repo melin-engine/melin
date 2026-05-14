@@ -50,7 +50,7 @@ dpdk = ["dep:melin-dpdk", "melin-dpdk/dpdk-sys"]
 ## bench all over rumcast). Implies `hash-chain` because rumcast
 ## replication needs the chain hash for divergence detection — same
 ## reason `noop` pulls it in.
-rumcast = ["dep:melin-rumcast", "melin-rumcast/io-uring", "hash-chain", "melin-client/rumcast"]
+rumcast = ["dep:melin-rumcast", "melin-rumcast/io-uring", "hash-chain"]
 pipeline-stats = ["melin-engine?/pipeline-stats", "melin-transport-core/pipeline-stats"]
 hash-chain = [
     "melin-engine?/hash-chain",
@@ -114,7 +114,7 @@ x25519-dalek = { workspace = true }
 
 [dev-dependencies]
 tempfile = "3"
-melin-client = { path = "../client" }
+melin-client = { path = "../client", features = ["rumcast"] }
 melin-protocol = { path = "../protocol" }
 ed25519-dalek = { workspace = true }
 base64 = { workspace = true }
