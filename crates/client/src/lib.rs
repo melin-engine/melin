@@ -1,11 +1,8 @@
 //! Client library for connecting to the trading server.
 //!
 //! Provides a typed API over the binary wire protocol. The public
-//! `Client` type is transport-agnostic at the source level: by default
-//! it speaks TCP via blocking I/O; built with `--features rumcast` it
-//! speaks rumcast (reliable UDP) instead. Mirrors the server's
-//! `--features rumcast` build so integration tests can exercise either
-//! transport without rewriting test code.
+//! `Client` type speaks TCP via blocking I/O against the server's
+//! TCP listener.
 
 use std::io;
 
@@ -25,9 +22,10 @@ pub enum ClientError {
     AuthFailed,
     /// Server pipeline is full. The caller should retry after a brief backoff.
     ServerBusy,
-    /// Operation didn't complete within the implementation's deadline
-    /// (rumcast handshake / response wait). TCP path uses blocking I/O
-    /// and surfaces timeouts as `Io` instead.
+    /// Operation didn't complete within the implementation's deadline.
+    /// The TCP path uses blocking I/O and surfaces socket-level
+    /// timeouts as `Io`, so this variant is currently unreachable —
+    /// kept in the API for forward compatibility.
     Timeout,
 }
 

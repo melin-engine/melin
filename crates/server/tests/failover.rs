@@ -198,15 +198,10 @@ fn wait_halted(addr: SocketAddr, timeout: Duration) {
 
 /// Wait for the primary's replication endpoint to be ready to accept
 /// inbound connections from replicas. Polls the *health* endpoint
-/// rather than the replication port directly so the same helper works
-/// regardless of replication transport — TCP (default features) and
-/// rumcast (UDP) both bind their replication socket during the same
-/// startup phase as the health endpoint, so a responsive `/healthz`
-/// is a reliable proxy for "replica may now connect".
-///
-/// Replaces older per-call `TcpStream::connect_timeout` probes that
-/// silently failed under `--features rumcast` because rumcast
-/// replication binds UDP, not TCP.
+/// rather than the replication port directly — a responsive
+/// `/healthz` is a reliable proxy for "replica may now connect"
+/// because the replication socket binds during the same startup phase
+/// as the health endpoint.
 fn wait_for_primary_repl_ready(health_addr: SocketAddr, timeout: Duration) {
     let start = Instant::now();
     loop {
