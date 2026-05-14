@@ -252,7 +252,9 @@ pub fn run(
             // spin path off `clock_gettime`. Without this, perf-annotate
             // showed ~22 % of the response thread's CPU on the vDSO.
             if let Some(interval) = heartbeat_interval
-                && heartbeat_timer.tick(Duration::from_secs(1), busy_spin || idle_spins < 1000).is_some()
+                && heartbeat_timer
+                    .tick(Duration::from_secs(1), busy_spin || idle_spins < 1000)
+                    .is_some()
             {
                 let now = Instant::now();
                 last_heartbeat_scan = now;
@@ -321,7 +323,7 @@ pub fn run(
         busy_count += 1;
 
         #[cfg(feature = "latency-trace")]
-        let consume_ts = trace::trace_ts();
+        let consume_ts = trace::mono_trace_ns();
 
         // Per-slot journal-wait / replica-wait tracker. Same shape as
         // the TCP response — see `crate::response::GateCrossTracker`
@@ -369,7 +371,7 @@ pub fn run(
                         crate::response::connected_persisted_min(metrics_ref, active_ref);
 
                     #[cfg(feature = "tick-to-trade")]
-                    gate_tracker.observe(journal_pos, repl_min, trace::trace_ts());
+                    gate_tracker.observe(journal_pos, repl_min, trace::mono_trace_ns());
 
                     let status = crate::response::evaluate_durability(
                         &policy,
@@ -496,7 +498,7 @@ pub fn run(
 
             for kind in &kinds[..kinds_len] {
                 #[cfg(feature = "tick-to-trade")]
-                let encode_start = trace::trace_ts();
+                let encode_start = trace::mono_trace_ns();
                 let written = match codec::encode_response(kind, &mut encode_buf) {
                     Ok(n) => n,
                     Err(e) => {
@@ -509,7 +511,7 @@ pub fn run(
                     }
                 };
                 #[cfg(feature = "tick-to-trade")]
-                encode_rec.record_elapsed(encode_start, trace::trace_ts());
+                encode_rec.record_elapsed(encode_start, trace::mono_trace_ns());
 
                 let len = written as u16;
                 tx_producers[tid].push_with(|frame| {
@@ -528,7 +530,7 @@ pub fn run(
                 // Record server-e2e relative to post-flush wall clock —
                 // i.e. the moment the DPDK poll thread can see the
                 // response.
-                server_e2e_rec.record_elapsed(slot.recv_ts, trace::trace_ts());
+                server_e2e_rec.record_elapsed(slot.recv_ts, trace::mono_trace_ns());
             }
 
             if let Some(state) = connections.get_mut(&slot.connection_id) {
@@ -537,7 +539,7 @@ pub fn run(
         }
 
         #[cfg(feature = "latency-trace")]
-        dispatch_rec.record_elapsed(consume_ts, trace::trace_ts());
+        dispatch_rec.record_elapsed(consume_ts, trace::mono_trace_ns());
     }
 }
 

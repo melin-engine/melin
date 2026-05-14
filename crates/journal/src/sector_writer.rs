@@ -1554,7 +1554,6 @@ fn rustix_to_io(err: rustix::io::Errno) -> JournalError {
     JournalError::Io(std::io::Error::from_raw_os_error(err.raw_os_error()))
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;

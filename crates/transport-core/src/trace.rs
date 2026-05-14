@@ -1,6 +1,6 @@
 //! Per-stage latency tracing for the disruptor pipeline.
 //!
-//! Behind the `latency-trace` feature gate. When disabled, `TraceTimestamp`
+//! Behind the `latency-trace` feature gate. When disabled, `MonoTraceInstant`
 //! is `()` (zero-sized) and all tracing helpers are no-ops — zero overhead.
 //!
 //! ## Stats registry
@@ -33,27 +33,32 @@
 //! `&mut self` on `record_ns` because `Recorder::record` does — the
 //! local buffer is mutated without synchronization.
 
-/// Timestamp carried through pipeline slots.
+/// Monotonic timestamp carried through pipeline slots.
+///
+/// Backed by `Instant::now()` — never goes backwards, ignores NTP. Used
+/// only for stage-to-stage latency measurement; never persisted, never
+/// compared across processes. For wall-clock timestamps stamped into
+/// journal records, see [`melin_app::unix_epoch_nanos`].
 ///
 /// `u64` nanoseconds when tracing is enabled, `()` (ZST, optimized away)
 /// when disabled. This avoids `#[cfg]` on struct fields while adding
 /// zero bytes to slot layouts in production builds.
 #[cfg(feature = "latency-trace")]
-pub type TraceTimestamp = u64;
+pub type MonoTraceInstant = u64;
 
 #[cfg(not(feature = "latency-trace"))]
-pub type TraceTimestamp = ();
+pub type MonoTraceInstant = ();
 
 /// Capture a trace timestamp. Returns `()` when tracing is disabled.
 #[cfg(feature = "latency-trace")]
 #[inline]
-pub fn trace_ts() -> TraceTimestamp {
+pub fn mono_trace_ns() -> MonoTraceInstant {
     mono_nanos()
 }
 
 #[cfg(not(feature = "latency-trace"))]
 #[inline]
-pub fn trace_ts() -> TraceTimestamp {}
+pub fn mono_trace_ns() -> MonoTraceInstant {}
 
 /// Monotonic nanoseconds since process start. Uses a static epoch to
 /// avoid overflow and keep values small.
@@ -70,7 +75,7 @@ fn mono_nanos() -> u64 {
 /// Elapsed nanoseconds between two trace timestamps.
 #[cfg(feature = "latency-trace")]
 #[inline]
-pub fn trace_elapsed_ns(start: TraceTimestamp, end: TraceTimestamp) -> u64 {
+pub fn mono_trace_elapsed_ns(start: MonoTraceInstant, end: MonoTraceInstant) -> u64 {
     end.saturating_sub(start)
 }
 
@@ -133,8 +138,8 @@ impl StageRecorder {
 
     /// Record the elapsed nanoseconds between two trace timestamps.
     #[inline]
-    pub fn record_elapsed(&mut self, start: TraceTimestamp, end: TraceTimestamp) {
-        self.record_ns(trace_elapsed_ns(start, end));
+    pub fn record_elapsed(&mut self, start: MonoTraceInstant, end: MonoTraceInstant) {
+        self.record_ns(mono_trace_elapsed_ns(start, end));
     }
 }
 
@@ -148,7 +153,7 @@ impl StageRecorder {
     pub fn record_ns(&mut self, _ns: u64) {}
 
     #[inline]
-    pub fn record_elapsed(&mut self, _start: TraceTimestamp, _end: TraceTimestamp) {}
+    pub fn record_elapsed(&mut self, _start: MonoTraceInstant, _end: MonoTraceInstant) {}
 }
 
 /// One stage's storage in the registry: a stable name + the

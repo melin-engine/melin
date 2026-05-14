@@ -28,11 +28,11 @@ use tracing::{debug, error};
 use crate::ControlEvent;
 use crate::InputSlot;
 use crate::JournalEvent;
-use melin_disruptor::ring;
-use melin_transport_core::trace::trace_ts;
 use melin_app::unix_epoch_nanos;
+use melin_disruptor::ring;
 use melin_protocol::auth::Permission;
 use melin_protocol::codec;
+use melin_transport_core::trace::mono_trace_ns;
 
 /// Size of each provided buffer. 4 KiB accommodates multiple frames per
 /// recv (frames are typically <100 bytes).
@@ -823,7 +823,7 @@ fn process_frames<R>(
         }
 
         #[allow(clippy::let_unit_value)]
-        let recv_ts = trace_ts();
+        let recv_ts = mono_trace_ns();
 
         let event = crate::request::to_event(&request);
 
@@ -843,7 +843,7 @@ fn process_frames<R>(
         };
 
         #[cfg(feature = "latency-trace")]
-        let pre_publish = trace_ts();
+        let pre_publish = mono_trace_ns();
 
         if producer
             .try_publish(InputSlot {
@@ -853,7 +853,7 @@ fn process_frames<R>(
                 sequence: 0,
                 timestamp_ns: ts,
                 event,
-                publish_ts: trace_ts(),
+                publish_ts: mono_trace_ns(),
                 recv_ts,
             })
             .is_err()
@@ -884,7 +884,7 @@ fn process_frames<R>(
         }
 
         #[cfg(feature = "latency-trace")]
-        let publish_done = trace_ts();
+        let publish_done = mono_trace_ns();
         #[cfg(feature = "latency-trace")]
         publish_rec.record_elapsed(pre_publish, publish_done);
         // Ingest covers the entire reader cost for this frame:

@@ -1373,9 +1373,9 @@ where
     if needs_seeding {
         use crate::InputSlot;
         use crate::JournalEvent;
-        use melin_transport_core::trace::trace_ts;
         use melin_app::unix_epoch_nanos;
         use melin_trading::types::{AccountId, CurrencyId, InstrumentSpec, Symbol};
+        use melin_transport_core::trace::mono_trace_ns;
 
         let seed_start = std::time::Instant::now();
 
@@ -1397,8 +1397,8 @@ where
                         },
                     },
                 ),
-                publish_ts: trace_ts(),
-                recv_ts: trace_ts(),
+                publish_ts: mono_trace_ns(),
+                recv_ts: mono_trace_ns(),
             });
         }
 
@@ -1419,8 +1419,8 @@ where
                         amount: u64::MAX / 4,
                     },
                 ),
-                publish_ts: trace_ts(),
-                recv_ts: trace_ts(),
+                publish_ts: mono_trace_ns(),
+                recv_ts: mono_trace_ns(),
             });
         }
         let publish_elapsed = account_start.elapsed();
@@ -2257,9 +2257,9 @@ where
     if needs_seeding {
         use crate::InputSlot;
         use crate::JournalEvent;
-        use melin_transport_core::trace::trace_ts;
         use melin_app::unix_epoch_nanos;
         use melin_trading::types::{AccountId, CurrencyId, InstrumentSpec, Symbol};
+        use melin_transport_core::trace::mono_trace_ns;
 
         // `sequence: 0` — the journal stage allocates sequences in
         // disruptor cursor order at encode time.
@@ -2279,8 +2279,8 @@ where
                         },
                     },
                 ),
-                publish_ts: trace_ts(),
-                recv_ts: trace_ts(),
+                publish_ts: mono_trace_ns(),
+                recv_ts: mono_trace_ns(),
             });
         }
 
@@ -2298,8 +2298,8 @@ where
                         amount: u64::MAX / 4,
                     },
                 ),
-                publish_ts: trace_ts(),
-                recv_ts: trace_ts(),
+                publish_ts: mono_trace_ns(),
+                recv_ts: mono_trace_ns(),
             });
         }
 

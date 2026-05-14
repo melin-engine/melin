@@ -488,7 +488,7 @@ pub fn run_dpdk_roundtrip(
     loop {
         // Stamp the start of each outer iter for the poll_iter histogram.
         // Cheap: rdtsc is a few cycles. The compiler elides this when the
-        // feature is off (TraceTimestamp = ()).
+        // feature is off (MonoTraceInstant = ()).
         #[cfg(feature = "latency-trace")]
         let iter_start_tsc = crate::rdtscp();
         #[cfg(feature = "latency-trace")]

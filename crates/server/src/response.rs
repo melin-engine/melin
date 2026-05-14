@@ -24,10 +24,10 @@ use melin_disruptor::ring;
 use crate::durability_policy::{CursorView, DurabilityMode, EvalStatus, Policy};
 use crate::replication::ReplicationMetrics;
 use crate::{OutputPayload, OutputSlot};
-#[cfg(feature = "latency-trace")]
-use melin_transport_core::trace;
 use melin_trading::types::QueryResponse;
 use melin_transport_core::pipeline::StageUtilization;
+#[cfg(feature = "latency-trace")]
+use melin_transport_core::trace;
 
 use melin_protocol::codec;
 use melin_protocol::message::ResponseKind;
@@ -345,7 +345,7 @@ pub fn run(
             // on the client RTT path.
             if !dirty_connections.is_empty() {
                 #[cfg(feature = "tick-to-trade")]
-                let egress_start = trace::trace_ts();
+                let egress_start = trace::mono_trace_ns();
                 flush_sends(
                     &mut ring,
                     &mut connections,
@@ -354,7 +354,7 @@ pub fn run(
                     &mut cqes,
                 );
                 #[cfg(feature = "tick-to-trade")]
-                egress_rec.record_elapsed(egress_start, trace::trace_ts());
+                egress_rec.record_elapsed(egress_start, trace::mono_trace_ns());
                 for conn_id in to_remove.drain(..) {
                     connections.remove(&conn_id);
                 }
@@ -436,7 +436,7 @@ pub fn run(
         busy_count += 1;
 
         #[cfg(feature = "latency-trace")]
-        let consume_ts = trace::trace_ts();
+        let consume_ts = trace::mono_trace_ns();
 
         // Wait for durability confirmation before sending responses.
         //
@@ -515,7 +515,7 @@ pub fn run(
                     let repl_min = connected_persisted_min(metrics_ref, active_ref);
 
                     #[cfg(feature = "tick-to-trade")]
-                    gate_tracker.observe(journal_pos, repl_min, trace::trace_ts());
+                    gate_tracker.observe(journal_pos, repl_min, trace::mono_trace_ns());
 
                     let status = evaluate_durability(&policy, journal_pos, metrics_ref, active_ref);
                     cached_durable_pos = status.durable_pos;
@@ -636,7 +636,7 @@ pub fn run(
                 for kind in &kinds[..kinds_len] {
                     // Encode the response (includes 4-byte length prefix).
                     #[cfg(feature = "tick-to-trade")]
-                    let encode_start = trace::trace_ts();
+                    let encode_start = trace::mono_trace_ns();
                     let written = match codec::encode_response(kind, &mut encode_buf) {
                         Ok(n) => n,
                         Err(e) => {
@@ -649,7 +649,7 @@ pub fn run(
                         }
                     };
                     #[cfg(feature = "tick-to-trade")]
-                    encode_rec.record_elapsed(encode_start, trace::trace_ts());
+                    encode_rec.record_elapsed(encode_start, trace::mono_trace_ns());
 
                     // Drop slow clients whose send buffer has grown too large.
                     // This prevents unbounded memory growth from a single laggy
@@ -674,7 +674,7 @@ pub fn run(
                     // Record server-side end-to-end: reader recv → response flush.
                     #[cfg(feature = "latency-trace")]
                     if matches!(kind, ResponseKind::BatchEnd) {
-                        server_e2e_rec.record_elapsed(slot.recv_ts, trace::trace_ts());
+                        server_e2e_rec.record_elapsed(slot.recv_ts, trace::mono_trace_ns());
                     }
                 }
             }
@@ -687,7 +687,7 @@ pub fn run(
         }
 
         #[cfg(feature = "latency-trace")]
-        dispatch_rec.record_elapsed(consume_ts, trace::trace_ts());
+        dispatch_rec.record_elapsed(consume_ts, trace::mono_trace_ns());
     }
 }
 
@@ -1025,12 +1025,12 @@ pub(crate) fn connected_persisted_min(
 ///
 /// `now_ns` is taken as a parameter rather than read internally so
 /// tests can supply deterministic timestamps. The caller's hot path
-/// reads `trace::trace_ts()` once per gate iteration and feeds it in.
+/// reads `trace::mono_trace_ns()` once per gate iteration and feeds it in.
 #[cfg(feature = "tick-to-trade")]
 pub(crate) struct GateCrossTracker {
     needed: u64,
-    journal_crossed_ts: Option<trace::TraceTimestamp>,
-    replica_crossed_ts: Option<trace::TraceTimestamp>,
+    journal_crossed_ts: Option<trace::MonoTraceInstant>,
+    replica_crossed_ts: Option<trace::MonoTraceInstant>,
     journal_was_below: bool,
     replica_was_below: bool,
     first: bool,
@@ -1053,7 +1053,7 @@ impl GateCrossTracker {
         &mut self,
         journal_pos: u64,
         repl_min: u64,
-        now_ns: trace::TraceTimestamp,
+        now_ns: trace::MonoTraceInstant,
     ) {
         if self.first {
             self.journal_was_below = journal_pos < self.needed;
@@ -1069,11 +1069,11 @@ impl GateCrossTracker {
         }
     }
 
-    pub(crate) fn journal_crossed(&self) -> Option<trace::TraceTimestamp> {
+    pub(crate) fn journal_crossed(&self) -> Option<trace::MonoTraceInstant> {
         self.journal_crossed_ts
     }
 
-    pub(crate) fn replica_crossed(&self) -> Option<trace::TraceTimestamp> {
+    pub(crate) fn replica_crossed(&self) -> Option<trace::MonoTraceInstant> {
         self.replica_crossed_ts
     }
 }

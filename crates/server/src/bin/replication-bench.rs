@@ -26,10 +26,9 @@ use base64::Engine as _;
 use clap::Parser;
 use ed25519_dalek::SigningKey;
 
+use melin_app::unix_epoch_nanos;
 #[allow(unused_imports)] // used by some feature combinations only
 use melin_journal::JournalWrite;
-use melin_transport_core::trace::trace_ts;
-use melin_app::unix_epoch_nanos;
 use melin_protocol::auth::AuthorizedKeys;
 use melin_server::replication::{ReplicationMetrics, Sender, run_receiver, run_sender};
 use melin_server::server::PipelineCores;
@@ -38,6 +37,7 @@ use melin_trading::trading_event::TradingEvent;
 use melin_trading::types::{AccountId, CurrencyId};
 use melin_transport_core::JournaledApp;
 use melin_transport_core::pipeline::{JournalStageRun, build_pipeline_with_replication};
+use melin_transport_core::trace::mono_trace_ns;
 
 #[derive(Parser)]
 struct Args {
@@ -277,8 +277,8 @@ fn main() {
             account: AccountId(1),
             amount: u64::MAX / 2,
         }),
-        publish_ts: trace_ts(),
-        recv_ts: trace_ts(),
+        publish_ts: mono_trace_ns(),
+        recv_ts: mono_trace_ns(),
     });
 
     // --- Generator + stats reporter ---
@@ -326,8 +326,8 @@ fn main() {
                         currency: CurrencyId(1),
                         amount: 1,
                     }),
-                    publish_ts: trace_ts(),
-                    recv_ts: trace_ts(),
+                    publish_ts: mono_trace_ns(),
+                    recv_ts: mono_trace_ns(),
                 });
                 total_published += 1;
             }

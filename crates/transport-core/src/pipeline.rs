@@ -22,12 +22,12 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
+use crate::trace::{MonoTraceInstant, mono_trace_ns};
 use melin_app::{AppEvent, Application, ApplyCtx, RejectReason};
 use melin_journal::JournalError;
 use melin_journal::JournalWrite;
 use melin_journal::preparer::SegmentPreparer;
 use melin_journal::replication::{ReplicationConsumer, ReplicationProducer};
-use crate::trace::{TraceTimestamp, trace_ts};
 
 use melin_disruptor::padding::Sequence;
 use melin_disruptor::ring;
@@ -156,11 +156,11 @@ pub struct InputSlot<E: AppEvent> {
     pub event: melin_journal::JournalEvent<E>,
     /// Timestamp when the publisher wrote this slot to the disruptor.
     /// `()` (zero-sized) when `latency-trace` is disabled.
-    pub publish_ts: TraceTimestamp,
+    pub publish_ts: MonoTraceInstant,
     /// Timestamp when the reader task received this request from the wire.
     /// Flows through the entire pipeline to measure server-side end-to-end latency.
     /// `()` (zero-sized) when `latency-trace` is disabled.
-    pub recv_ts: TraceTimestamp,
+    pub recv_ts: MonoTraceInstant,
 }
 
 impl<E: AppEvent> Default for InputSlot<E> {
@@ -176,8 +176,8 @@ impl<E: AppEvent> Default for InputSlot<E> {
             sequence: 0,
             timestamp_ns: 0,
             event: melin_journal::JournalEvent::Tick { now_ns: 0 },
-            publish_ts: trace_ts(),
-            recv_ts: trace_ts(),
+            publish_ts: mono_trace_ns(),
+            recv_ts: mono_trace_ns(),
         }
     }
 }
@@ -223,11 +223,11 @@ pub struct OutputSlot<R: Copy, Q: Copy> {
     pub payload: OutputPayload<R, Q>,
     /// Timestamp when the matching stage finished processing this event.
     /// `()` (zero-sized) when `latency-trace` is disabled.
-    pub match_complete_ts: TraceTimestamp,
+    pub match_complete_ts: MonoTraceInstant,
     /// Timestamp when the reader task received this request from the wire.
     /// Carried through the pipeline to measure server-side end-to-end latency.
     /// `()` (zero-sized) when `latency-trace` is disabled.
-    pub recv_ts: TraceTimestamp,
+    pub recv_ts: MonoTraceInstant,
     /// True when this is the final slot the matching stage emits for
     /// the originating input event. The response stage emits a wire
     /// `ResponseKind::BatchEnd` after the payload (skipped when the
@@ -289,8 +289,8 @@ impl<R: Copy, Q: Copy> Default for OutputSlot<R, Q> {
             connection_id: 0,
             input_seq: 0,
             payload: OutputPayload::BatchEnd,
-            match_complete_ts: trace_ts(),
-            recv_ts: trace_ts(),
+            match_complete_ts: mono_trace_ns(),
+            recv_ts: mono_trace_ns(),
             is_last_in_request: true,
             durability_bypass: false,
         }
@@ -552,9 +552,8 @@ impl<E: AppEvent, W: JournalWrite<E>> JournalStage<E, W> {
         // after all stage threads join, so dev runs still see the
         // stderr breakdown.
         #[cfg(feature = "latency-trace")]
-        let mut wakeup_rec = crate::trace::register_stage(
-            "journal: disruptor wakeup (publish → journal consume)",
-        );
+        let mut wakeup_rec =
+            crate::trace::register_stage("journal: disruptor wakeup (publish → journal consume)");
         #[cfg(feature = "latency-trace")]
         let mut batch_rec =
             crate::trace::register_stage("journal: batch processing (write + sync)");
@@ -599,7 +598,7 @@ impl<E: AppEvent, W: JournalWrite<E>> JournalStage<E, W> {
                 busy_count += 1;
 
                 #[cfg(feature = "latency-trace")]
-                let batch_start = trace_ts();
+                let batch_start = mono_trace_ns();
 
                 #[cfg(feature = "latency-trace")]
                 for slot in &batch[..count] {
@@ -676,7 +675,7 @@ impl<E: AppEvent, W: JournalWrite<E>> JournalStage<E, W> {
                 }
 
                 #[cfg(feature = "latency-trace")]
-                batch_rec.record_elapsed(batch_start, trace_ts());
+                batch_rec.record_elapsed(batch_start, mono_trace_ns());
             }
 
             // Sync when: we have data AND (batch full OR delay expired OR no delay).
@@ -1755,12 +1754,10 @@ impl<A: Application> MatchingStage<A> {
         // the server prints them via `trace::print_report_all` once
         // all stage threads have joined.
         #[cfg(feature = "latency-trace")]
-        let mut wakeup_rec = crate::trace::register_stage(
-            "matching: disruptor wakeup (publish → matching consume)",
-        );
+        let mut wakeup_rec =
+            crate::trace::register_stage("matching: disruptor wakeup (publish → matching consume)");
         #[cfg(feature = "latency-trace")]
-        let mut execute_rec =
-            crate::trace::register_stage("matching: execute (process_event)");
+        let mut execute_rec = crate::trace::register_stage("matching: execute (process_event)");
 
         loop {
             if shutdown.load(std::sync::atomic::Ordering::Relaxed) {
@@ -1842,13 +1839,13 @@ impl<A: Application> MatchingStage<A> {
                 busy_count += 1;
 
                 #[cfg(feature = "latency-trace")]
-                wakeup_rec.record_elapsed(slot.publish_ts, trace_ts());
+                wakeup_rec.record_elapsed(slot.publish_ts, mono_trace_ns());
 
                 reports.clear();
                 let mut query_report: Option<A::QueryResponse> = None;
 
                 #[cfg(feature = "latency-trace")]
-                let exec_start = trace_ts();
+                let exec_start = mono_trace_ns();
 
                 ctx.events_processed = local_events;
                 ctx.key_hash = slot.key_hash;
@@ -1922,8 +1919,8 @@ impl<A: Application> MatchingStage<A> {
 
                 #[cfg(feature = "latency-trace")]
                 {
-                    let exec_end = trace_ts();
-                    let elapsed_ns = crate::trace::trace_elapsed_ns(exec_start, exec_end);
+                    let exec_end = mono_trace_ns();
+                    let elapsed_ns = crate::trace::mono_trace_elapsed_ns(exec_start, exec_end);
                     // Outlier log: any execute > 1 ms is well into pathological
                     // territory for a path whose p50 is ~200 ns. Capture the
                     // event variant + correlation IDs so we can pin down what
@@ -1951,7 +1948,7 @@ impl<A: Application> MatchingStage<A> {
                 }
 
                 #[allow(clippy::let_unit_value)] // ZST when latency-trace is disabled
-                let match_complete_ts = trace_ts();
+                let match_complete_ts = mono_trace_ns();
 
                 // Push execution reports into the output batch.
                 // All output slots for this request carry the same
@@ -2105,7 +2102,7 @@ impl<A: Application> MatchingStage<A> {
             }
 
             #[allow(clippy::let_unit_value)]
-            let match_complete_ts = trace_ts();
+            let match_complete_ts = mono_trace_ns();
 
             // Same is_last_in_request convention as the run loop: mark
             // the final report (or a fallback BatchEnd-payload slot) as

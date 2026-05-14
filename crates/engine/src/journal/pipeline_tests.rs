@@ -16,7 +16,7 @@ mod tests {
 
     use melin_disruptor::padding::Sequence;
     use melin_disruptor::ring;
-    use melin_transport_core::trace::trace_ts;
+    use melin_transport_core::trace::mono_trace_ns;
 
     // Generic pipeline items the tests reach for by their raw form.
     use crate::journal::pipeline::{
@@ -108,8 +108,8 @@ mod tests {
                     quote: CurrencyId(1),
                 },
             }),
-            publish_ts: trace_ts(),
-            recv_ts: trace_ts(),
+            publish_ts: mono_trace_ns(),
+            recv_ts: mono_trace_ns(),
         });
         producer.publish(InputSlot {
             connection_id: 1,
@@ -122,8 +122,8 @@ mod tests {
                 currency: CurrencyId(1),
                 amount: 100_000,
             }),
-            publish_ts: trace_ts(),
-            recv_ts: trace_ts(),
+            publish_ts: mono_trace_ns(),
+            recv_ts: mono_trace_ns(),
         });
 
         let handle = std::thread::spawn(move || stage.run(&shutdown2));
@@ -211,8 +211,8 @@ mod tests {
                     currency: CurrencyId(0),
                     amount: 100,
                 }),
-                publish_ts: trace_ts(),
-                recv_ts: trace_ts(),
+                publish_ts: mono_trace_ns(),
+                recv_ts: mono_trace_ns(),
             });
         }
 
@@ -381,8 +381,8 @@ mod tests {
                             sequence: slot.sequence,
                             timestamp_ns: slot.timestamp_ns,
                             event: slot.event,
-                            publish_ts: trace_ts(),
-                            recv_ts: trace_ts(),
+                            publish_ts: mono_trace_ns(),
+                            recv_ts: mono_trace_ns(),
                         });
                     }
                     repl_c0.commit();
@@ -454,8 +454,8 @@ mod tests {
                     symbol: Symbol(1),
                     order: limit_order(i + 1, AccountId(1), side, 100, 1),
                 }),
-                publish_ts: trace_ts(),
-                recv_ts: trace_ts(),
+                publish_ts: mono_trace_ns(),
+                recv_ts: mono_trace_ns(),
             });
         }
 
@@ -551,8 +551,8 @@ mod tests {
                     quote: CurrencyId(1),
                 },
             }),
-            publish_ts: trace_ts(),
-            recv_ts: trace_ts(),
+            publish_ts: mono_trace_ns(),
+            recv_ts: mono_trace_ns(),
         });
         producer.publish(InputSlot {
             connection_id: 0,
@@ -565,8 +565,8 @@ mod tests {
                 currency: CurrencyId(0),
                 amount: 500,
             }),
-            publish_ts: trace_ts(),
-            recv_ts: trace_ts(),
+            publish_ts: mono_trace_ns(),
+            recv_ts: mono_trace_ns(),
         });
 
         let handle = std::thread::spawn(move || stage.run(&shutdown2));
@@ -637,8 +637,8 @@ mod tests {
                 currency: CurrencyId(0),
                 amount: 500,
             }),
-            publish_ts: trace_ts(),
-            recv_ts: trace_ts(),
+            publish_ts: mono_trace_ns(),
+            recv_ts: mono_trace_ns(),
         });
 
         // Publish a checkpoint with a deliberately wrong chain hash.
@@ -654,8 +654,8 @@ mod tests {
                 chain_hash: [0xFF; 32], // bogus hash — will not match
                 events_since_checkpoint: 1,
             },
-            publish_ts: trace_ts(),
-            recv_ts: trace_ts(),
+            publish_ts: mono_trace_ns(),
+            recv_ts: mono_trace_ns(),
         });
 
         let handle = std::thread::spawn(move || stage.run(&shutdown2));
@@ -727,8 +727,8 @@ mod tests {
                 symbol: Symbol(1),
                 order: limit_order(1, AccountId(2), Side::Sell, 100, 50),
             }),
-            publish_ts: trace_ts(),
-            recv_ts: trace_ts(),
+            publish_ts: mono_trace_ns(),
+            recv_ts: mono_trace_ns(),
         });
 
         let handle = std::thread::spawn(move || stage.run(&shutdown2));
@@ -815,8 +815,8 @@ mod tests {
                 symbol: Symbol(1),
                 order: limit_order(1, AccountId(2), Side::Sell, 100, 50),
             }),
-            publish_ts: trace_ts(),
-            recv_ts: trace_ts(),
+            publish_ts: mono_trace_ns(),
+            recv_ts: mono_trace_ns(),
         });
 
         // Wait for the Placed report in the output SPSC.
@@ -930,8 +930,8 @@ mod tests {
                 symbol: Symbol(1),
                 order: limit_order(1, AccountId(2), Side::Sell, 100, 50),
             }),
-            publish_ts: trace_ts(),
-            recv_ts: trace_ts(),
+            publish_ts: mono_trace_ns(),
+            recv_ts: mono_trace_ns(),
         });
 
         // Wait for the Placed report in the output SPSC (matching stage).
@@ -1148,8 +1148,8 @@ mod tests {
                 symbol: Symbol(1),
                 order: limit_order(100, AccountId(1), Side::Buy, 50, 10),
             }),
-            publish_ts: trace_ts(),
-            recv_ts: trace_ts(),
+            publish_ts: mono_trace_ns(),
+            recv_ts: mono_trace_ns(),
         });
 
         let reports = collect_reports(&mut output);
@@ -1183,8 +1183,8 @@ mod tests {
                 currency: CurrencyId(1),
                 amount: 100,
             }),
-            publish_ts: trace_ts(),
-            recv_ts: trace_ts(),
+            publish_ts: mono_trace_ns(),
+            recv_ts: mono_trace_ns(),
         });
 
         let reports = collect_reports(&mut output);
@@ -1212,8 +1212,8 @@ mod tests {
             sequence: 0,
             timestamp_ns: 0,
             event: JournalEvent::App(crate::trading_event::TradingEvent::QueryStats),
-            publish_ts: trace_ts(),
-            recv_ts: trace_ts(),
+            publish_ts: mono_trace_ns(),
+            recv_ts: mono_trace_ns(),
         });
 
         // QueryStats always produces a single output slot — StatsHeader
@@ -1260,8 +1260,8 @@ mod tests {
                 symbol: Symbol(1),
                 order: limit_order(200, AccountId(1), Side::Buy, 50, 10),
             }),
-            publish_ts: trace_ts(),
-            recv_ts: trace_ts(),
+            publish_ts: mono_trace_ns(),
+            recv_ts: mono_trace_ns(),
         });
 
         let reports = collect_reports(&mut output);
@@ -1287,8 +1287,8 @@ mod tests {
                 symbol: Symbol(1),
                 order: limit_order(200, AccountId(1), Side::Buy, 50, 10),
             }),
-            publish_ts: trace_ts(),
-            recv_ts: trace_ts(),
+            publish_ts: mono_trace_ns(),
+            recv_ts: mono_trace_ns(),
         });
 
         let reports = collect_reports(&mut output);
@@ -1348,8 +1348,8 @@ mod tests {
                 symbol: Symbol(1),
                 order: limit_order(1, AccountId(1), Side::Buy, 50, 10),
             }),
-            publish_ts: trace_ts(),
-            recv_ts: trace_ts(),
+            publish_ts: mono_trace_ns(),
+            recv_ts: mono_trace_ns(),
         });
 
         let reports = collect_reports(&mut output_consumer);
@@ -1416,8 +1416,8 @@ mod tests {
                     currency: CurrencyId(1),
                     amount,
                 }),
-                publish_ts: trace_ts(),
-                recv_ts: trace_ts(),
+                publish_ts: mono_trace_ns(),
+                recv_ts: mono_trace_ns(),
             });
         };
 
@@ -1525,8 +1525,8 @@ mod tests {
                 currency: CurrencyId(1),
                 amount: 42,
             }),
-            publish_ts: trace_ts(),
-            recv_ts: trace_ts(),
+            publish_ts: mono_trace_ns(),
+            recv_ts: mono_trace_ns(),
         });
 
         let archive_path = std::path::PathBuf::from(format!("{}.000001", path.display()));
@@ -1601,8 +1601,8 @@ mod tests {
                     currency: CurrencyId(1),
                     amount,
                 }),
-                publish_ts: trace_ts(),
-                recv_ts: trace_ts(),
+                publish_ts: mono_trace_ns(),
+                recv_ts: mono_trace_ns(),
             });
         };
 
@@ -1712,8 +1712,8 @@ mod tests {
                     currency: CurrencyId(1),
                     amount,
                 }),
-                publish_ts: trace_ts(),
-                recv_ts: trace_ts(),
+                publish_ts: mono_trace_ns(),
+                recv_ts: mono_trace_ns(),
             });
         };
 
@@ -1848,8 +1848,8 @@ mod tests {
                             currency: CurrencyId(1),
                             amount,
                         }),
-                        publish_ts: trace_ts(),
-                        recv_ts: trace_ts(),
+                        publish_ts: mono_trace_ns(),
+                        recv_ts: mono_trace_ns(),
                     });
                 }
 

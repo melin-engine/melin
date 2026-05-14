@@ -2088,8 +2088,8 @@ fn seed_and_drain(
     accounts: u32,
     shutdown: &AtomicBool,
 ) {
-    use melin_transport_core::trace::trace_ts;
     use melin_trading::types::{AccountId, CurrencyId, InstrumentSpec, Symbol};
+    use melin_transport_core::trace::mono_trace_ns;
 
     let seed_start = std::time::Instant::now();
 
@@ -2108,8 +2108,8 @@ fn seed_and_drain(
                     quote: CurrencyId(i * 2 + 1),
                 },
             }),
-            publish_ts: trace_ts(),
-            recv_ts: trace_ts(),
+            publish_ts: mono_trace_ns(),
+            recv_ts: mono_trace_ns(),
         });
     }
 
@@ -2125,8 +2125,8 @@ fn seed_and_drain(
                 account: AccountId(acct),
                 amount: u64::MAX / 4,
             }),
-            publish_ts: trace_ts(),
-            recv_ts: trace_ts(),
+            publish_ts: mono_trace_ns(),
+            recv_ts: mono_trace_ns(),
         });
     }
 

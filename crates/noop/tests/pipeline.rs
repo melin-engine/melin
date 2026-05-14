@@ -9,13 +9,13 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
 use melin_journal::BufferedWriter;
-use melin_transport_core::trace::trace_ts;
 use melin_noop::NoopApp;
 use melin_trading::trading_event::TradingEvent;
 use melin_trading::types::{AccountId, CurrencyId};
 use melin_transport_core::pipeline::{
     InputSlot, JournalStageRun, OutputPayload, build_pipeline_with_replication,
 };
+use melin_transport_core::trace::mono_trace_ns;
 
 #[test]
 fn pipeline_with_noop_app_runs_events_to_output() {
@@ -66,8 +66,8 @@ fn pipeline_with_noop_app_runs_events_to_output() {
                 currency: CurrencyId(1),
                 amount: 100 + i,
             }),
-            publish_ts: trace_ts(),
-            recv_ts: trace_ts(),
+            publish_ts: mono_trace_ns(),
+            recv_ts: mono_trace_ns(),
         });
     }
     drop(producer);

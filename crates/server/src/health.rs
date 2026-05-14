@@ -1330,7 +1330,8 @@ mod tests {
         // Recorder dropped before the snapshot fetch — see the
         // SyncHistogram caveat in `crates/journal/src/trace.rs` tests.
         {
-            let mut rec = melin_transport_core::trace::register_stage("test::stats_dump_emit_marker");
+            let mut rec =
+                melin_transport_core::trace::register_stage("test::stats_dump_emit_marker");
             rec.record_ns(1_500);
             rec.record_ns(2_500);
             rec.record_ns(3_500);
@@ -1403,7 +1404,8 @@ mod tests {
     #[test]
     fn stats_dump_body_skips_empty_stages() {
         // A stage with no samples must not appear in the dump.
-        let _empty = melin_transport_core::trace::register_stage("test::stats_dump_empty_stage_marker");
+        let _empty =
+            melin_transport_core::trace::register_stage("test::stats_dump_empty_stage_marker");
         // No record_ns calls.
 
         let (addr, _events, _healthy, shutdown, handle) = start_health(0, 0, u64::MAX);

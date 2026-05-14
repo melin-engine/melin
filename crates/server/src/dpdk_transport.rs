@@ -42,13 +42,13 @@ use rustc_hash::FxHashMap;
 use crate::InputSlot;
 use crate::JournalEvent;
 use ed25519_dalek::{Verifier, VerifyingKey};
+use melin_app::unix_epoch_nanos;
 use melin_disruptor::ring;
 use melin_dpdk::transport::DpdkTransport;
-use melin_transport_core::trace::trace_ts;
-use melin_app::unix_epoch_nanos;
 use melin_protocol::auth::{AuthorizedKeys, Permission};
 use melin_protocol::codec;
 use melin_protocol::message::{ConnectionId, Request, ResponseKind};
+use melin_transport_core::trace::mono_trace_ns;
 use rand::Rng;
 
 use crate::request as shared_request;
@@ -234,10 +234,11 @@ pub fn run_dpdk_poll(
     // order experiences. Registered with the global stats registry; the
     // /stats-dump endpoint snapshots it alongside the other stages.
     #[cfg(feature = "latency-trace")]
-    let mut poll_iter_rec =
-        melin_transport_core::trace::register_stage("dpdk poll: outer iteration (work-iterations only)");
+    let mut poll_iter_rec = melin_transport_core::trace::register_stage(
+        "dpdk poll: outer iteration (work-iterations only)",
+    );
     #[cfg(feature = "latency-trace")]
-    let mut poll_iter_start = trace_ts();
+    let mut poll_iter_start = mono_trace_ns();
 
     loop {
         if shutdown.load(Ordering::Relaxed) {
@@ -580,7 +581,7 @@ pub fn run_dpdk_poll(
 
         #[cfg(feature = "latency-trace")]
         {
-            let now = trace_ts();
+            let now = mono_trace_ns();
             // Skip records once shutdown has been observed: matches the
             // gate on the journal / matching / response stages and keeps
             // diagnostic numbers comparable across runs.
@@ -816,8 +817,9 @@ fn process_trading_frames(
         match codec::decode_request(payload) {
             Ok((seq, request)) => {
                 if !shared_request::should_filter(&request) {
-                    #[allow(clippy::let_unit_value)] // trace_ts() returns () without latency-trace
-                    let recv_ts = trace_ts();
+                    #[allow(clippy::let_unit_value)]
+                    // mono_trace_ns() returns () without latency-trace
+                    let recv_ts = mono_trace_ns();
                     let event = shared_request::to_event(&request);
                     // Sequence is allocated by the journal stage in
                     // disruptor cursor order — see `InputSlot::sequence`.
@@ -835,7 +837,7 @@ fn process_trading_frames(
                     let connection_id = conn.connection_id.0;
                     let key_hash = conn.key_hash;
                     #[allow(clippy::let_unit_value)]
-                    let publish_ts = trace_ts();
+                    let publish_ts = mono_trace_ns();
                     batch.push_with(|slot| {
                         slot.connection_id = connection_id;
                         slot.key_hash = key_hash;
@@ -847,7 +849,7 @@ fn process_trading_frames(
                         slot.recv_ts = recv_ts;
                     });
                     #[cfg(feature = "tick-to-trade")]
-                    ingest_rec.record_elapsed(recv_ts, trace_ts());
+                    ingest_rec.record_elapsed(recv_ts, mono_trace_ns());
                 }
             }
             Err(e) => {

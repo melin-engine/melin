@@ -837,11 +837,11 @@ fn run_pipeline_inner<W>(
             Writer = W,
         >,
 {
+    use melin_app::unix_epoch_nanos;
     use melin_engine::journal::InputSlot;
     use melin_engine::journal::JournalEvent;
     use melin_engine::journal::pipeline::{JournalStageRun, build_pipeline_with_replication};
-    use melin_engine::journal::trace::trace_ts;
-    use melin_app::unix_epoch_nanos;
+    use melin_engine::journal::trace::mono_trace_ns;
 
     let PipelineInnerCfg {
         group_commit_us,
@@ -964,8 +964,8 @@ fn run_pipeline_inner<W>(
                             },
                         },
                     ),
-                    publish_ts: trace_ts(),
-                    recv_ts: trace_ts(),
+                    publish_ts: mono_trace_ns(),
+                    recv_ts: mono_trace_ns(),
                 });
                 inflight_pub.fetch_add(1, Ordering::Release);
                 ts_tx.publish(ts);

@@ -24,7 +24,7 @@
 use crate::InputSlot;
 use crate::JournalEvent;
 use melin_disruptor::ring;
-use melin_transport_core::trace::trace_ts;
+use melin_transport_core::trace::mono_trace_ns;
 
 /// Strict-monotonic clamp on the wall-clock timestamp emitted by each tick.
 /// `last_now_ns == 0` is the initial-state sentinel — the first tick is
@@ -61,8 +61,8 @@ pub(crate) fn publish_tick(producer: &mut ring::Producer<InputSlot>, now_ns: u64
         sequence: 0,
         timestamp_ns: now_ns,
         event: JournalEvent::Tick { now_ns },
-        publish_ts: trace_ts(),
-        recv_ts: trace_ts(),
+        publish_ts: mono_trace_ns(),
+        recv_ts: mono_trace_ns(),
     });
 }
 
