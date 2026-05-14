@@ -177,9 +177,17 @@ pub fn spawn_reader<R: AsRawFd + Send + 'static>(
     let handle = std::thread::Builder::new()
         .name("uring-reader".into())
         .spawn(move || {
-            match crate::affinity::pin_to_core(core) {
-                Ok(c) => tracing::info!(thread = "uring-reader", core = c, "pinned to core"),
-                Err(e) => tracing::warn!(thread = "uring-reader", core = core, error = %e, "failed to pin"),
+            // `core == 0` is the "do not pin" sentinel — see
+            // `crate::affinity` module docs.
+            if core == 0 {
+                tracing::info!(thread = "uring-reader", "thread left unpinned (core 0 sentinel)");
+            } else {
+                match crate::affinity::pin_to_core(core) {
+                    Ok(c) => {
+                        tracing::info!(thread = "uring-reader", core = c, "pinned to core")
+                    }
+                    Err(e) => tracing::warn!(thread = "uring-reader", core = core, error = %e, "failed to pin"),
+                }
             }
             reader_loop(
                 rx,

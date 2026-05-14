@@ -13,12 +13,20 @@
 //! thread. Requires `CAP_SYS_NICE` or root; degrades gracefully to
 //! `SCHED_OTHER` if unavailable.
 //!
-//! **Core 0 exception**: `SCHED_FIFO` is never set on core 0. Core 0 is
-//! the housekeeping core shared by the kernel, IRQ handlers, and other
-//! system processes. Real-time priority there would starve critical work.
-//! In tests, all cores default to 0 (`--cores 0,0,0,...`) — without this
-//! guard, multiple server processes with RT threads on core 0 starve the
-//! test harness.
+//! **Pipeline `--cores 0` means "do not pin"**. The pipeline-thread
+//! wrapper [`pin_thread`] treats `0` as a sentinel and skips affinity
+//! entirely, leaving the thread on the default OS scheduler across all
+//! CPUs. Production deployments never run pipeline threads on core 0
+//! (it is reserved for the kernel, IRQ handlers, and other system
+//! processes), so the value is free to repurpose. This lets the
+//! integration tests pass `--cores 0,0,0,...` without cramming every
+//! pipeline thread of every spawned server onto a single physical CPU
+//! — which previously caused the io_uring reader to starve under
+//! contention and the failover suite to time out.
+//!
+//! The lower-level [`pin_to_core`] still pins literally — non-pipeline
+//! callers (e.g. the bench progress thread that pins to core 0 on
+//! purpose to stay off the bench cores) keep the old semantics.
 
 /// Pin the calling thread to the specified logical CPU core and set
 /// `SCHED_FIFO` real-time scheduling priority.
@@ -89,11 +97,20 @@ fn set_realtime_fifo(priority: i32) {
 
 /// Pin the calling thread to `core` with logging on success/failure.
 ///
-/// Thin convenience wrapper around [`pin_to_core`] that emits a
-/// structured log entry — `info!` on success, `warn!` on failure — so
-/// every pipeline thread (primary and replica, journal/matching/response
-/// /shadow/sender/receiver) reports its pin outcome consistently.
+/// Convenience wrapper around [`pin_to_core`] for pipeline threads
+/// (primary and replica, journal/matching/response/shadow/sender/
+/// receiver). Emits a structured log entry — `info!` on success,
+/// `warn!` on failure — so every pipeline thread reports its pin
+/// outcome consistently.
+///
+/// `core == 0` is treated as a sentinel: affinity is skipped and the
+/// thread is left on the default OS scheduler. See module docs for
+/// rationale.
 pub(crate) fn pin_thread(name: &str, core: usize) {
+    if core == 0 {
+        tracing::info!(thread = name, "thread left unpinned (core 0 sentinel)");
+        return;
+    }
     match pin_to_core(core) {
         Ok(c) => tracing::info!(core = c, thread = name, "pinned to core"),
         Err(e) => tracing::warn!(thread = name, error = e, "core pinning failed"),
