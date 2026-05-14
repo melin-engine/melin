@@ -9,3 +9,4 @@ path = "src/lib.rs"
 
 [dependencies]
 melin-app = { path = "../app" }
+melin-types = { path = "../types" }

@@ -1758,6 +1758,7 @@ name = "melin-trading"
 version = "0.7.0"
 dependencies = [
  "melin-app",
+ "melin-types",
 ]
 
 [[package]]
@@ -1796,6 +1797,10 @@ dependencies = [
  "melin-gateway-core",
  "ratatui 0.30.0",
 ]
+
+[[package]]
+name = "melin-types"
+version = "0.7.0"
 
 [[package]]
 name = "memchr"

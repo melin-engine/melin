@@ -9,9 +9,13 @@
 
 #![cfg_attr(not(test), deny(clippy::unwrap_used))]
 
-pub mod le;
 pub mod trading_event;
-pub mod types;
+
+// Re-exported from melin-types so existing `melin_trading::types::*` and
+// `melin_trading::le::*` paths keep resolving. melin-types is the leaf
+// crate that owns the wire-level data model; trading owns the event enum
+// and matching-engine-adjacent glue.
+pub use melin_types::{le, types};
 
 pub use trading_event::TradingEvent;
 pub use types::*;

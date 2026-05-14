@@ -1,0 +1,10 @@
+[package]
+name = "melin-types"
+version = "0.7.0"
+edition = "2024"
+
+[lib]
+name = "melin_types"
+path = "src/lib.rs"
+
+[dependencies]
