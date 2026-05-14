@@ -42,7 +42,7 @@ The server uses jemalloc by default (thread-local caches eliminate allocator loc
 | `--authorized-keys` | `authorized_keys` | Path to the Ed25519 authorized keys file. Every connection must authenticate before trading. Ignored in replica mode (`--replica-of`). |
 | `--cores` | `1,2,3,6,7,8` | Pipeline core IDs: `journal,matching,response,repl-sender,event-publisher,shadow` (comma-separated). Core 0 should be reserved for OS/IRQ. |
 | `--reader-cores` | `4` | CPU core for the reader thread (TCP) or first poll thread (DPDK). |
-| `--max-journal-mib` | `256` | Maximum journal size in MiB before automatic rotation at startup. Set to `0` to disable. |
+| `--max-journal-mib` | `256` | Live journal size in MiB above which the segment is archived and a fresh live file opens. Rotation runs online at the journal stage's fsync boundary. Set to `0` to disable. |
 | `--max-journal-batch` | `4096` | Maximum events per journal fsync batch. Smaller values reduce tail latency; larger values improve throughput. |
 | `--group-commit-us` | `0` | Group commit coalescing delay in microseconds. Keep at `0` for TCP transport. Only useful with UDS (see CLAUDE.md). |
 | `--accounts` | `100000` | Number of accounts to seed on first startup (fresh journal only). |
@@ -53,7 +53,7 @@ The server uses jemalloc by default (thread-local caches eliminate allocator loc
 | `--yield-idle` | `false` | Yield to OS scheduler when pipeline threads are idle instead of busy-spinning. Use on shared machines without isolated cores. |
 | `--health-bind` | `127.0.0.1:9878` | Address for the health/liveness TCP endpoint. Returns `OK\|ERR <conns> <seq> <lag>`. Omit to disable. |
 | `--event-bind` | (none) | Address for the output event publisher. Subscribers connect to receive all execution events in real time (market data, fills, cancellations). Ed25519 auth required. Omit to disable. See [Output Event Channel](#output-event-channel). |
-| `--snapshot-interval-secs` | `0` | Interval in seconds for automatic snapshots via the shadow exchange. `0` = disabled (startup-only snapshots). When enabled, a shadow exchange replays events on a separate thread and takes periodic snapshots without pausing the primary matching engine. See [Scheduled Snapshots](#scheduled-snapshots). |
+| `--snapshot-interval-ms` | `3_000_000` (50 min) | Interval in milliseconds between snapshots written by the shadow exchange — the sole snapshot writer. Set to `0` to disable; recovery then falls back to full journal replay. The shadow replays events on a dedicated thread, so snapshot writes never pause the primary matching engine. See [Scheduled Snapshots](#scheduled-snapshots). |
 | `--snapshot-path` | (derived) | Path for snapshot files. Defaults to journal path with `.snapshot` extension. **Recommended: place on the OS disk, not the journal NVMe, to avoid I/O jitter on the hot path.** |
 
 #### Replication Flags
@@ -206,7 +206,7 @@ The `init_engine` function checks the following conditions in order:
 
 1. **Snapshot exists AND journal exists**: Recover from snapshot, then replay only journal entries after the snapshot's sequence number. This is the fast path -- avoids replaying the full history from genesis.
 
-2. **Snapshot exists AND journal is missing**: This indicates a crash between journal archive (rename) and new journal creation during rotation. Loads the snapshot and creates a fresh journal continuing from the snapshot's sequence number. Logs: `recovering from snapshot only (journal missing, post-rotation crash?)`.
+2. **Snapshot exists AND live journal is missing (no archives either)**: Loads the snapshot and creates a fresh journal continuing from the snapshot's sequence number. Logs: `recovering from snapshot only (journal missing)`. If archives are present, recovery falls into case 1 — it walks them from the snapshot's sequence and synthesizes a continuing live file if needed.
 
 3. **Journal exists (no snapshot)**: Full replay from genesis. Every event in the journal is replayed to reconstruct exchange state.
 
@@ -214,20 +214,16 @@ The `init_engine` function checks the following conditions in order:
 
 ### Post-Recovery Rotation Check
 
-After recovery, if `--max-journal-mib` is set (default 256) and the journal exceeds that threshold, the server automatically:
+After recovery, if `--max-journal-mib` is set (default 256) and the live segment exceeds that threshold, the server archives the segment to its next monotonic slot and opens a fresh live file before the pipeline starts. No snapshot is taken at this point — the shadow stage owns snapshot writes on its own cadence.
 
-1. Saves a snapshot at the current sequence boundary.
-2. Archives the old journal (renames to `.1`, bumping existing archives).
-3. Creates a fresh journal continuing the sequence numbering.
-
-This prevents unbounded journal growth across restarts.
+The same size-trigger also runs online during normal operation at the journal stage's fsync boundary, so the server doesn't depend on restarts to bound disk usage.
 
 ### Recovery Time
 
-Recovery time is proportional to the number of journal entries replayed. With snapshots enabled (default), only entries since the last snapshot are replayed. At ~80 bytes per event:
+Recovery time is proportional to the number of journal entries replayed. With the shadow snapshot writer enabled (default), only entries since the last shadow snapshot are replayed. At ~80 bytes per event:
 
-- 256 MiB journal = ~3.2M events to replay
-- With snapshot: only events since last rotation (typically seconds of traffic)
+- 256 MiB segment = ~3.2M events to replay
+- With shadow snapshot: only events since the last snapshot interval (typically minutes of traffic at default 50-minute cadence)
 
 ---
 
@@ -239,26 +235,22 @@ The `--journal-writer` flag picks how the journal stage writes batches to disk. 
 
 ### How Rotation Works
 
-Rotation is triggered at startup when the journal exceeds `--max-journal-mib` (default: 256 MiB). The process:
+Rotation runs online at the journal stage's fsync boundary. Two independent triggers fire it: the live segment crossing `--max-journal-mib` (default 256 MiB), or an operator `ROTATE` admin command. The boot path additionally checks the on-disk segment size on startup and rotates once before opening the pipeline if needed.
 
-1. **Save snapshot**: Writes the full exchange state (accounts, order books, instruments, circuit breakers, risk limits) to the snapshot file. Written atomically via `.tmp` + rename.
-2. **Archive old journal**: Renames the current journal using a numeric suffix scheme:
-   - `melin.journal` becomes `melin.journal.1`
-   - Existing `.1` becomes `.2`, `.2` becomes `.3`, etc.
-   - Renames happen in reverse order to avoid overwriting.
-3. **Create new journal**: Opens a fresh journal file continuing the sequence numbering and BLAKE3 hash chain from where the old journal left off.
+Each rotation is a single rename of the live file to its next monotonic archive slot, followed by opening a fresh live file that continues the sequence and BLAKE3 hash chain. No snapshot is written at rotation — snapshots are produced exclusively by the shadow exchange on its own cadence.
 
 ### Archive Naming
 
 ```
-melin.journal      <-- current (active)
-melin.journal.1    <-- previous rotation
-melin.journal.2    <-- two rotations ago
-melin.journal.3    <-- three rotations ago
-...
+melin.journal           <-- current (active)
+melin.journal.000001    <-- oldest archive
+melin.journal.000002    <-- next archive
+melin.journal.000003    <-- ...
 ```
 
-The snapshot file is always overwritten on each rotation -- only the latest snapshot is kept. Archived journals are preserved indefinitely for audit purposes.
+Archive numbers are assigned monotonically and never renamed — each rotation is a single rename of the live file to the next free number. Archived journals are preserved indefinitely for audit purposes.
+
+Snapshots (`melin.snapshot`, with `melin.snapshot.prev` as a one-deep rollback target) are written and rotated by the shadow exchange independently of journal rotation.
 
 ### Disk Space Planning
 
@@ -284,7 +276,7 @@ The journal writer pre-allocates in 256 MiB chunks (`posix_fallocate`) to avoid 
 
 ### Architecture
 
-When `--snapshot-interval-secs` is set to a non-zero value, the server spawns a **shadow exchange** on a dedicated thread. The shadow exchange is a third consumer on the input disruptor ring, gated on the journal cursor (it only processes events after the journal has confirmed durability). It replays every event through its own independent copy of the exchange state, and periodically saves a snapshot to disk.
+When `--snapshot-interval-ms` is non-zero (default: 3,000,000 — 50 minutes), the server spawns a **shadow exchange** on a dedicated thread. The shadow is the sole snapshot writer in the system. It is a third consumer on the input disruptor ring, gated on the journal cursor (it only processes events after the journal has confirmed durability), replays every event through its own independent copy of the exchange state, and periodically saves a snapshot to disk.
 
 ```
 Input Disruptor Ring
@@ -294,7 +286,7 @@ Input Disruptor Ring
                           │
                           ▼
                     Periodic snapshot save
-                    (every --snapshot-interval-secs)
+                    (every --snapshot-interval-ms)
 ```
 
 ### How It Works
@@ -318,7 +310,7 @@ The only state shared between stages is the BLAKE3 chain hash, published by the 
 ./target/release/melin-server \
     --journal /mnt/nvme/melin.journal \
     --snapshot-path /var/lib/melin/melin.snapshot \
-    --snapshot-interval-secs 60 \
+    --snapshot-interval-ms 60000 \
     --cores 1,2,3,6,7,8 \
     ...
 ```
@@ -348,7 +340,7 @@ After each snapshot write (which may take tens of milliseconds for a large excha
 
 If the shadow thread panics or dies, the server detects this via the pipeline health check and initiates a **full shutdown**. This is necessary because a dead consumer on the input disruptor stops advancing its ring progress counter, which would eventually cause the ring to fill and stall the journal and matching stages.
 
-If scheduled snapshots are not critical to your deployment, you can disable them (`--snapshot-interval-secs 0`, the default) to eliminate this failure mode entirely.
+If scheduled snapshots are not critical to your deployment, you can disable the shadow with `--snapshot-interval-ms 0` to eliminate this failure mode entirely. With the shadow disabled, no snapshots are written and recovery falls back to full journal replay from genesis (across all archived segments).
 
 ---
 
@@ -810,13 +802,11 @@ This is handled automatically. No manual intervention required.
 
 ### 3. Crash During Rotation
 
-Rotation has three steps: (1) save snapshot, (2) rename journal to `.1`, (3) create new journal. A crash between steps:
+Rotation is a single rename of the live segment to its next monotonic archive slot followed by opening a fresh live file (no snapshot involvement — snapshots are written separately by the shadow). A crash between these two steps leaves the just-archived segment intact and no live file present. Recovery walks the archive chain and synthesizes a fresh live segment continuing from the last archive's tail (see `docs/journal-rotation.md` scenario #2). No acknowledged event is lost.
 
-- **Crash after step 1 but before step 2**: Snapshot exists, original journal still in place. Normal recovery from snapshot + journal. The snapshot is redundant but harmless.
+### Crash During Snapshot Write
 
-- **Crash after step 2 but before step 3**: Snapshot exists, old journal is archived as `.1`, but the new (active) journal does not exist. The server detects this case on startup: snapshot exists but journal is missing. It loads the snapshot and creates a fresh journal continuing from the snapshot's sequence number. Logs: `recovering from snapshot only (journal missing, post-rotation crash?)`.
-
-- **Crash during snapshot write**: Snapshots are written atomically via `.tmp` file + rename. If the crash happens during the `.tmp` write, the rename never occurs and the old snapshot (if any) remains valid. If there is no prior snapshot, the server falls back to full journal replay.
+Snapshots are written atomically via `.tmp` file + rename. If the crash happens during the `.tmp` write, the rename never occurs and the previous snapshot (`melin.snapshot`, or `melin.snapshot.prev` if the rename happened but the next save failed) remains valid. If there is no prior snapshot, the server falls back to full journal replay across all segments.
 
 ### 4. Snapshot-Only Recovery (No Journal)
 

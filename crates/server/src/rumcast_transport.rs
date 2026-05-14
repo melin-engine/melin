@@ -90,10 +90,10 @@ use melin_rumcast::pub_log::PublicationLog;
 use melin_rumcast::shared_udp::SharedUdp;
 use melin_rumcast::transport::{KernelUdp, UdpTransport};
 use melin_rumcast::wire::{FrameView, data_flags};
-use melin_types::types::QueryResponse;
 use melin_transport_core::pipeline::{
     JournalStage, JournalStageRun, OutputPayload, Pipeline, build_pipeline_with_replication,
 };
+use melin_types::types::QueryResponse;
 
 use crate::TradingEvent;
 use crate::server::{ServerConfig, init_engine};
@@ -2088,8 +2088,8 @@ fn seed_and_drain(
     accounts: u32,
     shutdown: &AtomicBool,
 ) {
-    use melin_types::types::{AccountId, CurrencyId, InstrumentSpec, Symbol};
     use melin_transport_core::trace::mono_trace_ns;
+    use melin_types::types::{AccountId, CurrencyId, InstrumentSpec, Symbol};
 
     let seed_start = std::time::Instant::now();
 

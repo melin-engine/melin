@@ -192,7 +192,7 @@ The `MultiProducer` is `Clone + Send + Sync` -- each reader thread holds its own
 
 - **Consumer 0**: Journal stage
 - **Consumer 1**: Matching stage
-- **Consumer 2** (optional): Shadow exchange stage (when `--snapshot-interval-secs > 0`). Gated on the journal cursor — it only processes events after they are durable. Takes periodic snapshots on a dedicated thread without pausing the matching engine.
+- **Consumer 2** (optional): Shadow exchange stage (when `--snapshot-interval-ms > 0`). Gated on the journal cursor — it only processes events after they are durable. Takes periodic snapshots on a dedicated thread without pausing the matching engine.
 
 Because the journal and matching consumers are gated only on the producer, they can process events concurrently. The journal stage does not block the matching stage, and vice versa. Backpressure is applied by the producer checking the minimum progress of all terminal consumers before claiming new slots.
 
@@ -346,7 +346,7 @@ The server spawns 3-6 dedicated OS threads for the pipeline plus one reader thre
 | Reader | 4 | io_uring-based connection multiplexing + tick generation | No |
 | Repl Sender | 6 | Stream journal batches to replicas | Yes (`--replication-bind`) |
 | Event Publisher | 7 | Broadcast execution events to subscribers | Yes (`--event-bind`) |
-| Shadow Exchange | 8 | Periodic snapshots without pausing matching | Yes (`--snapshot-interval-secs`) |
+| Shadow Exchange | 8 | Periodic snapshots without pausing matching | Yes (`--snapshot-interval-ms`) |
 
 Core 0 is reserved for OS/IRQ handling.
 

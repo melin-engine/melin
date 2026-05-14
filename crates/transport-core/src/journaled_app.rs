@@ -9,7 +9,8 @@
 //!   post-snapshot delta.
 //! - [`save_snapshot`]: write the current state via the generic
 //!   [`crate::snapshot`] framing.
-//! - [`rotate`]: snapshot + archive old journal + start fresh.
+//! - [`rotate_segment`]: archive the live journal segment and start a
+//!   fresh one. Snapshots are written separately by the shadow stage.
 //! - [`into_parts`]: hand the (app, writer) pair to the disruptor
 //!   pipeline.
 //!
@@ -236,13 +237,13 @@ impl<A: Application, W: JournalWrite<A::Event>> JournaledApp<A, W> {
         Ok(())
     }
 
-    /// Rotate the journal: snapshot the current state, archive the live
-    /// segment to its next monotonic slot (`<path>.NNNNNN`), and open a
-    /// fresh live segment continuing the sequence. The new segment's
-    /// `GenesisHash` carries the chain state at the boundary so multi-
-    /// segment recovery can verify cross-segment continuity.
-    pub fn rotate(&mut self, snapshot_path: &Path) -> Result<(), JournaledAppError> {
-        self.save_snapshot(snapshot_path)?;
+    /// Archive the live journal segment to its next monotonic slot
+    /// (`<path>.NNNNNN`) and open a fresh live segment continuing the
+    /// sequence. The new segment's `GenesisHash` carries the chain
+    /// state at the boundary so multi-segment recovery can verify
+    /// cross-segment continuity. Snapshots are produced separately by
+    /// the shadow exchange.
+    pub fn rotate_segment(&mut self) -> Result<(), JournaledAppError> {
         self.writer.rotate_segment()?;
         Ok(())
     }
@@ -628,7 +629,8 @@ mod tests {
             key_hwm: ja.app().key_hwm.clone(),
         };
 
-        ja.rotate(&snap_path).unwrap();
+        ja.save_snapshot(&snap_path).unwrap();
+        ja.rotate_segment().unwrap();
 
         // Archived journal lives at `.000001` (monotonic naming).
         let archived = dir.path().join("journal.bin.000001");
@@ -672,11 +674,14 @@ mod tests {
 
         let ja = TestApp_::create(TestApp::new(), &journal_path).unwrap();
         let mut ja = append_events(ja, &phase_a, 1);
-        ja.rotate(&snap_path).unwrap();
+        ja.save_snapshot(&snap_path).unwrap();
+        ja.rotate_segment().unwrap();
         let mut ja = append_events(ja, &phase_b, 1 + phase_a.len() as u64);
-        ja.rotate(&snap_path).unwrap();
+        ja.save_snapshot(&snap_path).unwrap();
+        ja.rotate_segment().unwrap();
         let mut ja = append_events(ja, &phase_c, 1 + (phase_a.len() + phase_b.len()) as u64);
-        ja.rotate(&snap_path).unwrap();
+        ja.save_snapshot(&snap_path).unwrap();
+        ja.rotate_segment().unwrap();
         let ja = append_events(
             ja,
             &phase_d,
@@ -720,9 +725,11 @@ mod tests {
 
         let ja = TestApp_::create(TestApp::new(), &journal_path).unwrap();
         let mut ja = append_events(ja, &phase_a, 1);
-        ja.rotate(&snap_path).unwrap();
+        ja.save_snapshot(&snap_path).unwrap();
+        ja.rotate_segment().unwrap();
         let mut ja = append_events(ja, &phase_b, 1 + phase_a.len() as u64);
-        ja.rotate(&snap_path).unwrap();
+        ja.save_snapshot(&snap_path).unwrap();
+        ja.rotate_segment().unwrap();
         let ja = append_events(ja, &phase_c, 1 + (phase_a.len() + phase_b.len()) as u64);
         drop(ja);
 
@@ -763,7 +770,8 @@ mod tests {
 
         let ja = TestApp_::create(TestApp::new(), &journal_path).unwrap();
         let mut ja = append_events(ja, &phase_a, 1);
-        ja.rotate(&snap_path).unwrap(); // → archive 000001 sealed
+        ja.save_snapshot(&snap_path).unwrap();
+        ja.rotate_segment().unwrap(); // → archive 000001 sealed
         let ja = append_events(ja, &phase_b, 1 + phase_a.len() as u64);
         drop(ja);
 

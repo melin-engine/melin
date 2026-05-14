@@ -414,23 +414,13 @@ impl<W: JournalWrite<TradingEvent>> JournaledExchange<W> {
         self.writer.chain_hash()
     }
 
-    /// Rotate the journal: save a snapshot, archive the old journal, and
-    /// start writing to a new empty journal file.
+    /// Archive the current journal segment and start a fresh live file.
     ///
-    /// The new journal continues the sequence numbering from the old one,
-    /// so recovery from the snapshot + new journal produces the same state.
-    ///
-    /// The old journal is renamed to its next monotonic archive slot
-    /// (`<path>.NNNNNN`). The snapshot is written to `snapshot_path`
-    /// atomically (via `.tmp` + rename).
-    ///
-    /// Call this before `into_parts()` — rotation requires both the
-    /// exchange (for snapshot) and the writer (for sequence continuity).
-    pub fn rotate(&mut self, snapshot_path: &Path) -> Result<(), JournalError> {
-        self.save_snapshot(snapshot_path)?;
-        // The writer's `rotate_segment` archives the live file and opens
-        // a fresh continuing live in one step — sequence and chain
-        // continuity are both writer-internal concerns.
+    /// The new live continues sequence numbering and the hash chain from
+    /// the old one, so recovery walks both segments seamlessly. No
+    /// snapshot is written here — snapshots are produced exclusively by
+    /// the shadow exchange on its own cadence.
+    pub fn rotate_segment(&mut self) -> Result<(), JournalError> {
         self.writer.rotate_segment()?;
         Ok(())
     }
@@ -1184,7 +1174,7 @@ mod tests {
     }
 
     #[test]
-    fn rotate_produces_valid_snapshot_and_new_journal() {
+    fn save_snapshot_then_rotate_produces_valid_files() {
         let dir = tempfile::tempdir().unwrap();
         let journal_path = dir.path().join("test.journal");
         let snap_path = dir.path().join("test.snapshot");
@@ -1209,7 +1199,8 @@ mod tests {
         assert!(size_before > 0);
 
         // Rotate.
-        engine.rotate(&snap_path).unwrap();
+        engine.save_snapshot(&snap_path).unwrap();
+        engine.rotate_segment().unwrap();
 
         // Snapshot exists.
         assert!(snap_path.exists());
@@ -1260,7 +1251,8 @@ mod tests {
             .unwrap();
 
         // Rotate — snapshot captures the buy order.
-        engine.rotate(&snap_path).unwrap();
+        engine.save_snapshot(&snap_path).unwrap();
+        engine.rotate_segment().unwrap();
 
         // Submit a sell AFTER rotation — only in the new journal.
         engine
@@ -1300,11 +1292,13 @@ mod tests {
 
         // Rotate twice — monotonic naming preserves both archives without
         // shifting (no cascade).
-        engine.rotate(&snap_path).unwrap();
+        engine.save_snapshot(&snap_path).unwrap();
+        engine.rotate_segment().unwrap();
         assert!(std::path::Path::new(&format!("{}.000001", journal_path.display())).exists());
 
         engine.deposit(ACCT_A, BTC, 500).unwrap();
-        engine.rotate(&snap_path).unwrap();
+        engine.save_snapshot(&snap_path).unwrap();
+        engine.rotate_segment().unwrap();
         assert!(std::path::Path::new(&format!("{}.000001", journal_path.display())).exists());
         assert!(std::path::Path::new(&format!("{}.000002", journal_path.display())).exists());
         assert!(journal_path.exists());
@@ -1372,7 +1366,8 @@ mod tests {
         let hash_before_rotate = engine.writer_chain_hash();
         assert!(hash_before_rotate.is_some());
 
-        engine.rotate(&snap_path).unwrap();
+        engine.save_snapshot(&snap_path).unwrap();
+        engine.rotate_segment().unwrap();
 
         // After rotation, the new journal's genesis hash is the old chain hash.
         // The new chain hash is computed over the genesis entry (which contains
@@ -1418,7 +1413,8 @@ mod tests {
         let mut engine = TestExchange::create(&journal_path).unwrap();
         engine.add_instrument(btc_usd_spec()).unwrap();
         engine.deposit(ACCT_A, USD, 1_000_000).unwrap();
-        engine.rotate(&snap_path).unwrap();
+        engine.save_snapshot(&snap_path).unwrap();
+        engine.rotate_segment().unwrap();
 
         // Append events to the new journal.
         engine.deposit(ACCT_B, BTC, 500).unwrap();
@@ -1503,7 +1499,8 @@ mod tests {
             let hash_before = engine.writer_chain_hash();
             assert!(hash_before.is_some());
 
-            engine.rotate(&snap_path).unwrap();
+            engine.save_snapshot(&snap_path).unwrap();
+            engine.rotate_segment().unwrap();
 
             // Chain hash should change (genesis entry hashed).
             let hash_after = engine.writer_chain_hash();
@@ -1698,7 +1695,8 @@ mod tests {
             je.withdraw(ACCT_B, USD, b_usd).unwrap();
 
             // Snapshot + rotate.
-            je.rotate(&snap_path).unwrap();
+            je.save_snapshot(&snap_path).unwrap();
+            je.rotate_segment().unwrap();
 
             // One more deposit after rotation.
             je.deposit(ACCT_A, USD, 999).unwrap();
@@ -2013,7 +2011,8 @@ mod tests {
         // Build state, rotate, add more events after rotation.
         let mut engine = TestExchange::create(&journal_path).unwrap();
         build_workload(&mut engine);
-        engine.rotate(&snap_path).unwrap();
+        engine.save_snapshot(&snap_path).unwrap();
+        engine.rotate_segment().unwrap();
 
         // Post-rotation events.
         let mut reports = Vec::new();
@@ -2326,7 +2325,8 @@ mod tests {
                 &mut reports,
             )
             .unwrap();
-        engine.rotate(&snap_path).unwrap();
+        engine.save_snapshot(&snap_path).unwrap();
+        engine.rotate_segment().unwrap();
 
         // Rotation 2.
         engine
@@ -2337,7 +2337,8 @@ mod tests {
             )
             .unwrap();
         engine.deposit(ACCT_A, BTC, 500).unwrap();
-        engine.rotate(&snap_path).unwrap();
+        engine.save_snapshot(&snap_path).unwrap();
+        engine.rotate_segment().unwrap();
 
         // Rotation 3.
         engine.deposit(ACCT_B, USD, 999).unwrap();
@@ -2348,7 +2349,8 @@ mod tests {
                 &mut reports,
             )
             .unwrap();
-        engine.rotate(&snap_path).unwrap();
+        engine.save_snapshot(&snap_path).unwrap();
+        engine.rotate_segment().unwrap();
 
         // Post-rotation events in the final journal segment.
         engine.deposit(ACCT_A, USD, 111).unwrap();

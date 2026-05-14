@@ -11,11 +11,11 @@ use std::time::Duration;
 use melin_journal::BufferedWriter;
 use melin_noop::NoopApp;
 use melin_trading::trading_event::TradingEvent;
-use melin_types::types::{AccountId, CurrencyId};
 use melin_transport_core::pipeline::{
     InputSlot, JournalStageRun, OutputPayload, build_pipeline_with_replication,
 };
 use melin_transport_core::trace::mono_trace_ns;
+use melin_types::types::{AccountId, CurrencyId};
 
 #[test]
 fn pipeline_with_noop_app_runs_events_to_output() {

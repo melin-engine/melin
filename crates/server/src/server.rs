@@ -57,7 +57,7 @@ pub struct ServerConfig {
     /// Pipeline core IDs: journal,matching,response,repl-sender,event-publisher,shadow,repl-handler-0,repl-handler-1
     /// (comma-separated). Core 0 is reserved for OS/IRQ handling.
     /// repl-sender is used when replication is enabled, event-publisher when
-    /// `--event-bind` is set, shadow when `--snapshot-interval-secs` > 0.
+    /// `--event-bind` is set, shadow when `--snapshot-interval-ms` > 0.
     /// repl-handler-0/1 are for the per-replica TCP handler threads (0 = unpinned).
     #[arg(long, default_value = "1,2,3,6,7,8,9,10", value_parser = parse_cores)]
     pub cores: PipelineCores,
@@ -484,7 +484,7 @@ impl ServerConfig {
 /// Six fields: journal, matching, response, repl-sender, event-publisher,
 /// and shadow. All are always stored; repl-sender is only used when
 /// replication is enabled, event-publisher only when `--event-bind` is set,
-/// and shadow only when `--snapshot-interval-secs` > 0.
+/// and shadow only when `--snapshot-interval-ms` > 0.
 #[derive(Debug, Clone, Copy)]
 pub struct PipelineCores {
     pub journal: usize,
@@ -1374,8 +1374,8 @@ where
         use crate::InputSlot;
         use crate::JournalEvent;
         use melin_app::unix_epoch_nanos;
-        use melin_types::types::{AccountId, CurrencyId, InstrumentSpec, Symbol};
         use melin_transport_core::trace::mono_trace_ns;
+        use melin_types::types::{AccountId, CurrencyId, InstrumentSpec, Symbol};
 
         let seed_start = std::time::Instant::now();
 
@@ -2258,8 +2258,8 @@ where
         use crate::InputSlot;
         use crate::JournalEvent;
         use melin_app::unix_epoch_nanos;
-        use melin_types::types::{AccountId, CurrencyId, InstrumentSpec, Symbol};
         use melin_transport_core::trace::mono_trace_ns;
+        use melin_types::types::{AccountId, CurrencyId, InstrumentSpec, Symbol};
 
         // `sequence: 0` — the journal stage allocates sequences in
         // disruptor cursor order at encode time.
@@ -2638,25 +2638,22 @@ where
         config.max_orders_burst,
     );
 
-    // Rotate journal if it exceeds the configured size threshold.
-    // This saves a snapshot, archives the old journal, and starts
-    // a fresh one — preventing unbounded disk growth across restarts.
+    // Archive the live journal segment if it exceeds the configured
+    // size threshold. The shadow exchange owns snapshot writes; here we
+    // only rotate the segment so disk usage stays bounded across
+    // restarts. Recovery walks the archive chain forward from the
+    // latest shadow snapshot.
     if config.max_journal_mib > 0 {
         let threshold = config.max_journal_mib * 1024 * 1024;
         let current_size = engine.journal_size();
         if current_size > threshold {
-            let snap_path = config
-                .snapshot
-                .clone()
-                .unwrap_or_else(|| config.journal.with_extension("snapshot"));
             info!(
                 current_mib = current_size / (1024 * 1024),
                 threshold_mib = config.max_journal_mib,
-                snapshot = %snap_path.display(),
-                "journal exceeds threshold, rotating"
+                "journal exceeds threshold, rotating segment"
             );
-            engine.rotate(&snap_path)?;
-            info!("journal rotated successfully");
+            engine.rotate_segment()?;
+            info!("journal segment rotated successfully");
         }
     }
 

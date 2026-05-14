@@ -107,9 +107,9 @@ Same hybrid gate as above, just at window=1 so queueing drops out entirely. The 
 - Write-ahead journal with CRC32C checksums and BLAKE3 hash chain (tamper evidence, replica consistency)
 - Persist-before-ack: matching overlapped against journal writes, acknowledgement gated on confirmed durability
 - Batch journal I/O with pre-allocated storage for reduced fsync latency
-- Snapshot save/load for fast recovery; journal rotation (automatic snapshot + archive when size threshold exceeded)
+- Snapshot save/load for fast recovery; size-triggered journal segment rotation keeps disk usage bounded
 - Deterministic replay from journal for crash recovery and audit
-- Scheduled snapshots on a dedicated thread without pausing the matching engine
+- Scheduled snapshots on a dedicated shadow thread — the sole snapshot writer, never pauses the matching engine
 
 ### [Replication & High Availability](docs/replication.md)
 - Synchronous dual replication — live WAL streaming to 2 replicas via lock-free ring buffer; replicas fsync and ack before the primary sends responses to clients (zero acknowledged data loss)

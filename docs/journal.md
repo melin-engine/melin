@@ -311,11 +311,12 @@ A crash during snapshot creation leaves only a temporary file, which is harmless
 
 ### When to Snapshot
 
-Snapshots are taken automatically during journal rotation, which triggers at startup when the journal exceeds a configurable size threshold (`--max-journal-mib`, default 256 MiB). Snapshots can also be triggered manually via `save_snapshot()`.
+Snapshots are written exclusively by the shadow exchange on a configurable interval (`--snapshot-interval-ms`, default 50 minutes). The shadow runs as a dedicated consumer on the input ring, replays events through its own copy of the engine state, and writes a snapshot every interval — entirely off the matching thread.
 
-- **At rotation** — automatic snapshot + journal archiving when size threshold exceeded.
+Journal segment rotation is independent of snapshots. When the live journal exceeds `--max-journal-mib` (default 256 MiB), the segment is archived and a fresh live file opens; no snapshot is written at rotation. Recovery walks the archive chain forward from the latest shadow snapshot.
+
+- **On interval** — shadow exchange writes snapshots every `--snapshot-interval-ms`.
 - **Before deploying a new engine version** — version boundary (see Migration below).
-- **Periodically** — to bound recovery time if rotation threshold is set high.
 
 ## BLAKE3 Hash Chain
 

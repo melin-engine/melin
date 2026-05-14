@@ -822,7 +822,7 @@ fn snapshot_transfer_dpdk(
     if !snap_path.exists() {
         return Err(io::Error::other(
             "snapshot transfer required but no snapshot available \
-             — enable --snapshot-interval-secs or trigger a journal rotation",
+             — set --snapshot-interval-ms to a non-zero value so the shadow exchange writes snapshots",
         ));
     }
 

@@ -24,10 +24,10 @@ use melin_disruptor::ring;
 use crate::durability_policy::{CursorView, DurabilityMode, EvalStatus, Policy};
 use crate::replication::ReplicationMetrics;
 use crate::{OutputPayload, OutputSlot};
-use melin_types::types::QueryResponse;
 use melin_transport_core::pipeline::StageUtilization;
 #[cfg(feature = "latency-trace")]
 use melin_transport_core::trace;
+use melin_types::types::QueryResponse;
 
 use melin_protocol::codec;
 use melin_protocol::message::ResponseKind;
