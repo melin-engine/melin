@@ -24,6 +24,20 @@ use std::path::Path;
 use melin_app::Application;
 
 const SNAP_MAGIC: u32 = 0x534E_4150;
+
+/// Suffix appended to the snapshot path for the one-deep rollback file.
+const PREV_SUFFIX: &str = ".prev";
+
+/// Append [`PREV_SUFFIX`] to a snapshot path. Keeps the full filename intact
+/// (e.g. `melin.snapshot` → `melin.snapshot.prev`) so operators can run
+/// `mv melin.snapshot.prev melin.snapshot` to roll back. Using
+/// [`Path::with_extension`] is wrong here — it would replace the existing
+/// extension instead of appending.
+fn prev_snapshot_path(path: &Path) -> std::path::PathBuf {
+    let mut prev = path.as_os_str().to_owned();
+    prev.push(PREV_SUFFIX);
+    std::path::PathBuf::from(prev)
+}
 const TRANSPORT_VERSION: u16 = 1;
 const HEADER_SIZE: usize = 4 + 2 + 2 + 8 + 32; // magic + t_ver + a_ver + seq + hash
 const CRC_SIZE: usize = 4;
@@ -145,6 +159,17 @@ fn save_with_limit<A: Application>(
         file.write_all(&buf)?;
         file.sync_all()?;
     }
+
+    // Rotate the previous snapshot to `<path>.prev` before clobbering it.
+    // Operators rely on this as a one-deep rollback target — see
+    // `docs/operations.md` "Snapshot rotation". On first save the source
+    // doesn't exist (NotFound) and the rename simply does nothing. Other
+    // errors (e.g. EACCES) are dropped on purpose: per the documented
+    // contract, losing the rollback point is preferable to failing the
+    // snapshot entirely.
+    let prev_path = prev_snapshot_path(path);
+    let _ = std::fs::rename(path, &prev_path);
+
     std::fs::rename(&tmp_path, path)?;
 
     // POSIX semantics: the rename is atomic wrt concurrent readers but
@@ -291,6 +316,43 @@ mod tests {
         assert_eq!(seq, 999);
         assert_eq!(ch, chain);
         assert_eq!(restored, app);
+    }
+
+    #[test]
+    fn second_save_rotates_previous_to_prev() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("melin.snapshot");
+        let prev_path = dir.path().join("melin.snapshot.prev");
+
+        let app = populated_app();
+
+        // First save — no previous snapshot exists; `.prev` is not created.
+        save::<TestApp>(&app, 1, [0x11; 32], &path).unwrap();
+        assert!(path.exists());
+        assert!(
+            !prev_path.exists(),
+            "no .prev file should be created on first save"
+        );
+        let first_bytes = std::fs::read(&path).unwrap();
+
+        // Second save — previous snapshot must be rotated to .prev verbatim.
+        save::<TestApp>(&app, 2, [0x22; 32], &path).unwrap();
+        assert!(path.exists());
+        assert!(prev_path.exists(), "second save must produce a .prev file");
+        assert_eq!(
+            std::fs::read(&prev_path).unwrap(),
+            first_bytes,
+            ".prev must contain the first snapshot's bytes byte-for-byte"
+        );
+
+        // Both files must round-trip independently with their own metadata.
+        let (_, seq_curr, hash_curr) = load::<TestApp>(&path).unwrap();
+        assert_eq!(seq_curr, 2);
+        assert_eq!(hash_curr, [0x22; 32]);
+
+        let (_, seq_prev, hash_prev) = load::<TestApp>(&prev_path).unwrap();
+        assert_eq!(seq_prev, 1);
+        assert_eq!(hash_prev, [0x11; 32]);
     }
 
     #[test]
