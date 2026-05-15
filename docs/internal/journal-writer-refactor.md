@@ -168,8 +168,8 @@ only as a cleanup pass; doesn't fix the real smell.
    trait bound; leave `JournalWriter` enum in place for now.
 3. Make `JournalStage` generic. `run_uring` moves to a sector-only `impl`.
    Branching on `mode()` moves from runtime to construction site.
-4. Update every construction site (`server.rs`, `rumcast_transport.rs`,
-   `replication/{tcp,dpdk,rumcast}_receiver.rs`, `replication-bench.rs`,
+4. Update every construction site (`server.rs`,
+   `replication/{tcp,dpdk}_receiver.rs`, `replication-bench.rs`,
    `transport-core/journaled_app.rs`, `engine/journal/engine.rs`, benches,
    tests) to pick the concrete writer at startup.
 5. Delete the `JournalWriter` enum and `create_fresh_replica` helper —
@@ -184,8 +184,8 @@ only as a cleanup pass; doesn't fix the real smell.
 
 - `JournalWriter` enum deleted.
 - No `unwrap_sector*` or `as_sector*` calls anywhere.
-- `cargo check` passes for all feature combinations: default, `dpdk,trading`,
-  `dpdk,noop`, `rumcast,trading`, `rumcast,noop`, `melin-bench --features dpdk`.
+- `cargo check` passes for all feature combinations: default,
+  `dpdk,trading`, `dpdk,noop`, `melin-bench --features dpdk`.
 - `tcp-dual-repl throughput` ≥ 3.6M ord/s on Cherry rig (current baseline:
   3.68M).
 - Standalone buffered ≥ 3.8M ord/s (current baseline: 3.85M).
@@ -210,12 +210,11 @@ only as a cleanup pass; doesn't fix the real smell.
   through `stage.run(&shutdown)` regardless of which writer was
   selected; both specialisations implement it.
 - ✅ Server boot path now dispatches on `--journal-writer` at the
-  three public entry points (`run_with_shutdown`, `run_dpdk`,
-  `run_rumcast`). `init_engine`, `run_as_primary`, the rumcast
-  primary/replica helpers, and all three replica receivers
-  (`run_receiver`, `run_receiver_dpdk`, `run_receiver_rumcast`) are
-  generic over `W`. The `pub type JournalWriter = BufferedWriter;`
-  shims in both `melin-engine` and `melin-server` are gone.
+  two public entry points (`run_with_shutdown`, `run_dpdk`).
+  `init_engine`, `run_as_primary`, and the replica receivers
+  (`run_receiver`, `run_receiver_dpdk`) are generic over `W`. The
+  `pub type JournalWriter = BufferedWriter;` shims in both
+  `melin-engine` and `melin-server` are gone.
 - ⚠️ `melin-bench` and `replication-bench` remain monomorphised on
   `BufferedWriter` by design — both are standalone harnesses; their
   `--journal-writer` flag is recorded for provenance only.

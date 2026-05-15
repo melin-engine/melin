@@ -167,8 +167,7 @@ the server runs in standalone mode.
 ## Wire protocol
 
 Length-prefixed frames, little-endian. Runs over a dedicated TCP
-connection (or rumcast UDP session, under `--features rumcast`)
-separate from the client protocol.
+connection separate from the client protocol.
 
 ### Replica → Primary
 

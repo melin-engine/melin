@@ -371,10 +371,9 @@ vm.dirty_background_bytes = 33554432
 vm.dirty_bytes = 67108864
 # Network buffer tuning.
 # rmem_max / wmem_max: system-wide cap on SO_RCVBUF / SO_SNDBUF for any
-# socket. The kernel default (208 KiB) is far too small for a high-throughput
-# UDP server (rumcast) with many concurrent sessions — the receive queue
-# overflows and forces retransmits. 32 MiB gives the rumcast server room to
-# request a large buffer via setsockopt without hitting the cap.
+# socket. The kernel default (208 KiB) is on the low side for the
+# bursty TCP replication writes; raising the ceiling lets `tcp_rmem` /
+# `tcp_wmem` autotuning grow buffers without hitting an arbitrary cap.
 net.core.rmem_max = 33554432
 net.core.wmem_max = 33554432
 # TCP receive/send buffer autotuning bounds. The max column is the ceiling

@@ -7,9 +7,6 @@
 #     tcp             Kernel TCP, standalone (no replication)
 #     tcp-repl        Kernel TCP + 1 synchronous replica
 #     tcp-dual-repl   Kernel TCP + 2 synchronous replicas
-#     udp             Rumcast (reliable UDP), standalone
-#     udp-repl        Rumcast + 1 synchronous replica (e2e UDP)
-#     udp-dual-repl   Rumcast + 2 synchronous replicas (e2e UDP)
 #     dpdk            DPDK kernel bypass, standalone
 #     dpdk-repl       DPDK + 1 synchronous replica (e2e DPDK)
 #     dpdk-dual-repl  DPDK + 2 synchronous replicas (e2e DPDK)
@@ -74,7 +71,7 @@
 #                       can coexist with durable-mode results.
 #   MAIN_EXTRA_FEATURES=<list>
 #                       Comma-separated cargo features appended to the
-#                       kernel-TCP / kernel-rumcast main build. Composes
+#                       kernel-TCP main build. Composes
 #                       with NO_PERSIST. Use e.g. `no-o-direct` to bench
 #                       the journal without `O_DIRECT` (consumer NVMe
 #                       drives without Power Loss Protection).
@@ -192,20 +189,6 @@ REPLICA_EXTRA_ARGS="${REPLICA_EXTRA_ARGS-}"
 # socket, slow-SEND completions, and replica-side queue depths.
 BENCH_RUST_LOG="${RUST_LOG:-info}"
 
-# Forward RUMCAST_DIAG=1 to rumcast server invocations to enable
-# the per-second session_translator counter dump on stderr.
-if [[ "${RUMCAST_DIAG:-}" == "1" ]]; then
-    RUMCAST_DIAG_ENV="RUMCAST_DIAG=1 "
-else
-    RUMCAST_DIAG_ENV=""
-fi
-
-# Diagnostic only — opt-in disable of UDP-GSO on rumcast send paths.
-# A/B helper for "is GSO actually helping or hurting on this NIC?".
-if [[ "${RUMCAST_DISABLE_GSO:-}" == "1" ]]; then
-    RUMCAST_DIAG_ENV="${RUMCAST_DIAG_ENV}RUMCAST_DISABLE_GSO=1 "
-fi
-
 # Order counts — override for quick smoke tests.
 THROUGHPUT_ORDERS="${THROUGHPUT_ORDERS:-100000000}"
 THROUGHPUT_CLIENTS="${THROUGHPUT_CLIENTS:-16}"
@@ -232,14 +215,12 @@ DPDK_RAN=0
 cleanup() {
     for host in "$SERVER" ${REPLICA:+"$REPLICA"} ${REPLICA2:+"$REPLICA2"}; do
         ssh $SSH_OPTS "$host" "pkill -INT -x melin-server 2>/dev/null; \
-                               pkill -INT -f '[m]elin-server.rumcast' 2>/dev/null; \
                                pkill -INT -f '[m]elin-server.dpdk' 2>/dev/null; true" 2>/dev/null || true
     done
     # Kill any orphaned bench client too — a hung run leaves the bench
     # binary executing on $BENCH and the next build trips "Text file
-    # busy" on the cp into the .rumcast / .dpdk suffixed path.
+    # busy" on the cp into the .dpdk suffixed path.
     ssh $SSH_OPTS "$BENCH" "pkill -INT -x melin-bench 2>/dev/null; \
-                            pkill -INT -f '[m]elin-bench.rumcast' 2>/dev/null; \
                             pkill -INT -f '[m]elin-bench.dpdk' 2>/dev/null; true" 2>/dev/null || true
     # Close ssh master connections and remove their control sockets.
     for host in "$SERVER" "$BENCH" ${REPLICA:+"$REPLICA"} ${REPLICA2:+"$REPLICA2"}; do
@@ -258,11 +239,6 @@ trap cleanup EXIT
 VALID_TCP="throughput single sweep-window sweep-clients sweep-instruments sweep-accounts"
 VALID_TCP_REPL="throughput single"
 VALID_TCP_DUAL_REPL="throughput single"
-# Rumcast bench is single-client today (Phase 4); the throughput
-# workload still measures throughput, just with one client.
-VALID_UDP="throughput single"
-VALID_UDP_REPL="throughput single"
-VALID_UDP_DUAL_REPL="throughput single"
 VALID_DPDK="throughput single"
 VALID_DPDK_REPL="throughput single"
 VALID_DPDK_DUAL_REPL="throughput single"
@@ -278,9 +254,6 @@ if [[ "$TRANSPORTS" == "all" ]]; then
     TRANSPORTS="tcp"
     if [[ -n "$REPLICA_PUB" ]]; then TRANSPORTS="${TRANSPORTS},tcp-repl"; fi
     if [[ -n "$REPLICA2_PUB" ]]; then TRANSPORTS="${TRANSPORTS},tcp-dual-repl"; fi
-    TRANSPORTS="${TRANSPORTS},udp"
-    if [[ -n "$REPLICA_PUB" ]]; then TRANSPORTS="${TRANSPORTS},udp-repl"; fi
-    if [[ -n "$REPLICA2_PUB" ]]; then TRANSPORTS="${TRANSPORTS},udp-dual-repl"; fi
     TRANSPORTS="${TRANSPORTS},dpdk"
     if [[ -n "$REPLICA_PUB" ]]; then TRANSPORTS="${TRANSPORTS},dpdk-repl"; fi
     if [[ -n "$REPLICA2_PUB" ]]; then TRANSPORTS="${TRANSPORTS},dpdk-dual-repl"; fi
@@ -313,12 +286,12 @@ for workload in "${WORKLOAD_LIST[@]}"; do
 
         # Check infrastructure.
         case "$transport" in
-            tcp-repl|dpdk-repl|udp-repl)
+            tcp-repl|dpdk-repl)
                 if [[ -z "$REPLICA_PUB" || -z "$REPLICA_VLAN" ]]; then
                     echo "  SKIP ${transport}:${workload} — no replica server specified"
                     continue
                 fi ;;
-            tcp-dual-repl|dpdk-dual-repl|udp-dual-repl)
+            tcp-dual-repl|dpdk-dual-repl)
                 if [[ -z "$REPLICA_PUB" || -z "$REPLICA2_PUB" ]]; then
                     echo "  SKIP ${transport}:${workload} — need two replica servers"
                     continue
@@ -331,9 +304,6 @@ for workload in "${WORKLOAD_LIST[@]}"; do
             tcp)            valid_list="$VALID_TCP" ;;
             tcp-repl)       valid_list="$VALID_TCP_REPL" ;;
             tcp-dual-repl)  valid_list="$VALID_TCP_DUAL_REPL" ;;
-            udp)            valid_list="$VALID_UDP" ;;
-            udp-repl)       valid_list="$VALID_UDP_REPL" ;;
-            udp-dual-repl)  valid_list="$VALID_UDP_DUAL_REPL" ;;
             dpdk)           valid_list="$VALID_DPDK" ;;
             dpdk-repl)      valid_list="$VALID_DPDK_REPL" ;;
             dpdk-dual-repl) valid_list="$VALID_DPDK_DUAL_REPL" ;;
@@ -485,107 +455,6 @@ if [[ -n "${SERVER_FEATURES:-}" ]]; then
     ssh $SSH_OPTS "$SERVER" "cd ${REPO_DIR} && source ~/.cargo/env && \
         export RUSTFLAGS=\"${RUSTFLAGS:-}\" && \
         cargo build --release -p melin-server --features ${SERVER_FEATURES}" 2>&1 | tail -3
-fi
-
-# Rumcast (UDP) build. Mirrors the DPDK pattern: build melin-server and
-# melin-bench with --features rumcast, then cp to a `.rumcast` suffix
-# so the default `melin-server` (TCP/main) binary keeps working in the
-# same suite run. The bench needs the same treatment because rumcast
-# wire-up is feature-gated at compile time.
-NEED_RUMCAST=0
-_need_udp_repl=0
-_need_udp_dual_repl=0
-for item in "${MATRIX[@]}"; do
-    case "${item%%:*}" in
-        udp)            NEED_RUMCAST=1 ;;
-        udp-repl)       NEED_RUMCAST=1; _need_udp_repl=1 ;;
-        udp-dual-repl)  NEED_RUMCAST=1; _need_udp_repl=1; _need_udp_dual_repl=1 ;;
-    esac
-done
-if [[ "$NEED_RUMCAST" == "1" ]]; then
-    if [[ "${NOOP:-0}" == "1" ]]; then
-        RUMCAST_SERVER_FEATURES="rumcast,noop"
-    else
-        RUMCAST_SERVER_FEATURES="rumcast,trading,hash-chain,release-tracing"
-    fi
-    if [[ "${NO_PERSIST:-0}" == "1" ]]; then
-        RUMCAST_SERVER_FEATURES="${RUMCAST_SERVER_FEATURES},no-persist"
-    fi
-
-    echo "  Building rumcast server (--features ${RUMCAST_SERVER_FEATURES}) and bench in parallel..."
-    # Stop any previously-running .rumcast binaries first — Linux refuses
-    # to overwrite a running ELF ("Text file busy"). Use pkill -f because
-    # the comm field is truncated to 15 chars (TASK_COMM_LEN-1) and -x
-    # silently doesn't match the .rumcast / .dpdk suffixed names.
-    ssh $SSH_OPTS "$SERVER" "pkill -f '[m]elin-server.rumcast' 2>/dev/null; true"
-    ssh $SSH_OPTS "$BENCH"  "pkill -f '[m]elin-bench.rumcast' 2>/dev/null; true"
-    if (( _need_udp_repl )) && [[ -n "$REPLICA" ]]; then
-        ssh $SSH_OPTS "$REPLICA" "pkill -f '[m]elin-server.rumcast' 2>/dev/null; true"
-    fi
-    if (( _need_udp_dual_repl )) && [[ -n "$REPLICA2" ]]; then
-        ssh $SSH_OPTS "$REPLICA2" "pkill -f '[m]elin-server.rumcast' 2>/dev/null; true"
-    fi
-    rumcast_pids=()
-    (
-        ssh $SSH_OPTS "$SERVER" "cd ${REPO_DIR} && source ~/.cargo/env && \
-            export RUSTFLAGS=\"${RUSTFLAGS:-}\" && \
-            cargo build --release -p melin-server --features ${RUMCAST_SERVER_FEATURES} --no-default-features && \
-            cp target/release/melin-server target/release/melin-server.rumcast" 2>&1 \
-            | tail -3 | sed "s/^/  [${SERVER} rumcast-server] /"
-    ) &
-    rumcast_pids+=($!)
-    (
-        ssh $SSH_OPTS "$BENCH" "cd ${REPO_DIR} && source ~/.cargo/env && \
-            export RUSTFLAGS=\"${RUSTFLAGS:-}\" && \
-            cargo build --release -p melin-bench --features rumcast && \
-            cp target/release/melin-bench target/release/melin-bench.rumcast" 2>&1 \
-            | tail -3 | sed "s/^/  [${BENCH} rumcast-bench] /"
-    ) &
-    rumcast_pids+=($!)
-    if (( _need_udp_repl )) && [[ -n "$REPLICA" ]]; then
-        (
-            ssh $SSH_OPTS "$REPLICA" "cd ${REPO_DIR} && source ~/.cargo/env && \
-                export RUSTFLAGS=\"${RUSTFLAGS:-}\" && \
-                cargo build --release -p melin-server --features ${RUMCAST_SERVER_FEATURES} --no-default-features && \
-                cp target/release/melin-server target/release/melin-server.rumcast" 2>&1 \
-                | tail -3 | sed "s/^/  [${REPLICA} rumcast-server] /"
-        ) &
-        rumcast_pids+=($!)
-    fi
-    if (( _need_udp_dual_repl )) && [[ -n "$REPLICA2" ]]; then
-        (
-            ssh $SSH_OPTS "$REPLICA2" "cd ${REPO_DIR} && source ~/.cargo/env && \
-                export RUSTFLAGS=\"${RUSTFLAGS:-}\" && \
-                cargo build --release -p melin-server --features ${RUMCAST_SERVER_FEATURES} --no-default-features && \
-                cp target/release/melin-server target/release/melin-server.rumcast" 2>&1 \
-                | tail -3 | sed "s/^/  [${REPLICA2} rumcast-server] /"
-        ) &
-        rumcast_pids+=($!)
-    fi
-    rumcast_failed=0
-    for pid in "${rumcast_pids[@]}"; do
-        wait "$pid" || rumcast_failed=1
-    done
-    if [[ "$rumcast_failed" == "1" ]]; then
-        echo "  Rumcast build failed on at least one host."
-        exit 1
-    fi
-    # The cp above leaves the `target/release/melin-server` binary built
-    # with rumcast features (no `tcp` codepath). Rebuild the default
-    # variant so a downstream tcp/dpdk transport in the same matrix still
-    # has a working binary. Cargo's incremental build skips most work.
-    echo "  Restoring default melin-server / melin-bench binaries..."
-    restore_pids=()
-    for HOST in "$SERVER" "$BENCH" ${REPLICA:+"$REPLICA"} ${REPLICA2:+"$REPLICA2"}; do
-        (
-            ssh $SSH_OPTS "$HOST" "cd ${REPO_DIR} && source ~/.cargo/env && \
-                export RUSTFLAGS=\"${RUSTFLAGS:-}\" && \
-                ${MAIN_BUILD}" 2>&1 \
-                | tail -3 | sed "s/^/  [${HOST} default-restore] /"
-        ) &
-        restore_pids+=($!)
-    done
-    for pid in "${restore_pids[@]}"; do wait "$pid" || true; done
 fi
 
 # DPDK build on server (and replica if dpdk-repl).
@@ -798,10 +667,9 @@ wait_for_log() {
 
 stop_servers() {
     for host in "$@"; do
-        # `pkill -x` is exact-match; the rumcast and dpdk binaries have
-        # suffixes so we must list them explicitly.
+        # `pkill -x` is exact-match; the dpdk binary has a suffix so
+        # we list it explicitly.
         ssh $SSH_OPTS "$host" "pkill -INT -x melin-server 2>/dev/null; \
-                               pkill -INT -f '[m]elin-server.rumcast' 2>/dev/null; \
                                pkill -INT -f '[m]elin-server.dpdk' 2>/dev/null; true"
     done
     sleep 2
@@ -832,37 +700,6 @@ run_bench() {
             --json /tmp/bench-results.json \
             --bench-cores 1 \
             ${warmup_arg} ${cooldown_arg} ${threads_arg} \
-            ${orders} $*"
-}
-
-# Run the rumcast bench client (built with --features rumcast, so it's
-# a separate binary at melin-bench.rumcast). Multi-client capable: the
-# bench process drives N concurrent authenticated rumcast sessions
-# through one shared UDP socket via the muxed primitives. Pass
-# --clients via the trailing args same as the TCP path.
-# Usage: run_bench_rumcast <server_addr> <orders> <extra_bench_args...>
-run_bench_rumcast() {
-    local server_addr="$1" orders="$2"
-    shift 2
-    local warmup_arg=""
-    if [[ -n "${WARMUP_ORDERS}" ]]; then
-        warmup_arg="--warmup ${WARMUP_ORDERS}"
-    fi
-    local cooldown_arg=""
-    if [[ -n "${COOLDOWN_ORDERS}" ]]; then
-        cooldown_arg="--cooldown ${COOLDOWN_ORDERS}"
-    fi
-    # rumcast bench picks an ephemeral local port on all interfaces;
-    # the server auto-discovers the response dst from the bench's
-    # first inbound frame.
-    ssh $SSH_OPTS "$BENCH" "cd ${REPO_DIR} && source ~/.cargo/env && \
-        ${RUMCAST_DIAG_ENV}./target/release/melin-bench.rumcast \
-            --addr ${server_addr} \
-            --rumcast-bind 0.0.0.0:0 \
-            --key bench.key \
-            --json /tmp/bench-results.json \
-            ${warmup_arg} ${cooldown_arg} \
-            ${BENCH_EXTRA_ARGS:-} \
             ${orders} $*"
 }
 
@@ -1016,157 +853,6 @@ transport_start_tcp_dual_repl() {
 }
 
 transport_stop_tcp_dual_repl() {
-    perf_capture_stop
-    stop_servers "$SERVER" "$REPLICA" "$REPLICA2"
-    if [[ "${SKIP_JOURNAL_VERIFY:-0}" == "1" ]]; then
-        echo "  Skipping journal verification (SKIP_JOURNAL_VERIFY=1)"
-        return
-    fi
-    echo "  Verifying journal consistency (replica1)..."
-    "${SCRIPT_DIR}/journal-verify.sh" "$SERVER" "$JOURNAL_PATH" "$REPLICA" "${REPLICA_JOURNAL}"
-    echo "  Verifying journal consistency (replica2)..."
-    "${SCRIPT_DIR}/journal-verify.sh" "$SERVER" "$JOURNAL_PATH" "$REPLICA2" "${REPLICA2_JOURNAL}"
-}
-
-# --- UDP transports (rumcast) ---
-#
-# The rumcast server binary is at `target/release/melin-server.rumcast`
-# (built + cp'd in the rumcast build section above so the default
-# `melin-server` binary stays available for tcp/dpdk transports). On the
-# wire it uses the same --bind / --replication-bind flags as TCP — only
-# the dispatch in main.rs differs (compile-time #[cfg]).
-
-transport_start_udp() {
-    clean_journal "$SERVER" "$JOURNAL_PATH"
-    pin_irqs "$SERVER" "server"
-    pin_irqs "$BENCH" "bench"
-
-    ssh $SSH_OPTS "$SERVER" "pkill -f '[m]elin-server.rumcast' 2>/dev/null; pkill -x melin-server 2>/dev/null; true"
-    sleep 1
-    ssh $SSH_OPTS "$SERVER" "NO_COLOR=1 RUST_LOG=${BENCH_RUST_LOG} ${RUMCAST_DIAG_ENV}nohup ${REPO_DIR}/target/release/melin-server.rumcast \
-            --bind ${SERVER_VLAN}:9876 \
-            --health-bind ${SERVER_VLAN}:9878 \
-            --journal ${JOURNAL_PATH} \
-            --authorized-keys ${REPO_DIR}/authorized_keys \
-            ${SERVER_EXTRA_ARGS:-} \
-        >/tmp/melin-server.log 2>&1 </dev/null &" </dev/null
-
-    wait_for_log "$SERVER" "/tmp/melin-server.log" "rumcast standalone server up" 120 "Rumcast server"
-    CURRENT_BIND="${SERVER_VLAN}:9876"
-    CURRENT_HEALTH="${SERVER_VLAN}:9878"
-
-    perf_capture_start "udp"
-}
-
-transport_stop_udp() {
-    perf_capture_stop
-    stop_servers "$SERVER"
-}
-
-transport_start_udp_repl() {
-    local replica_journal="${REPLICA_JOURNAL}"
-    clean_journal "$SERVER" "$JOURNAL_PATH"
-    clean_journal "$REPLICA" "$replica_journal"
-    pin_irqs "$SERVER" "server"
-    pin_irqs "$BENCH" "bench"
-    pin_irqs "$REPLICA" "replica"
-
-    ssh $SSH_OPTS "$SERVER" "pkill -f '[m]elin-server.rumcast' 2>/dev/null; pkill -x melin-server 2>/dev/null; true"
-    sleep 1
-    ssh $SSH_OPTS "$SERVER" "NO_COLOR=1 RUST_LOG=${BENCH_RUST_LOG} ${RUMCAST_DIAG_ENV}nohup ${REPO_DIR}/target/release/melin-server.rumcast \
-            --bind ${SERVER_VLAN}:9876 \
-            --health-bind ${SERVER_VLAN}:9878 \
-            --journal ${JOURNAL_PATH} \
-            --authorized-keys ${REPO_DIR}/authorized_keys \
-            --replication-bind ${SERVER_VLAN}:${REPL_PORT} \
-            ${SERVER_EXTRA_ARGS:-} \
-        >/tmp/melin-server.log 2>&1 </dev/null &" </dev/null
-
-    wait_for_log "$SERVER" "/tmp/melin-server.log" "rumcast replication sender listening" 30 "Rumcast replication listener"
-
-    ssh $SSH_OPTS "$REPLICA" "pkill -f '[m]elin-server.rumcast' 2>/dev/null; pkill -x melin-server 2>/dev/null; true"
-    sleep 1
-    ssh $SSH_OPTS "$REPLICA" "NO_COLOR=1 RUST_LOG=${BENCH_RUST_LOG} ${RUMCAST_DIAG_ENV}nohup ${REPO_DIR}/target/release/melin-server.rumcast \
-            --bind ${REPLICA_VLAN}:9876 \
-            --replica-of ${SERVER_VLAN}:${REPL_PORT} \
-            --replication-key ${REPO_DIR}/repl.key \
-            --journal ${replica_journal} \
-            --authorized-keys ${REPO_DIR}/authorized_keys \
-            ${REPLICA_EXTRA_ARGS:-} \
-        >/tmp/melin-server.log 2>&1 </dev/null &" </dev/null
-
-    wait_for_log "$SERVER" "/tmp/melin-server.log" "rumcast standalone server up" 120 "Rumcast primary"
-    CURRENT_BIND="${SERVER_VLAN}:9876"
-    CURRENT_HEALTH="${SERVER_VLAN}:9878"
-
-    perf_capture_start "udp-repl"
-}
-
-transport_stop_udp_repl() {
-    perf_capture_stop
-    stop_servers "$SERVER" "$REPLICA"
-    if [[ "${SKIP_JOURNAL_VERIFY:-0}" == "1" ]]; then
-        echo "  Skipping journal verification (SKIP_JOURNAL_VERIFY=1)"
-        return
-    fi
-    echo "  Verifying journal consistency..."
-    "${SCRIPT_DIR}/journal-verify.sh" "$SERVER" "$JOURNAL_PATH" "$REPLICA" "${REPLICA_JOURNAL}"
-}
-
-transport_start_udp_dual_repl() {
-    local replica_journal="${REPLICA_JOURNAL}"
-    local replica2_journal="${REPLICA2_JOURNAL}"
-    clean_journal "$SERVER" "$JOURNAL_PATH"
-    clean_journal "$REPLICA" "$replica_journal"
-    clean_journal "$REPLICA2" "$replica2_journal"
-    pin_irqs "$SERVER" "server"
-    pin_irqs "$BENCH" "bench"
-    pin_irqs "$REPLICA" "replica1"
-    pin_irqs "$REPLICA2" "replica2"
-
-    ssh $SSH_OPTS "$SERVER" "pkill -f '[m]elin-server.rumcast' 2>/dev/null; pkill -x melin-server 2>/dev/null; true"
-    sleep 1
-    ssh $SSH_OPTS "$SERVER" "NO_COLOR=1 RUST_LOG=${BENCH_RUST_LOG} ${RUMCAST_DIAG_ENV}nohup ${REPO_DIR}/target/release/melin-server.rumcast \
-            --bind ${SERVER_VLAN}:9876 \
-            --health-bind ${SERVER_VLAN}:9878 \
-            --journal ${JOURNAL_PATH} \
-            --authorized-keys ${REPO_DIR}/authorized_keys \
-            --replication-bind ${SERVER_VLAN}:${REPL_PORT} \
-            ${SERVER_EXTRA_ARGS:-} \
-        >/tmp/melin-server.log 2>&1 </dev/null &" </dev/null
-
-    wait_for_log "$SERVER" "/tmp/melin-server.log" "rumcast replication sender listening" 30 "Rumcast replication listener"
-
-    ssh $SSH_OPTS "$REPLICA" "pkill -f '[m]elin-server.rumcast' 2>/dev/null; pkill -x melin-server 2>/dev/null; true"
-    sleep 1
-    ssh $SSH_OPTS "$REPLICA" "NO_COLOR=1 RUST_LOG=${BENCH_RUST_LOG} ${RUMCAST_DIAG_ENV}nohup ${REPO_DIR}/target/release/melin-server.rumcast \
-            --bind ${REPLICA_VLAN}:9876 \
-            --replica-of ${SERVER_VLAN}:${REPL_PORT} \
-            --replication-key ${REPO_DIR}/repl.key \
-            --journal ${replica_journal} \
-            --authorized-keys ${REPO_DIR}/authorized_keys \
-            ${REPLICA_EXTRA_ARGS:-} \
-        >/tmp/melin-server.log 2>&1 </dev/null &" </dev/null
-
-    ssh $SSH_OPTS "$REPLICA2" "pkill -f '[m]elin-server.rumcast' 2>/dev/null; pkill -x melin-server 2>/dev/null; true"
-    sleep 1
-    ssh $SSH_OPTS "$REPLICA2" "NO_COLOR=1 RUST_LOG=${BENCH_RUST_LOG} ${RUMCAST_DIAG_ENV}nohup ${REPO_DIR}/target/release/melin-server.rumcast \
-            --bind ${REPLICA2_VLAN}:9876 \
-            --replica-of ${SERVER_VLAN}:${REPL_PORT} \
-            --replication-key ${REPO_DIR}/repl.key \
-            --journal ${replica2_journal} \
-            --authorized-keys ${REPO_DIR}/authorized_keys \
-            ${REPLICA_EXTRA_ARGS:-} \
-        >/tmp/melin-server.log 2>&1 </dev/null &" </dev/null
-
-    wait_for_log "$SERVER" "/tmp/melin-server.log" "rumcast standalone server up" 120 "Rumcast primary"
-    CURRENT_BIND="${SERVER_VLAN}:9876"
-    CURRENT_HEALTH="${SERVER_VLAN}:9878"
-
-    perf_capture_start "udp-dual-repl"
-}
-
-transport_stop_udp_dual_repl() {
     perf_capture_stop
     stop_servers "$SERVER" "$REPLICA" "$REPLICA2"
     if [[ "${SKIP_JOURNAL_VERIFY:-0}" == "1" ]]; then
@@ -1753,8 +1439,6 @@ workload_throughput() {
                 --json /tmp/bench-results.json \
                 ${BENCH_DPDK_ARGS} ${warmup_arg} ${cooldown_arg} ${threads_arg} \
                 ${THROUGHPUT_ORDERS} --clients ${THROUGHPUT_CLIENTS} --window ${THROUGHPUT_WINDOW}"
-    elif [[ "$transport" == udp* ]]; then
-        run_bench_rumcast "$CURRENT_BIND" "${THROUGHPUT_ORDERS}" --clients "${THROUGHPUT_CLIENTS}" --window "${THROUGHPUT_WINDOW}"
     else
         run_bench "$CURRENT_BIND" "$CURRENT_HEALTH" "${THROUGHPUT_ORDERS}" --clients "${THROUGHPUT_CLIENTS}" --window "${THROUGHPUT_WINDOW}"
     fi
@@ -1784,8 +1468,6 @@ workload_single() {
                 --json /tmp/bench-results.json \
                 ${BENCH_DPDK_ARGS} ${warmup_arg} ${cooldown_arg} \
                 ${SINGLE_ORDERS} --clients 1 --window 1"
-    elif [[ "$transport" == udp* ]]; then
-        run_bench_rumcast "$CURRENT_BIND" "${SINGLE_ORDERS}" --clients 1 --window 1
     else
         run_bench "$CURRENT_BIND" "$CURRENT_HEALTH" "${SINGLE_ORDERS}" --clients 1 --window 1
     fi
