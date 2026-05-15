@@ -56,18 +56,10 @@ const BATCH_BUF_CAPACITY: usize = 512 * 1024;
 /// produce interchangeable layouts. Renamed locally for legibility.
 const HEADER_OFFSET: u64 = ENTRY_OFFSET;
 
-/// Pre-allocation chunk size (256 MiB), overridable via
-/// `MELIN_JOURNAL_PREALLOC_MIB` for tests. Mirrors the O_DIRECT writer's
-/// default so a switch between writers doesn't change disk-space cadence.
-const DEFAULT_PREALLOC_CHUNK: u64 = 256 * 1024 * 1024;
-
-fn prealloc_chunk_bytes() -> u64 {
-    std::env::var("MELIN_JOURNAL_PREALLOC_MIB")
-        .ok()
-        .and_then(|s| s.parse::<u64>().ok())
-        .map(|m| m.max(1) * 1024 * 1024)
-        .unwrap_or(DEFAULT_PREALLOC_CHUNK)
-}
+// Pre-allocation chunk size is resolved by the shared `prealloc` module
+// so a switch between this writer and `SectorWriter` doesn't change
+// disk-space cadence under matched configuration.
+use crate::prealloc::prealloc_chunk_bytes;
 
 /// Append-only journal writer that goes through the kernel page cache
 /// and forces durability with `fdatasync` per flush.

@@ -22,12 +22,16 @@ pub mod event;
 pub mod fresh_replica;
 pub(crate) mod le;
 pub mod mode;
+pub(crate) mod prealloc;
 pub mod preparer;
 pub mod reader;
 pub mod replication;
 pub mod sector_writer;
 pub mod segment;
 pub mod write;
+
+#[cfg(feature = "test-utils")]
+pub mod test_utils;
 
 pub use buffered_writer::BufferedWriter;
 pub use error::JournalError;

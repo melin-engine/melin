@@ -20,6 +20,11 @@ hash-chain = ["dep:blake3"]
 ## must leave this off; with `no-o-direct` enabled, durability becomes
 ## best-effort (no per-batch flush).
 no-o-direct = []
+## Expose `test_utils` hooks used by consuming crates' tests — notably
+## an in-process override for the prealloc chunk size, so recovery
+## stress tests avoid the 256 MiB fallocate per iteration. Activate
+## from `[dev-dependencies]` only; production builds must leave this off.
+test-utils = []
 
 [dependencies]
 blake3 = { version = "1", optional = true }

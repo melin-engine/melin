@@ -1927,11 +1927,20 @@ mod tests {
     /// from the file header through the valid data end. For each truncation,
     /// verify that recovery succeeds and the engine can continue appending.
     ///
-    /// Uses a small workload (5 events) to keep the byte range manageable
-    /// (~500 bytes → ~500 iterations). The larger workload is exercised
-    /// by `crash_recovery_under_realistic_load` with sampled truncation points.
+    /// Shrinks the journal prealloc chunk to 1 MiB for this test so the
+    /// per-iteration `fallocate` doesn't dominate wall time, and runs the
+    /// truncation grid across all available cores — each iteration is
+    /// independent (its own work file, its own truncation point), and the
+    /// per-iteration cost is overwhelmingly kernel I/O wait (fallocate +
+    /// fdatasync), so the workers add negligible CPU pressure for
+    /// neighbouring tests.
     #[test]
     fn crash_at_every_byte_offset_recovers() {
+        // Shrink the prealloc chunk so each `recover()` reopen-for-append
+        // doesn't pay the 256 MiB fallocate cost. Persists for the rest
+        // of the process, but only matters here.
+        melin_journal::test_utils::set_prealloc_chunk_bytes_override(Some(1024 * 1024));
+
         let dir = tempfile::tempdir().unwrap();
         let original = dir.path().join("original.journal");
 
@@ -1959,10 +1968,9 @@ mod tests {
         let header_end = melin_journal::codec::FILE_HEADER_SIZE as u64;
         assert!(end > header_end, "journal should have data beyond header");
 
-        let work = dir.path().join("work.journal");
-
-        // Shrink the original to its valid data size. The pre-allocated file
-        // is 256 MiB; copying that per iteration dominates runtime.
+        // Shrink the original to its valid data size. The pre-allocated
+        // tail (1 MiB under the override above) would otherwise be
+        // copied per iteration.
         {
             let f = std::fs::OpenOptions::new()
                 .write(true)
@@ -1971,32 +1979,53 @@ mod tests {
             f.set_len(end).unwrap();
         }
 
-        for trunc_at in header_end..=end {
-            // Copy the (now small) original and truncate.
-            copy_file(&original, &work);
-            {
-                let f = std::fs::OpenOptions::new().write(true).open(&work).unwrap();
-                f.set_len(trunc_at).unwrap();
+        // Parallelize across worker threads. Each iteration is
+        // independent (its own truncation point, its own work file), so
+        // the loop scales near-linearly with cores. Per-iteration cost
+        // is dominated by kernel I/O wait (small `fallocate` + the
+        // post-recovery `fdatasync`), so the workers add negligible CPU
+        // pressure for neighbouring tests under nextest.
+        let num_threads = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(4);
+        let work_dir = dir.path().to_path_buf();
+        std::thread::scope(|scope| {
+            for tid in 0..num_threads {
+                let original = &original;
+                let work_dir = &work_dir;
+                scope.spawn(move || {
+                    // Per-thread work file so concurrent recoveries
+                    // don't trample each other's truncated journal.
+                    let work = work_dir.join(format!("work-{tid}.journal"));
+                    // Stride the offset range across threads so each
+                    // worker sees a mix of small and large truncations
+                    // — keeps per-thread workload balanced even when
+                    // recovery cost varies with truncation point.
+                    let mut trunc_at = header_end + tid as u64;
+                    while trunc_at <= end {
+                        copy_file(original, &work);
+                        {
+                            let f = std::fs::OpenOptions::new().write(true).open(&work).unwrap();
+                            f.set_len(trunc_at).unwrap();
+                        }
+
+                        let mut je = TestExchange::recover(&work).unwrap();
+                        assert!(je.next_sequence() >= 1, "seq underflow at byte {trunc_at}");
+
+                        je.deposit(ACCT_A, USD, 1).unwrap();
+
+                        drop(je);
+                        let je2 = TestExchange::recover(&work).unwrap();
+                        assert!(
+                            je2.next_sequence() >= 2,
+                            "double-recovery seq too low at byte {trunc_at}"
+                        );
+
+                        trunc_at += num_threads as u64;
+                    }
+                });
             }
-
-            // Recovery must not panic or error.
-            let mut je = TestExchange::recover(&work).unwrap();
-
-            // Sequence must be valid (at least 1, the starting point for an empty journal).
-            assert!(je.next_sequence() >= 1, "seq underflow at byte {trunc_at}");
-
-            // Must be able to append after recovery.
-            je.deposit(ACCT_A, USD, 1).unwrap();
-
-            // Double-recovery of the post-append journal must also succeed.
-            drop(je);
-            let je2 = TestExchange::recover(&work).unwrap();
-            // At least 2: the deposit we appended (seq 1) + next is 2.
-            assert!(
-                je2.next_sequence() >= 2,
-                "double-recovery seq too low at byte {trunc_at}"
-            );
-        }
+        });
     }
 
     /// Crash during or after snapshot-based rotation: truncate the *new*

@@ -58,25 +58,10 @@ const MAX_ENTRY_SIZE: usize = 144;
 /// Pre-allocated once, reused across batches.
 const BATCH_BUF_CAPACITY: usize = 512 * 1024;
 
-/// Default pre-allocation chunk size (256 MiB). Matches the default journal
-/// rotation threshold so that a freshly created journal never needs mid-run
-/// extension. At ~80 bytes per entry, one chunk covers ~3.2M entries. If the
-/// journal does exceed this (large rotation threshold or disabled rotation),
-/// it extends by one more chunk — but this is exceedingly rare.
-const DEFAULT_PREALLOC_CHUNK: u64 = 256 * 1024 * 1024;
-
-/// Pre-allocation chunk size, overridable via `MELIN_JOURNAL_PREALLOC_MIB`.
-/// Used by integration tests that spawn the server binary to shrink the
-/// per-startup `posix_fallocate` + prefault cost from 256 MiB to a few MiB,
-/// shaving seconds off suite wall-time. Floored at 1 MiB. Read once per
-/// extension, off the hot path.
-fn prealloc_chunk_bytes() -> u64 {
-    std::env::var("MELIN_JOURNAL_PREALLOC_MIB")
-        .ok()
-        .and_then(|s| s.parse::<u64>().ok())
-        .map(|m| m.max(1) * 1024 * 1024)
-        .unwrap_or(DEFAULT_PREALLOC_CHUNK)
-}
+// Pre-allocation chunk size is resolved by the shared `prealloc`
+// module (env override `MELIN_JOURNAL_PREALLOC_MIB`, 256 MiB default).
+// Read once per extension, off the hot path.
+use crate::prealloc::prealloc_chunk_bytes;
 
 /// Default number of events between automatic hash chain checkpoints.
 /// 100K events × ~80 bytes = ~8 MB of journal data between checkpoints.
