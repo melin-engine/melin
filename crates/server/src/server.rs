@@ -912,8 +912,7 @@ where
     // Event publisher is trading-only (market-data book mirrors); the
     // noop build silently ignores `--event-bind` so the same invocation
     // works against either binary.
-    let enable_event_publisher =
-        cfg!(all(feature = "trading", not(feature = "noop"))) && config.event_bind.is_some();
+    let enable_event_publisher = cfg!(feature = "trading") && config.event_bind.is_some();
     let Pipeline {
         input_producer,
         journal_stage,
@@ -2422,17 +2421,12 @@ where
     )
 }
 
-/// Build a fresh, empty application. The concrete constructor is
-/// feature-gated: trading uses the production pre-sized `Exchange`; noop
-/// uses the trivial `NoopApp`. Everything downstream of this call is
-/// application-agnostic via the `Application` trait.
 /// Apply operator-set runtime knobs that aren't carried in the journal /
 /// snapshot. Called on every fresh / recovered / restored engine — the
 /// per-account open-order cap (SEC-03) and the order-submission rate
 /// limit (SEC-04) live in `Exchange` state but are operator policy, so
 /// primary and replicas must converge on them via configuration rather
 /// than replay.
-#[cfg(all(feature = "trading", not(feature = "noop")))]
 pub fn apply_max_orders(
     app: &mut App,
     max_orders_per_account: u32,
@@ -2475,23 +2469,8 @@ pub fn apply_max_orders(
     );
 }
 
-#[cfg(all(feature = "noop", not(feature = "trading")))]
-pub fn apply_max_orders(
-    _app: &mut App,
-    _max_orders_per_account: u32,
-    _max_orders_per_second: u32,
-    _max_orders_burst: u32,
-) {
-}
-
-#[cfg(all(feature = "trading", not(feature = "noop")))]
 pub(crate) fn empty_app() -> App {
     melin_engine::exchange::Exchange::with_capacity()
-}
-
-#[cfg(all(feature = "noop", not(feature = "trading")))]
-pub(crate) fn empty_app() -> App {
-    melin_noop::NoopApp::new()
 }
 
 /// Build a fresh, empty application sized for a known bulk-seed workload.
@@ -2504,7 +2483,6 @@ pub(crate) fn empty_app() -> App {
 /// itself does bulk seeding). Replica receivers and other paths use
 /// [`empty_app`] because they reconstruct state from snapshots / replicated
 /// frames, both of which already size their HashMap from a known count.
-#[cfg(all(feature = "trading", not(feature = "noop")))]
 pub(crate) fn empty_app_for_seed(config: &ServerConfig) -> App {
     let mut ex = melin_engine::exchange::Exchange::with_seed_capacity(
         config.accounts as usize,
@@ -2517,11 +2495,6 @@ pub(crate) fn empty_app_for_seed(config: &ServerConfig) -> App {
         config.max_orders_burst,
     );
     ex
-}
-
-#[cfg(all(feature = "noop", not(feature = "trading")))]
-pub(crate) fn empty_app_for_seed(_config: &ServerConfig) -> App {
-    melin_noop::NoopApp::new()
 }
 
 /// Initialize or recover the journaled application from disk.
@@ -2632,7 +2605,7 @@ where
 /// publisher is trading-only (it depends on `melin-market-data` for book
 /// mirrors); under the noop build this is a no-op and `consumer` is
 /// always `None`.
-#[cfg(all(feature = "trading", not(feature = "noop")))]
+#[cfg(feature = "trading")]
 fn spawn_event_publisher(
     consumer: Option<melin_disruptor::ring::Consumer<crate::OutputSlot>>,
     config: &ServerConfig,
@@ -2667,7 +2640,7 @@ fn spawn_event_publisher(
     Ok(Some(event_handle))
 }
 
-#[cfg(all(feature = "noop", not(feature = "trading")))]
+#[cfg(not(feature = "trading"))]
 fn spawn_event_publisher(
     consumer: Option<melin_disruptor::ring::Consumer<crate::OutputSlot>>,
     _config: &ServerConfig,

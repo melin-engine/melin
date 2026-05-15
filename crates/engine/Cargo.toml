@@ -34,6 +34,13 @@ no-o-direct = [
     "melin-journal/no-o-direct",
     "melin-transport-core/no-o-direct",
 ]
+## Replace the trading `Application` impl on `Exchange` with a trivial
+## journal-then-reject pass. Used by the server's `noop` feature to
+## isolate transport throughput from matching cost — same wire types
+## and same dep graph, just every event short-circuits to a rejection.
+## All Exchange business methods (`execute`, `cancel`, …) still
+## compile but are unreachable from the pipeline under this feature.
+noop = []
 
 default = []
 

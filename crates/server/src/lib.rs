@@ -14,15 +14,11 @@ compile_error!(
 
 /// The concrete [`Application`] this server is built against.
 ///
-/// With `--features trading` (default): the full matching engine.
-/// With `--features noop --no-default-features`: the transport-only
-/// benchmark app. Downstream modules refer to it as [`App`] so there is
-/// a single place to swap.
-#[cfg(all(feature = "trading", not(feature = "noop")))]
+/// Always `Exchange` — under `--features noop` the engine's `noop`
+/// feature short-circuits `Exchange::execute` to a single rejection
+/// per `SubmitOrder` so the matching hot path is bypassed, but the
+/// type stays uniform for downstream modules.
 pub type App = melin_engine::exchange::Exchange;
-
-#[cfg(all(feature = "noop", not(feature = "trading")))]
-pub type App = melin_noop::NoopApp;
 
 /// Trading-bound ring-slot aliases. The server operates on the trading
 /// wire format regardless of which application is plugged in (that's

@@ -1012,8 +1012,25 @@ impl Exchange {
     ///
     /// Validates the instrument exists, reserves funds, then executes.
     /// On fill, balances are updated. On reject/cancel, reserves are released.
+    ///
+    /// Under `feature = "noop"` the body is short-circuited to a single
+    /// `Rejected{NoLiquidity}` push, used by the server's transport-only
+    /// benchmark build to isolate transport throughput from matching
+    /// cost. Same wire shape — bench clients still see one response
+    /// per `SubmitOrder` — but no order book / account state touched.
     #[inline]
     pub fn execute(&mut self, symbol: Symbol, order: Order, reports: &mut Vec<ExecutionReport>) {
+        #[cfg(feature = "noop")]
+        {
+            reports.push(ExecutionReport::Rejected {
+                order_id: order.id,
+                symbol,
+                account: order.account,
+                reason: RejectReason::NoLiquidity,
+            });
+            return;
+        }
+        #[cfg_attr(feature = "noop", allow(unreachable_code))]
         let Some(inst) = inst_ref(&self.instruments, symbol) else {
             reports.push(ExecutionReport::Rejected {
                 order_id: order.id,

@@ -10,19 +10,16 @@ default = ["trading", "hash-chain", "release-tracing"]
 ## tracing filter check (~5-10ns) on every call site in the hot path.
 ## Disable with --no-default-features to get RUST_LOG=debug back.
 release-tracing = ["tracing/max_level_info"]
-## App selection: either `trading` (the real matching engine, via
-## `melin-engine::Exchange`) or `noop` (the transport-only benchmark
-## app, via `melin-noop::NoopApp`). Exactly one must be enabled;
-## `cargo build --features noop --no-default-features` drops
-## `melin-engine` from the dependency tree entirely. `noop` pulls in
-## `hash-chain` (required for replication) and `release-tracing` so
-## the noop binary behaves identically to the default trading build
-## in all transport-level functionality. `melin-market-data` is
-## trading-only (book mirrors for the event publisher), so it piggy-
-## backs on the `trading` feature.
-trading = ["dep:melin-engine", "dep:melin-market-data"]
-noop = ["dep:melin-noop", "hash-chain", "release-tracing"]
-no-persist = ["melin-engine?/no-persist", "melin-transport-core/no-persist"]
+## App selection: `trading` is the real matching engine, `noop`
+## short-circuits `Exchange::execute` to a single rejection (used to
+## isolate transport throughput from matching cost). Exactly one must
+## be enabled; `melin-market-data` is trading-only and piggy-backs on
+## `trading`. The noop build still links `melin-engine`, but every
+## `SubmitOrder` is bypassed by the engine's `noop` feature so the
+## matching hot path is never exercised.
+trading = ["dep:melin-market-data"]
+noop = ["melin-engine/noop", "hash-chain", "release-tracing"]
+no-persist = ["melin-engine/no-persist", "melin-transport-core/no-persist"]
 ## Lightweight per-stage histograms for the original 4 stages
 ## (journal/matching wakeup + execute, journal batch). Adds ~3-5 mutex
 ## locks per event on the hot path; appropriate for narrow debugging
@@ -30,7 +27,7 @@ no-persist = ["melin-engine?/no-persist", "melin-transport-core/no-persist"]
 ## off — slot sizes grow by 16 bytes per InputSlot/OutputSlot to carry
 ## the trace timestamps.
 latency-trace = [
-    "melin-engine?/latency-trace",
+    "melin-engine/latency-trace",
     "melin-transport-core/latency-trace",
     "melin-protocol/latency-trace",
 ]
@@ -44,16 +41,16 @@ tick-to-trade = ["latency-trace"]
 ## Kept for backward compatibility — io_uring is now always used.
 io-uring = []
 dpdk = ["dep:melin-dpdk", "melin-dpdk/dpdk-sys"]
-pipeline-stats = ["melin-engine?/pipeline-stats", "melin-transport-core/pipeline-stats"]
+pipeline-stats = ["melin-engine/pipeline-stats", "melin-transport-core/pipeline-stats"]
 hash-chain = [
-    "melin-engine?/hash-chain",
+    "melin-engine/hash-chain",
     "melin-journal/hash-chain",
     "melin-transport-core/hash-chain",
 ]
 ## Open the journal without `O_DIRECT`. Passthrough — see the
 ## `melin-journal` feature of the same name. Benchmarking only.
 no-o-direct = [
-    "melin-engine?/no-o-direct",
+    "melin-engine/no-o-direct",
     "melin-journal/no-o-direct",
     "melin-transport-core/no-o-direct",
 ]
@@ -73,8 +70,7 @@ required-features = ["noop"]
 
 [dependencies]
 melin-app = { path = "../app" }
-melin-engine = { path = "../engine", optional = true }
-melin-noop = { path = "../noop", optional = true }
+melin-engine = { path = "../engine" }
 melin-journal = { path = "../journal" }
 melin-trading = { path = "../trading" }
 melin-transport-core = { path = "../transport-core" }
