@@ -66,6 +66,12 @@ pub struct GeneratorConfig {
     /// new submits that replenish the book. Must satisfy
     /// `cancel_ratio + cancel_replace_ratio < 1.0`.
     /// Default: 0.60 (with cancel_replace at 0.30, total cancel+amend = 0.90).
+    ///
+    // TODO(calibration): real-venue removes-per-add is ~1.07; this generator
+    // converges to ~1.5 in steady state because ring-buffer eviction adds
+    // synthetic cancels on top of the configured ratio. Either widen the live
+    // ring or rework `generate_cancel` so eviction-driven cancels are not
+    // counted against the rate budget.
     pub cancel_ratio: f64,
     /// Mid-price around which limit orders are placed (in ticks).
     pub mid_price: u64,
@@ -73,17 +79,47 @@ pub struct GeneratorConfig {
     /// Empirical: ~1.5. Higher = orders cluster tighter around mid.
     pub price_alpha: f64,
     /// Maximum price offset from mid (in ticks).
+    //
+    // TODO(calibration): real venues show p99.9 distance-from-mid four orders
+    // of magnitude beyond `max_price_offset` (deep "rejection floor" /
+    // protection-order ladder). The hard cap should be replaced with a
+    // heavy-tailed sampler so the tail of the distance distribution can be
+    // matched.
     pub max_price_offset: u64,
-    /// Power-law exponent for order sizes.
+    /// Power-law exponent for order sizes (continuous tail).
     /// Empirical: ~1.5-2.5.
     pub size_alpha: f64,
     /// Minimum order size.
     pub min_size: u64,
     /// Maximum order size.
     pub max_size: u64,
+    /// Modal lot size — the dominant exact share count produced by the
+    /// discrete mixture in `pick_size`. Real equity flow is dominated by
+    /// round-lot orders (e.g., 100 shares on NASDAQ-listed names), so a
+    /// pure power-law over `[min_size, max_size]` undersizes the body of
+    /// the distribution. Set to 1 to fall back to pure power-law sampling.
+    pub round_lot_size: u64,
+    /// Fraction of submits below the modal round lot (odd-lot retail and
+    /// algo slicing). Sampled from the size power-law clamped to
+    /// `[min_size, round_lot_size - 1]`. Default: 0.15.
+    pub odd_lot_fraction: f64,
+    /// Fraction of submits placed at exactly `round_lot_size`. This is
+    /// the dominant mass in real equity flow. Default: 0.70.
+    pub modal_lot_fraction: f64,
+    /// Fraction of submits at 2×, 3×, 5×, or 10× the modal round lot,
+    /// weighted toward the smaller multiples. Default: 0.10.
+    pub multi_round_fraction: f64,
     /// Probability that a new order is aggressive (crosses the spread).
     /// Aggressive buys are placed above mid, aggressive sells below mid,
     /// producing immediate fills. Default: 0.10 (10% of submits fill).
+    //
+    // TODO(calibration): aggression is currently a flat per-submit Bernoulli;
+    // real markets condition it on book imbalance and spread compression.
+    // Once that's modeled, crossing-Adds should also be suppressed at the
+    // adapter (real ITCH never broadcasts an Add for an order that crosses
+    // at submit time — those surface only as Executes against resting
+    // liquidity), so the crossing-fraction comparison becomes apples-to-apples
+    // instead of structurally zero on the ITCH side.
     pub aggression_ratio: f64,
     /// Probability that a submit is a market order (no price, IOC-like).
     /// Default: 0.05 (5% of submits).
@@ -134,7 +170,11 @@ impl Default for GeneratorConfig {
             max_price_offset: 200,
             size_alpha: 2.0,
             min_size: 1,
-            max_size: 1000,
+            max_size: 100_000,
+            round_lot_size: 100,
+            odd_lot_fraction: 0.25,
+            modal_lot_fraction: 0.65,
+            multi_round_fraction: 0.07,
             aggression_ratio: 0.10,
             market_order_ratio: 0.05,
             ioc_ratio: 0.05,
@@ -520,11 +560,50 @@ impl OrderFlowGenerator {
         Price(NonZeroU64::new(price_val).expect("price > 0"))
     }
 
-    /// Pick an order size from a power-law distribution.
+    /// Pick an order size from a discrete-plus-tail mixture. Real equity
+    /// flow has heavy mass at the modal round lot (e.g., 100 shares on
+    /// NASDAQ-listed names) and lighter mass on integer multiples, with
+    /// odd lots filling the sub-modal range and a power-law tail
+    /// capturing institutional blocks. A pure power-law produces a
+    /// continuous distribution that doesn't reproduce this shape.
     fn pick_size(&mut self) -> Quantity {
+        let cfg = &self.config;
         let u: f64 = self.unit_dist.sample(&mut self.rng);
-        let raw = self.config.min_size as f64 * fast_powf(1.0 - u, self.size_exponent);
-        let size = (raw as u64).clamp(self.config.min_size, self.config.max_size);
+        let size = if cfg.round_lot_size <= 1 {
+            // Round-lot snapping disabled: fall back to pure power-law.
+            let raw = cfg.min_size as f64 * fast_powf(1.0 - u, self.size_exponent);
+            (raw as u64).clamp(cfg.min_size, cfg.max_size)
+        } else if u < cfg.odd_lot_fraction {
+            // Odd lots below the modal round lot. Reuses the size
+            // power-law, clamped to the sub-modal range.
+            let v = self.unit_dist.sample(&mut self.rng);
+            let raw = cfg.min_size as f64 * fast_powf(1.0 - v, self.size_exponent);
+            (raw as u64).clamp(cfg.min_size, cfg.round_lot_size.saturating_sub(1).max(1))
+        } else if u < cfg.odd_lot_fraction + cfg.modal_lot_fraction {
+            // Modal mass — the dominant exact round lot.
+            cfg.round_lot_size
+        } else if u < cfg.odd_lot_fraction + cfg.modal_lot_fraction + cfg.multi_round_fraction {
+            // Other round lots at integer multiples of the modal size,
+            // weighted toward smaller multiples (which dominate real
+            // flow: 200 > 300 > 500 > 1000).
+            let v: f64 = self.unit_dist.sample(&mut self.rng);
+            let multiplier: u64 = if v < 0.4 {
+                2
+            } else if v < 0.6 {
+                3
+            } else if v < 0.8 {
+                5
+            } else {
+                10
+            };
+            (cfg.round_lot_size * multiplier).min(cfg.max_size)
+        } else {
+            // Heavy tail: power-law starting from the modal size, capturing
+            // institutional block orders.
+            let v = self.unit_dist.sample(&mut self.rng);
+            let raw = cfg.round_lot_size as f64 * fast_powf(1.0 - v, self.size_exponent);
+            (raw as u64).clamp(cfg.round_lot_size, cfg.max_size)
+        };
         Quantity(NonZeroU64::new(size).expect("size > 0"))
     }
 
@@ -586,6 +665,65 @@ mod tests {
             }
         }
         assert!(max_id > 0);
+    }
+
+    #[test]
+    fn size_mixture_produces_modal_round_lot_majority() {
+        // With the default mixture (modal_lot_fraction=0.70 at round_lot_size=100),
+        // a large sample should show >60% orders at exactly 100 shares.
+        let mut ofg = OrderFlowGenerator::new(GeneratorConfig::default());
+        let mut total = 0usize;
+        let mut at_modal = 0usize;
+        let mut sub_modal = 0usize;
+        for _ in 0..20_000 {
+            if let GeneratedEvent::Submit { order, .. } = ofg.next_event() {
+                let q = order.quantity.get();
+                total += 1;
+                if q == 100 {
+                    at_modal += 1;
+                } else if q < 100 {
+                    sub_modal += 1;
+                }
+            }
+        }
+        let modal_frac = at_modal as f64 / total as f64;
+        let sub_frac = sub_modal as f64 / total as f64;
+        assert!(
+            modal_frac > 0.6,
+            "expected >60% of orders at modal size 100, got {modal_frac:.4}"
+        );
+        // Odd-lot mass should be non-trivial too (we want some sub-100 orders).
+        assert!(
+            (0.05..0.30).contains(&sub_frac),
+            "odd-lot fraction off: {sub_frac:.4}"
+        );
+    }
+
+    #[test]
+    fn size_mixture_disabled_falls_back_to_power_law() {
+        // round_lot_size=1 disables the mixture and restores pure power-law.
+        let config = GeneratorConfig {
+            round_lot_size: 1,
+            ..Default::default()
+        };
+        let mut ofg = OrderFlowGenerator::new(config);
+        let mut at_modal = 0usize;
+        let mut total = 0usize;
+        for _ in 0..5_000 {
+            if let GeneratedEvent::Submit { order, .. } = ofg.next_event() {
+                if order.quantity.get() == 100 {
+                    at_modal += 1;
+                }
+                total += 1;
+            }
+        }
+        // With pure power-law alpha=2.0, exactly-100 should be vanishingly
+        // rare — well under the modal-mixture rate.
+        let frac = at_modal as f64 / total as f64;
+        assert!(
+            frac < 0.05,
+            "without mixture, exact-100 mass should stay <5%, got {frac:.4}"
+        );
     }
 
     #[test]
