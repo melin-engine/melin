@@ -10,6 +10,7 @@
 
 pub mod book;
 pub mod itch;
+pub mod stats;
 
 /// Order side. Buys and sells are kept symmetric throughout the
 /// pipeline; ratios are reported per-side so imbalance is visible.
