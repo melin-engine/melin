@@ -1,4 +1,4 @@
-//! Snapshot save/load for Exchange state.
+//! Payload codec for Exchange snapshot state.
 //!
 //! Snapshots bridge version boundaries: before an engine upgrade, snapshot
 //! current state; the new version loads the snapshot and starts a fresh
@@ -8,23 +8,14 @@
 //! Uses manual binary serialization (same approach as the journal codec)
 //! to avoid serde dependency.
 //!
-//! ## File format (v15)
-//!
-//! | Field          | Type    | Bytes | Purpose                            |
-//! |----------------|---------|-------|------------------------------------|
-//! | file_magic     | u32     | 4     | `0x534E4150` ("SNAP")              |
-//! | format_version | u16     | 2     | Current version = 17               |
-//! | reserved       | u16     | 2     | Padding, zeroed                    |
-//! | sequence       | u64     | 8     | Journal sequence at snapshot       |
-//! | chain_hash     | [u8;32] | 32    | BLAKE3 hash chain state            |
-//! | data           | ...     | var   | Serialized Exchange state          |
-//! | crc32c         | u32     | 4     | CRC32C of everything above         |
+//! On-disk framing (magic, versions, sequence, chain hash, CRC, atomic
+//! rename) lives in `melin_transport_core::snapshot` — generic over the
+//! `melin_app::Application` trait, which `Exchange` implements in
+//! `application_impl.rs`. This module owns the engine-specific payload
+//! bytes only.
 
 use std::collections::HashMap as StdHashMap;
-use std::fs::{self, File};
-use std::io::{Read, Write};
 use std::num::NonZeroU64;
-use std::path::Path;
 
 use crate::account::{AccountManager, Balance};
 use crate::exchange::Exchange;
@@ -44,10 +35,9 @@ type RestingLevels = Vec<(Price, Vec<RestingOrderSnapshot>)>;
 /// Decoded stop-side levels: Vec of (trigger_price, stops-at-that-level).
 type StopLevels = Vec<(Price, Vec<PendingStopSnapshot>)>;
 
-/// Snapshot file magic: "SNAP" in ASCII (little-endian u32).
-const SNAP_MAGIC: u32 = 0x534E_4150;
-
-/// Current snapshot format version.
+/// Current snapshot payload version. Surfaced through
+/// `<Exchange as Application>::APP_VERSION` and embedded in the on-disk
+/// frame by the transport.
 /// v1 → v2: added SelfTradeProtection byte to PendingStopSnapshot.
 /// v2 → v3: added per-account OrderId high-water marks for client dedup.
 /// v3 → v4: added per-instrument RiskLimits for fat finger checks.
@@ -84,12 +74,7 @@ const SNAP_MAGIC: u32 = 0x534E_4150;
 ///            restore. v18 carries the bucket map (`account`, `tokens`,
 ///            `last_refill_ns`) so primary and replica converge bit-for-
 ///            bit on the very next event after restore.
-const SNAP_VERSION: u16 = 18;
-
-/// Re-exports for callers that serialize the Exchange payload without the
-/// full on-disk framing — e.g. the `melin-app::Application` impl which
-/// hands its snapshot stream to the transport for wrapping.
-pub(crate) const PAYLOAD_VERSION: u16 = SNAP_VERSION;
+pub(crate) const PAYLOAD_VERSION: u16 = 18;
 
 /// Encode the Exchange's full state (the "payload" portion of a snapshot —
 /// everything between the header and the CRC) into a freshly allocated
@@ -110,140 +95,6 @@ pub(crate) fn encode_exchange_payload(exchange: &Exchange) -> Vec<u8> {
 pub(crate) fn decode_exchange_payload(buf: &[u8], version: u16) -> Result<Exchange, JournalError> {
     let (_consumed, state) = decode_exchange_state(buf, version)?;
     Ok(Exchange::restore_state(state))
-}
-
-/// Snapshot header size: magic(4) + version(2) + reserved(2) + sequence(8) + chain_hash(32) = 48.
-const SNAP_HEADER_SIZE: usize = 48;
-
-/// Maximum snapshot file size (256 MiB). Prevents OOM from malicious or corrupt
-/// files. A snapshot with millions of orders is well under this limit.
-const MAX_SNAPSHOT_SIZE: u64 = 256 * 1024 * 1024;
-
-/// Save a snapshot of the exchange state to disk.
-///
-/// The `journal_sequence` records the journal position at snapshot time,
-/// so recovery knows where to start replaying. The `chain_hash` stores
-/// the BLAKE3 hash chain state so recovery can resume the chain without
-/// replaying from genesis.
-pub fn save(
-    exchange: &Exchange,
-    journal_sequence: u64,
-    chain_hash: [u8; 32],
-    path: &Path,
-) -> Result<(), JournalError> {
-    // Vec used as a growable byte buffer — avoids multiple small writes
-    // to disk. The entire snapshot is built in memory then written atomically.
-    let mut buf = Vec::with_capacity(4096);
-
-    // Header: magic(4) + version(2) + reserved(2) + sequence(8) + chain_hash(32).
-    buf.extend_from_slice(&SNAP_MAGIC.to_le_bytes());
-    buf.extend_from_slice(&SNAP_VERSION.to_le_bytes());
-    buf.extend_from_slice(&0u16.to_le_bytes());
-    buf.extend_from_slice(&journal_sequence.to_le_bytes());
-    buf.extend_from_slice(&chain_hash);
-
-    // Serialize exchange state.
-    let state = exchange.snapshot_state();
-    encode_exchange_state(&state, &mut buf);
-
-    // CRC32C over everything.
-    let crc = crc32c::crc32c(&buf);
-    buf.extend_from_slice(&crc.to_le_bytes());
-
-    // Write atomically: temp file → fsync → rotate previous → rename.
-    // A crash mid-write leaves only the temp file; the previous snapshot
-    // (if any) is intact. The `.prev` copy allows operators to roll back
-    // if the latest snapshot is corrupt or contains undesired state.
-    let tmp_path = path.with_extension("snap.tmp");
-    let mut file = File::create(&tmp_path)?;
-    file.write_all(&buf)?;
-    file.sync_data()?;
-    drop(file);
-
-    // Rotate: preserve the current snapshot as `.snapshot.prev` before
-    // overwriting. Best-effort — if the current snapshot doesn't exist
-    // (first save) or the rename fails, we proceed anyway.
-    let prev_path = path.with_extension("snapshot.prev");
-    let _ = fs::rename(path, &prev_path);
-
-    fs::rename(&tmp_path, path)?;
-
-    Ok(())
-}
-
-/// Load a snapshot from disk. Returns the Exchange, the journal sequence
-/// number at which to resume replay, and the BLAKE3 chain hash.
-pub fn load(path: &Path) -> Result<(Exchange, u64, [u8; 32]), JournalError> {
-    let mut file = File::open(path)?;
-
-    // Check file size before reading to prevent OOM on malicious files.
-    let metadata = file.metadata()?;
-    if metadata.len() > MAX_SNAPSHOT_SIZE {
-        return Err(JournalError::CorruptEntry {
-            sequence: 0,
-            reason: "snapshot file exceeds size limit",
-        });
-    }
-
-    let mut buf = Vec::new();
-    file.read_to_end(&mut buf)?;
-
-    // Validate header magic first (before size check, since header size
-    // depends on version).
-    if buf.len() < 8 {
-        return Err(JournalError::TruncatedEntry);
-    }
-    let magic = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]);
-    if magic != SNAP_MAGIC {
-        return Err(JournalError::InvalidFile);
-    }
-    let version = u16::from_le_bytes([buf[4], buf[5]]);
-
-    // Pre-production: only the current version is accepted. Older snapshot
-    // formats are intentionally not loadable while the on-disk layout is
-    // still in flux.
-    if version != SNAP_VERSION {
-        return Err(JournalError::UnsupportedVersion { version });
-    }
-    let header_size = SNAP_HEADER_SIZE;
-
-    if buf.len() < header_size + 4 {
-        return Err(JournalError::TruncatedEntry);
-    }
-
-    // Validate CRC.
-    let data_len = buf.len() - 4;
-    let expected_crc = u32::from_le_bytes([
-        buf[data_len],
-        buf[data_len + 1],
-        buf[data_len + 2],
-        buf[data_len + 3],
-    ]);
-    let actual_crc = crc32c::crc32c(&buf[..data_len]);
-    if expected_crc != actual_crc {
-        return Err(JournalError::ChecksumMismatch {
-            sequence: 0,
-            expected: expected_crc,
-            actual: actual_crc,
-        });
-    }
-
-    let sequence = u64::from_le_bytes([
-        buf[8], buf[9], buf[10], buf[11], buf[12], buf[13], buf[14], buf[15],
-    ]);
-
-    // Chain hash always present in supported versions.
-    let chain_hash = {
-        let mut h = [0u8; 32];
-        h.copy_from_slice(&buf[16..48]);
-        h
-    };
-
-    // Decode exchange state.
-    let (_, state) = decode_exchange_state(&buf[header_size..data_len], version)?;
-    let exchange = Exchange::restore_state(state);
-
-    Ok((exchange, sequence, chain_hash))
 }
 
 /// Serialized exchange state — all the data needed to reconstruct an Exchange.
@@ -277,7 +128,7 @@ pub(crate) struct ExchangeSnapshot {
     /// is disabled or no account has yet submitted an order. Carrying
     /// this in the snapshot is what closes the SEC-04
     /// divergence window — see the version-history comment on
-    /// `SNAP_VERSION` for the v17 → v18 motivation.
+    /// `PAYLOAD_VERSION` for the v17 → v18 motivation.
     pub(crate) order_buckets: Vec<(AccountId, u64, u64)>,
 }
 
@@ -1811,9 +1662,26 @@ impl OrderBook {
 mod tests {
     use std::num::NonZeroU64;
 
+    use std::path::Path;
+
     use super::*;
     use crate::exchange::Exchange;
     use crate::types::*;
+
+    // The on-disk save/load API moved to `melin_transport_core::snapshot`,
+    // generic over `melin_app::Application`. These shims preserve the
+    // engine-side test ergonomics — every round-trip test in this file
+    // exercises `Exchange::snapshot`/`restore` (which delegate to the
+    // payload codec below) through the same framing production uses.
+    type SnapResult<T> = Result<T, melin_transport_core::snapshot::SnapshotError>;
+
+    fn save(exchange: &Exchange, seq: u64, chain_hash: [u8; 32], path: &Path) -> SnapResult<()> {
+        melin_transport_core::snapshot::save::<Exchange>(exchange, seq, chain_hash, path)
+    }
+
+    fn load(path: &Path) -> SnapResult<(Exchange, u64, [u8; 32])> {
+        melin_transport_core::snapshot::load::<Exchange>(path)
+    }
 
     const ACCT_A: AccountId = AccountId(1);
     const ACCT_B: AccountId = AccountId(2);
@@ -2129,25 +1997,6 @@ mod tests {
     }
 
     #[test]
-    fn corrupt_snapshot_detected() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("corrupt.snapshot");
-
-        let exchange = Exchange::new();
-        save(&exchange, 0, [0u8; 32], &path).unwrap();
-
-        // Corrupt a byte.
-        let mut data = std::fs::read(&path).unwrap();
-        data[SNAP_HEADER_SIZE] ^= 0xFF;
-        std::fs::write(&path, &data).unwrap();
-
-        assert!(matches!(
-            load(&path),
-            Err(JournalError::ChecksumMismatch { .. })
-        ));
-    }
-
-    #[test]
     fn snapshot_rebuilds_scheduler_heap_from_gtd_orders() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("rebuild.snapshot");
@@ -2264,40 +2113,6 @@ mod tests {
                 ..
             }
         ));
-    }
-
-    #[test]
-    fn save_rotates_previous_snapshot() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("rotate.snapshot");
-        let prev_path = dir.path().join("rotate.snapshot.prev");
-
-        // First save — no previous snapshot exists.
-        let exchange = Exchange::new();
-        save(&exchange, 1, [0x11; 32], &path).unwrap();
-        assert!(path.exists());
-        assert!(!prev_path.exists());
-
-        let first_data = std::fs::read(&path).unwrap();
-
-        // Second save — first snapshot should be rotated to .prev.
-        save(&exchange, 2, [0x22; 32], &path).unwrap();
-        assert!(path.exists());
-        assert!(prev_path.exists());
-
-        // .prev should contain the first snapshot's bytes exactly.
-        let prev_data = std::fs::read(&prev_path).unwrap();
-        assert_eq!(prev_data, first_data);
-
-        // Current should be loadable with the second save's sequence.
-        let (_, seq, hash) = load(&path).unwrap();
-        assert_eq!(seq, 2);
-        assert_eq!(hash, [0x22; 32]);
-
-        // .prev should be loadable with the first save's sequence.
-        let (_, prev_seq, prev_hash) = load(&prev_path).unwrap();
-        assert_eq!(prev_seq, 1);
-        assert_eq!(prev_hash, [0x11; 32]);
     }
 
     #[cfg(feature = "hash-chain")]
@@ -2452,7 +2267,7 @@ mod tests {
         // real on-disk truncation.
         let full = encode_exchange_payload(&exchange);
         let truncated = &full[..full.len() - 24];
-        match decode_exchange_payload(truncated, SNAP_VERSION) {
+        match decode_exchange_payload(truncated, PAYLOAD_VERSION) {
             Err(JournalError::TruncatedEntry) => {}
             Err(other) => panic!("expected TruncatedEntry, got {other:?}"),
             Ok(_) => panic!("truncated v18 payload must not decode silently as empty"),
@@ -2495,7 +2310,7 @@ mod tests {
         payload[count_pos..count_pos + 4].copy_from_slice(&new_count.to_le_bytes());
         payload.extend_from_slice(&dup_entry);
 
-        match decode_exchange_payload(&payload, SNAP_VERSION) {
+        match decode_exchange_payload(&payload, PAYLOAD_VERSION) {
             Err(JournalError::CorruptEntry { reason, .. }) => {
                 assert!(
                     reason.contains("duplicate account"),

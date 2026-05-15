@@ -9565,7 +9565,6 @@ mod tests {
     #[test]
     fn snapshot_preserves_fee_account() {
         use crate::account::FEE_ACCOUNT;
-        use crate::journal::snapshot;
 
         let mut exchange = Exchange::new();
         exchange.add_instrument(btc_usd_spec());
@@ -9600,8 +9599,10 @@ mod tests {
         // Save and load snapshot.
         let dir = tempfile::tempdir().unwrap();
         let snap_path = dir.path().join("test.snapshot");
-        snapshot::save(&exchange, 100, [0u8; 32], &snap_path).unwrap();
-        let (restored, _, _) = snapshot::load(&snap_path).unwrap();
+        melin_transport_core::snapshot::save::<Exchange>(&exchange, 100, [0u8; 32], &snap_path)
+            .unwrap();
+        let (restored, _, _) =
+            melin_transport_core::snapshot::load::<Exchange>(&snap_path).unwrap();
 
         let fee_after = restored.accounts().balance(FEE_ACCOUNT, USD).available;
         assert_eq!(

@@ -58,7 +58,7 @@ fn fuzz_journal_roundtrip() {
 /// snapshot load path — wraps arbitrary bytes with a valid header and CRC.
 #[test]
 fn fuzz_snapshot_decode() {
-    use crate::journal::snapshot;
+    use crate::exchange::Exchange;
 
     bolero::check!().for_each(|data: &[u8]| {
         // Write data as a snapshot file and try to load it.
@@ -66,7 +66,7 @@ fn fuzz_snapshot_decode() {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("fuzz.snapshot");
         std::fs::write(&path, data).expect("write");
-        let _ = snapshot::load(&path);
+        let _ = melin_transport_core::snapshot::load::<Exchange>(&path);
     });
 }
 
