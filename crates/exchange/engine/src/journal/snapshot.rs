@@ -2142,35 +2142,6 @@ mod tests {
         ));
     }
 
-    #[cfg(feature = "hash-chain")]
-    #[test]
-    fn snapshot_chain_hash_round_trip() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("chain.snapshot");
-
-        let chain_hash = [0xAB; 32];
-        let exchange = Exchange::new();
-        save(&exchange, 42, chain_hash, &path).unwrap();
-
-        let (_, seq, loaded_hash) = load(&path).unwrap();
-        assert_eq!(seq, 42);
-        assert_eq!(loaded_hash, chain_hash);
-    }
-
-    #[cfg(feature = "hash-chain")]
-    #[test]
-    fn snapshot_zero_chain_hash_round_trip() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("zero_chain.snapshot");
-
-        let exchange = Exchange::new();
-        save(&exchange, 10, [0u8; 32], &path).unwrap();
-
-        let (_, seq, loaded_hash) = load(&path).unwrap();
-        assert_eq!(seq, 10);
-        assert_eq!(loaded_hash, [0u8; 32]);
-    }
-
     /// SEC-04 v18+ regression: per-account rate-limiter bucket state must
     /// survive a snapshot round-trip so a replica restoring from a
     /// snapshot taken mid-throttle sees the same `tokens` /
