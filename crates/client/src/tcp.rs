@@ -106,6 +106,18 @@ impl Client {
         })
     }
 
+    /// Set a read timeout on the underlying TCP socket. A pending
+    /// `read_frame` call will return `WouldBlock` / `TimedOut` once the
+    /// deadline elapses without bytes arriving, instead of blocking
+    /// forever.
+    ///
+    /// Intended for tests and tools that need to fail fast when a
+    /// server stalls; production clients usually want the default
+    /// behaviour (no timeout — a healthy connection is just idle).
+    pub fn set_read_timeout(&self, dur: Option<std::time::Duration>) -> std::io::Result<()> {
+        self.reader.get_ref().set_read_timeout(dur)
+    }
+
     /// Send a request and collect all responses until BatchEnd.
     ///
     /// Returns the list of responses (excluding the BatchEnd marker itself).

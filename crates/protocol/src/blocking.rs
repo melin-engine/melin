@@ -62,6 +62,14 @@ impl<R: Read> BlockingFrameReader<R> {
 
         Ok(Some(&self.buf[..len]))
     }
+
+    /// Borrow the underlying reader. Mirrors `BufReader::get_ref` — used
+    /// by callers that need to reach the raw stream for socket-level
+    /// configuration (`set_read_timeout`, `set_nodelay`, …) without
+    /// going through the framed layer.
+    pub fn get_ref(&self) -> &R {
+        self.reader.get_ref()
+    }
 }
 
 /// Blocking frame writer. Writes length-prefixed frames to any `Write` sink.

@@ -46,6 +46,19 @@ fn server_bin() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_melin-server"))
 }
 
+/// Connect a TCP client with a 60s socket read timeout so the test
+/// suite fails fast when a server stalls instead of soaking the host
+/// indefinitely. 60s sits well above every in-test wait
+/// (`wait_ready` / `wait_for_replacement_catchup` cap at 30s), so a
+/// healthy run never trips it.
+fn connect_with_timeout(addr: SocketAddr, key: &SigningKey) -> Client {
+    let client = Client::connect(addr, key).expect("client connect");
+    client
+        .set_read_timeout(Some(Duration::from_secs(60)))
+        .expect("set read timeout");
+    client
+}
+
 /// Allocate a unique TCP port for a test-spawned server.
 ///
 /// Previous implementation bound an ephemeral port (`127.0.0.1:0`) and
@@ -760,7 +773,7 @@ impl TestCluster {
 
     /// Connect a client to the primary using the first key.
     fn connect_primary(&self) -> Client {
-        Client::connect(self.primary.client_addr, &self.key).expect("connect to primary")
+        connect_with_timeout(self.primary.client_addr, &self.key)
     }
 
     /// Wait for replication lag to reach 0.
@@ -800,7 +813,7 @@ impl TestCluster {
 
         wait_ready(self.replica.health_addr, Duration::from_secs(30));
 
-        Client::connect(self.replica.client_addr, &self.key2).expect("connect to promoted replica")
+        connect_with_timeout(self.replica.client_addr, &self.key2)
     }
 }
 
@@ -1067,8 +1080,7 @@ fn crashed_primary_recovers_from_journal() {
 
     wait_ready(recovered.health_addr, Duration::from_secs(30));
 
-    let mut client3 = Client::connect(recovered.client_addr, &cluster.key2)
-        .expect("connect to recovered primary");
+    let mut client3 = connect_with_timeout(recovered.client_addr, &cluster.key2);
 
     // New order must succeed — proves recovery restored instruments + balances.
     // May fill against resting orders that survived recovery, so accept
@@ -1354,8 +1366,7 @@ fn same_key_retry_after_failover_is_rejected() {
     // per-key HWM for this key should be 10 (from the 10 requests above).
     // A fresh Client starts at next_seq=0, so the first send uses seq=1.
     // Since 1 <= 10 (the HWM), it should be rejected as DuplicateRequest.
-    let mut client_retry = Client::connect(cluster.replica.client_addr, &cluster.key)
-        .expect("reconnect with same key");
+    let mut client_retry = connect_with_timeout(cluster.replica.client_addr, &cluster.key);
     let r = submit_order(&mut client_retry, 11, 1, 1, Side::Buy, 100, 10);
     assert!(
         has_report(&r, |rep| matches!(
@@ -1474,7 +1485,7 @@ impl DualCluster {
     }
 
     fn connect_primary(&self) -> Client {
-        Client::connect(self.primary.client_addr, &self.key).expect("connect to primary")
+        connect_with_timeout(self.primary.client_addr, &self.key)
     }
 
     fn wait_replicated(&self) {
@@ -1521,8 +1532,7 @@ impl DualCluster {
         // the full rationale.
         set_durability_mode(addr, &self.operator_key, "local");
         wait_ready(self.replica1.health_addr, Duration::from_secs(30));
-        Client::connect(self.replica1.client_addr, &self.key2)
-            .expect("connect to promoted replica 1")
+        connect_with_timeout(self.replica1.client_addr, &self.key2)
     }
 
     fn promote_replica2(&self) -> Client {
@@ -1532,8 +1542,7 @@ impl DualCluster {
         promote(addr, &self.operator_key);
         set_durability_mode(addr, &self.operator_key, "local");
         wait_ready(self.replica2.health_addr, Duration::from_secs(30));
-        Client::connect(self.replica2.client_addr, &self.key2)
-            .expect("connect to promoted replica 2")
+        connect_with_timeout(self.replica2.client_addr, &self.key2)
     }
 
     fn primary_trading(&self) -> bool {
@@ -1915,11 +1924,10 @@ fn replacement_replica_catches_up_from_journal() {
     let r3_health_addr: SocketAddr = format!("127.0.0.1:{r3_health}").parse().unwrap();
     wait_ready(r3_health_addr, Duration::from_secs(30));
 
-    let mut client2 = Client::connect(
+    let mut client2 = connect_with_timeout(
         format!("127.0.0.1:{r3_client}").parse().unwrap(),
         &cluster.key2,
-    )
-    .expect("connect to promoted replacement");
+    );
 
     // All 50 orders must be present — ID 51 succeeds, duplicate of 50 rejected.
     let r = submit_order(&mut client2, 51, 1, 1, Side::Buy, 200, 5);
@@ -2041,11 +2049,10 @@ fn catchup_with_fills_during_gap() {
         Duration::from_secs(30),
     );
 
-    let mut client2 = Client::connect(
+    let mut client2 = connect_with_timeout(
         format!("127.0.0.1:{r3_client}").parse().unwrap(),
         &cluster.key2,
-    )
-    .expect("connect to promoted replacement");
+    );
 
     // Place a sell + matching buy to verify balances are correct.
     let r = submit_order(&mut client2, 21, 2, 1, Side::Sell, 500, 1);
@@ -2163,11 +2170,10 @@ fn catchup_then_immediate_failover() {
         Duration::from_secs(30),
     );
 
-    let mut client2 = Client::connect(
+    let mut client2 = connect_with_timeout(
         format!("127.0.0.1:{r3_client}").parse().unwrap(),
         &cluster.key2,
-    )
-    .expect("connect to promoted replacement");
+    );
 
     // All 30 orders must be present.
     let r = submit_order(&mut client2, 31, 1, 1, Side::Buy, 200, 5);
@@ -2286,11 +2292,10 @@ fn fresh_replica_full_catchup() {
         Duration::from_secs(30),
     );
 
-    let mut client2 = Client::connect(
+    let mut client2 = connect_with_timeout(
         format!("127.0.0.1:{r3_client}").parse().unwrap(),
         &cluster.key2,
-    )
-    .expect("connect to promoted fresh replacement");
+    );
 
     // All 35 orders must be present.
     let r = submit_order(&mut client2, 36, 1, 1, Side::Buy, 200, 5);
@@ -2385,7 +2390,7 @@ fn snapshot_transfer_when_archives_purged() {
     wait_healthy(primary.health_addr, Duration::from_secs(30));
 
     // Connect and send orders.
-    let mut client = Client::connect(primary.client_addr, &key).expect("connect");
+    let mut client = connect_with_timeout(primary.client_addr, &key);
     for i in 1..=20u64 {
         let r = submit_order(&mut client, i, 1, 1, Side::Buy, 100, 10);
         assert!(!r.is_empty(), "order {i}: no response");
@@ -2507,7 +2512,7 @@ fn snapshot_transfer_when_archives_purged() {
     eprintln!("Replica caught up via snapshot transfer.");
 
     // Submit a new order to verify the primary is functional.
-    let mut client2 = Client::connect(primary2.client_addr, &key2).expect("connect to primary2");
+    let mut client2 = connect_with_timeout(primary2.client_addr, &key2);
     let r = submit_order(&mut client2, 21, 1, 1, Side::Buy, 200, 5);
     assert!(
         has_report(&r, |rep| matches!(
@@ -2657,7 +2662,7 @@ fn rotation_soak_under_load() {
     wait_healthy(primary.health_addr, Duration::from_secs(30));
 
     // ----- Drive load with interleaved ROTATEs -----
-    let mut client = Client::connect(primary.client_addr, &key).expect("connect to primary");
+    let mut client = connect_with_timeout(primary.client_addr, &key);
     let admin_addr: SocketAddr = primary_admin_addr.parse().unwrap();
     let replica_admin_addr: SocketAddr = format!("127.0.0.1:{replica_admin_port}").parse().unwrap();
 
@@ -2745,7 +2750,7 @@ fn rotation_soak_under_load() {
     // than the pre-shutdown high-water mark, which is only possible if
     // the writer's `next_sequence` was correctly seeded from the
     // multi-segment archive walk on startup.
-    let mut client2 = Client::connect(primary2.client_addr, &key).expect("connect to primary2");
+    let mut client2 = connect_with_timeout(primary2.client_addr, &key);
     submit_resting_burst(&mut client2, total_orders + 1, 1);
     // Allow the order to fsync before shutdown.
     let deadline = Instant::now() + Duration::from_secs(5);
