@@ -91,9 +91,11 @@ pub(crate) fn encode_exchange_payload(exchange: &Exchange) -> Vec<u8> {
 
 /// Decode an Exchange from the payload bytes produced by
 /// [`encode_exchange_payload`]. The caller is responsible for verifying
-/// framing and CRC before handing bytes to this function.
-pub(crate) fn decode_exchange_payload(buf: &[u8], version: u16) -> Result<Exchange, JournalError> {
-    let (_consumed, state) = decode_exchange_state(buf, version)?;
+/// framing and CRC before handing bytes to this function. Decoding is
+/// always at [`PAYLOAD_VERSION`]; the transport rejects mismatched
+/// `APP_VERSION` before this is ever called.
+pub(crate) fn decode_exchange_payload(buf: &[u8]) -> Result<Exchange, JournalError> {
+    let (_consumed, state) = decode_exchange_state(buf, PAYLOAD_VERSION)?;
     Ok(Exchange::restore_state(state))
 }
 
@@ -1719,6 +1721,31 @@ mod tests {
         }
     }
 
+    /// Smoke test that the engine sees the transport's `SnapshotError`
+    /// variants intact through the shim above. Transport-core has its
+    /// own framing-corruption tests; this one guards against a future
+    /// error-type rename or restructure in transport-core silently
+    /// breaking engine callers that match on these variants.
+    #[test]
+    fn checksum_mismatch_surfaces_as_snapshot_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("corrupt.snapshot");
+
+        save(&Exchange::new(), 0, [0u8; 32], &path).unwrap();
+
+        // Flip one byte inside the payload region so the CRC fails.
+        // 48-byte transport header + 1 lands squarely in payload bytes.
+        let mut data = std::fs::read(&path).unwrap();
+        data[49] ^= 0xFF;
+        std::fs::write(&path, &data).unwrap();
+
+        match load(&path) {
+            Err(melin_transport_core::snapshot::SnapshotError::ChecksumMismatch { .. }) => {}
+            Err(other) => panic!("expected ChecksumMismatch, got {other:?}"),
+            Ok(_) => panic!("expected ChecksumMismatch, got Ok"),
+        }
+    }
+
     #[test]
     fn snapshot_save_load_round_trip() {
         let dir = tempfile::tempdir().unwrap();
@@ -2266,7 +2293,7 @@ mod tests {
         // real on-disk truncation.
         let full = encode_exchange_payload(&exchange);
         let truncated = &full[..full.len() - 24];
-        match decode_exchange_payload(truncated, PAYLOAD_VERSION) {
+        match decode_exchange_payload(truncated) {
             Err(JournalError::TruncatedEntry) => {}
             Err(other) => panic!("expected TruncatedEntry, got {other:?}"),
             Ok(_) => panic!("truncated v18 payload must not decode silently as empty"),
@@ -2309,7 +2336,7 @@ mod tests {
         payload[count_pos..count_pos + 4].copy_from_slice(&new_count.to_le_bytes());
         payload.extend_from_slice(&dup_entry);
 
-        match decode_exchange_payload(&payload, PAYLOAD_VERSION) {
+        match decode_exchange_payload(&payload) {
             Err(JournalError::CorruptEntry { reason, .. }) => {
                 assert!(
                     reason.contains("duplicate account"),

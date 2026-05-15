@@ -32,15 +32,18 @@ const MAX_SNAPSHOT_SIZE: u64 = 256 * 1024 * 1024;
 /// Suffix appended to the snapshot path for the one-deep rollback file.
 const PREV_SUFFIX: &str = ".prev";
 
-/// Append [`PREV_SUFFIX`] to a snapshot path. Keeps the full filename intact
+/// Suffix used for the in-progress write before the atomic publish rename.
+const TMP_SUFFIX: &str = ".tmp";
+
+/// Append `suffix` to a snapshot path. Keeps the full filename intact
 /// (e.g. `melin.snapshot` → `melin.snapshot.prev`) so operators can run
 /// `mv melin.snapshot.prev melin.snapshot` to roll back. Using
 /// [`Path::with_extension`] is wrong here — it would replace the existing
-/// extension instead of appending.
-fn prev_snapshot_path(path: &Path) -> std::path::PathBuf {
-    let mut prev = path.as_os_str().to_owned();
-    prev.push(PREV_SUFFIX);
-    std::path::PathBuf::from(prev)
+/// extension instead of appending, which breaks multi-dot filenames.
+fn with_suffix(path: &Path, suffix: &str) -> std::path::PathBuf {
+    let mut buf = path.as_os_str().to_owned();
+    buf.push(suffix);
+    std::path::PathBuf::from(buf)
 }
 
 /// Error surfaced by [`save`] and [`load`].
@@ -142,13 +145,7 @@ fn save_with_limit<A: Application>(
         return Err(SnapshotError::TooLarge(buf.len() as u64));
     }
 
-    // Atomic rename via `.tmp`.
-    let mut tmp_path = path.to_path_buf();
-    let tmp_ext = match path.extension() {
-        Some(e) => format!("{}.tmp", e.to_string_lossy()),
-        None => "tmp".to_string(),
-    };
-    tmp_path.set_extension(tmp_ext);
+    let tmp_path = with_suffix(path, TMP_SUFFIX);
 
     {
         let mut file = OpenOptions::new()
@@ -160,32 +157,38 @@ fn save_with_limit<A: Application>(
         file.sync_all()?;
     }
 
-    // Rotate the previous snapshot to `<path>.prev` before clobbering it.
-    // Operators rely on this as a one-deep rollback target — see
-    // `docs/operations.md` "Snapshot rotation". On first save the source
-    // doesn't exist (NotFound) and the rename simply does nothing. Other
-    // errors (e.g. EACCES) are dropped on purpose: per the documented
-    // contract, losing the rollback point is preferable to failing the
-    // snapshot entirely.
-    let prev_path = prev_snapshot_path(path);
-    let _ = std::fs::rename(path, &prev_path);
-
-    std::fs::rename(&tmp_path, path)?;
-
-    // POSIX semantics: the rename is atomic wrt concurrent readers but
-    // not durable until the parent directory's metadata is fsynced. A
-    // crash between `rename` returning and the dir metadata hitting
-    // disk can lose the rename on ext4/xfs — the file reverts to its
-    // pre-rename state (or, rarely, the directory ends up with both
-    // `.tmp` and the final path, or neither). `File::sync_all` on the
-    // opened directory issues `fsync(2)` which forces the dir
-    // metadata out.
+    // Resolve the parent dir once. POSIX renames are atomic wrt readers
+    // but the directory entries they create/remove are not durable until
+    // the parent's metadata is fsynced — without that, a crash can lose
+    // the rename on ext4/xfs. Empty parent ("snap" with no separator)
+    // denotes CWD; use "." so the open succeeds rather than ENOENT.
     let parent = match path.parent() {
-        // Empty parent ("snap" with no separator) denotes CWD; use "." so
-        // the open succeeds rather than failing with ENOENT.
         Some(p) if !p.as_os_str().is_empty() => p.to_path_buf(),
         _ => std::path::PathBuf::from("."),
     };
+
+    // Rotate the previous snapshot to `<path>.prev` before clobbering it.
+    // Operators rely on this as a one-deep rollback target — see
+    // `docs/operations.md` "Snapshot rotation". On first save the source
+    // doesn't exist (NotFound) and the rename does nothing. Other errors
+    // (e.g. EACCES) are dropped on purpose: per the documented best-effort
+    // contract, losing the rollback point is preferable to failing the
+    // snapshot entirely.
+    let prev_path = with_suffix(path, PREV_SUFFIX);
+    let rotated = std::fs::rename(path, &prev_path).is_ok();
+
+    // Fsync the parent dir between the two renames so the rotation is
+    // durable before the publish overwrites `path`. Without this, a crash
+    // between the rotation and the publish rename could leave the dir
+    // metadata in a state where neither `path` nor `path.prev` is present
+    // — the rollback point would be silently lost. Skip the extra fsync
+    // when no rotation happened (first save) to avoid a syscall on the
+    // common path.
+    if rotated {
+        File::open(&parent)?.sync_all()?;
+    }
+
+    std::fs::rename(&tmp_path, path)?;
     File::open(&parent)?.sync_all()?;
 
     Ok(())

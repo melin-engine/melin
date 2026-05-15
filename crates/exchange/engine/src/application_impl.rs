@@ -16,7 +16,6 @@ use melin_app::{Application, ApplyCtx, RejectReason as TransportRejectReason};
 
 use crate::exchange::Exchange;
 use crate::journal::snapshot as engine_snapshot;
-use crate::le;
 use crate::trading_event::TradingEvent;
 use crate::types::{
     AccountId, ExecutionReport, OrderId, QueryResponse, RejectReason as EngineRejectReason, Symbol,
@@ -48,7 +47,7 @@ impl Application for Exchange {
     type QueryResponse = QueryResponse;
 
     /// Schema version for the snapshot payload. Tracks the underlying
-    /// `snapshot` module's `SNAP_VERSION` — any change there forces a
+    /// `snapshot` module's `PAYLOAD_VERSION` — any change there forces a
     /// bump here too, surfaced through the transport-owned frame.
     const APP_VERSION: u16 = engine_snapshot::PAYLOAD_VERSION;
 
@@ -222,31 +221,21 @@ impl Application for Exchange {
         }
     }
 
-    /// Encodes `[app_version: u16 LE][exchange payload bytes]`.
-    ///
-    /// The transport supplies framing (magic, transport version,
-    /// sequence, chain_hash, CRC). The version prefix here is app-owned
-    /// so `restore` can migrate older snapshot schemas without the
-    /// transport having to know about schema evolution.
+    /// Writes the engine payload bytes verbatim. The transport stores
+    /// `APP_VERSION` in its frame and rejects mismatching files before
+    /// `restore` is ever called, so duplicating the version in the
+    /// payload would be unreachable. If multi-version migration ever
+    /// lands, drop the transport-side `APP_VERSION` check and reintroduce
+    /// an in-payload version prefix here.
     fn snapshot<W: Write>(&self, w: &mut W) -> io::Result<()> {
         let bytes = engine_snapshot::encode_exchange_payload(self);
-        let mut version_buf = [0u8; 2];
-        le::put_u16(&mut version_buf, Self::APP_VERSION);
-        w.write_all(&version_buf)?;
         w.write_all(&bytes)
     }
 
     fn restore<R: Read>(r: &mut R) -> io::Result<Self> {
         let mut bytes = Vec::new();
         r.read_to_end(&mut bytes)?;
-        if bytes.len() < 2 {
-            return Err(io::Error::new(
-                io::ErrorKind::UnexpectedEof,
-                "snapshot payload shorter than version prefix",
-            ));
-        }
-        let version = le::get_u16(&bytes[0..2]);
-        engine_snapshot::decode_exchange_payload(&bytes[2..], version)
+        engine_snapshot::decode_exchange_payload(&bytes)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
     }
 }
