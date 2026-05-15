@@ -310,7 +310,6 @@ struct BenchArgs {
     /// real fsync. Default 4096. Try 256 for low-latency no-persist runs.
     #[arg(long, default_value_t = 4096)]
     max_journal_batch: usize,
-
 }
 
 fn main() {

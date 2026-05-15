@@ -219,4 +219,3 @@ fn dpdk_config_from(cfg: &ServerConfig) -> melin_dpdk::DpdkConfig {
 fn dpdk_num_queues(_cfg: &ServerConfig) -> u16 {
     1
 }
-
