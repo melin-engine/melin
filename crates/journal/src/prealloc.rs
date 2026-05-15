@@ -44,6 +44,7 @@ pub(crate) fn prealloc_chunk_bytes() -> u64 {
 
 /// Internal hook for `test_utils::set_prealloc_chunk_bytes_override`.
 /// `None` clears the override; `Some(0)` is treated as "clear".
+#[cfg(feature = "test-utils")]
 pub(crate) fn set_override(bytes: Option<u64>) {
     OVERRIDE_BYTES.store(bytes.unwrap_or(0), Ordering::Relaxed);
 }

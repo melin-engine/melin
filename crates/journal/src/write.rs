@@ -1,10 +1,10 @@
 //! Shared trait implemented by both concrete journal writers
 //! ([`SectorWriter`] and [`BufferedWriter`]).
 //!
-//! The trait is what `JournalStage`, `Pipeline`, `JournaledApp`, and
-//! `JournaledExchange` are generic over. Each call site picks a
-//! concrete writer at construction time, so the trait is statically
-//! dispatched — no runtime `match` on a writer variant.
+//! The trait is what `JournalStage`, `Pipeline`, and `JournaledApp`
+//! are generic over. Each call site picks a concrete writer at
+//! construction time, so the trait is statically dispatched — no
+//! runtime `match` on a writer variant.
 //!
 //! The trait is intentionally **not** dyn-compatible-by-design: it has
 //! no consumers that need `Box<dyn JournalWrite>` and several methods

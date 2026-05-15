@@ -1825,9 +1825,9 @@ fn replacement_replica_catches_up_from_journal() {
         "replacement journal must exist after copy"
     );
     // Verify the copied journal exists and has meaningful size.
-    // We don't call JournaledExchange::recover() here because the
-    // replica may have been killed mid-write, leaving a truncated entry
-    // that recovery would reject. The replacement replica's run_receiver
+    // We don't call `JournaledApp::recover()` here because the replica
+    // may have been killed mid-write, leaving a truncated entry that
+    // recovery would reject. The replacement replica's run_receiver
     // handles recovery gracefully (truncates and continues).
     let copy_len = std::fs::metadata(&replacement_journal)
         .expect("replacement journal metadata")

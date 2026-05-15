@@ -62,5 +62,9 @@ bolero = "0.13"
 # feature set with the regular `[dependencies]` entry above during
 # test builds only — production builds don't see `test-utils`.
 melin-journal = { path = "../journal", features = ["test-utils"] }
+# Same trick for transport-core: enable `test-utils` only in test
+# builds so engine recovery tests can use `apply_journaled` (the
+# successor to the deleted `JournaledExchange` wrapper).
+melin-transport-core = { path = "../transport-core", features = ["test-utils"] }
 proptest = "1"
 tempfile = "3"

@@ -24,6 +24,12 @@ hash-chain = ["melin-journal/hash-chain"]
 ## Open the journal without `O_DIRECT`. Passthrough — see the
 ## `melin-journal` feature of the same name. Benchmarking only.
 no-o-direct = ["melin-journal/no-o-direct"]
+## Expose `JournaledApp::apply_journaled` / `tick_journaled` /
+## `writer_mut` — synchronous test-only primitives that journal an
+## event then apply it on the calling thread. Production drives events
+## through the disruptor pipeline and never uses these. Activate from
+## a consuming crate's `[dev-dependencies]` only.
+test-utils = []
 
 [dependencies]
 crc32c = "0.6"

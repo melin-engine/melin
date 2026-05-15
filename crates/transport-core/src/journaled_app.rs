@@ -290,6 +290,52 @@ impl<A: Application, W: JournalWrite<A::Event>> JournaledApp<A, W> {
     }
 }
 
+#[cfg(feature = "test-utils")]
+impl<A: Application, W: JournalWrite<A::Event>> JournaledApp<A, W> {
+    /// Journal an event and apply it to the inner application in one
+    /// call. Test-only primitive — production drives events through the
+    /// disruptor pipeline (journal stage + matching stage on separate
+    /// threads), and never journals-then-applies on the same thread.
+    ///
+    /// Used by tests that migrated off the now-deleted
+    /// `JournaledExchange` wrapper, which exposed the same shape.
+    pub fn apply_journaled(
+        &mut self,
+        event: A::Event,
+        out: &mut Vec<A::Report>,
+    ) -> Result<Option<A::QueryResponse>, JournalError> {
+        let seq = self.writer.append(&JournalEvent::App(event))?;
+        let ctx = melin_app::ApplyCtx {
+            now_ns: melin_app::unix_epoch_nanos(),
+            journal_sequence: seq,
+            active_connections: 0,
+            events_processed: 0,
+            key_hash: 0,
+        };
+        Ok(self.app.apply(event, &ctx, out))
+    }
+
+    /// Journal a tick event and dispatch it to the inner application.
+    /// Mirrors `apply_journaled` for the tick path.
+    pub fn tick_journaled(
+        &mut self,
+        now_ns: u64,
+        out: &mut Vec<A::Report>,
+    ) -> Result<(), JournalError> {
+        self.writer.append(&JournalEvent::Tick { now_ns })?;
+        self.app.tick(now_ns, out);
+        Ok(())
+    }
+
+    /// Mutable access to the writer for tests that need to journal raw
+    /// `JournalEvent` variants the public API doesn't expose (e.g. a
+    /// deliberately-mismatched checkpoint to exercise divergence
+    /// handling).
+    pub fn writer_mut(&mut self) -> &mut W {
+        &mut self.writer
+    }
+}
+
 /// Dispatch a single journaled entry back into the application during
 /// replay. Mirrors the live matching-stage dispatch: hybrid scheduler
 /// clock drain, `check_request_seq` rebuilds the per-key HWM, then the

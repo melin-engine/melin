@@ -1,662 +1,216 @@
-//! JournaledExchange — wraps `Exchange` with durable event journaling.
-//!
-//! Journals every input command before executing it, ensuring the
-//! persist-before-ack invariant. On crash, replay reconstructs identical state.
-
-use std::path::Path;
-
-use crate::exchange::Exchange;
-use crate::types::{
-    AccountId, CircuitBreakerConfig, CurrencyId, ExecutionReport, FeeSchedule, InstrumentSpec,
-    Order, OrderId, RejectReason, RiskLimits, Symbol,
-};
-
-use crate::journal::JournalEvent;
-use crate::journal::JournalReader;
-#[cfg(test)]
-use crate::journal::SectorWriter;
-use crate::journal::snapshot;
-use crate::trading_event::TradingEvent;
-use melin_journal::{JournalError, JournalWrite};
-
-/// Error surfaced by [`JournaledExchange::withdraw`]: either a journal
-/// I/O failure or a business-level rejection (insufficient balance,
-/// resting orders, unknown account). Kept engine-local so the
-/// `melin-journal` crate stays free of trading types.
-#[derive(Debug)]
-pub enum JournaledExchangeError {
-    /// Transport-level journal failure (I/O, CRC, version, …).
-    Journal(JournalError),
-    /// Exchange rejected the operation (business logic). The journal
-    /// entry is still durable so replay reproduces this deterministically.
-    Rejected(RejectReason),
-}
-
-impl std::fmt::Display for JournaledExchangeError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Journal(e) => write!(f, "journal error: {e}"),
-            Self::Rejected(r) => write!(f, "command rejected: {r:?}"),
-        }
-    }
-}
-
-impl std::error::Error for JournaledExchangeError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            Self::Journal(e) => Some(e),
-            Self::Rejected(_) => None,
-        }
-    }
-}
-
-impl From<JournalError> for JournaledExchangeError {
-    fn from(e: JournalError) -> Self {
-        Self::Journal(e)
-    }
-}
-
-/// Exchange wrapper that journals all input commands to a write-ahead log
-/// before executing them. Provides crash recovery via journal replay.
-///
-/// Generic over `W` — the caller picks the concrete writer type
-/// ([`crate::journal::BufferedWriter`] or [`crate::journal::SectorWriter`])
-/// at construction time. The pipeline boot path dispatches on the
-/// runtime mode flag and picks `W` once.
-pub struct JournaledExchange<W: JournalWrite<TradingEvent>> {
-    exchange: Exchange,
-    writer: W,
-}
-
-impl<W: JournalWrite<TradingEvent>> JournaledExchange<W> {
-    /// Create a new journaled exchange with a fresh journal file.
-    pub fn create(journal_path: &Path) -> Result<Self, JournalError> {
-        let writer = W::create(journal_path)?;
-        Ok(Self {
-            exchange: Exchange::with_capacity(),
-            writer,
-        })
-    }
-
-    /// Register a new instrument. Journals before executing.
-    pub fn add_instrument(&mut self, spec: InstrumentSpec) -> Result<(), JournalError> {
-        self.writer.append(&JournalEvent::App(
-            crate::trading_event::TradingEvent::AddInstrument { spec },
-        ))?;
-        self.exchange.add_instrument(spec);
-        Ok(())
-    }
-
-    /// Deposit funds. Journals before executing.
-    pub fn deposit(
-        &mut self,
-        account: AccountId,
-        currency: CurrencyId,
-        amount: u64,
-    ) -> Result<(), JournalError> {
-        self.writer.append(&JournalEvent::App(
-            crate::trading_event::TradingEvent::Deposit {
-                account,
-                currency,
-                amount,
-            },
-        ))?;
-        self.exchange.deposit(account, currency, amount);
-        Ok(())
-    }
-
-    /// Cancel all orders for an account (kill switch). Journals before executing.
-    pub fn cancel_all(
-        &mut self,
-        account: AccountId,
-        reports: &mut Vec<ExecutionReport>,
-    ) -> Result<(), JournalError> {
-        self.writer.append(&JournalEvent::App(
-            crate::trading_event::TradingEvent::CancelAll { account },
-        ))?;
-        self.exchange.cancel_all(account, reports);
-        Ok(())
-    }
-
-    /// Withdraw funds from an account. Journals before executing.
-    /// Rejects if the account has resting orders or insufficient balance.
-    ///
-    /// The journal entry is appended unconditionally so that replay
-    /// reproduces the same rejection deterministically. Business-level
-    /// rejections (insufficient balance, unknown account, resting orders)
-    /// are surfaced to the caller as `JournaledExchangeError::Rejected`.
-    pub fn withdraw(
-        &mut self,
-        account: AccountId,
-        currency: CurrencyId,
-        amount: u64,
-    ) -> Result<(), JournaledExchangeError> {
-        self.writer.append(&JournalEvent::App(
-            crate::trading_event::TradingEvent::Withdraw {
-                account,
-                currency,
-                amount,
-            },
-        ))?;
-        self.exchange
-            .withdraw(account, currency, amount)
-            .map_err(JournaledExchangeError::Rejected)
-    }
-
-    /// Set risk limits for an instrument. Journals before executing.
-    pub fn set_risk_limits(
-        &mut self,
-        symbol: Symbol,
-        limits: RiskLimits,
-    ) -> Result<(), JournalError> {
-        self.writer.append(&JournalEvent::App(
-            crate::trading_event::TradingEvent::SetRiskLimits { symbol, limits },
-        ))?;
-        self.exchange.set_risk_limits(symbol, limits);
-        Ok(())
-    }
-
-    /// Set circuit breaker configuration for an instrument. Journals before executing.
-    pub fn set_circuit_breaker(
-        &mut self,
-        symbol: Symbol,
-        config: CircuitBreakerConfig,
-    ) -> Result<(), JournalError> {
-        self.writer.append(&JournalEvent::App(
-            crate::trading_event::TradingEvent::SetCircuitBreaker { symbol, config },
-        ))?;
-        self.exchange.set_circuit_breaker(symbol, config);
-        Ok(())
-    }
-
-    /// Set the fee schedule for an instrument. Journals before executing.
-    /// May cancel orders whose accounts can't afford the new fee cushion.
-    pub fn set_fee_schedule(
-        &mut self,
-        symbol: Symbol,
-        schedule: FeeSchedule,
-        reports: &mut Vec<ExecutionReport>,
-    ) -> Result<(), JournalError> {
-        self.writer.append(&JournalEvent::App(
-            crate::trading_event::TradingEvent::SetFeeSchedule { symbol, schedule },
-        ))?;
-        self.exchange.set_fee_schedule(symbol, schedule, reports);
-        Ok(())
-    }
-
-    /// Submit an order. Journals before executing.
-    pub fn execute(
-        &mut self,
-        symbol: Symbol,
-        order: Order,
-        reports: &mut Vec<ExecutionReport>,
-    ) -> Result<(), JournalError> {
-        self.writer.append(&JournalEvent::App(
-            crate::trading_event::TradingEvent::SubmitOrder { symbol, order },
-        ))?;
-        self.exchange.execute(symbol, order, reports);
-        Ok(())
-    }
-
-    /// Cancel an order. Journals before executing.
-    pub fn cancel(
-        &mut self,
-        symbol: Symbol,
-        account: AccountId,
-        order_id: OrderId,
-        reports: &mut Vec<ExecutionReport>,
-    ) -> Result<(), JournalError> {
-        self.writer.append(&JournalEvent::App(
-            crate::trading_event::TradingEvent::CancelOrder {
-                symbol,
-                account,
-                order_id,
-            },
-        ))?;
-        self.exchange.cancel(symbol, account, order_id, reports);
-        Ok(())
-    }
-
-    /// Disable an instrument. Journals before executing.
-    pub fn disable_instrument(
-        &mut self,
-        symbol: Symbol,
-        reports: &mut Vec<ExecutionReport>,
-    ) -> Result<(), JournalError> {
-        self.writer.append(&JournalEvent::App(
-            crate::trading_event::TradingEvent::DisableInstrument { symbol },
-        ))?;
-        self.exchange.disable_instrument(symbol, reports);
-        Ok(())
-    }
-
-    /// Re-enable a disabled instrument. Journals before executing.
-    pub fn enable_instrument(
-        &mut self,
-        symbol: Symbol,
-        reports: &mut Vec<ExecutionReport>,
-    ) -> Result<(), JournalError> {
-        self.writer.append(&JournalEvent::App(
-            crate::trading_event::TradingEvent::EnableInstrument { symbol },
-        ))?;
-        self.exchange.enable_instrument(symbol, reports);
-        Ok(())
-    }
-
-    /// Remove a disabled instrument. Journals before executing.
-    pub fn remove_instrument(
-        &mut self,
-        symbol: Symbol,
-        reports: &mut Vec<ExecutionReport>,
-    ) -> Result<(), JournalError> {
-        self.writer.append(&JournalEvent::App(
-            crate::trading_event::TradingEvent::RemoveInstrument { symbol },
-        ))?;
-        self.exchange.remove_instrument(symbol, reports);
-        Ok(())
-    }
-
-    /// Advance the engine clock to `now_ns`, draining any due scheduled
-    /// tasks. Journals the tick first so replay reproduces the same firing
-    /// boundary. In production the tick is published by the dedicated tick
-    /// thread onto the pipeline ring; this entry point exists for tests and
-    /// for callers that drive a JournaledExchange directly.
-    pub fn tick(
-        &mut self,
-        now_ns: u64,
-        reports: &mut Vec<ExecutionReport>,
-    ) -> Result<(), JournalError> {
-        self.writer.append(&JournalEvent::Tick { now_ns })?;
-        self.exchange.drain_due_scheduled_tasks(now_ns, reports);
-        Ok(())
-    }
-
-    /// Recover from an existing journal file by replaying all events.
-    ///
-    /// Truncates any trailing garbage from a partial write (crash recovery),
-    /// then reopens the writer for appending new events.
-    pub fn recover(journal_path: &Path) -> Result<Self, JournalError> {
-        Self::recover_inner(journal_path, None)
-    }
-
-    /// Recover from a snapshot plus a journal file.
-    pub fn recover_from_snapshot(
-        snapshot_path: &Path,
-        journal_path: &Path,
-    ) -> Result<Self, JournalError> {
-        let (exchange, snap_sequence, snap_chain_hash) = snapshot::load(snapshot_path)?;
-        Self::recover_inner_with_state(
-            exchange,
-            journal_path,
-            Some((snap_sequence, snap_chain_hash)),
-        )
-    }
-
-    /// Multi-segment recovery driver. Walks every archived segment in
-    /// order, then the live segment, replaying app events on top of a
-    /// fresh `Exchange`. See [`Self::recover_inner_with_state`] for the
-    /// snapshot-aware path that mirrors this for the snapshot case.
-    fn recover_inner(
-        journal_path: &Path,
-        snapshot: Option<(u64, [u8; 32])>,
-    ) -> Result<Self, JournalError> {
-        Self::recover_inner_with_state(Exchange::with_capacity(), journal_path, snapshot)
-    }
-
-    fn recover_inner_with_state(
-        mut exchange: Exchange,
-        journal_path: &Path,
-        snapshot: Option<(u64, [u8; 32])>,
-    ) -> Result<Self, JournalError> {
-        let archives =
-            melin_journal::segment::list_archives(journal_path).map_err(JournalError::Io)?;
-        let snap_sequence = snapshot.map(|(s, _)| s).unwrap_or(0);
-        let mut reports = Vec::new();
-        let mut last_drain_ns: u64 = 0;
-        let mut prev_tail_hash: Option<[u8; 32]> = None;
-        // Highest sequence observed across walked archives. Used to
-        // synthesize a new live when rotation crashed mid-rename — see
-        // [`JournaledApp::recover_inner`] for the full Phase B
-        // rationale.
-        let mut last_seq_seen: u64 = snap_sequence;
-
-        for (idx, archive_path) in &archives {
-            let mut reader = JournalReader::open(archive_path)?;
-            replay_segment_into_exchange(
-                &mut reader,
-                &mut exchange,
-                snap_sequence,
-                &mut last_drain_ns,
-                &mut reports,
-                /* allow_partial_tail = */ false,
-            )?;
-            verify_segment_boundary(*idx, prev_tail_hash, reader.genesis_payload())?;
-            if let Some(h) = reader.chain_hash() {
-                prev_tail_hash = Some(h);
-            }
-            if let Some(seq) = reader.last_sequence() {
-                last_seq_seen = last_seq_seen.max(seq);
-            }
-        }
-
-        if !journal_path.exists() {
-            // Phase B: live missing but archives present — rotation
-            // crashed between the rename and the new live's creation.
-            // Synthesize a fresh live segment continuing from the last
-            // archive's tail so the pipeline has somewhere to append.
-            if archives.is_empty() {
-                return Err(JournalError::Io(std::io::Error::new(
-                    std::io::ErrorKind::NotFound,
-                    "no live journal and no archives — nothing to recover",
-                )));
-            }
-            let genesis = prev_tail_hash.unwrap_or([0u8; 32]);
-            let writer = W::create_continuing(journal_path, last_seq_seen + 1, genesis)?;
-            return Ok(Self { exchange, writer });
-        }
-
-        let mut reader = JournalReader::open(journal_path)?;
-        replay_segment_into_exchange(
-            &mut reader,
-            &mut exchange,
-            snap_sequence,
-            &mut last_drain_ns,
-            &mut reports,
-            /* allow_partial_tail = */ true,
-        )?;
-        verify_segment_boundary(0, prev_tail_hash, reader.genesis_payload())?;
-
-        let last_seq = reader.last_sequence().unwrap_or(snap_sequence);
-        let valid_end = reader.valid_file_end();
-        let chain_hash = reader.chain_hash();
-        let events_since_checkpoint = reader.events_since_checkpoint();
-        tracing::debug!(last_seq, valid_end, "recover: opening append");
-        let writer = W::open_append(
-            journal_path,
-            last_seq,
-            valid_end,
-            chain_hash,
-            events_since_checkpoint,
-        )?;
-
-        Ok(Self { exchange, writer })
-    }
-
-    /// Save a snapshot of the current exchange state.
-    ///
-    /// The snapshot records the current journal sequence and chain hash
-    /// so recovery knows where to start replaying and can resume the
-    /// hash chain without replaying from genesis.
-    pub fn save_snapshot(&self, snapshot_path: &Path) -> Result<(), JournalError> {
-        // Snapshot captures state as of the last journaled event.
-        let seq = self.writer.next_sequence().saturating_sub(1);
-        let chain_hash = self.writer.chain_hash().unwrap_or([0u8; 32]);
-        snapshot::save(&self.exchange, seq, chain_hash, snapshot_path)
-    }
-
-    /// Access the underlying exchange (for queries like balance checks).
-    pub fn exchange(&self) -> &Exchange {
-        &self.exchange
-    }
-
-    /// Current journal sequence number (next to be assigned).
-    pub fn next_sequence(&self) -> u64 {
-        self.writer.next_sequence()
-    }
-
-    /// Path to the journal file.
-    pub fn journal_path(&self) -> &Path {
-        self.writer.path()
-    }
-
-    /// Current BLAKE3 chain hash (for testing and diagnostics).
-    pub fn writer_chain_hash(&self) -> Option<[u8; 32]> {
-        self.writer.chain_hash()
-    }
-
-    /// Archive the current journal segment and start a fresh live file.
-    ///
-    /// The new live continues sequence numbering and the hash chain from
-    /// the old one, so recovery walks both segments seamlessly. No
-    /// snapshot is written here — snapshots are produced exclusively by
-    /// the shadow exchange on its own cadence.
-    pub fn rotate_segment(&mut self) -> Result<(), JournalError> {
-        self.writer.rotate_segment()?;
-        Ok(())
-    }
-
-    /// Size of the current journal file in bytes.
-    pub fn journal_size(&self) -> u64 {
-        self.writer.valid_end()
-    }
-
-    /// Construct from pre-built parts. Used by the server for snapshot-only
-    /// recovery (when the journal is missing after a rotation crash).
-    pub fn from_parts(exchange: Exchange, writer: W) -> Self {
-        Self { exchange, writer }
-    }
-
-    /// Decompose into parts for the pipeline architecture.
-    ///
-    /// After recovery, the exchange and journal writer are handed to separate
-    /// pipeline stages: the matching thread owns the `Exchange`, and the
-    /// journal thread owns the writer.
-    pub fn into_parts(self) -> (Exchange, W) {
-        (self.exchange, self.writer)
-    }
-}
-
-/// Replay a single journal event into an exchange. Used during recovery.
-///
-/// Rebuilds the per-key request sequence HWM by calling `check_request_seq`
-/// on every event. Since the journal contains no duplicates (they were
-/// rejected at write time), this always returns true — the purpose is
-/// to reconstruct the HWM state for live dedup after recovery.
-///
-/// Replay a single segment into an `Exchange`, skipping events whose
-/// sequence is `<= snap_sequence`. `allow_partial_tail` controls how
-/// `SequenceGap` is handled — an archived segment is sealed (any gap is
-/// corruption), while the live segment may have a torn tail from a crash.
-fn replay_segment_into_exchange(
-    reader: &mut JournalReader,
-    exchange: &mut Exchange,
-    snap_sequence: u64,
-    last_drain_ns: &mut u64,
-    reports: &mut Vec<ExecutionReport>,
-    allow_partial_tail: bool,
-) -> Result<(), JournalError> {
-    loop {
-        match reader.next_entry() {
-            Ok(Some(entry)) => {
-                if entry.sequence > snap_sequence {
-                    replay_event(
-                        exchange,
-                        &entry.event,
-                        entry.timestamp_ns,
-                        entry.key_hash,
-                        entry.request_seq,
-                        last_drain_ns,
-                        reports,
-                    );
-                    reports.clear();
-                }
-            }
-            Ok(None) => break,
-            Err(JournalError::SequenceGap { expected, actual }) => {
-                if allow_partial_tail {
-                    tracing::warn!(
-                        expected,
-                        actual,
-                        "sequence gap during recovery — truncating at gap"
-                    );
-                    break;
-                }
-                return Err(JournalError::SequenceGap { expected, actual });
-            }
-            Err(e) => return Err(e),
-        }
-    }
-    Ok(())
-}
-
-/// Verify that this segment's `GenesisHash` payload equals the previous
-/// segment's tail chain hash. `index = 0` denotes the live segment.
-/// No-op when either side is `None`.
-fn verify_segment_boundary(
-    index: u32,
-    prev_tail: Option<[u8; 32]>,
-    genesis_payload: Option<[u8; 32]>,
-) -> Result<(), JournalError> {
-    if let (Some(expected), Some(actual)) = (prev_tail, genesis_payload)
-        && expected != actual
-    {
-        return Err(JournalError::SegmentChainBreak {
-            index,
-            expected,
-            actual,
-        });
-    }
-    Ok(())
-}
-
-/// `timestamp_ns` is the journaled wall-clock stamp from this entry; it
-/// drives the same per-event scheduler drain that the live matching stage
-/// performs, keeping replay state byte-identical to the live system.
-/// `last_drain_ns` is caller-tracked across the replay loop so the drain
-/// stays monotonic.
-fn replay_event(
-    exchange: &mut Exchange,
-    event: &JournalEvent,
-    timestamp_ns: u64,
-    key_hash: u64,
-    request_seq: u64,
-    last_drain_ns: &mut u64,
-    reports: &mut Vec<ExecutionReport>,
-) {
-    // Rebuild per-key HWM state (always succeeds on journal replay — no
-    // duplicates in the journal).
-    exchange.check_request_seq(key_hash, request_seq);
-
-    // Mirror the matching stage's per-event scheduler drain — without this,
-    // replay would not fire scheduled tasks at the same points the live
-    // system did, and the recovered Exchange would diverge.
-    if timestamp_ns > *last_drain_ns {
-        *last_drain_ns = timestamp_ns;
-        exchange.drain_due_scheduled_tasks(timestamp_ns, reports);
-    }
-
-    match *event {
-        JournalEvent::App(crate::trading_event::TradingEvent::AddInstrument { spec }) => {
-            exchange.add_instrument(spec);
-        }
-        JournalEvent::App(crate::trading_event::TradingEvent::Deposit {
-            account,
-            currency,
-            amount,
-        }) => {
-            exchange.deposit(account, currency, amount);
-        }
-        JournalEvent::App(crate::trading_event::TradingEvent::SubmitOrder { symbol, order }) => {
-            exchange.execute(symbol, order, reports);
-        }
-        JournalEvent::App(crate::trading_event::TradingEvent::CancelOrder {
-            symbol,
-            account,
-            order_id,
-        }) => {
-            exchange.cancel(symbol, account, order_id, reports);
-        }
-        JournalEvent::App(crate::trading_event::TradingEvent::SetRiskLimits { symbol, limits }) => {
-            exchange.set_risk_limits(symbol, limits);
-        }
-        JournalEvent::App(crate::trading_event::TradingEvent::CancelAll { account }) => {
-            exchange.cancel_all(account, reports);
-        }
-        JournalEvent::App(crate::trading_event::TradingEvent::EndOfDay) => {
-            exchange.end_of_day(reports);
-        }
-        JournalEvent::App(crate::trading_event::TradingEvent::SetCircuitBreaker {
-            symbol,
-            config,
-        }) => {
-            exchange.set_circuit_breaker(symbol, config);
-        }
-        JournalEvent::App(crate::trading_event::TradingEvent::CancelReplace {
-            symbol,
-            account,
-            order_id,
-            new_price,
-            new_quantity,
-        }) => {
-            exchange.cancel_replace(symbol, account, order_id, new_price, new_quantity, reports);
-        }
-        JournalEvent::App(crate::trading_event::TradingEvent::SetFeeSchedule {
-            symbol,
-            schedule,
-        }) => {
-            exchange.set_fee_schedule(symbol, schedule, reports);
-        }
-        JournalEvent::App(crate::trading_event::TradingEvent::ProvisionAccount {
-            account,
-            amount,
-        }) => {
-            exchange.provision_account(account, amount);
-        }
-        JournalEvent::App(crate::trading_event::TradingEvent::Withdraw {
-            account,
-            currency,
-            amount,
-        }) => {
-            // Withdraw errors (insufficient balance, resting orders) are
-            // non-fatal on replay — the journal recorded the attempt, and
-            // the original error was already returned to the client.
-            let _ = exchange.withdraw(account, currency, amount);
-        }
-        JournalEvent::App(crate::trading_event::TradingEvent::DisableInstrument { symbol }) => {
-            exchange.disable_instrument(symbol, reports);
-        }
-        JournalEvent::App(crate::trading_event::TradingEvent::EnableInstrument { symbol }) => {
-            exchange.enable_instrument(symbol, reports);
-        }
-        JournalEvent::App(crate::trading_event::TradingEvent::RemoveInstrument { symbol }) => {
-            exchange.remove_instrument(symbol, reports);
-        }
-        JournalEvent::Tick { now_ns } => {
-            // Defensive: head-of-event drain typically already advanced to
-            // this point. Re-draining via the explicit `now_ns` payload
-            // keeps the contract consistent for callers that pass
-            // `timestamp_ns = 0` (tests, manually replayed entries).
-            exchange.drain_due_scheduled_tasks(now_ns, reports);
-        }
-        JournalEvent::App(crate::trading_event::TradingEvent::QueryStats)
-        | JournalEvent::App(crate::trading_event::TradingEvent::QueryPosition { .. })
-        | JournalEvent::App(crate::trading_event::TradingEvent::QueryRequestSeq) => {
-            // Read-only queries are never journaled, so they should never
-            // appear during replay. No-op if they somehow do.
-        }
-        JournalEvent::GenesisHash { .. } | JournalEvent::Checkpoint { .. } => {
-            // Hash chain metadata — no exchange state change.
-        }
-        JournalEvent::Shutdown => {
-            // Pipeline-only sentinel — never journaled, so unreachable on
-            // the replay path. Defensive no-op.
-        }
-    }
-}
+//! Engine-side journal recovery tests (formerly contained the
+//! `JournaledExchange` synchronous wrapper, now deleted in favour of
+//! `melin_transport_core::JournaledApp<Exchange, _>`). The wrapper's
+//! API survives only as a test harness inside the `tests` module so
+//! the long-standing recovery / snapshot / crash tests don't have to
+//! open-code the journal-then-apply dance.
 
 #[cfg(test)]
 mod tests {
     use std::num::NonZeroU64;
 
-    use super::*;
-    use crate::journal::BufferedWriter;
+    use crate::journal::{BufferedWriter, SectorWriter};
     use crate::types::*;
 
-    // Concrete writer used by every test in this module. The choice
-    // doesn't affect the behaviour under test — all journaling paths
-    // produce the same on-disk layout — so we standardise on the
-    // production default (buffered + fdatasync) for portability.
-    type TestExchange = JournaledExchange<BufferedWriter>;
+    use std::path::Path;
+
+    use melin_journal::{JournalError, JournalEvent, JournalWrite};
+    use melin_transport_core::journaled_app::{JournaledApp, JournaledAppError};
+
+    use crate::exchange::Exchange;
+    use crate::trading_event::TradingEvent;
+    use melin_transport_core::snapshot;
+
+    /// Synchronous journal-then-apply harness. Wraps
+    /// `JournaledApp<Exchange, BufferedWriter>` and re-exposes the
+    /// per-event methods (`execute`, `deposit`, …) the recovery tests
+    /// below need, so they read close to their pre-deletion shape.
+    /// Production never journals-then-applies on the same thread; it
+    /// runs the journal stage and matching stage on separate disruptor
+    /// rings. This harness exists only because every test would
+    /// otherwise open-code the same `writer.append` + `exchange.apply`
+    /// dance.
+    struct TestExchange {
+        inner: JournaledApp<Exchange, BufferedWriter>,
+    }
+
+    impl TestExchange {
+        fn create(path: &Path) -> Result<Self, JournaledAppError> {
+            JournaledApp::create(Exchange::with_capacity(), path).map(|inner| Self { inner })
+        }
+
+        fn recover(path: &Path) -> Result<Self, JournaledAppError> {
+            JournaledApp::recover(Exchange::with_capacity(), path).map(|inner| Self { inner })
+        }
+
+        fn recover_from_snapshot(
+            snapshot_path: &Path,
+            journal_path: &Path,
+        ) -> Result<Self, JournaledAppError> {
+            JournaledApp::recover_from_snapshot(snapshot_path, journal_path)
+                .map(|inner| Self { inner })
+        }
+
+        fn from_parts(exchange: Exchange, writer: BufferedWriter) -> Self {
+            Self {
+                inner: JournaledApp::from_parts(exchange, writer),
+            }
+        }
+
+        fn save_snapshot(&self, path: &Path) -> Result<(), JournaledAppError> {
+            self.inner.save_snapshot(path)
+        }
+
+        fn rotate_segment(&mut self) -> Result<(), JournaledAppError> {
+            self.inner.rotate_segment()
+        }
+
+        fn exchange(&self) -> &Exchange {
+            self.inner.app()
+        }
+
+        fn next_sequence(&self) -> u64 {
+            self.inner.next_sequence()
+        }
+
+        fn writer_chain_hash(&self) -> Option<[u8; 32]> {
+            self.inner.chain_hash()
+        }
+
+        fn journal_size(&self) -> u64 {
+            self.inner.journal_size()
+        }
+
+        fn add_instrument(&mut self, spec: InstrumentSpec) -> Result<(), JournalError> {
+            let mut reports = Vec::new();
+            self.inner
+                .apply_journaled(TradingEvent::AddInstrument { spec }, &mut reports)?;
+            Ok(())
+        }
+
+        fn deposit(
+            &mut self,
+            account: AccountId,
+            currency: CurrencyId,
+            amount: u64,
+        ) -> Result<(), JournalError> {
+            let mut reports = Vec::new();
+            self.inner.apply_journaled(
+                TradingEvent::Deposit {
+                    account,
+                    currency,
+                    amount,
+                },
+                &mut reports,
+            )?;
+            Ok(())
+        }
+
+        fn cancel_all(
+            &mut self,
+            account: AccountId,
+            reports: &mut Vec<ExecutionReport>,
+        ) -> Result<(), JournalError> {
+            self.inner
+                .apply_journaled(TradingEvent::CancelAll { account }, reports)?;
+            Ok(())
+        }
+
+        /// Journal the withdraw event unconditionally (so replay re-
+        /// fires the same rejection), then call `Exchange::withdraw`
+        /// directly to capture its rejection. The pipeline's
+        /// `TradingEvent::Withdraw` arm discards this error today;
+        /// `Exchange::withdraw` is the only API that surfaces it.
+        fn withdraw(
+            &mut self,
+            account: AccountId,
+            currency: CurrencyId,
+            amount: u64,
+        ) -> Result<(), RejectReason> {
+            self.inner
+                .writer_mut()
+                .append(&JournalEvent::App(TradingEvent::Withdraw {
+                    account,
+                    currency,
+                    amount,
+                }))
+                .expect("journal write");
+            self.inner.app_mut().withdraw(account, currency, amount)
+        }
+
+        fn set_risk_limits(
+            &mut self,
+            symbol: Symbol,
+            limits: RiskLimits,
+        ) -> Result<(), JournalError> {
+            let mut reports = Vec::new();
+            self.inner
+                .apply_journaled(TradingEvent::SetRiskLimits { symbol, limits }, &mut reports)?;
+            Ok(())
+        }
+
+        fn set_circuit_breaker(
+            &mut self,
+            symbol: Symbol,
+            config: CircuitBreakerConfig,
+        ) -> Result<(), JournalError> {
+            let mut reports = Vec::new();
+            self.inner.apply_journaled(
+                TradingEvent::SetCircuitBreaker { symbol, config },
+                &mut reports,
+            )?;
+            Ok(())
+        }
+
+        fn set_fee_schedule(
+            &mut self,
+            symbol: Symbol,
+            schedule: FeeSchedule,
+            reports: &mut Vec<ExecutionReport>,
+        ) -> Result<(), JournalError> {
+            self.inner
+                .apply_journaled(TradingEvent::SetFeeSchedule { symbol, schedule }, reports)?;
+            Ok(())
+        }
+
+        fn execute(
+            &mut self,
+            symbol: Symbol,
+            order: Order,
+            reports: &mut Vec<ExecutionReport>,
+        ) -> Result<(), JournalError> {
+            self.inner
+                .apply_journaled(TradingEvent::SubmitOrder { symbol, order }, reports)?;
+            Ok(())
+        }
+
+        fn cancel(
+            &mut self,
+            symbol: Symbol,
+            account: AccountId,
+            order_id: OrderId,
+            reports: &mut Vec<ExecutionReport>,
+        ) -> Result<(), JournalError> {
+            self.inner.apply_journaled(
+                TradingEvent::CancelOrder {
+                    symbol,
+                    account,
+                    order_id,
+                },
+                reports,
+            )?;
+            Ok(())
+        }
+
+        fn tick(
+            &mut self,
+            now_ns: u64,
+            reports: &mut Vec<ExecutionReport>,
+        ) -> Result<(), JournalError> {
+            self.inner.tick_journaled(now_ns, reports)?;
+            Ok(())
+        }
+    }
 
     /// First user-event sequence: 2 with hash-chain (genesis takes 1), 1 without.
     #[cfg(feature = "hash-chain")]
@@ -821,22 +375,41 @@ mod tests {
             .unwrap();
         }
 
-        // Replay should produce identical reports.
+        // Replay should produce identical reports. Walk the journal
+        // and feed each App event through the canonical
+        // `Application::apply` dispatch — same path the production
+        // matching stage uses during recovery.
         let mut reader = crate::journal::JournalReader::open(&path).unwrap();
         let mut replay_exchange = Exchange::new();
         let mut replay_reports = Vec::new();
         let mut last_drain_ns: u64 = 0;
 
+        use melin_app::Application;
         while let Some(entry) = reader.next_entry().unwrap() {
-            replay_event(
-                &mut replay_exchange,
-                &entry.event,
-                entry.timestamp_ns,
-                entry.key_hash,
-                entry.request_seq,
-                &mut last_drain_ns,
-                &mut replay_reports,
-            );
+            match entry.event {
+                JournalEvent::App(event) => {
+                    replay_exchange.check_request_seq(entry.key_hash, entry.request_seq);
+                    if entry.timestamp_ns > last_drain_ns {
+                        last_drain_ns = entry.timestamp_ns;
+                        replay_exchange
+                            .drain_due_scheduled_tasks(entry.timestamp_ns, &mut replay_reports);
+                    }
+                    let ctx = melin_app::ApplyCtx {
+                        now_ns: entry.timestamp_ns,
+                        journal_sequence: entry.sequence,
+                        active_connections: 0,
+                        events_processed: 0,
+                        key_hash: entry.key_hash,
+                    };
+                    replay_exchange.apply(event, &ctx, &mut replay_reports);
+                }
+                JournalEvent::Tick { now_ns } => {
+                    replay_exchange.drain_due_scheduled_tasks(now_ns, &mut replay_reports);
+                }
+                JournalEvent::GenesisHash { .. }
+                | JournalEvent::Checkpoint { .. }
+                | JournalEvent::Shutdown => {}
+            }
         }
 
         assert_eq!(original_reports, replay_reports);
@@ -1396,7 +969,7 @@ mod tests {
         }
 
         // Load snapshot and verify chain hash.
-        let (_, _, loaded_hash) = snapshot::load(&snap_path).unwrap();
+        let (_, _, loaded_hash) = snapshot::load::<Exchange>(&snap_path).unwrap();
         assert_eq!(loaded_hash, chain_hash_at_snap);
     }
 
@@ -1548,72 +1121,43 @@ mod tests {
 
     #[test]
     fn withdraw_insufficient_balance_returns_error() {
-        // Regression: JournaledExchange::withdraw used to silently discard
-        // the underlying RejectReason and return Ok, hiding failures from
-        // the caller. The journaled event must still be recorded (for
-        // deterministic replay), but the API must surface the rejection.
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("withdraw_err.journal");
-
-        let mut je = TestExchange::create(&path).unwrap();
-        je.deposit(ACCT_A, USD, 100).unwrap();
-
-        let err = je.withdraw(ACCT_A, USD, 200).unwrap_err();
-        assert!(
-            matches!(
-                err,
-                JournaledExchangeError::Rejected(RejectReason::InsufficientBalance)
-            ),
-            "expected Rejected(InsufficientBalance), got {err:?}"
-        );
-
-        // Balance must be unchanged.
-        assert_eq!(je.exchange().accounts().balance(ACCT_A, USD).available, 100);
+        // Property test on `Exchange::withdraw` directly: it must
+        // surface the underlying RejectReason rather than returning Ok
+        // on failure.
+        //
+        // Note: in the live pipeline the `TradingEvent::Withdraw` arm
+        // (see `application_impl.rs`) currently *discards* this error
+        // and the client sees no response. A test routed through the
+        // journaled path would be testing a synthetic contract; the
+        // domain property lives on `Exchange::withdraw`.
+        let mut exchange = Exchange::new();
+        exchange.deposit(ACCT_A, USD, 100);
+        let err = exchange.withdraw(ACCT_A, USD, 200).unwrap_err();
+        assert_eq!(err, RejectReason::InsufficientBalance);
+        // Balance unchanged.
+        assert_eq!(exchange.accounts().balance(ACCT_A, USD).available, 100);
     }
 
     #[test]
     fn withdraw_with_resting_orders_returns_error() {
-        // A withdraw against an account with resting orders must be rejected
-        // and the rejection must be surfaced to the caller. The journal entry
-        // is still appended so replay reproduces the same outcome.
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("withdraw_resting.journal");
-
-        let mut je = TestExchange::create(&path).unwrap();
-        je.add_instrument(btc_usd_spec()).unwrap();
-        je.deposit(ACCT_A, USD, 100_000).unwrap();
-
+        let mut exchange = Exchange::new();
+        exchange.add_instrument(btc_usd_spec());
+        exchange.deposit(ACCT_A, USD, 100_000);
         let mut reports = Vec::new();
-        je.execute(
+        exchange.execute(
             Symbol(1),
             limit_order(1, ACCT_A, Side::Buy, 100, 10),
             &mut reports,
-        )
-        .unwrap();
-
-        let err = je.withdraw(ACCT_A, USD, 1).unwrap_err();
-        assert!(
-            matches!(
-                err,
-                JournaledExchangeError::Rejected(RejectReason::HasRestingOrders)
-            ),
-            "expected Rejected(HasRestingOrders), got {err:?}"
         );
+        let err = exchange.withdraw(ACCT_A, USD, 1).unwrap_err();
+        assert_eq!(err, RejectReason::HasRestingOrders);
     }
 
     #[test]
     fn withdraw_unknown_account_returns_error() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("withdraw_unknown.journal");
-        let mut je = TestExchange::create(&path).unwrap();
-        let err = je.withdraw(ACCT_A, USD, 1).unwrap_err();
-        assert!(
-            matches!(
-                err,
-                JournaledExchangeError::Rejected(RejectReason::UnknownAccount)
-            ),
-            "expected Rejected(UnknownAccount), got {err:?}"
-        );
+        let mut exchange = Exchange::new();
+        let err = exchange.withdraw(ACCT_A, USD, 1).unwrap_err();
+        assert_eq!(err, RejectReason::UnknownAccount);
     }
 
     #[test]
@@ -1638,13 +1182,7 @@ mod tests {
             // This withdraw is journaled but rejected at execution because
             // the account has a resting order. The error must be surfaced.
             let err = je.withdraw(ACCT_A, USD, 1_000).unwrap_err();
-            assert!(
-                matches!(
-                    err,
-                    JournaledExchangeError::Rejected(RejectReason::HasRestingOrders)
-                ),
-                "expected Rejected(HasRestingOrders), got {err:?}"
-            );
+            assert_eq!(err, RejectReason::HasRestingOrders);
         }
 
         // Replay: the rejected withdraw should be a no-op.
@@ -1813,7 +1351,7 @@ mod tests {
         je.save_snapshot(&snapshot_path).unwrap();
 
         // Load snapshot into a fresh exchange.
-        let (restored, _seq, _chain) = super::snapshot::load(&snapshot_path).unwrap();
+        let (restored, _seq, _chain) = snapshot::load::<Exchange>(&snapshot_path).unwrap();
         let hwm = restored.snapshot_key_hwm();
         assert_eq!(hwm.len(), 1);
         assert_eq!(hwm[0], (key_hash, 5));
@@ -2057,7 +1595,7 @@ mod tests {
         drop(engine);
 
         // Snapshot state (for comparison when all post-rotation events are lost).
-        let (snap_exchange, snap_seq, _snap_hash) = super::snapshot::load(&snap_path).unwrap();
+        let (snap_exchange, snap_seq, _snap_hash) = snapshot::load::<Exchange>(&snap_path).unwrap();
         let snap_bal_a_usd = snap_exchange.accounts().balance(ACCT_A, USD).available;
 
         let end = valid_data_end(&journal_path);
@@ -2106,9 +1644,9 @@ mod tests {
         std::fs::remove_file(&journal_path).ok();
         // The server's init_engine handles this case by loading the snapshot
         // and creating a fresh journal. Simulate that path here.
-        let (exchange, seq, chain_hash) = super::snapshot::load(&snap_path).unwrap();
+        let (exchange, seq, chain_hash) = snapshot::load::<Exchange>(&snap_path).unwrap();
         let writer = BufferedWriter::create_continuing(&journal_path, seq + 1, chain_hash).unwrap();
-        let je = JournaledExchange::from_parts(exchange, writer);
+        let je = TestExchange::from_parts(exchange, writer);
         assert_eq!(
             je.exchange().accounts().balance(ACCT_A, USD).available,
             snap_bal_a_usd
@@ -2530,7 +2068,7 @@ mod tests {
         events
     }
 
-    /// Apply a TestEvent to a JournaledExchange.
+    /// Apply a TestEvent to the `TestExchange` harness.
     fn apply_event(je: &mut TestExchange, evt: &TestEvent, reports: &mut Vec<ExecutionReport>) {
         match evt {
             TestEvent::AddInstrument(spec) => {
@@ -2553,12 +2091,10 @@ mod tests {
             }
             TestEvent::Withdraw(acct, cur, amt) => {
                 // Random workload may legitimately hit rejections
-                // (insufficient balance, resting orders); replay must
-                // still reproduce them deterministically.
-                match je.withdraw(*acct, *cur, *amt) {
-                    Ok(()) | Err(JournaledExchangeError::Rejected(_)) => {}
-                    Err(e) => panic!("unexpected journal error: {e:?}"),
-                }
+                // (insufficient balance, resting orders); both Ok and
+                // Err are expected here, the journaled event captures
+                // either outcome for deterministic replay.
+                let _ = je.withdraw(*acct, *cur, *amt);
             }
         }
     }

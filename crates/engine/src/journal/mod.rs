@@ -5,17 +5,15 @@
 //! `melin-transport-core`. This module re-exports them with the
 //! trading-bound aliases so engine-internal and server-side callers can
 //! keep using `JournalEvent`, `InputSlot`, `Pipeline`, etc. without
-//! spelling the generic every time. The legacy synchronous
-//! `JournaledExchange` wrapper and the Exchange-aware snapshot framing
-//! stay here because they're entangled with `Exchange` internals.
+//! spelling the generic every time. The Exchange-aware snapshot framing
+//! lives here too, since it's entangled with `Exchange` internals.
 
-pub mod engine;
+#[cfg(test)]
+mod engine;
 pub mod snapshot;
 
 #[cfg(test)]
 pub mod halt_tests;
-
-pub use engine::{JournaledExchange, JournaledExchangeError};
 
 /// The `TradingEvent`-parameterised journal types — aliased here so
 /// engine/server code doesn't have to spell the generic every time.
