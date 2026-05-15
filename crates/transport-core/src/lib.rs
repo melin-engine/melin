@@ -25,4 +25,7 @@ pub mod trace;
 #[cfg(test)]
 mod test_support;
 
+#[cfg(test)]
+mod pipeline_tests;
+
 pub use journaled_app::{JournaledApp, JournaledAppError};

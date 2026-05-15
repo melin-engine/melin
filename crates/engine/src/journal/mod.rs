@@ -13,7 +13,7 @@ pub mod engine;
 pub mod snapshot;
 
 #[cfg(test)]
-pub mod pipeline_tests;
+pub mod halt_tests;
 
 pub use engine::{JournaledExchange, JournaledExchangeError};
 
