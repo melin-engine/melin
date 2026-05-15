@@ -35,7 +35,7 @@ use melin_rumcast::sub_log::{SubscriptionConfig, SubscriptionLog};
 use melin_rumcast::wire::{FrameView, data_flags};
 use melin_server::rumcast_transport::{RumcastConfig, run_rumcast};
 use melin_server::server::ServerConfig;
-use melin_trading::types::{
+use melin_types::types::{
     AccountId, Order, OrderId, OrderType, Price, Quantity, SelfTradeProtection, Side, Symbol,
     TimeInForce,
 };
