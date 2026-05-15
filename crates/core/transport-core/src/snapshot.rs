@@ -24,6 +24,10 @@ use std::path::Path;
 use melin_app::Application;
 
 const SNAP_MAGIC: u32 = 0x534E_4150;
+const TRANSPORT_VERSION: u16 = 1;
+const HEADER_SIZE: usize = 4 + 2 + 2 + 8 + 32; // magic + t_ver + a_ver + seq + hash
+const CRC_SIZE: usize = 4;
+const MAX_SNAPSHOT_SIZE: u64 = 256 * 1024 * 1024;
 
 /// Suffix appended to the snapshot path for the one-deep rollback file.
 const PREV_SUFFIX: &str = ".prev";
@@ -38,10 +42,6 @@ fn prev_snapshot_path(path: &Path) -> std::path::PathBuf {
     prev.push(PREV_SUFFIX);
     std::path::PathBuf::from(prev)
 }
-const TRANSPORT_VERSION: u16 = 1;
-const HEADER_SIZE: usize = 4 + 2 + 2 + 8 + 32; // magic + t_ver + a_ver + seq + hash
-const CRC_SIZE: usize = 4;
-const MAX_SNAPSHOT_SIZE: u64 = 256 * 1024 * 1024;
 
 /// Error surfaced by [`save`] and [`load`].
 #[derive(Debug)]
