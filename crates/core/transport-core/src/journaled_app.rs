@@ -482,7 +482,7 @@ fn verify_segment_boundary(
 mod tests {
     use super::*;
     use crate::test_support::{TestApp, TestEvent};
-    use melin_journal::{BufferedWriter, JournalEvent};
+    use melin_journal::{BufferedWriter, JournalEvent, JournalReader};
 
     // Concrete writer used by every test. The buffered path covers
     // the same JournaledApp logic without needing PLP hardware.
@@ -983,6 +983,226 @@ mod tests {
 
         let recovered = TestApp_::recover(TestApp::new(), &journal_path).unwrap();
         assert_eq!(recovered.app().total, expected);
+    }
+
+    /// Replicas may restore from a snapshot whose chain hash is the
+    /// `[0u8; 32]` "uninitialized" sentinel (e.g. an older snapshot
+    /// written before hash-chain tracking). `recover_from_snapshot`
+    /// must still load the app state and replay the post-snapshot
+    /// journal delta — `seed_chain_hash` treats the sentinel as a
+    /// no-op rather than seeding the chain with zeros.
+    #[test]
+    fn recover_from_snapshot_accepts_zero_chain_hash_sentinel() {
+        let dir = tempfile::tempdir().unwrap();
+        let journal_path = dir.path().join("journal.bin");
+        let snap_path = dir.path().join("snap.bin");
+
+        let pre = [TestEvent::Add(3), TestEvent::Add(5)];
+        let post = [TestEvent::Add(7), TestEvent::Add(11)];
+
+        let ja = TestApp_::create(TestApp::new(), &journal_path).unwrap();
+        let ja = append_events(ja, &pre, 1);
+        drop(ja);
+
+        // `append_events` writes the journal but doesn't apply to the
+        // app — recover() to get a populated app, then save a snapshot
+        // through the generic API with the all-zero sentinel chain
+        // hash (replica scenario, where the chain isn't tracked).
+        let ja = TestApp_::recover(TestApp::new(), &journal_path).unwrap();
+        let seq = ja.next_sequence().saturating_sub(1);
+        snapshot::save::<TestApp>(ja.app(), seq, [0u8; 32], &snap_path).unwrap();
+        let ja = append_events(ja, &post, 1 + pre.len() as u64);
+        drop(ja);
+
+        let recovered = TestApp_::recover_from_snapshot(&snap_path, &journal_path).unwrap();
+        let all: Vec<TestEvent> = pre.iter().chain(post.iter()).copied().collect();
+        assert_eq!(recovered.app().total, expected_state(&all, 1).total);
+    }
+
+    /// Exhaustive crash simulation: truncate the journal at every byte
+    /// from the file header through the valid-data end, and verify
+    /// recovery succeeds at each cut. After each recovery, append one
+    /// more event and re-recover to prove the recovered writer is
+    /// usable, not just readable. Complements the per-phase crash tests
+    /// above by sweeping the full corruption-boundary space (mid-CRC,
+    /// mid-payload, partial header, …) rather than hitting fixed phases.
+    ///
+    /// Runs across all available cores. Each iteration is independent
+    /// (its own work file), and per-iteration cost is dominated by
+    /// kernel I/O wait (`fallocate` + `fdatasync`), so the workers add
+    /// negligible CPU pressure for neighbouring tests.
+    #[test]
+    fn crash_at_every_byte_offset_recovers() {
+        // Shrink the prealloc chunk so each recover()-then-append cycle
+        // doesn't pay the default 256 MiB fallocate cost. The override
+        // is process-global but only affects later writes; siblings
+        // that don't depend on prealloc size are unaffected.
+        melin_journal::test_utils::set_prealloc_chunk_bytes_override(Some(1024 * 1024));
+
+        let dir = tempfile::tempdir().unwrap();
+        let original = dir.path().join("original.journal");
+
+        let events = [
+            TestEvent::Add(3),
+            TestEvent::Add(5),
+            TestEvent::Add(7),
+            TestEvent::Add(11),
+            TestEvent::Add(13),
+            TestEvent::Add(17),
+        ];
+        let ja = TestApp_::create(TestApp::new(), &original).unwrap();
+        let ja = append_events(ja, &events, 1);
+        drop(ja);
+
+        let end = valid_data_end(&original);
+        let header_end = melin_journal::codec::FILE_HEADER_SIZE as u64;
+        assert!(end > header_end, "journal should have data beyond header");
+
+        // Shrink the original to its valid data size. The pre-allocated
+        // tail (1 MiB under the override above) would otherwise be
+        // copied per iteration.
+        {
+            let f = std::fs::OpenOptions::new()
+                .write(true)
+                .open(&original)
+                .unwrap();
+            f.set_len(end).unwrap();
+        }
+
+        let num_threads = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(4);
+        let work_dir = dir.path().to_path_buf();
+        std::thread::scope(|scope| {
+            for tid in 0..num_threads {
+                let original = &original;
+                let work_dir = &work_dir;
+                scope.spawn(move || {
+                    let work = work_dir.join(format!("work-{tid}.journal"));
+                    // Stride truncation offsets across threads so each
+                    // worker sees a mix of small and large truncations.
+                    let mut trunc_at = header_end + tid as u64;
+                    while trunc_at <= end {
+                        std::fs::copy(original, &work).unwrap();
+                        {
+                            let f = std::fs::OpenOptions::new().write(true).open(&work).unwrap();
+                            f.set_len(trunc_at).unwrap();
+                        }
+
+                        let je = TestApp_::recover(TestApp::new(), &work).unwrap();
+                        assert!(je.next_sequence() >= 1, "seq underflow at byte {trunc_at}");
+
+                        // Append + re-recover to prove the recovered
+                        // writer is usable, not just readable.
+                        let ja = append_events(je, &[TestEvent::Add(1)], events.len() as u64 + 1);
+                        drop(ja);
+                        let je2 = TestApp_::recover(TestApp::new(), &work).unwrap();
+                        assert!(
+                            je2.next_sequence() >= 2,
+                            "double-recovery seq too low at byte {trunc_at}"
+                        );
+
+                        trunc_at += num_threads as u64;
+                    }
+                });
+            }
+        });
+    }
+
+    /// Crash during/after rotation: snapshot + rotate + post-rotation
+    /// events, then truncate the new live segment at every byte and
+    /// recover from snapshot + truncated journal. Every truncation must
+    /// produce a `next_sequence` in `(snap_seq, final_seq]` — the
+    /// snapshot always covers pre-rotation state, and truncation cannot
+    /// fabricate sequences past what was actually written. The tail of
+    /// the test covers the "live file missing entirely after rotation"
+    /// edge case, recovering from snapshot alone via `from_parts` +
+    /// `create_continuing`.
+    #[test]
+    fn crash_during_snapshot_rotation_recovers() {
+        // Shrink the prealloc chunk so each iteration's
+        // `recover_from_snapshot` doesn't pay the default 256 MiB
+        // fallocate for the new live segment.
+        melin_journal::test_utils::set_prealloc_chunk_bytes_override(Some(1024 * 1024));
+
+        let dir = tempfile::tempdir().unwrap();
+        let journal_path = dir.path().join("rotation.journal");
+        let snap_path = dir.path().join("rotation.snapshot");
+
+        let pre = [TestEvent::Add(3), TestEvent::Add(5), TestEvent::Add(7)];
+        let post = [TestEvent::Add(11), TestEvent::Add(13)];
+
+        let ja = TestApp_::create(TestApp::new(), &journal_path).unwrap();
+        let ja = append_events(ja, &pre, 1);
+        drop(ja);
+        // Recover to populate app state from journal, then snapshot —
+        // `append_events` doesn't apply to the app on the write path,
+        // so an immediate snapshot would capture total=0 and trivialise
+        // the missing-journal assertion at the end.
+        let mut ja = TestApp_::recover(TestApp::new(), &journal_path).unwrap();
+        ja.save_snapshot(&snap_path).unwrap();
+        ja.rotate_segment().unwrap();
+        let ja = append_events(ja, &post, 1 + pre.len() as u64);
+        let final_seq = ja.next_sequence();
+        drop(ja);
+
+        let (snap_app, snap_seq, snap_chain_hash) = snapshot::load::<TestApp>(&snap_path).unwrap();
+        let snap_total = snap_app.total;
+        assert!(snap_total > 0, "snapshot must capture pre-rotation state");
+
+        let end = valid_data_end(&journal_path);
+        let header_end = melin_journal::codec::FILE_HEADER_SIZE as u64;
+        let work = dir.path().join("work.journal");
+
+        // Shrink the new live to its valid data size to avoid copying
+        // the 256 MiB pre-allocated tail per iteration.
+        {
+            let f = std::fs::OpenOptions::new()
+                .write(true)
+                .open(&journal_path)
+                .unwrap();
+            f.set_len(end).unwrap();
+        }
+
+        for trunc_at in header_end..=end {
+            std::fs::copy(&journal_path, &work).unwrap();
+            {
+                let f = std::fs::OpenOptions::new().write(true).open(&work).unwrap();
+                f.set_len(trunc_at).unwrap();
+            }
+
+            let je = TestApp_::recover_from_snapshot(&snap_path, &work).unwrap();
+            assert!(
+                je.next_sequence() <= final_seq,
+                "seq overshoot at byte {trunc_at}: {} > {final_seq}",
+                je.next_sequence()
+            );
+            assert!(
+                je.next_sequence() > snap_seq,
+                "seq undershot snapshot at byte {trunc_at}"
+            );
+        }
+
+        // Live file missing entirely after rotation — recover from
+        // snapshot alone via from_parts + create_continuing, the same
+        // path the server's init takes.
+        // ok(): best-effort cleanup; the assertion below is what
+        // actually guards the path.
+        std::fs::remove_file(&journal_path).ok();
+        let writer =
+            BufferedWriter::create_continuing(&journal_path, snap_seq + 1, snap_chain_hash)
+                .unwrap();
+        let je = JournaledApp::from_parts(snap_app, writer);
+        assert_eq!(je.app().total, snap_total);
+    }
+
+    /// Helper for the byte-sweep crash tests: walk every entry in the
+    /// journal and return the byte offset where the valid data ends
+    /// (before any pre-allocated tail).
+    fn valid_data_end(path: &Path) -> u64 {
+        let mut reader = JournalReader::<TestEvent>::open(path).unwrap();
+        while reader.next_entry().unwrap().is_some() {}
+        reader.valid_file_end()
     }
 
     /// Phase D crash: rotation completed and the new live has begun
