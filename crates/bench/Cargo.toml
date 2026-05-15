@@ -16,10 +16,12 @@ trading = ["melin-server/trading"]
 hash-chain = ["melin-server/hash-chain"]
 ## Forward to `melin-server/release-tracing` (compile out debug!/trace!).
 release-tracing = ["melin-server/release-tracing"]
-## Transport-only noop app — mutually exclusive with `trading` at the
-## server level. Use `--no-default-features --features=noop` to bench
-## the pipeline without the matching engine.
-noop = ["melin-server/noop"]
+## Transport-only build — short-circuits `Exchange::execute` so the
+## matching hot path is bypassed. Mutually exclusive with `trading` at
+## the server level. Use
+## `--no-default-features --features=skip-order-exec` to bench the
+## pipeline without the matching engine.
+skip-order-exec = ["melin-server/skip-order-exec"]
 no-persist = ["melin-server/no-persist"]
 ## Open the journal without `O_DIRECT`. Passthrough — see the
 ## `melin-journal` feature of the same name. Use this when benching on
@@ -38,8 +40,8 @@ io-uring = []
 ## because the server crate needs an app selected to compile, and
 ## `release-tracing` matches the production-style binary the DPDK rig
 ## benches against. Add `--features=hash-chain` separately if you want
-## to measure with the journal hash chain on; add `noop` and drop
-## `trading` to bench transport-only.
+## to measure with the journal hash chain on; add `skip-order-exec`
+## and drop `trading` to bench transport-only.
 dpdk = [
     "dep:melin-dpdk",
     "melin-dpdk/dpdk-sys",

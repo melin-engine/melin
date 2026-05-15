@@ -185,7 +185,7 @@ only as a cleanup pass; doesn't fix the real smell.
 - `JournalWriter` enum deleted.
 - No `unwrap_sector*` or `as_sector*` calls anywhere.
 - `cargo check` passes for all feature combinations: default,
-  `dpdk,trading`, `dpdk,noop`, `melin-bench --features dpdk`.
+  `dpdk,trading`, `dpdk,skip-order-exec`, `melin-bench --features dpdk`.
 - `tcp-dual-repl throughput` ≥ 3.6M ord/s on Cherry rig (current baseline:
   3.68M).
 - Standalone buffered ≥ 3.8M ord/s (current baseline: 3.85M).

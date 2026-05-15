@@ -1,28 +1,30 @@
-//! Trading / no-op server library — exposes server startup for embedding
-//! (benchmarks, tests). The concrete [`Application`] that plugs into the
-//! generic pipeline is selected at compile time through the `trading`
-//! and `noop` cargo features, exactly one of which must be enabled.
+//! Trading / transport-only server library — exposes server startup
+//! for embedding (benchmarks, tests). The mode is selected at compile
+//! time through the `trading` and `skip-order-exec` cargo features,
+//! exactly one of which must be enabled.
 
-#[cfg(all(feature = "trading", feature = "noop"))]
+#[cfg(all(feature = "trading", feature = "skip-order-exec"))]
 compile_error!(
-    "melin-server must be built with exactly one of the `trading` or `noop` features enabled"
+    "melin-server must be built with exactly one of the `trading` or \
+     `skip-order-exec` features enabled"
 );
-#[cfg(not(any(feature = "trading", feature = "noop")))]
+#[cfg(not(any(feature = "trading", feature = "skip-order-exec")))]
 compile_error!(
-    "melin-server must be built with exactly one of the `trading` or `noop` features enabled"
+    "melin-server must be built with exactly one of the `trading` or \
+     `skip-order-exec` features enabled"
 );
 
 /// The concrete [`Application`] this server is built against.
 ///
-/// Always `Exchange` — under `--features noop` the engine's `noop`
-/// feature short-circuits `Exchange::execute` to a single rejection
-/// per `SubmitOrder` so the matching hot path is bypassed, but the
-/// type stays uniform for downstream modules.
+/// Always `Exchange` — under `--features skip-order-exec` the engine
+/// short-circuits `Exchange::execute` to a single rejection per
+/// `SubmitOrder` so the matching hot path is bypassed, but the type
+/// stays uniform for downstream modules.
 pub type App = melin_engine::exchange::Exchange;
 
 /// Trading-bound ring-slot aliases. The server operates on the trading
-/// wire format regardless of which application is plugged in (that's
-/// the whole point of noop — same protocol, different matcher).
+/// wire format regardless of which mode it's built in (that's the
+/// whole point of skip-order-exec — same protocol, no matching).
 pub type JournalEvent = melin_journal::JournalEvent<melin_trading::trading_event::TradingEvent>;
 pub type InputSlot =
     melin_transport_core::pipeline::InputSlot<melin_trading::trading_event::TradingEvent>;
@@ -43,9 +45,9 @@ pub type JournalReader = melin_journal::JournalReader<melin_trading::trading_eve
 pub type TradingEvent = melin_trading::trading_event::TradingEvent;
 
 /// Control plane event the accept loop and response stage exchange.
-/// Defined at the crate root so both the trading `server` and the noop
-/// `server_noop` can refer to the same type (it's transport-agnostic —
-/// the payload is a socket fd + writer, not an app event).
+/// Defined at the crate root so both build modes refer to the same
+/// type (it's transport-agnostic — the payload is a socket fd +
+/// writer, not an app event).
 pub enum ControlEvent {
     Connected {
         connection_id: u64,
@@ -68,7 +70,7 @@ pub(crate) mod amortized_timer;
 pub mod durability_policy;
 /// Firehose event publisher — trading-only because it depends on
 /// `melin-market-data` for book-mirror snapshots.
-#[cfg(all(feature = "trading", not(feature = "noop")))]
+#[cfg(all(feature = "trading", not(feature = "skip-order-exec")))]
 pub mod event_publisher;
 pub mod health;
 mod reader;
@@ -78,16 +80,17 @@ pub mod tick;
 
 /// Replica failover and shadow snapshotting. Both are transport-level
 /// concerns and work for any `A: Application`, so they compile into the
-/// noop build too — that is precisely the point of the noop binary
-/// (stress the full durable transport without the matching engine).
+/// skip-order-exec build too — that's precisely the point of the
+/// transport-only binary (stress the full durable transport without
+/// the matching engine).
 pub mod replication;
 pub mod shadow;
 
 /// Server runtime (TCP accept loop, pipeline bootstrap, auth handshake).
-/// Both the trading and no-op builds share the same entry points — the
-/// feature-gated `App` alias plus the optional `replication` / `shadow`
-/// modules are what actually differ. Cfg branches inside `server.rs`
-/// select the right recovery/seed/shadow path per feature.
+/// Both build modes share the same entry points — only the engine's
+/// behaviour differs (full matching vs. skip-order-exec early return).
+/// Cfg branches inside `server.rs` select the right recovery/seed/
+/// shadow path per feature.
 pub mod server;
 
 #[cfg(feature = "dpdk")]

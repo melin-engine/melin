@@ -865,8 +865,9 @@ where
     // Used to enforce max_connections (SEC-02).
     let active_connections = Arc::new(AtomicU64::new(0));
 
-    // Determine replication mode. Both trading and noop builds ship the
-    // full durable transport (journal + replication + shadow), so the
+    // Determine replication mode. Both trading and skip-order-exec
+    // builds ship the full durable transport (journal + replication +
+    // shadow), so the
     // same config knob drives either binary.
     let enable_replication = config.replication_bind.is_some();
     if enable_replication && config.standalone {
@@ -910,8 +911,8 @@ where
 
     // Build the disruptor pipeline with optional replication consumer.
     // Event publisher is trading-only (market-data book mirrors); the
-    // noop build silently ignores `--event-bind` so the same invocation
-    // works against either binary.
+    // skip-order-exec build silently ignores `--event-bind` so the
+    // same invocation works against either binary.
     let enable_event_publisher = cfg!(feature = "trading") && config.event_bind.is_some();
     let Pipeline {
         input_producer,
@@ -1216,7 +1217,7 @@ where
     // consumer 1 and broadcasts all execution events to TCP subscribers.
     // Trading-only — the publisher depends on `melin-market-data` for
     // book-mirror snapshots; `spawn_event_publisher` is a no-op under
-    // the noop feature.
+    // the skip-order-exec feature.
     let event_publisher_handle = spawn_event_publisher(
         event_publisher_consumer,
         config,
@@ -1227,7 +1228,8 @@ where
     )?;
 
     // Spawn shadow snapshot thread if enabled. Works for any
-    // `A: Application` — the noop app just snapshots its trivial counter.
+    // `A: Application` — under `skip-order-exec` the Exchange state
+    // stays empty and the snapshot is trivially small.
     let shadow_handle = if let Some(shadow_cons) = shadow_consumer {
         let snap_path = config.shadow_snapshot_path();
         let interval = std::time::Duration::from_millis(config.snapshot_interval_ms);
@@ -2603,8 +2605,8 @@ where
 
 /// Spawn the event-publisher thread if the consumer was wired. The
 /// publisher is trading-only (it depends on `melin-market-data` for book
-/// mirrors); under the noop build this is a no-op and `consumer` is
-/// always `None`.
+/// mirrors); under the skip-order-exec build this is a no-op and
+/// `consumer` is always `None`.
 #[cfg(feature = "trading")]
 fn spawn_event_publisher(
     consumer: Option<melin_disruptor::ring::Consumer<crate::OutputSlot>>,
@@ -2650,7 +2652,7 @@ fn spawn_event_publisher(
     _busy_spin: bool,
 ) -> Result<Option<std::thread::JoinHandle<()>>, Box<dyn std::error::Error>> {
     // Caller suppresses event-publisher wiring via `enable_event_publisher`
-    // under the noop feature, so the consumer is always None.
+    // under the skip-order-exec feature, so the consumer is always None.
     debug_assert!(consumer.is_none());
     Ok(None)
 }

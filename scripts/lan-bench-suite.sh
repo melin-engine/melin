@@ -75,16 +75,19 @@
 #                       with NO_PERSIST. Use e.g. `no-o-direct` to bench
 #                       the journal without `O_DIRECT` (consumer NVMe
 #                       drives without Power Loss Protection).
-#   NOOP=1              Build `melin-server` with the no-op matching engine
-#                       (--no-default-features --features noop) so the run
-#                       isolates durable-transport cost from matching cost.
-#                       The bench client + wire protocol are unchanged, so
-#                       the server journals every request, NoopApp emits a
-#                       trivial rejection, and the full disruptor +
-#                       replication + shadow pipeline runs just like
-#                       trading. The LOCAL workloads `engine-only` and
-#                       `pipeline-only` are trading-only (they run a real
-#                       Exchange in-process) and are skipped under NOOP=1.
+#   SKIP_ORDER_EXEC=1   Build `melin-server` with the matching hot path
+#                       bypassed (--no-default-features
+#                       --features skip-order-exec) so the run isolates
+#                       durable-transport cost from matching cost. The
+#                       bench client + wire protocol are unchanged, so
+#                       the server journals every request,
+#                       `Exchange::execute` short-circuits to a trivial
+#                       rejection, and the full disruptor + replication
+#                       + shadow pipeline runs just like trading. The
+#                       LOCAL workloads `engine-only` and `pipeline-only`
+#                       are trading-only (they run a real Exchange
+#                       in-process) and are skipped under
+#                       SKIP_ORDER_EXEC=1.
 #   PERF=1              Capture `perf record` on the server's ingress core
 #                       (io_uring reader for kernel TCP, DPDK poll thread
 #                       for DPDK — both default to core 4 via reader_cores)
@@ -273,8 +276,8 @@ LOCAL_MATRIX=()
 for workload in "${WORKLOAD_LIST[@]}"; do
     workload="$(echo "$workload" | xargs)" # trim whitespace
     if [[ " ${LOCAL_WORKLOADS} " == *" ${workload} "* ]]; then
-        if [[ "${NOOP:-0}" == "1" ]]; then
-            echo "  SKIP local:${workload} — NOOP=1 (runs Exchange in-process; trading-only)"
+        if [[ "${SKIP_ORDER_EXEC:-0}" == "1" ]]; then
+            echo "  SKIP local:${workload} — SKIP_ORDER_EXEC=1 (runs Exchange in-process; trading-only)"
             continue
         fi
         LOCAL_MATRIX+=("$workload")
@@ -340,8 +343,8 @@ fi
 if [[ -n "$REPLICA2_PUB" ]]; then
     echo "  Replica2: ${REPLICA2_PUB} (VLAN: ${REPLICA2_VLAN})"
 fi
-if [[ "${NOOP:-0}" == "1" ]]; then
-    echo "  Server feature: NOOP (noop matching engine, trading wire)"
+if [[ "${SKIP_ORDER_EXEC:-0}" == "1" ]]; then
+    echo "  Server feature: skip-order-exec (matching bypassed, trading wire)"
 fi
 if [[ "${NO_PERSIST:-0}" == "1" ]]; then
     echo "  Server feature: NO_PERSIST (journal I/O skipped — results tagged -no-persist)"
@@ -387,24 +390,24 @@ if [[ -n "$REPLICA" ]]; then BUILD_HOSTS+=("$REPLICA"); fi
 if [[ -n "$REPLICA2" ]]; then BUILD_HOSTS+=("$REPLICA2"); fi
 
 # Cargo invocation for the server + bench release binaries. Feature
-# selection composes NOOP (server only, swaps to the noop matching
-# engine) and NO_PERSIST (skips journal I/O on every crate that exposes
-# the feature — unsafe for production but useful for benchmarking).
-# The bench client remains default-featured — it talks the trading wire
-# protocol regardless of the server flavor.
-# Internal feature-list variable for the noop build; deliberately
-# distinct from the user-facing `SERVER_FEATURES` env var below (the
-# latter drives a separate diagnostic-rebuild step).
-if [[ "${NOOP:-0}" == "1" ]]; then
-    NOOP_MAIN_FEATURES="noop"
+# selection composes SKIP_ORDER_EXEC (server only, bypasses the
+# matching hot path) and NO_PERSIST (skips journal I/O on every crate
+# that exposes the feature — unsafe for production but useful for
+# benchmarking). The bench client remains default-featured — it talks
+# the trading wire protocol regardless of the server mode.
+# Internal feature-list variable for the skip-order-exec build;
+# deliberately distinct from the user-facing `SERVER_FEATURES` env var
+# below (the latter drives a separate diagnostic-rebuild step).
+if [[ "${SKIP_ORDER_EXEC:-0}" == "1" ]]; then
+    SKIP_ORDER_EXEC_FEATURES="skip-order-exec"
     if [[ "${NO_PERSIST:-0}" == "1" ]]; then
-        NOOP_MAIN_FEATURES="noop,no-persist"
+        SKIP_ORDER_EXEC_FEATURES="skip-order-exec,no-persist"
     fi
     if [[ -n "${MAIN_EXTRA_FEATURES:-}" ]]; then
-        NOOP_MAIN_FEATURES="${NOOP_MAIN_FEATURES},${MAIN_EXTRA_FEATURES}"
+        SKIP_ORDER_EXEC_FEATURES="${SKIP_ORDER_EXEC_FEATURES},${MAIN_EXTRA_FEATURES}"
     fi
     MAIN_BUILD="cargo build --release -p melin-bench && \
-        cargo build --release -p melin-server --no-default-features --features ${NOOP_MAIN_FEATURES}"
+        cargo build --release -p melin-server --no-default-features --features ${SKIP_ORDER_EXEC_FEATURES}"
 else
     MAIN_FEATURES=""
     if [[ "${NO_PERSIST:-0}" == "1" ]]; then
@@ -460,13 +463,13 @@ fi
 # DPDK build on server (and replica if dpdk-repl).
 # In TAP mode, test-containers-start.sh already built the .dpdk binary.
 # In SR-IOV mode we rebuild melin-server here with the dpdk feature plus
-# the app selector (trading by default, noop under NOOP=1). `--features
-# dpdk` alone fails to compile — the server requires exactly one of
-# `trading` or `noop`.
+# the mode selector (trading by default, skip-order-exec under
+# SKIP_ORDER_EXEC=1). `--features dpdk` alone fails to compile — the
+# server requires exactly one of `trading` or `skip-order-exec`.
 if [[ "$NEED_DPDK" == "1" ]]; then
     # Feature set for the DPDK server build. Mirrors MAIN_BUILD above.
-    if [[ "${NOOP:-0}" == "1" ]]; then
-        DPDK_SERVER_FEATURES="dpdk,noop"
+    if [[ "${SKIP_ORDER_EXEC:-0}" == "1" ]]; then
+        DPDK_SERVER_FEATURES="dpdk,skip-order-exec"
     else
         DPDK_SERVER_FEATURES="dpdk,trading,hash-chain,release-tracing"
     fi

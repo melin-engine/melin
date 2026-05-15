@@ -230,11 +230,11 @@ fn dispatch_event(
 }
 
 // The shadow module's test suite exercises every trading-event branch
-// against a real `Exchange`. Under the noop build the equivalent
-// assertions would be trivial (every event produces the same rejection
-// report), so the suite is gated to the trading build rather than
-// rewritten.
-#[cfg(all(test, feature = "trading", not(feature = "noop")))]
+// against a real `Exchange`. Under `skip-order-exec` the equivalent
+// assertions would be trivial (every order produces the same
+// `NoLiquidity` rejection), so the suite is gated to the trading
+// build rather than rewritten.
+#[cfg(all(test, feature = "trading", not(feature = "skip-order-exec")))]
 mod tests {
     use super::*;
     use crate::JournalEvent;

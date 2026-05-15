@@ -10,15 +10,16 @@ default = ["trading", "hash-chain", "release-tracing"]
 ## tracing filter check (~5-10ns) on every call site in the hot path.
 ## Disable with --no-default-features to get RUST_LOG=debug back.
 release-tracing = ["tracing/max_level_info"]
-## App selection: `trading` is the real matching engine, `noop`
-## short-circuits `Exchange::execute` to a single rejection (used to
-## isolate transport throughput from matching cost). Exactly one must
-## be enabled; `melin-market-data` is trading-only and piggy-backs on
-## `trading`. The noop build still links `melin-engine`, but every
-## `SubmitOrder` is bypassed by the engine's `noop` feature so the
-## matching hot path is never exercised.
+## App selection: `trading` is the real matching engine,
+## `skip-order-exec` short-circuits `Exchange::execute` to a single
+## rejection (used to isolate transport throughput from matching cost).
+## Exactly one must be enabled. `melin-market-data` is trading-only and
+## piggy-backs on `trading`. The skip-order-exec build still links
+## `melin-engine` — every `SubmitOrder` is bypassed by the engine's
+## `skip-order-exec` feature so the matching hot path is never
+## exercised.
 trading = ["dep:melin-market-data"]
-noop = ["melin-engine/noop", "hash-chain", "release-tracing"]
+skip-order-exec = ["melin-engine/skip-order-exec", "hash-chain", "release-tracing"]
 no-persist = ["melin-engine/no-persist", "melin-transport-core/no-persist"]
 ## Lightweight per-stage histograms for the original 4 stages
 ## (journal/matching wakeup + execute, journal batch). Adds ~3-5 mutex
@@ -66,7 +67,7 @@ path = "src/main.rs"
 [[bin]]
 name = "melin-replication-bench"
 path = "src/bin/replication-bench.rs"
-required-features = ["noop"]
+required-features = ["skip-order-exec"]
 
 [dependencies]
 melin-app = { path = "../app" }

@@ -13,12 +13,13 @@
 //! exercises the real replication and promotion code paths.
 //!
 //! Trading-only — the scenarios under test (order submit / balance /
-//! matching invariants) are meaningful only against the real engine. The
-//! noop build's promoted replica would trivially pass because every order
-//! is rejected with `NoLiquidity`. When running `cargo test` against the
-//! noop build this file is compiled as an empty test crate.
+//! matching invariants) are meaningful only against the real engine.
+//! Under `skip-order-exec` the promoted replica would trivially pass
+//! because every order is rejected with `NoLiquidity`. When running
+//! `cargo test` against the skip-order-exec build this file is
+//! compiled as an empty test crate.
 
-#![cfg(all(feature = "trading", not(feature = "noop")))]
+#![cfg(all(feature = "trading", not(feature = "skip-order-exec")))]
 
 use ed25519_dalek::Signer;
 use serial_test::serial;

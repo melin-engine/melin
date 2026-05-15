@@ -12,8 +12,8 @@
 //!   input ring → replica journal + matching + drain → ack →
 //!   replication_cursor advance.
 //!
-//! Built with the `noop` feature so the matching stage is near-
-//! no-op on both sides — what we measure is the replication
+//! Built with the `skip-order-exec` feature so the matching stage
+//! short-circuits on both sides — what we measure is the replication
 //! plumbing, not exchange logic. Built with `no-persist` to skip
 //! disk I/O so the replication path's CPU cost dominates.
 
