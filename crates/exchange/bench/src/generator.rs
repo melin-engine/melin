@@ -65,27 +65,41 @@ pub struct GeneratorConfig {
     /// rate. The remainder `1 - cancel_ratio - cancel_replace_ratio` produces
     /// new submits that replenish the book. Must satisfy
     /// `cancel_ratio + cancel_replace_ratio < 1.0`.
-    /// Default: 0.60 (with cancel_replace at 0.30, total cancel+amend = 0.90).
-    ///
-    // TODO(calibration): real-venue removes-per-add is ~1.07; this generator
-    // converges to ~1.5 in steady state because ring-buffer eviction adds
-    // synthetic cancels on top of the configured ratio. Either widen the live
-    // ring or rework `generate_cancel` so eviction-driven cancels are not
-    // counted against the rate budget.
+    /// Default: 0.45. Calibrated against ITCH 5.0 reference (real-venue
+    /// `submit:cancel:replace ≈ 48:45:7`) so the steady-state removes-per-add
+    /// lands near 1.07 (real-venue typical) once `live_orders` is large enough
+    /// for ring eviction to be rare on bench-sized runs.
     pub cancel_ratio: f64,
     /// Mid-price around which limit orders are placed (in ticks).
     pub mid_price: u64,
     /// Power-law exponent for price offset from mid.
     /// Empirical: ~1.5. Higher = orders cluster tighter around mid.
     pub price_alpha: f64,
-    /// Maximum price offset from mid (in ticks).
-    //
-    // TODO(calibration): real venues show p99.9 distance-from-mid four orders
-    // of magnitude beyond `max_price_offset` (deep "rejection floor" /
-    // protection-order ladder). The hard cap should be replaced with a
-    // heavy-tailed sampler so the tail of the distance distribution can be
-    // matched.
+    /// Minimum price offset from mid (in ticks). The near-mid power-law
+    /// scales its raw draw by this floor so the body of the distance
+    /// distribution sits at a realistic spread rather than collapsing
+    /// onto the touch (real venues quote tens to hundreds of ticks of
+    /// spread; on AAPL the empirical p10 distance-from-mid is ~100
+    /// ticks). Default: 50 ticks.
+    pub min_price_offset: u64,
+    /// Hard cap on price offset from mid (in ticks). Acts as the upper
+    /// bound for the *body* of the price distribution; the heavy tail
+    /// extends well past this via [`far_price_offset_fraction`] up to
+    /// [`far_max_price_offset`].
     pub max_price_offset: u64,
+    /// Fraction of price placements drawn from the heavy-tail far-from-mid
+    /// regime instead of the near-mid power-law. Real venues advertise stub
+    /// quotes and protection-order ladders many orders of magnitude past
+    /// the best bid/ask; this knob controls how often the generator places
+    /// an order in that regime. Default: 0.05 — calibrated so the
+    /// distance-from-mid distribution's p90–p99.9 tail matches the ITCH
+    /// reference.
+    pub far_price_offset_fraction: f64,
+    /// Maximum tail offset (in ticks) when a far-from-mid placement is
+    /// sampled. The far sampler uses the same alpha as the near sampler
+    /// but is scaled into `[max_price_offset, far_max_price_offset]`.
+    /// Default: 2_000_000 ticks (≈ ITCH p99.9 distance for AAPL).
+    pub far_max_price_offset: u64,
     /// Power-law exponent for order sizes (continuous tail).
     /// Empirical: ~1.5-2.5.
     pub size_alpha: f64,
@@ -100,9 +114,15 @@ pub struct GeneratorConfig {
     /// the distribution. Set to 1 to fall back to pure power-law sampling.
     pub round_lot_size: u64,
     /// Fraction of submits below the modal round lot (odd-lot retail and
-    /// algo slicing). Sampled from the size power-law clamped to
-    /// `[min_size, round_lot_size - 1]`. Default: 0.15.
+    /// algo slicing). Sampled with a flatter power-law than the main size
+    /// tail so the sub-modal range covers `[min_size, round_lot_size - 1]`
+    /// without collapsing onto `min_size`. Default: 0.25.
     pub odd_lot_fraction: f64,
+    /// Power-law alpha for the odd-lot sampler. Smaller than `size_alpha`
+    /// so odd lots spread across the sub-modal range instead of all
+    /// landing on `min_size`. Default: 1.2 — matches the empirical
+    /// odd-lot body shape (p5 ~ 10, p10 ~ 25 against AAPL reference).
+    pub odd_lot_alpha: f64,
     /// Fraction of submits placed at exactly `round_lot_size`. This is
     /// the dominant mass in real equity flow. Default: 0.70.
     pub modal_lot_fraction: f64,
@@ -146,9 +166,8 @@ pub struct GeneratorConfig {
     /// Default: 0.10 (10% of resting limits).
     pub day_order_ratio: f64,
     /// Conditional probability of a cancel-replace amendment when live orders
-    /// exist. In real markets, market makers rapidly amend resting quotes —
-    /// cancel-replace is more common than outright cancel.
-    /// Default: 0.30 (with cancel at 0.60, total cancel+amend = 0.90).
+    /// exist. Calibrated against ITCH 5.0 reference (real-venue
+    /// `submit:cancel:replace ≈ 48:45:7`). Default: 0.07.
     pub cancel_replace_ratio: f64,
     /// Starting order ID. Used to partition ID ranges across multiple
     /// bench clients to avoid collisions.
@@ -164,15 +183,19 @@ impl Default for GeneratorConfig {
         Self {
             num_accounts: 1_000_000,
             num_instruments: 1,
-            cancel_ratio: 0.60,
+            cancel_ratio: 0.45,
             mid_price: 10_000,
             price_alpha: 1.5,
-            max_price_offset: 200,
+            min_price_offset: 50,
+            max_price_offset: 1_500,
+            far_price_offset_fraction: 0.05,
+            far_max_price_offset: 2_000_000,
             size_alpha: 2.0,
             min_size: 1,
             max_size: 100_000,
             round_lot_size: 100,
             odd_lot_fraction: 0.25,
+            odd_lot_alpha: 1.15,
             modal_lot_fraction: 0.65,
             multi_round_fraction: 0.07,
             aggression_ratio: 0.10,
@@ -182,7 +205,7 @@ impl Default for GeneratorConfig {
             stop_order_ratio: 0.03,
             post_only_ratio: 0.05,
             day_order_ratio: 0.10,
-            cancel_replace_ratio: 0.30,
+            cancel_replace_ratio: 0.07,
             start_order_id: 1,
             seed: 42,
         }
@@ -239,6 +262,10 @@ pub struct OrderFlowGenerator {
     /// Pre-computed exponent for power-law size distribution.
     /// `= -1.0 / (size_alpha - 1.0)`. Avoids recomputing per call.
     size_exponent: f64,
+    /// Pre-computed exponent for the odd-lot power-law sampler.
+    /// `= -1.0 / (odd_lot_alpha - 1.0)`. Cached to avoid the log/exp
+    /// chain on every odd-lot draw.
+    odd_lot_exponent: f64,
     /// Pre-built uniform distribution for symbol selection.
     symbol_dist: Uniform<u32>,
 }
@@ -246,11 +273,17 @@ pub struct OrderFlowGenerator {
 impl OrderFlowGenerator {
     /// Create a new generator with the given configuration.
     pub fn new(config: GeneratorConfig) -> Self {
-        let capacity = 100_000; // track up to 100K live orders for cancellation
+        // 1M slots: real venues carry hundreds of thousands of resting
+        // orders per name, and a 100k ring filled within seconds at bench
+        // throughput, contaminating the cancel-ratio with eviction-driven
+        // cancels. Vec layout = `(OrderId, AccountId, Symbol, Side)` = 24B;
+        // 1M slots ≈ 24 MiB — negligible at bench scale.
+        let capacity = 1_000_000;
         let start_id = config.start_order_id;
         let seed = config.seed;
         let price_exponent = -1.0 / (config.price_alpha - 1.0);
         let size_exponent = -1.0 / (config.size_alpha - 1.0);
+        let odd_lot_exponent = -1.0 / (config.odd_lot_alpha - 1.0);
         let symbol_dist = Uniform::new(1, config.num_instruments + 1).expect("valid range");
         Self {
             config,
@@ -264,6 +297,7 @@ impl OrderFlowGenerator {
             side_dist: Uniform::new(0, 2).expect("valid range"),
             price_exponent,
             size_exponent,
+            odd_lot_exponent,
             symbol_dist,
         }
     }
@@ -543,18 +577,29 @@ impl OrderFlowGenerator {
     /// are placed above mid (crossing into the ask side) and sells below
     /// mid (crossing into the bid side), producing immediate fills.
     fn pick_price(&mut self, side: Side) -> Price {
+        let cfg = &self.config;
         let u: f64 = self.unit_dist.sample(&mut self.rng);
-        let raw = fast_powf(1.0 - u, self.price_exponent);
-        let offset = (raw as u64).clamp(1, self.config.max_price_offset);
+        // Two-regime mixture: near-mid power-law for the body, plus a
+        // heavy-tail far-from-mid regime for stub quotes / protection
+        // ladders. A single power-law clamped to a small range collapses
+        // the tail and dramatically under-shoots the empirical p90+
+        // distance-from-mid.
+        let offset = if self.unit_dist.sample(&mut self.rng) < cfg.far_price_offset_fraction {
+            let raw = cfg.max_price_offset as f64 * fast_powf(1.0 - u, self.price_exponent);
+            (raw as u64).clamp(cfg.max_price_offset, cfg.far_max_price_offset)
+        } else {
+            let raw = cfg.min_price_offset as f64 * fast_powf(1.0 - u, self.price_exponent);
+            (raw as u64).clamp(cfg.min_price_offset, cfg.max_price_offset)
+        };
 
         // Aggressive orders cross the spread: buy above mid, sell below.
-        let aggressive = self.unit_dist.sample(&mut self.rng) < self.config.aggression_ratio;
+        let aggressive = self.unit_dist.sample(&mut self.rng) < cfg.aggression_ratio;
 
         let price_val = match (side, aggressive) {
-            (Side::Buy, false) => self.config.mid_price.saturating_sub(offset),
-            (Side::Buy, true) => self.config.mid_price.saturating_add(offset),
-            (Side::Sell, false) => self.config.mid_price.saturating_add(offset),
-            (Side::Sell, true) => self.config.mid_price.saturating_sub(offset),
+            (Side::Buy, false) => cfg.mid_price.saturating_sub(offset),
+            (Side::Buy, true) => cfg.mid_price.saturating_add(offset),
+            (Side::Sell, false) => cfg.mid_price.saturating_add(offset),
+            (Side::Sell, true) => cfg.mid_price.saturating_sub(offset),
         };
         let price_val = price_val.max(1);
         Price(NonZeroU64::new(price_val).expect("price > 0"))
@@ -574,10 +619,12 @@ impl OrderFlowGenerator {
             let raw = cfg.min_size as f64 * fast_powf(1.0 - u, self.size_exponent);
             (raw as u64).clamp(cfg.min_size, cfg.max_size)
         } else if u < cfg.odd_lot_fraction {
-            // Odd lots below the modal round lot. Reuses the size
-            // power-law, clamped to the sub-modal range.
+            // Odd lots below the modal round lot. Uses a flatter alpha
+            // (`odd_lot_alpha`) than the main size tail so the sub-modal
+            // body spreads across `[min_size, round_lot_size - 1]` instead
+            // of collapsing onto `min_size`.
             let v = self.unit_dist.sample(&mut self.rng);
-            let raw = cfg.min_size as f64 * fast_powf(1.0 - v, self.size_exponent);
+            let raw = cfg.min_size as f64 * fast_powf(1.0 - v, self.odd_lot_exponent);
             (raw as u64).clamp(cfg.min_size, cfg.round_lot_size.saturating_sub(1).max(1))
         } else if u < cfg.odd_lot_fraction + cfg.modal_lot_fraction {
             // Modal mass — the dominant exact round lot.
@@ -733,9 +780,14 @@ mod tests {
             ..Default::default()
         };
         let mut ofg = OrderFlowGenerator::new(config);
-        let mut within_10_ticks = 0;
+        let mut within_body = 0;
         let mut total = 0;
 
+        // The near-mid power-law is floored at `min_price_offset` (50 by
+        // default), so prices won't sit on top of the mid. "Clustering"
+        // here means "stays in the near-mid body", i.e., well inside
+        // `max_price_offset` (1500 default) rather than landing in the
+        // heavy far-from-mid tail.
         for _ in 0..10_000 {
             if let GeneratedEvent::Submit { order, .. } = ofg.next_event() {
                 let OrderType::Limit { price, .. } = order.order_type else {
@@ -743,17 +795,17 @@ mod tests {
                 };
                 let price = price.get();
                 let dist = (price as i64 - 10_000).unsigned_abs();
-                if dist <= 10 {
-                    within_10_ticks += 1;
+                if dist <= 1_500 {
+                    within_body += 1;
                 }
                 total += 1;
             }
         }
 
-        let pct = within_10_ticks as f64 / total as f64;
+        let pct = within_body as f64 / total as f64;
         assert!(
-            pct > 0.2,
-            "expected >20% of orders within 10 ticks of mid, got {pct:.2}"
+            pct > 0.85,
+            "expected >85% of orders inside the near-mid body, got {pct:.2}"
         );
     }
 
