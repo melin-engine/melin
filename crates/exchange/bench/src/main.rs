@@ -1566,9 +1566,9 @@ fn run_uring_roundtrip<R, W, F>(
         .collect();
     eprintln!("  per-client generators initialised for {num_clients} clients");
 
+    // Connect and auth all clients in parallel via rayon — independent
+    // network handshakes that amortise nicely across a thread pool.
     use rayon::prelude::*;
-
-    // Connect and auth all clients in parallel (reuses the rayon pool).
     let setup_start = Instant::now();
     let connected: Vec<(R, W)> = (0..num_clients)
         .into_par_iter()

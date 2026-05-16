@@ -52,6 +52,13 @@ struct DpdkBenchConn {
     /// (`[u32 LE len][payload]`) until it's fully sent. Sized for the
     /// largest encoded request.
     scratch_frame: Vec<u8>,
+    /// A frame that was pulled from the generator but never attempted on
+    /// the wire (socket couldn't send or returned an error). Held here so
+    /// the next poll iteration can retry without re-generating — the
+    /// generator is stateful and cannot be rewound. Distinct from
+    /// `send_pending`, which holds *partial-send remainders* of frames
+    /// that have already been counted in `inflight_ts` / `send_cursor`.
+    pending_unsent: Option<Vec<u8>>,
     /// Number of frames produced so far (also drives the send window check).
     send_cursor: usize,
     /// Pending send bytes (partial frame that didn't fit in smoltcp TX buffer).
@@ -374,7 +381,8 @@ pub fn run_dpdk_roundtrip(
             handle,
             parse_buf: Vec::with_capacity(1028),
             flow,
-            scratch_frame: Vec::with_capacity(140),
+            scratch_frame: Vec::with_capacity(generator::MAX_REQUEST_FRAME_BYTES),
+            pending_unsent: None,
             send_cursor: 0,
             send_pending: Vec::new(),
             inflight_ts: VecDeque::with_capacity(window),
@@ -557,32 +565,52 @@ pub fn run_dpdk_roundtrip(
             }
 
             // Send new frames while window has room. Each frame is generated
-            // on-the-fly into `scratch_frame` as [u32 LE len][payload].
+            // on-the-fly into `scratch_frame` as [u32 LE len][payload]. When
+            // the socket can't accept any bytes, the unsent frame is parked in
+            // `pending_unsent` and `inflight_ts` / `send_cursor` are *not*
+            // advanced — so the recorded send timestamp reflects the moment
+            // bytes actually start hitting the wire, matching pre-refactor
+            // semantics.
             while conn.send_pending.is_empty()
                 && conn.inflight_ts.len() < window
                 && conn.send_cursor < conn.total_orders
                 && socket.can_send()
             {
-                conn.scratch_frame.clear();
-                conn.flow.next_wire_frame(&mut conn.scratch_frame);
+                // Reuse a previously-generated-but-never-sent frame if there
+                // is one; otherwise pull a fresh frame from the generator.
+                if let Some(prev) = conn.pending_unsent.take() {
+                    conn.scratch_frame = prev;
+                } else {
+                    conn.scratch_frame.clear();
+                    conn.flow.next_wire_frame(&mut conn.scratch_frame);
+                }
                 let wire_frame = &conn.scratch_frame;
                 match socket.send_slice(wire_frame) {
-                    Ok(n) if n == wire_frame.len() => {}
-                    Ok(n) if n > 0 => {
-                        // Partial send — buffer remainder.
-                        conn.send_pending.extend_from_slice(&wire_frame[n..]);
+                    Ok(n) if n == wire_frame.len() => {
+                        conn.inflight_ts.push_back(crate::rdtscp());
+                        conn.send_cursor += 1;
                     }
-                    Ok(_) | Err(_) => {
-                        // Nothing sent. The frame was already pulled from the
-                        // generator (which is stateful and cannot be rewound),
-                        // so stash the whole wire frame in send_pending; the
-                        // outer loop's send_pending drain will retry it next
-                        // poll.
-                        conn.send_pending.extend_from_slice(wire_frame);
+                    Ok(n) if n > 0 => {
+                        // Partial send — remainder goes to send_pending; the
+                        // frame has started hitting the wire so it counts.
+                        conn.send_pending.extend_from_slice(&wire_frame[n..]);
+                        conn.inflight_ts.push_back(crate::rdtscp());
+                        conn.send_cursor += 1;
+                    }
+                    Ok(_) => {
+                        // Zero bytes sent — socket transiently full. Park the
+                        // frame and exit; retry on the next poll iteration.
+                        conn.pending_unsent = Some(std::mem::take(&mut conn.scratch_frame));
+                        break;
+                    }
+                    Err(e) => {
+                        // Client-side TCP error — debug! per project log-level
+                        // convention. Park the frame for retry.
+                        eprintln!("debug: dpdk send_slice error: {e:?}");
+                        conn.pending_unsent = Some(std::mem::take(&mut conn.scratch_frame));
+                        break;
                     }
                 }
-                conn.inflight_ts.push_back(crate::rdtscp());
-                conn.send_cursor += 1;
             }
 
             // --- Recv: drain directly into parse_buf (no intermediate copy) ---

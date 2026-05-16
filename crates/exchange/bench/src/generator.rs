@@ -47,6 +47,13 @@ fn fast_powf(base: f64, exp: f64) -> f64 {
 
 use melin_protocol::codec;
 use melin_protocol::message::Request;
+
+/// Upper bound on the size (in bytes) of any single length-prefixed request
+/// frame this generator can produce. Matches the largest fixed encoding the
+/// codec emits for the request variants used by the bench (`SubmitOrder`,
+/// `CancelOrder`, `CancelReplace`) including the 4-byte LE length prefix.
+/// Callers should size scratch buffers to this so the encoder never reallocates.
+pub const MAX_REQUEST_FRAME_BYTES: usize = 136;
 use melin_types::types::{
     AccountId, Order, OrderId, OrderType, Price, Quantity, SelfTradeProtection, Side, Symbol,
     TimeInForce,
@@ -360,7 +367,7 @@ impl OrderFlowGenerator {
         self.seq += 1;
         // Stack scratch sized to the largest encoded request — codec writes
         // [u32 LE length][payload] starting at offset 0.
-        let mut encode_buf = [0u8; 136];
+        let mut encode_buf = [0u8; MAX_REQUEST_FRAME_BYTES];
         let written = codec::encode_request(&request, self.seq, &mut encode_buf).expect("encode");
         out.extend_from_slice(&encode_buf[..written]);
     }
