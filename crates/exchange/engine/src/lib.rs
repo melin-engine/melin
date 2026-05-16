@@ -2,9 +2,9 @@
 
 pub mod account;
 pub mod exchange;
-pub mod journal;
 pub mod orderbook;
 pub mod scheduler;
+pub mod snapshot;
 pub mod types;
 
 // Re-exports of the shared trading wire types and codec. Extracted

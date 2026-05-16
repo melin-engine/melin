@@ -10,9 +10,9 @@
 //!
 //! On-disk framing (magic, versions, sequence, chain hash, CRC, atomic
 //! rename) lives in `melin_transport_core::snapshot` — generic over the
-//! `melin_app::Application` trait, which `Exchange` implements in
-//! `application_impl.rs`. This module owns the engine-specific payload
-//! bytes only.
+//! `melin_app::Application` trait, which `melin_server::exchange_app::ServerApp`
+//! implements as a thin newtype around `Exchange`. This module owns the
+//! engine-specific payload bytes only.
 
 use std::collections::HashMap as StdHashMap;
 use std::num::NonZeroU64;

@@ -9601,8 +9601,8 @@ mod tests {
         // minus the transport framing/CRC (which lives behind the
         // `Application` trait in `melin-transport-core` and is exercised
         // by the integration tests in `melin-server/tests/`).
-        let bytes = crate::journal::snapshot::encode_exchange_payload(&exchange);
-        let restored = crate::journal::snapshot::decode_exchange_payload(&bytes).unwrap();
+        let bytes = crate::snapshot::encode_exchange_payload(&exchange);
+        let restored = crate::snapshot::decode_exchange_payload(&bytes).unwrap();
 
         let fee_after = restored.accounts().balance(FEE_ACCOUNT, USD).available;
         assert_eq!(

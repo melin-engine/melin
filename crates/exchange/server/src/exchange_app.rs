@@ -16,7 +16,7 @@ use std::ops::{Deref, DerefMut};
 
 use melin_app::{Application, ApplyCtx, RejectReason as TransportRejectReason};
 use melin_engine::exchange::Exchange;
-use melin_engine::journal::snapshot as engine_snapshot;
+use melin_engine::snapshot as engine_snapshot;
 use melin_trading::trading_event::TradingEvent;
 use melin_types::types::{
     AccountId, ExecutionReport, OrderId, QueryResponse, RejectReason as EngineRejectReason, Symbol,
