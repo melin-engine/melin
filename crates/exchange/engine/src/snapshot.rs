@@ -27,7 +27,31 @@ use crate::types::{
 };
 
 use crate::le;
-use melin_journal::JournalError;
+
+/// Failure modes for [`decode_exchange_payload`]. Engine-local so the
+/// snapshot codec doesn't depend on `melin-journal` — the journal layer
+/// has its own broader error type, but snapshot payload decoding only
+/// ever produces these two outcomes.
+#[derive(Debug)]
+pub enum SnapshotDecodeError {
+    /// Buffer ended before a section could be fully read.
+    Truncated,
+    /// Bytes were structurally invalid (bad count, overflow, unknown
+    /// discriminant, etc). `reason` is a static description suitable
+    /// for surfacing in `io::Error`'s message.
+    Corrupt { reason: &'static str },
+}
+
+impl std::fmt::Display for SnapshotDecodeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Truncated => write!(f, "truncated snapshot payload"),
+            Self::Corrupt { reason } => write!(f, "corrupt snapshot payload: {reason}"),
+        }
+    }
+}
+
+impl std::error::Error for SnapshotDecodeError {}
 
 /// Decoded book-side levels: Vec of (price, orders-at-that-level).
 type RestingLevels = Vec<(Price, Vec<RestingOrderSnapshot>)>;
@@ -94,7 +118,7 @@ pub fn encode_exchange_payload(exchange: &Exchange) -> Vec<u8> {
 /// framing and CRC before handing bytes to this function. Decoding is
 /// always at [`PAYLOAD_VERSION`]; the transport rejects mismatched
 /// `APP_VERSION` before this is ever called.
-pub fn decode_exchange_payload(buf: &[u8]) -> Result<Exchange, JournalError> {
+pub fn decode_exchange_payload(buf: &[u8]) -> Result<Exchange, SnapshotDecodeError> {
     let (_consumed, state) = decode_exchange_state(buf, PAYLOAD_VERSION)?;
     Ok(Exchange::restore_state(state))
 }
@@ -434,11 +458,10 @@ fn encode_stop_side(levels: &[(Price, Vec<PendingStopSnapshot>)], buf: &mut Vec<
 /// Validate that a claimed count `n` of items each `item_size` bytes can
 /// actually fit in the remaining buffer. Prevents memory exhaustion from
 /// crafted count values.
-fn validate_count(remaining: usize, n: usize, item_size: usize) -> Result<(), JournalError> {
+fn validate_count(remaining: usize, n: usize, item_size: usize) -> Result<(), SnapshotDecodeError> {
     let needed = n.saturating_mul(item_size);
     if needed > remaining {
-        Err(JournalError::CorruptEntry {
-            sequence: 0,
+        Err(SnapshotDecodeError::Corrupt {
             reason: "count exceeds remaining buffer",
         })
     } else {
@@ -454,19 +477,15 @@ type ReservationEntry = (OrderId, AccountId, CurrencyId, u64);
 type OrderSideEntry = ((AccountId, OrderId), Side);
 type OrderBucketEntry = (AccountId, u64, u64);
 
-// Reusable corrupt-entry helper; `sequence: 0` matches the prior
-// closure-based pattern (the caller has no sequence in scope here).
-fn corrupt(reason: &'static str) -> JournalError {
-    JournalError::CorruptEntry {
-        sequence: 0,
-        reason,
-    }
+// Reusable corrupt-entry helper.
+fn corrupt(reason: &'static str) -> SnapshotDecodeError {
+    SnapshotDecodeError::Corrupt { reason }
 }
 
 // Bounds check: returns TruncatedEntry if `pos + need` exceeds the buffer.
-fn check(buf: &[u8], pos: usize, need: usize) -> Result<(), JournalError> {
+fn check(buf: &[u8], pos: usize, need: usize) -> Result<(), SnapshotDecodeError> {
     if pos + need > buf.len() {
-        Err(JournalError::TruncatedEntry)
+        Err(SnapshotDecodeError::Truncated)
     } else {
         Ok(())
     }
@@ -475,12 +494,12 @@ fn check(buf: &[u8], pos: usize, need: usize) -> Result<(), JournalError> {
 // Read the 4-byte length prefix at `buf[0..4]` and return (length, body)
 // where body is the slice past the prefix. Caller adds the consumed bytes
 // to its own cursor.
-fn read_section_len(buf: &[u8]) -> Result<usize, JournalError> {
+fn read_section_len(buf: &[u8]) -> Result<usize, SnapshotDecodeError> {
     check(buf, 0, 4)?;
     Ok(le::get_u32(buf) as usize)
 }
 
-fn decode_instruments(buf: &[u8]) -> Result<(usize, Vec<InstrumentSpec>), JournalError> {
+fn decode_instruments(buf: &[u8]) -> Result<(usize, Vec<InstrumentSpec>), SnapshotDecodeError> {
     let n = read_section_len(buf)?;
     let mut pos = 4;
     validate_count(buf.len() - pos, n, 12)?;
@@ -497,7 +516,7 @@ fn decode_instruments(buf: &[u8]) -> Result<(usize, Vec<InstrumentSpec>), Journa
     Ok((pos, out))
 }
 
-fn decode_balances(buf: &[u8]) -> Result<(usize, Vec<BalanceEntry>), JournalError> {
+fn decode_balances(buf: &[u8]) -> Result<(usize, Vec<BalanceEntry>), SnapshotDecodeError> {
     let n = read_section_len(buf)?;
     let mut pos = 4;
     validate_count(buf.len() - pos, n, 24)?;
@@ -520,7 +539,7 @@ fn decode_balances(buf: &[u8]) -> Result<(usize, Vec<BalanceEntry>), JournalErro
     Ok((pos, out))
 }
 
-fn decode_reservations(buf: &[u8]) -> Result<(usize, Vec<ReservationEntry>), JournalError> {
+fn decode_reservations(buf: &[u8]) -> Result<(usize, Vec<ReservationEntry>), SnapshotDecodeError> {
     let n = read_section_len(buf)?;
     let mut pos = 4;
     validate_count(buf.len() - pos, n, 24)?;
@@ -544,7 +563,7 @@ fn decode_reservations(buf: &[u8]) -> Result<(usize, Vec<ReservationEntry>), Jou
 fn decode_order_sides(
     buf: &[u8],
     version: u16,
-) -> Result<(usize, Vec<OrderSideEntry>), JournalError> {
+) -> Result<(usize, Vec<OrderSideEntry>), SnapshotDecodeError> {
     let n = read_section_len(buf)?;
     let mut pos = 4;
     let mut out = Vec::with_capacity(n);
@@ -574,7 +593,7 @@ fn decode_order_sides(
 fn decode_books(
     buf: &[u8],
     version: u16,
-) -> Result<(usize, Vec<(Symbol, BookSnapshot)>), JournalError> {
+) -> Result<(usize, Vec<(Symbol, BookSnapshot)>), SnapshotDecodeError> {
     let n = read_section_len(buf)?;
     let mut pos = 4;
     // Minimum per-book overhead: at least a few bytes for the empty-book structure.
@@ -598,7 +617,7 @@ fn decode_opt_nz_u64(
     mut pos: usize,
     invalid_tag_reason: &'static str,
     zero_value_reason: &'static str,
-) -> Result<(usize, Option<NonZeroU64>), JournalError> {
+) -> Result<(usize, Option<NonZeroU64>), SnapshotDecodeError> {
     check(buf, pos, 1)?;
     match buf[pos] {
         1 => {
@@ -613,7 +632,9 @@ fn decode_opt_nz_u64(
     }
 }
 
-fn decode_risk_limits(buf: &[u8]) -> Result<(usize, Vec<(Symbol, RiskLimits)>), JournalError> {
+fn decode_risk_limits(
+    buf: &[u8],
+) -> Result<(usize, Vec<(Symbol, RiskLimits)>), SnapshotDecodeError> {
     let n = read_section_len(buf)?;
     let mut pos = 4;
     // Each entry is at least 6 bytes: symbol(4) + two option tags(1+1).
@@ -659,7 +680,7 @@ fn decode_risk_limits(buf: &[u8]) -> Result<(usize, Vec<(Symbol, RiskLimits)>), 
 
 fn decode_circuit_breakers(
     buf: &[u8],
-) -> Result<(usize, Vec<(Symbol, CircuitBreakerConfig)>), JournalError> {
+) -> Result<(usize, Vec<(Symbol, CircuitBreakerConfig)>), SnapshotDecodeError> {
     let n = read_section_len(buf)?;
     let mut pos = 4;
     // Each entry is at least 7 bytes: symbol(4) + two option tags(1+1) + halted(1).
@@ -698,7 +719,9 @@ fn decode_circuit_breakers(
     Ok((pos, out))
 }
 
-fn decode_fee_schedules(buf: &[u8]) -> Result<(usize, Vec<(Symbol, FeeSchedule)>), JournalError> {
+fn decode_fee_schedules(
+    buf: &[u8],
+) -> Result<(usize, Vec<(Symbol, FeeSchedule)>), SnapshotDecodeError> {
     let n = read_section_len(buf)?;
     let mut pos = 4;
     // Each fee schedule: symbol(4) + maker_bps(2) + taker_bps(2) = 8 bytes.
@@ -723,7 +746,7 @@ fn decode_fee_schedules(buf: &[u8]) -> Result<(usize, Vec<(Symbol, FeeSchedule)>
     Ok((pos, out))
 }
 
-fn decode_key_hwm(buf: &[u8]) -> Result<(usize, Vec<(u64, u64)>), JournalError> {
+fn decode_key_hwm(buf: &[u8]) -> Result<(usize, Vec<(u64, u64)>), SnapshotDecodeError> {
     let n = read_section_len(buf)?;
     let mut pos = 4;
     // Each entry: key_hash(8) + hwm(8) = 16 bytes.
@@ -739,7 +762,7 @@ fn decode_key_hwm(buf: &[u8]) -> Result<(usize, Vec<(u64, u64)>), JournalError> 
     Ok((pos, out))
 }
 
-fn decode_disabled_instruments(buf: &[u8]) -> Result<(usize, Vec<Symbol>), JournalError> {
+fn decode_disabled_instruments(buf: &[u8]) -> Result<(usize, Vec<Symbol>), SnapshotDecodeError> {
     let n = read_section_len(buf)?;
     let mut pos = 4;
     // Each entry: symbol(4) = 4 bytes.
@@ -755,7 +778,7 @@ fn decode_disabled_instruments(buf: &[u8]) -> Result<(usize, Vec<Symbol>), Journ
 
 fn decode_fee_account_deficits(
     buf: &[u8],
-) -> Result<(usize, Vec<(CurrencyId, u64)>), JournalError> {
+) -> Result<(usize, Vec<(CurrencyId, u64)>), SnapshotDecodeError> {
     let n = read_section_len(buf)?;
     let mut pos = 4;
     // Each entry: currency(4) + amount(8) = 12 bytes.
@@ -773,7 +796,7 @@ fn decode_fee_account_deficits(
 
 // Per-account rate-limiter bucket state (SEC-04). Each entry is
 // account(4) + tokens(8) + last_refill_ns(8) = 20 bytes.
-fn decode_order_buckets(buf: &[u8]) -> Result<(usize, Vec<OrderBucketEntry>), JournalError> {
+fn decode_order_buckets(buf: &[u8]) -> Result<(usize, Vec<OrderBucketEntry>), SnapshotDecodeError> {
     let n = read_section_len(buf)?;
     let mut pos = 4;
     validate_count(buf.len() - pos, n, 20)?;
@@ -803,7 +826,7 @@ fn decode_order_buckets(buf: &[u8]) -> Result<(usize, Vec<OrderBucketEntry>), Jo
 fn decode_exchange_state(
     buf: &[u8],
     version: u16,
-) -> Result<(usize, ExchangeSnapshot), JournalError> {
+) -> Result<(usize, ExchangeSnapshot), SnapshotDecodeError> {
     let mut pos = 0;
 
     let (consumed, instruments) = decode_instruments(&buf[pos..])?;
@@ -886,16 +909,16 @@ fn decode_exchange_state(
     ))
 }
 
-fn decode_book_snapshot(buf: &[u8], version: u16) -> Result<(usize, BookSnapshot), JournalError> {
-    let corrupt = |reason: &'static str| JournalError::CorruptEntry {
-        sequence: 0,
-        reason,
-    };
+fn decode_book_snapshot(
+    buf: &[u8],
+    version: u16,
+) -> Result<(usize, BookSnapshot), SnapshotDecodeError> {
+    let corrupt = |reason: &'static str| SnapshotDecodeError::Corrupt { reason };
     let mut pos = 0;
 
-    let check = |pos: usize, need: usize| -> Result<(), JournalError> {
+    let check = |pos: usize, need: usize| -> Result<(), SnapshotDecodeError> {
         if pos + need > buf.len() {
-            Err(JournalError::TruncatedEntry)
+            Err(SnapshotDecodeError::Truncated)
         } else {
             Ok(())
         }
@@ -1017,15 +1040,12 @@ fn decode_book_snapshot(buf: &[u8], version: u16) -> Result<(usize, BookSnapshot
 fn decode_book_side_levels(
     buf: &[u8],
     version: u16,
-) -> Result<(usize, RestingLevels), JournalError> {
-    let corrupt = |reason: &'static str| JournalError::CorruptEntry {
-        sequence: 0,
-        reason,
-    };
+) -> Result<(usize, RestingLevels), SnapshotDecodeError> {
+    let corrupt = |reason: &'static str| SnapshotDecodeError::Corrupt { reason };
     let mut pos = 0;
 
     if buf.len() < 4 {
-        return Err(JournalError::TruncatedEntry);
+        return Err(SnapshotDecodeError::Truncated);
     }
     let n_levels = le::get_u32(&buf[pos..]) as usize;
     pos += 4;
@@ -1038,7 +1058,7 @@ fn decode_book_side_levels(
     let mut levels = Vec::with_capacity(n_levels);
     for _ in 0..n_levels {
         if pos + 12 > buf.len() {
-            return Err(JournalError::TruncatedEntry);
+            return Err(SnapshotDecodeError::Truncated);
         }
         let price_val =
             NonZeroU64::new(le::get_u64(&buf[pos..])).ok_or(corrupt("zero price in book level"))?;
@@ -1051,7 +1071,7 @@ fn decode_book_side_levels(
         let mut orders = Vec::with_capacity(n_orders);
         for _ in 0..n_orders {
             if pos + order_size > buf.len() {
-                return Err(JournalError::TruncatedEntry);
+                return Err(SnapshotDecodeError::Truncated);
             }
             let id = OrderId(le::get_u64(&buf[pos..]));
             let account = AccountId(le::get_u32(&buf[pos + 8..]));
@@ -1081,15 +1101,15 @@ fn decode_book_side_levels(
     Ok((pos, levels))
 }
 
-fn decode_stop_side_levels(buf: &[u8], version: u16) -> Result<(usize, StopLevels), JournalError> {
-    let corrupt = |reason: &'static str| JournalError::CorruptEntry {
-        sequence: 0,
-        reason,
-    };
+fn decode_stop_side_levels(
+    buf: &[u8],
+    version: u16,
+) -> Result<(usize, StopLevels), SnapshotDecodeError> {
+    let corrupt = |reason: &'static str| SnapshotDecodeError::Corrupt { reason };
     let mut pos = 0;
 
     if buf.len() < 4 {
-        return Err(JournalError::TruncatedEntry);
+        return Err(SnapshotDecodeError::Truncated);
     }
     let n_levels = le::get_u32(&buf[pos..]) as usize;
     pos += 4;
@@ -1099,7 +1119,7 @@ fn decode_stop_side_levels(buf: &[u8], version: u16) -> Result<(usize, StopLevel
     let mut levels = Vec::with_capacity(n_levels);
     for _ in 0..n_levels {
         if pos + 12 > buf.len() {
-            return Err(JournalError::TruncatedEntry);
+            return Err(SnapshotDecodeError::Truncated);
         }
         let trigger_val = NonZeroU64::new(le::get_u64(&buf[pos..]))
             .ok_or(corrupt("zero trigger price in stop level"))?;
@@ -1113,7 +1133,7 @@ fn decode_stop_side_levels(buf: &[u8], version: u16) -> Result<(usize, StopLevel
         for _ in 0..n_stops {
             // id(8) + account(4) + side(1) + trigger(8) + qty(8) + tif(1) + limit_tag(1) = 31 min
             if pos + 31 > buf.len() {
-                return Err(JournalError::TruncatedEntry);
+                return Err(SnapshotDecodeError::Truncated);
             }
             let id = OrderId(le::get_u64(&buf[pos..]));
             pos += 8;
@@ -1134,7 +1154,7 @@ fn decode_stop_side_levels(buf: &[u8], version: u16) -> Result<(usize, StopLevel
                 1 => {
                     pos += 1;
                     if pos + 8 > buf.len() {
-                        return Err(JournalError::TruncatedEntry);
+                        return Err(SnapshotDecodeError::Truncated);
                     }
                     let lp = NonZeroU64::new(le::get_u64(&buf[pos..]))
                         .ok_or(corrupt("zero limit price in stop"))?;
@@ -1150,13 +1170,13 @@ fn decode_stop_side_levels(buf: &[u8], version: u16) -> Result<(usize, StopLevel
 
             // Decode quote_budget (Option<u64>).
             if pos >= buf.len() {
-                return Err(JournalError::TruncatedEntry);
+                return Err(SnapshotDecodeError::Truncated);
             }
             let quote_budget = match buf[pos] {
                 1 => {
                     pos += 1;
                     if pos + 8 > buf.len() {
-                        return Err(JournalError::TruncatedEntry);
+                        return Err(SnapshotDecodeError::Truncated);
                     }
                     let budget = le::get_u64(&buf[pos..]);
                     pos += 8;
@@ -1170,7 +1190,7 @@ fn decode_stop_side_levels(buf: &[u8], version: u16) -> Result<(usize, StopLevel
             };
 
             if pos >= buf.len() {
-                return Err(JournalError::TruncatedEntry);
+                return Err(SnapshotDecodeError::Truncated);
             }
             let stp = le::decode_stp(buf[pos]).ok_or(corrupt("invalid stp in stop"))?;
             pos += 1;
@@ -1178,7 +1198,7 @@ fn decode_stop_side_levels(buf: &[u8], version: u16) -> Result<(usize, StopLevel
             // expiry_ns (v11+): needed for GTD stop orders.
             let expiry_ns = if version >= 11 {
                 if pos + 8 > buf.len() {
-                    return Err(JournalError::TruncatedEntry);
+                    return Err(SnapshotDecodeError::Truncated);
                 }
                 let v = le::get_u64(&buf[pos..]);
                 pos += 8;
@@ -2263,7 +2283,7 @@ mod tests {
         let full = encode_exchange_payload(&exchange);
         let truncated = &full[..full.len() - 24];
         match decode_exchange_payload(truncated) {
-            Err(JournalError::TruncatedEntry) => {}
+            Err(SnapshotDecodeError::Truncated) => {}
             Err(other) => panic!("expected TruncatedEntry, got {other:?}"),
             Ok(_) => panic!("truncated v18 payload must not decode silently as empty"),
         }
@@ -2306,7 +2326,7 @@ mod tests {
         payload.extend_from_slice(&dup_entry);
 
         match decode_exchange_payload(&payload) {
-            Err(JournalError::CorruptEntry { reason, .. }) => {
+            Err(SnapshotDecodeError::Corrupt { reason, .. }) => {
                 assert!(
                     reason.contains("duplicate account"),
                     "expected duplicate-account corruption, got: {reason}",

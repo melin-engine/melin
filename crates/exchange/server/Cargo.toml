@@ -20,7 +20,7 @@ release-tracing = ["tracing/max_level_info"]
 ## exercised.
 trading = ["dep:melin-market-data"]
 skip-order-exec = ["melin-engine/skip-order-exec", "hash-chain", "release-tracing"]
-no-persist = ["melin-engine/no-persist", "melin-transport-core/no-persist"]
+no-persist = ["melin-transport-core/no-persist"]
 ## Lightweight per-stage histograms for the original 4 stages
 ## (journal/matching wakeup + execute, journal batch). Adds ~3-5 mutex
 ## locks per event on the hot path; appropriate for narrow debugging
@@ -28,7 +28,6 @@ no-persist = ["melin-engine/no-persist", "melin-transport-core/no-persist"]
 ## off — slot sizes grow by 16 bytes per InputSlot/OutputSlot to carry
 ## the trace timestamps.
 latency-trace = [
-    "melin-engine/latency-trace",
     "melin-transport-core/latency-trace",
     "melin-protocol/latency-trace",
 ]
@@ -42,16 +41,14 @@ tick-to-trade = ["latency-trace"]
 ## Kept for backward compatibility — io_uring is now always used.
 io-uring = []
 dpdk = ["dep:melin-dpdk", "melin-dpdk/dpdk-sys"]
-pipeline-stats = ["melin-engine/pipeline-stats", "melin-transport-core/pipeline-stats"]
+pipeline-stats = ["melin-transport-core/pipeline-stats"]
 hash-chain = [
-    "melin-engine/hash-chain",
     "melin-journal/hash-chain",
     "melin-transport-core/hash-chain",
 ]
 ## Open the journal without `O_DIRECT`. Passthrough — see the
 ## `melin-journal` feature of the same name. Benchmarking only.
 no-o-direct = [
-    "melin-engine/no-o-direct",
     "melin-journal/no-o-direct",
     "melin-transport-core/no-o-direct",
 ]

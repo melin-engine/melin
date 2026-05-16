@@ -4,36 +4,6 @@ version = "0.7.0"
 edition = "2024"
 
 [features]
-## Skip all journal I/O (no writes, no fsync). Unsafe for production —
-## nothing is persisted — but useful for benchmarking to measure pure
-## pipeline + matching latency without any disk I/O.
-no-persist = ["melin-transport-core/no-persist"]
-## Record per-stage latency histograms and print a summary on shutdown.
-## Adds ~20ns of clock overhead per event. Not for production.
-latency-trace = [
-    "dep:hdrhistogram",
-    "melin-transport-core/latency-trace",
-]
-## Kept for backward compatibility — io_uring is now always used.
-io-uring = []
-## Print per-stage busy/idle utilization on shutdown. Identifies the pipeline
-## bottleneck: the stage closest to 100% busy is the constraint.
-pipeline-stats = ["melin-transport-core/pipeline-stats"]
-## BLAKE3 tamper-evident hash chain. Hashes every journal entry into a
-## cryptographic chain verified at checkpoints. Catches deliberate tampering
-## (not just corruption — CRC32C handles that). Adds ~15-30ns per event.
-## Disable for maximum throughput when audit tamper-evidence is not required.
-hash-chain = [
-    "dep:blake3",
-    "melin-journal/hash-chain",
-    "melin-transport-core/hash-chain",
-]
-## Open the journal without `O_DIRECT`. Passthrough — see the
-## `melin-journal` feature of the same name. Benchmarking only.
-no-o-direct = [
-    "melin-journal/no-o-direct",
-    "melin-transport-core/no-o-direct",
-]
 ## Short-circuit `Exchange::execute` to a single `Rejected{NoLiquidity}`
 ## push instead of running the matching engine. Used by the server's
 ## `skip-order-exec` feature to isolate transport throughput from
@@ -46,33 +16,12 @@ skip-order-exec = []
 default = []
 
 [dependencies]
-blake3 = { version = "1", optional = true }
 rustc-hash = "2"
-crc32c = "0.6"
-getrandom = "0.3"
-hdrhistogram = { version = "7", optional = true }
-io-uring = "0.7"
-libc = { workspace = true }
 tracing = { workspace = true }
-melin-app = { path = "../../core/app" }
-melin-disruptor = { path = "../../core/disruptor" }
-melin-journal = { path = "../../core/journal" }
 melin-trading = { path = "../trading" }
-melin-transport-core = { path = "../../core/transport-core" }
 melin-types = { path = "../types" }
 astenn = { git = "ssh://git@github.com/pierre-l/astenn.git" }
 
 [dev-dependencies]
-bolero = "0.13"
-# Re-list `melin-journal` with `test-utils` so engine tests can reach
-# into the journal-side prealloc override (used by recovery stress
-# tests to skip the 256 MiB per-iter fallocate). Cargo unifies the
-# feature set with the regular `[dependencies]` entry above during
-# test builds only — production builds don't see `test-utils`.
-melin-journal = { path = "../../core/journal", features = ["test-utils"] }
-# Same trick for transport-core: enable `test-utils` only in test
-# builds so engine recovery tests can use `apply_journaled` (the
-# successor to the deleted `JournaledExchange` wrapper).
-melin-transport-core = { path = "../../core/transport-core", features = ["test-utils"] }
 proptest = "1"
 tempfile = "3"

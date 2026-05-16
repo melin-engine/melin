@@ -1573,18 +1573,7 @@ name = "melin-engine"
 version = "0.7.0"
 dependencies = [
  "astenn",
- "blake3",
- "bolero",
- "crc32c",
- "getrandom 0.3.4",
- "hdrhistogram",
- "io-uring",
- "libc",
- "melin-app",
- "melin-disruptor",
- "melin-journal",
  "melin-trading",
- "melin-transport-core",
  "melin-types",
  "proptest",
  "rustc-hash",
