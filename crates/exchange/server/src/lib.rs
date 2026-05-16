@@ -48,6 +48,28 @@ pub type JournalReader = melin_journal::JournalReader<melin_trading::trading_eve
 /// bounds at every generic boot-path call site short.
 pub type TradingEvent = melin_trading::trading_event::TradingEvent;
 
+/// `TradingEvent`-bound alias for the generic journal stage in
+/// transport-core. `W` is the concrete writer the caller picked at
+/// boot (sector vs buffered).
+pub type JournalStage<W> =
+    melin_transport_core::pipeline::JournalStage<melin_trading::trading_event::TradingEvent, W>;
+
+// Re-export the writer-selection enum + the generic pipeline / trace /
+// codec / replication modules at the server crate root. Bench and any
+// other downstream consumer now reach the LMAX-pipeline plumbing
+// through `melin-server` instead of through `melin-engine` — engine
+// is the matching domain library, server is the wiring layer.
+pub use melin_app::unix_epoch_nanos;
+/// Re-export of the journal replication module — namespaced under
+/// `journal_replication` to avoid colliding with the server's own
+/// `replication` module (the orchestrator that wraps it).
+pub use melin_journal::replication as journal_replication;
+pub use melin_journal::{
+    AsyncWriteBatch, JournalError, JournalWrite, JournalWriterMode, RawJournalScanner,
+    checkpoint_interval, codec, create_fresh_replica,
+};
+pub use melin_transport_core::{pipeline, trace};
+
 /// Control plane event the accept loop and response stage exchange.
 /// Defined at the crate root so both build modes refer to the same
 /// type (it's transport-agnostic — the payload is a socket fd +

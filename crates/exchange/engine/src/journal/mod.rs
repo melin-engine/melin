@@ -1,46 +1,13 @@
-//! Durable write-ahead log for the trading engine.
+//! Exchange-aware snapshot codec.
 //!
-//! After the transport/app split the codec, writer, reader, replication
-//! channel, and generic pipeline live in `melin-journal` and
-//! `melin-transport-core`. This module re-exports them with the
-//! trading-bound aliases so engine-internal and server-side callers can
-//! keep using `JournalEvent`, `InputSlot`, `Pipeline`, etc. without
-//! spelling the generic every time. The Exchange-aware snapshot framing
-//! lives here too, since it's entangled with `Exchange` internals.
+//! The journal-transport plumbing (codec, writer, reader, replication
+//! channel, generic pipeline) lives in `melin-journal` and
+//! `melin-transport-core`, and the `TradingEvent`-bound aliases for
+//! that plumbing live in `melin-server`. This module is left here only
+//! for the `Exchange`-state serialization that necessarily entangles
+//! with engine internals.
+//!
+//! Slated for promotion to `melin_engine::snapshot` at the engine
+//! top-level; the `journal/` path is historical.
 
 pub mod snapshot;
-
-/// The `TradingEvent`-parameterised journal types — aliased here so
-/// engine/server code doesn't have to spell the generic every time.
-pub type JournalEvent = melin_journal::JournalEvent<crate::trading_event::TradingEvent>;
-pub type JournalEntry = melin_journal::JournalEntry<crate::trading_event::TradingEvent>;
-pub type JournalReader = melin_journal::JournalReader<crate::trading_event::TradingEvent>;
-pub type SectorWriter = melin_journal::SectorWriter<crate::trading_event::TradingEvent>;
-pub type BufferedWriter = melin_journal::BufferedWriter<crate::trading_event::TradingEvent>;
-pub use melin_journal::{JournalWriterMode, create_fresh_replica};
-
-/// Trading-bound aliases for the generic pipeline types (now living in
-/// `melin-transport-core`). Server/bench callers use these so they
-/// never have to spell `<Exchange>` or `<TradingEvent>` explicitly.
-/// `W` is the concrete journal writer the caller dispatched on (sector
-/// vs buffered) — picked once at boot.
-pub type InputSlot = pipeline::InputSlot<crate::trading_event::TradingEvent>;
-pub type OutputSlot =
-    pipeline::OutputSlot<crate::types::ExecutionReport, crate::types::QueryResponse>;
-pub type OutputPayload =
-    pipeline::OutputPayload<crate::types::ExecutionReport, crate::types::QueryResponse>;
-pub type Pipeline<W> = pipeline::Pipeline<crate::exchange::Exchange, W>;
-pub type ReplicaPipeline<W> = pipeline::ReplicaPipeline<crate::exchange::Exchange, W>;
-pub type MatchingStage = pipeline::MatchingStage<crate::exchange::Exchange>;
-pub type JournalStage<W> = pipeline::JournalStage<crate::trading_event::TradingEvent, W>;
-
-/// Re-export the generic pipeline module so callers reaching for raw
-/// generic types (`pipeline::build_pipeline_with_replication::<A>`,
-/// `pipeline::StageUtilization`) find them at the familiar path.
-pub use melin_transport_core::{pipeline, trace};
-
-pub use melin_app::unix_epoch_nanos;
-pub use melin_journal::{
-    AsyncWriteBatch, JournalError, JournalWrite, RawJournalScanner, checkpoint_interval, codec,
-    replication,
-};

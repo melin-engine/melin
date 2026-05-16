@@ -33,7 +33,7 @@ echo ""
 # Build the verify tool on both servers (cached — instant if already built).
 for HOST in "$SERVER1" "$SERVER2"; do
     ssh $SSH_OPTS "$HOST" "cd ${REPO_DIR} && source ~/.cargo/env && \
-        cargo build --release -p melin-engine --example journal_verify 2>&1 | tail -1"
+        cargo build --release -p melin-server --example journal_verify 2>&1 | tail -1"
 done
 
 echo "  Server 1: ${SERVER1} → ${JOURNAL1}"

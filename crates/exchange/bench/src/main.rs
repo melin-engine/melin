@@ -323,10 +323,10 @@ struct BenchArgs {
     /// docs/journal-writer-modes.md before benchmarking with it.
     #[arg(
         long,
-        default_value_t = melin_engine::journal::JournalWriterMode::default(),
-        value_parser = melin_engine::journal::JournalWriterMode::parse,
+        default_value_t = melin_server::JournalWriterMode::default(),
+        value_parser = melin_server::JournalWriterMode::parse,
     )]
-    journal_writer: melin_engine::journal::JournalWriterMode,
+    journal_writer: melin_server::JournalWriterMode,
     /// Number of trading accounts.
     #[arg(long, default_value_t = 10_000)]
     accounts: u32,
@@ -737,9 +737,9 @@ fn run_pipeline_bench(
     journal_path: Option<std::path::PathBuf>,
     json_path: Option<&std::path::Path>,
     max_journal_batch: usize,
-    journal_writer_mode: melin_engine::journal::JournalWriterMode,
+    journal_writer_mode: melin_server::JournalWriterMode,
 ) {
-    use melin_engine::journal::{BufferedWriter, JournalWriterMode, SectorWriter};
+    use melin_server::{BufferedWriter, JournalWriterMode, SectorWriter};
 
     // Set up exchange with one instrument and funded account.
     let mut app =
@@ -802,18 +802,16 @@ struct PipelineInnerCfg<'a> {
 /// statically-dispatched `run_sync` or `run_uring` per writer.
 fn run_pipeline_inner<W>(app: melin_server::App, writer: W, cfg: PipelineInnerCfg<'_>)
 where
-    W: melin_engine::journal::JournalWrite<melin_trading::trading_event::TradingEvent>
-        + Send
-        + 'static,
-    melin_engine::journal::JournalStage<W>: melin_engine::journal::pipeline::JournalStageRun<
+    W: melin_server::JournalWrite<melin_trading::trading_event::TradingEvent> + Send + 'static,
+    melin_server::JournalStage<W>: melin_server::pipeline::JournalStageRun<
             melin_trading::trading_event::TradingEvent,
             Writer = W,
         >,
 {
-    use melin_engine::journal::InputSlot;
-    use melin_engine::journal::JournalEvent;
-    use melin_engine::journal::pipeline::{JournalStageRun, build_pipeline_with_replication};
-    use melin_engine::journal::trace::mono_trace_ns;
+    use melin_server::InputSlot;
+    use melin_server::JournalEvent;
+    use melin_server::pipeline::{JournalStageRun, build_pipeline_with_replication};
+    use melin_server::trace::mono_trace_ns;
 
     let PipelineInnerCfg {
         group_commit_us,
@@ -836,7 +834,7 @@ where
         active_conns,
         false, // no replication
         max_journal_batch,
-        melin_engine::journal::replication::REPLICATION_RING_CAPACITY,
+        melin_server::journal_replication::REPLICATION_RING_CAPACITY,
         true,  // busy_spin — match production default (yield_idle=false)
         false, // event_publisher
         false, // shadow

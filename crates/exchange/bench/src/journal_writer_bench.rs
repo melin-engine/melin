@@ -31,10 +31,10 @@ use std::num::NonZero;
 use std::path::Path;
 use std::time::Instant;
 
-use melin_engine::journal::BufferedWriter;
-use melin_engine::journal::JournalEvent;
-use melin_engine::journal::JournalWrite;
-use melin_engine::journal::SectorWriter;
+use melin_server::BufferedWriter;
+use melin_server::JournalEvent;
+use melin_server::JournalWrite;
+use melin_server::SectorWriter;
 use melin_trading::trading_event::TradingEvent;
 
 #[derive(Parser)]
