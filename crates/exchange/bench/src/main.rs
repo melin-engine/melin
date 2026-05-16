@@ -546,21 +546,23 @@ fn run_engine_bench(
     exchange.prefault();
 
     let total_events = warmup + total_pairs * 2;
+    let measure_end = total_events.saturating_sub(cooldown);
 
-    // Pre-generate all events so RNG overhead doesn't pollute timing.
-    eprintln!("Pre-generating {total_events} events...");
+    // Orders are generated on-the-fly so memory stays bounded for long runs.
+    // RNG cost per event (~tens of ns) is folded into the measured latency,
+    // which matches the production hot path where the engine sees fresh
+    // requests rather than a pre-materialised batch.
     let mut flow = OrderFlowGenerator::new(config);
-    let events = flow.generate_events(total_events);
-    eprintln!("Pre-generation complete.");
 
     let mut reports = Vec::with_capacity(256);
     let mut histogram =
         Histogram::<u64>::new_with_bounds(1, 10_000_000_000, 3).expect("histogram bounds");
 
     // Warmup.
-    for event in &events[..warmup] {
+    for _ in 0..warmup {
         reports.clear();
-        match *event {
+        let event = flow.next_event();
+        match event {
             GeneratedEvent::Submit { symbol, order } => {
                 exchange.execute(symbol, order, &mut reports);
             }
@@ -602,22 +604,48 @@ fn run_engine_bench(
 
     // Track the N slowest orders for post-run diagnostics.
     // Min-heap by latency: the smallest is at the top so we can
-    // efficiently evict it when a slower order arrives.
+    // efficiently evict it when a slower order arrives. Wrapped in a
+    // local struct because `GeneratedEvent` isn't Ord — heap ordering
+    // is by `latency_ns` only.
     const SLOWEST_N: usize = 10;
-    let mut slowest: std::collections::BinaryHeap<std::cmp::Reverse<(u64, usize, usize, u64)>> =
+    #[derive(Clone, Copy)]
+    struct SlowEntry {
+        latency_ns: u64,
+        event: GeneratedEvent,
+        num_reports: usize,
+        offset_us: u64,
+    }
+    impl PartialEq for SlowEntry {
+        fn eq(&self, o: &Self) -> bool {
+            self.latency_ns == o.latency_ns
+        }
+    }
+    impl Eq for SlowEntry {}
+    impl PartialOrd for SlowEntry {
+        fn partial_cmp(&self, o: &Self) -> Option<std::cmp::Ordering> {
+            Some(self.cmp(o))
+        }
+    }
+    impl Ord for SlowEntry {
+        fn cmp(&self, o: &Self) -> std::cmp::Ordering {
+            self.latency_ns.cmp(&o.latency_ns)
+        }
+    }
+    let mut slowest: std::collections::BinaryHeap<std::cmp::Reverse<SlowEntry>> =
         std::collections::BinaryHeap::with_capacity(SLOWEST_N + 1);
 
     let start = Instant::now();
-    let measure_end = events.len().saturating_sub(cooldown);
-    for (i, event) in events[warmup..measure_end].iter().enumerate() {
+    let measured = measure_end.saturating_sub(warmup);
+    for _ in 0..measured {
         reports.clear();
+        let event = flow.next_event();
 
         #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
         let t0 = rdtscp();
         #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
         let t0 = Instant::now();
 
-        match *event {
+        match event {
             GeneratedEvent::Submit { symbol, order } => {
                 exchange.execute(symbol, order, &mut reports);
                 submits += 1;
@@ -663,18 +691,29 @@ fn run_engine_bench(
         // Only compute wall-clock offset when actually inserting (rare path).
         if slowest.len() < SLOWEST_N {
             let offset_us = start.elapsed().as_micros() as u64;
-            slowest.push(std::cmp::Reverse((elapsed_ns, i, reports.len(), offset_us)));
-        } else if let Some(&std::cmp::Reverse((min_ns, _, _, _))) = slowest.peek()
+            slowest.push(std::cmp::Reverse(SlowEntry {
+                latency_ns: elapsed_ns,
+                event,
+                num_reports: reports.len(),
+                offset_us,
+            }));
+        } else if let Some(&std::cmp::Reverse(SlowEntry {
+            latency_ns: min_ns, ..
+        })) = slowest.peek()
             && elapsed_ns > min_ns
         {
             let offset_us = start.elapsed().as_micros() as u64;
             slowest.pop();
-            slowest.push(std::cmp::Reverse((elapsed_ns, i, reports.len(), offset_us)));
+            slowest.push(std::cmp::Reverse(SlowEntry {
+                latency_ns: elapsed_ns,
+                event,
+                num_reports: reports.len(),
+                offset_us,
+            }));
         }
     }
     let wall = start.elapsed();
 
-    let measured = measure_end.saturating_sub(warmup);
     let total_events = submits + cancels + amends;
     let cancel_pct = if total_events > 0 {
         cancels as f64 / total_events as f64 * 100.0
@@ -709,12 +748,13 @@ fn run_engine_bench(
 
     // Print the slowest orders for tail latency diagnosis.
     let mut sorted: Vec<_> = slowest.into_iter().map(|std::cmp::Reverse(e)| e).collect();
-    sorted.sort_by_key(|b| std::cmp::Reverse(b.0)); // descending by latency
+    sorted.sort_by_key(|b| std::cmp::Reverse(b.latency_ns)); // descending by latency
     println!("\n  Slowest {SLOWEST_N} Orders");
-    for (latency_ns, event_idx, num_reports, offset_us) in &sorted {
-        let event = &events[warmup + event_idx];
-        let latency_us = *latency_ns as f64 / 1000.0;
-        let offset_ms = *offset_us as f64 / 1000.0;
+    for entry in &sorted {
+        let latency_us = entry.latency_ns as f64 / 1000.0;
+        let offset_ms = entry.offset_us as f64 / 1000.0;
+        let event = entry.event;
+        let num_reports = entry.num_reports;
         println!("    {latency_us:>7.2}µs  @{offset_ms:>7.1}ms  reports={num_reports}  {event:?}");
     }
 }
@@ -1495,10 +1535,9 @@ fn run_uring_roundtrip<R, W, F>(
     let pairs_per_client = total_pairs / num_clients;
     let remainder = total_pairs % num_clients;
 
-    // Pre-generate frames for all clients in parallel.
-    use rayon::prelude::*;
-    let all_frames: Vec<_> = (0..num_clients)
-        .into_par_iter()
+    // Build a generator per client. Orders are produced on-the-fly during the
+    // bench loop so memory stays bounded regardless of run length.
+    let per_client: Vec<(generator::OrderFlowGenerator, usize)> = (0..num_clients)
         .map(|client_id| {
             let client_pairs = if client_id == num_clients - 1 {
                 pairs_per_client + remainder
@@ -1516,16 +1555,18 @@ fn run_uring_roundtrip<R, W, F>(
                     (warmup + p * 2) as u64
                 })
                 .sum();
-            let mut flow = generator::OrderFlowGenerator::new(generator::GeneratorConfig {
+            let flow = generator::OrderFlowGenerator::new(generator::GeneratorConfig {
                 num_accounts,
                 num_instruments,
                 start_order_id: order_id_offset + 1,
                 ..Default::default()
             });
-            (flow.generate_frames(total_orders), total_orders)
+            (flow, total_orders)
         })
         .collect();
-    eprintln!("  frames generated for all {num_clients} clients");
+    eprintln!("  per-client generators initialised for {num_clients} clients");
+
+    use rayon::prelude::*;
 
     // Connect and auth all clients in parallel (reuses the rayon pool).
     let setup_start = Instant::now();
@@ -1544,10 +1585,10 @@ fn run_uring_roundtrip<R, W, F>(
 
     let num_threads = bench_threads.min(num_clients);
 
-    // Attach pre-generated frames and distribute round-robin across bench threads.
+    // Attach per-client generator and distribute round-robin across bench threads.
     let mut thread_conns: Vec<Vec<UringBenchConn>> = (0..num_threads).map(|_| Vec::new()).collect();
-    for (i, ((read_stream, write_stream), (frames, total_orders))) in
-        connected.into_iter().zip(all_frames).enumerate()
+    for (i, ((read_stream, write_stream), (flow, total_orders))) in
+        connected.into_iter().zip(per_client).enumerate()
     {
         let read_fd = read_stream.as_raw_fd();
         let write_fd = write_stream.as_raw_fd();
@@ -1562,7 +1603,7 @@ fn run_uring_roundtrip<R, W, F>(
             recv_pending: false,
             send_buf: Vec::with_capacity(4096),
             send_pending: false,
-            frames,
+            flow,
             send_cursor: 0,
             inflight_ts: VecDeque::with_capacity(window),
             batch_count: 0,
@@ -1728,8 +1769,9 @@ struct UringBenchConn {
     send_buf: Vec<u8>,
     send_pending: bool,
 
-    // Pipelining state
-    frames: Vec<Vec<u8>>,
+    // Pipelining state — orders are generated on-the-fly so the per-connection
+    // memory footprint stays constant regardless of `total_orders`.
+    flow: generator::OrderFlowGenerator,
     send_cursor: usize,
     /// TSC tick at send time. `u64` instead of `Instant` to avoid
     /// ~15-25ns vDSO overhead per timestamp on the hot path.
@@ -1933,12 +1975,9 @@ fn uring_fill_windows(
         }
 
         // Fill the send buffer with as many frames as the window allows.
+        // Each frame is encoded directly into `send_buf` as `[u32 LE len][payload]`.
         while conn.inflight_ts.len() < window && conn.send_cursor < conn.total_orders {
-            let frame = &conn.frames[conn.send_cursor];
-            // Write the length-prefixed wire frame into the send buffer.
-            let len = frame.len() as u32;
-            conn.send_buf.extend_from_slice(&len.to_le_bytes());
-            conn.send_buf.extend_from_slice(frame);
+            conn.flow.next_wire_frame(&mut conn.send_buf);
             conn.inflight_ts.push_back(rdtscp());
             conn.send_cursor += 1;
         }

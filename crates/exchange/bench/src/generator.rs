@@ -268,6 +268,11 @@ pub struct OrderFlowGenerator {
     odd_lot_exponent: f64,
     /// Pre-built uniform distribution for symbol selection.
     symbol_dist: Uniform<u32>,
+    /// Per-generator monotonic sequence for idempotency dedup. Increments on
+    /// every wire frame produced. Lives in the generator so streaming callers
+    /// can keep generator + seq paired in one place (was a local in the old
+    /// `generate_frames` helper).
+    seq: u64,
 }
 
 impl OrderFlowGenerator {
@@ -299,6 +304,7 @@ impl OrderFlowGenerator {
             size_exponent,
             odd_lot_exponent,
             symbol_dist,
+            seq: 0,
         }
     }
 
@@ -320,58 +326,43 @@ impl OrderFlowGenerator {
         self.generate_submit()
     }
 
-    /// Pre-generate a batch of events for engine-only benchmarks.
-    /// Generates all events upfront so RNG overhead doesn't pollute timing.
-    pub fn generate_events(&mut self, count: usize) -> Vec<GeneratedEvent> {
-        let mut events = Vec::with_capacity(count);
-        for _ in 0..count {
-            events.push(self.next_event());
-        }
-        events
-    }
+    /// Generate the next event and append its length-prefixed wire frame
+    /// (`[u32 LE length][payload]`) to `out`. Used by transport benchmarks
+    /// that generate orders on-the-fly to keep bench memory bounded.
+    pub fn next_wire_frame(&mut self, out: &mut Vec<u8>) {
+        let event = self.next_event();
+        let request = match event {
+            GeneratedEvent::Submit { symbol, order } => Request::SubmitOrder { symbol, order },
+            GeneratedEvent::Cancel {
+                symbol,
+                account,
+                order_id,
+            } => Request::CancelOrder {
+                symbol,
+                account,
+                order_id,
+            },
+            GeneratedEvent::CancelReplace {
+                symbol,
+                account,
+                order_id,
+                new_price,
+                new_quantity,
+            } => Request::CancelReplace {
+                symbol,
+                account,
+                order_id,
+                new_price,
+                new_quantity,
+            },
+        };
 
-    /// Pre-generate a batch of pre-encoded wire frames for roundtrip benchmarks.
-    /// Generates all events upfront so RNG overhead doesn't pollute timing.
-    pub fn generate_frames(&mut self, count: usize) -> Vec<Vec<u8>> {
-        let mut frames = Vec::with_capacity(count);
+        self.seq += 1;
+        // Stack scratch sized to the largest encoded request — codec writes
+        // [u32 LE length][payload] starting at offset 0.
         let mut encode_buf = [0u8; 136];
-        // Per-connection monotonic sequence for idempotency dedup.
-        let mut seq: u64 = 0;
-
-        for _ in 0..count {
-            let event = self.next_event();
-            let request = match event {
-                GeneratedEvent::Submit { symbol, order } => Request::SubmitOrder { symbol, order },
-                GeneratedEvent::Cancel {
-                    symbol,
-                    account,
-                    order_id,
-                } => Request::CancelOrder {
-                    symbol,
-                    account,
-                    order_id,
-                },
-                GeneratedEvent::CancelReplace {
-                    symbol,
-                    account,
-                    order_id,
-                    new_price,
-                    new_quantity,
-                } => Request::CancelReplace {
-                    symbol,
-                    account,
-                    order_id,
-                    new_price,
-                    new_quantity,
-                },
-            };
-
-            seq += 1;
-            let written = codec::encode_request(&request, seq, &mut encode_buf).expect("encode");
-            frames.push(encode_buf[4..written].to_vec());
-        }
-
-        frames
+        let written = codec::encode_request(&request, self.seq, &mut encode_buf).expect("encode");
+        out.extend_from_slice(&encode_buf[..written]);
     }
 
     fn generate_submit(&mut self) -> GeneratedEvent {
@@ -810,17 +801,23 @@ mod tests {
     }
 
     #[test]
-    fn generate_frames_produces_valid_wire_data() {
+    fn next_wire_frame_produces_valid_wire_data() {
         let mut ofg = OrderFlowGenerator::new(GeneratorConfig::default());
-        let frames = ofg.generate_frames(100);
-        assert_eq!(frames.len(), 100);
+        let mut buf = Vec::new();
 
-        for frame in &frames {
-            let result = codec::decode_request(frame);
-            assert!(result.is_ok(), "frame should decode: {result:?}");
-            let (seq, _request) = result.unwrap();
+        // Decode each frame as it's produced. Each call appends one
+        // length-prefixed frame to `buf`; we walk the cursor forward.
+        let mut cursor = 0usize;
+        for _ in 0..100 {
+            ofg.next_wire_frame(&mut buf);
+            assert!(buf.len() >= cursor + 4, "frame must include length prefix");
+            let len = u32::from_le_bytes(buf[cursor..cursor + 4].try_into().unwrap()) as usize;
+            let payload = &buf[cursor + 4..cursor + 4 + len];
+            let (seq, _request) = codec::decode_request(payload).expect("decode");
             assert!(seq > 0, "frame seq should be > 0");
+            cursor += 4 + len;
         }
+        assert_eq!(cursor, buf.len(), "all bytes consumed");
     }
 
     #[test]
@@ -968,11 +965,15 @@ mod tests {
         assert!(fills > 0, "expected some fills with 50% aggression ratio");
     }
 
-    #[test]
-    fn pre_generated_events_match_count() {
-        let mut ofg = OrderFlowGenerator::new(GeneratorConfig::default());
-        let events = ofg.generate_events(500);
-        assert_eq!(events.len(), 500);
+    fn collect_frames(ofg: &mut OrderFlowGenerator, count: usize) -> Vec<Vec<u8>> {
+        let mut frames = Vec::with_capacity(count);
+        let mut scratch = Vec::new();
+        for _ in 0..count {
+            scratch.clear();
+            ofg.next_wire_frame(&mut scratch);
+            frames.push(scratch.clone());
+        }
+        frames
     }
 
     #[test]
@@ -981,8 +982,8 @@ mod tests {
         let mut gen1 = OrderFlowGenerator::new(config.clone());
         let mut gen2 = OrderFlowGenerator::new(config);
 
-        let events1 = gen1.generate_frames(1000);
-        let events2 = gen2.generate_frames(1000);
+        let events1 = collect_frames(&mut gen1, 1000);
+        let events2 = collect_frames(&mut gen2, 1000);
 
         assert_eq!(events1.len(), events2.len());
         for (i, (a, b)) in events1.iter().zip(events2.iter()).enumerate() {
@@ -1001,8 +1002,8 @@ mod tests {
             ..Default::default()
         });
 
-        let events1 = gen1.generate_frames(100);
-        let events2 = gen2.generate_frames(100);
+        let events1 = collect_frames(&mut gen1, 100);
+        let events2 = collect_frames(&mut gen2, 100);
 
         // At least some frames should differ.
         let differ = events1

@@ -45,9 +45,14 @@ struct DpdkBenchConn {
     handle: SocketHandle,
     /// Accumulated received bytes for frame parsing.
     parse_buf: Vec<u8>,
-    /// Pre-encoded request frames for this connection.
-    frames: Vec<Vec<u8>>,
-    /// Next frame index to send.
+    /// Order generator — produces frames on-the-fly so memory stays bounded
+    /// regardless of `total_orders`.
+    flow: generator::OrderFlowGenerator,
+    /// Reusable scratch buffer holding the current wire frame
+    /// (`[u32 LE len][payload]`) until it's fully sent. Sized for the
+    /// largest encoded request.
+    scratch_frame: Vec<u8>,
+    /// Number of frames produced so far (also drives the send window check).
     send_cursor: usize,
     /// Pending send bytes (partial frame that didn't fit in smoltcp TX buffer).
     send_pending: Vec<u8>,
@@ -303,15 +308,9 @@ pub fn run_dpdk_roundtrip(
     let pairs_per_client = total_pairs / num_clients;
     let remainder = total_pairs % num_clients;
 
-    // Pre-generate wire frames for all clients in parallel. Frame
-    // generation is pure CPU (no DPDK or smoltcp state), so it can
-    // run on a rayon pool while the main thread later drives the
-    // single DPDK transport sequentially. This dominates setup
-    // time at ~12.6M frames/client.
-    use rayon::prelude::*;
-    eprintln!("  generating frames for {num_clients} clients...");
-    let all_frames: Vec<(Vec<Vec<u8>>, usize)> = (0..num_clients)
-        .into_par_iter()
+    // Build a generator per client. Orders are produced on-the-fly during
+    // the bench loop so memory stays bounded regardless of run length.
+    let per_client: Vec<(generator::OrderFlowGenerator, usize)> = (0..num_clients)
         .map(|client_id| {
             let client_pairs = if client_id == num_clients - 1 {
                 pairs_per_client + remainder
@@ -329,28 +328,16 @@ pub fn run_dpdk_roundtrip(
                     (warmup + p * 2) as u64
                 })
                 .sum();
-            let mut flow = generator::OrderFlowGenerator::new(generator::GeneratorConfig {
+            let flow = generator::OrderFlowGenerator::new(generator::GeneratorConfig {
                 num_accounts,
                 num_instruments,
                 start_order_id: order_id_offset + 1,
                 ..Default::default()
             });
-            // Pre-build wire frames: [u32 LE length][payload].
-            // Single send_slice per frame instead of two (prefix + payload).
-            let frames: Vec<Vec<u8>> = flow
-                .generate_frames(total_orders)
-                .into_iter()
-                .map(|payload| {
-                    let mut wire = Vec::with_capacity(4 + payload.len());
-                    wire.extend_from_slice(&(payload.len() as u32).to_le_bytes());
-                    wire.extend_from_slice(&payload);
-                    wire
-                })
-                .collect();
-            (frames, total_orders)
+            (flow, total_orders)
         })
         .collect();
-    eprintln!("  frames generated for all {num_clients} clients");
+    eprintln!("  per-client generators initialised for {num_clients} clients");
 
     // Sequential connect + auth — smoltcp's TCP stack is single-threaded
     // and shared across all sockets via the same `Interface` poll loop.
@@ -359,7 +346,7 @@ pub fn run_dpdk_roundtrip(
     let mut connections: Vec<DpdkBenchConn> = Vec::with_capacity(num_clients);
     let setup_start = Instant::now();
     eprintln!("  connecting {num_clients} clients via DPDK...");
-    for (client_id, (frames, total_orders)) in all_frames.into_iter().enumerate() {
+    for (client_id, (flow, total_orders)) in per_client.into_iter().enumerate() {
         let rx_buf = tcp::SocketBuffer::new(vec![0u8; SOCKET_BUF_SIZE]);
         let tx_buf = tcp::SocketBuffer::new(vec![0u8; SOCKET_BUF_SIZE]);
         let mut socket = tcp::Socket::new(rx_buf, tx_buf);
@@ -386,7 +373,8 @@ pub fn run_dpdk_roundtrip(
         connections.push(DpdkBenchConn {
             handle,
             parse_buf: Vec::with_capacity(1028),
-            frames,
+            flow,
+            scratch_frame: Vec::with_capacity(140),
             send_cursor: 0,
             send_pending: Vec::new(),
             inflight_ts: VecDeque::with_capacity(window),
@@ -568,22 +556,30 @@ pub fn run_dpdk_roundtrip(
                 }
             }
 
-            // Send new frames while window has room.
+            // Send new frames while window has room. Each frame is generated
+            // on-the-fly into `scratch_frame` as [u32 LE len][payload].
             while conn.send_pending.is_empty()
                 && conn.inflight_ts.len() < window
                 && conn.send_cursor < conn.total_orders
                 && socket.can_send()
             {
-                // Frames are pre-built with length prefix: [u32 LE len][payload].
-                let wire_frame = &conn.frames[conn.send_cursor];
+                conn.scratch_frame.clear();
+                conn.flow.next_wire_frame(&mut conn.scratch_frame);
+                let wire_frame = &conn.scratch_frame;
                 match socket.send_slice(wire_frame) {
                     Ok(n) if n == wire_frame.len() => {}
                     Ok(n) if n > 0 => {
                         // Partial send — buffer remainder.
                         conn.send_pending.extend_from_slice(&wire_frame[n..]);
                     }
-                    Ok(_) => break,
-                    Err(_) => break,
+                    Ok(_) | Err(_) => {
+                        // Nothing sent. The frame was already pulled from the
+                        // generator (which is stateful and cannot be rewound),
+                        // so stash the whole wire frame in send_pending; the
+                        // outer loop's send_pending drain will retry it next
+                        // poll.
+                        conn.send_pending.extend_from_slice(wire_frame);
+                    }
                 }
                 conn.inflight_ts.push_back(crate::rdtscp());
                 conn.send_cursor += 1;
