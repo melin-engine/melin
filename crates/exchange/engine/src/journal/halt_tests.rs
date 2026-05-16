@@ -91,6 +91,7 @@ mod tests {
             active_conns,
             Some(Arc::clone(&counter)),
             false,
+            1, // starting_wire_seq (halt test does not exercise the gate)
         );
 
         let shutdown = Arc::new(AtomicBool::new(false));

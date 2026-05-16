@@ -929,6 +929,7 @@ where
         shadow_consumer,
         chain_hash_lock,
         replication_ring_progress,
+        last_seq,
     } = build_pipeline_with_replication(
         exchange,
         writer,
@@ -1080,7 +1081,7 @@ where
 
     // Clone cursors for the response thread — the originals are needed
     // later for seed drain gating.
-    let journal_cursor_response = Arc::clone(&journal_cursor);
+    let journal_persisted_wire_seq_response = Arc::clone(&last_seq);
     let replication_metrics_response = replication_metrics.as_ref().map(Arc::clone);
     let replica_active_response = replica_active.clone();
     let durability_mode_response = Arc::clone(&durability_mode_atomic);
@@ -1096,7 +1097,7 @@ where
                 output_consumer,
                 control_rx,
                 crate::response::Response {
-                    journal_cursor: journal_cursor_response,
+                    journal_persisted_wire_seq: journal_persisted_wire_seq_response,
                     durability_mode: durability_mode_response,
                     replication_metrics: replication_metrics_response,
                     replica_active: replica_active_response,
@@ -1921,6 +1922,7 @@ where
         shadow_consumer,
         chain_hash_lock,
         replication_ring_progress,
+        last_seq,
     } = build_pipeline_with_replication(
         exchange,
         writer,
@@ -2047,7 +2049,7 @@ where
 
     // Spawn DPDK response stage (encodes to TX channel instead of kernel sockets).
     let output_consumer = output_consumers.remove(0);
-    let journal_cursor_response = Arc::clone(&journal_cursor);
+    let journal_persisted_wire_seq_response = Arc::clone(&last_seq);
     let replication_metrics_response = replication_metrics.as_ref().map(Arc::clone);
     let replica_active_response = replica_active.clone();
     let durability_mode_response = Arc::clone(&durability_mode_atomic);
@@ -2062,7 +2064,7 @@ where
             crate::dpdk_response::run(
                 output_consumer,
                 control_rx,
-                journal_cursor_response,
+                journal_persisted_wire_seq_response,
                 durability_mode_response,
                 replication_metrics_response,
                 replica_active_response,

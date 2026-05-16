@@ -167,6 +167,7 @@ fn matching_stage_processes_events() {
         active_conns,
         None, // standalone — no halt check
         false,
+        1, // starting_wire_seq (test does not exercise the gate)
     );
 
     let shutdown = Arc::new(AtomicBool::new(false));

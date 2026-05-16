@@ -11,14 +11,13 @@
 use std::collections::{HashMap, HashSet};
 use std::os::unix::io::RawFd;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 use io_uring::{IoUring, opcode, types};
 use tracing::{debug, error};
 
-use melin_disruptor::padding::Sequence;
 use melin_disruptor::ring;
 
 use crate::durability_policy::{CursorView, DurabilityMode, EvalStatus, Policy};
@@ -55,7 +54,15 @@ pub use crate::ControlEvent;
 
 /// Configuration and shared state for the response stage.
 pub struct Response {
-    pub journal_cursor: Arc<Sequence>,
+    /// Highest wire seq durably persisted on the primary's journal.
+    /// In the same sequence space as `OutputSlot.wire_seq` and the
+    /// replica metrics (`metrics.in_memory_sequence` /
+    /// `metrics.acked_sequence`), so the durability gate can compare
+    /// these values numerically and the comparison is meaningful
+    /// regardless of `starting_sequence` (fresh vs recovered primary).
+    /// Updated by the journal stage after every fsync batch via
+    /// `set_last_seq_publisher`.
+    pub journal_persisted_wire_seq: Arc<AtomicU64>,
     /// Operator-selected durability mode, published through a shared
     /// [`AtomicU8`] so the admin `DURABILITY` command can swap it at
     /// runtime without restarting the node. The response stage reads
@@ -112,7 +119,7 @@ pub fn run(
     shutdown: &AtomicBool,
 ) {
     let Response {
-        journal_cursor,
+        journal_persisted_wire_seq,
         durability_mode,
         replication_metrics,
         replica_active,
@@ -174,7 +181,7 @@ pub fn run(
     // the first batch arrives.
     let mut degraded_logger;
     {
-        let journal_pos = journal_cursor.get().load(Ordering::Acquire);
+        let journal_pos = journal_persisted_wire_seq.load(Ordering::Acquire);
         let metrics_ref = replication_metrics.as_deref();
         let active_ref = replica_active.as_ref();
         let status = evaluate_durability(&policy, journal_pos, metrics_ref, active_ref);
@@ -402,7 +409,7 @@ pub fn run(
                 let now_ts = Instant::now();
                 if now_ts.duration_since(last_policy_check) >= POLICY_CHECK_INTERVAL {
                     last_policy_check = now_ts;
-                    let journal_pos = journal_cursor.get().load(Ordering::Acquire);
+                    let journal_pos = journal_persisted_wire_seq.load(Ordering::Acquire);
                     let metrics_ref = replication_metrics.as_deref();
                     let active_ref = replica_active.as_ref();
                     let status = evaluate_durability(&policy, journal_pos, metrics_ref, active_ref);
@@ -454,17 +461,33 @@ pub fn run(
         #[cfg(feature = "tick-to-trade")]
         let mut gate_tracker;
         {
-            let max_seq = batch[..count]
+            // Gate on `wire_seq`, not `input_seq`. `input_seq` is in
+            // local-consumer space (the matching cursor on the input
+            // ring, starts at 0 in this process) while replica metrics
+            // and the primary's `journal_persisted_wire_seq` live in
+            // wire-seq space (allocated by the journal stage starting
+            // at `starting_sequence`). A `needed` derived from
+            // `input_seq` and compared against wire-seq cursors only
+            // works when `starting_sequence == 1`; a recovered primary
+            // (or any process whose journal already has prior content
+            // pushing `starting_sequence` above 1) would silently open
+            // the gate ahead of the replica's actual replicated state.
+            //
+            // Every cursor in the policy view (`journal_persisted_wire_seq`,
+            // `metrics.in_memory_sequence`, `metrics.acked_sequence`)
+            // carries "highest wire seq known to be in that state on
+            // node X". A batch's `needed` is therefore the *exact*
+            // wire seq the gate must see — not `+1` — for the latest
+            // event in the batch to be considered durable. The legacy
+            // `+1` was load-bearing only because `input_seq` was off
+            // by `starting_sequence - 1` from wire seq; with the
+            // wire-seq stamp it would over-shoot by one event and
+            // make the gate stall an extra round-trip per response.
+            let needed = batch[..count]
                 .iter()
-                .map(|s| s.input_seq)
+                .map(|s| s.wire_seq)
                 .max()
                 .expect("non-empty batch");
-            // `saturating_add` is free on this cold path. `u64::MAX`
-            // is astronomically out of reach (~10²² events), but if
-            // it ever happens — bug, test fixture, far-future replay
-            // — we'd rather saturate at MAX than wrap to 0 and open
-            // the gate spuriously.
-            let needed = max_seq.saturating_add(1);
             #[cfg(feature = "tick-to-trade")]
             {
                 gate_tracker = GateCrossTracker::new(needed);
@@ -509,7 +532,7 @@ pub fn run(
                         degraded_logger = DegradationLogger::new(Instant::now());
                     }
 
-                    let journal_pos = journal_cursor.get().load(Ordering::Acquire);
+                    let journal_pos = journal_persisted_wire_seq.load(Ordering::Acquire);
                     let metrics_ref = replication_metrics.as_deref();
                     let active_ref = replica_active.as_ref();
                     let repl_min = connected_persisted_min(metrics_ref, active_ref);

@@ -34,9 +34,14 @@ use crate::types::{
 // dev/bench only, not the production cache footprint we're guarding.
 #[cfg(not(feature = "latency-trace"))]
 const _: () = assert!(size_of::<melin_transport_core::pipeline::InputSlot<TradingEvent>>() == 104);
+// Bumped from 416 → 424 (one extra u64) when `OutputSlot.wire_seq` was
+// added so the response stage's durability gate can compare against
+// replica metrics in wire-seq space rather than the unsound local-vs-wire
+// mix that previously let the gate open on un-replicated events on a
+// recovered primary. Correctness > footprint here.
 #[cfg(not(feature = "latency-trace"))]
 const _: () = assert!(
-    size_of::<melin_transport_core::pipeline::OutputSlot<ExecutionReport, QueryResponse>>() == 416
+    size_of::<melin_transport_core::pipeline::OutputSlot<ExecutionReport, QueryResponse>>() == 424
 );
 const _: () = assert!(size_of::<melin_journal::JournalEvent<TradingEvent>>() == 64);
 const _: () = assert!(size_of::<ExecutionReport>() == 64);

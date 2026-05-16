@@ -216,9 +216,29 @@ pub struct OutputSlot<R: Copy, Q: Copy> {
     /// Which client connection receives this response.
     pub connection_id: u64,
     /// Input disruptor sequence this output originated from.
-    /// The response stage must not send this until the journal cursor
-    /// has advanced past this value (i.e., the event is durable).
+    /// Retained for per-slot latency attribution and ordering invariants
+    /// inside this process. The response stage's *durability* gate uses
+    /// `wire_seq` instead — `input_seq` is in local-consumer space (this
+    /// process's matching cursor on the input ring) while replica
+    /// metrics live in wire-seq space, and a direct numeric comparison
+    /// across those two spaces is unsound (see commit history).
     pub input_seq: u64,
+    /// Primary-allocated wire sequence of the event that produced this
+    /// output slot, in the same space as `metrics.in_memory_sequence` /
+    /// `metrics.acked_sequence` and the journal stage's allocator. The
+    /// response stage uses this — *not* `input_seq` — for `needed` when
+    /// evaluating the durability policy, so the gate is sound regardless
+    /// of `starting_sequence` (fresh start vs recovery from a journal
+    /// with prior history).
+    ///
+    /// Set by the matching stage; the journal stage publishes a parallel
+    /// `journal_wire_seq_cursor` on the persisted track. Both follow the
+    /// journal-allocation rule (events the journal would `continue` past
+    /// — `Query` and `Checkpoint` — do not advance the counter; their
+    /// output slots carry the prior wire seq, so the gate waits for
+    /// preceding allocated events to be durable before releasing a
+    /// query response).
+    pub wire_seq: u64,
     /// The response payload.
     pub payload: OutputPayload<R, Q>,
     /// Timestamp when the matching stage finished processing this event.
@@ -288,6 +308,7 @@ impl<R: Copy, Q: Copy> Default for OutputSlot<R, Q> {
         Self {
             connection_id: 0,
             input_seq: 0,
+            wire_seq: 0,
             payload: OutputPayload::BatchEnd,
             match_complete_ts: mono_trace_ns(),
             recv_ts: mono_trace_ns(),
@@ -1681,10 +1702,21 @@ pub struct MatchingStage<A: Application> {
     /// thing that moves time forward. Derived state — not snapshotted; recovery
     /// catches up at the first replayed event with a non-zero timestamp.
     last_drain_ns: u64,
+    /// Wire-seq counter shadowing the journal stage's allocator. Stamped
+    /// into `OutputSlot.wire_seq` so the response stage's durability gate
+    /// can compare against replica metrics in the same space. Initialised
+    /// to the journal writer's `starting_sequence` and advanced for each
+    /// event the journal would allocate (App non-query, Tick,
+    /// GenesisHash); held flat for events the journal skips (Query,
+    /// Checkpoint). The skip-rule mirrors `JournalStage::run` exactly —
+    /// any drift would re-introduce the off-by-one the wire-seq field
+    /// exists to eliminate. Tests pin this invariant.
+    next_wire_seq: u64,
 }
 
 impl<A: Application> MatchingStage<A> {
     /// Create a new matching stage.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         app: A,
         consumer: ring::Consumer<InputSlot<A::Event>>,
@@ -1694,6 +1726,7 @@ impl<A: Application> MatchingStage<A> {
         active_connections: Arc<AtomicU64>,
         replicas_connected: Option<Arc<AtomicU32>>,
         busy_spin: bool,
+        starting_wire_seq: u64,
     ) -> Self {
         Self {
             app,
@@ -1706,6 +1739,7 @@ impl<A: Application> MatchingStage<A> {
             busy_spin,
             utilization: Arc::new(StageUtilization::new()),
             last_drain_ns: 0,
+            next_wire_seq: starting_wire_seq,
         }
     }
 
@@ -1836,6 +1870,26 @@ impl<A: Application> MatchingStage<A> {
                     break;
                 }
                 let input_seq = batch_start + i as u64;
+                // Wire seq for this event, in the same space as
+                // `metrics.in_memory_sequence` / the journal stage's
+                // allocator. Skip the counter advance for the same event
+                // kinds the journal skips (Queries via `is_query()`, plus
+                // `Checkpoint` which the journal `continue`s past). For
+                // those skipped slots we stamp the *prior* allocated wire
+                // seq so the response gate waits on already-allocated
+                // events to be durable before releasing — a query
+                // arriving before any allocation gets `0`, which the gate
+                // is guaranteed to satisfy.
+                let is_query_event = slot.event.is_query();
+                let is_checkpoint =
+                    matches!(slot.event, melin_journal::JournalEvent::Checkpoint { .. });
+                let wire_seq = if is_query_event || is_checkpoint {
+                    self.next_wire_seq.saturating_sub(1)
+                } else {
+                    let s = self.next_wire_seq;
+                    self.next_wire_seq = self.next_wire_seq.saturating_add(1);
+                    s
+                };
                 busy_count += 1;
 
                 #[cfg(feature = "latency-trace")]
@@ -1986,6 +2040,7 @@ impl<A: Application> MatchingStage<A> {
                             *s = OutputSlot {
                                 connection_id: slot.connection_id,
                                 input_seq,
+                                wire_seq,
                                 payload: OutputPayload::BatchEnd,
                                 match_complete_ts,
                                 recv_ts: slot.recv_ts,
@@ -2001,6 +2056,7 @@ impl<A: Application> MatchingStage<A> {
                             *s = OutputSlot {
                                 connection_id: slot.connection_id,
                                 input_seq,
+                                wire_seq,
                                 payload: OutputPayload::Report(*report),
                                 match_complete_ts,
                                 recv_ts: slot.recv_ts,
@@ -2014,6 +2070,7 @@ impl<A: Application> MatchingStage<A> {
                             *s = OutputSlot {
                                 connection_id: slot.connection_id,
                                 input_seq,
+                                wire_seq,
                                 payload: OutputPayload::QueryResponse(qr),
                                 match_complete_ts,
                                 recv_ts: slot.recv_ts,
@@ -2076,10 +2133,27 @@ impl<A: Application> MatchingStage<A> {
             let Some((input_seq, slot)) = entry else {
                 break;
             };
+            // Mirror the main loop's wire-seq stamping rule so output
+            // slots emitted on shutdown carry a sound wire_seq for the
+            // response stage's gate. Queries are skipped below (their
+            // output slots are meaningless on shutdown) — for non-query
+            // events the journal would still allocate, so advance the
+            // counter. Checkpoint-without-allocation matches the main
+            // loop's `saturating_sub` behavior.
+            let is_query_event = slot.event.is_query();
+            let is_checkpoint =
+                matches!(slot.event, melin_journal::JournalEvent::Checkpoint { .. });
+            let wire_seq = if is_query_event || is_checkpoint {
+                self.next_wire_seq.saturating_sub(1)
+            } else {
+                let s = self.next_wire_seq;
+                self.next_wire_seq = self.next_wire_seq.saturating_add(1);
+                s
+            };
             // Read-only queries are meaningless during shutdown — skip
             // to avoid emitting a bare BatchEnd without a preceding
             // response.
-            if slot.event.is_query() {
+            if is_query_event {
                 continue;
             }
             reports.clear();
@@ -2113,6 +2187,7 @@ impl<A: Application> MatchingStage<A> {
                 self.output.publish(OutputSlot {
                     connection_id: slot.connection_id,
                     input_seq,
+                    wire_seq,
                     payload: OutputPayload::BatchEnd,
                     match_complete_ts,
                     recv_ts: slot.recv_ts,
@@ -2125,6 +2200,7 @@ impl<A: Application> MatchingStage<A> {
                     self.output.publish(OutputSlot {
                         connection_id: slot.connection_id,
                         input_seq,
+                        wire_seq,
                         payload: OutputPayload::Report(*report),
                         match_complete_ts,
                         recv_ts: slot.recv_ts,
@@ -2240,6 +2316,14 @@ pub struct Pipeline<A: Application, W: JournalWrite<A::Event>> {
     pub shadow_consumer: Option<ring::Consumer<InputSlot<A::Event>>>,
     pub chain_hash_lock: Option<Arc<SeqLock<[u8; 32]>>>,
     pub replication_ring_progress: Option<ReplicationRingProgress>,
+    /// Highest wire seq durably persisted on this node's journal.
+    /// Published by the journal stage after every fsync batch via
+    /// `set_last_seq_publisher`. The response stage uses this — *not*
+    /// `journal_cursor` — for the primary's `persisted` cursor in the
+    /// durability policy view: it's in wire-seq space (same as replica
+    /// metrics and `OutputSlot.wire_seq`), so the gate's numeric
+    /// comparison is sound regardless of `starting_sequence`.
+    pub last_seq: Arc<AtomicU64>,
 }
 
 /// Assembled replica pipeline stages and handles returned by [`build_replica_pipeline`].
@@ -2420,6 +2504,21 @@ where
 
     let events_processed = Arc::new(AtomicU64::new(0));
 
+    // Snapshot the wire-seq allocator's starting value before handing the
+    // writer to the journal stage. The matching stage shadows this counter
+    // (incrementing in lockstep with what the journal would allocate) so
+    // it can stamp `OutputSlot.wire_seq` in the same sequence space as
+    // replica metrics — that's what makes the response gate sound under
+    // recovery from a non-trivial journal (`starting_sequence > 1`).
+    let starting_wire_seq = writer.next_sequence();
+
+    // Atomic carrying "highest wire seq durably persisted on disk".
+    // Initial value = `starting_wire_seq - 1` so the response stage sees
+    // the post-recovery / post-genesis durable cursor immediately rather
+    // than waiting for the first user event's fsync to publish it. The
+    // journal stage Release-stores into this after every fsync batch.
+    let last_seq = Arc::new(AtomicU64::new(starting_wire_seq.saturating_sub(1)));
+
     let mut journal_stage = JournalStage::new(
         writer,
         journal_consumer,
@@ -2427,6 +2526,7 @@ where
         max_journal_batch,
         busy_spin,
     );
+    journal_stage.set_last_seq_publisher(Arc::clone(&last_seq));
 
     // Build two independent SPSC replication rings (one per replica slot).
     // Each ring has its own producer and consumer, so a slow replica only
@@ -2496,6 +2596,7 @@ where
         active_connections,
         replicas_connected.clone(),
         busy_spin,
+        starting_wire_seq,
     );
 
     // Replication cursor: shared atomic read by the response stage.
@@ -2521,6 +2622,7 @@ where
         shadow_consumer,
         chain_hash_lock,
         replication_ring_progress,
+        last_seq,
     }
 }
 
@@ -2571,6 +2673,15 @@ where
 
     let events_processed = Arc::new(AtomicU64::new(0));
 
+    // Snapshot the wire-seq allocator's starting value before handing the
+    // writer to the journal stage. On the replica every incoming slot
+    // already carries `slot.sequence`, so the matching stage's counter
+    // only needs to be initialised here and from then on tracks 1:1 with
+    // those primary-assigned sequences. After promotion (or any future
+    // path where the replica's matching stamps wire seqs locally) the
+    // counter is positioned correctly.
+    let starting_wire_seq = writer.next_sequence();
+
     // Journal stage: same as primary (encode mode). Pre-assigned sequences
     // in each InputSlot keep the replica's journal aligned with the primary.
     let mut journal_stage = JournalStage::new(
@@ -2602,6 +2713,7 @@ where
         active_connections,
         None, // no replicas_connected halt check on replica
         busy_spin,
+        starting_wire_seq,
     );
 
     ReplicaPipeline {

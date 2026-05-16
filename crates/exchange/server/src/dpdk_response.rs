@@ -16,7 +16,6 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
-use melin_disruptor::padding::Sequence;
 use melin_disruptor::ring;
 use melin_disruptor::spsc;
 
@@ -95,10 +94,15 @@ pub enum ControlEvent {
 /// owned elsewhere; bundling into a config struct adds indirection
 /// without simplifying.
 #[allow(clippy::too_many_arguments)]
+// `journal_persisted_wire_seq`: highest wire seq durably persisted on
+// this node's journal — same semantics as
+// `response::Response::journal_persisted_wire_seq`. See that field's docs
+// for why the gate must use wire-seq space rather than the
+// journal-consumer cursor.
 pub fn run(
     mut consumer: ring::Consumer<OutputSlot>,
     control_rx: mpsc::Receiver<ControlEvent>,
-    journal_cursor: Arc<Sequence>,
+    journal_persisted_wire_seq: Arc<AtomicU64>,
     durability_mode: Arc<std::sync::atomic::AtomicU8>,
     replication_metrics: Option<Arc<crate::replication::ReplicationMetrics>>,
     replica_active: Option<[Arc<AtomicBool>; 2]>,
@@ -142,7 +146,7 @@ pub fn run(
 
     let mut degraded_logger;
     {
-        let journal_pos = journal_cursor.get().load(Ordering::Acquire);
+        let journal_pos = journal_persisted_wire_seq.load(Ordering::Acquire);
         let metrics_ref = replication_metrics.as_deref();
         let active_ref = replica_active.as_ref();
         let status =
@@ -291,7 +295,7 @@ pub fn run(
                 let now_ts = Instant::now();
                 if now_ts.duration_since(last_policy_check) >= POLICY_CHECK_INTERVAL {
                     last_policy_check = now_ts;
-                    let journal_pos = journal_cursor.get().load(Ordering::Acquire);
+                    let journal_pos = journal_persisted_wire_seq.load(Ordering::Acquire);
                     let metrics_ref = replication_metrics.as_deref();
                     let active_ref = replica_active.as_ref();
                     let status = crate::response::evaluate_durability(
@@ -333,13 +337,18 @@ pub fn run(
 
         // Wait for durability (see response.rs for full explanation).
         {
-            let max_seq = batch[..count]
+            // Gate on `wire_seq` (matches `response::run`) — see that
+            // module's notes on the input-seq vs wire-seq space mismatch
+            // that motivated the field. With the wire-seq stamp, `needed`
+            // is the exact wire seq the gate must observe to consider
+            // the batch's latest event durable; no `+1` (the old `+1`
+            // compensated for the input-seq off-by-(starting-1), which
+            // is gone now).
+            let needed = batch[..count]
                 .iter()
-                .map(|s| s.input_seq)
+                .map(|s| s.wire_seq)
                 .max()
                 .expect("non-empty batch");
-            // Saturating add — see response.rs for the rationale.
-            let needed = max_seq.saturating_add(1);
             #[cfg(feature = "tick-to-trade")]
             {
                 gate_tracker = crate::response::GateCrossTracker::new(needed);
@@ -364,7 +373,7 @@ pub fn run(
                         degraded_logger = crate::response::DegradationLogger::new(Instant::now());
                     }
 
-                    let journal_pos = journal_cursor.get().load(Ordering::Acquire);
+                    let journal_pos = journal_persisted_wire_seq.load(Ordering::Acquire);
                     let metrics_ref = replication_metrics.as_deref();
                     let active_ref = replica_active.as_ref();
                     let repl_min =

@@ -1084,19 +1084,32 @@ fn recovered_primary_durability_gate_holds() {
     wait_healthy(cluster.primary.health_addr, Duration::from_secs(30));
     cluster.wait_replicated();
 
-    // Phase 2: submit BURST new orders. Each response is gated on the
-    // hybrid policy; if the gate is sound every acked response is on the
-    // replica.
+    // Phase 2: submit BURST new orders. The new client is a fresh
+    // connection so its session-local `next_seq` starts at 0; without
+    // an explicit sync it would collide with the recovered primary's
+    // `request_seq` HWM (50 after phase 1) and every request would
+    // come back as `Rejected{DuplicateRequest}` rather than a
+    // gate-driven `Placed`. The test's invariant is about Placed
+    // responses on the durability gate, not dedup behaviour, so adopt
+    // the engine's HWM up front.
     let mut client = cluster.connect_primary();
+    client
+        .synchronize_request_seq()
+        .expect("synchronize_request_seq with recovered primary");
     let mut acked: Vec<u64> = Vec::with_capacity(BURST as usize);
     for i in 0..BURST {
         let id = PREFILL + 1 + i;
         let r = submit_order(&mut client, id, 1, 1, Side::Buy, 100, 10);
-        if !r.is_empty() {
+        // Only count orders that were actually Placed — a non-empty
+        // response could also be a Rejected (e.g. balance, dedup),
+        // which doesn't reflect a gated-durable state.
+        if has_report(&r, |rep| {
+            matches!(rep, melin_protocol::types::ExecutionReport::Placed { .. })
+        }) {
             acked.push(id);
         }
     }
-    assert!(!acked.is_empty(), "no burst orders were acked");
+    assert!(!acked.is_empty(), "no burst orders were placed");
     drop(client);
 
     // Promote the replica WITHOUT waiting for replication lag — the
