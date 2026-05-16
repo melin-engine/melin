@@ -10,12 +10,6 @@
 
 pub mod snapshot;
 
-#[cfg(test)]
-mod halt_tests;
-
-#[cfg(test)]
-mod recovery_tests;
-
 /// The `TradingEvent`-parameterised journal types — aliased here so
 /// engine/server code doesn't have to spell the generic every time.
 pub type JournalEvent = melin_journal::JournalEvent<crate::trading_event::TradingEvent>;

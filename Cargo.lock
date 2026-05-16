@@ -1685,6 +1685,7 @@ version = "0.7.0"
 dependencies = [
  "base64 0.22.1",
  "blake3",
+ "bolero",
  "clap",
  "crc32c",
  "ed25519-dalek",

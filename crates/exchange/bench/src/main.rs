@@ -742,15 +742,16 @@ fn run_pipeline_bench(
     use melin_engine::journal::{BufferedWriter, JournalWriterMode, SectorWriter};
 
     // Set up exchange with one instrument and funded account.
-    let mut exchange = melin_engine::exchange::Exchange::with_capacity();
-    exchange.add_instrument(InstrumentSpec {
+    let mut app =
+        melin_server::exchange_app::ServerApp(melin_engine::exchange::Exchange::with_capacity());
+    app.add_instrument(InstrumentSpec {
         symbol: Symbol(1),
         base: CurrencyId(1),
         quote: CurrencyId(2),
     });
-    exchange.deposit(AccountId(1), CurrencyId(1), u64::MAX / 2);
-    exchange.deposit(AccountId(1), CurrencyId(2), u64::MAX / 2);
-    exchange.prefault();
+    app.deposit(AccountId(1), CurrencyId(1), u64::MAX / 2);
+    app.deposit(AccountId(1), CurrencyId(2), u64::MAX / 2);
+    app.prefault();
 
     let tmp_dir = tempdir();
     let effective_journal = journal_path.unwrap_or_else(|| tmp_dir.join("pipeline-bench.journal"));
@@ -771,12 +772,12 @@ fn run_pipeline_bench(
     // `dyn` writer and call once.
     match journal_writer_mode {
         JournalWriterMode::Buffered => run_pipeline_inner(
-            exchange,
+            app,
             BufferedWriter::create(&effective_journal).expect("create journal"),
             cfg,
         ),
         JournalWriterMode::Sector => run_pipeline_inner(
-            exchange,
+            app,
             SectorWriter::create(&effective_journal).expect("create journal"),
             cfg,
         ),
@@ -799,11 +800,8 @@ struct PipelineInnerCfg<'a> {
 
 /// Pipeline-mode body, generic over the journal writer so we get a
 /// statically-dispatched `run_sync` or `run_uring` per writer.
-fn run_pipeline_inner<W>(
-    exchange: melin_engine::exchange::Exchange,
-    writer: W,
-    cfg: PipelineInnerCfg<'_>,
-) where
+fn run_pipeline_inner<W>(app: melin_server::App, writer: W, cfg: PipelineInnerCfg<'_>)
+where
     W: melin_engine::journal::JournalWrite<melin_trading::trading_event::TradingEvent>
         + Send
         + 'static,
@@ -832,7 +830,7 @@ fn run_pipeline_inner<W>(
     let group_commit_delay = Duration::from_micros(group_commit_us);
     let active_conns = Arc::new(AtomicU64::new(0));
     let mut out = build_pipeline_with_replication(
-        exchange,
+        app,
         writer,
         group_commit_delay,
         active_conns,

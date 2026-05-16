@@ -106,3 +106,11 @@ ed25519-dalek = { workspace = true }
 base64 = { workspace = true }
 serial_test = "3"
 proptest = "1"
+# Fuzz-test driver — only used by the journal/codec fuzz tests in tests/.
+bolero = "0.13"
+# Re-list `melin-journal` / `melin-transport-core` with `test-utils` so
+# the recovery tests in tests/ can reach `apply_journaled`,
+# `tick_journaled`, and `writer_mut` (test-only primitives gated behind
+# that feature in transport-core).
+melin-journal = { path = "../../core/journal", features = ["test-utils"] }
+melin-transport-core = { path = "../../core/transport-core", features = ["test-utils"] }

@@ -16,11 +16,15 @@ compile_error!(
 
 /// The concrete [`Application`] this server is built against.
 ///
-/// Always `Exchange` — under `--features skip-order-exec` the engine
-/// short-circuits `Exchange::execute` to a single rejection per
-/// `SubmitOrder` so the matching hot path is bypassed, but the type
-/// stays uniform for downstream modules.
-pub type App = melin_engine::exchange::Exchange;
+/// `ServerApp` is a transparent newtype around `melin_engine::exchange::Exchange`
+/// that carries the `Application` impl. Wrapping is required by the
+/// orphan rule — the trait lives in `melin-app` and `Exchange` lives in
+/// `melin-engine`, so the impl can only attach via a type that's local
+/// here. Under `--features skip-order-exec` the engine short-circuits
+/// `Exchange::execute` to a single rejection per `SubmitOrder` so the
+/// matching hot path is bypassed, but the type stays uniform for
+/// downstream modules.
+pub type App = exchange_app::ServerApp;
 
 /// Trading-bound ring-slot aliases. The server operates on the trading
 /// wire format regardless of which mode it's built in (that's the
@@ -72,6 +76,9 @@ pub mod durability_policy;
 /// `melin-market-data` for book-mirror snapshots.
 #[cfg(all(feature = "trading", not(feature = "skip-order-exec")))]
 pub mod event_publisher;
+/// Newtype wrapping `melin_engine::exchange::Exchange` that carries the
+/// `melin_app::Application` impl — see [`exchange_app::ServerApp`].
+pub mod exchange_app;
 pub mod health;
 mod reader;
 pub mod request;

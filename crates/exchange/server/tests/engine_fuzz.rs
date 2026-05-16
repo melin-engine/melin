@@ -4,14 +4,15 @@
 //! accesses, and infinite loops. Complements the proptest round-trip
 //! tests which only exercise valid inputs.
 
-use crate::journal::codec;
+use melin_journal::codec;
+use melin_trading::trading_event::TradingEvent;
 
 /// Journal entry decoder must never panic on arbitrary input.
 /// It must return Ok or a well-formed Err for any byte sequence.
 #[test]
 fn fuzz_journal_decode() {
     bolero::check!().for_each(|data: &[u8]| {
-        let _ = codec::decode::<crate::trading_event::TradingEvent>(data, codec::FORMAT_VERSION);
+        let _ = codec::decode::<TradingEvent>(data, codec::FORMAT_VERSION);
     });
 }
 
@@ -58,15 +59,13 @@ fn fuzz_journal_roundtrip() {
 /// snapshot load path — wraps arbitrary bytes with a valid header and CRC.
 #[test]
 fn fuzz_snapshot_decode() {
-    use crate::exchange::Exchange;
-
     bolero::check!().for_each(|data: &[u8]| {
         // Write data as a snapshot file and try to load it.
         // This exercises the full decode path including header/CRC validation.
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("fuzz.snapshot");
         std::fs::write(&path, data).expect("write");
-        let _ = melin_transport_core::snapshot::load::<Exchange>(&path);
+        let _ = melin_transport_core::snapshot::load::<melin_server::App>(&path);
     });
 }
 
@@ -74,8 +73,8 @@ fn fuzz_snapshot_decode() {
 // Helpers: construct valid types from raw bytes
 // ---------------------------------------------------------------------------
 
-use crate::journal::JournalEvent;
-use crate::types::*;
+use melin_server::JournalEvent;
+use melin_types::types::*;
 use std::num::NonZeroU64;
 
 /// Read a NonZeroU64 from bytes, returning None if zero or insufficient data.
@@ -116,25 +115,21 @@ fn journal_event_from_bytes(data: &[u8]) -> Option<JournalEvent> {
     match data[0] % 11 {
         0 => {
             // AddInstrument.
-            Some(JournalEvent::App(
-                crate::trading_event::TradingEvent::AddInstrument {
-                    spec: InstrumentSpec {
-                        symbol: Symbol(u32_at(data, 1)?),
-                        base: CurrencyId(u32_at(data, 5)?),
-                        quote: CurrencyId(u32_at(data, 9)?),
-                    },
+            Some(JournalEvent::App(TradingEvent::AddInstrument {
+                spec: InstrumentSpec {
+                    symbol: Symbol(u32_at(data, 1)?),
+                    base: CurrencyId(u32_at(data, 5)?),
+                    quote: CurrencyId(u32_at(data, 9)?),
                 },
-            ))
+            }))
         }
         1 => {
             // Deposit.
-            Some(JournalEvent::App(
-                crate::trading_event::TradingEvent::Deposit {
-                    account: AccountId(u32_at(data, 1)?),
-                    currency: CurrencyId(u32_at(data, 5)?),
-                    amount: u64_at(data, 9)?,
-                },
-            ))
+            Some(JournalEvent::App(TradingEvent::Deposit {
+                account: AccountId(u32_at(data, 1)?),
+                currency: CurrencyId(u32_at(data, 5)?),
+                amount: u64_at(data, 9)?,
+            }))
         }
         2 => {
             // SubmitOrder.
@@ -178,31 +173,27 @@ fn journal_event_from_bytes(data: &[u8]) -> Option<JournalEvent> {
                     limit_price: Price(nz64(data, 37)?),
                 },
             };
-            Some(JournalEvent::App(
-                crate::trading_event::TradingEvent::SubmitOrder {
-                    symbol,
-                    order: Order {
-                        id,
-                        account,
-                        side,
-                        order_type,
-                        time_in_force: tif,
-                        quantity: qty,
-                        stp,
-                        expiry_ns: 0,
-                    },
+            Some(JournalEvent::App(TradingEvent::SubmitOrder {
+                symbol,
+                order: Order {
+                    id,
+                    account,
+                    side,
+                    order_type,
+                    time_in_force: tif,
+                    quantity: qty,
+                    stp,
+                    expiry_ns: 0,
                 },
-            ))
+            }))
         }
         3 => {
             // CancelOrder.
-            Some(JournalEvent::App(
-                crate::trading_event::TradingEvent::CancelOrder {
-                    symbol: Symbol(u32_at(data, 1)?),
-                    account: AccountId(u32_at(data, 5)?),
-                    order_id: OrderId(u64_at(data, 9)?),
-                },
-            ))
+            Some(JournalEvent::App(TradingEvent::CancelOrder {
+                symbol: Symbol(u32_at(data, 1)?),
+                account: AccountId(u32_at(data, 5)?),
+                order_id: OrderId(u64_at(data, 9)?),
+            }))
         }
         4 => {
             // SetRiskLimits.
@@ -226,47 +217,37 @@ fn journal_event_from_bytes(data: &[u8]) -> Option<JournalEvent> {
             } else {
                 None
             };
-            Some(JournalEvent::App(
-                crate::trading_event::TradingEvent::SetRiskLimits {
-                    symbol,
-                    limits: RiskLimits {
-                        max_order_qty,
-                        max_order_notional,
-                    },
+            Some(JournalEvent::App(TradingEvent::SetRiskLimits {
+                symbol,
+                limits: RiskLimits {
+                    max_order_qty,
+                    max_order_notional,
                 },
-            ))
+            }))
         }
         5 => {
             // CancelAll.
-            Some(JournalEvent::App(
-                crate::trading_event::TradingEvent::CancelAll {
-                    account: AccountId(u32_at(data, 1)?),
-                },
-            ))
+            Some(JournalEvent::App(TradingEvent::CancelAll {
+                account: AccountId(u32_at(data, 1)?),
+            }))
         }
         7 => {
             // DisableInstrument.
-            Some(JournalEvent::App(
-                crate::trading_event::TradingEvent::DisableInstrument {
-                    symbol: Symbol(u32_at(data, 1)?),
-                },
-            ))
+            Some(JournalEvent::App(TradingEvent::DisableInstrument {
+                symbol: Symbol(u32_at(data, 1)?),
+            }))
         }
         8 => {
             // EnableInstrument.
-            Some(JournalEvent::App(
-                crate::trading_event::TradingEvent::EnableInstrument {
-                    symbol: Symbol(u32_at(data, 1)?),
-                },
-            ))
+            Some(JournalEvent::App(TradingEvent::EnableInstrument {
+                symbol: Symbol(u32_at(data, 1)?),
+            }))
         }
         9 => {
             // RemoveInstrument.
-            Some(JournalEvent::App(
-                crate::trading_event::TradingEvent::RemoveInstrument {
-                    symbol: Symbol(u32_at(data, 1)?),
-                },
-            ))
+            Some(JournalEvent::App(TradingEvent::RemoveInstrument {
+                symbol: Symbol(u32_at(data, 1)?),
+            }))
         }
         _ => {
             // SetCircuitBreaker.
@@ -294,16 +275,14 @@ fn journal_event_from_bytes(data: &[u8]) -> Option<JournalEvent> {
                 None
             };
             let halted = data.len() > p && data[p] & 1 == 1;
-            Some(JournalEvent::App(
-                crate::trading_event::TradingEvent::SetCircuitBreaker {
-                    symbol,
-                    config: CircuitBreakerConfig {
-                        price_band_lower: lower,
-                        price_band_upper: upper,
-                        halted,
-                    },
+            Some(JournalEvent::App(TradingEvent::SetCircuitBreaker {
+                symbol,
+                config: CircuitBreakerConfig {
+                    price_band_lower: lower,
+                    price_band_upper: upper,
+                    halted,
                 },
-            ))
+            }))
         }
     }
 }

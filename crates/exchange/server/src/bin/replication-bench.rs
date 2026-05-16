@@ -97,12 +97,11 @@ fn main() {
     // Bench runs the buffered writer end-to-end; the sector path is
     // exercised separately in pipeline tests until the boot-site
     // dispatch refactor lands.
-    let engine =
-        JournaledApp::<melin_engine::exchange::Exchange, melin_journal::BufferedWriter<_>>::create(
-            melin_engine::exchange::Exchange::with_capacity(),
-            &primary_journal,
-        )
-        .expect("create primary journal");
+    let engine = JournaledApp::<melin_server::App, melin_journal::BufferedWriter<_>>::create(
+        melin_server::exchange_app::ServerApp(melin_engine::exchange::Exchange::with_capacity()),
+        &primary_journal,
+    )
+    .expect("create primary journal");
     let (exchange, writer) = engine.into_parts();
 
     // Read genesis before moving writer into the pipeline.

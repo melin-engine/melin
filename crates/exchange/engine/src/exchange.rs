@@ -551,7 +551,7 @@ impl Exchange {
     /// taking a `now_ns` parameter. Called by `Application::apply` exactly
     /// once per event before dispatch.
     #[inline]
-    pub(crate) fn set_current_event_ts_ns(&mut self, now_ns: u64) {
+    pub fn set_current_event_ts_ns(&mut self, now_ns: u64) {
         self.current_event_ts_ns = now_ns;
     }
 
@@ -733,7 +733,7 @@ impl Exchange {
     }
 
     /// Snapshot per-key request sequence HWMs for serialization.
-    pub(crate) fn snapshot_key_hwm(&self) -> Vec<(u64, u64)> {
+    pub fn snapshot_key_hwm(&self) -> Vec<(u64, u64)> {
         self.key_hwm
             .iter()
             .filter(|(_, hwm)| **hwm > 0)
@@ -788,7 +788,7 @@ impl Exchange {
     }
 
     /// Iterate over instrument specs (for snapshot serialization).
-    pub(crate) fn instrument_specs(&self) -> impl Iterator<Item = &InstrumentSpec> {
+    pub fn instrument_specs(&self) -> impl Iterator<Item = &InstrumentSpec> {
         self.instruments
             .iter()
             .filter_map(|slot| slot.as_deref())
@@ -806,7 +806,7 @@ impl Exchange {
     /// Snapshot the order-side map as a Vec for serialization.
     /// Only serializes the side; reservation slots are ephemeral and
     /// reassigned on restore.
-    pub(crate) fn snapshot_order_sides(&self) -> Vec<((AccountId, OrderId), Side)> {
+    pub fn snapshot_order_sides(&self) -> Vec<((AccountId, OrderId), Side)> {
         let mut sides = Vec::new();
         for inst in &self.instruments {
             if let Some(inst) = inst.as_deref() {
@@ -853,7 +853,7 @@ impl Exchange {
     }
 
     /// Snapshot the per-instrument risk limits for serialization.
-    pub(crate) fn snapshot_risk_limits(&self) -> Vec<(Symbol, RiskLimits)> {
+    pub fn snapshot_risk_limits(&self) -> Vec<(Symbol, RiskLimits)> {
         self.instruments
             .iter()
             .filter_map(|slot| slot.as_deref())
@@ -909,7 +909,7 @@ impl Exchange {
     }
 
     /// Snapshot the per-instrument circuit breaker configs for serialization.
-    pub(crate) fn snapshot_circuit_breakers(&self) -> Vec<(Symbol, CircuitBreakerConfig)> {
+    pub fn snapshot_circuit_breakers(&self) -> Vec<(Symbol, CircuitBreakerConfig)> {
         self.instruments
             .iter()
             .filter_map(|slot| slot.as_deref())
@@ -9596,13 +9596,13 @@ mod tests {
         let fee_before = exchange.accounts().balance(FEE_ACCOUNT, USD).available;
         assert!(fee_before > 0, "fees should have been collected");
 
-        // Save and load snapshot.
-        let dir = tempfile::tempdir().unwrap();
-        let snap_path = dir.path().join("test.snapshot");
-        melin_transport_core::snapshot::save::<Exchange>(&exchange, 100, [0u8; 32], &snap_path)
-            .unwrap();
-        let (restored, _, _) =
-            melin_transport_core::snapshot::load::<Exchange>(&snap_path).unwrap();
+        // In-memory payload round-trip via the engine's encode/decode
+        // pair — same code path the production on-disk snapshot uses,
+        // minus the transport framing/CRC (which lives behind the
+        // `Application` trait in `melin-transport-core` and is exercised
+        // by the integration tests in `melin-server/tests/`).
+        let bytes = crate::journal::snapshot::encode_exchange_payload(&exchange);
+        let restored = crate::journal::snapshot::decode_exchange_payload(&bytes).unwrap();
 
         let fee_after = restored.accounts().balance(FEE_ACCOUNT, USD).available;
         assert_eq!(

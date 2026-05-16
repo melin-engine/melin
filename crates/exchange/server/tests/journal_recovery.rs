@@ -1,6 +1,6 @@
 //! Engine-side journal recovery tests.
 //!
-//! Exercise `JournaledApp<Exchange, _>` (transport-core) end-to-end:
+//! Exercise `JournaledApp<App, _>` (transport-core) end-to-end:
 //! create, write, snapshot, rotate, recover, replay, crash-and-recover
 //! across every byte offset. The `TestExchange` harness below mirrors
 //! the shape of the deleted `JournaledExchange` wrapper so the tests
@@ -15,13 +15,16 @@ mod tests {
     use melin_transport_core::journaled_app::{JournaledApp, JournaledAppError};
     use melin_transport_core::snapshot;
 
-    use crate::exchange::Exchange;
-    use crate::journal::BufferedWriter;
-    use crate::trading_event::TradingEvent;
-    use crate::types::*;
+    use melin_engine::exchange::Exchange;
+    // Import the concrete newtype (not the `pub type App = ServerApp`
+    // alias) so it's usable as a tuple-struct constructor in `App(...)`.
+    use melin_server::BufferedWriter;
+    use melin_server::exchange_app::ServerApp as App;
+    use melin_trading::trading_event::TradingEvent;
+    use melin_types::types::*;
 
     /// Synchronous journal-then-apply harness mirroring the deleted
-    /// `JournaledExchange` API. Wraps `JournaledApp<Exchange,
+    /// `JournaledExchange` API. Wraps `JournaledApp<App,
     /// BufferedWriter>` and re-exposes per-event methods so the recovery
     /// tests below read close to their pre-deletion shape.
     ///
@@ -37,19 +40,19 @@ mod tests {
     /// see those zeros — fine for the recovery tests here, all of which
     /// are state-mutation only.
     struct TestExchange {
-        inner: JournaledApp<Exchange, BufferedWriter>,
+        inner: JournaledApp<App, BufferedWriter>,
     }
 
     impl TestExchange {
         /// Fresh exchange + fresh journal at `path`.
         fn create(path: &Path) -> Result<Self, JournaledAppError> {
-            JournaledApp::create(Exchange::with_capacity(), path).map(|inner| Self { inner })
+            JournaledApp::create(App(Exchange::with_capacity()), path).map(|inner| Self { inner })
         }
 
         /// Walk every archived segment then the live segment, replaying
         /// every event into a fresh `Exchange`.
         fn recover(path: &Path) -> Result<Self, JournaledAppError> {
-            JournaledApp::recover(Exchange::with_capacity(), path).map(|inner| Self { inner })
+            JournaledApp::recover(App(Exchange::with_capacity()), path).map(|inner| Self { inner })
         }
 
         /// Load `Exchange` state from a snapshot, then replay the
@@ -76,7 +79,7 @@ mod tests {
 
         /// Read-only access for state assertions (balances, order book).
         fn exchange(&self) -> &Exchange {
-            self.inner.app()
+            &self.inner.app().0
         }
 
         /// Next sequence the writer will assign.
@@ -260,7 +263,7 @@ mod tests {
 
     #[test]
     fn ticks_drive_gtd_expiry_through_replay() {
-        use crate::journal::unix_epoch_nanos;
+        use melin_app::unix_epoch_nanos;
 
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("gtd_ticks.journal");
@@ -544,12 +547,12 @@ mod tests {
 
         // Write journal entries with key_hash + request_seq.
         {
-            let mut writer = crate::journal::SectorWriter::create(&path).unwrap();
-            let ts = crate::journal::unix_epoch_nanos();
+            let mut writer = melin_server::SectorWriter::create(&path).unwrap();
+            let ts = melin_app::unix_epoch_nanos();
             // Deposit with seq=1
             writer
                 .batch_append_with_ts(
-                    &JournalEvent::App(crate::trading_event::TradingEvent::AddInstrument {
+                    &JournalEvent::App(TradingEvent::AddInstrument {
                         spec: btc_usd_spec(),
                     }),
                     ts,
@@ -560,7 +563,7 @@ mod tests {
             // Deposit with seq=2
             writer
                 .batch_append_with_ts(
-                    &JournalEvent::App(crate::trading_event::TradingEvent::Deposit {
+                    &JournalEvent::App(TradingEvent::Deposit {
                         account: ACCT_A,
                         currency: USD,
                         amount: 1000,
@@ -599,11 +602,11 @@ mod tests {
 
         // Create journaled exchange, write events with key_hash.
         {
-            let mut writer = crate::journal::SectorWriter::create(&journal_path).unwrap();
-            let ts = crate::journal::unix_epoch_nanos();
+            let mut writer = melin_server::SectorWriter::create(&journal_path).unwrap();
+            let ts = melin_app::unix_epoch_nanos();
             writer
                 .batch_append_with_ts(
-                    &JournalEvent::App(crate::trading_event::TradingEvent::AddInstrument {
+                    &JournalEvent::App(TradingEvent::AddInstrument {
                         spec: btc_usd_spec(),
                     }),
                     ts,
@@ -613,7 +616,7 @@ mod tests {
                 .unwrap();
             writer
                 .batch_append_with_ts(
-                    &JournalEvent::App(crate::trading_event::TradingEvent::Deposit {
+                    &JournalEvent::App(TradingEvent::Deposit {
                         account: ACCT_A,
                         currency: USD,
                         amount: 5000,
@@ -631,7 +634,7 @@ mod tests {
         je.save_snapshot(&snapshot_path).unwrap();
 
         // Load snapshot into a fresh exchange.
-        let (restored, _seq, _chain) = snapshot::load::<Exchange>(&snapshot_path).unwrap();
+        let (restored, _seq, _chain) = snapshot::load::<App>(&snapshot_path).unwrap();
         let hwm = restored.snapshot_key_hwm();
         assert_eq!(hwm.len(), 1);
         assert_eq!(hwm[0], (key_hash, 5));
@@ -649,7 +652,7 @@ mod tests {
     /// Helper: find the byte offset where valid journal data ends
     /// (after the last fully-written entry, before pre-allocated space).
     fn valid_data_end(path: &Path) -> u64 {
-        let mut reader = crate::journal::JournalReader::open(path).unwrap();
+        let mut reader = melin_server::JournalReader::open(path).unwrap();
         while reader.next_entry().unwrap().is_some() {}
         reader.valid_file_end()
     }
@@ -986,7 +989,7 @@ mod tests {
     /// produce the same fee account balance after recovery.
     #[test]
     fn journal_replay_preserves_fee_schedule() {
-        use crate::account::FEE_ACCOUNT;
+        use melin_engine::account::FEE_ACCOUNT;
 
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("fees.journal");

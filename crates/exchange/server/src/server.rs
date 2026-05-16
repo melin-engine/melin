@@ -2474,7 +2474,7 @@ pub fn apply_max_orders(
 }
 
 pub(crate) fn empty_app() -> App {
-    melin_engine::exchange::Exchange::with_capacity()
+    crate::exchange_app::ServerApp(melin_engine::exchange::Exchange::with_capacity())
 }
 
 /// Build a fresh, empty application sized for a known bulk-seed workload.
@@ -2488,17 +2488,18 @@ pub(crate) fn empty_app() -> App {
 /// [`empty_app`] because they reconstruct state from snapshots / replicated
 /// frames, both of which already size their HashMap from a known count.
 pub(crate) fn empty_app_for_seed(config: &ServerConfig) -> App {
-    let mut ex = melin_engine::exchange::Exchange::with_seed_capacity(
-        config.accounts as usize,
-        config.instruments as usize,
-    );
+    let mut app =
+        crate::exchange_app::ServerApp(melin_engine::exchange::Exchange::with_seed_capacity(
+            config.accounts as usize,
+            config.instruments as usize,
+        ));
     apply_max_orders(
-        &mut ex,
+        &mut app,
         config.max_orders_per_account,
         config.max_orders_per_second,
         config.max_orders_burst,
     );
-    ex
+    app
 }
 
 /// Initialize or recover the journaled application from disk.

@@ -74,12 +74,12 @@ type StopLevels = Vec<(Price, Vec<PendingStopSnapshot>)>;
 ///            restore. v18 carries the bucket map (`account`, `tokens`,
 ///            `last_refill_ns`) so primary and replica converge bit-for-
 ///            bit on the very next event after restore.
-pub(crate) const PAYLOAD_VERSION: u16 = 18;
+pub const PAYLOAD_VERSION: u16 = 18;
 
 /// Encode the Exchange's full state (the "payload" portion of a snapshot —
 /// everything between the header and the CRC) into a freshly allocated
 /// `Vec<u8>`. The caller owns framing and checksum.
-pub(crate) fn encode_exchange_payload(exchange: &Exchange) -> Vec<u8> {
+pub fn encode_exchange_payload(exchange: &Exchange) -> Vec<u8> {
     let state = exchange.snapshot_state();
     // Exchange snapshots grow with account/order count; start with a
     // generously sized buffer to minimise reallocations but avoid
@@ -94,7 +94,7 @@ pub(crate) fn encode_exchange_payload(exchange: &Exchange) -> Vec<u8> {
 /// framing and CRC before handing bytes to this function. Decoding is
 /// always at [`PAYLOAD_VERSION`]; the transport rejects mismatched
 /// `APP_VERSION` before this is ever called.
-pub(crate) fn decode_exchange_payload(buf: &[u8]) -> Result<Exchange, JournalError> {
+pub fn decode_exchange_payload(buf: &[u8]) -> Result<Exchange, JournalError> {
     let (_consumed, state) = decode_exchange_state(buf, PAYLOAD_VERSION)?;
     Ok(Exchange::restore_state(state))
 }
@@ -1669,19 +1669,36 @@ mod tests {
     use crate::exchange::Exchange;
     use crate::types::*;
 
-    // The on-disk save/load API moved to `melin_transport_core::snapshot`,
-    // generic over `melin_app::Application`. These shims preserve the
-    // engine-side test ergonomics — every round-trip test in this file
-    // exercises `Exchange::snapshot`/`restore` (which delegate to the
-    // payload codec below) through the same framing production uses.
-    type SnapResult<T> = Result<T, melin_transport_core::snapshot::SnapshotError>;
+    // Engine-local round-trip framing for the snapshot codec tests
+    // below. The production on-disk path lives in
+    // `melin_transport_core::snapshot` (generic over `Application`,
+    // including CRC32C framing) and is exercised by the integration
+    // tests in `melin-server/tests/`. Engine tests only need to verify
+    // the payload codec (`encode_exchange_payload` /
+    // `decode_exchange_payload`) — the seq + chain_hash are persisted
+    // alongside so existing tests that assert on them keep working.
+    type SnapResult<T> = std::io::Result<T>;
 
     fn save(exchange: &Exchange, seq: u64, chain_hash: [u8; 32], path: &Path) -> SnapResult<()> {
-        melin_transport_core::snapshot::save::<Exchange>(exchange, seq, chain_hash, path)
+        let payload = encode_exchange_payload(exchange);
+        let mut framed = Vec::with_capacity(40 + payload.len());
+        framed.extend_from_slice(&seq.to_le_bytes());
+        framed.extend_from_slice(&chain_hash);
+        framed.extend_from_slice(&payload);
+        std::fs::write(path, framed)
     }
 
     fn load(path: &Path) -> SnapResult<(Exchange, u64, [u8; 32])> {
-        melin_transport_core::snapshot::load::<Exchange>(path)
+        let bytes = std::fs::read(path)?;
+        if bytes.len() < 40 {
+            return Err(std::io::Error::other("truncated test snapshot header"));
+        }
+        let seq = u64::from_le_bytes(bytes[..8].try_into().unwrap());
+        let mut hash = [0u8; 32];
+        hash.copy_from_slice(&bytes[8..40]);
+        let exchange = decode_exchange_payload(&bytes[40..])
+            .map_err(|e| std::io::Error::other(e.to_string()))?;
+        Ok((exchange, seq, hash))
     }
 
     const ACCT_A: AccountId = AccountId(1);
@@ -1721,31 +1738,11 @@ mod tests {
         }
     }
 
-    /// Smoke test that the engine sees the transport's `SnapshotError`
-    /// variants intact through the shim above. Transport-core has its
-    /// own framing-corruption tests; this one guards against a future
-    /// error-type rename or restructure in transport-core silently
-    /// breaking engine callers that match on these variants.
-    #[test]
-    fn checksum_mismatch_surfaces_as_snapshot_error() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("corrupt.snapshot");
-
-        save(&Exchange::new(), 0, [0u8; 32], &path).unwrap();
-
-        // Flip one byte inside the payload region so the CRC fails.
-        // The transport header is 48 bytes, so index 48 is the first
-        // payload byte; flipping index 49 lands one byte into the payload.
-        let mut data = std::fs::read(&path).unwrap();
-        data[49] ^= 0xFF;
-        std::fs::write(&path, &data).unwrap();
-
-        match load(&path) {
-            Err(melin_transport_core::snapshot::SnapshotError::ChecksumMismatch { .. }) => {}
-            Err(other) => panic!("expected ChecksumMismatch, got {other:?}"),
-            Ok(_) => panic!("expected ChecksumMismatch, got Ok"),
-        }
-    }
+    // Note: the previous engine-side `checksum_mismatch_surfaces_as_snapshot_error`
+    // test was deleted in the engine ↔ core decoupling. That guarantee
+    // belongs to `melin_transport_core::snapshot`, which has its own
+    // framing-corruption tests, and `melin-server/tests/` exercises the
+    // full production framing end-to-end via `Application`.
 
     #[test]
     fn snapshot_save_load_round_trip() {
