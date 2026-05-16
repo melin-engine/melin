@@ -223,6 +223,10 @@ impl FixtureMetadata {
 
 /// Trim ITCH's space-padded 8-byte ticker for use as a JSON key.
 pub fn ticker_key(stock: &[u8; 8]) -> String {
+    // Diagnostic JSON key only — a non-UTF-8 ticker would never appear in
+    // a valid ITCH 5.0 'R' message (the field is ASCII alphanumeric +
+    // space), but if a corrupt dump ever surfaced one we'd rather emit
+    // "?" into the report than abort the calibration run.
     let s = std::str::from_utf8(stock).unwrap_or("?");
     s.trim_end().to_string()
 }

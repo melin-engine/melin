@@ -49,6 +49,31 @@ pub struct GeneratorAdapter {
 impl GeneratorAdapter {
     pub fn new(config: GeneratorConfig) -> Self {
         let num = config.num_instruments;
+        // `synthetic_ticker` encodes the symbol id as a 5-digit decimal
+        // suffix, so ids > 99_999 collide in ticker space and would
+        // silently merge per-symbol stats. ITCH-scale venues sit well
+        // below this; the assert guards misconfig in offline calibration.
+        debug_assert!(
+            num <= 99_999,
+            "num_instruments={num} exceeds synthetic_ticker capacity (99_999)"
+        );
+        // The ITCH wire format is u32 for both shares and price; the
+        // generator's defaults sit ~1000× below that ceiling. Asserts
+        // here so a future config that bumps the size/price ceilings
+        // past u32::MAX fails loudly at adapter construction instead of
+        // silently truncating per-event downstream.
+        debug_assert!(
+            config.max_size <= u32::MAX as u64,
+            "max_size={} exceeds ITCH u32 shares field",
+            config.max_size
+        );
+        debug_assert!(
+            config
+                .mid_price
+                .checked_add(config.far_max_price_offset)
+                .is_some_and(|p| p <= u32::MAX as u64),
+            "mid_price + far_max_price_offset exceeds ITCH u32 price field"
+        );
         let mut tickers = Vec::with_capacity(num as usize);
         for s in 1..=num {
             tickers.push(synthetic_ticker(s));

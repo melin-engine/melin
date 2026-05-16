@@ -387,40 +387,48 @@ fn record_add(
     let best_bid = book.best_bid(stock_locate);
     let best_ask = book.best_ask(stock_locate);
 
-    match (best_bid, best_ask) {
-        (Some(bb), Some(ba)) => {
-            // Integer mid: tick precision is plenty for distance stats,
-            // and using f64 here would only hide rounding behavior.
-            let mid = ((bb as u64 + ba as u64) / 2) as u32;
-            let signed = price as i64 - mid as i64;
-            match side {
-                Side::Buy => {
-                    stats.buy_distance_from_mid.record(signed);
-                    if price >= ba {
-                        stats.crossing_buys += 1;
-                    }
-                }
-                Side::Sell => {
-                    stats.sell_distance_from_mid.record(signed);
-                    if price <= bb {
-                        stats.crossing_sells += 1;
-                    }
-                }
-            }
-        }
-        _ => stats.adds_without_mid += 1,
-    }
-
-    stats.add_size.saturating_record(shares as u64);
-    count_side(&mut stats.side_balance, side, SideEvent::Add);
-    if attributed {
-        stats.event_counts.add_attr += 1;
-    } else {
-        stats.event_counts.add += 1;
-    }
-
+    // Gate every per-add stat on `book.add()` succeeding — otherwise a
+    // duplicate order_ref (NewRefAlreadyExists) gets counted both as a
+    // successful add (size histogram, distance-from-mid, side balance,
+    // event_counts) and as an error via `classify_err`, double-attributing
+    // it and skewing the marginals the calibration is trying to measure.
+    // Symmetric with the Cancel/Delete/Replace/Exec handlers above, which
+    // all gate their bookkeeping on the Ok branch.
     match book.add(order_ref, stock_locate, side, price, shares) {
-        Ok(()) => StatsOutcome::Applied,
+        Ok(()) => {
+            match (best_bid, best_ask) {
+                (Some(bb), Some(ba)) => {
+                    // Integer mid: tick precision is plenty for distance
+                    // stats, and f64 here would only hide rounding.
+                    let mid = ((bb as u64 + ba as u64) / 2) as u32;
+                    let signed = price as i64 - mid as i64;
+                    match side {
+                        Side::Buy => {
+                            stats.buy_distance_from_mid.record(signed);
+                            if price >= ba {
+                                stats.crossing_buys += 1;
+                            }
+                        }
+                        Side::Sell => {
+                            stats.sell_distance_from_mid.record(signed);
+                            if price <= bb {
+                                stats.crossing_sells += 1;
+                            }
+                        }
+                    }
+                }
+                _ => stats.adds_without_mid += 1,
+            }
+
+            stats.add_size.saturating_record(shares as u64);
+            count_side(&mut stats.side_balance, side, SideEvent::Add);
+            if attributed {
+                stats.event_counts.add_attr += 1;
+            } else {
+                stats.event_counts.add += 1;
+            }
+            StatsOutcome::Applied
+        }
         Err(e) => classify_err(stats, e),
     }
 }

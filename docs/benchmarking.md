@@ -44,7 +44,7 @@ Why numbers differ from pipeline: there is no journal fsync, no ring buffer sync
 
 ## Order Generation
 
-All modes use the same realistic order flow generator (`crates/exchange/bench/src/generator.rs`), which produces synthetic order streams that mimic real exchange order flow patterns. Events are pre-generated into memory before the timed run begins, so RNG overhead and allocation do not pollute per-order timing.
+All modes use the same realistic order flow generator (`crates/exchange/bench/src/generator.rs`), which produces synthetic order streams that mimic real exchange order flow patterns. The generator's event mix, size distribution, and price-distance-from-mid distribution are calibrated against a NASDAQ ITCH 5.0 reference; see [Calibration tooling](#calibration-tooling) below for the methodology and how to verify the fit against your own venue's data. Events are pre-generated into memory before the timed run begins, so RNG overhead and allocation do not pollute per-order timing.
 
 ### Flow composition
 
