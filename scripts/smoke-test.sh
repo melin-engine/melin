@@ -70,6 +70,7 @@ RUST_LOG=info,melin_server=debug \
     --journal "$TMPDIR/smoke.journal" \
     --authorized-keys "$TMPDIR/authorized_keys" \
     --standalone \
+    --durability-mode local \
     --accounts 100 \
     --instruments 10 \
     > "$TMPDIR/server.log" 2>&1 &

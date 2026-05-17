@@ -128,7 +128,8 @@ samples count without further coordination.
 | `--addr <IP:PORT>` | (none) | Connect to a remote engine instead of spawning an embedded server. Enables LAN benchmarking. Mutually exclusive with `--uds`. Requires `--key`. |
 | `--uds` | false | Use Unix domain sockets instead of TCP (roundtrip mode only, local embedded server). |
 | `--clients` | 16 | Number of concurrent client connections (roundtrip mode). |
-| `--window` | 64 | Pipeline depth: number of requests in flight per client before waiting for a response. |
+| `--window` | 64 | Pipeline depth: number of requests in flight per client before waiting for a response. With `--target-rate` set, this acts as a hard inflight cap on top of the schedule. |
+| `--target-rate <ops/s>` | 0 (disabled) | Open-loop send rate in orders per second. When set, the bench schedules sends at fixed intervals and records latency from the *scheduled* tick — the standard fix for coordinated omission. `0` keeps the historical closed-loop (window-filling) behaviour. See [Target rate / open-loop pacing](#target-rate--open-loop-pacing). |
 | `--bench-threads` | 4 | Number of bench client threads. Each runs its own io_uring ring and manages a subset of connections. |
 | `--group-commit-us` | 0 | Group commit coalescing delay in microseconds. Adds an artificial delay before fsyncing to batch more events per sync. Beneficial for UDS transport; harmful for TCP (see [roadmap deferred section](roadmap.md#deferred)). |
 | `--journal <PATH>` | temp directory | Path for the journal file. Use a dedicated NVMe disk for realistic durability benchmarks. |
@@ -276,6 +277,57 @@ Without pipelining (`--window=1`), each order must complete the full round trip 
 - `--window=1`: measures single-order latency with no amortization. This is the "how fast is one order" number.
 - `--window=64` (default): reasonable balance between throughput and per-order latency.
 - `--window=192-256`: saturates the pipeline for peak throughput measurements. Diminishing returns beyond this point; higher values mostly increase queueing delay without improving throughput.
+
+## Target rate / open-loop pacing
+
+By default the bench is **closed-loop**: each client keeps `--window` requests in flight and submits a new one only after a response arrives, so the achieved rate equals whatever the server can absorb. This is the right model for "what is the peak sustainable throughput?" — but it hides one important effect: when the server slows, the bench slows with it, and the latency histogram only sees responses to *requests that were issued slowly enough to fit*. Any latency that would have been incurred by requests the bench *should have sent but didn't* is invisible. This is the **coordinated omission** problem.
+
+Pass `--target-rate <ops/s>` to switch to **open-loop** scheduling: sends are scheduled at fixed intervals, and each completion's latency is measured from its *scheduled* tick rather than its actual submission tick. If the server falls behind the schedule, that lateness is recorded as elevated latency on the next response — the way a real client would experience it.
+
+### CLI
+
+```
+melin-bench --addr <server> --target-rate 500000 --duration 60s
+```
+
+Aggregate rate is split evenly across `--clients` (or across the single publisher in `pipeline` mode, or the single in-process engine call in `engine` mode). Per-client first sends are staggered by `period / clients` so the bench does not produce a thundering herd at startup.
+
+### How `--window` interacts
+
+`--window` keeps its meaning as a hard inflight cap. When pacing engages and the server can keep up, the inflight count stays well below the window and the cap never engages — sends fire on schedule. When the server cannot keep up, the cap engages, the schedule falls behind, and the report surfaces `late_sends` and `max_send_delay_us` instead of silently absorbing the back-pressure. The combination `--target-rate > 0 && --window=0` is rejected up-front.
+
+### Reading the report
+
+When pacing is active the console summary adds a line:
+
+```
+Target rate: 500000 ops/s (scheduled 30000001, late 12, max send delay 1.4 µs)
+```
+
+And the JSON output gains a `pacing` block:
+
+```json
+"pacing": {
+  "target_rate": 500000,
+  "scheduled": 30000001,
+  "achieved_rate": 499998,
+  "late_sends": 12,
+  "max_send_delay_us": 1.42
+}
+```
+
+- `scheduled` — sends the pacer placed on the schedule across all phases.
+- `achieved_rate` — `measured_orders / measured_duration`. Should track `target_rate` closely when the server is keeping up.
+- `late_sends` — sends whose actual submission time was more than 1 ms past their scheduled time. A non-zero value indicates structural back-pressure (the server or the inflight cap is throttling), not microsecond-scale jitter.
+- `max_send_delay_us` — worst observed gap between scheduled and actual submission. Useful for spotting outliers even when `late_sends` is zero.
+
+### When to use it
+
+- **Saturation curves**: sweep `--target-rate` from low to high and plot `achieved_rate` vs `target_rate`. The curve plateaus at the server's true sustainable rate; the gap between scheduled and achieved tells you exactly where the knee is.
+- **Latency-under-load reporting**: pick a rate well below the saturation point and report the p99/p99.9 latency at that rate. Closed-loop numbers cannot be apples-to-apples compared because they're at different effective loads.
+- **Coordinated-omission-correct percentiles**: any latency number meant for publication or customer-facing SLO claims should come from a paced run, not a closed-loop one.
+
+Use closed-loop (target-rate unset) for peak-throughput exploration where coordinated omission is acceptable — you just want to know how fast the server can possibly go.
 
 ## Hardware Setup
 
