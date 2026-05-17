@@ -943,7 +943,14 @@ mod tests {
     /// consumed yet, `last_sequence == None`) still surfaces as a
     /// `ChecksumMismatch`. We only relax the check past genesis, so
     /// corruption of the first entry remains visible.
-    #[cfg(not(feature = "hash-chain"))]
+    ///
+    /// Runs under both feature configs: under hash-chain, the writer's
+    /// genesis at ENTRY_OFFSET gets overwritten by the forged entry, so
+    /// the reader's first decode hits the CRC check before any
+    /// hash-chain state has been built (`codec::decode` validates CRC
+    /// before returning, and `validate_and_advance` — where hash-chain
+    /// validation lives — only runs on a successful decode). Either way,
+    /// `last_sequence` is still `None` at the moment the mismatch fires.
     #[test]
     fn zero_crc_at_first_entry_still_errors() {
         let dir = tempfile::tempdir().unwrap();
@@ -982,7 +989,10 @@ mod tests {
     /// bytes is a **hole** in the journal (data loss), not preallocated
     /// tail. The reader must surface this as an error so recovery halts
     /// instead of silently truncating the journal to the prefix.
-    #[cfg(not(feature = "hash-chain"))]
+    ///
+    /// Runs under both feature configs: the CRC mismatch on the forged
+    /// entry fires inside `codec::decode`, before `validate_and_advance`
+    /// (and therefore before any hash-chain check) ever runs.
     #[test]
     fn zero_crc_with_data_after_surfaces_error() {
         let dir = tempfile::tempdir().unwrap();

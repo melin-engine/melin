@@ -73,10 +73,13 @@ static OVERRIDE_LOCK: Mutex<()> = Mutex::new(());
 /// so one bad test doesn't cascade into the rest of the suite.
 #[cfg(any(test, feature = "test-utils"))]
 pub struct PreallocOverrideGuard {
-    // Held for the lifetime of the guard, released on drop. The
-    // explicit field name keeps the lock alive even if the guard is
-    // bound with `_` — `let _guard = ...` would drop immediately, but
-    // `let _g = ...` and a named struct field both keep it.
+    // The lock is released on drop. Bind the guard to a *named*
+    // variable (`let _guard = PreallocOverrideGuard::new(N);`) — never
+    // to bare `_` (`let _ = ...`), which drops the guard immediately
+    // and releases both the lock and the override. The `_lock` field
+    // prefix is purely the standard rustc convention to suppress
+    // "field never read" warnings; the field's *existence* is what
+    // keeps the guard alive.
     _lock: MutexGuard<'static, ()>,
 }
 
