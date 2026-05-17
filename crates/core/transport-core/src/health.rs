@@ -678,6 +678,7 @@ fn handle_health_connection(mut stream: TcpStream, state: &HealthState) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::replication::ReplicationMetrics;
     use std::io::Read;
 
     /// Test-only QueueCursor backed by an AtomicU64.
@@ -1411,6 +1412,296 @@ mod tests {
         assert!(
             !response.contains("test::stats_dump_empty_stage_marker"),
             "empty stage leaked into dump: {response}"
+        );
+
+        shutdown.store(true, Ordering::Relaxed);
+        handle.join().unwrap();
+    }
+
+    // ------------------------------------------------------------------
+    // PER-REPLICA METRICS — Prometheus output for the per-slot replication
+    // counters wasn't asserted by any test before, so a rename or label
+    // typo in `write_prometheus` could ship silently. One test per family.
+    // ------------------------------------------------------------------
+
+    /// Spin up the health loop with a fully-populated `ReplicationMetrics`
+    /// and gauge-style auxiliary cursors, then return the Prometheus body
+    /// for the caller to make assertions on. Keeps each per-family test
+    /// short.
+    fn prometheus_with_full_replication_state()
+    -> (String, Arc<AtomicBool>, std::thread::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let s = Arc::clone(&shutdown);
+
+        // Populate every per-slot counter with a distinct value so a
+        // label/index swap (e.g. printing slot 1's value under slot 0)
+        // shows up as a failed assertion below.
+        let metrics = Arc::new(ReplicationMetrics::default());
+        metrics.acked_sequence[0].store(900, Ordering::Relaxed);
+        metrics.acked_sequence[1].store(800, Ordering::Relaxed);
+        metrics.in_memory_sequence[0].store(950, Ordering::Relaxed);
+        metrics.in_memory_sequence[1].store(850, Ordering::Relaxed);
+        metrics.bytes_sent[0].store(11_111, Ordering::Relaxed);
+        metrics.bytes_sent[1].store(22_222, Ordering::Relaxed);
+        metrics.ack_latency_us[0].store(33, Ordering::Relaxed);
+        metrics.ack_latency_us[1].store(44, Ordering::Relaxed);
+        metrics.catching_up[0].store(true, Ordering::Relaxed);
+        metrics.catching_up[1].store(false, Ordering::Relaxed);
+        metrics.evictions_total.store(7, Ordering::Relaxed);
+
+        // journal_seq=1000 so per_replica_lag = 1000 - acked.
+        let state = HealthState {
+            active_connections: Arc::new(AtomicU64::new(0)),
+            events_processed: Arc::new(AtomicU64::new(0)),
+            journal_cursor: Arc::new(Sequence::new(AtomicU64::new(1000))),
+            matching_cursor: Arc::new(Sequence::new(AtomicU64::new(1000))),
+            input_cursor: Box::new(MockCursor(AtomicU64::new(1000))),
+            replication_cursor: Arc::new(AtomicU64::new(900)),
+            pipeline_healthy: Arc::new(AtomicBool::new(true)),
+            replicas_connected: Some(Arc::new(AtomicU32::new(2))),
+            replication_metrics: Some(metrics),
+            replication_ring_producer_cursors: None,
+            replication_ring_consumer_cursors: None,
+            fastest_replica_cursor: None,
+            journal_utilization: Arc::new(StageUtilization::new()),
+            matching_utilization: Arc::new(StageUtilization::new()),
+            response_utilization: Arc::new(StageUtilization::new()),
+        };
+
+        let handle = std::thread::spawn(move || {
+            health_loop(&listener, &state, &s);
+        });
+
+        let body = http_request(addr, "GET /metrics HTTP/1.1\r\n\r\n");
+        (body, shutdown, handle)
+    }
+
+    #[test]
+    fn metrics_emits_per_replica_acked_and_in_memory_sequence() {
+        let (body, shutdown, handle) = prometheus_with_full_replication_state();
+        assert!(
+            body.contains("melin_replica_acked_sequence{slot=\"0\"} 900\n"),
+            "slot 0 acked: {body}"
+        );
+        assert!(
+            body.contains("melin_replica_acked_sequence{slot=\"1\"} 800\n"),
+            "slot 1 acked: {body}"
+        );
+        assert!(
+            body.contains("melin_replica_in_memory_sequence{slot=\"0\"} 950\n"),
+            "slot 0 in_memory: {body}"
+        );
+        assert!(
+            body.contains("melin_replica_in_memory_sequence{slot=\"1\"} 850\n"),
+            "slot 1 in_memory: {body}"
+        );
+        shutdown.store(true, Ordering::Relaxed);
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn metrics_emits_per_replica_lag_relative_to_journal_seq() {
+        let (body, shutdown, handle) = prometheus_with_full_replication_state();
+        // journal_seq=1000, acked=[900, 800] → lag=[100, 200].
+        assert!(
+            body.contains("melin_replica_lag{slot=\"0\"} 100\n"),
+            "slot 0 lag: {body}"
+        );
+        assert!(
+            body.contains("melin_replica_lag{slot=\"1\"} 200\n"),
+            "slot 1 lag: {body}"
+        );
+        shutdown.store(true, Ordering::Relaxed);
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn metrics_emits_per_replica_bytes_and_ack_latency() {
+        let (body, shutdown, handle) = prometheus_with_full_replication_state();
+        assert!(
+            body.contains("melin_replica_bytes_sent_total{slot=\"0\"} 11111\n"),
+            "slot 0 bytes: {body}"
+        );
+        assert!(
+            body.contains("melin_replica_bytes_sent_total{slot=\"1\"} 22222\n"),
+            "slot 1 bytes: {body}"
+        );
+        assert!(
+            body.contains("melin_replica_ack_latency_us{slot=\"0\"} 33\n"),
+            "slot 0 latency: {body}"
+        );
+        assert!(
+            body.contains("melin_replica_ack_latency_us{slot=\"1\"} 44\n"),
+            "slot 1 latency: {body}"
+        );
+        shutdown.store(true, Ordering::Relaxed);
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn metrics_emits_per_replica_catching_up_and_evictions() {
+        let (body, shutdown, handle) = prometheus_with_full_replication_state();
+        assert!(
+            body.contains("melin_replica_catching_up{slot=\"0\"} 1\n"),
+            "slot 0 catching_up: {body}"
+        );
+        assert!(
+            body.contains("melin_replica_catching_up{slot=\"1\"} 0\n"),
+            "slot 1 catching_up: {body}"
+        );
+        assert!(
+            body.contains("melin_replica_evictions_total 7\n"),
+            "evictions: {body}"
+        );
+        shutdown.store(true, Ordering::Relaxed);
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn metrics_emits_response_gate_counters_and_policy_degraded() {
+        // The response-stage StageUtilization carries three signals not
+        // exercised by `stage_utilization_in_metrics`: gate_journal,
+        // gate_replication, and policy_degraded. All three are read
+        // from the response stage's utilization counter on every
+        // health snapshot.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let s = Arc::clone(&shutdown);
+
+        let response_util = Arc::new(StageUtilization::new());
+        response_util.gate_journal.store(13, Ordering::Relaxed);
+        response_util.gate_replication.store(17, Ordering::Relaxed);
+        response_util.policy_degraded.store(true, Ordering::Relaxed);
+
+        let state = HealthState {
+            active_connections: Arc::new(AtomicU64::new(0)),
+            events_processed: Arc::new(AtomicU64::new(0)),
+            journal_cursor: Arc::new(Sequence::new(AtomicU64::new(0))),
+            matching_cursor: Arc::new(Sequence::new(AtomicU64::new(0))),
+            input_cursor: Box::new(MockCursor(AtomicU64::new(0))),
+            replication_cursor: Arc::new(AtomicU64::new(u64::MAX)),
+            pipeline_healthy: Arc::new(AtomicBool::new(true)),
+            replicas_connected: None,
+            replication_metrics: None,
+            replication_ring_producer_cursors: None,
+            replication_ring_consumer_cursors: None,
+            fastest_replica_cursor: None,
+            journal_utilization: Arc::new(StageUtilization::new()),
+            matching_utilization: Arc::new(StageUtilization::new()),
+            response_utilization: response_util,
+        };
+
+        let handle = std::thread::spawn(move || {
+            health_loop(&listener, &state, &s);
+        });
+
+        let response = http_request(addr, "GET /metrics HTTP/1.1\r\n\r\n");
+        assert!(
+            response.contains("melin_response_gate_total{blocker=\"journal\"} 13\n"),
+            "gate_journal: {response}"
+        );
+        assert!(
+            response.contains("melin_response_gate_total{blocker=\"replication\"} 17\n"),
+            "gate_replication: {response}"
+        );
+        assert!(
+            response.contains("melin_durability_policy_degraded 1\n"),
+            "policy_degraded: {response}"
+        );
+
+        shutdown.store(true, Ordering::Relaxed);
+        handle.join().unwrap();
+    }
+
+    // ------------------------------------------------------------------
+    // REQUEST CLASSIFICATION — guard against `detect_request` returning
+    // `PlainTcp` for an HTTP request that doesn't start with `GET `.
+    // A non-GET method would otherwise get a raw status-line response
+    // (no HTTP framing), which most HTTP clients would treat as garbage.
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn non_get_http_method_is_classified_as_plain_tcp() {
+        // POST is not a documented health-endpoint method — it falls
+        // through the GET prefix guards and is treated as a plain TCP
+        // probe. The server writes a raw status line and closes; the
+        // unread request bytes still in the kernel buffer mean the close
+        // may RST the connection, so the client can legitimately observe
+        // either the status line + EOF or a truncated read + RST. The
+        // load-bearing assertion is just "no HTTP framing comes back" —
+        // a future regression that started serving an HTTP response to
+        // POST would be a deliberate, reviewed change.
+        let (addr, _events, _healthy, shutdown, handle) = start_health(0, 42, u64::MAX);
+
+        let mut client = TcpStream::connect(addr).unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        client
+            .write_all(b"POST /metrics HTTP/1.1\r\nContent-Length: 0\r\n\r\n")
+            .unwrap();
+        client.shutdown(std::net::Shutdown::Write).unwrap();
+        let mut buf = String::new();
+        // RST from the server's close (unread bytes in recv buffer) is
+        // expected on Linux — tolerate the read error and inspect what
+        // bytes did arrive before the reset.
+        let _ = client.read_to_string(&mut buf);
+
+        assert!(
+            !buf.starts_with("HTTP/"),
+            "POST must not get an HTTP response (got: {buf:?})"
+        );
+
+        shutdown.store(true, Ordering::Relaxed);
+        handle.join().unwrap();
+    }
+
+    // ------------------------------------------------------------------
+    // BUFFER CAPACITY — `write_prometheus` writes into a fixed-size stack
+    // buffer (8 KiB). A future addition of more per-slot metrics could
+    // silently truncate output. Pin a lower bound on the current full
+    // body length and assert the buffer still holds it with headroom.
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn prometheus_body_fits_with_headroom_under_full_replication_state() {
+        let (body, shutdown, handle) = prometheus_with_full_replication_state();
+
+        // Strip HTTP headers — keep only the metrics body.
+        let metrics_body = body
+            .split("\r\n\r\n")
+            .nth(1)
+            .expect("HTTP head separator present");
+
+        // The body buffer in handle_health_connection is 8192 bytes.
+        // Today's body is around 3 KiB; allocate 25 % headroom and fail
+        // loudly if we ever drift past it. The point of this test is
+        // to fire before silent truncation, not to track the exact size.
+        const BODY_BUF: usize = 8192;
+        const HEADROOM_LIMIT: usize = BODY_BUF * 3 / 4; // 6144
+
+        assert!(
+            metrics_body.len() < HEADROOM_LIMIT,
+            "prometheus body ({} bytes) is past 75 % of the {BODY_BUF}-byte stack \
+             buffer — adding more metrics will silently truncate the output. \
+             Either trim the body or grow body_buf in handle_health_connection.",
+            metrics_body.len()
+        );
+
+        // Sanity: confirm we're well past zero. If the body shrank
+        // dramatically, something would have stopped rendering.
+        assert!(
+            metrics_body.len() > 1500,
+            "prometheus body unexpectedly short ({} bytes) — a write! failure \
+             would silently drop content. Body: {metrics_body}",
+            metrics_body.len()
         );
 
         shutdown.store(true, Ordering::Relaxed);
