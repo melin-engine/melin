@@ -702,6 +702,10 @@ pub fn run_dpdk_roundtrip(
                 }
 
                 let payload = &conn.parse_buf[cursor + 4..cursor + 4 + frame_len];
+                // Decode errors are dropped intentionally: malformed
+                // frames from the server are not the bench's
+                // responsibility to diagnose, and panicking would mask
+                // genuine throughput regressions during a long run.
                 if let Ok(response) = codec::decode_response(payload) {
                     if matches!(response, ResponseKind::BatchEnd) {
                         // Capture `rdtscp()` BEFORE any per-frame
@@ -743,10 +747,6 @@ pub fn run_dpdk_roundtrip(
                     // the wire roundtrip.
                     conn.outcomes.record(&response);
                 }
-                // Decode errors are dropped intentionally: malformed
-                // frames from the server are not the bench's
-                // responsibility to diagnose, and panicking would mask
-                // genuine throughput regressions during a long run.
 
                 cursor += 4 + frame_len;
             }

@@ -2787,7 +2787,7 @@ fn reject_reason_index(reason: RejectReason) -> usize {
     // stable index. An exhaustive match makes adding a new variant a
     // compile error until both this function and `REJECT_REASONS` above
     // are updated.
-    match reason {
+    let idx = match reason {
         RejectReason::NoLiquidity => 0,
         RejectReason::FOKCannotFill => 1,
         RejectReason::InsufficientBalance => 2,
@@ -2809,7 +2809,17 @@ fn reject_reason_index(reason: RejectReason) -> usize {
         RejectReason::InstrumentDisabled => 18,
         RejectReason::ExceedsMaxOpenOrders => 19,
         RejectReason::ExceedsOrderRate => 20,
-    }
+    };
+    // Catch silent label/index swaps: an exhaustive match would still
+    // type-check if two arms had their integers swapped, but the
+    // `REJECT_REASONS` table would then mislabel counts at print time.
+    // The existing `reject_reasons_indices_are_unique_and_match_table_length`
+    // test calls this for every variant, so a swap explodes there.
+    debug_assert_eq!(
+        REJECT_REASONS[idx].0, reason,
+        "REJECT_REASONS table and reject_reason_index match arms diverged at idx {idx}",
+    );
+    idx
 }
 
 /// Counts of execution-report variants observed by the bench client over
