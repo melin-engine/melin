@@ -33,7 +33,8 @@ use melin_transport_core::pipeline::{
 };
 pub type Pipeline<W> = GenericPipeline<App, W>;
 
-use melin_protocol::auth::{AuthorizedKeys, Permission};
+use melin_app::auth::Permission;
+use melin_protocol::auth::AuthorizedKeys;
 use melin_protocol::blocking::BlockingFrameWriter;
 use melin_protocol::message::ConnectionId;
 use melin_protocol::transport::BlockingTransportListener;
@@ -2909,7 +2910,8 @@ mod tests {
     use std::os::unix::net::UnixStream;
 
     use ed25519_dalek::{Signer, SigningKey};
-    use melin_protocol::auth::{AuthorizedKeys, Permission};
+    use melin_app::auth::Permission;
+    use melin_protocol::auth::AuthorizedKeys;
     use melin_protocol::codec;
     use melin_protocol::message::{ConnectionId, Request, ResponseKind};
 

@@ -5,7 +5,7 @@
 //! enforcement and request→event conversion across transport impls.
 
 use crate::JournalEvent;
-use melin_protocol::auth::Permission;
+use melin_app::auth::Permission;
 use melin_protocol::message::Request;
 
 /// Returns `true` if the request should be filtered out (not published

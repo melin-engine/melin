@@ -1,8 +1,9 @@
-//! Authentication types for challenge-response handshake.
+//! Wire-side authentication for the challenge-response handshake.
 //!
-//! Provides the `Permission` model and `AuthorizedKeys` file loader.
-//! The server requires an authorized keys file at startup — every
-//! connection must authenticate via Ed25519 challenge-response.
+//! Owns the `AuthorizedKeys` file loader and the [`auth_signing_payload`]
+//! helper. The application-shaped [`Permission`] enum lives in
+//! [`melin_app::auth`] and is re-exported here for the existing call
+//! sites that reach it through this module.
 
 use std::collections::HashMap;
 use std::io;
@@ -11,66 +12,7 @@ use std::path::Path;
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64;
 
-/// Permission level assigned to an authenticated connection.
-///
-/// Five specialized roles with no overlap — separation of duties:
-///   Operator: exchange configuration (instruments, risk, circuit breakers)
-///   Trader: order submission and cancellation
-///   Custodian: fund management (deposit/withdraw)
-///   ReadOnly: observation only (heartbeats, future market data)
-///   Replication: journal streaming between primary and replica servers
-///
-/// No single role has full access. An organization needing both trading
-/// and admin uses separate keys for each role.
-///
-/// Checked on the reader thread (cold per-request check) with zero
-/// cost on the matching engine hot path.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Permission {
-    /// Exchange configuration: instrument management, circuit breakers,
-    /// risk limits, fee schedules, end-of-day, stats. Cannot trade or
-    /// manage funds.
-    Operator,
-    /// Submit/cancel orders and heartbeats. Cannot perform admin ops
-    /// or fund management (deposit/withdraw).
-    Trader,
-    /// Deposit and withdraw only. Cannot trade or perform admin ops.
-    /// Separates fund management from trading and exchange administration.
-    Custodian,
-    /// Heartbeats only. Future: market data subscriptions.
-    ReadOnly,
-    /// Replication only. Authorizes a replica to connect and receive
-    /// journal streams. Cannot trade, manage funds, or configure the
-    /// exchange. Infrastructure role, not client-facing.
-    Replication,
-}
-
-impl Permission {
-    /// Whether this permission level allows trading operations
-    /// (submit order, cancel order, cancel all, cancel-replace).
-    pub fn can_trade(self) -> bool {
-        matches!(self, Permission::Trader)
-    }
-
-    /// Whether this permission level allows administrative operations
-    /// (add instrument, set risk limits, circuit breakers, fee schedules,
-    /// end-of-day, query stats).
-    pub fn is_operator(self) -> bool {
-        matches!(self, Permission::Operator)
-    }
-
-    /// Whether this permission level allows fund management operations
-    /// (deposit, withdraw).
-    pub fn can_manage_funds(self) -> bool {
-        matches!(self, Permission::Custodian)
-    }
-
-    /// Whether this permission level authorizes replication connections
-    /// (journal streaming between primary and replica).
-    pub fn is_replication(self) -> bool {
-        matches!(self, Permission::Replication)
-    }
-}
+pub use melin_app::auth::Permission;
 
 /// Maps Ed25519 public keys to permission levels.
 ///
@@ -234,42 +176,6 @@ operator AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA= test
     fn lookup_missing_key_returns_none() {
         let keys = AuthorizedKeys::parse("").unwrap();
         assert!(keys.lookup(&[0u8; 32]).is_none());
-    }
-
-    #[test]
-    fn permission_can_trade() {
-        assert!(!Permission::Operator.can_trade());
-        assert!(Permission::Trader.can_trade());
-        assert!(!Permission::Custodian.can_trade());
-        assert!(!Permission::ReadOnly.can_trade());
-        assert!(!Permission::Replication.can_trade());
-    }
-
-    #[test]
-    fn permission_is_operator() {
-        assert!(Permission::Operator.is_operator());
-        assert!(!Permission::Trader.is_operator());
-        assert!(!Permission::Custodian.is_operator());
-        assert!(!Permission::ReadOnly.is_operator());
-        assert!(!Permission::Replication.is_operator());
-    }
-
-    #[test]
-    fn permission_can_manage_funds() {
-        assert!(!Permission::Operator.can_manage_funds());
-        assert!(!Permission::Trader.can_manage_funds());
-        assert!(Permission::Custodian.can_manage_funds());
-        assert!(!Permission::ReadOnly.can_manage_funds());
-        assert!(!Permission::Replication.can_manage_funds());
-    }
-
-    #[test]
-    fn permission_is_replication() {
-        assert!(!Permission::Operator.is_replication());
-        assert!(!Permission::Trader.is_replication());
-        assert!(!Permission::Custodian.is_replication());
-        assert!(!Permission::ReadOnly.is_replication());
-        assert!(Permission::Replication.is_replication());
     }
 
     #[test]

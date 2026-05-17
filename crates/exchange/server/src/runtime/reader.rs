@@ -28,9 +28,9 @@ use tracing::{debug, error};
 use crate::ControlEvent;
 use crate::InputSlot;
 use crate::JournalEvent;
+use melin_app::auth::Permission;
 use melin_app::unix_epoch_nanos;
 use melin_disruptor::ring;
-use melin_protocol::auth::Permission;
 use melin_protocol::codec;
 use melin_transport_core::trace::mono_trace_ns;
 

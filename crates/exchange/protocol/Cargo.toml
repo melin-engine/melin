@@ -15,6 +15,7 @@ ed25519-dalek = { workspace = true }
 # `FromBytes` / `IntoBytes`.
 zerocopy = { version = "0.8", features = ["derive"] }
 melin-types = { path = "../types" }
+melin-app = { path = "../../core/app" }
 
 [dev-dependencies]
 bolero = "0.13"

@@ -22,6 +22,10 @@ pub mod affinity;
 /// replication sender, and replica receiver all hit this on the hot
 /// path. Pure timing utility — no transport coupling.
 pub mod amortized_timer;
+/// Connection-level permission model — application-shaped access
+/// control (operator / trader / custodian / read-only / replication).
+/// Consumed by the wire-side auth handshake in `melin-protocol::auth`.
+pub mod auth;
 
 use std::io::{self, Read, Write};
 use std::time::{SystemTime, UNIX_EPOCH};

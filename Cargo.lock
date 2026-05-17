@@ -1675,6 +1675,7 @@ dependencies = [
  "blake3",
  "bolero",
  "ed25519-dalek",
+ "melin-app",
  "melin-types",
  "tempfile",
  "zerocopy",
