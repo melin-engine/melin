@@ -28,6 +28,10 @@ pub mod pipeline;
 /// with the consuming application.
 pub mod replication;
 pub mod replication_wire;
+/// Shadow snapshot stage — replays journal events on a cloned
+/// application off the hot path and writes periodic snapshots gated on
+/// journal fsync. Generic over `A: Application`.
+pub mod shadow;
 pub mod snapshot;
 pub mod tick;
 pub mod trace;

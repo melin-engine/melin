@@ -1243,7 +1243,7 @@ where
             .name("shadow".into())
             .spawn(move || {
                 melin_app::affinity::pin_thread("shadow", cores.shadow);
-                crate::shadow::run(
+                melin_transport_core::shadow::run(
                     shadow_cons,
                     shadow_ex,
                     snap_path,
@@ -2091,7 +2091,7 @@ where
             .name("shadow".into())
             .spawn(move || {
                 melin_app::affinity::pin_thread("shadow", cores.shadow);
-                crate::shadow::run(
+                melin_transport_core::shadow::run(
                     shadow_cons,
                     shadow_ex,
                     snap_path,
