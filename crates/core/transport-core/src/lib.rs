@@ -20,6 +20,11 @@
 /// Application-agnostic — the operator-facing CLI mode that picks
 /// between named policies lives with the consuming application.
 pub mod durability_policy;
+/// Health / liveness endpoint — plain TCP listener that serves a one-line
+/// status to Kubernetes probes, an HTTP-wrapped status to `GET /`, and a
+/// Prometheus text exposition body to `GET /metrics`. The state struct
+/// holds only atomics/cursors; the endpoint is fully transport-shaped.
+pub mod health;
 pub mod journaled_app;
 pub mod pipeline;
 /// Replication wire protocol, journal-file catch-up, ack queueing,

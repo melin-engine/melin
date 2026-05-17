@@ -1307,9 +1307,9 @@ where
         let fastest_repl_cursor_health = replication_metrics
             .as_ref()
             .map(|_| Arc::clone(&fastest_replica_cursor));
-        Some(crate::health::spawn(
+        Some(melin_transport_core::health::spawn(
             health_addr,
-            crate::health::HealthState {
+            melin_transport_core::health::HealthState {
                 active_connections: Arc::clone(&active_connections),
                 events_processed: Arc::clone(&events_processed),
                 journal_cursor: Arc::clone(&journal_cursor),
@@ -2342,9 +2342,9 @@ where
         let fastest_repl_cursor_health = replication_metrics
             .as_ref()
             .map(|_| Arc::clone(&fastest_replica_cursor));
-        Some(crate::health::spawn(
+        Some(melin_transport_core::health::spawn(
             health_addr,
-            crate::health::HealthState {
+            melin_transport_core::health::HealthState {
                 active_connections: Arc::clone(&active_connections),
                 events_processed: Arc::clone(&events_processed),
                 journal_cursor: Arc::clone(&journal_cursor),

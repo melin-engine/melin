@@ -99,7 +99,6 @@ pub mod event_publisher;
 /// Newtype wrapping `melin_engine::exchange::Exchange` that carries the
 /// `melin_app::Application` impl — see [`exchange_app::ServerApp`].
 pub mod exchange_app;
-pub mod health;
 mod reader;
 pub mod request;
 mod response;

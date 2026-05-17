@@ -29,12 +29,9 @@ use std::time::Duration;
 
 use melin_disruptor::padding::Sequence;
 use melin_disruptor::ring::QueueCursor;
-use melin_transport_core::pipeline::StageUtilization;
 use tracing::{debug, error, info};
 
-/// Input disruptor capacity. Duplicated here to avoid depending on the engine
-/// crate — the value is stable (1 << 20 = 1,048,576 slots).
-const INPUT_QUEUE_CAPACITY: u64 = 1 << 20;
+use crate::pipeline::{INPUT_RING_CAPACITY, StageUtilization};
 
 /// Shared monitoring state passed to the health loop.
 /// Bundles all the atomics/cursors into one struct to avoid parameter explosion.
@@ -48,7 +45,7 @@ pub struct HealthState {
     pub pipeline_healthy: Arc<AtomicBool>,
     pub replicas_connected: Option<Arc<AtomicU32>>,
     /// Per-replica replication metrics. None in standalone mode.
-    pub replication_metrics: Option<Arc<crate::replication::ReplicationMetrics>>,
+    pub replication_metrics: Option<Arc<crate::replication::metrics::ReplicationMetrics>>,
     /// Per-slot replication-ring producer cursors. Paired index-wise with
     /// `replication_ring_consumer_cursors` to compute per-slot ring depth
     /// (producer - consumer). `None` in standalone mode.
@@ -427,7 +424,7 @@ impl HealthSnapshot {
             self.replication_lag,
             healthy_val,
             self.input_queue_depth,
-            INPUT_QUEUE_CAPACITY,
+            INPUT_RING_CAPACITY,
             trading_val,
             self.replicas_connected,
             self.per_replica_acked_sequence[0],
