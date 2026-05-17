@@ -26,6 +26,16 @@ pub mod amortized_timer;
 /// control (operator / trader / custodian / read-only / replication).
 /// Consumed by the wire-side auth handshake in `melin-protocol::auth`.
 pub mod auth;
+/// Request-decoder seam: `RequestDecoder` + `Decoded<E>`. Lets the
+/// server runtime turn wire frames into application events without
+/// naming the concrete wire enum. See [`decoder`] for the trait shape
+/// and the four outcomes the runtime branches on.
+pub mod decoder;
+/// Response-encoder seam: `ResponseEncoder`. Mirror of [`decoder`]
+/// on the outbound path — application reports / query responses get
+/// encoded to wire bytes through this trait, while transport-shaped
+/// envelope variants (`BatchEnd`, `EngineError`) stay in runtime.
+pub mod encoder;
 
 use std::io::{self, Read, Write};
 use std::time::{SystemTime, UNIX_EPOCH};
