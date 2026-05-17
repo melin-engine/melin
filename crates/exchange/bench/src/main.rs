@@ -687,16 +687,21 @@ fn run_engine_bench(
         std::collections::BinaryHeap::with_capacity(SLOWEST_N + 1);
 
     // Measured phase: record latencies until `measured_end` passes. We
-    // poll `Instant::now()` only once per ~SAMPLE_INTERVAL iterations
-    // because every per-order `Instant::now()` would inflate the busy
-    // loop. The interval already gates the latency-time-series sampler,
-    // so reuse its tick boundary as a cheap deadline check too.
+    // poll `Instant::now()` only once per ~DEADLINE_POLL_INTERVAL
+    // iterations because every per-order `Instant::now()` (~15-25 ns
+    // vDSO) would inflate the engine measurement that we're trying to
+    // capture in the hundreds-of-ns range. The slop is at most
+    // `interval / throughput`; at 3 M ops/s × 1024 iters that's ~340 µs
+    // of samples that could land just past `measured_end` and still be
+    // recorded into the histogram. Negligible at any practical run
+    // length, and `wall` is clamped to `phases.measured` below so
+    // throughput math stays exact.
     let start = Instant::now();
     let mut iter_since_check: u32 = 0;
-    let deadline_poll_interval: u32 = 1024;
+    const DEADLINE_POLL_INTERVAL: u32 = 1024;
     let mut measured_orders: u64 = 0;
     loop {
-        if iter_since_check >= deadline_poll_interval {
+        if iter_since_check >= DEADLINE_POLL_INTERVAL {
             if Instant::now() >= deadlines.measured_end {
                 break;
             }
@@ -779,7 +784,11 @@ fn run_engine_bench(
             }));
         }
     }
-    let wall = start.elapsed();
+    // Clamp to `phases.measured` so the reported throughput divisor
+    // matches the configured measured-phase length even when the
+    // deadline-poll slop overruns by up to `DEADLINE_POLL_INTERVAL`
+    // iterations. Mirrors the cap in pipeline/roundtrip/DPDK paths.
+    let wall = start.elapsed().min(phases.measured);
 
     // Cooldown — keep driving the engine to absorb any drain-tail
     // artefacts (none here in engine mode, but symmetric with the other
@@ -1944,10 +1953,9 @@ fn run_uring_loop(
     uring_fill_windows(&mut ring, &mut connections, window, &deadlines);
 
     loop {
-        // Wall-clock-driven termination: once cooldown ends, stop. Any
-        // inflight responses are discarded — the histogram has already
-        // been sealed at `measured_end`, so abandoning the tail does
-        // not change reported latencies.
+        // Wall-clock-driven termination. The histogram is sealed at
+        // `measured_end`, so any inflight responses left after we break
+        // would only land in cooldown and be discarded anyway.
         if Instant::now() >= deadlines.cooldown_end {
             break;
         }
@@ -1956,6 +1964,16 @@ fn run_uring_loop(
             Err(ref e) if e.raw_os_error() == Some(libc::EINTR) => continue,
             Err(e) => panic!("io_uring submit_and_wait: {e}"),
         }
+
+        // Sample the wall clock *after* the blocking wait and reuse it
+        // for the phase classifier on every CQE in this batch. Saves a
+        // vDSO call per response — at multi-M ops/s the per-CQE
+        // `Instant::now()` (~15-25 ns) was visible in profiles. Outer
+        // iters batch many CQEs and phase boundaries are coarse (5 s
+        // warmup, 60 s measured), so reusing one timestamp across a
+        // batch misclassifies at most a handful of samples around the
+        // warmup/measured boundary — far below run-to-run noise.
+        let now = Instant::now();
 
         cqes.clear();
         cqes.extend(ring.completion().map(|cqe| (cqe.user_data(), cqe.result())));
@@ -2016,10 +2034,10 @@ fn run_uring_loop(
                             "inflight timestamp desync: got BatchEnd without matching send",
                         );
                         let latency_ns = tsc_to_ns(rdtscp() - sent_tsc, ticks_per_ns);
-                        // Phase classification by *receive* time. Once
-                        // `measured_end` passes the histogram is sealed,
-                        // any further completions fall through silently.
-                        let now = Instant::now();
+                        // Phase classification by *receive* time, using
+                        // the outer-iter `now`. Once `measured_end`
+                        // passes the histogram is sealed; any further
+                        // completions fall through silently.
                         if now >= deadlines.warmup_end && now < deadlines.measured_end {
                             if measured_start.is_none() {
                                 measured_start = Some(now);

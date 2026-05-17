@@ -501,12 +501,22 @@ pub fn run_dpdk_roundtrip(
                 .ok();
         }
 
+        // Sample the wall clock once per outer iter and reuse it for
+        // both the cooldown break and the per-completion phase
+        // classifier below. Saves one vDSO call (~15-25 ns) per
+        // BatchEnd; at multi-M ops/s the per-completion `Instant::now()`
+        // was visible in profiles. Phase boundaries are coarse (5 s
+        // warmup, 60 s measured) so the reused timestamp misclassifies
+        // at most a handful of samples on a boundary — orders of
+        // magnitude below run-to-run noise.
+        //
         // Wall-clock-driven termination: stop once cooldown ends. The
         // histogram is sealed at `measured_end` so any responses that
         // would arrive in the cooldown tail are already discarded by
-        // the phase classifier below; abandoning them at `cooldown_end`
-        // doesn't change reported latencies.
-        if Instant::now() >= deadlines.cooldown_end {
+        // the phase classifier; abandoning them doesn't change the
+        // reported latencies.
+        let now = Instant::now();
+        if now >= deadlines.cooldown_end {
             break;
         }
 
@@ -615,33 +625,28 @@ pub fn run_dpdk_roundtrip(
                 if let Ok(response) = codec::decode_response(payload)
                     && matches!(response, ResponseKind::BatchEnd)
                 {
-                    // Phase classification by *receive* time. Once
-                    // `measured_end` passes the histogram is sealed —
-                    // any further completions still pop their inflight
-                    // entry but no longer contribute to the report.
-                    let now_recv = Instant::now();
-                    let sent_tsc = conn.inflight_ts.pop_front();
-                    if now_recv >= deadlines.warmup_end && now_recv < deadlines.measured_end {
+                    // Always pop the inflight entry to keep the FIFO
+                    // aligned with sends — without this, cooldown
+                    // completions would leak the queue.  Phase
+                    // classification by *receive* time, reusing the
+                    // outer-iter `now`: past `measured_end` we discard
+                    // the sample, before `warmup_end` we discard too.
+                    if let Some(sent_tsc) = conn.inflight_ts.pop_front()
+                        && now >= deadlines.warmup_end
+                        && now < deadlines.measured_end
+                    {
                         if measured_start.is_none() {
-                            measured_start = Some(now_recv);
+                            measured_start = Some(now);
                         }
-                        if let Some(sent_tsc) = sent_tsc {
-                            let latency_ns =
-                                crate::tsc_to_ns(crate::rdtscp() - sent_tsc, ticks_per_ns);
-                            histogram.record(latency_ns).ok();
-                            interval_hist.record(latency_ns).ok();
-                            interval_count += 1;
-                            maybe_sample(
-                                &mut interval_hist,
-                                &mut interval_count,
-                                &mut series,
-                                start,
-                            );
-                            progress.fetch_add(1, Ordering::Relaxed);
-                            #[cfg(feature = "latency-trace")]
-                            {
-                                work_done_this_iter = true;
-                            }
+                        let latency_ns = crate::tsc_to_ns(crate::rdtscp() - sent_tsc, ticks_per_ns);
+                        histogram.record(latency_ns).ok();
+                        interval_hist.record(latency_ns).ok();
+                        interval_count += 1;
+                        maybe_sample(&mut interval_hist, &mut interval_count, &mut series, start);
+                        progress.fetch_add(1, Ordering::Relaxed);
+                        #[cfg(feature = "latency-trace")]
+                        {
+                            work_done_this_iter = true;
                         }
                     }
                 }
