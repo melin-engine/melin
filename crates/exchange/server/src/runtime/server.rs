@@ -2399,6 +2399,7 @@ where
     crate::runtime::dpdk_transport::run_dpdk_poll(
         transport_0,
         input_producer,
+        Arc::new(crate::domain::request::TradingRequestDecoder),
         control_tx,
         tx_rx_0,
         &shutdown,

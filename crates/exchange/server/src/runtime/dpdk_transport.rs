@@ -42,15 +42,22 @@ use rustc_hash::FxHashMap;
 use crate::InputSlot;
 use crate::JournalEvent;
 use ed25519_dalek::{Verifier, VerifyingKey};
+use melin_app::AppEvent;
+use melin_app::auth::Permission;
+use melin_app::decoder::{Decoded, RequestDecoder};
 use melin_app::unix_epoch_nanos;
 use melin_disruptor::ring;
 use melin_dpdk::transport::DpdkTransport;
-use melin_protocol::auth::{AuthorizedKeys, Permission};
+use melin_protocol::auth::AuthorizedKeys;
 use melin_protocol::codec;
 use melin_protocol::message::{ConnectionId, Request, ResponseKind};
 use melin_transport_core::trace::mono_trace_ns;
 use rand::Rng;
 
+use crate::TradingEvent;
+// Only the test module still uses the transitional `to_event` helper;
+// the live path goes through the `RequestDecoder` trait above.
+#[cfg(test)]
 use crate::domain::request as shared_request;
 use melin_dpdk::SocketHandle;
 use tracing::{debug, warn};
@@ -76,7 +83,7 @@ enum AuthState {
         accepted_at: Instant,
     },
     /// Auth completed successfully. Connection is ready for trading.
-    Authenticated { _permission: Permission },
+    Authenticated { permission: Permission },
 }
 
 /// Per-connection state in the DPDK poll thread.
@@ -122,6 +129,7 @@ struct ConnectionState {
 pub fn run_dpdk_poll(
     mut transport: DpdkTransport,
     mut producer: ring::Producer<InputSlot>,
+    decoder: Arc<dyn RequestDecoder<Event = TradingEvent>>,
     control_tx: mpsc::Sender<ControlEvent>,
     mut tx_rx: melin_disruptor::spsc::Consumer<TxFrame>,
     shutdown: &AtomicBool,
@@ -530,11 +538,17 @@ pub fn run_dpdk_poll(
                         conn_handle,
                     );
                 }
-                AuthState::Authenticated { .. } => {
-                    // Process trading frames.
+                AuthState::Authenticated { permission } => {
+                    // Process trading frames. `permission` is bound by
+                    // reference to the outer `&mut conn.auth` match;
+                    // copy it out (Permission: Copy) so the call below
+                    // can release the borrow on `conn.auth`.
+                    let permission = *permission;
                     process_trading_frames(
                         conn,
+                        permission,
                         &mut transport,
+                        &*decoder,
                         &mut batch,
                         &control_tx,
                         &mut id_to_handle,
@@ -722,9 +736,7 @@ fn process_auth_frame(
 
     // Transition to authenticated state.
     conn.key_hash = key_hash;
-    conn.auth = AuthState::Authenticated {
-        _permission: permission,
-    };
+    conn.auth = AuthState::Authenticated { permission };
 
     // Register with the response stage and ID map.
     id_to_handle.insert(conn.connection_id.0, handle);
@@ -760,7 +772,9 @@ fn send_auth_failed(conn: &ConnectionState, transport: &mut DpdkTransport) {
 /// pinned on the per-publish cursor write.
 fn process_trading_frames(
     conn: &mut ConnectionState,
+    permission: Permission,
     transport: &mut DpdkTransport,
+    decoder: &dyn RequestDecoder<Event = TradingEvent>,
     batch: &mut ring::Batch<'_, InputSlot>,
     control_tx: &mpsc::Sender<ControlEvent>,
     id_to_handle: &mut FxHashMap<u64, SocketHandle>,
@@ -792,52 +806,55 @@ fn process_trading_frames(
 
         let payload = &conn.parse_buf[cursor + 4..cursor + 4 + frame_len];
 
-        match codec::decode_request(payload) {
-            Ok((seq, request)) => {
-                if !shared_request::should_filter(&request) {
-                    #[allow(clippy::let_unit_value)]
-                    // mono_trace_ns() returns () without latency-trace
-                    let recv_ts = mono_trace_ns();
-                    let event = shared_request::to_event(&request);
-                    // Sequence is allocated by the journal stage in
-                    // disruptor cursor order — see `InputSlot::sequence`.
-                    let ts = if matches!(
-                        event,
-                        JournalEvent::App(melin_trading::trading_event::TradingEvent::QueryStats)
-                            | JournalEvent::App(
-                                melin_trading::trading_event::TradingEvent::QueryPosition { .. }
-                            )
-                    ) {
-                        0
-                    } else {
-                        batch_wall_ns
-                    };
-                    let connection_id = conn.connection_id.0;
-                    let key_hash = conn.key_hash;
-                    #[allow(clippy::let_unit_value)]
-                    let publish_ts = mono_trace_ns();
-                    batch.push_with(|slot| {
-                        slot.connection_id = connection_id;
-                        slot.key_hash = key_hash;
-                        slot.request_seq = seq;
-                        slot.sequence = 0;
-                        slot.timestamp_ns = ts;
-                        slot.event = event;
-                        slot.publish_ts = publish_ts;
-                        slot.recv_ts = recv_ts;
-                    });
-                    #[cfg(feature = "tick-to-trade")]
-                    ingest_rec.record_elapsed(recv_ts, mono_trace_ns());
-                }
+        let (seq, event) = match decoder.decode(payload, permission) {
+            Decoded::Filter => {
+                cursor += 4 + frame_len;
+                continue;
             }
-            Err(e) => {
+            Decoded::PermissionDenied(reason) => {
                 debug!(
                     connection_id = conn.connection_id.0,
-                    error = %e,
-                    "DPDK: decode error"
+                    reason, "DPDK: permission denied, dropping request"
                 );
+                cursor += 4 + frame_len;
+                continue;
             }
-        }
+            Decoded::DecodeError(reason) => {
+                debug!(
+                    connection_id = conn.connection_id.0,
+                    reason, "DPDK: decode error"
+                );
+                cursor += 4 + frame_len;
+                continue;
+            }
+            Decoded::Permitted { request_seq, event } => (request_seq, event),
+        };
+
+        #[allow(clippy::let_unit_value)]
+        // mono_trace_ns() returns () without latency-trace
+        let recv_ts = mono_trace_ns();
+        // Sequence is allocated by the journal stage in disruptor
+        // cursor order — see `InputSlot::sequence`. Read-only query
+        // events (`AppEvent::is_query`) bypass the journal and skip
+        // the wall-clock stamp.
+        let ts = if event.is_query() { 0 } else { batch_wall_ns };
+        let event = JournalEvent::App(event);
+        let connection_id = conn.connection_id.0;
+        let key_hash = conn.key_hash;
+        #[allow(clippy::let_unit_value)]
+        let publish_ts = mono_trace_ns();
+        batch.push_with(|slot| {
+            slot.connection_id = connection_id;
+            slot.key_hash = key_hash;
+            slot.request_seq = seq;
+            slot.sequence = 0;
+            slot.timestamp_ns = ts;
+            slot.event = event;
+            slot.publish_ts = publish_ts;
+            slot.recv_ts = recv_ts;
+        });
+        #[cfg(feature = "tick-to-trade")]
+        ingest_rec.record_elapsed(recv_ts, mono_trace_ns());
 
         cursor += 4 + frame_len;
     }
