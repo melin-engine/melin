@@ -104,13 +104,13 @@ mod reader;
 pub mod request;
 mod response;
 
-/// Replica failover and shadow snapshotting. Both are transport-level
-/// concerns and work for any `A: Application`, so they compile into the
-/// skip-order-exec build too — that's precisely the point of the
-/// transport-only binary (stress the full durable transport without
-/// the matching engine).
+/// Replica failover. Transport-level concern that works for any
+/// `A: Application`, so it compiles into the skip-order-exec build too —
+/// that's precisely the point of the transport-only binary (stress the
+/// full durable transport without the matching engine). The shadow
+/// snapshot stage that used to live next to this module now lives in
+/// `melin_transport_core::shadow`; call it through that path.
 pub mod replication;
-pub mod shadow;
 
 /// Server runtime (TCP accept loop, pipeline bootstrap, auth handshake).
 /// Both build modes share the same entry points — only the engine's

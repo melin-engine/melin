@@ -320,7 +320,7 @@ where
                 .name("replica-shadow".into())
                 .spawn(move || {
                     melin_app::affinity::pin_thread("replica-shadow", shadow_core);
-                    crate::shadow::run(
+                    melin_transport_core::shadow::run(
                         shadow_cons,
                         shadow_exchange,
                         snap_path,
