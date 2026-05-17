@@ -224,3 +224,127 @@ pub fn dispatch_event<A: Application>(
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::pipeline::InputSlot;
+    use crate::test_support::{TestApp, TestEvent};
+    use melin_disruptor::ring::DisruptorBuilder;
+    use std::time::Instant;
+
+    #[test]
+    fn shadow_shutdown_exits_promptly() {
+        let (_, mut consumers) = DisruptorBuilder::<InputSlot<TestEvent>>::new(64)
+            .add_consumer()
+            .build();
+        let consumer = consumers.pop().unwrap();
+
+        let app = TestApp::new();
+        let chain_hash = Arc::new(SeqLock::new([0u8; 32]));
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let shutdown2 = Arc::clone(&shutdown);
+
+        let dir = tempfile::tempdir().unwrap();
+        let snap_path = dir.path().join("test.snapshot");
+
+        let handle = std::thread::Builder::new()
+            .name("test-shadow".into())
+            .spawn(move || {
+                run(
+                    consumer,
+                    app,
+                    snap_path,
+                    Duration::from_secs(3600), // won't fire during test
+                    chain_hash,
+                    &shutdown2,
+                    false,
+                );
+            })
+            .unwrap();
+
+        // Give it a moment to start, then signal shutdown.
+        std::thread::sleep(Duration::from_millis(50));
+        shutdown.store(true, Ordering::Relaxed);
+
+        // Should exit promptly.
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn shadow_takes_snapshot_at_interval() {
+        let (mut producer, mut consumers) = DisruptorBuilder::<InputSlot<TestEvent>>::new(64)
+            .add_consumer()
+            .build();
+        let consumer = consumers.pop().unwrap();
+
+        let app = TestApp::new();
+        let chain_hash = Arc::new(SeqLock::new([0xAB; 32]));
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let shutdown2 = Arc::clone(&shutdown);
+
+        let dir = tempfile::tempdir().unwrap();
+        let snap_path = dir.path().join("test.snapshot");
+        let snap_path2 = snap_path.clone();
+
+        // Very short interval so the snapshot fires quickly.
+        let handle = std::thread::Builder::new()
+            .name("test-shadow".into())
+            .spawn(move || {
+                run(
+                    consumer,
+                    app,
+                    snap_path2,
+                    Duration::from_millis(50),
+                    chain_hash,
+                    &shutdown2,
+                    false,
+                );
+            })
+            .unwrap();
+
+        // Publish both events before the interval elapses so the snapshot
+        // captures both adds. The idle-check fires the snapshot after the
+        // 50ms interval even without new events arriving.
+        producer.publish(InputSlot {
+            connection_id: 0,
+            key_hash: 0,
+            request_seq: 0,
+            sequence: 0,
+            timestamp_ns: 0,
+            event: JournalEvent::App(TestEvent::Add(1000)),
+            publish_ts: Default::default(),
+            recv_ts: Default::default(),
+        });
+        producer.publish(InputSlot {
+            connection_id: 0,
+            key_hash: 0,
+            request_seq: 0,
+            sequence: 0,
+            timestamp_ns: 0,
+            event: JournalEvent::App(TestEvent::Add(500)),
+            publish_ts: Default::default(),
+            recv_ts: Default::default(),
+        });
+
+        // Wait for the snapshot to be written (idle-check triggers it
+        // after the 50ms interval elapses). Generous deadline because
+        // nextest runs many tests concurrently and the shadow worker can
+        // be starved on a busy machine — the test still completes
+        // quickly in the common case via the tight poll.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !snap_path.exists() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        shutdown.store(true, Ordering::Relaxed);
+        handle.join().unwrap();
+
+        // Verify the snapshot file was created and is loadable, and that
+        // both adds are reflected in the restored app's running total.
+        assert!(snap_path.exists(), "snapshot file should exist");
+        let (restored, _seq, chain) = snapshot::load::<TestApp>(&snap_path).unwrap();
+        assert_eq!(chain, [0xAB; 32]); // chain hash from SeqLock
+        assert_eq!(restored.total, 1500);
+    }
+}
