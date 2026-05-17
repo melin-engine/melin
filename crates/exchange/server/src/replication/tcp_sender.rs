@@ -14,13 +14,16 @@ use tracing::{debug, error, info, warn};
 use melin_journal::replication::ReplicationConsumer;
 
 use super::auth::authenticate_replica;
-use super::catchup::{CatchUpResult, can_catch_up_from_journal, catch_up_from_journal};
-use super::protocol::{
+use super::{ReplicationMetrics, update_dual_replication_cursor};
+use crate::TradingEvent;
+use melin_transport_core::replication::catchup::{
+    CatchUpResult, can_catch_up_from_journal, catch_up_from_journal,
+};
+use melin_transport_core::replication::protocol::{
     MAX_CONTROL_FRAME, ReplicaMessage, decode_replica_message, encode_heartbeat,
     encode_need_snapshot, encode_snapshot_begin, encode_snapshot_chunk, encode_snapshot_end,
     encode_stream_start, read_frame,
 };
-use super::{ReplicationMetrics, update_dual_replication_cursor};
 
 // --- Replication Sender (Primary side) ---
 
@@ -440,8 +443,12 @@ fn handle_replica_connection(
         writer.flush()?;
         send_buf.clear();
 
-        let catchup_result =
-            catch_up_from_journal(journal_path, handshake.last_sequence, &mut writer, shutdown)?;
+        let catchup_result = catch_up_from_journal::<TradingEvent>(
+            journal_path,
+            handshake.last_sequence,
+            &mut writer,
+            shutdown,
+        )?;
         match catchup_result {
             CatchUpResult::Ok(end) => end,
             CatchUpResult::NeedSnapshot => {
@@ -535,8 +542,12 @@ fn handle_replica_connection(
 
         // Catch up from the snapshot's sequence using the current journal.
         // The current journal starts at snap_sequence+1 (rotation boundary).
-        let post_snap_result =
-            catch_up_from_journal(journal_path, snap_sequence, &mut writer, shutdown)?;
+        let post_snap_result = catch_up_from_journal::<TradingEvent>(
+            journal_path,
+            snap_sequence,
+            &mut writer,
+            shutdown,
+        )?;
         match post_snap_result {
             CatchUpResult::Ok(end) => end,
             CatchUpResult::NeedSnapshot => {

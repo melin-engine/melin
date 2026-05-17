@@ -18,17 +18,19 @@ use melin_transport_core::pipeline::{JournalStage, JournalStageRun};
 
 use crate::TradingEvent;
 
-use super::catchup::{can_catch_up_from_journal, discover_journal_files};
-use super::protocol::{
-    Ack, Handshake, MAX_CONTROL_FRAME, MAX_DATA_FRAME, PrimaryMessage, ReplicaMessage,
-    decode_primary_message, decode_replica_message, encode_ack, encode_handshake, encode_heartbeat,
-    encode_need_snapshot, encode_snapshot_begin, encode_snapshot_chunk, encode_snapshot_end,
-    encode_stream_start, try_decode_input_batch,
-};
 use super::{
     PendingAckQueue, ReceiverResult, ReplicaPipelineHandles, ReplicationMetrics,
     build_replica_pipeline_with_threads, sleep_checking_flags, teardown_replica_pipeline,
     try_flush_dual_track, update_dual_replication_cursor,
+};
+use melin_transport_core::replication::catchup::{
+    can_catch_up_from_journal, discover_journal_files,
+};
+use melin_transport_core::replication::protocol::{
+    Ack, Handshake, MAX_CONTROL_FRAME, MAX_DATA_FRAME, PrimaryMessage, ReplicaMessage,
+    decode_primary_message, decode_replica_message, encode_ack, encode_handshake, encode_heartbeat,
+    encode_need_snapshot, encode_snapshot_begin, encode_snapshot_chunk, encode_snapshot_end,
+    encode_stream_start, try_decode_input_batch,
 };
 
 enum FrameResult {
@@ -761,13 +763,16 @@ fn catch_up_from_journal_dpdk(
             // as an InputBatch for the wire — same wire format the live
             // streaming path uses.
             let slots =
-                super::protocol::decode_journal_to_input_slots(&batch_buf).map_err(|e| {
+                melin_transport_core::replication::protocol::decode_journal_to_input_slots::<
+                    crate::TradingEvent,
+                >(&batch_buf)
+                .map_err(|e| {
                     io::Error::other(format!(
                         "catch-up journal decode at seq {batch_end_seq}: {e}"
                     ))
                 })?;
             send_buf.clear();
-            super::protocol::encode_input_batch(&slots, send_buf);
+            melin_transport_core::replication::protocol::encode_input_batch(&slots, send_buf);
             // Retry-with-poll: a 64 KiB batch can fill the TX queue even
             // after a previous poll. Spin-poll until queue_send accepts
             // the batch (or the replica drops). This is bounded — TX

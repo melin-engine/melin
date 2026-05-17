@@ -22,6 +22,11 @@
 pub mod durability_policy;
 pub mod journaled_app;
 pub mod pipeline;
+/// Replication wire protocol, journal-file catch-up, ack queueing,
+/// and per-replica observability metrics. Generic over
+/// `E: AppEvent`; connection orchestration and key authorization live
+/// with the consuming application.
+pub mod replication;
 pub mod replication_wire;
 pub mod snapshot;
 pub mod tick;

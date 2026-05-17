@@ -3,7 +3,7 @@
 //!
 //! Reads raw entry bytes from the primary's journal files (journal-codec
 //! format), decodes them into `InputSlot` records, and pushes them as
-//! `InputBatch` frames over the replica's TCP stream. Does NOT consume
+//! `InputBatch` frames over the replica's transport. Does NOT consume
 //! from the live replication ring during catch-up — the ring accumulates
 //! new data while this runs; the caller drains overlapping ring entries
 //! once catch-up completes.
@@ -12,6 +12,7 @@ use std::io::{self, Write};
 use std::net::TcpStream;
 use std::sync::atomic::{AtomicBool, Ordering};
 
+use melin_app::AppEvent;
 use tracing::{info, warn};
 
 use super::protocol::{decode_journal_to_input_slots, encode_input_batch};
@@ -21,10 +22,10 @@ use super::protocol::{decode_journal_to_input_slots, encode_input_batch};
 /// and is responsible for actually shipping the bytes to the replica. The
 /// closure returns `io::Error` on transport failure so the caller can
 /// abandon the catch-up and surface a clean disconnect.
-pub(super) type CatchUpPublisher<'a> = &'a mut dyn FnMut(&[u8]) -> io::Result<()>;
+pub type CatchUpPublisher<'a> = &'a mut dyn FnMut(&[u8]) -> io::Result<()>;
 
 /// Result of a journal catch-up attempt.
-pub(super) enum CatchUpResult {
+pub enum CatchUpResult {
     /// Catch-up succeeded. Contains the last sequence sent (or the input
     /// last_sequence if no entries were sent).
     Ok(u64),
@@ -35,7 +36,7 @@ pub(super) enum CatchUpResult {
 
 /// Discover journal archive files, sorted oldest to newest.
 /// Returns `[path.3, path.2, path.1, path]` — only files that exist.
-pub(super) fn discover_journal_files(journal_path: &std::path::Path) -> Vec<std::path::PathBuf> {
+pub fn discover_journal_files(journal_path: &std::path::Path) -> Vec<std::path::PathBuf> {
     let mut archives = Vec::new();
     let mut n = 1u32;
     loop {
@@ -58,7 +59,7 @@ pub(super) fn discover_journal_files(journal_path: &std::path::Path) -> Vec<std:
 /// Check if journal catch-up is possible without sending any data.
 /// Returns true if the journal archives contain the replica's last_sequence,
 /// false if the archives have been purged and a snapshot transfer is needed.
-pub(super) fn can_catch_up_from_journal(
+pub fn can_catch_up_from_journal(
     journal_path: &std::path::Path,
     last_sequence: u64,
 ) -> io::Result<bool> {
@@ -92,7 +93,12 @@ pub(super) fn can_catch_up_from_journal(
 /// entries were sent. The closure is called once per encoded `InputBatch`
 /// frame; it receives the bytes to ship and is responsible for the
 /// actual transport write (TCP `write_all`+`flush`).
-pub(super) fn catch_up_from_journal_with(
+///
+/// Generic over `E: AppEvent` — the journal codec decodes into the
+/// application's event type, and the resulting `InputSlot<E>` records
+/// are re-encoded as `InputBatch` frames the replica's input ring
+/// expects.
+pub fn catch_up_from_journal_with<E: AppEvent>(
     journal_path: &std::path::Path,
     last_sequence: u64,
     publisher: CatchUpPublisher<'_>,
@@ -183,7 +189,7 @@ pub(super) fn catch_up_from_journal_with(
             // as an `InputBatch` for the wire. Catch-up reads journal
             // *files* (still journal-codec); the live streaming path's
             // ring chunks are already InputBatch frames so it skips this.
-            let slots = decode_journal_to_input_slots(&batch_buf).map_err(|e| {
+            let slots = decode_journal_to_input_slots::<E>(&batch_buf).map_err(|e| {
                 io::Error::other(format!(
                     "catch-up journal decode at seq {batch_end_seq}: {e}"
                 ))
@@ -205,7 +211,7 @@ pub(super) fn catch_up_from_journal_with(
 
 /// Thin wrapper around [`catch_up_from_journal_with`] that ships
 /// frames over a TCP stream.
-pub(super) fn catch_up_from_journal(
+pub fn catch_up_from_journal<E: AppEvent>(
     journal_path: &std::path::Path,
     last_sequence: u64,
     writer: &mut TcpStream,
@@ -215,5 +221,5 @@ pub(super) fn catch_up_from_journal(
         writer.write_all(buf)?;
         writer.flush()
     };
-    catch_up_from_journal_with(journal_path, last_sequence, &mut publish, shutdown)
+    catch_up_from_journal_with::<E>(journal_path, last_sequence, &mut publish, shutdown)
 }

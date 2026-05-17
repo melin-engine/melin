@@ -1,57 +1,55 @@
 //! Replication wire protocol — message types, framing, encode/decode.
 //!
 //! Length-prefixed frames, little-endian, over a dedicated TCP connection
-//! (or DPDK pipe). See `mod.rs` for the message catalogue.
-//!
-//! All items are `pub(super)` — the protocol is an internal contract
-//! between the sender and receiver paths in the parent module.
+//! (or DPDK pipe). See the parent module for the message catalogue.
 
 use std::io::{self, Read};
 
-use melin_trading::trading_event::TradingEvent;
+use melin_app::AppEvent;
 use zerocopy::little_endian::{U32, U64};
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout, Unaligned};
 
-use crate::InputSlot;
+use crate::pipeline::InputSlot;
 
-// Wire format for `MSG_INPUT_BATCH` lives in `transport-core` so the
-// journal stage can encode directly into the replication ring without
-// depending on the server crate. Re-export the helpers at server scope so
-// existing `super::protocol::{...}` imports keep working.
-pub(super) use melin_transport_core::replication_wire::{
+// Wire format for `MSG_INPUT_BATCH` lives alongside in
+// `crate::replication_wire` so the journal stage can encode directly
+// into the replication ring without depending on this submodule.
+// Re-export the helpers at replication scope so existing
+// `replication::protocol::{...}` imports keep working.
+pub use crate::replication_wire::{
     encode_input_batch, try_decode_input_batch, try_decode_input_batch_into,
 };
 
 // --- Wire protocol message tags ---
 
-pub(super) const MSG_HANDSHAKE: u8 = 0x01;
-pub(super) const MSG_ACK: u8 = 0x02;
+pub const MSG_HANDSHAKE: u8 = 0x01;
+pub const MSG_ACK: u8 = 0x02;
 // Auth messages (exchanged before the handshake).
-pub(super) const MSG_CHALLENGE: u8 = 0x03;
-pub(super) const MSG_CHALLENGE_RESPONSE: u8 = 0x04;
-pub(super) const MSG_AUTH_OK: u8 = 0x05;
-pub(super) const MSG_AUTH_FAILED: u8 = 0x06;
-pub(super) const MSG_STREAM_START: u8 = 0x10;
-pub(super) const MSG_NEED_SNAPSHOT: u8 = 0x11;
-pub(super) const MSG_HASH_MISMATCH: u8 = 0x12;
-pub(super) const MSG_SNAPSHOT_BEGIN: u8 = 0x13;
-pub(super) const MSG_SNAPSHOT_CHUNK: u8 = 0x14;
-pub(super) const MSG_SNAPSHOT_END: u8 = 0x15;
+pub const MSG_CHALLENGE: u8 = 0x03;
+pub const MSG_CHALLENGE_RESPONSE: u8 = 0x04;
+pub const MSG_AUTH_OK: u8 = 0x05;
+pub const MSG_AUTH_FAILED: u8 = 0x06;
+pub const MSG_STREAM_START: u8 = 0x10;
+pub const MSG_NEED_SNAPSHOT: u8 = 0x11;
+pub const MSG_HASH_MISMATCH: u8 = 0x12;
+pub const MSG_SNAPSHOT_BEGIN: u8 = 0x13;
+pub const MSG_SNAPSHOT_CHUNK: u8 = 0x14;
+pub const MSG_SNAPSHOT_END: u8 = 0x15;
 // `MSG_INPUT_BATCH` (0x21) — re-exported above; carries `InputSlot`
 // records on the wire. Replaces the old `MSG_DATA_BATCH = 0x20` (removed
 // in phase 3 of feat/unified-pipeline).
-pub(super) const MSG_HEARTBEAT: u8 = 0x30;
+pub const MSG_HEARTBEAT: u8 = 0x30;
 
 /// Maximum frame size for control messages (handshake, ack, etc.).
 /// `InputBatch` frames can be much larger (up to a full 512 KiB ring chunk).
-pub(super) const MAX_CONTROL_FRAME: usize = 256;
+pub const MAX_CONTROL_FRAME: usize = 256;
 
 /// Maximum `InputBatch` frame size. Must be >= the replication ring's
 /// `CHUNK_SIZE` (512 KiB) — the journal stage's `InputBatch` buffer can
 /// fill an entire chunk before sync. The 256 KiB headroom covers
 /// length-prefix + per-slot framing overhead inside the chunk plus a
 /// safety margin.
-pub(super) const MAX_DATA_FRAME: usize = 768 * 1024;
+pub const MAX_DATA_FRAME: usize = 768 * 1024;
 
 // --- Message structs / enums ---
 
@@ -65,7 +63,8 @@ pub struct Handshake {
 /// Ack message sent by the replica.
 ///
 /// Carries two cursors so the primary's response gate can evaluate
-/// multi-level durability policies (see `crate::durability_policy`):
+/// multi-level durability policies (see
+/// `crate::durability_policy`):
 ///
 /// - `acked_sequence` — highest sequence persisted on the replica
 ///   (`O_DIRECT` `pwrite` returned, durable behind PLP).
@@ -211,7 +210,7 @@ fn write_length_prefix(buf: &mut Vec<u8>, payload_len: u32) {
 // --- Encoders ---
 
 /// Encode a handshake message into a frame (length-prefixed).
-pub(super) fn encode_handshake(h: &Handshake, buf: &mut Vec<u8>) {
+pub fn encode_handshake(h: &Handshake, buf: &mut Vec<u8>) {
     let frame = HandshakeFrame {
         tag: MSG_HANDSHAKE,
         last_sequence: U64::new(h.last_sequence),
@@ -223,7 +222,7 @@ pub(super) fn encode_handshake(h: &Handshake, buf: &mut Vec<u8>) {
 }
 
 /// Encode an ack message into a frame.
-pub(super) fn encode_ack(ack: &Ack, buf: &mut Vec<u8>) {
+pub fn encode_ack(ack: &Ack, buf: &mut Vec<u8>) {
     let frame = AckFrame {
         tag: MSG_ACK,
         acked_sequence: U64::new(ack.acked_sequence),
@@ -235,7 +234,7 @@ pub(super) fn encode_ack(ack: &Ack, buf: &mut Vec<u8>) {
 }
 
 /// Encode a Challenge message (primary → replica).
-pub(super) fn encode_challenge(nonce: &[u8; 32], buf: &mut Vec<u8>) {
+pub fn encode_challenge(nonce: &[u8; 32], buf: &mut Vec<u8>) {
     let frame = ChallengeFrame {
         tag: MSG_CHALLENGE,
         nonce: *nonce,
@@ -246,11 +245,7 @@ pub(super) fn encode_challenge(nonce: &[u8; 32], buf: &mut Vec<u8>) {
 }
 
 /// Encode a ChallengeResponse message (replica → primary).
-pub(super) fn encode_challenge_response(
-    signature: &[u8; 64],
-    pubkey: &[u8; 32],
-    buf: &mut Vec<u8>,
-) {
+pub fn encode_challenge_response(signature: &[u8; 64], pubkey: &[u8; 32], buf: &mut Vec<u8>) {
     let frame = ChallengeResponseFrame {
         tag: MSG_CHALLENGE_RESPONSE,
         signature: *signature,
@@ -262,14 +257,14 @@ pub(super) fn encode_challenge_response(
 }
 
 /// Encode an AuthOk message (primary → replica).
-pub(super) fn encode_auth_ok(buf: &mut Vec<u8>) {
+pub fn encode_auth_ok(buf: &mut Vec<u8>) {
     let payload_len: u32 = 1;
     buf.extend_from_slice(&payload_len.to_le_bytes());
     buf.push(MSG_AUTH_OK);
 }
 
 /// Encode an AuthFailed message (primary → replica).
-pub(super) fn encode_auth_failed(buf: &mut Vec<u8>) {
+pub fn encode_auth_failed(buf: &mut Vec<u8>) {
     let payload_len: u32 = 1;
     buf.extend_from_slice(&payload_len.to_le_bytes());
     buf.push(MSG_AUTH_FAILED);
@@ -281,11 +276,7 @@ pub(super) fn encode_auth_failed(buf: &mut Vec<u8>) {
 /// write a byte-identical genesis to its journal. This ensures the
 /// BLAKE3 hash chain starts from the exact same encoded bytes (including
 /// the timestamp), so checkpoint verification works on the replica.
-pub(super) fn encode_stream_start(
-    start_sequence: u64,
-    genesis_entry_bytes: &[u8],
-    buf: &mut Vec<u8>,
-) {
+pub fn encode_stream_start(start_sequence: u64, genesis_entry_bytes: &[u8], buf: &mut Vec<u8>) {
     let header = StreamStartHeader {
         tag: MSG_STREAM_START,
         start_sequence: U64::new(start_sequence),
@@ -298,14 +289,14 @@ pub(super) fn encode_stream_start(
 }
 
 /// Encode a NeedSnapshot message.
-pub(super) fn encode_need_snapshot(buf: &mut Vec<u8>) {
+pub fn encode_need_snapshot(buf: &mut Vec<u8>) {
     let payload_len: u32 = 1;
     buf.extend_from_slice(&payload_len.to_le_bytes());
     buf.push(MSG_NEED_SNAPSHOT);
 }
 
 /// Encode a SnapshotBegin message.
-pub(super) fn encode_snapshot_begin(
+pub fn encode_snapshot_begin(
     snapshot_len: u64,
     snap_sequence: u64,
     snap_chain_hash: &[u8; 32],
@@ -323,7 +314,7 @@ pub(super) fn encode_snapshot_begin(
 }
 
 /// Encode a SnapshotChunk message.
-pub(super) fn encode_snapshot_chunk(data: &[u8], buf: &mut Vec<u8>) {
+pub fn encode_snapshot_chunk(data: &[u8], buf: &mut Vec<u8>) {
     // type(1) + data
     let payload_len: u32 = (1 + data.len()) as u32;
     buf.extend_from_slice(&payload_len.to_le_bytes());
@@ -332,7 +323,7 @@ pub(super) fn encode_snapshot_chunk(data: &[u8], buf: &mut Vec<u8>) {
 }
 
 /// Encode a SnapshotEnd message.
-pub(super) fn encode_snapshot_end(crc32c: u32, buf: &mut Vec<u8>) {
+pub fn encode_snapshot_end(crc32c: u32, buf: &mut Vec<u8>) {
     let frame = SnapshotEndFrame {
         tag: MSG_SNAPSHOT_END,
         crc32c: U32::new(crc32c),
@@ -344,7 +335,7 @@ pub(super) fn encode_snapshot_end(crc32c: u32, buf: &mut Vec<u8>) {
 
 /// Encode a HashMismatch message.
 #[allow(dead_code)] // Used in future catch-up implementation.
-pub(super) fn encode_hash_mismatch(buf: &mut Vec<u8>) {
+pub fn encode_hash_mismatch(buf: &mut Vec<u8>) {
     let payload_len: u32 = 1;
     buf.extend_from_slice(&payload_len.to_le_bytes());
     buf.push(MSG_HASH_MISMATCH);
@@ -352,7 +343,7 @@ pub(super) fn encode_hash_mismatch(buf: &mut Vec<u8>) {
 
 /// Encode a Heartbeat message. Carries only the last-acked sequence;
 /// the chain hash is verified at Checkpoint events, not on every heartbeat.
-pub(super) fn encode_heartbeat(sequence: u64, buf: &mut Vec<u8>) {
+pub fn encode_heartbeat(sequence: u64, buf: &mut Vec<u8>) {
     let frame = HeartbeatFrame {
         tag: MSG_HEARTBEAT,
         sequence: U64::new(sequence),
@@ -365,7 +356,7 @@ pub(super) fn encode_heartbeat(sequence: u64, buf: &mut Vec<u8>) {
 // --- Decoders / framing ---
 
 /// Read a length-prefixed frame from a stream. Returns the payload (without length prefix).
-pub(super) fn read_frame(reader: &mut impl Read, max_size: usize) -> io::Result<Vec<u8>> {
+pub fn read_frame(reader: &mut impl Read, max_size: usize) -> io::Result<Vec<u8>> {
     let mut len_buf = [0u8; 4];
     reader.read_exact(&mut len_buf)?;
     let len = u32::from_le_bytes(len_buf) as usize;
@@ -383,7 +374,7 @@ pub(super) fn read_frame(reader: &mut impl Read, max_size: usize) -> io::Result<
 }
 
 /// Decode a Challenge payload → 32-byte nonce.
-pub(super) fn decode_challenge(payload: &[u8]) -> io::Result<[u8; 32]> {
+pub fn decode_challenge(payload: &[u8]) -> io::Result<[u8; 32]> {
     let (frame, _) = ChallengeFrame::ref_from_prefix(payload)
         .map_err(|_| io::Error::other("challenge too short"))?;
     if frame.tag != MSG_CHALLENGE {
@@ -396,7 +387,7 @@ pub(super) fn decode_challenge(payload: &[u8]) -> io::Result<[u8; 32]> {
 }
 
 /// Decode a ChallengeResponse payload → (signature, pubkey).
-pub(super) fn decode_challenge_response(payload: &[u8]) -> io::Result<([u8; 64], [u8; 32])> {
+pub fn decode_challenge_response(payload: &[u8]) -> io::Result<([u8; 64], [u8; 32])> {
     let (frame, _) = ChallengeResponseFrame::ref_from_prefix(payload)
         .map_err(|_| io::Error::other("challenge response too short"))?;
     if frame.tag != MSG_CHALLENGE_RESPONSE {
@@ -409,7 +400,7 @@ pub(super) fn decode_challenge_response(payload: &[u8]) -> io::Result<([u8; 64],
 }
 
 /// Decode an auth result payload → true if AuthOk, false if AuthFailed.
-pub(super) fn decode_auth_result(payload: &[u8]) -> io::Result<bool> {
+pub fn decode_auth_result(payload: &[u8]) -> io::Result<bool> {
     if payload.is_empty() {
         return Err(io::Error::other("empty auth result"));
     }
@@ -423,7 +414,7 @@ pub(super) fn decode_auth_result(payload: &[u8]) -> io::Result<bool> {
 }
 
 /// Decode a replica message from a frame payload.
-pub(super) fn decode_replica_message(payload: &[u8]) -> io::Result<ReplicaMessage> {
+pub fn decode_replica_message(payload: &[u8]) -> io::Result<ReplicaMessage> {
     if payload.is_empty() {
         return Err(io::Error::other("empty payload"));
     }
@@ -451,7 +442,7 @@ pub(super) fn decode_replica_message(payload: &[u8]) -> io::Result<ReplicaMessag
 }
 
 /// Decode a primary message from a frame payload.
-pub(super) fn decode_primary_message(payload: &[u8]) -> io::Result<PrimaryMessage> {
+pub fn decode_primary_message(payload: &[u8]) -> io::Result<PrimaryMessage> {
     if payload.is_empty() {
         return Err(io::Error::other("empty payload"));
     }
@@ -511,12 +502,18 @@ pub(super) fn decode_primary_message(payload: &[u8]) -> io::Result<PrimaryMessag
 /// Decode a journal-codec byte stream into `InputSlot` records. Used by
 /// the catch-up paths (`catchup.rs` for TCP, the DPDK catch-up loop) to
 /// turn journal-file bytes into wire-ready `InputBatch` frames.
-pub(super) fn decode_journal_to_input_slots(journal_bytes: &[u8]) -> io::Result<Vec<InputSlot>> {
+///
+/// Generic over `E: AppEvent` — the journal codec decodes into the
+/// application's event type, and the resulting `InputSlot<E>` records
+/// are what the receiver's input ring expects.
+pub fn decode_journal_to_input_slots<E: AppEvent>(
+    journal_bytes: &[u8],
+) -> io::Result<Vec<InputSlot<E>>> {
     let mut slots = Vec::with_capacity(64);
     let mut offset = 0;
     while offset < journal_bytes.len() {
         let (consumed, sequence, timestamp_ns, key_hash, request_seq, event) =
-            melin_journal::codec::decode::<TradingEvent>(
+            melin_journal::codec::decode::<E>(
                 &journal_bytes[offset..],
                 melin_journal::codec::FORMAT_VERSION,
             )

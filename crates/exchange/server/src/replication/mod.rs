@@ -14,7 +14,8 @@
 //!
 //! Length-prefixed frames, little-endian, over a dedicated TCP connection
 //! (or DPDK pipe). The full `InputBatch` payload layout lives in
-//! [`crate::replication::protocol`] / `transport-core::replication_wire`.
+//! `melin_transport_core::replication::protocol` /
+//! `melin_transport_core::replication_wire`.
 //!
 //! ### Auth (before handshake)
 //! - **Challenge** (Primary → Replica): `[len:u32][0x03][nonce:[u8;32]]`
@@ -53,18 +54,18 @@ use melin_transport_core::pipeline::{JournalStage, JournalStageRun};
 use crate::TradingEvent;
 
 mod auth;
-mod catchup;
 #[cfg(feature = "dpdk")]
 mod dpdk;
-mod protocol;
 mod tcp_receiver;
 mod tcp_sender;
 
-// Re-export the public wire-protocol types so the module's public API
-// surface is unchanged after the split. Without these re-exports the
-// types would become crate-private and dead-code analysis would (rightly)
-// flag fields that are only read by external consumers / tests.
-pub use protocol::{Ack, Handshake, PrimaryMessage, ReplicaMessage};
+// Wire-protocol types, auth, and catch-up now live in
+// `melin_transport_core::replication`. Re-export the public message
+// types here so the module's public API surface (e.g. `melin_server::
+// replication::Ack`) is unchanged for downstream consumers and tests.
+pub use melin_transport_core::replication::protocol::{
+    Ack, Handshake, PrimaryMessage, ReplicaMessage,
+};
 
 #[cfg(feature = "dpdk")]
 pub use dpdk::{DpdkReplicationDriver, run_receiver_dpdk};
@@ -604,7 +605,7 @@ pub(super) fn try_flush_dual_track(
     accum_end_sequence: u64,
     last_sent_acked: u64,
     last_sent_in_memory: u64,
-) -> Option<crate::replication::protocol::Ack> {
+) -> Option<melin_transport_core::replication::protocol::Ack> {
     let acked_now = pending_acks
         .pop_ready(journal_cursor)
         .unwrap_or(last_sent_acked);
@@ -615,7 +616,7 @@ pub(super) fn try_flush_dual_track(
     );
     let in_mem_now = accum_end_sequence;
     if acked_now > last_sent_acked || in_mem_now > last_sent_in_memory {
-        Some(crate::replication::protocol::Ack {
+        Some(melin_transport_core::replication::protocol::Ack {
             acked_sequence: acked_now,
             in_memory_sequence: in_mem_now,
         })
@@ -631,7 +632,8 @@ mod tests {
     use std::sync::atomic::AtomicU32;
 
     use super::auth::{authenticate_replica, authenticate_with_primary};
-    use super::protocol::{
+    use super::*;
+    use melin_transport_core::replication::protocol::{
         MAX_CONTROL_FRAME, MAX_DATA_FRAME, MSG_AUTH_OK, MSG_CHALLENGE_RESPONSE, MSG_SNAPSHOT_BEGIN,
         MSG_SNAPSHOT_CHUNK, MSG_SNAPSHOT_END, decode_auth_result, decode_challenge,
         decode_challenge_response, decode_primary_message, decode_replica_message, encode_ack,
@@ -640,7 +642,6 @@ mod tests {
         encode_need_snapshot, encode_snapshot_begin, encode_snapshot_chunk, encode_snapshot_end,
         encode_stream_start, read_frame, try_decode_input_batch,
     };
-    use super::*;
 
     /// Build a wire-ready `InputBatch` frame containing a single `Tick`
     /// slot at the given sequence — the protocol-level tests don't need
@@ -1001,7 +1002,7 @@ mod tests {
         // Replica side: read challenge, but sign with a DIFFERENT key,
         // then send the response with the correct public key (spoofing).
         let replica_handle = std::thread::spawn(move || {
-            use super::protocol::*;
+            use melin_transport_core::replication::protocol::*;
 
             let mut reader = replica_stream.try_clone().unwrap();
             let mut writer = replica_stream;
