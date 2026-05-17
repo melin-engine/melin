@@ -42,9 +42,11 @@ pub(crate) fn prealloc_chunk_bytes() -> u64 {
         .unwrap_or(DEFAULT_PREALLOC_CHUNK)
 }
 
-/// Internal hook for `test_utils::set_prealloc_chunk_bytes_override`.
+/// Internal hook for `test_utils::set_prealloc_chunk_bytes_override`
+/// and in-crate tests that need to engineer specific prealloc-boundary
+/// scenarios (notably `ensure_allocated`'s zero-range invariant).
 /// `None` clears the override; `Some(0)` is treated as "clear".
-#[cfg(feature = "test-utils")]
+#[cfg(any(test, feature = "test-utils"))]
 pub(crate) fn set_override(bytes: Option<u64>) {
     OVERRIDE_BYTES.store(bytes.unwrap_or(0), Ordering::Relaxed);
 }
