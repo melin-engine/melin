@@ -1485,6 +1485,7 @@ where
     let reader_shutdown = Arc::new(AtomicBool::new(false));
     let mut reader_handle = crate::runtime::reader::spawn_reader(
         input_producer,
+        Arc::new(crate::domain::request::TradingRequestDecoder),
         control_tx.clone(),
         config.reader_cores,
         connection_timeout,

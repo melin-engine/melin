@@ -1,16 +1,59 @@
-//! Shared request processing logic used by all transport backends
-//! (io_uring reader, DPDK transport).
+//! Trading-side [`RequestDecoder`] implementation.
 //!
-//! Extracting these functions avoids duplicating critical permission
-//! enforcement and request→event conversion across transport impls.
+//! Owns the bytes -> `melin_protocol::Request` -> `TradingEvent`
+//! pipeline. Hides the wire enum behind the [`RequestDecoder`] trait
+//! so the server runtime never needs to pattern-match on
+//! application-shaped variants.
 
 use crate::JournalEvent;
 use melin_app::auth::Permission;
+use melin_app::decoder::{Decoded, RequestDecoder};
+use melin_protocol::codec;
 use melin_protocol::message::Request;
+use melin_trading::trading_event::TradingEvent;
 
-/// Returns `true` if the request should be filtered out (not published
-/// to the pipeline). Heartbeats and post-auth ChallengeResponse are
-/// filtered.
+/// Decoder for the trading wire protocol.
+///
+/// Zero-sized. The runtime owns an `Arc<dyn RequestDecoder<...>>`;
+/// constructing one is `Arc::new(TradingRequestDecoder)`.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct TradingRequestDecoder;
+
+impl RequestDecoder for TradingRequestDecoder {
+    type Event = TradingEvent;
+
+    fn decode(&self, bytes: &[u8], permission: Permission) -> Decoded<TradingEvent> {
+        let (request_seq, request) = match codec::decode_request(bytes) {
+            Ok(pair) => pair,
+            // The protocol codec returns a typed error; collapsing to a
+            // static reason matches the reader's debug-log granularity
+            // and keeps the trait return type small.
+            Err(_) => return Decoded::DecodeError("malformed request frame"),
+        };
+
+        if should_filter(&request) {
+            return Decoded::Filter;
+        }
+
+        if let Err(reason) = check_permission(&request, permission) {
+            return Decoded::PermissionDenied(reason);
+        }
+
+        Decoded::Permitted {
+            request_seq,
+            event: to_trading_event(&request),
+        }
+    }
+}
+
+// The three helpers below are public for transitional callers (the
+// DPDK transport still calls them directly; Commit D rewires it
+// through the trait). After that, they become private and folded
+// inline into `decode`.
+
+/// Transport-level frames the runtime never publishes to the
+/// pipeline: heartbeats, post-auth handshakes, subscription control.
+#[inline]
 pub fn should_filter(request: &Request) -> bool {
     matches!(
         request,
@@ -18,14 +61,12 @@ pub fn should_filter(request: &Request) -> bool {
     )
 }
 
-/// Check whether the given request is permitted for the connection's
-/// permission level. Returns `Ok(())` if allowed, `Err(reason)` if not.
-///
-/// Permission model:
-/// - Operator: exchange configuration (add instrument, risk limits, circuit breakers, fee schedules, end-of-day, stats)
+/// Permission model — separation of duties:
+/// - Operator: exchange configuration (instruments, risk, circuit breakers, fees, EOD, stats)
 /// - Custodian: fund management (deposit, withdraw)
-/// - Trader: order submission, cancellation
+/// - Trader: order submission and cancellation
 /// - ReadOnly: heartbeats only (filtered before this function)
+#[inline]
 pub fn check_permission(request: &Request, permission: Permission) -> Result<(), &'static str> {
     if request.requires_operator() && !permission.is_operator() {
         return Err("non-operator attempted operator command");
@@ -39,102 +80,79 @@ pub fn check_permission(request: &Request, permission: Permission) -> Result<(),
     Ok(())
 }
 
-/// Convert a wire `Request` to a `JournalEvent` for the pipeline.
-///
-/// The request must have been filtered via [`should_filter`] first —
-/// this function panics on `Heartbeat` and `ChallengeResponse`.
+/// Wrap a decoded request as a `JournalEvent::App`. Transitional —
+/// the DPDK transport still wants the journal-wrapped form; once
+/// Commit D routes DPDK through the decoder trait, this and the
+/// helpers above are folded inline.
 pub fn to_event(request: &Request) -> JournalEvent {
+    JournalEvent::App(to_trading_event(request))
+}
+
+/// Per-variant `Request -> TradingEvent` mapping. Caller must have
+/// filtered transport-level frames first; this panics on heartbeats /
+/// post-auth handshakes / subscribe frames.
+#[inline]
+fn to_trading_event(request: &Request) -> TradingEvent {
     match *request {
-        Request::SubmitOrder { symbol, order } => {
-            JournalEvent::App(melin_trading::trading_event::TradingEvent::SubmitOrder {
-                symbol,
-                order,
-            })
-        }
+        Request::SubmitOrder { symbol, order } => TradingEvent::SubmitOrder { symbol, order },
         Request::CancelOrder {
             symbol,
             account,
             order_id,
-        } => JournalEvent::App(melin_trading::trading_event::TradingEvent::CancelOrder {
+        } => TradingEvent::CancelOrder {
             symbol,
             account,
             order_id,
-        }),
-        Request::CancelAll { account } => {
-            JournalEvent::App(melin_trading::trading_event::TradingEvent::CancelAll { account })
-        }
-        Request::AddInstrument { spec } => {
-            JournalEvent::App(melin_trading::trading_event::TradingEvent::AddInstrument { spec })
-        }
+        },
+        Request::CancelAll { account } => TradingEvent::CancelAll { account },
+        Request::AddInstrument { spec } => TradingEvent::AddInstrument { spec },
         Request::Deposit {
             account,
             currency,
             amount,
-        } => JournalEvent::App(melin_trading::trading_event::TradingEvent::Deposit {
+        } => TradingEvent::Deposit {
             account,
             currency,
             amount,
-        }),
+        },
         Request::Withdraw {
             account,
             currency,
             amount,
-        } => JournalEvent::App(melin_trading::trading_event::TradingEvent::Withdraw {
+        } => TradingEvent::Withdraw {
             account,
             currency,
             amount,
-        }),
-        Request::SetRiskLimits { symbol, limits } => {
-            JournalEvent::App(melin_trading::trading_event::TradingEvent::SetRiskLimits {
-                symbol,
-                limits,
-            })
+        },
+        Request::SetRiskLimits { symbol, limits } => TradingEvent::SetRiskLimits { symbol, limits },
+        Request::SetCircuitBreaker { symbol, config } => {
+            TradingEvent::SetCircuitBreaker { symbol, config }
         }
-        Request::SetCircuitBreaker { symbol, config } => JournalEvent::App(
-            melin_trading::trading_event::TradingEvent::SetCircuitBreaker { symbol, config },
-        ),
         Request::CancelReplace {
             symbol,
             account,
             order_id,
             new_price,
             new_quantity,
-        } => JournalEvent::App(melin_trading::trading_event::TradingEvent::CancelReplace {
+        } => TradingEvent::CancelReplace {
             symbol,
             account,
             order_id,
             new_price,
             new_quantity,
-        }),
+        },
         Request::SetFeeSchedule { symbol, schedule } => {
-            JournalEvent::App(melin_trading::trading_event::TradingEvent::SetFeeSchedule {
-                symbol,
-                schedule,
-            })
+            TradingEvent::SetFeeSchedule { symbol, schedule }
         }
-        Request::QueryStats => {
-            JournalEvent::App(melin_trading::trading_event::TradingEvent::QueryStats)
-        }
-        Request::QueryPosition { account } => {
-            JournalEvent::App(melin_trading::trading_event::TradingEvent::QueryPosition { account })
-        }
-        Request::QueryRequestSeq => {
-            JournalEvent::App(melin_trading::trading_event::TradingEvent::QueryRequestSeq)
-        }
-        Request::EndOfDay => {
-            JournalEvent::App(melin_trading::trading_event::TradingEvent::EndOfDay)
-        }
-        Request::DisableInstrument { symbol } => JournalEvent::App(
-            melin_trading::trading_event::TradingEvent::DisableInstrument { symbol },
-        ),
-        Request::EnableInstrument { symbol } => JournalEvent::App(
-            melin_trading::trading_event::TradingEvent::EnableInstrument { symbol },
-        ),
-        Request::RemoveInstrument { symbol } => JournalEvent::App(
-            melin_trading::trading_event::TradingEvent::RemoveInstrument { symbol },
-        ),
+        Request::QueryStats => TradingEvent::QueryStats,
+        Request::QueryPosition { account } => TradingEvent::QueryPosition { account },
+        Request::QueryRequestSeq => TradingEvent::QueryRequestSeq,
+        Request::EndOfDay => TradingEvent::EndOfDay,
+        Request::DisableInstrument { symbol } => TradingEvent::DisableInstrument { symbol },
+        Request::EnableInstrument { symbol } => TradingEvent::EnableInstrument { symbol },
+        Request::RemoveInstrument { symbol } => TradingEvent::RemoveInstrument { symbol },
         Request::Heartbeat | Request::ChallengeResponse { .. } | Request::Subscribe { .. } => {
-            unreachable!("heartbeats, auth, and subscribe must be filtered before to_event")
+            unreachable!("filtered before to_event")
         }
     }
 }
@@ -144,113 +162,20 @@ mod tests {
     use super::*;
     use std::num::NonZeroU64;
 
+    use melin_app::AppEvent;
     use melin_types::types::*;
 
-    #[test]
-    fn filter_heartbeat() {
-        assert!(should_filter(&Request::Heartbeat));
+    /// Wire-encode a Request into the byte form the decoder expects
+    /// (seq + tag + payload, with the framing length-prefix already
+    /// stripped — same shape `codec::decode_request` consumes).
+    fn encode(request: &Request, seq: u64) -> Vec<u8> {
+        let mut buf = vec![0u8; 256];
+        let total = codec::encode_request(request, seq, &mut buf).unwrap();
+        buf[4..total].to_vec()
     }
 
-    #[test]
-    fn filter_challenge_response() {
-        assert!(should_filter(&Request::ChallengeResponse {
-            signature: [0u8; 64],
-            public_key: [0u8; 32],
-        }));
-    }
-
-    #[test]
-    fn do_not_filter_submit_order() {
-        let req = Request::SubmitOrder {
-            symbol: Symbol(1),
-            order: Order {
-                id: OrderId(1),
-                account: AccountId(1),
-                side: Side::Buy,
-                order_type: OrderType::Limit {
-                    price: Price(NonZeroU64::new(100).unwrap()),
-                    post_only: false,
-                },
-                quantity: Quantity(NonZeroU64::new(10).unwrap()),
-                time_in_force: TimeInForce::GTC,
-                stp: SelfTradeProtection::CancelNewest,
-                expiry_ns: 0,
-            },
-        };
-        assert!(!should_filter(&req));
-    }
-
-    #[test]
-    fn do_not_filter_cancel() {
-        assert!(!should_filter(&Request::CancelAll {
-            account: AccountId(1),
-        }));
-    }
-
-    #[test]
-    fn permission_trader_can_trade() {
-        let req = Request::CancelAll {
-            account: AccountId(1),
-        };
-        assert!(check_permission(&req, Permission::Trader).is_ok());
-    }
-
-    #[test]
-    fn permission_readonly_cannot_trade() {
-        let req = Request::CancelAll {
-            account: AccountId(1),
-        };
-        assert!(check_permission(&req, Permission::ReadOnly).is_err());
-    }
-
-    #[test]
-    fn permission_operator_can_operate() {
-        let req = Request::AddInstrument {
-            spec: InstrumentSpec {
-                symbol: Symbol(1),
-                base: CurrencyId(1),
-                quote: CurrencyId(2),
-            },
-        };
-        assert!(check_permission(&req, Permission::Operator).is_ok());
-    }
-
-    #[test]
-    fn permission_trader_cannot_operate() {
-        let req = Request::AddInstrument {
-            spec: InstrumentSpec {
-                symbol: Symbol(1),
-                base: CurrencyId(1),
-                quote: CurrencyId(2),
-            },
-        };
-        assert!(check_permission(&req, Permission::Trader).is_err());
-    }
-
-    #[test]
-    fn permission_custodian_can_deposit() {
-        let req = Request::Deposit {
-            account: AccountId(1),
-            currency: CurrencyId(1),
-            amount: 100,
-        };
-        assert!(check_permission(&req, Permission::Custodian).is_ok());
-    }
-
-    #[test]
-    fn permission_trader_cannot_deposit() {
-        let req = Request::Deposit {
-            account: AccountId(1),
-            currency: CurrencyId(1),
-            amount: 100,
-        };
-        assert!(check_permission(&req, Permission::Trader).is_err());
-    }
-
-    #[test]
-    fn to_event_all_trading_variants() {
-        // Just verify they don't panic.
-        let order = Order {
+    fn order() -> Order {
+        Order {
             id: OrderId(1),
             account: AccountId(1),
             side: Side::Buy,
@@ -259,28 +184,165 @@ mod tests {
             time_in_force: TimeInForce::GTC,
             stp: SelfTradeProtection::Allow,
             expiry_ns: 0,
-        };
-        to_event(&Request::SubmitOrder {
-            symbol: Symbol(1),
-            order,
-        });
-        to_event(&Request::CancelOrder {
-            symbol: Symbol(1),
-            account: AccountId(1),
-            order_id: OrderId(1),
-        });
-        to_event(&Request::CancelAll {
-            account: AccountId(1),
-        });
-        to_event(&Request::QueryStats);
-        to_event(&Request::QueryPosition {
-            account: AccountId(1),
-        });
+        }
     }
 
     #[test]
-    #[should_panic(expected = "must be filtered")]
-    fn to_event_panics_on_heartbeat() {
-        to_event(&Request::Heartbeat);
+    fn heartbeat_is_filtered() {
+        let bytes = encode(&Request::Heartbeat, 0);
+        assert!(matches!(
+            TradingRequestDecoder.decode(&bytes, Permission::Trader),
+            Decoded::Filter
+        ));
+    }
+
+    #[test]
+    fn challenge_response_is_filtered() {
+        let bytes = encode(
+            &Request::ChallengeResponse {
+                signature: [0u8; 64],
+                public_key: [0u8; 32],
+            },
+            0,
+        );
+        assert!(matches!(
+            TradingRequestDecoder.decode(&bytes, Permission::Trader),
+            Decoded::Filter
+        ));
+    }
+
+    #[test]
+    fn submit_order_as_trader_is_permitted() {
+        let bytes = encode(
+            &Request::SubmitOrder {
+                symbol: Symbol(1),
+                order: order(),
+            },
+            42,
+        );
+        match TradingRequestDecoder.decode(&bytes, Permission::Trader) {
+            Decoded::Permitted { request_seq, event } => {
+                assert_eq!(request_seq, 42);
+                assert!(matches!(event, TradingEvent::SubmitOrder { .. }));
+                // Trading-side query taxonomy: order submission is not a query.
+                assert!(!event.is_query());
+            }
+            other => panic!("expected Permitted, got {:?}", debug_variant(&other)),
+        }
+    }
+
+    #[test]
+    fn submit_order_as_readonly_is_denied() {
+        let bytes = encode(
+            &Request::SubmitOrder {
+                symbol: Symbol(1),
+                order: order(),
+            },
+            0,
+        );
+        assert!(matches!(
+            TradingRequestDecoder.decode(&bytes, Permission::ReadOnly),
+            Decoded::PermissionDenied(_)
+        ));
+    }
+
+    #[test]
+    fn add_instrument_as_operator_is_permitted() {
+        let bytes = encode(
+            &Request::AddInstrument {
+                spec: InstrumentSpec {
+                    symbol: Symbol(1),
+                    base: CurrencyId(1),
+                    quote: CurrencyId(2),
+                },
+            },
+            7,
+        );
+        assert!(matches!(
+            TradingRequestDecoder.decode(&bytes, Permission::Operator),
+            Decoded::Permitted { .. }
+        ));
+    }
+
+    #[test]
+    fn add_instrument_as_trader_is_denied() {
+        let bytes = encode(
+            &Request::AddInstrument {
+                spec: InstrumentSpec {
+                    symbol: Symbol(1),
+                    base: CurrencyId(1),
+                    quote: CurrencyId(2),
+                },
+            },
+            0,
+        );
+        assert!(matches!(
+            TradingRequestDecoder.decode(&bytes, Permission::Trader),
+            Decoded::PermissionDenied(_)
+        ));
+    }
+
+    #[test]
+    fn deposit_as_custodian_is_permitted() {
+        let bytes = encode(
+            &Request::Deposit {
+                account: AccountId(1),
+                currency: CurrencyId(1),
+                amount: 100,
+            },
+            3,
+        );
+        assert!(matches!(
+            TradingRequestDecoder.decode(&bytes, Permission::Custodian),
+            Decoded::Permitted { .. }
+        ));
+    }
+
+    #[test]
+    fn deposit_as_trader_is_denied() {
+        let bytes = encode(
+            &Request::Deposit {
+                account: AccountId(1),
+                currency: CurrencyId(1),
+                amount: 100,
+            },
+            0,
+        );
+        assert!(matches!(
+            TradingRequestDecoder.decode(&bytes, Permission::Trader),
+            Decoded::PermissionDenied(_)
+        ));
+    }
+
+    #[test]
+    fn query_stats_is_permitted_and_flagged() {
+        // QueryStats is an operator-only request — see
+        // `Request::requires_operator`.
+        let bytes = encode(&Request::QueryStats, 1);
+        match TradingRequestDecoder.decode(&bytes, Permission::Operator) {
+            Decoded::Permitted { event, .. } => {
+                assert!(matches!(event, TradingEvent::QueryStats));
+                assert!(event.is_query());
+            }
+            other => panic!("expected Permitted, got {:?}", debug_variant(&other)),
+        }
+    }
+
+    #[test]
+    fn malformed_frame_yields_decode_error() {
+        // Empty bytes can't even fit the request_seq prefix.
+        assert!(matches!(
+            TradingRequestDecoder.decode(&[], Permission::Trader),
+            Decoded::DecodeError(_)
+        ));
+    }
+
+    fn debug_variant<E: AppEvent>(d: &Decoded<E>) -> &'static str {
+        match d {
+            Decoded::Filter => "Filter",
+            Decoded::Permitted { .. } => "Permitted",
+            Decoded::PermissionDenied(_) => "PermissionDenied",
+            Decoded::DecodeError(_) => "DecodeError",
+        }
     }
 }
