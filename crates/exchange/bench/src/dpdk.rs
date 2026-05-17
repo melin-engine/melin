@@ -27,7 +27,10 @@ use melin_protocol::codec;
 use melin_protocol::message::ResponseKind;
 
 use crate::generator;
-use crate::{BenchPhases, TimeSeries, maybe_sample, print_results, spawn_progress_reporter};
+use crate::{
+    BenchPhases, OutcomeReport, TimeSeries, enforce_rejection_threshold, maybe_sample,
+    print_results, spawn_progress_reporter,
+};
 
 /// TCP socket buffer size. 64KB gives plenty of headroom for pipelined
 /// frames in flight.
@@ -69,6 +72,10 @@ struct DpdkBenchConn {
     /// Open-loop scheduler when `--target-rate > 0`. Built after auth
     /// handshake so its TSC anchor is close to the measurement start.
     pacer: Option<crate::PaceClock>,
+    /// Counts every execution-report variant received on this
+    /// connection. Folded into the run-wide [`OutcomeReport`] after the
+    /// poll loop exits.
+    outcomes: OutcomeReport,
 }
 
 /// DPDK benchmark configuration.
@@ -90,6 +97,7 @@ pub struct DpdkBenchConfig {
 /// Run the DPDK roundtrip benchmark.
 #[allow(clippy::too_many_arguments)]
 pub fn run_dpdk_roundtrip(
+    max_reject_pct: f64,
     config: DpdkBenchConfig,
     phases: BenchPhases,
     window: usize,
@@ -368,6 +376,7 @@ pub fn run_dpdk_roundtrip(
             send_pending: Vec::new(),
             inflight_ts: VecDeque::with_capacity(window),
             pacer: None,
+            outcomes: OutcomeReport::default(),
         });
 
         // Wait for TCP handshake to complete.
@@ -693,34 +702,51 @@ pub fn run_dpdk_roundtrip(
                 }
 
                 let payload = &conn.parse_buf[cursor + 4..cursor + 4 + frame_len];
-                if let Ok(response) = codec::decode_response(payload)
-                    && matches!(response, ResponseKind::BatchEnd)
-                {
-                    // Always pop the inflight entry to keep the FIFO
-                    // aligned with sends — without this, cooldown
-                    // completions would leak the queue.  Phase
-                    // classification by *receive* time, reusing the
-                    // outer-iter `now`: past `measured_end` we discard
-                    // the sample, before `warmup_end` we discard too.
-                    if let Some(sent_tsc) = conn.inflight_ts.pop_front()
-                        && now >= deadlines.warmup_end
-                        && now < deadlines.measured_end
-                    {
-                        if measured_start.is_none() {
-                            measured_start = Some(now);
-                        }
-                        let latency_ns = crate::tsc_to_ns(crate::rdtscp() - sent_tsc, ticks_per_ns);
-                        histogram.record(latency_ns).ok();
-                        interval_hist.record(latency_ns).ok();
-                        interval_count += 1;
-                        maybe_sample(&mut interval_hist, &mut interval_count, &mut series, start);
-                        progress.fetch_add(1, Ordering::Relaxed);
-                        #[cfg(feature = "latency-trace")]
+                if let Ok(response) = codec::decode_response(payload) {
+                    if matches!(response, ResponseKind::BatchEnd) {
+                        // Capture `rdtscp()` BEFORE any per-frame
+                        // bookkeeping (outcome tally below) so the
+                        // histogram reflects only the wire roundtrip.
+                        // Always pop the inflight entry to keep the FIFO
+                        // aligned with sends — without this, cooldown
+                        // completions would leak the queue. Phase
+                        // classification by *receive* time, reusing the
+                        // outer-iter `now`: past `measured_end` we
+                        // discard the sample, before `warmup_end` too.
+                        if let Some(sent_tsc) = conn.inflight_ts.pop_front()
+                            && now >= deadlines.warmup_end
+                            && now < deadlines.measured_end
                         {
-                            work_done_this_iter = true;
+                            if measured_start.is_none() {
+                                measured_start = Some(now);
+                            }
+                            let latency_ns =
+                                crate::tsc_to_ns(crate::rdtscp() - sent_tsc, ticks_per_ns);
+                            histogram.record(latency_ns).ok();
+                            interval_hist.record(latency_ns).ok();
+                            interval_count += 1;
+                            maybe_sample(
+                                &mut interval_hist,
+                                &mut interval_count,
+                                &mut series,
+                                start,
+                            );
+                            progress.fetch_add(1, Ordering::Relaxed);
+                            #[cfg(feature = "latency-trace")]
+                            {
+                                work_done_this_iter = true;
+                            }
                         }
                     }
+                    // Outcome tally runs *after* the latency capture
+                    // above so this counter increment is not billed to
+                    // the wire roundtrip.
+                    conn.outcomes.record(&response);
                 }
+                // Decode errors are dropped intentionally: malformed
+                // frames from the server are not the bench's
+                // responsibility to diagnose, and panicking would mask
+                // genuine throughput regressions during a long run.
 
                 cursor += 4 + frame_len;
             }
@@ -829,6 +855,13 @@ pub fn run_dpdk_roundtrip(
         None => crate::stats_client::Body::Empty,
     };
 
+    // Fold per-connection outcome counters. Single-threaded DPDK loop so
+    // no atomics needed; we just sum across the conn vector.
+    let mut outcomes = OutcomeReport::default();
+    for conn in &connections {
+        outcomes.merge(&conn.outcomes);
+    }
+
     print_results(
         "Roundtrip",
         histogram.len() as usize,
@@ -841,7 +874,10 @@ pub fn run_dpdk_roundtrip(
         &health_poller.map(|p| p.stop()).unwrap_or_default(),
         &server_stages,
         pacing_report.as_ref(),
+        Some(&outcomes),
     );
+
+    enforce_rejection_threshold(&outcomes, max_reject_pct);
 }
 
 /// Run the auth handshake for all connections over smoltcp.

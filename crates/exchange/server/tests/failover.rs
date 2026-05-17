@@ -1421,6 +1421,12 @@ fn bench_binary_journals_contiguous_across_checkpoint_boundary() {
         "10",
         "--instruments",
         "2",
+        // This test exercises journal shape, not acceptance ratios. With
+        // only 10 accounts and 2 instruments the generator naturally
+        // produces a high reject rate (self-trade prevention, balance
+        // limits). Disable the bench's rejection gate so the test isn't
+        // sensitive to that incidental fact.
+        "--max-reject-pct=100",
     ]);
     let bench_status = bench_cmd
         .stdout(Stdio::inherit())
