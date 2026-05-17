@@ -14,3 +14,5 @@ pub mod ack_queue;
 pub mod catchup;
 pub mod metrics;
 pub mod protocol;
+
+pub use metrics::ReplicationMetrics;

@@ -65,11 +65,11 @@ mod tcp_sender;
 // here so the module's public API surface (e.g.
 // `melin_server::replication::Ack` / `::ReplicationMetrics`) is
 // unchanged for downstream consumers and tests.
+pub use melin_transport_core::replication::ReplicationMetrics;
 pub use melin_transport_core::replication::ack_queue::{
     PendingAck, PendingAckQueue, try_flush_dual_track, update_dual_replication_cursor,
     wait_for_journal_cursor,
 };
-pub use melin_transport_core::replication::metrics::ReplicationMetrics;
 pub use melin_transport_core::replication::protocol::{
     Ack, Handshake, PrimaryMessage, ReplicaMessage,
 };

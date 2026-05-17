@@ -6,7 +6,7 @@
 //!    Backward-compatible with Kubernetes TCP probes and `nc`.
 //! 2. **HTTP `GET /`**: wraps the one-line status in an HTTP 200 response.
 //! 3. **HTTP `GET /metrics`**: returns Prometheus text exposition format with
-//!    all engine counters.
+//!    all pipeline and replication counters.
 //!
 //! ## Plain-text response format
 //!
@@ -45,7 +45,7 @@ pub struct HealthState {
     pub pipeline_healthy: Arc<AtomicBool>,
     pub replicas_connected: Option<Arc<AtomicU32>>,
     /// Per-replica replication metrics. None in standalone mode.
-    pub replication_metrics: Option<Arc<crate::replication::metrics::ReplicationMetrics>>,
+    pub replication_metrics: Option<Arc<crate::replication::ReplicationMetrics>>,
     /// Per-slot replication-ring producer cursors. Paired index-wise with
     /// `replication_ring_consumer_cursors` to compute per-slot ring depth
     /// (producer - consumer). `None` in standalone mode.
