@@ -405,10 +405,10 @@ impl App {
     /// Handle a character typed into a number/cancel input field.
     fn type_char(&mut self, c: char) {
         match &mut self.screen {
-            Screen::NumberInput { buf, .. } | Screen::CancelInput { buf, .. } => {
-                if c.is_ascii_digit() {
-                    buf.push(c);
-                }
+            Screen::NumberInput { buf, .. } | Screen::CancelInput { buf, .. }
+                if c.is_ascii_digit() =>
+            {
+                buf.push(c);
             }
             _ => {}
         }

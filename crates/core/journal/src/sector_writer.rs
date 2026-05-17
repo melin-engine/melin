@@ -163,8 +163,48 @@ pub struct SectorWriter<E: AppEvent> {
     /// every flush; `write_pos` advances only when this sector is full.
     /// Allocated as MAX_SECTOR_SIZE bytes so it works for both 512 and 4096;
     /// only `sector_size` bytes are used at runtime.
+    ///
+    /// **Load-bearing invariant for new code — do not break:** while
+    /// `tail_sector_len > 0`, the bytes `tail_sector[..tail_sector_len]`
+    /// MUST equal what's on disk at `[write_pos, write_pos + tail_sector_len)`.
+    /// Any subsequent write at `write_pos` MUST therefore include this
+    /// prefix; otherwise the next pwrite truncates the previously-written
+    /// tail bytes (O_DIRECT overwrites the whole sector — there is no
+    /// "append only" mode at the device level).
+    ///
+    /// Today this is maintained because *every* write to `write_pos` is
+    /// sourced from `tail_sector` itself — `flush_to_sectors`
+    /// reconstructs the full sector by prepending the tail to the new
+    /// batch (see `copy_from_slice` of `tail_sector[..tail_sector_len]`
+    /// into `batch_buf[..tail_sector_len]`), and
+    /// `take_batch_for_async_write` keeps appending into `tail_sector`
+    /// and sync-pwrites it as-is. Only `open_append` constructs the
+    /// initial tail content, and it does so by reading the on-disk sector
+    /// back into the buffer.
+    ///
+    /// Things that would silently corrupt the journal if added carelessly:
+    /// 1. A code path that resets `tail_sector_len = 0` without first
+    ///    advancing `write_pos` past the partial sector (or without first
+    ///    issuing a flush that absorbs the bytes).
+    /// 2. A pwrite at `write_pos` sourced from a buffer that doesn't
+    ///    include the existing `tail_sector[..tail_sector_len]` as its
+    ///    prefix.
+    /// 3. Rotation / writer hand-off that takes ownership of `self`
+    ///    without first calling `flush_batch_sync` to commit the tail
+    ///    state (the rotated segment would then start with stale tail
+    ///    content from `tail_sector`).
+    ///
+    /// This is a state-machine invariant, not a range-bounds invariant,
+    /// so it can't be reduced to a single API surface the way
+    /// `zero_unwritten_through` did for the prealloc-zero bug. The
+    /// principled fix would be phantom-typed writer states; the surface
+    /// is small enough today that the load-bearing-comment approach is
+    /// the pragmatic call. Revisit if a third "looks-correct, silently
+    /// truncates" bug shows up in this area.
     tail_sector: Box<AlignedBuf<MAX_SECTOR_SIZE>>,
     /// Bytes of real data in `tail_sector`. Always < sector_size.
+    /// See `tail_sector`'s docstring for the on-disk-equality invariant
+    /// that ties `tail_sector_len` to the writer's `write_pos`.
     tail_sector_len: usize,
 }
 
@@ -1292,14 +1332,45 @@ impl<E: AppEvent> SectorWriter<E> {
     ///
     /// O_DIRECT writes are sector-aligned; we extend the prealloc as soon as
     /// the next sector would land past `allocated_end`.
+    ///
+    /// Data-loss safety lives in [`Self::zero_unwritten_through`] rather
+    /// than here: this function only has to ask "extend the prealloc
+    /// past where we're about to write" and the helper takes care of
+    /// only zeroing bytes the writer hasn't placed yet.
     fn ensure_allocated(&mut self) -> Result<(), JournalError> {
         if self.write_pos + self.sector_size as u64 <= self.allocated_end {
             return Ok(());
         }
-        let old_end = self.allocated_end;
         self.allocated_end = preallocate(&self.file, self.write_pos)?;
-        zero_range_extents(&self.file, old_end, self.allocated_end);
+        self.zero_unwritten_through(self.allocated_end);
         Ok(())
+    }
+
+    /// Zero the byte range strictly past the writer's frontier
+    /// (`write_pos`) up to `end`, via `FALLOC_FL_ZERO_RANGE`.
+    ///
+    /// **The invariant this API encodes**: the start of the zero range
+    /// is *always* the writer's frontier, computed internally. Callers
+    /// can only choose the *upper* bound, so they can't accidentally
+    /// re-zero bytes the writer has already placed past the previous
+    /// `allocated_end`. That class of bug (a stale `old_end` used as
+    /// the start) is unreachable through this method.
+    ///
+    /// Both write paths — sync (`flush_to_sectors`) and async
+    /// (`take_batch_for_async_write`) — can issue a single multi-sector
+    /// `pwrite` that the kernel auto-extends past `allocated_end`. By
+    /// the time we get here to extend the prealloc, `write_pos` may
+    /// already be past the old `allocated_end`; the `<=` guard ensures
+    /// we don't ask the kernel to zero a degenerate or backwards range.
+    ///
+    /// The raw [`zero_range_extents`] helper is retained for one-shot
+    /// initialisation sites (create-time, segment preparer) where the
+    /// start is a compile-time constant and no writer frontier exists
+    /// yet.
+    fn zero_unwritten_through(&self, end: u64) {
+        if self.write_pos < end {
+            zero_range_extents(&self.file, self.write_pos, end);
+        }
     }
 
     /// Allocate two zeroed sector-aligned batch buffers (batch_buf + spare_buf).
@@ -2087,6 +2158,83 @@ mod tests {
             first_live_seq,
             last_archived_seq + 1,
             "expected contiguous sequence across rotation boundary"
+        );
+    }
+
+    /// Regression: `ensure_allocated` must not zero data the writer has
+    /// already placed past the previous `allocated_end`.
+    ///
+    /// A single `flush_to_sectors` (or `take_batch_for_async_write`)
+    /// call can issue a multi-sector `pwrite` that advances `write_pos`
+    /// well past the current `allocated_end` — the kernel auto-extends
+    /// the file to absorb the write. The *next* `ensure_allocated`
+    /// then sees `write_pos > allocated_end`, calls `preallocate`,
+    /// and follows up with `FALLOC_FL_ZERO_RANGE` over the
+    /// newly-allocated region. Before the fix that zero-range started
+    /// at the stale `old_end` and wiped every byte in
+    /// `[old_end, write_pos)` — punching ~180 KB holes into the
+    /// journal under load.
+    ///
+    /// This test shrinks the prealloc chunk so a single batch easily
+    /// overflows it, then verifies every event is recoverable.
+    /// Without the fix the reader returns far fewer entries than were
+    /// written (the bytes between `old_end` and `write_pos` are
+    /// zeroed, so the reader stops at the first zero-magic sector).
+    #[test]
+    fn ensure_allocated_preserves_data_written_past_preallocation() {
+        use crate::prealloc::PreallocOverrideGuard;
+        use crate::write::JournalWrite;
+
+        // Shrink the prealloc chunk so `flush_to_sectors`' multi-sector
+        // pwrite easily exceeds it in one go. The guard scopes the
+        // override to this test and serialises with any other test
+        // using the same mechanism.
+        let _guard = PreallocOverrideGuard::new(8 * 1024);
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("regression.journal");
+        let mut writer = SectorWriter::<TestEvent>::create(&path).unwrap();
+
+        // Batch-encode ~100 KiB of events without flushing — about 12×
+        // the 8 KiB prealloc chunk. When `flush_batch_sync` issues the
+        // single multi-sector pwrite below, `write_pos` advances well
+        // past `allocated_end` and the file auto-extends.
+        const N: u64 = 2000;
+        for i in 0..N {
+            writer
+                .batch_append_with_ts(&JournalEvent::App(TestEvent(i)), 0, 0, 0)
+                .unwrap();
+        }
+        writer.flush_batch_sync().unwrap();
+
+        // Append + flush one more event. This triggers `ensure_allocated`
+        // with `write_pos` far past the stale `allocated_end` — exactly
+        // the condition the fix guards against. Pre-fix:
+        // `zero_range_extents(file, old_end, new_end)` wipes the bytes
+        // the previous batch wrote between `old_end` and `write_pos`.
+        // Post-fix: `zero_unwritten_through` derives the start from
+        // `write_pos` internally and only touches truly-new bytes.
+        writer.append(&JournalEvent::App(TestEvent(9_999))).unwrap();
+        drop(writer);
+
+        // Round-trip every event. Pre-fix this surfaces either a
+        // `ChecksumMismatch` (the reader's hardening rejects the hole
+        // because real entries exist after it) or short recovery (the
+        // reader stops at the first zero-magic sector inside the hole).
+        let entries = read_all(&path);
+        assert_eq!(
+            entries.len(),
+            (N + 1) as usize,
+            "ensure_allocated wiped journal data: recovered {} of {}",
+            entries.len(),
+            N + 1
+        );
+        for (i, e) in entries.iter().take(N as usize).enumerate() {
+            assert_eq!(e.event, JournalEvent::App(TestEvent(i as u64)));
+        }
+        assert_eq!(
+            entries[N as usize].event,
+            JournalEvent::App(TestEvent(9_999))
         );
     }
 }

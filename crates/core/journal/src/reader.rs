@@ -184,15 +184,112 @@ impl<E: AppEvent> JournalReader<E> {
                         }
                         // Truly truncated — crash recovery case.
                         Err(JournalError::TruncatedEntry) => Ok(None),
-                        Err(e) => Err(e),
+                        Err(e) => self.classify_decode_error(e),
                     }
                 } else {
                     // No more data available — truncated at EOF.
                     Ok(None)
                 }
             }
-            Err(e) => Err(e),
+            Err(e) => self.classify_decode_error(e),
         }
+    }
+
+    /// Defense in depth: distinguish "walked into a partially-initialised
+    /// region of a preallocated segment" from real corruption / data loss.
+    ///
+    /// Bytes past the writer's last fully-durable entry may legitimately
+    /// look entry-shaped under specific failure modes (e.g. an in-flight
+    /// async write whose CQE has not yet arrived, or a torn write where
+    /// the header sectors landed but the trailing CRC sector did not). In
+    /// every such case the CRC slot on disk reads as `0x00000000` — the
+    /// preallocation pattern — because no write ever placed real CRC
+    /// bytes there. Treat that signature as end-of-data **only** when the
+    /// rest of the file is genuinely preallocation zeros: a zero-CRC in
+    /// the middle of a file with more entry-shaped bytes after it is a
+    /// hole, i.e. *data loss*, and must surface as corruption so recovery
+    /// halts loudly instead of silently truncating the journal.
+    ///
+    /// We only apply the heuristic past genesis (`last_sequence` is set)
+    /// — at the very start of a file, a zero CRC genuinely indicates
+    /// corruption of the first entry.
+    ///
+    /// The log line is `warn` so the event is always visible: a
+    /// CRC-32C of valid data CAN coincidentally equal zero (≈1 in 2^32),
+    /// in which case we'd silently drop one real entry. The warning lets
+    /// operators audit every occurrence.
+    fn classify_decode_error(
+        &self,
+        err: JournalError,
+    ) -> Result<Option<JournalEntry<E>>, JournalError> {
+        if let JournalError::ChecksumMismatch { expected, .. } = &err
+            && *expected == 0
+            && self.last_sequence.is_some()
+            && self.tail_is_all_zero_past_suspect()?
+        {
+            tracing::warn!(
+                last_sequence = ?self.last_sequence,
+                valid_file_end = self.valid_file_end,
+                "journal reader stopped on suspected pre-allocated tail \
+                 (CRC slot is zero and rest of file is all zeros); \
+                 treating as end-of-data"
+            );
+            return Ok(None);
+        }
+        Err(err)
+    }
+
+    /// True iff every byte strictly past the suspect entry is zero — i.e.
+    /// the only non-zero bytes left in the file are the malformed entry
+    /// itself, sitting at the writer's last-claimed-durable boundary.
+    ///
+    /// The suspect entry's own bytes are skipped (it's the partial write
+    /// pattern we're choosing to treat as preallocated tail). What we
+    /// must guard against is a *hole*: a CRC=0 entry with real entries
+    /// after it. That signature is data loss and must surface as a hard
+    /// error so recovery halts instead of silently truncating.
+    ///
+    /// Reads are positioned via `read_at` (pread) so they don't disturb
+    /// the buffered reader cursor; chunked so a multi-MB tail doesn't
+    /// allocate a matching buffer.
+    fn tail_is_all_zero_past_suspect(&self) -> Result<bool, JournalError> {
+        use std::os::unix::fs::FileExt;
+        // Recover the suspect entry's total on-disk size from its own
+        // header bytes (which decode parsed cleanly — only the CRC was
+        // wrong). The bytes are still in `self.buffer[self.pos..]`.
+        let data = &self.buffer[self.pos..self.valid];
+        if data.len() < ENTRY_HEADER_SIZE {
+            // Header not fully buffered — be conservative and refuse to
+            // treat as EOF; the caller will surface the original error.
+            return Ok(false);
+        }
+        let (header, _) =
+            EntryHeader::ref_from_prefix(data).map_err(|_| JournalError::TruncatedEntry)?;
+        let payload_len = header.length.get() as usize;
+        let suspect_entry_end =
+            self.valid_file_end + (ENTRY_HEADER_SIZE + payload_len + CRC_SIZE) as u64;
+
+        let file_end = self.file.metadata()?.len();
+        if suspect_entry_end > file_end {
+            // The "entry" claims to extend past EOF — definitely garbage,
+            // and nothing after it to worry about. Safe to treat as EOF.
+            return Ok(true);
+        }
+
+        let mut offset = suspect_entry_end;
+        let mut scratch = [0u8; 8192];
+        while offset < file_end {
+            let want = ((file_end - offset) as usize).min(scratch.len());
+            let n = self.file.read_at(&mut scratch[..want], offset)?;
+            if n == 0 {
+                break;
+            }
+            if scratch[..n].iter().any(|b| *b != 0) {
+                return Ok(false);
+            }
+            offset += n as u64;
+        }
+        Ok(true)
     }
 
     /// Validate sequence continuity, update hash chain, and advance read position.
@@ -783,6 +880,182 @@ mod tests {
         let mut reader = JournalReader::<TestEvent>::open(&path).unwrap();
         let err = reader.next_entry();
         assert!(err.is_err(), "expected error, got {err:?}");
+    }
+
+    /// Defense-in-depth: bytes past the writer's last durable entry can,
+    /// under specific failure modes (e.g. an in-flight async write whose
+    /// CQE hasn't arrived, or a torn multi-sector write), look entry-shaped
+    /// while the CRC slot is still preallocation zeros. The reader treats
+    /// that exact signature (`ChecksumMismatch` with stored CRC = 0, past
+    /// genesis) as end-of-data so recovery succeeds on a journal whose
+    /// last write was only partially observable.
+    #[test]
+    fn zero_crc_past_genesis_treated_as_end_of_data() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.journal");
+        {
+            let mut writer = SectorWriter::<TestEvent>::create(&path).unwrap();
+            writer.append(&JournalEvent::App(TestEvent(1))).unwrap();
+            writer.append(&JournalEvent::App(TestEvent(2))).unwrap();
+        }
+
+        // Discover where the next entry would start.
+        let valid_end = {
+            let mut reader = JournalReader::<TestEvent>::open(&path).unwrap();
+            while reader.next_entry().unwrap().is_some() {}
+            reader.valid_file_end()
+        };
+
+        // Forge an entry past `valid_end` with real-looking header+payload
+        // but a zeroed CRC slot — the exact byte pattern observed when a
+        // multi-sector write lands the header but loses the trailing CRC
+        // sector. Built via `codec::encode` so it parses cleanly, then the
+        // 4-byte CRC tail is zeroed.
+        let mut scratch = [0u8; 256];
+        let entry_len = {
+            let event: JournalEvent<TestEvent> = JournalEvent::App(TestEvent(99));
+            codec::encode(9_999, 0, 0, 0, &event, &mut scratch).unwrap()
+        };
+        scratch[entry_len - CRC_SIZE..entry_len].fill(0);
+
+        use std::io::{Seek, SeekFrom};
+        let mut file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
+        file.seek(SeekFrom::Start(valid_end)).unwrap();
+        file.write_all(&scratch[..entry_len]).unwrap();
+        file.sync_all().unwrap();
+
+        // Reader yields the two real entries (transparent genesis already
+        // consumed under hash-chain) and stops gracefully on the forged
+        // zero-CRC entry instead of surfacing `ChecksumMismatch`.
+        let mut reader = JournalReader::<TestEvent>::open(&path).unwrap();
+        let mut count = 0;
+        while let Some(_entry) = reader.next_entry().unwrap() {
+            count += 1;
+        }
+        assert_eq!(count, 2, "two real entries should be recoverable");
+    }
+
+    /// Inverse guard: a zero CRC at the *very first* entry (no genesis
+    /// consumed yet, `last_sequence == None`) still surfaces as a
+    /// `ChecksumMismatch`. We only relax the check past genesis, so
+    /// corruption of the first entry remains visible.
+    ///
+    /// Runs under both feature configs: under hash-chain, the writer's
+    /// genesis at ENTRY_OFFSET gets overwritten by the forged entry, so
+    /// the reader's first decode hits the CRC check before any
+    /// hash-chain state has been built (`codec::decode` validates CRC
+    /// before returning, and `validate_and_advance` — where hash-chain
+    /// validation lives — only runs on a successful decode). Either way,
+    /// `last_sequence` is still `None` at the moment the mismatch fires.
+    #[test]
+    fn zero_crc_at_first_entry_still_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.journal");
+        {
+            // Create the file header only; no user events.
+            let _writer = SectorWriter::<TestEvent>::create(&path).unwrap();
+        }
+
+        let mut scratch = [0u8; 256];
+        let entry_len = {
+            let event: JournalEvent<TestEvent> = JournalEvent::App(TestEvent(1));
+            codec::encode(1, 0, 0, 0, &event, &mut scratch).unwrap()
+        };
+        scratch[entry_len - CRC_SIZE..entry_len].fill(0);
+
+        use std::io::{Seek, SeekFrom};
+        let mut file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
+        file.seek(SeekFrom::Start(ENTRY_OFFSET)).unwrap();
+        file.write_all(&scratch[..entry_len]).unwrap();
+        file.sync_all().unwrap();
+
+        let mut reader = JournalReader::<TestEvent>::open(&path).unwrap();
+        let err = reader.next_entry();
+        assert!(
+            matches!(err, Err(JournalError::ChecksumMismatch { .. })),
+            "expected ChecksumMismatch at first entry, got {err:?}"
+        );
+    }
+
+    /// Critical guard: a zero-CRC entry followed by more entry-shaped
+    /// bytes is a **hole** in the journal (data loss), not preallocated
+    /// tail. The reader must surface this as an error so recovery halts
+    /// instead of silently truncating the journal to the prefix.
+    ///
+    /// Runs under both feature configs: the CRC mismatch on the forged
+    /// entry fires inside `codec::decode`, before `validate_and_advance`
+    /// (and therefore before any hash-chain check) ever runs.
+    #[test]
+    fn zero_crc_with_data_after_surfaces_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.journal");
+        {
+            let mut writer = SectorWriter::<TestEvent>::create(&path).unwrap();
+            writer.append(&JournalEvent::App(TestEvent(1))).unwrap();
+            writer.append(&JournalEvent::App(TestEvent(2))).unwrap();
+        }
+        let valid_end = {
+            let mut reader = JournalReader::<TestEvent>::open(&path).unwrap();
+            while reader.next_entry().unwrap().is_some() {}
+            reader.valid_file_end()
+        };
+
+        // Encode two entries; zero the CRC of the FIRST one so it reads
+        // as a hole, leaving the SECOND one as real-looking data that
+        // proves the file isn't just preallocated tail.
+        let mut scratch1 = [0u8; 256];
+        let mut scratch2 = [0u8; 256];
+        let len1 = codec::encode(
+            9_999,
+            0,
+            0,
+            0,
+            &JournalEvent::App(TestEvent(98)),
+            &mut scratch1,
+        )
+        .unwrap();
+        let len2 = codec::encode(
+            10_000,
+            0,
+            0,
+            0,
+            &JournalEvent::App(TestEvent(99)),
+            &mut scratch2,
+        )
+        .unwrap();
+        scratch1[len1 - CRC_SIZE..len1].fill(0); // hole marker
+
+        use std::io::{Seek, SeekFrom};
+        let mut file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
+        file.seek(SeekFrom::Start(valid_end)).unwrap();
+        file.write_all(&scratch1[..len1]).unwrap();
+        file.write_all(&scratch2[..len2]).unwrap();
+        file.sync_all().unwrap();
+
+        let mut reader = JournalReader::<TestEvent>::open(&path).unwrap();
+        // Walk past the two real entries — they decode fine.
+        for _ in 0..2 {
+            reader.next_entry().unwrap();
+        }
+        // Hitting the zero-CRC entry with real data after it must
+        // surface as ChecksumMismatch, not silently stop.
+        let err = reader.next_entry();
+        assert!(
+            matches!(err, Err(JournalError::ChecksumMismatch { .. })),
+            "expected ChecksumMismatch (data loss hole), got {err:?}"
+        );
     }
 
     #[test]

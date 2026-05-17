@@ -1178,11 +1178,9 @@ impl Session {
             state.cum_qty += fill_qty_raw;
             // Weighted average: avg_px = (old_avg * old_cum + fill_px * fill_qty) / new_cum
             let old_cum = state.cum_qty - fill_qty_raw;
-            state.avg_px = if state.cum_qty > 0 {
-                (state.avg_px * old_cum + fill_price.get() * fill_qty_raw) / state.cum_qty
-            } else {
-                fill_price.get()
-            };
+            state.avg_px = (state.avg_px * old_cum + fill_price.get() * fill_qty_raw)
+                .checked_div(state.cum_qty)
+                .unwrap_or_else(|| fill_price.get());
 
             // Parse leaves_qty as raw ticks, subtract fill, re-format.
             // If parsing fails (shouldn't happen), treat as fully filled.

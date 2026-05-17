@@ -709,7 +709,7 @@ fn run_engine_bench(
 
     // Print the slowest orders for tail latency diagnosis.
     let mut sorted: Vec<_> = slowest.into_iter().map(|std::cmp::Reverse(e)| e).collect();
-    sorted.sort_by(|a, b| b.0.cmp(&a.0)); // descending by latency
+    sorted.sort_by_key(|b| std::cmp::Reverse(b.0)); // descending by latency
     println!("\n  Slowest {SLOWEST_N} Orders");
     for (latency_ns, event_idx, num_reports, offset_us) in &sorted {
         let event = &events[warmup + event_idx];

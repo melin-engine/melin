@@ -342,12 +342,10 @@ fn replica_stream_uring(
                 }
                 for &(bp_token, bp_result, bp_flags) in &bp_cqes[..bp_count] {
                     match bp_token {
-                        TOKEN_PROVIDE => {
-                            if bp_result < 0 {
-                                debug!(
-                                    "ProvideBuffers re-provision failed during backpressure drain: {bp_result}"
-                                );
-                            }
+                        TOKEN_PROVIDE if bp_result < 0 => {
+                            debug!(
+                                "ProvideBuffers re-provision failed during backpressure drain: {bp_result}"
+                            );
                         }
                         TOKEN_SEND => {
                             if bp_result < 0 {
@@ -705,12 +703,10 @@ fn replica_stream_uring(
                     }
                 }
 
-                TOKEN_PROVIDE => {
-                    // Best-effort re-provision; failures only manifest
-                    // as ENOBUFS later, which we handle by resubmitting.
-                    if result < 0 {
-                        debug!("ProvideBuffers re-provision failed: {result}");
-                    }
+                // Best-effort re-provision; failures only manifest as
+                // ENOBUFS later, which we handle by resubmitting.
+                TOKEN_PROVIDE if result < 0 => {
+                    debug!("ProvideBuffers re-provision failed: {result}");
                 }
 
                 TOKEN_SEND => {

@@ -742,17 +742,39 @@ fn primary_journal_sequences_contiguous_across_checkpoint_boundary() {
         match reader.next_entry() {
             Ok(Some(_)) => count += 1,
             Ok(None) => break,
-            Err(e) => panic!(
-                "journal read error after {count} user entries \
-                 (last_sequence = {:?}): {e}",
-                reader.last_sequence()
-            ),
+            Err(e) => {
+                let dump = dump_journal_for_diagnosis(&path, "primary_journal");
+                panic!(
+                    "journal read error after {count} user entries \
+                     (last_sequence = {:?}, valid_file_end = {}): {e}\n  \
+                     raw journal copied to: {dump}",
+                    reader.last_sequence(),
+                    reader.valid_file_end(),
+                );
+            }
         }
     }
-    assert_eq!(
-        count, total,
-        "expected all {total} user events to be recoverable from the journal"
-    );
+    if count != total {
+        let dump = dump_journal_for_diagnosis(&path, "primary_journal_count");
+        panic!(
+            "expected all {total} user events to be recoverable from the journal, \
+             got {count}\n  raw journal copied to: {dump}"
+        );
+    }
+}
+
+/// Copy a failing journal to a stable `/tmp/` path keyed by test name +
+/// pid so the byte pattern at the read failure can be inspected with
+/// `xxd` after the test panics. Returns the dump path; on any I/O error
+/// returns a short diagnostic instead of panicking inside a panic path.
+#[cfg(all(feature = "hash-chain", not(feature = "no-persist")))]
+fn dump_journal_for_diagnosis(src: &std::path::Path, label: &str) -> String {
+    let pid = std::process::id();
+    let dst = format!("/tmp/journal-failure-{label}-{pid}.dump");
+    match std::fs::copy(src, &dst) {
+        Ok(bytes) => format!("{dst} ({bytes} bytes)"),
+        Err(e) => format!("<failed to copy {}: {e}>", src.display()),
+    }
 }
 
 /// End-to-end primary → replica test. The primary's journal stage
@@ -937,11 +959,16 @@ fn primary_and_replica_journals_contiguous_across_checkpoint_boundary() {
             match reader.next_entry() {
                 Ok(Some(_)) => count += 1,
                 Ok(None) => break,
-                Err(e) => panic!(
-                    "{label} journal read error after {count} user entries \
-                     (last_sequence = {:?}): {e}",
-                    reader.last_sequence()
-                ),
+                Err(e) => {
+                    let dump = dump_journal_for_diagnosis(path, label);
+                    panic!(
+                        "{label} journal read error after {count} user entries \
+                         (last_sequence = {:?}, valid_file_end = {}): {e}\n  \
+                         raw journal copied to: {dump}",
+                        reader.last_sequence(),
+                        reader.valid_file_end(),
+                    );
+                }
             }
         }
         count
@@ -949,6 +976,20 @@ fn primary_and_replica_journals_contiguous_across_checkpoint_boundary() {
 
     let primary_count = scan("primary", &primary_path);
     let replica_count = scan("replica", &replica_path);
+    if primary_count != total {
+        let dump = dump_journal_for_diagnosis(&primary_path, "primary_count");
+        panic!(
+            "expected all {total} user events recoverable from the primary journal, \
+             got {primary_count}\n  raw journal copied to: {dump}"
+        );
+    }
+    if replica_count != total {
+        let dump = dump_journal_for_diagnosis(&replica_path, "replica_count");
+        panic!(
+            "expected all {total} user events recoverable from the replica journal, \
+             got {replica_count}\n  raw journal copied to: {dump}"
+        );
+    }
 
     assert_eq!(
         primary_count, total,
