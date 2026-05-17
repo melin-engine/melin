@@ -24,7 +24,7 @@ compile_error!(
 /// `Exchange::execute` to a single rejection per `SubmitOrder` so the
 /// matching hot path is bypassed, but the type stays uniform for
 /// downstream modules.
-pub type App = exchange_app::ServerApp;
+pub type App = domain::exchange_app::ServerApp;
 
 /// Trading-bound ring-slot aliases. The server operates on the trading
 /// wire format regardless of which mode it's built in (that's the
@@ -91,26 +91,6 @@ pub enum ControlEvent {
 pub mod domain;
 /// Application-agnostic server runtime — accept loop, frame reader,
 /// durability policy, admin endpoint, replication, DPDK transport.
-/// Submodules are re-exported at the crate root below so existing
-/// `melin_server::server` / `melin_server::replication` style paths
-/// keep working.
+/// Generic in shape; the long-term plan is to make it parametric
+/// over `A: Application` and move it into `crates/core/`.
 pub mod runtime;
-
-// Re-export submodules at the crate root to preserve the existing
-// public API surface and keep intra-crate `crate::server::X` /
-// `crate::request::X` paths working unchanged after the
-// runtime/domain split.
-pub use domain::{exchange_app, request};
-pub use runtime::{admin, durability_policy, replication, server};
-// `reader` and `response` were private in the pre-split layout —
-// keep them crate-private to preserve the existing public API.
-pub(crate) use domain::response;
-pub(crate) use runtime::reader;
-
-#[cfg(all(feature = "trading", not(feature = "skip-order-exec")))]
-pub use domain::event_publisher;
-
-#[cfg(feature = "dpdk")]
-pub use domain::dpdk_response;
-#[cfg(feature = "dpdk")]
-pub use runtime::dpdk_transport;

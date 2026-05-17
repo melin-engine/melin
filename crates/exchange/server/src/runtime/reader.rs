@@ -818,11 +818,11 @@ fn process_frames<R>(
             }
         };
 
-        if crate::request::should_filter(&request) {
+        if crate::domain::request::should_filter(&request) {
             continue;
         }
 
-        if let Err(reason) = crate::request::check_permission(&request, conn.permission) {
+        if let Err(reason) = crate::domain::request::check_permission(&request, conn.permission) {
             debug!(
                 connection_id = conn.connection_id,
                 reason, "permission denied, dropping request"
@@ -833,7 +833,7 @@ fn process_frames<R>(
         #[allow(clippy::let_unit_value)]
         let recv_ts = mono_trace_ns();
 
-        let event = crate::request::to_event(&request);
+        let event = crate::domain::request::to_event(&request);
 
         // Sequence is allocated by the journal stage in disruptor cursor
         // order — see `InputSlot::sequence`. QueryStats/QueryPosition are

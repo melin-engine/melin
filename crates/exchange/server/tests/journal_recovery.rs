@@ -19,7 +19,7 @@ mod tests {
     // Import the concrete newtype (not the `pub type App = ServerApp`
     // alias) so it's usable as a tuple-struct constructor in `App(...)`.
     use melin_server::BufferedWriter;
-    use melin_server::exchange_app::ServerApp as App;
+    use melin_server::domain::exchange_app::ServerApp as App;
     use melin_trading::trading_event::TradingEvent;
     use melin_types::types::*;
 

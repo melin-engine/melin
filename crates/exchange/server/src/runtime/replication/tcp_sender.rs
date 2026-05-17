@@ -246,9 +246,10 @@ pub fn run_sender(
                     // SO_BUSY_POLL on the sender side: the per-replica thread
                     // spins on `recv` for ack frames, so kernel busy-polling
                     // removes the softirq->wakeup handoff from the ack path.
-                    if let Err(e) =
-                        crate::server::set_busy_poll(&stream, crate::server::BUSY_POLL_US)
-                    {
+                    if let Err(e) = crate::runtime::server::set_busy_poll(
+                        &stream,
+                        crate::runtime::server::BUSY_POLL_US,
+                    ) {
                         debug!(error = %e, "failed to set SO_BUSY_POLL on replica connection");
                     }
 

@@ -927,7 +927,7 @@ pub fn run_receiver_dpdk<W>(
     promote: &AtomicBool,
     snapshot_interval_ms: u64,
     snapshot_path: std::path::PathBuf,
-    cores: crate::server::PipelineCores,
+    cores: crate::runtime::server::PipelineCores,
     receiver_core: usize,
     group_commit_delay: std::time::Duration,
     pipeline_depth: usize,
@@ -958,7 +958,7 @@ where
                 )?
             } else {
                 melin_transport_core::JournaledApp::<App, W>::recover(
-                    crate::server::empty_app(),
+                    crate::runtime::server::empty_app(),
                     journal_path,
                 )?
             };
@@ -966,7 +966,7 @@ where
             let last = next.saturating_sub(1);
             let hash = engine.chain_hash().unwrap_or([0u8; 32]);
             let (mut exchange, writer) = engine.into_parts();
-            crate::server::apply_max_orders(
+            crate::runtime::server::apply_max_orders(
                 &mut exchange,
                 max_orders_per_account,
                 max_orders_per_second,
@@ -1247,8 +1247,8 @@ where
         if journal_writer.is_none() && !primary_genesis_entry.is_empty() {
             let writer =
                 melin_journal::create_fresh_replica::<_, W>(journal_path, &primary_genesis_entry)?;
-            let mut fresh = crate::server::empty_app();
-            crate::server::apply_max_orders(
+            let mut fresh = crate::runtime::server::empty_app();
+            crate::runtime::server::apply_max_orders(
                 &mut fresh,
                 max_orders_per_account,
                 max_orders_per_second,

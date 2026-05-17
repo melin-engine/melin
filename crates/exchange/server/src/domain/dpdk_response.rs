@@ -104,7 +104,7 @@ pub fn run(
     control_rx: mpsc::Receiver<ControlEvent>,
     journal_persisted_wire_seq: Arc<AtomicU64>,
     durability_mode: Arc<std::sync::atomic::AtomicU8>,
-    replication_metrics: Option<Arc<crate::replication::ReplicationMetrics>>,
+    replication_metrics: Option<Arc<crate::runtime::replication::ReplicationMetrics>>,
     replica_active: Option<[Arc<AtomicBool>; 2]>,
     shutdown: &AtomicBool,
     heartbeat_interval: Option<Duration>,
@@ -116,7 +116,7 @@ pub fn run(
     // Mirrors `response::run`: derive the local Policy from the shared
     // mode atomic and observe runtime swaps from the admin
     // `DURABILITY` command.
-    use crate::durability_policy::DurabilityMode;
+    use crate::runtime::durability_policy::DurabilityMode;
     let mut active_mode =
         DurabilityMode::from_u8(durability_mode.load(Ordering::Relaxed)).unwrap_or_else(|| {
             tracing::error!(
@@ -149,16 +149,20 @@ pub fn run(
         let journal_pos = journal_persisted_wire_seq.load(Ordering::Acquire);
         let metrics_ref = replication_metrics.as_deref();
         let active_ref = replica_active.as_ref();
-        let status =
-            crate::response::evaluate_durability(&policy, journal_pos, metrics_ref, active_ref);
+        let status = crate::domain::response::evaluate_durability(
+            &policy,
+            journal_pos,
+            metrics_ref,
+            active_ref,
+        );
         cached_durable_pos = status.durable_pos;
         utilization
             .policy_degraded
             .store(status.degraded, Ordering::Relaxed);
         degraded_logger = if status.degraded {
-            crate::response::DegradationLogger::new_starting_degraded(startup_now, &policy)
+            crate::domain::response::DegradationLogger::new_starting_degraded(startup_now, &policy)
         } else {
-            crate::response::DegradationLogger::new(startup_now)
+            crate::domain::response::DegradationLogger::new(startup_now)
         };
     }
 
@@ -215,7 +219,8 @@ pub fn run(
                     active_mode = next;
                     policy = active_mode.to_policy();
                     cached_durable_pos = 0;
-                    degraded_logger = crate::response::DegradationLogger::new(Instant::now());
+                    degraded_logger =
+                        crate::domain::response::DegradationLogger::new(Instant::now());
                 }
                 None => {
                     tracing::error!(
@@ -298,7 +303,7 @@ pub fn run(
                     let journal_pos = journal_persisted_wire_seq.load(Ordering::Acquire);
                     let metrics_ref = replication_metrics.as_deref();
                     let active_ref = replica_active.as_ref();
-                    let status = crate::response::evaluate_durability(
+                    let status = crate::domain::response::evaluate_durability(
                         &policy,
                         journal_pos,
                         metrics_ref,
@@ -330,7 +335,7 @@ pub fn run(
         let consume_ts = trace::mono_trace_ns();
 
         // Per-slot journal-wait / replica-wait tracker. Same shape as
-        // the TCP response — see `crate::response::GateCrossTracker`
+        // the TCP response — see `crate::domain::response::GateCrossTracker`
         // for the rationale and edge cases.
         #[cfg(feature = "tick-to-trade")]
         let mut gate_tracker;
@@ -351,7 +356,7 @@ pub fn run(
                 .expect("non-empty batch");
             #[cfg(feature = "tick-to-trade")]
             {
-                gate_tracker = crate::response::GateCrossTracker::new(needed);
+                gate_tracker = crate::domain::response::GateCrossTracker::new(needed);
             }
             if cached_durable_pos < needed {
                 loop {
@@ -370,19 +375,20 @@ pub fn run(
                         );
                         active_mode = next;
                         policy = active_mode.to_policy();
-                        degraded_logger = crate::response::DegradationLogger::new(Instant::now());
+                        degraded_logger =
+                            crate::domain::response::DegradationLogger::new(Instant::now());
                     }
 
                     let journal_pos = journal_persisted_wire_seq.load(Ordering::Acquire);
                     let metrics_ref = replication_metrics.as_deref();
                     let active_ref = replica_active.as_ref();
                     let repl_min =
-                        crate::response::connected_persisted_min(metrics_ref, active_ref);
+                        crate::domain::response::connected_persisted_min(metrics_ref, active_ref);
 
                     #[cfg(feature = "tick-to-trade")]
                     gate_tracker.observe(journal_pos, repl_min, trace::mono_trace_ns());
 
-                    let status = crate::response::evaluate_durability(
+                    let status = crate::domain::response::evaluate_durability(
                         &policy,
                         journal_pos,
                         metrics_ref,

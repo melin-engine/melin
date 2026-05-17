@@ -221,8 +221,8 @@ pub struct ServerConfig {
     /// the correct behaviour for a serious deployment that has lost
     /// its replicas. See `docs/replication.md` for the operational
     /// menu.
-    #[arg(long, value_enum, default_value_t = crate::durability_policy::DurabilityMode::Hybrid)]
-    pub durability_mode: crate::durability_policy::DurabilityMode,
+    #[arg(long, value_enum, default_value_t = crate::runtime::durability_policy::DurabilityMode::Hybrid)]
+    pub durability_mode: crate::runtime::durability_policy::DurabilityMode,
 
     /// Yield to the OS scheduler when pipeline threads are idle instead
     /// of busy-spinning. Use on shared machines without isolated cores to
@@ -385,7 +385,7 @@ impl Default for ServerConfig {
             replication_heartbeat_secs: 5,
             replication_pipeline_depth: DEFAULT_REPLICATION_PIPELINE_DEPTH,
             replication_ring_size: 256,
-            durability_mode: crate::durability_policy::DurabilityMode::Hybrid,
+            durability_mode: crate::runtime::durability_policy::DurabilityMode::Hybrid,
             yield_idle: false,
             dpdk_eal_args: String::new(),
             dpdk_ports: vec![0],
@@ -637,7 +637,7 @@ where
         let promote_flag = Arc::new(AtomicBool::new(false));
         let rotate_flag = config.admin_bind.map(|_| Arc::new(AtomicBool::new(false)));
         let _admin_handle = config.admin_bind.map(|addr| {
-            crate::admin::spawn(
+            crate::runtime::admin::spawn(
                 addr,
                 Some(Arc::clone(&promote_flag)),
                 rotate_flag.clone(),
@@ -659,7 +659,7 @@ where
             )),
         };
 
-        match crate::replication::run_receiver::<W>(
+        match crate::runtime::replication::run_receiver::<W>(
             primary_addr,
             &config.journal,
             &signing_key,
@@ -711,7 +711,7 @@ where
     // whenever the admin endpoint is configured.
     let rotate_flag = config.admin_bind.map(|_| Arc::new(AtomicBool::new(false)));
     let _admin_handle = config.admin_bind.map(|addr| {
-        crate::admin::spawn(
+        crate::runtime::admin::spawn(
             addr,
             None,
             rotate_flag.clone(),
@@ -877,7 +877,7 @@ where
     // satisfied. `hybrid` and `durably-replicated` would stall the gate
     // forever; reject loudly at startup with the fix in the message.
     if config.standalone
-        && config.durability_mode != crate::durability_policy::DurabilityMode::Local
+        && config.durability_mode != crate::runtime::durability_policy::DurabilityMode::Local
     {
         return Err(format!(
             "--standalone requires --durability-mode local; got `{}` (this mode needs at least one connected replica)",
@@ -1042,9 +1042,11 @@ where
 
     // ReplicationMetrics must be constructed before the response thread
     // spawns so the gate can read per-slot cursors at every poll.
-    let replication_metrics: Option<Arc<crate::replication::ReplicationMetrics>> =
+    let replication_metrics: Option<Arc<crate::runtime::replication::ReplicationMetrics>> =
         if replication_consumers.is_some() {
-            Some(Arc::new(crate::replication::ReplicationMetrics::default()))
+            Some(Arc::new(
+                crate::runtime::replication::ReplicationMetrics::default(),
+            ))
         } else {
             None
         };
@@ -1058,7 +1060,7 @@ where
     // startup log so what we log matches what's actually live (an
     // operator may have stored a different mode via `DURABILITY`
     // between `run_with_shutdown` and this point).
-    let active_mode_at_start = crate::durability_policy::DurabilityMode::from_u8(
+    let active_mode_at_start = crate::runtime::durability_policy::DurabilityMode::from_u8(
         durability_mode_atomic.load(Ordering::Relaxed),
     )
     .unwrap_or(config.durability_mode);
@@ -1093,10 +1095,10 @@ where
         .name("response".into())
         .spawn(move || {
             melin_app::affinity::pin_thread("response", cores.response);
-            crate::response::run(
+            crate::domain::response::run(
                 output_consumer,
                 control_rx,
-                crate::response::Response {
+                crate::domain::response::Response {
                     journal_persisted_wire_seq: journal_persisted_wire_seq_response,
                     durability_mode: durability_mode_response,
                     replication_metrics: replication_metrics_response,
@@ -1180,8 +1182,8 @@ where
             .name("repl-sender".into())
             .spawn(move || {
                 melin_app::affinity::pin_thread("repl-sender", cores.repl_sender);
-                crate::replication::run_sender(
-                    crate::replication::Sender {
+                crate::runtime::replication::run_sender(
+                    crate::runtime::replication::Sender {
                         bind_addr: repl_bind,
                         repl_consumer_1,
                         repl_consumer_2,
@@ -1480,7 +1482,7 @@ where
     // If shutdown was requested while seed was draining we still spawn the
     // reader so the unified shutdown sequence below joins every thread.
     let reader_shutdown = Arc::new(AtomicBool::new(false));
-    let mut reader_handle = crate::reader::spawn_reader(
+    let mut reader_handle = crate::runtime::reader::spawn_reader(
         input_producer,
         control_tx.clone(),
         config.reader_cores,
@@ -1651,7 +1653,7 @@ where
         }
 
         // Register the reader fd with the io_uring reader thread.
-        reader_handle.register(crate::reader::ReaderRegistration {
+        reader_handle.register(crate::runtime::reader::ReaderRegistration {
             connection_id,
             reader: std_read,
             addr,
@@ -1751,7 +1753,7 @@ where
         let promote_flag = Arc::new(AtomicBool::new(false));
         let rotate_flag = config.admin_bind.map(|_| Arc::new(AtomicBool::new(false)));
         let _admin_handle = config.admin_bind.map(|addr| {
-            crate::admin::spawn(
+            crate::runtime::admin::spawn(
                 addr,
                 Some(Arc::clone(&promote_flag)),
                 rotate_flag.clone(),
@@ -1789,7 +1791,7 @@ where
             }
         };
 
-        match crate::replication::run_receiver_dpdk::<W>(
+        match crate::runtime::replication::run_receiver_dpdk::<W>(
             repl_transport,
             primary_ipv4,
             primary_addr.port(),
@@ -1887,7 +1889,7 @@ where
     // satisfied. `hybrid` and `durably-replicated` would stall the gate
     // forever; reject loudly at startup with the fix in the message.
     if config.standalone
-        && config.durability_mode != crate::durability_policy::DurabilityMode::Local
+        && config.durability_mode != crate::runtime::durability_policy::DurabilityMode::Local
     {
         return Err(format!(
             "--standalone requires --durability-mode local; got `{}` (this mode needs at least one connected replica)",
@@ -1965,7 +1967,8 @@ where
     let mut tx_producers = Vec::with_capacity(num_dpdk_threads);
     let mut tx_consumers = Vec::with_capacity(num_dpdk_threads);
     for _ in 0..num_dpdk_threads {
-        let (tx_out, tx_rx) = melin_disruptor::spsc::channel::<crate::dpdk_response::TxFrame>(4096);
+        let (tx_out, tx_rx) =
+            melin_disruptor::spsc::channel::<crate::domain::dpdk_response::TxFrame>(4096);
         tx_producers.push(tx_out);
         tx_consumers.push(tx_rx);
     }
@@ -1979,7 +1982,7 @@ where
     let mut journal_stage = journal_stage;
     let rotate_flag = config.admin_bind.map(|_| Arc::new(AtomicBool::new(false)));
     let _admin_handle = config.admin_bind.map(|addr| {
-        crate::admin::spawn(
+        crate::runtime::admin::spawn(
             addr,
             None,
             rotate_flag.clone(),
@@ -2022,14 +2025,16 @@ where
 
     // ReplicationMetrics must be constructed before the response thread
     // spawns so the gate can read per-slot cursors at every poll.
-    let replication_metrics: Option<Arc<crate::replication::ReplicationMetrics>> =
+    let replication_metrics: Option<Arc<crate::runtime::replication::ReplicationMetrics>> =
         if replication_consumers.is_some() {
-            Some(Arc::new(crate::replication::ReplicationMetrics::default()))
+            Some(Arc::new(
+                crate::runtime::replication::ReplicationMetrics::default(),
+            ))
         } else {
             None
         };
 
-    let active_mode_at_start = crate::durability_policy::DurabilityMode::from_u8(
+    let active_mode_at_start = crate::runtime::durability_policy::DurabilityMode::from_u8(
         durability_mode_atomic.load(Ordering::Relaxed),
     )
     .unwrap_or(config.durability_mode);
@@ -2061,7 +2066,7 @@ where
         .name("response".into())
         .spawn(move || {
             melin_app::affinity::pin_thread("response", cores.response);
-            crate::dpdk_response::run(
+            crate::domain::dpdk_response::run(
                 output_consumer,
                 control_rx,
                 journal_persisted_wire_seq_response,
@@ -2178,7 +2183,7 @@ where
             .add_listener(repl_port)
             .map_err(|e| format!("add replication listener: {e}"))?;
 
-        let driver = crate::replication::DpdkReplicationDriver::new(
+        let driver = crate::runtime::replication::DpdkReplicationDriver::new(
             [repl_consumer_1, repl_consumer_2],
             repl_cursor,
             fastest_repl_cursor,
@@ -2389,7 +2394,7 @@ where
     let transport_0 = transports.pop().expect("one client transport");
     let tx_rx_0 = tx_consumers.remove(0);
     melin_app::affinity::pin_thread("dpdk-poll-0", reader_cores);
-    crate::dpdk_transport::run_dpdk_poll(
+    crate::runtime::dpdk_transport::run_dpdk_poll(
         transport_0,
         input_producer,
         control_tx,
@@ -2474,7 +2479,7 @@ pub fn apply_max_orders(
 }
 
 pub(crate) fn empty_app() -> App {
-    crate::exchange_app::ServerApp(melin_engine::exchange::Exchange::with_capacity())
+    crate::domain::exchange_app::ServerApp(melin_engine::exchange::Exchange::with_capacity())
 }
 
 /// Build a fresh, empty application sized for a known bulk-seed workload.
@@ -2488,11 +2493,12 @@ pub(crate) fn empty_app() -> App {
 /// [`empty_app`] because they reconstruct state from snapshots / replicated
 /// frames, both of which already size their HashMap from a known count.
 pub(crate) fn empty_app_for_seed(config: &ServerConfig) -> App {
-    let mut app =
-        crate::exchange_app::ServerApp(melin_engine::exchange::Exchange::with_seed_capacity(
+    let mut app = crate::domain::exchange_app::ServerApp(
+        melin_engine::exchange::Exchange::with_seed_capacity(
             config.accounts as usize,
             config.instruments as usize,
-        ));
+        ),
+    );
     apply_max_orders(
         &mut app,
         config.max_orders_per_account,
@@ -2632,7 +2638,7 @@ fn spawn_event_publisher(
         .name("event-publisher".into())
         .spawn(move || {
             melin_app::affinity::pin_thread("event-publisher", event_core);
-            crate::event_publisher::run(
+            crate::domain::event_publisher::run(
                 event_consumer,
                 event_bind,
                 event_keys,

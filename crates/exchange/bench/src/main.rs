@@ -79,7 +79,7 @@ use melin_protocol::message::ResponseKind;
 #[cfg(not(feature = "dpdk"))]
 use melin_protocol::transport::BlockingTransportListener;
 #[cfg(not(feature = "dpdk"))]
-use melin_server::server::ServerConfig;
+use melin_server::runtime::server::ServerConfig;
 use melin_types::types::*;
 
 /// Number of completed orders between latency time-series samples.
@@ -1188,8 +1188,9 @@ fn run_pipeline_bench(
     use melin_server::{BufferedWriter, JournalWriterMode, SectorWriter};
 
     // Set up exchange with one instrument and funded account.
-    let mut app =
-        melin_server::exchange_app::ServerApp(melin_engine::exchange::Exchange::with_capacity());
+    let mut app = melin_server::domain::exchange_app::ServerApp(
+        melin_engine::exchange::Exchange::with_capacity(),
+    );
     app.add_instrument(InstrumentSpec {
         symbol: Symbol(1),
         base: CurrencyId(1),
@@ -1690,7 +1691,7 @@ fn run_roundtrip_bench(
         // local persistence alone. The default `Hybrid` mode waits for
         // `in_memory>=2` replica acks that never arrive when nothing else
         // is connected, which would stall every response.
-        durability_mode: melin_server::durability_policy::DurabilityMode::Local,
+        durability_mode: melin_server::runtime::durability_policy::DurabilityMode::Local,
         ..ServerConfig::default()
     };
 
@@ -1796,7 +1797,9 @@ fn start_server<L: BlockingTransportListener>(
     std::thread::Builder::new()
         .name("server".into())
         .spawn(move || {
-            if let Err(e) = melin_server::server::run_with_shutdown(listener, config, shutdown) {
+            if let Err(e) =
+                melin_server::runtime::server::run_with_shutdown(listener, config, shutdown)
+            {
                 eprintln!("server error: {e}");
             }
         })

@@ -63,7 +63,7 @@ mod tcp_sender;
 // cursor management, and per-replica metrics now live in
 // `melin_transport_core::replication`. Re-export the public types
 // here so the module's public API surface (e.g.
-// `melin_server::replication::Ack` / `::ReplicationMetrics`) is
+// `melin_server::runtime::replication::Ack` / `::ReplicationMetrics`) is
 // unchanged for downstream consumers and tests.
 pub use melin_transport_core::replication::ReplicationMetrics;
 pub use melin_transport_core::replication::ack_queue::{
@@ -229,7 +229,7 @@ pub(super) struct ReplicaPipelineHandles<W: Send + 'static> {
 pub(super) fn build_replica_pipeline_with_threads<W>(
     exchange: crate::App,
     writer: W,
-    cores: crate::server::PipelineCores,
+    cores: crate::runtime::server::PipelineCores,
     snapshot_interval_ms: u64,
     snapshot_path: std::path::PathBuf,
     group_commit_delay: std::time::Duration,

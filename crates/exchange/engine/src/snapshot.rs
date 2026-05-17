@@ -10,7 +10,7 @@
 //!
 //! On-disk framing (magic, versions, sequence, chain hash, CRC, atomic
 //! rename) lives in `melin_transport_core::snapshot` — generic over the
-//! `melin_app::Application` trait, which `melin_server::exchange_app::ServerApp`
+//! `melin_app::Application` trait, which `melin_server::domain::exchange_app::ServerApp`
 //! implements as a thin newtype around `Exchange`. This module owns the
 //! engine-specific payload bytes only.
 

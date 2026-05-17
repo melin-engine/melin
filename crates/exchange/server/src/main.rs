@@ -30,7 +30,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use clap::Parser;
 #[cfg(not(feature = "dpdk"))]
 use melin_protocol::tcp::BlockingTcpListener;
-use melin_server::server::ServerConfig;
+use melin_server::runtime::server::ServerConfig;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt()
@@ -76,13 +76,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     #[cfg(feature = "dpdk")]
     {
         let dpdk_config = dpdk_config_from(&config);
-        melin_server::server::run_dpdk(config, dpdk_config, shutdown)
+        melin_server::runtime::server::run_dpdk(config, dpdk_config, shutdown)
     }
 
     #[cfg(not(feature = "dpdk"))]
     {
         let listener = BlockingTcpListener::bind(config.bind)?;
-        melin_server::server::run_with_shutdown(listener, config, shutdown)
+        melin_server::runtime::server::run_with_shutdown(listener, config, shutdown)
     }
 }
 
