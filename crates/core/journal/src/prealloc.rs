@@ -15,6 +15,8 @@
 //! 3. `DEFAULT_PREALLOC_CHUNK` (256 MiB) — the production default.
 
 use std::sync::atomic::{AtomicU64, Ordering};
+#[cfg(any(test, feature = "test-utils"))]
+use std::sync::{Mutex, MutexGuard};
 
 /// Default pre-allocation chunk size (256 MiB). Matches the journal
 /// rotation threshold so a freshly created journal never needs mid-run
@@ -49,4 +51,51 @@ pub(crate) fn prealloc_chunk_bytes() -> u64 {
 #[cfg(any(test, feature = "test-utils"))]
 pub(crate) fn set_override(bytes: Option<u64>) {
     OVERRIDE_BYTES.store(bytes.unwrap_or(0), Ordering::Relaxed);
+}
+
+/// Process-wide lock serialising tests that mutate the prealloc chunk
+/// override. Acquired by [`PreallocOverrideGuard`] so concurrent tests
+/// can't observe each other's intermediate override state — without
+/// this, test A's `set_override(X)` could be overwritten by test B's
+/// `set_override(Y)` while A still expects X.
+#[cfg(any(test, feature = "test-utils"))]
+static OVERRIDE_LOCK: Mutex<()> = Mutex::new(());
+
+/// RAII guard scoping a prealloc chunk override to the lifetime of a
+/// test. Acquires a process-wide lock on construction (so two tests
+/// using this mechanism never race), sets the override, and clears it
+/// on drop — properly bounding the side effect.
+///
+/// Use this in any test that needs to shrink the prealloc chunk
+/// (typically to keep a recovery loop fast or to force
+/// `ensure_allocated` to fire). Falls back to inner-poisoning rather
+/// than panicking if a sibling test panicked while holding the guard,
+/// so one bad test doesn't cascade into the rest of the suite.
+#[cfg(any(test, feature = "test-utils"))]
+pub struct PreallocOverrideGuard {
+    // Held for the lifetime of the guard, released on drop. The
+    // explicit field name keeps the lock alive even if the guard is
+    // bound with `_` — `let _guard = ...` would drop immediately, but
+    // `let _g = ...` and a named struct field both keep it.
+    _lock: MutexGuard<'static, ()>,
+}
+
+#[cfg(any(test, feature = "test-utils"))]
+impl PreallocOverrideGuard {
+    /// Acquire the override lock and install `bytes` as the chunk
+    /// size. Blocks if another guard is currently held. Poison is
+    /// recovered transparently (a panicking test only invalidates
+    /// itself, not the rest of the suite).
+    pub fn new(bytes: u64) -> Self {
+        let lock = OVERRIDE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        set_override(Some(bytes));
+        Self { _lock: lock }
+    }
+}
+
+#[cfg(any(test, feature = "test-utils"))]
+impl Drop for PreallocOverrideGuard {
+    fn drop(&mut self) {
+        set_override(None);
+    }
 }

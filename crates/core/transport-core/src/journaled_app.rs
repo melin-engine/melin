@@ -1034,10 +1034,13 @@ mod tests {
     #[test]
     fn crash_at_every_byte_offset_recovers() {
         // Shrink the prealloc chunk so each recover()-then-append cycle
-        // doesn't pay the default 256 MiB fallocate cost. The override
-        // is process-global but only affects later writes; siblings
-        // that don't depend on prealloc size are unaffected.
-        melin_journal::test_utils::set_prealloc_chunk_bytes_override(Some(1024 * 1024));
+        // doesn't pay the default 256 MiB fallocate cost. The guard
+        // scopes the override to this test and serialises with any
+        // sibling test using the same mechanism — without it, the old
+        // permanent setter could let an 8 KiB override (from
+        // sector_writer's regression test, were it in the same binary)
+        // leak across siblings and corrupt assumptions.
+        let _prealloc_guard = melin_journal::test_utils::PreallocOverrideGuard::new(1024 * 1024);
 
         let dir = tempfile::tempdir().unwrap();
         let original = dir.path().join("original.journal");
@@ -1122,8 +1125,10 @@ mod tests {
     fn crash_during_snapshot_rotation_recovers() {
         // Shrink the prealloc chunk so each iteration's
         // `recover_from_snapshot` doesn't pay the default 256 MiB
-        // fallocate for the new live segment.
-        melin_journal::test_utils::set_prealloc_chunk_bytes_override(Some(1024 * 1024));
+        // fallocate for the new live segment. RAII guard scopes the
+        // override to this test and serialises with any sibling test
+        // using the same mechanism.
+        let _prealloc_guard = melin_journal::test_utils::PreallocOverrideGuard::new(1024 * 1024);
 
         let dir = tempfile::tempdir().unwrap();
         let journal_path = dir.path().join("rotation.journal");

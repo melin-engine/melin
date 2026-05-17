@@ -1294,14 +1294,16 @@ impl<E: AppEvent> SectorWriter<E> {
     /// the next sector would land past `allocated_end`.
     ///
     /// **Data-loss guard**: the post-fallocate `FALLOC_FL_ZERO_RANGE` must
-    /// only touch bytes the writer has not yet written. A single
-    /// `take_batch_for_async_write` call can advance `write_pos` by many
-    /// sectors in one go — far past the previous `allocated_end` — and the
-    /// underlying `pwrite` auto-extends the file to absorb those writes.
-    /// If we then zeroed `[old_end, new_allocated_end)`, we'd silently wipe
-    /// every byte between `old_end` and the now-advanced `write_pos`,
-    /// punching a hole into the middle of the journal. Start the zero-range
-    /// at `max(old_end, write_pos)` so already-written data is preserved.
+    /// only touch bytes the writer has not yet written. Both write paths
+    /// — sync (`flush_to_sectors`) and async
+    /// (`take_batch_for_async_write`) — can issue a single multi-sector
+    /// `pwrite` that advances `write_pos` far past the previous
+    /// `allocated_end`; the kernel auto-extends the file to absorb the
+    /// write. If we then zeroed `[old_end, new_allocated_end)`, we'd
+    /// silently wipe every byte between `old_end` and the now-advanced
+    /// `write_pos`, punching a hole into the middle of the journal.
+    /// Start the zero-range at `max(old_end, write_pos)` so
+    /// already-written data is preserved.
     fn ensure_allocated(&mut self) -> Result<(), JournalError> {
         if self.write_pos + self.sector_size as u64 <= self.allocated_end {
             return Ok(());
@@ -2120,22 +2122,16 @@ mod tests {
     /// Without the fix the reader returns far fewer entries than were
     /// written (the bytes between `old_end` and `write_pos` are
     /// zeroed, so the reader stops at the first zero-magic sector).
-    ///
-    /// **Side effect**: this test installs an 8 KiB prealloc override
-    /// that persists for the test-binary lifetime (per the documented
-    /// `prealloc::set_override` contract). The only sibling test that
-    /// reads `prealloc_chunk_bytes` is
-    /// `create_initializes_header_and_preallocates`, which asserts
-    /// `file_len >= prealloc_chunk_bytes()` — robust to either chunk
-    /// value because the file size is fixed at create time and the
-    /// assertion reads the override at the same point.
     #[test]
     fn ensure_allocated_preserves_data_written_past_preallocation() {
+        use crate::prealloc::PreallocOverrideGuard;
         use crate::write::JournalWrite;
 
         // Shrink the prealloc chunk so `flush_to_sectors`' multi-sector
-        // pwrite easily exceeds it in one go.
-        crate::prealloc::set_override(Some(8 * 1024));
+        // pwrite easily exceeds it in one go. The guard scopes the
+        // override to this test and serialises with any other test
+        // using the same mechanism.
+        let _guard = PreallocOverrideGuard::new(8 * 1024);
 
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("regression.journal");

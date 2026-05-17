@@ -219,7 +219,7 @@ impl<E: AppEvent> JournalReader<E> {
     /// in which case we'd silently drop one real entry. The warning lets
     /// operators audit every occurrence.
     fn classify_decode_error(
-        &mut self,
+        &self,
         err: JournalError,
     ) -> Result<Option<JournalEntry<E>>, JournalError> {
         if let JournalError::ChecksumMismatch { expected, .. } = &err
