@@ -347,4 +347,167 @@ mod tests {
         assert_eq!(chain, [0xAB; 32]); // chain hash from SeqLock
         assert_eq!(restored.total, 1500);
     }
+
+    // ------------------------------------------------------------------
+    // dispatch_event contract tests
+    //
+    // dispatch_event has four observable behaviours:
+    //   - App events advance per-key HWM (gated on !is_query) and reach
+    //     Application::apply
+    //   - Query events skip the HWM advance
+    //   - `timestamp_ns` drives a monotonic Application::tick drain
+    //   - Transport variants (Tick / GenesisHash / Checkpoint / Shutdown)
+    //     are handled without touching app-event state
+    //
+    // Each test below pins one of those behaviours. The fixture is the
+    // app-agnostic TestApp — we used to cross-check against a real
+    // trading Exchange + its direct method API, but that's the engine's
+    // job; here we only validate dispatch_event's control flow.
+    // ------------------------------------------------------------------
+
+    const KEY: u64 = 0xDEAD_BEEF;
+
+    fn dispatch(app: &mut TestApp, event: &JournalEvent<TestEvent>, ts: u64, seq: u64) {
+        let mut reports = Vec::new();
+        let mut drain = 0u64;
+        dispatch_event(app, event, ts, KEY, seq, &mut drain, &mut reports);
+    }
+
+    #[test]
+    fn app_event_advances_hwm_and_reaches_apply() {
+        let mut app = TestApp::new();
+        let mut reports = Vec::new();
+        let mut drain = 0u64;
+
+        // Non-query Add: HWM should bump to seq, total should bump by n.
+        dispatch_event(
+            &mut app,
+            &JournalEvent::App(TestEvent::Add(42)),
+            0,
+            KEY,
+            10,
+            &mut drain,
+            &mut reports,
+        );
+
+        assert_eq!(app.total, 42, "apply must have run");
+        assert_eq!(app.key_hwm.get(&KEY).copied(), Some(10));
+    }
+
+    #[test]
+    fn query_event_does_not_advance_hwm() {
+        // Regression: the shadow reads from the pre-journal input ring so
+        // it sees queries (the matching stage filters them out at the
+        // !is_query gate). Advancing HWM on queries would push shadow's
+        // key_hwm above primary's and a post-restore could reject
+        // legitimate non-duplicate requests.
+        let mut app = TestApp::new();
+        dispatch(&mut app, &JournalEvent::App(TestEvent::Query), 0, 100);
+
+        // HWM unchanged, so a same-seq non-query still passes.
+        assert!(app.key_hwm.get(&KEY).copied().unwrap_or(0) < 100);
+        assert!(app.check_request_seq(KEY, 100));
+    }
+
+    #[test]
+    fn timestamp_drives_monotonic_clock_drain() {
+        // The drain trips Application::tick when `timestamp_ns >
+        // last_drain_ns`. Across one dispatch_event call the local
+        // `last_drain_ns` is initialised to 0 so any positive timestamp
+        // fires exactly one tick. A second dispatch with a backward
+        // timestamp on the same caller-tracked drain must NOT re-tick.
+        let mut app = TestApp::new();
+        let mut reports = Vec::new();
+        let mut drain = 0u64;
+
+        // Forward timestamp: one tick.
+        dispatch_event(
+            &mut app,
+            &JournalEvent::App(TestEvent::Add(1)),
+            100,
+            KEY,
+            1,
+            &mut drain,
+            &mut reports,
+        );
+        assert_eq!(app.ticks, 1, "forward timestamp must drain clock once");
+        assert_eq!(drain, 100, "caller-tracked drain must advance to 100");
+
+        // Backward timestamp on the same caller-tracked drain: no new tick.
+        dispatch_event(
+            &mut app,
+            &JournalEvent::App(TestEvent::Add(1)),
+            50,
+            KEY,
+            2,
+            &mut drain,
+            &mut reports,
+        );
+        assert_eq!(app.ticks, 1, "backward timestamp must not re-drain");
+
+        // Equal timestamp: also no new tick (strict greater-than gate).
+        dispatch_event(
+            &mut app,
+            &JournalEvent::App(TestEvent::Add(1)),
+            100,
+            KEY,
+            3,
+            &mut drain,
+            &mut reports,
+        );
+        assert_eq!(app.ticks, 1, "equal timestamp must not re-drain");
+
+        // New forward timestamp resumes draining.
+        dispatch_event(
+            &mut app,
+            &JournalEvent::App(TestEvent::Add(1)),
+            200,
+            KEY,
+            4,
+            &mut drain,
+            &mut reports,
+        );
+        assert_eq!(app.ticks, 2);
+    }
+
+    #[test]
+    fn tick_variant_advances_clock_state_only() {
+        // JournalEvent::Tick { now_ns } reaches Application::tick (which
+        // bumps TestApp::ticks) and never reaches apply (which would bump
+        // TestApp::total).
+        let mut app = TestApp::new();
+        dispatch(&mut app, &JournalEvent::Tick { now_ns: 1_000 }, 0, 1);
+
+        assert_eq!(app.total, 0, "Tick variant must not call apply");
+        assert!(app.ticks >= 1, "Tick variant must call Application::tick");
+    }
+
+    #[test]
+    fn transport_variants_are_state_noops() {
+        // GenesisHash, Checkpoint, and Shutdown carry hash-chain or
+        // pipeline-control metadata and must never mutate app state.
+        // (Shutdown shouldn't even reach dispatch_event in practice — the
+        // run loop exits on it — but the match arm exists as defence in
+        // depth and is exercised here.)
+        let mut app = TestApp::new();
+        dispatch(
+            &mut app,
+            &JournalEvent::GenesisHash { hash: [0xAA; 32] },
+            0,
+            1,
+        );
+        dispatch(
+            &mut app,
+            &JournalEvent::Checkpoint {
+                chain_hash: [0xBB; 32],
+                events_since_checkpoint: 7,
+            },
+            0,
+            2,
+        );
+        dispatch(&mut app, &JournalEvent::Shutdown, 0, 3);
+
+        assert_eq!(app.total, 0, "no app-event state change");
+        assert_eq!(app.ticks, 0, "no clock drain (timestamp_ns was 0)");
+    }
 }
