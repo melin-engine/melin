@@ -510,4 +510,299 @@ mod tests {
         assert_eq!(app.total, 0, "no app-event state change");
         assert_eq!(app.ticks, 0, "no clock drain (timestamp_ns was 0)");
     }
+
+    #[test]
+    fn key_hash_zero_bypasses_hwm_dedup() {
+        // Transport-internal events (Tick, GenesisHash, Checkpoint) and
+        // any seed-time inserts use key_hash=0 to opt out of per-key
+        // dedup. dispatch_event must hand those events to apply
+        // regardless of the request_seq value — TestApp::check_request_seq
+        // mirrors Exchange::check_request_seq in returning true for
+        // key_hash=0 without consulting the HWM map.
+        let mut app = TestApp::new();
+        let mut reports = Vec::new();
+        let mut drain = 0u64;
+
+        for _ in 0..3 {
+            dispatch_event(
+                &mut app,
+                &JournalEvent::App(TestEvent::Add(7)),
+                0,
+                0, // key_hash sentinel
+                1, // same seq each time — would be a duplicate for any real key
+                &mut drain,
+                &mut reports,
+            );
+        }
+        assert_eq!(app.total, 21, "every internal event must apply");
+        assert!(
+            app.key_hwm.is_empty(),
+            "key_hash=0 must not allocate an HWM entry"
+        );
+    }
+
+    #[test]
+    fn duplicate_request_seq_still_applies_event() {
+        // dispatch_event discards check_request_seq's return value — even
+        // when the matching stage would have rejected the event as a
+        // duplicate, the shadow still applies it. This mirrors
+        // JournaledApp::replay_entry's non-query branch, and the
+        // shadow_vs_primary divergence assumes both paths apply the same
+        // bytes regardless of dedup outcome. Without this, a primary
+        // that re-replays the same journal segment would diverge from a
+        // shadow that skipped duplicates.
+        let mut app = TestApp::new();
+        let mut reports = Vec::new();
+        let mut drain = 0u64;
+
+        // First dispatch at seq=10 — advances HWM and applies.
+        dispatch_event(
+            &mut app,
+            &JournalEvent::App(TestEvent::Add(5)),
+            0,
+            KEY,
+            10,
+            &mut drain,
+            &mut reports,
+        );
+        assert_eq!(app.total, 5);
+        assert_eq!(app.key_hwm.get(&KEY).copied(), Some(10));
+
+        // Second dispatch at seq=10 — dedup gate would reject (seq not
+        // strictly greater than HWM), but apply still runs.
+        dispatch_event(
+            &mut app,
+            &JournalEvent::App(TestEvent::Add(5)),
+            0,
+            KEY,
+            10,
+            &mut drain,
+            &mut reports,
+        );
+        assert_eq!(
+            app.total, 10,
+            "apply must run even when dedup would have rejected"
+        );
+        assert_eq!(
+            app.key_hwm.get(&KEY).copied(),
+            Some(10),
+            "HWM must not regress"
+        );
+    }
+
+    #[test]
+    fn has_events_gate_prevents_idle_snapshot() {
+        // The has_events gate (set true after the first consumed batch)
+        // is what stops the shadow from writing an empty-state snapshot
+        // immediately at startup. Operationally this matters: a snapshot
+        // dropped before the first event arrives could overwrite the
+        // last valid one on disk during a quick restart, leaving the
+        // operator with a zero-state recovery target.
+        let (_producer, mut consumers) = DisruptorBuilder::<InputSlot<TestEvent>>::new(64)
+            .add_consumer()
+            .build();
+        let consumer = consumers.pop().unwrap();
+
+        let app = TestApp::new();
+        let chain_hash = Arc::new(SeqLock::new([0u8; 32]));
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let shutdown2 = Arc::clone(&shutdown);
+
+        let dir = tempfile::tempdir().unwrap();
+        let snap_path = dir.path().join("test.snapshot");
+        let snap_path2 = snap_path.clone();
+
+        let handle = std::thread::Builder::new()
+            .name("test-shadow-idle".into())
+            .spawn(move || {
+                run(
+                    consumer,
+                    app,
+                    snap_path2,
+                    Duration::from_millis(20),
+                    chain_hash,
+                    &shutdown2,
+                    false,
+                );
+            })
+            .unwrap();
+
+        // Sleep well past several intervals — if has_events were
+        // misordered, the idle-tick branch would already have written
+        // a snapshot file.
+        std::thread::sleep(Duration::from_millis(200));
+        shutdown.store(true, Ordering::Relaxed);
+        handle.join().unwrap();
+
+        assert!(
+            !snap_path.exists(),
+            "idle shadow must not write a snapshot before any event arrives"
+        );
+    }
+
+    #[test]
+    fn snapshot_picks_up_updated_chain_hash() {
+        // chain_hash_lock is loaded on each save_snapshot call, not
+        // cached at startup. A mid-run hash update (the journal stage
+        // publishes after every fsync batch) must be reflected in the
+        // very next snapshot the shadow writes.
+        let (mut producer, mut consumers) = DisruptorBuilder::<InputSlot<TestEvent>>::new(64)
+            .add_consumer()
+            .build();
+        let consumer = consumers.pop().unwrap();
+
+        let app = TestApp::new();
+        let chain_hash = Arc::new(SeqLock::new([0x11; 32]));
+        let chain_hash_writer = Arc::clone(&chain_hash);
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let shutdown2 = Arc::clone(&shutdown);
+
+        let dir = tempfile::tempdir().unwrap();
+        let snap_path = dir.path().join("test.snapshot");
+        let snap_path2 = snap_path.clone();
+
+        let handle = std::thread::Builder::new()
+            .name("test-shadow-chain".into())
+            .spawn(move || {
+                run(
+                    consumer,
+                    app,
+                    snap_path2,
+                    Duration::from_millis(30),
+                    chain_hash,
+                    &shutdown2,
+                    false,
+                );
+            })
+            .unwrap();
+
+        // Phase 1: publish one event, wait for first snapshot.
+        producer.publish(InputSlot {
+            connection_id: 0,
+            key_hash: 0,
+            request_seq: 0,
+            sequence: 0,
+            timestamp_ns: 0,
+            event: JournalEvent::App(TestEvent::Add(1)),
+            publish_ts: Default::default(),
+            recv_ts: Default::default(),
+        });
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !snap_path.exists() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(snap_path.exists(), "first snapshot must be written");
+        let (_, _, hash_initial) = snapshot::load::<TestApp>(&snap_path).unwrap();
+        assert_eq!(hash_initial, [0x11; 32], "first snapshot has initial hash");
+
+        // Phase 2: update SeqLock, drive another event, wait for the
+        // second snapshot. Poll until the on-disk hash flips.
+        chain_hash_writer.store([0x22; 32]);
+        producer.publish(InputSlot {
+            connection_id: 0,
+            key_hash: 0,
+            request_seq: 0,
+            sequence: 0,
+            timestamp_ns: 0,
+            event: JournalEvent::App(TestEvent::Add(1)),
+            publish_ts: Default::default(),
+            recv_ts: Default::default(),
+        });
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            if let Ok((_, _, hash)) = snapshot::load::<TestApp>(&snap_path)
+                && hash == [0x22; 32]
+            {
+                break;
+            }
+            if Instant::now() >= deadline {
+                panic!("snapshot did not pick up updated chain hash within deadline");
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+
+        shutdown.store(true, Ordering::Relaxed);
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn multi_batch_replay_accumulates_into_snapshot() {
+        // End-to-end: events arriving across multiple consume_batch
+        // iterations all reach the shadow app and the eventual snapshot
+        // reflects the running total. last_drain_ns persists across
+        // batches in the run loop, but the test focuses on the
+        // accumulated app-event side — Add semantics make the sum
+        // load-bearing and easy to assert.
+        let (mut producer, mut consumers) = DisruptorBuilder::<InputSlot<TestEvent>>::new(64)
+            .add_consumer()
+            .build();
+        let consumer = consumers.pop().unwrap();
+
+        let app = TestApp::new();
+        let chain_hash = Arc::new(SeqLock::new([0xCD; 32]));
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let shutdown2 = Arc::clone(&shutdown);
+
+        let dir = tempfile::tempdir().unwrap();
+        let snap_path = dir.path().join("test.snapshot");
+        let snap_path2 = snap_path.clone();
+
+        let handle = std::thread::Builder::new()
+            .name("test-shadow-batches".into())
+            .spawn(move || {
+                run(
+                    consumer,
+                    app,
+                    snap_path2,
+                    Duration::from_millis(20),
+                    chain_hash,
+                    &shutdown2,
+                    false,
+                );
+            })
+            .unwrap();
+
+        // Publish three small batches with brief gaps so the consumer
+        // sees them as separate consume_batch iterations rather than one
+        // big drain.
+        for batch in [&[10u64, 20u64][..], &[30u64, 40u64][..], &[50u64][..]] {
+            for &n in batch {
+                producer.publish(InputSlot {
+                    connection_id: 0,
+                    key_hash: 0,
+                    request_seq: 0,
+                    sequence: 0,
+                    timestamp_ns: 0,
+                    event: JournalEvent::App(TestEvent::Add(n)),
+                    publish_ts: Default::default(),
+                    recv_ts: Default::default(),
+                });
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+
+        // Wait for a snapshot whose restored total reflects all batches
+        // (10+20+30+40+50 = 150). Polling the total handles the race
+        // between snapshot emission and the next event arriving.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            if let Ok((restored, _, _)) = snapshot::load::<TestApp>(&snap_path)
+                && restored.total == 150
+            {
+                break;
+            }
+            if Instant::now() >= deadline {
+                let observed = snapshot::load::<TestApp>(&snap_path)
+                    .map(|(a, _, _)| a.total)
+                    .unwrap_or(u64::MAX);
+                panic!("snapshot did not reach total=150 (observed={observed})");
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+
+        shutdown.store(true, Ordering::Relaxed);
+        handle.join().unwrap();
+    }
 }
