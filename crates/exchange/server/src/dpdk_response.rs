@@ -19,8 +19,8 @@ use std::time::{Duration, Instant};
 use melin_disruptor::ring;
 use melin_disruptor::spsc;
 
-use crate::amortized_timer::AmortizedTimer;
 use crate::{OutputPayload, OutputSlot};
+use melin_app::amortized_timer::AmortizedTimer;
 use melin_transport_core::pipeline::StageUtilization;
 use melin_types::types::QueryResponse;
 

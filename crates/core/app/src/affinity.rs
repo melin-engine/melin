@@ -106,7 +106,7 @@ fn set_realtime_fifo(priority: i32) {
 /// `core == 0` is treated as a sentinel: affinity is skipped and the
 /// thread is left on the default OS scheduler. See module docs for
 /// rationale.
-pub(crate) fn pin_thread(name: &str, core: usize) {
+pub fn pin_thread(name: &str, core: usize) {
     if core == 0 {
         tracing::info!(thread = name, "thread left unpinned (core 0 sentinel)");
         return;

@@ -182,7 +182,7 @@ pub fn spawn_reader<R: AsRawFd + Send + 'static>(
             if core == 0 {
                 tracing::info!(thread = "uring-reader", "thread left unpinned (core 0 sentinel)");
             } else {
-                match crate::affinity::pin_to_core(core) {
+                match melin_app::affinity::pin_to_core(core) {
                     Ok(c) => {
                         tracing::info!(thread = "uring-reader", core = c, "pinned to core")
                     }
@@ -411,9 +411,9 @@ fn reader_loop<R: AsRawFd>(
             let now = Instant::now();
             if now >= next_tick_deadline {
                 let raw_now_ns = unix_epoch_nanos();
-                let now_ns = crate::tick::clamp_monotonic(raw_now_ns, last_tick_ns);
+                let now_ns = melin_transport_core::tick::clamp_monotonic(raw_now_ns, last_tick_ns);
                 last_tick_ns = now_ns;
-                crate::tick::publish_tick(&mut producer, now_ns);
+                melin_transport_core::tick::publish_tick(&mut producer, now_ns);
                 // Catch up rather than burst-emit if we fell badly behind.
                 let elapsed = Instant::now().saturating_duration_since(next_tick_deadline);
                 next_tick_deadline = if elapsed > cadence {

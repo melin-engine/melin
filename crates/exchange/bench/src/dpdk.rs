@@ -107,7 +107,7 @@ pub fn run_dpdk_roundtrip(
     health_addr: Option<std::net::SocketAddr>,
 ) {
     // Pin to dedicated core.
-    if let Err(e) = melin_server::affinity::pin_to_core(core_id) {
+    if let Err(e) = melin_app::affinity::pin_to_core(core_id) {
         eprintln!("warning: could not pin bench to core {core_id}: {e}");
     }
 

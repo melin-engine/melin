@@ -14,13 +14,16 @@ use tracing::{debug, error, info, warn};
 use melin_journal::replication::ReplicationConsumer;
 
 use super::auth::authenticate_replica;
-use super::catchup::{CatchUpResult, can_catch_up_from_journal, catch_up_from_journal};
-use super::protocol::{
+use super::{ReplicationMetrics, update_dual_replication_cursor};
+use crate::TradingEvent;
+use melin_transport_core::replication::catchup::{
+    CatchUpResult, can_catch_up_from_journal, catch_up_from_journal,
+};
+use melin_transport_core::replication::protocol::{
     MAX_CONTROL_FRAME, ReplicaMessage, decode_replica_message, encode_heartbeat,
     encode_need_snapshot, encode_snapshot_begin, encode_snapshot_chunk, encode_snapshot_end,
     encode_stream_start, read_frame,
 };
-use super::{ReplicationMetrics, update_dual_replication_cursor};
 
 // --- Replication Sender (Primary side) ---
 
@@ -278,7 +281,7 @@ pub fn run_sender(
                             // otherwise clear inherited affinity from the
                             // sender thread so the OS can schedule freely.
                             if handler_core > 0 {
-                                match crate::affinity::pin_to_core(handler_core) {
+                                match melin_app::affinity::pin_to_core(handler_core) {
                                     Ok(c) => tracing::info!(
                                         core = c,
                                         slot = slot_idx,
@@ -290,7 +293,7 @@ pub fn run_sender(
                                         "failed to pin handler"
                                     ),
                                 }
-                            } else if let Err(e) = crate::affinity::clear_affinity() {
+                            } else if let Err(e) = melin_app::affinity::clear_affinity() {
                                 tracing::warn!(error = e, "failed to clear handler affinity");
                             }
                             // Safety: shutdown and replica_ready outlive this thread
@@ -440,8 +443,12 @@ fn handle_replica_connection(
         writer.flush()?;
         send_buf.clear();
 
-        let catchup_result =
-            catch_up_from_journal(journal_path, handshake.last_sequence, &mut writer, shutdown)?;
+        let catchup_result = catch_up_from_journal::<TradingEvent>(
+            journal_path,
+            handshake.last_sequence,
+            &mut writer,
+            shutdown,
+        )?;
         match catchup_result {
             CatchUpResult::Ok(end) => end,
             CatchUpResult::NeedSnapshot => {
@@ -535,8 +542,12 @@ fn handle_replica_connection(
 
         // Catch up from the snapshot's sequence using the current journal.
         // The current journal starts at snap_sequence+1 (rotation boundary).
-        let post_snap_result =
-            catch_up_from_journal(journal_path, snap_sequence, &mut writer, shutdown)?;
+        let post_snap_result = catch_up_from_journal::<TradingEvent>(
+            journal_path,
+            snap_sequence,
+            &mut writer,
+            shutdown,
+        )?;
         match post_snap_result {
             CatchUpResult::Ok(end) => end,
             CatchUpResult::NeedSnapshot => {
@@ -692,13 +703,13 @@ fn live_stream_uring(
     let mut send_in_flight = false;
     let mut send_offset: usize = 0;
     let mut idle_spins: u32 = 0;
-    let mut heartbeat_timer = crate::amortized_timer::AmortizedTimer::new();
+    let mut heartbeat_timer = melin_app::amortized_timer::AmortizedTimer::new();
 
     // Diagnostic (RUST_LOG=debug): per-slot TCP_INFO snapshot once a
     // second, slow-SEND detection (CQE elapsed >= threshold), and a
     // TCP_INFO capture at the evict-exit point. Amortized so the
     // per-iteration cost is a single `AND` + predictable branch.
-    let mut info_log_timer = crate::amortized_timer::AmortizedTimer::new();
+    let mut info_log_timer = melin_app::amortized_timer::AmortizedTimer::new();
     let mut send_submit_ts: Option<std::time::Instant> = None;
     const SLOW_SEND_THRESHOLD_MS: u128 = 5;
 
@@ -757,7 +768,7 @@ fn live_stream_uring(
                 *last_send = std::time::Instant::now();
                 send_submit_ts = Some(*last_send);
                 idle_spins = 0;
-                heartbeat_timer = crate::amortized_timer::AmortizedTimer::new();
+                heartbeat_timer = melin_app::amortized_timer::AmortizedTimer::new();
             } else {
                 // Heartbeat check: amortized when spinning (mask keeps the
                 // clock read at ~10/s at 10M iter/s). In yield mode the loop

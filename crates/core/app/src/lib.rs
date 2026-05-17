@@ -13,6 +13,16 @@
 
 #![cfg_attr(not(test), deny(clippy::unwrap_used))]
 
+/// Linux `sched_setaffinity` + `SCHED_FIFO` helpers used by every
+/// pipeline thread in the transport (journal, matching, response,
+/// shadow, replication sender/receiver). Generic OS plumbing — the
+/// matching engine never references it directly.
+pub mod affinity;
+/// Clock-read amortization for busy-spin loops. The shadow stage,
+/// replication sender, and replica receiver all hit this on the hot
+/// path. Pure timing utility — no transport coupling.
+pub mod amortized_timer;
+
 use std::io::{self, Read, Write};
 use std::time::{SystemTime, UNIX_EPOCH};
 

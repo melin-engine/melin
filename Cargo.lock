@@ -1508,6 +1508,10 @@ dependencies = [
 [[package]]
 name = "melin-app"
 version = "0.8.0"
+dependencies = [
+ "libc",
+ "tracing",
+]
 
 [[package]]
 name = "melin-bench"
@@ -1723,6 +1727,7 @@ dependencies = [
  "melin-app",
  "melin-disruptor",
  "melin-journal",
+ "proptest",
  "tempfile",
  "tracing",
  "zerocopy",

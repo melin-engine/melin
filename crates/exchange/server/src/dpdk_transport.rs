@@ -253,9 +253,10 @@ pub fn run_dpdk_poll(
                 let now = Instant::now();
                 if now >= next_tick_deadline {
                     let raw_now_ns = unix_epoch_nanos();
-                    let now_ns = crate::tick::clamp_monotonic(raw_now_ns, last_tick_ns);
+                    let now_ns =
+                        melin_transport_core::tick::clamp_monotonic(raw_now_ns, last_tick_ns);
                     last_tick_ns = now_ns;
-                    crate::tick::publish_tick(&mut producer, now_ns);
+                    melin_transport_core::tick::publish_tick(&mut producer, now_ns);
                     let elapsed = Instant::now().saturating_duration_since(next_tick_deadline);
                     next_tick_deadline = if elapsed > cadence {
                         Instant::now() + cadence

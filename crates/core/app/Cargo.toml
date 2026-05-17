@@ -8,3 +8,5 @@ name = "melin_app"
 path = "src/lib.rs"
 
 [dependencies]
+libc = { workspace = true }
+tracing = { workspace = true }

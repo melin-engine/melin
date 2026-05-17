@@ -86,13 +86,11 @@ pub enum ControlEvent {
 }
 
 pub mod admin;
-pub mod affinity;
-/// AmortizedTimer is used by the shadow stage's clock-check amortization
-/// and by the replication sender. Always compiled.
-pub(crate) mod amortized_timer;
-/// Configurable durability ack policy. Pure logic — defines the
-/// `Level` / `Clause` / `Policy` types and a string parser used by
-/// the response stage's gate. No threading or I/O concerns.
+/// Operator-facing durability mode (`local` / `hybrid` /
+/// `durably-replicated`) and its mapping to a [`Policy`]. The generic
+/// policy types themselves (Level / Clause / Policy / CursorView /
+/// EvalStatus) live in `melin_transport_core::durability_policy` and
+/// are re-exported here for callers.
 pub mod durability_policy;
 /// Firehose event publisher — trading-only because it depends on
 /// `melin-market-data` for book-mirror snapshots.
@@ -105,7 +103,6 @@ pub mod health;
 mod reader;
 pub mod request;
 mod response;
-pub mod tick;
 
 /// Replica failover and shadow snapshotting. Both are transport-level
 /// concerns and work for any `A: Application`, so they compile into the

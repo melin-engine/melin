@@ -4,7 +4,7 @@
 //! spins at ~10 M iterations/s costs ~15–25 % of a CPU core on Linux
 //! x86_64 — the vDSO `clock_gettime(CLOCK_MONOTONIC)` is fast (~15–25 ns)
 //! but not free, and the hot path has nothing else in it to amortize
-//! that cost against. Multiple stages in this crate busy-spin; a naive
+//! that cost against. Multiple stages in the transport busy-spin; a naive
 //! `last.elapsed() >= period` check in any of them is a measurable
 //! throughput tax (seen on the replica receiver, the primary per-slot
 //! replication handler, and the shadow snapshot stage — in the latter,
@@ -25,10 +25,16 @@
 //! of times per second. Use a real clock-based timer for anything
 //! needing tight timing or for infrequent loops.
 
-pub(crate) struct AmortizedTimer {
+pub struct AmortizedTimer {
     last: std::time::Instant,
     // Iteration counter used only when `spinning = true` in `tick`.
     iter: u64,
+}
+
+impl Default for AmortizedTimer {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl AmortizedTimer {
@@ -36,7 +42,7 @@ impl AmortizedTimer {
     /// At ~10 M loop iters/s this yields ~10 clock reads per second.
     const CHECK_MASK: u64 = (1 << 20) - 1;
 
-    pub(crate) fn new() -> Self {
+    pub fn new() -> Self {
         Self {
             last: std::time::Instant::now(),
             iter: 0,
@@ -55,7 +61,7 @@ impl AmortizedTimer {
     /// The returned `elapsed` is the real time since the previous tick,
     /// suitable for computing per-interval rates without a second clock read.
     #[inline]
-    pub(crate) fn tick(
+    pub fn tick(
         &mut self,
         period: std::time::Duration,
         spinning: bool,

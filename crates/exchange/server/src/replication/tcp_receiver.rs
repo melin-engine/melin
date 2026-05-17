@@ -48,11 +48,11 @@ fn arm_tcp_quickack(fd: RawFd) {
 }
 
 use super::auth::authenticate_with_primary;
-use super::protocol::{
+use melin_app::amortized_timer::AmortizedTimer;
+use melin_transport_core::replication::protocol::{
     Ack, Handshake, MAX_CONTROL_FRAME, MAX_DATA_FRAME, PrimaryMessage, decode_primary_message,
     encode_ack, encode_handshake, read_frame, try_decode_input_batch, try_decode_input_batch_into,
 };
-use crate::amortized_timer::AmortizedTimer;
 
 use super::{
     PendingAckQueue, ReplicaPipelineHandles, build_replica_pipeline_with_threads, log_tcp_info,
@@ -1208,7 +1208,7 @@ where
                 let handle = std::thread::Builder::new()
                     .name("replica-receiver".into())
                     .spawn_scoped(s, || {
-                        crate::affinity::pin_thread("replica-receiver", receiver_core);
+                        melin_app::affinity::pin_thread("replica-receiver", receiver_core);
                         replica_stream_uring(
                             &tcp_writer,
                             input_producer,

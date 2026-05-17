@@ -1011,7 +1011,7 @@ where
     let journal_handle = std::thread::Builder::new()
         .name("journal".into())
         .spawn(move || {
-            crate::affinity::pin_thread("journal", cores.journal);
+            melin_app::affinity::pin_thread("journal", cores.journal);
             let result = journal_stage.run(&s1);
             let was_shutdown = shutdown_for_journal.load(Ordering::Relaxed);
             match &result {
@@ -1028,7 +1028,7 @@ where
     let matching_handle = std::thread::Builder::new()
         .name("matching".into())
         .spawn(move || {
-            crate::affinity::pin_thread("matching", cores.matching);
+            melin_app::affinity::pin_thread("matching", cores.matching);
             let app = matching_stage.run(&s2);
             let was_shutdown = shutdown_for_matching.load(Ordering::Relaxed);
             if was_shutdown {
@@ -1092,7 +1092,7 @@ where
     let response_handle = std::thread::Builder::new()
         .name("response".into())
         .spawn(move || {
-            crate::affinity::pin_thread("response", cores.response);
+            melin_app::affinity::pin_thread("response", cores.response);
             crate::response::run(
                 output_consumer,
                 control_rx,
@@ -1179,7 +1179,7 @@ where
         let repl_sender_handle = std::thread::Builder::new()
             .name("repl-sender".into())
             .spawn(move || {
-                crate::affinity::pin_thread("repl-sender", cores.repl_sender);
+                melin_app::affinity::pin_thread("repl-sender", cores.repl_sender);
                 crate::replication::run_sender(
                     crate::replication::Sender {
                         bind_addr: repl_bind,
@@ -1242,7 +1242,7 @@ where
         let handle = std::thread::Builder::new()
             .name("shadow".into())
             .spawn(move || {
-                crate::affinity::pin_thread("shadow", cores.shadow);
+                melin_app::affinity::pin_thread("shadow", cores.shadow);
                 crate::shadow::run(
                     shadow_cons,
                     shadow_ex,
@@ -2006,7 +2006,7 @@ where
     let journal_handle = std::thread::Builder::new()
         .name("journal".into())
         .spawn(move || {
-            crate::affinity::pin_thread("journal", cores.journal);
+            melin_app::affinity::pin_thread("journal", cores.journal);
             journal_stage.run(&s1)
         })
         .map_err(|e| format!("spawn journal thread: {e}"))?;
@@ -2015,7 +2015,7 @@ where
     let matching_handle = std::thread::Builder::new()
         .name("matching".into())
         .spawn(move || {
-            crate::affinity::pin_thread("matching", cores.matching);
+            melin_app::affinity::pin_thread("matching", cores.matching);
             matching_stage.run(&s2)
         })
         .map_err(|e| format!("spawn matching thread: {e}"))?;
@@ -2060,7 +2060,7 @@ where
     let response_handle = std::thread::Builder::new()
         .name("response".into())
         .spawn(move || {
-            crate::affinity::pin_thread("response", cores.response);
+            melin_app::affinity::pin_thread("response", cores.response);
             crate::dpdk_response::run(
                 output_consumer,
                 control_rx,
@@ -2090,7 +2090,7 @@ where
         let handle = std::thread::Builder::new()
             .name("shadow".into())
             .spawn(move || {
-                crate::affinity::pin_thread("shadow", cores.shadow);
+                melin_app::affinity::pin_thread("shadow", cores.shadow);
                 crate::shadow::run(
                     shadow_cons,
                     shadow_ex,
@@ -2388,7 +2388,7 @@ where
     );
     let transport_0 = transports.pop().expect("one client transport");
     let tx_rx_0 = tx_consumers.remove(0);
-    crate::affinity::pin_thread("dpdk-poll-0", reader_cores);
+    melin_app::affinity::pin_thread("dpdk-poll-0", reader_cores);
     crate::dpdk_transport::run_dpdk_poll(
         transport_0,
         input_producer,
@@ -2631,7 +2631,7 @@ fn spawn_event_publisher(
     let event_handle = std::thread::Builder::new()
         .name("event-publisher".into())
         .spawn(move || {
-            crate::affinity::pin_thread("event-publisher", event_core);
+            melin_app::affinity::pin_thread("event-publisher", event_core);
             crate::event_publisher::run(
                 event_consumer,
                 event_bind,

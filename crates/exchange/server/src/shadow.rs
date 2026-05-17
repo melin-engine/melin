@@ -23,7 +23,7 @@ use melin_transport_core::snapshot;
 
 type Report = <App as Application>::Report;
 
-use crate::amortized_timer::AmortizedTimer;
+use melin_app::amortized_timer::AmortizedTimer;
 
 /// Maximum events consumed per batch. Matches the journal stage batch size
 /// for consistent throughput characteristics.

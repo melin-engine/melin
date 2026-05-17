@@ -47,6 +47,7 @@ melin-journal = { path = "../journal" }
 
 [dev-dependencies]
 tempfile = "3"
+proptest = "1"
 # Re-pull melin-journal with `test-utils` so the byte-sweep crash test
 # can shrink the journal prealloc chunk to keep per-iteration cost bounded.
 melin-journal = { path = "../journal", features = ["test-utils"] }

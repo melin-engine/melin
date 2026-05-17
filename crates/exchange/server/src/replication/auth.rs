@@ -3,10 +3,15 @@
 //! Both halves of the handshake live here: `authenticate_replica` runs on
 //! the primary side and verifies the replica's signature; `authenticate_with_primary`
 //! runs on the replica side and signs the challenge.
+//!
+//! The wire framing and message encoders/decoders live in
+//! `melin_transport_core::replication::protocol`; this module is the
+//! exchange-side glue that pairs the generic auth flow with the
+//! operator-managed `AuthorizedKeys` permission table.
 
 use std::io::{self, Read, Write};
 
-use super::protocol::{
+use melin_transport_core::replication::protocol::{
     MAX_CONTROL_FRAME, decode_auth_result, decode_challenge, decode_challenge_response,
     encode_auth_failed, encode_auth_ok, encode_challenge, encode_challenge_response, read_frame,
 };
