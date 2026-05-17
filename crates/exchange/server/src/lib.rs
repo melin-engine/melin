@@ -85,40 +85,32 @@ pub enum ControlEvent {
     },
 }
 
-pub mod admin;
-/// Operator-facing durability mode (`local` / `hybrid` /
-/// `durably-replicated`) and its mapping to a [`Policy`]. The generic
-/// policy types themselves (Level / Clause / Policy / CursorView /
-/// EvalStatus) live in `melin_transport_core::durability_policy` and
-/// are re-exported here for callers.
-pub mod durability_policy;
-/// Firehose event publisher — trading-only because it depends on
-/// `melin-market-data` for book-mirror snapshots.
+/// Trading-specific server wiring — wire-`Request` decode,
+/// `OutputPayload` response encoding, the `ServerApp` newtype that
+/// carries the `Application` impl, and the market-data firehose.
+pub mod domain;
+/// Application-agnostic server runtime — accept loop, frame reader,
+/// durability policy, admin endpoint, replication, DPDK transport.
+/// Submodules are re-exported at the crate root below so existing
+/// `melin_server::server` / `melin_server::replication` style paths
+/// keep working.
+pub mod runtime;
+
+// Re-export submodules at the crate root to preserve the existing
+// public API surface and keep intra-crate `crate::server::X` /
+// `crate::request::X` paths working unchanged after the
+// runtime/domain split.
+pub use domain::{exchange_app, request};
+pub use runtime::{admin, durability_policy, replication, server};
+// `reader` and `response` were private in the pre-split layout —
+// keep them crate-private to preserve the existing public API.
+pub(crate) use domain::response;
+pub(crate) use runtime::reader;
+
 #[cfg(all(feature = "trading", not(feature = "skip-order-exec")))]
-pub mod event_publisher;
-/// Newtype wrapping `melin_engine::exchange::Exchange` that carries the
-/// `melin_app::Application` impl — see [`exchange_app::ServerApp`].
-pub mod exchange_app;
-mod reader;
-pub mod request;
-mod response;
-
-/// Replica failover. Transport-level concern that works for any
-/// `A: Application`, so it compiles into the skip-order-exec build too —
-/// that's precisely the point of the transport-only binary (stress the
-/// full durable transport without the matching engine). The shadow
-/// snapshot stage that used to live next to this module now lives in
-/// `melin_transport_core::shadow`; call it through that path.
-pub mod replication;
-
-/// Server runtime (TCP accept loop, pipeline bootstrap, auth handshake).
-/// Both build modes share the same entry points — only the engine's
-/// behaviour differs (full matching vs. skip-order-exec early return).
-/// Cfg branches inside `server.rs` select the right recovery/seed/
-/// shadow path per feature.
-pub mod server;
+pub use domain::event_publisher;
 
 #[cfg(feature = "dpdk")]
-pub mod dpdk_response;
+pub use domain::dpdk_response;
 #[cfg(feature = "dpdk")]
-pub mod dpdk_transport;
+pub use runtime::dpdk_transport;
