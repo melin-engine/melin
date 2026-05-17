@@ -376,6 +376,17 @@ impl PaceClock {
         }
     }
 
+    /// Unconditionally return the next scheduled tick and advance the
+    /// cursor. Intended for synchronous loops (engine mode) where the
+    /// caller spin-waits until the returned tick before doing work; for
+    /// event-loop callers see `pop_due`.
+    #[inline]
+    pub(crate) fn advance(&mut self) -> u64 {
+        let scheduled = self.next_due_ticks;
+        self.next_due_ticks = self.next_due_ticks.saturating_add(self.period_ticks);
+        scheduled
+    }
+
     #[cfg(test)]
     pub(crate) fn period_ticks(&self) -> u64 {
         self.period_ticks
@@ -619,7 +630,13 @@ fn main() {
 
     match args.mode.as_str() {
         "engine" => {
-            run_engine_bench(phases, args.accounts, args.instruments, json_path);
+            run_engine_bench(
+                phases,
+                args.accounts,
+                args.instruments,
+                json_path,
+                args.target_rate,
+            );
         }
         "pipeline" => {
             run_pipeline_bench(
@@ -630,6 +647,7 @@ fn main() {
                 json_path,
                 args.max_journal_batch,
                 args.journal_writer,
+                args.target_rate,
             );
         }
         "roundtrip" => {
@@ -719,6 +737,7 @@ fn run_engine_bench(
     num_accounts: u32,
     num_instruments: u32,
     json_path: Option<&std::path::Path>,
+    target_rate: u64,
 ) {
     use generator::{GeneratedEvent, GeneratorConfig, OrderFlowGenerator};
 
@@ -762,6 +781,17 @@ fn run_engine_bench(
 
     let phase_start = Instant::now();
     let deadlines = phases.deadlines(phase_start);
+
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    let pace_stats = PaceStats::default();
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+    {
+        if target_rate > 0 {
+            eprintln!(
+                "warning: --target-rate ignored on this architecture (requires TSC; x86_64 or aarch64)"
+            );
+        }
+    }
 
     // Warmup — drive the engine at full speed but discard timings. Polling
     // `Instant::now()` every iteration is fine because the warmup body is
@@ -853,6 +883,19 @@ fn run_engine_bench(
     // length, and `wall` is clamped to `phases.measured` below so
     // throughput math stays exact.
     let start = Instant::now();
+
+    // Open-loop pacer for engine mode. Built here — *after* warmup — so
+    // its TSC anchor lines up with the measured-phase start. Building it
+    // before warmup would leave the schedule stale by `warmup_duration`
+    // by the time the measured loop began, blasting through every
+    // already-due slot and recording huge spurious late counts.
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    let mut pacer = if target_rate > 0 {
+        Some(PaceClock::new(target_rate, 1, ticks_per_ns, rdtscp(), 0))
+    } else {
+        None
+    };
+
     let mut iter_since_check: u32 = 0;
     const DEADLINE_POLL_INTERVAL: u32 = 1024;
     let mut measured_orders: u64 = 0;
@@ -867,8 +910,23 @@ fn run_engine_bench(
         reports.clear();
         let event = flow.next_event();
 
+        // With pacing, spin until the next scheduled tick, then measure
+        // from that tick (not the actual call time) so any "behind
+        // schedule" engine slowness shows up as queueing latency rather
+        // than being absorbed silently. Without pacing, the loop runs
+        // hot and `t0` is just the per-call start tick.
         #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
-        let t0 = rdtscp();
+        let t0 = if let Some(p) = pacer.as_mut() {
+            let scheduled = p.advance();
+            while rdtscp() < scheduled {
+                std::hint::spin_loop();
+            }
+            let now = rdtscp();
+            pace_stats.record_send(now, scheduled, ticks_per_ns);
+            scheduled
+        } else {
+            rdtscp()
+        };
         #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
         let t0 = Instant::now();
 
@@ -995,25 +1053,51 @@ fn run_engine_bench(
         0.0
     };
 
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    let pacing_report = if target_rate > 0 {
+        let max_delay_ns = tsc_to_ns(
+            pace_stats.max_send_delay_ticks.load(Ordering::Relaxed),
+            ticks_per_ns,
+        );
+        Some(PacingReport {
+            target_rate,
+            scheduled: pace_stats.scheduled.load(Ordering::Relaxed),
+            late_sends: pace_stats.late_sends.load(Ordering::Relaxed),
+            max_send_delay_us: max_delay_ns as f64 / 1_000.0,
+        })
+    } else {
+        None
+    };
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+    let pacing_report: Option<PacingReport> = None;
+
+    let mut extra_lines = vec![
+        format!("  Accounts: {num_accounts}, Instruments: {num_instruments}"),
+        format!(
+            "  Submits: {submits}, Cancels: {cancels} ({cancel_pct:.1}%), Amends: {amends} ({amend_pct:.1}%)"
+        ),
+    ];
+    if let Some(p) = pacing_report.as_ref() {
+        extra_lines.push(format!(
+            "  Target rate: {} ops/s (scheduled {}, late {}, max send delay {:.1} µs)",
+            p.target_rate, p.scheduled, p.late_sends, p.max_send_delay_us,
+        ));
+    }
+
     print_results(
         "Realistic Order Flow",
         measured_orders as usize,
         phases,
         &histogram,
         wall,
-        &[
-            format!("  Accounts: {num_accounts}, Instruments: {num_instruments}"),
-            format!(
-                "  Submits: {submits}, Cancels: {cancels} ({cancel_pct:.1}%), Amends: {amends} ({amend_pct:.1}%)"
-            ),
-        ],
+        &extra_lines,
         json_path,
         &series,
         &[],
         // Engine mode runs the matching engine in-process with no
         // server / health endpoint, so there's nothing to fetch.
         &stats_client::Body::Empty,
-        None,
+        pacing_report.as_ref(),
     );
 
     // Print the slowest orders for tail latency diagnosis.
@@ -1046,6 +1130,7 @@ fn run_pipeline_bench(
     json_path: Option<&std::path::Path>,
     max_journal_batch: usize,
     journal_writer_mode: melin_server::JournalWriterMode,
+    target_rate: u64,
 ) {
     use melin_server::{BufferedWriter, JournalWriterMode, SectorWriter};
 
@@ -1070,6 +1155,7 @@ fn run_pipeline_bench(
         phases,
         window,
         json_path,
+        target_rate,
     };
 
     // The two arms are forced by monomorphisation — each writer has
@@ -1100,6 +1186,7 @@ struct PipelineInnerCfg<'a> {
     phases: BenchPhases,
     window: usize,
     json_path: Option<&'a std::path::Path>,
+    target_rate: u64,
 }
 
 /// Pipeline-mode body, generic over the journal writer so we get a
@@ -1123,6 +1210,7 @@ where
         phases,
         window,
         json_path,
+        target_rate,
     } = cfg;
 
     let nz = |v: u64| NonZeroU64::new(v).expect("non-zero");
@@ -1207,12 +1295,23 @@ where
     let mut producer = out.input_producer;
     let inflight_pub = Arc::clone(&inflight);
     let pub_stop_p = Arc::clone(&pub_stop);
+    let pace_stats = Arc::new(PaceStats::default());
+    let pace_stats_pub = Arc::clone(&pace_stats);
     let publish_handle = std::thread::Builder::new()
         .name("pipeline-pub".into())
         .spawn(move || {
             if let Err(e) = melin_app::affinity::pin_to_core(3) {
                 eprintln!("warning: could not pin pipeline-pub to core 3: {e}");
             }
+            // Pacer is built inside the thread so its TSC start aligns
+            // with the publisher's pinned-core clock. Pipeline mode has
+            // one publisher, so `clients=1` keeps the period == the
+            // aggregate target.
+            let mut pacer = if target_rate > 0 {
+                Some(PaceClock::new(target_rate, 1, ticks_per_ns, rdtscp(), 0))
+            } else {
+                None
+            };
             // Publish until the drain thread signals stop (set once the
             // cooldown deadline passes and the inflight queue is drained).
             // OrderId is a free-running u64; no risk of overflow at any
@@ -1237,7 +1336,27 @@ where
                     std::hint::spin_loop();
                 }
 
-                let ts = rdtscp();
+                // With pacing, gate on the schedule and record the
+                // scheduled tick (coordinated-omission fix). Without
+                // pacing, fall back to the actual send tick.
+                let ts = if let Some(p) = pacer.as_mut() {
+                    let now_tsc = rdtscp();
+                    match p.pop_due(now_tsc) {
+                        Some(scheduled) => {
+                            pace_stats_pub.record_send(now_tsc, scheduled, ticks_per_ns);
+                            scheduled
+                        }
+                        None => {
+                            // Not yet due — yield and retry without
+                            // burning the inflight window.
+                            std::hint::spin_loop();
+                            i -= 1;
+                            continue;
+                        }
+                    }
+                } else {
+                    rdtscp()
+                };
                 producer.publish(InputSlot {
                     connection_id: 0,
                     key_hash: 0,
@@ -1334,6 +1453,33 @@ where
         extra_lines.push(format!("  Group commit delay: {group_commit_us} µs"));
     }
     extra_lines.push(format!("  Window: {window}"));
+    if target_rate > 0 {
+        let scheduled = pace_stats.scheduled.load(Ordering::Relaxed);
+        let late = pace_stats.late_sends.load(Ordering::Relaxed);
+        let max_delay_us = tsc_to_ns(
+            pace_stats.max_send_delay_ticks.load(Ordering::Relaxed),
+            ticks_per_ns,
+        ) as f64
+            / 1_000.0;
+        extra_lines.push(format!(
+            "  Target rate: {target_rate} ops/s (scheduled {scheduled}, late {late}, max send delay {max_delay_us:.1} µs)"
+        ));
+    }
+
+    let pacing_report = if target_rate > 0 {
+        let max_delay_ns = tsc_to_ns(
+            pace_stats.max_send_delay_ticks.load(Ordering::Relaxed),
+            ticks_per_ns,
+        );
+        Some(PacingReport {
+            target_rate,
+            scheduled: pace_stats.scheduled.load(Ordering::Relaxed),
+            late_sends: pace_stats.late_sends.load(Ordering::Relaxed),
+            max_send_delay_us: max_delay_ns as f64 / 1_000.0,
+        })
+    } else {
+        None
+    };
 
     print_results(
         "Pipeline (no network)",
@@ -1348,7 +1494,7 @@ where
         // Pipeline mode runs the disruptor stages in-process with no
         // server / health endpoint, so there's nothing to fetch.
         &stats_client::Body::Empty,
-        None,
+        pacing_report.as_ref(),
     );
 
     println!();
@@ -2719,6 +2865,14 @@ mod pace_clock_tests {
         // 1 M orders/sec / 4 clients = 250 k/sec per client = 4 µs period.
         let p = PaceClock::new(1_000_000, 4, TICKS_PER_NS, 0, 0);
         assert_eq!(p.period_ticks(), 4_000);
+    }
+
+    #[test]
+    fn advance_returns_scheduled_and_steps_by_period() {
+        let mut p = PaceClock::new(1_000_000, 1, TICKS_PER_NS, 5_000, 0);
+        assert_eq!(p.advance(), 5_000);
+        assert_eq!(p.advance(), 6_000);
+        assert_eq!(p.advance(), 7_000);
     }
 
     #[test]
