@@ -63,8 +63,12 @@ struct DpdkBenchConn {
     send_pending: Vec<u8>,
     /// FIFO of send timestamps (TSC ticks) for in-flight orders.
     /// `u64` instead of `Instant` to avoid ~15-25ns vDSO overhead per
-    /// timestamp on the hot path.
+    /// timestamp on the hot path. With pacing enabled this stores the
+    /// *scheduled* TSC, not the actual send TSC (coordinated-omission fix).
     inflight_ts: VecDeque<u64>,
+    /// Open-loop scheduler when `--target-rate > 0`. Built after auth
+    /// handshake so its TSC anchor is close to the measurement start.
+    pacer: Option<crate::PaceClock>,
 }
 
 /// DPDK benchmark configuration.
@@ -96,6 +100,7 @@ pub fn run_dpdk_roundtrip(
     num_instruments: u32,
     core_id: usize,
     health_addr: Option<std::net::SocketAddr>,
+    target_rate: u64,
 ) {
     // Pin to dedicated core.
     if let Err(e) = melin_app::affinity::pin_to_core(core_id) {
@@ -362,6 +367,7 @@ pub fn run_dpdk_roundtrip(
             pending_unsent: None,
             send_pending: Vec::new(),
             inflight_ts: VecDeque::with_capacity(window),
+            pacer: None,
         });
 
         // Wait for TCP handshake to complete.
@@ -403,15 +409,13 @@ pub fn run_dpdk_roundtrip(
     // --- Main benchmark loop ---
     let progress = Arc::new(AtomicU64::new(0));
     let progress_shutdown = Arc::new(AtomicBool::new(false));
-    // DPDK pacing is not wired in this commit — pass target_rate=0 so the
-    // progress reporter renders the closed-loop format.
     let pace_stats = Arc::new(crate::PaceStats::default());
     let progress_handle = spawn_progress_reporter(
         Arc::clone(&progress),
         phases,
         Arc::clone(&progress_shutdown),
-        0,
-        pace_stats,
+        target_rate,
+        Arc::clone(&pace_stats),
     );
 
     let health_poller = health_addr.map(crate::health_poller::HealthPoller::start);
@@ -420,6 +424,24 @@ pub fn run_dpdk_roundtrip(
     let start = Instant::now();
     let deadlines = phases.deadlines(start);
     let mut measured_start: Option<Instant> = None;
+
+    // Build per-connection pacers anchored at the bench-start TSC. With
+    // the DPDK loop running single-threaded over all connections, a
+    // shared anchor is sufficient; staggered first sends via
+    // `conn_index` keep the connections out of phase within one period.
+    if target_rate > 0 {
+        let start_tsc = crate::rdtscp();
+        let clients = num_clients.max(1) as u64;
+        for (idx, conn) in connections.iter_mut().enumerate() {
+            conn.pacer = Some(crate::PaceClock::new(
+                target_rate,
+                clients,
+                ticks_per_ns,
+                start_tsc,
+                idx as u64,
+            ));
+        }
+    }
 
     let mut histogram =
         Histogram::<u64>::new_with_bounds(1, 10_000_000_000, 3).expect("histogram bounds");
@@ -560,10 +582,29 @@ pub fn run_dpdk_roundtrip(
             // in `pending_unsent` and `inflight_ts` is *not* advanced — so
             // the recorded send timestamp reflects the moment bytes actually
             // start hitting the wire, not the moment generation completed.
+            //
+            // With pacing, `pop_due` gates each new frame on the schedule
+            // and the recorded timestamp is the *scheduled* tick (closes
+            // the coordinated-omission loophole).
             while conn.send_pending.is_empty()
                 && conn.inflight_ts.len() < window
                 && socket.can_send()
             {
+                // Pacing gate first — if the next slot isn't due yet,
+                // stop filling for this conn this iteration.
+                let paced_ts = if let Some(p) = conn.pacer.as_mut() {
+                    let now_tsc = crate::rdtscp();
+                    match p.pop_due(now_tsc) {
+                        Some(scheduled) => {
+                            pace_stats.record_send(now_tsc, scheduled, ticks_per_ns);
+                            Some(scheduled)
+                        }
+                        None => break,
+                    }
+                } else {
+                    None
+                };
+
                 // Reuse a previously-generated-but-never-sent frame if there
                 // is one; otherwise pull a fresh frame from the generator.
                 if let Some(prev) = conn.pending_unsent.take() {
@@ -575,17 +616,26 @@ pub fn run_dpdk_roundtrip(
                 let wire_frame = &conn.scratch_frame;
                 match socket.send_slice(wire_frame) {
                     Ok(n) if n == wire_frame.len() => {
-                        conn.inflight_ts.push_back(crate::rdtscp());
+                        conn.inflight_ts
+                            .push_back(paced_ts.unwrap_or_else(crate::rdtscp));
                     }
                     Ok(n) if n > 0 => {
                         // Partial send — remainder goes to send_pending; the
                         // frame has started hitting the wire so it counts.
                         conn.send_pending.extend_from_slice(&wire_frame[n..]);
-                        conn.inflight_ts.push_back(crate::rdtscp());
+                        conn.inflight_ts
+                            .push_back(paced_ts.unwrap_or_else(crate::rdtscp));
                     }
                     Ok(_) => {
                         // Zero bytes sent — socket transiently full. Park the
                         // frame and exit; retry on the next poll iteration.
+                        // Roll back the pacer so the same scheduled slot
+                        // is re-issued for the parked frame.
+                        if paced_ts.is_some()
+                            && let Some(p) = conn.pacer.as_mut()
+                        {
+                            p.unpop();
+                        }
                         conn.pending_unsent = Some(std::mem::take(&mut conn.scratch_frame));
                         break;
                     }
@@ -593,8 +643,13 @@ pub fn run_dpdk_roundtrip(
                         // Client-side TCP error — debug! per project log-level
                         // convention (silent at default RUST_LOG level so a
                         // noisy network doesn't spam stderr). Park the frame
-                        // for retry.
+                        // for retry. Roll back the pacer (see above).
                         tracing::debug!("dpdk send_slice error: {e:?}");
+                        if paced_ts.is_some()
+                            && let Some(p) = conn.pacer.as_mut()
+                        {
+                            p.unpop();
+                        }
                         conn.pending_unsent = Some(std::mem::take(&mut conn.scratch_frame));
                         break;
                     }
@@ -693,11 +748,31 @@ pub fn run_dpdk_roundtrip(
 
     series.sort_by(|a, b| a.elapsed_secs.partial_cmp(&b.elapsed_secs).unwrap());
 
-    let extra_lines = vec![
+    let mut extra_lines = vec![
         format!("  Transport: DPDK (smoltcp)"),
         format!("  DPDK core: {core_id}"),
         format!("  Window: {window}, Clients: {num_clients}"),
     ];
+    let pacing_report = if target_rate > 0 {
+        let scheduled = pace_stats.scheduled.load(Ordering::Relaxed);
+        let late = pace_stats.late_sends.load(Ordering::Relaxed);
+        let max_delay_us = crate::tsc_to_ns(
+            pace_stats.max_send_delay_ticks.load(Ordering::Relaxed),
+            ticks_per_ns,
+        ) as f64
+            / 1_000.0;
+        extra_lines.push(format!(
+            "  Target rate: {target_rate} ops/s (scheduled {scheduled}, late {late}, max send delay {max_delay_us:.1} µs)"
+        ));
+        Some(crate::PacingReport {
+            target_rate,
+            scheduled,
+            late_sends: late,
+            max_send_delay_us: max_delay_us,
+        })
+    } else {
+        None
+    };
 
     #[cfg(feature = "latency-trace")]
     {
@@ -754,8 +829,7 @@ pub fn run_dpdk_roundtrip(
         &series,
         &health_poller.map(|p| p.stop()).unwrap_or_default(),
         &server_stages,
-        // DPDK pacing not wired in this commit.
-        None,
+        pacing_report.as_ref(),
     );
 }
 

@@ -387,6 +387,20 @@ impl PaceClock {
         scheduled
     }
 
+    /// Reverse the most recent `pop_due` or `advance` so that the popped
+    /// scheduled slot is re-issued next call. Used by transports that
+    /// pop optimistically but may need to roll back when the wire send
+    /// fails — without it, a transient send error would drop a scheduled
+    /// slot and skew the achieved rate downward. Only the DPDK path
+    /// currently rolls back (smoltcp can return Ok(0) on transient
+    /// back-pressure); the kernel-TCP uring path never reaches a state
+    /// where a popped frame isn't queued for send.
+    #[cfg_attr(not(feature = "dpdk"), allow(dead_code))]
+    #[inline]
+    pub(crate) fn unpop(&mut self) {
+        self.next_due_ticks = self.next_due_ticks.saturating_sub(self.period_ticks);
+    }
+
     #[cfg(test)]
     pub(crate) fn period_ticks(&self) -> u64 {
         self.period_ticks
@@ -690,6 +704,7 @@ fn main() {
                     args.instruments,
                     args.dpdk_core,
                     args.health_addr,
+                    args.target_rate,
                 );
             }
 
@@ -2871,6 +2886,17 @@ mod pace_clock_tests {
     fn advance_returns_scheduled_and_steps_by_period() {
         let mut p = PaceClock::new(1_000_000, 1, TICKS_PER_NS, 5_000, 0);
         assert_eq!(p.advance(), 5_000);
+        assert_eq!(p.advance(), 6_000);
+        assert_eq!(p.advance(), 7_000);
+    }
+
+    #[test]
+    fn unpop_reverses_one_step() {
+        let mut p = PaceClock::new(1_000_000, 1, TICKS_PER_NS, 5_000, 0);
+        assert_eq!(p.advance(), 5_000);
+        assert_eq!(p.advance(), 6_000);
+        p.unpop();
+        // After unpop, the next advance re-issues 6_000.
         assert_eq!(p.advance(), 6_000);
         assert_eq!(p.advance(), 7_000);
     }
