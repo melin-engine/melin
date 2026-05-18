@@ -37,7 +37,28 @@ use crate::runtime::reader::RequestDecoderArc;
 use crate::runtime::response::ResponseEncoderArc;
 use melin_app::app_factory::AppFactory;
 use melin_app::auth::Permission;
+use melin_disruptor::ring::Consumer;
 use melin_protocol::auth::AuthorizedKeys;
+
+/// Body of the event-publisher thread: a free function with this exact
+/// signature (the trading binary supplies
+/// [`event_publisher::run`](crate::domain::event_publisher::run); the
+/// skip-order-exec binary supplies nothing). Passing it as a function
+/// pointer keeps the runtime decoupled from the trading domain — no
+/// `crate::domain::*` reference inside server.rs — without paying for a
+/// boxed closure.
+///
+/// Threaded into [`run`] / [`run_dpdk`] as `Option<EventPublisherFn>`:
+/// `None` disables the publisher unconditionally, `Some(_)` wires it up
+/// when `--event-bind` is also set.
+pub type EventPublisherFn = fn(
+    consumer: Consumer<crate::OutputSlot>,
+    bind_addr: SocketAddr,
+    authorized_keys: Arc<AuthorizedKeys>,
+    shutdown: &AtomicBool,
+    busy_spin: bool,
+);
+
 use melin_protocol::blocking::BlockingFrameWriter;
 use melin_protocol::message::ConnectionId;
 use melin_protocol::transport::BlockingTransportListener;
@@ -563,6 +584,7 @@ pub fn run<L: BlockingTransportListener>(
     factory: Arc<dyn AppFactory<App = App>>,
     decoder: RequestDecoderArc<App>,
     encoder: ResponseEncoderArc<App>,
+    event_publisher: Option<EventPublisherFn>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     run_with_shutdown(
         listener,
@@ -570,6 +592,7 @@ pub fn run<L: BlockingTransportListener>(
         factory,
         decoder,
         encoder,
+        event_publisher,
         Arc::new(AtomicBool::new(false)),
     )
 }
@@ -585,6 +608,7 @@ pub fn run_with_shutdown<L: BlockingTransportListener>(
     factory: Arc<dyn AppFactory<App = App>>,
     decoder: RequestDecoderArc<App>,
     encoder: ResponseEncoderArc<App>,
+    event_publisher: Option<EventPublisherFn>,
     shutdown: Arc<AtomicBool>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // Dispatch on the operator-selected journal writer. Each branch
@@ -594,10 +618,22 @@ pub fn run_with_shutdown<L: BlockingTransportListener>(
     // at runtime.
     match config.journal_writer {
         melin_journal::JournalWriterMode::Buffered => run_with_shutdown_impl::<L, BufferedWriter>(
-            listener, config, factory, decoder, encoder, shutdown,
+            listener,
+            config,
+            factory,
+            decoder,
+            encoder,
+            event_publisher,
+            shutdown,
         ),
         melin_journal::JournalWriterMode::Sector => run_with_shutdown_impl::<L, SectorWriter>(
-            listener, config, factory, decoder, encoder, shutdown,
+            listener,
+            config,
+            factory,
+            decoder,
+            encoder,
+            event_publisher,
+            shutdown,
         ),
     }
 }
@@ -608,6 +644,7 @@ fn run_with_shutdown_impl<L, W>(
     factory: Arc<dyn AppFactory<App = App>>,
     decoder: RequestDecoderArc<App>,
     encoder: ResponseEncoderArc<App>,
+    event_publisher: Option<EventPublisherFn>,
     shutdown: Arc<AtomicBool>,
 ) -> Result<(), Box<dyn std::error::Error>>
 where
@@ -722,6 +759,7 @@ where
                     &*factory,
                     decoder,
                     encoder,
+                    event_publisher,
                     shutdown,
                     authorized_keys,
                     false, // no seeding needed — state comes from replication
@@ -772,6 +810,7 @@ where
         &*factory,
         decoder,
         encoder,
+        event_publisher,
         shutdown,
         authorized_keys,
         needs_seeding,
@@ -888,6 +927,7 @@ fn run_as_primary<L, W>(
     factory: &dyn AppFactory<App = App>,
     decoder: RequestDecoderArc<App>,
     encoder: ResponseEncoderArc<App>,
+    event_publisher: Option<EventPublisherFn>,
     shutdown: Arc<AtomicBool>,
     authorized_keys: Arc<AuthorizedKeys>,
     needs_seeding: bool,
@@ -953,7 +993,10 @@ where
     // Event publisher is trading-only (market-data book mirrors); the
     // skip-order-exec build silently ignores `--event-bind` so the
     // same invocation works against either binary.
-    let enable_event_publisher = cfg!(feature = "trading") && config.event_bind.is_some();
+    // The caller (binary) decides whether an event-publisher fn is
+    // available; we only allocate the consumer slot when both the fn is
+    // wired AND `--event-bind` is set.
+    let enable_event_publisher = event_publisher.is_some() && config.event_bind.is_some();
     let Pipeline {
         input_producer,
         journal_stage,
@@ -1259,11 +1302,12 @@ where
 
     // Spawn event publisher thread if enabled. Consumes from output ring
     // consumer 1 and broadcasts all execution events to TCP subscribers.
-    // Trading-only — the publisher depends on `melin-market-data` for
-    // book-mirror snapshots; `spawn_event_publisher` is a no-op under
-    // the skip-order-exec feature.
+    // Caller-supplied (the trading binary wires
+    // `domain::event_publisher::run`; the skip-order-exec binary passes
+    // `None`), so the runtime carries no trading-specific reference.
     let event_publisher_handle = spawn_event_publisher(
         event_publisher_consumer,
+        event_publisher,
         config,
         &cores,
         &authorized_keys,
@@ -1718,6 +1762,7 @@ pub fn run_dpdk(
     factory: Arc<dyn AppFactory<App = App>>,
     decoder: RequestDecoderArc<App>,
     encoder: ResponseEncoderArc<App>,
+    event_publisher: Option<EventPublisherFn>,
     dpdk_config: melin_dpdk::DpdkConfig,
     shutdown: Arc<AtomicBool>,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -1728,12 +1773,19 @@ pub fn run_dpdk(
             factory,
             decoder,
             encoder,
+            event_publisher,
             dpdk_config,
             shutdown,
         ),
-        melin_journal::JournalWriterMode::Sector => {
-            run_dpdk_impl::<SectorWriter>(config, factory, decoder, encoder, dpdk_config, shutdown)
-        }
+        melin_journal::JournalWriterMode::Sector => run_dpdk_impl::<SectorWriter>(
+            config,
+            factory,
+            decoder,
+            encoder,
+            event_publisher,
+            dpdk_config,
+            shutdown,
+        ),
     }
 }
 
@@ -1743,6 +1795,7 @@ fn run_dpdk_impl<W>(
     factory: Arc<dyn AppFactory<App = App>>,
     decoder: RequestDecoderArc<App>,
     encoder: ResponseEncoderArc<App>,
+    event_publisher: Option<EventPublisherFn>,
     dpdk_config: melin_dpdk::DpdkConfig,
     shutdown: Arc<AtomicBool>,
 ) -> Result<(), Box<dyn std::error::Error>>
@@ -1853,6 +1906,7 @@ where
                     &*factory,
                     decoder,
                     encoder,
+                    event_publisher,
                     shutdown,
                     authorized_keys,
                     false,
@@ -1935,7 +1989,12 @@ where
     };
 
     // Build disruptor pipeline (same flags as the kernel TCP path).
-    let enable_event_publisher = config.event_bind.is_some();
+    // DPDK doesn't currently spawn the publisher thread (see
+    // `event_publisher: None` in the handles bundle further down) but
+    // gating consumer allocation on the same `Some`/`event_bind` pair
+    // the kernel-TCP path uses means passing `None` from the binary is
+    // honoured here too — no orphan consumer slot is wired up.
+    let enable_event_publisher = event_publisher.is_some() && config.event_bind.is_some();
     let enable_shadow = config.snapshot_interval_ms > 0;
     let Pipeline {
         input_producer,
@@ -2549,20 +2608,23 @@ where
     Ok((app, writer, needs_seeding))
 }
 
-/// Spawn the event-publisher thread if the consumer was wired. The
-/// publisher is trading-only (it depends on `melin-market-data` for book
-/// mirrors); under the skip-order-exec build this is a no-op and
-/// `consumer` is always `None`.
-#[cfg(feature = "trading")]
+/// Spawn the event-publisher thread on the affinity core configured by
+/// `cores.event_publisher`, delegating the loop body to the
+/// caller-supplied [`EventPublisherFn`]. Returns `Ok(None)` when either
+/// the consumer slot wasn't wired (the pipeline build saw
+/// `enable_event_publisher == false`) or the binary passed no
+/// publisher fn. The runtime owns thread lifecycle and CPU pinning so
+/// the caller's fn stays domain-only.
 fn spawn_event_publisher(
-    consumer: Option<melin_disruptor::ring::Consumer<crate::OutputSlot>>,
+    consumer: Option<Consumer<crate::OutputSlot>>,
+    run_fn: Option<EventPublisherFn>,
     config: &ServerConfig,
     cores: &PipelineCores,
     authorized_keys: &Arc<AuthorizedKeys>,
     shutdown: &Arc<AtomicBool>,
     busy_spin: bool,
 ) -> Result<Option<std::thread::JoinHandle<()>>, Box<dyn std::error::Error>> {
-    let Some(event_consumer) = consumer else {
+    let (Some(event_consumer), Some(run_fn)) = (consumer, run_fn) else {
         return Ok(None);
     };
     let event_bind = config
@@ -2575,32 +2637,11 @@ fn spawn_event_publisher(
         .name("event-publisher".into())
         .spawn(move || {
             melin_app::affinity::pin_thread("event-publisher", event_core);
-            crate::domain::event_publisher::run(
-                event_consumer,
-                event_bind,
-                event_keys,
-                &s_event,
-                busy_spin,
-            );
+            run_fn(event_consumer, event_bind, event_keys, &s_event, busy_spin);
         })
         .map_err(|e| format!("spawn event publisher thread: {e}"))?;
     info!(addr = %event_bind, "event publisher started");
     Ok(Some(event_handle))
-}
-
-#[cfg(not(feature = "trading"))]
-fn spawn_event_publisher(
-    consumer: Option<melin_disruptor::ring::Consumer<crate::OutputSlot>>,
-    _config: &ServerConfig,
-    _cores: &PipelineCores,
-    _authorized_keys: &Arc<AuthorizedKeys>,
-    _shutdown: &Arc<AtomicBool>,
-    _busy_spin: bool,
-) -> Result<Option<std::thread::JoinHandle<()>>, Box<dyn std::error::Error>> {
-    // Caller suppresses event-publisher wiring via `enable_event_publisher`
-    // under the skip-order-exec feature, so the consumer is always None.
-    debug_assert!(consumer.is_none());
-    Ok(None)
 }
 
 /// Perform challenge-response authentication on a new connection.

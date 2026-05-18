@@ -90,6 +90,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Arc::new(melin_server::domain::request::ExchangeRequestDecoder);
     let encoder: melin_server::runtime::response::ResponseEncoderArc<melin_server::App> =
         Arc::new(melin_server::domain::response_encoder::ExchangeResponseEncoder);
+    // Event publisher is trading-only: under `trading` the binary wires
+    // the market-data publisher fn; under `skip-order-exec` no publisher
+    // exists, so we pass `None` and the runtime never allocates the
+    // consumer slot.
+    let event_publisher: Option<melin_server::runtime::server::EventPublisherFn> = {
+        #[cfg(feature = "trading")]
+        {
+            Some(melin_server::domain::event_publisher::run)
+        }
+        #[cfg(not(feature = "trading"))]
+        {
+            None
+        }
+    };
 
     if !config.no_mlock {
         try_lock_memory();
@@ -103,6 +117,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             factory,
             decoder,
             encoder,
+            event_publisher,
             dpdk_config,
             shutdown,
         )
@@ -112,7 +127,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     {
         let listener = BlockingTcpListener::bind(config.bind)?;
         melin_server::runtime::server::run_with_shutdown(
-            listener, config, factory, decoder, encoder, shutdown,
+            listener,
+            config,
+            factory,
+            decoder,
+            encoder,
+            event_publisher,
+            shutdown,
         )
     }
 }

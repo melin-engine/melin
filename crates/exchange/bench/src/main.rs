@@ -1826,11 +1826,20 @@ fn start_server<L: BlockingTransportListener>(
         Arc::new(melin_server::domain::request::ExchangeRequestDecoder);
     let encoder: melin_server::runtime::response::ResponseEncoderArc<melin_server::App> =
         Arc::new(melin_server::domain::response_encoder::ExchangeResponseEncoder);
+    // The bench has no event subscribers; pass `None` so the runtime
+    // never allocates the publisher consumer slot.
+    let event_publisher: Option<melin_server::runtime::server::EventPublisherFn> = None;
     std::thread::Builder::new()
         .name("server".into())
         .spawn(move || {
             if let Err(e) = melin_server::runtime::server::run_with_shutdown(
-                listener, config, factory, decoder, encoder, shutdown,
+                listener,
+                config,
+                factory,
+                decoder,
+                encoder,
+                event_publisher,
+                shutdown,
             ) {
                 eprintln!("server error: {e}");
             }
