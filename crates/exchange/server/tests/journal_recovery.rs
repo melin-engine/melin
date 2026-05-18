@@ -116,13 +116,10 @@ mod tests {
 
         /// Journal the withdraw event unconditionally (so replay re-
         /// fires the same rejection), then call `Exchange::withdraw`
-        /// directly to capture the rejection.
-        ///
-        /// Bypasses `apply_journaled` because the pipeline's
-        /// `TradingEvent::Withdraw` arm discards rejections today
-        /// (`let _ = self.withdraw(...)` in `application_impl.rs`).
-        /// `Exchange::withdraw` is the only API that surfaces them —
-        /// flagged on the roadmap as item #15.
+        /// directly to capture the rejection as a `Result` for the
+        /// caller. The pipeline path (`ServerApp::apply`) surfaces
+        /// the same rejection as an `ExecutionReport::Rejected`, but
+        /// this helper wants the typed `Result` for in-test assertions.
         fn withdraw(
             &mut self,
             account: AccountId,
@@ -406,13 +403,10 @@ mod tests {
     fn withdraw_insufficient_balance_returns_error() {
         // Property test on `Exchange::withdraw` directly: it must
         // surface the underlying RejectReason rather than returning Ok
-        // on failure.
-        //
-        // Note: in the live pipeline the `TradingEvent::Withdraw` arm
-        // (see `application_impl.rs`) currently *discards* this error
-        // and the client sees no response. A test routed through the
-        // journaled path would be testing a synthetic contract; the
-        // domain property lives on `Exchange::withdraw`.
+        // on failure. The pipeline-level surfacing (an
+        // `ExecutionReport::Rejected` emitted from `ServerApp::apply`)
+        // is covered by a unit test in `exchange_app.rs`; this test
+        // pins the engine-level contract those layers rely on.
         let mut exchange = Exchange::new();
         exchange.deposit(ACCT_A, USD, 100);
         let err = exchange.withdraw(ACCT_A, USD, 200).unwrap_err();
