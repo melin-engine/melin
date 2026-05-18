@@ -174,6 +174,15 @@ REPLICA2_JOURNAL="${JOURNAL_DIR}/replica2.journal"
 REPL_PORT=9877
 RUN_PLOTS="${RUN_PLOTS:-0}"
 
+# Open-loop target rate in orders/sec for the throughput workload.
+# `0` (default) keeps closed-loop window-filling. When set, the bench
+# paces sends at the requested rate and feeds *scheduled* timestamps
+# into the latency histogram (coordinated-omission fix). Requires a
+# non-zero --window; the script's THROUGHPUT_WINDOW already provides
+# one. Only wired into the throughput workload — single is a window=1
+# unloaded-latency probe and pacing it would defeat the purpose.
+TARGET_RATE="${TARGET_RATE:-0}"
+
 # Primary server args.
 SERVER_EXTRA_ARGS="${SERVER_EXTRA_ARGS-}"
 
@@ -1460,6 +1469,8 @@ workload_throughput() {
     if [[ -n "${COOLDOWN_DURATION}" ]]; then cooldown_arg="--cooldown-duration ${COOLDOWN_DURATION}"; fi
     local threads_arg=""
     if [[ -n "${BENCH_THREADS:-}" ]]; then threads_arg="--bench-threads ${BENCH_THREADS}"; fi
+    local rate_arg=""
+    if [[ "${TARGET_RATE}" != "0" ]]; then rate_arg="--target-rate ${TARGET_RATE}"; fi
 
     if [[ "$transport" == dpdk* ]]; then
         ssh $SSH_OPTS "$BENCH" "cd ${REPO_DIR} && source ~/.cargo/env && \
@@ -1470,8 +1481,10 @@ workload_throughput() {
                 --json /tmp/bench-results.json \
                 --duration ${THROUGHPUT_DURATION} \
                 --accounts ${BENCH_ACCOUNTS} \
-                ${BENCH_DPDK_ARGS} ${warmup_arg} ${cooldown_arg} ${threads_arg} \
+                ${BENCH_DPDK_ARGS} ${warmup_arg} ${cooldown_arg} ${threads_arg} ${rate_arg} \
                 --clients ${THROUGHPUT_CLIENTS} --window ${THROUGHPUT_WINDOW}"
+    elif [[ -n "${rate_arg}" ]]; then
+        run_bench "$CURRENT_BIND" "$CURRENT_HEALTH" "${THROUGHPUT_DURATION}" --accounts "${BENCH_ACCOUNTS}" --clients "${THROUGHPUT_CLIENTS}" --window "${THROUGHPUT_WINDOW}" --target-rate "${TARGET_RATE}"
     else
         run_bench "$CURRENT_BIND" "$CURRENT_HEALTH" "${THROUGHPUT_DURATION}" --accounts "${BENCH_ACCOUNTS}" --clients "${THROUGHPUT_CLIENTS}" --window "${THROUGHPUT_WINDOW}"
     fi
