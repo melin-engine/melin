@@ -80,6 +80,7 @@ melin-server = { path = "../server", default-features = false }
 melin-app = { path = "../../core/app" }
 melin-transport-core = { path = "../../core/transport-core" }
 base64 = { workspace = true }
+blake3 = { workspace = true }
 clap = { workspace = true }
 ed25519-dalek = { workspace = true }
 getrandom = "0.3"

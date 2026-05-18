@@ -275,10 +275,9 @@ pub struct OrderFlowGenerator {
     odd_lot_exponent: f64,
     /// Pre-built uniform distribution for symbol selection.
     symbol_dist: Uniform<u32>,
-    /// Per-generator monotonic sequence for idempotency dedup. Increments on
-    /// every wire frame produced. Lives in the generator so streaming callers
-    /// can keep generator + seq paired in one place (was a local in the old
-    /// `generate_frames` helper).
+    /// Per-generator monotonic sequence for idempotency dedup. Each
+    /// bench client uses its own signing key, so the engine's per-key
+    /// HWM is partitioned per connection and this counter is private.
     seq: u64,
 }
 

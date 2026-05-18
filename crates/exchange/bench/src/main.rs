@@ -48,6 +48,7 @@
 
 mod generator;
 mod health_poller;
+mod keys;
 mod stats_client;
 
 #[cfg(feature = "dpdk")]
@@ -626,6 +627,13 @@ struct BenchArgs {
     /// should be near-zero.
     #[arg(long, default_value_t = 50.0)]
     max_reject_pct: f64,
+    /// Utility mode: print `authorized_keys` lines for `--clients`
+    /// derived child keys and exit. Used by the LAN bench script to
+    /// populate the server's authorized_keys file with the same per-
+    /// client pubkeys the bench will authenticate as. Requires `--key`.
+    /// No bench runs in this mode.
+    #[arg(long)]
+    print_authorized_keys: bool,
 }
 
 fn main() {
@@ -636,6 +644,25 @@ fn main() {
         .init();
 
     let args = <BenchArgs as clap::Parser>::parse();
+
+    // Utility mode — print authorized_keys lines for `--clients`
+    // derived child keys and exit. Used by the LAN bench script.
+    if args.print_authorized_keys {
+        let key_path = args.key.as_deref().unwrap_or_else(|| {
+            eprintln!("error: --key is required with --print-authorized-keys");
+            std::process::exit(1);
+        });
+        let master = load_signing_key(key_path);
+        for i in 0..args.clients {
+            let child = keys::derive_client_key(&master, i as u32);
+            println!(
+                "{}",
+                keys::authorized_keys_line(&child, &format!("bench-{i}"))
+            );
+        }
+        return;
+    }
+
     let json_path = args.json.as_deref();
     let phases = BenchPhases {
         warmup: args.warmup_duration.into(),
@@ -1667,16 +1694,23 @@ fn run_roundtrip_bench(
     }
 
     // Local mode: spawn an embedded server.
-    // Generate a deterministic bench key and matching authorized_keys file.
+    // Generate a deterministic bench master key and write the N derived
+    // per-client pubkeys to authorized_keys — every client connection
+    // authenticates with its own derived key so the engine's per-key
+    // dedup HWM partitions cleanly across connections.
     let bench_key = ed25519_dalek::SigningKey::from_bytes(&[0xBE; 32]);
     let tmp_dir = tempdir();
     let keys_path = tmp_dir.join("authorized_keys");
-    let pub_key_b64 = base64::Engine::encode(
-        &base64::engine::general_purpose::STANDARD,
-        bench_key.verifying_key().to_bytes(),
-    );
-    std::fs::write(&keys_path, format!("trader {pub_key_b64} bench\n"))
-        .expect("write authorized_keys");
+    let authorized_keys = (0..num_clients)
+        .map(|i| {
+            let child = keys::derive_client_key(&bench_key, i as u32);
+            format!(
+                "{}\n",
+                keys::authorized_keys_line(&child, &format!("bench-{i}"))
+            )
+        })
+        .collect::<String>();
+    std::fs::write(&keys_path, authorized_keys).expect("write authorized_keys");
 
     let effective_journal = journal_path.unwrap_or_else(|| tmp_dir.join("bench.journal"));
 
@@ -2159,15 +2193,26 @@ fn run_uring_roundtrip<R, W, F>(
         .collect();
     eprintln!("  per-client generators initialised for {num_clients} clients");
 
+    // Per-client signing keys: the engine dedups by `(key_hash,
+    // request_seq)` with a single per-key HWM that only advances. If
+    // every connection shared one key, the leading client's seq would
+    // jump the HWM and every other connection's request would be
+    // rejected as `DuplicateRequest`. Deriving a child key per client
+    // gives each connection its own `key_hash`, so dedup is partitioned
+    // per connection and seqs can grow independently.
+    let client_keys: Vec<ed25519_dalek::SigningKey> = (0..num_clients)
+        .map(|i| keys::derive_client_key(key, i as u32))
+        .collect();
+
     // Connect and auth all clients in parallel via rayon — independent
     // network handshakes that amortise nicely across a thread pool.
     use rayon::prelude::*;
     let setup_start = Instant::now();
     let connected: Vec<(R, W)> = (0..num_clients)
         .into_par_iter()
-        .map(|_| {
+        .map(|i| {
             let (mut read_stream, write_stream) = connect();
-            auth_handshake(&mut read_stream, key);
+            auth_handshake(&mut read_stream, &client_keys[i]);
             (read_stream, write_stream)
         })
         .collect();

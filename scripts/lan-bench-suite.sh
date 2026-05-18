@@ -570,7 +570,20 @@ ssh $SSH_OPTS "$BENCH" "cd ${REPO_DIR} && \
         echo 'bench.key already exists'; \
     fi"
 
-AUTH_LINE=$(ssh $SSH_OPTS "$BENCH" "cd ${REPO_DIR} && cat bench.pub | xargs -I{} echo 'trader {} bench'")
+# Derive per-client signing keys from bench.key and emit one
+# authorized_keys line per derived child. The engine dedups by
+# (key_hash, request_seq) with a single per-key HWM, so every bench
+# connection needs its own key — sharing one collapses every
+# connection into one HWM and the leader rejects everyone else as
+# DuplicateRequest. 1024 entries covers the largest sweep-clients
+# workload; extra entries cost nothing at server startup (HashMap
+# insert) and runtime (no lookup hit on unused entries).
+AUTH_KEYS_COUNT=1024
+AUTH_LINE=$(ssh $SSH_OPTS "$BENCH" "cd ${REPO_DIR} && \
+    ./target/release/melin-bench \
+        --key bench.key \
+        --clients ${AUTH_KEYS_COUNT} \
+        --print-authorized-keys")
 
 # Generate replication key on server if any replication transport is used.
 REPL_AUTH_LINE=""
@@ -603,12 +616,17 @@ if [[ "$HAS_REPL" == "1" ]]; then
     rm -f /tmp/repl.key
 fi
 
-# Write authorized_keys on server (trader + replication).
-FULL_AUTH="${AUTH_LINE}"
-if [[ -n "$REPL_AUTH_LINE" ]]; then
-    FULL_AUTH="${FULL_AUTH}\n${REPL_AUTH_LINE}"
-fi
-ssh $SSH_OPTS "$SERVER" "cd ${REPO_DIR} && echo -e '${FULL_AUTH}' > authorized_keys"
+# Write authorized_keys on server (trader keys + replication).
+# AUTH_LINE is multi-line (one per derived client key) so we pipe it
+# through ssh stdin rather than embedding it in the remote command — a
+# single-quoted command string would lose the line breaks during local
+# expansion.
+{
+    printf '%s\n' "${AUTH_LINE}"
+    if [[ -n "$REPL_AUTH_LINE" ]]; then
+        printf '%s\n' "${REPL_AUTH_LINE}"
+    fi
+} | ssh $SSH_OPTS "$SERVER" "cat > ${REPO_DIR}/authorized_keys"
 
 # Distribute authorized_keys to replicas so they don't use stale files.
 if [[ -n "$REPLICA" ]]; then

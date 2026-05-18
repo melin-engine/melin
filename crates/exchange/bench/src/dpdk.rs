@@ -336,6 +336,14 @@ pub fn run_dpdk_roundtrip(
         .collect();
     eprintln!("  per-client generators initialised for {num_clients} clients");
 
+    // Per-client signing keys — see the matching comment in main.rs.
+    // The engine dedups by `(key_hash, request_seq)` with a single
+    // per-key HWM; sharing one key collapses every connection into one
+    // namespace and the leader's HWM rejects everyone else's requests.
+    let client_keys: Vec<ed25519_dalek::SigningKey> = (0..num_clients)
+        .map(|i| crate::keys::derive_client_key(key, i as u32))
+        .collect();
+
     // Sequential connect + auth — smoltcp's TCP stack is single-threaded
     // and shared across all sockets via the same `Interface` poll loop.
     // Per-client SYN-then-auth ordering avoids the auth-deadlock risk of
@@ -397,6 +405,7 @@ pub fn run_dpdk_roundtrip(
         // Auth handshake.
         {
             let conn = std::slice::from_mut(connections.last_mut().unwrap());
+            let conn_key = std::slice::from_ref(&client_keys[client_id]);
             dpdk_auth_all(
                 conn,
                 &mut device,
@@ -404,7 +413,7 @@ pub fn run_dpdk_roundtrip(
                 &mut sockets,
                 &mut poll_count,
                 &mut cached_ts,
-                key,
+                conn_key,
             );
         }
 
@@ -882,6 +891,11 @@ pub fn run_dpdk_roundtrip(
 
 /// Run the auth handshake for all connections over smoltcp.
 /// Polls until all connections complete Challenge → ChallengeResponse → ServerReady.
+///
+/// `keys` must have one entry per connection — each connection signs the
+/// challenge with its own key so the engine's per-key dedup HWM is
+/// partitioned per connection. See `keys::derive_client_key` for the
+/// derivation contract.
 fn dpdk_auth_all(
     connections: &mut [DpdkBenchConn],
     device: &mut DpdkDevice,
@@ -889,8 +903,13 @@ fn dpdk_auth_all(
     sockets: &mut SocketSet<'_>,
     poll_count: &mut u32,
     cached_ts: &mut SmolInstant,
-    key: &ed25519_dalek::SigningKey,
+    keys: &[ed25519_dalek::SigningKey],
 ) {
+    assert_eq!(
+        connections.len(),
+        keys.len(),
+        "dpdk_auth_all: one key required per connection",
+    );
     use ed25519_dalek::Signer;
     use melin_protocol::message::Request;
 
@@ -971,10 +990,11 @@ fn dpdk_auth_all(
                     // Sign nonce + ephemerals (DPDK TCP uses zero ephs)
                     // — see `melin_protocol::auth::auth_signing_payload`.
                     let signing_payload = melin_protocol::auth::auth_signing_payload(&nonce);
-                    let signature = key.sign(&signing_payload);
+                    let conn_key = &keys[i];
+                    let signature = conn_key.sign(&signing_payload);
                     let request = Request::ChallengeResponse {
                         signature: signature.to_bytes(),
-                        public_key: key.verifying_key().to_bytes(),
+                        public_key: conn_key.verifying_key().to_bytes(),
                     };
                     let mut buf = [0u8; 256];
                     let written = codec::encode_request(&request, 0, &mut buf)
