@@ -8,6 +8,7 @@
 use melin_app::auth::Permission;
 use melin_app::decoder::{Decoded, RequestDecoder};
 use melin_protocol::codec;
+use melin_protocol::error::ProtocolError;
 use melin_protocol::message::Request;
 use melin_trading::trading_event::TradingEvent;
 
@@ -15,7 +16,7 @@ use melin_trading::trading_event::TradingEvent;
 ///
 /// Zero-sized. The runtime owns an `Arc<dyn RequestDecoder<...>>`;
 /// constructing one is `Arc::new(TradingRequestDecoder)`.
-#[derive(Debug, Default, Clone, Copy)]
+#[derive(Debug, Clone, Copy)]
 pub struct TradingRequestDecoder;
 
 impl RequestDecoder for TradingRequestDecoder {
@@ -24,10 +25,7 @@ impl RequestDecoder for TradingRequestDecoder {
     fn decode(&self, bytes: &[u8], permission: Permission) -> Decoded<TradingEvent> {
         let (request_seq, request) = match codec::decode_request(bytes) {
             Ok(pair) => pair,
-            // The protocol codec returns a typed error; collapsing to a
-            // static reason matches the reader's debug-log granularity
-            // and keeps the trait return type small.
-            Err(_) => return Decoded::DecodeError("malformed request frame"),
+            Err(e) => return Decoded::DecodeError(protocol_error_reason(&e)),
         };
 
         if should_filter(&request) {
@@ -45,6 +43,21 @@ impl RequestDecoder for TradingRequestDecoder {
     }
 }
 
+/// Collapse a typed `ProtocolError` into the static reason carried by
+/// `Decoded::DecodeError`. The reader's debug log surfaces this
+/// reason; a misbehaving client gets diagnosed without exposing the
+/// full error chain.
+#[inline]
+fn protocol_error_reason(e: &ProtocolError) -> &'static str {
+    match e {
+        ProtocolError::Truncated => "truncated frame",
+        ProtocolError::UnknownTag(_) => "unknown variant tag",
+        ProtocolError::InvalidField(_) => "invalid field",
+        ProtocolError::MessageTooLarge(_) => "message too large",
+        ProtocolError::Io(_) => "io error",
+    }
+}
+
 /// Transport-level frames the runtime never publishes to the
 /// pipeline: heartbeats, post-auth handshakes, subscription control.
 #[inline]
@@ -59,7 +72,10 @@ fn should_filter(request: &Request) -> bool {
 /// - Operator: exchange configuration (instruments, risk, circuit breakers, fees, EOD, stats)
 /// - Custodian: fund management (deposit, withdraw)
 /// - Trader: order submission and cancellation
-/// - ReadOnly: heartbeats only (filtered before this function)
+/// - ReadOnly: rejected here for anything that isn't filtered out above
+///   (heartbeats / handshakes / subscribe never reach this function;
+///   any other request from a ReadOnly connection falls into the final
+///   clause and is denied for lacking `can_trade`).
 #[inline]
 fn check_permission(request: &Request, permission: Permission) -> Result<(), &'static str> {
     if request.requires_operator() && !permission.is_operator() {
@@ -138,7 +154,7 @@ fn to_trading_event(request: &Request) -> TradingEvent {
         Request::EnableInstrument { symbol } => TradingEvent::EnableInstrument { symbol },
         Request::RemoveInstrument { symbol } => TradingEvent::RemoveInstrument { symbol },
         Request::Heartbeat | Request::ChallengeResponse { .. } | Request::Subscribe { .. } => {
-            unreachable!("filtered before to_event")
+            unreachable!("filtered before to_trading_event")
         }
     }
 }
@@ -176,6 +192,21 @@ mod tests {
     #[test]
     fn heartbeat_is_filtered() {
         let bytes = encode(&Request::Heartbeat, 0);
+        assert!(matches!(
+            TradingRequestDecoder.decode(&bytes, Permission::Trader),
+            Decoded::Filter
+        ));
+    }
+
+    #[test]
+    fn subscribe_is_filtered() {
+        let bytes = encode(
+            &Request::Subscribe {
+                symbols: [Symbol(0); 8],
+                count: 0,
+            },
+            0,
+        );
         assert!(matches!(
             TradingRequestDecoder.decode(&bytes, Permission::Trader),
             Decoded::Filter
@@ -484,13 +515,13 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "filtered before to_event")]
+    #[should_panic(expected = "filtered before to_trading_event")]
     fn heartbeat_panics_if_not_filtered() {
         to_trading_event(&Request::Heartbeat);
     }
 
     #[test]
-    #[should_panic(expected = "filtered before to_event")]
+    #[should_panic(expected = "filtered before to_trading_event")]
     fn challenge_response_panics_if_not_filtered() {
         to_trading_event(&Request::ChallengeResponse {
             signature: [0u8; 64],
