@@ -30,7 +30,11 @@ use melin_transport_core::pipeline::{
     InputSlot, JournalStage, JournalStageRun, OutputSlot as GenericOutputSlot,
     Pipeline as GenericPipeline, build_pipeline_with_replication,
 };
-pub type Pipeline<A, W> = GenericPipeline<A, W>;
+/// Internal alias for the disruptor-built pipeline, used only by
+/// destructuring `let Pipeline { … }` patterns inside the boot path.
+/// Not part of the public API — callers reach the underlying type
+/// through `melin_transport_core::pipeline`.
+type Pipeline<A, W> = GenericPipeline<A, W>;
 
 use crate::runtime::reader::RequestDecoderArc;
 use crate::runtime::response::ResponseEncoderArc;
