@@ -199,6 +199,12 @@ THROUGHPUT_DURATION="${THROUGHPUT_DURATION:-60s}"
 THROUGHPUT_CLIENTS="${THROUGHPUT_CLIENTS:-16}"
 THROUGHPUT_WINDOW="${THROUGHPUT_WINDOW:-128}"
 SINGLE_DURATION="${SINGLE_DURATION:-30s}"
+# Account / instrument cardinality for the throughput + single
+# workloads. Higher account counts spread Zipf-distributed order flow
+# across more per-account rate-limit buckets — at multi-M-orders/sec
+# loads a small account pool saturates the buckets and inflates
+# ExceedsOrderRate rejections.
+BENCH_ACCOUNTS="${BENCH_ACCOUNTS:-100000}"
 WARMUP_DURATION="${WARMUP_DURATION:-}"   # empty = bench default (5s)
 COOLDOWN_DURATION="${COOLDOWN_DURATION:-}"  # empty = bench default (5s)
 SWEEP_DURATION="${SWEEP_DURATION:-30s}"
@@ -1463,10 +1469,11 @@ workload_throughput() {
                 --key bench.key \
                 --json /tmp/bench-results.json \
                 --duration ${THROUGHPUT_DURATION} \
+                --accounts ${BENCH_ACCOUNTS} \
                 ${BENCH_DPDK_ARGS} ${warmup_arg} ${cooldown_arg} ${threads_arg} \
                 --clients ${THROUGHPUT_CLIENTS} --window ${THROUGHPUT_WINDOW}"
     else
-        run_bench "$CURRENT_BIND" "$CURRENT_HEALTH" "${THROUGHPUT_DURATION}" --clients "${THROUGHPUT_CLIENTS}" --window "${THROUGHPUT_WINDOW}"
+        run_bench "$CURRENT_BIND" "$CURRENT_HEALTH" "${THROUGHPUT_DURATION}" --accounts "${BENCH_ACCOUNTS}" --clients "${THROUGHPUT_CLIENTS}" --window "${THROUGHPUT_WINDOW}"
     fi
     collect_result "${transport}-throughput"
 }
@@ -1493,10 +1500,11 @@ workload_single() {
                 --key bench.key \
                 --json /tmp/bench-results.json \
                 --duration ${SINGLE_DURATION} \
+                --accounts ${BENCH_ACCOUNTS} \
                 ${BENCH_DPDK_ARGS} ${warmup_arg} ${cooldown_arg} \
                 --clients 1 --window 1"
     else
-        run_bench "$CURRENT_BIND" "$CURRENT_HEALTH" "${SINGLE_DURATION}" --clients 1 --window 1
+        run_bench "$CURRENT_BIND" "$CURRENT_HEALTH" "${SINGLE_DURATION}" --accounts "${BENCH_ACCOUNTS}" --clients 1 --window 1
     fi
     collect_result "${transport}-single"
 }
