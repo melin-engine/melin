@@ -50,8 +50,6 @@ struct BenchResult {
     #[allow(dead_code)]
     measured_orders: u64,
     #[allow(dead_code)]
-    warmup_orders: u64,
-    #[allow(dead_code)]
     wall_ms: f64,
     throughput_ops: f64,
     latency: BTreeMap<String, f64>,
