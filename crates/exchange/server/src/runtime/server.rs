@@ -33,6 +33,8 @@ use melin_transport_core::pipeline::{
 };
 pub type Pipeline<W> = GenericPipeline<App, W>;
 
+use crate::runtime::reader::RequestDecoderArc;
+use crate::runtime::response::ResponseEncoderArc;
 use melin_app::app_factory::AppFactory;
 use melin_app::auth::Permission;
 use melin_protocol::auth::AuthorizedKeys;
@@ -543,18 +545,33 @@ fn parse_cores(s: &str) -> Result<PipelineCores, String> {
 ///
 /// `factory` constructs fresh `App` instances for the recovery and
 /// replication paths and yields the bulk-seed events a fresh primary
-/// journals at startup. The trading binary constructs an
-/// [`ExchangeAppFactory`](crate::domain::app_factory::ExchangeAppFactory);
-/// alternative applications plug in a different `AppFactory` impl
-/// without touching the runtime.
+/// journals at startup. `decoder` parses inbound client frames into
+/// `App::Event` values for the input ring; `encoder` serialises
+/// `App::Report` / `App::QueryResponse` values into wire frames on the
+/// response stage. The trading binary constructs the three trading-side
+/// impls
+/// ([`ExchangeAppFactory`](crate::domain::app_factory::ExchangeAppFactory),
+/// [`ExchangeRequestDecoder`](crate::domain::request::ExchangeRequestDecoder),
+/// [`ExchangeResponseEncoder`](crate::domain::response_encoder::ExchangeResponseEncoder));
+/// alternative applications plug in different trait impls without
+/// touching the runtime.
 ///
 /// Returns when the listener encounters a fatal error.
 pub fn run<L: BlockingTransportListener>(
     listener: L,
     config: ServerConfig,
     factory: Arc<dyn AppFactory<App = App>>,
+    decoder: RequestDecoderArc<App>,
+    encoder: ResponseEncoderArc<App>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    run_with_shutdown(listener, config, factory, Arc::new(AtomicBool::new(false)))
+    run_with_shutdown(
+        listener,
+        config,
+        factory,
+        decoder,
+        encoder,
+        Arc::new(AtomicBool::new(false)),
+    )
 }
 
 /// Run the trading server with an externally controlled shutdown flag.
@@ -566,6 +583,8 @@ pub fn run_with_shutdown<L: BlockingTransportListener>(
     listener: L,
     config: ServerConfig,
     factory: Arc<dyn AppFactory<App = App>>,
+    decoder: RequestDecoderArc<App>,
+    encoder: ResponseEncoderArc<App>,
     shutdown: Arc<AtomicBool>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // Dispatch on the operator-selected journal writer. Each branch
@@ -574,12 +593,12 @@ pub fn run_with_shutdown<L: BlockingTransportListener>(
     // takes the writer type as a parameter rather than reading the mode
     // at runtime.
     match config.journal_writer {
-        melin_journal::JournalWriterMode::Buffered => {
-            run_with_shutdown_impl::<L, BufferedWriter>(listener, config, factory, shutdown)
-        }
-        melin_journal::JournalWriterMode::Sector => {
-            run_with_shutdown_impl::<L, SectorWriter>(listener, config, factory, shutdown)
-        }
+        melin_journal::JournalWriterMode::Buffered => run_with_shutdown_impl::<L, BufferedWriter>(
+            listener, config, factory, decoder, encoder, shutdown,
+        ),
+        melin_journal::JournalWriterMode::Sector => run_with_shutdown_impl::<L, SectorWriter>(
+            listener, config, factory, decoder, encoder, shutdown,
+        ),
     }
 }
 
@@ -587,6 +606,8 @@ fn run_with_shutdown_impl<L, W>(
     listener: L,
     config: ServerConfig,
     factory: Arc<dyn AppFactory<App = App>>,
+    decoder: RequestDecoderArc<App>,
+    encoder: ResponseEncoderArc<App>,
     shutdown: Arc<AtomicBool>,
 ) -> Result<(), Box<dyn std::error::Error>>
 where
@@ -699,6 +720,8 @@ where
                     listener,
                     &config,
                     &*factory,
+                    decoder,
+                    encoder,
                     shutdown,
                     authorized_keys,
                     false, // no seeding needed — state comes from replication
@@ -747,6 +770,8 @@ where
         listener,
         &config,
         &*factory,
+        decoder,
+        encoder,
         shutdown,
         authorized_keys,
         needs_seeding,
@@ -861,6 +886,8 @@ fn run_as_primary<L, W>(
     mut listener: L,
     config: &ServerConfig,
     factory: &dyn AppFactory<App = App>,
+    decoder: RequestDecoderArc<App>,
+    encoder: ResponseEncoderArc<App>,
     shutdown: Arc<AtomicBool>,
     authorized_keys: Arc<AuthorizedKeys>,
     needs_seeding: bool,
@@ -1119,7 +1146,7 @@ where
                     heartbeat_interval,
                     busy_spin,
                     utilization: response_utilization_thread,
-                    encoder: Arc::new(crate::domain::response_encoder::ExchangeResponseEncoder),
+                    encoder,
                 },
                 &s3,
             );
@@ -1470,7 +1497,7 @@ where
     let reader_shutdown = Arc::new(AtomicBool::new(false));
     let mut reader_handle = crate::runtime::reader::spawn_reader::<App, _>(
         input_producer,
-        Arc::new(crate::domain::request::ExchangeRequestDecoder),
+        decoder,
         control_tx.clone(),
         config.reader_cores,
         connection_timeout,
@@ -1689,16 +1716,23 @@ where
 pub fn run_dpdk(
     config: ServerConfig,
     factory: Arc<dyn AppFactory<App = App>>,
+    decoder: RequestDecoderArc<App>,
+    encoder: ResponseEncoderArc<App>,
     dpdk_config: melin_dpdk::DpdkConfig,
     shutdown: Arc<AtomicBool>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // Dispatch the DPDK boot path on the operator-selected journal writer.
     match config.journal_writer {
-        melin_journal::JournalWriterMode::Buffered => {
-            run_dpdk_impl::<BufferedWriter>(config, factory, dpdk_config, shutdown)
-        }
+        melin_journal::JournalWriterMode::Buffered => run_dpdk_impl::<BufferedWriter>(
+            config,
+            factory,
+            decoder,
+            encoder,
+            dpdk_config,
+            shutdown,
+        ),
         melin_journal::JournalWriterMode::Sector => {
-            run_dpdk_impl::<SectorWriter>(config, factory, dpdk_config, shutdown)
+            run_dpdk_impl::<SectorWriter>(config, factory, decoder, encoder, dpdk_config, shutdown)
         }
     }
 }
@@ -1707,6 +1741,8 @@ pub fn run_dpdk(
 fn run_dpdk_impl<W>(
     config: ServerConfig,
     factory: Arc<dyn AppFactory<App = App>>,
+    decoder: RequestDecoderArc<App>,
+    encoder: ResponseEncoderArc<App>,
     dpdk_config: melin_dpdk::DpdkConfig,
     shutdown: Arc<AtomicBool>,
 ) -> Result<(), Box<dyn std::error::Error>>
@@ -1815,6 +1851,8 @@ where
                     listener,
                     &config,
                     &*factory,
+                    decoder,
+                    encoder,
                     shutdown,
                     authorized_keys,
                     false,
@@ -2069,7 +2107,7 @@ where
                 tx_producers,
                 response_utilization_thread,
                 busy_spin,
-                Arc::new(crate::domain::response_encoder::ExchangeResponseEncoder),
+                encoder,
             );
         })
         .map_err(|e| format!("spawn response thread: {e}"))?;
@@ -2363,7 +2401,7 @@ where
     crate::runtime::dpdk_transport::run_dpdk_poll::<App>(
         transport_0,
         input_producer,
-        Arc::new(crate::domain::request::ExchangeRequestDecoder),
+        decoder,
         control_tx,
         tx_rx_0,
         &shutdown,

@@ -30,6 +30,12 @@ use melin_app::AppEvent;
 use melin_app::Application;
 use melin_app::auth::Permission;
 use melin_app::decoder::{Decoded, RequestDecoder};
+
+/// Decoder type alias: request decoder bound to the application's `Event`
+/// type. Mirrors [`crate::runtime::response::ResponseEncoderArc`]; hides
+/// the `dyn RequestDecoder<Event = …>` spelling at call sites that thread
+/// the decoder through several functions.
+pub type RequestDecoderArc<A> = Arc<dyn RequestDecoder<Event = <A as Application>::Event>>;
 use melin_app::unix_epoch_nanos;
 use melin_disruptor::ring;
 use melin_journal::JournalEvent;

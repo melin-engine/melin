@@ -1820,11 +1820,17 @@ fn start_server<L: BlockingTransportListener>(
     factory: Arc<dyn melin_app::app_factory::AppFactory<App = melin_server::App>>,
     shutdown: Arc<AtomicBool>,
 ) {
+    // Trading-side codecs constructed at the call boundary, mirroring
+    // the binary in `crates/exchange/server/src/main.rs`.
+    let decoder: melin_server::runtime::reader::RequestDecoderArc<melin_server::App> =
+        Arc::new(melin_server::domain::request::ExchangeRequestDecoder);
+    let encoder: melin_server::runtime::response::ResponseEncoderArc<melin_server::App> =
+        Arc::new(melin_server::domain::response_encoder::ExchangeResponseEncoder);
     std::thread::Builder::new()
         .name("server".into())
         .spawn(move || {
             if let Err(e) = melin_server::runtime::server::run_with_shutdown(
-                listener, config, factory, shutdown,
+                listener, config, factory, decoder, encoder, shutdown,
             ) {
                 eprintln!("server error: {e}");
             }

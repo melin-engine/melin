@@ -83,6 +83,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 max_orders_burst: config.max_orders_burst,
             },
         ));
+    // Trading-side wire codecs. The runtime takes these as trait objects
+    // so non-trading applications plug in their own codecs without
+    // touching server.rs.
+    let decoder: melin_server::runtime::reader::RequestDecoderArc<melin_server::App> =
+        Arc::new(melin_server::domain::request::ExchangeRequestDecoder);
+    let encoder: melin_server::runtime::response::ResponseEncoderArc<melin_server::App> =
+        Arc::new(melin_server::domain::response_encoder::ExchangeResponseEncoder);
 
     if !config.no_mlock {
         try_lock_memory();
@@ -91,13 +98,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     #[cfg(feature = "dpdk")]
     {
         let dpdk_config = dpdk_config_from(&config);
-        melin_server::runtime::server::run_dpdk(config, factory, dpdk_config, shutdown)
+        melin_server::runtime::server::run_dpdk(
+            config,
+            factory,
+            decoder,
+            encoder,
+            dpdk_config,
+            shutdown,
+        )
     }
 
     #[cfg(not(feature = "dpdk"))]
     {
         let listener = BlockingTcpListener::bind(config.bind)?;
-        melin_server::runtime::server::run_with_shutdown(listener, config, factory, shutdown)
+        melin_server::runtime::server::run_with_shutdown(
+            listener, config, factory, decoder, encoder, shutdown,
+        )
     }
 }
 
