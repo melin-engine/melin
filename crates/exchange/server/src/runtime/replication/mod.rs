@@ -377,6 +377,8 @@ mod tests {
 
     use super::auth::{authenticate_replica, authenticate_with_primary};
     use super::*;
+    use melin_trading::trading_event::TradingEvent;
+    type InputSlot = melin_transport_core::pipeline::InputSlot<TradingEvent>;
     use melin_transport_core::replication::protocol::{
         MAX_CONTROL_FRAME, MAX_DATA_FRAME, MSG_AUTH_OK, MSG_CHALLENGE_RESPONSE, MSG_SNAPSHOT_BEGIN,
         MSG_SNAPSHOT_CHUNK, MSG_SNAPSHOT_END, decode_auth_result, decode_challenge,
@@ -391,7 +393,7 @@ mod tests {
     /// slot at the given sequence — the protocol-level tests don't need
     /// real journal payloads, just something with a known max sequence.
     fn encode_input_batch_with_seq(end_sequence: u64, buf: &mut Vec<u8>) {
-        let slot = crate::InputSlot {
+        let slot = InputSlot {
             connection_id: 0,
             key_hash: 0,
             request_seq: 0,
@@ -823,8 +825,7 @@ mod tests {
 
             // Read InputBatch.
             let frame = read_frame(&mut reader, MAX_DATA_FRAME).unwrap();
-            let slots: Vec<crate::InputSlot> =
-                try_decode_input_batch(&frame).expect("decode InputBatch");
+            let slots: Vec<InputSlot> = try_decode_input_batch(&frame).expect("decode InputBatch");
             let end_seq = slots
                 .last()
                 .map(|s| s.sequence)
@@ -964,7 +965,7 @@ mod tests {
             let mut acked_seqs = Vec::new();
             for _ in 0..3 {
                 let frame = read_frame(&mut reader, MAX_DATA_FRAME).unwrap();
-                let slots: Vec<crate::InputSlot> =
+                let slots: Vec<InputSlot> =
                     try_decode_input_batch(&frame).expect("decode InputBatch");
                 let end_seq = slots
                     .last()
@@ -1084,8 +1085,7 @@ mod tests {
 
             // Read an InputBatch — should be for events AFTER 100.
             let frame = read_frame(&mut reader, MAX_DATA_FRAME).unwrap();
-            let slots: Vec<crate::InputSlot> =
-                try_decode_input_batch(&frame).expect("decode InputBatch");
+            let slots: Vec<InputSlot> = try_decode_input_batch(&frame).expect("decode InputBatch");
             let end_sequence = slots
                 .last()
                 .map(|s| s.sequence)

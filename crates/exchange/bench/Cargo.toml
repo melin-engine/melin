@@ -73,6 +73,7 @@ path = "src/journal_writer_bench.rs"
 melin-engine = { path = "../engine" }
 melin-trading = { path = "../trading" }
 melin-types = { path = "../types" }
+melin-journal = { path = "../../core/journal" }
 melin-disruptor = { path = "../../core/disruptor" }
 melin-protocol = { path = "../protocol" }
 melin-server = { path = "../server", default-features = false }

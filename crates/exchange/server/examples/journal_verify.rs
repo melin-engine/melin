@@ -6,7 +6,11 @@ fn main() {
     let path = std::env::args()
         .nth(1)
         .expect("usage: journal_verify <journal-path>");
-    let mut reader = melin_server::JournalReader::open(path.as_ref()).expect("open journal");
+    let mut reader =
+        melin_journal::JournalReader::<melin_trading::trading_event::TradingEvent>::open(
+            path.as_ref(),
+        )
+        .expect("open journal");
 
     let mut count = 0u64;
     let mut last_seq = 0u64;

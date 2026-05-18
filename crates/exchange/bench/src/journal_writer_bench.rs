@@ -31,10 +31,10 @@ use std::num::NonZero;
 use std::path::Path;
 use std::time::Instant;
 
-use melin_server::BufferedWriter;
-use melin_server::JournalEvent;
+use melin_journal::BufferedWriter;
+use melin_journal::JournalEvent;
+use melin_journal::SectorWriter;
 use melin_server::JournalWrite;
-use melin_server::SectorWriter;
 use melin_trading::trading_event::TradingEvent;
 
 #[derive(Parser)]
@@ -108,7 +108,7 @@ fn main() {
 
 /// Build a `SubmitOrder` event for slot `i`. Alternates Buy/Sell so the
 /// generated stream is not trivially compressible.
-fn make_event(i: usize) -> JournalEvent {
+fn make_event(i: usize) -> JournalEvent<TradingEvent> {
     let nz = |v: u64| NonZero::new(v).expect("non-zero");
     let order_id = melin_types::types::OrderId((i as u64) + 1);
     let side = if i.is_multiple_of(2) {
@@ -191,7 +191,7 @@ fn run_sync_mode<W: JournalWrite<TradingEvent>>(
 /// directly the way `run_uring` does in production on a sector replica.
 /// Sector-only; gated at the dispatch site in `main`.
 fn run_iouring_mode(
-    mut writer: SectorWriter,
+    mut writer: SectorWriter<TradingEvent>,
     num_events: usize,
     batch_size: usize,
     journal_path: &Path,

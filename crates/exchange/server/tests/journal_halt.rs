@@ -18,11 +18,18 @@ use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
 use melin_disruptor::padding::Sequence;
 use melin_disruptor::ring;
-use melin_server::{App, InputSlot, JournalEvent, OutputPayload, OutputSlot};
+use melin_journal::JournalEvent;
+use melin_server::App;
 use melin_trading::trading_event::TradingEvent;
 use melin_transport_core::pipeline::MatchingStage;
 use melin_transport_core::trace::mono_trace_ns;
 use melin_types::types::*;
+
+// Trading-bound aliases scoped to this integration test. Mirror the
+// concrete ring-slot shapes the server's runtime monomorphises against.
+type InputSlot = melin_transport_core::pipeline::InputSlot<TradingEvent>;
+type OutputSlot = melin_transport_core::pipeline::OutputSlot<ExecutionReport, QueryResponse>;
+type OutputPayload = melin_transport_core::pipeline::OutputPayload<ExecutionReport, QueryResponse>;
 
 /// Return type for `start_matching_with_halt`:
 /// (input_producer, output_consumer, connected_counter, shutdown, join_handle).

@@ -18,7 +18,7 @@ mod tests {
     use melin_engine::exchange::Exchange;
     // Import the concrete newtype (not the `pub type App = ServerApp`
     // alias) so it's usable as a tuple-struct constructor in `App(...)`.
-    use melin_server::BufferedWriter;
+    use melin_journal::BufferedWriter;
     use melin_server::domain::exchange_app::ServerApp as App;
     use melin_trading::trading_event::TradingEvent;
     use melin_types::types::*;
@@ -40,7 +40,7 @@ mod tests {
     /// see those zeros — fine for the recovery tests here, all of which
     /// are state-mutation only.
     struct TestExchange {
-        inner: JournaledApp<App, BufferedWriter>,
+        inner: JournaledApp<App, BufferedWriter<TradingEvent>>,
     }
 
     impl TestExchange {
@@ -547,7 +547,10 @@ mod tests {
 
         // Write journal entries with key_hash + request_seq.
         {
-            let mut writer = melin_server::SectorWriter::create(&path).unwrap();
+            let mut writer = melin_journal::SectorWriter::<
+                melin_trading::trading_event::TradingEvent,
+            >::create(&path)
+            .unwrap();
             let ts = melin_app::unix_epoch_nanos();
             // Deposit with seq=1
             writer
@@ -602,7 +605,10 @@ mod tests {
 
         // Create journaled exchange, write events with key_hash.
         {
-            let mut writer = melin_server::SectorWriter::create(&journal_path).unwrap();
+            let mut writer = melin_journal::SectorWriter::<
+                melin_trading::trading_event::TradingEvent,
+            >::create(&journal_path)
+            .unwrap();
             let ts = melin_app::unix_epoch_nanos();
             writer
                 .batch_append_with_ts(
@@ -652,7 +658,9 @@ mod tests {
     /// Helper: find the byte offset where valid journal data ends
     /// (after the last fully-written entry, before pre-allocated space).
     fn valid_data_end(path: &Path) -> u64 {
-        let mut reader = melin_server::JournalReader::open(path).unwrap();
+        let mut reader =
+            melin_journal::JournalReader::<melin_trading::trading_event::TradingEvent>::open(path)
+                .unwrap();
         while reader.next_entry().unwrap().is_some() {}
         reader.valid_file_end()
     }

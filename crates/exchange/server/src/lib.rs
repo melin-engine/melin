@@ -26,34 +26,6 @@ compile_error!(
 /// downstream modules.
 pub type App = domain::exchange_app::ServerApp;
 
-/// Trading-bound ring-slot aliases. The server operates on the trading
-/// wire format regardless of which mode it's built in (that's the
-/// whole point of skip-order-exec — same protocol, no matching).
-pub type JournalEvent = melin_journal::JournalEvent<melin_trading::trading_event::TradingEvent>;
-pub type InputSlot =
-    melin_transport_core::pipeline::InputSlot<melin_trading::trading_event::TradingEvent>;
-pub type OutputSlot = melin_transport_core::pipeline::OutputSlot<
-    melin_types::types::ExecutionReport,
-    melin_types::types::QueryResponse,
->;
-pub type OutputPayload = melin_transport_core::pipeline::OutputPayload<
-    melin_types::types::ExecutionReport,
-    melin_types::types::QueryResponse,
->;
-pub type SectorWriter = melin_journal::SectorWriter<melin_trading::trading_event::TradingEvent>;
-pub type BufferedWriter = melin_journal::BufferedWriter<melin_trading::trading_event::TradingEvent>;
-pub type JournalReader = melin_journal::JournalReader<melin_trading::trading_event::TradingEvent>;
-/// Crate-wide shorthand for the wire-event type. Keeps the
-/// `JournalWrite<TradingEvent>` / `JournalStageRun<TradingEvent, ...>`
-/// bounds at every generic boot-path call site short.
-pub type TradingEvent = melin_trading::trading_event::TradingEvent;
-
-/// `TradingEvent`-bound alias for the generic journal stage in
-/// transport-core. `W` is the concrete writer the caller picked at
-/// boot (sector vs buffered).
-pub type JournalStage<W> =
-    melin_transport_core::pipeline::JournalStage<melin_trading::trading_event::TradingEvent, W>;
-
 // Re-export the writer-selection enum + the generic pipeline / trace /
 // codec / replication modules at the server crate root. Bench and any
 // other downstream consumer now reach the LMAX-pipeline plumbing

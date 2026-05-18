@@ -1537,6 +1537,7 @@ dependencies = [
  "melin-disruptor",
  "melin-dpdk",
  "melin-engine",
+ "melin-journal",
  "melin-protocol",
  "melin-server",
  "melin-trading",

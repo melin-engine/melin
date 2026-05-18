@@ -30,8 +30,17 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use tracing::{debug, error, info, warn};
 
-use crate::{OutputPayload, OutputSlot};
 use melin_disruptor::ring;
+use melin_transport_core::pipeline::{
+    OutputPayload as GenericOutputPayload, OutputSlot as GenericOutputSlot,
+};
+
+// Trading-bound shorthand for the wire-format types this publisher
+// consumes. The runtime feeds it `Consumer<OutputSlot<A>>` where
+// `A = ServerApp`, so binding `A::Report`/`A::QueryResponse` here
+// keeps the rest of the file readable.
+type OutputSlot = GenericOutputSlot<ExecutionReport, QueryResponse>;
+type OutputPayload = GenericOutputPayload<ExecutionReport, QueryResponse>;
 use melin_market_data::mirror::BookMirror;
 use melin_protocol::auth::AuthorizedKeys;
 use melin_protocol::codec;
@@ -581,7 +590,6 @@ fn send_auth_failed(writer: &mut dyn Write) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::OutputSlot;
     use melin_types::types::*;
 
     /// Helper to create a Streaming subscriber for tests that bypass

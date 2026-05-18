@@ -1185,7 +1185,8 @@ fn run_pipeline_bench(
     target_rate: u64,
     max_reject_pct: f64,
 ) {
-    use melin_server::{BufferedWriter, JournalWriterMode, SectorWriter};
+    use melin_journal::{BufferedWriter, SectorWriter};
+    use melin_server::JournalWriterMode;
 
     // Set up exchange with one instrument and funded account.
     let mut app = melin_server::domain::exchange_app::ServerApp(
@@ -1250,14 +1251,14 @@ struct PipelineInnerCfg<'a> {
 fn run_pipeline_inner<W>(app: melin_server::App, writer: W, cfg: PipelineInnerCfg<'_>)
 where
     W: melin_server::JournalWrite<melin_trading::trading_event::TradingEvent> + Send + 'static,
-    melin_server::JournalStage<W>: melin_server::pipeline::JournalStageRun<
-            melin_trading::trading_event::TradingEvent,
-            Writer = W,
-        >,
+    melin_server::pipeline::JournalStage<melin_trading::trading_event::TradingEvent, W>:
+        melin_server::pipeline::JournalStageRun<
+                melin_trading::trading_event::TradingEvent,
+                Writer = W,
+            >,
 {
-    use melin_server::InputSlot;
-    use melin_server::JournalEvent;
-    use melin_server::pipeline::{JournalStageRun, build_pipeline_with_replication};
+    use melin_journal::JournalEvent;
+    use melin_server::pipeline::{InputSlot, JournalStageRun, build_pipeline_with_replication};
     use melin_server::trace::mono_trace_ns;
     use melin_transport_core::pipeline::OutputPayload;
 

@@ -73,7 +73,7 @@ fn fuzz_snapshot_decode() {
 // Helpers: construct valid types from raw bytes
 // ---------------------------------------------------------------------------
 
-use melin_server::JournalEvent;
+use melin_journal::JournalEvent;
 use melin_types::types::*;
 use std::num::NonZeroU64;
 
@@ -107,7 +107,7 @@ fn u64_at(data: &[u8], offset: usize) -> Option<u64> {
 
 /// Construct a JournalEvent from arbitrary bytes. Returns None if the bytes
 /// are insufficient to build a valid event.
-fn journal_event_from_bytes(data: &[u8]) -> Option<JournalEvent> {
+fn journal_event_from_bytes(data: &[u8]) -> Option<JournalEvent<TradingEvent>> {
     if data.is_empty() {
         return None;
     }

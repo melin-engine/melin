@@ -27,13 +27,18 @@ use clap::Parser;
 use ed25519_dalek::SigningKey;
 
 use melin_app::unix_epoch_nanos;
+use melin_journal::JournalEvent;
 #[allow(unused_imports)] // used by some feature combinations only
 use melin_journal::JournalWrite;
 use melin_protocol::auth::AuthorizedKeys;
 use melin_server::runtime::replication::{ReplicationMetrics, Sender, run_receiver, run_sender};
 use melin_server::runtime::server::PipelineCores;
-use melin_server::{InputSlot, JournalEvent, OutputSlot};
 use melin_trading::trading_event::TradingEvent;
+type InputSlot = melin_transport_core::pipeline::InputSlot<TradingEvent>;
+type OutputSlot = melin_transport_core::pipeline::OutputSlot<
+    melin_types::types::ExecutionReport,
+    melin_types::types::QueryResponse,
+>;
 use melin_transport_core::JournaledApp;
 use melin_transport_core::pipeline::{JournalStageRun, build_pipeline_with_replication};
 use melin_transport_core::trace::mono_trace_ns;
