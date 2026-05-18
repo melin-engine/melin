@@ -31,7 +31,6 @@ pub type App = domain::exchange_app::ServerApp;
 // other downstream consumer now reach the LMAX-pipeline plumbing
 // through `melin-server` instead of through `melin-engine` — engine
 // is the matching domain library, server is the wiring layer.
-pub use melin_app::unix_epoch_nanos;
 /// Re-export of the journal replication module — namespaced under
 /// `journal_replication` to avoid colliding with the server's own
 /// `replication` module (the orchestrator that wraps it).

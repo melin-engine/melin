@@ -1248,17 +1248,19 @@ struct PipelineInnerCfg<'a> {
 
 /// Pipeline-mode body, generic over the journal writer so we get a
 /// statically-dispatched `run_sync` or `run_uring` per writer.
+// Module-scope imports for `run_pipeline_inner`'s where clause —
+// the bound has to name `TradingEvent` / `JournalStage` /
+// `JournalStageRun` in the signature scope, not the body scope.
+use melin_server::pipeline::{JournalStage, JournalStageRun};
+use melin_trading::trading_event::TradingEvent;
+
 fn run_pipeline_inner<W>(app: melin_server::App, writer: W, cfg: PipelineInnerCfg<'_>)
 where
-    W: melin_server::JournalWrite<melin_trading::trading_event::TradingEvent> + Send + 'static,
-    melin_server::pipeline::JournalStage<melin_trading::trading_event::TradingEvent, W>:
-        melin_server::pipeline::JournalStageRun<
-                melin_trading::trading_event::TradingEvent,
-                Writer = W,
-            >,
+    W: melin_server::JournalWrite<TradingEvent> + Send + 'static,
+    JournalStage<TradingEvent, W>: JournalStageRun<TradingEvent, Writer = W>,
 {
     use melin_journal::JournalEvent;
-    use melin_server::pipeline::{InputSlot, JournalStageRun, build_pipeline_with_replication};
+    use melin_server::pipeline::{InputSlot, build_pipeline_with_replication};
     use melin_server::trace::mono_trace_ns;
     use melin_transport_core::pipeline::OutputPayload;
 
