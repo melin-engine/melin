@@ -32,7 +32,7 @@ pub type App = domain::exchange_app::ServerApp;
 // through `melin-server` instead of through `melin-engine` — engine
 // is the matching domain library, server is the wiring layer.
 /// Re-export of the journal replication module — namespaced under
-/// `journal_replication` to avoid colliding with the server's own
+/// `journal_replication` to avoid colliding with the runtime's
 /// `replication` module (the orchestrator that wraps it).
 pub use melin_journal::replication as journal_replication;
 pub use melin_journal::{
@@ -41,28 +41,17 @@ pub use melin_journal::{
 };
 pub use melin_transport_core::{pipeline, trace};
 
-/// Control plane event the accept loop and response stage exchange.
-/// Defined at the crate root so both build modes refer to the same
-/// type (it's transport-agnostic — the payload is a socket fd +
-/// writer, not an app event).
-pub enum ControlEvent {
-    Connected {
-        connection_id: u64,
-        fd: std::os::unix::io::RawFd,
-        writer: melin_protocol::blocking::BlockingFrameWriter<Box<dyn std::io::Write + Send>>,
-    },
-    Disconnected {
-        connection_id: u64,
-    },
-}
+/// Re-export of the control-plane event so existing call sites
+/// (`melin_server::ControlEvent`) keep resolving after the runtime
+/// crate split.
+pub use melin_server_runtime::ControlEvent;
 
 /// Trading-specific server wiring — wire-`Request` decode,
 /// `OutputPayload` response encoding, the `ServerApp` newtype that
 /// carries the `Application` impl, and the market-data firehose.
 pub mod domain;
-/// Application-agnostic server runtime — accept loop, frame reader,
-/// durability policy, admin endpoint, replication, DPDK transport.
-/// Generic over `A: Application`; the long-term plan is to move it
-/// into `crates/core/server-runtime/` once `domain/` lifts out into
-/// its own crate.
-pub mod runtime;
+/// Application-agnostic server runtime — re-exported from
+/// `melin-server-runtime`. Kept under the same `runtime` path so
+/// internal callers (`melin_server::runtime::server::*`) keep
+/// resolving without churn.
+pub use melin_server_runtime as runtime;

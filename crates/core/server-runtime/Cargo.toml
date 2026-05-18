@@ -1,0 +1,64 @@
+[package]
+name = "melin-server-runtime"
+version = "0.8.0"
+edition = "2024"
+description = "Application-agnostic LMAX-pipeline server runtime (accept loop, journal/matching/response stages, replication, optional DPDK transport)."
+
+[features]
+## Compile out debug! and trace! at build time. Eliminates the tracing
+## filter check (~5-10 ns) on every call site in the hot path.
+release-tracing = ["tracing/max_level_info"]
+no-persist = ["melin-transport-core/no-persist"]
+## Lightweight per-stage histograms.
+latency-trace = [
+    "melin-transport-core/latency-trace",
+    "melin-protocol/latency-trace",
+]
+## Full tick-to-trade decomposition. Implies latency-trace.
+tick-to-trade = ["latency-trace"]
+## Kept for backward compatibility — io_uring is now always used.
+io-uring = []
+## DPDK userspace TCP transport.
+dpdk = ["dep:melin-dpdk", "melin-dpdk/dpdk-sys"]
+pipeline-stats = ["melin-transport-core/pipeline-stats"]
+hash-chain = [
+    "melin-journal/hash-chain",
+    "melin-transport-core/hash-chain",
+]
+no-o-direct = [
+    "melin-journal/no-o-direct",
+    "melin-transport-core/no-o-direct",
+]
+
+[dependencies]
+melin-app = { path = "../app" }
+melin-disruptor = { path = "../disruptor" }
+melin-journal = { path = "../journal" }
+melin-protocol = { path = "../../exchange/protocol" }
+melin-transport-core = { path = "../transport-core" }
+blake3 = "1"
+base64 = { workspace = true }
+clap = { workspace = true }
+crc32c = "0.6"
+ed25519-dalek = { workspace = true }
+getrandom = "0.3"
+io-uring = "0.7"
+libc = { workspace = true }
+rand = { workspace = true }
+rustc-hash = "2"
+tracing = { workspace = true }
+zerocopy = { version = "0.8", features = ["derive"] }
+melin-dpdk = { path = "../dpdk", optional = true }
+
+[dev-dependencies]
+# The runtime's library API is application-agnostic, but a few unit
+# tests (replication wire format, DPDK fixtures) construct realistic
+# fixtures with the trading domain's `TradingEvent` and `melin-types`.
+# These are dev-only — the lib has no trading dependency.
+melin-trading = { path = "../../exchange/trading" }
+melin-types = { path = "../../exchange/types" }
+tempfile = "3"
+serial_test = "3"
+proptest = "1"
+melin-journal = { path = "../journal", features = ["test-utils"] }
+melin-transport-core = { path = "../transport-core", features = ["test-utils"] }

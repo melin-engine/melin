@@ -38,7 +38,7 @@ use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
-use crate::runtime::durability_policy::DurabilityMode;
+use crate::durability_policy::DurabilityMode;
 
 use ed25519_dalek::{Verifier, VerifyingKey};
 use tracing::{debug, error, info};

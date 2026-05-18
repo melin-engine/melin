@@ -20,8 +20,8 @@ use tracing::{debug, error};
 
 use melin_disruptor::ring;
 
-use crate::runtime::durability_policy::{CursorView, DurabilityMode, EvalStatus, Policy};
-use crate::runtime::replication::ReplicationMetrics;
+use crate::durability_policy::{CursorView, DurabilityMode, EvalStatus, Policy};
+use crate::replication::ReplicationMetrics;
 use melin_app::Application;
 use melin_transport_core::pipeline::{OutputPayload, OutputSlot, StageUtilization};
 #[cfg(feature = "latency-trace")]
@@ -78,7 +78,7 @@ pub struct Response<A: Application> {
     /// this once per gate iteration with a relaxed load (cheaper than a
     /// `Mutex` or refcounted `Arc<Policy>` snapshot) and rebuilds its
     /// local [`Policy`] when the byte changes. See
-    /// [`crate::runtime::durability_policy::DurabilityMode::as_u8`] for the
+    /// [`crate::durability_policy::DurabilityMode::as_u8`] for the
     /// encoding.
     pub durability_mode: Arc<std::sync::atomic::AtomicU8>,
     /// Per-slot replica cursors. `None` for standalone deployments
@@ -1166,8 +1166,8 @@ mod tests {
     #[cfg(feature = "tick-to-trade")]
     use super::GateCrossTracker;
     use super::{DegradationLogger, connected_persisted_min, evaluate_durability};
-    use crate::runtime::durability_policy::{Clause, Level, Policy};
-    use crate::runtime::replication::ReplicationMetrics;
+    use crate::durability_policy::{Clause, Level, Policy};
+    use crate::replication::ReplicationMetrics;
 
     /// Build a [`Policy`] from a mini DSL: one or more
     /// `"<level>>=<count>"` clauses joined with `&&`. Test-only
@@ -1650,7 +1650,7 @@ mod tests {
     // gauge, which the logger updates on every tick regardless of
     // log emission.
 
-    fn logger_test_policy() -> crate::runtime::durability_policy::Policy {
+    fn logger_test_policy() -> crate::durability_policy::Policy {
         parse("persisted>=2").unwrap()
     }
 
@@ -1661,7 +1661,7 @@ mod tests {
     fn drive_logger(
         logger: &mut DegradationLogger,
         utilization: &StageUtilization,
-        policy: &crate::runtime::durability_policy::Policy,
+        policy: &crate::durability_policy::Policy,
         start: Instant,
         states: &[bool],
         step: Duration,

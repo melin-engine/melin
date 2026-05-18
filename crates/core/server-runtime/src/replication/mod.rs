@@ -230,7 +230,7 @@ pub(super) struct ReplicaPipelineHandles<A: Application, W: Send + 'static> {
 pub(super) fn build_replica_pipeline_with_threads<A, W>(
     exchange: A,
     writer: W,
-    cores: crate::runtime::server::PipelineCores,
+    cores: crate::server::PipelineCores,
     snapshot_interval_ms: u64,
     snapshot_path: std::path::PathBuf,
     group_commit_delay: std::time::Duration,

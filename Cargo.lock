@@ -1703,6 +1703,7 @@ dependencies = [
  "melin-journal",
  "melin-market-data",
  "melin-protocol",
+ "melin-server-runtime",
  "melin-trading",
  "melin-transport-core",
  "melin-types",
@@ -1714,6 +1715,35 @@ dependencies = [
  "tikv-jemallocator",
  "tracing",
  "tracing-subscriber",
+ "zerocopy",
+]
+
+[[package]]
+name = "melin-server-runtime"
+version = "0.8.0"
+dependencies = [
+ "base64 0.22.1",
+ "blake3",
+ "clap",
+ "crc32c",
+ "ed25519-dalek",
+ "getrandom 0.3.4",
+ "io-uring",
+ "libc",
+ "melin-app",
+ "melin-disruptor",
+ "melin-dpdk",
+ "melin-journal",
+ "melin-protocol",
+ "melin-trading",
+ "melin-transport-core",
+ "melin-types",
+ "proptest",
+ "rand 0.9.2",
+ "rustc-hash",
+ "serial_test",
+ "tempfile",
+ "tracing",
  "zerocopy",
 ]
 

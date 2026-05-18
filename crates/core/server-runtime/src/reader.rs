@@ -32,7 +32,7 @@ use melin_app::auth::Permission;
 use melin_app::decoder::{Decoded, RequestDecoder};
 
 /// Decoder type alias: request decoder bound to the application's `Event`
-/// type. Mirrors [`crate::runtime::response::ResponseEncoderArc`]; hides
+/// type. Mirrors [`crate::response::ResponseEncoderArc`]; hides
 /// the `dyn RequestDecoder<Event = …>` spelling at call sites that thread
 /// the decoder through several functions.
 pub type RequestDecoderArc<A> = Arc<dyn RequestDecoder<Event = <A as Application>::Event>>;

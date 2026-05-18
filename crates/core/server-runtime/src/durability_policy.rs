@@ -3,7 +3,7 @@
 //! The generic policy types — [`Level`], [`Clause`], [`Policy`],
 //! [`CursorView`], [`EvalStatus`], [`PolicyError`], [`MAX_CLUSTER_SIZE`]
 //! — live in `melin_transport_core::durability_policy`. They're
-//! re-exported here so existing call sites (`crate::runtime::durability_policy::*`)
+//! re-exported here so existing call sites (`crate::durability_policy::*`)
 //! keep working, and the response stage's ack gate is built on them.
 //!
 //! What this module owns is the *operator surface*: a small enum that

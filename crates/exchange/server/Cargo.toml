@@ -9,7 +9,7 @@ default = ["trading", "hash-chain", "release-tracing"]
 ## Compile out debug! and trace! macros at build time. Eliminates the
 ## tracing filter check (~5-10ns) on every call site in the hot path.
 ## Disable with --no-default-features to get RUST_LOG=debug back.
-release-tracing = ["tracing/max_level_info"]
+release-tracing = ["tracing/max_level_info", "melin-server-runtime/release-tracing"]
 ## App selection: `trading` is the real matching engine,
 ## `skip-order-exec` short-circuits `Exchange::execute` to a single
 ## rejection (used to isolate transport throughput from matching cost).
@@ -20,7 +20,7 @@ release-tracing = ["tracing/max_level_info"]
 ## exercised.
 trading = ["dep:melin-market-data"]
 skip-order-exec = ["melin-engine/skip-order-exec", "hash-chain", "release-tracing"]
-no-persist = ["melin-transport-core/no-persist"]
+no-persist = ["melin-transport-core/no-persist", "melin-server-runtime/no-persist"]
 ## Lightweight per-stage histograms for the original 4 stages
 ## (journal/matching wakeup + execute, journal batch). Adds ~3-5 mutex
 ## locks per event on the hot path; appropriate for narrow debugging
@@ -30,6 +30,7 @@ no-persist = ["melin-transport-core/no-persist"]
 latency-trace = [
     "melin-transport-core/latency-trace",
     "melin-protocol/latency-trace",
+    "melin-server-runtime/latency-trace",
 ]
 ## Full tick-to-trade decomposition: adds 5 commercial-grade stages
 ## on top of latency-trace (reader: ingest, response: journal-wait,
@@ -37,20 +38,25 @@ latency-trace = [
 ## doubles the hot-path mutex traffic vs latency-trace alone, so opt
 ## into it explicitly when you want the breakdown — bench-side runs
 ## that produce the README-style decomposition table need this flag.
-tick-to-trade = ["latency-trace"]
+tick-to-trade = ["latency-trace", "melin-server-runtime/tick-to-trade"]
 ## Kept for backward compatibility — io_uring is now always used.
 io-uring = []
-dpdk = ["dep:melin-dpdk", "melin-dpdk/dpdk-sys"]
-pipeline-stats = ["melin-transport-core/pipeline-stats"]
+dpdk = ["dep:melin-dpdk", "melin-dpdk/dpdk-sys", "melin-server-runtime/dpdk"]
+pipeline-stats = [
+    "melin-transport-core/pipeline-stats",
+    "melin-server-runtime/pipeline-stats",
+]
 hash-chain = [
     "melin-journal/hash-chain",
     "melin-transport-core/hash-chain",
+    "melin-server-runtime/hash-chain",
 ]
 ## Open the journal without `O_DIRECT`. Passthrough — see the
 ## `melin-journal` feature of the same name. Benchmarking only.
 no-o-direct = [
     "melin-journal/no-o-direct",
     "melin-transport-core/no-o-direct",
+    "melin-server-runtime/no-o-direct",
 ]
 
 [lib]
@@ -70,6 +76,7 @@ required-features = ["skip-order-exec"]
 melin-app = { path = "../../core/app" }
 melin-engine = { path = "../engine" }
 melin-journal = { path = "../../core/journal" }
+melin-server-runtime = { path = "../../core/server-runtime" }
 melin-trading = { path = "../trading" }
 melin-transport-core = { path = "../../core/transport-core" }
 melin-types = { path = "../types" }

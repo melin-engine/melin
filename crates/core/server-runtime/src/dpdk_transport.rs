@@ -57,7 +57,7 @@ use rand::Rng;
 use melin_dpdk::SocketHandle;
 use tracing::{debug, warn};
 
-use crate::runtime::dpdk_response::{ControlEvent, TxFrame};
+use crate::dpdk_response::{ControlEvent, TxFrame};
 
 /// Maximum frame payload size (matches reader).
 const MAX_FRAME_SIZE: usize = 1024;
@@ -143,7 +143,7 @@ pub fn run_dpdk_poll<A: Application>(
     // ack processing). Replaces the separate replication-sender thread —
     // see `feat/dpdk-single-queue` for the rationale (RSS routing on
     // iavf made the previous multi-queue split unworkable).
-    repl_driver: Option<crate::runtime::replication::DpdkReplicationDriver>,
+    repl_driver: Option<crate::replication::DpdkReplicationDriver>,
     // TCP port the replication driver listens on. Used to filter
     // `AcceptedConnection::listen_port` so client connections go to the
     // client handler and replication connections to the driver. Ignored

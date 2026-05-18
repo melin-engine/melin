@@ -810,7 +810,7 @@ pub fn run_receiver<A, W>(
     promote: &AtomicBool,
     snapshot_interval_ms: u64,
     snapshot_path: std::path::PathBuf,
-    cores: crate::runtime::server::PipelineCores,
+    cores: crate::server::PipelineCores,
     receiver_core: usize,
     group_commit_delay: std::time::Duration,
     pipeline_depth: usize,
