@@ -63,6 +63,7 @@ pub enum ControlEvent {
 pub mod domain;
 /// Application-agnostic server runtime — accept loop, frame reader,
 /// durability policy, admin endpoint, replication, DPDK transport.
-/// Generic in shape; the long-term plan is to make it parametric
-/// over `A: Application` and move it into `crates/core/`.
+/// Generic over `A: Application`; the long-term plan is to move it
+/// into `crates/core/server-runtime/` once `domain/` lifts out into
+/// its own crate.
 pub mod runtime;

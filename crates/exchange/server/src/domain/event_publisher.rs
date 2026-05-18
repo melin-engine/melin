@@ -31,21 +31,21 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use tracing::{debug, error, info, warn};
 
 use melin_disruptor::ring;
-use melin_transport_core::pipeline::{
-    OutputPayload as GenericOutputPayload, OutputSlot as GenericOutputSlot,
-};
-
-// Trading-bound shorthand for the wire-format types this publisher
-// consumes. The runtime feeds it `Consumer<OutputSlot<A>>` where
-// `A = ServerApp`, so binding `A::Report`/`A::QueryResponse` here
-// keeps the rest of the file readable.
-type OutputSlot = GenericOutputSlot<ExecutionReport, QueryResponse>;
-type OutputPayload = GenericOutputPayload<ExecutionReport, QueryResponse>;
 use melin_market_data::mirror::BookMirror;
 use melin_protocol::auth::AuthorizedKeys;
 use melin_protocol::codec;
 use melin_protocol::message::{Request, ResponseKind};
+use melin_transport_core::pipeline::{
+    OutputPayload as GenericOutputPayload, OutputSlot as GenericOutputSlot,
+};
 use melin_types::types::{ExecutionReport, QueryResponse, Symbol};
+
+// Trading-bound shorthand for the wire-format types this publisher
+// consumes. The runtime feeds it `Consumer<OutputSlot<A>>` where
+// `A = ServerApp`, so binding `A::Report` / `A::QueryResponse` here
+// keeps the rest of the file readable.
+type OutputSlot = GenericOutputSlot<ExecutionReport, QueryResponse>;
+type OutputPayload = GenericOutputPayload<ExecutionReport, QueryResponse>;
 
 /// Maximum number of output slots consumed per batch.
 const MAX_BATCH: usize = 1024;
