@@ -598,12 +598,6 @@ where
     A::Report: Send + 'static,
     A::QueryResponse: Send + 'static,
     L: BlockingTransportListener,
-    BufferedWriter<A::Event>: JournalWrite<A::Event> + Send + 'static,
-    SectorWriter<A::Event>: JournalWrite<A::Event> + Send + 'static,
-    JournalStage<A::Event, BufferedWriter<A::Event>>:
-        JournalStageRun<A::Event, Writer = BufferedWriter<A::Event>>,
-    JournalStage<A::Event, SectorWriter<A::Event>>:
-        JournalStageRun<A::Event, Writer = SectorWriter<A::Event>>,
 {
     run_with_shutdown(
         listener,
@@ -636,12 +630,6 @@ where
     A::Report: Send + 'static,
     A::QueryResponse: Send + 'static,
     L: BlockingTransportListener,
-    BufferedWriter<A::Event>: JournalWrite<A::Event> + Send + 'static,
-    SectorWriter<A::Event>: JournalWrite<A::Event> + Send + 'static,
-    JournalStage<A::Event, BufferedWriter<A::Event>>:
-        JournalStageRun<A::Event, Writer = BufferedWriter<A::Event>>,
-    JournalStage<A::Event, SectorWriter<A::Event>>:
-        JournalStageRun<A::Event, Writer = SectorWriter<A::Event>>,
 {
     // Dispatch on the operator-selected journal writer. Each branch
     // monomorphises the boot path against a concrete writer type; from
@@ -1812,12 +1800,6 @@ where
     A::Event: Send + Sync + 'static,
     A::Report: Send + 'static,
     A::QueryResponse: Send + 'static,
-    BufferedWriter<A::Event>: JournalWrite<A::Event> + Send + 'static,
-    SectorWriter<A::Event>: JournalWrite<A::Event> + Send + 'static,
-    JournalStage<A::Event, BufferedWriter<A::Event>>:
-        JournalStageRun<A::Event, Writer = BufferedWriter<A::Event>>,
-    JournalStage<A::Event, SectorWriter<A::Event>>:
-        JournalStageRun<A::Event, Writer = SectorWriter<A::Event>>,
 {
     // Dispatch the DPDK boot path on the operator-selected journal writer.
     match config.journal_writer {
