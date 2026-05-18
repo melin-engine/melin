@@ -339,16 +339,6 @@ pub struct ServerConfig {
     /// leave it on.
     #[arg(long, default_value_t = false)]
     pub no_mlock: bool,
-
-    /// Application factory: produces `A` instances for replication
-    /// recovery and yields the bulk-seed events a fresh primary
-    /// journals at startup. `None` after CLI parsing — the binary
-    /// must populate this (typically `Some(Arc::new(ExchangeAppFactory::new(...)))`)
-    /// before calling [`run`]. The runtime panics if missing.
-    /// `#[arg(skip)]` keeps clap out of it; the field uses
-    /// `Option<...>` so `Default::default()` is `None`.
-    #[arg(skip)]
-    pub factory: Option<Arc<dyn AppFactory<App = App>>>,
 }
 
 /// Delegates to clap so `#[arg(default_value...)]` is the single source of
@@ -413,24 +403,11 @@ impl Default for ServerConfig {
             snapshot_path: None,
             tick_interval_ms: 250,
             no_mlock: false,
-            factory: None,
         }
     }
 }
 
 impl ServerConfig {
-    /// Borrow the `AppFactory` the runtime uses to construct fresh
-    /// applications (replication recovery) and produce the bulk-seed
-    /// event list (fresh-primary startup). Panics if the field was
-    /// not set before [`run`] — the binary populates it after CLI
-    /// parsing; in-process tests construct one inline.
-    pub fn factory(&self) -> &Arc<dyn AppFactory<App = App>> {
-        self.factory.as_ref().expect(
-            "ServerConfig::factory must be set before run() — \
-             populate it after CLI parsing or struct construction",
-        )
-    }
-
     /// Group commit delay as a Duration.
     pub fn group_commit_delay(&self) -> std::time::Duration {
         std::time::Duration::from_micros(self.group_commit_us)
@@ -564,12 +541,20 @@ fn parse_cores(s: &str) -> Result<PipelineCores, String> {
 /// 3. Spawns 3 OS threads: journal, matching, response.
 /// 4. Runs the accept loop, spawning a reader OS thread per connection.
 ///
+/// `factory` constructs fresh `App` instances for the recovery and
+/// replication paths and yields the bulk-seed events a fresh primary
+/// journals at startup. The trading binary constructs an
+/// [`ExchangeAppFactory`](crate::domain::app_factory::ExchangeAppFactory);
+/// alternative applications plug in a different `AppFactory` impl
+/// without touching the runtime.
+///
 /// Returns when the listener encounters a fatal error.
 pub fn run<L: BlockingTransportListener>(
     listener: L,
     config: ServerConfig,
+    factory: Arc<dyn AppFactory<App = App>>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    run_with_shutdown(listener, config, Arc::new(AtomicBool::new(false)))
+    run_with_shutdown(listener, config, factory, Arc::new(AtomicBool::new(false)))
 }
 
 /// Run the trading server with an externally controlled shutdown flag.
@@ -580,6 +565,7 @@ pub fn run<L: BlockingTransportListener>(
 pub fn run_with_shutdown<L: BlockingTransportListener>(
     listener: L,
     config: ServerConfig,
+    factory: Arc<dyn AppFactory<App = App>>,
     shutdown: Arc<AtomicBool>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // Dispatch on the operator-selected journal writer. Each branch
@@ -589,10 +575,10 @@ pub fn run_with_shutdown<L: BlockingTransportListener>(
     // at runtime.
     match config.journal_writer {
         melin_journal::JournalWriterMode::Buffered => {
-            run_with_shutdown_impl::<L, BufferedWriter>(listener, config, shutdown)
+            run_with_shutdown_impl::<L, BufferedWriter>(listener, config, factory, shutdown)
         }
         melin_journal::JournalWriterMode::Sector => {
-            run_with_shutdown_impl::<L, SectorWriter>(listener, config, shutdown)
+            run_with_shutdown_impl::<L, SectorWriter>(listener, config, factory, shutdown)
         }
     }
 }
@@ -600,6 +586,7 @@ pub fn run_with_shutdown<L: BlockingTransportListener>(
 fn run_with_shutdown_impl<L, W>(
     listener: L,
     config: ServerConfig,
+    factory: Arc<dyn AppFactory<App = App>>,
     shutdown: Arc<AtomicBool>,
 ) -> Result<(), Box<dyn std::error::Error>>
 where
@@ -698,7 +685,7 @@ where
             config.replication_pipeline_depth,
             !config.yield_idle,
             rotation,
-            Arc::clone(config.factory()),
+            Arc::clone(&factory),
         )? {
             None => return Ok(()), // clean shutdown
             Some((mut exchange, writer)) => {
@@ -711,6 +698,7 @@ where
                     writer,
                     listener,
                     &config,
+                    &*factory,
                     shutdown,
                     authorized_keys,
                     false, // no seeding needed — state comes from replication
@@ -746,7 +734,7 @@ where
 
     // Initialize or recover the app. `needs_seeding` is true on first
     // startup — seed events will flow through the pipeline later.
-    let (mut exchange, writer, needs_seeding) = init_engine::<W>(&config)?;
+    let (mut exchange, writer, needs_seeding) = init_engine::<W>(&config, &*factory)?;
 
     // Pre-fault any application-owned memory (slabs, indices) so page
     // faults happen now, not on the hot path. Default trait impl is a
@@ -758,6 +746,7 @@ where
         writer,
         listener,
         &config,
+        &*factory,
         shutdown,
         authorized_keys,
         needs_seeding,
@@ -871,6 +860,7 @@ fn run_as_primary<L, W>(
     writer: W,
     mut listener: L,
     config: &ServerConfig,
+    factory: &dyn AppFactory<App = App>,
     shutdown: Arc<AtomicBool>,
     authorized_keys: Arc<AuthorizedKeys>,
     needs_seeding: bool,
@@ -1374,7 +1364,7 @@ where
         use melin_transport_core::trace::mono_trace_ns;
 
         let seed_start = std::time::Instant::now();
-        let seed_events = config.factory().seed_events();
+        let seed_events = factory.seed_events();
         let seed_count = seed_events.len();
 
         // `sequence: 0` — the journal stage allocates sequences in
@@ -1693,19 +1683,22 @@ where
 /// - Core 1:   Journal stage
 /// - Core 2:   Matching stage
 /// - Core 3:   Response stage (encodes to TX channel)
+///
+/// See [`run`] for the role of `factory`.
 #[cfg(feature = "dpdk")]
 pub fn run_dpdk(
     config: ServerConfig,
+    factory: Arc<dyn AppFactory<App = App>>,
     dpdk_config: melin_dpdk::DpdkConfig,
     shutdown: Arc<AtomicBool>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // Dispatch the DPDK boot path on the operator-selected journal writer.
     match config.journal_writer {
         melin_journal::JournalWriterMode::Buffered => {
-            run_dpdk_impl::<BufferedWriter>(config, dpdk_config, shutdown)
+            run_dpdk_impl::<BufferedWriter>(config, factory, dpdk_config, shutdown)
         }
         melin_journal::JournalWriterMode::Sector => {
-            run_dpdk_impl::<SectorWriter>(config, dpdk_config, shutdown)
+            run_dpdk_impl::<SectorWriter>(config, factory, dpdk_config, shutdown)
         }
     }
 }
@@ -1713,6 +1706,7 @@ pub fn run_dpdk(
 #[cfg(feature = "dpdk")]
 fn run_dpdk_impl<W>(
     config: ServerConfig,
+    factory: Arc<dyn AppFactory<App = App>>,
     dpdk_config: melin_dpdk::DpdkConfig,
     shutdown: Arc<AtomicBool>,
 ) -> Result<(), Box<dyn std::error::Error>>
@@ -1803,7 +1797,7 @@ where
             config.replication_pipeline_depth,
             !config.yield_idle,
             rotation,
-            Arc::clone(config.factory()),
+            Arc::clone(&factory),
         )? {
             None => return Ok(()), // clean shutdown
             Some((mut exchange, writer)) => {
@@ -1820,6 +1814,7 @@ where
                     writer,
                     listener,
                     &config,
+                    &*factory,
                     shutdown,
                     authorized_keys,
                     false,
@@ -1859,7 +1854,7 @@ where
     );
 
     // Initialize or recover the exchange.
-    let (mut exchange, writer, needs_seeding) = init_engine::<W>(&config)?;
+    let (mut exchange, writer, needs_seeding) = init_engine::<W>(&config, &*factory)?;
     <App as melin_app::Application>::prefault(&mut exchange);
 
     // Clone exchange state for the shadow snapshot stage before moving
@@ -2233,7 +2228,7 @@ where
         use melin_app::unix_epoch_nanos;
         use melin_transport_core::trace::mono_trace_ns;
 
-        let seed_events = config.factory().seed_events();
+        let seed_events = factory.seed_events();
 
         // `sequence: 0` — the journal stage allocates sequences in
         // disruptor cursor order at encode time.
@@ -2405,10 +2400,11 @@ where
 // The `apply_max_orders` / `empty_app` / `empty_app_for_seed` helpers
 // that used to live here have moved behind the `AppFactory` trait —
 // see `crate::domain::app_factory::ExchangeAppFactory`. The runtime
-// reaches them through `config.factory().{empty, empty_for_seed,
-// apply_operator_policy}()`; replication paths take a
-// `factory: Arc<dyn AppFactory<App = App>>` parameter instead of
-// the three rate-limit primitives they used to pass through.
+// reaches them through the `factory: &dyn AppFactory<App = App>`
+// parameter threaded into [`init_engine`], [`run_as_primary`], and
+// the replication receivers; the binary passes a single
+// `Arc<dyn AppFactory<App = App>>` into [`run`] / [`run_dpdk`] at
+// startup and the runtime clones it on each call.
 //
 // SEC-03 (per-account open-order cap) and SEC-04 (order-submission
 // rate limit) live in `Exchange` state but are operator policy, not
@@ -2425,6 +2421,7 @@ where
 /// Same engine initialization the TCP / DPDK paths use.
 pub(crate) fn init_engine<W>(
     config: &ServerConfig,
+    factory: &dyn AppFactory<App = App>,
 ) -> Result<(App, W, bool), Box<dyn std::error::Error>>
 where
     W: JournalWrite<TradingEvent>,
@@ -2466,10 +2463,10 @@ where
         JournaledApp::<App, W>::from_parts(app, writer)
     } else if journal_exists {
         info!(writer_mode = %writer_mode, "recovering from journal");
-        JournaledApp::<App, W>::recover(config.factory().empty_for_seed(), &config.journal)?
+        JournaledApp::<App, W>::recover(factory.empty_for_seed(), &config.journal)?
     } else {
         info!(writer_mode = %writer_mode, "creating new journal");
-        JournaledApp::<App, W>::create(config.factory().empty_for_seed(), &config.journal)?
+        JournaledApp::<App, W>::create(factory.empty_for_seed(), &config.journal)?
     };
 
     let needs_seeding = !journal_exists;
@@ -2489,7 +2486,7 @@ where
     //     restored state is preserved. An operator mis-set that differs
     //     from the primary's config will silently clear those buckets;
     //     primary and replica must run with matching values.
-    config.factory().apply_operator_policy(engine.app_mut());
+    factory.apply_operator_policy(engine.app_mut());
 
     // Archive the live journal segment if it exceeds the configured
     // size threshold. The shadow exchange owns snapshot writes; here we

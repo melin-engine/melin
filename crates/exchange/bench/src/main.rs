@@ -1677,7 +1677,7 @@ fn run_roundtrip_bench(
 
     let effective_journal = journal_path.unwrap_or_else(|| tmp_dir.join("bench.journal"));
 
-    let mut config = ServerConfig {
+    let config = ServerConfig {
         journal: effective_journal,
         snapshot: None,
         group_commit_us,
@@ -1694,12 +1694,13 @@ fn run_roundtrip_bench(
         durability_mode: melin_server::runtime::durability_policy::DurabilityMode::Local,
         ..ServerConfig::default()
     };
-    // Wire the trading AppFactory: replication / seed paths read it
-    // through `config.factory`. The bench server runs standalone but
-    // still bulk-seeds via the same code path as the binary, so the
-    // factory must be set even for in-process benchmarks.
-    config.factory = Some(std::sync::Arc::new(
-        melin_server::domain::app_factory::ExchangeAppFactory::new(
+    // Wire the trading AppFactory: replication / seed paths take it
+    // as an argument to `run_with_shutdown`. The bench server runs
+    // standalone but still bulk-seeds via the same code path as the
+    // binary, so the factory must be constructed even for in-process
+    // benchmarks.
+    let factory: Arc<dyn melin_app::app_factory::AppFactory<App = melin_server::App>> =
+        Arc::new(melin_server::domain::app_factory::ExchangeAppFactory::new(
             melin_server::domain::app_factory::ExchangeAppFactoryConfig {
                 accounts: config.accounts,
                 instruments: config.instruments,
@@ -1707,8 +1708,7 @@ fn run_roundtrip_bench(
                 max_orders_per_second: config.max_orders_per_second,
                 max_orders_burst: config.max_orders_burst,
             },
-        ),
-    ));
+        ));
 
     let shutdown = Arc::new(AtomicBool::new(false));
 
@@ -1720,7 +1720,12 @@ fn run_roundtrip_bench(
 
         let sock_path = tmp_dir.join("bench.sock");
         let listener = BlockingUdsListener::bind(&sock_path).expect("bind UDS");
-        start_server(listener, config, Arc::clone(&shutdown));
+        start_server(
+            listener,
+            config,
+            Arc::clone(&factory),
+            Arc::clone(&shutdown),
+        );
 
         let sock_path_ref = &sock_path;
         let connect = || {
@@ -1753,7 +1758,12 @@ fn run_roundtrip_bench(
         let listener = BlockingTcpListener::bind("127.0.0.1:0".parse().expect("valid addr"))
             .expect("bind TCP");
         let addr = listener.local_addr().expect("local addr");
-        start_server(listener, config, Arc::clone(&shutdown));
+        start_server(
+            listener,
+            config,
+            Arc::clone(&factory),
+            Arc::clone(&shutdown),
+        );
 
         let connect = || {
             let stream = connect_tcp(addr);
@@ -1807,14 +1817,15 @@ fn load_signing_key(path: &std::path::Path) -> ed25519_dalek::SigningKey {
 fn start_server<L: BlockingTransportListener>(
     listener: L,
     config: ServerConfig,
+    factory: Arc<dyn melin_app::app_factory::AppFactory<App = melin_server::App>>,
     shutdown: Arc<AtomicBool>,
 ) {
     std::thread::Builder::new()
         .name("server".into())
         .spawn(move || {
-            if let Err(e) =
-                melin_server::runtime::server::run_with_shutdown(listener, config, shutdown)
-            {
+            if let Err(e) = melin_server::runtime::server::run_with_shutdown(
+                listener, config, factory, shutdown,
+            ) {
                 eprintln!("server error: {e}");
             }
         })

@@ -67,14 +67,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let shutdown = Arc::new(AtomicBool::new(false));
     install_shutdown_handler(&shutdown);
 
-    let mut config = ServerConfig::parse();
+    let config = ServerConfig::parse();
     // Wire the trading-side AppFactory the runtime needs for fresh-app
     // construction (replication recovery, snapshot rebuild) and for
     // the bulk-seed events a fresh primary journals at startup. The
     // factory captures `accounts`/`instruments`/`max_orders_*` so the
     // runtime never names trading concepts by their wire variants.
-    config.factory = Some(std::sync::Arc::new(
-        melin_server::domain::app_factory::ExchangeAppFactory::new(
+    let factory: Arc<dyn melin_app::app_factory::AppFactory<App = melin_server::App>> =
+        Arc::new(melin_server::domain::app_factory::ExchangeAppFactory::new(
             melin_server::domain::app_factory::ExchangeAppFactoryConfig {
                 accounts: config.accounts,
                 instruments: config.instruments,
@@ -82,8 +82,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 max_orders_per_second: config.max_orders_per_second,
                 max_orders_burst: config.max_orders_burst,
             },
-        ),
-    ));
+        ));
 
     if !config.no_mlock {
         try_lock_memory();
@@ -92,13 +91,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     #[cfg(feature = "dpdk")]
     {
         let dpdk_config = dpdk_config_from(&config);
-        melin_server::runtime::server::run_dpdk(config, dpdk_config, shutdown)
+        melin_server::runtime::server::run_dpdk(config, factory, dpdk_config, shutdown)
     }
 
     #[cfg(not(feature = "dpdk"))]
     {
         let listener = BlockingTcpListener::bind(config.bind)?;
-        melin_server::runtime::server::run_with_shutdown(listener, config, shutdown)
+        melin_server::runtime::server::run_with_shutdown(listener, config, factory, shutdown)
     }
 }
 
