@@ -19,10 +19,12 @@
 
 /// Encode application-shaped output payloads into wire bytes.
 ///
-/// The encoder appends framed bytes (length prefix included) to the
-/// caller's reusable scratch buffer. The runtime then flushes the
-/// buffer to the socket and clears it. Implementors are typically
-/// zero-sized types.
+/// The encoder writes the full wire frame (length prefix included)
+/// into the caller's scratch slice and returns the number of bytes
+/// written. The runtime then copies that prefix into the per-
+/// connection send buffer (TCP) or a DPDK tx frame, and reuses the
+/// scratch slice for the next slot — no per-slot allocation on the
+/// hot path. Implementors are typically zero-sized types.
 pub trait ResponseEncoder: Send + Sync {
     /// Per-event fan-out report type. Must match
     /// [`crate::Application::Report`] at the call site.
@@ -31,12 +33,16 @@ pub trait ResponseEncoder: Send + Sync {
     /// [`crate::Application::QueryResponse`] at the call site.
     type Query: Copy;
 
-    /// Encode an application report. Appends framed bytes to `buf`.
+    /// Encode an application report into `buf`, returning the number
+    /// of bytes written. `buf` is guaranteed by the caller to be
+    /// large enough for any single response (`MAX_RESPONSE_BUF`).
     /// Returns `Err` with a static reason on encode failure (the
-    /// runtime logs and drops the frame; the connection stays open).
-    fn encode_report(&self, report: &Self::Report, buf: &mut Vec<u8>) -> Result<(), &'static str>;
+    /// runtime logs at error level and drops the frame; the
+    /// connection stays open).
+    fn encode_report(&self, report: &Self::Report, buf: &mut [u8]) -> Result<usize, &'static str>;
 
-    /// Encode an application query response. Appends framed bytes to
-    /// `buf`. Same error semantics as [`Self::encode_report`].
-    fn encode_query(&self, query: &Self::Query, buf: &mut Vec<u8>) -> Result<(), &'static str>;
+    /// Encode an application query response into `buf`, returning the
+    /// number of bytes written. Same buffer-size guarantee and error
+    /// semantics as [`Self::encode_report`].
+    fn encode_query(&self, query: &Self::Query, buf: &mut [u8]) -> Result<usize, &'static str>;
 }

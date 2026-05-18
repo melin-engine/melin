@@ -12,6 +12,7 @@
 
 pub mod exchange_app;
 pub mod request;
+pub mod response_encoder;
 
 #[cfg(all(feature = "trading", not(feature = "skip-order-exec")))]
 pub mod event_publisher;

@@ -26,7 +26,7 @@ use crate::{OutputPayload, OutputSlot};
 use melin_transport_core::pipeline::StageUtilization;
 #[cfg(feature = "latency-trace")]
 use melin_transport_core::trace;
-use melin_types::types::QueryResponse;
+use melin_types::types::{ExecutionReport, QueryResponse};
 
 use melin_protocol::codec;
 use melin_protocol::message::ResponseKind;
@@ -51,6 +51,12 @@ const RING_SIZE: u32 = 4096;
 const MAX_SEND_BUF: usize = 64 * 1024;
 
 pub use crate::ControlEvent;
+
+/// Encoder type alias: trading wire encoder bound to the engine's
+/// `ExecutionReport` / `QueryResponse` types. Hides the long
+/// `dyn ResponseEncoder<Report = ..., Query = ...>` at call sites.
+pub type ResponseEncoderArc =
+    Arc<dyn melin_app::encoder::ResponseEncoder<Report = ExecutionReport, Query = QueryResponse>>;
 
 /// Configuration and shared state for the response stage.
 pub struct Response {
@@ -86,6 +92,10 @@ pub struct Response {
     pub heartbeat_interval: Option<Duration>,
     pub busy_spin: bool,
     pub utilization: Arc<StageUtilization>,
+    /// Wire encoder for application-shaped payloads. Constructed
+    /// once at boot (`Arc::new(TradingResponseEncoder)`) and shared
+    /// with the DPDK response stage.
+    pub encoder: ResponseEncoderArc,
 }
 
 /// Per-connection state for batched io_uring sends.
@@ -126,6 +136,7 @@ pub fn run(
         heartbeat_interval,
         busy_spin,
         utilization,
+        encoder,
     } = config;
     // Resolve the starting mode from the shared atomic and derive the
     // local Policy. The atomic is the single source of truth across the
@@ -601,104 +612,73 @@ pub fn run(
                 replica_wait_rec.record_elapsed(slot.match_complete_ts, ts);
             }
 
-            // Each slot expands to at most two wire frames: the payload
-            // (Report / QueryResponse / EngineError) and an optional
-            // trailing `BatchEnd` when `is_last_in_request` is set.
-            // `OutputPayload::BatchEnd` carries no payload of its own —
-            // the wire BatchEnd is emitted purely from the flag.
-            let mut kinds: [ResponseKind; 2] = [ResponseKind::BatchEnd; 2];
-            let mut kinds_len: usize = 0;
-            match slot.payload {
-                OutputPayload::QueryResponse(QueryResponse::Stats {
-                    active_connections,
-                    events_processed,
-                    journal_sequence,
-                }) => {
-                    kinds[kinds_len] = ResponseKind::StatsHeader {
-                        active_connections,
-                        events_processed,
-                        journal_sequence,
-                    };
-                    kinds_len += 1;
-                }
-                OutputPayload::QueryResponse(QueryResponse::Position {
-                    account,
-                    balances,
-                    count,
-                }) => {
-                    kinds[kinds_len] = ResponseKind::PositionSnapshot {
-                        account,
-                        balances,
-                        count,
-                    };
-                    kinds_len += 1;
-                }
-                OutputPayload::QueryResponse(QueryResponse::RequestSeqHwm { hwm }) => {
-                    kinds[kinds_len] = ResponseKind::RequestSeqHwm { hwm };
-                    kinds_len += 1;
-                }
-                OutputPayload::Report(report) => {
-                    kinds[kinds_len] = ResponseKind::Report(report);
-                    kinds_len += 1;
-                }
-                OutputPayload::BatchEnd => {
-                    // No payload — terminator only. is_last_in_request
-                    // is always set on BatchEnd-payload slots.
-                }
-                OutputPayload::EngineError => {
-                    kinds[kinds_len] = ResponseKind::EngineError;
-                    kinds_len += 1;
-                }
-            }
-            if slot.is_last_in_request {
-                kinds[kinds_len] = ResponseKind::BatchEnd;
-                kinds_len += 1;
-            }
-
+            // Each slot expands to at most two wire frames: the
+            // application payload (Report / Query / EngineError) and
+            // an optional trailing `BatchEnd` when
+            // `is_last_in_request` is set. Application-shaped
+            // payloads go through the encoder; transport-shaped
+            // frames (EngineError, BatchEnd) are encoded by the
+            // runtime directly.
             if let Some(entry) = connections.get_mut(&slot.connection_id) {
-                for kind in &kinds[..kinds_len] {
-                    // Encode the response (includes 4-byte length prefix).
+                // Frame 1: application payload (if any). BatchEnd
+                // payloads carry no body — the terminator below
+                // handles them via `is_last_in_request`.
+                let payload_result: Option<Result<usize, &'static str>> = match slot.payload {
+                    OutputPayload::Report(ref report) => {
+                        Some(encoder.encode_report(report, &mut encode_buf))
+                    }
+                    OutputPayload::QueryResponse(ref q) => {
+                        Some(encoder.encode_query(q, &mut encode_buf))
+                    }
+                    OutputPayload::EngineError => Some(
+                        codec::encode_response(&ResponseKind::EngineError, &mut encode_buf)
+                            .map_err(|_| "encode error"),
+                    ),
+                    OutputPayload::BatchEnd => None,
+                };
+
+                let payload_handled = if let Some(result) = payload_result {
                     #[cfg(feature = "tick-to-trade")]
                     let encode_start = trace::mono_trace_ns();
-                    let written = match codec::encode_response(kind, &mut encode_buf) {
-                        Ok(n) => n,
-                        Err(e) => {
-                            tracing::error!(
-                                connection_id = slot.connection_id,
-                                error = %e,
-                                "encode error"
-                            );
-                            continue;
-                        }
-                    };
+                    let outcome = append_frame(
+                        result,
+                        slot.connection_id,
+                        entry,
+                        &encode_buf,
+                        batch_now,
+                        &mut dirty_connections,
+                        &mut to_remove,
+                    );
                     #[cfg(feature = "tick-to-trade")]
                     encode_rec.record_elapsed(encode_start, trace::mono_trace_ns());
+                    outcome
+                } else {
+                    AppendOutcome::Continue
+                };
 
-                    // Drop slow clients whose send buffer has grown too large.
-                    // This prevents unbounded memory growth from a single laggy
-                    // connection causing allocator pressure and tail latency spikes.
-                    if entry.send_buf.len() + written > MAX_SEND_BUF {
-                        debug!(
-                            connection_id = slot.connection_id,
-                            send_buf_len = entry.send_buf.len(),
-                            "send buffer exceeded limit, dropping connection"
-                        );
-                        to_remove.push(slot.connection_id);
-                        break;
-                    }
-
-                    // Append the full wire frame to the connection's send buffer.
-                    // encode_response writes [length(4) | payload], which is the
-                    // complete wire format — no extra framing needed.
-                    entry.send_buf.extend_from_slice(&encode_buf[..written]);
-                    entry.last_send = batch_now;
-                    dirty_connections.insert(slot.connection_id);
-
-                    // Record server-side end-to-end: reader recv → response flush.
+                // Frame 2: BatchEnd terminator. Skipped if the payload
+                // append dropped the connection.
+                if matches!(payload_handled, AppendOutcome::Continue) && slot.is_last_in_request {
+                    let result = codec::encode_response(&ResponseKind::BatchEnd, &mut encode_buf)
+                        .map_err(|_| "encode error");
+                    let outcome = append_frame(
+                        result,
+                        slot.connection_id,
+                        entry,
+                        &encode_buf,
+                        batch_now,
+                        &mut dirty_connections,
+                        &mut to_remove,
+                    );
+                    // Record server-side end-to-end: reader recv ->
+                    // response flush. Only the BatchEnd frame carries
+                    // this measurement; tracked here after the append
+                    // so a dropped connection doesn't skew the metric.
                     #[cfg(feature = "latency-trace")]
-                    if matches!(kind, ResponseKind::BatchEnd) {
+                    if matches!(outcome, AppendOutcome::Continue) {
                         server_e2e_rec.record_elapsed(slot.recv_ts, trace::mono_trace_ns());
                     }
+                    let _ = outcome;
                 }
             }
         }
@@ -716,6 +696,64 @@ pub fn run(
 
 /// Submit io_uring SEND SQEs for all dirty connections and wait for completions.
 ///
+/// Outcome of a single per-frame append. `Continue` means the
+/// caller may proceed to the next frame for this slot;
+/// `ConnectionDropped` means the connection's send buffer overflowed
+/// or the encode failed, and the connection has been queued for
+/// removal — no further frames should be appended for this slot.
+#[derive(Clone, Copy)]
+enum AppendOutcome {
+    Continue,
+    ConnectionDropped,
+}
+
+/// Copy an encoded frame into the connection's send buffer with
+/// overflow checking. Splits the responsibilities the inline encode
+/// loop used to have: the caller passes in the encode result (so it
+/// can come from the `ResponseEncoder` trait for application
+/// payloads, or `codec::encode_response` for transport-shaped
+/// frames), and this helper handles size accounting + dirty
+/// tracking uniformly.
+#[allow(clippy::too_many_arguments)]
+fn append_frame(
+    result: Result<usize, &'static str>,
+    connection_id: u64,
+    entry: &mut ConnectionEntry,
+    encode_buf: &[u8],
+    batch_now: Instant,
+    dirty_connections: &mut HashSet<u64>,
+    to_remove: &mut Vec<u64>,
+) -> AppendOutcome {
+    let written = match result {
+        Ok(n) => n,
+        Err(reason) => {
+            tracing::error!(connection_id, reason, "encode error");
+            return AppendOutcome::Continue;
+        }
+    };
+
+    // Drop slow clients whose send buffer has grown too large. This
+    // prevents unbounded memory growth from a single laggy connection
+    // causing allocator pressure and tail latency spikes.
+    if entry.send_buf.len() + written > MAX_SEND_BUF {
+        debug!(
+            connection_id,
+            send_buf_len = entry.send_buf.len(),
+            "send buffer exceeded limit, dropping connection"
+        );
+        to_remove.push(connection_id);
+        return AppendOutcome::ConnectionDropped;
+    }
+
+    // Append the full wire frame to the connection's send buffer.
+    // The encoder writes [length(4) | payload], which is the complete
+    // wire format — no extra framing needed.
+    entry.send_buf.extend_from_slice(&encode_buf[..written]);
+    entry.last_send = batch_now;
+    dirty_connections.insert(connection_id);
+    AppendOutcome::Continue
+}
+
 /// Each dirty connection's accumulated send buffer is sent in a single SEND
 /// operation. Partial sends are retried until all bytes are delivered.
 /// Failed connections are collected in `to_remove` for the caller to clean up.

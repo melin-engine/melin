@@ -1107,6 +1107,7 @@ where
                     heartbeat_interval,
                     busy_spin,
                     utilization: response_utilization_thread,
+                    encoder: Arc::new(crate::domain::response_encoder::TradingResponseEncoder),
                 },
                 &s3,
             );
@@ -2081,6 +2082,7 @@ where
                 tx_producers,
                 response_utilization_thread,
                 busy_spin,
+                Arc::new(crate::domain::response_encoder::TradingResponseEncoder),
             );
         })
         .map_err(|e| format!("spawn response thread: {e}"))?;
