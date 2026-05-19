@@ -698,8 +698,7 @@ fn process_auth_frame(
         }
     };
     let signature = ed25519_dalek::Signature::from_bytes(&signature_bytes);
-    let signing_payload = melin_protocol::auth::auth_signing_payload(&nonce);
-    if verifying_key.verify(&signing_payload, &signature).is_err() {
+    if verifying_key.verify(&nonce, &signature).is_err() {
         debug!(
             connection_id = conn.connection_id.0,
             "DPDK: signature verification failed"

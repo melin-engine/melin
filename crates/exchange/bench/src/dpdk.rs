@@ -987,11 +987,8 @@ fn dpdk_auth_all(
                         other => panic!("client {i}: expected Challenge, got {other:?}"),
                     };
 
-                    // Sign nonce + ephemerals (DPDK TCP uses zero ephs)
-                    // — see `melin_protocol::auth::auth_signing_payload`.
-                    let signing_payload = melin_protocol::auth::auth_signing_payload(&nonce);
                     let conn_key = &keys[i];
-                    let signature = conn_key.sign(&signing_payload);
+                    let signature = conn_key.sign(&nonce);
                     let request = Request::ChallengeResponse {
                         signature: signature.to_bytes(),
                         public_key: conn_key.verifying_key().to_bytes(),

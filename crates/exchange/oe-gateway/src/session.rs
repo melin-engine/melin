@@ -450,8 +450,7 @@ impl Session {
             }
         };
 
-        let signing_payload = melin_protocol::auth::auth_signing_payload(&nonce);
-        let signature = signing_key.sign(&signing_payload);
+        let signature = signing_key.sign(&nonce);
         let request = Request::ChallengeResponse {
             signature: signature.to_bytes(),
             public_key: signing_key.verifying_key().to_bytes(),

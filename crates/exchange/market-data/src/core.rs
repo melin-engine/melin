@@ -117,8 +117,7 @@ fn run_session(
         }
     };
 
-    let signing_payload = melin_protocol::auth::auth_signing_payload(&nonce);
-    let signature = signing_key.sign(&signing_payload);
+    let signature = signing_key.sign(&nonce);
     let auth_request = Request::ChallengeResponse {
         signature: signature.to_bytes(),
         public_key: public_key.to_bytes(),

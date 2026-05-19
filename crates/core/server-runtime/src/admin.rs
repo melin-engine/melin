@@ -215,13 +215,10 @@ fn authenticate(stream: &mut TcpStream, authorized_keys: &AuthorizedKeys) -> Res
         format!("invalid public key: {e}")
     })?;
     let signature = ed25519_dalek::Signature::from_bytes(&signature_bytes);
-    let signing_payload = melin_protocol::auth::auth_signing_payload(&nonce);
-    verifying_key
-        .verify(&signing_payload, &signature)
-        .map_err(|e| {
-            send_auth_failed(stream);
-            format!("signature verification failed: {e}")
-        })?;
+    verifying_key.verify(&nonce, &signature).map_err(|e| {
+        send_auth_failed(stream);
+        format!("signature verification failed: {e}")
+    })?;
 
     let written = codec::encode_response(&ResponseKind::ServerReady, &mut buf)
         .map_err(|e| format!("encode ServerReady: {e}"))?;
@@ -444,8 +441,7 @@ mod tests {
             other => panic!("expected Challenge, got {other:?}"),
         };
 
-        let signing_payload = melin_protocol::auth::auth_signing_payload(&nonce);
-        let signature = key.sign(&signing_payload);
+        let signature = key.sign(&nonce);
         let request = Request::ChallengeResponse {
             signature: signature.to_bytes(),
             public_key: key.verifying_key().to_bytes(),

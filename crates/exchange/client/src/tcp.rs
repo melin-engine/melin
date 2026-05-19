@@ -59,8 +59,7 @@ impl Client {
         };
 
         // Step 2: Sign the nonce and send ChallengeResponse.
-        let signing_payload = melin_protocol::auth::auth_signing_payload(&nonce);
-        let signature = key.sign(&signing_payload);
+        let signature = key.sign(&nonce);
         let public_key = key.verifying_key().to_bytes();
         let request = Request::ChallengeResponse {
             signature: signature.to_bytes(),
@@ -233,8 +232,7 @@ mod tests {
         // Verify signature over the nonce.
         let vk = VerifyingKey::from_bytes(&pk_bytes).unwrap();
         let sig = ed25519_dalek::Signature::from_bytes(&sig_bytes);
-        let signing_payload = melin_protocol::auth::auth_signing_payload(&nonce);
-        vk.verify(&signing_payload, &sig).unwrap();
+        vk.verify(&nonce, &sig).unwrap();
 
         // Send ServerReady.
         let written = codec::encode_response(&ResponseKind::ServerReady, &mut buf).unwrap();

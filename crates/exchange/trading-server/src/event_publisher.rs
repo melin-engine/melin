@@ -559,13 +559,10 @@ fn authenticate_subscriber(
         io::Error::other(format!("invalid public key: {e}"))
     })?;
     let signature = ed25519_dalek::Signature::from_bytes(&signature_bytes);
-    let signing_payload = melin_protocol::auth::auth_signing_payload(&nonce);
-    verifying_key
-        .verify(&signing_payload, &signature)
-        .map_err(|e| {
-            send_auth_failed(&mut write_stream);
-            io::Error::other(format!("signature verification failed: {e}"))
-        })?;
+    verifying_key.verify(&nonce, &signature).map_err(|e| {
+        send_auth_failed(&mut write_stream);
+        io::Error::other(format!("signature verification failed: {e}"))
+    })?;
 
     // Auth succeeded — send ServerReady.
     let written = codec::encode_response(&ResponseKind::ServerReady, &mut buf)

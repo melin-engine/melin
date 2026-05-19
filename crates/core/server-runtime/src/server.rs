@@ -2776,13 +2776,10 @@ fn authenticate_connection<R: std::io::Read, W: std::io::Write>(
         io::Error::other(format!("invalid public key: {e}"))
     })?;
     let signature = ed25519_dalek::Signature::from_bytes(&signature_bytes);
-    let signing_payload = melin_protocol::auth::auth_signing_payload(&nonce);
-    verifying_key
-        .verify(&signing_payload, &signature)
-        .map_err(|e| {
-            send_auth_failed(writer);
-            io::Error::other(format!("signature verification failed: {e}"))
-        })?;
+    verifying_key.verify(&nonce, &signature).map_err(|e| {
+        send_auth_failed(writer);
+        io::Error::other(format!("signature verification failed: {e}"))
+    })?;
 
     // Auth succeeded — send ServerReady.
     let written = codec::encode_response(&ResponseKind::ServerReady, &mut buf)
@@ -3011,8 +3008,7 @@ mod tests {
             other => panic!("expected Challenge, got {other:?}"),
         };
 
-        let signing_payload = melin_protocol::auth::auth_signing_payload(&nonce);
-        let sig = key.sign(&signing_payload);
+        let sig = key.sign(&nonce);
         let request = Request::ChallengeResponse {
             signature: sig.to_bytes(),
             public_key: key.verifying_key().to_bytes(),
@@ -3037,8 +3033,7 @@ mod tests {
             other => panic!("expected Challenge, got {other:?}"),
         };
 
-        let signing_payload = melin_protocol::auth::auth_signing_payload(&nonce);
-        let mut sig_bytes = key.sign(&signing_payload).to_bytes();
+        let mut sig_bytes = key.sign(&nonce).to_bytes();
         sig_bytes[0] ^= 0xFF;
 
         let request = Request::ChallengeResponse {

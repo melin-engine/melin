@@ -368,8 +368,7 @@ fn admin_command(addr: SocketAddr, operator_key: &SigningKey, command: &str) -> 
     };
 
     // Step 2: Sign nonce + ephemerals (TCP path uses zero ephs).
-    let signing_payload = melin_protocol::auth::auth_signing_payload(&nonce);
-    let signature = operator_key.sign(&signing_payload);
+    let signature = operator_key.sign(&nonce);
     let request = Request::ChallengeResponse {
         signature: signature.to_bytes(),
         public_key: operator_key.verifying_key().to_bytes(),

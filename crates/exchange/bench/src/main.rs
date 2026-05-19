@@ -1955,10 +1955,7 @@ fn auth_handshake(
         other => panic!("expected Challenge, got {other:?}"),
     };
 
-    // Sign nonce + ephemerals (TCP bench uses zero ephs) — see
-    // `melin_protocol::auth::auth_signing_payload`.
-    let signing_payload = melin_protocol::auth::auth_signing_payload(&nonce);
-    let signature = key.sign(&signing_payload);
+    let signature = key.sign(&nonce);
     let request = Request::ChallengeResponse {
         signature: signature.to_bytes(),
         public_key: key.verifying_key().to_bytes(),
