@@ -1766,14 +1766,12 @@ if [[ "$RUN_PLOTS" == "1" ]]; then
     echo ""
 
     if command -v cargo &>/dev/null && [[ -f "${SCRIPT_DIR}/../crates/exchange/bench/src/plot.rs" ]]; then
-        # Plots land alongside the run's JSON files first so each results
+        # Plots land alongside the run's JSON files so each results
         # directory is self-contained — two runs kept in /tmp can be
-        # compared visually without the in-tree copies overwriting each
-        # other. After generation we mirror to the repo's docs/plots/
-        # so the in-tree copy reflects the latest run (for README / PR use).
+        # compared visually. The in-tree docs/plots/ copy is updated
+        # manually when a run is good enough to publish.
         RUN_PLOT_DIR="${RESULTS_DIR}/plots"
-        REPO_PLOT_DIR="${LOCAL_REPO}/docs/plots"
-        mkdir -p "${RUN_PLOT_DIR}" "${REPO_PLOT_DIR}"
+        mkdir -p "${RUN_PLOT_DIR}"
 
         echo "  Building plot tool..."
         (cd "$LOCAL_REPO" && cargo build --release -p melin-bench --features plot --bin melin-plot 2>&1 | tail -1)
@@ -1809,19 +1807,8 @@ if [[ "$RUN_PLOTS" == "1" ]]; then
             "${PLOT_TOOL}" health -o "${RUN_PLOT_DIR}/health-${label}" "$f" 2>&1 || true
         done
 
-        # Mirror the per-run plots into the repo's docs/plots/. Existing
-        # files in the repo copy are overwritten but not pruned — matching
-        # prior behavior of writing there directly.
-        shopt -s nullglob
-        mirror_files=("${RUN_PLOT_DIR}"/*)
-        shopt -u nullglob
-        if [[ ${#mirror_files[@]} -gt 0 ]]; then
-            cp "${mirror_files[@]}" "${REPO_PLOT_DIR}/"
-        fi
-
         echo ""
         echo "  Plots written to ${RUN_PLOT_DIR}/"
-        echo "  Mirrored to ${REPO_PLOT_DIR}/"
     fi
 fi
 
