@@ -143,7 +143,7 @@ pub fn run_dpdk_poll<A: Application>(
     // ack processing). Replaces the separate replication-sender thread —
     // see `feat/dpdk-single-queue` for the rationale (RSS routing on
     // iavf made the previous multi-queue split unworkable).
-    repl_driver: Option<crate::replication::DpdkReplicationDriver>,
+    repl_driver: Option<crate::replication::DpdkReplicationDriver<A>>,
     // TCP port the replication driver listens on. Used to filter
     // `AcceptedConnection::listen_port` so client connections go to the
     // client handler and replication connections to the driver. Ignored
@@ -410,7 +410,7 @@ pub fn run_dpdk_poll<A: Application>(
                 // drains the ring, and the journal evicts both replicas with
                 // "ring backpressure timeout".
                 if let Some(ref mut driver) = repl_driver {
-                    driver.tick::<A>(&mut transport, shutdown);
+                    driver.tick(&mut transport, shutdown);
                 }
             }
             active_idx += 1;
@@ -571,7 +571,7 @@ pub fn run_dpdk_poll<A: Application>(
         // dedicated repl-sender thread; transport.poll() above flushed
         // any TX the driver queued on the prior iteration.
         if let Some(ref mut driver) = repl_driver {
-            driver.tick::<A>(&mut transport, shutdown);
+            driver.tick(&mut transport, shutdown);
         }
 
         #[cfg(feature = "latency-trace")]

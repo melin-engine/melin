@@ -7,6 +7,7 @@
 #![cfg(feature = "dpdk")]
 
 use std::io;
+use std::marker::PhantomData;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
@@ -95,7 +96,13 @@ struct DpdkReplicaSlot {
 /// traffic by calling `tick()` once per poll iteration and dispatching
 /// `accept_connection()` for any `AcceptedConnection` that arrives on the
 /// replication listen port.
-pub struct DpdkReplicationDriver {
+///
+/// Parameterised over `A: Application` so successive `tick` calls cannot
+/// disagree on the application type — the journal catch-up and snapshot
+/// transfer paths both decode events through `A`, so a mid-flight switch
+/// would silently corrupt the wire. The driver carries no `A`-typed
+/// data, hence the `PhantomData`.
+pub struct DpdkReplicationDriver<A: Application> {
     slots: [DpdkReplicaSlot; 2],
     replication_cursor: Arc<AtomicU64>,
     fastest_replica_cursor: Arc<AtomicU64>,
@@ -106,9 +113,15 @@ pub struct DpdkReplicationDriver {
     metrics: Arc<ReplicationMetrics>,
     batch_size: usize,
     heartbeat_interval: std::time::Duration,
+    // Anchors the `A` type parameter — the struct holds no app-typed
+    // state, but `tick`'s journal-catchup and snapshot-transfer paths
+    // do, and we want the type system to enforce that the same `A`
+    // flows through every call rather than relying on every call site
+    // to spell `::<A>` consistently.
+    _app: PhantomData<fn(A)>,
 }
 
-impl DpdkReplicationDriver {
+impl<A: Application> DpdkReplicationDriver<A> {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         repl_consumers: [ReplicationConsumer; 2],
@@ -160,6 +173,7 @@ impl DpdkReplicationDriver {
             metrics,
             batch_size,
             heartbeat_interval: std::time::Duration::from_secs(heartbeat_secs),
+            _app: PhantomData,
         }
     }
 
@@ -192,7 +206,7 @@ impl DpdkReplicationDriver {
     /// `true` if at least one slot is currently active (Handshaking or
     /// Streaming) — caller can use this to decide whether to busy-spin
     /// on idle.
-    pub fn tick<A: Application>(
+    pub fn tick(
         &mut self,
         transport: &mut melin_dpdk::DpdkTransport,
         shutdown: &AtomicBool,
