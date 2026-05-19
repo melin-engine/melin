@@ -7,7 +7,6 @@ edition = "2024"
 latency-trace = []
 
 [dependencies]
-base64 = { workspace = true }
 blake3 = { workspace = true }
 ed25519-dalek = { workspace = true }
 # Typed views over raw byte buffers for the wire frame header —
@@ -15,7 +14,6 @@ ed25519-dalek = { workspace = true }
 # `FromBytes` / `IntoBytes`.
 zerocopy = { version = "0.8", features = ["derive"] }
 melin-types = { path = "../types" }
-melin-app = { path = "../../core/app" }
 
 [dev-dependencies]
 bolero = "0.13"

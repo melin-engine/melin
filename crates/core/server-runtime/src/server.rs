@@ -40,9 +40,9 @@ use crate::reader::RequestDecoderArc;
 use crate::response::ResponseEncoderArc;
 use melin_app::Application;
 use melin_app::app_factory::AppFactory;
+use melin_app::auth::AuthorizedKeys;
 use melin_app::auth::Permission;
 use melin_disruptor::ring::Consumer;
-use melin_protocol::auth::AuthorizedKeys;
 
 /// Output-slot sugar parameterised on the application — saves spelling
 /// `<A::Report, A::QueryResponse>` at every pipeline-facing signature
@@ -2927,8 +2927,8 @@ mod tests {
     use std::os::unix::net::UnixStream;
 
     use ed25519_dalek::{Signer, SigningKey};
+    use melin_app::auth::AuthorizedKeys;
     use melin_app::auth::Permission;
-    use melin_protocol::auth::AuthorizedKeys;
     use melin_protocol::codec;
     use melin_protocol::message::{ConnectionId, Request, ResponseKind};
 

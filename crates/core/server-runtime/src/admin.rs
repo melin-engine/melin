@@ -43,7 +43,7 @@ use crate::durability_policy::DurabilityMode;
 use ed25519_dalek::{Verifier, VerifyingKey};
 use tracing::{debug, error, info};
 
-use melin_protocol::auth::{AuthorizedKeys, Permission};
+use melin_app::auth::{AuthorizedKeys, Permission};
 use melin_protocol::codec;
 use melin_protocol::message::{Request, ResponseKind};
 

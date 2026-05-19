@@ -619,7 +619,7 @@ mod tests {
             repl_key.verifying_key().to_bytes(),
         );
         let keys_content = format!("replication {pub_b64} test-replica\n");
-        let authorized_keys = melin_protocol::auth::AuthorizedKeys::parse(&keys_content).unwrap();
+        let authorized_keys = melin_app::auth::AuthorizedKeys::parse(&keys_content).unwrap();
 
         let (primary_stream, replica_stream) = UnixStream::pair().unwrap();
         primary_stream
@@ -656,7 +656,7 @@ mod tests {
             authorized_key.verifying_key().to_bytes(),
         );
         let keys_content = format!("replication {pub_b64} authorized-replica\n");
-        let authorized_keys = melin_protocol::auth::AuthorizedKeys::parse(&keys_content).unwrap();
+        let authorized_keys = melin_app::auth::AuthorizedKeys::parse(&keys_content).unwrap();
 
         let (primary_stream, replica_stream) = UnixStream::pair().unwrap();
         primary_stream
@@ -695,7 +695,7 @@ mod tests {
             key.verifying_key().to_bytes(),
         );
         let keys_content = format!("trader {pub_b64} wrong-role\n");
-        let authorized_keys = melin_protocol::auth::AuthorizedKeys::parse(&keys_content).unwrap();
+        let authorized_keys = melin_app::auth::AuthorizedKeys::parse(&keys_content).unwrap();
 
         let (primary_stream, replica_stream) = UnixStream::pair().unwrap();
         primary_stream
@@ -735,7 +735,7 @@ mod tests {
             correct_key.verifying_key().to_bytes(),
         );
         let keys_content = format!("replication {pub_b64} test-replica\n");
-        let authorized_keys = melin_protocol::auth::AuthorizedKeys::parse(&keys_content).unwrap();
+        let authorized_keys = melin_app::auth::AuthorizedKeys::parse(&keys_content).unwrap();
 
         let (primary_stream, replica_stream) = UnixStream::pair().unwrap();
         primary_stream

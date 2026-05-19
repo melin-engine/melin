@@ -8,5 +8,9 @@ name = "melin_app"
 path = "src/lib.rs"
 
 [dependencies]
+base64 = { workspace = true }
 libc = { workspace = true }
 tracing = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"

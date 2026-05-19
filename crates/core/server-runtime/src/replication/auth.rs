@@ -24,7 +24,7 @@ use melin_transport_core::replication::protocol::{
 pub(super) fn authenticate_replica(
     reader: &mut impl Read,
     writer: &mut impl Write,
-    authorized_keys: &melin_protocol::auth::AuthorizedKeys,
+    authorized_keys: &melin_app::auth::AuthorizedKeys,
 ) -> io::Result<()> {
     use ed25519_dalek::{Verifier, VerifyingKey};
 

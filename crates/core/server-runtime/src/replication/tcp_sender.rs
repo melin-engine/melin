@@ -38,7 +38,7 @@ pub struct Sender {
     /// replicas in `StreamStart` so they write a byte-identical genesis.
     pub genesis_entry: Vec<u8>,
     pub journal_path: std::path::PathBuf,
-    pub authorized_keys: Arc<melin_protocol::auth::AuthorizedKeys>,
+    pub authorized_keys: Arc<melin_app::auth::AuthorizedKeys>,
     pub evict_flags: [Arc<AtomicBool>; 2],
     pub active_flags: [Arc<AtomicBool>; 2],
     pub metrics: Arc<ReplicationMetrics>,
@@ -350,7 +350,7 @@ struct SlotContext<'a> {
     other_slot_acked: &'a Arc<AtomicU64>,
     genesis_entry: &'a [u8],
     journal_path: &'a std::path::Path,
-    authorized_keys: &'a melin_protocol::auth::AuthorizedKeys,
+    authorized_keys: &'a melin_app::auth::AuthorizedKeys,
     shutdown: &'a AtomicBool,
     replica_ready: &'a AtomicBool,
     active_flag: &'a AtomicBool,

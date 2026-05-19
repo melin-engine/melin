@@ -40,6 +40,7 @@ use std::time::{Duration, Instant};
 use rustc_hash::FxHashMap;
 
 use ed25519_dalek::{Verifier, VerifyingKey};
+use melin_app::auth::AuthorizedKeys;
 use melin_app::auth::Permission;
 use melin_app::decoder::{Decoded, RequestDecoder};
 use melin_app::unix_epoch_nanos;
@@ -47,7 +48,6 @@ use melin_app::{AppEvent, Application};
 use melin_disruptor::ring;
 use melin_dpdk::transport::DpdkTransport;
 use melin_journal::JournalEvent;
-use melin_protocol::auth::AuthorizedKeys;
 use melin_protocol::codec;
 use melin_protocol::message::{ConnectionId, Request, ResponseKind};
 use melin_transport_core::pipeline::InputSlot;

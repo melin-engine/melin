@@ -26,11 +26,11 @@ use base64::Engine as _;
 use clap::Parser;
 use ed25519_dalek::SigningKey;
 
+use melin_app::auth::AuthorizedKeys;
 use melin_app::unix_epoch_nanos;
 use melin_journal::JournalEvent;
 #[allow(unused_imports)] // used by some feature combinations only
 use melin_journal::JournalWrite;
-use melin_protocol::auth::AuthorizedKeys;
 use melin_server::runtime::replication::{ReplicationMetrics, Sender, run_receiver, run_sender};
 use melin_server::runtime::server::PipelineCores;
 use melin_trading::trading_event::TradingEvent;

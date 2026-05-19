@@ -1515,7 +1515,9 @@ dependencies = [
 name = "melin-app"
 version = "0.8.0"
 dependencies = [
+ "base64 0.22.1",
  "libc",
+ "tempfile",
  "tracing",
 ]
 
@@ -1673,11 +1675,9 @@ dependencies = [
 name = "melin-protocol"
 version = "0.8.0"
 dependencies = [
- "base64 0.22.1",
  "blake3",
  "bolero",
  "ed25519-dalek",
- "melin-app",
  "melin-types",
  "tempfile",
  "zerocopy",
