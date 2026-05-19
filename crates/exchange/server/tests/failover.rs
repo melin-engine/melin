@@ -1216,7 +1216,17 @@ fn replica_reconnects_after_primary_restart_without_journal_wipe() {
         .expect("synchronize_request_seq with recovered primary");
     for i in 11..=20u64 {
         let r = submit_order(&mut client, i, 1, 1, Side::Buy, 100, 10);
-        assert!(!r.is_empty(), "phase-2 order {i} no response");
+        // Require an explicit `Placed` rather than just non-empty: a
+        // `Rejected{DuplicateRequest}` (e.g. if the HWM sync regressed)
+        // would otherwise masquerade as success and let the test pass
+        // against a primary that's silently rejecting every order.
+        assert!(
+            has_report(&r, |rep| matches!(
+                rep,
+                melin_protocol::types::ExecutionReport::Placed { .. }
+            )),
+            "phase-2 order {i}: expected Placed, got {r:?}"
+        );
     }
     drop(client);
     cluster.wait_replicated();
