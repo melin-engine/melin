@@ -196,7 +196,16 @@ fn replica_stream_uring<A: Application>(
     // response gate before it is visible to local consumers, breaking
     // the durability guarantee the gate sells. Updated *after* every
     // `batch.commit()`; asserted before every ack-send site below.
-    let mut last_committed_primary_seq: u64 = 0;
+    //
+    // Seeded from `*accum_end_sequence` because the two are bumped in
+    // lockstep after `batch.commit()` (see the publish path below), so
+    // on session entry the outer-scope accumulator already reflects
+    // everything committed to the ring. Without this priming, a
+    // reconnect against a live pipeline (which has been receiving
+    // batches across sessions) would re-enter with this local at 0
+    // while `accum_end_sequence` is non-zero, and the very next ack
+    // flush would trip the assert.
+    let mut last_committed_primary_seq: u64 = *accum_end_sequence;
     let mut idle_spins: u32 = 0;
     // Submit initial multishot RECV. The kernel will produce CQEs
     // continuously until EOF, error, or buffer pool exhaustion.
@@ -1146,8 +1155,15 @@ where
         };
 
         // --- Create journal for fresh replica (first connection only) ---
-
-        if journal_writer.is_none() {
+        //
+        // Gate on `pipeline.is_none()` rather than `journal_writer.is_none()`:
+        // the writer is moved into the pipeline on first connect and never
+        // returned, so on every subsequent reconnect `journal_writer` is
+        // `None` even though a live writer is still mid-stream inside the
+        // pipeline. `pipeline.is_none()` distinguishes "true first connect or
+        // post-snapshot rebuild" from "reconnect against an existing
+        // pipeline" — the latter must not recreate the journal file.
+        if pipeline.is_none() && journal_writer.is_none() {
             let writer =
                 melin_journal::create_fresh_replica::<_, W>(journal_path, &primary_genesis_entry)?;
             let mut fresh = factory.empty();

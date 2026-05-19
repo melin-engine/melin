@@ -1037,11 +1037,12 @@ fn recovered_primary_durability_gate_holds() {
     cluster.wait_replicated();
     drop(client);
 
-    // SIGKILL both nodes. We restart the primary from its journal (the
-    // recovery path is what bumps `starting_sequence` for the test);
-    // restarting the replica with a wiped journal avoids an unrelated
-    // bug in the same-process reconnect path that surfaces "File exists"
-    // when a long-lived replica reconnects after primary restart.
+    // SIGKILL both nodes and restart the replica with a wiped journal.
+    // The primary recovers from its journal so its `starting_sequence`
+    // is bumped past 2 — that's the property under test. The replica
+    // wipe is unrelated to the test invariant; it just keeps the
+    // recovery surface narrow (the live-replica reconnect path is
+    // exercised by `replica_reconnects_after_primary_restart_without_journal_wipe`).
     unsafe {
         libc::kill(cluster.primary.child.id() as i32, libc::SIGKILL);
         libc::kill(cluster.replica.child.id() as i32, libc::SIGKILL);
@@ -1140,6 +1141,88 @@ fn recovered_primary_durability_gate_holds() {
         missing,
         acked,
     );
+}
+
+/// Regression: a long-lived replica must rejoin a restarted primary
+/// without recreating its journal file.
+///
+/// Before the fix, the replica's reconnect loop gated the
+/// `create_fresh_replica` call on `journal_writer.is_none()`. The writer
+/// is moved into the pipeline on first connect and never returned, so
+/// every subsequent reconnect sees `journal_writer == None` and tries to
+/// create a fresh journal file — which fails `AlreadyExists` against the
+/// journal the replica is already streaming into. The
+/// `recovered_primary_durability_gate_holds` test sidesteps this by also
+/// wiping the replica's journal on restart; production deployments
+/// cannot.
+///
+/// This test SIGKILLs **only the primary**, restarts it on the same port
+/// from its own journal, and asserts that the live replica reconnects
+/// and converges replication lag to 0 — proving the fresh-journal path
+/// is not re-entered on reconnect.
+#[test]
+#[serial]
+fn replica_reconnects_after_primary_restart_without_journal_wipe() {
+    let mut cluster = TestCluster::start();
+    let mut client = cluster.connect_primary();
+
+    // Initial traffic so both nodes have non-trivial journal state.
+    for i in 1..=10u64 {
+        let r = submit_order(&mut client, i, 1, 1, Side::Buy, 100, 10);
+        assert!(!r.is_empty(), "phase-1 order {i} no response");
+    }
+    cluster.wait_replicated();
+    drop(client);
+
+    // SIGKILL the primary only — replica process stays alive and will
+    // attempt to reconnect. This is the scenario the prior bug broke.
+    unsafe {
+        libc::kill(cluster.primary.child.id() as i32, libc::SIGKILL);
+    }
+    let _ = cluster.primary.child.wait();
+
+    // Restart the primary on the same ports from its existing journal.
+    let restarted_primary = spawn_primary_with_extra(
+        &cluster.bin,
+        cluster._tmp.path(),
+        &cluster.keys_path,
+        cluster.primary.client_addr.port(),
+        cluster.primary.health_addr.port(),
+        cluster.primary_repl_port,
+        &[],
+    );
+    cluster.primary = restarted_primary;
+    wait_for_primary_repl_ready(cluster.primary.health_addr, Duration::from_secs(10));
+
+    // The replica was never restarted: its journal file still exists, and
+    // its in-process pipeline still owns the writer. Before the fix this
+    // reconnect would fail with `AlreadyExists` from `create_fresh_replica`
+    // and replication lag would never converge.
+    wait_healthy(cluster.primary.health_addr, Duration::from_secs(30));
+    cluster.wait_replicated();
+
+    // Push more traffic and confirm it replicates — this proves the
+    // replica is genuinely streaming, not just temporarily caught up.
+    let mut client = cluster.connect_primary();
+    client
+        .synchronize_request_seq()
+        .expect("synchronize_request_seq with recovered primary");
+    for i in 11..=20u64 {
+        let r = submit_order(&mut client, i, 1, 1, Side::Buy, 100, 10);
+        // Require an explicit `Placed` rather than just non-empty: a
+        // `Rejected{DuplicateRequest}` (e.g. if the HWM sync regressed)
+        // would otherwise masquerade as success and let the test pass
+        // against a primary that's silently rejecting every order.
+        assert!(
+            has_report(&r, |rep| matches!(
+                rep,
+                melin_protocol::types::ExecutionReport::Placed { .. }
+            )),
+            "phase-2 order {i}: expected Placed, got {r:?}"
+        );
+    }
+    drop(client);
+    cluster.wait_replicated();
 }
 
 /// After killing the primary and promoting the replica, restart the old
