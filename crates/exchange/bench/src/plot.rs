@@ -66,8 +66,13 @@ struct HealthResult {
 }
 
 /// A single health sample from the Prometheus metrics poller.
-#[derive(Debug, Deserialize)]
-#[allow(dead_code)]
+///
+/// Every server-side `melin_*` metric is a typed field here. The
+/// `_assert_all_metrics_plotted` function below destructures this struct
+/// without `..`, so adding a field without listing it there is a compile
+/// error — that is how we guarantee every metric has an explicit plotting
+/// decision.
+#[derive(Debug, Deserialize, Default)]
 struct HealthPoint {
     elapsed_secs: f64,
     active_connections: u64,
@@ -78,16 +83,185 @@ struct HealthPoint {
     input_queue_capacity: u64,
     pipeline_healthy: bool,
     trading_active: bool,
-    /// Additional metrics captured by the forward-compatible poller.
-    /// Keys are Prometheus metric names (including labels), values are f64.
+    #[serde(default, rename = "melin_replicas_connected")]
+    replicas_connected: u64,
+    #[serde(default, rename = "melin_replica_acked_sequence_slot_0")]
+    replica_acked_sequence_slot_0: u64,
+    #[serde(default, rename = "melin_replica_acked_sequence_slot_1")]
+    replica_acked_sequence_slot_1: u64,
+    #[serde(default, rename = "melin_replica_in_memory_sequence_slot_0")]
+    replica_in_memory_sequence_slot_0: u64,
+    #[serde(default, rename = "melin_replica_in_memory_sequence_slot_1")]
+    replica_in_memory_sequence_slot_1: u64,
+    #[serde(default, rename = "melin_replica_lag_slot_0")]
+    replica_lag_slot_0: u64,
+    #[serde(default, rename = "melin_replica_lag_slot_1")]
+    replica_lag_slot_1: u64,
+    #[serde(default, rename = "melin_replica_bytes_sent_total_slot_0")]
+    replica_bytes_sent_total_slot_0: u64,
+    #[serde(default, rename = "melin_replica_bytes_sent_total_slot_1")]
+    replica_bytes_sent_total_slot_1: u64,
+    #[serde(default, rename = "melin_replica_ack_latency_us_slot_0")]
+    replica_ack_latency_us_slot_0: u64,
+    #[serde(default, rename = "melin_replica_ack_latency_us_slot_1")]
+    replica_ack_latency_us_slot_1: u64,
+    #[serde(default, rename = "melin_replica_catching_up_slot_0")]
+    replica_catching_up_slot_0: u64,
+    #[serde(default, rename = "melin_replica_catching_up_slot_1")]
+    replica_catching_up_slot_1: u64,
+    #[serde(default, rename = "melin_replica_evictions_total")]
+    replica_evictions_total: u64,
+    #[serde(default, rename = "melin_replication_ring_depth_slot_0")]
+    replication_ring_depth_slot_0: u64,
+    #[serde(default, rename = "melin_replication_ring_depth_slot_1")]
+    replication_ring_depth_slot_1: u64,
+    #[serde(default, rename = "melin_fastest_replica_cursor")]
+    fastest_replica_cursor: u64,
+    #[serde(default, rename = "melin_stage_busy_total_stage_journal")]
+    stage_busy_total_journal: u64,
+    #[serde(default, rename = "melin_stage_busy_total_stage_matching")]
+    stage_busy_total_matching: u64,
+    #[serde(default, rename = "melin_stage_busy_total_stage_response")]
+    stage_busy_total_response: u64,
+    #[serde(default, rename = "melin_stage_idle_total_stage_journal")]
+    stage_idle_total_journal: u64,
+    #[serde(default, rename = "melin_stage_idle_total_stage_matching")]
+    stage_idle_total_matching: u64,
+    #[serde(default, rename = "melin_stage_idle_total_stage_response")]
+    stage_idle_total_response: u64,
+    #[serde(default, rename = "melin_response_gate_total_blocker_journal")]
+    response_gate_total_journal: u64,
+    #[serde(default, rename = "melin_response_gate_total_blocker_replication")]
+    response_gate_total_replication: u64,
+    #[serde(default, rename = "melin_durability_policy_degraded")]
+    durability_policy_degraded: u64,
+    /// Catch-all for genuinely-unknown metrics the server added without
+    /// updating this struct. A non-empty map at load time is logged as a
+    /// warning so we know to add a typed field + plot.
     #[serde(flatten)]
-    extra: HashMap<String, serde_json::Value>,
+    unknown: HashMap<String, serde_json::Value>,
 }
 
 impl HealthPoint {
-    /// Get an extra metric by name, returning 0.0 if not present.
-    fn extra_f64(&self, key: &str) -> f64 {
-        self.extra.get(key).and_then(|v| v.as_f64()).unwrap_or(0.0)
+    /// String-keyed metric lookup used by the generic plot helpers.
+    /// Adding a new metric to this struct also requires adding an arm
+    /// here (otherwise the typed field is unreachable from string-keyed
+    /// callers — caught at code review, not by the compiler).
+    fn metric_f64(&self, key: &str) -> f64 {
+        match key {
+            "melin_active_connections" => self.active_connections as f64,
+            "melin_events_processed" => self.events_processed as f64,
+            "melin_journal_sequence" => self.journal_sequence as f64,
+            "melin_replication_lag" => self.replication_lag as f64,
+            "melin_input_queue_depth" => self.input_queue_depth as f64,
+            "melin_input_queue_capacity" => self.input_queue_capacity as f64,
+            "melin_pipeline_healthy" => self.pipeline_healthy as u64 as f64,
+            "melin_trading_active" => self.trading_active as u64 as f64,
+            "melin_replicas_connected" => self.replicas_connected as f64,
+            "melin_replica_acked_sequence_slot_0" => self.replica_acked_sequence_slot_0 as f64,
+            "melin_replica_acked_sequence_slot_1" => self.replica_acked_sequence_slot_1 as f64,
+            "melin_replica_in_memory_sequence_slot_0" => {
+                self.replica_in_memory_sequence_slot_0 as f64
+            }
+            "melin_replica_in_memory_sequence_slot_1" => {
+                self.replica_in_memory_sequence_slot_1 as f64
+            }
+            "melin_replica_lag_slot_0" => self.replica_lag_slot_0 as f64,
+            "melin_replica_lag_slot_1" => self.replica_lag_slot_1 as f64,
+            "melin_replica_bytes_sent_total_slot_0" => self.replica_bytes_sent_total_slot_0 as f64,
+            "melin_replica_bytes_sent_total_slot_1" => self.replica_bytes_sent_total_slot_1 as f64,
+            "melin_replica_ack_latency_us_slot_0" => self.replica_ack_latency_us_slot_0 as f64,
+            "melin_replica_ack_latency_us_slot_1" => self.replica_ack_latency_us_slot_1 as f64,
+            "melin_replica_catching_up_slot_0" => self.replica_catching_up_slot_0 as f64,
+            "melin_replica_catching_up_slot_1" => self.replica_catching_up_slot_1 as f64,
+            "melin_replica_evictions_total" => self.replica_evictions_total as f64,
+            "melin_replication_ring_depth_slot_0" => self.replication_ring_depth_slot_0 as f64,
+            "melin_replication_ring_depth_slot_1" => self.replication_ring_depth_slot_1 as f64,
+            "melin_fastest_replica_cursor" => self.fastest_replica_cursor as f64,
+            "melin_stage_busy_total_stage_journal" => self.stage_busy_total_journal as f64,
+            "melin_stage_busy_total_stage_matching" => self.stage_busy_total_matching as f64,
+            "melin_stage_busy_total_stage_response" => self.stage_busy_total_response as f64,
+            "melin_stage_idle_total_stage_journal" => self.stage_idle_total_journal as f64,
+            "melin_stage_idle_total_stage_matching" => self.stage_idle_total_matching as f64,
+            "melin_stage_idle_total_stage_response" => self.stage_idle_total_response as f64,
+            "melin_response_gate_total_blocker_journal" => self.response_gate_total_journal as f64,
+            "melin_response_gate_total_blocker_replication" => {
+                self.response_gate_total_replication as f64
+            }
+            "melin_durability_policy_degraded" => self.durability_policy_degraded as f64,
+            other => self
+                .unknown
+                .get(other)
+                .and_then(|v| v.as_f64())
+                .unwrap_or(0.0),
+        }
+    }
+}
+
+/// Compile-time check: every field on `HealthPoint` must be named here. If
+/// a new typed field is added without updating this destructure, the
+/// compiler errors with "pattern does not mention field `...`". That is the
+/// guarantee that every metric gets a plot decision.
+///
+/// The `// plotted by` comments document where each field is consumed.
+#[allow(dead_code, unused_variables)]
+fn _assert_all_metrics_plotted(p: &HealthPoint) {
+    let HealthPoint {
+        elapsed_secs,                      // x-axis
+        active_connections,                // plot_health_connections
+        events_processed,                  // plot_health_throughput
+        journal_sequence,                  // plot_health_journal_sequence
+        replication_lag,                   // plot_health_replication_lag
+        input_queue_depth,                 // plot_health_queue_depth
+        input_queue_capacity,              // y-axis bound for queue_depth
+        pipeline_healthy,                  // plot_health_binary (status)
+        trading_active,                    // plot_health_binary (status)
+        replicas_connected,                // plot_health_extra_metric
+        replica_acked_sequence_slot_0,     // plot_health_extra_metric (per-slot)
+        replica_acked_sequence_slot_1,     // plot_health_extra_metric (per-slot)
+        replica_in_memory_sequence_slot_0, // plot_health_extra_metric (per-slot)
+        replica_in_memory_sequence_slot_1, // plot_health_extra_metric (per-slot)
+        replica_lag_slot_0,                // plot_health_extra_metric (per-slot)
+        replica_lag_slot_1,                // plot_health_extra_metric (per-slot)
+        replica_bytes_sent_total_slot_0,   // plot_health_extra_metric (per-slot)
+        replica_bytes_sent_total_slot_1,   // plot_health_extra_metric (per-slot)
+        replica_ack_latency_us_slot_0,     // plot_health_extra_metric (per-slot)
+        replica_ack_latency_us_slot_1,     // plot_health_extra_metric (per-slot)
+        replica_catching_up_slot_0,        // plot_health_extra_metric (per-slot)
+        replica_catching_up_slot_1,        // plot_health_extra_metric (per-slot)
+        replica_evictions_total,           // plot_health_extra_metric
+        replication_ring_depth_slot_0,     // plot_health_extra_metric (per-slot)
+        replication_ring_depth_slot_1,     // plot_health_extra_metric (per-slot)
+        fastest_replica_cursor,            // plot_health_extra_metric
+        stage_busy_total_journal,          // plot_health_utilization (derivative)
+        stage_busy_total_matching,         // plot_health_utilization (derivative)
+        stage_busy_total_response,         // plot_health_utilization (derivative)
+        stage_idle_total_journal,          // plot_health_utilization (derivative)
+        stage_idle_total_matching,         // plot_health_utilization (derivative)
+        stage_idle_total_response,         // plot_health_utilization (derivative)
+        response_gate_total_journal,       // plot_health_extra_metric
+        response_gate_total_replication,   // plot_health_extra_metric
+        durability_policy_degraded,        // plot_health_binary (status)
+        unknown,                           // warned at load time, not plotted
+    } = p;
+}
+
+/// Print a warning if the loaded health result contains metric keys that
+/// don't correspond to any typed field. New server-side metrics land here
+/// and are a signal to add a typed field + plot.
+fn warn_unknown_metrics(result: &HealthResult, filename: &str) {
+    let mut seen: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
+    for h in &result.health {
+        for k in h.unknown.keys() {
+            seen.insert(k.as_str());
+        }
+    }
+    if !seen.is_empty() {
+        let keys: Vec<&str> = seen.into_iter().collect();
+        eprintln!(
+            "warning: {filename} has unrecognized health metrics (no plot generated): {}",
+            keys.join(", ")
+        );
     }
 }
 
@@ -969,6 +1143,7 @@ fn cmd_health(args: &[String]) {
                     .file_name()
                     .map(|f| f.to_string_lossy().into_owned())
                     .unwrap_or_default();
+                warn_unknown_metrics(&r, &filename);
                 all_results.push((r, filename));
             }
             Ok(_) => eprintln!("warning: {} has no health data, skipping", path.display()),
@@ -1063,6 +1238,72 @@ fn cmd_health(args: &[String]) {
         &["fastest"],
         "Fastest-Replica Cursor Over Time",
         "Sequence",
+    );
+
+    // Cumulative replica evictions — every increment marks a replica that
+    // fell behind enough to be dropped from the ring. A flat line at zero
+    // is the healthy case.
+    plot_health_extra_metric(
+        &all_results,
+        &PathBuf::from(format!("{stem}-replica-evictions.svg")),
+        &["melin_replica_evictions_total"],
+        &["evictions"],
+        "Replica Evictions (cumulative)",
+        "Evictions",
+    );
+
+    plot_health_extra_metric(
+        &all_results,
+        &PathBuf::from(format!("{stem}-replicas-connected.svg")),
+        &["melin_replicas_connected"],
+        &["connected"],
+        "Replicas Connected Over Time",
+        "Count",
+    );
+
+    plot_health_extra_metric(
+        &all_results,
+        &PathBuf::from(format!("{stem}-replica-acked-sequence.svg")),
+        &[
+            "melin_replica_acked_sequence_slot_0",
+            "melin_replica_acked_sequence_slot_1",
+        ],
+        &["slot 0", "slot 1"],
+        "Per-Replica Acked Sequence (journal-persisted)",
+        "Sequence",
+    );
+
+    plot_health_extra_metric(
+        &all_results,
+        &PathBuf::from(format!("{stem}-replica-in-memory-sequence.svg")),
+        &[
+            "melin_replica_in_memory_sequence_slot_0",
+            "melin_replica_in_memory_sequence_slot_1",
+        ],
+        &["slot 0", "slot 1"],
+        "Per-Replica In-Memory Sequence (pre-journal)",
+        "Sequence",
+    );
+
+    plot_health_extra_metric(
+        &all_results,
+        &PathBuf::from(format!("{stem}-replica-catching-up.svg")),
+        &[
+            "melin_replica_catching_up_slot_0",
+            "melin_replica_catching_up_slot_1",
+        ],
+        &["slot 0", "slot 1"],
+        "Per-Replica Catching-Up Status (1 = replaying from journal)",
+        "Status",
+    );
+
+    plot_health_extra_metric(
+        &all_results,
+        &PathBuf::from(format!("{stem}-durability-degraded.svg")),
+        &["melin_durability_policy_degraded"],
+        &["degraded"],
+        "Durability Policy Degraded (1 = clamped below target node count)",
+        "Status",
     );
 
     // Response gate bottleneck: journal vs replication gate-wait events.
@@ -1356,7 +1597,7 @@ fn plot_health_extra_metric(
     let has_data = results.iter().any(|(r, _)| {
         r.health
             .iter()
-            .any(|h| metric_keys.iter().any(|k| h.extra_f64(k) > 0.0))
+            .any(|h| metric_keys.iter().any(|k| h.metric_f64(k) > 0.0))
     });
     if !has_data {
         return;
@@ -1368,7 +1609,7 @@ fn plot_health_extra_metric(
         .flat_map(|(r, _)| {
             r.health
                 .iter()
-                .flat_map(|h| metric_keys.iter().map(|k| h.extra_f64(k)))
+                .flat_map(|h| metric_keys.iter().map(|k| h.metric_f64(k)))
         })
         .fold(1.0f64, f64::max)
         * 1.2;
@@ -1405,7 +1646,7 @@ fn plot_health_extra_metric(
                 let points: Vec<(f64, f64)> = result
                     .health
                     .iter()
-                    .map(|h| (h.elapsed_secs, h.extra_f64(key)))
+                    .map(|h| (h.elapsed_secs, h.metric_f64(key)))
                     .collect();
 
                 chart
@@ -1447,7 +1688,7 @@ fn plot_health_utilization(results: &[(HealthResult, String)], output: &PathBuf)
     let has_data = results.iter().any(|(r, _)| {
         r.health
             .iter()
-            .any(|h| BUSY_KEYS.iter().any(|k| h.extra_f64(k) > 0.0))
+            .any(|h| BUSY_KEYS.iter().any(|k| h.metric_f64(k) > 0.0))
     });
     if !has_data {
         return;
@@ -1489,10 +1730,10 @@ fn plot_health_utilization(results: &[(HealthResult, String)], output: &PathBuf)
                     .windows(2)
                     .filter_map(|pair| {
                         let (prev, cur) = (&pair[0], &pair[1]);
-                        let d_busy = cur.extra_f64(BUSY_KEYS[stage_idx])
-                            - prev.extra_f64(BUSY_KEYS[stage_idx]);
-                        let d_idle = cur.extra_f64(IDLE_KEYS[stage_idx])
-                            - prev.extra_f64(IDLE_KEYS[stage_idx]);
+                        let d_busy = cur.metric_f64(BUSY_KEYS[stage_idx])
+                            - prev.metric_f64(BUSY_KEYS[stage_idx]);
+                        let d_idle = cur.metric_f64(IDLE_KEYS[stage_idx])
+                            - prev.metric_f64(IDLE_KEYS[stage_idx]);
                         let total = d_busy + d_idle;
                         if total > 0.0 {
                             Some((cur.elapsed_secs, d_busy / total * 100.0))
@@ -1700,6 +1941,7 @@ fn cmd_all(args: &[String]) {
                 .file_name()
                 .map(|f| f.to_string_lossy().into_owned())
                 .unwrap_or_default();
+            warn_unknown_metrics(&r, &filename);
             health_results.push((r, filename));
         }
     }
@@ -1744,6 +1986,63 @@ fn cmd_all(args: &[String]) {
             &["fastest"],
             "Fastest-Replica Cursor Over Time",
             "Sequence",
+        );
+        plot_health_extra_metric(
+            &health_results,
+            &PathBuf::from(format!("{stem}-replica-evictions.svg")),
+            &["melin_replica_evictions_total"],
+            &["evictions"],
+            "Replica Evictions (cumulative)",
+            "Evictions",
+        );
+        plot_health_extra_metric(
+            &health_results,
+            &PathBuf::from(format!("{stem}-replicas-connected.svg")),
+            &["melin_replicas_connected"],
+            &["connected"],
+            "Replicas Connected Over Time",
+            "Count",
+        );
+        plot_health_extra_metric(
+            &health_results,
+            &PathBuf::from(format!("{stem}-replica-acked-sequence.svg")),
+            &[
+                "melin_replica_acked_sequence_slot_0",
+                "melin_replica_acked_sequence_slot_1",
+            ],
+            &["slot 0", "slot 1"],
+            "Per-Replica Acked Sequence (journal-persisted)",
+            "Sequence",
+        );
+        plot_health_extra_metric(
+            &health_results,
+            &PathBuf::from(format!("{stem}-replica-in-memory-sequence.svg")),
+            &[
+                "melin_replica_in_memory_sequence_slot_0",
+                "melin_replica_in_memory_sequence_slot_1",
+            ],
+            &["slot 0", "slot 1"],
+            "Per-Replica In-Memory Sequence (pre-journal)",
+            "Sequence",
+        );
+        plot_health_extra_metric(
+            &health_results,
+            &PathBuf::from(format!("{stem}-replica-catching-up.svg")),
+            &[
+                "melin_replica_catching_up_slot_0",
+                "melin_replica_catching_up_slot_1",
+            ],
+            &["slot 0", "slot 1"],
+            "Per-Replica Catching-Up Status (1 = replaying from journal)",
+            "Status",
+        );
+        plot_health_extra_metric(
+            &health_results,
+            &PathBuf::from(format!("{stem}-durability-degraded.svg")),
+            &["melin_durability_policy_degraded"],
+            &["degraded"],
+            "Durability Policy Degraded (1 = clamped below target node count)",
+            "Status",
         );
         plot_health_utilization(
             &health_results,
