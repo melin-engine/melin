@@ -467,10 +467,21 @@ impl DpdkTransport {
     }
 
     /// Check if a socket has completed the TCP handshake and is ready
-    /// for data transfer (both send and receive directions open).
+    /// for data transfer (both send and receive directions open). A
+    /// handle that has been removed (caller raced a `close`) reads as
+    /// "not connected" — never panic on the caller's behalf.
     pub fn is_connected(&mut self, handle: SocketHandle) -> bool {
-        let socket = self.sockets.get_mut::<tcp::Socket>(handle);
-        socket.may_send() && socket.may_recv()
+        match self.sockets.try_get_mut::<tcp::Socket>(handle) {
+            Some(socket) => socket.may_send() && socket.may_recv(),
+            None => {
+                tracing::warn!(
+                    handle = ?handle,
+                    site = "is_connected",
+                    "DPDK: stale SocketHandle observed"
+                );
+                false
+            }
+        }
     }
 
     /// Convenience: initialize shared resources + create a single-queue transport.
@@ -567,33 +578,63 @@ impl DpdkTransport {
         let mut i = 0;
         while i < self.listeners.len() {
             let (port, handle) = self.listeners[i];
-            let socket = self.sockets.get_mut::<tcp::Socket>(handle);
-            if socket.state() != State::Established {
-                i += 1;
-                continue;
-            }
-
-            let peer = match socket.remote_endpoint() {
-                Some(remote) => match remote.addr {
-                    IpAddress::Ipv4(ip) => {
-                        let octets = ip.octets();
-                        std::net::SocketAddr::new(
-                            std::net::IpAddr::V4(Ipv4Addr::new(
-                                octets[0], octets[1], octets[2], octets[3],
-                            )),
-                            remote.port,
-                        )
+            let (state, peer) = match self.sockets.try_get_mut::<tcp::Socket>(handle) {
+                Some(socket) => {
+                    if socket.state() != State::Established {
+                        i += 1;
+                        continue;
                     }
-                },
+                    let peer = match socket.remote_endpoint() {
+                        Some(remote) => match remote.addr {
+                            IpAddress::Ipv4(ip) => {
+                                let octets = ip.octets();
+                                std::net::SocketAddr::new(
+                                    std::net::IpAddr::V4(Ipv4Addr::new(
+                                        octets[0], octets[1], octets[2], octets[3],
+                                    )),
+                                    remote.port,
+                                )
+                            }
+                        },
+                        None => {
+                            i += 1;
+                            continue;
+                        }
+                    };
+                    (socket.state(), peer)
+                }
                 None => {
-                    i += 1;
+                    // Listener handle gone — caller raced an out-of-band
+                    // socket removal. Drop the entry so we stop probing
+                    // it and let the listener-replacement path put a
+                    // fresh socket back on this port on a later poll.
+                    tracing::warn!(
+                        handle = ?handle,
+                        port,
+                        site = "check_listener",
+                        "DPDK: stale listener handle, removing from listeners[]"
+                    );
+                    self.listeners.swap_remove(i);
                     continue;
                 }
             };
+            let _ = state; // used only for the early-continue above
 
             // Register zero-copy callbacks on the accepted socket before
-            // it processes any data segments.
-            let accepted_socket = self.sockets.get_mut::<tcp::Socket>(handle);
+            // it processes any data segments. If the handle has been
+            // removed between the read above and now (shouldn't happen —
+            // we don't yield in this function — but guard anyway), skip
+            // the entry instead of crashing.
+            let Some(accepted_socket) = self.sockets.try_get_mut::<tcp::Socket>(handle) else {
+                tracing::warn!(
+                    handle = ?handle,
+                    port,
+                    site = "check_listener.accepted",
+                    "DPDK: accepted handle vanished mid-iteration"
+                );
+                self.listeners.swap_remove(i);
+                continue;
+            };
             accepted_socket.set_zero_copy_retain_fn(retain_mbuf);
             accepted_socket.set_zero_copy_release_fn(release_mbuf);
 
@@ -680,8 +721,13 @@ impl DpdkTransport {
     }
 
     /// Read available data from a connection into an external buffer.
+    /// A stale handle (closed/removed concurrently) reads as "nothing
+    /// available" — never panic on the caller's behalf.
     pub fn recv(&mut self, handle: SocketHandle, buf: &mut [u8]) -> usize {
-        let socket = self.sockets.get_mut::<tcp::Socket>(handle);
+        let Some(socket) = self.sockets.try_get_mut::<tcp::Socket>(handle) else {
+            tracing::warn!(handle = ?handle, site = "recv", "DPDK: stale SocketHandle observed");
+            return 0;
+        };
         if !socket.can_recv() {
             return 0;
         }
@@ -690,9 +736,13 @@ impl DpdkTransport {
 
     /// Append available data from a connection directly into a Vec.
     /// Uses zero-copy RX: reads directly from DPDK mbuf memory, then
-    /// releases the mbuf via the registered release callback.
+    /// releases the mbuf via the registered release callback. Stale
+    /// handle → 0 bytes appended, no panic.
     pub fn recv_into_vec(&mut self, handle: SocketHandle, dest: &mut Vec<u8>) -> usize {
-        let socket = self.sockets.get_mut::<tcp::Socket>(handle);
+        let Some(socket) = self.sockets.try_get_mut::<tcp::Socket>(handle) else {
+            tracing::warn!(handle = ?handle, site = "recv_into_vec", "DPDK: stale SocketHandle observed");
+            return 0;
+        };
         if !socket.can_recv() {
             return 0;
         }
@@ -739,19 +789,38 @@ impl DpdkTransport {
         MAX_TX_QUEUE_SIZE
     }
 
-    /// Check if a connection is still open.
+    /// Check if a connection is still open. A stale handle reads as
+    /// "not active" — never panic on the caller's behalf.
     pub fn is_active(&mut self, handle: SocketHandle) -> bool {
-        let socket = self.sockets.get_mut::<tcp::Socket>(handle);
-        socket.is_active()
+        match self.sockets.try_get_mut::<tcp::Socket>(handle) {
+            Some(socket) => socket.is_active(),
+            None => {
+                tracing::warn!(
+                    handle = ?handle,
+                    site = "is_active",
+                    "DPDK: stale SocketHandle observed"
+                );
+                false
+            }
+        }
     }
 
     /// Close a connection (sends FIN) and remove from the socket set.
     /// The socket is fully removed so its tuple doesn't block future
-    /// connections from the same source port.
+    /// connections from the same source port. Idempotent: a second
+    /// `close` for a handle that has already been removed is a no-op,
+    /// the TX queue (if any) is still drained for accounting.
     pub fn close(&mut self, handle: SocketHandle) {
-        let socket = self.sockets.get_mut::<tcp::Socket>(handle);
-        socket.abort();
-        self.sockets.remove(handle);
+        if let Some(socket) = self.sockets.try_get_mut::<tcp::Socket>(handle) {
+            socket.abort();
+            self.sockets.remove(handle);
+        } else {
+            tracing::warn!(
+                handle = ?handle,
+                site = "close",
+                "DPDK: close called on already-removed handle"
+            );
+        }
         if let Some(q) = self.tx_queues[handle.index()].take() {
             self.pending_tx_bytes -= q.queued_bytes();
         }
