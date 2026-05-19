@@ -442,6 +442,18 @@ impl<E: AppEvent> JournalReader<E> {
         }))
     }
 
+    /// Test-only constructor that opens the journal with a custom
+    /// initial buffer size. Lets unit tests force entries to straddle
+    /// buffer boundaries (and exercise the refill/grow paths) without
+    /// having to write millions of entries to overflow the production
+    /// 1 MiB buffer.
+    #[cfg(test)]
+    pub(crate) fn open_with_buffer(path: &Path, buf_size: usize) -> Result<Self, JournalError> {
+        let mut reader = Self::open(path)?;
+        reader.buffer = vec![0u8; buf_size];
+        Ok(reader)
+    }
+
     /// Last successfully read sequence number.
     pub fn last_sequence(&self) -> Option<u64> {
         self.last_sequence
@@ -587,9 +599,13 @@ impl<E: AppEvent> JournalReader<E> {
         }
 
         // Grow when the pending partial entry already fills the
-        // buffer — rare; covers oversized entries that exceed
-        // INITIAL_BUF_SIZE. Doubles on each miss so the loop bounded
-        // by the entry size, not by buffer size.
+        // buffer — rare under production traffic; the codec caps
+        // entry length at `u16::MAX` (~64 KiB total), so with the
+        // 1 MiB INITIAL_BUF_SIZE this branch is structurally
+        // unreachable. Kept for the small-buffer test path and as
+        // defense-in-depth if the codec's cap is ever loosened.
+        // Doubles on each miss so the loop is bounded by the entry
+        // size, not by buffer size.
         if self.valid == self.buffer.len() {
             self.buffer.resize(self.buffer.len() * 2, 0);
         }
@@ -840,6 +856,42 @@ mod tests {
         for (i, entry) in decoded.iter().enumerate() {
             assert_eq!(entry.sequence, FIRST_SEQ + i as u64);
             assert_eq!(entry.event, events[i]);
+        }
+    }
+
+    /// Forces entries to straddle the reader's internal buffer
+    /// boundary by opening with a buffer smaller than a single entry.
+    /// Every `next_entry` then exercises the lazy-refill ↔
+    /// compact-grow-read split: `fill_buffer` returns early when the
+    /// buffer holds the entry header but not the payload, decode
+    /// returns `TruncatedEntry`, `try_extend_buffer` compacts the
+    /// consumed prefix and reads more, decode succeeds. With 100
+    /// entries and a 64-byte buffer (one entry ≈ 49 bytes), the seam
+    /// is crossed dozens of times within the same scan.
+    #[test]
+    fn entries_straddling_buffer_boundary_decode_correctly() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.journal");
+        const N: u64 = 100;
+        {
+            let mut writer = SectorWriter::<TestEvent>::create(&path).unwrap();
+            for i in 0..N {
+                writer.append(&JournalEvent::App(TestEvent(i))).unwrap();
+            }
+        }
+
+        // Tiny buffer (< one entry) guarantees a refill straddles
+        // every entry. The grow path also fires once when the buffer
+        // is full of header bytes but still can't fit the payload.
+        let mut reader = JournalReader::<TestEvent>::open_with_buffer(&path, 64).unwrap();
+        let mut decoded = Vec::new();
+        while let Some(entry) = reader.next_entry().unwrap() {
+            decoded.push(entry);
+        }
+        assert_eq!(decoded.len(), N as usize);
+        for (i, entry) in decoded.iter().enumerate() {
+            assert_eq!(entry.sequence, FIRST_SEQ + i as u64);
+            assert_eq!(entry.event, JournalEvent::App(TestEvent(i as u64)));
         }
     }
 
