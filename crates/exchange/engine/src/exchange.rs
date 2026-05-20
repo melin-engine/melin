@@ -12,7 +12,7 @@ use crate::account::AccountManager;
 use crate::orderbook::OrderBook;
 use crate::scheduler::{ScheduledTask, ScheduledTaskHeap, ScheduledTaskKind};
 use crate::types::{
-    AccountId, CircuitBreakerConfig, CurrencyId, ExecutionReport, FeeSchedule, FxHashMap, HashMap,
+    AccountId, CircuitBreakerConfig, CurrencyId, ExecutionReport, FeeSchedule, FxHashSet, HashMap,
     HashMap4, InstrumentSpec, InstrumentStatus, Order, OrderId, OrderType, Price, Quantity,
     RejectReason, ReservationSlot, RiskLimits, Side, Symbol, TimeInForce,
 };
@@ -85,13 +85,13 @@ pub struct Exchange {
     /// forever," which keeps the gateway's session-local id_map workable
     /// across reconnects without needing to query the engine for HWMs.
     /// Used as a set: the unit value carries no information.
-    /// Open-addressing (hashbrown) rather than the project's HashMap4
-    /// (astenn) — `(AccountId, OrderId)` has unbounded distinct keys
-    /// under the bench's churn pattern but bounded live count, exactly
-    /// the workload extendible hashing handles poorly (directory grows
-    /// with lifetime inserts). Hashbrown's backshift deletion keeps
-    /// capacity tracking the live set.
-    live_order_ids: FxHashMap<(AccountId, OrderId), ()>,
+    /// Open-addressing (hashbrown) set rather than the project's
+    /// HashMap4 (astenn) — `(AccountId, OrderId)` has unbounded
+    /// distinct keys under the bench's churn pattern but bounded live
+    /// count, exactly the workload extendible hashing handles poorly
+    /// (directory grows with lifetime inserts). Hashbrown's backshift
+    /// deletion keeps capacity tracking the live set.
+    live_order_ids: FxHashSet<(AccountId, OrderId)>,
     /// Per-account count of resting orders (on the book or pending stops).
     /// Used to reject withdrawals while orders are outstanding.
     /// Entries are removed when the count reaches zero.
@@ -371,7 +371,7 @@ impl Exchange {
         Self {
             instruments: Vec::new(),
             accounts: AccountManager::new(),
-            live_order_ids: FxHashMap::default(),
+            live_order_ids: FxHashSet::default(),
             order_counts: HashMap4::default(),
             key_hwm: HashMap::default(),
             scheduled_tasks: ScheduledTaskHeap::new(),
@@ -401,7 +401,7 @@ impl Exchange {
             // smaller than the lifetime total. hashbrown-backed: the
             // bounded-live-count + unbounded-distinct-keys workload
             // doesn't grow the table once warmup settles.
-            live_order_ids: FxHashMap::with_capacity_and_hasher(1_000_000, Default::default()),
+            live_order_ids: FxHashSet::with_capacity_and_hasher(1_000_000, Default::default()),
             // 1M accounts × ~32 bytes per entry ≈ 32 MB. Covers the
             // default benchmark (1M accounts) with no hot-path resizes.
             // Pages are faulted during prefault() via insert/clear.
@@ -451,7 +451,7 @@ impl Exchange {
         Self {
             instruments: Vec::with_capacity(num_instruments.max(64)),
             accounts: AccountManager::with_balance_capacity(balance_capacity),
-            live_order_ids: FxHashMap::with_capacity_and_hasher(1_000_000, Default::default()),
+            live_order_ids: FxHashSet::with_capacity_and_hasher(1_000_000, Default::default()),
             order_counts: HashMap4::with_capacity_and_hasher(
                 num_accounts.max(1_000_000),
                 Default::default(),
@@ -486,16 +486,16 @@ impl Exchange {
         // so the snapshot doesn't carry them — the only source of truth
         // is the order index.
         let mut order_counts: HashMap4<AccountId, u32> = HashMap4::default();
-        let mut live_order_ids: FxHashMap<(AccountId, OrderId), ()> = FxHashMap::default();
+        let mut live_order_ids: FxHashSet<(AccountId, OrderId)> = FxHashSet::default();
         for inst in &instruments {
             if let Some(inst) = inst.as_deref() {
                 for ((account, order_id), _) in inst.book.active_order_slots() {
                     *order_counts.entry(account).or_default() += 1;
-                    live_order_ids.insert((account, order_id), ());
+                    live_order_ids.insert((account, order_id));
                 }
                 for ((account, order_id), _) in inst.book.active_stop_slots() {
                     *order_counts.entry(account).or_default() += 1;
-                    live_order_ids.insert((account, order_id), ());
+                    live_order_ids.insert((account, order_id));
                 }
             }
         }
@@ -972,7 +972,7 @@ impl Exchange {
             let cap = self.live_order_ids.capacity();
             for i in 0..cap as u32 {
                 self.live_order_ids
-                    .insert((AccountId(i), OrderId(i as u64)), ());
+                    .insert((AccountId(i), OrderId(i as u64)));
             }
             self.live_order_ids.clear();
         }
@@ -1107,7 +1107,7 @@ impl Exchange {
         // not here — duplicate journaled SubmitOrder events never reach
         // this point. Reuse of an `OrderId` after the original closes
         // is permitted by design.
-        if self.live_order_ids.contains_key(&(order.account, order.id)) {
+        if self.live_order_ids.contains(&(order.account, order.id)) {
             reports.push(ExecutionReport::Rejected {
                 order_id: order.id,
                 symbol,
@@ -1313,7 +1313,7 @@ impl Exchange {
         // dedup check. If the order closes within this `execute` call
         // (IOC/FOK fill, FOK kill, etc.) the entry is freed in the
         // `freed` loop below; if it rests, the entry stays put.
-        self.live_order_ids.insert((order.account, order.id), ());
+        self.live_order_ids.insert((order.account, order.id));
 
         let taker_account = order.account;
         let taker_id = order.id;

@@ -1622,22 +1622,24 @@ impl OrderBook {
         node_for.extend(bid_node_idx);
         node_for.extend(ask_node_idx);
 
-        let mut order_index: crate::slab_map::SlabMap<(Side, Price, ReservationSlot, u32)> =
-            crate::slab_map::SlabMap::with_capacity(snap.order_index.len());
-        for (id, account, side, price) in snap.order_index.into_iter() {
-            let node_idx = node_for
-                .get(&(account, id))
-                .copied()
-                // Snapshot self-consistency: every order_index entry
-                // must correspond to a resting order in the same
-                // snapshot. If it doesn't, the snapshot is corrupt and
-                // we'd rather fail loudly than silently skip cancels.
-                .expect("snapshot order_index references missing book entry");
-            order_index.insert(
-                (account, id),
-                (side, price, ReservationSlot::DUMMY, node_idx),
-            );
-        }
+        let order_index: crate::slab_map::SlabMap<(Side, Price, ReservationSlot, u32)> = snap
+            .order_index
+            .into_iter()
+            .map(|(id, account, side, price)| {
+                let node_idx = node_for
+                    .get(&(account, id))
+                    .copied()
+                    // Snapshot self-consistency: every order_index entry
+                    // must correspond to a resting order in the same
+                    // snapshot. If it doesn't, the snapshot is corrupt and
+                    // we'd rather fail loudly than silently skip cancels.
+                    .expect("snapshot order_index references missing book entry");
+                (
+                    (account, id),
+                    (side, price, ReservationSlot::DUMMY, node_idx),
+                )
+            })
+            .collect();
 
         // Build stop sides; collect the slab-index mapping the same way
         // as for resting orders so we can populate `stop_index` with
@@ -1650,15 +1652,17 @@ impl OrderBook {
         stop_node_for.extend(buy_stop_idx);
         stop_node_for.extend(sell_stop_idx);
 
-        let mut stop_index: crate::slab_map::SlabMap<(Side, Price, u32)> =
-            crate::slab_map::SlabMap::with_capacity(snap.stop_index.len());
-        for (id, account, side, price) in snap.stop_index.into_iter() {
-            let node_idx = stop_node_for
-                .get(&(account, id))
-                .copied()
-                .expect("snapshot stop_index references missing stop entry");
-            stop_index.insert((account, id), (side, price, node_idx));
-        }
+        let stop_index: crate::slab_map::SlabMap<(Side, Price, u32)> = snap
+            .stop_index
+            .into_iter()
+            .map(|(id, account, side, price)| {
+                let node_idx = stop_node_for
+                    .get(&(account, id))
+                    .copied()
+                    .expect("snapshot stop_index references missing stop entry");
+                ((account, id), (side, price, node_idx))
+            })
+            .collect();
 
         Self::from_parts(
             symbol,

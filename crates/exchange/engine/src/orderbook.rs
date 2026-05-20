@@ -980,10 +980,10 @@ impl OrderBook {
             symbol,
             bids: BookSide::default(),
             asks: BookSide::default(),
-            order_index: SlabMap::with_capacity(0),
+            order_index: SlabMap::new(),
             stop_buys: StopSide::default(),
             stop_sells: StopSide::default(),
-            stop_index: SlabMap::with_capacity(0),
+            stop_index: SlabMap::new(),
             last_trade_price: None,
             // Hot-path scratch buffers reused across orders (cleared at
             // the top of each match). 64 capacity covers the typical

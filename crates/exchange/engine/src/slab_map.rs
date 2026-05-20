@@ -48,7 +48,6 @@ enum Slot<V> {
 /// the key (always `(AccountId, OrderId)`) because that's the only key
 /// shape the engine uses; generalising would add a type parameter for
 /// negligible benefit.
-#[allow(dead_code)] // call sites land in the next commit on the same branch
 #[derive(Debug)]
 pub(crate) struct SlabMap<V> {
     /// `(AccountId, OrderId)` → slot_id (`u32`). hashbrown-backed via
@@ -61,8 +60,13 @@ pub(crate) struct SlabMap<V> {
     next_free: u32,
 }
 
-#[allow(dead_code)]
 impl<V> SlabMap<V> {
+    /// Create an empty slab map. Equivalent to `with_capacity(0)`; mirrors
+    /// the `Vec::new` / `HashMap::new` shape that callers expect.
+    pub(crate) fn new() -> Self {
+        Self::with_capacity(0)
+    }
+
     /// Create an empty slab map with the given initial capacity for both
     /// the lookup and the slot storage. Pre-sizing both avoids a
     /// reallocation when the bench's prefault pass touches every slot.
@@ -74,15 +78,22 @@ impl<V> SlabMap<V> {
         }
     }
 
-    /// Insert or update an entry. Returns the slot_id of the entry.
-    ///
-    /// If `key` was already present, the existing slot is reused and the
-    /// old value is replaced (no slot churn).
-    pub(crate) fn insert(&mut self, key: (AccountId, OrderId), value: V) -> u32 {
+    /// Insert an entry. Returns the previous value at `key` if it was
+    /// present (mirroring `std::collections::HashMap::insert`). On
+    /// overwrite the existing slot is reused (no slot churn / freelist
+    /// movement).
+    pub(crate) fn insert(&mut self, key: (AccountId, OrderId), value: V) -> Option<V> {
         if let Some(&slot_id) = self.lookup.get(&key) {
-            // Existing entry: overwrite the value in place.
-            self.slots[slot_id as usize] = Slot::Occupied { key, value };
-            return slot_id;
+            // Existing entry: overwrite the value in place and return
+            // the prior value so callers can detect collisions.
+            let prev = std::mem::replace(
+                &mut self.slots[slot_id as usize],
+                Slot::Occupied { key, value },
+            );
+            return match prev {
+                Slot::Occupied { value, .. } => Some(value),
+                Slot::Vacant { .. } => None,
+            };
         }
         let slot_id = if self.next_free == u32::MAX {
             let id = self.slots.len() as u32;
@@ -103,7 +114,7 @@ impl<V> SlabMap<V> {
             id
         };
         self.lookup.insert(key, slot_id);
-        slot_id
+        None
     }
 
     /// Remove an entry. Returns the stored value if `key` was present.
@@ -134,21 +145,14 @@ impl<V> SlabMap<V> {
         }
     }
 
-    /// Mutable lookup without removing.
-    pub(crate) fn get_mut(&mut self, key: &(AccountId, OrderId)) -> Option<&mut V> {
-        let &slot_id = self.lookup.get(key)?;
-        match &mut self.slots[slot_id as usize] {
-            Slot::Occupied { value, .. } => Some(value),
-            Slot::Vacant { .. } => None,
-        }
-    }
-
     /// True iff `key` is present.
     pub(crate) fn contains_key(&self, key: &(AccountId, OrderId)) -> bool {
         self.lookup.contains_key(key)
     }
 
-    /// Number of live entries.
+    /// Number of live entries. Test-only today; kept on the public API
+    /// because callers will reach for `len()` to mirror std collections.
+    #[cfg(test)]
     pub(crate) fn len(&self) -> usize {
         self.lookup.len()
     }
@@ -185,6 +189,22 @@ impl<V> SlabMap<V> {
     }
 }
 
+impl<V> FromIterator<((AccountId, OrderId), V)> for SlabMap<V> {
+    /// Build a `SlabMap` from an iterator of `(key, value)` pairs. The
+    /// `size_hint` lower bound is used to pre-size the underlying lookup
+    /// and slab so a known-length producer (e.g. snapshot restore) avoids
+    /// rehash / Vec-growth allocations during the build.
+    fn from_iter<I: IntoIterator<Item = ((AccountId, OrderId), V)>>(iter: I) -> Self {
+        let iter = iter.into_iter();
+        let (lower, _) = iter.size_hint();
+        let mut map = Self::with_capacity(lower);
+        for (key, value) in iter {
+            map.insert(key, value);
+        }
+        map
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -209,9 +229,12 @@ mod tests {
     #[test]
     fn insert_overwrites_existing_slot() {
         let mut m: SlabMap<u32> = SlabMap::with_capacity(16);
-        let id1 = m.insert(key(1, 1), 100);
-        let id2 = m.insert(key(1, 1), 200);
-        assert_eq!(id1, id2, "overwrite must reuse the slot");
+        assert_eq!(m.insert(key(1, 1), 100), None, "fresh insert returns None");
+        assert_eq!(
+            m.insert(key(1, 1), 200),
+            Some(100),
+            "overwrite returns the prior value (mirroring HashMap::insert)",
+        );
         assert_eq!(m.get(&key(1, 1)), Some(&200));
         assert_eq!(m.len(), 1);
     }
@@ -219,10 +242,12 @@ mod tests {
     #[test]
     fn slot_recycled_after_remove() {
         let mut m: SlabMap<u32> = SlabMap::with_capacity(16);
-        let id1 = m.insert(key(1, 1), 100);
+        m.insert(key(1, 1), 100);
         m.remove(&key(1, 1));
-        let id2 = m.insert(key(2, 2), 200);
-        assert_eq!(id1, id2, "freed slot must be reused");
+        m.insert(key(2, 2), 200);
+        // Slot reuse is the load-bearing property: insert-remove-insert
+        // must NOT grow the slab Vec past 1 entry.
+        assert_eq!(m.slots.len(), 1, "freed slot must be reused");
     }
 
     #[test]
