@@ -890,7 +890,12 @@ fn run_engine_bench(
     let mut interval_hist =
         Histogram::<u64>::new_with_bounds(1, 10_000_000_000, 3).expect("interval histogram");
     let mut interval_count: usize = 0;
-    let mut series: TimeSeries = Vec::new();
+    // Pre-allocate generously: at 10M ord/s × SAMPLE_INTERVAL=1000 across
+    // typical bench durations (≤ 10 min) we push ≤ 600k entries; sizing
+    // for that up-front avoids the doubling-reallocate spikes that show
+    // up as ~100µs outliers in the deep tail at the 32k/64k/128k/256k
+    // capacity boundaries.
+    let mut series: TimeSeries = Vec::with_capacity(600_000);
 
     let mut submits: u64 = 0;
     let mut cancels: u64 = 0;
@@ -2552,7 +2557,12 @@ fn run_uring_loop(
     let mut interval_hist =
         Histogram::<u64>::new_with_bounds(1, 10_000_000_000, 3).expect("interval histogram");
     let mut interval_count: usize = 0;
-    let mut series: TimeSeries = Vec::new();
+    // Pre-allocate generously: at 10M ord/s × SAMPLE_INTERVAL=1000 across
+    // typical bench durations (≤ 10 min) we push ≤ 600k entries; sizing
+    // for that up-front avoids the doubling-reallocate spikes that show
+    // up as ~100µs outliers in the deep tail at the 32k/64k/128k/256k
+    // capacity boundaries.
+    let mut series: TimeSeries = Vec::with_capacity(600_000);
 
     // Pre-allocated CQE collection buffer. Must collect CQEs before
     // processing because the CQ borrow must end before mutating connections.
