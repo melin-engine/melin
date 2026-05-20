@@ -195,6 +195,24 @@ pub struct Exchange {
     /// must call `set_current_event_ts_ns` themselves before each
     /// `execute` (or call through `Application::apply`, which stamps).
     current_event_ts_ns: u64,
+    /// Scratch buffer for consumed-slot drain during `execute`. Reused
+    /// across calls to eliminate the per-event Vec allocation that
+    /// `inst.book.drain_consumed_slots().collect()` would otherwise
+    /// perform; the allocator's first-touch on a freshly-mmap'd page
+    /// was the dominant source of the engine's deep-tail outliers
+    /// (~100µs spikes at p99.99999 under realistic flow on the cherry
+    /// EPYC box). Vec for sequential append + iterate; capacity held
+    /// across calls via `mem::take` / put-back at the end of `execute`.
+    scratch_consumed: Vec<(AccountId, OrderId, Side, ReservationSlot)>,
+    /// Scratch buffer for `freed` tracking inside `execute`. Same
+    /// rationale as `scratch_consumed`. Vec rather than HashSet because
+    /// typical depth is small (0-5 entries) — linear `.contains()` beats
+    /// hashing at this size. Caveat for future tuning: at 10M ord/s a
+    /// pathological deep-cross (thousands of fills against a single
+    /// aggressive market order) would push `freed.contains()` into
+    /// O(n²) — switch to a small ahash set or sort+binary-search if
+    /// that workload becomes realistic.
+    scratch_freed: Vec<(AccountId, OrderId)>,
 }
 
 /// Per-account token-bucket state for the order-submission rate limiter.
@@ -358,6 +376,10 @@ impl Exchange {
             max_orders_burst: DEFAULT_MAX_ORDERS_BURST,
             order_buckets: HashMap4::default(),
             current_event_ts_ns: 0,
+            // Match OrderBook::consumed_slots's 64-element pre-alloc so
+            // typical fills (0-5 entries) never trigger growth.
+            scratch_consumed: Vec::with_capacity(64),
+            scratch_freed: Vec::with_capacity(64),
         }
     }
 
@@ -387,6 +409,8 @@ impl Exchange {
             // active-account count.
             order_buckets: HashMap4::with_capacity_and_hasher(1_000_000, Default::default()),
             current_event_ts_ns: 0,
+            scratch_consumed: Vec::with_capacity(64),
+            scratch_freed: Vec::with_capacity(64),
         }
     }
 
@@ -437,6 +461,8 @@ impl Exchange {
                 Default::default(),
             ),
             current_event_ts_ns: 0,
+            scratch_consumed: Vec::with_capacity(64),
+            scratch_freed: Vec::with_capacity(64),
         }
     }
 
@@ -486,6 +512,8 @@ impl Exchange {
             // buckets — see `set_max_orders_per_second`).
             order_buckets: HashMap4::default(),
             current_event_ts_ns: 0,
+            scratch_consumed: Vec::with_capacity(64),
+            scratch_freed: Vec::with_capacity(64),
         }
     }
 
@@ -1283,6 +1311,24 @@ impl Exchange {
         let taker_id = order.id;
         let report_start = reports.len();
 
+        // Take scratch buffers out of `self` BEFORE the `inst_mut` borrow
+        // below. `inst` mutably borrows `self.instruments` for the rest
+        // of the function, so we can't touch `self.scratch_*` once it's
+        // live. `mem::take` swaps with an empty Vec (no allocation —
+        // `Vec::new()` is const) and the populated buffer is restored
+        // at the end. Net effect: the inner loop has the same shape as
+        // before but no per-event Vec allocation.
+        //
+        // The leading `clear()` calls are belt-and-braces: the put-back
+        // at function end leaves the field empty, so under normal
+        // control flow the take yields an already-empty Vec. The clear
+        // only does work if a previous `execute` panicked between take
+        // and put-back, leaving stale entries in the scratch.
+        let mut consumed = std::mem::take(&mut self.scratch_consumed);
+        consumed.clear();
+        let mut freed = std::mem::take(&mut self.scratch_freed);
+        freed.clear();
+
         // Single mutable lookup: book, fees all from the same struct.
         // Existence was established by the `inst_ref` guard at the top of
         // `execute` (line ~1017); same single-threaded invariant as the
@@ -1302,12 +1348,7 @@ impl Exchange {
         //
         // consumed_slots: fully-filled or STP-cancelled makers, with their
         // reservation slots. Typically 0-5 entries per aggressive order.
-        let consumed: Vec<(AccountId, OrderId, Side, ReservationSlot)> =
-            inst.book.drain_consumed_slots().collect();
-
-        // Track which (account, order_id) pairs are fully done (slot freed).
-        // Used to avoid double-free and to decrement order_counts.
-        let mut freed: Vec<(AccountId, OrderId)> = Vec::new();
+        consumed.extend(inst.book.drain_consumed_slots());
 
         for report in &mut reports[report_start..] {
             match report {
@@ -1510,6 +1551,15 @@ impl Exchange {
         {
             self.schedule_gtd_expiry(symbol, taker_account, taker_id, order.expiry_ns);
         }
+
+        // Clear before restoring so the next call starts from an empty
+        // Vec; capacity is retained. (`consumed` is iterated by reference
+        // in the loop above and may still hold entries; `freed` is also
+        // by-reference in its loop. Neither is drained as a side effect.)
+        consumed.clear();
+        freed.clear();
+        self.scratch_consumed = consumed;
+        self.scratch_freed = freed;
     }
 
     /// Cancel all resting orders and pending stops for an account across
