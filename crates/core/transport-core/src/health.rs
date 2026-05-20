@@ -553,7 +553,7 @@ fn write_stats_dump(buf: &mut [u8]) -> usize {
 
     #[cfg(feature = "latency-trace")]
     {
-        let snaps = melin_transport_core::trace::global_registry().snapshot_all();
+        let snaps = crate::trace::global_registry().snapshot_all();
         if snaps.is_empty() {
             // Feature on but no samples yet — explicit empty marker so
             // the bench doesn't confuse it with a feature-off server.
