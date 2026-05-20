@@ -8,8 +8,9 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-/// Polling interval between metric scrapes.
-const POLL_INTERVAL: Duration = Duration::from_millis(100);
+/// Polling interval between metric scrapes. 1 Hz keeps the poller out of
+/// the bench-host CPU budget; 100 ms was starving alongside the pacer.
+const POLL_INTERVAL: Duration = Duration::from_secs(1);
 
 /// Read timeout for the HTTP response. Short because the metrics endpoint
 /// is a small, fast response — if it takes longer something is wrong.
