@@ -4,6 +4,7 @@ pub mod account;
 pub mod exchange;
 pub mod orderbook;
 pub mod scheduler;
+pub(crate) mod slab_map;
 pub mod snapshot;
 pub mod types;
 

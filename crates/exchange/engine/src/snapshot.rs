@@ -1622,10 +1622,7 @@ impl OrderBook {
         node_for.extend(bid_node_idx);
         node_for.extend(ask_node_idx);
 
-        let order_index: crate::types::HashMap4<
-            (AccountId, OrderId),
-            (Side, Price, ReservationSlot, u32),
-        > = snap
+        let order_index: crate::slab_map::SlabMap<(Side, Price, ReservationSlot, u32)> = snap
             .order_index
             .into_iter()
             .map(|(id, account, side, price)| {
@@ -1655,7 +1652,7 @@ impl OrderBook {
         stop_node_for.extend(buy_stop_idx);
         stop_node_for.extend(sell_stop_idx);
 
-        let stop_index: crate::types::HashMap4<(AccountId, OrderId), (Side, Price, u32)> = snap
+        let stop_index: crate::slab_map::SlabMap<(Side, Price, u32)> = snap
             .stop_index
             .into_iter()
             .map(|(id, account, side, price)| {

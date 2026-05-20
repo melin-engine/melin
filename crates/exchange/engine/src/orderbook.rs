@@ -15,8 +15,9 @@ const INVALID_NODE: u32 = u32::MAX;
 /// this to populate `order_index` with valid node handles.
 pub(crate) type SnapshotNodeMapping = Vec<((AccountId, OrderId), u32)>;
 
+use crate::slab_map::SlabMap;
 use crate::types::{
-    AccountId, ExecutionReport, HashMap4, Order, OrderId, OrderType, Price, Quantity, RejectReason,
+    AccountId, ExecutionReport, Order, OrderId, OrderType, Price, Quantity, RejectReason,
     ReservationSlot, SelfTradeProtection, Side, Symbol, TimeInForce,
 };
 
@@ -919,19 +920,27 @@ pub struct OrderBook {
     symbol: Symbol,
     bids: BookSide,
     asks: BookSide,
-    /// HashMap: O(1) lookup mapping `(account, order_id)` to a resting
-    /// order's location and slab handle. Keyed by `(AccountId, OrderId)`
-    /// to eliminate cross-account collisions — different accounts can
+    /// O(1) lookup mapping `(account, order_id)` to a resting order's
+    /// location and slab handle. Keyed by `(AccountId, OrderId)` to
+    /// eliminate cross-account collisions — different accounts can
     /// independently use the same OrderId without index conflicts.
     ///
-    /// The 4-tuple stores:
+    /// `SlabMap` (hashbrown lookup + dense Vec slab) replaces the
+    /// previous astenn HashMap so the structure stays bounded under
+    /// high-churn workloads: astenn's extendible-hashing directory
+    /// grew with lifetime inserts (not live count), producing first-
+    /// touch page-fault outliers in the deep tail. Hashbrown's Robin
+    /// Hood + backshift deletion plus the slab's freelist keep the
+    /// memory footprint proportional to peak live entries.
+    ///
+    /// The 4-tuple value stores:
     /// - `Side` — which `BookSide` slab the node lives in
     /// - `Price` — the price level (used to update `LevelHead` on remove)
     /// - `ReservationSlot` — so cancel/amend release balance without an
     ///   extra HashMap lookup
     /// - `u32` — the slab index, making `BookSide::remove_node` O(1)
     ///   instead of an O(level_depth) `VecDeque` scan
-    order_index: HashMap4<(AccountId, OrderId), (Side, Price, ReservationSlot, u32)>,
+    order_index: SlabMap<(Side, Price, ReservationSlot, u32)>,
     /// BTreeMap keyed by trigger price so we can efficiently find all stops
     /// that should fire at a given trade price. Stop buys trigger when price
     /// rises (iterate from lowest trigger up), stop sells when price falls
@@ -945,8 +954,8 @@ pub struct OrderBook {
     /// Keyed by (AccountId, OrderId) to match order_index and eliminate
     /// cross-account collisions. Value tuple carries the slab index so
     /// cancel can splice the stop out without scanning its trigger
-    /// level.
-    stop_index: HashMap4<(AccountId, OrderId), (Side, Price, u32)>,
+    /// level. Same `SlabMap` rationale as `order_index`.
+    stop_index: SlabMap<(Side, Price, u32)>,
     /// Last trade price, used to determine which stops to trigger.
     last_trade_price: Option<Price>,
     /// Reusable buffers to avoid per-order allocations on the hot path.
@@ -971,10 +980,10 @@ impl OrderBook {
             symbol,
             bids: BookSide::default(),
             asks: BookSide::default(),
-            order_index: HashMap4::default(),
+            order_index: SlabMap::new(),
             stop_buys: StopSide::default(),
             stop_sells: StopSide::default(),
-            stop_index: HashMap4::default(),
+            stop_index: SlabMap::new(),
             last_trade_price: None,
             // Hot-path scratch buffers reused across orders (cleared at
             // the top of each match). 64 capacity covers the typical
@@ -1005,16 +1014,19 @@ impl OrderBook {
             symbol,
             bids: BookSide::with_capacity(2_048),
             asks: BookSide::with_capacity(2_048),
-            // One entry per resting order for O(1) cancel lookups.
-            // 4096 slots ≈ 128 KB (key 12 B + value 16 B + control 1 B per
-            // slot) — fits in L2 cache for fast probes. Typical book depth
-            // is 100-2000 orders; resize cost at 4K is ~5 µs.
-            order_index: HashMap4::with_capacity_and_hasher(4_096, Default::default()),
+            // One entry per resting order for O(1) cancel lookups. 4096
+            // slots covers typical book depth (100-2000 orders) without
+            // hot-path resize. `SlabMap` keeps the structure bounded by
+            // peak live entries under churn, so this is a tighter
+            // "expected steady-state size" than the previous astenn
+            // capacity (which had to be over-allocated to hide the
+            // lifetime-insert growth pathology).
+            order_index: SlabMap::with_capacity(4_096),
             // Stops are ~3% of order flow so a 1K slab covers a hot
             // book without wasted space.
             stop_buys: StopSide::with_capacity(1_024),
             stop_sells: StopSide::with_capacity(1_024),
-            stop_index: HashMap4::with_capacity_and_hasher(1_024, Default::default()),
+            stop_index: SlabMap::with_capacity(1_024),
             last_trade_price: None,
             trigger_price_buf: Vec::with_capacity(64),
             triggered_buf: Vec::with_capacity(64),
@@ -1071,10 +1083,10 @@ impl OrderBook {
         symbol: Symbol,
         bids: BookSide,
         asks: BookSide,
-        order_index: HashMap4<(AccountId, OrderId), (Side, Price, ReservationSlot, u32)>,
+        order_index: SlabMap<(Side, Price, ReservationSlot, u32)>,
         stop_buys: StopSide,
         stop_sells: StopSide,
-        stop_index: HashMap4<(AccountId, OrderId), (Side, Price, u32)>,
+        stop_index: SlabMap<(Side, Price, u32)>,
         last_trade_price: Option<Price>,
     ) -> Self {
         Self {

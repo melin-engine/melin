@@ -30,6 +30,18 @@ pub type HashMap<K, V> = astenn::HashMap<K, V, rustc_hash::FxBuildHasher>;
 /// during growth.
 pub type HashMap4<K, V> = astenn::HashMap<K, V, rustc_hash::FxBuildHasher, 4>;
 
+/// Open-addressing HashMap (hashbrown via `std`) with `FxHash`. Use this
+/// for high-churn maps with bounded live count and unbounded unique
+/// keys. Astenn's extendible hashing grows the directory based on
+/// lifetime unique inserts; hashbrown's Robin Hood + backshift deletion
+/// keeps capacity tracking live entries.
+pub type FxHashMap<K, V> = std::collections::HashMap<K, V, rustc_hash::FxBuildHasher>;
+
+/// Open-addressing HashSet (hashbrown via `std`) with `FxHash`. Use this
+/// for high-churn sets with the same workload shape as [`FxHashMap`]
+/// (e.g. `live_order_ids`, the (account, order_id) dedup set).
+pub type FxHashSet<T> = std::collections::HashSet<T, rustc_hash::FxBuildHasher>;
+
 /// Opaque handle to a reservation in the slab. O(1) Vec-indexed access,
 /// no hashing. Valid from `try_reserve` until `release` or fill completion.
 ///
