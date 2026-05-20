@@ -180,6 +180,15 @@ echo ""
 #   processor.max_cstate=1: prevent deep C-states (C2+ wakeup costs 10-100µs)
 #   skew_tick=1: offset timer ticks across cores to reduce kernel lock contention
 #   nosmt: disable hyperthreading — prevents HT siblings from polluting L1/L2 on pipeline cores
+#   tsc=nowatchdog: disable the kernel's clocksource watchdog for TSC. Separate
+#     from `nowatchdog` (which covers the lockup detectors only). The clocksource
+#     watchdog periodically (~12s) reads HPET/ACPI PM to validate TSC drift; each
+#     check is a ~100µs softirq that preempts the pinned engine thread, producing
+#     a recurring p99.99999 cluster at ~106µs measured directly on cpu 9 of an
+#     EPYC 7443P with all other tuning in place. AMD EPYC has invariant TSC, so
+#     skipping watchdog validation is safe. Verified: after enabling, the 12s
+#     cadence in `perf record -e timer:timer_start` disappears and the bench's
+#     p99.99999 drops ~79% (102µs → 21µs).
 GRUB_FILE="/etc/default/grub"
 
 # Count unique physical cores. `lscpu -p=CORE` lists one row per logical CPU
@@ -194,7 +203,7 @@ LAST_ISOLATED=$((PHYSICAL_CORES - 1))
 ISOLATED_RANGE="1-${LAST_ISOLATED}"
 echo "  detected $PHYSICAL_CORES physical cores → isolating ${ISOLATED_RANGE}"
 
-BENCH_PARAMS="isolcpus=nohz,domain,${ISOLATED_RANGE} nohz_full=${ISOLATED_RANGE} rcu_nocbs=${ISOLATED_RANGE} nowatchdog transparent_hugepage=never cpufreq.default_governor=performance processor.max_cstate=1 skew_tick=1 nosmt"
+BENCH_PARAMS="isolcpus=nohz,domain,${ISOLATED_RANGE} nohz_full=${ISOLATED_RANGE} rcu_nocbs=${ISOLATED_RANGE} nowatchdog transparent_hugepage=never cpufreq.default_governor=performance processor.max_cstate=1 skew_tick=1 nosmt tsc=nowatchdog"
 # IOMMU for DPDK/vfio-pci. iommu=pt sets passthrough mode so DMA
 # bypasses IOMMU translation for performance. intel_iommu=on is
 # Intel-specific; on AMD (EPYC, Ryzen) the kernel uses AMD-Vi
@@ -231,6 +240,15 @@ if [[ -f "$GRUB_FILE" ]]; then
         NEEDS_UPDATE=1
     fi
 
+    # tsc=nowatchdog is checked independently of `isolcpus` so it can be
+    # backfilled onto already-set-up boxes whose grub line predates this
+    # parameter (the original BENCH_PARAMS bundle is only re-emitted in
+    # the "isolcpus missing" path).
+    if ! grep -q "tsc=nowatchdog" "$GRUB_FILE" 2>/dev/null; then
+        echo "  Adding tsc=nowatchdog (disables the clocksource watchdog)"
+        NEEDS_UPDATE=1
+    fi
+
     if [[ "$NEEDS_UPDATE" -eq 1 || "$NEEDS_RANGE_REWRITE" -eq 1 ]]; then
         cp "$GRUB_FILE" "${GRUB_FILE}.bak"
 
@@ -251,6 +269,11 @@ if [[ -f "$GRUB_FILE" ]]; then
             fi
             if ! grep -q "iommu=pt" "$GRUB_FILE" 2>/dev/null; then
                 ADD_PARAMS="$ADD_PARAMS $IOMMU_PARAMS"
+            fi
+            # Backfill tsc=nowatchdog onto boxes whose grub already has
+            # isolcpus (so BENCH_PARAMS wasn't re-applied above).
+            if ! grep -q "tsc=nowatchdog" "$GRUB_FILE" 2>/dev/null; then
+                ADD_PARAMS="$ADD_PARAMS tsc=nowatchdog"
             fi
             if [[ -n "$ADD_PARAMS" ]]; then
                 sed -i "s/^GRUB_CMDLINE_LINUX_DEFAULT=\"\(.*\)\"/GRUB_CMDLINE_LINUX_DEFAULT=\"\1 $ADD_PARAMS\"/" "$GRUB_FILE"
