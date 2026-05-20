@@ -604,7 +604,9 @@ struct BenchArgs {
     /// bench_cores + i. When omitted, bench threads are not pinned (OS
     /// scheduler decides). For local benchmarks use 7 (avoids server cores
     /// 1-6). For remote benchmarks on a dedicated machine, use 1 with
-    /// isolcpus for tighter measurements.
+    /// isolcpus for tighter measurements. In engine mode this pins the
+    /// (single) bench thread to `bench_cores` and sets SCHED_FIFO (when
+    /// run as root) to bypass CFS load-balancer scans.
     #[arg(long)]
     bench_cores: Option<usize>,
     /// Health endpoint address to poll for server metrics during the run
@@ -687,6 +689,7 @@ fn main() {
                 json_path,
                 args.target_rate,
                 args.max_reject_pct,
+                args.bench_cores,
             );
         }
         "pipeline" => {
@@ -794,8 +797,24 @@ fn run_engine_bench(
     json_path: Option<&std::path::Path>,
     target_rate: u64,
     max_reject_pct: f64,
+    bench_cores: Option<usize>,
 ) {
     use generator::{GeneratedEvent, GeneratorConfig, OrderFlowGenerator};
+
+    // Pin + RT the bench thread when --bench-cores is set. `pin_to_core`
+    // both pins affinity and (on non-zero cores) sets SCHED_FIFO priority
+    // 1 — bypassing the CFS periodic load-balancer scans that otherwise
+    // show up as a 1Hz, ~18µs cluster at p99.99999 on isolated cores.
+    // Matches the scheduler class the server's pipeline threads
+    // (matching/journal/response/etc.) already run under in production
+    // when started as root. Failure to set RT (no root, no CAP_SYS_NICE)
+    // is logged but non-fatal.
+    if let Some(core) = bench_cores {
+        match melin_app::affinity::pin_to_core(core) {
+            Ok(_) => eprintln!("bench thread pinned to core {core} (SCHED_FIFO if root)"),
+            Err(e) => eprintln!("warning: pin_to_core({core}) failed: {e}"),
+        }
+    }
 
     #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
     let ticks_per_ns = calibrate_tsc();
