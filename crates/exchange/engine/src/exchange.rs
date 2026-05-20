@@ -207,7 +207,11 @@ pub struct Exchange {
     /// Scratch buffer for `freed` tracking inside `execute`. Same
     /// rationale as `scratch_consumed`. Vec rather than HashSet because
     /// typical depth is small (0-5 entries) — linear `.contains()` beats
-    /// hashing at this size.
+    /// hashing at this size. Caveat for future tuning: at 10M ord/s a
+    /// pathological deep-cross (thousands of fills against a single
+    /// aggressive market order) would push `freed.contains()` into
+    /// O(n²) — switch to a small ahash set or sort+binary-search if
+    /// that workload becomes realistic.
     scratch_freed: Vec<(AccountId, OrderId)>,
 }
 
@@ -1314,6 +1318,12 @@ impl Exchange {
         // `Vec::new()` is const) and the populated buffer is restored
         // at the end. Net effect: the inner loop has the same shape as
         // before but no per-event Vec allocation.
+        //
+        // The leading `clear()` calls are belt-and-braces: the put-back
+        // at function end leaves the field empty, so under normal
+        // control flow the take yields an already-empty Vec. The clear
+        // only does work if a previous `execute` panicked between take
+        // and put-back, leaving stale entries in the scratch.
         let mut consumed = std::mem::take(&mut self.scratch_consumed);
         consumed.clear();
         let mut freed = std::mem::take(&mut self.scratch_freed);
@@ -1542,8 +1552,10 @@ impl Exchange {
             self.schedule_gtd_expiry(symbol, taker_account, taker_id, order.expiry_ns);
         }
 
-        // Restore scratch buffers. Both are now empty (drained by the
-        // loops above) but retain their capacity for the next call.
+        // Clear before restoring so the next call starts from an empty
+        // Vec; capacity is retained. (`consumed` is iterated by reference
+        // in the loop above and may still hold entries; `freed` is also
+        // by-reference in its loop. Neither is drained as a side effect.)
         consumed.clear();
         freed.clear();
         self.scratch_consumed = consumed;
