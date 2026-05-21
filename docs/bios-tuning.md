@@ -8,9 +8,10 @@ Platform-level configuration for AMD EPYC servers running Melin. Written for the
 
 A stock AMD EPYC BIOS leaves several firmware behaviours enabled that periodically interrupt or stall the cores:
 
+- The memory controller periodically re-runs DDR signal-integrity training to compensate for thermal drift.
 - The System Management Unit (SMU) samples each core to adjust voltage, frequency, and Infinity Fabric P-states.
 - Data Fabric C-states gate the on-chip interconnect into low-power states.
-- The memory controller runs background ECC patrol scrubbing.
+- The memory controller also runs background ECC patrol scrubbing.
 - The BIOS uses System Management Interrupts (SMI) to emulate legacy USB keyboards, poll the serial console, and enforce power caps.
 
 These activities are largely invisible to standard OS counters (no IRQ in `/proc/interrupts`, no context switch) and individually cost only microseconds, but on a busy core they show up at the deep tail as a recurring periodic spike. Applying the settings below removes or substantially shrinks that periodic source.
@@ -19,10 +20,11 @@ Older AMD generations exhibit larger amplitudes of the same spike; the same BIOS
 
 ## Quick reference
 
-The settings in priority order, highest-impact first. Apply the first eight if you only have time to do something quick: they remove the dominant periodic spike sources.
+Settings grouped by expected impact, based on the AMD platform-level knobs commonly cited as contributors to deep-tail jitter. Apply the first nine for a quick pass.
 
 | Setting | Value | Category |
 |---|---|---|
+| **Periodic Training Mode** (memory controller) | Disabled | Memory |
 | **DF C-States** (Data Fabric) | Disabled | SMU / IF |
 | **APBDIS** | 1 | SMU / IF |
 | **Fixed SOC P-state** (a.k.a. DfPstate) | P0 | SMU / IF |
@@ -63,8 +65,6 @@ The settings in priority order, highest-impact first. Apply the first eight if y
 
 ### SMU and Infinity Fabric
 
-The single largest source of periodic noise on idle-otherwise cores.
-
 - **DF C-States: Disabled.** Prevents the Data Fabric (the on-chip interconnect linking core complexes, memory controllers, and I/O hubs) from entering low-power states. When the fabric exits a C-state to service traffic, the wake-up takes microseconds and looks like a memory stall to any core issuing requests at that moment.
 - **APBDIS: 1.** The name is a double negative: APBDIS = "Algorithmic Performance Boost Disable", and `1` *disables* the algorithm. The algorithm in question dynamically picks an Infinity Fabric / memory-controller P-state based on observed load. Each transition briefly affects memory bandwidth. With APBDIS=1, the IF P-state stops moving: it's then locked to whatever **Fixed SOC P-state** says.
 - **Fixed SOC P-state (a.k.a. DfPstate): P0.** With APBDIS=1, this knob takes effect. P0 is the highest performance state: IF and memory clocks pinned at maximum.
@@ -87,6 +87,7 @@ The single largest source of periodic noise on idle-otherwise cores.
 
 ### Memory
 
+- **Periodic Training Mode: Disabled.** The memory controller periodically re-runs DDR signal-integrity calibration to compensate for thermal drift. The "Legacy" mode runs this on a fixed timer (roughly once per second), and each pass briefly stalls memory access while it executes, which on a busy core lands at the deep tail of every workload that touches DRAM. Modern DDR5 self-corrects sufficiently at runtime that disabling periodic re-training is safe on a stable thermal envelope. This setting often lives under *North Bridge Configuration* or *UMC Common Options*, not under a memory submenu.
 - **Memory Frequency: Maximum JEDEC-rated for the SKU.** For EPYC 9255 this is DDR5-6000 (or the highest supported by your DIMM module population). Do not leave at *Auto*. Auto sometimes negotiates conservatively, and re-training during runtime is a stall source.
 - **Memory Power Down Enable: Disabled.** Prevents DRAM ranks from entering power-down states between accesses.
 - **DRAM Refresh Rate: 1x.** Not 2x. 2x doubles refresh frequency; useful in high-temperature environments but each refresh briefly blocks the bank, so 2x doubles the stall opportunities.
@@ -177,4 +178,4 @@ BIOS setting names vary across hardware vendors. Approximate translations:
 - **HPE ProLiant**: "Workload Profile" → *Low Latency*. Individual knobs under "System Options → Processor Options" and similar.
 - **ASRock Rack / Tyan**: Most settings appear verbatim under "AMD CBS".
 
-If a knob mentioned here is not exposed in your BIOS, ignore it; the most impactful settings (DF C-states, APBDIS+P0, Global C-state Control, USB Legacy, PCIe ASPM) are almost universally available.
+If a knob mentioned here is not exposed in your BIOS, ignore it; the commonly cited core settings (DF C-states, APBDIS+P0, Global C-state Control, USB Legacy, PCIe ASPM) are almost universally available.
