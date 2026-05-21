@@ -52,7 +52,7 @@ use melin_protocol::codec;
 use melin_protocol::message::{ConnectionId, Request, ResponseKind};
 use melin_transport_core::pipeline::InputSlot;
 use melin_transport_core::trace::mono_trace_ns;
-use rand::Rng;
+use rand::RngExt;
 
 use melin_dpdk::SocketHandle;
 use tracing::{debug, warn};

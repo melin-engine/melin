@@ -9,7 +9,7 @@ clap = { version = "4", features = ["derive"] }
 ed25519-dalek = { version = "2", features = ["rand_core"] }
 humantime = "2"
 libc = "0.2"
-rand = "0.9"
+rand = "0.10"
 tikv-jemallocator = "0.6"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }

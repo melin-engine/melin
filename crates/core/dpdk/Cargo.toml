@@ -29,7 +29,7 @@ rustc-hash = "2"
 [build-dependencies]
 # bindgen generates Rust FFI bindings from DPDK C headers at build time.
 # Requires DPDK to be installed (pkg-config --cflags --libs libdpdk).
-bindgen = { version = "0.71", optional = true }
+bindgen = { version = "0.72", optional = true }
 pkg-config = { version = "0.3", optional = true }
 # cc compiles the C wrapper functions for DPDK inline functions.
 cc = { version = "1", optional = true }

@@ -87,7 +87,7 @@ ed25519-dalek = { workspace = true }
 getrandom = "0.4"
 hdrhistogram = "7"
 humantime = { workspace = true }
-rand = "0.9"
+rand = "0.10"
 libc = { workspace = true }
 tikv-jemallocator = { workspace = true }
 tracing = { workspace = true }
@@ -95,8 +95,8 @@ tracing-subscriber = { workspace = true }
 io-uring = "0.7"
 melin-dpdk = { path = "../../core/dpdk", optional = true }
 smoltcp = { version = "0.13", default-features = false, features = ["std", "medium-ethernet", "proto-ipv4", "socket-tcp"], optional = true }
-ratatui = { version = "0.29", optional = true }
-crossterm = { version = "0.28", optional = true }
+ratatui = { version = "0.30", optional = true }
+crossterm = { version = "0.29", optional = true }
 plotters = { version = "0.3", optional = true, default-features = false, features = ["svg_backend", "bitmap_backend", "bitmap_encoder", "ttf", "line_series"] }
 rayon = "1"
 serde = { version = "1", features = ["derive"] }
