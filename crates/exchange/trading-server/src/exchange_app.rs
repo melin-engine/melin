@@ -30,11 +30,12 @@ use melin_types::types::{
 // Numbers match the layout on x86_64 Linux; bump deliberately if a
 // genuine field addition requires it.
 //
-// Skipped under `latency-trace` because the trace timestamps grow each
-// slot by 16 bytes — that growth is deliberate and the feature is
-// dev/bench only, not the production cache footprint we're guarding.
-#[cfg(not(feature = "latency-trace"))]
-const _: () = assert!(size_of::<melin_transport_core::pipeline::InputSlot<TradingEvent>>() == 104);
+// Forced to 128 by `#[repr(align(64))]` on `InputSlot` itself (natural
+// layout is 104 B without `latency-trace`, 120 B with it). The alignment
+// attribute rounds either configuration up to two cache lines, so the
+// production footprint stays constant whether trace timestamps are
+// included or not — the assertion no longer needs a cfg-gate.
+const _: () = assert!(size_of::<melin_transport_core::pipeline::InputSlot<TradingEvent>>() == 128);
 // Bumped from 416 → 424 (one extra u64) when `OutputSlot.wire_seq` was
 // added so the response stage's durability gate can compare against
 // replica metrics in wire-seq space rather than the unsound local-vs-wire

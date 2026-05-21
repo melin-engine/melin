@@ -130,7 +130,16 @@ const MAX_MATCHING_BATCH: usize = 16;
 /// knows where to route execution reports. `Copy` for zero-cost ring
 /// buffer ops. Generic over `E: AppEvent` — the concrete engine crate
 /// aliases this to `InputSlot<TradingEvent>`.
+///
+/// `#[repr(align(64))]` forces 64-byte alignment and rounds the struct
+/// size up to a multiple of 64 — without padding the natural layout is
+/// 104 bytes (or 120 with `latency-trace`), which makes adjacent slots
+/// share cache lines and forces every slot access to touch 2–3 lines
+/// instead of 2. With this attribute both configurations occupy exactly
+/// 128 bytes (two cache lines), so the producer's writes to slot N never
+/// share a line with slot N±1 and per-slot line traffic is minimised.
 #[derive(Debug, Clone, Copy)]
+#[repr(align(64))]
 pub struct InputSlot<E: AppEvent> {
     /// Which client connection submitted this command.
     pub connection_id: u64,
