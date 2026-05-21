@@ -5,3 +5,12 @@ edition = "2024"
 
 [dependencies]
 # No external dependencies — this is a generic, reusable ring buffer library.
+
+[dev-dependencies]
+# Used only by examples/false_sharing.rs for sched_setaffinity. Does not
+# bleed into the published library — examples + dev-deps are not shipped.
+libc = { workspace = true }
+
+[[example]]
+name = "false_sharing"
+path = "examples/false_sharing.rs"

@@ -1548,6 +1548,9 @@ dependencies = [
 [[package]]
 name = "melin-disruptor"
 version = "0.8.0"
+dependencies = [
+ "libc",
+]
 
 [[package]]
 name = "melin-dpdk"
