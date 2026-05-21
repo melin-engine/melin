@@ -84,7 +84,7 @@ base64 = { workspace = true }
 blake3 = { workspace = true }
 clap = { workspace = true }
 ed25519-dalek = { workspace = true }
-getrandom = "0.3"
+getrandom = "0.4"
 hdrhistogram = "7"
 humantime = { workspace = true }
 rand = "0.9"

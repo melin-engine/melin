@@ -42,7 +42,7 @@ base64 = { workspace = true }
 clap = { workspace = true }
 crc32c = "0.6"
 ed25519-dalek = { workspace = true }
-getrandom = "0.3"
+getrandom = "0.4"
 io-uring = "0.7"
 libc = { workspace = true }
 rand = { workspace = true }

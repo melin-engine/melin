@@ -28,7 +28,7 @@ melin-transport-core = { path = "../../core/transport-core" }
 melin-types = { path = "../types" }
 melin-market-data = { path = "../market-data", optional = true }
 ed25519-dalek = { workspace = true }
-getrandom = "0.3"
+getrandom = "0.4"
 libc = { workspace = true }
 rustc-hash = "2"
 tracing = { workspace = true }

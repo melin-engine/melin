@@ -29,7 +29,7 @@ test-utils = []
 [dependencies]
 blake3 = { version = "1", optional = true }
 crc32c = "0.6"
-getrandom = "0.3"
+getrandom = "0.4"
 io-uring = "0.7"
 libc = { workspace = true }
 # Safe wrappers for `pwrite`, `pwritev2`, `fallocate` so the journal hot

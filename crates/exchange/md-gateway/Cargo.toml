@@ -13,7 +13,7 @@ melin-market-data = { path = "../market-data" }
 melin-protocol = { path = "../protocol" }
 melin-types = { path = "../types" }
 ed25519-dalek = { workspace = true }
-toml = "0.8"
+toml = "1"
 serde = { version = "1", features = ["derive"] }
 io-uring = "0.7"
 tracing = { workspace = true }
