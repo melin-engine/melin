@@ -2,6 +2,7 @@
 name = "melin-bench"
 version = "0.8.0"
 edition = "2024"
+default-run = "melin-bench"
 
 [features]
 ## Default mirrors `melin-server`'s default set so plain `cargo run -p
