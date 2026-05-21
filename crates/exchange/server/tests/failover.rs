@@ -686,7 +686,6 @@ struct TestCluster {
     operator_key: SigningKey,
     bin: PathBuf,
     keys_path: PathBuf,
-    #[allow(dead_code)] // Available for replacement replica spawns.
     repl_key_path: PathBuf,
     _tmp: tempfile::TempDir,
 }

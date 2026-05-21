@@ -456,10 +456,6 @@ impl Gateway {
                 SessionAction::SendMelin => {
                     self.dirty_melin.push(idx);
                 }
-                SessionAction::SendBoth => {
-                    self.dirty_fix.push(idx);
-                    self.dirty_melin.push(idx);
-                }
                 SessionAction::Close => {
                     // Send any pending data, then remove.
                     self.dirty_fix.push(idx);
@@ -628,10 +624,6 @@ impl Gateway {
                     self.dirty_fix.push(idx);
                 }
                 SessionAction::SendMelin => {
-                    self.dirty_melin.push(idx);
-                }
-                SessionAction::SendBoth => {
-                    self.dirty_fix.push(idx);
                     self.dirty_melin.push(idx);
                 }
                 SessionAction::Close => {
@@ -887,7 +879,6 @@ impl Gateway {
 // ---------------------------------------------------------------------------
 
 /// Actions the event loop should take after a session processes a message.
-#[allow(dead_code)]
 #[derive(Debug, PartialEq, Eq)]
 pub enum SessionAction {
     /// No I/O needed.
@@ -898,8 +889,6 @@ pub enum SessionAction {
     SendFix,
     /// Flush Melin send buffer.
     SendMelin,
-    /// Flush both send buffers.
-    SendBoth,
     /// Send pending data and close the session.
     Close,
 }

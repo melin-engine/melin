@@ -1050,9 +1050,7 @@ mod tests {
         let config = GatewayConfig {
             listen: "127.0.0.1:0".parse().unwrap(),
             event_publisher: "127.0.0.1:1".parse().unwrap(),
-            authorized_keys: std::path::PathBuf::new(),
             subscriber_key: std::path::PathBuf::new(),
-            core: 0,
             sender_comp_id: sender.to_string(),
             symbols: std::collections::HashMap::new(),
         };
@@ -1216,9 +1214,7 @@ mod tests {
         let mut config = GatewayConfig {
             listen: "127.0.0.1:0".parse().unwrap(),
             event_publisher: "127.0.0.1:1".parse().unwrap(),
-            authorized_keys: std::path::PathBuf::new(),
             subscriber_key: std::path::PathBuf::new(),
-            core: 0,
             sender_comp_id: "MELIN-MD".to_string(),
             symbols: std::collections::HashMap::new(),
         };
@@ -1434,9 +1430,7 @@ mod tests {
         let mut config = GatewayConfig {
             listen: "127.0.0.1:0".parse().unwrap(),
             event_publisher: "127.0.0.1:1".parse().unwrap(),
-            authorized_keys: std::path::PathBuf::new(),
             subscriber_key: std::path::PathBuf::new(),
-            core: 0,
             sender_comp_id: "MELIN-MD".to_string(),
             symbols: std::collections::HashMap::new(),
         };

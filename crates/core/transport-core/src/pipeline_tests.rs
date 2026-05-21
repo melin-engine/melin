@@ -65,29 +65,10 @@ fn add_slot(n: u64, timestamp_ns: u64) -> TestInput {
 
 /// Like `add_slot` but with a pre-assigned journal sequence — simulates
 /// the slot shape the replication receiver produces.
-#[allow(dead_code)]
 fn add_slot_with_seq(n: u64, sequence: u64, timestamp_ns: u64) -> TestInput {
     InputSlot {
         sequence,
         ..add_slot(n, timestamp_ns)
-    }
-}
-
-/// Drain the output ring, returning every report seen up to and
-/// including the request-terminator slot.
-#[allow(dead_code)]
-fn collect_reports(output: &mut ring::Consumer<TestOutput>) -> Vec<TestReport> {
-    let mut reports = Vec::new();
-    loop {
-        if let Some((_, slot)) = output.try_consume() {
-            if let OutputPayload::Report(r) = slot.payload {
-                reports.push(r);
-            }
-            if slot.is_last_in_request {
-                return reports;
-            }
-        }
-        std::hint::spin_loop();
     }
 }
 

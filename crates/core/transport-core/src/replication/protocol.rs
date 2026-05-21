@@ -334,7 +334,6 @@ pub fn encode_snapshot_end(crc32c: u32, buf: &mut Vec<u8>) {
 }
 
 /// Encode a HashMismatch message.
-#[allow(dead_code)] // Used in future catch-up implementation.
 pub fn encode_hash_mismatch(buf: &mut Vec<u8>) {
     let payload_len: u32 = 1;
     buf.extend_from_slice(&payload_len.to_le_bytes());
