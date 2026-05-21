@@ -796,6 +796,39 @@ fn process_frames<A: Application, R>(
     #[cfg(feature = "tick-to-trade")] ingest_rec: &mut melin_transport_core::trace::StageRecorder,
 ) -> bool {
     let mut cursor = 0;
+    // Disconnect signal returned to caller (set on oversize frame).
+    let mut disconnect = false;
+    // Set when `try_push_with` reports the input ring is full. We commit
+    // whatever made it into the batch before sending ServerBusy and
+    // breaking out of the loop, so the consumer sees this connection's
+    // earlier frames promptly.
+    let mut pipeline_full = false;
+
+    // Batch every publish from this recv-cycle into a single Release
+    // store on the input ring's producer cursor. Per-event `try_publish`
+    // emits one cursor-store per frame; under steady-state TCP load the
+    // matching/journal consumers see that store cross the cache line on
+    // every event. Coalescing into one store per recv-loop iteration
+    // brings the TCP path to parity with the DPDK ingress (which
+    // already uses the batch API — see `dpdk_transport.rs`). The batch
+    // is committed at function exit regardless of how the loop ends; on
+    // an early return we explicitly commit before propagating.
+    //
+    // Bounded at `COMMIT_EVERY` events to cap consumer-visibility delay.
+    // Unbounded batching let tcp-dual-repl p99.9 drift +~80 µs vs the
+    // pre-batch baseline: tail recv-cycles up to ~100 events left their
+    // first frame waiting ~tens of µs before becoming visible to the
+    // journal stage, which then interacted with replica ack pacing.
+    // A diagnostic histogram (now removed) measured the recv-cycle
+    // distribution under steady-state load — p50 ≈ 10, p99 ≈ 30,
+    // p99.9 ≈ 40, max ≈ 100 events per batch. Capping at 16 leaves the
+    // median path unsplit (≤1% extra cursor stores) while bounding
+    // worst-case visibility delay to ~16 decode iterations. The cap
+    // turned out to *also* improve median throughput on tcp single-node
+    // (+4.75% vs main vs +3.15% unbounded) — pipeline backpressure
+    // visibly eased once consumers stopped waiting on long batches.
+    const COMMIT_EVERY: u64 = 16;
+    let mut batch = producer.batch();
 
     while cursor + 4 <= conn.parse_buf.len() {
         // Read 4-byte little-endian length prefix.
@@ -811,7 +844,8 @@ fn process_frames<A: Application, R>(
                 frame_len,
                 "frame too large, dropping connection"
             );
-            return true;
+            disconnect = true;
+            break;
         }
 
         // Wait for the complete frame before parsing.
@@ -855,42 +889,34 @@ fn process_frames<A: Application, R>(
 
         #[cfg(feature = "latency-trace")]
         let pre_publish = mono_trace_ns();
+        #[allow(clippy::let_unit_value)]
+        let publish_ts = mono_trace_ns();
+        let connection_id = conn.connection_id;
+        let key_hash = conn.key_hash;
 
-        if producer
-            .try_publish(InputSlot {
-                connection_id: conn.connection_id,
-                key_hash: conn.key_hash,
-                request_seq: seq,
-                sequence: 0,
-                timestamp_ns: ts,
-                event,
-                publish_ts: mono_trace_ns(),
-                recv_ts,
-            })
-            .is_err()
-        {
-            // Pipeline full — send ServerBusy directly on the socket.
-            // Best-effort: if the write fails, the client will timeout.
-            debug!(
-                connection_id = conn.connection_id,
-                "pipeline full, sending ServerBusy"
-            );
-            let n = unsafe {
-                libc::write(
-                    conn.fd,
-                    server_busy_frame.as_ptr().cast(),
-                    server_busy_frame.len(),
-                )
-            };
-            if n != server_busy_frame.len() as isize {
-                debug!(
-                    connection_id = conn.connection_id,
-                    written = n,
-                    "ServerBusy write incomplete"
-                );
-            }
-            // Stop processing further frames — leave them in parse_buf
-            // for the next recv cycle.
+        // Slot fields are captured by-value into the closure so the slot
+        // can be filled in place inside the ring buffer — same idiom as
+        // the DPDK ingress path.
+        let push_result = batch.try_push_with(|slot| {
+            slot.connection_id = connection_id;
+            slot.key_hash = key_hash;
+            slot.request_seq = seq;
+            slot.sequence = 0;
+            slot.timestamp_ns = ts;
+            slot.event = event;
+            slot.publish_ts = publish_ts;
+            slot.recv_ts = recv_ts;
+        });
+
+        if push_result.is_err() {
+            // Pipeline full. The frame's bytes have already been
+            // consumed from `parse_buf` via the `cursor +=` above and
+            // will be dropped at the compaction step — the client
+            // receives a ServerBusy in lieu of a response for this
+            // frame. We send ServerBusy *after* committing the batch
+            // below so the events that did fit become visible to the
+            // pipeline before the client is told we're busy.
+            pipeline_full = true;
             break;
         }
 
@@ -902,9 +928,49 @@ fn process_frames<A: Application, R>(
         // decode + auth/dedup + slot construction + publish.
         // `recv_ts` is the frame-extraction timestamp (a software
         // approximation of NIC ingress — true HW timestamping is
-        // a follow-up; see `docs/benchmarking.md`).
+        // a follow-up; see `docs/benchmarking.md`). Measured up to the
+        // slot-fill completion; the cursor-advance cost is amortised
+        // across the whole batch and not attributed per-frame.
         #[cfg(feature = "tick-to-trade")]
-        ingest_rec.record_elapsed(recv_ts, publish_done);
+        ingest_rec.record_elapsed(recv_ts, mono_trace_ns());
+
+        // Rotate the batch once it reaches the visibility-delay cap. The
+        // commit produces a single Release store on the input cursor; a
+        // fresh `producer.batch()` starts the next group from the new
+        // cursor with `count = 0`. Recv-cycles smaller than the cap (the
+        // common case — p50 ≈ 10 events) commit exactly once at function
+        // exit and never enter this branch.
+        if batch.len() >= COMMIT_EVERY {
+            batch.commit();
+            batch = producer.batch();
+        }
+    }
+
+    // Single Release store on the input cursor for every slot pushed in
+    // this call. Safe to invoke with zero slots — `Batch::commit` is a
+    // no-op when nothing was written.
+    batch.commit();
+
+    if pipeline_full {
+        debug!(
+            connection_id = conn.connection_id,
+            "pipeline full, sending ServerBusy"
+        );
+        // Best-effort: if the write fails, the client will timeout.
+        let n = unsafe {
+            libc::write(
+                conn.fd,
+                server_busy_frame.as_ptr().cast(),
+                server_busy_frame.len(),
+            )
+        };
+        if n != server_busy_frame.len() as isize {
+            debug!(
+                connection_id = conn.connection_id,
+                written = n,
+                "ServerBusy write incomplete"
+            );
+        }
     }
 
     // Compact: shift remaining bytes to the front of the parse buffer.
@@ -916,5 +982,5 @@ fn process_frames<A: Application, R>(
         conn.parse_buf.truncate(remaining);
     }
 
-    false
+    disconnect
 }
