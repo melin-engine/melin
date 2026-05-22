@@ -118,10 +118,15 @@ require replaying from genesis.
 ### Fault isolation between replica slots
 
 Each replica slot has an independent ring buffer (configurable via
-`--replication-ring-size`, default 64 slots × 512 KiB = 32 MiB per
-slot). If a slot is full for longer than 500 ms (replica not keeping
-up), the primary disconnects that replica and frees the ring — the
-surviving replica and client trading are unaffected.
+`--replication-ring-size`, default 256 slots × 512 KiB = 128 MiB per
+ring, 256 MiB total for a dual-replica deployment). If a slot's ring
+fills up — i.e. the replica isn't draining fast enough for the
+primary's next journal batch to fit — the primary evicts that replica
+immediately, on the same batch, and frees the ring. There is no grace
+period: a skipped batch would create a sequence gap in the replica's
+journal that can only be repaired by reconnection + catch-up, so the
+primary refuses to publish past the gap. The surviving replica and
+client trading are unaffected.
 
 ## Manual promotion
 
