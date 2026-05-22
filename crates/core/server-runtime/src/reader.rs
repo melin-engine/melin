@@ -984,3 +984,491 @@ fn process_frames<A: Application, R>(
 
     disconnect
 }
+
+#[cfg(test)]
+mod tests {
+    //! Unit tests for [`process_frames`]. The function has four exit paths
+    //! (normal end, partial parse-buf, pipeline-full, oversize-frame), each
+    //! with subtle batch-commit ordering requirements. These tests pin that
+    //! behaviour against a synthetic decoder so refactors of the batch path
+    //! (e.g. moving the batch up to span the whole CQE drain) can't silently
+    //! regress the "earlier frames must be visible before ServerBusy /
+    //! disconnect" guarantees.
+    use super::*;
+    use melin_app::auth::Permission;
+    use melin_app::decoder::{Decoded, RequestDecoder};
+    use melin_app::{AppEvent, Application, ApplyCtx, CodecError, RejectReason};
+    use melin_disruptor::ring::DisruptorBuilder;
+    use std::io::{ErrorKind, Read};
+    use std::os::unix::net::UnixStream;
+    use std::time::Duration;
+
+    /// Minimal `AppEvent` for these tests. `Copy` is required by `AppEvent`;
+    /// the on-wire codec is unused because [`TagDecoder`] never invokes it
+    /// (frames are interpreted directly from their tag byte).
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum TestEvent {
+        Cmd(u8),
+        Query,
+    }
+
+    impl AppEvent for TestEvent {
+        fn encoded_size(&self) -> usize {
+            // Unused — the tests never round-trip through encode/decode.
+            2
+        }
+        fn encode(&self, _buf: &mut [u8]) -> usize {
+            unreachable!("process_frames does not encode app events")
+        }
+        fn decode(_buf: &[u8]) -> Result<Self, CodecError> {
+            unreachable!("process_frames does not decode app events directly")
+        }
+        fn is_query(&self) -> bool {
+            matches!(self, TestEvent::Query)
+        }
+    }
+
+    /// Placeholder `Application` impl. `process_frames` is generic over `A`
+    /// only to constrain `A::Event` — none of the trait methods are called
+    /// from the function under test, so they all `unreachable!`.
+    struct TestApp;
+
+    impl Application for TestApp {
+        type Event = TestEvent;
+        type Report = ();
+        type QueryResponse = ();
+        const APP_VERSION: u16 = 0;
+        fn apply(&mut self, _event: TestEvent, _ctx: &ApplyCtx, _out: &mut Vec<()>) -> Option<()> {
+            unreachable!()
+        }
+        fn tick(&mut self, _now_ns: u64, _out: &mut Vec<()>) {
+            unreachable!()
+        }
+        fn check_request_seq(&mut self, _key_hash: u64, _seq: u64) -> bool {
+            unreachable!()
+        }
+        fn build_reject(_event: &TestEvent, _reason: RejectReason) -> () {
+            unreachable!()
+        }
+        fn snapshot<W: std::io::Write>(&self, _w: &mut W) -> std::io::Result<()> {
+            unreachable!()
+        }
+        fn restore<R: Read>(_r: &mut R) -> std::io::Result<Self> {
+            unreachable!()
+        }
+    }
+
+    /// Stateless decoder that maps a frame's single payload byte to a
+    /// [`Decoded`] outcome. Lets each test feed a precise mix of permitted,
+    /// filtered, denied, and decode-error frames without standing up the
+    /// real wire codec.
+    ///
+    /// Tag mapping (`0x00..=0xFB` map 1:1 to a Permitted seq, reserving the
+    /// top four byte values for the non-Permitted outcomes):
+    ///   * `0xFC` -> `Filter`
+    ///   * `0xFD` -> `PermissionDenied`
+    ///   * `0xFE` -> `DecodeError`
+    ///   * `0xFF` -> `Permitted` with `is_query == true`
+    ///   * `0x00..=0xFB` -> `Permitted` with `request_seq == byte`
+    struct TagDecoder;
+
+    impl RequestDecoder for TagDecoder {
+        type Event = TestEvent;
+        fn decode(&self, bytes: &[u8], _permission: Permission) -> Decoded<TestEvent> {
+            match bytes.first().copied() {
+                None => Decoded::DecodeError("empty payload"),
+                Some(0xFC) => Decoded::Filter,
+                Some(0xFD) => Decoded::PermissionDenied("denied"),
+                Some(0xFE) => Decoded::DecodeError("bad"),
+                Some(0xFF) => Decoded::Permitted {
+                    request_seq: 0xFF,
+                    event: TestEvent::Query,
+                },
+                Some(b) => Decoded::Permitted {
+                    request_seq: b as u64,
+                    event: TestEvent::Cmd(b),
+                },
+            }
+        }
+    }
+
+    /// 5-byte ServerBusy placeholder. The real reader passes an encoded
+    /// `ResponseKind::ServerBusy`, but `process_frames` writes the bytes
+    /// verbatim — distinct sentinel bytes make peer-side assertions
+    /// unambiguous.
+    const TEST_SERVER_BUSY: [u8; 5] = [0xAA, 0xBB, 0xCC, 0xDD, 0xEE];
+
+    /// One-byte payload framed as `[u32 LE length=1][byte]`.
+    fn frame(byte: u8) -> [u8; 5] {
+        let mut f = [0u8; 5];
+        f[..4].copy_from_slice(&1u32.to_le_bytes());
+        f[4] = byte;
+        f
+    }
+
+    /// Length prefix announcing an oversize frame. No payload bytes follow —
+    /// `process_frames` decides on the prefix alone, before waiting for the
+    /// body.
+    fn oversize_prefix() -> [u8; 4] {
+        ((MAX_FRAME_SIZE as u32) + 1).to_le_bytes()
+    }
+
+    /// Test fixture bundle. Grouped into a struct rather than returned as a
+    /// 4-tuple to keep clippy happy (`type_complexity`) and to give each
+    /// field a name at call sites.
+    struct Fixture {
+        conn: ConnectionEntry<UnixStream>,
+        producer: ring::Producer<InputSlot<TestEvent>>,
+        consumer: ring::Consumer<InputSlot<TestEvent>>,
+        /// Client-side end of the socket pair — read from this to inspect
+        /// any `ServerBusy` bytes the function under test writes.
+        peer: UnixStream,
+    }
+
+    /// Build a fresh fixture: a `ConnectionEntry` backed by a `UnixStream`
+    /// pair plus a single-consumer disruptor of the requested capacity.
+    fn make_fixture(ring_capacity: usize) -> Fixture {
+        let (server_side, peer) = UnixStream::pair().expect("UnixStream::pair");
+        // Short read timeout on the peer so assertions of "no ServerBusy
+        // written" return promptly instead of hanging the test.
+        peer.set_read_timeout(Some(Duration::from_millis(50)))
+            .expect("set_read_timeout");
+
+        let entry = ConnectionEntry::<UnixStream> {
+            connection_id: 7,
+            addr: "127.0.0.1:1".parse().expect("addr parses"),
+            permission: Permission::Trader,
+            key_hash: 0xC0FFEE_u64,
+            fd: server_side.as_raw_fd(),
+            _reader: server_side,
+            parse_buf: Vec::with_capacity(64),
+            multishot_active: false,
+            last_activity: Instant::now(),
+        };
+
+        let (producer, mut consumers) =
+            DisruptorBuilder::<InputSlot<TestEvent>>::new(ring_capacity)
+                .add_consumer()
+                .build();
+        let consumer = consumers.pop().expect("consumer present");
+
+        Fixture {
+            conn: entry,
+            producer,
+            consumer,
+            peer,
+        }
+    }
+
+    /// Invoke `process_frames::<TestApp, UnixStream>`, threading the
+    /// feature-gated histogram args when the relevant features are on so
+    /// the call compiles in every `cargo test` configuration.
+    fn run_process_frames(
+        conn: &mut ConnectionEntry<UnixStream>,
+        producer: &mut ring::Producer<InputSlot<TestEvent>>,
+    ) -> bool {
+        #[cfg(feature = "latency-trace")]
+        let mut publish_rec = melin_transport_core::trace::register_stage("test: publish");
+        #[cfg(feature = "tick-to-trade")]
+        let mut ingest_rec = melin_transport_core::trace::register_stage("test: ingest");
+
+        process_frames::<TestApp, UnixStream>(
+            conn,
+            producer,
+            &TagDecoder,
+            &TEST_SERVER_BUSY,
+            0xDEAD_BEEF,
+            #[cfg(feature = "latency-trace")]
+            &mut publish_rec,
+            #[cfg(feature = "tick-to-trade")]
+            &mut ingest_rec,
+        )
+    }
+
+    /// Drain `consumer` into a Vec of `(seq, slot)` until it yields `None`.
+    /// Used to assert exact event sequences after `process_frames` returns.
+    fn drain(
+        consumer: &mut ring::Consumer<InputSlot<TestEvent>>,
+    ) -> Vec<(u64, InputSlot<TestEvent>)> {
+        let mut out = Vec::new();
+        while let Some(pair) = consumer.try_consume() {
+            out.push(pair);
+        }
+        out
+    }
+
+    /// Try to read exactly 5 bytes (the ServerBusy frame size) from the
+    /// peer. Returns `Some(bytes)` if the read completes within the peer's
+    /// configured timeout, `None` if it times out (i.e. nothing was sent).
+    fn read_server_busy(peer: &mut UnixStream) -> Option<[u8; 5]> {
+        let mut buf = [0u8; 5];
+        match peer.read_exact(&mut buf) {
+            Ok(()) => Some(buf),
+            Err(e) if e.kind() == ErrorKind::WouldBlock || e.kind() == ErrorKind::TimedOut => None,
+            Err(e) => panic!("unexpected peer read error: {e}"),
+        }
+    }
+
+    #[test]
+    fn process_frames_publishes_all_frames_after_single_commit() {
+        // Capacity > number of frames — every frame must succeed and become
+        // visible to the consumer after the trailing `batch.commit()`.
+        let Fixture {
+            mut conn,
+            mut producer,
+            mut consumer,
+            mut peer,
+        } = make_fixture(16);
+        for byte in [0x01, 0x02, 0x03, 0x04, 0x05] {
+            conn.parse_buf.extend_from_slice(&frame(byte));
+        }
+
+        let disconnect = run_process_frames(&mut conn, &mut producer);
+        assert!(!disconnect, "no oversize frame ⇒ no disconnect");
+
+        let events = drain(&mut consumer);
+        assert_eq!(events.len(), 5, "all 5 frames must be visible");
+        for (i, (seq, slot)) in events.iter().enumerate() {
+            assert_eq!(*seq, i as u64, "seq monotonic from 0");
+            assert_eq!(slot.connection_id, 7);
+            assert_eq!(slot.key_hash, 0xC0FFEE_u64);
+            let byte = (i + 1) as u8;
+            assert_eq!(slot.request_seq, byte as u64);
+            assert_eq!(slot.event, JournalEvent::App(TestEvent::Cmd(byte)));
+            // Non-query event ⇒ inherits the caller-supplied wall-clock.
+            assert_eq!(slot.timestamp_ns, 0xDEAD_BEEF);
+        }
+        // Parse buffer fully consumed.
+        assert!(conn.parse_buf.is_empty());
+        // No ServerBusy on the wire — no Full happened.
+        assert!(
+            read_server_busy(&mut peer).is_none(),
+            "ServerBusy must not be sent on the happy path"
+        );
+    }
+
+    #[test]
+    fn process_frames_rotates_batch_at_commit_every_cap() {
+        // Push more events than `COMMIT_EVERY` (= 16) into a recv-cycle.
+        // The cap must trigger at least one mid-loop commit so the
+        // consumer sees the first capacity-many events before the
+        // remainder lands. Validates the visibility-delay cap from the
+        // perf branch — without it, all 32 events would commit together
+        // and the first frame would wait for the 32nd to decode.
+        //
+        // Capacity 64 leaves room for the entire input (no Full); ring
+        // backpressure is exercised separately in
+        // `process_frames_partial_commit_then_server_busy_when_pipeline_full`.
+        let Fixture {
+            mut conn,
+            mut producer,
+            mut consumer,
+            ..
+        } = make_fixture(64);
+        const EVENT_COUNT: usize = 32;
+        for i in 0..EVENT_COUNT {
+            // Use bytes 1..=32 (each ≤ 0xFB so TagDecoder yields
+            // `Permitted` with `request_seq == byte`).
+            conn.parse_buf.extend_from_slice(&frame((i + 1) as u8));
+        }
+
+        let disconnect = run_process_frames(&mut conn, &mut producer);
+        assert!(!disconnect, "no oversize / no Full ⇒ no disconnect");
+
+        let events = drain(&mut consumer);
+        assert_eq!(events.len(), EVENT_COUNT, "every event visible");
+        for (i, (seq, slot)) in events.iter().enumerate() {
+            assert_eq!(*seq, i as u64, "seq contiguous across batch rotations");
+            let byte = (i + 1) as u8;
+            assert_eq!(slot.event, JournalEvent::App(TestEvent::Cmd(byte)));
+        }
+        assert!(conn.parse_buf.is_empty());
+    }
+
+    #[test]
+    fn process_frames_query_event_skips_wall_clock_stamp() {
+        // `AppEvent::is_query` events bypass the journal stamp — verify
+        // the timestamp is zeroed even when a non-zero batch_wall_ns was
+        // supplied.
+        let Fixture {
+            mut conn,
+            mut producer,
+            mut consumer,
+            ..
+        } = make_fixture(8);
+        conn.parse_buf.extend_from_slice(&frame(0xFF)); // tag → Query
+
+        let disconnect = run_process_frames(&mut conn, &mut producer);
+        assert!(!disconnect);
+
+        let events = drain(&mut consumer);
+        assert_eq!(events.len(), 1);
+        let (_, slot) = &events[0];
+        assert_eq!(slot.event, JournalEvent::App(TestEvent::Query));
+        assert_eq!(
+            slot.timestamp_ns, 0,
+            "query events must skip the wall-clock stamp"
+        );
+    }
+
+    #[test]
+    fn process_frames_partial_commit_then_server_busy_when_pipeline_full() {
+        // Ring capacity 4 + 6 frames ⇒ first 4 commit, 5th triggers Full,
+        // 6th is never reached because the loop breaks on Full. Validates:
+        //   * `Err(Full)` does not roll back the prior 4 (single commit
+        //     happens before the ServerBusy write).
+        //   * The frame that triggered Full is silently dropped — its bytes
+        //     are compacted out of `parse_buf` along with every earlier
+        //     frame, mirroring pre-batch behaviour.
+        //   * ServerBusy is written exactly once to the peer.
+        let Fixture {
+            mut conn,
+            mut producer,
+            mut consumer,
+            mut peer,
+        } = make_fixture(4);
+        for byte in [0x01, 0x02, 0x03, 0x04, 0x05, 0x06] {
+            conn.parse_buf.extend_from_slice(&frame(byte));
+        }
+
+        let disconnect = run_process_frames(&mut conn, &mut producer);
+        assert!(!disconnect, "Full does not drop the connection");
+
+        let events = drain(&mut consumer);
+        assert_eq!(
+            events.len(),
+            4,
+            "only the first capacity-many frames are visible"
+        );
+        for (i, (_, slot)) in events.iter().enumerate() {
+            let byte = (i + 1) as u8;
+            assert_eq!(slot.event, JournalEvent::App(TestEvent::Cmd(byte)));
+        }
+
+        // ServerBusy is delivered to the peer.
+        let busy = read_server_busy(&mut peer).expect("ServerBusy frame written");
+        assert_eq!(busy, TEST_SERVER_BUSY);
+
+        // The frame that triggered Full (0x05) had its bytes consumed by
+        // the loop's `cursor +=` before `try_push_with` ran; the 6th frame
+        // is never inspected because the loop broke. Compaction shifts
+        // the unprocessed tail (the 6th frame's bytes) to the front.
+        assert_eq!(
+            conn.parse_buf,
+            frame(0x06).to_vec(),
+            "the 6th frame remains in parse_buf for the next recv-cycle"
+        );
+    }
+
+    #[test]
+    fn process_frames_oversize_commits_prior_frames_then_signals_disconnect() {
+        // Two valid frames followed by an oversize length prefix must:
+        //   * publish the two valid frames (commit-before-break) so the
+        //     pipeline observes them even though we're about to tear the
+        //     connection down,
+        //   * return `true` so the caller drops the connection,
+        //   * NOT write ServerBusy (that is reserved for pipeline-full).
+        let Fixture {
+            mut conn,
+            mut producer,
+            mut consumer,
+            mut peer,
+        } = make_fixture(16);
+        conn.parse_buf.extend_from_slice(&frame(0x01));
+        conn.parse_buf.extend_from_slice(&frame(0x02));
+        conn.parse_buf.extend_from_slice(&oversize_prefix());
+
+        let disconnect = run_process_frames(&mut conn, &mut producer);
+        assert!(disconnect, "oversize frame must request disconnect");
+
+        let events = drain(&mut consumer);
+        assert_eq!(
+            events.len(),
+            2,
+            "prior frames are committed before the break"
+        );
+        assert_eq!(events[0].1.event, JournalEvent::App(TestEvent::Cmd(0x01)));
+        assert_eq!(events[1].1.event, JournalEvent::App(TestEvent::Cmd(0x02)));
+
+        assert!(
+            read_server_busy(&mut peer).is_none(),
+            "ServerBusy is sent on Full, not on oversize"
+        );
+    }
+
+    #[test]
+    fn process_frames_filters_denied_and_decode_errors_advance_cursor() {
+        // Mixed batch: Permitted, Filter, PermissionDenied, DecodeError,
+        // Permitted. Only the two Permitted frames must reach the
+        // consumer; all bytes are consumed (parse_buf fully drains).
+        let Fixture {
+            mut conn,
+            mut producer,
+            mut consumer,
+            ..
+        } = make_fixture(16);
+        for byte in [0x01, 0xFC, 0xFD, 0xFE, 0x02] {
+            conn.parse_buf.extend_from_slice(&frame(byte));
+        }
+
+        let disconnect = run_process_frames(&mut conn, &mut producer);
+        assert!(!disconnect);
+
+        let events = drain(&mut consumer);
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].1.event, JournalEvent::App(TestEvent::Cmd(0x01)));
+        assert_eq!(events[1].1.event, JournalEvent::App(TestEvent::Cmd(0x02)));
+        assert!(
+            conn.parse_buf.is_empty(),
+            "all bytes advanced past compaction"
+        );
+    }
+
+    #[test]
+    fn process_frames_preserves_partial_trailing_frame() {
+        // One complete frame followed by a truncated length prefix. The
+        // complete frame must publish; the partial bytes must survive
+        // compaction at the front of `parse_buf` for the next recv-cycle.
+        let Fixture {
+            mut conn,
+            mut producer,
+            mut consumer,
+            ..
+        } = make_fixture(16);
+        conn.parse_buf.extend_from_slice(&frame(0x42));
+        // Three of four length-prefix bytes — `cursor + 4 <= len()` is
+        // false, so the loop breaks before consuming anything from the
+        // partial.
+        conn.parse_buf.extend_from_slice(&[0xDE, 0xAD, 0xBE]);
+
+        let disconnect = run_process_frames(&mut conn, &mut producer);
+        assert!(!disconnect);
+
+        let events = drain(&mut consumer);
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].1.event, JournalEvent::App(TestEvent::Cmd(0x42)));
+        assert_eq!(
+            conn.parse_buf,
+            vec![0xDE, 0xAD, 0xBE],
+            "partial length prefix preserved for next recv-cycle"
+        );
+    }
+
+    #[test]
+    fn process_frames_empty_buffer_is_noop() {
+        // No bytes in parse_buf ⇒ loop never enters; commit is the
+        // documented zero-slot no-op; no ServerBusy; no disconnect.
+        let Fixture {
+            mut conn,
+            mut producer,
+            mut consumer,
+            mut peer,
+        } = make_fixture(4);
+
+        let disconnect = run_process_frames(&mut conn, &mut producer);
+        assert!(!disconnect);
+        assert_eq!(drain(&mut consumer).len(), 0);
+        assert!(conn.parse_buf.is_empty());
+        assert!(read_server_busy(&mut peer).is_none());
+    }
+}
