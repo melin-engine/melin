@@ -566,26 +566,56 @@ fn parse_cores(s: &str) -> Result<PipelineCores, String> {
     })
 }
 
-/// Run the server.
+/// Run the server with automatic transport selection.
 ///
-/// 1. Initializes (or recovers) the `JournaledApp<A>`, then decomposes
-///    it into `A` and `W` (the operator-selected writer) for the pipeline.
-/// 2. Builds the disruptor pipeline (input ring + output ring + stages).
-/// 3. Spawns 3 OS threads: journal, matching, response.
-/// 4. Runs the accept loop, spawning a reader OS thread per connection.
+/// Under the `dpdk` feature, builds a DPDK transport from `config`.
+/// Otherwise, binds a TCP listener to `config.bind`.
 ///
-/// `factory` constructs fresh `A` instances for the recovery and
-/// replication paths and yields the bulk-seed events a fresh primary
-/// journals at startup. `decoder` parses inbound client frames into
-/// `A::Event` values for the input ring; `encoder` serialises
-/// `A::Report` / `A::QueryResponse` values into wire frames on the
-/// response stage. The application binary constructs the concrete
-/// trait impls; alternative applications plug in different impls
-/// without touching the runtime.
+/// For callers that need a pre-bound listener (e.g. benchmarks),
+/// use [`run_with_listener`] instead.
+pub fn run<A>(
+    config: ServerConfig,
+    factory: Arc<dyn AppFactory<App = A>>,
+    decoder: RequestDecoderArc<A>,
+    encoder: ResponseEncoderArc<A>,
+    event_publisher: Option<EventPublisherFn<A>>,
+    shutdown: Arc<AtomicBool>,
+) -> Result<(), Box<dyn std::error::Error>>
+where
+    A: Application + Send + 'static,
+    A::Event: Send + Sync + 'static,
+    A::Report: Send + 'static,
+    A::QueryResponse: Send + 'static,
+{
+    #[cfg(feature = "dpdk")]
+    {
+        run_dpdk(config, factory, decoder, encoder, event_publisher, shutdown)
+    }
+
+    #[cfg(not(feature = "dpdk"))]
+    {
+        let listener = melin_wire_protocol::tcp::BlockingTcpListener::bind(config.bind)?;
+        run_with_listener(
+            listener,
+            config,
+            factory,
+            decoder,
+            encoder,
+            event_publisher,
+            shutdown,
+        )
+    }
+}
+
+/// Run the server with a caller-supplied listener.
+///
+/// Use this when the listener must be pre-bound before the server
+/// starts (e.g. benchmarks that need the kernel backlog to queue
+/// connections immediately).
 ///
 /// Set `shutdown` to `true` to trigger a clean shutdown of all
 /// pipeline threads.
-pub fn run<A, L>(
+pub fn run_with_listener<A, L>(
     listener: L,
     config: ServerConfig,
     factory: Arc<dyn AppFactory<App = A>>,
@@ -1750,7 +1780,7 @@ where
 ///
 /// See [`run`] for the role of `factory`.
 #[cfg(feature = "dpdk")]
-pub fn run_dpdk<A>(
+fn run_dpdk<A>(
     config: ServerConfig,
     factory: Arc<dyn AppFactory<App = A>>,
     decoder: RequestDecoderArc<A>,

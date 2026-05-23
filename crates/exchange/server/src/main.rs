@@ -30,8 +30,6 @@ use std::sync::atomic::AtomicBool;
 use clap::Parser;
 use melin_server::exchange_app::ServerApp;
 use melin_server_runtime::server::ServerConfig;
-#[cfg(not(feature = "dpdk"))]
-use melin_wire_protocol::tcp::BlockingTcpListener;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt()
@@ -85,29 +83,5 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         melin_server_runtime::process::try_lock_memory();
     }
 
-    #[cfg(feature = "dpdk")]
-    {
-        melin_server_runtime::server::run_dpdk(
-            config,
-            factory,
-            decoder,
-            encoder,
-            event_publisher,
-            shutdown,
-        )
-    }
-
-    #[cfg(not(feature = "dpdk"))]
-    {
-        let listener = BlockingTcpListener::bind(config.bind)?;
-        melin_server_runtime::server::run(
-            listener,
-            config,
-            factory,
-            decoder,
-            encoder,
-            event_publisher,
-            shutdown,
-        )
-    }
+    melin_server_runtime::server::run(config, factory, decoder, encoder, event_publisher, shutdown)
 }

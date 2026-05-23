@@ -1755,7 +1755,7 @@ fn run_roundtrip_bench(
         ..ServerConfig::default()
     };
     // Wire the trading AppFactory: replication / seed paths take it
-    // as an argument to `run`. The bench server runs
+    // as an argument to `run_with_listener`. The bench server runs
     // standalone but still bulk-seeds via the same code path as the
     // binary, so the factory must be constructed even for in-process
     // benchmarks.
@@ -1892,7 +1892,7 @@ fn start_server<L: BlockingTransportListener>(
     std::thread::Builder::new()
         .name("server".into())
         .spawn(move || {
-            if let Err(e) = melin_server_runtime::server::run(
+            if let Err(e) = melin_server_runtime::server::run_with_listener(
                 listener,
                 config,
                 factory,
