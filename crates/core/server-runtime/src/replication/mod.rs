@@ -212,9 +212,11 @@ pub(super) struct ReplicaPipelineHandles<A: Application, W: Send + 'static> {
     /// after each fsync. Read by the orchestrator to fill in the reconnect
     /// handshake without owning the writer.
     pub(super) last_seq: Arc<AtomicU64>,
-    /// SeqLock-published chain hash (Option to mirror the primary-side
-    /// pattern; always Some on replicas now).
-    pub(super) chain_hash_lock: Option<Arc<melin_disruptor::seqlock::SeqLock<[u8; 32]>>>,
+    /// SeqLock-published fsync state (chain hash + journal seq + ring
+    /// cursor). Option to mirror the primary-side pattern; always Some
+    /// on replicas now.
+    pub(super) chain_hash_lock:
+        Option<Arc<melin_disruptor::seqlock::SeqLock<melin_transport_core::pipeline::FsyncState>>>,
     /// Per-pipeline shutdown flag — flipped only on a controlled teardown
     /// (Promote/Shutdown/Fatal/Snapshot). NOT flipped on `Disconnected`.
     pub(super) pipeline_shutdown: Arc<AtomicBool>,

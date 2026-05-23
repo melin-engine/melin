@@ -35,6 +35,29 @@ use melin_disruptor::seqlock::SeqLock;
 
 use crate::replication_wire::{finalize_input_batch, init_input_batch};
 
+/// Post-fsync state published by the journal stage after each durable
+/// write. The [`SeqLock`] guarantees all fields are read atomically —
+/// no TOCTOU between `journal_seq` and `chain_hash`.
+///
+/// Read by the shadow snapshot stage (`journal_seq` + `chain_hash` for
+/// the snapshot header, `input_ring_seq` for alignment) and by
+/// replication receivers (`chain_hash` for handshake validation).
+#[derive(Clone, Copy, Default)]
+#[repr(C)]
+pub struct FsyncState {
+    /// Highest journal sequence durably persisted
+    /// (`writer.next_sequence() - 1`).
+    pub journal_seq: u64,
+    /// BLAKE3 chain hash after the fsync. `[0u8; 32]` when hash-chain
+    /// is disabled.
+    pub chain_hash: [u8; 32],
+    /// Input ring cursor at the fsync commit boundary
+    /// (`consumer.next_read()` right after `commit`/`set_progress`).
+    /// The shadow compares this against its own `next_read` to confirm
+    /// it has caught up to the exact fsync boundary.
+    pub input_ring_seq: u64,
+}
+
 /// Per-stage busy/idle iteration counters for pipeline utilization monitoring.
 ///
 /// Each pipeline stage (journal, matching, response) owns one instance.
@@ -359,7 +382,7 @@ pub struct JournalStage<E: AppEvent, W: JournalWrite<E>> {
     /// Optional SeqLock for publishing the BLAKE3 chain hash to the shadow
     /// snapshot stage. Updated once per fsync batch (cold path). `None` when
     /// shadow snapshots are disabled — no allocation or write overhead.
-    chain_hash: Option<Arc<SeqLock<[u8; 32]>>>,
+    chain_hash: Option<Arc<SeqLock<FsyncState>>>,
     /// Optional atomic for publishing the writer's `next_sequence - 1`
     /// (the highest journal sequence durably persisted) to readers outside
     /// the pipeline thread. Replicas use this so the orchestrator can read
@@ -540,7 +563,7 @@ impl<E: AppEvent, W: JournalWrite<E>> JournalStage<E, W> {
     /// Set the SeqLock for publishing the BLAKE3 chain hash to the shadow
     /// snapshot stage. Called once during pipeline construction when shadow
     /// snapshots are enabled.
-    pub fn set_chain_hash_lock(&mut self, lock: Arc<SeqLock<[u8; 32]>>) {
+    pub fn set_chain_hash_lock(&mut self, lock: Arc<SeqLock<FsyncState>>) {
         self.chain_hash = Some(lock);
     }
 
@@ -753,7 +776,7 @@ impl<E: AppEvent, W: JournalWrite<E>> JournalStage<E, W> {
                     self.writer.discard_batch_buf();
 
                     self.consumer.commit(pending);
-                    self.publish_chain_hash();
+                    self.publish_fsync_state();
                     let _ = self.maybe_rotate();
 
                     pending = 0;
@@ -788,7 +811,7 @@ impl<E: AppEvent, W: JournalWrite<E>> JournalStage<E, W> {
                     #[cfg(feature = "no-persist")]
                     self.writer.discard_batch_buf();
                     self.consumer.commit(pending);
-                    self.publish_chain_hash();
+                    self.publish_fsync_state();
                 }
                 self.utilization.busy.store(busy_count, Ordering::Relaxed);
                 self.utilization.idle.store(idle_count, Ordering::Relaxed);
@@ -892,27 +915,24 @@ impl<E: AppEvent, W: JournalWrite<E>> JournalStage<E, W> {
     /// via the SeqLock. Called once per fsync batch (cold path). No-op when
     /// shadow snapshots are disabled or hash-chain is not active.
     /// Publish the post-fsync writer state to optional readers:
-    /// `chain_hash` (for shadow snapshots and replica handshakes) and
+    /// [`FsyncState`] (for shadow snapshots and replica handshakes) and
     /// `last_seq` (highest journal sequence durably persisted, used by the
     /// replica orchestrator on reconnect handshakes). Both `Option`s are
     /// independent; either can be set or unset. Called once per fsync
     /// batch (cold path); each `if let Some` is a single branch on a small
     /// struct field.
     #[inline]
-    fn publish_chain_hash(&self) {
-        if let Some(ref lock) = self.chain_hash
-            && let Some(hash) = self.writer.chain_hash()
-        {
-            lock.store(hash);
+    fn publish_fsync_state(&self) {
+        let journal_seq = self.writer.next_sequence().saturating_sub(1);
+        if let Some(ref lock) = self.chain_hash {
+            lock.store(FsyncState {
+                journal_seq,
+                chain_hash: self.writer.chain_hash().unwrap_or([0u8; 32]),
+                input_ring_seq: self.consumer.next_read(),
+            });
         }
         if let Some(ref atom) = self.last_seq {
-            // `next_sequence` is the sequence about to be allocated; the
-            // highest written is one less. Saturating prevents underflow for
-            // a fresh writer at sequence 0.
-            atom.store(
-                self.writer.next_sequence().saturating_sub(1),
-                Ordering::Release,
-            );
+            atom.store(journal_seq, Ordering::Release);
         }
     }
 
@@ -993,7 +1013,7 @@ impl<E: AppEvent, W: JournalWrite<E>> JournalStage<E, W> {
                 }
                 // The new segment's GenesisHash advanced the chain;
                 // republish so shadow + cursor observers see it.
-                self.publish_chain_hash();
+                self.publish_fsync_state();
                 true
             }
             Err(e) => {
@@ -1250,7 +1270,7 @@ impl<E: AppEvent> JournalStage<E, melin_journal::SectorWriter<E>> {
                 if let Some(p) = self.preparer.as_ref() {
                     p.arm();
                 }
-                self.publish_chain_hash();
+                self.publish_fsync_state();
                 true
             }
             Err(e) => {
@@ -1367,7 +1387,7 @@ impl<E: AppEvent> JournalStage<E, melin_journal::SectorWriter<E>> {
                         ring.submit().expect("io_uring submit failed");
                         self.wait_for_cqe(&mut ring, len)?;
                         self.consumer.set_progress(seq);
-                        self.publish_chain_hash();
+                        self.publish_fsync_state();
                         self.writer.confirm_async_write(async_batch);
                     } else {
                         // Buffer was empty (read-only queries only) — just commit.
@@ -1403,7 +1423,7 @@ impl<E: AppEvent> JournalStage<E, melin_journal::SectorWriter<E>> {
                 }
                 // Advance cursor: these events are now durable.
                 self.consumer.set_progress(seq);
-                self.publish_chain_hash();
+                self.publish_fsync_state();
                 let completed = inflight.take().expect("checked above");
                 self.writer.confirm_async_write(completed.0);
                 rotated_top = self.maybe_rotate_with_prepared();
@@ -1519,7 +1539,7 @@ impl<E: AppEvent> JournalStage<E, melin_journal::SectorWriter<E>> {
                     ))));
                 }
                 self.consumer.set_progress(seq);
-                self.publish_chain_hash();
+                self.publish_fsync_state();
                 let completed = inflight.take().expect("checked above");
                 self.writer.confirm_async_write(completed.0);
                 rotated_eager = self.maybe_rotate_with_prepared();
@@ -1549,7 +1569,7 @@ impl<E: AppEvent> JournalStage<E, melin_journal::SectorWriter<E>> {
                     if let Some((batch_data, seq)) = inflight.take() {
                         self.wait_for_cqe(&mut ring, batch_data.len)?;
                         self.consumer.set_progress(seq);
-                        self.publish_chain_hash();
+                        self.publish_fsync_state();
                         self.writer.confirm_async_write(batch_data);
                         if self.maybe_rotate_with_prepared() {
                             Self::reregister_journal_fd(&ring, self.writer.fd())?;
@@ -1597,7 +1617,7 @@ impl<E: AppEvent> JournalStage<E, melin_journal::SectorWriter<E>> {
                             // the data is durable, so commit, publish chain
                             // state, and check for rotation triggers.
                             self.consumer.commit(pending);
-                            self.publish_chain_hash();
+                            self.publish_fsync_state();
                             if self.maybe_rotate_with_prepared() {
                                 Self::reregister_journal_fd(&ring, self.writer.fd())?;
                             }
@@ -1643,7 +1663,7 @@ impl<E: AppEvent> JournalStage<E, melin_journal::SectorWriter<E>> {
         if let Some((batch_data, seq)) = inflight.take() {
             self.wait_for_cqe(ring, batch_data.len)?;
             self.consumer.set_progress(seq);
-            self.publish_chain_hash();
+            self.publish_fsync_state();
             self.writer.confirm_async_write(batch_data);
         }
         Ok(())
@@ -2353,7 +2373,7 @@ pub struct Pipeline<A: Application, W: JournalWrite<A::Event>> {
     pub replication_cursor: Arc<AtomicU64>,
     pub replicas_connected: Option<Arc<AtomicU32>>,
     pub shadow_consumer: Option<ring::Consumer<InputSlot<A::Event>>>,
-    pub chain_hash_lock: Option<Arc<SeqLock<[u8; 32]>>>,
+    pub chain_hash_lock: Option<Arc<SeqLock<FsyncState>>>,
     pub replication_ring_progress: Option<ReplicationRingProgress>,
     /// Highest wire seq durably persisted on this node's journal.
     /// Published by the journal stage after every fsync batch via
@@ -2378,7 +2398,7 @@ pub struct ReplicaPipeline<A: Application, W: JournalWrite<A::Event>> {
     /// reconnect handshakes (last journal sequence the replica has durably
     /// persisted). Updated by `JournalStage` after each fsync batch.
     pub last_seq: Arc<AtomicU64>,
-    pub chain_hash_lock: Option<Arc<SeqLock<[u8; 32]>>>,
+    pub chain_hash_lock: Option<Arc<SeqLock<FsyncState>>>,
 }
 
 /// Build the pipeline with optional replication support.
@@ -2488,9 +2508,9 @@ fn build_input_disruptor<E: AppEvent + Send + 'static>(
 fn setup_chain_hash_publisher<E: AppEvent, W: JournalWrite<E>>(
     journal_stage: &mut JournalStage<E, W>,
     enable_shadow: bool,
-) -> Option<Arc<SeqLock<[u8; 32]>>> {
+) -> Option<Arc<SeqLock<FsyncState>>> {
     if enable_shadow {
-        let lock = Arc::new(SeqLock::new([0u8; 32]));
+        let lock = Arc::new(SeqLock::new(FsyncState::default()));
         journal_stage.set_chain_hash_lock(Arc::clone(&lock));
         Some(lock)
     } else {

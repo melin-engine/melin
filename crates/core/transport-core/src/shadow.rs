@@ -13,7 +13,7 @@ use std::time::Duration;
 
 use tracing::{error, info};
 
-use crate::pipeline::InputSlot;
+use crate::pipeline::{FsyncState, InputSlot};
 use crate::snapshot;
 use melin_app::amortized_timer::AmortizedTimer;
 use melin_app::{Application, ApplyCtx};
@@ -39,14 +39,17 @@ fn idle_wait(idle_spins: &mut u32, busy_spin: bool) {
 /// Run the shadow snapshot stage.
 ///
 /// Consumes events from the input ring (gated on journal fsync), replays them
-/// on a cloned application, and saves periodic snapshots with the BLAKE3 chain
-/// hash read from the journal stage's SeqLock.
+/// on a cloned application, and saves periodic snapshots. The snapshot's
+/// journal sequence and chain hash are read from the journal stage's
+/// [`FsyncState`] SeqLock — only saved when the shadow's ring cursor
+/// matches the fsync boundary, guaranteeing the triple (app state,
+/// journal_seq, chain_hash) is self-consistent.
 pub fn run<A: Application>(
     mut consumer: ring::Consumer<InputSlot<A::Event>>,
     mut app: A,
     snapshot_path: PathBuf,
     snapshot_interval: Duration,
-    chain_hash_lock: Arc<SeqLock<[u8; 32]>>,
+    fsync_state: Arc<SeqLock<FsyncState>>,
     shutdown: &AtomicBool,
     busy_spin: bool,
 ) {
@@ -92,8 +95,7 @@ pub fn run<A: Application>(
                     .tick(snapshot_interval, busy_spin || idle_spins < 1000)
                     .is_some()
             {
-                let last_seq = consumer.next_read().saturating_sub(1);
-                save_snapshot::<A>(&app, last_seq, &chain_hash_lock, &snapshot_path);
+                try_save_snapshot::<A>(&app, &consumer, &fsync_state, &snapshot_path);
             }
             idle_wait(&mut idle_spins, busy_spin);
             continue;
@@ -118,31 +120,40 @@ pub fn run<A: Application>(
 
         // Check if a snapshot is due.
         if snapshot_timer.tick(snapshot_interval, true).is_some() {
-            let last_seq = consumer.next_read() - 1;
-            save_snapshot::<A>(&app, last_seq, &chain_hash_lock, &snapshot_path);
+            try_save_snapshot::<A>(&app, &consumer, &fsync_state, &snapshot_path);
         }
     }
 }
 
-/// Save a shadow snapshot, logging success or failure.
-fn save_snapshot<A: Application>(
+/// Save a shadow snapshot if the shadow's ring cursor is aligned with
+/// the journal stage's last fsync boundary. When aligned, journal_seq
+/// and chain_hash from [`FsyncState`] correspond exactly to the
+/// shadow's app state.
+///
+/// When not aligned (shadow mid-batch or journal fsynced again since
+/// shadow's last consume), the snapshot is deferred — the next timer
+/// tick retries.
+fn try_save_snapshot<A: Application>(
     app: &A,
-    sequence: u64,
-    chain_hash_lock: &Arc<SeqLock<[u8; 32]>>,
+    consumer: &ring::Consumer<InputSlot<A::Event>>,
+    fsync_state: &SeqLock<FsyncState>,
     path: &std::path::Path,
 ) {
-    let chain_hash = chain_hash_lock.load();
-    match snapshot::save::<A>(app, sequence, chain_hash, path) {
+    let state = fsync_state.load();
+    if state.input_ring_seq != consumer.next_read() {
+        return;
+    }
+    match snapshot::save::<A>(app, state.journal_seq, state.chain_hash, path) {
         Ok(()) => {
             info!(
-                sequence,
+                journal_seq = state.journal_seq,
                 path = %path.display(),
                 "shadow snapshot saved"
             );
         }
         Err(e) => {
             error!(
-                sequence,
+                journal_seq = state.journal_seq,
                 error = %e,
                 path = %path.display(),
                 "shadow snapshot failed"
@@ -241,7 +252,7 @@ mod tests {
         let consumer = consumers.pop().unwrap();
 
         let app = TestApp::new();
-        let chain_hash = Arc::new(SeqLock::new([0u8; 32]));
+        let fsync_state = Arc::new(SeqLock::new(FsyncState::default()));
         let shutdown = Arc::new(AtomicBool::new(false));
         let shutdown2 = Arc::clone(&shutdown);
 
@@ -256,7 +267,7 @@ mod tests {
                     app,
                     snap_path,
                     Duration::from_secs(3600), // won't fire during test
-                    chain_hash,
+                    fsync_state,
                     &shutdown2,
                     false,
                 );
@@ -279,7 +290,13 @@ mod tests {
         let consumer = consumers.pop().unwrap();
 
         let app = TestApp::new();
-        let chain_hash = Arc::new(SeqLock::new([0xAB; 32]));
+        // Pre-set input_ring_seq = 2 (the ring cursor after consuming
+        // both events below). Shadow only saves when aligned.
+        let fsync_state = Arc::new(SeqLock::new(FsyncState {
+            journal_seq: 3,
+            chain_hash: [0xAB; 32],
+            input_ring_seq: 2,
+        }));
         let shutdown = Arc::new(AtomicBool::new(false));
         let shutdown2 = Arc::clone(&shutdown);
 
@@ -296,7 +313,7 @@ mod tests {
                     app,
                     snap_path2,
                     Duration::from_millis(50),
-                    chain_hash,
+                    fsync_state,
                     &shutdown2,
                     false,
                 );
@@ -604,7 +621,7 @@ mod tests {
         let consumer = consumers.pop().unwrap();
 
         let app = TestApp::new();
-        let chain_hash = Arc::new(SeqLock::new([0u8; 32]));
+        let fsync_state = Arc::new(SeqLock::new(FsyncState::default()));
         let shutdown = Arc::new(AtomicBool::new(false));
         let shutdown2 = Arc::clone(&shutdown);
 
@@ -620,7 +637,7 @@ mod tests {
                     app,
                     snap_path2,
                     Duration::from_millis(20),
-                    chain_hash,
+                    fsync_state,
                     &shutdown2,
                     false,
                 );
@@ -652,8 +669,12 @@ mod tests {
         let consumer = consumers.pop().unwrap();
 
         let app = TestApp::new();
-        let chain_hash = Arc::new(SeqLock::new([0x11; 32]));
-        let chain_hash_writer = Arc::clone(&chain_hash);
+        let fsync_state = Arc::new(SeqLock::new(FsyncState {
+            journal_seq: 2,
+            chain_hash: [0x11; 32],
+            input_ring_seq: 1,
+        }));
+        let fsync_state_writer = Arc::clone(&fsync_state);
         let shutdown = Arc::new(AtomicBool::new(false));
         let shutdown2 = Arc::clone(&shutdown);
 
@@ -669,7 +690,7 @@ mod tests {
                     app,
                     snap_path2,
                     Duration::from_millis(30),
-                    chain_hash,
+                    fsync_state,
                     &shutdown2,
                     false,
                 );
@@ -696,9 +717,13 @@ mod tests {
         let (_, _, hash_initial) = snapshot::load::<TestApp>(&snap_path).unwrap();
         assert_eq!(hash_initial, [0x11; 32], "first snapshot has initial hash");
 
-        // Phase 2: update SeqLock, drive another event, wait for the
-        // second snapshot. Poll until the on-disk hash flips.
-        chain_hash_writer.store([0x22; 32]);
+        // Phase 2: update FsyncState (new hash + advanced ring cursor),
+        // drive another event, wait for the second snapshot.
+        fsync_state_writer.store(FsyncState {
+            journal_seq: 3,
+            chain_hash: [0x22; 32],
+            input_ring_seq: 2,
+        });
         producer.publish(InputSlot {
             connection_id: 0,
             key_hash: 0,
@@ -741,7 +766,13 @@ mod tests {
         let consumer = consumers.pop().unwrap();
 
         let app = TestApp::new();
-        let chain_hash = Arc::new(SeqLock::new([0xCD; 32]));
+        // 5 events total (10,20,30,40,50). Pre-set input_ring_seq = 5
+        // so the alignment check passes once shadow consumes all.
+        let fsync_state = Arc::new(SeqLock::new(FsyncState {
+            journal_seq: 6,
+            chain_hash: [0xCD; 32],
+            input_ring_seq: 5,
+        }));
         let shutdown = Arc::new(AtomicBool::new(false));
         let shutdown2 = Arc::clone(&shutdown);
 
@@ -757,7 +788,7 @@ mod tests {
                     app,
                     snap_path2,
                     Duration::from_millis(20),
-                    chain_hash,
+                    fsync_state,
                     &shutdown2,
                     false,
                 );
