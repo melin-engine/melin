@@ -486,13 +486,21 @@ fn handle_replica_connection<A: Application>(
             return Err(io::Error::other("snapshot file too small for header"));
         }
         // Validate snapshot magic (0x534E4150 = "SNAP") before transfer.
-        let magic = u32::from_le_bytes(snap_data[0..4].try_into().unwrap());
+        let magic = u32::from_le_bytes(
+            snap_data[0..4]
+                .try_into()
+                .expect("bounds checked: snap_data has at least 48 bytes"),
+        );
         if magic != 0x534E_4150 {
             return Err(io::Error::other(format!(
                 "snapshot file has invalid magic: {magic:#x} (expected 0x534e4150)"
             )));
         }
-        let snap_sequence = u64::from_le_bytes(snap_data[8..16].try_into().unwrap());
+        let snap_sequence = u64::from_le_bytes(
+            snap_data[8..16]
+                .try_into()
+                .expect("bounds checked: snap_data has at least 48 bytes"),
+        );
         let mut snap_chain_hash = [0u8; 32];
         snap_chain_hash.copy_from_slice(&snap_data[16..48]);
 
@@ -839,9 +847,11 @@ fn live_stream_uring(
                     // Extract complete ack frames from parse_buf.
                     let mut cursor = 0;
                     while cursor + 4 <= parse_buf.len() {
-                        let frame_len =
-                            u32::from_le_bytes(parse_buf[cursor..cursor + 4].try_into().unwrap())
-                                as usize;
+                        let frame_len = u32::from_le_bytes(
+                            parse_buf[cursor..cursor + 4]
+                                .try_into()
+                                .expect("bounds checked: 4-byte slice"),
+                        ) as usize;
                         if frame_len == 0 || frame_len > MAX_CONTROL_FRAME {
                             return Err(io::Error::other(format!(
                                 "invalid ack frame length: {frame_len}"

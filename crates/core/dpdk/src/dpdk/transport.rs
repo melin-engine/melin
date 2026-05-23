@@ -344,7 +344,7 @@ impl DpdkTransport {
         let now = Instant::from_millis(
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
+                .expect("system clock is before UNIX epoch")
                 .as_millis() as i64,
         );
         let mut iface = Interface::new(iface_config, &mut DpdkDeviceRef(&device), now);
@@ -500,7 +500,7 @@ impl DpdkTransport {
             self.cached_timestamp = Instant::from_millis(
                 std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap()
+                    .expect("system clock is before UNIX epoch")
                     .as_millis() as i64,
             );
         }

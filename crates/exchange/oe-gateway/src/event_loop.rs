@@ -483,23 +483,24 @@ impl Gateway {
         set_tcp_nodelay(fd);
         set_busy_poll(fd);
 
-        if let Some(session) = self.sessions.get_mut(idx) {
-            session.melin_fd = Some(fd);
-        }
-
         // Build sockaddr for the connect SQE.
         let sockaddr = socket_addr_to_sockaddr(server_addr);
         let sockaddr_len = std::mem::size_of::<libc::sockaddr_in>() as u32;
 
-        // Store the sockaddr in the session so it lives long enough for
-        // io_uring to read it.
-        if let Some(session) = self.sessions.get_mut(idx) {
-            session.connect_addr = Some(sockaddr);
-        }
-
-        let session = self.sessions.get(idx).unwrap();
-        let addr_ptr = session.connect_addr.as_ref().unwrap() as *const libc::sockaddr_in
-            as *const libc::sockaddr;
+        // Store fd + sockaddr on the session so it lives long enough for
+        // io_uring to read it. Bail if the session slot has gone away.
+        let Some(session) = self.sessions.get_mut(idx) else {
+            debug!(idx, "session missing in start_melin_connect");
+            self.to_remove.push(idx);
+            return;
+        };
+        session.melin_fd = Some(fd);
+        // The kernel reads this address asynchronously after we submit the
+        // connect SQE, so it must outlive the call — the session owns it
+        // until the connection completes.
+        let addr_ptr = session.connect_addr.insert(sockaddr) // &mut sockaddr_in
+            as *const libc::sockaddr_in                      // coerce to raw pointer
+            as *const libc::sockaddr; // reinterpret as generic sockaddr
 
         let sqe = opcode::Connect::new(types::Fd(fd), addr_ptr, sockaddr_len)
             .build()

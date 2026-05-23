@@ -47,7 +47,11 @@ fn try_extract_frame(buf: &[u8], max_size: usize) -> FrameResult {
     if buf.len() < 4 {
         return FrameResult::Incomplete;
     }
-    let len = u32::from_le_bytes(buf[0..4].try_into().unwrap()) as usize;
+    let len = u32::from_le_bytes(
+        buf[0..4]
+            .try_into()
+            .expect("bounds checked: buf has at least 4 bytes"),
+    ) as usize;
     if len == 0 || len > max_size {
         return FrameResult::Oversized;
     }
@@ -1025,13 +1029,21 @@ fn snapshot_transfer_dpdk<A: Application>(
     if snap_data.len() < 48 {
         return Err(io::Error::other("snapshot file too small for header"));
     }
-    let magic = u32::from_le_bytes(snap_data[0..4].try_into().unwrap());
+    let magic = u32::from_le_bytes(
+        snap_data[0..4]
+            .try_into()
+            .expect("bounds checked: snap_data has at least 48 bytes"),
+    );
     if magic != 0x534E_4150 {
         return Err(io::Error::other(format!(
             "snapshot file has invalid magic: {magic:#x} (expected 0x534e4150)"
         )));
     }
-    let snap_sequence = u64::from_le_bytes(snap_data[8..16].try_into().unwrap());
+    let snap_sequence = u64::from_le_bytes(
+        snap_data[8..16]
+            .try_into()
+            .expect("bounds checked: snap_data has at least 48 bytes"),
+    );
     let mut snap_chain_hash = [0u8; 32];
     snap_chain_hash.copy_from_slice(&snap_data[16..48]);
     let snap_len = snap_data.len() as u64;

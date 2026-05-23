@@ -239,8 +239,11 @@ fn replica_stream_uring<A: Application>(
             let mut last_target: u64 = 0;
             let mut any_published = false;
             while cursor + 4 <= parse_buf.len() {
-                let frame_len =
-                    u32::from_le_bytes(parse_buf[cursor..cursor + 4].try_into().unwrap()) as usize;
+                let frame_len = u32::from_le_bytes(
+                    parse_buf[cursor..cursor + 4]
+                        .try_into()
+                        .expect("bounds checked: 4-byte slice"),
+                ) as usize;
                 if frame_len == 0
                     || frame_len > MAX_DATA_FRAME
                     || cursor + 4 + frame_len > parse_buf.len()
@@ -626,9 +629,11 @@ fn replica_stream_uring<A: Application>(
                     // session's flushes after a reconnect.
                     let mut pending_accum = *accum_end_sequence;
                     while cursor + 4 <= parse_buf.len() {
-                        let frame_len =
-                            u32::from_le_bytes(parse_buf[cursor..cursor + 4].try_into().unwrap())
-                                as usize;
+                        let frame_len = u32::from_le_bytes(
+                            parse_buf[cursor..cursor + 4]
+                                .try_into()
+                                .expect("bounds checked: 4-byte slice"),
+                        ) as usize;
                         if frame_len == 0 || frame_len > MAX_DATA_FRAME {
                             warn!(frame_len, "invalid frame length from primary");
                             return SessionExit::Disconnected;

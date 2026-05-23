@@ -83,11 +83,9 @@ impl TradeRing {
         let cap = self.buf.len();
         // If not full, oldest is at index 0; if full, oldest is at head.
         let start = if self.len < cap { 0 } else { self.head };
-        (0..self.len).map(move |i| {
-            let idx = (start + i) % cap;
-            // Safety: all indices in [0..len) are written.
-            self.buf[idx].as_ref().unwrap()
-        })
+        // By construction, slots in [0..len) are always Some; filter_map
+        // skips the (unreachable) None case without panicking.
+        (0..self.len).filter_map(move |i| self.buf[(start + i) % cap].as_ref())
     }
 
     /// Remove all trades.
