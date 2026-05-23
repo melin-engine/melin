@@ -911,10 +911,7 @@ impl<E: AppEvent, W: JournalWrite<E>> JournalStage<E, W> {
         }
     }
 
-    /// Publish the current BLAKE3 chain hash to the shadow snapshot stage
-    /// via the SeqLock. Called once per fsync batch (cold path). No-op when
-    /// shadow snapshots are disabled or hash-chain is not active.
-    /// Publish the post-fsync writer state to optional readers:
+    /// Publish post-fsync writer state to optional readers:
     /// [`FsyncState`] (for shadow snapshots and replica handshakes) and
     /// `last_seq` (highest journal sequence durably persisted, used by the
     /// replica orchestrator on reconnect handshakes). Both `Option`s are

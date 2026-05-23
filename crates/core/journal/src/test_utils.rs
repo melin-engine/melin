@@ -22,4 +22,5 @@ pub fn set_prealloc_chunk_bytes_override(bytes: Option<u64>) {
     crate::prealloc::set_override(bytes);
 }
 
+pub use crate::checkpoint::CheckpointIntervalOverrideGuard;
 pub use crate::prealloc::PreallocOverrideGuard;

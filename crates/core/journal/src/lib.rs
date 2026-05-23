@@ -16,6 +16,7 @@
 #![cfg_attr(not(test), deny(clippy::unwrap_used))]
 
 pub mod buffered_writer;
+pub(crate) mod checkpoint;
 pub mod codec;
 pub mod error;
 pub mod event;

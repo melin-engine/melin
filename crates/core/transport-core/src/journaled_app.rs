@@ -1117,6 +1117,61 @@ mod tests {
         assert_eq!(recovered.app().total, expected_state(&events, 1).total);
     }
 
+    /// Snapshot + recovery round-trip when auto-emitted Checkpoints
+    /// are present in the journal. With a low checkpoint interval the
+    /// snapshot's `sequence` (from `writer.next_sequence() - 1`) may
+    /// land on a Checkpoint entry rather than an App event. Recovery
+    /// must still accept the snapshot — the post-walk anchor check
+    /// uses `reader.last_sequence()` which advances for control
+    /// entries too.
+    #[cfg(feature = "hash-chain")]
+    #[test]
+    fn recover_from_snapshot_with_checkpoints_in_journal() {
+        let _ckpt_guard = melin_journal::test_utils::CheckpointIntervalOverrideGuard::new(3);
+        let _prealloc_guard = melin_journal::test_utils::PreallocOverrideGuard::new(1024 * 1024);
+
+        let dir = tempfile::tempdir().unwrap();
+        let journal_path = dir.path().join("journal.bin");
+        let snap_path = dir.path().join("snap.bin");
+
+        // 6 events → 2 Checkpoints (at interval 3). Journal seqs:
+        //   1=Genesis, 2-4=events, 5=Checkpoint, 6-8=events, 9=Checkpoint.
+        // save_snapshot records writer.next_sequence()-1 which may be
+        // the Checkpoint's seq.
+        let pre = [
+            TestEvent::Add(1),
+            TestEvent::Add(2),
+            TestEvent::Add(3),
+            TestEvent::Add(4),
+            TestEvent::Add(5),
+            TestEvent::Add(6),
+        ];
+        let post = [TestEvent::Add(100), TestEvent::Add(200)];
+
+        let ja = TestApp_::create(TestApp::new(), &journal_path).unwrap();
+        let ja = append_events(ja, &pre, 1);
+        drop(ja);
+        let ja = TestApp_::recover(TestApp::new(), &journal_path).unwrap();
+        ja.save_snapshot(&snap_path).unwrap();
+
+        let (_, snap_seq, _) = snapshot::load::<TestApp>(&snap_path).unwrap();
+        // With genesis + 6 events + 2 checkpoints, last seq = 9.
+        // snap_seq should be in journal-space, not ring-space.
+        assert!(
+            snap_seq > pre.len() as u64,
+            "snap_seq {snap_seq} should exceed event count {} (checkpoints add seqs)",
+            pre.len()
+        );
+
+        // Append post-snapshot events and verify round-trip.
+        let ja = append_events(ja, &post, 1 + pre.len() as u64);
+        drop(ja);
+
+        let recovered = TestApp_::recover_from_snapshot(&snap_path, &journal_path).unwrap();
+        let all: Vec<TestEvent> = pre.iter().chain(post.iter()).copied().collect();
+        assert_eq!(recovered.app().total, expected_state(&all, 1).total);
+    }
+
     /// Recovery refuses to pair a snapshot with a journal that doesn't
     /// reach the snapshot's recorded sequence. Without this guard a
     /// stale journal restored from before the snapshot would be
