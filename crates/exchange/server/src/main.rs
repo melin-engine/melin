@@ -11,10 +11,13 @@ static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 ///   thread. Default jemalloc does the purge work on whatever thread
 ///   happens to free memory, which on the matching/journal hot path
 ///   shows up as occasional multi-millisecond stalls in `process_event`.
-/// - `dirty_decay_ms:60000` / `muzzy_decay_ms:60000` — hold dirty/muzzy
-///   pages for 60 s (vs the 10 s default) before reclaiming. Trades
+/// - `dirty_decay_ms:53000` / `muzzy_decay_ms:57000` — hold dirty/muzzy
+///   pages for ~53/57 s (vs the 10 s default) before reclaiming. Trades
 ///   marginally higher steady-state RSS for fewer purge events; with
 ///   the background thread this also bounds how often that thread runs.
+///   Values are deliberately odd so purge-induced latency spikes are
+///   immediately attributable to jemalloc rather than blending into
+///   60 s monitoring/heartbeat boundaries.
 ///
 /// The trailing NUL is required: jemalloc reads `malloc_conf` as a C
 /// string. `non_upper_case_globals` is the documented spelling — the
@@ -22,7 +25,7 @@ static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 #[allow(non_upper_case_globals)]
 #[unsafe(export_name = "malloc_conf")]
 pub static malloc_conf: &[u8] =
-    b"background_thread:true,dirty_decay_ms:60000,muzzy_decay_ms:60000\0";
+    b"background_thread:true,dirty_decay_ms:53000,muzzy_decay_ms:57000\0";
 
 use std::sync::Arc;
 
