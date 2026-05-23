@@ -725,6 +725,9 @@ fn live_stream_uring(
     )
     .build()
     .user_data(TOKEN_RECV);
+    // SAFETY: `recv_buf` is owned by this task and lives across the
+    // event loop until the corresponding CQE is drained. The ring is
+    // single-threaded — only this task pushes/reaps on it.
     unsafe { ring.submission().push(&sqe).expect("SQ full") };
 
     loop {
@@ -766,6 +769,10 @@ fn live_stream_uring(
                     opcode::Send::new(types::Fixed(0), send_buf.as_ptr(), send_buf.len() as u32)
                         .build()
                         .user_data(TOKEN_SEND);
+                // SAFETY: `send_buf` is owned by this task and pinned
+                // by `send_in_flight = true` below — it isn't mutated
+                // until the matching TOKEN_SEND CQE clears the flag.
+                // The ring is single-threaded.
                 unsafe { ring.submission().push(&sqe).expect("SQ full") };
                 send_in_flight = true;
                 send_offset = 0;
@@ -788,6 +795,9 @@ fn live_stream_uring(
                     )
                     .build()
                     .user_data(TOKEN_SEND);
+                    // SAFETY: same as the coalesced send above —
+                    // `send_buf` is owned and pinned by `send_in_flight`
+                    // until the TOKEN_SEND CQE clears it.
                     unsafe { ring.submission().push(&sqe).expect("SQ full") };
                     send_in_flight = true;
                     send_offset = 0;
@@ -895,6 +905,9 @@ fn live_stream_uring(
                     )
                     .build()
                     .user_data(TOKEN_RECV);
+                    // SAFETY: `recv_buf` is owned by this task; only
+                    // one RECV is ever in flight (we just consumed the
+                    // previous CQE). Ring is single-threaded.
                     unsafe { ring.submission().push(&sqe).expect("SQ full") };
                 }
 
@@ -935,6 +948,9 @@ fn live_stream_uring(
                         )
                         .build()
                         .user_data(TOKEN_SEND);
+                        // SAFETY: `send_buf` is owned and still pinned
+                        // (`send_in_flight` stays true across partial
+                        // sends); ring is single-threaded.
                         unsafe { ring.submission().push(&sqe).expect("SQ full") };
                     }
                 }

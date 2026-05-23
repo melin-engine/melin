@@ -160,6 +160,9 @@ fn replica_stream_uring<A: Application>(
         )
         .build()
         .user_data(TOKEN_PROVIDE);
+        // SAFETY: `pool_ptr` and the buffer-group size were just
+        // computed from the locally-owned `recv_pool`; ring is
+        // single-threaded.
         unsafe { ring.submission().push(&sqe).expect("SQ full") };
         if let Err(e) = ring.submit_and_wait(1) {
             error!(error = %e, "ProvideBuffers submit failed");
@@ -212,6 +215,9 @@ fn replica_stream_uring<A: Application>(
     let sqe = opcode::RecvMulti::new(types::Fd(tcp_fd), RECV_BUF_GROUP_ID)
         .build()
         .user_data(TOKEN_RECV);
+    // SAFETY: `tcp_fd` is the connected primary socket; the kernel
+    // pulls buffers from RECV_BUF_GROUP_ID, which we provided above.
+    // Ring is single-threaded.
     unsafe { ring.submission().push(&sqe).expect("SQ full") };
     let mut multishot_active = true;
 
@@ -312,6 +318,10 @@ fn replica_stream_uring<A: Application>(
             )
             .build()
             .user_data(TOKEN_SEND);
+            // SAFETY: `ack_send_buf` is owned by this task and pinned
+            // by `ack_send_in_flight = true` immediately below — not
+            // mutated until the TOKEN_SEND CQE clears the flag. Ring
+            // is single-threaded.
             unsafe { ring.submission().push(&sqe).expect("SQ full") };
             ack_send_in_flight = true;
             ack_send_offset = 0;
@@ -377,6 +387,10 @@ fn replica_stream_uring<A: Application>(
                                 )
                                 .build()
                                 .user_data(TOKEN_SEND);
+                                // SAFETY: `ack_send_buf` is still
+                                // pinned (ack_send_in_flight stays
+                                // true across partial sends). Ring is
+                                // single-threaded.
                                 unsafe { ring.submission().push(&sqe).expect("SQ full") };
                             }
                         }
@@ -407,10 +421,12 @@ fn replica_stream_uring<A: Application>(
                             arm_tcp_quickack(tcp_fd);
                             let n = bp_result as usize;
                             let buf_id = (bp_flags >> IORING_CQE_BUFFER_SHIFT) as usize;
+                            // SAFETY: same invariants as the main loop:
+                            // `buf_id` came from the kernel CQE for a
+                            // buffer we previously provided from
+                            // `recv_pool`, so the offset is in bounds;
+                            // and the kernel wrote `n` bytes there.
                             let buf_ptr = unsafe { pool_ptr.add(buf_id * RECV_BUF_SIZE) };
-                            // SAFETY: same invariant as the main loop —
-                            // kernel wrote `n` bytes into our owned pool
-                            // at this offset.
                             let slice = unsafe { std::slice::from_raw_parts(buf_ptr, n) };
                             parse_buf.extend_from_slice(slice);
                             // Re-provide the buffer.
@@ -423,6 +439,10 @@ fn replica_stream_uring<A: Application>(
                             )
                             .build()
                             .user_data(TOKEN_PROVIDE);
+                            // SAFETY: `buf_ptr` is still in our owned
+                            // pool; we've already copied its bytes out
+                            // so the kernel can repopulate it. Ring is
+                            // single-threaded.
                             unsafe { ring.submission().push(&provide_sqe).expect("SQ full") };
                         }
                         _ => {}
@@ -471,6 +491,9 @@ fn replica_stream_uring<A: Application>(
             )
             .build()
             .user_data(TOKEN_SEND);
+            // SAFETY: `ack_send_buf` is owned and pinned by
+            // `ack_send_in_flight = true` immediately below. Ring is
+            // single-threaded.
             unsafe { ring.submission().push(&sqe).expect("SQ full") };
             ack_send_in_flight = true;
             ack_send_offset = 0;
@@ -580,11 +603,12 @@ fn replica_stream_uring<A: Application>(
                     let n = result as usize;
                     bytes_received_since_log += n as u64;
                     let buf_id = (flags >> IORING_CQE_BUFFER_SHIFT) as usize;
+                    // SAFETY: `buf_id` came from the kernel CQE for a
+                    // buffer we previously provided from `recv_pool`,
+                    // so the offset is in bounds; the kernel wrote `n`
+                    // bytes (n = result) at that offset, and the buffer
+                    // is not in flight until re-provided below.
                     let buf_ptr = unsafe { pool_ptr.add(buf_id * RECV_BUF_SIZE) };
-                    // SAFETY: kernel wrote `n` bytes (n = result) into
-                    // the buffer at offset `buf_id * RECV_BUF_SIZE`,
-                    // which is within `recv_pool`. We own the pool and
-                    // the buffer is not in flight until re-provided.
                     let slice = unsafe { std::slice::from_raw_parts(buf_ptr, n) };
                     parse_buf.extend_from_slice(slice);
                     // Re-provide the consumed buffer to the pool.
@@ -597,6 +621,10 @@ fn replica_stream_uring<A: Application>(
                     )
                     .build()
                     .user_data(TOKEN_PROVIDE);
+                    // SAFETY: `buf_ptr` came from `pool_ptr.add(buf_id
+                    // * RECV_BUF_SIZE)` within our owned `recv_pool`;
+                    // we just copied its data out and the slot is now
+                    // free to re-provide. Ring is single-threaded.
                     unsafe { ring.submission().push(&provide_sqe).expect("SQ full") };
 
                     // Extract complete frames from parse_buf and publish
@@ -742,6 +770,9 @@ fn replica_stream_uring<A: Application>(
                         )
                         .build()
                         .user_data(TOKEN_SEND);
+                        // SAFETY: `ack_send_buf` is still pinned
+                        // (ack_send_in_flight stays true across
+                        // partial sends). Ring is single-threaded.
                         unsafe { ring.submission().push(&sqe).expect("SQ full") };
                     }
                 }
@@ -758,6 +789,8 @@ fn replica_stream_uring<A: Application>(
             let sqe = opcode::RecvMulti::new(types::Fd(tcp_fd), RECV_BUF_GROUP_ID)
                 .build()
                 .user_data(TOKEN_RECV);
+            // SAFETY: `tcp_fd` is still the connected primary socket
+            // and the buffer group is intact. Ring is single-threaded.
             unsafe { ring.submission().push(&sqe).expect("SQ full") };
             multishot_active = true;
         }
