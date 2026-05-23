@@ -568,18 +568,20 @@ fn parse_cores(s: &str) -> Result<PipelineCores, String> {
 
 /// Run the server with automatic transport selection.
 ///
-/// Under the `dpdk` feature, builds a DPDK transport from `config`.
-/// Otherwise, binds a TCP listener to `config.bind`.
+/// Installs SIGINT/SIGTERM handlers, optionally locks memory, selects
+/// the transport (DPDK under the `dpdk` feature, kernel TCP otherwise),
+/// and enters the pipeline loop. This is the main entry point for
+/// application binaries.
 ///
-/// For callers that need a pre-bound listener (e.g. benchmarks),
-/// use [`run_with_listener`] instead.
+/// For callers that need a pre-bound listener or an externally
+/// controlled shutdown flag (e.g. benchmarks), use
+/// [`run_with_listener`] instead.
 pub fn run<A>(
     config: ServerConfig,
     factory: Arc<dyn AppFactory<App = A>>,
     decoder: RequestDecoderArc<A>,
     encoder: ResponseEncoderArc<A>,
     event_publisher: Option<EventPublisherFn<A>>,
-    shutdown: Arc<AtomicBool>,
 ) -> Result<(), Box<dyn std::error::Error>>
 where
     A: Application + Send + 'static,
@@ -587,6 +589,13 @@ where
     A::Report: Send + 'static,
     A::QueryResponse: Send + 'static,
 {
+    let shutdown = Arc::new(AtomicBool::new(false));
+    crate::process::install_shutdown_handler(&shutdown);
+
+    if !config.no_mlock {
+        crate::process::try_lock_memory();
+    }
+
     #[cfg(feature = "dpdk")]
     {
         run_dpdk(config, factory, decoder, encoder, event_publisher, shutdown)

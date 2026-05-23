@@ -25,7 +25,6 @@ pub static malloc_conf: &[u8] =
     b"background_thread:true,dirty_decay_ms:60000,muzzy_decay_ms:60000\0";
 
 use std::sync::Arc;
-use std::sync::atomic::AtomicBool;
 
 use clap::Parser;
 use melin_server::exchange_app::ServerApp;
@@ -38,15 +37,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .with_thread_names(true)
         .init();
 
-    let shutdown = Arc::new(AtomicBool::new(false));
-    melin_server_runtime::process::install_shutdown_handler(&shutdown);
-
     let config = ServerConfig::parse();
-    // Wire the trading-side AppFactory the runtime needs for fresh-app
-    // construction (replication recovery, snapshot rebuild) and for
-    // the bulk-seed events a fresh primary journals at startup. The
-    // factory captures `accounts`/`instruments`/`max_orders_*` so the
-    // runtime never names trading concepts by their wire variants.
+
     let factory: Arc<dyn melin_app::app_factory::AppFactory<App = ServerApp>> =
         Arc::new(melin_server::app_factory::ExchangeAppFactory::new(
             melin_server::app_factory::ExchangeAppFactoryConfig {
@@ -57,17 +49,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 max_orders_burst: config.max_orders_burst,
             },
         ));
-    // Trading-side wire codecs. The runtime takes these as trait objects
-    // so non-trading applications plug in their own codecs without
-    // touching server.rs.
+
     let decoder: melin_server_runtime::reader::RequestDecoderArc<ServerApp> =
         Arc::new(melin_server::request_decoder::ExchangeRequestDecoder);
     let encoder: melin_server_runtime::response::ResponseEncoderArc<ServerApp> =
         Arc::new(melin_server::response_encoder::ExchangeResponseEncoder);
-    // Event publisher is trading-only: under `trading` the binary wires
-    // the market-data publisher fn; under `skip-order-exec` no publisher
-    // exists, so we pass `None` and the runtime never allocates the
-    // consumer slot.
+
     let event_publisher: Option<melin_server_runtime::server::EventPublisherFn<ServerApp>> = {
         #[cfg(feature = "trading")]
         {
@@ -79,9 +66,5 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     };
 
-    if !config.no_mlock {
-        melin_server_runtime::process::try_lock_memory();
-    }
-
-    melin_server_runtime::server::run(config, factory, decoder, encoder, event_publisher, shutdown)
+    melin_server_runtime::server::run(config, factory, decoder, encoder, event_publisher)
 }
