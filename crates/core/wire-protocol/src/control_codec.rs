@@ -1,23 +1,24 @@
 //! Codec for transport-level control frames.
 //!
-//! Encodes/decodes [`TransportResponse`] and [`ChallengeResponse`]
-//! using the same wire format and tag values as `melin-protocol`'s
-//! full codec, so the two are interchangeable on the wire.
+//! Encodes/decodes [`TransportResponse`] and [`ChallengeResponse`].
+//! Tag constants are public and re-used by the exchange-level codec
+//! so there is a single source of truth for wire values.
 
 use crate::control::{ChallengeResponse, TransportResponse};
 use crate::error::ProtocolError;
 
-// Wire tags — must stay in sync with the values in melin-protocol's
-// codec. The transport-level subset lives here; domain-level tags
-// (SubmitOrder, Placed, etc.) stay in the exchange crate.
-const TAG_CHALLENGE_RESPONSE: u8 = 5;
-const TAG_ENGINE_ERROR: u8 = 16;
-const TAG_BATCH_END: u8 = 17;
-const TAG_SERVER_READY: u8 = 18;
-const TAG_RESPONSE_HEARTBEAT: u8 = 19;
-const TAG_CHALLENGE: u8 = 20;
-const TAG_AUTH_FAILED: u8 = 21;
-const TAG_SERVER_BUSY: u8 = 24;
+// Wire tags for transport-level control frames. Public so the
+// exchange-level codec can import them instead of redefining its own
+// copies — a single source of truth prevents silent wire drift.
+// Domain-level tags (SubmitOrder, Placed, etc.) stay in the exchange crate.
+pub const TAG_CHALLENGE_RESPONSE: u8 = 5;
+pub const TAG_ENGINE_ERROR: u8 = 16;
+pub const TAG_BATCH_END: u8 = 17;
+pub const TAG_SERVER_READY: u8 = 18;
+pub const TAG_RESPONSE_HEARTBEAT: u8 = 19;
+pub const TAG_CHALLENGE: u8 = 20;
+pub const TAG_AUTH_FAILED: u8 = 21;
+pub const TAG_SERVER_BUSY: u8 = 24;
 
 /// Encode a transport-level response into `buf`.
 ///

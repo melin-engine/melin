@@ -75,12 +75,17 @@ struct RequestSeqHeader {
 const REQUEST_SEQ_HEADER_LEN: usize = core::mem::size_of::<RequestSeqHeader>();
 const _: () = assert!(REQUEST_SEQ_HEADER_LEN == 8);
 
+// Transport-level tags — imported from wire-protocol (single source of truth).
+use melin_wire_protocol::control_codec::{
+    TAG_AUTH_FAILED, TAG_BATCH_END, TAG_CHALLENGE, TAG_CHALLENGE_RESPONSE, TAG_ENGINE_ERROR,
+    TAG_RESPONSE_HEARTBEAT, TAG_SERVER_BUSY, TAG_SERVER_READY,
+};
+
 // --- Request tags ---
 const TAG_SUBMIT_ORDER: u8 = 1;
 const TAG_CANCEL_ORDER: u8 = 2;
 const TAG_REQUEST_HEARTBEAT: u8 = 3;
 const TAG_CANCEL_ALL: u8 = 4;
-const TAG_CHALLENGE_RESPONSE: u8 = 5;
 const TAG_ADD_INSTRUMENT: u8 = 6;
 const TAG_DEPOSIT: u8 = 7;
 const TAG_SET_RISK_LIMITS: u8 = 8;
@@ -103,16 +108,11 @@ const TAG_FILL: u8 = 12;
 const TAG_CANCELLED: u8 = 13;
 const TAG_TRIGGERED: u8 = 14;
 const TAG_REJECTED: u8 = 15;
-const TAG_ENGINE_ERROR: u8 = 16;
-const TAG_BATCH_END: u8 = 17;
-const TAG_SERVER_READY: u8 = 18;
-const TAG_RESPONSE_HEARTBEAT: u8 = 19;
-const TAG_CHALLENGE: u8 = 20;
-const TAG_AUTH_FAILED: u8 = 21;
+// TAG_ENGINE_ERROR (16), TAG_BATCH_END (17), TAG_SERVER_READY (18),
+// TAG_RESPONSE_HEARTBEAT (19), TAG_CHALLENGE (20), TAG_AUTH_FAILED (21),
+// TAG_SERVER_BUSY (24) — imported from wire-protocol above.
 const TAG_REPLACED: u8 = 22;
 const TAG_STATS_HEADER: u8 = 23;
-/// Server pipeline full — client should retry after backoff.
-const TAG_SERVER_BUSY: u8 = 24;
 const TAG_INSTRUMENT_STATUS_CHANGED: u8 = 25;
 const TAG_BOOK_SNAPSHOT_BEGIN: u8 = 40;
 const TAG_BOOK_SNAPSHOT_LEVEL: u8 = 41;
