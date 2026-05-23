@@ -8,9 +8,14 @@
 //! stays single-threaded. Note: portfolio risk checks then require
 //! cross-shard message passing, adding latency and complexity.
 
+mod instrument;
 mod token_bucket;
 
+use self::instrument::{inst_mut, inst_ref};
 use self::token_bucket::TokenBucket;
+// Re-exported so existing crate paths (`crate::exchange::InstrumentState`,
+// used by `crate::snapshot`) keep working after the move.
+pub(crate) use self::instrument::InstrumentState;
 use crate::account::AccountManager;
 use crate::orderbook::OrderBook;
 use crate::scheduler::{ScheduledTask, ScheduledTaskHeap, ScheduledTaskKind};
@@ -19,28 +24,6 @@ use crate::types::{
     HashMap4, InstrumentSpec, InstrumentStatus, Order, OrderId, OrderType, Price, Quantity,
     RejectReason, ReservationSlot, RiskLimits, Side, Symbol, TimeInForce,
 };
-
-/// Helper: get an immutable reference to the InstrumentState at `symbol`.
-#[inline]
-fn inst_ref(
-    instruments: &[Option<Box<InstrumentState>>],
-    symbol: Symbol,
-) -> Option<&InstrumentState> {
-    instruments
-        .get(symbol.0 as usize)
-        .and_then(|o| o.as_deref())
-}
-
-/// Helper: get a mutable reference to the InstrumentState at `symbol`.
-#[inline]
-fn inst_mut(
-    instruments: &mut [Option<Box<InstrumentState>>],
-    symbol: Symbol,
-) -> Option<&mut InstrumentState> {
-    instruments
-        .get_mut(symbol.0 as usize)
-        .and_then(|o| o.as_deref_mut())
-}
 
 /// Compute the required reservation for a buy-side order at a known
 /// price: `price * qty` in quote currency. Pure notional — fees are
@@ -51,20 +34,6 @@ fn required_notional(price: u64, qty: u64) -> u64 {
     let cost = price as u128 * qty as u128;
     // Saturate to u64::MAX — identical to try_reserve behavior.
     cost.min(u64::MAX as u128) as u64
-}
-
-/// All per-instrument state in one struct for cache-friendly single-lookup
-/// access. On every order the engine does one HashMap lookup instead of 5,
-/// turning 5 potential cache misses into 1.
-pub(crate) struct InstrumentState {
-    pub(crate) spec: InstrumentSpec,
-    pub(crate) book: OrderBook,
-    pub(crate) risk_limits: RiskLimits,
-    pub(crate) circuit_breaker: CircuitBreakerConfig,
-    pub(crate) fee_schedule: FeeSchedule,
-    /// When true, the instrument is disabled — no new orders or amendments
-    /// are accepted. All resting orders are cancelled on disable.
-    pub(crate) disabled: bool,
 }
 
 /// Top-level exchange managing multiple instruments.
