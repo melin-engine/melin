@@ -31,7 +31,6 @@ no-o-direct = [
 ]
 latency-trace = [
     "melin-transport-core/latency-trace",
-    "melin-protocol/latency-trace",
     "melin-server-runtime/latency-trace",
     "melin-server/latency-trace",
 ]

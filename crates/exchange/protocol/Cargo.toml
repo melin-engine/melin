@@ -3,9 +3,6 @@ name = "melin-protocol"
 version = "0.8.0"
 edition = "2024"
 
-[features]
-latency-trace = []
-
 [dependencies]
 # Typed views over raw byte buffers for the wire frame header —
 # replaces hand-rolled le::put / le::get pairs. derive feature for

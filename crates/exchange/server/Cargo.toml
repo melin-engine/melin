@@ -33,7 +33,6 @@ no-persist = ["melin-transport-core/no-persist", "melin-server-runtime/no-persis
 ## the trace timestamps.
 latency-trace = [
     "melin-transport-core/latency-trace",
-    "melin-protocol/latency-trace",
     "melin-server-runtime/latency-trace",
 ]
 ## Full tick-to-trade decomposition: adds 5 commercial-grade stages
