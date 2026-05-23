@@ -928,6 +928,8 @@ mod cancel_replace_tests;
 #[cfg(test)]
 mod open_order_cap_tests;
 #[cfg(test)]
+mod stp_tests;
+#[cfg(test)]
 mod test_helpers;
 #[cfg(test)]
 #[path = "exchange_tests.rs"]
