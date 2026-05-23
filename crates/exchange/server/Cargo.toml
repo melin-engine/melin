@@ -18,10 +18,9 @@ release-tracing = ["tracing/max_level_info", "melin-server-runtime/release-traci
 ## `melin-exchange-core` — every `SubmitOrder` is bypassed by the
 ## `skip-order-exec` feature so the matching hot path is never
 ## exercised.
-trading = ["dep:melin-market-data", "melin-trading-server/trading"]
+trading = ["dep:melin-market-data"]
 skip-order-exec = [
     "melin-exchange-core/skip-order-exec",
-    "melin-trading-server/skip-order-exec",
     "hash-chain",
     "release-tracing",
 ]
@@ -36,7 +35,6 @@ latency-trace = [
     "melin-transport-core/latency-trace",
     "melin-protocol/latency-trace",
     "melin-server-runtime/latency-trace",
-    "melin-trading-server/latency-trace",
 ]
 ## Full tick-to-trade decomposition: adds 5 commercial-grade stages
 ## on top of latency-trace (reader: ingest, response: journal-wait,
@@ -65,6 +63,10 @@ no-o-direct = [
     "melin-server-runtime/no-o-direct",
 ]
 
+[lib]
+name = "melin_server"
+path = "src/lib.rs"
+
 [[bin]]
 name = "melin-server"
 path = "src/main.rs"
@@ -76,40 +78,38 @@ required-features = ["skip-order-exec"]
 
 [dependencies]
 melin-app = { path = "../../core/app" }
+melin-disruptor = { path = "../../core/disruptor" }
 melin-exchange-core = { path = "../exchange-core" }
 melin-journal = { path = "../../core/journal" }
+melin-protocol = { path = "../protocol" }
 melin-server-runtime = { path = "../../core/server-runtime" }
 melin-trading = { path = "../trading" }
-melin-trading-server = { path = "../trading-server", default-features = false }
 melin-transport-core = { path = "../../core/transport-core" }
 melin-types = { path = "../types" }
-melin-disruptor = { path = "../../core/disruptor" }
-melin-market-data = { path = "../market-data", optional = true }
-melin-protocol = { path = "../protocol" }
 melin-wire-protocol = { path = "../../core/wire-protocol" }
+melin-market-data = { path = "../market-data", optional = true }
 blake3 = "1"
 clap = { workspace = true }
 base64 = { workspace = true }
 crc32c = "0.6"
 ed25519-dalek = { workspace = true }
 getrandom = "0.4"
-libc = { workspace = true }
-rustc-hash = "2"
-rand = { workspace = true }
-tracing = { workspace = true }
-tikv-jemallocator = { workspace = true }
-tracing-subscriber = { workspace = true }
 io-uring = "0.7"
-# Typed views over raw byte buffers for replication control frames —
-# replaces hand-rolled extend_from_slice / try_into chains. derive
-# feature for `FromBytes` / `IntoBytes`.
+libc = { workspace = true }
+rand = { workspace = true }
+rustc-hash = "2"
+tikv-jemallocator = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
 zerocopy = { version = "0.8", features = ["derive"] }
 melin-dpdk = { path = "../../core/dpdk", optional = true }
 
 [dev-dependencies]
+bolero = "0.13"
 melin-client = { path = "../client" }
-melin-journal = { path = "../../core/journal" }
+melin-journal = { path = "../../core/journal", features = ["test-utils"] }
 melin-protocol = { path = "../protocol" }
+melin-transport-core = { path = "../../core/transport-core", features = ["test-utils"] }
 ed25519-dalek = { workspace = true }
 serial_test = "3"
 tempfile = "3"

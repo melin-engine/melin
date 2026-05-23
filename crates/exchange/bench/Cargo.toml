@@ -10,7 +10,7 @@ default-run = "melin-bench"
 ## features with `--no-default-features --features=...` to benchmark
 ## without trading, hash-chain, or release-tracing.
 default = ["trading", "hash-chain", "release-tracing"]
-trading = ["melin-trading-server/trading"]
+trading = ["melin-server/trading"]
 hash-chain = [
     "melin-journal/hash-chain",
     "melin-transport-core/hash-chain",
@@ -19,7 +19,7 @@ hash-chain = [
 release-tracing = ["tracing/max_level_info", "melin-server-runtime/release-tracing"]
 skip-order-exec = [
     "melin-exchange-core/skip-order-exec",
-    "melin-trading-server/skip-order-exec",
+    "melin-server/skip-order-exec",
     "hash-chain",
     "release-tracing",
 ]
@@ -33,7 +33,7 @@ latency-trace = [
     "melin-transport-core/latency-trace",
     "melin-protocol/latency-trace",
     "melin-server-runtime/latency-trace",
-    "melin-trading-server/latency-trace",
+    "melin-server/latency-trace",
 ]
 tick-to-trade = ["latency-trace", "melin-server-runtime/tick-to-trade"]
 ## Kept for backward compatibility — io_uring is now always used.
@@ -83,7 +83,7 @@ melin-disruptor = { path = "../../core/disruptor" }
 melin-protocol = { path = "../protocol" }
 melin-wire-protocol = { path = "../../core/wire-protocol" }
 melin-server-runtime = { path = "../../core/server-runtime" }
-melin-trading-server = { path = "../trading-server", default-features = false }
+melin-server = { path = "../server", default-features = false }
 melin-app = { path = "../../core/app" }
 melin-transport-core = { path = "../../core/transport-core" }
 base64 = { workspace = true }

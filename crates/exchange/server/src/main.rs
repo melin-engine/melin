@@ -28,8 +28,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use clap::Parser;
+use melin_server::exchange_app::ServerApp;
 use melin_server_runtime::server::ServerConfig;
-use melin_trading_server::exchange_app::ServerApp;
 #[cfg(not(feature = "dpdk"))]
 use melin_wire_protocol::tcp::BlockingTcpListener;
 
@@ -50,8 +50,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // factory captures `accounts`/`instruments`/`max_orders_*` so the
     // runtime never names trading concepts by their wire variants.
     let factory: Arc<dyn melin_app::app_factory::AppFactory<App = ServerApp>> =
-        Arc::new(melin_trading_server::app_factory::ExchangeAppFactory::new(
-            melin_trading_server::app_factory::ExchangeAppFactoryConfig {
+        Arc::new(melin_server::app_factory::ExchangeAppFactory::new(
+            melin_server::app_factory::ExchangeAppFactoryConfig {
                 accounts: config.accounts,
                 instruments: config.instruments,
                 max_orders_per_account: config.max_orders_per_account,
@@ -63,9 +63,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // so non-trading applications plug in their own codecs without
     // touching server.rs.
     let decoder: melin_server_runtime::reader::RequestDecoderArc<ServerApp> =
-        Arc::new(melin_trading_server::request::ExchangeRequestDecoder);
+        Arc::new(melin_server::request::ExchangeRequestDecoder);
     let encoder: melin_server_runtime::response::ResponseEncoderArc<ServerApp> =
-        Arc::new(melin_trading_server::response_encoder::ExchangeResponseEncoder);
+        Arc::new(melin_server::response_encoder::ExchangeResponseEncoder);
     // Event publisher is trading-only: under `trading` the binary wires
     // the market-data publisher fn; under `skip-order-exec` no publisher
     // exists, so we pass `None` and the runtime never allocates the
@@ -73,7 +73,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let event_publisher: Option<melin_server_runtime::server::EventPublisherFn<ServerApp>> = {
         #[cfg(feature = "trading")]
         {
-            Some(melin_trading_server::event_publisher::run)
+            Some(melin_server::event_publisher::run)
         }
         #[cfg(not(feature = "trading"))]
         {

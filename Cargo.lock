@@ -1518,9 +1518,9 @@ dependencies = [
  "melin-exchange-core",
  "melin-journal",
  "melin-protocol",
+ "melin-server",
  "melin-server-runtime",
  "melin-trading",
- "melin-trading-server",
  "melin-transport-core",
  "melin-types",
  "melin-wire-protocol",
@@ -1670,6 +1670,7 @@ version = "0.8.0"
 dependencies = [
  "base64 0.22.1",
  "blake3",
+ "bolero",
  "clap",
  "crc32c",
  "ed25519-dalek",
@@ -1686,7 +1687,6 @@ dependencies = [
  "melin-protocol",
  "melin-server-runtime",
  "melin-trading",
- "melin-trading-server",
  "melin-transport-core",
  "melin-types",
  "melin-wire-protocol",
@@ -1736,29 +1736,6 @@ version = "0.8.0"
 dependencies = [
  "melin-app",
  "melin-types",
-]
-
-[[package]]
-name = "melin-trading-server"
-version = "0.8.0"
-dependencies = [
- "bolero",
- "ed25519-dalek",
- "getrandom 0.4.2",
- "libc",
- "melin-app",
- "melin-disruptor",
- "melin-exchange-core",
- "melin-journal",
- "melin-market-data",
- "melin-protocol",
- "melin-trading",
- "melin-transport-core",
- "melin-types",
- "melin-wire-protocol",
- "rustc-hash",
- "tempfile",
- "tracing",
 ]
 
 [[package]]

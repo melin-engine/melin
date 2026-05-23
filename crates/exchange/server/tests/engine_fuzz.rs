@@ -5,8 +5,8 @@
 //! tests which only exercise valid inputs.
 
 use melin_journal::codec;
+use melin_server::exchange_app::ServerApp;
 use melin_trading::trading_event::TradingEvent;
-use melin_trading_server::exchange_app::ServerApp;
 
 /// Journal entry decoder must never panic on arbitrary input.
 /// It must return Ok or a well-formed Err for any byte sequence.

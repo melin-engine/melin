@@ -52,10 +52,10 @@ type OutputSlot<A> =
 
 /// Body of the event-publisher thread: a free function with this exact
 /// signature (the trading binary supplies
-/// `melin_trading_server::event_publisher::run`; the
+/// `melin_server::event_publisher::run`; the
 /// skip-order-exec binary supplies nothing). Passing it as a function
 /// pointer keeps the runtime decoupled from the trading domain — no
-/// `melin_trading_server::*` reference inside server.rs — without paying for a
+/// `melin_server::*` reference inside server.rs — without paying for a
 /// boxed closure.
 ///
 /// Threaded into [`run`] (and `run_dpdk` under `feature = "dpdk"`) as `Option<EventPublisherFn>`:
@@ -581,9 +581,9 @@ fn parse_cores(s: &str) -> Result<PipelineCores, String> {
 /// `A::Report` / `A::QueryResponse` values into wire frames on the
 /// response stage. The trading binary constructs the three trading-side
 /// impls
-/// (`melin_trading_server::ExchangeAppFactory`,
-/// `melin_trading_server::ExchangeRequestDecoder`,
-/// `melin_trading_server::ExchangeResponseEncoder`);
+/// (`melin_server::ExchangeAppFactory`,
+/// `melin_server::ExchangeRequestDecoder`,
+/// `melin_server::ExchangeResponseEncoder`);
 /// alternative applications plug in different trait impls without
 /// touching the runtime.
 ///
@@ -2531,7 +2531,7 @@ where
 
 // The `apply_max_orders` / `empty_app` / `empty_app_for_seed` helpers
 // that used to live here have moved behind the `AppFactory` trait —
-// see `melin_trading_server::ExchangeAppFactory`. The runtime
+// see `melin_server::ExchangeAppFactory`. The runtime
 // reaches them through the `factory: &dyn AppFactory<App = A>`
 // parameter threaded into [`init_engine`], [`run_as_primary`], and
 // the replication receivers; the binary passes a single

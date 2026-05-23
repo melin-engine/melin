@@ -10,7 +10,7 @@
 //!
 //! The trading-side wiring (`ServerApp`, `ExchangeRequestDecoder`,
 //! `ExchangeResponseEncoder`, market-data firehose) lives in the
-//! separate `melin-trading-server` crate.
+//! separate `melin-server` crate.
 
 pub mod admin;
 pub mod durability_policy;

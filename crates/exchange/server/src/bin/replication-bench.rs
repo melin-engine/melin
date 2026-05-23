@@ -31,10 +31,10 @@ use melin_app::unix_epoch_nanos;
 use melin_journal::JournalEvent;
 #[allow(unused_imports)] // used by some feature combinations only
 use melin_journal::JournalWrite;
+use melin_server::exchange_app::ServerApp;
 use melin_server_runtime::replication::{ReplicationMetrics, Sender, run_receiver, run_sender};
 use melin_server_runtime::server::PipelineCores;
 use melin_trading::trading_event::TradingEvent;
-use melin_trading_server::exchange_app::ServerApp;
 type InputSlot = melin_transport_core::pipeline::InputSlot<TradingEvent>;
 type OutputSlot = melin_transport_core::pipeline::OutputSlot<
     melin_types::types::ExecutionReport,
@@ -252,8 +252,8 @@ fn main() {
                 8, // pipeline_depth
                 busy_spin,
                 None, // rotation: bench replica doesn't rotate
-                std::sync::Arc::new(melin_trading_server::app_factory::ExchangeAppFactory::new(
-                    melin_trading_server::app_factory::ExchangeAppFactoryConfig {
+                std::sync::Arc::new(melin_server::app_factory::ExchangeAppFactory::new(
+                    melin_server::app_factory::ExchangeAppFactoryConfig {
                         accounts: 0,
                         instruments: 0,
                         max_orders_per_account: 10_000,

@@ -77,9 +77,9 @@ use hdrhistogram::Histogram;
 #[cfg(not(feature = "dpdk"))]
 use melin_protocol::codec;
 use melin_protocol::message::ResponseKind;
+use melin_server::exchange_app::ServerApp;
 #[cfg(not(feature = "dpdk"))]
 use melin_server_runtime::server::ServerConfig;
-use melin_trading_server::exchange_app::ServerApp;
 use melin_types::types::*;
 #[cfg(not(feature = "dpdk"))]
 use melin_wire_protocol::transport::BlockingTransportListener;
@@ -1760,8 +1760,8 @@ fn run_roundtrip_bench(
     // binary, so the factory must be constructed even for in-process
     // benchmarks.
     let factory: Arc<dyn melin_app::app_factory::AppFactory<App = ServerApp>> =
-        Arc::new(melin_trading_server::app_factory::ExchangeAppFactory::new(
-            melin_trading_server::app_factory::ExchangeAppFactoryConfig {
+        Arc::new(melin_server::app_factory::ExchangeAppFactory::new(
+            melin_server::app_factory::ExchangeAppFactoryConfig {
                 accounts: config.accounts,
                 instruments: config.instruments,
                 max_orders_per_account: config.max_orders_per_account,
@@ -1883,9 +1883,9 @@ fn start_server<L: BlockingTransportListener>(
     // Trading-side codecs constructed at the call boundary, mirroring
     // the binary in `crates/exchange/server/src/main.rs`.
     let decoder: melin_server_runtime::reader::RequestDecoderArc<ServerApp> =
-        Arc::new(melin_trading_server::request::ExchangeRequestDecoder);
+        Arc::new(melin_server::request::ExchangeRequestDecoder);
     let encoder: melin_server_runtime::response::ResponseEncoderArc<ServerApp> =
-        Arc::new(melin_trading_server::response_encoder::ExchangeResponseEncoder);
+        Arc::new(melin_server::response_encoder::ExchangeResponseEncoder);
     // The bench has no event subscribers; pass `None` so the runtime
     // never allocates the publisher consumer slot.
     let event_publisher: Option<melin_server_runtime::server::EventPublisherFn<ServerApp>> = None;
