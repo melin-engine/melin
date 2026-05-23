@@ -44,8 +44,8 @@ use ed25519_dalek::{Verifier, VerifyingKey};
 use tracing::{debug, error, info};
 
 use melin_app::auth::{AuthorizedKeys, Permission};
-use melin_protocol::codec;
-use melin_protocol::message::{Request, ResponseKind};
+use melin_wire_protocol::control::TransportResponse;
+use melin_wire_protocol::control_codec;
 
 /// Spawn the admin listener on a dedicated thread.
 ///
@@ -156,8 +156,9 @@ fn authenticate(stream: &mut TcpStream, authorized_keys: &AuthorizedKeys) -> Res
     getrandom::fill(&mut nonce).map_err(|e| format!("getrandom failed: {e}"))?;
 
     let mut buf = [0u8; 128];
-    let written = codec::encode_response(&ResponseKind::Challenge { nonce }, &mut buf)
-        .map_err(|e| format!("encode Challenge: {e}"))?;
+    let written =
+        control_codec::encode_transport_response(&TransportResponse::Challenge { nonce }, &mut buf)
+            .map_err(|e| format!("encode Challenge: {e}"))?;
     stream
         .write_all(&buf[..written])
         .map_err(|e| format!("send Challenge: {e}"))?;
@@ -177,7 +178,7 @@ fn authenticate(stream: &mut TcpStream, authorized_keys: &AuthorizedKeys) -> Res
     std::io::Read::read_exact(stream, &mut frame_buf[..frame_len])
         .map_err(|e| format!("read auth frame payload: {e}"))?;
 
-    let (_seq, request) = match codec::decode_request(&frame_buf[..frame_len]) {
+    let (_seq, cr) = match control_codec::decode_challenge_response(&frame_buf[..frame_len]) {
         Ok(pair) => pair,
         Err(e) => {
             send_auth_failed(stream);
@@ -185,16 +186,7 @@ fn authenticate(stream: &mut TcpStream, authorized_keys: &AuthorizedKeys) -> Res
         }
     };
 
-    let (signature_bytes, public_key_bytes) = match request {
-        Request::ChallengeResponse {
-            signature,
-            public_key,
-        } => (signature, public_key),
-        _ => {
-            send_auth_failed(stream);
-            return Err("expected ChallengeResponse".into());
-        }
-    };
+    let (signature_bytes, public_key_bytes) = (cr.signature, cr.public_key);
 
     let permission = match authorized_keys.lookup(&public_key_bytes) {
         Some(perm) => perm,
@@ -220,8 +212,9 @@ fn authenticate(stream: &mut TcpStream, authorized_keys: &AuthorizedKeys) -> Res
         format!("signature verification failed: {e}")
     })?;
 
-    let written = codec::encode_response(&ResponseKind::ServerReady, &mut buf)
-        .map_err(|e| format!("encode ServerReady: {e}"))?;
+    let written =
+        control_codec::encode_transport_response(&TransportResponse::ServerReady, &mut buf)
+            .map_err(|e| format!("encode ServerReady: {e}"))?;
     stream
         .write_all(&buf[..written])
         .map_err(|e| format!("send ServerReady: {e}"))?;
@@ -234,7 +227,9 @@ fn authenticate(stream: &mut TcpStream, authorized_keys: &AuthorizedKeys) -> Res
 
 fn send_auth_failed(stream: &mut TcpStream) {
     let mut buf = [0u8; 8];
-    if let Ok(written) = codec::encode_response(&ResponseKind::AuthFailed, &mut buf) {
+    if let Ok(written) =
+        control_codec::encode_transport_response(&TransportResponse::AuthFailed, &mut buf)
+    {
         // Best-effort: an unauthenticated peer may already be gone, and
         // we're about to drop the stream regardless. Write errors here
         // carry no actionable signal.
@@ -404,6 +399,8 @@ mod tests {
     use std::io::{BufRead, BufReader, Read, Write};
 
     use ed25519_dalek::{Signer, SigningKey};
+    use melin_protocol::codec;
+    use melin_protocol::message::{Request, ResponseKind};
 
     fn operator_keys() -> (SigningKey, Arc<AuthorizedKeys>) {
         let signing_key = SigningKey::from_bytes(&[0xAD; 32]);

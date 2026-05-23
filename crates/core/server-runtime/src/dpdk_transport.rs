@@ -48,10 +48,11 @@ use melin_app::{AppEvent, Application};
 use melin_disruptor::ring;
 use melin_dpdk::transport::DpdkTransport;
 use melin_journal::JournalEvent;
-use melin_protocol::codec;
-use melin_protocol::message::{ConnectionId, Request, ResponseKind};
 use melin_transport_core::pipeline::InputSlot;
 use melin_transport_core::trace::mono_trace_ns;
+use melin_wire_protocol::control::ConnectionId;
+use melin_wire_protocol::control::TransportResponse;
+use melin_wire_protocol::control_codec;
 use rand::RngExt;
 
 use melin_dpdk::SocketHandle;
@@ -312,9 +313,11 @@ pub fn run_dpdk_poll<A: Application>(
 
             // Send the Challenge frame immediately.
             let mut challenge_buf = [0u8; 128];
-            let written =
-                codec::encode_response(&ResponseKind::Challenge { nonce }, &mut challenge_buf)
-                    .expect("challenge encodes");
+            let written = control_codec::encode_transport_response(
+                &TransportResponse::Challenge { nonce },
+                &mut challenge_buf,
+            )
+            .expect("challenge encodes");
             transport.queue_send(accepted.handle, &challenge_buf[..written]);
 
             let accepted_idx = accepted.handle.index();
@@ -626,8 +629,8 @@ fn process_auth_frame(
     let consumed = 4 + frame_len;
 
     // Decode the ChallengeResponse (seq is ignored during auth).
-    let (_seq, request) = match codec::decode_request(&conn.parse_buf[4..consumed]) {
-        Ok(req) => req,
+    let (_seq, cr) = match control_codec::decode_challenge_response(&conn.parse_buf[4..consumed]) {
+        Ok(pair) => pair,
         Err(e) => {
             debug!(
                 connection_id = conn.connection_id.0,
@@ -649,20 +652,7 @@ fn process_auth_frame(
     conn.parse_buf.copy_within(consumed.., 0);
     conn.parse_buf.truncate(remaining);
 
-    let (signature_bytes, public_key_bytes) = match request {
-        Request::ChallengeResponse {
-            signature,
-            public_key,
-        } => (signature, public_key),
-        _ => {
-            debug!(
-                connection_id = conn.connection_id.0,
-                "DPDK: expected ChallengeResponse, got something else"
-            );
-            send_auth_failed(conn, transport);
-            return;
-        }
-    };
+    let (signature_bytes, public_key_bytes) = (cr.signature, cr.public_key);
 
     // Look up the public key.
     let permission = match authorized_keys.lookup(&public_key_bytes) {
@@ -709,7 +699,8 @@ fn process_auth_frame(
     // Auth succeeded — send ServerReady.
     let mut buf = [0u8; 16];
     let written =
-        codec::encode_response(&ResponseKind::ServerReady, &mut buf).expect("ServerReady encodes");
+        control_codec::encode_transport_response(&TransportResponse::ServerReady, &mut buf)
+            .expect("ServerReady encodes");
     transport.queue_send(conn.handle, &buf[..written]);
 
     debug!(
@@ -741,7 +732,9 @@ fn process_auth_frame(
 /// Send an AuthFailed response and close the connection.
 fn send_auth_failed(conn: &ConnectionState, transport: &mut DpdkTransport) {
     let mut buf = [0u8; 16];
-    if let Ok(written) = codec::encode_response(&ResponseKind::AuthFailed, &mut buf) {
+    if let Ok(written) =
+        control_codec::encode_transport_response(&TransportResponse::AuthFailed, &mut buf)
+    {
         transport.queue_send(conn.handle, &buf[..written]);
     }
     // Don't close immediately — let smoltcp flush the AuthFailed frame first.

@@ -23,8 +23,8 @@ use melin_app::Application;
 use melin_app::amortized_timer::AmortizedTimer;
 use melin_transport_core::pipeline::{OutputPayload, OutputSlot, StageUtilization};
 
-use melin_protocol::codec;
-use melin_protocol::message::ResponseKind;
+use melin_wire_protocol::control::TransportResponse;
+use melin_wire_protocol::control_codec;
 
 #[cfg(feature = "latency-trace")]
 use melin_transport_core::trace;
@@ -164,8 +164,11 @@ pub fn run<A: Application>(
 
     // Pre-encode heartbeat frame (fixed-size, no heap allocation).
     let mut heartbeat_frame = [0u8; 8];
-    let heartbeat_len = codec::encode_response(&ResponseKind::Heartbeat, &mut heartbeat_frame)
-        .expect("heartbeat encodes");
+    let heartbeat_len = control_codec::encode_transport_response(
+        &TransportResponse::Heartbeat,
+        &mut heartbeat_frame,
+    )
+    .expect("heartbeat encodes");
 
     let mut last_heartbeat_scan = Instant::now();
     // Gate the heartbeat scan's clock read so the count==0 spin doesn't
@@ -468,8 +471,11 @@ pub fn run<A: Application>(
                     Some(encoder.encode_query(q, &mut encode_buf))
                 }
                 OutputPayload::EngineError => Some(
-                    codec::encode_response(&ResponseKind::EngineError, &mut encode_buf)
-                        .map_err(|_| "encode error"),
+                    control_codec::encode_transport_response(
+                        &TransportResponse::EngineError,
+                        &mut encode_buf,
+                    )
+                    .map_err(|_| "encode error"),
                 ),
                 OutputPayload::BatchEnd => None,
             };
@@ -486,8 +492,11 @@ pub fn run<A: Application>(
             // directly via codec — never reaches the application
             // encoder trait.
             if slot.is_last_in_request {
-                let result = codec::encode_response(&ResponseKind::BatchEnd, &mut encode_buf)
-                    .map_err(|_| "encode error");
+                let result = control_codec::encode_transport_response(
+                    &TransportResponse::BatchEnd,
+                    &mut encode_buf,
+                )
+                .map_err(|_| "encode error");
                 push_frame(result, conn_id, &mut tx_producers[tid], &encode_buf);
             }
 
@@ -518,7 +527,7 @@ pub fn run<A: Application>(
 /// behaviour as the pre-refactor inline loop. Splitting the
 /// responsibility into a helper lets the slot-processing code call
 /// it uniformly for application payloads (via the `ResponseEncoder`
-/// trait) and transport-shaped frames (via `codec::encode_response`).
+/// trait) and transport-shaped frames (via `encode_transport_response`).
 #[inline]
 fn push_frame(
     result: Result<usize, &'static str>,

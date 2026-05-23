@@ -39,9 +39,10 @@ pub type RequestDecoderArc<A> = Arc<dyn RequestDecoder<Event = <A as Application
 use melin_app::unix_epoch_nanos;
 use melin_disruptor::ring;
 use melin_journal::JournalEvent;
-use melin_protocol::codec;
 use melin_transport_core::pipeline::InputSlot;
 use melin_transport_core::trace::mono_trace_ns;
+use melin_wire_protocol::control::TransportResponse;
+use melin_wire_protocol::control_codec;
 
 /// Size of each provided buffer. 4 KiB accommodates multiple frames per
 /// recv (frames are typically <100 bytes).
@@ -88,7 +89,7 @@ const IORING_CQE_F_MORE: u32 = 1 << 1;
 /// Bit shift to extract buffer ID from CQE flags.
 const IORING_CQE_BUFFER_SHIFT: u32 = 16;
 
-use melin_protocol::message::ConnectionId;
+use melin_wire_protocol::control::ConnectionId;
 
 /// Command sent from the accept loop to a reader thread.
 pub struct ReaderRegistration<R> {
@@ -321,9 +322,8 @@ fn reader_loop<A: Application, R: AsRawFd>(
     // Pre-encode the ServerBusy response frame (length prefix + tag = 5 bytes).
     let server_busy_frame = {
         let mut buf = [0u8; 8];
-        let n =
-            codec::encode_response(&melin_protocol::message::ResponseKind::ServerBusy, &mut buf)
-                .expect("ServerBusy encodes");
+        let n = control_codec::encode_transport_response(&TransportResponse::ServerBusy, &mut buf)
+            .expect("ServerBusy encodes");
         let mut frame = [0u8; 5];
         frame.copy_from_slice(&buf[..n]);
         frame

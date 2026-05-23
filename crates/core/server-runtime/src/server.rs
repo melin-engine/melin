@@ -69,8 +69,8 @@ pub type EventPublisherFn<A> = fn(
     busy_spin: bool,
 );
 
-use melin_protocol::message::ConnectionId;
 use melin_wire_protocol::blocking::BlockingFrameWriter;
+use melin_wire_protocol::control::ConnectionId;
 use melin_wire_protocol::transport::BlockingTransportListener;
 
 /// Default replica pipeline depth (pending ack queue capacity).
@@ -2704,8 +2704,8 @@ fn authenticate_connection<R: std::io::Read, W: std::io::Write>(
     use std::io;
 
     use ed25519_dalek::{Verifier, VerifyingKey};
-    use melin_protocol::codec;
-    use melin_protocol::message::{Request, ResponseKind};
+    use melin_wire_protocol::control::TransportResponse;
+    use melin_wire_protocol::control_codec;
 
     // Generate a 32-byte random nonce for this connection.
     // Explicit OsRng for cryptographic material (SEC-10).
@@ -2713,8 +2713,9 @@ fn authenticate_connection<R: std::io::Read, W: std::io::Write>(
     getrandom::fill(&mut nonce).map_err(|e| io::Error::other(format!("getrandom failed: {e}")))?;
 
     let mut buf = [0u8; 128];
-    let written = codec::encode_response(&ResponseKind::Challenge { nonce }, &mut buf)
-        .map_err(|e| io::Error::other(format!("encode Challenge: {e}")))?;
+    let written =
+        control_codec::encode_transport_response(&TransportResponse::Challenge { nonce }, &mut buf)
+            .map_err(|e| io::Error::other(format!("encode Challenge: {e}")))?;
     writer.write_all(&buf[..written])?;
     writer.flush()?;
 
@@ -2737,7 +2738,7 @@ fn authenticate_connection<R: std::io::Read, W: std::io::Write>(
         .read_exact(&mut frame_buf[..frame_len])
         .map_err(|e| io::Error::other(format!("read auth frame payload: {e}")))?;
 
-    let (_seq, request) = match codec::decode_request(&frame_buf[..frame_len]) {
+    let (_seq, cr) = match control_codec::decode_challenge_response(&frame_buf[..frame_len]) {
         Ok(pair) => pair,
         Err(e) => {
             send_auth_failed(writer);
@@ -2745,20 +2746,7 @@ fn authenticate_connection<R: std::io::Read, W: std::io::Write>(
         }
     };
 
-    let (signature_bytes, public_key_bytes) = match request {
-        Request::ChallengeResponse {
-            signature,
-            public_key,
-        } => (signature, public_key),
-        other => {
-            send_auth_failed(writer);
-            return Err(format!(
-                "expected ChallengeResponse, got {:?}",
-                std::mem::discriminant(&other)
-            )
-            .into());
-        }
-    };
+    let (signature_bytes, public_key_bytes) = (cr.signature, cr.public_key);
 
     // Look up the public key in authorized_keys.
     let permission = match authorized_keys.lookup(&public_key_bytes) {
@@ -2782,8 +2770,9 @@ fn authenticate_connection<R: std::io::Read, W: std::io::Write>(
     })?;
 
     // Auth succeeded — send ServerReady.
-    let written = codec::encode_response(&ResponseKind::ServerReady, &mut buf)
-        .map_err(|e| io::Error::other(format!("encode ServerReady: {e}")))?;
+    let written =
+        control_codec::encode_transport_response(&TransportResponse::ServerReady, &mut buf)
+            .map_err(|e| io::Error::other(format!("encode ServerReady: {e}")))?;
     writer.write_all(&buf[..written])?;
     writer.flush()?;
 
@@ -2908,11 +2897,13 @@ fn set_write_timeout<F: std::os::unix::io::AsRawFd>(
 
 /// Best-effort send of AuthFailed before dropping a connection.
 fn send_auth_failed(writer: &mut impl std::io::Write) {
+    use melin_wire_protocol::control::TransportResponse;
+    use melin_wire_protocol::control_codec;
+
     let mut buf = [0u8; 8];
-    if let Ok(written) = melin_protocol::codec::encode_response(
-        &melin_protocol::message::ResponseKind::AuthFailed,
-        &mut buf,
-    ) {
+    if let Ok(written) =
+        control_codec::encode_transport_response(&TransportResponse::AuthFailed, &mut buf)
+    {
         let _ = writer.write_all(&buf[..written]);
         let _ = writer.flush();
     }

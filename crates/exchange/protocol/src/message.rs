@@ -9,13 +9,7 @@ use melin_types::types::{
     InstrumentSpec, Order, OrderId, Price, Quantity, RiskLimits, Side, Symbol,
 };
 
-/// Connection identifier assigned by the server.
-///
-/// Uses `u64` — monotonically increasing, never reused within a server
-/// lifetime. Fits in a register and supports more connections than any
-/// single server will ever handle.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct ConnectionId(pub u64);
+pub use melin_wire_protocol::control::ConnectionId;
 
 /// Client → server request.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

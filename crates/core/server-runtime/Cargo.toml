@@ -12,7 +12,6 @@ no-persist = ["melin-transport-core/no-persist"]
 ## Lightweight per-stage histograms.
 latency-trace = [
     "melin-transport-core/latency-trace",
-    "melin-protocol/latency-trace",
 ]
 ## Full tick-to-trade decomposition. Implies latency-trace.
 tick-to-trade = ["latency-trace"]
@@ -34,7 +33,6 @@ no-o-direct = [
 melin-app = { path = "../app" }
 melin-disruptor = { path = "../disruptor" }
 melin-journal = { path = "../journal" }
-melin-protocol = { path = "../../exchange/protocol" }
 melin-wire-protocol = { path = "../wire-protocol" }
 melin-transport-core = { path = "../transport-core" }
 blake3 = "1"
@@ -53,9 +51,10 @@ melin-dpdk = { path = "../dpdk", optional = true }
 
 [dev-dependencies]
 # The runtime's library API is application-agnostic, but a few unit
-# tests (replication wire format, DPDK fixtures) construct realistic
-# fixtures with the trading domain's `TradingEvent` and `melin-types`.
-# These are dev-only — the lib has no trading dependency.
+# tests (auth handshake, replication wire format, DPDK fixtures) need
+# the full exchange protocol/types to construct realistic fixtures.
+# These are dev-only — the lib has no exchange dependency.
+melin-protocol = { path = "../../exchange/protocol" }
 melin-trading = { path = "../../exchange/trading" }
 melin-types = { path = "../../exchange/types" }
 tempfile = "3"

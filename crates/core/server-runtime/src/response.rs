@@ -27,8 +27,8 @@ use melin_transport_core::pipeline::{OutputPayload, OutputSlot, StageUtilization
 #[cfg(feature = "latency-trace")]
 use melin_transport_core::trace;
 
-use melin_protocol::codec;
-use melin_protocol::message::ResponseKind;
+use melin_wire_protocol::control::TransportResponse;
+use melin_wire_protocol::control_codec;
 
 /// Maximum number of output slots consumed per batch.
 const MAX_BATCH: usize = 1024;
@@ -226,7 +226,7 @@ pub fn run<A: Application>(
     // durability path (recorded only when the gate actually held us
     // up — cache-hit paths skip to avoid inflating the metric with
     // crossings that happened before we noticed). Encode is wall-time
-    // around `codec::encode_response`. Egress wraps a `flush_sends`
+    // around `encode_transport_response`. Egress wraps a `flush_sends`
     // call (one sample per io_uring flush, batching many slots).
     // Gated on `tick-to-trade`, not `latency-trace`, because these
     // stages roughly double the hot-path mutex traffic vs the lighter
@@ -259,7 +259,8 @@ pub fn run<A: Application>(
     let heartbeat_wire_frame = {
         let mut buf = [0u8; 8];
         let written =
-            codec::encode_response(&ResponseKind::Heartbeat, &mut buf).expect("heartbeat encodes");
+            control_codec::encode_transport_response(&TransportResponse::Heartbeat, &mut buf)
+                .expect("heartbeat encodes");
         buf[..written].to_vec()
     };
 
@@ -634,8 +635,11 @@ pub fn run<A: Application>(
                         Some(encoder.encode_query(q, &mut encode_buf))
                     }
                     OutputPayload::EngineError => Some(
-                        codec::encode_response(&ResponseKind::EngineError, &mut encode_buf)
-                            .map_err(|_| "encode error"),
+                        control_codec::encode_transport_response(
+                            &TransportResponse::EngineError,
+                            &mut encode_buf,
+                        )
+                        .map_err(|_| "encode error"),
                     ),
                     OutputPayload::BatchEnd => None,
                 };
@@ -662,8 +666,11 @@ pub fn run<A: Application>(
                 // Frame 2: BatchEnd terminator. Skipped if the payload
                 // append dropped the connection.
                 if matches!(payload_handled, AppendOutcome::Continue) && slot.is_last_in_request {
-                    let result = codec::encode_response(&ResponseKind::BatchEnd, &mut encode_buf)
-                        .map_err(|_| "encode error");
+                    let result = control_codec::encode_transport_response(
+                        &TransportResponse::BatchEnd,
+                        &mut encode_buf,
+                    )
+                    .map_err(|_| "encode error");
                     let outcome = append_frame(
                         result,
                         slot.connection_id,
@@ -714,7 +721,7 @@ enum AppendOutcome {
 /// overflow checking. Splits the responsibilities the inline encode
 /// loop used to have: the caller passes in the encode result (so it
 /// can come from the `ResponseEncoder` trait for application
-/// payloads, or `codec::encode_response` for transport-shaped
+/// payloads, or `encode_transport_response` for transport-shaped
 /// frames), and this helper handles size accounting + dirty
 /// tracking uniformly.
 #[allow(clippy::too_many_arguments)]
