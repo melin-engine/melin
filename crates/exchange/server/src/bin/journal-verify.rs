@@ -1,11 +1,11 @@
 //! Read a journal file and print its final sequence number and BLAKE3 chain hash.
 //!
-//! Usage: cargo run --release -p melin-server --example journal_verify -- <path>
+//! Usage: cargo run --release -p melin-server --bin journal-verify -- <path>
 
 fn main() {
     let path = std::env::args()
         .nth(1)
-        .expect("usage: journal_verify <journal-path>");
+        .expect("usage: journal-verify <journal-path>");
     let mut reader =
         melin_journal::JournalReader::<melin_trading::trading_event::TradingEvent>::open(
             path.as_ref(),

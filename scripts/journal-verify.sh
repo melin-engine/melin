@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Compare journal integrity across two servers using BLAKE3 chain hashes.
 #
-# Builds and runs the journal_verify example on each server, then
+# Builds and runs the journal-verify binary on each server, then
 # compares the output. Matching chain_hash + last_seq means the
 # journals contain identical event streams.
 #
@@ -33,16 +33,16 @@ echo ""
 # Build the verify tool on both servers (cached — instant if already built).
 for HOST in "$SERVER1" "$SERVER2"; do
     ssh $SSH_OPTS "$HOST" "cd ${REPO_DIR} && source ~/.cargo/env && \
-        cargo build --release -p melin-server --example journal_verify 2>&1 | tail -1"
+        cargo build --release -p melin-server --bin journal-verify 2>&1 | tail -1"
 done
 
 echo "  Server 1: ${SERVER1} → ${JOURNAL1}"
-OUT1=$(ssh $SSH_OPTS "$SERVER1" "cd ${REPO_DIR} && ./target/release/examples/journal_verify ${JOURNAL1}")
+OUT1=$(ssh $SSH_OPTS "$SERVER1" "cd ${REPO_DIR} && ./target/release/journal-verify ${JOURNAL1}")
 echo "$OUT1" | sed 's/^/    /'
 echo ""
 
 echo "  Server 2: ${SERVER2} → ${JOURNAL2}"
-OUT2=$(ssh $SSH_OPTS "$SERVER2" "cd ${REPO_DIR} && ./target/release/examples/journal_verify ${JOURNAL2}")
+OUT2=$(ssh $SSH_OPTS "$SERVER2" "cd ${REPO_DIR} && ./target/release/journal-verify ${JOURNAL2}")
 echo "$OUT2" | sed 's/^/    /'
 echo ""
 

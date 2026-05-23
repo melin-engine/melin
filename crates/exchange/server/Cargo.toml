@@ -76,6 +76,10 @@ name = "melin-replication-bench"
 path = "src/bin/replication-bench.rs"
 required-features = ["skip-order-exec"]
 
+[[bin]]
+name = "journal-verify"
+path = "src/bin/journal-verify.rs"
+
 [dependencies]
 melin-app = { path = "../../core/app" }
 melin-disruptor = { path = "../../core/disruptor" }
