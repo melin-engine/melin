@@ -12,12 +12,12 @@ use melin_types::types::{AccountId, CurrencyId, InstrumentSpec, Symbol};
 
 use crate::exchange_app::ServerApp;
 
-/// Construction config for [`ExchangeAppFactory`]. Mirrors the
+/// Construction config for [`Factory`]. Mirrors the
 /// trading-shaped fields of `ServerConfig`; kept as its own struct
 /// so the binary can build one independently of the larger runtime
 /// config when the eventual `ServerConfig` split happens.
 #[derive(Debug, Clone, Copy)]
-pub struct ExchangeAppFactoryConfig {
+pub struct FactoryConfig {
     /// Number of accounts to provision at startup.
     pub accounts: u32,
     /// Number of instruments to register at startup.
@@ -34,17 +34,17 @@ pub struct ExchangeAppFactoryConfig {
 
 /// Trading-side [`AppFactory`] producing `ServerApp` instances.
 #[derive(Debug, Clone, Copy)]
-pub struct ExchangeAppFactory {
-    config: ExchangeAppFactoryConfig,
+pub struct Factory {
+    config: FactoryConfig,
 }
 
-impl ExchangeAppFactory {
-    pub fn new(config: ExchangeAppFactoryConfig) -> Self {
+impl Factory {
+    pub fn new(config: FactoryConfig) -> Self {
         Self { config }
     }
 }
 
-impl AppFactory for ExchangeAppFactory {
+impl AppFactory for Factory {
     type App = ServerApp;
 
     fn empty(&self) -> ServerApp {
@@ -79,7 +79,7 @@ impl AppFactory for ExchangeAppFactory {
                 restored_buckets,
                 max_orders_per_second = self.config.max_orders_per_second,
                 max_orders_burst = self.config.max_orders_burst,
-                "SEC-04 config mismatch: snapshot carries rate-limit buckets but local limiter \
+                "config mismatch: snapshot carries rate-limit buckets but local limiter \
                  is disabled — primary and replica must run with matching values"
             );
         }
@@ -129,8 +129,8 @@ impl AppFactory for ExchangeAppFactory {
 mod tests {
     use super::*;
 
-    fn cfg(accounts: u32, instruments: u32) -> ExchangeAppFactoryConfig {
-        ExchangeAppFactoryConfig {
+    fn cfg(accounts: u32, instruments: u32) -> FactoryConfig {
+        FactoryConfig {
             accounts,
             instruments,
             max_orders_per_account: 100,
@@ -141,7 +141,7 @@ mod tests {
 
     #[test]
     fn seed_events_count_matches_config() {
-        let factory = ExchangeAppFactory::new(cfg(5, 3));
+        let factory = Factory::new(cfg(5, 3));
         let events = factory.seed_events();
         // 3 instruments + 5 accounts.
         assert_eq!(events.len(), 8);
@@ -149,7 +149,7 @@ mod tests {
 
     #[test]
     fn seed_events_order_is_instruments_then_accounts() {
-        let factory = ExchangeAppFactory::new(cfg(2, 2));
+        let factory = Factory::new(cfg(2, 2));
         let events = factory.seed_events();
         assert!(matches!(events[0], TradingEvent::AddInstrument { .. }));
         assert!(matches!(events[1], TradingEvent::AddInstrument { .. }));
@@ -159,13 +159,13 @@ mod tests {
 
     #[test]
     fn seed_events_empty_when_no_accounts_or_instruments() {
-        let factory = ExchangeAppFactory::new(cfg(0, 0));
+        let factory = Factory::new(cfg(0, 0));
         assert!(factory.seed_events().is_empty());
     }
 
     #[test]
     fn empty_for_seed_applies_policy() {
-        let factory = ExchangeAppFactory::new(cfg(2, 2));
+        let factory = Factory::new(cfg(2, 2));
         let app = factory.empty_for_seed();
         // The configured cap (100) was applied, not the exchange
         // default (10_000).
@@ -174,7 +174,7 @@ mod tests {
 
     #[test]
     fn empty_does_not_apply_policy() {
-        let factory = ExchangeAppFactory::new(cfg(2, 2));
+        let factory = Factory::new(cfg(2, 2));
         let app = factory.empty();
         // Fresh exchange — default cap, not the configured value.
         // Replication paths call `apply_operator_policy` explicitly
@@ -184,7 +184,7 @@ mod tests {
 
     #[test]
     fn apply_operator_policy_overrides_default() {
-        let factory = ExchangeAppFactory::new(cfg(2, 2));
+        let factory = Factory::new(cfg(2, 2));
         let mut app = factory.empty();
         factory.apply_operator_policy(&mut app);
         assert_eq!(app.max_open_orders_per_account(), 100);

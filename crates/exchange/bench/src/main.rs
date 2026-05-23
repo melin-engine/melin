@@ -1759,15 +1759,14 @@ fn run_roundtrip_bench(
     // standalone but still bulk-seeds via the same code path as the
     // binary, so the factory must be constructed even for in-process
     // benchmarks.
-    let factory = melin_server::app_factory::ExchangeAppFactory::new(
-        melin_server::app_factory::ExchangeAppFactoryConfig {
+    let factory =
+        melin_server::app_factory::Factory::new(melin_server::app_factory::FactoryConfig {
             accounts: config.accounts,
             instruments: config.instruments,
             max_orders_per_account: config.max_orders_per_account,
             max_orders_per_second: config.max_orders_per_second,
             max_orders_burst: config.max_orders_burst,
-        },
-    );
+        });
 
     let shutdown = Arc::new(AtomicBool::new(false));
 
@@ -1866,11 +1865,11 @@ fn load_signing_key(path: &std::path::Path) -> ed25519_dalek::SigningKey {
 fn start_server<L: BlockingTransportListener>(
     listener: L,
     config: ServerConfig,
-    factory: melin_server::app_factory::ExchangeAppFactory,
+    factory: melin_server::app_factory::Factory,
     shutdown: Arc<AtomicBool>,
 ) {
-    use melin_server::request_decoder::ExchangeRequestDecoder;
-    use melin_server::response_encoder::ExchangeResponseEncoder;
+    use melin_server::request_decoder::RequestDecoder;
+    use melin_server::response_encoder::ResponseEncoder;
     use melin_server_runtime::server::EventPublisherFn;
 
     let event_publisher: Option<EventPublisherFn<ServerApp>> = None;
@@ -1881,8 +1880,8 @@ fn start_server<L: BlockingTransportListener>(
                 listener,
                 config,
                 factory,
-                ExchangeRequestDecoder,
-                ExchangeResponseEncoder,
+                RequestDecoder,
+                ResponseEncoder,
                 event_publisher,
                 shutdown,
             ) {

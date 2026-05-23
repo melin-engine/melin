@@ -252,8 +252,8 @@ fn main() {
                 8, // pipeline_depth
                 busy_spin,
                 None, // rotation: bench replica doesn't rotate
-                std::sync::Arc::new(melin_server::app_factory::ExchangeAppFactory::new(
-                    melin_server::app_factory::ExchangeAppFactoryConfig {
+                std::sync::Arc::new(melin_server::app_factory::Factory::new(
+                    melin_server::app_factory::FactoryConfig {
                         accounts: 0,
                         instruments: 0,
                         max_orders_per_account: 10_000,

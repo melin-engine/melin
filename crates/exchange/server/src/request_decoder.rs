@@ -6,7 +6,7 @@
 //! application-shaped variants.
 
 use melin_app::auth::Permission;
-use melin_app::decoder::{Decoded, RequestDecoder};
+use melin_app::decoder::{Decoded, RequestDecoder as RequestDecoderTrait};
 use melin_protocol::codec;
 use melin_protocol::message::Request;
 use melin_trading::trading_event::TradingEvent;
@@ -15,11 +15,11 @@ use melin_wire_protocol::error::ProtocolError;
 /// Decoder for the trading wire protocol.
 ///
 /// Zero-sized. The runtime owns an `Arc<dyn RequestDecoder<...>>`;
-/// constructing one is `Arc::new(ExchangeRequestDecoder)`.
+/// constructing one is `Arc::new(RequestDecoder)`.
 #[derive(Debug, Clone, Copy)]
-pub struct ExchangeRequestDecoder;
+pub struct RequestDecoder;
 
-impl RequestDecoder for ExchangeRequestDecoder {
+impl RequestDecoderTrait for RequestDecoder {
     type Event = TradingEvent;
 
     fn decode(&self, bytes: &[u8], permission: Permission) -> Decoded<TradingEvent> {
@@ -193,7 +193,7 @@ mod tests {
     fn heartbeat_is_filtered() {
         let bytes = encode(&Request::Heartbeat, 0);
         assert!(matches!(
-            ExchangeRequestDecoder.decode(&bytes, Permission::Trader),
+            RequestDecoder.decode(&bytes, Permission::Trader),
             Decoded::Filter
         ));
     }
@@ -208,7 +208,7 @@ mod tests {
             0,
         );
         assert!(matches!(
-            ExchangeRequestDecoder.decode(&bytes, Permission::Trader),
+            RequestDecoder.decode(&bytes, Permission::Trader),
             Decoded::Filter
         ));
     }
@@ -223,7 +223,7 @@ mod tests {
             0,
         );
         assert!(matches!(
-            ExchangeRequestDecoder.decode(&bytes, Permission::Trader),
+            RequestDecoder.decode(&bytes, Permission::Trader),
             Decoded::Filter
         ));
     }
@@ -237,7 +237,7 @@ mod tests {
             },
             42,
         );
-        match ExchangeRequestDecoder.decode(&bytes, Permission::Trader) {
+        match RequestDecoder.decode(&bytes, Permission::Trader) {
             Decoded::Permitted { request_seq, event } => {
                 assert_eq!(request_seq, 42);
                 assert!(matches!(event, TradingEvent::SubmitOrder { .. }));
@@ -258,7 +258,7 @@ mod tests {
             0,
         );
         assert!(matches!(
-            ExchangeRequestDecoder.decode(&bytes, Permission::ReadOnly),
+            RequestDecoder.decode(&bytes, Permission::ReadOnly),
             Decoded::PermissionDenied(_)
         ));
     }
@@ -276,7 +276,7 @@ mod tests {
             7,
         );
         assert!(matches!(
-            ExchangeRequestDecoder.decode(&bytes, Permission::Operator),
+            RequestDecoder.decode(&bytes, Permission::Operator),
             Decoded::Permitted { .. }
         ));
     }
@@ -294,7 +294,7 @@ mod tests {
             0,
         );
         assert!(matches!(
-            ExchangeRequestDecoder.decode(&bytes, Permission::Trader),
+            RequestDecoder.decode(&bytes, Permission::Trader),
             Decoded::PermissionDenied(_)
         ));
     }
@@ -310,7 +310,7 @@ mod tests {
             3,
         );
         assert!(matches!(
-            ExchangeRequestDecoder.decode(&bytes, Permission::Custodian),
+            RequestDecoder.decode(&bytes, Permission::Custodian),
             Decoded::Permitted { .. }
         ));
     }
@@ -326,7 +326,7 @@ mod tests {
             0,
         );
         assert!(matches!(
-            ExchangeRequestDecoder.decode(&bytes, Permission::Trader),
+            RequestDecoder.decode(&bytes, Permission::Trader),
             Decoded::PermissionDenied(_)
         ));
     }
@@ -336,7 +336,7 @@ mod tests {
         // QueryStats is an operator-only request — see
         // `Request::requires_operator`.
         let bytes = encode(&Request::QueryStats, 1);
-        match ExchangeRequestDecoder.decode(&bytes, Permission::Operator) {
+        match RequestDecoder.decode(&bytes, Permission::Operator) {
             Decoded::Permitted { event, .. } => {
                 assert!(matches!(event, TradingEvent::QueryStats));
                 assert!(event.is_query());
@@ -349,7 +349,7 @@ mod tests {
     fn malformed_frame_yields_decode_error() {
         // Empty bytes can't even fit the request_seq prefix.
         assert!(matches!(
-            ExchangeRequestDecoder.decode(&[], Permission::Trader),
+            RequestDecoder.decode(&[], Permission::Trader),
             Decoded::DecodeError(_)
         ));
     }

@@ -28,10 +28,10 @@ pub static malloc_conf: &[u8] =
     b"background_thread:true,dirty_decay_ms:53000,muzzy_decay_ms:57000\0";
 
 use clap::Parser;
-use melin_server::app_factory::{ExchangeAppFactory, ExchangeAppFactoryConfig};
+use melin_server::app_factory::{Factory, FactoryConfig};
 use melin_server::event_publisher;
-use melin_server::request_decoder::ExchangeRequestDecoder;
-use melin_server::response_encoder::ExchangeResponseEncoder;
+use melin_server::request_decoder::RequestDecoder;
+use melin_server::response_encoder::ResponseEncoder;
 use melin_server_runtime::server::{self, ServerConfig};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -43,7 +43,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let config = ServerConfig::parse();
 
-    let factory = ExchangeAppFactory::new(ExchangeAppFactoryConfig {
+    let factory = Factory::new(FactoryConfig {
         accounts: config.accounts,
         instruments: config.instruments,
         max_orders_per_account: config.max_orders_per_account,
@@ -54,8 +54,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     server::run(
         config,
         factory,
-        ExchangeRequestDecoder,
-        ExchangeResponseEncoder,
+        RequestDecoder,
+        ResponseEncoder,
         Some(event_publisher::run),
     )
 }

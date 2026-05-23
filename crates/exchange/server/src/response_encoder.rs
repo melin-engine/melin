@@ -1,12 +1,12 @@
 //! Trading-side [`ResponseEncoder`] implementation.
 //!
-//! Mirror of [`crate::request::ExchangeRequestDecoder`] on the
+//! Mirror of [`crate::request_decoder::RequestDecoder`] on the
 //! outbound path: maps trading-shaped output payloads
 //! (`ExecutionReport`, `QueryResponse`) to wire frames. Transport-
 //! shaped variants (`BatchEnd`, `EngineError`) are handled by the
 //! runtime directly and never reach this encoder.
 
-use melin_app::encoder::ResponseEncoder;
+use melin_app::encoder::ResponseEncoder as ResponseEncoderTrait;
 use melin_protocol::codec;
 use melin_protocol::message::ResponseKind;
 use melin_types::types::{ExecutionReport, QueryResponse};
@@ -14,11 +14,11 @@ use melin_types::types::{ExecutionReport, QueryResponse};
 /// Encoder for the trading wire protocol.
 ///
 /// Zero-sized. The runtime owns an `Arc<dyn ResponseEncoder<...>>`;
-/// constructing one is `Arc::new(ExchangeResponseEncoder)`.
+/// constructing one is `Arc::new(ResponseEncoder)`.
 #[derive(Debug, Clone, Copy)]
-pub struct ExchangeResponseEncoder;
+pub struct ResponseEncoder;
 
-impl ResponseEncoder for ExchangeResponseEncoder {
+impl ResponseEncoderTrait for ResponseEncoder {
     type Report = ExecutionReport;
     type Query = QueryResponse;
 
@@ -86,7 +86,7 @@ mod tests {
     #[test]
     fn encodes_report() {
         let mut buf = [0u8; SCRATCH];
-        let n = ExchangeResponseEncoder
+        let n = ResponseEncoder
             .encode_report(&sample_placed(), &mut buf)
             .unwrap();
         assert!(matches!(
@@ -104,7 +104,7 @@ mod tests {
             journal_sequence: 999,
         };
         let mut buf = [0u8; SCRATCH];
-        let n = ExchangeResponseEncoder.encode_query(&q, &mut buf).unwrap();
+        let n = ResponseEncoder.encode_query(&q, &mut buf).unwrap();
         assert!(matches!(
             round_trip(&buf[..n]),
             ResponseKind::StatsHeader {
@@ -129,7 +129,7 @@ mod tests {
             count: 1,
         };
         let mut buf = [0u8; SCRATCH];
-        let n = ExchangeResponseEncoder.encode_query(&q, &mut buf).unwrap();
+        let n = ResponseEncoder.encode_query(&q, &mut buf).unwrap();
         assert!(matches!(
             round_trip(&buf[..n]),
             ResponseKind::PositionSnapshot { account, count: 1, .. }
@@ -141,7 +141,7 @@ mod tests {
     fn encodes_query_request_seq_hwm() {
         let q = QueryResponse::RequestSeqHwm { hwm: 4242 };
         let mut buf = [0u8; SCRATCH];
-        let n = ExchangeResponseEncoder.encode_query(&q, &mut buf).unwrap();
+        let n = ResponseEncoder.encode_query(&q, &mut buf).unwrap();
         assert!(matches!(
             round_trip(&buf[..n]),
             ResponseKind::RequestSeqHwm { hwm: 4242 }
