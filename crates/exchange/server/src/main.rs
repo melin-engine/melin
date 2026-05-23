@@ -40,31 +40,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .with_thread_names(true)
         .init();
 
-    // Route panics through tracing so a thread that dies mid-event
-    // shows up in container logs instead of disappearing into a
-    // half-flushed stderr write. The hook fires before the default
-    // panic handler tears the thread down, so we still get the
-    // backtrace via RUST_BACKTRACE if set.
-    let prev_panic_hook = std::panic::take_hook();
-    std::panic::set_hook(Box::new(move |info| {
-        let location = info
-            .location()
-            .map(|l| format!("{}:{}:{}", l.file(), l.line(), l.column()))
-            .unwrap_or_else(|| "<unknown>".to_string());
-        let payload = info.payload();
-        let msg = if let Some(s) = payload.downcast_ref::<&'static str>() {
-            (*s).to_string()
-        } else if let Some(s) = payload.downcast_ref::<String>() {
-            s.clone()
-        } else {
-            "<non-string panic payload>".to_string()
-        };
-        let thread = std::thread::current();
-        let thread_name = thread.name().unwrap_or("<unnamed>");
-        tracing::error!(thread = thread_name, location = %location, message = %msg, "thread panicked");
-        prev_panic_hook(info);
-    }));
-
     let shutdown = Arc::new(AtomicBool::new(false));
     install_shutdown_handler(&shutdown);
 
