@@ -830,7 +830,7 @@ fn run_engine_bench(
         ..Default::default()
     };
 
-    let mut exchange = melin_engine::exchange::Exchange::with_capacity();
+    let mut exchange = melin_exchange_core::exchange::Exchange::with_capacity();
 
     // Register instruments.
     for i in 1..=num_instruments {
@@ -1241,7 +1241,7 @@ fn run_pipeline_bench(
 
     // Set up exchange with one instrument and funded account.
     let mut app = melin_server::domain::exchange_app::ServerApp(
-        melin_engine::exchange::Exchange::with_capacity(),
+        melin_exchange_core::exchange::Exchange::with_capacity(),
     );
     app.add_instrument(InstrumentSpec {
         symbol: Symbol(1),

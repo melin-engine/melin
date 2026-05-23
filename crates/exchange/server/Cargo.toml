@@ -15,12 +15,12 @@ release-tracing = ["tracing/max_level_info", "melin-server-runtime/release-traci
 ## rejection (used to isolate transport throughput from matching cost).
 ## Exactly one must be enabled. `melin-market-data` is trading-only and
 ## piggy-backs on `trading`. The skip-order-exec build still links
-## `melin-engine` — every `SubmitOrder` is bypassed by the engine's
+## `melin-exchange-core` — every `SubmitOrder` is bypassed by the
 ## `skip-order-exec` feature so the matching hot path is never
 ## exercised.
 trading = ["dep:melin-market-data", "melin-trading-server/trading"]
 skip-order-exec = [
-    "melin-engine/skip-order-exec",
+    "melin-exchange-core/skip-order-exec",
     "melin-trading-server/skip-order-exec",
     "hash-chain",
     "release-tracing",
@@ -80,7 +80,7 @@ required-features = ["skip-order-exec"]
 
 [dependencies]
 melin-app = { path = "../../core/app" }
-melin-engine = { path = "../engine" }
+melin-exchange-core = { path = "../exchange-core" }
 melin-journal = { path = "../../core/journal" }
 melin-server-runtime = { path = "../../core/server-runtime" }
 melin-trading = { path = "../trading" }

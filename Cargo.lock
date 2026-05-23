@@ -1515,7 +1515,7 @@ dependencies = [
  "melin-app",
  "melin-disruptor",
  "melin-dpdk",
- "melin-engine",
+ "melin-exchange-core",
  "melin-journal",
  "melin-protocol",
  "melin-server",
@@ -1566,7 +1566,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "melin-engine"
+name = "melin-exchange-core"
 version = "0.8.0"
 dependencies = [
  "astenn",
@@ -1642,7 +1642,7 @@ dependencies = [
  "ed25519-dalek",
  "io-uring",
  "libc",
- "melin-engine",
+ "melin-exchange-core",
  "melin-gateway-core",
  "melin-protocol",
  "melin-types",
@@ -1680,7 +1680,7 @@ dependencies = [
  "melin-client",
  "melin-disruptor",
  "melin-dpdk",
- "melin-engine",
+ "melin-exchange-core",
  "melin-journal",
  "melin-market-data",
  "melin-protocol",
@@ -1748,7 +1748,7 @@ dependencies = [
  "libc",
  "melin-app",
  "melin-disruptor",
- "melin-engine",
+ "melin-exchange-core",
  "melin-journal",
  "melin-market-data",
  "melin-protocol",

@@ -104,7 +104,7 @@ fn main() {
     // dispatch refactor lands.
     let engine = JournaledApp::<melin_server::App, melin_journal::BufferedWriter<_>>::create(
         melin_server::domain::exchange_app::ServerApp(
-            melin_engine::exchange::Exchange::with_capacity(),
+            melin_exchange_core::exchange::Exchange::with_capacity(),
         ),
         &primary_journal,
     )

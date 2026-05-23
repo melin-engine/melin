@@ -2,7 +2,7 @@
 //!
 //! These exercise the journal stage, matching stage, and combined
 //! pipeline against `TestApp` / `TestEvent` rather than any concrete
-//! business engine. They used to live in `melin-engine` only because the
+//! business engine. They used to live in `melin-exchange-core` only because the
 //! pipeline source was extracted from there; now that the pipeline lives
 //! here, the infrastructure-level tests do too.
 //!

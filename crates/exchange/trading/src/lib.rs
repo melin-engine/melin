@@ -3,7 +3,7 @@
 //! this crate knows how matching works; it just describes the shapes
 //! that flow across the network and through the journal.
 //!
-//! Extracting these out of `melin-engine` is what lets the transport +
+//! Extracting these out of `melin-exchange-core` is what lets the transport +
 //! no-op binary run the same benchmark traffic without linking the
 //! matching logic.
 

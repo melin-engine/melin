@@ -1,6 +1,6 @@
 //! `Application` impl for the trading engine.
 //!
-//! `melin-engine` owns the matching domain (`Exchange`) and knows nothing
+//! `melin-exchange-core` owns the matching domain (`Exchange`) and knows nothing
 //! about the LMAX transport pipeline. The transport's `Application`
 //! contract lives in `melin-app`, and `melin-server` is what wires the
 //! two together — so the trait impl lives here, on a thin newtype around
@@ -15,8 +15,8 @@ use std::io::{self, Read, Write};
 use std::ops::{Deref, DerefMut};
 
 use melin_app::{Application, ApplyCtx, RejectReason as TransportRejectReason};
-use melin_engine::exchange::Exchange;
-use melin_engine::snapshot as engine_snapshot;
+use melin_exchange_core::exchange::Exchange;
+use melin_exchange_core::snapshot as engine_snapshot;
 use melin_trading::trading_event::TradingEvent;
 use melin_types::types::{
     AccountId, ExecutionReport, OrderId, QueryResponse, RejectReason as EngineRejectReason, Symbol,
@@ -52,7 +52,7 @@ const _: () = assert!(size_of::<ExecutionReport>() == 64);
 /// `Application` trait impl. Exists solely so the impl can live in
 /// `melin-server` (the wiring crate) without violating the orphan rule —
 /// neither `Application` (in `melin-app`) nor `Exchange` (in
-/// `melin-engine`) is local to `melin-server`, but `ServerApp` is.
+/// `melin-exchange-core`) is local to `melin-server`, but `ServerApp` is.
 ///
 /// The inner field is `pub` because the server frequently constructs an
 /// `Exchange` directly (`Exchange::with_capacity`, `with_seed_capacity`)

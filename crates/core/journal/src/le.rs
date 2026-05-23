@@ -1,6 +1,6 @@
 //! Little-endian read/write helpers.
 //!
-//! Duplicated from `melin-engine::le` to keep the journal crate free of
+//! Duplicated from `melin-exchange-core::le` to keep the journal crate free of
 //! engine-side trading types. Phase 3 may consolidate these into a single
 //! shared utility crate if more consumers emerge.
 

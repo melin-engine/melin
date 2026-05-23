@@ -10,7 +10,7 @@ path = "src/main.rs"
 [dependencies]
 melin-gateway-core = { path = "../gateway-core" }
 melin-protocol = { path = "../protocol" }
-melin-engine = { path = "../engine" }
+melin-exchange-core = { path = "../exchange-core" }
 melin-types = { path = "../types" }
 ed25519-dalek = { workspace = true }
 toml = "1"

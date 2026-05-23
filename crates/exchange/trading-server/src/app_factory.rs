@@ -48,11 +48,11 @@ impl AppFactory for ExchangeAppFactory {
     type App = ServerApp;
 
     fn empty(&self) -> ServerApp {
-        ServerApp(melin_engine::exchange::Exchange::with_capacity())
+        ServerApp(melin_exchange_core::exchange::Exchange::with_capacity())
     }
 
     fn empty_for_seed(&self) -> ServerApp {
-        let mut app = ServerApp(melin_engine::exchange::Exchange::with_seed_capacity(
+        let mut app = ServerApp(melin_exchange_core::exchange::Exchange::with_seed_capacity(
             self.config.accounts as usize,
             self.config.instruments as usize,
         ));

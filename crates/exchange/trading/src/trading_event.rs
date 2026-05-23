@@ -675,7 +675,7 @@ const _: fn() = || {
 };
 
 // The cache-line size bound on `JournalEvent<TradingEvent>` lives in
-// `melin-engine` alongside the other InputSlot assertions — this crate
+// `melin-exchange-core` alongside the other InputSlot assertions — this crate
 // stays dependency-free of the journal framing.
 
 #[cfg(test)]

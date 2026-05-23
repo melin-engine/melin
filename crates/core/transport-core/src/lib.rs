@@ -4,7 +4,7 @@
 //! output ring), the `InputSlot<E>` / `OutputSlot<R, Q>` ring slot types, the
 //! `OutputPayload<R, Q>` envelope, and the `Pipeline<A>` / `ReplicaPipeline<A>`
 //! builders. Everything here is generic over an `A: Application` — the
-//! matching engine (`melin-engine`) is the canonical implementation.
+//! matching engine (`melin-exchange-core`) is the canonical implementation.
 //!
 //! Also owns the application-generic snapshot framing (`snapshot::{save,
 //! load}`) and the `JournaledApp<A>` lifecycle wrapper (create / recover /

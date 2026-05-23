@@ -13,7 +13,7 @@
 //! identically (halves journal size, simplifies the format).
 //!
 //! The ≤ 64-byte size bound is enforced by the concrete-`E` consumer
-//! (e.g. `melin-engine` asserts on `JournalEvent<TradingEvent>`), not
+//! (e.g. `melin-exchange-core` asserts on `JournalEvent<TradingEvent>`), not
 //! here: the bound is meaningful only when `E`'s layout is known.
 
 use melin_app::AppEvent;

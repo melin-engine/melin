@@ -71,7 +71,7 @@ name = "journal_writer_bench"
 path = "src/journal_writer_bench.rs"
 
 [dependencies]
-melin-engine = { path = "../engine" }
+melin-exchange-core = { path = "../exchange-core" }
 melin-trading = { path = "../trading" }
 melin-types = { path = "../types" }
 melin-journal = { path = "../../core/journal" }

@@ -15,7 +15,7 @@ mod tests {
     use melin_transport_core::journaled_app::{JournaledApp, JournaledAppError};
     use melin_transport_core::snapshot;
 
-    use melin_engine::exchange::Exchange;
+    use melin_exchange_core::exchange::Exchange;
     // Import the concrete newtype (not the `pub type App = ServerApp`
     // alias) so it's usable as a tuple-struct constructor in `App(...)`.
     use melin_journal::BufferedWriter;
@@ -991,7 +991,7 @@ mod tests {
     /// produce the same fee account balance after recovery.
     #[test]
     fn journal_replay_preserves_fee_schedule() {
-        use melin_engine::account::FEE_ACCOUNT;
+        use melin_exchange_core::account::FEE_ACCOUNT;
 
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("fees.journal");

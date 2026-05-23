@@ -4,9 +4,9 @@
 //! `melin-server-runtime` pipeline:
 //!
 //! - [`exchange_app::ServerApp`] — the `Application`-impl newtype
-//!   wrapping `melin_engine::exchange::Exchange` (orphan-rule
+//!   wrapping `melin_exchange_core::exchange::Exchange` (orphan-rule
 //!   workaround: the trait lives in `melin-app`, the engine in
-//!   `melin-engine`, so the impl can only attach here).
+//!   `melin-exchange-core`, so the impl can only attach here).
 //! - [`app_factory::ExchangeAppFactory`] — `AppFactory` impl that
 //!   builds empty / seed-ready exchanges and yields the bulk-seed
 //!   events the runtime journals on first start.

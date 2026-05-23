@@ -908,7 +908,7 @@ mod tests {
 
     #[test]
     fn aggressive_orders_produce_fills() {
-        use melin_engine::exchange::Exchange;
+        use melin_exchange_core::exchange::Exchange;
         use melin_types::types::{CurrencyId, ExecutionReport, InstrumentSpec};
 
         let config = GeneratorConfig {

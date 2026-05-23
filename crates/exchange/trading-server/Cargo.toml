@@ -11,7 +11,7 @@ trading = ["dep:melin-market-data"]
 ## Transport-only mode — short-circuits matching. Mutually exclusive
 ## with `trading` at the workspace level. Used by the replication
 ## bench binary.
-skip-order-exec = ["melin-engine/skip-order-exec"]
+skip-order-exec = ["melin-exchange-core/skip-order-exec"]
 ## Per-stage histograms. Passthrough — `exchange_app.rs` toggles
 ## branches in `Application` impl methods based on this flag.
 latency-trace = ["melin-transport-core/latency-trace"]
@@ -19,7 +19,7 @@ latency-trace = ["melin-transport-core/latency-trace"]
 [dependencies]
 melin-app = { path = "../../core/app" }
 melin-disruptor = { path = "../../core/disruptor" }
-melin-engine = { path = "../engine" }
+melin-exchange-core = { path = "../exchange-core" }
 melin-journal = { path = "../../core/journal" }
 melin-protocol = { path = "../protocol" }
 melin-wire-protocol = { path = "../../core/wire-protocol" }

@@ -21,7 +21,7 @@ pub type App = domain::exchange_app::ServerApp;
 // Re-export the writer-selection enum + the generic pipeline / trace /
 // codec / replication modules at the server crate root. Bench and any
 // other downstream consumer now reach the LMAX-pipeline plumbing
-// through `melin-server` instead of through `melin-engine` — engine
+// through `melin-server` instead of through `melin-exchange-core` — engine
 // is the matching domain library, server is the wiring layer.
 /// Re-export of the journal replication module — namespaced under
 /// `journal_replication` to avoid colliding with the runtime's
