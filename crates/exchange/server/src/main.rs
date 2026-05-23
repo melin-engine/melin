@@ -25,7 +25,7 @@ pub static malloc_conf: &[u8] =
     b"background_thread:true,dirty_decay_ms:60000,muzzy_decay_ms:60000\0";
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::AtomicBool;
 
 use clap::Parser;
 use melin_server::exchange_app::ServerApp;
@@ -41,7 +41,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .init();
 
     let shutdown = Arc::new(AtomicBool::new(false));
-    install_shutdown_handler(&shutdown);
+    melin_server_runtime::process::install_shutdown_handler(&shutdown);
 
     let config = ServerConfig::parse();
     // Wire the trading-side AppFactory the runtime needs for fresh-app
@@ -82,7 +82,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     if !config.no_mlock {
-        try_lock_memory();
+        melin_server_runtime::process::try_lock_memory();
     }
 
     #[cfg(feature = "dpdk")]
@@ -111,100 +111,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             event_publisher,
             shutdown,
         )
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Memory locking
-// ---------------------------------------------------------------------------
-
-/// Pin the entire process address space into RAM with `mlockall`.
-///
-/// Without locking, the kernel can fault out engine pages on memory
-/// pressure, surfacing as 100µs–10ms tail spikes the next time the
-/// matching thread touches the evicted page. Pinning is best-effort:
-/// it requires `CAP_IPC_LOCK` (or root) and `RLIMIT_MEMLOCK` raised
-/// to a value larger than the resident set. We raise the rlimit
-/// ourselves to [`libc::RLIM_INFINITY`] before calling `mlockall`,
-/// but the rlimit raise itself needs `CAP_SYS_RESOURCE` (also held
-/// by root) to go above the hard ceiling. On a non-privileged dev
-/// run we log a warning and continue — the server still works,
-/// just without the tail-latency benefit. Use `--no-mlock` to skip
-/// this entirely without the warning noise.
-fn try_lock_memory() {
-    // Raise RLIMIT_MEMLOCK so mlockall isn't artificially capped at
-    // 64 KiB (typical default). EPERM here is non-fatal: the existing
-    // hard limit may already be high enough, in which case mlockall
-    // will succeed regardless.
-    let unlim = libc::rlimit {
-        rlim_cur: libc::RLIM_INFINITY,
-        rlim_max: libc::RLIM_INFINITY,
-    };
-    let setrlimit_rc = unsafe { libc::setrlimit(libc::RLIMIT_MEMLOCK, &unlim) };
-    if setrlimit_rc != 0 {
-        let err = std::io::Error::last_os_error();
-        tracing::warn!(
-            error = %err,
-            "could not raise RLIMIT_MEMLOCK; mlockall may fail or be capped"
-        );
-    }
-
-    // Lock current AND future mappings — covers heap growth, mmap'd
-    // journal regions, and lazily-faulted stacks of threads spawned
-    // later. ONFAULT (lock pages only when they're first accessed)
-    // would be cheaper but defeats the purpose: we want the whole
-    // working set resident before any latency-sensitive work runs.
-    let rc = unsafe { libc::mlockall(libc::MCL_CURRENT | libc::MCL_FUTURE) };
-    if rc == 0 {
-        tracing::info!("mlockall(MCL_CURRENT | MCL_FUTURE) succeeded");
-    } else {
-        let err = std::io::Error::last_os_error();
-        tracing::warn!(
-            error = %err,
-            "mlockall failed; running without memory lock — tail latency may be affected. \
-             Pass --no-mlock to suppress this warning."
-        );
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Signal handling
-// ---------------------------------------------------------------------------
-
-/// Pointer to the shared shutdown flag, set once before signals can fire.
-/// `AtomicUsize` stores the raw pointer as an integer — signal-safe.
-static SHUTDOWN_PTR: AtomicUsize = AtomicUsize::new(0);
-
-/// Signal handler for SIGINT/SIGTERM. Sets the shutdown flag.
-/// Second signal force-exits (user is impatient).
-extern "C" fn signal_handler(_sig: libc::c_int) {
-    let ptr = SHUTDOWN_PTR.load(Ordering::Relaxed);
-    if ptr != 0 {
-        let flag = unsafe { &*(ptr as *const AtomicBool) };
-        if flag.swap(true, Ordering::Relaxed) {
-            // Already set — second signal. Force exit immediately.
-            // Use _exit (not std::process::exit) because atexit handlers
-            // and stdio flushes are not signal-safe and can deadlock.
-            unsafe { libc::_exit(1) };
-        }
-    }
-}
-
-/// Install SIGINT/SIGTERM handlers that flip `shutdown` on first signal
-/// and force-exit on the second. The caller must keep the `Arc` alive
-/// for the program's lifetime — we publish its pointer to a signal-safe
-/// static so the handler can reach the flag.
-fn install_shutdown_handler(shutdown: &Arc<AtomicBool>) {
-    SHUTDOWN_PTR.store(Arc::as_ptr(shutdown) as usize, Ordering::Relaxed);
-    unsafe {
-        libc::signal(
-            libc::SIGINT,
-            signal_handler as *const () as libc::sighandler_t,
-        );
-        libc::signal(
-            libc::SIGTERM,
-            signal_handler as *const () as libc::sighandler_t,
-        );
     }
 }
 

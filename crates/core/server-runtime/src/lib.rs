@@ -14,6 +14,7 @@
 
 pub mod admin;
 pub mod durability_policy;
+pub mod process;
 pub mod reader;
 pub mod replication;
 pub mod response;
