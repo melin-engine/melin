@@ -209,6 +209,110 @@ pub fn catch_up_from_journal_with<E: AppEvent>(
     Ok(CatchUpResult::Ok(end_sequence))
 }
 
+/// Transfer a snapshot to a replica, then catch up from journal.
+///
+/// Reads the snapshot file, validates its header (magic, sequence,
+/// chain hash), and streams the bytes as `NeedSnapshot → SnapshotBegin
+/// → SnapshotChunk* → SnapshotEnd → StreamStart` followed by journal
+/// catch-up from the snapshot's sequence.
+///
+/// `publisher` is called for each encoded control/chunk frame. The TCP
+/// path passes `write_all+flush`; the DPDK path passes
+/// `queue_send+poll`.
+pub fn snapshot_transfer_with<E: AppEvent>(
+    journal_path: &std::path::Path,
+    genesis_entry: &[u8],
+    publisher: CatchUpPublisher<'_>,
+    shutdown: &AtomicBool,
+) -> io::Result<CatchUpResult> {
+    use super::protocol::{
+        encode_need_snapshot, encode_snapshot_begin, encode_snapshot_chunk, encode_snapshot_end,
+        encode_stream_start,
+    };
+
+    let snap_path = journal_path.with_extension("snapshot");
+    if !snap_path.exists() {
+        return Err(io::Error::other(
+            "snapshot transfer required but no snapshot available \
+             — set --snapshot-interval-ms to a non-zero value so the shadow exchange writes snapshots",
+        ));
+    }
+
+    let mut send_buf = Vec::with_capacity(64 * 1024 + 128);
+
+    // Send NeedSnapshot.
+    encode_need_snapshot(&mut send_buf);
+    publisher(&send_buf)?;
+    send_buf.clear();
+
+    // Read and validate snapshot.
+    let snap_data = std::fs::read(&snap_path)
+        .map_err(|e| io::Error::other(format!("read snapshot {}: {e}", snap_path.display())))?;
+    if snap_data.len() < 48 {
+        return Err(io::Error::other("snapshot file too small for header"));
+    }
+    let magic = u32::from_le_bytes(
+        snap_data[0..4]
+            .try_into()
+            .expect("bounds checked: snap_data has at least 48 bytes"),
+    );
+    if magic != 0x534E_4150 {
+        return Err(io::Error::other(format!(
+            "snapshot file has invalid magic: {magic:#x} (expected 0x534e4150)"
+        )));
+    }
+    let snap_sequence = u64::from_le_bytes(
+        snap_data[8..16]
+            .try_into()
+            .expect("bounds checked: snap_data has at least 48 bytes"),
+    );
+    let mut snap_chain_hash = [0u8; 32];
+    snap_chain_hash.copy_from_slice(&snap_data[16..48]);
+    let snap_len = snap_data.len() as u64;
+
+    info!(
+        snap_sequence,
+        snap_len,
+        path = %snap_path.display(),
+        "transferring snapshot to replica"
+    );
+
+    // Send SnapshotBegin.
+    encode_snapshot_begin(snap_len, snap_sequence, &snap_chain_hash, &mut send_buf);
+    publisher(&send_buf)?;
+    send_buf.clear();
+
+    // Stream snapshot in 64 KiB chunks.
+    const CHUNK_SIZE: usize = 64 * 1024;
+    let mut offset = 0;
+    while offset < snap_data.len() {
+        if shutdown.load(Ordering::Relaxed) {
+            return Ok(CatchUpResult::Ok(snap_sequence));
+        }
+        let end = (offset + CHUNK_SIZE).min(snap_data.len());
+        encode_snapshot_chunk(&snap_data[offset..end], &mut send_buf);
+        publisher(&send_buf)?;
+        send_buf.clear();
+        offset = end;
+    }
+
+    // Send SnapshotEnd with CRC32C.
+    let transfer_crc = crc32c::crc32c(&snap_data);
+    encode_snapshot_end(transfer_crc, &mut send_buf);
+    publisher(&send_buf)?;
+    send_buf.clear();
+
+    info!(snap_sequence, "snapshot transfer complete");
+
+    // Send StreamStart so the replica can set up its journal.
+    encode_stream_start(snap_sequence, genesis_entry, &mut send_buf);
+    publisher(&send_buf)?;
+    send_buf.clear();
+
+    // Catch up from the snapshot's sequence.
+    catch_up_from_journal_with::<E>(journal_path, snap_sequence, publisher, shutdown)
+}
+
 /// Thin wrapper around [`catch_up_from_journal_with`] that ships
 /// frames over a TCP stream.
 pub fn catch_up_from_journal<E: AppEvent>(

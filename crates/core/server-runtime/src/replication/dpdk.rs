@@ -28,12 +28,11 @@ use super::{
     update_dual_replication_cursor,
 };
 use melin_transport_core::replication::catchup::{
-    can_catch_up_from_journal, discover_journal_files,
+    can_catch_up_from_journal, catch_up_from_journal_with, snapshot_transfer_with,
 };
 use melin_transport_core::replication::protocol::{
     Ack, Handshake, MAX_CONTROL_FRAME, MAX_DATA_FRAME, PrimaryMessage, ReplicaMessage,
     decode_primary_message, decode_replica_message, encode_ack, encode_handshake, encode_heartbeat,
-    encode_need_snapshot, encode_snapshot_begin, encode_snapshot_chunk, encode_snapshot_end,
     encode_stream_start,
 };
 
@@ -389,63 +388,65 @@ impl<A: Application> DpdkReplicationDriver<A> {
 
                                     compact_recv_buf(&mut slot.recv_buf, frame_end);
 
-                                    if can_catch_up {
-                                        // Send StreamStart, then catch up from journal files.
+                                    // DPDK publisher: queue_send + poll to keep
+                                    // smoltcp timers alive during bulk transfer.
+                                    let mut dpdk_publish = |buf: &[u8]| -> std::io::Result<()> {
+                                        loop {
+                                            if transport.queue_send(handle, buf) {
+                                                break;
+                                            }
+                                            transport.poll();
+                                            if !transport.is_active(handle) {
+                                                return Err(std::io::Error::other(
+                                                    "replica disconnected during send (TX backpressure)",
+                                                ));
+                                            }
+                                        }
+                                        transport.poll();
+                                        Ok(())
+                                    };
+
+                                    let catchup_err = if can_catch_up {
                                         slot.send_buf.clear();
                                         encode_stream_start(
                                             h.last_sequence,
                                             genesis_entry,
                                             &mut slot.send_buf,
                                         );
-                                        transport.queue_send(handle, &slot.send_buf);
-                                        slot.send_buf.clear();
-
-                                        // Journal catch-up via DPDK transport.
-                                        if let Err(e) = catch_up_from_journal_dpdk::<A>(
-                                            journal_path,
-                                            h.last_sequence,
-                                            handle,
-                                            transport,
-                                            &mut slot.send_buf,
-                                            shutdown,
-                                        ) {
-                                            warn!(slot = slot_idx, error = %e, "journal catch-up failed — disconnecting");
-                                            transport.close(handle);
-                                            slot.state = SlotState::Idle;
-                                            slot.recv_buf.clear();
-                                            metrics.catching_up[slot_idx]
-                                                .store(false, Ordering::Relaxed);
-                                            replicas_connected.fetch_sub(1, Ordering::Release);
-                                            if replicas_connected.load(Ordering::Relaxed) == 0 {
-                                                replication_cursor
-                                                    .store(u64::MAX, Ordering::Release);
-                                            }
-                                            continue;
-                                        }
+                                        dpdk_publish(&slot.send_buf)
+                                            .and_then(|()| {
+                                                catch_up_from_journal_with::<A::Event>(
+                                                    journal_path,
+                                                    h.last_sequence,
+                                                    &mut dpdk_publish,
+                                                    shutdown,
+                                                )
+                                                .map(|_| ())
+                                            })
+                                            .err()
                                     } else {
-                                        // Replica's state predates all journal archives.
-                                        // Transfer a snapshot, then catch up.
-                                        if let Err(e) = snapshot_transfer_dpdk::<A>(
+                                        snapshot_transfer_with::<A::Event>(
                                             journal_path,
                                             genesis_entry,
-                                            handle,
-                                            transport,
-                                            &mut slot.send_buf,
+                                            &mut dpdk_publish,
                                             shutdown,
-                                        ) {
-                                            warn!(slot = slot_idx, error = %e, "snapshot transfer failed — disconnecting");
-                                            transport.close(handle);
-                                            slot.state = SlotState::Idle;
-                                            slot.recv_buf.clear();
-                                            metrics.catching_up[slot_idx]
-                                                .store(false, Ordering::Relaxed);
-                                            replicas_connected.fetch_sub(1, Ordering::Release);
-                                            if replicas_connected.load(Ordering::Relaxed) == 0 {
-                                                replication_cursor
-                                                    .store(u64::MAX, Ordering::Release);
-                                            }
-                                            continue;
+                                        )
+                                        .map(|_| ())
+                                        .err()
+                                    };
+
+                                    if let Some(e) = catchup_err {
+                                        warn!(slot = slot_idx, error = %e, "catch-up/snapshot failed — disconnecting");
+                                        transport.close(handle);
+                                        slot.state = SlotState::Idle;
+                                        slot.recv_buf.clear();
+                                        metrics.catching_up[slot_idx]
+                                            .store(false, Ordering::Relaxed);
+                                        replicas_connected.fetch_sub(1, Ordering::Release);
+                                        if replicas_connected.load(Ordering::Relaxed) == 0 {
+                                            replication_cursor.store(u64::MAX, Ordering::Release);
                                         }
+                                        continue;
                                     }
 
                                     // Set cursor to this replica's acked position.
@@ -715,245 +716,6 @@ impl<A: Application> DpdkReplicationDriver<A> {
 
         any_active
     }
-}
-
-/// DPDK-adapted journal catch-up: reads journal files (journal-codec
-/// bytes), decodes them into `InputSlot` records, and sends them as
-/// `InputBatch` frames via the DPDK transport. Periodically polls the
-/// transport to flush TX and keep smoltcp's timers alive.
-fn catch_up_from_journal_dpdk<A: Application>(
-    journal_path: &std::path::Path,
-    last_sequence: u64,
-    handle: melin_dpdk::SocketHandle,
-    transport: &mut melin_dpdk::DpdkTransport,
-    send_buf: &mut Vec<u8>,
-    shutdown: &AtomicBool,
-) -> std::io::Result<()> {
-    use melin_journal::RawJournalScanner;
-
-    let files = discover_journal_files(journal_path);
-    if files.is_empty() {
-        return Ok(());
-    }
-
-    // Find the first file that contains entries after last_sequence.
-    let mut start_file_idx = 0;
-    if last_sequence > 0 {
-        let mut found = false;
-        for (i, path) in files.iter().enumerate().rev() {
-            let mut scanner = RawJournalScanner::open(path)
-                .map_err(|e| io::Error::other(format!("open journal {}: {e}", path.display())))?;
-            if let Some(first_seq) = scanner
-                .first_sequence()
-                .map_err(|e| io::Error::other(format!("read {}: {e}", path.display())))?
-                && first_seq <= last_sequence
-            {
-                start_file_idx = i;
-                found = true;
-                break;
-            }
-        }
-        if !found {
-            return Err(io::Error::other(
-                "catch-up failed: replica's last_sequence predates all journal files",
-            ));
-        }
-    }
-
-    let mut batch_buf = Vec::with_capacity(64 * 1024);
-    let mut end_sequence = last_sequence;
-    let mut batches_sent = 0u64;
-
-    info!(
-        last_sequence,
-        files = files.len(),
-        start_file = start_file_idx,
-        "starting journal catch-up (DPDK)"
-    );
-
-    for path in &files[start_file_idx..] {
-        if shutdown.load(Ordering::Relaxed) {
-            return Ok(());
-        }
-
-        let mut scanner = RawJournalScanner::open(path)
-            .map_err(|e| io::Error::other(format!("open journal {}: {e}", path.display())))?;
-
-        let skip_to = end_sequence.max(1);
-        scanner
-            .skip_to_after(skip_to)
-            .map_err(|e| io::Error::other(format!("skip in {}: {e}", path.display())))?;
-
-        loop {
-            if shutdown.load(Ordering::Relaxed) {
-                return Ok(());
-            }
-
-            batch_buf.clear();
-            let batch = scanner
-                .read_raw_batch(&mut batch_buf, 64 * 1024)
-                .map_err(|e| io::Error::other(format!("read {}: {e}", path.display())))?;
-
-            let Some(batch_end_seq) = batch else {
-                break;
-            };
-
-            // Decode the journal-batch bytes into InputSlots and re-encode
-            // as an InputBatch for the wire — same wire format the live
-            // streaming path uses.
-            let slots =
-                melin_transport_core::replication::protocol::decode_journal_to_input_slots::<
-                    A::Event,
-                >(&batch_buf)
-                .map_err(|e| {
-                    io::Error::other(format!(
-                        "catch-up journal decode at seq {batch_end_seq}: {e}"
-                    ))
-                })?;
-            send_buf.clear();
-            melin_transport_core::replication::protocol::encode_input_batch(&slots, send_buf);
-            // Retry-with-poll: a 64 KiB batch can fill the TX queue even
-            // after a previous poll. Spin-poll until queue_send accepts
-            // the batch (or the replica drops). This is bounded — TX
-            // drains as fast as smoltcp can dispatch segments.
-            loop {
-                if shutdown.load(Ordering::Relaxed) {
-                    return Ok(());
-                }
-                if transport.queue_send(handle, send_buf) {
-                    break;
-                }
-                transport.poll();
-                if !transport.is_active(handle) {
-                    return Err(io::Error::other(
-                        "replica disconnected during journal catch-up (TX backpressure)",
-                    ));
-                }
-            }
-            // Flush TX periodically to keep smoltcp and the NIC flowing.
-            transport.poll();
-
-            if !transport.is_active(handle) {
-                return Err(io::Error::other(
-                    "replica disconnected during journal catch-up",
-                ));
-            }
-
-            end_sequence = batch_end_seq;
-            batches_sent += 1;
-        }
-    }
-
-    info!(
-        end_sequence,
-        batches_sent, "journal catch-up complete (DPDK)"
-    );
-    Ok(())
-}
-
-/// Transfer a snapshot to a replica via DPDK, then catch up from journals.
-/// Sends: NeedSnapshot → SnapshotBegin → SnapshotChunk* → SnapshotEnd →
-/// StreamStart → InputBatch* (catch-up).
-fn snapshot_transfer_dpdk<A: Application>(
-    journal_path: &std::path::Path,
-    genesis_entry: &[u8],
-    handle: melin_dpdk::SocketHandle,
-    transport: &mut melin_dpdk::DpdkTransport,
-    send_buf: &mut Vec<u8>,
-    shutdown: &AtomicBool,
-) -> std::io::Result<()> {
-    let snap_path = journal_path.with_extension("snapshot");
-    if !snap_path.exists() {
-        return Err(io::Error::other(
-            "snapshot transfer required but no snapshot available \
-             — set --snapshot-interval-ms to a non-zero value so the shadow exchange writes snapshots",
-        ));
-    }
-
-    // Send NeedSnapshot.
-    send_buf.clear();
-    encode_need_snapshot(send_buf);
-    transport.queue_send(handle, send_buf);
-    transport.poll();
-
-    // Read and validate snapshot.
-    let snap_data = std::fs::read(&snap_path)
-        .map_err(|e| io::Error::other(format!("read snapshot {}: {e}", snap_path.display())))?;
-    if snap_data.len() < 48 {
-        return Err(io::Error::other("snapshot file too small for header"));
-    }
-    let magic = u32::from_le_bytes(
-        snap_data[0..4]
-            .try_into()
-            .expect("bounds checked: snap_data has at least 48 bytes"),
-    );
-    if magic != 0x534E_4150 {
-        return Err(io::Error::other(format!(
-            "snapshot file has invalid magic: {magic:#x} (expected 0x534e4150)"
-        )));
-    }
-    let snap_sequence = u64::from_le_bytes(
-        snap_data[8..16]
-            .try_into()
-            .expect("bounds checked: snap_data has at least 48 bytes"),
-    );
-    let mut snap_chain_hash = [0u8; 32];
-    snap_chain_hash.copy_from_slice(&snap_data[16..48]);
-    let snap_len = snap_data.len() as u64;
-
-    info!(snap_sequence, snap_len, path = %snap_path.display(), "transferring snapshot to replica (DPDK)");
-
-    // Send SnapshotBegin.
-    send_buf.clear();
-    encode_snapshot_begin(snap_len, snap_sequence, &snap_chain_hash, send_buf);
-    transport.queue_send(handle, send_buf);
-    transport.poll();
-
-    // Stream snapshot in 64 KiB chunks.
-    const CHUNK_SIZE: usize = 64 * 1024;
-    let mut offset = 0;
-    while offset < snap_data.len() {
-        let end = (offset + CHUNK_SIZE).min(snap_data.len());
-        send_buf.clear();
-        encode_snapshot_chunk(&snap_data[offset..end], send_buf);
-        transport.queue_send(handle, send_buf);
-        // Flush periodically to avoid overwhelming the TX queue.
-        if offset % (CHUNK_SIZE * 8) == 0 {
-            transport.poll();
-            if !transport.is_active(handle) {
-                return Err(io::Error::other(
-                    "replica disconnected during snapshot transfer",
-                ));
-            }
-        }
-        offset = end;
-    }
-    transport.poll();
-
-    // Send SnapshotEnd with CRC32C.
-    let transfer_crc = crc32c::crc32c(&snap_data);
-    send_buf.clear();
-    encode_snapshot_end(transfer_crc, send_buf);
-    transport.queue_send(handle, send_buf);
-    transport.poll();
-
-    info!(snap_sequence, "snapshot transfer complete (DPDK)");
-
-    // Send StreamStart so the replica can set up its journal.
-    send_buf.clear();
-    encode_stream_start(snap_sequence, genesis_entry, send_buf);
-    transport.queue_send(handle, send_buf);
-    transport.poll();
-
-    // Catch up from the snapshot's sequence using the current journal.
-    catch_up_from_journal_dpdk::<A>(
-        journal_path,
-        snap_sequence,
-        handle,
-        transport,
-        send_buf,
-        shutdown,
-    )
 }
 
 /// DPDK variant of the replication receiver. Uses a `DpdkTransport` (smoltcp)

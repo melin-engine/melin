@@ -17,11 +17,10 @@ use super::auth::authenticate_replica;
 use super::{ReplicationMetrics, update_dual_replication_cursor};
 use melin_app::Application;
 use melin_transport_core::replication::catchup::{
-    CatchUpResult, can_catch_up_from_journal, catch_up_from_journal,
+    CatchUpResult, can_catch_up_from_journal, catch_up_from_journal, snapshot_transfer_with,
 };
 use melin_transport_core::replication::protocol::{
     MAX_CONTROL_FRAME, ReplicaMessage, decode_replica_message, encode_heartbeat,
-    encode_need_snapshot, encode_snapshot_begin, encode_snapshot_chunk, encode_snapshot_end,
     encode_stream_start, read_frame,
 };
 
@@ -436,127 +435,36 @@ fn handle_replica_connection<A: Application>(
     // the journals are too old.
     let can_catch_up = can_catch_up_from_journal(journal_path, handshake.last_sequence)?;
 
+    let mut publish = |buf: &[u8]| -> io::Result<()> {
+        writer.write_all(buf)?;
+        writer.flush()
+    };
+
     let catchup_end = if can_catch_up {
-        // Normal path: send StreamStart, then catch up from journal files.
         encode_stream_start(handshake.last_sequence, genesis_entry, &mut send_buf);
-        writer.write_all(&send_buf)?;
-        writer.flush()?;
+        publish(&send_buf)?;
         send_buf.clear();
 
-        let catchup_result = catch_up_from_journal::<A::Event>(
+        match catch_up_from_journal::<A::Event>(
             journal_path,
             handshake.last_sequence,
             &mut writer,
             shutdown,
-        )?;
-        match catchup_result {
+        )? {
             CatchUpResult::Ok(end) => end,
             CatchUpResult::NeedSnapshot => {
-                // Shouldn't happen — we already checked. But handle gracefully.
                 return Err(io::Error::other("catch-up failed unexpectedly after probe"));
             }
         }
     } else {
-        // Replica's state predates all journal archives. Transfer a snapshot.
-        let snap_path = journal_path.with_extension("snapshot");
-        if !snap_path.exists() {
-            error!(
-                "snapshot transfer requested but no snapshot file at {}",
-                snap_path.display()
-            );
-            return Err(io::Error::other(
-                "snapshot transfer required but no snapshot available \
-                 — set --snapshot-interval-ms to a non-zero value so the shadow exchange writes snapshots",
-            ));
-        }
-
-        // Send NeedSnapshot to tell the replica to prepare.
-        encode_need_snapshot(&mut send_buf);
-        writer.write_all(&send_buf)?;
-        writer.flush()?;
-        send_buf.clear();
-
-        // Read snapshot file and validate magic before transferring.
-        let snap_data = std::fs::read(&snap_path)
-            .map_err(|e| io::Error::other(format!("read snapshot {}: {e}", snap_path.display())))?;
-        let snap_len = snap_data.len() as u64;
-
-        // Parse header: magic(4) + version(2) + reserved(2) + sequence(8) + chain_hash(32)
-        if snap_data.len() < 48 {
-            return Err(io::Error::other("snapshot file too small for header"));
-        }
-        // Validate snapshot magic (0x534E4150 = "SNAP") before transfer.
-        let magic = u32::from_le_bytes(
-            snap_data[0..4]
-                .try_into()
-                .expect("bounds checked: snap_data has at least 48 bytes"),
-        );
-        if magic != 0x534E_4150 {
-            return Err(io::Error::other(format!(
-                "snapshot file has invalid magic: {magic:#x} (expected 0x534e4150)"
-            )));
-        }
-        let snap_sequence = u64::from_le_bytes(
-            snap_data[8..16]
-                .try_into()
-                .expect("bounds checked: snap_data has at least 48 bytes"),
-        );
-        let mut snap_chain_hash = [0u8; 32];
-        snap_chain_hash.copy_from_slice(&snap_data[16..48]);
-
-        info!(
-            snap_sequence,
-            snap_len,
-            path = %snap_path.display(),
-            "transferring snapshot to replica"
-        );
-
-        // Send SnapshotBegin.
-        encode_snapshot_begin(snap_len, snap_sequence, &snap_chain_hash, &mut send_buf);
-        writer.write_all(&send_buf)?;
-        writer.flush()?;
-        send_buf.clear();
-
-        // Stream snapshot in 64 KiB chunks.
-        const CHUNK_SIZE: usize = 64 * 1024;
-        let mut offset = 0;
-        while offset < snap_data.len() {
-            let end = (offset + CHUNK_SIZE).min(snap_data.len());
-            encode_snapshot_chunk(&snap_data[offset..end], &mut send_buf);
-            writer.write_all(&send_buf)?;
-            send_buf.clear();
-            offset = end;
-        }
-        writer.flush()?;
-
-        // Send SnapshotEnd with CRC32C of the entire file.
-        // The snapshot file already has a CRC at the end, but we
-        // compute one over the entire file for transfer integrity.
-        let transfer_crc = crc32c::crc32c(&snap_data);
-        encode_snapshot_end(transfer_crc, &mut send_buf);
-        writer.write_all(&send_buf)?;
-        writer.flush()?;
-        send_buf.clear();
-
-        info!(snap_sequence, "snapshot transfer complete");
-
-        // Send StreamStart so the replica can set up its journal after
-        // loading the snapshot. The start_sequence is the snapshot's
-        // sequence — catch-up will send entries after this.
-        encode_stream_start(snap_sequence, genesis_entry, &mut send_buf);
-        writer.write_all(&send_buf)?;
-        writer.flush()?;
-        send_buf.clear();
-
-        // Catch up from the snapshot's sequence using the current journal.
-        // The current journal starts at snap_sequence+1 (rotation boundary).
-        let post_snap_result =
-            catch_up_from_journal::<A::Event>(journal_path, snap_sequence, &mut writer, shutdown)?;
-        match post_snap_result {
+        match snapshot_transfer_with::<A::Event>(
+            journal_path,
+            genesis_entry,
+            &mut publish,
+            shutdown,
+        )? {
             CatchUpResult::Ok(end) => end,
             CatchUpResult::NeedSnapshot => {
-                // This shouldn't happen — we just transferred a snapshot
-                // and the current journal should cover from snap_sequence.
                 return Err(io::Error::other(
                     "catch-up failed even after snapshot transfer",
                 ));
