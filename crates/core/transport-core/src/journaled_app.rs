@@ -158,6 +158,12 @@ impl<A: Application, W: JournalWrite<A::Event>> JournaledApp<A, W> {
         let archives = melin_journal::segment::list_archives(journal_path)?;
 
         let has_snapshot = snapshot.is_some();
+        // Chain hash carried in the snapshot but not currently cross-
+        // checked against the journal during recovery. Re-enabling the
+        // compare is viable now that FsyncState guarantees the shadow
+        // publishes journal-space sequences — requires exposing the
+        // reader's chain hash at control-entry boundaries (Checkpoint /
+        // GenesisHash) which next_entry processes internally.
         let (snap_sequence, _snap_chain_hash) = snapshot.unwrap_or((0, [0u8; 32]));
 
         let mut reports: Vec<A::Report> = Vec::new();
