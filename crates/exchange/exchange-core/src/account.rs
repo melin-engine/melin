@@ -211,11 +211,10 @@ impl AccountManager {
 
     /// Create an AccountManager with the balances HashMap pre-sized for a
     /// known bulk-seed workload. `balance_capacity` should be the expected
-    /// total number of `(account, currency)` pairs after seeding completes
-    /// — typically `num_accounts × num_instruments × 2` for the bench
+    /// total number of `(account, currency)` pairs after seeding completes.
+    /// Typically `num_accounts × num_instruments × 2` for the bench
     /// `ProvisionAccount` flow which deposits both base and quote per
-    /// instrument. Pre-sizing eliminates the multi-hundred-ms rehash
-    /// stalls that otherwise show up in seed-phase outliers.
+    /// instrument.
     pub fn with_balance_capacity(balance_capacity: usize) -> Self {
         Self {
             balances: HashMap4::with_capacity_and_hasher(balance_capacity, Default::default()),

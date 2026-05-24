@@ -55,8 +55,8 @@ const _: () = assert!(size_of::<ExecutionReport>() == 64);
 /// `melin-exchange-core`) is local to `melin-server`, but `ServerApp` is.
 ///
 /// The inner field is `pub` because the server frequently constructs an
-/// `Exchange` directly (`Exchange::with_capacity`, `with_seed_capacity`)
-/// and wraps it; making the wrap explicit at every construction site is
+/// `Exchange` directly (`Exchange::with_capacity`) and wraps it; making
+/// the wrap explicit at every construction site is
 /// cheaper than introducing a parallel set of constructors here.
 pub struct ServerApp(pub Exchange);
 

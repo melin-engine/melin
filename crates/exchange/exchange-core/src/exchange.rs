@@ -71,7 +71,7 @@ pub struct Exchange {
     /// feature pushes a task; the substrate alone never schedules anything.
     scheduled_tasks: ScheduledTaskHeap,
     /// Pre-allocated empty `OrderBook`s, populated by
-    /// [`Self::with_seed_capacity`] and indexed by symbol. When
+    /// [`Self::prefault_seed`] and indexed by symbol. When
     /// `add_instrument` runs on the matching thread, it takes the book
     /// from this pool instead of allocating a fresh one — avoiding the
     /// 5–11 ms first-touch + mlock spike that would otherwise show up
@@ -262,56 +262,19 @@ impl Exchange {
         }
     }
 
-    /// Create an Exchange pre-sized for a known bulk-seed workload.
+    /// Pre-allocate order books for a known bulk-seed workload.
     ///
-    /// `num_accounts` and `num_instruments` are the seed counts. Each
-    /// `ProvisionAccount` event creates 2 balance entries per instrument
-    /// (base + quote), so the AccountManager's balance HashMap is sized
-    /// to `num_accounts × num_instruments × 2`. Without this, seeding
-    /// 100K accounts × 100 instruments hits multi-hundred-ms rehash
-    /// stalls as the map grows — visible in T1's seed-phase outlier
-    /// log as `matching execute outlier elapsed_us=1146403` near the
-    /// end of the seed phase.
-    ///
-    /// Falls back to [`Self::with_capacity`]'s production defaults for
-    /// the other collections (instruments, live_order_ids, order_counts).
-    pub fn with_seed_capacity(num_accounts: usize, num_instruments: usize) -> Self {
-        let balance_capacity = num_accounts
-            .saturating_mul(num_instruments)
-            .saturating_mul(2);
-        // Pre-allocate one OrderBook per expected instrument, indexed by
-        // symbol. AddInstrument on the matching thread pulls from this
-        // pool instead of allocating fresh — see the field doc on
-        // `instrument_pool`. Symbol convention is `Symbol(0)..Symbol(N-1)`
-        // (matches the bench seed); off-pattern symbols fall back to fresh
-        // allocation in `add_instrument`.
-        let instrument_pool: Vec<Option<OrderBook>> = (0..num_instruments)
+    /// Populates the instrument pool with one `OrderBook` per expected
+    /// instrument (indexed by symbol). `add_instrument` pulls from
+    /// this pool instead of allocating fresh, avoiding the 5-11 ms
+    /// first-touch + mlock spike during seed (matching thread runs
+    /// under MCL_FUTURE so any new allocation faults thousands of
+    /// pages at once).
+    pub fn prefault_seed(&mut self, num_instruments: usize) {
+        self.instruments.reserve(num_instruments.max(64));
+        self.instrument_pool = (0..num_instruments)
             .map(|i| Some(OrderBook::with_capacity(Symbol(i as u32))))
             .collect();
-        Self {
-            instruments: Vec::with_capacity(num_instruments.max(64)),
-            accounts: AccountManager::with_balance_capacity(balance_capacity),
-            live_order_ids: FxHashSet::with_capacity_and_hasher(1_000_000, Default::default()),
-            order_counts: HashMap4::with_capacity_and_hasher(
-                num_accounts.max(1_000_000),
-                Default::default(),
-            ),
-            key_hwm: HashMap::default(),
-            scheduled_tasks: ScheduledTaskHeap::new(),
-            instrument_pool,
-            presized: true,
-            max_open_orders_per_account: DEFAULT_MAX_OPEN_ORDERS_PER_ACCOUNT,
-            max_orders_per_second: DEFAULT_MAX_ORDERS_PER_SECOND,
-            max_orders_burst: DEFAULT_MAX_ORDERS_BURST,
-            // Match `order_counts` sizing here too.
-            order_buckets: HashMap4::with_capacity_and_hasher(
-                num_accounts.max(1_000_000),
-                Default::default(),
-            ),
-            current_event_ts_ns: 0,
-            scratch_consumed: Vec::with_capacity(64),
-            scratch_freed: Vec::with_capacity(64),
-        }
     }
 
     /// Reconstruct from pre-built parts (used by snapshot restore).

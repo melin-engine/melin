@@ -2661,10 +2661,14 @@ where
         JournaledApp::<A, W>::from_parts(app, writer)
     } else if journal_exists {
         info!(writer_mode = %writer_mode, "recovering from journal");
-        JournaledApp::<A, W>::recover(factory.empty_for_seed(), &config.journal)?
+        let mut app = factory.empty();
+        factory.prefault(&mut app);
+        JournaledApp::<A, W>::recover(app, &config.journal)?
     } else {
         info!(writer_mode = %writer_mode, "creating new journal");
-        JournaledApp::<A, W>::create(factory.empty_for_seed(), &config.journal)?
+        let mut app = factory.empty();
+        factory.prefault(&mut app);
+        JournaledApp::<A, W>::create(app, &config.journal)?
     };
 
     let needs_seeding = !journal_exists;

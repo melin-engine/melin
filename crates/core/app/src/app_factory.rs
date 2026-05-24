@@ -1,19 +1,14 @@
-//! Application construction + bulk-seed seam.
+//! Application construction, pre-allocation, and operator policy.
 //!
-//! The server runtime needs to construct application instances in
-//! several contexts: a fresh primary at startup, a replica preparing
-//! to receive a snapshot transfer, a replica catching up from genesis
-//! via journal replay. All three want a clean `A`, but only the
-//! "fresh primary at startup" path also publishes bulk-seed events
-//! that the matching stage applies and the journal stage persists —
-//! so replicas converge on the same state via standard journal
-//! replay rather than via parallel out-of-band construction.
-//!
-//! Trading apps seed accounts and instruments. A different
-//! application might seed nothing, or seed a currency table, or
-//! initialize a ledger schema. This trait is the seam — the runtime
-//! drives the construction and publishes whatever the factory hands
-//! it, never touching application-shaped event variants directly.
+//! The server runtime constructs application instances in several
+//! contexts: a fresh primary at startup, a replica preparing to
+//! receive a snapshot transfer, a replica catching up from genesis
+//! via journal replay, and the shadow stage (which maintains a
+//! parallel copy for snapshotting). All share [`AppFactory::empty`].
+//! The primary startup path additionally calls
+//! [`AppFactory::prefault`] to pre-size collections before the
+//! bulk-seed phase, then [`AppFactory::apply_operator_policy`] for
+//! non-journaled config.
 //!
 //! Operator-controlled policy (rate limits, caps, ...) is kept
 //! separate from journaled state. [`AppFactory::apply_operator_policy`]
@@ -36,26 +31,16 @@ pub trait AppFactory: Send + Sync {
     /// The concrete application this factory produces.
     type App: Application;
 
-    /// Construct an empty application. Used by replication paths
-    /// that need a clean state before receiving a snapshot or
-    /// replaying the journal from genesis. The returned app has no
-    /// operator policy applied — the caller pairs this with
-    /// [`Self::apply_operator_policy`] when the policy matters
-    /// (post-snapshot or pre-live-replay).
+    /// Construct an empty application. Used by all paths that need
+    /// a clean state: primary startup, replication snapshot receive,
+    /// journal replay from genesis.
     fn empty(&self) -> Self::App;
 
-    /// Construct an empty application pre-sized for the configured
-    /// bulk-seed workload, with operator policy applied. The default
-    /// impl is `self.empty()` + `self.apply_operator_policy()`;
-    /// override only when the application can use the seed-size hint
-    /// to pre-allocate internal collections (e.g. trading pre-sizes
-    /// the account-balance map so the seed phase doesn't hit
-    /// per-rehash hundred-millisecond stalls).
-    fn empty_for_seed(&self) -> Self::App {
-        let mut app = self.empty();
-        self.apply_operator_policy(&mut app);
-        app
-    }
+    /// Pre-allocate internal collections for a known bulk-seed
+    /// workload. Called once on the primary startup path before
+    /// seeding begins, so the seed phase doesn't hit allocation
+    /// stalls as collections grow.
+    fn prefault(&self, app: &mut Self::App);
 
     /// Reapply operator-controlled policy (rate limits, caps, ...)
     /// to an existing app. The policy is NOT journaled — primary

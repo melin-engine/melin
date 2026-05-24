@@ -51,13 +51,8 @@ impl AppFactory for Factory {
         ServerApp(melin_exchange_core::exchange::Exchange::with_capacity())
     }
 
-    fn empty_for_seed(&self) -> ServerApp {
-        let mut app = ServerApp(melin_exchange_core::exchange::Exchange::with_seed_capacity(
-            self.config.accounts as usize,
-            self.config.instruments as usize,
-        ));
-        self.apply_operator_policy(&mut app);
-        app
+    fn prefault(&self, app: &mut ServerApp) {
+        app.0.prefault_seed(self.config.instruments as usize);
     }
 
     fn apply_operator_policy(&self, app: &mut ServerApp) {
@@ -164,21 +159,9 @@ mod tests {
     }
 
     #[test]
-    fn empty_for_seed_applies_policy() {
-        let factory = Factory::new(cfg(2, 2));
-        let app = factory.empty_for_seed();
-        // The configured cap (100) was applied, not the exchange
-        // default (10_000).
-        assert_eq!(app.max_open_orders_per_account(), 100);
-    }
-
-    #[test]
     fn empty_does_not_apply_policy() {
         let factory = Factory::new(cfg(2, 2));
         let app = factory.empty();
-        // Fresh exchange — default cap, not the configured value.
-        // Replication paths call `apply_operator_policy` explicitly
-        // after `empty()` to converge primary/replica.
         assert_ne!(app.max_open_orders_per_account(), 100);
     }
 
