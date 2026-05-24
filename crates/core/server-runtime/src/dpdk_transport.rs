@@ -180,6 +180,9 @@ pub fn run_dpdk_poll<A: Application>(
     // publish-call histogram because `batch.push_with` is a slot
     // assignment in a pre-allocated batch — the work is dominated by
     // the surrounding decode + dedup, which is what `ingest` measures.
+    #[cfg(feature = "latency-trace")]
+    let mut publish_rec =
+        melin_transport_core::trace::register_stage("dpdk: publish (decode → disruptor publish)");
     #[cfg(feature = "tick-to-trade")]
     let mut ingest_rec =
         melin_transport_core::trace::register_stage("reader: ingest (recv_ts → publish complete)");
@@ -553,6 +556,8 @@ pub fn run_dpdk_poll<A: Application>(
                         &control_tx,
                         &mut id_to_handle,
                         *batch_wall_ns.get_or_insert_with(unix_epoch_nanos),
+                        #[cfg(feature = "latency-trace")]
+                        &mut publish_rec,
                         #[cfg(feature = "tick-to-trade")]
                         &mut ingest_rec,
                     );
@@ -774,12 +779,10 @@ fn process_trading_frames<A: Application>(
     control_tx: &mpsc::Sender<ControlEvent>,
     id_to_handle: &mut FxHashMap<u64, SocketHandle>,
     batch_wall_ns: u64,
+    #[cfg(feature = "latency-trace")] publish_rec: &mut melin_transport_core::trace::StageRecorder,
     #[cfg(feature = "tick-to-trade")] ingest_rec: &mut melin_transport_core::trace::StageRecorder,
 ) {
     use crate::client_frames::{FrameAction, process_client_frames};
-
-    #[cfg(feature = "latency-trace")]
-    let mut publish_rec = melin_transport_core::trace::register_stage("dpdk: publish");
 
     let action = process_client_frames(
         &mut conn.parse_buf,
@@ -790,7 +793,7 @@ fn process_trading_frames<A: Application>(
         decoder,
         batch_wall_ns,
         #[cfg(feature = "latency-trace")]
-        &mut publish_rec,
+        publish_rec,
         #[cfg(feature = "tick-to-trade")]
         ingest_rec,
     );
