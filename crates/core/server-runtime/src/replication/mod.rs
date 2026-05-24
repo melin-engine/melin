@@ -57,6 +57,7 @@ use melin_transport_core::pipeline::{InputSlot, OutputSlot};
 mod auth;
 #[cfg(feature = "dpdk")]
 mod dpdk;
+mod receiver_transport;
 mod tcp_receiver;
 mod tcp_sender;
 

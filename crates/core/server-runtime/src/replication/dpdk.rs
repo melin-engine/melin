@@ -18,10 +18,14 @@ use melin_journal::JournalWrite;
 use melin_journal::replication::ReplicationConsumer;
 use melin_transport_core::pipeline::{JournalStage, JournalStageRun};
 
+use super::receiver_transport::{
+    FrameResult, ReceiverTransport, SessionExit, compact_recv_buf, streaming_loop,
+    try_extract_frame,
+};
 use super::{
-    PendingAckQueue, ReceiverResult, ReplicaPipelineHandles, ReplicationMetrics,
+    ReceiverResult, ReplicaPipelineHandles, ReplicationMetrics,
     build_replica_pipeline_with_threads, sleep_checking_flags, teardown_replica_pipeline,
-    try_flush_dual_track, update_dual_replication_cursor,
+    update_dual_replication_cursor,
 };
 use melin_transport_core::replication::catchup::{
     can_catch_up_from_journal, discover_journal_files,
@@ -30,210 +34,59 @@ use melin_transport_core::replication::protocol::{
     Ack, Handshake, MAX_CONTROL_FRAME, MAX_DATA_FRAME, PrimaryMessage, ReplicaMessage,
     decode_primary_message, decode_replica_message, encode_ack, encode_handshake, encode_heartbeat,
     encode_need_snapshot, encode_snapshot_begin, encode_snapshot_chunk, encode_snapshot_end,
-    encode_stream_start, try_decode_input_batch,
+    encode_stream_start,
 };
 
-enum FrameResult {
-    /// Complete frame found: payload starts at index 0, frame ends at index 1.
-    Complete(usize, usize),
-    /// Not enough data for a complete frame — wait for more.
-    Incomplete,
-    /// Frame exceeds max_size or is malformed — connection should be dropped.
-    Oversized,
-}
-
-/// Try to extract one length-prefixed frame from a receive buffer.
-fn try_extract_frame(buf: &[u8], max_size: usize) -> FrameResult {
-    if buf.len() < 4 {
-        return FrameResult::Incomplete;
-    }
-    let len = u32::from_le_bytes(
-        buf[0..4]
-            .try_into()
-            .expect("bounds checked: buf has at least 4 bytes"),
-    ) as usize;
-    if len == 0 || len > max_size {
-        return FrameResult::Oversized;
-    }
-    if buf.len() < 4 + len {
-        return FrameResult::Incomplete;
-    }
-    FrameResult::Complete(4, 4 + len)
-}
-
-/// Compact a receive buffer by removing consumed bytes from the front.
-fn compact_recv_buf(buf: &mut Vec<u8>, consumed: usize) {
-    if consumed > 0 {
-        buf.drain(..consumed);
-    }
-}
-
 // ---------------------------------------------------------------------------
-// Recv-cycle frame processing
-//
-// The streaming and promotion-drain inner loops both extract length-prefixed
-// frames from a recv buffer, decode each as either an `InputBatch` or a
-// primary control message, and publish the resulting `InputSlot`s into the
-// replica's input ring under a single per-recv `Producer::batch`. Pulling
-// that logic into pure helpers lets the receiver code stay focused on
-// session lifecycle (handshake, acks, exit) and — more importantly — lets
-// the `pending_accum`-shadow invariant be exercised by unit tests without
-// real DPDK hardware. See the `tests` module at the bottom of this file.
+// DPDK ReceiverTransport implementation
 // ---------------------------------------------------------------------------
 
-/// Outcome of `process_streaming_frames` for one recv-cycle.
-struct StreamingFrameOutcome {
-    /// Bytes consumed from `recv_buf` — caller passes to `compact_recv_buf`.
-    consumed: usize,
-    /// Sequence of the last slot pushed, for `pending_acks.push`.
-    last_target: u64,
-    /// Whether any slot was pushed this cycle. Drives the caller's
-    /// `pending_acks.push` vs `yield_now` choice.
-    any_published: bool,
-    /// Updated `accum_end_sequence` — reflects only slots that were
-    /// actually committed to the input ring. Equal to the input value
-    /// when no slots were pushed.
-    accum_end_sequence: u64,
-    /// Whether at least one non-empty `InputBatch` arrived. Folded into
-    /// the session-wide `received_data` flag by the caller.
-    received_data: bool,
-    /// `Some(e)` ⇒ caller breaks `'streaming SessionExit::Fatal(e)` —
-    /// oversize frame or unrecognised primary message. Slots pushed
-    /// before the error are still committed.
-    frame_err: Option<Box<dyn std::error::Error>>,
-}
-
-/// Process every frame visible in `recv_buf`, publishing decoded slots
-/// onto `input_producer` under a single `Producer::batch`. The cursor
-/// advances exactly once per call regardless of how many frames or slots
-/// were processed.
+/// DPDK/smoltcp-backed receiver transport for the replica side.
 ///
-/// `pending_accum` shadows `accum_end_sequence` until `batch.commit()`
-/// runs so the returned `accum_end_sequence` only ever names slots that
-/// are visible to consumers. The commit runs in every exit path
-/// (clean end, fatal break) so the caller can safely use the returned
-/// `accum_end_sequence` for `pending_acks.push` or for a subsequent ack.
-fn process_streaming_frames<E: melin_app::AppEvent>(
-    recv_buf: &[u8],
-    input_producer: &mut melin_pipeline::ring::Producer<
-        melin_transport_core::pipeline::InputSlot<E>,
-    >,
-    accum_end_sequence: u64,
-) -> StreamingFrameOutcome {
-    let mut consumed = 0;
-    let mut last_target = 0u64;
-    let mut any_published = false;
-    let mut received_data = false;
-    let mut frame_err: Option<Box<dyn std::error::Error>> = None;
-    let mut batch = input_producer.batch();
-    let mut pending_accum = accum_end_sequence;
-    loop {
-        let remaining = &recv_buf[consumed..];
-        match try_extract_frame(remaining, MAX_DATA_FRAME) {
-            FrameResult::Complete(payload_start, frame_end) => {
-                let payload = &remaining[payload_start..frame_end];
-                match try_decode_input_batch::<E>(payload) {
-                    Ok(slots) => {
-                        if !slots.is_empty() {
-                            received_data = true;
-                            for slot in slots {
-                                let primary_seq = slot.sequence;
-                                last_target = batch.push_with(|s| *s = slot);
-                                pending_accum = primary_seq;
-                                any_published = true;
-                            }
-                        }
-                    }
-                    Err(_) => match decode_primary_message(payload) {
-                        Ok(PrimaryMessage::Heartbeat { sequence }) => {
-                            debug!(sequence, "heartbeat from primary (DPDK)");
-                        }
-                        Ok(other) => {
-                            debug!("unexpected message during streaming: {other:?}");
-                        }
-                        Err(e) => {
-                            frame_err =
-                                Some(format!("failed to decode primary message: {e}").into());
-                            break;
-                        }
-                    },
-                }
-                consumed += frame_end;
-            }
-            FrameResult::Oversized => {
-                frame_err = Some("oversized frame from primary during streaming".into());
-                break;
-            }
-            FrameResult::Incomplete => break,
-        }
-    }
-    // Commit before returning so the slots pushed above become visible to
-    // the apply consumer in every exit path — including the fatal ones,
-    // which tear the session down right after this returns.
-    batch.commit();
-    StreamingFrameOutcome {
-        consumed,
-        last_target,
-        any_published,
-        accum_end_sequence: pending_accum,
-        received_data,
-        frame_err,
-    }
+/// Wraps a `DpdkTransport` + `SocketHandle` and implements
+/// [`ReceiverTransport`] so the generic [`streaming_loop`] can drive it
+/// identically to the kernel io_uring path.
+struct DpdkReceiverTransport<'a> {
+    transport: &'a mut melin_dpdk::DpdkTransport,
+    handle: melin_dpdk::SocketHandle,
+    send_buf: Vec<u8>,
 }
 
-/// Outcome of `process_drain_frames` for one drain recv-cycle. Drain is
-/// the post-promotion flush: a lenient pass that publishes whatever
-/// `InputBatch` frames are visible and stops at the first non-input
-/// frame (no heartbeat handling, no fatal-on-decode-error — we're
-/// already on the way out).
-struct DrainFrameOutcome {
-    consumed: usize,
-    last_target: u64,
-    any_published: bool,
-    accum_end_sequence: u64,
-}
+const ACK_RETRY_CAP: u32 = 32;
 
-/// Drain pass: extract every `InputBatch` frame from `recv_buf` and
-/// publish slots under a single batch. Anything that isn't a decodable
-/// `InputBatch` (heartbeat, partial frame, error) terminates the inner
-/// loop without raising — the promotion sequence is about flushing
-/// pending data, not validating the wire.
-fn process_drain_frames<E: melin_app::AppEvent>(
-    recv_buf: &[u8],
-    input_producer: &mut melin_pipeline::ring::Producer<
-        melin_transport_core::pipeline::InputSlot<E>,
-    >,
-    accum_end_sequence: u64,
-) -> DrainFrameOutcome {
-    let mut consumed = 0;
-    let mut last_target = 0u64;
-    let mut any_published = false;
-    let mut batch = input_producer.batch();
-    let mut pending_accum = accum_end_sequence;
-    loop {
-        let remaining = &recv_buf[consumed..];
-        match try_extract_frame(remaining, MAX_DATA_FRAME) {
-            FrameResult::Complete(ps, fe) => {
-                let payload = &remaining[ps..fe];
-                if let Ok(slots) = try_decode_input_batch::<E>(payload) {
-                    for slot in slots {
-                        let primary_seq = slot.sequence;
-                        last_target = batch.push_with(|s| *s = slot);
-                        pending_accum = primary_seq;
-                        any_published = true;
-                    }
-                }
-                consumed += fe;
+impl ReceiverTransport for DpdkReceiverTransport<'_> {
+    fn poll_recv(&mut self, recv_buf: &mut Vec<u8>) -> io::Result<bool> {
+        self.transport.poll();
+        let before = recv_buf.len();
+        self.transport.recv_into_vec(self.handle, recv_buf);
+        Ok(recv_buf.len() > before)
+    }
+
+    fn send_ack(&mut self, ack: &Ack) -> io::Result<bool> {
+        self.send_buf.clear();
+        encode_ack(ack, &mut self.send_buf);
+        let mut attempts: u32 = 0;
+        loop {
+            if self.transport.queue_send(self.handle, &self.send_buf) {
+                return Ok(true);
             }
-            _ => break,
+            attempts += 1;
+            if attempts >= ACK_RETRY_CAP {
+                return Ok(true);
+            }
+            self.transport.poll();
+            if !self.transport.is_active(self.handle) {
+                return Err(io::Error::other("replica disconnected during ack send"));
+            }
         }
     }
-    batch.commit();
-    DrainFrameOutcome {
-        consumed,
-        last_target,
-        any_published,
-        accum_end_sequence: pending_accum,
+
+    fn ack_in_flight(&self) -> bool {
+        false
+    }
+
+    fn is_connected(&mut self) -> bool {
+        self.transport.is_active(self.handle)
     }
 }
 
@@ -1501,196 +1354,40 @@ where
             melin_app::affinity::pin_thread("receiver", receiver_core);
         }
 
-        let mut pending_acks = PendingAckQueue::new(pipeline_depth);
-        let mut received_data = false;
-        let mut accum_end_sequence: u64 = 0;
-        // Last cursor pair sent on the wire. Coalesces dual-track ack
-        // triggers (see the `// --- Flush acks ---` block below for the
-        // full rationale; mirrors `tcp_receiver`'s scheme).
-        let mut last_sent_acked_seq: u64 = 0;
-        let mut last_sent_in_memory_seq: u64 = 0;
-
-        // Encode an ack into send_buf and queue it on the DPDK transport.
-        //
-        // Bounded retry-with-poll: under sustained load the DPDK TX
-        // queue can fill up before this ack is queued. Silently
-        // dropping it permanently would freeze the primary's
-        // `replication_cursor`. But blocking forever while waiting
-        // for TX to drain deadlocks against the primary, which is
-        // also waiting on its own TX (single-queue path shares one
-        // TX between client traffic, replication data, and acks).
-        //
-        // Cap the retry at `ACK_RETRY_CAP` poll cycles. If we still
-        // can't queue the ack, drop it: acks carry the cumulative
-        // sequence, so the next ack we send (with a higher sequence)
-        // subsumes anything dropped here. The streaming loop's
-        // outer `transport.poll()` will continue draining TX, and
-        // the next data-batch processing pass will retry the ack
-        // with an updated cursor.
-        const ACK_RETRY_CAP: u32 = 32;
-        macro_rules! send_ack_dpdk {
-            ($ack:expr) => {{
-                send_buf.clear();
-                encode_ack(&$ack, &mut send_buf);
-                let mut attempts: u32 = 0;
-                loop {
-                    if transport.queue_send(handle, &send_buf) {
-                        break;
-                    }
-                    attempts += 1;
-                    if attempts >= ACK_RETRY_CAP {
-                        break;
-                    }
-                    transport.poll();
-                    if shutdown.load(Ordering::Relaxed) {
-                        break;
-                    }
-                    if !transport.is_active(handle) {
-                        break;
-                    }
-                }
-            }};
-        }
-
-        // Borrow input_producer + journal_cursor from the live pipeline
-        // for the streaming session. On disconnect we drop these locals
-        // and retake them next iteration.
-        let p = pipeline.as_mut().expect("pipeline must exist by here");
-        let input_producer = &mut p.input_producer;
-        let journal_cursor = p.journal_cursor.as_ref();
-
-        // --- Inner streaming loop ---
-        //
-        // Returns one of: Disconnected → reconnect with pipeline alive;
-        // Shutdown → tear down + Ok(None); Promote → tear down + Ok(Some);
-        // Fatal(err) → tear down + Err.
-        enum SessionExit {
-            Disconnected,
-            Shutdown,
-            Promote,
-            Fatal(Box<dyn std::error::Error>),
-        }
-        let session_exit = 'streaming: loop {
-            if shutdown.load(Ordering::Relaxed) {
-                info!("replica shutting down (DPDK)");
-                if let Some(seq) = pending_acks.pop_all_blocking(journal_cursor, busy_spin) {
-                    send_ack_dpdk!(Ack {
-                        acked_sequence: seq,
-                        in_memory_sequence: accum_end_sequence,
-                    });
-                    transport.poll();
-                }
-                break 'streaming SessionExit::Shutdown;
-            }
-
-            if promote.load(Ordering::Acquire) {
-                info!("promotion triggered (DPDK) — stopping replication");
-                // Drain remaining data from smoltcp buffer.
-                loop {
-                    transport.poll();
-                    let before = recv_buf.len();
-                    transport.recv_into_vec(handle, &mut recv_buf);
-                    if recv_buf.len() == before {
-                        break;
-                    }
-                    let outcome = process_drain_frames::<A::Event>(
-                        &recv_buf,
-                        input_producer,
-                        accum_end_sequence,
-                    );
-                    accum_end_sequence = outcome.accum_end_sequence;
-                    compact_recv_buf(&mut recv_buf, outcome.consumed);
-                    if outcome.any_published && !pending_acks.is_full() {
-                        pending_acks.push(outcome.last_target, accum_end_sequence);
-                    }
-                }
-                if let Some(seq) = pending_acks.pop_all_blocking(journal_cursor, busy_spin) {
-                    send_ack_dpdk!(Ack {
-                        acked_sequence: seq,
-                        in_memory_sequence: accum_end_sequence,
-                    });
-                    transport.poll();
-                }
-                break 'streaming SessionExit::Promote;
-            }
-
-            // --- Flush acks (dual-track) ---
-            //
-            // See `try_flush_dual_track` in `replication/mod.rs` for the
-            // model. The helper centralises the persisted-vs-in-memory
-            // logic and the namespace translation between local-ring
-            // positions and primary sequences across all three receivers.
-            if let Some(ack) = try_flush_dual_track(
-                &mut pending_acks,
+        // --- Streaming session (transport-agnostic) ---
+        let result = {
+            let p = pipeline.as_mut().expect("pipeline must exist by here");
+            let input_producer = &mut p.input_producer;
+            let journal_cursor = p.journal_cursor.as_ref();
+            let mut dpdk_transport = DpdkReceiverTransport {
+                transport: &mut transport,
+                handle,
+                send_buf: std::mem::take(&mut send_buf),
+            };
+            let r = streaming_loop::<DpdkReceiverTransport<'_>, A::Event>(
+                &mut dpdk_transport,
+                input_producer,
                 journal_cursor,
-                accum_end_sequence,
-                last_sent_acked_seq,
-                last_sent_in_memory_seq,
-            ) {
-                send_ack_dpdk!(ack);
-                last_sent_acked_seq = ack.acked_sequence;
-                last_sent_in_memory_seq = ack.in_memory_sequence;
-            }
-
-            // Backpressure: if pipeline is saturated, block until the oldest
-            // batch is durable.
-            if pending_acks.is_full() {
-                let seq = pending_acks.pop_oldest_blocking(journal_cursor, busy_spin);
-                let in_mem_now = accum_end_sequence;
-                send_ack_dpdk!(Ack {
-                    acked_sequence: seq,
-                    in_memory_sequence: in_mem_now,
-                });
-                // Sync trackers so the flush block doesn't refire — see
-                // tcp_receiver for the full rationale.
-                last_sent_acked_seq = seq;
-                last_sent_in_memory_seq = in_mem_now;
-            }
-
-            // Poll smoltcp and receive data.
-            transport.poll();
-            transport.recv_into_vec(handle, &mut recv_buf);
-
-            // Check for disconnect.
-            if !transport.is_active(handle) && recv_buf.is_empty() {
-                if let Some(seq) = pending_acks.pop_all_blocking(journal_cursor, busy_spin) {
-                    send_ack_dpdk!(Ack {
-                        acked_sequence: seq,
-                        in_memory_sequence: accum_end_sequence,
-                    });
-                    transport.poll();
-                }
-                break 'streaming SessionExit::Disconnected;
-            }
-
-            // Parse frames from the receive buffer and publish slots
-            // straight into the input ring (mirrors the io_uring TCP
-            // receiver — no journal-codec round-trip on the wire). The
-            // helper opens one `Producer::batch` across every frame so
-            // the input-ring cursor advances with a single Release
-            // store, not one per slot. See `process_streaming_frames`
-            // for the `pending_accum`-shadow correctness invariant.
-            let outcome =
-                process_streaming_frames::<A::Event>(&recv_buf, input_producer, accum_end_sequence);
-            accum_end_sequence = outcome.accum_end_sequence;
-            received_data |= outcome.received_data;
-            let burst_last_target = outcome.last_target;
-            let burst_any_published = outcome.any_published;
-            compact_recv_buf(&mut recv_buf, outcome.consumed);
-            if let Some(e) = outcome.frame_err {
-                break 'streaming SessionExit::Fatal(e);
-            }
-
-            // One pending_acks entry per recv burst — covers all slots
-            // published from this RECV's buffer.
-            if burst_any_published && !pending_acks.is_full() {
-                pending_acks.push(burst_last_target, accum_end_sequence);
-            } else if !burst_any_published {
-                std::thread::yield_now();
-            }
+                shutdown,
+                promote,
+                pipeline_depth,
+                busy_spin,
+                std::mem::take(&mut recv_buf),
+            );
+            send_buf = dpdk_transport.send_buf;
+            r
         };
 
-        match session_exit {
+        // Publish sentinel for terminal exits.
+        if !matches!(result.exit, SessionExit::Disconnected)
+            && let Some(p) = pipeline.as_mut()
+        {
+            p.input_producer.publish(
+                melin_transport_core::pipeline::InputSlot::<A::Event>::shutdown_sentinel(),
+            );
+        }
+
+        match result.exit {
             SessionExit::Shutdown => {
                 if let Some(p) = pipeline.take() {
                     let _ = teardown_replica_pipeline::<A, W>(p);
@@ -1718,7 +1415,7 @@ where
             }
         }
 
-        if received_data {
+        if result.received_data {
             backoff = std::time::Duration::from_secs(1);
         }
 
@@ -1874,320 +1571,4 @@ fn receive_snapshot_dpdk<A: Application>(
     }
 
     Ok((snap_exchange, snap_sequence, snap_chain_hash))
-}
-
-#[cfg(test)]
-mod tests {
-    //! Unit tests for the recv-cycle frame helpers
-    //! ([`process_streaming_frames`] / [`process_drain_frames`]).
-    //!
-    //! Real DPDK transport needs hardware, but the helpers are pure
-    //! functions over a `&[u8]` recv buffer and a `Producer<InputSlot<E>>`
-    //! — every exit path is exercisable in-process. The tests pin the
-    //! batch-commit ordering invariants introduced by the perf refactor:
-    //! the returned `accum_end_sequence` must only name slots that were
-    //! actually committed, in every path including the fatal ones.
-    use super::*;
-    use melin_app::{AppEvent, CodecError};
-    use melin_journal::JournalEvent;
-    use melin_pipeline::ring::DisruptorBuilder;
-    use melin_transport_core::pipeline::InputSlot;
-    use melin_transport_core::replication::protocol::{encode_heartbeat, encode_input_batch};
-
-    /// Minimal `AppEvent` for these tests. Encoded as a single tag byte
-    /// (the value of the variant); we never round-trip the bytes — the
-    /// helpers under test only depend on `is_query` (false here) and the
-    /// fact that the type is `Copy`.
-    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-    struct TestEvent(u8);
-
-    impl AppEvent for TestEvent {
-        fn encoded_size(&self) -> usize {
-            1
-        }
-        fn encode(&self, buf: &mut [u8]) -> usize {
-            buf[0] = self.0;
-            1
-        }
-        fn decode(buf: &[u8]) -> Result<Self, CodecError> {
-            Ok(TestEvent(buf[0]))
-        }
-        fn is_query(&self) -> bool {
-            false
-        }
-    }
-
-    /// Build an `InputSlot<TestEvent>` carrying the given primary sequence.
-    /// `tag` is stored in `request_seq` because `try_decode_input_batch`
-    /// resets `connection_id` / `publish_ts` / `recv_ts` to defaults (the
-    /// wire format documents this — replication frames don't carry
-    /// per-connection metadata, see `try_decode_input_batch`'s doc).
-    /// `request_seq` round-trips, so it doubles as an identity tag the
-    /// tests can assert on after the consumer drain.
-    fn slot(primary_seq: u64, tag: u64) -> InputSlot<TestEvent> {
-        InputSlot {
-            connection_id: 0,
-            key_hash: 0,
-            request_seq: tag,
-            sequence: primary_seq,
-            timestamp_ns: 0,
-            event: JournalEvent::App(TestEvent(tag as u8)),
-            publish_ts: Default::default(),
-            recv_ts: Default::default(),
-        }
-    }
-
-    /// Wire-encode an `InputBatch` frame for the given slots and append
-    /// it to `out`. `encode_input_batch` produces a length-prefixed
-    /// frame, so multiple calls chain into a valid recv buffer.
-    fn append_input_batch_frame(out: &mut Vec<u8>, slots: &[InputSlot<TestEvent>]) {
-        encode_input_batch(slots, out);
-    }
-
-    /// Drain `consumer` until it yields `None`, returning every slot it saw.
-    fn drain(
-        consumer: &mut melin_pipeline::ring::Consumer<InputSlot<TestEvent>>,
-    ) -> Vec<InputSlot<TestEvent>> {
-        let mut out = Vec::new();
-        while let Some((_seq, slot)) = consumer.try_consume() {
-            out.push(slot);
-        }
-        out
-    }
-
-    /// Build a single-consumer disruptor of the requested capacity.
-    fn ring(
-        capacity: usize,
-    ) -> (
-        melin_pipeline::ring::Producer<InputSlot<TestEvent>>,
-        melin_pipeline::ring::Consumer<InputSlot<TestEvent>>,
-    ) {
-        let (producer, mut consumers) = DisruptorBuilder::<InputSlot<TestEvent>>::new(capacity)
-            .add_consumer()
-            .build();
-        (producer, consumers.pop().expect("consumer present"))
-    }
-
-    #[test]
-    fn streaming_publishes_all_slots_and_advances_accum_end_sequence() {
-        // One InputBatch frame with three slots, plus a heartbeat between
-        // two more single-slot frames. Verifies:
-        //   * every slot lands on the consumer (single-commit visibility)
-        //   * accum_end_sequence reflects the last primary_seq
-        //   * heartbeats don't push spurious slots
-        //   * `received_data` reflects whether non-empty InputBatch frames arrived
-        let (mut producer, mut consumer) = ring(16);
-
-        let mut buf = Vec::new();
-        append_input_batch_frame(&mut buf, &[slot(10, 0xA0), slot(11, 0xA1), slot(12, 0xA2)]);
-        encode_heartbeat(99, &mut buf);
-        append_input_batch_frame(&mut buf, &[slot(13, 0xA3)]);
-
-        let outcome = process_streaming_frames::<TestEvent>(&buf, &mut producer, 5);
-
-        assert!(outcome.frame_err.is_none(), "no fatal exit");
-        assert_eq!(outcome.consumed, buf.len(), "every byte processed");
-        assert!(outcome.any_published);
-        assert!(outcome.received_data);
-        assert_eq!(
-            outcome.accum_end_sequence, 13,
-            "tracks the last primary_seq, not the pre-call value"
-        );
-
-        let slots = drain(&mut consumer);
-        assert_eq!(slots.len(), 4);
-        let ids: Vec<u64> = slots.iter().map(|s| s.request_seq).collect();
-        assert_eq!(ids, vec![0xA0, 0xA1, 0xA2, 0xA3]);
-    }
-
-    #[test]
-    fn streaming_oversize_frame_commits_prior_slots_then_fatal() {
-        // **Core invariant**: a fatal exit (oversize) must not leave
-        // `accum_end_sequence` referencing a slot the consumer can't
-        // observe. Two valid frames followed by an oversize length
-        // prefix → both prior slots must be visible AND
-        // `accum_end_sequence` must equal their max primary_seq.
-        let (mut producer, mut consumer) = ring(16);
-
-        let mut buf = Vec::new();
-        append_input_batch_frame(&mut buf, &[slot(7, 0xB0)]);
-        append_input_batch_frame(&mut buf, &[slot(8, 0xB1)]);
-        // Length prefix > MAX_DATA_FRAME, no body — `try_extract_frame`
-        // returns `Oversized` on the prefix alone.
-        let oversize_len = (MAX_DATA_FRAME as u32) + 1;
-        buf.extend_from_slice(&oversize_len.to_le_bytes());
-
-        let outcome = process_streaming_frames::<TestEvent>(&buf, &mut producer, 0);
-
-        assert!(outcome.frame_err.is_some(), "oversize ⇒ fatal");
-        assert_eq!(
-            outcome.accum_end_sequence, 8,
-            "only committed slots count toward accum_end_sequence"
-        );
-        assert!(outcome.any_published);
-        let slots = drain(&mut consumer);
-        assert_eq!(
-            slots.len(),
-            2,
-            "prior frames are visible to the consumer despite the fatal exit"
-        );
-    }
-
-    #[test]
-    fn streaming_unknown_message_after_valid_input_commits_then_fatal() {
-        // A non-InputBatch frame whose payload `decode_primary_message`
-        // also rejects must terminate the session, but only after
-        // committing the valid slots that came before.
-        let (mut producer, mut consumer) = ring(16);
-
-        let mut buf = Vec::new();
-        append_input_batch_frame(&mut buf, &[slot(3, 0xC0), slot(4, 0xC1)]);
-        // A 1-byte garbage payload (msg_type 0xFF doesn't exist on the
-        // primary control vocabulary, so decode_primary_message errors).
-        // Wire format: [u32 LE length=1][0xFF].
-        buf.extend_from_slice(&1u32.to_le_bytes());
-        buf.push(0xFF);
-
-        let outcome = process_streaming_frames::<TestEvent>(&buf, &mut producer, 0);
-
-        assert!(outcome.frame_err.is_some(), "unknown primary msg ⇒ fatal");
-        assert_eq!(outcome.accum_end_sequence, 4);
-        let slots = drain(&mut consumer);
-        assert_eq!(slots.len(), 2);
-    }
-
-    #[test]
-    fn streaming_partial_trailing_frame_is_incomplete_not_fatal() {
-        // A complete frame followed by a truncated length prefix:
-        //   * the complete frame publishes,
-        //   * `consumed` stops before the partial bytes,
-        //   * no fatal exit (the caller will recv more next cycle).
-        let (mut producer, mut consumer) = ring(8);
-
-        let mut buf = Vec::new();
-        append_input_batch_frame(&mut buf, &[slot(1, 0xD0)]);
-        let complete_len = buf.len();
-        buf.extend_from_slice(&[0xDE, 0xAD, 0xBE]); // 3 of 4 prefix bytes
-
-        let outcome = process_streaming_frames::<TestEvent>(&buf, &mut producer, 0);
-
-        assert!(outcome.frame_err.is_none());
-        assert_eq!(outcome.consumed, complete_len);
-        assert_eq!(outcome.accum_end_sequence, 1);
-        assert_eq!(drain(&mut consumer).len(), 1);
-    }
-
-    #[test]
-    fn streaming_heartbeat_only_does_not_advance_accum_end_sequence() {
-        // No InputBatch frames in this recv. accum_end_sequence is
-        // unchanged from the input value (the consumer can't see slots
-        // that don't exist).
-        let (mut producer, mut consumer) = ring(8);
-
-        let mut buf = Vec::new();
-        encode_heartbeat(42, &mut buf);
-        encode_heartbeat(43, &mut buf);
-
-        let outcome = process_streaming_frames::<TestEvent>(&buf, &mut producer, 100);
-
-        assert!(outcome.frame_err.is_none());
-        assert_eq!(outcome.consumed, buf.len());
-        assert!(!outcome.any_published);
-        assert!(!outcome.received_data);
-        assert_eq!(
-            outcome.accum_end_sequence, 100,
-            "pre-call value preserved when nothing committed"
-        );
-        assert!(drain(&mut consumer).is_empty());
-    }
-
-    #[test]
-    fn streaming_empty_buffer_is_a_noop() {
-        // Nothing in the recv buffer ⇒ loop never enters ⇒ batch.commit
-        // is a no-op ⇒ accum_end_sequence is returned untouched.
-        let (mut producer, mut consumer) = ring(4);
-
-        let outcome = process_streaming_frames::<TestEvent>(&[], &mut producer, 77);
-
-        assert!(outcome.frame_err.is_none());
-        assert_eq!(outcome.consumed, 0);
-        assert!(!outcome.any_published);
-        assert!(!outcome.received_data);
-        assert_eq!(outcome.accum_end_sequence, 77);
-        assert!(drain(&mut consumer).is_empty());
-    }
-
-    #[test]
-    fn drain_skips_non_input_frames_and_publishes_every_input_batch() {
-        // The promotion-drain helper is lenient: it silently skips any
-        // frame whose payload isn't an `InputBatch` (heartbeats,
-        // anything else `try_decode_input_batch` rejects) and keeps
-        // going. The inner `_ => break` arm only fires on `Incomplete`
-        // or `Oversized` from `try_extract_frame` — a structurally
-        // valid but non-input frame is consumed and skipped, not
-        // treated as terminal.
-        //
-        // This matters because drain runs at promotion to flush every
-        // pending slot before the replica becomes primary. Heartbeats
-        // interleaved with data must not strand the slots behind them.
-        let (mut producer, mut consumer) = ring(16);
-
-        let mut buf = Vec::new();
-        append_input_batch_frame(&mut buf, &[slot(20, 0xE0), slot(21, 0xE1)]);
-        encode_heartbeat(999, &mut buf);
-        // A trailing InputBatch *after* the heartbeat — drain MUST
-        // reach it, because the heartbeat is silently skipped.
-        append_input_batch_frame(&mut buf, &[slot(22, 0xE2)]);
-
-        let outcome = process_drain_frames::<TestEvent>(&buf, &mut producer, 0);
-
-        assert!(outcome.any_published);
-        assert_eq!(
-            outcome.consumed,
-            buf.len(),
-            "drain advances past every well-formed frame"
-        );
-        assert_eq!(outcome.accum_end_sequence, 22);
-        let slots = drain(&mut consumer);
-        let ids: Vec<u64> = slots.iter().map(|s| s.request_seq).collect();
-        assert_eq!(
-            ids,
-            vec![0xE0, 0xE1, 0xE2],
-            "every InputBatch slot lands, including those after the heartbeat"
-        );
-    }
-
-    #[test]
-    fn drain_stops_at_incomplete_trailing_frame() {
-        // Drain *does* stop on `Incomplete` (truncated length prefix)
-        // and on `Oversized` — the only two `_ => break` cases. Verify
-        // the incomplete-prefix path leaves `consumed` at the boundary
-        // of the last fully-extracted frame so the caller's
-        // `compact_recv_buf` preserves the partial bytes for the next
-        // recv.
-        let (mut producer, mut consumer) = ring(16);
-
-        let mut buf = Vec::new();
-        append_input_batch_frame(&mut buf, &[slot(50, 0xF0)]);
-        let complete_len = buf.len();
-        buf.extend_from_slice(&[0xDE, 0xAD]); // 2 of 4 prefix bytes
-
-        let outcome = process_drain_frames::<TestEvent>(&buf, &mut producer, 0);
-
-        assert_eq!(outcome.consumed, complete_len);
-        assert_eq!(outcome.accum_end_sequence, 50);
-        assert_eq!(drain(&mut consumer).len(), 1);
-    }
-
-    #[test]
-    fn drain_empty_buffer_is_a_noop() {
-        let (mut producer, mut consumer) = ring(4);
-
-        let outcome = process_drain_frames::<TestEvent>(&[], &mut producer, 55);
-
-        assert_eq!(outcome.consumed, 0);
-        assert!(!outcome.any_published);
-        assert_eq!(outcome.accum_end_sequence, 55);
-        assert!(drain(&mut consumer).is_empty());
-    }
 }
