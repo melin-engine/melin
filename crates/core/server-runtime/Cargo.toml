@@ -31,7 +31,7 @@ no-o-direct = [
 
 [dependencies]
 melin-app = { path = "../app" }
-melin-disruptor = { path = "../disruptor" }
+melin-pipeline = { path = "../pipeline" }
 melin-journal = { path = "../journal" }
 melin-wire-protocol = { path = "../wire-protocol" }
 melin-transport-core = { path = "../transport-core" }

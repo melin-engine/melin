@@ -42,7 +42,7 @@ tracing = { workspace = true }
 # read/writes. derive feature for `FromBytes` / `IntoBytes`.
 zerocopy = { version = "0.8", features = ["derive", "alloc"] }
 melin-app = { path = "../app" }
-melin-disruptor = { path = "../disruptor" }
+melin-pipeline = { path = "../pipeline" }
 memmap2 = "0.9.10"
 
 [dev-dependencies]

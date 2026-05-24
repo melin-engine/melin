@@ -16,9 +16,9 @@ use std::num::NonZeroU64;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
-use melin_disruptor::padding::Sequence;
-use melin_disruptor::ring;
 use melin_journal::JournalEvent;
+use melin_pipeline::padding::Sequence;
+use melin_pipeline::ring;
 use melin_server::exchange_app::ServerApp as App;
 use melin_trading::trading_event::TradingEvent;
 use melin_transport_core::pipeline::MatchingStage;

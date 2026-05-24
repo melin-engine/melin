@@ -29,9 +29,9 @@ use melin_journal::JournalWrite;
 use melin_journal::preparer::SegmentPreparer;
 use melin_journal::replication::{ReplicationConsumer, ReplicationProducer};
 
-use melin_disruptor::padding::Sequence;
-use melin_disruptor::ring;
-use melin_disruptor::seqlock::SeqLock;
+use melin_pipeline::padding::Sequence;
+use melin_pipeline::ring;
+use melin_pipeline::seqlock::SeqLock;
 
 use crate::replication_wire::{finalize_input_batch, init_input_batch};
 

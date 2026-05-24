@@ -25,8 +25,8 @@
 use crate::pipeline::InputSlot;
 use crate::trace::mono_trace_ns;
 use melin_app::AppEvent;
-use melin_disruptor::ring;
 use melin_journal::JournalEvent;
+use melin_pipeline::ring;
 
 /// Strict-monotonic clamp on the wall-clock timestamp emitted by each tick.
 /// `last_now_ns == 0` is the initial-state sentinel — the first tick is

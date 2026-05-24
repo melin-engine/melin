@@ -45,9 +45,9 @@ use melin_app::auth::Permission;
 use melin_app::decoder::{Decoded, RequestDecoder};
 use melin_app::unix_epoch_nanos;
 use melin_app::{AppEvent, Application};
-use melin_disruptor::ring;
 use melin_dpdk::transport::DpdkTransport;
 use melin_journal::JournalEvent;
+use melin_pipeline::ring;
 use melin_transport_core::pipeline::InputSlot;
 use melin_transport_core::trace::mono_trace_ns;
 use melin_wire_protocol::control::ConnectionId;
@@ -127,7 +127,7 @@ pub fn run_dpdk_poll<A: Application>(
     mut producer: ring::Producer<InputSlot<A::Event>>,
     decoder: Arc<dyn RequestDecoder<Event = A::Event>>,
     control_tx: mpsc::Sender<ControlEvent>,
-    mut tx_rx: melin_disruptor::spsc::Consumer<TxFrame>,
+    mut tx_rx: melin_pipeline::spsc::Consumer<TxFrame>,
     shutdown: &AtomicBool,
     authorized_keys: Arc<AuthorizedKeys>,
     connection_timeout: Option<Duration>,

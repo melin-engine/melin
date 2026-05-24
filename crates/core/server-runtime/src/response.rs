@@ -18,7 +18,7 @@ use std::time::{Duration, Instant};
 use io_uring::{IoUring, opcode, types};
 use tracing::{debug, error};
 
-use melin_disruptor::ring;
+use melin_pipeline::ring;
 
 use crate::durability_policy::{CursorView, DurabilityMode, EvalStatus, Policy};
 use crate::replication::ReplicationMetrics;

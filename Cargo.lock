@@ -1513,10 +1513,10 @@ dependencies = [
  "io-uring",
  "libc",
  "melin-app",
- "melin-disruptor",
  "melin-dpdk",
  "melin-exchange-core",
  "melin-journal",
+ "melin-pipeline",
  "melin-protocol",
  "melin-server",
  "melin-server-runtime",
@@ -1544,13 +1544,6 @@ dependencies = [
  "ed25519-dalek",
  "melin-protocol",
  "melin-wire-protocol",
-]
-
-[[package]]
-name = "melin-disruptor"
-version = "0.8.0"
-dependencies = [
- "libc",
 ]
 
 [[package]]
@@ -1597,7 +1590,7 @@ dependencies = [
  "io-uring",
  "libc",
  "melin-app",
- "melin-disruptor",
+ "melin-pipeline",
  "memmap2",
  "rustix",
  "tempfile",
@@ -1655,6 +1648,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "melin-pipeline"
+version = "0.8.0"
+dependencies = [
+ "libc",
+]
+
+[[package]]
 name = "melin-protocol"
 version = "0.8.0"
 dependencies = [
@@ -1679,11 +1679,11 @@ dependencies = [
  "libc",
  "melin-app",
  "melin-client",
- "melin-disruptor",
  "melin-dpdk",
  "melin-exchange-core",
  "melin-journal",
  "melin-market-data",
+ "melin-pipeline",
  "melin-protocol",
  "melin-server-runtime",
  "melin-trading",
@@ -1713,9 +1713,9 @@ dependencies = [
  "io-uring",
  "libc",
  "melin-app",
- "melin-disruptor",
  "melin-dpdk",
  "melin-journal",
+ "melin-pipeline",
  "melin-protocol",
  "melin-trading",
  "melin-transport-core",
@@ -1747,8 +1747,8 @@ dependencies = [
  "io-uring",
  "libc",
  "melin-app",
- "melin-disruptor",
  "melin-journal",
+ "melin-pipeline",
  "proptest",
  "tempfile",
  "tracing",

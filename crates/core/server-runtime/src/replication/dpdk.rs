@@ -115,7 +115,7 @@ struct StreamingFrameOutcome {
 /// `accum_end_sequence` for `pending_acks.push` or for a subsequent ack.
 fn process_streaming_frames<E: melin_app::AppEvent>(
     recv_buf: &[u8],
-    input_producer: &mut melin_disruptor::ring::Producer<
+    input_producer: &mut melin_pipeline::ring::Producer<
         melin_transport_core::pipeline::InputSlot<E>,
     >,
     accum_end_sequence: u64,
@@ -200,7 +200,7 @@ struct DrainFrameOutcome {
 /// pending data, not validating the wire.
 fn process_drain_frames<E: melin_app::AppEvent>(
     recv_buf: &[u8],
-    input_producer: &mut melin_disruptor::ring::Producer<
+    input_producer: &mut melin_pipeline::ring::Producer<
         melin_transport_core::pipeline::InputSlot<E>,
     >,
     accum_end_sequence: u64,
@@ -1869,8 +1869,8 @@ mod tests {
     //! actually committed, in every path including the fatal ones.
     use super::*;
     use melin_app::{AppEvent, CodecError};
-    use melin_disruptor::ring::DisruptorBuilder;
     use melin_journal::JournalEvent;
+    use melin_pipeline::ring::DisruptorBuilder;
     use melin_transport_core::pipeline::InputSlot;
     use melin_transport_core::replication::protocol::{encode_heartbeat, encode_input_batch};
 
@@ -1926,7 +1926,7 @@ mod tests {
 
     /// Drain `consumer` until it yields `None`, returning every slot it saw.
     fn drain(
-        consumer: &mut melin_disruptor::ring::Consumer<InputSlot<TestEvent>>,
+        consumer: &mut melin_pipeline::ring::Consumer<InputSlot<TestEvent>>,
     ) -> Vec<InputSlot<TestEvent>> {
         let mut out = Vec::new();
         while let Some((_seq, slot)) = consumer.try_consume() {
@@ -1939,8 +1939,8 @@ mod tests {
     fn ring(
         capacity: usize,
     ) -> (
-        melin_disruptor::ring::Producer<InputSlot<TestEvent>>,
-        melin_disruptor::ring::Consumer<InputSlot<TestEvent>>,
+        melin_pipeline::ring::Producer<InputSlot<TestEvent>>,
+        melin_pipeline::ring::Consumer<InputSlot<TestEvent>>,
     ) {
         let (producer, mut consumers) = DisruptorBuilder::<InputSlot<TestEvent>>::new(capacity)
             .add_consumer()

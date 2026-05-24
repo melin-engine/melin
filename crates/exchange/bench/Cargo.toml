@@ -74,7 +74,7 @@ melin-exchange-core = { path = "../exchange-core" }
 melin-trading = { path = "../trading" }
 melin-types = { path = "../types" }
 melin-journal = { path = "../../core/journal" }
-melin-disruptor = { path = "../../core/disruptor" }
+melin-pipeline = { path = "../../core/pipeline" }
 melin-protocol = { path = "../protocol" }
 melin-wire-protocol = { path = "../../core/wire-protocol" }
 melin-server-runtime = { path = "../../core/server-runtime" }

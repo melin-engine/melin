@@ -27,8 +27,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::time::Duration;
 
-use melin_disruptor::padding::Sequence;
-use melin_disruptor::ring::QueueCursor;
+use melin_pipeline::padding::Sequence;
+use melin_pipeline::ring::QueueCursor;
 use tracing::{debug, error, info};
 
 use crate::pipeline::{INPUT_RING_CAPACITY, StageUtilization};

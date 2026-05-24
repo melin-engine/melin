@@ -76,8 +76,8 @@ use super::{
 #[allow(clippy::too_many_arguments)]
 fn replica_stream_uring<A: Application>(
     tcp_stream: &TcpStream,
-    input_producer: &mut melin_disruptor::ring::Producer<InputSlot<A::Event>>,
-    journal_cursor: &melin_disruptor::padding::Sequence,
+    input_producer: &mut melin_pipeline::ring::Producer<InputSlot<A::Event>>,
+    journal_cursor: &melin_pipeline::padding::Sequence,
     pending_acks: &mut PendingAckQueue,
     received_data: &mut bool,
     accum_end_sequence: &mut u64,

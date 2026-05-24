@@ -16,8 +16,8 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
-use melin_disruptor::ring;
-use melin_disruptor::spsc;
+use melin_pipeline::ring;
+use melin_pipeline::spsc;
 
 use melin_app::Application;
 use melin_app::amortized_timer::AmortizedTimer;

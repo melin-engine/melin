@@ -72,7 +72,7 @@ path = "src/bin/journal-verify.rs"
 
 [dependencies]
 melin-app = { path = "../../core/app" }
-melin-disruptor = { path = "../../core/disruptor" }
+melin-pipeline = { path = "../../core/pipeline" }
 melin-exchange-core = { path = "../exchange-core" }
 melin-journal = { path = "../../core/journal" }
 melin-protocol = { path = "../protocol" }

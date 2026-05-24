@@ -10,7 +10,7 @@
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use melin_disruptor::padding::Sequence;
+use melin_pipeline::padding::Sequence;
 
 use super::protocol::Ack;
 

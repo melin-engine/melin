@@ -17,9 +17,9 @@ use crate::pipeline::{FsyncState, InputSlot};
 use crate::snapshot;
 use melin_app::amortized_timer::AmortizedTimer;
 use melin_app::{Application, ApplyCtx};
-use melin_disruptor::ring;
-use melin_disruptor::seqlock::SeqLock;
 use melin_journal::JournalEvent;
+use melin_pipeline::ring;
+use melin_pipeline::seqlock::SeqLock;
 
 /// Maximum events consumed per batch. Matches the journal stage batch size
 /// for consistent throughput characteristics.
@@ -241,7 +241,7 @@ mod tests {
     use super::*;
     use crate::pipeline::InputSlot;
     use crate::test_support::{TestApp, TestEvent};
-    use melin_disruptor::ring::DisruptorBuilder;
+    use melin_pipeline::ring::DisruptorBuilder;
     use std::time::Instant;
 
     #[test]

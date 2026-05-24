@@ -36,7 +36,7 @@
 //! Pair with `perf c2c record -F 4000 -- <bench>` then `perf c2c report`
 //! to confirm HITM events drop to ~zero after padding.
 
-use melin_disruptor::ring::DisruptorBuilder;
+use melin_pipeline::ring::DisruptorBuilder;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};

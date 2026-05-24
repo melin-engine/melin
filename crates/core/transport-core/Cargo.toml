@@ -42,7 +42,7 @@ tracing = { workspace = true }
 # single struct write/read. derive feature for `FromBytes` / `IntoBytes`.
 zerocopy = { version = "0.8", features = ["derive"] }
 melin-app = { path = "../app" }
-melin-disruptor = { path = "../disruptor" }
+melin-pipeline = { path = "../pipeline" }
 melin-journal = { path = "../journal" }
 
 [dev-dependencies]

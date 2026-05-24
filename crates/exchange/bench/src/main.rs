@@ -1383,7 +1383,7 @@ where
     //
     // Coordination: inflight counter (AtomicU64) for window gating,
     // lock-free SPSC ring for timestamps (publisher → drainer).
-    // Using melin_disruptor::spsc instead of std::sync::mpsc::sync_channel
+    // Using melin_pipeline::spsc instead of std::sync::mpsc::sync_channel
     // eliminates the mutex overhead per order (~2-5µs tail reduction).
     let inflight = Arc::new(AtomicU64::new(0));
     // TSC ticks instead of Instant::now() for the latency measurement
@@ -1398,7 +1398,7 @@ where
     // SPSC channel requires capacity >= 2; clamp so `--window=1` (useful
     // for isolating pure pipeline latency without queueing) doesn't panic.
     let ts_capacity = window.next_power_of_two().max(2);
-    let (mut ts_tx, mut ts_rx) = melin_disruptor::spsc::channel::<u64>(ts_capacity);
+    let (mut ts_tx, mut ts_rx) = melin_pipeline::spsc::channel::<u64>(ts_capacity);
 
     // Publisher thread: continuously feeds events into the disruptor.
     // `sequence: 0` — the journal stage allocates sequences in disruptor

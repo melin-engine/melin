@@ -206,8 +206,8 @@ pub(super) fn shutdown_pipeline<A: Application + Send + 'static, W: Send + 'stat
 /// both refresh handshake state from `last_seq` + `chain_hash_lock` at
 /// reconnect time.
 pub(super) struct ReplicaPipelineHandles<A: Application, W: Send + 'static> {
-    pub(super) input_producer: melin_disruptor::ring::Producer<InputSlot<A::Event>>,
-    pub(super) journal_cursor: Arc<melin_disruptor::padding::Sequence>,
+    pub(super) input_producer: melin_pipeline::ring::Producer<InputSlot<A::Event>>,
+    pub(super) journal_cursor: Arc<melin_pipeline::padding::Sequence>,
     /// Highest journal sequence durably persisted, published by JournalStage
     /// after each fsync. Read by the orchestrator to fill in the reconnect
     /// handshake without owning the writer.
@@ -216,7 +216,7 @@ pub(super) struct ReplicaPipelineHandles<A: Application, W: Send + 'static> {
     /// cursor). Option to mirror the primary-side pattern; always Some
     /// on replicas now.
     pub(super) chain_hash_lock:
-        Option<Arc<melin_disruptor::seqlock::SeqLock<melin_transport_core::pipeline::FsyncState>>>,
+        Option<Arc<melin_pipeline::seqlock::SeqLock<melin_transport_core::pipeline::FsyncState>>>,
     /// Per-pipeline shutdown flag — flipped only on a controlled teardown
     /// (Promote/Shutdown/Fatal/Snapshot). NOT flipped on `Disconnected`.
     pub(super) pipeline_shutdown: Arc<AtomicBool>,
@@ -1523,8 +1523,8 @@ mod tests {
 
     // --- PendingAckQueue tests ---
 
-    fn make_journal_cursor(val: u64) -> melin_disruptor::padding::Sequence {
-        melin_disruptor::padding::Sequence::new(AtomicU64::new(val))
+    fn make_journal_cursor(val: u64) -> melin_pipeline::padding::Sequence {
+        melin_pipeline::padding::Sequence::new(AtomicU64::new(val))
     }
 
     #[test]

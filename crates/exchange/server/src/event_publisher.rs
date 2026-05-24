@@ -31,8 +31,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use tracing::{debug, error, info, warn};
 
 use melin_app::auth::AuthorizedKeys;
-use melin_disruptor::ring;
 use melin_market_data::mirror::BookMirror;
+use melin_pipeline::ring;
 use melin_protocol::codec;
 use melin_protocol::message::{Request, ResponseKind};
 use melin_transport_core::pipeline::{

@@ -16,10 +16,10 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
-use melin_disruptor::padding::Sequence;
-use melin_disruptor::ring;
 use melin_journal::replication::REPLICATION_RING_CAPACITY;
 use melin_journal::{BufferedWriter, JournalEvent, JournalReader, SectorWriter};
+use melin_pipeline::padding::Sequence;
+use melin_pipeline::ring;
 
 use crate::journaled_app::JournaledApp;
 #[cfg(all(feature = "hash-chain", not(feature = "no-persist")))]

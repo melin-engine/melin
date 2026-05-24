@@ -72,7 +72,7 @@ When the journal disk fills, `posix_fallocate` returns ENOSPC. The error propaga
 
 ### SEC-06: Disruptor backpressure spins at 100% CPU (MEDIUM)
 
-**File**: `crates/core/disruptor/src/ring.rs:216-223`
+**File**: `crates/core/pipeline/src/ring.rs:216-223`
 
 When the input ring buffer is full, `publish()` spins in a tight loop calling `std::hint::spin_loop()`. If the matching stage falls behind (e.g., processing a large stop cascade), the reader thread burns 100% CPU spinning.
 

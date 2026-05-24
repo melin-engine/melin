@@ -176,7 +176,7 @@ The matching stage maintains a per-instance `last_drain_ns` watermark. At the he
 
 ## Input Disruptor
 
-The input disruptor is a multi-producer, multi-consumer ring buffer defined in `crates/core/disruptor/src/ring.rs`.
+The input disruptor is a multi-producer, multi-consumer ring buffer defined in `crates/core/pipeline/src/ring.rs`.
 
 **Capacity**: `INPUT_RING_CAPACITY = 1 << 20` (1,048,576 slots). At approximately 72 bytes per `InputSlot`, this is roughly 72 MiB -- sized to fit in L3 cache on modern server CPUs. Provides approximately 100 ms of buffering at 10M orders/sec, enough headroom for fsync stalls without backpressure reaching the readers.
 
@@ -314,7 +314,7 @@ When the SPSC is empty (idle period), the response stage scans connections for h
 
 ## Output SPSC
 
-The output SPSC queue connects the matching stage to the response stage. Defined in `crates/core/disruptor/src/spsc.rs`.
+The output SPSC queue connects the matching stage to the response stage. Defined in `crates/core/pipeline/src/spsc.rs`.
 
 **Capacity**: `OUTPUT_RING_CAPACITY = 1 << 20` (1,048,576 slots). Matches the input ring size because one input event can produce multiple output messages (e.g., a market order sweeping many price levels produces one `Fill` per level plus a `BatchEnd`).
 

@@ -37,8 +37,8 @@ use melin_app::decoder::{Decoded, RequestDecoder};
 /// the decoder through several functions.
 pub type RequestDecoderArc<A> = Arc<dyn RequestDecoder<Event = <A as Application>::Event>>;
 use melin_app::unix_epoch_nanos;
-use melin_disruptor::ring;
 use melin_journal::JournalEvent;
+use melin_pipeline::ring;
 use melin_transport_core::pipeline::InputSlot;
 use melin_transport_core::trace::mono_trace_ns;
 use melin_wire_protocol::control::TransportResponse;
@@ -998,7 +998,7 @@ mod tests {
     use melin_app::auth::Permission;
     use melin_app::decoder::{Decoded, RequestDecoder};
     use melin_app::{AppEvent, Application, ApplyCtx, CodecError, RejectReason};
-    use melin_disruptor::ring::DisruptorBuilder;
+    use melin_pipeline::ring::DisruptorBuilder;
     use std::io::{ErrorKind, Read};
     use std::os::unix::net::UnixStream;
     use std::time::Duration;

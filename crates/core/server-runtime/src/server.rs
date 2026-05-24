@@ -44,7 +44,7 @@ use melin_app::auth::AuthorizedKeys;
 use melin_app::auth::Permission;
 use melin_app::decoder::RequestDecoder;
 use melin_app::encoder::ResponseEncoder;
-use melin_disruptor::ring::Consumer;
+use melin_pipeline::ring::Consumer;
 
 /// Output-slot sugar parameterised on the application — saves spelling
 /// `<A::Report, A::QueryResponse>` at every pipeline-facing signature
@@ -2153,7 +2153,7 @@ where
     let mut tx_producers = Vec::with_capacity(num_dpdk_threads);
     let mut tx_consumers = Vec::with_capacity(num_dpdk_threads);
     for _ in 0..num_dpdk_threads {
-        let (tx_out, tx_rx) = melin_disruptor::spsc::channel::<crate::dpdk_response::TxFrame>(4096);
+        let (tx_out, tx_rx) = melin_pipeline::spsc::channel::<crate::dpdk_response::TxFrame>(4096);
         tx_producers.push(tx_out);
         tx_consumers.push(tx_rx);
     }
