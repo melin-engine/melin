@@ -6,13 +6,11 @@ An exchange core built on the [Melin sequencer](../../README.md). Handles order 
 
 ## Performance
 
-### Matching engine in isolation
-
-Just the matching engine, no network, no journal, no replication. Measures the `Exchange::execute()` hot path on a single core under realistic order flow; 30 s measurement window after 10 s warmup. Single AMD EPYC 9255 (24C Zen 5, SMT off).
+The single-threaded exchange core — order matching, risk checks, balance updates, fee calculation — with no network, journal, or replication. Measures the `Exchange::execute()` hot path on a single core under realistic order flow; 30 s measurement window after 10 s warmup. Single AMD EPYC 9255 (24C Zen 5, SMT off).
 
 | Throughput | p50 | p99 | p99.9 | p99.99 | p99.999 | p99.9999 | p99.99999 |
 |------------|-----|-----|-------|--------|---------|----------|-----------|
-| **4.60M/s** | 0.10 us | 0.42 us | 0.58 us | 0.77 us | 0.99 us | 1.17 us | 1.35 us |
+| 4.60M/s | 0.10 us | 0.42 us | 0.58 us | 0.77 us | 0.99 us | 1.17 us | 1.35 us |
 
 End-to-end numbers (including journal, replication, and network) are in the [sequencer README](../../README.md#benchmarks).
 
@@ -21,7 +19,7 @@ End-to-end numbers (including journal, replication, and network) are in the [seq
 - Strict price-time priority verified by property-based tests across thousands of random order sequences
 - Cross-validated against independent matching engine implementations and real market data
 - Deterministic replay guarantees identical state from the same journal
-- Property-based, fuzz, crash-injection, cross-engine differential, and multi-process failover tests — more than 700 scenarios
+- Property-based, fuzz, crash-injection, cross-engine differential, and multi-process failover tests — more than a thousand test scenarios in total
 
 ## Order Types
 
