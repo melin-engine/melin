@@ -640,7 +640,7 @@ else
     echo "  Cloning repo..."
     mkdir -p "$USER_HOME/workspace"
     chown "$USER_NAME:" "$USER_HOME/workspace"
-    run_as_user "git clone git@github.com:pierre-l/melin.git $REPO_DIR"
+    run_as_user "git clone git@github.com:melin-engine/melin.git $REPO_DIR"
     run_as_user "cd $REPO_DIR && git checkout main"
 fi
 

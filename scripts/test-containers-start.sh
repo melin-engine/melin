@@ -142,7 +142,7 @@ EOF
     docker exec "$name" bash -c "
         source /root/.cargo/env && \
         mkdir -p /root/workspace && \
-        git clone git@github.com:pierre-l/melin.git $REPO_DIR && \
+        git clone git@github.com:melin-engine/melin.git $REPO_DIR && \
         cd $REPO_DIR && \
         $CHECKOUT_CMD
         cargo build --release
