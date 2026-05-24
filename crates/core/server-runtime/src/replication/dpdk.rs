@@ -1430,8 +1430,16 @@ where
             continue;
         }
 
-        // Create journal for fresh replica using the primary's raw genesis entry.
-        if journal_writer.is_none() && !primary_genesis_entry.is_empty() {
+        // Create journal for fresh replica (first connection only).
+        //
+        // Gate on `pipeline.is_none()` rather than `journal_writer.is_none()`:
+        // the writer is moved into the pipeline on first connect and never
+        // returned, so on every subsequent reconnect `journal_writer` is
+        // `None` even though a live writer is still mid-stream inside the
+        // pipeline. `pipeline.is_none()` distinguishes "true first connect or
+        // post-snapshot rebuild" from "reconnect against an existing
+        // pipeline" — the latter must not recreate the journal file.
+        if pipeline.is_none() && journal_writer.is_none() {
             let writer =
                 melin_journal::create_fresh_replica::<_, W>(journal_path, &primary_genesis_entry)?;
             let mut fresh = factory.empty();

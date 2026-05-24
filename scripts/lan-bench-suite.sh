@@ -251,6 +251,13 @@ cleanup() {
     # busy" on the cp into the .dpdk suffixed path.
     ssh $SSH_OPTS "$BENCH" "pkill -INT -x melin-bench 2>/dev/null; \
                             pkill -INT -f '[m]elin-bench.dpdk' 2>/dev/null; true" 2>/dev/null || true
+    # Clean DPDK EAL lock files so the next run doesn't fail with
+    # "Cannot create lock on '/var/run/dpdk/rte/config'".
+    if [[ "${DPDK_RAN:-0}" == "1" ]]; then
+        for host in "$SERVER" "$BENCH" ${REPLICA:+"$REPLICA"} ${REPLICA2:+"$REPLICA2"}; do
+            ssh $SSH_OPTS "$host" "rm -rf /var/run/dpdk/rte 2>/dev/null; true" 2>/dev/null || true
+        done
+    fi
     # Close ssh master connections and remove their control sockets.
     for host in "$SERVER" "$BENCH" ${REPLICA:+"$REPLICA"} ${REPLICA2:+"$REPLICA2"}; do
         ssh -O exit $SSH_OPTS "$host" 2>/dev/null || true
@@ -812,6 +819,15 @@ stop_servers() {
     sleep 2
 }
 
+# Remove DPDK EAL lock files left by a previous run. Without this,
+# restarting a DPDK process on the same host fails with
+# "Cannot create lock on '/var/run/dpdk/rte/config'".
+clean_eal_lockfiles() {
+    for host in "$@"; do
+        ssh $SSH_OPTS "$host" "rm -rf /var/run/dpdk/rte 2>/dev/null; true"
+    done
+}
+
 # Run the bench client against an already-running server.
 # Usage: run_bench <server_addr> <health_addr> <duration> <extra_bench_args...>
 # `duration` is the measured-phase duration (humantime, e.g. `30s`).
@@ -1315,6 +1331,7 @@ transport_stop_dpdk() {
     stop_servers "$SERVER"
     # TAP mode uses melin-server.dpdk — kill that too.
     ssh $SSH_OPTS "$SERVER" "pkill -INT -f '[m]elin-server.dpdk' 2>/dev/null; true"
+    clean_eal_lockfiles "$SERVER" "$BENCH"
 }
 
 transport_start_dpdk_repl() {
@@ -1409,6 +1426,7 @@ transport_stop_dpdk_repl() {
     for host in "$SERVER" "$REPLICA"; do
         ssh $SSH_OPTS "$host" "pkill -INT -f '[m]elin-server.dpdk' 2>/dev/null; true"
     done
+    clean_eal_lockfiles "$SERVER" "$BENCH" "$REPLICA"
     if [[ "${SKIP_JOURNAL_VERIFY:-0}" == "1" ]]; then
         echo "  Skipping journal verification (SKIP_JOURNAL_VERIFY=1)"
         return
@@ -1539,6 +1557,7 @@ transport_stop_dpdk_dual_repl() {
     for host in "$SERVER" "$REPLICA" "$REPLICA2"; do
         ssh $SSH_OPTS "$host" "pkill -INT -f '[m]elin-server.dpdk' 2>/dev/null; true"
     done
+    clean_eal_lockfiles "$SERVER" "$BENCH" "$REPLICA" "$REPLICA2"
     if [[ "${SKIP_JOURNAL_VERIFY:-0}" == "1" ]]; then
         echo "  Skipping journal verification (SKIP_JOURNAL_VERIFY=1)"
         return
