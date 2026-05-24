@@ -6,7 +6,7 @@ Built in Rust on an [LMAX](https://martinfowler.com/articles/lmax.html)-inspired
 
 ## Properties
 
-**Deterministic replay** — given the same journal, the application produces identical output. This is the foundation of crash recovery, audit, and replica consistency. The sequencer enforces it; your application logic inherits it for free.
+**Deterministic replay** — given the same journal, the application produces identical output. This is the foundation of crash recovery, audit, and replica consistency. The sequencer enforces it; your application logic inherits it as long as it stays pure (no I/O, no non-deterministic state).
 
 **Durable before acknowledgement** — every event is persisted to the journal and replicated before the client sees a response. Configurable durability modes let you trade latency for stronger guarantees:
 - **Hybrid** (default) — one node persisted, two nodes in-memory. Any single node's slow disk is masked by the others, and single-node failures cause no data-loss.
