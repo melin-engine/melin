@@ -82,6 +82,12 @@ See [replication](docs/replication.md) for the full durability-mode menu, [opera
 
 Melin ships with an exchange core built on the sequencer: order matching, account management, risk controls, circuit breakers, fee schedules, market data, and a FIX 4.4 gateway. See [the exchange core README](crates/exchange/README.md).
 
+## Contributing
+
+Bug fixes and correctness improvements are welcome. Feature PRs without prior discussion will likely be closed — open an issue first to discuss the problem and approach.
+
+By submitting a pull request, you agree to the terms of our [Contributor License Agreement](CLA.md).
+
 ## License
 
 Licensed under the [Business Source License 1.1](LICENSE). Production use requires a commercial license from P.L.S.C. — contact [contact@melin-engine.com](mailto:contact@melin-engine.com).
