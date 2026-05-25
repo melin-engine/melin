@@ -283,6 +283,11 @@ impl Exchange {
         self.instrument_pool = (0..num_instruments)
             .map(|i| Some(OrderBook::with_capacity(Symbol(i as u32))))
             .collect();
+        self.live_order_ids = FxHashSet::with_capacity_and_hasher(1_000_000, Default::default());
+        self.order_counts =
+            HashMap4::with_capacity_and_hasher(num_accounts.max(1_000_000), Default::default());
+        self.order_buckets =
+            HashMap4::with_capacity_and_hasher(num_accounts.max(1_000_000), Default::default());
     }
 
     /// Reconstruct from pre-built parts (used by snapshot restore).
