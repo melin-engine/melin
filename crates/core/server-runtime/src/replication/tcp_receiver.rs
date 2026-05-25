@@ -670,6 +670,7 @@ where
                             pipeline_depth,
                             busy_spin,
                             Vec::with_capacity(MAX_DATA_FRAME + 4),
+                            None,
                         )
                     })
                     .expect("spawn replica-receiver thread");

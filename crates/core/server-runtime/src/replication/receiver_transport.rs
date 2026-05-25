@@ -294,6 +294,7 @@ pub(super) fn streaming_loop<T: ReceiverTransport, E: AppEvent>(
     // The TCP path passes an empty buffer — kernel-buffered data is
     // picked up by the io_uring multishot RECV.
     mut recv_buf: Vec<u8>,
+    utilization: Option<&melin_transport_core::pipeline::StageUtilization>,
 ) -> StreamingResult {
     let mut slot_buf: Vec<InputSlot<E>> = Vec::new();
     let mut pending_acks = PendingAckQueue::new(pipeline_depth);
@@ -305,6 +306,8 @@ pub(super) fn streaming_loop<T: ReceiverTransport, E: AppEvent>(
 
     let mut received_data = false;
     let mut idle_spins: u32 = 0;
+    let mut busy_count: u64 = 0;
+    let mut idle_count: u64 = 0;
 
     let exit = loop {
         // --- Check flags ---
@@ -454,6 +457,7 @@ pub(super) fn streaming_loop<T: ReceiverTransport, E: AppEvent>(
 
         // --- Idle wait ---
         if !any_data && !outcome.any_published {
+            idle_count += 1;
             if busy_spin || idle_spins < 1000 {
                 idle_spins = idle_spins.wrapping_add(1);
                 std::hint::spin_loop();
@@ -461,9 +465,15 @@ pub(super) fn streaming_loop<T: ReceiverTransport, E: AppEvent>(
                 std::thread::yield_now();
             }
         } else {
+            busy_count += 1;
             idle_spins = 0;
         }
     };
+
+    if let Some(u) = utilization {
+        u.busy.store(busy_count, Ordering::Relaxed);
+        u.idle.store(idle_count, Ordering::Relaxed);
+    }
 
     StreamingResult {
         exit,
@@ -669,6 +679,7 @@ mod tests {
             4,
             false,
             Vec::new(),
+            None,
         );
 
         assert!(matches!(result.exit, SessionExit::Shutdown));
@@ -697,6 +708,7 @@ mod tests {
             4,
             false,
             Vec::new(),
+            None,
         );
 
         assert!(matches!(result.exit, SessionExit::Promote));
@@ -723,6 +735,7 @@ mod tests {
             4,
             false,
             Vec::new(),
+            None,
         );
 
         assert!(matches!(result.exit, SessionExit::Disconnected));
@@ -751,6 +764,7 @@ mod tests {
             4,
             false,
             Vec::new(),
+            None,
         );
 
         assert!(matches!(result.exit, SessionExit::Disconnected));
@@ -791,6 +805,7 @@ mod tests {
             4,
             false,
             initial,
+            None,
         );
 
         assert!(result.received_data);
@@ -829,6 +844,7 @@ mod tests {
             1, // pipeline_depth=1 → PendingAckQueue cap=1
             false,
             Vec::new(),
+            None,
         );
 
         assert!(matches!(result.exit, SessionExit::Disconnected));
@@ -864,6 +880,7 @@ mod tests {
             4,
             false,
             Vec::new(),
+            None,
         );
 
         assert!(matches!(result.exit, SessionExit::Fatal(_)));
@@ -907,6 +924,7 @@ mod tests {
                 4,
                 false,
                 Vec::new(),
+                None,
             );
 
             assert!(matches!(result.exit, SessionExit::Shutdown));
@@ -917,6 +935,39 @@ mod tests {
             !transport.sent_acks.is_empty(),
             "shutdown should send a final ack for durable data"
         );
+    }
+
+    #[test]
+    fn loop_tracks_utilization_when_provided() {
+        let (mut producer, _consumer) = ring(16);
+        let cursor = journal_cursor(u64::MAX);
+        let shutdown = AtomicBool::new(false);
+        let promote = AtomicBool::new(false);
+        let mut transport = MockTransport::new();
+
+        let mut data = Vec::new();
+        append_input_batch_frame(&mut data, &[slot(1, 0x01)]);
+        transport.push_data(data);
+        transport.disconnect_after_data();
+
+        let utilization = melin_transport_core::pipeline::StageUtilization::new();
+
+        let _result = streaming_loop::<MockTransport, TestEvent>(
+            &mut transport,
+            &mut producer,
+            &cursor,
+            &shutdown,
+            &promote,
+            4,
+            false,
+            Vec::new(),
+            Some(&utilization),
+        );
+
+        let busy = utilization.busy.load(Ordering::Relaxed);
+        let idle = utilization.idle.load(Ordering::Relaxed);
+        assert!(busy > 0, "should have recorded busy iterations");
+        assert!(busy + idle > 0, "total iterations should be non-zero");
     }
 
     // ---------------------------------------------------------------

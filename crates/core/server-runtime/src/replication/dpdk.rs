@@ -1135,6 +1135,7 @@ where
                 pipeline_depth,
                 busy_spin,
                 std::mem::take(&mut recv_buf),
+                None,
             );
             send_buf = dpdk_transport.send_buf;
             r
