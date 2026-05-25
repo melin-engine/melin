@@ -542,25 +542,40 @@ pub fn run_dpdk_poll<A: Application>(
                     );
                 }
                 AuthState::Authenticated { permission } => {
-                    // Process trading frames. `permission` is bound by
-                    // reference to the outer `&mut conn.auth` match;
-                    // copy it out (Permission: Copy) so the call below
-                    // can release the borrow on `conn.auth`.
+                    use crate::client_frames::{FrameAction, process_client_frames};
                     let permission = *permission;
-                    process_trading_frames::<A>(
-                        conn,
+                    let action = process_client_frames(
+                        &mut conn.parse_buf,
+                        conn.connection_id.0,
+                        conn.key_hash,
                         permission,
-                        &mut transport,
-                        &*decoder,
                         &mut producer,
-                        &control_tx,
-                        &mut id_to_handle,
+                        &*decoder,
                         *batch_wall_ns.get_or_insert_with(unix_epoch_nanos),
                         #[cfg(feature = "latency-trace")]
                         &mut publish_rec,
                         #[cfg(feature = "tick-to-trade")]
                         &mut ingest_rec,
                     );
+                    if matches!(action, FrameAction::Disconnect | FrameAction::PipelineFull) {
+                        if matches!(action, FrameAction::PipelineFull) {
+                            debug!(
+                                connection_id = conn.connection_id.0,
+                                "DPDK: pipeline full, dropping connection"
+                            );
+                        }
+                        transport.close(conn.handle);
+                        let _ = control_tx.send(ControlEvent::Disconnected {
+                            connection_id: conn.connection_id.0,
+                        });
+                        id_to_handle.remove(&conn.connection_id.0);
+                        if let Some(mut removed) = connections[idx].take() {
+                            removed.parse_buf.clear();
+                            parse_buf_pool.push(removed.parse_buf);
+                            connection_count -= 1;
+                        }
+                        continue;
+                    }
                 }
             }
 
@@ -744,76 +759,6 @@ fn send_auth_failed(conn: &ConnectionState, transport: &mut DpdkTransport) {
     // Don't close immediately — let smoltcp flush the AuthFailed frame first.
     // The connection will be cleaned up on the next poll when the client
     // disconnects or the auth timeout fires.
-}
-
-/// Process trading frames from an authenticated connection.
-///
-/// Uses a cursor to avoid O(n) drain/memmove on every frame. The buffer
-/// is compacted once after all frames in this batch are processed.
-/// Extract trading frames from `conn.parse_buf` and publish decoded
-/// `InputSlot`s directly into the disruptor batch. `batch_wall_ns` is
-/// captured once per outer poll iteration by the caller; all
-/// non-query requests stamped in this call share it, sparing a
-/// per-request `clock_gettime(CLOCK_REALTIME)` on the hot path.
-///
-/// Opens a per-connection `Producer::batch`, capped at `COMMIT_EVERY=16`
-/// events. The cap bounds consumer-visibility delay — without it, a
-/// burst-heavy connection can leave its first frame waiting for tens of
-/// later frames to decode before the journal stage sees any of them.
-/// See `reader.rs::process_frames` for the same cap on the kernel-TCP
-/// reader and the measured rationale.
-///
-/// Earlier this batch spanned every connection in the outer-poll
-/// iteration — one Release store per iteration covered all decoded
-/// events. The per-connection scope here is slightly more cursor
-/// stores (one per active connection per outer iter vs one for all)
-/// but matches the reader-side optimisation shape and is *still* a
-/// 10×+ reduction vs per-event publish — the per-publish cursor write
-/// `perf annotate` pinned at ~9% of this core's cycles.
-fn process_trading_frames<A: Application>(
-    conn: &mut ConnectionState,
-    permission: Permission,
-    transport: &mut DpdkTransport,
-    decoder: &dyn RequestDecoder<Event = A::Event>,
-    producer: &mut ring::Producer<InputSlot<A::Event>>,
-    control_tx: &mpsc::Sender<ControlEvent>,
-    id_to_handle: &mut FxHashMap<u64, SocketHandle>,
-    batch_wall_ns: u64,
-    #[cfg(feature = "latency-trace")] publish_rec: &mut melin_transport_core::trace::StageRecorder,
-    #[cfg(feature = "tick-to-trade")] ingest_rec: &mut melin_transport_core::trace::StageRecorder,
-) {
-    use crate::client_frames::{FrameAction, process_client_frames};
-
-    let action = process_client_frames(
-        &mut conn.parse_buf,
-        conn.connection_id.0,
-        conn.key_hash,
-        permission,
-        producer,
-        decoder,
-        batch_wall_ns,
-        #[cfg(feature = "latency-trace")]
-        publish_rec,
-        #[cfg(feature = "tick-to-trade")]
-        ingest_rec,
-    );
-
-    match action {
-        FrameAction::Continue => {}
-        FrameAction::Disconnect | FrameAction::PipelineFull => {
-            if matches!(action, FrameAction::PipelineFull) {
-                debug!(
-                    connection_id = conn.connection_id.0,
-                    "DPDK: pipeline full, dropping connection"
-                );
-            }
-            transport.close(conn.handle);
-            let _ = control_tx.send(ControlEvent::Disconnected {
-                connection_id: conn.connection_id.0,
-            });
-            id_to_handle.remove(&conn.connection_id.0);
-        }
-    }
 }
 
 #[cfg(test)]
