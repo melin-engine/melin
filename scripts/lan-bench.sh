@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Run a LAN benchmark across two Cherry servers.
+# Run a LAN benchmark across two servers.
 #
 # Deploys, builds, starts the engine on the server, runs the benchmark
 # from the bench machine, collects results.
@@ -35,7 +35,7 @@
 #
 # Prerequisites:
 #   - SSH access to both machines (as root by default, or as [user])
-#   - Both machines have been set up via cherry-deploy.sh (or cherry-setup.sh)
+#   - Both machines have been set up via server-deploy.sh (or server-setup.sh)
 #   - A VLAN/private network between the two machines
 #   - The bench machine can reach <server-vlan-ip> over the private network
 

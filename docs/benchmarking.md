@@ -415,7 +415,7 @@ On AMD CPUs, SMI counts cannot be measured (MSR 0x34 is Intel-specific). The `be
 
 When the response stage waits on a local journal `fdatasync` for every order (standalone, or single-replication where the primary needs both local disk and the replica), the tail-latency floor is set by the *filesystem*, not the drive. With ext4, jbd2 batches metadata commits at internal extent-group boundaries and fires a 1–2 ms `fdatasync` every ~256 MiB of sustained writes. The drive itself doesn't pause — we verified with OCP `latency-monitor-log` (zero NVMe commands above 10 ms during a 60 s run on a Micron 7400 PRO) that no individual NVMe command exceeds the threshold. The stall is between the syscall and the device.
 
-xfs doesn't exhibit this behaviour on the same hardware: same throughput, p50/p99 unchanged, max latency cut from ~2.6 ms to ~1.5 ms, and the periodic cadence vanishes. `scripts/cherry-setup.sh` formats the journal disk as xfs with `noatime,logbsize=256k,logbufs=8` for this reason.
+xfs doesn't exhibit this behaviour on the same hardware: same throughput, p50/p99 unchanged, max latency cut from ~2.6 ms to ~1.5 ms, and the periodic cadence vanishes. `scripts/server-setup.sh` formats the journal disk as xfs with `noatime,logbsize=256k,logbufs=8` for this reason.
 
 Symptoms you will see on ext4 at this floor:
 
@@ -425,7 +425,7 @@ Symptoms you will see on ext4 at this floor:
 
 **Mitigations when a tighter tail matters:**
 
-- **Use xfs for the journal disk.** This is the single biggest win on ext4 systems. See `cherry-setup.sh` for the formatting and mount options.
+- **Use xfs for the journal disk.** This is the single biggest win on ext4 systems. See `server-setup.sh` for the formatting and mount options.
 - **Run with dual replication and the default `hybrid` durability mode.** The response stage releases as soon as any node has the event on PLP-backed NVMe AND at least one replica has acked in memory — single-node fsync stalls are usually masked. (The ~10 s ext4 spike defeats this masking specifically because deterministic event flow correlates the spike across every node; xfs eliminates the correlation.)
 - **Raise drive over-provisioning** if you stay on ext4. Smaller namespace + more unallocated capacity reduces drive-internal GC pressure that compounds with the fs-level spike.
 

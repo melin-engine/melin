@@ -1,14 +1,14 @@
 #!/usr/bin/env bash
-# Deploy and setup a Cherry benchmark server.
+# Deploy and setup a benchmark server.
 #
 # Copies SSH credentials and the setup script to the remote server,
 # then runs setup via SSH. Expects root access on the remote.
 #
 # Usage:
-#   ./scripts/cherry-deploy.sh <remote>
+#   ./scripts/server-deploy.sh <remote>
 #
 # Example:
-#   ./scripts/cherry-deploy.sh root@84.32.176.142
+#   ./scripts/server-deploy.sh root@84.32.176.142
 
 set -euo pipefail
 
@@ -21,7 +21,7 @@ fi
 REMOTE="$1"
 SSH_KEY="$HOME/.ssh/te_test_ed"
 SSH_PUB="$HOME/.ssh/te_test_ed.pub"
-SETUP_SCRIPT="$(dirname "$0")/cherry-setup.sh"
+SETUP_SCRIPT="$(dirname "$0")/server-setup.sh"
 
 # Skip host key prompt on first connect — these are throwaway bench boxes.
 SSH_OPTS=(-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR)
@@ -58,20 +58,20 @@ echo "  SSH keys deployed."
 
 # 2. Copy and run the setup script.
 echo "  Copying setup script..."
-scp -q "$SETUP_SCRIPT" "$REMOTE:/tmp/cherry-setup.sh"
-ssh "$REMOTE" "chmod +x /tmp/cherry-setup.sh"
+scp -q "$SETUP_SCRIPT" "$REMOTE:/tmp/server-setup.sh"
+ssh "$REMOTE" "chmod +x /tmp/server-setup.sh"
 
 echo "  Running setup (this may take a few minutes)..."
 echo ""
 # Run directly (not via sudo) — we're already root.
 # Use bash explicitly to avoid TTY issues with ssh -t.
-ssh "$REMOTE" "bash /tmp/cherry-setup.sh"
+ssh "$REMOTE" "bash /tmp/server-setup.sh"
 
 # 3. Reboot if kernel boot params were just configured.
-NEEDS_REBOOT=$(ssh "$REMOTE" "test -f /tmp/.cherry-needs-reboot && echo yes || echo no")
+NEEDS_REBOOT=$(ssh "$REMOTE" "test -f /tmp/.server-needs-reboot && echo yes || echo no")
 if [[ "$NEEDS_REBOOT" == "yes" ]]; then
     echo "=== Rebooting for kernel boot params (isolcpus, nohz_full, rcu_nocbs) ==="
-    ssh "$REMOTE" "rm -f /tmp/.cherry-needs-reboot && shutdown -r now" 2>/dev/null || true
+    ssh "$REMOTE" "rm -f /tmp/.server-needs-reboot && shutdown -r now" 2>/dev/null || true
 
     # Wait for SSH to go down.
     echo -n "  Waiting for shutdown..."

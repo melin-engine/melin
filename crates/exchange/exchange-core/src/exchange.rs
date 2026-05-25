@@ -170,8 +170,7 @@ pub struct Exchange {
     /// `inst.book.drain_consumed_slots().collect()` would otherwise
     /// perform; the allocator's first-touch on a freshly-mmap'd page
     /// was the dominant source of the engine's deep-tail outliers
-    /// (~100µs spikes at p99.99999 under realistic flow on the cherry
-    /// EPYC box). Vec for sequential append + iterate; capacity held
+    /// (~100µs spikes at p99.99999 under realistic flow on EPYC 9255). Vec for sequential append + iterate; capacity held
     /// across calls via `mem::take` / put-back at the end of `execute`.
     scratch_consumed: Vec<(AccountId, OrderId, Side, ReservationSlot)>,
     /// Scratch buffer for `freed` tracking inside `execute`. Same

@@ -76,8 +76,8 @@ DPDK_IP="${DPDK_IP:-auto}"
 HUGEPAGES="${HUGEPAGES:-1024}"
 
 # MTU for trading interfaces. 1500 = standard Ethernet (default).
-# Use 9000 for jumbo frames if the switch supports it (Cherry VLAN
-# switches typically do NOT — test before deploying).
+# Use 9000 for jumbo frames if the switch supports it (many VLAN
+# switches do NOT — test before deploying).
 MTU="${MTU:-1500}"
 
 # Parse CLI overrides.

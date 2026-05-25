@@ -1,14 +1,14 @@
 #!/usr/bin/env bash
-# Setup script for Cherry benchmark servers.
+# Setup script for benchmark servers.
 #
 # Installs system packages, Rust, clones the repo, builds, and runs tests.
 # Designed to run as root (either directly or via sudo).
 #
 # Usage:
-#   ./scripts/cherry-deploy.sh root@<server-ip>   # preferred (handles everything)
+#   ./scripts/server-deploy.sh root@<server-ip>   # preferred (handles everything)
 #   # or manually:
 #   ssh root@<server-ip>
-#   bash /tmp/cherry-setup.sh
+#   bash /tmp/server-setup.sh
 
 set -euo pipefail
 
@@ -30,7 +30,7 @@ run_as_user() {
     fi
 }
 
-echo "=== Cherry server setup ==="
+echo "=== Server setup ==="
 echo "  User: $USER_NAME"
 echo "  Home: $USER_HOME"
 echo ""
@@ -281,7 +281,7 @@ if [[ -f "$GRUB_FILE" ]]; then
         fi
 
         update-grub
-        touch /tmp/.cherry-needs-reboot
+        touch /tmp/.server-needs-reboot
         echo "  *** REBOOT REQUIRED for new kernel params to take effect ***"
     else
         echo "=== Kernel boot params already configured ==="
@@ -577,7 +577,7 @@ if [[ -n "$JOURNAL_DISK" ]]; then
     UDEV_RULE="/etc/udev/rules.d/99-melin-journal-nvme.rules"
     cat > "$UDEV_RULE" << EOF
 # Melin journal NVMe tuning — reduce block layer jitter.
-# Applied to the journal disk identified during cherry-setup.sh.
+# Applied to the journal disk identified during server-setup.sh.
 ACTION=="add|change", KERNEL=="$JOURNAL_DEV", ATTR{queue/scheduler}="none", ATTR{queue/nr_requests}="2", ATTR{queue/nomerges}="2", ATTR{queue/wbt_lat_usec}="0", ATTR{queue/add_random}="0"
 EOF
     echo "  Installed udev rule: $UDEV_RULE"

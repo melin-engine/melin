@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Run the README benchmarks on a LAN setup (two+ Cherry servers).
+# Run the README benchmarks on a LAN setup (two+ servers).
 #
 # Benchmarks are organized as a transport × workload matrix:
 #
@@ -129,7 +129,7 @@
 #
 # Prerequisites:
 #   - SSH access to all machines (as root by default)
-#   - cherry-deploy.sh or cherry-setup.sh completed on all machines
+#   - server-deploy.sh or server-setup.sh completed on all machines
 #   - VLAN/private network between machines
 #   - bench-isolate.sh run on all machines for stable numbers
 
