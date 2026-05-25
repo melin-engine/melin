@@ -96,7 +96,7 @@ tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 io-uring = "0.7"
 melin-dpdk = { path = "../../core/dpdk", optional = true }
-smoltcp = { version = "0.13", default-features = false, features = ["std", "medium-ethernet", "proto-ipv4", "socket-tcp"], optional = true }
+smoltcp = { package = "fastcp", version = "0.13", default-features = false, features = ["std", "medium-ethernet", "proto-ipv4", "socket-tcp"], optional = true }
 ratatui = { version = "0.30", optional = true }
 crossterm = { version = "0.29", optional = true }
 plotters = { version = "0.3", optional = true, default-features = false, features = ["svg_backend", "bitmap_backend", "bitmap_encoder", "ttf", "line_series"] }
