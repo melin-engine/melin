@@ -1195,32 +1195,10 @@ where
         })
         .map_err(|e| format!("spawn matching thread: {e}"))?;
 
-    // ReplicationMetrics must be constructed before the response thread
-    // spawns so the gate can read per-slot cursors at every poll.
-    let replication_metrics: Option<Arc<crate::replication::ReplicationMetrics>> =
-        if replication_consumers.is_some() {
-            Some(Arc::new(crate::replication::ReplicationMetrics::default()))
-        } else {
-            None
-        };
-
-    // The operator-selected durability mode is published through a
-    // shared `AtomicU8` constructed by the caller (so the admin
-    // listener can hold a clone before this function runs). The
-    // response stage reads it once per gate iteration and rebuilds its
-    // local `Policy` when the byte changes; the admin `DURABILITY`
-    // command writes it. Re-derive the active mode here for the
-    // startup log so what we log matches what's actually live (an
-    // operator may have stored a different mode via `DURABILITY`
-    // between `run` and this point).
-    let active_mode_at_start = crate::durability_policy::DurabilityMode::from_u8(
-        durability_mode_atomic.load(Ordering::Relaxed),
-    )
-    .unwrap_or(config.durability_mode);
-    info!(
-        mode = %active_mode_at_start,
-        policy = %active_mode_at_start.to_policy(),
-        "durability mode active"
+    let replication_metrics = build_replication_metrics(
+        replication_consumers.is_some(),
+        &durability_mode_atomic,
+        config.durability_mode,
     );
 
     // Per-slot active flags exposed by the journal stage's replication
@@ -1385,42 +1363,15 @@ where
         busy_spin,
     )?;
 
-    // Spawn shadow snapshot thread if enabled. Works for any
-    // `A: Application` — under `skip-order-exec` the Exchange state
-    // stays empty and the snapshot is trivially small.
-    let shadow_handle = if let Some(shadow_cons) = shadow_consumer {
-        let snap_path = config.shadow_snapshot_path();
-        let interval = std::time::Duration::from_millis(config.snapshot_interval_ms);
-        let chain_hash =
-            chain_hash_lock.ok_or("chain hash lock must be Some when shadow is enabled")?;
-        let shadow_ex =
-            shadow_exchange.ok_or("shadow exchange must be Some when shadow is enabled")?;
-        let s_shadow = Arc::clone(&shutdown);
-        let handle = std::thread::Builder::new()
-            .name("shadow".into())
-            .spawn(move || {
-                melin_app::affinity::pin_thread("shadow", cores.shadow);
-                melin_transport_core::shadow::run(
-                    shadow_cons,
-                    shadow_ex,
-                    snap_path,
-                    interval,
-                    chain_hash,
-                    &s_shadow,
-                    busy_spin,
-                );
-            })
-            .map_err(|e| format!("spawn shadow thread: {e}"))?;
-
-        info!(
-            interval_ms = config.snapshot_interval_ms,
-            path = %config.shadow_snapshot_path().display(),
-            "shadow snapshot stage started"
-        );
-        Some(handle)
-    } else {
-        None
-    };
+    let shadow_handle = spawn_shadow_stage::<A>(
+        shadow_consumer,
+        shadow_exchange,
+        chain_hash_lock,
+        config,
+        &cores,
+        &shutdown,
+        busy_spin,
+    )?;
 
     // Seed instruments and accounts through the pipeline on first startup.
     // Events flow through journal + matching + replication like regular
@@ -1442,52 +1393,24 @@ where
     // the client port, so spawning health here doesn't change accept
     // semantics.
     let pipeline_healthy = Arc::new(AtomicBool::new(true));
-    let health_handle = if let Some(health_addr) = config.health_bind {
-        // Clone the replication ring cursors so the health snapshot can
-        // report per-slot ring depth (producer_cursor - consumer.processed).
-        // Both cursor types are `Arc`-backed, so cloning is cheap.
-        let (repl_ring_producers, repl_ring_consumers) = replication_ring_progress
-            .as_ref()
-            .map(|rp| {
-                (
-                    Some([
-                        Arc::clone(&rp.producer_cursors[0]),
-                        Arc::clone(&rp.producer_cursors[1]),
-                    ]),
-                    Some([
-                        Arc::clone(&rp.consumer_cursors[0]),
-                        Arc::clone(&rp.consumer_cursors[1]),
-                    ]),
-                )
-            })
-            .unwrap_or((None, None));
-        let fastest_repl_cursor_health = replication_metrics
-            .as_ref()
-            .map(|_| Arc::clone(&fastest_replica_cursor));
-        Some(melin_transport_core::health::spawn(
-            health_addr,
-            melin_transport_core::health::HealthState {
-                active_connections: Arc::clone(&active_connections),
-                events_processed: Arc::clone(&events_processed),
-                journal_cursor: Arc::clone(&journal_cursor),
-                matching_cursor: Arc::clone(&matching_cursor),
-                input_cursor,
-                replication_cursor: Arc::clone(&replication_cursor),
-                pipeline_healthy: Arc::clone(&pipeline_healthy),
-                replicas_connected: replicas_connected.clone(),
-                replication_metrics: replication_metrics.clone(),
-                replication_ring_producer_cursors: repl_ring_producers,
-                replication_ring_consumer_cursors: repl_ring_consumers,
-                fastest_replica_cursor: fastest_repl_cursor_health,
-                journal_utilization: Arc::clone(&journal_utilization),
-                matching_utilization: Arc::clone(&matching_utilization),
-                response_utilization: Arc::clone(&response_utilization),
-            },
-            Arc::clone(&shutdown),
-        )?)
-    } else {
-        None
-    };
+    let health_handle = spawn_health_endpoint(
+        config,
+        &active_connections,
+        &events_processed,
+        &journal_cursor,
+        &matching_cursor,
+        input_cursor,
+        &replication_cursor,
+        &pipeline_healthy,
+        &replicas_connected,
+        &replication_metrics,
+        &replication_ring_progress,
+        &fastest_replica_cursor,
+        &journal_utilization,
+        &matching_utilization,
+        &response_utilization,
+        &shutdown,
+    )?;
 
     if enable_replication && needs_seeding {
         info!("waiting for replica to connect before seeding...");
@@ -2208,23 +2131,10 @@ where
         })
         .map_err(|e| format!("spawn matching thread: {e}"))?;
 
-    // ReplicationMetrics must be constructed before the response thread
-    // spawns so the gate can read per-slot cursors at every poll.
-    let replication_metrics: Option<Arc<crate::replication::ReplicationMetrics>> =
-        if replication_consumers.is_some() {
-            Some(Arc::new(crate::replication::ReplicationMetrics::default()))
-        } else {
-            None
-        };
-
-    let active_mode_at_start = crate::durability_policy::DurabilityMode::from_u8(
-        durability_mode_atomic.load(Ordering::Relaxed),
-    )
-    .unwrap_or(config.durability_mode);
-    info!(
-        mode = %active_mode_at_start,
-        policy = %active_mode_at_start.to_policy(),
-        "durability mode active"
+    let replication_metrics = build_replication_metrics(
+        replication_consumers.is_some(),
+        &durability_mode_atomic,
+        config.durability_mode,
     );
 
     let replica_active: Option<[Arc<AtomicBool>; 2]> =
@@ -2267,40 +2177,15 @@ where
         })
         .map_err(|e| format!("spawn response thread: {e}"))?;
 
-    // Spawn shadow snapshot thread if enabled (same as kernel TCP path).
-    let shadow_handle = if let Some(shadow_cons) = shadow_consumer {
-        let snap_path = config.shadow_snapshot_path();
-        let interval = std::time::Duration::from_millis(config.snapshot_interval_ms);
-        let chain_hash =
-            chain_hash_lock.ok_or("chain hash lock must be Some when shadow is enabled")?;
-        let shadow_ex =
-            shadow_exchange.ok_or("shadow exchange must be Some when shadow is enabled")?;
-        let s_shadow = Arc::clone(&shutdown);
-        let handle = std::thread::Builder::new()
-            .name("shadow".into())
-            .spawn(move || {
-                melin_app::affinity::pin_thread("shadow", cores.shadow);
-                melin_transport_core::shadow::run(
-                    shadow_cons,
-                    shadow_ex,
-                    snap_path,
-                    interval,
-                    chain_hash,
-                    &s_shadow,
-                    busy_spin,
-                );
-            })
-            .map_err(|e| format!("spawn shadow thread: {e}"))?;
-
-        info!(
-            interval_ms = config.snapshot_interval_ms,
-            path = %config.shadow_snapshot_path().display(),
-            "shadow snapshot stage started"
-        );
-        Some(handle)
-    } else {
-        None
-    };
+    let shadow_handle = spawn_shadow_stage::<A>(
+        shadow_consumer,
+        shadow_exchange,
+        chain_hash_lock,
+        &config,
+        &cores,
+        &shutdown,
+        busy_spin,
+    )?;
 
     // Spawn DPDK replication sender if enabled. Uses its own DPDK queue pair
     // and smoltcp stack so the replication channel goes through kernel bypass.
@@ -2487,53 +2372,25 @@ where
     // during seeding — the same property the TCP path achieves by deferring
     // its `spawn_reader` call to after seed-drain.
 
-    // Pipeline health flag: true while all pipeline threads are alive.
     let pipeline_healthy = Arc::new(AtomicBool::new(true));
-
-    // Spawn health/liveness endpoint (same as TCP path).
-    let health_handle = if let Some(health_addr) = config.health_bind {
-        let (repl_ring_producers, repl_ring_consumers) = replication_ring_progress
-            .as_ref()
-            .map(|rp| {
-                (
-                    Some([
-                        Arc::clone(&rp.producer_cursors[0]),
-                        Arc::clone(&rp.producer_cursors[1]),
-                    ]),
-                    Some([
-                        Arc::clone(&rp.consumer_cursors[0]),
-                        Arc::clone(&rp.consumer_cursors[1]),
-                    ]),
-                )
-            })
-            .unwrap_or((None, None));
-        let fastest_repl_cursor_health = replication_metrics
-            .as_ref()
-            .map(|_| Arc::clone(&fastest_replica_cursor));
-        Some(melin_transport_core::health::spawn(
-            health_addr,
-            melin_transport_core::health::HealthState {
-                active_connections: Arc::clone(&active_connections),
-                events_processed: Arc::clone(&events_processed),
-                journal_cursor: Arc::clone(&journal_cursor),
-                matching_cursor: Arc::clone(&matching_cursor),
-                input_cursor,
-                replication_cursor: Arc::clone(&replication_cursor),
-                pipeline_healthy: Arc::clone(&pipeline_healthy),
-                replicas_connected: replicas_connected.clone(),
-                replication_metrics: replication_metrics.clone(),
-                replication_ring_producer_cursors: repl_ring_producers,
-                replication_ring_consumer_cursors: repl_ring_consumers,
-                fastest_replica_cursor: fastest_repl_cursor_health,
-                journal_utilization: Arc::clone(&journal_utilization),
-                matching_utilization: Arc::clone(&matching_utilization),
-                response_utilization: Arc::clone(&response_utilization),
-            },
-            Arc::clone(&shutdown),
-        )?)
-    } else {
-        None
-    };
+    let health_handle = spawn_health_endpoint(
+        &config,
+        &active_connections,
+        &events_processed,
+        &journal_cursor,
+        &matching_cursor,
+        input_cursor,
+        &replication_cursor,
+        &pipeline_healthy,
+        &replicas_connected,
+        &replication_metrics,
+        &replication_ring_progress,
+        &fastest_replica_cursor,
+        &journal_utilization,
+        &matching_utilization,
+        &response_utilization,
+        &shutdown,
+    )?;
 
     info!(
         ip = %dpdk_config.ip_addr,
@@ -2711,6 +2568,146 @@ where
 
     let (app, writer) = engine.into_parts();
     Ok((app, writer, needs_seeding))
+}
+
+// ---------------------------------------------------------------------------
+// Shared helpers — used identically by both TCP and DPDK boot paths.
+// ---------------------------------------------------------------------------
+
+fn build_replication_metrics(
+    has_replication: bool,
+    durability_mode_atomic: &AtomicU8,
+    config_mode: crate::durability_policy::DurabilityMode,
+) -> Option<Arc<crate::replication::ReplicationMetrics>> {
+    let metrics = if has_replication {
+        Some(Arc::new(crate::replication::ReplicationMetrics::default()))
+    } else {
+        None
+    };
+
+    let active_mode = crate::durability_policy::DurabilityMode::from_u8(
+        durability_mode_atomic.load(Ordering::Relaxed),
+    )
+    .unwrap_or(config_mode);
+    info!(
+        mode = %active_mode,
+        policy = %active_mode.to_policy(),
+        "durability mode active"
+    );
+
+    metrics
+}
+
+fn spawn_shadow_stage<A: Application + Send + 'static>(
+    shadow_consumer: Option<Consumer<InputSlot<A::Event>>>,
+    shadow_exchange: Option<A>,
+    chain_hash_lock: Option<
+        Arc<melin_pipeline::seqlock::SeqLock<melin_transport_core::pipeline::FsyncState>>,
+    >,
+    config: &ServerConfig,
+    cores: &PipelineCores,
+    shutdown: &Arc<AtomicBool>,
+    busy_spin: bool,
+) -> Result<Option<std::thread::JoinHandle<()>>, Box<dyn std::error::Error>>
+where
+    A::Event: Send + Sync + 'static,
+{
+    let Some(shadow_cons) = shadow_consumer else {
+        return Ok(None);
+    };
+    let snap_path = config.shadow_snapshot_path();
+    let interval = std::time::Duration::from_millis(config.snapshot_interval_ms);
+    let chain_hash =
+        chain_hash_lock.ok_or("chain hash lock must be Some when shadow is enabled")?;
+    let shadow_ex = shadow_exchange.ok_or("shadow exchange must be Some when shadow is enabled")?;
+    let s_shadow = Arc::clone(shutdown);
+    let shadow_core = cores.shadow;
+    let handle = std::thread::Builder::new()
+        .name("shadow".into())
+        .spawn(move || {
+            melin_app::affinity::pin_thread("shadow", shadow_core);
+            melin_transport_core::shadow::run(
+                shadow_cons,
+                shadow_ex,
+                snap_path,
+                interval,
+                chain_hash,
+                &s_shadow,
+                busy_spin,
+            );
+        })
+        .map_err(|e| format!("spawn shadow thread: {e}"))?;
+
+    info!(
+        interval_ms = config.snapshot_interval_ms,
+        path = %config.shadow_snapshot_path().display(),
+        "shadow snapshot stage started"
+    );
+    Ok(Some(handle))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn spawn_health_endpoint(
+    config: &ServerConfig,
+    active_connections: &Arc<AtomicU64>,
+    events_processed: &Arc<AtomicU64>,
+    journal_cursor: &Arc<melin_pipeline::padding::Sequence>,
+    matching_cursor: &Arc<melin_pipeline::padding::Sequence>,
+    input_cursor: Box<dyn melin_pipeline::ring::QueueCursor>,
+    replication_cursor: &Arc<AtomicU64>,
+    pipeline_healthy: &Arc<AtomicBool>,
+    replicas_connected: &Option<Arc<std::sync::atomic::AtomicU32>>,
+    replication_metrics: &Option<Arc<crate::replication::ReplicationMetrics>>,
+    replication_ring_progress: &Option<melin_transport_core::pipeline::ReplicationRingProgress>,
+    fastest_replica_cursor: &Arc<AtomicU64>,
+    journal_utilization: &Arc<melin_transport_core::pipeline::StageUtilization>,
+    matching_utilization: &Arc<melin_transport_core::pipeline::StageUtilization>,
+    response_utilization: &Arc<melin_transport_core::pipeline::StageUtilization>,
+    shutdown: &Arc<AtomicBool>,
+) -> Result<Option<std::thread::JoinHandle<()>>, Box<dyn std::error::Error>> {
+    let Some(health_addr) = config.health_bind else {
+        return Ok(None);
+    };
+
+    let (repl_ring_producers, repl_ring_consumers) = replication_ring_progress
+        .as_ref()
+        .map(|rp| {
+            (
+                Some([
+                    Arc::clone(&rp.producer_cursors[0]),
+                    Arc::clone(&rp.producer_cursors[1]),
+                ]),
+                Some([
+                    Arc::clone(&rp.consumer_cursors[0]),
+                    Arc::clone(&rp.consumer_cursors[1]),
+                ]),
+            )
+        })
+        .unwrap_or((None, None));
+    let fastest_repl_cursor_health = replication_metrics
+        .as_ref()
+        .map(|_| Arc::clone(fastest_replica_cursor));
+    Ok(Some(melin_transport_core::health::spawn(
+        health_addr,
+        melin_transport_core::health::HealthState {
+            active_connections: Arc::clone(active_connections),
+            events_processed: Arc::clone(events_processed),
+            journal_cursor: Arc::clone(journal_cursor),
+            matching_cursor: Arc::clone(matching_cursor),
+            input_cursor,
+            replication_cursor: Arc::clone(replication_cursor),
+            pipeline_healthy: Arc::clone(pipeline_healthy),
+            replicas_connected: replicas_connected.clone(),
+            replication_metrics: replication_metrics.clone(),
+            replication_ring_producer_cursors: repl_ring_producers,
+            replication_ring_consumer_cursors: repl_ring_consumers,
+            fastest_replica_cursor: fastest_repl_cursor_health,
+            journal_utilization: Arc::clone(journal_utilization),
+            matching_utilization: Arc::clone(matching_utilization),
+            response_utilization: Arc::clone(response_utilization),
+        },
+        Arc::clone(shutdown),
+    )?))
 }
 
 /// Spawn the event-publisher thread on the affinity core configured by
