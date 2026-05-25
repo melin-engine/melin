@@ -628,18 +628,30 @@ impl<A: Application> DpdkReplicationDriver<A> {
 
                     slot.send_buf.clear();
                     let mut batches_sent = 0;
-                    // Read-and-peek loop: only commit a batch once we've
-                    // confirmed it fits. If it doesn't fit, leave the
-                    // ring cursor in place so the next iteration retries
-                    // after transport.poll() drains the wire.
                     while batches_sent < batch_size {
                         let Some((meta, data)) = slot.consumer.try_read() else {
                             break;
                         };
                         let data_len = data.len();
                         if data_len > available {
-                            // Don't commit; retry next iteration.
-                            break;
+                            // Batch doesn't fit — flush what we have so
+                            // far, poll to drain the wire, then re-check
+                            // with a clean slate.
+                            if !slot.send_buf.is_empty() {
+                                metrics.bytes_sent[slot_idx]
+                                    .fetch_add(slot.send_buf.len() as u64, Ordering::Relaxed);
+                                if !transport.queue_send(handle, &slot.send_buf) {
+                                    slot.send_buf.clear();
+                                    break;
+                                }
+                                slot.send_buf.clear();
+                            }
+                            transport.poll();
+                            let used = transport.tx_queue_bytes(handle);
+                            available = max_tx.saturating_sub(used);
+                            if data_len > available {
+                                break;
+                            }
                         }
                         slot.send_buf.extend_from_slice(data);
                         slot.consumer.commit();
@@ -682,6 +694,13 @@ impl<A: Application> DpdkReplicationDriver<A> {
                             }
                             continue;
                         }
+                        // Flush immediately so replication data hits the
+                        // wire without waiting for the next outer-loop
+                        // poll. Without this, a client-traffic burst
+                        // starves the replication TX path: the TxQueue
+                        // fills, the driver backs off, the ring overflows,
+                        // and the response gate freezes the exchange.
+                        transport.poll();
                         slot.last_send = std::time::Instant::now();
                     }
 
