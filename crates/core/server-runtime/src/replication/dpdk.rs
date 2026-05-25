@@ -71,7 +71,8 @@ impl ReceiverTransport for DpdkReceiverTransport<'_> {
             }
             attempts += 1;
             if attempts >= ACK_RETRY_CAP {
-                return Ok(true);
+                tracing::warn!("DPDK ack send failed after {ACK_RETRY_CAP} retries");
+                return Ok(false);
             }
             self.transport.poll();
             if !self.transport.is_active(self.handle) {
