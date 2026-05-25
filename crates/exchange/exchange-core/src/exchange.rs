@@ -262,7 +262,11 @@ impl Exchange {
         }
     }
 
-    /// Pre-allocate order books for a known bulk-seed workload.
+    /// Pre-allocate collections for a known bulk-seed workload.
+    ///
+    /// Sizes the balance map to `num_accounts × num_instruments × 2`
+    /// (base + quote per instrument per account) so the seed phase
+    /// doesn't hit multi-hundred-ms rehash stalls as the map grows.
     ///
     /// Populates the instrument pool with one `OrderBook` per expected
     /// instrument (indexed by symbol). `add_instrument` pulls from
@@ -270,7 +274,11 @@ impl Exchange {
     /// first-touch + mlock spike during seed (matching thread runs
     /// under MCL_FUTURE so any new allocation faults thousands of
     /// pages at once).
-    pub fn prefault_seed(&mut self, num_instruments: usize) {
+    pub fn prefault_seed(&mut self, num_accounts: usize, num_instruments: usize) {
+        let balance_capacity = num_accounts
+            .saturating_mul(num_instruments)
+            .saturating_mul(2);
+        self.accounts = AccountManager::with_balance_capacity(balance_capacity);
         self.instruments.reserve(num_instruments.max(64));
         self.instrument_pool = (0..num_instruments)
             .map(|i| Some(OrderBook::with_capacity(Symbol(i as u32))))

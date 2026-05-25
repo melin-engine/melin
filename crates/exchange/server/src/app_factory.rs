@@ -52,7 +52,10 @@ impl AppFactory for Factory {
     }
 
     fn prefault(&self, app: &mut ServerApp) {
-        app.0.prefault_seed(self.config.instruments as usize);
+        app.0.prefault_seed(
+            self.config.accounts as usize,
+            self.config.instruments as usize,
+        );
     }
 
     fn apply_operator_policy(&self, app: &mut ServerApp) {
