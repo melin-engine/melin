@@ -67,6 +67,9 @@ impl ReceiverTransport for DpdkReceiverTransport<'_> {
         let mut attempts: u32 = 0;
         loop {
             if self.transport.queue_send(self.handle, &self.send_buf) {
+                // Flush immediately so the ACK reaches the primary
+                // without waiting for the next poll_recv iteration.
+                self.transport.poll();
                 return Ok(true);
             }
             attempts += 1;

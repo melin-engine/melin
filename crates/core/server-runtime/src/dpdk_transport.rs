@@ -273,10 +273,45 @@ pub fn run_dpdk_poll<A: Application>(
             }
         }
 
-        // 1. Poll NIC + smoltcp.
+        // TX drain macro — used at multiple points in the loop to move
+        // response frames from the SPSC queue into smoltcp socket buffers
+        // so the next transport.poll() flushes them to the wire.
+        macro_rules! drain_tx {
+            () => {
+                while let Some((_seq, frame)) = tx_rx.try_consume() {
+                    if let Some(&handle) = id_to_handle.get(&frame.connection_id)
+                        && !transport.queue_send(handle, frame.as_bytes())
+                    {
+                        debug!(
+                            connection_id = frame.connection_id,
+                            "DPDK: TX queue overflow, dropping connection"
+                        );
+                        transport.close(handle);
+                        let _ = control_tx.send(ControlEvent::Disconnected {
+                            connection_id: frame.connection_id,
+                        });
+                        id_to_handle.remove(&frame.connection_id);
+                        if let Some(mut removed) = connections[handle.index()].take() {
+                            removed.parse_buf.clear();
+                            parse_buf_pool.push(removed.parse_buf);
+                            connection_count -= 1;
+                        }
+                    }
+                }
+            };
+        }
+
+        // 1. Drain TX frames from the response stage BEFORE polling.
+        // queue_send() stores data in TxQueue; the subsequent poll()
+        // calls flush_tx_queues → iface.poll → flush_tx to push it
+        // onto the wire in the same iteration. Previously the drain
+        // happened after poll, adding a full loop iteration of latency.
+        drain_tx!();
+
+        // 2. Poll NIC + smoltcp (flushes TX we just drained + receives RX).
         transport.poll();
 
-        // 2. Accept new connections — dispatch by listen port so the
+        // 3. Accept new connections — dispatch by listen port so the
         //    replication driver gets its own connections, client logic
         //    only sees trading-port connections.
         for accepted in transport.take_accepted() {
@@ -345,35 +380,10 @@ pub fn run_dpdk_poll<A: Application>(
             connection_count += 1;
         }
 
-        // 3. Drain TX frames from the response stage into smoltcp sockets.
-        // Lock-free SPSC — no mutex contention on the hot path.
-        // Single HashMap lookup (id_to_handle) instead of two.
-        while let Some((_seq, frame)) = tx_rx.try_consume() {
-            if let Some(&handle) = id_to_handle.get(&frame.connection_id)
-                && !transport.queue_send(handle, frame.as_bytes())
-            {
-                // TX queue overflow — client fell behind. Drop connection.
-                debug!(
-                    connection_id = frame.connection_id,
-                    "DPDK: TX queue overflow, dropping connection"
-                );
-                transport.close(handle);
-                let _ = control_tx.send(ControlEvent::Disconnected {
-                    connection_id: frame.connection_id,
-                });
-                id_to_handle.remove(&frame.connection_id);
-                if let Some(mut removed) = connections[handle.index()].take() {
-                    removed.parse_buf.clear();
-                    parse_buf_pool.push(removed.parse_buf);
-                    connection_count -= 1;
-                }
-            }
-        }
-
         // 4. Read data from all connections and process.
-        // Mid-iteration poll every N connections to keep the NIC busy —
-        // flush TX responses and receive new data without waiting for
-        // the full connection iteration to complete.
+        // Mid-iteration: drain TX + poll every N connections to keep
+        // responses flowing and the NIC busy without waiting for the
+        // full connection iteration to complete.
         const POLL_EVERY_N_CONNS: usize = 4;
 
         // One wall-clock read per outer poll iteration, reused for
@@ -410,6 +420,9 @@ pub fn run_dpdk_poll<A: Application>(
                 continue;
             }
             if active_idx > 0 && active_idx.is_multiple_of(POLL_EVERY_N_CONNS) {
+                // Drain fresh responses before polling so they're flushed
+                // to the wire in this poll cycle instead of the next.
+                drain_tx!();
                 transport.poll();
                 // Drive the replication driver at the same cadence as the
                 // mid-loop NIC poll. Without this, `tick()` only fires once
@@ -419,6 +432,10 @@ pub fn run_dpdk_poll<A: Application>(
                 // "ring backpressure timeout".
                 if let Some(ref mut driver) = repl_driver {
                     driver.tick(&mut transport, shutdown);
+                }
+                // drain_tx may have closed the connection at this idx
+                if connections[idx].is_none() {
+                    continue;
                 }
             }
             active_idx += 1;
@@ -585,12 +602,19 @@ pub fn run_dpdk_poll<A: Application>(
             }
         }
 
+        // Final drain + poll before the replication tick so fresh ACK
+        // data from replicas is available (arrived since the last mid-
+        // iteration poll) and any remaining client TX is flushed.
+        drain_tx!();
+        transport.poll();
+
         // Drive the replication driver's per-iteration work — handshake
         // progression, journal catch-up (blocking on first connect),
         // ack processing, and live data-batch sends. With a single
         // queue + single thread, this is what replaces the previous
-        // dedicated repl-sender thread; transport.poll() above flushed
-        // any TX the driver queued on the prior iteration.
+        // dedicated repl-sender thread; the poll above flushed any TX
+        // the driver queued on the prior iteration and received any
+        // pending ACKs from replicas.
         if let Some(ref mut driver) = repl_driver {
             driver.tick(&mut transport, shutdown);
         }
