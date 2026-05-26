@@ -10,7 +10,7 @@ The single-threaded exchange core (order matching, risk checks, balance updates,
 
 | Throughput | p50 | p99 | p99.9 | p99.99 | p99.999 | p99.9999 | p99.99999 |
 |------------|-----|-----|-------|--------|---------|----------|-----------|
-| 4.60M/s | 0.10 us | 0.42 us | 0.58 us | 0.77 us | 0.99 us | 1.17 us | 1.35 us |
+| 4.60M/s | 0.10 µs | 0.42 µs | 0.58 µs | 0.77 µs | 0.99 µs | 1.17 µs | 1.35 µs |
 
 End-to-end numbers (including journal, replication, and network) are in the [sequencer README](../../README.md#benchmarks).
 

@@ -14,7 +14,7 @@ Built in Rust on an [LMAX](https://martinfowler.com/articles/lmax.html)-inspired
 - CRC32C integrity checks and BLAKE3 hash chain for tamper evidence.
 - Journal catch-up, snapshot transfer, and automatic trading halt on replica loss. Sub-second switchover upon promotion.
 
-**Fast.** p99 ~ 520 us at 1M events/sec on kernel TCP and commodity datacenter hardware (AMD EPYC 9275F, 25 Gb/s NIC, PLP NVMe). Single-event latency floor: 27 us p99.
+**Fast.** p99 ~ 520 µs at 1M events/sec on kernel TCP and commodity datacenter hardware (AMD EPYC 9275F, 25 Gb/s NIC, PLP NVMe). Single-event latency floor: 27 µs p99.
 
 ## Architecture
 
@@ -57,13 +57,13 @@ All numbers are **full round-trip** (client sends → server persists + replicat
 
 | Durability | Throughput | p50 | p99 | p99.9 | p99.99 |
 |------------|-----------|-----|-----|-------|--------|
-| Hybrid (1 persisted + 2 in-memory) | 1M/s | 103 us | 522 us | 597 us | 667 us |
+| Hybrid (1 persisted + 2 in-memory) | 1M/s | 103 µs | 522 µs | 597 µs | 667 µs |
 
 ### Single-event latency (1 client, window 1)
 
 | Durability | Throughput | p50 | p99 | p99.9 | p99.99 |
 |-----------|-----------|-----|-----|-------|--------|
-| Hybrid (1 persisted + 2 in-memory) | 45K/s | 22 us | 27 us | 30 us | 36 us |
+| Hybrid (1 persisted + 2 in-memory) | 45K/s | 22 µs | 27 µs | 30 µs | 36 µs |
 
 See [replication](docs/replication.md) for the full durability-mode menu, [operations](docs/operations.md) and [benchmarking](docs/benchmarking.md) for tuning guidance.
 
