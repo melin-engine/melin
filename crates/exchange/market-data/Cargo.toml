@@ -1,6 +1,6 @@
 [package]
 name = "melin-market-data"
-version = "0.10.0"
+version = "0.10.1"
 edition = "2024"
 license-file.workspace = true
 repository.workspace = true
@@ -9,9 +9,9 @@ authors.workspace = true
 description = "Order book mirror and trade history reconstructed from execution reports"
 
 [dependencies]
-melin-types = { path = "../types", version = "0.10.0" }
-melin-protocol = { path = "../protocol", version = "0.10.0" }
-melin-wire-protocol = { path = "../../core/wire-protocol", version = "0.10.0" }
+melin-types = { path = "../types", version = "0.10.1" }
+melin-protocol = { path = "../protocol", version = "0.10.1" }
+melin-wire-protocol = { path = "../../core/wire-protocol", version = "0.10.1" }
 ed25519-dalek = { workspace = true }
 tracing = { workspace = true }
 astenn = "0.1"

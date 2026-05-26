@@ -1,6 +1,6 @@
 [package]
 name = "melin-protocol"
-version = "0.10.0"
+version = "0.10.1"
 edition = "2024"
 license-file.workspace = true
 repository.workspace = true
@@ -13,8 +13,8 @@ description = "Binary wire protocol with typed request/response enums for the Me
 # replaces hand-rolled le::put / le::get pairs. derive feature for
 # `FromBytes` / `IntoBytes`.
 zerocopy = { version = "0.8", features = ["derive"] }
-melin-types = { path = "../types", version = "0.10.0" }
-melin-wire-protocol = { path = "../../core/wire-protocol", version = "0.10.0" }
+melin-types = { path = "../types", version = "0.10.1" }
+melin-wire-protocol = { path = "../../core/wire-protocol", version = "0.10.1" }
 
 [dev-dependencies]
 bolero = "0.13"

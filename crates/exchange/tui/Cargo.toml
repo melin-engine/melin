@@ -1,6 +1,6 @@
 [package]
 name = "melin-tui"
-version = "0.10.0"
+version = "0.10.1"
 edition = "2024"
 license-file.workspace = true
 repository.workspace = true
@@ -9,8 +9,8 @@ authors.workspace = true
 description = "Interactive TUI trading client for the Melin exchange"
 
 [dependencies]
-melin-client = { path = "../client", version = "0.10.0" }
-melin-protocol = { path = "../protocol", version = "0.10.0" }
+melin-client = { path = "../client", version = "0.10.1" }
+melin-protocol = { path = "../protocol", version = "0.10.1" }
 ed25519-dalek = { workspace = true }
 ratatui = "0.30"
 crossterm = "0.29"

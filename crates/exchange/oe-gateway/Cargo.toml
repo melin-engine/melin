@@ -1,6 +1,6 @@
 [package]
 name = "melin-oe-gateway"
-version = "0.10.0"
+version = "0.10.1"
 edition = "2024"
 license-file.workspace = true
 repository.workspace = true
@@ -13,10 +13,10 @@ name = "melin-oe-gateway"
 path = "src/main.rs"
 
 [dependencies]
-melin-gateway-core = { path = "../gateway-core", version = "0.10.0" }
-melin-protocol = { path = "../protocol", version = "0.10.0" }
-melin-exchange-core = { path = "../exchange-core", version = "0.10.0" }
-melin-types = { path = "../types", version = "0.10.0" }
+melin-gateway-core = { path = "../gateway-core", version = "0.10.1" }
+melin-protocol = { path = "../protocol", version = "0.10.1" }
+melin-exchange-core = { path = "../exchange-core", version = "0.10.1" }
+melin-types = { path = "../types", version = "0.10.1" }
 ed25519-dalek = { workspace = true }
 toml = "1"
 serde = { version = "1", features = ["derive"] }

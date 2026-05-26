@@ -1,6 +1,6 @@
 [package]
 name = "melin-admin"
-version = "0.10.0"
+version = "0.10.1"
 edition = "2024"
 license-file.workspace = true
 repository.workspace = true
@@ -21,8 +21,8 @@ name = "melin-promote"
 path = "src/promote.rs"
 
 [dependencies]
-melin-client = { path = "../client", version = "0.10.0" }
-melin-protocol = { path = "../protocol", version = "0.10.0" }
+melin-client = { path = "../client", version = "0.10.1" }
+melin-protocol = { path = "../protocol", version = "0.10.1" }
 base64 = { workspace = true }
 ed25519-dalek = { workspace = true }
 rand = { workspace = true }
