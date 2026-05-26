@@ -2,7 +2,7 @@
 name = "melin-oe-gateway"
 version = "0.10.0"
 edition = "2024"
-license.workspace = true
+license-file.workspace = true
 repository.workspace = true
 homepage.workspace = true
 authors.workspace = true
@@ -13,10 +13,10 @@ name = "melin-oe-gateway"
 path = "src/main.rs"
 
 [dependencies]
-melin-gateway-core = { path = "../gateway-core" }
-melin-protocol = { path = "../protocol" }
-melin-exchange-core = { path = "../exchange-core" }
-melin-types = { path = "../types" }
+melin-gateway-core = { path = "../gateway-core", version = "0.10.0" }
+melin-protocol = { path = "../protocol", version = "0.10.0" }
+melin-exchange-core = { path = "../exchange-core", version = "0.10.0" }
+melin-types = { path = "../types", version = "0.10.0" }
 ed25519-dalek = { workspace = true }
 toml = "1"
 serde = { version = "1", features = ["derive"] }

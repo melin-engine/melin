@@ -3,7 +3,7 @@ members = ["crates/*/*"]
 resolver = "3"
 
 [workspace.package]
-license = "LicenseRef-BuSL-1.1"
+license-file = "LICENSE"
 repository = "https://github.com/melin-engine/melin"
 homepage = "https://github.com/melin-engine/melin"
 authors = ["P.L.S.C."]

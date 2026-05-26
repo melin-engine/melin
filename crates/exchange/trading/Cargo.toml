@@ -2,7 +2,7 @@
 name = "melin-trading"
 version = "0.10.0"
 edition = "2024"
-license.workspace = true
+license-file.workspace = true
 repository.workspace = true
 homepage.workspace = true
 authors.workspace = true
@@ -13,5 +13,5 @@ name = "melin_trading"
 path = "src/lib.rs"
 
 [dependencies]
-melin-app = { path = "../../core/app" }
-melin-types = { path = "../types" }
+melin-app = { path = "../../core/app", version = "0.10.0" }
+melin-types = { path = "../types", version = "0.10.0" }

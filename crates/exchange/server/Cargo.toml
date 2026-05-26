@@ -2,7 +2,7 @@
 name = "melin-server"
 version = "0.10.0"
 edition = "2024"
-license.workspace = true
+license-file.workspace = true
 repository.workspace = true
 homepage.workspace = true
 authors.workspace = true
@@ -76,17 +76,17 @@ name = "journal-verify"
 path = "src/bin/journal-verify.rs"
 
 [dependencies]
-melin-app = { path = "../../core/app" }
-melin-pipeline = { path = "../../core/pipeline" }
-melin-exchange-core = { path = "../exchange-core" }
-melin-journal = { path = "../../core/journal" }
-melin-protocol = { path = "../protocol" }
-melin-server-runtime = { path = "../../core/server-runtime" }
-melin-trading = { path = "../trading" }
-melin-transport-core = { path = "../../core/transport-core" }
-melin-types = { path = "../types" }
-melin-wire-protocol = { path = "../../core/wire-protocol" }
-melin-market-data = { path = "../market-data" }
+melin-app = { path = "../../core/app", version = "0.10.0" }
+melin-pipeline = { path = "../../core/pipeline", version = "0.10.0" }
+melin-exchange-core = { path = "../exchange-core", version = "0.10.0" }
+melin-journal = { path = "../../core/journal", version = "0.10.0" }
+melin-protocol = { path = "../protocol", version = "0.10.0" }
+melin-server-runtime = { path = "../../core/server-runtime", version = "0.10.0" }
+melin-trading = { path = "../trading", version = "0.10.0" }
+melin-transport-core = { path = "../../core/transport-core", version = "0.10.0" }
+melin-types = { path = "../types", version = "0.10.0" }
+melin-wire-protocol = { path = "../../core/wire-protocol", version = "0.10.0" }
+melin-market-data = { path = "../market-data", version = "0.10.0" }
 blake3 = "1"
 clap = { workspace = true }
 base64 = { workspace = true }
@@ -101,14 +101,14 @@ tikv-jemallocator = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 zerocopy = { version = "0.8", features = ["derive"] }
-melin-dpdk = { path = "../../core/dpdk", optional = true }
+melin-dpdk = { path = "../../core/dpdk", version = "0.10.0", optional = true }
 
 [dev-dependencies]
 bolero = "0.13"
-melin-client = { path = "../client" }
-melin-journal = { path = "../../core/journal", features = ["test-utils"] }
-melin-protocol = { path = "../protocol" }
-melin-transport-core = { path = "../../core/transport-core", features = ["test-utils"] }
+melin-client = { path = "../client", version = "0.10.0" }
+melin-journal = { path = "../../core/journal", version = "0.10.0", features = ["test-utils"] }
+melin-protocol = { path = "../protocol", version = "0.10.0" }
+melin-transport-core = { path = "../../core/transport-core", version = "0.10.0", features = ["test-utils"] }
 ed25519-dalek = { workspace = true }
 serial_test = "3"
 tempfile = "3"

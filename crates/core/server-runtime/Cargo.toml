@@ -2,7 +2,7 @@
 name = "melin-server-runtime"
 version = "0.10.0"
 edition = "2024"
-license.workspace = true
+license-file.workspace = true
 repository.workspace = true
 homepage.workspace = true
 authors.workspace = true
@@ -34,11 +34,11 @@ no-o-direct = [
 ]
 
 [dependencies]
-melin-app = { path = "../app" }
-melin-pipeline = { path = "../pipeline" }
-melin-journal = { path = "../journal" }
-melin-wire-protocol = { path = "../wire-protocol" }
-melin-transport-core = { path = "../transport-core" }
+melin-app = { path = "../app", version = "0.10.0" }
+melin-pipeline = { path = "../pipeline", version = "0.10.0" }
+melin-journal = { path = "../journal", version = "0.10.0" }
+melin-wire-protocol = { path = "../wire-protocol", version = "0.10.0" }
+melin-transport-core = { path = "../transport-core", version = "0.10.0" }
 blake3 = "1"
 base64 = { workspace = true }
 clap = { workspace = true }
@@ -51,18 +51,18 @@ rand = { workspace = true }
 rustc-hash = "2"
 tracing = { workspace = true }
 zerocopy = { version = "0.8", features = ["derive"] }
-melin-dpdk = { path = "../dpdk", optional = true }
+melin-dpdk = { path = "../dpdk", version = "0.10.0", optional = true }
 
 [dev-dependencies]
 # The runtime's library API is application-agnostic, but a few unit
 # tests (auth handshake, replication wire format, DPDK fixtures) need
 # the full exchange protocol/types to construct realistic fixtures.
 # These are dev-only — the lib has no exchange dependency.
-melin-protocol = { path = "../../exchange/protocol" }
-melin-trading = { path = "../../exchange/trading" }
-melin-types = { path = "../../exchange/types" }
+melin-protocol = { path = "../../exchange/protocol", version = "0.10.0" }
+melin-trading = { path = "../../exchange/trading", version = "0.10.0" }
+melin-types = { path = "../../exchange/types", version = "0.10.0" }
 tempfile = "3"
 serial_test = "3"
 proptest = "1"
-melin-journal = { path = "../journal", features = ["test-utils"] }
-melin-transport-core = { path = "../transport-core", features = ["test-utils"] }
+melin-journal = { path = "../journal", version = "0.10.0", features = ["test-utils"] }
+melin-transport-core = { path = "../transport-core", version = "0.10.0", features = ["test-utils"] }

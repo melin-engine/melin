@@ -2,7 +2,7 @@
 name = "melin-journal"
 version = "0.10.0"
 edition = "2024"
-license.workspace = true
+license-file.workspace = true
 repository.workspace = true
 homepage.workspace = true
 authors.workspace = true
@@ -46,8 +46,8 @@ tracing = { workspace = true }
 # replaces field-by-field le::put / le::get chains with single struct
 # read/writes. derive feature for `FromBytes` / `IntoBytes`.
 zerocopy = { version = "0.8", features = ["derive", "alloc"] }
-melin-app = { path = "../app" }
-melin-pipeline = { path = "../pipeline" }
+melin-app = { path = "../app", version = "0.10.0" }
+melin-pipeline = { path = "../pipeline", version = "0.10.0" }
 memmap2 = "0.9.10"
 
 [dev-dependencies]

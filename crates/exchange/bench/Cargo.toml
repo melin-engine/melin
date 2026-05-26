@@ -2,7 +2,7 @@
 name = "melin-bench"
 version = "0.10.0"
 edition = "2024"
-license.workspace = true
+license-file.workspace = true
 repository.workspace = true
 homepage.workspace = true
 authors.workspace = true
@@ -75,17 +75,17 @@ name = "journal_writer_bench"
 path = "src/journal_writer_bench.rs"
 
 [dependencies]
-melin-exchange-core = { path = "../exchange-core" }
-melin-trading = { path = "../trading" }
-melin-types = { path = "../types" }
-melin-journal = { path = "../../core/journal" }
-melin-pipeline = { path = "../../core/pipeline" }
-melin-protocol = { path = "../protocol" }
-melin-wire-protocol = { path = "../../core/wire-protocol" }
-melin-server-runtime = { path = "../../core/server-runtime" }
-melin-server = { path = "../server", default-features = false }
-melin-app = { path = "../../core/app" }
-melin-transport-core = { path = "../../core/transport-core" }
+melin-exchange-core = { path = "../exchange-core", version = "0.10.0" }
+melin-trading = { path = "../trading", version = "0.10.0" }
+melin-types = { path = "../types", version = "0.10.0" }
+melin-journal = { path = "../../core/journal", version = "0.10.0" }
+melin-pipeline = { path = "../../core/pipeline", version = "0.10.0" }
+melin-protocol = { path = "../protocol", version = "0.10.0" }
+melin-wire-protocol = { path = "../../core/wire-protocol", version = "0.10.0" }
+melin-server-runtime = { path = "../../core/server-runtime", version = "0.10.0" }
+melin-server = { path = "../server", version = "0.10.0", default-features = false }
+melin-app = { path = "../../core/app", version = "0.10.0" }
+melin-transport-core = { path = "../../core/transport-core", version = "0.10.0" }
 base64 = { workspace = true }
 blake3 = { workspace = true }
 clap = { workspace = true }
@@ -99,7 +99,7 @@ tikv-jemallocator = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 io-uring = "0.7"
-melin-dpdk = { path = "../../core/dpdk", optional = true }
+melin-dpdk = { path = "../../core/dpdk", version = "0.10.0", optional = true }
 smoltcp = { package = "fastcp", version = "0.13", default-features = false, features = ["std", "medium-ethernet", "proto-ipv4", "socket-tcp"], optional = true }
 ratatui = { version = "0.30", optional = true }
 crossterm = { version = "0.29", optional = true }

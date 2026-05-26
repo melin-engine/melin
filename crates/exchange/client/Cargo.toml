@@ -2,7 +2,7 @@
 name = "melin-client"
 version = "0.10.0"
 edition = "2024"
-license.workspace = true
+license-file.workspace = true
 repository.workspace = true
 homepage.workspace = true
 authors.workspace = true
@@ -10,5 +10,5 @@ description = "Blocking client library for the Melin exchange binary protocol"
 
 [dependencies]
 ed25519-dalek = { workspace = true }
-melin-protocol = { path = "../protocol" }
-melin-wire-protocol = { path = "../../core/wire-protocol" }
+melin-protocol = { path = "../protocol", version = "0.10.0" }
+melin-wire-protocol = { path = "../../core/wire-protocol", version = "0.10.0" }
