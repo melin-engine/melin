@@ -772,7 +772,6 @@ pub fn run_receiver_dpdk<A, W>(
     snapshot_interval_ms: u64,
     snapshot_path: std::path::PathBuf,
     cores: crate::server::PipelineCores,
-    receiver_core: usize,
     group_commit_delay: std::time::Duration,
     pipeline_depth: usize,
     busy_spin: bool,
@@ -1126,7 +1125,7 @@ where
             // Unpin before spawning the pipeline. Same rationale as the
             // kernel-TCP receiver: `pin_to_core` sets `SCHED_FIFO` and on
             // post-snapshot rebuilds this thread is already pinned —
-            // children would inherit `{receiver_core}` + FIFO and never
+            // children would inherit `cores.reader` + FIFO and never
             // preempt the busy-spinning receiver to reach their own
             // self-pin.
             if let Err(e) = melin_app::affinity::clear_affinity() {
@@ -1148,7 +1147,7 @@ where
             // pin the receive thread — mirrors the primary's reader pin
             // so the thread producing input-ring entries from the network
             // isn't migrated across L3s mid-batch.
-            melin_app::affinity::pin_thread("receiver", receiver_core);
+            melin_app::affinity::pin_thread("receiver", cores.reader);
         }
 
         // --- Streaming session (transport-agnostic) ---

@@ -91,20 +91,14 @@ pub struct ServerConfig {
     /// Path to a snapshot file for faster recovery.
     #[arg(long)]
     pub snapshot: Option<PathBuf>,
-    /// Pipeline core IDs: journal,matching,response,repl-sender,event-publisher,shadow,repl-handler-0,repl-handler-1
+    /// Pipeline core IDs: journal,matching,response,reader,repl-sender,event-publisher,shadow,repl-handler-0,repl-handler-1
     /// (comma-separated). Core 0 is reserved for OS/IRQ handling.
+    /// reader pins the io_uring reader (TCP) or DPDK poll thread.
     /// repl-sender is used when replication is enabled, event-publisher when
     /// `--event-bind` is set, shadow when `--snapshot-interval-ms` > 0.
     /// repl-handler-0/1 are for the per-replica TCP handler threads (0 = unpinned).
-    #[arg(long, default_value = "1,2,3,6,7,8,9,10", value_parser = parse_cores)]
+    #[arg(long, default_value = "1,2,3,4,5,6,7,8,9", value_parser = parse_cores)]
     pub cores: PipelineCores,
-    /// CPU core for the reader thread. In kernel TCP mode this pins the
-    /// io_uring reader; in DPDK mode it pins the (first) poll thread.
-    /// The matching stage is the throughput bottleneck — a single
-    /// io_uring reader with multishot RECV easily multiplexes thousands
-    /// of connections without becoming the limit.
-    #[arg(long, default_value_t = 4)]
-    pub reader_cores: usize,
     /// Group commit coalescing delay in microseconds. Keep at 0 for TCP.
     #[arg(long, default_value_t = 0)]
     pub group_commit_us: u64,
@@ -393,13 +387,13 @@ impl Default for ServerConfig {
                 journal: 1,
                 matching: 2,
                 response: 3,
-                repl_sender: 6,
-                event_publisher: 7,
-                shadow: 8,
-                repl_handler_0: 9,
-                repl_handler_1: 10,
+                reader: 4,
+                repl_sender: 5,
+                event_publisher: 6,
+                shadow: 7,
+                repl_handler_0: 8,
+                repl_handler_1: 9,
             },
-            reader_cores: 4,
             group_commit_us: 0,
             heartbeat_interval_secs: 10,
             connection_timeout_secs: 30,
@@ -487,15 +481,17 @@ impl ServerConfig {
 
 /// Core assignments for pipeline threads.
 ///
-/// Six fields: journal, matching, response, repl-sender, event-publisher,
-/// and shadow. All are always stored; repl-sender is only used when
-/// replication is enabled, event-publisher only when `--event-bind` is set,
-/// and shadow only when `--snapshot-interval-ms` > 0.
+/// All fields are always stored; repl-sender is only used when replication is
+/// enabled, event-publisher only when `--event-bind` is set, and shadow only
+/// when `--snapshot-interval-ms` > 0. repl-handler-0/1 are spawned on replica
+/// connect, not at startup. 0 = unpinned (OS scheduled) for any field.
 #[derive(Debug, Clone, Copy)]
 pub struct PipelineCores {
     pub journal: usize,
     pub matching: usize,
     pub response: usize,
+    /// io_uring reader thread (TCP) or DPDK poll thread.
+    pub reader: usize,
     pub repl_sender: usize,
     pub event_publisher: usize,
     pub shadow: usize,
@@ -512,16 +508,16 @@ impl PipelineCores {
     /// the pipeline cores.
     ///
     /// On the default workstation `Default` layout the journal (core 1),
-    /// matching (core 2), and shadow/repl_handler cores (8/9/10) are HT
+    /// matching (core 2), and shadow/repl_handler cores (7/8/9) are HT
     /// siblings of each other on an 8-core (16-thread) Ryzen — a layout
-    /// designed for a 16-physical-core box. This packs everything into
-    /// the lower physical cores and leaves the last one free.
+    /// designed for a 10-physical-core box. This packs everything into
+    /// the lower physical cores and leaves core 10+ free.
     ///
     /// Returns the chosen layout and the recommended bench/client core.
     /// Errors if `num_cpus` is too small to host the pipeline.
     pub fn compact(num_cpus: usize) -> Result<(Self, usize), String> {
         // Need: journal, matching, response, event_publisher, shadow,
-        // repl_sender (one each) + 1 reserved for bench = 7 cores. Plus
+        // reader (one each) + 1 reserved for bench = 7 cores. Plus
         // core 0 for the OS / IRQs. So minimum 8 logical cores.
         if num_cpus < 8 {
             return Err(format!(
@@ -532,10 +528,12 @@ impl PipelineCores {
             journal: 1,
             matching: 2,
             response: 3,
-            repl_sender: 4,
+            reader: 4,
+            // repl_sender not spawned in compact (no --replication-bind).
+            repl_sender: 0,
             event_publisher: 5,
             shadow: 6,
-            // repl handlers don't run in embedded bench; 0 = unpinned.
+            // repl handlers not spawned in compact; 0 = unpinned.
             repl_handler_0: 0,
             repl_handler_1: 0,
         };
@@ -543,12 +541,12 @@ impl PipelineCores {
     }
 }
 
-/// Parse "j,m,r,s,e,sh,h0,h1" into `PipelineCores` for pipeline core affinity.
+/// Parse "j,m,r,rd,rs,ep,sh,h0,h1" into `PipelineCores` for pipeline core affinity.
 fn parse_cores(s: &str) -> Result<PipelineCores, String> {
     let parts: Vec<&str> = s.split(',').collect();
-    if parts.len() != 8 {
+    if parts.len() != 9 {
         return Err(format!(
-            "expected 8 comma-separated core IDs (journal,matching,response,repl-sender,event-publisher,shadow,repl-handler-0,repl-handler-1), got {}",
+            "expected 9 comma-separated core IDs (journal,matching,response,reader,repl-sender,event-publisher,shadow,repl-handler-0,repl-handler-1), got {}",
             parts.len()
         ));
     }
@@ -560,11 +558,12 @@ fn parse_cores(s: &str) -> Result<PipelineCores, String> {
         journal: parse(parts[0])?,
         matching: parse(parts[1])?,
         response: parse(parts[2])?,
-        repl_sender: parse(parts[3])?,
-        event_publisher: parse(parts[4])?,
-        shadow: parse(parts[5])?,
-        repl_handler_0: parse(parts[6])?,
-        repl_handler_1: parse(parts[7])?,
+        reader: parse(parts[3])?,
+        repl_sender: parse(parts[4])?,
+        event_publisher: parse(parts[5])?,
+        shadow: parse(parts[6])?,
+        repl_handler_0: parse(parts[7])?,
+        repl_handler_1: parse(parts[8])?,
     })
 }
 
@@ -808,7 +807,6 @@ where
             config.snapshot_interval_ms,
             config.shadow_snapshot_path(),
             config.cores,
-            config.reader_cores,
             config.group_commit_delay(),
             config.replication_pipeline_depth,
             !config.yield_idle,
@@ -1119,7 +1117,7 @@ where
 
     // Spawn the io_uring reader thread. A single reader uses multishot RECV
     // to multiplex every TCP connection on the server. Pinned to
-    // `--reader-cores`. The matching stage is the throughput limit, so a
+    // cores.reader. The matching stage is the throughput limit, so a
     // second reader would not raise throughput — only re-introduce the
     // multi-producer ordering race on the input ring.
     let connection_timeout = config.connection_timeout();
@@ -1541,7 +1539,7 @@ where
         input_producer,
         decoder,
         control_tx.clone(),
-        config.reader_cores,
+        config.cores.reader,
         connection_timeout,
         config.tick_interval(),
         Arc::clone(&reader_shutdown),
@@ -1911,7 +1909,6 @@ where
             config.snapshot_interval_ms,
             config.shadow_snapshot_path(),
             config.cores,
-            config.reader_cores,
             config.group_commit_delay(),
             config.replication_pipeline_depth,
             !config.yield_idle,
@@ -2411,7 +2408,7 @@ where
 
     let connection_timeout = config.connection_timeout();
     let max_conns = config.max_connections;
-    let reader_cores = config.reader_cores;
+    let reader_core = config.cores.reader;
 
     // Exactly one client poll queue (LMAX: single reader → single matcher).
     // Additional DPDK queues, if any, are dedicated to the replication sender
@@ -2423,7 +2420,7 @@ where
     );
     let transport_0 = transports.pop().expect("one client transport");
     let tx_rx_0 = tx_consumers.remove(0);
-    melin_app::affinity::pin_thread("dpdk-poll-0", reader_cores);
+    melin_app::affinity::pin_thread("dpdk-poll-0", reader_core);
     crate::dpdk_transport::run_dpdk_poll::<A>(
         transport_0,
         input_producer,

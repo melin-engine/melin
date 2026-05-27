@@ -496,9 +496,7 @@ fn spawn_primary_with_extra_env(
         "--yield-idle".into(),
         // Reduce core count to avoid conflicts in CI.
         "--cores".into(),
-        "0,0,0,0,0,0,0,0".into(),
-        "--reader-cores".into(),
-        "0".into(),
+        "0,0,0,0,0,0,0,0,0".into(),
     ];
     for a in extra_args {
         args.push((*a).into());
@@ -634,9 +632,7 @@ fn spawn_replica_named_with_extra_env(
         "0".into(),
         "--yield-idle".into(),
         "--cores".into(),
-        "0,0,0,0,0,0,0,0".into(),
-        "--reader-cores".into(),
-        "0".into(),
+        "0,0,0,0,0,0,0,0,0".into(),
     ];
     for a in extra_args {
         args.push((*a).into());
@@ -1280,9 +1276,7 @@ fn crashed_primary_recovers_from_journal() {
                 "0",
                 "--yield-idle",
                 "--cores",
-                "0,0,0,0,0,0,0,0",
-                "--reader-cores",
-                "0",
+                "0,0,0,0,0,0,0,0,0",
             ])
             .stdout(Stdio::inherit())
             .stderr(Stdio::inherit())
@@ -1970,9 +1964,7 @@ fn replacement_replica_catches_up_from_journal() {
                 "0",
                 "--yield-idle",
                 "--cores",
-                "0,0,0,0,0,0,0,0",
-                "--reader-cores",
-                "0",
+                "0,0,0,0,0,0,0,0,0",
             ])
             .stdout(Stdio::inherit())
             .stderr(Stdio::inherit())
@@ -2098,9 +2090,7 @@ fn catchup_with_fills_during_gap() {
                 "0",
                 "--yield-idle",
                 "--cores",
-                "0,0,0,0,0,0,0,0",
-                "--reader-cores",
-                "0",
+                "0,0,0,0,0,0,0,0,0",
             ])
             .stdout(Stdio::inherit())
             .stderr(Stdio::inherit())
@@ -2214,9 +2204,7 @@ fn catchup_then_immediate_failover() {
                 "0",
                 "--yield-idle",
                 "--cores",
-                "0,0,0,0,0,0,0,0",
-                "--reader-cores",
-                "0",
+                "0,0,0,0,0,0,0,0,0",
             ])
             .stdout(Stdio::inherit())
             .stderr(Stdio::inherit())
@@ -2337,9 +2325,7 @@ fn fresh_replica_full_catchup() {
                 "0",
                 "--yield-idle",
                 "--cores",
-                "0,0,0,0,0,0,0,0",
-                "--reader-cores",
-                "0",
+                "0,0,0,0,0,0,0,0,0",
             ])
             .stdout(Stdio::inherit())
             .stderr(Stdio::inherit())
@@ -2448,9 +2434,7 @@ fn snapshot_transfer_when_archives_purged() {
                 "0",
                 "--yield-idle",
                 "--cores",
-                "0,0,0,0,0,0,0,0",
-                "--reader-cores",
-                "0",
+                "0,0,0,0,0,0,0,0,0",
                 "--standalone",
                 "--durability-mode",
                 "local",
@@ -2548,9 +2532,7 @@ fn snapshot_transfer_when_archives_purged() {
                 "0",
                 "--yield-idle",
                 "--cores",
-                "0,0,0,0,0,0,0,0",
-                "--reader-cores",
-                "0",
+                "0,0,0,0,0,0,0,0,0",
                 "--snapshot-interval-ms",
                 "100",
             ])
