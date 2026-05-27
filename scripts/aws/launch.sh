@@ -232,6 +232,12 @@ INSTANCE_IDS=$(aws ec2 run-instances "${LAUNCH_ARGS[@]}" \
 
 SERVER_ID=$(echo "$INSTANCE_IDS" | awk '{print $1}')
 BENCH_ID=$(echo "$INSTANCE_IDS" | awk '{print $2}')
+
+if [[ -z "$SERVER_ID" || -z "$BENCH_ID" ]]; then
+    echo "error: expected 2 instance IDs, got: $INSTANCE_IDS" >&2
+    exit 1
+fi
+
 CREATED_INSTANCES=("$SERVER_ID" "$BENCH_ID")
 
 # Tag with roles.
