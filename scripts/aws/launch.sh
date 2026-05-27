@@ -20,6 +20,8 @@
 #   --smt                     Keep hyperthreading enabled (default: disabled)
 #   --dpdk                    Attach a second ENI for DPDK kernel bypass
 #   --placement-group <name>  Cluster placement group (low-latency, same rack)
+#   --journal-vol <spec>      Attach a dedicated EBS journal volume to the server.
+#                             Spec: <type>[:<iops>] — e.g., gp3, io2:10000, gp3:8000
 #   --skip-setup              Skip server-setup.sh (just launch raw instances)
 #   --user <name>             SSH user (default: ubuntu)
 #   --output <path>           Write instance metadata JSON (default: /tmp/melin-aws-instances.json)
@@ -51,6 +53,7 @@ SECURITY_GROUP_ID=""
 DISABLE_SMT=1
 ENABLE_DPDK=0
 PLACEMENT_GROUP=""
+JOURNAL_VOL=""
 SKIP_SETUP=0
 SSH_USER="ubuntu"
 OUTPUT="/tmp/melin-aws-instances.json"
@@ -70,6 +73,7 @@ while [[ $# -gt 0 ]]; do
         --smt)            DISABLE_SMT=0; shift ;;
         --dpdk)           ENABLE_DPDK=1; shift ;;
         --placement-group) PLACEMENT_GROUP="$2"; shift 2 ;;
+        --journal-vol)    JOURNAL_VOL="$2"; shift 2 ;;
         --skip-setup)     SKIP_SETUP=1; shift ;;
         --user)           SSH_USER="$2"; shift 2 ;;
         --output)         OUTPUT="$2"; shift 2 ;;
@@ -117,6 +121,7 @@ fi
 CREATED_SG=""
 CREATED_INSTANCES=()
 CREATED_ENIS=()
+CREATED_VOLUMES=()
 
 cleanup_on_error() {
     local exit_code=$?
@@ -134,6 +139,11 @@ cleanup_on_error() {
         echo "  Deleting ENI: $eni_id" >&2
         aws ec2 delete-network-interface "${REGION_ARGS[@]}" \
             --network-interface-id "$eni_id" 2>/dev/null || true
+    done
+    for vol_id in "${CREATED_VOLUMES[@]}"; do
+        echo "  Deleting volume: $vol_id" >&2
+        aws ec2 delete-volume "${REGION_ARGS[@]}" \
+            --volume-id "$vol_id" 2>/dev/null || true
     done
     if [[ -n "$CREATED_SG" ]]; then
         sleep 3
@@ -306,6 +316,67 @@ echo "  Server: $SERVER_ID  pub=$SERVER_PUB  priv=$SERVER_PRIV"
 echo "  Bench:  $BENCH_ID  pub=$BENCH_PUB  priv=$BENCH_PRIV"
 
 # ---------------------------------------------------------------------------
+# Journal volume: create and attach a dedicated EBS volume to the server
+# ---------------------------------------------------------------------------
+JOURNAL_VOL_ID=""
+
+if [[ -n "$JOURNAL_VOL" ]]; then
+    echo ""
+    echo "=== Creating journal volume ==="
+
+    JV_TYPE="${JOURNAL_VOL%%:*}"
+    JV_IOPS="${JOURNAL_VOL#*:}"
+    if [[ "$JV_IOPS" == "$JV_TYPE" ]]; then
+        JV_IOPS=""
+    fi
+
+    # Resolve the server's AZ (volumes must be in the same AZ).
+    SERVER_AZ=$(aws ec2 describe-instances "${REGION_ARGS[@]}" \
+        --instance-ids "$SERVER_ID" \
+        --query 'Reservations[0].Instances[0].Placement.AvailabilityZone' --output text)
+
+    VOL_ARGS=(
+        "${REGION_ARGS[@]}"
+        --availability-zone "$SERVER_AZ"
+        --volume-type "$JV_TYPE"
+        --size 10
+        --tag-specifications "ResourceType=volume,Tags=[{Key=Name,Value=melin-journal},{Key=melin-role,Value=journal}]"
+    )
+
+    if [[ -n "$JV_IOPS" ]]; then
+        VOL_ARGS+=(--iops "$JV_IOPS")
+    fi
+    # io2 requires throughput to be unset; gp3 benefits from max throughput.
+    if [[ "$JV_TYPE" == "gp3" ]]; then
+        VOL_ARGS+=(--throughput 1000)
+    fi
+
+    JOURNAL_VOL_ID=$(aws ec2 create-volume "${VOL_ARGS[@]}" \
+        --query 'VolumeId' --output text)
+    CREATED_VOLUMES+=("$JOURNAL_VOL_ID")
+
+    echo "  Volume: $JOURNAL_VOL_ID ($JV_TYPE${JV_IOPS:+, ${JV_IOPS} IOPS})"
+    echo "  Waiting for volume to become available..."
+    aws ec2 wait volume-available "${REGION_ARGS[@]}" --volume-ids "$JOURNAL_VOL_ID"
+
+    aws ec2 attach-volume "${REGION_ARGS[@]}" \
+        --volume-id "$JOURNAL_VOL_ID" \
+        --instance-id "$SERVER_ID" \
+        --device "/dev/sdf" >/dev/null
+
+    echo "  Attached to $SERVER_ID as /dev/sdf"
+
+    # Wait for the attachment to complete.
+    aws ec2 wait volume-in-use "${REGION_ARGS[@]}" --volume-ids "$JOURNAL_VOL_ID"
+
+    # Set delete-on-termination so terminate.sh doesn't need explicit cleanup.
+    aws ec2 modify-instance-attribute "${REGION_ARGS[@]}" \
+        --instance-id "$SERVER_ID" \
+        --block-device-mappings "[{\"DeviceName\":\"/dev/sdf\",\"Ebs\":{\"DeleteOnTermination\":true}}]"
+    echo "  Delete-on-termination enabled"
+fi
+
+# ---------------------------------------------------------------------------
 # DPDK: Create and attach secondary ENIs
 # ---------------------------------------------------------------------------
 SERVER_ENI=""
@@ -392,6 +463,8 @@ jq -n \
     --arg bench_priv     "$BENCH_PRIV" \
     --argjson dpdk       "$DPDK_JSON" \
     --arg placement      "$PLACEMENT_GROUP" \
+    --arg journal_vol    "$JOURNAL_VOL_ID" \
+    --arg journal_spec   "$JOURNAL_VOL" \
     '{
       region: $region,
       instance_type: $instance_type,
@@ -399,6 +472,7 @@ jq -n \
       smt_disabled: $smt_disabled,
       security_group_id: $sg_id,
       placement_group: (if $placement == "" then null else $placement end),
+      journal_volume: (if $journal_vol == "" then null else {volume_id: $journal_vol, spec: $journal_spec} end),
       server: {instance_id: $server_id, public_ip: $server_pub, private_ip: $server_priv},
       bench:  {instance_id: $bench_id,  public_ip: $bench_pub,  private_ip: $bench_priv},
       dpdk: $dpdk

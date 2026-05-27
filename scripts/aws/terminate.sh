@@ -62,6 +62,7 @@ SG_ID=$(jq -r '.security_group_id' "$INSTANCES_FILE")
 INSTANCE_TYPE=$(jq -r '.instance_type' "$INSTANCES_FILE")
 SERVER_ENI=$(jq -r '.dpdk.server_eni_id // empty' "$INSTANCES_FILE" 2>/dev/null || true)
 BENCH_ENI=$(jq -r '.dpdk.bench_eni_id // empty' "$INSTANCES_FILE" 2>/dev/null || true)
+JOURNAL_VOL=$(jq -r '.journal_volume.volume_id // empty' "$INSTANCES_FILE" 2>/dev/null || true)
 
 # Use region from CLI flag, else from metadata, else from AWS config.
 if [[ -z "$REGION" ]]; then
@@ -79,6 +80,9 @@ echo "  Bench:  $BENCH_ID"
 echo "  SG:     $SG_ID"
 if [[ -n "$SERVER_ENI" ]]; then
     echo "  DPDK ENIs: $SERVER_ENI, $BENCH_ENI"
+fi
+if [[ -n "$JOURNAL_VOL" ]]; then
+    echo "  Journal vol: $JOURNAL_VOL"
 fi
 echo ""
 
@@ -116,6 +120,16 @@ for eni_id in "$SERVER_ENI" "$BENCH_ENI"; do
         echo "  Deleted orphaned ENI: $eni_id"
     fi
 done
+
+# ---------------------------------------------------------------------------
+# Delete journal volume (safety net — normally auto-deleted with instance)
+# ---------------------------------------------------------------------------
+if [[ -n "$JOURNAL_VOL" ]]; then
+    if aws ec2 delete-volume "${REGION_ARGS[@]}" \
+            --volume-id "$JOURNAL_VOL" 2>/dev/null; then
+        echo "  Deleted orphaned journal volume: $JOURNAL_VOL"
+    fi
+fi
 
 # ---------------------------------------------------------------------------
 # Delete security group
