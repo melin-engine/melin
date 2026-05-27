@@ -163,6 +163,14 @@ BENCH="${SSH_USER}@${BENCH_PUB}"
 REPLICA="${REPLICA_PUB:+${SSH_USER}@${REPLICA_PUB}}"
 REPLICA2="${REPLICA2_PUB:+${SSH_USER}@${REPLICA2_PUB}}"
 
+# When running as a non-root user (e.g. ubuntu on AWS), prefix privileged
+# operations (IRQ pinning, SCHED_FIFO) with sudo. No-op when SSH_USER=root.
+if [[ "$SSH_USER" == "root" ]]; then
+    RSUDO=""
+else
+    RSUDO="sudo -E"
+fi
+
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 LOCAL_REPO="$(cd "${SCRIPT_DIR}/.." && pwd)"
 REPO_DIR="~/workspace/melin"
@@ -243,19 +251,19 @@ DPDK_RAN=0
 # ---------------------------------------------------------------------------
 cleanup() {
     for host in "$SERVER" ${REPLICA:+"$REPLICA"} ${REPLICA2:+"$REPLICA2"}; do
-        ssh $SSH_OPTS "$host" "pkill -INT -x melin-server 2>/dev/null; \
-                               pkill -INT -f '[m]elin-server.dpdk' 2>/dev/null; true" 2>/dev/null || true
+        ssh $SSH_OPTS "$host" "${RSUDO} pkill -INT -x melin-server 2>/dev/null; \
+                               ${RSUDO} pkill -INT -f '[m]elin-server.dpdk' 2>/dev/null; true" 2>/dev/null || true
     done
     # Kill any orphaned bench client too — a hung run leaves the bench
     # binary executing on $BENCH and the next build trips "Text file
     # busy" on the cp into the .dpdk suffixed path.
-    ssh $SSH_OPTS "$BENCH" "pkill -INT -x melin-bench 2>/dev/null; \
-                            pkill -INT -f '[m]elin-bench.dpdk' 2>/dev/null; true" 2>/dev/null || true
+    ssh $SSH_OPTS "$BENCH" "${RSUDO} pkill -INT -x melin-bench 2>/dev/null; \
+                            ${RSUDO} pkill -INT -f '[m]elin-bench.dpdk' 2>/dev/null; true" 2>/dev/null || true
     # Clean DPDK EAL lock files so the next run doesn't fail with
     # "Cannot create lock on '/var/run/dpdk/rte/config'".
     if [[ "${DPDK_RAN:-0}" == "1" ]]; then
         for host in "$SERVER" "$BENCH" ${REPLICA:+"$REPLICA"} ${REPLICA2:+"$REPLICA2"}; do
-            ssh $SSH_OPTS "$host" "rm -rf /var/run/dpdk/rte 2>/dev/null; true" 2>/dev/null || true
+            ssh $SSH_OPTS "$host" "${RSUDO} rm -rf /var/run/dpdk/rte 2>/dev/null; true" 2>/dev/null || true
         done
     fi
     # Close ssh master connections and remove their control sockets.
@@ -774,7 +782,7 @@ export CARGO_BUILD_FLAGS="--release"
 pin_irqs() {
     local host="$1" label="$2"
     echo "  Pinning IRQs on ${label}..."
-    ssh $SSH_OPTS "$host" 'pinned=0; failed=0
+    ssh $SSH_OPTS "$host" "${RSUDO} bash -c '"'pinned=0; failed=0
 for f in /proc/irq/*/smp_affinity; do
     if echo 1 > "$f" 2>/dev/null; then
         pinned=$((pinned + 1))
@@ -785,7 +793,7 @@ done
 # Restrict kernel writeback threads to core 0 to prevent them from
 # running on isolated pipeline cores during journal fsync.
 echo 1 > /sys/bus/workqueue/devices/writeback/cpumask 2>/dev/null || true
-echo "    Pinned ${pinned} IRQs to core 0 (${failed} unchanged)"'
+echo "    Pinned ${pinned} IRQs to core 0 (${failed} unchanged)"'"'"
 }
 
 clean_journal() {
@@ -813,8 +821,8 @@ stop_servers() {
     for host in "$@"; do
         # `pkill -x` is exact-match; the dpdk binary has a suffix so
         # we list it explicitly.
-        ssh $SSH_OPTS "$host" "pkill -INT -x melin-server 2>/dev/null; \
-                               pkill -INT -f '[m]elin-server.dpdk' 2>/dev/null; true"
+        ssh $SSH_OPTS "$host" "${RSUDO} pkill -INT -x melin-server 2>/dev/null; \
+                               ${RSUDO} pkill -INT -f '[m]elin-server.dpdk' 2>/dev/null; true"
     done
     # Wait for processes to exit. DPDK EAL cleanup can take several
     # seconds; if we restart too early the VFIO groups are still held.
@@ -837,8 +845,8 @@ stop_servers() {
     done
     if [ "$waited" -ge 10 ]; then
         for host in "$@"; do
-            ssh $SSH_OPTS "$host" "pkill -KILL -x melin-server 2>/dev/null; \
-                                   pkill -KILL -f '[m]elin-server.dpdk' 2>/dev/null; true"
+            ssh $SSH_OPTS "$host" "${RSUDO} pkill -KILL -x melin-server 2>/dev/null; \
+                                   ${RSUDO} pkill -KILL -f '[m]elin-server.dpdk' 2>/dev/null; true"
         done
         sleep 1
     fi
@@ -849,7 +857,7 @@ stop_servers() {
 # "Cannot create lock on '/var/run/dpdk/rte/config'".
 clean_eal_lockfiles() {
     for host in "$@"; do
-        ssh $SSH_OPTS "$host" "rm -rf /var/run/dpdk/rte 2>/dev/null; true"
+        ssh $SSH_OPTS "$host" "${RSUDO} rm -rf /var/run/dpdk/rte 2>/dev/null; true"
     done
 }
 
@@ -871,8 +879,9 @@ run_bench() {
     if [[ -n "${BENCH_THREADS:-}" ]]; then
         threads_arg="--bench-threads ${BENCH_THREADS}"
     fi
+    ssh $SSH_OPTS "$BENCH" "${RSUDO} rm -f /tmp/bench-results.json"
     ssh $SSH_OPTS "$BENCH" "cd ${REPO_DIR} && source ~/.cargo/env && \
-        ./target/release/melin-bench \
+        ${RSUDO} ./target/release/melin-bench \
             --addr ${server_addr} \
             --health-addr ${health_addr} \
             --key bench.key \
@@ -890,6 +899,9 @@ collect_result() {
     if [[ "${NO_PERSIST:-0}" == "1" ]]; then
         name="${name}-no-persist"
     fi
+    # When the bench ran as root (via RSUDO), the JSON is root-owned and
+    # scp as the SSH user can't read it. Make it readable first.
+    ssh $SSH_OPTS "$BENCH" "${RSUDO} chmod 644 /tmp/bench-results.json 2>/dev/null; true"
     scp $SSH_OPTS -q "${SSH_USER}@${BENCH_PUB}:/tmp/bench-results.json" "${RESULTS_DIR}/${name}.json" 2>/dev/null || true
 }
 
@@ -910,9 +922,9 @@ transport_start_tcp() {
     pin_irqs "$SERVER" "server"
     pin_irqs "$BENCH" "bench"
 
-    ssh $SSH_OPTS "$SERVER" "pkill -x melin-server 2>/dev/null; true"
+    ssh $SSH_OPTS "$SERVER" "${RSUDO} pkill -x melin-server 2>/dev/null; true"
     sleep 1
-    ssh $SSH_OPTS "$SERVER" "NO_COLOR=1 RUST_LOG=${BENCH_RUST_LOG} ${MELIN_EXTRA_ENV:-} nohup ${REPO_DIR}/target/release/melin-server \
+    ssh $SSH_OPTS "$SERVER" "NO_COLOR=1 RUST_LOG=${BENCH_RUST_LOG} ${MELIN_EXTRA_ENV:-} ${RSUDO} nohup ${REPO_DIR}/target/release/melin-server \
             --bind ${SERVER_VLAN}:9876 \
             --health-bind ${SERVER_VLAN}:9878 \
             --journal ${JOURNAL_PATH} \
@@ -940,9 +952,9 @@ transport_start_tcp_repl() {
     pin_irqs "$BENCH" "bench"
     pin_irqs "$REPLICA" "replica"
 
-    ssh $SSH_OPTS "$SERVER" "pkill -x melin-server 2>/dev/null; true"
+    ssh $SSH_OPTS "$SERVER" "${RSUDO} pkill -x melin-server 2>/dev/null; true"
     sleep 1
-    ssh $SSH_OPTS "$SERVER" "NO_COLOR=1 RUST_LOG=${BENCH_RUST_LOG} ${MELIN_EXTRA_ENV:-} nohup ${REPO_DIR}/target/release/melin-server \
+    ssh $SSH_OPTS "$SERVER" "NO_COLOR=1 RUST_LOG=${BENCH_RUST_LOG} ${MELIN_EXTRA_ENV:-} ${RSUDO} nohup ${REPO_DIR}/target/release/melin-server \
             --bind ${SERVER_VLAN}:9876 \
             --health-bind ${SERVER_VLAN}:9878 \
             --journal ${JOURNAL_PATH} \
@@ -953,9 +965,9 @@ transport_start_tcp_repl() {
 
     wait_for_log "$SERVER" "/tmp/melin-server.log" "replication sender listening" 30 "Replication listener"
 
-    ssh $SSH_OPTS "$REPLICA" "pkill -x melin-server 2>/dev/null; true"
+    ssh $SSH_OPTS "$REPLICA" "${RSUDO} pkill -x melin-server 2>/dev/null; true"
     sleep 1
-    ssh $SSH_OPTS "$REPLICA" "NO_COLOR=1 RUST_LOG=${BENCH_RUST_LOG} ${MELIN_EXTRA_ENV:-} nohup ${REPO_DIR}/target/release/melin-server \
+    ssh $SSH_OPTS "$REPLICA" "NO_COLOR=1 RUST_LOG=${BENCH_RUST_LOG} ${MELIN_EXTRA_ENV:-} ${RSUDO} nohup ${REPO_DIR}/target/release/melin-server \
             --replica-of ${SERVER_VLAN}:${REPL_PORT} \
             --replication-key ${REPO_DIR}/repl.key \
             --journal ${replica_journal} \
@@ -992,9 +1004,9 @@ transport_start_tcp_dual_repl() {
     pin_irqs "$REPLICA" "replica1"
     pin_irqs "$REPLICA2" "replica2"
 
-    ssh $SSH_OPTS "$SERVER" "pkill -x melin-server 2>/dev/null; true"
+    ssh $SSH_OPTS "$SERVER" "${RSUDO} pkill -x melin-server 2>/dev/null; true"
     sleep 1
-    ssh $SSH_OPTS "$SERVER" "NO_COLOR=1 RUST_LOG=${BENCH_RUST_LOG} ${MELIN_EXTRA_ENV:-} nohup ${REPO_DIR}/target/release/melin-server \
+    ssh $SSH_OPTS "$SERVER" "NO_COLOR=1 RUST_LOG=${BENCH_RUST_LOG} ${MELIN_EXTRA_ENV:-} ${RSUDO} nohup ${REPO_DIR}/target/release/melin-server \
             --bind ${SERVER_VLAN}:9876 \
             --health-bind ${SERVER_VLAN}:9878 \
             --journal ${JOURNAL_PATH} \
@@ -1005,9 +1017,9 @@ transport_start_tcp_dual_repl() {
 
     wait_for_log "$SERVER" "/tmp/melin-server.log" "replication sender listening" 30 "Replication listener"
 
-    ssh $SSH_OPTS "$REPLICA" "pkill -x melin-server 2>/dev/null; true"
+    ssh $SSH_OPTS "$REPLICA" "${RSUDO} pkill -x melin-server 2>/dev/null; true"
     sleep 1
-    ssh $SSH_OPTS "$REPLICA" "NO_COLOR=1 RUST_LOG=${BENCH_RUST_LOG} ${MELIN_EXTRA_ENV:-} nohup ${REPO_DIR}/target/release/melin-server \
+    ssh $SSH_OPTS "$REPLICA" "NO_COLOR=1 RUST_LOG=${BENCH_RUST_LOG} ${MELIN_EXTRA_ENV:-} ${RSUDO} nohup ${REPO_DIR}/target/release/melin-server \
             --replica-of ${SERVER_VLAN}:${REPL_PORT} \
             --replication-key ${REPO_DIR}/repl.key \
             --journal ${replica_journal} \
@@ -1015,9 +1027,9 @@ transport_start_tcp_dual_repl() {
             ${REPLICA_EXTRA_ARGS:-} \
         >/tmp/melin-server.log 2>&1 </dev/null &" </dev/null
 
-    ssh $SSH_OPTS "$REPLICA2" "pkill -x melin-server 2>/dev/null; true"
+    ssh $SSH_OPTS "$REPLICA2" "${RSUDO} pkill -x melin-server 2>/dev/null; true"
     sleep 1
-    ssh $SSH_OPTS "$REPLICA2" "NO_COLOR=1 RUST_LOG=${BENCH_RUST_LOG} ${MELIN_EXTRA_ENV:-} nohup ${REPO_DIR}/target/release/melin-server \
+    ssh $SSH_OPTS "$REPLICA2" "NO_COLOR=1 RUST_LOG=${BENCH_RUST_LOG} ${MELIN_EXTRA_ENV:-} ${RSUDO} nohup ${REPO_DIR}/target/release/melin-server \
             --replica-of ${SERVER_VLAN}:${REPL_PORT} \
             --replication-key ${REPO_DIR}/repl.key \
             --journal ${replica2_journal} \
@@ -1303,7 +1315,7 @@ transport_start_dpdk() {
         vlan_arg="--dpdk-vlan ${SERVER_DPDK_VLAN}"
     fi
 
-    ssh $SSH_OPTS "$SERVER" "pkill -x melin-server 2>/dev/null; pkill -f '[m]elin-server.dpdk' 2>/dev/null; true"
+    ssh $SSH_OPTS "$SERVER" "${RSUDO} pkill -x melin-server 2>/dev/null; pkill -f '[m]elin-server.dpdk' 2>/dev/null; true"
     sleep 1
     ssh $SSH_OPTS "$SERVER" "NO_COLOR=1 RUST_LOG=${BENCH_RUST_LOG} nohup ${DPDK_SERVER_BIN} \
             --bind 0.0.0.0:9876 \
@@ -1355,7 +1367,7 @@ transport_stop_dpdk() {
     perf_capture_stop
     stop_servers "$SERVER"
     # TAP mode uses melin-server.dpdk — kill that too.
-    ssh $SSH_OPTS "$SERVER" "pkill -INT -f '[m]elin-server.dpdk' 2>/dev/null; true"
+    ssh $SSH_OPTS "$SERVER" "${RSUDO} pkill -INT -f '[m]elin-server.dpdk' 2>/dev/null; true"
     clean_eal_lockfiles "$SERVER" "$BENCH"
 }
 
@@ -1388,7 +1400,7 @@ transport_start_dpdk_repl() {
         replica_eal="--huge-dir=${HUGE_DIR}"
     fi
 
-    ssh $SSH_OPTS "$SERVER" "pkill -x melin-server 2>/dev/null; pkill -f '[m]elin-server.dpdk' 2>/dev/null; true"
+    ssh $SSH_OPTS "$SERVER" "${RSUDO} pkill -x melin-server 2>/dev/null; pkill -f '[m]elin-server.dpdk' 2>/dev/null; true"
     sleep 1
     ssh $SSH_OPTS "$SERVER" "NO_COLOR=1 RUST_LOG=${BENCH_RUST_LOG} nohup ${DPDK_SERVER_BIN} \
             --bind 0.0.0.0:9876 \
@@ -1404,7 +1416,7 @@ transport_start_dpdk_repl() {
 
     wait_for_log "$SERVER" "/tmp/melin-server.log" "DPDK replication sender started" 30 "DPDK replication listener"
 
-    ssh $SSH_OPTS "$REPLICA" "pkill -x melin-server 2>/dev/null; pkill -f '[m]elin-server.dpdk' 2>/dev/null; true"
+    ssh $SSH_OPTS "$REPLICA" "${RSUDO} pkill -x melin-server 2>/dev/null; pkill -f '[m]elin-server.dpdk' 2>/dev/null; true"
     sleep 1
     ssh $SSH_OPTS "$REPLICA" "NO_COLOR=1 RUST_LOG=${BENCH_RUST_LOG} nohup ${DPDK_SERVER_BIN} \
             --replica-of ${SERVER_DPDK_IP}:${REPL_PORT} \
@@ -1449,7 +1461,7 @@ transport_stop_dpdk_repl() {
     perf_capture_stop
     stop_servers "$SERVER" "$REPLICA"
     for host in "$SERVER" "$REPLICA"; do
-        ssh $SSH_OPTS "$host" "pkill -INT -f '[m]elin-server.dpdk' 2>/dev/null; true"
+        ssh $SSH_OPTS "$host" "${RSUDO} pkill -INT -f '[m]elin-server.dpdk' 2>/dev/null; true"
     done
     clean_eal_lockfiles "$SERVER" "$BENCH" "$REPLICA"
     if [[ "${SKIP_JOURNAL_VERIFY:-0}" == "1" ]]; then
@@ -1505,7 +1517,7 @@ transport_start_dpdk_dual_repl() {
         replica2_eal="--huge-dir=${HUGE_DIR}"
     fi
 
-    ssh $SSH_OPTS "$SERVER" "pkill -x melin-server 2>/dev/null; pkill -f '[m]elin-server.dpdk' 2>/dev/null; true"
+    ssh $SSH_OPTS "$SERVER" "${RSUDO} pkill -x melin-server 2>/dev/null; pkill -f '[m]elin-server.dpdk' 2>/dev/null; true"
     sleep 1
     ssh $SSH_OPTS "$SERVER" "NO_COLOR=1 RUST_LOG=${BENCH_RUST_LOG} nohup ${DPDK_SERVER_BIN} \
             --bind 0.0.0.0:9876 \
@@ -1521,7 +1533,7 @@ transport_start_dpdk_dual_repl() {
 
     wait_for_log "$SERVER" "/tmp/melin-server.log" "DPDK replication sender started" 30 "DPDK replication listener"
 
-    ssh $SSH_OPTS "$REPLICA" "pkill -x melin-server 2>/dev/null; pkill -f '[m]elin-server.dpdk' 2>/dev/null; true"
+    ssh $SSH_OPTS "$REPLICA" "${RSUDO} pkill -x melin-server 2>/dev/null; pkill -f '[m]elin-server.dpdk' 2>/dev/null; true"
     sleep 1
     ssh $SSH_OPTS "$REPLICA" "NO_COLOR=1 RUST_LOG=${BENCH_RUST_LOG} nohup ${DPDK_SERVER_BIN} \
             --replica-of ${SERVER_DPDK_IP}:${REPL_PORT} \
@@ -1535,7 +1547,7 @@ transport_start_dpdk_dual_repl() {
             ${REPLICA_EXTRA_ARGS:-} \
         >/tmp/melin-server.log 2>&1 </dev/null &" </dev/null
 
-    ssh $SSH_OPTS "$REPLICA2" "pkill -x melin-server 2>/dev/null; pkill -f '[m]elin-server.dpdk' 2>/dev/null; true"
+    ssh $SSH_OPTS "$REPLICA2" "${RSUDO} pkill -x melin-server 2>/dev/null; pkill -f '[m]elin-server.dpdk' 2>/dev/null; true"
     sleep 1
     ssh $SSH_OPTS "$REPLICA2" "NO_COLOR=1 RUST_LOG=${BENCH_RUST_LOG} nohup ${DPDK_SERVER_BIN} \
             --replica-of ${SERVER_DPDK_IP}:${REPL_PORT} \
@@ -1580,7 +1592,7 @@ transport_stop_dpdk_dual_repl() {
     perf_capture_stop
     stop_servers "$SERVER" "$REPLICA" "$REPLICA2"
     for host in "$SERVER" "$REPLICA" "$REPLICA2"; do
-        ssh $SSH_OPTS "$host" "pkill -INT -f '[m]elin-server.dpdk' 2>/dev/null; true"
+        ssh $SSH_OPTS "$host" "${RSUDO} pkill -INT -f '[m]elin-server.dpdk' 2>/dev/null; true"
     done
     clean_eal_lockfiles "$SERVER" "$BENCH" "$REPLICA" "$REPLICA2"
     if [[ "${SKIP_JOURNAL_VERIFY:-0}" == "1" ]]; then
@@ -1616,8 +1628,9 @@ workload_throughput() {
     if [[ "${TARGET_RATE}" != "0" ]]; then rate_arg="--target-rate ${TARGET_RATE}"; fi
 
     if [[ "$transport" == dpdk* ]]; then
+        ssh $SSH_OPTS "$BENCH" "${RSUDO} rm -f /tmp/bench-results.json"
         ssh $SSH_OPTS "$BENCH" "cd ${REPO_DIR} && source ~/.cargo/env && \
-            ./target/release/melin-bench \
+            ${RSUDO} ./target/release/melin-bench \
                 --addr ${CURRENT_BIND} \
                 --health-addr ${CURRENT_HEALTH} \
                 --key bench.key \
@@ -1649,8 +1662,9 @@ workload_single() {
     if [[ -n "${COOLDOWN_DURATION}" ]]; then cooldown_arg="--cooldown-duration ${COOLDOWN_DURATION}"; fi
 
     if [[ "$transport" == dpdk* ]]; then
+        ssh $SSH_OPTS "$BENCH" "${RSUDO} rm -f /tmp/bench-results.json"
         ssh $SSH_OPTS "$BENCH" "cd ${REPO_DIR} && source ~/.cargo/env && \
-            ./target/release/melin-bench \
+            ${RSUDO} ./target/release/melin-bench \
                 --addr ${CURRENT_BIND} \
                 --health-addr ${CURRENT_HEALTH} \
                 --key bench.key \
@@ -1673,12 +1687,14 @@ workload_engine_only() {
     echo "============================================================"
     echo ""
 
+    ssh $SSH_OPTS "$SERVER" "${RSUDO} rm -f /tmp/bench-results.json"
     ssh $SSH_OPTS "$SERVER" "cd ${REPO_DIR} && source ~/.cargo/env && \
-        ./target/release/melin-bench \
+        ${RSUDO} ./target/release/melin-bench \
             --mode engine \
             --json /tmp/bench-results.json \
             --duration ${LOCAL_DURATION}"
 
+    ssh $SSH_OPTS "$SERVER" "${RSUDO} chmod 644 /tmp/bench-results.json 2>/dev/null; true"
     scp $SSH_OPTS -q "${SSH_USER}@${SERVER_PUB}:/tmp/bench-results.json" \
         "${RESULTS_DIR}/local-engine-only.json" 2>/dev/null || true
 }
@@ -1693,14 +1709,16 @@ workload_pipeline_only() {
 
     clean_journal "$SERVER" "$JOURNAL_PATH"
 
+    ssh $SSH_OPTS "$SERVER" "${RSUDO} rm -f /tmp/bench-results.json"
     ssh $SSH_OPTS "$SERVER" "cd ${REPO_DIR} && source ~/.cargo/env && \
-        ./target/release/melin-bench \
+        ${RSUDO} ./target/release/melin-bench \
             --mode pipeline \
             --window 256 \
             --journal ${JOURNAL_PATH} \
             --json /tmp/bench-results.json \
             --duration ${LOCAL_DURATION}"
 
+    ssh $SSH_OPTS "$SERVER" "${RSUDO} chmod 644 /tmp/bench-results.json 2>/dev/null; true"
     scp $SSH_OPTS -q "${SSH_USER}@${SERVER_PUB}:/tmp/bench-results.json" \
         "${RESULTS_DIR}/local-pipeline-only.json" 2>/dev/null || true
 }
