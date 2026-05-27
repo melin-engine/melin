@@ -354,9 +354,9 @@ Core 0 is reserved for OS/IRQ handling.
 
 Each pipeline thread calls `sched_setaffinity` (via `crate::affinity::pin_to_core`) immediately after spawning, before entering its main loop. Pinning eliminates involuntary context switches and keeps hot data in L1/L2 cache, reducing p99/p99.9 latency jitter from approximately 5-20 us per core migration to near zero.
 
-In **kernel TCP mode**, the reader thread is pinned to `--reader-cores` (default 4). io_uring with multishot RECV multiplexes every client connection on this single thread.
+In **kernel TCP mode**, the reader thread is pinned to the `reader` position in `--cores` (default 4). io_uring with multishot RECV multiplexes every client connection on this single thread.
 
-In **DPDK mode**, a single poll thread handles all client connections (one NIC queue, no RSS). It is also pinned to the `--reader-cores` core.
+In **DPDK mode**, a single poll thread handles all client connections (one NIC queue, no RSS). It is also pinned to the `reader` core in `--cores`.
 
 ### Why not async
 
@@ -386,8 +386,7 @@ Because the journal and matching consumers run in parallel (not chained), the ma
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--cores` | `1,2,3,6,7,8` | Pipeline core IDs: journal, matching, response, repl-sender, event-publisher, shadow (comma-separated) |
-| `--reader-cores` | `4` | CPU core for the reader thread (TCP) or first poll thread (DPDK). |
+| `--cores` | `1,2,3,6,7,8,4,9,10` | Pipeline core IDs: journal, matching, response, repl-sender, event-publisher, shadow, reader, repl-handler-0, repl-handler-1 (comma-separated). 0 = unpinned. |
 | `--group-commit-us` | `0` | Group commit coalescing delay in microseconds. Keep at 0 for TCP. |
 | `--heartbeat-interval-secs` | `10` | Heartbeat interval for idle connections (0 to disable) |
 | `--connection-timeout-secs` | `30` | Disconnect clients silent for this long (0 to disable) |

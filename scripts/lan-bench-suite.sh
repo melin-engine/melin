@@ -92,7 +92,7 @@
 #                       SKIP_ORDER_EXEC=1.
 #   PERF=1              Capture `perf record` on the server's ingress core
 #                       (io_uring reader for kernel TCP, DPDK poll thread
-#                       for DPDK — both default to core 4 via reader_cores)
+#                       for DPDK — both default to core 4 via --cores reader field)
 #                       during the first workload of the run. Report + raw
 #                       perf.data are copied to ${RESULTS_DIR}. Defaults:
 #                       core 4, settle 15s after server start, record 30s.

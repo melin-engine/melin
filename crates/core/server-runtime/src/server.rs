@@ -2408,7 +2408,7 @@ where
 
     let connection_timeout = config.connection_timeout();
     let max_conns = config.max_connections;
-    let reader_cores = config.cores.reader;
+    let reader_core = config.cores.reader;
 
     // Exactly one client poll queue (LMAX: single reader → single matcher).
     // Additional DPDK queues, if any, are dedicated to the replication sender
@@ -2420,7 +2420,7 @@ where
     );
     let transport_0 = transports.pop().expect("one client transport");
     let tx_rx_0 = tx_consumers.remove(0);
-    melin_app::affinity::pin_thread("dpdk-poll-0", reader_cores);
+    melin_app::affinity::pin_thread("dpdk-poll-0", reader_core);
     crate::dpdk_transport::run_dpdk_poll::<A>(
         transport_0,
         input_producer,

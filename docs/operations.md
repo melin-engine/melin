@@ -40,8 +40,7 @@ The server uses jemalloc by default (thread-local caches eliminate allocator loc
 | `--journal` | `melin.journal` | Path to the journal file. Use a dedicated NVMe for best latency. |
 | `--snapshot` | (derived) | Path to the snapshot file. If omitted, defaults to `<journal>.snapshot` (e.g., `melin.snapshot`). |
 | `--authorized-keys` | `authorized_keys` | Path to the Ed25519 authorized keys file. Every connection must authenticate before trading. Ignored in replica mode (`--replica-of`). |
-| `--cores` | `1,2,3,6,7,8` | Pipeline core IDs: `journal,matching,response,repl-sender,event-publisher,shadow` (comma-separated). Core 0 should be reserved for OS/IRQ. |
-| `--reader-cores` | `4` | CPU core for the reader thread (TCP) or first poll thread (DPDK). |
+| `--cores` | `1,2,3,6,7,8,4,9,10` | Pipeline core IDs: `journal,matching,response,repl-sender,event-publisher,shadow,reader,repl-handler-0,repl-handler-1` (comma-separated). Core 0 should be reserved for OS/IRQ. 0 = unpinned for any field. |
 | `--max-journal-mib` | `256` | Live journal size in MiB above which the segment is archived and a fresh live file opens. Rotation runs online at the journal stage's fsync boundary. Set to `0` to disable. |
 | `--max-journal-batch` | `4096` | Maximum events per journal fsync batch. Smaller values reduce tail latency; larger values improve throughput. |
 | `--group-commit-us` | `0` | Group commit coalescing delay in microseconds. Keep at `0` for TCP transport. Only useful with UDS (see CLAUDE.md). |
@@ -93,8 +92,7 @@ With quorum durability (default), when 2 replicas are connected the response sta
     --health-bind 0.0.0.0:9878 \
     --journal /mnt/nvme/melin.journal \
     --authorized-keys /etc/melin/authorized_keys \
-    --cores 1,2,3,6,7,8 \
-    --reader-cores 4 \
+    --cores 1,2,3,6,7,8,4,9,10 \
     --max-journal-mib 512 \
     --standalone
 ```
@@ -108,15 +106,14 @@ With quorum durability (default), when 2 replicas are connected the response sta
     --health-bind 0.0.0.0:9878 \
     --journal /mnt/nvme/melin.journal \
     --authorized-keys /etc/melin/authorized_keys \
-    --cores 1,2,3,6,7,8 \
-    --reader-cores 4 \
+    --cores 1,2,3,6,7,8,4,9,10 \
     --max-journal-mib 512 \
     --replication-bind 0.0.0.0:9877
 
 # Replica (separate machine)
 ./target/release/melin-server \
     --journal /mnt/nvme/melin.journal \
-    --cores 1,2,3,6,7,8 \
+    --cores 1,2,3,6,7,8,4,9,10 \
     --replica-of <primary-ip>:9877 \
     --replication-key /etc/melin/replication.key
 ```
@@ -132,8 +129,7 @@ The event channel provides a real-time firehose of all execution events (fills, 
     --event-bind 0.0.0.0:9879 \
     --journal /mnt/nvme/melin.journal \
     --authorized-keys /etc/melin/authorized_keys \
-    --cores 1,2,3,6,7,8 \
-    --reader-cores 4 \
+    --cores 1,2,3,6,7,8,4,9,10 \
     --standalone
 ```
 
@@ -430,26 +426,25 @@ RUST_LOG=melin_server=debug,melin_engine=info ./target/release/melin-server ...
 
 The recommended core assignment for a production server:
 
-| Core(s) | Assignment | Flag |
+| Core(s) | Assignment | `--cores` position |
 |---------|-----------|------|
 | 0 | OS, IRQs, RCU callbacks | (reserved, never assign pipeline work) |
-| 1 | Journal stage | `--cores 1,...` |
-| 2 | Matching stage | `--cores ...,2,...` |
-| 3 | Response stage | `--cores ...,...,3,...` |
-| 4 | Reader thread | `--reader-cores 4` |
-| 6 | Replication sender | `--cores ...,...,...,6,...` |
-| 7 | Event publisher | `--cores ...,...,...,...,7,...` |
-| 8 | Shadow exchange (scheduled snapshots) | `--cores ...,...,...,...,...,8` |
-| 9 | Replication handler 0 | `--cores ...,...,...,...,...,...,9,...` |
-| 10 | Replication handler 1 | `--cores ...,...,...,...,...,...,...,10` |
+| 1 | Journal stage | 1st |
+| 2 | Matching stage | 2nd |
+| 3 | Response stage | 3rd |
+| 6 | Replication sender | 4th |
+| 7 | Event publisher | 5th |
+| 8 | Shadow exchange (scheduled snapshots) | 6th |
+| 4 | Reader thread (io_uring / DPDK poll) | 7th |
+| 9 | Replication handler 0 | 8th |
+| 10 | Replication handler 1 | 9th |
 | 11+ | Available for other work (benchmarks, monitoring) | -- |
 
-### Core Pinning (`--cores`, `--reader-cores`)
+### Core Pinning (`--cores`)
 
 Each pipeline thread calls `sched_setaffinity` to pin itself to the specified core. If pinning fails, a warning is logged but the server continues.
 
-- `--cores 1,2,3,6,7,8,9,10` pins journal to core 1, matching to core 2, response to core 3, repl-sender to core 6, event-publisher to core 7, shadow exchange to core 8, repl-handler-0 to core 9, repl-handler-1 to core 10.
-- `--reader-cores 4` pins the single reader thread to core 4.
+`--cores 1,2,3,6,7,8,4,9,10` pins journal→1, matching→2, response→3, repl-sender→6, event-publisher→7, shadow→8, reader→4, repl-handler-0→9, repl-handler-1→10. Use `0` for any position to leave that thread unpinned (OS-scheduled).
 
 ### Kernel Boot Parameters (GRUB)
 
