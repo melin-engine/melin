@@ -97,7 +97,7 @@ pub struct ServerConfig {
     /// repl-sender is used when replication is enabled, event-publisher when
     /// `--event-bind` is set, shadow when `--snapshot-interval-ms` > 0.
     /// repl-handler-0/1 are for the per-replica TCP handler threads (0 = unpinned).
-    #[arg(long, default_value = "1,2,3,4,6,7,8,9,10", value_parser = parse_cores)]
+    #[arg(long, default_value = "1,2,3,4,5,6,7,8,9", value_parser = parse_cores)]
     pub cores: PipelineCores,
     /// Group commit coalescing delay in microseconds. Keep at 0 for TCP.
     #[arg(long, default_value_t = 0)]
@@ -387,12 +387,12 @@ impl Default for ServerConfig {
                 journal: 1,
                 matching: 2,
                 response: 3,
-                repl_sender: 6,
-                event_publisher: 7,
-                shadow: 8,
                 reader: 4,
-                repl_handler_0: 9,
-                repl_handler_1: 10,
+                repl_sender: 5,
+                event_publisher: 6,
+                shadow: 7,
+                repl_handler_0: 8,
+                repl_handler_1: 9,
             },
             group_commit_us: 0,
             heartbeat_interval_secs: 10,

@@ -40,7 +40,7 @@ The server uses jemalloc by default (thread-local caches eliminate allocator loc
 | `--journal` | `melin.journal` | Path to the journal file. Use a dedicated NVMe for best latency. |
 | `--snapshot` | (derived) | Path to the snapshot file. If omitted, defaults to `<journal>.snapshot` (e.g., `melin.snapshot`). |
 | `--authorized-keys` | `authorized_keys` | Path to the Ed25519 authorized keys file. Every connection must authenticate before trading. Ignored in replica mode (`--replica-of`). |
-| `--cores` | `1,2,3,4,6,7,8,9,10` | Pipeline core IDs: `journal,matching,response,reader,repl-sender,event-publisher,shadow,repl-handler-0,repl-handler-1` (comma-separated). Core 0 should be reserved for OS/IRQ. 0 = unpinned for any field. |
+| `--cores` | `1,2,3,4,5,6,7,8,9` | Pipeline core IDs: `journal,matching,response,reader,repl-sender,event-publisher,shadow,repl-handler-0,repl-handler-1` (comma-separated). Core 0 should be reserved for OS/IRQ. 0 = unpinned for any field. |
 | `--max-journal-mib` | `256` | Live journal size in MiB above which the segment is archived and a fresh live file opens. Rotation runs online at the journal stage's fsync boundary. Set to `0` to disable. |
 | `--max-journal-batch` | `4096` | Maximum events per journal fsync batch. Smaller values reduce tail latency; larger values improve throughput. |
 | `--group-commit-us` | `0` | Group commit coalescing delay in microseconds. Keep at `0` for TCP transport. Only useful with UDS (see CLAUDE.md). |
@@ -92,7 +92,7 @@ With quorum durability (default), when 2 replicas are connected the response sta
     --health-bind 0.0.0.0:9878 \
     --journal /mnt/nvme/melin.journal \
     --authorized-keys /etc/melin/authorized_keys \
-    --cores 1,2,3,4,6,7,8,9,10 \
+    --cores 1,2,3,4,5,6,7,8,9 \
     --max-journal-mib 512 \
     --standalone
 ```
@@ -106,14 +106,14 @@ With quorum durability (default), when 2 replicas are connected the response sta
     --health-bind 0.0.0.0:9878 \
     --journal /mnt/nvme/melin.journal \
     --authorized-keys /etc/melin/authorized_keys \
-    --cores 1,2,3,4,6,7,8,9,10 \
+    --cores 1,2,3,4,5,6,7,8,9 \
     --max-journal-mib 512 \
     --replication-bind 0.0.0.0:9877
 
 # Replica (separate machine)
 ./target/release/melin-server \
     --journal /mnt/nvme/melin.journal \
-    --cores 1,2,3,4,6,7,8,9,10 \
+    --cores 1,2,3,4,5,6,7,8,9 \
     --replica-of <primary-ip>:9877 \
     --replication-key /etc/melin/replication.key
 ```
@@ -129,7 +129,7 @@ The event channel provides a real-time firehose of all execution events (fills, 
     --event-bind 0.0.0.0:9879 \
     --journal /mnt/nvme/melin.journal \
     --authorized-keys /etc/melin/authorized_keys \
-    --cores 1,2,3,4,6,7,8,9,10 \
+    --cores 1,2,3,4,5,6,7,8,9 \
     --standalone
 ```
 
@@ -432,19 +432,19 @@ The recommended core assignment for a production server:
 | 1 | Journal stage | 1st |
 | 2 | Matching stage | 2nd |
 | 3 | Response stage | 3rd |
-| 6 | Replication sender | 4th |
-| 7 | Event publisher | 5th |
-| 8 | Shadow exchange (scheduled snapshots) | 6th |
-| 4 | Reader thread (io_uring / DPDK poll) | 7th |
-| 9 | Replication handler 0 | 8th |
-| 10 | Replication handler 1 | 9th |
-| 11+ | Available for other work (benchmarks, monitoring) | -- |
+| 4 | Reader thread (io_uring / DPDK poll) | 4th |
+| 5 | Replication sender | 5th |
+| 6 | Event publisher | 6th |
+| 7 | Shadow exchange (scheduled snapshots) | 7th |
+| 8 | Replication handler 0 | 8th |
+| 9 | Replication handler 1 | 9th |
+| 10+ | Available for other work (benchmarks, monitoring) | -- |
 
 ### Core Pinning (`--cores`)
 
 Each pipeline thread calls `sched_setaffinity` to pin itself to the specified core. If pinning fails, a warning is logged but the server continues.
 
-`--cores 1,2,3,4,6,7,8,9,10` pins journal→1, matching→2, response→3, reader→4, repl-sender→6, event-publisher→7, shadow→8, repl-handler-0→9, repl-handler-1→10. Use `0` for any position to leave that thread unpinned (OS-scheduled).
+`--cores 1,2,3,4,5,6,7,8,9` pins journal→1, matching→2, response→3, reader→4, repl-sender→5, event-publisher→6, shadow→7, repl-handler-0→8, repl-handler-1→9. Use `0` for any position to leave that thread unpinned (OS-scheduled).
 
 ### Kernel Boot Parameters (GRUB)
 
