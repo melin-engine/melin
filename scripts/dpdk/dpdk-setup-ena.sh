@@ -81,10 +81,14 @@ if [[ -z "$DPDK_IFACE" ]]; then
     exit 1
 fi
 
+# Capture the MAC before unbinding from the kernel driver.
+DPDK_MAC=$(ip link show "$DPDK_IFACE" | grep link/ether | awk '{print $2}')
+
 echo "=== DPDK ENA Setup ==="
 echo "  Primary:   $PRIMARY_IFACE (kernel — SSH/management)"
 echo "  Secondary: $DPDK_IFACE ($DPDK_PCI) → DPDK"
 echo "  DPDK IP:   $DPDK_IP/$DPDK_PREFIX"
+echo "  DPDK MAC:  $DPDK_MAC"
 echo ""
 
 # ---------------------------------------------------------------------------
@@ -151,6 +155,7 @@ DPDK_IP=${DPDK_IP}
 DPDK_PREFIX=${DPDK_PREFIX}
 DPDK_PORT=0
 DPDK_MODE=ena
+DPDK_MAC=${DPDK_MAC}
 HUGE_DIR=/mnt/huge_2m
 EOF
 echo "  Config written"

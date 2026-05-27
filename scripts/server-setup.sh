@@ -553,6 +553,8 @@ EOF
     echo "  Installed udev rule: $UDEV_RULE"
 else
     echo "=== No dedicated journal disk found, skipping ==="
+    mkdir -p "$JOURNAL_MOUNT"
+    chown "${USER_NAME}:${USER_NAME}" "$JOURNAL_MOUNT"
 fi
 
 echo ""

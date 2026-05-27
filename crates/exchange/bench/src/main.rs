@@ -598,6 +598,11 @@ struct BenchArgs {
     /// VLAN ID for hardware strip/insert. Required for dedicated NIC mode.
     #[arg(long)]
     dpdk_vlan: Option<u16>,
+    /// Server MAC address for the DPDK ARP seed (xx:xx:xx:xx:xx:xx).
+    /// When omitted, derived from the server IP (SR-IOV VF scheme).
+    /// Required for NICs with fixed MACs (e.g., AWS ENA).
+    #[arg(long)]
+    dpdk_server_mac: Option<String>,
     /// CPU core for the DPDK bench poll thread.
     #[arg(long, default_value_t = 7)]
     dpdk_core: usize,
@@ -719,6 +724,20 @@ fn main() {
                 });
                 let key = load_signing_key(key_path);
 
+                let server_mac = args.dpdk_server_mac.as_deref().map(|s| {
+                    let parts: Vec<u8> = s
+                        .split(':')
+                        .map(|h| u8::from_str_radix(h, 16).expect("invalid --dpdk-server-mac"))
+                        .collect();
+                    assert!(
+                        parts.len() == 6,
+                        "invalid --dpdk-server-mac: expected 6 octets"
+                    );
+                    let mut mac = [0u8; 6];
+                    mac.copy_from_slice(&parts);
+                    mac
+                });
+
                 dpdk::run_dpdk_roundtrip(
                     args.max_reject_pct,
                     dpdk::DpdkBenchConfig {
@@ -737,6 +756,7 @@ fn main() {
                         server_addr: addr,
                         mtu: args.dpdk_mtu,
                         vlan_id: args.dpdk_vlan,
+                        server_mac,
                     },
                     phases,
                     args.window,

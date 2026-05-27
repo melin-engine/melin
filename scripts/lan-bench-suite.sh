@@ -1060,18 +1060,19 @@ transport_stop_tcp_dual_repl() {
 # --- DPDK transports ---
 
 # Load DPDK config from /etc/melin-dpdk.conf on a host.
-# Populates ${prefix}_DPDK_IP, _PORT, _PREFIX, _MODE, _EAL_ARGS.
+# Populates ${prefix}_DPDK_IP, _PORT, _PREFIX, _MODE, _EAL_ARGS, _DPDK_MAC.
 load_dpdk_config() {
     local host="$1" prefix="$2"
     local conf
     conf=$(ssh $SSH_OPTS "$host" "cat /etc/melin-dpdk.conf 2>/dev/null" || true)
     if [[ -n "$conf" ]]; then
-        local ip port dpdk_prefix mode eal_args
+        local ip port dpdk_prefix mode eal_args dpdk_mac
         ip=$(echo "$conf" | grep "^DPDK_IP=" | cut -d= -f2 || true)
         port=$(echo "$conf" | grep "^DPDK_PORT=" | cut -d= -f2 || true)
         dpdk_prefix=$(echo "$conf" | grep "^DPDK_PREFIX=" | cut -d= -f2 || true)
         mode=$(echo "$conf" | grep "^DPDK_MODE=" | cut -d= -f2 || true)
         eal_args=$(echo "$conf" | grep "^DPDK_EAL_ARGS=" | cut -d= -f2- || true)
+        dpdk_mac=$(echo "$conf" | grep "^DPDK_MAC=" | cut -d= -f2 || true)
         local vlan_id
         vlan_id=$(echo "$conf" | grep "^VLAN_ID=" | cut -d= -f2 || true)
         eval "${prefix}_DPDK_IP=${ip:-}"
@@ -1080,6 +1081,7 @@ load_dpdk_config() {
         eval "${prefix}_DPDK_MODE=${mode:-sriov}"
         eval "${prefix}_DPDK_EAL_ARGS='${eal_args:-}'"
         eval "${prefix}_DPDK_VLAN=${vlan_id:-}"
+        eval "${prefix}_DPDK_MAC=${dpdk_mac:-}"
     fi
 }
 
@@ -1364,6 +1366,12 @@ transport_start_dpdk() {
         if [[ -n "${BENCH_DPDK_IP:-}" ]]; then
             BENCH_DPDK_ARGS="${BENCH_DPDK_ARGS} --dpdk-ip ${BENCH_DPDK_IP} --dpdk-prefix-len ${BENCH_DPDK_PREFIX}"
         fi
+    fi
+
+    # ENA mode: pass the server's real MAC to the bench so the ARP seed
+    # uses the correct hardware address instead of deriving from the IP.
+    if [[ -n "${SERVER_DPDK_MAC:-}" ]]; then
+        BENCH_DPDK_ARGS="${BENCH_DPDK_ARGS} --dpdk-server-mac ${SERVER_DPDK_MAC}"
     fi
 
     CURRENT_BIND="${SERVER_DPDK_IP}:9876"
