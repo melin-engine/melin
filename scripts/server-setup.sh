@@ -39,10 +39,13 @@ echo ""
 # 1. System packages
 # ---------------------------------------------------------------------------
 echo "=== Installing system packages ==="
-# Skip `apt-get update` if the index was refreshed within the last hour.
-# `-qq` forces a refresh otherwise; on a freshly-provisioned box this
-# dominates the setup boot time. Threshold is conservative: 1h is short
-# enough that security updates land same-day in practice.
+# Cloud images (AWS, GCP, Azure) may not have the universe repo enabled;
+# clang/llvm/lld/nasm live there on Ubuntu. No-op if already enabled or
+# not Ubuntu (Debian doesn't have universe).
+if command -v add-apt-repository &>/dev/null; then
+    add-apt-repository -y universe 2>/dev/null || true
+fi
+
 APT_INDEX_MAX_AGE=3600
 if [[ -f /var/cache/apt/pkgcache.bin ]]; then
     INDEX_AGE=$(( $(date +%s) - $(stat -c %Y /var/cache/apt/pkgcache.bin) ))
