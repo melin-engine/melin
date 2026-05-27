@@ -102,7 +102,7 @@ fi
 
 # Track created resources for cleanup on failure.
 CREATED_SG=""
-CREATED_INSTANCES=""
+CREATED_INSTANCES=()
 
 cleanup_on_error() {
     local exit_code=$?
@@ -111,10 +111,10 @@ cleanup_on_error() {
     fi
     echo "" >&2
     echo "=== Launch failed — cleaning up ===" >&2
-    if [[ -n "$CREATED_INSTANCES" ]]; then
-        echo "  Terminating instances: $CREATED_INSTANCES" >&2
+    if [[ ${#CREATED_INSTANCES[@]} -gt 0 ]]; then
+        echo "  Terminating instances: ${CREATED_INSTANCES[*]}" >&2
         aws ec2 terminate-instances "${REGION_ARGS[@]}" \
-            --instance-ids $CREATED_INSTANCES >/dev/null 2>&1 || true
+            --instance-ids "${CREATED_INSTANCES[@]}" >/dev/null 2>&1 || true
     fi
     if [[ -n "$CREATED_SG" ]]; then
         # Wait briefly for instances to release the SG.
@@ -225,7 +225,7 @@ INSTANCE_IDS=$(aws ec2 run-instances "${LAUNCH_ARGS[@]}" \
 
 SERVER_ID=$(echo "$INSTANCE_IDS" | awk '{print $1}')
 BENCH_ID=$(echo "$INSTANCE_IDS" | awk '{print $2}')
-CREATED_INSTANCES="$SERVER_ID $BENCH_ID"
+CREATED_INSTANCES=("$SERVER_ID" "$BENCH_ID")
 
 # Tag with roles.
 aws ec2 create-tags "${REGION_ARGS[@]}" --resources "$SERVER_ID" \
@@ -265,26 +265,29 @@ echo "  Bench:  $BENCH_ID  pub=$BENCH_PUB  priv=$BENCH_PRIV"
 # Write metadata
 # ---------------------------------------------------------------------------
 EFFECTIVE_REGION="${REGION:-$(aws configure get region 2>/dev/null || echo "")}"
+SMT_DISABLED=$( [[ "$DISABLE_SMT" -eq 1 ]] && echo "true" || echo "false" )
 
-cat > "$OUTPUT" << EOF
-{
-  "region": "$EFFECTIVE_REGION",
-  "instance_type": "$INSTANCE_TYPE",
-  "ami_id": "$AMI_ID",
-  "smt_disabled": $( [[ "$DISABLE_SMT" -eq 1 ]] && echo "true" || echo "false" ),
-  "security_group_id": "$SECURITY_GROUP_ID",
-  "server": {
-    "instance_id": "$SERVER_ID",
-    "public_ip": "$SERVER_PUB",
-    "private_ip": "$SERVER_PRIV"
-  },
-  "bench": {
-    "instance_id": "$BENCH_ID",
-    "public_ip": "$BENCH_PUB",
-    "private_ip": "$BENCH_PRIV"
-  }
-}
-EOF
+jq -n \
+    --arg region         "$EFFECTIVE_REGION" \
+    --arg instance_type  "$INSTANCE_TYPE" \
+    --arg ami_id         "$AMI_ID" \
+    --argjson smt_disabled "$SMT_DISABLED" \
+    --arg sg_id          "$SECURITY_GROUP_ID" \
+    --arg server_id      "$SERVER_ID" \
+    --arg server_pub     "$SERVER_PUB" \
+    --arg server_priv    "$SERVER_PRIV" \
+    --arg bench_id       "$BENCH_ID" \
+    --arg bench_pub      "$BENCH_PUB" \
+    --arg bench_priv     "$BENCH_PRIV" \
+    '{
+      region: $region,
+      instance_type: $instance_type,
+      ami_id: $ami_id,
+      smt_disabled: $smt_disabled,
+      security_group_id: $sg_id,
+      server: {instance_id: $server_id, public_ip: $server_pub, private_ip: $server_priv},
+      bench:  {instance_id: $bench_id,  public_ip: $bench_pub,  private_ip: $bench_priv}
+    }' > "$OUTPUT"
 
 # Metadata written — from here, terminate.sh handles cleanup.
 trap - EXIT
@@ -302,46 +305,56 @@ if [[ "$SKIP_SETUP" -eq 1 ]]; then
     echo "  ./scripts/lan-bench-suite.sh $SERVER_PUB $BENCH_PUB $SERVER_PRIV $SSH_USER"
     echo ""
     echo "Tear down:"
-    echo "  ./scripts/aws/terminate.sh"
+    echo "  ./scripts/aws/terminate.sh --instances $OUTPUT"
     exit 0
 fi
 
 echo ""
 echo "=== Running server-setup.sh on both instances ==="
 
-SSH_OPTS="-i $SSH_KEY -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -o ConnectTimeout=30"
+SSH_BASE=(-i "$SSH_KEY" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR)
+SSH_OPTS=("${SSH_BASE[@]}" -o ConnectTimeout=30)
+SSH_QUICK=("${SSH_BASE[@]}" -o ConnectTimeout=5)
 
 setup_host() {
     local pub_ip="$1"
     local role="$2"
+    local reboot_flag="$3"
 
     echo "  [$role] Copying setup script..."
-    scp $SSH_OPTS "$SETUP_SCRIPT" "$SSH_USER@$pub_ip:/tmp/server-setup.sh"
+    scp "${SSH_OPTS[@]}" "$SETUP_SCRIPT" "$SSH_USER@$pub_ip:/tmp/server-setup.sh"
 
     echo "  [$role] Running setup (this takes a few minutes)..."
-    ssh $SSH_OPTS "$SSH_USER@$pub_ip" "sudo bash /tmp/server-setup.sh"
+    ssh "${SSH_OPTS[@]}" "$SSH_USER@$pub_ip" "sudo bash /tmp/server-setup.sh"
 
-    # Check if reboot is needed.
-    if ssh $SSH_OPTS "$SSH_USER@$pub_ip" "test -f /tmp/.server-needs-reboot" 2>/dev/null; then
+    # Check if reboot is needed (touching a local flag file avoids conflating
+    # setup errors with reboot requests via exit code).
+    if ssh "${SSH_OPTS[@]}" "$SSH_USER@$pub_ip" "test -f /tmp/.server-needs-reboot" 2>/dev/null; then
         echo "  [$role] Rebooting for kernel params..."
-        ssh $SSH_OPTS "$SSH_USER@$pub_ip" "sudo reboot" || true
-        return 1
+        ssh "${SSH_OPTS[@]}" "$SSH_USER@$pub_ip" "sudo reboot" || true
+        touch "$reboot_flag"
     fi
-    return 0
 }
 
+REBOOT_FLAG_SERVER=$(mktemp)
+REBOOT_FLAG_BENCH=$(mktemp)
+rm "$REBOOT_FLAG_SERVER" "$REBOOT_FLAG_BENCH"
+
 # Run setup on both in parallel.
-setup_host "$SERVER_PUB" "server" &
+setup_host "$SERVER_PUB" "server" "$REBOOT_FLAG_SERVER" &
 PID_SERVER=$!
 
-setup_host "$BENCH_PUB" "bench" &
+setup_host "$BENCH_PUB" "bench" "$REBOOT_FLAG_BENCH" &
 PID_BENCH=$!
 
-# Wait for both. Exit code 1 = reboot needed (not a failure).
+wait $PID_SERVER
+wait $PID_BENCH
+
 NEEDS_REBOOT_SERVER=0
 NEEDS_REBOOT_BENCH=0
-wait $PID_SERVER || NEEDS_REBOOT_SERVER=1
-wait $PID_BENCH || NEEDS_REBOOT_BENCH=1
+[[ -f "$REBOOT_FLAG_SERVER" ]] && NEEDS_REBOOT_SERVER=1
+[[ -f "$REBOOT_FLAG_BENCH"  ]] && NEEDS_REBOOT_BENCH=1
+rm -f "$REBOOT_FLAG_SERVER" "$REBOOT_FLAG_BENCH"
 
 # ---------------------------------------------------------------------------
 # Reboot and wait (if needed)
@@ -356,12 +369,18 @@ if [[ "$NEEDS_REBOOT_SERVER" -eq 1 || "$NEEDS_REBOOT_BENCH" -eq 1 ]]; then
 
     # Verify SSH is back.
     for host in "$SERVER_PUB" "$BENCH_PUB"; do
+        connected=0
         for attempt in $(seq 1 30); do
-            if ssh $SSH_OPTS -o ConnectTimeout=5 "$SSH_USER@$host" "true" 2>/dev/null; then
+            if ssh "${SSH_QUICK[@]}" "$SSH_USER@$host" "true" 2>/dev/null; then
+                connected=1
                 break
             fi
             sleep 2
         done
+        if [[ "$connected" -eq 0 ]]; then
+            echo "error: SSH did not come back on $host after reboot" >&2
+            exit 1
+        fi
     done
     echo "  Both instances back online."
 fi
@@ -374,7 +393,7 @@ echo "=== Verifying kernel tuning ==="
 for pair in "$SERVER_PUB:server" "$BENCH_PUB:bench"; do
     host="${pair%%:*}"
     role="${pair##*:}"
-    isolated=$(ssh $SSH_OPTS "$SSH_USER@$host" "cat /sys/devices/system/cpu/isolated 2>/dev/null || echo none")
+    isolated=$(ssh "${SSH_OPTS[@]}" "$SSH_USER@$host" "cat /sys/devices/system/cpu/isolated 2>/dev/null || echo none")
     echo "  [$role] isolcpus=$isolated"
 done
 
@@ -385,5 +404,5 @@ echo "Run benchmarks:"
 echo "  ./scripts/lan-bench-suite.sh $SERVER_PUB $BENCH_PUB $SERVER_PRIV $SSH_USER"
 echo ""
 echo "Tear down:"
-echo "  ./scripts/aws/terminate.sh"
+echo "  ./scripts/aws/terminate.sh --instances $OUTPUT"
 echo ""
