@@ -40,7 +40,7 @@ The server uses jemalloc by default (thread-local caches eliminate allocator loc
 | `--journal` | `melin.journal` | Path to the journal file. Use a dedicated NVMe for best latency. |
 | `--snapshot` | (derived) | Path to the snapshot file. If omitted, defaults to `<journal>.snapshot` (e.g., `melin.snapshot`). |
 | `--authorized-keys` | `authorized_keys` | Path to the Ed25519 authorized keys file. Every connection must authenticate before trading. Ignored in replica mode (`--replica-of`). |
-| `--cores` | `1,2,3,6,7,8,4,9,10` | Pipeline core IDs: `journal,matching,response,repl-sender,event-publisher,shadow,reader,repl-handler-0,repl-handler-1` (comma-separated). Core 0 should be reserved for OS/IRQ. 0 = unpinned for any field. |
+| `--cores` | `1,2,3,4,6,7,8,9,10` | Pipeline core IDs: `journal,matching,response,reader,repl-sender,event-publisher,shadow,repl-handler-0,repl-handler-1` (comma-separated). Core 0 should be reserved for OS/IRQ. 0 = unpinned for any field. |
 | `--max-journal-mib` | `256` | Live journal size in MiB above which the segment is archived and a fresh live file opens. Rotation runs online at the journal stage's fsync boundary. Set to `0` to disable. |
 | `--max-journal-batch` | `4096` | Maximum events per journal fsync batch. Smaller values reduce tail latency; larger values improve throughput. |
 | `--group-commit-us` | `0` | Group commit coalescing delay in microseconds. Keep at `0` for TCP transport. Only useful with UDS (see CLAUDE.md). |
@@ -92,7 +92,7 @@ With quorum durability (default), when 2 replicas are connected the response sta
     --health-bind 0.0.0.0:9878 \
     --journal /mnt/nvme/melin.journal \
     --authorized-keys /etc/melin/authorized_keys \
-    --cores 1,2,3,6,7,8,4,9,10 \
+    --cores 1,2,3,4,6,7,8,9,10 \
     --max-journal-mib 512 \
     --standalone
 ```
@@ -106,14 +106,14 @@ With quorum durability (default), when 2 replicas are connected the response sta
     --health-bind 0.0.0.0:9878 \
     --journal /mnt/nvme/melin.journal \
     --authorized-keys /etc/melin/authorized_keys \
-    --cores 1,2,3,6,7,8,4,9,10 \
+    --cores 1,2,3,4,6,7,8,9,10 \
     --max-journal-mib 512 \
     --replication-bind 0.0.0.0:9877
 
 # Replica (separate machine)
 ./target/release/melin-server \
     --journal /mnt/nvme/melin.journal \
-    --cores 1,2,3,6,7,8,4,9,10 \
+    --cores 1,2,3,4,6,7,8,9,10 \
     --replica-of <primary-ip>:9877 \
     --replication-key /etc/melin/replication.key
 ```
@@ -129,7 +129,7 @@ The event channel provides a real-time firehose of all execution events (fills, 
     --event-bind 0.0.0.0:9879 \
     --journal /mnt/nvme/melin.journal \
     --authorized-keys /etc/melin/authorized_keys \
-    --cores 1,2,3,6,7,8,4,9,10 \
+    --cores 1,2,3,4,6,7,8,9,10 \
     --standalone
 ```
 
@@ -444,7 +444,7 @@ The recommended core assignment for a production server:
 
 Each pipeline thread calls `sched_setaffinity` to pin itself to the specified core. If pinning fails, a warning is logged but the server continues.
 
-`--cores 1,2,3,6,7,8,4,9,10` pins journal→1, matching→2, response→3, repl-sender→6, event-publisher→7, shadow→8, reader→4, repl-handler-0→9, repl-handler-1→10. Use `0` for any position to leave that thread unpinned (OS-scheduled).
+`--cores 1,2,3,4,6,7,8,9,10` pins journal→1, matching→2, response→3, reader→4, repl-sender→6, event-publisher→7, shadow→8, repl-handler-0→9, repl-handler-1→10. Use `0` for any position to leave that thread unpinned (OS-scheduled).
 
 ### Kernel Boot Parameters (GRUB)
 

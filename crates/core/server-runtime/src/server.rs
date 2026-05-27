@@ -91,13 +91,13 @@ pub struct ServerConfig {
     /// Path to a snapshot file for faster recovery.
     #[arg(long)]
     pub snapshot: Option<PathBuf>,
-    /// Pipeline core IDs: journal,matching,response,repl-sender,event-publisher,shadow,reader,repl-handler-0,repl-handler-1
+    /// Pipeline core IDs: journal,matching,response,reader,repl-sender,event-publisher,shadow,repl-handler-0,repl-handler-1
     /// (comma-separated). Core 0 is reserved for OS/IRQ handling.
+    /// reader pins the io_uring reader (TCP) or DPDK poll thread.
     /// repl-sender is used when replication is enabled, event-publisher when
     /// `--event-bind` is set, shadow when `--snapshot-interval-ms` > 0.
-    /// reader pins the io_uring reader (TCP) or DPDK poll thread.
     /// repl-handler-0/1 are for the per-replica TCP handler threads (0 = unpinned).
-    #[arg(long, default_value = "1,2,3,6,7,8,4,9,10", value_parser = parse_cores)]
+    #[arg(long, default_value = "1,2,3,4,6,7,8,9,10", value_parser = parse_cores)]
     pub cores: PipelineCores,
     /// Group commit coalescing delay in microseconds. Keep at 0 for TCP.
     #[arg(long, default_value_t = 0)]
@@ -490,11 +490,11 @@ pub struct PipelineCores {
     pub journal: usize,
     pub matching: usize,
     pub response: usize,
+    /// io_uring reader thread (TCP) or DPDK poll thread.
+    pub reader: usize,
     pub repl_sender: usize,
     pub event_publisher: usize,
     pub shadow: usize,
-    /// io_uring reader thread (TCP) or DPDK poll thread.
-    pub reader: usize,
     /// Core for replication handler thread 0. 0 = unpinned (OS scheduled).
     pub repl_handler_0: usize,
     /// Core for replication handler thread 1. 0 = unpinned (OS scheduled).
@@ -541,12 +541,12 @@ impl PipelineCores {
     }
 }
 
-/// Parse "j,m,r,rs,ep,sh,rd,h0,h1" into `PipelineCores` for pipeline core affinity.
+/// Parse "j,m,r,rd,rs,ep,sh,h0,h1" into `PipelineCores` for pipeline core affinity.
 fn parse_cores(s: &str) -> Result<PipelineCores, String> {
     let parts: Vec<&str> = s.split(',').collect();
     if parts.len() != 9 {
         return Err(format!(
-            "expected 9 comma-separated core IDs (journal,matching,response,repl-sender,event-publisher,shadow,reader,repl-handler-0,repl-handler-1), got {}",
+            "expected 9 comma-separated core IDs (journal,matching,response,reader,repl-sender,event-publisher,shadow,repl-handler-0,repl-handler-1), got {}",
             parts.len()
         ));
     }
@@ -558,10 +558,10 @@ fn parse_cores(s: &str) -> Result<PipelineCores, String> {
         journal: parse(parts[0])?,
         matching: parse(parts[1])?,
         response: parse(parts[2])?,
-        repl_sender: parse(parts[3])?,
-        event_publisher: parse(parts[4])?,
-        shadow: parse(parts[5])?,
-        reader: parse(parts[6])?,
+        reader: parse(parts[3])?,
+        repl_sender: parse(parts[4])?,
+        event_publisher: parse(parts[5])?,
+        shadow: parse(parts[6])?,
         repl_handler_0: parse(parts[7])?,
         repl_handler_1: parse(parts[8])?,
     })

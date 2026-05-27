@@ -386,7 +386,7 @@ Because the journal and matching consumers run in parallel (not chained), the ma
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--cores` | `1,2,3,6,7,8,4,9,10` | Pipeline core IDs: journal, matching, response, repl-sender, event-publisher, shadow, reader, repl-handler-0, repl-handler-1 (comma-separated). 0 = unpinned. |
+| `--cores` | `1,2,3,4,6,7,8,9,10` | Pipeline core IDs: journal, matching, response, reader, repl-sender, event-publisher, shadow, repl-handler-0, repl-handler-1 (comma-separated). 0 = unpinned. |
 | `--group-commit-us` | `0` | Group commit coalescing delay in microseconds. Keep at 0 for TCP. |
 | `--heartbeat-interval-secs` | `10` | Heartbeat interval for idle connections (0 to disable) |
 | `--connection-timeout-secs` | `30` | Disconnect clients silent for this long (0 to disable) |
