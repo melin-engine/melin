@@ -228,10 +228,10 @@ fn main() {
         repl_sender: 0,
         event_publisher: 0,
         shadow: 0,
+        reader: 0,
         repl_handler_0: 0,
         repl_handler_1: 0,
     };
-    let receiver_core = 0_usize;
     let s = Arc::clone(&shutdown);
     let promote = Arc::new(AtomicBool::new(false));
     let p = Arc::clone(&promote);
@@ -247,7 +247,6 @@ fn main() {
                 3_000_000, // snapshot_interval_ms (effectively never)
                 replica_snapshot,
                 cores,
-                receiver_core,
                 std::time::Duration::ZERO,
                 8, // pipeline_depth
                 busy_spin,

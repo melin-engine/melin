@@ -338,7 +338,6 @@ pub fn run_receiver<A, W>(
     snapshot_interval_ms: u64,
     snapshot_path: std::path::PathBuf,
     cores: crate::server::PipelineCores,
-    receiver_core: usize,
     group_commit_delay: std::time::Duration,
     pipeline_depth: usize,
     busy_spin: bool,
@@ -650,7 +649,7 @@ where
                 let handle = std::thread::Builder::new()
                     .name("replica-receiver".into())
                     .spawn_scoped(s, || {
-                        melin_app::affinity::pin_thread("replica-receiver", receiver_core);
+                        melin_app::affinity::pin_thread("replica-receiver", cores.reader);
                         let mut transport = match UringTransport::new(&tcp_writer) {
                             Ok(t) => t,
                             Err(e) => {
