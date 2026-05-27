@@ -528,11 +528,11 @@ impl PipelineCores {
             journal: 1,
             matching: 2,
             response: 3,
+            reader: 4,
             // repl_sender not spawned in compact (no --replication-bind).
             repl_sender: 0,
             event_publisher: 5,
             shadow: 6,
-            reader: 4,
             // repl handlers not spawned in compact; 0 = unpinned.
             repl_handler_0: 0,
             repl_handler_1: 0,

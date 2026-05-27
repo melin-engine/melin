@@ -464,7 +464,7 @@ sudo reboot
 What each parameter does:
 
 - **`isolcpus=nohz,domain,1-9`**: Removes cores 1-9 from the scheduler's load balancing and timer tick distribution. Only explicitly pinned threads run on these cores.
-- **`nohz_full=1-9`**: Stops the timer tick on cores 1-9 when only one task is running. Eliminates ~1-9us jitter every 4ms (HZ=250).
+- **`nohz_full=1-9`**: Stops the timer tick on cores 1-9 when only one task is running. Eliminates ~1–10 µs jitter every 4ms (HZ=250).
 - **`rcu_nocbs=1-9`**: Moves RCU callback processing off cores 1-9. Without this, RCU grace periods can still interrupt isolated cores.
 
 Verify after reboot:
