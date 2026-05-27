@@ -204,7 +204,7 @@ LAST_ISOLATED=$((PHYSICAL_CORES - 1))
 ISOLATED_RANGE="1-${LAST_ISOLATED}"
 echo "  detected $PHYSICAL_CORES physical cores → isolating ${ISOLATED_RANGE}"
 
-BENCH_PARAMS="isolcpus=nohz,domain,${ISOLATED_RANGE} nohz_full=${ISOLATED_RANGE} rcu_nocbs=${ISOLATED_RANGE} nowatchdog transparent_hugepage=never cpufreq.default_governor=performance processor.max_cstate=1 skew_tick=1 nosmt tsc=nowatchdog"
+BENCH_PARAMS="isolcpus=nohz,domain,managed_irq,${ISOLATED_RANGE} nohz_full=${ISOLATED_RANGE} rcu_nocbs=${ISOLATED_RANGE} irqaffinity=0 nowatchdog transparent_hugepage=never cpufreq.default_governor=performance processor.max_cstate=1 skew_tick=1 nosmt tsc=nowatchdog"
 # IOMMU for DPDK/vfio-pci. iommu=pt sets passthrough mode so DMA
 # bypasses IOMMU translation for performance. intel_iommu=on is
 # Intel-specific; on AMD (EPYC, Ryzen) the kernel uses AMD-Vi
