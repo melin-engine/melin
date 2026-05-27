@@ -360,8 +360,14 @@ PID_SERVER=$!
 setup_host "$BENCH_PUB" "bench" "$REBOOT_FLAG_BENCH" &
 PID_BENCH=$!
 
-wait $PID_SERVER
-wait $PID_BENCH
+SETUP_FAILED=0
+wait $PID_SERVER || SETUP_FAILED=1
+wait $PID_BENCH  || SETUP_FAILED=1
+
+if [[ "$SETUP_FAILED" -eq 1 ]]; then
+    echo "error: setup failed on one or more instances" >&2
+    exit 1
+fi
 
 NEEDS_REBOOT_SERVER=0
 NEEDS_REBOOT_BENCH=0
