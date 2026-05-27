@@ -184,7 +184,13 @@ echo ""
 #     skipping watchdog validation is safe. Verified: after enabling, the 12s
 #     cadence in `perf record -e timer:timer_start` disappears and the bench's
 #     p99.99999 drops ~79% (102µs → 21µs).
-GRUB_FILE="/etc/default/grub"
+# Use a grub.d drop-in so our params survive platform overrides.
+# Cloud images (AWS, GCP) ship a 50-cloudimg-settings.cfg that overwrites
+# GRUB_CMDLINE_LINUX_DEFAULT after /etc/default/grub is sourced. A
+# 99-melin.cfg drop-in runs last and appends to whatever the platform set,
+# so both the platform defaults and our tuning end up on the kernel cmdline.
+GRUB_DIR="/etc/default/grub.d"
+MELIN_GRUB_CFG="${GRUB_DIR}/99-melin.cfg"
 
 # Count unique physical cores. `lscpu -p=CORE` lists one row per logical CPU
 # with its physical core ID; sort -u collapses SMT siblings. nosmt is set
@@ -209,78 +215,43 @@ else
     IOMMU_PARAMS="intel_iommu=on iommu=pt"
 fi
 
-if [[ -f "$GRUB_FILE" ]]; then
-    NEEDS_UPDATE=0
-    NEEDS_RANGE_REWRITE=0
+ALL_PARAMS="$BENCH_PARAMS $IOMMU_PARAMS"
 
-    if ! grep -q "isolcpus" "$GRUB_FILE" 2>/dev/null; then
-        echo "=== Adding kernel boot parameters ==="
-        echo "  Adding: $BENCH_PARAMS"
-        NEEDS_UPDATE=1
-    else
-        # isolcpus is present — check whether the range matches what this
-        # host actually needs. A 9950X-tuned config (1-10) on a 24-core
-        # 9255 leaves cores 11-23 unisolated, which is exactly the bug
-        # this script is meant to prevent.
-        CURRENT_RANGE=$(grep -oE 'isolcpus=nohz,domain,[0-9-]+' "$GRUB_FILE" | sed 's/^isolcpus=nohz,domain,//')
+if [[ -d "$GRUB_DIR" ]] || [[ -f /etc/default/grub ]]; then
+    mkdir -p "$GRUB_DIR"
+    NEEDS_UPDATE=0
+
+    if [[ -f "$MELIN_GRUB_CFG" ]]; then
+        # Check if the isolated range matches what this host needs.
+        CURRENT_RANGE=$(grep -oE 'isolcpus=nohz,domain,[0-9-]+' "$MELIN_GRUB_CFG" 2>/dev/null | sed 's/^isolcpus=nohz,domain,//')
         if [[ -n "$CURRENT_RANGE" && "$CURRENT_RANGE" != "$ISOLATED_RANGE" ]]; then
             echo "=== Updating isolcpus range ==="
             echo "  Current: $CURRENT_RANGE → Desired: $ISOLATED_RANGE"
-            NEEDS_RANGE_REWRITE=1
+            NEEDS_UPDATE=1
+        elif ! grep -q "tsc=nowatchdog" "$MELIN_GRUB_CFG" 2>/dev/null; then
+            echo "  Backfilling tsc=nowatchdog"
+            NEEDS_UPDATE=1
+        elif ! grep -q "iommu=pt" "$MELIN_GRUB_CFG" 2>/dev/null; then
+            echo "  Backfilling IOMMU params"
+            NEEDS_UPDATE=1
         fi
-    fi
-
-    if ! grep -q "iommu=pt" "$GRUB_FILE" 2>/dev/null; then
-        echo "  Adding IOMMU passthrough for DPDK: $IOMMU_PARAMS"
+    else
+        echo "=== Adding kernel boot parameters ==="
+        echo "  Adding: $ALL_PARAMS"
         NEEDS_UPDATE=1
     fi
 
-    # tsc=nowatchdog is checked independently of `isolcpus` so it can be
-    # backfilled onto already-set-up boxes whose grub line predates this
-    # parameter (the original BENCH_PARAMS bundle is only re-emitted in
-    # the "isolcpus missing" path).
-    if ! grep -q "tsc=nowatchdog" "$GRUB_FILE" 2>/dev/null; then
-        echo "  Adding tsc=nowatchdog (disables the clocksource watchdog)"
-        NEEDS_UPDATE=1
-    fi
-
-    if [[ "$NEEDS_UPDATE" -eq 1 || "$NEEDS_RANGE_REWRITE" -eq 1 ]]; then
-        cp "$GRUB_FILE" "${GRUB_FILE}.bak"
-
-        if [[ "$NEEDS_RANGE_REWRITE" -eq 1 ]]; then
-            # Rewrite the three core-range parameters in place. We match
-            # the parameter name + value so unrelated numeric ranges
-            # elsewhere on the line are unaffected.
-            sed -i -E "s/isolcpus=nohz,domain,[0-9-]+/isolcpus=nohz,domain,${ISOLATED_RANGE}/" "$GRUB_FILE"
-            sed -i -E "s/nohz_full=[0-9-]+/nohz_full=${ISOLATED_RANGE}/" "$GRUB_FILE"
-            sed -i -E "s/rcu_nocbs=[0-9-]+/rcu_nocbs=${ISOLATED_RANGE}/" "$GRUB_FILE"
-        fi
-
-        if [[ "$NEEDS_UPDATE" -eq 1 ]]; then
-            # Append any missing parameter blocks (initial install path).
-            ADD_PARAMS=""
-            if ! grep -q "isolcpus" "$GRUB_FILE" 2>/dev/null; then
-                ADD_PARAMS="$BENCH_PARAMS"
-            fi
-            if ! grep -q "iommu=pt" "$GRUB_FILE" 2>/dev/null; then
-                ADD_PARAMS="$ADD_PARAMS $IOMMU_PARAMS"
-            fi
-            # Backfill tsc=nowatchdog onto boxes whose grub already has
-            # isolcpus (so BENCH_PARAMS wasn't re-applied above).
-            if ! grep -q "tsc=nowatchdog" "$GRUB_FILE" 2>/dev/null; then
-                ADD_PARAMS="$ADD_PARAMS tsc=nowatchdog"
-            fi
-            if [[ -n "$ADD_PARAMS" ]]; then
-                sed -i "s/^GRUB_CMDLINE_LINUX_DEFAULT=\"\(.*\)\"/GRUB_CMDLINE_LINUX_DEFAULT=\"\1 $ADD_PARAMS\"/" "$GRUB_FILE"
-            fi
-        fi
-
+    if [[ "$NEEDS_UPDATE" -eq 1 ]]; then
+        cat > "$MELIN_GRUB_CFG" << EOF
+# Melin benchmark — kernel tuning (appends to platform defaults).
+GRUB_CMDLINE_LINUX_DEFAULT="\$GRUB_CMDLINE_LINUX_DEFAULT $ALL_PARAMS"
+EOF
         update-grub
         touch /tmp/.server-needs-reboot
         echo "  *** REBOOT REQUIRED for new kernel params to take effect ***"
     else
         echo "=== Kernel boot params already configured ==="
-        grep "GRUB_CMDLINE_LINUX_DEFAULT" "$GRUB_FILE"
+        cat "$MELIN_GRUB_CFG"
     fi
 else
     echo "=== No GRUB config found, skipping kernel boot params ==="
@@ -410,11 +381,15 @@ EOF
 # clone) + server-side accept fds + journal/io_uring fds ≈ 1500+.
 LIMITS_FILE="/etc/security/limits.d/99-melin-bench.conf"
 cat > "$LIMITS_FILE" << 'EOF'
-# Melin benchmark — raise fd limits for high client counts.
+# Melin benchmark — raise fd and memlock limits.
 *    soft nofile 65536
 *    hard nofile 65536
 root soft nofile 65536
 root hard nofile 65536
+*    soft memlock unlimited
+*    hard memlock unlimited
+root soft memlock unlimited
+root hard memlock unlimited
 EOF
 echo "  Written $LIMITS_FILE (nofile=65536)"
 sysctl --system --quiet
