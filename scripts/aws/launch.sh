@@ -19,6 +19,7 @@
 #   --security-group-id <id> Existing SG (default: creates melin-bench-sg)
 #   --smt                     Keep hyperthreading enabled (default: disabled)
 #   --dpdk                    Attach a second ENI for DPDK kernel bypass
+#   --placement-group <name>  Cluster placement group (low-latency, same rack)
 #   --skip-setup              Skip server-setup.sh (just launch raw instances)
 #   --user <name>             SSH user (default: ubuntu)
 #   --output <path>           Write instance metadata JSON (default: /tmp/melin-aws-instances.json)
@@ -49,6 +50,7 @@ SUBNET_ID=""
 SECURITY_GROUP_ID=""
 DISABLE_SMT=1
 ENABLE_DPDK=0
+PLACEMENT_GROUP=""
 SKIP_SETUP=0
 SSH_USER="ubuntu"
 OUTPUT="/tmp/melin-aws-instances.json"
@@ -67,6 +69,7 @@ while [[ $# -gt 0 ]]; do
         --security-group-id) SECURITY_GROUP_ID="$2"; shift 2 ;;
         --smt)            DISABLE_SMT=0; shift ;;
         --dpdk)           ENABLE_DPDK=1; shift ;;
+        --placement-group) PLACEMENT_GROUP="$2"; shift 2 ;;
         --skip-setup)     SKIP_SETUP=1; shift ;;
         --user)           SSH_USER="$2"; shift 2 ;;
         --output)         OUTPUT="$2"; shift 2 ;;
@@ -238,6 +241,19 @@ if [[ -n "$SUBNET_ID" ]]; then
     LAUNCH_ARGS+=(--subnet-id "$SUBNET_ID")
 fi
 
+if [[ -n "$PLACEMENT_GROUP" ]]; then
+    # Create the placement group if it doesn't exist.
+    if ! aws ec2 describe-placement-groups "${REGION_ARGS[@]}" \
+            --group-names "$PLACEMENT_GROUP" &>/dev/null; then
+        aws ec2 create-placement-group "${REGION_ARGS[@]}" \
+            --group-name "$PLACEMENT_GROUP" --strategy cluster >/dev/null
+        echo "  Created cluster placement group: $PLACEMENT_GROUP"
+    else
+        echo "  Using existing placement group: $PLACEMENT_GROUP"
+    fi
+    LAUNCH_ARGS+=(--placement "GroupName=$PLACEMENT_GROUP")
+fi
+
 if [[ -n "$CPU_OPTIONS" ]]; then
     LAUNCH_ARGS+=(--cpu-options "$CPU_OPTIONS")
 fi
@@ -375,12 +391,14 @@ jq -n \
     --arg bench_pub      "$BENCH_PUB" \
     --arg bench_priv     "$BENCH_PRIV" \
     --argjson dpdk       "$DPDK_JSON" \
+    --arg placement      "$PLACEMENT_GROUP" \
     '{
       region: $region,
       instance_type: $instance_type,
       ami_id: $ami_id,
       smt_disabled: $smt_disabled,
       security_group_id: $sg_id,
+      placement_group: (if $placement == "" then null else $placement end),
       server: {instance_id: $server_id, public_ip: $server_pub, private_ip: $server_priv},
       bench:  {instance_id: $bench_id,  public_ip: $bench_pub,  private_ip: $bench_priv},
       dpdk: $dpdk
