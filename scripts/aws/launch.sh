@@ -164,10 +164,17 @@ if [[ -z "$SECURITY_GROUP_ID" ]]; then
             --description "Melin benchmark - SSH + internal traffic" \
             --query 'GroupId' --output text)
 
-        # SSH from anywhere (for bench access).
+        # SSH restricted to the caller's public IP.
+        MY_IP=$(curl -s --max-time 5 https://checkip.amazonaws.com || true)
+        if [[ -n "$MY_IP" ]]; then
+            SSH_CIDR="${MY_IP}/32"
+        else
+            echo "  warning: could not detect public IP, allowing SSH from 0.0.0.0/0" >&2
+            SSH_CIDR="0.0.0.0/0"
+        fi
         aws ec2 authorize-security-group-ingress "${REGION_ARGS[@]}" \
             --group-id "$SECURITY_GROUP_ID" \
-            --protocol tcp --port 22 --cidr 0.0.0.0/0 >/dev/null
+            --protocol tcp --port 22 --cidr "$SSH_CIDR" >/dev/null
 
         # All traffic within the SG (server ↔ bench).
         aws ec2 authorize-security-group-ingress "${REGION_ARGS[@]}" \
