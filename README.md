@@ -1,5 +1,9 @@
 # Melin
 
+[![Crates.io](https://img.shields.io/crates/v/melin-app)](https://crates.io/crates/melin-app)
+[![docs.rs](https://img.shields.io/docsrs/melin-app)](https://docs.rs/melin-app)
+[![License: BSL-1.1](https://img.shields.io/badge/license-BSL--1.1-blue)](LICENSE)
+
 Melin is a deterministic, replicated sequencer for latency-critical applications. It provides a multi-threaded, event-sourced processing pipeline with durable journaling, synchronous replication, and sub-millisecond tail latency under load. The infrastructure layer for systems where every event must be persisted, ordered, and replayed exactly.
 
 Built in Rust on an [LMAX](https://martinfowler.com/articles/lmax.html)-inspired architecture: a lock-free disruptor pipeline, io_uring I/O, and mechanical sympathy throughout.
