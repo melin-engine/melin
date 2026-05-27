@@ -1105,6 +1105,19 @@ dpdk_sriov_setup() {
         echo "=== DPDK TAP mode (no SR-IOV) ==="
         echo "  Server DPDK: IP=${SERVER_DPDK_IP}, port=${SERVER_DPDK_PORT}, mode=tap"
         echo ""
+    elif [[ "$DPDK_MODE" == "ena" ]]; then
+        # ENA mode (AWS EC2): secondary ENI already bound to vfio-pci
+        # by launch.sh / dpdk-setup-ena.sh. No setup call needed.
+        DPDK_SERVER_BIN="${REPO_DIR}/target/release/melin-server"
+        load_dpdk_config "$BENCH" "BENCH"
+        SERVER_DPDK_PORT="${SERVER_DPDK_PORT:-0}"
+        echo ""
+        echo "=== DPDK ENA mode (AWS) ==="
+        echo "  Server DPDK: IP=${SERVER_DPDK_IP}, port=${SERVER_DPDK_PORT}, mode=ena"
+        if [[ -n "${BENCH_DPDK_IP:-}" ]]; then
+            echo "  Bench  DPDK: IP=${BENCH_DPDK_IP}, port=${BENCH_DPDK_PORT:-0}"
+        fi
+        echo ""
     else
         echo ""
         echo "=== Setting up DPDK SR-IOV ==="
@@ -1317,7 +1330,7 @@ transport_start_dpdk() {
 
     ssh $SSH_OPTS "$SERVER" "${RSUDO} pkill -x melin-server 2>/dev/null; pkill -f '[m]elin-server.dpdk' 2>/dev/null; true"
     sleep 1
-    ssh $SSH_OPTS "$SERVER" "NO_COLOR=1 RUST_LOG=${BENCH_RUST_LOG} nohup ${DPDK_SERVER_BIN} \
+    ssh $SSH_OPTS "$SERVER" "NO_COLOR=1 RUST_LOG=${BENCH_RUST_LOG} ${RSUDO} nohup ${DPDK_SERVER_BIN} \
             --bind 0.0.0.0:9876 \
             --health-bind ${SERVER_VLAN}:9878 \
             --journal ${JOURNAL_PATH} \
@@ -1402,7 +1415,7 @@ transport_start_dpdk_repl() {
 
     ssh $SSH_OPTS "$SERVER" "${RSUDO} pkill -x melin-server 2>/dev/null; pkill -f '[m]elin-server.dpdk' 2>/dev/null; true"
     sleep 1
-    ssh $SSH_OPTS "$SERVER" "NO_COLOR=1 RUST_LOG=${BENCH_RUST_LOG} nohup ${DPDK_SERVER_BIN} \
+    ssh $SSH_OPTS "$SERVER" "NO_COLOR=1 RUST_LOG=${BENCH_RUST_LOG} ${RSUDO} nohup ${DPDK_SERVER_BIN} \
             --bind 0.0.0.0:9876 \
             --journal ${JOURNAL_PATH} \
             --authorized-keys ${REPO_DIR}/authorized_keys \
@@ -1418,7 +1431,7 @@ transport_start_dpdk_repl() {
 
     ssh $SSH_OPTS "$REPLICA" "${RSUDO} pkill -x melin-server 2>/dev/null; pkill -f '[m]elin-server.dpdk' 2>/dev/null; true"
     sleep 1
-    ssh $SSH_OPTS "$REPLICA" "NO_COLOR=1 RUST_LOG=${BENCH_RUST_LOG} nohup ${DPDK_SERVER_BIN} \
+    ssh $SSH_OPTS "$REPLICA" "NO_COLOR=1 RUST_LOG=${BENCH_RUST_LOG} ${RSUDO} nohup ${DPDK_SERVER_BIN} \
             --replica-of ${SERVER_DPDK_IP}:${REPL_PORT} \
             --replication-key ${REPO_DIR}/repl.key \
             --journal ${replica_journal} \
@@ -1519,7 +1532,7 @@ transport_start_dpdk_dual_repl() {
 
     ssh $SSH_OPTS "$SERVER" "${RSUDO} pkill -x melin-server 2>/dev/null; pkill -f '[m]elin-server.dpdk' 2>/dev/null; true"
     sleep 1
-    ssh $SSH_OPTS "$SERVER" "NO_COLOR=1 RUST_LOG=${BENCH_RUST_LOG} nohup ${DPDK_SERVER_BIN} \
+    ssh $SSH_OPTS "$SERVER" "NO_COLOR=1 RUST_LOG=${BENCH_RUST_LOG} ${RSUDO} nohup ${DPDK_SERVER_BIN} \
             --bind 0.0.0.0:9876 \
             --journal ${JOURNAL_PATH} \
             --authorized-keys ${REPO_DIR}/authorized_keys \
@@ -1535,7 +1548,7 @@ transport_start_dpdk_dual_repl() {
 
     ssh $SSH_OPTS "$REPLICA" "${RSUDO} pkill -x melin-server 2>/dev/null; pkill -f '[m]elin-server.dpdk' 2>/dev/null; true"
     sleep 1
-    ssh $SSH_OPTS "$REPLICA" "NO_COLOR=1 RUST_LOG=${BENCH_RUST_LOG} nohup ${DPDK_SERVER_BIN} \
+    ssh $SSH_OPTS "$REPLICA" "NO_COLOR=1 RUST_LOG=${BENCH_RUST_LOG} ${RSUDO} nohup ${DPDK_SERVER_BIN} \
             --replica-of ${SERVER_DPDK_IP}:${REPL_PORT} \
             --replication-key ${REPO_DIR}/repl.key \
             --journal ${replica_journal} \
@@ -1549,7 +1562,7 @@ transport_start_dpdk_dual_repl() {
 
     ssh $SSH_OPTS "$REPLICA2" "${RSUDO} pkill -x melin-server 2>/dev/null; pkill -f '[m]elin-server.dpdk' 2>/dev/null; true"
     sleep 1
-    ssh $SSH_OPTS "$REPLICA2" "NO_COLOR=1 RUST_LOG=${BENCH_RUST_LOG} nohup ${DPDK_SERVER_BIN} \
+    ssh $SSH_OPTS "$REPLICA2" "NO_COLOR=1 RUST_LOG=${BENCH_RUST_LOG} ${RSUDO} nohup ${DPDK_SERVER_BIN} \
             --replica-of ${SERVER_DPDK_IP}:${REPL_PORT} \
             --replication-key ${REPO_DIR}/repl.key \
             --journal ${replica2_journal} \

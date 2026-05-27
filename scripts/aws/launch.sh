@@ -18,12 +18,14 @@
 #   --subnet-id <id>         Specific subnet (default: first in default VPC)
 #   --security-group-id <id> Existing SG (default: creates melin-bench-sg)
 #   --smt                     Keep hyperthreading enabled (default: disabled)
+#   --dpdk                    Attach a second ENI for DPDK kernel bypass
 #   --skip-setup              Skip server-setup.sh (just launch raw instances)
 #   --user <name>             SSH user (default: ubuntu)
 #   --output <path>           Write instance metadata JSON (default: /tmp/melin-aws-instances.json)
 #
 # Examples:
 #   ./scripts/aws/launch.sh --key-name my-key --key ~/.ssh/my-key.pem
+#   ./scripts/aws/launch.sh --key-name my-key --key ~/.ssh/my-key.pem --dpdk
 #   ./scripts/aws/launch.sh --key-name my-key --key ~/.ssh/my-key.pem --instance-type c7i.4xlarge --smt
 
 set -euo pipefail
@@ -46,6 +48,7 @@ REGION=""
 SUBNET_ID=""
 SECURITY_GROUP_ID=""
 DISABLE_SMT=1
+ENABLE_DPDK=0
 SKIP_SETUP=0
 SSH_USER="ubuntu"
 OUTPUT="/tmp/melin-aws-instances.json"
@@ -63,6 +66,7 @@ while [[ $# -gt 0 ]]; do
         --subnet-id)     SUBNET_ID="$2"; shift 2 ;;
         --security-group-id) SECURITY_GROUP_ID="$2"; shift 2 ;;
         --smt)            DISABLE_SMT=0; shift ;;
+        --dpdk)           ENABLE_DPDK=1; shift ;;
         --skip-setup)     SKIP_SETUP=1; shift ;;
         --user)           SSH_USER="$2"; shift 2 ;;
         --output)         OUTPUT="$2"; shift 2 ;;
@@ -95,6 +99,12 @@ if [[ "$SKIP_SETUP" -eq 0 && ! -f "$SETUP_SCRIPT" ]]; then
     exit 1
 fi
 
+DPDK_SETUP_SCRIPT="$SCRIPT_DIR/../dpdk/dpdk-setup-ena.sh"
+if [[ "$ENABLE_DPDK" -eq 1 && ! -f "$DPDK_SETUP_SCRIPT" ]]; then
+    echo "error: dpdk-setup-ena.sh not found at $DPDK_SETUP_SCRIPT" >&2
+    exit 1
+fi
+
 REGION_ARGS=()
 if [[ -n "$REGION" ]]; then
     REGION_ARGS=(--region "$REGION")
@@ -103,6 +113,7 @@ fi
 # Track created resources for cleanup on failure.
 CREATED_SG=""
 CREATED_INSTANCES=()
+CREATED_ENIS=()
 
 cleanup_on_error() {
     local exit_code=$?
@@ -116,8 +127,12 @@ cleanup_on_error() {
         aws ec2 terminate-instances "${REGION_ARGS[@]}" \
             --instance-ids "${CREATED_INSTANCES[@]}" >/dev/null 2>&1 || true
     fi
+    for eni_id in "${CREATED_ENIS[@]}"; do
+        echo "  Deleting ENI: $eni_id" >&2
+        aws ec2 delete-network-interface "${REGION_ARGS[@]}" \
+            --network-interface-id "$eni_id" 2>/dev/null || true
+    done
     if [[ -n "$CREATED_SG" ]]; then
-        # Wait briefly for instances to release the SG.
         sleep 3
         echo "  Deleting security group: $CREATED_SG" >&2
         aws ec2 delete-security-group "${REGION_ARGS[@]}" \
@@ -275,10 +290,77 @@ echo "  Server: $SERVER_ID  pub=$SERVER_PUB  priv=$SERVER_PRIV"
 echo "  Bench:  $BENCH_ID  pub=$BENCH_PUB  priv=$BENCH_PRIV"
 
 # ---------------------------------------------------------------------------
+# DPDK: Create and attach secondary ENIs
+# ---------------------------------------------------------------------------
+SERVER_ENI=""
+BENCH_ENI=""
+SERVER_DPDK_IP=""
+BENCH_DPDK_IP=""
+CIDR_PREFIX=""
+
+if [[ "$ENABLE_DPDK" -eq 1 ]]; then
+    echo ""
+    echo "=== Creating DPDK network interfaces ==="
+
+    DPDK_SUBNET=$(aws ec2 describe-instances "${REGION_ARGS[@]}" \
+        --instance-ids "$SERVER_ID" \
+        --query 'Reservations[0].Instances[0].SubnetId' --output text)
+    SUBNET_CIDR=$(aws ec2 describe-subnets "${REGION_ARGS[@]}" \
+        --subnet-ids "$DPDK_SUBNET" \
+        --query 'Subnets[0].CidrBlock' --output text)
+    CIDR_PREFIX="${SUBNET_CIDR##*/}"
+
+    for role_pair in "server:$SERVER_ID" "bench:$BENCH_ID"; do
+        role="${role_pair%%:*}"
+        inst_id="${role_pair##*:}"
+
+        eni_id=$(aws ec2 create-network-interface "${REGION_ARGS[@]}" \
+            --subnet-id "$DPDK_SUBNET" \
+            --groups "$SECURITY_GROUP_ID" \
+            --description "melin-bench DPDK ($role)" \
+            --query 'NetworkInterface.NetworkInterfaceId' --output text)
+        CREATED_ENIS+=("$eni_id")
+
+        att_id=$(aws ec2 attach-network-interface "${REGION_ARGS[@]}" \
+            --network-interface-id "$eni_id" \
+            --instance-id "$inst_id" \
+            --device-index 1 \
+            --query 'AttachmentId' --output text)
+
+        aws ec2 modify-network-interface-attribute "${REGION_ARGS[@]}" \
+            --network-interface-id "$eni_id" \
+            --attachment "AttachmentId=$att_id,DeleteOnTermination=true"
+
+        dpdk_ip=$(aws ec2 describe-network-interfaces "${REGION_ARGS[@]}" \
+            --network-interface-ids "$eni_id" \
+            --query 'NetworkInterfaces[0].PrivateIpAddress' --output text)
+
+        if [[ "$role" == "server" ]]; then
+            SERVER_ENI="$eni_id"
+            SERVER_DPDK_IP="$dpdk_ip"
+        else
+            BENCH_ENI="$eni_id"
+            BENCH_DPDK_IP="$dpdk_ip"
+        fi
+
+        echo "  [$role] ENI: $eni_id  DPDK IP: $dpdk_ip"
+    done
+fi
+
+# ---------------------------------------------------------------------------
 # Write metadata
 # ---------------------------------------------------------------------------
 EFFECTIVE_REGION="${REGION:-$(aws configure get region 2>/dev/null || echo "")}"
 SMT_DISABLED=$( [[ "$DISABLE_SMT" -eq 1 ]] && echo "true" || echo "false" )
+
+DPDK_JSON="null"
+if [[ "$ENABLE_DPDK" -eq 1 ]]; then
+    DPDK_JSON=$(jq -n \
+        --arg seni "$SERVER_ENI" --arg sdip "$SERVER_DPDK_IP" \
+        --arg beni "$BENCH_ENI"  --arg bdip "$BENCH_DPDK_IP" \
+        --arg prefix "$CIDR_PREFIX" \
+        '{server_eni_id: $seni, server_dpdk_ip: $sdip, bench_eni_id: $beni, bench_dpdk_ip: $bdip, prefix: $prefix}')
+fi
 
 jq -n \
     --arg region         "$EFFECTIVE_REGION" \
@@ -292,6 +374,7 @@ jq -n \
     --arg bench_id       "$BENCH_ID" \
     --arg bench_pub      "$BENCH_PUB" \
     --arg bench_priv     "$BENCH_PRIV" \
+    --argjson dpdk       "$DPDK_JSON" \
     '{
       region: $region,
       instance_type: $instance_type,
@@ -299,7 +382,8 @@ jq -n \
       smt_disabled: $smt_disabled,
       security_group_id: $sg_id,
       server: {instance_id: $server_id, public_ip: $server_pub, private_ip: $server_priv},
-      bench:  {instance_id: $bench_id,  public_ip: $bench_pub,  private_ip: $bench_priv}
+      bench:  {instance_id: $bench_id,  public_ip: $bench_pub,  private_ip: $bench_priv},
+      dpdk: $dpdk
     }' > "$OUTPUT"
 
 # Metadata written — switch to terminate.sh for cleanup on failure.
@@ -426,12 +510,48 @@ for pair in "$SERVER_PUB:server" "$BENCH_PUB:bench"; do
     echo "  [$role] isolcpus=$isolated"
 done
 
+# ---------------------------------------------------------------------------
+# DPDK: Bind secondary ENIs to vfio-pci
+# ---------------------------------------------------------------------------
+if [[ "$ENABLE_DPDK" -eq 1 ]]; then
+    echo ""
+    echo "=== Setting up DPDK (ENA) on both instances ==="
+
+    setup_dpdk_host() {
+        local pub_ip="$1" dpdk_ip="$2" prefix="$3" role="$4"
+        echo "  [$role] Copying dpdk-setup-ena.sh..."
+        scp "${SSH_OPTS[@]}" "$DPDK_SETUP_SCRIPT" "$SSH_USER@$pub_ip:/tmp/dpdk-setup-ena.sh"
+        echo "  [$role] Running DPDK ENA setup..."
+        ssh "${SSH_OPTS[@]}" "$SSH_USER@$pub_ip" \
+            "sudo bash /tmp/dpdk-setup-ena.sh --ip $dpdk_ip --prefix $prefix" 2>&1 \
+            | sed "s/^/  [$role] /"
+    }
+
+    setup_dpdk_host "$SERVER_PUB" "$SERVER_DPDK_IP" "$CIDR_PREFIX" "server" &
+    PID_DPDK_SERVER=$!
+    setup_dpdk_host "$BENCH_PUB" "$BENCH_DPDK_IP" "$CIDR_PREFIX" "bench" &
+    PID_DPDK_BENCH=$!
+
+    DPDK_FAILED=0
+    wait $PID_DPDK_SERVER || DPDK_FAILED=1
+    wait $PID_DPDK_BENCH  || DPDK_FAILED=1
+
+    if [[ "$DPDK_FAILED" -eq 1 ]]; then
+        echo "error: DPDK setup failed on one or more instances" >&2
+        exit 1
+    fi
+fi
+
 trap - EXIT
 echo ""
 echo "=== Instances ready ==="
 echo ""
 echo "Run benchmarks:"
-echo "  ./scripts/lan-bench-suite.sh $SERVER_PUB $BENCH_PUB $SERVER_PRIV $SSH_USER"
+if [[ "$ENABLE_DPDK" -eq 1 ]]; then
+    echo "  TRANSPORTS=dpdk ./scripts/lan-bench-suite.sh $SERVER_PUB $BENCH_PUB $SERVER_PRIV $SSH_USER"
+else
+    echo "  ./scripts/lan-bench-suite.sh $SERVER_PUB $BENCH_PUB $SERVER_PRIV $SSH_USER"
+fi
 echo ""
 echo "Tear down:"
 echo "  ./scripts/aws/terminate.sh --instances $OUTPUT"

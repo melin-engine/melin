@@ -60,6 +60,8 @@ SERVER_ID=$(jq -r '.server.instance_id' "$INSTANCES_FILE")
 BENCH_ID=$(jq -r '.bench.instance_id' "$INSTANCES_FILE")
 SG_ID=$(jq -r '.security_group_id' "$INSTANCES_FILE")
 INSTANCE_TYPE=$(jq -r '.instance_type' "$INSTANCES_FILE")
+SERVER_ENI=$(jq -r '.dpdk.server_eni_id // empty' "$INSTANCES_FILE" 2>/dev/null || true)
+BENCH_ENI=$(jq -r '.dpdk.bench_eni_id // empty' "$INSTANCES_FILE" 2>/dev/null || true)
 
 # Use region from CLI flag, else from metadata, else from AWS config.
 if [[ -z "$REGION" ]]; then
@@ -75,6 +77,9 @@ echo "  Instance type: $INSTANCE_TYPE"
 echo "  Server: $SERVER_ID"
 echo "  Bench:  $BENCH_ID"
 echo "  SG:     $SG_ID"
+if [[ -n "$SERVER_ENI" ]]; then
+    echo "  DPDK ENIs: $SERVER_ENI, $BENCH_ENI"
+fi
 echo ""
 
 # ---------------------------------------------------------------------------
@@ -100,6 +105,17 @@ aws ec2 terminate-instances "${REGION_ARGS[@]}" \
 echo "  Waiting for termination..."
 aws ec2 wait instance-terminated "${REGION_ARGS[@]}" --instance-ids "$SERVER_ID" "$BENCH_ID"
 echo "  Instances terminated."
+
+# ---------------------------------------------------------------------------
+# Delete DPDK ENIs (safety net — normally auto-deleted with instance)
+# ---------------------------------------------------------------------------
+for eni_id in "$SERVER_ENI" "$BENCH_ENI"; do
+    if [[ -z "$eni_id" ]]; then continue; fi
+    if aws ec2 delete-network-interface "${REGION_ARGS[@]}" \
+            --network-interface-id "$eni_id" 2>/dev/null; then
+        echo "  Deleted orphaned ENI: $eni_id"
+    fi
+done
 
 # ---------------------------------------------------------------------------
 # Delete security group
