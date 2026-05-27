@@ -302,8 +302,17 @@ jq -n \
       bench:  {instance_id: $bench_id,  public_ip: $bench_pub,  private_ip: $bench_priv}
     }' > "$OUTPUT"
 
-# Metadata written — from here, terminate.sh handles cleanup.
-trap - EXIT
+# Metadata written — switch to terminate.sh for cleanup on failure.
+cleanup_after_metadata() {
+    local exit_code=$?
+    if [[ $exit_code -eq 0 ]]; then
+        return
+    fi
+    echo "" >&2
+    echo "=== Setup failed — tearing down instances ===" >&2
+    "$SCRIPT_DIR/terminate.sh" --instances "$OUTPUT" --yes 2>&1 | sed 's/^/  /' >&2
+}
+trap cleanup_after_metadata EXIT
 echo ""
 echo "=== Metadata written to $OUTPUT ==="
 
@@ -311,6 +320,7 @@ echo "=== Metadata written to $OUTPUT ==="
 # System setup (server-setup.sh on both instances in parallel)
 # ---------------------------------------------------------------------------
 if [[ "$SKIP_SETUP" -eq 1 ]]; then
+    trap - EXIT
     echo ""
     echo "=== Skipping setup (--skip-setup) ==="
     echo ""
@@ -416,6 +426,7 @@ for pair in "$SERVER_PUB:server" "$BENCH_PUB:bench"; do
     echo "  [$role] isolcpus=$isolated"
 done
 
+trap - EXIT
 echo ""
 echo "=== Instances ready ==="
 echo ""
