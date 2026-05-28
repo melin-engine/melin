@@ -20,8 +20,9 @@
 #   --smt                     Keep hyperthreading enabled (default: disabled)
 #   --dpdk                    Attach a second ENI for DPDK kernel bypass
 #   --placement-group <name>  Cluster placement group (low-latency, same rack)
-#   --journal-vol <spec>      Attach a dedicated EBS journal volume to the server.
+#   --journal-vol <spec>      Dedicated EBS journal volume for the server (default: io2:10000).
 #                             Spec: <type>[:<iops>] — e.g., gp3, io2:10000, gp3:8000
+#   --no-journal-vol          Skip the dedicated journal volume (use root gp3)
 #   --skip-setup              Skip server-setup.sh (just launch raw instances)
 #   --user <name>             SSH user (default: ubuntu)
 #   --output <path>           Write instance metadata JSON (default: /tmp/melin-aws-instances.json)
@@ -53,7 +54,7 @@ SECURITY_GROUP_ID=""
 DISABLE_SMT=1
 ENABLE_DPDK=0
 PLACEMENT_GROUP=""
-JOURNAL_VOL=""
+JOURNAL_VOL="io2:10000"
 SKIP_SETUP=0
 SSH_USER="ubuntu"
 OUTPUT="/tmp/melin-aws-instances.json"
@@ -74,6 +75,7 @@ while [[ $# -gt 0 ]]; do
         --dpdk)           ENABLE_DPDK=1; shift ;;
         --placement-group) PLACEMENT_GROUP="$2"; shift 2 ;;
         --journal-vol)    JOURNAL_VOL="$2"; shift 2 ;;
+        --no-journal-vol) JOURNAL_VOL=""; shift ;;
         --skip-setup)     SKIP_SETUP=1; shift ;;
         --user)           SSH_USER="$2"; shift 2 ;;
         --output)         OUTPUT="$2"; shift 2 ;;
@@ -310,6 +312,28 @@ read -r BENCH_PUB BENCH_PRIV <<< "$(aws ec2 describe-instances "${REGION_ARGS[@]
     --query 'Reservations[0].Instances[0].[PublicIpAddress,PrivateIpAddress]' \
     --output text)"
 
+# ---------------------------------------------------------------------------
+# Enable ENA Express (SRD) on primary ENIs when the instance type supports it
+# ---------------------------------------------------------------------------
+ENA_SRD_SUPPORTED=$(aws ec2 describe-instance-types "${REGION_ARGS[@]}" \
+    --instance-types "$INSTANCE_TYPE" \
+    --query 'InstanceTypes[0].NetworkInfo.EnaSrdSupported' --output text 2>/dev/null || echo "False")
+
+if [[ "$ENA_SRD_SUPPORTED" == "True" || "$ENA_SRD_SUPPORTED" == "true" ]]; then
+    echo ""
+    echo "=== Enabling ENA Express (SRD) ==="
+    for inst_id in "$SERVER_ID" "$BENCH_ID"; do
+        eni_id=$(aws ec2 describe-instances "${REGION_ARGS[@]}" \
+            --instance-ids "$inst_id" \
+            --query 'Reservations[0].Instances[0].NetworkInterfaces[0].NetworkInterfaceId' --output text)
+        aws ec2 modify-network-interface-attribute "${REGION_ARGS[@]}" \
+            --network-interface-id "$eni_id" \
+            --ena-srd-specification "EnaSrdEnabled=true,EnaSrdUdpSpecification={EnaSrdUdpEnabled=true}" 2>/dev/null \
+            && echo "  $inst_id ($eni_id): ENA Express enabled" \
+            || echo "  $inst_id ($eni_id): ENA Express not available"
+    done
+fi
+
 echo ""
 echo "=== Instance details ==="
 echo "  Server: $SERVER_ID  pub=$SERVER_PUB  priv=$SERVER_PRIV"
@@ -417,6 +441,12 @@ if [[ "$ENABLE_DPDK" -eq 1 ]]; then
         aws ec2 modify-network-interface-attribute "${REGION_ARGS[@]}" \
             --network-interface-id "$eni_id" \
             --attachment "AttachmentId=$att_id,DeleteOnTermination=true"
+
+        if [[ "$ENA_SRD_SUPPORTED" == "True" || "$ENA_SRD_SUPPORTED" == "true" ]]; then
+            aws ec2 modify-network-interface-attribute "${REGION_ARGS[@]}" \
+                --network-interface-id "$eni_id" \
+                --ena-srd-specification "EnaSrdEnabled=true,EnaSrdUdpSpecification={EnaSrdUdpEnabled=true}" 2>/dev/null || true
+        fi
 
         dpdk_ip=$(aws ec2 describe-network-interfaces "${REGION_ARGS[@]}" \
             --network-interface-ids "$eni_id" \
