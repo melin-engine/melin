@@ -210,7 +210,7 @@ run_mlx5_setup() {
     # up just that device and leaves any other Mellanox ports (e.g. the
     # SSH port on a dual-port card) untouched.
     # Multi-word values are double-quoted so `source` / `eval` consumers
-    # (dpdk-server.sh, dpdk-test.sh, dpdk-lan-bench.sh) don't misparse
+    # (dpdk-server.sh, dpdk-test.sh, lan-bench-suite.sh) don't misparse
     # them as `VAR=word1 command word2…`. Single-word values are left
     # unquoted to match the existing SR-IOV / TAP conf shape.
     cat > "$conf" <<EOF
@@ -499,7 +499,7 @@ run_sriov_bond_setup() {
     VF0_PCI=$(readlink -f "/sys/bus/pci/devices/${PF0_PCI}/virtfn0" 2>/dev/null | xargs basename 2>/dev/null || echo "?")
     VF1_PCI=$(readlink -f "/sys/bus/pci/devices/${PF1_PCI}/virtfn0" 2>/dev/null | xargs basename 2>/dev/null || echo "?")
 
-    # Save DPDK config for use by dpdk-server.sh and dpdk-lan-bench.sh.
+    # Save DPDK config for use by dpdk-server.sh and lan-bench-suite.sh.
     DPDK_CONF="/etc/melin-dpdk.conf"
     cat > "$DPDK_CONF" <<EOF
 DPDK_IP=${DPDK_IP%%/*}
