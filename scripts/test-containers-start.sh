@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Start Docker containers for testing lan-bench.sh and replication locally.
+# Start Docker containers for testing the LAN bench suite and replication locally.
 #
 # Creates a "bench-net" network and two to four privileged Ubuntu
 # containers with SSH access via your default SSH key.
@@ -13,7 +13,7 @@
 # After starting:
 #   SERVER_IP=$(docker inspect -f '{{range.NetworkSettings.Networks}}{{.IPAddress}}{{end}}' bench-server)
 #   BENCH_IP=$(docker inspect -f '{{range.NetworkSettings.Networks}}{{.IPAddress}}{{end}}' bench-client)
-#   ./scripts/lan-bench.sh "$SERVER_IP" "$BENCH_IP" "$SERVER_IP" root
+#   ./scripts/lan-bench-suite.sh "$SERVER_IP" "$BENCH_IP" "$SERVER_IP" root
 #
 #   # With replica:
 #   REPLICA_IP=$(docker inspect -f '{{range.NetworkSettings.Networks}}{{.IPAddress}}{{end}}' bench-replica)
@@ -213,7 +213,7 @@ fi
 # ---------------------------------------------------------------------------
 echo ""
 echo "Containers ready. Run the benchmark with:"
-echo "  ./scripts/lan-bench.sh $SERVER_IP $CLIENT_IP $SERVER_IP"
+echo "  ./scripts/lan-bench-suite.sh $SERVER_IP $CLIENT_IP $SERVER_IP root"
 
 if [[ "$WITH_REPLICA" == "true" ]]; then
     echo ""

@@ -351,7 +351,7 @@ ls -la /sys/bus/pci/drivers/vfio-pci/ 2>/dev/null | grep "0000:" || echo "  (non
 VF0_PCI=$(readlink -f "/sys/bus/pci/devices/${PF0_PCI}/virtfn0" 2>/dev/null | xargs basename 2>/dev/null || echo "?")
 VF1_PCI=$(readlink -f "/sys/bus/pci/devices/${PF1_PCI}/virtfn0" 2>/dev/null | xargs basename 2>/dev/null || echo "?")
 
-# Save DPDK config for use by dpdk-server.sh and dpdk-lan-bench.sh.
+# Save DPDK config for use by dpdk-server.sh and lan-bench-suite.sh.
 DPDK_CONF="/etc/melin-dpdk.conf"
 cat > "$DPDK_CONF" <<EOF
 DPDK_IP=${DPDK_IP%%/*}
