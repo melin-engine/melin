@@ -78,10 +78,15 @@ for name in "${CONTAINERS[@]}"; do
     # Remove old container if it exists.
     docker rm -f "$name" 2>/dev/null || true
 
+    # --init runs tini as PID 1 so it reaps orphaned children. Without it
+    # the entrypoint (`sleep infinity`) is PID 1, never calls wait(), and
+    # every benchmark's short-lived melin-server processes pile up as
+    # unreaped zombies after their launching ssh/nohup shell exits.
     docker run -d \
         --name "$name" \
         --network "$NETWORK" \
         --privileged \
+        --init \
         "$IMAGE" \
         sleep infinity
 
