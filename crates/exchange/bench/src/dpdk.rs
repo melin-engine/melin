@@ -358,14 +358,15 @@ pub fn run_dpdk_roundtrip(
         // Low-latency TCP tuning for dedicated LAN.
         socket.set_nagle_enabled(false);
         socket.set_ack_delay(None);
-        // Retransmit timeouts sized for a µs-RTT shared-mem/LAN link, not
-        // smoltcp's internet defaults (min 10ms / initial 50ms). Round-trip
-        // here is ~40µs (p90 ~65µs), so a lost segment should recover in
-        // sub-ms, not stall the in-flight window for tens of ms. The floor is
-        // the spurious-retransmit risk: RTO must stay above the worst
-        // legitimate round-trip, so we keep min_rto ~6× the median RTT.
-        socket.set_min_rto(smoltcp::time::Duration::from_micros(250));
-        socket.set_initial_rto(smoltcp::time::Duration::from_micros(500));
+        // Retransmit timeouts at fastcp's floor (1ms), down from its
+        // internet-tuned defaults (min 10ms / initial 50ms). On the µs-RTT
+        // shared-mem/LAN link a lost segment otherwise stalls the in-flight
+        // window for tens of ms (a ~50ms p99 cliff at 1M ops/s). 1ms is as
+        // low as fastcp goes: its RttEstimator — RTO, min/max RTO, and RTT
+        // sampling — is u32-millisecond, so any sub-ms Duration truncates to
+        // 0 (which panics on min_rto). True sub-ms would need a fork change.
+        socket.set_min_rto(smoltcp::time::Duration::from_millis(1));
+        socket.set_initial_rto(smoltcp::time::Duration::from_millis(1));
         socket.set_initial_congestion_window(64 * 1024);
 
         // Randomize ephemeral port base to avoid colliding with TIME_WAIT
