@@ -9,6 +9,17 @@
 #   ./scripts/test-containers-start.sh --replica                    # server + client + 1 replica
 #   ./scripts/test-containers-start.sh --dual-replica               # server + client + 2 replicas
 #   ./scripts/test-containers-start.sh --dual-replica --branch foo  # checkout branch "foo" in all containers
+#   ./scripts/test-containers-start.sh --memif                      # additionally wire DPDK over memif (see below)
+#
+# DPDK transport modes:
+#   Default: TAP mode (DPDK_MODE=tap). The DPDK server reads packets via a
+#   kernel TAP fd — functional but slow (per-packet kernel crossing).
+#   --memif: shared-memory mode (DPDK_MODE=memif). Both the server AND the
+#   bench run DPDK and exchange packets over a memif shared-memory link via
+#   a unix socket on a shared volume — near-native throughput, the closest
+#   cheap proxy for real DPDK performance on a single host. Requires the
+#   extra DPDK bench build, hence the flag. The kernel-TCP path is
+#   unaffected either way, so TCP benchmarks keep working.
 #
 # After starting:
 #   SERVER_IP=$(docker inspect -f '{{range.NetworkSettings.Networks}}{{.IPAddress}}{{end}}' bench-server)
@@ -36,15 +47,24 @@ REPO_DIR="/root/workspace/melin"
 # Parse flags.
 WITH_REPLICA=false
 WITH_DUAL_REPLICA=false
+WITH_MEMIF=false
 BRANCH=""
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --replica) WITH_REPLICA=true; shift ;;
         --dual-replica) WITH_REPLICA=true; WITH_DUAL_REPLICA=true; shift ;;
+        --memif) WITH_MEMIF=true; shift ;;
         --branch) BRANCH="$2"; shift 2 ;;
         *) echo "unknown flag: $1" >&2; exit 1 ;;
     esac
 done
+
+# memif rendezvous: a Docker volume shared between the server and client
+# containers holds the memif control socket. The data rings are memfd-backed
+# and handed over the socket via SCM_RIGHTS, so only the socket needs to live
+# on a shared mount. Mounted at /memif in both endpoints.
+MEMIF_VOLUME="bench-memif"
+MEMIF_SOCKET="/memif/memif.sock"
 
 # SSH key for logging into the containers.
 SSH_PUB=""
@@ -64,6 +84,13 @@ echo "Using SSH key: $SSH_PUB"
 # Create network (ignore if exists).
 docker network create "$NETWORK" 2>/dev/null || true
 
+# Recreate the memif socket volume fresh so a stale socket from a previous
+# run can't confuse the handshake.
+if [[ "$WITH_MEMIF" == "true" ]]; then
+    docker volume rm "$MEMIF_VOLUME" 2>/dev/null || true
+    docker volume create "$MEMIF_VOLUME" >/dev/null
+fi
+
 # Build container list.
 CONTAINERS=("$SERVER" "$CLIENT")
 if [[ "$WITH_REPLICA" == "true" ]]; then
@@ -78,6 +105,13 @@ for name in "${CONTAINERS[@]}"; do
     # Remove old container if it exists.
     docker rm -f "$name" 2>/dev/null || true
 
+    # Mount the shared memif socket volume only on the two memif endpoints
+    # (server + client); replicas use TCP replication and don't need it.
+    MOUNT_ARGS=()
+    if [[ "$WITH_MEMIF" == "true" && ( "$name" == "$SERVER" || "$name" == "$CLIENT" ) ]]; then
+        MOUNT_ARGS=(-v "${MEMIF_VOLUME}:/memif")
+    fi
+
     # --init runs tini as PID 1 so it reaps orphaned children. Without it
     # the entrypoint (`sleep infinity`) is PID 1, never calls wait(), and
     # every benchmark's short-lived melin-server processes pile up as
@@ -87,6 +121,7 @@ for name in "${CONTAINERS[@]}"; do
         --network "$NETWORK" \
         --privileged \
         --init \
+        "${MOUNT_ARGS[@]+"${MOUNT_ARGS[@]}"}" \
         "$IMAGE" \
         sleep infinity
 
@@ -135,8 +170,11 @@ done
 # plus iproute2 for TAP device routing. The bench suite detects TAP mode
 # via DPDK_MODE=tap in /etc/melin-dpdk.conf and skips SR-IOV setup.
 echo ""
-echo "Setting up DPDK (TAP mode) on server..."
+echo "Setting up DPDK on server (building DPDK server binary)..."
 
+# Build the DPDK server binary (melin-server.dpdk). It is PMD-agnostic — the
+# transport (TAP vs memif) is selected entirely by the EAL --vdev passed at
+# runtime — so the same binary serves both modes.
 docker exec "$SERVER" bash -c "
     apt-get install -y --no-install-recommends libdpdk-dev libclang-dev iproute2 2>&1 | tail -3 && \
     source /root/.cargo/env && \
@@ -148,12 +186,64 @@ docker exec "$SERVER" bash -c "
     ls -la target/release/melin-server target/release/melin-server.dpdk
 "
 
-# Pick a DPDK IP that's on the Docker bridge subnet but not used by any
-# container. The bench suite routes traffic to this IP via the server.
-DPDK_TAP_IP="172.17.0.100"
+if [[ "$WITH_MEMIF" == "true" ]]; then
+    # memif mode: both ends run DPDK over a shared-memory link. Build a
+    # DPDK-enabled bench on the client, kept alongside the kernel-TCP bench
+    # as melin-bench.dpdk (mirroring melin-server.dpdk), then write a memif
+    # config the suite consumes.
+    echo "Setting up DPDK (memif mode) on client (building DPDK bench binary)..."
+    docker exec "$CLIENT" bash -c "
+        apt-get install -y --no-install-recommends libdpdk-dev libclang-dev 2>&1 | tail -3 && \
+        source /root/.cargo/env && \
+        cd $REPO_DIR && \
+        cargo build --release -p melin-bench --features dpdk 2>&1 | tail -3 && \
+        cp target/release/melin-bench target/release/melin-bench.dpdk && \
+        echo 'Rebuilding default (non-DPDK) bench binary...' && \
+        cargo build --release -p melin-bench 2>&1 | tail -3 && \
+        ls -la target/release/melin-bench target/release/melin-bench.dpdk
+    "
 
-docker exec "$SERVER" bash -c "
-    cat > /etc/melin-dpdk.conf << EOF
+    # Hugepages — memif throughput roughly doubled vs --no-huge (TLB
+    # pressure). nr_hugepages is host-global (containers share the kernel),
+    # so allocating it from a privileged container reserves host memory.
+    # NOT released on container stop; reclaim with:
+    #   docker exec ${SERVER} sh -c 'echo 0 > /proc/sys/vm/nr_hugepages'
+    HUGEPAGES="${HUGEPAGES:-1024}"   # 2 MiB each => ~2 GiB
+    echo "Allocating ${HUGEPAGES} hugepages (host-global) + mounting hugetlbfs..."
+    docker exec "$SERVER" bash -c "echo ${HUGEPAGES} > /proc/sys/vm/nr_hugepages"
+    for name in "$SERVER" "$CLIENT"; do
+        docker exec "$name" bash -c "mkdir -p /dev/hugepages; mountpoint -q /dev/hugepages || mount -t hugetlbfs nodev /dev/hugepages"
+    done
+    echo "  HugePages_Total=$(docker exec "$SERVER" sh -c 'grep HugePages_Total /proc/meminfo | tr -s " " | cut -d" " -f2')"
+
+    # memif is a direct point-to-point L2 link between the two DPDK stacks,
+    # so both smoltcp endpoints sit on a private /24 with no kernel routing
+    # or gateway (unlike TAP). Server = memif master (creates the socket);
+    # the suite starts the bench as the memif client.
+    # DPDK_EAL_ARGS here is the SERVER side (role=server); the suite derives
+    # the client EAL (role=client) plus per-side --file-prefix and MAC from
+    # it. Uses hugepages (allocated above).
+    # TODO(mem): -m 256 is a guess for the memif rings + mbuf pool; tune.
+    docker exec "$SERVER" bash -c "
+        cat > /etc/melin-dpdk.conf << EOF
+DPDK_MODE=memif
+DPDK_IP=10.0.0.1
+DPDK_PREFIX=24
+DPDK_PORT=0
+MEMIF_SOCKET=${MEMIF_SOCKET}
+DPDK_EAL_ARGS=--no-pci -m 256 --vdev net_memif0,role=server,socket-abstract=no,socket=${MEMIF_SOCKET},id=0
+EOF
+"
+    echo "  DPDK config written (memif mode, server IP=10.0.0.1, socket=${MEMIF_SOCKET})"
+    # TODO(repl): memif here only covers the server<->bench trading link;
+    #   replication still uses kernel TCP. memif for replica links is future.
+else
+    # Pick a DPDK IP that's on the Docker bridge subnet but not used by any
+    # container. The bench suite routes traffic to this IP via the server.
+    DPDK_TAP_IP="172.17.0.100"
+
+    docker exec "$SERVER" bash -c "
+        cat > /etc/melin-dpdk.conf << EOF
 DPDK_MODE=tap
 DPDK_IP=${DPDK_TAP_IP}
 DPDK_PREFIX=16
@@ -161,7 +251,8 @@ DPDK_PORT=0
 DPDK_EAL_ARGS=--no-huge --no-pci --vdev net_tap0 -m 256
 EOF
 "
-echo "  DPDK config written (TAP mode, IP=${DPDK_TAP_IP})"
+    echo "  DPDK config written (TAP mode, IP=${DPDK_TAP_IP})"
+fi
 
 # Install iproute2 on all other containers (bench needs it for routing).
 IPROUTE_HOSTS=("$CLIENT")
@@ -219,6 +310,15 @@ fi
 echo ""
 echo "Containers ready. Run the benchmark with:"
 echo "  ./scripts/lan-bench-suite.sh $SERVER_IP $CLIENT_IP $SERVER_IP root"
+
+if [[ "$WITH_MEMIF" == "true" ]]; then
+    echo ""
+    echo "DPDK memif configured (DPDK_MODE=memif, socket=${MEMIF_SOCKET})."
+    echo "  Drive it with TRANSPORTS=dpdk (the suite reads DPDK_MODE=memif):"
+    echo "    NO_PERSIST=0 TRANSPORTS=dpdk WORKLOADS=throughput THROUGHPUT_DURATION=15s \\"
+    echo "      ./scripts/docker-bench-suite.sh"
+    echo "  NO_PERSIST=0 because the prebuilt .dpdk binaries are durable-mode."
+fi
 
 if [[ "$WITH_REPLICA" == "true" ]]; then
     echo ""
