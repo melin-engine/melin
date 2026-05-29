@@ -523,10 +523,7 @@ for item in "${MATRIX[@]}"; do
 done
 
 echo "=== Building release binaries ==="
-# A host list must not contain the same SSH target twice — building one host
-# concurrently with itself races on the git index / cargo target locks.
-BUILD_HOSTS=("$SERVER")
-[[ "$BENCH" != "$SERVER" ]] && BUILD_HOSTS+=("$BENCH")
+BUILD_HOSTS=("$SERVER" "$BENCH")
 if [[ -n "$REPLICA" ]]; then BUILD_HOSTS+=("$REPLICA"); fi
 if [[ -n "$REPLICA2" ]]; then BUILD_HOSTS+=("$REPLICA2"); fi
 
@@ -1065,7 +1062,8 @@ transport_stop_tcp_dual_repl() {
 # --- DPDK transports ---
 
 # Load DPDK config from /etc/melin-dpdk.conf on a host.
-# Populates ${prefix}_DPDK_IP, _PORT, _PREFIX, _MODE, _EAL_ARGS, _MEMIF_SOCKET.
+# Populates ${prefix}_DPDK_IP, _PORT, _PREFIX, _MODE, _EAL_ARGS, _MEMIF_SOCKET,
+# and (memif) _MEMIF_CLIENT_EAL, _MEMIF_CLIENT_IP.
 load_dpdk_config() {
     local host="$1" prefix="$2"
     local conf
@@ -1077,8 +1075,10 @@ load_dpdk_config() {
         dpdk_prefix=$(echo "$conf" | grep "^DPDK_PREFIX=" | cut -d= -f2 || true)
         mode=$(echo "$conf" | grep "^DPDK_MODE=" | cut -d= -f2 || true)
         eal_args=$(echo "$conf" | grep "^DPDK_EAL_ARGS=" | cut -d= -f2- || true)
-        local memif_socket
+        local memif_socket memif_client_eal memif_client_ip
         memif_socket=$(echo "$conf" | grep "^MEMIF_SOCKET=" | cut -d= -f2 || true)
+        memif_client_eal=$(echo "$conf" | grep "^MEMIF_CLIENT_EAL=" | cut -d= -f2- || true)
+        memif_client_ip=$(echo "$conf" | grep "^MEMIF_CLIENT_IP=" | cut -d= -f2 || true)
         local vlan_id
         vlan_id=$(echo "$conf" | grep "^VLAN_ID=" | cut -d= -f2 || true)
         eval "${prefix}_DPDK_IP=${ip:-}"
@@ -1087,6 +1087,8 @@ load_dpdk_config() {
         eval "${prefix}_DPDK_MODE=${mode:-sriov}"
         eval "${prefix}_DPDK_EAL_ARGS='${eal_args:-}'"
         eval "${prefix}_MEMIF_SOCKET='${memif_socket:-}'"
+        eval "${prefix}_MEMIF_CLIENT_EAL='${memif_client_eal:-}'"
+        eval "${prefix}_MEMIF_CLIENT_IP=${memif_client_ip:-}"
         eval "${prefix}_DPDK_VLAN=${vlan_id:-}"
     fi
 }
@@ -1172,20 +1174,6 @@ dpdk_sriov_setup() {
 
 HUGE_DIR="${HUGE_DIR:-/mnt/huge_2m}"
 BENCH_DPDK_CORE="${BENCH_DPDK_CORE:-7}"
-# Bench side of the memif point-to-point /24 (server is 10.0.0.1, set by
-# test-containers-start.sh --memif). No kernel routing — direct shared-mem link.
-BENCH_MEMIF_IP="${BENCH_MEMIF_IP:-10.0.0.2}"
-
-# Derive a deterministic locally-administered MAC from an IPv4 address:
-# 02:00:<ip bytes>. The bench seeds the server's MAC with this exact scheme
-# (see bench/src/dpdk.rs and dpdk-setup-sriov.sh), so the memif ports must
-# carry the matching MAC or smoltcp drops every frame. e.g. 10.0.0.1 ->
-# 02:00:0a:00:00:01.
-ip_to_memif_mac() {
-    local a b c d
-    IFS=. read -r a b c d <<<"$1"
-    printf '02:00:%02x:%02x:%02x:%02x' "$a" "$b" "$c" "$d"
-}
 
 # After starting a DPDK TAP server, set up kernel routing so external
 # clients can reach smoltcp through the TAP device.
@@ -1334,17 +1322,9 @@ transport_start_dpdk() {
     # Build EAL args: TAP mode uses config from /etc/melin-dpdk.conf,
     # SR-IOV mode uses hugepages.
     local server_eal
-    if [[ "$DPDK_MODE" == "memif" ]]; then
-        # Container memif: config carries the full EAL (incl. --vdev). Pin
-        # the memif port MAC to the IP-derived value the bench seeds, so the
-        # bench's frames aren't dropped by smoltcp. (The config EAL ends with
-        # the net_memif vdev, so appending ,mac=... extends it.) A distinct
-        # --file-prefix gives this EAL its own /var/run/dpdk runtime dir, so
-        # the server and bench can run as two DPDK primaries in one container
-        # (same-host memif) without colliding on the EAL config lock.
-        server_eal="--file-prefix memif-server ${SERVER_DPDK_EAL_ARGS},mac=$(ip_to_memif_mac "$SERVER_DPDK_IP")"
-    elif [[ "$DPDK_MODE" == "tap" ]]; then
-        # Container TAP: config carries the full EAL (incl. --vdev).
+    if [[ "$DPDK_MODE" == "tap" || "$DPDK_MODE" == "memif" ]]; then
+        # Container modes: the config carries the full EAL verbatim (incl. the
+        # --vdev and, for memif, role=server + the seeded MAC).
         server_eal="${SERVER_DPDK_EAL_ARGS}"
     else
         server_eal="--huge-dir=${HUGE_DIR}"
@@ -1394,16 +1374,11 @@ transport_start_dpdk() {
         BENCH_DPDK_ARGS=""
     elif [[ "$DPDK_MODE" == "memif" ]]; then
         # memif is a direct shared-memory L2 link between the two DPDK stacks
-        # — no kernel routing. The bench is the memif client: derive its EAL
-        # from the server's by flipping the memif role, and put it on the
-        # same private /24 (server .1, bench .2). It reaches the server's
-        # smoltcp at CURRENT_BIND below directly over the shared-memory link.
-        # Flip the memif role and pin the bench's port MAC to its own
-        # IP-derived value (distinct from the server's). The distinct
-        # --file-prefix lets the bench run as a second DPDK primary alongside
-        # the server in the same container (same-host memif).
-        local client_eal="--file-prefix memif-client ${SERVER_DPDK_EAL_ARGS/role=server/role=client},mac=$(ip_to_memif_mac "$BENCH_MEMIF_IP")"
-        BENCH_DPDK_ARGS="--dpdk-eal-args='${client_eal}' --dpdk-ports ${SERVER_DPDK_PORT} --dpdk-core ${BENCH_DPDK_CORE} --dpdk-ip ${BENCH_MEMIF_IP} --dpdk-prefix-len ${SERVER_DPDK_PREFIX}"
+        # — no kernel routing. The bench is the memif client; its full EAL
+        # (role=client + MAC) and IP come straight from the config, so the
+        # suite does no role/MAC rewriting. It reaches the server's smoltcp at
+        # CURRENT_BIND below directly over the shared-memory link.
+        BENCH_DPDK_ARGS="--dpdk-eal-args='${SERVER_MEMIF_CLIENT_EAL}' --dpdk-ports ${SERVER_DPDK_PORT} --dpdk-core ${BENCH_DPDK_CORE} --dpdk-ip ${SERVER_MEMIF_CLIENT_IP} --dpdk-prefix-len ${SERVER_DPDK_PREFIX}"
     else
         local bench_eal="--huge-dir=${HUGE_DIR}"
         if [[ -n "${BENCH_DPDK_EAL_ARGS:-}" ]]; then
