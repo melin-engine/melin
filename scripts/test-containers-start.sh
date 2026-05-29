@@ -144,19 +144,20 @@ for name in "${CONTAINERS[@]}"; do
         curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable
     " > /dev/null 2>&1
 
-    # Clone the repo and build.
-    echo "  Cloning repo and building in $name (this takes a few minutes)..."
+    # Clone the repo only — binaries are built by lan-bench-suite.sh on the
+    # first run (single builder, so nothing is pre-baked and later goes
+    # stale). The first suite run pays the full build; subsequent runs are
+    # incremental.
+    echo "  Cloning repo in $name..."
     CHECKOUT_CMD=""
     if [[ -n "$BRANCH" ]]; then
         CHECKOUT_CMD="git fetch origin $BRANCH && git checkout $BRANCH &&"
     fi
     docker exec "$name" bash -c "
-        source /root/.cargo/env && \
         mkdir -p /root/workspace && \
         git clone https://github.com/melin-engine/melin.git $REPO_DIR && \
         cd $REPO_DIR && \
-        $CHECKOUT_CMD
-        cargo build --release
+        $CHECKOUT_CMD true
     " 2>&1 | tail -3
 
     IP=$(docker inspect -f '{{range.NetworkSettings.Networks}}{{.IPAddress}}{{end}}' "$name")
@@ -164,45 +165,26 @@ for name in "${CONTAINERS[@]}"; do
 done
 
 # ---------------------------------------------------------------------------
-# Install DPDK build deps and build the DPDK server binary.
+# Install DPDK build deps (the suite builds the DPDK binaries itself).
 # ---------------------------------------------------------------------------
-# The server container gets libdpdk-dev + libclang-dev for the DPDK build,
-# plus iproute2 for TAP device routing. The bench suite detects TAP mode
-# via DPDK_MODE=tap in /etc/melin-dpdk.conf and skips SR-IOV setup.
+# The server container gets libdpdk-dev + libclang-dev so lan-bench-suite.sh
+# can build the DPDK server on first run (bindgen needs libclang), plus
+# iproute2 for TAP device routing. The suite detects the mode via
+# DPDK_MODE=... in /etc/melin-dpdk.conf.
 echo ""
-echo "Setting up DPDK on server (building DPDK server binary)..."
-
-# Build the DPDK server binary (melin-server.dpdk). It is PMD-agnostic — the
-# transport (TAP vs memif) is selected entirely by the EAL --vdev passed at
-# runtime — so the same binary serves both modes.
+echo "Installing DPDK build deps on server..."
 docker exec "$SERVER" bash -c "
-    apt-get install -y --no-install-recommends libdpdk-dev libclang-dev iproute2 2>&1 | tail -3 && \
-    source /root/.cargo/env && \
-    cd $REPO_DIR && \
-    cargo build --release -p melin-server --features dpdk 2>&1 | tail -3 && \
-    cp target/release/melin-server target/release/melin-server.dpdk && \
-    git rev-parse HEAD > target/release/melin-server.dpdk.commit && \
-    echo 'Rebuilding default (non-DPDK) server binary...' && \
-    cargo build --release -p melin-server 2>&1 | tail -3 && \
-    ls -la target/release/melin-server target/release/melin-server.dpdk
+    apt-get install -y --no-install-recommends libdpdk-dev libclang-dev iproute2 2>&1 | tail -3
 "
 
 if [[ "$WITH_MEMIF" == "true" ]]; then
-    # memif mode: both ends run DPDK over a shared-memory link. Build a
-    # DPDK-enabled bench on the client, kept alongside the kernel-TCP bench
-    # as melin-bench.dpdk (mirroring melin-server.dpdk), then write a memif
-    # config the suite consumes.
-    echo "Setting up DPDK (memif mode) on client (building DPDK bench binary)..."
+    # memif mode: both ends run DPDK over a shared-memory link, so the bench
+    # (client) also needs the DPDK build toolchain — the suite builds the
+    # DPDK bench there on first run. Then write a memif config the suite
+    # consumes.
+    echo "Installing DPDK build deps on client (the memif bench builds there)..."
     docker exec "$CLIENT" bash -c "
-        apt-get install -y --no-install-recommends libdpdk-dev libclang-dev 2>&1 | tail -3 && \
-        source /root/.cargo/env && \
-        cd $REPO_DIR && \
-        cargo build --release -p melin-bench --features dpdk 2>&1 | tail -3 && \
-        cp target/release/melin-bench target/release/melin-bench.dpdk && \
-        git rev-parse HEAD > target/release/melin-bench.dpdk.commit && \
-        echo 'Rebuilding default (non-DPDK) bench binary...' && \
-        cargo build --release -p melin-bench 2>&1 | tail -3 && \
-        ls -la target/release/melin-bench target/release/melin-bench.dpdk
+        apt-get install -y --no-install-recommends libdpdk-dev libclang-dev 2>&1 | tail -3
     "
 
     # Hugepages — memif throughput roughly doubled vs --no-huge (TLB
