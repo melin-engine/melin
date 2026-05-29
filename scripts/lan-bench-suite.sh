@@ -598,11 +598,12 @@ if [[ -n "${SERVER_FEATURES:-}" ]]; then
         cargo build --release -p melin-server --features ${SERVER_FEATURES}" 2>&1 | tail -3
 fi
 
-# DPDK build on server (and replica if dpdk-repl).
-# In TAP mode, test-containers-start.sh already built the .dpdk binary.
-# In SR-IOV mode we rebuild melin-server here with the dpdk feature plus
-# the mode selector (skip-order-exec under SKIP_ORDER_EXEC=1, trading
-# is the default and no longer needs a feature flag).
+# DPDK build. This suite is the sole builder of the DPDK binaries (nothing
+# is pre-baked). Container modes (tap/memif) compile into target-dpdk and
+# copy to target/release/*.dpdk so they coexist with the kernel-TCP binaries;
+# SR-IOV builds melin-server in place. The feature set adds skip-order-exec
+# under SKIP_ORDER_EXEC=1 (trading is the default, no flag) and no-persist
+# under NO_PERSIST=1.
 if [[ "$NEED_DPDK" == "1" ]]; then
     # Feature set for the DPDK server build. Mirrors MAIN_BUILD above.
     if [[ "${SKIP_ORDER_EXEC:-0}" == "1" ]]; then
@@ -620,56 +621,51 @@ if [[ "$NEED_DPDK" == "1" ]]; then
         DPDK_SERVER_FEATURES="${DPDK_SERVER_FEATURES},${DPDK_SERVER_EXTRA_FEATURES}"
     fi
 
-    # Check if the .dpdk binary already exists (built by test-containers-start
-    # for the container modes). These suffixed binaries are NOT rebuilt
-    # per-run, so guard against silently benchmarking stale code: compare the
-    # commit they were stamped with against the repo's current HEAD. A
-    # mismatch means the repo moved (BENCH_BRANCH, a pull, a fresh checkout)
-    # since the binaries were baked — abort with how to refresh.
-    HAVE_DPDK_BIN=$(ssh $SSH_OPTS "$SERVER" "test -f ${REPO_DIR}/target/release/melin-server.dpdk && echo yes || echo no")
-    if [[ "$HAVE_DPDK_BIN" == "yes" ]]; then
-        dpdk_stamp=$(ssh $SSH_OPTS "$SERVER" "cat ${REPO_DIR}/target/release/melin-server.dpdk.commit 2>/dev/null || true")
-        dpdk_head=$(ssh $SSH_OPTS "$SERVER" "cd ${REPO_DIR} && git rev-parse HEAD 2>/dev/null || true")
-        if [[ -z "$dpdk_stamp" ]]; then
-            echo "  WARN: melin-server.dpdk has no commit stamp — can't verify it matches" >&2
-            echo "        the code under test; rebuild via test-containers-start if unsure." >&2
-            echo "  DPDK binary already built (melin-server.dpdk, unverified)."
-        elif [[ -n "$dpdk_head" && "$dpdk_stamp" != "$dpdk_head" ]]; then
-            echo "================================================================" >&2
-            echo "  ERROR: prebuilt DPDK (.dpdk) binaries are stale."              >&2
-            echo "         built from ${dpdk_stamp:0:12}, repo now at ${dpdk_head:0:12}." >&2
-            echo "  The .dpdk binaries are baked by test-containers-start and are"  >&2
-            echo "  not rebuilt per-run. Refresh them, e.g.:"                       >&2
-            echo "    ./scripts/test-containers-start.sh --memif --branch <branch>" >&2
-            echo "================================================================" >&2
-            exit 1
-        else
-            echo "  DPDK binary already built (melin-server.dpdk @ ${dpdk_head:0:12})."
+    # Bench feature set (the server set was computed above).
+    DPDK_BENCH_FEATURES="dpdk"
+    if [[ -n "${DPDK_BENCH_EXTRA_FEATURES:-}" ]]; then
+        DPDK_BENCH_FEATURES="${DPDK_BENCH_FEATURES},${DPDK_BENCH_EXTRA_FEATURES}"
+    fi
+
+    # Build a single DPDK binary on a host. melin-server takes
+    # --no-default-features (its DPDK feature set is self-contained); the
+    # bench keeps defaults. Container modes ($mode=container) build into a
+    # separate target dir (target-dpdk) so the DPDK build doesn't thrash the
+    # kernel-TCP build in target/, then copy the result to the .dpdk path the
+    # run/kill paths expect. SR-IOV builds in place (dedicated host).
+    _dpdk_build_host() {
+        local host="$1" pkg="$2" features="$3" mode="$4" nodefault=""
+        [[ "$pkg" == "melin-server" ]] && nodefault="--no-default-features"
+        local cmd="cargo build --release -p ${pkg} --features ${features} ${nodefault}"
+        [[ "$mode" == "container" ]] && \
+            cmd="${cmd} --target-dir target-dpdk && cp target-dpdk/release/${pkg} target/release/${pkg}.dpdk"
+        ssh $SSH_OPTS "$host" "cd ${REPO_DIR} && source ~/.cargo/env && \
+            export RUSTFLAGS=\"${RUSTFLAGS:-}\" && ${cmd}" 2>&1 \
+            | tail -3 | sed "s/^/  [${host} ${pkg}] /"
+    }
+
+    # Container modes (tap/memif) build into a separate target dir so the DPDK
+    # binaries coexist with the kernel-TCP (non-DPDK) binaries in target/ —
+    # no feature-flip recompiles, and this suite is the sole builder (nothing
+    # pre-baked to go stale). SR-IOV builds into the default target/ (its
+    # server host is dedicated, so no TCP/DPDK coexistence concern).
+    SUITE_DPDK_MODE=$(ssh $SSH_OPTS "$SERVER" "grep '^DPDK_MODE=' /etc/melin-dpdk.conf 2>/dev/null | cut -d= -f2" </dev/null || true)
+    dpdk_pids=()
+    if [[ "$SUITE_DPDK_MODE" == "tap" || "$SUITE_DPDK_MODE" == "memif" ]]; then
+        _bench_note=""
+        [[ "$SUITE_DPDK_MODE" == "memif" ]] && _bench_note=" + bench"
+        echo "  Building DPDK binaries into target-dpdk (server${_bench_note})..."
+        ( _dpdk_build_host "$SERVER" melin-server "$DPDK_SERVER_FEATURES" container ) &
+        dpdk_pids+=($!)
+        if [[ "$SUITE_DPDK_MODE" == "memif" ]]; then
+            ( _dpdk_build_host "$BENCH" melin-bench "$DPDK_BENCH_FEATURES" container ) &
+            dpdk_pids+=($!)
         fi
     else
-        # Each DPDK build is independent — run them concurrently and
-        # fail the suite if any one returns non-zero.
         echo "  Building DPDK server (--features ${DPDK_SERVER_FEATURES}), bench, (and replica if dpdk-repl) in parallel..."
-        dpdk_pids=()
-        (
-            ssh $SSH_OPTS "$SERVER" "cd ${REPO_DIR} && source ~/.cargo/env && \
-                export RUSTFLAGS=\"${RUSTFLAGS:-}\" && \
-                cargo build --release -p melin-server --features ${DPDK_SERVER_FEATURES} --no-default-features" 2>&1 \
-                | tail -3 | sed "s/^/  [${SERVER} dpdk-server] /"
-        ) &
+        ( _dpdk_build_host "$SERVER" melin-server "$DPDK_SERVER_FEATURES" sriov ) &
         dpdk_pids+=($!)
-        # Bench feature set: append DPDK_BENCH_EXTRA_FEATURES if set so
-        # diagnostic features (latency-trace) can be enabled per-run.
-        DPDK_BENCH_FEATURES="dpdk"
-        if [[ -n "${DPDK_BENCH_EXTRA_FEATURES:-}" ]]; then
-            DPDK_BENCH_FEATURES="${DPDK_BENCH_FEATURES},${DPDK_BENCH_EXTRA_FEATURES}"
-        fi
-        (
-            ssh $SSH_OPTS "$BENCH" "cd ${REPO_DIR} && source ~/.cargo/env && \
-                export RUSTFLAGS=\"${RUSTFLAGS:-}\" && \
-                cargo build --release -p melin-bench --features ${DPDK_BENCH_FEATURES}" 2>&1 \
-                | tail -3 | sed "s/^/  [${BENCH} dpdk-bench] /"
-        ) &
+        ( _dpdk_build_host "$BENCH" melin-bench "$DPDK_BENCH_FEATURES" sriov ) &
         dpdk_pids+=($!)
         # Build DPDK server on replicas when any dpdk-*repl variant is in
         # the matrix. dpdk-dual-repl also needs REPLICA2.
@@ -682,31 +678,21 @@ if [[ "$NEED_DPDK" == "1" ]]; then
             esac
         done
         if (( _need_dpdk_repl || _need_dpdk_dual_repl )) && [[ -n "$REPLICA" ]]; then
-            (
-                ssh $SSH_OPTS "$REPLICA" "cd ${REPO_DIR} && source ~/.cargo/env && \
-                    export RUSTFLAGS=\"${RUSTFLAGS:-}\" && \
-                    cargo build --release -p melin-server --features ${DPDK_SERVER_FEATURES} --no-default-features" 2>&1 \
-                    | tail -3 | sed "s/^/  [${REPLICA} dpdk-server] /"
-            ) &
+            ( _dpdk_build_host "$REPLICA" melin-server "$DPDK_SERVER_FEATURES" sriov ) &
             dpdk_pids+=($!)
         fi
         if (( _need_dpdk_dual_repl )) && [[ -n "$REPLICA2" ]]; then
-            (
-                ssh $SSH_OPTS "$REPLICA2" "cd ${REPO_DIR} && source ~/.cargo/env && \
-                    export RUSTFLAGS=\"${RUSTFLAGS:-}\" && \
-                    cargo build --release -p melin-server --features ${DPDK_SERVER_FEATURES} --no-default-features" 2>&1 \
-                    | tail -3 | sed "s/^/  [${REPLICA2} dpdk-server] /"
-            ) &
+            ( _dpdk_build_host "$REPLICA2" melin-server "$DPDK_SERVER_FEATURES" sriov ) &
             dpdk_pids+=($!)
         fi
-        dpdk_failed=0
-        for pid in "${dpdk_pids[@]}"; do
-            wait "$pid" || dpdk_failed=1
-        done
-        if [[ "$dpdk_failed" == "1" ]]; then
-            echo "  DPDK build failed on at least one host."
-            exit 1
-        fi
+    fi
+    dpdk_failed=0
+    for pid in "${dpdk_pids[@]}"; do
+        wait "$pid" || dpdk_failed=1
+    done
+    if [[ "$dpdk_failed" == "1" ]]; then
+        echo "  DPDK build failed on at least one host."
+        exit 1
     fi
 fi
 echo "  Builds complete."
@@ -1133,10 +1119,11 @@ dpdk_sriov_setup() {
     DPDK_MODE="${SERVER_DPDK_MODE:-sriov}"
 
     if [[ "$DPDK_MODE" == "tap" || "$DPDK_MODE" == "memif" ]]; then
-        # Container modes (TAP / memif): skip SR-IOV, use the .dpdk binary
-        # (separate from the default so TCP transports aren't broken by the
-        # DPDK feature flag). memif additionally drives the bench through
-        # DPDK, so it needs the .dpdk bench binary too.
+        # Container modes (TAP / memif): skip SR-IOV. The build step compiles
+        # the DPDK binaries in target-dpdk and copies them to these .dpdk
+        # paths (separate from the kernel-TCP binaries in target/release so
+        # both coexist). memif additionally drives the bench through DPDK, so
+        # it uses the DPDK bench binary too.
         DPDK_SERVER_BIN="${REPO_DIR}/target/release/melin-server.dpdk"
         if [[ "$DPDK_MODE" == "memif" ]]; then
             DPDK_BENCH_BIN="./target/release/melin-bench.dpdk"
