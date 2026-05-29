@@ -301,6 +301,21 @@ impl Port {
     pub fn port_id(&self) -> u16 {
         self.port_id
     }
+
+    /// Whether the port's link is up (non-blocking query). For memif this
+    /// reflects whether the peer has completed the control-plane handshake,
+    /// so callers can wait for the link before pumping rx/tx (pumping
+    /// concurrently with the in-progress handshake races it).
+    pub fn link_up(&self) -> bool {
+        let mut link: ffi::rte_eth_link = unsafe { std::mem::zeroed() };
+        // Non-blocking: reads cached link state, no device round-trip.
+        // `rte_eth_link` is a union (val64 | bitfield struct), so reading the
+        // link_status bit goes through the bindgen-generated union arms.
+        unsafe {
+            ffi::rte_eth_link_get_nowait(self.port_id, &mut link);
+            link.__bindgen_anon_1.__bindgen_anon_1.link_status() != 0
+        }
+    }
 }
 
 impl Drop for Port {
