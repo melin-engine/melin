@@ -44,6 +44,10 @@
 #                          (humantime, default: 60s)
 #   THROUGHPUT_CLIENTS=N   Clients for throughput workload (default: 8)
 #   THROUGHPUT_WINDOW=N    Window for throughput workload (default: 128)
+#   TARGET_RATE=N          Open-loop offered load in orders/sec for the
+#                          throughput workload (default: 1000000). Paces
+#                          sends and reports coordinated-omission-corrected
+#                          latency. Set 0 for closed-loop peak-saturation.
 #   BENCH_THREADS=N        Number of bench client io_uring threads (default: bench default)
 #   SKIP_JOURNAL_VERIFY=1  Skip post-run journal consistency check (default: 0)
 #   SINGLE_DURATION=T      Measured-phase duration for single-order workload
@@ -175,13 +179,16 @@ REPL_PORT=9877
 RUN_PLOTS="${RUN_PLOTS:-0}"
 
 # Open-loop target rate in orders/sec for the throughput workload.
-# `0` (default) keeps closed-loop window-filling. When set, the bench
-# paces sends at the requested rate and feeds *scheduled* timestamps
-# into the latency histogram (coordinated-omission fix). Requires a
-# non-zero --window; the script's THROUGHPUT_WINDOW already provides
-# one. Only wired into the throughput workload — single is a window=1
-# unloaded-latency probe and pacing it would defeat the purpose.
-TARGET_RATE="${TARGET_RATE:-0}"
+# Defaults to 1M/s: paced runs feed *scheduled* timestamps into the
+# latency histogram (coordinated-omission fix), so the reported tail
+# reflects the latency a client actually sees at a fixed offered load —
+# the number we care about most of the time. Set `TARGET_RATE=0` to fall
+# back to closed-loop window-filling (measures peak saturation throughput
+# instead). Pacing requires a non-zero --window; the script's
+# THROUGHPUT_WINDOW already provides one. Only wired into the throughput
+# workload — single is a window=1 unloaded-latency probe and pacing it
+# would defeat the purpose.
+TARGET_RATE="${TARGET_RATE:-1000000}"
 
 # The server's per-account rate limiter (SEC-04) defaults to 1000 ops/s
 # with 5000 burst — a sensible production ceiling, but far below what
@@ -516,7 +523,10 @@ for item in "${MATRIX[@]}"; do
 done
 
 echo "=== Building release binaries ==="
-BUILD_HOSTS=("$SERVER" "$BENCH")
+# A host list must not contain the same SSH target twice — building one host
+# concurrently with itself races on the git index / cargo target locks.
+BUILD_HOSTS=("$SERVER")
+[[ "$BENCH" != "$SERVER" ]] && BUILD_HOSTS+=("$BENCH")
 if [[ -n "$REPLICA" ]]; then BUILD_HOSTS+=("$REPLICA"); fi
 if [[ -n "$REPLICA2" ]]; then BUILD_HOSTS+=("$REPLICA2"); fi
 
@@ -1055,7 +1065,7 @@ transport_stop_tcp_dual_repl() {
 # --- DPDK transports ---
 
 # Load DPDK config from /etc/melin-dpdk.conf on a host.
-# Populates ${prefix}_DPDK_IP, _PORT, _PREFIX, _MODE, _EAL_ARGS.
+# Populates ${prefix}_DPDK_IP, _PORT, _PREFIX, _MODE, _EAL_ARGS, _MEMIF_SOCKET.
 load_dpdk_config() {
     local host="$1" prefix="$2"
     local conf
@@ -1067,6 +1077,8 @@ load_dpdk_config() {
         dpdk_prefix=$(echo "$conf" | grep "^DPDK_PREFIX=" | cut -d= -f2 || true)
         mode=$(echo "$conf" | grep "^DPDK_MODE=" | cut -d= -f2 || true)
         eal_args=$(echo "$conf" | grep "^DPDK_EAL_ARGS=" | cut -d= -f2- || true)
+        local memif_socket
+        memif_socket=$(echo "$conf" | grep "^MEMIF_SOCKET=" | cut -d= -f2 || true)
         local vlan_id
         vlan_id=$(echo "$conf" | grep "^VLAN_ID=" | cut -d= -f2 || true)
         eval "${prefix}_DPDK_IP=${ip:-}"
@@ -1074,13 +1086,18 @@ load_dpdk_config() {
         eval "${prefix}_DPDK_PREFIX=${dpdk_prefix:-24}"
         eval "${prefix}_DPDK_MODE=${mode:-sriov}"
         eval "${prefix}_DPDK_EAL_ARGS='${eal_args:-}'"
+        eval "${prefix}_MEMIF_SOCKET='${memif_socket:-}'"
         eval "${prefix}_DPDK_VLAN=${vlan_id:-}"
     fi
 }
 
 DPDK_SRIOV_DONE=0
-# Set to "tap" when TAP mode detected — controls routing setup.
+# Set to "tap" / "memif" when those modes are detected — controls routing
+# setup and which bench binary the dpdk workloads use.
 DPDK_MODE="sriov"
+# Bench binary for dpdk workloads. memif drives the bench through DPDK and
+# uses the separate .dpdk build; tap/sriov use the default path.
+DPDK_BENCH_BIN="./target/release/melin-bench"
 
 dpdk_sriov_setup() {
     if [[ "$DPDK_SRIOV_DONE" == "1" ]]; then return; fi
@@ -1091,14 +1108,18 @@ dpdk_sriov_setup() {
     SERVER_DPDK_PREFIX="${SERVER_DPDK_PREFIX:-24}"
     DPDK_MODE="${SERVER_DPDK_MODE:-sriov}"
 
-    if [[ "$DPDK_MODE" == "tap" ]]; then
-        # TAP mode (Docker containers): skip SR-IOV, use TAP PMD.
-        # The .dpdk binary is separate from the default binary so TCP
-        # transports aren't broken by the DPDK feature flag.
+    if [[ "$DPDK_MODE" == "tap" || "$DPDK_MODE" == "memif" ]]; then
+        # Container modes (TAP / memif): skip SR-IOV, use the .dpdk binary
+        # (separate from the default so TCP transports aren't broken by the
+        # DPDK feature flag). memif additionally drives the bench through
+        # DPDK, so it needs the .dpdk bench binary too.
         DPDK_SERVER_BIN="${REPO_DIR}/target/release/melin-server.dpdk"
+        if [[ "$DPDK_MODE" == "memif" ]]; then
+            DPDK_BENCH_BIN="./target/release/melin-bench.dpdk"
+        fi
         echo ""
-        echo "=== DPDK TAP mode (no SR-IOV) ==="
-        echo "  Server DPDK: IP=${SERVER_DPDK_IP}, port=${SERVER_DPDK_PORT}, mode=tap"
+        echo "=== DPDK ${DPDK_MODE} mode (no SR-IOV) ==="
+        echo "  Server DPDK: IP=${SERVER_DPDK_IP}, port=${SERVER_DPDK_PORT}, mode=${DPDK_MODE}"
         echo ""
     else
         echo ""
@@ -1151,6 +1172,20 @@ dpdk_sriov_setup() {
 
 HUGE_DIR="${HUGE_DIR:-/mnt/huge_2m}"
 BENCH_DPDK_CORE="${BENCH_DPDK_CORE:-7}"
+# Bench side of the memif point-to-point /24 (server is 10.0.0.1, set by
+# test-containers-start.sh --memif). No kernel routing — direct shared-mem link.
+BENCH_MEMIF_IP="${BENCH_MEMIF_IP:-10.0.0.2}"
+
+# Derive a deterministic locally-administered MAC from an IPv4 address:
+# 02:00:<ip bytes>. The bench seeds the server's MAC with this exact scheme
+# (see bench/src/dpdk.rs and dpdk-setup-sriov.sh), so the memif ports must
+# carry the matching MAC or smoltcp drops every frame. e.g. 10.0.0.1 ->
+# 02:00:0a:00:00:01.
+ip_to_memif_mac() {
+    local a b c d
+    IFS=. read -r a b c d <<<"$1"
+    printf '02:00:%02x:%02x:%02x:%02x' "$a" "$b" "$c" "$d"
+}
 
 # After starting a DPDK TAP server, set up kernel routing so external
 # clients can reach smoltcp through the TAP device.
@@ -1299,7 +1334,17 @@ transport_start_dpdk() {
     # Build EAL args: TAP mode uses config from /etc/melin-dpdk.conf,
     # SR-IOV mode uses hugepages.
     local server_eal
-    if [[ "$DPDK_MODE" == "tap" ]]; then
+    if [[ "$DPDK_MODE" == "memif" ]]; then
+        # Container memif: config carries the full EAL (incl. --vdev). Pin
+        # the memif port MAC to the IP-derived value the bench seeds, so the
+        # bench's frames aren't dropped by smoltcp. (The config EAL ends with
+        # the net_memif vdev, so appending ,mac=... extends it.) A distinct
+        # --file-prefix gives this EAL its own /var/run/dpdk runtime dir, so
+        # the server and bench can run as two DPDK primaries in one container
+        # (same-host memif) without colliding on the EAL config lock.
+        server_eal="--file-prefix memif-server ${SERVER_DPDK_EAL_ARGS},mac=$(ip_to_memif_mac "$SERVER_DPDK_IP")"
+    elif [[ "$DPDK_MODE" == "tap" ]]; then
+        # Container TAP: config carries the full EAL (incl. --vdev).
         server_eal="${SERVER_DPDK_EAL_ARGS}"
     else
         server_eal="--huge-dir=${HUGE_DIR}"
@@ -1312,6 +1357,20 @@ transport_start_dpdk() {
 
     ssh $SSH_OPTS "$SERVER" "pkill -x melin-server 2>/dev/null; pkill -f '[m]elin-server.dpdk' 2>/dev/null; true"
     sleep 1
+    # A SIGKILL'd or crashed DPDK process leaves a runtime lock in
+    # /var/run/dpdk that blocks the next EAL init ("Cannot create lock on
+    # .../config"). Clear it for the container-mode primaries (server always;
+    # bench too under memif) now that the processes are down. Scoped to
+    # container modes so the SR-IOV path is untouched.
+    if [[ "$DPDK_MODE" == "tap" || "$DPDK_MODE" == "memif" ]]; then
+        ssh $SSH_OPTS "$SERVER" "rm -rf /var/run/dpdk/* 2>/dev/null; true"
+    fi
+    if [[ "$DPDK_MODE" == "memif" ]]; then
+        # The server is the memif master and recreates the socket; a leftover
+        # socket file from a prior run fails the bind with EADDRINUSE.
+        ssh $SSH_OPTS "$SERVER" "rm -f ${SERVER_MEMIF_SOCKET:-/memif/memif.sock} 2>/dev/null; true"
+        ssh $SSH_OPTS "$BENCH" "pkill -f '[m]elin-bench.dpdk' 2>/dev/null; rm -rf /var/run/dpdk/* 2>/dev/null; true"
+    fi
     ssh $SSH_OPTS "$SERVER" "NO_COLOR=1 RUST_LOG=${BENCH_RUST_LOG} nohup ${DPDK_SERVER_BIN} \
             --bind 0.0.0.0:9876 \
             --health-bind ${SERVER_VLAN}:9878 \
@@ -1333,6 +1392,18 @@ transport_start_dpdk() {
         add_tap_route "$BENCH" "${SERVER_DPDK_IP}" "${SERVER_PUB}"
         # In TAP mode, the bench client uses kernel TCP (no DPDK on client).
         BENCH_DPDK_ARGS=""
+    elif [[ "$DPDK_MODE" == "memif" ]]; then
+        # memif is a direct shared-memory L2 link between the two DPDK stacks
+        # — no kernel routing. The bench is the memif client: derive its EAL
+        # from the server's by flipping the memif role, and put it on the
+        # same private /24 (server .1, bench .2). It reaches the server's
+        # smoltcp at CURRENT_BIND below directly over the shared-memory link.
+        # Flip the memif role and pin the bench's port MAC to its own
+        # IP-derived value (distinct from the server's). The distinct
+        # --file-prefix lets the bench run as a second DPDK primary alongside
+        # the server in the same container (same-host memif).
+        local client_eal="--file-prefix memif-client ${SERVER_DPDK_EAL_ARGS/role=server/role=client},mac=$(ip_to_memif_mac "$BENCH_MEMIF_IP")"
+        BENCH_DPDK_ARGS="--dpdk-eal-args='${client_eal}' --dpdk-ports ${SERVER_DPDK_PORT} --dpdk-core ${BENCH_DPDK_CORE} --dpdk-ip ${BENCH_MEMIF_IP} --dpdk-prefix-len ${SERVER_DPDK_PREFIX}"
     else
         local bench_eal="--huge-dir=${HUGE_DIR}"
         if [[ -n "${BENCH_DPDK_EAL_ARGS:-}" ]]; then
@@ -1624,7 +1695,7 @@ workload_throughput() {
 
     if [[ "$transport" == dpdk* ]]; then
         ssh $SSH_OPTS "$BENCH" "cd ${REPO_DIR} && source ~/.cargo/env && \
-            ./target/release/melin-bench \
+            ${DPDK_BENCH_BIN} \
                 --addr ${CURRENT_BIND} \
                 --health-addr ${CURRENT_HEALTH} \
                 --key bench.key \
@@ -1657,7 +1728,7 @@ workload_single() {
 
     if [[ "$transport" == dpdk* ]]; then
         ssh $SSH_OPTS "$BENCH" "cd ${REPO_DIR} && source ~/.cargo/env && \
-            ./target/release/melin-bench \
+            ${DPDK_BENCH_BIN} \
                 --addr ${CURRENT_BIND} \
                 --health-addr ${CURRENT_HEALTH} \
                 --key bench.key \
@@ -1878,9 +1949,13 @@ for transport in "${ORDERED_TRANSPORTS[@]}"; do
 done
 
 # ---------------------------------------------------------------------------
-# DPDK cleanup: reboot if any DPDK transport ran
+# DPDK cleanup: reboot if any DPDK transport ran.
+# Only needed for SR-IOV (resets NIC/VF state). The container modes (tap,
+# memif) bypass real hardware — DPDK EAL cleanup is enough — and `reboot`
+# inside a container is pointless (and kills it without an init that handles
+# the syscall), so skip both.
 # ---------------------------------------------------------------------------
-if [[ "$DPDK_RAN" == "1" && "$DPDK_MODE" != "tap" && "${SKIP_REBOOT:-0}" != "1" ]]; then
+if [[ "$DPDK_RAN" == "1" && "$DPDK_MODE" != "tap" && "$DPDK_MODE" != "memif" && "${SKIP_REBOOT:-0}" != "1" ]]; then
     echo ""
     echo "============================================================"
     echo "  Rebooting all machines to clean up DPDK state"

@@ -89,6 +89,21 @@ WORKLOADS="${WORKLOADS:-throughput}"
 JOURNAL_PATH="${JOURNAL_PATH:-/tmp/journal/bench.journal}"
 SNAPSHOT_PATH="${SNAPSHOT_PATH:-/tmp/journal/bench.snapshot}"
 
+# memif DPDK path: the server container's /etc/melin-dpdk.conf selects
+# DPDK_MODE=memif (set by test-containers-start.sh --memif). The bench runs
+# DPDK too and shares host cores with the server (no cpuset), so pin its poll
+# core off the server's pinned set (server uses 1-4 + shadow on 7; core 5 is
+# free). The prebuilt .dpdk binaries are durable-mode, so default
+# NO_PERSIST=0 to match — a no-persist run needs no-persist .dpdk binaries.
+MEMIF=0
+if [[ "$TRANSPORTS" == *dpdk* ]] \
+   && [[ "$(docker exec "$SERVER_CONTAINER" sh -c 'grep -s "^DPDK_MODE=" /etc/melin-dpdk.conf | cut -d= -f2' 2>/dev/null)" == "memif" ]]; then
+    MEMIF=1
+    : "${BENCH_DPDK_CORE:=5}"
+    : "${NO_PERSIST:=0}"
+    export BENCH_DPDK_CORE
+fi
+
 # Default to no-persist: the containers' journal lives on the host's overlay
 # filesystem, where fsync latency is unrepresentative and would dominate the
 # measurement. Skipping journal I/O measures the transport floor instead.
@@ -150,6 +165,7 @@ echo "  client:        ${CLIENT_CONTAINER} (${CLIENT_IP})"
 [[ -n "$REPLICA_IP" ]]  && echo "  replica:       ${REPLICA_CONTAINER} (${REPLICA_IP})"
 [[ -n "$REPLICA2_IP" ]] && echo "  replica2:      ${REPLICA2_CONTAINER} (${REPLICA2_IP})"
 echo "  transports:    ${TRANSPORTS}"
+[[ "$MEMIF" == 1 ]] && echo "                 (DPDK memif: bench runs DPDK, pinned to core ${BENCH_DPDK_CORE})"
 echo "  workloads:     ${WORKLOADS}"
 echo "  journal:       ${JOURNAL_PATH}"
 echo "  no-persist:    ${NO_PERSIST}"
