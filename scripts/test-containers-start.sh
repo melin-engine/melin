@@ -181,6 +181,7 @@ docker exec "$SERVER" bash -c "
     cd $REPO_DIR && \
     cargo build --release -p melin-server --features dpdk 2>&1 | tail -3 && \
     cp target/release/melin-server target/release/melin-server.dpdk && \
+    git rev-parse HEAD > target/release/melin-server.dpdk.commit && \
     echo 'Rebuilding default (non-DPDK) server binary...' && \
     cargo build --release -p melin-server 2>&1 | tail -3 && \
     ls -la target/release/melin-server target/release/melin-server.dpdk
@@ -198,6 +199,7 @@ if [[ "$WITH_MEMIF" == "true" ]]; then
         cd $REPO_DIR && \
         cargo build --release -p melin-bench --features dpdk 2>&1 | tail -3 && \
         cp target/release/melin-bench target/release/melin-bench.dpdk && \
+        git rev-parse HEAD > target/release/melin-bench.dpdk.commit && \
         echo 'Rebuilding default (non-DPDK) bench binary...' && \
         cargo build --release -p melin-bench 2>&1 | tail -3 && \
         ls -la target/release/melin-bench target/release/melin-bench.dpdk

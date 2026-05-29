@@ -620,10 +620,32 @@ if [[ "$NEED_DPDK" == "1" ]]; then
         DPDK_SERVER_FEATURES="${DPDK_SERVER_FEATURES},${DPDK_SERVER_EXTRA_FEATURES}"
     fi
 
-    # Check if TAP mode .dpdk binary already exists (container setup).
+    # Check if the .dpdk binary already exists (built by test-containers-start
+    # for the container modes). These suffixed binaries are NOT rebuilt
+    # per-run, so guard against silently benchmarking stale code: compare the
+    # commit they were stamped with against the repo's current HEAD. A
+    # mismatch means the repo moved (BENCH_BRANCH, a pull, a fresh checkout)
+    # since the binaries were baked — abort with how to refresh.
     HAVE_DPDK_BIN=$(ssh $SSH_OPTS "$SERVER" "test -f ${REPO_DIR}/target/release/melin-server.dpdk && echo yes || echo no")
     if [[ "$HAVE_DPDK_BIN" == "yes" ]]; then
-        echo "  DPDK binary already built (melin-server.dpdk)."
+        dpdk_stamp=$(ssh $SSH_OPTS "$SERVER" "cat ${REPO_DIR}/target/release/melin-server.dpdk.commit 2>/dev/null || true")
+        dpdk_head=$(ssh $SSH_OPTS "$SERVER" "cd ${REPO_DIR} && git rev-parse HEAD 2>/dev/null || true")
+        if [[ -z "$dpdk_stamp" ]]; then
+            echo "  WARN: melin-server.dpdk has no commit stamp — can't verify it matches" >&2
+            echo "        the code under test; rebuild via test-containers-start if unsure." >&2
+            echo "  DPDK binary already built (melin-server.dpdk, unverified)."
+        elif [[ -n "$dpdk_head" && "$dpdk_stamp" != "$dpdk_head" ]]; then
+            echo "================================================================" >&2
+            echo "  ERROR: prebuilt DPDK (.dpdk) binaries are stale."              >&2
+            echo "         built from ${dpdk_stamp:0:12}, repo now at ${dpdk_head:0:12}." >&2
+            echo "  The .dpdk binaries are baked by test-containers-start and are"  >&2
+            echo "  not rebuilt per-run. Refresh them, e.g.:"                       >&2
+            echo "    ./scripts/test-containers-start.sh --memif --branch <branch>" >&2
+            echo "================================================================" >&2
+            exit 1
+        else
+            echo "  DPDK binary already built (melin-server.dpdk @ ${dpdk_head:0:12})."
+        fi
     else
         # Each DPDK build is independent — run them concurrently and
         # fail the suite if any one returns non-zero.
