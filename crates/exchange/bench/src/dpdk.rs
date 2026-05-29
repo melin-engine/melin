@@ -42,6 +42,11 @@ const SOCKET_BUF_SIZE: usize = 65536;
 /// connect loop spin forever. Fail loudly instead.
 const CONNECT_TIMEOUT_SECS: u64 = 30;
 
+/// Bound the wait for the DPDK link to come up after port start. memif's
+/// control-plane handshake is asynchronous; this lets it settle before we
+/// pump rx/tx. Generous — a healthy link comes up in well under a second.
+const LINK_UP_TIMEOUT_SECS: u64 = 10;
+
 /// How often to refresh the smoltcp timestamp (poll iterations).
 /// During connection setup (ARP + TCP handshake), smoltcp needs
 /// advancing timestamps to drive retransmit timers. Using 1 here
@@ -160,6 +165,28 @@ pub fn run_dpdk_roundtrip(
         ports.push(port);
     }
     let offloads = combined_offloads.unwrap_or_default();
+
+    // Wait for the link to come up before pumping any rx/tx. The memif
+    // control-plane handshake completes asynchronously on the EAL interrupt
+    // thread after port start; calling rx_burst concurrently with it races
+    // the handshake and can leave the link permanently down (observed as the
+    // TCP connect hanging in SynSent). Polling link status — not rx_burst —
+    // lets the interrupt thread finish undisturbed. Warn-and-proceed on
+    // timeout so transports that report link state differently aren't
+    // penalized; the per-connection connect timeout is the hard backstop.
+    {
+        let link_deadline = Instant::now() + std::time::Duration::from_secs(LINK_UP_TIMEOUT_SECS);
+        while !ports.iter().all(|p| p.link_up()) {
+            if Instant::now() >= link_deadline {
+                eprintln!(
+                    "  WARN: DPDK link still down after {LINK_UP_TIMEOUT_SECS}s — \
+                     proceeding (memif peer not connected?)"
+                );
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+    }
 
     let mac = ports[0].mac_addr();
     let mut device = DpdkDevice::new(&config.port_ids, mempool.as_raw(), offloads, 0);
