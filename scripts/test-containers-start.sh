@@ -218,11 +218,13 @@ if [[ "$WITH_MEMIF" == "true" ]]; then
 
     # memif is a direct point-to-point L2 link between the two DPDK stacks,
     # so both smoltcp endpoints sit on a private /24 with no kernel routing
-    # or gateway (unlike TAP). Server = memif master (creates the socket);
-    # the suite starts the bench as the memif client.
-    # DPDK_EAL_ARGS here is the SERVER side (role=server); the suite derives
-    # the client EAL (role=client) plus per-side --file-prefix and MAC from
-    # it. Uses hugepages (allocated above).
+    # or gateway (unlike TAP). Server = memif master (creates the socket),
+    # bench = client. The config carries the complete EAL for BOTH ends so
+    # the suite stays a transport-agnostic consumer (no role/MAC munging).
+    # Cross-container, so each end has its own /var/run/dpdk — no file-prefix
+    # needed. Each port's MAC is the deterministic 02:00:<ip> value the bench
+    # seeds for its peer (see bench/src/dpdk.rs); without it smoltcp drops
+    # every frame. Uses hugepages (allocated above).
     # TODO(mem): -m 256 is a guess for the memif rings + mbuf pool; tune.
     docker exec "$SERVER" bash -c "
         cat > /etc/melin-dpdk.conf << EOF
@@ -231,7 +233,9 @@ DPDK_IP=10.0.0.1
 DPDK_PREFIX=24
 DPDK_PORT=0
 MEMIF_SOCKET=${MEMIF_SOCKET}
-DPDK_EAL_ARGS=--no-pci -m 256 --vdev net_memif0,role=server,socket-abstract=no,socket=${MEMIF_SOCKET},id=0
+DPDK_EAL_ARGS=--no-pci -m 256 --vdev net_memif0,role=server,socket-abstract=no,socket=${MEMIF_SOCKET},id=0,mac=02:00:0a:00:00:01
+MEMIF_CLIENT_IP=10.0.0.2
+MEMIF_CLIENT_EAL=--no-pci -m 256 --vdev net_memif0,role=client,socket-abstract=no,socket=${MEMIF_SOCKET},id=0,mac=02:00:0a:00:00:02
 EOF
 "
     echo "  DPDK config written (memif mode, server IP=10.0.0.1, socket=${MEMIF_SOCKET})"
@@ -314,10 +318,9 @@ echo "  ./scripts/lan-bench-suite.sh $SERVER_IP $CLIENT_IP $SERVER_IP root"
 if [[ "$WITH_MEMIF" == "true" ]]; then
     echo ""
     echo "DPDK memif configured (DPDK_MODE=memif, socket=${MEMIF_SOCKET})."
-    echo "  Drive it with TRANSPORTS=dpdk (the suite reads DPDK_MODE=memif):"
-    echo "    NO_PERSIST=0 TRANSPORTS=dpdk WORKLOADS=throughput THROUGHPUT_DURATION=15s \\"
+    echo "  Drive it with TRANSPORTS=dpdk (the wrapper auto-detects memif):"
+    echo "    TRANSPORTS=dpdk WORKLOADS=throughput THROUGHPUT_DURATION=15s \\"
     echo "      ./scripts/docker-bench-suite.sh"
-    echo "  NO_PERSIST=0 because the prebuilt .dpdk binaries are durable-mode."
 fi
 
 if [[ "$WITH_REPLICA" == "true" ]]; then
