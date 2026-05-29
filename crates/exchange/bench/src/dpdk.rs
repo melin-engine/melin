@@ -36,6 +36,12 @@ use crate::{
 /// frames in flight.
 const SOCKET_BUF_SIZE: usize = 65536;
 
+/// Bound the per-connection TCP handshake wait. A healthy handshake
+/// completes in milliseconds; without a bound a broken DPDK link (e.g. a
+/// memif peer that never connected, or an IP/MAC mismatch) makes the
+/// connect loop spin forever. Fail loudly instead.
+const CONNECT_TIMEOUT_SECS: u64 = 30;
+
 /// How often to refresh the smoltcp timestamp (poll iterations).
 /// During connection setup (ARP + TCP handshake), smoltcp needs
 /// advancing timestamps to drive retransmit timers. Using 1 here
@@ -394,7 +400,12 @@ pub fn run_dpdk_roundtrip(
             outcomes: OutcomeReport::default(),
         });
 
-        // Wait for TCP handshake to complete.
+        // Wait for TCP handshake to complete, bounded so a broken link
+        // fails loudly instead of spinning forever. Reuse the smoltcp
+        // timestamp the poll loop already refreshes every iteration rather
+        // than adding an Instant::now() syscall to the hot loop.
+        let handshake_deadline =
+            cached_ts + smoltcp::time::Duration::from_secs(CONNECT_TIMEOUT_SECS);
         loop {
             poll(
                 &mut device,
@@ -406,6 +417,15 @@ pub fn run_dpdk_roundtrip(
             let s = sockets.get_mut::<tcp::Socket>(handle);
             if s.state() == State::Established {
                 break;
+            }
+            if cached_ts >= handshake_deadline {
+                panic!(
+                    "client {client_id}: TCP handshake to {server_endpoint} did not \
+                     complete within {CONNECT_TIMEOUT_SECS}s (smoltcp state: {:?}). \
+                     Check the DPDK link — is the memif peer connected, and do the \
+                     server/bench DPDK IPs and MACs match?",
+                    s.state()
+                );
             }
         }
 
