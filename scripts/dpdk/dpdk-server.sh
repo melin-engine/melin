@@ -108,6 +108,7 @@ if [[ -z "$MODE" ]]; then
     fi
 fi
 
+DPDK_L3_ARGS=""
 case "$MODE" in
     mlx5)
         # Bifurcated PMD — conf provides the full EAL args (`-a <PCI>
@@ -118,6 +119,23 @@ case "$MODE" in
         fi
         DPDK_PORTS_ARG="--dpdk-ports ${DPDK_PORT}"
         if [[ "$MTU" != "1500" ]]; then DPDK_MTU_ARG="--dpdk-mtu $MTU"; fi
+        ;;
+    l3)
+        # L3 bifurcated PMD — same NIC as the kernel; rte_flow isolation
+        # plus the gateway / peer flags are MANDATORY. Without them the
+        # PMD's default RSS rule would capture every packet and SSH dies.
+        if [[ -z "$EAL_ARGS" ]]; then
+            echo "error: DPDK_MODE=l3 but DPDK_EAL_ARGS missing in $CONF" >&2
+            exit 1
+        fi
+        if [[ -z "${DPDK_GATEWAY:-}" || -z "${DPDK_GATEWAY_MAC:-}" || -z "${DPDK_PEER_IP:-}" ]]; then
+            echo "error: DPDK_MODE=l3 requires DPDK_GATEWAY, DPDK_GATEWAY_MAC and DPDK_PEER_IP in $CONF" >&2
+            echo "  Re-run: sudo DPDK_MODE=l3 DPDK_PEER_IP=<peer-pub-ip> ./scripts/dpdk/dpdk-setup.sh" >&2
+            exit 1
+        fi
+        DPDK_PORTS_ARG="--dpdk-ports ${DPDK_PORT}"
+        if [[ "$MTU" != "1500" ]]; then DPDK_MTU_ARG="--dpdk-mtu $MTU"; fi
+        DPDK_L3_ARGS="--dpdk-gateway $DPDK_GATEWAY --dpdk-gateway-mac $DPDK_GATEWAY_MAC --dpdk-peer-ip $DPDK_PEER_IP"
         ;;
     sriov)
         # VFs bound to vfio-pci. Two VFs = bonded SR-IOV; one VF = single port.
@@ -181,4 +199,5 @@ exec cargo run --release -p melin-server --features "$FEATURES" --no-default-fea
     $DPDK_PORTS_ARG \
     $DPDK_VLAN_ARG \
     $DPDK_MTU_ARG \
+    $DPDK_L3_ARGS \
     "$@"

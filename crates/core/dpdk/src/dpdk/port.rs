@@ -284,13 +284,19 @@ impl Port {
     /// mode (mlx5) to send traffic from the configured peer into DPDK
     /// while leaving everything else (SSH, ARP, other tenants) with the
     /// kernel. Must be called AFTER `start()`.
+    ///
+    /// The flow handle returned by `rte_flow_create` is intentionally
+    /// dropped — the rule lives for the lifetime of the port and is
+    /// torn down by `rte_eth_dev_stop` in `Port::drop`.
     pub fn install_src_ipv4_steering(
         &mut self,
         src_ipv4: std::net::Ipv4Addr,
     ) -> Result<(), PortError> {
-        // Convert to network byte order. rte_flow_item_ipv4 expects the
-        // 32-bit IPv4 in the same wire format as the IP header.
-        let src_be = u32::from_be_bytes(src_ipv4.octets()).to_be();
+        // `rte_flow_item_ipv4.hdr.src_addr` is a `rte_be32_t` (network
+        // byte order). Reading wire-order octets into a u32 using
+        // native-endian semantics produces the same in-memory byte
+        // layout the matcher expects on both LE and BE hosts.
+        let src_be = u32::from_ne_bytes(src_ipv4.octets());
         let mut err_type: i32 = 0;
         let ret = unsafe {
             ffi::dpdk_install_src_ipv4_steering(self.port_id, src_be, &mut err_type)
