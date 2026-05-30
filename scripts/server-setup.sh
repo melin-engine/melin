@@ -457,19 +457,66 @@ echo ""
 # 4. Journal disk (dedicated NVMe)
 # ---------------------------------------------------------------------------
 JOURNAL_MOUNT="/mnt/journal"
-# Find the second NVMe disk (not the OS disk). The OS disk has partitions;
-# the journal disk is a raw whole-disk device with no partitions.
-JOURNAL_DISK=""
-for dev in /dev/nvme*n1; do
-    # Skip unexpanded globs (no NVMe devices found).
-    [[ -e "$dev" ]] || continue
-    # Skip if it has partitions (OS disk).
-    if ls "${dev}p"* &>/dev/null; then
-        continue
+# Pick the journal disk. Order of preference:
+#   1. JOURNAL_DISK=/dev/nvmeXn1 in the environment — explicit operator pick,
+#      used for benchmarking specific drives or any host where the auto-pick
+#      doesn't match the operator's intent. Validated for block-device-ness
+#      before we use it.
+#   2. Largest unpartitioned NVMe whole-disk device. Production sizing intent
+#      is "biggest data drive available" — more NAND = more endurance budget
+#      and capacity headroom. "First unpartitioned" (the previous heuristic)
+#      was enumeration-order dependent and silently grabbed whatever the BIOS
+#      enumerated first, which on hosts with mixed M.2 + U.3 drives often
+#      picked the smaller M.2 by accident.
+# If nothing matches, JOURNAL_DISK is left empty and the conditional below
+# skips journal setup with a clear log line — same behaviour as before.
+if [[ -n "${JOURNAL_DISK:-}" ]]; then
+    if [[ ! -b "${JOURNAL_DISK}" ]]; then
+        echo "error: JOURNAL_DISK=${JOURNAL_DISK} is not a block device" >&2
+        exit 1
     fi
-    JOURNAL_DISK="$dev"
-    break
-done
+    echo "  Journal disk: ${JOURNAL_DISK} (from JOURNAL_DISK env var)"
+else
+    # Walk the NVMe whole-disks and keep the largest unpartitioned one.
+    # `blockdev --getsize64` returns bytes; we compare numerically. No
+    # subshell pipeline — keeps state in this shell so we can also report
+    # what we considered vs. picked if anyone adds debug logging later.
+    # Initialise to empty so `set -u` is happy when no NVMe matches —
+    # the existing "if [[ -n "$JOURNAL_DISK" ]]" below depends on it.
+    JOURNAL_DISK=""
+    BEST_SIZE=0
+    for dev in /dev/nvme*n1; do
+        [[ -e "$dev" ]] || continue
+        # Skip if it has partitions (OS disk).
+        ls "${dev}p"* &>/dev/null && continue
+        size=$(blockdev --getsize64 "$dev" 2>/dev/null || echo 0)
+        if (( size > BEST_SIZE )); then
+            BEST_SIZE=$size
+            JOURNAL_DISK=$dev
+        fi
+    done
+fi
+
+# Safety net for re-runs: if $JOURNAL_MOUNT is already mounted from a
+# *different* block device than the one we just selected, refuse rather
+# than silently formatting the new pick and leaving it unmounted while
+# the old disk keeps serving the journal. The most common way to hit
+# this is a host that was provisioned with the older "first
+# unpartitioned NVMe" heuristic and is now being re-deployed — the new
+# size-ranked picker chooses a different drive. Operators get an
+# explicit choice: pin JOURNAL_DISK to the existing mount to keep it,
+# or unmount + re-run to migrate.
+if [[ -n "${JOURNAL_DISK:-}" ]] && mountpoint -q "$JOURNAL_MOUNT"; then
+    current=$(findmnt -n -o SOURCE "$JOURNAL_MOUNT" || true)
+    if [[ -n "$current" && "$current" != "$JOURNAL_DISK" ]]; then
+        echo "error: $JOURNAL_MOUNT is mounted from $current but the setup picked $JOURNAL_DISK" >&2
+        echo "  This typically means a previous setup chose a different disk." >&2
+        echo "  Either:" >&2
+        echo "    - Re-run with JOURNAL_DISK=$current to keep the existing mount, or" >&2
+        echo "    - Stop the server, 'umount $JOURNAL_MOUNT', then re-run to migrate." >&2
+        exit 1
+    fi
+fi
 
 if [[ -n "$JOURNAL_DISK" ]]; then
     echo "=== Journal disk: $JOURNAL_DISK → $JOURNAL_MOUNT ==="

@@ -45,8 +45,11 @@ echo ""
 # bare-metal providers that don't expose root via SSH (latitude.sh,
 # Hetzner Robot, etc.). Relies on NOPASSWD sudo, which is the
 # default on those images.
+# Forward JOURNAL_DISK through `sudo env` rather than `sudo -E` —
+# sudo's default `env_reset` drops arbitrary caller env vars even
+# with -E, so we set them explicitly via the env(1) wrapper.
 # Use bash explicitly to avoid TTY issues with ssh -t.
-ssh "$REMOTE" "sudo -n bash /tmp/server-setup.sh"
+ssh "$REMOTE" "sudo -n env JOURNAL_DISK='${JOURNAL_DISK:-}' bash /tmp/server-setup.sh"
 
 # 3. Reboot if kernel boot params were just configured.
 NEEDS_REBOOT=$(ssh "$REMOTE" "test -f /tmp/.server-needs-reboot && echo yes || echo no")
