@@ -568,7 +568,7 @@ run_l3_setup() {
     # almost always REACHABLE. Warm it with a ping if needed.
     local gw_mac
     gw_mac=$(ip neigh show "$def_gw" dev "$DPDK_NIC" 2>/dev/null \
-        | awk '/lladdr/{print $5; exit}')
+        | awk '{for(i=1;i<NF;i++) if ($i=="lladdr") {print $(i+1); exit}}')
     if [[ -z "$gw_mac" ]]; then
         ping -c 1 -W 1 "$def_gw" >/dev/null 2>&1 || true
         gw_mac=$(ip neigh show "$def_gw" dev "$DPDK_NIC" 2>/dev/null \
