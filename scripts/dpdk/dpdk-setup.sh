@@ -527,17 +527,119 @@ EOF
 }
 
 # ---------------------------------------------------------------------------
+# L3 bifurcated path (DPDK shares the public NIC with the kernel via
+# rte_flow steering — used when the host has no dedicated L2 path to
+# its peer and must talk over its public IP via the upstream router).
+# ---------------------------------------------------------------------------
+run_l3_setup() {
+    if [[ -z "${DPDK_PEER_IP:-}" ]]; then
+        echo "error: DPDK_PEER_IP=<peer-public-ip> is required in L3 mode" >&2
+        echo "  L3 mode steers traffic from one specific source IP into DPDK;" >&2
+        echo "  everything else stays with the kernel (SSH, etc.)." >&2
+        echo "  Example: DPDK_MODE=l3 DPDK_PEER_IP=67.213.121.227 sudo $0" >&2
+        exit 1
+    fi
+
+    local def_iface def_gw
+    def_iface=$(default_route_iface)
+    def_gw=$(ip -4 route show default 2>/dev/null | awk '{print $3; exit}')
+    if [[ -z "$def_iface" || -z "$def_gw" ]]; then
+        echo "error: could not detect default route — host has no L3 path" >&2
+        exit 1
+    fi
+
+    # DPDK_NIC defaults to the default-route iface — that IS the point
+    # of L3 mode (share the public NIC with the kernel).
+    DPDK_NIC="${DPDK_NIC:-$def_iface}"
+
+    # Auto-detect local IP / prefix from the kernel netdev unless overridden.
+    if [[ -z "${DPDK_IP:-}" || "$DPDK_IP" == "auto" ]]; then
+        local cidr
+        cidr=$(ip -4 -o addr show "$DPDK_NIC" 2>/dev/null | awk '{print $4; exit}')
+        if [[ -z "$cidr" ]]; then
+            echo "error: could not read IPv4 address on $DPDK_NIC" >&2
+            exit 1
+        fi
+        DPDK_IP="$cidr"
+    fi
+
+    # Resolve the gateway MAC from the kernel's ARP cache. The kernel
+    # already maintains this for every packet to the gateway, so it's
+    # almost always REACHABLE. Warm it with a ping if needed.
+    local gw_mac
+    gw_mac=$(ip neigh show "$def_gw" dev "$DPDK_NIC" 2>/dev/null \
+        | awk '/lladdr/{print $5; exit}')
+    if [[ -z "$gw_mac" ]]; then
+        ping -c 1 -W 1 "$def_gw" >/dev/null 2>&1 || true
+        gw_mac=$(ip neigh show "$def_gw" dev "$DPDK_NIC" 2>/dev/null \
+            | awk '/lladdr/{print $5; exit}')
+    fi
+    if [[ -z "$gw_mac" ]]; then
+        echo "error: could not resolve gateway $def_gw MAC via ARP" >&2
+        exit 1
+    fi
+
+    local pci mac
+    pci=$(ethtool -i "$DPDK_NIC" 2>/dev/null | awk '/^bus-info:/{print $2}')
+    if [[ -z "$pci" ]]; then
+        echo "error: could not read PCI address for $DPDK_NIC" >&2
+        exit 1
+    fi
+    mac=$(cat "/sys/class/net/${DPDK_NIC}/address")
+
+    echo "=== DPDK L3 bifurcated mode ==="
+    echo "  NIC:          ${DPDK_NIC} (shares the public path with the kernel)"
+    echo "  PCI:          ${pci}"
+    echo "  Local IP:     ${DPDK_IP}"
+    echo "  Local MAC:    ${mac}"
+    echo "  Gateway IP:   ${def_gw}"
+    echo "  Gateway MAC:  ${gw_mac}"
+    echo "  Peer IP:      ${DPDK_PEER_IP}"
+    echo "  MTU:          ${MTU}"
+    echo ""
+
+    setup_hugepages
+
+    ip link set "${DPDK_NIC}" mtu "${MTU}"
+    ip link set "${DPDK_NIC}" up
+
+    local conf="/etc/melin-dpdk.conf"
+    cat > "$conf" <<EOF
+DPDK_IP=${DPDK_IP%%/*}
+DPDK_PREFIX=${DPDK_IP##*/}
+DPDK_PORT=0
+DPDK_MODE=l3
+DPDK_PCI=${pci}
+DPDK_NIC=${DPDK_NIC}
+DPDK_GATEWAY=${def_gw}
+DPDK_GATEWAY_MAC=${gw_mac}
+DPDK_PEER_IP=${DPDK_PEER_IP}
+HUGE_DIR=/mnt/huge_2m
+MTU=${MTU}
+DPDK_EAL_ARGS="-a ${pci} --huge-dir=/mnt/huge_2m"
+EOF
+    echo "  Config written to ${conf}"
+    echo ""
+    echo "=== Setup complete (L3 bifurcated) ==="
+}
+
+# ---------------------------------------------------------------------------
 # Dispatch
 # ---------------------------------------------------------------------------
-MODE="$(detect_mode)"
+# An explicit DPDK_MODE override always wins; otherwise auto-detect from
+# the visible kernel topology. L3 must be explicit — we won't grab the
+# public NIC without being told to.
+MODE="${DPDK_MODE:-$(detect_mode)}"
 case "$MODE" in
     sriov-bond) run_sriov_bond_setup ;;
     mlx5)       run_mlx5_setup ;;
+    l3)         run_l3_setup ;;
     *)
         echo "error: could not detect a supported DPDK topology" >&2
         echo "  Supported:" >&2
-        echo "    - LACP bond over Intel E810/i40e/ixgbe → SR-IOV path" >&2
-        echo "    - Mellanox CX-{5,6,7} on a raw port    → bifurcated PMD path" >&2
+        echo "    - LACP bond over Intel E810/i40e/ixgbe   → SR-IOV path" >&2
+        echo "    - Mellanox CX-{5,6,7} on a raw port      → bifurcated PMD path" >&2
+        echo "    - DPDK_MODE=l3 DPDK_PEER_IP=<peer>       → L3 bifurcated (public NIC)" >&2
         echo "  Observed: no bond0 and no mlx5_core netdev." >&2
         echo "  Override the bond auto-detect by setting PF0_PCI / PF1_PCI." >&2
         exit 1

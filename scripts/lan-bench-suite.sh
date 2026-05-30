@@ -1104,8 +1104,11 @@ load_dpdk_config() {
         dpdk_prefix=$(echo "$conf" | grep "^DPDK_PREFIX=" | cut -d= -f2 || true)
         mode=$(echo "$conf" | grep "^DPDK_MODE=" | cut -d= -f2 || true)
         eal_args=$(echo "$conf" | grep "^DPDK_EAL_ARGS=" | cut -d= -f2- || true)
-        local vlan_id
+        local vlan_id gateway gateway_mac peer_ip
         vlan_id=$(echo "$conf" | grep "^VLAN_ID=" | cut -d= -f2 || true)
+        gateway=$(echo "$conf" | grep "^DPDK_GATEWAY=" | cut -d= -f2 || true)
+        gateway_mac=$(echo "$conf" | grep "^DPDK_GATEWAY_MAC=" | cut -d= -f2 || true)
+        peer_ip=$(echo "$conf" | grep "^DPDK_PEER_IP=" | cut -d= -f2 || true)
         # Strip surrounding double quotes from multi-word values (mlx5
         # writes `DPDK_EAL_ARGS="…"` so `source` / `eval` consumers
         # don't misparse it; we have to undo the quoting on the
@@ -1118,6 +1121,9 @@ load_dpdk_config() {
         eval "${prefix}_DPDK_MODE=${mode:-sriov}"
         eval "${prefix}_DPDK_EAL_ARGS='${eal_args:-}'"
         eval "${prefix}_DPDK_VLAN=${vlan_id:-}"
+        eval "${prefix}_DPDK_GATEWAY=${gateway:-}"
+        eval "${prefix}_DPDK_GATEWAY_MAC=${gateway_mac:-}"
+        eval "${prefix}_DPDK_PEER_IP=${peer_ip:-}"
     fi
 }
 
@@ -1156,6 +1162,22 @@ dpdk_sriov_setup() {
         if [[ -z "${BENCH_DPDK_EAL_ARGS:-}" ]]; then
             echo "  WARN: no /etc/melin-dpdk.conf on bench host ${BENCH}." >&2
             echo "        Run: sudo DPDK_IP=<bench-dpdk-ip/cidr> ./scripts/dpdk/dpdk-setup.sh" >&2
+        fi
+        echo ""
+    elif [[ "$DPDK_MODE" == "l3" ]]; then
+        # L3 bifurcated: DPDK shares the public NIC with the kernel via
+        # rte_flow steering. Setup is fully operator-driven on each host
+        # (`DPDK_MODE=l3 DPDK_PEER_IP=<peer> dpdk-setup.sh`), so here we
+        # just load both confs and trust them.
+        DPDK_SERVER_BIN="${REPO_DIR}/target/release/melin-server"
+        load_dpdk_config "$BENCH" "BENCH"
+        echo ""
+        echo "=== DPDK L3 bifurcated mode (operator-provisioned) ==="
+        echo "  Server DPDK: IP=${SERVER_DPDK_IP}, gw=${SERVER_DPDK_GATEWAY}, peer=${SERVER_DPDK_PEER_IP}"
+        echo "  Bench DPDK:  IP=${BENCH_DPDK_IP}, gw=${BENCH_DPDK_GATEWAY}, peer=${BENCH_DPDK_PEER_IP}"
+        if [[ -z "${BENCH_DPDK_EAL_ARGS:-}" ]]; then
+            echo "  WARN: no /etc/melin-dpdk.conf on bench host ${BENCH}." >&2
+            echo "        Run: sudo DPDK_MODE=l3 DPDK_PEER_IP=<server-pub> ./scripts/dpdk/dpdk-setup.sh" >&2
         fi
         echo ""
     else
@@ -1383,11 +1405,24 @@ transport_start_dpdk() {
         vlan_arg="--dpdk-vlan ${SERVER_DPDK_VLAN}"
     fi
 
+    # L3 bifurcated mode: smoltcp talks over the public NIC, so it needs
+    # the gateway IP + MAC (for default route) and the peer IP (for the
+    # rte_flow steering rule that keeps SSH alive). No VLAN tagging.
+    local server_l3_args=""
+    local server_health_ip="${SERVER_VLAN}"
+    if [[ "$DPDK_MODE" == "l3" ]]; then
+        server_l3_args="--dpdk-gateway ${SERVER_DPDK_GATEWAY} --dpdk-gateway-mac ${SERVER_DPDK_GATEWAY_MAC} --dpdk-peer-ip ${SERVER_DPDK_PEER_IP}"
+        # No private VLAN in L3 — bind the kernel-side health endpoint
+        # to the public IP that the bench reaches via the L3 fabric.
+        server_health_ip="${SERVER_PUB}"
+        vlan_arg=""
+    fi
+
     ssh $SSH_OPTS "$SERVER" "${SUDO} pkill -x melin-server 2>/dev/null; ${SUDO} pkill -f '[m]elin-server.dpdk' 2>/dev/null; true"
     sleep 1
     ssh $SSH_OPTS "$SERVER" "${SUDO} env NO_COLOR=1 RUST_LOG=${BENCH_RUST_LOG} nohup ${DPDK_SERVER_BIN} \
             --bind 0.0.0.0:9876 \
-            --health-bind ${SERVER_VLAN}:9878 \
+            --health-bind ${server_health_ip}:9878 \
             --journal ${JOURNAL_PATH} \
             --authorized-keys ${REPO_DIR}/authorized_keys \
             --dpdk-eal-args='${server_eal}' \
@@ -1395,6 +1430,7 @@ transport_start_dpdk() {
             --dpdk-prefix-len ${SERVER_DPDK_PREFIX} \
             --dpdk-ports ${SERVER_DPDK_PORT} \
             ${vlan_arg} \
+            ${server_l3_args} \
             ${SERVER_EXTRA_ARGS:-} \
         >/tmp/melin-server.log 2>&1 </dev/null &" </dev/null
 
@@ -1410,12 +1446,15 @@ transport_start_dpdk() {
         local bench_eal
         bench_eal=$(_resolve_dpdk_eal_args "${BENCH_DPDK_EAL_ARGS:-}")
         local bench_vlan_arg=""
-        if [[ -n "${BENCH_DPDK_VLAN:-}" ]]; then
+        if [[ -n "${BENCH_DPDK_VLAN:-}" && "$DPDK_MODE" != "l3" ]]; then
             bench_vlan_arg="--dpdk-vlan ${BENCH_DPDK_VLAN}"
         fi
         BENCH_DPDK_ARGS="--dpdk-eal-args='${bench_eal}' --dpdk-ports ${BENCH_DPDK_PORT} --dpdk-core ${BENCH_DPDK_CORE} ${bench_vlan_arg}"
         if [[ -n "${BENCH_DPDK_IP:-}" ]]; then
             BENCH_DPDK_ARGS="${BENCH_DPDK_ARGS} --dpdk-ip ${BENCH_DPDK_IP} --dpdk-prefix-len ${BENCH_DPDK_PREFIX}"
+        fi
+        if [[ "$DPDK_MODE" == "l3" ]]; then
+            BENCH_DPDK_ARGS="${BENCH_DPDK_ARGS} --dpdk-gateway ${BENCH_DPDK_GATEWAY} --dpdk-gateway-mac ${BENCH_DPDK_GATEWAY_MAC} --dpdk-peer-ip ${BENCH_DPDK_PEER_IP}"
         fi
     fi
 
@@ -1423,7 +1462,12 @@ transport_start_dpdk() {
     # Health endpoint uses kernel TCP (separate from DPDK trading port),
     # so it's reachable from the bench host's kernel side. Required for
     # the bench's tick-to-trade /stats-dump fetch.
-    CURRENT_HEALTH="${SERVER_VLAN}:9878"
+    if [[ "$DPDK_MODE" == "l3" ]]; then
+        # L3 mode has no private VLAN — health binds on the public IP.
+        CURRENT_HEALTH="${SERVER_PUB}:9878"
+    else
+        CURRENT_HEALTH="${SERVER_VLAN}:9878"
+    fi
     DPDK_RAN=1
 
     perf_capture_start "dpdk"
