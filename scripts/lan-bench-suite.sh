@@ -1729,7 +1729,7 @@ workload_throughput() {
 
     if [[ "$transport" == dpdk* ]]; then
         ssh $SSH_OPTS "$BENCH" "cd ${REPO_DIR} && source ~/.cargo/env && \
-            ./target/release/melin-bench \
+            ${SUDO} ./target/release/melin-bench \
                 --addr ${CURRENT_BIND} \
                 --health-addr ${CURRENT_HEALTH} \
                 --key bench.key \
@@ -1762,7 +1762,7 @@ workload_single() {
 
     if [[ "$transport" == dpdk* ]]; then
         ssh $SSH_OPTS "$BENCH" "cd ${REPO_DIR} && source ~/.cargo/env && \
-            ./target/release/melin-bench \
+            ${SUDO} ./target/release/melin-bench \
                 --addr ${CURRENT_BIND} \
                 --health-addr ${CURRENT_HEALTH} \
                 --key bench.key \
