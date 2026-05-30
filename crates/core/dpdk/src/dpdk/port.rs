@@ -72,6 +72,45 @@ impl Port {
         vlan_id: Option<u16>,
         num_queues: u16,
     ) -> Result<Self, PortError> {
+        Self::configure_internal(port_id, mempool, vlan_id, num_queues, false)
+    }
+
+    /// Configure in bifurcated mode (mlx5): the kernel netdev keeps
+    /// ownership of the device; DPDK only receives traffic matching
+    /// rules installed with `install_src_ipv4_steering()` after start.
+    ///
+    /// Internally enables `rte_flow_isolate()` before `rte_eth_dev_configure`,
+    /// which mlx5 requires as the very first operation. Promiscuous mode
+    /// is NOT enabled in this path — the goal is to leave non-matching
+    /// traffic (SSH, ARP, etc.) with the kernel.
+    pub fn configure_bifurcated(
+        port_id: u16,
+        mempool: &Mempool,
+        vlan_id: Option<u16>,
+        num_queues: u16,
+    ) -> Result<Self, PortError> {
+        Self::configure_internal(port_id, mempool, vlan_id, num_queues, true)
+    }
+
+    fn configure_internal(
+        port_id: u16,
+        mempool: &Mempool,
+        vlan_id: Option<u16>,
+        num_queues: u16,
+        bifurcated: bool,
+    ) -> Result<Self, PortError> {
+        // For PMDs like mlx5, `rte_flow_isolate` must be called as the
+        // very first operation on the port, before `rte_eth_dev_configure`.
+        // Isolated mode means the PMD does not install any default
+        // catch-all RSS rule — DPDK only sees traffic that matches
+        // explicit rules added later via `install_src_ipv4_steering`.
+        if bifurcated {
+            let ret = unsafe { ffi::dpdk_flow_isolate(port_id) };
+            if ret != 0 {
+                return Err(PortError::FlowIsolateFailed(ret));
+            }
+            tracing::info!(port_id, "rte_flow isolated mode enabled");
+        }
         // Get port info for default RX/TX config.
         let mut dev_info: ffi::rte_eth_dev_info = unsafe { std::mem::zeroed() };
         let ret = unsafe { ffi::rte_eth_dev_info_get(port_id, &mut dev_info) };
@@ -199,9 +238,14 @@ impl Port {
 
         // Enable promiscuous mode so we receive all packets (needed for
         // ARP responses and when IP doesn't match NIC hardware filter).
-        let ret = unsafe { ffi::rte_eth_promiscuous_enable(port_id) };
-        if ret != 0 {
-            tracing::warn!(port_id, ret, "failed to enable promiscuous mode");
+        // In bifurcated mode this is harmful — promiscuous would race
+        // the kernel netdev for incoming frames. We rely entirely on
+        // explicit `rte_flow` rules to capture our traffic instead.
+        if !bifurcated {
+            let ret = unsafe { ffi::rte_eth_promiscuous_enable(port_id) };
+            if ret != 0 {
+                tracing::warn!(port_id, ret, "failed to enable promiscuous mode");
+            }
         }
 
         tracing::info!(
@@ -232,6 +276,33 @@ impl Port {
 
         tracing::info!(port_id = self.port_id, "DPDK port started");
 
+        Ok(())
+    }
+
+    /// Install a flow steering rule that captures all IPv4 packets with
+    /// the given source IPv4 address into RX queue 0. Used in bifurcated
+    /// mode (mlx5) to send traffic from the configured peer into DPDK
+    /// while leaving everything else (SSH, ARP, other tenants) with the
+    /// kernel. Must be called AFTER `start()`.
+    pub fn install_src_ipv4_steering(
+        &mut self,
+        src_ipv4: std::net::Ipv4Addr,
+    ) -> Result<(), PortError> {
+        // Convert to network byte order. rte_flow_item_ipv4 expects the
+        // 32-bit IPv4 in the same wire format as the IP header.
+        let src_be = u32::from_be_bytes(src_ipv4.octets()).to_be();
+        let mut err_type: i32 = 0;
+        let ret = unsafe {
+            ffi::dpdk_install_src_ipv4_steering(self.port_id, src_be, &mut err_type)
+        };
+        if ret != 0 {
+            return Err(PortError::FlowRuleFailed { ret, err_type });
+        }
+        tracing::info!(
+            port_id = self.port_id,
+            peer_ip = %src_ipv4,
+            "rte_flow steering rule installed (src IPv4 -> queue 0)"
+        );
         Ok(())
     }
 
@@ -268,6 +339,8 @@ pub enum PortError {
     RxQueueFailed(i32),
     TxQueueFailed(i32),
     StartFailed(i32),
+    FlowIsolateFailed(i32),
+    FlowRuleFailed { ret: i32, err_type: i32 },
 }
 
 impl std::fmt::Display for PortError {
@@ -278,6 +351,11 @@ impl std::fmt::Display for PortError {
             PortError::RxQueueFailed(c) => write!(f, "rte_eth_rx_queue_setup failed: {c}"),
             PortError::TxQueueFailed(c) => write!(f, "rte_eth_tx_queue_setup failed: {c}"),
             PortError::StartFailed(c) => write!(f, "rte_eth_dev_start failed: {c}"),
+            PortError::FlowIsolateFailed(c) => write!(f, "rte_flow_isolate failed: {c}"),
+            PortError::FlowRuleFailed { ret, err_type } => write!(
+                f,
+                "rte_flow_create failed: ret={ret} err_type={err_type}"
+            ),
         }
     }
 }

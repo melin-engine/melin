@@ -112,6 +112,19 @@ pub struct DpdkConfig {
     pub ip_addr: Ipv4Addr,
     pub prefix_len: u8,
     pub gateway: Option<Ipv4Addr>,
+    /// Peer IPv4 to capture into DPDK via an `rte_flow` steering rule.
+    /// When Some, the port is configured in bifurcated mode: kernel
+    /// keeps every packet that does NOT come from this source IP, so
+    /// the management plane (SSH, ARP, neighbor tenants) keeps working
+    /// while DPDK steals only this peer's traffic. Used for L3 setups
+    /// where the public NIC is shared with the kernel.
+    pub peer_ip: Option<Ipv4Addr>,
+    /// MAC address to seed into smoltcp's neighbor cache for the
+    /// gateway IP. Required in bifurcated L3 mode because the gateway's
+    /// ARP reply would not match our flow rule (different source IP) —
+    /// it would be eaten by the kernel. Operators source this MAC from
+    /// the kernel's existing `ip neigh` cache and pass it in.
+    pub gateway_mac: Option<[u8; 6]>,
     pub listen_port: u16,
     /// MTU for the DPDK interface. 1500 for standard Ethernet, 9000 for
     /// jumbo frames (6x fewer TCP segments, ~6x less per-segment overhead).
@@ -134,6 +147,8 @@ impl Default for DpdkConfig {
             ip_addr: Ipv4Addr::new(10, 0, 0, 1),
             prefix_len: 24,
             gateway: None,
+            peer_ip: None,
+            gateway_mac: None,
             listen_port: LISTEN_PORT,
             mtu: 1500,
             vlan_id: None,
@@ -301,12 +316,24 @@ impl DpdkShared {
         };
 
         // Configure and start all ports with N queue pairs.
+        //
+        // In bifurcated mode (peer_ip set), the port is configured with
+        // `rte_flow` isolation enabled BEFORE configure, and a steering
+        // rule is installed after start to capture the peer's traffic
+        // into DPDK queue 0. Everything else stays with the kernel.
+        let bifurcated = config.peer_ip.is_some();
         let mut ports = Vec::with_capacity(config.port_ids.len());
         let mut combined_offloads: Option<ChecksumOffloads> = None;
         for &pid in &config.port_ids {
-            let mut port =
-                Port::configure_with_vlan(pid, &mempool, config.vlan_id, config.num_queues)?;
+            let mut port = if bifurcated {
+                Port::configure_bifurcated(pid, &mempool, config.vlan_id, config.num_queues)?
+            } else {
+                Port::configure_with_vlan(pid, &mempool, config.vlan_id, config.num_queues)?
+            };
             port.start()?;
+            if let Some(peer) = config.peer_ip {
+                port.install_src_ipv4_steering(peer)?;
+            }
             combined_offloads = Some(match combined_offloads {
                 None => port.offloads,
                 Some(prev) => prev.intersect(port.offloads),
@@ -415,7 +442,7 @@ impl DpdkTransport {
             "DPDK transport initialized"
         );
 
-        Ok(DpdkTransport {
+        let mut transport = DpdkTransport {
             _shared: Arc::clone(shared),
             device,
             iface,
@@ -436,7 +463,18 @@ impl DpdkTransport {
             cached_timestamp: now,
             poll_count: 0,
             pending_tx_bytes: 0,
-        })
+        };
+
+        // In bifurcated L3 mode, ARP for the gateway would not match our
+        // src-IP flow rule, so the gateway's ARP reply lands in the
+        // kernel instead of smoltcp. Seed the gateway MAC statically
+        // (operators source it from `ip neigh` on the host) so smoltcp
+        // can route its first outbound packet without needing ARP.
+        if let (Some(gw), Some(gw_mac)) = (config.gateway, config.gateway_mac) {
+            transport.seed_neighbor(gw, gw_mac);
+        }
+
+        Ok(transport)
     }
 
     /// Like `from_shared` but overrides the listen port.

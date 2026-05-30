@@ -110,6 +110,10 @@ fn generate_bindings() {
             uint64_t dpdk_eth_rss_ip(void);\n\
             uint64_t dpdk_eth_rss_tcp(void);\n\
             uint64_t dpdk_eth_mq_rx_rss(void);\n\
+            int dpdk_flow_isolate(uint16_t port_id);\n\
+            int dpdk_install_src_ipv4_steering(uint16_t port_id,\n\
+                                                uint32_t src_ipv4_be,\n\
+                                                int *err_type);\n\
             ",
         )
         .clang_args(&include_args)
@@ -158,6 +162,9 @@ fn generate_bindings() {
         .allowlist_function("dpdk_eth_rss_ip")
         .allowlist_function("dpdk_eth_rss_tcp")
         .allowlist_function("dpdk_eth_mq_rx_rss")
+        // rte_flow steering for bifurcated PMD mode.
+        .allowlist_function("dpdk_flow_isolate")
+        .allowlist_function("dpdk_install_src_ipv4_steering")
         // Types.
         .allowlist_type("rte_mbuf")
         .allowlist_type("rte_mempool")
