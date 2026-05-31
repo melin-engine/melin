@@ -1391,6 +1391,70 @@ mod tests {
             .expect("control-anchor snapshot must bypass the chain-hash cross-check");
     }
 
+    /// Multi-segment variant of the chain-hash mismatch check: the
+    /// snapshot anchor sits in a sealed archive (not the live
+    /// segment), so the cross-check must fire from inside the
+    /// archive-walking loop in `recover_inner` and propagate via `?`
+    /// out of the loop. Companion to the single-segment negative test
+    /// above — proves the second call site of `replay_segment` is
+    /// wired correctly and that later archives / the live segment
+    /// aren't walked once the mismatch is hit.
+    #[cfg(feature = "hash-chain")]
+    #[test]
+    fn recover_from_snapshot_rejects_chain_hash_mismatch_in_archive() {
+        // Keep both segments free of Checkpoint control entries so
+        // the snapshot anchor is guaranteed to land on an app event
+        // (the cross-check is app-event-only).
+        let _ckpt_guard = melin_journal::test_utils::CheckpointIntervalOverrideGuard::new(1000);
+
+        let dir = tempfile::tempdir().unwrap();
+        let journal_path = dir.path().join("journal.bin");
+        let snap_path = dir.path().join("snap.bin");
+
+        let phase_a = [TestEvent::Add(1), TestEvent::Add(2)];
+        let phase_b = [TestEvent::Add(10), TestEvent::Add(20)];
+
+        // Phase A: 2 events at seqs 2,3 (Genesis at seq 1); snapshot
+        // anchors at seq 3 — the last event before rotation, which
+        // ends up inside archive 000001 after the rotate below.
+        let ja = TestApp_::create(TestApp::new(), &journal_path).unwrap();
+        let mut ja = append_events(ja, &phase_a, 1);
+        ja.save_snapshot(&snap_path).unwrap();
+        ja.rotate_segment().unwrap();
+        // Phase B lives in the new live segment; recovery must not
+        // reach it once the archive's mismatch is detected.
+        let ja = append_events(ja, &phase_b, 1 + phase_a.len() as u64);
+        drop(ja);
+
+        // Round-trip the snapshot with a deliberately wrong chain hash
+        // at the same anchor sequence.
+        let (loaded_app, snap_seq, real_hash) =
+            snapshot::load::<TestApp>(&snap_path).unwrap();
+        assert_ne!(
+            real_hash, [0u8; 32],
+            "hash-chain feature must produce a non-sentinel hash for this test"
+        );
+        let bad_hash = [0xAA; 32];
+        snapshot::save::<TestApp>(&loaded_app, snap_seq, bad_hash, &snap_path).unwrap();
+
+        let err = match TestApp_::recover_from_snapshot(&snap_path, &journal_path) {
+            Ok(_) => panic!("expected recovery to reject archived chain-hash mismatch"),
+            Err(e) => e,
+        };
+        match err {
+            JournaledAppError::SnapshotChainMismatch {
+                snap_sequence,
+                expected_chain_hash,
+                actual_chain_hash,
+            } => {
+                assert_eq!(snap_sequence, snap_seq);
+                assert_eq!(expected_chain_hash, bad_hash);
+                assert_eq!(actual_chain_hash, real_hash);
+            }
+            other => panic!("expected SnapshotChainMismatch, got {other:?}"),
+        }
+    }
+
     /// Exhaustive crash simulation: truncate the journal at every byte
     /// from the file header through the valid-data end, and verify
     /// recovery succeeds at each cut. After each recovery, append one
