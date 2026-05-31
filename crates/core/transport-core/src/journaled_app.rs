@@ -1328,8 +1328,7 @@ mod tests {
         // sequence but a deliberately wrong chain hash. The journal
         // itself is unchanged, so recovery should compute the original
         // chain hash at the anchor sequence and detect the mismatch.
-        let (loaded_app, snap_seq, real_hash) =
-            snapshot::load::<TestApp>(&snap_path).unwrap();
+        let (loaded_app, snap_seq, real_hash) = snapshot::load::<TestApp>(&snap_path).unwrap();
         assert_ne!(
             real_hash, [0u8; 32],
             "hash-chain feature must produce a non-sentinel hash for this test"
@@ -1428,8 +1427,7 @@ mod tests {
 
         // Round-trip the snapshot with a deliberately wrong chain hash
         // at the same anchor sequence.
-        let (loaded_app, snap_seq, real_hash) =
-            snapshot::load::<TestApp>(&snap_path).unwrap();
+        let (loaded_app, snap_seq, real_hash) = snapshot::load::<TestApp>(&snap_path).unwrap();
         assert_ne!(
             real_hash, [0u8; 32],
             "hash-chain feature must produce a non-sentinel hash for this test"
