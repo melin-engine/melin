@@ -1355,6 +1355,42 @@ mod tests {
         }
     }
 
+    /// Documents the app-event-only design of the chain-hash cross-
+    /// check: a snapshot anchored on a Checkpoint (or GenesisHash)
+    /// control entry is silently accepted even when its recorded chain
+    /// hash is wrong, because the reader processes those entries
+    /// internally and never surfaces them to `replay_segment`. The
+    /// roadmap notes this gap is acceptable in practice — tightening
+    /// the check to cover control-entry anchors (by exposing the
+    /// reader's chain hash at control boundaries) will need to flip
+    /// this test.
+    #[cfg(feature = "hash-chain")]
+    #[test]
+    fn recover_from_snapshot_skips_chain_check_at_control_anchor() {
+        // 3-event Checkpoint cadence: a Checkpoint lands at seq 5 in
+        // a fresh journal (1=Genesis, 2,3,4=events, 5=Checkpoint).
+        let _ckpt_guard = melin_journal::test_utils::CheckpointIntervalOverrideGuard::new(3);
+
+        let dir = tempfile::tempdir().unwrap();
+        let journal_path = dir.path().join("journal.bin");
+        let snap_path = dir.path().join("snap.bin");
+
+        let events = [TestEvent::Add(1), TestEvent::Add(2), TestEvent::Add(3)];
+        let ja = TestApp_::create(TestApp::new(), &journal_path).unwrap();
+        let ja = append_events(ja, &events, 1);
+        drop(ja);
+
+        // Forge a snapshot anchored at the Checkpoint seq (5) with a
+        // deliberately wrong chain hash. The snapshot's app state is
+        // immaterial here — the point is that the chain-hash cross-
+        // check does not fire for control-entry anchors, so recovery
+        // must succeed despite the bad hash.
+        snapshot::save::<TestApp>(&TestApp::new(), 5, [0xFF; 32], &snap_path).unwrap();
+
+        let _recovered = TestApp_::recover_from_snapshot(&snap_path, &journal_path)
+            .expect("control-anchor snapshot must bypass the chain-hash cross-check");
+    }
+
     /// Exhaustive crash simulation: truncate the journal at every byte
     /// from the file header through the valid-data end, and verify
     /// recovery succeeds at each cut. After each recovery, append one
