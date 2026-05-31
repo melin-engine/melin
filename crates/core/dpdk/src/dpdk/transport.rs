@@ -325,11 +325,8 @@ impl DpdkShared {
         let mut ports = Vec::with_capacity(config.port_ids.len());
         let mut combined_offloads: Option<ChecksumOffloads> = None;
         for &pid in &config.port_ids {
-            let mut port = if bifurcated {
-                Port::configure_bifurcated(pid, &mempool, config.vlan_id, config.num_queues)?
-            } else {
-                Port::configure_with_vlan(pid, &mempool, config.vlan_id, config.num_queues)?
-            };
+            let mut port =
+                Port::configure(pid, &mempool, config.vlan_id, config.num_queues, bifurcated)?;
             port.start()?;
             if let Some(peer) = config.peer_ip {
                 port.install_src_ipv4_steering(peer)?;

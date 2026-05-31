@@ -53,46 +53,22 @@ pub struct Port {
 }
 
 impl Port {
-    /// Configure a DPDK port with the given number of RX/TX queue pairs.
+    /// Configure a DPDK port with N RX/TX queue pairs.
     ///
     /// `port_id` is the DPDK port index (typically 0 for the first NIC
     /// bound to DPDK). `mempool` provides the mbuf pool for RX DMA.
     /// `vlan_id` enables hardware VLAN strip (RX) and insert (TX) for
     /// dedicated NIC mode where the kernel isn't handling VLAN tags.
-    /// When `num_queues > 1`, RSS (Receive Side Scaling) is enabled to
-    /// distribute TCP/IP flows across RX queues.
-    pub fn configure(port_id: u16, mempool: &Mempool) -> Result<Self, PortError> {
-        Self::configure_with_vlan(port_id, mempool, None, 1)
-    }
-
-    /// Configure with optional VLAN hardware offload and N queue pairs.
-    pub fn configure_with_vlan(
-        port_id: u16,
-        mempool: &Mempool,
-        vlan_id: Option<u16>,
-        num_queues: u16,
-    ) -> Result<Self, PortError> {
-        Self::configure_internal(port_id, mempool, vlan_id, num_queues, false)
-    }
-
-    /// Configure in bifurcated mode (mlx5): the kernel netdev keeps
-    /// ownership of the device; DPDK only receives traffic matching
-    /// rules installed with `install_src_ipv4_steering()` after start.
+    /// When `num_queues > 1`, RSS distributes TCP/IP flows across RX
+    /// queues.
     ///
-    /// Internally enables `rte_flow_isolate()` before `rte_eth_dev_configure`,
-    /// which mlx5 requires as the very first operation. Promiscuous mode
-    /// is NOT enabled in this path — the goal is to leave non-matching
-    /// traffic (SSH, ARP, etc.) with the kernel.
-    pub fn configure_bifurcated(
-        port_id: u16,
-        mempool: &Mempool,
-        vlan_id: Option<u16>,
-        num_queues: u16,
-    ) -> Result<Self, PortError> {
-        Self::configure_internal(port_id, mempool, vlan_id, num_queues, true)
-    }
-
-    fn configure_internal(
+    /// When `bifurcated` is true the PMD opens in isolated mode (mlx5
+    /// requires `rte_flow_isolate()` as the very first operation), the
+    /// kernel netdev keeps ownership of the device, and promiscuous
+    /// mode is left off — the caller is then responsible for installing
+    /// explicit steering rules via `install_src_ipv4_steering()` after
+    /// `start()`. Non-matching traffic stays with the kernel.
+    pub fn configure(
         port_id: u16,
         mempool: &Mempool,
         vlan_id: Option<u16>,
