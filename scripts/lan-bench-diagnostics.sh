@@ -1,4 +1,15 @@
 #!/usr/bin/env bash
+###############################################################################
+# ⚠  UNMAINTAINED — DOES NOT CURRENTLY RUN  ⚠
+#
+# This wrapper is NO LONGER MAINTAINED. It invokes lan-bench.sh, which has
+# been removed, so it will fail if run as-is. The maintained benchmark path
+# is lan-bench-suite.sh (or docker-bench-suite.sh for containers).
+#
+# It is kept ONLY in case the per-run diagnostic capture below is needed
+# again later. If you revive it, repoint the invocation at lan-bench-suite.sh.
+###############################################################################
+#
 # Run a LAN benchmark while capturing system diagnostics to help identify
 # the source of tail latency spikes.
 #
@@ -32,6 +43,16 @@
 #   Results and diagnostics saved to /tmp/lan-bench-latency-<timestamp>/
 
 set -euo pipefail
+
+# Loud runtime notice — this script is unmaintained (see header banner).
+# Printed to stderr so it surfaces even if stdout is redirected/quiet.
+cat >&2 <<'UNMAINTAINED'
+###############################################################################
+# WARNING: lan-bench-diagnostics.sh is UNMAINTAINED and likely broken — it
+# wraps lan-bench.sh, which has been removed. Maintained path: lan-bench-suite.sh
+# (or docker-bench-suite.sh for containers). Kept only for possible later revival.
+###############################################################################
+UNMAINTAINED
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DIAG_TARGET="${DIAG_TARGET:-server}"
