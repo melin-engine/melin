@@ -256,14 +256,19 @@ JournaledExchange::recover(journal_path):
 
 ```
 JournaledExchange::recover_from_snapshot(snapshot_path, journal_path):
-  1. Load snapshot → (Exchange state, snapshot_sequence).
+  1. Load snapshot → (Exchange state, snapshot_sequence, snapshot_chain_hash).
   2. Open journal, validate header.
   3. Read entries sequentially. Skip all entries with sequence <= snapshot_sequence.
-  4. Replay only entries after the snapshot.
-  5. Truncate and reopen writer as above.
+  4. At the snapshot's anchor sequence, verify the journal's chain hash at
+     that point matches the snapshot's recorded chain hash. Mismatch aborts
+     recovery before any post-snapshot events are replayed.
+  5. Replay only entries after the snapshot.
+  6. Truncate and reopen writer as above.
 ```
 
 This avoids replaying the entire journal from genesis. Recovery time is proportional to the journal tail length (events since last snapshot), not total history.
+
+The chain-hash cross-check at the anchor sequence ensures the snapshot and the journal share the same history: it rejects a snapshot paired with another cluster's journal, a divergent history, or a journal whose entries up to the anchor were tampered with. Coverage is uniform — the check fires whether the anchor lands on an ordinary event, the per-segment genesis entry, or an auto-emitted checkpoint.
 
 ## Snapshots
 
@@ -339,6 +344,7 @@ Every v6 journal maintains a running BLAKE3 hash chain for tamper evidence and r
 - **Tampered entries** — modifying any byte in any entry breaks the chain at the next checkpoint.
 - **Reordered entries** — entries hashed in a different order produce a different chain hash.
 - **Replica divergence** — a replica replaying events can compare checkpoint hashes to prove it processed the same events in the same order.
+- **Snapshot/journal mismatch** — at recovery from a snapshot, the journal's computed chain hash at the snapshot's anchor sequence must match the hash the snapshot recorded. Mismatch rejects the pair before any state is restored, catching snapshots paired with the wrong cluster's journal, divergent histories, or pre-anchor tampering.
 
 ### What It Does NOT Detect
 
