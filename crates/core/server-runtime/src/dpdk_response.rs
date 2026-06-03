@@ -218,7 +218,9 @@ pub fn run<A: Application>(
                     active_mode = next;
                     policy = active_mode.to_policy();
                     cached_durable_pos = 0;
-                    degraded_logger = crate::response::DegradationLogger::new(Instant::now());
+                    // Flush accrual before re-seeding so pre-swap degraded
+                    // time isn't dropped.
+                    degraded_logger.reseed(&utilization, Instant::now());
                 }
                 None => {
                     tracing::error!(
@@ -357,6 +359,10 @@ pub fn run<A: Application>(
                 gate_tracker = crate::response::GateCrossTracker::new(needed);
             }
             if cached_durable_pos < needed {
+                // Periodic accrual ticks during a long wedge so the
+                // degraded-duration counter keeps advancing while the gate
+                // is stalled. See `response::run` for the rationale.
+                let mut gate_accrual_timer = AmortizedTimer::new();
                 loop {
                     // Observe a mode swap mid-gate-wait so a stuck
                     // batch can be unblocked by an operator
@@ -373,7 +379,9 @@ pub fn run<A: Application>(
                         );
                         active_mode = next;
                         policy = active_mode.to_policy();
-                        degraded_logger = crate::response::DegradationLogger::new(Instant::now());
+                        // Flush accrual before re-seeding so the wedged-
+                        // degraded interval up to the swap isn't dropped.
+                        degraded_logger.reseed(&utilization, Instant::now());
                     }
 
                     let journal_pos = journal_persisted_wire_seq.load(Ordering::Acquire);
@@ -395,6 +403,23 @@ pub fn run<A: Application>(
                     utilization
                         .policy_degraded
                         .store(status.degraded, Ordering::Relaxed);
+
+                    // Accrue degraded time while wedged so a mid-wedge
+                    // flip isn't mis-charged by the post-gate tick.
+                    // Amortized to ~1 Hz; this loop always spins.
+                    if gate_accrual_timer
+                        .tick(POLICY_CHECK_INTERVAL, true)
+                        .is_some()
+                    {
+                        degraded_logger.tick(
+                            &policy,
+                            &utilization,
+                            status.degraded,
+                            Instant::now(),
+                            DEGRADED_LOG_INTERVAL,
+                        );
+                    }
+
                     if cached_durable_pos >= needed {
                         // Attribution: which subsystem was slowest. See
                         // response.rs for the rationale.

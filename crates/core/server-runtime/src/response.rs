@@ -23,6 +23,7 @@ use melin_pipeline::ring;
 use crate::durability_policy::{CursorView, DurabilityMode, EvalStatus, Policy};
 use crate::replication::ReplicationMetrics;
 use melin_app::Application;
+use melin_app::amortized_timer::AmortizedTimer;
 use melin_transport_core::pipeline::{OutputPayload, OutputSlot, StageUtilization};
 #[cfg(feature = "latency-trace")]
 use melin_transport_core::trace;
@@ -300,8 +301,9 @@ pub fn run<A: Application>(
                     // Re-seed the degradation logger so a transition
                     // out of (or into) degraded under the new policy
                     // surfaces immediately rather than waiting for the
-                    // sustained-state hold to roll over.
-                    degraded_logger = DegradationLogger::new(Instant::now());
+                    // sustained-state hold to roll over. Flushes accrual
+                    // first so pre-swap degraded time isn't dropped.
+                    degraded_logger.reseed(&utilization, Instant::now());
                 }
                 None => {
                     tracing::error!(
@@ -522,6 +524,12 @@ pub fn run<A: Application>(
             // inversion vs. a strict-gate world).
             let needs_gate = batch[..count].iter().any(|s| !s.durability_bypass);
             if needs_gate && cached_durable_pos < needed {
+                // Drives periodic accrual ticks during a long wedge so
+                // the degraded-duration counter keeps advancing while the
+                // gate is stalled (the spin doesn't otherwise tick the
+                // logger). Amortized to ~1 Hz; fresh per gate-wait entry,
+                // so the first interval is captured by the post-gate tick.
+                let mut gate_accrual_timer = AmortizedTimer::new();
                 loop {
                     // Inside the gate-wait spin loop, also observe a
                     // mode swap. Without this, a batch whose gate
@@ -544,7 +552,9 @@ pub fn run<A: Application>(
                         );
                         active_mode = next;
                         policy = active_mode.to_policy();
-                        degraded_logger = DegradationLogger::new(Instant::now());
+                        // Flush accrual before re-seeding so the wedged-
+                        // degraded interval up to the swap isn't dropped.
+                        degraded_logger.reseed(&utilization, Instant::now());
                     }
 
                     let journal_pos = journal_persisted_wire_seq.load(Ordering::Acquire);
@@ -560,6 +570,25 @@ pub fn run<A: Application>(
                     utilization
                         .policy_degraded
                         .store(status.degraded, Ordering::Relaxed);
+
+                    // Accrue degraded time while wedged. The post-gate
+                    // tick attributes the whole wait to a single state, so
+                    // without this a healthy→degraded flip during the
+                    // wedge would be mis-charged. Amortized: `true` because
+                    // this loop always spins (never yields), so the clock
+                    // read lands ~once per second, not per iteration.
+                    if gate_accrual_timer
+                        .tick(POLICY_CHECK_INTERVAL, true)
+                        .is_some()
+                    {
+                        degraded_logger.tick(
+                            &policy,
+                            &utilization,
+                            status.degraded,
+                            Instant::now(),
+                            DEGRADED_LOG_INTERVAL,
+                        );
+                    }
 
                     if cached_durable_pos >= needed {
                         // Attribution: which subsystem was slowest at
@@ -1001,6 +1030,46 @@ impl DegradationLogger {
         }
     }
 
+    /// Charge the interval `[last_tick, now]` to the degraded-duration
+    /// counter when `prev_degraded` (the state observed at the previous
+    /// tick) was degraded, then advance `last_tick`. Drives the
+    /// `_seconds_total` counter so `rate()` reflects time-in-degraded
+    /// continuously, even mid-incident, rather than only stepping on
+    /// recovery. Shared by [`Self::tick`] and [`Self::reseed`] so accrual
+    /// is never skipped on a logger lifecycle boundary.
+    #[inline]
+    fn accrue(&mut self, utilization: &StageUtilization, prev_degraded: bool, now: Instant) {
+        if prev_degraded {
+            // `duration_since` saturates to zero when `now < last_tick`;
+            // `now` is always >= `last_tick` here (single-thread monotonic
+            // clock), matching the plain `duration_since` used elsewhere
+            // in this file.
+            let elapsed = now.duration_since(self.last_tick);
+            // `as_nanos()` is u128; one inter-tick interval is sub-second
+            // to a few seconds, far below the u64 nanos ceiling (~584
+            // years), so the cast can't truncate. See the field doc on
+            // `StageUtilization::policy_degraded_nanos`.
+            utilization
+                .policy_degraded_nanos
+                .fetch_add(elapsed.as_nanos() as u64, Ordering::Relaxed);
+        }
+        self.last_tick = now;
+    }
+
+    /// Flush in-flight degraded accrual up to `now`, then reset to a
+    /// fresh healthy-start logger. Called on a runtime durability-mode
+    /// swap, which is a logger lifecycle boundary: without flushing
+    /// first, the pre-swap degraded interval — on the gate-wait path the
+    /// entire wedge — would be silently dropped. The new policy's actual
+    /// degraded state is re-derived by the next `tick`, so the brief
+    /// swap-to-next-tick window is attributed healthy; that residual is
+    /// bounded by one tick interval, the counter's inherent granularity.
+    pub(crate) fn reseed(&mut self, utilization: &StageUtilization, now: Instant) {
+        let prev_state = self.pending_state;
+        self.accrue(utilization, prev_state, now);
+        *self = Self::new(now);
+    }
+
     /// Update the gauge + emit transition/heartbeat logs as needed.
     /// Cheap on the hot path: one atomic store, a few branches, one
     /// `Instant::duration_since`.
@@ -1012,22 +1081,12 @@ impl DegradationLogger {
         now: Instant,
         heartbeat_interval: Duration,
     ) {
-        // Accumulate the just-elapsed interval against the state observed
-        // at the *previous* tick — `pending_state` still holds it here,
-        // before any update below. This drives the `_seconds_total`
-        // counter so `rate()` reflects time-in-degraded continuously,
-        // even mid-incident, rather than only stepping on recovery.
-        // A logger re-seed on a runtime mode swap resets `last_tick`,
-        // rebasing accrual to the swap instant so pre-swap time isn't
-        // re-counted. `saturating_duration_since` is belt-and-suspenders:
-        // `now` is always >= `last_tick` here, so it never underflows.
-        if self.pending_state {
-            let elapsed = now.saturating_duration_since(self.last_tick);
-            utilization
-                .policy_degraded_nanos
-                .fetch_add(elapsed.as_nanos() as u64, Ordering::Relaxed);
-        }
-        self.last_tick = now;
+        // Charge the just-elapsed interval to the state observed at the
+        // *previous* tick. Snapshot it up front, before the flap-hold
+        // bookkeeping below mutates `pending_state`, so accrual stays
+        // correct even if that block is later reordered.
+        let prev_state = self.pending_state;
+        self.accrue(utilization, prev_state, now);
 
         utilization
             .policy_degraded
@@ -1817,6 +1876,101 @@ mod tests {
         assert_eq!(
             utilization.policy_degraded_nanos.load(Ordering::Relaxed),
             Duration::from_secs(1).as_nanos() as u64
+        );
+    }
+
+    #[test]
+    fn logger_reseed_flushes_in_flight_degraded_accrual() {
+        // A runtime mode swap re-seeds the logger. On the gate-wait path
+        // the swap can land after many seconds of wedged-degraded time
+        // with no intervening tick, so `reseed` must flush that interval
+        // before resetting — otherwise the whole wedge is silently lost,
+        // which is exactly the incident the metric exists to measure.
+        let p = logger_test_policy();
+        let utilization = StageUtilization::new();
+        let start = Instant::now();
+        let sec = Duration::from_secs(1);
+
+        let mut logger = DegradationLogger::new_starting_degraded(start, &p);
+        logger.tick(&p, &utilization, true, start, Duration::from_secs(5));
+        assert_eq!(utilization.policy_degraded_nanos.load(Ordering::Relaxed), 0);
+
+        // 30s wedged-degraded with no tick (frozen spin), then swap.
+        logger.reseed(&utilization, start + 30 * sec);
+        assert_eq!(
+            utilization.policy_degraded_nanos.load(Ordering::Relaxed),
+            30 * sec.as_nanos() as u64
+        );
+
+        // Post-reseed the logger is healthy-start; a healthy interval
+        // does not accrue, and `last_tick` was rebased to the swap so
+        // the next interval isn't double-counted.
+        logger.tick(
+            &p,
+            &utilization,
+            false,
+            start + 31 * sec,
+            Duration::from_secs(5),
+        );
+        assert_eq!(
+            utilization.policy_degraded_nanos.load(Ordering::Relaxed),
+            30 * sec.as_nanos() as u64
+        );
+    }
+
+    #[test]
+    fn logger_starting_degraded_then_first_tick_healthy_counts_construction_interval() {
+        // `new_starting_degraded` seeds the degraded state, so the
+        // construction→first-tick interval is attributed degraded even
+        // when the first observed state is already healthy (the cluster
+        // recovered before the first tick). Locks this intentional edge.
+        let p = logger_test_policy();
+        let utilization = StageUtilization::new();
+        let start = Instant::now();
+        let mut logger = DegradationLogger::new_starting_degraded(start, &p);
+
+        logger.tick(
+            &p,
+            &utilization,
+            false,
+            start + Duration::from_secs(2),
+            Duration::from_secs(5),
+        );
+        assert_eq!(
+            utilization.policy_degraded_nanos.load(Ordering::Relaxed),
+            Duration::from_secs(2).as_nanos() as u64
+        );
+    }
+
+    #[test]
+    fn logger_counter_matches_total_degraded_time_across_flaps() {
+        // The cumulative counter must equal exactly the wall time spent
+        // in degraded states across a flap sequence — the guarantee
+        // `rate(...degraded_seconds_total)` dashboards depend on.
+        let p = logger_test_policy();
+        let utilization = StageUtilization::new();
+        let start = Instant::now();
+        let step = Duration::from_millis(500);
+        let mut logger = DegradationLogger::new(start);
+
+        // State observed at tick i (fired at start + i*step). The state
+        // set at tick i holds over [tick i, tick i+1], so degraded wall
+        // time = the spans where the *prior* tick's state was true:
+        // [t1,t2], [t2,t3], [t4,t5] = 3 * step.
+        let states = [false, true, true, false, true, false];
+        for (i, &s) in states.iter().enumerate() {
+            logger.tick(
+                &p,
+                &utilization,
+                s,
+                start + step * i as u32,
+                Duration::from_secs(5),
+            );
+        }
+
+        assert_eq!(
+            utilization.policy_degraded_nanos.load(Ordering::Relaxed),
+            (3 * step).as_nanos() as u64
         );
     }
 
