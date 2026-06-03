@@ -249,7 +249,10 @@ normal-case post-recovery state.
   degradation shorter than that interval on a quiet venue may not be
   resolved. Use `rate(melin_durability_policy_degraded_seconds_total[5m])`
   for the fraction of the last 5 minutes spent degraded, without scraping
-  the gauge at high frequency to reconstruct intervals.
+  the gauge at high frequency to reconstruct intervals. The accumulator
+  resets to zero on process restart (standard Prometheus counter
+  semantics — `rate()`/`increase()` handle resets); cumulative degraded
+  time across a restart is not retained.
 - A warn-level log fires on transition into the degraded state and
   every 5 seconds while it persists; an info-level log fires on
   return to target.

@@ -179,6 +179,9 @@ pub fn run<A: Application>(
     let mut idle_spins: u32 = 0;
     let mut busy_count: u64 = 0;
     let mut idle_count: u64 = 0;
+    // Paces accrual ticks inside the gate-wait spin. Function-scoped so
+    // the normal gated path pays no extra clock read — see `response::run`.
+    let mut gate_accrual_timer = AmortizedTimer::new();
 
     // Stage histograms — mirror the TCP response stage but without
     // an `egress` histogram. DPDK egress lives in the poll thread
@@ -359,10 +362,6 @@ pub fn run<A: Application>(
                 gate_tracker = crate::response::GateCrossTracker::new(needed);
             }
             if cached_durable_pos < needed {
-                // Periodic accrual ticks during a long wedge so the
-                // degraded-duration counter keeps advancing while the gate
-                // is stalled. See `response::run` for the rationale.
-                let mut gate_accrual_timer = AmortizedTimer::new();
                 loop {
                     // Observe a mode swap mid-gate-wait so a stuck
                     // batch can be unblocked by an operator

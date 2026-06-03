@@ -274,6 +274,14 @@ pub fn run<A: Application>(
     let mut busy_count: u64 = 0;
     let mut idle_count: u64 = 0;
 
+    // Paces accrual ticks inside the durability gate-wait spin so the
+    // degraded-duration counter keeps advancing during a hard stall.
+    // Declared once at function scope (not per gate entry) so the normal
+    // gated path — entered briefly whenever durability lags by a few µs —
+    // pays no extra `Instant::now()`; the amortized mask only reads the
+    // clock once per ~1 M cumulative spin iterations.
+    let mut gate_accrual_timer = AmortizedTimer::new();
+
     loop {
         // Observe runtime mode swaps from the admin `DURABILITY`
         // command. Relaxed load (single writer is the admin handler,
@@ -524,12 +532,6 @@ pub fn run<A: Application>(
             // inversion vs. a strict-gate world).
             let needs_gate = batch[..count].iter().any(|s| !s.durability_bypass);
             if needs_gate && cached_durable_pos < needed {
-                // Drives periodic accrual ticks during a long wedge so
-                // the degraded-duration counter keeps advancing while the
-                // gate is stalled (the spin doesn't otherwise tick the
-                // logger). Amortized to ~1 Hz; fresh per gate-wait entry,
-                // so the first interval is captured by the post-gate tick.
-                let mut gate_accrual_timer = AmortizedTimer::new();
                 loop {
                     // Inside the gate-wait spin loop, also observe a
                     // mode swap. Without this, a batch whose gate
