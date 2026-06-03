@@ -190,6 +190,17 @@ pub fn run<A: Application>(
     /// gauge / warn-log reflecting it. Cheap (a handful of atomic
     /// loads + the policy evaluator) at this rate.
     const POLICY_CHECK_INTERVAL: Duration = Duration::from_secs(1);
+    /// Cadence at which the gate-wait spin folds elapsed time into the
+    /// degraded-duration counter while the durability gate is stalled.
+    /// Tighter than the idle cadence — it bounds the boundary error when
+    /// a degradation begins or flips mid-wedge, which matters most for
+    /// short stalls. The accrual tick is gated by this period, but the
+    /// clock read behind it is gated by the `AmortizedTimer` mask, so the
+    /// effective resolution is `max(this, the mask's clock-read cadence)`.
+    /// With the default mask (~50–100 ms between reads at this spin's
+    /// rate) the 10 ms here is currently clamped to that floor; lowering
+    /// `AmortizedTimer::CHECK_MASK` realizes the full resolution.
+    const GATE_ACCRUAL_INTERVAL: Duration = Duration::from_millis(10);
 
     // Initial evaluation so the cached durable position and the
     // `/healthz` gauge reflect the cluster's startup shape before
@@ -576,11 +587,12 @@ pub fn run<A: Application>(
                     // Accrue degraded time while wedged. The post-gate
                     // tick attributes the whole wait to a single state, so
                     // without this a healthy→degraded flip during the
-                    // wedge would be mis-charged. Amortized: `true` because
-                    // this loop always spins (never yields), so the clock
-                    // read lands ~once per second, not per iteration.
+                    // wedge would be mis-charged. `spinning = true`: this
+                    // loop always spins (never yields), so the clock read
+                    // behind the tick is mask-gated, landing only every
+                    // ~1 M iterations regardless of the period below.
                     if gate_accrual_timer
-                        .tick(POLICY_CHECK_INTERVAL, true)
+                        .tick(GATE_ACCRUAL_INTERVAL, true)
                         .is_some()
                     {
                         degraded_logger.tick(

@@ -244,8 +244,8 @@ normal-case post-recovery state.
   current cluster shape, `0` otherwise. Alert on sustained `1`.
 - `melin_durability_policy_degraded_seconds_total` (Prometheus counter)
   — cumulative seconds spent in the degraded state. Advances on each
-  policy evaluation (per response batch under load, and roughly once a
-  second while idle or while the durability gate is stalled), so a
+  policy evaluation (per response batch under load, sub-second while the
+  durability gate is stalled, and roughly once a second while idle), so a
   degradation shorter than that interval on a quiet venue may not be
   resolved. Use `rate(melin_durability_policy_degraded_seconds_total[5m])`
   for the fraction of the last 5 minutes spent degraded, without scraping

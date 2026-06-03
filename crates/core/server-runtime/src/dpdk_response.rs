@@ -143,6 +143,10 @@ pub fn run<A: Application>(
     let mut last_policy_check = startup_now;
     const DEGRADED_LOG_INTERVAL: Duration = Duration::from_secs(5);
     const POLICY_CHECK_INTERVAL: Duration = Duration::from_secs(1);
+    /// Gate-wait accrual cadence — see `response::run`. Tighter than the
+    /// idle policy-check cadence to bound boundary error on short stalls;
+    /// currently clamped to the `AmortizedTimer` mask's clock-read floor.
+    const GATE_ACCRUAL_INTERVAL: Duration = Duration::from_millis(10);
 
     let mut degraded_logger;
     {
@@ -404,10 +408,10 @@ pub fn run<A: Application>(
                         .store(status.degraded, Ordering::Relaxed);
 
                     // Accrue degraded time while wedged so a mid-wedge
-                    // flip isn't mis-charged by the post-gate tick.
-                    // Amortized to ~1 Hz; this loop always spins.
+                    // flip isn't mis-charged by the post-gate tick. The
+                    // clock read stays mask-gated; this loop always spins.
                     if gate_accrual_timer
-                        .tick(POLICY_CHECK_INTERVAL, true)
+                        .tick(GATE_ACCRUAL_INTERVAL, true)
                         .is_some()
                     {
                         degraded_logger.tick(
