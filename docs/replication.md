@@ -262,20 +262,25 @@ promoted node would hold a journal that doesn't match the events
 clients were told about. Tracked as a roadmap item — two
 implementation shapes are scoped (tip-only check, ~half a day; full
 arbitrary-N check, 1–2 days against the journal-crate hashing
-arithmetic).
+arithmetic). On mismatch the replica will be re-synced through the
+existing snapshot path, with its divergent journal archived for the
+audit trail rather than deleted.
 
 ### No automatic split-brain fencing
 
 After manual promotion, the old primary must be stopped manually. If
-it stays up, two primaries will accept writes. Automatic fencing
-(epoch-based or STONITH-style) is on the roadmap and gated on the
-Raft integration.
+it stays up, two primaries will accept writes. Epoch-based fencing is
+on the roadmap as a standalone prerequisite for automatic failover —
+it lands before the Raft integration and closes this window for the
+manual flow as well.
 
 ### No automatic failover
 
 Promotion is operator-driven via the `--admin-bind` endpoint. Leader
-election and automatic promotion are on the roadmap and gated on the
-Raft integration.
+election and automatic promotion are on the roadmap, built on a
+control-plane Raft integration: Raft carries election, membership,
+and fencing epochs only, while order flow stays on the existing
+replication path and keeps the durability modes unchanged.
 
 ### No offline journal inspector
 
