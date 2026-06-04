@@ -1195,6 +1195,72 @@ mod tests {
         assert_eq!(recovered.app().total, expected);
     }
 
+    /// The original silent-data-loss layout, end to end: a snapshot
+    /// taken mid-segment, more acked events journaled after it, then a
+    /// rotation crash between the live → archive rename and the new
+    /// live file's creation. On disk: snapshot + an archive holding
+    /// events PAST the snapshot + no live segment.
+    ///
+    /// `recover_from_snapshot` must compose all three halves at once —
+    /// snapshot restore, post-snapshot delta replay out of the archive
+    /// (with the chain cross-check at the anchor entry), and Phase-B
+    /// synthesis of the missing live continuing the archive's tail.
+    /// Bootstrapping "snapshot only" from this layout (the pre-fix
+    /// server behaviour) silently rewound the post-snapshot events.
+    #[test]
+    fn recover_from_snapshot_replays_archived_events_past_snapshot_when_live_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let journal_path = dir.path().join("journal.bin");
+        let snap_path = dir.path().join("snap.bin");
+
+        let pre = [TestEvent::Add(1), TestEvent::Add(2)];
+        let post = [TestEvent::Add(10), TestEvent::Add(20)];
+
+        // pre events (seqs 1-2), recover to populate the app, snapshot
+        // at seq 2, then post events (seqs 3-4) into the SAME segment.
+        let ja = TestApp_::create(TestApp::new(), &journal_path).unwrap();
+        let ja = append_events(ja, &pre, 1);
+        drop(ja);
+        let ja = TestApp_::recover(TestApp::new(), &journal_path).unwrap();
+        let pre_total = ja.app().total;
+        ja.save_snapshot(&snap_path).unwrap();
+        let mut ja = append_events(ja, &post, 1 + pre.len() as u64);
+
+        // Rotation seals seqs 1-4 into archive 000001; deleting the
+        // fresh live reproduces the crash window between the rename and
+        // create_continuing.
+        ja.rotate_segment().unwrap();
+        drop(ja);
+        std::fs::remove_file(&journal_path).unwrap();
+
+        let recovered = TestApp_::recover_from_snapshot(&snap_path, &journal_path).unwrap();
+        assert_eq!(
+            recovered.app().total,
+            pre_total + 10 + 20,
+            "post-snapshot events in the archive must replay"
+        );
+        assert_eq!(
+            recovered.next_sequence(),
+            1 + (pre.len() + post.len()) as u64,
+            "synthesized live must continue past the archived tail"
+        );
+        assert!(
+            journal_path.exists(),
+            "recovery should have synthesized a fresh live segment"
+        );
+
+        // The synthesized live is usable: append, then re-recover the
+        // full lineage from the same snapshot.
+        let ja = append_events(
+            recovered,
+            &[TestEvent::Add(100)],
+            1 + (pre.len() + post.len()) as u64,
+        );
+        drop(ja);
+        let re = TestApp_::recover_from_snapshot(&snap_path, &journal_path).unwrap();
+        assert_eq!(re.app().total, pre_total + 10 + 20 + 100);
+    }
+
     /// Recovery accepts a snapshot anchored exactly at a rotation
     /// boundary even when the segment holding the anchor entry has been
     /// trimmed (e.g. moved to cold storage). The successor segment's
