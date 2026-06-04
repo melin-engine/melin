@@ -2643,81 +2643,22 @@ fn count_archives(journal_path: &Path) -> usize {
         .unwrap_or(0)
 }
 
-/// Walk a node's full segment chain (archives in monotonic order, then
-/// the live segment) and assert every lineage invariant:
-///
-/// - each segment's first entry carries its header `starting_sequence`
-///   (enforced by the reader itself);
-/// - sequences are dense across segment boundaries — a successor's
-///   header starts exactly one past the predecessor's last entry (or at
-///   the same value after an empty segment);
-/// - each successor's header anchor equals the predecessor's tail chain
-///   hash (cross-segment tamper link).
-///
-/// Returns `(first_sequence, last_sequence)` over the whole lineage.
+/// Walk a node's full segment chain via the shared lineage verifier
+/// (dense sequences within and across segments, each header matching
+/// its first entry, successor anchors equal to predecessor tails) and
+/// return `(first_sequence, last_sequence)` over the whole lineage.
 fn walk_segments_dense(journal_path: &Path) -> (u64, u64) {
-    use melin_journal::JournalReader;
     use melin_trading::trading_event::TradingEvent;
 
-    let mut segments: Vec<std::path::PathBuf> = melin_journal::segment::list_archives(journal_path)
-        .expect("list archives")
-        .into_iter()
-        .map(|(_, p)| p)
-        .collect();
-    segments.push(journal_path.to_path_buf());
-
-    let mut prev_tail: Option<[u8; 32]> = None;
-    let mut expected_start: Option<u64> = None;
-    let mut first_seq: Option<u64> = None;
-    let mut last_seq: u64 = 0;
-
-    for path in &segments {
-        let mut reader = JournalReader::<TradingEvent>::open(path)
-            .unwrap_or_else(|e| panic!("open segment {}: {e}", path.display()));
-
-        if let (Some(prev), Some(anchor)) = (prev_tail, reader.anchor()) {
-            assert_eq!(
-                prev,
-                anchor,
-                "segment {} anchor does not match predecessor's tail",
-                path.display()
-            );
-        }
-        if let Some(expected) = expected_start {
-            assert_eq!(
-                reader.starting_sequence(),
-                expected,
-                "segment {} starts mid-air (sequence gap across boundary)",
-                path.display()
-            );
-        }
-
-        // Walk every entry; the reader enforces in-segment density and
-        // the header/first-entry match.
-        while let Some(entry) = reader
-            .next_entry()
-            .unwrap_or_else(|e| panic!("walk {}: {e}", path.display()))
-        {
-            if first_seq.is_none() {
-                first_seq = Some(entry.sequence);
-            }
-            last_seq = entry.sequence;
-        }
-
-        if let Some(tail) = reader.chain_hash() {
-            prev_tail = Some(tail);
-        }
-        expected_start = Some(
-            reader
-                .last_sequence()
-                .map(|s| s + 1)
-                .unwrap_or_else(|| reader.starting_sequence()),
-        );
-    }
-
+    let report = melin_journal::segment::verify_lineage::<TradingEvent>(journal_path)
+        .unwrap_or_else(|e| panic!("lineage of {} broken: {e}", journal_path.display()));
     (
-        first_seq.expect("lineage should contain at least one entry"),
-        last_seq,
+        report
+            .first_sequence
+            .expect("lineage should contain at least one entry"),
+        report
+            .last_sequence
+            .expect("lineage should contain at least one entry"),
     )
 }
 
@@ -2873,6 +2814,29 @@ fn rotation_soak_under_load() {
         r_last >= total_orders,
         "replica tail {r_last} must cover all {total_orders} orders"
     );
+
+    // Run the REPLICA's journal through production multi-segment
+    // recovery (full replay, real trading engine) — not just the
+    // read-only lineage walk. This is what a promotion-after-restart
+    // would execute; the recovered writer must resume exactly one past
+    // the replica's durable tail.
+    {
+        use melin_journal::BufferedWriter;
+        use melin_server::ServerApp;
+        use melin_trading::trading_event::TradingEvent;
+        use melin_transport_core::JournaledApp;
+
+        let recovered = JournaledApp::<ServerApp, BufferedWriter<TradingEvent>>::recover(
+            ServerApp(melin_exchange_core::exchange::Exchange::with_capacity()),
+            &replica_journal,
+        )
+        .expect("replica journal must recover through the production path");
+        assert_eq!(
+            recovered.next_sequence(),
+            r_last + 1,
+            "recovered replica writer must resume after its durable tail"
+        );
+    }
 
     // ----- Restart and verify recovered state matches -----
     // primary2 is brought up alone — no replica is spawned alongside it

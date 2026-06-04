@@ -20,6 +20,120 @@ use crate::error::JournalError;
 /// million rotations — over a century at hourly rotations.
 const ARCHIVE_INDEX_WIDTH: usize = 6;
 
+/// Summary of a verified journal lineage, returned by [`verify_lineage`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LineageReport {
+    /// Number of segments walked (archives + live).
+    pub segments: usize,
+    /// Total entries across all segments.
+    pub entries: u64,
+    /// Sequence of the first entry in the lineage. `None` when every
+    /// segment is empty.
+    pub first_sequence: Option<u64>,
+    /// Sequence of the last entry in the lineage. `None` when every
+    /// segment is empty.
+    pub last_sequence: Option<u64>,
+    /// `starting_sequence` of the oldest segment — where the on-disk
+    /// history begins. Callers with snapshot context can check it
+    /// against their required floor (recovery does; offline audits
+    /// report it for the operator).
+    pub lineage_start: u64,
+    /// Tail chain hash after the last segment. `None` when the
+    /// `hash-chain` feature is disabled.
+    pub tail_chain_hash: Option<[u8; 32]>,
+}
+
+/// Walk a journal lineage (archives in monotonic order, then the live
+/// segment) and verify every cross-segment invariant:
+///
+/// - each segment's entries are dense and CRC-valid, with the first
+///   entry matching the header's `starting_sequence` (enforced by the
+///   reader);
+/// - each successor's header anchor equals its predecessor's tail
+///   chain hash (`SegmentChainBreak` otherwise);
+/// - each successor's `starting_sequence` continues the sequence space
+///   exactly (`SequenceGap` otherwise), including across empty
+///   segments (rotation consumes no sequence).
+///
+/// This is the offline-audit counterpart of recovery's walk — recovery
+/// interleaves the same checks with replay, while this function only
+/// reads. It does not validate against a snapshot (it has none), so a
+/// trimmed-but-internally-consistent lineage passes; callers judge
+/// `lineage_start` themselves.
+pub fn verify_lineage<E: melin_app::AppEvent>(live: &Path) -> Result<LineageReport, JournalError> {
+    let mut segments: Vec<PathBuf> = list_archives(live)?.into_iter().map(|(_, p)| p).collect();
+    if live.exists() {
+        segments.push(live.to_path_buf());
+    }
+    if segments.is_empty() {
+        return Err(JournalError::Io(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "no journal segments on disk",
+        )));
+    }
+
+    let mut prev_tail: Option<[u8; 32]> = None;
+    let mut expected_start: Option<u64> = None;
+    let mut lineage_start: u64 = 0;
+    let mut first_sequence: Option<u64> = None;
+    let mut last_sequence: Option<u64> = None;
+    let mut entries: u64 = 0;
+    let mut tail_chain_hash: Option<[u8; 32]> = None;
+
+    for (index, path) in segments.iter().enumerate() {
+        let mut reader = crate::reader::JournalReader::<E>::open(path)?;
+
+        if index == 0 {
+            lineage_start = reader.starting_sequence();
+        }
+        if let (Some(expected), Some(actual)) = (prev_tail, reader.anchor())
+            && expected != actual
+        {
+            return Err(JournalError::SegmentChainBreak {
+                index: index as u32,
+                expected,
+                actual,
+            });
+        }
+        if let Some(expected) = expected_start
+            && reader.starting_sequence() != expected
+        {
+            return Err(JournalError::SequenceGap {
+                expected,
+                actual: reader.starting_sequence(),
+            });
+        }
+
+        while let Some(entry) = reader.next_entry()? {
+            if first_sequence.is_none() {
+                first_sequence = Some(entry.sequence);
+            }
+            last_sequence = Some(entry.sequence);
+            entries += 1;
+        }
+
+        if let Some(tail) = reader.chain_hash() {
+            prev_tail = Some(tail);
+            tail_chain_hash = Some(tail);
+        }
+        expected_start = Some(
+            reader
+                .last_sequence()
+                .map(|s| s + 1)
+                .unwrap_or_else(|| reader.starting_sequence()),
+        );
+    }
+
+    Ok(LineageReport {
+        segments: segments.len(),
+        entries,
+        first_sequence,
+        last_sequence,
+        lineage_start,
+        tail_chain_hash,
+    })
+}
+
 /// Read and validate a segment's file header, returning its decoded
 /// fields (`starting_sequence`, `anchor_hash`, …).
 ///
@@ -29,13 +143,10 @@ const ARCHIVE_INDEX_WIDTH: usize = 6;
 pub fn read_header_info(path: &Path) -> Result<FileHeaderInfo, JournalError> {
     let file = std::fs::File::open(path)?;
     let mut buf = [0u8; codec::FILE_HEADER_SIZE];
-    let n = file.read_at(&mut buf, 0)?;
-    if n < codec::FILE_HEADER_SIZE {
-        return Err(JournalError::Io(std::io::Error::new(
-            std::io::ErrorKind::UnexpectedEof,
-            "journal file too short to read file header",
-        )));
-    }
+    // read_exact_at loops on short preads (legal under POSIX — NFS,
+    // signal interruption) instead of treating them as truncation; a
+    // genuinely short file still surfaces as UnexpectedEof.
+    file.read_exact_at(&mut buf, 0)?;
     codec::decode_file_header(&buf)
 }
 
@@ -160,6 +271,101 @@ pub fn fsync_parent_dir(live: &Path) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::buffered_writer::BufferedWriter;
+    use crate::event::JournalEvent;
+    use crate::write::JournalWrite;
+    use melin_app::{AppEvent, CodecError};
+
+    /// Minimal `AppEvent` for lineage tests.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    struct TestEvent(u64);
+
+    impl AppEvent for TestEvent {
+        fn encoded_size(&self) -> usize {
+            8
+        }
+        fn encode(&self, buf: &mut [u8]) -> usize {
+            buf[..8].copy_from_slice(&self.0.to_le_bytes());
+            8
+        }
+        fn decode(buf: &[u8]) -> Result<Self, CodecError> {
+            if buf.len() < 8 {
+                return Err(CodecError::Truncated);
+            }
+            Ok(TestEvent(u64::from_le_bytes(buf[..8].try_into().unwrap())))
+        }
+        fn is_query(&self) -> bool {
+            false
+        }
+    }
+
+    /// Build `live` with `events_per_phase` entries between rotations.
+    /// `phases.len() - 1` rotations are performed (the last phase stays
+    /// in the live segment). A phase count of 0 produces an empty
+    /// segment.
+    fn build_lineage(live: &Path, phases: &[u64]) {
+        let mut writer = BufferedWriter::<TestEvent>::create(live).unwrap();
+        let mut value = 0u64;
+        for (i, &count) in phases.iter().enumerate() {
+            for _ in 0..count {
+                value += 1;
+                writer.append(&JournalEvent::App(TestEvent(value))).unwrap();
+            }
+            if i + 1 < phases.len() {
+                writer.rotate_segment().unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn verify_lineage_accepts_intact_multi_segment_journal() {
+        let dir = tempfile::tempdir().unwrap();
+        let live = dir.path().join("j.journal");
+        // Includes an empty middle segment from back-to-back rotation.
+        build_lineage(&live, &[2, 0, 3]);
+
+        let report = verify_lineage::<TestEvent>(&live).unwrap();
+        assert_eq!(report.segments, 3);
+        assert_eq!(report.entries, 5);
+        assert_eq!(report.lineage_start, 1);
+        assert_eq!(report.first_sequence, Some(1));
+        assert_eq!(report.last_sequence, Some(5));
+        #[cfg(feature = "hash-chain")]
+        assert!(report.tail_chain_hash.is_some());
+    }
+
+    #[test]
+    fn verify_lineage_rejects_missing_middle_segment() {
+        let dir = tempfile::tempdir().unwrap();
+        let live = dir.path().join("j.journal");
+        build_lineage(&live, &[2, 2, 2]);
+        std::fs::remove_file(archive_path(&live, 2)).unwrap();
+
+        let err = verify_lineage::<TestEvent>(&live).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                JournalError::SegmentChainBreak { .. } | JournalError::SequenceGap { .. }
+            ),
+            "expected lineage break, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn verify_lineage_reports_trimmed_start() {
+        // A trimmed-but-consistent prefix passes verification (no
+        // snapshot context here) but the report exposes where history
+        // begins so callers can judge.
+        let dir = tempfile::tempdir().unwrap();
+        let live = dir.path().join("j.journal");
+        build_lineage(&live, &[2, 2, 2]);
+        std::fs::remove_file(archive_path(&live, 1)).unwrap();
+
+        let report = verify_lineage::<TestEvent>(&live).unwrap();
+        assert_eq!(report.lineage_start, 3);
+        assert_eq!(report.first_sequence, Some(3));
+        assert_eq!(report.last_sequence, Some(6));
+    }
 
     #[test]
     fn archive_path_pads_to_six_digits() {

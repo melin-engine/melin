@@ -358,6 +358,20 @@ impl<A: Application, W: JournalWrite<A::Event>> JournaledApp<A, W> {
 
         let writer = W::open_append(journal_path, last_seq, valid_end)?;
 
+        // The writer rebuilt its chain self-containedly (header anchor +
+        // raw byte re-absorption to `valid_end`); the reader accumulated
+        // the same chain entry-by-entry during the walk. Equality is the
+        // invariant `chain::rebuild_from_file` documents — enforce it
+        // here so a regression fails loudly at recovery instead of
+        // surfacing later as a baffling SegmentChainBreak at the next
+        // rotation. Exercised by every recovery test, including the
+        // crash-at-every-byte sweeps.
+        debug_assert_eq!(
+            writer.chain_hash(),
+            reader.chain_hash(),
+            "writer's rebuilt chain must equal the reader's accumulated chain"
+        );
+
         Ok(Self { app, writer })
     }
 
@@ -461,10 +475,9 @@ impl<A: Application, W: JournalWrite<A::Event>> JournaledApp<A, W> {
         Ok(())
     }
 
-    /// Mutable access to the writer for tests that need to journal raw
-    /// `JournalEvent` variants the public API doesn't expose (e.g. a
-    /// deliberately-mismatched checkpoint to exercise divergence
-    /// handling).
+    /// Mutable access to the writer for tests that need writer-level
+    /// control the public API doesn't expose (e.g. encoding entries
+    /// with hand-picked sequences to exercise recovery edge cases).
     pub fn writer_mut(&mut self) -> &mut W {
         &mut self.writer
     }
@@ -1508,6 +1521,89 @@ mod tests {
         assert!(
             matches!(err, JournaledAppError::SnapshotChainMismatch { .. }),
             "expected SnapshotChainMismatch, got {err:?}"
+        );
+    }
+
+    /// Phase B crash with an *empty trailing archive*: rotate twice
+    /// back-to-back, then crash between the second rotation's rename
+    /// and the new live file's creation. On disk: a populated archive,
+    /// an empty archive, and no live. Recovery must synthesize the live
+    /// continuing from the empty archive's starting sequence (rotation
+    /// consumed nothing) with its anchor chained through the empty
+    /// segment.
+    #[test]
+    fn recover_synthesizes_live_after_phase_b_crash_with_empty_trailing_archive() {
+        let dir = tempfile::tempdir().unwrap();
+        let journal_path = dir.path().join("journal.bin");
+
+        let events = [TestEvent::Add(5), TestEvent::Add(7)];
+        let ja = TestApp_::create(TestApp::new(), &journal_path).unwrap();
+        let mut ja = append_events(ja, &events, 1);
+        ja.rotate_segment().unwrap();
+        ja.rotate_segment().unwrap(); // archive 000002 is empty
+        drop(ja);
+        // Simulate the crash window: the (empty) live vanishes.
+        std::fs::remove_file(&journal_path).unwrap();
+
+        let recovered = TestApp_::recover(TestApp::new(), &journal_path).unwrap();
+        assert_eq!(recovered.app().total, 5 + 7);
+        assert_eq!(
+            recovered.next_sequence(),
+            1 + events.len() as u64,
+            "synthesized live must continue from the empty archive's start"
+        );
+
+        // The synthesized live must be appendable and re-recoverable —
+        // its anchor chained through the empty archive.
+        let ja = append_events(recovered, &[TestEvent::Add(100)], 1 + events.len() as u64);
+        drop(ja);
+        let re = TestApp_::recover(TestApp::new(), &journal_path).unwrap();
+        assert_eq!(re.app().total, 5 + 7 + 100);
+    }
+
+    /// A *foreign* archive restored over a trimmed prefix — internally
+    /// valid, right starting sequence, wrong lineage — is rejected by
+    /// the snapshot chain cross-check when the anchor entry is
+    /// observed. The random per-lineage anchor is what guarantees two
+    /// independent histories can never produce the same chain value.
+    #[cfg(feature = "hash-chain")]
+    #[test]
+    fn recover_from_snapshot_rejects_foreign_covering_archive() {
+        let dir = tempfile::tempdir().unwrap();
+        let journal_path = dir.path().join("journal.bin");
+        let snap_path = dir.path().join("snap.bin");
+
+        let events = [TestEvent::Add(1), TestEvent::Add(2)];
+
+        // Genuine lineage: events, snapshot at the tail, rotate.
+        let ja = TestApp_::create(TestApp::new(), &journal_path).unwrap();
+        let mut ja = append_events(ja, &events, 1);
+        ja.save_snapshot(&snap_path).unwrap();
+        ja.rotate_segment().unwrap();
+        drop(ja);
+
+        // Foreign lineage with the same shape (same event count, same
+        // request seqs — only the random anchor and payloads differ).
+        let foreign_dir = tempfile::tempdir().unwrap();
+        let foreign_live = foreign_dir.path().join("journal.bin");
+        let fja = TestApp_::create(TestApp::new(), &foreign_live).unwrap();
+        let mut fja = append_events(fja, &[TestEvent::Add(9), TestEvent::Add(8)], 1);
+        fja.rotate_segment().unwrap();
+        drop(fja);
+
+        // "Restore" the foreign archive over the genuine one.
+        let archive = dir.path().join("journal.bin.000001");
+        std::fs::remove_file(&archive).unwrap();
+        std::fs::copy(foreign_dir.path().join("journal.bin.000001"), &archive).unwrap();
+
+        let err = match TestApp_::recover_from_snapshot(&snap_path, &journal_path) {
+            Ok(_) => panic!("expected rejection of foreign covering archive"),
+            Err(e) => e,
+        };
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("snapshot chain hash mismatch") || msg.contains("segment chain break"),
+            "expected a chain rejection, got: {msg}"
         );
     }
 
