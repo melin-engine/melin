@@ -700,6 +700,13 @@ impl<E: AppEvent, W: JournalWrite<E>> JournalStage<E, W> {
                         }
                         continue;
                     }
+                    if let melin_journal::JournalEvent::GenesisHash { hash } = &slot.event {
+                        // Primary-driven rotation point delivered through
+                        // the stream (live or catch-up) — rotate the local
+                        // segment adopting the primary's entry verbatim.
+                        self.rotate_on_replicated_genesis(slot.sequence, slot.timestamp_ns, *hash)?;
+                        continue;
+                    }
                     let seq = if slot.sequence != 0 {
                         self.writer.set_next_sequence(slot.sequence + 1);
                         slot.sequence
@@ -1011,6 +1018,56 @@ impl<E: AppEvent, W: JournalWrite<E>> JournalStage<E, W> {
                 // The new segment's GenesisHash advanced the chain;
                 // republish so shadow + cursor observers see it.
                 self.publish_fsync_state();
+                // The rotation genesis consumed a sequence and re-seeded
+                // the chain — replicas must journal the identical entry
+                // at the identical position. Publish it to the
+                // replication rings as its own InputBatch (the previous
+                // batch was published and reset before rotation, so the
+                // frame is empty here). Offline replicas receive it via
+                // journal catch-up instead.
+                //
+                // hash-chain only: without it rotation writes no genesis
+                // entry and consumes no sequence, so there is nothing to
+                // replicate — and the new live file is empty, which the
+                // read below would misreport as a failure.
+                #[cfg(feature = "hash-chain")]
+                if self.repl.any_producer() {
+                    match self.writer.read_genesis_entry() {
+                        // Strip the 2-byte entry magic and 4-byte CRC —
+                        // the framing record_slot_for_replication expects.
+                        Ok(raw) if raw.len() > 6 => {
+                            let genesis_seq = self.writer.next_sequence() - 1;
+                            Self::record_slot_for_replication(
+                                &mut self.repl,
+                                &raw[2..raw.len() - 4],
+                            );
+                            Self::publish_input_batch_to_rings(&mut self.repl, genesis_seq);
+                        }
+                        other => {
+                            // Without the genesis on the wire every live
+                            // replica is guaranteed a journal hole — evict
+                            // them all so they reconnect and heal via
+                            // catch-up (which reads the entry from the
+                            // journal file directly).
+                            let reason = match other {
+                                Err(e) => e.to_string(),
+                                Ok(raw) => format!("genesis entry too short ({} bytes)", raw.len()),
+                            };
+                            tracing::error!(
+                                error = %reason,
+                                "failed to read rotation genesis for replication — \
+                                 evicting replicas to force catch-up"
+                            );
+                            for i in 0..2 {
+                                if self.repl.producers[i].is_some()
+                                    && self.repl.active[i].load(Ordering::Relaxed)
+                                {
+                                    self.repl.evict[i].store(true, Ordering::Release);
+                                }
+                            }
+                        }
+                    }
+                }
                 true
             }
             Err(e) => {
@@ -1061,6 +1118,47 @@ impl<E: AppEvent, W: JournalWrite<E>> JournalStage<E, W> {
         Ok(())
     }
 
+    /// Handle a replicated rotation `GenesisHash` slot (replica mode):
+    /// rotate the local segment adopting the primary's entry verbatim,
+    /// so the replica's journal holds the identical entry at the
+    /// identical sequence and its chain re-seeds to the same value.
+    /// The new segment resets checkpoint cadence, matching the
+    /// primary's post-rotation writer. Reached from both live streaming
+    /// and journal catch-up — the slot is the rotation directive.
+    ///
+    /// A `GenesisHash` slot can only arrive pre-sequenced — no local
+    /// input path produces one — so `sequence == 0` is a protocol
+    /// error, not a sequencing decision left to this stage.
+    fn rotate_on_replicated_genesis(
+        &mut self,
+        sequence: u64,
+        timestamp_ns: u64,
+        prev_chain_hash: [u8; 32],
+    ) -> Result<(), JournalError> {
+        if sequence == 0 {
+            return Err(JournalError::Io(std::io::Error::other(
+                "GenesisHash slot without a pre-assigned sequence — rotation \
+                 genesis entries are replicated, never produced locally",
+            )));
+        }
+        // Under no-persist pending batch bytes are dropped, not flushed;
+        // clear them so the rotation's internal flush is a no-op.
+        #[cfg(feature = "no-persist")]
+        self.writer.discard_batch_buf();
+        let archived = melin_journal::rotate_adopting_genesis::<E, W>(
+            &mut self.writer,
+            sequence,
+            timestamp_ns,
+            prev_chain_hash,
+        )?;
+        tracing::info!(
+            archive = %archived.display(),
+            sequence,
+            "rotated segment at replicated rotation point"
+        );
+        Ok(())
+    }
+
     /// Drain any remaining entries from the ring buffer on shutdown.
     fn drain_remaining(&mut self, batch: &mut [InputSlot<E>]) {
         loop {
@@ -1089,6 +1187,19 @@ impl<E: AppEvent, W: JournalWrite<E>> JournalStage<E, W> {
                                 self.verify_primary_checkpoint(chain_hash, slot.sequence)
                         {
                             tracing::error!(error = %e, "divergence on drain");
+                        }
+                        continue;
+                    }
+                    if let melin_journal::JournalEvent::GenesisHash { hash } = &slot.event {
+                        // Rotation point reached during shutdown drain —
+                        // best-effort rotate so the journal stays aligned
+                        // with the primary's segmentation.
+                        if let Err(e) = self.rotate_on_replicated_genesis(
+                            slot.sequence,
+                            slot.timestamp_ns,
+                            *hash,
+                        ) {
+                            tracing::error!(error = %e, "rotation at replicated genesis failed on drain");
                         }
                         continue;
                     }
@@ -1467,6 +1578,13 @@ impl<E: AppEvent> JournalStage<E, melin_journal::SectorWriter<E>> {
                         if slot.sequence != 0 {
                             self.verify_primary_checkpoint(chain_hash, slot.sequence)?;
                         }
+                        continue;
+                    }
+                    if let melin_journal::JournalEvent::GenesisHash { hash } = &slot.event {
+                        // Primary-driven rotation point delivered through
+                        // the stream (live or catch-up) — rotate the local
+                        // segment adopting the primary's entry verbatim.
+                        self.rotate_on_replicated_genesis(slot.sequence, slot.timestamp_ns, *hash)?;
                         continue;
                     }
                     let seq = if slot.sequence != 0 {

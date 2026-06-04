@@ -803,17 +803,13 @@ where
             )
         });
 
-        // Runtime rotation on the replica side. Each node rotates its
-        // own segments independently of the primary.
-        let max_journal_bytes = config.max_journal_mib.saturating_mul(1024 * 1024);
-        let rotation = match (max_journal_bytes, rotate_flag.as_ref()) {
-            (0, None) => None,
-            (b, f) => Some((
-                b,
-                f.cloned()
-                    .unwrap_or_else(|| Arc::new(AtomicBool::new(false))),
-            )),
-        };
+        // Replicas never rotate on their own — the primary's rotation
+        // points arrive as replicated `GenesisHash` slots and the
+        // journal stage rotates on receipt, keeping segment boundaries
+        // (and therefore sequences and chain hashes) aligned
+        // cluster-wide. `rotate_flag` stays alive solely for the
+        // post-promotion primary stage, which re-wires it via
+        // `set_rotation` in `run_as_primary`.
 
         match crate::replication::run_receiver::<A, W>(
             primary_addr,
@@ -827,7 +823,6 @@ where
             config.group_commit_delay(),
             config.replication_pipeline_depth,
             !config.yield_idle,
-            rotation,
             Arc::clone(&factory),
         )? {
             None => return Ok(()), // clean shutdown
@@ -1059,8 +1054,13 @@ where
     // handshake so it can write a byte-identical genesis, ensuring the
     // BLAKE3 hash chain starts from the exact same encoded bytes.
     let genesis_entry = if enable_replication {
-        writer
-            .read_genesis_entry()
+        // Must be the *original* seq-1 genesis: after a rotation the
+        // live file starts at a rotation point, so source from the
+        // oldest segment on disk. Fresh replicas seed their journal
+        // (hardwired as sequence 1) from these bytes via StreamStart.
+        let oldest = melin_journal::segment::oldest_segment(&config.journal)
+            .map_err(|e| format!("failed to locate oldest journal segment: {e}"))?;
+        melin_journal::segment::read_genesis_entry(&oldest)
             .map_err(|e| format!("failed to read genesis entry: {e}"))?
     } else {
         Vec::new()
@@ -1893,15 +1893,8 @@ where
             )
         });
 
-        let max_journal_bytes = config.max_journal_mib.saturating_mul(1024 * 1024);
-        let rotation = match (max_journal_bytes, rotate_flag.as_ref()) {
-            (0, None) => None,
-            (b, f) => Some((
-                b,
-                f.cloned()
-                    .unwrap_or_else(|| Arc::new(AtomicBool::new(false))),
-            )),
-        };
+        // Replicas never rotate on their own (see the kernel-TCP replica
+        // path above for the full rationale) — no rotation wiring here.
 
         // Use queue 0 for the replication receiver's smoltcp connection.
         // Listen port is unused (receiver connects outbound, doesn't listen),
@@ -1934,7 +1927,6 @@ where
             config.group_commit_delay(),
             config.replication_pipeline_depth,
             !config.yield_idle,
-            rotation,
             Arc::clone(&factory),
         )? {
             None => return Ok(()), // clean shutdown
@@ -2028,8 +2020,13 @@ where
     }
 
     let genesis_entry = if enable_replication {
-        writer
-            .read_genesis_entry()
+        // Must be the *original* seq-1 genesis: after a rotation the
+        // live file starts at a rotation point, so source from the
+        // oldest segment on disk. Fresh replicas seed their journal
+        // (hardwired as sequence 1) from these bytes via StreamStart.
+        let oldest = melin_journal::segment::oldest_segment(&config.journal)
+            .map_err(|e| format!("failed to locate oldest journal segment: {e}"))?;
+        melin_journal::segment::read_genesis_entry(&oldest)
             .map_err(|e| format!("failed to read genesis entry: {e}"))?
     } else {
         Vec::new()

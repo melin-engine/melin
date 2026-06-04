@@ -31,13 +31,19 @@ Two independent triggers fire rotation, both observed at the journal stage's fsy
 
 ### Size threshold
 
-When `--max-journal-mib` is non-zero (default: 256 MiB) and the live segment crosses that size after an fsync batch, the journal stage rotates immediately. Tune this larger to reduce rotation frequency (and the brief stall described below) at the cost of more bytes per archive segment.
+When `--max-journal-mib` is non-zero (default: 256 MiB) and the live segment crosses that size after an fsync batch, the journal stage rotates immediately. Tune this larger to reduce rotation frequency (and the brief stall described below) at the cost of more bytes per archive segment. On replicas the size threshold is inert — rotation always follows the primary's boundaries (see "Rotation and replication" below).
 
 ### Operator-driven (`ROTATE` admin command)
 
 When `--admin-bind <addr>` is set, the server listens on that TCP address for operator commands (the same endpoint that accepts `PROMOTE` for replica → primary failover). An operator authenticates with an Ed25519 operator key (challenge-response, same scheme as all other admin handshakes) and sends `ROTATE\n`. The journal stage performs one rotation at the next fsync boundary. Concurrent or repeated `ROTATE` commands collapse into a single rotation rather than queueing.
 
-This command is accepted on both primary and replica nodes; each side rotates its own local segments independently.
+`ROTATE` is accepted on the primary only. Replicas reject it (`ERR ROTATE not available on a replica`): rotation points are decided by the primary and replicated through the event stream, so every node rotates at exactly the same sequence boundary. A promoted replica accepts `ROTATE` again as soon as the promotion completes.
+
+## Rotation and Replication
+
+A rotation writes a new-segment anchor entry that consumes a sequence number and re-anchors the tamper-evidence hash chain. That entry is delivered to connected replicas through the replication stream like any other event, and each replica rotates its own live segment on receipt — adopting the primary's anchor bytes verbatim. Replicas that are offline during a rotation receive the same entry during journal catch-up on reconnect and reconstruct the identical segment boundary.
+
+The result: sequence numbering, chain hashes, and archive boundaries stay aligned across the cluster. A replica restarted after any number of rotations recovers from its own journal and rejoins cleanly, and cross-node hash comparisons remain valid at every sequence.
 
 ## Recovery: Multi-Segment Walk
 

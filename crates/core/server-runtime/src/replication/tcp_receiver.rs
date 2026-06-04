@@ -341,7 +341,6 @@ pub fn run_receiver<A, W>(
     group_commit_delay: std::time::Duration,
     pipeline_depth: usize,
     busy_spin: bool,
-    rotation: Option<(u64, std::sync::Arc<AtomicBool>)>,
     factory: std::sync::Arc<dyn melin_app::app_factory::AppFactory<App = A>>,
 ) -> ReceiverResult<A, W>
 where
@@ -478,139 +477,192 @@ where
         }
         info!("authenticated with primary");
 
-        // --- Handshake ---
-        let handshake = Handshake {
-            last_sequence,
-            chain_hash,
-        };
-        send_buf.clear();
-        encode_handshake(&handshake, &mut send_buf);
-        tcp_writer.write_all(&send_buf)?;
-        tcp_writer.flush()?;
-        send_buf.clear();
+        // --- Handshake + protocol negotiation ---
+        // Runs as a fallible block: connection I/O failures in this
+        // phase are transient (primary restarting, network blip) and
+        // re-enter the reconnect/backoff loop below — they must not
+        // take the replica process down. Protocol violations and
+        // HashMismatch remain fatal.
+        let negotiated = (|| -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+            let handshake = Handshake {
+                last_sequence,
+                chain_hash,
+            };
+            send_buf.clear();
+            encode_handshake(&handshake, &mut send_buf);
+            tcp_writer.write_all(&send_buf)?;
+            tcp_writer.flush()?;
+            send_buf.clear();
 
-        // --- Protocol negotiation ---
-        let response_frame = read_frame(&mut reader, MAX_CONTROL_FRAME)?;
-        let response = decode_primary_message(&response_frame)?;
-        let primary_genesis_entry = match response {
-            PrimaryMessage::StreamStart {
-                start_sequence,
-                genesis_entry,
-            } => {
-                info!(start_sequence, "streaming started");
-                genesis_entry
-            }
-            PrimaryMessage::NeedSnapshot => {
-                info!("primary requires snapshot transfer — receiving snapshot");
-
-                if let Some(mut p) = pipeline.take() {
-                    p.input_producer
-                        .publish(InputSlot::<A::Event>::shutdown_sentinel());
-                    let _ = teardown_replica_pipeline::<A, W>(p);
+            let response_frame = read_frame(&mut reader, MAX_CONTROL_FRAME)?;
+            let response = decode_primary_message(&response_frame)?;
+            match response {
+                PrimaryMessage::StreamStart {
+                    start_sequence,
+                    genesis_entry,
+                } => {
+                    info!(start_sequence, "streaming started");
+                    Ok(genesis_entry)
                 }
+                PrimaryMessage::NeedSnapshot => {
+                    info!("primary requires snapshot transfer — receiving snapshot");
 
-                let _ = std::fs::remove_file(journal_path);
-                let _ = std::fs::remove_file(&snapshot_path);
+                    if let Some(mut p) = pipeline.take() {
+                        p.input_producer
+                            .publish(InputSlot::<A::Event>::shutdown_sentinel());
+                        let _ = teardown_replica_pipeline::<A, W>(p);
+                    }
 
-                let begin_frame = read_frame(&mut reader, MAX_CONTROL_FRAME)?;
-                let (snap_len, snap_sequence, snap_chain_hash) =
-                    match decode_primary_message(&begin_frame)? {
-                        PrimaryMessage::SnapshotBegin {
-                            snapshot_len,
-                            snap_sequence,
-                            snap_chain_hash,
-                        } => (snapshot_len, snap_sequence, snap_chain_hash),
-                        other => {
-                            return Err(format!("expected SnapshotBegin, got {other:?}").into());
-                        }
-                    };
+                    let _ = std::fs::remove_file(journal_path);
+                    let _ = std::fs::remove_file(&snapshot_path);
 
-                info!(snap_sequence, snap_len, "receiving snapshot");
-
-                let tmp_path = snapshot_path.with_extension("snapshot.tmp");
-                {
-                    let mut tmp_file = std::fs::File::create(&tmp_path)?;
-                    let mut received: u64 = 0;
-                    let mut running_crc: u32 = 0;
-                    loop {
-                        let chunk_frame = read_frame(&mut reader, MAX_DATA_FRAME)?;
-                        match decode_primary_message(&chunk_frame)? {
-                            PrimaryMessage::SnapshotChunk(data) => {
-                                std::io::Write::write_all(&mut tmp_file, &data)?;
-                                received += data.len() as u64;
-                                running_crc = crc32c::crc32c_append(running_crc, &data);
+                    let begin_frame = read_frame(&mut reader, MAX_CONTROL_FRAME)?;
+                    let (snap_len, snap_sequence, snap_chain_hash) =
+                        match decode_primary_message(&begin_frame)? {
+                            PrimaryMessage::SnapshotBegin {
+                                snapshot_len,
+                                snap_sequence,
+                                snap_chain_hash,
+                            } => (snapshot_len, snap_sequence, snap_chain_hash),
+                            other => {
+                                return Err(format!("expected SnapshotBegin, got {other:?}").into());
                             }
-                            PrimaryMessage::SnapshotEnd {
-                                crc32c: expected_crc,
-                            } => {
-                                tmp_file.sync_all()?;
-                                drop(tmp_file);
+                        };
 
-                                if received != snap_len {
-                                    let _ = std::fs::remove_file(&tmp_path);
-                                    return Err(format!(
+                    info!(snap_sequence, snap_len, "receiving snapshot");
+
+                    let tmp_path = snapshot_path.with_extension("snapshot.tmp");
+                    {
+                        let mut tmp_file = std::fs::File::create(&tmp_path)?;
+                        let mut received: u64 = 0;
+                        let mut running_crc: u32 = 0;
+                        loop {
+                            let chunk_frame = read_frame(&mut reader, MAX_DATA_FRAME)?;
+                            match decode_primary_message(&chunk_frame)? {
+                                PrimaryMessage::SnapshotChunk(data) => {
+                                    std::io::Write::write_all(&mut tmp_file, &data)?;
+                                    received += data.len() as u64;
+                                    running_crc = crc32c::crc32c_append(running_crc, &data);
+                                }
+                                PrimaryMessage::SnapshotEnd {
+                                    crc32c: expected_crc,
+                                } => {
+                                    tmp_file.sync_all()?;
+                                    drop(tmp_file);
+
+                                    if received != snap_len {
+                                        let _ = std::fs::remove_file(&tmp_path);
+                                        return Err(format!(
                                         "snapshot length mismatch: expected {snap_len} bytes, got {received}"
                                     )
                                     .into());
-                                }
+                                    }
 
-                                if running_crc != expected_crc {
-                                    let _ = std::fs::remove_file(&tmp_path);
-                                    return Err(format!(
+                                    if running_crc != expected_crc {
+                                        let _ = std::fs::remove_file(&tmp_path);
+                                        return Err(format!(
                                         "snapshot CRC mismatch: expected {expected_crc:#x}, got {running_crc:#x}"
                                     )
                                     .into());
-                                }
+                                    }
 
-                                std::fs::rename(&tmp_path, &snapshot_path)?;
-                                info!(snap_sequence, received, "snapshot received and verified");
-                                break;
-                            }
-                            other => {
-                                let _ = std::fs::remove_file(&tmp_path);
-                                return Err(
-                                    format!("expected SnapshotChunk/End, got {other:?}").into()
-                                );
+                                    std::fs::rename(&tmp_path, &snapshot_path)?;
+                                    info!(
+                                        snap_sequence,
+                                        received, "snapshot received and verified"
+                                    );
+                                    break;
+                                }
+                                other => {
+                                    let _ = std::fs::remove_file(&tmp_path);
+                                    return Err(format!(
+                                        "expected SnapshotChunk/End, got {other:?}"
+                                    )
+                                    .into());
+                                }
                             }
                         }
                     }
-                }
 
-                let (snap_exchange, _snap_seq, snap_hash) =
-                    melin_transport_core::snapshot::load::<A>(&snapshot_path)?;
-                if snap_hash != snap_chain_hash {
-                    return Err(format!(
-                        "snapshot chain hash mismatch: primary sent {snap_chain_hash:02x?}, \
+                    let (snap_exchange, _snap_seq, snap_hash) =
+                        melin_transport_core::snapshot::load::<A>(&snapshot_path)?;
+                    if snap_hash != snap_chain_hash {
+                        return Err(format!(
+                            "snapshot chain hash mismatch: primary sent {snap_chain_hash:02x?}, \
                          loaded snapshot has {snap_hash:02x?}"
-                    )
-                    .into());
-                }
-                exchange = Some(snap_exchange);
-
-                let writer = W::create_continuing(journal_path, snap_sequence + 1, snap_hash)?;
-                journal_writer = Some(writer);
-
-                let ss_frame = read_frame(&mut reader, MAX_CONTROL_FRAME)?;
-                match decode_primary_message(&ss_frame)? {
-                    PrimaryMessage::StreamStart {
-                        start_sequence,
-                        genesis_entry,
-                    } => {
-                        info!(start_sequence, "streaming resumed after snapshot transfer");
-                        genesis_entry
+                        )
+                        .into());
                     }
-                    other => {
-                        return Err(
+                    exchange = Some(snap_exchange);
+
+                    let writer = W::create_continuing(journal_path, snap_sequence + 1, snap_hash)?;
+                    journal_writer = Some(writer);
+
+                    let ss_frame = read_frame(&mut reader, MAX_CONTROL_FRAME)?;
+                    match decode_primary_message(&ss_frame)? {
+                        PrimaryMessage::StreamStart {
+                            start_sequence,
+                            genesis_entry,
+                        } => {
+                            info!(start_sequence, "streaming resumed after snapshot transfer");
+                            Ok(genesis_entry)
+                        }
+                        other => Err(
                             format!("expected StreamStart after snapshot, got {other:?}").into(),
-                        );
+                        ),
                     }
                 }
+                PrimaryMessage::HashMismatch => {
+                    Err("chain hash mismatch — replica has divergent history".into())
+                }
+                _ => Err(format!("unexpected response: {response:?}").into()),
             }
-            PrimaryMessage::HashMismatch => {
-                return Err("chain hash mismatch — replica has divergent history".into());
-            }
-            _ => {
-                return Err(format!("unexpected response: {response:?}").into());
+        })();
+
+        let primary_genesis_entry = match negotiated {
+            Ok(genesis) => genesis,
+            Err(e) => {
+                // Only connection-shaped I/O failures are retryable;
+                // everything else (protocol violations, HashMismatch,
+                // local journal/snapshot errors) is fatal.
+                let transient = e.downcast_ref::<std::io::Error>().is_some_and(|io| {
+                    matches!(
+                        io.kind(),
+                        std::io::ErrorKind::UnexpectedEof
+                            | std::io::ErrorKind::ConnectionReset
+                            | std::io::ErrorKind::ConnectionAborted
+                            | std::io::ErrorKind::BrokenPipe
+                            | std::io::ErrorKind::TimedOut
+                            | std::io::ErrorKind::WouldBlock
+                    )
+                });
+                if !transient {
+                    return Err(e);
+                }
+                warn!(
+                    error = %e,
+                    backoff_secs = backoff.as_secs(),
+                    "connection lost during replication negotiation — retrying"
+                );
+                // Re-derive the handshake cursor from local reality: a
+                // failed snapshot transfer may have torn down the
+                // pipeline, deleted the journal, or reopened a writer at
+                // a new sequence — the next handshake must not advertise
+                // a stale position. (With a live pipeline the loop top
+                // refreshes from it instead.)
+                if pipeline.is_none() {
+                    if let Some(w) = journal_writer.as_ref() {
+                        last_sequence = w.next_sequence().saturating_sub(1);
+                        chain_hash = w.chain_hash().unwrap_or([0u8; 32]);
+                    } else if !journal_path.exists() {
+                        last_sequence = 0;
+                        chain_hash = [0u8; 32];
+                    }
+                }
+                // Shutdown/promotion are observed at the loop top.
+                sleep_checking_flags(backoff, shutdown, promote);
+                backoff = (backoff * 2).min(MAX_BACKOFF);
+                continue;
             }
         };
 
@@ -636,7 +688,6 @@ where
                 snapshot_path.clone(),
                 group_commit_delay,
                 busy_spin,
-                rotation.clone(),
             )?);
         }
 

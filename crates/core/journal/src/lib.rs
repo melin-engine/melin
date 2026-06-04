@@ -37,7 +37,7 @@ pub mod test_utils;
 pub use buffered_writer::BufferedWriter;
 pub use error::JournalError;
 pub use event::JournalEvent;
-pub use fresh_replica::create_fresh_replica;
+pub use fresh_replica::{create_fresh_replica, rotate_adopting_genesis};
 pub use mode::JournalWriterMode;
 pub use reader::{JournalEntry, JournalReader, RawJournalScanner};
 pub use sector_writer::{AsyncWriteBatch, SectorWriter, checkpoint_interval, detect_sector_size};

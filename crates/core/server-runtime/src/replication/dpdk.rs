@@ -775,7 +775,6 @@ pub fn run_receiver_dpdk<A, W>(
     group_commit_delay: std::time::Duration,
     pipeline_depth: usize,
     busy_spin: bool,
-    rotation: Option<(u64, std::sync::Arc<AtomicBool>)>,
     // Application factory: see the kernel-TCP `run_receiver` for the
     // shape and rationale. Carries operator policy (rate limits, caps,
     // ...) alongside the empty-app constructor.
@@ -1140,7 +1139,6 @@ where
                 snapshot_path.clone(),
                 group_commit_delay,
                 busy_spin,
-                rotation.clone(),
             )?);
 
             // Pipeline children are spawned and self-pinned. Now safe to

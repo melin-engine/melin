@@ -297,17 +297,33 @@ fn handle_connection(
                 debug!("rejected PROMOTE — flag not wired (primary node?)");
             }
         },
-        "ROTATE" => match rotate_requested {
-            Some(flag) => {
-                flag.store(true, Ordering::Release);
-                send_best_effort(&mut stream, b"OK\n");
-                info!("rotation requested by operator");
+        "ROTATE" => {
+            // In replica mode (promote wired, not yet fired) rotation is
+            // rejected: rotation points are decided by the primary and
+            // replicated through the stream — a local rotation would
+            // consume a sequence the primary has already assigned to a
+            // future event. After promotion the same flag drives the new
+            // primary's journal stage, so ROTATE works again.
+            let is_replica = promote.is_some_and(|p| !p.load(Ordering::Acquire));
+            match rotate_requested {
+                Some(flag) if !is_replica => {
+                    flag.store(true, Ordering::Release);
+                    send_best_effort(&mut stream, b"OK\n");
+                    info!("rotation requested by operator");
+                }
+                Some(_) => {
+                    send_best_effort(
+                        &mut stream,
+                        b"ERR ROTATE not available on a replica - rotation follows the primary\n",
+                    );
+                    debug!("rejected ROTATE — replica mode (rotation follows the primary)");
+                }
+                None => {
+                    send_best_effort(&mut stream, b"ERR ROTATE not available on this node\n");
+                    debug!("rejected ROTATE — flag not wired");
+                }
             }
-            None => {
-                send_best_effort(&mut stream, b"ERR ROTATE not available on this node\n");
-                debug!("rejected ROTATE — flag not wired");
-            }
-        },
+        }
         cmd if cmd.starts_with("DURABILITY") => {
             // Parse `DURABILITY <mode>` with any positive whitespace
             // between the verb and the argument. `splitn(2, ' ')` is
@@ -512,12 +528,11 @@ mod tests {
         drop(listener);
 
         let (key, auth_keys) = operator_keys();
-        let promote = Arc::new(AtomicBool::new(false));
         let rotate = Arc::new(AtomicBool::new(false));
         let shutdown = Arc::new(AtomicBool::new(false));
         let _h = spawn(
             addr,
-            Some(Arc::clone(&promote)),
+            None, // primary-started node: no promote flag wired
             Some(Arc::clone(&rotate)),
             None,
             Arc::clone(&shutdown),
@@ -527,7 +542,6 @@ mod tests {
 
         assert_eq!(send_command(addr, &key, b"ROTATE\n"), "OK");
         assert!(rotate.load(Ordering::Acquire));
-        assert!(!promote.load(Ordering::Acquire));
 
         shutdown.store(true, Ordering::Release);
     }
@@ -607,6 +621,20 @@ mod tests {
         );
         std::thread::sleep(Duration::from_millis(200));
 
+        // Replica mode (promote wired, unfired): ROTATE is rejected —
+        // rotation follows the primary's replicated rotation points.
+        let resp = send_command(addr, &key, b"ROTATE\n");
+        assert!(
+            resp.starts_with("ERR"),
+            "expected ERR pre-promotion, got {resp}"
+        );
+        assert!(!rotate.load(Ordering::Acquire));
+
+        // Promote on the same listener.
+        assert_eq!(send_command(addr, &key, b"PROMOTE\n"), "OK");
+        assert!(promote.load(Ordering::Acquire));
+
+        // Post-promotion: ROTATE drives the new primary's stage again.
         // Three rotations, each consuming the flag (simulates the
         // journal stage's CAS).
         for _ in 0..3 {
@@ -617,10 +645,6 @@ mod tests {
                 .expect("flag should still be set");
             std::thread::sleep(Duration::from_millis(100));
         }
-
-        // Final PROMOTE on the same listener still works.
-        assert_eq!(send_command(addr, &key, b"PROMOTE\n"), "OK");
-        assert!(promote.load(Ordering::Acquire));
 
         shutdown.store(true, Ordering::Release);
     }

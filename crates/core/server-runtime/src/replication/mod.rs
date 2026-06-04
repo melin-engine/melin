@@ -238,7 +238,6 @@ pub(super) fn build_replica_pipeline_with_threads<A, W>(
     snapshot_path: std::path::PathBuf,
     group_commit_delay: std::time::Duration,
     busy_spin: bool,
-    rotation: Option<(u64, Arc<AtomicBool>)>,
 ) -> Result<ReplicaPipelineHandles<A, W>, Box<dyn std::error::Error>>
 where
     A: Application + Send + 'static,
@@ -264,10 +263,12 @@ where
 
     let ps = Arc::clone(&pipeline_shutdown);
     let journal_core = cores.journal;
-    let mut journal_stage = pipeline.journal_stage;
-    if let Some((max_bytes, flag)) = rotation {
-        journal_stage.set_rotation(max_bytes, Some(flag));
-    }
+    // No `set_rotation` here: replicas never rotate on their own. The
+    // primary's rotation points are replicated as `GenesisHash` slots
+    // and the journal stage rotates on receipt
+    // (`rotate_on_replicated_genesis`), keeping segment boundaries —
+    // and therefore sequences and chain hashes — aligned cluster-wide.
+    let journal_stage = pipeline.journal_stage;
     let journal_handle = std::thread::Builder::new()
         .name("journal".into())
         .spawn(move || {

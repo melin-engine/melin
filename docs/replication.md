@@ -162,7 +162,7 @@ requiring the full journal history.
 | `--standalone` | No | `false` | Explicitly disable replication. Requires `--durability-mode local`. |
 | `--replica-of <addr>` | No | — | Run as a replica connected to the given primary. |
 | `--replication-key <path>` | Replica | — | Ed25519 private key for replication auth. Required when `--replica-of` is set. The corresponding public key must be in the primary's `authorized_keys` with `replication` permission. |
-| `--admin-bind <addr>` | Any | — | Address for the operator admin endpoint. Accepts `PROMOTE`, `ROTATE`, and `DURABILITY <mode>`. |
+| `--admin-bind <addr>` | Any | — | Address for the operator admin endpoint. Accepts `PROMOTE`, `ROTATE`, and `DURABILITY <mode>`. `ROTATE` is rejected on replicas — rotation follows the primary's replicated rotation points (see the journal rotation doc). |
 | `--durability-mode <mode>` | Primary | `hybrid` | Active durability mode at startup. `local`, `hybrid`, or `durably-replicated`. Can be swapped at runtime via admin `DURABILITY`. |
 
 `--replication-bind` and `--standalone` are mutually exclusive.

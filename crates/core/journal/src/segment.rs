@@ -116,6 +116,49 @@ pub fn archive_live(live: &Path) -> std::io::Result<PathBuf> {
     Ok(target)
 }
 
+/// Path of the oldest on-disk segment for `live`: the lowest-numbered
+/// archive when any exist, else the live file itself.
+pub fn oldest_segment(live: &Path) -> std::io::Result<PathBuf> {
+    Ok(list_archives(live)?
+        .into_iter()
+        .next()
+        .map(|(_, path)| path)
+        .unwrap_or_else(|| live.to_path_buf()))
+}
+
+/// Read the raw genesis entry (first entry) of the segment at `path`:
+/// `EntryHeader + payload + CRC`, exactly as on disk.
+///
+/// Callers sourcing the `StreamStart` genesis must read it from the
+/// *oldest* segment (see [`oldest_segment`]) — after a rotation the
+/// live file's first entry is a rotation point, not the seq-1 genesis
+/// a fresh replica has to seed from.
+pub fn read_genesis_entry(path: &Path) -> std::io::Result<Vec<u8>> {
+    use std::os::unix::fs::FileExt;
+    let file = std::fs::File::open(path)?;
+    let offset = crate::codec::ENTRY_OFFSET;
+    // First 4 bytes: magic(2) + length(2).
+    let mut hdr4 = [0u8; 4];
+    let n = file.read_at(&mut hdr4, offset)?;
+    if n < 4 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::UnexpectedEof,
+            "journal too short to contain genesis entry",
+        ));
+    }
+    let entry_len = u16::from_le_bytes([hdr4[2], hdr4[3]]) as usize;
+    let total = 20 + entry_len + 4; // EntryHeader(20) + payload + CRC(4)
+    let mut entry = vec![0u8; total];
+    let n = file.read_at(&mut entry, offset)?;
+    if n < total {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::UnexpectedEof,
+            "journal truncated at genesis entry",
+        ));
+    }
+    Ok(entry)
+}
+
 /// Fsync the parent directory of `live` to durably commit dirent
 /// changes (renames, file creations). Without this, a rename + new-file
 /// pair that has reached the page cache may be lost on power loss even

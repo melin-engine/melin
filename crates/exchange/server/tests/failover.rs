@@ -2809,8 +2809,9 @@ fn rotation_soak_under_load() {
     // the rotate flag through the journal stage; rotating after
     // bursts would leave the final ROTATE's flag set with no event
     // to drive observation, producing rounds-1 archives instead of
-    // rounds. Two of the rounds also rotate the replica to validate
-    // independent replica-side rotation.
+    // rounds. Two of the rounds also send ROTATE to the replica to
+    // validate it is rejected — rotation follows the primary; the
+    // replica rotates only at replicated rotation points.
     let per_round: u64 = 15;
     let rounds: u64 = 5;
     let total_orders: u64 = per_round * rounds;
@@ -2820,7 +2821,10 @@ fn rotation_soak_under_load() {
         assert!(resp == "OK", "primary ROTATE #{round} failed: {resp}");
         if round == 1 || round == 3 {
             let resp = admin_command(replica_admin_addr, &operator_key, "ROTATE");
-            assert!(resp == "OK", "replica ROTATE #{round} failed: {resp}");
+            assert!(
+                resp.starts_with("ERR"),
+                "replica must reject ROTATE #{round} — rotation follows the primary (got: {resp})"
+            );
         }
         submit_resting_burst(&mut client, next_id, per_round);
         next_id += per_round;
@@ -2862,8 +2866,9 @@ fn rotation_soak_under_load() {
 
     // Primary should have exactly 5 archives (one per ROTATE).
     assert_eq!(count_archives(&primary_journal), 5, "primary archive count");
-    // Replica should have exactly 2 (the two ROTATEs we sent there).
-    assert_eq!(count_archives(&replica_journal), 2, "replica archive count");
+    // The replica mirrors the primary's segmentation: each rotation
+    // point is replicated and rotates the replica's segment on receipt.
+    assert_eq!(count_archives(&replica_journal), 5, "replica archive count");
 
     // ----- Restart and verify recovered state matches -----
     // primary2 is brought up alone — no replica is spawned alongside it
@@ -3032,19 +3037,21 @@ fn replica_journal_survives_primary_rotation() {
 
     // ----- Stop the replica cleanly and inspect its journal -----
     unsafe { libc::kill(replica.child.id() as i32, libc::SIGINT) };
-    let _ = replica.child.wait_timeout_with_kill(Duration::from_secs(10));
+    let _ = replica
+        .child
+        .wait_timeout_with_kill(Duration::from_secs(10));
 
     let replica_journal = tmp.path().join("replica.journal");
     assert_eq!(
         count_archives(&replica_journal),
-        0,
-        "replica never rotated; its journal must be a single segment"
+        1,
+        "replica segmentation must follow the primary's rotation"
     );
 
     // The replica acked every event (lag 0 three times), so its journal
-    // must be a gapless event stream. Today this walk fails with
-    // `SequenceGap` at the sequence the primary's rotation GenesisHash
-    // consumed — an entry replication never delivered.
+    // must be a gapless event stream. Without the replicated rotation
+    // point this walk fails with `SequenceGap` at the sequence the
+    // primary's rotation GenesisHash consumed.
     let replica_tail = walk_journal_segment(
         &replica_journal,
         "the primary's rotation left a hole in the replica's journal",
@@ -3083,8 +3090,12 @@ fn replica_journal_survives_primary_rotation() {
         libc::kill(primary.child.id() as i32, libc::SIGINT);
         libc::kill(replica.child.id() as i32, libc::SIGINT);
     }
-    let _ = primary.child.wait_timeout_with_kill(Duration::from_secs(10));
-    let _ = replica.child.wait_timeout_with_kill(Duration::from_secs(10));
+    let _ = primary
+        .child
+        .wait_timeout_with_kill(Duration::from_secs(10));
+    let _ = replica
+        .child
+        .wait_timeout_with_kill(Duration::from_secs(10));
 }
 
 /// Repro for the catch-up variant of the rotation × replication defect.
@@ -3178,7 +3189,9 @@ fn replica_survives_catchup_across_primary_rotation() {
     submit_resting_burst(&mut client, 1, 15);
     wait_lag_zero(primary_health, "burst 1");
     unsafe { libc::kill(replica.child.id() as i32, libc::SIGINT) };
-    let _ = replica.child.wait_timeout_with_kill(Duration::from_secs(10));
+    let _ = replica
+        .child
+        .wait_timeout_with_kill(Duration::from_secs(10));
 
     let replica_journal = tmp.path().join("replica.journal");
     let offline_tail = walk_journal_segment(
@@ -3242,7 +3255,9 @@ fn replica_survives_catchup_across_primary_rotation() {
     // Final structural check: stop the replica and walk its live
     // segment (which starts at the replicated genesis entry).
     unsafe { libc::kill(replica.child.id() as i32, libc::SIGINT) };
-    let _ = replica.child.wait_timeout_with_kill(Duration::from_secs(10));
+    let _ = replica
+        .child
+        .wait_timeout_with_kill(Duration::from_secs(10));
     walk_journal_segment(
         &replica_journal,
         "replica live segment must be clean after catch-up across a rotation",
@@ -3250,7 +3265,9 @@ fn replica_survives_catchup_across_primary_rotation() {
 
     drop(client);
     unsafe { libc::kill(primary.child.id() as i32, libc::SIGINT) };
-    let _ = primary.child.wait_timeout_with_kill(Duration::from_secs(10));
+    let _ = primary
+        .child
+        .wait_timeout_with_kill(Duration::from_secs(10));
 }
 
 /// Repro for the replica-local rotation variant: `ROTATE` against a
@@ -3316,9 +3333,7 @@ fn replica_rotate_command_cannot_corrupt_journal() {
     wait_healthy(primary_health, Duration::from_secs(30));
 
     let mut client = connect_with_timeout(primary.client_addr, &key);
-    let replica_admin_addr: SocketAddr = format!("127.0.0.1:{replica_admin_port}")
-        .parse()
-        .unwrap();
+    let replica_admin_addr: SocketAddr = format!("127.0.0.1:{replica_admin_port}").parse().unwrap();
 
     // Burst 1 replicated, then ROTATE the *replica*. The response is
     // asserted at the end (the fix turns it into an ERR); the journal
@@ -3337,7 +3352,9 @@ fn replica_rotate_command_cannot_corrupt_journal() {
 
     // ----- Stop the replica and inspect its journal -----
     unsafe { libc::kill(replica.child.id() as i32, libc::SIGINT) };
-    let _ = replica.child.wait_timeout_with_kill(Duration::from_secs(10));
+    let _ = replica
+        .child
+        .wait_timeout_with_kill(Duration::from_secs(10));
 
     // Today the live segment opens with the replica's own rotation
     // genesis and the very next replicated event reuses its sequence —
@@ -3385,8 +3402,12 @@ fn replica_rotate_command_cannot_corrupt_journal() {
         libc::kill(primary.child.id() as i32, libc::SIGINT);
         libc::kill(replica.child.id() as i32, libc::SIGINT);
     }
-    let _ = primary.child.wait_timeout_with_kill(Duration::from_secs(10));
-    let _ = replica.child.wait_timeout_with_kill(Duration::from_secs(10));
+    let _ = primary
+        .child
+        .wait_timeout_with_kill(Duration::from_secs(10));
+    let _ = replica
+        .child
+        .wait_timeout_with_kill(Duration::from_secs(10));
 }
 
 /// `policy_degraded` health gauge transitions correctly across a

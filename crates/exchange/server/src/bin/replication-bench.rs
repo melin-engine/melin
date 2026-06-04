@@ -250,7 +250,6 @@ fn main() {
                 std::time::Duration::ZERO,
                 8, // pipeline_depth
                 busy_spin,
-                None, // rotation: bench replica doesn't rotate
                 std::sync::Arc::new(melin_server::app_factory::Factory::new(
                     melin_server::app_factory::FactoryConfig {
                         accounts: 0,
