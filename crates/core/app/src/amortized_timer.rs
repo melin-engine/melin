@@ -12,11 +12,11 @@
 //! before this timer was adopted).
 //!
 //! [`AmortizedTimer::tick`] reads the clock only once every
-//! [`Self::CHECK_MASK`] + 1 iterations (~1 M) **while spinning**. When
+//! [`Self::CHECK_MASK`] + 1 iterations (~65 k) **while spinning**. When
 //! the caller has fallen back to `yield_now()` the loop rate drops to
 //! scheduler timeslice frequency (typically hundreds of iterations per
-//! second), so the mask would delay a 5 s heartbeat by 2^20 × yield_latency
-//! ≈ 17 minutes. Passing `spinning = false` bypasses the mask and reads
+//! second), so the mask would delay a 5 s heartbeat by 2^16 × yield_latency
+//! ≈ 1 minute. Passing `spinning = false` bypasses the mask and reads
 //! the clock every iteration; the yield syscall already paid orders of
 //! magnitude more than a vDSO clock read.
 //!
@@ -39,8 +39,10 @@ impl Default for AmortizedTimer {
 
 impl AmortizedTimer {
     /// Power-of-two mask so `iter & CHECK_MASK` lowers to `AND`.
-    /// At ~10 M loop iters/s this yields ~10 clock reads per second.
-    const CHECK_MASK: u64 = (1 << 20) - 1;
+    /// At ~10 M loop iters/s this yields ~150 clock reads per second
+    /// (~6.5 ms apart) — still negligible (~3 µs/s of vDSO time), but
+    /// fine-grained enough for callers wanting ~10 ms event resolution.
+    const CHECK_MASK: u64 = (1 << 16) - 1;
 
     pub fn new() -> Self {
         Self {
