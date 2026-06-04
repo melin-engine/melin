@@ -2856,6 +2856,216 @@ fn rotation_soak_under_load() {
     );
 }
 
+/// Repro for the rotation × live-replication defect: rotating the
+/// primary's journal writes a `GenesisHash` entry that consumes a
+/// sequence number and re-seeds the hash chain, but that entry is never
+/// published to the replication stream. A replica that live-streams
+/// through the rotation ends up with a hole in its journal at the
+/// genesis sequence — silently, until its next restart, when journal
+/// recovery fails with `SequenceGap` and the node cannot rejoin the
+/// cluster.
+///
+/// The test asserts the *correct* behavior (gapless replica journal,
+/// successful restart + rejoin), so it fails until the defect is fixed.
+#[test]
+#[serial]
+fn replica_journal_survives_primary_rotation() {
+    let bin = server_bin();
+    assert!(bin.exists(), "melin-server binary not found at {bin:?}");
+    let tmp = tempfile::Builder::new()
+        .prefix("melin-rotrepl-")
+        .tempdir()
+        .expect("create temp dir");
+
+    let key = SigningKey::from_bytes(&[0xD1; 32]);
+    let operator_key = SigningKey::from_bytes(&[0xD2; 32]);
+    let repl_key = SigningKey::from_bytes(&[0xD3; 32]);
+    let (keys_path, repl_key_path) =
+        write_auth_keys_multi(tmp.path(), &[&key], &operator_key, &repl_key);
+
+    let primary_repl_port = free_port();
+    let primary_admin_port = free_port();
+
+    // Same isolation as `rotation_soak_under_load`: disable the size
+    // trigger (ROTATE only, for determinism) and push the checkpoint
+    // interval out of reach so the known checkpoint × rotation race
+    // can't muddy the repro.
+    let primary_admin_addr = format!("127.0.0.1:{primary_admin_port}");
+    let primary_extra: &[&str] = &[
+        "--admin-bind",
+        &primary_admin_addr,
+        "--max-journal-mib",
+        "0",
+    ];
+    let extra_env: &[(&str, &str)] = &[("MELIN_JOURNAL_CHECKPOINT_INTERVAL", "1000000")];
+
+    let mut primary = spawn_primary_with_extra_env(
+        &bin,
+        tmp.path(),
+        &keys_path,
+        free_port(),
+        free_port(),
+        primary_repl_port,
+        primary_extra,
+        extra_env,
+    );
+    let primary_health = primary.health_addr;
+    wait_for_primary_repl_ready(primary_health, Duration::from_secs(10));
+
+    let mut replica = spawn_replica_named_with_extra_env(
+        &bin,
+        tmp.path(),
+        &keys_path,
+        &repl_key_path,
+        primary_repl_port,
+        free_port(),
+        free_port(),
+        free_port(),
+        "replica",
+        &[],
+        extra_env,
+    );
+    wait_healthy(primary_health, Duration::from_secs(30));
+
+    let mut client = connect_with_timeout(primary.client_addr, &key);
+    let admin_addr: SocketAddr = primary_admin_addr.parse().unwrap();
+
+    // While the replica is connected its slot participates in the lag
+    // min, so lag==0 here genuinely means "replica acked everything".
+    let wait_lag_zero = |label: &str| {
+        let start = Instant::now();
+        loop {
+            let h = query_health(primary_health);
+            if let Ok((_, _, 0, _)) = h {
+                return;
+            }
+            assert!(
+                start.elapsed() < Duration::from_secs(30),
+                "replication lag did not reach 0 after {label}; last health = {h:?}"
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    };
+
+    // Burst 1: pre-rotation traffic, fully replicated.
+    submit_resting_burst(&mut client, 1, 15);
+    wait_lag_zero("burst 1");
+
+    // Rotate the primary mid-stream. The flag is consumed at the next
+    // fsync boundary, so burst 2 drives the actual rotation. Poll for
+    // the archive rather than asserting immediately — the replica ack
+    // (and thus lag==0) can race ahead of the rename by a few ms.
+    let resp = admin_command(admin_addr, &operator_key, "ROTATE");
+    assert_eq!(resp, "OK", "primary ROTATE failed: {resp}");
+    submit_resting_burst(&mut client, 101, 15);
+    wait_lag_zero("burst 2");
+    let primary_journal = tmp.path().join("primary.journal");
+    let start = Instant::now();
+    while count_archives(&primary_journal) != 1 {
+        assert!(
+            start.elapsed() < Duration::from_secs(10),
+            "primary never rotated (archives = {})",
+            count_archives(&primary_journal)
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+
+    // Burst 3: post-rotation traffic, so the replica's journal has
+    // entries on both sides of the rotation point.
+    submit_resting_burst(&mut client, 201, 15);
+    wait_lag_zero("burst 3");
+
+    // ----- Stop the replica cleanly and inspect its journal -----
+    unsafe { libc::kill(replica.child.id() as i32, libc::SIGINT) };
+    let _ = replica.child.wait_timeout_with_kill(Duration::from_secs(10));
+
+    let replica_journal = tmp.path().join("replica.journal");
+    assert_eq!(
+        count_archives(&replica_journal),
+        0,
+        "replica never rotated; its journal must be a single segment"
+    );
+
+    // The replica acked every event (lag 0 three times), so its journal
+    // must be a gapless event stream. Today this walk fails with
+    // `SequenceGap` at the sequence the primary's rotation GenesisHash
+    // consumed — an entry replication never delivered.
+    use melin_journal::JournalReader;
+    let mut reader =
+        JournalReader::<melin_trading::trading_event::TradingEvent>::open(&replica_journal)
+            .expect("open replica journal");
+    loop {
+        match reader.next_entry() {
+            Ok(Some(_)) => {}
+            Ok(None) => break,
+            Err(e) => panic!(
+                "replica journal walk failed after seq {:?}: {e:?} — \
+                 the primary's rotation left a hole in the replica's journal",
+                reader.last_sequence()
+            ),
+        }
+    }
+    let replica_tail = reader.last_sequence().unwrap_or(0);
+    assert!(
+        replica_tail >= 45,
+        "replica journal too short: tail = {replica_tail}"
+    );
+
+    // ----- Restart the replica on its own journal and rejoin -----
+    // Recovery performs the same walk as above in-process; a hole means
+    // the process exits instead of reconnecting.
+    replica = spawn_replica_named_with_extra_env(
+        &bin,
+        tmp.path(),
+        &keys_path,
+        &repl_key_path,
+        primary_repl_port,
+        free_port(),
+        free_port(),
+        free_port(),
+        "replica",
+        &[],
+        extra_env,
+    );
+
+    // Wait until the restarted replica reconnects and re-acks its tail.
+    // The handshake seeds the slot's acked cursor at the replica's
+    // last_sequence, so acked >= replica_tail proves the rejoin.
+    let start = Instant::now();
+    loop {
+        if let Some(cursors) = fetch_replica_cursors(primary_health)
+            && cursors
+                .iter()
+                .any(|&(_, acked)| acked != u64::MAX && acked >= replica_tail)
+        {
+            break;
+        }
+        if let Some(status) = replica.child.try_wait().expect("poll restarted replica") {
+            panic!(
+                "restarted replica exited ({status}) instead of rejoining — \
+                 journal recovery failed on the post-rotation journal"
+            );
+        }
+        assert!(
+            start.elapsed() < Duration::from_secs(30),
+            "restarted replica never re-acked its tail (seq {replica_tail})"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+
+    // Live streaming must resume end-to-end after the rejoin.
+    submit_resting_burst(&mut client, 301, 15);
+    wait_lag_zero("post-restart burst");
+
+    drop(client);
+    unsafe {
+        libc::kill(primary.child.id() as i32, libc::SIGINT);
+        libc::kill(replica.child.id() as i32, libc::SIGINT);
+    }
+    let _ = primary.child.wait_timeout_with_kill(Duration::from_secs(10));
+    let _ = replica.child.wait_timeout_with_kill(Duration::from_secs(10));
+}
+
 /// `policy_degraded` health gauge transitions correctly across a
 /// replica failure under the default `persisted>=2 best_effort`
 /// policy. Default policy plus 2 connected replicas → 3 nodes in
