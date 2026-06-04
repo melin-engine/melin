@@ -185,7 +185,7 @@ connection separate from the client protocol.
 
 | Message | Layout | Purpose |
 |---|---|---|
-| StreamStart | `[len:u32][type=0x10][start_sequence:u64][segment_start_sequence:u64][anchor_hash:[u8;32]]` | Confirms the handshake; carries the journal-segment identity (starting sequence + chain anchor) a fresh replica creates its local journal with, so its journal is byte-identical to the primary's as the stream is consumed. |
+| StreamStart | `[len:u32][type=0x10][start_sequence:u64][segment_start_sequence:u64][anchor_hash:[u8;32]]` | Confirms the handshake; carries the journal-segment identity (starting sequence + chain anchor) a fresh replica creates its local journal with. The replica's segment is byte-identical to the primary's until the first rotation on either node — rotations are local, so segment boundaries diverge after that even though the event stream stays identical (alignment lands with primary-driven rotation; see Limitations). |
 | NeedSnapshot | `[len:u32][type=0x11]` | Replica is too far behind the live journal and archives have been purged — triggers snapshot transfer. |
 | SnapshotBegin | `[len:u32][type=0x13][snapshot_len:u64][snap_sequence:u64][snap_chain_hash:[u8;32]]` | Start of snapshot transfer with metadata. |
 | SnapshotChunk | `[len:u32][type=0x14][data...]` | Chunk of snapshot data (up to 64 KiB). |
@@ -260,6 +260,12 @@ history (e.g. previously connected to a different primary, or with a
 corrupted journal) is accepted without warning. After failover the
 promoted node would hold a journal that doesn't match the events
 clients were told about.
+
+This includes the live stream: the replica decodes and re-encodes
+events locally, and nothing compares the resulting journals across
+nodes at runtime. (The pre-v14 design verified in-stream checkpoint
+hashes, but only on the catch-up path — live streaming was never
+covered — so v14 retired that partial check rather than replacing it.)
 
 Each node *does* verify its own journal's integrity locally on every
 recovery (per-segment chains, cross-segment anchors, snapshot

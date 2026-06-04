@@ -687,6 +687,14 @@ fn dump_journal_for_diagnosis(src: &std::path::Path, label: &str) -> String {
 /// published event — and, because the replica re-encodes the same
 /// (seq, timestamp, key, payload) tuples over the same anchor, the two
 /// journals must be chain-identical (the bitwise-mirror property).
+///
+/// Scope: neither side rotates here, so both journals are single
+/// segments sharing one anchor. Chain equality only holds while
+/// segment boundaries align — an unaligned rotation on either node
+/// legitimately breaks it (the entry *stream* stays identical). Do not
+/// extend this test with rotation and keep the equality assert;
+/// cross-node comparison under rotation is the primary-driven-rotation
+/// roadmap item.
 #[cfg(all(feature = "hash-chain", not(feature = "no-persist")))]
 #[test]
 fn primary_and_replica_journals_contiguous_and_chain_identical() {

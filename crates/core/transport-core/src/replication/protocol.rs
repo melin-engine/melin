@@ -280,8 +280,12 @@ pub fn encode_auth_failed(buf: &mut Vec<u8>) {
 ///
 /// `segment_start_sequence` and `anchor_hash` identify the journal
 /// segment a fresh replica should create before consuming the stream —
-/// with the same header identity and the same entry bytes, the replica's
-/// journal is byte-identical to the primary's from that point on.
+/// with the same header identity and the same entry bytes, the
+/// replica's segment is byte-identical to the primary's **until the
+/// first rotation on either node**: rotations are local, so segment
+/// boundaries (and with them per-segment anchors and chain values)
+/// diverge after that, even though the entry stream stays identical.
+/// Boundary alignment lands with primary-driven rotation (roadmap).
 pub fn encode_stream_start(
     start_sequence: u64,
     segment_start_sequence: u64,
@@ -519,11 +523,9 @@ pub fn decode_journal_to_input_slots<E: AppEvent>(
     let mut offset = 0;
     while offset < journal_bytes.len() {
         let (consumed, sequence, timestamp_ns, key_hash, request_seq, event) =
-            melin_journal::codec::decode::<E>(
-                &journal_bytes[offset..],
-                melin_journal::codec::FORMAT_VERSION,
-            )
-            .map_err(|e| io::Error::other(format!("journal decode at offset {offset}: {e:?}")))?;
+            melin_journal::codec::decode::<E>(&journal_bytes[offset..]).map_err(|e| {
+                io::Error::other(format!("journal decode at offset {offset}: {e:?}"))
+            })?;
         offset += consumed;
         slots.push(InputSlot {
             connection_id: 0,

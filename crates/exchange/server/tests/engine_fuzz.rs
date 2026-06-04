@@ -13,7 +13,7 @@ use melin_trading::trading_event::TradingEvent;
 #[test]
 fn fuzz_journal_decode() {
     bolero::check!().for_each(|data: &[u8]| {
-        let _ = codec::decode::<TradingEvent>(data, codec::FORMAT_VERSION);
+        let _ = codec::decode::<TradingEvent>(data);
     });
 }
 
@@ -45,8 +45,7 @@ fn fuzz_journal_roundtrip() {
         };
 
         let (consumed, dec_seq, dec_ts, _kh, _rs, dec_event) =
-            codec::decode(&buf[..written], codec::FORMAT_VERSION)
-                .expect("decode of freshly encoded event must succeed");
+            codec::decode(&buf[..written]).expect("decode of freshly encoded event must succeed");
 
         assert_eq!(consumed, written);
         assert_eq!(dec_seq, seq);

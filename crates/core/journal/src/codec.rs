@@ -127,9 +127,12 @@ struct FileHeader {
 }
 
 /// Decoded file-header fields returned by [`decode_file_header`].
+///
+/// No `version` field: [`decode_file_header`] accepts only
+/// [`FORMAT_VERSION`], so the gate inside it is the single source of
+/// truth and nothing downstream branches on a version.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FileHeaderInfo {
-    pub version: u16,
     /// Byte offset where entries begin (one header reservation).
     pub sector_size: usize,
     /// Sequence number of the segment's first entry.
@@ -270,9 +273,9 @@ pub fn decode_file_header(buf: &[u8]) -> Result<FileHeaderInfo, JournalError> {
     if header.file_magic.get() != FILE_MAGIC {
         return Err(JournalError::InvalidFile);
     }
-    let version = header.format_version.get();
     // Pre-production: only the current version is accepted. Older
     // formats can be revived later as the on-disk format stabilises.
+    let version = header.format_version.get();
     if version != FORMAT_VERSION {
         return Err(JournalError::UnsupportedVersion { version });
     }
@@ -299,7 +302,6 @@ pub fn decode_file_header(buf: &[u8]) -> Result<FileHeaderInfo, JournalError> {
         _ => return Err(JournalError::InvalidFile),
     };
     Ok(FileHeaderInfo {
-        version,
         sector_size,
         starting_sequence: header.starting_sequence.get(),
         anchor_hash: header.anchor_hash,
@@ -398,9 +400,10 @@ pub type DecodedEntry<E> = (usize, u64, u64, u64, u64, JournalEvent<E>);
 /// Decode a journal entry from `buf`.
 ///
 /// Returns `(bytes_consumed, sequence, timestamp_ns, key_hash, request_seq, event)`.
-/// The `version` parameter is reserved for future per-version layout
-/// branches; the current codec accepts only [`FORMAT_VERSION`].
-pub fn decode<E: AppEvent>(buf: &[u8], _version: u16) -> Result<DecodedEntry<E>, JournalError> {
+/// Entry layout is versioned by the file header alone —
+/// [`decode_file_header`] rejects anything but [`FORMAT_VERSION`], so by
+/// the time entries are decoded the layout is known.
+pub fn decode<E: AppEvent>(buf: &[u8]) -> Result<DecodedEntry<E>, JournalError> {
     if buf.len() < ENTRY_HEADER_SIZE + 1 + CRC_SIZE {
         return Err(JournalError::TruncatedEntry);
     }
@@ -557,8 +560,7 @@ mod tests {
     fn round_trip(event: JournalEvent<TestEvent>) {
         let mut buf = [0u8; 256];
         let n = encode(42, 123_456, 0xabcd, 7, &event, &mut buf).expect("encode");
-        let (consumed, seq, ts, kh, rs, decoded) =
-            decode::<TestEvent>(&buf[..n], FORMAT_VERSION).expect("decode");
+        let (consumed, seq, ts, kh, rs, decoded) = decode::<TestEvent>(&buf[..n]).expect("decode");
         assert_eq!(consumed, n);
         assert_eq!(seq, 42);
         assert_eq!(ts, 123_456);
@@ -592,7 +594,7 @@ mod tests {
         // Corrupt the entry magic.
         buf[0] = 0;
         buf[1] = 0;
-        let err = decode::<TestEvent>(&buf[..n], FORMAT_VERSION).unwrap_err();
+        let err = decode::<TestEvent>(&buf[..n]).unwrap_err();
         assert!(matches!(err, JournalError::CorruptEntry { .. }));
     }
 
@@ -603,13 +605,13 @@ mod tests {
         let n = encode(1, 0, 0, 0, &ev, &mut buf).unwrap();
         // Flip a byte inside the payload (post-header, pre-CRC).
         buf[ENTRY_HEADER_SIZE + 16 + 1] ^= 0xff;
-        let err = decode::<TestEvent>(&buf[..n], FORMAT_VERSION).unwrap_err();
+        let err = decode::<TestEvent>(&buf[..n]).unwrap_err();
         assert!(matches!(err, JournalError::ChecksumMismatch { .. }));
     }
 
     #[test]
     fn truncated_input_rejected() {
-        let err = decode::<TestEvent>(&[0u8; 10], FORMAT_VERSION).unwrap_err();
+        let err = decode::<TestEvent>(&[0u8; 10]).unwrap_err();
         assert!(matches!(err, JournalError::TruncatedEntry));
     }
 
@@ -639,7 +641,7 @@ mod tests {
         let data_end = n - CRC_SIZE;
         let new_crc = crc32c::crc32c(&buf[..data_end]);
         le::put_u32(&mut buf[data_end..], new_crc);
-        let err = decode::<TestEvent>(&buf[..n], FORMAT_VERSION).unwrap_err();
+        let err = decode::<TestEvent>(&buf[..n]).unwrap_err();
         assert!(matches!(err, JournalError::CorruptEntry { .. }));
     }
 
@@ -651,7 +653,6 @@ mod tests {
         assert_eq!(
             decode_file_header(&buf).unwrap(),
             FileHeaderInfo {
-                version: FORMAT_VERSION,
                 sector_size: 512,
                 starting_sequence: 42,
                 anchor_hash: anchor,
@@ -664,7 +665,6 @@ mod tests {
         let mut buf = [0u8; MAX_SECTOR_SIZE];
         encode_file_header(&mut buf, 4096, 1, [0u8; 32]);
         let info = decode_file_header(&buf).unwrap();
-        assert_eq!(info.version, FORMAT_VERSION);
         assert_eq!(info.sector_size, 4096);
         assert_eq!(info.starting_sequence, 1);
     }

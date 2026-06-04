@@ -68,9 +68,6 @@ pub struct JournalReader<E: AppEvent> {
     /// Byte offset in the file of the end of the last successfully decoded entry.
     /// Used by recovery to know where to truncate trailing garbage.
     valid_file_end: u64,
-    /// Journal format version from the file header. Reserved for future
-    /// per-version layout branches in the codec.
-    version: u16,
     /// Byte offset where entries begin (one header reservation). Decoded
     /// from the file header at open time.
     sector_size: usize,
@@ -113,7 +110,6 @@ impl<E: AppEvent> JournalReader<E> {
             valid: 0,
             last_sequence: None,
             valid_file_end: info.sector_size as u64,
-            version: info.version,
             sector_size: info.sector_size,
             starting_sequence: info.starting_sequence,
             #[cfg(feature = "hash-chain")]
@@ -145,7 +141,7 @@ impl<E: AppEvent> JournalReader<E> {
 
         let data = &self.buffer[self.pos..self.valid];
 
-        match codec::decode(data, self.version) {
+        match codec::decode(data) {
             Ok((consumed, sequence, timestamp_ns, key_hash, request_seq, event)) => self
                 .validate_and_advance(
                     consumed,
@@ -167,7 +163,7 @@ impl<E: AppEvent> JournalReader<E> {
                         return Ok(None);
                     }
 
-                    match codec::decode(data, self.version) {
+                    match codec::decode(data) {
                         Ok((consumed, sequence, timestamp_ns, key_hash, request_seq, event)) => {
                             self.validate_and_advance(
                                 consumed,

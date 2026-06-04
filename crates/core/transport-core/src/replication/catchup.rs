@@ -57,7 +57,8 @@ pub fn discover_journal_files(journal_path: &std::path::Path) -> Vec<std::path::
 
 /// Header identity of the oldest available segment — the lineage origin
 /// a fresh replica must create its journal with so full catch-up
-/// produces a byte-identical journal.
+/// produces a byte-identical segment (identical until the first
+/// rotation on either node; segment boundaries are local after that).
 pub fn lineage_origin(journal_path: &std::path::Path) -> io::Result<(u64, [u8; 32])> {
     let files = discover_journal_files(journal_path);
     let oldest = files
