@@ -131,6 +131,8 @@ This is materially different from the legacy startup-only rotation, where the sn
 
 Archived segments are append-only history and **not deleted automatically**. The full sequence of events from genesis is preserved across all archive files plus the live segment. Operators who need long-term retention should set up a separate workflow (e.g., copy `melin.journal.NNNNNN` to cold storage when their numeric suffix is sufficiently old).
 
+Removing local archives is only safe when a snapshot covers them: recovery requires the oldest surviving segment to start at or before `snapshot_sequence + 1` (sequence 1 when no snapshot exists) and refuses to start otherwise (`MissingHistoryPrefix`), rather than silently rebuilding partial state from a truncated history.
+
 Replays for forensic purposes can use the standalone reader against any archived segment in isolation: the chain is self-contained per segment (header anchor + entry bytes), with cross-segment continuity validated against the next segment's header anchor. Because the chain is defined over the raw byte stream, a sealed segment can even be verified without journal-aware tooling: `BLAKE3(bytes[4096..valid_end] ‖ anchor)` must equal the successor's anchor.
 
 ### Replication

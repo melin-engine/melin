@@ -2643,6 +2643,84 @@ fn count_archives(journal_path: &Path) -> usize {
         .unwrap_or(0)
 }
 
+/// Walk a node's full segment chain (archives in monotonic order, then
+/// the live segment) and assert every lineage invariant:
+///
+/// - each segment's first entry carries its header `starting_sequence`
+///   (enforced by the reader itself);
+/// - sequences are dense across segment boundaries — a successor's
+///   header starts exactly one past the predecessor's last entry (or at
+///   the same value after an empty segment);
+/// - each successor's header anchor equals the predecessor's tail chain
+///   hash (cross-segment tamper link).
+///
+/// Returns `(first_sequence, last_sequence)` over the whole lineage.
+fn walk_segments_dense(journal_path: &Path) -> (u64, u64) {
+    use melin_journal::JournalReader;
+    use melin_trading::trading_event::TradingEvent;
+
+    let mut segments: Vec<std::path::PathBuf> = melin_journal::segment::list_archives(journal_path)
+        .expect("list archives")
+        .into_iter()
+        .map(|(_, p)| p)
+        .collect();
+    segments.push(journal_path.to_path_buf());
+
+    let mut prev_tail: Option<[u8; 32]> = None;
+    let mut expected_start: Option<u64> = None;
+    let mut first_seq: Option<u64> = None;
+    let mut last_seq: u64 = 0;
+
+    for path in &segments {
+        let mut reader = JournalReader::<TradingEvent>::open(path)
+            .unwrap_or_else(|e| panic!("open segment {}: {e}", path.display()));
+
+        if let (Some(prev), Some(anchor)) = (prev_tail, reader.anchor()) {
+            assert_eq!(
+                prev,
+                anchor,
+                "segment {} anchor does not match predecessor's tail",
+                path.display()
+            );
+        }
+        if let Some(expected) = expected_start {
+            assert_eq!(
+                reader.starting_sequence(),
+                expected,
+                "segment {} starts mid-air (sequence gap across boundary)",
+                path.display()
+            );
+        }
+
+        // Walk every entry; the reader enforces in-segment density and
+        // the header/first-entry match.
+        while let Some(entry) = reader
+            .next_entry()
+            .unwrap_or_else(|e| panic!("walk {}: {e}", path.display()))
+        {
+            if first_seq.is_none() {
+                first_seq = Some(entry.sequence);
+            }
+            last_seq = entry.sequence;
+        }
+
+        if let Some(tail) = reader.chain_hash() {
+            prev_tail = Some(tail);
+        }
+        expected_start = Some(
+            reader
+                .last_sequence()
+                .map(|s| s + 1)
+                .unwrap_or_else(|| reader.starting_sequence()),
+        );
+    }
+
+    (
+        first_seq.expect("lineage should contain at least one entry"),
+        last_seq,
+    )
+}
+
 #[test]
 #[serial]
 fn rotation_soak_under_load() {
@@ -2768,6 +2846,33 @@ fn rotation_soak_under_load() {
     assert_eq!(count_archives(&primary_journal), 5, "primary archive count");
     // Replica should have exactly 2 (the two ROTATEs we sent there).
     assert_eq!(count_archives(&replica_journal), 2, "replica archive count");
+
+    // Walk BOTH nodes' full segment chains and assert every lineage
+    // invariant holds: dense sequences within and across segments, each
+    // segment's first entry matching its header, and each successor's
+    // anchor equal to its predecessor's tail chain hash. On the replica
+    // this is the end-to-end regression guard for "primary rotations
+    // must not punch sequence gaps into a live replica's journal" — a
+    // failure mode that previously went undetected because no test ever
+    // replayed a replica journal written across primary rotations.
+    let (p_first, p_last) = walk_segments_dense(&primary_journal);
+    let (r_first, r_last) = walk_segments_dense(&replica_journal);
+    assert_eq!(p_first, 1, "primary lineage must begin at sequence 1");
+    assert_eq!(r_first, 1, "replica lineage must begin at sequence 1");
+    assert!(
+        p_last >= total_orders,
+        "primary tail {p_last} must cover all {total_orders} orders"
+    );
+    // Every acked order is durable on the replica (clean SIGINT drains
+    // the replica's ring into its journal), and the orders alone occupy
+    // at least `total_orders` sequences. Not compared against `p_last`
+    // or the health cursor: periodic Tick events journaled between the
+    // lag-0 observation and SIGINT may legitimately not have
+    // replicated. The dense walk above is what catches gaps.
+    assert!(
+        r_last >= total_orders,
+        "replica tail {r_last} must cover all {total_orders} orders"
+    );
 
     // ----- Restart and verify recovered state matches -----
     // primary2 is brought up alone — no replica is spawned alongside it

@@ -816,6 +816,57 @@ mod tests {
         assert!(err.is_err(), "expected error, got {err:?}");
     }
 
+    /// A repeated sequence number mid-stream surfaces as
+    /// `SequenceDuplicate`, distinct from `SequenceGap`, so operators
+    /// can tell "writer emitted the same seq twice" from "entries
+    /// missing". The writers' debug asserts make this unreachable in
+    /// process; the forged entry simulates an external tool or storage
+    /// anomaly producing it on disk.
+    #[test]
+    fn duplicate_sequence_detected() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.journal");
+        {
+            let mut writer = SectorWriter::<TestEvent>::create(&path).unwrap();
+            writer.append(&JournalEvent::App(TestEvent(1))).unwrap();
+            writer.append(&JournalEvent::App(TestEvent(2))).unwrap();
+        }
+        let valid_end = {
+            let mut reader = JournalReader::<TestEvent>::open(&path).unwrap();
+            while reader.next_entry().unwrap().is_some() {}
+            reader.valid_file_end()
+        };
+
+        // Forge a fully valid entry (correct CRC) that re-uses seq 2.
+        let mut scratch = [0u8; 256];
+        let len =
+            codec::encode(2, 0, 0, 0, &JournalEvent::App(TestEvent(99)), &mut scratch).unwrap();
+        use std::io::{Seek, SeekFrom};
+        let mut file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
+        file.seek(SeekFrom::Start(valid_end)).unwrap();
+        file.write_all(&scratch[..len]).unwrap();
+        file.sync_all().unwrap();
+
+        let mut reader = JournalReader::<TestEvent>::open(&path).unwrap();
+        reader.next_entry().unwrap().expect("first entry");
+        reader.next_entry().unwrap().expect("second entry");
+        let err = reader.next_entry();
+        assert!(
+            matches!(
+                err,
+                Err(JournalError::SequenceDuplicate {
+                    sequence: 2,
+                    previous_seq: 2
+                })
+            ),
+            "expected SequenceDuplicate, got {err:?}"
+        );
+    }
+
     /// Defense-in-depth: bytes past the writer's last durable entry can,
     /// under specific failure modes (e.g. an in-flight async write whose
     /// CQE hasn't arrived, or a torn multi-sector write), look entry-shaped

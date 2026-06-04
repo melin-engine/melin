@@ -345,3 +345,103 @@ pub fn catch_up_from_journal<E: AppEvent>(
     };
     catch_up_from_journal_with::<E>(journal_path, last_sequence, &mut publish, shutdown)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_support::TestEvent;
+    use melin_journal::{BufferedWriter, JournalEvent, JournalWrite};
+
+    /// Build a 3-segment journal (two rotations) with one event per
+    /// phase, returning the live path.
+    fn three_segment_journal(dir: &std::path::Path) -> std::path::PathBuf {
+        let live = dir.join("j.journal");
+        let mut writer = BufferedWriter::<TestEvent>::create(&live).unwrap();
+        writer
+            .append(&JournalEvent::App(TestEvent::Add(1)))
+            .unwrap();
+        writer.rotate_segment().unwrap();
+        writer
+            .append(&JournalEvent::App(TestEvent::Add(2)))
+            .unwrap();
+        writer.rotate_segment().unwrap();
+        writer
+            .append(&JournalEvent::App(TestEvent::Add(3)))
+            .unwrap();
+        drop(writer);
+        live
+    }
+
+    /// Catch-up discovery must see monotonic `.NNNNNN` archives in
+    /// rotation order, then the live segment — the same set recovery
+    /// walks. (Regression: discovery used the legacy `.1`/`.2` naming
+    /// and silently saw only the live segment, forcing snapshot
+    /// transfers for any replica behind the last rotation.)
+    #[test]
+    fn discovery_orders_monotonic_archives_oldest_first() {
+        let dir = tempfile::tempdir().unwrap();
+        let live = three_segment_journal(dir.path());
+
+        let files = discover_journal_files(&live);
+        assert_eq!(files.len(), 3, "two archives + live: {files:?}");
+        assert_eq!(files[0], dir.path().join("j.journal.000001"));
+        assert_eq!(files[1], dir.path().join("j.journal.000002"));
+        assert_eq!(files[2], live);
+
+        // Header starting sequences must ascend across the walk order.
+        let starts: Vec<u64> = files
+            .iter()
+            .map(|p| {
+                melin_journal::segment::read_header_info(p)
+                    .unwrap()
+                    .starting_sequence
+            })
+            .collect();
+        assert_eq!(starts, vec![1, 2, 3]);
+    }
+
+    /// The lineage origin is the oldest segment's header identity —
+    /// what a fresh replica must seed its journal with so full catch-up
+    /// reproduces the primary's journal byte-for-byte.
+    #[test]
+    fn lineage_origin_is_oldest_segments_header() {
+        let dir = tempfile::tempdir().unwrap();
+        let live = three_segment_journal(dir.path());
+
+        let (start, anchor) = lineage_origin(&live).unwrap();
+        let oldest =
+            melin_journal::segment::read_header_info(&dir.path().join("j.journal.000001")).unwrap();
+        assert_eq!(start, 1);
+        assert_eq!(start, oldest.starting_sequence);
+        assert_eq!(anchor, oldest.anchor_hash);
+
+        // Without rotations, the live segment itself is the origin.
+        let solo = dir.path().join("solo.journal");
+        drop(BufferedWriter::<TestEvent>::create(&solo).unwrap());
+        let (solo_start, solo_anchor) = lineage_origin(&solo).unwrap();
+        let solo_info = melin_journal::segment::read_header_info(&solo).unwrap();
+        assert_eq!(solo_start, 1);
+        assert_eq!(solo_anchor, solo_info.anchor_hash);
+    }
+
+    /// Catch-up probing spans the full archive set: a replica whose
+    /// `last_sequence` falls inside the oldest archive is reachable by
+    /// journal catch-up; one predating a trimmed history is not.
+    #[test]
+    fn can_catch_up_spans_archives() {
+        let dir = tempfile::tempdir().unwrap();
+        let live = three_segment_journal(dir.path());
+
+        // Seq 1 lives in archive 000001 — reachable.
+        assert!(can_catch_up_from_journal(&live, 1).unwrap());
+        // Fresh replica (0) — always reachable via full replay.
+        assert!(can_catch_up_from_journal(&live, 0).unwrap());
+
+        // Trim the oldest archive: a replica at seq 1 now predates all
+        // surviving files (000002 starts at 2).
+        std::fs::remove_file(dir.path().join("j.journal.000001")).unwrap();
+        assert!(!can_catch_up_from_journal(&live, 1).unwrap());
+        // But a replica already at seq 2 is still reachable.
+        assert!(can_catch_up_from_journal(&live, 2).unwrap());
+    }
+}

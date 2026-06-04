@@ -63,6 +63,21 @@ pub enum JournaledAppError {
         expected_chain_hash: [u8; 32],
         actual_chain_hash: [u8; 32],
     },
+    /// The oldest available segment begins after the history start that
+    /// recovery requires (sequence 1 without a snapshot; the snapshot's
+    /// anchor + 1 with one). Replaying would silently reconstruct
+    /// partial state — events before `first_segment_start` exist in the
+    /// lineage (the header proves it) but are not on disk and not
+    /// covered by a snapshot. Causes: archives trimmed to cold storage
+    /// without a covering snapshot, a deleted snapshot file on a node
+    /// whose journal was created mid-history (e.g. a snapshot-seeded
+    /// replica), or a snapshot/journal pair from different points in
+    /// the lineage. Recovery refuses to proceed; restore the missing
+    /// archives or a snapshot covering them.
+    MissingHistoryPrefix {
+        first_segment_start: u64,
+        required_floor: u64,
+    },
 }
 
 impl std::fmt::Display for JournaledAppError {
@@ -93,6 +108,16 @@ impl std::fmt::Display for JournaledAppError {
                 melin_journal::error::hex_prefix(expected_chain_hash),
                 melin_journal::error::hex_prefix(actual_chain_hash),
             ),
+            Self::MissingHistoryPrefix {
+                first_segment_start,
+                required_floor,
+            } => write!(
+                f,
+                "journal history begins at sequence {first_segment_start} but recovery \
+                 requires it to begin at or before {required_floor} — archives trimmed \
+                 without a covering snapshot, or snapshot/journal from different points \
+                 in the lineage",
+            ),
         }
     }
 }
@@ -105,6 +130,7 @@ impl std::error::Error for JournaledAppError {
             Self::Io(e) => Some(e),
             Self::SnapshotAnchorMissing { .. } => None,
             Self::SnapshotChainMismatch { .. } => None,
+            Self::MissingHistoryPrefix { .. } => None,
         }
     }
 }
@@ -194,6 +220,10 @@ impl<A: Application, W: JournalWrite<A::Event>> JournaledApp<A, W> {
 
         let mut reports: Vec<A::Report> = Vec::new();
         let mut last_drain_ns: u64 = 0;
+        // The oldest walked segment must start at or before this floor,
+        // or a prefix of history is provably missing (see
+        // [`Self::MissingHistoryPrefix`]).
+        let history_floor = snap_sequence + 1;
         // Tail chain hash carried forward across segments. `None` means
         // no boundary check has anything to compare against yet — the
         // very first segment we walk has no predecessor in this run.
@@ -219,7 +249,7 @@ impl<A: Application, W: JournalWrite<A::Event>> JournaledApp<A, W> {
             let mut reader = JournalReader::<A::Event>::open(archive_path)?;
             // Verify lineage continuity from the header alone, before
             // any of this segment's events reach the application.
-            verify_segment_link(*idx, &reader, prev_tail_hash, expected_start)?;
+            verify_segment_link(*idx, &reader, prev_tail_hash, expected_start, history_floor)?;
             verify_boundary_snapshot_anchor(&reader, snap_sequence, snap_chain_check)?;
             replay_segment(
                 &mut reader,
@@ -290,7 +320,7 @@ impl<A: Application, W: JournalWrite<A::Event>> JournaledApp<A, W> {
         }
 
         let mut reader = JournalReader::<A::Event>::open(journal_path)?;
-        verify_segment_link(0, &reader, prev_tail_hash, expected_start)?;
+        verify_segment_link(0, &reader, prev_tail_hash, expected_start, history_floor)?;
         verify_boundary_snapshot_anchor(&reader, snap_sequence, snap_chain_check)?;
         // The live segment may have a partial-tail crash: replay loop
         // tolerates `SequenceGap` by stopping early, mirroring legacy
@@ -580,15 +610,22 @@ fn replay_segment<A: Application>(
 /// space exactly. Runs *before* the segment is replayed, so a foreign or
 /// tampered segment never reaches the application.
 ///
+/// The first walked segment has no predecessor (`expected_start` is
+/// `None`); instead it must start at or before `history_floor` —
+/// sequence 1 without a snapshot, the snapshot's anchor + 1 with one.
+/// Otherwise a prefix of the lineage is provably missing (the header
+/// records where the lineage continues from) and replay would silently
+/// reconstruct partial state.
+///
 /// `index = 0` denotes the live segment in diagnostics. The chain
 /// compare is a no-op when either side is unavailable (hash-chain off,
-/// or no predecessor in this run); the sequence compare is a no-op for
-/// the first walked segment.
+/// or no predecessor in this run).
 fn verify_segment_link<E: melin_app::AppEvent>(
     index: u32,
     reader: &JournalReader<E>,
     prev_tail: Option<[u8; 32]>,
     expected_start: Option<u64>,
+    history_floor: u64,
 ) -> Result<(), JournaledAppError> {
     if let (Some(expected), Some(actual)) = (prev_tail, reader.anchor())
         && expected != actual
@@ -600,14 +637,24 @@ fn verify_segment_link<E: melin_app::AppEvent>(
         }
         .into());
     }
-    if let Some(expected) = expected_start
-        && reader.starting_sequence() != expected
-    {
-        return Err(JournalError::SequenceGap {
-            expected,
-            actual: reader.starting_sequence(),
+    match expected_start {
+        Some(expected) => {
+            if reader.starting_sequence() != expected {
+                return Err(JournalError::SequenceGap {
+                    expected,
+                    actual: reader.starting_sequence(),
+                }
+                .into());
+            }
         }
-        .into());
+        None => {
+            if reader.starting_sequence() > history_floor {
+                return Err(JournaledAppError::MissingHistoryPrefix {
+                    first_segment_start: reader.starting_sequence(),
+                    required_floor: history_floor,
+                });
+            }
+        }
     }
     Ok(())
 }
@@ -1257,6 +1304,211 @@ mod tests {
         let recovered = TestApp_::recover_from_snapshot(&snap_path, &journal_path).unwrap();
         let all: Vec<TestEvent> = pre.iter().chain(post.iter()).copied().collect();
         assert_eq!(recovered.app().total, expected_state(&all, 1).total);
+    }
+
+    /// Snapshot-less recovery on a journal whose oldest segment begins
+    /// mid-history (oldest archive trimmed) must be REJECTED, not
+    /// silently replayed into partial state. The segment header records
+    /// where the lineage continues from, so the missing prefix is
+    /// provable. Before the `MissingHistoryPrefix` guard, this exact
+    /// scenario produced a partial ledger with no error.
+    #[test]
+    fn recover_rejects_trimmed_history_prefix_without_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        let journal_path = dir.path().join("journal.bin");
+
+        let phase_a = [TestEvent::Add(1), TestEvent::Add(2)];
+        let phase_b = [TestEvent::Add(10), TestEvent::Add(20)];
+        let phase_c = [TestEvent::Add(100)];
+
+        let ja = TestApp_::create(TestApp::new(), &journal_path).unwrap();
+        let mut ja = append_events(ja, &phase_a, 1);
+        ja.rotate_segment().unwrap();
+        let mut ja = append_events(ja, &phase_b, 1 + phase_a.len() as u64);
+        ja.rotate_segment().unwrap();
+        let ja = append_events(ja, &phase_c, 1 + (phase_a.len() + phase_b.len()) as u64);
+        drop(ja);
+
+        // Trim the oldest archive — the surviving 000002 starts at
+        // sequence 3, so history 1..=2 is provably missing.
+        std::fs::remove_file(dir.path().join("journal.bin.000001")).unwrap();
+
+        let err = match TestApp_::recover(TestApp::new(), &journal_path) {
+            Ok(recovered) => panic!(
+                "recovery must reject a trimmed history prefix; \
+                 instead produced partial state with total = {}",
+                recovered.app().total
+            ),
+            Err(e) => e,
+        };
+        match err {
+            JournaledAppError::MissingHistoryPrefix {
+                first_segment_start,
+                required_floor,
+            } => {
+                assert_eq!(first_segment_start, 1 + phase_a.len() as u64);
+                assert_eq!(required_floor, 1);
+            }
+            other => panic!("expected MissingHistoryPrefix, got {other:?}"),
+        }
+    }
+
+    /// Snapshot-based recovery must likewise reject a journal whose
+    /// oldest surviving segment starts past `snapshot_sequence + 1` —
+    /// the events between the snapshot and the first on-disk segment
+    /// would be silently lost.
+    #[test]
+    fn recover_from_snapshot_rejects_gap_between_snapshot_and_oldest_segment() {
+        let dir = tempfile::tempdir().unwrap();
+        let journal_path = dir.path().join("journal.bin");
+        let snap_path = dir.path().join("snap.bin");
+
+        let phase_a = [TestEvent::Add(1), TestEvent::Add(2)];
+        let phase_b = [TestEvent::Add(10), TestEvent::Add(20)];
+
+        // Snapshot at seq 2 (tail of phase_a), then two rotations so
+        // the live segment starts at seq 5.
+        let ja = TestApp_::create(TestApp::new(), &journal_path).unwrap();
+        let mut ja = append_events(ja, &phase_a, 1);
+        ja.save_snapshot(&snap_path).unwrap();
+        ja.rotate_segment().unwrap();
+        let mut ja = append_events(ja, &phase_b, 1 + phase_a.len() as u64);
+        ja.rotate_segment().unwrap();
+        drop(ja);
+
+        // Trim BOTH archives: the live segment starts at 5 but the
+        // snapshot only covers through 2 — seqs 3..=4 are gone.
+        std::fs::remove_file(dir.path().join("journal.bin.000001")).unwrap();
+        std::fs::remove_file(dir.path().join("journal.bin.000002")).unwrap();
+
+        let err = match TestApp_::recover_from_snapshot(&snap_path, &journal_path) {
+            Ok(_) => panic!("expected rejection of snapshot/segment gap"),
+            Err(e) => e,
+        };
+        match err {
+            JournaledAppError::MissingHistoryPrefix {
+                first_segment_start,
+                required_floor,
+            } => {
+                assert_eq!(first_segment_start, 5);
+                assert_eq!(required_floor, phase_a.len() as u64 + 1);
+            }
+            other => panic!("expected MissingHistoryPrefix, got {other:?}"),
+        }
+    }
+
+    /// A missing *middle* archive is caught by the cross-segment link
+    /// check before any of the post-gap events replay: the successor's
+    /// header fails either the anchor compare (hash-chain on) or the
+    /// starting-sequence continuity compare.
+    #[test]
+    fn recover_rejects_missing_middle_archive() {
+        let dir = tempfile::tempdir().unwrap();
+        let journal_path = dir.path().join("journal.bin");
+
+        let phase_a = [TestEvent::Add(1), TestEvent::Add(2)];
+        let phase_b = [TestEvent::Add(10), TestEvent::Add(20)];
+        let phase_c = [TestEvent::Add(100)];
+
+        let ja = TestApp_::create(TestApp::new(), &journal_path).unwrap();
+        let mut ja = append_events(ja, &phase_a, 1);
+        ja.rotate_segment().unwrap();
+        let mut ja = append_events(ja, &phase_b, 1 + phase_a.len() as u64);
+        ja.rotate_segment().unwrap();
+        let ja = append_events(ja, &phase_c, 1 + (phase_a.len() + phase_b.len()) as u64);
+        drop(ja);
+
+        std::fs::remove_file(dir.path().join("journal.bin.000002")).unwrap();
+
+        let err = match TestApp_::recover(TestApp::new(), &journal_path) {
+            Ok(_) => panic!("expected rejection of missing middle archive"),
+            Err(e) => e,
+        };
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("segment chain break") || msg.contains("sequence gap"),
+            "expected a lineage-break error, got: {msg}"
+        );
+    }
+
+    /// Two back-to-back rotations leave an empty archive in the middle
+    /// of the lineage. Recovery must walk through it: the empty
+    /// segment's tail chain hash is its anchor (identity), and the next
+    /// segment's expected start equals the empty segment's own
+    /// `starting_sequence` (no sequences were consumed).
+    #[test]
+    fn recover_walks_empty_segment_from_double_rotation() {
+        let dir = tempfile::tempdir().unwrap();
+        let journal_path = dir.path().join("journal.bin");
+
+        let phase_a = [TestEvent::Add(1), TestEvent::Add(2)];
+        let phase_b = [TestEvent::Add(10), TestEvent::Add(20)];
+
+        let ja = TestApp_::create(TestApp::new(), &journal_path).unwrap();
+        let mut ja = append_events(ja, &phase_a, 1);
+        ja.rotate_segment().unwrap();
+        ja.rotate_segment().unwrap(); // archive 000002 is empty
+        let ja = append_events(ja, &phase_b, 1 + phase_a.len() as u64);
+        drop(ja);
+
+        // Sanity: the empty middle archive exists and starts where the
+        // live segment also starts (no sequence consumed by rotation).
+        let empty_archive = dir.path().join("journal.bin.000002");
+        assert!(empty_archive.exists());
+        let info = melin_journal::segment::read_header_info(&empty_archive).unwrap();
+        assert_eq!(info.starting_sequence, 1 + phase_a.len() as u64);
+
+        let recovered = TestApp_::recover(TestApp::new(), &journal_path).unwrap();
+        assert_eq!(recovered.app().total, 1 + 2 + 10 + 20);
+    }
+
+    /// A snapshot taken on a fresh journal (sequence 0, chain hash =
+    /// the segment anchor) round-trips through snapshot recovery.
+    /// Companion negative test below proves the same anchor compare
+    /// rejects an empty snapshot from a *different* lineage.
+    #[test]
+    fn fresh_snapshot_at_sequence_zero_round_trips() {
+        let dir = tempfile::tempdir().unwrap();
+        let journal_path = dir.path().join("journal.bin");
+        let snap_path = dir.path().join("snap.bin");
+
+        let ja = TestApp_::create(TestApp::new(), &journal_path).unwrap();
+        ja.save_snapshot(&snap_path).unwrap();
+        drop(ja);
+
+        let (_, snap_seq, _) = snapshot::load::<TestApp>(&snap_path).unwrap();
+        assert_eq!(snap_seq, 0, "fresh snapshot anchors at sequence 0");
+
+        let recovered = TestApp_::recover_from_snapshot(&snap_path, &journal_path).unwrap();
+        assert_eq!(*recovered.app(), TestApp::new());
+        assert_eq!(recovered.next_sequence(), 1);
+    }
+
+    /// An empty snapshot from another lineage (different random anchor)
+    /// is rejected by the boundary anchor compare even though both
+    /// sides hold zero events — the random anchor is what makes two
+    /// independent histories unconfusable.
+    #[cfg(feature = "hash-chain")]
+    #[test]
+    fn recover_from_snapshot_rejects_foreign_empty_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        let journal_a = dir.path().join("a.journal");
+        let journal_b = dir.path().join("b.journal");
+        let snap_a = dir.path().join("a.snap");
+
+        let ja = TestApp_::create(TestApp::new(), &journal_a).unwrap();
+        ja.save_snapshot(&snap_a).unwrap();
+        drop(ja);
+        drop(TestApp_::create(TestApp::new(), &journal_b).unwrap());
+
+        let err = match TestApp_::recover_from_snapshot(&snap_a, &journal_b) {
+            Ok(_) => panic!("expected rejection of foreign empty snapshot"),
+            Err(e) => e,
+        };
+        assert!(
+            matches!(err, JournaledAppError::SnapshotChainMismatch { .. }),
+            "expected SnapshotChainMismatch, got {err:?}"
+        );
     }
 
     /// Recovery refuses to pair a snapshot with a journal that doesn't

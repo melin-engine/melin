@@ -504,6 +504,7 @@ The `timestamp_ns` field is wall-clock time from `clock_gettime(CLOCK_REALTIME)`
 | `SequenceDuplicate` | A sequence number repeated | Writer bug or storage anomaly — investigate |
 | `TruncatedEntry` | Incomplete entry at EOF | Normal crash recovery — entry is discarded |
 | `SegmentChainBreak` | A segment's header anchor does not equal the previous segment's tail chain hash | Tampered archive, missing segment, or foreign segment spliced in — investigate before trusting the history |
+| `MissingHistoryPrefix` | The oldest surviving segment starts after the history start recovery requires (sequence 1, or the snapshot's anchor + 1) | Archives trimmed without a covering snapshot — restore the trimmed segments or a snapshot that covers them; recovery refuses to build partial state |
 | `Io` | Underlying I/O error | Disk failure, permissions, full disk |
 
 ### Limitations
