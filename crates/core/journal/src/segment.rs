@@ -41,6 +41,16 @@ pub struct LineageReport {
     /// Tail chain hash after the last segment. `None` when the
     /// `hash-chain` feature is disabled.
     pub tail_chain_hash: Option<[u8; 32]>,
+    /// `Some((expected, found))` when the LIVE segment's tail had a
+    /// sequence gap — the crash artifact recovery tolerates and
+    /// truncates (e.g. an async write completing out of order at the
+    /// moment of a crash). Entries before the gap verified normally;
+    /// entries after it are exactly what recovery would discard, and
+    /// none of them were ever acknowledged (persist-before-ack). A gap
+    /// anywhere in a sealed archive is NOT tolerated — that's
+    /// corruption and surfaces as an error instead. A cleanly shut
+    /// journal must report `None` here.
+    pub live_tail_gap: Option<(u64, u64)>,
 }
 
 /// Walk a journal lineage (archives in monotonic order, then the live
@@ -57,7 +67,10 @@ pub struct LineageReport {
 ///
 /// This is the offline-audit counterpart of recovery's walk — recovery
 /// interleaves the same checks with replay, while this function only
-/// reads. It does not validate against a snapshot (it has none), so a
+/// reads. It mirrors recovery's crash tolerance exactly: a sequence gap
+/// at the LIVE segment's tail is reported (not fatal) because recovery
+/// would truncate there, while a gap inside any sealed archive is an
+/// error. It does not validate against a snapshot (it has none), so a
 /// trimmed-but-internally-consistent lineage passes; callers judge
 /// `lineage_start` themselves.
 pub fn verify_lineage<E: melin_app::AppEvent>(live: &Path) -> Result<LineageReport, JournalError> {
@@ -79,9 +92,14 @@ pub fn verify_lineage<E: melin_app::AppEvent>(live: &Path) -> Result<LineageRepo
     let mut last_sequence: Option<u64> = None;
     let mut entries: u64 = 0;
     let mut tail_chain_hash: Option<[u8; 32]> = None;
+    let mut live_tail_gap: Option<(u64, u64)> = None;
 
     for (index, path) in segments.iter().enumerate() {
         let mut reader = crate::reader::JournalReader::<E>::open(path)?;
+        // Gap tolerance applies only to the live segment (recovery's
+        // `allow_partial_tail`) — never to a sealed archive, and never
+        // to a trailing archive standing in for a missing live.
+        let is_live = path == live;
 
         if index == 0 {
             lineage_start = reader.starting_sequence();
@@ -104,12 +122,27 @@ pub fn verify_lineage<E: melin_app::AppEvent>(live: &Path) -> Result<LineageRepo
             });
         }
 
-        while let Some(entry) = reader.next_entry()? {
-            if first_sequence.is_none() {
-                first_sequence = Some(entry.sequence);
+        loop {
+            match reader.next_entry() {
+                Ok(Some(entry)) => {
+                    if first_sequence.is_none() {
+                        first_sequence = Some(entry.sequence);
+                    }
+                    last_sequence = Some(entry.sequence);
+                    entries += 1;
+                }
+                Ok(None) => break,
+                Err(JournalError::SequenceGap { expected, actual }) if is_live => {
+                    // Same crash shape recovery truncates at; everything
+                    // before the gap verified, nothing after it was ever
+                    // acknowledged. Report rather than fail so an
+                    // operator auditing a crashed-but-recoverable
+                    // journal can tell this apart from tampering.
+                    live_tail_gap = Some((expected, actual));
+                    break;
+                }
+                Err(e) => return Err(e),
             }
-            last_sequence = Some(entry.sequence);
-            entries += 1;
         }
 
         if let Some(tail) = reader.chain_hash() {
@@ -131,6 +164,7 @@ pub fn verify_lineage<E: melin_app::AppEvent>(live: &Path) -> Result<LineageRepo
         last_sequence,
         lineage_start,
         tail_chain_hash,
+        live_tail_gap,
     })
 }
 
@@ -348,6 +382,76 @@ mod tests {
                 JournalError::SegmentChainBreak { .. } | JournalError::SequenceGap { .. }
             ),
             "expected lineage break, got {err:?}"
+        );
+    }
+
+    /// Forge a valid-CRC entry with a skipped sequence at `path`'s
+    /// valid data end — the io_uring out-of-order-completion crash
+    /// shape (a later write landed, an earlier one didn't).
+    fn forge_gap_entry(path: &Path, gap_seq: u64) {
+        let valid_end = {
+            let mut reader = crate::reader::JournalReader::<TestEvent>::open(path).unwrap();
+            while reader.next_entry().unwrap().is_some() {}
+            reader.valid_file_end()
+        };
+        let mut scratch = [0u8; 256];
+        let len = crate::codec::encode(
+            gap_seq,
+            0,
+            0,
+            0,
+            &JournalEvent::App(TestEvent(99)),
+            &mut scratch,
+        )
+        .unwrap();
+        let file = std::fs::OpenOptions::new().write(true).open(path).unwrap();
+        file.write_all_at(&scratch[..len], valid_end).unwrap();
+        file.sync_all().unwrap();
+    }
+
+    /// A sequence gap at the LIVE tail is the crash artifact recovery
+    /// truncates — the verifier reports it instead of failing, so an
+    /// operator can tell "normal crash tail" from tampering.
+    #[test]
+    fn verify_lineage_reports_gap_at_live_tail() {
+        let dir = tempfile::tempdir().unwrap();
+        let live = dir.path().join("j.journal");
+        build_lineage(&live, &[2, 2]); // archive(1-2) + live(3-4)
+        forge_gap_entry(&live, 6); // expected 5, found 6
+
+        let report = verify_lineage::<TestEvent>(&live).unwrap();
+        assert_eq!(report.live_tail_gap, Some((5, 6)));
+        // Everything before the gap verified normally.
+        assert_eq!(report.entries, 4);
+        assert_eq!(report.last_sequence, Some(4));
+    }
+
+    /// The same gap inside a SEALED archive is corruption, not a crash
+    /// artifact — the verifier must fail, exactly like recovery.
+    #[test]
+    fn verify_lineage_rejects_gap_inside_archive() {
+        let dir = tempfile::tempdir().unwrap();
+        let live = dir.path().join("j.journal");
+        // One segment with a forged gap, then rotate so it gets sealed.
+        let mut writer = BufferedWriter::<TestEvent>::create(&live).unwrap();
+        writer.append(&JournalEvent::App(TestEvent(1))).unwrap();
+        writer.append(&JournalEvent::App(TestEvent(2))).unwrap();
+        drop(writer);
+        forge_gap_entry(&live, 4); // expected 3, found 4
+        std::fs::rename(&live, archive_path(&live, 1)).unwrap();
+        // Recreate an (empty) live so the archive isn't the last word.
+        drop(BufferedWriter::<TestEvent>::create_continuing(&live, 5, [0u8; 32]).unwrap());
+
+        let err = verify_lineage::<TestEvent>(&live).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                JournalError::SequenceGap {
+                    expected: 3,
+                    actual: 4
+                }
+            ),
+            "expected hard SequenceGap inside the archive, got {err:?}"
         );
     }
 

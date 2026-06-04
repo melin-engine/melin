@@ -83,6 +83,14 @@ fn main() {
     match melin_journal::segment::verify_lineage::<TradingEvent>(&path) {
         Ok(report) => {
             println!("lineage:  OK");
+            if let Some((expected, found)) = report.live_tail_gap {
+                println!(
+                    "  note: live segment tail has a sequence gap (expected {expected}, \
+                     found {found}) — a recoverable crash artifact, not tampering. \
+                     Entries before the gap verified; recovery will truncate at the gap \
+                     and nothing past it was ever acknowledged."
+                );
+            }
             println!("  segments:      {}", report.segments);
             println!("  entries:       {}", report.entries);
             println!("  lineage_start: {}", report.lineage_start);

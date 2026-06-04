@@ -2652,6 +2652,15 @@ fn walk_segments_dense(journal_path: &Path) -> (u64, u64) {
 
     let report = melin_journal::segment::verify_lineage::<TradingEvent>(journal_path)
         .unwrap_or_else(|e| panic!("lineage of {} broken: {e}", journal_path.display()));
+    // The verifier tolerates a live-tail crash gap (recovery's
+    // allow_partial_tail); these journals were cleanly shut, so any
+    // gap here would be a real bug.
+    assert_eq!(
+        report.live_tail_gap,
+        None,
+        "cleanly-shut journal {} must have no live-tail gap",
+        journal_path.display()
+    );
     (
         report
             .first_sequence
