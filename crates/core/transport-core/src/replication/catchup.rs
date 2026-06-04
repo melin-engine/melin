@@ -34,26 +34,25 @@ pub enum CatchUpResult {
     NeedSnapshot,
 }
 
-/// Discover journal archive files, sorted oldest to newest.
-/// Returns `[path.3, path.2, path.1, path]` — only files that exist.
-pub fn discover_journal_files(journal_path: &std::path::Path) -> Vec<std::path::PathBuf> {
-    let mut archives = Vec::new();
-    let mut n = 1u32;
-    loop {
-        let archive = std::path::PathBuf::from(format!("{}.{n}", journal_path.display()));
-        if !archive.exists() {
-            break;
-        }
-        archives.push(archive);
-        n += 1;
-    }
-    // Reverse so oldest is first (highest number = oldest).
-    archives.reverse();
+/// Discover journal segment files, sorted oldest to newest, ending with
+/// the live segment. Delegates archive discovery to
+/// `segment::list_archives` — the same canonical six-digit
+/// `<journal>.NNNNNN` scheme recovery walks (legacy `.N` names are
+/// accepted by the same parser). `list_archives` sorts ascending, and
+/// rotation assigns indices in rotation order, so index order *is*
+/// oldest-to-newest.
+pub fn discover_journal_files(
+    journal_path: &std::path::Path,
+) -> io::Result<Vec<std::path::PathBuf>> {
+    let mut files: Vec<std::path::PathBuf> = melin_journal::segment::list_archives(journal_path)?
+        .into_iter()
+        .map(|(_, path)| path)
+        .collect();
     // Current journal is newest.
     if journal_path.exists() {
-        archives.push(journal_path.to_path_buf());
+        files.push(journal_path.to_path_buf());
     }
-    archives
+    Ok(files)
 }
 
 /// Check if journal catch-up is possible without sending any data.
@@ -65,7 +64,7 @@ pub fn can_catch_up_from_journal(
 ) -> io::Result<bool> {
     use melin_journal::RawJournalScanner;
 
-    let files = discover_journal_files(journal_path);
+    let files = discover_journal_files(journal_path)?;
     if files.is_empty() || last_sequence == 0 {
         // No files or fresh replica — catch-up will handle it.
         return Ok(true);
@@ -106,7 +105,7 @@ pub fn catch_up_from_journal_with<E: AppEvent>(
 ) -> io::Result<CatchUpResult> {
     use melin_journal::RawJournalScanner;
 
-    let files = discover_journal_files(journal_path);
+    let files = discover_journal_files(journal_path)?;
     if files.is_empty() {
         return Ok(CatchUpResult::Ok(last_sequence));
     }
