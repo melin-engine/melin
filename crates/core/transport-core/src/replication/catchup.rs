@@ -25,6 +25,7 @@ use super::protocol::{decode_journal_to_input_slots, encode_input_batch};
 pub type CatchUpPublisher<'a> = &'a mut dyn FnMut(&[u8]) -> io::Result<()>;
 
 /// Result of a journal catch-up attempt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CatchUpResult {
     /// Catch-up succeeded. Contains the last sequence sent (or the input
     /// last_sequence if no entries were sent).
@@ -44,6 +45,13 @@ pub fn discover_journal_files(journal_path: &std::path::Path) -> Vec<std::path::
         match melin_journal::segment::list_archives(journal_path) {
             Ok(archives) => archives.into_iter().map(|(_, p)| p).collect(),
             Err(e) => {
+                // Degrading to live-only fails safe in both probe
+                // directions: a behind replica's coverage check finds no
+                // file reaching its last_sequence, and a fresh replica's
+                // history check finds the live header starting past 1 —
+                // either way `can_catch_up_from_journal` answers
+                // NeedSnapshot rather than catching up from partial
+                // history. Never silently narrows what gets streamed.
                 warn!(error = %e, "archive discovery failed — catch-up limited to live segment");
                 Vec::new()
             }
@@ -76,27 +84,31 @@ pub fn can_catch_up_from_journal(
     journal_path: &std::path::Path,
     last_sequence: u64,
 ) -> io::Result<bool> {
-    use melin_journal::RawJournalScanner;
-
     let files = discover_journal_files(journal_path);
-    if files.is_empty() || last_sequence == 0 {
-        // No files or fresh replica — catch-up will handle it.
+    let Some(oldest) = files.first() else {
+        // No files at all — catch-up streams nothing, which is correct.
         return Ok(true);
-    }
+    };
 
-    // Check if any file starts at or before the target sequence.
-    for path in files.iter().rev() {
-        let mut scanner = RawJournalScanner::open(path)
-            .map_err(|e| io::Error::other(format!("open journal {}: {e}", path.display())))?;
-        if let Some(first_seq) = scanner
-            .first_sequence()
-            .map_err(|e| io::Error::other(format!("read {}: {e}", path.display())))?
-            && first_seq <= last_sequence
-        {
-            return Ok(true);
-        }
-    }
-    Ok(false)
+    // One rule covers every replica: the on-disk lineage is dense from
+    // the oldest header to the tail (recovery verifies this), so
+    // catch-up can serve a replica iff the oldest segment starts at or
+    // before the replica's next needed sequence. The header's
+    // `starting_sequence` — NOT the first entry — so empty segments
+    // (a just-created live, a fresh rotation) count as the history
+    // their header says they continue.
+    //
+    // The fresh-replica case (`last_sequence == 0`) falls out naturally:
+    // it needs the oldest header to start at 1, i.e. the COMPLETE
+    // history. After archive pruning or a snapshot-only restart the
+    // oldest surviving header starts past 1 — streaming from there
+    // would build a self-consistent journal on top of an empty
+    // exchange, silently missing every pre-trim event (the replica's
+    // own next restart would refuse it with MissingHistoryPrefix).
+    // Snapshot transfer is the correct route.
+    let info = melin_journal::segment::read_header_info(oldest)
+        .map_err(|e| io::Error::other(format!("read header of {}: {e}", oldest.display())))?;
+    Ok(info.starting_sequence <= last_sequence.saturating_add(1))
 }
 
 /// Stream historical journal entries to a catching-up replica via a
@@ -124,36 +136,33 @@ pub fn catch_up_from_journal_with<E: AppEvent>(
         return Ok(CatchUpResult::Ok(last_sequence));
     }
 
-    // Find the first file that contains entries after last_sequence.
-    // For a fresh replica (last_sequence=0), start from the oldest file.
-    let mut start_file_idx = 0;
-    if last_sequence > 0 {
-        // Scan files from newest to oldest to find which contains our target.
-        let mut found = false;
-        for (i, path) in files.iter().enumerate().rev() {
-            let mut scanner = RawJournalScanner::open(path)
-                .map_err(|e| io::Error::other(format!("open journal {}: {e}", path.display())))?;
-            if let Some(first_seq) = scanner
-                .first_sequence()
-                .map_err(|e| io::Error::other(format!("read {}: {e}", path.display())))?
-                && first_seq <= last_sequence
-            {
-                // This file starts at or before our target — start here.
-                start_file_idx = i;
-                found = true;
-                break;
-            }
-        }
-        if !found {
-            // All files start after our target — journal archives were purged.
-            // The replica needs a snapshot transfer.
-            warn!(
-                last_sequence,
-                "replica's last_sequence predates all available journal files — snapshot transfer required"
-            );
-            return Ok(CatchUpResult::NeedSnapshot);
+    // Find the newest file whose header starts at or before the
+    // replica's next needed sequence — streaming begins there and walks
+    // forward. Headers, not first entries: an empty segment (e.g. a
+    // just-created live after a snapshot-only restart, exactly one past
+    // the snapshot the replica just received) is a valid, contiguous
+    // start point with nothing to send — NOT a missing-history signal.
+    // Treating it as missing caused an infinite NeedSnapshot loop: the
+    // post-transfer replica sits exactly at the empty live's boundary.
+    let next_needed = last_sequence.saturating_add(1);
+    let mut start_file_idx = None;
+    for (i, path) in files.iter().enumerate().rev() {
+        let info = melin_journal::segment::read_header_info(path)
+            .map_err(|e| io::Error::other(format!("read header of {}: {e}", path.display())))?;
+        if info.starting_sequence <= next_needed {
+            start_file_idx = Some(i);
+            break;
         }
     }
+    let Some(start_file_idx) = start_file_idx else {
+        // Even the oldest header starts past the replica's next needed
+        // sequence — the history between is gone (archives purged).
+        warn!(
+            last_sequence,
+            "replica's last_sequence predates all available journal files — snapshot transfer required"
+        );
+        return Ok(CatchUpResult::NeedSnapshot);
+    };
 
     let mut send_buf = Vec::with_capacity(128 * 1024);
     let mut batch_buf = Vec::with_capacity(64 * 1024);
@@ -435,14 +444,89 @@ mod tests {
 
         // Seq 1 lives in archive 000001 — reachable.
         assert!(can_catch_up_from_journal(&live, 1).unwrap());
-        // Fresh replica (0) — always reachable via full replay.
+        // Fresh replica (0) — reachable, history goes back to seq 1.
         assert!(can_catch_up_from_journal(&live, 0).unwrap());
 
-        // Trim the oldest archive: a replica at seq 1 now predates all
-        // surviving files (000002 starts at 2).
+        // Trim the oldest archive (held seq 1). A replica at seq 1 sits
+        // exactly at the surviving lineage's boundary (000002 starts at
+        // 2) — reachable with nothing missed. A fresh replica is not.
         std::fs::remove_file(dir.path().join("j.journal.000001")).unwrap();
+        assert!(can_catch_up_from_journal(&live, 1).unwrap());
+        assert!(!can_catch_up_from_journal(&live, 0).unwrap());
+
+        // Trim the next archive too (held seq 2): a replica at seq 1
+        // now genuinely predates the surviving history (live starts at
+        // 3), while one at the live's boundary remains reachable.
+        std::fs::remove_file(dir.path().join("j.journal.000002")).unwrap();
         assert!(!can_catch_up_from_journal(&live, 1).unwrap());
-        // But a replica already at seq 2 is still reachable.
         assert!(can_catch_up_from_journal(&live, 2).unwrap());
+    }
+
+    /// A replica sitting exactly at the boundary of an EMPTY live
+    /// segment — the position every replica holds right after a
+    /// snapshot transfer from a snapshot-only-restarted primary — is
+    /// contiguous with the on-disk history: catch-up has nothing to
+    /// send, which is success. (Regression: the start-file scan read
+    /// first *entries* instead of headers, so the empty live looked
+    /// like missing history and the sender looped snapshot transfer →
+    /// NeedSnapshot forever, never letting the replica register.)
+    #[test]
+    fn boundary_replica_of_empty_live_catches_up_with_nothing_to_send() {
+        let dir = tempfile::tempdir().unwrap();
+        let live = dir.path().join("resumed.journal");
+        drop(BufferedWriter::<TestEvent>::create_continuing(&live, 34, [7u8; 32]).unwrap());
+
+        assert!(can_catch_up_from_journal(&live, 33).unwrap());
+
+        let shutdown = std::sync::atomic::AtomicBool::new(false);
+        let mut published = 0usize;
+        let mut publish = |_: &[u8]| -> io::Result<()> {
+            published += 1;
+            Ok(())
+        };
+        let res = catch_up_from_journal_with::<TestEvent>(&live, 33, &mut publish, &shutdown)
+            .unwrap();
+        assert!(
+            matches!(res, CatchUpResult::Ok(33)),
+            "boundary catch-up must succeed with nothing to send, got {res:?}"
+        );
+        assert_eq!(published, 0, "no batches expected at the boundary");
+    }
+
+    /// A fresh replica must be routed to snapshot transfer whenever the
+    /// on-disk history doesn't reach back to sequence 1. (Regression:
+    /// `last_sequence == 0` returned true unconditionally, so a fresh
+    /// replica facing a pruned lineage caught up from the surviving
+    /// suffix — a self-consistent journal over an empty exchange,
+    /// silently missing every pre-trim event.)
+    #[test]
+    fn fresh_replica_needs_snapshot_when_history_trimmed() {
+        let dir = tempfile::tempdir().unwrap();
+        let live = three_segment_journal(dir.path());
+
+        // Trimmed prefix: oldest surviving header starts at 2.
+        std::fs::remove_file(dir.path().join("j.journal.000001")).unwrap();
+        assert!(
+            !can_catch_up_from_journal(&live, 0).unwrap(),
+            "fresh replica must not catch up from a trimmed lineage"
+        );
+
+        // A snapshot-only restart layout: single live segment whose
+        // header starts past 1 (no entries yet).
+        let resumed = dir.path().join("resumed.journal");
+        drop(BufferedWriter::<TestEvent>::create_continuing(&resumed, 21, [7u8; 32]).unwrap());
+        assert!(
+            !can_catch_up_from_journal(&resumed, 0).unwrap(),
+            "fresh replica must not catch up from a snapshot-anchored journal"
+        );
+
+        // An empty-but-complete journal (fresh primary, no events yet)
+        // IS reachable: header starts at 1, nothing is missing.
+        let fresh = dir.path().join("fresh.journal");
+        drop(BufferedWriter::<TestEvent>::create(&fresh).unwrap());
+        assert!(
+            can_catch_up_from_journal(&fresh, 0).unwrap(),
+            "fresh replica of a fresh primary needs no snapshot"
+        );
     }
 }

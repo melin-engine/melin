@@ -2379,6 +2379,13 @@ fn fresh_replica_full_catchup() {
 /// exists. A new replica connects — the primary detects journals are too old,
 /// transfers the snapshot, then catches up from the current journal. The
 /// replica ends up with all orders.
+///
+/// The replica's state is asserted directly, by promoting it: a fresh
+/// replica (`last_sequence = 0`) facing a pruned lineage (oldest segment
+/// starting past 1) MUST receive the snapshot, not journal catch-up —
+/// catch-up from a trimmed history would build a self-consistent journal
+/// on top of an empty exchange, silently missing every pre-snapshot
+/// event. Only interrogating the promoted replica can catch that.
 #[test]
 #[serial]
 fn snapshot_transfer_when_archives_purged() {
@@ -2572,8 +2579,13 @@ fn snapshot_transfer_when_archives_purged() {
         "expected Placed or Fill after snapshot transfer, got: {r:?}"
     );
 
-    // Verify dedup: replay order 20 (from before snapshot) must be rejected.
-    let r = submit_order(&mut client2, 20, 1, 1, Side::Buy, 100, 10);
+    // Verify dedup: replay order 19 (from before snapshot) must be rejected.
+    // Deliberately NOT id 20 — that id is reserved for the promoted-replica
+    // probe below. Every submit here is journaled (inputs persist before
+    // matching) and streamed to the replica, so replaying an id on the
+    // primary lets a state-diverged replica *place* it from the stream,
+    // which would satisfy the later duplicate probe for the wrong reason.
+    let r = submit_order(&mut client2, 19, 1, 1, Side::Buy, 100, 10);
     assert!(
         has_report(&r, |rep| matches!(
             rep,
@@ -2582,15 +2594,91 @@ fn snapshot_transfer_when_archives_purged() {
                 ..
             }
         )),
-        "expected DuplicateOrderId for id=20 after snapshot transfer, got: {r:?}"
+        "expected DuplicateOrderId for id=19 after snapshot transfer, got: {r:?}"
     );
 
-    // Cleanup.
+    // Make sure orders 20-21 (the post-transfer traffic above) have
+    // durably reached the replica before the primary goes away: capture
+    // the primary's tail, then wait for replication lag 0 at-or-past it.
+    let (_, tail_after_orders, _, _) =
+        query_health(primary2.health_addr).expect("health after post-transfer orders");
+    let start = Instant::now();
+    loop {
+        if let Ok((_, journal_seq, lag, _)) = query_health(primary2.health_addr)
+            && lag == 0
+            && journal_seq >= tail_after_orders
+        {
+            break;
+        }
+        if start.elapsed() > Duration::from_secs(30) {
+            panic!("replica never drained post-transfer orders (lag != 0)");
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
     drop(client2);
+
+    // ----- Promote the replica and interrogate ITS state -----
     unsafe { libc::kill(primary2.child.id() as i32, libc::SIGINT) };
     let _ = primary2.child.wait();
 
-    eprintln!("PASS: snapshot transfer — replica caught up after archive purge.");
+    let promote_addr: SocketAddr = format!("127.0.0.1:{replica_admin_port}").parse().unwrap();
+    promote(promote_addr, &operator_key);
+    set_durability_mode(promote_addr, &operator_key, "local");
+    wait_ready(
+        format!("127.0.0.1:{replica_health_port}").parse().unwrap(),
+        Duration::from_secs(30),
+    );
+
+    let mut rclient = connect_with_timeout(
+        format!("127.0.0.1:{replica_client_port}").parse().unwrap(),
+        &key2,
+    );
+
+    // Pre-snapshot state: order 20 exists ONLY in the transferred
+    // snapshot — its id was never journaled after the purge, so the
+    // stream could not have delivered it. A replica that journal-caught-up
+    // from the pruned lineage instead of receiving the snapshot has an
+    // empty book here and places this as a fresh order — the silent
+    // state divergence this test exists to catch.
+    let r = submit_order(&mut rclient, 20, 1, 1, Side::Buy, 100, 10);
+    assert!(
+        has_report(&r, |rep| matches!(
+            rep,
+            melin_protocol::types::ExecutionReport::Rejected {
+                reason: melin_protocol::types::RejectReason::DuplicateOrderId,
+                ..
+            }
+        )),
+        "promoted replica is missing pre-snapshot state (order 20 not a duplicate): {r:?}"
+    );
+
+    // Live-streamed state: order 21 arrived over the stream after the
+    // snapshot transfer.
+    let r = submit_order(&mut rclient, 21, 1, 1, Side::Buy, 200, 5);
+    assert!(
+        has_report(&r, |rep| matches!(
+            rep,
+            melin_protocol::types::ExecutionReport::Rejected {
+                reason: melin_protocol::types::RejectReason::DuplicateOrderId,
+                ..
+            }
+        )),
+        "promoted replica is missing live-streamed state (order 21 not a duplicate): {r:?}"
+    );
+
+    // And it accepts new business as the authority.
+    let r = submit_order(&mut rclient, 22, 1, 1, Side::Buy, 200, 5);
+    assert!(
+        has_report(&r, |rep| matches!(
+            rep,
+            melin_protocol::types::ExecutionReport::Placed { .. }
+                | melin_protocol::types::ExecutionReport::Fill { .. }
+        )),
+        "expected Placed or Fill on promoted replica, got: {r:?}"
+    );
+
+    drop(rclient);
+    eprintln!("PASS: snapshot transfer — promoted replica holds pre-snapshot and streamed state.");
 }
 
 // ---------------------------------------------------------------------------
