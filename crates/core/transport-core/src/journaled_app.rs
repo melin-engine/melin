@@ -770,6 +770,60 @@ mod tests {
         assert_eq!(*recovered.app(), TestApp::new());
     }
 
+    /// An old-format journal must fail recovery with
+    /// `UnsupportedVersion` — never be misread as corruption (which
+    /// reads as "restore from backup" to an operator) nor, worse, as a
+    /// fresh/empty layout that a bootstrap path would overwrite. This
+    /// is the contract behind the documented upgrade procedure
+    /// (snapshot → deploy → fresh journal): the version gate must fail
+    /// fast at open, before any entry is decoded, and leave the
+    /// old-format file untouched as the operator's upgrade input.
+    #[test]
+    fn recover_rejects_old_format_version() {
+        use std::io::{Read, Seek, SeekFrom, Write};
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("journal.bin");
+
+        let ja = TestApp_::create(TestApp::new(), &path).unwrap();
+        let ja = append_events(ja, &[TestEvent::Add(1), TestEvent::Add(2)], 1);
+        drop(ja);
+
+        // Rewrite the header with an old format version. Header layout
+        // (see codec.rs): magic u32 | format_version u16 @4 |
+        // sector_size u16 | starting_sequence u64 | anchor_hash [u8;32]
+        // | header_crc u32 @48, CRC over bytes 0..48 — fixed up after
+        // the patch so the version check is provably the only fault.
+        let mut header = [0u8; 52];
+        {
+            let mut f = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&path)
+                .unwrap();
+            f.read_exact(&mut header).unwrap();
+            header[4..6].copy_from_slice(&13u16.to_le_bytes());
+            let crc = crc32c::crc32c(&header[..48]);
+            header[48..52].copy_from_slice(&crc.to_le_bytes());
+            f.seek(SeekFrom::Start(0)).unwrap();
+            f.write_all(&header).unwrap();
+            f.sync_all().unwrap();
+        }
+        let len_before = std::fs::metadata(&path).unwrap().len();
+
+        match TestApp_::recover(TestApp::new(), &path) {
+            Err(JournaledAppError::Journal(JournalError::UnsupportedVersion { version })) => {
+                assert_eq!(version, 13)
+            }
+            Err(other) => panic!("expected UnsupportedVersion, got {other:?}"),
+            Ok(_) => panic!("recovery accepted an old-format journal"),
+        }
+
+        // The failed recovery must not have touched the file — it is
+        // the operator's audit evidence and upgrade input.
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), len_before);
+    }
+
     #[test]
     fn recover_replays_events_in_order() {
         let dir = tempfile::tempdir().unwrap();

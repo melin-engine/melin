@@ -692,6 +692,49 @@ mod tests {
         let _reader = JournalReader::<TestEvent>::open(&path).unwrap();
     }
 
+    /// The documented upgrade path depends on old-format journal *files*
+    /// being rejected fail-fast at open — never decoded best-effort
+    /// (field layouts differ across versions, so a lenient reader would
+    /// produce corrupt state mid-replay). The codec-level version check
+    /// is covered in `codec::tests`; this pins the file-level behavior
+    /// the operator actually sees. The header CRC is fixed up after the
+    /// version patch so the version check is provably the only fault.
+    #[test]
+    fn open_rejects_old_format_version_file() {
+        use std::io::{Read, Seek, SeekFrom};
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.journal");
+        write_sample(&path);
+
+        // Header layout (see codec.rs): magic u32 | format_version u16 @4
+        // | sector_size u16 | starting_sequence u64 | anchor_hash [u8;32]
+        // | header_crc u32 @48, CRC over bytes 0..48.
+        let mut header = [0u8; 52];
+        {
+            let mut f = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&path)
+                .unwrap();
+            f.read_exact(&mut header).unwrap();
+            header[4..6].copy_from_slice(&13u16.to_le_bytes());
+            let crc = crc32c::crc32c(&header[..48]);
+            header[48..52].copy_from_slice(&crc.to_le_bytes());
+            f.seek(SeekFrom::Start(0)).unwrap();
+            f.write_all(&header).unwrap();
+            // The writer used O_DIRECT; flush the buffered patch so a
+            // direct-I/O reader can't see a stale page.
+            f.sync_all().unwrap();
+        }
+
+        match JournalReader::<TestEvent>::open(&path) {
+            Err(JournalError::UnsupportedVersion { version }) => assert_eq!(version, 13),
+            Err(other) => panic!("expected UnsupportedVersion for a v13 file, got {other:?}"),
+            Ok(_) => panic!("reader opened a v13 file"),
+        }
+    }
+
     #[test]
     fn many_events_round_trip() {
         let dir = tempfile::tempdir().unwrap();
