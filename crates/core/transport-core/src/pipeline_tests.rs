@@ -531,7 +531,7 @@ fn recovery_resumes_allocator_wire_and_gate_agreement() {
     {
         let writer = Writer::create(&path).unwrap();
         let active_conns = Arc::new(AtomicU64::new(0));
-        let mut out = build_pipeline_with_replication(
+        let out = build_pipeline_with_replication(
             TestApp::new(),
             writer,
             Duration::ZERO,
