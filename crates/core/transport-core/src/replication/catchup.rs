@@ -484,8 +484,8 @@ mod tests {
             published += 1;
             Ok(())
         };
-        let res = catch_up_from_journal_with::<TestEvent>(&live, 33, &mut publish, &shutdown)
-            .unwrap();
+        let res =
+            catch_up_from_journal_with::<TestEvent>(&live, 33, &mut publish, &shutdown).unwrap();
         assert!(
             matches!(res, CatchUpResult::Ok(33)),
             "boundary catch-up must succeed with nothing to send, got {res:?}"
