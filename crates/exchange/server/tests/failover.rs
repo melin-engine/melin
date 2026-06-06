@@ -3141,6 +3141,91 @@ fn in_memory_cursor_runs_ahead_of_persisted_under_sustained_traffic() {
     let _ = saw_in_mem_ahead;
 }
 
+/// Behavioral tripwire for the durability gate: under the cluster
+/// default `hybrid` (`persisted>=1 && in_memory>=2`), a client ack must
+/// not be released until a replica has confirmed the order in memory.
+///
+/// Freeze the replica process with SIGSTOP — the primary keeps
+/// journaling and shipping (the entry lands in the replica's socket
+/// buffer) so `persisted>=1` is satisfied, but no ack ever returns, so
+/// `in_memory>=2` cannot be. The response must NOT arrive while the
+/// replica is frozen. SIGCONT the replica and the same in-flight order
+/// must complete with a normal `Placed` ack.
+///
+/// This is deliberately mechanism-agnostic: the pre-v14 sequence-space
+/// drift voided the gate within seconds of uptime (replica cursors ran
+/// ahead of wire space, releasing acks ~0.1µs after matching), and this
+/// test fails on that build — but it equally catches any future bug
+/// that satisfies the gate without a real replica confirmation (cursor
+/// inflation, policy mis-evaluation, metric misplumbing). The
+/// allocator/wire-space agreement itself is pinned separately by
+/// `allocator_wire_seq_and_gate_cursor_agree_across_rotation` in
+/// `melin-transport-core`.
+///
+/// Timing margins: a healthy gate releases in ~tens of µs, and replica
+/// eviction is ring-backpressure-driven (one order cannot fill the
+/// ring), so the 1.5s frozen window sits 4+ orders of magnitude above
+/// normal release latency while staying well inside any teardown path.
+#[test]
+#[serial]
+fn hybrid_gate_stalls_while_replica_frozen() {
+    let cluster = TestCluster::start();
+    let mut client = cluster.connect_primary();
+
+    // Warm-up: prove the ack path works before freezing anything, and
+    // let replication settle so the frozen-phase observation starts
+    // from lag 0.
+    let r = submit_order(&mut client, 1, 1, 1, Side::Buy, 100, 10);
+    assert!(!r.is_empty(), "warm-up order got no response");
+    cluster.wait_replicated();
+
+    // Freeze the replica. SIGSTOP halts ack production without closing
+    // the TCP stream, so the primary sees a connected-but-silent peer —
+    // the exact shape the gate exists to hold against.
+    unsafe {
+        libc::kill(cluster.replica.child.id() as i32, libc::SIGSTOP);
+    }
+
+    // Submit from a helper thread; the response (if any) is forwarded
+    // over a channel so the main thread can assert on its *timing*.
+    let (tx, rx) = std::sync::mpsc::channel();
+    let submitter = std::thread::spawn(move || {
+        let r = submit_order(&mut client, 2, 1, 1, Side::Buy, 101, 10);
+        // Channel send fails only if the test already panicked on the
+        // frozen-phase assertion; nothing to do with the response then.
+        let _ = tx.send(r);
+    });
+
+    // The gate must hold while the replica is frozen. A response here
+    // means the gate released without replica confirmation — the
+    // vacuous-gate bug.
+    match rx.recv_timeout(Duration::from_millis(1500)) {
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+        Ok(r) => panic!(
+            "durability gate released a client ack while the only replica \
+             was frozen (hybrid requires in_memory>=2): {r:?}"
+        ),
+        Err(e) => panic!("submitter channel closed unexpectedly: {e}"),
+    }
+
+    // Thaw the replica: it drains the buffered stream, acks, and the
+    // in-flight response must now be released promptly.
+    unsafe {
+        libc::kill(cluster.replica.child.id() as i32, libc::SIGCONT);
+    }
+    let r = rx
+        .recv_timeout(Duration::from_secs(30))
+        .expect("no response after replica thawed — gate stuck");
+    assert!(
+        has_report(&r, |rep| matches!(
+            rep,
+            melin_protocol::types::ExecutionReport::Placed { .. }
+        )),
+        "expected a normal Placed ack after thaw, got: {r:?}"
+    );
+    submitter.join().expect("submitter thread panicked");
+}
+
 /// Helper extension: wait up to `timeout` for the child, then SIGKILL.
 trait ChildExt {
     fn wait_timeout_with_kill(&mut self, timeout: Duration) -> std::io::Result<()>;
