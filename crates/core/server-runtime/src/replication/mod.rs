@@ -72,14 +72,13 @@ mod tcp_sender;
 // here so the module's public API surface (e.g.
 // `melin_server_runtime::replication::Ack` / `::ReplicationMetrics`) is
 // unchanged for downstream consumers and tests.
-pub use melin_transport_core::replication::ReplicationMetrics;
 pub use melin_transport_core::replication::ack_queue::{
-    PendingAck, PendingAckQueue, try_flush_dual_track, update_dual_replication_cursor,
-    wait_for_journal_cursor,
+    PendingAck, PendingAckQueue, try_flush_dual_track, wait_for_journal_cursor,
 };
 pub use melin_transport_core::replication::protocol::{
     Ack, Handshake, PrimaryMessage, ReplicaMessage,
 };
+pub use melin_transport_core::replication::{ReplicaCursors, ReplicationMetrics};
 
 #[cfg(feature = "dpdk")]
 pub use dpdk::{DpdkReplicationDriver, run_receiver_dpdk};
@@ -1771,95 +1770,6 @@ mod tests {
             .is_none(),
             "post-resume idle → no further ack",
         );
-    }
-
-    // --- Dual-replica cursor update tests ---
-
-    #[test]
-    fn dual_cursor_takes_min_and_max_of_both_slots() {
-        let cursor_min = Arc::new(AtomicU64::new(0));
-        let cursor_max = Arc::new(AtomicU64::new(0));
-        // Slot 0 at seq 100, slot 1 at seq 50 → min = 50, max = 100.
-        update_dual_replication_cursor(100, 50, &cursor_min, &cursor_max);
-        assert_eq!(cursor_min.load(Ordering::Relaxed), 50);
-        assert_eq!(cursor_max.load(Ordering::Relaxed), 100);
-    }
-
-    #[test]
-    fn dual_cursor_idle_slot_uses_max() {
-        let cursor_min = Arc::new(AtomicU64::new(0));
-        let cursor_max = Arc::new(AtomicU64::new(0));
-        // Slot 0 at seq 100, slot 1 idle (u64::MAX) → min = 100, max = u64::MAX.
-        update_dual_replication_cursor(100, u64::MAX, &cursor_min, &cursor_max);
-        assert_eq!(cursor_min.load(Ordering::Relaxed), 100);
-        assert_eq!(cursor_max.load(Ordering::Relaxed), u64::MAX);
-    }
-
-    #[test]
-    fn dual_cursor_both_idle() {
-        let cursor_min = Arc::new(AtomicU64::new(42));
-        let cursor_max = Arc::new(AtomicU64::new(42));
-        // Both idle → min = max = u64::MAX (no replicas gating).
-        update_dual_replication_cursor(u64::MAX, u64::MAX, &cursor_min, &cursor_max);
-        assert_eq!(cursor_min.load(Ordering::Relaxed), u64::MAX);
-        assert_eq!(cursor_max.load(Ordering::Relaxed), u64::MAX);
-    }
-
-    #[test]
-    fn dual_cursor_decreases_when_slower_replica_connects() {
-        let cursor_min = Arc::new(AtomicU64::new(0));
-        let cursor_max = Arc::new(AtomicU64::new(0));
-
-        // Slot 0 streaming alone → min = 100, max = u64::MAX.
-        update_dual_replication_cursor(100, u64::MAX, &cursor_min, &cursor_max);
-        assert_eq!(cursor_min.load(Ordering::Relaxed), 100);
-
-        // Slot 1 connects with acked_cursor = 51 (last_sequence 50).
-        // Min must decrease to 51, max stays at 100.
-        update_dual_replication_cursor(51, 100, &cursor_min, &cursor_max);
-        assert_eq!(cursor_min.load(Ordering::Relaxed), 51);
-        assert_eq!(cursor_max.load(Ordering::Relaxed), 100);
-    }
-
-    #[test]
-    fn dual_cursor_advances_as_slower_replica_catches_up() {
-        let cursor_min = Arc::new(AtomicU64::new(0));
-        let cursor_max = Arc::new(AtomicU64::new(0));
-
-        // Initial: slot 0 at 100, slot 1 at 51 → min = 51, max = 100.
-        update_dual_replication_cursor(51, 100, &cursor_min, &cursor_max);
-        assert_eq!(cursor_min.load(Ordering::Relaxed), 51);
-        assert_eq!(cursor_max.load(Ordering::Relaxed), 100);
-
-        // Slot 1 catches up to 80 → min = 80, max = 100.
-        update_dual_replication_cursor(80, 100, &cursor_min, &cursor_max);
-        assert_eq!(cursor_min.load(Ordering::Relaxed), 80);
-
-        // Both at 100 → min = max = 100.
-        update_dual_replication_cursor(100, 100, &cursor_min, &cursor_max);
-        assert_eq!(cursor_min.load(Ordering::Relaxed), 100);
-        assert_eq!(cursor_max.load(Ordering::Relaxed), 100);
-
-        // Both advance → min = max = 150.
-        update_dual_replication_cursor(150, 150, &cursor_min, &cursor_max);
-        assert_eq!(cursor_min.load(Ordering::Relaxed), 150);
-        assert_eq!(cursor_max.load(Ordering::Relaxed), 150);
-    }
-
-    #[test]
-    fn dual_cursor_slot_disconnect_raises_to_surviving() {
-        let cursor_min = Arc::new(AtomicU64::new(0));
-        let cursor_max = Arc::new(AtomicU64::new(0));
-
-        // Both streaming: slot 0 at 100, slot 1 at 80 → min = 80, max = 100.
-        update_dual_replication_cursor(80, 100, &cursor_min, &cursor_max);
-        assert_eq!(cursor_min.load(Ordering::Relaxed), 80);
-        assert_eq!(cursor_max.load(Ordering::Relaxed), 100);
-
-        // Slot 1 disconnects (goes to u64::MAX) → min = 100, max = u64::MAX.
-        update_dual_replication_cursor(100, u64::MAX, &cursor_min, &cursor_max);
-        assert_eq!(cursor_min.load(Ordering::Relaxed), 100);
-        assert_eq!(cursor_max.load(Ordering::Relaxed), u64::MAX);
     }
 
     // --- Cursor reset test ---

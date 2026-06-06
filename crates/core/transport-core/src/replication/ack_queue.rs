@@ -8,7 +8,7 @@
 //! the journal stage catches up, and decide when a fresh ack frame
 //! needs to be sent on the wire.
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::Ordering;
 
 use melin_pipeline::padding::Sequence;
 
@@ -150,24 +150,6 @@ pub fn wait_for_journal_cursor(journal_cursor: &Sequence, target: u64, busy_spin
             std::thread::yield_now();
         }
     }
-}
-
-/// Update both replication cursors after an ack or disconnect.
-///
-/// - `cursor_min`: `min(slot0, slot1)` — both replicas have confirmed up to here.
-/// - `cursor_max`: `max(slot0, slot1)` — fastest replica has confirmed up to here.
-///
-/// Used by both TCP (per-slot threads) and DPDK (single-threaded loop).
-/// Uses `store` (not `fetch_max`) because the cursor must be able to
-/// *decrease* when a second replica connects with a lower acked position.
-pub fn update_dual_replication_cursor(
-    this_acked: u64,
-    other_acked: u64,
-    cursor_min: &AtomicU64,
-    cursor_max: &AtomicU64,
-) {
-    cursor_min.store(this_acked.min(other_acked), Ordering::Release);
-    cursor_max.store(this_acked.max(other_acked), Ordering::Release);
 }
 
 /// Build the next replica → primary [`Ack`] to fire under the

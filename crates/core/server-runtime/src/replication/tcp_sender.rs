@@ -14,7 +14,7 @@ use tracing::{debug, error, info, warn};
 use melin_journal::replication::ReplicationConsumer;
 
 use super::auth::authenticate_replica;
-use super::{ReplicationMetrics, update_dual_replication_cursor};
+use super::{ReplicaCursors, ReplicationMetrics};
 use melin_app::Application;
 use melin_transport_core::replication::catchup::{
     CatchUpResult, can_catch_up_from_journal, catch_up_from_journal, snapshot_transfer_with,
@@ -106,14 +106,15 @@ pub fn run_sender<A: Application>(
         },
     ];
 
-    // Per-slot acked positions. Each handler thread writes its own slot and
-    // reads the other to compute the shared min/max cursors. Initialized to
-    // u64::MAX (idle — not gating). This mirrors the DPDK path's per-slot
-    // `acked_cursor` fields.
-    let slot_acked: [Arc<AtomicU64>; 2] = [
-        Arc::new(AtomicU64::new(u64::MAX)),
-        Arc::new(AtomicU64::new(u64::MAX)),
-    ];
+    // Single owner of the per-replica progress cursors (per-slot acked
+    // positions, shared min/max, and the gate's gauge pair). Shared by
+    // both handler threads — see `ReplicaCursors` for the ordering
+    // contract relative to the active flags.
+    let cursors = Arc::new(ReplicaCursors::new(
+        Arc::clone(&replication_cursor),
+        Arc::clone(&fastest_replica_cursor),
+        Arc::clone(&metrics),
+    ));
 
     loop {
         if shutdown.load(Ordering::Relaxed) {
@@ -178,16 +179,10 @@ pub fn run_sender<A: Application>(
                         consumer.skip_to_producer();
                         slot.consumer = Some(consumer);
                         replicas_connected.fetch_sub(1, Ordering::Release);
-                        // Reset per-slot metrics BEFORE clearing the active
-                        // flag so a reader that observes active=false also
-                        // observes the zeroed cursors via the Release pair.
-                        // Reversing this order would leave a window on weak-
-                        // memory architectures (ARM/AArch64) where a reader
-                        // sees active=true (stale) paired with cursor=0
-                        // (fresh) — see `evaluate_durability` and the B2
-                        // notes in `docs/durability-policy-followups.md`.
-                        metrics.acked_sequence[i].store(0, Ordering::Relaxed);
-                        metrics.in_memory_sequence[i].store(0, Ordering::Relaxed);
+                        // Disengage the slot's cursors BEFORE clearing the
+                        // active flag — see `ReplicaCursors` for the
+                        // ordering contract (B2).
+                        cursors.clear_on_disconnect(i);
                         metrics.catching_up[i].store(false, Ordering::Relaxed);
                         // Clear active flag — journal stage stops publishing
                         // to this ring. Must happen before clearing evict.
@@ -199,16 +194,6 @@ pub fn run_sender<A: Application>(
                         } else {
                             warn!(slot = i, "replica disconnected");
                         }
-                        // Reset this slot's acked position and recompute
-                        // shared cursors from the two per-slot values.
-                        slot_acked[i].store(u64::MAX, Ordering::Release);
-                        let other = slot_acked[1 - i].load(Ordering::Acquire);
-                        update_dual_replication_cursor(
-                            u64::MAX,
-                            other,
-                            &replication_cursor,
-                            &fastest_replica_cursor,
-                        );
                         if replicas_connected.load(Ordering::Relaxed) == 0 {
                             warn!("all replicas disconnected — trading halted");
                         }
@@ -256,10 +241,7 @@ pub fn run_sender<A: Application>(
                         .take()
                         .expect("empty_slot check guarantees consumer is Some");
 
-                    let cursor = Arc::clone(&replication_cursor);
-                    let fastest_cursor = Arc::clone(&fastest_replica_cursor);
-                    let this_slot_acked = Arc::clone(&slot_acked[slot_idx]);
-                    let other_slot_acked = Arc::clone(&slot_acked[1 - slot_idx]);
+                    let slot_cursors = Arc::clone(&cursors);
                     let jpath = journal_path.clone();
                     let auth_keys = Arc::clone(&authorized_keys);
                     let slot_metrics = Arc::clone(&metrics);
@@ -296,10 +278,7 @@ pub fn run_sender<A: Application>(
                             let shutdown_ref = unsafe { &*(shutdown_flag as *const AtomicBool) };
                             let ready_ref = unsafe { &*(ready_flag as *const AtomicBool) };
                             let ctx = SlotContext {
-                                replication_cursor: &cursor,
-                                fastest_replica_cursor: &fastest_cursor,
-                                this_slot_acked: &this_slot_acked,
-                                other_slot_acked: &other_slot_acked,
+                                cursors: &slot_cursors,
                                 journal_path: &jpath,
                                 authorized_keys: &auth_keys,
                                 shutdown: shutdown_ref,
@@ -337,10 +316,7 @@ pub fn run_sender<A: Application>(
 /// Per-slot state shared across the replica handler call chain
 /// (`run_replica_slot` → `handle_replica_connection` → `live_stream_uring`).
 struct SlotContext<'a> {
-    replication_cursor: &'a Arc<AtomicU64>,
-    fastest_replica_cursor: &'a Arc<AtomicU64>,
-    this_slot_acked: &'a Arc<AtomicU64>,
-    other_slot_acked: &'a Arc<AtomicU64>,
+    cursors: &'a Arc<ReplicaCursors>,
     journal_path: &'a std::path::Path,
     authorized_keys: &'a melin_app::auth::AuthorizedKeys,
     shutdown: &'a AtomicBool,
@@ -374,10 +350,7 @@ fn handle_replica_connection<A: Application>(
     ctx: &SlotContext<'_>,
 ) -> io::Result<()> {
     let SlotContext {
-        replication_cursor,
-        fastest_replica_cursor,
-        this_slot_acked,
-        other_slot_acked,
+        cursors,
         journal_path,
         authorized_keys,
         shutdown,
@@ -486,32 +459,14 @@ fn handle_replica_connection<A: Application>(
         }
     }
 
-    // Engage both replication cursors. Set this slot's per-slot acked
-    // position and recompute the shared min/max cursors.
-    let initial_acked = handshake.last_sequence + 1;
-    this_slot_acked.store(initial_acked, Ordering::Release);
-    let other = other_slot_acked.load(Ordering::Acquire);
-    update_dual_replication_cursor(
-        initial_acked,
-        other,
-        replication_cursor,
-        fastest_replica_cursor,
-    );
-
     // Catch-up complete — replica is entering the live streaming loop.
     metrics.catching_up[slot_idx].store(false, Ordering::Relaxed);
 
-    // Seed the per-slot metrics cursors that the response gate's
-    // `evaluate_durability` reads. Must happen BEFORE the active_flag
-    // Release so any reader that observes `active=true` also observes
-    // a non-zero cursor pair — otherwise a 1-replica deployment running
-    // degraded freezes the gate at 0 for the first live-ack RTT after
-    // a reconnect (the disconnect-cleanup zeroed these atomics, and
-    // without seeding the gate would include a `[0, 0]` row in the
-    // policy view). The active_flag Release below publishes these
-    // Relaxed stores together.
-    metrics.acked_sequence[slot_idx].store(handshake.last_sequence, Ordering::Relaxed);
-    metrics.in_memory_sequence[slot_idx].store(handshake.last_sequence, Ordering::Relaxed);
+    // Engage this slot's cursors and seed the gauge pair the response
+    // gate's `evaluate_durability` reads. Must happen BEFORE the
+    // active_flag Release — see `ReplicaCursors` for the ordering
+    // contract.
+    cursors.seed_on_handshake(slot_idx, handshake.last_sequence);
 
     // Mark this ring as active — the journal stage will start publishing
     // to it. Must happen BEFORE replica_ready so the seed drain can wait
@@ -556,10 +511,7 @@ fn live_stream_uring(
     last_sequence: &mut u64,
 ) -> io::Result<()> {
     let SlotContext {
-        replication_cursor,
-        fastest_replica_cursor,
-        this_slot_acked,
-        other_slot_acked,
+        cursors,
         shutdown,
         evict_flag,
         metrics,
@@ -776,19 +728,7 @@ fn live_stream_uring(
                         }
                         let payload = &parse_buf[cursor + 4..cursor + 4 + frame_len];
                         if let Ok(ReplicaMessage::Ack(ack)) = decode_replica_message(payload) {
-                            let new_val = ack.acked_sequence + 1;
-                            this_slot_acked.store(new_val, Ordering::Release);
-                            let other = other_slot_acked.load(Ordering::Acquire);
-                            update_dual_replication_cursor(
-                                new_val,
-                                other,
-                                replication_cursor,
-                                fastest_replica_cursor,
-                            );
-                            metrics.acked_sequence[slot_idx]
-                                .store(ack.acked_sequence, Ordering::Relaxed);
-                            metrics.in_memory_sequence[slot_idx]
-                                .store(ack.in_memory_sequence, Ordering::Relaxed);
+                            cursors.record_ack(slot_idx, &ack);
                             metrics.ack_latency_us[slot_idx]
                                 .store(last_send.elapsed().as_micros() as u64, Ordering::Relaxed);
                         }

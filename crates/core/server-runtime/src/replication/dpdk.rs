@@ -23,9 +23,8 @@ use super::receiver_transport::{
     try_extract_frame,
 };
 use super::{
-    ReceiverResult, ReplicaPipelineHandles, ReplicationMetrics,
+    ReceiverResult, ReplicaCursors, ReplicaPipelineHandles, ReplicationMetrics,
     build_replica_pipeline_with_threads, sleep_checking_flags, teardown_replica_pipeline,
-    update_dual_replication_cursor,
 };
 use melin_transport_core::replication::catchup::{
     CatchUpResult, can_catch_up_from_journal, catch_up_from_journal_with, snapshot_transfer_with,
@@ -113,9 +112,6 @@ struct DpdkReplicaSlot {
     send_buf: Vec<u8>,
     last_send: std::time::Instant,
     last_sequence: u64,
-    /// Per-slot acked cursor. `u64::MAX` when not streaming —
-    /// doesn't block the replication cursor (min of both slots).
-    acked_cursor: u64,
 }
 
 /// Step-able DPDK replication state. Owns both slot state machines and the
@@ -133,8 +129,9 @@ struct DpdkReplicaSlot {
 /// data, hence the `PhantomData`.
 pub struct DpdkReplicationDriver<A: Application> {
     slots: [DpdkReplicaSlot; 2],
-    replication_cursor: Arc<AtomicU64>,
-    fastest_replica_cursor: Arc<AtomicU64>,
+    /// Single owner of the per-replica progress cursors (per-slot
+    /// acked positions, shared min/max, and the gate's gauge pair).
+    cursors: ReplicaCursors,
     journal_path: std::path::PathBuf,
     replica_ready: Arc<AtomicBool>,
     replicas_connected: Arc<AtomicU32>,
@@ -177,7 +174,6 @@ impl<A: Application> DpdkReplicationDriver<A> {
                     send_buf: Vec::with_capacity(512 * 1024),
                     last_send: now,
                     last_sequence: 0,
-                    acked_cursor: u64::MAX,
                 },
                 DpdkReplicaSlot {
                     state: SlotState::Idle,
@@ -188,11 +184,13 @@ impl<A: Application> DpdkReplicationDriver<A> {
                     send_buf: Vec::with_capacity(512 * 1024),
                     last_send: now,
                     last_sequence: 0,
-                    acked_cursor: u64::MAX,
                 },
             ],
-            replication_cursor,
-            fastest_replica_cursor,
+            cursors: ReplicaCursors::new(
+                replication_cursor,
+                fastest_replica_cursor,
+                metrics.clone(),
+            ),
             journal_path,
             replica_ready,
             replicas_connected,
@@ -241,8 +239,7 @@ impl<A: Application> DpdkReplicationDriver<A> {
         // the previous run_sender_dpdk thread, mostly verbatim, so keep
         // the variable names matching.
         let slots = &mut self.slots;
-        let replication_cursor = &self.replication_cursor;
-        let fastest_replica_cursor = &self.fastest_replica_cursor;
+        let cursors = &self.cursors;
         let journal_path = &self.journal_path;
         let replica_ready = &self.replica_ready;
         let replicas_connected = &self.replicas_connected;
@@ -251,9 +248,9 @@ impl<A: Application> DpdkReplicationDriver<A> {
         let heartbeat_interval = self.heartbeat_interval;
 
         // Check eviction flags from the journal stage.
-        for i in 0..2 {
-            let evicting = slots[i].evict_flag.load(Ordering::Acquire)
-                && !matches!(slots[i].state, SlotState::Idle);
+        for (i, slot) in slots.iter_mut().enumerate() {
+            let evicting =
+                slot.evict_flag.load(Ordering::Acquire) && !matches!(slot.state, SlotState::Idle);
             if !evicting {
                 continue;
             }
@@ -262,19 +259,19 @@ impl<A: Application> DpdkReplicationDriver<A> {
                 slot = i,
                 "evicting slow replica (ring backpressure timeout, DPDK)"
             );
-            let slot = &mut slots[i];
             if let SlotState::Streaming(h) | SlotState::Handshaking(h) = slot.state {
                 transport.close(h);
             }
-            // Zero per-slot metrics BEFORE the active_flag Release so
-            // a reader cannot observe `active=true` paired with `cursor=0`
-            // on weak-memory architectures (see B2 in the follow-ups doc).
-            metrics.acked_sequence[i].store(0, Ordering::Relaxed);
-            metrics.in_memory_sequence[i].store(0, Ordering::Relaxed);
+            // Disengage the slot's cursors BEFORE the active_flag
+            // Release — see `ReplicaCursors` for the ordering contract
+            // (B2) and why the shared min must be recomputed from the
+            // surviving slot (a frozen min stops the primary from
+            // acking client requests even though the surviving replica
+            // is healthy).
+            cursors.clear_on_disconnect(i);
             metrics.catching_up[i].store(false, Ordering::Relaxed);
             slot.active_flag.store(false, Ordering::Release);
             slot.evict_flag.store(false, Ordering::Release);
-            slot.acked_cursor = u64::MAX;
             slot.recv_buf.clear();
             // Drop any unread ring entries so a reconnecting replica
             // on this slot doesn't replay pre-eviction data and stall
@@ -283,21 +280,6 @@ impl<A: Application> DpdkReplicationDriver<A> {
             slot.consumer.skip_to_producer();
             slot.state = SlotState::Idle;
             replicas_connected.fetch_sub(1, Ordering::Release);
-
-            // Recompute the shared replication cursor from the *surviving*
-            // slot's progress so the response stage's gate can advance.
-            // Without this, `replication_cursor` stays frozen at its pre-
-            // eviction value (the min that included this slot's last
-            // ack), and the primary stops acking client requests even
-            // though the surviving replica is healthy. The kernel-TCP
-            // path does the equivalent in tcp_sender.rs.
-            let other_acked = slots[1 - i].acked_cursor;
-            update_dual_replication_cursor(
-                u64::MAX,
-                other_acked,
-                replication_cursor,
-                fastest_replica_cursor,
-            );
             if replicas_connected.load(Ordering::Relaxed) == 0 {
                 warn!("all replicas disconnected — trading halted");
             }
@@ -305,19 +287,7 @@ impl<A: Application> DpdkReplicationDriver<A> {
 
         let mut any_active = false;
 
-        for slot_idx in 0..2 {
-            // Split the array to get disjoint mutable/immutable borrows.
-            // This lets us read the other slot's acked_cursor while
-            // mutably borrowing the current slot.
-            let (slot, other_acked) = {
-                let (left, right) = slots.split_at_mut(1);
-                if slot_idx == 0 {
-                    (&mut left[0], right[0].acked_cursor)
-                } else {
-                    (&mut right[0], left[0].acked_cursor)
-                }
-            };
-
+        for (slot_idx, slot) in slots.iter_mut().enumerate() {
             match slot.state {
                 SlotState::Idle => {
                     // Drain ring to keep it flowing. The journal stage
@@ -338,15 +308,9 @@ impl<A: Application> DpdkReplicationDriver<A> {
                             "replica disconnected during handshake (DPDK)"
                         );
                         slot.state = SlotState::Idle;
-                        slot.acked_cursor = u64::MAX;
                         slot.recv_buf.clear();
                         replicas_connected.fetch_sub(1, Ordering::Release);
-                        update_dual_replication_cursor(
-                            u64::MAX,
-                            other_acked,
-                            replication_cursor,
-                            fastest_replica_cursor,
-                        );
+                        cursors.clear_on_disconnect(slot_idx);
                         continue;
                     }
 
@@ -378,10 +342,7 @@ impl<A: Application> DpdkReplicationDriver<A> {
                                             slot.state = SlotState::Idle;
                                             slot.recv_buf.clear();
                                             replicas_connected.fetch_sub(1, Ordering::Release);
-                                            if replicas_connected.load(Ordering::Relaxed) == 0 {
-                                                replication_cursor
-                                                    .store(u64::MAX, Ordering::Release);
-                                            }
+                                            cursors.clear_on_disconnect(slot_idx);
                                             continue;
                                         }
                                     };
@@ -460,14 +421,10 @@ impl<A: Application> DpdkReplicationDriver<A> {
                                         metrics.catching_up[slot_idx]
                                             .store(false, Ordering::Relaxed);
                                         replicas_connected.fetch_sub(1, Ordering::Release);
-                                        if replicas_connected.load(Ordering::Relaxed) == 0 {
-                                            replication_cursor.store(u64::MAX, Ordering::Release);
-                                        }
+                                        cursors.clear_on_disconnect(slot_idx);
                                         continue;
                                     }
 
-                                    // Set cursor to this replica's acked position.
-                                    slot.acked_cursor = h.last_sequence + 1;
                                     slot.last_sequence = h.last_sequence;
                                     slot.last_send = std::time::Instant::now();
 
@@ -487,29 +444,17 @@ impl<A: Application> DpdkReplicationDriver<A> {
                                         slot.consumer.commit();
                                     }
 
-                                    // Seed the per-slot metrics cursors before flipping
-                                    // active so a reader that observes active=true also
-                                    // observes a non-zero cursor pair. Without this, a
-                                    // degraded gate freezes after a replica rejoins —
-                                    // see tcp_sender for the full rationale. Relaxed is
-                                    // fine because the active_flag Release below
-                                    // publishes these stores in program order.
-                                    metrics.acked_sequence[slot_idx]
-                                        .store(h.last_sequence, Ordering::Relaxed);
-                                    metrics.in_memory_sequence[slot_idx]
-                                        .store(h.last_sequence, Ordering::Relaxed);
+                                    // Engage this slot's cursors and seed the gauge
+                                    // pair BEFORE flipping active so a reader that
+                                    // observes active=true also observes a non-zero
+                                    // cursor pair — see `ReplicaCursors` for the
+                                    // ordering contract.
+                                    cursors.seed_on_handshake(slot_idx, h.last_sequence);
 
                                     // Mark ring active before signaling readiness
                                     // so the journal stage publishes when seeds flow.
                                     slot.active_flag.store(true, Ordering::Release);
                                     replica_ready.store(true, Ordering::Release);
-
-                                    update_dual_replication_cursor(
-                                        slot.acked_cursor,
-                                        other_acked,
-                                        replication_cursor,
-                                        fastest_replica_cursor,
-                                    );
 
                                     metrics.catching_up[slot_idx].store(false, Ordering::Relaxed);
                                     slot.state = SlotState::Streaming(handle);
@@ -523,10 +468,7 @@ impl<A: Application> DpdkReplicationDriver<A> {
                                     slot.state = SlotState::Idle;
                                     slot.recv_buf.clear();
                                     replicas_connected.fetch_sub(1, Ordering::Release);
-                                    if replicas_connected.load(Ordering::Relaxed) == 0 {
-                                        replication_cursor.store(u64::MAX, Ordering::Release);
-                                        fastest_replica_cursor.store(u64::MAX, Ordering::Release);
-                                    }
+                                    cursors.clear_on_disconnect(slot_idx);
                                 }
                                 Err(e) => {
                                     warn!(slot = slot_idx, error = %e, "failed to decode handshake — disconnecting");
@@ -534,10 +476,7 @@ impl<A: Application> DpdkReplicationDriver<A> {
                                     slot.state = SlotState::Idle;
                                     slot.recv_buf.clear();
                                     replicas_connected.fetch_sub(1, Ordering::Release);
-                                    if replicas_connected.load(Ordering::Relaxed) == 0 {
-                                        replication_cursor.store(u64::MAX, Ordering::Release);
-                                        fastest_replica_cursor.store(u64::MAX, Ordering::Release);
-                                    }
+                                    cursors.clear_on_disconnect(slot_idx);
                                 }
                             }
                         }
@@ -547,10 +486,7 @@ impl<A: Application> DpdkReplicationDriver<A> {
                             slot.state = SlotState::Idle;
                             slot.recv_buf.clear();
                             replicas_connected.fetch_sub(1, Ordering::Release);
-                            if replicas_connected.load(Ordering::Relaxed) == 0 {
-                                replication_cursor.store(u64::MAX, Ordering::Release);
-                                fastest_replica_cursor.store(u64::MAX, Ordering::Release);
-                            }
+                            cursors.clear_on_disconnect(slot_idx);
                         }
                         FrameResult::Incomplete => {} // Wait for more data.
                     }
@@ -571,17 +507,7 @@ impl<A: Application> DpdkReplicationDriver<A> {
                                 if let Ok(ReplicaMessage::Ack(ack)) =
                                     decode_replica_message(payload)
                                 {
-                                    slot.acked_cursor = ack.acked_sequence + 1;
-                                    metrics.acked_sequence[slot_idx]
-                                        .store(ack.acked_sequence, Ordering::Relaxed);
-                                    metrics.in_memory_sequence[slot_idx]
-                                        .store(ack.in_memory_sequence, Ordering::Relaxed);
-                                    update_dual_replication_cursor(
-                                        slot.acked_cursor,
-                                        other_acked,
-                                        replication_cursor,
-                                        fastest_replica_cursor,
-                                    );
+                                    cursors.record_ack(slot_idx, &ack);
                                 }
                                 consumed += frame_end;
                             }
@@ -599,20 +525,12 @@ impl<A: Application> DpdkReplicationDriver<A> {
                     compact_recv_buf(&mut slot.recv_buf, consumed);
                     if ack_error {
                         transport.close(handle);
-                        // Zero metrics before active_flag Release — see B2.
-                        metrics.acked_sequence[slot_idx].store(0, Ordering::Relaxed);
-                        metrics.in_memory_sequence[slot_idx].store(0, Ordering::Relaxed);
+                        // Disengage cursors before the active_flag Release — see B2.
+                        cursors.clear_on_disconnect(slot_idx);
                         slot.active_flag.store(false, Ordering::Release);
-                        slot.acked_cursor = u64::MAX;
                         slot.recv_buf.clear();
                         slot.state = SlotState::Idle;
                         replicas_connected.fetch_sub(1, Ordering::Release);
-                        update_dual_replication_cursor(
-                            u64::MAX,
-                            other_acked,
-                            replication_cursor,
-                            fastest_replica_cursor,
-                        );
                         if replicas_connected.load(Ordering::Relaxed) == 0 {
                             warn!("all replicas disconnected — trading halted");
                         }
@@ -683,20 +601,12 @@ impl<A: Application> DpdkReplicationDriver<A> {
                             "TX overflow on replica socket — disconnecting"
                         );
                         transport.close(handle);
-                        // Zero metrics before active_flag Release — see B2.
-                        metrics.acked_sequence[slot_idx].store(0, Ordering::Relaxed);
-                        metrics.in_memory_sequence[slot_idx].store(0, Ordering::Relaxed);
+                        // Disengage cursors before the active_flag Release — see B2.
+                        cursors.clear_on_disconnect(slot_idx);
                         slot.active_flag.store(false, Ordering::Release);
-                        slot.acked_cursor = u64::MAX;
                         slot.recv_buf.clear();
                         slot.state = SlotState::Idle;
                         replicas_connected.fetch_sub(1, Ordering::Release);
-                        update_dual_replication_cursor(
-                            u64::MAX,
-                            other_acked,
-                            replication_cursor,
-                            fastest_replica_cursor,
-                        );
                         if replicas_connected.load(Ordering::Relaxed) == 0 {
                             warn!("all replicas disconnected — trading halted");
                         }
@@ -724,20 +634,12 @@ impl<A: Application> DpdkReplicationDriver<A> {
                     // 4. Check for disconnect.
                     if !transport.is_active(handle) {
                         warn!(slot = slot_idx, "replica disconnected (DPDK)");
-                        // Zero metrics before active_flag Release — see B2.
-                        metrics.acked_sequence[slot_idx].store(0, Ordering::Relaxed);
-                        metrics.in_memory_sequence[slot_idx].store(0, Ordering::Relaxed);
+                        // Disengage cursors before the active_flag Release — see B2.
+                        cursors.clear_on_disconnect(slot_idx);
                         slot.active_flag.store(false, Ordering::Release);
-                        slot.acked_cursor = u64::MAX;
                         slot.recv_buf.clear();
                         slot.state = SlotState::Idle;
                         replicas_connected.fetch_sub(1, Ordering::Release);
-                        update_dual_replication_cursor(
-                            u64::MAX,
-                            other_acked,
-                            replication_cursor,
-                            fastest_replica_cursor,
-                        );
                         if replicas_connected.load(Ordering::Relaxed) == 0 {
                             warn!("all replicas disconnected — trading halted");
                         }
