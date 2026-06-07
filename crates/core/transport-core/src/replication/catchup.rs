@@ -341,6 +341,75 @@ pub fn snapshot_transfer_with<E: AppEvent>(
     catch_up_from_journal_with::<E>(journal_path, snap_sequence, publisher, shutdown)
 }
 
+/// Bridge a replica from journal catch-up into live ring streaming
+/// without a sequence hole, returning the slot's seeded
+/// [`SentHighWater`].
+///
+/// The journal stage only publishes to a slot's ring while the slot's
+/// `active_flag` is set — and the bulk catch-up pass runs with it
+/// clear (so a long transfer can't overflow the ring). Entries
+/// journaled between the bulk pass's scanner EOF and the flag flip are
+/// therefore in *neither* the catch-up stream *nor* the ring; they
+/// exist only on disk. This function closes that hole:
+///
+/// 1. **Activate the ring first.** From this store on, every batch the
+///    journal stage syncs is either published to the ring or evicts
+///    the replica — nothing new can fall through.
+/// 2. **Residual journal pass** from `bulk_catchup_end`: picks up off
+///    the disk everything that fell into the window. Its scanner
+///    starts after the store, so its EOF covers every batch whose
+///    activation check preceded the store.
+/// 3. **Seed + overlap drain**: ring chunks the residual pass already
+///    covered are discarded, the first chunk beyond it is forwarded
+///    (chunk-granular, so a chunk straddling the residual EOF re-sends
+///    a few covered slots — the receiver skips duplicates; see
+///    `process_streaming_frames`), and the rest stays for the live
+///    loop.
+///
+/// Overlap between the passes is possible; a gap is not. Owning the
+/// `active_flag` store here makes the activate-before-residual order
+/// impossible to get wrong at the call sites — the same rationale as
+/// [`SentHighWater`] owning the drain condition. Callers must still
+/// engage the slot's cursors *before* calling this (the seed-before-
+/// active ordering contract, B2 in `ReplicaCursors`).
+///
+/// Regression context: the 2026-06-07 LAN bench reconnected an evicted
+/// replica whose live stream resumed 212 entries past its catch-up end
+/// — the pre-bridge handoff went live directly off the bulk pass.
+pub fn bridge_catchup_to_live<E: AppEvent>(
+    journal_path: &std::path::Path,
+    handshake_last_sequence: u64,
+    bulk_catchup_end: u64,
+    active_flag: &AtomicBool,
+    consumer: &mut melin_journal::replication::ReplicationConsumer,
+    publisher: CatchUpPublisher<'_>,
+    shutdown: &AtomicBool,
+) -> io::Result<super::sent::SentHighWater> {
+    active_flag.store(true, Ordering::Release);
+
+    let residual_end = match catch_up_from_journal_with::<E>(
+        journal_path,
+        bulk_catchup_end,
+        &mut *publisher,
+        shutdown,
+    )? {
+        CatchUpResult::Ok(end) => end,
+        // The bulk pass just streamed up to `bulk_catchup_end`; only a
+        // concurrent archive prune could make the residual pass lose
+        // its start point. Tear the connection down — the replica
+        // re-handshakes and gets routed to snapshot transfer.
+        CatchUpResult::NeedSnapshot => {
+            return Err(io::Error::other(
+                "journal history pruned during catch-up handoff — reconnect for snapshot transfer",
+            ));
+        }
+    };
+
+    let mut sent = super::sent::SentHighWater::seed(handshake_last_sequence, residual_end);
+    sent.drain_overlap(consumer, |data| publisher(data))?;
+    Ok(sent)
+}
+
 /// Thin wrapper around [`catch_up_from_journal_with`] that ships
 /// frames over a TCP stream.
 pub fn catch_up_from_journal<E: AppEvent>(

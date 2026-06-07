@@ -128,6 +128,27 @@ pub(super) struct StreamingFrameOutcome {
 ///
 /// Uses `try_decode_input_batch_into` to decode into a reusable
 /// `slot_buf`, avoiding per-batch heap allocation on the hot path.
+///
+/// # Sequence contiguity
+///
+/// The wire stream is the replica's only source of truth for journal
+/// sequences — the journal stage stamps `slot.sequence` verbatim, so
+/// anything published here lands in the replica's journal at face
+/// value. This function is the gate. Cumulative-delivery semantics,
+/// anchored at `accum_end_sequence` (the session's resume point, then
+/// the last accepted slot):
+///
+/// - `seq <= accum` — skipped: idempotent re-delivery. The catch-up →
+///   live handoff drains ring chunks whole, and a chunk straddling the
+///   catch-up end legitimately re-carries covered slots.
+/// - `seq == accum + 1` — accepted.
+/// - `seq > accum + 1` — fatal. A gap can never be repaired
+///   downstream: acking past it overstates durability to the
+///   primary's response gate, and the hole surfaces only at lineage
+///   audit (the 2026-06-07 bench failure). The contiguous prefix is
+///   committed (progress preserved — mirrors the oversize-frame
+///   semantics); the session tears down and re-handshakes from its
+///   true position.
 pub(super) fn process_streaming_frames<E: AppEvent>(
     recv_buf: &[u8],
     input_producer: &mut melin_pipeline::ring::Producer<InputSlot<E>>,
@@ -153,9 +174,30 @@ pub(super) fn process_streaming_frames<E: AppEvent>(
                             received_data = true;
                             for slot in slot_buf.drain(..) {
                                 let primary_seq = slot.sequence;
+                                if primary_seq <= pending_accum {
+                                    // Duplicate from handoff chunk overlap —
+                                    // already applied; never re-publish (a
+                                    // re-applied slot rewinds the journal
+                                    // stage's sequence counter).
+                                    continue;
+                                }
+                                if primary_seq != pending_accum + 1 {
+                                    frame_err = Some(
+                                        format!(
+                                            "sequence gap in replication stream: \
+                                             expected {}, got {primary_seq}",
+                                            pending_accum + 1
+                                        )
+                                        .into(),
+                                    );
+                                    break;
+                                }
                                 last_target = batch.push_with(|s| *s = slot);
                                 pending_accum = primary_seq;
                                 any_published = true;
+                            }
+                            if frame_err.is_some() {
+                                break;
                             }
                         }
                     }
@@ -215,6 +257,14 @@ pub(super) struct DrainFrameOutcome {
 /// publish slots under a single batch. Non-input frames are silently
 /// skipped — the promotion sequence only cares about flushing pending
 /// data, not validating the wire.
+///
+/// Sequence contiguity is enforced exactly as in
+/// [`process_streaming_frames`] — these slots feed the journal the
+/// about-to-be-primary replays from, so a gap accepted here becomes a
+/// gapped journal on the new primary. With no error channel on the
+/// drain path, the drain simply stops at the gap: everything before it
+/// is flushed, everything after is unreachable anyway (it could never
+/// be applied without the missing entries).
 pub(super) fn process_drain_frames<E: AppEvent>(
     recv_buf: &[u8],
     input_producer: &mut melin_pipeline::ring::Producer<InputSlot<E>>,
@@ -227,7 +277,7 @@ pub(super) fn process_drain_frames<E: AppEvent>(
     let mut batch = input_producer.batch();
     let mut pending_accum = accum_end_sequence;
 
-    loop {
+    'frames: loop {
         let remaining = &recv_buf[consumed..];
         match try_extract_frame(remaining, MAX_DATA_FRAME) {
             FrameResult::Complete(ps, fe) => {
@@ -235,6 +285,19 @@ pub(super) fn process_drain_frames<E: AppEvent>(
                 if let Ok(()) = try_decode_input_batch_into(payload, slot_buf) {
                     for slot in slot_buf.drain(..) {
                         let primary_seq = slot.sequence;
+                        if primary_seq <= pending_accum {
+                            // Duplicate from handoff chunk overlap.
+                            continue;
+                        }
+                        if primary_seq != pending_accum + 1 {
+                            tracing::warn!(
+                                expected = pending_accum + 1,
+                                got = primary_seq,
+                                "sequence gap in promotion drain — stopping at the \
+                                 last contiguous slot"
+                            );
+                            break 'frames;
+                        }
                         last_target = batch.push_with(|s| *s = slot);
                         pending_accum = primary_seq;
                         any_published = true;
@@ -285,6 +348,12 @@ pub(super) struct StreamingResult {
 ///
 /// Parameterised over `T: ReceiverTransport` so the exact same loop
 /// drives both the io_uring (kernel TCP) and DPDK (smoltcp) backends.
+///
+/// `initial_sequence` is the session's resume point — the highest
+/// primary sequence already applied locally (handshake `last_sequence`,
+/// or the snapshot sequence after a transfer). It anchors the
+/// contiguity gate in [`process_streaming_frames`]: the first slot on
+/// the wire must be `initial_sequence + 1`.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn streaming_loop<T: ReceiverTransport, E: AppEvent>(
     transport: &mut T,
@@ -294,6 +363,7 @@ pub(super) fn streaming_loop<T: ReceiverTransport, E: AppEvent>(
     promote: &AtomicBool,
     pipeline_depth: usize,
     busy_spin: bool,
+    initial_sequence: u64,
     // Caller-owned receive buffer. May contain leftover bytes from the
     // handshake phase (DPDK path: smoltcp can deliver the StreamStart
     // response and the first InputBatch in a single recv, so the bytes
@@ -306,10 +376,16 @@ pub(super) fn streaming_loop<T: ReceiverTransport, E: AppEvent>(
     let mut slot_buf: Vec<InputSlot<E>> = Vec::new();
     let mut pending_acks = PendingAckQueue::new(pipeline_depth);
 
-    let mut accum_end_sequence: u64 = 0;
-    let mut last_sent_acked_seq: u64 = 0;
-    let mut last_sent_in_memory_seq: u64 = 0;
-    let mut last_committed_primary_seq: u64 = 0;
+    // All four cursors seed from the resume point: `accum` anchors the
+    // contiguity gate, `last_committed` keeps the in-memory-ack
+    // debug_assert honest, and the `last_sent_*` pair suppresses a
+    // session-start ack that would otherwise fire before any data
+    // arrives (in-memory coverage up to `initial_sequence` is implied
+    // by the handshake itself).
+    let mut accum_end_sequence: u64 = initial_sequence;
+    let mut last_sent_acked_seq: u64 = initial_sequence;
+    let mut last_sent_in_memory_seq: u64 = initial_sequence;
+    let mut last_committed_primary_seq: u64 = initial_sequence;
 
     let mut received_data = false;
     let mut idle_spins: u32 = 0;
@@ -686,6 +762,7 @@ mod tests {
             &promote,
             4,
             false,
+            0,
             Vec::new(),
             None,
         );
@@ -715,6 +792,7 @@ mod tests {
             &promote,
             4,
             false,
+            0,
             Vec::new(),
             None,
         );
@@ -742,6 +820,7 @@ mod tests {
             &promote,
             4,
             false,
+            0,
             Vec::new(),
             None,
         );
@@ -771,6 +850,7 @@ mod tests {
             &promote,
             4,
             false,
+            9,
             Vec::new(),
             None,
         );
@@ -812,6 +892,7 @@ mod tests {
             &promote,
             4,
             false,
+            0,
             initial,
             None,
         );
@@ -851,6 +932,7 @@ mod tests {
             &promote,
             1, // pipeline_depth=1 → PendingAckQueue cap=1
             false,
+            0,
             Vec::new(),
             None,
         );
@@ -887,6 +969,7 @@ mod tests {
             &promote,
             4,
             false,
+            0,
             Vec::new(),
             None,
         );
@@ -931,6 +1014,7 @@ mod tests {
                 &promote,
                 4,
                 false,
+                41,
                 Vec::new(),
                 None,
             );
@@ -968,6 +1052,7 @@ mod tests {
             &promote,
             4,
             false,
+            0,
             Vec::new(),
             Some(&utilization),
         );
@@ -988,9 +1073,9 @@ mod tests {
         let mut slot_buf = Vec::new();
 
         let mut buf = Vec::new();
-        append_input_batch_frame(&mut buf, &[slot(10, 0xA0), slot(11, 0xA1), slot(12, 0xA2)]);
+        append_input_batch_frame(&mut buf, &[slot(6, 0xA0), slot(7, 0xA1), slot(8, 0xA2)]);
         encode_heartbeat(99, &mut buf);
-        append_input_batch_frame(&mut buf, &[slot(13, 0xA3)]);
+        append_input_batch_frame(&mut buf, &[slot(9, 0xA3)]);
 
         let outcome = process_streaming_frames::<TestEvent>(&buf, &mut producer, 5, &mut slot_buf);
 
@@ -998,7 +1083,7 @@ mod tests {
         assert_eq!(outcome.consumed, buf.len(), "every byte processed");
         assert!(outcome.any_published);
         assert!(outcome.received_data);
-        assert_eq!(outcome.accum_end_sequence, 13);
+        assert_eq!(outcome.accum_end_sequence, 9);
 
         let slots = drain(&mut consumer);
         assert_eq!(slots.len(), 4);
@@ -1017,7 +1102,7 @@ mod tests {
         let oversize_len = (MAX_DATA_FRAME as u32) + 1;
         buf.extend_from_slice(&oversize_len.to_le_bytes());
 
-        let outcome = process_streaming_frames::<TestEvent>(&buf, &mut producer, 0, &mut slot_buf);
+        let outcome = process_streaming_frames::<TestEvent>(&buf, &mut producer, 6, &mut slot_buf);
 
         assert!(outcome.frame_err.is_some(), "oversize => fatal");
         assert_eq!(outcome.accum_end_sequence, 8);
@@ -1036,7 +1121,7 @@ mod tests {
         buf.extend_from_slice(&1u32.to_le_bytes());
         buf.push(0xFF);
 
-        let outcome = process_streaming_frames::<TestEvent>(&buf, &mut producer, 0, &mut slot_buf);
+        let outcome = process_streaming_frames::<TestEvent>(&buf, &mut producer, 2, &mut slot_buf);
 
         assert!(outcome.frame_err.is_some(), "unknown primary msg => fatal");
         assert_eq!(outcome.accum_end_sequence, 4);
@@ -1097,6 +1182,197 @@ mod tests {
         assert!(drain(&mut consumer).is_empty());
     }
 
+    // ---------------------------------------------------------------
+    // Sequence-contiguity tests
+    //
+    // The wire stream is the replica's only source of truth for journal
+    // sequences — the journal stage stamps `slot.sequence` verbatim
+    // (`set_next_sequence(slot.sequence + 1)`), so anything the receiver
+    // publishes lands in the replica's journal at face value. The
+    // receiver is therefore the gate: a slot whose sequence skips ahead
+    // of the last accepted one must be a fatal protocol violation, never
+    // silently applied. Regression: the 2026-06-07 LAN bench shipped a
+    // reconnecting replica a stream with a 212-entry hole (catch-up →
+    // live handoff race on the primary); the replica accepted it, acked
+    // past the hole, and its journal failed lineage verification only
+    // at post-run audit.
+    //
+    // Pinned semantics, mirroring TCP-style cumulative delivery:
+    //   seq <= accum      → skip (idempotent re-delivery: the first
+    //                       live chunk after catch-up may straddle the
+    //                       catch-up end and re-carry covered slots)
+    //   seq == accum + 1  → accept
+    //   seq >  accum + 1  → fatal — a gap can never be repaired
+    //                       downstream; acking past it overstates
+    //                       durability and corrupts the journal lineage.
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn streaming_rejects_sequence_gap_across_frames() {
+        let (mut producer, mut consumer) = ring(16);
+        let mut slot_buf = Vec::new();
+
+        let mut buf = Vec::new();
+        append_input_batch_frame(&mut buf, &[slot(10, 0xA0), slot(11, 0xA1)]);
+        // 11 → 14: entries 12..=13 are missing from the wire.
+        append_input_batch_frame(&mut buf, &[slot(14, 0xA2), slot(15, 0xA3)]);
+
+        let outcome = process_streaming_frames::<TestEvent>(&buf, &mut producer, 9, &mut slot_buf);
+
+        assert!(
+            outcome.frame_err.is_some(),
+            "a sequence gap (11 → 14) must be a fatal protocol violation, \
+             not silently accepted"
+        );
+        let published: Vec<u64> = drain(&mut consumer).iter().map(|s| s.sequence).collect();
+        assert_eq!(
+            published,
+            vec![10, 11],
+            "nothing at or beyond the gap may reach the input ring"
+        );
+        assert_eq!(
+            outcome.accum_end_sequence, 11,
+            "accum must stop at the last contiguous slot"
+        );
+    }
+
+    #[test]
+    fn streaming_rejects_sequence_gap_within_a_frame() {
+        let (mut producer, mut consumer) = ring(16);
+        let mut slot_buf = Vec::new();
+
+        let mut buf = Vec::new();
+        // 11 → 13 inside a single InputBatch: entry 12 is missing.
+        append_input_batch_frame(&mut buf, &[slot(10, 0xB0), slot(11, 0xB1), slot(13, 0xB2)]);
+
+        let outcome = process_streaming_frames::<TestEvent>(&buf, &mut producer, 9, &mut slot_buf);
+
+        assert!(
+            outcome.frame_err.is_some(),
+            "an intra-frame sequence gap (11 → 13) must be fatal"
+        );
+        let published: Vec<u64> = drain(&mut consumer).iter().map(|s| s.sequence).collect();
+        assert_eq!(
+            published,
+            vec![10, 11],
+            "the contiguous prefix is committed; the slot past the gap is not \
+             (mirrors the oversize-frame semantics: commit prior progress, then fatal)"
+        );
+        assert_eq!(outcome.accum_end_sequence, 11);
+    }
+
+    #[test]
+    fn streaming_skips_already_applied_slots_instead_of_reapplying() {
+        let (mut producer, mut consumer) = ring(16);
+        let mut slot_buf = Vec::new();
+
+        let mut buf = Vec::new();
+        append_input_batch_frame(&mut buf, &[slot(10, 0xC0), slot(11, 0xC1)]);
+        // Overlapping re-delivery: the first live chunk after catch-up
+        // may straddle the catch-up end and re-carry slot 11. The
+        // duplicate must be dropped, the new slot accepted.
+        append_input_batch_frame(&mut buf, &[slot(11, 0xC1), slot(12, 0xC2)]);
+
+        let outcome = process_streaming_frames::<TestEvent>(&buf, &mut producer, 9, &mut slot_buf);
+
+        assert!(
+            outcome.frame_err.is_none(),
+            "covered-slot re-delivery is benign overlap, not a violation: {:?}",
+            outcome.frame_err
+        );
+        let published: Vec<u64> = drain(&mut consumer).iter().map(|s| s.sequence).collect();
+        assert_eq!(
+            published,
+            vec![10, 11, 12],
+            "slot 11 must be applied exactly once — re-publishing rewinds the \
+             replica journal's sequence counter and corrupts its lineage"
+        );
+        assert_eq!(outcome.accum_end_sequence, 12);
+    }
+
+    #[test]
+    fn drain_does_not_publish_past_a_sequence_gap() {
+        let (mut producer, mut consumer) = ring(16);
+        let mut slot_buf = Vec::new();
+
+        let mut buf = Vec::new();
+        append_input_batch_frame(&mut buf, &[slot(10, 0xD0), slot(11, 0xD1)]);
+        append_input_batch_frame(&mut buf, &[slot(14, 0xD2)]);
+
+        // The promote drain flushes buffered frames straight into the
+        // pipeline that the about-to-be-primary replays from — a gap
+        // accepted here becomes a gapped journal on the new primary, at
+        // the worst possible moment.
+        let outcome = process_drain_frames::<TestEvent>(&buf, &mut producer, 9, &mut slot_buf);
+
+        let published: Vec<u64> = drain(&mut consumer).iter().map(|s| s.sequence).collect();
+        assert_eq!(
+            published,
+            vec![10, 11],
+            "promotion drain must not publish slots past a sequence gap"
+        );
+        assert_eq!(outcome.accum_end_sequence, 11);
+    }
+
+    /// Loop-level pin of the durability contract: after a gapped wire
+    /// stream, the session must end fatally and no ack — persisted or
+    /// in-memory — may ever name a sequence past the last contiguous
+    /// slot. In the bench failure the replica kept acking for the rest
+    /// of the 60s run with a 212-entry hole behind its cursors,
+    /// overstating durability to the primary's response gate.
+    #[test]
+    fn streaming_loop_sequence_gap_is_fatal_and_never_acked_past() {
+        let (mut producer, mut consumer) = ring(16);
+        // Journal cursor at u64::MAX so pending acks are immediately
+        // durable — ack content is what's under test, not flush timing.
+        let cursor = journal_cursor(u64::MAX);
+        let shutdown = AtomicBool::new(false);
+        let promote = AtomicBool::new(false);
+        let mut transport = MockTransport::new();
+
+        let mut data1 = Vec::new();
+        append_input_batch_frame(&mut data1, &[slot(1, 0x01), slot(2, 0x02)]);
+        transport.push_data(data1);
+        let mut data2 = Vec::new();
+        // 2 → 5: entries 3..=4 never arrive.
+        append_input_batch_frame(&mut data2, &[slot(5, 0x05), slot(6, 0x06)]);
+        transport.push_data(data2);
+        transport.disconnect_after_data();
+
+        let result = streaming_loop::<MockTransport, TestEvent>(
+            &mut transport,
+            &mut producer,
+            &cursor,
+            &shutdown,
+            &promote,
+            4,
+            false,
+            0,
+            Vec::new(),
+            None,
+        );
+
+        assert!(
+            matches!(result.exit, SessionExit::Fatal(_)),
+            "a gapped stream must end the session fatally (got a clean exit)"
+        );
+        let published: Vec<u64> = drain(&mut consumer).iter().map(|s| s.sequence).collect();
+        assert_eq!(
+            published,
+            vec![1, 2],
+            "slots past the gap must not enter the pipeline"
+        );
+        for ack in &transport.sent_acks {
+            assert!(
+                ack.acked_sequence <= 2 && ack.in_memory_sequence <= 2,
+                "ack ({}, {}) names sequences past the gap at 2 — durability \
+                 overstated for entries the replica never received",
+                ack.acked_sequence,
+                ack.in_memory_sequence,
+            );
+        }
+    }
+
     #[test]
     fn drain_skips_non_input_frames_and_publishes_every_input_batch() {
         let (mut producer, mut consumer) = ring(16);
@@ -1107,7 +1383,7 @@ mod tests {
         encode_heartbeat(999, &mut buf);
         append_input_batch_frame(&mut buf, &[slot(22, 0xE2)]);
 
-        let outcome = process_drain_frames::<TestEvent>(&buf, &mut producer, 0, &mut slot_buf);
+        let outcome = process_drain_frames::<TestEvent>(&buf, &mut producer, 19, &mut slot_buf);
 
         assert!(outcome.any_published);
         assert_eq!(outcome.consumed, buf.len());
@@ -1127,7 +1403,7 @@ mod tests {
         let complete_len = buf.len();
         buf.extend_from_slice(&[0xDE, 0xAD]);
 
-        let outcome = process_drain_frames::<TestEvent>(&buf, &mut producer, 0, &mut slot_buf);
+        let outcome = process_drain_frames::<TestEvent>(&buf, &mut producer, 49, &mut slot_buf);
 
         assert_eq!(outcome.consumed, complete_len);
         assert_eq!(outcome.accum_end_sequence, 50);

@@ -17,7 +17,8 @@ use super::auth::authenticate_replica;
 use super::{ReplicaCursors, ReplicationMetrics, SentHighWater};
 use melin_app::Application;
 use melin_transport_core::replication::catchup::{
-    CatchUpResult, can_catch_up_from_journal, catch_up_from_journal, snapshot_transfer_with,
+    CatchUpResult, bridge_catchup_to_live, can_catch_up_from_journal, catch_up_from_journal,
+    snapshot_transfer_with,
 };
 use melin_transport_core::replication::protocol::{
     MAX_CONTROL_FRAME, ReplicaMessage, decode_replica_message, encode_heartbeat,
@@ -442,33 +443,38 @@ fn handle_replica_connection<A: Application>(
         }
     };
 
-    // Sent high-water — the bound the ack-sanity invariant checks acks
-    // against, and the sequence heartbeats advertise. Monotonic by
-    // construction; advances with every chunk forwarded below / in the
-    // live loop. See `SentHighWater`.
-    let mut sent = SentHighWater::seed(handshake.last_sequence, catchup_end);
+    // Engage this slot's cursors and seed the gauge pair the response
+    // gate's `evaluate_durability` reads. Must happen BEFORE the
+    // bridge's active_flag Release — see `ReplicaCursors` for the
+    // ordering contract.
+    cursors.seed_on_handshake(slot_idx, handshake.last_sequence);
 
-    // Drain ring entries already covered by catch-up; forward the first
-    // chunk beyond the high-water (later entries stay in the ring for
-    // the live streaming loop).
-    sent.drain_overlap(repl_consumer, |data| {
-        writer.write_all(data)?;
-        writer.flush()
-    })?;
+    // Bridge into live streaming: activates the ring, re-reads from the
+    // journal whatever was synced between the bulk catch-up's EOF and
+    // the activation store (those entries are in neither the catch-up
+    // stream nor the ring), then drains covered ring chunks and
+    // forwards the first live one. Returns the slot's sent high-water —
+    // the bound the ack-sanity invariant checks acks against, advanced
+    // by every chunk the live loop forwards. See `bridge_catchup_to_live`
+    // for the sequence hole this closes.
+    let mut sent = {
+        let mut publish = |buf: &[u8]| -> io::Result<()> {
+            writer.write_all(buf)?;
+            writer.flush()
+        };
+        bridge_catchup_to_live::<A::Event>(
+            journal_path,
+            handshake.last_sequence,
+            catchup_end,
+            active_flag,
+            repl_consumer,
+            &mut publish,
+            shutdown,
+        )?
+    };
 
     // Catch-up complete — replica is entering the live streaming loop.
     metrics.catching_up[slot_idx].store(false, Ordering::Relaxed);
-
-    // Engage this slot's cursors and seed the gauge pair the response
-    // gate's `evaluate_durability` reads. Must happen BEFORE the
-    // active_flag Release — see `ReplicaCursors` for the ordering
-    // contract.
-    cursors.seed_on_handshake(slot_idx, handshake.last_sequence);
-
-    // Mark this ring as active — the journal stage will start publishing
-    // to it. Must happen BEFORE replica_ready so the seed drain can wait
-    // on this ring's consumer cursor.
-    active_flag.store(true, Ordering::Release);
 
     // Signal that this replica is ready to consume from the replication
     // ring. The main thread waits on this before seeding test data.

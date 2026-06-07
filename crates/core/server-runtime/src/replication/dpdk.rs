@@ -27,7 +27,8 @@ use super::{
     build_replica_pipeline_with_threads, sleep_checking_flags, teardown_replica_pipeline,
 };
 use melin_transport_core::replication::catchup::{
-    CatchUpResult, can_catch_up_from_journal, catch_up_from_journal_with, snapshot_transfer_with,
+    CatchUpResult, bridge_catchup_to_live, can_catch_up_from_journal, catch_up_from_journal_with,
+    snapshot_transfer_with,
 };
 use melin_transport_core::replication::protocol::{
     Ack, Handshake, MAX_CONTROL_FRAME, MAX_DATA_FRAME, PrimaryMessage, ReplicaMessage,
@@ -444,49 +445,52 @@ impl<A: Application> DpdkReplicationDriver<A> {
                                         continue;
                                     }
 
-                                    // Sent high-water: everything up to the
-                                    // catch-up end has been streamed. Monotonic
-                                    // by construction — see `SentHighWater`.
-                                    slot.sent = SentHighWater::seed(h.last_sequence, catchup_end);
-                                    slot.last_send = std::time::Instant::now();
-
-                                    // Drain ring entries already covered by
-                                    // catch-up; forward the first chunk beyond
-                                    // the high-water (later entries stay for
-                                    // the live loop). Disjoint field borrows:
-                                    // the drain holds `sent` + `consumer`, the
-                                    // closure captures `send_buf`.
-                                    let DpdkReplicaSlot {
-                                        sent,
-                                        consumer,
-                                        send_buf,
-                                        ..
-                                    } = &mut *slot;
-                                    let Ok(()) = sent.drain_overlap(consumer, |data| {
-                                        send_buf.clear();
-                                        send_buf.extend_from_slice(data);
-                                        // queue_send's bool is deliberately
-                                        // ignored (as pre-existing): the
-                                        // connection just completed its
-                                        // handshake, so the TX queue is empty
-                                        // and overflow cannot occur here.
-                                        transport.queue_send(handle, send_buf);
-                                        send_buf.clear();
-                                        Ok::<(), std::convert::Infallible>(())
-                                    });
-
                                     // Engage this slot's cursors and seed the gauge
-                                    // pair BEFORE flipping active so a reader that
-                                    // observes active=true also observes a non-zero
-                                    // cursor pair — see `ReplicaCursors` for the
-                                    // ordering contract.
+                                    // pair BEFORE the bridge flips active so a reader
+                                    // that observes active=true also observes a
+                                    // non-zero cursor pair — see `ReplicaCursors` for
+                                    // the ordering contract.
                                     cursors.seed_on_handshake(slot_idx, h.last_sequence);
 
-                                    // Mark ring active before signaling readiness
-                                    // so the journal stage publishes when seeds flow.
-                                    slot.active_flag.store(true, Ordering::Release);
-                                    replica_ready.store(true, Ordering::Release);
+                                    // Bridge into live streaming: activates the
+                                    // ring, re-reads from the journal whatever was
+                                    // synced between the bulk catch-up's EOF and
+                                    // the activation store (in neither the stream
+                                    // nor the ring), then drains covered ring
+                                    // chunks. Forwards via the retrying DPDK
+                                    // publisher — the residual pass may leave bytes
+                                    // in the TX queue, so the previous
+                                    // fire-and-forget `queue_send` would silently
+                                    // drop chunks here. Returns the slot's sent
+                                    // high-water (heartbeats + ack-sanity bound).
+                                    match bridge_catchup_to_live::<A::Event>(
+                                        journal_path,
+                                        h.last_sequence,
+                                        catchup_end,
+                                        &slot.active_flag,
+                                        &mut slot.consumer,
+                                        &mut dpdk_publish,
+                                        shutdown,
+                                    ) {
+                                        Ok(sent) => slot.sent = sent,
+                                        Err(e) => {
+                                            warn!(slot = slot_idx, error = %e, "catch-up handoff failed — disconnecting");
+                                            transport.close(handle);
+                                            slot.state = SlotState::Idle;
+                                            slot.recv_buf.clear();
+                                            metrics.catching_up[slot_idx]
+                                                .store(false, Ordering::Relaxed);
+                                            replicas_connected.fetch_sub(1, Ordering::Release);
+                                            // Disengage cursors before clearing
+                                            // active — ordering contract B2.
+                                            cursors.clear_on_disconnect(slot_idx);
+                                            slot.active_flag.store(false, Ordering::Release);
+                                            continue;
+                                        }
+                                    }
+                                    slot.last_send = std::time::Instant::now();
 
+                                    replica_ready.store(true, Ordering::Release);
                                     metrics.catching_up[slot_idx].store(false, Ordering::Relaxed);
                                     slot.state = SlotState::Streaming(handle);
                                 }
@@ -1137,6 +1141,9 @@ where
                 handle,
                 send_buf: std::mem::take(&mut send_buf),
             };
+            // `last_sequence` is the session's resume point — updated to
+            // the snapshot sequence after a transfer, so it anchors the
+            // contiguity gate on both negotiation paths.
             let r = streaming_loop::<DpdkReceiverTransport<'_>, A::Event>(
                 &mut dpdk_transport,
                 input_producer,
@@ -1145,6 +1152,7 @@ where
                 promote,
                 pipeline_depth,
                 busy_spin,
+                last_sequence,
                 std::mem::take(&mut recv_buf),
                 None,
             );

@@ -548,16 +548,21 @@ where
         send_buf.clear();
 
         // --- Protocol negotiation ---
+        // `session_start` is the resume point this streaming session
+        // continues from — the value that anchors the receiver's
+        // sequence-contiguity gate. Derived from local knowledge (our
+        // own handshake, or the verified snapshot), never from the
+        // wire.
         let response_frame = read_frame(&mut reader, MAX_CONTROL_FRAME)?;
         let response = decode_primary_message(&response_frame)?;
-        let stream_lineage = match response {
+        let (stream_lineage, session_start) = match response {
             PrimaryMessage::StreamStart {
                 start_sequence,
                 segment_start_sequence,
                 anchor_hash,
             } => {
                 info!(start_sequence, "streaming started");
-                (segment_start_sequence, anchor_hash)
+                ((segment_start_sequence, anchor_hash), last_sequence)
             }
             PrimaryMessage::NeedSnapshot => {
                 info!("primary requires snapshot transfer — receiving snapshot");
@@ -650,7 +655,7 @@ where
                 journal_writer = Some(writer);
 
                 let ss_frame = read_frame(&mut reader, MAX_CONTROL_FRAME)?;
-                match decode_primary_message(&ss_frame)? {
+                let lineage = match decode_primary_message(&ss_frame)? {
                     PrimaryMessage::StreamStart {
                         start_sequence,
                         segment_start_sequence,
@@ -681,7 +686,10 @@ where
                             format!("expected StreamStart after snapshot, got {other:?}").into(),
                         );
                     }
-                }
+                };
+                // Post-snapshot streaming resumes one past the
+                // (verified) snapshot sequence.
+                (lineage, snap_sequence)
             }
             PrimaryMessage::HashMismatch => {
                 return Err("chain hash mismatch — replica has divergent history".into());
@@ -752,6 +760,7 @@ where
                             promote,
                             pipeline_depth,
                             busy_spin,
+                            session_start,
                             Vec::with_capacity(MAX_DATA_FRAME + 4),
                             None,
                         )
