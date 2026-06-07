@@ -23,7 +23,7 @@ use super::receiver_transport::{
     try_extract_frame,
 };
 use super::{
-    ReceiverResult, ReplicaCursors, ReplicaPipelineHandles, ReplicationMetrics,
+    ReceiverResult, ReplicaCursors, ReplicaPipelineHandles, ReplicationMetrics, SentHighWater,
     build_replica_pipeline_with_threads, sleep_checking_flags, teardown_replica_pipeline,
 };
 use melin_transport_core::replication::catchup::{
@@ -111,7 +111,10 @@ struct DpdkReplicaSlot {
     recv_buf: Vec<u8>,
     send_buf: Vec<u8>,
     last_send: std::time::Instant,
-    last_sequence: u64,
+    /// Sent high-water for the current connection — the ack-sanity
+    /// bound and the heartbeat sequence. Meaningless while `Idle`;
+    /// re-seeded on every handshake. See `SentHighWater`.
+    sent: SentHighWater,
 }
 
 /// Step-able DPDK replication state. Owns both slot state machines and the
@@ -173,7 +176,9 @@ impl<A: Application> DpdkReplicationDriver<A> {
                     recv_buf: Vec::with_capacity(4096),
                     send_buf: Vec::with_capacity(512 * 1024),
                     last_send: now,
-                    last_sequence: 0,
+                    // Placeholder until the slot engages — re-seeded on
+                    // every handshake.
+                    sent: SentHighWater::seed(0, 0),
                 },
                 DpdkReplicaSlot {
                     state: SlotState::Idle,
@@ -183,7 +188,9 @@ impl<A: Application> DpdkReplicationDriver<A> {
                     recv_buf: Vec::with_capacity(4096),
                     send_buf: Vec::with_capacity(512 * 1024),
                     last_send: now,
-                    last_sequence: 0,
+                    // Placeholder until the slot engages — re-seeded on
+                    // every handshake.
+                    sent: SentHighWater::seed(0, 0),
                 },
             ],
             cursors: ReplicaCursors::new(
@@ -437,27 +444,36 @@ impl<A: Application> DpdkReplicationDriver<A> {
                                         continue;
                                     }
 
-                                    // Sent high-water mark: everything up to the
-                                    // catch-up end has been streamed (monotonic
-                                    // from the handshake value).
-                                    slot.last_sequence = catchup_end;
+                                    // Sent high-water: everything up to the
+                                    // catch-up end has been streamed. Monotonic
+                                    // by construction — see `SentHighWater`.
+                                    slot.sent = SentHighWater::seed(h.last_sequence, catchup_end);
                                     slot.last_send = std::time::Instant::now();
 
-                                    // Drain overlapping ring entries from catch-up.
-                                    // Ring chunks are wire-ready InputBatch frames;
-                                    // forward as-is.
-                                    while let Some((meta, data)) = slot.consumer.try_read() {
-                                        if meta.end_sequence > h.last_sequence {
-                                            slot.send_buf.clear();
-                                            slot.send_buf.extend_from_slice(data);
-                                            slot.consumer.commit();
-                                            transport.queue_send(handle, &slot.send_buf);
-                                            slot.send_buf.clear();
-                                            slot.last_sequence = meta.end_sequence;
-                                            break;
-                                        }
-                                        slot.consumer.commit();
-                                    }
+                                    // Drain ring entries already covered by
+                                    // catch-up; forward the first chunk beyond
+                                    // the high-water (later entries stay for
+                                    // the live loop). Disjoint field borrows:
+                                    // the drain holds `sent` + `consumer`, the
+                                    // closure captures `send_buf`.
+                                    let DpdkReplicaSlot {
+                                        sent,
+                                        consumer,
+                                        send_buf,
+                                        ..
+                                    } = &mut *slot;
+                                    let Ok(()) = sent.drain_overlap(consumer, |data| {
+                                        send_buf.clear();
+                                        send_buf.extend_from_slice(data);
+                                        // queue_send's bool is deliberately
+                                        // ignored (as pre-existing): the
+                                        // connection just completed its
+                                        // handshake, so the TX queue is empty
+                                        // and overflow cannot occur here.
+                                        transport.queue_send(handle, send_buf);
+                                        send_buf.clear();
+                                        Ok::<(), std::convert::Infallible>(())
+                                    });
 
                                     // Engage this slot's cursors and seed the gauge
                                     // pair BEFORE flipping active so a reader that
@@ -521,9 +537,7 @@ impl<A: Application> DpdkReplicationDriver<A> {
                                 let payload = &remaining[payload_start..frame_end];
                                 if let Ok(ReplicaMessage::Ack(ack)) =
                                     decode_replica_message(payload)
-                                    && cursors
-                                        .record_ack(slot_idx, &ack, slot.last_sequence)
-                                        .is_err()
+                                    && cursors.record_ack(slot_idx, &ack, slot.sent.get()).is_err()
                                 {
                                     // Eviction on violation: reuse the ack-error
                                     // teardown below (the store already logged
@@ -604,7 +618,7 @@ impl<A: Application> DpdkReplicationDriver<A> {
                         }
                         slot.send_buf.extend_from_slice(data);
                         slot.consumer.commit();
-                        slot.last_sequence = meta.end_sequence;
+                        slot.sent.advance(meta.end_sequence);
                         batches_sent += 1;
                         available = available.saturating_sub(data_len);
                     }
@@ -648,7 +662,7 @@ impl<A: Application> DpdkReplicationDriver<A> {
                     // 3. Heartbeat if idle.
                     if batches_sent == 0 && slot.last_send.elapsed() >= heartbeat_interval {
                         slot.send_buf.clear();
-                        encode_heartbeat(slot.last_sequence, &mut slot.send_buf);
+                        encode_heartbeat(slot.sent.get(), &mut slot.send_buf);
                         transport.queue_send(handle, &slot.send_buf);
                         slot.last_send = std::time::Instant::now();
                     }

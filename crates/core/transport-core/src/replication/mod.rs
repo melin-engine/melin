@@ -15,6 +15,8 @@ pub mod catchup;
 pub mod cursors;
 pub mod metrics;
 pub mod protocol;
+pub mod sent;
 
 pub use cursors::ReplicaCursors;
 pub use metrics::ReplicationMetrics;
+pub use sent::SentHighWater;

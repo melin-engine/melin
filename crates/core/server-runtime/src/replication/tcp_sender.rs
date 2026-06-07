@@ -14,7 +14,7 @@ use tracing::{debug, error, info, warn};
 use melin_journal::replication::ReplicationConsumer;
 
 use super::auth::authenticate_replica;
-use super::{ReplicaCursors, ReplicationMetrics};
+use super::{ReplicaCursors, ReplicationMetrics, SentHighWater};
 use melin_app::Application;
 use melin_transport_core::replication::catchup::{
     CatchUpResult, can_catch_up_from_journal, catch_up_from_journal, snapshot_transfer_with,
@@ -442,30 +442,19 @@ fn handle_replica_connection<A: Application>(
         }
     };
 
-    // Highest primary sequence streamed to this replica so far — the
-    // bound the ack-sanity invariant checks acks against, and the
-    // sequence heartbeats advertise. Starts at the catch-up end
-    // (`CatchUpResult::Ok` is monotonic from the handshake value) and
-    // advances with every chunk forwarded below / in the live loop.
-    let mut last_sequence = handshake.last_sequence.max(catchup_end);
+    // Sent high-water — the bound the ack-sanity invariant checks acks
+    // against, and the sequence heartbeats advertise. Monotonic by
+    // construction; advances with every chunk forwarded below / in the
+    // live loop. See `SentHighWater`.
+    let mut sent = SentHighWater::seed(handshake.last_sequence, catchup_end);
 
-    // Drain overlapping ring entries — the ring may contain entries that
-    // were already sent during catch-up. Only discard entries whose
-    // end_sequence is fully covered by the catch-up. Entries beyond
-    // catch-up are left in the ring for the live streaming loop. Ring
-    // chunks are wire-ready `InputBatch` frames; forward as-is.
-    if catchup_end > 0 {
-        while let Some((meta, data)) = repl_consumer.try_read() {
-            if meta.end_sequence > catchup_end {
-                writer.write_all(data)?;
-                writer.flush()?;
-                repl_consumer.commit();
-                last_sequence = meta.end_sequence;
-                break;
-            }
-            repl_consumer.commit();
-        }
-    }
+    // Drain ring entries already covered by catch-up; forward the first
+    // chunk beyond the high-water (later entries stay in the ring for
+    // the live streaming loop).
+    sent.drain_overlap(repl_consumer, |data| {
+        writer.write_all(data)?;
+        writer.flush()
+    })?;
 
     // Catch-up complete — replica is entering the live streaming loop.
     metrics.catching_up[slot_idx].store(false, Ordering::Relaxed);
@@ -498,7 +487,7 @@ fn handle_replica_connection<A: Application>(
         heartbeat_interval,
         &mut send_buf,
         &mut last_send,
-        &mut last_sequence,
+        &mut sent,
     )
 }
 
@@ -515,7 +504,7 @@ fn live_stream_uring(
     heartbeat_interval: std::time::Duration,
     send_buf: &mut Vec<u8>,
     last_send: &mut std::time::Instant,
-    last_sequence: &mut u64,
+    sent: &mut SentHighWater,
 ) -> io::Result<()> {
     let SlotContext {
         cursors,
@@ -619,7 +608,7 @@ fn live_stream_uring(
                 if let Some((meta, data)) = repl_consumer.try_read() {
                     send_buf.extend_from_slice(data);
                     repl_consumer.commit();
-                    *last_sequence = meta.end_sequence;
+                    sent.advance(meta.end_sequence);
                     coalesced += 1;
                 } else {
                     break;
@@ -650,7 +639,7 @@ fn live_stream_uring(
                 // free and must not be skipped — see AmortizedTimer docs.
                 let spinning = busy_spin || idle_spins < 1000;
                 if heartbeat_timer.tick(heartbeat_interval, spinning).is_some() {
-                    encode_heartbeat(*last_sequence, send_buf);
+                    encode_heartbeat(sent.get(), send_buf);
                     let sqe = opcode::Send::new(
                         types::Fixed(0),
                         send_buf.as_ptr(),
@@ -739,7 +728,7 @@ fn live_stream_uring(
                             // connection down; the accept loop's cleanup
                             // disengages the cursors and frees the slot.
                             cursors
-                                .record_ack(slot_idx, &ack, *last_sequence)
+                                .record_ack(slot_idx, &ack, sent.get())
                                 .map_err(io::Error::other)?;
                             metrics.ack_latency_us[slot_idx]
                                 .store(last_send.elapsed().as_micros() as u64, Ordering::Relaxed);

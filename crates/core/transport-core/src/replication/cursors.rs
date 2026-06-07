@@ -153,7 +153,9 @@ impl ReplicaCursors {
     ///
     /// `highest_sent_sequence` is the highest primary sequence the
     /// caller has actually streamed to this replica (handshake
-    /// baseline, catch-up end, and live ring drains all count). The
+    /// baseline, catch-up end, and live ring drains all count) —
+    /// callers maintain it via [`super::sent::SentHighWater`], which
+    /// keeps it monotonic within a connection by construction. The
     /// ack-sanity invariant is checked against it at this single store
     /// site: a replica cannot truthfully confirm sequences it was never
     /// sent, nor report its persisted track ahead of its in-memory

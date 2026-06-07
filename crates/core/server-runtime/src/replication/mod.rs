@@ -78,7 +78,7 @@ pub use melin_transport_core::replication::ack_queue::{
 pub use melin_transport_core::replication::protocol::{
     Ack, Handshake, PrimaryMessage, ReplicaMessage,
 };
-pub use melin_transport_core::replication::{ReplicaCursors, ReplicationMetrics};
+pub use melin_transport_core::replication::{ReplicaCursors, ReplicationMetrics, SentHighWater};
 
 #[cfg(feature = "dpdk")]
 pub use dpdk::{DpdkReplicationDriver, run_receiver_dpdk};
