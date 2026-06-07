@@ -10,14 +10,17 @@
 //!
 //! These tests pin that the bridge recovers the window's entries (the
 //! pre-bridge handoff went live directly off the bulk pass and shipped
-//! a gapped stream). The bridge *narrows* the window deterministically
-//! in the common case; it is not the correctness guarantee — because
-//! the journal stage publishes to the ring before flushing to disk, a
-//! sub-millisecond residual-vs-flush race can still leave a hole. The
-//! receiver's sequence-contiguity gate (`process_streaming_frames`,
-//! tested in `melin-server-runtime`) is what makes the handoff correct:
-//! it rejects any gap fatally, forcing a reconnect rather than a silent
-//! hole. See [`bridge_catchup_to_live`] for the full reasoning.
+//! a gapped stream). The bridge closes the window under load:
+//! `drain_into_contiguity` holds the ring's first ahead chunk and
+//! back-fills from disk until it is contiguous (the journal stage
+//! publishes to the ring before flushing, so a skipped entry may not be
+//! durable yet at handoff). The deterministic race cases for that drain
+//! live next to it in `catchup.rs`; these tests cover the bridge
+//! end-to-end against a real journal + ring. The receiver's
+//! sequence-contiguity gate (`process_streaming_frames`, tested in
+//! `melin-server-runtime`) backstops the rare quiescent corner the
+//! sender can't see. See [`bridge_catchup_to_live`] for the full
+//! reasoning.
 //!
 //! Regression: the 2026-06-07 LAN bench (tcp-dual-repl, ~2.9M orders/s)
 //! evicted a slow replica during warmup; on reconnect, catch-up ended

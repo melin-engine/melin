@@ -451,13 +451,13 @@ fn handle_replica_connection<A: Application>(
 
     // Bridge into live streaming: activates the ring, re-reads from the
     // journal the entries that fell into the activation window, then
-    // drains covered ring chunks and forwards the first live one.
-    // Returns the slot's sent high-water — the bound the ack-sanity
-    // invariant checks acks against, advanced by every chunk the live
-    // loop forwards. The bridge NARROWS the catch-up→live gap but does
-    // not close it (publish-to-ring precedes the disk flush); the
-    // receiver's contiguity gate is the actual guarantee. See
-    // `bridge_catchup_to_live`.
+    // drains the ring into sequence-contiguity (back-filling from disk
+    // if a skipped entry hasn't flushed yet) before going live. Returns
+    // the slot's sent high-water — the bound the ack-sanity invariant
+    // checks acks against, advanced by every chunk the live loop
+    // forwards. The bridge closes the catch-up→live gap under load (the
+    // receiver's contiguity gate backstops only the rare quiescent
+    // corner). See `bridge_catchup_to_live`.
     let mut sent = {
         let mut publish = |buf: &[u8]| -> io::Result<()> {
             writer.write_all(buf)?;

@@ -11,11 +11,22 @@
 use std::io::{self, Write};
 use std::net::TcpStream;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
 
 use melin_app::AppEvent;
 use tracing::{info, warn};
 
 use super::protocol::{decode_journal_to_input_slots, encode_input_batch};
+use crate::replication_wire::peek_first_sequence;
+
+/// Upper bound on how long the catch-up→live handoff waits for the
+/// disk to catch up to the ring (see [`drain_into_contiguity`]). The
+/// gap it closes is one journal `fdatasync` of slack — microseconds to
+/// low milliseconds even on a loaded NVMe — so 250 ms is ~3 orders of
+/// magnitude of headroom. On expiry the handoff falls back to the
+/// receiver's contiguity gate (a reconnect), so this is a safety bound,
+/// not a steady-state cost.
+const HANDOFF_BRIDGE_TIMEOUT: Duration = Duration::from_millis(250);
 
 /// Closure-based publisher passed to [`catch_up_from_journal_with`].
 /// Receives the fully encoded `InputBatch` frame (length prefix included)
@@ -23,6 +34,17 @@ use super::protocol::{decode_journal_to_input_slots, encode_input_batch};
 /// closure returns `io::Error` on transport failure so the caller can
 /// abandon the catch-up and surface a clean disconnect.
 pub type CatchUpPublisher<'a> = &'a mut dyn FnMut(&[u8]) -> io::Result<()>;
+
+/// Forward-bytes sink used inside [`drain_into_contiguity`] — the
+/// transport write for one `InputBatch` frame.
+type ForwardFn<'a> = &'a mut dyn FnMut(&[u8]) -> io::Result<()>;
+
+/// Re-read the journal forward from a sequence, forwarding any
+/// newly-durable entries via the supplied sink, and return the new
+/// high-water (`from` unchanged when nothing new is durable). Injected
+/// into [`drain_into_contiguity`] so the disk/ring race is testable
+/// without real files; production wraps [`catch_up_from_journal_with`].
+type RefillFn<'a> = &'a mut dyn FnMut(u64, ForwardFn<'_>) -> io::Result<u64>;
 
 /// Result of a journal catch-up attempt.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -349,7 +371,11 @@ pub fn snapshot_transfer_with<E: AppEvent>(
 /// clear (so a long transfer can't overflow the ring). Entries
 /// journaled between the bulk pass's scanner EOF and the flag flip are
 /// therefore in *neither* the catch-up stream *nor* the ring; they
-/// exist only on disk. This function narrows that window:
+/// exist only on disk, and — because the journal stage publishes a
+/// batch to the ring *before* it flushes that batch (`pipeline.rs`:
+/// publish-to-ring precedes `flush_batch_sync`) — an entry skipped from
+/// the ring reaches disk only at its later `fdatasync`. This function
+/// closes that disk/ring visibility window:
 ///
 /// 1. **Activate the ring first.** From this store on, a batch whose
 ///    publish-check sees the flag set is published to the ring (or
@@ -357,36 +383,30 @@ pub fn snapshot_transfer_with<E: AppEvent>(
 /// 2. **Residual journal pass** from `bulk_catchup_end`: re-reads off
 ///    the disk the entries that fell into the window — those skipped
 ///    from the ring because their publish-check preceded the store.
-/// 3. **Seed + overlap drain**: ring chunks the residual pass already
-///    covered are discarded, the first chunk beyond it is forwarded
-///    (chunk-granular, so a chunk straddling the residual EOF re-sends
-///    a few covered slots — the receiver skips duplicates; see
-///    `process_streaming_frames`), and the rest stays for the live
-///    loop.
+/// 3. **Contiguity drain** ([`drain_into_contiguity`]): before going
+///    live, walk the ring's accumulated chunks. The first chunk that
+///    is *ahead* of what has been streamed is the boundary — its lead
+///    sequence proves the journal observed the activation, so every
+///    entry below it was either skipped from the ring or is still
+///    mid-flush. Re-read the journal until those entries land,
+///    forwarding them ahead of the chunk, then forward the chunk.
+///    Consecutive ring chunks are dense by construction (a batch that
+///    can't be published evicts the replica rather than skipping it).
 ///
-/// **This narrows the window but does not close it, and is NOT the
-/// correctness guarantee.** The journal stage publishes a batch to the
-/// ring *before* it flushes that batch to disk (`pipeline.rs`:
-/// publish-to-ring precedes `flush_batch_sync`; `encode_event` only
-/// fills an in-memory buffer until then). So an entry skipped from the
-/// ring reaches disk only at its later `fdatasync` — and if the
-/// residual pass hits EOF in the sub-millisecond window before that
-/// flush lands, it can still miss it, leaving the same shape of hole
-/// (residual ends at 10 while the ring's first chunk starts at 13, with
-/// 11–12 in neither path), just orders of magnitude narrower than the
-/// pre-bridge bug.
+/// Under load — when handoffs actually happen — the journal has
+/// published chunks since activation, so the drain takes the
+/// chunk-present path and closes the gap deterministically; the
+/// receiver's contiguity gate never fires. The drain returns `Err`
+/// only if the journal stalls past [`HANDOFF_BRIDGE_TIMEOUT`] while a
+/// chunk waits (tear down and reconnect, never ship a gap).
 ///
-/// What makes the handoff *correct* regardless is the receiver's
-/// sequence-contiguity gate in `process_streaming_frames`: a forward
-/// gap is fatal, so the replica tears down and re-handshakes from its
-/// true position, by which point the missing entries are durable and
-/// bulk catch-up covers them. The worst case is a rare extra reconnect
-/// — most likely under the same peak load that triggers the handoff,
-/// and not free (a reconnect re-streams from the replica's
-/// `last_sequence`) — never silent corruption found at audit. A
-/// deterministic sender-side close (snapshot the journal's encoded
-/// sequence after activation, wait for the durable cursor to reach it,
-/// then run residual) is tracked on the roadmap.
+/// The one case the sender does *not* close is a skipped entry still
+/// mid-flush that is the last before a quiescent gap, with no later
+/// ring chunk to expose it: the drain sees an empty ring and goes live
+/// (spinning for it would tax every ordinary handoff, since an empty
+/// ring at the handoff point is the norm once the disk drains the
+/// ring). That rare corner is the receiver's sequence-contiguity gate's
+/// job — a reconnect, never a silent hole.
 ///
 /// Owning the `active_flag` store here keeps the activate-before-
 /// residual order in one place. Callers must still engage the slot's
@@ -426,8 +446,119 @@ pub fn bridge_catchup_to_live<E: AppEvent>(
     };
 
     let mut sent = super::sent::SentHighWater::seed(handshake_last_sequence, residual_end);
-    sent.drain_overlap(consumer, |data| publisher(data))?;
+
+    // Deterministically close the disk/ring visibility gap: the first
+    // uncovered ring chunk may start past `sent` because entries skipped
+    // from the ring (inactive at publish-check) reach disk only at a
+    // later flush. `refill` re-reads the journal forward; `expired`
+    // bounds the wait. This makes the receiver gate a backstop rather
+    // than the load-bearing guarantee for the common (under-load) case.
+    let deadline = Instant::now() + HANDOFF_BRIDGE_TIMEOUT;
+    let mut refill = |from: u64, fwd: &mut dyn FnMut(&[u8]) -> io::Result<()>| -> io::Result<u64> {
+        match catch_up_from_journal_with::<E>(journal_path, from, fwd, shutdown)? {
+            CatchUpResult::Ok(end) => Ok(end),
+            CatchUpResult::NeedSnapshot => Err(io::Error::other(
+                "journal history pruned during catch-up handoff backfill",
+            )),
+        }
+    };
+    let mut expired = || Instant::now() >= deadline;
+    drain_into_contiguity(
+        &mut sent,
+        consumer,
+        &mut *publisher,
+        &mut refill,
+        &mut expired,
+    )?;
     Ok(sent)
+}
+
+/// Drain the replication ring into sequence-contiguity with `sent`,
+/// back-filling from the journal when the first uncovered chunk starts
+/// past `sent`+1 — the deterministic close of the catch-up→live handoff
+/// race (see [`bridge_catchup_to_live`]).
+///
+/// The first uncovered ring chunk's lead sequence ([`peek_first_sequence`])
+/// is the boundary the journal stage's own behaviour hands us: it
+/// publishes a chunk to the ring only after observing the activation, so
+/// every entry below that chunk's first sequence was skipped from the
+/// ring and reaches the wire only from disk. If those entries haven't
+/// flushed yet, `refill` (re-read the journal forward from `sent`) is
+/// retried until they land, then the held chunk is forwarded —
+/// contiguous by construction. The chunk's peek is held across the
+/// retries: `refill` never touches the consumer, so the two-phase read
+/// stays valid and the chunk is never lost.
+///
+/// An empty ring returns `Ok` immediately — it means the disk has
+/// drained the ring, so the next published chunk is contiguous (the rare
+/// stranded-mid-flush corner with no later chunk is the receiver gate's
+/// job; spinning for it would tax every ordinary handoff).
+///
+/// Injected for testability without real files or sleeps:
+/// - `forward` ships chunk bytes to the wire.
+/// - `refill(from, fwd)` re-reads the journal from `from`, forwarding any
+///   newly-durable entries via `fwd`, and returns the new high-water
+///   (production: [`catch_up_from_journal_with`]). Returns `from`
+///   unchanged when nothing new is durable yet.
+/// - `expired()` bounds the back-fill wait. It is only consulted while a
+///   chunk is present but still ahead (entries below it not yet flushed);
+///   on expiry that is a fatal `Err` — the journal has stalled, so tear
+///   down and reconnect rather than ship a gap.
+fn drain_into_contiguity(
+    sent: &mut super::sent::SentHighWater,
+    consumer: &mut melin_journal::replication::ReplicationConsumer,
+    forward: ForwardFn<'_>,
+    refill: RefillFn<'_>,
+    expired: &mut dyn FnMut() -> bool,
+) -> io::Result<()> {
+    loop {
+        let Some((meta, data)) = consumer.try_read() else {
+            // The ring carries nothing past the handoff point. Under load
+            // the journal has published chunks since activation, so an
+            // empty ring here means the disk has caught up to the ring and
+            // the next published chunk will be contiguous — go live. (The
+            // rare corner this does NOT cover: a skipped entry still
+            // mid-flush that is the last before a quiescent gap, with no
+            // later ring chunk to expose it. That falls to the receiver's
+            // contiguity gate — a reconnect, never a silent hole. Spinning
+            // here to catch it would tax every ordinary handoff with the
+            // full deadline, since an empty ring at the handoff point is
+            // the common case once the disk has drained the ring.)
+            return Ok(());
+        };
+        if meta.end_sequence <= sent.get() {
+            // Wholly covered by the bulk/residual pass — discard.
+            consumer.commit();
+            continue;
+        }
+        // First uncovered chunk. Its lead sequence is fixed; hold the peek
+        // (refill never touches the consumer) and back-fill from disk
+        // until the chunk is contiguous with `sent`.
+        let first = peek_first_sequence(data)?;
+        while first > sent.get() + 1 {
+            let end = refill(sent.get(), forward)?;
+            sent.advance(end);
+            if first > sent.get() + 1 {
+                if expired() {
+                    return Err(io::Error::other(format!(
+                        "catch-up handoff: ring chunk starts at {first} but the journal \
+                         stalled at {} — reconnecting",
+                        sent.get()
+                    )));
+                }
+                std::thread::yield_now();
+            }
+        }
+        // Contiguous now. Forward the held chunk unless the back-fill
+        // already covered it (the receiver also dedups, but skipping
+        // avoids a redundant wire frame).
+        if meta.end_sequence > sent.get() {
+            forward(data)?;
+            sent.advance(meta.end_sequence);
+        }
+        consumer.commit();
+        return Ok(());
+    }
 }
 
 /// Thin wrapper around [`catch_up_from_journal_with`] that ships
@@ -617,5 +748,287 @@ mod tests {
             can_catch_up_from_journal(&fresh, 0).unwrap(),
             "fresh replica of a fresh primary needs no snapshot"
         );
+    }
+}
+
+/// Unit tests for [`drain_into_contiguity`] — the deterministic close of
+/// the catch-up→live handoff race. The disk re-read (`refill`) and the
+/// clock (`expired`) are injected, so the disk/ring visibility race is
+/// reproduced exactly without real files, threads, or sleeps.
+#[cfg(test)]
+mod drain_into_contiguity_tests {
+    use super::*;
+    use crate::pipeline::InputSlot;
+    use crate::test_support::TestEvent;
+    use melin_journal::JournalEvent;
+    use melin_journal::replication::{
+        ReplicationConsumer, ReplicationProducer, build_replication_ring,
+    };
+    use std::cell::{Cell, RefCell};
+
+    fn slot(seq: u64) -> InputSlot<TestEvent> {
+        InputSlot {
+            connection_id: 0,
+            key_hash: 0,
+            request_seq: seq,
+            sequence: seq,
+            timestamp_ns: 0,
+            event: JournalEvent::App(TestEvent::Add(seq)),
+            publish_ts: Default::default(),
+            recv_ts: Default::default(),
+        }
+    }
+
+    /// Encode a one-or-more-slot `InputBatch` frame (the ring-chunk shape).
+    fn frame(seqs: &[u64]) -> Vec<u8> {
+        let slots: Vec<InputSlot<TestEvent>> = seqs.iter().map(|&s| slot(s)).collect();
+        let mut buf = Vec::new();
+        encode_input_batch(&slots, &mut buf);
+        buf
+    }
+
+    fn ring() -> (ReplicationProducer, ReplicationConsumer) {
+        let (producer, mut consumers) = build_replication_ring(1, 8);
+        (producer, consumers.pop().expect("one consumer"))
+    }
+
+    /// A contiguous first chunk is forwarded directly — no disk re-read.
+    #[test]
+    fn contiguous_first_chunk_forwards_without_refill() {
+        let (mut producer, mut consumer) = ring();
+        producer.publish(&frame(&[101, 102]), 102);
+
+        let mut sent = super::super::sent::SentHighWater::seed(100, 100);
+        let forwarded = RefCell::new(Vec::<u64>::new());
+        let refill_calls = Cell::new(0usize);
+
+        let mut forward = |data: &[u8]| -> io::Result<()> {
+            forwarded
+                .borrow_mut()
+                .push(peek_first_sequence(data).unwrap());
+            Ok(())
+        };
+        let mut refill =
+            |from: u64, _fwd: &mut dyn FnMut(&[u8]) -> io::Result<()>| -> io::Result<u64> {
+                refill_calls.set(refill_calls.get() + 1);
+                Ok(from)
+            };
+        let mut expired = || false;
+
+        drain_into_contiguity(
+            &mut sent,
+            &mut consumer,
+            &mut forward,
+            &mut refill,
+            &mut expired,
+        )
+        .expect("contiguous chunk drains cleanly");
+
+        assert_eq!(*forwarded.borrow(), vec![101]);
+        assert_eq!(sent.get(), 102);
+        assert_eq!(
+            refill_calls.get(),
+            0,
+            "no back-fill needed for a contiguous chunk"
+        );
+    }
+
+    /// A chunk wholly covered by the bulk pass is discarded; the next
+    /// contiguous chunk is forwarded.
+    #[test]
+    fn covered_chunk_is_skipped_then_contiguous_chunk_forwards() {
+        let (mut producer, mut consumer) = ring();
+        producer.publish(&frame(&[98, 99]), 99); // covered (<= sent 100)
+        producer.publish(&frame(&[101, 102]), 102);
+
+        let mut sent = super::super::sent::SentHighWater::seed(100, 100);
+        let forwarded = RefCell::new(Vec::<u64>::new());
+        let mut forward = |data: &[u8]| -> io::Result<()> {
+            forwarded
+                .borrow_mut()
+                .push(peek_first_sequence(data).unwrap());
+            Ok(())
+        };
+        let mut refill =
+            |from: u64, _: &mut dyn FnMut(&[u8]) -> io::Result<()>| -> io::Result<u64> { Ok(from) };
+        let mut expired = || false;
+
+        drain_into_contiguity(
+            &mut sent,
+            &mut consumer,
+            &mut forward,
+            &mut refill,
+            &mut expired,
+        )
+        .expect("drains cleanly");
+
+        assert_eq!(*forwarded.borrow(), vec![101], "covered chunk not re-sent");
+        assert_eq!(sent.get(), 102);
+    }
+
+    /// The race: the first uncovered ring chunk starts past `sent`+1
+    /// because entries 101–102 were skipped from the ring and not yet
+    /// flushed. The back-fill re-reads the journal until they land, then
+    /// forwards the held chunk — dense, in order.
+    #[test]
+    fn gap_backfills_from_disk_then_forwards_the_held_chunk() {
+        let (mut producer, mut consumer) = ring();
+        producer.publish(&frame(&[103, 104]), 104); // first=103, gap over 101,102
+
+        let mut sent = super::super::sent::SentHighWater::seed(100, 100);
+        let forwarded = RefCell::new(Vec::<u64>::new());
+        let refill_calls = Cell::new(0usize);
+
+        let mut forward = |data: &[u8]| -> io::Result<()> {
+            forwarded
+                .borrow_mut()
+                .push(peek_first_sequence(data).unwrap());
+            Ok(())
+        };
+        // Call 0: 101–102 not durable yet (no progress). Call 1: they
+        // flushed — forward each and advance to 102.
+        let mut refill =
+            |from: u64, fwd: &mut dyn FnMut(&[u8]) -> io::Result<()>| -> io::Result<u64> {
+                let n = refill_calls.get();
+                refill_calls.set(n + 1);
+                if n == 0 {
+                    return Ok(from);
+                }
+                fwd(&frame(&[101]))?;
+                fwd(&frame(&[102]))?;
+                Ok(102)
+            };
+        let mut expired = || false;
+
+        drain_into_contiguity(
+            &mut sent,
+            &mut consumer,
+            &mut forward,
+            &mut refill,
+            &mut expired,
+        )
+        .expect("gap is back-filled, not fatal");
+
+        assert_eq!(
+            *forwarded.borrow(),
+            vec![101, 102, 103],
+            "back-filled entries precede the held ring chunk"
+        );
+        assert_eq!(sent.get(), 104);
+        assert_eq!(
+            refill_calls.get(),
+            2,
+            "retried once while pending, succeeded on the second"
+        );
+    }
+
+    /// If the gap never resolves (the journal stalls), the handoff fails
+    /// fatally on the deadline so the connection tears down and the
+    /// receiver gate / reconnect take over. Nothing past the gap is
+    /// forwarded.
+    #[test]
+    fn gap_that_never_flushes_times_out_fatally() {
+        let (mut producer, mut consumer) = ring();
+        producer.publish(&frame(&[103, 104]), 104);
+
+        let mut sent = super::super::sent::SentHighWater::seed(100, 100);
+        let forwarded = RefCell::new(Vec::<u64>::new());
+        let exp_calls = Cell::new(0usize);
+
+        let mut forward = |data: &[u8]| -> io::Result<()> {
+            forwarded
+                .borrow_mut()
+                .push(peek_first_sequence(data).unwrap());
+            Ok(())
+        };
+        let mut refill =
+            |from: u64, _: &mut dyn FnMut(&[u8]) -> io::Result<()>| -> io::Result<u64> { Ok(from) };
+        let mut expired = || {
+            exp_calls.set(exp_calls.get() + 1);
+            exp_calls.get() >= 3
+        };
+
+        let err = drain_into_contiguity(
+            &mut sent,
+            &mut consumer,
+            &mut forward,
+            &mut refill,
+            &mut expired,
+        )
+        .expect_err("a never-flushing gap must be fatal");
+        assert!(err.to_string().contains("stalled"), "got: {err}");
+        assert!(
+            forwarded.borrow().is_empty(),
+            "nothing past the gap reaches the wire"
+        );
+        assert_eq!(sent.get(), 100, "high-water never advances past the gap");
+    }
+
+    /// An empty ring goes live immediately (Ok) — the disk has drained
+    /// the ring, so the next chunk whenever traffic resumes is contiguous.
+    /// No back-fill, no deadline spin: `refill`/`expired` must not even be
+    /// consulted (the old design spun here and taxed every handoff).
+    #[test]
+    fn empty_ring_goes_live_immediately() {
+        let (_producer, mut consumer) = ring();
+
+        let mut sent = super::super::sent::SentHighWater::seed(100, 100);
+        let forwarded = RefCell::new(Vec::<u64>::new());
+
+        let mut forward = |data: &[u8]| -> io::Result<()> {
+            forwarded
+                .borrow_mut()
+                .push(peek_first_sequence(data).unwrap());
+            Ok(())
+        };
+        let mut refill = |_: u64, _: &mut dyn FnMut(&[u8]) -> io::Result<()>| -> io::Result<u64> {
+            panic!("empty ring must not back-fill")
+        };
+        let mut expired = || panic!("empty ring must not consult the deadline");
+
+        drain_into_contiguity(
+            &mut sent,
+            &mut consumer,
+            &mut forward,
+            &mut refill,
+            &mut expired,
+        )
+        .expect("empty ring goes live");
+        assert!(forwarded.borrow().is_empty());
+        assert_eq!(sent.get(), 100);
+    }
+
+    /// Covered chunks are skipped until the ring drains to empty, then the
+    /// handoff goes live — the covered-skip loop must terminate at the
+    /// empty ring without back-filling or spinning.
+    #[test]
+    fn covered_chunks_then_empty_goes_live() {
+        let (mut producer, mut consumer) = ring();
+        producer.publish(&frame(&[98, 99]), 99);
+        producer.publish(&frame(&[100]), 100);
+
+        let mut sent = super::super::sent::SentHighWater::seed(100, 100);
+        let forwarded = RefCell::new(Vec::<u64>::new());
+        let mut forward = |data: &[u8]| -> io::Result<()> {
+            forwarded
+                .borrow_mut()
+                .push(peek_first_sequence(data).unwrap());
+            Ok(())
+        };
+        let mut refill = |_: u64, _: &mut dyn FnMut(&[u8]) -> io::Result<()>| -> io::Result<u64> {
+            panic!("no back-fill expected")
+        };
+        let mut expired = || panic!("no deadline expected");
+
+        drain_into_contiguity(
+            &mut sent,
+            &mut consumer,
+            &mut forward,
+            &mut refill,
+            &mut expired,
+        )
+        .expect("covered chunks drain then go live");
+        assert!(forwarded.borrow().is_empty(), "all chunks were covered");
+        assert_eq!(sent.get(), 100);
     }
 }

@@ -290,6 +290,37 @@ pub fn try_decode_input_batch<E: AppEvent>(payload: &[u8]) -> io::Result<Vec<Inp
     Ok(slots)
 }
 
+/// Read the journal sequence of the *first* slot in a length-prefixed
+/// `InputBatch` frame — the full wire bytes as carried in a replication
+/// ring chunk (`[length:u32][type:u8][count:u16][slots…]`) — without
+/// decoding the rest of the batch.
+///
+/// Used by the catch-up→live handoff to decide, in O(1), whether the
+/// ring's first uncovered chunk is contiguous with what the sender has
+/// already streamed: a chunk whose first slot is more than one past the
+/// high-water means the journal stage skipped entries from the ring that
+/// must be back-filled from disk first. Reads only the frame header and
+/// the first slot header — no allocation, no per-slot walk.
+///
+/// Errors if the frame is too short, isn't an `InputBatch`, or carries
+/// no slots.
+pub fn peek_first_sequence(frame: &[u8]) -> io::Result<u64> {
+    let (header, rest) = FrameHeader::ref_from_prefix(frame)
+        .map_err(|_| io::Error::other("InputBatch frame too short for header"))?;
+    if header.msg_type != MSG_INPUT_BATCH {
+        return Err(io::Error::other(format!(
+            "expected InputBatch (0x{MSG_INPUT_BATCH:02x}), got 0x{:02x}",
+            header.msg_type
+        )));
+    }
+    if header.count.get() == 0 {
+        return Err(io::Error::other("InputBatch frame carries no slots"));
+    }
+    let (slot, _) = SlotHeader::ref_from_prefix(rest)
+        .map_err(|_| io::Error::other("InputBatch frame too short for first slot"))?;
+    Ok(slot.sequence.get())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -387,6 +418,59 @@ mod tests {
         let decoded: Vec<InputSlot<TestEvent>> =
             try_decode_input_batch(payload).expect("decode succeeds");
         assert!(decoded.is_empty());
+    }
+
+    #[test]
+    fn peek_first_sequence_reads_the_lead_slot() {
+        // peek operates on the FULL length-prefixed frame (the ring-chunk
+        // shape), not the post-length payload — verify it skips the frame
+        // header and reads the first slot, ignoring later slots.
+        let slots = vec![
+            sample_slot(6_932_801, JournalEvent::Tick { now_ns: 1 }),
+            sample_slot(6_932_802, JournalEvent::App(TestEvent(2))),
+            sample_slot(6_932_803, JournalEvent::App(TestEvent(3))),
+        ];
+        let mut frame = Vec::new();
+        encode_input_batch(&slots, &mut frame);
+        assert_eq!(peek_first_sequence(&frame).unwrap(), 6_932_801);
+    }
+
+    #[test]
+    fn peek_first_sequence_single_slot() {
+        let mut frame = Vec::new();
+        encode_input_batch(
+            &[sample_slot(1, JournalEvent::App(TestEvent(0)))],
+            &mut frame,
+        );
+        assert_eq!(peek_first_sequence(&frame).unwrap(), 1);
+    }
+
+    #[test]
+    fn peek_first_sequence_rejects_malformed_frames() {
+        // Too short for the frame header.
+        assert!(peek_first_sequence(&[]).is_err());
+        assert!(peek_first_sequence(&[0, 0, 0]).is_err());
+
+        // Well-formed 7-byte header but wrong message type.
+        let mut wrong_type = Vec::new();
+        wrong_type.extend_from_slice(&36u32.to_le_bytes()); // length
+        wrong_type.push(0xFF); // not MSG_INPUT_BATCH
+        wrong_type.extend_from_slice(&1u16.to_le_bytes()); // count
+        wrong_type.extend_from_slice(&[0u8; 35]); // slot header
+        assert!(peek_first_sequence(&wrong_type).is_err());
+
+        // count=0 frame carries no first slot to peek.
+        let mut empty = Vec::new();
+        encode_input_batch::<TestEvent>(&[], &mut empty);
+        assert!(peek_first_sequence(&empty).is_err());
+
+        // Header claims a slot but the bytes are truncated before it.
+        let mut truncated = Vec::new();
+        truncated.extend_from_slice(&36u32.to_le_bytes());
+        truncated.push(MSG_INPUT_BATCH);
+        truncated.extend_from_slice(&1u16.to_le_bytes());
+        // no slot header bytes
+        assert!(peek_first_sequence(&truncated).is_err());
     }
 
     #[test]

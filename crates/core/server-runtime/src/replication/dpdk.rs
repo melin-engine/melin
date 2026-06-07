@@ -455,17 +455,18 @@ impl<A: Application> DpdkReplicationDriver<A> {
                                     // Bridge into live streaming: activates the
                                     // ring, re-reads from the journal the entries
                                     // that fell into the activation window, then
-                                    // drains covered ring chunks. The bridge
-                                    // NARROWS the catch-up→live gap but does not
-                                    // close it (publish-to-ring precedes the disk
-                                    // flush); the receiver's contiguity gate is the
-                                    // actual guarantee — see `bridge_catchup_to_live`.
+                                    // drains the ring into sequence-contiguity
+                                    // (back-filling from disk if a skipped entry
+                                    // hasn't flushed yet) before going live. The
+                                    // bridge closes the catch-up→live gap under load
+                                    // (the receiver's contiguity gate backstops only
+                                    // the rare quiescent corner) — see
+                                    // `bridge_catchup_to_live`.
                                     // Forwards via the retrying DPDK publisher — the
-                                    // residual pass may leave bytes in the TX queue,
-                                    // so the previous fire-and-forget `queue_send`
-                                    // would silently drop chunks here. Returns the
-                                    // slot's sent high-water (heartbeats + ack-sanity
-                                    // bound).
+                                    // drain may leave bytes in the TX queue, so the
+                                    // previous fire-and-forget `queue_send` would
+                                    // silently drop chunks here. Returns the slot's
+                                    // sent high-water (heartbeats + ack-sanity bound).
                                     match bridge_catchup_to_live::<A::Event>(
                                         journal_path,
                                         h.last_sequence,
