@@ -1373,6 +1373,115 @@ mod tests {
         }
     }
 
+    /// The contiguity gate must anchor at the session's resume point, not
+    /// at zero. After a snapshot transfer the receiver passes
+    /// `initial_sequence = snap_sequence` (and on journal catch-up, the
+    /// handshake `last_sequence`); `streaming_loop` must seed
+    /// `accum_end_sequence` from it so the *first* live slot is required
+    /// to be `initial_sequence + 1`. Without the seed the gate would
+    /// start at 0, silently accept a first slot thousands past the
+    /// snapshot, and journal a hole exactly where the snapshot→stream
+    /// boundary lives.
+    ///
+    /// Here the replica resumes at 100 (e.g. a snapshot at sequence 100)
+    /// and the first frame jumps to 102 — sequence 101 is missing. The
+    /// session must die fatally with nothing published and no ack past
+    /// 100.
+    #[test]
+    fn streaming_loop_anchors_contiguity_at_the_resume_point() {
+        let (mut producer, mut consumer) = ring(16);
+        let cursor = journal_cursor(u64::MAX);
+        let shutdown = AtomicBool::new(false);
+        let promote = AtomicBool::new(false);
+        let mut transport = MockTransport::new();
+
+        let mut data = Vec::new();
+        // Resume point is 100; first slot is 102 → 101 missing.
+        append_input_batch_frame(&mut data, &[slot(102, 0x66), slot(103, 0x67)]);
+        transport.push_data(data);
+        transport.disconnect_after_data();
+
+        let result = streaming_loop::<MockTransport, TestEvent>(
+            &mut transport,
+            &mut producer,
+            &cursor,
+            &shutdown,
+            &promote,
+            4,
+            false,
+            100, // initial_sequence — the post-snapshot resume point
+            Vec::new(),
+            None,
+        );
+
+        assert!(
+            matches!(result.exit, SessionExit::Fatal(_)),
+            "a first slot past resume_point+1 must be fatal — the gate is \
+             not anchored at the resume point"
+        );
+        assert!(
+            drain(&mut consumer).is_empty(),
+            "nothing may be published when the first slot is already a gap"
+        );
+        for ack in &transport.sent_acks {
+            assert!(
+                ack.acked_sequence <= 100 && ack.in_memory_sequence <= 100,
+                "ack ({}, {}) names a sequence past the resume point 100",
+                ack.acked_sequence,
+                ack.in_memory_sequence,
+            );
+        }
+    }
+
+    /// Complement of the above: a stream that resumes exactly one past
+    /// the resume point is the contiguous happy path — accepted and
+    /// acked. Proves the seeding doesn't reject a legitimate
+    /// post-snapshot stream (off-by-one in the anchor would make every
+    /// snapshot resume fail).
+    #[test]
+    fn streaming_loop_accepts_contiguous_stream_from_resume_point() {
+        let (mut producer, mut consumer) = ring(16);
+        let cursor = journal_cursor(u64::MAX);
+        let shutdown = AtomicBool::new(false);
+        let promote = AtomicBool::new(false);
+        let mut transport = MockTransport::new();
+
+        let mut data = Vec::new();
+        // Resume point 100; stream continues at 101, 102.
+        append_input_batch_frame(&mut data, &[slot(101, 0x70), slot(102, 0x71)]);
+        transport.push_data(data);
+        transport.disconnect_after_data();
+
+        let result = streaming_loop::<MockTransport, TestEvent>(
+            &mut transport,
+            &mut producer,
+            &cursor,
+            &shutdown,
+            &promote,
+            4,
+            false,
+            100,
+            Vec::new(),
+            None,
+        );
+
+        assert!(
+            matches!(result.exit, SessionExit::Disconnected),
+            "a contiguous post-resume stream must not be fatal: {:?}",
+            matches!(result.exit, SessionExit::Fatal(_))
+        );
+        let published: Vec<u64> = drain(&mut consumer).iter().map(|s| s.sequence).collect();
+        assert_eq!(published, vec![101, 102]);
+        let last = transport
+            .sent_acks
+            .last()
+            .expect("a contiguous stream must produce an ack");
+        assert_eq!(
+            last.in_memory_sequence, 102,
+            "ack must advance to the last contiguous slot from the resume point"
+        );
+    }
+
     #[test]
     fn drain_skips_non_input_frames_and_publishes_every_input_batch() {
         let (mut producer, mut consumer) = ring(16);
