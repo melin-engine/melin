@@ -27,6 +27,7 @@ use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use ed25519_dalek::SigningKey;
@@ -288,6 +289,48 @@ fn wait_for_policy_degraded(addr: SocketAddr, expected: u32, timeout: Duration) 
         if start.elapsed() >= timeout {
             let last = fetch_policy_degraded(addr);
             panic!("timed out waiting for policy_degraded={expected}; last observed = {last:?}");
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+/// Fetch one numeric metric from the Prometheus endpoint by exact line
+/// prefix. Include labels and the trailing space in `line_prefix`, e.g.
+/// `melin_replica_catching_up{slot="0"} `.
+fn fetch_metric_u64(addr: SocketAddr, line_prefix: &str) -> Option<u64> {
+    let mut stream = TcpStream::connect_timeout(&addr, Duration::from_secs(1)).ok()?;
+    stream.set_read_timeout(Some(Duration::from_secs(2))).ok()?;
+    stream.write_all(b"GET /metrics HTTP/1.1\r\n\r\n").ok()?;
+    let mut body = Vec::new();
+    stream.read_to_end(&mut body).ok()?;
+    let text = std::str::from_utf8(&body).ok()?;
+    for line in text.lines() {
+        if let Some(rest) = line.strip_prefix(line_prefix) {
+            return rest.trim().parse().ok();
+        }
+    }
+    None
+}
+
+/// Poll a metric until `pred(value)` holds, or panic on timeout with
+/// the last observed value.
+fn wait_metric(
+    addr: SocketAddr,
+    line_prefix: &str,
+    timeout: Duration,
+    what: &str,
+    pred: impl Fn(u64) -> bool,
+) {
+    let start = Instant::now();
+    loop {
+        if let Some(v) = fetch_metric_u64(addr, line_prefix)
+            && pred(v)
+        {
+            return;
+        }
+        if start.elapsed() >= timeout {
+            let last = fetch_metric_u64(addr, line_prefix);
+            panic!("timed out waiting for {what}; last `{line_prefix}` = {last:?}");
         }
         std::thread::sleep(Duration::from_millis(100));
     }
@@ -3224,6 +3267,257 @@ fn hybrid_gate_stalls_while_replica_frozen() {
         "expected a normal Placed ack after thaw, got: {r:?}"
     );
     submitter.join().expect("submitter thread panicked");
+}
+
+/// End-to-end regression for the catch-up → live-stream handoff hole
+/// found by the 2026-06-07 LAN bench (tcp-dual-repl): a slow replica
+/// was ring-evicted during the warmup ramp, reconnected, caught up
+/// from the primary's journal to seq 6932800 — and live streaming
+/// resumed at 6933013. The 212 entries journaled between the catch-up
+/// scanner's EOF and the slot's ring activation were never sent; the
+/// replica accepted the non-contiguous stream, acked past the hole for
+/// the rest of the run, and its journal failed lineage verification
+/// only at post-run audit.
+///
+/// Reproduce the full production shape: under sustained dual-replica
+/// load, SIGSTOP replica2 until ring backpressure evicts it (the
+/// healthy replica1 keeps satisfying the hybrid gate, so load never
+/// stops), SIGCONT so it reconnects and catches up *while the journal
+/// keeps growing*, and repeat. Every reconnect crosses the handoff
+/// window; the dense-lineage walk at the end catches any hole the
+/// handoff punched. The race is timing-dependent per cycle, so this
+/// asserts the invariant rather than a specific failure — the unit
+/// pins live in `melin-transport-core` (sender handoff) and
+/// `melin-server-runtime` (receiver contiguity).
+#[test]
+#[serial]
+fn evicted_replica_catchup_under_load_preserves_dense_lineage() {
+    // Small replication rings (16 × 512 KiB) so the frozen replica's
+    // ring fills — and evicts — seconds after its socket jams, instead
+    // of the default 256 slots that would need minutes of test load.
+    let mut cluster = DualCluster::start_with_primary_args(&["--replication-ring-size", "16"]);
+
+    let primary_health = cluster.primary.health_addr;
+    wait_metric(
+        primary_health,
+        "melin_replicas_connected ",
+        Duration::from_secs(30),
+        "both replicas connected at startup",
+        |v| v == 2,
+    );
+
+    let stop = AtomicBool::new(false);
+    // One submission counter per submitter thread (no sharing — summed
+    // at the end for the coverage assertion).
+    let submitted = [AtomicU64::new(0), AtomicU64::new(0)];
+
+    // Panic guard: `thread::scope` joins spawned threads on unwind, and
+    // the submitters only exit via `stop` — without this, a panicking
+    // wait below would leave them submitting forever and hang the test
+    // instead of failing it.
+    struct StopOnDrop<'a>(&'a AtomicBool);
+    impl Drop for StopOnDrop<'_> {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::Relaxed);
+        }
+    }
+
+    std::thread::scope(|s| {
+        let _stop_guard = StopOnDrop(&stop);
+        // Two closed-loop submitters, one per trader key — the per-key
+        // request_seq HWM means each concurrent connection needs its
+        // own key. Closed-loop keeps the response sockets drained so
+        // the servers never wedge on response backpressure.
+        for (idx, key) in [&cluster.key, &cluster.key2].into_iter().enumerate() {
+            let stop = &stop;
+            let counter = &submitted[idx];
+            let addr = cluster.primary.client_addr;
+            let key = key.clone();
+            s.spawn(move || {
+                let mut client = connect_with_timeout(addr, &key);
+                // Disjoint id ranges and accounts per submitter.
+                let mut id = 1_000_000u64 * (idx as u64 + 1);
+                while !stop.load(Ordering::Relaxed) {
+                    let r = client.send_request(&Request::SubmitOrder {
+                        symbol: Symbol(1),
+                        order: Order {
+                            id: OrderId(id),
+                            account: AccountId(idx as u32 + 1),
+                            side: Side::Buy,
+                            order_type: OrderType::Limit {
+                                price: price(50),
+                                post_only: false,
+                            },
+                            time_in_force: TimeInForce::GTC,
+                            quantity: qty(1),
+                            stp: melin_protocol::types::SelfTradeProtection::Allow,
+                            expiry_ns: 0,
+                        },
+                    });
+                    if r.is_err() {
+                        // Server-side failure — stop counting; the main
+                        // thread's waits and asserts surface the cause.
+                        break;
+                    }
+                    id += 1;
+                    counter.fetch_add(1, Ordering::Relaxed);
+                }
+            });
+        }
+
+        // Let load flow and replication settle before the first freeze.
+        let warm_start = Instant::now();
+        while submitted[0].load(Ordering::Relaxed) + submitted[1].load(Ordering::Relaxed) < 200 {
+            assert!(
+                warm_start.elapsed() < Duration::from_secs(30),
+                "submitters made no progress against the fresh cluster"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+
+        // Freeze → evict → thaw → reconnect + catch-up, under
+        // continuous load throughout. Multiple cycles amplify the odds
+        // of an entry landing inside the handoff window.
+        //
+        // The waits are deliberately slot-agnostic and self-healing:
+        // with rings this small under sustained load, *either* replica
+        // can be evicted at almost any point (including replica2 again
+        // right after it finished catching up) — and every eviction →
+        // reconnect → catch-up is exactly the handoff under test. The
+        // connected-count is the one signal that is robust to all
+        // interleavings: a frozen replica cannot reconnect, so a drop
+        // below 2 proves a ring-backpressure eviction happened.
+        const CYCLES: u32 = 4;
+        for cycle in 0..CYCLES {
+            // Only freeze a *connected* replica — the previous thaw (or
+            // plain load) may have evicted it again; freezing a
+            // disconnected replica would wait forever on an eviction
+            // that its inactive ring can never produce.
+            wait_metric(
+                primary_health,
+                "melin_replicas_connected ",
+                Duration::from_secs(60),
+                &format!("cycle {cycle}: cluster whole before freeze"),
+                |v| v == 2,
+            );
+
+            // SIGSTOP halts the replica without closing its sockets:
+            // the primary sees a connected-but-silent peer, exactly the
+            // slow-replica shape that drives ring-backpressure eviction.
+            unsafe {
+                libc::kill(cluster.replica2.child.id() as i32, libc::SIGSTOP);
+            }
+
+            wait_metric(
+                primary_health,
+                "melin_replicas_connected ",
+                Duration::from_secs(60),
+                &format!("cycle {cycle}: a replica evicted under ring backpressure"),
+                |v| v < 2,
+            );
+
+            unsafe {
+                libc::kill(cluster.replica2.child.id() as i32, libc::SIGCONT);
+            }
+
+            // The thawed replica drains the dead connection's buffered
+            // tail, notices EOF, reconnects (1s backoff), catches up
+            // from the primary's journal, and goes live — all while the
+            // submitters keep the journal growing.
+            wait_metric(
+                primary_health,
+                "melin_replicas_connected ",
+                Duration::from_secs(60),
+                &format!("cycle {cycle}: evicted replica reconnected"),
+                |v| v == 2,
+            );
+            for slot_line in [
+                "melin_replica_catching_up{slot=\"0\"} ",
+                "melin_replica_catching_up{slot=\"1\"} ",
+            ] {
+                wait_metric(
+                    primary_health,
+                    slot_line,
+                    Duration::from_secs(60),
+                    &format!("cycle {cycle}: catch-up complete"),
+                    |v| v == 0,
+                );
+            }
+        }
+    });
+
+    let total_submitted =
+        submitted[0].load(Ordering::Relaxed) + submitted[1].load(Ordering::Relaxed);
+
+    // Quiesce: every acked order must become durable on both replicas.
+    // Lag excludes disconnected slots, so first wait for the cluster to
+    // be whole and live — a replica may have been mid-evict/reconnect
+    // when the load stopped.
+    wait_metric(
+        primary_health,
+        "melin_replicas_connected ",
+        Duration::from_secs(60),
+        "cluster whole after load stopped",
+        |v| v == 2,
+    );
+    for slot_line in [
+        "melin_replica_catching_up{slot=\"0\"} ",
+        "melin_replica_catching_up{slot=\"1\"} ",
+    ] {
+        wait_metric(
+            primary_health,
+            slot_line,
+            Duration::from_secs(60),
+            "final catch-up complete",
+            |v| v == 0,
+        );
+    }
+    let start = Instant::now();
+    loop {
+        if let Ok((_, _, 0, _)) = query_health(primary_health) {
+            break;
+        }
+        assert!(
+            start.elapsed() < Duration::from_secs(30),
+            "replication lag did not reach 0 after load stopped"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+
+    // Clean shutdown so the dense walk sees fully-drained journals.
+    unsafe {
+        libc::kill(cluster.primary.child.id() as i32, libc::SIGINT);
+        libc::kill(cluster.replica1.child.id() as i32, libc::SIGINT);
+        libc::kill(cluster.replica2.child.id() as i32, libc::SIGINT);
+    }
+    let _ = cluster
+        .primary
+        .child
+        .wait_timeout_with_kill(Duration::from_secs(10));
+    let _ = cluster
+        .replica1
+        .child
+        .wait_timeout_with_kill(Duration::from_secs(10));
+    let _ = cluster
+        .replica2
+        .child
+        .wait_timeout_with_kill(Duration::from_secs(10));
+
+    // The regression assertion: the evicted-and-reconnected replica's
+    // journal lineage must be dense from sequence 1 — `verify_lineage`
+    // inside the walk panics on any hole (the bench failure mode).
+    let dir = cluster._tmp.path();
+    let (r2_first, r2_last) = walk_segments_dense(&dir.join("replica2.journal"));
+    assert_eq!(r2_first, 1, "replica2 lineage must begin at sequence 1");
+    assert!(
+        r2_last >= total_submitted,
+        "replica2 tail {r2_last} must cover all {total_submitted} acked orders"
+    );
+    // Controls: the primary and the never-frozen replica.
+    let (p_first, _) = walk_segments_dense(&dir.join("primary.journal"));
+    let (r1_first, _) = walk_segments_dense(&dir.join("replica1.journal"));
+    assert_eq!(p_first, 1, "primary lineage must begin at sequence 1");
+    assert_eq!(r1_first, 1, "replica1 lineage must begin at sequence 1");
 }
 
 /// Helper extension: wait up to `timeout` for the child, then SIGKILL.

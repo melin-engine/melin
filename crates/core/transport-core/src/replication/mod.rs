@@ -17,6 +17,9 @@ pub mod metrics;
 pub mod protocol;
 pub mod sent;
 
+#[cfg(test)]
+mod handoff_test;
+
 pub use cursors::ReplicaCursors;
 pub use metrics::ReplicationMetrics;
 pub use sent::SentHighWater;
