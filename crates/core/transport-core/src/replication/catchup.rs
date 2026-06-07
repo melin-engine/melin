@@ -341,24 +341,22 @@ pub fn snapshot_transfer_with<E: AppEvent>(
     catch_up_from_journal_with::<E>(journal_path, snap_sequence, publisher, shutdown)
 }
 
-/// Bridge a replica from journal catch-up into live ring streaming
-/// without a sequence hole, returning the slot's seeded
-/// [`SentHighWater`].
+/// Bridge a replica from journal catch-up into live ring streaming,
+/// returning the slot's seeded [`SentHighWater`].
 ///
 /// The journal stage only publishes to a slot's ring while the slot's
 /// `active_flag` is set — and the bulk catch-up pass runs with it
 /// clear (so a long transfer can't overflow the ring). Entries
 /// journaled between the bulk pass's scanner EOF and the flag flip are
 /// therefore in *neither* the catch-up stream *nor* the ring; they
-/// exist only on disk. This function closes that hole:
+/// exist only on disk. This function narrows that window:
 ///
-/// 1. **Activate the ring first.** From this store on, every batch the
-///    journal stage syncs is either published to the ring or evicts
-///    the replica — nothing new can fall through.
-/// 2. **Residual journal pass** from `bulk_catchup_end`: picks up off
-///    the disk everything that fell into the window. Its scanner
-///    starts after the store, so its EOF covers every batch whose
-///    activation check preceded the store.
+/// 1. **Activate the ring first.** From this store on, a batch whose
+///    publish-check sees the flag set is published to the ring (or
+///    evicts the replica).
+/// 2. **Residual journal pass** from `bulk_catchup_end`: re-reads off
+///    the disk the entries that fell into the window — those skipped
+///    from the ring because their publish-check preceded the store.
 /// 3. **Seed + overlap drain**: ring chunks the residual pass already
 ///    covered are discarded, the first chunk beyond it is forwarded
 ///    (chunk-granular, so a chunk straddling the residual EOF re-sends
@@ -366,12 +364,34 @@ pub fn snapshot_transfer_with<E: AppEvent>(
 ///    `process_streaming_frames`), and the rest stays for the live
 ///    loop.
 ///
-/// Overlap between the passes is possible; a gap is not. Owning the
-/// `active_flag` store here makes the activate-before-residual order
-/// impossible to get wrong at the call sites — the same rationale as
-/// [`SentHighWater`] owning the drain condition. Callers must still
-/// engage the slot's cursors *before* calling this (the seed-before-
-/// active ordering contract, B2 in `ReplicaCursors`).
+/// **This narrows the window but does not close it, and is NOT the
+/// correctness guarantee.** The journal stage publishes a batch to the
+/// ring *before* it flushes that batch to disk (`pipeline.rs`:
+/// publish-to-ring precedes `flush_batch_sync`; `encode_event` only
+/// fills an in-memory buffer until then). So an entry skipped from the
+/// ring reaches disk only at its later `fdatasync` — and if the
+/// residual pass hits EOF in the sub-millisecond window before that
+/// flush lands, it can still miss it, leaving the same shape of hole
+/// (residual ends at 10 while the ring's first chunk starts at 13, with
+/// 11–12 in neither path), just orders of magnitude narrower than the
+/// pre-bridge bug.
+///
+/// What makes the handoff *correct* regardless is the receiver's
+/// sequence-contiguity gate in `process_streaming_frames`: a forward
+/// gap is fatal, so the replica tears down and re-handshakes from its
+/// true position, by which point the missing entries are durable and
+/// bulk catch-up covers them. The worst case is a rare extra reconnect
+/// — most likely under the same peak load that triggers the handoff,
+/// and not free (a reconnect re-streams from the replica's
+/// `last_sequence`) — never silent corruption found at audit. A
+/// deterministic sender-side close (snapshot the journal's encoded
+/// sequence after activation, wait for the durable cursor to reach it,
+/// then run residual) is tracked on the roadmap.
+///
+/// Owning the `active_flag` store here keeps the activate-before-
+/// residual order in one place. Callers must still engage the slot's
+/// cursors *before* calling this (the seed-before-active ordering
+/// contract, B2 in `ReplicaCursors`).
 ///
 /// Regression context: the 2026-06-07 LAN bench reconnected an evicted
 /// replica whose live stream resumed 212 entries past its catch-up end

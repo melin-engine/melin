@@ -1,20 +1,23 @@
-//! Catch-up → live-stream handoff invariant tests.
+//! Catch-up → live-stream handoff narrowing tests.
 //!
-//! The senders (kernel-TCP `handle_replica_connection`, DPDK driver)
-//! compose three pieces when a replica reconnects:
+//! When a replica reconnects, the bulk catch-up pass
+//! ([`catch_up_from_journal_with`]) runs with the slot's ring inactive,
+//! so the journal stage doesn't publish to it. Entries journaled
+//! between the bulk pass's scanner EOF and ring activation land in
+//! *neither* the catch-up stream *nor* the ring — only on disk.
+//! [`bridge_catchup_to_live`] activates the ring, then re-reads those
+//! entries off the disk before draining into the live ring.
 //!
-//!   1. [`catch_up_from_journal_with`] — streams journal-file entries up
-//!      to whatever the scanner saw at EOF time,
-//!   2. [`SentHighWater::seed`] — records that bound, and
-//!   3. [`SentHighWater::drain_overlap`] — bridges into the live ring.
-//!
-//! The journal stage keeps appending while this runs, and it only
-//! publishes to a slot's ring once the slot's `active_flag` flips —
-//! which the sender does *after* steps 1–3. Entries journaled between
-//! the catch-up scanner's EOF and the flag flip are therefore in
-//! neither the catch-up stream nor the ring. The handoff must close
-//! that hole (or refuse to go live); silently forwarding the first
-//! post-activation chunk ships the replica a gapped stream.
+//! These tests pin that the bridge recovers the window's entries (the
+//! pre-bridge handoff went live directly off the bulk pass and shipped
+//! a gapped stream). The bridge *narrows* the window deterministically
+//! in the common case; it is not the correctness guarantee — because
+//! the journal stage publishes to the ring before flushing to disk, a
+//! sub-millisecond residual-vs-flush race can still leave a hole. The
+//! receiver's sequence-contiguity gate (`process_streaming_frames`,
+//! tested in `melin-server-runtime`) is what makes the handoff correct:
+//! it rejects any gap fatally, forcing a reconnect rather than a silent
+//! hole. See [`bridge_catchup_to_live`] for the full reasoning.
 //!
 //! Regression: the 2026-06-07 LAN bench (tcp-dual-repl, ~2.9M orders/s)
 //! evicted a slow replica during warmup; on reconnect, catch-up ended
@@ -168,7 +171,8 @@ fn handoff_must_not_skip_entries_journaled_before_ring_activation() {
     assert!(
         active_flag.load(Ordering::Acquire),
         "the bridge owns ring activation — it must flip the flag before \
-         its residual pass so nothing new can fall through"
+         its residual pass (this narrows the catch-up→live window; the \
+         receiver's contiguity gate is the actual guarantee)"
     );
 
     // The invariant: the replica-bound stream is dense from the

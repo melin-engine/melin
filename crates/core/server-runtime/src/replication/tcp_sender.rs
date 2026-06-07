@@ -450,13 +450,14 @@ fn handle_replica_connection<A: Application>(
     cursors.seed_on_handshake(slot_idx, handshake.last_sequence);
 
     // Bridge into live streaming: activates the ring, re-reads from the
-    // journal whatever was synced between the bulk catch-up's EOF and
-    // the activation store (those entries are in neither the catch-up
-    // stream nor the ring), then drains covered ring chunks and
-    // forwards the first live one. Returns the slot's sent high-water —
-    // the bound the ack-sanity invariant checks acks against, advanced
-    // by every chunk the live loop forwards. See `bridge_catchup_to_live`
-    // for the sequence hole this closes.
+    // journal the entries that fell into the activation window, then
+    // drains covered ring chunks and forwards the first live one.
+    // Returns the slot's sent high-water — the bound the ack-sanity
+    // invariant checks acks against, advanced by every chunk the live
+    // loop forwards. The bridge NARROWS the catch-up→live gap but does
+    // not close it (publish-to-ring precedes the disk flush); the
+    // receiver's contiguity gate is the actual guarantee. See
+    // `bridge_catchup_to_live`.
     let mut sent = {
         let mut publish = |buf: &[u8]| -> io::Result<()> {
             writer.write_all(buf)?;
