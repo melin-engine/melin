@@ -17,7 +17,7 @@ use crate::pipeline::InputSlot;
 // Re-export the helpers at replication scope so existing
 // `replication::protocol::{...}` imports keep working.
 pub use crate::replication_wire::{
-    encode_input_batch, try_decode_input_batch, try_decode_input_batch_into,
+    encode_input_batch, peek_first_sequence, try_decode_input_batch, try_decode_input_batch_into,
 };
 
 // --- Wire protocol message tags ---

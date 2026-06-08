@@ -16,8 +16,7 @@ use std::time::{Duration, Instant};
 use melin_app::AppEvent;
 use tracing::{info, warn};
 
-use super::protocol::{decode_journal_to_input_slots, encode_input_batch};
-use crate::replication_wire::peek_first_sequence;
+use super::protocol::{decode_journal_to_input_slots, encode_input_batch, peek_first_sequence};
 
 /// Upper bound on how long the catch-up→live handoff waits for the
 /// disk to catch up to the ring (see [`drain_into_contiguity`]). The
