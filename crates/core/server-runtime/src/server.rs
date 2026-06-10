@@ -803,6 +803,13 @@ where
             )
         });
 
+        // Shared fencing state, created before mode detection so it
+        // survives a replica → primary transition. Seeded at epoch 0; the
+        // receiver raises it from the replica's recovered journal and the
+        // replication stream, and a promotion bumps it by injecting an
+        // `EpochBump`. Carried into `run_as_primary` post-promotion.
+        let fence_state = Arc::new(melin_transport_core::fence::FenceState::new(0));
+
         // Runtime rotation on the replica side. Each node rotates its
         // own segments independently of the primary.
         let max_journal_bytes = config.max_journal_mib.saturating_mul(1024 * 1024);
@@ -829,10 +836,12 @@ where
             !config.yield_idle,
             rotation,
             Arc::clone(&factory),
+            Arc::clone(&fence_state),
         )? {
             None => return Ok(()), // clean shutdown
             Some((mut exchange, writer)) => {
-                // Promotion! Transition to primary mode.
+                // Promotion! Transition to primary mode. Bump the epoch so a
+                // paused/partitioned ex-primary is fenced when it reconnects.
                 info!("replica promoted — transitioning to primary");
                 <A as Application>::prefault(&mut exchange);
 
@@ -850,6 +859,8 @@ where
                     false, // no seeding needed — state comes from replication
                     rotate_flag,
                     durability_mode_atomic,
+                    fence_state,
+                    true, // promoted — inject an EpochBump before serving
                 );
             }
         }
@@ -880,12 +891,19 @@ where
 
     // Initialize or recover the app. `needs_seeding` is true on first
     // startup — seed events will flow through the pipeline later.
-    let (mut exchange, writer, needs_seeding) = init_engine::<A, W>(&config, &*factory)?;
+    let (mut exchange, writer, needs_seeding, recovered_epoch) =
+        init_engine::<A, W>(&config, &*factory)?;
 
     // Pre-fault any application-owned memory (slabs, indices) so page
     // faults happen now, not on the hot path. Default trait impl is a
     // no-op; `Exchange` overrides.
     <A as Application>::prefault(&mut exchange);
+
+    // A primary booting directly (not via promotion) keeps whatever epoch
+    // its journal recovered; no bump.
+    let fence_state = Arc::new(melin_transport_core::fence::FenceState::new(
+        recovered_epoch,
+    ));
 
     run_as_primary::<A, L, W>(
         exchange,
@@ -901,6 +919,8 @@ where
         needs_seeding,
         rotate_flag,
         durability_mode_atomic,
+        fence_state,
+        false, // not promoted — no EpochBump injection
     )
 }
 
@@ -1018,6 +1038,8 @@ fn run_as_primary<A, L, W>(
     needs_seeding: bool,
     rotate_flag: Option<Arc<AtomicBool>>,
     durability_mode_atomic: Arc<AtomicU8>,
+    fence_state: Arc<melin_transport_core::fence::FenceState>,
+    promoted: bool,
 ) -> Result<(), Box<dyn std::error::Error>>
 where
     A: Application + Send + 'static,
@@ -1099,6 +1121,7 @@ where
         !config.yield_idle,
         enable_event_publisher,
         enable_shadow,
+        Arc::clone(&fence_state),
     );
     // Fastest-replica cursor: `max(slot0_acked, slot1_acked)`. Used by the
     // response stage for quorum durability — an event is durable if either
@@ -1225,6 +1248,7 @@ where
     let shutdown_for_response = Arc::clone(&shutdown);
     let busy_spin = !config.yield_idle;
     let response_utilization_thread = Arc::clone(&response_utilization);
+    let response_fence = Arc::clone(&fence_state);
     let response_handle = std::thread::Builder::new()
         .name("response".into())
         .spawn(move || {
@@ -1241,6 +1265,7 @@ where
                     busy_spin,
                     utilization: response_utilization_thread,
                     encoder,
+                    fence_state: response_fence,
                 },
                 &s3,
             );
@@ -1313,6 +1338,7 @@ where
             .clone()
             .ok_or("replication_metrics must be Some when replication is enabled")?;
         let handler_cores = [cores.repl_handler_0, cores.repl_handler_1];
+        let sender_fence = Arc::clone(&fence_state);
         let repl_sender_handle = std::thread::Builder::new()
             .name("repl-sender".into())
             .spawn(move || {
@@ -1333,6 +1359,7 @@ where
                         batch_size,
                         heartbeat_secs,
                         busy_spin,
+                        fence_state: sender_fence,
                     },
                     &s_repl,
                     &ready_flag,
@@ -1373,6 +1400,7 @@ where
         &cores,
         &shutdown,
         busy_spin,
+        fence_state.epoch(),
     )?;
 
     // Seed instruments and accounts through the pipeline on first startup.
@@ -1528,6 +1556,43 @@ where
             total_ms = seed_start.elapsed().as_millis(),
             "seeded application state through pipeline"
         );
+    }
+
+    // Promotion fencing: a node that reached primary via promotion injects
+    // an `EpochBump` as the first journaled entry of its tenure, raising the
+    // cluster epoch so a paused/partitioned ex-primary self-demotes when a
+    // handshake crosses (see `melin_transport_core::fence`). Genesis primaries
+    // skip this — their epoch stays at whatever the journal recovered. The
+    // bump rides the input ring like a seed event (connection_id == 0), so it
+    // flows through journal + replication to every replica. We wait for the
+    // matching stage to apply it (epoch advanced) before serving so the first
+    // handshake already advertises the new epoch.
+    if promoted {
+        use melin_app::unix_epoch_nanos;
+        use melin_journal::JournalEvent;
+        use melin_transport_core::trace::mono_trace_ns;
+
+        let new_epoch = fence_state.epoch().saturating_add(1);
+        info!(new_epoch, "promotion: injecting epoch bump");
+        input_producer.publish(InputSlot {
+            connection_id: 0,
+            key_hash: 0,
+            request_seq: 0,
+            sequence: 0,
+            timestamp_ns: unix_epoch_nanos(),
+            event: JournalEvent::EpochBump { epoch: new_epoch },
+            publish_ts: mono_trace_ns(),
+            recv_ts: mono_trace_ns(),
+        });
+        // Spin until the matching stage observes the bump (epoch raised) so
+        // the node advertises `new_epoch` on the very first handshake. Bounded
+        // by the shutdown flag so a stuck pipeline can't wedge startup.
+        while fence_state.epoch() < new_epoch {
+            if shutdown.load(Ordering::Relaxed) {
+                break;
+            }
+            std::hint::spin_loop();
+        }
     }
 
     // Now that seeding is fully drained, spawn the reader thread. From here
@@ -1880,6 +1945,13 @@ where
             )
         });
 
+        // Shared fencing state, created before mode detection so it
+        // survives a replica → primary transition. Seeded at epoch 0; the
+        // receiver raises it from the replica's recovered journal and the
+        // replication stream, and a promotion bumps it by injecting an
+        // `EpochBump`. Carried into `run_as_primary` post-promotion.
+        let fence_state = Arc::new(melin_transport_core::fence::FenceState::new(0));
+
         let max_journal_bytes = config.max_journal_mib.saturating_mul(1024 * 1024);
         let rotation = match (max_journal_bytes, rotate_flag.as_ref()) {
             (0, None) => None,
@@ -1923,6 +1995,7 @@ where
             !config.yield_idle,
             rotation,
             Arc::clone(&factory),
+            Arc::clone(&fence_state),
         )? {
             None => return Ok(()), // clean shutdown
             Some((mut exchange, writer)) => {
@@ -1948,6 +2021,8 @@ where
                     false,
                     rotate_flag,
                     durability_mode_atomic,
+                    fence_state,
+                    true, // promoted — inject an EpochBump before serving
                 );
             }
         }
@@ -1982,8 +2057,14 @@ where
     );
 
     // Initialize or recover the exchange.
-    let (mut exchange, writer, needs_seeding) = init_engine::<A, W>(&config, &*factory)?;
+    let (mut exchange, writer, needs_seeding, recovered_epoch) =
+        init_engine::<A, W>(&config, &*factory)?;
     <A as Application>::prefault(&mut exchange);
+
+    // Fencing state for this DPDK primary, seeded with the recovered epoch.
+    let fence_state = Arc::new(melin_transport_core::fence::FenceState::new(
+        recovered_epoch,
+    ));
 
     // Clone exchange state for the shadow snapshot stage before moving
     // exchange into the pipeline (same as the kernel TCP path).
@@ -2049,6 +2130,7 @@ where
         !config.yield_idle,
         enable_event_publisher,
         enable_shadow,
+        Arc::clone(&fence_state),
     );
 
     let heartbeat_interval = config.heartbeat_interval();
@@ -2159,6 +2241,7 @@ where
     let s3 = Arc::clone(&shutdown);
     let response_utilization_thread = Arc::clone(&response_utilization);
     let busy_spin = !config.yield_idle;
+    let response_fence = Arc::clone(&fence_state);
     let response_handle = std::thread::Builder::new()
         .name("response".into())
         .spawn(move || {
@@ -2177,6 +2260,7 @@ where
                 response_utilization_thread,
                 busy_spin,
                 encoder,
+                response_fence,
             );
         })
         .map_err(|e| format!("spawn response thread: {e}"))?;
@@ -2189,6 +2273,7 @@ where
         &cores,
         &shutdown,
         busy_spin,
+        fence_state.epoch(),
     )?;
 
     // Spawn DPDK replication sender if enabled. Uses its own DPDK queue pair
@@ -2273,6 +2358,7 @@ where
             repl_metrics,
             batch_size,
             heartbeat_secs,
+            Arc::clone(&fence_state),
         );
         // Legacy text match — `lan-bench-suite.sh` `wait_for_log` keys
         // off "DPDK replication sender started" to know the primary
@@ -2511,16 +2597,18 @@ fn choose_bootstrap(
 
 /// Initialize or recover the journaled application from disk.
 ///
-/// Returns `(app, writer, needs_seeding)`. `needs_seeding` is true on
-/// first startup (fresh journal) — the caller must publish seed events
-/// through the pipeline. The recovery paths (snapshot+journal, snapshot
-/// only, journal only, fresh) are transport-level concerns and work
-/// uniformly for any `A: Application` via `JournaledApp<A>`.
-/// Same engine initialization the TCP / DPDK paths use.
+/// Returns `(app, writer, needs_seeding, recovered_epoch)`. `needs_seeding`
+/// is true on first startup (fresh journal) — the caller must publish seed
+/// events through the pipeline. `recovered_epoch` is the fencing epoch
+/// recovered from the snapshot + journal (0 for a genesis node); the caller
+/// seeds the node's `FenceState` with it. The recovery paths
+/// (snapshot+journal, snapshot only, journal only, fresh) are
+/// transport-level concerns and work uniformly for any `A: Application`
+/// via `JournaledApp<A>`. Same engine initialization the TCP / DPDK paths use.
 pub(crate) fn init_engine<A, W>(
     config: &ServerConfig,
     factory: &dyn AppFactory<App = A>,
-) -> Result<(A, W, bool), Box<dyn std::error::Error>>
+) -> Result<(A, W, bool, u64), Box<dyn std::error::Error>>
 where
     A: Application,
     W: JournalWrite<A::Event>,
@@ -2568,10 +2656,10 @@ where
                 writer_mode = %writer_mode,
                 "recovering from snapshot only (no journal segments on disk)"
             );
-            let (app, snap_sequence, snap_chain_hash) =
+            let (app, snap_sequence, snap_chain_hash, snap_epoch) =
                 melin_transport_core::snapshot::load::<A>(snap_path)?;
             let writer = W::create_continuing(&config.journal, snap_sequence + 1, snap_chain_hash)?;
-            JournaledApp::<A, W>::from_parts(app, writer)
+            JournaledApp::<A, W>::from_parts(app, writer, snap_epoch)
         }
         BootstrapSource::JournalOnly => {
             info!(writer_mode = %writer_mode, "recovering from journal");
@@ -2627,8 +2715,9 @@ where
         }
     }
 
+    let recovered_epoch = engine.recovered_epoch();
     let (app, writer) = engine.into_parts();
-    Ok((app, writer, needs_seeding))
+    Ok((app, writer, needs_seeding, recovered_epoch))
 }
 
 // ---------------------------------------------------------------------------
@@ -2669,6 +2758,7 @@ fn spawn_shadow_stage<A: Application + Send + 'static>(
     cores: &PipelineCores,
     shutdown: &Arc<AtomicBool>,
     busy_spin: bool,
+    initial_epoch: u64,
 ) -> Result<Option<std::thread::JoinHandle<()>>, Box<dyn std::error::Error>>
 where
     A::Event: Send + Sync + 'static,
@@ -2683,6 +2773,7 @@ where
     let shadow_ex = shadow_exchange.ok_or("shadow exchange must be Some when shadow is enabled")?;
     let s_shadow = Arc::clone(shutdown);
     let shadow_core = cores.shadow;
+    let shadow_initial_epoch = initial_epoch;
     let handle = std::thread::Builder::new()
         .name("shadow".into())
         .spawn(move || {
@@ -2695,6 +2786,7 @@ where
                 chain_hash,
                 &s_shadow,
                 busy_spin,
+                shadow_initial_epoch,
             );
         })
         .map_err(|e| format!("spawn shadow thread: {e}"))?;

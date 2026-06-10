@@ -234,6 +234,7 @@ pub(super) struct ReplicaPipelineHandles<A: Application, W: Send + 'static> {
 /// Build the replica pipeline and spawn its stage threads on the configured
 /// cores. Returns the bundle of state the orchestrator keeps across
 /// `Disconnected` reconnects.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn build_replica_pipeline_with_threads<A, W>(
     exchange: A,
     writer: W,
@@ -243,6 +244,7 @@ pub(super) fn build_replica_pipeline_with_threads<A, W>(
     group_commit_delay: std::time::Duration,
     busy_spin: bool,
     rotation: Option<(u64, Arc<AtomicBool>)>,
+    fence_state: Arc<melin_transport_core::fence::FenceState>,
 ) -> Result<ReplicaPipelineHandles<A, W>, Box<dyn std::error::Error>>
 where
     A: Application + Send + 'static,
@@ -255,6 +257,9 @@ where
     let shadow_exchange = <A as Application>::clone_via_snapshot(&exchange)?;
 
     let enable_shadow = snapshot_interval_ms > 0;
+    // Shadow snapshot seeds its epoch from the fence state's current value
+    // (set from the replica's recovered journal before this builder runs).
+    let shadow_initial_epoch = fence_state.epoch();
     let pipeline = melin_transport_core::pipeline::build_replica_pipeline(
         exchange,
         writer,
@@ -262,6 +267,7 @@ where
         group_commit_delay,
         busy_spin,
         enable_shadow,
+        fence_state,
     );
 
     let pipeline_shutdown = Arc::new(AtomicBool::new(false));
@@ -340,6 +346,7 @@ where
                         chain_lock,
                         &ps,
                         false,
+                        shadow_initial_epoch,
                     );
                 })
                 .expect("spawn shadow thread"),
@@ -418,6 +425,8 @@ mod tests {
         let handshake = Handshake {
             last_sequence: 42,
             chain_hash: [0xAB; 32],
+            // Non-zero so a dropped/zeroed epoch field is caught.
+            epoch: 9,
         };
         let mut buf = Vec::new();
         encode_handshake(&handshake, &mut buf);
@@ -429,6 +438,7 @@ mod tests {
             ReplicaMessage::Handshake(h) => {
                 assert_eq!(h.last_sequence, 42);
                 assert_eq!(h.chain_hash, [0xAB; 32]);
+                assert_eq!(h.epoch, 9);
             }
             _ => panic!("expected Handshake"),
         }
@@ -483,7 +493,8 @@ mod tests {
     #[test]
     fn stream_start_encode_decode_round_trip() {
         let mut buf = Vec::new();
-        encode_stream_start(99, 42, [0xAA; 32], &mut buf);
+        // Non-zero epoch so a dropped/zeroed field is caught.
+        encode_stream_start(99, 42, [0xAA; 32], 5, &mut buf);
 
         let payload = &buf[4..];
         let msg = decode_primary_message(payload).unwrap();
@@ -492,10 +503,12 @@ mod tests {
                 start_sequence,
                 segment_start_sequence,
                 anchor_hash,
+                epoch,
             } => {
                 assert_eq!(start_sequence, 99);
                 assert_eq!(segment_start_sequence, 42);
                 assert_eq!(anchor_hash, [0xAA; 32]);
+                assert_eq!(epoch, 5);
             }
             _ => panic!("expected StreamStart"),
         }
@@ -821,6 +834,7 @@ mod tests {
             let handshake = Handshake {
                 last_sequence: 0,
                 chain_hash: [0u8; 32],
+                epoch: 0,
             };
             encode_handshake(&handshake, &mut buf);
             writer.write_all(&buf).unwrap();
@@ -866,7 +880,7 @@ mod tests {
 
         // Send StreamStart.
         let mut buf = Vec::new();
-        encode_stream_start(0, 1, [0u8; 32], &mut buf); // fake lineage for test
+        encode_stream_start(0, 1, [0u8; 32], 0, &mut buf); // fake lineage for test
         p_writer.write_all(&buf).unwrap();
         p_writer.flush().unwrap();
         buf.clear();
@@ -956,6 +970,7 @@ mod tests {
                 &Handshake {
                     last_sequence: 0,
                     chain_hash: [0u8; 32],
+                    epoch: 0,
                 },
                 &mut buf,
             );
@@ -1010,7 +1025,7 @@ mod tests {
         ));
 
         // Send StreamStart.
-        encode_stream_start(0, 1, [0u8; 32], &mut buf);
+        encode_stream_start(0, 1, [0u8; 32], 0, &mut buf);
         p_writer.write_all(&buf).unwrap();
         p_writer.flush().unwrap();
         buf.clear();
@@ -1073,6 +1088,7 @@ mod tests {
                 &Handshake {
                     last_sequence: 100,
                     chain_hash: [0xBB; 32],
+                    epoch: 0,
                 },
                 &mut buf,
             );
@@ -1120,7 +1136,7 @@ mod tests {
         assert_eq!(handshake.chain_hash, [0xBB; 32]);
 
         // Send StreamStart echoing the replica's sequence.
-        encode_stream_start(handshake.last_sequence, 1, [0u8; 32], &mut buf);
+        encode_stream_start(handshake.last_sequence, 1, [0u8; 32], 0, &mut buf);
         p_writer.write_all(&buf).unwrap();
         p_writer.flush().unwrap();
         buf.clear();

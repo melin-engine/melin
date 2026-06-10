@@ -58,6 +58,11 @@ pub const MAX_DATA_FRAME: usize = 768 * 1024;
 pub struct Handshake {
     pub last_sequence: u64,
     pub chain_hash: [u8; 32],
+    /// The replica's current fencing epoch. The primary compares it against
+    /// its own: a replica advertising a *higher* epoch has seen a promotion
+    /// the primary hasn't, so the primary is stale and self-demotes (see
+    /// `crate::fence`).
+    pub epoch: u64,
 }
 
 /// Ack message sent by the replica.
@@ -90,6 +95,11 @@ pub enum PrimaryMessage {
         /// existing local state ignore it.
         segment_start_sequence: u64,
         anchor_hash: [u8; 32],
+        /// The primary's current fencing epoch. A replica that already
+        /// observed a *higher* epoch refuses to follow this (stale) primary;
+        /// a replica behind it adopts the epoch as the stream's `EpochBump`s
+        /// replay. See `crate::fence`.
+        epoch: u64,
     },
     NeedSnapshot,
     HashMismatch,
@@ -138,6 +148,7 @@ struct HandshakeFrame {
     tag: u8,
     last_sequence: U64,
     chain_hash: [u8; 32],
+    epoch: U64,
 }
 
 #[derive(FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned)]
@@ -195,16 +206,17 @@ struct StreamStartFrame {
     start_sequence: U64,
     segment_start_sequence: U64,
     anchor_hash: [u8; 32],
+    epoch: U64,
 }
 
-const _: () = assert!(core::mem::size_of::<HandshakeFrame>() == 41);
+const _: () = assert!(core::mem::size_of::<HandshakeFrame>() == 49);
 const _: () = assert!(core::mem::size_of::<AckFrame>() == 17);
 const _: () = assert!(core::mem::size_of::<ChallengeFrame>() == 33);
 const _: () = assert!(core::mem::size_of::<ChallengeResponseFrame>() == 97);
 const _: () = assert!(core::mem::size_of::<SnapshotBeginFrame>() == 49);
 const _: () = assert!(core::mem::size_of::<SnapshotEndFrame>() == 5);
 const _: () = assert!(core::mem::size_of::<HeartbeatFrame>() == 9);
-const _: () = assert!(core::mem::size_of::<StreamStartFrame>() == 49);
+const _: () = assert!(core::mem::size_of::<StreamStartFrame>() == 57);
 
 /// Helper: `length_prefix(buf, payload_len)` writes the 4-byte LE
 /// frame length prefix for a payload of `payload_len` bytes.
@@ -221,6 +233,7 @@ pub fn encode_handshake(h: &Handshake, buf: &mut Vec<u8>) {
         tag: MSG_HANDSHAKE,
         last_sequence: U64::new(h.last_sequence),
         chain_hash: h.chain_hash,
+        epoch: U64::new(h.epoch),
     };
     let payload = frame.as_bytes();
     write_length_prefix(buf, payload.len() as u32);
@@ -290,6 +303,7 @@ pub fn encode_stream_start(
     start_sequence: u64,
     segment_start_sequence: u64,
     anchor_hash: [u8; 32],
+    epoch: u64,
     buf: &mut Vec<u8>,
 ) {
     let frame = StreamStartFrame {
@@ -297,6 +311,7 @@ pub fn encode_stream_start(
         start_sequence: U64::new(start_sequence),
         segment_start_sequence: U64::new(segment_start_sequence),
         anchor_hash,
+        epoch: U64::new(epoch),
     };
     let payload = frame.as_bytes();
     write_length_prefix(buf, payload.len() as u32);
@@ -438,6 +453,7 @@ pub fn decode_replica_message(payload: &[u8]) -> io::Result<ReplicaMessage> {
             Ok(ReplicaMessage::Handshake(Handshake {
                 last_sequence: frame.last_sequence.get(),
                 chain_hash: frame.chain_hash,
+                epoch: frame.epoch.get(),
             }))
         }
         MSG_ACK => {
@@ -467,6 +483,7 @@ pub fn decode_primary_message(payload: &[u8]) -> io::Result<PrimaryMessage> {
                 start_sequence: frame.start_sequence.get(),
                 segment_start_sequence: frame.segment_start_sequence.get(),
                 anchor_hash: frame.anchor_hash,
+                epoch: frame.epoch.get(),
             })
         }
         MSG_NEED_SNAPSHOT => Ok(PrimaryMessage::NeedSnapshot),

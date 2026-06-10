@@ -216,6 +216,9 @@ const _: () = assert!(ENTRY_META_SIZE == 17);
 /// check, but distinct tags keep any forensic byte-level inspection
 /// unambiguous.
 const TAG_TICK: u8 = 0x03;
+/// Replication fencing epoch bump (see [`JournalEvent::EpochBump`]).
+/// Payload is the 8-byte little-endian epoch.
+const TAG_EPOCH_BUMP: u8 = 0x04;
 const TAG_APP: u8 = 0x80;
 
 /// Bytes after the header + key_hash + request_seq reserved for the
@@ -334,6 +337,11 @@ pub fn encode<E: AppEvent>(
             le::put_u64(&mut buf[pos..], *now_ns);
             pos += 8;
             TAG_TICK
+        }
+        JournalEvent::EpochBump { epoch } => {
+            le::put_u64(&mut buf[pos..], *epoch);
+            pos += 8;
+            TAG_EPOCH_BUMP
         }
         JournalEvent::App(e) => {
             let n = e.encoded_size();
@@ -465,6 +473,17 @@ pub fn decode<E: AppEvent>(buf: &[u8]) -> Result<DecodedEntry<E>, JournalError> 
                 now_ns: le::get_u64(event_payload),
             }
         }
+        TAG_EPOCH_BUMP => {
+            if event_payload.len() < 8 {
+                return Err(JournalError::CorruptEntry {
+                    sequence,
+                    reason: "EpochBump payload too short",
+                });
+            }
+            JournalEvent::EpochBump {
+                epoch: le::get_u64(event_payload),
+            }
+        }
         TAG_APP => {
             let e = E::decode(event_payload).map_err(|codec_err| JournalError::CorruptEntry {
                 sequence,
@@ -574,6 +593,13 @@ mod tests {
         round_trip(JournalEvent::Tick {
             now_ns: 1_700_000_000_000_000_000,
         });
+    }
+
+    #[test]
+    fn round_trip_epoch_bump() {
+        round_trip(JournalEvent::EpochBump { epoch: 0 });
+        round_trip(JournalEvent::EpochBump { epoch: 1 });
+        round_trip(JournalEvent::EpochBump { epoch: u64::MAX });
     }
 
     #[test]

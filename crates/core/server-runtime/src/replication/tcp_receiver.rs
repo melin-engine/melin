@@ -9,6 +9,7 @@
 use std::io::{self, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::os::unix::io::RawFd;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use tracing::{info, warn};
@@ -394,6 +395,7 @@ pub fn run_receiver<A, W>(
     busy_spin: bool,
     rotation: Option<(u64, std::sync::Arc<AtomicBool>)>,
     factory: std::sync::Arc<dyn melin_app::app_factory::AppFactory<App = A>>,
+    fence_state: std::sync::Arc<melin_transport_core::fence::FenceState>,
 ) -> ReceiverResult<A, W>
 where
     A: Application + Send + 'static,
@@ -424,6 +426,9 @@ where
         let next = engine.next_sequence();
         let last = next.saturating_sub(1);
         let hash = engine.chain_hash().unwrap_or([0u8; 32]);
+        // Seed the observed epoch from the replica's own recovered journal.
+        // Streaming `EpochBump`s and the snapshot-resync path raise it later.
+        fence_state.observe_epoch(engine.recovered_epoch());
         let (mut exchange, writer) = engine.into_parts();
         factory.apply_operator_policy(&mut exchange);
         (Some(exchange), Some(writer), last, hash)
@@ -537,9 +542,13 @@ where
         info!("authenticated with primary");
 
         // --- Handshake ---
+        // Advertise our fencing epoch. If we are ahead of the primary it
+        // sees this and self-demotes (it's a stale ex-primary); see
+        // `crate::fence` and the sender's handshake handling.
         let handshake = Handshake {
             last_sequence,
             chain_hash,
+            epoch: fence_state.epoch(),
         };
         send_buf.clear();
         encode_handshake(&handshake, &mut send_buf);
@@ -560,8 +569,30 @@ where
                 start_sequence,
                 segment_start_sequence,
                 anchor_hash,
+                epoch,
             } => {
-                info!(start_sequence, "streaming started");
+                // Fence: refuse to follow a primary whose epoch is behind
+                // ours — following its (divergent) lineage on top of our
+                // more-current state would corrupt the journal. Disconnect
+                // and retry with backoff; the operator's logs flag the
+                // misdirected `--replica-of`. Our handshake (already sent)
+                // carries our higher epoch, so the stale primary also fences
+                // itself on its side.
+                let our_epoch = fence_state.epoch();
+                if epoch < our_epoch {
+                    warn!(
+                        primary_epoch = epoch,
+                        our_epoch,
+                        "primary is behind our fencing epoch — refusing to follow stale primary"
+                    );
+                    backoff = (backoff * 2).min(MAX_BACKOFF);
+                    sleep_checking_flags(backoff, shutdown, promote);
+                    continue;
+                }
+                // Adopt the primary's epoch immediately; streamed `EpochBump`s
+                // keep it current thereafter.
+                fence_state.observe_epoch(epoch);
+                info!(start_sequence, epoch, "streaming started");
                 ((segment_start_sequence, anchor_hash), last_sequence)
             }
             PrimaryMessage::NeedSnapshot => {
@@ -640,7 +671,7 @@ where
                     }
                 }
 
-                let (snap_exchange, _snap_seq, snap_hash) =
+                let (snap_exchange, _snap_seq, snap_hash, snap_epoch) =
                     melin_transport_core::snapshot::load::<A>(&snapshot_path)?;
                 if snap_hash != snap_chain_hash {
                     return Err(format!(
@@ -649,6 +680,9 @@ where
                     )
                     .into());
                 }
+                // Adopt the primary's snapshot epoch — the resync rebases this
+                // replica onto the primary's lineage, including its epoch.
+                fence_state.observe_epoch(snap_epoch);
                 exchange = Some(snap_exchange);
 
                 let writer = W::create_continuing(journal_path, snap_sequence + 1, snap_hash)?;
@@ -660,6 +694,7 @@ where
                         start_sequence,
                         segment_start_sequence,
                         anchor_hash,
+                        epoch,
                     } => {
                         // The lineage must agree with the snapshot the
                         // primary just transferred — the local journal
@@ -678,7 +713,14 @@ where
                             )
                             .into());
                         }
-                        info!(start_sequence, "streaming resumed after snapshot transfer");
+                        // We just rebased onto this primary's snapshot, so we
+                        // adopt its epoch wholesale (no stale-primary refusal
+                        // here — our prior state was discarded).
+                        fence_state.observe_epoch(epoch);
+                        info!(
+                            start_sequence,
+                            epoch, "streaming resumed after snapshot transfer"
+                        );
                         (segment_start_sequence, anchor_hash)
                     }
                     other => {
@@ -729,6 +771,7 @@ where
                 group_commit_delay,
                 busy_spin,
                 rotation.clone(),
+                Arc::clone(&fence_state),
             )?);
         }
 

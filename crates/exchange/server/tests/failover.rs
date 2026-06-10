@@ -3543,3 +3543,151 @@ impl ChildExt for std::process::Child {
         }
     }
 }
+
+/// Replication fencing: a higher-epoch node connecting to a stale primary
+/// forces the primary to self-demote. This is the split-brain window the
+/// epoch closes — exercised here against the case where the fence is the
+/// *sole* protection (the primary keeps a healthy replica, so the
+/// all-replicas-disconnected halt is not what stops it).
+///
+/// 1. Primary `P` (epoch 0) with two replicas: `keep` (stays connected so
+///    `P` never trips the 0-replica halt) and `prom` (the promotion target).
+/// 2. Promote `prom` → it becomes a primary at epoch 1, journaling an
+///    `EpochBump` as the first entry of its tenure.
+/// 3. An acked order forces that bump durable, then `prom` is killed —
+///    leaving its epoch-1 journal on disk.
+/// 4. A fresh replica boots from that epoch-1 journal, pointed at the still
+///    -running `P`. Its handshake advertises epoch 1.
+/// 5. `P`, at epoch 0, observes the higher epoch and self-demotes: matching
+///    halts (`trading` → false) and the process shuts down.
+#[test]
+#[serial]
+fn higher_epoch_handshake_fences_stale_primary() {
+    let bin = server_bin();
+    assert!(bin.exists(), "melin-server binary not found");
+    let tmp = tempfile::tempdir().expect("create temp dir");
+
+    let key = SigningKey::from_bytes(&[0xFA; 32]);
+    let operator_key = SigningKey::from_bytes(&[0xFD; 32]);
+    let repl_key = SigningKey::from_bytes(&[0xFC; 32]);
+    let (keys_path, repl_key_path) =
+        write_auth_keys_multi(tmp.path(), &[&key], &operator_key, &repl_key);
+
+    let p_client = free_port();
+    let p_health = free_port();
+    let p_repl = free_port();
+    let keep_client = free_port();
+    let keep_health = free_port();
+    let keep_admin = free_port();
+    let prom_client = free_port();
+    let prom_health = free_port();
+    let prom_admin = free_port();
+
+    // Primary at epoch 0.
+    let mut primary = spawn_primary_with_extra(
+        &bin,
+        tmp.path(),
+        &keys_path,
+        p_client,
+        p_health,
+        p_repl,
+        &[],
+    );
+    wait_for_primary_repl_ready(primary.health_addr, Duration::from_secs(10));
+
+    // `keep` holds the replica gate for the whole test; `prom` is promoted.
+    let _keep = spawn_replica_named(
+        &bin,
+        tmp.path(),
+        &keys_path,
+        &repl_key_path,
+        p_repl,
+        keep_client,
+        keep_health,
+        keep_admin,
+        "fence-keep",
+    );
+    let prom = spawn_replica_named(
+        &bin,
+        tmp.path(),
+        &keys_path,
+        &repl_key_path,
+        p_repl,
+        prom_client,
+        prom_health,
+        prom_admin,
+        "fence-prom",
+    );
+    wait_healthy(primary.health_addr, Duration::from_secs(30));
+
+    // Promote `prom` → epoch 1. Downgrade it to `local` so its gate opens
+    // without peers (it left the primary on promotion).
+    let prom_admin_addr: SocketAddr = format!("127.0.0.1:{prom_admin}").parse().unwrap();
+    promote(prom_admin_addr, &operator_key);
+    set_durability_mode(prom_admin_addr, &operator_key, "local");
+    wait_ready(prom.health_addr, Duration::from_secs(30));
+
+    // Force the EpochBump durable: an acked order can only return once every
+    // preceding journal entry (the bump included) is on disk.
+    {
+        let mut pc =
+            connect_with_timeout(format!("127.0.0.1:{prom_client}").parse().unwrap(), &key);
+        let resp = submit_order(&mut pc, 1, 0, 0, Side::Buy, 100, 1);
+        assert!(
+            !resp.is_empty(),
+            "order to the promoted node should be acked"
+        );
+    }
+
+    // Kill the promoted node, keeping its epoch-1 journal on disk.
+    drop(prom);
+
+    // The primary still trades at epoch 0 — `keep` holds the gate, so this
+    // is not the 0-replica halt.
+    let (_, _, _, trading_before) =
+        query_health(primary.health_addr).expect("primary health before fence");
+    assert!(
+        trading_before,
+        "primary should still be trading before the higher-epoch node connects"
+    );
+
+    // Boot a replica from the epoch-1 journal (same journal name → same
+    // lineage), pointed at the stale primary.
+    let ghost_client = free_port();
+    let ghost_health = free_port();
+    let ghost_admin = free_port();
+    let _ghost = spawn_replica_named(
+        &bin,
+        tmp.path(),
+        &keys_path,
+        &repl_key_path,
+        p_repl,
+        ghost_client,
+        ghost_health,
+        ghost_admin,
+        "fence-prom",
+    );
+
+    // The fence latches `is_halted` (trading → false) and triggers shutdown
+    // (process exit). Either is a definitive self-demotion signal; a healthy
+    // primary would do neither, so a timeout here means the fence failed.
+    let start = Instant::now();
+    let mut fenced = false;
+    while start.elapsed() < Duration::from_secs(20) {
+        if matches!(primary.child.try_wait(), Ok(Some(_))) {
+            fenced = true;
+            break;
+        }
+        if let Ok((_, _, _, trading)) = query_health(primary.health_addr)
+            && !trading
+        {
+            fenced = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    assert!(
+        fenced,
+        "stale primary was not fenced by the higher-epoch handshake"
+    );
+}

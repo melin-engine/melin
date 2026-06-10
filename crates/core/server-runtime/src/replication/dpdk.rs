@@ -11,7 +11,7 @@ use std::marker::PhantomData;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 use melin_app::Application;
 use melin_journal::JournalWrite;
@@ -142,6 +142,10 @@ pub struct DpdkReplicationDriver<A: Application> {
     metrics: Arc<ReplicationMetrics>,
     batch_size: usize,
     heartbeat_interval: std::time::Duration,
+    /// Node fencing state — see the kernel-TCP sender. Read to stamp the
+    /// primary's epoch onto each `StreamStart` and to self-demote when a
+    /// replica handshakes with a higher epoch.
+    fence_state: Arc<melin_transport_core::fence::FenceState>,
     // Anchors the `A` type parameter — the struct holds no app-typed
     // state, but `tick`'s journal-catchup and snapshot-transfer paths
     // do, and we want the type system to enforce that the same `A`
@@ -164,6 +168,7 @@ impl<A: Application> DpdkReplicationDriver<A> {
         metrics: Arc<ReplicationMetrics>,
         batch_size: usize,
         heartbeat_secs: u64,
+        fence_state: Arc<melin_transport_core::fence::FenceState>,
     ) -> Self {
         let [consumer_0, consumer_1] = repl_consumers;
         let now = std::time::Instant::now();
@@ -205,6 +210,7 @@ impl<A: Application> DpdkReplicationDriver<A> {
             metrics,
             batch_size,
             heartbeat_interval: std::time::Duration::from_secs(heartbeat_secs),
+            fence_state,
             _app: PhantomData,
         }
     }
@@ -252,6 +258,7 @@ impl<A: Application> DpdkReplicationDriver<A> {
         let replica_ready = &self.replica_ready;
         let replicas_connected = &self.replicas_connected;
         let metrics = &self.metrics;
+        let fence_state = &self.fence_state;
         let batch_size = self.batch_size;
         let heartbeat_interval = self.heartbeat_interval;
 
@@ -333,8 +340,34 @@ impl<A: Application> DpdkReplicationDriver<A> {
                                     info!(
                                         slot = slot_idx,
                                         last_sequence = h.last_sequence,
+                                        replica_epoch = h.epoch,
                                         "replica handshake received (DPDK)"
                                     );
+
+                                    // Fence: a replica with a higher epoch
+                                    // means we are a superseded ex-primary —
+                                    // self-demote (latch fenced + trigger
+                                    // shutdown) and drop the connection. See
+                                    // the kernel-TCP sender for the rationale.
+                                    if h.epoch > fence_state.epoch() {
+                                        if fence_state.fence() {
+                                            error!(
+                                                slot = slot_idx,
+                                                replica_epoch = h.epoch,
+                                                our_epoch = fence_state.epoch(),
+                                                "fenced: a replica advertises a higher epoch — \
+                                                 this primary has been superseded; self-demoting \
+                                                 and shutting down (DPDK)"
+                                            );
+                                        }
+                                        shutdown.store(true, Ordering::Release);
+                                        transport.close(handle);
+                                        slot.state = SlotState::Idle;
+                                        slot.recv_buf.clear();
+                                        replicas_connected.fetch_sub(1, Ordering::Release);
+                                        cursors.clear_on_disconnect(slot_idx);
+                                        continue;
+                                    }
 
                                     metrics.catching_up[slot_idx].store(true, Ordering::Relaxed);
 
@@ -391,6 +424,7 @@ impl<A: Application> DpdkReplicationDriver<A> {
                                                 h.last_sequence,
                                                 lineage_start,
                                                 lineage_anchor,
+                                                fence_state.epoch(),
                                                 &mut slot.send_buf,
                                             );
                                             dpdk_publish(&slot.send_buf)
@@ -729,6 +763,7 @@ pub fn run_receiver_dpdk<A, W>(
     // shape and rationale. Carries operator policy (rate limits, caps,
     // ...) alongside the empty-app constructor.
     factory: std::sync::Arc<dyn melin_app::app_factory::AppFactory<App = A>>,
+    fence_state: Arc<melin_transport_core::fence::FenceState>,
 ) -> ReceiverResult<A, W>
 where
     A: Application + Send + 'static,
@@ -760,6 +795,9 @@ where
         let next = engine.next_sequence();
         let last = next.saturating_sub(1);
         let hash = engine.chain_hash().unwrap_or([0u8; 32]);
+        // Seed the observed epoch from the replica's own recovered journal
+        // (mirrors the kernel-TCP receiver).
+        fence_state.observe_epoch(engine.recovered_epoch());
         let (mut exchange, writer) = engine.into_parts();
         factory.apply_operator_policy(&mut exchange);
         (Some(exchange), Some(writer), last, hash)
@@ -915,11 +953,13 @@ where
         }
         info!("connected to primary (DPDK)");
 
-        // Send handshake.
+        // Send handshake. Advertise our fencing epoch so a stale primary
+        // self-demotes when it sees we are ahead (see `crate::fence`).
         send_buf.clear();
         let handshake = Handshake {
             last_sequence,
             chain_hash,
+            epoch: fence_state.epoch(),
         };
         encode_handshake(&handshake, &mut send_buf);
         transport.queue_send(handle, &send_buf);
@@ -964,6 +1004,7 @@ where
                             start_sequence,
                             segment_start_sequence,
                             anchor_hash,
+                            epoch,
                         } => {
                             if let Some((expected_start, expected_anchor)) = expected_post_snapshot
                                 && (segment_start_sequence != expected_start
@@ -979,7 +1020,24 @@ where
                                     .into()
                                 );
                             }
-                            info!(start_sequence, "streaming started (DPDK)");
+                            // Fence: on a normal resume (not a fresh snapshot
+                            // rebase), refuse a primary behind our epoch — its
+                            // divergent lineage must not overwrite our more
+                            // current state. Mirrors the kernel-TCP receiver.
+                            let our_epoch = fence_state.epoch();
+                            if expected_post_snapshot.is_none() && epoch < our_epoch {
+                                warn!(
+                                    primary_epoch = epoch,
+                                    our_epoch,
+                                    "primary is behind our fencing epoch — refusing to follow \
+                                     stale primary (DPDK)"
+                                );
+                                backoff = (backoff * 2).min(MAX_BACKOFF);
+                                sleep_checking_flags(backoff, shutdown, promote);
+                                break 'handshake None; // caught by the None check below
+                            }
+                            fence_state.observe_epoch(epoch);
+                            info!(start_sequence, epoch, "streaming started (DPDK)");
                             break 'handshake Some((segment_start_sequence, anchor_hash));
                         }
                         PrimaryMessage::NeedSnapshot => {
@@ -1126,6 +1184,7 @@ where
                 group_commit_delay,
                 busy_spin,
                 rotation.clone(),
+                Arc::clone(&fence_state),
             )?);
 
             // Pipeline children are spawned and self-pinned. Now safe to
@@ -1345,8 +1404,10 @@ fn receive_snapshot_dpdk<A: Application>(
         }
     } // tmp_file dropped here if not already dropped in SnapshotEnd path
 
-    // Load and verify the snapshot.
-    let (snap_exchange, _snap_seq, snap_hash) =
+    // Load and verify the snapshot. The snapshot's epoch is adopted via the
+    // post-snapshot `StreamStart` the caller processes next (which carries
+    // the primary's current epoch), so it is not consumed here.
+    let (snap_exchange, _snap_seq, snap_hash, _snap_epoch) =
         melin_transport_core::snapshot::load::<A>(snapshot_path)?;
     if snap_hash != snap_chain_hash {
         return Err(format!(

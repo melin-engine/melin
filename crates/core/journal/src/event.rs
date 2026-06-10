@@ -34,6 +34,17 @@ pub enum JournalEvent<E: AppEvent> {
     /// scheduled tasks. Replay feeds the recorded `now_ns` back,
     /// preserving determinism.
     Tick { now_ns: u64 },
+    /// Replication fencing epoch bump. Written as the first journaled
+    /// entry of a node's primary tenure — genesis primaries never emit
+    /// it (epoch stays 0); a promoted replica emits `EpochBump { prior
+    /// epoch + 1 }` before accepting any client order. Carries no
+    /// application state: it is lineage metadata, like the chain anchor,
+    /// but unlike the anchor it must be totally ordered against the order
+    /// flow (every order is unambiguously inside exactly one epoch), so it
+    /// rides the journal as a sequenced event rather than living in the
+    /// segment header. Replayed on recovery and replication to advance a
+    /// node's observed epoch; never delivered to the `Application`.
+    EpochBump { epoch: u64 },
     /// Pipeline-shutdown sentinel. Published by the receiver/reader as
     /// the last slot before exit; downstream stages stop at this slot
     /// (after completing any pending work) and exit.

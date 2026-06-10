@@ -105,6 +105,7 @@ fn build_matching_with_halt(initial_connected: u32) -> UnspawnedMatchingHaltResu
         dummy_cursor,
         active_conns,
         Some(Arc::clone(&counter)),
+        Arc::new(melin_transport_core::fence::FenceState::new(0)),
         false,
         1, // starting_wire_seq (halt test does not exercise the gate)
     );

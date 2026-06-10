@@ -43,6 +43,11 @@ pub const MSG_INPUT_BATCH: u8 = 0x21;
 // chain metadata never rides in the entry stream; divergence checks use
 // dedicated chain frames instead. Do not reuse the values.
 pub const SLOT_TAG_TICK: u8 = 0x03;
+/// Replication fencing epoch bump (see [`JournalEvent::EpochBump`]).
+/// Payload is the 8-byte little-endian epoch — kept in lockstep with the
+/// journal codec's `TAG_EPOCH_BUMP` so the replica re-journals it
+/// identically to the primary.
+pub const SLOT_TAG_EPOCH_BUMP: u8 = 0x04;
 pub const SLOT_TAG_APP: u8 = 0x80;
 
 // --- Wire structs ---
@@ -135,6 +140,10 @@ pub fn append_input_slot<E: AppEvent>(buf: &mut Vec<u8>, slot: &InputSlot<E>, se
         JournalEvent::Tick { now_ns } => {
             buf.extend_from_slice(&now_ns.to_le_bytes());
             SLOT_TAG_TICK
+        }
+        JournalEvent::EpochBump { epoch } => {
+            buf.extend_from_slice(&epoch.to_le_bytes());
+            SLOT_TAG_EPOCH_BUMP
         }
         JournalEvent::App(e) => {
             let n = e.encoded_size();
@@ -255,6 +264,17 @@ pub fn try_decode_input_batch_into<E: AppEvent>(
                         .expect("8-byte slice into [u8; 8]"),
                 );
                 JournalEvent::Tick { now_ns }
+            }
+            SLOT_TAG_EPOCH_BUMP => {
+                if event_payload.len() < 8 {
+                    return Err(io::Error::other("EpochBump payload too short"));
+                }
+                let epoch = u64::from_le_bytes(
+                    event_payload[..8]
+                        .try_into()
+                        .expect("8-byte slice into [u8; 8]"),
+                );
+                JournalEvent::EpochBump { epoch }
             }
             SLOT_TAG_APP => {
                 let app = E::decode(event_payload)
@@ -391,6 +411,24 @@ mod tests {
         match decoded[0].event {
             JournalEvent::Tick { now_ns } => assert_eq!(now_ns, 12_345_678),
             ref other => panic!("expected Tick, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn roundtrip_epoch_bump() {
+        // The fencing epoch bump streams to replicas like any other entry;
+        // the replica must re-journal it byte-identically to the primary.
+        let slots = vec![sample_slot(11, JournalEvent::EpochBump { epoch: 42 })];
+        let mut buf = Vec::new();
+        encode_input_batch(&slots, &mut buf);
+        let payload = &buf[4..];
+        let decoded: Vec<InputSlot<TestEvent>> =
+            try_decode_input_batch(payload).expect("decode succeeds");
+        assert_eq!(decoded.len(), 1);
+        assert_eq!(decoded[0].sequence, 11);
+        match decoded[0].event {
+            JournalEvent::EpochBump { epoch } => assert_eq!(epoch, 42),
+            ref other => panic!("expected EpochBump, got {other:?}"),
         }
     }
 

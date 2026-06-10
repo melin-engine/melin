@@ -1358,6 +1358,7 @@ where
         true,  // busy_spin — match production default (yield_idle=false)
         false, // event_publisher
         false, // shadow
+        std::sync::Arc::new(melin_transport_core::fence::FenceState::new(0)),
     );
     let mut output_consumer = out.output_consumers.pop().expect("response consumer");
 

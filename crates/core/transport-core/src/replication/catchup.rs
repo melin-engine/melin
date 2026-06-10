@@ -303,7 +303,7 @@ pub fn snapshot_transfer_with<E: AppEvent>(
     // Read and validate snapshot.
     let snap_data = std::fs::read(&snap_path)
         .map_err(|e| io::Error::other(format!("read snapshot {}: {e}", snap_path.display())))?;
-    if snap_data.len() < 48 {
+    if snap_data.len() < 56 {
         return Err(io::Error::other("snapshot file too small for header"));
     }
     let magic = u32::from_le_bytes(
@@ -323,6 +323,12 @@ pub fn snapshot_transfer_with<E: AppEvent>(
     );
     let mut snap_chain_hash = [0u8; 32];
     snap_chain_hash.copy_from_slice(&snap_data[16..48]);
+    // Fencing epoch the snapshot was taken at (header v2, bytes [48..56]).
+    let snap_epoch = u64::from_le_bytes(
+        snap_data[48..56]
+            .try_into()
+            .expect("bounds checked: snap_data has at least 56 bytes"),
+    );
     let snap_len = snap_data.len() as u64;
 
     info!(
@@ -366,6 +372,7 @@ pub fn snapshot_transfer_with<E: AppEvent>(
         snap_sequence,
         snap_sequence + 1,
         snap_chain_hash,
+        snap_epoch,
         &mut send_buf,
     );
     publisher(&send_buf)?;

@@ -1658,6 +1658,13 @@ pub struct MatchingStage<A: Application> {
     /// (~1ns). `0` = no replicas connected → reject all mutations.
     /// `None` = standalone mode → no halt check.
     replicas_connected: Option<Arc<AtomicU32>>,
+    /// Replication fencing state. Advanced when an `EpochBump` event is
+    /// processed (recovery replay, live replication stream, or local
+    /// promotion injection); the per-event halt check folds in its
+    /// `is_fenced()` latch so a fenced node stops accepting client writes.
+    /// One Relaxed load per event (~1ns), shared with the response stage
+    /// and replication threads.
+    fence_state: Arc<crate::fence::FenceState>,
     /// When true, never yield — spin indefinitely. See [`idle_wait`].
     busy_spin: bool,
     /// Shared busy/idle counters for health endpoint monitoring.
@@ -1692,6 +1699,7 @@ impl<A: Application> MatchingStage<A> {
         journal_cursor: Arc<Sequence>,
         active_connections: Arc<AtomicU64>,
         replicas_connected: Option<Arc<AtomicU32>>,
+        fence_state: Arc<crate::fence::FenceState>,
         busy_spin: bool,
         starting_wire_seq: u64,
     ) -> Self {
@@ -1703,6 +1711,7 @@ impl<A: Application> MatchingStage<A> {
             journal_cursor,
             active_connections,
             replicas_connected,
+            fence_state,
             busy_spin,
             utilization: Arc::new(StageUtilization::new()),
             last_drain_ns: 0,
@@ -1715,12 +1724,18 @@ impl<A: Application> MatchingStage<A> {
         Arc::clone(&self.utilization)
     }
 
-    /// Returns true if trading is halted due to all replicas disconnected.
-    /// Always false in standalone mode (replicas_connected is None).
+    /// Returns true if trading is halted: either all replicas have
+    /// disconnected (durability can't be honoured) or the node has been
+    /// fenced by a higher epoch (superseded after a promotion). Always
+    /// false for the replica-disconnect cause in standalone mode
+    /// (`replicas_connected` is None); the fence latch is checked
+    /// unconditionally but can only be set when replication is active.
     fn is_halted(&self) -> bool {
-        self.replicas_connected
-            .as_ref()
-            .is_some_and(|count| count.load(Ordering::Relaxed) == 0)
+        self.fence_state.is_fenced()
+            || self
+                .replicas_connected
+                .as_ref()
+                .is_some_and(|count| count.load(Ordering::Relaxed) == 0)
     }
 
     /// Run the matching stage loop. Blocks until shutdown.
@@ -1944,6 +1959,13 @@ impl<A: Application> MatchingStage<A> {
                         melin_journal::JournalEvent::Tick { now_ns } => {
                             self.app.tick(now_ns, &mut reports);
                         }
+                        melin_journal::JournalEvent::EpochBump { epoch } => {
+                            // Lineage metadata, not application state: advance
+                            // the observed epoch and produce no report. Reaches
+                            // here on a replica replaying the stream and on the
+                            // new primary's own promotion injection.
+                            self.fence_state.observe_epoch(epoch);
+                        }
                         melin_journal::JournalEvent::Shutdown => {}
                     }
                 }
@@ -1962,6 +1984,7 @@ impl<A: Application> MatchingStage<A> {
                         let event_kind: &'static str = match &slot.event {
                             melin_journal::JournalEvent::App(_) => "app",
                             melin_journal::JournalEvent::Tick { .. } => "tick",
+                            melin_journal::JournalEvent::EpochBump { .. } => "epoch_bump",
                             melin_journal::JournalEvent::Shutdown => "shutdown",
                         };
                         tracing::warn!(
@@ -2235,6 +2258,11 @@ impl<A: Application> MatchingStage<A> {
                 // `JournalEvent::Tick`.
                 self.app.tick(now_ns, reports);
             }
+            melin_journal::JournalEvent::EpochBump { epoch } => {
+                // Lineage metadata — advance the observed epoch, never
+                // touch application state (see the main run loop).
+                self.fence_state.observe_epoch(epoch);
+            }
             melin_journal::JournalEvent::Shutdown => {
                 // Pipeline sentinel — handled at the run-loop level
                 // (stage exits on observing it). Never reaches process_event
@@ -2444,6 +2472,7 @@ pub fn build_pipeline_with_replication<A, W>(
     busy_spin: bool,
     enable_event_publisher: bool,
     enable_shadow: bool,
+    fence_state: Arc<crate::fence::FenceState>,
 ) -> Pipeline<A, W>
 where
     A: Application + Send + 'static,
@@ -2567,6 +2596,7 @@ where
         Arc::clone(&journal_cursor),
         active_connections,
         replicas_connected.clone(),
+        fence_state,
         busy_spin,
         starting_wire_seq,
     );
@@ -2618,6 +2648,7 @@ pub fn build_replica_pipeline<A, W>(
     group_commit_delay: Duration,
     busy_spin: bool,
     enable_shadow: bool,
+    fence_state: Arc<crate::fence::FenceState>,
 ) -> ReplicaPipeline<A, W>
 where
     A: Application + Send + 'static,
@@ -2689,6 +2720,7 @@ where
         Arc::clone(&journal_cursor),
         active_connections,
         None, // no replicas_connected halt check on replica
+        fence_state,
         busy_spin,
         starting_wire_seq,
     );
