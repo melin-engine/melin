@@ -1358,6 +1358,7 @@ where
         true,  // busy_spin — match production default (yield_idle=false)
         false, // event_publisher
         false, // shadow
+        std::sync::Arc::new(melin_transport_core::fence::FenceState::new(0)),
     );
     let mut output_consumer = out.output_consumers.pop().expect("response consumer");
 
@@ -2900,6 +2901,7 @@ pub(crate) const REJECT_REASONS: &[(RejectReason, &str)] = &[
     (RejectReason::InstrumentDisabled, "InstrumentDisabled"),
     (RejectReason::ExceedsMaxOpenOrders, "ExceedsMaxOpenOrders"),
     (RejectReason::ExceedsOrderRate, "ExceedsOrderRate"),
+    (RejectReason::Superseded, "Superseded"),
 ];
 
 fn reject_reason_index(reason: RejectReason) -> usize {
@@ -2929,6 +2931,7 @@ fn reject_reason_index(reason: RejectReason) -> usize {
         RejectReason::InstrumentDisabled => 18,
         RejectReason::ExceedsMaxOpenOrders => 19,
         RejectReason::ExceedsOrderRate => 20,
+        RejectReason::Superseded => 21,
     };
     // Catch silent label/index swaps: an exhaustive match would still
     // type-check if two arms had their integers swapped, but the

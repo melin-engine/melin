@@ -273,6 +273,7 @@ impl Application for ServerApp {
         let engine_reason = match reason {
             TransportRejectReason::DuplicateRequest => EngineRejectReason::DuplicateRequest,
             TransportRejectReason::ReplicaDisconnected => EngineRejectReason::ReplicaDisconnected,
+            TransportRejectReason::Superseded => EngineRejectReason::Superseded,
         };
         ExecutionReport::Rejected {
             order_id: extract_order_id(event),
@@ -546,6 +547,22 @@ mod tests {
                 assert_eq!(symbol, Symbol(0));
                 assert_eq!(account, AccountId(9));
                 assert_eq!(reason, EngineRejectReason::ReplicaDisconnected);
+            }
+            other => panic!("expected Rejected, got {other:?}"),
+        }
+
+        let r = <ServerApp as Application>::build_reject(
+            &TradingEvent::CancelAll {
+                account: AccountId(9),
+            },
+            TransportRejectReason::Superseded,
+        );
+        match r {
+            ExecutionReport::Rejected {
+                account, reason, ..
+            } => {
+                assert_eq!(account, AccountId(9));
+                assert_eq!(reason, EngineRejectReason::Superseded);
             }
             other => panic!("expected Rejected, got {other:?}"),
         }

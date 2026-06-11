@@ -54,6 +54,12 @@ pub struct HealthState {
     pub input_cursor: Box<dyn QueueCursor>,
     pub pipeline_healthy: Arc<AtomicBool>,
     pub replicas_connected: Option<Arc<AtomicU32>>,
+    /// Node fencing state. Folded into the `trading` flag so a fenced
+    /// (superseded) ex-primary reports `halted` to probes and monitoring
+    /// for the short window before the process finishes winding down —
+    /// it has already stopped acking, and load balancers must not keep
+    /// routing to it. `None` in tests/binaries without fencing wired.
+    pub fence_state: Option<Arc<crate::fence::FenceState>>,
     /// Per-replica replication metrics. None in standalone mode.
     pub replication_metrics: Option<Arc<crate::replication::ReplicationMetrics>>,
     /// Per-slot engaged flags from the replication sender (`Release`-flipped
@@ -206,11 +212,15 @@ impl HealthSnapshot {
 
         // Trading state: "trading" when standalone or at least one replica
         // connected, "halted" when replication is enabled but all replicas
-        // are disconnected.
-        let trading = state
-            .replicas_connected
-            .as_ref()
-            .is_none_or(|count| count.load(Ordering::Relaxed) > 0);
+        // are disconnected — or when the node has been fenced (superseded
+        // by a higher-epoch primary). Mirrors the matching stage's
+        // `is_halted()` so probes agree with what the engine enforces.
+        let fenced = state.fence_state.as_ref().is_some_and(|f| f.is_fenced());
+        let trading = !fenced
+            && state
+                .replicas_connected
+                .as_ref()
+                .is_none_or(|count| count.load(Ordering::Relaxed) > 0);
 
         // Per-replica metrics from the replication sender (if enabled).
         let replicas_connected_val = state
@@ -807,17 +817,19 @@ mod tests {
         Arc<AtomicBool>,
         std::thread::JoinHandle<()>,
     ) {
-        start_health_with_replica(active, journal_seq, repl_acked, None)
+        start_health_with_replica(active, journal_seq, repl_acked, None, None)
     }
 
-    /// Like `start_health` but with an explicit `replicas_connected` flag.
-    /// `repl_acked` is the slowest engaged replica's acked wire seq, or
-    /// `u64::MAX` for "no replica engaged" — see [`test_cursors`].
+    /// Like `start_health` but with explicit `replicas_connected` and
+    /// `fence_state` wiring. `repl_acked` is the slowest engaged replica's
+    /// acked wire seq, or `u64::MAX` for "no replica engaged" — see
+    /// [`test_cursors`].
     fn start_health_with_replica(
         active: u64,
         journal_seq: u64,
         repl_acked: u64,
         replicas_connected: Option<Arc<AtomicU32>>,
+        fence_state: Option<Arc<crate::fence::FenceState>>,
     ) -> (
         SocketAddr,
         Arc<AtomicU64>,
@@ -847,6 +859,7 @@ mod tests {
             input_cursor: Box::new(MockCursor(AtomicU64::new(journal_seq))),
             pipeline_healthy: Arc::clone(&healthy),
             replicas_connected,
+            fence_state,
             replication_metrics: None,
             replica_active: None,
             replication_ring_producer_cursors: None,
@@ -972,6 +985,7 @@ mod tests {
                 input_cursor: Box::new(MockCursor(AtomicU64::new(99))),
                 pipeline_healthy: Arc::clone(&healthy),
                 replicas_connected: None,
+                fence_state: None,
                 replication_metrics: None,
                 replica_active: None,
                 replication_ring_producer_cursors: None,
@@ -1006,6 +1020,7 @@ mod tests {
                 input_cursor: Box::new(MockCursor(AtomicU64::new(0))),
                 pipeline_healthy: Arc::new(AtomicBool::new(true)),
                 replicas_connected: None,
+                fence_state: None,
                 replication_metrics: None,
                 replica_active: None,
                 replication_ring_producer_cursors: None,
@@ -1068,7 +1083,7 @@ mod tests {
     fn health_shows_halted_when_replica_disconnected() {
         let replica_count = Arc::new(AtomicU32::new(0)); // no replicas connected
         let (addr, _events, _healthy, shutdown, handle) =
-            start_health_with_replica(5, 100, u64::MAX, Some(Arc::clone(&replica_count)));
+            start_health_with_replica(5, 100, u64::MAX, Some(Arc::clone(&replica_count)), None);
 
         let buf = read_health(addr);
         assert_eq!(buf, "OK 5 100 0 halted\n");
@@ -1077,6 +1092,36 @@ mod tests {
         replica_count.store(1, Ordering::Relaxed);
         let buf = read_health(addr);
         assert_eq!(buf, "OK 5 100 0 trading\n");
+
+        shutdown.store(true, Ordering::Relaxed);
+        handle.join().unwrap();
+    }
+
+    /// A fenced (superseded) ex-primary must report `halted` even while a
+    /// replica is still connected — the replica count is healthy in the
+    /// exact split-brain scenario fencing exists for, so probes must key
+    /// off the fence latch, not just the count.
+    #[test]
+    fn health_shows_halted_when_fenced() {
+        let replica_count = Arc::new(AtomicU32::new(1)); // replica still connected
+        let fence = Arc::new(crate::fence::FenceState::new(0));
+        let (addr, _events, _healthy, shutdown, handle) = start_health_with_replica(
+            5,
+            100,
+            u64::MAX,
+            Some(Arc::clone(&replica_count)),
+            Some(Arc::clone(&fence)),
+        );
+
+        let buf = read_health(addr);
+        assert_eq!(buf, "OK 5 100 0 trading\n", "healthy node trades");
+
+        fence.fence();
+        let buf = read_health(addr);
+        assert_eq!(
+            buf, "OK 5 100 0 halted\n",
+            "fenced node must report halted despite a connected replica"
+        );
 
         shutdown.store(true, Ordering::Relaxed);
         handle.join().unwrap();
@@ -1136,6 +1181,7 @@ mod tests {
             input_cursor: Box::new(MockCursor(AtomicU64::new(5))),
             pipeline_healthy: Arc::new(AtomicBool::new(true)),
             replicas_connected: None,
+            fence_state: None,
             replication_metrics: None,
             replica_active: None,
             replication_ring_producer_cursors: None,
@@ -1171,7 +1217,7 @@ mod tests {
         // Verify that unhealthy + halted → 0 values.
         let replica_count = Arc::new(AtomicU32::new(0)); // disconnected → halted
         let (addr, _events, healthy, shutdown, handle) =
-            start_health_with_replica(0, 0, u64::MAX, Some(Arc::clone(&replica_count)));
+            start_health_with_replica(0, 0, u64::MAX, Some(Arc::clone(&replica_count)), None);
 
         healthy.store(false, Ordering::Relaxed);
 
@@ -1237,6 +1283,7 @@ mod tests {
             input_cursor: Box::new(MockCursor(AtomicU64::new(1000))),
             pipeline_healthy: Arc::new(AtomicBool::new(true)),
             replicas_connected: None,
+            fence_state: None,
             replication_metrics: None,
             replica_active: None,
             replication_ring_producer_cursors: None,
@@ -1292,6 +1339,7 @@ mod tests {
             input_cursor: Box::new(MockCursor(AtomicU64::new(0))),
             pipeline_healthy: Arc::new(AtomicBool::new(true)),
             replicas_connected: None,
+            fence_state: None,
             replication_metrics: None,
             replica_active: None,
             replication_ring_producer_cursors: None,
@@ -1356,6 +1404,7 @@ mod tests {
             input_cursor: Box::new(MockCursor(AtomicU64::new(5000))),
             pipeline_healthy: Arc::new(AtomicBool::new(true)),
             replicas_connected: None,
+            fence_state: None,
             replication_metrics: None,
             replica_active: None,
             replication_ring_producer_cursors: Some([prod_0, prod_1]),
@@ -1406,6 +1455,7 @@ mod tests {
             input_cursor: Box::new(MockCursor(AtomicU64::new(0))),
             pipeline_healthy: Arc::new(AtomicBool::new(true)),
             replicas_connected: None,
+            fence_state: None,
             replication_metrics: None,
             replica_active: None,
             replication_ring_producer_cursors: None,
@@ -1616,6 +1666,7 @@ mod tests {
             input_cursor: Box::new(MockCursor(AtomicU64::new(1000))),
             pipeline_healthy: Arc::new(AtomicBool::new(true)),
             replicas_connected: Some(Arc::new(AtomicU32::new(2))),
+            fence_state: None,
             replication_metrics: Some(metrics),
             replica_active: Some([
                 Arc::new(AtomicBool::new(true)),
@@ -1698,6 +1749,7 @@ mod tests {
             input_cursor: Box::new(MockCursor(AtomicU64::new(1_000))),
             pipeline_healthy: Arc::new(AtomicBool::new(true)),
             replicas_connected: Some(Arc::new(AtomicU32::new(1))),
+            fence_state: None,
             replication_metrics: Some(metrics),
             replica_active: Some([
                 Arc::new(AtomicBool::new(true)),
@@ -1780,6 +1832,7 @@ mod tests {
             input_cursor: Box::new(MockCursor(AtomicU64::new(0))),
             pipeline_healthy: Arc::new(AtomicBool::new(true)),
             replicas_connected: Some(Arc::new(AtomicU32::new(2))),
+            fence_state: None,
             replication_metrics: Some(Arc::clone(&metrics)),
             replica_active: Some([Arc::clone(&active[0]), Arc::clone(&active[1])]),
             replication_ring_producer_cursors: None,
@@ -1939,6 +1992,7 @@ mod tests {
             input_cursor: Box::new(MockCursor(AtomicU64::new(0))),
             pipeline_healthy: Arc::new(AtomicBool::new(true)),
             replicas_connected: None,
+            fence_state: None,
             replication_metrics: None,
             replica_active: None,
             replication_ring_producer_cursors: None,

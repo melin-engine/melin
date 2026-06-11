@@ -102,6 +102,12 @@ pub struct Response<A: Application> {
     /// once at boot (`Arc::new(ExchangeResponseEncoder)`) and shared
     /// with the DPDK response stage.
     pub encoder: ResponseEncoderArc<A>,
+    /// Node fencing state. When latched (a higher epoch was observed), the
+    /// stage exits *without* the best-effort flush — in-flight responses
+    /// for orders on a superseded epoch must not be acknowledged. Fencing
+    /// co-sets `shutdown`, so the latch is only consulted on the shutdown
+    /// path (zero steady-state cost). See `crate::fence`.
+    pub fence_state: Arc<melin_transport_core::fence::FenceState>,
 }
 
 /// Per-connection state for batched io_uring sends.
@@ -143,6 +149,7 @@ pub fn run<A: Application>(
         busy_spin,
         utilization,
         encoder,
+        fence_state,
     } = config;
     // Resolve the starting mode from the shared atomic and derive the
     // local Policy. The atomic is the single source of truth across the
@@ -336,8 +343,17 @@ pub fn run<A: Application>(
         }
 
         if shutdown.load(Ordering::Relaxed) {
+            // Fence: a superseded ex-primary must not acknowledge any
+            // further in-flight work — skip the best-effort flush so
+            // responses buffered for orders on the old epoch are dropped
+            // (the client sees a connection reset and reconciles on
+            // reconnect). Checked only here, not per iteration: fencing
+            // always co-sets `shutdown` (`FenceState::fence_if_superseded`
+            // owns that invariant), so this branch is the first one a
+            // fenced node reaches and the steady-state loop pays nothing.
+            let flush = !fence_state.is_fenced();
             // Best-effort flush before shutdown.
-            if !dirty_connections.is_empty() {
+            if flush && !dirty_connections.is_empty() {
                 flush_sends(
                     &mut ring,
                     &mut connections,

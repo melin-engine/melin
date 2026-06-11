@@ -159,6 +159,12 @@ impl From<std::io::Error> for JournaledAppError {
 pub struct JournaledApp<A: Application, W: JournalWrite<A::Event>> {
     app: A,
     writer: W,
+    /// Fencing epoch recovered from the snapshot + journal replay (the
+    /// highest `EpochBump` observed, or the snapshot's epoch if newer, or
+    /// `0` for a genesis node). The boot site reads this via
+    /// [`Self::recovered_epoch`] to seed the node's `FenceState` before
+    /// the pipeline starts. Not part of `(A, W)` — extracted separately.
+    recovered_epoch: u64,
 }
 
 impl<A: Application, W: JournalWrite<A::Event>> JournaledApp<A, W> {
@@ -168,7 +174,12 @@ impl<A: Application, W: JournalWrite<A::Event>> JournaledApp<A, W> {
     /// than relying on `Default`.
     pub fn create(app: A, journal_path: &Path) -> Result<Self, JournaledAppError> {
         let writer = W::create(journal_path)?;
-        Ok(Self { app, writer })
+        // Genesis node — no prior promotion, so epoch starts at 0.
+        Ok(Self {
+            app,
+            writer,
+            recovered_epoch: 0,
+        })
     }
 
     /// Recover from an existing journal. Replays every archived segment
@@ -187,16 +198,20 @@ impl<A: Application, W: JournalWrite<A::Event>> JournaledApp<A, W> {
         snapshot_path: &Path,
         journal_path: &Path,
     ) -> Result<Self, JournaledAppError> {
-        let (app, snap_sequence, snap_chain_hash) = snapshot::load::<A>(snapshot_path)?;
-        Self::recover_inner(app, journal_path, Some((snap_sequence, snap_chain_hash)))
+        let (app, snap_sequence, snap_chain_hash, snap_epoch) = snapshot::load::<A>(snapshot_path)?;
+        Self::recover_inner(
+            app,
+            journal_path,
+            Some((snap_sequence, snap_chain_hash, snap_epoch)),
+        )
     }
 
     /// Shared multi-segment recovery driver.
     ///
-    /// `snapshot` carries `(sequence, chain_hash)` when the caller has
-    /// already restored from a snapshot; events with `seq <= sequence`
+    /// `snapshot` carries `(sequence, chain_hash, epoch)` when the caller
+    /// has already restored from a snapshot; events with `seq <= sequence`
     /// are skipped during replay but still walked so per-segment chain
-    /// validation runs.
+    /// validation runs. The epoch seeds the recovered-epoch accumulator.
     ///
     /// Cross-segment continuity is enforced before each segment is
     /// replayed: its header anchor must equal the previous segment's
@@ -206,17 +221,22 @@ impl<A: Application, W: JournalWrite<A::Event>> JournaledApp<A, W> {
     fn recover_inner(
         mut app: A,
         journal_path: &Path,
-        snapshot: Option<(u64, [u8; 32])>,
+        snapshot: Option<(u64, [u8; 32], u64)>,
     ) -> Result<Self, JournaledAppError> {
         let archives = melin_journal::segment::list_archives(journal_path)?;
+        // Highest fencing epoch observed during replay. Seeded from the
+        // snapshot's epoch (replay only walks entries strictly after the
+        // snapshot, so an `EpochBump` folded into the snapshot is invisible
+        // here) and raised by each replayed `EpochBump`.
+        let mut recovered_epoch = snapshot.map(|(_, _, e)| e).unwrap_or(0);
 
         let has_snapshot = snapshot.is_some();
-        let snap_sequence = snapshot.map(|(s, _)| s).unwrap_or(0);
+        let snap_sequence = snapshot.map(|(s, _, _)| s).unwrap_or(0);
         // Expected chain hash at the snapshot's anchor sequence. Compared
         // inside `replay_segment` when the anchor entry is observed, and
         // against a successor segment's header anchor when the snapshot
         // is anchored exactly at a rotation boundary.
-        let snap_chain_check: Option<[u8; 32]> = snapshot.map(|(_, h)| h);
+        let snap_chain_check: Option<[u8; 32]> = snapshot.map(|(_, h, _)| h);
 
         let mut reports: Vec<A::Report> = Vec::new();
         let mut last_drain_ns: u64 = 0;
@@ -257,6 +277,7 @@ impl<A: Application, W: JournalWrite<A::Event>> JournaledApp<A, W> {
                 snap_sequence,
                 snap_chain_check,
                 &mut last_drain_ns,
+                &mut recovered_epoch,
                 &mut reports,
                 /* allow_partial_tail = */ false,
             )?;
@@ -316,7 +337,11 @@ impl<A: Application, W: JournalWrite<A::Event>> JournaledApp<A, W> {
             }
             let anchor = prev_tail_hash.unwrap_or([0u8; 32]);
             let writer = W::create_continuing(journal_path, last_seq_seen + 1, anchor)?;
-            return Ok(Self { app, writer });
+            return Ok(Self {
+                app,
+                writer,
+                recovered_epoch,
+            });
         }
 
         let mut reader = JournalReader::<A::Event>::open(journal_path)?;
@@ -331,6 +356,7 @@ impl<A: Application, W: JournalWrite<A::Event>> JournaledApp<A, W> {
             snap_sequence,
             snap_chain_check,
             &mut last_drain_ns,
+            &mut recovered_epoch,
             &mut reports,
             /* allow_partial_tail = */ true,
         )?;
@@ -372,7 +398,11 @@ impl<A: Application, W: JournalWrite<A::Event>> JournaledApp<A, W> {
             "writer's rebuilt chain must equal the reader's accumulated chain"
         );
 
-        Ok(Self { app, writer })
+        Ok(Self {
+            app,
+            writer,
+            recovered_epoch,
+        })
     }
 
     /// Save a snapshot of the current application state. The snapshot
@@ -382,7 +412,16 @@ impl<A: Application, W: JournalWrite<A::Event>> JournaledApp<A, W> {
         // Wire-seq space: the allocator's last assigned sequence.
         let seq = crate::cursors::WireSeq::new(self.writer.next_sequence().saturating_sub(1));
         let chain_hash = self.writer.chain_hash().unwrap_or([0u8; 32]);
-        snapshot::save::<A>(&self.app, seq, chain_hash, snapshot_path)?;
+        // Runtime snapshots are produced by the shadow stage (which tracks
+        // the live epoch); this convenience method snapshots from the
+        // recovered epoch, correct for the boot/test paths that use it.
+        snapshot::save::<A>(
+            &self.app,
+            seq,
+            chain_hash,
+            self.recovered_epoch,
+            snapshot_path,
+        )?;
         Ok(())
     }
 
@@ -428,14 +467,25 @@ impl<A: Application, W: JournalWrite<A::Event>> JournaledApp<A, W> {
     }
 
     /// Construct from pre-built parts. Used by the server's
-    /// "snapshot-only" recovery path (journal missing post-rotation).
-    pub fn from_parts(app: A, writer: W) -> Self {
-        Self { app, writer }
+    /// "snapshot-only" recovery path (journal missing post-rotation),
+    /// which supplies the epoch read from the snapshot it loaded.
+    pub fn from_parts(app: A, writer: W, recovered_epoch: u64) -> Self {
+        Self {
+            app,
+            writer,
+            recovered_epoch,
+        }
     }
 
     /// Decompose into parts for the pipeline architecture.
     pub fn into_parts(self) -> (A, W) {
         (self.app, self.writer)
+    }
+
+    /// Fencing epoch recovered from the snapshot + journal. The boot site
+    /// reads this to seed the node's `FenceState`.
+    pub fn recovered_epoch(&self) -> u64 {
+        self.recovered_epoch
     }
 }
 
@@ -495,6 +545,7 @@ fn replay_entry<A: Application>(
     key_hash: u64,
     request_seq: u64,
     last_drain_ns: &mut u64,
+    recovered_epoch: &mut u64,
     reports: &mut Vec<A::Report>,
 ) {
     // Rebuild per-key HWM and capture whether this was a new request.
@@ -538,6 +589,11 @@ fn replay_entry<A: Application>(
         JournalEvent::Tick { now_ns } => {
             app.tick(*now_ns, reports);
         }
+        JournalEvent::EpochBump { epoch } => {
+            // Lineage metadata — advance the recovered epoch, never touch
+            // application state. Mirrors the live matching-stage dispatch.
+            crate::fence::observe_into(recovered_epoch, *epoch);
+        }
         JournalEvent::Shutdown => {
             // Pipeline-only sentinel; never written to disk and so
             // unreachable on the replay path. Treat defensively rather
@@ -566,6 +622,7 @@ fn replay_segment<A: Application>(
     snap_sequence: u64,
     snap_chain: Option<[u8; 32]>,
     last_drain_ns: &mut u64,
+    recovered_epoch: &mut u64,
     reports: &mut Vec<A::Report>,
     allow_partial_tail: bool,
 ) -> Result<(), JournaledAppError> {
@@ -595,6 +652,7 @@ fn replay_segment<A: Application>(
                         entry.key_hash,
                         entry.request_seq,
                         last_drain_ns,
+                        recovered_epoch,
                         reports,
                     );
                     reports.clear();
@@ -727,7 +785,7 @@ mod tests {
                 .unwrap();
         }
         writer.flush_batch_sync().unwrap();
-        JournaledApp::from_parts(app, writer)
+        JournaledApp::from_parts(app, writer, 0)
     }
 
     /// Compute the TestApp state that results from applying `events` in
@@ -769,6 +827,52 @@ mod tests {
 
         let recovered = TestApp_::recover(TestApp::new(), &path).unwrap();
         assert_eq!(*recovered.app(), TestApp::new());
+    }
+
+    /// A promoted primary writes an `EpochBump` as a journaled event. On
+    /// recovery the bump must advance the node's observed epoch (so it
+    /// re-advertises the post-promotion epoch on the next handshake) while
+    /// never touching application state — it is lineage metadata, like a
+    /// `Tick` the application never sees.
+    #[test]
+    fn recovers_epoch_from_journaled_epoch_bump() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("epoch.journal");
+
+        // Genesis: no promotion yet, so the recovered epoch is 0.
+        let ja = TestApp_::create(TestApp::new(), &path).unwrap();
+        assert_eq!(ja.recovered_epoch(), 0, "genesis epoch must be 0");
+        let (app, mut writer) = ja.into_parts();
+
+        // Journal an App event, then an EpochBump (the promotion marker),
+        // then another App event — the shape a promoted primary produces.
+        let s0 = writer.allocate_sequence();
+        writer
+            .encode_event(s0, 1_000, &JournalEvent::App(TestEvent::Add(5)), 1, 1)
+            .unwrap();
+        let s1 = writer.allocate_sequence();
+        writer
+            .encode_event(s1, 2_000, &JournalEvent::EpochBump { epoch: 3 }, 0, 0)
+            .unwrap();
+        let s2 = writer.allocate_sequence();
+        writer
+            .encode_event(s2, 3_000, &JournalEvent::App(TestEvent::Add(7)), 1, 2)
+            .unwrap();
+        writer.flush_batch_sync().unwrap();
+        drop(JournaledApp::from_parts(app, writer, 0));
+
+        let recovered = TestApp_::recover(TestApp::new(), &path).unwrap();
+        assert_eq!(
+            recovered.recovered_epoch(),
+            3,
+            "epoch must be recovered from the journaled EpochBump"
+        );
+        // Both App events applied (5 + 7); the EpochBump did not.
+        assert_eq!(
+            recovered.app().total,
+            12,
+            "App events must apply and the EpochBump must not touch app state"
+        );
     }
 
     /// An old-format journal must fail recovery with
@@ -851,7 +955,7 @@ mod tests {
         let ja = TestApp_::recover(TestApp::new(), &journal_path).unwrap();
         ja.save_snapshot(&snap_path).unwrap();
 
-        let (restored, seq, _chain) = snapshot::load::<TestApp>(&snap_path).unwrap();
+        let (restored, seq, _chain, _) = snapshot::load::<TestApp>(&snap_path).unwrap();
         assert_eq!(restored, expected_state(&events, 1));
         // Sequences are 1-indexed; after N events, next_sequence = N + 1
         // and save_snapshot records the last issued sequence (next - 1) = N.
@@ -955,7 +1059,7 @@ mod tests {
         // no sequence number.
         assert_eq!(ja.next_sequence(), pre_rotate_next_seq);
         // Snapshot captures the pre-rotate state.
-        let (snap_app, _seq, _chain) = snapshot::load::<TestApp>(&snap_path).unwrap();
+        let (snap_app, _seq, _chain, _) = snapshot::load::<TestApp>(&snap_path).unwrap();
         assert_eq!(snap_app, pre_rotate_state);
 
         // The new journal is fresh — recovering it without the snapshot
@@ -1374,13 +1478,14 @@ mod tests {
         std::fs::remove_file(&archive).unwrap();
 
         // Forge the snapshot's chain hash; sequence stays at the boundary.
-        let (loaded_app, snap_seq, real_hash) = snapshot::load::<TestApp>(&snap_path).unwrap();
+        let (loaded_app, snap_seq, real_hash, _) = snapshot::load::<TestApp>(&snap_path).unwrap();
         let bad_hash = [0xEE; 32];
         assert_ne!(real_hash, bad_hash);
         snapshot::save::<TestApp>(
             &loaded_app,
             crate::cursors::WireSeq::new(snap_seq),
             bad_hash,
+            0,
             &snap_path,
         )
         .unwrap();
@@ -1430,7 +1535,7 @@ mod tests {
         let ja = TestApp_::recover(TestApp::new(), &journal_path).unwrap();
         ja.save_snapshot(&snap_path).unwrap();
 
-        let (_, snap_seq, _) = snapshot::load::<TestApp>(&snap_path).unwrap();
+        let (_, snap_seq, _, _) = snapshot::load::<TestApp>(&snap_path).unwrap();
         assert_eq!(
             snap_seq,
             pre.len() as u64,
@@ -1616,7 +1721,7 @@ mod tests {
         ja.save_snapshot(&snap_path).unwrap();
         drop(ja);
 
-        let (_, snap_seq, _) = snapshot::load::<TestApp>(&snap_path).unwrap();
+        let (_, snap_seq, _, _) = snapshot::load::<TestApp>(&snap_path).unwrap();
         assert_eq!(snap_seq, 0, "fresh snapshot anchors at sequence 0");
 
         let recovered = TestApp_::recover_from_snapshot(&snap_path, &journal_path).unwrap();
@@ -1755,7 +1860,7 @@ mod tests {
         ja.save_snapshot(&snap_path).unwrap();
         drop(ja);
 
-        let (_app, snap_seq, _hash) = snapshot::load::<TestApp>(&snap_path).unwrap();
+        let (_app, snap_seq, _hash, _) = snapshot::load::<TestApp>(&snap_path).unwrap();
         assert!(snap_seq > 0);
 
         // Replace the journal with a stale copy that holds only the
@@ -1812,7 +1917,7 @@ mod tests {
         // sequence but a deliberately wrong chain hash. The journal
         // itself is unchanged, so recovery should compute the original
         // chain hash at the anchor sequence and detect the mismatch.
-        let (loaded_app, snap_seq, real_hash) = snapshot::load::<TestApp>(&snap_path).unwrap();
+        let (loaded_app, snap_seq, real_hash, _) = snapshot::load::<TestApp>(&snap_path).unwrap();
         assert_ne!(
             real_hash, [0u8; 32],
             "hash-chain feature must produce a non-sentinel hash for this test"
@@ -1822,6 +1927,7 @@ mod tests {
             &loaded_app,
             crate::cursors::WireSeq::new(snap_seq),
             bad_hash,
+            0,
             &snap_path,
         )
         .unwrap();
@@ -1876,7 +1982,7 @@ mod tests {
 
         // Round-trip the snapshot with a deliberately wrong chain hash
         // at the same anchor sequence.
-        let (loaded_app, snap_seq, real_hash) = snapshot::load::<TestApp>(&snap_path).unwrap();
+        let (loaded_app, snap_seq, real_hash, _) = snapshot::load::<TestApp>(&snap_path).unwrap();
         assert_ne!(
             real_hash, [0u8; 32],
             "hash-chain feature must produce a non-sentinel hash for this test"
@@ -1886,6 +1992,7 @@ mod tests {
             &loaded_app,
             crate::cursors::WireSeq::new(snap_seq),
             bad_hash,
+            0,
             &snap_path,
         )
         .unwrap();
@@ -2040,7 +2147,8 @@ mod tests {
         let final_seq = ja.next_sequence();
         drop(ja);
 
-        let (snap_app, snap_seq, snap_chain_hash) = snapshot::load::<TestApp>(&snap_path).unwrap();
+        let (snap_app, snap_seq, snap_chain_hash, _) =
+            snapshot::load::<TestApp>(&snap_path).unwrap();
         let snap_total = snap_app.total;
         assert!(snap_total > 0, "snapshot must capture pre-rotation state");
 
@@ -2097,7 +2205,7 @@ mod tests {
         let writer =
             BufferedWriter::create_continuing(&journal_path, snap_seq + 1, snap_chain_hash)
                 .unwrap();
-        let je = JournaledApp::from_parts(snap_app, writer);
+        let je = JournaledApp::from_parts(snap_app, writer, 0);
         assert_eq!(je.app().total, snap_total);
     }
 

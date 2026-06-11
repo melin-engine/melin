@@ -152,6 +152,7 @@ fn matching_stage_processes_events() {
         dummy_cursor,
         active_conns,
         None, // standalone — no halt check
+        Arc::new(crate::fence::FenceState::new(0)),
         false,
         1, // starting_wire_seq (test does not exercise the gate)
     );
@@ -224,6 +225,10 @@ fn matching_stage_stamps_wire_seq_in_journal_lockstep() {
     // assertion below rather than coincidentally satisfy them when
     // `starting == 1` makes input-seq and wire-seq numerically agree.
     const STARTING_WIRE_SEQ: u64 = 10;
+    // Keep a handle so we can assert the `EpochBump` below advances the
+    // observed epoch (it is sequenced like any non-query event but never
+    // reaches the application).
+    let fence = Arc::new(crate::fence::FenceState::new(0));
     let stage = MatchingStage::new(
         app,
         consumer,
@@ -232,6 +237,7 @@ fn matching_stage_stamps_wire_seq_in_journal_lockstep() {
         dummy_cursor,
         active_conns,
         None,
+        Arc::clone(&fence),
         false,
         STARTING_WIRE_SEQ,
     );
@@ -253,11 +259,15 @@ fn matching_stage_stamps_wire_seq_in_journal_lockstep() {
     //   3  | App(Add 2)           | yes → 11          | 11
     //   4  | App(Add 3)           | yes → 12          | 12
     //   5  | Tick                 | yes → 13          | 13
+    //   6  | EpochBump{7}         | yes → 14          | 14
     //
     // All slots carry `connection_id = 1` so events that produce no
-    // application reports (Tick) still emit a `BatchEnd` terminator on
-    // the output ring; that way every input event appears exactly once
-    // in the assertions below regardless of payload shape.
+    // application reports (Tick, EpochBump) still emit a `BatchEnd`
+    // terminator on the output ring; that way every input event appears
+    // exactly once in the assertions below regardless of payload shape.
+    // `EpochBump` is the regression guard for the seq-allocation policy:
+    // it must follow the *same* allocate rule as App/Tick (it is not a
+    // query), so wire space and journal-allocator space stay in lockstep.
     let conn_id = 1u64;
     let mut publish = |event: JournalEvent<TestEvent>| {
         input_producer.publish(InputSlot {
@@ -276,12 +286,13 @@ fn matching_stage_stamps_wire_seq_in_journal_lockstep() {
     publish(JournalEvent::App(TestEvent::Add(2)));
     publish(JournalEvent::App(TestEvent::Add(3)));
     publish(JournalEvent::Tick { now_ns: 1 });
+    publish(JournalEvent::EpochBump { epoch: 7 });
 
-    // Drain five output slots — one per input event under the
+    // Drain six output slots — one per input event under the
     // connection-id-1 invariant above.
-    let mut outputs: Vec<TestOutput> = Vec::with_capacity(5);
+    let mut outputs: Vec<TestOutput> = Vec::with_capacity(6);
     let mut spins = 0u64;
-    while outputs.len() < 5 {
+    while outputs.len() < 6 {
         if let Some((_, slot)) = output_consumer.try_consume() {
             outputs.push(slot);
         } else {
@@ -294,8 +305,16 @@ fn matching_stage_stamps_wire_seq_in_journal_lockstep() {
     let actual: Vec<u64> = outputs.iter().map(|s| s.wire_seq).collect();
     assert_eq!(
         actual,
-        vec![10, 10, 11, 12, 13],
+        vec![10, 10, 11, 12, 13, 14],
         "wire_seq stamping diverged from the journal allocator's per-event rule"
+    );
+
+    // The EpochBump must have advanced the observed epoch without ever
+    // touching application state.
+    assert_eq!(
+        fence.epoch(),
+        7,
+        "EpochBump did not advance the observed epoch"
     );
 
     // Sanity-check the output payload shape so a future change that
@@ -313,7 +332,14 @@ fn matching_stage_stamps_wire_seq_in_journal_lockstep() {
         .collect();
     assert_eq!(
         payload_kinds,
-        vec!["Report", "QueryResponse", "Report", "Report", "BatchEnd"],
+        vec![
+            "Report",
+            "QueryResponse",
+            "Report",
+            "Report",
+            "BatchEnd",
+            "BatchEnd"
+        ],
     );
 
     shutdown.store(true, Ordering::Relaxed);
@@ -364,6 +390,7 @@ fn allocator_wire_seq_and_gate_cursor_agree_across_rotation() {
         false,
         false,
         false,
+        Arc::new(crate::fence::FenceState::new(0)),
     );
     let mut input_producer = out.input_producer;
     let mut journal_stage = out.journal_stage;
@@ -548,6 +575,7 @@ fn recovery_resumes_allocator_wire_and_gate_agreement() {
             false,
             false,
             false,
+            Arc::new(crate::fence::FenceState::new(0)),
         );
         let mut input_producer = out.input_producer;
         let mut journal_stage = out.journal_stage;
@@ -605,6 +633,7 @@ fn recovery_resumes_allocator_wire_and_gate_agreement() {
         false,
         false,
         false,
+        Arc::new(crate::fence::FenceState::new(0)),
     );
     let mut input_producer = out.input_producer;
     let journal_stage = out.journal_stage;
@@ -708,6 +737,7 @@ fn replica_ack_cursor_tracks_primary_sequences_across_local_rotation() {
         Duration::ZERO,
         false,
         false,
+        Arc::new(crate::fence::FenceState::new(0)),
     );
     let mut input_producer = replica.input_producer;
     let mut journal_stage = replica.journal_stage;
@@ -847,6 +877,7 @@ fn full_pipeline_journal_and_matching_parallel() {
         false,
         false,
         false,
+        Arc::new(crate::fence::FenceState::new(0)),
     );
     let mut input_producer = out.input_producer;
     let journal_stage = out.journal_stage;
@@ -918,6 +949,7 @@ fn journal_stage_sends_replication_batches() {
         false,
         false,
         false,
+        Arc::new(crate::fence::FenceState::new(0)),
     );
     let mut output_consumer = out.output_consumers.pop().unwrap();
 
@@ -1035,6 +1067,7 @@ fn replication_cursor_always_starts_at_max() {
             false,
             false,
             false,
+            Arc::new(crate::fence::FenceState::new(0)),
         );
         assert!(out.replication_consumers.is_none());
         assert_eq!(
@@ -1062,6 +1095,7 @@ fn replication_cursor_always_starts_at_max() {
             false,
             false,
             false,
+            Arc::new(crate::fence::FenceState::new(0)),
         );
         assert!(out.replication_consumers.is_some());
         assert_eq!(
@@ -1189,6 +1223,7 @@ fn primary_and_replica_journals_contiguous_and_chain_identical() {
         false,
         false,
         false,
+        Arc::new(crate::fence::FenceState::new(0)),
     );
 
     // -------- replica --------
@@ -1200,6 +1235,7 @@ fn primary_and_replica_journals_contiguous_and_chain_identical() {
         Duration::ZERO,
         false,
         false,
+        Arc::new(crate::fence::FenceState::new(0)),
     );
 
     // Mark a replica as connected so the primary doesn't halt and
@@ -1837,6 +1873,7 @@ fn stats_query_reports_durable_wire_seq_across_recovery() {
             false,
             false,
             false,
+            Arc::new(crate::fence::FenceState::new(0)),
         );
         let mut input_producer = out.input_producer;
         let journal_stage = out.journal_stage;
@@ -1890,6 +1927,7 @@ fn stats_query_reports_durable_wire_seq_across_recovery() {
         false,
         false,
         false,
+        Arc::new(crate::fence::FenceState::new(0)),
     );
     let mut input_producer = out.input_producer;
     let journal_stage = out.journal_stage;

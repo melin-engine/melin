@@ -102,6 +102,13 @@ pub enum RejectReason {
     /// the transport refuses state-mutating events to preserve the
     /// persist-before-ack invariant.
     ReplicaDisconnected,
+    /// This node was superseded by a higher-epoch primary (fenced) and is
+    /// self-demoting. State-mutating events are refused because the node is
+    /// no longer the lineage's owner — the client should reconnect and will
+    /// land on the new primary. Distinct from [`Self::ReplicaDisconnected`]:
+    /// a superseded node may still have healthy replicas attached, so the
+    /// replica count is not what stopped it.
+    Superseded,
 }
 
 /// Wire-sequence space: the monotonic sequence the journal allocates per

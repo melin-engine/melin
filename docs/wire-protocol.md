@@ -408,6 +408,9 @@ Reports that an order was rejected by the matching engine.
 | 16   | ReplicaDisconnected   |
 | 17   | InvalidExpiry         |
 | 18   | InstrumentDisabled    |
+| 19   | ExceedsMaxOpenOrders  |
+| 20   | ExceedsOrderRate      |
+| 21   | Superseded            |
 
 ### Tag 16: EngineError
 

@@ -584,6 +584,7 @@ fn reject_reason_code(reason: &RejectReason) -> String {
         RejectReason::PostOnlyWouldCross => 99,
         RejectReason::DuplicateRequest => 6,
         RejectReason::ReplicaDisconnected => 99,
+        RejectReason::Superseded => 99,
         RejectReason::InvalidExpiry => 99,
         RejectReason::InstrumentDisabled => 14,
         _ => 99, // Other

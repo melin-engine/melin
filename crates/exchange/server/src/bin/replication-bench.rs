@@ -111,6 +111,7 @@ fn main() {
     let (exchange, writer) = engine.into_parts();
 
     let active_connections = Arc::new(AtomicU64::new(0));
+    let primary_fence = Arc::new(melin_transport_core::fence::FenceState::new(0));
 
     let pipeline = build_pipeline_with_replication(
         exchange,
@@ -123,6 +124,7 @@ fn main() {
         busy_spin,
         false, // enable_event_publisher
         false, // enable_shadow
+        Arc::clone(&primary_fence),
     );
 
     let mut input_producer = pipeline.input_producer;
@@ -205,6 +207,7 @@ fn main() {
         batch_size: BATCH_SIZE,
         heartbeat_secs: HEARTBEAT_SECS,
         busy_spin,
+        fence_state: Arc::clone(&primary_fence),
     };
 
     let s = Arc::clone(&shutdown);
@@ -233,6 +236,7 @@ fn main() {
     let s = Arc::clone(&shutdown);
     let promote = Arc::new(AtomicBool::new(false));
     let p = Arc::clone(&promote);
+    let replica_fence = Arc::new(melin_transport_core::fence::FenceState::new(0));
     let receiver_handle = std::thread::Builder::new()
         .name("bench-repl-receiver".into())
         .spawn(move || {
@@ -258,6 +262,7 @@ fn main() {
                         max_orders_burst: 0,
                     },
                 )),
+                replica_fence,
             );
         })
         .expect("spawn run_receiver");

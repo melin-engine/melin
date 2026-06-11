@@ -240,6 +240,12 @@ pub fn run<A: Application>(
             }
         }
 
+        // Fencing note: a superseded ex-primary exits through this same
+        // shutdown branch (`FenceState::fence_if_superseded` co-sets
+        // `shutdown`). Unlike the kernel response stage there is no
+        // best-effort flush here to suppress, so the fence needs no
+        // dedicated check — exiting stops releasing response frames onto
+        // the TX rings, which is the whole ack gate.
         if shutdown.load(Ordering::Relaxed) {
             utilization.busy.store(busy_count, Ordering::Relaxed);
             utilization.idle.store(idle_count, Ordering::Relaxed);

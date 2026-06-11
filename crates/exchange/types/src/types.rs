@@ -422,6 +422,12 @@ pub enum RejectReason {
     /// state-mutating operations are rejected until the replica reconnects
     /// to preserve the durability guarantee.
     ReplicaDisconnected,
+    /// This node was superseded by a higher-epoch primary (fenced) and is
+    /// self-demoting after a failover. State-mutating operations are
+    /// rejected because the node no longer owns the lineage; reconnect to
+    /// land on the new primary. Unlike `ReplicaDisconnected`, this can fire
+    /// while the node still has healthy replicas attached.
+    Superseded,
     /// GTD order with expiry_ns == 0 (missing expiry), or non-GTD order
     /// with expiry_ns != 0 (unexpected expiry).
     InvalidExpiry,

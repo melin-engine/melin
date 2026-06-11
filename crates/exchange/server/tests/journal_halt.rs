@@ -31,24 +31,27 @@ type OutputSlot = melin_transport_core::pipeline::OutputSlot<ExecutionReport, Qu
 type OutputPayload = melin_transport_core::pipeline::OutputPayload<ExecutionReport, QueryResponse>;
 
 /// Return type for `start_matching_with_halt`:
-/// (input_producer, output_consumer, connected_counter, shutdown, join_handle).
+/// (input_producer, output_consumer, connected_counter, fence, shutdown,
+/// join_handle).
 type MatchingHaltResult = (
     ring::Producer<InputSlot>,
     ring::Consumer<OutputSlot>,
     Arc<AtomicU32>,
+    Arc<melin_transport_core::fence::FenceState>,
     Arc<AtomicBool>,
     std::thread::JoinHandle<App>,
 );
 
 /// Return type for `build_matching_with_halt`:
-/// (input_producer, output_consumer, connected_counter, shutdown, stage).
-/// Same shape as `MatchingHaltResult` but with the stage handed back
-/// unspawned so a test can publish events and toggle `shutdown` before
-/// the matching loop ever runs.
+/// (input_producer, output_consumer, connected_counter, fence, shutdown,
+/// stage). Same shape as `MatchingHaltResult` but with the stage handed
+/// back unspawned so a test can publish events and toggle `shutdown`
+/// before the matching loop ever runs.
 type UnspawnedMatchingHaltResult = (
     ring::Producer<InputSlot>,
     ring::Consumer<OutputSlot>,
     Arc<AtomicU32>,
+    Arc<melin_transport_core::fence::FenceState>,
     Arc<AtomicBool>,
     MatchingStage<App>,
 );
@@ -98,6 +101,7 @@ fn build_matching_with_halt(initial_connected: u32) -> UnspawnedMatchingHaltResu
     let active_conns = Arc::new(AtomicU64::new(0));
     let counter = Arc::new(AtomicU32::new(initial_connected));
 
+    let fence = Arc::new(melin_transport_core::fence::FenceState::new(0));
     let stage = MatchingStage::new(
         app,
         consumer,
@@ -106,12 +110,20 @@ fn build_matching_with_halt(initial_connected: u32) -> UnspawnedMatchingHaltResu
         dummy_cursor,
         active_conns,
         Some(Arc::clone(&counter)),
+        Arc::clone(&fence),
         false,
         1, // starting_wire_seq (halt test does not exercise the gate)
     );
 
     let shutdown = Arc::new(AtomicBool::new(false));
-    (input_producer, output_consumer, counter, shutdown, stage)
+    (
+        input_producer,
+        output_consumer,
+        counter,
+        fence,
+        shutdown,
+        stage,
+    )
 }
 
 /// Build a minimal matching stage wired with a `replicas_connected`
@@ -119,10 +131,11 @@ fn build_matching_with_halt(initial_connected: u32) -> UnspawnedMatchingHaltResu
 /// exchange has one instrument plus a funded account so a `SubmitOrder`
 /// would normally succeed — the halt gate is what we're isolating.
 fn start_matching_with_halt(initial_connected: u32) -> MatchingHaltResult {
-    let (input, output, counter, shutdown, stage) = build_matching_with_halt(initial_connected);
+    let (input, output, counter, fence, shutdown, stage) =
+        build_matching_with_halt(initial_connected);
     let s = Arc::clone(&shutdown);
     let handle = std::thread::spawn(move || stage.run(&s));
-    (input, output, counter, shutdown, handle)
+    (input, output, counter, fence, shutdown, handle)
 }
 
 /// Consume outputs until the request terminator, returning all
@@ -146,7 +159,7 @@ fn collect_reports(output: &mut ring::Consumer<OutputSlot>) -> Vec<ExecutionRepo
 
 #[test]
 fn halt_rejects_submit_order() {
-    let (mut input, mut output, _flag, shutdown, handle) = start_matching_with_halt(0);
+    let (mut input, mut output, _flag, _fence, shutdown, handle) = start_matching_with_halt(0);
 
     input.publish(InputSlot {
         connection_id: 1,
@@ -178,9 +191,65 @@ fn halt_rejects_submit_order() {
     handle.join().unwrap();
 }
 
+/// The fence latch must halt the *live* matching loop, not only the
+/// shutdown drain. Replicas stay connected (count = 1) so the
+/// replica-disconnect halt is inert — the fence is the sole gate, exactly
+/// the split-brain topology where a superseded ex-primary still has a
+/// healthy replica attached. Without the live-loop check the order below
+/// would match and extend the stale journal lineage.
+#[test]
+fn fence_halts_live_matching_loop() {
+    let (mut input, mut output, _flag, fence, shutdown, handle) = start_matching_with_halt(1);
+
+    fence.fence();
+
+    input.publish(InputSlot {
+        connection_id: 1,
+        key_hash: 0xAA,
+        request_seq: 1,
+        sequence: 0,
+        timestamp_ns: 0,
+        event: JournalEvent::App(TradingEvent::SubmitOrder {
+            symbol: Symbol(1),
+            order: limit_order(100, AccountId(1), Side::Buy, 50, 10),
+        }),
+        publish_ts: mono_trace_ns(),
+        recv_ts: mono_trace_ns(),
+    });
+
+    let reports = collect_reports(&mut output);
+    assert_eq!(reports.len(), 1);
+    assert!(
+        matches!(
+            reports[0],
+            ExecutionReport::Rejected {
+                order_id: OrderId(100),
+                account: AccountId(1),
+                // A fenced node rejects with `Superseded`, not
+                // `ReplicaDisconnected`: the replica count is healthy here,
+                // so the reason must name the actual cause (a higher epoch
+                // demoted us), not a disconnect that didn't happen.
+                reason: RejectReason::Superseded,
+                ..
+            }
+        ),
+        "fenced node must reject client writes with Superseded even with a replica connected"
+    );
+
+    shutdown.store(true, Ordering::Relaxed);
+    let app = handle.join().unwrap();
+    // The order must not have touched the book — fencing rejected it
+    // before any engine state advanced.
+    assert_eq!(
+        app.open_order_count(AccountId(1)),
+        0,
+        "no order may rest on a fenced node's book"
+    );
+}
+
 #[test]
 fn halt_rejects_deposit() {
-    let (mut input, mut output, _flag, shutdown, handle) = start_matching_with_halt(0);
+    let (mut input, mut output, _flag, _fence, shutdown, handle) = start_matching_with_halt(0);
 
     input.publish(InputSlot {
         connection_id: 1,
@@ -213,7 +282,7 @@ fn halt_rejects_deposit() {
 
 #[test]
 fn halt_allows_query_stats() {
-    let (mut input, mut output, _flag, shutdown, handle) = start_matching_with_halt(0);
+    let (mut input, mut output, _flag, _fence, shutdown, handle) = start_matching_with_halt(0);
 
     input.publish(InputSlot {
         connection_id: 1,
@@ -255,7 +324,7 @@ fn halt_allows_query_stats() {
 
 #[test]
 fn halt_then_reconnect_resumes_trading() {
-    let (mut input, mut output, flag, shutdown, handle) = start_matching_with_halt(0);
+    let (mut input, mut output, flag, _fence, shutdown, handle) = start_matching_with_halt(0);
 
     // Submit while halted — rejected.
     input.publish(InputSlot {
@@ -324,7 +393,7 @@ fn halt_then_reconnect_resumes_trading() {
 /// subsequent client request rejects with `UnknownSymbol`.
 #[test]
 fn seed_event_bypasses_halt() {
-    let (mut input, mut output, _flag, shutdown, handle) = start_matching_with_halt(0);
+    let (mut input, mut output, _flag, _fence, shutdown, handle) = start_matching_with_halt(0);
 
     input.publish(InputSlot {
         connection_id: 0,
@@ -382,7 +451,7 @@ fn seed_event_bypasses_halt() {
 /// place.
 #[test]
 fn seed_event_during_drain_bypasses_halt() {
-    let (mut input, mut output, _flag, shutdown, stage) = build_matching_with_halt(0);
+    let (mut input, mut output, _flag, _fence, shutdown, stage) = build_matching_with_halt(0);
 
     // Publish the seed before the matching thread starts so the event
     // sits in the input ring. Flipping `shutdown` to true before spawn

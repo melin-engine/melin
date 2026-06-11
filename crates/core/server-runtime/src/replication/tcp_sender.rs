@@ -43,6 +43,10 @@ pub struct Sender {
     pub batch_size: usize,
     pub heartbeat_secs: u64,
     pub busy_spin: bool,
+    /// Node fencing state. Read to stamp the primary's epoch onto each
+    /// `StreamStart`, and to self-demote when a replica handshakes with a
+    /// higher epoch (this primary has been superseded). See `crate::fence`.
+    pub fence_state: Arc<melin_transport_core::fence::FenceState>,
 }
 
 /// Run the replication sender. Listens for replica connections,
@@ -71,6 +75,7 @@ pub fn run_sender<A: Application>(
         batch_size,
         heartbeat_secs,
         busy_spin,
+        fence_state,
     } = config;
     let listener = match TcpListener::bind(bind_addr) {
         Ok(l) => l,
@@ -248,6 +253,7 @@ pub fn run_sender<A: Application>(
                     let slot_metrics = Arc::clone(&metrics);
                     let slot_active = Arc::clone(&active_flags[slot_idx]);
                     let slot_evict = Arc::clone(&evict_flags[slot_idx]);
+                    let slot_fence = Arc::clone(&fence_state);
                     let handler_core = handler_cores[slot_idx];
                     let shutdown_flag = shutdown as *const AtomicBool as usize;
                     let ready_flag = replica_ready as *const AtomicBool as usize;
@@ -287,6 +293,7 @@ pub fn run_sender<A: Application>(
                                 active_flag: &slot_active,
                                 evict_flag: &slot_evict,
                                 metrics: &slot_metrics,
+                                fence_state: &slot_fence,
                                 slot_idx,
                                 batch_size,
                                 heartbeat_secs,
@@ -325,6 +332,7 @@ struct SlotContext<'a> {
     active_flag: &'a AtomicBool,
     evict_flag: &'a AtomicBool,
     metrics: &'a ReplicationMetrics,
+    fence_state: &'a melin_transport_core::fence::FenceState,
     slot_idx: usize,
     batch_size: usize,
     heartbeat_secs: u64,
@@ -359,6 +367,7 @@ fn handle_replica_connection<A: Application>(
         active_flag,
         evict_flag: _,
         metrics,
+        fence_state,
         slot_idx,
         batch_size: _,
         heartbeat_secs,
@@ -388,8 +397,29 @@ fn handle_replica_connection<A: Application>(
 
     info!(
         last_sequence = handshake.last_sequence,
+        replica_epoch = handshake.epoch,
         "replica handshake received"
     );
+
+    // Fence: a replica advertising an epoch higher than ours means a
+    // promotion happened that this node missed — we are a stale ex-primary.
+    // The policy (latch fenced + trigger shutdown) lives on `FenceState` so
+    // the kernel-TCP and DPDK senders cannot drift; the matching stage
+    // halts new client writes, the response gate stops acking, and the node
+    // winds down for the operator to restart it as a replica. Refuse this
+    // connection so we send no stale stream.
+    let our_epoch = fence_state.epoch();
+    if let Some(first_latch) = fence_state.fence_if_superseded(handshake.epoch, shutdown) {
+        if first_latch {
+            error!(
+                replica_epoch = handshake.epoch,
+                our_epoch,
+                "fenced: a replica advertises a higher epoch — this primary has been \
+                 superseded; self-demoting and shutting down"
+            );
+        }
+        return Err(io::Error::other("fenced by higher-epoch replica"));
+    }
 
     // Mark this slot as catching up. Cleared when entering the live loop.
     metrics.catching_up[slot_idx].store(true, Ordering::Relaxed);
@@ -416,6 +446,7 @@ fn handle_replica_connection<A: Application>(
             handshake.last_sequence,
             lineage_start,
             lineage_anchor,
+            fence_state.epoch(),
             &mut send_buf,
         );
         publish(&send_buf)?;
@@ -527,6 +558,7 @@ fn live_stream_uring(
         replica_ready: _,
         active_flag: _,
         heartbeat_secs: _,
+        fence_state: _,
     } = ctx;
     let slot_idx = *slot_idx;
     let batch_size = *batch_size;

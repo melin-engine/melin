@@ -634,7 +634,7 @@ mod tests {
         je.save_snapshot(&snapshot_path).unwrap();
 
         // Load snapshot into a fresh exchange.
-        let (restored, _seq, _chain) = snapshot::load::<App>(&snapshot_path).unwrap();
+        let (restored, _seq, _chain, _epoch) = snapshot::load::<App>(&snapshot_path).unwrap();
         let hwm = restored.snapshot_key_hwm();
         assert_eq!(hwm.len(), 1);
         assert_eq!(hwm[0], (key_hash, 5));

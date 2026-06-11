@@ -52,6 +52,7 @@ pub fn run<A: Application>(
     fsync_state: Arc<SeqLock<FsyncState>>,
     shutdown: &AtomicBool,
     busy_spin: bool,
+    initial_epoch: u64,
 ) {
     // Scratch buffer for app methods that require a reports Vec.
     // Cleared after each call — shadow discards all reports.
@@ -78,6 +79,13 @@ pub fn run<A: Application>(
     // Highest event timestamp the shadow's scheduler has drained against.
     // See `dispatch_event` for the per-event drain rationale.
     let mut last_drain_ns: u64 = 0;
+    // Fencing epoch as of the shadow's consumed position. Seeded from the
+    // recovered epoch (the live pipeline's starting epoch) because the
+    // shadow only sees events published *after* boot — any `EpochBump`
+    // already folded into the recovered app state never crosses the ring.
+    // Advanced by replaying `EpochBump` events and stamped into each
+    // snapshot so a snapshot-bootstrapped node restores the right epoch.
+    let mut shadow_epoch: u64 = initial_epoch;
 
     loop {
         if shutdown.load(Ordering::Relaxed) {
@@ -95,7 +103,7 @@ pub fn run<A: Application>(
                     .tick(snapshot_interval, busy_spin || idle_spins < 1000)
                     .is_some()
             {
-                try_save_snapshot::<A>(&app, &consumer, &fsync_state, &snapshot_path);
+                try_save_snapshot::<A>(&app, &consumer, &fsync_state, &snapshot_path, shadow_epoch);
             }
             idle_wait(&mut idle_spins, busy_spin);
             continue;
@@ -114,13 +122,14 @@ pub fn run<A: Application>(
                 slot.key_hash,
                 slot.request_seq,
                 &mut last_drain_ns,
+                &mut shadow_epoch,
                 &mut reports,
             );
         }
 
         // Check if a snapshot is due.
         if snapshot_timer.tick(snapshot_interval, true).is_some() {
-            try_save_snapshot::<A>(&app, &consumer, &fsync_state, &snapshot_path);
+            try_save_snapshot::<A>(&app, &consumer, &fsync_state, &snapshot_path, shadow_epoch);
         }
     }
 }
@@ -138,13 +147,14 @@ fn try_save_snapshot<A: Application>(
     consumer: &ring::Consumer<InputSlot<A::Event>>,
     fsync_state: &SeqLock<FsyncState>,
     path: &std::path::Path,
+    epoch: u64,
 ) {
     let state = fsync_state.load();
     // Both ring-index space — compare the raw positions.
     if state.input_ring_seq.get() != consumer.next_read() {
         return;
     }
-    match snapshot::save::<A>(app, state.journal_seq, state.chain_hash, path) {
+    match snapshot::save::<A>(app, state.journal_seq, state.chain_hash, epoch, path) {
         Ok(()) => {
             info!(
                 journal_seq = state.journal_seq.get(),
@@ -179,6 +189,7 @@ fn dispatch_event<A: Application>(
     key_hash: u64,
     request_seq: u64,
     last_drain_ns: &mut u64,
+    epoch: &mut u64,
     reports: &mut Vec<A::Report>,
 ) {
     reports.clear();
@@ -227,6 +238,11 @@ fn dispatch_event<A: Application>(
             // (tests, manually constructed events).
             app.tick(now_ns, reports);
         }
+        JournalEvent::EpochBump { epoch: bump } => {
+            // Lineage metadata — advance the shadow's tracked epoch so the
+            // next snapshot records it. Never touches application state.
+            crate::fence::observe_into(epoch, bump);
+        }
         JournalEvent::Shutdown => {
             // Pipeline-only sentinel — handled at the run-loop level by
             // exiting; should never reach this dispatch.
@@ -269,6 +285,7 @@ mod tests {
                     fsync_state,
                     &shutdown2,
                     false,
+                    0, // initial_epoch
                 );
             })
             .unwrap();
@@ -315,6 +332,7 @@ mod tests {
                     fsync_state,
                     &shutdown2,
                     false,
+                    0, // initial_epoch
                 );
             })
             .unwrap();
@@ -359,7 +377,7 @@ mod tests {
         // Verify the snapshot file was created and is loadable, and that
         // both adds are reflected in the restored app's running total.
         assert!(snap_path.exists(), "snapshot file should exist");
-        let (restored, _seq, chain) = snapshot::load::<TestApp>(&snap_path).unwrap();
+        let (restored, _seq, chain, _epoch) = snapshot::load::<TestApp>(&snap_path).unwrap();
         assert_eq!(chain, [0xAB; 32]); // chain hash from SeqLock
         assert_eq!(restored.total, 1500);
     }
@@ -386,7 +404,17 @@ mod tests {
     fn dispatch(app: &mut TestApp, event: &JournalEvent<TestEvent>, ts: u64, seq: u64) {
         let mut reports = Vec::new();
         let mut drain = 0u64;
-        dispatch_event(app, event, ts, KEY, seq, &mut drain, &mut reports);
+        let mut epoch = 0u64;
+        dispatch_event(
+            app,
+            event,
+            ts,
+            KEY,
+            seq,
+            &mut drain,
+            &mut epoch,
+            &mut reports,
+        );
     }
 
     #[test]
@@ -403,6 +431,7 @@ mod tests {
             KEY,
             10,
             &mut drain,
+            &mut 0u64,
             &mut reports,
         );
 
@@ -444,6 +473,7 @@ mod tests {
             KEY,
             1,
             &mut drain,
+            &mut 0u64,
             &mut reports,
         );
         assert_eq!(app.ticks, 1, "forward timestamp must drain clock once");
@@ -457,6 +487,7 @@ mod tests {
             KEY,
             2,
             &mut drain,
+            &mut 0u64,
             &mut reports,
         );
         assert_eq!(app.ticks, 1, "backward timestamp must not re-drain");
@@ -469,6 +500,7 @@ mod tests {
             KEY,
             3,
             &mut drain,
+            &mut 0u64,
             &mut reports,
         );
         assert_eq!(app.ticks, 1, "equal timestamp must not re-drain");
@@ -481,6 +513,7 @@ mod tests {
             KEY,
             4,
             &mut drain,
+            &mut 0u64,
             &mut reports,
         );
         assert_eq!(app.ticks, 2);
@@ -531,6 +564,7 @@ mod tests {
                 0, // key_hash sentinel
                 1, // same seq each time — would be a duplicate for any real key
                 &mut drain,
+                &mut 0u64,
                 &mut reports,
             );
         }
@@ -563,6 +597,7 @@ mod tests {
             KEY,
             10,
             &mut drain,
+            &mut 0u64,
             &mut reports,
         );
         assert_eq!(app.total, 5);
@@ -577,6 +612,7 @@ mod tests {
             KEY,
             10,
             &mut drain,
+            &mut 0u64,
             &mut reports,
         );
         assert_eq!(
@@ -623,6 +659,7 @@ mod tests {
                     fsync_state,
                     &shutdown2,
                     false,
+                    0, // initial_epoch
                 );
             })
             .unwrap();
@@ -676,6 +713,7 @@ mod tests {
                     fsync_state,
                     &shutdown2,
                     false,
+                    0, // initial_epoch
                 );
             })
             .unwrap();
@@ -697,7 +735,7 @@ mod tests {
             std::thread::sleep(Duration::from_millis(5));
         }
         assert!(snap_path.exists(), "first snapshot must be written");
-        let (_, _, hash_initial) = snapshot::load::<TestApp>(&snap_path).unwrap();
+        let (_, _, hash_initial, _) = snapshot::load::<TestApp>(&snap_path).unwrap();
         assert_eq!(hash_initial, [0x11; 32], "first snapshot has initial hash");
 
         // Phase 2: update FsyncState (new hash + advanced ring cursor),
@@ -720,7 +758,7 @@ mod tests {
 
         let deadline = Instant::now() + Duration::from_secs(10);
         loop {
-            if let Ok((_, _, hash)) = snapshot::load::<TestApp>(&snap_path)
+            if let Ok((_, _, hash, _)) = snapshot::load::<TestApp>(&snap_path)
                 && hash == [0x22; 32]
             {
                 break;
@@ -774,6 +812,7 @@ mod tests {
                     fsync_state,
                     &shutdown2,
                     false,
+                    0, // initial_epoch
                 );
             })
             .unwrap();
@@ -802,14 +841,14 @@ mod tests {
         // between snapshot emission and the next event arriving.
         let deadline = Instant::now() + Duration::from_secs(10);
         loop {
-            if let Ok((restored, _, _)) = snapshot::load::<TestApp>(&snap_path)
+            if let Ok((restored, _, _, _)) = snapshot::load::<TestApp>(&snap_path)
                 && restored.total == 150
             {
                 break;
             }
             if Instant::now() >= deadline {
                 let observed = snapshot::load::<TestApp>(&snap_path)
-                    .map(|(a, _, _)| a.total)
+                    .map(|(a, _, _, _)| a.total)
                     .unwrap_or(u64::MAX);
                 panic!("snapshot did not reach total=150 (observed={observed})");
             }

@@ -139,8 +139,42 @@ replicas connected (see above) — the operator's playbook is to either
 spin up new replicas immediately or send `DURABILITY local` to resume
 trading at reduced durability.
 
-The old primary must be stopped to prevent split-brain. Automatic
-fencing is not yet implemented; see Limitations.
+The old primary should still be stopped promptly, but epoch fencing
+(below) now closes the split-brain window if it isn't: the moment the
+stale primary hears from any node that observed the promotion, it
+stops accepting and acknowledging orders and shuts itself down.
+
+## Fencing epochs
+
+Every promotion advances a cluster-wide **fencing epoch**, recorded in
+the journal as the first entry of the new primary's tenure and
+replicated to every node like any other event. The epoch survives
+restarts and snapshots, and establishes which primary tenure any given
+order belongs to.
+
+The epoch is exchanged on every replication connection, in both
+directions, and enforces two rules:
+
+- **A superseded primary self-demotes.** If a connecting replica
+  advertises a higher epoch than the primary's own, a promotion
+  happened that this primary missed — it is stale. It immediately
+  stops accepting orders, stops acknowledging in-flight ones (those
+  clients see a connection reset and should reconcile on reconnect),
+  reports `halted` on the health endpoint, logs an error, and shuts
+  down. Restart it with `--replica-of` pointing at the new primary to
+  rejoin the cluster.
+- **A replica refuses a stale primary.** If a primary advertises a
+  lower epoch than the replica has already observed, the replica
+  refuses to follow it (its lineage would overwrite newer state),
+  logs a warning, and retries with backoff — check the `--replica-of`
+  target if this fires persistently.
+
+No operator action is needed to *enable* fencing; it is always on
+when replication is configured. The remaining gap is two promotions
+issued independently during the same outage: both new primaries land
+on the same epoch and fencing cannot distinguish them. Promote exactly
+one replica per failover — coordinated election lands with the
+automatic-failover roadmap item.
 
 ## Snapshot transfer
 
@@ -178,14 +212,14 @@ connection separate from the client protocol.
 
 | Message | Layout | Purpose |
 |---|---|---|
-| Handshake | `[len:u32][type=0x01][last_sequence:u64][chain_hash:[u8;32]]` | Initial connection — replica reports its last durable sequence and the chain hash at that point. |
+| Handshake | `[len:u32][type=0x01][last_sequence:u64][chain_hash:[u8;32]][epoch:u64][protocol_version:u16]` | Initial connection — replica reports its last durable sequence, the chain hash at that point, its fencing epoch, and the replication protocol version it speaks. A version mismatch is rejected with an explicit log line naming both versions. |
 | Ack | `[len:u32][type=0x02][acked_sequence:u64][in_memory_sequence:u64]` | Replica confirms persisted writes up to `acked_sequence` and pre-journal receipt up to `in_memory_sequence`. Both fields are populated on every ack so the primary's gate can evaluate any mode without separate ack streams. |
 
 ### Primary → Replica
 
 | Message | Layout | Purpose |
 |---|---|---|
-| StreamStart | `[len:u32][type=0x10][start_sequence:u64][segment_start_sequence:u64][anchor_hash:[u8;32]]` | Confirms the handshake; carries the journal-segment identity (starting sequence + chain anchor) a fresh replica creates its local journal with. The replica's segment is byte-identical to the primary's until the first rotation on either node — rotations are local, so segment boundaries diverge after that even though the event stream stays identical (alignment lands with primary-driven rotation; see Limitations). |
+| StreamStart | `[len:u32][type=0x10][start_sequence:u64][segment_start_sequence:u64][anchor_hash:[u8;32]][epoch:u64]` | Confirms the handshake; carries the primary's fencing epoch and the journal-segment identity (starting sequence + chain anchor) a fresh replica creates its local journal with. The replica's segment is byte-identical to the primary's until the first rotation on either node — rotations are local, so segment boundaries diverge after that even though the event stream stays identical (alignment lands with primary-driven rotation; see Limitations). |
 | NeedSnapshot | `[len:u32][type=0x11]` | Replica is too far behind the live journal and archives have been purged — triggers snapshot transfer. |
 | SnapshotBegin | `[len:u32][type=0x13][snapshot_len:u64][snap_sequence:u64][snap_chain_hash:[u8;32]]` | Start of snapshot transfer with metadata. |
 | SnapshotChunk | `[len:u32][type=0x14][data...]` | Chunk of snapshot data (up to 64 KiB). |
@@ -237,8 +271,32 @@ guaranteed to hold the acked frontier (by contract two nodes had each
 acked event on disk), so the top two journals being tied is the
 normal-case post-recovery state.
 
+## Upgrade and rollback notes
+
+- **Upgrade primaries and replicas together.** The replication
+  protocol carries a version number and frame layouts change between
+  releases; a mixed-version pair refuses to connect, logging which
+  side is behind. Replication (and trading, under the
+  replicas-required durability modes) is down until the versions
+  match, so upgrade the whole cluster in one maintenance window.
+- **Snapshots are forward-compatible.** This release reads snapshots
+  written by pre-fencing releases (their epoch is taken as 0, which
+  is exact — they predate any promotion). No action needed before
+  upgrading.
+- **Rolling back across a promotion needs care.** Once a promotion
+  has been journaled, binaries older than this release cannot replay
+  that journal — they stop at the promotion marker and report the
+  entry as unreadable. The journal is healthy; the old binary simply
+  predates the entry type. To roll back anyway, restore the node from
+  a snapshot taken by the older release, or re-sync it as a fresh
+  replica of a node running the older version.
+
 ## Observability
 
+- The health endpoint's `trading`/`halted` flag (and the
+  `melin_trading_active` gauge) reports `halted` on a fenced node even
+  while replicas remain connected — point load-balancer probes and
+  failover alerting at it.
 - `melin_durability_policy_degraded` (Prometheus gauge on the health
   endpoint) — `1` while the active mode can't be satisfied by the
   current cluster shape, `0` otherwise. Alert on sustained `1`.
@@ -290,13 +348,16 @@ plus periodically in the live stream. On mismatch the replica will be
 re-synced through the existing snapshot path, with its divergent
 journal archived for the audit trail rather than deleted.
 
-### No automatic split-brain fencing
+### Fencing cannot distinguish concurrent promotions
 
-After manual promotion, the old primary must be stopped manually. If
-it stays up, two primaries will accept writes. Epoch-based fencing is
-on the roadmap as a standalone prerequisite for automatic failover —
-it lands before the Raft integration and closes this window for the
-manual flow as well.
+Epoch fencing (see above) demotes a stale primary as soon as any
+higher-epoch node contacts it, but two replicas promoted independently
+during the same outage land on the *same* epoch and neither fences the
+other. Until coordinated election lands (next item), the operator
+playbook is: promote exactly one replica per failover. A stale primary
+that never hears from a higher-epoch node (e.g. fully partitioned with
+its own replica set) also keeps trading until the partition heals —
+fencing triggers on contact, not on a timer.
 
 ### No automatic failover
 

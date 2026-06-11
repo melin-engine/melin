@@ -300,29 +300,22 @@ pub fn snapshot_transfer_with<E: AppEvent>(
     publisher(&send_buf)?;
     send_buf.clear();
 
-    // Read and validate snapshot.
+    // Read and validate snapshot. The shared header parser enforces the
+    // magic *and* the transport-version gate — serving a file the replica's
+    // `snapshot::load` would reject (after it already wiped its local state
+    // for the rebase) must fail here, on the primary, with the path in the
+    // error. v1 files (pre-fencing) parse with epoch 0.
     let snap_data = std::fs::read(&snap_path)
         .map_err(|e| io::Error::other(format!("read snapshot {}: {e}", snap_path.display())))?;
-    if snap_data.len() < 48 {
-        return Err(io::Error::other("snapshot file too small for header"));
-    }
-    let magic = u32::from_le_bytes(
-        snap_data[0..4]
-            .try_into()
-            .expect("bounds checked: snap_data has at least 48 bytes"),
-    );
-    if magic != 0x534E_4150 {
-        return Err(io::Error::other(format!(
-            "snapshot file has invalid magic: {magic:#x} (expected 0x534e4150)"
-        )));
-    }
-    let snap_sequence = u64::from_le_bytes(
-        snap_data[8..16]
-            .try_into()
-            .expect("bounds checked: snap_data has at least 48 bytes"),
-    );
-    let mut snap_chain_hash = [0u8; 32];
-    snap_chain_hash.copy_from_slice(&snap_data[16..48]);
+    let header = crate::snapshot::SnapshotHeader::parse(&snap_data).map_err(|e| {
+        io::Error::other(format!(
+            "snapshot {} not servable for transfer: {e}",
+            snap_path.display()
+        ))
+    })?;
+    let snap_sequence = header.sequence;
+    let snap_chain_hash = header.chain_hash;
+    let snap_epoch = header.epoch;
     let snap_len = snap_data.len() as u64;
 
     info!(
@@ -366,6 +359,7 @@ pub fn snapshot_transfer_with<E: AppEvent>(
         snap_sequence,
         snap_sequence + 1,
         snap_chain_hash,
+        snap_epoch,
         &mut send_buf,
     );
     publisher(&send_buf)?;

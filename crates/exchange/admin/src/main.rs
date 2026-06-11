@@ -1348,6 +1348,7 @@ fn format_report(report: &ExecutionReport) -> String {
                 RejectReason::HasRestingOrders => "has resting orders",
                 RejectReason::DuplicateRequest => "duplicate request",
                 RejectReason::ReplicaDisconnected => "replica disconnected",
+                RejectReason::Superseded => "superseded (fenced)",
                 RejectReason::InvalidExpiry => "invalid expiry",
                 RejectReason::InstrumentDisabled => "instrument disabled",
                 RejectReason::ExceedsMaxOpenOrders => "exceeds max open orders",
