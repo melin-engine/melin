@@ -18,7 +18,6 @@ use std::time::Duration;
 
 use melin_journal::replication::REPLICATION_RING_CAPACITY;
 use melin_journal::{BufferedWriter, JournalEvent, JournalReader, SectorWriter};
-use melin_pipeline::padding::Sequence;
 use melin_pipeline::ring;
 
 use crate::cursors::{DurableWireSeqCursor, PipelineCursors, WireSeq};
@@ -42,12 +41,7 @@ type TestOutput = OutputSlot<TestReport, TestQuery>;
 /// A standalone durable-wire-seq handle for matching-stage-only tests
 /// (nothing publishes into it; the stage reads it once per batch).
 fn dummy_durable_cursor() -> DurableWireSeqCursor {
-    PipelineCursors::new(
-        WireSeq::new(0),
-        Arc::new(Sequence::new(AtomicU64::new(0))),
-        Arc::new(Sequence::new(AtomicU64::new(0))),
-    )
-    .durable_wire_seq()
+    DurableWireSeqCursor::detached(WireSeq::new(0))
 }
 
 /// First user-event sequence. Chain metadata lives in the file header,

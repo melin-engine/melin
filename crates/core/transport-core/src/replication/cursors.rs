@@ -52,6 +52,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use tracing::error;
 
+use crate::cursors::{SlotAcked, WireSeq};
+
 use super::metrics::ReplicationMetrics;
 use super::protocol::Ack;
 
@@ -59,13 +61,11 @@ use super::protocol::Ack;
 /// topology cap (see `ReplicationMetrics` for the same rationale).
 const SLOTS: usize = 2;
 
-/// A disengaged slot's parking value. Defined as the reader-side sentinel
-/// (`PipelineCursors::NO_REPLICA`) on purpose: `min`/`max` over all-disengaged
-/// slots propagate it into the shared cursors, where
-/// `PipelineCursors::load_replica_quorum_acked` maps it to `None`. The two
-/// modules must agree on this value or the health endpoint would misread a
-/// disengaged cluster as an absurdly-far-ahead replica.
-const DISENGAGED: u64 = crate::cursors::PipelineCursors::NO_REPLICA;
+/// A disengaged slot's parking value, from the shared [`SlotAcked`] space
+/// type: `min` over all-disengaged slots propagates it into the shared
+/// cursors, where `PipelineCursors::load_replica_quorum_acked` maps it to
+/// `None` (and the max recompute below skips it explicitly).
+const DISENGAGED: u64 = SlotAcked::DISENGAGED.raw();
 
 /// A replica reported a cursor that cannot be true: ahead of what the
 /// primary ever sent it, or with the persisted track ahead of the
@@ -152,7 +152,10 @@ impl ReplicaCursors {
     pub fn seed_on_handshake(&self, slot: usize, handshake_last_sequence: u64) {
         self.metrics.acked_sequence[slot].store(handshake_last_sequence, Ordering::Relaxed);
         self.metrics.in_memory_sequence[slot].store(handshake_last_sequence, Ordering::Relaxed);
-        self.slot_acked[slot].store(handshake_last_sequence + 1, Ordering::Release);
+        self.slot_acked[slot].store(
+            SlotAcked::from_acked(WireSeq::new(handshake_last_sequence)).raw(),
+            Ordering::Release,
+        );
         self.recompute_shared();
     }
 
@@ -201,7 +204,10 @@ impl ReplicaCursors {
         self.metrics.acked_sequence[slot].store(ack.acked_sequence, Ordering::Relaxed);
         self.metrics.in_memory_sequence[slot].store(ack.in_memory_sequence, Ordering::Relaxed);
         self.metrics.acks_received[slot].fetch_add(1, Ordering::Relaxed);
-        self.slot_acked[slot].store(ack.acked_sequence + 1, Ordering::Release);
+        self.slot_acked[slot].store(
+            SlotAcked::from_acked(WireSeq::new(ack.acked_sequence)).raw(),
+            Ordering::Release,
+        );
         self.recompute_shared();
         Ok(())
     }
@@ -233,11 +239,23 @@ impl ReplicaCursors {
     /// must be able to *decrease*: a second replica connecting with a
     /// lower acked position lowers the min, and a disconnect can lower
     /// the max back to the survivor's position.
+    ///
+    /// The min needs no disengaged handling (`min(x, DISENGAGED) == x`,
+    /// and all-disengaged yields the sentinel), but the max must skip
+    /// disengaged slots explicitly — otherwise one parked slot's sentinel
+    /// masquerades as the fastest replica whenever fewer than two replicas
+    /// are connected.
     fn recompute_shared(&self) {
         let a = self.slot_acked[0].load(Ordering::Acquire);
         let b = self.slot_acked[1].load(Ordering::Acquire);
         self.cursor_min.store(a.min(b), Ordering::Release);
-        self.cursor_max.store(a.max(b), Ordering::Release);
+        let max = match (a == DISENGAGED, b == DISENGAGED) {
+            (true, true) => DISENGAGED,
+            (true, false) => b,
+            (false, true) => a,
+            (false, false) => a.max(b),
+        };
+        self.cursor_max.store(max, Ordering::Release);
     }
 }
 
@@ -273,13 +291,14 @@ mod tests {
     }
 
     #[test]
-    fn seed_engages_min_and_leaves_max_unconstrained() {
+    fn seed_engages_both_cursors_at_the_single_slot() {
         let (min, max, metrics, cursors) = store();
         cursors.seed_on_handshake(0, 41);
-        // Slot 0 gates the min at 42 (= last + 1); slot 1 is still
-        // disengaged so the max stays at the MAX sentinel.
+        // Slot 0 is the only engaged replica, so it is simultaneously the
+        // slowest (min) and the fastest (max) at 42 (= last + 1). The
+        // disengaged slot 1 must not leak its parking sentinel into the max.
         assert_eq!(min.load(Ordering::Acquire), 42);
-        assert_eq!(max.load(Ordering::Acquire), u64::MAX);
+        assert_eq!(max.load(Ordering::Acquire), 42);
         assert_eq!(metrics.acked_sequence[0].load(Ordering::Relaxed), 41);
         assert_eq!(metrics.in_memory_sequence[0].load(Ordering::Relaxed), 41);
     }
@@ -337,10 +356,10 @@ mod tests {
         cursors.clear_on_disconnect(1);
         assert_eq!(metrics.acked_sequence[1].load(Ordering::Relaxed), 0);
         assert_eq!(metrics.in_memory_sequence[1].load(Ordering::Relaxed), 0);
-        // Survivor (slot 0, cursor 11) owns the min; the max parks at
-        // the MAX sentinel (no constraint from a disengaged slot).
+        // Survivor (slot 0, cursor 11) owns both cursors — the max must
+        // DECREASE back to the survivor, not park at the sentinel.
         assert_eq!(min.load(Ordering::Acquire), 11);
-        assert_eq!(max.load(Ordering::Acquire), u64::MAX);
+        assert_eq!(max.load(Ordering::Acquire), 11);
     }
 
     #[test]
@@ -361,7 +380,7 @@ mod tests {
         // Slot 1 fails its handshake without ever engaging.
         cursors.clear_on_disconnect(1);
         assert_eq!(min.load(Ordering::Acquire), 11);
-        assert_eq!(max.load(Ordering::Acquire), u64::MAX);
+        assert_eq!(max.load(Ordering::Acquire), 11);
         assert_eq!(metrics.acked_sequence[0].load(Ordering::Relaxed), 10);
     }
 
@@ -391,12 +410,13 @@ mod tests {
         assert_eq!(violation.slot, 0);
         assert_eq!(violation.in_memory_sequence, 250);
         assert_eq!(violation.highest_sent_sequence, 200);
-        // Nothing moved: the gate's view still shows the seeded state.
+        // Nothing moved: the gate's view still shows the seeded state
+        // (slot 0 is the only engaged replica, so it owns both cursors).
         assert_eq!(metrics.acked_sequence[0].load(Ordering::Relaxed), 100);
         assert_eq!(metrics.in_memory_sequence[0].load(Ordering::Relaxed), 100);
         assert_eq!(metrics.acks_received[0].load(Ordering::Relaxed), 0);
         assert_eq!(min.load(Ordering::Acquire), 101);
-        assert_eq!(max.load(Ordering::Acquire), u64::MAX);
+        assert_eq!(max.load(Ordering::Acquire), 101);
     }
 
     #[test]

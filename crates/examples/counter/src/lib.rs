@@ -317,7 +317,7 @@ mod tests {
         let mut counter = Counter { value: 0 };
         let ctx = ApplyCtx {
             now_ns: 0,
-            journal_sequence: 0,
+            journal_sequence: melin_app::WireSeq::new(0),
             active_connections: 0,
             events_processed: 0,
             key_hash: 0,
@@ -338,7 +338,7 @@ mod tests {
         let mut counter = Counter { value: 99 };
         let ctx = ApplyCtx {
             now_ns: 0,
-            journal_sequence: 0,
+            journal_sequence: melin_app::WireSeq::new(0),
             active_connections: 0,
             events_processed: 0,
             key_hash: 0,

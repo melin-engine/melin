@@ -104,6 +104,44 @@ pub enum RejectReason {
     ReplicaDisconnected,
 }
 
+/// Wire-sequence space: the monotonic sequence the journal allocates per
+/// durable event. Comparable across nodes and stable across recovery (a
+/// fresh vs recovered primary), unlike disruptor ring positions which reset
+/// every process start — the newtype exists so the two spaces cannot be
+/// mixed (see `melin-transport-core`'s `cursors` module, which re-exports
+/// this and defines the sibling spaces). Defined here, in the trait crate,
+/// so [`ApplyCtx`] can carry it across the application boundary.
+///
+/// A position, not a count; subtract two of them with
+/// [`WireSeq::saturating_sub`] to get a lag.
+///
+/// `#[repr(transparent)]` so it is layout-identical to `u64` and can be a
+/// field of `#[repr(C)]` structs without changing their layout.
+#[repr(transparent)]
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default, Hash, Debug)]
+pub struct WireSeq(u64);
+
+impl WireSeq {
+    #[inline]
+    pub const fn new(seq: u64) -> Self {
+        Self(seq)
+    }
+
+    /// Unwrap to the raw `u64` — used only at the wire-encode / display
+    /// boundaries where the value leaves the type system.
+    #[inline]
+    pub const fn get(self) -> u64 {
+        self.0
+    }
+
+    /// Lag between two wire-seq positions, saturating at zero. Returns a raw
+    /// `u64` because a lag is a count, not a position.
+    #[inline]
+    pub const fn saturating_sub(self, earlier: WireSeq) -> u64 {
+        self.0.saturating_sub(earlier.0)
+    }
+}
+
 /// Transport state observable by the application during event application.
 ///
 /// Passed by reference into [`Application::apply`] so the app can synthesise
@@ -120,13 +158,13 @@ pub struct ApplyCtx {
     /// nanoseconds since the Unix epoch. Identical across primary and
     /// replica for deterministic replay.
     pub now_ns: u64,
-    /// Journal sequence number of the last event durably persisted
-    /// (wire-seq space, same as the health endpoint's `journal_seq`
-    /// gauge — survives recovery and does not count non-journaled
-    /// queries). Advances on every fsynced batch; batch-stale by up to
-    /// one matching batch. Advisory only — apps must not derive
-    /// deterministic state from it (it depends on fsync timing).
-    pub journal_sequence: u64,
+    /// Journal sequence of the last event durably persisted (same value as
+    /// the health endpoint's `journal_seq` gauge — survives recovery and
+    /// does not count non-journaled queries). Advances on every fsynced
+    /// batch; batch-stale by up to one matching batch. Advisory only — apps
+    /// must not derive deterministic state from it (it depends on fsync
+    /// timing).
+    pub journal_sequence: WireSeq,
     /// Count of client connections currently attached to this server.
     pub active_connections: u64,
     /// Monotonic count of events the matching stage has applied since

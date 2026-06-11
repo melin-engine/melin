@@ -16,7 +16,7 @@ use tracing::{error, info};
 use crate::pipeline::{FsyncState, InputSlot};
 use crate::snapshot;
 use melin_app::amortized_timer::AmortizedTimer;
-use melin_app::{Application, ApplyCtx};
+use melin_app::{Application, ApplyCtx, WireSeq};
 use melin_journal::JournalEvent;
 use melin_pipeline::ring;
 use melin_pipeline::seqlock::SeqLock;
@@ -211,7 +211,7 @@ fn dispatch_event<A: Application>(
             // consistent between live and shadow paths.
             let ctx = ApplyCtx {
                 now_ns: timestamp_ns,
-                journal_sequence: 0,
+                journal_sequence: WireSeq::new(0),
                 active_connections: 0,
                 events_processed: 0,
                 key_hash,

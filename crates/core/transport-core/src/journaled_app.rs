@@ -456,7 +456,7 @@ impl<A: Application, W: JournalWrite<A::Event>> JournaledApp<A, W> {
         let seq = self.writer.append(&JournalEvent::App(event))?;
         let ctx = melin_app::ApplyCtx {
             now_ns: melin_app::unix_epoch_nanos(),
-            journal_sequence: seq,
+            journal_sequence: melin_app::WireSeq::new(seq),
             active_connections: 0,
             events_processed: 0,
             key_hash: 0,
@@ -526,7 +526,7 @@ fn replay_entry<A: Application>(
             // per-key state under replay.
             let ctx = ApplyCtx {
                 now_ns: timestamp_ns,
-                journal_sequence: 0,
+                journal_sequence: melin_app::WireSeq::new(0),
                 active_connections: 0,
                 events_processed: 0,
                 key_hash,
@@ -739,7 +739,7 @@ mod tests {
         let mut reports = Vec::new();
         let ctx = ApplyCtx {
             now_ns: 0,
-            journal_sequence: 0,
+            journal_sequence: melin_app::WireSeq::new(0),
             active_connections: 0,
             events_processed: 0,
             key_hash: 1,

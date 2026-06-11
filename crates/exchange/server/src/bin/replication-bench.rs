@@ -135,7 +135,9 @@ fn main() {
     let replication_ring_progress = pipeline
         .replication_ring_progress
         .expect("replication enabled");
-    let fastest_replica_cursor = Arc::new(AtomicU64::new(u64::MAX));
+    let fastest_replica_cursor = Arc::new(AtomicU64::new(
+        melin_transport_core::PipelineCursors::NO_REPLICA,
+    ));
 
     // Pop consumer 0 — the production response stage drains it. We
     // don't run the response stage (it's irrelevant to replication

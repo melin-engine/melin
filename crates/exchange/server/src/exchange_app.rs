@@ -220,7 +220,7 @@ impl Application for ServerApp {
                 Some(QueryResponse::Stats {
                     active_connections: ctx.active_connections,
                     events_processed: ctx.events_processed,
-                    journal_sequence: ctx.journal_sequence,
+                    journal_sequence: ctx.journal_sequence.get(),
                 })
             }
             TradingEvent::QueryPosition { account } => {
@@ -381,7 +381,7 @@ mod tests {
         let mut reports = Vec::new();
         let ctx = ApplyCtx {
             now_ns: 0,
-            journal_sequence: 0,
+            journal_sequence: melin_app::WireSeq::new(0),
             active_connections: 0,
             events_processed: 0,
             key_hash: 0,
@@ -442,7 +442,7 @@ mod tests {
         let mut reports = Vec::new();
         let mk_ctx = |kh| ApplyCtx {
             now_ns: 0,
-            journal_sequence: 0,
+            journal_sequence: melin_app::WireSeq::new(0),
             active_connections: 0,
             events_processed: 0,
             key_hash: kh,
@@ -556,7 +556,7 @@ mod tests {
         let mut app = seeded_app();
         let ctx = ApplyCtx {
             now_ns: 0,
-            journal_sequence: 0,
+            journal_sequence: melin_app::WireSeq::new(0),
             active_connections: 0,
             events_processed: 0,
             key_hash: 0,

@@ -390,6 +390,7 @@ mod tests {
     use super::*;
     use melin_trading::trading_event::TradingEvent;
     type InputSlot = melin_transport_core::pipeline::InputSlot<TradingEvent>;
+    use melin_transport_core::PipelineCursors;
     use melin_transport_core::replication::protocol::{
         MAX_CONTROL_FRAME, MAX_DATA_FRAME, MSG_AUTH_OK, MSG_CHALLENGE_RESPONSE, MSG_SNAPSHOT_BEGIN,
         MSG_SNAPSHOT_CHUNK, MSG_SNAPSHOT_END, decode_auth_result, decode_challenge,
@@ -911,9 +912,10 @@ mod tests {
         cursor.fetch_max(100 + 1, Ordering::Release);
         assert_eq!(cursor.load(Ordering::Acquire), 101);
 
-        // Simulate disconnect: run_sender resets to MAX.
-        cursor.store(u64::MAX, Ordering::Release);
-        assert_eq!(cursor.load(Ordering::Acquire), u64::MAX);
+        // Simulate disconnect: run_sender parks the cursor at the
+        // disengaged sentinel.
+        cursor.store(PipelineCursors::NO_REPLICA, Ordering::Release);
+        assert_eq!(cursor.load(Ordering::Acquire), PipelineCursors::NO_REPLICA);
 
         // Simulate reconnect: cursor set back to handshake value.
         cursor.store(1, Ordering::Release);
@@ -1781,7 +1783,7 @@ mod tests {
     #[test]
     fn disconnect_resets_cursor_to_max() {
         // Verify the cursor reset behavior documented in the replication
-        // cursor table: "All replicas disconnect → u64::MAX".
+        // cursor table: "All replicas disconnect → NO_REPLICA sentinel".
         let cursor = Arc::new(AtomicU64::new(42));
         let replicas_connected = Arc::new(AtomicU32::new(1));
 
@@ -1790,10 +1792,10 @@ mod tests {
 
         // The sender loop checks and resets.
         if replicas_connected.load(Ordering::Relaxed) == 0 {
-            cursor.store(u64::MAX, Ordering::Release);
+            cursor.store(PipelineCursors::NO_REPLICA, Ordering::Release);
         }
 
-        assert_eq!(cursor.load(Ordering::Relaxed), u64::MAX);
+        assert_eq!(cursor.load(Ordering::Relaxed), PipelineCursors::NO_REPLICA);
     }
 
     #[test]
@@ -1805,7 +1807,7 @@ mod tests {
         replicas_connected.fetch_sub(1, Ordering::Release);
 
         if replicas_connected.load(Ordering::Relaxed) == 0 {
-            cursor.store(u64::MAX, Ordering::Release);
+            cursor.store(PipelineCursors::NO_REPLICA, Ordering::Release);
         }
 
         // Cursor should NOT be reset — one replica still connected.

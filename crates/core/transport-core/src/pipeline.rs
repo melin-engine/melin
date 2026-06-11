@@ -1812,7 +1812,7 @@ impl<A: Application> MatchingStage<A> {
             // per event.
             let mut ctx = ApplyCtx {
                 now_ns: 0,
-                journal_sequence: self.durable_wire_seq.load().get(),
+                journal_sequence: self.durable_wire_seq.load(),
                 active_connections: self.active_connections.load(Ordering::Relaxed),
                 events_processed: local_events,
                 key_hash: 0,
@@ -2107,7 +2107,7 @@ impl<A: Application> MatchingStage<A> {
         // with zeroed counters (no health endpoint cares at this point).
         let ctx = ApplyCtx {
             now_ns: 0,
-            journal_sequence: 0,
+            journal_sequence: WireSeq::new(0),
             active_connections: 0,
             events_processed: 0,
             key_hash: 0,
@@ -2435,7 +2435,8 @@ fn setup_chain_hash_publisher<E: AppEvent, W: JournalWrite<E>>(
     }
 }
 
-/// When replication is disabled, the cursor is `u64::MAX` (standalone mode).
+/// When replication is disabled, the replica quorum cursor stays at its
+/// `PipelineCursors::NO_REPLICA` sentinel (standalone mode).
 #[allow(clippy::too_many_arguments)]
 pub fn build_pipeline_with_replication<A, W>(
     app: A,
