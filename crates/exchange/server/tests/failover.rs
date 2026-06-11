@@ -3006,13 +3006,11 @@ fn rotation_soak_under_load() {
     // only possible if the writer's `next_sequence` was correctly seeded
     // from the multi-segment archive walk on startup.
     //
-    // `p_last` is the only valid baseline here. The health endpoint's
-    // `journal_seq` is the pipeline's journal CURSOR, which advances for
-    // every consumed slot including read-only queries that are never
-    // journaled (each client connect's request-seq adopt is one), so it
-    // overshoots the on-disk sequence and the comparison would then
-    // hinge on whether a 250 ms tick happens to fire during the restarted
-    // primary's sub-second life — a coin flip that made this assert flaky.
+    // `p_last` is the cleanest baseline here: both sides of the assert
+    // come from on-disk journal walks, independent of health-endpoint
+    // publish timing. (The health `journal_seq` gauge reads the durable
+    // wire seq nowadays — same space as the disk walk — but keeping both
+    // sides on disk reads keeps the comparison self-contained.)
     let mut client2 = connect_with_timeout(primary2.client_addr, &key);
     submit_resting_burst(&mut client2, total_orders + 1, 1);
     // Allow the order to fsync before shutdown.

@@ -379,7 +379,8 @@ impl<A: Application, W: JournalWrite<A::Event>> JournaledApp<A, W> {
     /// records the last journal sequence and current chain hash so
     /// recovery can resume both.
     pub fn save_snapshot(&self, snapshot_path: &Path) -> Result<(), JournaledAppError> {
-        let seq = self.writer.next_sequence().saturating_sub(1);
+        // Wire-seq space: the allocator's last assigned sequence.
+        let seq = crate::cursors::WireSeq::new(self.writer.next_sequence().saturating_sub(1));
         let chain_hash = self.writer.chain_hash().unwrap_or([0u8; 32]);
         snapshot::save::<A>(&self.app, seq, chain_hash, snapshot_path)?;
         Ok(())
@@ -455,7 +456,7 @@ impl<A: Application, W: JournalWrite<A::Event>> JournaledApp<A, W> {
         let seq = self.writer.append(&JournalEvent::App(event))?;
         let ctx = melin_app::ApplyCtx {
             now_ns: melin_app::unix_epoch_nanos(),
-            journal_sequence: seq,
+            journal_sequence: melin_app::WireSeq::new(seq),
             active_connections: 0,
             events_processed: 0,
             key_hash: 0,
@@ -525,7 +526,7 @@ fn replay_entry<A: Application>(
             // per-key state under replay.
             let ctx = ApplyCtx {
                 now_ns: timestamp_ns,
-                journal_sequence: 0,
+                journal_sequence: melin_app::WireSeq::new(0),
                 active_connections: 0,
                 events_processed: 0,
                 key_hash,
@@ -738,7 +739,7 @@ mod tests {
         let mut reports = Vec::new();
         let ctx = ApplyCtx {
             now_ns: 0,
-            journal_sequence: 0,
+            journal_sequence: melin_app::WireSeq::new(0),
             active_connections: 0,
             events_processed: 0,
             key_hash: 1,
@@ -1376,7 +1377,13 @@ mod tests {
         let (loaded_app, snap_seq, real_hash) = snapshot::load::<TestApp>(&snap_path).unwrap();
         let bad_hash = [0xEE; 32];
         assert_ne!(real_hash, bad_hash);
-        snapshot::save::<TestApp>(&loaded_app, snap_seq, bad_hash, &snap_path).unwrap();
+        snapshot::save::<TestApp>(
+            &loaded_app,
+            crate::cursors::WireSeq::new(snap_seq),
+            bad_hash,
+            &snap_path,
+        )
+        .unwrap();
 
         let err = match TestApp_::recover_from_snapshot(&snap_path, &journal_path) {
             Ok(_) => panic!("expected boundary-anchor mismatch rejection"),
@@ -1811,7 +1818,13 @@ mod tests {
             "hash-chain feature must produce a non-sentinel hash for this test"
         );
         let bad_hash = [0xFF; 32];
-        snapshot::save::<TestApp>(&loaded_app, snap_seq, bad_hash, &snap_path).unwrap();
+        snapshot::save::<TestApp>(
+            &loaded_app,
+            crate::cursors::WireSeq::new(snap_seq),
+            bad_hash,
+            &snap_path,
+        )
+        .unwrap();
 
         let err = match TestApp_::recover_from_snapshot(&snap_path, &journal_path) {
             Ok(_) => panic!("expected recovery to reject chain-hash mismatch"),
@@ -1869,7 +1882,13 @@ mod tests {
             "hash-chain feature must produce a non-sentinel hash for this test"
         );
         let bad_hash = [0xAA; 32];
-        snapshot::save::<TestApp>(&loaded_app, snap_seq, bad_hash, &snap_path).unwrap();
+        snapshot::save::<TestApp>(
+            &loaded_app,
+            crate::cursors::WireSeq::new(snap_seq),
+            bad_hash,
+            &snap_path,
+        )
+        .unwrap();
 
         let err = match TestApp_::recover_from_snapshot(&snap_path, &journal_path) {
             Ok(_) => panic!("expected recovery to reject archived chain-hash mismatch"),

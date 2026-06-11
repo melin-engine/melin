@@ -797,7 +797,7 @@ where
     loop {
         // Refresh handshake state from the running pipeline, if any.
         if let Some(p) = pipeline.as_ref() {
-            last_sequence = p.last_seq.load(Ordering::Acquire);
+            last_sequence = p.last_seq.load().get();
             if let Some(ref lock) = p.chain_hash_lock {
                 chain_hash = lock.load().chain_hash;
             }

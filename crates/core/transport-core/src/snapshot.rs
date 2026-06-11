@@ -22,6 +22,8 @@ use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::Path;
 
 use melin_app::Application;
+
+use crate::cursors::WireSeq;
 use tracing::warn;
 
 const SNAP_MAGIC: u32 = 0x534E_4150;
@@ -108,9 +110,13 @@ impl From<std::io::Error> for SnapshotError {
 /// to `<path>.tmp` first and atomically renames on success — on crash
 /// the partial tmp file is discarded on recovery and the previous
 /// snapshot (if any) is untouched.
+///
+/// `journal_sequence` is the recovery resume point — typed [`WireSeq`]
+/// because recording any other space (e.g. a ring position) here would
+/// make recovery replay already-applied events on top of restored state.
 pub fn save<A: Application>(
     app: &A,
-    journal_sequence: u64,
+    journal_sequence: WireSeq,
     chain_hash: [u8; 32],
     path: &Path,
 ) -> Result<(), SnapshotError> {
@@ -121,7 +127,7 @@ pub fn save<A: Application>(
 /// tests can exercise the cap without allocating a 256 MiB payload.
 fn save_with_limit<A: Application>(
     app: &A,
-    journal_sequence: u64,
+    journal_sequence: WireSeq,
     chain_hash: [u8; 32],
     path: &Path,
     max_size: u64,
@@ -131,7 +137,7 @@ fn save_with_limit<A: Application>(
     buf.extend_from_slice(&SNAP_MAGIC.to_le_bytes());
     buf.extend_from_slice(&TRANSPORT_VERSION.to_le_bytes());
     buf.extend_from_slice(&A::APP_VERSION.to_le_bytes());
-    buf.extend_from_slice(&journal_sequence.to_le_bytes());
+    buf.extend_from_slice(&journal_sequence.get().to_le_bytes());
     buf.extend_from_slice(&chain_hash);
     // App payload.
     app.snapshot(&mut buf)?;
@@ -333,7 +339,7 @@ mod tests {
         // save/load today, just an intent guard).
         for (label, chain) in [("populated", [0xCDu8; 32]), ("zero sentinel", [0u8; 32])] {
             let path = dir.path().join(format!("snap.{label}"));
-            save::<TestApp>(&app, 999, chain, &path).unwrap();
+            save::<TestApp>(&app, WireSeq::new(999), chain, &path).unwrap();
 
             let (restored, seq, ch) = load::<TestApp>(&path).unwrap();
             assert_eq!(seq, 999, "{label}");
@@ -351,7 +357,7 @@ mod tests {
         let app = populated_app();
 
         // First save — no previous snapshot exists; `.prev` is not created.
-        save::<TestApp>(&app, 1, [0x11; 32], &path).unwrap();
+        save::<TestApp>(&app, WireSeq::new(1), [0x11; 32], &path).unwrap();
         assert!(path.exists());
         assert!(
             !prev_path.exists(),
@@ -360,7 +366,7 @@ mod tests {
         let first_bytes = std::fs::read(&path).unwrap();
 
         // Second save — previous snapshot must be rotated to .prev verbatim.
-        save::<TestApp>(&app, 2, [0x22; 32], &path).unwrap();
+        save::<TestApp>(&app, WireSeq::new(2), [0x22; 32], &path).unwrap();
         assert!(path.exists());
         assert!(prev_path.exists(), "second save must produce a .prev file");
         assert_eq!(
@@ -444,7 +450,7 @@ mod tests {
     fn checksum_mismatch_detected() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("snap");
-        save::<TestApp>(&populated_app(), 0, [0u8; 32], &path).unwrap();
+        save::<TestApp>(&populated_app(), WireSeq::new(0), [0u8; 32], &path).unwrap();
         // Flip one bit inside the payload region (after the header, before
         // the trailing CRC). The mutated byte recomputes to a different
         // CRC than the one written at save time.
@@ -491,7 +497,13 @@ mod tests {
         let path = dir.path().join("snap");
         let app = populated_app();
 
-        match save_with_limit::<TestApp>(&app, 0, [0u8; 32], &path, /* max_size */ 16) {
+        match save_with_limit::<TestApp>(
+            &app,
+            WireSeq::new(0),
+            [0u8; 32],
+            &path,
+            /* max_size */ 16,
+        ) {
             Err(SnapshotError::TooLarge(_)) => {}
             other => panic!("expected TooLarge, got {other:?}"),
         }

@@ -21,6 +21,7 @@ use melin_pipeline::spsc;
 
 use melin_app::Application;
 use melin_app::amortized_timer::AmortizedTimer;
+use melin_transport_core::DurableWireSeqCursor;
 use melin_transport_core::pipeline::{OutputPayload, OutputSlot, StageUtilization};
 
 use melin_wire_protocol::control::TransportResponse;
@@ -101,7 +102,7 @@ pub enum ControlEvent {
 pub fn run<A: Application>(
     mut consumer: ring::Consumer<OutputSlot<A::Report, A::QueryResponse>>,
     control_rx: mpsc::Receiver<ControlEvent>,
-    journal_persisted_wire_seq: Arc<AtomicU64>,
+    journal_persisted_wire_seq: DurableWireSeqCursor,
     durability_mode: Arc<std::sync::atomic::AtomicU8>,
     replication_metrics: Option<Arc<crate::replication::ReplicationMetrics>>,
     replica_active: Option<[Arc<AtomicBool>; 2]>,
@@ -151,7 +152,7 @@ pub fn run<A: Application>(
 
     let mut degraded_logger;
     {
-        let journal_pos = journal_persisted_wire_seq.load(Ordering::Acquire);
+        let journal_pos = journal_persisted_wire_seq.load();
         let metrics_ref = replication_metrics.as_deref();
         let active_ref = replica_active.as_ref();
         let status =
@@ -308,7 +309,7 @@ pub fn run<A: Application>(
                 let now_ts = Instant::now();
                 if now_ts.duration_since(last_policy_check) >= POLICY_CHECK_INTERVAL {
                     last_policy_check = now_ts;
-                    let journal_pos = journal_persisted_wire_seq.load(Ordering::Acquire);
+                    let journal_pos = journal_persisted_wire_seq.load();
                     let metrics_ref = replication_metrics.as_deref();
                     let active_ref = replica_active.as_ref();
                     let status = crate::response::evaluate_durability(
@@ -388,14 +389,14 @@ pub fn run<A: Application>(
                         degraded_logger.reseed(&utilization, Instant::now());
                     }
 
-                    let journal_pos = journal_persisted_wire_seq.load(Ordering::Acquire);
+                    let journal_pos = journal_persisted_wire_seq.load();
                     let metrics_ref = replication_metrics.as_deref();
                     let active_ref = replica_active.as_ref();
                     let repl_min =
                         crate::response::connected_persisted_min(metrics_ref, active_ref);
 
                     #[cfg(feature = "tick-to-trade")]
-                    gate_tracker.observe(journal_pos, repl_min, trace::mono_trace_ns());
+                    gate_tracker.observe(journal_pos.get(), repl_min, trace::mono_trace_ns());
 
                     let status = crate::response::evaluate_durability(
                         &policy,
@@ -427,7 +428,7 @@ pub fn run<A: Application>(
                     if cached_durable_pos >= needed {
                         // Attribution: which subsystem was slowest. See
                         // response.rs for the rationale.
-                        if journal_pos <= repl_min {
+                        if journal_pos.get() <= repl_min {
                             utilization.gate_journal.fetch_add(1, Ordering::Relaxed);
                         } else {
                             utilization.gate_replication.fetch_add(1, Ordering::Relaxed);

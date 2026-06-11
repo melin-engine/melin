@@ -17,7 +17,6 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
 use melin_journal::JournalEvent;
-use melin_pipeline::padding::Sequence;
 use melin_pipeline::ring;
 use melin_server::exchange_app::ServerApp as App;
 use melin_trading::trading_event::TradingEvent;
@@ -92,7 +91,9 @@ fn build_matching_with_halt(initial_connected: u32) -> UnspawnedMatchingHaltResu
         .build();
     let output_consumer = output_consumers.pop().unwrap();
 
-    let dummy_cursor = Arc::new(Sequence::new(AtomicU64::new(0)));
+    // Durable cursor unused by the halt test — nothing publishes into it.
+    let dummy_cursor =
+        melin_transport_core::DurableWireSeqCursor::detached(melin_transport_core::WireSeq::new(0));
     let events_counter = Arc::new(AtomicU64::new(0));
     let active_conns = Arc::new(AtomicU64::new(0));
     let counter = Arc::new(AtomicU32::new(initial_connected));

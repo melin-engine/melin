@@ -11,7 +11,7 @@
 use std::collections::{HashMap, HashSet};
 use std::os::unix::io::RawFd;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
@@ -27,6 +27,7 @@ use melin_app::amortized_timer::AmortizedTimer;
 use melin_transport_core::pipeline::{OutputPayload, OutputSlot, StageUtilization};
 #[cfg(feature = "latency-trace")]
 use melin_transport_core::trace;
+use melin_transport_core::{DurableWireSeqCursor, WireSeq};
 
 use melin_wire_protocol::control::TransportResponse;
 use melin_wire_protocol::control_codec;
@@ -70,9 +71,10 @@ pub struct Response<A: Application> {
     /// `metrics.acked_sequence`), so the durability gate can compare
     /// these values numerically and the comparison is meaningful
     /// regardless of `starting_sequence` (fresh vs recovered primary).
-    /// Updated by the journal stage after every fsync batch via
-    /// `set_last_seq_publisher`.
-    pub journal_persisted_wire_seq: Arc<AtomicU64>,
+    /// Typed [`DurableWireSeqCursor`] so the gate cannot be wired to a
+    /// ring-space counter — the pre-v14 bug class. Updated by the
+    /// journal stage after every fsync batch via `set_last_seq_publisher`.
+    pub journal_persisted_wire_seq: DurableWireSeqCursor,
     /// Operator-selected durability mode, published through a shared
     /// [`AtomicU8`] so the admin `DURABILITY` command can swap it at
     /// runtime without restarting the node. The response stage reads
@@ -207,7 +209,7 @@ pub fn run<A: Application>(
     // the first batch arrives.
     let mut degraded_logger;
     {
-        let journal_pos = journal_persisted_wire_seq.load(Ordering::Acquire);
+        let journal_pos = journal_persisted_wire_seq.load();
         let metrics_ref = replication_metrics.as_deref();
         let active_ref = replica_active.as_ref();
         let status = evaluate_durability(&policy, journal_pos, metrics_ref, active_ref);
@@ -445,7 +447,7 @@ pub fn run<A: Application>(
                 let now_ts = Instant::now();
                 if now_ts.duration_since(last_policy_check) >= POLICY_CHECK_INTERVAL {
                     last_policy_check = now_ts;
-                    let journal_pos = journal_persisted_wire_seq.load(Ordering::Acquire);
+                    let journal_pos = journal_persisted_wire_seq.load();
                     let metrics_ref = replication_metrics.as_deref();
                     let active_ref = replica_active.as_ref();
                     let status = evaluate_durability(&policy, journal_pos, metrics_ref, active_ref);
@@ -570,13 +572,13 @@ pub fn run<A: Application>(
                         degraded_logger.reseed(&utilization, Instant::now());
                     }
 
-                    let journal_pos = journal_persisted_wire_seq.load(Ordering::Acquire);
+                    let journal_pos = journal_persisted_wire_seq.load();
                     let metrics_ref = replication_metrics.as_deref();
                     let active_ref = replica_active.as_ref();
                     let repl_min = connected_persisted_min(metrics_ref, active_ref);
 
                     #[cfg(feature = "tick-to-trade")]
-                    gate_tracker.observe(journal_pos, repl_min, trace::mono_trace_ns());
+                    gate_tracker.observe(journal_pos.get(), repl_min, trace::mono_trace_ns());
 
                     let status = evaluate_durability(&policy, journal_pos, metrics_ref, active_ref);
                     cached_durable_pos = status.durable_pos;
@@ -609,7 +611,7 @@ pub fn run<A: Application>(
                         // Attribution: which subsystem was slowest at
                         // the moment the gate opened. Relaxed is fine —
                         // health reads are infrequent.
-                        if journal_pos <= repl_min {
+                        if journal_pos.get() <= repl_min {
                             utilization.gate_journal.fetch_add(1, Ordering::Relaxed);
                         } else {
                             utilization.gate_replication.fetch_add(1, Ordering::Relaxed);
@@ -949,13 +951,16 @@ fn retry_send(
 #[inline]
 pub(crate) fn evaluate_durability(
     policy: &Policy,
-    journal_pos: u64,
+    journal_pos: WireSeq,
     metrics: Option<&ReplicationMetrics>,
     replica_active: Option<&[Arc<AtomicBool>; 2]>,
 ) -> EvalStatus {
-    // Primary + up to 2 replica slots = 3 nodes max.
+    // Primary + up to 2 replica slots = 3 nodes max. The policy view is
+    // raw `u64`, all wire-seq space: `journal_pos` leaves the type system
+    // here, alongside the replica metrics gauges (the `Ack` frame's
+    // wire-seq fields verbatim).
     let mut nodes: [[u64; 2]; 3] = [[0, 0]; 3];
-    nodes[0] = [u64::MAX, journal_pos];
+    nodes[0] = [u64::MAX, journal_pos.get()];
     let mut len = 1;
     if let (Some(m), Some(active)) = (metrics, replica_active) {
         for (i, slot_active) in active.iter().enumerate() {
@@ -1271,7 +1276,7 @@ fn print_utilization(stage: &str, busy: u64, idle: u64) {
 mod tests {
     #[cfg(feature = "tick-to-trade")]
     use super::GateCrossTracker;
-    use super::{DegradationLogger, connected_persisted_min, evaluate_durability};
+    use super::{DegradationLogger, WireSeq, connected_persisted_min, evaluate_durability};
     use crate::durability_policy::{Clause, Level, Policy};
     use crate::replication::ReplicationMetrics;
 
@@ -1333,7 +1338,10 @@ mod tests {
         // No metrics → only the primary is in the view. `persisted>=1`
         // is satisfied by the primary alone at journal_pos.
         let p = parse("persisted>=1").unwrap();
-        assert_eq!(evaluate_durability(&p, 500, None, None).durable_pos, 500);
+        assert_eq!(
+            evaluate_durability(&p, WireSeq::new(500), None, None).durable_pos,
+            500
+        );
     }
 
     #[test]
@@ -1343,7 +1351,7 @@ mod tests {
         // policy surfaces as degraded so the operator sees the gate
         // is stalled because the cluster can't meet the policy.
         let p = parse("persisted>=2").unwrap();
-        let r = evaluate_durability(&p, 500, None, None);
+        let r = evaluate_durability(&p, WireSeq::new(500), None, None);
         assert_eq!(r.durable_pos, 0);
         assert!(
             r.degraded,
@@ -1361,7 +1369,7 @@ mod tests {
         let m = metrics((100, 100), (120, 120));
         let a = both_active();
         assert_eq!(
-            evaluate_durability(&p, 50, Some(&m), Some(&a)).durable_pos,
+            evaluate_durability(&p, WireSeq::new(50), Some(&m), Some(&a)).durable_pos,
             100
         );
     }
@@ -1373,7 +1381,7 @@ mod tests {
         let m = metrics((100, 100), (120, 120));
         let a = both_active();
         assert_eq!(
-            evaluate_durability(&p, 500, Some(&m), Some(&a)).durable_pos,
+            evaluate_durability(&p, WireSeq::new(500), Some(&m), Some(&a)).durable_pos,
             120
         );
     }
@@ -1386,7 +1394,7 @@ mod tests {
         let m = metrics((50, 50), (200, 200));
         let a = both_active();
         assert_eq!(
-            evaluate_durability(&p, 150, Some(&m), Some(&a)).durable_pos,
+            evaluate_durability(&p, WireSeq::new(150), Some(&m), Some(&a)).durable_pos,
             150
         );
     }
@@ -1403,11 +1411,11 @@ mod tests {
         let m = metrics((100, 100), (999, 999)); // slot 1 cursors ignored
         let a = flags(true, false);
         assert_eq!(
-            evaluate_durability(&p, 50, Some(&m), Some(&a)).durable_pos,
+            evaluate_durability(&p, WireSeq::new(50), Some(&m), Some(&a)).durable_pos,
             50
         );
         assert_eq!(
-            evaluate_durability(&p, 200, Some(&m), Some(&a)).durable_pos,
+            evaluate_durability(&p, WireSeq::new(200), Some(&m), Some(&a)).durable_pos,
             100
         );
     }
@@ -1420,7 +1428,7 @@ mod tests {
         let p = parse("persisted>=2").unwrap();
         let m = metrics((100, 100), (999, 999));
         let a = flags(true, false);
-        let r = evaluate_durability(&p, 50, Some(&m), Some(&a));
+        let r = evaluate_durability(&p, WireSeq::new(50), Some(&m), Some(&a));
         assert_eq!(r.durable_pos, 50);
         assert!(!r.degraded);
     }
@@ -1433,7 +1441,7 @@ mod tests {
         let m = metrics((999, 999), (999, 999));
         let a = flags(false, false);
         assert_eq!(
-            evaluate_durability(&p, 500, Some(&m), Some(&a)).durable_pos,
+            evaluate_durability(&p, WireSeq::new(500), Some(&m), Some(&a)).durable_pos,
             0
         );
     }
@@ -1449,7 +1457,7 @@ mod tests {
         let p = parse("persisted>=2").unwrap();
         let m = metrics((999, 999), (999, 999));
         let a = flags(false, false);
-        let r = evaluate_durability(&p, 500, Some(&m), Some(&a));
+        let r = evaluate_durability(&p, WireSeq::new(500), Some(&m), Some(&a));
         assert_eq!(r.durable_pos, 0);
         assert!(r.degraded);
     }
@@ -1470,7 +1478,7 @@ mod tests {
         let m = metrics((80, 20), (999, 999));
         let a = flags(true, false);
         assert_eq!(
-            evaluate_durability(&p, 50, Some(&m), Some(&a)).durable_pos,
+            evaluate_durability(&p, WireSeq::new(50), Some(&m), Some(&a)).durable_pos,
             50
         );
     }
@@ -1485,7 +1493,7 @@ mod tests {
         let m = metrics((100, 100), (200, 200));
         let a = both_active();
         assert_eq!(
-            evaluate_durability(&p, 0, Some(&m), Some(&a)).durable_pos,
+            evaluate_durability(&p, WireSeq::new(0), Some(&m), Some(&a)).durable_pos,
             200
         );
     }
@@ -1524,7 +1532,7 @@ mod tests {
         // degraded and the gate sits at the 2nd-largest persisted = 0.
         let m = metrics((0, 0), (0, 0));
         let a = both_active();
-        let r = evaluate_durability(&p, 0, Some(&m), Some(&a));
+        let r = evaluate_durability(&p, WireSeq::new(0), Some(&m), Some(&a));
         assert_eq!(r.durable_pos, 0);
         assert!(
             !r.degraded,
@@ -1579,7 +1587,7 @@ mod tests {
         let p = parse("persisted>=2").unwrap();
         let m = metrics((480, 480), (999, 999));
         let a = flags(true, false);
-        let r = evaluate_durability(&p, 500, Some(&m), Some(&a));
+        let r = evaluate_durability(&p, WireSeq::new(500), Some(&m), Some(&a));
         assert_eq!(
             r.durable_pos, 480,
             "post-seed reconnect should produce a coherent gate position equal to the slower node, not freeze at 0"
@@ -1596,7 +1604,7 @@ mod tests {
         let p = parse("persisted>=2").unwrap();
         let m = metrics((0, 0), (999, 999));
         let a = flags(true, false);
-        let r = evaluate_durability(&p, 500, Some(&m), Some(&a));
+        let r = evaluate_durability(&p, WireSeq::new(500), Some(&m), Some(&a));
         assert_eq!(
             r.durable_pos, 0,
             "the gate behaviour under (active=true, cursor=0) — if the senders ever fail to seed before flipping active, this is the freeze the operator would see"
@@ -1620,7 +1628,7 @@ mod tests {
         let p = parse("persisted>=2").unwrap();
         let m = metrics((0, 0), (999, 999));
         let a = flags(true, false);
-        let r = evaluate_durability(&p, 500, Some(&m), Some(&a));
+        let r = evaluate_durability(&p, WireSeq::new(500), Some(&m), Some(&a));
         // 2nd-largest persisted across {primary=500, slot=0} = 0.
         // Gate stalls. ✓
         assert_eq!(r.durable_pos, 0);
@@ -1632,7 +1640,7 @@ mod tests {
         // accepting new orders; the gate side's job is just to keep
         // the existing in-flight orders stalled and the alert lit.
         let a_disconnected = flags(false, false);
-        let r_after = evaluate_durability(&p, 500, Some(&m), Some(&a_disconnected));
+        let r_after = evaluate_durability(&p, WireSeq::new(500), Some(&m), Some(&a_disconnected));
         assert_eq!(r_after.durable_pos, 0);
         assert!(
             r_after.degraded,
@@ -1651,7 +1659,7 @@ mod tests {
         let m = metrics((0, 0), (999, 999));
         let a = flags(true, false);
         for primary_pos in [0, 1, 100, 500, 1_000_000_000_u64] {
-            let r = evaluate_durability(&p, primary_pos, Some(&m), Some(&a));
+            let r = evaluate_durability(&p, WireSeq::new(primary_pos), Some(&m), Some(&a));
             // 2nd-largest of {primary_pos, 0} = 0 for any primary > 0.
             // For primary_pos = 0, also 0. So always 0.
             assert_eq!(

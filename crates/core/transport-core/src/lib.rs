@@ -15,6 +15,10 @@
 
 #![cfg_attr(not(test), deny(clippy::unwrap_used))]
 
+/// Named sequence-space cursors (`WireSeq` / `RingPos` / `PipelineCursors`).
+/// Bundles the journal-progress atomics behind space-typed accessors so the
+/// compiler rejects mixing wire-seq and ring-index values.
+pub mod cursors;
 /// Cluster-wide durability ack policy: the `Level`/`Clause`/`Policy`
 /// cursor-evaluation core used by the response stage's ack gate.
 /// Application-agnostic — the operator-facing CLI mode that picks
@@ -47,4 +51,5 @@ mod test_support;
 #[cfg(test)]
 mod pipeline_tests;
 
+pub use cursors::{DurableWireSeqCursor, PipelineCursors, RingPos, SlotAcked, WireSeq};
 pub use journaled_app::{JournaledApp, JournaledAppError};

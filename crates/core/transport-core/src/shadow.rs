@@ -16,7 +16,7 @@ use tracing::{error, info};
 use crate::pipeline::{FsyncState, InputSlot};
 use crate::snapshot;
 use melin_app::amortized_timer::AmortizedTimer;
-use melin_app::{Application, ApplyCtx};
+use melin_app::{Application, ApplyCtx, WireSeq};
 use melin_journal::JournalEvent;
 use melin_pipeline::ring;
 use melin_pipeline::seqlock::SeqLock;
@@ -140,20 +140,21 @@ fn try_save_snapshot<A: Application>(
     path: &std::path::Path,
 ) {
     let state = fsync_state.load();
-    if state.input_ring_seq != consumer.next_read() {
+    // Both ring-index space — compare the raw positions.
+    if state.input_ring_seq.get() != consumer.next_read() {
         return;
     }
     match snapshot::save::<A>(app, state.journal_seq, state.chain_hash, path) {
         Ok(()) => {
             info!(
-                journal_seq = state.journal_seq,
+                journal_seq = state.journal_seq.get(),
                 path = %path.display(),
                 "shadow snapshot saved"
             );
         }
         Err(e) => {
             error!(
-                journal_seq = state.journal_seq,
+                journal_seq = state.journal_seq.get(),
                 error = %e,
                 path = %path.display(),
                 "shadow snapshot failed"
@@ -210,7 +211,7 @@ fn dispatch_event<A: Application>(
             // consistent between live and shadow paths.
             let ctx = ApplyCtx {
                 now_ns: timestamp_ns,
-                journal_sequence: 0,
+                journal_sequence: WireSeq::new(0),
                 active_connections: 0,
                 events_processed: 0,
                 key_hash,
@@ -236,6 +237,7 @@ fn dispatch_event<A: Application>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cursors::{RingPos, WireSeq};
     use crate::pipeline::InputSlot;
     use crate::test_support::{TestApp, TestEvent};
     use melin_pipeline::ring::DisruptorBuilder;
@@ -290,9 +292,9 @@ mod tests {
         // Pre-set input_ring_seq = 2 (the ring cursor after consuming
         // both events below). Shadow only saves when aligned.
         let fsync_state = Arc::new(SeqLock::new(FsyncState {
-            journal_seq: 3,
+            journal_seq: WireSeq::new(3),
             chain_hash: [0xAB; 32],
-            input_ring_seq: 2,
+            input_ring_seq: RingPos::new(2),
         }));
         let shutdown = Arc::new(AtomicBool::new(false));
         let shutdown2 = Arc::clone(&shutdown);
@@ -651,9 +653,9 @@ mod tests {
 
         let app = TestApp::new();
         let fsync_state = Arc::new(SeqLock::new(FsyncState {
-            journal_seq: 2,
+            journal_seq: WireSeq::new(2),
             chain_hash: [0x11; 32],
-            input_ring_seq: 1,
+            input_ring_seq: RingPos::new(1),
         }));
         let fsync_state_writer = Arc::clone(&fsync_state);
         let shutdown = Arc::new(AtomicBool::new(false));
@@ -701,9 +703,9 @@ mod tests {
         // Phase 2: update FsyncState (new hash + advanced ring cursor),
         // drive another event, wait for the second snapshot.
         fsync_state_writer.store(FsyncState {
-            journal_seq: 3,
+            journal_seq: WireSeq::new(3),
             chain_hash: [0x22; 32],
-            input_ring_seq: 2,
+            input_ring_seq: RingPos::new(2),
         });
         producer.publish(InputSlot {
             connection_id: 0,
@@ -750,9 +752,9 @@ mod tests {
         // 5 events total (10,20,30,40,50). Pre-set input_ring_seq = 5
         // so the alignment check passes once shadow consumes all.
         let fsync_state = Arc::new(SeqLock::new(FsyncState {
-            journal_seq: 6,
+            journal_seq: WireSeq::new(6),
             chain_hash: [0xCD; 32],
-            input_ring_seq: 5,
+            input_ring_seq: RingPos::new(5),
         }));
         let shutdown = Arc::new(AtomicBool::new(false));
         let shutdown2 = Arc::clone(&shutdown);

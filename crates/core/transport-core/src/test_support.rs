@@ -68,6 +68,10 @@ pub struct TestReport {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TestQuery {
     pub total: u64,
+    /// Echo of `ApplyCtx.journal_sequence` (durable wire seq) at apply
+    /// time. Mirrors the exchange app's `QueryStats`, so pipeline tests
+    /// can assert what the stats-style query surface reports.
+    pub journal_sequence: u64,
 }
 
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -96,7 +100,7 @@ impl Application for TestApp {
     fn apply(
         &mut self,
         event: Self::Event,
-        _ctx: &ApplyCtx,
+        ctx: &ApplyCtx,
         out: &mut Vec<Self::Report>,
     ) -> Option<Self::QueryResponse> {
         match event {
@@ -107,7 +111,10 @@ impl Application for TestApp {
                 });
                 None
             }
-            TestEvent::Query => Some(TestQuery { total: self.total }),
+            TestEvent::Query => Some(TestQuery {
+                total: self.total,
+                journal_sequence: ctx.journal_sequence.get(),
+            }),
         }
     }
 

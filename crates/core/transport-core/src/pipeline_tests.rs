@@ -18,9 +18,9 @@ use std::time::Duration;
 
 use melin_journal::replication::REPLICATION_RING_CAPACITY;
 use melin_journal::{BufferedWriter, JournalEvent, JournalReader, SectorWriter};
-use melin_pipeline::padding::Sequence;
 use melin_pipeline::ring;
 
+use crate::cursors::{DurableWireSeqCursor, PipelineCursors, WireSeq};
 use crate::journaled_app::JournaledApp;
 #[cfg(all(feature = "hash-chain", not(feature = "no-persist")))]
 use crate::pipeline::build_replica_pipeline;
@@ -37,6 +37,12 @@ use crate::trace::mono_trace_ns;
 type Writer = SectorWriter<TestEvent>;
 type TestInput = InputSlot<TestEvent>;
 type TestOutput = OutputSlot<TestReport, TestQuery>;
+
+/// A standalone durable-wire-seq handle for matching-stage-only tests
+/// (nothing publishes into it; the stage reads it once per batch).
+fn dummy_durable_cursor() -> DurableWireSeqCursor {
+    DurableWireSeqCursor::detached(WireSeq::new(0))
+}
 
 /// First user-event sequence. Chain metadata lives in the file header,
 /// so sequence 1 is a real event under every feature config. Only
@@ -134,8 +140,8 @@ fn matching_stage_processes_events() {
         .build();
     let mut output_consumer = output_consumers.pop().unwrap();
 
-    // Journal cursor and counters not used in this test — create dummies.
-    let dummy_cursor = Arc::new(Sequence::new(AtomicU64::new(0)));
+    // Durable cursor and counters not used in this test — create dummies.
+    let dummy_cursor = dummy_durable_cursor();
     let events_counter = Arc::new(AtomicU64::new(0));
     let active_conns = Arc::new(AtomicU64::new(0));
     let stage = MatchingStage::new(
@@ -210,7 +216,7 @@ fn matching_stage_stamps_wire_seq_in_journal_lockstep() {
         .build();
     let mut output_consumer = output_consumers.pop().unwrap();
 
-    let dummy_cursor = Arc::new(Sequence::new(AtomicU64::new(0)));
+    let dummy_cursor = dummy_durable_cursor();
     let events_counter = Arc::new(AtomicU64::new(0));
     let active_conns = Arc::new(AtomicU64::new(0));
     // Pick a non-1 starting value (10) so an off-by-`starting-1` regression
@@ -362,7 +368,7 @@ fn allocator_wire_seq_and_gate_cursor_agree_across_rotation() {
     let mut input_producer = out.input_producer;
     let mut journal_stage = out.journal_stage;
     let matching_stage = out.matching_stage;
-    let last_seq = Arc::clone(&out.last_seq);
+    let last_seq = out.cursors.durable_wire_seq();
     let mut output_consumer = out.output_consumers.pop().unwrap();
 
     let rotate_flag = Arc::new(AtomicBool::new(false));
@@ -408,7 +414,7 @@ fn allocator_wire_seq_and_gate_cursor_agree_across_rotation() {
     // boundary genuinely splits the stream. Polled — fixed sleeps
     // flake on slow CI machines.
     let deadline = std::time::Instant::now() + Duration::from_secs(5);
-    while last_seq.load(Ordering::Acquire) < 3 && std::time::Instant::now() < deadline {
+    while last_seq.load().get() < 3 && std::time::Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(10));
     }
     rotate_flag.store(true, Ordering::Release);
@@ -452,11 +458,11 @@ fn allocator_wire_seq_and_gate_cursor_agree_across_rotation() {
     // allocator running ahead of wire space overshoots and fails
     // immediately rather than timing out.
     let deadline = std::time::Instant::now() + Duration::from_secs(5);
-    while last_seq.load(Ordering::Acquire) < MAX_WIRE_SEQ && std::time::Instant::now() < deadline {
+    while last_seq.load().get() < MAX_WIRE_SEQ && std::time::Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(10));
     }
     assert_eq!(
-        last_seq.load(Ordering::Acquire),
+        last_seq.load().get(),
         MAX_WIRE_SEQ,
         "gate persisted cursor diverged from wire space — a writer-internal \
          entry is consuming sequences again (the pre-v14 vacuous-gate bug)"
@@ -546,7 +552,7 @@ fn recovery_resumes_allocator_wire_and_gate_agreement() {
         let mut input_producer = out.input_producer;
         let mut journal_stage = out.journal_stage;
         let matching_stage = out.matching_stage;
-        let last_seq = Arc::clone(&out.last_seq);
+        let last_seq = out.cursors.durable_wire_seq();
 
         let rotate_flag = Arc::new(AtomicBool::new(false));
         journal_stage.set_rotation(
@@ -564,17 +570,17 @@ fn recovery_resumes_allocator_wire_and_gate_agreement() {
             input_producer.publish(make_slot(JournalEvent::App(TestEvent::Add(n))));
         }
         let deadline = std::time::Instant::now() + Duration::from_secs(5);
-        while last_seq.load(Ordering::Acquire) < 3 && std::time::Instant::now() < deadline {
+        while last_seq.load().get() < 3 && std::time::Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(10));
         }
         rotate_flag.store(true, Ordering::Release);
         input_producer.publish(make_slot(JournalEvent::App(TestEvent::Add(4))));
 
         let deadline = std::time::Instant::now() + Duration::from_secs(5);
-        while last_seq.load(Ordering::Acquire) < 4 && std::time::Instant::now() < deadline {
+        while last_seq.load().get() < 4 && std::time::Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(10));
         }
-        assert_eq!(last_seq.load(Ordering::Acquire), 4, "phase 1 fsync");
+        assert_eq!(last_seq.load().get(), 4, "phase 1 fsync");
 
         shutdown.store(true, Ordering::Relaxed);
         let _writer = t_journal.join().unwrap();
@@ -603,14 +609,14 @@ fn recovery_resumes_allocator_wire_and_gate_agreement() {
     let mut input_producer = out.input_producer;
     let journal_stage = out.journal_stage;
     let matching_stage = out.matching_stage;
-    let last_seq = Arc::clone(&out.last_seq);
+    let last_seq = out.cursors.durable_wire_seq();
     let mut output_consumer = out.output_consumers.pop().unwrap();
 
     // The gate cursor must resume at exactly the recovered high-water
     // mark — before any new event is published. A writer-internal
     // entry consumed during recovery/reopen would overshoot here.
     assert_eq!(
-        last_seq.load(Ordering::Acquire),
+        last_seq.load().get(),
         4,
         "gate persisted cursor must resume at the recovered high-water mark"
     );
@@ -648,11 +654,11 @@ fn recovery_resumes_allocator_wire_and_gate_agreement() {
     );
 
     let deadline = std::time::Instant::now() + Duration::from_secs(5);
-    while last_seq.load(Ordering::Acquire) < 6 && std::time::Instant::now() < deadline {
+    while last_seq.load().get() < 6 && std::time::Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(10));
     }
     assert_eq!(
-        last_seq.load(Ordering::Acquire),
+        last_seq.load().get(),
         6,
         "gate persisted cursor diverged from wire space after recovery"
     );
@@ -706,7 +712,7 @@ fn replica_ack_cursor_tracks_primary_sequences_across_local_rotation() {
     let mut input_producer = replica.input_producer;
     let mut journal_stage = replica.journal_stage;
     let matching_stage = replica.matching_stage;
-    let last_seq = Arc::clone(&replica.last_seq);
+    let last_seq = replica.cursors.durable_wire_seq();
 
     let rotate_flag = Arc::new(AtomicBool::new(false));
     journal_stage.set_rotation(
@@ -726,7 +732,7 @@ fn replica_ack_cursor_tracks_primary_sequences_across_local_rotation() {
         input_producer.publish(add_slot_with_seq(seq * 10, seq, 1_000_000_000 + seq));
     }
     let deadline = std::time::Instant::now() + Duration::from_secs(5);
-    while last_seq.load(Ordering::Acquire) < 3 && std::time::Instant::now() < deadline {
+    while last_seq.load().get() < 3 && std::time::Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(10));
     }
     rotate_flag.store(true, Ordering::Release);
@@ -745,11 +751,11 @@ fn replica_ack_cursor_tracks_primary_sequences_across_local_rotation() {
     // consumed a sequence — the replica would ack events the primary
     // never sent.
     let deadline = std::time::Instant::now() + Duration::from_secs(5);
-    while last_seq.load(Ordering::Acquire) < 5 && std::time::Instant::now() < deadline {
+    while last_seq.load().get() < 5 && std::time::Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(10));
     }
     assert_eq!(
-        last_seq.load(Ordering::Acquire),
+        last_seq.load().get(),
         5,
         "replica ack cursor diverged from primary-stamped sequences — a \
          replica-local writer entry is consuming sequences"
@@ -845,7 +851,7 @@ fn full_pipeline_journal_and_matching_parallel() {
     let mut input_producer = out.input_producer;
     let journal_stage = out.journal_stage;
     let matching_stage = out.matching_stage;
-    let journal_cursor = out.journal_cursor;
+    let journal_cursor = out.cursors.journal_ring_arc();
     let mut output_consumer = out.output_consumers.pop().unwrap();
 
     let shutdown = Arc::new(AtomicBool::new(false));
@@ -931,8 +937,8 @@ fn journal_stage_sends_replication_batches() {
     let journal_stage = out.journal_stage;
     let matching_stage = out.matching_stage;
     let mut input_producer = out.input_producer;
-    let journal_cursor = out.journal_cursor;
-    let replication_cursor = out.replication_cursor;
+    let journal_cursor = out.cursors.journal_ring_arc();
+    let replication_cursor = out.cursors.replica_quorum_cursor_arc();
 
     let shutdown = Arc::new(AtomicBool::new(false));
     let s1 = Arc::clone(&shutdown);
@@ -1031,7 +1037,12 @@ fn replication_cursor_always_starts_at_max() {
             false,
         );
         assert!(out.replication_consumers.is_none());
-        assert_eq!(out.replication_cursor.load(Ordering::Relaxed), u64::MAX);
+        assert_eq!(
+            out.cursors
+                .replica_quorum_cursor_arc()
+                .load(Ordering::Relaxed),
+            PipelineCursors::NO_REPLICA
+        );
     }
 
     // Replication enabled — cursor still starts at u64::MAX.
@@ -1054,9 +1065,11 @@ fn replication_cursor_always_starts_at_max() {
         );
         assert!(out.replication_consumers.is_some());
         assert_eq!(
-            out.replication_cursor.load(Ordering::Relaxed),
-            u64::MAX,
-            "replication cursor should start at MAX even when enabled"
+            out.cursors
+                .replica_quorum_cursor_arc()
+                .load(Ordering::Relaxed),
+            PipelineCursors::NO_REPLICA,
+            "replication cursor should start at the sentinel even when enabled"
         );
     }
 }
@@ -1769,4 +1782,138 @@ fn pipeline_journal_contents_match_across_writer_modes() {
         "writer modes diverged on app-event sequences"
     );
     assert_eq!(sector.len(), 5);
+}
+
+/// End-to-end pin for the stats-query surface: `ApplyCtx.journal_sequence`
+/// must report the durable wire seq — the same space as the health
+/// endpoint's `journal_seq` gauge — both live and, critically, after
+/// recovery, where the journal ring cursor restarts near zero while the
+/// durable cursor resumes at the recovered high-water mark. Guards the
+/// space fix that moved the stats surface off the ring cursor.
+#[test]
+fn stats_query_reports_durable_wire_seq_across_recovery() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("stats_query_durable.journal");
+
+    fn slot(event: JournalEvent<TestEvent>) -> TestInput {
+        InputSlot {
+            connection_id: 1,
+            key_hash: 0,
+            request_seq: 0,
+            sequence: 0,
+            timestamp_ns: 0,
+            event,
+            publish_ts: mono_trace_ns(),
+            recv_ts: mono_trace_ns(),
+        }
+    }
+
+    fn drain_query(output_consumer: &mut ring::Consumer<TestOutput>) -> TestQuery {
+        let mut spins = 0u64;
+        loop {
+            if let Some((_, out_slot)) = output_consumer.try_consume() {
+                if let OutputPayload::QueryResponse(q) = out_slot.payload {
+                    return q;
+                }
+            } else {
+                spins += 1;
+                assert!(spins < 100_000_000, "timeout draining query response");
+                std::hint::spin_loop();
+            }
+        }
+    }
+
+    // --- Phase 1: fresh journal — the query reports the live durable seq.
+    {
+        let writer = Writer::create(&path).unwrap();
+        let mut out = build_pipeline_with_replication(
+            TestApp::new(),
+            writer,
+            Duration::ZERO,
+            Arc::new(AtomicU64::new(0)),
+            false,
+            MAX_JOURNAL_BATCH,
+            REPLICATION_RING_CAPACITY,
+            false,
+            false,
+            false,
+        );
+        let mut input_producer = out.input_producer;
+        let journal_stage = out.journal_stage;
+        let matching_stage = out.matching_stage;
+        let last_seq = out.cursors.durable_wire_seq();
+        let mut output_consumer = out.output_consumers.pop().unwrap();
+
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let s1 = Arc::clone(&shutdown);
+        let s2 = Arc::clone(&shutdown);
+        let t_journal = std::thread::spawn(move || journal_stage.run(&s1));
+        let t_matching = std::thread::spawn(move || matching_stage.run(&s2));
+
+        for n in 1..=5u64 {
+            input_producer.publish(slot(JournalEvent::App(TestEvent::Add(n))));
+        }
+        // Wait for the fsync to land before querying: the durable cursor
+        // then sits at exactly 5 and cannot move (queries are never
+        // journaled), so the assertion below is race-free.
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while last_seq.load().get() < 5 && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(last_seq.load().get(), 5, "phase 1 fsync");
+
+        input_producer.publish(slot(JournalEvent::App(TestEvent::Query)));
+        let q = drain_query(&mut output_consumer);
+        assert_eq!(q.total, 1 + 2 + 3 + 4 + 5);
+        assert_eq!(
+            q.journal_sequence, 5,
+            "live stats query must report the durable wire seq"
+        );
+
+        shutdown.store(true, Ordering::Relaxed);
+        let _writer = t_journal.join().unwrap();
+        let _app = t_matching.join().unwrap();
+    }
+
+    // --- Phase 2: recover — the ring cursor restarts at zero, but the
+    // stats surface must keep reporting the recovered high-water mark.
+    let engine = JournaledApp::<TestApp, Writer>::recover(TestApp::new(), &path).unwrap();
+    let (app, writer) = engine.into_parts();
+    let mut out = build_pipeline_with_replication(
+        app,
+        writer,
+        Duration::ZERO,
+        Arc::new(AtomicU64::new(0)),
+        false,
+        MAX_JOURNAL_BATCH,
+        REPLICATION_RING_CAPACITY,
+        false,
+        false,
+        false,
+    );
+    let mut input_producer = out.input_producer;
+    let journal_stage = out.journal_stage;
+    let matching_stage = out.matching_stage;
+    let mut output_consumer = out.output_consumers.pop().unwrap();
+
+    let shutdown = Arc::new(AtomicBool::new(false));
+    let s1 = Arc::clone(&shutdown);
+    let s2 = Arc::clone(&shutdown);
+    let t_journal = std::thread::spawn(move || journal_stage.run(&s1));
+    let t_matching = std::thread::spawn(move || matching_stage.run(&s2));
+
+    // The query is the FIRST slot consumed after boot — the journal ring
+    // cursor is still ~0, so reading the ring instead of the durable
+    // cursor (the pre-fix behaviour) would report ~0 here, not 5.
+    input_producer.publish(slot(JournalEvent::App(TestEvent::Query)));
+    let q = drain_query(&mut output_consumer);
+    assert_eq!(q.total, 15, "recovered state");
+    assert_eq!(
+        q.journal_sequence, 5,
+        "post-recovery stats query must report the recovered durable high-water, not the ring position"
+    );
+
+    shutdown.store(true, Ordering::Relaxed);
+    let _writer = t_journal.join().unwrap();
+    let _app = t_matching.join().unwrap();
 }

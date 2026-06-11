@@ -11,9 +11,11 @@
 //!    to the output SPSC. Runs concurrently with the journal — no waiting for sync.
 //!
 //! The **response stage** (in the server crate) consumes the output SPSC but
-//! gates on `min(journal_cursor, replication_cursor)` before sending: a response
-//! is only sent after the event is durable on disk **and** acknowledged by the
-//! replica (when replication is active).
+//! gates each event on the configured durability policy before sending: it
+//! evaluates the durable wire-seq cursor (local fsync progress) together with
+//! the per-replica ack metrics, so a response is only sent once the policy's
+//! durability requirement is met (e.g. on disk **and** acknowledged by a
+//! replica when replication is active).
 //!
 //! This gives maximum pipeline parallelism (matching overlaps journal I/O)
 //! while preserving persist-before-ack at the response boundary.
@@ -33,6 +35,8 @@ use melin_pipeline::padding::Sequence;
 use melin_pipeline::ring;
 use melin_pipeline::seqlock::SeqLock;
 
+use crate::cursors::{DurableWireSeqCursor, PipelineCursors, RingPos, WireSeq};
+
 use crate::replication_wire::{finalize_input_batch, init_input_batch};
 
 /// Post-fsync state published by the journal stage after each durable
@@ -46,8 +50,10 @@ use crate::replication_wire::{finalize_input_batch, init_input_batch};
 #[repr(C)]
 pub struct FsyncState {
     /// Highest journal sequence durably persisted
-    /// (`writer.next_sequence() - 1`).
-    pub journal_seq: u64,
+    /// (`writer.next_sequence() - 1`). Wire-seq space — the same value the
+    /// journal stage publishes through `PipelineCursors::durable_wire_seq`
+    /// (both are written in the same `publish_fsync_state` call).
+    pub journal_seq: WireSeq,
     /// BLAKE3 chain hash after the fsync. `[0u8; 32]` when hash-chain
     /// is disabled.
     pub chain_hash: [u8; 32],
@@ -55,7 +61,7 @@ pub struct FsyncState {
     /// (`consumer.next_read()` right after `commit`/`set_progress`).
     /// The shadow compares this against its own `next_read` to confirm
     /// it has caught up to the exact fsync boundary.
-    pub input_ring_seq: u64,
+    pub input_ring_seq: RingPos,
 }
 
 /// Per-stage busy/idle iteration counters for pipeline utilization monitoring.
@@ -393,12 +399,12 @@ pub struct JournalStage<E: AppEvent, W: JournalWrite<E>> {
     /// snapshot stage. Updated once per fsync batch (cold path). `None` when
     /// shadow snapshots are disabled — no allocation or write overhead.
     chain_hash: Option<Arc<SeqLock<FsyncState>>>,
-    /// Optional atomic for publishing the writer's `next_sequence - 1`
-    /// (the highest journal sequence durably persisted) to readers outside
-    /// the pipeline thread. Replicas use this so the orchestrator can read
-    /// last-journal-seq for reconnect handshakes without owning the writer.
+    /// Optional typed handle for publishing the writer's `next_sequence - 1`
+    /// (the highest wire seq durably persisted) to readers outside the
+    /// pipeline thread — the durability gate, health endpoint, and the
+    /// replica orchestrator's reconnect handshake all read the same cursor.
     /// Updated once per fsync batch alongside `chain_hash`.
-    last_seq: Option<Arc<AtomicU64>>,
+    last_seq: Option<DurableWireSeqCursor>,
     /// When true, never yield to the OS scheduler — spin indefinitely with
     /// PAUSE. Requires isolated cores (`isolcpus`). See [`idle_wait`].
     busy_spin: bool,
@@ -577,11 +583,11 @@ impl<E: AppEvent, W: JournalWrite<E>> JournalStage<E, W> {
         self.chain_hash = Some(lock);
     }
 
-    /// Set the atomic for publishing the highest journal sequence durably
+    /// Set the cursor handle for publishing the highest wire seq durably
     /// persisted. Called once during pipeline construction when readers
     /// outside the pipeline thread (e.g., the replication-receive
     /// orchestrator) need to read the writer's progress without owning it.
-    pub fn set_last_seq_publisher(&mut self, last_seq: Arc<AtomicU64>) {
+    pub fn set_last_seq_publisher(&mut self, last_seq: DurableWireSeqCursor) {
         self.last_seq = Some(last_seq);
     }
 
@@ -917,13 +923,13 @@ impl<E: AppEvent, W: JournalWrite<E>> JournalStage<E, W> {
         let journal_seq = self.writer.next_sequence().saturating_sub(1);
         if let Some(ref lock) = self.chain_hash {
             lock.store(FsyncState {
-                journal_seq,
+                journal_seq: WireSeq::new(journal_seq),
                 chain_hash: self.writer.chain_hash().unwrap_or([0u8; 32]),
-                input_ring_seq: self.consumer.next_read(),
+                input_ring_seq: RingPos::new(self.consumer.next_read()),
             });
         }
-        if let Some(ref atom) = self.last_seq {
-            atom.store(journal_seq, Ordering::Release);
+        if let Some(ref cursor) = self.last_seq {
+            cursor.store(WireSeq::new(journal_seq));
         }
     }
 
@@ -1647,10 +1653,12 @@ pub struct MatchingStage<A: Application> {
     /// is sufficient — this is a diagnostic counter, not a synchronization
     /// primitive. One `fetch_add(1, Relaxed)` per event (~1ns).
     events_processed: Arc<AtomicU64>,
-    /// Journal cursor for reading the current durable sequence. Used by
-    /// `QueryStats` to report the journal position without adding any
-    /// cross-thread synchronization on the hot path.
-    journal_cursor: Arc<Sequence>,
+    /// Durable-wire-seq cursor for reading the highest durably-persisted
+    /// sequence. Feeds `ApplyCtx.journal_sequence` (read by `QueryStats`),
+    /// in the same wire-seq space as the health endpoint's `journal_seq`
+    /// gauge so the two operator surfaces agree. One `Acquire` load per
+    /// batch — no extra cross-thread synchronization on the hot path.
+    durable_wire_seq: DurableWireSeqCursor,
     /// Active connection count, shared with the server accept loop.
     /// Read only when processing `QueryStats` (once per second at most).
     active_connections: Arc<AtomicU64>,
@@ -1689,7 +1697,7 @@ impl<A: Application> MatchingStage<A> {
         consumer: ring::Consumer<InputSlot<A::Event>>,
         output: ring::Producer<OutputSlot<A::Report, A::QueryResponse>>,
         events_processed: Arc<AtomicU64>,
-        journal_cursor: Arc<Sequence>,
+        durable_wire_seq: DurableWireSeqCursor,
         active_connections: Arc<AtomicU64>,
         replicas_connected: Option<Arc<AtomicU32>>,
         busy_spin: bool,
@@ -1700,7 +1708,7 @@ impl<A: Application> MatchingStage<A> {
             consumer,
             output,
             events_processed,
-            journal_cursor,
+            durable_wire_seq,
             active_connections,
             replicas_connected,
             busy_spin,
@@ -1800,10 +1808,11 @@ impl<A: Application> MatchingStage<A> {
             // fine. `now_ns` and `key_hash` are overwritten per-event
             // below (the latter from the slot's authenticated identity
             // so self-introspecting queries can read it from `ctx`).
-            // Three Relaxed loads per batch instead of per event.
+            // Two Relaxed loads + one Acquire load per batch instead of
+            // per event.
             let mut ctx = ApplyCtx {
                 now_ns: 0,
-                journal_sequence: self.journal_cursor.get().load(Ordering::Relaxed),
+                journal_sequence: self.durable_wire_seq.load(),
                 active_connections: self.active_connections.load(Ordering::Relaxed),
                 events_processed: local_events,
                 key_hash: 0,
@@ -2098,7 +2107,7 @@ impl<A: Application> MatchingStage<A> {
         // with zeroed counters (no health endpoint cares at this point).
         let ctx = ApplyCtx {
             now_ns: 0,
-            journal_sequence: 0,
+            journal_sequence: WireSeq::new(0),
             active_connections: 0,
             events_processed: 0,
             key_hash: 0,
@@ -2278,24 +2287,20 @@ pub struct Pipeline<A: Application, W: JournalWrite<A::Event>> {
     pub journal_stage: JournalStage<A::Event, W>,
     pub matching_stage: MatchingStage<A>,
     pub output_consumers: Vec<ring::Consumer<OutputSlot<A::Report, A::QueryResponse>>>,
-    pub journal_cursor: Arc<Sequence>,
-    pub matching_cursor: Arc<Sequence>,
     pub events_processed: Arc<AtomicU64>,
     pub input_cursor: Box<dyn ring::QueueCursor>,
     pub replication_consumers: Option<(ReplicationConsumer, ReplicationConsumer)>,
-    pub replication_cursor: Arc<AtomicU64>,
     pub replicas_connected: Option<Arc<AtomicU32>>,
     pub shadow_consumer: Option<ring::Consumer<InputSlot<A::Event>>>,
     pub chain_hash_lock: Option<Arc<SeqLock<FsyncState>>>,
     pub replication_ring_progress: Option<ReplicationRingProgress>,
-    /// Highest wire seq durably persisted on this node's journal.
-    /// Published by the journal stage after every fsync batch via
-    /// `set_last_seq_publisher`. The response stage uses this — *not*
-    /// `journal_cursor` — for the primary's `persisted` cursor in the
-    /// durability policy view: it's in wire-seq space (same as replica
-    /// metrics and `OutputSlot.wire_seq`), so the gate's numeric
-    /// comparison is sound regardless of `starting_sequence`.
-    pub last_seq: Arc<AtomicU64>,
+    /// Journal-progress cursors, space-typed. Bundles the durable wire seq
+    /// (the response stage's `persisted` cursor and the replica handshake
+    /// value), the journal/matching ring positions (queue-depth monitoring),
+    /// and the replica quorum cursor (slowest engaged replica's ack, for
+    /// replication-lag monitoring). See [`PipelineCursors`] for why the
+    /// wire-seq vs ring-index split matters.
+    pub cursors: PipelineCursors,
 }
 
 /// Assembled replica pipeline stages and handles returned by [`build_replica_pipeline`].
@@ -2304,13 +2309,12 @@ pub struct ReplicaPipeline<A: Application, W: JournalWrite<A::Event>> {
     pub journal_stage: JournalStage<A::Event, W>,
     pub matching_stage: MatchingStage<A>,
     pub drain_consumer: ring::Consumer<OutputSlot<A::Report, A::QueryResponse>>,
-    pub journal_cursor: Arc<Sequence>,
-    pub matching_cursor: Arc<Sequence>,
     pub shadow_consumer: Option<ring::Consumer<InputSlot<A::Event>>>,
-    /// Always populated for replicas — the orchestrator reads it for
-    /// reconnect handshakes (last journal sequence the replica has durably
-    /// persisted). Updated by `JournalStage` after each fsync batch.
-    pub last_seq: Arc<AtomicU64>,
+    /// Journal-progress cursors, space-typed. On a replica the orchestrator
+    /// reads `durable_wire_seq` for reconnect handshakes (last journal sequence
+    /// durably persisted); the replica quorum cursor stays at the `NO_REPLICA` sentinel
+    /// (no downstream replica). Updated by `JournalStage` after each fsync.
+    pub cursors: PipelineCursors,
     pub chain_hash_lock: Option<Arc<SeqLock<FsyncState>>>,
 }
 
@@ -2431,7 +2435,8 @@ fn setup_chain_hash_publisher<E: AppEvent, W: JournalWrite<E>>(
     }
 }
 
-/// When replication is disabled, the cursor is `u64::MAX` (standalone mode).
+/// When replication is disabled, the replica quorum cursor stays at its
+/// `PipelineCursors::NO_REPLICA` sentinel (standalone mode).
 #[allow(clippy::too_many_arguments)]
 pub fn build_pipeline_with_replication<A, W>(
     app: A,
@@ -2484,12 +2489,20 @@ where
     // recovery from a non-trivial journal (`starting_sequence > 1`).
     let starting_wire_seq = writer.next_sequence();
 
-    // Atomic carrying "highest wire seq durably persisted on disk".
-    // Initial value = `starting_wire_seq - 1` so the response stage sees
-    // the post-recovery / post-genesis durable cursor immediately rather
-    // than waiting for the first user event's fsync to publish it. The
-    // journal stage Release-stores into this after every fsync batch.
-    let last_seq = Arc::new(AtomicU64::new(starting_wire_seq.saturating_sub(1)));
+    // Bundle the journal-progress cursors behind space-typed accessors and
+    // wire every stage from it. The durable cursor starts at
+    // `starting_wire_seq - 1` so the response stage sees the post-recovery /
+    // post-genesis durable position immediately rather than waiting for the
+    // first user event's fsync to publish it; the journal stage
+    // Release-stores into it after every fsync batch. The replica quorum
+    // cursor starts at the `NO_REPLICA` sentinel so the server works
+    // immediately even before a replica connects (the replication sender
+    // takes over the cursor when one does).
+    let cursors = PipelineCursors::new(
+        WireSeq::new(starting_wire_seq.saturating_sub(1)),
+        journal_cursor,
+        matching_cursor,
+    );
 
     let mut journal_stage = JournalStage::new(
         writer,
@@ -2498,7 +2511,7 @@ where
         max_journal_batch,
         busy_spin,
     );
-    journal_stage.set_last_seq_publisher(Arc::clone(&last_seq));
+    journal_stage.set_last_seq_publisher(cursors.durable_wire_seq());
 
     // Build two independent SPSC replication rings (one per replica slot).
     // Each ring has its own producer and consumer, so a slow replica only
@@ -2564,37 +2577,26 @@ where
         matching_consumer,
         output_producer,
         Arc::clone(&events_processed),
-        Arc::clone(&journal_cursor),
+        cursors.durable_wire_seq(),
         active_connections,
         replicas_connected.clone(),
         busy_spin,
         starting_wire_seq,
     );
 
-    // Replication cursor: shared atomic read by the response stage.
-    // Always initialized to u64::MAX so the server works immediately
-    // even before a replica connects. When a replica connects and starts
-    // acking, the sender thread sets this to the acked sequence.
-    // On disconnect, it's reset to u64::MAX (degrade to local-only).
-    // This means: `min(journal_cursor, u64::MAX) = journal_cursor`.
-    let replication_cursor = Arc::new(AtomicU64::new(u64::MAX));
-
     Pipeline {
         input_producer,
         journal_stage,
         matching_stage,
         output_consumers,
-        journal_cursor,
-        matching_cursor,
         events_processed,
         input_cursor,
         replication_consumers,
-        replication_cursor,
         replicas_connected,
         shadow_consumer,
         chain_hash_lock,
         replication_ring_progress,
-        last_seq,
+        cursors,
     }
 }
 
@@ -2666,17 +2668,23 @@ where
 
     let chain_hash_lock = setup_chain_hash_publisher(&mut journal_stage, enable_shadow);
 
-    // Last-journaled-sequence atomic — always populated for replicas. The
-    // orchestrator reads it for reconnect handshakes without owning the
-    // writer (the writer lives inside `journal_stage` for the lifetime of
-    // the pipeline). Initialise from the writer's pre-pipeline state
-    // (mirrors the primary builder) so the handshake reflects what's
-    // already on disk even before the first fsync nudges the atomic —
-    // a fresh writer here returns `starting_wire_seq == 1` (no genesis
-    // yet) or `>= 2` (post-genesis), so `saturating_sub(1)` yields the
-    // correct "highest wire seq durable" reading at boot.
-    let last_seq = Arc::new(AtomicU64::new(starting_wire_seq.saturating_sub(1)));
-    journal_stage.set_last_seq_publisher(Arc::clone(&last_seq));
+    // Bundle the journal-progress cursors (mirrors the primary builder).
+    // The durable cursor is always published on replicas: the orchestrator
+    // reads it for reconnect handshakes without owning the writer (the
+    // writer lives inside `journal_stage` for the lifetime of the
+    // pipeline). Initialise from the writer's pre-pipeline state so the
+    // handshake reflects what's already on disk even before the first
+    // fsync nudges the cursor — a fresh writer here returns
+    // `starting_wire_seq == 1` (no genesis yet) or `>= 2` (post-genesis),
+    // so `saturating_sub(1)` yields the correct "highest wire seq durable"
+    // reading at boot. The replica quorum cursor stays at its `NO_REPLICA`
+    // sentinel for the lifetime of the pipeline (no downstream replica).
+    let cursors = PipelineCursors::new(
+        WireSeq::new(starting_wire_seq.saturating_sub(1)),
+        journal_cursor,
+        matching_cursor,
+    );
+    journal_stage.set_last_seq_publisher(cursors.durable_wire_seq());
 
     // Matching stage: same as primary but with no replicas_connected check
     // (None = standalone mode, never halts on replica disconnect).
@@ -2686,7 +2694,7 @@ where
         matching_consumer,
         output_producer,
         Arc::clone(&events_processed),
-        Arc::clone(&journal_cursor),
+        cursors.durable_wire_seq(),
         active_connections,
         None, // no replicas_connected halt check on replica
         busy_spin,
@@ -2698,10 +2706,8 @@ where
         journal_stage,
         matching_stage,
         drain_consumer,
-        journal_cursor,
-        matching_cursor,
         shadow_consumer,
-        last_seq,
+        cursors,
         chain_hash_lock,
     }
 }

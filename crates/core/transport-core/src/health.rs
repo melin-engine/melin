@@ -18,8 +18,14 @@
 //! panicked or the server is shutting down).
 //!
 //! - `active_connections`: currently authenticated client connections
-//! - `journal_seq`: latest durable journal sequence number
-//! - `replication_lag`: `journal_seq - replication_cursor` (0 in standalone)
+//! - `journal_seq`: latest durable journal sequence number (wire-seq space —
+//!   the highest sequence fsynced to this node's journal)
+//! - `replication_lag`: `journal_seq - replica_quorum_ack` in wire-seq space,
+//!   where `replica_quorum_ack` is the *slowest engaged* replica's durably
+//!   confirmed sequence — the number of durable events not yet confirmed by
+//!   every engaged replica (0 in standalone, or until a replica engages; the
+//!   fastest replica's position is the separate `fastest_replica_cursor`
+//!   gauge)
 
 use std::io::{Cursor, Read as _, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
@@ -31,6 +37,7 @@ use melin_pipeline::padding::Sequence;
 use melin_pipeline::ring::QueueCursor;
 use tracing::{debug, error, info};
 
+use crate::cursors::{PipelineCursors, RingPos, SlotAcked, WireSeq};
 use crate::pipeline::{INPUT_RING_CAPACITY, StageUtilization};
 
 /// Shared monitoring state passed to the health loop.
@@ -38,23 +45,33 @@ use crate::pipeline::{INPUT_RING_CAPACITY, StageUtilization};
 pub struct HealthState {
     pub active_connections: Arc<AtomicU64>,
     pub events_processed: Arc<AtomicU64>,
-    pub journal_cursor: Arc<Sequence>,
-    pub matching_cursor: Arc<Sequence>,
+    /// Journal-progress cursors, space-typed. The `journal_seq` gauge reads
+    /// `durable_wire_seq` (wire-seq); the ring positions drive queue-depth, and
+    /// the replica quorum cursor drives replication lag. See [`PipelineCursors`].
+    pub cursors: PipelineCursors,
+    /// Input ring producer cursor (ring-index space). Paired with the matching
+    /// consumer position to compute input queue depth.
     pub input_cursor: Box<dyn QueueCursor>,
-    pub replication_cursor: Arc<AtomicU64>,
     pub pipeline_healthy: Arc<AtomicBool>,
     pub replicas_connected: Option<Arc<AtomicU32>>,
     /// Per-replica replication metrics. None in standalone mode.
     pub replication_metrics: Option<Arc<crate::replication::ReplicationMetrics>>,
+    /// Per-slot engaged flags from the replication sender (`Release`-flipped
+    /// after the slot's gauge pair is seeded). Distinguishes "engaged at
+    /// acked 0" (fresh replica — real lag) from "disconnected" (gauges
+    /// zeroed — lag 0). `None` in standalone mode or for callers that don't
+    /// wire it; per-slot lag then falls back to the `acked == 0` heuristic.
+    pub replica_active: Option<[Arc<AtomicBool>; 2]>,
     /// Per-slot replication-ring producer cursors. Paired index-wise with
     /// `replication_ring_consumer_cursors` to compute per-slot ring depth
     /// (producer - consumer). `None` in standalone mode.
     pub replication_ring_producer_cursors: Option<[Arc<dyn QueueCursor>; 2]>,
     /// Per-slot replication-ring consumer progress counters. See above.
     pub replication_ring_consumer_cursors: Option<[Arc<Sequence>; 2]>,
-    /// The "fastest replica" cursor — `max(slot_acked[0], slot_acked[1])`,
-    /// maintained by the replication sender. Stored as `u64::MAX` when no
-    /// replica has engaged yet. `None` in standalone mode.
+    /// The "fastest replica" cursor — `max` over the engaged slots'
+    /// [`SlotAcked`] cursors, maintained by the replication sender; the
+    /// snapshot decodes it to the acked wire seq. Holds the disengaged
+    /// sentinel when no replica has engaged. `None` in standalone mode.
     pub fastest_replica_cursor: Option<Arc<AtomicU64>>,
     /// Per-stage busy/idle utilization counters.
     pub journal_utilization: Arc<StageUtilization>,
@@ -165,21 +182,26 @@ impl HealthSnapshot {
         let healthy = state.pipeline_healthy.load(Ordering::Relaxed);
         let conns = state.active_connections.load(Ordering::Relaxed);
         let evts = state.events_processed.load(Ordering::Relaxed);
-        let journal_seq = state.journal_cursor.get().load(Ordering::Relaxed);
-        let repl_cursor = state.replication_cursor.load(Ordering::Relaxed);
+        // Highest durably-persisted wire seq — the true "latest durable journal
+        // sequence". Read in wire-seq space (not the journal ring cursor) so the
+        // gauge survives recovery and queries, and so the lag computations below
+        // stay in one space.
+        let journal_seq = state.cursors.load_durable_wire_seq();
+        let replica_quorum_acked = state.cursors.load_replica_quorum_acked();
 
-        // Input queue depth: producer_cursor - matching_cursor.
-        // Matching is the terminal consumer (gated on journal), so this
+        // Input queue depth: producer_cursor - matching_cursor (ring-index
+        // space). Matching is the terminal consumer (gated on journal), so this
         // is the total pending items in the input disruptor.
-        let producer_seq = state.input_cursor.load();
-        let matching_seq = state.matching_cursor.get().load(Ordering::Relaxed);
+        let producer_seq = RingPos::new(state.input_cursor.load());
+        let matching_seq = state.cursors.load_matching_ring();
         let input_queue_depth = producer_seq.saturating_sub(matching_seq);
 
-        // Replication lag: 0 in standalone mode (cursor is u64::MAX).
-        let replication_lag = if repl_cursor == u64::MAX {
-            0
-        } else {
-            journal_seq.saturating_sub(repl_cursor)
+        // Replication lag in wire-seq space: durable events not yet confirmed
+        // by every engaged replica (the slowest engaged replica's deficit).
+        // 0 in standalone mode (no replica has engaged).
+        let replication_lag = match replica_quorum_acked {
+            Some(acked) => journal_seq.saturating_sub(acked),
+            None => 0,
         };
 
         // Trading state: "trading" when standalone or at least one replica
@@ -224,16 +246,32 @@ impl HealthSnapshot {
                 rm.in_memory_sequence[0].load(Ordering::Relaxed),
                 rm.in_memory_sequence[1].load(Ordering::Relaxed),
             ];
+            // `acked` is wire-seq (replica ack metrics), same space as
+            // `journal_seq`. Lag is reported only for engaged slots: a
+            // replica legitimately engaged at acked 0 (fresh journal) must
+            // show its real deficit, while a disengaged slot (whose gauge
+            // pair is zeroed on disconnect) reports 0. The per-slot active
+            // flags disambiguate; when they aren't wired (older callers,
+            // tests), fall back to the historical `acked == 0` heuristic.
+            let engaged = |i: usize| {
+                state
+                    .replica_active
+                    .as_ref()
+                    // `Acquire` pairs with the sender's `Release` flag flip,
+                    // which happens after the gauge pair is seeded.
+                    .map(|flags| flags[i].load(Ordering::Acquire))
+                    .unwrap_or(acked[i] != 0)
+            };
             let lag = [
-                if acked[0] == 0 {
-                    0
+                if engaged(0) {
+                    journal_seq.saturating_sub(WireSeq::new(acked[0]))
                 } else {
-                    journal_seq.saturating_sub(acked[0])
+                    0
                 },
-                if acked[1] == 0 {
-                    0
+                if engaged(1) {
+                    journal_seq.saturating_sub(WireSeq::new(acked[1]))
                 } else {
-                    journal_seq.saturating_sub(acked[1])
+                    0
                 },
             ];
             let bytes = [
@@ -288,21 +326,22 @@ impl HealthSnapshot {
             _ => [0, 0],
         };
 
-        // Fastest-replica cursor. Mapped from the `u64::MAX` sentinel
-        // (no replica engaged yet / all disconnected) to 0 so the
-        // plotted series stays on-scale.
+        // Fastest-replica cursor, decoded from slot-acked space to the acked
+        // wire seq (same space as `journal_seq` and the per-slot acked
+        // gauges). The disengaged sentinel maps to 0 so the plotted series
+        // stays on-scale.
         let fastest_replica_cursor = state
             .fastest_replica_cursor
             .as_ref()
-            .map(|c| c.load(Ordering::Relaxed))
-            .map(|v| if v == u64::MAX { 0 } else { v })
-            .unwrap_or(0);
+            .map(|c| SlotAcked::from_raw(c.load(Ordering::Relaxed)))
+            .and_then(SlotAcked::acked)
+            .map_or(0, WireSeq::get);
 
         Self {
             healthy,
             active_connections: conns,
             events_processed: evts,
-            journal_seq,
+            journal_seq: journal_seq.get(),
             replication_lag,
             input_queue_depth,
             trading,
@@ -381,7 +420,7 @@ impl HealthSnapshot {
              # HELP melin_journal_sequence Latest durable journal sequence number.\n\
              # TYPE melin_journal_sequence counter\n\
              melin_journal_sequence {}\n\
-             # HELP melin_replication_lag Journal sequence minus replication cursor.\n\
+             # HELP melin_replication_lag Durable events not yet confirmed by every engaged replica (0 when none engaged).\n\
              # TYPE melin_replication_lag gauge\n\
              melin_replication_lag {}\n\
              # HELP melin_pipeline_healthy Whether the pipeline is healthy (1) or degraded (0).\n\
@@ -731,13 +770,36 @@ mod tests {
         }
     }
 
+    /// Build test cursors with explicit seeds for each space. `repl_acked`
+    /// is the slowest engaged replica's *acked wire seq* (stored as
+    /// `acked + 1`, mirroring `ReplicaCursors`' slot-acked space), or
+    /// `u64::MAX` (`NO_REPLICA`) for "no replica engaged".
+    fn test_cursors(
+        durable: u64,
+        journal_ring: u64,
+        matching_ring: u64,
+        repl_acked: u64,
+    ) -> PipelineCursors {
+        let cursors = PipelineCursors::new(
+            WireSeq::new(durable),
+            Arc::new(Sequence::new(AtomicU64::new(journal_ring))),
+            Arc::new(Sequence::new(AtomicU64::new(matching_ring))),
+        );
+        if repl_acked != PipelineCursors::NO_REPLICA {
+            cursors
+                .replica_quorum_cursor_arc()
+                .store(repl_acked + 1, Ordering::Relaxed);
+        }
+        cursors
+    }
+
     /// Helper: create a non-blocking listener and spawn the health loop.
     /// Returns (addr, events_processed, pipeline_healthy, shutdown_flag, join_handle).
     /// `replicas_connected` is None (standalone mode) unless overridden.
     fn start_health(
         active: u64,
         journal_seq: u64,
-        repl_cursor: u64,
+        repl_acked: u64,
     ) -> (
         SocketAddr,
         Arc<AtomicU64>,
@@ -745,14 +807,16 @@ mod tests {
         Arc<AtomicBool>,
         std::thread::JoinHandle<()>,
     ) {
-        start_health_with_replica(active, journal_seq, repl_cursor, None)
+        start_health_with_replica(active, journal_seq, repl_acked, None)
     }
 
     /// Like `start_health` but with an explicit `replicas_connected` flag.
+    /// `repl_acked` is the slowest engaged replica's acked wire seq, or
+    /// `u64::MAX` for "no replica engaged" — see [`test_cursors`].
     fn start_health_with_replica(
         active: u64,
         journal_seq: u64,
-        repl_cursor: u64,
+        repl_acked: u64,
         replicas_connected: Option<Arc<AtomicU32>>,
     ) -> (
         SocketAddr,
@@ -767,10 +831,6 @@ mod tests {
 
         let active = Arc::new(AtomicU64::new(active));
         let events = Arc::new(AtomicU64::new(0));
-        let journal = Arc::new(Sequence::new(AtomicU64::new(journal_seq)));
-        // Matching cursor = journal_seq (fully caught up) for most tests.
-        let matching = Arc::new(Sequence::new(AtomicU64::new(journal_seq)));
-        let repl = Arc::new(AtomicU64::new(repl_cursor));
         let healthy = Arc::new(AtomicBool::new(true));
         let shutdown = Arc::new(AtomicBool::new(false));
 
@@ -778,14 +838,17 @@ mod tests {
         let state = HealthState {
             active_connections: active,
             events_processed: Arc::clone(&events),
-            journal_cursor: journal,
-            matching_cursor: matching,
+            // The gauge reads `durable_wire_seq`; the ring cursors only feed
+            // queue depth. Seed all three from `journal_seq` so "fully caught
+            // up, empty queue" holds for most tests (depth = input − matching
+            // = 0).
+            cursors: test_cursors(journal_seq, journal_seq, journal_seq, repl_acked),
             // Input cursor = journal_seq (empty queue) for most tests.
             input_cursor: Box::new(MockCursor(AtomicU64::new(journal_seq))),
-            replication_cursor: repl,
             pipeline_healthy: Arc::clone(&healthy),
             replicas_connected,
             replication_metrics: None,
+            replica_active: None,
             replication_ring_producer_cursors: None,
             replication_ring_consumer_cursors: None,
             fastest_replica_cursor: None,
@@ -897,9 +960,6 @@ mod tests {
         // Test the public `spawn` API (bind + thread + accept + respond).
         let active = Arc::new(AtomicU64::new(7));
         let events = Arc::new(AtomicU64::new(0));
-        let journal = Arc::new(Sequence::new(AtomicU64::new(99)));
-        let matching = Arc::new(Sequence::new(AtomicU64::new(99)));
-        let repl = Arc::new(AtomicU64::new(u64::MAX));
         let healthy = Arc::new(AtomicBool::new(true));
         let shutdown = Arc::new(AtomicBool::new(false));
 
@@ -908,13 +968,12 @@ mod tests {
             HealthState {
                 active_connections: Arc::clone(&active),
                 events_processed: Arc::clone(&events),
-                journal_cursor: Arc::clone(&journal),
-                matching_cursor: Arc::clone(&matching),
+                cursors: test_cursors(99, 99, 99, u64::MAX),
                 input_cursor: Box::new(MockCursor(AtomicU64::new(99))),
-                replication_cursor: Arc::clone(&repl),
                 pipeline_healthy: Arc::clone(&healthy),
                 replicas_connected: None,
                 replication_metrics: None,
+                replica_active: None,
                 replication_ring_producer_cursors: None,
                 replication_ring_consumer_cursors: None,
                 fastest_replica_cursor: None,
@@ -943,13 +1002,12 @@ mod tests {
             HealthState {
                 active_connections: Arc::new(AtomicU64::new(0)),
                 events_processed: Arc::new(AtomicU64::new(0)),
-                journal_cursor: Arc::new(Sequence::new(AtomicU64::new(0))),
-                matching_cursor: Arc::new(Sequence::new(AtomicU64::new(0))),
+                cursors: test_cursors(0, 0, 0, u64::MAX),
                 input_cursor: Box::new(MockCursor(AtomicU64::new(0))),
-                replication_cursor: Arc::new(AtomicU64::new(u64::MAX)),
                 pipeline_healthy: Arc::new(AtomicBool::new(true)),
                 replicas_connected: None,
                 replication_metrics: None,
+                replica_active: None,
                 replication_ring_producer_cursors: None,
                 replication_ring_consumer_cursors: None,
                 fastest_replica_cursor: None,
@@ -1055,6 +1113,59 @@ mod tests {
         handle.join().unwrap();
     }
 
+    /// Regression: the `journal_sequence` gauge must report the durable
+    /// wire-seq, not the journal ring cursor. These live in different spaces
+    /// (the ring cursor resets to ~0 each process start and counts queries),
+    /// so a recovered node would otherwise report a tiny value. We pin the
+    /// distinction by giving the two cursors deliberately different values.
+    #[test]
+    fn journal_sequence_gauge_reads_durable_wire_seq_not_ring() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let addr = listener.local_addr().unwrap();
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let s = Arc::clone(&shutdown);
+
+        // Durable wire seq = 1_000_000 (post-recovery high-water), but the
+        // journal ring cursor is only 3 (fresh process, few slots drained).
+        // Matching ring = 1 so input queue depth = input(5) − matching(1) = 4.
+        let state = HealthState {
+            active_connections: Arc::new(AtomicU64::new(0)),
+            events_processed: Arc::new(AtomicU64::new(0)),
+            cursors: test_cursors(1_000_000, 3, 1, u64::MAX),
+            input_cursor: Box::new(MockCursor(AtomicU64::new(5))),
+            pipeline_healthy: Arc::new(AtomicBool::new(true)),
+            replicas_connected: None,
+            replication_metrics: None,
+            replica_active: None,
+            replication_ring_producer_cursors: None,
+            replication_ring_consumer_cursors: None,
+            fastest_replica_cursor: None,
+            journal_utilization: Arc::new(StageUtilization::new()),
+            matching_utilization: Arc::new(StageUtilization::new()),
+            response_utilization: Arc::new(StageUtilization::new()),
+        };
+
+        let handle = std::thread::spawn(move || {
+            health_loop(&listener, &state, &s);
+        });
+
+        let response = http_request(addr, "GET /metrics HTTP/1.1\r\n\r\n");
+        // Gauge tracks the durable wire seq, not the ring cursor (3).
+        assert!(
+            response.contains("melin_journal_sequence 1000000\n"),
+            "gauge should read durable wire seq, got: {response}"
+        );
+        // Queue depth still comes from the ring cursors (5 − 1 = 4).
+        assert!(
+            response.contains("melin_input_queue_depth 4\n"),
+            "queue depth should use the ring cursors, got: {response}"
+        );
+
+        shutdown.store(true, Ordering::Relaxed);
+        handle.join().unwrap();
+    }
+
     #[test]
     fn metrics_boolean_encoding() {
         // Verify that unhealthy + halted → 0 values.
@@ -1122,13 +1233,12 @@ mod tests {
         let state = HealthState {
             active_connections: Arc::new(AtomicU64::new(0)),
             events_processed: Arc::new(AtomicU64::new(0)),
-            journal_cursor: Arc::new(Sequence::new(AtomicU64::new(1000))),
-            matching_cursor: Arc::new(Sequence::new(AtomicU64::new(900))),
+            cursors: test_cursors(1000, 1000, 900, u64::MAX),
             input_cursor: Box::new(MockCursor(AtomicU64::new(1000))),
-            replication_cursor: Arc::new(AtomicU64::new(u64::MAX)),
             pipeline_healthy: Arc::new(AtomicBool::new(true)),
             replicas_connected: None,
             replication_metrics: None,
+            replica_active: None,
             replication_ring_producer_cursors: None,
             replication_ring_consumer_cursors: None,
             fastest_replica_cursor: None,
@@ -1178,13 +1288,12 @@ mod tests {
         let state = HealthState {
             active_connections: Arc::new(AtomicU64::new(0)),
             events_processed: Arc::new(AtomicU64::new(0)),
-            journal_cursor: Arc::new(Sequence::new(AtomicU64::new(0))),
-            matching_cursor: Arc::new(Sequence::new(AtomicU64::new(0))),
+            cursors: test_cursors(0, 0, 0, u64::MAX),
             input_cursor: Box::new(MockCursor(AtomicU64::new(0))),
-            replication_cursor: Arc::new(AtomicU64::new(u64::MAX)),
             pipeline_healthy: Arc::new(AtomicBool::new(true)),
             replicas_connected: None,
             replication_metrics: None,
+            replica_active: None,
             replication_ring_producer_cursors: None,
             replication_ring_consumer_cursors: None,
             fastest_replica_cursor: None,
@@ -1234,18 +1343,21 @@ mod tests {
         let prod_1: Arc<dyn QueueCursor> = Arc::new(MockCursor(AtomicU64::new(5000)));
         let cons_0 = Arc::new(Sequence::new(AtomicU64::new(4950)));
         let cons_1 = Arc::new(Sequence::new(AtomicU64::new(5000)));
-        let fastest = Arc::new(AtomicU64::new(4990));
+        // Stored the way the sender does — slot-acked encoded; the gauge
+        // must decode back to the acked wire seq (4990).
+        let fastest = Arc::new(AtomicU64::new(
+            SlotAcked::from_acked(WireSeq::new(4990)).raw(),
+        ));
 
         let state = HealthState {
             active_connections: Arc::new(AtomicU64::new(0)),
             events_processed: Arc::new(AtomicU64::new(0)),
-            journal_cursor: Arc::new(Sequence::new(AtomicU64::new(5000))),
-            matching_cursor: Arc::new(Sequence::new(AtomicU64::new(5000))),
+            cursors: test_cursors(5000, 5000, 5000, 4990),
             input_cursor: Box::new(MockCursor(AtomicU64::new(5000))),
-            replication_cursor: Arc::new(AtomicU64::new(4990)),
             pipeline_healthy: Arc::new(AtomicBool::new(true)),
             replicas_connected: None,
             replication_metrics: None,
+            replica_active: None,
             replication_ring_producer_cursors: Some([prod_0, prod_1]),
             replication_ring_consumer_cursors: Some([cons_0, cons_1]),
             fastest_replica_cursor: Some(fastest),
@@ -1290,13 +1402,12 @@ mod tests {
         let state = HealthState {
             active_connections: Arc::new(AtomicU64::new(0)),
             events_processed: Arc::new(AtomicU64::new(0)),
-            journal_cursor: Arc::new(Sequence::new(AtomicU64::new(0))),
-            matching_cursor: Arc::new(Sequence::new(AtomicU64::new(0))),
+            cursors: test_cursors(0, 0, 0, u64::MAX),
             input_cursor: Box::new(MockCursor(AtomicU64::new(0))),
-            replication_cursor: Arc::new(AtomicU64::new(u64::MAX)),
             pipeline_healthy: Arc::new(AtomicBool::new(true)),
             replicas_connected: None,
             replication_metrics: None,
+            replica_active: None,
             replication_ring_producer_cursors: None,
             replication_ring_consumer_cursors: None,
             fastest_replica_cursor: Some(Arc::new(AtomicU64::new(u64::MAX))),
@@ -1499,13 +1610,17 @@ mod tests {
         let state = HealthState {
             active_connections: Arc::new(AtomicU64::new(0)),
             events_processed: Arc::new(AtomicU64::new(0)),
-            journal_cursor: Arc::new(Sequence::new(AtomicU64::new(1000))),
-            matching_cursor: Arc::new(Sequence::new(AtomicU64::new(1000))),
+            // Quorum cursor = slowest acked (slot 1's 800), consistent with
+            // the per-slot metrics above.
+            cursors: test_cursors(1000, 1000, 1000, 800),
             input_cursor: Box::new(MockCursor(AtomicU64::new(1000))),
-            replication_cursor: Arc::new(AtomicU64::new(900)),
             pipeline_healthy: Arc::new(AtomicBool::new(true)),
             replicas_connected: Some(Arc::new(AtomicU32::new(2))),
             replication_metrics: Some(metrics),
+            replica_active: Some([
+                Arc::new(AtomicBool::new(true)),
+                Arc::new(AtomicBool::new(true)),
+            ]),
             replication_ring_producer_cursors: None,
             replication_ring_consumer_cursors: None,
             fastest_replica_cursor: None,
@@ -1557,6 +1672,196 @@ mod tests {
             body.contains("melin_replica_lag{slot=\"1\"} 200\n"),
             "slot 1 lag: {body}"
         );
+        shutdown.store(true, Ordering::Relaxed);
+        handle.join().unwrap();
+    }
+
+    /// Regression: a replica engaged at acked 0 (fresh journal, mid
+    /// catch-up) must report its real per-slot lag — `acked == 0` is also
+    /// the cleared-on-disconnect gauge state, so only the per-slot active
+    /// flag can distinguish the two. Slot 0 is engaged at 0 (full lag),
+    /// slot 1 is disconnected (lag 0).
+    #[test]
+    fn engaged_replica_at_acked_zero_reports_real_lag() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let addr = listener.local_addr().unwrap();
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let s = Arc::clone(&shutdown);
+
+        let metrics = Arc::new(ReplicationMetrics::default());
+        // Both slots' gauges read 0 — indistinguishable without the flags.
+        let state = HealthState {
+            active_connections: Arc::new(AtomicU64::new(0)),
+            events_processed: Arc::new(AtomicU64::new(0)),
+            cursors: test_cursors(1_000, 1_000, 1_000, 0),
+            input_cursor: Box::new(MockCursor(AtomicU64::new(1_000))),
+            pipeline_healthy: Arc::new(AtomicBool::new(true)),
+            replicas_connected: Some(Arc::new(AtomicU32::new(1))),
+            replication_metrics: Some(metrics),
+            replica_active: Some([
+                Arc::new(AtomicBool::new(true)),
+                Arc::new(AtomicBool::new(false)),
+            ]),
+            replication_ring_producer_cursors: None,
+            replication_ring_consumer_cursors: None,
+            fastest_replica_cursor: None,
+            journal_utilization: Arc::new(StageUtilization::new()),
+            matching_utilization: Arc::new(StageUtilization::new()),
+            response_utilization: Arc::new(StageUtilization::new()),
+        };
+
+        let handle = std::thread::spawn(move || {
+            health_loop(&listener, &state, &s);
+        });
+
+        let body = http_request(addr, "GET /metrics HTTP/1.1\r\n\r\n");
+        assert!(
+            body.contains("melin_replica_lag{slot=\"0\"} 1000\n"),
+            "engaged-at-0 slot should report full lag: {body}"
+        );
+        assert!(
+            body.contains("melin_replica_lag{slot=\"1\"} 0\n"),
+            "disengaged slot should report zero lag: {body}"
+        );
+        // The aggregate agrees with the drill-down: quorum acked 0 → lag 1000.
+        assert!(
+            body.contains("melin_replication_lag 1000\n"),
+            "aggregate lag should match the engaged slot: {body}"
+        );
+
+        shutdown.store(true, Ordering::Relaxed);
+        handle.join().unwrap();
+    }
+
+    /// Writer↔reader contract: drive the *production* cursor writer
+    /// (`ReplicaCursors`) against the same atomics the health snapshot
+    /// reads — no hand-seeded values — and assert the gauges decode to
+    /// exact wire-seq numbers through every lifecycle step (two engaged,
+    /// one disconnects, all disconnect). This is what pins the slot-acked
+    /// encode (writer) and decode (reader) to the same `SlotAcked`
+    /// convention; the other tests seed cursors by hand and would keep
+    /// passing if one side drifted.
+    #[test]
+    fn replica_cursor_writer_drives_health_gauges_end_to_end() {
+        use crate::replication::ReplicaCursors;
+        use crate::replication::protocol::Ack;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let addr = listener.local_addr().unwrap();
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let s = Arc::clone(&shutdown);
+
+        // Production wiring shape: the bundle owns the quorum cursor, the
+        // fastest cursor is the loose max twin, and ReplicaCursors is the
+        // single writer for both (plus the metrics gauge pair).
+        let cursors = PipelineCursors::new(
+            WireSeq::new(1_000),
+            Arc::new(Sequence::new(AtomicU64::new(0))),
+            Arc::new(Sequence::new(AtomicU64::new(0))),
+        );
+        let fastest = Arc::new(AtomicU64::new(PipelineCursors::NO_REPLICA));
+        let metrics = Arc::new(ReplicationMetrics::default());
+        let active = [
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicBool::new(false)),
+        ];
+        let writer = ReplicaCursors::new(
+            cursors.replica_quorum_cursor_arc(),
+            Arc::clone(&fastest),
+            Arc::clone(&metrics),
+        );
+
+        let state = HealthState {
+            active_connections: Arc::new(AtomicU64::new(0)),
+            events_processed: Arc::new(AtomicU64::new(0)),
+            cursors: cursors.clone(),
+            input_cursor: Box::new(MockCursor(AtomicU64::new(0))),
+            pipeline_healthy: Arc::new(AtomicBool::new(true)),
+            replicas_connected: Some(Arc::new(AtomicU32::new(2))),
+            replication_metrics: Some(Arc::clone(&metrics)),
+            replica_active: Some([Arc::clone(&active[0]), Arc::clone(&active[1])]),
+            replication_ring_producer_cursors: None,
+            replication_ring_consumer_cursors: None,
+            fastest_replica_cursor: Some(Arc::clone(&fastest)),
+            journal_utilization: Arc::new(StageUtilization::new()),
+            matching_utilization: Arc::new(StageUtilization::new()),
+            response_utilization: Arc::new(StageUtilization::new()),
+        };
+
+        let handle = std::thread::spawn(move || {
+            health_loop(&listener, &state, &s);
+        });
+
+        // Two replicas engage and ack: slot 0 at 900, slot 1 at 800.
+        // Ordering mirrors the senders: seed/ack before the flag flip.
+        writer.seed_on_handshake(0, 850);
+        active[0].store(true, Ordering::Release);
+        writer.seed_on_handshake(1, 800);
+        active[1].store(true, Ordering::Release);
+        writer
+            .record_ack(
+                0,
+                &Ack {
+                    acked_sequence: 900,
+                    in_memory_sequence: 950,
+                },
+                1_000,
+            )
+            .expect("valid ack");
+
+        let body = http_request(addr, "GET /metrics HTTP/1.1\r\n\r\n");
+        assert!(
+            body.contains("melin_replication_lag 200\n"),
+            "quorum = slowest engaged (800): journal 1000 - 800: {body}"
+        );
+        assert!(
+            body.contains("melin_fastest_replica_cursor 900\n"),
+            "fastest = highest acked, decoded to wire seq: {body}"
+        );
+        assert!(
+            body.contains("melin_replica_lag{slot=\"0\"} 100\n"),
+            "slot 0 lag: {body}"
+        );
+        assert!(
+            body.contains("melin_replica_lag{slot=\"1\"} 200\n"),
+            "slot 1 lag: {body}"
+        );
+
+        // The slower replica disconnects: quorum and fastest both follow
+        // the survivor; its per-slot lag drops to 0 (disengaged).
+        writer.clear_on_disconnect(1);
+        active[1].store(false, Ordering::Release);
+
+        let body = http_request(addr, "GET /metrics HTTP/1.1\r\n\r\n");
+        assert!(
+            body.contains("melin_replication_lag 100\n"),
+            "quorum follows the survivor (900): {body}"
+        );
+        assert!(
+            body.contains("melin_fastest_replica_cursor 900\n"),
+            "single engaged replica IS the fastest — not the sentinel: {body}"
+        );
+        assert!(
+            body.contains("melin_replica_lag{slot=\"1\"} 0\n"),
+            "disengaged slot lag: {body}"
+        );
+
+        // Last replica disconnects: everything returns to the no-replica shape.
+        writer.clear_on_disconnect(0);
+        active[0].store(false, Ordering::Release);
+
+        let body = http_request(addr, "GET /metrics HTTP/1.1\r\n\r\n");
+        assert!(
+            body.contains("melin_replication_lag 0\n"),
+            "no engaged replica → lag 0: {body}"
+        );
+        assert!(
+            body.contains("melin_fastest_replica_cursor 0\n"),
+            "no engaged replica → fastest renders 0: {body}"
+        );
+
         shutdown.store(true, Ordering::Relaxed);
         handle.join().unwrap();
     }
@@ -1630,13 +1935,12 @@ mod tests {
         let state = HealthState {
             active_connections: Arc::new(AtomicU64::new(0)),
             events_processed: Arc::new(AtomicU64::new(0)),
-            journal_cursor: Arc::new(Sequence::new(AtomicU64::new(0))),
-            matching_cursor: Arc::new(Sequence::new(AtomicU64::new(0))),
+            cursors: test_cursors(0, 0, 0, u64::MAX),
             input_cursor: Box::new(MockCursor(AtomicU64::new(0))),
-            replication_cursor: Arc::new(AtomicU64::new(u64::MAX)),
             pipeline_healthy: Arc::new(AtomicBool::new(true)),
             replicas_connected: None,
             replication_metrics: None,
+            replica_active: None,
             replication_ring_producer_cursors: None,
             replication_ring_consumer_cursors: None,
             fastest_replica_cursor: None,
