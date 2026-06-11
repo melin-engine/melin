@@ -1783,3 +1783,137 @@ fn pipeline_journal_contents_match_across_writer_modes() {
     );
     assert_eq!(sector.len(), 5);
 }
+
+/// End-to-end pin for the stats-query surface: `ApplyCtx.journal_sequence`
+/// must report the durable wire seq — the same space as the health
+/// endpoint's `journal_seq` gauge — both live and, critically, after
+/// recovery, where the journal ring cursor restarts near zero while the
+/// durable cursor resumes at the recovered high-water mark. Guards the
+/// space fix that moved the stats surface off the ring cursor.
+#[test]
+fn stats_query_reports_durable_wire_seq_across_recovery() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("stats_query_durable.journal");
+
+    fn slot(event: JournalEvent<TestEvent>) -> TestInput {
+        InputSlot {
+            connection_id: 1,
+            key_hash: 0,
+            request_seq: 0,
+            sequence: 0,
+            timestamp_ns: 0,
+            event,
+            publish_ts: mono_trace_ns(),
+            recv_ts: mono_trace_ns(),
+        }
+    }
+
+    fn drain_query(output_consumer: &mut ring::Consumer<TestOutput>) -> TestQuery {
+        let mut spins = 0u64;
+        loop {
+            if let Some((_, out_slot)) = output_consumer.try_consume() {
+                if let OutputPayload::QueryResponse(q) = out_slot.payload {
+                    return q;
+                }
+            } else {
+                spins += 1;
+                assert!(spins < 100_000_000, "timeout draining query response");
+                std::hint::spin_loop();
+            }
+        }
+    }
+
+    // --- Phase 1: fresh journal — the query reports the live durable seq.
+    {
+        let writer = Writer::create(&path).unwrap();
+        let mut out = build_pipeline_with_replication(
+            TestApp::new(),
+            writer,
+            Duration::ZERO,
+            Arc::new(AtomicU64::new(0)),
+            false,
+            MAX_JOURNAL_BATCH,
+            REPLICATION_RING_CAPACITY,
+            false,
+            false,
+            false,
+        );
+        let mut input_producer = out.input_producer;
+        let journal_stage = out.journal_stage;
+        let matching_stage = out.matching_stage;
+        let last_seq = out.cursors.durable_wire_seq();
+        let mut output_consumer = out.output_consumers.pop().unwrap();
+
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let s1 = Arc::clone(&shutdown);
+        let s2 = Arc::clone(&shutdown);
+        let t_journal = std::thread::spawn(move || journal_stage.run(&s1));
+        let t_matching = std::thread::spawn(move || matching_stage.run(&s2));
+
+        for n in 1..=5u64 {
+            input_producer.publish(slot(JournalEvent::App(TestEvent::Add(n))));
+        }
+        // Wait for the fsync to land before querying: the durable cursor
+        // then sits at exactly 5 and cannot move (queries are never
+        // journaled), so the assertion below is race-free.
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while last_seq.load().get() < 5 && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(last_seq.load().get(), 5, "phase 1 fsync");
+
+        input_producer.publish(slot(JournalEvent::App(TestEvent::Query)));
+        let q = drain_query(&mut output_consumer);
+        assert_eq!(q.total, 1 + 2 + 3 + 4 + 5);
+        assert_eq!(
+            q.journal_sequence, 5,
+            "live stats query must report the durable wire seq"
+        );
+
+        shutdown.store(true, Ordering::Relaxed);
+        let _writer = t_journal.join().unwrap();
+        let _app = t_matching.join().unwrap();
+    }
+
+    // --- Phase 2: recover — the ring cursor restarts at zero, but the
+    // stats surface must keep reporting the recovered high-water mark.
+    let engine = JournaledApp::<TestApp, Writer>::recover(TestApp::new(), &path).unwrap();
+    let (app, writer) = engine.into_parts();
+    let mut out = build_pipeline_with_replication(
+        app,
+        writer,
+        Duration::ZERO,
+        Arc::new(AtomicU64::new(0)),
+        false,
+        MAX_JOURNAL_BATCH,
+        REPLICATION_RING_CAPACITY,
+        false,
+        false,
+        false,
+    );
+    let mut input_producer = out.input_producer;
+    let journal_stage = out.journal_stage;
+    let matching_stage = out.matching_stage;
+    let mut output_consumer = out.output_consumers.pop().unwrap();
+
+    let shutdown = Arc::new(AtomicBool::new(false));
+    let s1 = Arc::clone(&shutdown);
+    let s2 = Arc::clone(&shutdown);
+    let t_journal = std::thread::spawn(move || journal_stage.run(&s1));
+    let t_matching = std::thread::spawn(move || matching_stage.run(&s2));
+
+    // The query is the FIRST slot consumed after boot — the journal ring
+    // cursor is still ~0, so reading the ring instead of the durable
+    // cursor (the pre-fix behaviour) would report ~0 here, not 5.
+    input_producer.publish(slot(JournalEvent::App(TestEvent::Query)));
+    let q = drain_query(&mut output_consumer);
+    assert_eq!(q.total, 15, "recovered state");
+    assert_eq!(
+        q.journal_sequence, 5,
+        "post-recovery stats query must report the recovered durable high-water, not the ring position"
+    );
+
+    shutdown.store(true, Ordering::Relaxed);
+    let _writer = t_journal.join().unwrap();
+    let _app = t_matching.join().unwrap();
+}

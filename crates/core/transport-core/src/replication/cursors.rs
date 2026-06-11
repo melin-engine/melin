@@ -443,4 +443,87 @@ mod tests {
             .expect("boundary ack is valid");
         assert_eq!(min.load(Ordering::Acquire), 201);
     }
+
+    mod props {
+        use super::*;
+        use proptest::prelude::*;
+
+        #[derive(Debug, Clone)]
+        enum Op {
+            Seed { slot: usize, last: u64 },
+            Ack { slot: usize, advance: u64 },
+            Disconnect { slot: usize },
+        }
+
+        fn op_strategy() -> impl Strategy<Value = Op> {
+            prop_oneof![
+                (0usize..2, 0u64..1_000).prop_map(|(slot, last)| Op::Seed { slot, last }),
+                (0usize..2, 0u64..100).prop_map(|(slot, advance)| Op::Ack { slot, advance }),
+                (0usize..2usize).prop_map(|slot| Op::Disconnect { slot }),
+            ]
+        }
+
+        proptest! {
+            /// Model check: after every step of an arbitrary connect /
+            /// ack / disconnect lifecycle, the shared cursors equal
+            /// min/max over the *engaged* slots' slot-acked positions
+            /// (`acked + 1`), or the DISENGAGED sentinel when no slot is
+            /// engaged. Pins both the `SlotAcked` encoding at the store
+            /// sites and the disengaged-slot exclusion in the max.
+            #[test]
+            fn shared_cursors_track_engaged_min_max(
+                ops in proptest::collection::vec(op_strategy(), 1..40)
+            ) {
+                let min = Arc::new(AtomicU64::new(u64::MAX));
+                let max = Arc::new(AtomicU64::new(u64::MAX));
+                let metrics = Arc::new(ReplicationMetrics::default());
+                let cursors =
+                    ReplicaCursors::new(Arc::clone(&min), Arc::clone(&max), Arc::clone(&metrics));
+
+                // Model: each engaged slot's acked wire seq.
+                let mut engaged: [Option<u64>; 2] = [None, None];
+
+                for op in ops {
+                    match op {
+                        Op::Seed { slot, last } => {
+                            cursors.seed_on_handshake(slot, last);
+                            engaged[slot] = Some(last);
+                        }
+                        Op::Ack { slot, advance } => {
+                            // Acks are only meaningful on an engaged slot;
+                            // keep them monotonic (the senders' SentHighWater
+                            // guarantees this) and pass a generous
+                            // highest_sent so validity never trips.
+                            if let Some(acked) = engaged[slot] {
+                                let next = acked + advance;
+                                cursors
+                                    .record_ack(slot, &ack(next, next), u64::MAX - 1)
+                                    .expect("monotonic ack within highest_sent");
+                                engaged[slot] = Some(next);
+                            }
+                        }
+                        Op::Disconnect { slot } => {
+                            cursors.clear_on_disconnect(slot);
+                            engaged[slot] = None;
+                        }
+                    }
+
+                    let expect_min = engaged
+                        .iter()
+                        .flatten()
+                        .map(|a| a + 1)
+                        .min()
+                        .unwrap_or(DISENGAGED);
+                    let expect_max = engaged
+                        .iter()
+                        .flatten()
+                        .map(|a| a + 1)
+                        .max()
+                        .unwrap_or(DISENGAGED);
+                    prop_assert_eq!(min.load(Ordering::Acquire), expect_min);
+                    prop_assert_eq!(max.load(Ordering::Acquire), expect_max);
+                }
+            }
+        }
+    }
 }

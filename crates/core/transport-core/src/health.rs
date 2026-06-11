@@ -1734,6 +1734,138 @@ mod tests {
         handle.join().unwrap();
     }
 
+    /// Writer↔reader contract: drive the *production* cursor writer
+    /// (`ReplicaCursors`) against the same atomics the health snapshot
+    /// reads — no hand-seeded values — and assert the gauges decode to
+    /// exact wire-seq numbers through every lifecycle step (two engaged,
+    /// one disconnects, all disconnect). This is what pins the slot-acked
+    /// encode (writer) and decode (reader) to the same `SlotAcked`
+    /// convention; the other tests seed cursors by hand and would keep
+    /// passing if one side drifted.
+    #[test]
+    fn replica_cursor_writer_drives_health_gauges_end_to_end() {
+        use crate::replication::ReplicaCursors;
+        use crate::replication::protocol::Ack;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let addr = listener.local_addr().unwrap();
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let s = Arc::clone(&shutdown);
+
+        // Production wiring shape: the bundle owns the quorum cursor, the
+        // fastest cursor is the loose max twin, and ReplicaCursors is the
+        // single writer for both (plus the metrics gauge pair).
+        let cursors = PipelineCursors::new(
+            WireSeq::new(1_000),
+            Arc::new(Sequence::new(AtomicU64::new(0))),
+            Arc::new(Sequence::new(AtomicU64::new(0))),
+        );
+        let fastest = Arc::new(AtomicU64::new(PipelineCursors::NO_REPLICA));
+        let metrics = Arc::new(ReplicationMetrics::default());
+        let active = [
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicBool::new(false)),
+        ];
+        let writer = ReplicaCursors::new(
+            cursors.replica_quorum_cursor_arc(),
+            Arc::clone(&fastest),
+            Arc::clone(&metrics),
+        );
+
+        let state = HealthState {
+            active_connections: Arc::new(AtomicU64::new(0)),
+            events_processed: Arc::new(AtomicU64::new(0)),
+            cursors: cursors.clone(),
+            input_cursor: Box::new(MockCursor(AtomicU64::new(0))),
+            pipeline_healthy: Arc::new(AtomicBool::new(true)),
+            replicas_connected: Some(Arc::new(AtomicU32::new(2))),
+            replication_metrics: Some(Arc::clone(&metrics)),
+            replica_active: Some([Arc::clone(&active[0]), Arc::clone(&active[1])]),
+            replication_ring_producer_cursors: None,
+            replication_ring_consumer_cursors: None,
+            fastest_replica_cursor: Some(Arc::clone(&fastest)),
+            journal_utilization: Arc::new(StageUtilization::new()),
+            matching_utilization: Arc::new(StageUtilization::new()),
+            response_utilization: Arc::new(StageUtilization::new()),
+        };
+
+        let handle = std::thread::spawn(move || {
+            health_loop(&listener, &state, &s);
+        });
+
+        // Two replicas engage and ack: slot 0 at 900, slot 1 at 800.
+        // Ordering mirrors the senders: seed/ack before the flag flip.
+        writer.seed_on_handshake(0, 850);
+        active[0].store(true, Ordering::Release);
+        writer.seed_on_handshake(1, 800);
+        active[1].store(true, Ordering::Release);
+        writer
+            .record_ack(
+                0,
+                &Ack {
+                    acked_sequence: 900,
+                    in_memory_sequence: 950,
+                },
+                1_000,
+            )
+            .expect("valid ack");
+
+        let body = http_request(addr, "GET /metrics HTTP/1.1\r\n\r\n");
+        assert!(
+            body.contains("melin_replication_lag 200\n"),
+            "quorum = slowest engaged (800): journal 1000 - 800: {body}"
+        );
+        assert!(
+            body.contains("melin_fastest_replica_cursor 900\n"),
+            "fastest = highest acked, decoded to wire seq: {body}"
+        );
+        assert!(
+            body.contains("melin_replica_lag{slot=\"0\"} 100\n"),
+            "slot 0 lag: {body}"
+        );
+        assert!(
+            body.contains("melin_replica_lag{slot=\"1\"} 200\n"),
+            "slot 1 lag: {body}"
+        );
+
+        // The slower replica disconnects: quorum and fastest both follow
+        // the survivor; its per-slot lag drops to 0 (disengaged).
+        writer.clear_on_disconnect(1);
+        active[1].store(false, Ordering::Release);
+
+        let body = http_request(addr, "GET /metrics HTTP/1.1\r\n\r\n");
+        assert!(
+            body.contains("melin_replication_lag 100\n"),
+            "quorum follows the survivor (900): {body}"
+        );
+        assert!(
+            body.contains("melin_fastest_replica_cursor 900\n"),
+            "single engaged replica IS the fastest — not the sentinel: {body}"
+        );
+        assert!(
+            body.contains("melin_replica_lag{slot=\"1\"} 0\n"),
+            "disengaged slot lag: {body}"
+        );
+
+        // Last replica disconnects: everything returns to the no-replica shape.
+        writer.clear_on_disconnect(0);
+        active[0].store(false, Ordering::Release);
+
+        let body = http_request(addr, "GET /metrics HTTP/1.1\r\n\r\n");
+        assert!(
+            body.contains("melin_replication_lag 0\n"),
+            "no engaged replica → lag 0: {body}"
+        );
+        assert!(
+            body.contains("melin_fastest_replica_cursor 0\n"),
+            "no engaged replica → fastest renders 0: {body}"
+        );
+
+        shutdown.store(true, Ordering::Relaxed);
+        handle.join().unwrap();
+    }
+
     #[test]
     fn metrics_emits_per_replica_bytes_and_ack_latency() {
         let (body, shutdown, handle) = prometheus_with_full_replication_state();

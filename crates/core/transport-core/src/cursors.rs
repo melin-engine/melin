@@ -350,4 +350,30 @@ mod tests {
     // compile, which is the whole point of the newtypes:
     //   let _ = WireSeq::new(1).saturating_sub(RingPos::new(1)); // mismatched types
     //   let _: WireSeq = RingPos::new(1);                        // mismatched types
+
+    mod props {
+        use super::*;
+        use proptest::prelude::*;
+
+        proptest! {
+            /// Encode/decode round-trip over the engaged range. The upper
+            /// bound excludes `u64::MAX - 1`, whose encoding saturates into
+            /// the DISENGAGED sentinel — unreachable in practice (the
+            /// journal allocator would have to exhaust `u64` first).
+            #[test]
+            fn slot_acked_round_trips(acked in 0u64..u64::MAX - 1) {
+                prop_assert_eq!(
+                    SlotAcked::from_acked(WireSeq::new(acked)).acked(),
+                    Some(WireSeq::new(acked))
+                );
+            }
+
+            /// Raw transport through the shared atomics is the identity —
+            /// `from_raw`/`raw` add no transformation.
+            #[test]
+            fn slot_acked_raw_is_identity(raw in proptest::num::u64::ANY) {
+                prop_assert_eq!(SlotAcked::from_raw(raw).raw(), raw);
+            }
+        }
+    }
 }
