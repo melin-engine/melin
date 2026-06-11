@@ -556,6 +556,20 @@ impl RawJournalScanner {
         }
     }
 
+    /// Like [`Self::read_raw_batch`] but never reads past
+    /// `stop_after_seq`: an entry with a higher sequence is left
+    /// unconsumed for the next call. Used by chain validation, which
+    /// must absorb the raw bytes of exactly the entries up to a target
+    /// sequence.
+    pub fn read_raw_batch_until(
+        &mut self,
+        out: &mut Vec<u8>,
+        max_bytes: usize,
+        stop_after_seq: u64,
+    ) -> Result<Option<u64>, JournalError> {
+        self.read_raw_batch_inner(out, max_bytes, Some(stop_after_seq))
+    }
+
     /// Read raw entry bytes into `out`, up to `max_bytes` total.
     /// Returns the last sequence in the batch, or `None` at EOF or when
     /// no complete entry fits within `max_bytes`.
@@ -563,6 +577,15 @@ impl RawJournalScanner {
         &mut self,
         out: &mut Vec<u8>,
         max_bytes: usize,
+    ) -> Result<Option<u64>, JournalError> {
+        self.read_raw_batch_inner(out, max_bytes, None)
+    }
+
+    fn read_raw_batch_inner(
+        &mut self,
+        out: &mut Vec<u8>,
+        max_bytes: usize,
+        stop_after_seq: Option<u64>,
     ) -> Result<Option<u64>, JournalError> {
         let mut any = false;
         let mut end_seq = 0u64;
@@ -589,6 +612,14 @@ impl RawJournalScanner {
                     ENTRY_HEADER_SIZE + header.length.get() as usize + CRC_SIZE,
                 )
             };
+
+            // Bounded read: leave entries past the stop sequence
+            // unconsumed (next call starts exactly there).
+            if let Some(stop) = stop_after_seq
+                && entry_seq > stop
+            {
+                break;
+            }
 
             // Don't exceed max_bytes (but always include at least one entry).
             if any && (out.len() - batch_start) + total > max_bytes {

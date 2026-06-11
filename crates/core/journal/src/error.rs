@@ -66,6 +66,18 @@ pub enum JournalError {
         expected: [u8; 32],
         actual: [u8; 32],
     },
+    /// A replica's local chain value at a primary-announced stream
+    /// position (a rotation boundary's tail hash, or a periodic
+    /// `ChainCheck`) disagrees with the primary's — the replica's
+    /// journal has divergent history (e.g. an ex-primary rejoining after
+    /// failover with a journaled-but-unreplicated suffix). The replica
+    /// must be re-seeded via snapshot resync; its local journal is
+    /// audit-trail material and must be archived, never deleted.
+    ReplicaChainDivergence {
+        sequence: u64,
+        expected: [u8; 32],
+        actual: [u8; 32],
+    },
 }
 
 impl fmt::Display for JournalError {
@@ -112,6 +124,18 @@ impl fmt::Display for JournalError {
                 f,
                 "segment chain break at archive {index}: header anchor {} does not match \
                  previous segment's final chain hash {}",
+                hex_prefix(actual),
+                hex_prefix(expected)
+            ),
+            Self::ReplicaChainDivergence {
+                sequence,
+                expected,
+                actual,
+            } => write!(
+                f,
+                "replica chain divergence at stream position {sequence}: local chain \
+                 {} does not match the primary's {} — divergent history, \
+                 snapshot resync required",
                 hex_prefix(actual),
                 hex_prefix(expected)
             ),

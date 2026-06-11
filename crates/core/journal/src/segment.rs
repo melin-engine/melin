@@ -184,6 +184,92 @@ pub fn read_header_info(path: &Path) -> Result<FileHeaderInfo, JournalError> {
     codec::decode_file_header(&buf)
 }
 
+/// Where a target sequence falls relative to one segment file's entries.
+#[cfg(feature = "hash-chain")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChainValueAt {
+    /// The segment contains the sequence; this is the chain value
+    /// through that entry (`BLAKE3(entry bytes ..= seq || anchor)`).
+    Value([u8; 32]),
+    /// The segment's entries end before the sequence — on the live
+    /// segment this means the peer claims history this node never
+    /// journaled.
+    BeyondTip,
+}
+
+/// Chain value of one segment file at `seq` — the value a writer would
+/// have reported right after encoding that entry. Walks raw entry bytes
+/// (header-decode only, no payload decode) absorbing them into the
+/// segment chain, exactly like recovery's `rebuild_from_file`, but
+/// stops at `seq` instead of `valid_end`.
+///
+/// The caller must have picked the containing segment
+/// (`starting_sequence <= seq`); `seq == starting_sequence - 1` has no
+/// entry to stop at — that boundary's value is the header anchor, which
+/// the caller reads directly via [`read_header_info`].
+///
+/// Cold path: replication handshake validation only.
+#[cfg(feature = "hash-chain")]
+pub fn chain_value_at(path: &Path, seq: u64) -> Result<ChainValueAt, JournalError> {
+    let info = read_header_info(path)?;
+    debug_assert!(
+        info.starting_sequence <= seq,
+        "caller must pick the containing segment"
+    );
+    let mut scanner = crate::reader::RawJournalScanner::open(path)?;
+    let mut chain = crate::chain::SegmentChain::new(info.anchor_hash);
+    // 1 MiB batches: large enough to amortize syscalls, small enough to
+    // keep this diagnostic path's working set flat.
+    let mut buf = Vec::with_capacity(1 << 20);
+    loop {
+        buf.clear();
+        match scanner.read_raw_batch_until(&mut buf, 1 << 20, seq)? {
+            Some(end) => {
+                chain.absorb(&buf);
+                if end == seq {
+                    return Ok(ChainValueAt::Value(chain.value()));
+                }
+            }
+            None => return Ok(ChainValueAt::BeyondTip),
+        }
+    }
+}
+
+/// Raw byte prefix of a segment file: the file header plus every entry
+/// through `through_seq`, exactly as on disk. Shipping this to a
+/// snapshot-seeded replica makes its live segment a byte-copy of the
+/// primary's, so its segment boundaries (and chain values) align from
+/// birth. `through_seq == starting_sequence - 1` returns the header
+/// alone; `None` when the segment's entries end before `through_seq`.
+///
+/// Whole-buffer rather than streaming — same trade-off as the snapshot
+/// transfer (`std::fs::read`): bounded by segment size, and operators
+/// rotate before seeding to keep the prefix small.
+pub fn read_segment_prefix(path: &Path, through_seq: u64) -> Result<Option<Vec<u8>>, JournalError> {
+    let info = read_header_info(path)?;
+    let mut out = vec![0u8; codec::ENTRY_OFFSET as usize];
+    let file = std::fs::File::open(path)?;
+    file.read_exact_at(&mut out, 0)?;
+    if through_seq == info.starting_sequence.saturating_sub(1) {
+        return Ok(Some(out));
+    }
+    debug_assert!(
+        info.starting_sequence <= through_seq,
+        "caller must pick the containing segment"
+    );
+    let mut scanner = crate::reader::RawJournalScanner::open(path)?;
+    loop {
+        match scanner.read_raw_batch_until(&mut out, 1 << 20, through_seq)? {
+            Some(end) => {
+                if end == through_seq {
+                    return Ok(Some(out));
+                }
+            }
+            None => return Ok(None),
+        }
+    }
+}
+
 /// Build the path for archive number `n`.
 pub fn archive_path(live: &Path, n: u32) -> PathBuf {
     PathBuf::from(format!(
@@ -349,6 +435,65 @@ mod tests {
                 writer.rotate_segment().unwrap();
             }
         }
+    }
+
+    /// `chain_value_at` must reproduce exactly what the writer reported
+    /// after encoding each entry, and flag a sequence past the tail.
+    #[cfg(feature = "hash-chain")]
+    #[test]
+    fn chain_value_at_matches_writer_at_every_prefix() {
+        let dir = tempfile::tempdir().unwrap();
+        let live = dir.path().join("chain_at.journal");
+
+        let mut writer = BufferedWriter::<TestEvent>::create(&live).unwrap();
+        let mut expected = Vec::new();
+        for v in 1..=3u64 {
+            writer.append(&JournalEvent::App(TestEvent(v))).unwrap();
+            expected.push(writer.chain_hash().expect("hash-chain enabled"));
+        }
+        drop(writer);
+
+        for (i, exp) in expected.iter().enumerate() {
+            let seq = i as u64 + 1;
+            assert_eq!(
+                chain_value_at(&live, seq).unwrap(),
+                ChainValueAt::Value(*exp),
+                "chain at seq {seq} must match the writer's reported value"
+            );
+        }
+        assert_eq!(
+            chain_value_at(&live, 4).unwrap(),
+            ChainValueAt::BeyondTip,
+            "a sequence past the tail must be flagged, not silently hashed"
+        );
+    }
+
+    /// `read_segment_prefix` returns exact on-disk byte prefixes:
+    /// header-only at the opening boundary, header + entries through the
+    /// target otherwise, `None` past the tail.
+    #[test]
+    fn read_segment_prefix_returns_exact_byte_prefixes() {
+        let dir = tempfile::tempdir().unwrap();
+        let live = dir.path().join("prefix.journal");
+        build_lineage(&live, &[3]);
+        let full = std::fs::read(&live).unwrap();
+
+        let header_only = read_segment_prefix(&live, 0).unwrap().unwrap();
+        assert_eq!(header_only.len() as u64, codec::ENTRY_OFFSET);
+        assert_eq!(header_only[..], full[..codec::ENTRY_OFFSET as usize]);
+
+        let through_2 = read_segment_prefix(&live, 2).unwrap().unwrap();
+        assert!(through_2.len() as u64 > codec::ENTRY_OFFSET);
+        assert_eq!(through_2[..], full[..through_2.len()]);
+
+        let through_3 = read_segment_prefix(&live, 3).unwrap().unwrap();
+        assert!(through_3.len() > through_2.len());
+        assert_eq!(through_3[..], full[..through_3.len()]);
+
+        assert!(
+            read_segment_prefix(&live, 4).unwrap().is_none(),
+            "a sequence past the tail has no prefix"
+        );
     }
 
     #[test]

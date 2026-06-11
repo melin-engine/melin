@@ -80,6 +80,12 @@ pub trait JournalWrite<E: AppEvent>: Sized {
 
     /// Sequence number that the next `allocate_sequence` call will return.
     fn next_sequence(&self) -> u64;
+    /// First sequence of the active segment (the header's
+    /// `starting_sequence`). Equal to `next_sequence` iff the live
+    /// segment is empty. Used by rotation logic: the primary skips
+    /// rotating an empty live segment, and replicas detect an
+    /// already-adopted rotation boundary.
+    fn segment_starting_sequence(&self) -> u64;
     /// Force the next allocated sequence number — used by replicas to
     /// adopt the primary's numbering.
     fn set_next_sequence(&mut self, seq: u64);
@@ -191,6 +197,11 @@ impl<E: AppEvent> JournalWrite<E> for SectorWriter<E> {
     }
 
     #[inline]
+    fn segment_starting_sequence(&self) -> u64 {
+        SectorWriter::segment_starting_sequence(self)
+    }
+
+    #[inline]
     fn set_next_sequence(&mut self, seq: u64) {
         SectorWriter::set_next_sequence(self, seq)
     }
@@ -279,6 +290,11 @@ impl<E: AppEvent> JournalWrite<E> for BufferedWriter<E> {
     }
 
     #[inline]
+    fn segment_starting_sequence(&self) -> u64 {
+        BufferedWriter::segment_starting_sequence(self)
+    }
+
+    #[inline]
     fn set_next_sequence(&mut self, seq: u64) {
         BufferedWriter::set_next_sequence(self, seq)
     }
@@ -353,8 +369,9 @@ mod tests {
         let initial_valid_end = writer.valid_end();
         assert!(initial_valid_end > 0);
         // Header info round-trips through the trait: fresh journals
-        // start at sequence 1.
+        // start at sequence 1, and the in-memory copy agrees.
         assert_eq!(writer.read_header_info().unwrap().starting_sequence, 1);
+        assert_eq!(writer.segment_starting_sequence(), 1);
 
         // discard on an empty batch is a no-op but must not panic.
         writer.discard_batch_buf();

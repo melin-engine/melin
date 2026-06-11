@@ -96,6 +96,12 @@ pub struct SectorWriter<E: AppEvent> {
     spare_buf: Option<Box<AlignedBuf<BATCH_BUF_CAPACITY>>>,
     /// Next sequence number to assign (monotonically increasing, starts at 1).
     next_sequence: u64,
+    /// First sequence of the active segment (the header's
+    /// `starting_sequence`). Kept in memory so callers can tell whether
+    /// the live segment is empty (`next_sequence == starting_sequence`)
+    /// or already begins past a given rotation boundary, without a disk
+    /// read of the header.
+    starting_sequence: u64,
     /// Path to the journal file (kept for error messages / reopening).
     path: PathBuf,
     /// Current byte offset where the next entry will be written.
@@ -315,6 +321,7 @@ impl<E: AppEvent> SectorWriter<E> {
             batch_buf,
             spare_buf: Some(spare_buf),
             next_sequence: starting_sequence,
+            starting_sequence,
             path: path.to_path_buf(),
             write_pos: ENTRY_OFFSET,
             allocated_end,
@@ -426,8 +433,8 @@ impl<E: AppEvent> SectorWriter<E> {
         // Decoded sector_size is informational — under v13+ it always
         // equals ENTRY_OFFSET (= 4096). The device's actual O_DIRECT
         // alignment is detected separately below. The header also
-        // carries the chain anchor used to rebuild the hash chain.
-        #[cfg_attr(not(feature = "hash-chain"), allow(unused_variables))]
+        // carries the chain anchor used to rebuild the hash chain and
+        // the segment's starting sequence.
         let info = codec::decode_file_header(&tail_sector[..FILE_HEADER_SIZE])?;
         tail_sector.fill(0);
 
@@ -491,6 +498,7 @@ impl<E: AppEvent> SectorWriter<E> {
             batch_buf,
             spare_buf: Some(spare_buf),
             next_sequence: last_seq + 1,
+            starting_sequence: info.starting_sequence,
             path: path.to_path_buf(),
             write_pos,
             allocated_end,
@@ -875,6 +883,13 @@ impl<E: AppEvent> SectorWriter<E> {
                 Err(e)
             }
         }
+    }
+
+    /// First sequence of the active segment (the header's
+    /// `starting_sequence`). `next_sequence() == segment_starting_sequence()`
+    /// means the live segment is empty.
+    pub fn segment_starting_sequence(&self) -> u64 {
+        self.starting_sequence
     }
 
     /// Current chain value: `BLAKE3(entry bytes so far || anchor)`, or

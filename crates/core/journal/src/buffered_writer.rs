@@ -78,6 +78,10 @@ pub struct BufferedWriter<E: AppEvent> {
     // new entries land at `batch_buf[batch_len..]`. Reset on every flush.
     batch_len: usize,
     next_sequence: u64,
+    // First sequence of the active segment (the header's
+    // `starting_sequence`), kept in memory so emptiness / rotation-
+    // boundary checks need no header re-read.
+    starting_sequence: u64,
     path: PathBuf,
     // Byte offset of the next entry to be written. Always points at the
     // end of valid data; no sector-tail bookkeeping, so `valid_end() ==
@@ -152,6 +156,7 @@ impl<E: AppEvent> BufferedWriter<E> {
             batch_buf: vec![0u8; BATCH_BUF_CAPACITY],
             batch_len: 0,
             next_sequence: starting_sequence,
+            starting_sequence,
             path: path.to_path_buf(),
             write_pos: HEADER_OFFSET,
             allocated_end,
@@ -191,7 +196,6 @@ impl<E: AppEvent> BufferedWriter<E> {
                 "journal file too short to read file header",
             )));
         }
-        #[cfg_attr(not(feature = "hash-chain"), allow(unused_variables))]
         let info = codec::decode_file_header(&header_buf)?;
 
         // Truncate down to `valid_end` so any torn-write garbage past
@@ -218,6 +222,7 @@ impl<E: AppEvent> BufferedWriter<E> {
             batch_buf: vec![0u8; BATCH_BUF_CAPACITY],
             batch_len: 0,
             next_sequence: last_seq + 1,
+            starting_sequence: info.starting_sequence,
             path: path.to_path_buf(),
             write_pos: valid_end,
             allocated_end,
@@ -388,6 +393,13 @@ impl<E: AppEvent> BufferedWriter<E> {
     /// byte-identical from the segment's first entry onward.
     pub fn read_header_info(&self) -> Result<codec::FileHeaderInfo, JournalError> {
         crate::segment::read_header_info(&self.path)
+    }
+
+    /// First sequence of the active segment (the header's
+    /// `starting_sequence`). `next_sequence() == segment_starting_sequence()`
+    /// means the live segment is empty.
+    pub fn segment_starting_sequence(&self) -> u64 {
+        self.starting_sequence
     }
 
     /// Current chain value: `BLAKE3(entry bytes so far || anchor)`, or
