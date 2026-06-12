@@ -276,7 +276,7 @@ impl ReplicationConsumer {
     /// `try_read`. After this call, the byte slice from `try_read` is invalid.
     pub fn commit(&mut self) {
         if self.pending_meta.take().is_some() {
-            self.inner.commit(1);
+            self.inner.commit();
         }
     }
 

@@ -485,7 +485,7 @@ impl<T: Copy + Default> Consumer<T> {
     pub fn consume_batch(&mut self, buf: &mut [T], max: usize) -> usize {
         let count = self.read_batch(buf, max);
         if count > 0 {
-            self.commit(count);
+            self.commit();
         }
         count
     }
@@ -584,12 +584,20 @@ impl<T: Copy + Default> Consumer<T> {
             .store(self.next_read, Ordering::Release);
     }
 
-    /// Advance the progress counter by `count` entries, making them visible
-    /// to downstream consumers and the producer (for backpressure).
+    /// Publish read progress: stores `next_read` into the progress
+    /// counter, making **everything read so far** visible to downstream
+    /// consumers and the producer (for backpressure).
     ///
     /// Must be called after [`read_batch`] once the entries have been
-    /// durably processed (e.g., after fsync).
-    pub fn commit(&mut self, _count: usize) {
+    /// durably processed (e.g., after fsync). To publish progress for
+    /// only *part* of what was read (e.g., an fsync that covers a
+    /// prefix of the read entries), use [`set_progress`] — there is
+    /// deliberately no count parameter here, so a caller cannot
+    /// mistakenly believe a partial commit happened.
+    ///
+    /// [`read_batch`]: Self::read_batch
+    /// [`set_progress`]: Self::set_progress
+    pub fn commit(&mut self) {
         // Release store so downstream consumers see our progress.
         self.processed
             .get()

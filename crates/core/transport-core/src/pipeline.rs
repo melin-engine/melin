@@ -726,7 +726,7 @@ impl<E: AppEvent, W: JournalWrite<E>> JournalStage<E, W> {
                     if let Err(e) = self.writer.flush_batch_sync() {
                         tracing::error!(error = %e, "journal sync error on shutdown");
                     }
-                    self.consumer.commit(pending);
+                    self.consumer.commit();
                 }
                 self.drain_remaining(&mut batch);
                 self.utilization.busy.store(busy_count, Ordering::Relaxed);
@@ -913,7 +913,7 @@ impl<E: AppEvent, W: JournalWrite<E>> JournalStage<E, W> {
                     }
                     #[cfg(feature = "no-persist")]
                     self.writer.discard_batch_buf();
-                    self.consumer.commit(pending);
+                    self.consumer.commit();
                     self.publish_fsync_state();
                 }
                 self.utilization.busy.store(busy_count, Ordering::Relaxed);
@@ -1496,7 +1496,7 @@ impl<E: AppEvent, W: JournalWrite<E>> JournalStage<E, W> {
                     tracing::error!(error = %e, "journal sync error on drain");
                 }
             }
-            self.consumer.commit(count);
+            self.consumer.commit();
         }
     }
 }
@@ -1801,7 +1801,7 @@ impl<E: AppEvent> JournalStage<E, melin_journal::SectorWriter<E>> {
                         self.writer.confirm_async_write(async_batch);
                     } else {
                         // Buffer was empty (read-only queries only) — just commit.
-                        self.consumer.commit(pending);
+                        self.consumer.commit();
                     }
                 }
                 self.drain_remaining(&mut batch);
@@ -1948,7 +1948,7 @@ impl<E: AppEvent> JournalStage<E, melin_journal::SectorWriter<E>> {
                 self.reap_inflight_on_shutdown(&mut ring, &mut inflight)?;
                 if pending > 0 {
                     self.writer.flush_batch_sync()?;
-                    self.consumer.commit(pending);
+                    self.consumer.commit();
                 }
                 self.drain_remaining(&mut batch);
                 self.utilization.busy.store(busy_count, Ordering::Relaxed);
@@ -2063,7 +2063,7 @@ impl<E: AppEvent> JournalStage<E, melin_journal::SectorWriter<E>> {
                             // `take_batch_for_async_write`. In both cases
                             // the data is durable, so commit, publish chain
                             // state, and check for rotation triggers.
-                            self.consumer.commit(pending);
+                            self.consumer.commit();
                             self.publish_fsync_state();
                             if self.maybe_rotate_with_prepared() {
                                 Self::reregister_journal_fd(&ring, self.writer.fd())?;
