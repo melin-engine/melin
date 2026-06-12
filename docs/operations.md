@@ -613,6 +613,9 @@ melin_trading_active 1
 | `melin_trading_active` | gauge | 1 when accepting orders, 0 when halted |
 | `melin_stage_busy_total{stage="..."}` | counter | Cumulative busy iterations per stage (journal/response: batches, matching: events) |
 | `melin_stage_idle_total{stage="..."}` | counter | Cumulative idle iterations per stage |
+| `melin_journal_rotations_total{path="..."}` | counter | Journal segment rotations by path: `fast` adopted a pre-staged segment; `sync_fallback` allocated synchronously on the journal thread |
+
+In `sector` mode, `melin_journal_rotations_total{path="sync_fallback"}` should stay flat in steady state — the first rotation after startup may take the synchronous path while the background staging warms up, but sustained growth means rotation stalls are landing on the order pipeline's critical path and is worth an alert.
 
 Use `rate(melin_stage_busy_total) / (rate(melin_stage_busy_total) + rate(melin_stage_idle_total))` for per-stage utilization percentage. The matching stage counts events (not batches), so its utilization is directly proportional to throughput.
 

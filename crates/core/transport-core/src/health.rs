@@ -180,6 +180,12 @@ struct HealthSnapshot {
     /// can `rate()` time-in-degraded over a window — see
     /// `StageUtilization::policy_degraded_nanos`.
     response_policy_degraded_nanos: u64,
+    /// Journal rotations that adopted a pre-staged segment (fast path).
+    journal_rotations_fast_path: u64,
+    /// Journal rotations that fell back to the synchronous allocate
+    /// path. Should stay at 0 in steady state on the io_uring path —
+    /// growth means rotation stalls are landing on the journal thread.
+    journal_rotations_sync_fallback: u64,
 }
 
 impl HealthSnapshot {
@@ -388,6 +394,14 @@ impl HealthSnapshot {
                 .response_utilization
                 .policy_degraded_nanos
                 .load(Ordering::Relaxed),
+            journal_rotations_fast_path: state
+                .journal_utilization
+                .rotations_fast_path
+                .load(Ordering::Relaxed),
+            journal_rotations_sync_fallback: state
+                .journal_utilization
+                .rotations_sync_fallback
+                .load(Ordering::Relaxed),
         }
     }
 
@@ -500,6 +514,10 @@ impl HealthSnapshot {
              # TYPE melin_response_gate_total counter\n\
              melin_response_gate_total{{blocker=\"journal\"}} {}\n\
              melin_response_gate_total{{blocker=\"replication\"}} {}\n\
+             # HELP melin_journal_rotations_total Journal segment rotations by path (fast = adopted a pre-staged segment; sync_fallback = synchronous allocate on the journal thread).\n\
+             # TYPE melin_journal_rotations_total counter\n\
+             melin_journal_rotations_total{{path=\"fast\"}} {}\n\
+             melin_journal_rotations_total{{path=\"sync_fallback\"}} {}\n\
              # HELP melin_durability_policy_degraded Durability policy currently clamped below its target node count (1 = degraded, 0 = healthy).\n\
              # TYPE melin_durability_policy_degraded gauge\n\
              melin_durability_policy_degraded {}\n\
@@ -541,6 +559,8 @@ impl HealthSnapshot {
             self.response_idle,
             self.response_gate_journal,
             self.response_gate_replication,
+            self.journal_rotations_fast_path,
+            self.journal_rotations_sync_fallback,
             if self.response_policy_degraded { 1 } else { 0 },
             self.response_policy_degraded_nanos as f64 / 1e9,
         );

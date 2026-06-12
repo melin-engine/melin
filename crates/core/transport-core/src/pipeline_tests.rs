@@ -1874,6 +1874,7 @@ fn primary_driven_rotation_mirrors_segmentation_on_replica() {
     primary
         .journal_stage
         .set_rotation(0, Some(Arc::clone(&rotate_flag)));
+    let p_util = primary.journal_stage.utilization();
 
     let replica_writer = Writer::create_continuing(&replica_path, 1, shared_anchor).unwrap();
     let mut replica = build_replica_pipeline(
@@ -1890,6 +1891,7 @@ fn primary_driven_rotation_mirrors_segmentation_on_replica() {
     replica
         .journal_stage
         .set_stream_marks(Arc::clone(&rotations));
+    let r_util = replica.journal_stage.utilization();
 
     if let Some(ref count) = primary.replicas_connected {
         count.store(1, Ordering::Relaxed);
@@ -2099,6 +2101,30 @@ fn primary_driven_rotation_mirrors_segmentation_on_replica() {
             r.display()
         );
     }
+
+    // Rotation accounting on the /healthz-surfaced counters: every
+    // primary rotation is mirrored by exactly one replica adoption.
+    // The primary is manual-only here (max_journal_bytes == 0), so by
+    // policy its preparer stays unarmed and every rotation takes the
+    // sync path; the replica's adoptions may land on either path
+    // depending on whether the preparer's staging won the race.
+    let rotations = (primary_files.len() - 1) as u64;
+    assert_eq!(
+        p_util.rotations_sync_fallback.load(Ordering::Relaxed),
+        rotations,
+        "manual-only primary rotations must all take the sync path"
+    );
+    assert_eq!(
+        p_util.rotations_fast_path.load(Ordering::Relaxed),
+        0,
+        "manual-only primary must not have a preparer"
+    );
+    assert_eq!(
+        r_util.rotations_fast_path.load(Ordering::Relaxed)
+            + r_util.rotations_sync_fallback.load(Ordering::Relaxed),
+        rotations,
+        "each adopted rotation must be counted"
+    );
 }
 
 /// Size-threshold rotation: setting a small `max_journal_bytes`
@@ -2148,6 +2174,103 @@ fn journal_stage_rotates_on_size_threshold() {
         archive_path.exists(),
         "size-threshold rotation should have produced {}",
         archive_path.display()
+    );
+}
+
+/// The run-startup sequence must arm the background preparer when
+/// rotation recurs, so steady-state rotations adopt the pre-staged
+/// segment instead of stalling on the synchronous allocate.
+/// Regression test for the unwired `enable_preparer` — without the
+/// startup call, every rotation is a sync fallback forever.
+#[cfg(not(feature = "no-persist"))]
+#[test]
+fn size_rotation_uses_prepared_fast_path_after_warmup() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("fast_rotate.journal");
+    let writer = Writer::create(&path).unwrap();
+
+    let (mut producer, mut consumers) = ring::DisruptorBuilder::<TestInput>::new(1024)
+        .add_consumer()
+        .build();
+    let consumer = consumers.pop().unwrap();
+
+    let mut stage = JournalStage::new(writer, consumer, Duration::ZERO, MAX_JOURNAL_BATCH, false);
+    // Tiny threshold — every non-empty fsync rotates.
+    stage.set_rotation(/* max_journal_bytes */ 1, None);
+    let util = stage.utilization();
+
+    let shutdown = Arc::new(AtomicBool::new(false));
+    let s = Arc::clone(&shutdown);
+    let handle = std::thread::spawn(move || stage.run(&s));
+
+    // Each publish lands in its own fsync (threshold 1) and rotates.
+    // Early rotations may race the preparer's initial staging and fall
+    // back; once the worker catches up, a rotation must hit the fast
+    // path. Keep publishing until one does (bounded by the deadline).
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let mut n = 0u64;
+    while util.rotations_fast_path.load(Ordering::Relaxed) == 0 {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "no fast-path rotation within deadline (sync fallbacks: {})",
+            util.rotations_sync_fallback.load(Ordering::Relaxed)
+        );
+        n += 1;
+        producer.publish(add_slot(n, 1_000_000_000 + n));
+        std::thread::sleep(Duration::from_millis(20));
+    }
+
+    shutdown.store(true, Ordering::Relaxed);
+    handle.join().unwrap().unwrap();
+}
+
+/// `enable_preparer` arms exactly when rotation recurs on a
+/// predictable cadence: size-driven rotation or replica adoption
+/// (primary-announced rotations arrive at the primary's cadence).
+/// Manual-only rotation must NOT arm it — the cadence is
+/// unpredictable and the staged segment may never be consumed.
+#[cfg(not(feature = "no-persist"))]
+#[test]
+fn preparer_arms_for_size_and_replica_modes_only() {
+    let dir = tempfile::tempdir().unwrap();
+    let mk_stage = |name: &str| {
+        let writer = Writer::create(&dir.path().join(name)).unwrap();
+        let (_p, mut consumers) = ring::DisruptorBuilder::<TestInput>::new(64)
+            .add_consumer()
+            .build();
+        JournalStage::new(
+            writer,
+            consumers.pop().unwrap(),
+            Duration::ZERO,
+            MAX_JOURNAL_BATCH,
+            false,
+        )
+    };
+
+    let mut size_driven = mk_stage("size.journal");
+    size_driven.set_rotation(1024, None);
+    size_driven.enable_preparer();
+    assert!(
+        size_driven.preparer_enabled(),
+        "size-driven rotation must arm the preparer"
+    );
+
+    let mut replica = mk_stage("replica.journal");
+    replica.set_stream_marks(Arc::new(std::sync::Mutex::new(
+        std::collections::VecDeque::new(),
+    )));
+    replica.enable_preparer();
+    assert!(
+        replica.preparer_enabled(),
+        "replica adoption must arm the preparer"
+    );
+
+    let mut manual_only = mk_stage("manual.journal");
+    manual_only.set_rotation(0, Some(Arc::new(AtomicBool::new(false))));
+    manual_only.enable_preparer();
+    assert!(
+        !manual_only.preparer_enabled(),
+        "manual-only rotation must not arm the preparer"
     );
 }
 
