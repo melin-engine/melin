@@ -3435,13 +3435,46 @@ fn evicted_replica_catchup_under_load_preserves_dense_lineage() {
                 libc::kill(cluster.replica2.child.id() as i32, libc::SIGSTOP);
             }
 
-            wait_metric(
-                primary_health,
-                "melin_replicas_connected ",
-                Duration::from_secs(60),
-                &format!("cycle {cycle}: a replica evicted under ring backpressure"),
-                |v| v < 2,
-            );
+            // Eviction fires only once the frozen replica's kernel TCP
+            // buffers (autotuned, potentially several MB) plus the
+            // 16-slot ring have filled — megabytes of submitted orders.
+            // On an idle box that takes seconds; on a loaded one
+            // (nextest runs the rest of the suite concurrently with
+            // this group) starved submitters can need minutes, so a
+            // fixed short deadline flakes. Allow a generous wall-clock
+            // budget while the submitters demonstrably make progress,
+            // and fail fast if they stall outright.
+            {
+                let deadline = Instant::now() + Duration::from_secs(300);
+                let mut last_count =
+                    submitted[0].load(Ordering::Relaxed) + submitted[1].load(Ordering::Relaxed);
+                let mut last_progress = Instant::now();
+                loop {
+                    if let Some(v) = fetch_metric_u64(primary_health, "melin_replicas_connected ")
+                        && v < 2
+                    {
+                        break;
+                    }
+                    let now_count =
+                        submitted[0].load(Ordering::Relaxed) + submitted[1].load(Ordering::Relaxed);
+                    if now_count > last_count {
+                        last_count = now_count;
+                        last_progress = Instant::now();
+                    }
+                    assert!(
+                        last_progress.elapsed() < Duration::from_secs(30),
+                        "cycle {cycle}: submitters stalled (stuck at {last_count} orders) \
+                         with no eviction — the cluster wedged or both submitters \
+                         errored out before ring backpressure could evict the frozen replica"
+                    );
+                    assert!(
+                        Instant::now() < deadline,
+                        "cycle {cycle}: no eviction under ring backpressure after 300s \
+                         ({last_count} orders submitted)"
+                    );
+                    std::thread::sleep(Duration::from_millis(100));
+                }
+            }
 
             unsafe {
                 libc::kill(cluster.replica2.child.id() as i32, libc::SIGCONT);
