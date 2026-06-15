@@ -19,13 +19,12 @@ use melin_journal::replication::ReplicationConsumer;
 use melin_transport_core::pipeline::{JournalStage, JournalStageRun};
 
 use super::receiver_transport::{
-    FrameResult, ReceiverTransport, SessionExit, compact_recv_buf, streaming_loop,
-    try_extract_frame,
+    FrameResult, ReceiverTransport, compact_recv_buf, streaming_loop, try_extract_frame,
 };
 use super::{
-    MAX_INPROCESS_DIVERGENCE_RESYNCS, ReceiverResult, ReplicaCursors, ReplicaPipelineHandles,
+    AfterSession, MAX_BACKOFF, ReceiverResult, ReplicaCursors, ReplicaPipelineHandles,
     ReplicationMetrics, SentHighWater, TeardownOutcome, build_replica_pipeline_with_threads,
-    recover_replica_state, sleep_checking_flags, teardown_replica_pipeline,
+    handle_session_exit, recover_replica_state, sleep_checking_flags, teardown_replica_pipeline,
 };
 use melin_transport_core::replication::archive::{ArchiveReason, archive_local_lineage};
 use melin_transport_core::replication::catchup::{
@@ -948,7 +947,6 @@ where
     // Exponential backoff for reconnection: 1s → 2s → 4s → … → 30s max.
     // Reset to 1s on successful streaming (first InputBatch received).
     let mut backoff = std::time::Duration::from_secs(1);
-    const MAX_BACKOFF: std::time::Duration = std::time::Duration::from_secs(30);
 
     // Mid-stream divergence resyncs this process has attempted — see
     // `MAX_INPROCESS_DIVERGENCE_RESYNCS`.
@@ -1443,108 +1441,43 @@ where
             r
         };
 
-        // Publish sentinel for terminal exits — unless the journal stage
-        // already failed: its gate cursor is frozen, so a full ring
-        // would wedge this publish forever, and the sentinel has no
-        // reader anyway (the matching stage is gated behind the journal
-        // cursor; teardown's shutdown flag covers every consumer).
-        if !matches!(result.exit, SessionExit::Disconnected)
-            && let Some(p) = pipeline.as_mut()
-            && !p.journal_failed.load(Ordering::Acquire)
-        {
-            p.input_producer.publish(
-                melin_transport_core::pipeline::InputSlot::<A::Event>::shutdown_sentinel(),
-            );
-        }
-
-        match result.exit {
-            SessionExit::Shutdown => {
-                if let Some(p) = pipeline.take() {
-                    let _ = teardown_replica_pipeline::<A, W>(p);
-                }
-                return Ok(None);
-            }
-            SessionExit::Promote => {
-                return match pipeline.take() {
-                    Some(p) => match teardown_replica_pipeline::<A, W>(p) {
-                        TeardownOutcome::Clean(ex, wr) => Ok(Some((ex, wr))),
-                        _ => Err("pipeline failed during promotion (DPDK)".into()),
-                    },
-                    None => Err("pipeline missing on promote (DPDK)".into()),
-                };
-            }
-            SessionExit::Fatal(e) => {
-                let outcome = match pipeline.take() {
-                    Some(p) => teardown_replica_pipeline::<A, W>(p),
-                    None => return Err(e),
-                };
-                // Mid-stream chain divergence is repairable in-process —
-                // re-derive handshake state from disk and reconnect; the
-                // next session takes the HashMismatch → archive → reseed
-                // path above. Mirrors the kernel-TCP receiver.
-                if let TeardownOutcome::JournalFailed(
-                    je @ melin_journal::JournalError::ReplicaChainDivergence { .. },
-                ) = outcome
-                {
-                    divergence_resyncs += 1;
-                    if divergence_resyncs > MAX_INPROCESS_DIVERGENCE_RESYNCS {
-                        return Err(format!(
-                            "mid-stream chain divergence recurred {divergence_resyncs} times — \
-                             giving up on in-process resync: {je}"
-                        )
-                        .into());
-                    }
-                    warn!(
-                        error = %je,
-                        attempt = divergence_resyncs,
-                        max_attempts = MAX_INPROCESS_DIVERGENCE_RESYNCS,
-                        "mid-stream chain divergence — re-deriving local state for \
-                         in-process resync (DPDK)"
-                    );
-                    // Close the old session before reconnecting: the TCP
-                    // connection to the primary is still healthy (the
-                    // divergence was detected locally), so without a FIN
-                    // the primary's slot stays occupied — and the DPDK
-                    // primary has no timeout eviction, so the repair
-                    // handshake could be refused indefinitely. Closing
-                    // also returns the socket entry to the socket set.
-                    transport.close(handle);
-                    let (ex, wr, seq, hash) = recover_replica_state::<A, W>(
-                        journal_path,
-                        &snapshot_path,
-                        factory.as_ref(),
-                        &fence_state,
-                    )?;
-                    exchange = ex;
-                    journal_writer = wr;
-                    last_sequence = seq;
-                    chain_hash = hash;
-                    continue;
-                }
-                return Err(e);
-            }
-            SessionExit::Disconnected => {
-                // Pipeline stays live — `last_sequence` and `chain_hash`
-                // refresh from its atomics at the top of the next iteration.
-                // The TCP session is already dead, but the smoltcp socket
-                // entry is only reclaimed by an explicit close — each
-                // reconnect allocates a fresh socket, so skipping this
-                // leaks one socket-set entry per disconnect.
-                transport.close(handle);
-            }
-        }
-
-        if result.received_data {
-            backoff = std::time::Duration::from_secs(1);
-        }
-
-        warn!(
+        match handle_session_exit(
+            result,
+            &mut pipeline,
+            &mut divergence_resyncs,
+            &mut backoff,
             last_sequence,
-            backoff_secs = backoff.as_secs(),
-            "reconnecting to primary (DPDK)"
-        );
-        sleep_checking_flags(backoff, shutdown, promote);
-        backoff = (backoff * 2).min(MAX_BACKOFF);
+            journal_path,
+            &snapshot_path,
+            factory.as_ref(),
+            &fence_state,
+            shutdown,
+            promote,
+            // Close the smoltcp session before any reconnect. The TCP
+            // connection to the primary may still be healthy (a locally
+            // detected divergence, or a half-open drop), so without an
+            // explicit FIN the primary's slot stays occupied — and the
+            // DPDK primary has no timeout eviction, so a repair handshake
+            // could be refused indefinitely. Closing also returns the
+            // socket entry to the socket set; each reconnect allocates a
+            // fresh one, so skipping it leaks one entry per disconnect.
+            || transport.close(handle),
+        ) {
+            AfterSession::Return(r) => return r,
+            AfterSession::Resync {
+                exchange: ex,
+                journal_writer: wr,
+                last_sequence: seq,
+                chain_hash: hash,
+            } => {
+                exchange = ex;
+                journal_writer = wr;
+                last_sequence = seq;
+                chain_hash = hash;
+                continue;
+            }
+            AfterSession::Reconnect => {}
+        }
     }
 }
 

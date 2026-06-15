@@ -73,6 +73,8 @@ mod receiver_transport;
 mod tcp_receiver;
 mod tcp_sender;
 
+use receiver_transport::{SessionExit, StreamingResult};
+
 // Wire-protocol types, auth, catch-up, ack queueing, dual-track
 // cursor management, and per-replica metrics now live in
 // `melin_transport_core::replication`. Re-export the public types
@@ -512,6 +514,182 @@ where
     let (mut exchange, writer) = engine.into_parts();
     factory.apply_operator_policy(&mut exchange);
     Ok((Some(exchange), Some(writer), last, hash))
+}
+
+/// Reconnect backoff cap shared by both receivers — exponential from
+/// 1 s, clamped here so a long outage settles to one attempt every 30 s
+/// without hammering a flapping primary.
+pub(super) const MAX_BACKOFF: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// What the receiver's reconnect loop does after a streaming session
+/// ends — the transport-independent half of the exit dispatch, returned
+/// by [`handle_session_exit`].
+pub(in crate::replication) enum AfterSession<A, W> {
+    /// Terminal: `run_receiver*` returns this verbatim — clean shutdown
+    /// (`Ok(None)`), a promotion hand-off (`Ok(Some(state))`), or a
+    /// fatal error.
+    Return(ReceiverResult<A, W>),
+    /// A mid-stream divergence was repaired in-process: the recovered
+    /// on-disk state is the new handshake position. The caller adopts it
+    /// and reconnects; the primary's `HashMismatch` verdict then routes
+    /// the replica through archive + re-seed.
+    Resync {
+        exchange: Option<A>,
+        journal_writer: Option<W>,
+        last_sequence: u64,
+        chain_hash: [u8; 32],
+    },
+    /// A plain disconnect — backoff has already been applied (and the
+    /// flags checked); the caller reconnects, reusing the still-live
+    /// pipeline.
+    Reconnect,
+}
+
+/// Dispatch a finished streaming session — shared by the kernel-TCP and
+/// DPDK receivers.
+///
+/// Folds the three behaviours that were previously copied between the
+/// two receiver loops (and had drifted — the copies reset the
+/// post-resync writer differently, a latent corruption bug): the
+/// terminal-exit shutdown-sentinel publish, the
+/// `Shutdown`/`Promote`/`Fatal` teardown (including the once-per-process
+/// in-process divergence-resync policy), and the `Disconnected`
+/// reconnect backoff.
+///
+/// `close` runs any transport-specific teardown that must precede a
+/// reconnect — the DPDK receiver closes its smoltcp socket so the
+/// primary's slot and the local socket-set entry are freed; the
+/// kernel-TCP receiver passes a no-op (its `TcpStream` is dropped by the
+/// caller on the next loop turn). It is invoked only on the two
+/// reconnecting paths (in-process resync, plain disconnect), matching
+/// the pre-refactor behaviour.
+// Twelve arguments is a lot, but each is a distinct piece of the
+// receiver loop's state; bundling them would only move the noise.
+#[allow(clippy::too_many_arguments)]
+pub(in crate::replication) fn handle_session_exit<A, W>(
+    result: StreamingResult,
+    pipeline: &mut Option<ReplicaPipelineHandles<A, W>>,
+    divergence_resyncs: &mut u32,
+    backoff: &mut std::time::Duration,
+    last_sequence: u64,
+    journal_path: &std::path::Path,
+    snapshot_path: &std::path::Path,
+    factory: &dyn melin_app::app_factory::AppFactory<App = A>,
+    fence_state: &melin_transport_core::fence::FenceState,
+    shutdown: &AtomicBool,
+    promote: &AtomicBool,
+    mut close: impl FnMut(),
+) -> AfterSession<A, W>
+where
+    A: Application + Send + 'static,
+    W: JournalWrite<A::Event> + Send + 'static,
+{
+    let StreamingResult {
+        exit,
+        received_data,
+    } = result;
+
+    // Publish the shutdown sentinel for terminal exits — unless the
+    // journal stage already failed: its gate cursor is frozen, so a full
+    // ring would wedge this publish forever, and the sentinel has no
+    // reader anyway (the matching stage is gated behind the journal
+    // cursor; teardown's shutdown flag covers every consumer).
+    if !matches!(exit, SessionExit::Disconnected)
+        && let Some(p) = pipeline.as_mut()
+        && !p.journal_failed.load(Ordering::Acquire)
+    {
+        p.input_producer
+            .publish(InputSlot::<A::Event>::shutdown_sentinel());
+    }
+
+    match exit {
+        SessionExit::Shutdown => {
+            if let Some(p) = pipeline.take() {
+                let _ = teardown_replica_pipeline::<A, W>(p);
+            }
+            AfterSession::Return(Ok(None))
+        }
+
+        SessionExit::Promote => AfterSession::Return(match pipeline.take() {
+            Some(p) => match teardown_replica_pipeline::<A, W>(p) {
+                TeardownOutcome::Clean(ex, wr) => Ok(Some((ex, wr))),
+                _ => Err("pipeline failed during promotion".into()),
+            },
+            None => Err("pipeline missing on promote".into()),
+        }),
+
+        SessionExit::Fatal(e) => {
+            let outcome = match pipeline.take() {
+                Some(p) => teardown_replica_pipeline::<A, W>(p),
+                // Fatal implies a streaming session, which implies a
+                // pipeline — but don't turn a missing one into a resync.
+                None => return AfterSession::Return(Err(e)),
+            };
+            // Mid-stream chain divergence is repairable in-process: the
+            // on-disk journal is self-consistent (merely forked from the
+            // primary's history), so re-derive the handshake state from
+            // disk and reconnect — the primary judges the recovered
+            // position divergent and the next session takes the
+            // HashMismatch → archive → reseed path, no restart needed.
+            // Every other fatal exits as before: protocol violations and
+            // journal I/O death (ENOSPC, RO-FS) would fail the same way
+            // after a resync.
+            let TeardownOutcome::JournalFailed(
+                je @ melin_journal::JournalError::ReplicaChainDivergence { .. },
+            ) = outcome
+            else {
+                return AfterSession::Return(Err(e));
+            };
+
+            *divergence_resyncs += 1;
+            let attempt = *divergence_resyncs;
+            if attempt > MAX_INPROCESS_DIVERGENCE_RESYNCS {
+                return AfterSession::Return(Err(format!(
+                    "mid-stream chain divergence recurred {attempt} times — giving up on \
+                     in-process resync (each cycle archives the local journal and re-seeds \
+                     from the primary; recurrence at this rate means the primary keeps \
+                     streaming history that forks from what it announces): {je}"
+                )
+                .into()));
+            }
+            tracing::warn!(
+                error = %je,
+                attempt,
+                max_attempts = MAX_INPROCESS_DIVERGENCE_RESYNCS,
+                "mid-stream chain divergence — re-deriving local state for in-process resync"
+            );
+            // Transport-specific teardown before reconnecting.
+            close();
+            match recover_replica_state::<A, W>(journal_path, snapshot_path, factory, fence_state) {
+                Ok((exchange, journal_writer, seq, hash)) => AfterSession::Resync {
+                    exchange,
+                    journal_writer,
+                    last_sequence: seq,
+                    chain_hash: hash,
+                },
+                Err(e) => AfterSession::Return(Err(e)),
+            }
+        }
+
+        SessionExit::Disconnected => {
+            // Transport-specific teardown before reconnecting (smoltcp
+            // socket reclaim on DPDK; no-op on kernel TCP).
+            close();
+            // A session that received data is proof the primary is
+            // reachable — treat the drop as transient and reset backoff.
+            if received_data {
+                *backoff = std::time::Duration::from_secs(1);
+            }
+            tracing::warn!(
+                last_sequence,
+                backoff_secs = backoff.as_secs(),
+                "reconnecting to primary"
+            );
+            sleep_checking_flags(*backoff, shutdown, promote);
+            *backoff = (*backoff * 2).min(MAX_BACKOFF);
+            AfterSession::Reconnect
+        }
+    }
 }
 
 #[cfg(test)]
