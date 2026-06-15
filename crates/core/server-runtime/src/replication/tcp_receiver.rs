@@ -21,9 +21,9 @@ use melin_transport_core::pipeline::{InputSlot, JournalStage, JournalStageRun};
 use super::auth::authenticate_with_primary;
 use super::receiver_transport::{ReceiverTransport, SessionExit, streaming_loop};
 use super::{
-    AfterSession, MAX_BACKOFF, ReplicaPipelineHandles, TeardownOutcome,
-    build_replica_pipeline_with_threads, handle_session_exit, recover_replica_state,
-    sleep_checking_flags, teardown_replica_pipeline,
+    AfterSession, MAX_BACKOFF, ReplicaPipelineHandles, build_replica_pipeline_with_threads,
+    handle_session_exit, recover_replica_state, sleep_checking_flags, take_pipeline_for_promotion,
+    teardown_replica_pipeline,
 };
 use melin_transport_core::replication::archive::{ArchiveReason, archive_local_lineage};
 use melin_transport_core::replication::protocol::{
@@ -517,18 +517,7 @@ where
         }
         if promote.load(Ordering::Acquire) {
             info!("promotion triggered while disconnected");
-            if let Some(mut p) = pipeline.take() {
-                p.input_producer
-                    .publish(InputSlot::<A::Event>::shutdown_sentinel());
-                if let TeardownOutcome::Clean(e, w) = teardown_replica_pipeline::<A, W>(p) {
-                    exchange = Some(e);
-                    journal_writer = Some(w);
-                }
-            }
-            return match (exchange, journal_writer) {
-                (Some(e), Some(w)) => Ok(Some((e, w))),
-                _ => Err("promotion requested but no local state available".into()),
-            };
+            return take_pipeline_for_promotion(&mut pipeline, &mut exchange, &mut journal_writer);
         }
 
         // --- Connect and authenticate ---
@@ -548,18 +537,11 @@ where
                 }
                 if promote.load(Ordering::Acquire) {
                     info!("promotion triggered during reconnect backoff");
-                    if let Some(mut p) = pipeline.take() {
-                        p.input_producer
-                            .publish(InputSlot::<A::Event>::shutdown_sentinel());
-                        if let TeardownOutcome::Clean(e, w) = teardown_replica_pipeline::<A, W>(p) {
-                            exchange = Some(e);
-                            journal_writer = Some(w);
-                        }
-                    }
-                    return match (exchange, journal_writer) {
-                        (Some(e), Some(w)) => Ok(Some((e, w))),
-                        _ => Err("promotion requested but no local state available".into()),
-                    };
+                    return take_pipeline_for_promotion(
+                        &mut pipeline,
+                        &mut exchange,
+                        &mut journal_writer,
+                    );
                 }
                 backoff = (backoff * 2).min(MAX_BACKOFF);
                 continue;

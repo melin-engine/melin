@@ -692,6 +692,42 @@ where
     }
 }
 
+/// Tear the live pipeline down for a promotion that fired while the
+/// receiver was disconnected — at the top of the reconnect loop or
+/// during reconnect backoff — and return the warm Exchange + writer for
+/// the promoted primary. Shared by both receivers.
+///
+/// Publishes the shutdown sentinel before teardown so the idle stages
+/// drain the input ring cleanly (any received-but-not-yet-journaled
+/// events) instead of exiting via the flag's emergency-abort branch —
+/// see [`shutdown_pipeline`]. A clean teardown hands back the warm
+/// state; if there is no pipeline (promotion before the first connect,
+/// or after a resync that left the state in the receiver's locals) those
+/// locals carry it. A missing pair is a hard error — a promote with
+/// nothing to promote.
+pub(in crate::replication) fn take_pipeline_for_promotion<A, W>(
+    pipeline: &mut Option<ReplicaPipelineHandles<A, W>>,
+    exchange: &mut Option<A>,
+    journal_writer: &mut Option<W>,
+) -> ReceiverResult<A, W>
+where
+    A: Application + Send + 'static,
+    W: JournalWrite<A::Event> + Send + 'static,
+{
+    if let Some(mut p) = pipeline.take() {
+        p.input_producer
+            .publish(InputSlot::<A::Event>::shutdown_sentinel());
+        if let TeardownOutcome::Clean(e, w) = teardown_replica_pipeline::<A, W>(p) {
+            *exchange = Some(e);
+            *journal_writer = Some(w);
+        }
+    }
+    match (exchange.take(), journal_writer.take()) {
+        (Some(e), Some(w)) => Ok(Some((e, w))),
+        _ => Err("promotion requested but no local state available".into()),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::io::Write;

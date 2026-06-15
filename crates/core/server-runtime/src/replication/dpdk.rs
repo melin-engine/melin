@@ -23,8 +23,9 @@ use super::receiver_transport::{
 };
 use super::{
     AfterSession, MAX_BACKOFF, ReceiverResult, ReplicaCursors, ReplicaPipelineHandles,
-    ReplicationMetrics, SentHighWater, TeardownOutcome, build_replica_pipeline_with_threads,
-    handle_session_exit, recover_replica_state, sleep_checking_flags, teardown_replica_pipeline,
+    ReplicationMetrics, SentHighWater, build_replica_pipeline_with_threads, handle_session_exit,
+    recover_replica_state, sleep_checking_flags, take_pipeline_for_promotion,
+    teardown_replica_pipeline,
 };
 use melin_transport_core::replication::archive::{ArchiveReason, archive_local_lineage};
 use melin_transport_core::replication::catchup::{
@@ -998,17 +999,8 @@ where
             return Ok(None);
         }
         if promote.load(Ordering::Acquire) {
-            info!("promotion triggered while disconnected (DPDK)");
-            if let Some(p) = pipeline.take()
-                && let TeardownOutcome::Clean(e, w) = teardown_replica_pipeline::<A, W>(p)
-            {
-                exchange = Some(e);
-                journal_writer = Some(w);
-            }
-            return match (exchange, journal_writer) {
-                (Some(e), Some(w)) => Ok(Some((e, w))),
-                _ => Err("promotion requested but no local state available".into()),
-            };
+            info!("promotion triggered while disconnected");
+            return take_pipeline_for_promotion(&mut pipeline, &mut exchange, &mut journal_writer);
         }
 
         info!(
@@ -1086,17 +1078,12 @@ where
                 return Ok(None);
             }
             if promote.load(Ordering::Acquire) {
-                info!("promotion triggered during reconnect backoff (DPDK)");
-                if let Some(p) = pipeline.take()
-                    && let TeardownOutcome::Clean(e, w) = teardown_replica_pipeline::<A, W>(p)
-                {
-                    exchange = Some(e);
-                    journal_writer = Some(w);
-                }
-                return match (exchange, journal_writer) {
-                    (Some(e), Some(w)) => Ok(Some((e, w))),
-                    _ => Err("promotion requested but no local state available".into()),
-                };
+                info!("promotion triggered during reconnect backoff");
+                return take_pipeline_for_promotion(
+                    &mut pipeline,
+                    &mut exchange,
+                    &mut journal_writer,
+                );
             }
             backoff = (backoff * 2).min(MAX_BACKOFF);
             continue;
