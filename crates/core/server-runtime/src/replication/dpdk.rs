@@ -19,7 +19,8 @@ use melin_journal::replication::ReplicationConsumer;
 use melin_transport_core::pipeline::{JournalStage, JournalStageRun};
 
 use super::receiver_transport::{
-    FrameResult, ReceiverTransport, compact_recv_buf, streaming_loop, try_extract_frame,
+    ControlFrameSource, FrameResult, ReceiverTransport, compact_recv_buf, receive_chunked_body,
+    streaming_loop, try_extract_frame,
 };
 use super::{
     AfterSession, MAX_BACKOFF, ReceiverResult, ReplicaCursors, ReplicaPipelineHandles,
@@ -33,9 +34,9 @@ use melin_transport_core::replication::catchup::{
     preflight_snapshot_transfer, snapshot_transfer_with,
 };
 use melin_transport_core::replication::protocol::{
-    Ack, Handshake, MAX_CONTROL_FRAME, MAX_DATA_FRAME, PrimaryMessage, ReplicaMessage,
-    decode_primary_message, decode_replica_message, encode_ack, encode_handshake,
-    encode_hash_mismatch, encode_heartbeat, encode_need_snapshot, encode_stream_start,
+    Ack, Handshake, MAX_CONTROL_FRAME, PrimaryMessage, ReplicaMessage, decode_primary_message,
+    decode_replica_message, encode_ack, encode_handshake, encode_hash_mismatch, encode_heartbeat,
+    encode_need_snapshot, encode_stream_start,
 };
 use melin_transport_core::replication::validate::{
     HandshakeValidation, validate_replica_handshake_settled,
@@ -1474,88 +1475,49 @@ where
 /// framing shared by the snapshot payload and the segment seed. The
 /// tmp file is removed on any failure, so callers never see a partial
 /// file. Leaves any bytes past the trailer in `recv_buf`.
-fn receive_chunked_body_dpdk(
+/// DPDK control-frame source: polls the smoltcp transport and extracts
+/// one length-prefixed frame per call. Drives the shared
+/// [`receive_chunked_body`] and the resync prologue reads
+/// (`SnapshotBegin` / `SegmentSeedBegin`). See [`ControlFrameSource`].
+struct DpdkFrameSource<'a> {
+    transport: &'a mut melin_dpdk::DpdkTransport,
     handle: melin_dpdk::SocketHandle,
-    transport: &mut melin_dpdk::DpdkTransport,
-    recv_buf: &mut Vec<u8>,
-    tmp_path: &std::path::Path,
-    expected_len: u64,
-    what: &str,
-    shutdown: &AtomicBool,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let result = (|| -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        let mut tmp_file = std::fs::File::create(tmp_path)?;
-        let mut received: u64 = 0;
-        let mut running_crc: u32 = 0;
+    recv_buf: &'a mut Vec<u8>,
+    shutdown: &'a AtomicBool,
+}
+
+impl ControlFrameSource for DpdkFrameSource<'_> {
+    fn next_frame(
+        &mut self,
+        max_size: usize,
+    ) -> Result<Vec<u8>, Box<dyn std::error::Error + Send + Sync>> {
         loop {
-            if shutdown.load(Ordering::Relaxed) {
-                return Err(format!("shutdown during {what} transfer").into());
+            if self.shutdown.load(Ordering::Relaxed) {
+                return Err("shutdown during transfer".into());
             }
-            transport.poll();
-            transport.recv_into_vec(handle, recv_buf);
+            self.transport.poll();
+            self.transport.recv_into_vec(self.handle, self.recv_buf);
 
-            // Process all complete frames in the buffer.
-            let mut consumed = 0;
-            loop {
-                let remaining = &recv_buf[consumed..];
-                match try_extract_frame(remaining, MAX_DATA_FRAME) {
-                    FrameResult::Complete(payload_start, frame_end) => {
-                        let payload = &remaining[payload_start..frame_end];
-                        match decode_primary_message(payload)? {
-                            PrimaryMessage::SnapshotChunk(data) => {
-                                std::io::Write::write_all(&mut tmp_file, &data)?;
-                                received += data.len() as u64;
-                                running_crc = crc32c::crc32c_append(running_crc, &data);
-                            }
-                            PrimaryMessage::SnapshotEnd {
-                                crc32c: expected_crc,
-                            } => {
-                                tmp_file.sync_all()?;
-                                if received != expected_len {
-                                    return Err(format!(
-                                        "{what} length mismatch: expected {expected_len}, got {received}"
-                                    )
-                                    .into());
-                                }
-                                if running_crc != expected_crc {
-                                    return Err(format!(
-                                        "{what} CRC mismatch: expected {expected_crc:#x}, got {running_crc:#x}"
-                                    )
-                                    .into());
-                                }
-                                consumed += frame_end;
-                                compact_recv_buf(recv_buf, consumed);
-                                return Ok(());
-                            }
-                            other => {
-                                return Err(format!(
-                                    "expected {what} SnapshotChunk/End, got {other:?}"
-                                )
-                                .into());
-                            }
-                        }
-                        consumed += frame_end;
-                    }
-                    FrameResult::Oversized => {
-                        return Err(format!("oversized frame during {what} transfer").into());
-                    }
-                    FrameResult::Incomplete => break,
+            match try_extract_frame(self.recv_buf, max_size) {
+                FrameResult::Complete(payload_start, frame_end) => {
+                    let payload = self.recv_buf[payload_start..frame_end].to_vec();
+                    compact_recv_buf(self.recv_buf, frame_end);
+                    return Ok(payload);
                 }
+                FrameResult::Oversized => {
+                    return Err("oversized frame during transfer".into());
+                }
+                FrameResult::Incomplete => {}
             }
-            compact_recv_buf(recv_buf, consumed);
 
-            if !transport.is_active(handle) {
-                return Err(format!("disconnected during {what} transfer").into());
+            // A frame arriving in the same poll as the FIN is returned
+            // above before we observe the disconnect here.
+            if !self.transport.is_active(self.handle) {
+                return Err("disconnected during transfer".into());
             }
             std::thread::yield_now();
         }
-    })();
-    if result.is_err() {
-        // Best-effort: a partial tmp file must not survive the failed
-        // transfer (it would shadow the next attempt's write).
-        let _ = std::fs::remove_file(tmp_path);
     }
-    result
 }
 
 /// Receive a snapshot from the primary via DPDK transport.
@@ -1568,47 +1530,29 @@ fn receive_snapshot_dpdk<A: Application>(
     snapshot_path: &std::path::Path,
     shutdown: &AtomicBool,
 ) -> Result<(A, u64, [u8; 32]), Box<dyn std::error::Error + Send + Sync>> {
-    // Read SnapshotBegin.
-    let (snap_len, snap_sequence, snap_chain_hash) = loop {
-        if shutdown.load(Ordering::Relaxed) {
-            return Err("shutdown during snapshot transfer".into());
-        }
-        transport.poll();
-        transport.recv_into_vec(handle, recv_buf);
-
-        match try_extract_frame(recv_buf, MAX_CONTROL_FRAME) {
-            FrameResult::Complete(payload_start, frame_end) => {
-                let payload = &recv_buf[payload_start..frame_end];
-                let msg = decode_primary_message(payload)?;
-                compact_recv_buf(recv_buf, frame_end);
-                match msg {
-                    PrimaryMessage::SnapshotBegin {
-                        snapshot_len,
-                        snap_sequence,
-                        snap_chain_hash,
-                    } => break (snapshot_len, snap_sequence, snap_chain_hash),
-                    other => return Err(format!("expected SnapshotBegin, got {other:?}").into()),
-                }
-            }
-            FrameResult::Oversized => {
-                return Err("oversized frame during snapshot transfer".into());
-            }
-            FrameResult::Incomplete => {}
-        }
-
-        if !transport.is_active(handle) {
-            return Err("disconnected during snapshot transfer".into());
-        }
-        std::thread::yield_now();
+    let mut source = DpdkFrameSource {
+        transport,
+        handle,
+        recv_buf,
+        shutdown,
     };
+
+    // Read SnapshotBegin.
+    let (snap_len, snap_sequence, snap_chain_hash) =
+        match decode_primary_message(&source.next_frame(MAX_CONTROL_FRAME)?)? {
+            PrimaryMessage::SnapshotBegin {
+                snapshot_len,
+                snap_sequence,
+                snap_chain_hash,
+            } => (snapshot_len, snap_sequence, snap_chain_hash),
+            other => return Err(format!("expected SnapshotBegin, got {other:?}").into()),
+        };
 
     info!(snap_sequence, snap_len, "receiving snapshot (DPDK)");
 
     // Receive snapshot chunks into a temp file, then install it.
     let tmp_path = snapshot_path.with_extension("snapshot.tmp");
-    receive_chunked_body_dpdk(
-        handle, transport, recv_buf, &tmp_path, snap_len, "snapshot", shutdown,
-    )?;
+    receive_chunked_body(&mut source, &tmp_path, snap_len, "snapshot")?;
     std::fs::rename(&tmp_path, snapshot_path)?;
     info!(
         snap_sequence,
@@ -1645,48 +1589,21 @@ fn receive_segment_seed_dpdk(
     snap_sequence: u64,
     shutdown: &AtomicBool,
 ) -> Result<u64, Box<dyn std::error::Error + Send + Sync>> {
+    let mut source = DpdkFrameSource {
+        transport,
+        handle,
+        recv_buf,
+        shutdown,
+    };
+
     // Read SegmentSeedBegin.
-    let seed_len = loop {
-        if shutdown.load(Ordering::Relaxed) {
-            return Err("shutdown during segment seed transfer".into());
-        }
-        transport.poll();
-        transport.recv_into_vec(handle, recv_buf);
-
-        match try_extract_frame(recv_buf, MAX_CONTROL_FRAME) {
-            FrameResult::Complete(payload_start, frame_end) => {
-                let payload = &recv_buf[payload_start..frame_end];
-                let msg = decode_primary_message(payload)?;
-                compact_recv_buf(recv_buf, frame_end);
-                match msg {
-                    PrimaryMessage::SegmentSeedBegin { seed_len } => break seed_len,
-                    other => {
-                        return Err(format!("expected SegmentSeedBegin, got {other:?}").into());
-                    }
-                }
-            }
-            FrameResult::Oversized => {
-                return Err("oversized frame during segment seed transfer".into());
-            }
-            FrameResult::Incomplete => {}
-        }
-
-        if !transport.is_active(handle) {
-            return Err("disconnected during segment seed transfer".into());
-        }
-        std::thread::yield_now();
+    let seed_len = match decode_primary_message(&source.next_frame(MAX_CONTROL_FRAME)?)? {
+        PrimaryMessage::SegmentSeedBegin { seed_len } => seed_len,
+        other => return Err(format!("expected SegmentSeedBegin, got {other:?}").into()),
     };
 
     let tmp_path = journal_path.with_extension("seed.tmp");
-    receive_chunked_body_dpdk(
-        handle,
-        transport,
-        recv_buf,
-        &tmp_path,
-        seed_len,
-        "segment seed",
-        shutdown,
-    )?;
+    receive_chunked_body(&mut source, &tmp_path, seed_len, "segment seed")?;
     // Structural check before installing - see the kernel-TCP receiver.
     if let Err(e) =
         melin_journal::segment::verify_segment_prefix(&tmp_path, snap_sequence, seed_len)

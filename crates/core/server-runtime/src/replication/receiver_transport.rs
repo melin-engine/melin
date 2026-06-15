@@ -103,6 +103,85 @@ pub(super) fn compact_recv_buf(buf: &mut Vec<u8>, consumed: usize) {
 }
 
 // ---------------------------------------------------------------------------
+// Chunked-body transfer (snapshot / segment seed)
+// ---------------------------------------------------------------------------
+
+/// A source of length-prefixed control-frame payloads from the primary
+/// during the handshake / resync phase.
+///
+/// Abstracts the two transports' framing — the kernel-TCP blocking
+/// reader and the DPDK poll loop — so the snapshot / segment-seed
+/// transfer (and its tests) are transport-generic. Returns the decoded
+/// frame *payload* (what [`decode_primary_message`] consumes), not the
+/// length prefix. Cold path: only the one-time resync transfer drives
+/// it.
+pub(super) trait ControlFrameSource {
+    /// Block until the next complete frame arrives; return its payload
+    /// bytes. Errors on disconnect, an oversize / malformed frame, or a
+    /// shutdown request.
+    fn next_frame(
+        &mut self,
+        max_size: usize,
+    ) -> Result<Vec<u8>, Box<dyn std::error::Error + Send + Sync>>;
+}
+
+/// Receive a chunked body (`SnapshotChunk*` → `SnapshotEnd`) into
+/// `tmp_path`, verifying the byte length and CRC32C trailer — the
+/// framing shared by the snapshot payload and the segment seed. The tmp
+/// file is removed on any failure (including transport errors), so
+/// callers never see a partial file. Shared by both receivers via
+/// [`ControlFrameSource`].
+pub(super) fn receive_chunked_body<S: ControlFrameSource>(
+    source: &mut S,
+    tmp_path: &std::path::Path,
+    expected_len: u64,
+    what: &str,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let result = (|| -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let mut tmp_file = std::fs::File::create(tmp_path)?;
+        let mut received: u64 = 0;
+        let mut running_crc: u32 = 0;
+        loop {
+            let frame = source.next_frame(MAX_DATA_FRAME)?;
+            match decode_primary_message(&frame)? {
+                PrimaryMessage::SnapshotChunk(data) => {
+                    std::io::Write::write_all(&mut tmp_file, &data)?;
+                    received += data.len() as u64;
+                    running_crc = crc32c::crc32c_append(running_crc, &data);
+                }
+                PrimaryMessage::SnapshotEnd {
+                    crc32c: expected_crc,
+                } => {
+                    tmp_file.sync_all()?;
+                    if received != expected_len {
+                        return Err(format!(
+                            "{what} length mismatch: expected {expected_len} bytes, got {received}"
+                        )
+                        .into());
+                    }
+                    if running_crc != expected_crc {
+                        return Err(format!(
+                            "{what} CRC mismatch: expected {expected_crc:#x}, got {running_crc:#x}"
+                        )
+                        .into());
+                    }
+                    return Ok(());
+                }
+                other => {
+                    return Err(format!("expected {what} SnapshotChunk/End, got {other:?}").into());
+                }
+            }
+        }
+    })();
+    if result.is_err() {
+        // Best-effort: a partial tmp file must not survive the failed
+        // transfer (it would shadow the next attempt's write).
+        let _ = std::fs::remove_file(tmp_path);
+    }
+    result
+}
+
+// ---------------------------------------------------------------------------
 // Streaming frame processing
 // ---------------------------------------------------------------------------
 
@@ -1940,5 +2019,124 @@ mod tests {
         assert!(!outcome.any_published);
         assert_eq!(outcome.accum_end_sequence, 55);
         assert!(drain(&mut consumer).is_empty());
+    }
+
+    // -----------------------------------------------------------------
+    // Chunked-body transfer (snapshot / segment seed), driven by a
+    // scripted ControlFrameSource — covers the body-receive logic (chunk
+    // write, length + CRC verification, tmp cleanup) that BOTH receivers
+    // now share, without a live transport.
+    // -----------------------------------------------------------------
+    mod chunked_body {
+        use super::super::{ControlFrameSource, receive_chunked_body};
+        use melin_transport_core::replication::protocol::{
+            encode_snapshot_chunk, encode_snapshot_end, encode_stream_start,
+        };
+        use std::collections::VecDeque;
+
+        /// Yields pre-built frame payloads in order, then errors
+        /// (modelling a disconnect) once drained.
+        struct Scripted {
+            frames: VecDeque<Vec<u8>>,
+        }
+
+        impl ControlFrameSource for Scripted {
+            fn next_frame(
+                &mut self,
+                _max_size: usize,
+            ) -> Result<Vec<u8>, Box<dyn std::error::Error + Send + Sync>> {
+                self.frames
+                    .pop_front()
+                    .ok_or_else(|| "disconnected during transfer".into())
+            }
+        }
+
+        /// `next_frame` yields payloads, not framed bytes — strip the
+        /// 4-byte length prefix an `encode_*` helper writes.
+        fn payload(mut encode: impl FnMut(&mut Vec<u8>)) -> Vec<u8> {
+            let mut buf = Vec::new();
+            encode(&mut buf);
+            buf[4..].to_vec()
+        }
+
+        fn chunk(data: &[u8]) -> Vec<u8> {
+            payload(|b| encode_snapshot_chunk(data, b))
+        }
+
+        fn end(crc: u32) -> Vec<u8> {
+            payload(|b| encode_snapshot_end(crc, b))
+        }
+
+        fn source(frames: Vec<Vec<u8>>) -> Scripted {
+            Scripted {
+                frames: frames.into(),
+            }
+        }
+
+        #[test]
+        fn happy_path_writes_body_and_verifies() {
+            let dir = tempfile::tempdir().unwrap();
+            let tmp = dir.path().join("body.tmp");
+            let body = b"hello, replica seed bytes";
+            let crc = crc32c::crc32c(body);
+            let mut src = source(vec![chunk(&body[..10]), chunk(&body[10..]), end(crc)]);
+
+            receive_chunked_body(&mut src, &tmp, body.len() as u64, "snapshot").unwrap();
+            assert_eq!(std::fs::read(&tmp).unwrap(), body);
+        }
+
+        #[test]
+        fn length_mismatch_errs_and_removes_tmp() {
+            let dir = tempfile::tempdir().unwrap();
+            let tmp = dir.path().join("body.tmp");
+            let body = b"twelve bytes";
+            let crc = crc32c::crc32c(body);
+            let mut src = source(vec![chunk(body), end(crc)]);
+
+            // Claim one more byte than we sent.
+            let err = receive_chunked_body(&mut src, &tmp, body.len() as u64 + 1, "snapshot")
+                .unwrap_err();
+            assert!(err.to_string().contains("length mismatch"), "{err}");
+            assert!(!tmp.exists(), "partial tmp must be removed");
+        }
+
+        #[test]
+        fn crc_mismatch_errs_and_removes_tmp() {
+            let dir = tempfile::tempdir().unwrap();
+            let tmp = dir.path().join("body.tmp");
+            let body = b"twelve bytes";
+            let mut src = source(vec![chunk(body), end(0xDEAD_BEEF)]);
+
+            let err =
+                receive_chunked_body(&mut src, &tmp, body.len() as u64, "snapshot").unwrap_err();
+            assert!(err.to_string().contains("CRC mismatch"), "{err}");
+            assert!(!tmp.exists());
+        }
+
+        #[test]
+        fn disconnect_before_end_errs_and_removes_tmp() {
+            let dir = tempfile::tempdir().unwrap();
+            let tmp = dir.path().join("body.tmp");
+            // A chunk arrives, then the source drains (disconnect) before
+            // SnapshotEnd.
+            let mut src = source(vec![chunk(b"partial")]);
+
+            let err = receive_chunked_body(&mut src, &tmp, 7, "segment seed").unwrap_err();
+            assert!(err.to_string().contains("disconnected"), "{err}");
+            assert!(!tmp.exists());
+        }
+
+        #[test]
+        fn unexpected_frame_errs_and_removes_tmp() {
+            let dir = tempfile::tempdir().unwrap();
+            let tmp = dir.path().join("body.tmp");
+            // A StreamStart where a chunk/end belongs.
+            let stray = payload(|b| encode_stream_start(0, 1, [0u8; 32], 0, b));
+            let mut src = source(vec![stray]);
+
+            let err = receive_chunked_body(&mut src, &tmp, 4, "snapshot").unwrap_err();
+            assert!(err.to_string().contains("SnapshotChunk/End"), "{err}");
+            assert!(!tmp.exists());
+        }
     }
 }
