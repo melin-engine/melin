@@ -674,6 +674,21 @@ where
                     let _ = teardown_replica_pipeline::<A, W>(p);
                 }
 
+                // Invalidate the in-memory App and writer before moving
+                // their backing files aside. On the in-process divergence
+                // repair path these still hold the recovered handles
+                // (`recover_replica_state` populated `exchange`/`journal_writer`
+                // before the reconnect that landed here, and the
+                // `pipeline.take()` above was a no-op). A snapshot-transfer
+                // failure below `continue`s; without this reset the stale
+                // writer — now pointing at an archived-away journal — would
+                // survive the fresh-replica create gate (`journal_writer.is_none()`
+                // false) and get rebuilt into the next pipeline, streaming
+                // onto a journal whose file no longer exists. Mirrors the
+                // DPDK receiver.
+                exchange = None;
+                journal_writer = None;
+
                 // Move the local lineage aside — never delete. Divergent
                 // journals are audit-trail material (under `local`
                 // durability they may hold acked orders that did not
@@ -1452,6 +1467,188 @@ mod tests {
                 "divergent lineage must be archived"
             );
             assert!(replica_journal.exists(), "re-seeded live journal");
+        }
+
+        /// A resync whose snapshot transfer drops mid-flight must retry
+        /// as a fresh replica with NO leftover in-memory state. On the
+        /// in-process divergence repair path `recover_replica_state`
+        /// leaves `exchange`/`journal_writer` populated; the resync arm
+        /// archives the live journal (renaming it aside) before the
+        /// transfer. If the transfer then fails and those handles are not
+        /// nulled, the stale writer — its backing file now under the
+        /// `.divergent.<n>` archive — survives the fresh-replica create
+        /// gate (`journal_writer.is_none()` false) and is rebuilt into the
+        /// next pipeline, so the live journal is never recreated and the
+        /// new session streams onto an archived-away inode. This pins the
+        /// fix (mirrors the DPDK receiver): after the failed transfer the
+        /// retry creates a fresh live journal from the StreamStart lineage.
+        #[test]
+        fn resync_transfer_failure_rebuilds_clean_not_over_stale_writer() {
+            let dir = tempfile::tempdir().expect("tempdir");
+
+            // Minimal scripted primary — only its lineage identity is used
+            // (session 3 streams from genesis; the dropped session 2 never
+            // reaches the snapshot body).
+            let primary_journal = dir.path().join("primary.journal");
+            let mut w = BufferedWriter::<EvtAdd>::create(&primary_journal).expect("create");
+            for v in 1..=2u64 {
+                w.append(&JournalEvent::App(EvtAdd(v))).expect("append");
+            }
+            drop(w);
+            let (lineage_start, lineage_anchor) =
+                lineage_origin(&primary_journal).expect("lineage");
+
+            let repl_key = ed25519_dalek::SigningKey::from_bytes(&[0xFC; 32]);
+            let pub_b64 = base64::Engine::encode(
+                &base64::engine::general_purpose::STANDARD,
+                repl_key.verifying_key().to_bytes(),
+            );
+            let authorized_keys = melin_app::auth::AuthorizedKeys::parse(&format!(
+                "replication {pub_b64} test-replica\n"
+            ))
+            .expect("parse keys");
+
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+            listener.set_nonblocking(true).expect("nonblocking");
+            let addr = listener.local_addr().expect("addr");
+
+            let replica_journal = dir.path().join("replica.journal");
+            let replica_snapshot = dir.path().join("replica.snapshot");
+            let shutdown = Arc::new(AtomicBool::new(false));
+            let promote = Arc::new(AtomicBool::new(false));
+            let cores = crate::server::PipelineCores {
+                journal: 0,
+                matching: 0,
+                response: 0,
+                reader: 0,
+                repl_sender: 0,
+                event_publisher: 0,
+                shadow: 0,
+                repl_handler_0: 0,
+                repl_handler_1: 0,
+            };
+            let replica = {
+                let journal = replica_journal.clone();
+                let shutdown = Arc::clone(&shutdown);
+                let promote = Arc::clone(&promote);
+                std::thread::spawn(move || -> Result<bool, String> {
+                    run_receiver::<App, BufferedWriter<EvtAdd>>(
+                        addr,
+                        &journal,
+                        &ed25519_dalek::SigningKey::from_bytes(&[0xFC; 32]),
+                        &shutdown,
+                        &promote,
+                        3_600_000,
+                        replica_snapshot,
+                        cores,
+                        Duration::ZERO,
+                        64,
+                        false,
+                        Arc::new(Factory),
+                        Arc::new(melin_transport_core::fence::FenceState::new(0)),
+                    )
+                    .map(|state| state.is_none())
+                    .map_err(|e| e.to_string())
+                })
+            };
+
+            // Helper: stream a single event (seq 1) over an established
+            // session and wait for its ack.
+            let stream_one = |s: &mut TcpStream, buf: &mut Vec<u8>| {
+                buf.clear();
+                encode_stream_start(0, lineage_start, lineage_anchor, 0, buf);
+                s.write_all(buf).expect("StreamStart");
+                buf.clear();
+                melin_transport_core::replication_wire::encode_input_batch(
+                    &[InputSlot::<EvtAdd> {
+                        connection_id: 0,
+                        key_hash: 0,
+                        request_seq: 0,
+                        sequence: 1,
+                        timestamp_ns: 1,
+                        event: JournalEvent::App(EvtAdd(1)),
+                        publish_ts: Default::default(),
+                        recv_ts: Default::default(),
+                    }],
+                    buf,
+                );
+                s.write_all(buf).expect("InputBatch");
+            };
+
+            // --- Session 1: fresh sync, event 1, poisoned rotation —
+            // the journal stage detects divergence and the receiver
+            // repairs in-process (`recover_replica_state` repopulates
+            // `exchange`/`journal_writer`).
+            let mut buf = Vec::new();
+            let mut s1 = accept_within(&listener, 30);
+            let mut s1r = s1.try_clone().expect("clone");
+            authenticate_replica(&mut s1r, &mut s1, &authorized_keys).expect("auth 1");
+            match read_replica_msg(&mut s1) {
+                ReplicaMessage::Handshake(h) => assert_eq!(h.last_sequence, 0, "fresh"),
+                other => panic!("expected Handshake, got {other:?}"),
+            }
+            stream_one(&mut s1, &mut buf);
+            wait_for_ack(&mut s1, 1);
+            buf.clear();
+            encode_rotate(1, &[0xEE; 32], &mut buf);
+            s1.write_all(&buf).expect("Rotate");
+
+            // --- Session 2: reconnect at the recovered position (seq 1),
+            // verdict HashMismatch (archives the live journal aside), then
+            // DROP the connection before SnapshotBegin — the transfer
+            // fails and the receiver must retry as a fresh replica.
+            let mut s2 = accept_within(&listener, 30);
+            let mut s2r = s2.try_clone().expect("clone");
+            authenticate_replica(&mut s2r, &mut s2, &authorized_keys).expect("auth 2");
+            match read_replica_msg(&mut s2) {
+                ReplicaMessage::Handshake(h) => assert_eq!(
+                    h.last_sequence, 1,
+                    "reconnect carries the recovered forked position"
+                ),
+                other => panic!("expected Handshake, got {other:?}"),
+            }
+            buf.clear();
+            encode_hash_mismatch(&mut buf);
+            s2.write_all(&buf).expect("HashMismatch");
+            s2.flush().expect("flush");
+            // Both fds reference the same socket (try_clone dups) — drop
+            // both to send FIN so the replica's SnapshotBegin read hits EOF.
+            drop(s2);
+            drop(s2r);
+
+            // --- Session 3: the receiver reconnects as a FRESH replica
+            // (the archived lineage's position is meaningless, so
+            // `last_sequence` is 0). It must recreate a live journal from
+            // the StreamStart lineage, NOT rebuild over the stale writer.
+            let mut s3 = accept_within(&listener, 30);
+            let mut s3r = s3.try_clone().expect("clone");
+            authenticate_replica(&mut s3r, &mut s3, &authorized_keys).expect("auth 3");
+            match read_replica_msg(&mut s3) {
+                ReplicaMessage::Handshake(h) => assert_eq!(
+                    h.last_sequence, 0,
+                    "after a failed transfer the retry handshakes as fresh"
+                ),
+                other => panic!("expected Handshake, got {other:?}"),
+            }
+            stream_one(&mut s3, &mut buf);
+            wait_for_ack(&mut s3, 1);
+
+            shutdown.store(true, Ordering::Relaxed);
+            let result = replica.join().expect("replica thread panicked");
+            assert_eq!(result, Ok(true), "receiver exits cleanly via shutdown");
+
+            // The forked lineage stays archived, and a fresh live journal
+            // was recreated from the lineage. With the bug, the stale
+            // writer would be reused and this path would not exist (its
+            // inode stranded under `.divergent.0`).
+            assert!(
+                dir.path().join("replica.journal.divergent.0").exists(),
+                "forked lineage archived, never deleted"
+            );
+            assert!(
+                replica_journal.exists(),
+                "fresh live journal recreated after the failed transfer"
+            );
         }
 
         /// The in-process repair budget is one per process lifetime: a
