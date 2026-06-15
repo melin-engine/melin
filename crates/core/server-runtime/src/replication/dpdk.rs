@@ -19,16 +19,15 @@ use melin_journal::replication::ReplicationConsumer;
 use melin_transport_core::pipeline::{JournalStage, JournalStageRun};
 
 use super::receiver_transport::{
-    ControlFrameSource, FrameResult, ReceiverTransport, compact_recv_buf, receive_chunked_body,
-    streaming_loop, try_extract_frame,
+    ControlFrameSource, FrameResult, ReceiverTransport, compact_recv_buf, streaming_loop,
+    try_extract_frame,
 };
 use super::{
     AfterSession, MAX_BACKOFF, ReceiverResult, ReplicaCursors, ReplicaPipelineHandles,
-    ReplicationMetrics, SentHighWater, build_replica_pipeline_with_threads, handle_session_exit,
-    recover_replica_state, sleep_checking_flags, take_pipeline_for_promotion,
-    teardown_replica_pipeline,
+    ReplicationMetrics, ResyncDecision, SentHighWater, build_replica_pipeline_with_threads,
+    handle_resync_verdict, handle_session_exit, recover_replica_state, sleep_checking_flags,
+    take_pipeline_for_promotion, teardown_replica_pipeline,
 };
-use melin_transport_core::replication::archive::{ArchiveReason, archive_local_lineage};
 use melin_transport_core::replication::catchup::{
     CatchUpResult, bridge_catchup_to_live, can_catch_up_from_journal, catch_up_from_journal_with,
     preflight_snapshot_transfer, snapshot_transfer_with,
@@ -1117,11 +1116,9 @@ where
         }
         recv_buf.clear();
         // `None` from the loop = failure path (disconnect or snapshot
-        // error) → reconnect. `Some(lineage)` = StreamStart received.
-        // After a snapshot transfer, the next StreamStart's lineage must
-        // agree with the snapshot the primary just sent (see the
-        // kernel-TCP receiver for the rationale).
-        let mut expected_post_snapshot: Option<(u64, [u8; 32])> = None;
+        // error) → reconnect. `Some(lineage)` = StreamStart received (or a
+        // resync that re-seeded and validated its own post-snapshot
+        // StreamStart inline, via `handle_resync_verdict`).
         let stream_lineage: Option<(u64, [u8; 32])> = 'handshake: loop {
             if shutdown.load(Ordering::Relaxed) {
                 if let Some(p) = pipeline.take() {
@@ -1144,28 +1141,13 @@ where
                             anchor_hash,
                             epoch,
                         } => {
-                            if let Some((expected_start, expected_anchor)) = expected_post_snapshot
-                                && (segment_start_sequence != expected_start
-                                    || anchor_hash != expected_anchor)
-                            {
-                                fatal_err_dpdk!(
-                                    format!(
-                                        "post-snapshot StreamStart lineage (start \
-                                     {segment_start_sequence}) disagrees with the \
-                                     transferred snapshot (expected start \
-                                     {expected_start}) — inconsistent primary"
-                                    )
-                                    .into()
-                                );
-                            }
-                            // Fence: on a normal resume (not a fresh snapshot
-                            // rebase), refuse a primary behind our epoch — its
+                            // Fence: refuse a primary behind our epoch — its
                             // divergent lineage must not overwrite our more
                             // current state. Mirrors the kernel-TCP receiver.
+                            // (A resync rebase adopts the primary's epoch
+                            // inside `handle_resync_verdict` instead.)
                             let our_epoch = fence_state.epoch();
-                            if expected_post_snapshot.is_none()
-                                && fence_state.refuses_primary(epoch)
-                            {
+                            if fence_state.refuses_primary(epoch) {
                                 warn!(
                                     primary_epoch = epoch,
                                     our_epoch,
@@ -1182,127 +1164,42 @@ where
                         }
                         ref resync @ (PrimaryMessage::NeedSnapshot
                         | PrimaryMessage::HashMismatch) => {
-                            // HashMismatch is NeedSnapshot plus the verdict
-                            // that the local journal is divergent — see the
-                            // kernel-TCP receiver.
                             let divergent = matches!(resync, PrimaryMessage::HashMismatch);
-                            if divergent {
-                                warn!(
-                                    last_sequence,
-                                    "primary reports chain divergence — archiving local \
-                                     journal, resyncing from snapshot (DPDK)"
-                                );
-                            } else {
-                                info!(
-                                    "primary requires snapshot transfer — receiving \
-                                     snapshot (DPDK)"
-                                );
-                            }
-
-                            // Tear down the live pipeline before moving its
-                            // backing journal — the journal stage holds the
-                            // file open and the App lives on the matching
-                            // thread; both must exit cleanly first.
-                            if let Some(p) = pipeline.take() {
-                                let _ = teardown_replica_pipeline::<A, W>(p);
-                            }
-
-                            // Invalidate the in-memory App and writer — their
-                            // underlying files are about to be moved aside.
-                            // The lineage is archived, never deleted: a
-                            // divergent journal is audit-trail material, a
-                            // stale one may be the last copy of pruned
-                            // history.
-                            exchange = None;
-                            journal_writer = None;
-                            let reason = if divergent {
-                                ArchiveReason::Divergent
-                            } else {
-                                ArchiveReason::Resync
-                            };
-                            archive_local_lineage(journal_path, &snapshot_path, reason)?;
-                            // The local lineage is gone — if the transfer
-                            // below fails, the in-process retry must
-                            // handshake as a fresh replica, not with the
-                            // archived lineage's (now meaningless)
-                            // position and hash.
-                            last_sequence = 0;
-                            chain_hash = [0u8; 32];
-
-                            // Receive snapshot + segment seed via DPDK
-                            // transport. The seed makes this replica's live
-                            // segment a byte-copy of the primary's containing
-                            // segment; opening it for append at the snapshot
-                            // position is recovery's resume path, and its
-                            // rebuilt chain must equal the snapshot's hash.
-                            let seeded = receive_snapshot_dpdk::<A>(
-                                handle,
-                                &mut transport,
-                                &mut recv_buf,
-                                &snapshot_path,
-                                shutdown,
-                            )
-                            .and_then(
-                                |(snap_exchange, snap_seq, snap_hash)| {
-                                    let seed_len = receive_segment_seed_dpdk(
-                                        handle,
-                                        &mut transport,
-                                        &mut recv_buf,
-                                        journal_path,
-                                        snap_seq,
-                                        shutdown,
-                                    )?;
-                                    Ok((snap_exchange, snap_seq, snap_hash, seed_len))
+                            let decision = handle_resync_verdict(
+                                divergent,
+                                &mut DpdkFrameSource {
+                                    transport: &mut transport,
+                                    handle,
+                                    recv_buf: &mut recv_buf,
+                                    shutdown,
                                 },
+                                &mut pipeline,
+                                &mut exchange,
+                                &mut journal_writer,
+                                journal_path,
+                                &snapshot_path,
+                                &fence_state,
+                                &mut last_sequence,
+                                &mut chain_hash,
                             );
-                            match seeded {
-                                Ok((snap_exchange, snap_seq, snap_hash, seed_len)) => {
-                                    exchange = Some(snap_exchange);
-                                    let writer = W::open_append(journal_path, snap_seq, seed_len)?;
-                                    // `chain_hash()` is `None` only with
-                                    // `hash-chain` disabled — nothing to tie
-                                    // then, the check passes by construction.
-                                    // All-zeros snapshot hash: the *primary*
-                                    // runs without `hash-chain` (a real chain
-                                    // value is never zeros) — also nothing
-                                    // to tie.
-                                    let seeded_chain = writer.chain_hash().unwrap_or(snap_hash);
-                                    if snap_hash != [0u8; 32] && seeded_chain != snap_hash {
-                                        fatal_err_dpdk!(
-                                            "segment seed chain disagrees with the \
-                                             transferred snapshot's hash — inconsistent \
-                                             primary"
-                                                .into()
-                                        );
-                                    }
-                                    let seeded_info =
-                                        melin_journal::segment::read_header_info(journal_path)?;
-                                    journal_writer = Some(writer);
-                                    last_sequence = snap_seq;
-                                    chain_hash = snap_hash;
-
-                                    // After snapshot + seed, expect a
-                                    // StreamStart whose lineage matches the
-                                    // seeded segment's header.
-                                    expected_post_snapshot = Some((
-                                        seeded_info.starting_sequence,
-                                        seeded_info.anchor_hash,
-                                    ));
-                                    continue;
+                            match decision {
+                                Ok(ResyncDecision::Ready {
+                                    segment_start_sequence,
+                                    anchor_hash,
+                                    resume_sequence,
+                                }) => {
+                                    // DPDK resumes streaming from `last_sequence`
+                                    // (the TCP path uses a separate `session_start`).
+                                    last_sequence = resume_sequence;
+                                    break 'handshake Some((segment_start_sequence, anchor_hash));
                                 }
-                                Err(e) => {
-                                    warn!(error = %e, "snapshot transfer failed (DPDK) — retrying");
-                                    // Half-applied resync state, not audit
-                                    // material — drop it so the retry loop
-                                    // doesn't archive a stray snapshot
-                                    // every round. Best-effort: a leftover
-                                    // is swept into the next archival.
-                                    let _ = std::fs::remove_file(&snapshot_path);
+                                Ok(ResyncDecision::Retry) => {
                                     transport.close(handle);
                                     sleep_checking_flags(backoff, shutdown, promote);
                                     backoff = (backoff * 2).min(MAX_BACKOFF);
                                     break 'handshake None; // caught by the None check below
                                 }
+                                Err(e) => fatal_err_dpdk!(e),
                             }
                         }
                         other => {
@@ -1518,102 +1415,4 @@ impl ControlFrameSource for DpdkFrameSource<'_> {
             std::thread::yield_now();
         }
     }
-}
-
-/// Receive a snapshot from the primary via DPDK transport.
-/// Expects: SnapshotBegin → SnapshotChunk* → SnapshotEnd.
-/// Returns the loaded App, snapshot sequence, and chain hash.
-fn receive_snapshot_dpdk<A: Application>(
-    handle: melin_dpdk::SocketHandle,
-    transport: &mut melin_dpdk::DpdkTransport,
-    recv_buf: &mut Vec<u8>,
-    snapshot_path: &std::path::Path,
-    shutdown: &AtomicBool,
-) -> Result<(A, u64, [u8; 32]), Box<dyn std::error::Error + Send + Sync>> {
-    let mut source = DpdkFrameSource {
-        transport,
-        handle,
-        recv_buf,
-        shutdown,
-    };
-
-    // Read SnapshotBegin.
-    let (snap_len, snap_sequence, snap_chain_hash) =
-        match decode_primary_message(&source.next_frame(MAX_CONTROL_FRAME)?)? {
-            PrimaryMessage::SnapshotBegin {
-                snapshot_len,
-                snap_sequence,
-                snap_chain_hash,
-            } => (snapshot_len, snap_sequence, snap_chain_hash),
-            other => return Err(format!("expected SnapshotBegin, got {other:?}").into()),
-        };
-
-    info!(snap_sequence, snap_len, "receiving snapshot (DPDK)");
-
-    // Receive snapshot chunks into a temp file, then install it.
-    let tmp_path = snapshot_path.with_extension("snapshot.tmp");
-    receive_chunked_body(&mut source, &tmp_path, snap_len, "snapshot")?;
-    std::fs::rename(&tmp_path, snapshot_path)?;
-    info!(
-        snap_sequence,
-        snap_len, "snapshot received and verified (DPDK)"
-    );
-
-    // Load and verify the snapshot. The snapshot's epoch is adopted via the
-    // post-snapshot `StreamStart` the caller processes next (which carries
-    // the primary's current epoch), so it is not consumed here.
-    let (snap_exchange, _snap_seq, snap_hash, _snap_epoch) =
-        melin_transport_core::snapshot::load::<A>(snapshot_path)?;
-    if snap_hash != snap_chain_hash {
-        return Err(format!(
-            "snapshot chain hash mismatch: primary sent {snap_chain_hash:02x?}, \
-             loaded snapshot has {snap_hash:02x?}"
-        )
-        .into());
-    }
-
-    Ok((snap_exchange, snap_sequence, snap_chain_hash))
-}
-
-/// Receive the post-snapshot segment seed via DPDK transport and write
-/// it verbatim to `journal_path` (tmp + structural verification against
-/// `snap_sequence` + rename + dir fsync). Expects: SegmentSeedBegin →
-/// SnapshotChunk* → SnapshotEnd. Returns the seed length — the
-/// journal's `valid_end` for `open_append`. See the kernel-TCP receiver
-/// for the seeding rationale.
-fn receive_segment_seed_dpdk(
-    handle: melin_dpdk::SocketHandle,
-    transport: &mut melin_dpdk::DpdkTransport,
-    recv_buf: &mut Vec<u8>,
-    journal_path: &std::path::Path,
-    snap_sequence: u64,
-    shutdown: &AtomicBool,
-) -> Result<u64, Box<dyn std::error::Error + Send + Sync>> {
-    let mut source = DpdkFrameSource {
-        transport,
-        handle,
-        recv_buf,
-        shutdown,
-    };
-
-    // Read SegmentSeedBegin.
-    let seed_len = match decode_primary_message(&source.next_frame(MAX_CONTROL_FRAME)?)? {
-        PrimaryMessage::SegmentSeedBegin { seed_len } => seed_len,
-        other => return Err(format!("expected SegmentSeedBegin, got {other:?}").into()),
-    };
-
-    let tmp_path = journal_path.with_extension("seed.tmp");
-    receive_chunked_body(&mut source, &tmp_path, seed_len, "segment seed")?;
-    // Structural check before installing - see the kernel-TCP receiver.
-    if let Err(e) =
-        melin_journal::segment::verify_segment_prefix(&tmp_path, snap_sequence, seed_len)
-    {
-        let _ = std::fs::remove_file(&tmp_path);
-        return Err(format!("segment seed failed structural verification: {e}").into());
-    }
-    std::fs::rename(&tmp_path, journal_path)?;
-    melin_journal::segment::fsync_parent_dir(journal_path)?;
-    info!(seed_len, "segment seed received and verified (DPDK)");
-
-    Ok(seed_len)
 }
