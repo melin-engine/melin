@@ -529,7 +529,9 @@ where
         let mut reader = stream.try_clone()?;
         let mut tcp_writer = stream;
 
-        if let Err(e) = authenticate_with_primary(&mut reader, &mut tcp_writer, signing_key) {
+        // `reader`/`tcp_writer` are clones of one socket; auth is sequential so
+        // a single handle works. Use `reader` (carries the read timeout above).
+        if let Err(e) = authenticate_with_primary(&mut reader, signing_key) {
             warn!(error = %e, "authentication failed — retrying");
             backoff = (backoff * 2).min(MAX_BACKOFF);
             continue;
@@ -1067,7 +1069,7 @@ mod tests {
             // rotation announce.
             let mut s1 = accept_within(&listener, 30);
             let mut s1r = s1.try_clone().expect("clone");
-            authenticate_replica(&mut s1r, &mut s1, &authorized_keys).expect("auth 1");
+            authenticate_replica(&mut s1r, &authorized_keys).expect("auth 1");
             match read_replica_msg(&mut s1) {
                 ReplicaMessage::Handshake(h) => {
                     assert_eq!(h.last_sequence, 0, "fresh replica handshake")
@@ -1105,7 +1107,7 @@ mod tests {
             // position re-derived from the forked on-disk journal.
             let mut s2 = accept_within(&listener, 30);
             let mut s2r = s2.try_clone().expect("clone");
-            authenticate_replica(&mut s2r, &mut s2, &authorized_keys).expect("auth 2");
+            authenticate_replica(&mut s2r, &authorized_keys).expect("auth 2");
             match read_replica_msg(&mut s2) {
                 ReplicaMessage::Handshake(h) => assert_eq!(
                     h.last_sequence, 1,
@@ -1264,7 +1266,7 @@ mod tests {
             let mut buf = Vec::new();
             let mut s1 = accept_within(&listener, 30);
             let mut s1r = s1.try_clone().expect("clone");
-            authenticate_replica(&mut s1r, &mut s1, &authorized_keys).expect("auth 1");
+            authenticate_replica(&mut s1r, &authorized_keys).expect("auth 1");
             match read_replica_msg(&mut s1) {
                 ReplicaMessage::Handshake(h) => assert_eq!(h.last_sequence, 0, "fresh"),
                 other => panic!("expected Handshake, got {other:?}"),
@@ -1281,7 +1283,7 @@ mod tests {
             // fails and the receiver must retry as a fresh replica.
             let mut s2 = accept_within(&listener, 30);
             let mut s2r = s2.try_clone().expect("clone");
-            authenticate_replica(&mut s2r, &mut s2, &authorized_keys).expect("auth 2");
+            authenticate_replica(&mut s2r, &authorized_keys).expect("auth 2");
             match read_replica_msg(&mut s2) {
                 ReplicaMessage::Handshake(h) => assert_eq!(
                     h.last_sequence, 1,
@@ -1304,7 +1306,7 @@ mod tests {
             // the StreamStart lineage, NOT rebuild over the stale writer.
             let mut s3 = accept_within(&listener, 30);
             let mut s3r = s3.try_clone().expect("clone");
-            authenticate_replica(&mut s3r, &mut s3, &authorized_keys).expect("auth 3");
+            authenticate_replica(&mut s3r, &authorized_keys).expect("auth 3");
             match read_replica_msg(&mut s3) {
                 ReplicaMessage::Handshake(h) => assert_eq!(
                     h.last_sequence, 0,
@@ -1424,7 +1426,7 @@ mod tests {
             // Session 1: fresh sync, one event, poisoned rotation.
             let mut s1 = accept_within(&listener, 30);
             let mut s1r = s1.try_clone().expect("clone");
-            authenticate_replica(&mut s1r, &mut s1, &authorized_keys).expect("auth 1");
+            authenticate_replica(&mut s1r, &authorized_keys).expect("auth 1");
             match read_replica_msg(&mut s1) {
                 ReplicaMessage::Handshake(h) => assert_eq!(h.last_sequence, 0),
                 other => panic!("expected Handshake, got {other:?}"),
@@ -1456,7 +1458,7 @@ mod tests {
             // SECOND poisoned rotation after streaming resumes.
             let mut s2 = accept_within(&listener, 30);
             let mut s2r = s2.try_clone().expect("clone");
-            authenticate_replica(&mut s2r, &mut s2, &authorized_keys).expect("auth 2");
+            authenticate_replica(&mut s2r, &authorized_keys).expect("auth 2");
             match read_replica_msg(&mut s2) {
                 ReplicaMessage::Handshake(h) => assert_eq!(h.last_sequence, 1),
                 other => panic!("expected Handshake, got {other:?}"),

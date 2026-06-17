@@ -385,8 +385,11 @@ fn handle_replica_connection<A: Application>(
     // Set a read timeout for the handshake and auth.
     reader.set_read_timeout(Some(std::time::Duration::from_secs(10)))?;
 
-    // Authenticate before any data exchange.
-    authenticate_replica(&mut reader, &mut writer, authorized_keys)?;
+    // Authenticate before any data exchange. `reader` and `writer` are clones
+    // of the same socket; auth is sequential (write challenge, read response,
+    // write result) so a single handle suffices. Use `reader` — it carries the
+    // read timeout set above.
+    authenticate_replica(&mut reader, authorized_keys)?;
     info!("replica authenticated");
 
     // Read handshake.

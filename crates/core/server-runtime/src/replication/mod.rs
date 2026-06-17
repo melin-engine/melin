@@ -1321,14 +1321,12 @@ mod tests {
 
         let repl_key_clone = SigningKey::from_bytes(&[0xFC; 32]);
         let replica_handle = std::thread::spawn(move || {
-            let mut reader = replica_stream.try_clone().unwrap();
-            let mut writer = replica_stream;
-            authenticate_with_primary(&mut reader, &mut writer, &repl_key_clone)
+            let mut conn = replica_stream;
+            authenticate_with_primary(&mut conn, &repl_key_clone)
         });
 
-        let mut reader = primary_stream.try_clone().unwrap();
-        let mut writer = primary_stream;
-        authenticate_replica(&mut reader, &mut writer, &authorized_keys).unwrap();
+        let mut conn = primary_stream;
+        authenticate_replica(&mut conn, &authorized_keys).unwrap();
 
         replica_handle.join().unwrap().unwrap();
     }
@@ -1357,14 +1355,12 @@ mod tests {
             .unwrap();
 
         let replica_handle = std::thread::spawn(move || {
-            let mut reader = replica_stream.try_clone().unwrap();
-            let mut writer = replica_stream;
-            authenticate_with_primary(&mut reader, &mut writer, &rogue_key)
+            let mut conn = replica_stream;
+            authenticate_with_primary(&mut conn, &rogue_key)
         });
 
-        let mut reader = primary_stream.try_clone().unwrap();
-        let mut writer = primary_stream;
-        let result = authenticate_replica(&mut reader, &mut writer, &authorized_keys);
+        let mut conn = primary_stream;
+        let result = authenticate_replica(&mut conn, &authorized_keys);
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("unknown"));
 
@@ -1396,14 +1392,12 @@ mod tests {
             .unwrap();
 
         let replica_handle = std::thread::spawn(move || {
-            let mut reader = replica_stream.try_clone().unwrap();
-            let mut writer = replica_stream;
-            authenticate_with_primary(&mut reader, &mut writer, &key)
+            let mut conn = replica_stream;
+            authenticate_with_primary(&mut conn, &key)
         });
 
-        let mut reader = primary_stream.try_clone().unwrap();
-        let mut writer = primary_stream;
-        let result = authenticate_replica(&mut reader, &mut writer, &authorized_keys);
+        let mut conn = primary_stream;
+        let result = authenticate_replica(&mut conn, &authorized_keys);
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("Replication"));
 
@@ -1467,9 +1461,8 @@ mod tests {
             assert!(!ok, "should receive auth failure");
         });
 
-        let mut reader = primary_stream.try_clone().unwrap();
-        let mut writer = primary_stream;
-        let result = authenticate_replica(&mut reader, &mut writer, &authorized_keys);
+        let mut conn = primary_stream;
+        let result = authenticate_replica(&mut conn, &authorized_keys);
         assert!(result.is_err());
         assert!(
             result

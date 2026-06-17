@@ -21,9 +21,8 @@ use melin_transport_core::replication::protocol::{
 /// Sends a 32-byte nonce challenge, verifies the replica's Ed25519
 /// signature, and checks that the key has `Replication` permission.
 /// Must complete within the stream's existing read timeout.
-pub(super) fn authenticate_replica(
-    reader: &mut impl Read,
-    writer: &mut impl Write,
+pub(super) fn authenticate_replica<S: Read + Write>(
+    stream: &mut S,
     authorized_keys: &melin_app::auth::AuthorizedKeys,
 ) -> io::Result<()> {
     use ed25519_dalek::{Verifier, VerifyingKey};
@@ -35,17 +34,19 @@ pub(super) fn authenticate_replica(
     // Send Challenge.
     let mut buf = Vec::with_capacity(64);
     encode_challenge(&nonce, &mut buf);
-    writer.write_all(&buf)?;
-    writer.flush()?;
+    stream.write_all(&buf)?;
+    stream.flush()?;
 
     // Read ChallengeResponse.
-    let frame = read_frame(reader, MAX_CONTROL_FRAME)?;
+    let frame = read_frame(stream, MAX_CONTROL_FRAME)?;
     let (signature_bytes, pubkey_bytes) = match decode_challenge_response(&frame) {
         Ok(pair) => pair,
         Err(e) => {
             buf.clear();
             encode_auth_failed(&mut buf);
-            let _ = writer.write_all(&buf);
+            // Best-effort AuthFailed notice before we bail — the connection
+            // is about to drop, so a failed write here is not actionable.
+            let _ = stream.write_all(&buf);
             return Err(io::Error::other(format!("bad challenge response: {e}")));
         }
     };
@@ -56,14 +57,14 @@ pub(super) fn authenticate_replica(
         None => {
             buf.clear();
             encode_auth_failed(&mut buf);
-            let _ = writer.write_all(&buf);
+            let _ = stream.write_all(&buf);
             return Err(io::Error::other("unknown replication key"));
         }
     };
     if !permission.is_replication() {
         buf.clear();
         encode_auth_failed(&mut buf);
-        let _ = writer.write_all(&buf);
+        let _ = stream.write_all(&buf);
         return Err(io::Error::other(format!(
             "key has {permission:?} permission, expected Replication"
         )));
@@ -73,22 +74,22 @@ pub(super) fn authenticate_replica(
     let verifying_key = VerifyingKey::from_bytes(&pubkey_bytes).map_err(|e| {
         buf.clear();
         encode_auth_failed(&mut buf);
-        let _ = writer.write_all(&buf);
+        let _ = stream.write_all(&buf);
         io::Error::other(format!("invalid public key: {e}"))
     })?;
     let signature = ed25519_dalek::Signature::from_bytes(&signature_bytes);
     verifying_key.verify(&nonce, &signature).map_err(|e| {
         buf.clear();
         encode_auth_failed(&mut buf);
-        let _ = writer.write_all(&buf);
+        let _ = stream.write_all(&buf);
         io::Error::other(format!("signature verification failed: {e}"))
     })?;
 
     // Auth succeeded.
     buf.clear();
     encode_auth_ok(&mut buf);
-    writer.write_all(&buf)?;
-    writer.flush()?;
+    stream.write_all(&buf)?;
+    stream.flush()?;
 
     Ok(())
 }
@@ -97,15 +98,14 @@ pub(super) fn authenticate_replica(
 ///
 /// Reads the nonce challenge, signs it with the replica's private key,
 /// sends the response, and waits for AuthOk/AuthFailed.
-pub(super) fn authenticate_with_primary(
-    reader: &mut impl Read,
-    writer: &mut impl Write,
+pub(super) fn authenticate_with_primary<S: Read + Write>(
+    stream: &mut S,
     signing_key: &ed25519_dalek::SigningKey,
 ) -> io::Result<()> {
     use ed25519_dalek::Signer;
 
     // Read Challenge.
-    let frame = read_frame(reader, MAX_CONTROL_FRAME)?;
+    let frame = read_frame(stream, MAX_CONTROL_FRAME)?;
     let nonce = decode_challenge(&frame)?;
 
     // Sign the nonce.
@@ -115,11 +115,11 @@ pub(super) fn authenticate_with_primary(
     // Send ChallengeResponse.
     let mut buf = Vec::with_capacity(128);
     encode_challenge_response(&signature.to_bytes(), pubkey.as_bytes(), &mut buf);
-    writer.write_all(&buf)?;
-    writer.flush()?;
+    stream.write_all(&buf)?;
+    stream.flush()?;
 
     // Read auth result.
-    let result_frame = read_frame(reader, MAX_CONTROL_FRAME)?;
+    let result_frame = read_frame(stream, MAX_CONTROL_FRAME)?;
     match decode_auth_result(&result_frame)? {
         true => Ok(()),
         false => Err(io::Error::other("primary rejected replication key")),
