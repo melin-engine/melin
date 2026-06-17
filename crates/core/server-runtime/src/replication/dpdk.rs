@@ -1266,11 +1266,11 @@ where
             let cur_writer = journal_writer.take().expect("journal_writer initialized");
 
             // Unpin before spawning the pipeline. Same rationale as the
-            // kernel-TCP receiver: `pin_to_core` sets `SCHED_FIFO` and on
-            // post-snapshot rebuilds this thread is already pinned —
-            // children would inherit `cores.reader` + FIFO and never
-            // preempt the busy-spinning receiver to reach their own
-            // self-pin.
+            // kernel-TCP receiver: on post-snapshot rebuilds this thread is
+            // already pinned to `cores.reader`, so children would inherit that
+            // affinity mask (and, on an isolated core, the SCHED_FIFO priority
+            // `pin_to_core` granted there) and never preempt the busy-spinning
+            // receiver to reach their own self-pin.
             if let Err(e) = melin_app::affinity::clear_affinity() {
                 tracing::warn!(error = e, "failed to clear receiver affinity before spawn");
             }
