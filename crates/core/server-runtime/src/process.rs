@@ -38,10 +38,24 @@ pub fn install_shutdown_handler(shutdown: &Arc<AtomicBool>) {
     }
 }
 
-/// Pin the entire process address space into RAM with `mlockall`.
+/// Pin engine pages into RAM with `mlockall`, lock-on-fault.
 ///
-/// Prevents the kernel from faulting out engine pages under memory
+/// Goal: prevent the kernel from faulting *out* engine pages under memory
 /// pressure, which otherwise surfaces as 100µs–10ms tail spikes.
+///
+/// We pass `MCL_ONFAULT` alongside `MCL_CURRENT | MCL_FUTURE` deliberately.
+/// This runs early — before the order book and the rest of the engine are
+/// built — so `MCL_FUTURE` is required to cover those later allocations.
+/// But plain `MCL_FUTURE` marks every future mapping `VM_LOCKED` and makes
+/// the kernel *eagerly populate* the whole mapping at `mmap` time, inside an
+/// uninterruptible `__mm_populate` walk. Any sizeable post-init allocation
+/// (a large malloc glibc serves via `mmap`, a snapshot/clone) then stalls
+/// the allocating thread until every page is faulted in — long enough to
+/// even outlast SIGKILL. `MCL_ONFAULT` switches future mappings to
+/// lock-on-fault: pages are locked as they are touched, not populated up
+/// front. The fault-out protection we actually want is preserved (a page,
+/// once touched on the hot path, stays resident), without the populate stall.
+///
 /// Best-effort: requires `CAP_IPC_LOCK` (or root) and a sufficient
 /// `RLIMIT_MEMLOCK`. Logs a warning and continues on failure.
 pub fn try_lock_memory() {
@@ -58,9 +72,10 @@ pub fn try_lock_memory() {
         );
     }
 
-    let rc = unsafe { libc::mlockall(libc::MCL_CURRENT | libc::MCL_FUTURE) };
+    let flags = libc::MCL_CURRENT | libc::MCL_FUTURE | libc::MCL_ONFAULT;
+    let rc = unsafe { libc::mlockall(flags) };
     if rc == 0 {
-        tracing::info!("mlockall(MCL_CURRENT | MCL_FUTURE) succeeded");
+        tracing::info!("mlockall(MCL_CURRENT | MCL_FUTURE | MCL_ONFAULT) succeeded");
     } else {
         let err = std::io::Error::last_os_error();
         tracing::warn!(
