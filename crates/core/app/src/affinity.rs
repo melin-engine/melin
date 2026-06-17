@@ -68,14 +68,60 @@ pub fn pin_to_core(core_id: usize) -> Result<usize, String> {
         }
     }
 
-    // Set SCHED_FIFO with minimum real-time priority (1) on isolated
-    // cores only. Core 0 is the housekeeping core — RT priority there
-    // would starve the kernel, IRQ handlers, and other processes.
-    if core_id > 0 {
+    // Real-time priority (SCHED_FIFO) is safe ONLY on isolated cores. On a
+    // shared core a busy-spinning RT thread starves every SCHED_OTHER thread
+    // pinned there. Under DPDK this is a concrete deadlock: EAL reserves cores
+    // and runs its control threads (mp-msg/intr/telemetry/workers) on them, so
+    // on a non-`isolcpus` host those threads share cores with the pinned
+    // pipeline threads — and one of them holding the glibc malloc arena lock
+    // while starved wedges graceful shutdown forever. (Kernel-TCP reserves no
+    // cores, so it never collides.) So: pin affinity always, but grant
+    // SCHED_FIFO only when the kernel actually reports this core isolated
+    // (`isolcpus=`). Core 0 is the housekeeping core and is excluded
+    // regardless — RT there would starve the kernel, IRQ handlers, and others.
+    if core_id > 0 && core_is_isolated(core_id) {
         set_realtime_fifo(1);
+    } else if core_id > 0 {
+        tracing::debug!(
+            core = core_id,
+            "core not isolated (no isolcpus); pinned affinity only, no SCHED_FIFO \
+             (real-time busy-spin on a shared core would starve co-located threads)"
+        );
     }
 
     Ok(core_id)
+}
+
+/// Whether `core_id` is in the kernel's isolated-CPU set, i.e. listed in
+/// `/sys/devices/system/cpu/isolated` (populated from the `isolcpus=` boot
+/// parameter). [`pin_to_core`] grants `SCHED_FIFO` only to isolated cores.
+///
+/// Best-effort: a missing or unreadable sysfs file is treated as "not
+/// isolated" (the safe default — affinity without real-time priority), which
+/// is the reality on any host booted without `isolcpus`.
+fn core_is_isolated(core_id: usize) -> bool {
+    match std::fs::read_to_string("/sys/devices/system/cpu/isolated") {
+        Ok(list) => cpu_list_contains(list.trim(), core_id),
+        // No isolcpus configured (or sysfs unavailable) → not isolated.
+        Err(_) => false,
+    }
+}
+
+/// Test membership in a Linux CPU-list string: comma-separated singletons and
+/// inclusive ranges, e.g. `"2-7"`, `"1,3,5"`, `"2-4,6-8"`, or empty (no
+/// isolated cores). Pure + total so it is unit-tested without touching sysfs.
+fn cpu_list_contains(list: &str, core_id: usize) -> bool {
+    list.split(',').filter(|p| !p.is_empty()).any(|part| {
+        match part.split_once('-') {
+            // Inclusive range "lo-hi".
+            Some((lo, hi)) => matches!(
+                (lo.parse::<usize>(), hi.parse::<usize>()),
+                (Ok(lo), Ok(hi)) if lo <= core_id && core_id <= hi
+            ),
+            // Single CPU "n"; a malformed (non-numeric) token never matches.
+            None => matches!(part.parse::<usize>(), Ok(n) if n == core_id),
+        }
+    })
 }
 
 /// Attempt to set `SCHED_FIFO` real-time scheduling on the calling thread.
@@ -171,5 +217,29 @@ mod tests {
     fn pin_to_invalid_core_fails() {
         // A core ID beyond any real hardware should fail.
         assert!(pin_to_core(99999).is_err());
+    }
+
+    #[test]
+    fn cpu_list_membership() {
+        // Single inclusive range.
+        assert!(cpu_list_contains("2-7", 2));
+        assert!(cpu_list_contains("2-7", 7));
+        assert!(cpu_list_contains("2-7", 5));
+        assert!(!cpu_list_contains("2-7", 1));
+        assert!(!cpu_list_contains("2-7", 8));
+        // Singletons.
+        assert!(cpu_list_contains("1,3,5", 3));
+        assert!(!cpu_list_contains("1,3,5", 4));
+        // Mixed ranges + singletons.
+        assert!(cpu_list_contains("2-4,6-8", 7));
+        assert!(cpu_list_contains("2-4,6-8", 3));
+        assert!(!cpu_list_contains("2-4,6-8", 5));
+        assert!(cpu_list_contains("0,2-4,9", 9));
+        // Empty (no isolcpus) — nothing is isolated.
+        assert!(!cpu_list_contains("", 0));
+        assert!(!cpu_list_contains("", 2));
+        // Malformed tokens never match (defensive parse of external data).
+        assert!(!cpu_list_contains("x,2-", 2));
+        assert!(!cpu_list_contains("foo", 0));
     }
 }
