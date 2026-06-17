@@ -48,23 +48,100 @@ HEALTH_PORT=9878
 VETH_REPLICA="dpdk-repl-r"
 VETH_PRIMARY="dpdk-repl-p"
 
+# Capture core dumps to a temp file (bypassing apport) so we can pull a
+# backtrace if either process crashes (e.g. a teardown segfault). Restored
+# in cleanup.
+ORIG_CORE_PATTERN=$(cat /proc/sys/kernel/core_pattern 2>/dev/null || echo "core")
+ulimit -c unlimited
+echo "$TMPDIR/core.%e.%p" > /proc/sys/kernel/core_pattern 2>/dev/null || true
+
+# Stop a process gracefully (SIGTERM), escalating to SIGKILL only if it hangs.
+# SIGTERM exercises the real teardown path (stop -> close the DPDK port -> EAL
+# cleanup, journal fdatasync, drop the exchange) — what a production operator
+# triggers. Both ends are DPDK here, so both exercise it. That path has wedged
+# before in two DPDK-specific ways, both fixed:
+#   1. mlockall(MCL_FUTURE) eagerly + synchronously populated every post-init
+#      mmap (`__mm_populate`), an uninterruptible page-walk that outlasted even
+#      SIGKILL — fixed by adding MCL_ONFAULT (lock-on-fault) in process.rs.
+#   2. SCHED_FIFO busy-spin pipeline threads, pinned to cores EAL also uses,
+#      starved co-located SCHED_OTHER DPDK control threads holding the glibc
+#      malloc arena lock — fixed by gating SCHED_FIFO on real core isolation
+#      (isolcpus) in affinity.rs.
+# If a process survives SIGTERM past the grace window, the dumps below pinpoint
+# the regression before we resort to SIGKILL.
+stop_pid() {
+    local pid="$1" name="$2" log="${3:-}"
+    kill -TERM "$pid" 2>/dev/null || true
+    local i=0
+    while kill -0 "$pid" 2>/dev/null; do
+        i=$((i + 1))
+        if [[ $i -gt 150 ]]; then
+            echo "  WARN: $name (pid $pid) ignored SIGTERM for 15s — kernel stacks:"
+            grep '^State:' "/proc/$pid/status" 2>/dev/null || true
+            for t in "/proc/$pid/task"/*; do
+                echo "    -- thread $(cat "$t/comm" 2>/dev/null) ($(basename "$t")) --"
+                cat "$t/stack" 2>/dev/null || true
+            done
+            # Kernel stacks only name syscalls. To name the Rust frames — which
+            # mutex / join / alloc / spin is wedged — grab userspace backtraces
+            # of every thread, persisted OUTSIDE the temp dir (cleanup wipes it)
+            # and echoed. Prefer eu-stack; fall back to gdb under `timeout` so it
+            # can never hang the harness. The process log carries a panicked
+            # pipeline thread's backtrace if that's the cause.
+            if [[ -n "$log" && -f "$log" ]]; then
+                echo "  --- panic lines in $log ---"
+                grep -n -A8 'panicked' "$log" 2>/dev/null || echo "    (no 'panicked' found)"
+                echo "  --- tail of $log ---"
+                tail -40 "$log" 2>/dev/null || true
+            fi
+            local diag="$PROJECT_DIR/dpdk-repl-wedge-$name-$pid.txt"
+            echo "  --- userspace backtraces -> $diag (also printed below) ---"
+            {
+                if command -v eu-stack >/dev/null 2>&1; then
+                    eu-stack -p "$pid" 2>&1
+                elif command -v gdb >/dev/null 2>&1; then
+                    timeout 60 gdb -batch -nx -p "$pid" \
+                        -ex "set pagination off" \
+                        -ex "set print thread-events off" \
+                        -ex "thread apply all bt" 2>&1
+                else
+                    echo "(neither eu-stack nor gdb installed: apt-get install elfutils gdb)"
+                fi
+            } | tee "$diag"
+            [[ -n "${SUDO_USER:-}" ]] && chown "$SUDO_USER:$SUDO_USER" "$diag" 2>/dev/null || true
+            echo "  --- end userspace backtraces ---"
+            echo "  Escalating to SIGKILL..."
+            kill -9 "$pid" 2>/dev/null || true
+            break
+        fi
+        sleep 0.1
+    done
+    wait "$pid" 2>/dev/null || true
+    echo "  $name stopped"
+}
+
 cleanup() {
     echo ""
     echo "=== Cleanup ==="
 
-    if [[ -n "${PRIMARY_PID:-}" ]]; then
-        kill "$PRIMARY_PID" 2>/dev/null && wait "$PRIMARY_PID" 2>/dev/null || true
-        echo "  Primary stopped"
+    if [[ -n "${TCPDUMP_PID:-}" ]]; then
+        kill "$TCPDUMP_PID" 2>/dev/null || true
     fi
+    # Replica first (clean disconnect from the primary), then the primary.
     if [[ -n "${REPLICA_PID:-}" ]]; then
-        kill "$REPLICA_PID" 2>/dev/null && wait "$REPLICA_PID" 2>/dev/null || true
-        echo "  Replica stopped"
+        stop_pid "$REPLICA_PID" "Replica" "$TMPDIR/replica.log"
+    fi
+    if [[ -n "${PRIMARY_PID:-}" ]]; then
+        stop_pid "$PRIMARY_PID" "Primary" "$TMPDIR/primary.log"
     fi
 
     ip link del "$VETH_REPLICA" 2>/dev/null || true
     echo "  Veth pair removed"
 
     rm -rf /var/run/dpdk/primary /var/run/dpdk/replica
+
+    # Restore the original core_pattern.
+    echo "$ORIG_CORE_PATTERN" > /proc/sys/kernel/core_pattern 2>/dev/null || true
 
     if [[ "${MOUNTED_HUGE_2M:-}" == "1" ]]; then
         umount "$HUGE_2M_MOUNT" 2>/dev/null || true
@@ -155,11 +232,21 @@ ip link set "$VETH_PRIMARY" up
 ethtool -K "$VETH_REPLICA" tx off rx off 2>/dev/null || true
 ethtool -K "$VETH_PRIMARY" tx off rx off 2>/dev/null || true
 echo "  $VETH_REPLICA <-> $VETH_PRIMARY (up, synthetic 02:00:<ip> MACs)"
+
+# Capture the wire so a failure shows whether ARP resolves and the replica's
+# SYNs reach the primary with the right dst MAC (the synthetic 02:00:<ip>).
+TCPDUMP_LOG="$TMPDIR/veth.tcpdump"
+if command -v tcpdump >/dev/null 2>&1; then
+    tcpdump -i "$VETH_PRIMARY" -e -nnvv -c 200 'arp or tcp port '"$REPL_PORT" \
+        > "$TCPDUMP_LOG" 2>&1 &
+    TCPDUMP_PID=$!
+    echo "  tcpdump capturing $VETH_PRIMARY -> $TCPDUMP_LOG (PID $TCPDUMP_PID)"
+fi
 echo ""
 
 # --- 5. Start primary ---
 echo "=== Starting DPDK primary ==="
-RUST_LOG=info \
+RUST_LOG=info RUST_BACKTRACE=1 \
 "$PROJECT_DIR/target/release/melin-server" \
     --bind "0.0.0.0:9876" \
     --health-bind "0.0.0.0:$HEALTH_PORT" \
@@ -202,7 +289,7 @@ echo ""
 
 # --- 6. Start replica ---
 echo "=== Starting DPDK replica ==="
-RUST_LOG=info \
+RUST_LOG=info RUST_BACKTRACE=1 \
 "$PROJECT_DIR/target/release/melin-server" \
     --journal "$TMPDIR/replica.journal" \
     --snapshot-interval-ms 0 \
