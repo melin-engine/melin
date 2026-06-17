@@ -1589,12 +1589,6 @@ where
     }
 }
 
-/// DPDK twin of the kernel-TCP receiver's `receive_chunked_body`:
-/// drain `SnapshotChunk` frames into `tmp_path` until the
-/// `SnapshotEnd` trailer, verifying byte length and CRC32C - the
-/// framing shared by the snapshot payload and the segment seed. The
-/// tmp file is removed on any failure, so callers never see a partial
-/// file. Leaves any bytes past the trailer in `recv_buf`.
 /// Blocking `Read`/`Write` adapter over the DPDK transport so the SHARED
 /// [`authenticate_with_primary`] (written against blocking `Read`/`Write`)
 /// can run over the non-blocking smoltcp poll loop. `read` polls until bytes
