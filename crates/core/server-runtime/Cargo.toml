@@ -54,10 +54,11 @@ zerocopy = { version = "0.8", features = ["derive"] }
 melin-dpdk = { path = "../dpdk", version = "0.10.1", optional = true }
 
 [dev-dependencies]
-# The runtime's library API is application-agnostic, but a few unit
-# tests (auth handshake, replication wire format, DPDK fixtures) need
-# the full exchange protocol/types to construct realistic fixtures.
-# These are dev-only — the lib has no exchange dependency.
+# Tests that need a concrete `Application`/`AppEvent` to drive the generic
+# pipeline use the in-tree counter example (path-only: it is
+# `publish = false`). Other test modules still build fixtures from the
+# exchange crates below.
+melin-example-counter = { path = "../../examples/counter" }
 melin-protocol = { path = "../../exchange/protocol", version = "0.10.1" }
 melin-trading = { path = "../../exchange/trading", version = "0.10.1" }
 melin-types = { path = "../../exchange/types", version = "0.10.1" }

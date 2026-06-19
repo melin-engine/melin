@@ -788,9 +788,13 @@ fn send_auth_failed(conn: &ConnectionState, transport: &mut DpdkTransport) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::num::NonZeroU64;
 
-    use melin_types::types::*;
+    // The framing tests below operate on raw length-prefixed bytes, so any
+    // `AppEvent` serves as a realistic payload. The in-tree counter example
+    // stands in for an exchange event, keeping these tests free of any
+    // exchange crate.
+    use counter_server::CounterEvent;
+    use melin_app::AppEvent;
 
     /// Result of trying to extract a length-prefixed frame from a parse buffer.
     #[derive(Debug, PartialEq)]
@@ -890,67 +894,37 @@ mod tests {
         assert!(matches!(try_extract_frame(&buf), FrameResult::Complete(_)));
     }
 
-    // `request_to_event_*` tests moved to `domain/request.rs` (where the
-    // mapping lives); the wire-level tests below exercise DPDK framing.
-
-    fn make_order(id: u64, account: u32, side: Side) -> Order {
-        Order {
-            id: OrderId(id),
-            account: AccountId(account),
-            side,
-            order_type: OrderType::Limit {
-                price: Price(NonZeroU64::new(100).unwrap()),
-                post_only: false,
-            },
-            quantity: Quantity(NonZeroU64::new(10).unwrap()),
-            time_in_force: TimeInForce::GTC,
-            stp: SelfTradeProtection::CancelNewest,
-            expiry_ns: 0,
-        }
+    /// Encode a `CounterEvent` into a length-prefixed wire frame:
+    /// `[len:u32][event bytes]` — the framing the DPDK transport extracts.
+    fn counter_frame(event: CounterEvent) -> Vec<u8> {
+        let mut body = vec![0u8; event.encoded_size()];
+        let n = event.encode(&mut body);
+        let mut frame = (n as u32).to_le_bytes().to_vec();
+        frame.extend_from_slice(&body[..n]);
+        frame
     }
 
-    // --- Wire-level round-trip: encode request → extract frame → decode ---
+    // --- Wire-level round-trip: encode event → extract frame → decode ---
 
     #[test]
-    fn wire_round_trip_submit_order() {
-        let order = make_order(99, 1, Side::Sell);
-        let req = Request::SubmitOrder {
-            symbol: Symbol(5),
-            order,
-        };
-        let mut buf = [0u8; 256];
-        let written = codec::encode_request(&req, 0, &mut buf).unwrap();
-
-        // encode_request writes [u32 length][payload].
-        let frame = try_extract_frame(&buf[..written]);
-        match frame {
+    fn wire_round_trip_increment() {
+        let frame = counter_frame(CounterEvent::Increment { amount: 42 });
+        match try_extract_frame(&frame) {
             FrameResult::Complete(payload) => {
-                let (_, decoded) = codec::decode_request(payload).unwrap();
-                assert!(
-                    matches!(decoded, Request::SubmitOrder { symbol, .. } if symbol == Symbol(5))
-                );
+                let decoded = CounterEvent::decode(payload).unwrap();
+                assert!(matches!(decoded, CounterEvent::Increment { amount: 42 }));
             }
             other => panic!("expected Complete, got {other:?}"),
         }
     }
 
     #[test]
-    fn wire_round_trip_cancel() {
-        let req = Request::CancelOrder {
-            symbol: Symbol(1),
-            account: AccountId(2),
-            order_id: OrderId(3),
-        };
-        let mut buf = [0u8; 256];
-        let written = codec::encode_request(&req, 0, &mut buf).unwrap();
-
-        let frame = try_extract_frame(&buf[..written]);
-        match frame {
+    fn wire_round_trip_get_value() {
+        let frame = counter_frame(CounterEvent::GetValue);
+        match try_extract_frame(&frame) {
             FrameResult::Complete(payload) => {
-                let (_, decoded) = codec::decode_request(payload).unwrap();
-                assert!(
-                    matches!(decoded, Request::CancelOrder { order_id, .. } if order_id == OrderId(3))
-                );
+                let decoded = CounterEvent::decode(payload).unwrap();
+                assert!(matches!(decoded, CounterEvent::GetValue));
             }
             other => panic!("expected Complete, got {other:?}"),
         }
@@ -960,10 +934,8 @@ mod tests {
 
     #[test]
     fn incremental_frame_accumulation() {
-        let req = Request::Heartbeat;
-        let mut wire = [0u8; 64];
-        let written = codec::encode_request(&req, 0, &mut wire).unwrap();
-        let wire = &wire[..written];
+        let wire = counter_frame(CounterEvent::Increment { amount: 7 });
+        let written = wire.len();
 
         // Feed bytes one at a time into a parse buffer.
         let mut parse_buf = Vec::new();
@@ -985,24 +957,19 @@ mod tests {
 
     #[test]
     fn multiple_frames_in_buffer() {
-        let req1 = Request::Heartbeat;
-        let req2 = Request::QueryStats;
-        let mut buf1 = [0u8; 64];
-        let mut buf2 = [0u8; 64];
-        let w1 = codec::encode_request(&req1, 0, &mut buf1).unwrap();
-        let w2 = codec::encode_request(&req2, 0, &mut buf2).unwrap();
+        let frame1 = counter_frame(CounterEvent::Increment { amount: 1 });
+        let frame2 = counter_frame(CounterEvent::GetValue);
 
         // Concatenate two frames.
         let mut combined = Vec::new();
-        combined.extend_from_slice(&buf1[..w1]);
-        combined.extend_from_slice(&buf2[..w2]);
+        combined.extend_from_slice(&frame1);
+        combined.extend_from_slice(&frame2);
 
         // First extraction should get frame 1.
-        let result1 = try_extract_frame(&combined);
-        let payload1_len = match result1 {
+        let payload1_len = match try_extract_frame(&combined) {
             FrameResult::Complete(p) => {
-                let (_, decoded) = codec::decode_request(p).unwrap();
-                assert!(matches!(decoded, Request::Heartbeat));
+                let decoded = CounterEvent::decode(p).unwrap();
+                assert!(matches!(decoded, CounterEvent::Increment { amount: 1 }));
                 p.len()
             }
             other => panic!("expected Complete, got {other:?}"),
@@ -1012,11 +979,10 @@ mod tests {
         let remaining = &combined[4 + payload1_len..];
 
         // Second extraction should get frame 2.
-        let result2 = try_extract_frame(remaining);
-        match result2 {
+        match try_extract_frame(remaining) {
             FrameResult::Complete(p) => {
-                let (_, decoded) = codec::decode_request(p).unwrap();
-                assert!(matches!(decoded, Request::QueryStats));
+                let decoded = CounterEvent::decode(p).unwrap();
+                assert!(matches!(decoded, CounterEvent::GetValue));
             }
             other => panic!("expected Complete, got {other:?}"),
         }
