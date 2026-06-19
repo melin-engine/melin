@@ -175,6 +175,29 @@ pub fn run_sender<A: Application>(
             }
         }
 
+        // Disengage a finished slot's shared state. Both the clean-exit and
+        // panic arms below call this, so they cannot drift: a panicked handler
+        // must tear down exactly like a clean exit, or it leaks the trading-halt
+        // gate and — far worse — leaves the slot's cursor engaged, freezing the
+        // shared min so the primary stops acking client requests even with a
+        // healthy surviving replica. Borrows only atomics (interior
+        // mutability), so it coexists with the `&mut` iteration over `slots`.
+        let disengage_slot = |slot_idx: usize| {
+            // Lower the gate only if this connection authenticated (and so
+            // lifted it); `swap` reads and resets the latch in one op, and the
+            // `join()` ordered the handler's post-auth writes before here.
+            // `lower` warns "trading halted" if this was the last replica.
+            if authenticated_flags[slot_idx].swap(false, Ordering::AcqRel) {
+                ReplicaGate::new(replicas_connected).lower();
+            }
+            // Disengage cursors BEFORE clearing the active flag — ordering
+            // contract B2 (see `ReplicaCursors`).
+            cursors.clear_on_disconnect(slot_idx);
+            metrics.catching_up[slot_idx].store(false, Ordering::Relaxed);
+            // Journal stage stops publishing to this ring.
+            active_flags[slot_idx].store(false, Ordering::Release);
+        };
+
         // Collect finished replica threads (disconnected replicas).
         for (i, slot) in slots.iter_mut().enumerate() {
             if let Some(ref handle) = slot.handle
@@ -198,26 +221,7 @@ pub fn run_sender<A: Application>(
                         // live-streaming loop starts with a clean ring.
                         consumer.skip_to_producer();
                         slot.consumer = Some(consumer);
-                        // Lower the trading-halt gate only if this connection
-                        // authenticated (and so lifted it). `swap` reads and
-                        // resets the latch in one op; the prior `join()` already
-                        // ordered the handler's post-auth writes before here.
-                        // `lower` emits the "trading halted" warn if this was the
-                        // last replica — before the cursor teardown below, so the
-                        // halt re-engages fail-closed.
-                        let was_authenticated =
-                            authenticated_flags[i].swap(false, Ordering::AcqRel);
-                        if was_authenticated {
-                            ReplicaGate::new(replicas_connected).lower();
-                        }
-                        // Disengage the slot's cursors BEFORE clearing the
-                        // active flag — see `ReplicaCursors` for the
-                        // ordering contract (B2).
-                        cursors.clear_on_disconnect(i);
-                        metrics.catching_up[i].store(false, Ordering::Relaxed);
-                        // Clear active flag — journal stage stops publishing
-                        // to this ring. Must happen before clearing evict.
-                        active_flags[i].store(false, Ordering::Release);
+                        disengage_slot(i);
                         // Clear eviction flag after reclaiming the consumer.
                         if evict_flags[i].load(Ordering::Relaxed) {
                             evict_flags[i].store(false, Ordering::Release);
@@ -228,10 +232,13 @@ pub fn run_sender<A: Application>(
                     }
                     Err(_) => {
                         error!(slot = i, "replica handler thread panicked");
-                        // Consumer is lost — can't recover this slot.
-                        // With independent rings, only this slot's ring is
-                        // affected. The other replica continues normally.
-                        active_flags[i].store(false, Ordering::Release);
+                        // Consumer is lost — the slot stays handle=None /
+                        // consumer=None, so the accept loop skips it. With
+                        // independent rings, only this slot's ring is affected;
+                        // the other replica continues normally. Still disengage
+                        // its shared state, or the gate leaks and the cursor
+                        // freezes (see `disengage_slot`).
+                        disengage_slot(i);
                         evict_flags[i].store(false, Ordering::Release);
                     }
                 }
