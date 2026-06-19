@@ -15,7 +15,7 @@ use melin_app::decoder::{Decoded, RequestDecoder};
 use melin_journal::JournalEvent;
 use melin_pipeline::ring;
 use melin_transport_core::pipeline::InputSlot;
-use melin_transport_core::trace::mono_trace_ns;
+use melin_transport_core::trace::{MonoTraceInstant, mono_trace_ns};
 
 /// Maximum frame payload size (matches `BlockingFrameReader`).
 pub(crate) const MAX_FRAME_SIZE: usize = 1024;
@@ -43,6 +43,15 @@ pub(crate) enum FrameAction {
 ///
 /// Returns [`FrameAction`] so the caller can handle transport-specific
 /// side effects (ServerBusy write, transport close, control events).
+///
+/// `recv_ts` is the trace timestamp the caller captured once, at the
+/// moment the kernel handed it this recv's bytes (the io_uring CQE /
+/// DPDK `recv_into_vec` site). Every slot published from `parse_buf`
+/// is stamped with it, so the `reader: ingest` and `server e2e` stages
+/// measure from true wire receipt — frame decode included — rather than
+/// re-sampling per frame after decode (which excluded decode and drifted
+/// forward for later frames in a multi-frame recv). `()` (zero-sized)
+/// when `latency-trace` is disabled.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn process_client_frames<E: AppEvent>(
     parse_buf: &mut Vec<u8>,
@@ -52,6 +61,7 @@ pub(crate) fn process_client_frames<E: AppEvent>(
     producer: &mut ring::Producer<InputSlot<E>>,
     decoder: &dyn RequestDecoder<Event = E>,
     batch_wall_ns: u64,
+    recv_ts: MonoTraceInstant,
     #[cfg(feature = "latency-trace")] publish_rec: &mut melin_transport_core::trace::StageRecorder,
     #[cfg(feature = "tick-to-trade")] ingest_rec: &mut melin_transport_core::trace::StageRecorder,
 ) -> FrameAction {
@@ -98,9 +108,6 @@ pub(crate) fn process_client_frames<E: AppEvent>(
             }
             Decoded::Permitted { request_seq, event } => (request_seq, event),
         };
-
-        #[allow(clippy::let_unit_value)]
-        let recv_ts = mono_trace_ns();
 
         let ts = if event.is_query() { 0 } else { batch_wall_ns };
         let event = JournalEvent::App(event);
