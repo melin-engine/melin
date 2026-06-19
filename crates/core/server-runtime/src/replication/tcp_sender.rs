@@ -14,7 +14,7 @@ use tracing::{debug, error, info, warn};
 use melin_journal::replication::ReplicationConsumer;
 
 use super::auth::authenticate_replica;
-use super::{ReplicaCursors, ReplicationMetrics, SentHighWater};
+use super::{ReplicaCursors, ReplicaGate, ReplicationMetrics, SentHighWater};
 use melin_app::Application;
 use melin_transport_core::replication::catchup::{
     CatchUpResult, bridge_catchup_to_live, can_catch_up_from_journal, catch_up_from_journal,
@@ -202,10 +202,13 @@ pub fn run_sender<A: Application>(
                         // authenticated (and so lifted it). `swap` reads and
                         // resets the latch in one op; the prior `join()` already
                         // ordered the handler's post-auth writes before here.
+                        // `lower` emits the "trading halted" warn if this was the
+                        // last replica — before the cursor teardown below, so the
+                        // halt re-engages fail-closed.
                         let was_authenticated =
                             authenticated_flags[i].swap(false, Ordering::AcqRel);
                         if was_authenticated {
-                            replicas_connected.fetch_sub(1, Ordering::Release);
+                            ReplicaGate::new(replicas_connected).lower();
                         }
                         // Disengage the slot's cursors BEFORE clearing the
                         // active flag — see `ReplicaCursors` for the
@@ -221,9 +224,6 @@ pub fn run_sender<A: Application>(
                             warn!(slot = i, "evicted replica — ring ready for reconnection");
                         } else {
                             warn!(slot = i, "replica disconnected");
-                        }
-                        if was_authenticated && replicas_connected.load(Ordering::Relaxed) == 0 {
-                            warn!("all replicas disconnected — trading halted");
                         }
                     }
                     Err(_) => {
@@ -433,7 +433,7 @@ fn handle_replica_connection<A: Application>(
     // it on slot teardown, reading `authenticated` to know this connection
     // lifted it. Set the latch after the increment so a post-join read of the
     // latch implies the increment is visible too.
-    replicas_connected.fetch_add(1, Ordering::Release);
+    ReplicaGate::new(replicas_connected).lift();
     authenticated.store(true, Ordering::Release);
 
     // Read handshake.

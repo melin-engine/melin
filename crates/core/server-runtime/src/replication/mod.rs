@@ -58,7 +58,7 @@
 use std::sync::Arc;
 #[cfg(test)]
 use std::sync::atomic::AtomicU64;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 use melin_journal::JournalWrite;
 use melin_transport_core::pipeline::{JournalStage, JournalStageRun};
@@ -76,6 +76,48 @@ mod tcp_receiver;
 mod tcp_sender;
 
 use receiver_transport::{ControlFrameSource, SessionExit, StreamingResult, receive_chunked_body};
+
+/// Writer-side view of the trading-halt gate (the `replicas_connected`
+/// counter). The matching stage refuses new orders while the count is zero, so
+/// the counter must reflect the number of replicas that have **authenticated**
+/// — a bare connection must not lift the halt. Both senders (kernel-TCP and
+/// DPDK) lift/lower the gate through this view so the policy, the memory
+/// orderings, and the "trading halted" warning live in one place and cannot
+/// drift apart.
+///
+/// Deliberately a *borrowed view*, not an owner: `melin_transport_core` owns
+/// the `Arc<AtomicU32>` and reads it on the matching hot path and for the
+/// `melin_replicas_connected` gauge. This type is only the senders' write
+/// surface, so centralizing it costs nothing on the read side.
+pub(crate) struct ReplicaGate<'a> {
+    count: &'a AtomicU32,
+}
+
+impl<'a> ReplicaGate<'a> {
+    pub(crate) fn new(count: &'a AtomicU32) -> Self {
+        Self { count }
+    }
+
+    /// A replica has authenticated — lift the halt by one. `Release` so a peer
+    /// that observes the connect also observes everything that preceded it.
+    pub(crate) fn lift(&self) {
+        self.count.fetch_add(1, Ordering::Release);
+    }
+
+    /// A replica left — lower the halt by one. Returns `true` if it was the
+    /// last one (trading is now unprotected), emitting the halt warning here so
+    /// both senders share the wording. `fetch_sub` returns the *prior* count,
+    /// so `== 1` means this call took it to zero; deriving "last one" from the
+    /// returned value rather than a follow-up load avoids a TOCTOU race with a
+    /// concurrent reconnect's `lift`.
+    pub(crate) fn lower(&self) -> bool {
+        let was_last = self.count.fetch_sub(1, Ordering::Release) == 1;
+        if was_last {
+            tracing::warn!("all replicas disconnected — trading halted");
+        }
+        was_last
+    }
+}
 
 // Wire-protocol types, auth, catch-up, ack queueing, dual-track
 // cursor management, and per-replica metrics now live in

@@ -27,7 +27,7 @@ use super::receiver_transport::{
     try_extract_frame,
 };
 use super::{
-    AfterSession, MAX_BACKOFF, ReceiverResult, ReplicaCursors, ReplicaPipelineHandles,
+    AfterSession, MAX_BACKOFF, ReceiverResult, ReplicaCursors, ReplicaGate, ReplicaPipelineHandles,
     ReplicationMetrics, ResyncDecision, SentHighWater, build_replica_pipeline_with_threads,
     handle_resync_verdict, handle_session_exit, recover_replica_state, sleep_checking_flags,
     take_pipeline_for_promotion, teardown_replica_pipeline,
@@ -230,9 +230,8 @@ impl DpdkReplicaSlot {
             cursors.clear_on_disconnect(slot_idx);
             self.active_flag.store(false, Ordering::Release);
             metrics.catching_up[slot_idx].store(false, Ordering::Relaxed);
-            // fetch_sub returns the prior count; == 1 means we just hit zero.
-            if was_authenticated && replicas_connected.fetch_sub(1, Ordering::Release) == 1 {
-                warn!("all replicas disconnected — trading halted");
+            if was_authenticated {
+                ReplicaGate::new(replicas_connected).lower();
             }
         }
         self.state = SlotState::Idle;
@@ -494,7 +493,7 @@ impl<A: Application> DpdkReplicationDriver<A> {
                             // Proven a Replication key — only now does this
                             // connection lift the trading-halt gate (lowered by
                             // `go_idle` on teardown).
-                            replicas_connected.fetch_add(1, Ordering::Release);
+                            ReplicaGate::new(replicas_connected).lift();
                             slot.state = SlotState::Handshaking(handle);
                         }
                         AuthOutcome::Rejected => {
