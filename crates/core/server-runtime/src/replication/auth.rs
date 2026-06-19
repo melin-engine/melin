@@ -193,8 +193,8 @@ pub(super) enum AuthOutcome {
     /// Verified; AuthOk has been queued. Advance to the handshake.
     Authenticated,
     /// Rejected: bad signature/permission, timeout, oversized frame, or a
-    /// mid-auth disconnect. The connection has been closed (unless the replica
-    /// was already gone) — the caller resets the slot.
+    /// mid-auth disconnect. The connection has been closed (idempotently, so a
+    /// replica that already vanished is fine) — the caller resets the slot.
     Rejected,
 }
 
@@ -215,9 +215,14 @@ pub(super) fn step_authentication<T: AuthTransport>(
     authorized_keys: &melin_app::auth::AuthorizedKeys,
     slot_idx: usize,
 ) -> AuthOutcome {
-    // Replica vanished mid-auth — already gone, nothing to close.
+    // Replica gone mid-auth. `is_active` reads false both for an
+    // already-removed handle and for a socket still pinned in the smoltcp
+    // SocketSet in a Closed/TimeWait state — and `close` (idempotent) is the
+    // only path that reclaims the latter, so call it unconditionally rather
+    // than leak the entry.
     if !transport.is_active(handle) {
         warn!(slot = slot_idx, "replica disconnected during auth (DPDK)");
+        transport.close(handle);
         return AuthOutcome::Rejected;
     }
 
@@ -642,17 +647,23 @@ mod tests {
     }
 
     #[test]
-    fn step_rejects_disconnect_without_closing() {
+    fn step_closes_on_disconnect_to_reclaim_socket() {
         let key = SigningKey::from_bytes(&[0x11; 32]);
         let keys = keys_for(&key, "replication");
         let challenge = challenge_at([0x42; 32], far_future());
         let mut tx = MockAuthTransport::with_incoming(Vec::new());
-        tx.active = false; // replica already gone
+        tx.active = false; // replica gone (RST/FIN observed)
         let mut recv = Vec::new();
         let mut send = Vec::new();
         let outcome = step_authentication(&mut tx, (), &challenge, &mut recv, &mut send, &keys, 0);
         assert!(matches!(outcome, AuthOutcome::Rejected));
-        assert!(!tx.closed, "an already-gone replica needs no close");
+        // `is_active` is false both for an already-removed handle and for a
+        // socket still pinned in the SocketSet (Closed/TimeWait); `close` is
+        // idempotent, so we call it unconditionally to reclaim the latter.
+        assert!(
+            tx.closed,
+            "a disconnected replica's socket entry is reclaimed"
+        );
     }
 
     // ---- Receiver-side blocking adapter (`PolledAuthStream`) ----

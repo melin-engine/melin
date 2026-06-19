@@ -499,6 +499,10 @@ impl<A: Application> DpdkReplicationDriver<A> {
                             slot = slot_idx,
                             "replica disconnected during handshake (DPDK)"
                         );
+                        // `is_active` is false for a Closed/TimeWait socket
+                        // still in the SocketSet too; `close` (idempotent)
+                        // reclaims it rather than leaking the handle.
+                        transport.close(handle);
                         slot.state = SlotState::Idle;
                         slot.recv_buf.clear();
                         // The handshake may have been mid-validation.
@@ -1024,6 +1028,10 @@ impl<A: Application> DpdkReplicationDriver<A> {
                     // 4. Check for disconnect.
                     if !transport.is_active(handle) {
                         warn!(slot = slot_idx, "replica disconnected (DPDK)");
+                        // `is_active` is false for a Closed/TimeWait socket
+                        // still in the SocketSet too; `close` (idempotent)
+                        // reclaims it rather than leaking the handle.
+                        transport.close(handle);
                         // Disengage cursors before the active_flag Release — see B2.
                         cursors.clear_on_disconnect(slot_idx);
                         slot.active_flag.store(false, Ordering::Release);
