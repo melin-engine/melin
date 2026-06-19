@@ -1020,8 +1020,13 @@ mod tests {
 
     use super::auth::{authenticate_replica, authenticate_with_primary};
     use super::*;
-    use melin_trading::trading_event::TradingEvent;
-    type InputSlot = melin_transport_core::pipeline::InputSlot<TradingEvent>;
+    // Any `AppEvent` works as the pipeline's event type here — these
+    // protocol-level tests never construct a real app event (the slot's
+    // event is always `JournalEvent::Tick`), so the counter example's
+    // event type stands in for an exchange event and keeps the runtime's
+    // test deps free of exchange crates.
+    use counter_server::CounterEvent;
+    type InputSlot = melin_transport_core::pipeline::InputSlot<CounterEvent>;
     use melin_transport_core::PipelineCursors;
     use melin_transport_core::replication::protocol::{
         MAX_CONTROL_FRAME, MAX_DATA_FRAME, MSG_AUTH_OK, MSG_CHALLENGE_RESPONSE, MSG_SNAPSHOT_BEGIN,

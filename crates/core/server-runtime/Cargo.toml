@@ -54,14 +54,19 @@ zerocopy = { version = "0.8", features = ["derive"] }
 melin-dpdk = { path = "../dpdk", version = "0.10.1", optional = true }
 
 [dev-dependencies]
-# Tests that need a concrete `Application`/`AppEvent` to drive the generic
-# pipeline use the in-tree counter example (path-only: it is
-# `publish = false`). Other test modules still build fixtures from the
-# exchange crates below.
+# The runtime's library API is application-agnostic. Tests that need a
+# concrete `Application`/`AppEvent` to instantiate the generic pipeline
+# (replication wire format, DPDK frame fixtures) use the in-tree counter
+# example rather than any exchange crate — this keeps the core dependency
+# graph free of exchange coupling. Auth-handshake tests build their wire
+# frames directly from `melin-wire-protocol::control_codec` (already a
+# normal dependency), the same path the runtime itself uses.
+#
+# Path-only (no version): `melin-example-counter` is `publish = false`, so
+# it must not carry a version requirement, and `cargo publish` strips
+# version-less dev-dependencies. This is a dev-only dependency cycle
+# (counter depends on the runtime), which Cargo permits.
 melin-example-counter = { path = "../../examples/counter" }
-melin-protocol = { path = "../../exchange/protocol", version = "0.10.1" }
-melin-trading = { path = "../../exchange/trading", version = "0.10.1" }
-melin-types = { path = "../../exchange/types", version = "0.10.1" }
 tempfile = "3"
 serial_test = "3"
 proptest = "1"

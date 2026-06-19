@@ -399,8 +399,9 @@ mod tests {
     use std::io::{BufRead, BufReader, Read, Write};
 
     use ed25519_dalek::{Signer, SigningKey};
-    use melin_protocol::codec;
-    use melin_protocol::message::{Request, ResponseKind};
+    use melin_wire_protocol::control_codec::{
+        TAG_AUTH_FAILED, TAG_CHALLENGE, TAG_CHALLENGE_RESPONSE, TAG_SERVER_READY,
+    };
 
     fn operator_keys() -> (SigningKey, Arc<AuthorizedKeys>) {
         let signing_key = SigningKey::from_bytes(&[0xAD; 32]);
@@ -424,7 +425,12 @@ mod tests {
         (signing_key, Arc::new(keys))
     }
 
-    fn client_authenticate(stream: &mut TcpStream, key: &SigningKey) -> ResponseKind {
+    /// Perform the transport-level auth handshake on `stream`, returning
+    /// the tag byte of the server's final response (`TAG_SERVER_READY` or
+    /// `TAG_AUTH_FAILED`). Builds frames directly from the control-codec
+    /// wire format so the test needs no exchange-protocol codec.
+    fn client_authenticate(stream: &mut TcpStream, key: &SigningKey) -> u8 {
+        // Read the Challenge: [len:u32][TAG_CHALLENGE][nonce:32].
         let mut len_buf = [0u8; 4];
         stream.read_exact(&mut len_buf).expect("read challenge len");
         let frame_len = u32::from_le_bytes(len_buf) as usize;
@@ -432,22 +438,24 @@ mod tests {
         stream
             .read_exact(&mut frame_buf)
             .expect("read challenge payload");
-        let response = codec::decode_response(&frame_buf).expect("decode challenge");
-        let nonce = match response {
-            ResponseKind::Challenge { nonce } => nonce,
-            other => panic!("expected Challenge, got {other:?}"),
-        };
+        assert_eq!(frame_buf[0], TAG_CHALLENGE, "expected Challenge");
+        let nonce = &frame_buf[1..33];
 
-        let signature = key.sign(&nonce);
-        let request = Request::ChallengeResponse {
-            signature: signature.to_bytes(),
-            public_key: key.verifying_key().to_bytes(),
-        };
-        let mut encode_buf = [0u8; 256];
-        let written = codec::encode_request(&request, 0, &mut encode_buf).expect("encode");
-        stream.write_all(&encode_buf[..written]).expect("send");
+        // Reply with a ChallengeResponse:
+        // [len:u32][seq:u64][TAG_CHALLENGE_RESPONSE][sig:64][pubkey:32].
+        let signature = key.sign(nonce);
+        let mut frame = Vec::with_capacity(105);
+        frame.extend_from_slice(&0u64.to_le_bytes()); // request_seq
+        frame.push(TAG_CHALLENGE_RESPONSE);
+        frame.extend_from_slice(&signature.to_bytes());
+        frame.extend_from_slice(&key.verifying_key().to_bytes());
+        stream
+            .write_all(&(frame.len() as u32).to_le_bytes())
+            .expect("send result len");
+        stream.write_all(&frame).expect("send");
         stream.flush().expect("flush");
 
+        // Read the server's result frame and return its tag byte.
         let mut len_buf2 = [0u8; 4];
         stream.read_exact(&mut len_buf2).expect("read result len");
         let result_len = u32::from_le_bytes(len_buf2) as usize;
@@ -455,7 +463,7 @@ mod tests {
         stream
             .read_exact(&mut result_buf)
             .expect("read result payload");
-        codec::decode_response(&result_buf).expect("decode result")
+        result_buf[0]
     }
 
     fn ephemeral_listener() -> (TcpListener, SocketAddr) {
@@ -468,10 +476,7 @@ mod tests {
     /// server's first response line.
     fn send_command(addr: SocketAddr, key: &SigningKey, command: &[u8]) -> String {
         let mut stream = TcpStream::connect(addr).unwrap();
-        assert!(matches!(
-            client_authenticate(&mut stream, key),
-            ResponseKind::ServerReady
-        ));
+        assert_eq!(client_authenticate(&mut stream, key), TAG_SERVER_READY);
         stream.write_all(command).unwrap();
         stream.flush().unwrap();
         let mut reader = BufReader::new(stream);
@@ -673,7 +678,7 @@ mod tests {
 
         let mut stream = TcpStream::connect(addr).unwrap();
         let result = client_authenticate(&mut stream, &trader_key);
-        assert!(matches!(result, ResponseKind::AuthFailed));
+        assert_eq!(result, TAG_AUTH_FAILED);
         assert!(!promote.load(Ordering::Acquire));
         assert!(!rotate.load(Ordering::Acquire));
 

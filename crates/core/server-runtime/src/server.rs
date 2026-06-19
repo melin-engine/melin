@@ -3172,8 +3172,11 @@ mod tests {
     use ed25519_dalek::{Signer, SigningKey};
     use melin_app::auth::AuthorizedKeys;
     use melin_app::auth::Permission;
-    use melin_protocol::codec;
-    use melin_protocol::message::{ConnectionId, Request, ResponseKind};
+    use melin_wire_protocol::control::ConnectionId;
+    use melin_wire_protocol::control_codec::{
+        TAG_AUTH_FAILED, TAG_CHALLENGE, TAG_CHALLENGE_RESPONSE, TAG_RESPONSE_HEARTBEAT,
+        TAG_SERVER_READY,
+    };
 
     use super::authenticate_connection;
     use super::{BootstrapSource, choose_bootstrap};
@@ -3213,9 +3216,9 @@ mod tests {
 
     /// Build an `AuthorizedKeys` containing the test key with the given permission.
     fn keys_with_test_key(perm: &str) -> AuthorizedKeys {
-        // Use melin_protocol's base64 re-export via AuthorizedKeys::parse.
-        // Encode the public key bytes as base64 manually using the simple
-        // alphabet (all test keys produce valid base64).
+        // Encode the public key bytes as base64 with the local helper so
+        // the test has no external codec dependency (all test keys produce
+        // valid base64), then feed it through AuthorizedKeys::parse.
         let pub_bytes = test_key().verifying_key().to_bytes();
         let pub_b64 = base64_encode(&pub_bytes);
         AuthorizedKeys::parse(&format!("{perm} {pub_b64} test\n")).unwrap()
@@ -3268,67 +3271,62 @@ mod tests {
         })
     }
 
-    /// Read a Challenge frame from the client end, sign it, and write
-    /// a ChallengeResponse back.
-    fn client_sign_challenge(stream: &mut UnixStream, key: &SigningKey) {
+    /// Read a length-prefixed Challenge frame and return its 32-byte
+    /// nonce. Frame layout: `[len:u32][TAG_CHALLENGE][nonce:32]`.
+    fn read_challenge(stream: &mut UnixStream) -> [u8; 32] {
         let mut len_buf = [0u8; 4];
-        let mut payload = [0u8; 128];
         stream.read_exact(&mut len_buf).unwrap();
         let len = u32::from_le_bytes(len_buf) as usize;
-        stream.read_exact(&mut payload[..len]).unwrap();
+        let mut payload = vec![0u8; len];
+        stream.read_exact(&mut payload).unwrap();
+        assert_eq!(payload[0], TAG_CHALLENGE, "expected Challenge");
+        payload[1..33].try_into().unwrap()
+    }
 
-        let resp = codec::decode_response(&payload[..len]).unwrap();
-        let nonce = match resp {
-            ResponseKind::Challenge { nonce } => nonce,
-            other => panic!("expected Challenge, got {other:?}"),
-        };
-
-        let sig = key.sign(&nonce);
-        let request = Request::ChallengeResponse {
-            signature: sig.to_bytes(),
-            public_key: key.verifying_key().to_bytes(),
-        };
-        let mut buf = [0u8; 256];
-        let written = codec::encode_request(&request, 0, &mut buf).unwrap();
-        stream.write_all(&buf[..written]).unwrap();
+    /// Write a length-prefixed ChallengeResponse frame, matching the
+    /// layout the runtime's `control_codec::decode_challenge_response`
+    /// expects: `[len:u32][seq:u64][TAG_CHALLENGE_RESPONSE][sig:64][pubkey:32]`.
+    fn write_challenge_response(
+        stream: &mut UnixStream,
+        signature: [u8; 64],
+        public_key: [u8; 32],
+    ) {
+        let mut frame = Vec::with_capacity(105);
+        frame.extend_from_slice(&0u64.to_le_bytes()); // request_seq
+        frame.push(TAG_CHALLENGE_RESPONSE);
+        frame.extend_from_slice(&signature);
+        frame.extend_from_slice(&public_key);
+        stream
+            .write_all(&(frame.len() as u32).to_le_bytes())
+            .unwrap();
+        stream.write_all(&frame).unwrap();
         stream.flush().unwrap();
+    }
+
+    /// Read a Challenge frame from the client end, sign the nonce, and
+    /// write a valid ChallengeResponse back.
+    fn client_sign_challenge(stream: &mut UnixStream, key: &SigningKey) {
+        let nonce = read_challenge(stream);
+        let sig = key.sign(&nonce);
+        write_challenge_response(stream, sig.to_bytes(), key.verifying_key().to_bytes());
     }
 
     /// Like `client_sign_challenge` but corrupts the signature.
     fn client_sign_challenge_bad(stream: &mut UnixStream, key: &SigningKey) {
-        let mut len_buf = [0u8; 4];
-        let mut payload = [0u8; 128];
-        stream.read_exact(&mut len_buf).unwrap();
-        let len = u32::from_le_bytes(len_buf) as usize;
-        stream.read_exact(&mut payload[..len]).unwrap();
-
-        let resp = codec::decode_response(&payload[..len]).unwrap();
-        let nonce = match resp {
-            ResponseKind::Challenge { nonce } => nonce,
-            other => panic!("expected Challenge, got {other:?}"),
-        };
-
+        let nonce = read_challenge(stream);
         let mut sig_bytes = key.sign(&nonce).to_bytes();
         sig_bytes[0] ^= 0xFF;
-
-        let request = Request::ChallengeResponse {
-            signature: sig_bytes,
-            public_key: key.verifying_key().to_bytes(),
-        };
-        let mut buf = [0u8; 256];
-        let written = codec::encode_request(&request, 0, &mut buf).unwrap();
-        stream.write_all(&buf[..written]).unwrap();
-        stream.flush().unwrap();
+        write_challenge_response(stream, sig_bytes, key.verifying_key().to_bytes());
     }
 
-    /// Read one length-prefixed frame and decode as a response.
-    fn read_response(stream: &mut UnixStream) -> ResponseKind {
+    /// Read one length-prefixed control frame and return its tag byte.
+    fn read_response_tag(stream: &mut UnixStream) -> u8 {
         let mut len_buf = [0u8; 4];
         stream.read_exact(&mut len_buf).unwrap();
         let len = u32::from_le_bytes(len_buf) as usize;
-        let mut buf = [0u8; 64];
-        stream.read_exact(&mut buf[..len]).unwrap();
-        codec::decode_response(&buf[..len]).unwrap()
+        let mut buf = vec![0u8; len];
+        stream.read_exact(&mut buf).unwrap();
+        buf[0]
     }
 
     #[test]
@@ -3340,8 +3338,8 @@ mod tests {
         let handle = run_server_auth(s1, keys);
 
         client_sign_challenge(&mut s2, &key);
-        let resp = read_response(&mut s2);
-        assert!(matches!(resp, ResponseKind::ServerReady));
+        let resp = read_response_tag(&mut s2);
+        assert_eq!(resp, TAG_SERVER_READY);
 
         let result = handle.join().unwrap();
         assert_eq!(result.unwrap(), Permission::Trader);
@@ -3356,8 +3354,8 @@ mod tests {
         let handle = run_server_auth(s1, keys);
 
         client_sign_challenge(&mut s2, &key);
-        let resp = read_response(&mut s2);
-        assert!(matches!(resp, ResponseKind::ServerReady));
+        let resp = read_response_tag(&mut s2);
+        assert_eq!(resp, TAG_SERVER_READY);
 
         assert_eq!(handle.join().unwrap().unwrap(), Permission::Operator);
     }
@@ -3371,8 +3369,8 @@ mod tests {
         let handle = run_server_auth(s1, keys);
 
         client_sign_challenge(&mut s2, &key);
-        let resp = read_response(&mut s2);
-        assert!(matches!(resp, ResponseKind::AuthFailed));
+        let resp = read_response_tag(&mut s2);
+        assert_eq!(resp, TAG_AUTH_FAILED);
 
         assert!(handle.join().unwrap().is_err());
     }
@@ -3386,8 +3384,8 @@ mod tests {
         let handle = run_server_auth(s1, keys);
 
         client_sign_challenge_bad(&mut s2, &key);
-        let resp = read_response(&mut s2);
-        assert!(matches!(resp, ResponseKind::AuthFailed));
+        let resp = read_response_tag(&mut s2);
+        assert_eq!(resp, TAG_AUTH_FAILED);
 
         assert!(handle.join().unwrap().is_err());
     }
@@ -3400,20 +3398,20 @@ mod tests {
         let handle = run_server_auth(s1, keys);
 
         // Read and discard the Challenge.
-        let mut len_buf = [0u8; 4];
-        let mut payload = [0u8; 128];
-        s2.read_exact(&mut len_buf).unwrap();
-        let len = u32::from_le_bytes(len_buf) as usize;
-        s2.read_exact(&mut payload[..len]).unwrap();
+        read_challenge(&mut s2);
 
-        // Send a Heartbeat instead of ChallengeResponse.
-        let mut buf = [0u8; 16];
-        let written = codec::encode_request(&Request::Heartbeat, 0, &mut buf).unwrap();
-        s2.write_all(&buf[..written]).unwrap();
+        // Send a frame carrying a transport-heartbeat tag where a
+        // ChallengeResponse is expected. It is the right length (105) so
+        // the auth decoder reaches the tag check and rejects the
+        // unexpected tag, replying AuthFailed.
+        let mut frame = vec![0u8; 105];
+        frame[8] = TAG_RESPONSE_HEARTBEAT; // tag byte sits after the u64 seq
+        s2.write_all(&(frame.len() as u32).to_le_bytes()).unwrap();
+        s2.write_all(&frame).unwrap();
         s2.flush().unwrap();
 
-        let resp = read_response(&mut s2);
-        assert!(matches!(resp, ResponseKind::AuthFailed));
+        let resp = read_response_tag(&mut s2);
+        assert_eq!(resp, TAG_AUTH_FAILED);
 
         assert!(handle.join().unwrap().is_err());
     }
@@ -3441,8 +3439,8 @@ mod tests {
         let handle = run_server_auth(s1, keys);
 
         client_sign_challenge(&mut s2, &wrong_key);
-        let resp = read_response(&mut s2);
-        assert!(matches!(resp, ResponseKind::AuthFailed));
+        let resp = read_response_tag(&mut s2);
+        assert_eq!(resp, TAG_AUTH_FAILED);
 
         assert!(handle.join().unwrap().is_err());
     }
@@ -3455,11 +3453,7 @@ mod tests {
         let handle = run_server_auth(s1, keys);
 
         // Read and discard Challenge.
-        let mut len_buf = [0u8; 4];
-        let mut payload = [0u8; 128];
-        s2.read_exact(&mut len_buf).unwrap();
-        let len = u32::from_le_bytes(len_buf) as usize;
-        s2.read_exact(&mut payload[..len]).unwrap();
+        read_challenge(&mut s2);
 
         // Send a frame claiming to be 1000 bytes (way over the 256 limit).
         let fake_len: u32 = 1000;
@@ -3467,8 +3461,8 @@ mod tests {
         s2.flush().unwrap();
 
         // Server should send AuthFailed before dropping.
-        let resp = read_response(&mut s2);
-        assert!(matches!(resp, ResponseKind::AuthFailed));
+        let resp = read_response_tag(&mut s2);
+        assert_eq!(resp, TAG_AUTH_FAILED);
 
         assert!(handle.join().unwrap().is_err());
     }
@@ -3481,11 +3475,7 @@ mod tests {
         let handle = run_server_auth(s1, keys);
 
         // Read and discard Challenge.
-        let mut len_buf = [0u8; 4];
-        let mut payload = [0u8; 128];
-        s2.read_exact(&mut len_buf).unwrap();
-        let len = u32::from_le_bytes(len_buf) as usize;
-        s2.read_exact(&mut payload[..len]).unwrap();
+        read_challenge(&mut s2);
 
         // Send a zero-length frame — decode_request will fail on empty input.
         let zero_len: u32 = 0;
@@ -3493,8 +3483,8 @@ mod tests {
         s2.flush().unwrap();
 
         // Server should send AuthFailed before dropping.
-        let resp = read_response(&mut s2);
-        assert!(matches!(resp, ResponseKind::AuthFailed));
+        let resp = read_response_tag(&mut s2);
+        assert_eq!(resp, TAG_AUTH_FAILED);
 
         assert!(handle.join().unwrap().is_err());
     }
@@ -3508,8 +3498,8 @@ mod tests {
         let handle = run_server_auth(s1, keys);
 
         client_sign_challenge(&mut s2, &key);
-        let resp = read_response(&mut s2);
-        assert!(matches!(resp, ResponseKind::ServerReady));
+        let resp = read_response_tag(&mut s2);
+        assert_eq!(resp, TAG_SERVER_READY);
 
         let perm = handle.join().unwrap().unwrap();
         assert_eq!(perm, Permission::ReadOnly);
