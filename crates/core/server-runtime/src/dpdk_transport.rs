@@ -544,6 +544,14 @@ pub fn run_dpdk_poll<A: Application>(
                 continue;
             }
 
+            // Trace timestamp: the moment `recv_into_vec` handed us these
+            // bytes. Captured once per recv — not per frame — and stamped
+            // onto every InputSlot parsed below, so the reader-ingest and
+            // server-e2e stages measure from true wire receipt (frame decode
+            // included) rather than re-sampling after each decode.
+            #[allow(clippy::let_unit_value)] // ZST when latency-trace is off
+            let recv_ts = melin_transport_core::trace::mono_trace_ns();
+
             // Process frames based on auth state.
             let was_waiting = matches!(conn.auth, AuthState::WaitingForResponse { .. });
             match &conn.auth {
@@ -569,6 +577,7 @@ pub fn run_dpdk_poll<A: Application>(
                         &mut producer,
                         &*decoder,
                         *batch_wall_ns.get_or_insert_with(unix_epoch_nanos),
+                        recv_ts,
                         #[cfg(feature = "latency-trace")]
                         &mut publish_rec,
                         #[cfg(feature = "tick-to-trade")]

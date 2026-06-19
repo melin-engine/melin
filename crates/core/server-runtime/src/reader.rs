@@ -570,6 +570,16 @@ fn reader_loop<A: Application, R: AsRawFd>(
 
             let n = result as usize;
 
+            // Trace timestamp: the moment the kernel handed us this recv's
+            // bytes. Captured once per CQE — not per frame — and stamped
+            // onto every InputSlot parsed from this buffer below, so the
+            // reader-ingest and server-e2e stages measure from true wire
+            // receipt (frame decode included) rather than re-sampling after
+            // each decode (which excluded decode and drifted forward for
+            // later frames in a multi-frame recv).
+            #[allow(clippy::let_unit_value)] // ZST when latency-trace is off
+            let recv_ts = melin_transport_core::trace::mono_trace_ns();
+
             // Extract the buffer ID from the CQE flags. The kernel sets
             // IORING_CQE_F_BUFFER and encodes the buffer ID in bits 16-31.
             let buf_id = if (flags & IORING_CQE_F_BUFFER) != 0 {
@@ -603,6 +613,7 @@ fn reader_loop<A: Application, R: AsRawFd>(
                     decoder,
                     &server_busy_frame,
                     batch_wall_ns,
+                    recv_ts,
                     #[cfg(feature = "latency-trace")]
                     &mut publish_rec,
                     #[cfg(feature = "tick-to-trade")]
@@ -788,6 +799,7 @@ fn process_frames<A: Application, R>(
     decoder: &dyn RequestDecoder<Event = A::Event>,
     server_busy_frame: &[u8; 5],
     batch_wall_ns: u64,
+    recv_ts: melin_transport_core::trace::MonoTraceInstant,
     #[cfg(feature = "latency-trace")] publish_rec: &mut melin_transport_core::trace::StageRecorder,
     #[cfg(feature = "tick-to-trade")] ingest_rec: &mut melin_transport_core::trace::StageRecorder,
 ) -> bool {
@@ -801,6 +813,7 @@ fn process_frames<A: Application, R>(
         producer,
         decoder,
         batch_wall_ns,
+        recv_ts,
         #[cfg(feature = "latency-trace")]
         publish_rec,
         #[cfg(feature = "tick-to-trade")]
@@ -1023,12 +1036,16 @@ mod tests {
         #[cfg(feature = "tick-to-trade")]
         let mut ingest_rec = melin_transport_core::trace::register_stage("test: ingest");
 
+        #[allow(clippy::let_unit_value)] // ZST when latency-trace is off
+        let recv_ts = melin_transport_core::trace::mono_trace_ns();
+
         process_frames::<TestApp, UnixStream>(
             conn,
             producer,
             &TagDecoder,
             &TEST_SERVER_BUSY,
             0xDEAD_BEEF,
+            recv_ts,
             #[cfg(feature = "latency-trace")]
             &mut publish_rec,
             #[cfg(feature = "tick-to-trade")]
@@ -1096,6 +1113,57 @@ mod tests {
             read_server_busy(&mut peer).is_none(),
             "ServerBusy must not be sent on the happy path"
         );
+    }
+
+    /// The caller stamps `recv_ts` once per recv (at the kernel-return
+    /// site) and every frame parsed from that buffer must carry that exact
+    /// value. Guards against a regression to per-frame `recv_ts` capture,
+    /// which excluded decode from the reader-ingest / server-e2e windows
+    /// and drifted forward for later frames in a multi-frame recv. Gated on
+    /// `latency-trace` because `recv_ts` is a real `u64` only then (`()`
+    /// otherwise, leaving nothing to assert).
+    #[cfg(feature = "latency-trace")]
+    #[test]
+    fn process_frames_stamps_every_slot_with_caller_recv_ts() {
+        let Fixture {
+            mut conn,
+            mut producer,
+            mut consumer,
+            ..
+        } = make_fixture(16);
+        for byte in [0x01, 0x02, 0x03, 0x04] {
+            conn.parse_buf.extend_from_slice(&frame(byte));
+        }
+
+        // A recognizable sentinel the caller would have captured at the
+        // recv site; distinct from the wall-clock stamp (0xDEAD_BEEF).
+        const RECV_TS: u64 = 0x5EED_5EED;
+
+        let mut publish_rec = melin_transport_core::trace::register_stage("test: publish recv_ts");
+        #[cfg(feature = "tick-to-trade")]
+        let mut ingest_rec = melin_transport_core::trace::register_stage("test: ingest recv_ts");
+
+        let disconnect = process_frames::<TestApp, UnixStream>(
+            &mut conn,
+            &mut producer,
+            &TagDecoder,
+            &TEST_SERVER_BUSY,
+            0xDEAD_BEEF,
+            RECV_TS,
+            &mut publish_rec,
+            #[cfg(feature = "tick-to-trade")]
+            &mut ingest_rec,
+        );
+        assert!(!disconnect);
+
+        let events = drain(&mut consumer);
+        assert_eq!(events.len(), 4, "all frames published");
+        for (_seq, slot) in &events {
+            assert_eq!(
+                slot.recv_ts, RECV_TS,
+                "every frame from one recv shares the single caller-supplied recv_ts"
+            );
+        }
     }
 
     #[test]
