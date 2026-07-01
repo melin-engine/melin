@@ -27,6 +27,14 @@ use crate::storage::FileStorage;
 pub const HEARTBEAT_TICKS: usize = 2;
 pub const ELECTION_TICKS: usize = 10;
 
+/// Applied log entries older than this many indexes behind the applied
+/// index are compacted away. Bounds the state file (every mutation
+/// rewrites the whole log) while leaving a buffer so a briefly-lagging
+/// follower catches up via appends rather than a snapshot. A few hundred
+/// entries is negligible on disk and covers realistic control-plane
+/// lag at election/config cadence.
+const LOG_RETENTION: u64 = 512;
+
 /// One control-plane Raft peer.
 pub struct ControlNode {
     raw: RawNode<FileStorage>,
@@ -186,7 +194,27 @@ impl ControlNode {
         self.apply_committed(committed, &mut out)?;
         self.raw.advance_apply();
 
+        self.maybe_compact()?;
+
         Ok(out)
+    }
+
+    /// Discard applied log entries older than the retention window so
+    /// the log — and the whole-file state rewrite on every mutation —
+    /// stays bounded rather than growing for the life of the
+    /// deployment. Keeps [`LOG_RETENTION`] entries behind the applied
+    /// index so a briefly-lagging follower still catches up via appends;
+    /// one further behind gets a snapshot (metadata-only here, which is
+    /// sufficient — the control-plane "state" is just membership + term,
+    /// both carried in the snapshot). `compact` is a no-op (no fsync)
+    /// when there is nothing old enough to drop, so this is cheap on the
+    /// common path.
+    fn maybe_compact(&mut self) -> io::Result<()> {
+        let applied = self.raw.raft.raft_log.applied();
+        let Some(target) = applied.checked_sub(LOG_RETENTION) else {
+            return Ok(()); // fewer than a window's worth applied yet
+        };
+        self.raw.mut_store().compact(target)
     }
 
     /// Apply a batch of committed entries: conf changes mutate raft +
