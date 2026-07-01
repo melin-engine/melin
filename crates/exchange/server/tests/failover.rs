@@ -3751,3 +3751,203 @@ fn higher_epoch_handshake_fences_stale_primary() {
         "stale primary was not fenced by the higher-epoch handshake"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Control-plane raft election (phase 1: election + observability only;
+// promotion stays operator-driven until auto-promotion lands)
+// ---------------------------------------------------------------------------
+
+/// Fetch one `melin_raft_*` gauge from the Prometheus metrics endpoint.
+/// Returns `None` while the endpoint or the gauge is unavailable.
+fn fetch_raft_gauge(addr: SocketAddr, gauge: &str) -> Option<u64> {
+    let mut stream = TcpStream::connect_timeout(&addr, Duration::from_secs(1)).ok()?;
+    stream.set_read_timeout(Some(Duration::from_secs(2))).ok()?;
+    stream.write_all(b"GET /metrics HTTP/1.1\r\n\r\n").ok()?;
+    let mut body = Vec::new();
+    stream.read_to_end(&mut body).ok()?;
+    let text = std::str::from_utf8(&body).ok()?;
+    let prefix = format!("melin_raft_{gauge} ");
+    for line in text.lines() {
+        if let Some(rest) = line.strip_prefix(&prefix) {
+            return rest.trim().parse().ok();
+        }
+    }
+    None
+}
+
+/// Spawn a standalone (no data-plane replication) server with the
+/// control-plane raft driver enabled. All nodes share one replication
+/// key — peer auth identifies the cluster, node identity is the raft id.
+#[allow(clippy::too_many_arguments)]
+fn spawn_raft_standalone(
+    bin: &Path,
+    tmp_dir: &Path,
+    keys_path: &Path,
+    repl_key_path: &Path,
+    node_id: u64,
+    client_port: u16,
+    health_port: u16,
+    raft_port: u16,
+    peers: &[(u64, u16)],
+) -> ServerProcess {
+    let journal = tmp_dir.join(format!("raft-node-{node_id}.journal"));
+    let mut args: Vec<String> = vec![
+        "--bind".into(),
+        format!("127.0.0.1:{client_port}"),
+        "--health-bind".into(),
+        format!("127.0.0.1:{health_port}"),
+        "--journal".into(),
+        journal.to_str().expect("valid path").into(),
+        "--authorized-keys".into(),
+        keys_path.to_str().expect("valid path").into(),
+        "--standalone".into(),
+        "--durability-mode".into(),
+        "local".into(),
+        "--accounts".into(),
+        "10".into(),
+        "--instruments".into(),
+        "2".into(),
+        "--connection-timeout-secs".into(),
+        "0".into(),
+        "--yield-idle".into(),
+        "--cores".into(),
+        "0,0,0,0,0,0,0,0,0".into(),
+        "--raft-bind".into(),
+        format!("127.0.0.1:{raft_port}"),
+        "--raft-node-id".into(),
+        node_id.to_string(),
+        "--replication-key".into(),
+        repl_key_path.to_str().expect("valid path").into(),
+    ];
+    for (peer_id, peer_port) in peers {
+        args.push("--raft-peer".into());
+        args.push(format!("{peer_id}@127.0.0.1:{peer_port}"));
+    }
+    let child = Command::new(bin)
+        .args(&args)
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .env("MELIN_JOURNAL_PREALLOC_MIB", "4")
+        .spawn()
+        .expect("spawn raft standalone server");
+    ServerProcess {
+        child,
+        client_addr: format!("127.0.0.1:{client_port}").parse().unwrap(),
+        health_addr: format!("127.0.0.1:{health_port}").parse().unwrap(),
+    }
+}
+
+/// Poll every live node's metrics until exactly one reports itself
+/// leader and every live node agrees on that leader's id. Returns
+/// `(leader_node_id, term)`.
+fn wait_for_raft_leader(nodes: &[(u64, SocketAddr)], timeout: Duration) -> (u64, u64) {
+    let start = Instant::now();
+    loop {
+        let leaders: Vec<(u64, u64)> = nodes
+            .iter()
+            .filter_map(|&(id, health)| {
+                (fetch_raft_gauge(health, "is_leader")? == 1).then_some(())?;
+                Some((id, fetch_raft_gauge(health, "term")?))
+            })
+            .collect();
+        if let [(leader, term)] = leaders.as_slice() {
+            let agreed = nodes
+                .iter()
+                .all(|&(_, health)| fetch_raft_gauge(health, "leader_id") == Some(*leader));
+            if agreed {
+                return (*leader, *term);
+            }
+        }
+        assert!(
+            start.elapsed() < timeout,
+            "no agreed raft leader within {timeout:?} (self-reported leaders: {leaders:?})"
+        );
+        std::thread::sleep(Duration::from_millis(200));
+    }
+}
+
+/// Three raft-enabled nodes elect exactly one leader; killing that
+/// leader's process makes the surviving quorum elect a new one at a
+/// strictly higher term (the epoch guarantee auto-promotion will build
+/// on).
+#[test]
+fn raft_elects_leader_and_reelects_after_kill() {
+    let bin = server_bin();
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let trader_key = SigningKey::from_bytes(&[7u8; 32]);
+    let operator_key = SigningKey::from_bytes(&[8u8; 32]);
+    let repl_key = SigningKey::from_bytes(&[9u8; 32]);
+    let (keys_path, repl_key_path) =
+        write_auth_keys_multi(tmp.path(), &[&trader_key], &operator_key, &repl_key);
+
+    let ids = [1u64, 2, 3];
+    let client_ports: Vec<u16> = ids.iter().map(|_| free_port()).collect();
+    let health_ports: Vec<u16> = ids.iter().map(|_| free_port()).collect();
+    let raft_ports: Vec<u16> = ids.iter().map(|_| free_port()).collect();
+
+    let mut nodes: std::collections::HashMap<u64, ServerProcess> = ids
+        .iter()
+        .enumerate()
+        .map(|(i, &id)| {
+            let peers: Vec<(u64, u16)> = ids
+                .iter()
+                .enumerate()
+                .filter(|&(_, &p)| p != id)
+                .map(|(j, &p)| (p, raft_ports[j]))
+                .collect();
+            let process = spawn_raft_standalone(
+                &bin,
+                tmp.path(),
+                &keys_path,
+                &repl_key_path,
+                id,
+                client_ports[i],
+                health_ports[i],
+                raft_ports[i],
+                &peers,
+            );
+            (id, process)
+        })
+        .collect();
+
+    let health_of: Vec<(u64, SocketAddr)> = ids
+        .iter()
+        .enumerate()
+        .map(|(i, &id)| {
+            (
+                id,
+                format!("127.0.0.1:{}", health_ports[i]).parse().unwrap(),
+            )
+        })
+        .collect();
+    for &(_, health) in &health_of {
+        wait_ready(health, Duration::from_secs(30));
+    }
+
+    // Phase 1: a single agreed leader emerges.
+    let (first_leader, first_term) = wait_for_raft_leader(&health_of, Duration::from_secs(30));
+    assert!(first_term >= 1);
+
+    // Phase 2: kill the leader; the surviving pair re-elects at a
+    // strictly higher term.
+    let mut killed = nodes.remove(&first_leader).expect("leader process");
+    unsafe {
+        libc::kill(killed.child.id() as i32, libc::SIGKILL);
+    }
+    let _ = killed.child.wait();
+
+    let survivors: Vec<(u64, SocketAddr)> = health_of
+        .iter()
+        .copied()
+        .filter(|(id, _)| *id != first_leader)
+        .collect();
+    let (second_leader, second_term) = wait_for_raft_leader(&survivors, Duration::from_secs(30));
+    assert_ne!(second_leader, first_leader);
+    assert!(
+        second_term > first_term,
+        "re-election must advance the term ({second_term} vs {first_term})"
+    );
+
+    // `nodes` dropping SIGKILLs the survivors.
+    drop(nodes);
+}

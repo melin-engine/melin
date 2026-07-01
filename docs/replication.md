@@ -421,13 +421,33 @@ that never hears from a higher-epoch node (e.g. fully partitioned with
 its own replica set) also keeps trading until the partition heals —
 fencing triggers on contact, not on a timer.
 
-### No automatic failover
+### No automatic failover (election shipped, promotion still manual)
 
-Promotion is operator-driven via the `--admin-bind` endpoint. Leader
-election and automatic promotion are on the roadmap, built on a
-control-plane Raft integration: Raft carries election, membership,
-and fencing epochs only, while order flow stays on the existing
-replication path and keeps the durability modes unchanged.
+Promotion is operator-driven via the `--admin-bind` endpoint. The
+first phase of the control-plane Raft integration has landed: nodes
+configured with `--raft-bind`, `--raft-node-id`, and `--raft-peer`
+run leader election among themselves and expose the outcome through
+the metrics endpoint (`melin_raft_term`, `melin_raft_leader_id`,
+`melin_raft_role`, `melin_raft_is_leader`), so monitoring can already
+observe which node the cluster would elect. Raft carries election,
+membership, and (in a later phase) fencing-epoch allocation only —
+order flow stays on the existing replication path and the durability
+modes are unchanged. The control plane is deliberately unhurried:
+~200 ms heartbeats, 1–2 s election timeouts, and vote requests from
+nodes whose journal is behind the voter's are refused, so the
+most-caught-up node wins.
+
+In this phase election is **observational**: it does not trigger
+promotion, and the manual `PROMOTE` playbook (including the
+"promote exactly one replica" rule above) remains authoritative.
+Configuration propagation and automatic promotion build on it next.
+
+Peer links authenticate with the cluster's replication keys, so every
+node's key must carry `replication` permission in every other node's
+`authorized_keys` file, and each raft node needs `--replication-key`.
+Durable election state (term, vote) lives in `--raft-dir` (default:
+`<journal>.raft/`); treat it like the journal — never wipe or share
+it on a live cluster, or a node can vote twice in one term.
 
 ### No offline journal inspector
 

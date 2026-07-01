@@ -85,7 +85,7 @@ pub(super) fn verify_challenge_response(
 /// complete within the stream's existing read timeout. The DPDK sender runs
 /// the same exchange non-blocking on its poll loop, reusing
 /// [`generate_challenge_nonce`] and [`verify_challenge_response`].
-pub(super) fn authenticate_replica<S: Read + Write>(
+pub(crate) fn authenticate_replica<S: Read + Write>(
     stream: &mut S,
     authorized_keys: &melin_app::auth::AuthorizedKeys,
 ) -> io::Result<()> {
@@ -121,7 +121,7 @@ pub(super) fn authenticate_replica<S: Read + Write>(
 ///
 /// Reads the nonce challenge, signs it with the replica's private key,
 /// sends the response, and waits for AuthOk/AuthFailed.
-pub(super) fn authenticate_with_primary<S: Read + Write>(
+pub(crate) fn authenticate_with_primary<S: Read + Write>(
     stream: &mut S,
     signing_key: &ed25519_dalek::SigningKey,
 ) -> io::Result<()> {

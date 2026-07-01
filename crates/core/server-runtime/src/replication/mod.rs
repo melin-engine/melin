@@ -68,7 +68,10 @@ use melin_transport_core::pipeline::{InputSlot, OutputSlot};
 use melin_transport_core::replication::archive::{ArchiveReason, archive_local_lineage};
 use melin_transport_core::replication::protocol::{MAX_CONTROL_FRAME, decode_primary_message};
 
-mod auth;
+// `pub(crate)`: the raft driver reuses the replication-key
+// challenge-response for control-plane peer auth (same trust domain —
+// cluster-internal links authenticated by `replication` keys).
+pub(crate) mod auth;
 #[cfg(feature = "dpdk")]
 mod dpdk;
 mod receiver_transport;

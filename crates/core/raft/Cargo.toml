@@ -1,0 +1,32 @@
+[package]
+name = "melin-raft"
+version = "0.11.0"
+edition = "2024"
+license-file.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+description = "Control-plane Raft — leader election, membership, and fencing-epoch allocation (order flow stays on the replication data plane)"
+
+[lib]
+name = "melin_raft"
+path = "src/lib.rs"
+
+[dependencies]
+# tikv's etcd-lineage Raft state machine. Caller-driven (tick/step/ready
+# on our own thread — no async runtime), PreVote + CheckQuorum, joint
+# consensus. Pinned to a master rev rather than crates.io 0.7.0 (2023):
+# master removed the deprecated rust-protobuf path under `prost-codec`
+# and carries three years of fixes. The rev is locked in Cargo.lock.
+raft = { git = "https://github.com/tikv/raft-rs.git", rev = "ad13f3d90780f53aea2488c6a4b76c0d334bf136", default-features = false, features = ["prost-codec"] }
+# raft-rs's mandatory logging facade; bridged into `tracing` in
+# `slog_bridge.rs` so the rest of the codebase keeps one logging system.
+slog = "2"
+# Same major as raft-proto's codec: needed to decode `ConfChange`
+# payloads out of committed entries and to frame `Message`s on the wire.
+prost = "0.11"
+crc32c = "0.6"
+tracing = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"

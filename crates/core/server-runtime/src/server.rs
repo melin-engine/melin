@@ -340,6 +340,36 @@ pub struct ServerConfig {
     #[arg(long)]
     pub admin_bind: Option<SocketAddr>,
 
+    /// TCP address for control-plane raft peer RPC (leader election,
+    /// membership, fencing-epoch allocation — order flow stays on the
+    /// replication data plane). Enables the raft driver; requires
+    /// `--raft-node-id` and `--replication-key` (peer links
+    /// authenticate with the cluster's replication keys). Unset means
+    /// no control-plane raft (today's operator-driven promotion only).
+    #[arg(long)]
+    pub raft_bind: Option<SocketAddr>,
+
+    /// This node's raft id (non-zero; 0 is raft's "invalid" sentinel).
+    /// Must be unique across the cluster and stable across restarts —
+    /// the durable raft state in `--raft-dir` belongs to this id.
+    #[arg(long)]
+    pub raft_node_id: Option<u64>,
+
+    /// One entry per *other* cluster node, as `<id>@<host:port>`
+    /// (repeatable, or comma-separated). The port is the peer's
+    /// `--raft-bind`. Every node must be configured with the same
+    /// total membership (its own id plus its peers); the initial
+    /// voter set is derived from it on first boot.
+    #[arg(long, value_delimiter = ',')]
+    pub raft_peer: Vec<String>,
+
+    /// Directory for the durable raft state file (term, vote, log).
+    /// Defaults to `<journal>.raft/` next to the journal. Loss of this
+    /// directory forgets the node's vote — never share or wipe it on a
+    /// live cluster.
+    #[arg(long)]
+    pub raft_dir: Option<PathBuf>,
+
     /// Interval in milliseconds between automatic shadow snapshots. The
     /// shadow stage replays journaled events on a cloned `A` and saves a
     /// consistent snapshot at this cadence — no hot-path stall. Set to 0
@@ -446,6 +476,10 @@ impl Default for ServerConfig {
             event_bind: None,
             health_bind: Some(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 9878)),
             admin_bind: None,
+            raft_bind: None,
+            raft_node_id: None,
+            raft_peer: Vec::new(),
+            raft_dir: None,
             snapshot_interval_ms: 3_000_000,
             snapshot_path: None,
             tick_interval_ms: 250,
@@ -757,25 +791,7 @@ where
         let replication_key_path = config.replication_key.as_ref().ok_or_else(|| {
             std::io::Error::other("--replication-key is required in replica mode (--replica-of)")
         })?;
-        let signing_key = {
-            let seed = std::fs::read(replication_key_path).map_err(|e| {
-                std::io::Error::other(format!(
-                    "failed to read replication key {}: {e}",
-                    replication_key_path.display()
-                ))
-            })?;
-            if seed.len() != 32 {
-                return Err(format!(
-                    "replication key must be 32 bytes, got {} ({})",
-                    seed.len(),
-                    replication_key_path.display()
-                )
-                .into());
-            }
-            let mut bytes = [0u8; 32];
-            bytes.copy_from_slice(&seed);
-            ed25519_dalek::SigningKey::from_bytes(&bytes)
-        };
+        let signing_key = load_replication_key(replication_key_path)?;
 
         // Load authorized keys early — the admin listener needs them for
         // Ed25519 challenge-response auth (operator keys only).
@@ -810,6 +826,12 @@ where
         // replication stream, and a promotion bumps it by injecting an
         // `EpochBump`. Carried into `run_as_primary` post-promotion.
         let fence_state = Arc::new(melin_transport_core::fence::FenceState::new(0));
+
+        // Control-plane raft, spawned before mode detection for the
+        // same reason as the admin flags: the driver keeps running
+        // across a replica → primary promotion (leadership is a
+        // property of the node, not of its current data-plane role).
+        let raft_status = spawn_raft_driver(&config, &authorized_keys, &fence_state, &shutdown)?;
 
         // No local rotation triggers on the replica side: segment
         // rotation is primary-driven (the replica adopts the boundaries
@@ -863,6 +885,7 @@ where
                     rotate_flag,
                     durability_mode_atomic,
                     fence_state,
+                    raft_status,
                     true, // promoted — inject an EpochBump before serving
                 );
             }
@@ -908,6 +931,8 @@ where
         recovered_epoch,
     ));
 
+    let raft_status = spawn_raft_driver(&config, &authorized_keys, &fence_state, &shutdown)?;
+
     run_as_primary::<A, L, W>(
         exchange,
         writer,
@@ -923,6 +948,7 @@ where
         rotate_flag,
         durability_mode_atomic,
         fence_state,
+        raft_status,
         false, // not promoted — no EpochBump injection
     )
 }
@@ -1042,6 +1068,7 @@ fn run_as_primary<A, L, W>(
     rotate_flag: Option<Arc<AtomicBool>>,
     durability_mode_atomic: Arc<AtomicU8>,
     fence_state: Arc<melin_transport_core::fence::FenceState>,
+    raft_status: Option<Arc<melin_transport_core::health::RaftStatus>>,
     promoted: bool,
 ) -> Result<(), Box<dyn std::error::Error>>
 where
@@ -1446,6 +1473,7 @@ where
         &journal_utilization,
         &matching_utilization,
         &response_utilization,
+        &raft_status,
         &shutdown,
     )?;
 
@@ -1942,25 +1970,7 @@ where
         let replication_key_path = config.replication_key.as_ref().ok_or_else(|| {
             std::io::Error::other("--replication-key is required in replica mode (--replica-of)")
         })?;
-        let signing_key = {
-            let seed = std::fs::read(replication_key_path).map_err(|e| {
-                std::io::Error::other(format!(
-                    "failed to read replication key {}: {e}",
-                    replication_key_path.display()
-                ))
-            })?;
-            if seed.len() != 32 {
-                return Err(format!(
-                    "replication key must be 32 bytes, got {} ({})",
-                    seed.len(),
-                    replication_key_path.display()
-                )
-                .into());
-            }
-            let mut bytes = [0u8; 32];
-            bytes.copy_from_slice(&seed);
-            ed25519_dalek::SigningKey::from_bytes(&bytes)
-        };
+        let signing_key = load_replication_key(replication_key_path)?;
 
         // Shared admin flags, same shape as the kernel TCP replica path
         // — see `run` for the rationale on lifetime.
@@ -1983,6 +1993,11 @@ where
         // replication stream, and a promotion bumps it by injecting an
         // `EpochBump`. Carried into `run_as_primary` post-promotion.
         let fence_state = Arc::new(melin_transport_core::fence::FenceState::new(0));
+
+        // Control-plane raft runs on kernel TCP even on DPDK nodes —
+        // the control plane is latency-insensitive and must survive
+        // independently of the DPDK data path.
+        let raft_status = spawn_raft_driver(&config, &authorized_keys, &fence_state, &shutdown)?;
 
         // No local rotation triggers on the replica side — rotation is
         // primary-driven (see the kernel-TCP receiver path).
@@ -2053,6 +2068,7 @@ where
                     rotate_flag,
                     durability_mode_atomic,
                     fence_state,
+                    raft_status,
                     true, // promoted — inject an EpochBump before serving
                 );
             }
@@ -2096,6 +2112,10 @@ where
     let fence_state = Arc::new(melin_transport_core::fence::FenceState::new(
         recovered_epoch,
     ));
+
+    // Control-plane raft runs on kernel TCP even on DPDK nodes — see
+    // the DPDK replica path for the rationale.
+    let raft_status = spawn_raft_driver(&config, &authorized_keys, &fence_state, &shutdown)?;
 
     // Clone exchange state for the shadow snapshot stage before moving
     // exchange into the pipeline (same as the kernel TCP path).
@@ -2518,6 +2538,7 @@ where
         &journal_utilization,
         &matching_utilization,
         &response_utilization,
+        &raft_status,
         &shutdown,
     )?;
 
@@ -2852,6 +2873,7 @@ fn spawn_health_endpoint(
     journal_utilization: &Arc<melin_transport_core::pipeline::StageUtilization>,
     matching_utilization: &Arc<melin_transport_core::pipeline::StageUtilization>,
     response_utilization: &Arc<melin_transport_core::pipeline::StageUtilization>,
+    raft_status: &Option<Arc<melin_transport_core::health::RaftStatus>>,
     shutdown: &Arc<AtomicBool>,
 ) -> Result<Option<std::thread::JoinHandle<()>>, Box<dyn std::error::Error>> {
     let Some(health_addr) = config.health_bind else {
@@ -2894,9 +2916,144 @@ fn spawn_health_endpoint(
             journal_utilization: Arc::clone(journal_utilization),
             matching_utilization: Arc::clone(matching_utilization),
             response_utilization: Arc::clone(response_utilization),
+            raft: raft_status.clone(),
         },
         Arc::clone(shutdown),
     )?))
+}
+
+/// Parse and validate the `--raft-*` CLI surface into a driver config.
+/// Returns `Ok(None)` when control-plane raft is not configured;
+/// partial configuration is a hard startup error, never a silent
+/// no-raft fallback.
+fn build_raft_config(
+    config: &ServerConfig,
+) -> Result<Option<(SocketAddr, crate::raft_driver::RaftDriverConfig)>, Box<dyn std::error::Error>>
+{
+    let Some(bind) = config.raft_bind else {
+        if config.raft_node_id.is_some() || !config.raft_peer.is_empty() {
+            return Err(
+                "--raft-node-id/--raft-peer require --raft-bind (control-plane raft is \
+                 enabled by binding its RPC address)"
+                    .into(),
+            );
+        }
+        return Ok(None);
+    };
+    let node_id = config
+        .raft_node_id
+        .ok_or("--raft-bind requires --raft-node-id")?;
+    if node_id == 0 {
+        return Err("--raft-node-id must be non-zero (0 is raft's invalid-id sentinel)".into());
+    }
+    if config.replication_key.is_none() {
+        return Err(
+            "--raft-bind requires --replication-key (peer links authenticate with the \
+             cluster's replication keys)"
+                .into(),
+        );
+    }
+
+    let mut peers = Vec::with_capacity(config.raft_peer.len());
+    let mut voters = vec![node_id];
+    for entry in &config.raft_peer {
+        let (id_str, addr_str) = entry
+            .split_once('@')
+            .ok_or_else(|| format!("--raft-peer `{entry}` is not of the form <id>@<host:port>"))?;
+        let peer_id: u64 = id_str
+            .parse()
+            .map_err(|e| format!("--raft-peer `{entry}`: bad node id: {e}"))?;
+        let addr: SocketAddr = addr_str
+            .parse()
+            .map_err(|e| format!("--raft-peer `{entry}`: bad address: {e}"))?;
+        if peer_id == 0 {
+            return Err(format!("--raft-peer `{entry}`: node id must be non-zero").into());
+        }
+        if peer_id == node_id || voters.contains(&peer_id) {
+            return Err(format!("--raft-peer `{entry}`: duplicate node id {peer_id}").into());
+        }
+        voters.push(peer_id);
+        peers.push((peer_id, addr));
+    }
+    // Deterministic voter order so every node bootstraps the identical
+    // initial membership regardless of flag order.
+    voters.sort_unstable();
+
+    // Default raft dir: a sibling of the journal, so the durable vote
+    // lives on the same volume/backup policy as the journal itself.
+    let dir = config.raft_dir.clone().unwrap_or_else(|| {
+        let mut os = config.journal.clone().into_os_string();
+        os.push(".raft");
+        PathBuf::from(os)
+    });
+
+    Ok(Some((
+        bind,
+        crate::raft_driver::RaftDriverConfig {
+            node_id,
+            voters,
+            peers,
+            dir,
+        },
+    )))
+}
+
+/// Spawn the control-plane raft driver if configured. Returns the
+/// election-status gauges for the health endpoint (`None` when raft is
+/// disabled). The join handle is deliberately dropped — like the admin
+/// listener, the driver parks on the shared `shutdown` flag and the
+/// process teardown does not join control-plane threads.
+fn spawn_raft_driver(
+    config: &ServerConfig,
+    authorized_keys: &Arc<AuthorizedKeys>,
+    fence_state: &Arc<melin_transport_core::fence::FenceState>,
+    shutdown: &Arc<AtomicBool>,
+) -> Result<Option<Arc<melin_transport_core::health::RaftStatus>>, Box<dyn std::error::Error>> {
+    let Some((bind, driver_config)) = build_raft_config(config)? else {
+        return Ok(None);
+    };
+    // Presence enforced by `build_raft_config`.
+    let key_path = config
+        .replication_key
+        .as_ref()
+        .ok_or("--raft-bind requires --replication-key")?;
+    let signing_key = load_replication_key(key_path)?;
+    let status = Arc::new(melin_transport_core::health::RaftStatus::new(
+        driver_config.node_id,
+    ));
+    crate::raft_driver::spawn(
+        bind,
+        driver_config,
+        crate::raft_driver::RaftDriverContext {
+            signing_key,
+            authorized_keys: Arc::clone(authorized_keys),
+            fence_state: Arc::clone(fence_state),
+            status: Arc::clone(&status),
+            shutdown: Arc::clone(shutdown),
+        },
+    )?;
+    Ok(Some(status))
+}
+
+/// Load a 32-byte Ed25519 seed from `path`. Shared by the replica's
+/// replication handshake and the raft driver's peer auth (same key,
+/// same trust domain).
+fn load_replication_key(
+    path: &std::path::Path,
+) -> Result<ed25519_dalek::SigningKey, Box<dyn std::error::Error>> {
+    let seed = std::fs::read(path)
+        .map_err(|e| format!("failed to read replication key {}: {e}", path.display()))?;
+    if seed.len() != 32 {
+        return Err(format!(
+            "replication key must be 32 bytes, got {} ({})",
+            seed.len(),
+            path.display()
+        )
+        .into());
+    }
+    let mut bytes = [0u8; 32];
+    bytes.copy_from_slice(&seed);
+    Ok(ed25519_dalek::SigningKey::from_bytes(&bytes))
 }
 
 /// Spawn the event-publisher thread on the affinity core configured by

@@ -30,7 +30,7 @@
 use std::io::{Cursor, Read as _, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, Ordering};
 use std::time::Duration;
 
 use melin_pipeline::padding::Sequence;
@@ -83,6 +83,53 @@ pub struct HealthState {
     pub journal_utilization: Arc<StageUtilization>,
     pub matching_utilization: Arc<StageUtilization>,
     pub response_utilization: Arc<StageUtilization>,
+    /// Control-plane raft election state, updated by the raft driver
+    /// thread. `None` when the node runs without control-plane raft
+    /// (no `--raft-bind`).
+    pub raft: Option<Arc<RaftStatus>>,
+}
+
+/// Control-plane raft election state exposed through `/metrics`.
+///
+/// Plain atomics (not a `Mutex`) so the raft driver publishes after
+/// every ready and the health thread reads without any coordination —
+/// each gauge is independently meaningful, so a torn multi-field read
+/// is harmless. Defined here (not in `melin-raft`) because this crate
+/// is observability plumbing and must not depend on the consensus
+/// crate.
+#[derive(Debug)]
+pub struct RaftStatus {
+    /// This node's raft id (static once configured).
+    pub node_id: u64,
+    /// Current raft term. Doubles as the fencing epoch a promotion
+    /// will journal, so operators can correlate elections with
+    /// `EpochBump` entries.
+    pub term: AtomicU64,
+    /// The leader this node currently believes in; 0 while unknown
+    /// (mid-election).
+    pub leader_id: AtomicU64,
+    /// Role encoding: 0 = follower, 1 = pre-candidate, 2 = candidate,
+    /// 3 = leader. `u8` — four states, and the health thread only
+    /// formats it.
+    pub role: AtomicU8,
+}
+
+impl RaftStatus {
+    /// Role gauge values (kept in sync with the raft driver's mapping).
+    pub const ROLE_FOLLOWER: u8 = 0;
+    pub const ROLE_PRE_CANDIDATE: u8 = 1;
+    pub const ROLE_CANDIDATE: u8 = 2;
+    pub const ROLE_LEADER: u8 = 3;
+
+    /// Fresh status for node `node_id`: follower, term 0, no leader.
+    pub fn new(node_id: u64) -> Self {
+        Self {
+            node_id,
+            term: AtomicU64::new(0),
+            leader_id: AtomicU64::new(0),
+            role: AtomicU8::new(Self::ROLE_FOLLOWER),
+        }
+    }
 }
 
 /// Spawn the health endpoint thread. Returns the join handle.
@@ -192,6 +239,17 @@ struct HealthSnapshot {
     /// Rotation attempts that failed and left the current segment in
     /// place (the journal keeps growing) — any growth is alert-worthy.
     journal_rotations_failed: u64,
+    /// Control-plane raft election state; `None` when raft isn't
+    /// configured on this node.
+    raft: Option<RaftSnapshot>,
+}
+
+/// Point-in-time copy of [`RaftStatus`] for the formatters.
+struct RaftSnapshot {
+    node_id: u64,
+    term: u64,
+    leader_id: u64,
+    role: u8,
 }
 
 impl HealthSnapshot {
@@ -416,6 +474,12 @@ impl HealthSnapshot {
                 .journal_utilization
                 .rotations_failed
                 .load(Ordering::Relaxed),
+            raft: state.raft.as_ref().map(|r| RaftSnapshot {
+                node_id: r.node_id,
+                term: r.term.load(Ordering::Relaxed),
+                leader_id: r.leader_id.load(Ordering::Relaxed),
+                role: r.role.load(Ordering::Relaxed),
+            }),
         }
     }
 
@@ -584,6 +648,34 @@ impl HealthSnapshot {
             if self.response_policy_degraded { 1 } else { 0 },
             self.response_policy_degraded_nanos as f64 / 1e9,
         );
+        // Raft gauges only exist on raft-enabled nodes — omitting the
+        // series entirely (rather than exporting zeros) keeps dashboards
+        // from suggesting a one-node "cluster" on standalone deployments.
+        if let Some(raft) = &self.raft {
+            let _ = write!(
+                c,
+                "# HELP melin_raft_node_id This node's control-plane raft id.\n\
+                 # TYPE melin_raft_node_id gauge\n\
+                 melin_raft_node_id {}\n\
+                 # HELP melin_raft_term Current raft term (doubles as the fencing epoch a promotion journals).\n\
+                 # TYPE melin_raft_term gauge\n\
+                 melin_raft_term {}\n\
+                 # HELP melin_raft_leader_id Node id of the current raft leader (0 while unknown).\n\
+                 # TYPE melin_raft_leader_id gauge\n\
+                 melin_raft_leader_id {}\n\
+                 # HELP melin_raft_role This node's raft role (0 follower, 1 pre-candidate, 2 candidate, 3 leader).\n\
+                 # TYPE melin_raft_role gauge\n\
+                 melin_raft_role {}\n\
+                 # HELP melin_raft_is_leader Whether this node currently leads the control plane (1) or not (0).\n\
+                 # TYPE melin_raft_is_leader gauge\n\
+                 melin_raft_is_leader {}\n",
+                raft.node_id,
+                raft.term,
+                raft.leader_id,
+                raft.role,
+                u8::from(raft.role == RaftStatus::ROLE_LEADER),
+            );
+        }
         c.position() as usize
     }
 }
@@ -908,6 +1000,7 @@ mod tests {
             journal_utilization: Arc::new(StageUtilization::new()),
             matching_utilization: Arc::new(StageUtilization::new()),
             response_utilization: Arc::new(StageUtilization::new()),
+            raft: None,
         };
 
         let handle = std::thread::spawn(move || {
@@ -1034,6 +1127,7 @@ mod tests {
                 journal_utilization: Arc::new(StageUtilization::new()),
                 matching_utilization: Arc::new(StageUtilization::new()),
                 response_utilization: Arc::new(StageUtilization::new()),
+                raft: None,
             },
             Arc::clone(&shutdown),
         );
@@ -1069,6 +1163,7 @@ mod tests {
                 journal_utilization: Arc::new(StageUtilization::new()),
                 matching_utilization: Arc::new(StageUtilization::new()),
                 response_utilization: Arc::new(StageUtilization::new()),
+                raft: None,
             },
             Arc::new(AtomicBool::new(false)),
         );
@@ -1230,6 +1325,7 @@ mod tests {
             journal_utilization: Arc::new(StageUtilization::new()),
             matching_utilization: Arc::new(StageUtilization::new()),
             response_utilization: Arc::new(StageUtilization::new()),
+            raft: None,
         };
 
         let handle = std::thread::spawn(move || {
@@ -1332,6 +1428,7 @@ mod tests {
             journal_utilization: Arc::new(StageUtilization::new()),
             matching_utilization: Arc::new(StageUtilization::new()),
             response_utilization: Arc::new(StageUtilization::new()),
+            raft: None,
         };
 
         let handle = std::thread::spawn(move || {
@@ -1395,6 +1492,7 @@ mod tests {
             journal_utilization: journal_util,
             matching_utilization: matching_util,
             response_utilization: response_util,
+            raft: None,
         };
 
         let handle = std::thread::spawn(move || {
@@ -1472,6 +1570,7 @@ mod tests {
             journal_utilization: Arc::new(StageUtilization::new()),
             matching_utilization: Arc::new(StageUtilization::new()),
             response_utilization: Arc::new(StageUtilization::new()),
+            raft: None,
         };
 
         let handle = std::thread::spawn(move || {
@@ -1523,6 +1622,7 @@ mod tests {
             journal_utilization: Arc::new(StageUtilization::new()),
             matching_utilization: Arc::new(StageUtilization::new()),
             response_utilization: Arc::new(StageUtilization::new()),
+            raft: None,
         };
 
         let handle = std::thread::spawn(move || {
@@ -1738,6 +1838,7 @@ mod tests {
             journal_utilization: Arc::new(StageUtilization::new()),
             matching_utilization: Arc::new(StageUtilization::new()),
             response_utilization: Arc::new(StageUtilization::new()),
+            raft: None,
         };
 
         let handle = std::thread::spawn(move || {
@@ -1821,6 +1922,7 @@ mod tests {
             journal_utilization: Arc::new(StageUtilization::new()),
             matching_utilization: Arc::new(StageUtilization::new()),
             response_utilization: Arc::new(StageUtilization::new()),
+            raft: None,
         };
 
         let handle = std::thread::spawn(move || {
@@ -1901,6 +2003,7 @@ mod tests {
             journal_utilization: Arc::new(StageUtilization::new()),
             matching_utilization: Arc::new(StageUtilization::new()),
             response_utilization: Arc::new(StageUtilization::new()),
+            raft: None,
         };
 
         let handle = std::thread::spawn(move || {
@@ -2065,6 +2168,7 @@ mod tests {
             journal_utilization: Arc::new(StageUtilization::new()),
             matching_utilization: Arc::new(StageUtilization::new()),
             response_utilization: response_util,
+            raft: None,
         };
 
         let handle = std::thread::spawn(move || {
