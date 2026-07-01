@@ -57,7 +57,7 @@ use melin_raft::{ControlNode, StateRole};
 use melin_transport_core::fence::FenceState;
 use melin_transport_core::health::RaftStatus;
 
-use crate::replication::auth::{authenticate_replica, authenticate_with_primary};
+use crate::replication::auth::{authenticate_replica_identified, authenticate_with_primary};
 
 /// Driver loop granularity. Bounds tick jitter and message latency;
 /// 10 ms is 1/10 of a tick and costs nothing measurable on a control
@@ -93,6 +93,19 @@ const INBOUND_CAP_FLOOR: usize = 8;
 /// close on their own.
 const INBOUND_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// One other cluster node, as configured on this node.
+#[derive(Debug, Clone)]
+pub struct RaftPeer {
+    /// The peer's raft id.
+    pub id: u64,
+    /// The peer's raft RPC address (its `--raft-bind`).
+    pub addr: SocketAddr,
+    /// The peer's Ed25519 replication public key, used to pin its
+    /// identity on inbound connections: a connection that authenticates
+    /// with this key may only speak for node [`id`](Self::id).
+    pub public_key: [u8; 32],
+}
+
 /// Static configuration for one node's control-plane raft.
 #[derive(Debug, Clone)]
 pub struct RaftDriverConfig {
@@ -101,8 +114,8 @@ pub struct RaftDriverConfig {
     /// The full cluster membership (including this node) — every node
     /// must be configured with the same set.
     pub voters: Vec<u64>,
-    /// Peer id → raft RPC address, excluding this node.
-    pub peers: Vec<(u64, SocketAddr)>,
+    /// The other cluster nodes, excluding this one.
+    pub peers: Vec<RaftPeer>,
     /// Directory for the durable raft state file.
     pub dir: PathBuf,
 }
@@ -139,8 +152,9 @@ pub struct RaftDriverContext {
 
 /// An authenticated socket delivered by a helper auth thread.
 enum AuthedSocket {
-    /// Inbound peer link (read-only for the driver).
-    Inbound(TcpStream, SocketAddr),
+    /// Inbound peer link (read-only for the driver): the resolved peer
+    /// id (from its pinned public key), the socket, and its address.
+    Inbound(u64, TcpStream, SocketAddr),
     /// Outbound link to `peer_id` (write-only for the driver).
     Outbound(u64, TcpStream),
     /// An outbound dial/auth attempt failed; retry after backoff.
@@ -149,6 +163,10 @@ enum AuthedSocket {
 
 /// One live inbound connection.
 struct InboundConn {
+    /// Raft id this connection authenticated as (via its pinned public
+    /// key). Frames whose `from` field disagrees are dropped — a peer
+    /// cannot speak for another node's id.
+    peer_id: u64,
     stream: TcpStream,
     peer: SocketAddr,
     recv_buf: Vec<u8>,
@@ -247,14 +265,18 @@ fn run(
     // and bounds a flood.
     let conn_cap = inbound_cap(config.peers.len());
     let inflight_auth = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    // Pinned identity map: an inbound connection authenticated with a
+    // peer's public key may only speak for that peer's id.
+    let pubkey_to_id: Arc<HashMap<[u8; 32], u64>> =
+        Arc::new(config.peers.iter().map(|p| (p.public_key, p.id)).collect());
     let mut links: HashMap<u64, PeerLink> = config
         .peers
         .iter()
-        .map(|&(id, addr)| {
+        .map(|p| {
             (
-                id,
+                p.id,
                 PeerLink {
-                    addr,
+                    addr: p.addr,
                     stream: None,
                     out_buf: Vec::new(),
                     next_dial: Instant::now(),
@@ -292,7 +314,14 @@ fn run(
         }
 
         // 2. New inbound connections → helper auth threads.
-        accept_inbound(&listener, &context, &authed_tx, &inflight_auth, conn_cap);
+        accept_inbound(
+            &listener,
+            &context,
+            &authed_tx,
+            &inflight_auth,
+            &pubkey_to_id,
+            conn_cap,
+        );
 
         // 3. Freshly authenticated sockets and dial results.
         drain_authed(&authed_rx, &mut inbound, &mut links, conn_cap);
@@ -332,6 +361,7 @@ fn accept_inbound(
     context: &RaftDriverContext,
     authed_tx: &Sender<AuthedSocket>,
     inflight_auth: &Arc<std::sync::atomic::AtomicUsize>,
+    pubkey_to_id: &Arc<HashMap<[u8; 32], u64>>,
     cap: usize,
 ) {
     loop {
@@ -350,6 +380,7 @@ fn accept_inbound(
                 // Reserve an auth slot; freed on thread exit by any path.
                 let slot = AuthSlot::acquire(inflight_auth);
                 let keys = Arc::clone(&context.authorized_keys);
+                let ids = Arc::clone(pubkey_to_id);
                 let tx = authed_tx.clone();
                 let spawned = std::thread::Builder::new()
                     .name("raft-peer-auth".into())
@@ -366,13 +397,22 @@ fn accept_inbound(
                             debug!(peer = %peer, "failed to arm raft auth timeout — dropping");
                             return;
                         }
-                        match authenticate_replica(&mut stream, &keys) {
-                            Ok(()) => {
-                                // Receiver gone ⇒ the driver exited; the
-                                // socket just drops, which is the correct
-                                // teardown either way.
-                                let _ = tx.send(AuthedSocket::Inbound(stream, peer));
-                            }
+                        match authenticate_replica_identified(&mut stream, &keys) {
+                            Ok(pubkey) => match ids.get(&pubkey) {
+                                Some(&peer_id) => {
+                                    // Receiver gone ⇒ the driver exited;
+                                    // the socket just drops, which is the
+                                    // correct teardown either way.
+                                    let _ = tx.send(AuthedSocket::Inbound(peer_id, stream, peer));
+                                }
+                                None => {
+                                    // A valid replication key, but not one
+                                    // of this node's configured raft peers
+                                    // (e.g. a data-plane-only replica key).
+                                    // It has no place in consensus.
+                                    debug!(peer = %peer, "raft peer key not a configured cluster member — rejecting");
+                                }
+                            },
                             Err(e) => {
                                 debug!(peer = %peer, error = %e, "raft peer auth failed");
                             }
@@ -406,7 +446,7 @@ fn drain_authed(
 ) {
     while let Ok(authed) = authed_rx.try_recv() {
         match authed {
-            AuthedSocket::Inbound(stream, peer) => {
+            AuthedSocket::Inbound(peer_id, stream, peer) => {
                 if inbound.len() >= cap {
                     debug!(peer = %peer, cap, "inbound raft link cap reached — dropping");
                     drop(stream);
@@ -416,8 +456,9 @@ fn drain_authed(
                     debug!(peer = %peer, error = %e, "failed to set inbound raft socket non-blocking");
                     continue;
                 }
-                debug!(peer = %peer, "raft peer link established (inbound)");
+                debug!(peer = %peer, peer_id, "raft peer link established (inbound)");
                 inbound.push(InboundConn {
+                    peer_id,
                     stream,
                     peer,
                     recv_buf: Vec::new(),
@@ -553,6 +594,21 @@ fn read_inbound(
                 Ok(FrameScan::Complete(envelope, used)) => {
                     consumed += used;
                     let msg = envelope.message;
+                    // Identity binding: this connection authenticated as
+                    // `conn.peer_id`, so it may not speak for any other
+                    // node. Drop (don't tear down — a benign racing
+                    // reconnect could momentarily carry a stale id) any
+                    // frame whose `from` disagrees, so a peer cannot
+                    // forge votes or messages as another node.
+                    if msg.from != conn.peer_id {
+                        debug!(
+                            peer = %conn.peer,
+                            authenticated_as = conn.peer_id,
+                            claimed = msg.from,
+                            "dropping raft frame with mismatched sender id"
+                        );
+                        continue;
+                    }
                     if is_vote_request(msg.msg_type())
                         && !vote_request_admitted(tip_ready, envelope.tip, local_tip)
                     {
@@ -862,7 +918,11 @@ mod tests {
                 peers: ids
                     .iter()
                     .filter(|&&p| p != id)
-                    .map(|&p| (p, addrs[&p]))
+                    .map(|&p| RaftPeer {
+                        id: p,
+                        addr: addrs[&p],
+                        public_key: signing[&p].verifying_key().to_bytes(),
+                    })
                     .collect(),
                 dir: dir.path().to_path_buf(),
             };

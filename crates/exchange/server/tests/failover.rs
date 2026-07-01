@@ -3778,6 +3778,14 @@ fn fetch_raft_gauge(addr: SocketAddr, gauge: &str) -> Option<u64> {
 /// Spawn a standalone (no data-plane replication) server with the
 /// control-plane raft driver enabled. All nodes share one replication
 /// key — peer auth identifies the cluster, node identity is the raft id.
+/// One peer's raft identity, as `spawn_raft_standalone` needs it:
+/// id, RPC port, and base64 public key (for `--raft-peer` pinning).
+struct RaftPeerArg {
+    id: u64,
+    port: u16,
+    pubkey_b64: String,
+}
+
 #[allow(clippy::too_many_arguments)]
 fn spawn_raft_standalone(
     bin: &Path,
@@ -3788,7 +3796,7 @@ fn spawn_raft_standalone(
     client_port: u16,
     health_port: u16,
     raft_port: u16,
-    peers: &[(u64, u16)],
+    peers: &[RaftPeerArg],
 ) -> ServerProcess {
     let journal = tmp_dir.join(format!("raft-node-{node_id}.journal"));
     let mut args: Vec<String> = vec![
@@ -3819,9 +3827,12 @@ fn spawn_raft_standalone(
         "--replication-key".into(),
         repl_key_path.to_str().expect("valid path").into(),
     ];
-    for (peer_id, peer_port) in peers {
+    for peer in peers {
         args.push("--raft-peer".into());
-        args.push(format!("{peer_id}@127.0.0.1:{peer_port}"));
+        args.push(format!(
+            "{}@127.0.0.1:{}@{}",
+            peer.id, peer.port, peer.pubkey_b64
+        ));
     }
     let child = Command::new(bin)
         .args(&args)
@@ -3874,13 +3885,46 @@ fn wait_for_raft_leader(nodes: &[(u64, SocketAddr)], timeout: Duration) -> (u64,
 fn raft_elects_leader_and_reelects_after_kill() {
     let bin = server_bin();
     let tmp = tempfile::tempdir().expect("tempdir");
-    let trader_key = SigningKey::from_bytes(&[7u8; 32]);
     let operator_key = SigningKey::from_bytes(&[8u8; 32]);
-    let repl_key = SigningKey::from_bytes(&[9u8; 32]);
-    let (keys_path, repl_key_path) =
-        write_auth_keys_multi(tmp.path(), &[&trader_key], &operator_key, &repl_key);
 
     let ids = [1u64, 2, 3];
+    // Each node has its own replication key (identity pinning requires
+    // distinct keys), and every node's public key is authorized so any
+    // peer can authenticate to any other.
+    let node_keys: std::collections::HashMap<u64, SigningKey> = ids
+        .iter()
+        .map(|&id| (id, SigningKey::from_bytes(&[id as u8; 32])))
+        .collect();
+    let pubkey_b64 = |id: u64| {
+        base64::Engine::encode(
+            &base64::engine::general_purpose::STANDARD,
+            node_keys[&id].verifying_key().to_bytes(),
+        )
+    };
+
+    // authorized_keys: an operator key plus every node's replication key.
+    let mut auth_content = format!(
+        "operator {} ops\n",
+        base64::Engine::encode(
+            &base64::engine::general_purpose::STANDARD,
+            operator_key.verifying_key().to_bytes(),
+        )
+    );
+    for &id in &ids {
+        auth_content.push_str(&format!("replication {} node-{id}\n", pubkey_b64(id)));
+    }
+    let keys_path = tmp.path().join("authorized_keys");
+    std::fs::write(&keys_path, auth_content).expect("write authorized_keys");
+    // Per-node key files.
+    let key_paths: std::collections::HashMap<u64, PathBuf> = ids
+        .iter()
+        .map(|&id| {
+            let p = tmp.path().join(format!("repl-{id}.key"));
+            std::fs::write(&p, node_keys[&id].to_bytes()).expect("write key");
+            (id, p)
+        })
+        .collect();
+
     let client_ports: Vec<u16> = ids.iter().map(|_| free_port()).collect();
     let health_ports: Vec<u16> = ids.iter().map(|_| free_port()).collect();
     let raft_ports: Vec<u16> = ids.iter().map(|_| free_port()).collect();
@@ -3889,17 +3933,21 @@ fn raft_elects_leader_and_reelects_after_kill() {
         .iter()
         .enumerate()
         .map(|(i, &id)| {
-            let peers: Vec<(u64, u16)> = ids
+            let peers: Vec<RaftPeerArg> = ids
                 .iter()
                 .enumerate()
                 .filter(|&(_, &p)| p != id)
-                .map(|(j, &p)| (p, raft_ports[j]))
+                .map(|(j, &p)| RaftPeerArg {
+                    id: p,
+                    port: raft_ports[j],
+                    pubkey_b64: pubkey_b64(p),
+                })
                 .collect();
             let process = spawn_raft_standalone(
                 &bin,
                 tmp.path(),
                 &keys_path,
-                &repl_key_path,
+                &key_paths[&id],
                 id,
                 client_ports[i],
                 health_ports[i],

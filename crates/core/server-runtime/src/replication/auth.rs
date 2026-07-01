@@ -89,6 +89,18 @@ pub(crate) fn authenticate_replica<S: Read + Write>(
     stream: &mut S,
     authorized_keys: &melin_app::auth::AuthorizedKeys,
 ) -> io::Result<()> {
+    authenticate_replica_identified(stream, authorized_keys).map(|_| ())
+}
+
+/// Like [`authenticate_replica`] but returns the verified peer public
+/// key, so a caller can bind the connection to a specific node identity
+/// (the control-plane raft driver uses this to reject a peer that
+/// authenticates with one cluster key but then claims another node's id
+/// in its raft messages).
+pub(crate) fn authenticate_replica_identified<S: Read + Write>(
+    stream: &mut S,
+    authorized_keys: &melin_app::auth::AuthorizedKeys,
+) -> io::Result<[u8; 32]> {
     let nonce = generate_challenge_nonce()?;
 
     // Send Challenge.
@@ -107,6 +119,9 @@ pub(crate) fn authenticate_replica<S: Read + Write>(
         let _ = stream.write_all(&buf);
         return Err(e);
     }
+    // Verified above; re-decode to hand back the authenticated key.
+    let (_signature, public_key) = decode_challenge_response(&frame)
+        .map_err(|e| io::Error::other(format!("bad challenge response: {e}")))?;
 
     // Auth succeeded.
     buf.clear();
@@ -114,7 +129,7 @@ pub(crate) fn authenticate_replica<S: Read + Write>(
     stream.write_all(&buf)?;
     stream.flush()?;
 
-    Ok(())
+    Ok(public_key)
 }
 
 /// Authenticate with the primary (replica side).

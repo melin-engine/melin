@@ -355,11 +355,16 @@ pub struct ServerConfig {
     #[arg(long)]
     pub raft_node_id: Option<u64>,
 
-    /// One entry per *other* cluster node, as `<id>@<host:port>`
-    /// (repeatable, or comma-separated). The port is the peer's
-    /// `--raft-bind`. Every node must be configured with the same
-    /// total membership (its own id plus its peers); the initial
-    /// voter set is derived from it on first boot.
+    /// One entry per *other* cluster node, as
+    /// `<id>@<host:port>@<pubkey-b64>` (repeatable, or comma-separated).
+    /// The port is the peer's `--raft-bind`; the base64 public key is
+    /// the peer's replication key (same encoding as `authorized_keys`)
+    /// and pins its identity — a connection authenticating with that key
+    /// may only speak for that node id, so a shared or stolen key cannot
+    /// impersonate another node or forge votes. Each node therefore
+    /// needs its own distinct `--replication-key`. Every node must be
+    /// configured with the same total membership (its own id plus its
+    /// peers); the initial voter set is derived from it on first boot.
     #[arg(long, value_delimiter = ',')]
     pub raft_peer: Vec<String>,
 
@@ -3001,23 +3006,48 @@ fn build_raft_config(
     let mut peers = Vec::with_capacity(config.raft_peer.len());
     let mut voters = vec![node_id];
     for entry in &config.raft_peer {
-        let (id_str, addr_str) = entry
-            .split_once('@')
-            .ok_or_else(|| format!("--raft-peer `{entry}` is not of the form <id>@<host:port>"))?;
+        // `<id>@<host:port>@<pubkey-b64>`. The public key pins the
+        // peer's identity: the driver rejects a connection that
+        // authenticates with one cluster key but claims another node's
+        // id in its raft messages, so a stolen/shared replication key
+        // cannot impersonate a node or forge votes.
+        let mut parts = entry.splitn(3, '@');
+        let id_str = parts.next().unwrap_or("");
+        let addr_str = parts.next().ok_or_else(|| {
+            format!("--raft-peer `{entry}` is not of the form <id>@<host:port>@<pubkey-b64>")
+        })?;
+        let key_b64 = parts.next().ok_or_else(|| {
+            format!(
+                "--raft-peer `{entry}` is missing the peer public key \
+                 (<id>@<host:port>@<pubkey-b64>)"
+            )
+        })?;
         let peer_id: u64 = id_str
             .parse()
             .map_err(|e| format!("--raft-peer `{entry}`: bad node id: {e}"))?;
         let addr: SocketAddr = addr_str
             .parse()
             .map_err(|e| format!("--raft-peer `{entry}`: bad address: {e}"))?;
+        let public_key = parse_ed25519_pubkey_b64(key_b64)
+            .map_err(|e| format!("--raft-peer `{entry}`: bad public key: {e}"))?;
         if peer_id == 0 {
             return Err(format!("--raft-peer `{entry}`: node id must be non-zero").into());
         }
         if peer_id == node_id || voters.contains(&peer_id) {
             return Err(format!("--raft-peer `{entry}`: duplicate node id {peer_id}").into());
         }
+        if peers
+            .iter()
+            .any(|p: &crate::raft_driver::RaftPeer| p.public_key == public_key)
+        {
+            return Err(format!("--raft-peer `{entry}`: duplicate public key").into());
+        }
         voters.push(peer_id);
-        peers.push((peer_id, addr));
+        peers.push(crate::raft_driver::RaftPeer {
+            id: peer_id,
+            addr,
+            public_key,
+        });
     }
     // Deterministic voter order so every node bootstraps the identical
     // initial membership regardless of flag order.
@@ -3083,6 +3113,21 @@ fn spawn_raft_driver(
         },
     )?;
     Ok(Some(status))
+}
+
+/// Decode a base64 (standard alphabet) Ed25519 public key — the same
+/// encoding `authorized_keys` uses — into raw 32 bytes.
+fn parse_ed25519_pubkey_b64(b64: &str) -> Result<[u8; 32], String> {
+    let bytes = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, b64.trim())
+        .map_err(|e| format!("not valid base64: {e}"))?;
+    let arr: [u8; 32] = bytes
+        .as_slice()
+        .try_into()
+        .map_err(|_| format!("expected 32 bytes, got {}", bytes.len()))?;
+    // Reject a key that isn't a valid curve point so a typo fails at
+    // startup, not at the first handshake.
+    ed25519_dalek::VerifyingKey::from_bytes(&arr).map_err(|e| format!("not a valid key: {e}"))?;
+    Ok(arr)
 }
 
 /// Load a 32-byte Ed25519 seed from `path`. Shared by the replica's
@@ -3379,6 +3424,117 @@ mod tests {
     use ed25519_dalek::{Signer, SigningKey};
     use melin_app::auth::AuthorizedKeys;
     use melin_app::auth::Permission;
+
+    use super::{build_raft_config, parse_ed25519_pubkey_b64};
+
+    fn pubkey_b64(seed: u8) -> String {
+        base64::Engine::encode(
+            &base64::engine::general_purpose::STANDARD,
+            SigningKey::from_bytes(&[seed; 32])
+                .verifying_key()
+                .to_bytes(),
+        )
+    }
+
+    /// A ServerConfig with the given raft flags set (everything else
+    /// default). `key` supplies a --replication-key path when needed.
+    fn raft_cfg(
+        bind: Option<&str>,
+        node_id: Option<u64>,
+        peers: Vec<String>,
+        key: Option<std::path::PathBuf>,
+    ) -> super::ServerConfig {
+        super::ServerConfig {
+            raft_bind: bind.map(|b| b.parse().unwrap()),
+            raft_node_id: node_id,
+            raft_peer: peers,
+            replication_key: key,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn parse_pubkey_rejects_bad_input() {
+        assert!(parse_ed25519_pubkey_b64(&pubkey_b64(1)).is_ok());
+        assert!(parse_ed25519_pubkey_b64("not-base64!!").is_err());
+        // Valid base64 but wrong length.
+        let short = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, [0u8; 16]);
+        assert!(parse_ed25519_pubkey_b64(&short).is_err());
+    }
+
+    #[test]
+    fn build_raft_config_disabled_when_no_flags() {
+        let cfg = raft_cfg(None, None, vec![], None);
+        assert!(build_raft_config(&cfg).unwrap().is_none());
+    }
+
+    #[test]
+    fn build_raft_config_partial_config_errors() {
+        // node-id / peer / dir without --raft-bind.
+        let cfg = raft_cfg(None, Some(1), vec![], None);
+        assert!(build_raft_config(&cfg).is_err());
+        let mut cfg = raft_cfg(None, None, vec![], None);
+        cfg.raft_dir = Some("x".into());
+        assert!(build_raft_config(&cfg).is_err());
+    }
+
+    #[test]
+    fn build_raft_config_requires_peer_pubkey() {
+        let key = std::env::temp_dir().join("melin-test-fake.key");
+        let _ = std::fs::write(&key, [0u8; 32]);
+        // Missing the third `@pubkey` field.
+        let cfg = raft_cfg(
+            Some("127.0.0.1:7000"),
+            Some(1),
+            vec!["2@127.0.0.1:7001".into()],
+            Some(key.clone()),
+        );
+        let err = build_raft_config(&cfg).unwrap_err().to_string();
+        assert!(err.contains("public key"), "{err}");
+    }
+
+    #[test]
+    fn build_raft_config_parses_pinned_peers() {
+        let key = std::env::temp_dir().join("melin-test-fake2.key");
+        std::fs::write(&key, [0u8; 32]).unwrap();
+        let cfg = raft_cfg(
+            Some("127.0.0.1:7000"),
+            Some(1),
+            vec![
+                format!("2@127.0.0.1:7001@{}", pubkey_b64(2)),
+                format!("3@127.0.0.1:7002@{}", pubkey_b64(3)),
+            ],
+            Some(key),
+        );
+        let (_, driver) = build_raft_config(&cfg).unwrap().expect("raft enabled");
+        assert_eq!(driver.node_id, 1);
+        assert_eq!(driver.voters, vec![1, 2, 3]);
+        assert_eq!(driver.peers.len(), 2);
+        // Pubkeys are pinned to the right ids.
+        let p2 = driver.peers.iter().find(|p| p.id == 2).unwrap();
+        assert_eq!(
+            p2.public_key,
+            SigningKey::from_bytes(&[2u8; 32])
+                .verifying_key()
+                .to_bytes()
+        );
+    }
+
+    #[test]
+    fn build_raft_config_rejects_duplicate_pubkey() {
+        let key = std::env::temp_dir().join("melin-test-fake3.key");
+        std::fs::write(&key, [0u8; 32]).unwrap();
+        let cfg = raft_cfg(
+            Some("127.0.0.1:7000"),
+            Some(1),
+            vec![
+                format!("2@127.0.0.1:7001@{}", pubkey_b64(9)),
+                format!("3@127.0.0.1:7002@{}", pubkey_b64(9)),
+            ],
+            Some(key),
+        );
+        assert!(build_raft_config(&cfg).is_err());
+    }
     use melin_wire_protocol::control::ConnectionId;
     use melin_wire_protocol::control_codec::{
         TAG_AUTH_FAILED, TAG_CHALLENGE, TAG_CHALLENGE_RESPONSE, TAG_RESPONSE_HEARTBEAT,
