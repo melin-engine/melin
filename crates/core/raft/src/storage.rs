@@ -947,4 +947,84 @@ mod tests {
         assert_eq!(reopened.hard_state().vote, 1);
         assert_eq!(reopened.initial_state().unwrap().conf_state.voters, vec![1]);
     }
+
+    /// Seeding `Config.applied` from the persisted commit index (what
+    /// `ControlNode::open` does) stops raft from re-delivering already-
+    /// applied committed entries on restart — the replay that, once
+    /// membership changes exist, re-runs a committed conf-change and
+    /// bricks the node. The single-voter leader's initial no-op entry
+    /// (index 1) stands in for any committed entry.
+    #[test]
+    fn seeding_applied_suppresses_committed_replay_on_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut s = FileStorage::open(dir.path()).unwrap();
+        s.initialize_with_conf_state(vec![1]).unwrap();
+
+        let config = raft::Config {
+            id: 1,
+            ..Default::default()
+        };
+        let mut node = raft::RawNode::new(&config, s, &crate::tracing_logger()).unwrap();
+        node.campaign().unwrap();
+        for _ in 0..10 {
+            if !node.has_ready() {
+                break;
+            }
+            let ready = node.ready();
+            if !ready.entries().is_empty() {
+                let entries = ready.entries().clone();
+                node.mut_store().append(&entries).unwrap();
+            }
+            if let Some(hs) = ready.hs() {
+                let hs = hs.clone();
+                node.mut_store().set_hard_state(&hs).unwrap();
+            }
+            let mut light = node.advance(ready);
+            if let Some(commit) = light.commit_index() {
+                node.mut_store().set_commit(commit).unwrap();
+            }
+            let _ = light.take_committed_entries();
+            node.advance_apply();
+        }
+        let commit = node.store().hard_state().commit;
+        assert!(commit >= 1, "leader should have committed its no-op");
+        drop(node);
+
+        // Reopen with applied=0 (the un-fixed path): raft re-delivers
+        // the committed entry as if it had never been applied.
+        let stale = FileStorage::open(dir.path()).unwrap();
+        let mut replayer = raft::RawNode::new(
+            &raft::Config {
+                id: 1,
+                applied: 0,
+                ..Default::default()
+            },
+            stale,
+            &crate::tracing_logger(),
+        )
+        .unwrap();
+        let replayed = replayer.ready().take_committed_entries();
+        assert!(
+            !replayed.is_empty(),
+            "control: applied=0 must re-surface the committed entry"
+        );
+
+        // Reopen with applied=commit (the fix): nothing is re-delivered.
+        let fresh = FileStorage::open(dir.path()).unwrap();
+        let mut node = raft::RawNode::new(
+            &raft::Config {
+                id: 1,
+                applied: commit,
+                ..Default::default()
+            },
+            fresh,
+            &crate::tracing_logger(),
+        )
+        .unwrap();
+        let redelivered = node.ready().take_committed_entries();
+        assert!(
+            redelivered.is_empty(),
+            "applied=commit must not re-surface already-applied entries, got {redelivered:?}"
+        );
+    }
 }

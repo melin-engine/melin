@@ -58,8 +58,21 @@ impl ControlNode {
             info!(id, ?voters, "bootstrapped control-plane raft membership");
         }
 
+        // Seed the applied index from the persisted commit index.
+        // `drain_ready` applies every committed entry synchronously
+        // before it returns (no async apply), so on a clean process
+        // everything committed is also applied. Without this, a restart
+        // leaves `applied` at 0 and raft re-delivers every committed
+        // entry from the truncation point — harmless for the empty
+        // election no-ops, but re-running a committed conf-change
+        // against the already-updated membership makes raft-rs error
+        // (e.g. "config is already joint"), which would permanently
+        // stop the driver on every boot.
+        let applied = storage.hard_state().commit;
+
         let config = Config {
             id,
+            applied,
             election_tick: ELECTION_TICKS,
             heartbeat_tick: HEARTBEAT_TICKS,
             // Pre-vote (raft thesis §9.6): a partitioned node that
