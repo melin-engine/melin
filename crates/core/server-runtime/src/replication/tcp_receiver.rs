@@ -415,6 +415,11 @@ pub fn run_receiver<A, W>(
     busy_spin: bool,
     factory: std::sync::Arc<dyn melin_app::app_factory::AppFactory<App = A>>,
     fence_state: std::sync::Arc<melin_transport_core::fence::FenceState>,
+    // Flipped `true` once the fence epoch reflects this replica's
+    // recovered journal, so the control-plane raft driver knows the tip
+    // it advertises (and the votes it grants) are trustworthy. See
+    // `RaftDriverContext::tip_ready`.
+    tip_ready: &AtomicBool,
 ) -> ReceiverResult<A, W>
 where
     A: Application + Send + 'static,
@@ -434,6 +439,11 @@ where
             factory.as_ref(),
             &fence_state,
         )?;
+    // The fence epoch now reflects the recovered journal (a fresh
+    // replica legitimately recovers epoch 0). Release-store so the raft
+    // driver's Acquire-load sees the seeded epoch before it trusts the
+    // flag.
+    tip_ready.store(true, Ordering::Release);
 
     let mut backoff = std::time::Duration::from_secs(1);
 
@@ -1058,6 +1068,8 @@ mod tests {
                         false,
                         Arc::new(Factory),
                         Arc::new(melin_transport_core::fence::FenceState::new(0)),
+                        // Raft is not exercised in this test; a throwaway flag.
+                        &AtomicBool::new(false),
                     )
                     // ReceiverResult's error is !Send — stringify for join().
                     .map(|state| state.is_none())
@@ -1230,6 +1242,8 @@ mod tests {
                         false,
                         Arc::new(Factory),
                         Arc::new(melin_transport_core::fence::FenceState::new(0)),
+                        // Raft is not exercised in this test; a throwaway flag.
+                        &AtomicBool::new(false),
                     )
                     .map(|state| state.is_none())
                     .map_err(|e| e.to_string())
@@ -1417,6 +1431,8 @@ mod tests {
                         false,
                         Arc::new(Factory),
                         Arc::new(melin_transport_core::fence::FenceState::new(0)),
+                        // Raft is not exercised in this test; a throwaway flag.
+                        &AtomicBool::new(false),
                     )
                     .map(|state| state.is_none())
                     .map_err(|e| e.to_string())

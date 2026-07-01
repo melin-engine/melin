@@ -1055,6 +1055,9 @@ pub fn run_receiver_dpdk<A, W>(
     // ...) alongside the empty-app constructor.
     factory: std::sync::Arc<dyn melin_app::app_factory::AppFactory<App = A>>,
     fence_state: Arc<melin_transport_core::fence::FenceState>,
+    // Flipped `true` once recovery has seeded the fence epoch — see the
+    // kernel-TCP `run_receiver` and `RaftDriverContext::tip_ready`.
+    tip_ready: &AtomicBool,
 ) -> ReceiverResult<A, W>
 where
     A: Application + Send + 'static,
@@ -1074,6 +1077,9 @@ where
             factory.as_ref(),
             &fence_state,
         )?;
+    // Fence epoch now reflects the recovered journal; let the raft driver
+    // trust this node's advertised tip.
+    tip_ready.store(true, Ordering::Release);
 
     // Exponential backoff for reconnection: 1s → 2s → 4s → … → 30s max.
     // Reset to 1s on successful streaming (first InputBatch received).

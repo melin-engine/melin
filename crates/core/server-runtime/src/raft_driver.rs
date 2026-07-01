@@ -120,6 +120,17 @@ pub struct RaftDriverContext {
     /// auto-promotion step; until then all nodes advertise sequence 0
     /// and the recency filter degrades to epoch-only comparison.
     pub fence_state: Arc<FenceState>,
+    /// `true` once this node's fence epoch reflects its own recovered
+    /// journal, so the tip it advertises (and votes it grants) are
+    /// trustworthy. A primary knows its epoch before the driver starts,
+    /// so it passes an already-`true` flag; a replica seeds its epoch
+    /// only after journal recovery, so it starts `false` and the
+    /// receiver flips it once recovery has run. While `false` the driver
+    /// refuses to grant votes (drops inbound vote requests) — advertising
+    /// epoch 0 mid-recovery would otherwise make a caught-up replica vote
+    /// for a stale peer. Dropping vote requests only delays an election,
+    /// never affects safety.
+    pub tip_ready: Arc<AtomicBool>,
     /// Election observability published to the health endpoint.
     pub status: Arc<RaftStatus>,
     /// Process-wide shutdown flag.
@@ -496,6 +507,7 @@ fn read_inbound(
     context: &RaftDriverContext,
 ) {
     let local_tip = local_tip(context);
+    let tip_ready = context.tip_ready.load(Ordering::Acquire);
     let now = Instant::now();
     inbound.retain_mut(|conn| {
         let mut chunk = [0u8; 16 * 1024];
@@ -542,18 +554,19 @@ fn read_inbound(
                     consumed += used;
                     let msg = envelope.message;
                     if is_vote_request(msg.msg_type())
-                        && !candidate_is_current(envelope.tip, local_tip)
+                        && !vote_request_admitted(tip_ready, envelope.tip, local_tip)
                     {
-                        // The whole point of the tip envelope: a
-                        // candidate behind our journal never gets our
-                        // vote. Dropping the request is safe (it looks
-                        // like packet loss to raft) — see melin-raft's
-                        // `recency` docs.
+                        // Refused because either our own tip isn't
+                        // trustworthy yet or the candidate is behind our
+                        // journal — see `vote_request_admitted`. Dropping
+                        // is safe: it looks like packet loss to raft and
+                        // can only delay an election.
                         debug!(
                             from = msg.from,
+                            tip_ready,
                             candidate_tip = ?envelope.tip,
                             our_tip = ?local_tip,
-                            "vote request filtered: candidate journal is behind ours"
+                            "vote request filtered (tip not ready or candidate behind)"
                         );
                         continue;
                     }
@@ -696,6 +709,19 @@ fn flush_link(peer_id: u64, link: &mut PeerLink) {
     }
 }
 
+/// Whether an inbound vote request should be delivered to raft.
+///
+/// Refused (returns `false`) when either our own tip isn't trustworthy
+/// yet (`!tip_ready` — a replica mid-recovery advertises epoch 0 and
+/// must not vote until it knows its real tip) or the `candidate` is
+/// behind our `local` journal (the recency rule). Both are safe to
+/// enforce by dropping the request: to raft it is indistinguishable
+/// from packet loss, so it can only delay an election, never split the
+/// vote.
+fn vote_request_admitted(tip_ready: bool, candidate: JournalTip, local: JournalTip) -> bool {
+    tip_ready && candidate_is_current(candidate, local)
+}
+
 /// The journal tip this node advertises. Sequence is 0 until the
 /// auto-promotion step wires the durable journal cursor through; the
 /// epoch half is already live via the fencing state.
@@ -741,6 +767,30 @@ mod tests {
         // Scales past the floor for larger ones.
         assert_eq!(inbound_cap(5), 5 * INBOUND_SLACK);
         assert!(inbound_cap(100) >= 100);
+    }
+
+    #[test]
+    fn vote_admitted_only_when_tip_ready_and_candidate_current() {
+        let ours = JournalTip {
+            epoch: 5,
+            last_sequence: 100,
+        };
+        let ahead = JournalTip {
+            epoch: 5,
+            last_sequence: 200,
+        };
+        let behind = JournalTip {
+            epoch: 5,
+            last_sequence: 10,
+        };
+        // Ready + caught-up candidate: admitted.
+        assert!(vote_request_admitted(true, ahead, ours));
+        assert!(vote_request_admitted(true, ours, ours));
+        // Ready but candidate behind: refused (recency rule).
+        assert!(!vote_request_admitted(true, behind, ours));
+        // Not ready: refused regardless of the candidate — a replica
+        // mid-recovery advertising epoch 0 must not grant votes.
+        assert!(!vote_request_admitted(false, ahead, ours));
     }
 
     #[test]
@@ -820,6 +870,8 @@ mod tests {
                 signing_key: signing[&id].clone(),
                 authorized_keys: Arc::clone(&authorized),
                 fence_state: Arc::new(FenceState::new(0)),
+                // These test nodes act as always-recovered primaries.
+                tip_ready: Arc::new(AtomicBool::new(true)),
                 status: Arc::clone(&status),
                 shutdown: Arc::clone(&shutdown),
             };

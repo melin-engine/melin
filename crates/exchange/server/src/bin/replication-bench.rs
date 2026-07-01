@@ -262,6 +262,8 @@ fn main() {
                     },
                 )),
                 replica_fence,
+                // Control-plane raft is not run in the replication bench.
+                &std::sync::atomic::AtomicBool::new(false),
             );
         })
         .expect("spawn run_receiver");

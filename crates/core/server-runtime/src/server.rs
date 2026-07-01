@@ -831,7 +831,17 @@ where
         // same reason as the admin flags: the driver keeps running
         // across a replica → primary promotion (leadership is a
         // property of the node, not of its current data-plane role).
-        let raft_status = spawn_raft_driver(&config, &authorized_keys, &fence_state, &shutdown)?;
+        // The tip isn't trustworthy until journal recovery seeds the
+        // fence epoch, so start `false` and let the receiver flip it —
+        // until then the driver refuses to grant votes.
+        let tip_ready = Arc::new(AtomicBool::new(false));
+        let raft_status = spawn_raft_driver(
+            &config,
+            &authorized_keys,
+            &fence_state,
+            Arc::clone(&tip_ready),
+            &shutdown,
+        )?;
 
         // No local rotation triggers on the replica side: segment
         // rotation is primary-driven (the replica adopts the boundaries
@@ -853,6 +863,7 @@ where
             !config.yield_idle,
             Arc::clone(&factory),
             Arc::clone(&fence_state),
+            &tip_ready,
         )? {
             None => return Ok(()), // clean shutdown
             Some((mut exchange, writer)) => {
@@ -931,7 +942,15 @@ where
         recovered_epoch,
     ));
 
-    let raft_status = spawn_raft_driver(&config, &authorized_keys, &fence_state, &shutdown)?;
+    // A primary's fence epoch is already recovered here, so its tip is
+    // trustworthy from the moment the driver starts.
+    let raft_status = spawn_raft_driver(
+        &config,
+        &authorized_keys,
+        &fence_state,
+        Arc::new(AtomicBool::new(true)),
+        &shutdown,
+    )?;
 
     run_as_primary::<A, L, W>(
         exchange,
@@ -1996,8 +2015,16 @@ where
 
         // Control-plane raft runs on kernel TCP even on DPDK nodes —
         // the control plane is latency-insensitive and must survive
-        // independently of the DPDK data path.
-        let raft_status = spawn_raft_driver(&config, &authorized_keys, &fence_state, &shutdown)?;
+        // independently of the DPDK data path. Tip not trustworthy until
+        // recovery seeds the epoch (see the kernel replica path).
+        let tip_ready = Arc::new(AtomicBool::new(false));
+        let raft_status = spawn_raft_driver(
+            &config,
+            &authorized_keys,
+            &fence_state,
+            Arc::clone(&tip_ready),
+            &shutdown,
+        )?;
 
         // No local rotation triggers on the replica side — rotation is
         // primary-driven (see the kernel-TCP receiver path).
@@ -2036,6 +2063,7 @@ where
             !config.yield_idle,
             Arc::clone(&factory),
             Arc::clone(&fence_state),
+            &tip_ready,
         )? {
             None => return Ok(()), // clean shutdown
             Some((mut exchange, writer)) => {
@@ -2114,8 +2142,15 @@ where
     ));
 
     // Control-plane raft runs on kernel TCP even on DPDK nodes — see
-    // the DPDK replica path for the rationale.
-    let raft_status = spawn_raft_driver(&config, &authorized_keys, &fence_state, &shutdown)?;
+    // the DPDK replica path for the rationale. Primary epoch already
+    // recovered, so the tip is trustworthy immediately.
+    let raft_status = spawn_raft_driver(
+        &config,
+        &authorized_keys,
+        &fence_state,
+        Arc::new(AtomicBool::new(true)),
+        &shutdown,
+    )?;
 
     // Clone exchange state for the shadow snapshot stage before moving
     // exchange into the pipeline (same as the kernel TCP path).
@@ -3012,10 +3047,15 @@ fn build_raft_config(
 /// disabled). The join handle is deliberately dropped — like the admin
 /// listener, the driver parks on the shared `shutdown` flag and the
 /// process teardown does not join control-plane threads.
+/// `tip_ready` tells the driver whether this node's fence epoch already
+/// reflects its recovered journal: `true` on a primary (its epoch is
+/// known before the driver starts), a shared `false` flag on a replica
+/// that the receiver flips once journal recovery has seeded the epoch.
 fn spawn_raft_driver(
     config: &ServerConfig,
     authorized_keys: &Arc<AuthorizedKeys>,
     fence_state: &Arc<melin_transport_core::fence::FenceState>,
+    tip_ready: Arc<AtomicBool>,
     shutdown: &Arc<AtomicBool>,
 ) -> Result<Option<Arc<melin_transport_core::health::RaftStatus>>, Box<dyn std::error::Error>> {
     let Some((bind, driver_config)) = build_raft_config(config)? else {
@@ -3037,6 +3077,7 @@ fn spawn_raft_driver(
             signing_key,
             authorized_keys: Arc::clone(authorized_keys),
             fence_state: Arc::clone(fence_state),
+            tip_ready,
             status: Arc::clone(&status),
             shutdown: Arc::clone(shutdown),
         },
