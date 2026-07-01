@@ -208,7 +208,7 @@ fn run(
 
     loop {
         if context.shutdown.load(Ordering::Relaxed) {
-            return;
+            break;
         }
         let now = Instant::now();
 
@@ -237,12 +237,19 @@ fn run(
         if !drain_node(&mut node, &mut links, &context) {
             // Storage failure: raft is inoperable by contract. The
             // control plane stops; trading continues on the data plane.
-            return;
+            break;
         }
 
         publish_status(&node, &context.status);
         std::thread::sleep(POLL_INTERVAL);
     }
+
+    // The driver is exiting (clean shutdown or storage failure). Clear
+    // leadership and drop the running flag so `/metrics` stops
+    // reporting a stale leader on a node whose control plane is gone —
+    // on a storage failure the process keeps serving trading and its
+    // health endpoint, so these gauges would otherwise freeze forever.
+    context.status.mark_stopped();
 }
 
 /// Accept any pending inbound connections and hand each to a helper

@@ -112,6 +112,13 @@ pub struct RaftStatus {
     /// 3 = leader. `u8` — four states, and the health thread only
     /// formats it.
     pub role: AtomicU8,
+    /// Whether the raft driver thread is still running. Flipped to
+    /// `false` when the driver exits (clean shutdown, or an
+    /// unrecoverable storage failure that stops raft while trading
+    /// continues). Exposed as `melin_raft_driver_running` so a dead
+    /// control plane is visible instead of its gauges freezing at the
+    /// last-published (possibly leader) state.
+    pub running: AtomicBool,
 }
 
 impl RaftStatus {
@@ -121,14 +128,27 @@ impl RaftStatus {
     pub const ROLE_CANDIDATE: u8 = 2;
     pub const ROLE_LEADER: u8 = 3;
 
-    /// Fresh status for node `node_id`: follower, term 0, no leader.
+    /// Fresh status for node `node_id`: follower, term 0, no leader,
+    /// running.
     pub fn new(node_id: u64) -> Self {
         Self {
             node_id,
             term: AtomicU64::new(0),
             leader_id: AtomicU64::new(0),
             role: AtomicU8::new(Self::ROLE_FOLLOWER),
+            running: AtomicBool::new(true),
         }
+    }
+
+    /// Mark the driver stopped: clears leadership (role → follower,
+    /// leader → none) so `melin_raft_is_leader` cannot stay stuck at 1
+    /// on a node whose control plane has died, and drops
+    /// `melin_raft_driver_running` to 0. The term is left as-is — its
+    /// last value is still meaningful for correlating the outage.
+    pub fn mark_stopped(&self) {
+        self.role.store(Self::ROLE_FOLLOWER, Ordering::Relaxed);
+        self.leader_id.store(0, Ordering::Relaxed);
+        self.running.store(false, Ordering::Relaxed);
     }
 }
 
@@ -250,6 +270,7 @@ struct RaftSnapshot {
     term: u64,
     leader_id: u64,
     role: u8,
+    running: bool,
 }
 
 impl HealthSnapshot {
@@ -479,6 +500,7 @@ impl HealthSnapshot {
                 term: r.term.load(Ordering::Relaxed),
                 leader_id: r.leader_id.load(Ordering::Relaxed),
                 role: r.role.load(Ordering::Relaxed),
+                running: r.running.load(Ordering::Relaxed),
             }),
         }
     }
@@ -668,12 +690,18 @@ impl HealthSnapshot {
                  melin_raft_role {}\n\
                  # HELP melin_raft_is_leader Whether this node currently leads the control plane (1) or not (0).\n\
                  # TYPE melin_raft_is_leader gauge\n\
-                 melin_raft_is_leader {}\n",
+                 melin_raft_is_leader {}\n\
+                 # HELP melin_raft_driver_running Whether the raft driver thread is alive (1) or has stopped, e.g. on an unrecoverable state-file error while trading continues (0).\n\
+                 # TYPE melin_raft_driver_running gauge\n\
+                 melin_raft_driver_running {}\n",
                 raft.node_id,
                 raft.term,
                 raft.leader_id,
                 raft.role,
-                u8::from(raft.role == RaftStatus::ROLE_LEADER),
+                // A stopped driver never leads, regardless of the last
+                // role it published.
+                u8::from(raft.running && raft.role == RaftStatus::ROLE_LEADER),
+                u8::from(raft.running),
             );
         }
         c.position() as usize
@@ -903,6 +931,27 @@ mod tests {
     use super::*;
     use crate::replication::ReplicationMetrics;
     use std::io::Read;
+
+    #[test]
+    fn raft_status_mark_stopped_clears_leadership() {
+        let status = RaftStatus::new(7);
+        status
+            .role
+            .store(RaftStatus::ROLE_LEADER, Ordering::Relaxed);
+        status.leader_id.store(7, Ordering::Relaxed);
+        status.term.store(4, Ordering::Relaxed);
+
+        status.mark_stopped();
+
+        assert_eq!(
+            status.role.load(Ordering::Relaxed),
+            RaftStatus::ROLE_FOLLOWER
+        );
+        assert_eq!(status.leader_id.load(Ordering::Relaxed), 0);
+        assert!(!status.running.load(Ordering::Relaxed));
+        // Term is deliberately retained for outage correlation.
+        assert_eq!(status.term.load(Ordering::Relaxed), 4);
+    }
 
     /// Test-only QueueCursor backed by an AtomicU64.
     struct MockCursor(AtomicU64);
