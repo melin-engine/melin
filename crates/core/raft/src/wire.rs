@@ -49,10 +49,47 @@ pub struct Envelope {
     pub message: Message,
 }
 
-/// Append one framed envelope to `buf`.
-pub fn encode_frame(tip: JournalTip, chain_hash: &[u8; 32], message: &Message, buf: &mut Vec<u8>) {
+/// A message whose framed payload would exceed [`MAX_FRAME`]. Returned
+/// by [`encode_frame`] instead of emitting a frame the receiver is
+/// guaranteed to reject: a too-large frame would make the peer drop the
+/// link, and raft would then resend the identical oversized message,
+/// looping the link down forever. Raft's own `max_size_per_msg` keeps
+/// appends well under the cap, so this is a backstop, not an expected
+/// path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FrameTooLarge {
+    /// The payload length that overflowed the cap.
+    pub payload_len: usize,
+}
+
+impl std::fmt::Display for FrameTooLarge {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "raft message payload {} bytes exceeds the {MAX_FRAME}-byte frame cap",
+            self.payload_len
+        )
+    }
+}
+
+impl std::error::Error for FrameTooLarge {}
+
+/// Append one framed envelope to `buf`. Refuses (leaving `buf`
+/// untouched) any message whose payload would exceed [`MAX_FRAME`] —
+/// see [`FrameTooLarge`].
+pub fn encode_frame(
+    tip: JournalTip,
+    chain_hash: &[u8; 32],
+    message: &Message,
+    buf: &mut Vec<u8>,
+) -> Result<(), FrameTooLarge> {
     let payload_len = ENVELOPE_PREFIX + message.encoded_len();
+    if payload_len > MAX_FRAME {
+        return Err(FrameTooLarge { payload_len });
+    }
     buf.reserve(FRAME_HEADER + payload_len);
+    // `payload_len <= MAX_FRAME` (< u32::MAX), so the cast cannot
+    // truncate.
     buf.extend_from_slice(&(payload_len as u32).to_le_bytes());
     let crc_pos = buf.len();
     buf.extend_from_slice(&[0u8; 4]); // crc placeholder
@@ -66,6 +103,7 @@ pub fn encode_frame(tip: JournalTip, chain_hash: &[u8; 32], message: &Message, b
         .expect("prost encode into Vec is infallible");
     let crc = crc32c::crc32c(&buf[payload_start..]);
     buf[crc_pos..crc_pos + 4].copy_from_slice(&crc.to_le_bytes());
+    Ok(())
 }
 
 /// Outcome of scanning a receive buffer for one frame.
@@ -152,10 +190,15 @@ mod tests {
         }
     }
 
+    /// Encode into `buf`, asserting the message fit under the cap.
+    fn encode(tip: JournalTip, chain_hash: &[u8; 32], message: &Message, buf: &mut Vec<u8>) {
+        encode_frame(tip, chain_hash, message, buf).expect("sample message fits");
+    }
+
     #[test]
     fn roundtrip() {
         let mut buf = Vec::new();
-        encode_frame(sample_tip(), &[0xAB; 32], &sample_message(), &mut buf);
+        encode(sample_tip(), &[0xAB; 32], &sample_message(), &mut buf);
         match scan_frame(&buf).unwrap() {
             FrameScan::Complete(env, consumed) => {
                 assert_eq!(consumed, buf.len());
@@ -170,7 +213,7 @@ mod tests {
     #[test]
     fn partial_frames_wait_for_more_bytes() {
         let mut buf = Vec::new();
-        encode_frame(sample_tip(), &[0; 32], &sample_message(), &mut buf);
+        encode(sample_tip(), &[0; 32], &sample_message(), &mut buf);
         for cut in [0, 3, FRAME_HEADER, buf.len() - 1] {
             assert!(
                 matches!(scan_frame(&buf[..cut]).unwrap(), FrameScan::Incomplete),
@@ -184,8 +227,8 @@ mod tests {
         let mut second = sample_message();
         second.term = 8;
         let mut buf = Vec::new();
-        encode_frame(sample_tip(), &[0; 32], &sample_message(), &mut buf);
-        encode_frame(sample_tip(), &[0; 32], &second, &mut buf);
+        encode(sample_tip(), &[0; 32], &sample_message(), &mut buf);
+        encode(sample_tip(), &[0; 32], &second, &mut buf);
 
         let FrameScan::Complete(first_env, consumed) = scan_frame(&buf).unwrap() else {
             panic!("first frame incomplete");
@@ -201,10 +244,29 @@ mod tests {
     #[test]
     fn corrupted_payload_is_rejected() {
         let mut buf = Vec::new();
-        encode_frame(sample_tip(), &[0; 32], &sample_message(), &mut buf);
+        encode(sample_tip(), &[0; 32], &sample_message(), &mut buf);
         let last = buf.len() - 1;
         buf[last] ^= 0xFF;
         assert!(scan_frame(&buf).is_err());
+    }
+
+    #[test]
+    fn oversized_message_is_refused_not_framed() {
+        use raft::eraftpb::{Entry, MessageType};
+        // An MsgAppend carrying one entry whose data overflows the cap.
+        let mut msg = Message::default();
+        msg.set_msg_type(MessageType::MsgAppend);
+        msg.entries.push(Entry {
+            data: vec![0u8; MAX_FRAME + 1],
+            ..Default::default()
+        });
+
+        let mut buf = Vec::new();
+        let err = encode_frame(sample_tip(), &[0; 32], &msg, &mut buf).unwrap_err();
+        assert!(err.payload_len > MAX_FRAME);
+        // Nothing was written — a partial/oversized frame must never
+        // reach the wire.
+        assert!(buf.is_empty());
     }
 
     #[test]

@@ -543,8 +543,20 @@ fn drain_node(
                 link.next_dial = Instant::now();
                 continue;
             }
-            encode_frame(tip, &chain_hash, &msg, &mut link.out_buf);
-            flush_link(msg.to, link);
+            let to = msg.to;
+            if let Err(e) = encode_frame(tip, &chain_hash, &msg, &mut link.out_buf) {
+                // Backstop for a message larger than the frame cap
+                // (Config.max_size_per_msg keeps appends well under it,
+                // so this should not happen). Drop it rather than frame
+                // a frame the peer will reject: a rejected oversized
+                // frame resets the link, and raft would resend the
+                // identical message, looping the link down forever.
+                // Dropping keeps the link up; raft makes progress with
+                // smaller messages.
+                warn!(to, error = %e, "dropping oversized raft message");
+                continue;
+            }
+            flush_link(to, link);
         }
         for payload in drained.committed {
             // Step 1 proposes nothing, so committed payloads can only

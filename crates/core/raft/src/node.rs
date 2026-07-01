@@ -70,6 +70,12 @@ impl ControlNode {
             // an election timeout — the property auto-promotion (step
             // 3) relies on so an isolated ex-leader stops acting.
             check_quorum: true,
+            // Cap the bytes of log entries a single MsgAppend carries so
+            // no message overruns the peer wire frame cap
+            // (`melin_raft::wire::MAX_FRAME`, 4 MiB). 1 MiB leaves ample
+            // room for the frame envelope; a catching-up follower just
+            // receives more, smaller appends.
+            max_size_per_msg: 1 << 20,
             ..Default::default()
         };
         config
