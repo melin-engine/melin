@@ -2931,10 +2931,19 @@ fn build_raft_config(
 ) -> Result<Option<(SocketAddr, crate::raft_driver::RaftDriverConfig)>, Box<dyn std::error::Error>>
 {
     let Some(bind) = config.raft_bind else {
-        if config.raft_node_id.is_some() || !config.raft_peer.is_empty() {
+        // Any other raft flag without --raft-bind is a partial config:
+        // raft is enabled by binding its RPC address, so a lone
+        // --raft-node-id / --raft-peer / --raft-dir means the operator
+        // intended raft but dropped the bind line. Fail loudly rather
+        // than boot with raft silently off (which would quietly cost the
+        // cluster a voter).
+        if config.raft_node_id.is_some()
+            || !config.raft_peer.is_empty()
+            || config.raft_dir.is_some()
+        {
             return Err(
-                "--raft-node-id/--raft-peer require --raft-bind (control-plane raft is \
-                 enabled by binding its RPC address)"
+                "--raft-node-id/--raft-peer/--raft-dir require --raft-bind (control-plane \
+                 raft is enabled by binding its RPC address)"
                     .into(),
             );
         }
