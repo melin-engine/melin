@@ -212,12 +212,22 @@ fn run(
         }
         let now = Instant::now();
 
-        // 1. Raft clock.
+        // 1. Raft clock. Deadline-anchored (`+= TICK`, not `now + TICK`)
+        // so ordinary slow iterations don't stretch the logical clock —
+        // but tick at most once per loop and drop any backlog. Without
+        // the resync, after a multi-second thread stall (VM pause, cgroup
+        // throttle, a slow state-file fsync) `now` stays past `next_tick`
+        // for many iterations and the raft clock runs at poll cadence
+        // (~10x real time), compressing election timeouts and flapping
+        // leadership on a node that never lost connectivity. A stalled
+        // node genuinely didn't advance its clock, so replaying the
+        // missed ticks is wrong.
         if now >= next_tick {
             node.tick();
-            // Deadline-anchored (not `now + TICK`) so a slow iteration
-            // doesn't stretch the logical clock.
             next_tick += TICK_INTERVAL;
+            if now >= next_tick {
+                next_tick = now + TICK_INTERVAL;
+            }
         }
 
         // 2. New inbound connections → helper auth threads.
