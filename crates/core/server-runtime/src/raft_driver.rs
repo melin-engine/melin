@@ -78,6 +78,20 @@ const MAX_OUT_BUFFER: usize = 4 << 20;
 /// Cap on buffered ingress from one peer before frame extraction —
 /// matches the wire codec's frame cap plus one header.
 const MAX_IN_BUFFER: usize = melin_raft::wire::MAX_FRAME + 8;
+/// Slack multiplier over the peer count for the inbound-connection and
+/// in-flight-auth caps: a healthy cluster holds exactly one inbound link
+/// per peer, so 4x leaves room for reconnect overlap while still bounding
+/// a flood. See [`inbound_cap`].
+const INBOUND_SLACK: usize = 4;
+/// Floor for the inbound/auth caps, so a tiny or misconfigured peer list
+/// still tolerates a couple of concurrent reconnects.
+const INBOUND_CAP_FLOOR: usize = 8;
+/// Drop an inbound link that has produced no bytes for this long. A
+/// connected peer sends heartbeats/appends far more often (sub-second at
+/// the 200 ms heartbeat), so this only reaps half-open links left by a
+/// peer that vanished without a FIN/RST — which raft's own timers never
+/// close on their own.
+const INBOUND_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Static configuration for one node's control-plane raft.
 #[derive(Debug, Clone)]
@@ -127,6 +141,37 @@ struct InboundConn {
     stream: TcpStream,
     peer: SocketAddr,
     recv_buf: Vec<u8>,
+    /// Last time this link produced bytes; drives idle reaping of
+    /// half-open connections (see [`INBOUND_IDLE_TIMEOUT`]).
+    last_activity: Instant,
+}
+
+/// The inbound-connection / concurrent-auth cap for a cluster with
+/// `peer_count` peers: one legitimate inbound link per peer, times
+/// [`INBOUND_SLACK`], floored at [`INBOUND_CAP_FLOOR`].
+fn inbound_cap(peer_count: usize) -> usize {
+    (peer_count * INBOUND_SLACK).max(INBOUND_CAP_FLOOR)
+}
+
+/// RAII counter for in-flight auth helper threads: [`AuthSlot::acquire`]
+/// increments the shared count and the guard decrements it when dropped
+/// (thread exit by any path — success, auth failure, timeout, panic), so
+/// a hung or slow handshake still frees its slot. The accept loop refuses
+/// new connections once the count reaches the cap, bounding the thread
+/// fan-out an unauthenticated flood on the raft port can create.
+struct AuthSlot(Arc<std::sync::atomic::AtomicUsize>);
+
+impl AuthSlot {
+    fn acquire(counter: &Arc<std::sync::atomic::AtomicUsize>) -> Self {
+        counter.fetch_add(1, Ordering::AcqRel);
+        AuthSlot(Arc::clone(counter))
+    }
+}
+
+impl Drop for AuthSlot {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::Release);
+    }
 }
 
 /// Outbound link state for one peer.
@@ -186,6 +231,11 @@ fn run(
 ) {
     let (authed_tx, authed_rx): (Sender<AuthedSocket>, Receiver<AuthedSocket>) = channel();
     let mut inbound: Vec<InboundConn> = Vec::new();
+    // A healthy cluster holds one inbound link (and needs at most one
+    // concurrent auth) per peer; the cap adds slack for reconnect overlap
+    // and bounds a flood.
+    let conn_cap = inbound_cap(config.peers.len());
+    let inflight_auth = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let mut links: HashMap<u64, PeerLink> = config
         .peers
         .iter()
@@ -231,10 +281,10 @@ fn run(
         }
 
         // 2. New inbound connections → helper auth threads.
-        accept_inbound(&listener, &context, &authed_tx);
+        accept_inbound(&listener, &context, &authed_tx, &inflight_auth, conn_cap);
 
         // 3. Freshly authenticated sockets and dial results.
-        drain_authed(&authed_rx, &mut inbound, &mut links);
+        drain_authed(&authed_rx, &mut inbound, &mut links, conn_cap);
 
         // 4. Kick off outbound dials that are due.
         dial_due_peers(&mut links, &config, &context, &authed_tx, now);
@@ -263,24 +313,48 @@ fn run(
 }
 
 /// Accept any pending inbound connections and hand each to a helper
-/// thread for the blocking auth handshake.
+/// thread for the blocking auth handshake. Refuses new connections once
+/// `cap` handshakes are already in flight, so an unauthenticated flood
+/// on the raft port cannot spawn unbounded OS threads.
 fn accept_inbound(
     listener: &TcpListener,
     context: &RaftDriverContext,
     authed_tx: &Sender<AuthedSocket>,
+    inflight_auth: &Arc<std::sync::atomic::AtomicUsize>,
+    cap: usize,
 ) {
     loop {
         match listener.accept() {
             Ok((stream, peer)) => {
+                if inflight_auth.load(Ordering::Acquire) >= cap {
+                    // At the auth-concurrency cap: drop the connection
+                    // without spawning a thread. A legitimate peer
+                    // re-dials with backoff; this only bites under a
+                    // flood, which is exactly when we want to shed.
+                    debug!(peer = %peer, cap, "raft auth cap reached — refusing connection");
+                    drop(stream);
+                    continue;
+                }
                 debug!(peer = %peer, "raft peer connection accepted — authenticating");
+                // Reserve an auth slot; freed on thread exit by any path.
+                let slot = AuthSlot::acquire(inflight_auth);
                 let keys = Arc::clone(&context.authorized_keys);
                 let tx = authed_tx.clone();
                 let spawned = std::thread::Builder::new()
                     .name("raft-peer-auth".into())
                     .spawn(move || {
+                        let _slot = slot;
                         let mut stream = stream;
-                        stream.set_read_timeout(Some(ACCEPT_AUTH_TIMEOUT)).ok();
-                        stream.set_write_timeout(Some(ACCEPT_AUTH_TIMEOUT)).ok();
+                        // A failure to arm the deadline would let a
+                        // silent peer block this helper thread forever,
+                        // so treat it as an auth failure rather than
+                        // proceeding without a timeout.
+                        if stream.set_read_timeout(Some(ACCEPT_AUTH_TIMEOUT)).is_err()
+                            || stream.set_write_timeout(Some(ACCEPT_AUTH_TIMEOUT)).is_err()
+                        {
+                            debug!(peer = %peer, "failed to arm raft auth timeout — dropping");
+                            return;
+                        }
                         match authenticate_replica(&mut stream, &keys) {
                             Ok(()) => {
                                 // Receiver gone ⇒ the driver exited; the
@@ -295,6 +369,9 @@ fn accept_inbound(
                     });
                 if let Err(e) = spawned {
                     warn!(error = %e, "failed to spawn raft peer auth thread");
+                    // `slot` was moved into the closure only on success;
+                    // on spawn failure it is dropped here, releasing the
+                    // reservation.
                 }
             }
             Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => return,
@@ -306,15 +383,24 @@ fn accept_inbound(
     }
 }
 
-/// Absorb helper-thread results into the live connection sets.
+/// Absorb helper-thread results into the live connection sets. `cap`
+/// bounds the live inbound set; excess links are dropped (the idle
+/// reaper clears stale ones, so a healthy peer re-dials into a freed
+/// slot).
 fn drain_authed(
     authed_rx: &Receiver<AuthedSocket>,
     inbound: &mut Vec<InboundConn>,
     links: &mut HashMap<u64, PeerLink>,
+    cap: usize,
 ) {
     while let Ok(authed) = authed_rx.try_recv() {
         match authed {
             AuthedSocket::Inbound(stream, peer) => {
+                if inbound.len() >= cap {
+                    debug!(peer = %peer, cap, "inbound raft link cap reached — dropping");
+                    drop(stream);
+                    continue;
+                }
                 if let Err(e) = stream.set_nonblocking(true) {
                     debug!(peer = %peer, error = %e, "failed to set inbound raft socket non-blocking");
                     continue;
@@ -324,6 +410,7 @@ fn drain_authed(
                     stream,
                     peer,
                     recv_buf: Vec::new(),
+                    last_activity: Instant::now(),
                 });
             }
             AuthedSocket::Outbound(peer_id, stream) => {
@@ -409,8 +496,10 @@ fn read_inbound(
     context: &RaftDriverContext,
 ) {
     let local_tip = local_tip(context);
+    let now = Instant::now();
     inbound.retain_mut(|conn| {
         let mut chunk = [0u8; 16 * 1024];
+        let mut got_bytes = false;
         loop {
             match conn.stream.read(&mut chunk) {
                 Ok(0) => {
@@ -423,6 +512,7 @@ fn read_inbound(
                         return false;
                     }
                     conn.recv_buf.extend_from_slice(&chunk[..n]);
+                    got_bytes = true;
                 }
                 Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => break,
                 Err(ref e) if e.kind() == io::ErrorKind::Interrupted => continue,
@@ -431,6 +521,17 @@ fn read_inbound(
                     return false;
                 }
             }
+        }
+
+        // Reap a half-open link: a peer that vanished without a FIN/RST
+        // leaves a connection that only ever returns WouldBlock. Raft's
+        // own timers re-elect around it but never close it, so without
+        // this it would sit in the set forever, polled every tick.
+        if got_bytes {
+            conn.last_activity = now;
+        } else if now.duration_since(conn.last_activity) > INBOUND_IDLE_TIMEOUT {
+            debug!(peer = %conn.peer, "raft inbound link idle past timeout — reaping");
+            return false;
         }
 
         // Extract every complete frame currently buffered.
@@ -631,6 +732,28 @@ fn publish_status(node: &ControlNode, status: &RaftStatus) {
 mod tests {
     use super::*;
     use base64::Engine as _;
+
+    #[test]
+    fn inbound_cap_scales_with_peers_and_has_a_floor() {
+        // Floor applies for tiny clusters.
+        assert_eq!(inbound_cap(0), INBOUND_CAP_FLOOR);
+        assert_eq!(inbound_cap(1), INBOUND_CAP_FLOOR);
+        // Scales past the floor for larger ones.
+        assert_eq!(inbound_cap(5), 5 * INBOUND_SLACK);
+        assert!(inbound_cap(100) >= 100);
+    }
+
+    #[test]
+    fn auth_slot_tracks_inflight_count() {
+        let counter = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let a = AuthSlot::acquire(&counter);
+        let b = AuthSlot::acquire(&counter);
+        assert_eq!(counter.load(Ordering::Acquire), 2);
+        drop(a);
+        assert_eq!(counter.load(Ordering::Acquire), 1);
+        drop(b);
+        assert_eq!(counter.load(Ordering::Acquire), 0);
+    }
 
     /// Build one signing key per node plus a shared `AuthorizedKeys`
     /// table granting all of them `replication` permission.
