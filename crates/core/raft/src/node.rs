@@ -255,10 +255,12 @@ impl ControlNode {
         self.raw.raft.id
     }
 
-    /// Current raft term. Doubles as the fencing epoch a promotion
-    /// journals (`EpochBump { epoch: term }`) — terms are unique per
-    /// leader tenure, which closes the manual-failover dual-promotion
-    /// collision documented in `docs/replication.md`.
+    /// Current raft term. Terms are unique per leader tenure, so a
+    /// later step will use the term to allocate the replication fencing
+    /// epoch a promotion journals (`EpochBump { epoch: term }`) —
+    /// closing the manual-failover dual-promotion collision documented
+    /// in `docs/replication.md`. Today the term is election bookkeeping
+    /// only; nothing journals it yet.
     pub fn term(&self) -> u64 {
         self.raw.raft.term
     }

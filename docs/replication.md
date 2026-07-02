@@ -428,26 +428,40 @@ first phase of the control-plane Raft integration has landed: nodes
 configured with `--raft-bind`, `--raft-node-id`, and `--raft-peer`
 run leader election among themselves and expose the outcome through
 the metrics endpoint (`melin_raft_term`, `melin_raft_leader_id`,
-`melin_raft_role`, `melin_raft_is_leader`), so monitoring can already
-observe which node the cluster would elect. Raft carries election,
-membership, and (in a later phase) fencing-epoch allocation only —
-order flow stays on the existing replication path and the durability
-modes are unchanged. The control plane is deliberately unhurried:
-~200 ms heartbeats, 1–2 s election timeouts, and vote requests from
-nodes whose journal is behind the voter's are refused, so the
-most-caught-up node wins.
+`melin_raft_role`, `melin_raft_is_leader`, and
+`melin_raft_driver_running`), on primaries and replicas alike, so
+monitoring can observe the elected leader — including on the surviving
+nodes during a failover. Raft carries election, membership, and (in a
+later phase) fencing-epoch allocation only — order flow stays on the
+existing replication path and the durability modes are unchanged. The
+control plane is deliberately unhurried: ~200 ms heartbeats, 1–2 s
+election timeouts.
+
+Election prefers a more-recent node's lineage: a candidate whose
+fencing epoch is behind a voter's is refused that vote. In this phase
+the comparison is **epoch-only** — it distinguishes primary tenures
+but not how far along within one, so two nodes on the same epoch are
+treated as equally current. Journal-sequence recency (so the
+furthest-along node within an epoch wins) arrives with automatic
+promotion; until then do **not** read `melin_raft_leader_id` as "the
+most-caught-up node" when choosing a manual `PROMOTE` target — verify
+the target's journal tip as the existing playbook directs.
 
 In this phase election is **observational**: it does not trigger
 promotion, and the manual `PROMOTE` playbook (including the
 "promote exactly one replica" rule above) remains authoritative.
 Configuration propagation and automatic promotion build on it next.
 
-Peer links authenticate with the cluster's replication keys, so every
-node's key must carry `replication` permission in every other node's
-`authorized_keys` file, and each raft node needs `--replication-key`.
-Durable election state (term, vote) lives in `--raft-dir` (default:
-`<journal>.raft/`); treat it like the journal — never wipe or share
-it on a live cluster, or a node can vote twice in one term.
+Each raft node needs its **own distinct** `--replication-key`, and
+every node's public key must carry `replication` permission in every
+other node's `authorized_keys` file. `--raft-peer` entries are
+`<id>@<host:port>@<pubkey-b64>`: the public key pins the peer's
+identity, so a connection authenticating with a given key may only
+speak for that node id — a shared or stolen key cannot impersonate
+another node or forge votes. Durable election state (term, vote) lives
+in `--raft-dir` (default: `<journal>.raft/`); treat it like the
+journal — never wipe or share it on a live cluster, or a node can vote
+twice in one term.
 
 ### No offline journal inspector
 
