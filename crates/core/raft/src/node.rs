@@ -14,7 +14,7 @@ use std::path::Path;
 
 use raft::eraftpb::{ConfChange, ConfChangeV2, Entry, EntryType, Message};
 use raft::{Config, RawNode, StateRole};
-use tracing::{info, warn};
+use tracing::{debug, info};
 
 use crate::storage::FileStorage;
 
@@ -121,20 +121,13 @@ impl ControlNode {
     pub fn step(&mut self, msg: Message) {
         // A step error means raft refused the message (e.g. unknown
         // peer after a membership change, stale term chatter). That is
-        // peer-input trouble, not a local invariant violation — log
-        // and drop, mirroring how the replication receiver treats
-        // malformed frames.
+        // peer-input trouble, not a local invariant violation, and a
+        // misconfigured or removed peer can trigger it repeatedly — so
+        // it is a client-caused event at `debug`, mirroring how the
+        // replication receiver treats malformed frames.
         if let Err(e) = self.raw.step(msg) {
-            warn!(error = %e, "control-plane raft rejected a peer message");
+            debug!(error = %e, "control-plane raft rejected a peer message");
         }
-    }
-
-    /// Ask raft to start an election now (test/ops hook; normal
-    /// elections come from tick timeouts).
-    pub fn campaign(&mut self) -> io::Result<()> {
-        self.raw
-            .campaign()
-            .map_err(|e| io::Error::other(format!("campaign failed: {e}")))
     }
 
     /// True when raft has state to persist, messages to send, or

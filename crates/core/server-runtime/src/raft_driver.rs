@@ -259,6 +259,11 @@ fn run(
     context: RaftDriverContext,
 ) {
     let (authed_tx, authed_rx): (Sender<AuthedSocket>, Receiver<AuthedSocket>) = channel();
+    // `Vec` (not a keyed map): the inbound set is tiny (bounded by the
+    // peer count) and only ever scanned/retained wholesale each tick, so
+    // a linear scan beats map overhead. `links` below is a `HashMap`
+    // because every raft message routes by peer id (`msg.to`), an
+    // O(1)-lookup access pattern.
     let mut inbound: Vec<InboundConn> = Vec::new();
     // A healthy cluster holds one inbound link (and needs at most one
     // concurrent auth) per peer; the cap adds slack for reconnect overlap

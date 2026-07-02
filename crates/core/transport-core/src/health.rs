@@ -730,6 +730,9 @@ impl HealthSnapshot {
         // series entirely (rather than exporting zeros) keeps dashboards
         // from suggesting a one-node "cluster" on standalone deployments.
         if let Some(raft) = &self.raft {
+            // Best-effort like the main block above: a write error only
+            // means the fixed metrics buffer filled, which truncates the
+            // exposition rather than being actionable here.
             let _ = write!(
                 c,
                 "# HELP melin_raft_node_id This node's control-plane raft id.\n\
