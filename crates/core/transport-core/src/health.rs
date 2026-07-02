@@ -89,6 +89,61 @@ pub struct HealthState {
     pub raft: Option<Arc<RaftStatus>>,
 }
 
+/// A [`QueueCursor`] that always reads 0 — used for the pipeline-cursor
+/// slots of a replica's minimal [`HealthState`], which has no client
+/// input ring.
+struct ZeroCursor;
+impl QueueCursor for ZeroCursor {
+    fn load(&self) -> u64 {
+        0
+    }
+}
+
+impl HealthState {
+    /// Minimal health state for a **replica** node.
+    ///
+    /// A replica accepts no client connections and its detailed
+    /// replication progress is reported by the primary's per-replica
+    /// gauges, so its own `/metrics` exists mainly to expose
+    /// control-plane raft election state (`raft`) and node liveness.
+    /// The pipeline/journal/replication gauges are intentionally
+    /// unpopulated (0); `replicas_connected: Some(0)` makes the node
+    /// report `halted` (it is following, not trading), and the fence
+    /// state still surfaces a superseded ex-primary. This reuses the one
+    /// `/metrics` implementation and exposition format rather than
+    /// standing up a second endpoint.
+    pub fn for_replica(
+        fence_state: Arc<crate::fence::FenceState>,
+        raft: Option<Arc<RaftStatus>>,
+        pipeline_healthy: Arc<AtomicBool>,
+    ) -> Self {
+        Self {
+            active_connections: Arc::new(AtomicU64::new(0)),
+            events_processed: Arc::new(AtomicU64::new(0)),
+            cursors: PipelineCursors::new(
+                WireSeq::new(0),
+                Arc::new(Sequence::new(AtomicU64::new(0))),
+                Arc::new(Sequence::new(AtomicU64::new(0))),
+            ),
+            input_cursor: Box::new(ZeroCursor),
+            pipeline_healthy,
+            // `Some(0)` (not `None`) so the trading flag reports
+            // `halted` — a replica is not accepting client orders.
+            replicas_connected: Some(Arc::new(AtomicU32::new(0))),
+            fence_state: Some(fence_state),
+            replication_metrics: None,
+            replica_active: None,
+            replication_ring_producer_cursors: None,
+            replication_ring_consumer_cursors: None,
+            fastest_replica_cursor: None,
+            journal_utilization: Arc::new(StageUtilization::new()),
+            matching_utilization: Arc::new(StageUtilization::new()),
+            response_utilization: Arc::new(StageUtilization::new()),
+            raft,
+        }
+    }
+}
+
 /// Control-plane raft election state exposed through `/metrics`.
 ///
 /// Plain atomics (not a `Mutex`) so the raft driver publishes after
@@ -1432,6 +1487,43 @@ mod tests {
             response.contains("OK 5 42 2 trading\n"),
             "missing status line in body: {response}"
         );
+
+        shutdown.store(true, Ordering::Relaxed);
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn replica_health_endpoint_serves_raft_gauges_and_reports_halted() {
+        // A replica's minimal endpoint must expose the election gauges
+        // (the point of having it) and report `halted` (it serves no
+        // client orders).
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener);
+
+        let raft = Arc::new(RaftStatus::new(2));
+        raft.role.store(RaftStatus::ROLE_LEADER, Ordering::Relaxed);
+        raft.leader_id.store(2, Ordering::Relaxed);
+        raft.term.store(7, Ordering::Relaxed);
+        let fence = Arc::new(crate::fence::FenceState::new(0));
+        let shutdown = Arc::new(AtomicBool::new(false));
+
+        let handle = spawn(
+            addr,
+            HealthState::for_replica(fence, Some(raft), Arc::new(AtomicBool::new(true))),
+            Arc::clone(&shutdown),
+        )
+        .unwrap();
+        // Give the listener a moment to come up.
+        std::thread::sleep(Duration::from_millis(100));
+
+        let body = http_request(addr, "GET /metrics HTTP/1.1\r\n\r\n");
+        assert!(body.contains("melin_raft_node_id 2\n"), "{body}");
+        assert!(body.contains("melin_raft_term 7\n"), "{body}");
+        assert!(body.contains("melin_raft_is_leader 1\n"), "{body}");
+        assert!(body.contains("melin_raft_driver_running 1\n"), "{body}");
+        // A replica is following, not accepting client orders.
+        assert!(body.contains("melin_trading_active 0\n"), "{body}");
 
         shutdown.store(true, Ordering::Relaxed);
         handle.join().unwrap();

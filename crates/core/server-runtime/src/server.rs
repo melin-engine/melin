@@ -848,6 +848,11 @@ where
             &shutdown,
         )?;
 
+        // Expose the replica's election gauges + liveness (a replica has
+        // no pipeline health endpoint of its own). Torn down before
+        // promotion so `run_as_primary` can rebind the same port.
+        let replica_health = spawn_replica_health(&config, &fence_state, &raft_status)?;
+
         // No local rotation triggers on the replica side: segment
         // rotation is primary-driven (the replica adopts the boundaries
         // announced over the replication stream), so replica journals
@@ -870,11 +875,17 @@ where
             Arc::clone(&fence_state),
             &tip_ready,
         )? {
-            None => return Ok(()), // clean shutdown
+            None => {
+                stop_replica_health(replica_health);
+                return Ok(()); // clean shutdown
+            }
             Some((mut exchange, writer)) => {
                 // Promotion! Transition to primary mode. Bump the epoch so a
                 // paused/partitioned ex-primary is fenced when it reconnects.
                 info!("replica promoted — transitioning to primary");
+                // Free the replica health port before `run_as_primary`
+                // rebinds `--health-bind`.
+                stop_replica_health(replica_health);
                 <A as Application>::prefault(&mut exchange);
 
                 // A ROTATE received while this node was a replica latched
@@ -2031,6 +2042,10 @@ where
             &shutdown,
         )?;
 
+        // Replica election/liveness endpoint (kernel TCP even on DPDK
+        // nodes); torn down before promotion. See the kernel path.
+        let replica_health = spawn_replica_health(&config, &fence_state, &raft_status)?;
+
         // No local rotation triggers on the replica side — rotation is
         // primary-driven (see the kernel-TCP receiver path).
 
@@ -2070,10 +2085,16 @@ where
             Arc::clone(&fence_state),
             &tip_ready,
         )? {
-            None => return Ok(()), // clean shutdown
+            None => {
+                stop_replica_health(replica_health);
+                return Ok(()); // clean shutdown
+            }
             Some((mut exchange, writer)) => {
                 // Promotion! Transition to primary mode (DPDK).
                 info!("replica promoted (DPDK) — transitioning to primary");
+                // Free the replica health port before the primary path
+                // rebinds `--health-bind`.
+                stop_replica_health(replica_health);
                 <A as Application>::prefault(&mut exchange);
 
                 // Clear a ROTATE latched while this node was a replica —
@@ -3113,6 +3134,58 @@ fn spawn_raft_driver(
         },
     )?;
     Ok(Some(status))
+}
+
+/// A running replica health endpoint: its thread plus a dedicated stop
+/// flag. The flag is separate from the process shutdown flag so the
+/// endpoint can be torn down (freeing its port) at promotion, before
+/// `run_as_primary` rebinds the same `--health-bind`.
+type ReplicaHealth = (std::thread::JoinHandle<()>, Arc<AtomicBool>);
+
+/// Spawn a minimal health endpoint for a replica so its control-plane
+/// raft election gauges and liveness are observable — a replica
+/// otherwise serves no `/metrics`, which hides election state on exactly
+/// the nodes that survive a failover.
+///
+/// Only spawned when control-plane raft is enabled (`raft_status` is
+/// `Some`): without raft a replica stays headless as before, so this
+/// doesn't perturb non-raft deployments. `Ok(None)` when raft is off or
+/// no `--health-bind` is configured.
+fn spawn_replica_health(
+    config: &ServerConfig,
+    fence_state: &Arc<melin_transport_core::fence::FenceState>,
+    raft_status: &Option<Arc<melin_transport_core::health::RaftStatus>>,
+) -> Result<Option<ReplicaHealth>, Box<dyn std::error::Error>> {
+    if raft_status.is_none() {
+        return Ok(None);
+    }
+    let Some(addr) = config.health_bind else {
+        return Ok(None);
+    };
+    let stop = Arc::new(AtomicBool::new(false));
+    let handle = melin_transport_core::health::spawn(
+        addr,
+        melin_transport_core::health::HealthState::for_replica(
+            Arc::clone(fence_state),
+            raft_status.clone(),
+            Arc::new(AtomicBool::new(true)),
+        ),
+        Arc::clone(&stop),
+    )?;
+    info!(addr = %addr, "replica health endpoint started (election + liveness)");
+    Ok(Some((handle, stop)))
+}
+
+/// Stop the replica health endpoint and join its thread so the listen
+/// socket is released — called on the promotion path before
+/// `run_as_primary` rebinds `--health-bind`, and on clean shutdown.
+fn stop_replica_health(health: Option<ReplicaHealth>) {
+    if let Some((handle, stop)) = health {
+        stop.store(true, Ordering::Release);
+        // Best-effort: a join error just means the thread already
+        // unwound; the port is freed either way.
+        let _ = handle.join();
+    }
 }
 
 /// Decode a base64 (standard alphabet) Ed25519 public key — the same
