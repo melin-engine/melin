@@ -3760,19 +3760,7 @@ fn higher_epoch_handshake_fences_stale_primary() {
 /// Fetch one `melin_raft_*` gauge from the Prometheus metrics endpoint.
 /// Returns `None` while the endpoint or the gauge is unavailable.
 fn fetch_raft_gauge(addr: SocketAddr, gauge: &str) -> Option<u64> {
-    let mut stream = TcpStream::connect_timeout(&addr, Duration::from_secs(1)).ok()?;
-    stream.set_read_timeout(Some(Duration::from_secs(2))).ok()?;
-    stream.write_all(b"GET /metrics HTTP/1.1\r\n\r\n").ok()?;
-    let mut body = Vec::new();
-    stream.read_to_end(&mut body).ok()?;
-    let text = std::str::from_utf8(&body).ok()?;
-    let prefix = format!("melin_raft_{gauge} ");
-    for line in text.lines() {
-        if let Some(rest) = line.strip_prefix(&prefix) {
-            return rest.trim().parse().ok();
-        }
-    }
-    None
+    fetch_metric_u64(addr, &format!("melin_raft_{gauge} "))
 }
 
 /// Spawn a standalone (no data-plane replication) server with the
