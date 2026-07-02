@@ -452,6 +452,33 @@ impl Exchange {
         self.operator_policy_set
     }
 
+    /// Install the operator policy from a snapshot restore. Assigns the
+    /// three limit fields directly and latches [`Self::operator_policy_set`],
+    /// **without** the online-reconfig bucket-clearing that
+    /// [`Self::set_max_orders_per_second`] performs.
+    ///
+    /// A snapshot restore establishes initial state, not a live
+    /// reconfiguration, so the bucket map already loaded by
+    /// [`Self::restore_order_buckets`] must survive regardless of the
+    /// restored `(rate, burst)`. Routing restore through `set_operator_policy`
+    /// would only preserve those buckets by relying on
+    /// `DEFAULT_MAX_ORDERS_PER_SECOND == 0` keeping the just-built engine in
+    /// the "limiter disabled" state (so the clear branch never fires) — a
+    /// silent dependency that would discard restored buckets and reopen the
+    /// SEC-04 divergence window if that default were ever made non-zero.
+    /// Assigning directly removes that coupling.
+    pub(crate) fn restore_operator_policy(
+        &mut self,
+        max_open_orders_per_account: u32,
+        max_orders_per_second: u32,
+        max_orders_burst: u32,
+    ) {
+        self.max_open_orders_per_account = max_open_orders_per_account;
+        self.max_orders_per_second = max_orders_per_second;
+        self.max_orders_burst = max_orders_burst;
+        self.operator_policy_set = true;
+    }
+
     /// Stash the current event's `now_ns` so per-event methods (`execute`,
     /// `cancel`, …) can read a deterministic clock without each method
     /// taking a `now_ns` parameter. Called by `Application::apply` exactly

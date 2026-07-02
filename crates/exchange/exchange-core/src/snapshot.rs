@@ -1517,11 +1517,12 @@ impl Exchange {
         // now journaled (`SetOperatorPolicy`) rather than reapplied per
         // node from the CLI, and carried in the snapshot so a
         // snapshot-recovered node restores exactly what the primary held.
-        // `set_operator_policy` also latches `operator_policy_set`, so the
-        // runtime's migration check sees this as an already-configured
-        // lineage. Ordered after `restore_order_buckets` so the restored
-        // bucket state is preserved through the activation.
-        exchange.set_operator_policy(
+        // `restore_operator_policy` assigns the fields directly and latches
+        // `operator_policy_set` (so the runtime's migration check sees an
+        // already-configured lineage) WITHOUT the online-reconfig bucket
+        // clear — the buckets restored just above are authoritative and must
+        // survive whatever `(rate, burst)` the snapshot carried.
+        exchange.restore_operator_policy(
             max_open_orders_per_account,
             max_orders_per_second,
             max_orders_burst,
@@ -2410,6 +2411,48 @@ mod tests {
         assert!(
             restored.operator_policy_set(),
             "restore must latch operator_policy_set so no migration is injected"
+        );
+    }
+
+    /// `restore_operator_policy` must preserve the restored bucket map even
+    /// when the restored `(rate, burst)` differs from the engine's current
+    /// active config — the exact case where the online-reconfig
+    /// `set_max_orders_per_second` path would `clear()` the buckets. This
+    /// guards the SEC-04 continuity contract independently of
+    /// `DEFAULT_MAX_ORDERS_PER_SECOND` staying at the disabled sentinel.
+    #[test]
+    fn restore_operator_policy_preserves_buckets_across_differing_config() {
+        let mut exchange = Exchange::new();
+        // Activate the limiter and deplete a bucket so there is real state
+        // that a spurious clear would destroy.
+        exchange.set_max_orders_per_second(1_000, 5);
+        exchange.add_instrument(btc_usd_spec());
+        exchange.deposit(ACCT_A, USD, 1_000_000);
+        exchange.set_current_event_ts_ns(1_000_000_000);
+        let mut reports = Vec::new();
+        exchange.execute(
+            Symbol(1),
+            limit_order(1, ACCT_A, Side::Buy, 100, 1),
+            &mut reports,
+        );
+        let before = exchange.snapshot_order_buckets();
+        assert!(
+            !before.is_empty(),
+            "test setup: expected a populated bucket"
+        );
+
+        // Restore a DIFFERENT active policy. `set_max_orders_per_second`
+        // would clear here (was_active && will_be_active && values_differ);
+        // `restore_operator_policy` must not.
+        exchange.restore_operator_policy(50, 2_000, 10);
+
+        assert_eq!(exchange.max_open_orders_per_account(), 50);
+        assert_eq!(exchange.max_orders_per_second(), (2_000, 10));
+        assert!(exchange.operator_policy_set());
+        assert_eq!(
+            exchange.snapshot_order_buckets(),
+            before,
+            "restore_operator_policy must not clear restored buckets"
         );
     }
 
