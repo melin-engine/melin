@@ -66,6 +66,19 @@ impl AppFactory for Factory {
         // `Application::operator_policy_present`. Always `Some`: the CLI
         // supplies concrete values (a `0` rate is a valid "disabled"
         // policy, still worth journaling so replicas match).
+        //
+        // Log the CLI-derived values here: this method is the CLI→journal
+        // seam (called only at genesis seeding and pre-v19 migration, the
+        // moments the CLI is authoritative), so it restores the
+        // operator-facing visibility the removed `apply_operator_policy`
+        // used to provide — the generic runtime can't log the values because
+        // the event is opaque there.
+        tracing::info!(
+            max_open_orders_per_account = self.config.max_orders_per_account,
+            max_orders_per_second = self.config.max_orders_per_second,
+            max_orders_burst = self.config.max_orders_burst,
+            "journaling operator policy from CLI (SEC-03 cap, SEC-04 rate)"
+        );
         Some(TradingEvent::SetOperatorPolicy {
             max_open_orders_per_account: self.config.max_orders_per_account,
             max_orders_per_second: self.config.max_orders_per_second,

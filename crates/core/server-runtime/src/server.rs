@@ -23,6 +23,7 @@ use tracing::{debug, error, info, warn};
 
 use melin_journal::BufferedWriter;
 use melin_journal::JournalError;
+use melin_journal::JournalEvent;
 use melin_journal::JournalWrite;
 use melin_journal::SectorWriter;
 use melin_transport_core::journaled_app::JournaledApp;
@@ -1006,6 +1007,25 @@ where
     )
 }
 
+/// Build the `InputSlot` for a runtime-injected "system" event. The bulk
+/// seed events, the promotion `EpochBump`, and the pre-v19 operator-policy
+/// migration all ride the input ring with this `connection_id == 0` shape and
+/// synthetic timestamps that mark them as non-client entries. Extracted so
+/// the several publish sites (kernel + DPDK) can't drift when the slot layout
+/// changes.
+fn system_input_slot<E: melin_app::AppEvent>(event: JournalEvent<E>) -> InputSlot<E> {
+    InputSlot {
+        connection_id: 0,
+        key_hash: 0,
+        request_seq: 0,
+        sequence: 0,
+        timestamp_ns: melin_app::unix_epoch_nanos(),
+        event,
+        publish_ts: melin_transport_core::trace::mono_trace_ns(),
+        recv_ts: melin_transport_core::trace::mono_trace_ns(),
+    }
+}
+
 /// Run the server as a primary: build the disruptor pipeline, spawn
 /// pipeline threads, optionally seed instruments/accounts, then accept
 /// client connections.
@@ -1541,10 +1561,6 @@ where
         }
     }
     if needs_seeding {
-        use melin_app::unix_epoch_nanos;
-        use melin_journal::JournalEvent;
-        use melin_transport_core::trace::mono_trace_ns;
-
         let seed_start = std::time::Instant::now();
         let seed_events = factory.seed_events();
         let seed_count = seed_events.len();
@@ -1555,16 +1571,8 @@ where
         // `JournalEvent::App` and stamps transport-level metadata.
         let mut last_published_seq = 0u64;
         for event in seed_events {
-            last_published_seq = input_producer.publish(InputSlot {
-                connection_id: 0,
-                key_hash: 0,
-                request_seq: 0,
-                sequence: 0,
-                timestamp_ns: unix_epoch_nanos(),
-                event: JournalEvent::App(event),
-                publish_ts: mono_trace_ns(),
-                recv_ts: mono_trace_ns(),
-            });
+            last_published_seq =
+                input_producer.publish(system_input_slot(JournalEvent::App(event)));
         }
         let publish_elapsed = seed_start.elapsed();
 
@@ -1647,36 +1655,6 @@ where
         );
     }
 
-    // Operator-policy migration: a recovered lineage that predates journaled
-    // operator policy (pre-v19) has no `SetOperatorPolicy` in its history, so
-    // after `apply_operator_policy` was removed it would run with the engine
-    // defaults (rate limiter OFF). Inject one from the CLI flags as the
-    // primary's first journaled entry so the config is captured once and
-    // replicated to every replica. Rides the input ring like a seed event
-    // (connection_id == 0). No drain needed: the input ring is single-producer
-    // and the reader (the only other producer) is not spawned until below, so
-    // this event is strictly ordered before every client event on the primary
-    // and before every replicated event — replicas apply it first too.
-    if needs_policy_migration {
-        use melin_app::unix_epoch_nanos;
-        use melin_journal::JournalEvent;
-        use melin_transport_core::trace::mono_trace_ns;
-
-        if let Some(policy) = factory.operator_policy_event() {
-            info!("migrating pre-v19 lineage: injecting operator policy from CLI flags");
-            input_producer.publish(InputSlot {
-                connection_id: 0,
-                key_hash: 0,
-                request_seq: 0,
-                sequence: 0,
-                timestamp_ns: unix_epoch_nanos(),
-                event: JournalEvent::App(policy),
-                publish_ts: mono_trace_ns(),
-                recv_ts: mono_trace_ns(),
-            });
-        }
-    }
-
     // Promotion fencing: a node that reached primary via promotion injects
     // an `EpochBump` as the first journaled entry of its tenure, raising the
     // cluster epoch so a paused/partitioned ex-primary self-demotes when a
@@ -1687,22 +1665,11 @@ where
     // matching stage to apply it (epoch advanced) before serving so the first
     // handshake already advertises the new epoch.
     if promoted {
-        use melin_app::unix_epoch_nanos;
-        use melin_journal::JournalEvent;
-        use melin_transport_core::trace::mono_trace_ns;
-
         let new_epoch = fence_state.epoch().saturating_add(1);
         info!(new_epoch, "promotion: injecting epoch bump");
-        input_producer.publish(InputSlot {
-            connection_id: 0,
-            key_hash: 0,
-            request_seq: 0,
-            sequence: 0,
-            timestamp_ns: unix_epoch_nanos(),
-            event: JournalEvent::EpochBump { epoch: new_epoch },
-            publish_ts: mono_trace_ns(),
-            recv_ts: mono_trace_ns(),
-        });
+        input_producer.publish(system_input_slot(JournalEvent::EpochBump {
+            epoch: new_epoch,
+        }));
         // Spin until the matching stage observes the bump (epoch raised) so
         // the node advertises `new_epoch` on the very first handshake. Bounded
         // by the shutdown flag so a stuck pipeline can't wedge startup.
@@ -1711,6 +1678,37 @@ where
                 break;
             }
             std::hint::spin_loop();
+        }
+    }
+
+    // Operator-policy migration: a recovered lineage that predates journaled
+    // operator policy (pre-v19) has no `SetOperatorPolicy` in its history, so
+    // after `apply_operator_policy` was removed it would run with the engine
+    // defaults (rate limiter OFF). Inject one from the CLI flags so the config
+    // is captured once and replicated to every replica. Ordered after the
+    // promotion `EpochBump` above so the bump stays the first journaled entry
+    // of a promoted tenure. No drain needed: the input ring is single-producer
+    // and the reader (the only other producer) is not spawned until below, so
+    // this is strictly ordered before every client and replicated event —
+    // replicas apply it first too.
+    if needs_policy_migration {
+        match factory.operator_policy_event() {
+            Some(policy) => {
+                info!("migrating pre-v19 lineage: injecting operator policy from CLI flags");
+                input_producer.publish(system_input_slot(JournalEvent::App(policy)));
+            }
+            None => {
+                // `needs_policy_migration` is derived from
+                // `Application::operator_policy_present()`, so reaching here
+                // means the app reports a missing policy while its factory
+                // yields none — the two hooks disagree and the node would run
+                // on engine defaults (rate limiter OFF). Surface it loudly
+                // rather than silently disabling throttling.
+                warn!(
+                    "operator-policy migration required but the factory produced no policy \
+                     event — running on engine defaults (rate limiter disabled)"
+                );
+            }
         }
     }
 
@@ -2571,10 +2569,6 @@ where
     // replicas independently of seeding; this only changes DPDK behavior.
     let _ = (&enable_replication, &replica_ready); // suppress unused warnings on non-DPDK paths
     if needs_seeding {
-        use melin_app::unix_epoch_nanos;
-        use melin_journal::JournalEvent;
-        use melin_transport_core::trace::mono_trace_ns;
-
         let seed_events = factory.seed_events();
         let seed_count = seed_events.len();
 
@@ -2582,16 +2576,8 @@ where
         // disruptor cursor order at encode time.
         let mut last_published_seq = 0u64;
         for event in seed_events {
-            last_published_seq = input_producer.publish(InputSlot {
-                connection_id: 0,
-                key_hash: 0,
-                request_seq: 0,
-                sequence: 0,
-                timestamp_ns: unix_epoch_nanos(),
-                event: JournalEvent::App(event),
-                publish_ts: mono_trace_ns(),
-                recv_ts: mono_trace_ns(),
-            });
+            last_published_seq =
+                input_producer.publish(system_input_slot(JournalEvent::App(event)));
         }
 
         // Wait for seeding to complete through journal + matching stages,
@@ -2639,24 +2625,24 @@ where
     // Operator-policy migration for a pre-v19 lineage — see the kernel-TCP
     // path for the rationale. Injected here (before the poll thread takes
     // the producer) so it is strictly ordered ahead of every client and
-    // replicated event; no drain required.
+    // replicated event; no drain required. The DPDK primary path is never
+    // reached via promotion (that falls back to kernel TCP), so there is no
+    // EpochBump-ordering concern here.
     if needs_policy_migration {
-        use melin_app::unix_epoch_nanos;
-        use melin_journal::JournalEvent;
-        use melin_transport_core::trace::mono_trace_ns;
-
-        if let Some(policy) = factory.operator_policy_event() {
-            info!("migrating pre-v19 lineage: injecting operator policy from CLI flags");
-            input_producer.publish(InputSlot {
-                connection_id: 0,
-                key_hash: 0,
-                request_seq: 0,
-                sequence: 0,
-                timestamp_ns: unix_epoch_nanos(),
-                event: JournalEvent::App(policy),
-                publish_ts: mono_trace_ns(),
-                recv_ts: mono_trace_ns(),
-            });
+        match factory.operator_policy_event() {
+            Some(policy) => {
+                info!("migrating pre-v19 lineage: injecting operator policy from CLI flags");
+                input_producer.publish(system_input_slot(JournalEvent::App(policy)));
+            }
+            None => {
+                // See the kernel path: the app reports a missing policy but
+                // its factory yields none — warn rather than silently running
+                // on engine defaults (rate limiter OFF).
+                warn!(
+                    "operator-policy migration required but the factory produced no policy \
+                     event — running on engine defaults (rate limiter disabled)"
+                );
+            }
         }
     }
 
